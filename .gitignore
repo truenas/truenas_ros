@@ -1,0 +1,4 @@
+# Cargo build artifacts
+/target
+
+# Cargo.lock is committed (this crate ships a binary-relevant CI); keep it.

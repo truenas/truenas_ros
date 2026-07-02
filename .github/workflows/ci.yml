@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [ main, master ]
+
+concurrency:
+  group: ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt + clippy + test (unprivileged)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    # The configparser differential tests spawn python3; guarantee it is present
+    # so they run for real here rather than skipping.
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install Rust toolchain
+      run: |
+        rustup toolchain install stable --profile minimal
+        rustup component add clippy rustfmt
+        rustup default stable
+
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
+
+    - name: rustfmt
+      run: cargo fmt --all --check
+
+    - name: clippy
+      run: cargo clippy --all-features --all-targets -- -D warnings
+
+    # The ZFS-backed and privileged tests skip automatically here (no datasets,
+    # unprivileged); the QEMU VM job exercises them for real. The configparser
+    # differential tests DO run here: TRUENAS_ROS_REQUIRE_PYTHON turns a missing
+    # python3 into a hard failure instead of a silent skip.
+    - name: test
+      run: cargo test --all-features
+      env:
+        TRUENAS_ROS_REQUIRE_PYTHON: "1"
+
+    - name: feature-matrix builds
+      run: |
+        cargo build --no-default-features
+        cargo build --all-features
+
+    - name: docs
+      run: cargo doc --all-features --no-deps

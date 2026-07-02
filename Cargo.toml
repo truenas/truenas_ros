@@ -1,0 +1,72 @@
+[package]
+name = "truenas_ros"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "Idiomatic Rust bindings for modern Linux filesystem/mount syscalls, ACLs, and related utilities (the Rust equivalent of truenas_pyos)."
+categories = ["os::unix-apis", "filesystem"]
+keywords = ["linux", "syscall", "mount", "acl", "truenas"]
+
+[dependencies]
+libc = { version = "0.2.155", features = ["extra_traits"] }
+bitflags = "2.6"
+
+[features]
+# Default enables the implemented subsystems; more join as phases land.
+default = [
+    "fs",
+    "xattr",
+    "mount",
+    "acl",
+    "fhandle",
+    "fsiter",
+    "namespace",
+    "shutil",
+    "configfile",
+]
+
+fs = []
+xattr = []
+mount = ["fs"]
+fhandle = ["fs"]
+acl = ["xattr"]
+fsiter = ["fs", "mount"]
+namespace = []
+shutil = ["fsiter", "xattr"]
+configfile = ["fs"]
+full = [
+    "fs",
+    "xattr",
+    "mount",
+    "fhandle",
+    "acl",
+    "fsiter",
+    "namespace",
+    "shutil",
+    "configfile",
+]
+
+[dev-dependencies]
+tempfile = "3"
+
+[[test]]
+name = "test"
+path = "test/test.rs"
+
+[[test]]
+name = "coverage"
+path = "test/coverage.rs"
+
+# Privileged, ZFS-backed tests (real NFSv4/POSIX ACLs, snapshot detection).
+# Skip automatically when no ACL-typed ZFS dataset is available; provisioned in
+# CI by .github/workflows/scripts/setup-test-zfs.sh.
+[[test]]
+name = "zfs"
+path = "test/zfs.rs"
+
+# Differential tests against the real Python `configparser` (byte-for-byte and
+# behavior parity). Skip automatically when `python3` is unavailable.
+[[test]]
+name = "configparser_compat"
+path = "test/configparser_compat.rs"
