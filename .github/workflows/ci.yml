@@ -44,14 +44,31 @@ jobs:
     - name: clippy
       run: cargo clippy --all-features --all-targets -- -D warnings
 
+    # The net (io_uring) tests skip themselves when a ring can't be created. We
+    # do NOT want that to pass silently as green, so force them to run below —
+    # but first fail fast and legibly if this runner has io_uring restricted,
+    # so a red is clearly "runner can't do io_uring" and not a net-code bug.
+    # (io_uring_disabled: 0 = on for everyone, 1 = unprivileged blocked, 2 =
+    # off; an absent sysctl predates the knob and means io_uring is on.)
+    - name: Verify io_uring is available
+      run: |
+        disabled=$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0)
+        if [ "$disabled" != "0" ]; then
+          echo "::error::io_uring restricted on this runner (io_uring_disabled=$disabled); net tests cannot run here"
+          exit 1
+        fi
+        echo "io_uring available (io_uring_disabled=$disabled)"
+
     # The ZFS-backed and privileged tests skip automatically here (no datasets,
-    # unprivileged); the QEMU VM job exercises them for real. The configparser
-    # differential tests DO run here: TRUENAS_ROS_REQUIRE_PYTHON turns a missing
-    # python3 into a hard failure instead of a silent skip.
+    # unprivileged); the QEMU VM job exercises them for real. Two otherwise-
+    # silent skips are turned into hard failures: the configparser differential
+    # tests (REQUIRE_PYTHON) and the net server/client tests (REQUIRE_IO_URING,
+    # backed by the ring probe above that guarantees they can actually run).
     - name: test
       run: cargo test --all-features
       env:
         TRUENAS_ROS_REQUIRE_PYTHON: "1"
+        TRUENAS_ROS_REQUIRE_IO_URING: "1"
 
     - name: feature-matrix builds
       run: |

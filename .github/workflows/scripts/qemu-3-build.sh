@@ -41,6 +41,12 @@ echo "Installing dependencies in VM..."
 ssh debian@$VM_IP bash -s <<'REMOTE_DEPS'
 set -eu
 
+# Run CI on TrueNAS 26.0's shipping kernel (6.18) instead of Trixie's default
+# 6.12: pull it from trixie-backports. This exercises the statmount 6.14/6.15
+# fields (sb_source, uid/gid maps) the fs tests need, and matches the kernel
+# ZFS is built for. The peercred version gate lives in qemu-4-test.sh.
+echo 'deb http://deb.debian.org/debian trixie-backports main' \
+  | sudo tee /etc/apt/sources.list.d/backports.list
 sudo apt-get update
 
 sudo apt-get install -y \
@@ -69,11 +75,15 @@ sudo apt-get install -y \
   python3-cffi \
   python3-setuptools \
   python3-sphinx \
-  linux-headers-amd64 \
   dkms \
   git \
   gdb \
   cargo
+
+# The 6.18 kernel image + matching headers from backports. GRUB boots the
+# highest version (6.18 > 6.12) on the reboot below; the headers are required
+# for the ZFS kmod build against that running kernel.
+sudo apt-get install -y -t trixie-backports linux-image-amd64 linux-headers-amd64
 REMOTE_DEPS
 
 # Reboot VM to boot into the newly installed kernel
@@ -116,9 +126,16 @@ for i in {1..60}; do
   sleep 5
 done
 
-# Verify VM is accessible and check kernel version
+# Verify the VM booted the 6.18 backports kernel (not Trixie's default 6.12).
+# A silent fallback to 6.12 would under-test statmount and misreport peercred,
+# so make the wrong kernel series a hard failure.
 echo "Verifying new kernel is running..."
-ssh debian@$VM_IP "uname -r"
+booted=$(ssh debian@$VM_IP "uname -r")
+echo "Booted kernel: $booted"
+case "$booted" in
+  6.18.* | 6.18-*) echo "On the 6.18 series as expected" ;;
+  *) echo "ERROR: expected a 6.18 kernel, got '$booted'"; exit 1 ;;
+esac
 
 # Now build/install OpenZFS
 echo "Building OpenZFS..."
