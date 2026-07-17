@@ -13,6 +13,16 @@ jobs:
   qemu-test:
     name: Debian Trixie QEMU Test (ZFS + privileged)
     runs-on: ubuntu-24.04
+    env:
+      # TrueNAS 26.0 ships the 6.18 kernel series and OpenZFS 2.4 is not
+      # validated on anything newer — ZFS on a 7.x kernel is unsupported.
+      # trixie-backports carries only its newest kernel (7.0.x now), so the VM
+      # installs the last 6.18 it ever shipped from a pinned
+      # snapshot.debian.org view of trixie-backports. The two values are
+      # coupled (that snapshot serves exactly that version — qemu-3-build.sh
+      # asserts it); bump them together when moving to a newer target kernel.
+      KERNEL_APT_SNAPSHOT: "20260317T000000Z"
+      KERNEL_DEB_VERSION: "6.18.15-1~bpo13+1"
     steps:
     - uses: actions/checkout@v4
       with:
@@ -29,12 +39,16 @@ jobs:
         echo "hash=$ZFS_COMMIT" >> $GITHUB_OUTPUT
         echo "OpenZFS commit: $ZFS_COMMIT"
 
+    # The cached ZFS debs contain kmods built against the VM's pinned kernel;
+    # modules cached for another kernel would install but never modprobe, so
+    # the key includes the pinned version (qemu-3-build.sh asserts the VM
+    # installed and booted exactly that kernel).
     - name: Cache OpenZFS packages
       id: cache-zfs
       uses: actions/cache@v4
       with:
         path: /tmp/zfs-debs
-        key: zfs-debs-debian-trixie-${{ steps.zfs-hash.outputs.hash }}
+        key: zfs-debs-debian-trixie-${{ steps.zfs-hash.outputs.hash }}-${{ env.KERNEL_DEB_VERSION }}
 
     - name: Cache Debian Trixie image
       uses: actions/cache@v4

@@ -4423,13 +4423,16 @@ fn retry<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
 // A real end-to-end TLS handshake around the server's kernel-TLS transport.
 // The library brings no TLS crate; these tests use OpenSSL as a dev-dependency
 // for both the consumer-side handshake worker and the client — exactly the
-// split a real consumer implements. Skips when the kernel lacks the `tls` ULP.
+// split a real consumer implements. Skips when the kernel lacks the `tls` ULP,
+// or when libssl cannot engage kTLS at all ([`ktls_engages`] — Ubuntu ships
+// OpenSSL 3.0 without `enable-ktls`).
 
 use foreign_types::ForeignType; // Ssl::as_ptr for the raw BIO/SSL_accept path
 use openssl::ssl::{
     Ssl, SslAcceptor, SslConnector, SslMethod, SslOptions, SslVerifyMode,
 };
-use std::os::fd::RawFd;
+use std::net::TcpListener;
+use std::os::fd::{AsRawFd, RawFd};
 
 const SSL_OP_ENABLE_KTLS: u64 = 1 << 3; // SSL_OP_BIT(3); no named crate const
 const BIO_NOCLOSE: libc::c_int = 0;
@@ -4595,6 +4598,78 @@ fn tls_connect(
     Ok(stream)
 }
 
+/// `SSL_OP_ENABLE_KTLS` is best-effort: when OpenSSL cannot install kTLS it
+/// silently falls back to userspace TLS records — a libssl built without
+/// `enable-ktls` (Debian/Ubuntu only enable it from 3.2), a TLS 1.3 RX gap
+/// (OpenSSL < 3.2), or a kernel missing the `tls` module. The handshake then
+/// completes but the TX/RX confirmation fails, the worker rejects every
+/// connection, and the kTLS data-path tests would fail rather than skip.
+/// Probe once with a loopback handshake — the same acceptor, client, and
+/// confirmation the tests use — so those tests can skip when this host's
+/// OpenSSL cannot engage kTLS.
+fn ktls_engages() -> &'static Result<(), String> {
+    static PROBE: std::sync::OnceLock<Result<(), String>> =
+        std::sync::OnceLock::new();
+    PROBE.get_or_init(|| {
+        let (cert, key) = self_signed();
+        let acceptor = ktls_acceptor(&cert, &key);
+        let listener =
+            TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        let std::net::SocketAddr::V4(v4) =
+            listener.local_addr().map_err(|e| e.to_string())?
+        else {
+            return Err("bound v4".into());
+        };
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (stream, _) = listener.accept().map_err(|e| e.to_string())?;
+            // `ktls_server_handshake` owns (and closes) the fd it is given;
+            // hand it a dup and let the `TcpStream` keep the socket.
+            // SAFETY: dup of a live fd.
+            let fd = unsafe { libc::dup(stream.as_raw_fd()) };
+            if fd < 0 {
+                return Err("dup".into());
+            }
+            ktls_server_handshake(fd, &acceptor)
+        });
+        match tls_connect(v4) {
+            Ok(stream) => {
+                let served = server
+                    .join()
+                    .map_err(|_| "probe server panicked".to_string())?;
+                drop(stream); // keep the session open until the server confirmed
+                served
+            }
+            Err(e) => {
+                // The client end is already gone, so the server side unblocks
+                // on EOF by itself; don't wait on it.
+                drop(server);
+                Err(e.to_string())
+            }
+        }
+    })
+}
+
+/// The OpenSSL-side skip for the kTLS data-path tests: `false` when this host
+/// engages kTLS end to end, `true` (with a visible note) when it cannot — or
+/// a hard failure when `TRUENAS_ROS_REQUIRE_KTLS` says skipping is forbidden.
+fn ktls_openssl_unsupported() -> bool {
+    match ktls_engages() {
+        Ok(()) => false,
+        Err(e) => {
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_KTLS").is_none(),
+                "TRUENAS_ROS_REQUIRE_KTLS set but {} cannot engage kTLS: {e}",
+                openssl::version::version(),
+            );
+            eprintln!(
+                "skipping kTLS data-path test: {} cannot engage kTLS ({e})",
+                openssl::version::version(),
+            );
+            true
+        }
+    }
+}
+
 #[test]
 fn ktls_echo_roundtrip() {
     // End-to-end: a kTLS listener, the consumer's OpenSSL handshake worker, and
@@ -4602,6 +4677,9 @@ fn ktls_echo_roundtrip() {
     // over the kernel-TLS transport; the server sees plaintext (kernel decrypts)
     // and the framer is unchanged.
     use std::sync::Mutex;
+    if ktls_openssl_unsupported() {
+        return;
+    }
     let (cert, key) = self_signed();
     let acceptor = Arc::new(ktls_acceptor(&cert, &key));
     let seen_listener: Arc<Mutex<Option<ServerAddr>>> =
@@ -4672,6 +4750,9 @@ fn ktls_rejected_handshake_sheds() {
     // A handshake that fails (the client speaks plaintext, not TLS) must reject
     // cleanly — the worker calls deferral.reject(), the slot is shed — and the
     // server keeps serving later TLS connections.
+    if ktls_openssl_unsupported() {
+        return;
+    }
     let (cert, key) = self_signed();
     let acceptor = Arc::new(ktls_acceptor(&cert, &key));
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -4812,6 +4893,9 @@ fn ktls_close_notify_reports_tls_control() {
     // the documented reason for a peer's clean TLS close — not as
     // TruncatedMessage.
     use std::sync::Mutex;
+    if ktls_openssl_unsupported() {
+        return;
+    }
     let (cert, key) = self_signed();
     let acceptor = Arc::new(ktls_acceptor(&cert, &key));
     let reasons = Arc::new(Mutex::new(Vec::new()));
@@ -4896,6 +4980,9 @@ fn tcp_splice_body_over_ktls() {
     // Force the straddle: the client writes header+body as ONE buffer, so TLS
     // record 1 = [5-byte header][~16 KiB body prefix]. A bounded reader asserts
     // the FULL body arrives, in order.
+    if ktls_openssl_unsupported() {
+        return;
+    }
     let (cert, key) = self_signed();
     let acceptor = Arc::new(ktls_acceptor(&cert, &key));
     let mut fds = [0 as libc::c_int; 2];
@@ -5020,6 +5107,9 @@ fn ktls_splice_body_slow_but_progressing_survives() {
     // below its watermark) and only cancels on a full period of ZERO progress,
     // so a steadily-fed transfer is never mistaken for a stall.
     use std::sync::Mutex;
+    if ktls_openssl_unsupported() {
+        return;
+    }
     let (cert, key) = self_signed();
     let acceptor = Arc::new(ktls_acceptor(&cert, &key));
     let mut fds = [0 as libc::c_int; 2];
@@ -5168,6 +5258,9 @@ fn ktls_splice_body_stall_reclaimed() {
     // slot plus a kernel io-wq thread until full shutdown (pool_size such
     // clients would deny all service, immune to every other timeout).
     use std::sync::Mutex;
+    if ktls_openssl_unsupported() {
+        return;
+    }
     let (cert, key) = self_signed();
     let acceptor = Arc::new(ktls_acceptor(&cert, &key));
     let mut fds = [0 as libc::c_int; 2];

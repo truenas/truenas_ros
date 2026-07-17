@@ -64,6 +64,13 @@ jobs:
     # silent skips are turned into hard failures: the configparser differential
     # tests (REQUIRE_PYTHON) and the net server/client tests (REQUIRE_IO_URING,
     # backed by the ring probe above that guarantees they can actually run).
+    #
+    # The kTLS data-path tests are deliberately NOT forced here: this runner's
+    # kernel has the tls ULP, but Ubuntu builds OpenSSL 3.0 without
+    # enable-ktls, so libssl can never install kTLS on a socket and the suites'
+    # loopback engagement probe skips those tests. The QEMU job (Trixie
+    # userspace, OpenSSL 3.2+ with ktls) sets TRUENAS_ROS_REQUIRE_KTLS=1 and
+    # runs them for real.
     - name: test
       run: cargo test --all-features
       env:

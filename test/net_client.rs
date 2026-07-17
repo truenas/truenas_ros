@@ -25,8 +25,8 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{SocketAddr, SocketAddrV4, TcpListener};
-use std::os::fd::RawFd;
+use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -778,8 +778,10 @@ fn tcp_splice_bad_fd() {
 // the server runs `SSL_accept` in its handshake worker, the client runs
 // `SSL_connect` in its own — exactly the split a real consumer implements. The
 // library brings no TLS crate; these tests use OpenSSL as a dev-dependency.
-// Skips when the kernel lacks the `tls` ULP (or `FIXED_FD_INSTALL`); force on a
-// known-good host with `TRUENAS_ROS_REQUIRE_KTLS`.
+// Skips when the kernel lacks the `tls` ULP (or `FIXED_FD_INSTALL`), or when
+// libssl cannot engage kTLS at all ([`ktls_engages`] — Ubuntu ships OpenSSL
+// 3.0 without `enable-ktls`); force on a known-good host with
+// `TRUENAS_ROS_REQUIRE_KTLS`.
 
 use foreign_types::ForeignType; // Ssl::as_ptr for the raw BIO/SSL_connect path
 use openssl::ssl::{
@@ -979,14 +981,87 @@ fn confirm_ktls(fd: RawFd) -> Result<(), String> {
     Ok(())
 }
 
+/// `SSL_OP_ENABLE_KTLS` is best-effort: when OpenSSL cannot install kTLS it
+/// silently falls back to userspace TLS records — a libssl built without
+/// `enable-ktls` (Debian/Ubuntu only enable it from 3.2), a TLS 1.3 RX gap
+/// (OpenSSL < 3.2), or a kernel missing the `tls` module. The handshake then
+/// completes but `confirm_ktls` fails, every worker rejects, and the data-path
+/// tests would fail rather than skip. Probe once with a loopback handshake —
+/// the same acceptor, client context, and confirmation the tests use — so
+/// those tests can skip when this host's OpenSSL cannot engage kTLS.
+fn ktls_engages() -> &'static Result<(), String> {
+    static PROBE: std::sync::OnceLock<Result<(), String>> =
+        std::sync::OnceLock::new();
+    PROBE.get_or_init(|| {
+        let (cert, key) = self_signed();
+        let acceptor = ktls_acceptor(&cert, &key);
+        let listener =
+            TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        let addr = listener.local_addr().map_err(|e| e.to_string())?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (stream, _) = listener.accept().map_err(|e| e.to_string())?;
+            // The handshake helpers own (and close) the fd they are given;
+            // hand each a dup and let the `TcpStream`s keep the sockets.
+            // SAFETY: dup of a live fd.
+            let fd = unsafe { libc::dup(stream.as_raw_fd()) };
+            if fd < 0 {
+                return Err("dup".into());
+            }
+            ktls_server_handshake(fd, &acceptor)
+        });
+        let stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
+        // SAFETY: dup of a live fd (see above).
+        let fd = unsafe { libc::dup(stream.as_raw_fd()) };
+        if fd < 0 {
+            return Err("dup".into());
+        }
+        let client = ktls_client_handshake(fd, &ktls_client_ctx());
+        if client.is_err() {
+            drop(stream); // EOF unblocks a server still mid-handshake
+            let _ = server.join();
+            return client;
+        }
+        let served = server
+            .join()
+            .map_err(|_| "probe server panicked".to_string())?;
+        drop(stream); // keep the socket open until the server side confirmed
+        served
+    })
+}
+
+/// The OpenSSL-side skip for the kTLS data-path tests: `false` when this host
+/// engages kTLS end to end, `true` (with a visible note) when it cannot — or
+/// a hard failure when `TRUENAS_ROS_REQUIRE_KTLS` says skipping is forbidden.
+fn ktls_openssl_unsupported() -> bool {
+    match ktls_engages() {
+        Ok(()) => false,
+        Err(e) => {
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_KTLS").is_none(),
+                "TRUENAS_ROS_REQUIRE_KTLS set but {} cannot engage kTLS: {e}",
+                openssl::version::version(),
+            );
+            eprintln!(
+                "skipping kTLS data-path test: {} cannot engage kTLS ({e})",
+                openssl::version::version(),
+            );
+            true
+        }
+    }
+}
+
 /// Bind a kTLS `net::server` echo server whose handshake worker runs
 /// `SSL_accept`, run `client` on a spawned thread against its resolved address,
 /// and propagate the client's result. The kTLS mirror of [`with_server`]; skips
-/// cleanly when io_uring or the kernel TLS ULP is unavailable.
+/// cleanly when io_uring, the kernel TLS ULP, or OpenSSL-side kTLS is
+/// unavailable.
 fn with_ktls_server<ClientBody>(client: ClientBody)
 where
     ClientBody: FnOnce(SocketAddrV4) -> io::Result<()> + Send + 'static,
 {
+    if ktls_openssl_unsupported() {
+        return;
+    }
     let (cert, key) = self_signed();
     let acceptor = Arc::new(ktls_acceptor(&cert, &key));
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
