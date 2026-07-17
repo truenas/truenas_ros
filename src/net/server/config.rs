@@ -50,8 +50,13 @@ pub struct ServerConfig {
     /// bytes yet received — for longer than this, reclaiming its pool slot.
     /// `None` (the default) keeps idle connections open indefinitely. Enforced
     /// by a kernel `LINK_TIMEOUT` on the idle recv, so an idle connection costs
-    /// no timer wakeups until it either sends or expires. Does not interrupt a
-    /// message already in progress (see `request_timeout` to bound that).
+    /// no timer wakeups until it either sends or expires. Serving the peer
+    /// counts as activity: a completed send (a deferred reply flushing, a
+    /// push) restarts the quiet interval, so the connection is reaped only
+    /// after a full `idle_timeout` of neither receiving from nor sending to
+    /// the peer — never in the instant after a reply it was still waiting on.
+    /// Does not interrupt a message already in progress (see `request_timeout`
+    /// to bound that).
     pub idle_timeout: Option<Duration>,
     /// If set, close a connection whose in-progress request is not fully
     /// received within this duration, reclaiming its pool slot. Bounds a peer

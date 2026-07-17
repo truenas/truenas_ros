@@ -3469,6 +3469,12 @@ fn tcp_idle_timeout_keeps_pipelined_deferred_reply() {
     // reply before the next) hits this whenever the worker outlives
     // `idle_timeout`. At the default `max_in_flight_requests` no read-ahead is
     // armed during a defer, so this shape is pipelined-only.
+    //
+    // `WORK` being an exact multiple of `IDLE` also lands the final clock
+    // expiry in a photo-finish with the reply's flush and the client's
+    // immediate next request — the served-since-arm rule keeps every ordering
+    // of that race alive (pinned deterministically, with wide margins, by
+    // `tcp_idle_clock_resets_on_served_reply`).
     const IDLE: Duration = Duration::from_millis(100);
     const WORK: Duration = Duration::from_millis(400); // outlives IDLE 4x
     let cfg = ServerConfig {
@@ -3534,6 +3540,94 @@ fn tcp_idle_timeout_keeps_pipelined_deferred_reply() {
             // fire during the *second* defer).
             send_framed(&mut s, b"world")?;
             assert_eq!(recv_framed(&mut s)?, b"re:world");
+            Ok(())
+        })()
+        .expect("client io");
+        stop.shutdown();
+    });
+
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join");
+}
+
+#[test]
+fn tcp_idle_clock_resets_on_served_reply() {
+    // Regression — the deterministic form of the race its sibling above only
+    // hits on a slow box (where it flaked in CI): the idle clock rides the
+    // parked read-ahead recv from ARM time, so while a deferred reply is
+    // produced and flushed the clock keeps counting. Serving that reply is
+    // activity — the quiet interval must restart — yet a guard that only asks
+    // "owes work NOW?" sees nothing outstanding at the next expiry and reaps
+    // the connection out from under a client it served moments ago (the
+    // client's follow-up request then hits EOF/reset).
+    //
+    // Timeline pinned here, margins in the hundreds of ms so a loaded VM
+    // cannot flip any edge: the read-ahead parks at ~0 with the clock running;
+    // the deferred reply flushes at ~WORK (300 ms); the stale clock expires at
+    // ~IDLE (600 ms) — an interval that SAW a served reply, so it must re-arm
+    // a fresh quiet interval, not reap — and the client's second request lands
+    // at ~700 ms, inside that fresh interval, and must be answered.
+    const IDLE: Duration = Duration::from_millis(600);
+    const WORK: Duration = Duration::from_millis(300);
+    const CLIENT_PAUSE: Duration = Duration::from_millis(400);
+    let cfg = ServerConfig {
+        max_in_flight_requests: 2, // pipelined → read-ahead parks during defer
+        idle_timeout: Some(IDLE),
+        ..ServerConfig::default()
+    };
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: |req: Request<'_, ()>| {
+            let Request {
+                body, responder, ..
+            } = req;
+            let mut reply = b"re:".to_vec();
+            reply.extend_from_slice(&body);
+            let (deferred, permit) = responder.defer();
+            thread::spawn(move || {
+                thread::sleep(WORK);
+                deferred.reply(echo_frame(&reply));
+            });
+            Response::Defer(permit)
+        },
+    };
+    let mut server = match Server::with_config(
+        [ServerAddr::Tcp(
+            "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
+        )],
+        cfg,
+        proto,
+    ) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            send_framed(&mut s, b"hello")?;
+            assert_eq!(recv_framed(&mut s)?, b"re:hello");
+            // Idle across the stale clock's expiry (but well inside the fresh
+            // interval that expiry must start): served-then-quiet, the exact
+            // window the flag-less guard reaped.
+            thread::sleep(CLIENT_PAUSE);
+            send_framed(&mut s, b"world")?;
+            assert_eq!(
+                recv_framed(&mut s)?,
+                b"re:world",
+                "connection reaped in the quiet window after a served reply"
+            );
             Ok(())
         })()
         .expect("client io");
