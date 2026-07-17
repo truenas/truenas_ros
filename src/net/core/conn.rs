@@ -287,6 +287,14 @@ pub(crate) struct Connection<U> {
     // parked for the next request). Captured at arm time — a property of the
     // armed read; a kTLS continuation clears it (mid-message is never idle).
     pub recv_idle: bool,
+    // The peer was served — a send (reply or push) completed — since the idle
+    // clock was last armed. The clock runs from recv ARM time, so on a
+    // pipelined connection it keeps counting while a deferred reply is
+    // produced and flushed; a fire whose interval saw a completed send
+    // measured busy time, not quiet, and `finish_failed_recv` re-arms a fresh
+    // clock instead of reaping (the reap would race the served client's next
+    // request). Cleared each idle arm; set by `on_send_complete`.
+    pub served_since_idle_arm: bool,
     // ---- recv clock pairing (short-read disambiguation) ----
     // Whether the in-flight recv carries a linked idle/request clock
     // (`Op::RecvClock`). A cancelled `MSG_WAITALL` recv that had consumed
@@ -379,6 +387,7 @@ impl<U> Connection<U> {
             send_msg: unsafe { std::mem::zeroed() },
             recving: false,
             recv_idle: false,
+            served_since_idle_arm: false,
             recv_clock_armed: false,
             recv_clock_fired: None,
             recv_close_stash: None,

@@ -664,6 +664,10 @@ impl<U> Reactor<U> {
             let conn = self.table.conn_mut(slot);
             conn.recv_clock_armed = timeout_ts.is_some();
             conn.recv_clock_fired = None;
+            if idle {
+                // A fresh idle clock opens a new quiet interval.
+                conn.served_since_idle_arm = false;
+            }
         }
         match timeout_ts {
             None => self.stage(pack(op, slot, generation), move |sqe| {
@@ -969,6 +973,18 @@ impl<U> Reactor<U> {
     /// fire once it is genuinely idle (no work in flight) — so this reclaims a
     /// real slow-loris while never dropping an owed reply. A mid-message recv
     /// (buffered>0) is a real request stall — it closes ([`RecvStep::Done`]).
+    ///
+    /// `served_since_idle_arm` extends "owes work" to the fire that RACES the
+    /// finish of that work: the idle clock runs from recv ARM time, so it
+    /// keeps counting while a deferred reply is produced and flushed. A fire
+    /// whose interval saw a completed send measured busy time, not quiet — it
+    /// re-arms a fresh clock (clearing the flag) instead of reaping, which
+    /// otherwise races the just-served client's next request (observed as a
+    /// CI flake: reply flushed, clock expired, client's follow-up hit EOF).
+    /// Only a fire whose whole interval was quiet — nothing owed, nothing
+    /// flushed — closes. A peer can never set the flag itself (it marks
+    /// server-initiated sends), so an idle-forever connection still closes on
+    /// its first expiry.
     fn finish_failed_recv(
         &mut self,
         slot: u32,
@@ -982,7 +998,10 @@ impl<U> Reactor<U> {
             if matches!(reason, CloseReason::IdleTimeout) {
                 let owes_work = {
                     let c = self.table.conn(slot);
-                    c.outstanding > 0 || c.sending || c.has_pending_send()
+                    c.outstanding > 0
+                        || c.sending
+                        || c.has_pending_send()
+                        || c.served_since_idle_arm
                 };
                 if owes_work {
                     return Ok(RecvStep::Pump);
@@ -1148,6 +1167,9 @@ impl<U> Reactor<U> {
             let progress = conn.advance_sent(res as usize);
             conn.outstanding =
                 conn.outstanding.saturating_sub(progress.replies);
+            // Bytes flushed to the peer: any idle clock armed before this
+            // completion measured a non-quiet interval (`finish_failed_recv`).
+            conn.served_since_idle_arm = true;
             progress
         };
         stat!(self, replies, u64::from(progress.replies));
