@@ -56,8 +56,22 @@ set -eu
 # archive. The snapshot's Release file has long expired —
 # [check-valid-until=no] accepts it; package integrity still comes from the
 # archive signatures. The peercred version gate lives in qemu-4-test.sh.
+#
+# The cloud image ALREADY ships live trixie-backports inside its default
+# debian.sources (inert until some install requests that release — but two
+# sources claiming the same release make apt take the newest version across
+# BOTH indexes, which is how live 7.0.x once beat this pin). Strip that
+# suite so the pinned snapshot below is the ONLY trixie-backports source,
+# and fail loudly if any other source file still mentions it.
+sudo sed -i 's/ trixie-backports\b//g' /etc/apt/sources.list.d/debian.sources
 echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${KERNEL_APT_SNAPSHOT}/ trixie-backports main" \
   | sudo tee /etc/apt/sources.list.d/backports.list
+stray=$(grep -rl 'trixie-backports' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null \
+  | grep -v '/backports.list$' || true)
+if [ -n "$stray" ]; then
+  echo "ERROR: live trixie-backports still configured in: $stray"
+  exit 1
+fi
 sudo apt-get update
 
 sudo apt-get install -y \
@@ -93,10 +107,16 @@ sudo apt-get install -y \
 
 # The pinned kernel image + matching headers (required for the ZFS kmod
 # build against that kernel). GRUB boots the highest version on the reboot
-# below (6.18 > 6.12). Assert apt resolved the exact pinned version — a
-# drifted snapshot or resolver surprise must fail here, not as a mystery
-# ZFS build/modprobe failure later.
-sudo apt-get install -y -t trixie-backports linux-image-amd64 linux-headers-amd64
+# below (6.18 > 6.12). Install by EXACT version — not `-t trixie-backports`,
+# which selects by release name and would take a newer kernel if a second
+# backports source ever sneaks back in; the version-specific dependency
+# chain (linux-image-6.18.x+deb13-amd64, headers, kbuild) exists only in the
+# snapshot, so it resolves from there automatically. Then assert dpkg
+# agrees — a drifted snapshot or resolver surprise must fail here, not as a
+# mystery ZFS build/modprobe failure later.
+sudo apt-get install -y \
+  "linux-image-amd64=$KERNEL_DEB_VERSION" \
+  "linux-headers-amd64=$KERNEL_DEB_VERSION"
 got=$(dpkg-query -W -f='${Version}' linux-image-amd64)
 if [ "$got" != "$KERNEL_DEB_VERSION" ]; then
   echo "ERROR: pinned kernel $KERNEL_DEB_VERSION but apt installed '$got'"
