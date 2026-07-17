@@ -11,6 +11,10 @@ echo "Building OpenZFS and staging truenas_ros..."
 # Load VM info
 source /tmp/vm-info.sh
 
+# The kernel pin (see qemu-test.yml env: for the rationale and how to bump it)
+: "${KERNEL_APT_SNAPSHOT:?set by qemu-test.yml}"
+: "${KERNEL_DEB_VERSION:?set by qemu-test.yml}"
+
 # Wait for cloud-init to finish
 echo "Waiting for cloud-init to complete..."
 ssh debian@$VM_IP "cloud-init status --wait" || true
@@ -38,9 +42,36 @@ rsync -az --exclude='.git' --exclude='target/' \
 
 # Install dependencies (OpenZFS build deps + the Rust toolchain)
 echo "Installing dependencies in VM..."
-ssh debian@$VM_IP bash -s <<'REMOTE_DEPS'
+ssh debian@$VM_IP \
+  "KERNEL_APT_SNAPSHOT='$KERNEL_APT_SNAPSHOT' KERNEL_DEB_VERSION='$KERNEL_DEB_VERSION' bash -s" \
+  <<'REMOTE_DEPS'
 set -eu
 
+# Run CI on TrueNAS 26.0's kernel series (6.18) instead of Trixie's default
+# 6.12: OpenZFS 2.4 targets 6.18 and is unsupported on newer majors (ZFS on a
+# 7.x kernel is undefined behavior), and 6.18 exercises the statmount
+# 6.14/6.15 fields (sb_source, uid/gid maps) the fs tests need. Live
+# trixie-backports carries only its newest kernel (7.0.x now), so pull the
+# last 6.18 it ever shipped from a pinned snapshot.debian.org view of the
+# archive. The snapshot's Release file has long expired —
+# [check-valid-until=no] accepts it; package integrity still comes from the
+# archive signatures. The peercred version gate lives in qemu-4-test.sh.
+#
+# The cloud image ALREADY ships live trixie-backports inside its default
+# debian.sources (inert until some install requests that release — but two
+# sources claiming the same release make apt take the newest version across
+# BOTH indexes, which is how live 7.0.x once beat this pin). Strip that
+# suite so the pinned snapshot below is the ONLY trixie-backports source,
+# and fail loudly if any other source file still mentions it.
+sudo sed -i 's/ trixie-backports\b//g' /etc/apt/sources.list.d/debian.sources
+echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${KERNEL_APT_SNAPSHOT}/ trixie-backports main" \
+  | sudo tee /etc/apt/sources.list.d/backports.list
+stray=$(grep -rl 'trixie-backports' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null \
+  | grep -v '/backports.list$' || true)
+if [ -n "$stray" ]; then
+  echo "ERROR: live trixie-backports still configured in: $stray"
+  exit 1
+fi
 sudo apt-get update
 
 sudo apt-get install -y \
@@ -69,11 +100,29 @@ sudo apt-get install -y \
   python3-cffi \
   python3-setuptools \
   python3-sphinx \
-  linux-headers-amd64 \
   dkms \
   git \
   gdb \
   cargo
+
+# The pinned kernel image + matching headers (required for the ZFS kmod
+# build against that kernel). GRUB boots the highest version on the reboot
+# below (6.18 > 6.12). Install by EXACT version — not `-t trixie-backports`,
+# which selects by release name and would take a newer kernel if a second
+# backports source ever sneaks back in; the version-specific dependency
+# chain (linux-image-6.18.x+deb13-amd64, headers, kbuild) exists only in the
+# snapshot, so it resolves from there automatically. Then assert dpkg
+# agrees — a drifted snapshot or resolver surprise must fail here, not as a
+# mystery ZFS build/modprobe failure later.
+sudo apt-get install -y \
+  "linux-image-amd64=$KERNEL_DEB_VERSION" \
+  "linux-headers-amd64=$KERNEL_DEB_VERSION"
+got=$(dpkg-query -W -f='${Version}' linux-image-amd64)
+if [ "$got" != "$KERNEL_DEB_VERSION" ]; then
+  echo "ERROR: pinned kernel $KERNEL_DEB_VERSION but apt installed '$got'"
+  exit 1
+fi
+echo "Installed pinned kernel $got"
 REMOTE_DEPS
 
 # Reboot VM to boot into the newly installed kernel
@@ -116,9 +165,17 @@ for i in {1..60}; do
   sleep 5
 done
 
-# Verify VM is accessible and check kernel version
+# Verify the VM booted the pinned 6.18 kernel, not Trixie's default 6.12. A
+# silent fallback to 6.12 would under-test statmount and misreport peercred,
+# so the wrong series is a hard failure. (The exact deb version was already
+# asserted at install time; GRUB boots the highest installed version.)
 echo "Verifying new kernel is running..."
-ssh debian@$VM_IP "uname -r"
+booted=$(ssh debian@$VM_IP "uname -r")
+echo "Booted kernel: $booted"
+case "$booted" in
+  6.18.* | 6.18-*) echo "On the pinned 6.18 series as expected" ;;
+  *) echo "ERROR: expected the pinned 6.18 kernel, got '$booted'"; exit 1 ;;
+esac
 
 # Now build/install OpenZFS
 echo "Building OpenZFS..."
@@ -126,13 +183,22 @@ ssh debian@$VM_IP bash -s "$CACHED_ZFS" <<'REMOTE_SCRIPT'
 CACHED_ZFS="$1"
 set -eu
 
-# Install or build OpenZFS
-if [ -d "/tmp/zfs-debs" ] && [ "$(ls -A /tmp/zfs-debs/*.deb 2>/dev/null)" ]; then
+# Install or build OpenZFS. The cached debs contain kmods built for ONE
+# kernel: trust them only if their KERNEL marker matches the running kernel.
+# The cache key already includes the backports kernel version, so a mismatch
+# here means key drift — rebuild rather than install modules that can never
+# modprobe.
+if [ -d "/tmp/zfs-debs" ] && [ "$(ls -A /tmp/zfs-debs/*.deb 2>/dev/null)" ] \
+  && [ "$(cat /tmp/zfs-debs/KERNEL 2>/dev/null)" = "$(uname -r)" ]; then
   echo "Using cached OpenZFS packages..."
   sudo apt-get -y install $(find /tmp/zfs-debs -name '*.deb' | grep -Ev 'dkms|dracut')
   echo "Updating module dependencies..."
   sudo depmod -a
 else
+  if [ -d "/tmp/zfs-debs" ] && [ "$(ls -A /tmp/zfs-debs 2>/dev/null)" ]; then
+    echo "Cached OpenZFS packages unusable on kernel $(uname -r); rebuilding..."
+    rm -rf /tmp/zfs-debs
+  fi
   echo "Building OpenZFS from source..."
   cd /tmp
   git clone --depth 1 --branch truenas/zfs-2.4-release https://github.com/truenas/zfs.git
@@ -151,6 +217,8 @@ else
   find /tmp -maxdepth 1 -name '*.deb' | grep -Ev 'dkms|dracut' | while read deb; do
     cp "$deb" /tmp/zfs-debs/
   done
+  # Mark which kernel these kmods were built for (checked before reuse above).
+  uname -r > /tmp/zfs-debs/KERNEL
 
   sudo apt-get -y install $(find /tmp -maxdepth 1 -name '*.deb' | grep -Ev 'dkms|dracut')
   echo "Updating module dependencies..."

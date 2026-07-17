@@ -35,6 +35,16 @@ fsiter = ["fs", "mount"]
 namespace = []
 shutil = ["fsiter", "xattr"]
 configfile = ["fs"]
+# io_uring stream networking. `net-core` is the shared reactor engine + vocab;
+# `net-server` (inbound) and `net-client` (outbound) are the roles, each pulling
+# in the core. Kept out of `default` (io_uring-runtime-dependent, use-case-
+# specific); opt in via a role feature or `full`.
+net-core = []
+net-server = ["net-core"]
+net-client = ["net-core"]
+# Internal: exposes the pure `frame_step` framing decision to the fuzz crate
+# (`fuzz/`). Not for consumers; implies `net-server` (where `frame_step` lives).
+__fuzz = ["net-server"]
 full = [
     "fs",
     "xattr",
@@ -45,10 +55,20 @@ full = [
     "namespace",
     "shutil",
     "configfile",
+    "net-server",
+    "net-client",
 ]
 
 [dev-dependencies]
 tempfile = "3"
+# socket_server splice test only: a raw `pipe()` as the splice target. `libc`
+# is already the library's normal dependency, so this adds no new footprint.
+libc = { version = "0.2.155", features = ["extra_traits"] }
+# kTLS integration test only: a real TLS client/server around the kernel-TLS
+# transport. The library itself pulls no TLS crate — the consumer brings one.
+openssl = "0.10"
+openssl-sys = "0.9"
+foreign-types = "0.3" # ForeignType::as_ptr for the raw SSL_accept BIO dance
 
 [[test]]
 name = "test"
@@ -70,3 +90,48 @@ path = "test/zfs.rs"
 [[test]]
 name = "configparser_compat"
 path = "test/configparser_compat.rs"
+
+# io_uring stream server. Live loopback tests; skip automatically when io_uring
+# is unavailable (sandbox/old kernel). Set TRUENAS_ROS_REQUIRE_IO_URING=1 to
+# make that a hard failure instead.
+[[test]]
+name = "net_server"
+path = "test/net_server.rs"
+
+# io_uring stream client. Live loopback echo against an in-process net::server;
+# skips automatically when io_uring is unavailable (sandbox/old kernel). Set
+# TRUENAS_ROS_REQUIRE_IO_URING=1 to make that a hard failure instead.
+[[test]]
+name = "net_client"
+path = "test/net_client.rs"
+
+# Consumer-facing example: the socket_server handlers (esp. `accept`) as
+# standalone functions. Built only when the `socket_server` feature is on.
+[[example]]
+name = "tcp_accept_fn"
+required-features = ["net-server"]
+
+# Consumer-facing example: offloading the body handler to a worker pool via
+# `Response::Defer` (the library ships no pool). Feature-gated like above.
+[[example]]
+name = "tcp_offload"
+required-features = ["net-server"]
+
+# Consumer-facing example: multi-core via SO_REUSEPORT — N independent
+# single-ring servers (one per thread) sharing one address.
+[[example]]
+name = "tcp_multicore"
+required-features = ["net-server"]
+
+# Consumer-facing example: detaching a connection's socket fd to a worker for a
+# blocking op on the socket (e.g. a ZFS send/recv ioctl), then resume or close.
+[[example]]
+name = "tcp_detach"
+required-features = ["net-server"]
+
+# Consumer-facing example: the outbound `net::client` — fan out connections,
+# batch framed requests, and pump `next_event` — against an in-process
+# `net::server` echo (so it runs standalone). Needs both roles.
+[[example]]
+name = "tcp_client"
+required-features = ["net-server", "net-client"]

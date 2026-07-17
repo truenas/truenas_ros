@@ -15,7 +15,8 @@
 //! # Features
 //!
 //! Functionality is split into per-subsystem Cargo features (`fs`, `xattr`,
-//! `mount`, `acl`, `fhandle`, `fsiter`, `namespace`, `shutil`); `full` enables
+//! `mount`, `acl`, `fhandle`, `fsiter`, `namespace`, `shutil`, `configfile`,
+//! and the `net` stack: `net-core`/`net-server`/`net-client`); `full` enables
 //! them all.
 #![cfg(target_os = "linux")]
 #![allow(non_camel_case_types)]
@@ -68,3 +69,6 @@ pub mod shutil;
 
 #[cfg(feature = "configfile")]
 pub mod configfile;
+
+#[cfg(feature = "net-core")]
+pub mod net;
