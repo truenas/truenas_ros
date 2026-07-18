@@ -9,7 +9,7 @@ use crate::errno::{self, Errno};
 use crate::net::core::conn::{pack, Op, RecvOutcome};
 use crate::net::core::handles::stat;
 use crate::net::core::protocol::{CloseReason, Framing};
-use crate::net::core::sys::*;
+use crate::uring::sys::*;
 use std::os::fd::RawFd;
 
 /// Bytes to request per chunked (`Framing::More`) recv.

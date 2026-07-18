@@ -12,12 +12,14 @@
 //! Higher-level APIs return [`Result<T>`] (the rich [`Error`]); `Errno`
 //! converts into `Error` via `From`, so `?` bridges the two.
 //!
-//! # Features
+//! # Features and layout
 //!
-//! Functionality is split into per-subsystem Cargo features (`fs`, `xattr`,
-//! `mount`, `acl`, `fhandle`, `fsiter`, `namespace`, `shutil`, `configfile`,
-//! and the `net` stack: `net-core`/`net-server`/`net-client`); `full` enables
-//! them all.
+//! Functionality is split into per-subsystem Cargo features grouped under
+//! umbrella modules: [`sync_fs`] (blocking fs bindings — features `sync-fs`,
+//! `xattr`, `acl`, `fhandle`, `fsiter`, `shutil`), [`mount`] (mount topology
+//! and idmapped-mount support — features `mount`, `idmap`), [`configfile`],
+//! and the io_uring `net` stack (`net-core`/`net-server`/`net-client`);
+//! `full` enables them all.
 #![cfg(target_os = "linux")]
 #![allow(non_camel_case_types)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -43,32 +45,27 @@ pub use error::{Error, Result};
 pub use fd::AT_FDCWD;
 pub use path::TnPath;
 
-#[cfg(feature = "fs")]
-pub mod fs;
+#[cfg(any(
+    feature = "sync-fs",
+    feature = "xattr",
+    feature = "acl",
+    feature = "fhandle",
+    feature = "fsiter",
+    feature = "shutil"
+))]
+pub mod sync_fs;
 
-#[cfg(feature = "xattr")]
-pub mod xattr;
-
-#[cfg(feature = "mount")]
+#[cfg(any(feature = "mount", feature = "idmap"))]
 pub mod mount;
-
-#[cfg(feature = "acl")]
-pub mod acl;
-
-#[cfg(feature = "fhandle")]
-pub mod fhandle;
-
-#[cfg(feature = "fsiter")]
-pub mod iter;
-
-#[cfg(feature = "namespace")]
-pub mod namespace;
-
-#[cfg(feature = "shutil")]
-pub mod shutil;
 
 #[cfg(feature = "configfile")]
 pub mod configfile;
+
+#[cfg(feature = "uring")]
+mod uring;
+
+#[cfg(feature = "async-fs")]
+pub mod async_fs;
 
 #[cfg(feature = "net-core")]
 pub mod net;

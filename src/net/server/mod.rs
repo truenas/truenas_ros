@@ -452,19 +452,16 @@ pub use crate::net::core::reactor::{frame_step, FrameStep};
 use crate::errno::{self};
 use crate::error::Error;
 use crate::net::core::conn::{unpack, Op};
-use crate::net::core::handles::{
-    create_eventfd, HandshakeOutcome, LoopShared, StatsInner, WakeHandle,
-};
+use crate::net::core::handles::HandshakeOutcome;
 use crate::net::core::probe::{probe_ktls, probe_tcp_cmd, probe_unix_peercred};
 use crate::net::core::reactor::{KernelPads, Reactor};
-use crate::net::core::ring::Ring;
 use crate::net::core::sock;
-use crate::net::core::sys::*;
-use crate::net::core::table::ConnTable;
+use crate::uring::engine::Engine;
+use crate::uring::sys::*;
 use handles::Injected;
 use listen::listen_socket;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -599,8 +596,8 @@ where
             .saturating_add(1 + addrs.len() as u32)
             .next_power_of_two()
             .min(MAX_RING_ENTRIES);
-        let mut ring = Ring::new(entries)?;
-        ring.register_pool(cfg.pool_size)?;
+        // The shared engine: ring + pool + wake + the universal probe.
+        let mut engine = Engine::new(entries, cfg.pool_size)?;
 
         // Fail fast — before binding — on kernels whose io_uring can't serve
         // the per-connection peer-identity fetches; otherwise every affected
@@ -608,26 +605,24 @@ where
         if cfg.unix_peercred
             && addrs.iter().any(|l| matches!(l.addr, ServerAddr::Unix(_)))
         {
-            probe_unix_peercred(&mut ring)?;
+            probe_unix_peercred(&mut engine.ring)?;
         }
         if addrs
             .iter()
             .any(|l| matches!(l.addr, ServerAddr::Tcp(_) | ServerAddr::Tcp6(_)))
         {
-            probe_tcp_cmd(&mut ring)?;
+            probe_tcp_cmd(&mut engine.ring)?;
         }
         // Fail fast if kTLS was requested but the kernel lacks the `tls` ULP.
         if addrs.iter().any(|l| l.tls) {
             probe_ktls()?;
         }
-        // `FIXED_FD_INSTALL` (Linux ≥ 6.8) furnishes the real fd behind every
-        // kTLS handshake and every `Response::Detach`. kTLS is known now —
-        // fail construction; Detach is a runtime decision, so the flag is
-        // kept and checked when a detach handler is installed
-        // (`serve_forever`).
-        let fixed_fd_install =
-            crate::net::core::probe::probe_fixed_fd_install(&ring);
-        if !fixed_fd_install && addrs.iter().any(|l| l.tls) {
+        // `FIXED_FD_INSTALL` (Linux ≥ 6.8, probed by `Engine::new`) furnishes
+        // the real fd behind every kTLS handshake and every
+        // `Response::Detach`. kTLS is known now — fail construction; Detach is
+        // a runtime decision, so the flag is kept and checked when a detach
+        // handler is installed (`serve_forever`).
+        if !engine.fixed_fd_install && addrs.iter().any(|l| l.tls) {
             return Err(Error::Validation(
                 "kTLS listeners require IORING_OP_FIXED_FD_INSTALL \
                  (Linux ≥ 6.8); this kernel's io_uring does not support it"
@@ -659,7 +654,6 @@ where
             tv_nsec: d.subsec_nanos() as i64,
         };
         let pads = Box::new(KernelPads {
-            wake_buf: 0,
             deadline: KernelTimespec::default(),
             accept_retry: ts_of(Duration::from_millis(ACCEPT_RETRY_MS)),
             idle_timeout: cfg.idle_timeout.map(ts_of).unwrap_or_default(),
@@ -671,32 +665,14 @@ where
                 .unwrap_or_default(),
         });
 
-        let shared = Arc::new(LoopShared {
-            stop: AtomicBool::new(false),
-            graceful: AtomicBool::new(false),
-            grace_ms: AtomicU64::new(0),
-            wake: WakeHandle {
-                fd: create_eventfd()?,
-            },
-        });
         let (inject_tx, inject_rx) = mpsc::channel();
         let (handshake_tx, handshake_rx) = mpsc::channel();
 
-        // The role-agnostic engine. `on_close` starts unset (installed by
-        // `set_close_hook`); `cfg.to_core()` projects the engine-read knobs.
-        let core = Reactor {
-            table: ConnTable::new(cfg.pool_size),
-            cfg: cfg.to_core(),
-            stats: Arc::new(StatsInner::default()),
-            shared,
-            pads,
-            on_close: None,
-            inflight: 0,
-            draining: false,
-            fixed_fd_install,
-            pool_freed: false,
-            ring,
-        };
+        // The stream reactor over the engine. `on_close` starts unset
+        // (installed by `set_close_hook`); `cfg.to_core()` projects the
+        // engine-read knobs.
+        let core =
+            Reactor::from_parts(engine, cfg.pool_size, cfg.to_core(), pads);
         Ok(Server {
             core,
             handlers: Handlers {
@@ -731,7 +707,8 @@ where
         // detach needs `IORING_OP_FIXED_FD_INSTALL` (Linux ≥ 6.8; probed at
         // construction). Fail here with a clear error instead of closing
         // every detached connection with a mysterious EINVAL at runtime.
-        if self.handlers.detach.is_some() && !self.core.fixed_fd_install {
+        if self.handlers.detach.is_some() && !self.core.engine.fixed_fd_install
+        {
             return Err(Error::Validation(
                 "Response::Detach requires IORING_OP_FIXED_FD_INSTALL \
                  (Linux ≥ 6.8); this kernel's io_uring does not support it"
@@ -751,14 +728,14 @@ where
 
     fn run_loop(&mut self) -> errno::Result<()> {
         while !self.core.stopping() {
-            if self.core.inflight == 0 {
+            if self.core.engine.inflight == 0 {
                 break; // nothing outstanding; avoid blocking forever
             }
             // submit_and_wait always enters with GETEVENTS, which also flushes
             // any IORING_SQ_CQ_OVERFLOW backlog, so completions can't be
             // stranded even under NODROP.
-            self.core.ring.submit_and_wait(1)?;
-            while let Some(cqe) = self.core.ring.reap() {
+            self.core.engine.ring.submit_and_wait(1)?;
+            while let Some(cqe) = self.core.engine.ring.reap() {
                 self.dispatch(cqe)?;
                 // A slot freed during this dispatch (`Reactor::reclaim_slot`
                 // raised the flag): re-arm any listener parked on a full pool.
@@ -782,7 +759,8 @@ where
         // (turning a fatal-error return into a hang in `serve_forever` and
         // `Drop`).
         if cqe.flags & IORING_CQE_F_MORE == 0 {
-            self.core.inflight = self.core.inflight.saturating_sub(1);
+            self.core.engine.inflight =
+                self.core.engine.inflight.saturating_sub(1);
         }
         match op {
             // For accept ops the slot field carries the listener index.
@@ -808,7 +786,7 @@ where
             // stop — `serve_forever`'s drain cancels whatever remains.
             Some(Op::Deadline) => {
                 if self.core.draining && !self.core.stopping() {
-                    self.core.shared.stop.store(true, Ordering::Release);
+                    self.core.engine.shared.stop.store(true, Ordering::Release);
                 }
             }
             // A peer-identity fetch — the slot's PendingPeer pad says which.
@@ -873,7 +851,7 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     /// thread. Obtain it before calling `serve_forever`.
     pub fn shutdown_handle(&self) -> ShutdownHandle {
         ShutdownHandle {
-            shared: Arc::clone(&self.core.shared),
+            shared: Arc::clone(&self.core.engine.shared),
         }
     }
 
@@ -943,8 +921,9 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Drop
     fn drop(&mut self) {
         // If `serve_forever` ran it already drained (no-op here); otherwise
         // (early drop / panic unwind) ensure no op is in flight before the
-        // buffers and ring are freed.
-        let _ = self.core.cancel_and_reap_all();
+        // buffers and ring are freed — and if that drain fails, leak the
+        // buffers rather than free them under a still-live op.
+        self.core.drain_or_leak();
     }
 }
 
@@ -955,8 +934,8 @@ impl<U, AcceptFn, HeaderFn, BodyFn> std::fmt::Debug
         f.debug_struct("Server")
             .field("addrs", &self.local_addrs())
             .field("cfg", &self.cfg)
-            .field("inflight", &self.core.inflight)
-            .field("ring", &self.core.ring)
+            .field("inflight", &self.core.engine.inflight)
+            .field("ring", &self.core.engine.ring)
             .finish_non_exhaustive()
     }
 }

@@ -5,8 +5,8 @@
 use crate::errno::Errno;
 use crate::error::Error;
 use crate::fd::owned_from_raw;
-use crate::net::core::ring::Ring;
-use crate::net::core::sys::*;
+use crate::uring::ring::Ring;
+use crate::uring::sys::*;
 use std::mem::size_of;
 use std::os::fd::AsRawFd;
 
@@ -96,12 +96,14 @@ pub(crate) fn probe_unix_peercred(ring: &mut Ring) -> crate::Result<()> {
     )))
 }
 
-/// Probe whether this kernel routes socket `URING_CMD`s for TCP (Linux ≥
-/// 6.7) — the per-connection `SO_PEERNAME` fetch every TCP accept depends on.
-/// A `SIOCOUTQ` command on a fresh, unconnected TCP socket needs no
-/// bind/connect: it returns 0 (empty send queue) where supported and an error
-/// where not, turning "every TCP connection mysteriously shed" into an
-/// immediate, actionable construction error.
+/// Probe whether this kernel serves the socket `GETSOCKOPT` `URING_CMD`
+/// (Linux ≥ 6.8) — the exact command every TCP accept's per-connection
+/// `SO_PEERNAME` fetch issues. Probing the real command (not the older
+/// `SIOCOUTQ`, which landed a release earlier) is what makes this guarantee
+/// hold: a `SO_TYPE` getsockopt on a fresh, unconnected TCP socket needs no
+/// bind/connect and returns the 4-byte type where supported, completing with
+/// `-EOPNOTSUPP` where not — turning "every TCP connection mysteriously shed"
+/// into an immediate, actionable construction error.
 pub(crate) fn probe_tcp_cmd(ring: &mut Ring) -> crate::Result<()> {
     // SAFETY: standard socket() call; result checked against the sentinel.
     let raw = Errno::result(unsafe {
@@ -109,12 +111,18 @@ pub(crate) fn probe_tcp_cmd(ring: &mut Ring) -> crate::Result<()> {
     })?;
     // SAFETY: socket() returned a fresh owned fd.
     let sock = unsafe { owned_from_raw(raw) };
-    // SIOCOUTQ takes no operands and writes no user memory, so the early
-    // error returns below leave nothing for the kernel to dangle on.
+    // The kernel writes the 4-byte option value into `val` while the command is
+    // in flight; the Box keeps its address stable and it outlives the reap.
+    let mut val: Box<i32> = Box::new(0);
+    let optval = std::ptr::addr_of_mut!(*val) as u64;
     ring.push_sqe(|sqe| {
-        sqe.opcode = IORING_OP_URING_CMD;
+        fill_getsockopt_cmd(
+            sqe,
+            libc::SO_TYPE,
+            optval,
+            size_of::<i32>() as u32,
+        );
         sqe.fd = sock.as_raw_fd();
-        sqe.off_addr2 = u64::from(SOCKET_URING_OP_SIOCOUTQ);
         sqe.user_data = u64::MAX; // reaped below; never reaches the loop
     })?;
     let res = loop {
@@ -125,13 +133,14 @@ pub(crate) fn probe_tcp_cmd(ring: &mut Ring) -> crate::Result<()> {
             break cqe.res;
         }
     };
+    drop(val);
     drop(sock);
     if res >= 0 {
         return Ok(());
     }
     Err(Error::Validation(format!(
-        "TCP listeners require io_uring socket commands (Linux ≥ 6.7) for \
-         per-connection peer addresses; probe got {}",
+        "TCP listeners require io_uring socket GETSOCKOPT commands (Linux ≥ \
+         6.8) for per-connection peer addresses; probe got {}",
         Errno::from_raw(-res)
     )))
 }
@@ -182,43 +191,4 @@ pub(crate) fn probe_ktls() -> crate::Result<()> {
         "kTLS listeners require the kernel TLS ULP (CONFIG_TLS / the `tls` \
          module); the setsockopt(TCP_ULP=\"tls\") probe got {err}"
     )))
-}
-
-/// Whether this kernel's io_uring supports `IORING_OP_FIXED_FD_INSTALL`
-/// (Linux ≥ 6.8) — required to furnish a real fd for every kTLS handshake
-/// (`Op::FdInstall`) and every connection detach (`Op::DetachInstall`).
-/// Without this probe, a 6.7 kernel passes the socket-cmd and TLS-ULP probes
-/// and then fails opcode 54 with `-EINVAL` at runtime: every kTLS accept is
-/// silently shed and every `Response::Detach` closes its connection — the
-/// mysterious failure mode this module exists to prevent.
-///
-/// Asks via `IORING_REGISTER_PROBE` (a control syscall on the already-built
-/// ring; available far below our 6.7 floor), which reports per-opcode support
-/// without executing anything. Any register failure reads as "unsupported" —
-/// fail closed; the callers turn `false` into a clear validation error.
-pub(crate) fn probe_fixed_fd_install(ring: &Ring) -> bool {
-    #[repr(C)]
-    struct ProbeBuf {
-        header: IoUringProbeHeader,
-        ops: [IoUringProbeOp; 256],
-    }
-    // SAFETY: all-integer plain data; zeroed is a valid initial value (the
-    // kernel requires the probe argument zeroed and fills it).
-    let mut buf: Box<ProbeBuf> = Box::new(unsafe { std::mem::zeroed() });
-    // SAFETY: `buf` is a valid, zeroed probe argument sized for 256 op
-    // entries, live across the call; the ring fd is live.
-    let rc = unsafe {
-        io_uring_register(
-            ring.raw_fd(),
-            IORING_REGISTER_PROBE,
-            (&mut *buf as *mut ProbeBuf).cast(),
-            buf.ops.len() as u32,
-        )
-    };
-    if rc.is_err() {
-        return false;
-    }
-    let op = IORING_OP_FIXED_FD_INSTALL;
-    buf.header.last_op >= op
-        && buf.ops[op as usize].flags & IO_URING_OP_SUPPORTED != 0
 }

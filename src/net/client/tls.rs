@@ -15,10 +15,10 @@ use super::event::{ConnId, Event};
 use super::Client;
 use crate::errno::{self, Errno};
 use crate::net::core::conn::{pack, Connection, Op};
-use crate::net::core::handles::LoopShared;
 use crate::net::core::protocol::{ClientAddr, Framing, ServerAddr};
-use crate::net::core::sys::*;
 use crate::net::core::table::PendingConnect;
+use crate::uring::sys::*;
+use crate::uring::wake::LoopShared;
 use std::os::fd::RawFd;
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
@@ -220,7 +220,7 @@ where
             slot,
             generation: gen64,
             tx: self.handshake_tx.clone(),
-            shared: Arc::clone(&self.core.shared),
+            shared: Arc::clone(&self.core.engine.shared),
             done: false,
         };
         let conn = ConnId::new(slot, gen64);

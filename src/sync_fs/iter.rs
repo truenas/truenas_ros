@@ -21,7 +21,7 @@
 //! left off:
 //!
 //! ```no_run
-//! # use truenas_ros::iter::{Cookie, FsIterBuilder};
+//! # use truenas_ros::sync_fs::iter::{Cookie, FsIterBuilder};
 //! # let saved_bytes: Vec<u8> = Vec::new();
 //! let cookie = Cookie::from_bytes(&saved_bytes).unwrap();
 //! let it = FsIterBuilder::new("/mnt/tank", "tank")
@@ -41,10 +41,10 @@
 use crate::errno::{self, retry_on_eintr, Errno};
 use crate::error::{Error, Result};
 use crate::fd::owned_from_raw;
-use crate::fs::{
+use crate::mount::{statmount, StatmountMask};
+use crate::sync_fs::{
     openat2, statx, AtFlags, OFlag, OpenHow, ResolveFlag, Statx, StatxMask,
 };
-use crate::mount::{statmount, StatmountMask};
 use crate::AT_FDCWD;
 use std::ffi::{CStr, OsStr, OsString};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
@@ -74,13 +74,18 @@ fn how(flags: OFlag, resolve: ResolveFlag) -> OpenHow {
 pub enum EntryType {
     /// A directory (the iterator descends into it unless `skip_descent`).
     Dir,
-    /// A regular file (or any non-dir, non-link, non-mount object).
+    /// A regular file.
     File,
     /// A symbolic link (only yielded with `include_symlinks`; fd is `O_PATH`).
     Symlink,
     /// A child mountpoint (only with `include_mountpoints`; fd is `O_PATH`,
     /// never descended into).
     Mountpoint,
+    /// A special file — a FIFO, socket, or block/character device. Its `fd` is
+    /// not for data I/O (a FIFO read would block, a socket can't be opened that
+    /// way); read the type/mode from [`Entry::statx`] and recreate it by type
+    /// rather than copying contents.
+    Special,
 }
 
 /// One directory level on the traversal stack.
@@ -294,6 +299,11 @@ impl Entry {
         self.file_type == EntryType::Mountpoint
     }
 
+    /// True if this is a special file (FIFO, socket, or device).
+    pub fn is_special(&self) -> bool {
+        self.file_type == EntryType::Special
+    }
+
     /// The `statx` result gathered when the entry was opened.
     pub fn statx(&self) -> &Statx {
         &self.statx
@@ -301,9 +311,11 @@ impl Entry {
 
     /// Borrow the entry's open file descriptor.
     ///
-    /// For [`EntryType::Symlink`] / [`EntryType::Mountpoint`] this is an
-    /// `O_PATH` fd — usable with `statx` and [`Entry::read_link`] but not for
-    /// data I/O.
+    /// For [`EntryType::Symlink`], [`EntryType::Mountpoint`], and
+    /// [`EntryType::Special`] this is not a data-I/O fd — it is an `O_PATH`
+    /// handle (a special file may instead be a non-blocking one) usable with
+    /// `statx` and [`Entry::read_link`]. Read file data only from an
+    /// [`EntryType::File`] fd.
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
@@ -403,15 +415,29 @@ impl FsIter {
     fn process(&mut self, dirent: &DirEntry) -> Result<Option<Entry>> {
         let is_dir_hint = dirent.d_type == libc::DT_DIR;
         let is_lnk = dirent.d_type == libc::DT_LNK;
+        // A FIFO/socket/device that `readdir` already identified: open it
+        // `O_PATH` so the walk never issues a blocking read-open (a writer-less
+        // FIFO would hang forever) and never runs a device's `open` method.
+        let is_special_hint = matches!(
+            dirent.d_type,
+            libc::DT_FIFO | libc::DT_SOCK | libc::DT_BLK | libc::DT_CHR
+        );
         if is_lnk && !self.include_symlinks {
             return Ok(None);
         }
         let open_flags = if is_dir_hint {
             DIR_OFLAGS
-        } else if is_lnk {
+        } else if is_lnk || is_special_hint {
             OPATH_OFLAGS
         } else {
-            self.file_open_flags
+            // A regular file, or an entry whose type `readdir` didn't report
+            // (`DT_UNKNOWN`). Open it readably, but add `O_NONBLOCK`: if it is
+            // really a FIFO — a filesystem that doesn't fill `d_type`, or an
+            // entry swapped under us between `readdir` and here — the open
+            // returns immediately instead of blocking on an absent writer.
+            // `O_NONBLOCK` has no effect on regular-file reads, so a regular
+            // file's handed-back fd behaves normally.
+            self.file_open_flags | OFlag::O_NONBLOCK
         };
 
         let parent = self.stack.last().unwrap().path.clone();
@@ -437,12 +463,23 @@ impl FsIter {
                         Err(e) => return Err(e.into()),
                     }
                 }
+                // A socket can't be opened through the filesystem (`ENXIO`) and
+                // `readdir` didn't flag it (`DT_UNKNOWN`). Grab an `O_PATH`
+                // handle so the walk classifies it instead of aborting.
+                Err(Errno::ENXIO) if !is_dir_hint && !is_lnk => {
+                    match openat2(dfd, name, how(OPATH_OFLAGS, ITER_RESOLVE)) {
+                        Ok(fd) => (fd, false),
+                        Err(Errno::ELOOP | Errno::ENOENT) => return Ok(None),
+                        Err(e) => return Err(e.into()),
+                    }
+                }
                 // Per-file access denial on a regular file: retry O_RDONLY so
                 // the caller still gets a usable fd; skip if that also fails.
                 Err(Errno::EPERM | Errno::EACCES)
                     if !is_dir_hint && !is_lnk =>
                 {
-                    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW;
+                    let flags =
+                        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
                     match openat2(dfd, name, how(flags, ITER_RESOLVE)) {
                         Ok(fd) => (fd, false),
                         Err(_) => return Ok(None),
@@ -470,8 +507,11 @@ impl FsIter {
             EntryType::Symlink
         } else if is_dir {
             EntryType::Dir
-        } else {
+        } else if st.is_regular() {
             EntryType::File
+        } else {
+            // FIFO, socket, or block/character device.
+            EntryType::Special
         };
 
         // Descend into real directories (never into a crossed mountpoint).

@@ -15,8 +15,9 @@ use crate::net::core::protocol::ClientAddr;
 use crate::net::core::protocol::ServerAddr;
 #[cfg(feature = "net-client")]
 use crate::net::core::sock::SockAddr;
+use crate::uring::slots::SlotEntry;
 #[cfg(feature = "net-client")]
-use crate::net::core::sys::KernelTimespec;
+use crate::uring::sys::KernelTimespec;
 
 /// The landing pad for a post-accept peer-identity fetch: stable boxed
 /// storage the kernel writes while the `URING_CMD` is in flight, held in the
@@ -116,21 +117,12 @@ pub(crate) enum SlotState<U> {
     Detached(Box<Connection<U>>),
 }
 
-/// A slot plus the generation guarding its reuse. The generation is `u64` so a
-/// long-retained cross-thread handle (a `Deferred`/`PushHandle`, which travels
-/// by channel — not `user_data`) can never alias a future incarnation of the
-/// same slot after 2^32 recycles. The kernel routing token packs only its low
-/// 32 bits, which is ample there: a completion never outlives its op's
-/// incarnation (the slot frees only at `ops == 0`), so the low bits match
-/// exactly.
-pub(crate) struct SlotEntry<U> {
-    pub(crate) generation: u64,
-    pub(crate) state: SlotState<U>,
-}
-
-/// All pool slots plus the live-connection count.
+/// All pool slots plus the live-connection count. Each slot rides the shared
+/// generation-guarded [`SlotEntry`] (see its doc for the u64-generation /
+/// low-32-kernel-token split; here the handles that carry the full width are
+/// `Deferred`/`PushHandle`, and a connection's slot frees only at `ops == 0`).
 pub(crate) struct ConnTable<U> {
-    slots: Vec<SlotEntry<U>>,
+    slots: Vec<SlotEntry<SlotState<U>>>,
     active: u32,
 }
 
@@ -501,6 +493,17 @@ impl<U> ConnTable<U> {
         true
     }
 
+    /// Leak every slot without running its destructors: the per-connection
+    /// recv/send buffers and boxed peer-fetch pads stay allocated forever
+    /// instead of being freed. Used only on the teardown path when the ring
+    /// drain failed and the kernel may still have an in-flight op writing into
+    /// one of those buffers — leaking keeps the addresses permanently valid
+    /// (memory-safe), where freeing would risk a write into reused heap.
+    pub(crate) fn leak(&mut self) {
+        std::mem::forget(std::mem::take(&mut self.slots));
+        self.active = 0;
+    }
+
     /// Empty the slot (whatever its state) and bump its generation so
     /// outstanding tokens go stale. Returns whether a live connection was freed
     /// — `Serving` or a detach state (the caller counts those; peer fetches and
@@ -526,7 +529,7 @@ impl<U> ConnTable<U> {
     /// All entries with their slot numbers (for drain sweeps).
     pub(crate) fn iter(
         &self,
-    ) -> impl Iterator<Item = (u32, &SlotEntry<U>)> + '_ {
+    ) -> impl Iterator<Item = (u32, &SlotEntry<SlotState<U>>)> + '_ {
         self.slots
             .iter()
             .enumerate()

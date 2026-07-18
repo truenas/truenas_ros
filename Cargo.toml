@@ -15,44 +15,58 @@ bitflags = "2.6"
 [features]
 # Default enables the implemented subsystems; more join as phases land.
 default = [
-    "fs",
+    "sync-fs",
     "xattr",
     "mount",
     "acl",
     "fhandle",
     "fsiter",
-    "namespace",
+    "idmap",
     "shutil",
     "configfile",
 ]
 
-fs = []
+# Blocking filesystem bindings (the `sync_fs` umbrella): `sync-fs` is the base
+# syscall layer at the umbrella root; each sibling feature gates one `sync_fs::`
+# submodule. `mount` + `idmap` (the userns builder feeding idmapped mounts) form
+# the `mount` umbrella.
+sync-fs = []
 xattr = []
-mount = ["fs"]
-fhandle = ["fs"]
+mount = ["sync-fs"]
+fhandle = ["sync-fs"]
 acl = ["xattr"]
-fsiter = ["fs", "mount"]
-namespace = []
+fsiter = ["sync-fs", "mount"]
+idmap = []
 shutil = ["fsiter", "xattr"]
-configfile = ["fs"]
-# io_uring stream networking. `net-core` is the shared reactor engine + vocab;
-# `net-server` (inbound) and `net-client` (outbound) are the roles, each pulling
-# in the core. Kept out of `default` (io_uring-runtime-dependent, use-case-
-# specific); opt in via a role feature or `full`.
-net-core = []
+configfile = ["sync-fs"]
+# The shared io_uring engine (`src/uring`): raw UAPI, ring, SQE staging,
+# wake, slot generations, the user_data codec. Internal — enabled transitively
+# by the domains built on it (the net stack today, async-fs next); not a
+# public API surface.
+uring = []
+# io_uring stream networking. `net-core` is the stream reactor + vocab over
+# the engine; `net-server` (inbound) and `net-client` (outbound) are the
+# roles, each pulling in the core. Kept out of `default` (io_uring-runtime-
+# dependent, use-case-specific); opt in via a role feature or `full`.
+net-core = ["uring"]
 net-server = ["net-core"]
 net-client = ["net-core"]
+# The io_uring filesystem reactor (design stub — the module documents the
+# charter; implementation lands per the fs-reactor design and will grow a
+# `sync-fs` dependency for the shared open/statx vocabulary). Kept out of
+# `default`/`full` until real.
+async-fs = ["uring"]
 # Internal: exposes the pure `frame_step` framing decision to the fuzz crate
 # (`fuzz/`). Not for consumers; implies `net-server` (where `frame_step` lives).
 __fuzz = ["net-server"]
 full = [
-    "fs",
+    "sync-fs",
     "xattr",
     "mount",
     "fhandle",
     "acl",
     "fsiter",
-    "namespace",
+    "idmap",
     "shutil",
     "configfile",
     "net-server",
@@ -61,8 +75,8 @@ full = [
 
 [dev-dependencies]
 tempfile = "3"
-# socket_server splice test only: a raw `pipe()` as the splice target. `libc`
-# is already the library's normal dependency, so this adds no new footprint.
+# net splice tests only: a raw `pipe()` as the splice target. `libc` is
+# already the library's normal dependency, so this adds no new footprint.
 libc = { version = "0.2.155", features = ["extra_traits"] }
 # kTLS integration test only: a real TLS client/server around the kernel-TLS
 # transport. The library itself pulls no TLS crate — the consumer brings one.
@@ -105,8 +119,8 @@ path = "test/net_server.rs"
 name = "net_client"
 path = "test/net_client.rs"
 
-# Consumer-facing example: the socket_server handlers (esp. `accept`) as
-# standalone functions. Built only when the `socket_server` feature is on.
+# Consumer-facing example: the `net::server` handlers (esp. `accept`) as
+# standalone functions. Built only when the `net-server` feature is on.
 [[example]]
 name = "tcp_accept_fn"
 required-features = ["net-server"]

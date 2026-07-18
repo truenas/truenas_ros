@@ -73,7 +73,7 @@ where
         AT_FDCWD,
         parent,
         OpenHow::new()
-            .flags(OFlag::O_DIRECTORY)
+            .flags(OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
             .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
     ) {
         Ok(fd) => fd,
@@ -180,7 +180,8 @@ fn create_temp(
             OFlag::O_CREAT
                 | OFlag::O_EXCL
                 | OFlag::O_WRONLY
-                | OFlag::O_NOFOLLOW,
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_CLOEXEC,
         )
         .mode(Mode::from_bits_truncate(mode as libc::mode_t))
         .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS);

@@ -24,20 +24,15 @@ pub use event::{ConnId, ConnectOpts, Event, RequestId};
 pub use tls::{ConnectDeferral, TlsConnectContext};
 
 use crate::net::core::conn::{unpack, Op};
-use crate::net::core::handles::{
-    create_eventfd, LoopShared, StatsInner, WakeHandle,
-};
-use crate::net::core::probe::{probe_fixed_fd_install, probe_ktls};
+use crate::net::core::probe::probe_ktls;
 use crate::net::core::protocol::{CloseReason, Framing};
 use crate::net::core::reactor::{KernelPads, Reactor};
-use crate::net::core::ring::Ring;
-use crate::net::core::sys::*;
-use crate::net::core::table::ConnTable;
+use crate::uring::engine::Engine;
+use crate::uring::sys::*;
 use io::PendingSplice;
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 use tls::{HandshakeResult, TlsConnectFn};
 
 /// Kernel cap on SQ ring entries.
@@ -96,6 +91,12 @@ where
     // stack box. Kept off the shared `KernelPads` so it can never alias the
     // core's own timers.
     deadline_pad: Box<KernelTimespec>,
+    // Whether a `next_event_timeout` deadline is currently in flight. A call
+    // that unwinds on a fatal ring error returns with its deadline unreaped;
+    // the next call reaps it before staging a fresh one, so two identical-
+    // `user_data` deadlines never coexist (a stale one would masquerade as the
+    // new call's and return a premature `None`).
+    deadline_inflight: bool,
 }
 
 impl<U, F> Client<U, F>
@@ -128,20 +129,17 @@ where
             .saturating_add(2)
             .next_power_of_two()
             .min(MAX_RING_ENTRIES);
-        let ring = Ring::new(entries)?;
-        ring.register_pool(config.pool_size)?;
-
-        // `FIXED_FD_INSTALL` (Linux >= 6.8) furnishes the real fd behind a kTLS
-        // handshake; the TLS ULP is what makes kTLS work at all. Probe both once
-        // and keep the flags (a runtime decision, like the server's detach) —
-        // a `tls` connect on a kernel missing either fails cleanly, while a
-        // plain-TCP client is unaffected.
-        let fixed_fd_install = probe_fixed_fd_install(&ring);
+        // The shared engine: ring + pool + wake + the `FIXED_FD_INSTALL`
+        // probe (Linux >= 6.8 — furnishes the real fd behind a kTLS
+        // handshake). The TLS ULP is what makes kTLS work at all; probe it
+        // once and keep the flag (a runtime decision, like the server's
+        // detach) — a `tls` connect on a kernel missing either fails cleanly,
+        // while a plain-TCP client is unaffected.
+        let engine = Engine::new(entries, config.pool_size)?;
         let ktls_supported = probe_ktls().is_ok();
 
         let ts_of = connect::ts_of; // shared duration → timespec clamp
         let pads = Box::new(KernelPads {
-            wake_buf: 0,
             deadline: KernelTimespec::default(),
             // Client-unused (only a server arms accept retries). The connect
             // timeout is per-connect, stored in each `PendingConnect`.
@@ -158,28 +156,12 @@ where
                 .unwrap_or_default(),
         });
 
-        let shared = Arc::new(LoopShared {
-            stop: AtomicBool::new(false),
-            graceful: AtomicBool::new(false),
-            grace_ms: AtomicU64::new(0),
-            wake: WakeHandle {
-                fd: create_eventfd()?,
-            },
-        });
-
-        let core = Reactor {
-            table: ConnTable::new(config.pool_size),
-            cfg: config.to_core(),
-            stats: Arc::new(StatsInner::default()),
-            shared,
+        let core = Reactor::from_parts(
+            engine,
+            config.pool_size,
+            config.to_core(),
             pads,
-            on_close: None,
-            inflight: 0,
-            draining: false,
-            fixed_fd_install,
-            pool_freed: false,
-            ring,
-        };
+        );
         let (handshake_tx, handshake_rx) = mpsc::channel();
         Ok(Client {
             core,
@@ -196,6 +178,7 @@ where
             ktls_supported,
             cfg: config,
             deadline_pad: Box::new(KernelTimespec::default()),
+            deadline_inflight: false,
         })
     }
 
@@ -229,7 +212,7 @@ where
     /// A plain-TCP client never arms the wake, so this stays `inflight == 0`.
     fn no_live_work(&self) -> bool {
         self.parked_handshakes == 0
-            && self.core.inflight == u64::from(self.wake_armed)
+            && self.core.engine.inflight == u64::from(self.wake_armed)
     }
 
     /// A wake poke was heard (a handshake worker handed back an outcome): drain
@@ -315,7 +298,8 @@ where
         // Count the CQE off `inflight` before its handler runs (the arms
         // `?`-propagate; a skipped decrement would hang `cancel_and_reap_all`).
         if cqe.flags & IORING_CQE_F_MORE == 0 {
-            self.core.inflight = self.core.inflight.saturating_sub(1);
+            self.core.engine.inflight =
+                self.core.engine.inflight.saturating_sub(1);
         }
         match op {
             // An outbound connect completed (`cqe.res == 0` up, `< 0` failed).
@@ -416,8 +400,10 @@ where
     F: FnMut(&[u8], &mut U) -> Framing,
 {
     fn drop(&mut self) {
-        // Ensure no op is in flight before the buffers and ring are freed.
-        let _ = self.core.cancel_and_reap_all();
+        // Ensure no op is in flight before the buffers and ring are freed; if
+        // the drain fails, leak the buffers rather than free them under a
+        // still-live op.
+        self.core.drain_or_leak();
     }
 }
 
@@ -428,7 +414,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
             .field("cfg", &self.cfg)
-            .field("inflight", &self.core.inflight)
+            .field("inflight", &self.core.engine.inflight)
             .field("pending_events", &self.events.len())
             .finish_non_exhaustive()
     }

@@ -178,10 +178,10 @@ mod path_tests {
 }
 
 // --------------------------------------------------------------------------- fs
-#[cfg(feature = "fs")]
+#[cfg(feature = "sync-fs")]
 mod fs {
     use truenas_ros::errno::Errno;
-    use truenas_ros::fs::{
+    use truenas_ros::sync_fs::{
         makedev, openat2, renameat2, statx, AtFlags, Mode, OFlag, OpenHow,
         RenameFlags, ResolveFlag, StatxMask,
     };
@@ -319,7 +319,7 @@ mod fs {
 mod xattr {
     use std::os::fd::AsFd;
     use truenas_ros::errno::Errno;
-    use truenas_ros::xattr::{
+    use truenas_ros::sync_fs::xattr::{
         fgetxattr, flistxattr, fremovexattr, fsetxattr, XattrFlags,
         XATTR_SIZE_MAX,
     };
@@ -425,13 +425,13 @@ mod xattr {
 mod mount {
     use std::os::fd::AsFd;
     use std::path::Path;
-    use truenas_ros::fs::{statx, AtFlags, OFlag, StatxMask};
     use truenas_ros::mount::{
         fsconfig, is_zfs_snapshot, listmount, mount_setattr, move_mount,
         open_mount_by_id, open_tree, statmount, statmount_path, umount,
         umount2, FsConfig, MntFlags, MntPropagation, MountAttr, MountSetattr,
         MoveMountFlags, OpenTreeFlags, StatmountMask, UmountOptions, LSMT_ROOT,
     };
+    use truenas_ros::sync_fs::{statx, AtFlags, OFlag, StatxMask};
     use truenas_ros::{Error, AT_FDCWD};
 
     fn root_id() -> u64 {
@@ -555,7 +555,7 @@ mod mount {
 #[cfg(feature = "acl")]
 mod acl {
     use std::os::fd::AsFd;
-    use truenas_ros::acl::{
+    use truenas_ros::sync_fs::acl::{
         fgetacl, fsetacl, validate_acl, Acl, AclTarget, Nfs4Ace, Nfs4AceType,
         Nfs4Acl, Nfs4AclFlag, Nfs4Flag, Nfs4Perm, Nfs4Who, PosixAce, PosixAcl,
         PosixPerm, PosixTag,
@@ -870,7 +870,7 @@ mod acl {
 
     #[test]
     fn low_level_fsetacl_paths() {
-        use truenas_ros::acl::{fsetacl_nfs4, fsetacl_posix};
+        use truenas_ros::sync_fs::acl::{fsetacl_nfs4, fsetacl_posix};
         let dir = tempfile::tempdir().unwrap();
         let d = std::fs::File::open(dir.path()).unwrap();
         let access = PosixAcl::from_aces(vec![
@@ -907,8 +907,10 @@ mod acl {
 mod fhandle {
     use std::os::fd::AsFd;
     use truenas_ros::errno::Errno;
-    use truenas_ros::fhandle::{name_to_handle_at, FhFlags, FileHandle};
-    use truenas_ros::fs::OFlag;
+    use truenas_ros::sync_fs::fhandle::{
+        name_to_handle_at, FhFlags, FileHandle,
+    };
+    use truenas_ros::sync_fs::OFlag;
     use truenas_ros::{Error, AT_FDCWD};
 
     #[test]
@@ -1005,8 +1007,10 @@ mod fhandle {
 #[cfg(feature = "fsiter")]
 mod fsiter {
     use truenas_ros::errno::Errno;
-    use truenas_ros::fs::{statx, AtFlags, OFlag, StatxMask};
-    use truenas_ros::iter::{Cookie, DirStackEntry, EntryType, FsIterBuilder};
+    use truenas_ros::sync_fs::iter::{
+        Cookie, DirStackEntry, EntryType, FsIterBuilder,
+    };
+    use truenas_ros::sync_fs::{statx, AtFlags, OFlag, StatxMask};
     use truenas_ros::{Error, AT_FDCWD};
 
     /// The mount source of `p`, so the fsiter source-check matches on kernels
@@ -1297,12 +1301,12 @@ mod fsiter {
 }
 
 // --------------------------------------------------------------------------- io
-#[cfg(feature = "fs")]
+#[cfg(feature = "sync-fs")]
 mod io {
     use std::io::{Read, Write};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use truenas_ros::errno::Errno;
-    use truenas_ros::fs::{
+    use truenas_ros::sync_fs::{
         atomic_replace, atomic_write, safe_open, AtomicWriteOptions, Mode,
         OFlag,
     };
@@ -1423,7 +1427,7 @@ mod shutil {
     use std::os::fd::AsFd;
     use std::os::unix::fs::PermissionsExt;
     use truenas_ros::errno::Errno;
-    use truenas_ros::shutil::{
+    use truenas_ros::sync_fs::shutil::{
         clonefile, copy_permissions, copy_xattrs, copyfile, copysendfile,
         copytree, copyuserspace, CopyFlags, CopyTreeConfig, CopyTreeOp,
         MAX_RW_SZ,
@@ -1503,7 +1507,7 @@ mod shutil {
 
     #[test]
     fn copy_xattrs_skips_acl_and_system() {
-        use truenas_ros::xattr::{fgetxattr, fsetxattr, XattrFlags};
+        use truenas_ros::sync_fs::xattr::{fgetxattr, fsetxattr, XattrFlags};
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("s"), b"x").unwrap();
         let s = std::fs::OpenOptions::new()

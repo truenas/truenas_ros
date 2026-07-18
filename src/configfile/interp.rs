@@ -9,6 +9,14 @@
 use super::{optionxform, Ordered, MAX_INTERPOLATION_DEPTH};
 use crate::error::{Error, Result};
 
+/// Cap on the total interpolated output for one value. [`MAX_INTERPOLATION_DEPTH`]
+/// bounds nesting depth but not the branching factor: B references per level
+/// over D levels expand to Bᴰ bytes (ten options each referencing the prior ten
+/// blow ~800 bytes up to 10¹⁰), so the depth limit alone does not stop an
+/// untrusted config from exhausting memory. Bounding the accumulated output
+/// does — 1 MiB is far beyond any real interpolated value.
+const MAX_INTERPOLATION_OUTPUT: usize = 1 << 20;
+
 /// Interpolate `value` for `option`, resolving `%(name)s` against `map` (the
 /// merged section-over-DEFAULT raw values). Mirrors `before_get`.
 pub(super) fn before_get(
@@ -35,6 +43,15 @@ fn interpolate(
     }
     let mut rest = rest;
     while !rest.is_empty() {
+        // `out` is shared across the whole recursion and grows monotonically, so
+        // checking here bounds the total expansion regardless of which nested
+        // reference is currently being resolved.
+        if out.len() > MAX_INTERPOLATION_OUTPUT {
+            return Err(Error::Parse(format!(
+                "interpolation for {option:?} expanded past \
+                 {MAX_INTERPOLATION_OUTPUT} bytes"
+            )));
+        }
         let p = match rest.find('%') {
             None => {
                 out.push_str(rest);

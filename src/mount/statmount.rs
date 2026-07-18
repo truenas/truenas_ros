@@ -235,8 +235,12 @@ fn parse(words: &[u64]) -> Statmount {
     // reading the fixed `RawStatmount` header is in-bounds and aligned.
     let hdr = unsafe { &*words.as_ptr().cast::<RawStatmount>() };
     // SAFETY: same allocation, reinterpreted as bytes for string extraction.
+    // Clamp to the kernel-reported `size` (never past the allocation) so string
+    // offsets are bounded by what the kernel actually wrote — the safety is then
+    // local, not contingent on the buffer having been zero-initialised.
+    let written = (hdr.size as usize).min(words.len() * 8);
     let bytes = unsafe {
-        std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() * 8)
+        std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), written)
     };
     let mask = StatmountMask::from_bits_retain(hdr.mask);
 

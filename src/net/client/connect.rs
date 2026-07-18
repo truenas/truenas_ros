@@ -12,8 +12,8 @@ use crate::fd::owned_from_raw;
 use crate::net::core::conn::{pack, Connection, Op};
 use crate::net::core::protocol::{ClientAddr, Framing, ServerAddr};
 use crate::net::core::sock::{build_sockaddr, set_opt};
-use crate::net::core::sys::*;
 use crate::net::core::table::PendingConnect;
+use crate::uring::sys::*;
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
@@ -175,7 +175,7 @@ where
                     "a tls connect requires Client::set_tls_handshake",
                 ));
             }
-            if !self.core.fixed_fd_install || !self.ktls_supported {
+            if !self.core.engine.fixed_fd_install || !self.ktls_supported {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "kTLS connect requires IORING_OP_FIXED_FD_INSTALL \
@@ -210,7 +210,8 @@ where
         };
         // Install the connected socket into the pool at `slot`; the kernel takes
         // its own reference, so the userspace fd is closed right after.
-        if let Err(e) = self.core.ring.install_file(slot, fd.as_raw_fd()) {
+        if let Err(e) = self.core.engine.ring.install_file(slot, fd.as_raw_fd())
+        {
             // Nothing was installed: drop the pending state and free the slot.
             self.core.table.take_connecting(slot);
             self.core.table.free(slot);
@@ -257,7 +258,7 @@ where
             // The socket is installed but the CONNECT never staged: uninstall
             // the fixed descriptor (dropping the kernel's ref closes it) and
             // free the slot.
-            let _ = self.core.ring.install_file(slot, -1);
+            let _ = self.core.engine.ring.install_file(slot, -1);
             self.core.table.take_connecting(slot);
             self.core.table.free(slot);
             return Err(e.into());

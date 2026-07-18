@@ -53,21 +53,31 @@ pub struct ClientConfig {
     /// per-connect [`ConnectOpts::connect_timeout`](super::ConnectOpts) overrides
     /// it. `None` (the default) uses the kernel's own connect timeout.
     pub connect_timeout: Option<Duration>,
-    /// If set, close a connection whose in-progress reply is not fully received
-    /// within this duration (a reverse slow-loris guard). Projects to the
-    /// engine's `request_timeout`. `None` (the default) never times a reply out —
-    /// so a framer that returns a `SpliceBody` verdict should set this: otherwise
-    /// a server that sends a body header then stalls mid-splice pins the
-    /// connection's pool slot indefinitely (the splice inactivity watchdog is
-    /// gated on `response_timeout`).
+    /// If set, close a connection whose reply, once it has *begun* arriving, is
+    /// not fully received within this duration. Projects to the engine's
+    /// `request_timeout`. `None` (the default) never times an in-progress reply
+    /// out.
+    ///
+    /// This bounds a reply that stalls partway through. It does *not* bound a
+    /// server that accepts the request and then sends nothing at all — until the
+    /// first reply byte the read is idle, so that case is bounded by
+    /// [`idle_timeout`](Self::idle_timeout). Set both to fully guard against a
+    /// hostile server (the same two-phase split the server role uses). A framer
+    /// that returns a `SpliceBody` verdict should set this: otherwise a server
+    /// that sends a body header then stalls mid-splice pins the connection's
+    /// pool slot indefinitely (the splice inactivity watchdog is gated on
+    /// `response_timeout`).
     pub response_timeout: Option<Duration>,
     /// If set, close a connection whose in-flight send makes no progress for
     /// this long (a peer that stopped reading). `None` (the default) never
     /// times sends out.
     pub send_timeout: Option<Duration>,
-    /// If set, close a connection left idle — no request in flight, no reply
-    /// awaited — for longer than this, reclaiming its slot. `None` (the
-    /// default) keeps idle connections open.
+    /// If set, close a connection left idle for longer than this, reclaiming its
+    /// slot. "Idle" includes a connection awaiting a reply whose first byte has
+    /// not arrived, so this — not [`response_timeout`](Self::response_timeout),
+    /// which bounds an *in-progress* reply — is what bounds a server that
+    /// accepts a request and then goes silent. `None` (the default) keeps idle
+    /// connections open.
     pub idle_timeout: Option<Duration>,
     /// If set, bound a kTLS connect handshake: a connection parked while its
     /// consumer handshake worker runs `SSL_connect` is shed with `ConnectFailed`

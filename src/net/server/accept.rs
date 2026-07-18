@@ -10,9 +10,9 @@ use crate::net::core::handles::{stat, AcceptDeferral, HandshakeOutcome};
 use crate::net::core::probe::fill_getsockopt_cmd;
 use crate::net::core::protocol::{ClientAddr, Framing, PeerCred, ServerAddr};
 use crate::net::core::sock;
-use crate::net::core::sys::*;
 use crate::net::core::table::PendingPeer;
 use crate::net::server::protocol::{Incoming, Request, Response};
+use crate::uring::sys::*;
 use std::mem::size_of;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
@@ -185,7 +185,7 @@ where
             // consumer's handshake, so it must not alias a future incarnation).
             generation: self.core.table.generation(slot),
             tx: self.mailbox.handshake_tx.clone(),
-            shared: Arc::clone(&self.core.shared),
+            shared: Arc::clone(&self.core.engine.shared),
             done: false,
         };
         match self.handlers.tls_handshake.as_mut() {
@@ -456,18 +456,29 @@ where
                 (listener, peer)
             }
             PendingPeer::Name { listener, pad } => {
-                // res = the address length written, or -errno (e.g. the
-                // peer already reset — `ENOTCONN`).
-                if res <= 0
-                    || res as usize > size_of::<libc::sockaddr_storage>()
-                {
+                // res = the address length written, or -errno (e.g. the peer
+                // already reset — `ENOTCONN`). Require EXACTLY the requested
+                // family size (16/28): a short or rewritten result — as a
+                // cgroup getsockopt BPF program can produce — is not a
+                // trustworthy address, so fail closed. `parse_peer` then
+                // re-checks the family, so a correct-length-but-rewritten pad
+                // also sheds rather than reading as a local `Unix` peer.
+                let want = match self.listeners[listener as usize].addr {
+                    ServerAddr::Tcp6(_) => size_of::<libc::sockaddr_in6>(),
+                    _ => size_of::<libc::sockaddr_in>(),
+                };
+                let peer = (res >= 0 && res as usize == want)
+                    .then(|| {
+                        sock::parse_peer(
+                            &pad,
+                            &self.listeners[listener as usize].addr,
+                        )
+                    })
+                    .flatten();
+                let Some(peer) = peer else {
                     stat!(self.core, shed);
                     return self.core.submit_teardown(slot, 0, true);
-                }
-                let peer = sock::parse_peer(
-                    &pad,
-                    &self.listeners[listener as usize].addr,
-                );
+                };
                 (listener, peer)
             }
         };
