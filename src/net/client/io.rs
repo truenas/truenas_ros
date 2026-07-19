@@ -16,7 +16,7 @@ use crate::net::core::protocol::{Body, CloseReason, Framing};
 use crate::net::core::reactor::{
     Enacted, Gate, RecvStep, SendStep, SpliceStep,
 };
-use crate::net::core::sys::*;
+use crate::uring::sys::*;
 use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
@@ -348,8 +348,8 @@ where
             if self.no_live_work() {
                 return Ok(None); // no connections/connects/handshakes left
             }
-            self.core.ring.submit_and_wait(1)?;
-            while let Some(cqe) = self.core.ring.reap() {
+            self.core.engine.ring.submit_and_wait(1)?;
+            while let Some(cqe) = self.core.engine.ring.reap() {
                 self.dispatch(cqe)?;
             }
             // The client has no listener to re-arm on a freed slot; clear the
@@ -383,10 +383,18 @@ where
         if self.no_live_work() {
             return Ok(None);
         }
+        // A prior call that unwound on a fatal ring error (a `?` below) returns
+        // with its deadline still in flight — the `deadline_pad` is durable for
+        // exactly this reason. Reap it before staging a new one so two
+        // identical-`user_data` deadlines never coexist: a stale one reaped by
+        // this call would be counted as ours and return a premature `None`.
+        if self.deadline_inflight {
+            self.cancel_and_reap_deadline(pack(Op::Deadline, 0, 0))?;
+            self.deadline_inflight = false;
+        }
         // Arm the deadline over the durable `deadline_pad` (see its field doc for
-        // why it outlives a fatal-error `Drop`). Safe to rewrite each call: the
-        // previous call reaped its deadline before returning. `Op::Deadline` with
-        // slot/gen 0 is unique on the client ring (it arms no other timer).
+        // why it outlives a fatal-error `Drop`). `Op::Deadline` with slot/gen 0
+        // is unique on the client ring (it arms no other timer).
         *self.deadline_pad = ts_of(dur);
         let ts_ptr = std::ptr::addr_of!(*self.deadline_pad) as u64;
         let deadline_ud = pack(Op::Deadline, 0, 0);
@@ -395,18 +403,20 @@ where
             sqe.addr = ts_ptr;
             sqe.len = 1; // exactly one timespec, per the kernel
         })?;
+        self.deadline_inflight = true;
         // Pump until an event is queued or the deadline fires. The deadline CQE
         // is reaped inline here (not via `dispatch`) so its firing is
         // observable; every other completion routes through `dispatch`, which
         // may queue an event.
         let mut fired = false;
         let out = loop {
-            self.core.ring.submit_and_wait(1)?;
-            while let Some(cqe) = self.core.ring.reap() {
+            self.core.engine.ring.submit_and_wait(1)?;
+            while let Some(cqe) = self.core.engine.ring.reap() {
                 let (op, _, _) = unpack(cqe.user_data);
                 if matches!(op, Some(Op::Deadline)) {
                     // Not multishot — count it off exactly as `dispatch` would.
-                    self.core.inflight = self.core.inflight.saturating_sub(1);
+                    self.core.engine.inflight =
+                        self.core.engine.inflight.saturating_sub(1);
                     fired = true;
                 } else {
                     self.dispatch(cqe)?;
@@ -427,6 +437,7 @@ where
         if !fired {
             self.cancel_and_reap_deadline(deadline_ud)?;
         }
+        self.deadline_inflight = false;
         Ok(out)
     }
 
@@ -444,14 +455,15 @@ where
             sqe.addr = deadline_ud;
         })?;
         loop {
-            self.core.ring.submit_and_wait(1)?;
+            self.core.engine.ring.submit_and_wait(1)?;
             let mut done = false;
-            while let Some(cqe) = self.core.ring.reap() {
+            while let Some(cqe) = self.core.engine.ring.reap() {
                 let (op, _, _) = unpack(cqe.user_data);
                 if matches!(op, Some(Op::Deadline)) {
                     // The cancelled deadline's own completion (`-ECANCELED`, or
                     // `-ETIME` if it fired concurrently). Count it off inline.
-                    self.core.inflight = self.core.inflight.saturating_sub(1);
+                    self.core.engine.inflight =
+                        self.core.engine.inflight.saturating_sub(1);
                     done = true;
                 } else {
                     // Includes the `Cancel` control op's completion, which

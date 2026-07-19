@@ -16,7 +16,7 @@ pub use posix::{PosixAce, PosixAcl, PosixPerm, PosixTag};
 
 use crate::errno::Errno;
 use crate::error::Result;
-use crate::xattr::{fgetxattr, fremovexattr, fsetxattr, XattrFlags};
+use crate::sync_fs::xattr::{fgetxattr, fremovexattr, fsetxattr, XattrFlags};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 

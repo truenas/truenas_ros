@@ -2,8 +2,8 @@
 
 use super::{MntPropagation, MountAttr};
 use crate::errno::{self, retry_on_eintr};
-use crate::fs::AtFlags;
 use crate::path::TnPath;
+use crate::sync_fs::AtFlags;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 /// Kernel `struct mount_attr` (VER0, 32 bytes).

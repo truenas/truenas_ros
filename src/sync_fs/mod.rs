@@ -1,23 +1,50 @@
-//! Modern filesystem syscalls and safe I/O helpers.
+//! Blocking (synchronous) filesystem bindings — the `sync_fs` umbrella.
 //!
-//! Currently: [`statx`], [`openat2`], [`renameat2`], and the shared flag types
-//! ([`AtFlags`], [`OFlag`], [`Mode`]).
+//! The umbrella root is the base syscall layer (feature `sync-fs`): [`statx`],
+//! [`openat2`], [`renameat2`], [`safe_open`], atomic writes, and the shared
+//! flag types ([`AtFlags`], [`OFlag`], [`Mode`]). Each sibling subsystem is a
+//! named submodule behind its own feature: [`xattr`], [`acl`] (NFS4/POSIX1E),
+//! [`fhandle`], [`iter`] (feature `fsiter`), and [`shutil`]. Mount topology
+//! and idmapped-mount support live in [`crate::mount`]; the io_uring reactor
+//! counterpart is the (future) `async_fs` module.
 
+#[cfg(feature = "sync-fs")]
 mod atomic;
+#[cfg(feature = "sync-fs")]
 mod openat2;
+#[cfg(feature = "sync-fs")]
 mod renameat2;
+#[cfg(feature = "sync-fs")]
 mod safe_open;
+#[cfg(feature = "sync-fs")]
 mod statx;
 
+#[cfg(feature = "acl")]
+pub mod acl;
+#[cfg(feature = "fhandle")]
+pub mod fhandle;
+#[cfg(feature = "fsiter")]
+pub mod iter;
+#[cfg(feature = "shutil")]
+pub mod shutil;
+#[cfg(feature = "xattr")]
+pub mod xattr;
+
+#[cfg(feature = "sync-fs")]
 pub use atomic::{atomic_replace, atomic_write, AtomicWriteOptions};
+#[cfg(feature = "sync-fs")]
 pub use openat2::{openat2, OpenHow, ResolveFlag};
+#[cfg(feature = "sync-fs")]
 pub use renameat2::{renameat2, RenameFlags};
+#[cfg(feature = "sync-fs")]
 pub use safe_open::safe_open;
+#[cfg(feature = "sync-fs")]
 pub use statx::{
     makedev, statx, Statx, StatxAttr, StatxMask, StatxRaw, StatxTimestamp,
     StatxTimestampRaw,
 };
 
+#[cfg(feature = "sync-fs")]
 tn_bitflags! {
     /// Flags for the `*at` family of syscalls (`AT_*`).
     pub struct AtFlags: libc::c_int {
@@ -38,6 +65,7 @@ tn_bitflags! {
     }
 }
 
+#[cfg(feature = "sync-fs")]
 tn_bitflags! {
     /// File status/creation flags (`O_*`) for [`openat2`] and friends.
     pub struct OFlag: libc::c_int {
@@ -84,6 +112,7 @@ tn_bitflags! {
     }
 }
 
+#[cfg(feature = "sync-fs")]
 tn_bitflags! {
     /// File mode / permission bits (`S_*`).
     pub struct Mode: libc::mode_t {

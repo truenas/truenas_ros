@@ -3,7 +3,7 @@
 use super::listmount::listmount;
 use super::statmount::{statmount, Statmount, StatmountMask};
 use crate::errno;
-use crate::fs::{openat2, OFlag, OpenHow};
+use crate::sync_fs::{openat2, OFlag, OpenHow};
 use crate::AT_FDCWD;
 use std::os::fd::OwnedFd;
 

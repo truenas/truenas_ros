@@ -15,6 +15,7 @@
 //! delivered message is drained and any pipelined remainder is re-framed.
 
 use super::protocol::{Body, ClientAddr, CloseReason};
+use crate::uring::user_data::{pack_raw, unpack_raw};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::os::fd::RawFd;
@@ -116,19 +117,17 @@ impl Op {
     }
 }
 
-const SLOT_MASK: u64 = 0x00ff_ffff; // 24 bits
-
-/// Encode `(op, slot, generation)` into an SQE `user_data` token.
+/// Encode `(op, slot, generation)` into an SQE `user_data` token — the
+/// stream vocabulary over the shared raw codec. Stream tags stay inside the
+/// `0x00..=0x7F` domain (`user_data::TAG_FS_DOMAIN` marks the other half).
 pub(crate) fn pack(op: Op, slot: u32, generation: u32) -> u64 {
-    (op as u64) | ((slot as u64 & SLOT_MASK) << 8) | ((generation as u64) << 32)
+    pack_raw(op as u8, slot, generation)
 }
 
 /// Decode a CQE `user_data` token. `op` is `None` for an unrecognized tag.
 pub(crate) fn unpack(user_data: u64) -> (Option<Op>, u32, u32) {
-    let op = Op::from_u8((user_data & 0xff) as u8);
-    let slot = ((user_data >> 8) & SLOT_MASK) as u32;
-    let generation = (user_data >> 32) as u32;
-    (op, slot, generation)
+    let (tag, slot, generation) = unpack_raw(user_data);
+    (Op::from_u8(tag), slot, generation)
 }
 
 /// One outgoing PDU: a request reply or a push.
@@ -208,8 +207,9 @@ impl KtlsRecv {
         unsafe {
             let mut cmsg = libc::CMSG_FIRSTHDR(&self.msg);
             while !cmsg.is_null() {
-                if (*cmsg).cmsg_level == super::sys::SOL_TLS
-                    && (*cmsg).cmsg_type == super::sys::TLS_GET_RECORD_TYPE
+                if (*cmsg).cmsg_level == crate::uring::sys::SOL_TLS
+                    && (*cmsg).cmsg_type
+                        == crate::uring::sys::TLS_GET_RECORD_TYPE
                 {
                     return Some(*libc::CMSG_DATA(cmsg));
                 }
@@ -630,7 +630,7 @@ impl<U> Connection<U> {
                 && (res as usize) < self.recv_want
                 && self.is_ktls()
                 && self.ktls_record_type()
-                    == Some(super::sys::TLS_RECORD_TYPE_DATA)
+                    == Some(crate::uring::sys::TLS_RECORD_TYPE_DATA)
             {
                 // The buffer length is NOT advanced here: the partial bytes
                 // sit in spare capacity until the continuation completes

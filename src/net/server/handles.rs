@@ -5,11 +5,12 @@
 
 #[cfg(doc)]
 use super::Server;
-use crate::net::core::handles::{LoopShared, StatsInner, Token};
+use crate::net::core::handles::{StatsInner, Token};
 #[cfg(doc)]
 use crate::net::core::protocol::CloseReason;
 #[cfg(doc)]
 use crate::net::server::protocol::Response;
+use crate::uring::wake::LoopShared;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;

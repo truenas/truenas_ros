@@ -7,7 +7,7 @@ use super::Reactor;
 use crate::errno::{self, Errno};
 use crate::net::core::conn::{pack, Op};
 use crate::net::core::protocol::CloseReason;
-use crate::net::core::sys::*;
+use crate::uring::sys::*;
 
 impl<U> Reactor<U> {
     /// Begin (idempotently) tearing a connection down: report it to the close

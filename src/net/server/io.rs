@@ -15,8 +15,8 @@ use crate::net::core::protocol::{CloseReason, Framing};
 use crate::net::core::reactor::{
     Enacted, Gate, RecvStep, SendStep, SpliceStep,
 };
-use crate::net::core::sys::*;
 use crate::net::server::protocol::{DetachContext, Request, Response};
+use crate::uring::sys::*;
 use std::sync::Arc;
 
 // The stages that run the consumer's framer/body handler — the only bounds
@@ -120,7 +120,7 @@ where
                     req_id,
                 },
                 tx: self.mailbox.inject_tx.clone(),
-                shared: Arc::clone(&self.core.shared),
+                shared: Arc::clone(&self.core.engine.shared),
             };
             let (header, body, peer, state) = conn.deliver_parts();
             (
@@ -187,6 +187,8 @@ where
                     let conn = self.core.table.conn(slot);
                     !conn.recving
                         && !conn.sending
+                        && !conn.splicing
+                        && !conn.splice_polling
                         && conn.outstanding == 0
                         && conn.buffered() == 0
                         && !conn.has_pending_send()
@@ -330,7 +332,7 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             generation: gen64,
             fd,
             tx: self.mailbox.inject_tx.clone(),
-            shared: Arc::clone(&self.core.shared),
+            shared: Arc::clone(&self.core.engine.shared),
             done: false,
         };
         // Disjoint-field borrow: `self.handlers` vs the local `conn`.

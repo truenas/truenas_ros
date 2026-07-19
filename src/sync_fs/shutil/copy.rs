@@ -5,7 +5,7 @@
 
 use crate::errno::{self, retry_on_eintr, Errno};
 use crate::error::Result;
-use crate::xattr::{fgetxattr, fsetxattr, XattrFlags};
+use crate::sync_fs::xattr::{fgetxattr, fsetxattr, XattrFlags};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr;
 

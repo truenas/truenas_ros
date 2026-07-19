@@ -77,9 +77,17 @@ jobs:
         TRUENAS_ROS_REQUIRE_PYTHON: "1"
         TRUENAS_ROS_REQUIRE_IO_URING: "1"
 
+    # Each feature alone proves the per-subsystem gates and dependency edges
+    # (acl without shutil, idmap alone, …); `uring` alone proves the shared
+    # engine builds severed from the net stack (the seam the async fs reactor
+    # relies on); each net role alone proves the role gates.
     - name: feature-matrix builds
       run: |
         cargo build --no-default-features
+        for f in sync-fs xattr mount acl fhandle fsiter idmap shutil \
+                 configfile uring net-server net-client async-fs; do
+          cargo build --no-default-features --features "$f"
+        done
         cargo build --all-features
 
     - name: docs

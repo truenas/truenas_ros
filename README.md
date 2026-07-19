@@ -18,27 +18,33 @@ false` and re-enable what you need (or use `full`):
 
 ```toml
 [dependencies]
-truenas_ros = { version = "0.1", default-features = false, features = ["fs", "configfile"] }
+truenas_ros = { version = "0.1", default-features = false, features = ["sync-fs", "configfile"] }
 ```
 
 | Feature | Contents |
 |---|---|
-| `fs` | `statx`, `openat2`, `renameat2`; `safe_open`, `atomic_write` / `atomic_replace` |
+| `sync-fs` | `statx`, `openat2`, `renameat2`; `safe_open`, `atomic_write` / `atomic_replace` (the `sync_fs` umbrella root; the features below through `shutil` are its submodules) |
 | `xattr` | `fgetxattr` / `fsetxattr` / `flistxattr` / `fremovexattr` |
 | `mount` | `statmount`, `listmount`, `iter_mount`, `open_tree`, `move_mount`, `mount_setattr`, `fsopen` / `fsconfig` / `fsmount`, `umount2`; higher-level `statmount_path`, `iter_mountinfo`, `umount` |
 | `acl` | NFS4 (`system.nfs4_acl_xdr`) and POSIX1E ACLs — decode / encode / validate + `fgetacl` / `fsetacl` |
 | `fhandle` | `name_to_handle_at` / `open_by_handle_at` (`FileHandle`) |
 | `fsiter` | single-filesystem depth-first `Iterator` yielding owned entries |
-| `namespace` | idmapped-mount user namespaces via `clone3` (`create_idmap_userns`, cached `idmap_userns`) |
+| `idmap` | idmapped-mount user namespaces via `clone3` (`create_idmap_userns`, cached `idmap_userns`) — lives at `mount::idmap` |
 | `shutil` | metadata-preserving recursive `copytree` + copy / clone primitives |
 | `configfile` | INI config files byte-for-byte compatible with Python's `configparser`, read symlink-safely and written atomically |
+
+An io_uring stack lives alongside the blocking bindings, off by default:
+`net-server` / `net-client` (stream roles over a shared reactor core, with
+kernel-TLS, splice, and peer-credential support) and `async-fs` (a filesystem
+reactor with per-op credential impersonation — currently a design stub). Both
+sit on the internal `uring` engine feature; see the crate docs.
 
 ## Examples
 
 Open a file without following any symlink in the path, then stat the fd:
 
 ```rust
-use truenas_ros::fs::{openat2, statx, AtFlags, OFlag, OpenHow, ResolveFlag, StatxMask};
+use truenas_ros::sync_fs::{openat2, statx, AtFlags, OFlag, OpenHow, ResolveFlag, StatxMask};
 use truenas_ros::AT_FDCWD;
 
 let how = OpenHow::new()
@@ -56,7 +62,7 @@ durability and safety that `configparser` itself leaves to the caller:
 
 ```rust
 use truenas_ros::configfile::ConfigFile;
-use truenas_ros::fs::AtomicWriteOptions;
+use truenas_ros::sync_fs::AtomicWriteOptions;
 
 let mut cfg = ConfigFile::new();
 cfg.read_str("[server]\nHost = localhost\nPort = 8080\n")?;

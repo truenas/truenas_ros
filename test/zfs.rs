@@ -12,11 +12,11 @@
 
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
-use truenas_ros::acl::{
+use truenas_ros::sync_fs::acl::{
     fgetacl, fsetacl, Acl, Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag,
     Nfs4Flag, Nfs4Perm, Nfs4Who, PosixAce, PosixAcl, PosixPerm, PosixTag,
 };
-use truenas_ros::xattr::fgetxattr;
+use truenas_ros::sync_fs::xattr::fgetxattr;
 
 /// Resolve an ACL-typed dataset directory, or `None` to skip the test.
 fn dataset(env_var: &str, fallback: &str) -> Option<PathBuf> {

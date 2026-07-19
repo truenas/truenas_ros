@@ -5,8 +5,8 @@ use super::{
 };
 use crate::errno::{self, Errno};
 use crate::error::{Error, Result};
-use crate::fs::{openat2, statx, AtFlags, OFlag, OpenHow, ResolveFlag};
-use crate::fs::{StatxAttr, StatxMask};
+use crate::sync_fs::{openat2, statx, AtFlags, OFlag, OpenHow, ResolveFlag};
+use crate::sync_fs::{StatxAttr, StatxMask};
 use crate::AT_FDCWD;
 use std::os::fd::AsFd;
 use std::path::Path;

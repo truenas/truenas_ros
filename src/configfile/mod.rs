@@ -37,7 +37,9 @@ mod write;
 
 use crate::errno::Errno;
 use crate::error::{Error, Result};
-use crate::fs::{atomic_replace, safe_open, AtomicWriteOptions, Mode, OFlag};
+use crate::sync_fs::{
+    atomic_replace, safe_open, AtomicWriteOptions, Mode, OFlag,
+};
 use crate::AT_FDCWD;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -60,51 +62,62 @@ enum Interp {
 
 /// A minimal insertion-ordered, string-keyed map.
 ///
-/// Config files are small, so a linear scan is fine and keeps the crate free of
-/// an ordered-map dependency. [`insert`](Ordered::insert) is an upsert that
-/// preserves an existing key's position — the Python `dict`-assignment semantics
-/// that `configparser`'s ordering relies on.
+/// `entries` preserves insertion order — the Python `dict`-assignment semantics
+/// `configparser`'s ordering relies on — and `index` maps each key to its
+/// position so lookups and the upsert [`insert`](Ordered::insert) are O(1)
+/// rather than a scan. Without the index, parsing an untrusted config with very
+/// many keys in one section would be quadratic.
 #[derive(Clone, Debug, Default)]
 struct Ordered<V> {
     entries: Vec<(String, V)>,
+    index: std::collections::HashMap<String, usize>,
 }
 
 impl<V> Ordered<V> {
     fn new() -> Self {
         Ordered {
             entries: Vec::new(),
+            index: std::collections::HashMap::new(),
         }
     }
 
     fn position(&self, key: &str) -> Option<usize> {
-        self.entries.iter().position(|(k, _)| k == key)
+        self.index.get(key).copied()
     }
 
     fn contains(&self, key: &str) -> bool {
-        self.position(key).is_some()
+        self.index.contains_key(key)
     }
 
     fn get(&self, key: &str) -> Option<&V> {
-        self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+        self.position(key).map(|i| &self.entries[i].1)
     }
 
     fn get_mut(&mut self, key: &str) -> Option<&mut V> {
-        self.entries
-            .iter_mut()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v)
+        match self.index.get(key).copied() {
+            Some(i) => Some(&mut self.entries[i].1),
+            None => None,
+        }
     }
 
     fn insert(&mut self, key: &str, value: V) {
-        if let Some(slot) = self.get_mut(key) {
-            *slot = value;
+        if let Some(&i) = self.index.get(key) {
+            self.entries[i].1 = value;
         } else {
+            self.index.insert(key.to_string(), self.entries.len());
             self.entries.push((key.to_string(), value));
         }
     }
 
     fn remove(&mut self, key: &str) -> Option<V> {
-        self.position(key).map(|i| self.entries.remove(i).1)
+        let i = self.index.remove(key)?;
+        let (_, v) = self.entries.remove(i);
+        // Entries after `i` shifted down by one; fix their recorded positions.
+        for pos in i..self.entries.len() {
+            let k = self.entries[pos].0.clone();
+            self.index.insert(k, pos);
+        }
+        Some(v)
     }
 
     fn is_empty(&self) -> bool {

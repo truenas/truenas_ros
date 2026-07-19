@@ -9,9 +9,9 @@ use super::Server;
 use crate::errno;
 use crate::net::core::conn::{pack, Op};
 use crate::net::core::protocol::{CloseReason, Framing};
-use crate::net::core::sys::*;
 use crate::net::core::table::SlotState;
 use crate::net::server::protocol::{Incoming, Request, Response};
+use crate::uring::sys::*;
 use std::sync::atomic::Ordering;
 
 // Wake-driven work can re-enter any stage — kTLS accept outcomes install
@@ -30,7 +30,7 @@ where
         if !self.core.stopping() {
             self.drain_injections()?;
             self.drain_handshake_outcomes()?;
-            if self.core.shared.graceful.load(Ordering::Acquire)
+            if self.core.engine.shared.graceful.load(Ordering::Acquire)
                 && !self.core.draining
             {
                 self.begin_drain()?;
@@ -63,7 +63,13 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         }
 
         // Grace-period deadline (a standalone TIMEOUT op).
-        let ms = self.core.shared.grace_ms.load(Ordering::Relaxed).max(1);
+        let ms = self
+            .core
+            .engine
+            .shared
+            .grace_ms
+            .load(Ordering::Relaxed)
+            .max(1);
         self.core.pads.deadline = KernelTimespec {
             tv_sec: (ms / 1000) as i64,
             tv_nsec: ((ms % 1000) * 1_000_000) as i64,

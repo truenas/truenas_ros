@@ -1,11 +1,11 @@
 //! Integration tests for `truenas_ros` (mirrors `src/`, nix convention).
 #![cfg(target_os = "linux")]
 
-#[cfg(feature = "fs")]
+#[cfg(feature = "sync-fs")]
 mod fs {
     use std::os::fd::AsFd;
     use truenas_ros::errno::Errno;
-    use truenas_ros::fs::{
+    use truenas_ros::sync_fs::{
         openat2, renameat2, statx, AtFlags, OFlag, OpenHow, RenameFlags,
         ResolveFlag, StatxMask,
     };
@@ -87,7 +87,9 @@ mod fs {
 mod xattr {
     use std::os::fd::AsFd;
     use truenas_ros::errno::Errno;
-    use truenas_ros::xattr::{fgetxattr, flistxattr, fsetxattr, XattrFlags};
+    use truenas_ros::sync_fs::xattr::{
+        fgetxattr, flistxattr, fsetxattr, XattrFlags,
+    };
 
     #[test]
     fn set_get_list_roundtrip() {
@@ -131,11 +133,11 @@ mod xattr {
 mod mount {
     use std::os::fd::AsFd;
     use truenas_ros::errno::Errno;
-    use truenas_ros::fs::{statx, AtFlags, StatxMask};
     use truenas_ros::mount::{
         fsconfig, fsmount, fsopen, iter_mount, listmount, statmount, FsConfig,
         FsmountFlags, FsopenFlags, MountAttr, StatmountMask, LSMT_ROOT,
     };
+    use truenas_ros::sync_fs::{statx, AtFlags, StatxMask};
     use truenas_ros::AT_FDCWD;
 
     fn root_mnt_id() -> u64 {
@@ -213,11 +215,11 @@ mod mount {
 #[cfg(feature = "acl")]
 mod acl {
     use std::os::fd::AsFd;
-    use truenas_ros::acl::{
+    use truenas_ros::sync_fs::acl::{
         fgetacl, Acl, Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag, Nfs4Flag,
         Nfs4Perm, Nfs4Who, PosixAcl, PosixPerm, PosixTag,
     };
-    use truenas_ros::xattr::fgetxattr;
+    use truenas_ros::sync_fs::xattr::fgetxattr;
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
@@ -350,8 +352,10 @@ mod acl {
 mod fhandle {
     use std::os::fd::AsFd;
     use truenas_ros::errno::Errno;
-    use truenas_ros::fhandle::{name_to_handle_at, FhFlags, FileHandle};
-    use truenas_ros::fs::{statx, AtFlags, OFlag, StatxMask};
+    use truenas_ros::sync_fs::fhandle::{
+        name_to_handle_at, FhFlags, FileHandle,
+    };
+    use truenas_ros::sync_fs::{statx, AtFlags, OFlag, StatxMask};
     use truenas_ros::{Error, AT_FDCWD};
 
     #[test]
@@ -417,8 +421,8 @@ mod fhandle {
 #[cfg(feature = "fsiter")]
 mod fsiter {
     use std::collections::BTreeSet;
-    use truenas_ros::fs::{statx, AtFlags, StatxMask};
-    use truenas_ros::iter::FsIterBuilder;
+    use truenas_ros::sync_fs::iter::FsIterBuilder;
+    use truenas_ros::sync_fs::{statx, AtFlags, StatxMask};
     use truenas_ros::Error;
 
     /// The mount source of `p`, so the fsiter source-check matches on kernels
@@ -456,6 +460,32 @@ mod fsiter {
         }
         assert_eq!(count, 5); // a, b, c, f1, f2
         assert_eq!(bytes, 6); // 1 + 2 + 3 (files only; dirs add no bytes)
+    }
+
+    // A writer-less FIFO in the tree used to hang the walk forever on a blocking
+    // O_RDONLY open; it must now classify as `Special` and the walk must finish.
+    // (Pre-fix this test hangs and the harness times it out.)
+    #[test]
+    fn special_files_classify_without_hanging() {
+        use std::os::unix::ffi::OsStrExt;
+        use truenas_ros::sync_fs::iter::EntryType;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("regular"), b"hi").unwrap();
+        let fifo = dir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+
+        let mut it = FsIterBuilder::new(dir.path(), fs_source(dir.path()))
+            .build()
+            .unwrap();
+        let mut kinds = std::collections::BTreeMap::new();
+        for res in it.by_ref() {
+            let e = res.unwrap();
+            kinds
+                .insert(e.name().to_string_lossy().into_owned(), e.file_type());
+        }
+        assert_eq!(kinds.get("regular"), Some(&EntryType::File));
+        assert_eq!(kinds.get("pipe"), Some(&EntryType::Special));
     }
 
     #[test]
@@ -556,7 +586,7 @@ mod fsiter {
     // [root, d_a, d_ab]).
     fn walk_to_f_ab1(
         root: &std::path::Path,
-    ) -> (BTreeSet<String>, truenas_ros::iter::Cookie) {
+    ) -> (BTreeSet<String>, truenas_ros::sync_fs::iter::Cookie) {
         let mut it = FsIterBuilder::new(root, fs_source(root)).build().unwrap();
         let mut prefix = BTreeSet::new();
         let mut cookie = None;
@@ -630,11 +660,13 @@ mod fsiter {
     }
 }
 
-#[cfg(feature = "namespace")]
+#[cfg(feature = "idmap")]
 mod namespace {
     use std::os::fd::AsRawFd;
     use truenas_ros::errno::Errno;
-    use truenas_ros::namespace::{create_idmap_userns, IdmapCache, IdmapEntry};
+    use truenas_ros::mount::idmap::{
+        create_idmap_userns, IdmapCache, IdmapEntry,
+    };
     use truenas_ros::Error;
 
     fn nsfs_link(fd: std::os::fd::RawFd) -> String {
@@ -705,11 +737,11 @@ mod namespace {
     }
 }
 
-#[cfg(feature = "fs")]
+#[cfg(feature = "sync-fs")]
 mod io {
     use std::io::Write;
     use truenas_ros::errno::Errno;
-    use truenas_ros::fs::{
+    use truenas_ros::sync_fs::{
         atomic_replace, atomic_write, safe_open, AtomicWriteOptions, Mode,
         OFlag,
     };
@@ -796,7 +828,31 @@ mod mount_helpers {
 #[cfg(feature = "shutil")]
 mod shutil {
     use std::os::unix::fs::PermissionsExt;
-    use truenas_ros::shutil::{copytree, copytree_reporting, CopyTreeConfig};
+    use truenas_ros::sync_fs::shutil::{
+        copytree, copytree_reporting, CopyTreeConfig,
+    };
+
+    // A writer-less FIFO in the source must be recreated by type, not read as a
+    // regular file (which would block the copy forever). Pre-fix this hangs.
+    #[test]
+    fn recreates_special_files_by_type() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("f"), b"data").unwrap();
+        let fifo = src.join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+
+        let dst = tmp.path().join("dst");
+        let stats = copytree(&src, &dst, &CopyTreeConfig::default()).unwrap();
+        assert_eq!(stats.files, 1);
+        assert_eq!(stats.specials, 1);
+        let md = std::fs::symlink_metadata(dst.join("pipe")).unwrap();
+        assert!(md.file_type().is_fifo());
+    }
 
     #[test]
     fn copies_tree_with_content_and_metadata() {
@@ -850,7 +906,7 @@ mod shutil {
 
     #[test]
     fn skips_metadata_when_flags_cleared() {
-        use truenas_ros::shutil::CopyFlags;
+        use truenas_ros::sync_fs::shutil::CopyFlags;
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("s");
         let dst = tmp.path().join("d");
@@ -997,8 +1053,28 @@ mod shutil {
 mod configfile {
     use std::os::unix::fs::PermissionsExt;
     use truenas_ros::configfile::ConfigFile;
-    use truenas_ros::fs::AtomicWriteOptions;
+    use truenas_ros::sync_fs::AtomicWriteOptions;
     use truenas_ros::Error;
+
+    // A shallow-but-wide interpolation (one value referencing another ~2000
+    // times, each ~1 KiB) expands past the output budget; the getter must error
+    // rather than build a multi-megabyte string. Pre-fix this exhausts memory
+    // for a deeply-nested variant; here it stays shallow so it exercises the
+    // output cap, not the depth cap.
+    #[test]
+    fn interpolation_output_is_bounded() {
+        let big = "x".repeat(1024);
+        let refs = "%(a)s".repeat(2048); // 2048 * ~1 KiB > 1 MiB budget
+        let src = format!("[s]\na = {big}\nb = {refs}\n");
+        let mut cfg = ConfigFile::new();
+        cfg.read_str(&src).unwrap();
+        assert!(
+            cfg.get("s", "b").is_err(),
+            "expected interpolation to be bounded"
+        );
+        // A modest interpolation still resolves.
+        assert_eq!(cfg.get("s", "a").unwrap().as_deref(), Some(big.as_str()));
+    }
 
     #[test]
     fn write_path_is_atomic_with_mode_and_round_trips() {

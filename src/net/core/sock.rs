@@ -155,18 +155,19 @@ pub(crate) fn parse_inet(
 pub(crate) fn parse_peer(
     storage: &libc::sockaddr_storage,
     kind: &ServerAddr,
-) -> ClientAddr {
+) -> Option<ClientAddr> {
     match kind {
         // Unix stream clients are unnamed; credentials (if enabled) are fetched
         // separately by the server before the accept handler runs.
-        ServerAddr::Unix(_) => ClientAddr::Unix { cred: None },
-        // TCP listeners: decode by the address's own family (which matches
-        // the listener's — the pad was filled by a fetch on the accepted
-        // socket). The unnamed fallback cannot fire in practice.
-        ServerAddr::Tcp(_) | ServerAddr::Tcp6(_) => match parse_inet(storage) {
-            Some(sa) => ClientAddr::Inet(sa),
-            None => ClientAddr::Unix { cred: None },
-        },
+        ServerAddr::Unix(_) => Some(ClientAddr::Unix { cred: None }),
+        // TCP listeners: decode by the address's own family. A pad that does
+        // not parse as `AF_INET`/`AF_INET6` — a short or rewritten peer-name
+        // result, e.g. from a cgroup getsockopt BPF program — yields `None` so
+        // the caller sheds, rather than fabricating a local `Unix` identity for
+        // a remote peer (fail closed, matching `peer_from_fd`).
+        ServerAddr::Tcp(_) | ServerAddr::Tcp6(_) => {
+            parse_inet(storage).map(ClientAddr::Inet)
+        }
     }
 }
 
@@ -260,7 +261,7 @@ mod tests {
         assert_eq!(u16::from_be(sin.sin_port), 8080);
         assert_eq!(sin.sin_addr.s_addr.to_ne_bytes(), [127, 0, 0, 1]);
         // round-trip
-        match parse_peer(&sa.storage, &a) {
+        match parse_peer(&sa.storage, &a).unwrap() {
             ClientAddr::Inet(SocketAddr::V4(v4)) => {
                 assert_eq!(*v4.ip(), Ipv4Addr::new(127, 0, 0, 1));
                 assert_eq!(v4.port(), 8080);

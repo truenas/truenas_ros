@@ -1,6 +1,6 @@
 //! Recursive, metadata-preserving tree copy (`copytree`).
 //!
-//! Driven by [`crate::iter::FsIter`]: the source tree is walked depth-first
+//! Driven by [`crate::sync_fs::iter::FsIter`]: the source tree is walked depth-first
 //! within a single filesystem, and each entry is recreated under the
 //! destination — cloning file data (with a `sendfile`/userspace fallback) and
 //! preserving ACLs, xattrs, ownership, and nanosecond timestamps. Directory
@@ -25,12 +25,14 @@ pub use copy::{
 
 use crate::errno::{retry_on_eintr, Errno};
 use crate::error::{Error, Result};
-use crate::fs::{openat2, statx, AtFlags, OFlag, OpenHow, ResolveFlag, Statx};
-use crate::fs::{Mode, StatxMask};
-use crate::iter::{EntryType, FsIterBuilder};
 use crate::mount;
 use crate::path::TnPath;
-use crate::xattr::flistxattr;
+use crate::sync_fs::iter::{EntryType, FsIterBuilder};
+use crate::sync_fs::xattr::flistxattr;
+use crate::sync_fs::{
+    openat2, statx, AtFlags, OFlag, OpenHow, ResolveFlag, Statx,
+};
+use crate::sync_fs::{Mode, StatxMask};
 use crate::AT_FDCWD;
 use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -125,6 +127,8 @@ pub struct CopyTreeStats {
     pub symlinks: u64,
     /// Total bytes of file data written.
     pub bytes: u64,
+    /// Special files (FIFOs, sockets, devices) recreated by type.
+    pub specials: u64,
 }
 
 /// A progress snapshot passed to a [`copytree_reporting`] callback.
@@ -175,7 +179,7 @@ pub fn copytree(
 /// current source path.
 ///
 /// (The Python original forwards a callback into its iterator; because this
-/// crate's [`FsIter`](crate::iter::FsIter) is caller-driven, `copytree` fires
+/// crate's [`FsIter`](crate::sync_fs::iter::FsIter) is caller-driven, `copytree` fires
 /// the callback itself and reports copy-specific stats rather than the
 /// iterator's generic counts.)
 pub fn copytree_reporting(
@@ -344,6 +348,10 @@ fn copy_one_mount(
             EntryType::Symlink => {
                 make_symlink(parent_dst, entry.name(), entry.fd(), config)?;
                 stats.symlinks += 1;
+            }
+            EntryType::Special => {
+                make_special(parent_dst, entry.name(), &st, config)?;
+                stats.specials += 1;
             }
             // Mountpoints are never yielded here (single-filesystem walk);
             // child mounts are handled by the traverse post-pass.
@@ -516,6 +524,97 @@ fn make_symlink(
         Ok(Err(e)) => Err(e.into()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Recreate a special file (FIFO, socket, or block/character device) by type
+/// rather than copying contents — a special file has none, and opening one for
+/// data would block (FIFO) or run a device's `open` method. Metadata is set
+/// directly on the new node (no data fd exists for these types), each attribute
+/// gated on its copy flag.
+fn make_special(
+    parent: BorrowedFd<'_>,
+    name: &OsStr,
+    src_st: &Statx,
+    config: &CopyTreeConfig,
+) -> Result<()> {
+    // `mknodat`'s mode is umask-masked, so the exact permission bits are
+    // restored below; `rdev` is 0 for FIFOs/sockets and the device number for
+    // block/character devices. The `S_IFMT` bits in `mode` select the type.
+    let res = name.with_tn_path(|n| {
+        retry_on_eintr(|| unsafe {
+            libc::mknodat(
+                parent.as_raw_fd(),
+                n.as_ptr(),
+                src_st.mode() as libc::mode_t,
+                src_st.rdev(),
+            )
+        })
+    })?;
+    match res {
+        Ok(_) => {}
+        Err(Errno::EEXIST) if config.exist_ok => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
+
+    if config.flags.contains(CopyFlags::PERMISSIONS) {
+        let r = name
+            .with_tn_path(|n| {
+                retry_on_eintr(|| unsafe {
+                    libc::fchmodat(
+                        parent.as_raw_fd(),
+                        n.as_ptr(),
+                        src_st.mode() as libc::mode_t & 0o7777,
+                        0,
+                    )
+                })
+            })?
+            .map(drop)
+            .map_err(Error::from);
+        guard(config, r)?;
+    }
+    // Ownership failures always propagate (matching `copy_metadata`).
+    if config.flags.contains(CopyFlags::OWNER) {
+        name.with_tn_path(|n| {
+            retry_on_eintr(|| unsafe {
+                libc::fchownat(
+                    parent.as_raw_fd(),
+                    n.as_ptr(),
+                    src_st.uid(),
+                    src_st.gid(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            })
+        })??;
+    }
+    if config.flags.contains(CopyFlags::TIMESTAMPS) {
+        let a = src_st.atime();
+        let m = src_st.mtime();
+        let times = [
+            libc::timespec {
+                tv_sec: a.sec,
+                tv_nsec: a.nsec as i64,
+            },
+            libc::timespec {
+                tv_sec: m.sec,
+                tv_nsec: m.nsec as i64,
+            },
+        ];
+        let r = name
+            .with_tn_path(|n| {
+                retry_on_eintr(|| unsafe {
+                    libc::utimensat(
+                        parent.as_raw_fd(),
+                        n.as_ptr(),
+                        times.as_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                })
+            })?
+            .map(drop)
+            .map_err(Error::from);
+        guard(config, r)?;
+    }
+    Ok(())
 }
 
 fn list_xattrs(

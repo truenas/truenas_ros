@@ -17,10 +17,8 @@ pub(crate) mod probe;
 pub(crate) mod protocol;
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 pub(crate) mod reactor;
-pub(crate) mod ring;
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 pub(crate) mod sock;
-pub(crate) mod sys;
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 pub(crate) mod table;
 

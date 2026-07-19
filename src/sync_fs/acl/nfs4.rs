@@ -191,7 +191,13 @@ impl Nfs4Acl {
         }
         let acl_flags = Nfs4AclFlag::from_bits_retain(be32(data, 0));
         let naces = be32(data, 4) as usize;
-        if data.len() < HDR_SZ + naces * ACE_SZ {
+        // `naces` is attacker-controlled (from the xattr blob); compute the
+        // required length with checked arithmetic so a huge count cannot wrap
+        // `usize` and slip past the truncation guard (a 32-bit-target hazard).
+        let need = naces
+            .checked_mul(ACE_SZ)
+            .and_then(|n| n.checked_add(HDR_SZ));
+        if need.map_or(true, |need| data.len() < need) {
             return Err(Error::Parse(format!(
                 "NFS4 ACL truncated: {} bytes for {naces} ACEs",
                 data.len()
