@@ -588,7 +588,7 @@ mod tests {
         assert_eq!(t.generation(0), 1);
         assert!(!t.slot_matches(0, 0)); // token minted for gen 0 is stale
         assert!(!t.free(0)); // freeing an empty slot counts nothing
-        assert_eq!(t.generation(0), 2); // but still bumps (mirrors today)
+        assert_eq!(t.generation(0), 2); // but still bumps
     }
 
     #[test]

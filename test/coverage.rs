@@ -1,6 +1,6 @@
 //! Coverage-oriented integration tests (companion to `test.rs`), exercising the
-//! error/errno/path plumbing and the many exposed-but-previously-untested paths
-//! across each subsystem.
+//! error/errno/path plumbing and the many exposed paths the primary suite does
+//! not reach across each subsystem.
 #![cfg(target_os = "linux")]
 
 // ------------------------------------------------------------------ errno/error

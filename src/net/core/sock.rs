@@ -177,7 +177,7 @@ pub(crate) fn parse_peer(
 /// parse as `AF_INET`/`AF_INET6`; a getpeername failure (e.g. `ENOTCONN`
 /// after an early RST) or any other family returns `None` and the caller
 /// sheds — fail CLOSED, like the `SO_PEERNAME` accept path. Returning a
-/// fabricated identity here (the old `Unix { cred: None }` fallback) let a
+/// fabricated identity here (a `Unix { cred: None }` fallback) would let a
 /// remote TCP peer read as a local unix one to per-listener policy and audit
 /// hooks.
 pub(crate) fn peer_from_fd(fd: RawFd) -> Option<ClientAddr> {

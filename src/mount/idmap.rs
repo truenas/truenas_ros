@@ -23,11 +23,6 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::ptr;
 use std::sync::Mutex;
 
-// clone3 flags (defined here as libc lacks CLONE_CLEAR_SIGHAND).
-const CLONE_NEWUSER: u64 = 0x1000_0000;
-const CLONE_PIDFD: u64 = 0x0000_1000;
-const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
-
 // PIDFD_GET_USER_NAMESPACE = _IO(0xFF, 9). Requires Linux >= 6.9.
 const PIDFD_GET_USER_NAMESPACE: libc::c_ulong = 0xFF09;
 
@@ -81,25 +76,6 @@ impl IdmapEntry {
     }
 }
 
-/// Kernel `struct clone_args` (VER2, 88 bytes).
-#[repr(C)]
-#[derive(Default)]
-struct CloneArgs {
-    flags: u64,
-    pidfd: u64,
-    child_tid: u64,
-    parent_tid: u64,
-    exit_signal: u64,
-    stack: u64,
-    stack_size: u64,
-    tls: u64,
-    set_tid: u64,
-    set_tid_size: u64,
-    cgroup: u64,
-}
-
-const _: () = assert!(core::mem::size_of::<CloneArgs>() == 88);
-
 /// Create a new user namespace populated with `uid_map` / `gid_map` and return
 /// an owning fd that pins it.
 ///
@@ -132,25 +108,16 @@ fn format_map(entries: &[IdmapEntry]) -> String {
 }
 
 fn create_userns_fd(uid_text: &str, gid_text: &str) -> Result<OwnedFd> {
-    let mut pidfd: libc::c_int = -1;
-    let mut ca = CloneArgs {
-        flags: CLONE_NEWUSER | CLONE_PIDFD | CLONE_CLEAR_SIGHAND,
-        pidfd: &mut pidfd as *mut libc::c_int as u64,
-        exit_signal: libc::SIGCHLD as u64,
-        ..Default::default()
-    };
-
-    // SAFETY: clone3 with a valid, correctly-sized clone_args.
+    let mut pidfd: RawFd = -1;
+    // SAFETY: `create_idmap_userns` documents the single-threaded-at-fork
+    // precondition; the child below runs only `pause()` (async-signal-safe).
     let pid = unsafe {
-        libc::syscall(
-            libc::SYS_clone3,
-            &mut ca as *mut CloneArgs,
-            core::mem::size_of::<CloneArgs>(),
+        crate::clone3::clone3_fork(
+            crate::clone3::CLONE_NEWUSER,
+            libc::SIGCHLD as u64,
+            &mut pidfd,
         )
-    };
-    if pid < 0 {
-        return Err(Errno::last().into());
-    }
+    }?;
     if pid == 0 {
         // CHILD: async-signal-safe only — no allocation, no locks, no panics.
         // Block until the parent SIGKILLs us (uncatchable, bypasses pause()).

@@ -85,6 +85,19 @@ pub(crate) struct Reactor<U> {
     /// role loop (`take_pool_freed`) to re-arm any listener parked on a full
     /// pool. A flag rather than a role-side call keeps slot reclamation core.
     pub(crate) pool_freed: bool,
+    /// Connections `(slot, generation)` that began closing this dispatch and
+    /// carry an embedded fs pool: the server drains this after the reap loop to
+    /// sweep any fs files they left open (`FsCore::close_owned_by`). Recorded
+    /// in `close_conn` (once per connection); a server-only concern, so it is
+    /// gated on the combined feature.
+    #[cfg(all(feature = "net-server", feature = "async-fs"))]
+    pub(crate) fs_closed: Vec<(u32, u64)>,
+    /// Whether this reactor actually has an fs pool to sweep. Only a server
+    /// built with `fs_files > 0` sets it; a client (which drains nothing) and a
+    /// pool-less server leave it false, so `close_conn` never records into
+    /// `fs_closed` for them — otherwise a client would grow that Vec unbounded.
+    #[cfg(all(feature = "net-server", feature = "async-fs"))]
+    pub(crate) has_fs_pool: bool,
     /// The shared io_uring engine (ring, in-flight accounting, wake, stop
     /// flags). Declared last so the ring drops after `table`'s buffers.
     pub(crate) engine: Engine,
@@ -108,6 +121,10 @@ impl<U> Reactor<U> {
             on_close: None,
             draining: false,
             pool_freed: false,
+            #[cfg(all(feature = "net-server", feature = "async-fs"))]
+            fs_closed: Vec::new(),
+            #[cfg(all(feature = "net-server", feature = "async-fs"))]
+            has_fs_pool: false,
             engine,
         }
     }
@@ -183,10 +200,16 @@ impl<U> Reactor<U> {
     /// them: the ring fd still closes as the engine drops (cancelling the ops),
     /// but now against permanently-valid memory. Mirrors the `mem::forget` the
     /// peercred probe uses when `io_uring_enter` fails under it.
-    pub(crate) fn drain_or_leak(&mut self) {
+    /// Returns `true` if the drain failed and the buffers were leaked — an
+    /// embedding host with its own kernel-visible buffers on this ring (the
+    /// server's fs op table) must then leak those too.
+    pub(crate) fn drain_or_leak(&mut self) -> bool {
         if self.cancel_and_reap_all().is_err() {
             self.table.leak();
             self.engine.leak_wake_buf();
+            true
+        } else {
+            false
         }
     }
 

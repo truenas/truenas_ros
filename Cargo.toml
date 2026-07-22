@@ -51,11 +51,15 @@ uring = []
 net-core = ["uring"]
 net-server = ["net-core"]
 net-client = ["net-core"]
-# The io_uring filesystem reactor (design stub — the module documents the
-# charter; implementation lands per the fs-reactor design and will grow a
-# `sync-fs` dependency for the shared open/statx vocabulary). Kept out of
-# `default`/`full` until real.
-async-fs = ["uring"]
+# The io_uring filesystem reactor: files opened into a fixed-descriptor
+# pool, every op stamped with a registered personality (kernel-enforced
+# per-op identity), anchored path resolution. Off by default and absent from
+# `full` — it depends on the io_uring runtime, and (unlike the net roles) on a
+# credential broker forked before the daemon starts threads, so it is opt-in
+# rather than something `full` turns on underneath a consumer. Depends on
+# `sync-fs` for the shared OpenHow/ResolveFlag vocabulary; combine with
+# `net-server` for the in-server reactor (`ServerConfig::fs_files`).
+async-fs = ["uring", "sync-fs"]
 # Internal: exposes the pure `frame_step` framing decision to the fuzz crate
 # (`fuzz/`). Not for consumers; implies `net-server` (where `frame_step` lives).
 __fuzz = ["net-server"]
@@ -118,6 +122,14 @@ path = "test/net_server.rs"
 [[test]]
 name = "net_client"
 path = "test/net_client.rs"
+
+# io_uring fs reactor. Live tests against a tempdir (opens, vectored I/O,
+# personality registration, fixed-slot lifecycle); skip automatically when
+# io_uring is unavailable (sandbox/old kernel). Set
+# TRUENAS_ROS_REQUIRE_IO_URING=1 to make that a hard failure instead.
+[[test]]
+name = "async_fs"
+path = "test/async_fs.rs"
 
 # Consumer-facing example: the `net::server` handlers (esp. `accept`) as
 # standalone functions. Built only when the `net-server` feature is on.
