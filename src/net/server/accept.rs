@@ -427,8 +427,7 @@ where
     ) -> errno::Result<()> {
         // Check the generation BEFORE taking the state: a stale completion for
         // a recycled slot must not clear the new incarnation's pending fetch
-        // (matches `drain_handshake_outcomes`; the fixed-slot-reuse Critical
-        // showed "shouldn't happen" is not impossible). Kernel completion →
+        // (matches `drain_handshake_outcomes`). Kernel completion →
         // compare only the low 32 bits the op's user_data carried.
         if self.core.table.generation_low(slot) != generation {
             return Ok(()); // slot recycled under us

@@ -979,8 +979,8 @@ impl<U> Reactor<U> {
     /// keeps counting while a deferred reply is produced and flushed. A fire
     /// whose interval saw a completed send measured busy time, not quiet — it
     /// re-arms a fresh clock (clearing the flag) instead of reaping, which
-    /// otherwise races the just-served client's next request (observed as a
-    /// CI flake: reply flushed, clock expired, client's follow-up hit EOF).
+    /// otherwise races the just-served client's next request (reply flushed,
+    /// clock expired, client's follow-up hits EOF).
     /// Only a fire whose whole interval was quiet — nothing owed, nothing
     /// flushed — closes. A peer can never set the flag itself (it marks
     /// server-initiated sends), so an idle-forever connection still closes on

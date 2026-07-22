@@ -462,9 +462,9 @@ mod fsiter {
         assert_eq!(bytes, 6); // 1 + 2 + 3 (files only; dirs add no bytes)
     }
 
-    // A writer-less FIFO in the tree used to hang the walk forever on a blocking
-    // O_RDONLY open; it must now classify as `Special` and the walk must finish.
-    // (Pre-fix this test hangs and the harness times it out.)
+    // A writer-less FIFO in the tree would hang the walk forever on a blocking
+    // O_RDONLY open; it must classify as `Special` so the walk finishes without
+    // opening it.
     #[test]
     fn special_files_classify_without_hanging() {
         use std::os::unix::ffi::OsStrExt;
@@ -833,7 +833,7 @@ mod shutil {
     };
 
     // A writer-less FIFO in the source must be recreated by type, not read as a
-    // regular file (which would block the copy forever). Pre-fix this hangs.
+    // regular file (which would block the copy forever).
     #[test]
     fn recreates_special_files_by_type() {
         use std::os::unix::ffi::OsStrExt;
@@ -1058,9 +1058,8 @@ mod configfile {
 
     // A shallow-but-wide interpolation (one value referencing another ~2000
     // times, each ~1 KiB) expands past the output budget; the getter must error
-    // rather than build a multi-megabyte string. Pre-fix this exhausts memory
-    // for a deeply-nested variant; here it stays shallow so it exercises the
-    // output cap, not the depth cap.
+    // rather than build a multi-megabyte string. The input stays shallow so
+    // this exercises the output cap, not the depth cap.
     #[test]
     fn interpolation_output_is_bounded() {
         let big = "x".repeat(1024);

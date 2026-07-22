@@ -4,66 +4,81 @@ on:
   pull_request:
   push:
     branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      train:
+        description: 'TrueNAS train to test against (master or 26; default: derived from branch)'
+        type: string
+        required: false
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
+# Bump IMAGE_VERSION to bust the cached Debian cloud image (e.g. when it has
+# drifted). The TrueNAS kernel and OpenZFS debs are downloaded fresh from their
+# rolling <train>-nightly releases every run, so they are not tied to this key.
+env:
+  IMAGE_VERSION: v1
+
 jobs:
   qemu-test:
     name: Debian Trixie QEMU Test (ZFS + privileged)
     runs-on: ubuntu-24.04
-    env:
-      # TrueNAS 26.0 ships the 6.18 kernel series and OpenZFS 2.4 is not
-      # validated on anything newer — ZFS on a 7.x kernel is unsupported.
-      # trixie-backports carries only its newest kernel (7.0.x now), so the VM
-      # installs the last 6.18 it ever shipped from a pinned
-      # snapshot.debian.org view of trixie-backports. The two values are
-      # coupled (that snapshot serves exactly that version — qemu-3-build.sh
-      # asserts it); bump them together when moving to a newer target kernel.
-      KERNEL_APT_SNAPSHOT: "20260317T000000Z"
-      KERNEL_DEB_VERSION: "6.18.15-1~bpo13+1"
     steps:
     - uses: actions/checkout@v4
       with:
         ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
+    - name: Determine TrueNAS train
+      id: train
+      # Every one of these is a context value, not a literal: pass them through
+      # `env:` and quote them in the shell rather than interpolating `${{ }}`
+      # into the script, so a ref or dispatch input can never be read as shell.
+      env:
+        TRAIN_INPUT: ${{ inputs.train }}
+        EVENT_NAME: ${{ github.event_name }}
+        BASE_REF: ${{ github.base_ref }}
+        REF_NAME: ${{ github.ref_name }}
+      run: |
+        # An explicit input wins; otherwise map the branch (the PR base on
+        # PRs, else the triggering ref) to its train.
+        if [ -n "$TRAIN_INPUT" ]; then
+          TRAIN="$TRAIN_INPUT"
+        elif [ "$EVENT_NAME" = "pull_request" ]; then
+          TRAIN="$(.github/workflows/scripts/train-for-ref.sh "$BASE_REF")"
+        else
+          TRAIN="$(.github/workflows/scripts/train-for-ref.sh "$REF_NAME")"
+        fi
+        # The train names a release tag and a filesystem path in the VM; keep it
+        # to the shape train-for-ref.sh produces so a hand-typed dispatch input
+        # cannot smuggle anything else through.
+        case "$TRAIN" in
+          master|[0-9]*) ;;
+          *) echo "ERROR: unexpected train '$TRAIN'"; exit 1 ;;
+        esac
+        echo "train=$TRAIN" >> "$GITHUB_OUTPUT"
+        echo "Using TrueNAS train: $TRAIN"
+
     - name: Setup QEMU
       timeout-minutes: 10
       run: bash .github/workflows/scripts/qemu-1-setup.sh
-
-    - name: Get OpenZFS commit hash
-      id: zfs-hash
-      run: |
-        ZFS_COMMIT=$(git ls-remote https://github.com/truenas/zfs.git refs/heads/truenas/zfs-2.4-release | cut -f1)
-        echo "hash=$ZFS_COMMIT" >> $GITHUB_OUTPUT
-        echo "OpenZFS commit: $ZFS_COMMIT"
-
-    # The cached ZFS debs contain kmods built against the VM's pinned kernel;
-    # modules cached for another kernel would install but never modprobe, so
-    # the key includes the pinned version (qemu-3-build.sh asserts the VM
-    # installed and booted exactly that kernel).
-    - name: Cache OpenZFS packages
-      id: cache-zfs
-      uses: actions/cache@v4
-      with:
-        path: /tmp/zfs-debs
-        key: zfs-debs-debian-trixie-${{ steps.zfs-hash.outputs.hash }}-${{ env.KERNEL_DEB_VERSION }}
 
     - name: Cache Debian Trixie image
       uses: actions/cache@v4
       with:
         path: /tmp/qemu-work/debian-trixie.qcow2
-        key: debian-trixie-image-v1
+        key: debian-trixie-image-${{ env.IMAGE_VERSION }}
 
     - name: Start Debian Trixie VM
       timeout-minutes: 10
       run: bash .github/workflows/scripts/qemu-2-start.sh
 
-    - name: Build OpenZFS and stage truenas_ros
-      timeout-minutes: 60
+    - name: Install kernel + OpenZFS and stage truenas_ros
+      timeout-minutes: 20
       env:
-        ZFS_CACHE_HIT: ${{ steps.cache-zfs.outputs.cache-hit }}
+        TRAIN: ${{ steps.train.outputs.train }}
       run: bash .github/workflows/scripts/qemu-3-build.sh
 
     - name: Restart VM to load kernel modules

@@ -323,6 +323,13 @@ impl Statx {
     pub fn raw(&self) -> &StatxRaw {
         &self.0
     }
+
+    /// Wrap a kernel-filled `struct statx` (the io_uring `STATX` op writes
+    /// one into a buffer the completion hands back).
+    #[cfg_attr(not(feature = "async-fs"), allow(dead_code))]
+    pub(crate) fn from_raw(raw: StatxRaw) -> Statx {
+        Statx(raw)
+    }
 }
 
 /// Retrieve extended attributes for the file named by `path` relative to

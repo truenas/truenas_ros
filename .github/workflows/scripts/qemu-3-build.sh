@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
 
 ######################################################################
-# Build/install OpenZFS and stage truenas_ros in the VM
+# Install the prebuilt TrueNAS kernel and OpenZFS release debs in the VM,
+# then stage truenas_ros for the test step.
+#
+# Invoked with the TrueNAS train (master or 26) in the TRAIN environment
+# variable.  The kernel image (truenas/linux) and the OpenZFS userland +
+# kmod debs (truenas/zfs) are consumed from the rolling <TRAIN>-nightly
+# GitHub releases; the OpenZFS modules are prebuilt against that kernel, so
+# the VM must reboot into it (qemu-3.5-restart.sh) before the tests can load
+# zfs.ko.  truenas_ros itself is pure Rust (libc + bitflags) and needs no
+# ZFS headers to build, so it is compiled in the test step (as root, which
+# the ZFS/privileged cases require) after the reboot.
 ######################################################################
 
 set -eu
 
-echo "Building OpenZFS and staging truenas_ros..."
+TRAIN="${TRAIN:?TRAIN must be set (master or 26)}"
+
+echo "Installing prebuilt TrueNAS kernel + OpenZFS ($TRAIN train) and staging truenas_ros..."
 
 # Load VM info
 source /tmp/vm-info.sh
-
-# The kernel pin (see qemu-test.yml env: for the rationale and how to bump it)
-: "${KERNEL_APT_SNAPSHOT:?set by qemu-test.yml}"
-: "${KERNEL_DEB_VERSION:?set by qemu-test.yml}"
 
 # Wait for cloud-init to finish
 echo "Waiting for cloud-init to complete..."
@@ -23,226 +31,125 @@ ssh debian@$VM_IP "cloud-init status --wait" || true
 echo "Installing rsync in VM..."
 ssh debian@$VM_IP "sudo apt-get update && sudo apt-get install -y rsync"
 
-# Check if we have cached ZFS packages
-if [ "$ZFS_CACHE_HIT" = "true" ] && [ -d "/tmp/zfs-debs" ]; then
-  echo "Found cached OpenZFS packages, copying to VM..."
-  ssh debian@$VM_IP "mkdir -p /tmp/zfs-debs"
-  rsync -az /tmp/zfs-debs/ debian@$VM_IP:/tmp/zfs-debs/
-  CACHED_ZFS="true"
-else
-  echo "No cached OpenZFS packages found, will build from source"
-  CACHED_ZFS="false"
-fi
-
-# Copy source code to VM
+# Copy source code to VM (this brings the .github/workflows/scripts helpers
+# the remote script calls, e.g. tn-fetch-debs.sh).
 echo "Copying source code to VM..."
 ssh debian@$VM_IP "mkdir -p ~/truenas_ros"
 rsync -az --exclude='.git' --exclude='target/' \
   "$GITHUB_WORKSPACE/" debian@$VM_IP:~/truenas_ros/
 
-# Install dependencies (OpenZFS build deps + the Rust toolchain)
-echo "Installing dependencies in VM..."
-ssh debian@$VM_IP \
-  "KERNEL_APT_SNAPSHOT='$KERNEL_APT_SNAPSHOT' KERNEL_DEB_VERSION='$KERNEL_DEB_VERSION' bash -s" \
-  <<'REMOTE_DEPS'
+# Install the kernel + OpenZFS inside the VM.
+echo "Running in-VM kernel/OpenZFS install..."
+ssh debian@$VM_IP bash -s "$TRAIN" <<'REMOTE_SCRIPT'
+TRAIN="$1"
 set -eu
+export DEBIAN_FRONTEND=noninteractive
 
-# Run CI on TrueNAS 26.0's kernel series (6.18) instead of Trixie's default
-# 6.12: OpenZFS 2.4 targets 6.18 and is unsupported on newer majors (ZFS on a
-# 7.x kernel is undefined behavior), and 6.18 exercises the statmount
-# 6.14/6.15 fields (sb_source, uid/gid maps) the fs tests need. Live
-# trixie-backports carries only its newest kernel (7.0.x now), so pull the
-# last 6.18 it ever shipped from a pinned snapshot.debian.org view of the
-# archive. The snapshot's Release file has long expired —
-# [check-valid-until=no] accepts it; package integrity still comes from the
-# archive signatures. The peercred version gate lives in qemu-4-test.sh.
-#
-# The cloud image ALREADY ships live trixie-backports inside its default
-# debian.sources (inert until some install requests that release — but two
-# sources claiming the same release make apt take the newest version across
-# BOTH indexes, which is how live 7.0.x once beat this pin). Strip that
-# suite so the pinned snapshot below is the ONLY trixie-backports source,
-# and fail loudly if any other source file still mentions it.
-sudo sed -i 's/ trixie-backports\b//g' /etc/apt/sources.list.d/debian.sources
-echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${KERNEL_APT_SNAPSHOT}/ trixie-backports main" \
-  | sudo tee /etc/apt/sources.list.d/backports.list
-stray=$(grep -rl 'trixie-backports' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null \
-  | grep -v '/backports.list$' || true)
-if [ -n "$stray" ]; then
-  echo "ERROR: live trixie-backports still configured in: $stray"
-  exit 1
-fi
+cd ~/truenas_ros
+
 sudo apt-get update
 
-sudo apt-get install -y \
-  build-essential \
-  devscripts \
-  debhelper \
-  dh-autoreconf \
-  dh-python \
-  autoconf \
-  automake \
-  libtool \
-  pkg-config \
-  uuid-dev \
-  libssl-dev \
-  libaio-dev \
-  libblkid-dev \
-  libelf-dev \
-  libpam0g-dev \
-  libtirpc-dev \
-  libudev-dev \
-  lsb-release \
-  po-debconf \
-  zlib1g-dev \
-  python3-dev \
-  python3-all-dev \
-  python3-cffi \
-  python3-setuptools \
-  python3-sphinx \
-  dkms \
-  git \
-  gdb \
-  cargo
+# Packages the VM needs:
+#  - build + run the Rust tests: cargo, gdb (core dumps).
+#  - fetch + verify the releases: curl, jq, ca-certificates.
+# truenas_ros depends only on libc + bitflags, so no ZFS dev packages are
+# needed to build it; the OpenZFS debs below bring the zpool/zfs userland the
+# tests drive.
+sudo apt-get install -y cargo gdb curl jq ca-certificates
 
-# The pinned kernel image + matching headers (required for the ZFS kmod
-# build against that kernel). GRUB boots the highest version on the reboot
-# below (6.18 > 6.12). Install by EXACT version — not `-t trixie-backports`,
-# which selects by release name and would take a newer kernel if a second
-# backports source ever sneaks back in; the version-specific dependency
-# chain (linux-image-6.18.x+deb13-amd64, headers, kbuild) exists only in the
-# snapshot, so it resolves from there automatically. Then assert dpkg
-# agrees — a drifted snapshot or resolver surprise must fail here, not as a
-# mystery ZFS build/modprobe failure later.
-sudo apt-get install -y \
-  "linux-image-amd64=$KERNEL_DEB_VERSION" \
-  "linux-headers-amd64=$KERNEL_DEB_VERSION"
-got=$(dpkg-query -W -f='${Version}' linux-image-amd64)
-if [ "$got" != "$KERNEL_DEB_VERSION" ]; then
-  echo "ERROR: pinned kernel $KERNEL_DEB_VERSION but apt installed '$got'"
+# Fetch (and verify) the prebuilt OpenZFS debs and the TrueNAS kernel image
+# from their rolling <TRAIN>-nightly releases.
+ZFS_MANIFEST="$(.github/workflows/scripts/tn-fetch-debs.sh \
+  truenas/zfs "$TRAIN" /tmp/zfs-debs 'openzfs-*')"
+KERNEL_MANIFEST="$(.github/workflows/scripts/tn-fetch-debs.sh \
+  truenas/linux "$TRAIN" /tmp/tn-kernel 'linux-image-*')"
+
+# The OpenZFS kmod is built against one exact kernel.  The kernel and zfs
+# nightlies roll independently, so if the kernel has advanced past the one zfs
+# was built against, the prebuilt zfs.ko will not load.  Refuse to proceed on a
+# mismatch with a clear message rather than failing later at modprobe time.
+ZFS_KREL="$(jq -r '.kernel_release' "$ZFS_MANIFEST")"
+RELEASE="$(jq -r '.release' "$KERNEL_MANIFEST")"
+# jq prints "null" for a key that isn't there, which would otherwise reach the
+# mismatch report below as a real kernel name and send whoever reads it hunting
+# a nightly-drift problem that doesn't exist.  Say what actually went wrong: the
+# manifest is not the shape this script expects.
+for pair in "kernel_release:$ZFS_KREL:$ZFS_MANIFEST" "release:$RELEASE:$KERNEL_MANIFEST"; do
+  key="${pair%%:*}"; rest="${pair#*:}"; val="${rest%%:*}"; file="${rest#*:}"
+  if [ -z "$val" ] || [ "$val" = "null" ]; then
+    echo "FATAL: $file has no usable '.$key' — the release manifest format changed."
+    exit 1
+  fi
+done
+if [ "$ZFS_KREL" != "$RELEASE" ]; then
+  echo "FATAL: OpenZFS $TRAIN-nightly debs were built against kernel $ZFS_KREL,"
+  echo "but truenas/linux $TRAIN-nightly currently publishes kernel $RELEASE."
+  echo "The two rolling nightlies are out of sync; the prebuilt zfs.ko cannot"
+  echo "load under the mismatched kernel.  This self-heals once the truenas/zfs"
+  echo "nightly rebuilds against $RELEASE."
   exit 1
 fi
-echo "Installed pinned kernel $got"
-REMOTE_DEPS
+echo "Kernel release: $RELEASE (matches the OpenZFS build kernel)"
 
-# Reboot VM to boot into the newly installed kernel
-echo "Rebooting VM to load new kernel..."
-ssh debian@$VM_IP 'sudo poweroff' &
+# Install the TrueNAS kernel image first, so /lib/modules/$RELEASE exists and
+# the modules deb's linux-image-$RELEASE dependency resolves.
+echo "Installing TrueNAS kernel image..."
+sudo -E apt-get install -y /tmp/tn-kernel/linux-image-*.deb
 
-# Wait for VM to shut down
-echo "Waiting for VM to shut down..."
-for i in {1..60}; do
-  if sudo virsh list --all | grep "$VM_NAME" | grep -q "shut off"; then
-    echo "VM has shut down"
-    break
-  fi
-  echo "Waiting for shutdown... ($i/60)"
-  sleep 2
-done
+# Install the OpenZFS userland + kmod debs (the release already excludes
+# dkms/dracut).
+echo "Installing OpenZFS debs..."
+sudo -E apt-get install -y /tmp/zfs-debs/openzfs-*.deb
+sudo depmod -a "$RELEASE"
 
-# Verify it's actually shut off
-if ! sudo virsh list --all | grep "$VM_NAME" | grep -q "shut off"; then
-  echo "VM did not shut down gracefully, forcing shutdown..."
-  sudo virsh destroy "$VM_NAME" || true
-  sleep 3
+# The prebuilt zfs.ko must have landed under the TrueNAS kernel's modules tree,
+# or the post-reboot modprobe will fail.  Fail loudly here instead.
+ZFS_KO="$(find "/lib/modules/$RELEASE" -name 'zfs.ko*' -print -quit 2>/dev/null || true)"
+if [ -z "$ZFS_KO" ]; then
+  echo "FATAL: no zfs.ko under /lib/modules/$RELEASE/ after installing the OpenZFS modules deb"
+  echo "Installed zfs.ko paths in /lib/modules:"
+  find /lib/modules -name 'zfs.ko*' 2>/dev/null || echo "  (none found)"
+  exit 1
 fi
+echo "Found zfs.ko at: $ZFS_KO"
 
-# Start the VM
-echo "Starting VM with new kernel..."
-sudo virsh start "$VM_NAME"
-
-# Give it time to start booting
-sleep 5
-
-# Wait for VM to be accessible via SSH again
-echo "Waiting for VM to come back up..."
-for i in {1..60}; do
-  if ssh -o ConnectTimeout=2 debian@$VM_IP "echo 'VM ready'" 2>/dev/null; then
-    echo "VM is accessible via SSH"
-    break
-  fi
-  echo "Waiting for VM... ($i/60)"
-  sleep 5
-done
-
-# Verify the VM booted the pinned 6.18 kernel, not Trixie's default 6.12. A
-# silent fallback to 6.12 would under-test statmount and misreport peercred,
-# so the wrong series is a hard failure. (The exact deb version was already
-# asserted at install time; GRUB boots the highest installed version.)
-echo "Verifying new kernel is running..."
-booted=$(ssh debian@$VM_IP "uname -r")
-echo "Booted kernel: $booted"
-case "$booted" in
-  6.18.* | 6.18-*) echo "On the pinned 6.18 series as expected" ;;
-  *) echo "ERROR: expected the pinned 6.18 kernel, got '$booted'"; exit 1 ;;
-esac
-
-# Now build/install OpenZFS
-echo "Building OpenZFS..."
-ssh debian@$VM_IP bash -s "$CACHED_ZFS" <<'REMOTE_SCRIPT'
-CACHED_ZFS="$1"
-set -eu
-
-# Install or build OpenZFS. The cached debs contain kmods built for ONE
-# kernel: trust them only if their KERNEL marker matches the running kernel.
-# The cache key already includes the backports kernel version, so a mismatch
-# here means key drift — rebuild rather than install modules that can never
-# modprobe.
-if [ -d "/tmp/zfs-debs" ] && [ "$(ls -A /tmp/zfs-debs/*.deb 2>/dev/null)" ] \
-  && [ "$(cat /tmp/zfs-debs/KERNEL 2>/dev/null)" = "$(uname -r)" ]; then
-  echo "Using cached OpenZFS packages..."
-  sudo apt-get -y install $(find /tmp/zfs-debs -name '*.deb' | grep -Ev 'dkms|dracut')
-  echo "Updating module dependencies..."
-  sudo depmod -a
-else
-  if [ -d "/tmp/zfs-debs" ] && [ "$(ls -A /tmp/zfs-debs 2>/dev/null)" ]; then
-    echo "Cached OpenZFS packages unusable on kernel $(uname -r); rebuilding..."
-    rm -rf /tmp/zfs-debs
-  fi
-  echo "Building OpenZFS from source..."
-  cd /tmp
-  git clone --depth 1 --branch truenas/zfs-2.4-release https://github.com/truenas/zfs.git
-  cd zfs
-  ./autogen.sh
-  ./configure --prefix=/usr --enable-debuginfo
-  # Build the native-deb targets sequentially. Run concurrently (with a
-  # multi-core -j) they each invoke dpkg-source in this shared tree and clobber
-  # one another's generated files (e.g. zfs_gitrev.h), which breaks the kmod
-  # module build; the failure is sensitive to the runner's core count.
-  make -j$(nproc) native-deb-utils
-  make -j$(nproc) native-deb-kmod
-
-  echo "Saving built packages for caching..."
-  mkdir -p /tmp/zfs-debs
-  find /tmp -maxdepth 1 -name '*.deb' | grep -Ev 'dkms|dracut' | while read deb; do
-    cp "$deb" /tmp/zfs-debs/
-  done
-  # Mark which kernel these kmods were built for (checked before reuse above).
-  uname -r > /tmp/zfs-debs/KERNEL
-
-  sudo apt-get -y install $(find /tmp -maxdepth 1 -name '*.deb' | grep -Ev 'dkms|dracut')
-  echo "Updating module dependencies..."
-  sudo depmod -a
+# Replace the distribution kernel with the TrueNAS kernel so the next boot
+# (qemu-3.5-restart.sh) can only use it, and the prebuilt zfs.ko can load.
+echo "Removing distribution kernels so the TrueNAS kernel is the default..."
+# Let apt remove the running (stock) kernel without aborting.
+echo 'linux-base linux-base/removing-running-kernel boolean false' | \
+  sudo debconf-set-selections
+# TrueNAS kernel packages carry version-free names
+# (linux-{image,headers}-truenas-production-amd64), so tell them apart from the
+# distribution kernels by name.
+STOCK=$(dpkg-query -W -f '${Package}\n' 'linux-image-*' 'linux-headers-*' | \
+  grep -v -- truenas || true)
+if [ -n "$STOCK" ]; then
+  sudo -E apt-get purge -y $STOCK
 fi
+sudo update-grub
 
-# Sanity-check the Rust toolchain; the tests are built in the test step (as root,
-# which is required for the ZFS/privileged cases).
+# The TrueNAS kernel must now be the one and only installed kernel.
+test -e "/boot/vmlinuz-$RELEASE"
+test "$(ls /boot/vmlinuz-* | wc -l)" -eq 1
+
+# Record it for the test step, which asserts the VM actually came back up on
+# this kernel.  "Only one kernel is installed" is not the same as "the reboot
+# landed on it" — a stale GRUB entry or a failed update-grub would boot
+# something else, and the ZFS/statmount/io_uring coverage silently changes.
+echo "$RELEASE" > /home/debian/tn-kernel-release
+
+# Sanity-check the Rust toolchain; the tests are built in the test step.
 echo "Rust toolchain:"
 cargo --version
 
-echo "OpenZFS installed and truenas_ros staged."
+echo "Kernel + OpenZFS installed and truenas_ros staged."
+echo "The zfs.ko module loads after the VM restarts into the TrueNAS kernel."
 REMOTE_SCRIPT
 
-# Copy ZFS packages back from VM for caching (if we built them)
-# Do this BEFORE powering off the VM
-if [ "$CACHED_ZFS" = "false" ]; then
-  echo "Copying built OpenZFS packages from VM for caching..."
-  mkdir -p /tmp/zfs-debs
-  rsync -az debian@$VM_IP:/tmp/zfs-debs/ /tmp/zfs-debs/ || echo "Note: No packages to cache"
-fi
-
-# Clean cloud-init and poweroff VM
+# Clean cloud-init and poweroff VM (qemu-3.5-restart.sh brings it back up into
+# the TrueNAS kernel).
 echo "Cleaning cloud-init and powering off VM..."
 ssh debian@$VM_IP 'sudo cloud-init clean --logs && sync && sleep 2 && sudo poweroff' &
 
-echo "Build complete, VM shutting down for final restart"
+echo "Install complete, VM shutting down for restart"

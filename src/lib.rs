@@ -18,8 +18,9 @@
 //! umbrella modules: [`sync_fs`] (blocking fs bindings — features `sync-fs`,
 //! `xattr`, `acl`, `fhandle`, `fsiter`, `shutil`), [`mount`] (mount topology
 //! and idmapped-mount support — features `mount`, `idmap`), [`configfile`],
-//! and the io_uring `net` stack (`net-core`/`net-server`/`net-client`);
-//! `full` enables them all.
+//! the io_uring `net` stack (`net-core`/`net-server`/`net-client`), and the
+//! io_uring fs reactor `async_fs` (`async-fs`); `full` enables all but the
+//! still-landing fs reactor.
 #![cfg(target_os = "linux")]
 #![allow(non_camel_case_types)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -39,6 +40,11 @@ pub mod errno;
 mod error;
 pub mod fd;
 pub mod path;
+
+// The shared `clone3` fork helper (pidfd + signal-handler reset), used by the
+// credential broker and the idmapped-mount userns builder.
+#[cfg(any(feature = "idmap", feature = "async-fs"))]
+mod clone3;
 
 pub use errno::Errno;
 pub use error::{Error, Result};

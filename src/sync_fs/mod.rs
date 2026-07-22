@@ -11,7 +11,7 @@
 #[cfg(feature = "sync-fs")]
 mod atomic;
 #[cfg(feature = "sync-fs")]
-mod openat2;
+pub(crate) mod openat2;
 #[cfg(feature = "sync-fs")]
 mod renameat2;
 #[cfg(feature = "sync-fs")]

@@ -154,10 +154,27 @@ impl Ring {
         register_file_alloc_range(self.raw_fd(), 0, count)
     }
 
+    /// Register a sparse table of `pool + fs` slots but confine
+    /// auto-allocation to just `[0, pool)` — the connection pool. The upper
+    /// `[pool, pool + fs)` range is handed out at **explicit** indices by the
+    /// embedded fs reactor, so multishot accept (which auto-allocates at each
+    /// completion) can never land there, and a burst of file opens can never
+    /// starve accepts. One table, two disjoint index ranges (fs-reactor
+    /// design §4).
+    #[cfg(all(feature = "net-server", feature = "async-fs"))]
+    pub(crate) fn register_pool_with_fs(
+        &self,
+        pool: u32,
+        fs: u32,
+    ) -> errno::Result<()> {
+        register_files_sparse(self.raw_fd(), pool + fs)?;
+        register_file_alloc_range(self.raw_fd(), 0, pool)
+    }
+
     /// Install a connected socket `fd` into the pool at `slot` (client-side; the
     /// server's pool fills via multishot-accept auto-allocation). The kernel
     /// takes its own reference, so `fd` may be closed after this returns.
-    #[cfg(feature = "net-client")]
+    #[cfg(any(feature = "net-client", feature = "async-fs"))]
     pub(crate) fn install_file(
         &self,
         slot: u32,
