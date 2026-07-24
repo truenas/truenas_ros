@@ -52,10 +52,15 @@ sudo apt-get update
 # Packages the VM needs:
 #  - build + run the Rust tests: cargo, gdb (core dumps).
 #  - fetch + verify the releases: curl, jq, ca-certificates.
-# truenas_ros depends only on libc + bitflags, so no ZFS dev packages are
-# needed to build it; the OpenZFS debs below bring the zpool/zfs userland the
-# tests drive.
-sudo apt-get install -y cargo gdb curl jq ca-certificates
+#  - link the kTLS test: pkg-config, libssl-dev. The library is still just
+#    libc + bitflags, but the test profile pulls openssl to put a real TLS
+#    peer opposite the kernel-TLS transport, and openssl-sys locates the
+#    system OpenSSL through pkg-config. Both used to arrive as OpenZFS
+#    build dependencies, which is why they outlived the source build here.
+# No ZFS dev packages are needed: the OpenZFS debs below bring the zpool/zfs
+# userland the tests drive.
+sudo apt-get install -y cargo gdb curl jq ca-certificates \
+  pkg-config libssl-dev
 
 # Fetch (and verify) the prebuilt OpenZFS debs and the TrueNAS kernel image
 # from their rolling <TRAIN>-nightly releases.

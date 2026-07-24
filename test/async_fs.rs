@@ -908,24 +908,40 @@ fn is_root() -> bool {
 const NOBODY_UID: u32 = 65_534;
 const NOBODY_GID: u32 = 65_534;
 
+/// The identity a test can actually register: root impersonates anyone, an
+/// unprivileged runner can only ask for what it already holds — *including*
+/// its supplementary groups. Naming uid/gid alone would request an empty
+/// group list, and dropping a group is itself a privileged change, so the
+/// broker's `setgroups` would fail with `EPERM`.
+fn registerable_user() -> AsUser {
+    if is_root() {
+        return AsUser::new(NOBODY_UID, NOBODY_GID);
+    }
+    // SAFETY: these cannot fail.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    // SAFETY: a zero count asks for the length instead of writing.
+    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    assert!(n >= 0, "getgroups count");
+    let mut groups = vec![0 as libc::gid_t; n as usize];
+    // SAFETY: the destination holds the `n` entries just counted.
+    let n = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
+    assert!(n >= 0, "getgroups");
+    groups.truncate(n as usize);
+    AsUser::new(uid, gid).groups(groups)
+}
+
 #[test]
 fn broker_registers_own_identity_unprivileged() {
     // Registering credentials identical to the broker's needs no privilege
     // at all, so this leg runs everywhere and covers the IPC round trip:
-    // socketpair framing, SCM_RIGHTS ring handoff, and a real op under the
+    // socketpair framing, the inherited ring fd, and a real op under the
     // resulting id.
     with_broker(|h, creds, _me, dir| {
-        // SAFETY: these cannot fail.
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        if uid == 0 {
+        if is_root() {
             // Root's own identity is refused by policy; covered below.
             return;
         }
-        let mut groups = [0 as libc::gid_t; 64];
-        // SAFETY: valid destination buffer.
-        let n = unsafe { libc::getgroups(64, groups.as_mut_ptr()) };
-        assert!(n >= 0);
-        let who = AsUser::new(uid, gid).groups(groups[..n as usize].to_vec());
+        let who = registerable_user();
         let id = creds.register(&who).expect("brokered self-registration");
 
         std::fs::write(dir.join("f"), b"brokered").unwrap();
@@ -1193,16 +1209,7 @@ fn broker_reverts_credentials_between_registrations() {
 #[test]
 fn unregistered_personality_stops_working() {
     with_broker(|h, creds, _me, dir| {
-        // SAFETY: cannot fail.
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        let who = if uid == 0 {
-            if !is_root() {
-                return;
-            }
-            AsUser::new(NOBODY_UID, NOBODY_GID)
-        } else {
-            AsUser::new(uid, gid)
-        };
+        let who = registerable_user();
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))
             .unwrap();
         std::fs::write(dir.join("f"), b"x").unwrap();
@@ -1231,26 +1238,11 @@ fn unregistered_personality_stops_working() {
 
 // --- M3: the identity cache (register once per *identity*, not per connection)
 
-/// The identity a test can actually register: root can impersonate anyone,
-/// an unprivileged runner can only re-register itself.
-fn cacheable_user() -> AsUser {
-    if is_root() {
-        AsUser::new(NOBODY_UID, NOBODY_GID)
-    } else {
-        // SAFETY: cannot fail.
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        let mut groups = [0 as libc::gid_t; 64];
-        // SAFETY: valid destination.
-        let n = unsafe { libc::getgroups(64, groups.as_mut_ptr()) };
-        AsUser::new(uid, gid).groups(groups[..n.max(0) as usize].to_vec())
-    }
-}
-
 #[test]
 fn identity_cache_registers_once_per_identity() {
     with_broker(|h, creds, _me, dir| {
         let cache = IdentityCache::new(creds.clone());
-        let who = cacheable_user();
+        let who = registerable_user();
 
         // Many "connections" for one identity → one registration.
         let leases: Vec<_> = (0..8)
@@ -1306,7 +1298,7 @@ fn identity_cache_registers_once_per_identity() {
 fn identity_cache_invalidation_reregisters_without_disturbing_leases() {
     with_broker(|h, creds, _me, dir| {
         let cache = IdentityCache::new(creds.clone());
-        let who = cacheable_user();
+        let who = registerable_user();
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))
             .unwrap();
         let anchor = Anchor::open(dir).unwrap();
@@ -1349,7 +1341,7 @@ fn identity_cache_invalidation_reregisters_without_disturbing_leases() {
 fn identity_cache_is_concurrency_safe() {
     with_broker(|_h, creds, _me, _dir| {
         let cache = IdentityCache::new(creds.clone());
-        let who = cacheable_user();
+        let who = registerable_user();
         // A connection burst for one identity collapses to one registration
         // rather than stampeding the broker.
         let ids: Vec<Personality> = thread::scope(|s| {
