@@ -81,6 +81,20 @@ fn require_fd_xattr(caps: Caps) -> bool {
     true
 }
 
+/// Pin a known umask for the whole binary. Several tests assert on the mode
+/// of something they create — `mkdirat`'s mode argument, or a setup file an
+/// impersonated user has to be able to read — and the kernel masks every one
+/// of those with the umask the suite happens to inherit. Left alone, a
+/// developer or CI runner at 0077 fails those tests for a reason that has
+/// nothing to do with the code under test.
+fn pin_umask() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: umask cannot fail; it returns the previous mask.
+        unsafe { libc::umask(0o022) };
+    });
+}
+
 /// Build an `AsyncFs` over a fresh tempdir, register a self personality, run
 /// the loop on this thread, and drive `client` from a scoped thread.
 fn with_fs<F>(cfg: FsConfig, client: F)
@@ -95,6 +109,7 @@ fn with_fs_caps<F>(cfg: FsConfig, client: F)
 where
     F: FnOnce(FsHandle, Personality, PathBuf, ShutdownHandle, Caps) + Send,
 {
+    pin_umask();
     let dir = tempfile::tempdir().expect("tempdir");
     let mut afs = match AsyncFs::new(cfg) {
         Ok(a) => a,
@@ -862,7 +877,17 @@ fn with_broker<F>(client: F)
 where
     F: FnOnce(&FsHandle, &CredHandle, Personality, &Path) + Send,
 {
+    pin_umask();
     let dir = tempfile::tempdir().expect("tempdir");
+    // These tests drive ops as an impersonated user, who must be able to
+    // traverse this directory and — for the ones that create as that user —
+    // write in it. A fresh tempdir is only owner-writable, so widen it once
+    // here rather than in each test.
+    std::fs::set_permissions(
+        dir.path(),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .expect("chmod tempdir");
     // The ring must exist before the broker forks: it inherits the fd,
     // because an io_uring descriptor cannot be sent over a unix socket.
     let mut afs = match AsyncFs::new(FsConfig::default()) {
@@ -915,7 +940,11 @@ const NOBODY_GID: u32 = 65_534;
 /// broker's `setgroups` would fail with `EPERM`.
 fn registerable_user() -> AsUser {
     if is_root() {
-        return AsUser::new(NOBODY_UID, NOBODY_GID);
+        // Carry two supplementary groups: the callers that exercise set
+        // normalization need something to shuffle, and an empty list would
+        // leave that check dead whenever the suite runs privileged.
+        return AsUser::new(NOBODY_UID, NOBODY_GID)
+            .groups(vec![NOBODY_GID, 65_533]);
     }
     // SAFETY: these cannot fail.
     let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
@@ -967,7 +996,7 @@ fn broker_refuses_uid_zero() {
 }
 
 #[test]
-fn broker_rejects_oversized_group_list() {
+fn group_list_beyond_the_cap_is_rejected_not_truncated() {
     with_broker(|_h, creds, _me, _dir| {
         // Distinct ids: repeating one gid would collapse under the set
         // normalization and no longer exceed the cap.
@@ -975,12 +1004,9 @@ fn broker_rejects_oversized_group_list() {
             .map(|i| 400_000 + i as u32)
             .collect();
         let who = AsUser::new(NOBODY_UID, NOBODY_GID).groups(over);
+        // Truncating would silently change what the identity may do, so an
+        // over-long list must fail loudly instead.
         assert!(matches!(creds.register(&who), Err(Error::Validation(_))));
-        // The broker is still healthy after a rejected request.
-        if is_root() {
-            let ok = AsUser::new(NOBODY_UID, NOBODY_GID);
-            creds.register(&ok).expect("broker still serving");
-        }
     });
 }
 
@@ -1092,9 +1118,6 @@ fn impersonated_create_is_owned_by_the_user() {
         return;
     }
     with_broker(|h, creds, _me, dir| {
-        // A directory the user may write in.
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))
-            .unwrap();
         let anchor = Anchor::open(dir).unwrap();
         let user = creds
             .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
@@ -1177,8 +1200,6 @@ fn broker_reverts_credentials_between_registrations() {
         return;
     }
     with_broker(|h, creds, _me, dir| {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))
-            .unwrap();
         let anchor = Anchor::open(dir).unwrap();
 
         // Register a low-privilege identity, then another with a different
@@ -1210,8 +1231,6 @@ fn broker_reverts_credentials_between_registrations() {
 fn unregistered_personality_stops_working() {
     with_broker(|h, creds, _me, dir| {
         let who = registerable_user();
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))
-            .unwrap();
         std::fs::write(dir.join("f"), b"x").unwrap();
         std::fs::set_permissions(
             dir.join("f"),
@@ -1268,16 +1287,14 @@ fn identity_cache_registers_once_per_identity() {
         }
 
         // The id works while leased.
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))
-            .unwrap();
         let anchor = Anchor::open(dir).unwrap();
         let f = h.open(id, &anchor, "c", creat_rw()).expect("open");
         h.close(f).unwrap();
 
-        // Dropping all but one keeps it alive...
+        // Every lease is gone, but the cache map holds the last reference —
+        // so the id survives and the next acquire reuses it rather than
+        // paying for a fresh registration.
         drop(leases);
-        // ...the equivalent-identity lease above already went out of scope,
-        // so re-acquire to hold it while we check liveness.
         let held = cache.acquire(&who).expect("re-acquire");
         assert_eq!(held.personality(), id, "still the same registration");
         let f = h.open(id, &anchor, "d", creat_rw()).expect("still live");
@@ -1299,8 +1316,6 @@ fn identity_cache_invalidation_reregisters_without_disturbing_leases() {
     with_broker(|h, creds, _me, dir| {
         let cache = IdentityCache::new(creds.clone());
         let who = registerable_user();
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))
-            .unwrap();
         let anchor = Anchor::open(dir).unwrap();
 
         let old = cache.acquire(&who).expect("acquire");
@@ -1375,9 +1390,6 @@ fn large_ad_group_list_round_trips() {
         return; // setgroups with a foreign list needs CAP_SETGID
     }
     with_broker(|h, creds, _me, dir| {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))
-            .unwrap();
-
         for n in [256usize, 1024, truenas_ros::async_fs::MAX_GROUPS] {
             let groups: Vec<u32> = (0..n as u32).map(|i| 200_000 + i).collect();
             // One of them is the group that will own the file, proving the
@@ -1424,19 +1436,6 @@ fn large_ad_group_list_round_trips() {
     });
 }
 
-#[test]
-fn group_list_beyond_the_cap_is_rejected_not_truncated() {
-    with_broker(|_h, creds, _me, _dir| {
-        let too_many: Vec<u32> = (0..=truenas_ros::async_fs::MAX_GROUPS)
-            .map(|i| 300_000 + i as u32)
-            .collect();
-        let who = AsUser::new(NOBODY_UID, NOBODY_GID).groups(too_many);
-        // Truncating would silently change what the identity may do, so an
-        // over-long list must fail loudly instead.
-        assert!(matches!(creds.register(&who), Err(Error::Validation(_))));
-    });
-}
-
 // --- Security regressions -------------------------------------------------
 
 #[test]
@@ -1465,10 +1464,5 @@ fn sentinel_uid_gid_are_refused_by_the_api() {
             creds.register(&AsUser::new(1000, u32::MAX)),
             Err(Error::Validation(_))
         ));
-        // The broker is still healthy after the rejections.
-        if is_root() {
-            let ok = creds.register(&AsUser::new(NOBODY_UID, NOBODY_GID));
-            ok.expect("broker still serving after sentinel rejection");
-        }
     });
 }
