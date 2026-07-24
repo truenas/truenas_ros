@@ -24,7 +24,7 @@ env:
 
 jobs:
   qemu-test:
-    name: Debian Trixie QEMU Test (ZFS + privileged)
+    name: Debian Trixie QEMU Test (TrueNAS kernel + ZFS)
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v4
