@@ -35,6 +35,16 @@ pub struct ServerConfig {
     /// ~512 MiB ceiling. Empty slots are near-free (~32 bytes each), so
     /// headroom costs nothing at idle.
     pub pool_size: u32,
+    /// Maximum concurrently-open files for the embedded fs reactor
+    /// ([`Request::fs`](super::Request::fs)), or `0` (the default) to disable
+    /// it. When non-zero the server registers one shared fixed-file table of
+    /// `pool_size + fs_files` slots — connections auto-allocate in
+    /// `[0, pool_size)`, opened files take explicit indices in the upper
+    /// range — and drives an `async_fs` reactor on this same ring, so a
+    /// protocol handler can do filesystem work bound to a request, stamped
+    /// with the connection's personality. Requires the `async-fs` feature.
+    #[cfg(feature = "async-fs")]
+    pub fs_files: u32,
     /// Maximum bytes accepted for one message (header + body), a memory guard
     /// that also bounds header scanning. Enforced strictly for length-prefixed
     /// frames; for a `More`/delimiter-scanning framer the accumulate buffer can
@@ -193,6 +203,8 @@ impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
             pool_size: 512,
+            #[cfg(feature = "async-fs")]
+            fs_files: 0,
             max_request_bytes: 1024 * 1024,
             backlog: 128,
             unlink_unix: true,
@@ -234,6 +246,29 @@ impl ServerConfig {
         if self.pool_size == 0 || self.pool_size > MAX_POOL {
             return Err(Error::Validation(format!(
                 "pool_size must be in 1..={MAX_POOL}"
+            )));
+        }
+        // The fs pool shares the one registered file table with the connection
+        // pool, so `pool_size + fs_files` (and `fs_files * 2` op slots) must fit
+        // the 24-bit slot space — bound it here (checked in u64) rather than
+        // overflow the `pool + fs` add in `Engine::new_with_fs`/`FsCore::new`.
+        #[cfg(feature = "async-fs")]
+        if u64::from(self.pool_size) + u64::from(self.fs_files)
+            > u64::from(MAX_POOL)
+        {
+            return Err(Error::Validation(format!(
+                "pool_size + fs_files must not exceed {MAX_POOL}"
+            )));
+        }
+        // Each fs file needs two op slots (`fs_files * 2`), and an op-slot index
+        // is packed into the same 24-bit `user_data` slot field as a pool slot.
+        // Bound it here so an oversized `fs_files` fails as a clean Validation
+        // rather than truncating a completion token later (`MAX_POOL` is that
+        // 24-bit ceiling — the `user_data::SLOT_MASK`).
+        #[cfg(feature = "async-fs")]
+        if u64::from(self.fs_files).saturating_mul(2) > u64::from(MAX_POOL) {
+            return Err(Error::Validation(format!(
+                "fs_files * 2 must not exceed {MAX_POOL}"
             )));
         }
         if self.max_request_bytes == 0

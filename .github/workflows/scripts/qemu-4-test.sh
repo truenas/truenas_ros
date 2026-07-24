@@ -16,6 +16,23 @@ ssh debian@$VM_IP 'sudo bash -s' <<'REMOTE_SCRIPT'
 set -eu
 
 echo "=========================================="
+echo "Verifying the booted kernel"
+echo "=========================================="
+# qemu-3-build.sh installed exactly one kernel and recorded its release; assert
+# the reboot actually landed on it. Booting anything else silently changes what
+# the suite covers (statmount 6.14/6.15 fields, io_uring opcode floors, the
+# peercred gate below) and would otherwise only surface as a confusing modprobe
+# failure — or not at all.
+EXPECTED_RELEASE=$(cat /home/debian/tn-kernel-release)
+if [ "$(uname -r)" != "$EXPECTED_RELEASE" ]; then
+  echo "ERROR: expected to boot the TrueNAS kernel $EXPECTED_RELEASE,"
+  echo "but the VM is running $(uname -r)"
+  exit 1
+fi
+echo "Booted the TrueNAS kernel $EXPECTED_RELEASE as expected"
+
+echo ""
+echo "=========================================="
 echo "Loading ZFS kernel module"
 echo "=========================================="
 sudo modprobe zfs || {
@@ -73,21 +90,24 @@ export CARGO_TERM_COLOR=never
 # real failure that must turn CI red.
 export TRUENAS_ROS_REQUIRE_IO_URING=1
 export TRUENAS_ROS_REQUIRE_KTLS=1
+# The async_fs fd-based xattr ops need io_uring to accept a registered-table
+# file for IORING_OP_F[GS]ETXATTR — kernel commit dc7e76ba7a60, Linux >= 6.13.
+# The TrueNAS nightly kernel (6.18-based for the master train) is well past
+# that, so these must RUN; they skip on older hosts (the 6.12 dev box), which
+# is exactly the coverage hole this closes.
+export TRUENAS_ROS_REQUIRE_FD_XATTR=1
 # unix_peercred needs the AF_UNIX io_uring getsockopt fix (kernel >= 6.18.16).
-# The pinned VM kernel (see qemu-test.yml) is currently 6.18.15 — the last
-# 6.18 trixie-backports ever shipped — so this stays pending until the pin
-# moves to a 6.18.16+ kernel (e.g. a TrueNAS-built 6.18); the gate below then
-# enforces automatically. Read the running kernel's exact Debian package
-# version: uname -r omits the stable point release, and /proc/version's first
-# "Debian x.y.z" is the compiler, not the kernel. Enforce when new enough;
-# else print a visible pending line, not a silent skip.
-kver=$(dpkg-query -W -f='${Version}' "linux-image-$(uname -r)" 2>/dev/null \
-  | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
+# We boot the TrueNAS <train>-nightly kernel (truenas/linux), whose uname -r
+# carries the full point release (e.g. 6.18.16-production+truenas), so read it
+# straight from there. Enforce once the booted kernel is new enough; else print
+# a visible pending line, not a silent skip (a still-behind TrueNAS kernel
+# self-heals when it picks up the fix).
+kver=$(uname -r | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
 if [ -n "$kver" ] && [ "$(printf '%s\n6.18.16\n' "$kver" | sort -V | head -n1)" = "6.18.16" ]; then
   echo "kernel $kver >= 6.18.16: enforcing unix_peercred"
   export TRUENAS_ROS_REQUIRE_PEERCRED=1
 else
-  echo "kernel ${kver:-unknown} < 6.18.16: unix_peercred pending (pinned kernel predates the fix)"
+  echo "kernel ${kver:-unknown} < 6.18.16: unix_peercred pending (kernel predates the fix)"
 fi
 cargo test --all-features 2>&1 | tee /home/debian/test-output.txt
 TEST_EXIT_CODE=${PIPESTATUS[0]}

@@ -21,11 +21,25 @@ impl<U> Reactor<U> {
         generation: u32,
         reason: CloseReason,
     ) -> errno::Result<()> {
+        // The owner tag the fs ops were stamped with at delivery (the full u64
+        // generation), read before the `conn` borrow below takes the table.
+        #[cfg(all(feature = "net-server", feature = "async-fs"))]
+        let gen64 = self.table.generation(slot);
         if let Some(conn) = self.table.get_conn_mut(slot) {
             if conn.closing {
                 return Ok(());
             }
             conn.closing = true;
+            // Record it for the fs owned-file sweep (drained after the reap
+            // loop): a handler may have opened files on the shared ring under
+            // this connection and never closed them. Only when this reactor has
+            // an fs pool to sweep — a client (or a pool-less server) drains
+            // nothing, so recording would grow the Vec unbounded. `fs_closed`
+            // is a field disjoint from `self.table` (which `conn` holds).
+            #[cfg(all(feature = "net-server", feature = "async-fs"))]
+            if self.has_fs_pool {
+                self.fs_closed.push((slot, gen64));
+            }
             // Stash the reason for the client's `Event::Closed` (emitted when
             // the slot is reclaimed). Client-only — the server reports closes
             // through its hook below and never reads this back.

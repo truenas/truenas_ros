@@ -27,13 +27,14 @@ tn_bitflags! {
 }
 
 /// Kernel `struct open_how`. Must be zero-initialised; unknown fields are
-/// zeroed so future kernels reject unsupported bits.
+/// zeroed so future kernels reject unsupported bits. Shared with the io_uring
+/// fs reactor, whose `OPENAT2` SQE points at one of these (`sqe.addr2`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-struct RawOpenHow {
-    flags: u64,
-    mode: u64,
-    resolve: u64,
+pub(crate) struct RawOpenHow {
+    pub(crate) flags: u64,
+    pub(crate) mode: u64,
+    pub(crate) resolve: u64,
 }
 
 /// The `open_how` argument to [`openat2`], constructed with builder methods.
@@ -63,6 +64,12 @@ impl OpenHow {
     pub fn resolve(mut self, resolve: ResolveFlag) -> Self {
         self.0.resolve = resolve.bits();
         self
+    }
+
+    /// The raw kernel payload (for the io_uring `OPENAT2` SQE).
+    #[cfg_attr(not(feature = "async-fs"), allow(dead_code))]
+    pub(crate) fn to_raw(self) -> RawOpenHow {
+        self.0
     }
 }
 

@@ -180,10 +180,9 @@ pub(crate) fn probe_ktls() -> crate::Result<()> {
     // an unregistered ULP name (`CONFIG_TLS=n`, or the `tls` module isn't
     // loaded — the common case) reports `ENOENT` from
     // `__tcp_ulp_find_autoload`, not `ENOPROTOOPT`; a kernel with no TCP_ULP
-    // support at all reports `ENOPROTOOPT`. The previous test keyed only on
-    // `ENOPROTOOPT` and so fell through the real `ENOENT` to `Ok`, defeating
-    // this very gate (every kTLS connection would then be silently shed at its
-    // first recv).
+    // support at all reports `ENOPROTOOPT`. Treating `ENOENT` as success would
+    // defeat this gate — every kTLS connection would then be silently shed at
+    // its first recv.
     if err == Errno::ENOTCONN {
         return Ok(());
     }
