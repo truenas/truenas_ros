@@ -77,6 +77,17 @@ jobs:
         TRUENAS_ROS_REQUIRE_PYTHON: "1"
         TRUENAS_ROS_REQUIRE_IO_URING: "1"
 
+    # The SQ/CQ memory-ordering model (src/uring/ring.rs) is gated on
+    # `#[cfg(loom)]`: loom substitutes std's atomics/UnsafeCell with its own
+    # permutation-checking versions, so it cannot ride along with the `cargo test`
+    # above — it needs its own build under `--cfg loom` and is invisible to every
+    # other step (including clippy). The model is deliberately tiny (a 2-slot ring,
+    # one issuer + one mock kernel) so exploring every user<->kernel interleaving of
+    # the ring index words stays sub-second. `uring` is the minimal feature that
+    # compiles the engine. cfg(loom) is registered in Cargo.toml's [lints.rust].
+    - name: loom (SQ/CQ memory-ordering model)
+      run: RUSTFLAGS="--cfg loom" cargo test --lib --features uring sq_cq_ordering
+
     # Each feature alone proves the per-subsystem gates and dependency edges
     # (acl without shutil, idmap alone, …); `uring` alone proves the shared
     # engine builds severed from the net stack (the seam the async fs reactor

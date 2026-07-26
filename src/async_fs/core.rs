@@ -1893,3 +1893,368 @@ fn reply_err(reply: &mpsc::Sender<FsOutcome>, err: Errno) {
         stat: None,
     });
 }
+
+/// Cancellation-injection fuzzer for the completion-routing state machine.
+///
+/// Drives the *real* `FsCore` (op table, file table, close-last discipline,
+/// generation guard) with fuzzed schedules of open/read/write/close submissions
+/// interleaved with completions delivered out of order and at fuzzed results,
+/// plus deliberately stale / wrong-tag / recycled completions. It runs entirely
+/// in userspace: a real `Engine` is built (so `submit_*`/`on_cqe` have their
+/// `&mut Engine`) but never submitted — staging only writes SQ memory, and the
+/// ring is sized so a single run never fills it, so the kernel never touches a
+/// buffer. A fresh `Engine` per seed resets the staged SQEs.
+///
+/// It exercises the exact hazard SPDK's raw-pointer `user_data` guards against by
+/// synchronous drain (§ reactor-design comparison): a completion arriving for a
+/// since-recycled slot. Here the generation guard must make it inert.
+///
+/// Invariants asserted (each maps to a line that trips if the logic breaks — see
+/// the mutation-verification recipe in the PR/commit):
+///   * a stale-generation / wrong-tag / recycled completion mutates nothing;
+///   * `ops` never underflows and a file's index-freeing CLOSE is its last op
+///     (both are `debug_assert`/`u16`-underflow panics, i.e. crash oracles);
+///   * at quiescence every op slot and file slot is free exactly once (no leak,
+///     no double-free) and `live_files == 0`;
+///   * every submission yields exactly one outcome and every r/w buffer returns
+///     exactly once (no lost/duplicated delivery).
+///
+/// Run: `TRUENAS_ROS_REQUIRE_IO_URING=1 cargo test --features async-fs \
+///       --lib routing_survives_fuzzed_cancellation`
+/// (skips automatically where io_uring is unavailable, like the integration
+/// suites). `CANCEL_FUZZ_SEEDS=N` overrides the seed count.
+#[cfg(test)]
+mod cancel_fuzz {
+    use super::*;
+    use std::collections::HashSet;
+
+    const OP_SLOTS: u32 = 64;
+    const FILE_SLOTS: u32 = 16;
+    const POOL: u32 = FILE_SLOTS + 1;
+    // >> SQEs any single run stages; the ring never fills, so push_sqe never
+    // flushes to the kernel (the routing runs purely in userspace).
+    const RING_ENTRIES: u32 = 1024;
+
+    /// A tiny deterministic xorshift RNG so a failing run reproduces from its seed.
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Rng {
+            Rng(seed ^ 0x9E37_79B9_7F4A_7C15 | 1)
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            (self.next() % u64::from(n.max(1))) as u32
+        }
+    }
+
+    /// Build a real `Engine` or signal an environment skip (mirrors the
+    /// integration suites' io_uring guard).
+    fn engine_or_skip() -> Option<Engine> {
+        match Engine::new(RING_ENTRIES, POOL) {
+            Ok(e) => Some(e),
+            Err(crate::Error::Errno(
+                Errno::EPERM | Errno::ENOSYS | Errno::EACCES,
+            )) => {
+                assert!(
+                    std::env::var_os("TRUENAS_ROS_REQUIRE_IO_URING").is_none(),
+                    "TRUENAS_ROS_REQUIRE_IO_URING set but io_uring unavailable"
+                );
+                None
+            }
+            Err(e) => panic!("Engine::new: {e}"),
+        }
+    }
+
+    /// A compact snapshot used to assert an injected stale/anomalous completion
+    /// is fully inert: free-list, per-op `(generation, state)`, and live count.
+    fn snapshot(c: &FsCore) -> (Vec<u32>, Vec<(u64, u8)>, u32) {
+        let mut free = c.op_free.clone();
+        free.sort_unstable();
+        let ops = c
+            .ops
+            .iter()
+            .map(|e| {
+                let code = match e.state.state {
+                    FsOpState::Free => 0u8,
+                    FsOpState::InFlight { tag } => tag,
+                };
+                (e.generation, code)
+            })
+            .collect();
+        (free, ops, c.live_files)
+    }
+
+    /// Currently in-flight ops as `(tag, slot, generation-low)` — the CQEs a real
+    /// kernel could deliver.
+    fn inflight(c: &FsCore) -> Vec<(u8, u32, u32)> {
+        c.ops
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e.state.state {
+                FsOpState::InFlight { tag } => {
+                    Some((tag, i as u32, e.generation as u32))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Files that accept a new fd-op or a close: `Open && !close_deferred`.
+    fn usable_files(c: &FsCore) -> Vec<(u32, u64)> {
+        c.files
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| {
+                (f.state.state == FileState::Open && !f.state.close_deferred)
+                    .then_some((i as u32, f.generation))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn routing_survives_fuzzed_cancellation() {
+        if engine_or_skip().is_none() {
+            return;
+        }
+        let anchor = Anchor::open("/").expect("open / as anchor");
+        let seeds: u64 = std::env::var("CANCEL_FUZZ_SEEDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+        for seed in 0..seeds {
+            // Fresh Engine per run: resets staged SQEs so the ring never fills.
+            let mut eng = Engine::new(RING_ENTRIES, POOL).expect("engine");
+            run_one(&mut eng, &anchor, seed);
+        }
+    }
+
+    fn run_one(eng: &mut Engine, anchor: &Anchor, seed: u64) {
+        let mut rng = Rng::new(seed);
+        let mut core = FsCore::new(OP_SLOTS, 0, FILE_SLOTS);
+        let (tx, rx) = mpsc::channel::<FsOutcome>();
+
+        let mut submitted: u64 = 0; // opens + rws + closes (each yields 1 outcome)
+        let mut next_buf_id: u64 = 1;
+        let mut issued_bufs: HashSet<u64> = HashSet::new();
+        let mut completed: Vec<(u8, u32, u32)> = Vec::new();
+
+        let steps = 24 + rng.below(72);
+        for _ in 0..steps {
+            match rng.below(6) {
+                // open a new file
+                0 | 1
+                    if !core.file_free.is_empty()
+                        && !core.op_free.is_empty() =>
+                {
+                    let how = OpenHow::new().to_raw();
+                    core.submit_open(
+                        eng,
+                        1,
+                        anchor.clone(),
+                        CString::new("x").unwrap(),
+                        how,
+                        FsWaiter::Channel(tx.clone()),
+                    );
+                    submitted += 1;
+                }
+                // read or write on a usable file
+                2 | 3 => {
+                    let files = usable_files(&core);
+                    if !files.is_empty() && !core.op_free.is_empty() {
+                        let (slot, gen) =
+                            files[rng.below(files.len() as u32) as usize];
+                        let tag = if rng.below(2) == 0 {
+                            TAG_READV
+                        } else {
+                            TAG_WRITEV
+                        };
+                        let id = next_buf_id;
+                        next_buf_id += 1;
+                        issued_bufs.insert(id);
+                        let mut b = vec![0u8; 16];
+                        b[..8].copy_from_slice(&id.to_le_bytes());
+                        core.submit_rw(
+                            eng,
+                            tag,
+                            1,
+                            slot,
+                            gen,
+                            vec![b],
+                            0,
+                            FsWaiter::Channel(tx.clone()),
+                        );
+                        submitted += 1;
+                    }
+                }
+                // close a usable file (defers + cancels if it has in-flight ops)
+                4 => {
+                    let files = usable_files(&core);
+                    if !files.is_empty() && !core.op_free.is_empty() {
+                        let (slot, gen) =
+                            files[rng.below(files.len() as u32) as usize];
+                        core.submit_close(eng, slot, gen, Some(tx.clone()));
+                        submitted += 1;
+                    }
+                }
+                // deliver a completion, or inject an anomaly the guard must reject
+                _ => {
+                    let inf = inflight(&core);
+                    if inf.is_empty() {
+                        continue;
+                    }
+                    let (tag, slot, gen) =
+                        inf[rng.below(inf.len() as u32) as usize];
+                    match rng.below(12) {
+                        // stale generation -> inert
+                        0 => {
+                            let before = snapshot(&core);
+                            let _ = core.on_cqe(
+                                eng,
+                                tag,
+                                slot,
+                                gen.wrapping_sub(1),
+                                0,
+                            );
+                            assert_eq!(
+                                snapshot(&core),
+                                before,
+                                "stale-gen CQE mutated state (seed {seed})"
+                            );
+                        }
+                        // wrong tag -> inert
+                        1 => {
+                            let bad = tag ^ 0x01;
+                            let before = snapshot(&core);
+                            let _ = core.on_cqe(eng, bad, slot, gen, 0);
+                            assert_eq!(
+                                snapshot(&core),
+                                before,
+                                "wrong-tag CQE mutated state (seed {seed})"
+                            );
+                        }
+                        // replay a since-recycled completion -> inert (the SPDK
+                        // raw-pointer hazard; here the generation makes it a no-op)
+                        2 if !completed.is_empty() => {
+                            let (t, s, g) = completed
+                                [rng.below(completed.len() as u32) as usize];
+                            let before = snapshot(&core);
+                            let _ = core.on_cqe(eng, t, s, g, 0);
+                            assert_eq!(
+                                snapshot(&core),
+                                before,
+                                "recycled CQE mutated state (seed {seed})"
+                            );
+                        }
+                        // genuine delivery, fuzzed result
+                        _ => {
+                            let res = match rng.below(8) {
+                                0 => -libc::ECANCELED,
+                                1 => -libc::EIO,
+                                _ => 0,
+                            };
+                            let _ = core.on_cqe(eng, tag, slot, gen, res);
+                            completed.push((tag, slot, gen));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drain to quiescence: deliver every in-flight op, then close every
+        // remaining open file, until nothing is in flight and nothing is live.
+        let mut guard = 0u32;
+        loop {
+            guard += 1;
+            assert!(guard < 100_000, "drain did not converge (seed {seed})");
+            if let Some(&(tag, slot, gen)) = inflight(&core).first() {
+                let _ = core.on_cqe(eng, tag, slot, gen, 0);
+                continue;
+            }
+            if let Some(&(slot, gen)) = usable_files(&core).first() {
+                core.submit_close(eng, slot, gen, Some(tx.clone()));
+                submitted += 1;
+                continue;
+            }
+            break;
+        }
+
+        // ---- structural quiescence invariants (private state) ----
+        assert!(
+            inflight(&core).is_empty(),
+            "ops still in flight (seed {seed})"
+        );
+        assert_eq!(core.live_files, 0, "live_files != 0 (seed {seed})");
+
+        let mut op_free = core.op_free.clone();
+        op_free.sort_unstable();
+        assert_eq!(
+            op_free.len(),
+            OP_SLOTS as usize,
+            "op slot leaked or double-freed (seed {seed})"
+        );
+        op_free.dedup();
+        assert_eq!(
+            op_free.len(),
+            OP_SLOTS as usize,
+            "op_free has a duplicate slot (seed {seed})"
+        );
+        assert!(
+            core.ops.iter().all(|e| e.state.state == FsOpState::Free),
+            "an op entry is not Free (seed {seed})"
+        );
+
+        let mut file_free = core.file_free.clone();
+        file_free.sort_unstable();
+        assert_eq!(
+            file_free.len(),
+            FILE_SLOTS as usize,
+            "file slot leaked or double-freed (seed {seed})"
+        );
+        file_free.dedup();
+        assert_eq!(
+            file_free.len(),
+            FILE_SLOTS as usize,
+            "file_free has a duplicate slot (seed {seed})"
+        );
+        assert!(
+            core.files.iter().all(|f| f.state.state == FileState::Free),
+            "a file entry is not Free (seed {seed})"
+        );
+
+        // ---- delivery-once + buffer-return-once ----
+        // Every stored sender was consumed as its op completed; dropping the
+        // local one closes the channel so the drain below terminates.
+        drop(tx);
+        let mut outcomes: u64 = 0;
+        let mut returned: HashSet<u64> = HashSet::new();
+        while let Ok(out) = rx.recv() {
+            outcomes += 1;
+            for b in &out.bufs {
+                if b.len() >= 8 {
+                    let id = u64::from_le_bytes(b[..8].try_into().unwrap());
+                    if issued_bufs.contains(&id) {
+                        assert!(
+                            returned.insert(id),
+                            "buffer {id} returned twice (seed {seed})"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            outcomes, submitted,
+            "each submission must yield exactly one outcome (seed {seed})"
+        );
+        assert_eq!(
+            returned, issued_bufs,
+            "every r/w buffer must return exactly once (seed {seed})"
+        );
+    }
+}

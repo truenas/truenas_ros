@@ -8,9 +8,23 @@ description = "Idiomatic Rust bindings for modern Linux filesystem/mount syscall
 categories = ["os::unix-apis", "filesystem"]
 keywords = ["linux", "syscall", "mount", "acl", "truenas"]
 
+[lints.rust]
+# `loom` is a dev-only cfg enabled via RUSTFLAGS="--cfg loom" for the SQ/CQ
+# memory-ordering model in src/uring/ring.rs. Register it so the crate's
+# deny(unexpected_cfgs) accepts it — the lint checks cfg *names* even when unset,
+# so `#[cfg(loom)]` in source must be declared regardless of the active build.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [dependencies]
 libc = { version = "0.2.155", features = ["extra_traits"] }
 bitflags = "2.6"
+
+# loom (a concurrency permutation checker) backs the SQ/CQ ordering test in
+# src/uring/ring.rs. Pulled ONLY under `--cfg loom`, so normal builds keep the
+# libc+bitflags charter untouched.
+#   Run: RUSTFLAGS="--cfg loom" cargo test --lib --features async-fs sq_cq
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
 
 [features]
 # Default enables the implemented subsystems; more join as phases land.
