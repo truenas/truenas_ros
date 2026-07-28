@@ -118,6 +118,24 @@ pub(crate) struct IoUringRsrcRegister {
 }
 const _: () = assert!(core::mem::size_of::<IoUringRsrcRegister>() == 32);
 
+/// `struct io_uring_rsrc_update2` (32 bytes) — arg for
+/// `IORING_REGISTER_BUFFERS_UPDATE`: fill `nr` buffer slots starting at
+/// `offset`; `data` points at `nr` iovecs, `tags` at `nr` u64 tags (0 =
+/// untagged).
+#[cfg(feature = "rt-tokio")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct IoUringRsrcUpdate2 {
+    pub offset: u32,
+    pub resv: u32,
+    pub data: u64,
+    pub tags: u64,
+    pub nr: u32,
+    pub resv2: u32,
+}
+#[cfg(feature = "rt-tokio")]
+const _: () = assert!(core::mem::size_of::<IoUringRsrcUpdate2>() == 32);
+
 /// `struct io_uring_file_index_range` (16 bytes) — arg for
 /// `IORING_REGISTER_FILE_ALLOC_RANGE`.
 #[repr(C)]
@@ -133,7 +151,7 @@ const _: () = assert!(core::mem::size_of::<IoUringFileIndexRange>() == 16);
 /// `IORING_REGISTER_FILES_UPDATE`. `data` points to an array of `nr_args` fds to
 /// install starting at registered-file slot `offset`; the kernel `fget`s its own
 /// reference to each, so the caller may close the fd after the call returns.
-#[cfg(any(feature = "net-client", feature = "async-fs"))]
+#[cfg(feature = "async-fs")]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct IoUringRsrcUpdate {
@@ -141,7 +159,7 @@ pub(crate) struct IoUringRsrcUpdate {
     pub resv: u32,
     pub data: u64, // pointer to the fd array (__aligned_u64 == u64 on 64-bit)
 }
-#[cfg(any(feature = "net-client", feature = "async-fs"))]
+#[cfg(feature = "async-fs")]
 const _: () = assert!(core::mem::size_of::<IoUringRsrcUpdate>() == 16);
 
 /// `struct __kernel_timespec` — the 16-byte timespec io_uring timeout ops read
@@ -166,6 +184,16 @@ const _: () = assert!(core::mem::size_of::<KernelTimespec>() == 16);
 pub(crate) const IORING_OP_READV: u8 = 1;
 /// Vectored write; field layout mirrors `READV`.
 pub(crate) const IORING_OP_WRITEV: u8 = 2;
+/// Read into a **registered buffer** (`IORING_REGISTER_BUFFERS2` table):
+/// `sqe.addr`/`sqe.len` name a range inside the registered chunk and
+/// `sqe.buf_index` its table slot — the kernel resolves the pre-pinned pages
+/// directly into a bvec iterator, skipping the per-op pin/unpin (and, with
+/// `O_DIRECT`, DMAs straight into them).
+#[cfg(feature = "rt-tokio")]
+pub(crate) const IORING_OP_READ_FIXED: u8 = 4;
+/// Write from a registered buffer; field layout mirrors `READ_FIXED`.
+#[cfg(feature = "rt-tokio")]
+pub(crate) const IORING_OP_WRITE_FIXED: u8 = 5;
 /// `fsync`/`fdatasync` on an fd; `sqe.fsync_flags` (`op_flags`) may carry
 /// [`IORING_FSYNC_DATASYNC`], `sqe.off`+`sqe.len` bound the range (0 = whole
 /// file). Always punted to io-wq (`REQ_F_FORCE_ASYNC`).
@@ -191,13 +219,6 @@ pub(crate) const IORING_OP_TIMEOUT: u8 = 11;
 pub(crate) const IORING_OP_ACCEPT: u8 = 13;
 pub(crate) const IORING_OP_ASYNC_CANCEL: u8 = 14;
 pub(crate) const IORING_OP_LINK_TIMEOUT: u8 = 15;
-/// Connect an outbound stream socket (client). `sqe.fd` is the (fixed) socket,
-/// `sqe.addr`@16 the target sockaddr, `sqe.addr2`@8 (`off_addr2`) its length;
-/// `len`/`op_flags`/`buf_index`/`file_index` must be 0 (`io_connect_prep` rejects
-/// otherwise). The kernel copies the sockaddr at prep, so it need only live until
-/// submission.
-#[cfg(feature = "net-client")]
-pub(crate) const IORING_OP_CONNECT: u8 = 16;
 pub(crate) const IORING_OP_CLOSE: u8 = 19;
 pub(crate) const IORING_OP_READ: u8 = 22;
 /// `openat2(2)` as a ring op: `fd` = dirfd (a REAL fd — the prep rejects
@@ -214,6 +235,16 @@ pub(crate) const IORING_OP_RECV: u8 = 27;
 pub(crate) const IORING_OP_SPLICE: u8 = 30;
 pub(crate) const IORING_OP_SHUTDOWN: u8 = 34;
 pub(crate) const IORING_OP_URING_CMD: u8 = 46;
+/// Zero-copy send: `MSG_ZEROCOPY` forced on, pages pinned until TX+ACK.
+/// **Two CQEs per op, same `user_data`**: the send *result* first, flagged
+/// [`IORING_CQE_F_MORE`] (non-terminal), then a notification CQE flagged
+/// [`IORING_CQE_F_NOTIF`] once the kernel released the pages — the buffer
+/// must live until the notif, not the result. An op that fails before any
+/// transmission posts a single terminal CQE with neither flag. Plaintext
+/// sockets only: kTLS `sendmsg` rejects `MSG_ZEROCOPY` (`-EOPNOTSUPP`).
+/// `sqe.ioprio` carries the `IORING_RECVSEND_*` zc flags (none used here).
+#[cfg(feature = "rt-tokio")]
+pub(crate) const IORING_OP_SEND_ZC: u8 = 47;
 /// Materialize a real (installed) fd from a direct/registered descriptor
 /// (Linux ≥ 6.8). The new fd rides in the CQE `res`; flags go in
 /// `install_fd_flags`, which overlays `op_flags` (the @28 union) here — left
@@ -323,7 +354,11 @@ pub(crate) const SPLICE_F_MOVE: u32 = 1;
 pub(crate) const SPLICE_F_FD_IN_FIXED: u32 = 1 << 31;
 
 // `cqe.flags`.
-pub(crate) const IORING_CQE_F_MORE: u32 = 1 << 1; // more CQEs follow (multishot)
+pub(crate) const IORING_CQE_F_MORE: u32 = 1 << 1;
+/// This CQE is a `SEND_ZC` buffer-release notification (the op's second,
+/// terminal completion), not an operation result.
+#[cfg(feature = "rt-tokio")]
+pub(crate) const IORING_CQE_F_NOTIF: u32 = 1 << 3; // more CQEs follow (multishot)
 pub(crate) const IORING_CQE_F_SOCK_NONEMPTY: u32 = 1 << 2;
 
 /// `io_uring_enter` flag: also wait for completions.
@@ -342,7 +377,7 @@ pub(crate) const IORING_OFF_SQES: i64 = 0x1000_0000;
 /// Install fds into an already-registered file table at chosen slots — a client
 /// places a freshly-`connect`ed socket into its pool this way (the server's pool
 /// is auto-allocated by multishot accept; a client must update explicitly).
-#[cfg(any(feature = "net-client", feature = "async-fs"))]
+#[cfg(feature = "async-fs")]
 pub(crate) const IORING_REGISTER_FILES_UPDATE: u32 = 6;
 pub(crate) const IORING_REGISTER_PROBE: u32 = 8;
 /// Snapshot the **calling task's** credentials (fsuid/fsgid, groups,
@@ -355,8 +390,30 @@ pub(crate) const IORING_REGISTER_PERSONALITY: u32 = 9;
 /// Free a personality id (`nr_args` = id, `arg` must be NULL).
 pub(crate) const IORING_UNREGISTER_PERSONALITY: u32 = 10;
 pub(crate) const IORING_REGISTER_FILES2: u32 = 13;
+/// Register a buffer table (the `io_uring_rsrc_register` form). Registered
+/// **sparse** at a fixed size up front — the table size is immutable after
+/// registration (a second register fails `-EBUSY`) — and filled/replaced
+/// slot-by-slot with [`IORING_REGISTER_BUFFERS_UPDATE`], which runs under
+/// `uring_lock` only (no ring quiesce).
+#[cfg(feature = "rt-tokio")]
+pub(crate) const IORING_REGISTER_BUFFERS2: u32 = 15;
+/// Fill/replace registered-buffer slots in place (`io_uring_rsrc_update2`);
+/// returns the number of slots updated.
+#[cfg(feature = "rt-tokio")]
+pub(crate) const IORING_REGISTER_BUFFERS_UPDATE: u32 = 16;
+/// Cap this ring's io-wq worker pools: `arg` = `[bounded, unbounded]` (0 =
+/// leave unchanged), written back with the previous values. Bounds the
+/// kernel threads buffered-fs punts and always-async ops (splice) can spawn.
+#[cfg(feature = "async-fs")]
+pub(crate) const IORING_REGISTER_IOWQ_MAX_WORKERS: u32 = 19;
 pub(crate) const IORING_REGISTER_FILE_ALLOC_RANGE: u32 = 25;
 pub(crate) const IORING_RSRC_REGISTER_SPARSE: u32 = 1 << 0;
+
+/// `io_uring_setup` flag: honour `params.cq_entries` instead of the default
+/// `2 × sq_entries` CQ. Used when a workload multiplies CQEs beyond that
+/// ratio (two-CQE `SEND_ZC` pairs, splice-hop chains) so completions never
+/// enter the kernel's slow overflow path.
+pub(crate) const IORING_SETUP_CQSIZE: u32 = 1 << 3;
 
 /// `io_uring_setup` flag: restrict submission — and `io_uring_register`, via
 /// the `-EEXIST` gate in `register.c` — to the creating task. **Never set by
@@ -570,7 +627,7 @@ pub(crate) fn register_file_alloc_range(
 /// The kernel takes its own reference (`fget`), so the caller may close `fd`
 /// afterward. Used by a client to place a freshly-`connect`ed socket into its
 /// pool at a chosen index (the server auto-allocates via multishot accept).
-#[cfg(any(feature = "net-client", feature = "async-fs"))]
+#[cfg(feature = "async-fs")]
 pub(crate) fn register_file_update(
     ring_fd: RawFd,
     slot: u32,
@@ -590,6 +647,95 @@ pub(crate) fn register_file_update(
             IORING_REGISTER_FILES_UPDATE,
             &update as *const IoUringRsrcUpdate as *const c_void,
             1,
+        )
+    }
+}
+
+/// Register a sparse (all-empty) **buffer** table of `count` slots. The size
+/// is fixed for the ring's lifetime (re-register fails `-EBUSY`); slots are
+/// filled later, in place, by [`register_buffers_update`]. Sparse slots pin
+/// nothing, so a generous ceiling costs only table bookkeeping.
+#[cfg(feature = "rt-tokio")]
+pub(crate) fn register_buffers_sparse(
+    ring_fd: RawFd,
+    count: u32,
+) -> errno::Result<()> {
+    let reg = IoUringRsrcRegister {
+        nr: count,
+        flags: IORING_RSRC_REGISTER_SPARSE,
+        ..Default::default()
+    };
+    // SAFETY: BUFFERS2 reads one `io_uring_rsrc_register`; the kernel
+    // requires `nr_args == sizeof(rr)` exactly as FILES2 does.
+    unsafe {
+        io_uring_register(
+            ring_fd,
+            IORING_REGISTER_BUFFERS2,
+            &reg as *const IoUringRsrcRegister as *const c_void,
+            core::mem::size_of::<IoUringRsrcRegister>() as u32,
+        )
+    }
+}
+
+/// Fill registered-buffer slot `slot` with `[base, base+len)`, pinning its
+/// pages. Runs under the kernel's `uring_lock` only — legal from any thread
+/// (this crate's rings never set `SINGLE_ISSUER`) and with I/O in flight on
+/// *other* slots; the caller guarantees `slot` itself has no in-flight op.
+///
+/// # Safety
+///
+/// `[base, base+len)` must be a live, writable mapping that stays valid until
+/// the slot is replaced or the ring is torn down: the kernel holds page pins
+/// (and may DMA) for as long as the slot names these pages.
+#[cfg(feature = "rt-tokio")]
+pub(crate) unsafe fn register_buffers_update(
+    ring_fd: RawFd,
+    slot: u32,
+    base: *mut u8,
+    len: usize,
+) -> errno::Result<()> {
+    let iov = libc::iovec {
+        iov_base: base.cast(),
+        iov_len: len,
+    };
+    let up = IoUringRsrcUpdate2 {
+        offset: slot,
+        data: &iov as *const libc::iovec as u64,
+        tags: 0, // untagged (the kernel treats a 0 tags pointer as "none")
+        nr: 1,
+        ..Default::default()
+    };
+    // SAFETY: BUFFERS_UPDATE reads one `io_uring_rsrc_update2` (`nr_args` is
+    // its size); `data` points at `nr` iovecs, live for the call. The mapping
+    // contract is forwarded to the caller. Success returns the count updated.
+    let done = unsafe {
+        io_uring_register_ret(
+            ring_fd,
+            IORING_REGISTER_BUFFERS_UPDATE,
+            &up as *const IoUringRsrcUpdate2 as *const c_void,
+            core::mem::size_of::<IoUringRsrcUpdate2>() as u32,
+        )
+    }?;
+    if done != 1 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
+/// Cap the ring's io-wq worker pools to `[bounded, unbounded]` (0 leaves a
+/// pool unchanged). The kernel writes the previous limits back into `caps`.
+#[cfg(feature = "async-fs")]
+pub(crate) fn register_iowq_max_workers(
+    ring_fd: RawFd,
+    caps: &mut [u32; 2],
+) -> errno::Result<()> {
+    // SAFETY: IOWQ_MAX_WORKERS reads and rewrites `nr_args` (= 2) u32s.
+    unsafe {
+        io_uring_register(
+            ring_fd,
+            IORING_REGISTER_IOWQ_MAX_WORKERS,
+            caps.as_mut_ptr() as *const c_void,
+            2,
         )
     }
 }

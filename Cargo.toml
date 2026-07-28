@@ -18,6 +18,32 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [dependencies]
 libc = { version = "0.2.155", features = ["extra_traits"] }
 bitflags = "2.6"
+# tokio backs the `rt-*` features only (async completion for the fs reactor;
+# later phases add the zero-copy bridges and the kTLS stream). Optional, so the
+# libc+bitflags charter holds for every other build. Version floor 1.43 (an LTS
+# line); the exact pin lives in Cargo.lock. No default features — the runtime
+# itself is the consumer's; the library needs only these primitives.
+tokio = { version = "1.43", optional = true, default-features = false, features = [
+    "net",     # AsyncFd + socket types for the bridges/KtlsStream
+    "sync",    # oneshot completion delivery + Semaphore backpressure
+    "time",    # bridge/watchdog timeouts
+    "rt",      # spawn_blocking for the TLS handshake helpers
+    "io-util", # AsyncRead/AsyncWrite plumbing for KtlsStream/FrameReader
+    "macros",  # select! in the serve() accept/drain loop
+] }
+# OpenSSL backs ONLY the `rt-tls-openssl` handshake helpers. The core
+# `KtlsStream` is TLS-crate-free: a consumer brings its own handshake and
+# hands over an fd with kernel TLS already engaged. `openssl-sys` +
+# `foreign-types` are the raw `BIO_new_socket`/`SSL_accept` dance those
+# helpers need — OpenSSL only installs kTLS when it handshakes over a real
+# socket BIO (a Rust-stream BIO would fall back to userspace TLS records).
+openssl = { version = "0.10", optional = true }
+openssl-sys = { version = "0.9", optional = true }
+foreign-types = { version = "0.3", optional = true }
+# The WS example only (`__ws-example`): the point of the tokio pivot is that
+# protocol layers like this come from the ecosystem, unowned.
+tokio-tungstenite = { version = "0.24", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false }
 
 # loom (a concurrency permutation checker) backs the SQ/CQ ordering test in
 # src/uring/ring.rs. Pulled ONLY under `--cfg loom`, so normal builds keep the
@@ -55,28 +81,57 @@ shutil = ["fsiter", "xattr"]
 configfile = ["sync-fs"]
 # The shared io_uring engine (`src/uring`): raw UAPI, ring, SQE staging,
 # wake, slot generations, the user_data codec. Internal — enabled transitively
-# by the domains built on it (the net stack today, async-fs next); not a
-# public API surface.
+# by the domains built on it (the fs reactor and the tokio-hybrid runtime);
+# not a public API surface.
 uring = []
-# io_uring stream networking. `net-core` is the stream reactor + vocab over
-# the engine; `net-server` (inbound) and `net-client` (outbound) are the
-# roles, each pulling in the core. Kept out of `default` (io_uring-runtime-
-# dependent, use-case-specific); opt in via a role feature or `full`.
-net-core = ["uring"]
-net-server = ["net-core"]
-net-client = ["net-core"]
 # The io_uring filesystem reactor: files opened into a fixed-descriptor
 # pool, every op stamped with a registered personality (kernel-enforced
 # per-op identity), anchored path resolution. Off by default and absent from
-# `full` — it depends on the io_uring runtime, and (unlike the net roles) on a
-# credential broker forked before the daemon starts threads, so it is opt-in
-# rather than something `full` turns on underneath a consumer. Depends on
-# `sync-fs` for the shared OpenHow/ResolveFlag vocabulary; combine with
-# `net-server` for the in-server reactor (`ServerConfig::fs_files`).
+# `full` — it depends on the io_uring runtime and on a credential broker
+# forked before the daemon starts threads, so it is opt-in rather than
+# something `full` turns on underneath a consumer. Depends on `sync-fs` for
+# the shared OpenHow/ResolveFlag vocabulary; `rt-tokio` builds on it.
 async-fs = ["uring", "sync-fs"]
-# Internal: exposes the pure `frame_step` framing decision to the fuzz crate
-# (`fuzz/`). Not for consumers; implies `net-server` (where `frame_step` lives).
-__fuzz = ["net-server"]
+# The tokio-hybrid runtime: sockets live on the consumer's multi-threaded
+# tokio; the io_uring engine serves as a single process-wide FILE reactor.
+# `rt-tokio` adds the async completion path (`FsRt`/`FsRuntime`) over the same
+# loop the blocking `FsHandle` uses; later phases add the zero-copy BufPool and
+# the socket↔file splice/SEND_ZC bridges. Off by default and absent from `full`
+# for the same reason as `async-fs` (runtime- and broker-dependent, opt-in).
+rt-tokio = ["dep:tokio", "async-fs", "framing"]
+# The pure framing decision core (`frame_step`, `Framing`, the length-prefix
+# framer) — dependency-free, transport-agnostic; consumed by the rt
+# FrameReader and the fuzz harnesses.
+framing = []
+# Kernel-TLS stream (`KtlsStream`: AsyncRead/AsyncWrite over an fd whose TLS
+# ULP + keys are already installed). Brings no TLS crate.
+rt-ktls = ["rt-tokio"]
+# OpenSSL convenience handshake helpers (SSL_OP_ENABLE_KTLS + spawn_blocking)
+# producing an engaged `KtlsStream`. The only feature linking openssl into the
+# library proper (it is otherwise a dev-dependency of the kTLS tests).
+rt-tls-openssl = [
+    "rt-ktls",
+    "dep:openssl",
+    "dep:openssl-sys",
+    "dep:foreign-types",
+]
+# Internal: what the rt integration tests need beyond `rt-tokio` — a real
+# multi-thread tokio runtime to drive the loop from many worker threads. A
+# private feature (not for consumers, who bring their own runtime) so the
+# library's own tokio stays primitive-only; `--all-features` (CI) enables it.
+__rt-test = ["rt-tls-openssl", "tokio/rt-multi-thread"]
+# Internal: the WebSocket layering example (`examples/rt_ws_echo.rs`) —
+# proves tokio-tungstenite sits directly on the crate's streams. The
+# tungstenite dependency exists only for it.
+__ws-example = [
+    "__rt-test",
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
+    "tokio/signal", # ctrl-c shutdown in the example binary only
+]
+# Internal: the feature set the fuzz crate (`fuzz/`) builds against — the
+# hoisted pure framing core. Not for consumers.
+__fuzz = ["framing"]
 full = [
     "sync-fs",
     "xattr",
@@ -87,8 +142,7 @@ full = [
     "idmap",
     "shutil",
     "configfile",
-    "net-server",
-    "net-client",
+    "framing",
 ]
 
 [dev-dependencies]
@@ -96,11 +150,12 @@ tempfile = "3"
 # net splice tests only: a raw `pipe()` as the splice target. `libc` is
 # already the library's normal dependency, so this adds no new footprint.
 libc = { version = "0.2.155", features = ["extra_traits"] }
-# kTLS integration test only: a real TLS client/server around the kernel-TLS
-# transport. The library itself pulls no TLS crate — the consumer brings one.
-openssl = "0.10"
-openssl-sys = "0.9"
-foreign-types = "0.3" # ForeignType::as_ptr for the raw SSL_accept BIO dance
+# NOTE: tokio (and openssl) are deliberately NOT dev-dependencies. Dev-deps are
+# unconditional, and the loom CI step (RUSTFLAGS="--cfg loom") applies its
+# cfg to every crate in the graph — tokio does not build under an external
+# `--cfg loom`. The rt tests reach tokio and openssl through the library's
+# own optional dependencies (test target `rt_fs`, required-features
+# `__rt-test`).
 
 [[test]]
 name = "test"
@@ -123,19 +178,6 @@ path = "test/zfs.rs"
 name = "configparser_compat"
 path = "test/configparser_compat.rs"
 
-# io_uring stream server. Live loopback tests; skip automatically when io_uring
-# is unavailable (sandbox/old kernel). Set TRUENAS_ROS_REQUIRE_IO_URING=1 to
-# make that a hard failure instead.
-[[test]]
-name = "net_server"
-path = "test/net_server.rs"
-
-# io_uring stream client. Live loopback echo against an in-process net::server;
-# skips automatically when io_uring is unavailable (sandbox/old kernel). Set
-# TRUENAS_ROS_REQUIRE_IO_URING=1 to make that a hard failure instead.
-[[test]]
-name = "net_client"
-path = "test/net_client.rs"
 
 # io_uring fs reactor. Live tests against a tempdir (opens, vectored I/O,
 # personality registration, fixed-slot lifecycle); skip automatically when
@@ -145,33 +187,23 @@ path = "test/net_client.rs"
 name = "async_fs"
 path = "test/async_fs.rs"
 
-# Consumer-facing example: the `net::server` handlers (esp. `accept`) as
-# standalone functions. Built only when the `net-server` feature is on.
-[[example]]
-name = "tcp_accept_fn"
-required-features = ["net-server"]
+# The tokio-hybrid runtime: async fs ops from multi-thread tokio tasks over
+# the same loop the blocking handles use. Skips like async_fs when io_uring
+# is unavailable. `required-features` (rather than an in-file cfg) because
+# the test uses the library's OPTIONAL tokio dependency — without the
+# feature the target must not build at all.
+[[test]]
+name = "rt_fs"
+path = "test/rt_fs.rs"
+required-features = ["__rt-test"]
 
-# Consumer-facing example: offloading the body handler to a worker pool via
-# `Response::Defer` (the library ships no pool). Feature-gated like above.
+# The tokio-hybrid layering proof: tungstenite (WebSocket) from the
+# ecosystem over a served TcpStream, journaling through the fs ring.
 [[example]]
-name = "tcp_offload"
-required-features = ["net-server"]
+name = "rt_ws_echo"
+required-features = ["__ws-example"]
 
-# Consumer-facing example: multi-core via SO_REUSEPORT — N independent
-# single-ring servers (one per thread) sharing one address.
-[[example]]
-name = "tcp_multicore"
-required-features = ["net-server"]
 
-# Consumer-facing example: detaching a connection's socket fd to a worker for a
-# blocking op on the socket (e.g. a ZFS send/recv ioctl), then resume or close.
-[[example]]
-name = "tcp_detach"
-required-features = ["net-server"]
 
-# Consumer-facing example: the outbound `net::client` — fan out connections,
-# batch framed requests, and pump `next_event` — against an in-process
-# `net::server` echo (so it runs standalone). Needs both roles.
-[[example]]
-name = "tcp_client"
-required-features = ["net-server", "net-client"]
+
+

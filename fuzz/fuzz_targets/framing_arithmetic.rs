@@ -13,7 +13,7 @@
 //! (e.g. a u64 length prefix near `u64::MAX`) from crashing the loop.
 
 use libfuzzer_sys::fuzz_target;
-use truenas_ros::net::server::{frame_step, FrameStep, Framing};
+use truenas_ros::framing::{frame_step, FrameStep, Framing};
 
 fuzz_target!(|input: (u8, u64, u64, u64, u64, Option<u64>)| {
     let (sel, a, b, buffered, max_request_bytes, threshold) = input;
@@ -29,7 +29,6 @@ fuzz_target!(|input: (u8, u64, u64, u64, u64, Option<u64>)| {
         3 => Framing::SpliceBody {
             header_len: a as usize,
             body_len: b as usize,
-            fd: -1, // frame_step passes the fd through untouched
         },
         _ => Framing::Invalid,
     };
@@ -103,10 +102,9 @@ fuzz_target!(|input: (u8, u64, u64, u64, u64, Option<u64>)| {
         FrameStep::SpliceBody {
             header_len,
             body_len,
-            ..
         } => {
-            // Splice keeps only the header buffered; the body streams to `fd`,
-            // never sliced from `buf`. The invariant: header+body doesn't
+            // Splice keeps only the header buffered; the body moves
+            // out-of-band, never sliced from `buf`: header+body doesn't
             // overflow, both are non-zero, the header fits the cap, and the
             // whole header (and nothing past it) is buffered.
             let total = header_len

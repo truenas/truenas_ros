@@ -7,18 +7,15 @@ use crate::fd::owned_from_raw;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::AtomicBool;
 
-/// The stop/graceful-drain flags and the wake eventfd cross-thread pokes ride
+/// The stop flag and the wake eventfd cross-thread pokes ride
 /// on. Domains wrap it in their own public handles; the engine arms the
 /// eventfd `READ` ([`super::engine::Engine::arm_wake`]).
 #[derive(Debug)]
 pub(crate) struct LoopShared {
     /// Hard-stop flag (`Release` store, `Acquire` load in the loop).
     pub(crate) stop: AtomicBool,
-    /// Graceful-drain request flag; `grace_ms` is read when it is seen.
-    pub(crate) graceful: AtomicBool,
-    pub(crate) grace_ms: AtomicU64,
     pub(crate) wake: WakeHandle,
 }
 

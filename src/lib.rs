@@ -73,5 +73,8 @@ mod uring;
 #[cfg(feature = "async-fs")]
 pub mod async_fs;
 
-#[cfg(feature = "net-core")]
-pub mod net;
+#[cfg(feature = "framing")]
+pub mod framing;
+
+#[cfg(feature = "rt-tokio")]
+pub mod rt;

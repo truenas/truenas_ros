@@ -2,7 +2,7 @@
 //! kernel-enforced per-operation identity.
 //!
 //! This is the asynchronous counterpart of [`crate::sync_fs`], built on the
-//! same shared engine (`uring`) the `net` roles drive. Files open **directly
+//! crate's shared io_uring engine (`uring`). Files open **directly
 //! into a fixed-descriptor pool** (no process fd is ever materialized) and
 //! every data op runs against that pool slot. Two rules shape the whole API:
 //!
@@ -23,14 +23,13 @@
 //!
 //! # Consumer shape
 //!
-//! There are two ways in, sharing one core. **Standalone** ([`AsyncFs`]) owns
-//! its own ring and loop; **embedded** puts the same reactor on a `net`
-//! server's ring, so a protocol handler does its filesystem work inline —
-//! that is [`FsConn`], reached through `Request::fs`, and it is described
-//! under [Embedding in a server](#embedding-in-a-server) below.
+//! **Standalone** ([`AsyncFs`]) owns its own ring and loop. (The core is
+//! host-agnostic: an embedding host can drive the same core on its own
+//! ring via [`FsConn`] callbacks — no such host ships in-tree today; the
+//! tokio-hybrid [`rt`](crate::rt) runtime wraps the standalone loop instead.)
 //!
 //! The standalone loop is synchronous and single-threaded ([`AsyncFs::run`],
-//! `!Send` like the net roles); concurrency comes from the ring. Off-loop
+//! `!Send`); concurrency comes from the ring. Off-loop
 //! callers use the `Send + Sync` [`FsHandle`], whose blocking calls submit over
 //! an inject channel and park on a per-call reply channel:
 //!
@@ -136,34 +135,17 @@
 //! wrap the broker in an [`IdentityCache`] to register once per *identity*
 //! rather than once per connection.
 //!
-//! # Embedding in a server
+//! # Embedding in another host
 //!
-//! The same core also runs on a `net` server's own ring, which is how a
-//! protocol handler does filesystem work without leaving the loop: build the
-//! server with `ServerConfig::fs_files` set, and each request arrives with an
-//! [`FsConn`] in `Request::fs`. Take it, park the request with
-//! `Responder::defer`, and submit — the completion fires **in the loop**, and
-//! the callback either chains the next op on the [`FsConn`] it is handed or
-//! resolves the request through the `Deferred` it captured. fs and net SQEs
-//! interleave on the one ring; there is no thread hop and no second reactor.
-//!
-//! Three differences from the off-loop [`FsHandle`] are worth knowing:
-//!
-//! - An open yields an [`FsFile`], not a [`FixedFile`]: `Copy`, no `Drop`, and
-//!   it **remembers the personality it was opened under**, so every later
-//!   fd-op on it runs as that identity without a per-op argument
-//!   ([`FsFile::as_root`] is the one deliberate exception). Close it in the
-//!   chain; a connection that dies mid-chain has its files reclaimed by the
-//!   close sweep.
-//! - Only the request-handler facade may [`open`](FsConn::open). A completion
-//!   callback's facade refuses it — see [`FsConn::open`].
-//! - Nothing returns an error to the caller: a submission or argument failure
-//!   drops the callback, and dropping the `Deferred` it captured closes the
-//!   connection. Operation failures (`ENOENT`, `EACCES`) arrive normally, in
-//!   the callback's [`FsDone`].
+//! The reactor core ([`FsConn`]/[`FsDone`]) is deliberately host-agnostic: a
+//! single-threaded event loop that owns its own `Engine` can drive fs ops
+//! inline and receive completions as in-loop callbacks, interleaving fs and
+//! its own SQEs on one ring. No in-tree host uses this mode today (the
+//! io_uring net server that did has been replaced by the tokio-hybrid
+//! [`rt`](crate::rt) runtime); the seam is kept for a future embedding.
 
 mod broker;
-// `pub(crate)` so the embedded host (`net::server`, when both features are on)
+// `pub(crate)` so an embedding host (a server driving `FsCore` on its own
 // can drive an `FsCore` on the server's own ring; the standalone host is
 // `async_fs`'s own `AsyncFs`.
 pub(crate) mod core;
@@ -212,6 +194,49 @@ pub(crate) fn statx_at_flags(flags: AtFlags) -> u32 {
     } else {
         (base | AtFlags::AT_SYMLINK_NOFOLLOW).bits() as u32
     }
+}
+
+/// Validate an anchor-relative open's `(path, how)` pair and produce the
+/// payloads an `OPENAT2` inject carries — shared by the blocking
+/// [`FsHandle::open`] and the async `rt` handle so both surfaces enforce
+/// identical rules: relative path only, no `O_CLOEXEC` (meaningless for a
+/// fixed-table open and rejected by the kernel), and confinement
+/// (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`) by default when the caller set
+/// no `resolve` policy of its own.
+pub(crate) fn open_parts<P: ?Sized + TnPath>(
+    path: &P,
+    how: OpenHow,
+) -> crate::Result<(CString, RawOpenHow)> {
+    let cpath: CString = path.with_tn_path(|c| c.to_owned())?;
+    let bytes = cpath.as_bytes();
+    if bytes.is_empty() {
+        return Err(crate::Error::Validation(
+            "async_fs open: empty path".into(),
+        ));
+    }
+    if bytes[0] == b'/' {
+        return Err(crate::Error::Validation(
+            "async_fs paths are anchor-relative; absolute paths are not \
+             accepted"
+                .into(),
+        ));
+    }
+    let mut raw = how.to_raw();
+    if raw.flags & libc::O_CLOEXEC as u64 != 0 {
+        return Err(crate::Error::Validation(
+            "async_fs open: O_CLOEXEC is meaningless for fixed-table \
+             opens (and rejected by the kernel); drop it"
+                .into(),
+        ));
+    }
+    // Confine to `anchor` by default (see `FsHandle::open`): an unset
+    // `resolve` would let `..`/symlinks escape the share.
+    if raw.resolve == 0 {
+        raw.resolve = ResolveFlag::RESOLVE_BENEATH
+            .union(ResolveFlag::RESOLVE_NO_SYMLINKS)
+            .bits();
+    }
+    Ok((cpath, raw))
 }
 
 /// A registered io_uring personality: a kernel-held snapshot of one
@@ -294,7 +319,7 @@ impl<'a> Leaf<'a> {
         Ok(Leaf(b))
     }
 
-    fn to_cstring(self) -> CString {
+    pub(crate) fn to_cstring(self) -> CString {
         CString::new(self.0).expect("validated: no interior NUL")
     }
 }
@@ -480,6 +505,94 @@ pub(crate) struct FsOutcome {
     pub(crate) file: Option<(u32, u64)>,
     /// For `statx`: the kernel-filled buffer.
     pub(crate) stat: Option<Box<StatxRaw>>,
+    /// For fixed-buffer ops: the pooled-buffer lease, round-tripped back.
+    /// Travels in [`ReplyTo::Once`] (kernel-owned until the CQE) and is moved
+    /// here at delivery — see [`ReplyTo::send`].
+    #[cfg(feature = "rt-tokio")]
+    pub(crate) fixed: Option<crate::rt::PooledBuf>,
+}
+
+impl FsOutcome {
+    /// The one constructor — so the `rt-tokio`-only `fixed` field needs no
+    /// per-site cfg at the (several) literal construction sites.
+    pub(crate) fn new(
+        res: Result<i32, Errno>,
+        bufs: Vec<Vec<u8>>,
+        file: Option<(u32, u64)>,
+        stat: Option<Box<StatxRaw>>,
+    ) -> FsOutcome {
+        FsOutcome {
+            res,
+            bufs,
+            file,
+            stat,
+            #[cfg(feature = "rt-tokio")]
+            fixed: None,
+        }
+    }
+}
+
+/// Where a completed op's [`FsOutcome`] goes: a blocking mpsc reply channel
+/// (the [`FsHandle`] path) or a tokio oneshot (the async `rt::FsRt` path).
+/// One enum so the loop's delivery is caller-agnostic — both sends are
+/// non-blocking, and a gone receiver (an abandoned call, a dropped future)
+/// makes the send a no-op: the outcome and its buffers are simply dropped,
+/// which is safe because delivery happens only after the CQE reaped, when
+/// the kernel is done with them.
+pub(crate) enum ReplyTo {
+    Sync(mpsc::Sender<FsOutcome>),
+    #[cfg(feature = "rt-tokio")]
+    Once {
+        tx: tokio::sync::oneshot::Sender<FsOutcome>,
+        /// The async submitter's backpressure permit. It rides loop-side —
+        /// not in the caller's future — so it is released exactly when the
+        /// outcome is delivered (right after the op slot freed), and a
+        /// cancelled future cannot release it early while its op still
+        /// occupies a slot.
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        /// A fixed-buffer op's pooled lease. Owned *here* — inside the
+        /// waiter, which lives in the op entry until its CQE reaps — so the
+        /// kernel-visible pages cannot be reclaimed while the op is in
+        /// flight, no matter what the caller's future does. Moved into
+        /// [`FsOutcome::fixed`] at delivery (back to the caller), or dropped
+        /// with an undeliverable outcome (back to the pool) — both strictly
+        /// after the CQE.
+        fixed: Option<crate::rt::PooledBuf>,
+    },
+}
+
+impl ReplyTo {
+    /// A oneshot endpoint with no fixed-buffer payload.
+    #[cfg(feature = "rt-tokio")]
+    pub(crate) fn once(
+        tx: tokio::sync::oneshot::Sender<FsOutcome>,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> ReplyTo {
+        ReplyTo::Once {
+            tx,
+            permit,
+            fixed: None,
+        }
+    }
+
+    /// Deliver the outcome (consuming the endpoint; nothing blocks).
+    /// Returns `Err(out)` when the receiver is already gone (an abandoned
+    /// call, a dropped future) — most sites ignore it, but a successful
+    /// `open` uses it to detect that no [`FixedFile`] will be built to
+    /// orphan-close the slot, and stages the close itself.
+    pub(crate) fn send(self, out: FsOutcome) -> Result<(), FsOutcome> {
+        match self {
+            ReplyTo::Sync(tx) => tx.send(out).map_err(|e| e.0),
+            #[cfg(feature = "rt-tokio")]
+            ReplyTo::Once { tx, permit, fixed } => {
+                let mut out = out;
+                out.fixed = fixed;
+                let r = tx.send(out);
+                drop(permit);
+                r
+            }
+        }
+    }
 }
 
 /// A cross-thread request to the loop. Every kernel-visible payload an op
@@ -492,7 +605,7 @@ pub(crate) enum FsInject {
         anchor: Anchor,
         path: CString,
         how: RawOpenHow,
-        reply: mpsc::Sender<FsOutcome>,
+        reply: ReplyTo,
     },
     Rw {
         /// [`core::TAG_READV`] or [`core::TAG_WRITEV`].
@@ -502,20 +615,38 @@ pub(crate) enum FsInject {
         gen: u64,
         bufs: Vec<Vec<u8>>,
         off: u64,
-        reply: mpsc::Sender<FsOutcome>,
+        reply: ReplyTo,
+    },
+    /// A registered-buffer read/write (`READ_FIXED`/`WRITE_FIXED`). The SQE
+    /// payload travels as raw scalars — the **owning** `PooledBuf` lease
+    /// rides inside `reply` ([`ReplyTo::Once::fixed`]), which the op entry
+    /// holds until the CQE, so `addr` can never dangle while the kernel may
+    /// touch it.
+    #[cfg(feature = "rt-tokio")]
+    RwFixed {
+        /// [`core::TAG_READ_FIXED`] or [`core::TAG_WRITE_FIXED`].
+        tag: u8,
+        pers: u16,
+        slot: u32,
+        gen: u64,
+        addr: u64,
+        len: u32,
+        buf_index: u16,
+        off: u64,
+        reply: ReplyTo,
     },
     Fsync {
         pers: u16,
         slot: u32,
         gen: u64,
         datasync: bool,
-        reply: mpsc::Sender<FsOutcome>,
+        reply: ReplyTo,
     },
     Close {
         slot: u32,
         gen: u64,
         /// `None` = orphan close (a dropped [`FixedFile`]); nobody waits.
-        reply: Option<mpsc::Sender<FsOutcome>>,
+        reply: Option<ReplyTo>,
     },
     /// A metadata op on an open file: ftruncate/fallocate (no payload) or
     /// fgetxattr/fsetxattr (owned name + value).
@@ -529,7 +660,7 @@ pub(crate) enum FsInject {
         off: u64,
         len64: u64,
         aux32: u32,
-        reply: mpsc::Sender<FsOutcome>,
+        reply: ReplyTo,
     },
     /// `statx` or a directory-entry op, resolved against real anchor dirfds.
     PathOp {
@@ -541,8 +672,98 @@ pub(crate) enum FsInject {
         n2: Option<CString>,
         flags: u32,
         len_arg: u32,
-        reply: mpsc::Sender<FsOutcome>,
+        reply: ReplyTo,
     },
+    /// One splice hop for the zero-copy bridges (socket↔pipe↔file). Ends are
+    /// raw process fds (sockets, pipe halves — kept alive by `keep`) or a
+    /// fixed-table file (generation-checked, counted for close-last).
+    /// Personality 0 by design: splice resolves no names; the file end was
+    /// permission-checked at its open.
+    #[cfg(feature = "rt-tokio")]
+    Splice {
+        in_end: SpliceEnd,
+        /// Input offset (`u64::MAX` = none — mandatory for pipes/sockets).
+        off_in: u64,
+        out_end: SpliceEnd,
+        /// Output offset (`u64::MAX` = none).
+        off_out: u64,
+        len: u32,
+        /// `SPLICE_F_*` (the fd-in-fixed bit is added from `in_end`).
+        flags: u32,
+        /// Keeps every raw end's descriptor open (and its fd number
+        /// un-reused) until the CQE reaps.
+        keep: Vec<Arc<OwnedFd>>,
+        /// Cancel-on-drop handshake — see [`CancelToken`].
+        cancel: CancelToken,
+        reply: ReplyTo,
+    },
+    /// One-shot readiness poll on a raw fd — the bridges' retry signal after
+    /// a splice returned `-EAGAIN` (io_uring never poll-arms splice itself).
+    #[cfg(feature = "rt-tokio")]
+    Poll {
+        fd: RawFd,
+        /// `poll(2)` events (`POLLIN`/`POLLOUT`; `ERR`/`HUP` are implicit).
+        events: u32,
+        keep: Arc<OwnedFd>,
+        cancel: CancelToken,
+        reply: ReplyTo,
+    },
+    /// A send on a raw socket fd — plain (`zc: false`, single CQE) or
+    /// zero-copy (`zc: true`, `SEND_ZC`'s two-CQE lifecycle: the result
+    /// resolves the reply, the buffer stays op-owned until the `F_NOTIF`).
+    /// `data[start..]` is transmitted; the whole `Vec` rides in the op entry
+    /// and round-trips on a plain send / early failure (so an `EOPNOTSUPP`
+    /// zc attempt hands the payload back for the plain-send fallback).
+    #[cfg(feature = "rt-tokio")]
+    Send {
+        fd: RawFd,
+        data: Vec<u8>,
+        start: usize,
+        /// `MSG_*` flags (`NOSIGNAL` always; `WAITALL` on plaintext).
+        msg_flags: u32,
+        zc: bool,
+        keep: Arc<OwnedFd>,
+        cancel: CancelToken,
+        reply: ReplyTo,
+    },
+    /// Cancel an in-flight bridge op by its `user_data` — injected by a
+    /// dropped/timed-out bridge future's [`CancelToken`] guard so the op's
+    /// slot and backpressure permit are reclaimed instead of leaking until a
+    /// silent peer acts (a poll that never fires, an io-wq-blocked kTLS
+    /// splice). A stale target (op already reaped, slot recycled) matches
+    /// nothing — the generation in `ud` guards it.
+    #[cfg(feature = "rt-tokio")]
+    CancelUd { ud: u64 },
+}
+
+/// The cancel-on-drop handshake between a bridge future and the loop. A
+/// small atomic state machine shared by the future's drop guard and the
+/// loop's `submit_*`:
+///
+/// - `0` — initial: not yet staged, not cancelled.
+/// - a nonzero `user_data` — the loop staged the op under it; a dropped
+///   guard injects [`FsInject::CancelUd`] for it.
+/// - [`CANCEL_REQUESTED`] — the guard fired *before* the loop staged; the
+///   loop sees it and aborts the op cleanly instead of staging a leak.
+///
+/// The two writers race through a single `compare_exchange`/`swap` on this
+/// word, so no op is ever both staged and left un-cancellable.
+#[cfg(feature = "rt-tokio")]
+pub(crate) type CancelToken = Arc<std::sync::atomic::AtomicU64>;
+
+/// The [`CancelToken`] sentinel a dropped guard writes before the op staged.
+/// `u64::MAX` can never be a real `user_data` (its tag byte, `0xFF`, is not
+/// an issued op tag), so it is unambiguous.
+#[cfg(feature = "rt-tokio")]
+pub(crate) const CANCEL_REQUESTED: u64 = u64::MAX;
+
+/// One end of a bridge splice: a raw process fd, or a fixed-table file
+/// (named by slot + full generation, checked at submission).
+#[cfg(feature = "rt-tokio")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SpliceEnd {
+    Raw(RawFd),
+    Fixed { slot: u32, gen: u64 },
 }
 
 /// An operation submitted with [`FsHandle::start_preadv`] (the
@@ -615,35 +836,7 @@ impl FsHandle {
         path: &P,
         how: OpenHow,
     ) -> crate::Result<FixedFile> {
-        let cpath: CString = path.with_tn_path(|c| c.to_owned())?;
-        let bytes = cpath.as_bytes();
-        if bytes.is_empty() {
-            return Err(crate::Error::Validation(
-                "async_fs open: empty path".into(),
-            ));
-        }
-        if bytes[0] == b'/' {
-            return Err(crate::Error::Validation(
-                "async_fs paths are anchor-relative; absolute paths are not \
-                 accepted"
-                    .into(),
-            ));
-        }
-        let mut raw = how.to_raw();
-        if raw.flags & libc::O_CLOEXEC as u64 != 0 {
-            return Err(crate::Error::Validation(
-                "async_fs open: O_CLOEXEC is meaningless for fixed-table \
-                 opens (and rejected by the kernel); drop it"
-                    .into(),
-            ));
-        }
-        // Confine to `anchor` by default (see the doc): an unset `resolve`
-        // would let `..`/symlinks escape the share.
-        if raw.resolve == 0 {
-            raw.resolve = ResolveFlag::RESOLVE_BENEATH
-                .union(ResolveFlag::RESOLVE_NO_SYMLINKS)
-                .bits();
-        }
+        let (cpath, raw) = open_parts(path, how)?;
         let (tx, rx) = mpsc::channel();
         let out = self.call(
             FsInject::Open {
@@ -651,7 +844,7 @@ impl FsHandle {
                 anchor: anchor.clone(),
                 path: cpath,
                 how: raw,
-                reply: tx,
+                reply: ReplyTo::Sync(tx),
             },
             &rx,
         )?;
@@ -744,7 +937,7 @@ impl FsHandle {
             gen: f.gen,
             bufs,
             off,
-            reply: tx,
+            reply: ReplyTo::Sync(tx),
         })
         .map_err(|_| crate::Error::from(Errno::ECONNABORTED))?;
         Ok(FsPending { rx })
@@ -1016,7 +1209,7 @@ impl FsHandle {
                 n2: Some(leaf.to_cstring()),
                 flags: 0,
                 len_arg: 0,
-                reply: tx,
+                reply: ReplyTo::Sync(tx),
             },
             &rx,
         )?;
@@ -1064,7 +1257,7 @@ impl FsHandle {
             FsInject::Close {
                 slot,
                 gen,
-                reply: Some(tx),
+                reply: Some(ReplyTo::Sync(tx)),
             },
             &rx,
         )?;
@@ -1084,7 +1277,7 @@ impl FsHandle {
                 slot: f.slot,
                 gen: f.gen,
                 datasync,
-                reply: tx,
+                reply: ReplyTo::Sync(tx),
             },
             &rx,
         )?;
@@ -1107,7 +1300,7 @@ impl FsHandle {
             gen: f.gen,
             bufs,
             off,
-            reply: tx,
+            reply: ReplyTo::Sync(tx),
         });
         if let Err(msg) = sent {
             // Loop gone: hand the caller's buffers back, as the completion
@@ -1150,7 +1343,7 @@ impl FsHandle {
             off,
             len64,
             aux32,
-            reply: tx,
+            reply: ReplyTo::Sync(tx),
         });
         if let Err(msg) = sent {
             // Loop gone: hand the caller's value buffer back.
@@ -1191,7 +1384,7 @@ impl FsHandle {
                 off,
                 len64,
                 aux32,
-                reply: tx,
+                reply: ReplyTo::Sync(tx),
             },
             &rx,
         )?;
@@ -1219,7 +1412,7 @@ impl FsHandle {
                 // `FsConn::statx`); AT_SYMLINK_FOLLOW opts into the target.
                 flags: statx_at_flags(flags),
                 len_arg: mask.bits(),
-                reply: tx,
+                reply: ReplyTo::Sync(tx),
             },
             &rx,
         )?;
@@ -1254,7 +1447,7 @@ impl FsHandle {
                 n2: n2.map(Leaf::to_cstring),
                 flags,
                 len_arg,
-                reply: tx,
+                reply: ReplyTo::Sync(tx),
             },
             &rx,
         )?;
@@ -1264,7 +1457,11 @@ impl FsHandle {
     /// Queue an inject and wake the loop. On failure (loop stopping or gone)
     /// the un-sent message is handed back as `Err(msg)` so a caller can recover
     /// the owned buffers it moved in; the error is always `ECONNABORTED`.
-    fn send(&self, msg: FsInject) -> Result<(), FsInject> {
+    /// (`pub(crate)`: the async `rt` handle submits through the same path.)
+    // The Err IS the un-sent message, by design — its size is the payload the
+    // caller gets back (buffers, lease), not an error-path allocation to shrink.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn send(&self, msg: FsInject) -> Result<(), FsInject> {
         use std::sync::atomic::Ordering;
         if self.shared.stop.load(Ordering::Acquire) {
             return Err(msg);

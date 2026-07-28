@@ -44,17 +44,18 @@ jobs:
     - name: clippy
       run: cargo clippy --all-features --all-targets -- -D warnings
 
-    # The net (io_uring) tests skip themselves when a ring can't be created. We
-    # do NOT want that to pass silently as green, so force them to run below —
-    # but first fail fast and legibly if this runner has io_uring restricted,
-    # so a red is clearly "runner can't do io_uring" and not a net-code bug.
+    # The io_uring suites (async_fs, rt_fs) skip themselves when a ring can't
+    # be created. We do NOT want that to pass silently as green, so force them
+    # to run below — but first fail fast and legibly if this runner has
+    # io_uring restricted, so a red is clearly "runner can't do io_uring" and
+    # not a reactor bug.
     # (io_uring_disabled: 0 = on for everyone, 1 = unprivileged blocked, 2 =
     # off; an absent sysctl predates the knob and means io_uring is on.)
     - name: Verify io_uring is available
       run: |
         disabled=$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0)
         if [ "$disabled" != "0" ]; then
-          echo "::error::io_uring restricted on this runner (io_uring_disabled=$disabled); net tests cannot run here"
+          echo "::error::io_uring restricted on this runner (io_uring_disabled=$disabled); the reactor tests cannot run here"
           exit 1
         fi
         echo "io_uring available (io_uring_disabled=$disabled)"
@@ -62,15 +63,15 @@ jobs:
     # The ZFS-backed and privileged tests skip automatically here (no datasets,
     # unprivileged); the QEMU VM job exercises them for real. Two otherwise-
     # silent skips are turned into hard failures: the configparser differential
-    # tests (REQUIRE_PYTHON) and the net server/client tests (REQUIRE_IO_URING,
+    # tests (REQUIRE_PYTHON) and the io_uring reactor suites (REQUIRE_IO_URING,
     # backed by the ring probe above that guarantees they can actually run).
     #
-    # The kTLS data-path tests are deliberately NOT forced here: this runner's
-    # kernel has the tls ULP, but Ubuntu builds OpenSSL 3.0 without
-    # enable-ktls, so libssl can never install kTLS on a socket and the suites'
-    # loopback engagement probe skips those tests. The QEMU job (Trixie
-    # userspace, OpenSSL 3.2+ with ktls) sets TRUENAS_ROS_REQUIRE_KTLS=1 and
-    # runs them for real.
+    # The kTLS tests (rt_fs's KtlsStream/bridge coverage) are deliberately NOT
+    # forced here: this runner's kernel has the tls ULP, but Ubuntu builds
+    # OpenSSL 3.0 without enable-ktls, so libssl can never install kTLS on a
+    # socket and the handshake helpers report non-engagement (a skip). The
+    # QEMU job (Trixie userspace, OpenSSL 3.2+ with ktls) sets
+    # TRUENAS_ROS_REQUIRE_KTLS=1 and runs them for real.
     - name: test
       run: cargo test --all-features
       env:
@@ -90,13 +91,15 @@ jobs:
 
     # Each feature alone proves the per-subsystem gates and dependency edges
     # (acl without shutil, idmap alone, …); `uring` alone proves the shared
-    # engine builds severed from the net stack (the seam the async fs reactor
-    # relies on); each net role alone proves the role gates.
+    # engine builds standalone; `framing` alone proves the dep-free decision
+    # core; each rt-* tier alone proves the tokio-hybrid gates
+    # (rt-tokio → rt-ktls → rt-tls-openssl).
     - name: feature-matrix builds
       run: |
         cargo build --no-default-features
         for f in sync-fs xattr mount acl fhandle fsiter idmap shutil \
-                 configfile uring net-server net-client async-fs; do
+                 configfile uring async-fs framing \
+                 rt-tokio rt-ktls rt-tls-openssl; do
           cargo build --no-default-features --features "$f"
         done
         cargo build --all-features

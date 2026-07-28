@@ -5,11 +5,10 @@
 //! a completion.
 
 use crate::errno;
-use crate::uring::probe::probe_op_supported;
 use crate::uring::ring::Ring;
 use crate::uring::sys::*;
 use crate::uring::wake::{create_eventfd, LoopShared, WakeHandle};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// The role-agnostic io_uring engine a domain stack embeds. Field order is
@@ -18,7 +17,7 @@ use std::sync::Arc;
 /// kernel-visible buffer drops before the ring is unmapped and its pool
 /// descriptors close (the kernel must never touch a freed buffer).
 pub(crate) struct Engine {
-    /// Stop/graceful flags + the wake eventfd, shared with every cross-thread
+    /// The stop flag + the wake eventfd, shared with every cross-thread
     /// handle.
     pub(crate) shared: Arc<LoopShared>,
     /// Landing pad for the wake eventfd `READ` (the kernel drains the counter
@@ -27,10 +26,6 @@ pub(crate) struct Engine {
     pub(crate) wake_buf: Box<u64>,
     /// Operations currently in flight on the ring.
     pub(crate) inflight: u64,
-    /// Whether the kernel supports `IORING_OP_FIXED_FD_INSTALL` (Linux ≥ 6.8;
-    /// probed at construction) — required to furnish real fds (kTLS
-    /// handshakes, connection detach).
-    pub(crate) fixed_fd_install: bool,
     /// Declared last so it drops after everything above; see the struct doc.
     pub(crate) ring: Ring,
 }
@@ -41,23 +36,17 @@ impl Engine {
     /// probes (socket commands, TLS ULP) run afterwards against
     /// [`Engine::ring`].
     pub(crate) fn new(entries: u32, pool_slots: u32) -> crate::Result<Engine> {
-        Self::assemble(Ring::new(entries)?, |ring| {
-            ring.register_pool(pool_slots)
-        })
+        Self::new_sized(entries, pool_slots, None)
     }
 
-    /// Like [`Engine::new`], but registers one shared table of
-    /// `pool_slots + fs_slots` with the auto-allocation range confined to the
-    /// connection pool `[0, pool_slots)` — the embedded fs reactor owns the
-    /// upper range at explicit indices ([`Ring::register_pool_with_fs`]).
-    #[cfg(all(feature = "net-server", feature = "async-fs"))]
-    pub(crate) fn new_with_fs(
+    /// [`Engine::new`] with an explicit CQ size ([`Ring::new_sized`]).
+    pub(crate) fn new_sized(
         entries: u32,
         pool_slots: u32,
-        fs_slots: u32,
+        cq_entries: Option<u32>,
     ) -> crate::Result<Engine> {
-        Self::assemble(Ring::new(entries)?, |ring| {
-            ring.register_pool_with_fs(pool_slots, fs_slots)
+        Self::assemble(Ring::new_sized(entries, cq_entries)?, |ring| {
+            ring.register_pool(pool_slots)
         })
     }
 
@@ -66,12 +55,8 @@ impl Engine {
         register: impl FnOnce(&Ring) -> errno::Result<()>,
     ) -> crate::Result<Engine> {
         register(&ring)?;
-        let fixed_fd_install =
-            probe_op_supported(&ring, IORING_OP_FIXED_FD_INSTALL);
         let shared = Arc::new(LoopShared {
             stop: AtomicBool::new(false),
-            graceful: AtomicBool::new(false),
-            grace_ms: AtomicU64::new(0),
             wake: WakeHandle {
                 fd: create_eventfd()?,
             },
@@ -80,7 +65,6 @@ impl Engine {
             shared,
             wake_buf: Box::new(0),
             inflight: 0,
-            fixed_fd_install,
             ring,
         })
     }
@@ -96,35 +80,6 @@ impl Engine {
             sqe.user_data = user_data;
         })?;
         self.inflight += 1;
-        Ok(())
-    }
-
-    /// Stage an `IO_LINK` head plus its trailing `LINK_TIMEOUT` as one
-    /// contiguous pair (the kernel accepts the timeout only in the same
-    /// submission as its head), counting both as in-flight. Each yields its
-    /// own terminal completion.
-    pub(crate) fn stage_linked<H, T>(
-        &mut self,
-        head_ud: u64,
-        head: H,
-        tail_ud: u64,
-        tail: T,
-    ) -> errno::Result<()>
-    where
-        H: FnOnce(&mut IoUringSqe),
-        T: FnOnce(&mut IoUringSqe),
-    {
-        self.ring.push_sqe_linked(
-            move |sqe| {
-                head(sqe);
-                sqe.user_data = head_ud;
-            },
-            move |sqe| {
-                tail(sqe);
-                sqe.user_data = tail_ud;
-            },
-        )?;
-        self.inflight += 2;
         Ok(())
     }
 
@@ -147,8 +102,8 @@ impl Engine {
     /// Cancel every outstanding op, then reap until nothing is in flight.
     /// `cancel_user_data` tags the `CANCEL_ANY` op; every reaped CQE is
     /// handed to `on_reaped` so the domain can release resources a
-    /// non-dispatching drain would otherwise leak (the stream stack closes
-    /// fds a completed `FIXED_FD_INSTALL` furnished, for example).
+    /// non-dispatching drain would otherwise leak (buffers, pooled leases,
+    /// parked waiters).
     pub(crate) fn cancel_and_reap_all(
         &mut self,
         cancel_user_data: u64,

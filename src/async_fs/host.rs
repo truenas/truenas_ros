@@ -92,6 +92,15 @@ pub struct FsConfig {
     /// Op-table slots — the maximum number of concurrently in-flight
     /// operations. Submitting past it fails `EBUSY`.
     pub ops: u32,
+    /// Completion-queue size (`IORING_SETUP_CQSIZE`; must be ≥ `entries`,
+    /// rounded up to a power of two by the kernel). `None` keeps the kernel
+    /// default of `2 × entries` — size it explicitly when a workload
+    /// multiplies CQEs beyond that ratio (two-CQE `SEND_ZC` pairs).
+    pub cq_entries: Option<u32>,
+    /// Cap the ring's io-wq worker pools as `[bounded, unbounded]` (0 leaves
+    /// a pool at the kernel default). Bounds the kernel worker threads that
+    /// buffered filesystem I/O and always-async ops (splice) can spawn.
+    pub iowq_max_workers: Option<[u32; 2]>,
 }
 
 impl Default for FsConfig {
@@ -100,6 +109,8 @@ impl Default for FsConfig {
             entries: 128,
             files: 64,
             ops: 128,
+            cq_entries: None,
+            iowq_max_workers: None,
         }
     }
 }
@@ -183,7 +194,19 @@ impl AsyncFs {
                 "FsConfig::entries must be at least 4".into(),
             ));
         }
-        let eng = Engine::new(cfg.entries, cfg.files)?;
+        if cfg.cq_entries.is_some_and(|cq| cq < cfg.entries) {
+            return Err(crate::Error::Validation(
+                "FsConfig::cq_entries must be >= entries".into(),
+            ));
+        }
+        let eng = Engine::new_sized(cfg.entries, cfg.files, cfg.cq_entries)?;
+        if let Some(caps) = cfg.iowq_max_workers {
+            let mut caps = caps;
+            crate::uring::sys::register_iowq_max_workers(
+                eng.ring.raw_fd(),
+                &mut caps,
+            )?;
+        }
         if !probe_op_supported(&eng.ring, IORING_OP_OPENAT2) {
             return Err(crate::Error::Validation(
                 "async_fs requires io_uring OPENAT2 (Linux >= 5.6); this \
@@ -303,8 +326,14 @@ impl AsyncFs {
             // `on_cqe` never returns an embedded callback here; drop the
             // (always-`None`) result.
             _ => {
-                let _ =
-                    self.fs.on_cqe(&mut self.eng, tag, slot, gen32, cqe.res);
+                let _ = self.fs.on_cqe(
+                    &mut self.eng,
+                    tag,
+                    slot,
+                    gen32,
+                    cqe.res,
+                    cqe.flags,
+                );
             }
         }
         Ok(())
@@ -345,6 +374,29 @@ impl AsyncFs {
                     off,
                     FsWaiter::Channel(reply),
                 ),
+                #[cfg(feature = "rt-tokio")]
+                FsInject::RwFixed {
+                    tag,
+                    pers,
+                    slot,
+                    gen,
+                    addr,
+                    len,
+                    buf_index,
+                    off,
+                    reply,
+                } => self.fs.submit_rw_fixed(
+                    &mut self.eng,
+                    tag,
+                    pers,
+                    slot,
+                    gen,
+                    addr,
+                    len,
+                    buf_index,
+                    off,
+                    FsWaiter::Channel(reply),
+                ),
                 FsInject::Fsync {
                     pers,
                     slot,
@@ -361,6 +413,69 @@ impl AsyncFs {
                 ),
                 FsInject::Close { slot, gen, reply } => {
                     self.fs.submit_close(&mut self.eng, slot, gen, reply)
+                }
+                #[cfg(feature = "rt-tokio")]
+                FsInject::Splice {
+                    in_end,
+                    off_in,
+                    out_end,
+                    off_out,
+                    len,
+                    flags,
+                    keep,
+                    cancel,
+                    reply,
+                } => self.fs.submit_splice(
+                    &mut self.eng,
+                    in_end,
+                    off_in,
+                    out_end,
+                    off_out,
+                    len,
+                    flags,
+                    keep,
+                    cancel,
+                    FsWaiter::Channel(reply),
+                ),
+                #[cfg(feature = "rt-tokio")]
+                FsInject::Poll {
+                    fd,
+                    events,
+                    keep,
+                    cancel,
+                    reply,
+                } => self.fs.submit_poll(
+                    &mut self.eng,
+                    fd,
+                    events,
+                    keep,
+                    cancel,
+                    FsWaiter::Channel(reply),
+                ),
+                #[cfg(feature = "rt-tokio")]
+                FsInject::Send {
+                    fd,
+                    data,
+                    start,
+                    msg_flags,
+                    zc,
+                    keep,
+                    cancel,
+                    reply,
+                } => self.fs.submit_send(
+                    &mut self.eng,
+                    fd,
+                    data,
+                    start,
+                    msg_flags,
+                    zc,
+                    keep,
+                    cancel,
+                    FsWaiter::Channel(reply),
+                ),
+                #[cfg(feature = "rt-tokio")]
+                FsInject::CancelUd { ud } => {
+                    self.fs.submit_cancel_ud(&mut self.eng, ud)
                 }
                 FsInject::FdMeta {
                     tag,
@@ -440,6 +555,20 @@ impl AsyncFs {
             let (reply, bufs) = match msg {
                 FsInject::Open { reply, .. } => (Some(reply), Vec::new()),
                 FsInject::Rw { reply, bufs, .. } => (Some(reply), bufs),
+                // The pooled lease rides inside `reply` and round-trips (or
+                // returns to the pool) via `ReplyTo::send`.
+                #[cfg(feature = "rt-tokio")]
+                FsInject::RwFixed { reply, .. } => (Some(reply), Vec::new()),
+                #[cfg(feature = "rt-tokio")]
+                FsInject::Splice { reply, .. } => (Some(reply), Vec::new()),
+                #[cfg(feature = "rt-tokio")]
+                FsInject::Poll { reply, .. } => (Some(reply), Vec::new()),
+                #[cfg(feature = "rt-tokio")]
+                FsInject::Send { reply, data, .. } => (Some(reply), vec![data]),
+                // A late cancel request for an op that is being torn down
+                // anyway: nothing to reply to, nothing to reclaim.
+                #[cfg(feature = "rt-tokio")]
+                FsInject::CancelUd { .. } => (None, Vec::new()),
                 FsInject::Fsync { reply, .. } => (Some(reply), Vec::new()),
                 FsInject::Close { reply, .. } => (reply, Vec::new()),
                 FsInject::FdMeta { reply, value, .. } => {
@@ -448,12 +577,12 @@ impl AsyncFs {
                 FsInject::PathOp { reply, .. } => (Some(reply), Vec::new()),
             };
             if let Some(reply) = reply {
-                let _ = reply.send(FsOutcome {
-                    res: Err(Errno::ECONNABORTED),
+                let _ = reply.send(FsOutcome::new(
+                    Err(Errno::ECONNABORTED),
                     bufs,
-                    file: None,
-                    stat: None,
-                });
+                    None,
+                    None,
+                ));
             }
         }
         drained?;

@@ -1,4 +1,4 @@
-# Fuzz harnesses for the net stack's framing. A separate, unpublished dev-only
+# Fuzz harnesses for the pure framing core. A separate, unpublished dev-only
 # crate (like the bench crate / kTLS test deps): it does NOT touch the library's
 # libc+bitflags charter or its 1.75 MSRV. Run with a nightly toolchain:
 #   cargo +nightly fuzz run framer_length_prefix
@@ -16,7 +16,7 @@ libfuzzer-sys = "0.4"
 
 [dependencies.truenas_ros]
 path = ".."
-# `__fuzz` implies `net-server` and exposes the pure `frame_step`.
+# `__fuzz` enables the `framing` module the harnesses exercise.
 features = ["__fuzz"]
 
 # Self-rooted so it never gets pulled into a parent workspace.

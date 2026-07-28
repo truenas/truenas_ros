@@ -18,7 +18,7 @@
 //!   `u64` generation (channel-side); op `user_data` packs the low 32 bits,
 //!   exact because an op entry frees only at its own single terminal CQE.
 
-use super::{Anchor, FsFile, FsOutcome, Leaf, Personality};
+use super::{Anchor, FsFile, FsOutcome, Leaf, Personality, ReplyTo};
 use crate::errno::Errno;
 use crate::sync_fs::openat2::RawOpenHow;
 use crate::sync_fs::{
@@ -36,10 +36,15 @@ use crate::uring::sys::{
     IORING_OP_SYMLINKAT, IORING_OP_UNLINKAT, IORING_OP_WRITEV,
     IOSQE_FIXED_FILE,
 };
+#[cfg(feature = "rt-tokio")]
+use crate::uring::sys::{
+    IORING_OP_POLL_ADD, IORING_OP_READ_FIXED, IORING_OP_SEND,
+    IORING_OP_SEND_ZC, IORING_OP_SPLICE, IORING_OP_WRITE_FIXED,
+    SPLICE_F_FD_IN_FIXED,
+};
 use crate::uring::user_data::{pack_raw, unpack_raw};
 use std::ffi::{CStr, CString};
 use std::mem::size_of;
-use std::sync::mpsc;
 
 // fs op tags (the 0x80 domain; fs-reactor design §13).
 pub(crate) const TAG_OPEN: u8 = 0x80;
@@ -57,6 +62,24 @@ pub(crate) const TAG_SYMLINKAT: u8 = 0x8C;
 pub(crate) const TAG_LINKAT: u8 = 0x8D;
 pub(crate) const TAG_FGETXATTR: u8 = 0x8E;
 pub(crate) const TAG_FSETXATTR: u8 = 0x8F;
+/// Registered-buffer read (`IORING_OP_READ_FIXED`) — the zero-copy tier's
+/// data ops. Unconditional consts (they gate `targets_file`, compiled in
+/// every build); the submit paths are `rt-tokio`-only.
+pub(crate) const TAG_READ_FIXED: u8 = 0x90;
+/// Registered-buffer write (`IORING_OP_WRITE_FIXED`).
+pub(crate) const TAG_WRITE_FIXED: u8 = 0x91;
+/// A bridge splice hop between raw fds (socket↔pipe); holds no file.
+pub(crate) const TAG_SPLICE_RAW: u8 = 0x92;
+/// A bridge splice hop with a fixed-table file end (pipe↔file) — counted
+/// against the file for close-last, like every fd-targeting op.
+pub(crate) const TAG_SPLICE_FILE: u8 = 0x93;
+/// A bridge readiness poll (one-shot `POLL_ADD` on a raw fd).
+pub(crate) const TAG_POLL: u8 = 0x94;
+/// A bridge send on a raw socket fd (single CQE).
+pub(crate) const TAG_SEND: u8 = 0x95;
+/// A bridge zero-copy send (`SEND_ZC`): two CQEs — the result (delivered,
+/// `F_MORE`) and the buffer-release notif (`F_NOTIF`, frees the slot).
+pub(crate) const TAG_SEND_ZC: u8 = 0x96;
 /// The standalone host's wake tag (an embedded host reuses its own).
 pub(crate) const TAG_WAKE: u8 = 0x9D;
 /// Tags `ASYNC_CANCEL` ops (and the teardown drain); completions ignored.
@@ -69,6 +92,9 @@ fn targets_file(tag: u8) -> bool {
         tag,
         TAG_READV
             | TAG_WRITEV
+            | TAG_READ_FIXED
+            | TAG_WRITE_FIXED
+            | TAG_SPLICE_FILE
             | TAG_FSYNC
             | TAG_FALLOCATE
             | TAG_FTRUNCATE
@@ -171,7 +197,7 @@ pub(crate) type Owner = Option<(u32, u64)>;
 /// connection's [`Owner`] tag, stamped onto the op (and its file, for an open)
 /// so the connection-close sweep can find them.
 pub(crate) enum FsWaiter {
-    Channel(mpsc::Sender<FsOutcome>),
+    Channel(ReplyTo),
     Embedded { owner: Owner, cb: EmbeddedCb },
 }
 
@@ -251,7 +277,7 @@ impl std::fmt::Debug for FsConn<'_> {
 impl<'a> FsConn<'a> {
     // Minted by the embedding `net` server (in dispatch and `Request::fs`); dead
     // in an async-fs-only build, which has no server to hand it out.
-    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    #[allow(dead_code)] // minted only by an embedding host (none in-tree today)
     pub(crate) fn new(
         fs: &'a mut FsCore,
         eng: &'a mut Engine,
@@ -881,6 +907,10 @@ struct FsOpEntry {
     anchor: Option<Anchor>,
     /// The second dirfd of a rename/link.
     anchor2: Option<Anchor>,
+    /// Raw descriptors a bridge op names (socket dups, pipe halves), kept
+    /// open — and their fd numbers un-reused — until the CQE reaps.
+    #[cfg(feature = "rt-tokio")]
+    raw_fds: Vec<std::sync::Arc<std::os::fd::OwnedFd>>,
     /// The fixed-file slot this op targets.
     file_slot: Option<u32>,
     /// The owning connection (embedded path), propagated to a chained op's
@@ -889,10 +919,26 @@ struct FsOpEntry {
     owner: Owner,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum FsOpState {
     Free,
-    InFlight { tag: u8 },
+    InFlight {
+        tag: u8,
+    },
+    /// A `SEND_ZC` past its *result* CQE (`F_MORE`), still pinning its
+    /// payload until the `F_NOTIF` CQE frees the slot. The generation is
+    /// deliberately unbumped — the notif carries the same `user_data` and
+    /// must still match. `failed_res` is `None` when the send succeeded (the
+    /// waiter was already resolved at the result; the notif just frees), or
+    /// `Some(negative res)` when it failed — in which case the waiter and
+    /// payload are held here and delivered at the notif, once the kernel has
+    /// definitively released every page (a mid-send error can leave partial
+    /// skbs referencing them until then, so handing the buffer back at the
+    /// result would be a use-after-free).
+    #[cfg(feature = "rt-tokio")]
+    ZcAwaitNotif {
+        failed_res: Option<i32>,
+    },
 }
 
 impl FsOpEntry {
@@ -908,6 +954,8 @@ impl FsOpEntry {
             stat: None,
             anchor: None,
             anchor2: None,
+            #[cfg(feature = "rt-tokio")]
+            raw_fds: Vec::new(),
             file_slot: None,
             owner: None,
         }
@@ -922,6 +970,8 @@ impl FsOpEntry {
         self.how = None;
         self.anchor = None;
         self.anchor2 = None;
+        #[cfg(feature = "rt-tokio")]
+        self.raw_fds.clear();
         self.file_slot = None;
         self.owner = None;
         self.state = FsOpState::Free;
@@ -947,7 +997,7 @@ struct FileEntry {
     /// A close arrived while `ops > 0`; the last reaping op stages it.
     close_deferred: bool,
     /// The deferred close's waiter, parked until the close is staged.
-    close_waiter: Option<mpsc::Sender<FsOutcome>>,
+    close_waiter: Option<ReplyTo>,
     /// The connection that opened this file (embedded path), for the
     /// connection-close sweep ([`FsCore::close_owned_by`]). `None` off-loop.
     owner: Owner,
@@ -1173,6 +1223,272 @@ impl FsCore {
         });
         if let Err(err) = staged {
             self.files[file_slot as usize].state.ops -= 1;
+            self.fail_op(op_slot, err);
+        }
+    }
+
+    /// Stage a `READ_FIXED`/`WRITE_FIXED` (per `tag`) against an open file.
+    /// The SQE names a range inside a registered buffer
+    /// (`addr`/`len`/`buf_index`); the **owning** lease rides in the
+    /// waiter's reply endpoint, held by this op entry until the CQE reaps —
+    /// so the address cannot dangle while the kernel may touch it (see
+    /// [`FsInject::RwFixed`](super::FsInject)).
+    #[cfg(feature = "rt-tokio")]
+    #[allow(clippy::too_many_arguments)] // an inject unpacked, not an API
+    pub(crate) fn submit_rw_fixed(
+        &mut self,
+        eng: &mut Engine,
+        tag: u8,
+        pers: u16,
+        file_slot: u32,
+        file_gen: u64,
+        addr: u64,
+        len: u32,
+        buf_index: u16,
+        off: u64,
+        waiter: FsWaiter,
+    ) {
+        if !self.file_usable(file_slot, file_gen) {
+            fail(waiter, Errno::EBADF, Vec::new());
+            return;
+        }
+        let Some(op_slot) = self.op_free.pop() else {
+            fail(waiter, Errno::EBUSY, Vec::new());
+            return;
+        };
+
+        let entry = &mut self.ops[op_slot as usize];
+        let gen32 = entry.generation as u32;
+        let e = &mut entry.state;
+        e.state = FsOpState::InFlight { tag };
+        e.owner = waiter.owner();
+        e.waiter = Some(waiter);
+        e.file_slot = Some(file_slot);
+
+        self.files[file_slot as usize].state.ops += 1;
+
+        let opcode = if tag == TAG_READ_FIXED {
+            IORING_OP_READ_FIXED
+        } else {
+            IORING_OP_WRITE_FIXED
+        };
+        let ud = pack_raw(tag, op_slot, gen32);
+        let staged = eng.stage(ud, |sqe| {
+            sqe.opcode = opcode;
+            sqe.flags = IOSQE_FIXED_FILE;
+            sqe.fd = file_slot as i32;
+            sqe.addr = addr;
+            sqe.len = len;
+            sqe.off_addr2 = off;
+            sqe.buf_index = buf_index;
+            // `pers` may be 0: the BECOME_ROOT path ([`FsFile::as_root`]);
+            // see `submit_rw`.
+            sqe.personality = pers;
+        });
+        if let Err(err) = staged {
+            self.files[file_slot as usize].state.ops -= 1;
+            self.fail_op(op_slot, err);
+        }
+    }
+
+    /// Stage one bridge splice hop. At most one end is a fixed-table file
+    /// (the bridges splice socket↔pipe↔file): that end is generation-checked
+    /// and takes an op reference (close-last); raw ends are kept alive by
+    /// the `keep` anchors until the CQE. Personality 0 by design — splice
+    /// resolves no names, and the file end was permission-checked at open.
+    #[cfg(feature = "rt-tokio")]
+    #[allow(clippy::too_many_arguments)] // an inject unpacked, not an API
+    pub(crate) fn submit_splice(
+        &mut self,
+        eng: &mut Engine,
+        in_end: super::SpliceEnd,
+        off_in: u64,
+        out_end: super::SpliceEnd,
+        off_out: u64,
+        len: u32,
+        flags: u32,
+        keep: Vec<std::sync::Arc<std::os::fd::OwnedFd>>,
+        cancel: super::CancelToken,
+        waiter: FsWaiter,
+    ) {
+        use super::SpliceEnd;
+        let file_slot = match (in_end, out_end) {
+            (SpliceEnd::Fixed { slot, gen }, _)
+            | (_, SpliceEnd::Fixed { slot, gen }) => {
+                if !self.file_usable(slot, gen) {
+                    fail(waiter, Errno::EBADF, Vec::new());
+                    return;
+                }
+                Some(slot)
+            }
+            _ => None,
+        };
+        let tag = if file_slot.is_some() {
+            TAG_SPLICE_FILE
+        } else {
+            TAG_SPLICE_RAW
+        };
+        let Some(op_slot) = self.op_free.pop() else {
+            fail(waiter, Errno::EBUSY, Vec::new());
+            return;
+        };
+        let gen32 = self.ops[op_slot as usize].generation as u32;
+        let ud = pack_raw(tag, op_slot, gen32);
+        if !publish_cancel(&cancel, ud) {
+            // The bridge future was dropped before we staged: abort cleanly.
+            self.op_free.push(op_slot);
+            fail(waiter, Errno::ECANCELED, Vec::new());
+            return;
+        }
+
+        let e = &mut self.ops[op_slot as usize].state;
+        e.state = FsOpState::InFlight { tag };
+        e.owner = waiter.owner();
+        e.waiter = Some(waiter);
+        e.raw_fds = keep;
+        e.file_slot = file_slot;
+        if let Some(fs) = file_slot {
+            self.files[fs as usize].state.ops += 1;
+        }
+
+        let staged = eng.stage(ud, |sqe| {
+            sqe.opcode = IORING_OP_SPLICE;
+            // Output end: `sqe.fd` — the 0-based fixed slot under
+            // `IOSQE_FIXED_FILE`, or the raw fd.
+            match out_end {
+                SpliceEnd::Raw(fd) => sqe.fd = fd,
+                SpliceEnd::Fixed { slot, .. } => {
+                    sqe.flags = IOSQE_FIXED_FILE;
+                    sqe.fd = slot as i32;
+                }
+            }
+            // Input end: `splice_fd_in` overlays `file_index` — the raw fd
+            // value, or the 0-based fixed slot flagged FD_IN_FIXED.
+            match in_end {
+                SpliceEnd::Raw(fd) => sqe.file_index = fd as u32,
+                SpliceEnd::Fixed { slot, .. } => {
+                    sqe.file_index = slot;
+                    sqe.op_flags = SPLICE_F_FD_IN_FIXED;
+                }
+            }
+            sqe.op_flags |= flags;
+            sqe.addr = off_in; // splice_off_in
+            sqe.off_addr2 = off_out; // off_out
+            sqe.len = len;
+        });
+        if let Err(err) = staged {
+            if let Some(fs) = file_slot {
+                self.files[fs as usize].state.ops -= 1;
+            }
+            self.fail_op(op_slot, err);
+        }
+    }
+
+    /// Stage a one-shot readiness poll on a raw fd — the bridges' retry
+    /// signal after a splice returned `-EAGAIN` (io_uring never poll-arms
+    /// splice itself; `opdef` declares no pollin/pollout for it).
+    #[cfg(feature = "rt-tokio")]
+    pub(crate) fn submit_poll(
+        &mut self,
+        eng: &mut Engine,
+        fd: std::os::fd::RawFd,
+        events: u32,
+        keep: std::sync::Arc<std::os::fd::OwnedFd>,
+        cancel: super::CancelToken,
+        waiter: FsWaiter,
+    ) {
+        let Some(op_slot) = self.op_free.pop() else {
+            fail(waiter, Errno::EBUSY, Vec::new());
+            return;
+        };
+        let gen32 = self.ops[op_slot as usize].generation as u32;
+        let ud = pack_raw(TAG_POLL, op_slot, gen32);
+        if !publish_cancel(&cancel, ud) {
+            self.op_free.push(op_slot);
+            fail(waiter, Errno::ECANCELED, Vec::new());
+            return;
+        }
+        let e = &mut self.ops[op_slot as usize].state;
+        e.state = FsOpState::InFlight { tag: TAG_POLL };
+        e.owner = waiter.owner();
+        e.waiter = Some(waiter);
+        e.raw_fds = vec![keep];
+
+        let staged = eng.stage(ud, |sqe| {
+            sqe.opcode = IORING_OP_POLL_ADD;
+            sqe.fd = fd;
+            sqe.op_flags = events; // poll32_events; ERR/HUP are implicit
+        });
+        if let Err(err) = staged {
+            self.fail_op(op_slot, err);
+        }
+    }
+
+    /// Stage a bridge send on a raw socket fd: `data[start..]`, plain
+    /// (`SEND`, one CQE, payload round-trips at completion) or zero-copy
+    /// (`SEND_ZC`, two CQEs — see [`FsCore::on_send_zc_cqe`]; the payload
+    /// stays op-owned until the notif, and round-trips only on a flagless
+    /// early failure, which is what lets the `EOPNOTSUPP`-on-kTLS attempt
+    /// hand the bytes back for the plain-send fallback).
+    #[cfg(feature = "rt-tokio")]
+    #[allow(clippy::too_many_arguments)] // an inject unpacked, not an API
+    pub(crate) fn submit_send(
+        &mut self,
+        eng: &mut Engine,
+        fd: std::os::fd::RawFd,
+        data: Vec<u8>,
+        start: usize,
+        msg_flags: u32,
+        zc: bool,
+        keep: std::sync::Arc<std::os::fd::OwnedFd>,
+        cancel: super::CancelToken,
+        waiter: FsWaiter,
+    ) {
+        if start >= data.len() {
+            fail(waiter, Errno::EINVAL, vec![data]);
+            return;
+        }
+        // `sqe.len` is a u32: a payload tail >= 4 GiB would truncate (or wrap
+        // to 0 at exactly 4 GiB) and silently under-send while reporting the
+        // truncated count as success. Reject it up front, as `rw_fixed` does
+        // — the caller chunks. (A single 4 GiB+ send is pathological; a bare
+        // truncating cast is a data-corruption hazard, not a convenience.)
+        let Ok(len) = u32::try_from(data.len() - start) else {
+            fail(waiter, Errno::EINVAL, vec![data]);
+            return;
+        };
+        let Some(op_slot) = self.op_free.pop() else {
+            fail(waiter, Errno::EBUSY, vec![data]);
+            return;
+        };
+        let tag = if zc { TAG_SEND_ZC } else { TAG_SEND };
+        let gen32 = self.ops[op_slot as usize].generation as u32;
+        let ud = pack_raw(tag, op_slot, gen32);
+        if !publish_cancel(&cancel, ud) {
+            self.op_free.push(op_slot);
+            fail(waiter, Errno::ECANCELED, vec![data]);
+            return;
+        }
+        let e = &mut self.ops[op_slot as usize].state;
+        e.state = FsOpState::InFlight { tag };
+        e.owner = waiter.owner();
+        e.waiter = Some(waiter);
+        e.bufs = vec![data];
+        e.raw_fds = vec![keep];
+        let addr = e.bufs[0].as_ptr() as u64 + start as u64;
+
+        let staged = eng.stage(ud, |sqe| {
+            sqe.opcode = if zc {
+                IORING_OP_SEND_ZC
+            } else {
+                IORING_OP_SEND
+            };
+            sqe.fd = fd;
+            sqe.addr = addr;
+            sqe.len = len;
+            sqe.op_flags = msg_flags;
+        });
+        if let Err(err) = staged {
             self.fail_op(op_slot, err);
         }
     }
@@ -1422,21 +1738,21 @@ impl FsCore {
         eng: &mut Engine,
         file_slot: u32,
         file_gen: u64,
-        reply: Option<mpsc::Sender<FsOutcome>>,
+        reply: Option<ReplyTo>,
     ) {
         let usable = self.files.get(file_slot as usize).is_some_and(|f| {
             f.generation == file_gen && f.state.state == FileState::Open
         });
         if !usable {
             if let Some(reply) = reply {
-                reply_err(&reply, Errno::EBADF);
+                reply_err(reply, Errno::EBADF);
             }
             return;
         }
         let fe = &mut self.files[file_slot as usize].state;
         if fe.close_deferred {
             if let Some(reply) = reply {
-                reply_err(&reply, Errno::EBADF);
+                reply_err(reply, Errno::EBADF);
             }
             return;
         }
@@ -1453,7 +1769,9 @@ impl FsCore {
 
     /// Route one fs-domain CQE. `tag` is the unpacked op tag; a generation
     /// mismatch makes the completion inert (defensive — op entries free only
-    /// at their own single CQE).
+    /// at their own terminal CQE). `cqe_flags` disambiguates the one op with
+    /// **two** CQEs, `SEND_ZC` (`F_MORE` result / `F_NOTIF` release); every
+    /// other completion ignores it.
     pub(crate) fn on_cqe(
         &mut self,
         eng: &mut Engine,
@@ -1461,10 +1779,25 @@ impl FsCore {
         op_slot: u32,
         gen32: u32,
         res: i32,
+        cqe_flags: u32,
     ) -> Option<(EmbeddedCb, FsDone, Owner)> {
         if tag == TAG_CANCEL {
             return None; // an ASYNC_CANCEL's own completion; nothing to route
         }
+        #[cfg(feature = "rt-tokio")]
+        {
+            use crate::uring::sys::{IORING_CQE_F_MORE, IORING_CQE_F_NOTIF};
+            if tag == TAG_SEND_ZC
+                && cqe_flags & (IORING_CQE_F_MORE | IORING_CQE_F_NOTIF) != 0
+            {
+                self.on_send_zc_cqe(eng, op_slot, gen32, res, cqe_flags);
+                return None;
+            }
+            // A flagless SEND_ZC CQE (early failure, no notif coming) takes
+            // the normal single-CQE path below — payload handed back.
+        }
+        #[cfg(not(feature = "rt-tokio"))]
+        let _ = cqe_flags;
         let done = self.take_op(tag, op_slot, gen32)?;
         let Completed {
             waiter,
@@ -1507,11 +1840,12 @@ impl FsCore {
                 } else {
                     // Explicit-index install convention: res == 0.
                     debug_assert_eq!(res, 0, "explicit-index install res");
-                    let fe = &mut self.files[file_slot as usize];
-                    fe.state.state = FileState::Open;
-                    let gen = fe.generation;
-                    let pers = fe.state.pers;
-                    if fe.state.orphaned {
+                    let (gen, pers, orphaned) = {
+                        let fe = &mut self.files[file_slot as usize];
+                        fe.state.state = FileState::Open;
+                        (fe.generation, fe.state.pers, fe.state.orphaned)
+                    };
+                    if orphaned {
                         // The owning connection closed while this file was
                         // opening: close it at once and drop the waiter (its
                         // `Deferred` targets the now-dead connection) rather
@@ -1520,13 +1854,38 @@ impl FsCore {
                         drop(waiter);
                         None
                     } else {
-                        deliver(
-                            waiter,
-                            Ok(res),
-                            bufs,
-                            Some((file_slot, gen, pers)),
-                            None,
-                        )
+                        // Deliver the freshly-opened file. If the caller's
+                        // receiver is gone — an async `open` future dropped or
+                        // timed out before it could await, a blocking caller
+                        // that panicked — then no `FixedFile` token will ever
+                        // be built to orphan-close this slot, so stage the
+                        // close here rather than leak the pool slot. Only the
+                        // channel path can fail this way; the embedded path
+                        // yields a callback the host fires.
+                        match waiter {
+                            Some(FsWaiter::Embedded { cb, .. }) => Some((
+                                cb,
+                                FsDone {
+                                    result: Ok(res),
+                                    bufs,
+                                    file: Some((file_slot, gen, pers)),
+                                    stat: None,
+                                },
+                            )),
+                            Some(FsWaiter::Channel(reply)) => {
+                                let out = FsOutcome::new(
+                                    Ok(res),
+                                    bufs,
+                                    Some((file_slot, gen)),
+                                    None,
+                                );
+                                if reply.send(out).is_err() {
+                                    self.stage_close(eng, file_slot, None);
+                                }
+                                None
+                            }
+                            None => None,
+                        }
                     }
                 }
             }
@@ -1563,6 +1922,84 @@ impl FsCore {
         fired.map(|(cb, done)| (cb, done, owner))
     }
 
+    /// The `SEND_ZC` two-CQE lifecycle. The **result** CQE (`F_MORE`)
+    /// delivers the outcome and parks the entry as
+    /// [`FsOpState::ZcAwaitNotif`] — payload still pinned by the kernel,
+    /// generation deliberately unbumped so the notif (same `user_data`)
+    /// still matches. The **notif** CQE (`F_NOTIF`) releases the payload and
+    /// frees the slot; nothing is delivered (the waiter already was).
+    #[cfg(feature = "rt-tokio")]
+    fn on_send_zc_cqe(
+        &mut self,
+        eng: &mut Engine,
+        op_slot: u32,
+        gen32: u32,
+        res: i32,
+        cqe_flags: u32,
+    ) {
+        use crate::uring::sys::IORING_CQE_F_NOTIF;
+        let Some(entry) = self.ops.get_mut(op_slot as usize) else {
+            return;
+        };
+        if entry.generation as u32 != gen32 {
+            return; // stale — inert, like every guarded completion
+        }
+        if cqe_flags & IORING_CQE_F_NOTIF != 0 {
+            let FsOpState::ZcAwaitNotif { failed_res } = entry.state.state
+            else {
+                return; // a notif without a parked result — inert
+            };
+            let e = &mut entry.state;
+            // The kernel has now released every page (this is the notif's
+            // whole meaning), so the payload is finally safe to move.
+            let bufs = std::mem::take(&mut e.bufs);
+            let waiter = e.waiter.take();
+            e.clear();
+            entry.generation += 1;
+            self.op_free.push(op_slot);
+            match failed_res {
+                // Success was already delivered at the result; just free.
+                None => drop((bufs, waiter)),
+                // Failure was deferred to here: deliver the error together
+                // with the round-tripped payload, which the bridge needs to
+                // retry via a plain send (the kTLS `EOPNOTSUPP` fallback).
+                Some(res) => {
+                    let _ = deliver(waiter, map_res(res), bufs, None, None);
+                }
+            }
+            // This freed an op slot; stage any close parked on exhaustion.
+            if self.close_retry {
+                self.retry_parked_closes(eng);
+            }
+            return;
+        }
+        // The send *result* (F_MORE set): a notif will follow (that is what
+        // F_MORE promises), and `io_send_zc` sets it only after `sock_sendmsg`
+        // ran with the pages installed as the skb's `msg_ubuf` (io_uring/
+        // net.c), so the payload must live until that notif regardless of the
+        // result's sign.
+        let e = &mut entry.state;
+        if e.state != (FsOpState::InFlight { tag: TAG_SEND_ZC }) {
+            return;
+        }
+        if res < 0 {
+            // Defer BOTH the error and the payload to the notif: a mid-send
+            // failure can leave partial skbs referencing the pages until
+            // then, so handing the `Vec` back now would be a use-after-free.
+            // (kTLS rejecting `MSG_ZEROCOPY` fails *before* any skb, so its
+            // notif is immediate — the fallback proceeds with no real delay.)
+            e.state = FsOpState::ZcAwaitNotif {
+                failed_res: Some(res),
+            };
+        } else {
+            // Success: deliver now, withhold the payload until the notif.
+            // Bridge sends are channel-only; no embedded callback can exist.
+            let waiter = e.waiter.take();
+            e.state = FsOpState::ZcAwaitNotif { failed_res: None };
+            let _ = deliver(waiter, Ok(res), Vec::new(), None, None);
+        }
+    }
+
     /// Teardown-drain routing: reply and free, but never stage (the drain is
     /// cancelling everything; deferred closes are moot — the ring teardown
     /// closes the whole registered table).
@@ -1570,6 +2007,76 @@ impl FsCore {
         let (tag, op_slot, gen32) = unpack_raw(cqe.user_data);
         if tag & 0x80 == 0 || tag == TAG_CANCEL || tag == TAG_WAKE {
             return;
+        }
+        #[cfg(feature = "rt-tokio")]
+        if tag == TAG_SEND_ZC {
+            use crate::uring::sys::{IORING_CQE_F_MORE, IORING_CQE_F_NOTIF};
+            if cqe.flags & IORING_CQE_F_NOTIF != 0 {
+                if let Some(entry) = self.ops.get_mut(op_slot as usize) {
+                    if entry.generation as u32 == gen32 {
+                        if let FsOpState::ZcAwaitNotif { failed_res } =
+                            entry.state.state
+                        {
+                            let e = &mut entry.state;
+                            let bufs = std::mem::take(&mut e.bufs);
+                            let waiter = e.waiter.take();
+                            e.clear();
+                            entry.generation += 1;
+                            self.op_free.push(op_slot);
+                            // Same split as `on_send_zc_cqe`: a deferred
+                            // failure delivers its error + payload now.
+                            match failed_res {
+                                None => drop((bufs, waiter)),
+                                Some(res) => {
+                                    let _ = deliver(
+                                        waiter,
+                                        map_res(res),
+                                        bufs,
+                                        None,
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            if cqe.flags & IORING_CQE_F_MORE != 0 {
+                // A result completing during teardown: park it — the drain
+                // keeps reaping until the notif lands (the engine's inflight
+                // count only drops on terminal CQEs). Payload and (on
+                // failure) the error are withheld until that notif, exactly
+                // as `on_send_zc_cqe` documents (F_MORE ⇒ a notif follows ⇒
+                // pages may still be kernel-pinned).
+                if let Some(entry) = self.ops.get_mut(op_slot as usize) {
+                    if entry.generation as u32 == gen32
+                        && entry.state.state
+                            == (FsOpState::InFlight { tag: TAG_SEND_ZC })
+                    {
+                        let e = &mut entry.state;
+                        if cqe.res < 0 {
+                            e.state = FsOpState::ZcAwaitNotif {
+                                failed_res: Some(cqe.res),
+                            };
+                        } else {
+                            let waiter = e.waiter.take();
+                            e.state =
+                                FsOpState::ZcAwaitNotif { failed_res: None };
+                            let _ = deliver(
+                                waiter,
+                                Ok(cqe.res),
+                                Vec::new(),
+                                None,
+                                None,
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+            // Flagless early failure: the normal drain path below hands the
+            // payload back.
         }
         let Some(done) = self.take_op(tag, op_slot, gen32) else {
             return;
@@ -1621,7 +2128,7 @@ impl FsCore {
     pub(crate) fn fail_parked(&mut self) {
         for f in &mut self.files {
             if let Some(w) = f.state.close_waiter.take() {
-                reply_err(&w, Errno::ECONNABORTED);
+                reply_err(w, Errno::ECONNABORTED);
             }
         }
     }
@@ -1640,7 +2147,7 @@ impl FsCore {
     /// (see [`FsCore::on_cqe`]).
     // Called only by the embedding server's connection-close sweep; dead in an
     // async-fs-only build.
-    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    #[allow(dead_code)] // minted only by an embedding host (none in-tree today)
     pub(crate) fn close_owned_by(
         &mut self,
         eng: &mut Engine,
@@ -1747,7 +2254,7 @@ impl FsCore {
         &mut self,
         eng: &mut Engine,
         file_slot: u32,
-        reply: Option<mpsc::Sender<FsOutcome>>,
+        reply: Option<ReplyTo>,
     ) {
         let Some(op_slot) = self.op_free.pop() else {
             // No op slot for the close: park it as deferred; the next
@@ -1834,6 +2341,39 @@ impl FsCore {
             });
         }
     }
+
+    /// Cancel a single in-flight op by its exact `user_data` — the bridges'
+    /// cancel-on-drop path ([`FsInject::CancelUd`](super::FsInject)). A
+    /// dropped/timed-out bridge future's guard injects this so a stalled op
+    /// (a `POLL_ADD` a silent peer never satisfies, an io-wq-blocked kTLS
+    /// splice) is torn down — freeing its slot and backpressure permit —
+    /// instead of leaking until the connection dies. Best-effort and inert
+    /// when stale: if the op already reaped and its slot recycled, the
+    /// generation baked into `target` matches nothing.
+    #[cfg(feature = "rt-tokio")]
+    pub(crate) fn submit_cancel_ud(&mut self, eng: &mut Engine, target: u64) {
+        let _ = eng.stage(pack_raw(TAG_CANCEL, 0, 0), |sqe| {
+            sqe.opcode = IORING_OP_ASYNC_CANCEL;
+            sqe.fd = -1;
+            sqe.addr = target;
+            sqe.op_flags = IORING_ASYNC_CANCEL_ALL;
+        });
+    }
+}
+
+/// The cancel-on-drop handshake, loop side: publish this op's `user_data`
+/// into the future's [`CancelToken`](super::CancelToken) so a later drop
+/// can target it. Returns `false` if the guard already wrote
+/// [`CANCEL_REQUESTED`](super::CANCEL_REQUESTED) — the future was dropped
+/// before we staged, so the caller must abort the op rather than stage a
+/// leak. The single `compare_exchange` is the whole race resolution: exactly
+/// one of {loop stages, guard cancels} wins the transition out of `0`.
+#[cfg(feature = "rt-tokio")]
+fn publish_cancel(cancel: &super::CancelToken, ud: u64) -> bool {
+    use std::sync::atomic::Ordering;
+    cancel
+        .compare_exchange(0, ud, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
 }
 
 fn map_res(res: i32) -> Result<i32, Errno> {
@@ -1863,13 +2403,16 @@ fn deliver(
     match waiter {
         // A gone caller (dropped receiver) orphans the op; nothing to do. The
         // off-loop `FixedFile` carries no personality, so drop it here.
+        // (A successful `open` does NOT route through here — its arm in
+        // `on_cqe` handles the gone-receiver case by staging a close, so the
+        // freshly-opened slot isn't leaked when no `FixedFile` gets built.)
         Some(FsWaiter::Channel(tx)) => {
-            let _ = tx.send(FsOutcome {
+            let _ = tx.send(FsOutcome::new(
                 res,
                 bufs,
-                file: file.map(|(slot, gen, _pers)| (slot, gen)),
+                file.map(|(slot, gen, _pers)| (slot, gen)),
                 stat,
-            });
+            ));
             None
         }
         Some(FsWaiter::Embedded { cb, .. }) => Some((
@@ -1885,13 +2428,8 @@ fn deliver(
     }
 }
 
-fn reply_err(reply: &mpsc::Sender<FsOutcome>, err: Errno) {
-    let _ = reply.send(FsOutcome {
-        res: Err(err),
-        bufs: Vec::new(),
-        file: None,
-        stat: None,
-    });
+fn reply_err(reply: ReplyTo, err: Errno) {
+    let _ = reply.send(FsOutcome::new(Err(err), Vec::new(), None, None));
 }
 
 /// Cancellation-injection fuzzer for the completion-routing state machine.
@@ -1927,6 +2465,7 @@ fn reply_err(reply: &mpsc::Sender<FsOutcome>, err: Errno) {
 mod cancel_fuzz {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::mpsc;
 
     const OP_SLOTS: u32 = 64;
     const FILE_SLOTS: u32 = 16;
@@ -1984,6 +2523,12 @@ mod cancel_fuzz {
                 let code = match e.state.state {
                     FsOpState::Free => 0u8,
                     FsOpState::InFlight { tag } => tag,
+                    #[cfg(feature = "rt-tokio")]
+                    FsOpState::ZcAwaitNotif { failed_res: None } => 0xFE,
+                    #[cfg(feature = "rt-tokio")]
+                    FsOpState::ZcAwaitNotif {
+                        failed_res: Some(_),
+                    } => 0xFF,
                 };
                 (e.generation, code)
             })
@@ -2060,7 +2605,7 @@ mod cancel_fuzz {
                         anchor.clone(),
                         CString::new("x").unwrap(),
                         how,
-                        FsWaiter::Channel(tx.clone()),
+                        FsWaiter::Channel(ReplyTo::Sync(tx.clone())),
                     );
                     submitted += 1;
                 }
@@ -2088,7 +2633,7 @@ mod cancel_fuzz {
                             gen,
                             vec![b],
                             0,
-                            FsWaiter::Channel(tx.clone()),
+                            FsWaiter::Channel(ReplyTo::Sync(tx.clone())),
                         );
                         submitted += 1;
                     }
@@ -2099,7 +2644,12 @@ mod cancel_fuzz {
                     if !files.is_empty() && !core.op_free.is_empty() {
                         let (slot, gen) =
                             files[rng.below(files.len() as u32) as usize];
-                        core.submit_close(eng, slot, gen, Some(tx.clone()));
+                        core.submit_close(
+                            eng,
+                            slot,
+                            gen,
+                            Some(ReplyTo::Sync(tx.clone())),
+                        );
                         submitted += 1;
                     }
                 }
@@ -2121,6 +2671,7 @@ mod cancel_fuzz {
                                 slot,
                                 gen.wrapping_sub(1),
                                 0,
+                                0,
                             );
                             assert_eq!(
                                 snapshot(&core),
@@ -2132,7 +2683,7 @@ mod cancel_fuzz {
                         1 => {
                             let bad = tag ^ 0x01;
                             let before = snapshot(&core);
-                            let _ = core.on_cqe(eng, bad, slot, gen, 0);
+                            let _ = core.on_cqe(eng, bad, slot, gen, 0, 0);
                             assert_eq!(
                                 snapshot(&core),
                                 before,
@@ -2145,7 +2696,7 @@ mod cancel_fuzz {
                             let (t, s, g) = completed
                                 [rng.below(completed.len() as u32) as usize];
                             let before = snapshot(&core);
-                            let _ = core.on_cqe(eng, t, s, g, 0);
+                            let _ = core.on_cqe(eng, t, s, g, 0, 0);
                             assert_eq!(
                                 snapshot(&core),
                                 before,
@@ -2159,7 +2710,7 @@ mod cancel_fuzz {
                                 1 => -libc::EIO,
                                 _ => 0,
                             };
-                            let _ = core.on_cqe(eng, tag, slot, gen, res);
+                            let _ = core.on_cqe(eng, tag, slot, gen, res, 0);
                             completed.push((tag, slot, gen));
                         }
                     }
@@ -2174,11 +2725,16 @@ mod cancel_fuzz {
             guard += 1;
             assert!(guard < 100_000, "drain did not converge (seed {seed})");
             if let Some(&(tag, slot, gen)) = inflight(&core).first() {
-                let _ = core.on_cqe(eng, tag, slot, gen, 0);
+                let _ = core.on_cqe(eng, tag, slot, gen, 0, 0);
                 continue;
             }
             if let Some(&(slot, gen)) = usable_files(&core).first() {
-                core.submit_close(eng, slot, gen, Some(tx.clone()));
+                core.submit_close(
+                    eng,
+                    slot,
+                    gen,
+                    Some(ReplyTo::Sync(tx.clone())),
+                );
                 submitted += 1;
                 continue;
             }
@@ -2256,5 +2812,398 @@ mod cancel_fuzz {
             returned, issued_bufs,
             "every r/w buffer must return exactly once (seed {seed})"
         );
+    }
+}
+
+/// Randomized lifecycle model for the `SEND_ZC` two-CQE state machine —
+/// the `cancel_fuzz` discipline applied to the one op whose slot outlives
+/// its delivered result. Same in-userspace trick: a real `Engine`, sized so
+/// staging never reaches the kernel.
+///
+/// Invariants asserted:
+///   * the result CQE (`F_MORE`) delivers exactly one outcome with the
+///     payload **withheld**, parks the entry (`ZcAwaitNotif`) and bumps no
+///     generation — the slot is unreusable between result and notif;
+///   * the notif CQE (`F_NOTIF`) frees the slot (generation bumped, slot on
+///     the free list) and delivers nothing;
+///   * a notif before any result, a second result, a stale-generation CQE
+///     of either kind — all inert;
+///   * a flagless CQE (early failure, no notif coming) is terminal in one
+///     step and hands the payload back;
+///   * at quiescence every slot is free and every submission produced
+///     exactly one outcome.
+#[cfg(all(test, feature = "rt-tokio"))]
+mod zc_lifecycle {
+    use super::*;
+    use crate::uring::sys::{IORING_CQE_F_MORE, IORING_CQE_F_NOTIF};
+    use std::os::fd::OwnedFd;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+
+    const RING_ENTRIES: u32 = 1024;
+    const OP_SLOTS: u32 = 6;
+
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Rng {
+            Rng(seed ^ 0x9E37_79B9_7F4A_7C15 | 1)
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            (self.next() % u64::from(n.max(1))) as u32
+        }
+    }
+
+    fn engine_or_skip() -> Option<Engine> {
+        match Engine::new(RING_ENTRIES, 4) {
+            Ok(e) => Some(e),
+            Err(crate::Error::Errno(
+                Errno::EPERM | Errno::ENOSYS | Errno::EACCES,
+            )) => {
+                assert!(
+                    std::env::var_os("TRUENAS_ROS_REQUIRE_IO_URING").is_none(),
+                    "TRUENAS_ROS_REQUIRE_IO_URING set but io_uring unavailable"
+                );
+                None
+            }
+            Err(e) => panic!("Engine::new: {e}"),
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mirror {
+        InFlight,
+        /// Past the result CQE, awaiting the notif. `failed` records whether
+        /// the result was an error (its outcome + payload are deferred to
+        /// the notif) or a success (already delivered at the result).
+        AwaitNotif {
+            failed: bool,
+        },
+    }
+
+    #[test]
+    fn zc_two_cqe_lifecycle_invariants() {
+        if engine_or_skip().is_none() {
+            return; // io_uring unavailable in this sandbox
+        }
+        let keep = Arc::new(OwnedFd::from(
+            std::fs::File::open("/dev/null").expect("open /dev/null"),
+        ));
+        let seeds: u64 = std::env::var("CANCEL_FUZZ_SEEDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(48);
+
+        for seed in 0..seeds {
+            let mut eng = engine_or_skip().expect("probed above");
+            let mut core = FsCore::new(OP_SLOTS, 0, 4);
+            let (tx, rx) = mpsc::channel::<FsOutcome>();
+            let mut rng = Rng::new(seed);
+
+            // (op_slot, gen32, mirror)
+            let mut live: Vec<(u32, u32, Mirror)> = Vec::new();
+            let mut submitted = 0usize;
+            let mut outcomes_ok = 0usize;
+            let mut outcomes_err_with_payload = 0usize;
+
+            for _ in 0..160 {
+                match rng.below(8) {
+                    // Submit a zc send.
+                    0 | 1 => {
+                        if core.op_free.is_empty() {
+                            continue;
+                        }
+                        let slot = *core.op_free.last().expect("nonempty");
+                        let gen32 = core.ops[slot as usize].generation as u32;
+                        core.submit_send(
+                            &mut eng,
+                            1, // fd value is never dereferenced (SQ never submitted)
+                            vec![0xA5; 16],
+                            0,
+                            0,
+                            true,
+                            keep.clone(),
+                            std::sync::Arc::new(
+                                std::sync::atomic::AtomicU64::new(0),
+                            ),
+                            FsWaiter::Channel(ReplyTo::Sync(tx.clone())),
+                        );
+                        assert_eq!(
+                            core.ops[slot as usize].state.state,
+                            FsOpState::InFlight { tag: TAG_SEND_ZC },
+                            "submit stages into the predicted slot"
+                        );
+                        live.push((slot, gen32, Mirror::InFlight));
+                        submitted += 1;
+                    }
+                    // Deliver the result (F_MORE). A result CQE carrying
+                    // F_MORE — the kernel's promise that a notif follows —
+                    // always withholds the payload until that notif (reaching
+                    // this arm means `sock_sendmsg` ran with the pages
+                    // installed, so an error can still leave partial skbs
+                    // pinning them). On SUCCESS the outcome is delivered now
+                    // (payload withheld); on FAILURE both the error and the
+                    // payload are deferred to the notif.
+                    2 | 3 => {
+                        let Some(i) =
+                            pick(&mut rng, &live, |m| m == Mirror::InFlight)
+                        else {
+                            continue;
+                        };
+                        let (slot, gen32, _) = live[i];
+                        let failed = rng.below(3) == 0;
+                        let res = if failed { -libc::EPIPE } else { 16 };
+                        let _ = core.on_cqe(
+                            &mut eng,
+                            TAG_SEND_ZC,
+                            slot,
+                            gen32,
+                            res,
+                            IORING_CQE_F_MORE,
+                        );
+                        if failed {
+                            assert!(
+                                rx.try_recv().is_err(),
+                                "a failed result defers its outcome to the \
+                                 notif (nothing delivered yet)"
+                            );
+                        } else {
+                            let out = rx.try_recv().expect("success delivered");
+                            assert_eq!(out.res, Ok(16));
+                            assert!(
+                                out.bufs.is_empty(),
+                                "a success withholds the payload until notif"
+                            );
+                            outcomes_ok += 1;
+                        }
+                        assert!(
+                            matches!(
+                                core.ops[slot as usize].state.state,
+                                FsOpState::ZcAwaitNotif { .. }
+                            ),
+                            "entry parks awaiting the notif"
+                        );
+                        assert_eq!(
+                            core.ops[slot as usize].generation as u32, gen32,
+                            "generation unbumped between result and notif"
+                        );
+                        assert!(
+                            !core.op_free.contains(&slot),
+                            "slot unreusable between result and notif"
+                        );
+                        live[i].2 = Mirror::AwaitNotif { failed };
+                    }
+                    // Deliver the notif (F_NOTIF): frees the slot, and for a
+                    // deferred failure delivers its error + payload now.
+                    4 => {
+                        let Some(i) = pick(&mut rng, &live, |m| {
+                            matches!(m, Mirror::AwaitNotif { .. })
+                        }) else {
+                            continue;
+                        };
+                        let (slot, gen32, m) = live.swap_remove(i);
+                        let failed =
+                            matches!(m, Mirror::AwaitNotif { failed: true });
+                        let _ = core.on_cqe(
+                            &mut eng,
+                            TAG_SEND_ZC,
+                            slot,
+                            gen32,
+                            0,
+                            IORING_CQE_F_NOTIF,
+                        );
+                        if failed {
+                            let out = rx.try_recv().expect("deferred failure");
+                            assert_eq!(out.res, Err(Errno::EPIPE));
+                            assert_eq!(
+                                out.bufs.len(),
+                                1,
+                                "a deferred failure hands the payload back \
+                                 at the notif"
+                            );
+                            outcomes_err_with_payload += 1;
+                        } else {
+                            assert!(
+                                rx.try_recv().is_err(),
+                                "a success notif delivers nothing"
+                            );
+                        }
+                        assert!(
+                            core.op_free.contains(&slot),
+                            "notif frees the slot"
+                        );
+                        assert_ne!(
+                            core.ops[slot as usize].generation as u32, gen32,
+                            "notif bumps the generation"
+                        );
+                    }
+                    // Flagless early failure (e.g. ENOTSOCK, or a socket
+                    // without SOCK_SUPPORT_ZC): no notif follows, so it is
+                    // terminal in one CQE and the payload comes straight
+                    // back via the normal single-CQE path.
+                    5 => {
+                        let Some(i) =
+                            pick(&mut rng, &live, |m| m == Mirror::InFlight)
+                        else {
+                            continue;
+                        };
+                        let (slot, gen32, _) = live.swap_remove(i);
+                        let _ = core.on_cqe(
+                            &mut eng,
+                            TAG_SEND_ZC,
+                            slot,
+                            gen32,
+                            -libc::EOPNOTSUPP,
+                            0,
+                        );
+                        let out = rx.try_recv().expect("failure delivered");
+                        assert_eq!(out.res, Err(Errno::EOPNOTSUPP));
+                        assert_eq!(
+                            out.bufs.len(),
+                            1,
+                            "early failure hands the payload back"
+                        );
+                        outcomes_err_with_payload += 1;
+                        assert!(core.op_free.contains(&slot));
+                    }
+                    // Anomalies — every one must be inert.
+                    _ => {
+                        if live.is_empty() {
+                            continue;
+                        }
+                        let i = rng.below(live.len() as u32) as usize;
+                        let (slot, gen32, m) = live[i];
+                        let snap_gen = core.ops[slot as usize].generation;
+                        let snap_free = core.op_free.len();
+                        match rng.below(3) {
+                            // Stale generation, either flag.
+                            0 => {
+                                let _ = core.on_cqe(
+                                    &mut eng,
+                                    TAG_SEND_ZC,
+                                    slot,
+                                    gen32.wrapping_add(9),
+                                    16,
+                                    if rng.below(2) == 0 {
+                                        IORING_CQE_F_MORE
+                                    } else {
+                                        IORING_CQE_F_NOTIF
+                                    },
+                                );
+                            }
+                            // A notif before any result.
+                            1 if m == Mirror::InFlight => {
+                                let _ = core.on_cqe(
+                                    &mut eng,
+                                    TAG_SEND_ZC,
+                                    slot,
+                                    gen32,
+                                    0,
+                                    IORING_CQE_F_NOTIF,
+                                );
+                            }
+                            // A second result after the first.
+                            _ if matches!(m, Mirror::AwaitNotif { .. }) => {
+                                let _ = core.on_cqe(
+                                    &mut eng,
+                                    TAG_SEND_ZC,
+                                    slot,
+                                    gen32,
+                                    16,
+                                    IORING_CQE_F_MORE,
+                                );
+                            }
+                            _ => continue,
+                        }
+                        assert_eq!(
+                            core.ops[slot as usize].generation, snap_gen,
+                            "anomalous CQE mutated a generation"
+                        );
+                        assert_eq!(
+                            core.op_free.len(),
+                            snap_free,
+                            "anomalous CQE freed a slot"
+                        );
+                        assert!(
+                            rx.try_recv().is_err(),
+                            "anomalous CQE delivered an outcome"
+                        );
+                    }
+                }
+            }
+
+            // Drain to quiescence: finish every op's remaining CQEs.
+            for (slot, gen32, m) in std::mem::take(&mut live) {
+                if m == Mirror::InFlight {
+                    // A success result, then its notif.
+                    let _ = core.on_cqe(
+                        &mut eng,
+                        TAG_SEND_ZC,
+                        slot,
+                        gen32,
+                        16,
+                        IORING_CQE_F_MORE,
+                    );
+                    let out = rx.try_recv().expect("drain result");
+                    assert_eq!(out.res, Ok(16));
+                    outcomes_ok += 1;
+                }
+                let _ = core.on_cqe(
+                    &mut eng,
+                    TAG_SEND_ZC,
+                    slot,
+                    gen32,
+                    0,
+                    IORING_CQE_F_NOTIF,
+                );
+                // A notif for a deferred failure delivers its error + payload.
+                if matches!(m, Mirror::AwaitNotif { failed: true }) {
+                    let out = rx.try_recv().expect("drain deferred failure");
+                    assert_eq!(out.res, Err(Errno::EPIPE));
+                    assert_eq!(out.bufs.len(), 1);
+                    outcomes_err_with_payload += 1;
+                }
+            }
+
+            assert_eq!(
+                core.op_free.len(),
+                OP_SLOTS as usize,
+                "seed {seed}: every op slot free exactly once at quiescence"
+            );
+            let mut dedup = core.op_free.clone();
+            dedup.sort_unstable();
+            dedup.dedup();
+            assert_eq!(dedup.len(), OP_SLOTS as usize, "seed {seed}: no dup");
+            assert_eq!(
+                outcomes_ok + outcomes_err_with_payload,
+                submitted,
+                "seed {seed}: exactly one outcome per submission"
+            );
+            assert!(rx.try_recv().is_err(), "seed {seed}: no stray outcome");
+        }
+    }
+
+    fn pick(
+        rng: &mut Rng,
+        live: &[(u32, u32, Mirror)],
+        want: impl Fn(Mirror) -> bool,
+    ) -> Option<usize> {
+        let candidates: Vec<usize> = live
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, m))| want(*m))
+            .map(|(i, _)| i)
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        Some(candidates[rng.below(candidates.len() as u32) as usize])
     }
 }

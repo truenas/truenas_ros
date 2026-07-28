@@ -267,7 +267,23 @@ impl Ring {
     /// of two by the kernel). Fails with `ENOSYS`/`EPERM` where io_uring is
     /// unavailable (old kernel, seccomp, `kernel.io_uring_disabled`).
     pub(crate) fn new(entries: u32) -> errno::Result<Ring> {
+        Ring::new_sized(entries, None)
+    }
+
+    /// [`Ring::new`] with an explicit completion-queue size
+    /// (`IORING_SETUP_CQSIZE`; the kernel rounds it up to a power of two and
+    /// requires it ≥ the SQ size). `None` keeps the default `2 × entries` —
+    /// enough unless a workload multiplies CQEs beyond that ratio (two-CQE
+    /// `SEND_ZC` pairs, splice-hop chains).
+    pub(crate) fn new_sized(
+        entries: u32,
+        cq_entries: Option<u32>,
+    ) -> errno::Result<Ring> {
         let mut p = IoUringParams::default();
+        if let Some(cq) = cq_entries {
+            p.flags |= IORING_SETUP_CQSIZE;
+            p.cq_entries = cq;
+        }
         let fd = io_uring_setup(entries, &mut p)?;
         let raw = fd.as_raw_fd();
 
@@ -354,27 +370,10 @@ impl Ring {
         register_file_alloc_range(self.raw_fd(), 0, count)
     }
 
-    /// Register a sparse table of `pool + fs` slots but confine
-    /// auto-allocation to just `[0, pool)` — the connection pool. The upper
-    /// `[pool, pool + fs)` range is handed out at **explicit** indices by the
-    /// embedded fs reactor, so multishot accept (which auto-allocates at each
-    /// completion) can never land there, and a burst of file opens can never
-    /// starve accepts. One table, two disjoint index ranges (fs-reactor
-    /// design §4).
-    #[cfg(all(feature = "net-server", feature = "async-fs"))]
-    pub(crate) fn register_pool_with_fs(
-        &self,
-        pool: u32,
-        fs: u32,
-    ) -> errno::Result<()> {
-        register_files_sparse(self.raw_fd(), pool + fs)?;
-        register_file_alloc_range(self.raw_fd(), 0, pool)
-    }
-
     /// Install a connected socket `fd` into the pool at `slot` (client-side; the
     /// server's pool fills via multishot-accept auto-allocation). The kernel
     /// takes its own reference, so `fd` may be closed after this returns.
-    #[cfg(any(feature = "net-client", feature = "async-fs"))]
+    #[cfg(feature = "async-fs")]
     pub(crate) fn install_file(
         &self,
         slot: u32,
@@ -399,40 +398,6 @@ impl Ring {
             }
         };
         self.rings.fill_sqe(idx, fill);
-        self.rings.advance(&mut self.sq_tail);
-        self.to_submit += 1;
-        Ok(())
-    }
-
-    /// Stage two SQEs guaranteed to be contiguous within a single submission: an
-    /// `IOSQE_IO_LINK` head and its trailing `IORING_OP_LINK_TIMEOUT`, which the
-    /// kernel accepts only when both are seen in the same `io_uring_enter`. Any
-    /// already-staged SQEs are flushed *first* if fewer than two slots are free,
-    /// so no intervening submit can split the pair.
-    pub(crate) fn push_sqe_linked(
-        &mut self,
-        head: impl FnOnce(&mut IoUringSqe),
-        tail: impl FnOnce(&mut IoUringSqe),
-    ) -> errno::Result<()> {
-        if self.rings.free_sqes(self.sq_tail) < 2 {
-            self.submit()?;
-            if self.rings.free_sqes(self.sq_tail) < 2 {
-                return Err(Errno::EBUSY);
-            }
-        }
-        // Two slots were just guaranteed free, so both reservations succeed.
-        let idx = self
-            .rings
-            .try_reserve(self.sq_tail)
-            .expect("slot reserved above");
-        self.rings.fill_sqe(idx, head);
-        self.rings.advance(&mut self.sq_tail);
-        self.to_submit += 1;
-        let idx = self
-            .rings
-            .try_reserve(self.sq_tail)
-            .expect("slot reserved above");
-        self.rings.fill_sqe(idx, tail);
         self.rings.advance(&mut self.sq_tail);
         self.to_submit += 1;
         Ok(())

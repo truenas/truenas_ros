@@ -9,7 +9,7 @@
 //! the message is delivered (`buf[..header_len]` then `[..body_len]`).
 
 use libfuzzer_sys::fuzz_target;
-use truenas_ros::net::server::{
+use truenas_ros::framing::{
     length_prefix_header, Endian, Framing, PrefixWidth,
 };
 
@@ -25,12 +25,12 @@ fuzz_target!(|data: &[u8]| {
         for endian in [Endian::Big, Endian::Little] {
             for includes_self in [false, true] {
                 let mut framer =
-                    length_prefix_header::<()>(width, endian, includes_self);
+                    length_prefix_header(width, endian, includes_self);
                 // Every distinct behavior is reached within the prefix width:
                 // empty..(hlen-1) -> Need, exactly hlen -> Complete/Invalid.
                 let probe = hlen.min(data.len());
                 for end in 0..=probe {
-                    match framer(&data[..end], &mut ()) {
+                    match framer(&data[..end]) {
                         Framing::Need(n) => {
                             // Only before the prefix is buffered, asking for at
                             // most the missing prefix bytes.
@@ -61,7 +61,7 @@ fuzz_target!(|data: &[u8]| {
                             let _ = body_len;
                         }
                         // A fixed-width prefix framer never scans for a
-                        // delimiter, and never diverts a body to a splice fd.
+                        // delimiter, and never diverts a body out-of-band.
                         Framing::More => {
                             panic!("length prefix framer returned More")
                         }
