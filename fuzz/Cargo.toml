@@ -1,6 +1,6 @@
 # Fuzz harnesses for the net stack's framing. A separate, unpublished dev-only
 # crate (like the bench crate / kTLS test deps): it does NOT touch the library's
-# libc+bitflags charter or its 1.75 MSRV. Run with a nightly toolchain:
+# libc+bitflags charter or its 1.97 MSRV. Run with a nightly toolchain:
 #   cargo +nightly fuzz run framer_length_prefix
 [package]
 name = "truenas_ros-fuzz"

@@ -295,7 +295,7 @@ fn copy_one_mount(
 
         *counter += 1;
         if config.reporting_increment != 0
-            && *counter % config.reporting_increment == 0
+            && counter.is_multiple_of(config.reporting_increment)
         {
             let cur = entry.path();
             progress(&CopyTreeProgress {

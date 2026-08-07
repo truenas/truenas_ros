@@ -598,8 +598,7 @@ pub(crate) fn register_file_update(
 mod tests {
     use super::*;
 
-    // Assert each SQE field lands at its kernel-ABI byte offset. Computed via
-    // pointer arithmetic so it works on the crate MSRV (1.75, pre-`offset_of!`).
+    // Assert each SQE field lands at its kernel-ABI byte offset.
     #[test]
     fn sqe_field_offsets() {
         let s = IoUringSqe::default();

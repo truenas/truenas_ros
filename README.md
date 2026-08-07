@@ -79,7 +79,7 @@ cfg.write_path("/etc/app.conf".as_ref(), opts)?;
 ## Requirements
 
 - A TrueNAS kernel version
-- Rust 1.75 or newer
+- Rust 1.97 or newer
 
 ## Testing
 
