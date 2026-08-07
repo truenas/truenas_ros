@@ -197,7 +197,7 @@ impl Nfs4Acl {
         let need = naces
             .checked_mul(ACE_SZ)
             .and_then(|n| n.checked_add(HDR_SZ));
-        if need.map_or(true, |need| data.len() < need) {
+        if need.is_none_or(|need| data.len() < need) {
             return Err(Error::Parse(format!(
                 "NFS4 ACL truncated: {} bytes for {naces} ACEs",
                 data.len()
