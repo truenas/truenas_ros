@@ -1,5 +1,5 @@
 //! `clone3(2)` fork helper shared by the credential broker
-//! ([`crate::async_fs`]) and the idmapped-mount user-namespace builder
+//! ([`crate::uring_fs`]) and the idmapped-mount user-namespace builder
 //! ([`crate::mount`]).
 //!
 //! Both fork a child *without* `CLONE_VM` — a plain copy-on-write

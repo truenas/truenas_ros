@@ -539,16 +539,16 @@ pub struct Server<U, AcceptFn, HeaderFn, BodyFn> {
     // before the ring is unmapped (same buffers-before-unmap invariant the
     // engine keeps internally). `None` = no fs pool. Read by the
     // dispatch-delegation arm (fs-domain CQEs) and `Request::fs`.
-    #[cfg(feature = "async-fs")]
-    fs: Option<crate::async_fs::core::FsCore>,
+    #[cfg(feature = "uring-fs")]
+    fs: Option<crate::uring_fs::core::FsCore>,
     // Kernel-capability flags for the two version-dependent fs ops, probed once
     // at construction (only when an fs pool exists): fixed-file xattr needs
     // Linux ≥ 6.13 and is invisible to `REGISTER_PROBE`, `ftruncate` needs
     // ≥ 6.9. Surfaced via `supports_fd_xattr`/`supports_ftruncate` so a handler
     // gates those `FsConn` ops rather than have them fail in the callback.
-    #[cfg(feature = "async-fs")]
+    #[cfg(feature = "uring-fs")]
     fd_xattr_ok: bool,
-    #[cfg(feature = "async-fs")]
+    #[cfg(feature = "uring-fs")]
     ftruncate_ok: bool,
     // The role-agnostic io_uring engine the server drives: the ring, the
     // connection table, the projected `CoreConfig`, the shared cross-thread
@@ -610,9 +610,9 @@ where
         // enough in-flight fs SQEs that a burst of opens+reads doesn't force a
         // mid-batch flush. Sized against `fs_files` since each open is
         // typically followed by a read/close on that file.
-        #[cfg(feature = "async-fs")]
+        #[cfg(feature = "uring-fs")]
         let fs_ops = cfg.fs_files.saturating_mul(2);
-        #[cfg(not(feature = "async-fs"))]
+        #[cfg(not(feature = "uring-fs"))]
         let fs_ops = 0u32;
         let entries = cfg
             .pool_size
@@ -621,16 +621,10 @@ where
             .saturating_add(fs_ops)
             .next_power_of_two()
             .min(MAX_RING_ENTRIES);
-        // The shared engine: ring + pool + wake + the universal probe. With an
-        // fs pool it registers `pool_size + fs_files` slots (the auto-alloc
-        // range stays confined to the connection pool).
-        #[cfg(feature = "async-fs")]
-        let mut engine = if cfg.fs_files > 0 {
-            Engine::new_with_fs(entries, cfg.pool_size, cfg.fs_files)?
-        } else {
-            Engine::new(entries, cfg.pool_size)?
-        };
-        #[cfg(not(feature = "async-fs"))]
+        // The shared engine: ring + connection pool + wake + the universal
+        // probe. FS ops submit on raw fds (not the registered table), so the
+        // pool holds only the `pool_size` connection slots regardless of
+        // `fs_files`.
         let mut engine = Engine::new(entries, cfg.pool_size)?;
 
         // Fail fast — before binding — on kernels whose io_uring can't serve
@@ -705,25 +699,25 @@ where
         // The stream reactor over the engine. `on_close` starts unset
         // (installed by `set_close_hook`); `cfg.to_core()` projects the
         // engine-read knobs.
-        // The fs op/file tables live on this same ring; files occupy the
-        // registered range `[pool_size, pool_size + fs_files)`.
-        #[cfg(feature = "async-fs")]
+        // The fs op table lives on this same ring; open files are plain raw fds
+        // (`Arc<OwnedFd>`), not registered-table slots.
+        #[cfg(feature = "uring-fs")]
         let fs = (cfg.fs_files > 0).then(|| {
-            crate::async_fs::core::FsCore::new(
-                fs_ops,
-                cfg.pool_size,
-                cfg.fs_files,
-            )
+            // The plain-fd `FsCore` takes only an op-slot count: FS ops submit
+            // on raw fds (`Arc<OwnedFd>`), never `IOSQE_FIXED_FILE`, so
+            // `fs_files` sizes only the fs op table (`fs_ops = fs_files * 2`),
+            // not any registered file pool.
+            crate::uring_fs::core::FsCore::new(fs_ops)
         });
         // Probe the two version-dependent fs ops once (only if a pool exists),
         // while `engine.ring` is still in hand. `ftruncate` (≥ 6.9) is a plain
         // opcode probe; fixed-file xattr (≥ 6.13) needs the real-combination
         // memfd probe, since `REGISTER_PROBE` reports opcode existence, not
         // flag acceptance.
-        #[cfg(feature = "async-fs")]
+        #[cfg(feature = "uring-fs")]
         let (fd_xattr_ok, ftruncate_ok) = if cfg.fs_files > 0 {
             (
-                crate::async_fs::host::probe_fixed_file_xattr(),
+                crate::uring_fs::host::probe_fixed_file_xattr(),
                 crate::uring::probe::probe_op_supported(
                     &engine.ring,
                     crate::uring::sys::IORING_OP_FTRUNCATE,
@@ -733,22 +727,22 @@ where
             (false, false)
         };
 
-        #[cfg_attr(not(feature = "async-fs"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "uring-fs"), allow(unused_mut))]
         let mut core =
             Reactor::from_parts(engine, cfg.pool_size, cfg.to_core(), pads);
         // Only a server with an fs pool sweeps closed connections; tell the
         // shared reactor so `close_conn` records into `fs_closed` here and not
         // on a client (which would never drain it).
-        #[cfg(feature = "async-fs")]
+        #[cfg(feature = "uring-fs")]
         {
             core.has_fs_pool = cfg.fs_files > 0;
         }
         Ok(Server {
-            #[cfg(feature = "async-fs")]
+            #[cfg(feature = "uring-fs")]
             fs,
-            #[cfg(feature = "async-fs")]
+            #[cfg(feature = "uring-fs")]
             fd_xattr_ok,
-            #[cfg(feature = "async-fs")]
+            #[cfg(feature = "uring-fs")]
             ftruncate_ok,
             core,
             handlers: Handlers {
@@ -825,26 +819,34 @@ where
             // Reap loop drained: sweep the fs files any connection that closed
             // during it left open (batched here so it runs after every fs
             // completion for those connections has been routed).
-            #[cfg(feature = "async-fs")]
+            #[cfg(feature = "uring-fs")]
             self.sweep_closed_fs();
         }
         Ok(())
     }
 
-    /// Close the fs files still owned by connections that closed since the last
-    /// sweep. Fire-and-forget: `close_owned_by` stages an orphan close per file
-    /// (whose completion frees the slot), so a handler that opened files
-    /// without closing them, or a connection that died mid-chain, can't leak
-    /// fixed-file slots until server teardown.
-    #[cfg(feature = "async-fs")]
+    /// Reclaim the fs fds still held by connections that closed since the last
+    /// sweep. Fire-and-forget: `cancel_owned_by` cancels each closed
+    /// connection's in-flight fs ops, so their parked `Arc<OwnedFd>`s drop on
+    /// the resulting CQEs and the fds close (close-last) — a handler that opened
+    /// a file without closing it, or a connection that died mid-chain, can't pin
+    /// an fd until server teardown.
+    #[cfg(feature = "uring-fs")]
     fn sweep_closed_fs(&mut self) {
+        // NOTE(stage1b): plain-fd files close by `Arc`-drop, but an op still in
+        // flight for a just-closed connection parks its fd until the op's CQE,
+        // and nothing else cancels it (a never-completing read would pin the fd
+        // until server teardown). So cancel the closed connections' in-flight fs
+        // ops by owner: each then completes `ECANCELED`, its CQE drops the
+        // parked `Arc`, and the fd closes (close-last). This is the Arc-model
+        // replacement for the old `close_owned_by` sweep.
         if self.core.fs_closed.is_empty() {
             return;
         }
         let owners: Vec<(u32, u64)> = self.core.fs_closed.drain(..).collect();
         if let Some(fs) = self.fs.as_mut() {
             for owner in owners {
-                fs.close_owned_by(&mut self.core.engine, owner);
+                fs.cancel_owned_by(&mut self.core.engine, owner);
             }
         }
     }
@@ -868,7 +870,7 @@ where
         // loop (chain the next op, or resolve the request via its captured
         // `Deferred`); fire it with a fresh `FsConn` once `on_cqe`'s borrow
         // of the fs tables has ended.
-        #[cfg(feature = "async-fs")]
+        #[cfg(feature = "uring-fs")]
         if cqe.user_data as u8 & crate::uring::user_data::TAG_FS_DOMAIN != 0 {
             let (fd_xattr_ok, ftruncate_ok) =
                 (self.fd_xattr_ok, self.ftruncate_ok);
@@ -878,7 +880,7 @@ where
                 let fired =
                     fs.on_cqe(&mut self.core.engine, tag, fslot, fgen, cqe.res);
                 if let Some((cb, done, owner)) = fired {
-                    let mut conn = crate::async_fs::core::FsConn::new(
+                    let mut conn = crate::uring_fs::core::FsConn::new(
                         fs,
                         &mut self.core.engine,
                         owner,
@@ -995,37 +997,37 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     }
 
     /// Register the calling process's **current** credentials as a
-    /// [`Personality`](crate::async_fs::Personality) on this server's ring —
+    /// [`Personality`](crate::uring_fs::Personality) on this server's ring —
     /// the identity a [`Request`]`::fs` op runs as.
     ///
     /// Unprivileged (registering your own creds needs no capability); the
     /// snapshot is frozen at this call. Only meaningful with an fs pool
     /// (`ServerConfig::fs_files`); ids come from a credential broker for acting
-    /// as authenticated peers (see [`CredBroker`](crate::async_fs::CredBroker),
-    /// which also registers on this ring). Requires the `async-fs` feature.
-    #[cfg(feature = "async-fs")]
-    pub fn register_self(&self) -> crate::Result<crate::async_fs::Personality> {
+    /// as authenticated peers (see [`CredBroker`](crate::uring_fs::CredBroker),
+    /// which also registers on this ring). Requires the `uring-fs` feature.
+    #[cfg(feature = "uring-fs")]
+    pub fn register_self(&self) -> crate::Result<crate::uring_fs::Personality> {
         let id = crate::uring::sys::register_personality(
             self.core.engine.ring.raw_fd(),
         )?;
-        crate::async_fs::Personality::from_raw(id)
+        crate::uring_fs::Personality::from_raw(id)
             .ok_or_else(|| crate::Error::from(errno::Errno::EINVAL))
     }
 
     /// Whether this kernel accepts a **registered-table file** for the
-    /// fd-based xattr ops ([`FsConn::fgetxattr`](crate::async_fs::FsConn)
+    /// fd-based xattr ops ([`FsConn::fgetxattr`](crate::uring_fs::FsConn)
     /// / `fsetxattr`) — Linux ≥ 6.13. Where false, gate those ops: submitting
     /// them anyway surfaces the kernel's `EBADF` in the callback. Requires an
-    /// fs pool and the `async-fs` feature.
-    #[cfg(feature = "async-fs")]
+    /// fs pool and the `uring-fs` feature.
+    #[cfg(feature = "uring-fs")]
     pub fn supports_fd_xattr(&self) -> bool {
         self.fd_xattr_ok
     }
 
-    /// Whether this kernel supports [`FsConn::ftruncate`](crate::async_fs::FsConn)
+    /// Whether this kernel supports [`FsConn::ftruncate`](crate::uring_fs::FsConn)
     /// (`IORING_OP_FTRUNCATE`, Linux ≥ 6.9). Requires an fs pool and the
-    /// `async-fs` feature.
-    #[cfg(feature = "async-fs")]
+    /// `uring-fs` feature.
+    #[cfg(feature = "uring-fs")]
     pub fn supports_ftruncate(&self) -> bool {
         self.ftruncate_ok
     }
@@ -1084,9 +1086,9 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
 
 // A server with an fs pool can act as authenticated peers: the credential
 // broker registers personalities on its ring (built first, then the broker
-// inherits the ring fd — the same fork-before-threads ordering as `AsyncFs`).
-#[cfg(feature = "async-fs")]
-impl<U, AcceptFn, HeaderFn, BodyFn> crate::async_fs::BrokerReactor
+// inherits the ring fd — the same fork-before-threads ordering as `UringFs`).
+#[cfg(feature = "uring-fs")]
+impl<U, AcceptFn, HeaderFn, BodyFn> crate::uring_fs::BrokerReactor
     for Server<U, AcceptFn, HeaderFn, BodyFn>
 {
     fn broker_ring_fd(&self) -> RawFd {
@@ -1106,7 +1108,7 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Drop
         // fs ops share this ring; on a failed drain they may still be in
         // flight, so leak the fs op buffers alongside the connection buffers
         // rather than free memory the kernel might yet write into.
-        #[cfg(feature = "async-fs")]
+        #[cfg(feature = "uring-fs")]
         if leaked {
             if let Some(fs) = self.fs.as_mut() {
                 fs.leak();

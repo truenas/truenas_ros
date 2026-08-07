@@ -133,7 +133,7 @@ const _: () = assert!(core::mem::size_of::<IoUringFileIndexRange>() == 16);
 /// `IORING_REGISTER_FILES_UPDATE`. `data` points to an array of `nr_args` fds to
 /// install starting at registered-file slot `offset`; the kernel `fget`s its own
 /// reference to each, so the caller may close the fd after the call returns.
-#[cfg(any(feature = "net-client", feature = "async-fs"))]
+#[cfg(any(feature = "net-client", feature = "uring-fs"))]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct IoUringRsrcUpdate {
@@ -141,7 +141,7 @@ pub(crate) struct IoUringRsrcUpdate {
     pub resv: u32,
     pub data: u64, // pointer to the fd array (__aligned_u64 == u64 on 64-bit)
 }
-#[cfg(any(feature = "net-client", feature = "async-fs"))]
+#[cfg(any(feature = "net-client", feature = "uring-fs"))]
 const _: () = assert!(core::mem::size_of::<IoUringRsrcUpdate>() == 16);
 
 /// `struct __kernel_timespec` — the 16-byte timespec io_uring timeout ops read
@@ -342,7 +342,7 @@ pub(crate) const IORING_OFF_SQES: i64 = 0x1000_0000;
 /// Install fds into an already-registered file table at chosen slots — a client
 /// places a freshly-`connect`ed socket into its pool this way (the server's pool
 /// is auto-allocated by multishot accept; a client must update explicitly).
-#[cfg(any(feature = "net-client", feature = "async-fs"))]
+#[cfg(any(feature = "net-client", feature = "uring-fs"))]
 pub(crate) const IORING_REGISTER_FILES_UPDATE: u32 = 6;
 pub(crate) const IORING_REGISTER_PROBE: u32 = 8;
 /// Snapshot the **calling task's** credentials (fsuid/fsgid, groups,
@@ -570,7 +570,7 @@ pub(crate) fn register_file_alloc_range(
 /// The kernel takes its own reference (`fget`), so the caller may close `fd`
 /// afterward. Used by a client to place a freshly-`connect`ed socket into its
 /// pool at a chosen index (the server auto-allocates via multishot accept).
-#[cfg(any(feature = "net-client", feature = "async-fs"))]
+#[cfg(any(feature = "net-client", feature = "uring-fs"))]
 pub(crate) fn register_file_update(
     ring_fd: RawFd,
     slot: u32,

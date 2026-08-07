@@ -326,7 +326,7 @@ impl Statx {
 
     /// Wrap a kernel-filled `struct statx` (the io_uring `STATX` op writes
     /// one into a buffer the completion hands back).
-    #[cfg_attr(not(feature = "async-fs"), allow(dead_code))]
+    #[cfg_attr(not(feature = "uring-fs"), allow(dead_code))]
     pub(crate) fn from_raw(raw: StatxRaw) -> Statx {
         Statx(raw)
     }

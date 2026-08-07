@@ -5462,7 +5462,7 @@ fn ktls_splice_body_stall_reclaimed() {
     }
 }
 
-#[cfg(feature = "async-fs")]
+#[cfg(feature = "uring-fs")]
 #[test]
 fn server_builds_with_fs_pool() {
     // A server with `fs_files` set registers ONE shared fixed-file table of
@@ -5505,12 +5505,12 @@ fn server_builds_with_fs_pool() {
 /// no worker thread, no blocking the ring). Two requests on one keep-alive
 /// connection prove the fixed-file slot is opened and freed per request rather
 /// than leaked.
-#[cfg(feature = "async-fs")]
+#[cfg(feature = "uring-fs")]
 #[test]
 fn fs_static_file_server_open_read_reply() {
     use std::ffi::CString;
     use std::sync::OnceLock;
-    use truenas_ros::async_fs::{Anchor, Personality};
+    use truenas_ros::uring_fs::{Anchor, Personality};
     use truenas_ros::sync_fs::{OFlag, OpenHow};
 
     let dir = tempfile::tempdir().unwrap();
@@ -5545,7 +5545,7 @@ fn fs_static_file_server_open_read_reply() {
                 deferred.close(); // open failed (ENOENT/EACCES — the personality working)
                 return;
             };
-            fs.pread(file, vec![0u8; 4096], 0, move |done, fs| {
+            fs.pread(who, file.clone(), vec![0u8; 4096], 0, move |done, fs| {
                 fs.close(file); // fire-and-forget: free the slot
                 match done.result() {
                     Ok(n) => {
@@ -5603,24 +5603,29 @@ fn fs_static_file_server_open_read_reply() {
     assert_eq!(second, b"the second file");
 }
 
-/// The `FsFile` carries the personality it was opened under, and `as_root()`
-/// runs an fd-op under the daemon's ambient (root) credentials
-/// (`sqe.personality = 0`). The open callback checks `file.personality()` round-
-/// trips the id it opened with, then reads the file through `file.as_root()`
-/// (the BECOME_ROOT path) — which must complete, not fail EINVAL, since
-/// personality 0 is the ambient identity, not an unregistered id. (On this
-/// root dev host the peer identity is itself root, so the read simply succeeds;
-/// the point is exercising the personality-0 SQE path end to end.)
-#[cfg(feature = "async-fs")]
+/// `FsConn::fgetxattr_as_root` reads an xattr under the reactor's ambient
+/// (root) credentials (`sqe.personality = 0`) — the sanctioned privileged-read
+/// path for a `trusted.*`/`security.*` attribute a request's own identity
+/// can't see. Here it reads a seeded `user.*` value end to end; the full
+/// privilege boundary (a non-root peer vs. a root-only xattr) isn't reproduced,
+/// since on this root dev host the peer identity is itself root — the point is
+/// exercising the `personality = 0` SQE path end to end.
+#[cfg(feature = "uring-fs")]
 #[test]
 fn fs_file_carries_personality_and_as_root() {
     use std::ffi::CString;
     use std::sync::OnceLock;
-    use truenas_ros::async_fs::{Anchor, Personality};
+    use truenas_ros::uring_fs::{Anchor, Personality};
     use truenas_ros::sync_fs::{OFlag, OpenHow};
 
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("f.txt"), b"payload").unwrap();
+    let fpath = dir.path().join("f.txt");
+    std::fs::write(&fpath, b"payload").unwrap();
+    // Seed an xattr to read back through the ambient-root path; skip if the
+    // filesystem refuses user xattrs (some `/tmp` configs).
+    if !set_user_xattr(&fpath, b"user.tr_test", b"secret") {
+        return;
+    }
 
     let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
     let anchor = match Anchor::open(dir.path()) {
@@ -5645,28 +5650,27 @@ fn fs_file_carries_personality_and_as_root() {
                 deferred.close();
                 return;
             };
-            // The token round-trips the personality it was opened under.
-            let tag: &[u8] = if file.personality().id() == who.id() {
-                b"ok"
-            } else {
-                b"mismatch"
-            };
-            // Read under ambient root (sqe.personality = 0) via as_root().
-            let tag = tag.to_vec();
-            fs.pread(file.as_root(), vec![0u8; 64], 0, move |d, fs| {
-                fs.close(file);
-                match d.result() {
-                    Ok(n) => {
-                        let mut v = d.into_bufs().pop().unwrap_or_default();
-                        v.truncate(n as usize);
-                        let mut out = tag;
-                        out.push(b':');
-                        out.extend_from_slice(&v);
-                        deferred.reply(echo_frame(&out));
+            // Read the seeded xattr under ambient root (personality 0) — no
+            // `who`. On this root host the peer is itself root, so this
+            // exercises the `personality = 0` SQE path end to end rather than a
+            // privilege boundary.
+            let name = CString::new("user.tr_test").unwrap();
+            fs.fgetxattr_as_root(
+                file.clone(),
+                &name,
+                vec![0u8; 64],
+                move |d, fs| {
+                    fs.close(file);
+                    match d.result() {
+                        Ok(n) => {
+                            let mut v = d.into_bufs().pop().unwrap_or_default();
+                            v.truncate(n as usize);
+                            deferred.reply(echo_frame(&v));
+                        }
+                        Err(_) => deferred.reply(echo_frame(b"xattr-err")),
                     }
-                    Err(_) => deferred.reply(echo_frame(b"read-err")),
-                }
-            });
+                },
+            );
         });
         Response::Defer(permit)
     };
@@ -5704,15 +5708,15 @@ fn fs_file_carries_personality_and_as_root() {
         stop.shutdown();
         Ok(r)
     });
-    server.serve_forever().expect("serve_forever personality");
+    server.serve_forever().expect("serve_forever as_root xattr");
     let reply = client.join().unwrap().expect("client io");
-    // "ok" = personality round-tripped; ":payload" = the as_root read worked.
-    assert_eq!(reply, b"ok:payload");
+    // The ambient-root fgetxattr read the seeded value end to end.
+    assert_eq!(reply, b"secret");
 }
 
 /// Set a `user.*` xattr from the test side; `false` if the filesystem refuses
 /// user xattrs (unusual `/tmp`) so the caller can skip the xattr assertion.
-#[cfg(feature = "async-fs")]
+#[cfg(feature = "uring-fs")]
 fn set_user_xattr(path: &Path, name: &[u8], value: &[u8]) -> bool {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -5737,12 +5741,12 @@ fn set_user_xattr(path: &Path, name: &[u8], value: &[u8]) -> bool {
 /// personality, driven from the body handler and resolved through a
 /// `Deferred`. The two version-gated ops (`ftruncate` ≥ 6.9, fixed-file xattr
 /// ≥ 6.13) run only where the server reports support; `renameat` always does.
-#[cfg(feature = "async-fs")]
+#[cfg(feature = "uring-fs")]
 #[test]
 fn fs_metadata_ops_rename_truncate_xattr() {
     use std::ffi::CString;
     use std::sync::OnceLock;
-    use truenas_ros::async_fs::{Anchor, Leaf, Personality};
+    use truenas_ros::uring_fs::{Anchor, Leaf, Personality};
     use truenas_ros::sync_fs::{OFlag, OpenHow, RenameFlags};
 
     let dir = tempfile::tempdir().unwrap();
@@ -5776,18 +5780,26 @@ fn fs_metadata_ops_rename_truncate_xattr() {
                         return;
                     };
                     let name = CString::new("user.color").unwrap();
-                    fs.fgetxattr(file, &name, vec![0u8; 64], move |d, fs| {
-                        fs.close(file);
-                        match d.result() {
-                            Ok(n) => {
-                                let mut v =
-                                    d.into_bufs().pop().unwrap_or_default();
-                                v.truncate(n as usize);
-                                deferred.reply(echo_frame(&v));
+                    fs.fgetxattr(
+                        who,
+                        file.clone(),
+                        &name,
+                        vec![0u8; 64],
+                        move |d, fs| {
+                            fs.close(file);
+                            match d.result() {
+                                Ok(n) => {
+                                    let mut v =
+                                        d.into_bufs().pop().unwrap_or_default();
+                                    v.truncate(n as usize);
+                                    deferred.reply(echo_frame(&v));
+                                }
+                                Err(_) => {
+                                    deferred.reply(echo_frame(b"xattr-err"))
+                                }
                             }
-                            Err(_) => deferred.reply(echo_frame(b"xattr-err")),
-                        }
-                    });
+                        },
+                    );
                 });
             }
             b"truncate" => {
@@ -5798,7 +5810,7 @@ fn fs_metadata_ops_rename_truncate_xattr() {
                         deferred.close();
                         return;
                     };
-                    fs.ftruncate(file, 3, move |d, fs| {
+                    fs.ftruncate(who, file.clone(), 3, move |d, fs| {
                         fs.close(file);
                         match d.result() {
                             Ok(_) => deferred.reply(echo_frame(b"ok")),
@@ -5908,12 +5920,12 @@ fn fs_metadata_ops_rename_truncate_xattr() {
 /// every open succeeds. (Mirrors `tcp_sequential_slot_reuse`: a small pool with
 /// slack absorbs the asynchronous close, so one-at-a-time connections never
 /// outrun the sweep.)
-#[cfg(feature = "async-fs")]
+#[cfg(feature = "uring-fs")]
 #[test]
 fn fs_owned_files_swept_on_connection_close() {
     use std::ffi::CString;
     use std::sync::OnceLock;
-    use truenas_ros::async_fs::{Anchor, Personality};
+    use truenas_ros::uring_fs::{Anchor, Personality};
     use truenas_ros::sync_fs::{OFlag, OpenHow};
 
     const N: usize = 16;
@@ -6014,12 +6026,12 @@ fn fs_owned_files_swept_on_connection_close() {
 /// `FsConn::new` call site to `root: true` and the reply appears instead.
 /// Looping well past `fs_files` keeps the sweep honest at the same time — every
 /// connection leaves its first file open.
-#[cfg(feature = "async-fs")]
+#[cfg(feature = "uring-fs")]
 #[test]
 fn fs_continuation_cannot_open_a_new_file() {
     use std::ffi::CString;
     use std::sync::OnceLock;
-    use truenas_ros::async_fs::{Anchor, Personality};
+    use truenas_ros::uring_fs::{Anchor, Personality};
     use truenas_ros::sync_fs::{OFlag, OpenHow};
 
     const N: usize = 6;
@@ -6124,7 +6136,7 @@ fn fs_continuation_cannot_open_a_new_file() {
 
 /// `true` iff running as root — the broker can only impersonate another uid
 /// with `CAP_SETUID`.
-#[cfg(feature = "async-fs")]
+#[cfg(feature = "uring-fs")]
 fn is_root() -> bool {
     // SAFETY: geteuid cannot fail.
     unsafe { libc::geteuid() == 0 }
@@ -6142,13 +6154,13 @@ fn is_root() -> bool {
 ///
 /// Root-only (the broker needs `CAP_SETUID` to become the peer); skipped
 /// otherwise.
-#[cfg(feature = "async-fs")]
+#[cfg(feature = "uring-fs")]
 #[test]
 fn fs_broker_personality_gates_open() {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::sync::OnceLock;
-    use truenas_ros::async_fs::{Anchor, AsUser, CredBroker, Personality};
+    use truenas_ros::uring_fs::{Anchor, AsUser, CredBroker, Personality};
     use truenas_ros::sync_fs::{OFlag, OpenHow};
 
     if !is_root() {
@@ -6203,7 +6215,7 @@ fn fs_broker_personality_gates_open() {
                 deferred.reply(echo_frame(b"denied"));
                 return;
             };
-            fs.pread(file, vec![0u8; 64], 0, move |d, fs| {
+            fs.pread(who, file.clone(), vec![0u8; 64], 0, move |d, fs| {
                 fs.close(file);
                 match d.result() {
                     Ok(n) => {
@@ -6278,5 +6290,299 @@ fn fs_broker_personality_gates_open() {
     assert_eq!(
         peer, b"denied",
         "the unprivileged peer is refused at open — the personality gates DAC"
+    );
+}
+
+/// Real privilege boundary for `fgetxattr_as_root`: a `trusted.*` attribute is
+/// invisible to an unprivileged reader (the kernel hides it without
+/// `CAP_SYS_ADMIN`, returning `ENODATA`), while the ambient-root path
+/// (`personality = 0`) holds the capability and returns the value. The peer
+/// opens a world-readable file, then reads the attribute both ways.
+///
+/// Root-only (the broker needs `CAP_SETUID`); skipped otherwise, and skipped if
+/// the fs refuses `trusted.*` or the kernel lacks fd-xattr (< 6.13).
+#[cfg(feature = "uring-fs")]
+#[test]
+fn fs_as_root_reads_trusted_xattr_across_privilege() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::OnceLock;
+    use truenas_ros::uring_fs::{Anchor, AsUser, CredBroker, Personality};
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+
+    if !is_root() {
+        return;
+    }
+    const NOBODY_UID: u32 = 65_534;
+    const NOBODY_GID: u32 = 65_534;
+
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("t.txt");
+    std::fs::write(&f, b"body").unwrap();
+    let cpath = CString::new(f.as_os_str().as_bytes()).unwrap();
+    // World-readable so the unprivileged peer can OPEN it — the boundary under
+    // test is the xattr `CAP_SYS_ADMIN` check, not DAC on open.
+    // SAFETY: valid path; chmod cannot corrupt memory.
+    assert_eq!(unsafe { libc::chmod(cpath.as_ptr(), 0o644) }, 0);
+    // Seed a `trusted.*` attribute (root/CAP_SYS_ADMIN only); skip if the fs
+    // refuses it.
+    let tname = CString::new("trusted.tr_test").unwrap();
+    // SAFETY: valid path/name and a 3-byte value.
+    let seeded = unsafe {
+        libc::setxattr(
+            cpath.as_ptr(),
+            tname.as_ptr(),
+            b"cap".as_ptr().cast(),
+            3,
+            0,
+        )
+    };
+    if seeded != 0 {
+        return; // filesystem refuses trusted.* here
+    }
+
+    let cell: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+
+    let pc = Arc::clone(&cell);
+    let body = move |mut req: Request<'_, ()>| -> Response {
+        let _ = req.body.take();
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let peer = *pc.get().expect("peer personality set before serving");
+        let anchor = anchor.clone();
+        let ro = OpenHow::new().flags(OFlag::O_RDONLY);
+        let path = CString::new("t.txt").unwrap();
+        fs.open(peer, &anchor, &path, ro, move |done, fs| {
+            let Some(file) = done.file() else {
+                deferred.reply(echo_frame(b"open-denied"));
+                return;
+            };
+            let name = CString::new("trusted.tr_test").unwrap();
+            // (1) As the unprivileged peer: trusted.* is hidden -> ENODATA.
+            fs.fgetxattr(
+                peer,
+                file.clone(),
+                &name,
+                vec![0u8; 32],
+                move |d1, fs| {
+                    let peer_failed = d1.result().is_err();
+                    let name2 = CString::new("trusted.tr_test").unwrap();
+                    // (2) As ambient root: CAP_SYS_ADMIN -> the value.
+                    fs.fgetxattr_as_root(
+                        file,
+                        &name2,
+                        vec![0u8; 32],
+                        move |d2, _fs| {
+                            let mut out = Vec::new();
+                            out.push(if peer_failed { b'1' } else { b'0' });
+                            out.push(b':');
+                            match d2.result() {
+                                Ok(n) => {
+                                    let mut v = d2
+                                        .into_bufs()
+                                        .pop()
+                                        .unwrap_or_default();
+                                    v.truncate(n as usize);
+                                    out.extend_from_slice(&v);
+                                }
+                                Err(_) => out.extend_from_slice(b"root-err"),
+                            }
+                            deferred.reply(echo_frame(&out));
+                        },
+                    );
+                },
+            );
+        });
+        Response::Defer(permit)
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let cfg = ServerConfig {
+        pool_size: 8,
+        fs_files: 8,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    let _root = server.register_self().expect("register_self");
+    let broker = match CredBroker::spawn(&[&server]) {
+        Ok(b) => b,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("CredBroker::spawn: {e}"),
+    };
+    let creds = broker.handle(0).expect("broker handle");
+    let peer = creds
+        .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
+        .expect("register peer");
+    cell.set(peer).unwrap();
+
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let mut s = connect_tcp(v4)?;
+        send_framed(&mut s, b"go")?;
+        let r = recv_framed(&mut s)?;
+        drop(s);
+        stop.shutdown();
+        Ok(r)
+    });
+    server.serve_forever().expect("serve_forever trusted-xattr");
+    let reply = client.join().unwrap().expect("client io");
+    // "1" = the peer's read failed (trusted.* hidden without CAP_SYS_ADMIN);
+    // ":cap" = the ambient-root read returned the value.
+    assert_eq!(
+        reply, b"1:cap",
+        "as-root read the trusted.* the unprivileged peer cannot see"
+    );
+}
+
+/// An fd opened for a connection torn down **mid-chain** is reclaimed when the
+/// connection closes. A handler opens a FIFO and submits a read that blocks
+/// forever (no writer sends data), then the peer disconnects before the read
+/// completes. Plain-fd files close by `Arc`-drop, but an in-flight op parks the
+/// fd until its CQE — so the connection-teardown sweep (`cancel_owned_by`)
+/// cancels the op; it completes `ECANCELED`, the parked `Arc` drops, and the fd
+/// closes without waiting for whole-server teardown. Validates the Arc-model
+/// replacement for the old `close_owned_by`.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn fs_fd_reclaimed_on_connection_close_midchain() {
+    use std::ffi::CString;
+    use std::os::fd::RawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    use truenas_ros::uring_fs::{Anchor, Personality};
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("f.fifo");
+    let cfifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: valid NUL-terminated path.
+    if unsafe { libc::mkfifo(cfifo.as_ptr(), 0o600) } != 0 {
+        return;
+    }
+    // Hold the FIFO open O_RDWR so the handler's O_RDONLY open succeeds without
+    // blocking and its reads block (no data is ever written).
+    // SAFETY: valid path; O_RDWR|O_NONBLOCK on a FIFO does not block.
+    let keep =
+        unsafe { libc::open(cfifo.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
+    assert!(keep >= 0, "open fifo O_RDWR");
+
+    let opened: Arc<OnceLock<RawFd>> = Arc::new(OnceLock::new());
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+
+    let oc = Arc::clone(&opened);
+    let pc = Arc::clone(&pers);
+    let body = move |mut req: Request<'_, ()>| -> Response {
+        let _ = req.body.take();
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let oc = Arc::clone(&oc);
+        let path = CString::new("f.fifo").unwrap();
+        let how = OpenHow::new().flags(OFlag::O_RDONLY);
+        fs.open(who, &anchor, &path, how, move |done, fs| {
+            let Some(file) = done.file() else {
+                deferred.close();
+                return;
+            };
+            let _ = oc.set(file.as_raw_fd());
+            // Reply now, then submit a read that never completes (FIFO, no
+            // data): it parks the file's `Arc` in the op entry. The peer will
+            // disconnect with this read still in flight.
+            deferred.reply(echo_frame(b"opened"));
+            fs.pread(who, file.clone(), vec![0u8; 16], 0, move |_d, fs| {
+                fs.close(file); // never reached — the read blocks forever
+            });
+        });
+        Response::Defer(permit)
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let cfg = ServerConfig {
+        pool_size: 8,
+        fs_files: 4,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    pers.set(server.register_self().expect("register_self"))
+        .unwrap();
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let oc2 = Arc::clone(&opened);
+    let client = thread::spawn(move || -> io::Result<bool> {
+        let mut s = connect_tcp(v4)?;
+        send_framed(&mut s, b"go")?;
+        let _ = recv_framed(&mut s)?; // "opened": fd recorded, read in flight
+        drop(s); // disconnect mid-chain, read still in flight
+        let fd = *oc2.get().expect("handler recorded the fd");
+        let link = format!("/proc/self/fd/{fd}");
+        // Poll for reclamation: the fd is reclaimed iff /proc/self/fd/N stops
+        // resolving to the FIFO (closed, or reused for a different file).
+        let mut leaked = true;
+        for _ in 0..80 {
+            thread::sleep(Duration::from_millis(10));
+            match std::fs::read_link(&link) {
+                Ok(t) if t == fifo => {}
+                _ => {
+                    leaked = false;
+                    break;
+                }
+            }
+        }
+        stop.shutdown();
+        Ok(leaked)
+    });
+    server.serve_forever().expect("serve_forever fd-leak");
+    let leaked = client.join().unwrap().expect("client io");
+    // SAFETY: closing our own kept fd.
+    unsafe { libc::close(keep) };
+    assert!(
+        !leaked,
+        "the fd opened for a connection torn down mid-chain was not reclaimed \
+         after the connection closed (leaked until server teardown)"
     );
 }

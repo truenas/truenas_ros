@@ -90,13 +90,13 @@ pub(crate) struct Reactor<U> {
     /// sweep any fs files they left open (`FsCore::close_owned_by`). Recorded
     /// in `close_conn` (once per connection); a server-only concern, so it is
     /// gated on the combined feature.
-    #[cfg(all(feature = "net-server", feature = "async-fs"))]
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) fs_closed: Vec<(u32, u64)>,
     /// Whether this reactor actually has an fs pool to sweep. Only a server
     /// built with `fs_files > 0` sets it; a client (which drains nothing) and a
     /// pool-less server leave it false, so `close_conn` never records into
     /// `fs_closed` for them — otherwise a client would grow that Vec unbounded.
-    #[cfg(all(feature = "net-server", feature = "async-fs"))]
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) has_fs_pool: bool,
     /// The shared io_uring engine (ring, in-flight accounting, wake, stop
     /// flags). Declared last so the ring drops after `table`'s buffers.
@@ -121,9 +121,9 @@ impl<U> Reactor<U> {
             on_close: None,
             draining: false,
             pool_freed: false,
-            #[cfg(all(feature = "net-server", feature = "async-fs"))]
+            #[cfg(all(feature = "net-server", feature = "uring-fs"))]
             fs_closed: Vec::new(),
-            #[cfg(all(feature = "net-server", feature = "async-fs"))]
+            #[cfg(all(feature = "net-server", feature = "uring-fs"))]
             has_fs_pool: false,
             engine,
         }

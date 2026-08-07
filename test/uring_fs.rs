@@ -1,4 +1,4 @@
-//! Integration tests for the `async_fs` io_uring reactor — live data and
+//! Integration tests for the `uring_fs` io_uring reactor — live data and
 //! metadata ops against a tempdir, every one stamped with a self personality
 //! and resolved against an [`Anchor`] (there is no unstamped or
 //! absolute-path variant to test).
@@ -7,19 +7,19 @@
 //! unavailable — a bare sandbox blocks the syscalls (ENOSYS/EPERM/EACCES) —
 //! and `TRUENAS_ROS_REQUIRE_IO_URING=1` turns that skip into a hard failure.
 //!
-//! `AsyncFs` is `!Send` (single-thread ring), so the harness runs the loop on
+//! `UringFs` is `!Send` (single-thread ring), so the harness runs the loop on
 //! the test thread and drives the client from a scoped thread; a panic-safe
 //! guard stops the loop however the client exits.
-#![cfg(all(target_os = "linux", feature = "async-fs"))]
+#![cfg(all(target_os = "linux", feature = "uring-fs"))]
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
-use truenas_ros::async_fs::{
-    Anchor, AsUser, AsyncFs, CredBroker, CredHandle, FsConfig, FsHandle,
+use std::time::Duration;
+use truenas_ros::uring_fs::{
+    Anchor, AsUser, UringFs, CredBroker, CredHandle, FsConfig, FsHandle,
     IdentityCache, Leaf, Personality, ShutdownHandle,
 };
 use truenas_ros::sync_fs::{
@@ -95,7 +95,7 @@ fn pin_umask() {
     });
 }
 
-/// Build an `AsyncFs` over a fresh tempdir, register a self personality, run
+/// Build an `UringFs` over a fresh tempdir, register a self personality, run
 /// the loop on this thread, and drive `client` from a scoped thread.
 fn with_fs<F>(cfg: FsConfig, client: F)
 where
@@ -111,13 +111,13 @@ where
 {
     pin_umask();
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut afs = match AsyncFs::new(cfg) {
+    let mut afs = match UringFs::new(cfg) {
         Ok(a) => a,
         Err(e) => {
             if should_skip(&e) {
                 return;
             }
-            panic!("AsyncFs::new: {e}");
+            panic!("UringFs::new: {e}");
         }
     };
     let me = afs.register_self().expect("register_self");
@@ -136,28 +136,6 @@ where
         });
         afs.run().expect("run");
     });
-}
-
-/// Retry `f` while it fails with `retry_on` (an orphan close is
-/// asynchronous; the slot frees when its CQE lands), bounded at 2s.
-fn eventually<T>(
-    retry_on: Errno,
-    mut f: impl FnMut() -> truenas_ros::Result<T>,
-) -> T {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match f() {
-            Ok(v) => return v,
-            Err(Error::Errno(e)) if e == retry_on => {
-                assert!(
-                    Instant::now() < deadline,
-                    "still failing {retry_on} after 2s"
-                );
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(e) => panic!("unexpected error: {e}"),
-        }
-    }
 }
 
 fn rdonly() -> OpenHow {
@@ -222,6 +200,36 @@ fn round_trip_write_fsync_read() {
 }
 
 #[test]
+fn ranged_fsync_syncs_a_byte_range_and_whole_file() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let f = h.open(me, &anchor, "ranged.bin", creat_rw()).expect("open");
+
+        // Write 8 KiB so a sub-range fsync has a range to bound.
+        let data = vec![0xABu8; 8192];
+        let (n, _) = h.pwrite(me, &f, data.clone(), 0);
+        assert_eq!(n.expect("pwrite"), 8192);
+
+        // Sync just the first 4 KiB (fsync range form: off=0, len=4096), then a
+        // tail range with datasync semantics, then the whole file via 0/0.
+        h.fsync_range(me, &f, false, 0, 4096)
+            .expect("fsync_range head");
+        h.fsync_range(me, &f, true, 4096, 4096)
+            .expect("fdatasync_range tail");
+        h.fsync_range(me, &f, false, 0, 0)
+            .expect("fsync_range whole");
+        // The plain wrappers keep their whole-file behavior.
+        h.fsync(me, &f).expect("fsync");
+        h.fdatasync(me, &f).expect("fdatasync");
+        h.close(f).expect("close");
+
+        // The data is intact on disk.
+        let disk = std::fs::read(dir.join("ranged.bin")).expect("read");
+        assert_eq!(disk, data);
+    });
+}
+
+#[test]
 fn multi_component_and_beneath() {
     with_fs(FsConfig::default(), |h, me, dir, _stop| {
         std::fs::create_dir(dir.join("sub")).unwrap();
@@ -270,24 +278,66 @@ fn multi_component_and_beneath() {
 }
 
 #[test]
+fn fstatx_reports_open_file_metadata() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("m.bin"), vec![0u8; 4096]).unwrap();
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let f = h.open(me, &anchor, "m.bin", rdonly()).expect("open");
+        // fstat-by-fd: no path resolved — the metadata is exactly this fd's.
+        let st = h
+            .fstatx(me, &f, AtFlags::empty(), StatxMask::BASIC_STATS)
+            .expect("fstatx");
+        assert_eq!(st.size(), 4096);
+        h.close(f).unwrap();
+    });
+}
+
+#[test]
+fn absolute_path_opts_out_of_confinement() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("abs.txt"), b"abs").unwrap();
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let abs = dir.join("abs.txt"); // an absolute path
+
+        // Under the default confinement, an absolute path is refused (EXDEV).
+        match h.open(me, &anchor, &abs, rdonly()) {
+            Err(Error::Errno(Errno::EXDEV)) => {}
+            other => {
+                panic!("expected EXDEV under RESOLVE_BENEATH, got {other:?}")
+            }
+        }
+        // An explicit `resolve` without RESOLVE_BENEATH opts out; the absolute
+        // path then resolves from the root (the dirfd is ignored).
+        let how = rdonly().resolve(ResolveFlag::RESOLVE_NO_MAGICLINKS);
+        let f = h
+            .open(me, &anchor, &abs, how)
+            .expect("absolute open, opted out");
+        h.close(f).unwrap();
+    });
+}
+
+#[test]
 fn validation_and_errno_mapping() {
     with_fs(FsConfig::default(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).unwrap();
 
-        // Library validation: no absolute paths, no empty path, no O_CLOEXEC.
-        assert!(matches!(
-            h.open(me, &anchor, "/etc/hostname", rdonly()),
-            Err(Error::Validation(_))
-        ));
+        // An empty path is a library-validation error; an absolute path is
+        // refused by the *kernel* under the default RESOLVE_BENEATH confinement
+        // (it cannot resolve outside the anchor).
         assert!(matches!(
             h.open(me, &anchor, "", rdonly()),
             Err(Error::Validation(_))
         ));
-        let cloexec = OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC);
         assert!(matches!(
-            h.open(me, &anchor, "x", cloexec),
-            Err(Error::Validation(_))
+            h.open(me, &anchor, "/etc/hostname", rdonly()),
+            Err(Error::Errno(Errno::EXDEV))
         ));
+        // O_CLOEXEC is accepted now (opens return real fds) and reaches the
+        // kernel, which opens the file.
+        std::fs::write(dir.join("cx"), b"cx").unwrap();
+        let cloexec = OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC);
+        let fc = h.open(me, &anchor, "cx", cloexec).expect("O_CLOEXEC open");
+        h.close(fc).unwrap();
 
         // Kernel errno round-trips: ENOENT for a missing file, EBADF for a
         // write on a read-only open.
@@ -307,7 +357,7 @@ fn validation_and_errno_mapping() {
 fn stale_personality_from_other_ring_is_einval() {
     // Two reactors: an id registered on ring A names nothing on ring B.
     let dir = tempfile::tempdir().unwrap();
-    let afs_a = match AsyncFs::new(FsConfig::default()) {
+    let afs_a = match UringFs::new(FsConfig::default()) {
         Ok(a) => a,
         Err(e) => {
             if should_skip(&e) {
@@ -317,7 +367,7 @@ fn stale_personality_from_other_ring_is_einval() {
         }
     };
     let id_a = afs_a.register_self().unwrap();
-    let mut afs_b = AsyncFs::new(FsConfig::default()).unwrap();
+    let mut afs_b = UringFs::new(FsConfig::default()).unwrap();
     // Deliberately: nothing registered on B.
     let h = afs_b.handle();
     let stop = afs_b.shutdown_handle();
@@ -338,78 +388,46 @@ fn stale_personality_from_other_ring_is_einval() {
     drop(afs_a); // ring A (and its registration) outlived the use on B
 }
 
+// Files are plain reference-counted fds now — there is no per-file pool to
+// exhaust (`ENFILE`), and dropping a token does NOT cancel in-flight ops: the
+// reactor keeps the fd alive (via the op entry's parked `Arc<OwnedFd>`) until
+// the op completes, then the fd closes with the last reference (close-last by
+// ownership). This test covers that cancel-safety property: a parked read
+// whose only caller token is dropped mid-flight still completes correctly when
+// data arrives — no use-after-close.
 #[test]
-fn pool_exhaustion_enfile_then_reclaim() {
-    let cfg = FsConfig {
-        files: 2,
-        ..FsConfig::default()
-    };
-    with_fs(cfg, |h, me, dir, _stop| {
-        std::fs::write(dir.join("a"), b"a").unwrap();
-        let anchor = Anchor::open(dir.as_path()).unwrap();
-        let f1 = h.open(me, &anchor, "a", rdonly()).unwrap();
-        let f2 = h.open(me, &anchor, "a", rdonly()).unwrap();
-        match h.open(me, &anchor, "a", rdonly()) {
-            Err(Error::Errno(Errno::ENFILE)) => {}
-            other => panic!("expected ENFILE, got {other:?}"),
-        }
-        h.close(f1).unwrap();
-        let f3 = h.open(me, &anchor, "a", rdonly()).expect("slot reclaimed");
-        h.close(f3).unwrap();
-        h.close(f2).unwrap();
-    });
-}
-
-#[test]
-fn dropped_file_reclaims_slot() {
-    let cfg = FsConfig {
-        files: 1,
-        ..FsConfig::default()
-    };
-    with_fs(cfg, |h, me, dir, _stop| {
-        std::fs::write(dir.join("a"), b"a").unwrap();
-        let anchor = Anchor::open(dir.as_path()).unwrap();
-        let f = h.open(me, &anchor, "a", rdonly()).unwrap();
-        drop(f); // orphan close: injected by Drop, completes asynchronously
-        let f =
-            eventually(Errno::ENFILE, || h.open(me, &anchor, "a", rdonly()));
-        h.close(f).unwrap();
-    });
-}
-
-#[test]
-fn dropped_file_mid_op_cancels_and_reclaims() {
-    let cfg = FsConfig {
-        files: 1,
-        ..FsConfig::default()
-    };
-    with_fs(cfg, |h, me, dir, _stop| {
+fn dropped_file_mid_op_completes_without_use_after_close() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
         mkfifo(&dir, "fifo");
-        std::fs::write(dir.join("a"), b"a").unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
 
-        // O_RDWR on a FIFO opens immediately and keeps a writer attached, so
-        // a read with no data parks forever — an op genuinely in flight.
+        // O_RDWR on a FIFO opens immediately and keeps a writer attached, so a
+        // read with no data parks — an op genuinely in flight.
         let how = OpenHow::new().flags(OFlag::O_RDWR);
         let f = h.open(me, &anchor, "fifo", how).expect("open fifo");
         let pending = h
-            .start_preadv(me, &f, vec![vec![0u8; 8]], 0)
+            .start_preadv(me, &f, vec![vec![0u8; 4]], 0)
             .expect("start readv");
         thread::sleep(Duration::from_millis(50)); // let it park in the kernel
 
-        // Dropping the only token cancels the parked read and closes the
-        // file once it drains — the close-last rule, observably: the pool's
-        // single slot becomes reusable.
+        // Drop the caller's only token while the read is parked. The reactor
+        // still owns the fd (op-entry `Arc`), so the read stays valid.
         drop(f);
-        let (res, _bufs) = pending.wait();
-        let err = res.expect_err("parked read must not complete normally");
-        let Error::Errno(_) = err else {
-            panic!("expected an errno from the cancelled read, got {err:?}");
-        };
 
-        let f =
-            eventually(Errno::ENFILE, || h.open(me, &anchor, "a", rdonly()));
-        h.close(f).unwrap();
+        // Feed the fifo from a fresh writer; the parked read must complete with
+        // the real bytes, proving the fd was not closed out from under it.
+        let path = dir.join("fifo");
+        let writer = thread::spawn(move || {
+            use std::io::Write;
+            let mut w =
+                std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            w.write_all(b"okay").unwrap();
+        });
+
+        let (res, bufs) = pending.wait();
+        assert_eq!(res.expect("parked read completes after data arrives"), 4);
+        assert_eq!(&bufs[0], b"okay");
+        writer.join().unwrap();
     });
 }
 
@@ -871,7 +889,7 @@ fn metadata_ops_carry_the_personality() {
 /// The broker forks, so it must be created before the harness starts
 /// threads. These tests each build their own reactor rather than using
 /// `with_fs`, and run the loop on a scoped thread while the test thread
-/// drives registration (the reverse of the other tests, because `AsyncFs`
+/// drives registration (the reverse of the other tests, because `UringFs`
 /// is `!Send` but `CredBroker`/`CredHandle` are `Send`).
 fn with_broker<F>(client: F)
 where
@@ -890,13 +908,13 @@ where
     .expect("chmod tempdir");
     // The ring must exist before the broker forks: it inherits the fd,
     // because an io_uring descriptor cannot be sent over a unix socket.
-    let mut afs = match AsyncFs::new(FsConfig::default()) {
+    let mut afs = match UringFs::new(FsConfig::default()) {
         Ok(a) => a,
         Err(e) => {
             if should_skip(&e) {
                 return;
             }
-            panic!("AsyncFs::new: {e}");
+            panic!("UringFs::new: {e}");
         }
     };
     let me = afs.register_self().expect("register_self");
@@ -926,6 +944,286 @@ where
 fn is_root() -> bool {
     // SAFETY: geteuid cannot fail.
     unsafe { libc::geteuid() == 0 }
+}
+
+// --- query_directory -------------------------------------------------------
+
+#[test]
+fn query_directory_lists_and_enriches() {
+    use std::collections::BTreeMap;
+    use std::ffi::CString;
+    use truenas_ros::uring_fs::{
+        query_directory, DirEntry, EnrichSpec, QueryOptions,
+    };
+
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("a.txt"), b"aa").unwrap();
+        std::fs::write(dir.join("b.txt"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join("c.txt"), vec![0u8; 4096]).unwrap();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let etag = CString::new("user.etag").unwrap();
+        // Tag a.txt; skip the xattr checks if the fs/kernel refuses user xattrs.
+        let xattr_ok = {
+            let how = OpenHow::new().flags(OFlag::O_RDWR);
+            let f = h.open(me, &anchor, "a.txt", how).unwrap();
+            let (res, _) = h.fsetxattr(me, &f, &etag, b"deadbeef".to_vec(), 0);
+            h.close(f).unwrap();
+            res.is_ok()
+        };
+
+        let opts = QueryOptions {
+            spec: EnrichSpec::STATX | EnrichSpec::XATTR,
+            xattr_names: vec![etag.clone()],
+            acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
+            clump: 2, // force more than one batch
+        };
+        let mut q = query_directory(&h, me, &anchor, opts).unwrap();
+        let mut all: BTreeMap<String, DirEntry> = BTreeMap::new();
+        while let Some(batch) = q.next() {
+            for e in batch.unwrap() {
+                all.insert(e.name.to_string_lossy().into_owned(), e);
+            }
+        }
+
+        assert_eq!(all.len(), 4, "3 files + 1 subdir");
+        assert_eq!(all["a.txt"].statx.as_ref().unwrap().size(), 2);
+        assert_eq!(all["b.txt"].statx.as_ref().unwrap().size(), 100);
+        assert_eq!(all["c.txt"].statx.as_ref().unwrap().size(), 4096);
+        assert!(all["sub"].is_dir);
+        assert!(!all["a.txt"].is_dir);
+        if xattr_ok {
+            assert_eq!(
+                all["a.txt"].xattrs[0].1.as_deref(),
+                Some(&b"deadbeef"[..]),
+                "a.txt carries the etag",
+            );
+            assert_eq!(all["b.txt"].xattrs[0].1, None, "b.txt has no etag");
+        }
+    });
+}
+
+/// Enumeration is gated by the caller's list permission: opening the directory
+/// readable under `who` is the DAC check, so a non-root peer that cannot list a
+/// `0700` directory it does not own gets `EACCES` (never the reactor's root).
+#[test]
+fn query_directory_enumeration_obeys_dac() {
+    use std::ffi::CString;
+    use truenas_ros::uring_fs::{query_directory, EnrichSpec, QueryOptions};
+    use truenas_ros::errno::Errno;
+
+    if !is_root() {
+        return; // the broker cannot become another uid without CAP_SETUID
+    }
+    const NOBODY_UID: u32 = 65_534;
+    const NOBODY_GID: u32 = 65_534;
+
+    with_broker(|h, creds, _me, dir| {
+        // A root-owned 0700 subdir the peer cannot list.
+        let secret = dir.join("secret");
+        std::fs::create_dir(&secret).unwrap();
+        std::fs::set_permissions(
+            &secret,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::write(secret.join("hidden.txt"), b"x").unwrap();
+
+        let peer = creds
+            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
+            .unwrap();
+        let anchor = Anchor::open(&secret).unwrap();
+        let opts = QueryOptions {
+            spec: EnrichSpec::STATX,
+            xattr_names: vec![],
+            acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
+            clump: 8,
+        };
+        let err = query_directory(h, peer, &anchor, opts).unwrap_err();
+        assert!(
+            matches!(err, Error::Errno(Errno::EACCES)),
+            "peer cannot list a 0700 dir it does not own: {err:?}"
+        );
+    });
+}
+
+/// Dropping a `QueryDir` mid-walk closes its directory fd (RAII), not at some
+/// later teardown — verified against `/proc/self/fd`.
+#[test]
+fn query_directory_drop_closes_dir_fd() {
+    use std::ffi::CString;
+    use truenas_ros::uring_fs::{query_directory, EnrichSpec, QueryOptions};
+
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        for i in 0..6 {
+            std::fs::write(dir.join(format!("f{i}")), b"x").unwrap();
+        }
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let opts = QueryOptions {
+            spec: EnrichSpec::STATX,
+            xattr_names: vec![],
+            acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
+            clump: 2,
+        };
+        let mut q = query_directory(&h, me, &anchor, opts).unwrap();
+        let fd = q.dir_fd();
+        let link = format!("/proc/self/fd/{fd}");
+        // Pull one batch, then drop mid-walk (files remain unread).
+        let first = q.next().expect("a batch").unwrap();
+        assert!(!first.is_empty());
+        assert!(std::fs::read_link(&link).is_ok(), "dir fd open during walk");
+        drop(q);
+        assert!(
+            std::fs::read_link(&link).is_err(),
+            "dir fd closed on drop, not deferred to teardown"
+        );
+    });
+}
+
+#[test]
+fn query_pool_lists_directory() {
+    use std::collections::BTreeSet;
+    use std::ffi::CString;
+    use truenas_ros::uring_fs::{EnrichSpec, QueryOptions, QueryPool};
+
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        for n in ["x.txt", "y.txt", "z.txt"] {
+            std::fs::write(dir.join(n), b"hi").unwrap();
+        }
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let pool = QueryPool::new(h, 2);
+        let opts = QueryOptions {
+            spec: EnrichSpec::STATX,
+            xattr_names: vec![],
+            acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
+            clump: 2,
+        };
+        // Non-blocking enqueue; pull batches from the handle.
+        let handle = pool.query(me, anchor, opts);
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        while let Some(batch) = handle.next() {
+            for e in batch.unwrap() {
+                names.insert(e.name.to_string_lossy().into_owned());
+            }
+        }
+        let want: BTreeSet<String> = ["x.txt", "y.txt", "z.txt"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(names, want);
+    });
+}
+
+#[test]
+fn query_pool_runs_multiple_listings() {
+    use std::collections::BTreeSet;
+    use std::ffi::CString;
+    use truenas_ros::uring_fs::{
+        EnrichSpec, QueryHandle, QueryOptions, QueryPool,
+    };
+
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        let d1 = dir.join("d1");
+        let d2 = dir.join("d2");
+        std::fs::create_dir(&d1).unwrap();
+        std::fs::create_dir(&d2).unwrap();
+        std::fs::write(d1.join("a"), b"1").unwrap();
+        std::fs::write(d1.join("b"), b"1").unwrap();
+        std::fs::write(d2.join("c"), b"2").unwrap();
+
+        let a1 = Anchor::open(d1.as_path()).unwrap();
+        let a2 = Anchor::open(d2.as_path()).unwrap();
+        let pool = QueryPool::new(h, 2);
+        let mk_opts = || QueryOptions {
+            spec: EnrichSpec::STATX,
+            xattr_names: vec![],
+            acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
+            clump: 8,
+        };
+        // Submit BOTH from this one thread before collecting either — the pool
+        // runs the walks (up to 2 concurrently), decoupled from the caller.
+        let h1 = pool.query(me, a1, mk_opts());
+        let h2 = pool.query(me, a2, mk_opts());
+        let collect = |handle: &QueryHandle| {
+            let mut names = BTreeSet::new();
+            while let Some(batch) = handle.next() {
+                for e in batch.unwrap() {
+                    names.insert(e.name.to_string_lossy().into_owned());
+                }
+            }
+            names
+        };
+        let n1 = collect(&h1);
+        let n2 = collect(&h2);
+        let want1: BTreeSet<String> =
+            ["a", "b"].into_iter().map(String::from).collect();
+        let want2: BTreeSet<String> =
+            ["c"].into_iter().map(String::from).collect();
+        assert_eq!(n1, want1, "d1 listing");
+        assert_eq!(n2, want2, "d2 listing");
+    });
+}
+
+#[test]
+fn pool_copy_file_range_whole() {
+    use truenas_ros::uring_fs::QueryPool;
+
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        let content: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
+        std::fs::write(dir.join("src"), &content).unwrap();
+        std::fs::write(dir.join("dst"), b"").unwrap();
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let src = h
+            .open(me, &anchor, "src", OpenHow::new().flags(OFlag::O_RDONLY))
+            .unwrap();
+        let dst = h
+            .open(me, &anchor, "dst", OpenHow::new().flags(OFlag::O_RDWR))
+            .unwrap();
+        let pool = QueryPool::new(h, 2);
+        // Clones inline on a block-cloning fs, else offloads a byte copy —
+        // either way the bytes land.
+        let n = match pool
+            .copy_file_range(&src, &dst, 0, 0, content.len() as u64)
+            .wait()
+        {
+            Ok(n) => n,
+            Err(_) => return, // fs doesn't support the copy here — skip
+        };
+        assert_eq!(n, content.len() as u64);
+        assert_eq!(std::fs::read(dir.join("dst")).unwrap(), content);
+    });
+}
+
+#[test]
+fn pool_copy_file_range_ranged_offload() {
+    use truenas_ros::uring_fs::QueryPool;
+
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        // src byte i = (i / 100): three 100-byte runs of 0, 1, 2.
+        let content: Vec<u8> = (0..300u32).map(|i| (i / 100) as u8).collect();
+        std::fs::write(dir.join("src"), &content).unwrap();
+        std::fs::write(dir.join("dst"), vec![0xFFu8; 300]).unwrap();
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let src = h
+            .open(me, &anchor, "src", OpenHow::new().flags(OFlag::O_RDONLY))
+            .unwrap();
+        let dst = h
+            .open(me, &anchor, "dst", OpenHow::new().flags(OFlag::O_RDWR))
+            .unwrap();
+        let pool = QueryPool::new(h, 1);
+        // A misaligned sub-block range forces the byte-copy offload path even on
+        // a block-cloning fs: copy src[100..200] -> dst[50..150].
+        let n = match pool.copy_file_range(&src, &dst, 100, 50, 100).wait() {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        assert_eq!(n, 100);
+        let out = std::fs::read(dir.join("dst")).unwrap();
+        assert_eq!(&out[50..150], &content[100..200], "the copied range");
+        assert_eq!(out[49], 0xFF, "before the range: untouched");
+        assert_eq!(out[150], 0xFF, "after the range: untouched");
+    });
 }
 
 /// A uid/gid pair that exists nowhere — no files, no group memberships —
@@ -1000,7 +1298,7 @@ fn group_list_beyond_the_cap_is_rejected_not_truncated() {
     with_broker(|_h, creds, _me, _dir| {
         // Distinct ids: repeating one gid would collapse under the set
         // normalization and no longer exceed the cap.
-        let over: Vec<u32> = (0..=truenas_ros::async_fs::MAX_GROUPS)
+        let over: Vec<u32> = (0..=truenas_ros::uring_fs::MAX_GROUPS)
             .map(|i| 400_000 + i as u32)
             .collect();
         let who = AsUser::new(NOBODY_UID, NOBODY_GID).groups(over);
@@ -1390,7 +1688,7 @@ fn large_ad_group_list_round_trips() {
         return; // setgroups with a foreign list needs CAP_SETGID
     }
     with_broker(|h, creds, _me, dir| {
-        for n in [256usize, 1024, truenas_ros::async_fs::MAX_GROUPS] {
+        for n in [256usize, 1024, truenas_ros::uring_fs::MAX_GROUPS] {
             let groups: Vec<u32> = (0..n as u32).map(|i| 200_000 + i).collect();
             // One of them is the group that will own the file, proving the
             // supplementary list actually reached the kernel intact rather

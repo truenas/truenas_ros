@@ -23,7 +23,7 @@ impl<U> Reactor<U> {
     ) -> errno::Result<()> {
         // The owner tag the fs ops were stamped with at delivery (the full u64
         // generation), read before the `conn` borrow below takes the table.
-        #[cfg(all(feature = "net-server", feature = "async-fs"))]
+        #[cfg(all(feature = "net-server", feature = "uring-fs"))]
         let gen64 = self.table.generation(slot);
         if let Some(conn) = self.table.get_conn_mut(slot) {
             if conn.closing {
@@ -36,7 +36,7 @@ impl<U> Reactor<U> {
             // an fs pool to sweep — a client (or a pool-less server) drains
             // nothing, so recording would grow the Vec unbounded. `fs_closed`
             // is a field disjoint from `self.table` (which `conn` holds).
-            #[cfg(all(feature = "net-server", feature = "async-fs"))]
+            #[cfg(all(feature = "net-server", feature = "uring-fs"))]
             if self.has_fs_pool {
                 self.fs_closed.push((slot, gen64));
             }

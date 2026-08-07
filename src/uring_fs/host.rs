@@ -1,4 +1,4 @@
-//! The standalone host: [`AsyncFs`] owns the engine and the fs core, runs
+//! The standalone host: [`UringFs`] owns the engine and the fs core, runs
 //! the completion loop on its thread, and mints the cross-thread handles.
 //! (The core is host-agnostic — a `net` server is the other host, driving the
 //! same [`FsCore`] on its own ring.)
@@ -81,7 +81,7 @@ pub(crate) fn probe_fixed_file_xattr() -> bool {
     }
 }
 
-/// Sizing for an [`AsyncFs`].
+/// Sizing for an [`UringFs`].
 #[derive(Clone, Copy, Debug)]
 pub struct FsConfig {
     /// Submission-queue depth (rounded up to a power of two by the kernel).
@@ -104,7 +104,7 @@ impl Default for FsConfig {
     }
 }
 
-/// Stops a running [`AsyncFs::run`] loop from any thread.
+/// Stops a running [`UringFs::run`] loop from any thread.
 #[derive(Clone, Debug)]
 pub struct ShutdownHandle {
     shared: Arc<LoopShared>,
@@ -112,7 +112,7 @@ pub struct ShutdownHandle {
 
 impl ShutdownHandle {
     /// Stop the loop: in-flight operations are cancelled (parked callers
-    /// observe `ECANCELED`/`ECONNABORTED`) and [`AsyncFs::run`] returns.
+    /// observe `ECANCELED`/`ECONNABORTED`) and [`UringFs::run`] returns.
     /// Safe to call from any thread and more than once. Infallible: a flag
     /// store plus an eventfd poke.
     pub fn shutdown(&self) {
@@ -121,13 +121,14 @@ impl ShutdownHandle {
     }
 }
 
-/// The standalone fs reactor: one ring, one loop thread, files in a
-/// fixed-descriptor pool, every operation stamped with a [`Personality`].
+/// The standalone fs reactor: one ring, one loop thread, open files as plain
+/// reference-counted fds (`Arc<OwnedFd>`, closed by last reference), every
+/// operation stamped with a [`Personality`].
 ///
 /// Like the `net` roles it is deliberately `!Send` (the ring is
 /// single-thread-owned): build it, mint [`FsHandle`]s/[`ShutdownHandle`]s
-/// for other threads, then park the owning thread in [`AsyncFs::run`].
-pub struct AsyncFs {
+/// for other threads, then park the owning thread in [`UringFs::run`].
+pub struct UringFs {
     // Field order is load-bearing (as in the net roles): `fs` owns every
     // kernel-visible buffer and is declared before `eng`, so those buffers
     // drop before the engine unmaps the ring — the kernel must never touch a
@@ -145,13 +146,13 @@ pub struct AsyncFs {
     eng: Engine,
 }
 
-impl fmt::Debug for AsyncFs {
+impl fmt::Debug for UringFs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AsyncFs").finish_non_exhaustive()
+        f.debug_struct("UringFs").finish_non_exhaustive()
     }
 }
 
-impl Drop for AsyncFs {
+impl Drop for UringFs {
     fn drop(&mut self) {
         // On the normal path `run` already drained, so this is a cheap no-op
         // (nothing in flight → `cancel_and_reap_all` returns at once). On an
@@ -162,12 +163,12 @@ impl Drop for AsyncFs {
     }
 }
 
-impl AsyncFs {
+impl UringFs {
     /// Build the ring, register the sparse fixed-file pool, and probe the
     /// kernel (`OPENAT2` as the canary for the op set). Fails with
     /// `Validation` on an unsupported kernel and with the underlying errno
     /// where io_uring itself is unavailable.
-    pub fn new(cfg: FsConfig) -> crate::Result<AsyncFs> {
+    pub fn new(cfg: FsConfig) -> crate::Result<UringFs> {
         if cfg.files == 0 {
             return Err(crate::Error::Validation(
                 "FsConfig::files must be at least 1".into(),
@@ -186,7 +187,7 @@ impl AsyncFs {
         let eng = Engine::new(cfg.entries, cfg.files)?;
         if !probe_op_supported(&eng.ring, IORING_OP_OPENAT2) {
             return Err(crate::Error::Validation(
-                "async_fs requires io_uring OPENAT2 (Linux >= 5.6); this \
+                "uring_fs requires io_uring OPENAT2 (Linux >= 5.6); this \
                  kernel's io_uring does not support it"
                     .into(),
             ));
@@ -194,8 +195,8 @@ impl AsyncFs {
         let ftruncate_ok = probe_op_supported(&eng.ring, IORING_OP_FTRUNCATE);
         let fd_xattr_ok = probe_fixed_file_xattr();
         let (inject_tx, inject_rx) = mpsc::channel();
-        Ok(AsyncFs {
-            fs: FsCore::new(cfg.ops, 0, cfg.files),
+        Ok(UringFs {
+            fs: FsCore::new(cfg.ops),
             inject_tx,
             inject_rx,
             ftruncate_ok,
@@ -217,7 +218,7 @@ impl AsyncFs {
     }
 
     /// Whether this kernel supports [`FsHandle::fgetxattr`] /
-    /// [`FsHandle::fsetxattr`] on an open [`FixedFile`](super::FixedFile)
+    /// [`FsHandle::fsetxattr`] on an open [`File`](super::File)
     /// (Linux ≥ 6.13 — before that, io_uring rejected a registered-table
     /// file for these ops). Where it is false those two calls return
     /// `EOPNOTSUPP`; everything else in the API works normally.
@@ -247,7 +248,7 @@ impl AsyncFs {
         }
     }
 
-    /// A handle that stops [`AsyncFs::run`] from any thread.
+    /// A handle that stops [`UringFs::run`] from any thread.
     pub fn shutdown_handle(&self) -> ShutdownHandle {
         ShutdownHandle {
             shared: self.eng.shared.clone(),
@@ -257,7 +258,7 @@ impl AsyncFs {
     /// Run the completion loop until a [`ShutdownHandle`] stops it or a
     /// fatal ring error occurs. In-flight operations are cancelled and
     /// drained before returning; parked handle callers are unblocked with
-    /// errors. Terminal: build a fresh `AsyncFs` rather than re-running.
+    /// errors. Terminal: build a fresh `UringFs` rather than re-running.
     pub fn run(&mut self) -> crate::Result<()> {
         self.eng.arm_wake(pack_raw(TAG_WAKE, 0, 0))?;
         let run = self.run_loop();
@@ -330,8 +331,7 @@ impl AsyncFs {
                 FsInject::Rw {
                     tag,
                     pers,
-                    slot,
-                    gen,
+                    file,
                     bufs,
                     off,
                     reply,
@@ -339,34 +339,31 @@ impl AsyncFs {
                     &mut self.eng,
                     tag,
                     pers,
-                    slot,
-                    gen,
+                    file,
                     bufs,
                     off,
                     FsWaiter::Channel(reply),
                 ),
                 FsInject::Fsync {
                     pers,
-                    slot,
-                    gen,
+                    file,
                     datasync,
+                    offset,
+                    length,
                     reply,
                 } => self.fs.submit_fsync(
                     &mut self.eng,
                     pers,
-                    slot,
-                    gen,
+                    file,
                     datasync,
+                    offset,
+                    length,
                     FsWaiter::Channel(reply),
                 ),
-                FsInject::Close { slot, gen, reply } => {
-                    self.fs.submit_close(&mut self.eng, slot, gen, reply)
-                }
                 FsInject::FdMeta {
                     tag,
                     pers,
-                    slot,
-                    gen,
+                    file,
                     name,
                     value,
                     off,
@@ -377,8 +374,7 @@ impl AsyncFs {
                     &mut self.eng,
                     tag,
                     pers,
-                    slot,
-                    gen,
+                    file,
                     name,
                     value,
                     off,
@@ -435,25 +431,27 @@ impl AsyncFs {
 
     fn drain_teardown(&mut self) -> crate::Result<()> {
         let drained = self.drain_or_leak();
-        self.fs.fail_parked();
         while let Ok(msg) = self.inject_rx.try_recv() {
             let (reply, bufs) = match msg {
                 FsInject::Open { reply, .. } => (Some(reply), Vec::new()),
                 FsInject::Rw { reply, bufs, .. } => (Some(reply), bufs),
+                // The pooled lease rides inside `reply` and round-trips (or
+                // returns to the pool) via `ReplyTo::send`.
+                // A late cancel request for an op that is being torn down
+                // anyway: nothing to reply to, nothing to reclaim.
                 FsInject::Fsync { reply, .. } => (Some(reply), Vec::new()),
-                FsInject::Close { reply, .. } => (reply, Vec::new()),
                 FsInject::FdMeta { reply, value, .. } => {
                     (Some(reply), vec![value])
                 }
                 FsInject::PathOp { reply, .. } => (Some(reply), Vec::new()),
             };
             if let Some(reply) = reply {
-                let _ = reply.send(FsOutcome {
-                    res: Err(Errno::ECONNABORTED),
+                let _ = reply.send(FsOutcome::new(
+                    Err(Errno::ECONNABORTED),
                     bufs,
-                    file: None,
-                    stat: None,
-                });
+                    None,
+                    None,
+                ));
             }
         }
         drained?;
@@ -469,7 +467,7 @@ impl AsyncFs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::async_fs::{Anchor, FixedFile, FsConfig, Personality};
+    use crate::uring_fs::{Anchor, FsConfig, Personality};
     use crate::sync_fs::openat2::RawOpenHow;
     use crate::sync_fs::{OFlag, OpenHow};
     use crate::uring::ring::Ring;
@@ -644,10 +642,10 @@ mod tests {
     fn stale_token_and_stale_personality_are_inert() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("f"), b"data").unwrap();
-        let mut afs = match AsyncFs::new(FsConfig::default()) {
+        let mut afs = match UringFs::new(FsConfig::default()) {
             Ok(a) => a,
             Err(crate::Error::Errno(e)) if skip_unavailable(e) => return,
-            Err(e) => panic!("AsyncFs::new: {e}"),
+            Err(e) => panic!("UringFs::new: {e}"),
         };
         let me = afs.register_self().unwrap();
         let h = afs.handle();
@@ -660,18 +658,8 @@ mod tests {
                 let how = OpenHow::new().flags(OFlag::O_RDONLY);
                 let f = h.open(me, &anchor, "f", how).unwrap();
 
-                // Forge a token with a wrong generation: EBADF, and the real
-                // token still works afterwards.
-                let forged = FixedFile {
-                    slot: f.slot,
-                    gen: f.gen.wrapping_add(7),
-                    tx: h.tx.clone(),
-                    shared: h.shared.clone(),
-                    defused: true,
-                };
-                let (res, _b) = h.pread(me, &forged, vec![0u8; 4], 0);
-                assert!(matches!(res, Err(crate::Error::Errno(Errno::EBADF))));
-                drop(forged);
+                // A plain read works (files are real fds now — there is no
+                // stale `{slot, generation}` token left to forge).
                 let (res, buf) = h.pread(me, &f, vec![0u8; 4], 0);
                 assert_eq!(res.unwrap(), 4);
                 assert_eq!(&buf, b"data");
