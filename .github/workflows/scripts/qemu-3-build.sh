@@ -51,7 +51,10 @@ sudo apt-get update
 
 # Packages the VM needs:
 #  - build + run the Rust tests: rustup (the compiler comes from it, below),
-#    gdb (core dumps).
+#    build-essential (rustc shells out to `cc` to link, and openssl-sys's build
+#    script compiles C), gdb (core dumps). Trixie's `cargo` used to supply the C
+#    toolchain transitively — its rustc Depends on gcc, libc-dev and binutils —
+#    but rustup depends on none of that, so name it here.
 #  - fetch + verify the releases: curl, jq, ca-certificates.
 #  - link the kTLS test: pkg-config, libssl-dev. The library is still just
 #    libc + bitflags, but the test profile pulls openssl to put a real TLS
@@ -60,7 +63,7 @@ sudo apt-get update
 #    build dependencies, which is why they outlived the source build here.
 # No ZFS dev packages are needed: the OpenZFS debs below bring the zpool/zfs
 # userland the tests drive.
-sudo apt-get install -y rustup gdb curl jq ca-certificates \
+sudo apt-get install -y rustup build-essential gdb curl jq ca-certificates \
   pkg-config libssl-dev
 
 # Trixie's own rustc/cargo is 1.85, older than this crate's rust-version, so
@@ -177,6 +180,19 @@ echo "$RELEASE" > /home/debian/tn-kernel-release
 echo "Rust toolchain:"
 rustc --version
 cargo --version
+
+# Prove it can *link*, not just report a version. The linker comes from a
+# different package than the compiler, and a missing `cc` otherwise only
+# surfaces at the end of the first real build — after the reboot, in the test
+# step, with the ZFS pool already provisioned around it.
+probe="$(mktemp -d)"
+echo 'fn main() {}' > "$probe/link-probe.rs"
+if ! rustc -o "$probe/link-probe" "$probe/link-probe.rs"; then
+  echo "FATAL: the Rust toolchain cannot link (cc: $(command -v cc || echo 'not found'))."
+  exit 1
+fi
+rm -rf "$probe"
+echo "Toolchain links via $(command -v cc)"
 
 echo "Kernel + OpenZFS installed and truenas_ros staged."
 echo "The zfs.ko module loads after the VM restarts into the TrueNAS kernel."
