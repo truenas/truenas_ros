@@ -87,6 +87,10 @@ echo "=========================================="
 . /etc/profile.d/rust.sh
 cargo --version
 export CARGO_TERM_COLOR=never
+# Frames for any panic in here too. The workflow-level env cannot reach this
+# far — the suite runs over ssh inside the VM — so export it alongside the
+# other test knobs.
+export RUST_BACKTRACE=1
 # The privileged + ZFS-backed tests (ACLs, mount/idmap, open_by_handle_at,
 # fsiter mountpoints) now execute instead of skipping.
 # This VM has a real kernel and runs as root, so an io_uring ring is always

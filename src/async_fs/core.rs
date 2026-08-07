@@ -2030,9 +2030,37 @@ mod cancel_fuzz {
             .unwrap_or(300);
         for seed in 0..seeds {
             // Fresh Engine per run: resets staged SQEs so the ring never fills.
-            let mut eng = Engine::new(RING_ENTRIES, POOL).expect("engine");
+            let mut eng = match Engine::new(RING_ENTRIES, POOL) {
+                Ok(eng) => eng,
+                // The backtrace stops at this `panic!` — the errno was minted
+                // several frames down inside a syscall wrapper — so say what a
+                // stack cannot: which iteration died, whether the bare
+                // `io_uring_setup` + mmaps are what the kernel refused (vs the
+                // pool registration / probe / eventfd after them), and the
+                // memory state behind an ENOMEM.
+                Err(e) => panic!(
+                    "Engine::new failed at seed {seed} of {seeds}: {e:?}\n\
+                     bare Ring::new({RING_ENTRIES}) retried here: {:?}\n{}",
+                    crate::uring::ring::Ring::new(RING_ENTRIES).map(|_| ()),
+                    ring_refused_context(),
+                ),
+            };
             run_one(&mut eng, &anchor, seed);
         }
+    }
+
+    /// What the box had left when a ring was refused. `MemAvailable` covers a
+    /// plain out-of-memory; the buddy lists cover the likelier shape — a
+    /// 1024-entry ring wants an order-4 (64 KiB) contiguous run for its SQE
+    /// array, so all-zero high-order columns mean fragmentation, not exhaustion.
+    fn ring_refused_context() -> String {
+        let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+        let mem = read("/proc/meminfo")
+            .lines()
+            .filter(|l| l.starts_with("Mem") || l.starts_with("Committed"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        format!("{mem}\n{}", read("/proc/buddyinfo").trim_end())
     }
 
     fn run_one(eng: &mut Engine, anchor: &Anchor, seed: u64) {

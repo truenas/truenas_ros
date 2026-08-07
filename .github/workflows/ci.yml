@@ -9,6 +9,11 @@ concurrency:
   group: ci-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
+# Some failures only ever reproduce on the runner, and a bare `panicked at
+# file:line` with no frames is not enough to chase one from a log.
+env:
+  RUST_BACKTRACE: "1"
+
 jobs:
   check:
     name: fmt + clippy + test (unprivileged)
