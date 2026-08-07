@@ -1903,7 +1903,9 @@ fn reply_err(reply: &mpsc::Sender<FsOutcome>, err: Errno) {
 /// in userspace: a real `Engine` is built (so `submit_*`/`on_cqe` have their
 /// `&mut Engine`) but never submitted — staging only writes SQ memory, and the
 /// ring is sized so a single run never fills it, so the kernel never touches a
-/// buffer. A fresh `Engine` per seed resets the staged SQEs.
+/// buffer. One `Engine` serves every seed, its staging cursor rewound between
+/// runs by `Engine::reset_staging`, which asserts nothing was ever submitted —
+/// so the "never enters the kernel" premise is checked, not assumed.
 ///
 /// It exercises the exact hazard SPDK's raw-pointer `user_data` guards against by
 /// synchronous drain (§ reactor-design comparison): a completion arriving for a
@@ -1968,7 +1970,7 @@ mod cancel_fuzz {
                 );
                 None
             }
-            Err(e) => panic!("Engine::new: {e}"),
+            Err(e) => panic!("Engine::new: {e:?} [{}]", ring_refused_context()),
         }
     }
 
@@ -2020,19 +2022,53 @@ mod cancel_fuzz {
 
     #[test]
     fn routing_survives_fuzzed_cancellation() {
-        if engine_or_skip().is_none() {
-            return;
-        }
+        let mut eng = match engine_or_skip() {
+            Some(eng) => eng,
+            None => return,
+        };
         let anchor = Anchor::open("/").expect("open / as anchor");
         let seeds: u64 = std::env::var("CANCEL_FUZZ_SEEDS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(300);
         for seed in 0..seeds {
-            // Fresh Engine per run: resets staged SQEs so the ring never fills.
-            let mut eng = Engine::new(RING_ENTRIES, POOL).expect("engine");
+            // Rewind staging between seeds; asserts no seed reached the kernel.
+            eng.reset_staging();
             run_one(&mut eng, &anchor, seed);
         }
+    }
+
+    /// The budget a refused ring was refused under. Since 6.13 the SQ/CQ and
+    /// SQE regions are charged to `RLIMIT_MEMLOCK` for any process without
+    /// `CAP_IPC_LOCK`, and a 1024-entry ring costs 26 pages (104 KiB) of it,
+    /// so an `ENOMEM` from `io_uring_setup` usually turns on the euid and that
+    /// limit; `MemAvailable` rules out a plain out-of-memory.
+    fn ring_refused_context() -> String {
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` only fills the `rlimit` we hand it.
+        unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rl) };
+        let memlock = if rl.rlim_cur == libc::RLIM_INFINITY {
+            "unlimited".to_string()
+        } else {
+            format!("{} KiB", rl.rlim_cur / 1024)
+        };
+        let avail = std::fs::read_to_string("/proc/meminfo")
+            .unwrap_or_default()
+            .lines()
+            .find(|l| l.starts_with("MemAvailable"))
+            .unwrap_or("MemAvailable: ?")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        format!(
+            "entries={RING_ENTRIES} pool={POOL} euid={euid} \
+             RLIMIT_MEMLOCK={memlock} {avail}"
+        )
     }
 
     fn run_one(eng: &mut Engine, anchor: &Anchor, seed: u64) {

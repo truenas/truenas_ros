@@ -9,6 +9,11 @@ concurrency:
   group: ci-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
+# Some failures only ever reproduce on the runner, and a bare `panicked at
+# file:line` with no frames is not enough to chase one from a log.
+env:
+  RUST_BACKTRACE: "1"
+
 jobs:
   check:
     name: fmt + clippy + test (unprivileged)
@@ -58,6 +63,7 @@ jobs:
           exit 1
         fi
         echo "io_uring available (io_uring_disabled=$disabled)"
+        echo "kernel=$(uname -r) uid=$(id -u) RLIMIT_MEMLOCK=$(ulimit -l) KiB"
 
     # The ZFS-backed and privileged tests skip automatically here (no datasets,
     # unprivileged); the QEMU VM job exercises them for real. Two otherwise-

@@ -50,7 +50,11 @@ cd ~/truenas_ros
 sudo apt-get update
 
 # Packages the VM needs:
-#  - build + run the Rust tests: cargo, gdb (core dumps).
+#  - build + run the Rust tests: rustup (the compiler comes from it, below),
+#    build-essential (rustc shells out to `cc` to link, and openssl-sys's build
+#    script compiles C), gdb (core dumps). Trixie's `cargo` used to supply the C
+#    toolchain transitively — its rustc Depends on gcc, libc-dev and binutils —
+#    but rustup depends on none of that, so name it here.
 #  - fetch + verify the releases: curl, jq, ca-certificates.
 #  - link the kTLS test: pkg-config, libssl-dev. The library is still just
 #    libc + bitflags, but the test profile pulls openssl to put a real TLS
@@ -59,8 +63,36 @@ sudo apt-get update
 #    build dependencies, which is why they outlived the source build here.
 # No ZFS dev packages are needed: the OpenZFS debs below bring the zpool/zfs
 # userland the tests drive.
-sudo apt-get install -y cargo gdb curl jq ca-certificates \
+sudo apt-get install -y rustup build-essential gdb curl jq ca-certificates \
   pkg-config libssl-dev
+
+# Trixie's own rustc/cargo is 1.85, older than this crate's rust-version, so
+# `cargo test` refuses to build anything at all ("rustc 1.85.0 is not supported
+# by the following packages"). Install current stable through rustup instead,
+# matching what the unprivileged CI job builds with.
+#
+# The toolchain has to outlive this shell: the test step runs after a reboot,
+# as root, over a fresh ssh session, so a per-user ~/.rustup would not be there
+# for it. Install into a system-wide RUSTUP_HOME and record that location once,
+# in a profile.d drop-in the test step sources (and an interactive debugging
+# login picks up for free).
+sudo tee /etc/profile.d/rust.sh >/dev/null <<'PROFILE'
+export RUSTUP_HOME=/usr/local/rustup
+PROFILE
+# shellcheck disable=SC1091
+. /etc/profile.d/rust.sh
+sudo env RUSTUP_HOME="$RUSTUP_HOME" \
+  rustup toolchain install stable --profile minimal --no-self-update
+sudo env RUSTUP_HOME="$RUSTUP_HOME" rustup default stable
+
+# Debian's rustup package ships no cargo/rustc of its own (it Conflicts with
+# the packages that own those names), so put the proxies in place by hand:
+# rustup dispatches on argv[0], which makes a symlink named `cargo` the cargo
+# proxy. /usr/local/bin is on the default PATH and on sudo's secure_path, so
+# the test step reaches them with nothing set but RUSTUP_HOME.
+for proxy in cargo rustc rustdoc; do
+  sudo ln -sf /usr/bin/rustup "/usr/local/bin/$proxy"
+done
 
 # Fetch (and verify) the prebuilt OpenZFS debs and the TrueNAS kernel image
 # from their rolling <TRAIN>-nightly releases.
@@ -146,7 +178,21 @@ echo "$RELEASE" > /home/debian/tn-kernel-release
 
 # Sanity-check the Rust toolchain; the tests are built in the test step.
 echo "Rust toolchain:"
+rustc --version
 cargo --version
+
+# Prove it can *link*, not just report a version. The linker comes from a
+# different package than the compiler, and a missing `cc` otherwise only
+# surfaces at the end of the first real build — after the reboot, in the test
+# step, with the ZFS pool already provisioned around it.
+probe="$(mktemp -d)"
+echo 'fn main() {}' > "$probe/link-probe.rs"
+if ! rustc -o "$probe/link-probe" "$probe/link-probe.rs"; then
+  echo "FATAL: the Rust toolchain cannot link (cc: $(command -v cc || echo 'not found'))."
+  exit 1
+fi
+rm -rf "$probe"
+echo "Toolchain links via $(command -v cc)"
 
 echo "Kernel + OpenZFS installed and truenas_ros staged."
 echo "The zfs.ko module loads after the VM restarts into the TrueNAS kernel."

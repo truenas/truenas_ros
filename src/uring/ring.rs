@@ -478,6 +478,34 @@ impl Ring {
         }
         Ok(())
     }
+
+    /// Rewind SQE staging to empty, so a test that only *stages* SQEs can reuse
+    /// one ring across iterations.
+    ///
+    /// Prefer this to a ring per iteration: an io_uring context is freed
+    /// asynchronously (`io_ring_exit_work`), and since 6.13 its SQ/CQ and SQE
+    /// regions are charged to `RLIMIT_MEMLOCK` for any process without
+    /// `CAP_IPC_LOCK` (`io_create_region` -> `__io_account_mem`), released only
+    /// when that deferred free runs. Creating rings faster than they are
+    /// reclaimed therefore hits `ENOMEM` under an unprivileged process's 8 MiB
+    /// limit with memory to spare; root, whose accounting is skipped, does not
+    /// see it.
+    ///
+    /// Sound only because nothing was ever submitted: the kernel advances the
+    /// SQ head solely inside `io_uring_enter`, so with no enter the head is
+    /// still 0 and no staged SQE was ever read. The assert enforces exactly
+    /// that — `to_submit` and `sq_tail` both count every staged SQE, and only
+    /// [`submit`](Ring::submit) parts them.
+    #[cfg(all(test, feature = "async-fs"))]
+    pub(crate) fn reset_staging(&mut self) {
+        assert_eq!(
+            self.to_submit, self.sq_tail,
+            "reset_staging after a submit: the kernel has seen these SQEs"
+        );
+        self.sq_tail = 0;
+        self.to_submit = 0;
+        self.rings.publish_sq_tail(0);
+    }
 }
 
 /// A single io_uring instance owned by one thread.

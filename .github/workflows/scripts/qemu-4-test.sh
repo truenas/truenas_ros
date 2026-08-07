@@ -78,7 +78,19 @@ echo ""
 echo "=========================================="
 echo "Running cargo test --all-features"
 echo "=========================================="
+# qemu-3-build.sh installed current stable under a system-wide RUSTUP_HOME
+# (Trixie's packaged rustc is older than the crate's rust-version) and
+# symlinked rustup's cargo/rustc proxies into /usr/local/bin. The proxies need
+# RUSTUP_HOME to find that toolchain, and this `sudo bash` is not a login
+# shell, so read the drop-in that records it explicitly.
+# shellcheck disable=SC1091
+. /etc/profile.d/rust.sh
+cargo --version
 export CARGO_TERM_COLOR=never
+# Frames for any panic in here too. The workflow-level env cannot reach this
+# far — the suite runs over ssh inside the VM — so export it alongside the
+# other test knobs.
+export RUST_BACKTRACE=1
 # The privileged + ZFS-backed tests (ACLs, mount/idmap, open_by_handle_at,
 # fsiter mountpoints) now execute instead of skipping.
 # This VM has a real kernel and runs as root, so an io_uring ring is always
