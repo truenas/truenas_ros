@@ -63,6 +63,7 @@ jobs:
           exit 1
         fi
         echo "io_uring available (io_uring_disabled=$disabled)"
+        echo "kernel=$(uname -r) uid=$(id -u) RLIMIT_MEMLOCK=$(ulimit -l) KiB"
 
     # The ZFS-backed and privileged tests skip automatically here (no datasets,
     # unprivileged); the QEMU VM job exercises them for real. Two otherwise-

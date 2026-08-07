@@ -177,6 +177,15 @@ impl Engine {
         self.shared.stop.load(Ordering::Acquire)
     }
 
+    /// Rewind SQE staging and the in-flight count, so a staging-only test can
+    /// reuse one engine across iterations. See [`Ring::reset_staging`] for the
+    /// conditions that make the rewind sound.
+    #[cfg(all(test, feature = "async-fs"))]
+    pub(crate) fn reset_staging(&mut self) {
+        self.ring.reset_staging();
+        self.inflight = 0;
+    }
+
     /// Leak the wake landing pad without freeing it. On a failed teardown drain
     /// the armed wake `READ` may still be in flight, and completing it writes 8
     /// bytes into [`Engine::wake_buf`]; leaking keeps that address permanently
