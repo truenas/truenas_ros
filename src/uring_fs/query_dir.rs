@@ -403,16 +403,18 @@ type Job = Box<dyn FnOnce() + Send>;
 /// pickup, so pickup is serialized while the jobs run in parallel. Security is
 /// automatic — a walk opens its directory under its own `who` (the
 /// list-permission check), so `EACCES` surfaces as an error batch.
-pub struct QueryPool {
+/// A fixed pool of worker threads running `Box<dyn FnOnce() + Send>` jobs — the
+/// shared machinery behind both the off-loop [`QueryPool`] helpers and the
+/// on-loop `FsConn::offload` path. Dropping it closes the queue (each worker's
+/// `recv` then returns `Err` and it exits) and joins the workers.
+pub(crate) struct WorkerPool {
     jobs: Option<mpsc::Sender<Job>>,
     workers: Vec<thread::JoinHandle<()>>,
-    h: FsHandle,
 }
 
-impl QueryPool {
-    /// Build a pool of `workers` (at least 1) threads over `h` (cloned cheaply
-    /// per job — the handle just shares the one loop).
-    pub fn new(h: FsHandle, workers: usize) -> QueryPool {
+impl WorkerPool {
+    /// Spawn `workers` (at least 1) threads pulling jobs off a shared queue.
+    pub(crate) fn new(workers: usize) -> WorkerPool {
         let (jobs, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
         let workers = (0..workers.max(1))
@@ -424,19 +426,51 @@ impl QueryPool {
                     .expect("spawn fs worker")
             })
             .collect();
-        QueryPool {
+        WorkerPool {
             jobs: Some(jobs),
             workers,
+        }
+    }
+
+    /// Enqueue `job` (a no-op if the pool is already dropping).
+    pub(crate) fn submit(&self, job: Job) {
+        if let Some(jobs) = &self.jobs {
+            let _ = jobs.send(job);
+        }
+    }
+}
+
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        // Close the queue so each worker's `recv` returns `Err` and exits, then
+        // join them (dropping a `Vec<JoinHandle>` alone only detaches).
+        drop(self.jobs.take());
+        for w in self.workers.drain(..) {
+            let _ = w.join();
+        }
+    }
+}
+
+/// A [`WorkerPool`] bound to an [`FsHandle`] for the off-loop directory-listing
+/// and byte-copy helpers.
+pub struct QueryPool {
+    pool: WorkerPool,
+    h: FsHandle,
+}
+
+impl QueryPool {
+    /// Build a pool of `workers` (at least 1) threads over `h` (cloned cheaply
+    /// per job — the handle just shares the one loop).
+    pub fn new(h: FsHandle, workers: usize) -> QueryPool {
+        QueryPool {
+            pool: WorkerPool::new(workers),
             h,
         }
     }
 
-    /// Enqueue `job` (a no-op if the pool is already dropping — the handle's
-    /// channel is then closed and yields nothing).
+    /// Enqueue `job` (a no-op if the pool is already dropping).
     fn submit(&self, job: Job) {
-        if let Some(jobs) = &self.jobs {
-            let _ = jobs.send(job);
-        }
+        self.pool.submit(job);
     }
 
     /// Enqueue a listing of `dir` as `who` and return immediately. Pull its
@@ -524,21 +558,10 @@ impl QueryPool {
     }
 }
 
-impl Drop for QueryPool {
-    fn drop(&mut self) {
-        // Close the queue so each worker's `recv` returns `Err` and it exits,
-        // then join them (dropping a `Vec<JoinHandle>` alone only detaches).
-        drop(self.jobs.take());
-        for w in self.workers.drain(..) {
-            let _ = w.join();
-        }
-    }
-}
-
 impl fmt::Debug for QueryPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("QueryPool")
-            .field("workers", &self.workers.len())
+            .field("workers", &self.pool.workers.len())
             .finish()
     }
 }

@@ -18,13 +18,14 @@
 //!   `(tag, op-slot, generation)`; an op entry frees only at its own single
 //!   terminal CQE, so a stale / duplicate / wrong-tag completion is rejected.
 
+use super::query_dir::WorkerPool;
 use super::{
     statx_at_flags, Anchor, File, FsOutcome, Leaf, Personality, ReplyTo,
 };
 use crate::errno::Errno;
 use crate::sync_fs::openat2::RawOpenHow;
 use crate::sync_fs::{
-    AtFlags, Mode, OpenHow, RenameFlags, ResolveFlag, Statx, StatxMask,
+    AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, Statx, StatxMask,
     StatxRaw,
 };
 use crate::uring::engine::Engine;
@@ -37,10 +38,19 @@ use crate::uring::sys::{
     IORING_OP_SYMLINKAT, IORING_OP_UNLINKAT, IORING_OP_WRITEV,
 };
 use crate::uring::user_data::{pack_raw, unpack_raw};
+use std::any::Any;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::Arc;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
+/// Worker threads backing [`FsConn::offload`]; the pool is spawned on first use.
+const OFFLOAD_WORKERS: usize = 4;
+/// Names per off-loop `readdir` batch in [`FsConn::next_batch`].
+const DIR_BATCH: usize = 256;
 
 // fs op tags (the 0x80 domain; fs-reactor design §13).
 pub(crate) const TAG_OPEN: u8 = 0x80;
@@ -184,9 +194,33 @@ struct Completed {
 
 /// The fs domain's tables. The host owns the [`Engine`] and passes it in for
 /// staging; completion routing happens in [`FsCore::on_cqe`].
+/// A finished off-loop job awaiting on-loop delivery: `(token, boxed result)`.
+type PoolCompletion = (u64, Box<dyn Any + Send>);
+/// A type-erased on-loop continuation: it downcasts the boxed job result back to
+/// the job's `R` and calls the caller's `on_done` with a fresh `FsConn`.
+type OffloadDeliver = Box<dyn FnOnce(Box<dyn Any + Send>, &mut FsConn<'_>)>;
+/// One drained offload ready to fire: its owner, its continuation, and the
+/// boxed job result to hand it.
+type PoolDelivery = (Owner, OffloadDeliver, Box<dyn Any + Send>);
+
+/// The reactor-side half of an in-flight [`FsConn::offload`]: the owner to scope
+/// the delivering [`FsConn`] to, and the type-erased continuation (it downcasts
+/// the boxed result back to the job's `R` and calls the caller's `on_done`).
+struct OffloadEntry {
+    owner: Owner,
+    deliver: OffloadDeliver,
+}
+
 pub(crate) struct FsCore {
     ops: Vec<SlotEntry<FsOpEntry>>,
     op_free: Vec<u32>,
+    /// The blocking worker pool for [`FsConn::offload`], spawned on first use.
+    pool: Option<WorkerPool>,
+    /// Where workers push finished jobs; drained on the loop's wake.
+    completions: Arc<Mutex<VecDeque<PoolCompletion>>>,
+    /// Reactor-side continuations for in-flight offloads, keyed by token.
+    offload_reg: HashMap<u64, OffloadEntry>,
+    next_offload: u64,
 }
 
 impl FsCore {
@@ -199,7 +233,58 @@ impl FsCore {
                 })
                 .collect(),
             op_free: (0..op_slots).rev().collect(),
+            pool: None,
+            completions: Arc::new(Mutex::new(VecDeque::new())),
+            offload_reg: HashMap::new(),
+            next_offload: 0,
         }
+    }
+
+    // ---- off-loop offload: run a blocking job, deliver its result on-loop ----
+
+    /// Register `deliver` (owner-scoped) for a new offload; returns its token.
+    fn register_offload(
+        &mut self,
+        owner: Owner,
+        deliver: OffloadDeliver,
+    ) -> u64 {
+        let token = self.next_offload;
+        self.next_offload = self.next_offload.wrapping_add(1);
+        self.offload_reg
+            .insert(token, OffloadEntry { owner, deliver });
+        token
+    }
+
+    /// A clone of the completion queue for a worker job to push its result onto.
+    fn completion_sink(&self) -> Arc<Mutex<VecDeque<PoolCompletion>>> {
+        Arc::clone(&self.completions)
+    }
+
+    /// Submit `job` to the offload pool (spawned on first use).
+    fn submit_offload(&mut self, job: Box<dyn FnOnce() + Send>) {
+        self.pool
+            .get_or_insert_with(|| WorkerPool::new(OFFLOAD_WORKERS))
+            .submit(job);
+    }
+
+    /// Take every finished offload paired with its owner + continuation. The
+    /// caller fires each with a fresh owner-scoped [`FsConn`] once its borrow of
+    /// the fs tables has ended (mirrors [`FsCore::on_cqe`]'s hand-back). Called
+    /// from the loop's `TAG_WAKE` handler.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    pub(crate) fn take_pool_completions(&mut self) -> Vec<PoolDelivery> {
+        let drained: Vec<PoolCompletion> = {
+            let mut q =
+                self.completions.lock().unwrap_or_else(|e| e.into_inner());
+            q.drain(..).collect()
+        };
+        let mut out = Vec::with_capacity(drained.len());
+        for (token, any) in drained {
+            if let Some(e) = self.offload_reg.remove(&token) {
+                out.push((e.owner, e.deliver, any));
+            }
+        }
+        out
     }
 
     // ---- submission (from drained injects) -----------------------------
@@ -1442,6 +1527,508 @@ impl<'a> FsConn<'a> {
             len_arg,
             embed(self.owner, on_done),
         );
+    }
+}
+
+// ---- hybrid off-loop listing: threaded readdir + on-loop enrichment --------
+
+/// A `*mut DIR` handed between the reactor and a worker thread. Sound only
+/// because the walk gives it to exactly one thread at a time (reactor -> worker
+/// for a batch, worker -> reactor on delivery) and never shares it concurrently.
+struct SendDir(*mut libc::DIR);
+// SAFETY: single-owner-at-a-time hand-off, never aliased across threads.
+unsafe impl Send for SendDir {}
+
+struct DirWalkInner {
+    /// The open directory. `null` while a readdir batch runs on a worker.
+    dp: *mut libc::DIR,
+    /// A batch job currently holds `dp`.
+    in_flight: bool,
+    /// The `DirWalk` was dropped; the in-flight batch must close `dp`.
+    dropped: bool,
+}
+
+/// A directory being walked by the hybrid lister ([`FsConn::open_dir`] /
+/// [`FsConn::next_batch`]). The reactor holds it while the blocking `readdir`
+/// runs off-loop on the pool; dropping it closes the `DIR*` (deferring to an
+/// in-flight batch's delivery if one is running), so the fd never leaks.
+///
+/// DAC is preserved: the list-permission check ran on the ring under `who` in
+/// `open_dir`; the pool only ever `readdir`s that already-authorized fd.
+#[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+pub struct DirWalk {
+    inner: Rc<RefCell<DirWalkInner>>,
+}
+
+impl std::fmt::Debug for DirWalk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirWalk").finish_non_exhaustive()
+    }
+}
+
+impl Drop for DirWalk {
+    fn drop(&mut self) {
+        let mut b = self.inner.borrow_mut();
+        b.dropped = true;
+        // If no batch job holds the DIR*, close it now; otherwise the batch's
+        // delivery sees `dropped` and closes it when the worker hands it back.
+        if !b.in_flight && !b.dp.is_null() {
+            // SAFETY: a live DIR* from fdopendir, closed exactly once.
+            unsafe { libc::closedir(b.dp) };
+            b.dp = std::ptr::null_mut();
+        }
+    }
+}
+
+/// One batch of raw entry names from a [`DirWalk`].
+#[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+#[derive(Debug)]
+pub struct NameBatch {
+    /// Entry names (one path component each); `.` and `..` are skipped.
+    pub names: Vec<Vec<u8>>,
+    /// True once the directory has been read to the end.
+    pub eod: bool,
+}
+
+impl FsConn<'_> {
+    /// Run `job` on a blocking worker thread, then deliver its result to
+    /// `on_done` **on the reactor thread** with a fresh owner-scoped [`FsConn`].
+    /// The generic escape hatch for work with no io_uring op (readdir,
+    /// `fdopendir`, an ioctl): the reactor stays free while the job runs, and
+    /// the continuation resumes on-loop like any completion callback.
+    pub fn offload<R, J, F>(&mut self, job: J, on_done: F)
+    where
+        J: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+        F: FnOnce(R, &mut FsConn<'_>) + 'static,
+    {
+        let deliver: OffloadDeliver = Box::new(move |any, conn| {
+            // The token pairs this continuation with the job that produced
+            // exactly an `R`, so the downcast cannot mismatch.
+            if let Ok(r) = any.downcast::<R>() {
+                on_done(*r, conn);
+            }
+        });
+        let token = self.fs.register_offload(self.owner, deliver);
+        let sink = self.fs.completion_sink();
+        let wake = Arc::clone(&self.eng.shared);
+        self.fs.submit_offload(Box::new(move || {
+            let r = job();
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back((token, Box::new(r)));
+            // Wake the loop to drain the completion (counting eventfd; the loop
+            // re-arms the READ, so no poke is lost — the inject-path pattern).
+            wake.wake.poke();
+        }));
+    }
+
+    /// Open `anchor` itself readable **under `who`** on the ring (the DAC /
+    /// list-permission check), then `fdopendir` it off-loop; deliver the ready
+    /// [`DirWalk`] to `on_ready` on the reactor thread. Only the request-handler
+    /// facade may open (like [`FsConn::open`]).
+    pub fn open_dir<F>(
+        &mut self,
+        who: Personality,
+        anchor: &Anchor,
+        on_ready: F,
+    ) where
+        F: FnOnce(crate::Result<DirWalk>, &mut FsConn<'_>) + 'static,
+    {
+        let how = OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY);
+        self.open(who, anchor, c".", how, move |done, conn| {
+            match done.file() {
+                Some(dir) => conn.offload(
+                    move || {
+                        // Worker: dup the authorized fd and fdopendir the dup (which
+                        // closedir/readdir then own; `dir` closes its own fd as it
+                        // drops here). No permission re-check — opened under `who`.
+                        // SAFETY: `dir` is a live fd for the dup; fdopendir takes
+                        // ownership of the fresh dup.
+                        let dup = unsafe { libc::dup(dir.as_raw_fd()) };
+                        SendDir(unsafe { libc::fdopendir(dup) })
+                    },
+                    move |sdir: SendDir, conn| {
+                        if sdir.0.is_null() {
+                            on_ready(Err(Errno::last().into()), conn);
+                        } else {
+                            on_ready(
+                                Ok(DirWalk {
+                                    inner: Rc::new(RefCell::new(
+                                        DirWalkInner {
+                                            dp: sdir.0,
+                                            in_flight: false,
+                                            dropped: false,
+                                        },
+                                    )),
+                                }),
+                                conn,
+                            );
+                        }
+                    },
+                ),
+                None => {
+                    let e = done
+                        .result()
+                        .err()
+                        .unwrap_or_else(|| Errno::EIO.into());
+                    on_ready(Err(e), conn);
+                }
+            }
+        });
+    }
+
+    /// Read the next batch of entry names for `walk` off-loop — one job per walk
+    /// (pull-style, natural backpressure) — delivering a [`NameBatch`] to
+    /// `on_batch` on the reactor thread. The per-name enrichment the caller does
+    /// (open + fgetxattr) stays on-loop. Calling again while a batch is still in
+    /// flight yields `EBUSY`.
+    pub fn next_batch<F>(&mut self, walk: &DirWalk, on_batch: F)
+    where
+        F: FnOnce(crate::Result<NameBatch>, &mut FsConn<'_>) + 'static,
+    {
+        // Take the DIR* out for the worker; mark it in flight so a concurrent
+        // Drop defers the close to this batch's delivery.
+        let dp = {
+            let mut b = walk.inner.borrow_mut();
+            if b.in_flight || b.dp.is_null() {
+                drop(b);
+                return on_batch(Err(Errno::EBUSY.into()), self);
+            }
+            b.in_flight = true;
+            std::mem::replace(&mut b.dp, std::ptr::null_mut())
+        };
+        let sdir = SendDir(dp);
+        let inner = Rc::clone(&walk.inner);
+        self.offload(
+            move || {
+                // Force whole-capture of the `Send` wrapper: 2021 disjoint
+                // captures would otherwise capture just its `*mut DIR` field and
+                // make the job `!Send`. Re-binding the whole value pins it.
+                let sdir = sdir;
+                let dp = sdir.0;
+                let mut names = Vec::with_capacity(DIR_BATCH);
+                let mut eod = false;
+                while names.len() < DIR_BATCH {
+                    Errno::clear();
+                    // SAFETY: `dp` is a live DIR*; the returned pointer is valid
+                    // until the next readdir/closedir, copied out immediately.
+                    let ent = unsafe { libc::readdir(dp) };
+                    if ent.is_null() {
+                        eod = true;
+                        break;
+                    }
+                    // SAFETY: `ent` is a valid dirent, NUL-terminated d_name.
+                    let name = unsafe {
+                        CStr::from_ptr((*ent).d_name.as_ptr())
+                            .to_bytes()
+                            .to_vec()
+                    };
+                    if name == b"." || name == b".." {
+                        continue;
+                    }
+                    names.push(name);
+                }
+                (NameBatch { names, eod }, SendDir(dp))
+            },
+            move |(batch, sdir): (NameBatch, SendDir), conn| {
+                let deliver = {
+                    let mut b = inner.borrow_mut();
+                    if b.dropped {
+                        // Walk dropped mid-batch: close the DIR* here and drop
+                        // the batch (the caller is gone).
+                        // SAFETY: live DIR*, closed exactly once.
+                        unsafe { libc::closedir(sdir.0) };
+                        false
+                    } else {
+                        b.dp = sdir.0;
+                        b.in_flight = false;
+                        true
+                    }
+                };
+                if deliver {
+                    on_batch(Ok(batch), conn);
+                }
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+mod hybrid_tests {
+    use super::*;
+    use crate::uring::sys::register_personality;
+    use crate::uring::user_data::TAG_FS_DOMAIN;
+
+    const OWNER0: Owner = Some((0, 0));
+    const XVAL: &[u8] = b"val";
+
+    fn xsum(n: usize) -> u64 {
+        n as u64 * XVAL.iter().map(|&b| b as u64).sum::<u64>()
+    }
+
+    fn setup() -> (Engine, FsCore, Personality) {
+        let eng = Engine::new(256, 128).expect("engine");
+        let fs = FsCore::new(256);
+        let me = Personality(
+            register_personality(eng.ring.raw_fd()).expect("personality"),
+        );
+        (eng, fs, me)
+    }
+
+    /// Build a fresh owner-scoped `FsConn`, run `kickoff` on it, then drive the
+    /// loop — firing embedded completions and pool deliveries, re-arming the
+    /// wake — until `done`. Mirrors the standalone host's run_loop.
+    fn drive(
+        eng: &mut Engine,
+        fs: &mut FsCore,
+        kickoff: impl FnOnce(&mut FsConn<'_>),
+        done: impl Fn() -> bool,
+    ) {
+        eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm_wake");
+        {
+            let mut c = FsConn::new(fs, eng, OWNER0, true, false, true);
+            kickoff(&mut c);
+        }
+        let mut guard = 0u32;
+        while !done() {
+            guard += 1;
+            assert!(guard < 5_000_000, "reactor stalled");
+            eng.ring.submit_and_wait(1).expect("submit_and_wait");
+            let mut cqes = Vec::new();
+            while let Some(cqe) = eng.ring.reap() {
+                cqes.push(cqe);
+            }
+            for cqe in cqes {
+                let (tag, slot, g) = unpack_raw(cqe.user_data);
+                if tag == TAG_WAKE {
+                    eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm");
+                    for (o, deliver, any) in fs.take_pool_completions() {
+                        let mut c = FsConn::new(fs, eng, o, true, false, true);
+                        deliver(any, &mut c);
+                    }
+                    continue;
+                }
+                if tag == TAG_CANCEL || tag & TAG_FS_DOMAIN == 0 {
+                    continue;
+                }
+                if let Some((cb, d, o)) = fs.on_cqe(eng, tag, slot, g, cqe.res)
+                {
+                    let mut c = FsConn::new(fs, eng, o, true, false, true);
+                    cb(d, &mut c);
+                }
+            }
+        }
+    }
+
+    fn fixture(n: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..n {
+            let p = dir.path().join(format!("f{i}"));
+            std::fs::write(&p, b"x").unwrap();
+            let cp = CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: valid path / name / value + len.
+            let r = unsafe {
+                libc::setxattr(
+                    cp.as_ptr(),
+                    c"user.bench".as_ptr(),
+                    XVAL.as_ptr().cast(),
+                    XVAL.len(),
+                    0,
+                )
+            };
+            assert_eq!(r, 0, "setxattr");
+        }
+        dir
+    }
+
+    #[test]
+    fn offload_delivers_result_on_loop() {
+        let (mut eng, mut fs, _me) = setup();
+        let got: Rc<RefCell<Option<u64>>> = Rc::new(RefCell::new(None));
+        let g2 = got.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                c.offload(|| 6u64 * 7, move |r, _c| *g2.borrow_mut() = Some(r));
+            },
+            || got.borrow().is_some(),
+        );
+        assert_eq!(*got.borrow(), Some(42));
+    }
+
+    #[test]
+    fn wake_drain_fires_every_completion() {
+        let (mut eng, mut fs, _me) = setup();
+        let count: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+        let c2 = count.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                for _ in 0..8 {
+                    let c3 = c2.clone();
+                    c.offload(|| (), move |(), _c| *c3.borrow_mut() += 1);
+                }
+            },
+            || *count.borrow() == 8,
+        );
+        assert_eq!(*count.borrow(), 8);
+    }
+
+    #[test]
+    fn dirwalk_drop_closes_the_dir() {
+        let (mut eng, mut fs, me) = setup();
+        let dir = fixture(3);
+        let anchor = Anchor::open(dir.path()).unwrap();
+        let captured: Rc<RefCell<Option<Rc<RefCell<DirWalkInner>>>>> =
+            Rc::new(RefCell::new(None));
+        let cap2 = captured.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                c.open_dir(me, &anchor, move |res, _c| {
+                    let walk = res.expect("open_dir");
+                    // Snapshot the inner, then drop `walk` at the end of this
+                    // closure (no batch in flight → Drop closes the DIR* now).
+                    *cap2.borrow_mut() = Some(walk.inner.clone());
+                });
+            },
+            || captured.borrow().is_some(),
+        );
+        let inner = captured.borrow().as_ref().unwrap().clone();
+        assert!(inner.borrow().dropped, "walk Drop ran");
+        assert!(
+            inner.borrow().dp.is_null(),
+            "DIR* closed on drop, not leaked"
+        );
+    }
+
+    struct ListState {
+        me: Personality,
+        anchor: Anchor,
+        walk: Option<DirWalk>,
+        pending: VecDeque<Vec<u8>>,
+        eod: bool,
+        seen: usize,
+        sum: u64,
+        finished: bool,
+    }
+    type ListRef = Rc<RefCell<ListState>>;
+
+    /// Pull the next batch of names for `st`'s walk (one job at a time).
+    fn request_batch(st: &ListRef, conn: &mut FsConn<'_>) {
+        let st2 = st.clone();
+        let b = st.borrow();
+        let walk = b.walk.as_ref().expect("walk");
+        conn.next_batch(walk, move |res, conn| {
+            let batch = res.expect("batch");
+            {
+                let mut s = st2.borrow_mut();
+                s.pending.extend(batch.names);
+                s.eod = batch.eod;
+            }
+            enrich_next(&st2, conn);
+        });
+    }
+
+    /// Enrich the next pending name on-loop (open + fgetxattr), <= 1 op in
+    /// flight; pull the next batch when the current one drains, finish at eod.
+    fn enrich_next(st: &ListRef, conn: &mut FsConn<'_>) {
+        let name = st.borrow_mut().pending.pop_front();
+        let Some(name) = name else {
+            let eod = st.borrow().eod;
+            if eod {
+                st.borrow_mut().finished = true;
+            } else {
+                request_batch(st, conn);
+            }
+            return;
+        };
+        let (me, anchor) = {
+            let b = st.borrow();
+            (b.me, b.anchor.clone())
+        };
+        let how = OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_NOFOLLOW);
+        let cname = CString::new(name).unwrap();
+        let st2 = st.clone();
+        conn.open(me, &anchor, &cname, how, move |done, conn| {
+            let Some(f) = done.file() else {
+                return enrich_next(&st2, conn);
+            };
+            let me = st2.borrow().me;
+            let st3 = st2.clone();
+            conn.fgetxattr(
+                me,
+                f,
+                c"user.bench",
+                vec![0u8; 64],
+                move |done, conn| {
+                    if let Ok(nb) = done.result() {
+                        let nb = nb as usize;
+                        let bufs = done.into_bufs();
+                        let mut s = st3.borrow_mut();
+                        s.seen += 1;
+                        if let Some(v) = bufs.first() {
+                            for &x in &v[..nb.min(v.len())] {
+                                s.sum += x as u64;
+                            }
+                        }
+                    }
+                    enrich_next(&st3, conn);
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn hybrid_listing_enriches_every_entry() {
+        let (mut eng, mut fs, me) = setup();
+        let n = 40usize;
+        let dir = fixture(n);
+        let anchor = Anchor::open(dir.path()).unwrap();
+        const CLIENTS: usize = 3;
+        let states: Vec<ListRef> = (0..CLIENTS)
+            .map(|_| {
+                Rc::new(RefCell::new(ListState {
+                    me,
+                    anchor: anchor.clone(),
+                    walk: None,
+                    pending: VecDeque::new(),
+                    eod: false,
+                    seen: 0,
+                    sum: 0,
+                    finished: false,
+                }))
+            })
+            .collect();
+        let kick = states.clone();
+        let check = states.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                for st in &kick {
+                    let st2 = st.clone();
+                    let (me, anchor) = {
+                        let b = st.borrow();
+                        (b.me, b.anchor.clone())
+                    };
+                    c.open_dir(me, &anchor, move |res, c| {
+                        st2.borrow_mut().walk = Some(res.expect("open_dir"));
+                        request_batch(&st2, c);
+                    });
+                }
+            },
+            move || check.iter().all(|s| s.borrow().finished),
+        );
+        for s in &states {
+            let b = s.borrow();
+            assert_eq!(b.seen, n, "every entry enriched");
+            assert_eq!(b.sum, xsum(n), "xattr values correct");
+        }
     }
 }
 
