@@ -22,7 +22,7 @@ bitflags = "2.6"
 # loom (a concurrency permutation checker) backs the SQ/CQ ordering test in
 # src/uring/ring.rs. Pulled ONLY under `--cfg loom`, so normal builds keep the
 # libc+bitflags charter untouched.
-#   Run: RUSTFLAGS="--cfg loom" cargo test --lib --features async-fs sq_cq
+#   Run: RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs sq_cq
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
@@ -55,7 +55,7 @@ shutil = ["fsiter", "xattr"]
 configfile = ["sync-fs"]
 # The shared io_uring engine (`src/uring`): raw UAPI, ring, SQE staging,
 # wake, slot generations, the user_data codec. Internal — enabled transitively
-# by the domains built on it (the net stack today, async-fs next); not a
+# by the domains built on it (the net stack today, uring-fs next); not a
 # public API surface.
 uring = []
 # io_uring stream networking. `net-core` is the stream reactor + vocab over
@@ -73,7 +73,7 @@ net-client = ["net-core"]
 # rather than something `full` turns on underneath a consumer. Depends on
 # `sync-fs` for the shared OpenHow/ResolveFlag vocabulary; combine with
 # `net-server` for the in-server reactor (`ServerConfig::fs_files`).
-async-fs = ["uring", "sync-fs"]
+uring-fs = ["uring", "sync-fs"]
 # Internal: exposes the pure `frame_step` framing decision to the fuzz crate
 # (`fuzz/`). Not for consumers; implies `net-server` (where `frame_step` lives).
 __fuzz = ["net-server"]
@@ -142,8 +142,8 @@ path = "test/net_client.rs"
 # io_uring is unavailable (sandbox/old kernel). Set
 # TRUENAS_ROS_REQUIRE_IO_URING=1 to make that a hard failure instead.
 [[test]]
-name = "async_fs"
-path = "test/async_fs.rs"
+name = "uring_fs"
+path = "test/uring_fs.rs"
 
 # Consumer-facing example: the `net::server` handlers (esp. `accept`) as
 # standalone functions. Built only when the `net-server` feature is on.

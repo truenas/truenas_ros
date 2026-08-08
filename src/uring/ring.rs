@@ -354,27 +354,10 @@ impl Ring {
         register_file_alloc_range(self.raw_fd(), 0, count)
     }
 
-    /// Register a sparse table of `pool + fs` slots but confine
-    /// auto-allocation to just `[0, pool)` — the connection pool. The upper
-    /// `[pool, pool + fs)` range is handed out at **explicit** indices by the
-    /// embedded fs reactor, so multishot accept (which auto-allocates at each
-    /// completion) can never land there, and a burst of file opens can never
-    /// starve accepts. One table, two disjoint index ranges (fs-reactor
-    /// design §4).
-    #[cfg(all(feature = "net-server", feature = "async-fs"))]
-    pub(crate) fn register_pool_with_fs(
-        &self,
-        pool: u32,
-        fs: u32,
-    ) -> errno::Result<()> {
-        register_files_sparse(self.raw_fd(), pool + fs)?;
-        register_file_alloc_range(self.raw_fd(), 0, pool)
-    }
-
     /// Install a connected socket `fd` into the pool at `slot` (client-side; the
     /// server's pool fills via multishot-accept auto-allocation). The kernel
     /// takes its own reference, so `fd` may be closed after this returns.
-    #[cfg(any(feature = "net-client", feature = "async-fs"))]
+    #[cfg(any(feature = "net-client", feature = "uring-fs"))]
     pub(crate) fn install_file(
         &self,
         slot: u32,
@@ -496,7 +479,7 @@ impl Ring {
     /// still 0 and no staged SQE was ever read. The assert enforces exactly
     /// that — `to_submit` and `sq_tail` both count every staged SQE, and only
     /// [`submit`](Ring::submit) parts them.
-    #[cfg(all(test, feature = "async-fs"))]
+    #[cfg(all(test, feature = "uring-fs"))]
     pub(crate) fn reset_staging(&mut self) {
         assert_eq!(
             self.to_submit, self.sq_tail,
@@ -596,7 +579,7 @@ unsafe fn field_ptr<T>(base: *mut u8, off: u32) -> *mut T {
 // loom model of the SQ/CQ ordering discipline
 // ---------------------------------------------------------------------------
 //
-// Run with:  RUSTFLAGS="--cfg loom" cargo test --lib --features async-fs sq_cq
+// Run with:  RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs sq_cq
 //
 // The test drives the SAME `SqCqRings` accessors the production ring uses
 // (`try_reserve`/`fill_sqe`/`advance`/`reap`) on a user thread, against a

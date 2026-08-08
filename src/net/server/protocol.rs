@@ -136,12 +136,12 @@ pub struct Request<'a, U> {
     /// The request-bound fs submission facade — `Some` when the server was
     /// built with an fs pool (`ServerConfig::fs_files`), else `None`. Take it
     /// (`req.fs.take()`) to open/read/stat files on the server's own ring under
-    /// a per-request [`Personality`](crate::async_fs::Personality): the first
+    /// a per-request [`Personality`](crate::uring_fs::Personality): the first
     /// op parks the request through a [`Deferred`](Responder::defer) the
     /// callback captures, so pair it with `Response::Defer`. Present only with
-    /// the `async-fs` feature.
-    #[cfg(feature = "async-fs")]
-    pub fs: Option<crate::async_fs::FsConn<'a>>,
+    /// the `uring-fs` feature.
+    #[cfg(feature = "uring-fs")]
+    pub fs: Option<crate::uring_fs::FsConn<'a>>,
 }
 
 impl<U> std::fmt::Debug for Request<'_, U> {

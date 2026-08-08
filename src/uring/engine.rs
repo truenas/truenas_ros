@@ -46,21 +46,6 @@ impl Engine {
         })
     }
 
-    /// Like [`Engine::new`], but registers one shared table of
-    /// `pool_slots + fs_slots` with the auto-allocation range confined to the
-    /// connection pool `[0, pool_slots)` — the embedded fs reactor owns the
-    /// upper range at explicit indices ([`Ring::register_pool_with_fs`]).
-    #[cfg(all(feature = "net-server", feature = "async-fs"))]
-    pub(crate) fn new_with_fs(
-        entries: u32,
-        pool_slots: u32,
-        fs_slots: u32,
-    ) -> crate::Result<Engine> {
-        Self::assemble(Ring::new(entries)?, |ring| {
-            ring.register_pool_with_fs(pool_slots, fs_slots)
-        })
-    }
-
     fn assemble(
         ring: Ring,
         register: impl FnOnce(&Ring) -> errno::Result<()>,
@@ -180,7 +165,7 @@ impl Engine {
     /// Rewind SQE staging and the in-flight count, so a staging-only test can
     /// reuse one engine across iterations. See [`Ring::reset_staging`] for the
     /// conditions that make the rewind sound.
-    #[cfg(all(test, feature = "async-fs"))]
+    #[cfg(all(test, feature = "uring-fs"))]
     pub(crate) fn reset_staging(&mut self) {
         self.ring.reset_staging();
         self.inflight = 0;

@@ -35,7 +35,7 @@ truenas_ros = { version = "0.1", default-features = false, features = ["sync-fs"
 
 An io_uring stack lives alongside the blocking bindings, off by default:
 `net-server` / `net-client` (stream roles over a shared reactor core, with
-kernel-TLS, splice, and peer-credential support) and `async-fs` (a filesystem
+kernel-TLS, splice, and peer-credential support) and `uring-fs` (a filesystem
 reactor with per-op credential impersonation — currently a design stub). Both
 sit on the internal `uring` engine feature; see the crate docs.
 

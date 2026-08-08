@@ -16,7 +16,7 @@
 //! ```text
 //! main (single-threaded)            broker (cloned child, keeps CAP_SETUID)
 //! ──────────────────────            ──────────────────────────────────────
-//! AsyncFs::new()  → ring fd
+//! UringFs::new()  → ring fd
 //! socketpair(SEQPACKET)
 //! clone3() ─────────────────────►   inherits the ring fds; closes all else
 //! drop CAP_SETUID/CAP_SETGID        loop: recv
@@ -83,7 +83,7 @@
 //!   `CAP_DAC_OVERRIDE` — the kernel's own permission checks then bind the
 //!   daemon exactly as they would bind the user.
 
-use super::{AsyncFs, Personality};
+use super::{Personality, UringFs};
 use crate::errno::{self, retry_on_eintr, Errno};
 use std::ffi::c_void;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -255,14 +255,14 @@ impl CredHandle {
     /// is the unprivileged path.
     ///
     /// Registering `uid == 0` is refused: the daemon's own identity comes
-    /// from [`AsyncFs::register_self`], and a root personality — which
+    /// from [`UringFs::register_self`], and a root personality — which
     /// would carry the daemon's capabilities — is exactly what this design
     /// exists to avoid.
     pub fn register(&self, who: &AsUser) -> crate::Result<Personality> {
         if who.uid == 0 {
             return Err(crate::Error::Validation(
                 "refusing to register a personality for uid 0; use \
-                 AsyncFs::register_self for the daemon's own identity"
+                 UringFs::register_self for the daemon's own identity"
                     .into(),
             ));
         }
@@ -360,8 +360,8 @@ impl Lease {
 /// to per-identity.
 ///
 /// ```no_run
-/// # use truenas_ros::async_fs::{AsUser, AsyncFs, CredBroker, FsConfig, IdentityCache};
-/// # let afs = AsyncFs::new(FsConfig::default())?;
+/// # use truenas_ros::uring_fs::{AsUser, UringFs, CredBroker, FsConfig, IdentityCache};
+/// # let afs = UringFs::new(FsConfig::default())?;
 /// # let broker = CredBroker::spawn(&[&afs])?;
 /// let cache = IdentityCache::new(broker.handle(0)?);
 ///
@@ -511,7 +511,7 @@ impl IdentityCache {
 
 /// A reactor whose io_uring ring a [`CredBroker`] registers personalities on.
 ///
-/// Implemented by the standalone [`AsyncFs`] and by a `net` server built with
+/// Implemented by the standalone [`UringFs`] and by a `net` server built with
 /// an fs pool — so a server can act as *authenticated peers* on its own ring,
 /// the fs ops and net ops interleaving there (fs ops carry a registered
 /// personality, net ops carry 0).
@@ -526,7 +526,7 @@ pub trait BrokerReactor {
     fn broker_ring_fd(&self) -> RawFd;
 }
 
-impl BrokerReactor for AsyncFs {
+impl BrokerReactor for UringFs {
     fn broker_ring_fd(&self) -> RawFd {
         self.ring_fd()
     }
@@ -542,7 +542,7 @@ impl CredBroker {
     /// 1. **Every ring must already exist.** The broker registers on the
     ///    fds it inherits at `fork`, and there is no way to hand it one
     ///    afterwards: since Linux 6.8 an io_uring fd cannot be sent over a
-    ///    unix socket (`SCM_RIGHTS` → `EINVAL`). Build every [`AsyncFs`]
+    ///    unix socket (`SCM_RIGHTS` → `EINVAL`). Build every [`UringFs`]
     ///    first, then spawn one broker with all of them.
     /// 2. **Call this before starting any threads.** Not a style
     ///    preference — a `fork` without `exec` keeps only the calling
@@ -601,7 +601,7 @@ impl CredBroker {
         //     fork-without-exec soundness hazard);
         //   * CLONE_PIDFD gives a race-free pidfd for supervision/reap;
         //   * exit_signal 0 means the broker's death sends NO SIGCHLD to the
-        //     host — async_fs is a library and must not disturb the consumer's
+        //     host — uring_fs is a library and must not disturb the consumer's
         //     own child reaping (the pidfd carries death instead).
         // Same single-threaded-at-spawn precondition as fork (sharper, even:
         // a raw clone3 has no glibc atfork net — see `crate::clone3`).
@@ -655,7 +655,7 @@ impl CredBroker {
         })
     }
 
-    /// The handle for ring `index` — the position of that [`AsyncFs`] in
+    /// The handle for ring `index` — the position of that [`UringFs`] in
     /// the slice passed to [`CredBroker::spawn`].
     pub fn handle(&self, index: u8) -> crate::Result<CredHandle> {
         if usize::from(index) >= self.inner.rings {

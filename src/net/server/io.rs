@@ -127,12 +127,12 @@ where
             // disjoint from `self.core.table` (which `conn` holds) and
             // `self.handlers`, so all three borrows coexist for the handler
             // call. `None` when no fs pool was configured.
-            #[cfg(feature = "async-fs")]
+            #[cfg(feature = "uring-fs")]
             let (fd_xattr_ok, ftruncate_ok) =
                 (self.fd_xattr_ok, self.ftruncate_ok);
-            #[cfg(feature = "async-fs")]
+            #[cfg(feature = "uring-fs")]
             let fs = self.fs.as_mut().map(|fc| {
-                crate::async_fs::core::FsConn::new(
+                crate::uring_fs::core::FsConn::new(
                     fc,
                     &mut self.core.engine,
                     Some((slot, gen64)),
@@ -149,7 +149,7 @@ where
                     peer,
                     state,
                     responder,
-                    #[cfg(feature = "async-fs")]
+                    #[cfg(feature = "uring-fs")]
                     fs,
                 }),
                 req_id,

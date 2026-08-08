@@ -2,43 +2,42 @@
 //! kernel-enforced per-operation identity.
 //!
 //! This is the asynchronous counterpart of [`crate::sync_fs`], built on the
-//! same shared engine (`uring`) the `net` roles drive. Files open **directly
-//! into a fixed-descriptor pool** (no process fd is ever materialized) and
-//! every data op runs against that pool slot. Two rules shape the whole API:
+//! crate's shared io_uring engine (`uring`). An open returns a **real process
+//! fd wrapped in an `Arc<OwnedFd>`** (closed by its last reference) and every
+//! data op runs against that fd. Two rules shape the whole API:
 //!
 //! - **Personality is mandatory.** Every consumer-staged operation carries a
 //!   [`Personality`] — a kernel-registered credential snapshot stamped into
 //!   the SQE, under which the kernel itself performs its permission checks
 //!   (`override_creds` around issue, io-wq included). There is no
 //!   ambient-identity variant: the daemon's own identity is minted like any
-//!   other via [`AsyncFs::register_self`], and `sqe.personality = 0` (the
+//!   other via [`UringFs::register_self`], and `sqe.personality = 0` (the
 //!   ring owner's ambient creds) is unreachable from this API. Only
 //!   [`FsHandle::close`] is exempt — teardown consults no credentials and
-//!   must be stageable from [`FixedFile`]'s `Drop`.
+//!   must be stageable from [`File`]'s `Drop`.
 //! - **Resolution is anchored.** No call takes an absolute path. [`Anchor`]
 //!   is a long-lived real directory fd; `open` resolves a **relative**,
 //!   multi-component path against it (confine it in-kernel with
 //!   [`ResolveFlag::RESOLVE_BENEATH`](crate::sync_fs::ResolveFlag)), and
-//!   every subsequent operation is fd-based on the opened [`FixedFile`].
+//!   every subsequent operation is fd-based on the opened [`File`].
 //!
 //! # Consumer shape
 //!
-//! There are two ways in, sharing one core. **Standalone** ([`AsyncFs`]) owns
-//! its own ring and loop; **embedded** puts the same reactor on a `net`
-//! server's ring, so a protocol handler does its filesystem work inline —
-//! that is [`FsConn`], reached through `Request::fs`, and it is described
-//! under [Embedding in a server](#embedding-in-a-server) below.
+//! **Standalone** ([`UringFs`]) owns its own ring and loop. The core is
+//! host-agnostic: an embedding host can drive the same core on its own ring
+//! via [`FsConn`] callbacks — under the `net-server` feature the io_uring net
+//! server does this, interleaving fs and socket ops on one ring.
 //!
-//! The standalone loop is synchronous and single-threaded ([`AsyncFs::run`],
-//! `!Send` like the net roles); concurrency comes from the ring. Off-loop
+//! The standalone loop is synchronous and single-threaded ([`UringFs::run`],
+//! `!Send`); concurrency comes from the ring. Off-loop
 //! callers use the `Send + Sync` [`FsHandle`], whose blocking calls submit over
 //! an inject channel and park on a per-call reply channel:
 //!
 //! ```no_run
-//! use truenas_ros::async_fs::{Anchor, AsyncFs, FsConfig};
+//! use truenas_ros::uring_fs::{Anchor, UringFs, FsConfig};
 //! use truenas_ros::sync_fs::{OFlag, OpenHow};
 //!
-//! let mut afs = AsyncFs::new(FsConfig::default())?;
+//! let mut afs = UringFs::new(FsConfig::default())?;
 //! let me = afs.register_self()?; // the daemon's own creds, as an explicit id
 //! let handle = afs.handle();
 //! let stop = afs.shutdown_handle();
@@ -70,9 +69,9 @@
 //! — [`pread`](FsHandle::pread)/[`pwrite`](FsHandle::pwrite) and their
 //! vectored [`preadv`](FsHandle::preadv)/[`pwritev`](FsHandle::pwritev)
 //! forms take an explicit file offset, exactly as `pread(2)`/`pwritev(2)` do.
-//! Every data op here is positional: a fixed-table file has no user-visible
-//! file position to advance, so there is no offsetless `read`/`write` and no
-//! `seek`. The **`at`** suffix is reserved for its usual meaning, the
+//! Every data op here is positional: ops carry their own offset rather than
+//! advance a shared file position, so there is no offsetless `read`/`write`
+//! and no `seek`. The **`at`** suffix is reserved for its usual meaning, the
 //! dirfd-relative syscall family ([`renameat`](FsHandle::renameat),
 //! [`unlinkat`](FsHandle::unlinkat), [`mkdirat`](FsHandle::mkdirat), …), where
 //! the anchor dirfd is what the name refers to.
@@ -82,17 +81,17 @@
 //! The API is fd-first, so that `open → metadata → close` is the natural
 //! shape and a file is named exactly once:
 //!
-//! - **On an open [`FixedFile`]:** [`preadv`](FsHandle::preadv) /
+//! - **On an open [`File`]:** [`preadv`](FsHandle::preadv) /
 //!   [`pwritev`](FsHandle::pwritev) (+ the `pread`/`pwrite` k=1 forms),
 //!   [`fsync`](FsHandle::fsync) / [`fdatasync`](FsHandle::fdatasync),
 //!   [`fgetxattr`](FsHandle::fgetxattr) / [`fsetxattr`](FsHandle::fsetxattr),
 //!   [`ftruncate`](FsHandle::ftruncate), [`fallocate`](FsHandle::fallocate),
 //!   and [`close`](FsHandle::close).
-//! - **The one exception, [`statx`](FsHandle::statx):** it resolves a name
-//!   against an anchor, because *no* kernel offers statx on a
-//!   registered-table file — io_uring's `STATX` rejects fixed files
-//!   outright. [`statx_anchor`](FsHandle::statx_anchor) is the closest
-//!   fd-based form (`AT_EMPTY_PATH` on the anchor's own dirfd).
+//! - **[`statx`](FsHandle::statx)** resolves a name against an anchor; for an
+//!   already-open file, [`fstatx`](FsHandle::fstatx) stats it directly
+//!   (`STATX` with `AT_EMPTY_PATH` on the plain fd — the `fstat` equivalent),
+//!   as does [`statx_anchor`](FsHandle::statx_anchor) for an anchor's own
+//!   dirfd.
 //! - **Directory entries** — [`mkdirat`](FsHandle::mkdirat),
 //!   [`unlinkat`](FsHandle::unlinkat), [`rmdirat`](FsHandle::rmdirat),
 //!   [`renameat`](FsHandle::renameat), [`symlinkat`](FsHandle::symlinkat),
@@ -102,24 +101,24 @@
 //!
 //! Two operations depend on the kernel version and are probed at
 //! construction rather than assumed: fd-based xattr needs Linux ≥ 6.13
-//! ([`AsyncFs::supports_fd_xattr`]) and `ftruncate` needs ≥ 6.9
-//! ([`AsyncFs::supports_ftruncate`]); both return `EOPNOTSUPP` where
+//! ([`UringFs::supports_fd_xattr`]) and `ftruncate` needs ≥ 6.9
+//! ([`UringFs::supports_ftruncate`]); both return `EOPNOTSUPP` where
 //! unavailable instead of failing construction.
 //!
 //! # Acting as other users
 //!
-//! [`AsyncFs::register_self`] mints the daemon's own identity. To act as an
+//! [`UringFs::register_self`] mints the daemon's own identity. To act as an
 //! *authenticated peer*, use the [`CredBroker`] — a tiny forked process
 //! that impersonates a user just long enough to snapshot their credentials,
 //! so the reactor process never changes identity itself:
 //!
 //! ```no_run
-//! use truenas_ros::async_fs::{AsUser, AsyncFs, CredBroker, FsConfig};
+//! use truenas_ros::uring_fs::{AsUser, UringFs, CredBroker, FsConfig};
 //!
 //! // Every ring first, then the broker (it inherits the ring fds), then
 //! // threads. Both halves of that ordering are load-bearing — see
 //! // `CredBroker::spawn`.
-//! let afs = AsyncFs::new(FsConfig::default())?;
+//! let afs = UringFs::new(FsConfig::default())?;
 //! let broker = CredBroker::spawn(&[&afs])?; // main loses CAP_SETUID here
 //! let creds = broker.handle(0)?;
 //!
@@ -136,51 +135,37 @@
 //! wrap the broker in an [`IdentityCache`] to register once per *identity*
 //! rather than once per connection.
 //!
-//! # Embedding in a server
+//! # Embedding in another host
 //!
-//! The same core also runs on a `net` server's own ring, which is how a
-//! protocol handler does filesystem work without leaving the loop: build the
-//! server with `ServerConfig::fs_files` set, and each request arrives with an
-//! [`FsConn`] in `Request::fs`. Take it, park the request with
-//! `Responder::defer`, and submit — the completion fires **in the loop**, and
-//! the callback either chains the next op on the [`FsConn`] it is handed or
-//! resolves the request through the `Deferred` it captured. fs and net SQEs
-//! interleave on the one ring; there is no thread hop and no second reactor.
-//!
-//! Three differences from the off-loop [`FsHandle`] are worth knowing:
-//!
-//! - An open yields an [`FsFile`], not a [`FixedFile`]: `Copy`, no `Drop`, and
-//!   it **remembers the personality it was opened under**, so every later
-//!   fd-op on it runs as that identity without a per-op argument
-//!   ([`FsFile::as_root`] is the one deliberate exception). Close it in the
-//!   chain; a connection that dies mid-chain has its files reclaimed by the
-//!   close sweep.
-//! - Only the request-handler facade may [`open`](FsConn::open). A completion
-//!   callback's facade refuses it — see [`FsConn::open`].
-//! - Nothing returns an error to the caller: a submission or argument failure
-//!   drops the callback, and dropping the `Deferred` it captured closes the
-//!   connection. Operation failures (`ENOENT`, `EACCES`) arrive normally, in
-//!   the callback's [`FsDone`].
+//! The reactor core ([`FsConn`]/[`FsDone`]) is deliberately host-agnostic: a
+//! single-threaded event loop that owns its own `Engine` can drive fs ops
+//! inline and receive completions as in-loop callbacks, interleaving fs and
+//! its own SQEs on one ring. Under the `net-server` feature the io_uring net
+//! server drives the core this way.
 
 mod broker;
-// `pub(crate)` so the embedded host (`net::server`, when both features are on)
+// `pub(crate)` so an embedding host (a server driving `FsCore` on its own
 // can drive an `FsCore` on the server's own ring; the standalone host is
-// `async_fs`'s own `AsyncFs`.
+// `uring_fs`'s own `UringFs`.
 pub(crate) mod core;
+#[cfg(feature = "net-server")]
+pub use core::{FsConn, FsDone};
+
+pub mod query_dir;
+pub use query_dir::{
+    query_directory, CopyHandle, DirEntry, EnrichSpec, QueryDir, QueryHandle,
+    QueryOptions, QueryPool,
+};
 // `pub(crate)` so a `net` server can reuse the fixed-file-xattr capability
 // probe (the 6.13 floor is not visible to `REGISTER_PROBE`); the standalone
-// reactor is `AsyncFs`.
+// reactor is `UringFs`.
 pub(crate) mod host;
 
 pub use broker::{
     AsUser, BrokerReactor, CredBroker, CredHandle, IdentityCache, Lease,
     MAX_GROUPS, MAX_RINGS,
 };
-// The embedded (in-loop) completion payload and chaining facade a `net` server
-// hands protocol handlers; only meaningful with an fs pool, but the types are
-// always exported so signatures don't shift with the `net-server` feature.
-pub use core::{FsConn, FsDone};
-pub use host::{AsyncFs, FsConfig, ShutdownHandle};
+pub use host::{FsConfig, ShutdownHandle, UringFs};
 
 use crate::errno::{retry_on_eintr, Errno};
 use crate::fd::owned_from_raw;
@@ -214,12 +199,46 @@ pub(crate) fn statx_at_flags(flags: AtFlags) -> u32 {
     }
 }
 
+/// Validate an open's `(path, how)` pair and produce the payloads an
+/// `OPENAT2` inject carries — shared by the blocking [`FsHandle::open`] and the
+/// async `rt` handle so both surfaces enforce identical rules.
+///
+/// The path may be **multi-component** and is resolved by the kernel against
+/// the anchor dirfd. It is **confined to the anchor by default**
+/// (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, applied when the caller set no
+/// `resolve` policy of its own). A caller that sets its own `resolve` — e.g.
+/// dropping `RESOLVE_BENEATH` — opts out of confinement and may then pass an
+/// **absolute** path, which the kernel resolves from the filesystem root
+/// (ignoring the dirfd), per `openat2(2)`. Opens return a real fd, so
+/// `O_CLOEXEC` is accepted.
+pub(crate) fn open_parts<P: ?Sized + TnPath>(
+    path: &P,
+    how: OpenHow,
+) -> crate::Result<(CString, RawOpenHow)> {
+    let cpath: CString = path.with_tn_path(|c| c.to_owned())?;
+    if cpath.as_bytes().is_empty() {
+        return Err(crate::Error::Validation(
+            "uring_fs open: empty path".into(),
+        ));
+    }
+    let mut raw = how.to_raw();
+    // Confine to the anchor by default: an unset `resolve` would let `..` or a
+    // symlink escape. A caller that sets its own `resolve` (e.g. to drop
+    // `RESOLVE_BENEATH` for an absolute path) opts out deliberately.
+    if raw.resolve == 0 {
+        raw.resolve = ResolveFlag::RESOLVE_BENEATH
+            .union(ResolveFlag::RESOLVE_NO_SYMLINKS)
+            .bits();
+    }
+    Ok((cpath, raw))
+}
+
 /// A registered io_uring personality: a kernel-held snapshot of one
 /// identity's credentials (fsuid/fsgid, supplementary groups, capabilities,
 /// LSM label), stamped into every SQE this module submits. The kernel — not
 /// the library — performs each operation's permission checks under it.
 ///
-/// Mint one for the calling process with [`AsyncFs::register_self`]. Ids are
+/// Mint one for the calling process with [`UringFs::register_self`]. Ids are
 /// ring-local and never 0 (the kernel's allocator starts at 1), so a
 /// `Personality` always names a real registration; a stale id (unregistered,
 /// or from another ring) fails the operation with `EINVAL` at submission.
@@ -294,7 +313,7 @@ impl<'a> Leaf<'a> {
         Ok(Leaf(b))
     }
 
-    fn to_cstring(self) -> CString {
+    pub(crate) fn to_cstring(self) -> CString {
         CString::new(self.0).expect("validated: no interior NUL")
     }
 }
@@ -348,125 +367,48 @@ impl Anchor {
         Ok(Anchor(Arc::new(fd)))
     }
 
+    /// Wrap an already-open fd (shared) as a resolution anchor **without** the
+    /// directory check — used internally to statx a plain file fd
+    /// (`AT_EMPTY_PATH`), where the anchor *is* the fd being stat'd, not a
+    /// dirfd. Not for path resolution.
+    pub(crate) fn from_shared(fd: Arc<OwnedFd>) -> Anchor {
+        Anchor(fd)
+    }
+
     pub(crate) fn raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()
     }
 }
 
-/// An open file in the reactor's fixed-descriptor table.
-///
-/// This is a token — `{slot, generation}` plus a channel back to the loop —
-/// not an fd: the file exists only in the ring's registered table. Close it
-/// explicitly with [`FsHandle::close`]; a dropped token injects a close by
-/// itself (cancelling any ops still in flight on it first), so a lost holder
-/// cannot leak a pool slot. A token whose slot has since been recycled is
-/// inert: operations through it fail `EBADF` and touch nothing.
-pub struct FixedFile {
-    pub(crate) slot: u32,
-    pub(crate) gen: u64,
-    pub(crate) tx: mpsc::Sender<FsInject>,
-    pub(crate) shared: Arc<LoopShared>,
-    pub(crate) defused: bool,
+/// An open file: a real OS file descriptor, reference-counted so the reactor
+/// can keep it alive across an in-flight op even after the caller drops this
+/// handle (each submitted op parks its own clone loop-side until the CQE). The
+/// fd closes when the last clone — this handle plus any op still holding one —
+/// drops, which gives close-last ordering by construction; [`FsHandle::close`]
+/// simply drops the handle. Cheap to [`Clone`].
+#[derive(Clone)]
+pub struct File {
+    pub(crate) fd: Arc<OwnedFd>,
 }
 
-impl fmt::Debug for FixedFile {
+impl fmt::Debug for File {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FixedFile")
-            .field("slot", &self.slot)
-            .field("gen", &self.gen)
-            .finish_non_exhaustive()
+        f.debug_struct("File")
+            .field("fd", &self.fd.as_raw_fd())
+            .finish()
     }
 }
 
-impl Drop for FixedFile {
-    fn drop(&mut self) {
-        if !self.defused {
-            // Orphan close: best-effort — a dead loop means the ring (and the
-            // file table with it) is already being torn down.
-            let _ = self.tx.send(FsInject::Close {
-                slot: self.slot,
-                gen: self.gen,
-                reply: None,
-            });
-            self.shared.wake.poke();
-        }
-    }
-}
-
-/// A bare open-file identity — `{slot, generation}` with no channel — for the
-/// **embedded** (in-loop) path, where follow-up ops are chained inline through
-/// an `FsConn` (a `net` server's request-bound fs facade) rather than injected
-/// over a channel.
-///
-/// Unlike [`FixedFile`], this is `Copy` and has no `Drop`: an embedded file is
-/// closed explicitly in the callback chain (or swept when its connection
-/// closes), never by a token going out of scope. A token whose slot has since
-/// been recycled is inert — operations through it fail `EBADF`.
-///
-/// The token also carries the [`Personality`] the file was **opened under**:
-/// every fd-op on it ([`FsConn::preadv`](crate::async_fs::FsConn) etc.) runs as
-/// that identity, so a file's whole lifecycle stays under one identity by
-/// construction — there is no per-op personality argument to mismatch. The one
-/// exception is [`as_root`](FsFile::as_root).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FsFile {
-    pub(crate) slot: u32,
-    pub(crate) gen: u64,
-    /// The personality id the file was opened under (always nonzero — an
-    /// `open` carries a real [`Personality`]). fd-ops stamp it unless
-    /// [`as_root`](FsFile::as_root) flips them to the ambient path.
-    pub(crate) pers: u16,
-    /// This flavor's fd-ops run as the daemon's own root credentials
-    /// (`sqe.personality = 0`) instead of the opened-under identity.
-    pub(crate) as_root: bool,
-}
-
-impl FsFile {
-    /// The fixed-table slot this file occupies.
-    pub fn slot(self) -> u32 {
-        self.slot
+impl File {
+    /// Wrap a freshly-opened owned fd as a file handle.
+    pub(crate) fn new(fd: Arc<OwnedFd>) -> File {
+        File { fd }
     }
 
-    /// The slot's generation at open time (stale-token detection).
-    pub fn generation(self) -> u64 {
-        self.gen
-    }
-
-    /// The [`Personality`] this file was opened under — the identity its fd-ops
-    /// run as (unless taken through [`as_root`](FsFile::as_root)).
-    pub fn personality(self) -> Personality {
-        Personality(self.pers)
-    }
-
-    /// A flavor of this token whose fd-ops run as the daemon's **own root
-    /// credentials** rather than the opened-under identity — the io_uring
-    /// equivalent of Samba's `become_root()` (`sqe.personality = 0`: no
-    /// `override_creds`, so the ring owner's ambient — root — creds apply,
-    /// verified against the kernel's `io_init_req`/`__io_issue_sqe`).
-    ///
-    /// The file's *data* was already access-checked at `open` under
-    /// [`personality`](FsFile::personality); this only changes the identity
-    /// subsequent ops are attributed to and re-checked under — its use is
-    /// privileged metadata the peer itself cannot touch (a `security.*` /
-    /// `trusted.*` xattr, quota-exempt writes). It does **not** re-open or
-    /// widen data access. Deliberately the only way to reach `personality = 0`
-    /// from this API; [`personality`](FsFile::personality) still reports the
-    /// original opened-under id.
-    pub fn as_root(self) -> FsFile {
-        FsFile {
-            as_root: true,
-            ..self
-        }
-    }
-
-    /// The personality id an fd-op on this token stamps: `0` (ambient root) for
-    /// an [`as_root`](FsFile::as_root) flavor, else the opened-under id.
-    pub(crate) fn op_pers(self) -> u16 {
-        if self.as_root {
-            0
-        } else {
-            self.pers
-        }
+    /// The underlying raw descriptor. It stays valid for at least this handle's
+    /// lifetime; the reactor independently keeps it open across any op it holds.
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
     }
 }
 
@@ -476,10 +418,50 @@ pub(crate) struct FsOutcome {
     pub(crate) res: Result<i32, Errno>,
     /// The owned buffers, round-tripped back (empty for non-data ops).
     pub(crate) bufs: Vec<Vec<u8>>,
-    /// For opens: the now-open `(slot, generation)`.
-    pub(crate) file: Option<(u32, u64)>,
+    /// For opens: the freshly-opened fd, reference-counted (the caller wraps it
+    /// in a [`File`]).
+    pub(crate) file: Option<Arc<OwnedFd>>,
     /// For `statx`: the kernel-filled buffer.
     pub(crate) stat: Option<Box<StatxRaw>>,
+}
+
+impl FsOutcome {
+    /// The one constructor, shared by every [`FsOutcome`] construction site.
+    pub(crate) fn new(
+        res: Result<i32, Errno>,
+        bufs: Vec<Vec<u8>>,
+        file: Option<Arc<OwnedFd>>,
+        stat: Option<Box<StatxRaw>>,
+    ) -> FsOutcome {
+        FsOutcome {
+            res,
+            bufs,
+            file,
+            stat,
+        }
+    }
+}
+
+/// Where a completed op's [`FsOutcome`] goes: the blocking mpsc reply channel
+/// of the [`FsHandle`] path. The send is non-blocking, and a gone receiver (an
+/// abandoned call) makes it a no-op — the outcome and its buffers are simply
+/// dropped, which is safe because delivery happens only after the CQE reaped,
+/// when the kernel is done with them.
+pub(crate) enum ReplyTo {
+    Sync(mpsc::Sender<FsOutcome>),
+}
+
+impl ReplyTo {
+    /// Deliver the outcome (consuming the endpoint; nothing blocks).
+    /// Returns `Err(out)` when the receiver is already gone (an abandoned
+    /// call, a dropped future) — most sites ignore it, but a successful
+    /// `open` uses it to detect that no [`File`] will be built to
+    /// orphan-close the slot, and stages the close itself.
+    pub(crate) fn send(self, out: FsOutcome) -> Result<(), FsOutcome> {
+        match self {
+            ReplyTo::Sync(tx) => tx.send(out).map_err(|e| e.0),
+        }
+    }
 }
 
 /// A cross-thread request to the loop. Every kernel-visible payload an op
@@ -492,44 +474,39 @@ pub(crate) enum FsInject {
         anchor: Anchor,
         path: CString,
         how: RawOpenHow,
-        reply: mpsc::Sender<FsOutcome>,
+        reply: ReplyTo,
     },
     Rw {
         /// [`core::TAG_READV`] or [`core::TAG_WRITEV`].
         tag: u8,
         pers: u16,
-        slot: u32,
-        gen: u64,
+        file: Arc<OwnedFd>,
         bufs: Vec<Vec<u8>>,
         off: u64,
-        reply: mpsc::Sender<FsOutcome>,
+        reply: ReplyTo,
     },
     Fsync {
         pers: u16,
-        slot: u32,
-        gen: u64,
+        file: Arc<OwnedFd>,
         datasync: bool,
-        reply: mpsc::Sender<FsOutcome>,
-    },
-    Close {
-        slot: u32,
-        gen: u64,
-        /// `None` = orphan close (a dropped [`FixedFile`]); nobody waits.
-        reply: Option<mpsc::Sender<FsOutcome>>,
+        /// Byte range `[offset, offset + length)` synced via the SQE's
+        /// `off`/`len`; `0`/`0` = whole file.
+        offset: u64,
+        length: u32,
+        reply: ReplyTo,
     },
     /// A metadata op on an open file: ftruncate/fallocate (no payload) or
     /// fgetxattr/fsetxattr (owned name + value).
     FdMeta {
         tag: u8,
         pers: u16,
-        slot: u32,
-        gen: u64,
+        file: Arc<OwnedFd>,
         name: Option<CString>,
         value: Vec<u8>,
         off: u64,
         len64: u64,
         aux32: u32,
-        reply: mpsc::Sender<FsOutcome>,
+        reply: ReplyTo,
     },
     /// `statx` or a directory-entry op, resolved against real anchor dirfds.
     PathOp {
@@ -541,7 +518,7 @@ pub(crate) enum FsInject {
         n2: Option<CString>,
         flags: u32,
         len_arg: u32,
-        reply: mpsc::Sender<FsOutcome>,
+        reply: ReplyTo,
     },
 }
 
@@ -556,7 +533,7 @@ pub struct FsPending {
 impl FsPending {
     /// Block until the operation completes; returns the byte count and the
     /// round-tripped buffers. A loop shut down mid-flight yields
-    /// `ECONNABORTED`; an operation cancelled by a dropped [`FixedFile`]
+    /// `ECONNABORTED`; an operation cancelled by a dropped [`File`]
     /// yields `ECANCELED`.
     pub fn wait(self) -> (crate::Result<usize>, Vec<Vec<u8>>) {
         match self.rx.recv() {
@@ -565,6 +542,15 @@ impl FsPending {
             }
             Err(_) => (Err(Errno::ECONNABORTED.into()), Vec::new()),
         }
+    }
+
+    /// Block until the op completes and hand back its **full** [`FsOutcome`]
+    /// (result, buffers, opened file, `statx` buffer) — for callers that need
+    /// more than [`wait`](Self::wait)'s byte count (an `open`'s `File`, a
+    /// `statx`'s buffer, an `fgetxattr`'s value). A loop shut down mid-flight
+    /// yields `ECONNABORTED`.
+    pub(crate) fn into_outcome(self) -> crate::Result<FsOutcome> {
+        self.rx.recv().map_err(|_| Errno::ECONNABORTED.into())
     }
 }
 
@@ -589,14 +575,12 @@ pub struct FsHandle {
 
 impl FsHandle {
     /// Open `path` — **relative**, resolved against `anchor` under the
-    /// kernel's checks as `who` — into a fixed-table slot.
+    /// kernel's checks as `who` — returning a real fd as a [`File`].
     ///
     /// `how` is the same [`OpenHow`] the blocking
-    /// [`openat2`](crate::sync_fs::openat2) takes. `O_CLOEXEC` is rejected
-    /// (meaningless for a file that never enters the process fd table, and
-    /// refused by the kernel when installing into one). Open failures
-    /// (`ENOENT`, `EACCES` — the personality *working*) come back as `Errno`
-    /// errors.
+    /// [`openat2`](crate::sync_fs::openat2) takes; `O_CLOEXEC` is accepted.
+    /// Open failures (`ENOENT`, `EACCES` — the personality *working*) come
+    /// back as `Errno` errors.
     ///
     /// **Confined to `anchor` by default.** When `how` carries no `resolve`
     /// policy, this applies `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`: a `..`
@@ -614,36 +598,8 @@ impl FsHandle {
         anchor: &Anchor,
         path: &P,
         how: OpenHow,
-    ) -> crate::Result<FixedFile> {
-        let cpath: CString = path.with_tn_path(|c| c.to_owned())?;
-        let bytes = cpath.as_bytes();
-        if bytes.is_empty() {
-            return Err(crate::Error::Validation(
-                "async_fs open: empty path".into(),
-            ));
-        }
-        if bytes[0] == b'/' {
-            return Err(crate::Error::Validation(
-                "async_fs paths are anchor-relative; absolute paths are not \
-                 accepted"
-                    .into(),
-            ));
-        }
-        let mut raw = how.to_raw();
-        if raw.flags & libc::O_CLOEXEC as u64 != 0 {
-            return Err(crate::Error::Validation(
-                "async_fs open: O_CLOEXEC is meaningless for fixed-table \
-                 opens (and rejected by the kernel); drop it"
-                    .into(),
-            ));
-        }
-        // Confine to `anchor` by default (see the doc): an unset `resolve`
-        // would let `..`/symlinks escape the share.
-        if raw.resolve == 0 {
-            raw.resolve = ResolveFlag::RESOLVE_BENEATH
-                .union(ResolveFlag::RESOLVE_NO_SYMLINKS)
-                .bits();
-        }
+    ) -> crate::Result<File> {
+        let (cpath, raw) = open_parts(path, how)?;
         let (tx, rx) = mpsc::channel();
         let out = self.call(
             FsInject::Open {
@@ -651,22 +607,16 @@ impl FsHandle {
                 anchor: anchor.clone(),
                 path: cpath,
                 how: raw,
-                reply: tx,
+                reply: ReplyTo::Sync(tx),
             },
             &rx,
         )?;
-        let (slot, gen) = match (out.res, out.file) {
-            (Ok(_), Some(sg)) => sg,
+        let fd = match (out.res, out.file) {
+            (Ok(_), Some(fd)) => fd,
             (Err(e), _) => return Err(e.into()),
             (Ok(_), None) => return Err(Errno::EIO.into()),
         };
-        Ok(FixedFile {
-            slot,
-            gen,
-            tx: self.tx.clone(),
-            shared: self.shared.clone(),
-            defused: false,
-        })
+        Ok(File::new(fd))
     }
 
     /// Vectored positional read as `who` — `preadv(2)` semantics: fill each
@@ -676,7 +626,7 @@ impl FsHandle {
     pub fn preadv(
         &self,
         who: Personality,
-        f: &FixedFile,
+        f: &File,
         bufs: Vec<Vec<u8>>,
         off: u64,
     ) -> (crate::Result<usize>, Vec<Vec<u8>>) {
@@ -688,7 +638,7 @@ impl FsHandle {
     pub fn pread(
         &self,
         who: Personality,
-        f: &FixedFile,
+        f: &File,
         buf: Vec<u8>,
         off: u64,
     ) -> (crate::Result<usize>, Vec<u8>) {
@@ -702,7 +652,7 @@ impl FsHandle {
     pub fn pwritev(
         &self,
         who: Personality,
-        f: &FixedFile,
+        f: &File,
         bufs: Vec<Vec<u8>>,
         off: u64,
     ) -> (crate::Result<usize>, Vec<Vec<u8>>) {
@@ -714,7 +664,7 @@ impl FsHandle {
     pub fn pwrite(
         &self,
         who: Personality,
-        f: &FixedFile,
+        f: &File,
         buf: Vec<u8>,
         off: u64,
     ) -> (crate::Result<usize>, Vec<u8>) {
@@ -729,7 +679,7 @@ impl FsHandle {
     pub fn start_preadv(
         &self,
         who: Personality,
-        f: &FixedFile,
+        f: &File,
         bufs: Vec<Vec<u8>>,
         off: u64,
     ) -> crate::Result<FsPending> {
@@ -740,28 +690,124 @@ impl FsHandle {
         self.send(FsInject::Rw {
             tag: core::TAG_READV,
             pers: who.0,
-            slot: f.slot,
-            gen: f.gen,
+            file: f.fd.clone(),
             bufs,
             off,
-            reply: tx,
+            reply: ReplyTo::Sync(tx),
+        })
+        .map_err(|_| crate::Error::from(Errno::ECONNABORTED))?;
+        Ok(FsPending { rx })
+    }
+
+    /// Start a `statx` of `leaf` inside `anchor` as `who` without blocking; the
+    /// returned [`FsPending`] carries the metadata via
+    /// [`into_outcome`](FsPending::into_outcome). The non-blocking twin of
+    /// [`statx`](Self::statx), for scattering per-entry metadata (see
+    /// [`query_directory`](crate::uring_fs::query_directory)).
+    pub fn start_statx(
+        &self,
+        who: Personality,
+        anchor: &Anchor,
+        leaf: Leaf<'_>,
+        flags: AtFlags,
+        mask: StatxMask,
+    ) -> crate::Result<FsPending> {
+        let (tx, rx) = mpsc::channel();
+        self.send(FsInject::PathOp {
+            tag: core::TAG_STATX,
+            pers: who.0,
+            a1: anchor.clone(),
+            n1: leaf.to_cstring(),
+            a2: None,
+            n2: None,
+            flags: statx_at_flags(flags),
+            len_arg: mask.bits(),
+            reply: ReplyTo::Sync(tx),
+        })
+        .map_err(|_| crate::Error::from(Errno::ECONNABORTED))?;
+        Ok(FsPending { rx })
+    }
+
+    /// Start an `open` of `path` under `anchor` as `who` without blocking; the
+    /// returned [`FsPending`] carries the opened [`File`] (via
+    /// [`into_outcome`](FsPending::into_outcome)). The non-blocking twin of
+    /// [`open`](Self::open).
+    pub fn start_open<P: ?Sized + TnPath>(
+        &self,
+        who: Personality,
+        anchor: &Anchor,
+        path: &P,
+        how: OpenHow,
+    ) -> crate::Result<FsPending> {
+        let (cpath, raw) = open_parts(path, how)?;
+        let (tx, rx) = mpsc::channel();
+        self.send(FsInject::Open {
+            pers: who.0,
+            anchor: anchor.clone(),
+            path: cpath,
+            how: raw,
+            reply: ReplyTo::Sync(tx),
+        })
+        .map_err(|_| crate::Error::from(Errno::ECONNABORTED))?;
+        Ok(FsPending { rx })
+    }
+
+    /// Start an `fgetxattr` of `name` on the open file `f` into `buf` as `who`
+    /// without blocking; the returned [`FsPending`] carries the size and filled
+    /// buffer (via [`into_outcome`](FsPending::into_outcome)). The non-blocking
+    /// twin of [`fgetxattr`](Self::fgetxattr).
+    pub fn start_fgetxattr(
+        &self,
+        who: Personality,
+        f: &File,
+        name: &CStr,
+        buf: Vec<u8>,
+    ) -> crate::Result<FsPending> {
+        if !self.fd_xattr_ok {
+            return Err(Errno::EOPNOTSUPP.into());
+        }
+        let (tx, rx) = mpsc::channel();
+        self.send(FsInject::FdMeta {
+            tag: core::TAG_FGETXATTR,
+            pers: who.0,
+            file: f.fd.clone(),
+            name: Some(name.to_owned()),
+            value: buf,
+            off: 0,
+            len64: 0,
+            aux32: 0,
+            reply: ReplyTo::Sync(tx),
         })
         .map_err(|_| crate::Error::from(Errno::ECONNABORTED))?;
         Ok(FsPending { rx })
     }
 
     /// Flush `f`'s data and metadata to stable storage (`fsync`).
-    pub fn fsync(&self, who: Personality, f: &FixedFile) -> crate::Result<()> {
-        self.sync(who, f, false)
+    pub fn fsync(&self, who: Personality, f: &File) -> crate::Result<()> {
+        self.sync(who, f, false, 0, 0)
     }
 
     /// Flush `f`'s data (and only essential metadata) — `fdatasync`.
-    pub fn fdatasync(
+    pub fn fdatasync(&self, who: Personality, f: &File) -> crate::Result<()> {
+        self.sync(who, f, true, 0, 0)
+    }
+
+    /// Flush the byte range `[offset, offset + length)` of `f` (`datasync`
+    /// selects `fdatasync` semantics), mirroring `truenas_pyos`'s ranged
+    /// `prep_fsync`. The kernel syncs `[offset, offset + length]` via
+    /// `vfs_fsync_range`; `offset == 0 && length == 0` syncs the whole file.
+    /// `length` is the SQE's 32-bit field (≤ ~4 GiB per call); a nonzero
+    /// `offset` with `length == 0` is a single-byte range at `offset`, **not**
+    /// through end-of-file.
+    pub fn fsync_range(
         &self,
         who: Personality,
-        f: &FixedFile,
+        f: &File,
+        datasync: bool,
+        offset: u64,
+        length: u32,
     ) -> crate::Result<()> {
-        self.sync(who, f, true)
+        self.sync(who, f, datasync, offset, length)
     }
 
     // ---- metadata on an open file (the encouraged shape) ---------------
@@ -778,11 +824,11 @@ impl FsHandle {
     /// Needs Linux ≥ 6.13 (before that io_uring refused a registered-table
     /// file here); on an older kernel this returns `EOPNOTSUPP` without
     /// touching the ring — check
-    /// [`AsyncFs::supports_fd_xattr`](crate::async_fs::AsyncFs::supports_fd_xattr).
+    /// [`UringFs::supports_fd_xattr`](crate::uring_fs::UringFs::supports_fd_xattr).
     pub fn fgetxattr(
         &self,
         who: Personality,
-        f: &FixedFile,
+        f: &File,
         name: &CStr,
         buf: Vec<u8>,
     ) -> (crate::Result<usize>, Vec<u8>) {
@@ -812,7 +858,7 @@ impl FsHandle {
     pub fn fsetxattr(
         &self,
         who: Personality,
-        f: &FixedFile,
+        f: &File,
         name: &CStr,
         value: Vec<u8>,
         flags: i32,
@@ -837,12 +883,12 @@ impl FsHandle {
     ///
     /// Requires `IORING_OP_FTRUNCATE` (Linux ≥ 6.9) — the one op above this
     /// crate's other io_uring floors. Where the kernel lacks it,
-    /// [`AsyncFs::new`] leaves it disabled and this returns `EOPNOTSUPP`
+    /// [`UringFs::new`] leaves it disabled and this returns `EOPNOTSUPP`
     /// without touching the ring.
     pub fn ftruncate(
         &self,
         who: Personality,
-        f: &FixedFile,
+        f: &File,
         len: u64,
     ) -> crate::Result<()> {
         if !self.ftruncate_ok {
@@ -857,7 +903,7 @@ impl FsHandle {
     pub fn fallocate(
         &self,
         who: Personality,
-        f: &FixedFile,
+        f: &File,
         mode: i32,
         off: u64,
         len: u64,
@@ -871,13 +917,12 @@ impl FsHandle {
     /// symlink by default (the link itself is stat'd); pass
     /// `AtFlags::AT_SYMLINK_FOLLOW` to stat the target.
     ///
-    /// **The one metadata op that resolves a name rather than taking an open
-    /// file** — no kernel exposes statx on a registered-table file
-    /// (io_uring's `STATX` rejects fixed files outright), so an open
-    /// [`FixedFile`] cannot be stat'ed. Prefer
-    /// [`statx_anchor`](Self::statx_anchor) where the target is a directory
-    /// you already hold, and be aware that a statx-then-open pair names the
-    /// file twice: the two can disagree if it is replaced in between.
+    /// **A metadata op that resolves a name** rather than taking an open file.
+    /// For an already-open [`File`], [`fstatx`](Self::fstatx) stats it directly
+    /// (`STATX` with `AT_EMPTY_PATH` on its plain fd); prefer that, or
+    /// [`statx_anchor`](Self::statx_anchor) when you already hold the target,
+    /// and be aware that a statx-then-open pair names the file twice: the two
+    /// can disagree if it is replaced in between.
     pub fn statx(
         &self,
         who: Personality,
@@ -905,6 +950,20 @@ impl FsHandle {
             flags | AtFlags::AT_EMPTY_PATH,
             mask,
         )
+    }
+
+    /// Statx an **open file** by its descriptor
+    /// (`statx(fd, "", AT_EMPTY_PATH)`) — the `fstat` equivalent. No path is
+    /// resolved (no name TOCTOU); the metadata is exactly this fd's.
+    pub fn fstatx(
+        &self,
+        who: Personality,
+        f: &File,
+        flags: AtFlags,
+        mask: StatxMask,
+    ) -> crate::Result<Statx> {
+        let anchor = Anchor::from_shared(f.fd.clone());
+        self.statx_anchor(who, &anchor, flags, mask)
     }
 
     // ---- directory entries ---------------------------------------------
@@ -1016,7 +1075,7 @@ impl FsHandle {
                 n2: Some(leaf.to_cstring()),
                 flags: 0,
                 len_arg: 0,
-                reply: tx,
+                reply: ReplyTo::Sync(tx),
             },
             &rx,
         )?;
@@ -1048,43 +1107,33 @@ impl FsHandle {
         )
     }
 
-    /// Close the file and free its pool slot, waiting for the kernel's
-    /// close. Ops still in flight on it are cancelled first; the
-    /// index-freeing close is always the file's last op.
-    ///
-    /// Deliberately personality-free: teardown consults no credentials, and
-    /// the same close must be stageable from [`FixedFile`]'s parameterless
-    /// `Drop`.
-    pub fn close(&self, mut f: FixedFile) -> crate::Result<()> {
-        let (slot, gen) = (f.slot, f.gen);
-        f.defused = true;
+    /// Close the file. This drops the handle's reference-counted fd; the
+    /// descriptor is closed once the last clone — this handle plus any op still
+    /// in flight on it — is dropped, so an in-flight op never races the close
+    /// and no explicit ring op is needed. Infallible (kept returning `Result`
+    /// for signature stability).
+    pub fn close(&self, f: File) -> crate::Result<()> {
         drop(f);
-        let (tx, rx) = mpsc::channel();
-        let out = self.call(
-            FsInject::Close {
-                slot,
-                gen,
-                reply: Some(tx),
-            },
-            &rx,
-        )?;
-        out.res.map(|_| ()).map_err(Into::into)
+        Ok(())
     }
 
     fn sync(
         &self,
         who: Personality,
-        f: &FixedFile,
+        f: &File,
         datasync: bool,
+        offset: u64,
+        length: u32,
     ) -> crate::Result<()> {
         let (tx, rx) = mpsc::channel();
         let out = self.call(
             FsInject::Fsync {
                 pers: who.0,
-                slot: f.slot,
-                gen: f.gen,
+                file: f.fd.clone(),
                 datasync,
-                reply: tx,
+                offset,
+                length,
+                reply: ReplyTo::Sync(tx),
             },
             &rx,
         )?;
@@ -1095,7 +1144,7 @@ impl FsHandle {
         &self,
         tag: u8,
         who: Personality,
-        f: &FixedFile,
+        f: &File,
         bufs: Vec<Vec<u8>>,
         off: u64,
     ) -> (crate::Result<usize>, Vec<Vec<u8>>) {
@@ -1103,11 +1152,10 @@ impl FsHandle {
         let sent = self.send(FsInject::Rw {
             tag,
             pers: who.0,
-            slot: f.slot,
-            gen: f.gen,
+            file: f.fd.clone(),
             bufs,
             off,
-            reply: tx,
+            reply: ReplyTo::Sync(tx),
         });
         if let Err(msg) = sent {
             // Loop gone: hand the caller's buffers back, as the completion
@@ -1132,7 +1180,7 @@ impl FsHandle {
         &self,
         tag: u8,
         who: Personality,
-        f: &FixedFile,
+        f: &File,
         name: Option<CString>,
         value: Vec<u8>,
         off: u64,
@@ -1143,14 +1191,13 @@ impl FsHandle {
         let sent = self.send(FsInject::FdMeta {
             tag,
             pers: who.0,
-            slot: f.slot,
-            gen: f.gen,
+            file: f.fd.clone(),
             name,
             value,
             off,
             len64,
             aux32,
-            reply: tx,
+            reply: ReplyTo::Sync(tx),
         });
         if let Err(msg) = sent {
             // Loop gone: hand the caller's value buffer back.
@@ -1174,7 +1221,7 @@ impl FsHandle {
         &self,
         tag: u8,
         who: Personality,
-        f: &FixedFile,
+        f: &File,
         off: u64,
         len64: u64,
         aux32: u32,
@@ -1184,14 +1231,13 @@ impl FsHandle {
             FsInject::FdMeta {
                 tag,
                 pers: who.0,
-                slot: f.slot,
-                gen: f.gen,
+                file: f.fd.clone(),
                 name: None,
                 value: Vec::new(),
                 off,
                 len64,
                 aux32,
-                reply: tx,
+                reply: ReplyTo::Sync(tx),
             },
             &rx,
         )?;
@@ -1219,7 +1265,7 @@ impl FsHandle {
                 // `FsConn::statx`); AT_SYMLINK_FOLLOW opts into the target.
                 flags: statx_at_flags(flags),
                 len_arg: mask.bits(),
-                reply: tx,
+                reply: ReplyTo::Sync(tx),
             },
             &rx,
         )?;
@@ -1254,7 +1300,7 @@ impl FsHandle {
                 n2: n2.map(Leaf::to_cstring),
                 flags,
                 len_arg,
-                reply: tx,
+                reply: ReplyTo::Sync(tx),
             },
             &rx,
         )?;
@@ -1264,7 +1310,11 @@ impl FsHandle {
     /// Queue an inject and wake the loop. On failure (loop stopping or gone)
     /// the un-sent message is handed back as `Err(msg)` so a caller can recover
     /// the owned buffers it moved in; the error is always `ECONNABORTED`.
-    fn send(&self, msg: FsInject) -> Result<(), FsInject> {
+    /// (`pub(crate)`: the async `rt` handle submits through the same path.)
+    // The Err IS the un-sent message, by design — its size is the payload the
+    // caller gets back (buffers, lease), not an error-path allocation to shrink.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn send(&self, msg: FsInject) -> Result<(), FsInject> {
         use std::sync::atomic::Ordering;
         if self.shared.stop.load(Ordering::Acquire) {
             return Err(msg);

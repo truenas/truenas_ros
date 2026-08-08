@@ -19,7 +19,7 @@
 //! `xattr`, `acl`, `fhandle`, `fsiter`, `shutil`), [`mount`] (mount topology
 //! and idmapped-mount support — features `mount`, `idmap`), [`configfile`],
 //! the io_uring `net` stack (`net-core`/`net-server`/`net-client`), and the
-//! io_uring fs reactor `async_fs` (`async-fs`); `full` enables all but the
+//! io_uring fs reactor `uring_fs` (`uring-fs`); `full` enables all but the
 //! still-landing fs reactor.
 #![cfg(target_os = "linux")]
 #![allow(non_camel_case_types)]
@@ -43,7 +43,7 @@ pub mod path;
 
 // The shared `clone3` fork helper (pidfd + signal-handler reset), used by the
 // credential broker and the idmapped-mount userns builder.
-#[cfg(any(feature = "idmap", feature = "async-fs"))]
+#[cfg(any(feature = "idmap", feature = "uring-fs"))]
 mod clone3;
 
 pub use errno::Errno;
@@ -70,8 +70,8 @@ pub mod configfile;
 #[cfg(feature = "uring")]
 mod uring;
 
-#[cfg(feature = "async-fs")]
-pub mod async_fs;
+#[cfg(feature = "uring-fs")]
+pub mod uring_fs;
 
 #[cfg(feature = "net-core")]
 pub mod net;

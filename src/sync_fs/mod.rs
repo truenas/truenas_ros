@@ -6,7 +6,7 @@
 //! named submodule behind its own feature: [`xattr`], [`acl`] (NFS4/POSIX1E),
 //! [`fhandle`], [`iter`] (feature `fsiter`), and [`shutil`]. Mount topology
 //! and idmapped-mount support live in [`crate::mount`]; the io_uring reactor
-//! counterpart is the (future) `async_fs` module.
+//! counterpart is the (future) `uring_fs` module.
 
 #[cfg(feature = "sync-fs")]
 mod atomic;

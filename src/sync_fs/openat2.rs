@@ -67,7 +67,7 @@ impl OpenHow {
     }
 
     /// The raw kernel payload (for the io_uring `OPENAT2` SQE).
-    #[cfg_attr(not(feature = "async-fs"), allow(dead_code))]
+    #[cfg_attr(not(feature = "uring-fs"), allow(dead_code))]
     pub(crate) fn to_raw(self) -> RawOpenHow {
         self.0
     }
