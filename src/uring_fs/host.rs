@@ -3,7 +3,7 @@
 //! (The core is host-agnostic — a `net` server is the other host, driving the
 //! same [`FsCore`] on its own ring.)
 
-use super::core::{FsCore, FsWaiter, TAG_CANCEL, TAG_WAKE};
+use super::core::{FsConn, FsCore, FsWaiter, TAG_CANCEL, TAG_WAKE};
 use super::{FsHandle, FsInject, FsOutcome, Personality};
 use crate::errno::{self, Errno};
 use crate::uring::engine::Engine;
@@ -292,20 +292,47 @@ impl UringFs {
         if tag & TAG_FS_DOMAIN == 0 {
             return Ok(()); // not ours (nothing stages such tags today)
         }
+        let (fd_xattr_ok, ftruncate_ok) = (self.fd_xattr_ok, self.ftruncate_ok);
         match tag {
             TAG_WAKE => {
                 if !self.eng.stopping() {
                     self.eng.arm_wake(pack_raw(TAG_WAKE, 0, 0))?;
                 }
                 self.drain_injects();
+                // Fire on-loop deliveries from finished off-loop pool jobs
+                // (`FsConn::offload` and the hybrid lister). Additive: the
+                // `FsHandle` path never touches the pool.
+                for (owner, deliver, any) in self.fs.take_pool_completions() {
+                    let mut conn = FsConn::new(
+                        &mut self.fs,
+                        &mut self.eng,
+                        owner,
+                        fd_xattr_ok,
+                        ftruncate_ok,
+                        true,
+                    );
+                    deliver(any, &mut conn);
+                }
             }
             TAG_CANCEL => {}
-            // The standalone host only ever parks channel waiters, so
-            // `on_cqe` never returns an embedded callback here; drop the
-            // (always-`None`) result.
+            // Deliver a completion. An `FsHandle` op parks a channel waiter
+            // (routed inside `on_cqe`, returns `None`); an embedded on-loop op
+            // (`FsConn`) hands its callback back to fire here with a fresh
+            // owner-scoped `FsConn`.
             _ => {
-                let _ =
-                    self.fs.on_cqe(&mut self.eng, tag, slot, gen32, cqe.res);
+                if let Some((cb, done, owner)) =
+                    self.fs.on_cqe(&mut self.eng, tag, slot, gen32, cqe.res)
+                {
+                    let mut conn = FsConn::new(
+                        &mut self.fs,
+                        &mut self.eng,
+                        owner,
+                        fd_xattr_ok,
+                        ftruncate_ok,
+                        true,
+                    );
+                    cb(done, &mut conn);
+                }
             }
         }
         Ok(())
