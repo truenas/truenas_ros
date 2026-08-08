@@ -63,18 +63,44 @@ enum OpOutput {
 // ---- ops (each becomes one real syscall in the mock) -----------------------
 
 enum OpSpec {
-    OpenAt { dir: RawFd, path: CString, flags: i32, mode: u32 },
-    StatIsDir { dir: RawFd, path: CString },
-    Write { fd: RawFd, data: Vec<u8> },
-    Fsync { fd: RawFd },
-    Rename { olddir: RawFd, old: CString, newdir: RawFd, new: CString },
-    Close { fd: RawFd },
-    Unlink { dir: RawFd, path: CString },
+    OpenAt {
+        dir: RawFd,
+        path: CString,
+        flags: i32,
+        mode: u32,
+    },
+    StatIsDir {
+        dir: RawFd,
+        path: CString,
+    },
+    Write {
+        fd: RawFd,
+        data: Vec<u8>,
+    },
+    Fsync {
+        fd: RawFd,
+    },
+    Rename {
+        olddir: RawFd,
+        old: CString,
+        newdir: RawFd,
+        new: CString,
+    },
+    Close {
+        fd: RawFd,
+    },
+    Unlink {
+        dir: RawFd,
+        path: CString,
+    },
 }
 
 // ---- staging: the callback stages follow-ups; the reactor flushes them ------
 
 type Callback = Box<dyn FnOnce(&Completion, &mut ReqState, &mut Staging)>;
+
+/// A request's terminal side effect: its result, delivered to the caller.
+type Done = Box<dyn FnOnce(Result<String, i32>)>;
 
 struct Staged {
     op: OpSpec,
@@ -91,7 +117,12 @@ struct Staging {
 impl Staging {
     /// One standalone op.
     fn one(&mut self, op: OpSpec, key: ReqKey, cb: Callback) {
-        self.runs.push(Staged { op, key, cb, link_next: false });
+        self.runs.push(Staged {
+            op,
+            key,
+            cb,
+            link_next: false,
+        });
     }
 
     /// A kernel-linked run (IOSQE_IO_LINK across all but the last): ordered and
@@ -100,7 +131,12 @@ impl Staging {
     fn linked_run(&mut self, items: Vec<(OpSpec, Callback)>, key: ReqKey) {
         let n = items.len();
         for (i, (op, cb)) in items.into_iter().enumerate() {
-            self.runs.push(Staged { op, key, cb, link_next: i + 1 < n });
+            self.runs.push(Staged {
+                op,
+                key,
+                cb,
+                link_next: i + 1 < n,
+            });
         }
     }
 }
@@ -116,7 +152,7 @@ struct ReqState {
     body: Vec<u8>,
     failed: bool,
     /// Terminal side effect — a plain closure, NOT a future.
-    done: Option<Box<dyn FnOnce(Result<String, i32>)>>,
+    done: Option<Done>,
 }
 impl ReqState {
     fn finish(&mut self, r: Result<String, i32>) {
@@ -150,7 +186,12 @@ impl Core {
         let slot = if let Some(s) = self.free.pop() {
             s
         } else {
-            self.slots.push(OpSlot { generation: 0, used: false, cb: None, key: 0 });
+            self.slots.push(OpSlot {
+                generation: 0,
+                used: false,
+                cb: None,
+                key: 0,
+            });
             (self.slots.len() - 1) as u32
         };
         let e = &mut self.slots[slot as usize];
@@ -199,7 +240,13 @@ impl Reactor {
     fn flush(&mut self) {
         let runs = std::mem::take(&mut self.staging.runs);
         let mut severed = false;
-        for Staged { op, key, cb, link_next } in runs {
+        for Staged {
+            op,
+            key,
+            cb,
+            link_next,
+        } in runs
+        {
             let token = self.core.alloc(key, cb);
             let (res, out) = if severed {
                 (-libc::ECANCELED, OpOutput::None)
@@ -228,9 +275,9 @@ impl Reactor {
             let staging = &mut self.staging;
             // A panicking callback must not abort the drain (pyos reports it
             // unraisable); catch_unwind is the equivalent.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                cb(&comp, state, staging)
-            }));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                move || cb(&comp, state, staging),
+            ));
         }
     }
 
@@ -252,8 +299,18 @@ fn execute(op: &OpSpec) -> (i32, OpOutput) {
     // duration (owned by the ReqState / OpSpec the caller still holds).
     unsafe {
         match op {
-            OpSpec::OpenAt { dir, path, flags, mode } => {
-                let fd = libc::openat(*dir, path.as_ptr(), *flags, *mode as libc::c_uint);
+            OpSpec::OpenAt {
+                dir,
+                path,
+                flags,
+                mode,
+            } => {
+                let fd = libc::openat(
+                    *dir,
+                    path.as_ptr(),
+                    *flags,
+                    *mode as libc::c_uint,
+                );
                 if fd < 0 {
                     errno_out()
                 } else {
@@ -265,13 +322,16 @@ fn execute(op: &OpSpec) -> (i32, OpOutput) {
                 if libc::fstatat(*dir, path.as_ptr(), &mut stx, 0) < 0 {
                     errno_out()
                 } else {
-                    let is_dir =
-                        (stx.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFDIR as u32;
+                    let is_dir = (stx.st_mode & libc::S_IFMT) == libc::S_IFDIR;
                     (0, OpOutput::IsDir(is_dir))
                 }
             }
             OpSpec::Write { fd, data } => {
-                let n = libc::write(*fd, data.as_ptr() as *const libc::c_void, data.len());
+                let n = libc::write(
+                    *fd,
+                    data.as_ptr() as *const libc::c_void,
+                    data.len(),
+                );
                 if n < 0 {
                     errno_out()
                 } else {
@@ -279,11 +339,21 @@ fn execute(op: &OpSpec) -> (i32, OpOutput) {
                 }
             }
             OpSpec::Fsync { fd } => io_result(libc::fsync(*fd)),
-            OpSpec::Rename { olddir, old, newdir, new } => {
-                io_result(libc::renameat(*olddir, old.as_ptr(), *newdir, new.as_ptr()))
-            }
+            OpSpec::Rename {
+                olddir,
+                old,
+                newdir,
+                new,
+            } => io_result(libc::renameat(
+                *olddir,
+                old.as_ptr(),
+                *newdir,
+                new.as_ptr(),
+            )),
             OpSpec::Close { fd } => io_result(libc::close(*fd)),
-            OpSpec::Unlink { dir, path } => io_result(libc::unlinkat(*dir, path.as_ptr(), 0)),
+            OpSpec::Unlink { dir, path } => {
+                io_result(libc::unlinkat(*dir, path.as_ptr(), 0))
+            }
         }
     }
 }
@@ -295,7 +365,9 @@ fn io_result(r: i32) -> (i32, OpOutput) {
     }
 }
 fn errno_out() -> (i32, OpOutput) {
-    let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+    let e = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO);
     (-e, OpOutput::None)
 }
 
@@ -309,7 +381,7 @@ fn put(
     tmp: &str,
     fin: &str,
     body: Vec<u8>,
-    done: Box<dyn FnOnce(Result<String, i32>)>,
+    done: Done,
 ) {
     let key = rt.begin(ReqState {
         key: 0,
@@ -341,7 +413,13 @@ fn on_tmp_open(c: &Completion, st: &mut ReqState, stage: &mut Staging) {
             // + parent dirfd. No data forwarding across a link -> plain fds
             // suffice, no fixed-file table needed.
             let items: Vec<(OpSpec, Callback)> = vec![
-                (OpSpec::Write { fd, data: std::mem::take(&mut st.body) }, Box::new(on_step)),
+                (
+                    OpSpec::Write {
+                        fd,
+                        data: std::mem::take(&mut st.body),
+                    },
+                    Box::new(on_step),
+                ),
                 (OpSpec::Fsync { fd }, Box::new(on_step)),
                 (
                     OpSpec::Rename {
@@ -367,12 +445,19 @@ fn on_step(c: &Completion, st: &mut ReqState, stage: &mut Staging) {
         st.failed = true;
         st.finish(Err(c.res));
         stage.one(
-            OpSpec::Unlink { dir: st.dir, path: st.tmp_path.clone() },
+            OpSpec::Unlink {
+                dir: st.dir,
+                path: st.tmp_path.clone(),
+            },
             st.key,
             Box::new(ignore),
         );
         if st.tmp_fd >= 0 {
-            stage.one(OpSpec::Close { fd: st.tmp_fd }, st.key, Box::new(ignore));
+            stage.one(
+                OpSpec::Close { fd: st.tmp_fd },
+                st.key,
+                Box::new(ignore),
+            );
         }
     }
 }
@@ -387,18 +472,17 @@ fn on_committed(c: &Completion, st: &mut ReqState, stage: &mut Staging) {
         st.failed = r.is_err();
         st.finish(r);
         if st.tmp_fd >= 0 {
-            stage.one(OpSpec::Close { fd: st.tmp_fd }, st.key, Box::new(ignore));
+            stage.one(
+                OpSpec::Close { fd: st.tmp_fd },
+                st.key,
+                Box::new(ignore),
+            );
         }
     }
 }
 
 /// stat -> (if a regular file) open. A directory finishes without opening.
-fn stat_then_open(
-    rt: &mut Reactor,
-    dir: RawFd,
-    name: &str,
-    done: Box<dyn FnOnce(Result<String, i32>)>,
-) {
+fn stat_then_open(rt: &mut Reactor, dir: RawFd, name: &str, done: Done) {
     let key = rt.begin(ReqState {
         key: 0,
         dir,
@@ -409,14 +493,28 @@ fn stat_then_open(
         failed: false,
         done: Some(done),
     });
-    rt.staging.one(OpSpec::StatIsDir { dir, path: cstr(name) }, key, Box::new(on_stat));
+    rt.staging.one(
+        OpSpec::StatIsDir {
+            dir,
+            path: cstr(name),
+        },
+        key,
+        Box::new(on_stat),
+    );
 }
 
 fn on_stat(c: &Completion, st: &mut ReqState, stage: &mut Staging) {
     match c.out {
-        OpOutput::IsDir(true) => st.finish(Ok("is a directory (not opened)".to_string())),
+        OpOutput::IsDir(true) => {
+            st.finish(Ok("is a directory (not opened)".to_string()))
+        }
         OpOutput::IsDir(false) => stage.one(
-            OpSpec::OpenAt { dir: st.dir, path: st.final_path.clone(), flags: libc::O_RDONLY, mode: 0 },
+            OpSpec::OpenAt {
+                dir: st.dir,
+                path: st.final_path.clone(),
+                flags: libc::O_RDONLY,
+                mode: 0,
+            },
             st.key,
             Box::new(on_open),
         ),
@@ -443,7 +541,8 @@ fn cstr(s: &str) -> CString {
 }
 
 fn main() {
-    let base = std::env::temp_dir().join(format!("fs_cb_demo_{}", std::process::id()));
+    let base =
+        std::env::temp_dir().join(format!("fs_cb_demo_{}", std::process::id()));
     std::fs::create_dir_all(&base).unwrap();
     let dir = open_dir(&base);
 
@@ -462,7 +561,9 @@ fn main() {
     report_file(&base, "obj1");
     report_absent(&base, "obj1.tmp");
 
-    println!("== Demo 2: atomic PUT (rename fails -> fail-fast, no half-write) ==");
+    println!(
+        "== Demo 2: atomic PUT (rename fails -> fail-fast, no half-write) =="
+    );
     put(
         &mut rt,
         dir,
@@ -476,9 +577,24 @@ fn main() {
     report_absent(&base, "nope"); // never created
 
     println!("== Demo 3: stat -> open chain ==");
-    stat_then_open(&mut rt, dir, "obj1", Box::new(|r| println!("  [open obj1]     -> {:?}", r)));
-    stat_then_open(&mut rt, dir, ".", Box::new(|r| println!("  [open .]        -> {:?}", r)));
-    stat_then_open(&mut rt, dir, "missing", Box::new(|r| println!("  [open missing]  -> {:?}", r)));
+    stat_then_open(
+        &mut rt,
+        dir,
+        "obj1",
+        Box::new(|r| println!("  [open obj1]     -> {:?}", r)),
+    );
+    stat_then_open(
+        &mut rt,
+        dir,
+        ".",
+        Box::new(|r| println!("  [open .]        -> {:?}", r)),
+    );
+    stat_then_open(
+        &mut rt,
+        dir,
+        "missing",
+        Box::new(|r| println!("  [open missing]  -> {:?}", r)),
+    );
     rt.run_until_idle();
 
     // SAFETY: `dir` is a live fd we opened above and no longer use.
@@ -491,8 +607,14 @@ fn main() {
 fn open_dir(p: &std::path::Path) -> RawFd {
     let c = CString::new(p.as_os_str().as_bytes()).unwrap();
     // SAFETY: `c` is a valid NUL-terminated path live for the call.
-    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
-    assert!(fd >= 0, "open dir {:?}: {}", p, std::io::Error::last_os_error());
+    let fd =
+        unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    assert!(
+        fd >= 0,
+        "open dir {:?}: {}",
+        p,
+        std::io::Error::last_os_error()
+    );
     fd
 }
 
@@ -508,5 +630,9 @@ fn report_file(base: &std::path::Path, name: &str) {
     }
 }
 fn report_absent(base: &std::path::Path, name: &str) {
-    println!("  {:?} present? {}  (expected: false)", name, base.join(name).exists());
+    println!(
+        "  {:?} present? {}  (expected: false)",
+        name,
+        base.join(name).exists()
+    );
 }

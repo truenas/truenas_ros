@@ -726,7 +726,7 @@ impl FsCore {
         // Teardown: the loop is dying — just report the outcome and hand any
         // buffers back. A file's fd is released when its op entry (and thus its
         // parked `Arc`) is dropped with the ring teardown.
-        let _ = deliver(waiter, map_res(cqe.res), bufs, None, stat);
+        deliver(waiter, map_res(cqe.res), bufs, None, stat);
     }
 
     /// Leak the op table without dropping it — used ONLY when a teardown
@@ -783,7 +783,7 @@ impl FsCore {
         e.clear();
         entry.generation += 1;
         self.op_free.push(op_slot);
-        let _ = deliver(waiter, Err(err), bufs, None, None);
+        deliver(waiter, Err(err), bufs, None, None);
     }
 }
 
@@ -1535,12 +1535,7 @@ mod routing_fuzz {
     /// A fresh real fd (so close-last is observable); `/dev/null` always opens.
     fn synth_fd() -> RawFd {
         // SAFETY: a static NUL-terminated path; open cannot corrupt memory.
-        let fd = unsafe {
-            libc::open(
-                b"/dev/null\0".as_ptr().cast::<libc::c_char>(),
-                libc::O_RDWR,
-            )
-        };
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
         assert!(fd >= 0, "open /dev/null");
         fd
     }

@@ -83,7 +83,7 @@
 //!   `CAP_DAC_OVERRIDE` — the kernel's own permission checks then bind the
 //!   daemon exactly as they would bind the user.
 
-use super::{UringFs, Personality};
+use super::{Personality, UringFs};
 use crate::errno::{self, retry_on_eintr, Errno};
 use std::ffi::c_void;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};

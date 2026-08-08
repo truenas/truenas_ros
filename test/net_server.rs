@@ -5510,8 +5510,8 @@ fn server_builds_with_fs_pool() {
 fn fs_static_file_server_open_read_reply() {
     use std::ffi::CString;
     use std::sync::OnceLock;
-    use truenas_ros::uring_fs::{Anchor, Personality};
     use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality};
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("hello.txt"), b"contents of hello").unwrap();
@@ -5615,8 +5615,8 @@ fn fs_static_file_server_open_read_reply() {
 fn fs_file_carries_personality_and_as_root() {
     use std::ffi::CString;
     use std::sync::OnceLock;
-    use truenas_ros::uring_fs::{Anchor, Personality};
     use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality};
 
     let dir = tempfile::tempdir().unwrap();
     let fpath = dir.path().join("f.txt");
@@ -5746,8 +5746,8 @@ fn set_user_xattr(path: &Path, name: &[u8], value: &[u8]) -> bool {
 fn fs_metadata_ops_rename_truncate_xattr() {
     use std::ffi::CString;
     use std::sync::OnceLock;
-    use truenas_ros::uring_fs::{Anchor, Leaf, Personality};
     use truenas_ros::sync_fs::{OFlag, OpenHow, RenameFlags};
+    use truenas_ros::uring_fs::{Anchor, Leaf, Personality};
 
     let dir = tempfile::tempdir().unwrap();
     let orig = dir.path().join("orig.txt");
@@ -5925,8 +5925,8 @@ fn fs_metadata_ops_rename_truncate_xattr() {
 fn fs_owned_files_swept_on_connection_close() {
     use std::ffi::CString;
     use std::sync::OnceLock;
-    use truenas_ros::uring_fs::{Anchor, Personality};
     use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality};
 
     const N: usize = 16;
     let dir = tempfile::tempdir().unwrap();
@@ -6031,8 +6031,8 @@ fn fs_owned_files_swept_on_connection_close() {
 fn fs_continuation_cannot_open_a_new_file() {
     use std::ffi::CString;
     use std::sync::OnceLock;
-    use truenas_ros::uring_fs::{Anchor, Personality};
     use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality};
 
     const N: usize = 6;
     let dir = tempfile::tempdir().unwrap();
@@ -6160,8 +6160,8 @@ fn fs_broker_personality_gates_open() {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::sync::OnceLock;
-    use truenas_ros::uring_fs::{Anchor, AsUser, CredBroker, Personality};
     use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, AsUser, CredBroker, Personality};
 
     if !is_root() {
         return; // the broker cannot become another uid without CAP_SETUID
@@ -6307,8 +6307,8 @@ fn fs_as_root_reads_trusted_xattr_across_privilege() {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::sync::OnceLock;
-    use truenas_ros::uring_fs::{Anchor, AsUser, CredBroker, Personality};
     use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, AsUser, CredBroker, Personality};
 
     if !is_root() {
         return;
@@ -6472,8 +6472,8 @@ fn fs_fd_reclaimed_on_connection_close_midchain() {
     use std::os::unix::ffi::OsStrExt;
     use std::sync::OnceLock;
     use std::time::Duration;
-    use truenas_ros::uring_fs::{Anchor, Personality};
     use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality};
 
     let dir = tempfile::tempdir().unwrap();
     let fifo = dir.path().join("f.fifo");

@@ -165,7 +165,7 @@ pub use broker::{
     AsUser, BrokerReactor, CredBroker, CredHandle, IdentityCache, Lease,
     MAX_GROUPS, MAX_RINGS,
 };
-pub use host::{UringFs, FsConfig, ShutdownHandle};
+pub use host::{FsConfig, ShutdownHandle, UringFs};
 
 use crate::errno::{retry_on_eintr, Errno};
 use crate::fd::owned_from_raw;

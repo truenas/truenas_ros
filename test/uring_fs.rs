@@ -18,12 +18,12 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
-use truenas_ros::uring_fs::{
-    Anchor, AsUser, UringFs, CredBroker, CredHandle, FsConfig, FsHandle,
-    IdentityCache, Leaf, Personality, ShutdownHandle,
-};
 use truenas_ros::sync_fs::{
     AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, StatxMask,
+};
+use truenas_ros::uring_fs::{
+    Anchor, AsUser, CredBroker, CredHandle, FsConfig, FsHandle, IdentityCache,
+    Leaf, Personality, ShutdownHandle, UringFs,
 };
 use truenas_ros::{Errno, Error};
 
@@ -1010,8 +1010,8 @@ fn query_directory_lists_and_enriches() {
 #[test]
 fn query_directory_enumeration_obeys_dac() {
     use std::ffi::CString;
-    use truenas_ros::uring_fs::{query_directory, EnrichSpec, QueryOptions};
     use truenas_ros::errno::Errno;
+    use truenas_ros::uring_fs::{query_directory, EnrichSpec, QueryOptions};
 
     if !is_root() {
         return; // the broker cannot become another uid without CAP_SETUID

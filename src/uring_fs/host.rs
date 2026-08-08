@@ -467,7 +467,6 @@ impl UringFs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::uring_fs::{Anchor, FsConfig, Personality};
     use crate::sync_fs::openat2::RawOpenHow;
     use crate::sync_fs::{OFlag, OpenHow};
     use crate::uring::ring::Ring;
@@ -475,6 +474,7 @@ mod tests {
         io_uring_setup, unregister_personality, IoUringParams,
         IORING_OP_FSETXATTR, IORING_SETUP_SINGLE_ISSUER,
     };
+    use crate::uring_fs::{Anchor, FsConfig, Personality};
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;

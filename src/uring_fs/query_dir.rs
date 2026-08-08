@@ -107,6 +107,9 @@ impl QueryDir {
 
     /// The next enriched batch of up to `clump` entries, or `None` at
     /// end-of-directory. A `readdir` error surfaces as `Some(Err)`.
+    // Inherent `next`, not `Iterator`: `QueryDir` owns a `!Send` `DIR*` and
+    // yields fallible batches the caller drives.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<crate::Result<Vec<DirEntry>>> {
         match self.read_clump() {
             Ok(names) if names.is_empty() => None,
