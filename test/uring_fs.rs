@@ -1072,12 +1072,22 @@ fn query_directory_drop_closes_dir_fd() {
         // Pull one batch, then drop mid-walk (files remain unread).
         let first = q.next().expect("a batch").unwrap();
         assert!(!first.is_empty());
-        assert!(std::fs::read_link(&link).is_ok(), "dir fd open during walk");
+        let target =
+            std::fs::read_link(&link).expect("dir fd open during walk");
         drop(q);
-        assert!(
-            std::fs::read_link(&link).is_err(),
-            "dir fd closed on drop, not deferred to teardown"
-        );
+        // `Drop` closes the `DIR*` (and its dup fd) synchronously via `closedir`.
+        // The freed fd *number* can be reused by the reactor thread running
+        // concurrently, so assert the fd no longer names our directory — closed
+        // (`Err`) or reused for something else (a different target) — rather than
+        // that the number is merely absent, which fd reuse would race.
+        match std::fs::read_link(&link) {
+            Err(_) => {}
+            Ok(reused) => assert_ne!(
+                reused, target,
+                "dir fd still open and still the directory after drop \
+                 (deferred to teardown?)"
+            ),
+        }
     });
 }
 
