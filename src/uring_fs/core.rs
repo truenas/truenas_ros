@@ -18,7 +18,7 @@
 //!   `(tag, op-slot, generation)`; an op entry frees only at its own single
 //!   terminal CQE, so a stale / duplicate / wrong-tag completion is rejected.
 
-use super::query_dir::WorkerPool;
+use super::query_dir::SharedPool;
 use super::{
     statx_at_flags, Anchor, File, FsOutcome, Leaf, Personality, ReplyTo,
 };
@@ -220,11 +220,9 @@ struct OffloadEntry {
 pub(crate) struct FsCore {
     ops: Vec<SlotEntry<FsOpEntry>>,
     op_free: Vec<u32>,
-    /// The blocking worker pool for [`FsConn::offload`], spawned on first use.
-    pool: Option<WorkerPool>,
-    /// The offload pool's warm floor and growth ceiling (set before first use).
-    offload_floor: usize,
-    offload_ceiling: usize,
+    /// This reactor's one blocking-work pool (shared with off-loop
+    /// [`QueryPool`](super::query_dir::QueryPool)s), spawned on first use.
+    pool: Arc<SharedPool>,
     /// Where workers push finished jobs; drained on the loop's wake.
     completions: Arc<Mutex<VecDeque<PoolCompletion>>>,
     /// Reactor-side continuations for in-flight offloads, keyed by token.
@@ -242,22 +240,20 @@ impl FsCore {
                 })
                 .collect(),
             op_free: (0..op_slots).rev().collect(),
-            pool: None,
-            offload_floor: OFFLOAD_FLOOR,
-            offload_ceiling: OFFLOAD_CEILING,
+            pool: SharedPool::new(OFFLOAD_FLOOR, OFFLOAD_CEILING),
             completions: Arc::new(Mutex::new(VecDeque::new())),
             offload_reg: HashMap::new(),
             next_offload: 0,
         }
     }
 
-    /// Set the offload pool's warm floor and growth ceiling. Takes effect only
-    /// before the pool is spawned (first offload), so call it at setup; sizes
-    /// the per-reactor thread budget for opcode-less blocking work.
+    /// Set the offload pool's warm floor and growth ceiling. Replaces the
+    /// (unspawned) pool, so call it at setup before minting any
+    /// [`FsHandle`](super::FsHandle); sizes the per-reactor thread budget for
+    /// opcode-less blocking work.
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     pub(crate) fn set_offload_bounds(&mut self, floor: usize, ceiling: usize) {
-        self.offload_floor = floor.max(1);
-        self.offload_ceiling = ceiling.max(self.offload_floor);
+        self.pool = SharedPool::new(floor, ceiling);
     }
 
     // ---- off-loop offload: run a blocking job, deliver its result on-loop ----
@@ -280,27 +276,18 @@ impl FsCore {
         Arc::clone(&self.completions)
     }
 
-    /// Submit `job` to the offload pool (spawned on first use). If a worker
-    /// thread cannot be spawned (pid/memory pressure), run `job` inline rather
-    /// than panic on the reactor and take every connection down: the job still
-    /// pushes its completion and pokes the wake, so delivery is unchanged, only
-    /// synchronous: a degraded loop, not a dead one.
+    /// A clone of this reactor's shared offload pool, for minting an
+    /// [`FsHandle`](super::FsHandle) that submits blocking work to the same
+    /// pool off-loop.
+    pub(crate) fn pool_handle(&self) -> Arc<SharedPool> {
+        Arc::clone(&self.pool)
+    }
+
+    /// Submit `job` to this reactor's shared offload pool (spawned on first
+    /// use). If a worker thread cannot be spawned the job runs inline rather
+    /// than take the reactor down; see [`SharedPool::submit`].
     fn submit_offload(&mut self, job: Box<dyn FnOnce() + Send>) {
-        if self.pool.is_none() {
-            match WorkerPool::try_elastic(
-                self.offload_floor,
-                self.offload_ceiling,
-            ) {
-                Ok(pool) => self.pool = Some(pool),
-                Err(_) => {
-                    job();
-                    return;
-                }
-            }
-        }
-        if let Some(pool) = self.pool.as_ref() {
-            pool.submit(job);
-        }
+        self.pool.submit(job);
     }
 
     /// Take every finished offload paired with its owner + continuation. The
@@ -1030,7 +1017,12 @@ impl<'a> FsConn<'a> {
         }
         let bytes = path.to_bytes();
         if bytes.is_empty() || bytes[0] == b'/' {
-            return; // anchor-relative only
+            // Server facade: anchor-relative only (and `root`-gated above),
+            // deliberately stricter than the general-client `FsHandle::open`
+            // (`open_parts`), which allows an absolute path when the caller
+            // drops `RESOLVE_BENEATH`. The two validations differ on purpose;
+            // do not unify them.
+            return;
         }
         let mut raw = how.to_raw();
         if raw.resolve == 0 {
@@ -1136,6 +1128,31 @@ impl<'a> FsConn<'a> {
         );
     }
 
+    /// Flush the byte range `[offset, offset + length)` of `f` as `who`
+    /// (`datasync` selects `fdatasync` semantics); `offset == 0 && length == 0`
+    /// syncs the whole file. `length` is the SQE's 32-bit field.
+    pub fn fsync_range<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        datasync: bool,
+        offset: u64,
+        length: u32,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.fs.submit_fsync(
+            self.eng,
+            who.0,
+            f.fd,
+            datasync,
+            offset,
+            length,
+            embed(self.owner, on_done),
+        );
+    }
+
     /// Stat the entry `leaf` inside `anchor` as `who` (no terminal-symlink
     /// follow by default; opt in with `AT_SYMLINK_FOLLOW`).
     pub fn statx<F>(
@@ -1186,6 +1203,22 @@ impl<'a> FsConn<'a> {
             mask.bits(),
             embed(self.owner, on_done),
         );
+    }
+
+    /// Stat the open file `f` itself (`AT_EMPTY_PATH` on its fd) as `who`, the
+    /// on-loop twin of [`FsHandle::fstatx`](super::FsHandle::fstatx).
+    pub fn fstatx<F>(
+        &mut self,
+        who: Personality,
+        f: &File,
+        flags: AtFlags,
+        mask: StatxMask,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        let anchor = Anchor::from_shared(f.fd.clone());
+        self.statx_anchor(who, &anchor, flags, mask, on_done);
     }
 
     /// Read extended attribute `name` from `f` into `buf` as `who`. Needs
@@ -1680,6 +1713,19 @@ impl FsConn<'_> {
             // re-arms the READ, so no poke is lost — the inject-path pattern).
             wake.wake.poke();
         }));
+    }
+
+    /// Offload a `flistxattr` of `f` to the pool and deliver its attribute
+    /// names (all namespaces, sorted) on the loop. The list runs at the
+    /// reactor's privilege, so it proposes candidates only: a caller relaying to
+    /// a `who` must read each value under `who` (via
+    /// [`fgetxattr`](Self::fgetxattr)) and drop the denials, exactly as the
+    /// directory enrichment does.
+    pub fn flistxattr<F>(&mut self, f: File, on_done: F)
+    where
+        F: FnOnce(crate::Result<Vec<CString>>, &mut FsConn<'_>) + 'static,
+    {
+        self.offload(move || super::query_dir::list_xattr_names(&f), on_done);
     }
 
     /// Open `anchor` itself readable **under `who`** on the ring (the DAC /
@@ -2212,6 +2258,43 @@ fn deliver(
             drop((bufs, file, stat));
         }
         None => {}
+    }
+}
+
+/// Deliver every finished offload's continuation on-loop, each with a fresh
+/// owner-scoped [`FsConn`] (`root` per the host: the standalone reactor passes
+/// `true`, a net-server continuation `false`). Shared by the host and the net
+/// server so the wake-drain is written once.
+pub(crate) fn deliver_pool_completions(
+    fs: &mut FsCore,
+    eng: &mut Engine,
+    fd_xattr_ok: bool,
+    ftruncate_ok: bool,
+    root: bool,
+) {
+    for (owner, deliver, any) in fs.take_pool_completions() {
+        let mut conn =
+            FsConn::new(fs, eng, owner, fd_xattr_ok, ftruncate_ok, root);
+        deliver(any, &mut conn);
+    }
+}
+
+/// Fire an embedded on-loop completion reaped by [`FsCore::on_cqe`] with a
+/// fresh owner-scoped [`FsConn`]; a no-op when `on_cqe` returned `None` (a
+/// channel op already delivered, or an inert stale CQE). Shared by the host and
+/// the net server so the CQE hand-back is written once.
+pub(crate) fn deliver_embedded(
+    fs: &mut FsCore,
+    eng: &mut Engine,
+    reaped: Option<(EmbeddedCb, FsDone, Owner)>,
+    fd_xattr_ok: bool,
+    ftruncate_ok: bool,
+    root: bool,
+) {
+    if let Some((cb, done, owner)) = reaped {
+        let mut conn =
+            FsConn::new(fs, eng, owner, fd_xattr_ok, ftruncate_ok, root);
+        cb(done, &mut conn);
     }
 }
 

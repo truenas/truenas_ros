@@ -5700,6 +5700,124 @@ fn fs_dir_listing_replies_through_the_wake_drain() {
     assert_eq!(reply, b"3", "listing counted the three entries and replied");
 }
 
+/// `FsConn::flistxattr` enumerates a file's xattr names on-loop: it opens the
+/// file on the ring, offloads the `flistxattr` to the pool, and delivers the
+/// names on the loop, answered via `Deferred` (same drain path as the listing).
+#[cfg(feature = "uring-fs")]
+#[test]
+fn fs_conn_flistxattr_lists_file_xattrs() {
+    use std::ffi::CString;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality};
+
+    let dir = tempfile::tempdir().unwrap();
+    let fp = dir.path().join("f.txt");
+    std::fs::write(&fp, b"x").unwrap();
+    // Seed two user xattrs with a plain syscall (independent of fd-xattr
+    // support, which only gates the ring read/write ops).
+    let cpath = CString::new(fp.to_string_lossy().as_bytes().to_vec()).unwrap();
+    for (name, val) in [("user.a", b"1".as_slice()), ("user.b", b"22")] {
+        let cname = CString::new(name).unwrap();
+        // SAFETY: `cpath`/`cname` are valid NUL-terminated C strings; `val` is a
+        // valid buffer of `val.len()` bytes for the syscall's duration.
+        let rc = unsafe {
+            libc::setxattr(
+                cpath.as_ptr(),
+                cname.as_ptr(),
+                val.as_ptr().cast(),
+                val.len(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return; // this fs refuses user xattrs
+        }
+    }
+
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+
+    let pc = Arc::clone(&pers);
+    let body = move |mut req: Request<'_, ()>| -> Response {
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let how = OpenHow::new().flags(OFlag::O_RDONLY);
+        fs.open(who, &anchor, c"f.txt", how, move |done, fs| {
+            let Some(file) = done.file() else {
+                return deferred.close();
+            };
+            fs.flistxattr(file, move |res, _fs| match res {
+                Ok(names) => {
+                    let joined = names
+                        .iter()
+                        .map(|c| c.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    deferred.reply(echo_frame(joined.as_bytes()));
+                }
+                Err(_) => deferred.close(),
+            });
+        });
+        Response::Defer(permit)
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let cfg = ServerConfig {
+        pool_size: 16,
+        fs_files: 8,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    pers.set(server.register_self().expect("register_self"))
+        .unwrap();
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let mut s = connect_tcp(v4)?;
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        send_framed(&mut s, b"list")?;
+        let reply = recv_framed(&mut s);
+        drop(s);
+        stop.shutdown();
+        reply
+    });
+    server.serve_forever().expect("serve_forever flistxattr");
+    let reply = client.join().unwrap().expect("client io");
+    let text = String::from_utf8_lossy(&reply);
+    assert!(
+        text.contains("user.a"),
+        "flistxattr listed user.a: {text:?}"
+    );
+    assert!(
+        text.contains("user.b"),
+        "flistxattr listed user.b: {text:?}"
+    );
+}
+
 /// `FsConn::fgetxattr_as_root` reads an xattr under the reactor's ambient
 /// (root) credentials (`sqe.personality = 0`) — the sanctioned privileged-read
 /// path for a `trusted.*`/`security.*` attribute a request's own identity

@@ -3,7 +3,10 @@
 //! (The core is host-agnostic — a `net` server is the other host, driving the
 //! same [`FsCore`] on its own ring.)
 
-use super::core::{FsConn, FsCore, FsWaiter, TAG_CANCEL, TAG_WAKE};
+use super::core::{
+    deliver_embedded, deliver_pool_completions, FsCore, FsWaiter, TAG_CANCEL,
+    TAG_WAKE,
+};
 use super::{FsHandle, FsInject, FsOutcome, Personality};
 use crate::errno::{self, Errno};
 use crate::uring::engine::Engine;
@@ -245,6 +248,7 @@ impl UringFs {
             shared: self.eng.shared.clone(),
             ftruncate_ok: self.ftruncate_ok,
             fd_xattr_ok: self.fd_xattr_ok,
+            pool: self.fs.pool_handle(),
         }
     }
 
@@ -302,17 +306,13 @@ impl UringFs {
                 // Fire on-loop deliveries from finished off-loop pool jobs
                 // (`FsConn::offload` and the hybrid lister). Additive: the
                 // `FsHandle` path never touches the pool.
-                for (owner, deliver, any) in self.fs.take_pool_completions() {
-                    let mut conn = FsConn::new(
-                        &mut self.fs,
-                        &mut self.eng,
-                        owner,
-                        fd_xattr_ok,
-                        ftruncate_ok,
-                        true,
-                    );
-                    deliver(any, &mut conn);
-                }
+                deliver_pool_completions(
+                    &mut self.fs,
+                    &mut self.eng,
+                    fd_xattr_ok,
+                    ftruncate_ok,
+                    true,
+                );
             }
             TAG_CANCEL => {}
             // Deliver a completion. An `FsHandle` op parks a channel waiter
@@ -320,19 +320,16 @@ impl UringFs {
             // (`FsConn`) hands its callback back to fire here with a fresh
             // owner-scoped `FsConn`.
             _ => {
-                if let Some((cb, done, owner)) =
-                    self.fs.on_cqe(&mut self.eng, tag, slot, gen32, cqe.res)
-                {
-                    let mut conn = FsConn::new(
-                        &mut self.fs,
-                        &mut self.eng,
-                        owner,
-                        fd_xattr_ok,
-                        ftruncate_ok,
-                        true,
-                    );
-                    cb(done, &mut conn);
-                }
+                let reaped =
+                    self.fs.on_cqe(&mut self.eng, tag, slot, gen32, cqe.res);
+                deliver_embedded(
+                    &mut self.fs,
+                    &mut self.eng,
+                    reaped,
+                    fd_xattr_ok,
+                    ftruncate_ok,
+                    true,
+                );
             }
         }
         Ok(())
@@ -409,6 +406,18 @@ impl UringFs {
                     aux32,
                     FsWaiter::Channel(reply),
                 ),
+                FsInject::FdMetaAsRoot {
+                    file,
+                    name,
+                    value,
+                    reply,
+                } => self.fs.submit_fgetxattr_as_root(
+                    &mut self.eng,
+                    file,
+                    name,
+                    value,
+                    FsWaiter::Channel(reply),
+                ),
                 FsInject::PathOp {
                     tag,
                     pers,
@@ -468,6 +477,9 @@ impl UringFs {
                 // anyway: nothing to reply to, nothing to reclaim.
                 FsInject::Fsync { reply, .. } => (Some(reply), Vec::new()),
                 FsInject::FdMeta { reply, value, .. } => {
+                    (Some(reply), vec![value])
+                }
+                FsInject::FdMetaAsRoot { reply, value, .. } => {
                     (Some(reply), vec![value])
                 }
                 FsInject::PathOp { reply, .. } => (Some(reply), Vec::new()),

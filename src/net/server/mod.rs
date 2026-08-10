@@ -879,21 +879,18 @@ where
             if let Some(fs) = self.fs.as_mut() {
                 let (tag, fslot, fgen) =
                     crate::uring::user_data::unpack_raw(cqe.user_data);
-                let fired =
+                let reaped =
                     fs.on_cqe(&mut self.core.engine, tag, fslot, fgen, cqe.res);
-                if let Some((cb, done, owner)) = fired {
-                    let mut conn = crate::uring_fs::core::FsConn::new(
-                        fs,
-                        &mut self.core.engine,
-                        owner,
-                        fd_xattr_ok,
-                        ftruncate_ok,
-                        // Continuation facade: no new `open` (the owning
-                        // connection may be gone — its file would leak).
-                        false,
-                    );
-                    cb(done, &mut conn);
-                }
+                // Continuation facade `root: false`: no new `open` (the owning
+                // connection may be gone; its file would leak).
+                crate::uring_fs::core::deliver_embedded(
+                    fs,
+                    &mut self.core.engine,
+                    reaped,
+                    fd_xattr_ok,
+                    ftruncate_ok,
+                    false,
+                );
             }
             return Ok(());
         }
