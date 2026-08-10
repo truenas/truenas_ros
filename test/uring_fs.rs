@@ -22,8 +22,10 @@ use truenas_ros::sync_fs::{
     AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, StatxMask,
 };
 use truenas_ros::uring_fs::{
-    Anchor, AsUser, CredBroker, CredHandle, FsConfig, FsHandle, IdentityCache,
-    Leaf, Personality, ShutdownHandle, UringFs,
+    query_directory, query_tree, Advice, Anchor, AsUser, Caps, CredBroker,
+    CredHandle, EnrichSpec, FsConfig, FsHandle, IdentityCache, Leaf, Order,
+    Personality, PrivilegedXattrs, QueryOptions, RwFlags, ShutdownHandle,
+    TreeCursor, TreeOptions, UringFs,
 };
 use truenas_ros::{Errno, Error};
 
@@ -60,27 +62,6 @@ impl Drop for StopGuard {
     }
 }
 
-/// What the running kernel supports, for tests that must gate on it.
-#[derive(Clone, Copy)]
-struct Caps {
-    fd_xattr: bool,
-    ftruncate: bool,
-}
-
-/// `fd_xattr` needs Linux >= 6.13 (kernel commit dc7e76ba7a60). Skip where
-/// absent, unless the environment demands full coverage.
-fn require_fd_xattr(caps: Caps) -> bool {
-    if !caps.fd_xattr {
-        assert!(
-            std::env::var_os("TRUENAS_ROS_REQUIRE_FD_XATTR").is_none(),
-            "TRUENAS_ROS_REQUIRE_FD_XATTR set but this kernel rejects \
-             fixed-file xattr ops (needs Linux >= 6.13)"
-        );
-        return false;
-    }
-    true
-}
-
 /// Pin a known umask for the whole binary. Several tests assert on the mode
 /// of something they create — `mkdirat`'s mode argument, or a setup file an
 /// impersonated user has to be able to read — and the kernel masks every one
@@ -101,14 +82,6 @@ fn with_fs<F>(cfg: FsConfig, client: F)
 where
     F: FnOnce(FsHandle, Personality, PathBuf, ShutdownHandle) + Send,
 {
-    with_fs_caps(cfg, |h, me, dir, stop, _caps| client(h, me, dir, stop))
-}
-
-/// [`with_fs`] plus the probed kernel capabilities.
-fn with_fs_caps<F>(cfg: FsConfig, client: F)
-where
-    F: FnOnce(FsHandle, Personality, PathBuf, ShutdownHandle, Caps) + Send,
-{
     pin_umask();
     let dir = tempfile::tempdir().expect("tempdir");
     let mut afs = match UringFs::new(cfg) {
@@ -121,10 +94,6 @@ where
         }
     };
     let me = afs.register_self().expect("register_self");
-    let caps = Caps {
-        fd_xattr: afs.supports_fd_xattr(),
-        ftruncate: afs.supports_ftruncate(),
-    };
     let handle = afs.handle();
     let stop = afs.shutdown_handle();
     let dir_path = dir.path().to_path_buf();
@@ -132,7 +101,7 @@ where
         let stop_for_client = stop.clone();
         s.spawn(move || {
             let _guard = StopGuard(stop);
-            client(handle, me, dir_path, stop_for_client, caps);
+            client(handle, me, dir_path, stop_for_client);
         });
         afs.run().expect("run");
     });
@@ -518,10 +487,7 @@ fn write_pread_offsets() {
 fn open_metadata_close_workflow() {
     // The shape the API is built to encourage: open once, do every metadata
     // op against the resulting fd, close. No path is named after the open.
-    with_fs_caps(FsConfig::default(), |h, me, dir, _stop, caps| {
-        if !require_fd_xattr(caps) {
-            return;
-        }
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let f = h.open(me, &anchor, "doc.bin", creat_rw()).unwrap();
 
@@ -577,20 +543,14 @@ fn open_metadata_close_workflow() {
 
 #[test]
 fn ftruncate_by_fd_or_unsupported() {
-    with_fs_caps(FsConfig::default(), |h, me, dir, _stop, caps| {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let f = h.open(me, &anchor, "t.bin", creat_rw()).unwrap();
         let (n, _b) = h.pwrite(me, &f, vec![b'y'; 100], 0);
         assert_eq!(n.unwrap(), 100);
 
-        let res = h.ftruncate(me, &f, 10);
-        if caps.ftruncate {
-            res.expect("ftruncate");
-            assert_eq!(std::fs::metadata(dir.join("t.bin")).unwrap().len(), 10);
-        } else {
-            // Below 6.9 the op is disabled, not attempted.
-            assert!(matches!(res, Err(Error::Errno(Errno::EOPNOTSUPP))));
-        }
+        h.ftruncate(me, &f, 10).expect("ftruncate");
+        assert_eq!(std::fs::metadata(dir.join("t.bin")).unwrap().len(), 10);
         h.close(f).unwrap();
     });
 }
@@ -604,10 +564,7 @@ fn fd_metadata_respects_close_last() {
         files: 1,
         ..FsConfig::default()
     };
-    with_fs_caps(cfg, |h, me, dir, _stop, caps| {
-        if !require_fd_xattr(caps) {
-            return;
-        }
+    with_fs(cfg, |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let f = h.open(me, &anchor, "a.bin", creat_rw()).unwrap();
         let name = xattr_name("user.k");
@@ -840,11 +797,566 @@ fn rename_across_two_anchors() {
     });
 }
 
+/// An `O_TMPFILE` create is invisible until `linkat` names it, and complete the
+/// instant it becomes visible — the durable-publish property an object store
+/// needs. Also pins that the file really has no name beforehand: the directory
+/// stays empty while the data is being written.
+#[test]
+fn o_tmpfile_is_invisible_until_linkat_publishes_it() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+
+        // O_TMPFILE names the *directory*; the file it creates has no entry.
+        // Deliberately no O_EXCL — that is the "never linkable" opt-out.
+        let how = OpenHow::new()
+            .flags(OFlag::O_TMPFILE | OFlag::O_RDWR)
+            .mode(Mode::from_bits_truncate(0o600));
+        let f = h.open(me, &anchor, ".", how).expect("open O_TMPFILE");
+
+        let (n, _) = h.pwrite(me, &f, b"published atomically".to_vec(), 0);
+        assert_eq!(n.expect("write"), 20);
+        h.fdatasync(me, &f).expect("fdatasync");
+
+        // Written, synced, and still nowhere in the namespace.
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "an unlinked O_TMPFILE must not appear in its directory"
+        );
+
+        h.linkat_file(me, &f, &anchor, leaf("object"))
+            .expect("linkat AT_EMPTY_PATH");
+
+        // Visible, and already whole: no window where a reader sees a partial
+        // file, which is the entire point of publishing this way.
+        assert_eq!(
+            std::fs::read(dir.join("object")).unwrap(),
+            b"published atomically"
+        );
+    });
+}
+
+/// `linkat` cannot replace an existing name, so overwriting is link-to-temp
+/// then rename. Pins the `EEXIST` that forces the two-step, and that the
+/// rename really does replace the old content atomically.
+#[test]
+fn linkat_file_cannot_replace_but_rename_can() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        std::fs::write(dir.join("object"), b"old").unwrap();
+
+        let how = OpenHow::new()
+            .flags(OFlag::O_TMPFILE | OFlag::O_RDWR)
+            .mode(Mode::from_bits_truncate(0o600));
+        let f = h.open(me, &anchor, ".", how).expect("open O_TMPFILE");
+        let (n, _) = h.pwrite(me, &f, b"new".to_vec(), 0);
+        assert_eq!(n.expect("write"), 3);
+
+        // Straight at the live name: refused.
+        assert!(
+            matches!(
+                h.linkat_file(me, &f, &anchor, leaf("object")),
+                Err(Error::Errno(Errno::EEXIST))
+            ),
+            "linkat must not clobber an existing entry"
+        );
+        assert_eq!(std::fs::read(dir.join("object")).unwrap(), b"old");
+
+        // Land on a private name, then rename over the target.
+        h.linkat_file(me, &f, &anchor, leaf(".tmp.object"))
+            .expect("link to a staging name");
+        h.renameat(
+            me,
+            &anchor,
+            leaf(".tmp.object"),
+            &anchor,
+            leaf("object"),
+            RenameFlags::empty(),
+        )
+        .expect("rename over the target");
+
+        assert_eq!(std::fs::read(dir.join("object")).unwrap(), b"new");
+        assert!(!dir.join(".tmp.object").exists(), "staging name consumed");
+    });
+}
+
+/// `O_EXCL` with `O_TMPFILE` is the "this inode may never be linked" opt-out:
+/// the kernel withholds `I_LINKABLE`, and `vfs_link` then refuses an inode
+/// whose link count is zero. The failure is `ENOENT`, which says nothing about
+/// the real cause — hence the test, and hence the warning in the docs.
+#[test]
+fn o_tmpfile_with_o_excl_is_unlinkable() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let how = OpenHow::new()
+            .flags(OFlag::O_TMPFILE | OFlag::O_RDWR | OFlag::O_EXCL)
+            .mode(Mode::from_bits_truncate(0o600));
+        let f = h
+            .open(me, &anchor, ".", how)
+            .expect("O_TMPFILE|O_EXCL still opens");
+
+        assert!(
+            matches!(
+                h.linkat_file(me, &f, &anchor, leaf("object")),
+                Err(Error::Errno(Errno::ENOENT))
+            ),
+            "an O_EXCL temp file is permanently anonymous"
+        );
+        assert!(!dir.join("object").exists());
+    });
+}
+
+/// Which personality may publish an `O_TMPFILE`?
+///
+/// `AT_EMPTY_PATH` demands `f_cred == current_cred()` — a **pointer**
+/// comparison (`fs/namei.c:2631`). io_uring's `register_personality` stores
+/// `get_current_cred()`, so two registrations taken from unchanged credentials
+/// reference the same `struct cred`. This pins the consequence: two
+/// `register_self` ids are interchangeable for the link, because they *are*
+/// the same credentials. The requirement therefore bites across genuinely
+/// different identities (the broker's), not across id values.
+#[test]
+fn linkat_file_accepts_any_id_for_the_same_credentials() {
+    pin_umask();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut afs = match UringFs::new(FsConfig::default()) {
+        Ok(a) => a,
+        Err(e) => {
+            if should_skip(&e) {
+                return;
+            }
+            panic!("UringFs::new: {e}");
+        }
+    };
+    let opener = afs.register_self().expect("first register_self");
+    let linker = afs.register_self().expect("second register_self");
+    assert_ne!(opener.id(), linker.id(), "two distinct personality ids");
+
+    let h = afs.handle();
+    let stop = afs.shutdown_handle();
+    let dir_path = dir.path().to_path_buf();
+    thread::scope(|s| {
+        s.spawn(move || {
+            let _guard = StopGuard(stop);
+            let anchor = Anchor::open(dir_path.as_path()).expect("anchor");
+            let how = OpenHow::new()
+                .flags(OFlag::O_TMPFILE | OFlag::O_RDWR)
+                .mode(Mode::from_bits_truncate(0o600));
+            let f = h.open(opener, &anchor, ".", how).expect("open");
+            let (n, _) = h.pwrite(opener, &f, b"x".to_vec(), 0);
+            assert_eq!(n.expect("write"), 1);
+
+            h.linkat_file(linker, &f, &anchor, leaf("object"))
+                .expect("a different id over the same creds may link");
+            assert_eq!(std::fs::read(dir_path.join("object")).unwrap(), b"x");
+        });
+        afs.run().expect("run");
+    });
+}
+
+/// The allowlist's *refusals* are the security property, so they get the test.
+/// `security.` would grant file capabilities, `system.` would rewrite ACLs, and
+/// `user.` needs no privilege at all — none may be elevated. A bare `trusted.`
+/// is refused too: it would cover the entire namespace.
+#[test]
+fn privileged_xattr_prefixes_refuse_dangerous_namespaces() {
+    for bad in [
+        c"security.",
+        c"security.capability",
+        c"system.",
+        c"system.posix_acl_access",
+        c"user.",
+        c"user.anything",
+        c"trusted.", // the whole namespace: too broad
+        c"",
+        c"nonsense",
+    ] {
+        assert!(
+            matches!(
+                PrivilegedXattrs::new().allow_prefix(bad),
+                Err(Error::Validation(_))
+            ),
+            "prefix {bad:?} must be refused"
+        );
+    }
+    // Anything naming more than the bare `trusted.` namespace is fine.
+    PrivilegedXattrs::new()
+        .allow_prefix(c"trusted.myserver_")
+        .expect("a scoped trusted. prefix is allowed");
+}
+
+/// An allowlisted `trusted.*` write is elevated to the reactor's ambient
+/// credentials; an unlisted name in the same namespace, through the same call,
+/// is not — and unprivileged callers cannot even see the elevated name.
+///
+/// Requires privilege to be meaningful (the `trusted.` namespace is
+/// `CAP_SYS_ADMIN`-gated), so it skips when not root — and skips on kernels
+/// below 6.13, where fd-based xattrs are unavailable.
+#[test]
+fn privileged_xattr_allowlist_elevates_only_listed_names() {
+    if !is_root() {
+        return;
+    }
+    pin_umask();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut afs = match UringFs::new(FsConfig::default()) {
+        Ok(a) => a,
+        Err(e) => {
+            if should_skip(&e) {
+                return;
+            }
+            panic!("UringFs::new: {e}");
+        }
+    };
+    // Needs Linux >= 6.13; `TRUENAS_ROS_REQUIRE_FD_XATTR` (set by the QEMU CI
+    // job) turns the skip into a failure so this cannot quietly stop running.
+    afs.set_privileged_xattrs(
+        PrivilegedXattrs::new()
+            .allow_prefix(c"trusted.truenas_test_")
+            .expect("valid prefix"),
+    );
+
+    // A *brokered*, unprivileged identity: the whole point is that this
+    // personality could never write `trusted.*` itself.
+    let broker = match CredBroker::spawn(&[&afs]) {
+        Ok(b) => b,
+        Err(_) => return, // no privilege to impersonate here
+    };
+    let creds = broker.handle(0).expect("broker handle");
+    let nobody = creds
+        .register(&AsUser::new(65534, 65534))
+        .expect("register an unprivileged identity");
+
+    let h = afs.handle();
+    let stop = afs.shutdown_handle();
+    let dir_path = dir.path().to_path_buf();
+    thread::scope(|s| {
+        s.spawn(move || {
+            let _guard = StopGuard(stop);
+            let anchor = Anchor::open(dir_path.as_path()).expect("anchor");
+            std::fs::write(dir_path.join("obj"), b"data").unwrap();
+            // World-writable so the identity's failures are about the xattr
+            // namespace, not about reaching the file.
+            std::fs::set_permissions(
+                dir_path.join("obj"),
+                std::fs::Permissions::from_mode(0o666),
+            )
+            .unwrap();
+            let f = h
+                .open(
+                    nobody,
+                    &anchor,
+                    "obj",
+                    OpenHow::new().flags(OFlag::O_RDWR),
+                )
+                .expect("open as the unprivileged identity");
+
+            // Allowlisted: elevated, so it succeeds despite `nobody` holding
+            // no CAP_SYS_ADMIN.
+            let (res, _) = h.fsetxattr(
+                nobody,
+                &f,
+                &xattr_name("trusted.truenas_test_meta"),
+                b"server-owned".to_vec(),
+                0,
+            );
+            res.expect("an allowlisted name is written with ambient creds");
+
+            // Same namespace, same call, not listed: stays with the request
+            // identity and is refused by the kernel.
+            let (res, _) = h.fsetxattr(
+                nobody,
+                &f,
+                &xattr_name("trusted.other"),
+                b"nope".to_vec(),
+                0,
+            );
+            assert!(
+                matches!(res, Err(Error::Errno(Errno::EPERM))),
+                "an unlisted trusted.* name must not be elevated, got {res:?}"
+            );
+
+            // The stored value is real, and readable only with privilege.
+            let (res, buf) = h.fgetxattr_as_root(
+                &f,
+                &xattr_name("trusted.truenas_test_meta"),
+                vec![0u8; 64],
+            );
+            let n = res.expect("privileged read");
+            assert_eq!(&buf[..n], b"server-owned");
+
+            // ...and invisible to the identity that "owns" the file.
+            let (res, _) = h.fgetxattr(
+                nobody,
+                &f,
+                &xattr_name("trusted.truenas_test_meta"),
+                vec![0u8; 64],
+            );
+            assert!(
+                matches!(res, Err(Error::Errno(Errno::ENODATA))),
+                "trusted.* must be invisible unprivileged, got {res:?}"
+            );
+        });
+        afs.run().expect("run");
+    });
+}
+
+/// `preadv2`/`pwritev2` round-trip with a durability flag, and — the part that
+/// matters — an *unsupported* flag fails the operation instead of being
+/// silently dropped. A durability flag that no-ops would be the worst possible
+/// failure mode, so the degrade path is the assertion.
+#[test]
+fn preadv2_pwritev2_flags_apply_or_fail_loudly() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let f = h.open(me, &anchor, "rw2", creat_rw()).expect("open");
+
+        // No flags: identical to the plain forms.
+        let (n, _) =
+            h.pwritev2(me, &f, vec![b"alpha".to_vec()], 0, RwFlags::empty());
+        assert_eq!(n.expect("pwritev2"), 5);
+
+        // RWF_DSYNC: the write is itself durable, standing in for fdatasync.
+        let (n, _) =
+            h.pwritev2(me, &f, vec![b"-beta".to_vec()], 5, RwFlags::RWF_DSYNC);
+        assert_eq!(n.expect("pwritev2 RWF_DSYNC"), 5);
+
+        let (n, bufs) =
+            h.preadv2(me, &f, vec![vec![0u8; 10]], 0, RwFlags::empty());
+        assert_eq!(n.expect("preadv2"), 10);
+        assert_eq!(&bufs[0][..10], b"alpha-beta");
+        assert_eq!(std::fs::read(dir.join("rw2")).unwrap(), b"alpha-beta");
+
+        // A flag the filesystem does not implement must be refused outright.
+        // `RWF_ATOMIC` needs FMODE_CAN_ATOMIC_WRITE, which neither tmpfs nor
+        // ZFS sets; accept EOPNOTSUPP or EINVAL, but never a silent success.
+        let (res, _) =
+            h.pwritev2(me, &f, vec![b"x".to_vec()], 0, RwFlags::RWF_ATOMIC);
+        assert!(
+            matches!(res, Err(Error::Errno(Errno::EOPNOTSUPP | Errno::EINVAL))),
+            "an unsupported rw flag must fail the op, got {res:?}"
+        );
+        // ...and must not have written anything.
+        assert_eq!(std::fs::read(dir.join("rw2")).unwrap(), b"alpha-beta");
+
+        h.close(f).unwrap();
+    });
+}
+
+/// `open_confined` cannot be talked out of its confinement. `open` yields to a
+/// caller-supplied `resolve` (documented, and fine for a general opener); the
+/// confined form unions the guarantees in, so the same escape attempt that
+/// succeeds through `open` fails through `open_confined`.
+#[test]
+fn open_confined_cannot_be_weakened_by_the_caller() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::create_dir(dir.join("inner")).unwrap();
+        std::fs::write(dir.join("outside"), b"secret").unwrap();
+        let inner = Anchor::open(dir.join("inner").as_path()).unwrap();
+
+        // A caller-chosen `resolve` that drops BENEATH: `open` honours it, so
+        // `..` walks out of the anchor. This is the documented escape hatch.
+        let permissive = OpenHow::new()
+            .flags(OFlag::O_RDONLY)
+            .resolve(ResolveFlag::RESOLVE_NO_MAGICLINKS);
+        assert!(
+            h.open(me, &inner, "../outside", permissive).is_ok(),
+            "plain open honours a caller's weaker policy"
+        );
+
+        // Same request, confined: refused by the kernel during resolution.
+        let res = h.open_confined(me, &inner, "../outside", permissive);
+        assert!(
+            matches!(res, Err(Error::Errno(Errno::EXDEV | Errno::ELOOP))),
+            "confined open must refuse a `..` escape, got {res:?}"
+        );
+
+        // A symlink pointing out of the tree is refused too, even though the
+        // path itself contains no `..`.
+        std::os::unix::fs::symlink(dir.join("outside"), dir.join("inner/link"))
+            .unwrap();
+        let res = h.open_confined(me, &inner, "link", permissive);
+        assert!(
+            matches!(res, Err(Error::Errno(Errno::ELOOP | Errno::EXDEV))),
+            "confined open must not follow a symlink out, got {res:?}"
+        );
+
+        // And an absolute path cannot bypass the anchor.
+        let res = h.open_confined(me, &inner, "/etc/hostname", permissive);
+        assert!(res.is_err(), "confined open must refuse an absolute path");
+    });
+}
+
+/// `mkdir_path` is `mkdir -p`, confined: it creates what is missing, tolerates
+/// what exists, and refuses to build a path that would leave the anchor.
+#[test]
+fn mkdir_path_creates_confined_and_is_idempotent() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let mode = Mode::from_bits_truncate(0o755);
+
+        let leaf_anchor = h
+            .mkdir_path(me, &anchor, "a/b/c", mode)
+            .expect("create a nested tree");
+        assert!(dir.join("a/b/c").is_dir());
+
+        // The returned anchor really is the deepest directory: a leaf op
+        // through it lands in `a/b/c`.
+        h.mkdirat(me, &leaf_anchor, leaf("d"), mode)
+            .expect("mkdir through the returned anchor");
+        assert!(dir.join("a/b/c/d").is_dir());
+
+        // Idempotent: re-running changes nothing and still succeeds (this is
+        // also the lost-race outcome when two callers create the same tree).
+        h.mkdir_path(me, &anchor, "a/b/c", mode)
+            .expect("existing tree is not an error");
+        // Partially-existing trees extend rather than fail.
+        h.mkdir_path(me, &anchor, "a/b/other/deep", mode)
+            .expect("extend an existing prefix");
+        assert!(dir.join("a/b/other/deep").is_dir());
+
+        // Redundant separators name the same directories.
+        h.mkdir_path(me, &anchor, "a//b/", mode)
+            .expect("doubled and trailing slashes are tolerated");
+
+        // Confinement holds for every component, not just the first.
+        for bad in ["../escape", "a/../../escape", "/abs/path"] {
+            assert!(
+                h.mkdir_path(me, &anchor, bad, mode).is_err(),
+                "mkdir_path must refuse {bad:?}"
+            );
+        }
+        assert!(!dir.parent().unwrap().join("escape").exists());
+    });
+}
+
+/// `RESOLVE_NO_XDEV` is what makes "this tree is one filesystem" a rule the
+/// kernel enforces rather than a convention: a walk that would step onto
+/// another mount fails instead of quietly serving files from it. Uses a real
+/// mount boundary on the running system (on TrueNAS, a child dataset);
+/// self-skips where the root filesystem has no child mounts.
+#[test]
+fn confined_open_refuses_to_cross_a_mount_point() {
+    with_fs(FsConfig::default(), |h, me, _dir, _stop| {
+        let root = Anchor::open("/").expect("anchor /");
+        let root_dev = std::fs::metadata("/").unwrap().dev();
+
+        // Find a top-level directory that lives on a different filesystem.
+        let Some(name) =
+            std::fs::read_dir("/").unwrap().flatten().find_map(|e| {
+                let p = e.path();
+                let md = std::fs::metadata(&p).ok()?;
+                (md.is_dir() && md.dev() != root_dev)
+                    .then(|| e.file_name().into_string().ok())?
+            })
+        else {
+            return; // single-filesystem host: nothing to cross
+        };
+
+        let how = OpenHow::new().flags(OFlag::O_PATH | OFlag::O_DIRECTORY);
+
+        // Without NO_XDEV the crossing is allowed — it is an ordinary open.
+        h.open(me, &root, name.as_str(), how)
+            .unwrap_or_else(|e| panic!("plain open of /{name}: {e}"));
+
+        // With it, resolution stops at the mount boundary.
+        let res = h.open_confined(me, &root, name.as_str(), how);
+        assert!(
+            matches!(res, Err(Error::Errno(Errno::EXDEV))),
+            "crossing into /{name} must fail EXDEV, got {res:?}"
+        );
+    });
+}
+
+/// An abandoned upload leaves nothing to clean up — the property that removes
+/// the need for a temp-file sweeper. Drop the file instead of committing it
+/// and assert the staging directory is still empty.
+#[test]
+fn abandoned_tmpfile_leaves_nothing_behind() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::create_dir(dir.join("staging")).unwrap();
+        let staging = Anchor::open(dir.join("staging").as_path()).unwrap();
+        let how = OpenHow::new()
+            .flags(OFlag::O_TMPFILE | OFlag::O_RDWR)
+            .mode(Mode::from_bits_truncate(0o644));
+
+        for _ in 0..8 {
+            let f = h.open(me, &staging, ".", how).expect("open O_TMPFILE");
+            let (n, _) = h.pwrite(me, &f, vec![b'x'; 4096], 0);
+            assert_eq!(n.expect("write"), 4096);
+            drop(f); // the upload is abandoned mid-flight
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.join("staging")).unwrap().count(),
+            0,
+            "abandoned temp files must leave no directory entries"
+        );
+    });
+}
+
+/// `readdir` honours no `RESOLVE_*` flags, so the listing side needs its own
+/// mount check — otherwise a nested dataset lists as though it were part of
+/// the tree. Uses a real mount boundary; self-skips without one.
+#[test]
+fn listing_can_be_confined_to_one_filesystem() {
+    with_fs(FsConfig::default(), |h, me, _dir, _stop| {
+        let root = Anchor::open("/").expect("anchor /");
+        let root_dev = std::fs::metadata("/").unwrap().dev();
+        let crossings: Vec<String> = std::fs::read_dir("/")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let md = std::fs::metadata(e.path()).ok()?;
+                (md.is_dir() && md.dev() != root_dev)
+                    .then(|| e.file_name().into_string().ok())?
+            })
+            .collect();
+        if crossings.is_empty() {
+            return; // single-filesystem host
+        }
+
+        let names = |same_device_only: bool| -> Vec<String> {
+            let opts = QueryOptions {
+                spec: EnrichSpec::STATX,
+                clump: 64,
+                same_device_only,
+                ..Default::default()
+            };
+            let mut q = query_directory(&h, me, &root, opts).expect("list /");
+            let mut out = Vec::new();
+            while let Some(batch) = q.next() {
+                for e in batch.expect("batch") {
+                    out.push(e.name.to_string_lossy().into_owned());
+                }
+            }
+            out
+        };
+
+        let all = names(false);
+        let confined = names(true);
+        for c in &crossings {
+            assert!(all.contains(c), "unconfined listing should include /{c}");
+            assert!(
+                !confined.contains(c),
+                "confined listing must drop the mount point /{c}"
+            );
+        }
+        // Only the crossings are dropped; same-filesystem entries survive.
+        assert!(
+            all.len() > confined.len(),
+            "confinement should drop something here"
+        );
+        for n in &confined {
+            assert!(all.contains(n), "confinement must not invent entries");
+        }
+    });
+}
+
 #[test]
 fn metadata_ops_carry_the_personality() {
     // Every metadata op stamps sqe.personality; an id this ring never
     // registered must fail at submission rather than running as the daemon.
-    with_fs_caps(FsConfig::default(), |h, me, dir, _stop, caps| {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
         std::fs::write(dir.join("f"), b"x").unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let bogus = Personality::from_raw(4242).unwrap();
@@ -875,11 +1387,9 @@ fn metadata_ops_carry_the_personality() {
         assert!(dir.join("f").exists(), "the refused unlink did nothing");
 
         let f = h.open(me, &anchor, "f", rdonly()).unwrap();
-        if caps.fd_xattr {
-            let name = xattr_name("user.k");
-            let (res, _v) = h.fgetxattr(bogus, &f, &name, vec![0u8; 8]);
-            assert!(matches!(res, Err(Error::Errno(Errno::EINVAL))));
-        }
+        let name = xattr_name("user.k");
+        let (res, _v) = h.fgetxattr(bogus, &f, &name, vec![0u8; 8]);
+        assert!(matches!(res, Err(Error::Errno(Errno::EINVAL))));
         h.close(f).unwrap();
     });
 }
@@ -892,6 +1402,14 @@ fn metadata_ops_carry_the_personality() {
 /// drives registration (the reverse of the other tests, because `UringFs`
 /// is `!Send` but `CredBroker`/`CredHandle` are `Send`).
 fn with_broker<F>(client: F)
+where
+    F: FnOnce(&FsHandle, &CredHandle, Personality, &Path) + Send,
+{
+    with_broker_caps(Caps::empty(), client)
+}
+
+/// [`with_broker`] with a spawn-time capability ceiling.
+fn with_broker_caps<F>(allowed: Caps, client: F)
 where
     F: FnOnce(&FsHandle, &CredHandle, Personality, &Path) + Send,
 {
@@ -918,7 +1436,7 @@ where
         }
     };
     let me = afs.register_self().expect("register_self");
-    let broker = match CredBroker::spawn(&[&afs]) {
+    let broker = match CredBroker::spawn_with_caps(&[&afs], allowed) {
         Ok(b) => b,
         Err(e) => {
             if should_skip(&e) {
@@ -979,6 +1497,8 @@ fn query_directory_lists_and_enriches() {
             acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
             xattr_ns: truenas_ros::uring_fs::XattrNamespaces::empty(),
             clump: 2, // force more than one batch
+            same_device_only: false,
+            ..Default::default()
         };
         let mut q = query_directory(&h, me, &anchor, opts).unwrap();
         let mut all: BTreeMap<String, DirEntry> = BTreeMap::new();
@@ -1284,6 +1804,8 @@ fn query_directory_enumeration_obeys_dac() {
             acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
             xattr_ns: truenas_ros::uring_fs::XattrNamespaces::empty(),
             clump: 8,
+            same_device_only: false,
+            ..Default::default()
         };
         let err = query_directory(h, peer, &anchor, opts).unwrap_err();
         assert!(
@@ -1311,6 +1833,8 @@ fn query_directory_drop_closes_dir_fd() {
             acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
             xattr_ns: truenas_ros::uring_fs::XattrNamespaces::empty(),
             clump: 2,
+            same_device_only: false,
+            ..Default::default()
         };
         let mut q = query_directory(&h, me, &anchor, opts).unwrap();
         let fd = q.dir_fd();
@@ -1513,6 +2037,8 @@ fn query_pool_lists_directory() {
             acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
             xattr_ns: truenas_ros::uring_fs::XattrNamespaces::empty(),
             clump: 2,
+            same_device_only: false,
+            ..Default::default()
         };
         // Non-blocking enqueue; pull batches from the handle.
         let handle = pool.query(me, anchor, opts);
@@ -1556,6 +2082,8 @@ fn query_pool_runs_multiple_listings() {
             acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
             xattr_ns: truenas_ros::uring_fs::XattrNamespaces::empty(),
             clump: 8,
+            same_device_only: false,
+            ..Default::default()
         };
         // Submit BOTH from this one thread before collecting either — the pool
         // runs the walks (up to 2 concurrently), decoupled from the caller.
@@ -2178,5 +2706,702 @@ fn sentinel_uid_gid_are_refused_by_the_api() {
             creds.register(&AsUser::new(1000, u32::MAX)),
             Err(Error::Validation(_))
         ));
+    });
+}
+
+// ---- ordered / filtered / resumable listing --------------------------------
+
+/// Every name a query yields, in the order it yields them.
+fn list_names(
+    h: &FsHandle,
+    me: Personality,
+    anchor: &Anchor,
+    opts: QueryOptions,
+) -> Vec<String> {
+    let mut q = query_directory(h, me, anchor, opts).expect("list");
+    let mut out = Vec::new();
+    while let Some(batch) = q.next() {
+        for e in batch.expect("batch") {
+            out.push(e.name.to_string_lossy().into_owned());
+        }
+    }
+    out
+}
+
+/// A directory sorts where its trailing separator puts it, not where its bare
+/// name does. `/` is `0x2F`, above `-` (`0x2D`) and `.` (`0x2E`), so `a`
+/// belongs *between* `a.txt` and `aa.txt`. A walk that recursed in bare-name
+/// order would emit everything under `a/` before `a-1.txt`, disagreeing with
+/// the order the full paths actually compare in.
+#[test]
+fn path_order_places_a_directory_after_its_dotted_siblings() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::create_dir(dir.join("a")).expect("mkdir a");
+        for f in ["a-1.txt", "a.txt", "aa.txt"] {
+            std::fs::write(dir.join(f), b"x").expect("write");
+        }
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        // `clump` below the entry count, so the sorted buffer is drained
+        // across several batches rather than served in one.
+        let opts = |order| QueryOptions {
+            clump: 2,
+            order,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            list_names(&h, me, &anchor, opts(Order::ByPathBytes)),
+            ["a-1.txt", "a.txt", "a", "aa.txt"],
+        );
+        // The ordering a walk must not use, asserted so the difference stays
+        // visible if either mode is ever touched.
+        assert_eq!(
+            list_names(&h, me, &anchor, opts(Order::ByName)),
+            ["a", "a-1.txt", "a.txt", "aa.txt"],
+        );
+        // Unordered yields the same set, in whatever order the filesystem has.
+        let mut raw = list_names(&h, me, &anchor, opts(Order::Readdir));
+        raw.sort();
+        assert_eq!(raw, ["a", "a-1.txt", "a.txt", "aa.txt"]);
+    });
+}
+
+/// `name_prefix` drops entries during the `readdir` pass, and a batch is still
+/// filled to `clump` *kept* entries — so a short batch keeps meaning
+/// end-of-directory rather than "the filter ate this one".
+#[test]
+fn name_prefix_filters_without_shortening_batches() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("keep-{i}")), b"x").expect("write");
+            std::fs::write(dir.join(format!("drop-{i}")), b"x").expect("write");
+        }
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let opts = QueryOptions {
+            clump: 2,
+            order: Order::ByName,
+            name_prefix: Some(b"keep-".to_vec()),
+            ..Default::default()
+        };
+
+        let mut q = query_directory(&h, me, &anchor, opts).expect("list");
+        let mut sizes = Vec::new();
+        let mut names = Vec::new();
+        while let Some(batch) = q.next() {
+            let batch = batch.expect("batch");
+            sizes.push(batch.len());
+            names.extend(
+                batch.iter().map(|e| e.name.to_string_lossy().into_owned()),
+            );
+        }
+
+        assert_eq!(
+            names,
+            ["keep-0", "keep-1", "keep-2", "keep-3", "keep-4"],
+            "only the prefixed names, in order"
+        );
+        // 5 kept entries at clump 2: full, full, remainder. The interleaved
+        // `drop-*` names must not have shortened either full batch.
+        assert_eq!(sizes, [2, 2, 1], "batches fill to clump on kept entries");
+    });
+}
+
+/// `start_after` resumes an ordered listing exactly at the cut, with no key
+/// repeated and none skipped. The cursor is a **literal key**, so resuming
+/// past the directory `a` means passing `a/` — where `a/` sorts — rather than
+/// `a`, where a file of that name would sort.
+#[test]
+fn start_after_resumes_a_path_ordered_listing_without_gaps() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::create_dir(dir.join("a")).expect("mkdir a");
+        for f in ["a-1.txt", "a.txt", "aa.txt"] {
+            std::fs::write(dir.join(f), b"x").expect("write");
+        }
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let page = |start_after: Option<Vec<u8>>| {
+            list_names(
+                &h,
+                me,
+                &anchor,
+                QueryOptions {
+                    clump: 64,
+                    order: Order::ByPathBytes,
+                    start_after,
+                    ..Default::default()
+                },
+            )
+        };
+
+        let all = page(None);
+        assert_eq!(all, ["a-1.txt", "a.txt", "a", "aa.txt"]);
+
+        // Cutting after each key in turn yields exactly the remainder. The
+        // directory's key carries its separator; the files' do not.
+        let keys = ["a-1.txt", "a.txt", "a/", "aa.txt"];
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(
+                page(Some(key.as_bytes().to_vec())),
+                all[i + 1..],
+                "resuming after {key:?}"
+            );
+        }
+
+        // The bare name `a` is *not* the directory's key: it sorts where a
+        // file `a` would, before `a-1.txt`, so nothing is consumed.
+        assert_eq!(page(Some(b"a".to_vec())), all);
+    });
+}
+
+/// The change cookie is the exact validator for anything cached per file, so
+/// two properties have to hold: it moves when the file is modified, and it
+/// does **not** move when the file is merely read. A cookie that advanced on
+/// reads would invalidate every cache entry on every access.
+///
+/// Skips where the filesystem does not supply one — the kernel reports that
+/// by leaving the bit out of the returned mask, which is why
+/// [`Statx::change_cookie`] is an `Option` rather than a bare `u64`.
+#[test]
+fn change_cookie_moves_on_writes_and_not_on_reads() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let how = OpenHow::new()
+            .flags(OFlag::O_RDWR | OFlag::O_CREAT)
+            .mode(Mode::from_bits_truncate(0o600));
+        let f = h.open(me, &anchor, "cookie.bin", how).expect("open");
+        let mask = StatxMask::BASIC_STATS | StatxMask::CHANGE_COOKIE;
+        let cookie = |f: &_| {
+            h.fstatx(me, f, AtFlags::empty(), mask)
+                .expect("fstatx")
+                .change_cookie()
+        };
+
+        let Some(first) = cookie(&f) else {
+            // No i_version on this filesystem — tmpfs, where `tempfile` puts
+            // its directory by default, is one. Point `TMPDIR` at a ZFS
+            // dataset to actually exercise this.
+            eprintln!(
+                "skipping: no change cookie on the filesystem backing {}",
+                dir.display()
+            );
+            return;
+        };
+
+        let (n, _) = h.pwrite(me, &f, b"hello".to_vec(), 0);
+        assert_eq!(n.expect("write"), 5);
+        let after_write = cookie(&f).expect("cookie still reported");
+        assert_ne!(after_write, first, "a write must move the change cookie");
+
+        let (n, _) = h.pread(me, &f, vec![0u8; 5], 0);
+        assert_eq!(n.expect("read"), 5);
+        assert_eq!(
+            cookie(&f).expect("cookie still reported"),
+            after_write,
+            "a read must not move the change cookie (note: a `noatime` or \
+             `relatime` mount can hide a violation here)"
+        );
+
+        h.close(f).expect("close");
+    });
+}
+
+// ---- capability-carrying personalities -------------------------------------
+
+const CAP_NOBODY_UID: u32 = 65_534;
+const CAP_NOBODY_GID: u32 = 65_534;
+
+/// The traversal problem this capability exists for: an object the identity is
+/// entitled to, under a directory it cannot search. Without the capability the
+/// walk stops at `vault/`; with it the kernel resolves through and the read
+/// succeeds.
+///
+/// The second assertion is the uncomfortable half, and it is here on purpose:
+/// `CAP_DAC_READ_SEARCH` is not traverse-only. It reads the file too, and no
+/// narrower capability exists (`CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH`
+/// are the only two DAC bypasses Linux defines). Anyone loosening this should
+/// have to change a test that says so.
+#[test]
+fn dac_read_search_traverses_a_directory_the_identity_cannot_search() {
+    if !is_root() {
+        return;
+    }
+    with_broker_caps(Caps::DAC_READ_SEARCH, |h, creds, _me, dir| {
+        std::fs::create_dir(dir.join("vault")).unwrap();
+        std::fs::write(dir.join("vault/inner"), b"secret").unwrap();
+        std::fs::set_permissions(
+            dir.join("vault"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        // Unreadable to the identity in its own right, so the successful read
+        // below is the capability's doing and not the mode's.
+        std::fs::set_permissions(
+            dir.join("vault/inner"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let anchor = Anchor::open(dir).unwrap();
+        let plain = AsUser::new(CAP_NOBODY_UID, CAP_NOBODY_GID);
+        let privileged = plain.clone().caps(Caps::DAC_READ_SEARCH);
+
+        let bare = creds.register(&plain).unwrap();
+        assert!(
+            matches!(
+                h.open(bare, &anchor, "vault/inner", rdonly()),
+                Err(Error::Errno(Errno::EACCES))
+            ),
+            "without the capability the 0700 directory still blocks the walk"
+        );
+
+        let elevated = creds.register(&privileged).unwrap();
+        let f = h
+            .open(elevated, &anchor, "vault/inner", rdonly())
+            .expect("DAC_READ_SEARCH should traverse the 0700 directory");
+        let (n, buf) = h.pread(elevated, &f, vec![0u8; 6], 0);
+        assert_eq!(n.expect("read"), 6);
+        assert_eq!(&buf[..6], b"secret", "and it reads the file, too");
+        h.close(f).unwrap();
+
+        creds.unregister(bare).unwrap();
+        creds.unregister(elevated).unwrap();
+    });
+}
+
+/// `CAP_DAC_READ_SEARCH` grants a *pure* read and nothing wider: `fs/namei.c`
+/// tests `mask == MAY_READ` with exact equality, so adding a write bit drops
+/// out of the grant entirely. `O_RDONLY` succeeds on a file `O_RDWR` cannot
+/// even open — asymmetric enough to be worth pinning.
+#[test]
+fn dac_read_search_grants_o_rdonly_but_not_o_rdwr() {
+    if !is_root() {
+        return;
+    }
+    with_broker_caps(Caps::DAC_READ_SEARCH, |h, creds, _me, dir| {
+        std::fs::write(dir.join("locked"), b"x").unwrap();
+        std::fs::set_permissions(
+            dir.join("locked"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let anchor = Anchor::open(dir).unwrap();
+        let who = creds
+            .register(
+                &AsUser::new(CAP_NOBODY_UID, CAP_NOBODY_GID)
+                    .caps(Caps::DAC_READ_SEARCH),
+            )
+            .unwrap();
+
+        let f = h
+            .open(who, &anchor, "locked", rdonly())
+            .expect("a pure read is granted");
+        h.close(f).unwrap();
+
+        assert!(
+            matches!(
+                h.open(
+                    who,
+                    &anchor,
+                    "locked",
+                    OpenHow::new().flags(OFlag::O_RDWR)
+                ),
+                Err(Error::Errno(Errno::EACCES))
+            ),
+            "read|write is not `mask == MAY_READ`, so the grant does not apply"
+        );
+
+        creds.unregister(who).unwrap();
+    });
+}
+
+/// The spawn-time mask is a ceiling the broker enforces, not a hint the caller
+/// may exceed. This is the property that keeps a compromised main — which can
+/// already mint any non-root identity — from minting itself read access to
+/// every file on the system.
+#[test]
+fn spawn_time_mask_is_a_ceiling_on_requested_caps() {
+    if !is_root() {
+        return;
+    }
+    with_broker(|_h, creds, _me, _dir| {
+        // `with_broker` spawns with `Caps::empty()`.
+        let err = creds
+            .register(
+                &AsUser::new(CAP_NOBODY_UID, CAP_NOBODY_GID)
+                    .caps(Caps::DAC_READ_SEARCH),
+            )
+            .expect_err("a capability outside the ceiling must be refused");
+        assert!(
+            matches!(err, Error::Errno(Errno::EPERM)),
+            "expected EPERM, got {err:?}"
+        );
+        // The same identity without capabilities still registers.
+        let ok = creds
+            .register(&AsUser::new(CAP_NOBODY_UID, CAP_NOBODY_GID))
+            .expect("the plain identity is unaffected");
+        creds.unregister(ok).unwrap();
+    });
+}
+
+/// `caps` participates in `AsUser`'s identity, so the cache mints a separate
+/// personality rather than handing back one registered without them. Getting
+/// this wrong would silently serve whichever variant was requested first —
+/// either leaking a capability or withholding one, depending on the order.
+#[test]
+fn identity_cache_keys_on_the_capability_set() {
+    if !is_root() {
+        return;
+    }
+    with_broker_caps(Caps::DAC_READ_SEARCH, |_h, creds, _me, _dir| {
+        let cache = IdentityCache::new(creds.clone());
+        let plain = AsUser::new(CAP_NOBODY_UID, CAP_NOBODY_GID);
+        let privileged = plain.clone().caps(Caps::DAC_READ_SEARCH);
+        assert_ne!(plain, privileged, "the capability set is part of identity");
+
+        let a = cache.acquire(&plain).unwrap();
+        let b = cache.acquire(&privileged).unwrap();
+        assert_ne!(
+            a.personality().id(),
+            b.personality().id(),
+            "distinct capability sets must not share a personality"
+        );
+        // And each is stable on re-acquire.
+        assert_eq!(
+            cache.acquire(&plain).unwrap().personality().id(),
+            a.personality().id()
+        );
+    });
+}
+
+// ---- recursive, resumable subtree walk -------------------------------------
+
+/// A tree whose root level exercises the `/`-vs-`.`-vs-`-` ordering trap at
+/// more than one depth, so a walk that got the comparator right at one level
+/// and wrong at another still fails.
+fn make_tree(dir: &Path) {
+    std::fs::create_dir(dir.join("a")).unwrap();
+    std::fs::create_dir(dir.join("a/c")).unwrap();
+    std::fs::create_dir(dir.join("z")).unwrap();
+    for f in [
+        "a-1.txt",
+        "a.txt",
+        "aa.txt",
+        "a/b.txt",
+        "a/c/d.txt",
+        "z/y.txt",
+    ] {
+        std::fs::write(dir.join(f), b"x").unwrap();
+    }
+}
+
+/// Every key the walk yields, in order, as strings.
+fn walk_keys(
+    h: &FsHandle,
+    me: Personality,
+    anchor: &Anchor,
+    opts: TreeOptions,
+) -> Vec<String> {
+    let mut t = query_tree(h, me, anchor, opts).expect("query_tree");
+    let mut out = Vec::new();
+    while let Some(e) = t.next() {
+        let e = e.expect("entry");
+        out.push(String::from_utf8(e.key()).unwrap());
+    }
+    out
+}
+
+/// Per-directory sorting composes into global path order. Note where `a/`
+/// lands: after `a.txt` because `/` outranks `.`, and its whole subtree
+/// follows immediately — `a/c/d.txt` still precedes `aa.txt`, which is the
+/// property a naive bare-name sort breaks.
+#[test]
+fn tree_walk_emits_the_subtree_in_global_path_order() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        make_tree(&dir);
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let keys = walk_keys(
+            &h,
+            me,
+            &anchor,
+            TreeOptions {
+                entries: QueryOptions {
+                    clump: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            keys,
+            [
+                "a-1.txt",
+                "a.txt",
+                "a/",
+                "a/b.txt",
+                "a/c/",
+                "a/c/d.txt",
+                "aa.txt",
+                "z/",
+                "z/y.txt",
+            ]
+        );
+
+        // The same set, sorted independently as flat byte strings, must agree
+        // — that is what "global path order" means, and it is checked here
+        // rather than trusted from the literal above.
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted);
+    });
+}
+
+/// `max_depth: 1` and `skip_descent` are the two ways to get the
+/// non-recursive listing a delimiter asks for, and they must agree.
+#[test]
+fn depth_one_and_skip_descent_both_stop_at_the_top_level() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        make_tree(&dir);
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let expected = ["a-1.txt", "a.txt", "a/", "aa.txt", "z/"];
+
+        let capped = walk_keys(
+            &h,
+            me,
+            &anchor,
+            TreeOptions {
+                max_depth: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(capped, expected, "max_depth 1");
+
+        // Pruning every directory as it is yielded reaches the same place,
+        // and is how a caller folds one into a common prefix.
+        let mut t = query_tree(&h, me, &anchor, TreeOptions::default())
+            .expect("query_tree");
+        let mut pruned = Vec::new();
+        while let Some(e) = t.next() {
+            let e = e.expect("entry");
+            let is_dir = e.is_dir();
+            pruned.push(String::from_utf8(e.key()).unwrap());
+            if is_dir {
+                t.skip_descent();
+            }
+        }
+        assert_eq!(pruned, expected, "skip_descent on every directory");
+    });
+}
+
+/// The pagination property, and the reason the cursor is key-based rather
+/// than a directory offset: paging through the tree must reproduce the whole
+/// walk **exactly** — no key repeated, none skipped — including when a page
+/// boundary falls on a directory, which is the case a position-based cursor
+/// gets wrong.
+#[test]
+fn paging_with_a_cursor_reproduces_the_walk_exactly() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        make_tree(&dir);
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let full = walk_keys(&h, me, &anchor, TreeOptions::default());
+
+        // Every page size from 1 up, so the boundary lands on each entry in
+        // turn — files, directories, and the last entry of a level alike.
+        for page in 1..=full.len() {
+            let mut paged: Vec<String> = Vec::new();
+            let mut resume: Option<TreeCursor> = None;
+            loop {
+                let mut t = query_tree(
+                    &h,
+                    me,
+                    &anchor,
+                    TreeOptions {
+                        resume: resume.clone(),
+                        ..Default::default()
+                    },
+                )
+                .expect("query_tree");
+                let mut n = 0;
+                while n < page {
+                    match t.next() {
+                        Some(e) => {
+                            let e = e.expect("entry");
+                            paged.push(String::from_utf8(e.key()).unwrap());
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+                resume = Some(t.cursor());
+            }
+            assert_eq!(paged, full, "paging {page} at a time");
+        }
+    });
+}
+
+/// A cursor survives serialization, so a listing can be resumed by a later
+/// request — or a later process — and not just within one walk.
+#[test]
+fn a_serialized_cursor_resumes_the_walk() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        make_tree(&dir);
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let full = walk_keys(&h, me, &anchor, TreeOptions::default());
+
+        let mut t = query_tree(&h, me, &anchor, TreeOptions::default())
+            .expect("query_tree");
+        for _ in 0..4 {
+            t.next().expect("entry").expect("ok");
+        }
+        let blob = t.cursor().to_bytes();
+        drop(t);
+
+        let restored = TreeCursor::from_bytes(&blob).expect("cursor decodes");
+        let rest = walk_keys(
+            &h,
+            me,
+            &anchor,
+            TreeOptions {
+                resume: Some(restored),
+                ..Default::default()
+            },
+        );
+        assert_eq!(rest, full[4..], "the tail of the walk, exactly once");
+    });
+}
+
+/// Descent resolves one component against the descriptor the walk already
+/// holds, under `CONFINED_RESOLVE` — so a symlink planted in the tree is not
+/// a way out of it, whether it points outside or back inside.
+#[test]
+fn the_walk_does_not_follow_symlinks_out_of_the_tree() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::create_dir(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real/inside.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink("/etc", dir.join("escape")).unwrap();
+        std::os::unix::fs::symlink("real", dir.join("loop")).unwrap();
+
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let keys = walk_keys(&h, me, &anchor, TreeOptions::default());
+
+        // The links are yielded as entries — they exist — but neither is
+        // descended into, so nothing from /etc and no second copy of
+        // `real/`'s contents appears.
+        assert!(keys.contains(&"real/".to_string()));
+        assert!(keys.contains(&"real/inside.txt".to_string()));
+        assert!(
+            !keys.iter().any(|k| k.starts_with("escape/")),
+            "symlink to /etc must not be descended: {keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|k| k.starts_with("loop/")),
+            "symlink to a sibling must not be descended: {keys:?}"
+        );
+    });
+}
+
+// ---- fadvise / fremovexattr / copy_file_range ------------------------------
+
+/// `fadvise` is advisory, so the assertion is that it is *accepted* and does
+/// not disturb the file — both advices ZFS implements natively (`WILLNEED` is
+/// a `dmu_prefetch`, `DONTNEED` a `dmu_evict_range`) plus the whole-file `0`
+/// length form.
+#[test]
+fn fadvise_is_accepted_and_leaves_contents_alone() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let f = h.open(me, &anchor, "adv.bin", creat_rw()).expect("open");
+        let (n, _) = h.pwrite(me, &f, b"0123456789".to_vec(), 0);
+        assert_eq!(n.expect("write"), 10);
+
+        for advice in [
+            Advice::Normal,
+            Advice::Sequential,
+            Advice::Random,
+            Advice::WillNeed,
+            Advice::NoReuse,
+        ] {
+            h.fadvise(me, &f, 0, 10, advice)
+                .unwrap_or_else(|e| panic!("fadvise {advice:?}: {e}"));
+        }
+        // Length 0 means "to end of file" — the form used after syncing a
+        // whole object, and the one most likely to be mis-encoded since the
+        // kernel reads the length from `addr`, not `len`.
+        h.fadvise(me, &f, 0, 0, Advice::DontNeed).expect("dontneed");
+        h.fadvise(me, &f, 4, 6, Advice::DontNeed).expect("ranged");
+
+        let (n, buf) = h.pread(me, &f, vec![0u8; 10], 0);
+        assert_eq!(n.expect("read"), 10);
+        assert_eq!(&buf[..10], b"0123456789", "advice must not alter data");
+        h.close(f).unwrap();
+    });
+}
+
+/// The allowlist is the whole security contract for `fremovexattr`: with no
+/// [`Personality`] to check, an unlisted name must be refused outright. The
+/// refusal is the property, so it is asserted first.
+#[test]
+fn fremovexattr_removes_only_allowlisted_attributes() {
+    let mut afs = match UringFs::new(FsConfig::default()) {
+        Ok(a) => a,
+        Err(e) => {
+            if should_skip(&e) {
+                return;
+            }
+            panic!("UringFs::new: {e}");
+        }
+    };
+    afs.set_privileged_xattrs(
+        PrivilegedXattrs::new()
+            .allow_prefix(c"trusted.example_")
+            .expect("allowlist"),
+    );
+    let me = afs.register_self().expect("register_self");
+    let h = afs.handle();
+    let stop = afs.shutdown_handle();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir_path = dir.path().to_path_buf();
+
+    thread::scope(|s| {
+        s.spawn(move || {
+            let _guard = StopGuard(stop);
+            let anchor = Anchor::open(dir_path.as_path()).expect("anchor");
+            let f = h.open(me, &anchor, "obj", creat_rw()).expect("open");
+
+            let owned = xattr_name("trusted.example_etag");
+            let user = xattr_name("user.mine");
+            h.fsetxattr(me, &f, &owned, b"abc".to_vec(), 0)
+                .0
+                .expect("server-owned set is promoted to root");
+            h.fsetxattr(me, &f, &user, b"xyz".to_vec(), 0)
+                .0
+                .expect("user set");
+
+            // Unlisted: refused, and the attribute survives.
+            assert!(
+                matches!(
+                    h.fremovexattr(&f, &user),
+                    Err(Error::Errno(Errno::EPERM))
+                ),
+                "an attribute the server does not own must not be removable"
+            );
+            assert!(
+                h.flistxattr(&f).unwrap().contains(&user),
+                "the refused attribute is still there"
+            );
+
+            // Allowlisted: actually removed, and gone from the listing —
+            // which a zero-length FSETXATTR would *not* have achieved.
+            h.fremovexattr(&f, &owned).expect("server-owned removal");
+            let names = h.flistxattr(&f).unwrap();
+            assert!(!names.contains(&owned), "removed, not emptied: {names:?}");
+            assert!(names.contains(&user), "the other attribute is untouched");
+
+            // Removing what is not there is ENODATA, not success.
+            assert!(h.fremovexattr(&f, &owned).is_err());
+
+            h.close(f).unwrap();
+        });
+        afs.run().expect("run");
     });
 }

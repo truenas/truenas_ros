@@ -53,13 +53,10 @@ where
     /// `DIR*`; the standalone host drains the same way from its own wake.
     #[cfg(feature = "uring-fs")]
     fn drain_fs_offloads(&mut self) -> errno::Result<()> {
-        let (fd_xattr_ok, ftruncate_ok) = (self.fd_xattr_ok, self.ftruncate_ok);
         if let Some(fs) = self.fs.as_mut() {
             crate::uring_fs::core::deliver_pool_completions(
                 fs,
                 &mut self.core.engine,
-                fd_xattr_ok,
-                ftruncate_ok,
                 false,
             );
         }

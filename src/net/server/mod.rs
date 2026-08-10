@@ -542,14 +542,6 @@ pub struct Server<U, AcceptFn, HeaderFn, BodyFn> {
     #[cfg(feature = "uring-fs")]
     fs: Option<crate::uring_fs::core::FsCore>,
     // Kernel-capability flags for the two version-dependent fs ops, probed once
-    // at construction (only when an fs pool exists): fixed-file xattr needs
-    // Linux ≥ 6.13 and is invisible to `REGISTER_PROBE`, `ftruncate` needs
-    // ≥ 6.9. Surfaced via `supports_fd_xattr`/`supports_ftruncate` so a handler
-    // gates those `FsConn` ops rather than have them fail in the callback.
-    #[cfg(feature = "uring-fs")]
-    fd_xattr_ok: bool,
-    #[cfg(feature = "uring-fs")]
-    ftruncate_ok: bool,
     // The role-agnostic io_uring engine the server drives: the ring, the
     // connection table, the projected `CoreConfig`, the shared cross-thread
     // flags/stats, the kernel-touched pads, and the close hook. Its own field
@@ -711,24 +703,6 @@ where
             fs.set_offload_bounds(cfg.fs_offload_floor, cfg.fs_offload_ceiling);
             fs
         });
-        // Probe the two version-dependent fs ops once (only if a pool exists),
-        // while `engine.ring` is still in hand. `ftruncate` (≥ 6.9) is a plain
-        // opcode probe; fixed-file xattr (≥ 6.13) needs the real-combination
-        // memfd probe, since `REGISTER_PROBE` reports opcode existence, not
-        // flag acceptance.
-        #[cfg(feature = "uring-fs")]
-        let (fd_xattr_ok, ftruncate_ok) = if cfg.fs_files > 0 {
-            (
-                crate::uring_fs::host::probe_fixed_file_xattr(),
-                crate::uring::probe::probe_op_supported(
-                    &engine.ring,
-                    crate::uring::sys::IORING_OP_FTRUNCATE,
-                ),
-            )
-        } else {
-            (false, false)
-        };
-
         #[cfg_attr(not(feature = "uring-fs"), allow(unused_mut))]
         let mut core =
             Reactor::from_parts(engine, cfg.pool_size, cfg.to_core(), pads);
@@ -742,10 +716,6 @@ where
         Ok(Server {
             #[cfg(feature = "uring-fs")]
             fs,
-            #[cfg(feature = "uring-fs")]
-            fd_xattr_ok,
-            #[cfg(feature = "uring-fs")]
-            ftruncate_ok,
             core,
             handlers: Handlers {
                 accept: protocol.accept,
@@ -874,8 +844,6 @@ where
         // of the fs tables has ended.
         #[cfg(feature = "uring-fs")]
         if cqe.user_data as u8 & crate::uring::user_data::TAG_FS_DOMAIN != 0 {
-            let (fd_xattr_ok, ftruncate_ok) =
-                (self.fd_xattr_ok, self.ftruncate_ok);
             if let Some(fs) = self.fs.as_mut() {
                 let (tag, fslot, fgen) =
                     crate::uring::user_data::unpack_raw(cqe.user_data);
@@ -887,8 +855,6 @@ where
                     fs,
                     &mut self.core.engine,
                     reaped,
-                    fd_xattr_ok,
-                    ftruncate_ok,
                     false,
                 );
             }
@@ -1011,24 +977,6 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         )?;
         crate::uring_fs::Personality::from_raw(id)
             .ok_or_else(|| crate::Error::from(errno::Errno::EINVAL))
-    }
-
-    /// Whether this kernel accepts a **registered-table file** for the
-    /// fd-based xattr ops ([`FsConn::fgetxattr`](crate::uring_fs::FsConn)
-    /// / `fsetxattr`) — Linux ≥ 6.13. Where false, gate those ops: submitting
-    /// them anyway surfaces the kernel's `EBADF` in the callback. Requires an
-    /// fs pool and the `uring-fs` feature.
-    #[cfg(feature = "uring-fs")]
-    pub fn supports_fd_xattr(&self) -> bool {
-        self.fd_xattr_ok
-    }
-
-    /// Whether this kernel supports [`FsConn::ftruncate`](crate::uring_fs::FsConn)
-    /// (`IORING_OP_FTRUNCATE`, Linux ≥ 6.9). Requires an fs pool and the
-    /// `uring-fs` feature.
-    #[cfg(feature = "uring-fs")]
-    pub fn supports_ftruncate(&self) -> bool {
-        self.ftruncate_ok
     }
 
     /// Install a hook invoked once per connection as it begins closing:
