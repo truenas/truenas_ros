@@ -428,8 +428,9 @@ mod mount {
     use truenas_ros::mount::{
         fsconfig, is_zfs_snapshot, listmount, mount_setattr, move_mount,
         open_mount_by_id, open_tree, statmount, statmount_path, umount,
-        umount2, FsConfig, MntFlags, MntPropagation, MountAttr, MountSetattr,
-        MoveMountFlags, OpenTreeFlags, StatmountMask, UmountOptions, LSMT_ROOT,
+        umount2, Atime, FsConfig, MntFlags, MntPropagation, MountAttr,
+        MountSetattr, MoveMountFlags, OpenTreeFlags, StatmountMask,
+        UmountOptions, LSMT_ROOT,
     };
     use truenas_ros::sync_fs::{statx, AtFlags, OFlag, StatxMask};
     use truenas_ros::{Error, AT_FDCWD};
@@ -502,6 +503,42 @@ mod mount {
         assert!(umount(dir.path(), UmountOptions::default()).is_err());
     }
 
+    /// The mountpoint of a mount with no children of its own, so a recursive
+    /// umount of it has nothing to tear down. `None` if the namespace has no
+    /// such mount or its mountpoint is unreadable.
+    fn leaf_mountpoint() -> Option<String> {
+        listmount(LSMT_ROOT, false)
+            .unwrap()
+            .into_iter()
+            .find_map(|id| {
+                listmount(id, false).ok().filter(|kids| kids.is_empty())?;
+                statmount(id, StatmountMask::MNT_POINT).ok()?.mnt_point
+            })
+    }
+
+    #[test]
+    fn recursive_umount_rejects_a_symlinked_mountpoint() {
+        let Some(point) = leaf_mountpoint() else {
+            panic!("no childless mount in this namespace");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("l");
+        std::os::unix::fs::symlink(&point, &link).unwrap();
+        // The symlink is not itself a mountpoint, so validation fails before
+        // any umount2 — a syscall error here would mean it got that far.
+        assert!(matches!(
+            umount(
+                &link,
+                UmountOptions {
+                    recursive: true,
+                    ..Default::default()
+                }
+            )
+            .unwrap_err(),
+            Error::Validation(_)
+        ));
+    }
+
     #[test]
     fn privileged_wrappers_are_callable() {
         // These need CAP_SYS_ADMIN; unprivileged they return an error. We only
@@ -518,6 +555,7 @@ mod mount {
         let attr = MountSetattr::new()
             .set(MountAttr::RDONLY)
             .clear(MountAttr::NODEV)
+            .atime(Atime::Noatime)
             .propagation(MntPropagation::MS_SLAVE)
             .idmap(anchor.as_fd());
         let _ = mount_setattr(AT_FDCWD, "/", AtFlags::empty(), &attr);
