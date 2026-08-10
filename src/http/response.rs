@@ -8,6 +8,8 @@
 //! never split a response, and statuses that don't fit the three-digit
 //! status-line grammar are replaced with 500.
 
+use std::borrow::Cow;
+
 use super::date::HttpDate;
 
 /// A response under construction, returned by the consumer's handler.
@@ -15,12 +17,64 @@ use super::date::HttpDate;
 /// Builder-style: `HttpResponse::new(200).header("etag", "\"abc\"").body(xml)`.
 /// Status text, `Date`, and `Content-Length` are supplied by the codec at
 /// serialization time.
+///
+/// Header names, values, and the body are stored as `Cow<'static, _>`:
+/// literals (the overwhelmingly common case for names, and common for
+/// values and error bodies) are kept as borrows, so building a response
+/// from static parts allocates nothing.
 #[derive(Debug)]
 pub struct HttpResponse {
     pub(crate) status: u16,
-    pub(crate) headers: Vec<(String, Vec<u8>)>,
-    pub(crate) body: Vec<u8>,
+    pub(crate) headers: Vec<(Cow<'static, str>, Cow<'static, [u8]>)>,
+    pub(crate) body: Cow<'static, [u8]>,
     pub(crate) close: bool,
+}
+
+/// Conversion into stored response bytes — the `Cow`-aware analogue of
+/// `Into<Vec<u8>>` for [`HttpResponse::header`] values and
+/// [`HttpResponse::body`]. (`Into<Cow<'static, [u8]>>` alone would reject
+/// the `&'static str` and `String` shapes handlers pass most, since std
+/// provides no str-to-byte-`Cow` conversions.) Static inputs stay borrows;
+/// owned inputs move without copying.
+pub trait IntoBytes {
+    /// Convert into the bytes to store.
+    fn into_bytes(self) -> Cow<'static, [u8]>;
+}
+
+impl IntoBytes for &'static str {
+    fn into_bytes(self) -> Cow<'static, [u8]> {
+        Cow::Borrowed(self.as_bytes())
+    }
+}
+
+impl IntoBytes for String {
+    fn into_bytes(self) -> Cow<'static, [u8]> {
+        Cow::Owned(self.into())
+    }
+}
+
+impl IntoBytes for &'static [u8] {
+    fn into_bytes(self) -> Cow<'static, [u8]> {
+        Cow::Borrowed(self)
+    }
+}
+
+impl<const N: usize> IntoBytes for &'static [u8; N] {
+    fn into_bytes(self) -> Cow<'static, [u8]> {
+        Cow::Borrowed(self)
+    }
+}
+
+impl IntoBytes for Vec<u8> {
+    fn into_bytes(self) -> Cow<'static, [u8]> {
+        Cow::Owned(self)
+    }
+}
+
+impl IntoBytes for Cow<'static, [u8]> {
+    fn into_bytes(self) -> Cow<'static, [u8]> {
+        self
+    }
 }
 
 impl HttpResponse {
@@ -38,7 +92,7 @@ impl HttpResponse {
                 500
             },
             headers: Vec::new(),
-            body: Vec::new(),
+            body: Cow::Borrowed(&[]),
             close: false,
         }
     }
@@ -49,13 +103,16 @@ impl HttpResponse {
     /// containing CR, LF, or NUL — serializing those verbatim would let
     /// handler-echoed bytes terminate the field line early and inject
     /// response framing (response splitting).
+    ///
+    /// A `&'static str` name and a static value are stored as borrows —
+    /// no allocation.
     pub fn header(
         mut self,
-        name: impl Into<String>,
-        value: impl Into<Vec<u8>>,
+        name: impl Into<Cow<'static, str>>,
+        value: impl IntoBytes,
     ) -> Self {
         let name = name.into();
-        let value = value.into();
+        let value = value.into_bytes();
         if is_token(&name) && !has_field_break(&value) && !is_codec_owned(&name)
         {
             self.headers.push((name, value));
@@ -65,9 +122,10 @@ impl HttpResponse {
 
     /// Set the body. `Content-Length` follows automatically; for a HEAD
     /// request the bytes are measured but not sent. On a bodyless status
-    /// (1xx/204/304) the bytes are never sent — see [`serialize`].
-    pub fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
-        self.body = body.into();
+    /// (1xx/204/304) the bytes are never sent — see [`serialize`]. Static
+    /// bytes are stored as a borrow — no copy.
+    pub fn body(mut self, body: impl IntoBytes) -> Self {
+        self.body = body.into_bytes();
         self
     }
 

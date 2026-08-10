@@ -14,6 +14,8 @@
 //! whole trailer section is capped ([`TRAILER_MAX`] → 431, the oversized-
 //! header-fields answer).
 
+use std::borrow::Cow;
+
 use super::head::HeaderView;
 
 /// Chunk-size line cap (hex digits + optional extensions, CRLF excluded).
@@ -246,20 +248,51 @@ pub(crate) fn scan(
     run(body, s, &mut |_| {}, &mut |_| {})
 }
 
+/// Accumulator for the decoded entity: a message whose payload is one
+/// contiguous span (the single-chunk shape default botocore sends) stays a
+/// borrow of the wire; only a second span forces the stitch into an owned
+/// buffer.
+enum Entity<'b> {
+    /// No payload seen yet.
+    Empty,
+    /// Exactly one payload span so far — still zero-copy.
+    Span(&'b [u8]),
+    /// Multiple spans, stitched into an owned buffer.
+    Stitched(Vec<u8>),
+}
+
 /// One-shot decode of a fully framed chunked message: the de-chunked entity
-/// plus the parsed trailer fields. The framer's scan already accepted these
-/// exact bytes as a complete message, so any failure here is a codec bug —
-/// callers answer it as one (500), never as a client error.
+/// plus the parsed trailer fields. A single-chunk message borrows its
+/// payload straight from `wire` (`Cow::Borrowed`) — no copy; only multi-chunk
+/// messages stitch into an owned buffer. The framer's scan already accepted
+/// these exact bytes as a complete message, so any failure here is a codec
+/// bug — callers answer it as one (500), never as a client error.
 pub(crate) fn decode(
     wire: &[u8],
-) -> Result<(Vec<u8>, Vec<HeaderView<'_>>), ()> {
+) -> Result<(Cow<'_, [u8]>, Vec<HeaderView<'_>>), ()> {
     let mut s = ChunkScan::default();
-    let mut entity = Vec::with_capacity(wire.len());
+    let mut entity = Entity::Empty;
     let mut lines: Vec<&[u8]> = Vec::new();
+    // Spill capacity: the decoded entity never exceeds its wire form.
+    let cap = wire.len();
     match run(
         wire,
         &mut s,
-        &mut |p| entity.extend_from_slice(p),
+        &mut |p| {
+            entity = match std::mem::replace(&mut entity, Entity::Empty) {
+                Entity::Empty => Entity::Span(p),
+                Entity::Span(first) => {
+                    let mut v = Vec::with_capacity(cap);
+                    v.extend_from_slice(first);
+                    v.extend_from_slice(p);
+                    Entity::Stitched(v)
+                }
+                Entity::Stitched(mut v) => {
+                    v.extend_from_slice(p);
+                    Entity::Stitched(v)
+                }
+            };
+        },
         &mut |l| lines.push(l),
     ) {
         Ok(Some(extent)) if extent == wire.len() => {}
@@ -271,6 +304,11 @@ pub(crate) fn decode(
         let name = std::str::from_utf8(name).map_err(|_| ())?;
         trailers.push(HeaderView { name, value });
     }
+    let entity = match entity {
+        Entity::Empty => Cow::Borrowed(&[][..]),
+        Entity::Span(span) => Cow::Borrowed(span),
+        Entity::Stitched(v) => Cow::Owned(v),
+    };
     Ok((entity, trailers))
 }
 
@@ -311,8 +349,10 @@ mod tests {
         let (entity, trailers) = decode(&wire).expect("decodes");
         // The HTTP band de-chunks its own layer only: the aws-chunked
         // entity passes through untouched, and there are no HTTP trailers.
-        assert_eq!(entity, botocore_entity());
+        assert_eq!(&entity[..], botocore_entity());
         assert!(trailers.is_empty());
+        // One HTTP chunk → the entity is a borrow of the wire, not a copy.
+        assert!(matches!(entity, Cow::Borrowed(_)));
     }
 
     #[test]
@@ -334,11 +374,14 @@ mod tests {
     fn multi_chunk_and_empty_entity() {
         let (entity, trailers) =
             decode(b"3\r\nfoo\r\n4\r\nbars\r\n0\r\n\r\n").expect("decodes");
-        assert_eq!(entity, b"foobars");
+        assert_eq!(&entity[..], b"foobars");
         assert!(trailers.is_empty());
+        // Two payload spans force the stitch into an owned buffer.
+        assert!(matches!(entity, Cow::Owned(_)));
         let (entity, trailers) = decode(b"0\r\n\r\n").expect("decodes");
         assert!(entity.is_empty());
         assert!(trailers.is_empty());
+        assert!(matches!(entity, Cow::Borrowed(_)));
     }
 
     #[test]
@@ -358,10 +401,10 @@ mod tests {
     fn extensions_ignored() {
         let (entity, _) =
             decode(b"5;name=val\r\nhello\r\n0\r\n\r\n").expect("decodes");
-        assert_eq!(entity, b"hello");
+        assert_eq!(&entity[..], b"hello");
         let (entity, _) =
             decode(b"5 ;x\r\nhello\r\n0\r\n\r\n").expect("decodes");
-        assert_eq!(entity, b"hello");
+        assert_eq!(&entity[..], b"hello");
     }
 
     fn scan_err(wire: &[u8]) -> u16 {

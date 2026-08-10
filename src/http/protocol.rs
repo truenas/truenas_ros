@@ -7,6 +7,7 @@
 //! and the connection's phase, so tests drive the real glue without a
 //! reactor.
 
+use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::net::server::{Body, Incoming, Protocol, Request, Response};
@@ -179,19 +180,28 @@ where
         }
         // A complete chunked message: de-chunk the wire extent, then
         // dispatch the entity against the in-buffer head or the dance's
-        // stash. The framer's scan accepted these exact bytes, so a decode
-        // failure is a codec bug, answered as one.
+        // stash. A single-chunk message decodes to a borrow of the wire
+        // (no copy — the shape default botocore sends); only stitched
+        // multi-chunk entities carry their own allocation. The framer's
+        // scan accepted these exact bytes, so a decode failure is a codec
+        // bug, answered as one.
         Phase::ChunkedDone { stash } => {
             let head_bytes = stash.as_deref().unwrap_or(header);
             match chunked::decode(&body) {
-                Ok((entity, trailers)) => dispatch(
-                    head_bytes,
-                    Body::placed(entity),
-                    &trailers,
-                    peer,
-                    &mut conn.state,
-                    handler,
-                ),
+                Ok((entity, trailers)) => {
+                    let entity = match entity {
+                        Cow::Borrowed(span) => Body::inline(span),
+                        Cow::Owned(v) => Body::placed(v),
+                    };
+                    dispatch(
+                        head_bytes,
+                        entity,
+                        &trailers,
+                        peer,
+                        &mut conn.state,
+                        handler,
+                    )
+                }
                 Err(()) => farewell(500, head_bytes.starts_with(b"HEAD ")),
             }
         }
