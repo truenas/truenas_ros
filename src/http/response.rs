@@ -25,7 +25,7 @@ use super::date::HttpDate;
 #[derive(Debug)]
 pub struct HttpResponse {
     pub(crate) status: u16,
-    pub(crate) headers: Vec<(Cow<'static, str>, Cow<'static, [u8]>)>,
+    pub(crate) headers: Headers,
     pub(crate) body: Cow<'static, [u8]>,
     pub(crate) close: bool,
 }
@@ -77,6 +77,59 @@ impl IntoBytes for Cow<'static, [u8]> {
     }
 }
 
+/// A response header pair: name and undecoded value, both `Cow<'static, _>`
+/// so a response built from literals borrows rather than allocates.
+pub(crate) type Header = (Cow<'static, str>, Cow<'static, [u8]>);
+
+/// Inline capacity for [`Headers`]. Every response this codec emits carries
+/// well under this many fields, so the common case never touches the heap.
+const INLINE_HEADERS: usize = 8;
+
+/// Response headers, stored inline until they spill. The first
+/// [`INLINE_HEADERS`] pairs live in a stack array; only fields past that go to
+/// `spilled`, whose backing `Vec` stays unallocated until then. The common
+/// case — an S3 200 carries a handful of fields — allocates nothing for its
+/// headers.
+#[derive(Debug)]
+pub(crate) struct Headers {
+    /// The first fields, in wire order; `inline_len` slots are filled.
+    inline: [Option<Header>; INLINE_HEADERS],
+    /// How many `inline` slots are filled.
+    inline_len: usize,
+    /// Fields past the inline capacity; empty (and unallocated) until spill.
+    spilled: Vec<Header>,
+}
+
+impl Default for Headers {
+    fn default() -> Self {
+        Headers {
+            inline: std::array::from_fn(|_| None),
+            inline_len: 0,
+            spilled: Vec::new(),
+        }
+    }
+}
+
+impl Headers {
+    /// Append a pair in wire order, spilling to the heap past the inline cap.
+    fn push(&mut self, h: Header) {
+        if self.inline_len < INLINE_HEADERS {
+            self.inline[self.inline_len] = Some(h);
+            self.inline_len += 1;
+        } else {
+            self.spilled.push(h);
+        }
+    }
+
+    /// The stored pairs in wire order.
+    fn iter(&self) -> impl Iterator<Item = &Header> {
+        self.inline[..self.inline_len]
+            .iter()
+            .map(|slot| slot.as_ref().expect("slot below len is filled"))
+            .chain(&self.spilled)
+    }
+}
+
 impl HttpResponse {
     /// Start a response with `status` (e.g. `200`), empty body, no headers.
     ///
@@ -91,7 +144,7 @@ impl HttpResponse {
             } else {
                 500
             },
-            headers: Vec::new(),
+            headers: Headers::default(),
             body: Cow::Borrowed(&[]),
             close: false,
         }
@@ -239,7 +292,7 @@ pub(crate) fn serialize(
         }
         ConnHeader::Close => out.extend_from_slice(b"Connection: close\r\n"),
     }
-    for (name, value) in &resp.headers {
+    for (name, value) in resp.headers.iter() {
         write!(out, "{name}: ").unwrap();
         out.extend_from_slice(value);
         out.extend_from_slice(b"\r\n");
@@ -281,6 +334,14 @@ fn reason(status: u16) -> &'static str {
 }
 
 #[cfg(test)]
+impl HttpResponse {
+    /// Whether the headers still fit the inline array (no heap spill yet).
+    fn headers_inline(&self) -> bool {
+        self.headers.spilled.is_empty()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -307,6 +368,33 @@ mod tests {
              x-amz-request-id: abc123\r\n\
              \r\n\
              hello"
+        );
+    }
+
+    #[test]
+    fn headers_inline_then_spill_in_order() {
+        // Distinct names so the wire order is checkable across the spill.
+        let names: [&str; INLINE_HEADERS + 1] = [
+            "x-0", "x-1", "x-2", "x-3", "x-4", "x-5", "x-6", "x-7", "x-8",
+        ];
+        let mut r = HttpResponse::new(200);
+        for (i, n) in names.iter().enumerate() {
+            r = r.header(*n, "v");
+            // Inline until the array fills; the pair past the cap spills.
+            assert_eq!(r.headers_inline(), i < INLINE_HEADERS, "after {i}");
+        }
+        let out = serialize(&r, false, date(), ConnHeader::None);
+        let s = text(&out);
+        let positions: Vec<usize> = names
+            .iter()
+            .map(|n| {
+                s.find(&format!("{n}: v"))
+                    .unwrap_or_else(|| panic!("{n} missing:\n{s}"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "push order not preserved:\n{s}"
         );
     }
 
