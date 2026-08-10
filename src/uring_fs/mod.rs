@@ -154,7 +154,7 @@ pub use core::{FsConn, FsDone};
 pub mod query_dir;
 pub use query_dir::{
     query_directory, CopyHandle, DirEntry, EnrichSpec, QueryDir, QueryHandle,
-    QueryOptions, QueryPool,
+    QueryOptions, QueryPool, XattrNamespaces,
 };
 // `pub(crate)` so a `net` server can reuse the fixed-file-xattr capability
 // probe (the 6.13 floor is not visible to `REGISTER_PROBE`); the standalone
@@ -508,6 +508,16 @@ pub(crate) enum FsInject {
         aux32: u32,
         reply: ReplyTo,
     },
+    /// A privileged `fgetxattr` under the reactor's ambient (root) credentials
+    /// (`personality = 0`), reading a `trusted.*`/`security.*` attribute a
+    /// request identity cannot see (the off-loop twin of
+    /// [`FsConn::fgetxattr_as_root`](core::FsConn::fgetxattr_as_root)).
+    FdMetaAsRoot {
+        file: Arc<OwnedFd>,
+        name: CString,
+        value: Vec<u8>,
+        reply: ReplyTo,
+    },
     /// `statx` or a directory-entry op, resolved against real anchor dirfds.
     PathOp {
         tag: u8,
@@ -571,6 +581,9 @@ pub struct FsHandle {
     /// Whether the fd-based xattr ops accept a registered-table file
     /// (probed at construction); see [`FsHandle::fgetxattr`].
     pub(crate) fd_xattr_ok: bool,
+    /// This reactor's shared blocking-work pool, for the off-loop
+    /// [`QueryPool`](query_dir::QueryPool) and generic offloaded work.
+    pub(crate) pool: Arc<query_dir::SharedPool>,
 }
 
 impl FsHandle {
@@ -847,6 +860,46 @@ impl FsHandle {
         )
     }
 
+    /// Read extended attribute `name` from `f` under the reactor's ambient
+    /// (root) credentials, not any `who`'s: the off-loop twin of
+    /// [`FsConn::fgetxattr_as_root`](crate::uring_fs::FsConn::fgetxattr_as_root).
+    ///
+    /// A privileged, unattributed read for a `trusted.*`/`security.*` attribute
+    /// a request identity cannot see. Use it only for server-internal metadata,
+    /// never to relay a value past a `who` that could not read it. Needs Linux
+    /// >= 6.13; fails closed (`EOPNOTSUPP`) otherwise.
+    pub fn fgetxattr_as_root(
+        &self,
+        f: &File,
+        name: &CStr,
+        buf: Vec<u8>,
+    ) -> (crate::Result<usize>, Vec<u8>) {
+        if !self.fd_xattr_ok {
+            return (Err(Errno::EOPNOTSUPP.into()), buf);
+        }
+        let (tx, rx) = mpsc::channel();
+        let sent = self.send(FsInject::FdMetaAsRoot {
+            file: f.fd.clone(),
+            name: name.to_owned(),
+            value: buf,
+            reply: ReplyTo::Sync(tx),
+        });
+        if let Err(msg) = sent {
+            let value = match msg {
+                FsInject::FdMetaAsRoot { value, .. } => value,
+                _ => Vec::new(),
+            };
+            return (Err(Errno::ECONNABORTED.into()), value);
+        }
+        match rx.recv() {
+            Ok(mut out) => (
+                out.res.map(|n| n as usize).map_err(Into::into),
+                out.bufs.pop().unwrap_or_default(),
+            ),
+            Err(_) => (Err(Errno::ECONNABORTED.into()), Vec::new()),
+        }
+    }
+
     /// Write extended attribute `name` on the open file.
     ///
     /// `flags` takes `libc::XATTR_CREATE` (fail if it exists) or
@@ -877,6 +930,35 @@ impl FsHandle {
             flags as u32,
         );
         (res.map(|_| ()), buf)
+    }
+
+    /// List the extended-attribute names on the open file `f` (all namespaces).
+    ///
+    /// Runs a blocking `flistxattr` on the calling thread at its own privilege,
+    /// so call it off the reactor (a worker or client thread). Names the caller
+    /// is not privileged to see (`trusted.*` without `CAP_SYS_ADMIN`) are
+    /// omitted by the kernel. Unlike the fd-xattr read/write ops this needs no
+    /// special kernel version.
+    pub fn flistxattr(&self, f: &File) -> crate::Result<Vec<CString>> {
+        query_dir::list_xattr_names(f)
+    }
+
+    /// Enumerate the extended attributes of `f` in the namespaces `ns`, read
+    /// their values under `who`, and return `(name, value)` for only those
+    /// `who` can read (see [`XattrNamespaces`](query_dir::XattrNamespaces)).
+    ///
+    /// The candidate `flistxattr` runs at this thread's privilege; the per-value
+    /// read under `who` is the authoritative gate, so an attribute `who` cannot
+    /// read (`trusted.*` for an unprivileged identity) is dropped, never
+    /// returned. Off-loop: it scatters ring reads and blocks on them, so call it
+    /// off the reactor. The caller owns any policy above `who`-readability.
+    pub fn query_xattrs(
+        &self,
+        who: Personality,
+        f: &File,
+        ns: query_dir::XattrNamespaces,
+    ) -> crate::Result<Vec<(CString, Vec<u8>)>> {
+        query_dir::scan_xattrs(self, who, f, ns)
     }
 
     /// Set the open file's length (`ftruncate`).

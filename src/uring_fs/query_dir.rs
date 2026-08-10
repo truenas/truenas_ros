@@ -19,15 +19,16 @@
 
 use super::{Anchor, File, FsHandle, FsPending, Leaf, Personality};
 use crate::errno::{retry_on_eintr, Errno};
+use crate::sync_fs::xattr::{flistxattr, XATTR_SIZE_MAX};
 use crate::sync_fs::{AtFlags, OFlag, OpenHow, Statx, StatxMask};
 use bitflags::bitflags;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt;
-use std::os::fd::RawFd;
+use std::os::fd::{AsFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,39 @@ bitflags! {
         /// the ACL extended attribute in [`QueryOptions::acl_name`]
         /// (`system.nfs4_acl_xdr` on ZFS, or `system.posix_acl_access`).
         const ACL = 0b0100;
+        /// discover attribute names via `flistxattr`, filtered to the
+        /// namespaces in [`QueryOptions::xattr_ns`], and fetch their values
+        /// (see [`XattrNamespaces`] for the credential contract).
+        const XATTR_LIST = 0b1000;
+    }
+}
+
+bitflags! {
+    /// Extended-attribute namespaces to enumerate for
+    /// [`EnrichSpec::XATTR_LIST`].
+    ///
+    /// The caller declares which namespaces it wants. Discovery runs
+    /// `flistxattr` to propose candidate names, keeps those in the selected
+    /// namespaces, and reads each value under the request identity `who`; only
+    /// attributes `who` can actually read are returned (an attribute `who`
+    /// lacks the privilege to read, such as `trusted.*` for a non-privileged
+    /// identity, is dropped). The kernel lists `user.`/`security.`/`system.`
+    /// names to any caller and gates `trusted.` on `CAP_SYS_ADMIN`; this crate
+    /// does not re-implement that policy, it enforces the per-value `who`
+    /// check. The consumer remains responsible for understanding and filtering
+    /// what is actually safe to expose to its own callers.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct XattrNamespaces: u8 {
+        /// The `user.` namespace (unprivileged application metadata; e.g. the
+        /// `user.DosStream.*` attributes an SMB server maps to NTFS streams).
+        const USER = 0b0001;
+        /// The `trusted.` namespace (reading a value requires `CAP_SYS_ADMIN`).
+        const TRUSTED = 0b0010;
+        /// The `security.` namespace (LSM labels, file capabilities).
+        const SECURITY = 0b0100;
+        /// The `system.` namespace (ACLs; e.g. `system.posix_acl_access`,
+        /// `system.nfs4_acl_xdr`).
+        const SYSTEM = 0b1000;
     }
 }
 
@@ -54,10 +88,26 @@ pub struct QueryOptions {
     pub spec: EnrichSpec,
     /// Extended attributes to fetch when [`EnrichSpec::XATTR`] is set.
     pub xattr_names: Vec<CString>,
+    /// Namespaces to enumerate when [`EnrichSpec::XATTR_LIST`] is set; the
+    /// library returns only the attributes readable under `who`. Defaults to
+    /// [`XattrNamespaces::USER`]. See [`XattrNamespaces`] for the contract.
+    pub xattr_ns: XattrNamespaces,
     /// The ACL xattr name to fetch when [`EnrichSpec::ACL`] is set.
     pub acl_name: CString,
     /// Entries per yielded batch (clamped to at least 1).
     pub clump: usize,
+}
+
+impl Default for QueryOptions {
+    fn default() -> Self {
+        QueryOptions {
+            spec: EnrichSpec::empty(),
+            xattr_names: Vec::new(),
+            xattr_ns: XattrNamespaces::USER,
+            acl_name: c"".to_owned(),
+            clump: 1,
+        }
+    }
 }
 
 /// One enriched directory entry. Which fields are populated depends on the
@@ -71,8 +121,11 @@ pub struct DirEntry {
     pub is_dir: bool,
     /// `statx` metadata, when [`EnrichSpec::STATX`] was requested and succeeded.
     pub statx: Option<Statx>,
-    /// Requested xattrs, in request order: `(name, value)`; `value` is `None`
-    /// when the attribute is absent (or the entry could not be opened).
+    /// Requested and discovered xattrs. Explicit [`QueryOptions::xattr_names`]
+    /// come first, in request order, with `value` `None` when the attribute is
+    /// absent (or the entry could not be opened); names discovered via
+    /// [`EnrichSpec::XATTR_LIST`] follow, sorted, each readable under `who`
+    /// (unreadable ones are dropped rather than listed).
     pub xattrs: Vec<(CString, Option<Vec<u8>>)>,
     /// The ACL xattr value, when [`EnrichSpec::ACL`] was requested and present.
     pub acl: Option<Vec<u8>>,
@@ -154,17 +207,19 @@ impl QueryDir {
         Ok(out)
     }
 
-    /// Enrich a clump: scatter `statx`+`open` for every entry (phase 1),
-    /// collect the results and opened fds, then scatter `fgetxattr` for every
-    /// opened fd (phase 2), collect, and assemble. Every op runs under `who`;
-    /// each phase submits all its ops before waiting on any, so they overlap on
-    /// the ring.
+    /// Enrich a clump of entries. For each entry, request its `statx` and open
+    /// its fd, then `fgetxattr` the requested and discovered attributes on that
+    /// fd. A clump's ring ops are all submitted before any result is awaited, so
+    /// they overlap on the ring, and each runs under `who`. `XATTR_LIST`
+    /// discovery lists candidate names with `flistxattr` on the caller's own
+    /// thread, then reads their values under `who` and keeps only the readable
+    /// ones.
     fn enrich(&self, names: Vec<(OsString, u8)>) -> Vec<DirEntry> {
         let who = self.who;
         let spec = self.opts.spec;
 
-        // Phase 1: submit statx + open for every entry.
-        let phase1: Vec<Scattered1> = names
+        // Request statx and an fd for each entry, opened as `who`.
+        let requested: Vec<Requested> = names
             .into_iter()
             .map(|(name, dtype)| {
                 let statx = if spec.contains(EnrichSpec::STATX) {
@@ -182,16 +237,19 @@ impl QueryDir {
                 } else {
                     None
                 };
-                let open = if spec
-                    .intersects(EnrichSpec::XATTR | EnrichSpec::ACL)
-                {
-                    let how = OpenHow::new()
-                        .flags(OFlag::O_RDONLY | OFlag::O_NOFOLLOW);
+                let open = if spec.intersects(
+                    EnrichSpec::XATTR
+                        | EnrichSpec::ACL
+                        | EnrichSpec::XATTR_LIST,
+                ) {
+                    let how = OpenHow::new().flags(
+                        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+                    );
                     self.h.start_open(who, &self.dir, name.as_bytes(), how).ok()
                 } else {
                     None
                 };
-                Scattered1 {
+                Requested {
                     name,
                     dtype,
                     statx,
@@ -200,8 +258,8 @@ impl QueryDir {
             })
             .collect();
 
-        // Phase 1 collect: statx result + opened File per entry.
-        let opened: Vec<Opened> = phase1
+        // Collect each entry's statx and opened fd.
+        let opened: Vec<Opened> = requested
             .into_iter()
             .map(|p| {
                 let statx = p.statx.and_then(pending_statx);
@@ -219,12 +277,14 @@ impl QueryDir {
             })
             .collect();
 
-        // Phase 2: submit fgetxattr for every opened file.
-        let phase2: Vec<Scattered2> = opened
+        // For each opened fd, read the explicit names and ACL, and read each
+        // discovered name into the initial buffer.
+        let reading: Vec<Reading> = opened
             .into_iter()
             .map(|p| {
                 let mut xattrs = Vec::new();
                 let mut acl = None;
+                let mut discovered = Vec::new();
                 match &p.file {
                     Some(f) => {
                         if spec.contains(EnrichSpec::XATTR) {
@@ -252,6 +312,31 @@ impl QueryDir {
                                 )
                                 .ok();
                         }
+                        if spec.contains(EnrichSpec::XATTR_LIST) {
+                            // Exclude only names actually fetched above, so
+                            // `XATTR_LIST` without `XATTR` still surfaces every
+                            // name in the namespace.
+                            let explicit: &[CString] =
+                                if spec.contains(EnrichSpec::XATTR) {
+                                    self.opts.xattr_names.as_slice()
+                                } else {
+                                    &[]
+                                };
+                            for dn in
+                                discover_names(f, self.opts.xattr_ns, explicit)
+                            {
+                                let pend = self
+                                    .h
+                                    .start_fgetxattr(
+                                        who,
+                                        f,
+                                        &dn,
+                                        vec![0u8; DISCOVER_BUF],
+                                    )
+                                    .ok();
+                                discovered.push((dn, pend));
+                            }
+                        }
                     }
                     None if spec.contains(EnrichSpec::XATTR) => {
                         for xn in &self.opts.xattr_names {
@@ -260,28 +345,45 @@ impl QueryDir {
                     }
                     None => {}
                 }
-                Scattered2 {
+                Reading {
                     name: p.name,
                     is_dir: p.is_dir,
                     statx: p.statx,
-                    _file: p.file,
+                    file: p.file,
                     xattrs,
                     acl,
+                    discovered,
                 }
             })
             .collect();
 
-        // Phase 2 collect + assemble. `_file` drops here — its fd closed once
-        // its xattr ops completed (each parked its own `Arc` until its CQE).
-        phase2
+        // Assemble each entry. Explicit xattrs keep their `None`-on-absent
+        // shape; a discovered value larger than the initial buffer is refetched
+        // at its true size under `who`, and one `who` cannot read is dropped.
+        // The fd is held until any refetch finishes, then dropped (each
+        // in-flight op keeps its own reference).
+        reading
             .into_iter()
             .map(|p| {
-                let xattrs = p
+                let mut xattrs: Vec<(CString, Option<Vec<u8>>)> = p
                     .xattrs
                     .into_iter()
                     .map(|(xn, pend)| (xn, pend.and_then(pending_bytes)))
                     .collect();
                 let acl = p.acl.and_then(pending_bytes);
+                for (dn, pend) in p.discovered {
+                    let val = match pend.map(pending_discovered) {
+                        Some(DiscRead::Got(v)) => Some(v),
+                        Some(DiscRead::Grow) => p
+                            .file
+                            .as_ref()
+                            .and_then(|f| refetch_grow(&self.h, who, f, &dn)),
+                        Some(DiscRead::Drop) | None => None,
+                    };
+                    if let Some(v) = val {
+                        xattrs.push((dn, Some(v)));
+                    }
+                }
                 DirEntry {
                     name: p.name,
                     is_dir: p.is_dir,
@@ -302,8 +404,8 @@ impl Drop for QueryDir {
     }
 }
 
-// Per-entry state threaded between the two scatter phases.
-struct Scattered1 {
+// Per-entry intermediate state.
+struct Requested {
     name: OsString,
     dtype: u8,
     statx: Option<FsPending>,
@@ -315,15 +417,16 @@ struct Opened {
     statx: Option<Statx>,
     file: Option<File>,
 }
-struct Scattered2 {
+struct Reading {
     name: OsString,
     is_dir: bool,
     statx: Option<Statx>,
-    // Held until its xattr ops were submitted; the ops park their own clones,
-    // so the fd survives to completion regardless.
-    _file: Option<File>,
+    // Kept alive until any oversized discovered value has been refetched; each
+    // in-flight op holds its own reference regardless.
+    file: Option<File>,
     xattrs: Vec<(CString, Option<FsPending>)>,
     acl: Option<FsPending>,
+    discovered: Vec<(CString, Option<FsPending>)>,
 }
 
 /// Await a `statx` twin: `Some(Statx)` on success, else `None`.
@@ -347,6 +450,156 @@ fn pending_bytes(p: FsPending) -> Option<Vec<u8>> {
     let n = out.res.ok()? as usize;
     let buf = out.bufs.into_iter().next()?;
     buf.get(..n).map(<[u8]>::to_vec)
+}
+
+/// Initial buffer for a discovered attribute's value read; larger values are
+/// refetched at their true size (see [`refetch_grow`]).
+const DISCOVER_BUF: usize = 4096;
+
+/// The namespace an attribute name belongs to (by prefix), or `None` for a name
+/// outside the four standard namespaces.
+fn namespace_of(name: &[u8]) -> Option<XattrNamespaces> {
+    if name.starts_with(b"user.") {
+        Some(XattrNamespaces::USER)
+    } else if name.starts_with(b"trusted.") {
+        Some(XattrNamespaces::TRUSTED)
+    } else if name.starts_with(b"security.") {
+        Some(XattrNamespaces::SECURITY)
+    } else if name.starts_with(b"system.") {
+        Some(XattrNamespaces::SYSTEM)
+    } else {
+        None
+    }
+}
+
+/// `flistxattr` the entry, keep names in the requested namespaces, drop any
+/// already named explicitly, and return them sorted (stable output). Runs on
+/// the caller's own thread (the same thread that reads the directory), at that
+/// thread's privilege: it only proposes candidates, the per-value `who` read is
+/// the authoritative gate.
+fn discover_names(
+    f: &File,
+    want: XattrNamespaces,
+    explicit: &[CString],
+) -> Vec<CString> {
+    let mut names: Vec<CString> = match flistxattr(f.fd.as_fd()) {
+        Ok(list) => list
+            .into_iter()
+            .filter(|n| {
+                namespace_of(n.as_bytes()).is_some_and(|ns| want.intersects(ns))
+            })
+            .filter_map(|n| CString::new(n).ok())
+            .filter(|c| !explicit.iter().any(|e| e == c))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// A discovered attribute's value read outcome.
+enum DiscRead {
+    /// Read succeeded.
+    Got(Vec<u8>),
+    /// Value outgrew the initial buffer (`ERANGE`); refetch at its true size.
+    Grow,
+    /// Absent, or `who` lacks the privilege to read it, or the loop is gone.
+    Drop,
+}
+
+/// Classify a discovered attribute's `fgetxattr` outcome (see [`DiscRead`]).
+fn pending_discovered(p: FsPending) -> DiscRead {
+    let Some(out) = p.into_outcome().ok() else {
+        return DiscRead::Drop;
+    };
+    match out.res {
+        Ok(n) => match out
+            .bufs
+            .into_iter()
+            .next()
+            .and_then(|b| b.get(..n as usize).map(<[u8]>::to_vec))
+        {
+            Some(v) => DiscRead::Got(v),
+            None => DiscRead::Drop,
+        },
+        Err(Errno::ERANGE) => DiscRead::Grow,
+        Err(_) => DiscRead::Drop,
+    }
+}
+
+/// Refetch a discovered attribute whose value outgrew [`DISCOVER_BUF`]: size-
+/// probe then read at that size under `who`, bounded to [`XATTR_SIZE_MAX`].
+/// `None` if it became unreadable or exceeds the cap.
+fn refetch_grow(
+    h: &FsHandle,
+    who: Personality,
+    f: &File,
+    name: &CStr,
+) -> Option<Vec<u8>> {
+    let (size, _) = h.fgetxattr(who, f, name, Vec::new());
+    let size = size.ok()?;
+    if size > XATTR_SIZE_MAX {
+        return None;
+    }
+    let (n, buf) = h.fgetxattr(who, f, name, vec![0u8; size]);
+    buf.get(..n.ok()?).map(<[u8]>::to_vec)
+}
+
+/// List the extended-attribute names on `f` (all namespaces), sorted. Runs a
+/// blocking `flistxattr` on the calling thread at its own privilege; names the
+/// caller is not privileged to see (`trusted.*` without `CAP_SYS_ADMIN`) are
+/// omitted by the kernel.
+pub(crate) fn list_xattr_names(f: &File) -> crate::Result<Vec<CString>> {
+    let mut names: Vec<CString> = flistxattr(f.fd.as_fd())?
+        .into_iter()
+        .filter_map(|n| CString::new(n).ok())
+        .collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+/// Enumerate the extended attributes of `f` in the namespaces `want`, read each
+/// value under `who`, and return only those `who` can read. `flistxattr` runs
+/// on the calling thread proposing candidates; the per-value read under `who`
+/// is the authoritative gate, so an attribute `who` cannot read is dropped.
+/// Off-loop only: it blocks on the ring, so never run it on the reactor.
+pub(crate) fn scan_xattrs(
+    h: &FsHandle,
+    who: Personality,
+    f: &File,
+    want: XattrNamespaces,
+) -> crate::Result<Vec<(CString, Vec<u8>)>> {
+    let mut names: Vec<CString> = flistxattr(f.fd.as_fd())?
+        .into_iter()
+        .filter(|n| {
+            namespace_of(n.as_bytes()).is_some_and(|ns| want.intersects(ns))
+        })
+        .filter_map(|n| CString::new(n).ok())
+        .collect();
+    names.sort();
+    names.dedup();
+    // Submit a read for every name before awaiting any, then gather.
+    let pending: Vec<(CString, Option<FsPending>)> = names
+        .into_iter()
+        .map(|n| {
+            let p = h.start_fgetxattr(who, f, &n, vec![0u8; DISCOVER_BUF]).ok();
+            (n, p)
+        })
+        .collect();
+    let mut out = Vec::with_capacity(pending.len());
+    for (n, p) in pending {
+        let val = match p.map(pending_discovered) {
+            Some(DiscRead::Got(v)) => Some(v),
+            Some(DiscRead::Grow) => refetch_grow(h, who, f, &n),
+            Some(DiscRead::Drop) | None => None,
+        };
+        if let Some(v) = val {
+            out.push((n, v));
+        }
+    }
+    Ok(out)
 }
 
 /// Start listing `dir` as `who`, enriching each entry per `opts`. Opening the
@@ -447,13 +700,6 @@ pub(crate) struct WorkerPool {
 }
 
 impl WorkerPool {
-    /// A fixed pool of `workers` (at least 1) threads that never grows
-    /// (`floor == ceiling`). Panics if a thread cannot be spawned, for off-loop
-    /// callers that build the pool up front ([`QueryPool::new`]).
-    pub(crate) fn new(workers: usize) -> WorkerPool {
-        Self::try_elastic(workers, workers).expect("spawn fs worker")
-    }
-
     /// An elastic pool: `floor` (at least 1) warm threads growing to `ceiling`
     /// under saturation, using the default cooldown and idle timeout. Returns
     /// the spawn error rather than panicking.
@@ -591,27 +837,78 @@ fn spawn_worker(shared: &Arc<PoolShared>) -> std::io::Result<()> {
         .map(|_| ())
 }
 
-/// A [`WorkerPool`] bound to an [`FsHandle`] for the off-loop directory-listing
-/// ([`query`](QueryPool::query)) and byte-range copy
+/// One lazily-spawned [`WorkerPool`] shared by a reactor's on-loop offloads
+/// (`FsConn::offload`) and its off-loop [`QueryPool`], so the reactor has a
+/// single blocking-work thread budget. Cheap to clone (`Arc`); the floor
+/// threads spawn on the first submit, and if a worker cannot be spawned the job
+/// runs inline (a degraded loop, not a dead one).
+pub(crate) struct SharedPool {
+    pool: OnceLock<WorkerPool>,
+    floor: usize,
+    ceiling: usize,
+}
+
+impl fmt::Debug for SharedPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedPool")
+            .field("spawned", &self.pool.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedPool {
+    /// A shared pool with warm floor `floor` and growth ceiling `ceiling` (each
+    /// at least 1); no threads spawn until the first [`submit`](Self::submit).
+    pub(crate) fn new(floor: usize, ceiling: usize) -> Arc<SharedPool> {
+        let floor = floor.max(1);
+        Arc::new(SharedPool {
+            pool: OnceLock::new(),
+            floor,
+            ceiling: ceiling.max(floor),
+        })
+    }
+
+    /// Submit a job, spawning the pool on first use. A lost init race just
+    /// drops the surplus pool (its `Drop` joins the idle workers); a spawn
+    /// failure runs the job inline rather than take the reactor down.
+    pub(crate) fn submit(&self, job: Job) {
+        if let Some(pool) = self.pool.get() {
+            return pool.submit(job);
+        }
+        match WorkerPool::try_elastic(self.floor, self.ceiling) {
+            Ok(pool) => {
+                let _ = self.pool.set(pool);
+                if let Some(pool) = self.pool.get() {
+                    pool.submit(job);
+                }
+            }
+            Err(_) => job(),
+        }
+    }
+}
+
+/// An [`FsHandle`] bound to the reactor's shared blocking-work pool for the
+/// off-loop directory-listing ([`query`](QueryPool::query)) and byte-range copy
 /// ([`copy_file_range`](QueryPool::copy_file_range)) helpers. Each method
-/// enqueues a job and returns immediately with a handle; up to `workers` jobs
-/// run concurrently, so one caller thread can fan out many and then collect
-/// them.
+/// enqueues a job and returns immediately with a handle; the pool is elastic
+/// (sized at reactor construction), so one caller thread can fan out many jobs
+/// and then collect them.
 ///
 /// A walk opens its directory under its own `who` (the list-permission check),
 /// so `EACCES` surfaces as an error batch rather than a listing taken under the
 /// reactor's ambient credentials.
 pub struct QueryPool {
-    pool: WorkerPool,
+    pool: Arc<SharedPool>,
     h: FsHandle,
 }
 
 impl QueryPool {
-    /// Build a pool of `workers` (at least 1) threads over `h` (cloned cheaply
-    /// per job — the handle just shares the one loop).
-    pub fn new(h: FsHandle, workers: usize) -> QueryPool {
+    /// Build a listing pool over `h`, sharing the reactor's one elastic
+    /// blocking-work pool. `h` is cloned cheaply per job (the handle just
+    /// shares the one loop).
+    pub fn new(h: FsHandle) -> QueryPool {
         QueryPool {
-            pool: WorkerPool::new(workers),
+            pool: h.pool.clone(),
             h,
         }
     }
@@ -708,15 +1005,8 @@ impl QueryPool {
 
 impl fmt::Debug for QueryPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let workers = self
-            .pool
-            .shared
-            .inner
-            .lock()
-            .map(|g| g.total)
-            .unwrap_or_else(|e| e.into_inner().total);
         f.debug_struct("QueryPool")
-            .field("workers", &workers)
+            .field("pool", &self.pool)
             .finish()
     }
 }
@@ -997,7 +1287,7 @@ mod pool_tests {
     /// A fixed pool (`floor == ceiling`) never grows, even when saturated.
     #[test]
     fn fixed_pool_does_not_grow() {
-        let pool = WorkerPool::new(2);
+        let pool = WorkerPool::try_elastic(2, 2).unwrap();
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let (started_tx, started_rx) = mpsc::channel::<()>();
         for _ in 0..2 {

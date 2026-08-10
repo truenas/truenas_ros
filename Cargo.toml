@@ -82,7 +82,7 @@ http = ["net-server", "dep:httparse"]
 # rather than something `full` turns on underneath a consumer. Depends on
 # `sync-fs` for the shared OpenHow/ResolveFlag vocabulary; combine with
 # `net-server` for the in-server reactor (`ServerConfig::fs_files`).
-uring-fs = ["uring", "sync-fs"]
+uring-fs = ["uring", "sync-fs", "xattr"]
 # Internal: exposes the pure `frame_step` framing decision to the fuzz crate
 # (`fuzz/`). Not for consumers; implies `net-server` (where `frame_step` lives).
 __fuzz = ["net-server"]

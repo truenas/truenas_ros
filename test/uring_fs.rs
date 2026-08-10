@@ -977,6 +977,7 @@ fn query_directory_lists_and_enriches() {
             spec: EnrichSpec::STATX | EnrichSpec::XATTR,
             xattr_names: vec![etag.clone()],
             acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
+            xattr_ns: truenas_ros::uring_fs::XattrNamespaces::empty(),
             clump: 2, // force more than one batch
         };
         let mut q = query_directory(&h, me, &anchor, opts).unwrap();
@@ -1001,6 +1002,249 @@ fn query_directory_lists_and_enriches() {
             );
             assert_eq!(all["b.txt"].xattrs[0].1, None, "b.txt has no etag");
         }
+    });
+}
+
+/// `XATTR_LIST` discovers the attributes present in the requested namespace and
+/// returns their values; a namespace the attributes are not in discovers none
+/// of them.
+#[test]
+fn query_directory_discovers_user_xattrs() {
+    use std::collections::BTreeMap;
+    use truenas_ros::uring_fs::{
+        query_directory, EnrichSpec, QueryOptions, XattrNamespaces,
+    };
+
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("a.txt"), b"aa").unwrap();
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+
+        // Tag a.txt with two user attrs; the first set probes fd-xattr support.
+        let set = |name: &str, val: &[u8]| -> bool {
+            let how = OpenHow::new().flags(OFlag::O_RDWR);
+            let f = h.open(me, &anchor, "a.txt", how).unwrap();
+            let (res, _) =
+                h.fsetxattr(me, &f, &xattr_name(name), val.to_vec(), 0);
+            h.close(f).unwrap();
+            res.is_ok()
+        };
+        if !set("user.alpha", b"one") {
+            return; // this kernel/fs refuses fd xattrs; nothing to discover
+        }
+        assert!(set("user.beta", b"two"));
+
+        let discover = |ns: XattrNamespaces| {
+            let opts = QueryOptions {
+                spec: EnrichSpec::XATTR_LIST,
+                xattr_ns: ns,
+                ..Default::default()
+            };
+            let mut q = query_directory(&h, me, &anchor, opts).unwrap();
+            let mut got: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
+            while let Some(batch) = q.next() {
+                for e in batch.unwrap() {
+                    if e.name.as_bytes() == b"a.txt" {
+                        for (n, v) in e.xattrs {
+                            got.insert(n.to_string_lossy().into_owned(), v);
+                        }
+                    }
+                }
+            }
+            got
+        };
+
+        let user = discover(XattrNamespaces::USER);
+        assert_eq!(
+            user.get("user.alpha").and_then(|v| v.as_deref()),
+            Some(&b"one"[..]),
+        );
+        assert_eq!(
+            user.get("user.beta").and_then(|v| v.as_deref()),
+            Some(&b"two"[..]),
+        );
+
+        let trusted = discover(XattrNamespaces::TRUSTED);
+        assert!(
+            !trusted.contains_key("user.alpha"),
+            "user.* must not surface under a TRUSTED-only query"
+        );
+    });
+}
+
+/// A discovered value larger than the initial buffer is refetched at its true
+/// size, not silently truncated or dropped.
+#[test]
+fn query_directory_discovers_large_value() {
+    use truenas_ros::uring_fs::{
+        query_directory, EnrichSpec, QueryOptions, XattrNamespaces,
+    };
+
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("big.bin"), b"x").unwrap();
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let big = vec![0xabu8; 5000]; // larger than the 4096-byte buffer
+
+        let set_ok = {
+            let how = OpenHow::new().flags(OFlag::O_RDWR);
+            let f = h.open(me, &anchor, "big.bin", how).unwrap();
+            let (res, _) =
+                h.fsetxattr(me, &f, &xattr_name("user.blob"), big.clone(), 0);
+            h.close(f).unwrap();
+            res.is_ok()
+        };
+        if !set_ok {
+            return; // fd xattrs unsupported, or the fs rejects the value size
+        }
+
+        let opts = QueryOptions {
+            spec: EnrichSpec::XATTR_LIST,
+            xattr_ns: XattrNamespaces::USER,
+            ..Default::default()
+        };
+        let mut q = query_directory(&h, me, &anchor, opts).unwrap();
+        let mut found = None;
+        while let Some(batch) = q.next() {
+            for e in batch.unwrap() {
+                if e.name.as_bytes() == b"big.bin" {
+                    for (n, v) in e.xattrs {
+                        if n.to_bytes() == b"user.blob" {
+                            found = v;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            found.as_deref(),
+            Some(big.as_slice()),
+            "the whole value is refetched"
+        );
+    });
+}
+
+/// Discovery runs each value read under the caller: an unprivileged identity
+/// sees the world-readable `user.*` attribute but never the `trusted.*` one,
+/// while a privileged identity does. The candidate-listing `flistxattr` runs at
+/// the reactor's privilege, so the per-value `who` read is what gates it.
+#[test]
+fn query_directory_discovery_drops_unreadable_trusted() {
+    use std::collections::BTreeMap;
+    use truenas_ros::uring_fs::{
+        query_directory, EnrichSpec, QueryOptions, XattrNamespaces,
+    };
+
+    if !is_root() {
+        return; // broker impersonation and trusted.* both need privilege
+    }
+    const NOBODY_UID: u32 = 65_534;
+    const NOBODY_GID: u32 = 65_534;
+
+    with_broker(|h, creds, me, dir| {
+        std::fs::write(dir.join("f.txt"), b"hi").unwrap();
+        std::fs::set_permissions(
+            dir.join("f.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let anchor = Anchor::open(dir).unwrap();
+
+        let set = |who: Personality, name: &str, val: &[u8]| {
+            let how = OpenHow::new().flags(OFlag::O_RDWR);
+            let f = h.open(who, &anchor, "f.txt", how).unwrap();
+            let (res, _) =
+                h.fsetxattr(who, &f, &xattr_name(name), val.to_vec(), 0);
+            h.close(f).unwrap();
+            res
+        };
+        if set(me, "user.pub", b"public").is_err() {
+            return; // fd xattrs unsupported
+        }
+        set(me, "trusted.secret", b"classified").unwrap();
+
+        let peer = creds
+            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
+            .unwrap();
+
+        let discover = |who: Personality| {
+            let opts = QueryOptions {
+                spec: EnrichSpec::XATTR_LIST,
+                xattr_ns: XattrNamespaces::USER | XattrNamespaces::TRUSTED,
+                ..Default::default()
+            };
+            let mut q = query_directory(h, who, &anchor, opts).unwrap();
+            let mut got: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
+            while let Some(batch) = q.next() {
+                for e in batch.unwrap() {
+                    if e.name.as_bytes() == b"f.txt" {
+                        for (n, v) in e.xattrs {
+                            got.insert(n.to_string_lossy().into_owned(), v);
+                        }
+                    }
+                }
+            }
+            got
+        };
+
+        let peer_view = discover(peer);
+        assert!(
+            peer_view.contains_key("user.pub"),
+            "peer should read the world-readable user attr"
+        );
+        assert!(
+            !peer_view.contains_key("trusted.secret"),
+            "trusted.* must not leak to an unprivileged identity"
+        );
+
+        let root_view = discover(me);
+        assert_eq!(
+            root_view.get("trusted.secret").and_then(|v| v.as_deref()),
+            Some(&b"classified"[..]),
+            "a privileged identity does read trusted.*"
+        );
+    });
+}
+
+/// Discovery works through the pooled lister as well as the direct one.
+#[test]
+fn query_pool_discovers_xattrs() {
+    use truenas_ros::uring_fs::{
+        EnrichSpec, QueryOptions, QueryPool, XattrNamespaces,
+    };
+
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("p.txt"), b"hi").unwrap();
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let set_ok = {
+            let how = OpenHow::new().flags(OFlag::O_RDWR);
+            let f = h.open(me, &anchor, "p.txt", how).unwrap();
+            let (res, _) =
+                h.fsetxattr(me, &f, &xattr_name("user.tag"), b"v".to_vec(), 0);
+            h.close(f).unwrap();
+            res.is_ok()
+        };
+        if !set_ok {
+            return;
+        }
+
+        let pool = QueryPool::new(h);
+        let opts = QueryOptions {
+            spec: EnrichSpec::XATTR_LIST,
+            xattr_ns: XattrNamespaces::USER,
+            ..Default::default()
+        };
+        let handle = pool.query(me, anchor, opts);
+        let mut found = false;
+        while let Some(batch) = handle.next() {
+            for e in batch.unwrap() {
+                if e.name.as_bytes() == b"p.txt" {
+                    found = e.xattrs.iter().any(|(n, v)| {
+                        n.to_bytes() == b"user.tag"
+                            && v.as_deref() == Some(&b"v"[..])
+                    });
+                }
+            }
+        }
+        assert!(found, "pool discovery surfaces the user attr");
     });
 }
 
@@ -1038,6 +1282,7 @@ fn query_directory_enumeration_obeys_dac() {
             spec: EnrichSpec::STATX,
             xattr_names: vec![],
             acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
+            xattr_ns: truenas_ros::uring_fs::XattrNamespaces::empty(),
             clump: 8,
         };
         let err = query_directory(h, peer, &anchor, opts).unwrap_err();
@@ -1064,6 +1309,7 @@ fn query_directory_drop_closes_dir_fd() {
             spec: EnrichSpec::STATX,
             xattr_names: vec![],
             acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
+            xattr_ns: truenas_ros::uring_fs::XattrNamespaces::empty(),
             clump: 2,
         };
         let mut q = query_directory(&h, me, &anchor, opts).unwrap();
@@ -1091,6 +1337,164 @@ fn query_directory_drop_closes_dir_fd() {
     });
 }
 
+/// The off-loop async-fs API enumerates a file's xattrs directly (no directory
+/// walk): `flistxattr` lists names, `query_xattrs` returns namespace-filtered
+/// names and values read under `who`.
+#[test]
+fn fs_handle_query_xattrs_reads_user_namespace() {
+    use std::collections::BTreeMap;
+    use truenas_ros::uring_fs::XattrNamespaces;
+
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("f.txt"), b"hi").unwrap();
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let how = OpenHow::new().flags(OFlag::O_RDWR);
+        let f = h.open(me, &anchor, "f.txt", how).unwrap();
+
+        let set = |name: &str, val: &[u8]| {
+            let (res, _) =
+                h.fsetxattr(me, &f, &xattr_name(name), val.to_vec(), 0);
+            res
+        };
+        if set("user.a", b"1").is_err() {
+            return; // this kernel/fs refuses fd xattrs
+        }
+        set("user.b", b"22").unwrap();
+
+        let names: Vec<String> = h
+            .flistxattr(&f)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n == "user.a"));
+        assert!(names.iter().any(|n| n == "user.b"));
+
+        let got: BTreeMap<String, Vec<u8>> = h
+            .query_xattrs(me, &f, XattrNamespaces::USER)
+            .unwrap()
+            .into_iter()
+            .map(|(n, v)| (n.to_string_lossy().into_owned(), v))
+            .collect();
+        assert_eq!(got.get("user.a").map(Vec::as_slice), Some(&b"1"[..]));
+        assert_eq!(got.get("user.b").map(Vec::as_slice), Some(&b"22"[..]));
+
+        h.close(f).unwrap();
+    });
+}
+
+/// Off-loop `query_xattrs` gates each value read under `who`: an unprivileged
+/// identity gets the world-readable `user.*` attribute but never the
+/// `trusted.*` one, while a privileged identity does.
+#[test]
+fn fs_handle_query_xattrs_drops_unreadable_trusted() {
+    use std::collections::BTreeMap;
+    use truenas_ros::uring_fs::XattrNamespaces;
+
+    if !is_root() {
+        return; // broker impersonation and trusted.* both need privilege
+    }
+    const NOBODY_UID: u32 = 65_534;
+    const NOBODY_GID: u32 = 65_534;
+
+    with_broker(|h, creds, me, dir| {
+        std::fs::write(dir.join("f.txt"), b"hi").unwrap();
+        std::fs::set_permissions(
+            dir.join("f.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let anchor = Anchor::open(dir).unwrap();
+        let owner =
+            h.open(me, &anchor, "f.txt", OpenHow::new().flags(OFlag::O_RDWR));
+        let owner = owner.unwrap();
+
+        let set = |name: &str, val: &[u8]| {
+            let (res, _) =
+                h.fsetxattr(me, &owner, &xattr_name(name), val.to_vec(), 0);
+            res
+        };
+        if set("user.pub", b"public").is_err() {
+            return; // fd xattrs unsupported
+        }
+        set("trusted.secret", b"classified").unwrap();
+        h.close(owner).unwrap();
+
+        let peer = creds
+            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
+            .unwrap();
+        let ns = XattrNamespaces::USER | XattrNamespaces::TRUSTED;
+        let query = |who| {
+            let how = OpenHow::new().flags(OFlag::O_RDONLY);
+            let f = h.open(who, &anchor, "f.txt", how).unwrap();
+            let got: BTreeMap<String, Vec<u8>> = h
+                .query_xattrs(who, &f, ns)
+                .unwrap()
+                .into_iter()
+                .map(|(n, v)| (n.to_string_lossy().into_owned(), v))
+                .collect();
+            h.close(f).unwrap();
+            got
+        };
+
+        let peer_view = query(peer);
+        assert!(peer_view.contains_key("user.pub"));
+        assert!(
+            !peer_view.contains_key("trusted.secret"),
+            "trusted.* must not leak off-loop"
+        );
+
+        let root_view = query(me);
+        assert_eq!(
+            root_view.get("trusted.secret").map(Vec::as_slice),
+            Some(&b"classified"[..]),
+        );
+    });
+}
+
+/// `FsHandle::fgetxattr_as_root` reads under the reactor's ambient (root)
+/// credentials, so it returns a `trusted.*` value that the same fd's normal
+/// `who`-attributed read (as an unprivileged identity) is denied.
+#[test]
+fn fs_handle_fgetxattr_as_root_reads_trusted() {
+    if !is_root() {
+        return; // broker impersonation and trusted.* both need privilege
+    }
+    const NOBODY_UID: u32 = 65_534;
+    const NOBODY_GID: u32 = 65_534;
+
+    with_broker(|h, creds, me, dir| {
+        std::fs::write(dir.join("f.txt"), b"hi").unwrap();
+        std::fs::set_permissions(
+            dir.join("f.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let anchor = Anchor::open(dir).unwrap();
+        let how = OpenHow::new().flags(OFlag::O_RDWR);
+        let f = h.open(me, &anchor, "f.txt", how).unwrap();
+        let name = xattr_name("trusted.secret");
+        let (set, _) = h.fsetxattr(me, &f, &name, b"classified".to_vec(), 0);
+        if set.is_err() {
+            return; // fd xattrs unsupported
+        }
+
+        let peer = creds
+            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
+            .unwrap();
+        // Attributed to the unprivileged peer, the read is denied.
+        let (peer_res, _) = h.fgetxattr(peer, &f, &name, vec![0u8; 64]);
+        assert!(peer_res.is_err(), "peer cannot read trusted.* as itself");
+
+        // As root, the same fd yields the value regardless of any `who`.
+        let (root_res, buf) = h.fgetxattr_as_root(&f, &name, vec![0u8; 64]);
+        let n = root_res.expect("as-root read succeeds");
+        assert_eq!(&buf[..n], b"classified");
+
+        h.close(f).unwrap();
+    });
+}
+
 #[test]
 fn query_pool_lists_directory() {
     use std::collections::BTreeSet;
@@ -1102,11 +1506,12 @@ fn query_pool_lists_directory() {
             std::fs::write(dir.join(n), b"hi").unwrap();
         }
         let anchor = Anchor::open(dir.as_path()).unwrap();
-        let pool = QueryPool::new(h, 2);
+        let pool = QueryPool::new(h);
         let opts = QueryOptions {
             spec: EnrichSpec::STATX,
             xattr_names: vec![],
             acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
+            xattr_ns: truenas_ros::uring_fs::XattrNamespaces::empty(),
             clump: 2,
         };
         // Non-blocking enqueue; pull batches from the handle.
@@ -1144,11 +1549,12 @@ fn query_pool_runs_multiple_listings() {
 
         let a1 = Anchor::open(d1.as_path()).unwrap();
         let a2 = Anchor::open(d2.as_path()).unwrap();
-        let pool = QueryPool::new(h, 2);
+        let pool = QueryPool::new(h);
         let mk_opts = || QueryOptions {
             spec: EnrichSpec::STATX,
             xattr_names: vec![],
             acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
+            xattr_ns: truenas_ros::uring_fs::XattrNamespaces::empty(),
             clump: 8,
         };
         // Submit BOTH from this one thread before collecting either — the pool
@@ -1190,7 +1596,7 @@ fn pool_copy_file_range_whole() {
         let dst = h
             .open(me, &anchor, "dst", OpenHow::new().flags(OFlag::O_RDWR))
             .unwrap();
-        let pool = QueryPool::new(h, 2);
+        let pool = QueryPool::new(h);
         // Clones inline on a block-cloning fs, else offloads a byte copy —
         // either way the bytes land.
         let n = match pool
@@ -1221,7 +1627,7 @@ fn pool_copy_file_range_ranged_offload() {
         let dst = h
             .open(me, &anchor, "dst", OpenHow::new().flags(OFlag::O_RDWR))
             .unwrap();
-        let pool = QueryPool::new(h, 1);
+        let pool = QueryPool::new(h);
         // A misaligned sub-block range forces the byte-copy offload path even on
         // a block-cloning fs: copy src[100..200] -> dst[50..150].
         let n = match pool.copy_file_range(&src, &dst, 100, 50, 100).wait() {
