@@ -178,7 +178,15 @@ where
         // Bound the park: if the consumer's handshake worker never calls back in
         // time, shed the slot (SECURITY: else a stalled TLS handshake pins a
         // pool slot indefinitely). No-op unless `tls_handshake_timeout` is set.
-        self.arm_handshake_timeout(slot, generation)?;
+        if let Err(e) = self.arm_handshake_timeout(slot, generation) {
+            // SAFETY: close the freshly furnished fd we will not deliver. The
+            // slot is already parked, so shed it via teardown as the other
+            // error arms do.
+            unsafe { libc::close(fd) };
+            stat!(self.core, shed);
+            let _ = self.core.submit_teardown(slot, generation, true);
+            return Err(e);
+        }
         let deferral = AcceptDeferral {
             slot,
             // Channel handle: carry the full u64 generation (retained across the
