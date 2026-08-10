@@ -88,6 +88,27 @@ impl Default for HttpConfig {
 }
 
 impl HttpConfig {
+    /// Reject a configuration that cannot admit any request: both caps must be
+    /// non-zero. Consumers who raise [`max_body`](HttpConfig::max_body) should
+    /// keep [`ServerConfig::max_request_bytes`] at or above
+    /// [`min_request_bytes`](HttpConfig::min_request_bytes) too, or a request
+    /// the codec would answer 413/431 is instead cut off with a raw close and
+    /// no HTTP response; that cross-check needs the reactor config, so it lives
+    /// at server construction, while this checks the codec caps in isolation.
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.max_head == 0 {
+            return Err(crate::Error::Validation(
+                "http max_head must be non-zero".into(),
+            ));
+        }
+        if self.max_body == 0 {
+            return Err(crate::Error::Validation(
+                "http max_body must be non-zero".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The smallest [`ServerConfig::max_request_bytes`] under which every
     /// message this codec admits reaches the framer intact:
     /// `max_head + max_body + CHUNK_WIRE_OVERHEAD` (the last term because a
@@ -386,6 +407,36 @@ mod tests {
 
     fn cfg() -> HttpConfig {
         HttpConfig::default()
+    }
+
+    #[test]
+    fn validate_rejects_zero_caps() {
+        assert!(HttpConfig::default().validate().is_ok());
+        assert!(HttpConfig {
+            max_head: 0,
+            max_body: 1024,
+        }
+        .validate()
+        .is_err());
+        assert!(HttpConfig {
+            max_head: 1024,
+            max_body: 0,
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn default_caps_compose_with_the_reactor() {
+        // The codec's default min request size equals the reactor's default
+        // message cap, so the default codec on the default server has no dead
+        // band. Pinned here because raising max_body without raising
+        // max_request_bytes in step is what opens one.
+        use crate::net::server::ServerConfig;
+        assert_eq!(
+            HttpConfig::default().min_request_bytes(),
+            ServerConfig::default().max_request_bytes
+        );
     }
 
     #[test]
