@@ -247,7 +247,10 @@ where
     /// [`RequestId`] (the reply is FIFO-correlated to it). `WouldBlock` when the
     /// per-connection in-flight cap (`max_in_flight`) or the send backlog
     /// (`max_send_backlog`) is reached; `NotConnected` for a stale/unconnected
-    /// handle. The `pdu` is sent verbatim — frame it yourself.
+    /// handle; `InvalidInput` for an empty `pdu` — a request holds a correlation
+    /// slot until its reply arrives, so (unlike a server reply, where empty means
+    /// "answered, nothing to send") there is no "send nothing" request. The `pdu`
+    /// is sent verbatim — frame it yourself.
     pub fn send(
         &mut self,
         conn: ConnId,
@@ -258,6 +261,12 @@ where
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "not a live connection",
+            ));
+        }
+        if pdu.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an empty request PDU has no reply to correlate",
             ));
         }
         let in_flight = self.awaiting.get(&slot).map_or(0, VecDeque::len);
@@ -444,7 +453,9 @@ where
     /// Cancel the still-pending `next_event_timeout` deadline (identified by its
     /// `user_data`) and reap until its terminal completion is seen — so the pad
     /// is free to rewrite next call and `inflight` stays exact. Any real events
-    /// reaped meanwhile are dispatched (queued for a later `next_event`).
+    /// reaped meanwhile are dispatched (queued for a later `next_event`). A
+    /// cancel completing `-ENOENT` matched nothing, so the deadline is already
+    /// reaped and no `Op::Deadline` completion is owed: stop waiting for one.
     fn cancel_and_reap_deadline(
         &mut self,
         deadline_ud: u64,
@@ -467,8 +478,12 @@ where
                     done = true;
                 } else {
                     // Includes the `Cancel` control op's completion, which
-                    // `dispatch` counts off and ignores.
+                    // `dispatch` counts off and ignores. `-ENOENT` on it means
+                    // the cancel found no target: the deadline is gone.
+                    let gone = matches!(op, Some(Op::Cancel))
+                        && cqe.res == -libc::ENOENT;
                     self.dispatch(cqe)?;
+                    done |= gone;
                 }
             }
             let _ = self.core.take_pool_freed();
@@ -477,5 +492,96 @@ where
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::client::{ClientConfig, ConnectOpts};
+    use crate::net::core::protocol::ServerAddr;
+    use crate::uring::sys::IoUringCqe;
+    use crate::Errno;
+    use std::net::{SocketAddr, TcpListener};
+    use std::thread;
+    use std::time::Instant;
+
+    /// A stateless framer type the test client is generic over.
+    type Framer = fn(&[u8], &mut ()) -> Framing;
+
+    /// A client for a white-box deadline test, or `None` where io_uring is
+    /// unavailable — the environment skip the integration suites also take.
+    fn client() -> Option<Client<(), Framer>> {
+        fn framer(_buf: &[u8], _state: &mut ()) -> Framing {
+            Framing::More
+        }
+        let framer: Framer = framer;
+        match Client::new(ClientConfig::default(), framer) {
+            Ok(c) => Some(c),
+            Err(crate::Error::Errno(
+                Errno::EPERM | Errno::ENOSYS | Errno::EACCES,
+            )) => None,
+            Err(e) => panic!("client new: {e}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_of_a_stray_deadline_retires_the_flag() {
+        let Some(mut client) = client() else { return };
+        // The state a `next_event_timeout` that unwound leaves behind: the flag
+        // set, its `Op::Deadline` still counted in flight.
+        client.deadline_inflight = true;
+        client.core.engine.inflight = 1;
+        client
+            .dispatch(IoUringCqe {
+                user_data: pack(Op::Deadline, 0, 0),
+                res: -libc::ETIME,
+                flags: 0,
+            })
+            .expect("dispatch the deadline");
+        assert!(
+            !client.deadline_inflight,
+            "consuming the deadline retires the flag"
+        );
+        assert_eq!(client.core.engine.inflight, 0, "counted off exactly once");
+    }
+
+    #[test]
+    fn bounded_wait_recovers_from_an_unarmed_deadline_flag() {
+        let Some(mut client) = client() else { return };
+        // A peer that accepts and then sits idle, so the client has live work
+        // (an armed reply recv) and no completion of its own to reap.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let SocketAddr::V4(v4) = listener.local_addr().expect("local_addr")
+        else {
+            unreachable!("bound v4");
+        };
+        let peer = thread::spawn(move || {
+            let held = listener.accept().expect("accept");
+            thread::sleep(Duration::from_millis(500));
+            drop(held);
+        });
+        let conn = client
+            .connect(ServerAddr::Tcp(v4), ConnectOpts::default())
+            .expect("connect to the idle peer");
+
+        // The flag set with no `Op::Deadline` armed: the reap-side cancel
+        // matches nothing (`-ENOENT`), which is the whole of what is owed, so
+        // the call goes on to arm its own deadline and time out normally.
+        client.deadline_inflight = true;
+        let t0 = Instant::now();
+        let ev = client
+            .next_event_timeout(Duration::from_millis(100))
+            .expect("bounded wait");
+        assert!(ev.is_none(), "expected no event, got {ev:?}");
+        assert!(
+            t0.elapsed() < Duration::from_millis(400),
+            "the bounded wait took {:?}",
+            t0.elapsed()
+        );
+        assert!(client.is_open(conn), "the connection is left open");
+
+        client.close_now(conn);
+        peer.join().ok();
     }
 }
