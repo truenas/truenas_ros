@@ -126,7 +126,12 @@ pub(crate) fn probe_tcp_cmd(ring: &mut Ring) -> crate::Result<()> {
         sqe.user_data = u64::MAX; // reaped below; never reaches the loop
     })?;
     let res = loop {
-        ring.submit_and_wait(1)?;
+        if let Err(e) = ring.submit_and_wait(1) {
+            // Enter failed with the op state unknowable: keep the landing pad
+            // alive rather than risk a kernel write into freed memory.
+            std::mem::forget(val);
+            return Err(e.into());
+        }
         // `submit_and_wait` returns without a completion only on CQ
         // backpressure — impossible on this idle ring — so this cannot spin.
         if let Some(cqe) = ring.reap() {
