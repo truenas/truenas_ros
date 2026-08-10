@@ -153,7 +153,8 @@ pub fn umount(path: &Path, opts: UmountOptions) -> Result<()> {
         }
         for mnt in iter_mountinfo(st.mnt_id(), true, true)? {
             if let Some(point) = mnt.mnt_point {
-                umount2(point.as_str(), flags)?;
+                // Unmount the exact bytes the kernel reported for the child.
+                umount2(&point, flags)?;
             }
         }
     }

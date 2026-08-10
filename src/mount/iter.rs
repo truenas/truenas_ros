@@ -49,5 +49,6 @@ pub fn iter_mount(
 pub fn open_mount_by_id(mnt_id: u64, flags: OFlag) -> errno::Result<OwnedFd> {
     let sm = statmount(mnt_id, StatmountMask::MNT_POINT)?;
     let point = sm.mnt_point.ok_or(errno::Errno::ENXIO)?;
-    openat2(AT_FDCWD, point.as_str(), OpenHow::new().flags(flags))
+    // Open the exact bytes the kernel reported, not a UTF-8 lookalike.
+    openat2(AT_FDCWD, &point, OpenHow::new().flags(flags))
 }

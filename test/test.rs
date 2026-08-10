@@ -165,7 +165,7 @@ mod mount {
         )
         .unwrap();
         assert_eq!(sm.mnt_id, Some(id));
-        assert_eq!(sm.mnt_point.as_deref(), Some("/"));
+        assert_eq!(sm.mnt_point.as_deref(), Some(std::path::Path::new("/")));
         assert!(sm.fs_type.is_some());
         // With SB_BASIC co-requested, options carry the synthetic ro/rw prefix.
         let opts = sm.mount_opts().unwrap();
@@ -869,7 +869,7 @@ mod mount_helpers {
     #[test]
     fn statmount_path_of_root() {
         let sm = statmount_path(Path::new("/")).unwrap();
-        assert_eq!(sm.mnt_point.as_deref(), Some("/"));
+        assert_eq!(sm.mnt_point.as_deref(), Some(std::path::Path::new("/")));
         assert!(sm.fs_type.is_some());
     }
 
@@ -946,6 +946,154 @@ mod shutil {
                 .mode();
             assert_eq!(mode & 0o7777, 0o6755, "{name} lost its setid bits");
         }
+    }
+
+    // setid grants the destination *owner's* identity, so preserving the mode
+    // without the ownership must not preserve it: a root-run copy of an
+    // unprivileged user's 4755 file would otherwise yield a setuid-root binary
+    // whose contents that user wrote.
+    #[test]
+    fn setid_withheld_when_ownership_is_not_preserved() {
+        use std::os::unix::ffi::OsStrExt;
+        use truenas_ros::sync_fs::shutil::CopyFlags;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("helper"), b"data").unwrap();
+        let fifo = src.join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        for name in ["helper", "pipe"] {
+            std::fs::set_permissions(
+                src.join(name),
+                std::fs::Permissions::from_mode(0o4755),
+            )
+            .unwrap();
+        }
+
+        // OWNER cleared: the destination keeps the copier's ownership, so setid
+        // must not be carried over.
+        let config = CopyTreeConfig {
+            flags: CopyFlags::PERMISSIONS
+                | CopyFlags::XATTRS
+                | CopyFlags::TIMESTAMPS,
+            ..Default::default()
+        };
+        let dst = tmp.path().join("dst");
+        copytree(&src, &dst, &config).unwrap();
+
+        for name in ["helper", "pipe"] {
+            let mode = std::fs::symlink_metadata(dst.join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o6000, 0, "{name} kept setid: {mode:o}");
+            assert_eq!(mode & 0o777, 0o755);
+        }
+    }
+
+    // A special file's permission bits are restored through a handle on the new
+    // node, never a re-resolved name: a symlink planted at the destination name
+    // is not the object chmodded, and the umask-masked bits are still restored
+    // on the ordinary path.
+    #[test]
+    fn special_file_mode_is_not_applied_through_a_symlink() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        let fifo = src.join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o777) }, 0);
+        std::fs::set_permissions(&fifo, std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"victim-content").unwrap();
+        std::fs::set_permissions(
+            &victim,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        std::os::unix::fs::symlink(&victim, dst.join("pipe")).unwrap();
+
+        // exist_ok tolerates the planted name; whether the copy errors or skips,
+        // nothing may be chmodded through the symlink.
+        let _ = copytree(&src, &dst, &CopyTreeConfig::default());
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o7777,
+            0o600,
+            "victim's mode changed — the destination name was followed"
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim-content");
+
+        // The ordinary path restores the exact bits mknodat lost to the umask.
+        let dst2 = tmp.path().join("dst2");
+        let stats = copytree(&src, &dst2, &CopyTreeConfig::default()).unwrap();
+        assert_eq!(stats.specials, 1);
+        let md = std::fs::symlink_metadata(dst2.join("pipe")).unwrap();
+        assert_eq!(md.permissions().mode() & 0o7777, 0o777);
+    }
+
+    // An existing destination file must be replaced, not filled in place: the
+    // copied data must never appear in an inode someone else created and may
+    // still hold open.
+    #[test]
+    fn existing_destination_file_is_replaced_not_reused() {
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("secret"), b"SECRET-KEY-MATERIAL").unwrap();
+
+        // The destination name is pre-created by someone who keeps it open.
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(dst.join("secret"), b"planted").unwrap();
+        let mut planted = std::fs::File::open(dst.join("secret")).unwrap();
+        let planted_ino = planted.metadata().unwrap().ino();
+
+        // exist_ok (the default) still tolerates the existing entry.
+        let stats = copytree(&src, &dst, &CopyTreeConfig::default()).unwrap();
+        assert_eq!(stats.files, 1);
+        assert_eq!(
+            std::fs::read(dst.join("secret")).unwrap(),
+            b"SECRET-KEY-MATERIAL"
+        );
+
+        // A different inode, and the held descriptor never sees the copy.
+        let copied_ino = std::fs::metadata(dst.join("secret")).unwrap().ino();
+        assert_ne!(copied_ino, planted_ino, "the copy reused the inode");
+        let mut through_held_fd = Vec::new();
+        planted.read_to_end(&mut through_held_fd).unwrap();
+        assert_eq!(through_held_fd, b"planted");
+    }
+
+    // The destination root's mkdir must not resolve a symlink in the path: the
+    // copy fails either way, but nothing may be created outside the tree.
+    #[test]
+    fn destination_root_is_not_created_through_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("f"), b"data").unwrap();
+
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let stage = tmp.path().join("stage");
+        std::fs::create_dir(&stage).unwrap();
+        std::os::unix::fs::symlink(&outside, stage.join("link")).unwrap();
+
+        let dst = stage.join("link/backup");
+        assert!(copytree(&src, &dst, &CopyTreeConfig::default()).is_err());
+        assert!(
+            !outside.join("backup").exists(),
+            "destination root was created outside the intended tree"
+        );
     }
 
     // copytree does not chmod a file that carries an access ACL: the ACL is

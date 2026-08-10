@@ -7,6 +7,10 @@ pub(crate) const NFS4_ACL_XATTR: &str = "system.nfs4_acl_xdr";
 
 const HDR_SZ: usize = 8;
 const ACE_SZ: usize = 20;
+// The `iflag` bit that marks a special principal (`OWNER@`/`GROUP@`/
+// `EVERYONE@`). ZFS tests this bit alone and ignores the rest of the word
+// (`ACEI4_SPECIAL_WHO`, zpl_xattr.c), so the decoder must too.
+const ACEI4_SPECIAL_WHO: u32 = 1;
 
 tn_enum! {
     /// The type of an NFS4 ACE.
@@ -217,9 +221,13 @@ impl Nfs4Acl {
         let need = naces
             .checked_mul(ACE_SZ)
             .and_then(|n| n.checked_add(HDR_SZ));
-        if need.is_none_or(|need| data.len() < need) {
+        // ZFS requires the blob to be exactly header + naces*ACE_SZ
+        // (`nfsacl41i_to_zfsacl`), so require the same length: a trailing
+        // remainder or a count that under-declares the ACEs on the wire would
+        // otherwise decode and re-encode to a different blob.
+        if need != Some(data.len()) {
             return Err(Error::Parse(format!(
-                "NFS4 ACL truncated: {} bytes for {naces} ACEs",
+                "NFS4 ACL is {} bytes for a declared {naces} ACEs",
                 data.len()
             )));
         }
@@ -232,10 +240,20 @@ impl Nfs4Acl {
             let iflag = be32(data, p + 8);
             let access_mask = Nfs4Perm::from_bits_retain(be32(data, p + 12));
             let who_raw = be32(data, p + 16);
-            let (who_type, who_id) = if iflag != 0 {
-                let w = Nfs4Who::try_from(who_raw).map_err(|_| {
-                    Error::Parse("invalid NFS4 special principal".into())
-                })?;
+            // ZFS decides "special principal" from bit 0 of `iflag` alone; a
+            // word with other bits set but bit 0 clear is a named id, so read
+            // it the same way.
+            let (who_type, who_id) = if iflag & ACEI4_SPECIAL_WHO != 0 {
+                let w = match who_raw {
+                    1 => Nfs4Who::Owner,
+                    2 => Nfs4Who::Group,
+                    3 => Nfs4Who::Everyone,
+                    _ => {
+                        return Err(Error::Parse(
+                            "invalid NFS4 special principal".into(),
+                        ))
+                    }
+                };
                 (w, -1)
             } else {
                 (Nfs4Who::Named, who_raw as i64)
@@ -477,6 +495,56 @@ mod tests {
         // The empty buffer is the sentinel; 1..7 bytes is a truncated blob.
         assert!(Nfs4Acl::from_xattr(&[0u8; 4]).is_err());
         assert!(Nfs4Acl::from_xattr(&[0u8; 7]).is_err());
+    }
+
+    // Build a raw NFS4 ACL blob: header (flags, count) then each ACE as five
+    // big-endian words [type, flag, iflag, access_mask, who].
+    fn blob(acl_flags: u32, aces: &[[u32; 5]]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&acl_flags.to_be_bytes());
+        v.extend_from_slice(&(aces.len() as u32).to_be_bytes());
+        for a in aces {
+            for w in a {
+                v.extend_from_slice(&w.to_be_bytes());
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn iflag_without_bit0_is_a_named_principal() {
+        // iflag=2 has bit 0 clear, so ZFS stores a named id; the decoder must
+        // read the same principal rather than treating the word as special.
+        let acl = Nfs4Acl::from_xattr(&blob(0, &[[0, 0, 2, 0x1, 7]])).unwrap();
+        assert_eq!(acl.aces.len(), 1);
+        assert_eq!(acl.aces[0].who_type, Nfs4Who::Named);
+        assert_eq!(acl.aces[0].who_id, 7);
+    }
+
+    #[test]
+    fn special_who_out_of_range_is_rejected() {
+        // Bit 0 set with who 0 or 4: ZFS returns -EINVAL for those.
+        assert!(Nfs4Acl::from_xattr(&blob(0, &[[0, 0, 1, 0x1, 0]])).is_err());
+        assert!(Nfs4Acl::from_xattr(&blob(0, &[[0, 0, 1, 0x1, 4]])).is_err());
+        // who 1 is OWNER@.
+        let acl = Nfs4Acl::from_xattr(&blob(0, &[[0, 0, 1, 0x1, 1]])).unwrap();
+        assert_eq!(acl.aces[0].who_type, Nfs4Who::Owner);
+    }
+
+    #[test]
+    fn blob_length_must_match_the_declared_count() {
+        let ok = blob(0, &[[0, 0, 0, 0x1, 5]]);
+        assert_eq!(ok.len(), HDR_SZ + ACE_SZ);
+        assert!(Nfs4Acl::from_xattr(&ok).is_ok());
+        // Trailing bytes past the declared count are rejected.
+        let mut long = ok.clone();
+        long.extend_from_slice(&[0u8; 7]);
+        assert!(Nfs4Acl::from_xattr(&long).is_err());
+        // Two ACEs on the wire under a header claiming one: the extra would be
+        // dropped and re-encoded away, so reject it.
+        let mut under = blob(0, &[[0, 0, 0, 0x1, 5], [0, 0, 0, 0x2, 6]]);
+        under[4..8].copy_from_slice(&1u32.to_be_bytes());
+        assert!(Nfs4Acl::from_xattr(&under).is_err());
     }
 
     #[test]

@@ -22,6 +22,17 @@ const ACL_XATTRS: [&str; 3] = [POSIX_ACCESS, POSIX_DEFAULT, NFS4_ACL];
 // new children, so it is excluded).
 const ACCESS_ACL_XATTRS: [&str; 2] = [POSIX_ACCESS, NFS4_ACL];
 
+// The mode bits that grant the file's own owner (or group) identity to whoever
+// executes it. Split out of the rest of the mode because they are only
+// meaningful alongside that ownership — see [`copy_setid`].
+pub(super) const SETID_BITS: libc::mode_t = libc::S_ISUID | libc::S_ISGID;
+
+fn has_access_acl(xattr_names: &[String]) -> bool {
+    xattr_names
+        .iter()
+        .any(|n| ACCESS_ACL_XATTRS.contains(&n.as_str()))
+}
+
 /// Block-level clone via `copy_file_range(2)`. Fails with `EXDEV` across
 /// filesystems / ZFS pools.
 pub fn clonefile(
@@ -124,26 +135,54 @@ pub fn copyfile(
 /// The ACL is authoritative on ZFS `aclmode=restricted`, where a `chmod` of an
 /// object holding a non-trivial ACL is rejected with `EPERM` (`zfs_setattr`).
 /// Mirrors `truenas_os` copy.py.
+///
+/// `S_ISUID`/`S_ISGID` are withheld — they belong to [`copy_setid`], which
+/// applies them once the destination carries the source's ownership.
 pub fn copy_permissions(
     src: BorrowedFd<'_>,
     dst: BorrowedFd<'_>,
     xattr_names: &[String],
     mode: u32,
 ) -> Result<()> {
-    let access: Vec<&String> = xattr_names
-        .iter()
-        .filter(|n| ACCESS_ACL_XATTRS.contains(&n.as_str()))
-        .collect();
-    if access.is_empty() {
+    if !has_access_acl(xattr_names) {
         retry_on_eintr(|| unsafe {
-            libc::fchmod(dst.as_raw_fd(), (mode & 0o7777) as libc::mode_t)
+            libc::fchmod(
+                dst.as_raw_fd(),
+                mode as libc::mode_t & 0o7777 & !SETID_BITS,
+            )
         })?;
         return Ok(());
     }
-    for name in access {
+    for name in xattr_names
+        .iter()
+        .filter(|n| ACCESS_ACL_XATTRS.contains(&n.as_str()))
+    {
         let buf = fgetxattr(src, name)?;
         fsetxattr(dst, name, &buf, XattrFlags::empty())?;
     }
+    Ok(())
+}
+
+/// Apply the `S_ISUID`/`S_ISGID` bits of `mode` that [`copy_permissions`]
+/// withholds.
+///
+/// setid grants the identity of the file's own owner and group, so it is the
+/// source's to give only when the destination carries the source's ownership
+/// too: call this after a successful `fchown`, and not at all when ownership is
+/// not preserved. `fchown` clears setid itself (`chown(2)`), so this runs last.
+///
+/// A destination whose permissions came from an ACL xattr is left alone: there
+/// the mode follows the ACL, and an `fchmod` could discard it.
+pub fn copy_setid(
+    dst: BorrowedFd<'_>,
+    xattr_names: &[String],
+    mode: u32,
+) -> Result<()> {
+    let mode = mode as libc::mode_t & 0o7777;
+    if mode & SETID_BITS == 0 || has_access_acl(xattr_names) {
+        return Ok(());
+    }
+    retry_on_eintr(|| unsafe { libc::fchmod(dst.as_raw_fd(), mode) })?;
     Ok(())
 }
 
