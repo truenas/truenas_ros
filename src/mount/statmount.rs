@@ -4,6 +4,9 @@ use super::{
     MntIdReq, MntPropagation, MountAttr, MNT_ID_REQ_SIZE_VER1, SYS_STATMOUNT,
 };
 use crate::errno::{self, retry_on_eintr, Errno};
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
 
 tn_bitflags! {
     /// `STATMOUNT_*` — fields requested from / returned by `statmount`
@@ -131,7 +134,12 @@ pub struct Statmount {
     /// Root of the mount relative to the root of its filesystem.
     pub mnt_root: Option<String>,
     /// Mount point relative to the current root.
-    pub mnt_point: Option<String>,
+    ///
+    /// A `PathBuf`, not a `String`: the kernel reports the mount point as raw
+    /// dentry bytes, which need not be UTF-8, and it is handed back to
+    /// `openat2`/`umount2` as those bytes so a lossy substitution cannot name a
+    /// different, still-openable path.
+    pub mnt_point: Option<PathBuf>,
     /// Filesystem type name.
     pub fs_type: Option<String>,
     /// Mount-namespace id.
@@ -244,14 +252,24 @@ fn parse(words: &[u64]) -> Statmount {
     };
     let mask = StatmountMask::from_bits_retain(hdr.mask);
 
-    let get_str = |offset: u32| -> String {
+    let get_bytes = |offset: u32| -> Vec<u8> {
         let start = STR_BASE + offset as usize;
         if start >= bytes.len() {
-            return String::new();
+            return Vec::new();
         }
         let tail = &bytes[start..];
         let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
-        String::from_utf8_lossy(&tail[..end]).into_owned()
+        tail[..end].to_vec()
+    };
+    // The kernel emits the mount point as raw dentry bytes — `statmount_mnt_point`
+    // writes it through `seq_path_root` with an empty escape set
+    // (fs/namespace.c) — so carry it as a path without a UTF-8 round-trip;
+    // substituting U+FFFD would yield a different, still-openable path.
+    let get_path = |offset: u32| -> PathBuf {
+        PathBuf::from(OsString::from_vec(get_bytes(offset)))
+    };
+    let get_str = |offset: u32| -> String {
+        String::from_utf8_lossy(&get_bytes(offset)).into_owned()
     };
 
     // A run of `count` NUL-terminated strings starting at `offset` into `str`.
@@ -289,7 +307,7 @@ fn parse(words: &[u64]) -> Statmount {
             .then_some(hdr.propagate_from),
         mnt_root: has(StatmountMask::MNT_ROOT).then(|| get_str(hdr.mnt_root)),
         mnt_point: has(StatmountMask::MNT_POINT)
-            .then(|| get_str(hdr.mnt_point)),
+            .then(|| get_path(hdr.mnt_point)),
         fs_type: has(StatmountMask::FS_TYPE).then(|| get_str(hdr.fs_type)),
         mnt_ns_id: has(StatmountMask::MNT_NS_ID).then_some(hdr.mnt_ns_id),
         sb_dev_major: sb_basic.then_some(hdr.sb_dev_major),
@@ -352,6 +370,70 @@ mod tests {
             mnt_gidmap: None,
             mnt_opts_raw: None,
         }
+    }
+
+    /// A `statmount` reply laid out as the kernel lays one out: the fixed
+    /// header, then NUL-terminated strings at offset [`STR_BASE`], with
+    /// `mnt_root`, `mnt_point`, `fs_type` and `sb_source` populated.
+    fn synth(
+        mnt_root: &[u8],
+        mnt_point: &[u8],
+        fs_type: &[u8],
+        sb_source: &[u8],
+    ) -> Vec<u64> {
+        let mut strs = Vec::new();
+        let mut offsets = [0u32; 4];
+        for (slot, s) in offsets
+            .iter_mut()
+            .zip([mnt_root, mnt_point, fs_type, sb_source])
+        {
+            *slot = strs.len() as u32;
+            strs.extend_from_slice(s);
+            strs.push(0);
+        }
+        let size = STR_BASE + strs.len();
+        let mut words = vec![0u64; size.div_ceil(8)];
+        // SAFETY: `words` is 8-byte aligned and at least STR_BASE bytes long,
+        // and every `RawStatmount` field is an integer, so the zeroed buffer is
+        // already a valid instance of it.
+        let hdr = unsafe { &mut *words.as_mut_ptr().cast::<RawStatmount>() };
+        hdr.size = size as u32;
+        hdr.mask = (StatmountMask::MNT_ROOT
+            | StatmountMask::MNT_POINT
+            | StatmountMask::FS_TYPE
+            | StatmountMask::SB_SOURCE)
+            .bits();
+        [hdr.mnt_root, hdr.mnt_point, hdr.fs_type, hdr.sb_source] = offsets;
+        // SAFETY: same allocation; `strs.len()` bytes starting at STR_BASE are
+        // in bounds by the `size.div_ceil(8)` allocation above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                strs.as_ptr(),
+                words.as_mut_ptr().cast::<u8>().add(STR_BASE),
+                strs.len(),
+            );
+        }
+        words
+    }
+
+    // The kernel reports the mount point as raw dentry bytes, handed straight
+    // to openat2/umount2. Replacing an invalid sequence with U+FFFD would name
+    // a different, still-openable path.
+    #[test]
+    fn non_utf8_mount_point_is_carried_verbatim() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::Path;
+        const POINT: &[u8] = b"/mnt/tank/share/ev\xffil";
+        let sm = parse(&synth(b"/", POINT, b"zfs", b"tank"));
+        assert_eq!(
+            sm.mnt_point.as_ref().unwrap().as_os_str().as_bytes(),
+            POINT
+        );
+        // The lossy form is a longer, different, and equally openable path.
+        assert_ne!(String::from_utf8_lossy(POINT).as_bytes(), POINT);
+        // Plain ASCII is unaffected.
+        let sm = parse(&synth(b"/", b"/mnt/tank", b"zfs", b"tank"));
+        assert_eq!(sm.mnt_point.as_deref(), Some(Path::new("/mnt/tank")));
     }
 
     #[test]

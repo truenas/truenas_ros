@@ -506,7 +506,7 @@ mod mount {
     /// The mountpoint of a mount with no children of its own, so a recursive
     /// umount of it has nothing to tear down. `None` if the namespace has no
     /// such mount or its mountpoint is unreadable.
-    fn leaf_mountpoint() -> Option<String> {
+    fn leaf_mountpoint() -> Option<std::path::PathBuf> {
         listmount(LSMT_ROOT, false)
             .unwrap()
             .into_iter()

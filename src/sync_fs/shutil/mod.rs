@@ -464,7 +464,7 @@ fn traverse_child_mounts(
             continue;
         };
         // Keep only mounts strictly beneath the source root.
-        let Ok(rel) = Path::new(child_mnt).strip_prefix(&src_real) else {
+        let Ok(rel) = child_mnt.strip_prefix(&src_real) else {
             continue;
         };
         if rel.as_os_str().is_empty() {
@@ -474,11 +474,11 @@ fn traverse_child_mounts(
         let child_fs_name = sm
             .sb_source
             .clone()
-            .unwrap_or_else(|| child_mnt.to_string());
+            .unwrap_or_else(|| child_mnt.to_string_lossy().into_owned());
 
         let child_src_fd = openat2(
             AT_FDCWD,
-            Path::new(child_mnt),
+            child_mnt,
             OpenHow::new()
                 .flags(DIR_OFLAGS)
                 .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),

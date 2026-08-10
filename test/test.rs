@@ -165,7 +165,7 @@ mod mount {
         )
         .unwrap();
         assert_eq!(sm.mnt_id, Some(id));
-        assert_eq!(sm.mnt_point.as_deref(), Some("/"));
+        assert_eq!(sm.mnt_point.as_deref(), Some(std::path::Path::new("/")));
         assert!(sm.fs_type.is_some());
         // With SB_BASIC co-requested, options carry the synthetic ro/rw prefix.
         let opts = sm.mount_opts().unwrap();
@@ -869,7 +869,7 @@ mod mount_helpers {
     #[test]
     fn statmount_path_of_root() {
         let sm = statmount_path(Path::new("/")).unwrap();
-        assert_eq!(sm.mnt_point.as_deref(), Some("/"));
+        assert_eq!(sm.mnt_point.as_deref(), Some(std::path::Path::new("/")));
         assert!(sm.fs_type.is_some());
     }
 
