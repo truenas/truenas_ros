@@ -432,7 +432,9 @@ mod tests {
             Err(400)
         );
         assert_eq!(
-            body(b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip\r\n\r\n"),
+            body(
+                b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip\r\n\r\n"
+            ),
             Err(400)
         );
         assert_eq!(

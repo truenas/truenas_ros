@@ -192,9 +192,7 @@ where
                     &mut conn.state,
                     handler,
                 ),
-                Err(()) => {
-                    farewell(500, head_bytes.starts_with(b"HEAD "))
-                }
+                Err(()) => farewell(500, head_bytes.starts_with(b"HEAD ")),
             }
         }
         // Mid-scan delivery cannot happen (the framer only answers `More`
@@ -559,8 +557,7 @@ mod tests {
                 body_len: wire.len()
             }
         );
-        let resp =
-            step(b"", Body::inline(&wire), &p, &mut conn, &mut handler);
+        let resp = step(b"", Body::inline(&wire), &p, &mut conn, &mut handler);
         assert!(matches!(resp, Response::Reply(_)));
         assert!(text(&resp).starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(matches!(conn.phase, Phase::Head));
