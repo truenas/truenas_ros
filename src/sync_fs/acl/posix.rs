@@ -93,6 +93,12 @@ fn parse_aces(data: &[u8], is_default: bool) -> Result<Vec<PosixAce>> {
     if data.len() < HDR_SZ {
         return Err(Error::Parse("POSIX ACL too short".into()));
     }
+    if le32(data, 0) != VERSION {
+        return Err(Error::Parse("unsupported POSIX ACL version".into()));
+    }
+    if !(data.len() - HDR_SZ).is_multiple_of(ACE_SZ) {
+        return Err(Error::Parse("POSIX ACL has a partial entry".into()));
+    }
     let naces = (data.len() - HDR_SZ) / ACE_SZ;
     let mut out = Vec::with_capacity(naces);
     for i in 0..naces {
@@ -372,6 +378,16 @@ mod tests {
             id,
             default: false,
         }
+    }
+
+    #[test]
+    fn decode_rejects_bad_version_and_partial_entry() {
+        // Wrong version word in the 4-byte header.
+        assert!(PosixAcl::from_xattr(&[9, 0, 0, 0], None).is_err());
+        // Version 2, then a 5-byte trailing partial entry (entries are 8).
+        let mut blob = vec![2u8, 0, 0, 0];
+        blob.extend_from_slice(&[1, 0, 0, 0, 0]);
+        assert!(PosixAcl::from_xattr(&blob, None).is_err());
     }
 
     /// A minimal valid access ACL whose named USER entry carries `id`.

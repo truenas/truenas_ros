@@ -193,14 +193,21 @@ fn named_who(who_id: i64) -> Result<u32> {
 impl Nfs4Acl {
     /// Decode from the raw big-endian XDR bytes of `system.nfs4_acl_xdr`.
     ///
-    /// A buffer shorter than the 8-byte header is treated as an empty,
-    /// trivial ACL (the "present but empty" sentinel from `fgetacl`).
+    /// An empty buffer is the "present but empty" sentinel from `fgetacl` and
+    /// decodes to a trivial ACL. A non-empty buffer shorter than the 8-byte
+    /// header is a truncated blob and is rejected.
     pub fn from_xattr(data: &[u8]) -> Result<Self> {
-        if data.len() < HDR_SZ {
+        if data.is_empty() {
             return Ok(Nfs4Acl {
                 acl_flags: Nfs4AclFlag::ACL_IS_TRIVIAL,
                 aces: Vec::new(),
             });
+        }
+        if data.len() < HDR_SZ {
+            return Err(Error::Parse(format!(
+                "NFS4 ACL truncated: {} bytes",
+                data.len()
+            )));
         }
         let acl_flags = Nfs4AclFlag::from_bits_retain(be32(data, 0));
         let naces = be32(data, 4) as usize;
@@ -463,6 +470,13 @@ mod tests {
         let acl = Nfs4Acl::from_xattr(&[]).unwrap();
         assert!(acl.trivial());
         assert!(acl.aces.is_empty());
+    }
+
+    #[test]
+    fn short_blob_is_rejected() {
+        // The empty buffer is the sentinel; 1..7 bytes is a truncated blob.
+        assert!(Nfs4Acl::from_xattr(&[0u8; 4]).is_err());
+        assert!(Nfs4Acl::from_xattr(&[0u8; 7]).is_err());
     }
 
     #[test]
