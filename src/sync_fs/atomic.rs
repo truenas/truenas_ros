@@ -18,10 +18,11 @@ use std::path::Path;
 /// Options controlling [`atomic_write`] / [`atomic_replace`].
 #[derive(Clone, Copy, Debug)]
 pub struct AtomicWriteOptions {
-    /// Owner uid to set; `None` preserves the existing file's owner (or leaves
-    /// the creator's uid when the target is new).
+    /// Owner uid to set; `None` preserves the existing *regular* file's owner
+    /// (or leaves the creator's uid when the target is new or not a regular
+    /// file).
     pub uid: Option<u32>,
-    /// Owner gid to set; `None` preserves the existing file's group.
+    /// Owner gid to set; `None` preserves the existing regular file's group.
     pub gid: Option<u32>,
     /// Permission bits for the new file.
     pub mode: u32,
@@ -102,8 +103,13 @@ where
     if opts.noclobber && existing.is_some() {
         return Err(Errno::EEXIST.into());
     }
-    let uid = opts.uid.or_else(|| existing.as_ref().map(|s| s.uid()));
-    let gid = opts.gid.or_else(|| existing.as_ref().map(|s| s.gid()));
+    // Adopt the owner only of an existing *regular* file. A symlink (or any
+    // other non-regular entry) statx'd with AT_SYMLINK_NOFOLLOW reports its own
+    // uid/gid rather than a target's, so treat those as a new target instead of
+    // fchowning the published file to that owner.
+    let inherit = existing.as_ref().filter(|s| s.is_regular());
+    let uid = opts.uid.or_else(|| inherit.map(|s| s.uid()));
+    let gid = opts.gid.or_else(|| inherit.map(|s| s.gid()));
 
     // Create the temp file, set its owner/mode, then hand it to the caller.
     let (tmp_name, mut file) = create_temp(dir, name, opts.mode)?;
@@ -280,6 +286,41 @@ mod tests {
         assert!(matches!(
             fsync_dir(read_end.as_fd()),
             Err(Error::Errno(Errno::EINVAL))
+        ));
+    }
+
+    // A planted symlink must not be followed for the write nor adopted for the
+    // published file's ownership; noclobber still treats it as existing.
+    #[test]
+    fn atomic_write_does_not_follow_or_adopt_a_planted_symlink() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, b"outside").unwrap();
+
+        let target = dir.path().join("cfg");
+        std::os::unix::fs::symlink(&outside, &target).unwrap();
+        atomic_replace(&target, b"trusted", AtomicWriteOptions::default())
+            .unwrap();
+
+        let md = std::fs::symlink_metadata(&target).unwrap();
+        assert!(md.file_type().is_file());
+        assert_eq!(std::fs::read(&target).unwrap(), b"trusted");
+        // The link's former target is untouched.
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        // The publisher owns the result, not an owner adopted from the link.
+        assert_eq!(md.uid(), unsafe { libc::geteuid() });
+
+        // A symlink is still an existing entry for noclobber.
+        let link2 = dir.path().join("cfg2");
+        std::os::unix::fs::symlink(&outside, &link2).unwrap();
+        let nc = AtomicWriteOptions {
+            noclobber: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            atomic_replace(&link2, b"x", nc),
+            Err(Error::Errno(Errno::EEXIST))
         ));
     }
 }
