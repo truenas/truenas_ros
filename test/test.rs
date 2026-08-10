@@ -255,7 +255,7 @@ mod acl {
         // EVERYONE@.
         assert_eq!(acl.aces[2].who_type, Nfs4Who::Everyone);
 
-        assert_eq!(acl.to_xattr(), data);
+        assert_eq!(acl.to_xattr().unwrap(), data);
     }
 
     #[test]
@@ -275,8 +275,8 @@ mod acl {
         assert_eq!(acl.access[4].tag, PosixTag::Other);
         assert_eq!(acl.access[4].perms, PosixPerm::empty());
 
-        assert_eq!(acl.access_bytes(), data);
-        assert!(acl.default_bytes().is_none());
+        assert_eq!(acl.access_bytes().unwrap(), data);
+        assert!(acl.default_bytes().unwrap().is_none());
     }
 
     #[test]
@@ -323,7 +323,7 @@ mod acl {
         match fgetacl(f.as_fd()) {
             Ok(Acl::Nfs4(acl)) => {
                 let raw = fgetxattr(f.as_fd(), "system.nfs4_acl_xdr").unwrap();
-                assert_eq!(acl.to_xattr(), raw);
+                assert_eq!(acl.to_xattr().unwrap(), raw);
             }
             Ok(Acl::Posix(_)) => panic!("expected an NFS4 ACL"),
             Err(_) => {} // filesystem may not support NFS4 ACLs here
@@ -340,7 +340,7 @@ mod acl {
             Ok(Acl::Posix(acl)) => {
                 let raw =
                     fgetxattr(f.as_fd(), "system.posix_acl_access").unwrap();
-                assert_eq!(acl.access_bytes(), raw);
+                assert_eq!(acl.access_bytes().unwrap(), raw);
             }
             Ok(Acl::Nfs4(_)) => panic!("expected a POSIX ACL"),
             Err(_) => {}

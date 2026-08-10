@@ -583,7 +583,7 @@ mod acl {
                 1000,
             )],
         };
-        let back = Nfs4Acl::from_xattr(&acl.to_xattr()).unwrap();
+        let back = Nfs4Acl::from_xattr(&acl.to_xattr().unwrap()).unwrap();
         assert_eq!(back.aces[0].who_type, Nfs4Who::Named);
         assert_eq!(back.aces[0].who_id, 1000);
         assert_eq!(back.acl_flags, acl.acl_flags);
@@ -774,6 +774,12 @@ mod acl {
         );
         aces.push(p_ace(PosixTag::Mask, -1, false));
         assert!(validate_acl(AclTarget::AssumeDir, &posix(aces)).is_ok());
+        // Entries out of canonical tag order → rejected, as the kernel would.
+        let mut unsorted = PosixAcl::from_aces(valid_access());
+        unsorted.access.reverse();
+        assert!(
+            validate_acl(AclTarget::AssumeDir, &Acl::Posix(unsorted)).is_err()
+        );
     }
 
     #[test]
@@ -801,12 +807,12 @@ mod acl {
         }));
         let acl = PosixAcl::from_aces(aces);
         assert!(acl.default.is_some());
-        assert!(acl.default_bytes().is_some());
+        assert!(acl.default_bytes().unwrap().is_some());
         assert!(!acl.trivial());
         // Round-trip through the wire codec.
         let round = PosixAcl::from_xattr(
-            &acl.access_bytes(),
-            acl.default_bytes().as_deref(),
+            &acl.access_bytes().unwrap(),
+            acl.default_bytes().unwrap().as_deref(),
         )
         .unwrap();
         assert_eq!(round.access.len(), 3);
@@ -878,7 +884,8 @@ mod acl {
             p_ace(PosixTag::GroupObj, -1, false),
             p_ace(PosixTag::Other, -1, false),
         ])
-        .access_bytes();
+        .access_bytes()
+        .unwrap();
         let default = PosixAcl::from_aces(vec![
             p_ace(PosixTag::UserObj, -1, true),
             p_ace(PosixTag::GroupObj, -1, true),
@@ -888,7 +895,7 @@ mod acl {
         let _ = fsetacl_posix(
             d.as_fd(),
             &access,
-            default.default_bytes().as_deref(),
+            default.default_bytes().unwrap().as_deref(),
         );
         let _ = fsetacl_posix(d.as_fd(), &access, None);
         // NFS4 low-level (empty, trivially valid): fails on a non-NFS4 fs but
@@ -897,7 +904,8 @@ mod acl {
             acl_flags: Nfs4AclFlag::empty(),
             aces: vec![],
         }
-        .to_xattr();
+        .to_xattr()
+        .unwrap();
         let _ = fsetacl_nfs4(d.as_fd(), &nfs4);
     }
 }

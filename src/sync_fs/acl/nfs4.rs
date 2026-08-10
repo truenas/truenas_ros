@@ -177,6 +177,19 @@ fn be32(b: &[u8], i: usize) -> u32 {
     u32::from_be_bytes(b[i..i + 4].try_into().unwrap())
 }
 
+/// The wire `who` word for a `Named` ACE. The field is 32 bits wide and ZFS
+/// stores it verbatim as a `uid_t` (`nfsace4i_to_acep`, `zpl_xattr.c`), so
+/// every `u32` is a valid named id. A `who_id` outside `0..=u32::MAX` cannot
+/// be represented and is rejected; a `Named` ACE never carries a negative id,
+/// since the decoder maps special principals to `-1`.
+fn named_who(who_id: i64) -> Result<u32> {
+    u32::try_from(who_id).map_err(|_| {
+        Error::Validation(format!(
+            "named NFS4 ACE id {who_id} is not a valid uid/gid"
+        ))
+    })
+}
+
 impl Nfs4Acl {
     /// Decode from the raw big-endian XDR bytes of `system.nfs4_acl_xdr`.
     ///
@@ -244,13 +257,16 @@ impl Nfs4Acl {
     }
 
     /// Encode to the raw big-endian XDR bytes (ACEs in stored order, no sort).
-    pub fn to_xattr(&self) -> Vec<u8> {
+    ///
+    /// Errors if a `Named` ACE's [`who_id`](Nfs4Ace::who_id) is not a valid
+    /// uid/gid.
+    pub fn to_xattr(&self) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(HDR_SZ + self.aces.len() * ACE_SZ);
         out.extend_from_slice(&self.acl_flags.bits().to_be_bytes());
         out.extend_from_slice(&(self.aces.len() as u32).to_be_bytes());
         for a in &self.aces {
             let (iflag, who) = if a.who_type == Nfs4Who::Named {
-                (0u32, a.who_id as u32)
+                (0u32, named_who(a.who_id)?)
             } else {
                 (1u32, a.who_type as u32)
             };
@@ -260,7 +276,7 @@ impl Nfs4Acl {
             out.extend_from_slice(&a.access_mask.bits().to_be_bytes());
             out.extend_from_slice(&who.to_be_bytes());
         }
-        out
+        Ok(out)
     }
 
     /// True if the on-disk `ACL_IS_TRIVIAL` bit is set (the ACL is equivalent
@@ -302,6 +318,9 @@ impl Nfs4Acl {
         let mut has_inheritable = false;
         for a in &self.aces {
             let special = a.who_type != Nfs4Who::Named;
+            if !special {
+                named_who(a.who_id)?;
+            }
             if a.ace_type == Nfs4AceType::Deny && special {
                 return Err(Error::Validation(
                     "DENY entries are not permitted for special principals \
@@ -392,6 +411,52 @@ fn inherited_flags(f: Nfs4Flag, is_dir: bool) -> Nfs4Flag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A single-ACE file ACL whose named principal carries `who_id`.
+    fn named_user(who_id: i64) -> Nfs4Acl {
+        Nfs4Acl {
+            acl_flags: Nfs4AclFlag::empty(),
+            aces: vec![Nfs4Ace {
+                ace_type: Nfs4AceType::Allow,
+                ace_flags: Nfs4Flag::empty(),
+                access_mask: Nfs4Perm::READ_DATA,
+                who_type: Nfs4Who::Named,
+                who_id,
+            }],
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unrepresentable_named_ids() {
+        assert!(named_user(1000).validate(false).is_ok());
+        // The whole 32-bit wire range is a valid ZFS id.
+        assert!(named_user(u32::MAX as i64).validate(false).is_ok());
+        // Wider than the 32-bit wire field.
+        assert!(named_user(u32::MAX as i64 + 1).validate(false).is_err());
+        assert!(named_user(i64::MAX).validate(false).is_err());
+        // `-1` marks a special principal, not a named one.
+        assert!(named_user(-1).validate(false).is_err());
+    }
+
+    #[test]
+    fn encoding_an_unrepresentable_named_id_errors() {
+        assert_eq!(named_user(1000).to_xattr().unwrap().len(), HDR_SZ + ACE_SZ);
+        assert!(named_user(u32::MAX as i64 + 1).to_xattr().is_err());
+        assert!(named_user(-1).to_xattr().is_err());
+        // A special principal's `who_id` is never encoded.
+        let mut acl = named_user(i64::MAX);
+        acl.aces[0].who_type = Nfs4Who::Everyone;
+        assert!(acl.to_xattr().is_ok());
+    }
+
+    #[test]
+    fn named_id_survives_a_byte_exact_roundtrip() {
+        for id in [0, 1, 3, 1000, u32::MAX as i64] {
+            let acl = named_user(id);
+            let back = Nfs4Acl::from_xattr(&acl.to_xattr().unwrap()).unwrap();
+            assert_eq!(back, acl, "id {id} must round-trip");
+        }
+    }
 
     #[test]
     fn empty_buffer_is_trivial() {
