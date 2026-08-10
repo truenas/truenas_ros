@@ -45,6 +45,20 @@ pub struct ServerConfig {
     /// with the connection's personality. Requires the `uring-fs` feature.
     #[cfg(feature = "uring-fs")]
     pub fs_files: u32,
+    /// Warm floor of offload worker threads for the embedded fs reactor's
+    /// blocking work (`readdir`/`fdopendir`, byte copies), which has no io_uring
+    /// opcode and so cannot run on the ring. Per server/ring; size it to the I/O
+    /// concurrency you expect for listings and copies. Default
+    /// [`OFFLOAD_FLOOR`](crate::uring_fs::core::OFFLOAD_FLOOR).
+    #[cfg(feature = "uring-fs")]
+    pub fs_offload_floor: usize,
+    /// Ceiling the offload pool grows to when every worker is blocked (a cold or
+    /// huge directory, an NFS/FUSE backing, a stalled copy), so one stalled walk
+    /// does not head-of-line-block the rest; burst threads retire when idle. Per
+    /// server/ring. Default
+    /// [`OFFLOAD_CEILING`](crate::uring_fs::core::OFFLOAD_CEILING).
+    #[cfg(feature = "uring-fs")]
+    pub fs_offload_ceiling: usize,
     /// Maximum bytes accepted for one message (header + body), a memory guard
     /// that also bounds header scanning. Enforced strictly for length-prefixed
     /// frames; for a `More`/delimiter-scanning framer the accumulate buffer can
@@ -205,6 +219,10 @@ impl Default for ServerConfig {
             pool_size: 512,
             #[cfg(feature = "uring-fs")]
             fs_files: 0,
+            #[cfg(feature = "uring-fs")]
+            fs_offload_floor: crate::uring_fs::core::OFFLOAD_FLOOR,
+            #[cfg(feature = "uring-fs")]
+            fs_offload_ceiling: crate::uring_fs::core::OFFLOAD_CEILING,
             max_request_bytes: 1024 * 1024,
             backlog: 128,
             unlink_unix: true,

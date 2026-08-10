@@ -707,7 +707,9 @@ where
             // on raw fds (`Arc<OwnedFd>`), never `IOSQE_FIXED_FILE`, so
             // `fs_files` sizes only the fs op table (`fs_ops = fs_files * 2`),
             // not any registered file pool.
-            crate::uring_fs::core::FsCore::new(fs_ops)
+            let mut fs = crate::uring_fs::core::FsCore::new(fs_ops);
+            fs.set_offload_bounds(cfg.fs_offload_floor, cfg.fs_offload_ceiling);
+            fs
         });
         // Probe the two version-dependent fs ops once (only if a pool exists),
         // while `engine.ring` is still in hand. `ftruncate` (≥ 6.9) is a plain

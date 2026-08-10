@@ -47,8 +47,14 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-/// Worker threads backing [`FsConn::offload`]; the pool is spawned on first use.
-const OFFLOAD_WORKERS: usize = 4;
+/// Default warm floor of worker threads backing [`FsConn::offload`]; the pool
+/// is spawned on first use and grows to [`OFFLOAD_CEILING`] under saturation.
+pub(crate) const OFFLOAD_FLOOR: usize = 4;
+/// Default ceiling the offload pool grows to under sustained blocking work
+/// (opcode-less `readdir`/`fdopendir`/copy). Blocked-on-I/O threads are cheap,
+/// so the cap is generous; a `reuse_port` multicore deployment multiplies it by
+/// the server count.
+pub(crate) const OFFLOAD_CEILING: usize = 64;
 /// Names per off-loop `readdir` batch in [`FsConn::next_batch`].
 const DIR_BATCH: usize = 256;
 
@@ -216,6 +222,9 @@ pub(crate) struct FsCore {
     op_free: Vec<u32>,
     /// The blocking worker pool for [`FsConn::offload`], spawned on first use.
     pool: Option<WorkerPool>,
+    /// The offload pool's warm floor and growth ceiling (set before first use).
+    offload_floor: usize,
+    offload_ceiling: usize,
     /// Where workers push finished jobs; drained on the loop's wake.
     completions: Arc<Mutex<VecDeque<PoolCompletion>>>,
     /// Reactor-side continuations for in-flight offloads, keyed by token.
@@ -234,10 +243,21 @@ impl FsCore {
                 .collect(),
             op_free: (0..op_slots).rev().collect(),
             pool: None,
+            offload_floor: OFFLOAD_FLOOR,
+            offload_ceiling: OFFLOAD_CEILING,
             completions: Arc::new(Mutex::new(VecDeque::new())),
             offload_reg: HashMap::new(),
             next_offload: 0,
         }
+    }
+
+    /// Set the offload pool's warm floor and growth ceiling. Takes effect only
+    /// before the pool is spawned (first offload), so call it at setup; sizes
+    /// the per-reactor thread budget for opcode-less blocking work.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    pub(crate) fn set_offload_bounds(&mut self, floor: usize, ceiling: usize) {
+        self.offload_floor = floor.max(1);
+        self.offload_ceiling = ceiling.max(self.offload_floor);
     }
 
     // ---- off-loop offload: run a blocking job, deliver its result on-loop ----
@@ -267,7 +287,10 @@ impl FsCore {
     /// synchronous: a degraded loop, not a dead one.
     fn submit_offload(&mut self, job: Box<dyn FnOnce() + Send>) {
         if self.pool.is_none() {
-            match WorkerPool::try_new(OFFLOAD_WORKERS) {
+            match WorkerPool::try_elastic(
+                self.offload_floor,
+                self.offload_ceiling,
+            ) {
                 Ok(pool) => self.pool = Some(pool),
                 Err(_) => {
                     job();

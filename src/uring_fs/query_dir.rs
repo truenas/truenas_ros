@@ -21,12 +21,15 @@ use super::{Anchor, File, FsHandle, FsPending, Leaf, Personality};
 use crate::errno::{retry_on_eintr, Errno};
 use crate::sync_fs::{AtFlags, OFlag, OpenHow, Statx, StatxMask};
 use bitflags::bitflags;
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 bitflags! {
     /// What to fetch for each directory entry. `STATX` is cheap (a path-based
@@ -395,77 +398,197 @@ pub fn query_directory(
 /// on the worker's own thread, never sent.
 type Job = Box<dyn FnOnce() + Send>;
 
-/// A fixed pool of worker threads running `Box<dyn FnOnce() + Send>` jobs, the
-/// shared machinery behind both the off-loop [`QueryPool`] helpers and the
-/// on-loop `FsConn::offload` path. It runs whatever job it is handed under the
+/// Growth is rate-limited to at most one new worker per this interval, so a
+/// burst of microsecond-fast jobs that momentarily saturates the pool does not
+/// spawn a thread per job; sustained blocking work still grows to the ceiling.
+const OFFLOAD_SPAWN_COOLDOWN: Duration = Duration::from_millis(1);
+/// A burst worker idle this long retires, back down to the floor.
+const OFFLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct PoolInner {
+    queue: VecDeque<Job>,
+    /// Live worker threads: the floor plus any grown-in burst workers.
+    total: usize,
+    /// The pool is dropping; workers drain the queue, then exit.
+    closed: bool,
+}
+
+struct PoolShared {
+    inner: Mutex<PoolInner>,
+    /// Signals a queued job, a shutdown, or a worker exit (`Drop` waits on it).
+    cv: Condvar,
+    /// Workers currently executing a job; `running == total` means saturated.
+    running: AtomicUsize,
+    floor: usize,
+    ceiling: usize,
+    epoch: Instant,
+    /// Micros since `epoch` of the last spawn, throttling growth.
+    last_spawn_us: AtomicU64,
+    cooldown: Duration,
+    idle_timeout: Duration,
+}
+
+/// An elastic pool of worker threads running `Box<dyn FnOnce() + Send>` jobs,
+/// the shared machinery behind both the off-loop [`QueryPool`] helpers and the
+/// on-loop `FsConn::offload` path. It keeps `floor` threads warm and grows to
+/// `ceiling` when every worker is busy (blocked on a slow `readdir` or copy),
+/// so one stalled walk does not head-of-line-block the rest; burst workers
+/// retire after an idle period. It runs whatever job it is handed under the
 /// reactor's ambient credentials; any per-`who` permission check belongs to the
 /// job, not the pool.
 ///
-/// The canonical std threadpool (the Rust Book design): worker threads share
-/// one `Arc<Mutex<mpsc::Receiver<Job>>>` and hold the lock only across job
-/// pickup, so pickup is serialized while the jobs run in parallel. Dropping it
-/// closes the queue (each worker's `recv` then returns `Err` and it exits) and
-/// joins the workers.
+/// Growth is hysteretic: a worker spawns only when the pool is saturated
+/// (`running == total`) and at most once per cooldown, so a burst of fast
+/// cached jobs clears without thread churn while genuinely blocking work grows.
+/// Dropping the pool closes the queue and waits for every worker to exit, so no
+/// detached worker outlives the state it borrows.
 pub(crate) struct WorkerPool {
-    jobs: Option<mpsc::Sender<Job>>,
-    workers: Vec<thread::JoinHandle<()>>,
+    shared: Arc<PoolShared>,
 }
 
 impl WorkerPool {
-    /// Spawn `workers` (at least 1) threads pulling jobs off a shared queue.
-    /// Panics if a thread cannot be spawned, for off-loop callers that build
-    /// the pool up front ([`QueryPool::new`]); the reactor path uses the
-    /// fallible [`WorkerPool::try_new`] and degrades instead.
+    /// A fixed pool of `workers` (at least 1) threads that never grows
+    /// (`floor == ceiling`). Panics if a thread cannot be spawned, for off-loop
+    /// callers that build the pool up front ([`QueryPool::new`]).
     pub(crate) fn new(workers: usize) -> WorkerPool {
-        Self::try_new(workers).expect("spawn fs worker")
+        Self::try_elastic(workers, workers).expect("spawn fs worker")
     }
 
-    /// Spawn `workers` (at least 1) threads, returning the spawn error rather
-    /// than panicking. On a partial failure the threads already spawned are
-    /// shut down (queue closed, joined) before returning, so none is orphaned.
-    pub(crate) fn try_new(workers: usize) -> std::io::Result<WorkerPool> {
-        let (jobs, rx) = mpsc::channel::<Job>();
-        let rx = Arc::new(Mutex::new(rx));
-        let mut handles = Vec::with_capacity(workers.max(1));
-        for _ in 0..workers.max(1) {
-            let rx = Arc::clone(&rx);
-            match thread::Builder::new()
-                .name("truenas-fs-worker".into())
-                .spawn(move || worker_loop(&rx))
+    /// An elastic pool: `floor` (at least 1) warm threads growing to `ceiling`
+    /// under saturation, using the default cooldown and idle timeout. Returns
+    /// the spawn error rather than panicking.
+    pub(crate) fn try_elastic(
+        floor: usize,
+        ceiling: usize,
+    ) -> std::io::Result<WorkerPool> {
+        Self::try_elastic_tuned(
+            floor,
+            ceiling,
+            OFFLOAD_SPAWN_COOLDOWN,
+            OFFLOAD_IDLE_TIMEOUT,
+        )
+    }
+
+    /// [`try_elastic`](Self::try_elastic) with explicit timings (for tests). On
+    /// a partial spawn failure the workers already started are shut down and
+    /// waited for before returning, so none is orphaned.
+    pub(crate) fn try_elastic_tuned(
+        floor: usize,
+        ceiling: usize,
+        cooldown: Duration,
+        idle_timeout: Duration,
+    ) -> std::io::Result<WorkerPool> {
+        let floor = floor.max(1);
+        let ceiling = ceiling.max(floor);
+        let shared = Arc::new(PoolShared {
+            inner: Mutex::new(PoolInner {
+                queue: VecDeque::new(),
+                total: 0,
+                closed: false,
+            }),
+            cv: Condvar::new(),
+            running: AtomicUsize::new(0),
+            floor,
+            ceiling,
+            epoch: Instant::now(),
+            last_spawn_us: AtomicU64::new(0),
+            cooldown,
+            idle_timeout,
+        });
+        let pool = WorkerPool {
+            shared: Arc::clone(&shared),
+        };
+        for _ in 0..floor {
             {
-                Ok(h) => handles.push(h),
-                Err(e) => {
-                    drop(jobs); // close the queue so spawned workers exit
-                    for h in handles {
-                        let _ = h.join();
-                    }
-                    return Err(e);
+                let mut g =
+                    shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+                g.total += 1; // account the worker before it can exit
+            }
+            if let Err(e) = spawn_worker(&shared) {
+                {
+                    let mut g =
+                        shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    g.total -= 1;
                 }
+                drop(pool); // closes and waits for the workers already started
+                return Err(e);
             }
         }
-        Ok(WorkerPool {
-            jobs: Some(jobs),
-            workers: handles,
-        })
+        Ok(pool)
     }
 
-    /// Enqueue `job` (a no-op if the pool is already dropping).
+    /// Enqueue `job`, growing the pool by one worker if it is saturated and the
+    /// cooldown has elapsed (a no-op if the pool is already dropping).
     pub(crate) fn submit(&self, job: Job) {
-        if let Some(jobs) = &self.jobs {
-            let _ = jobs.send(job);
+        let grow = {
+            let mut g =
+                self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if g.closed {
+                return;
+            }
+            g.queue.push_back(job);
+            self.shared.cv.notify_one();
+            let saturated =
+                self.shared.running.load(Ordering::Relaxed) >= g.total;
+            let grow = saturated
+                && g.total < self.shared.ceiling
+                && self.shared.claim_spawn_slot();
+            if grow {
+                g.total += 1; // reserve the slot before releasing the lock
+            }
+            grow
+        };
+        if grow && spawn_worker(&self.shared).is_err() {
+            // Spawn failed: return the reserved slot. The job still runs when a
+            // busy worker frees up.
+            let mut g =
+                self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.total -= 1;
         }
+    }
+}
+
+impl PoolShared {
+    /// True at most once per [`cooldown`](Self::cooldown), claiming the slot so
+    /// concurrent submits do not all spawn at once.
+    fn claim_spawn_slot(&self) -> bool {
+        let now = self.epoch.elapsed().as_micros() as u64;
+        let cooldown = self.cooldown.as_micros() as u64;
+        let last = self.last_spawn_us.load(Ordering::Relaxed);
+        now.saturating_sub(last) >= cooldown
+            && self
+                .last_spawn_us
+                .compare_exchange(
+                    last,
+                    now,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
     }
 }
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        // Close the queue so each worker's `recv` returns `Err` and exits, then
-        // join them (dropping a `Vec<JoinHandle>` alone only detaches).
-        drop(self.jobs.take());
-        for w in self.workers.drain(..) {
-            let _ = w.join();
+        let mut g = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.closed = true;
+        self.shared.cv.notify_all();
+        // Wait for every worker to drain and exit, so none touches the shared
+        // state after this returns (join-on-drop without tracking handles).
+        while g.total > 0 {
+            g = self.shared.cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
+}
+
+/// Spawn one worker thread bound to `shared`. The caller has already accounted
+/// it in `total`; the worker decrements `total` when it exits.
+fn spawn_worker(shared: &Arc<PoolShared>) -> std::io::Result<()> {
+    let shared = Arc::clone(shared);
+    thread::Builder::new()
+        .name("truenas-fs-worker".into())
+        .spawn(move || worker_loop(&shared))
+        .map(|_| ())
 }
 
 /// A [`WorkerPool`] bound to an [`FsHandle`] for the off-loop directory-listing
@@ -585,8 +708,15 @@ impl QueryPool {
 
 impl fmt::Debug for QueryPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let workers = self
+            .pool
+            .shared
+            .inner
+            .lock()
+            .map(|g| g.total)
+            .unwrap_or_else(|e| e.into_inner().total);
         f.debug_struct("QueryPool")
-            .field("workers", &self.pool.workers.len())
+            .field("workers", &workers)
             .finish()
     }
 }
@@ -626,23 +756,51 @@ impl Iterator for QueryHandle {
     }
 }
 
-/// A worker: pick up jobs (lock held only across `recv`) and run each unlocked,
-/// so `K` workers run `K` jobs concurrently. Exits when the queue closes.
+/// A worker: wait for a job, run it, repeat; `K` workers run `K` jobs
+/// concurrently. A burst worker idle past the idle timeout retires (never below
+/// the floor); on shutdown every worker drains the queue and exits, decrementing
+/// `total` so [`WorkerPool`]'s `Drop` can wait them all out.
 ///
 /// Each job runs under `catch_unwind`, so a panicking job retires only itself,
 /// not the worker: the pool keeps draining, and a later `submit` is not
 /// silently dropped onto a dead thread. Any handle the job owned (a `SendDir`)
 /// still closes as its unwinding frame drops.
-fn worker_loop(rx: &Mutex<mpsc::Receiver<Job>>) {
+fn worker_loop(shared: &Arc<PoolShared>) {
     loop {
         let job = {
-            let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
-            guard.recv()
+            let mut g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(job) = g.queue.pop_front() {
+                    break Some(job);
+                }
+                if g.closed {
+                    break None;
+                }
+                let (guard, wait) = shared
+                    .cv
+                    .wait_timeout(g, shared.idle_timeout)
+                    .unwrap_or_else(|e| e.into_inner());
+                g = guard;
+                if wait.timed_out()
+                    && g.queue.is_empty()
+                    && !g.closed
+                    && g.total > shared.floor
+                {
+                    g.total -= 1; // idle burst worker retires
+                    return;
+                }
+            }
         };
-        let Ok(job) = job else {
-            return; // queue closed — the pool is dropping
+        let Some(job) = job else {
+            // Pool closing: account the exit and wake `Drop`'s waiter.
+            let mut g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.total -= 1;
+            shared.cv.notify_all();
+            return;
         };
+        shared.running.fetch_add(1, Ordering::Relaxed);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+        shared.running.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -773,4 +931,98 @@ fn copy_range_rw(
         remaining -= r as u64;
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    /// The elastic pool grows past its floor when every worker is blocked, up to
+    /// the ceiling, then retires the burst workers once they sit idle.
+    #[test]
+    fn offload_pool_grows_under_saturation_then_reclaims_when_idle() {
+        // Floor 1, ceiling 4; no growth cooldown (deterministic under the
+        // start-synchronised submits below) and a quick idle timeout.
+        let pool = WorkerPool::try_elastic_tuned(
+            1,
+            4,
+            Duration::ZERO,
+            Duration::from_millis(50),
+        )
+        .expect("pool");
+
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+
+        // Submit blocking jobs one at a time, waiting until each is actually
+        // running before the next, so the growth decision sees an accurate
+        // `running` count rather than racing ahead of the workers.
+        for _ in 0..4 {
+            let r = Arc::clone(&release);
+            let s = started_tx.clone();
+            pool.submit(Box::new(move || {
+                s.send(()).unwrap();
+                let (m, cv) = &*r;
+                let mut held = m.lock().unwrap();
+                while !*held {
+                    held = cv.wait(held).unwrap();
+                }
+            }));
+            started_rx.recv().unwrap();
+        }
+
+        let grown = pool.shared.inner.lock().unwrap().total;
+
+        // Release the blocked jobs first, so a failing assertion cannot wedge
+        // teardown (Drop waits for every worker to exit).
+        {
+            let (m, cv) = &*release;
+            *m.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        assert_eq!(grown, 4, "grew from floor 1 to ceiling 4 under saturation");
+
+        // Idle burst workers retire back to the floor.
+        let mut total = grown;
+        for _ in 0..200 {
+            total = pool.shared.inner.lock().unwrap().total;
+            if total == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(total, 1, "burst workers retired back to the floor");
+    }
+
+    /// A fixed pool (`floor == ceiling`) never grows, even when saturated.
+    #[test]
+    fn fixed_pool_does_not_grow() {
+        let pool = WorkerPool::new(2);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        for _ in 0..2 {
+            let r = Arc::clone(&release);
+            let s = started_tx.clone();
+            pool.submit(Box::new(move || {
+                s.send(()).unwrap();
+                let (m, cv) = &*r;
+                let mut held = m.lock().unwrap();
+                while !*held {
+                    held = cv.wait(held).unwrap();
+                }
+            }));
+            started_rx.recv().unwrap();
+        }
+        // Two more jobs against a saturated fixed pool: they queue, no growth.
+        for _ in 0..2 {
+            pool.submit(Box::new(|| {}));
+        }
+        let total = pool.shared.inner.lock().unwrap().total;
+        {
+            let (m, cv) = &*release;
+            *m.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        assert_eq!(total, 2, "fixed pool stayed at its worker count");
+    }
 }
