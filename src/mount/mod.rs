@@ -68,6 +68,10 @@ tn_bitflags! {
         NODEV = 0x0000_0004;
         /// Disallow program execution.
         NOEXEC = 0x0000_0008;
+        /// Mask of the atime attributes, which hold an [`Atime`] policy rather
+        /// than independent bits. Relatime is the zero value, so it is named
+        /// by [`Atime`] rather than by a flag here.
+        __ATIME = 0x0000_0070;
         /// Do not update access times.
         NOATIME = 0x0000_0010;
         /// Always update access times.
@@ -78,6 +82,21 @@ tn_bitflags! {
         IDMAP = 0x0010_0000;
         /// Do not follow symbolic links.
         NOSYMFOLLOW = 0x0020_0000;
+    }
+}
+
+#[cfg(feature = "mount")]
+tn_enum! {
+    /// A mount's atime update policy — the value the
+    /// [`MountAttr::__ATIME`] bits hold. Exactly one applies at a time, so
+    /// [`MountSetattr::atime`] takes this rather than a flag.
+    pub enum Atime: u64 {
+        /// Update access times relative to mtime/ctime.
+        Relatime = 0x0000_0000,
+        /// Do not update access times.
+        Noatime = 0x0000_0010,
+        /// Always update access times.
+        Strictatime = 0x0000_0020
     }
 }
 

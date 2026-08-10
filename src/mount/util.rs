@@ -111,7 +111,10 @@ pub struct UmountOptions {
 /// Unmount the filesystem at `path`.
 ///
 /// With [`UmountOptions::recursive`], all child mounts (including transient ZFS
-/// snapshot mounts) are unmounted first; `path` must be a mountpoint.
+/// snapshot mounts) are unmounted first; `path` must be a mountpoint under the
+/// same symlink rules as the unmount itself, so unless
+/// [`UmountOptions::follow_symlinks`] is set a symlinked `path` is rejected and
+/// nothing is unmounted.
 pub fn umount(path: &Path, opts: UmountOptions) -> Result<()> {
     let mut flags = MntFlags::empty();
     if opts.force {
@@ -128,10 +131,18 @@ pub fn umount(path: &Path, opts: UmountOptions) -> Result<()> {
     }
 
     if opts.recursive {
+        // Resolve the target exactly as the unmount below will: under
+        // UMOUNT_NOFOLLOW a symlinked path is no mountpoint of its own, so it
+        // fails the check here.
+        let at = if opts.follow_symlinks {
+            AtFlags::empty()
+        } else {
+            AtFlags::AT_SYMLINK_NOFOLLOW
+        };
         let st = statx(
             AT_FDCWD,
             path,
-            AtFlags::empty(),
+            at,
             StatxMask::MNT_ID_UNIQUE | StatxMask::BASIC_STATS,
         )?;
         if !st.attributes().contains(StatxAttr::MOUNT_ROOT) {

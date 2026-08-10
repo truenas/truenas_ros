@@ -110,14 +110,14 @@ pub fn fsetacl<Fd: AsFd>(fd: Fd, acl: Option<&Acl>) -> Result<()> {
             fsetxattr(
                 fd,
                 nfs4::NFS4_ACL_XATTR,
-                &a.to_xattr(),
+                &a.to_xattr()?,
                 XattrFlags::empty(),
             )?;
             Ok(())
         }
         Some(Acl::Posix(a)) => {
             a.validate(target_is_dir(AclTarget::Fd(fd))?)?;
-            write_posix(fd, &a.access_bytes(), a.default_bytes().as_deref())
+            write_posix(fd, &a.access_bytes()?, a.default_bytes()?.as_deref())
         }
     }
 }
@@ -152,6 +152,8 @@ pub fn fsetacl_posix<Fd: AsFd>(
     write_posix(fd, access, default)
 }
 
+/// Write both halves of a POSIX ACL. Callers validate both lists first, so the
+/// kernel accepting the access xattr implies it accepts the default xattr too.
 fn write_posix(
     fd: BorrowedFd<'_>,
     access: &[u8],

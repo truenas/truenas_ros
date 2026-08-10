@@ -255,7 +255,7 @@ mod acl {
         // EVERYONE@.
         assert_eq!(acl.aces[2].who_type, Nfs4Who::Everyone);
 
-        assert_eq!(acl.to_xattr(), data);
+        assert_eq!(acl.to_xattr().unwrap(), data);
     }
 
     #[test]
@@ -275,8 +275,8 @@ mod acl {
         assert_eq!(acl.access[4].tag, PosixTag::Other);
         assert_eq!(acl.access[4].perms, PosixPerm::empty());
 
-        assert_eq!(acl.access_bytes(), data);
-        assert!(acl.default_bytes().is_none());
+        assert_eq!(acl.access_bytes().unwrap(), data);
+        assert!(acl.default_bytes().unwrap().is_none());
     }
 
     #[test]
@@ -323,7 +323,7 @@ mod acl {
         match fgetacl(f.as_fd()) {
             Ok(Acl::Nfs4(acl)) => {
                 let raw = fgetxattr(f.as_fd(), "system.nfs4_acl_xdr").unwrap();
-                assert_eq!(acl.to_xattr(), raw);
+                assert_eq!(acl.to_xattr().unwrap(), raw);
             }
             Ok(Acl::Posix(_)) => panic!("expected an NFS4 ACL"),
             Err(_) => {} // filesystem may not support NFS4 ACLs here
@@ -340,7 +340,7 @@ mod acl {
             Ok(Acl::Posix(acl)) => {
                 let raw =
                     fgetxattr(f.as_fd(), "system.posix_acl_access").unwrap();
-                assert_eq!(acl.access_bytes(), raw);
+                assert_eq!(acl.access_bytes().unwrap(), raw);
             }
             Ok(Acl::Nfs4(_)) => panic!("expected a POSIX ACL"),
             Err(_) => {}
@@ -828,9 +828,11 @@ mod mount_helpers {
 #[cfg(feature = "shutil")]
 mod shutil {
     use std::os::unix::fs::PermissionsExt;
+    use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::shutil::{
         copytree, copytree_reporting, CopyTreeConfig,
     };
+    use truenas_ros::Error;
 
     // A writer-less FIFO in the source must be recreated by type, not read as a
     // regular file (which would block the copy forever).
@@ -852,6 +854,196 @@ mod shutil {
         assert_eq!(stats.specials, 1);
         let md = std::fs::symlink_metadata(dst.join("pipe")).unwrap();
         assert!(md.file_type().is_fifo());
+    }
+
+    // The kernel clears S_ISUID/S_ISGID when a non-directory is chowned
+    // (`chown_common`, fs/open.c), so the copy must apply ownership before the
+    // mode for a setuid/setgid file — and for a special file — to keep both
+    // bits.
+    #[test]
+    fn preserves_setid_bits_on_files_and_specials() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("helper"), b"data").unwrap();
+        let fifo = src.join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        // Setuid and setgid on an own file, both set with the group execute bit
+        // so the kernel drops them unconditionally on chown.
+        for name in ["helper", "pipe"] {
+            std::fs::set_permissions(
+                src.join(name),
+                std::fs::Permissions::from_mode(0o6755),
+            )
+            .unwrap();
+        }
+
+        let dst = tmp.path().join("dst");
+        copytree(&src, &dst, &CopyTreeConfig::default()).unwrap();
+
+        for name in ["helper", "pipe"] {
+            let mode = std::fs::symlink_metadata(dst.join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o7777, 0o6755, "{name} lost its setid bits");
+        }
+    }
+
+    // copytree does not chmod a file that carries an access ACL: the ACL is
+    // authoritative for its permissions, and on a ZFS `aclmode=restricted`
+    // dataset a chmod of an object with a non-trivial ACL is rejected. So the
+    // ACL is copied faithfully, but the source's setid bits (which no ACL
+    // encodes) are not carried over. Matches `truenas_os`.
+    #[cfg(feature = "acl")]
+    #[test]
+    fn acl_bearing_file_is_copied_without_chmod() {
+        use std::os::fd::AsFd;
+        use truenas_ros::sync_fs::acl::{
+            fsetacl_posix, PosixAce, PosixAcl, PosixPerm, PosixTag,
+        };
+        use truenas_ros::sync_fs::xattr::fgetxattr;
+
+        let ace = |tag, perms, id| PosixAce {
+            tag,
+            perms,
+            id,
+            default: false,
+        };
+        let rx = PosixPerm::READ | PosixPerm::EXECUTE;
+        // A named user and a mask, so the ACL cannot be folded back into the
+        // mode and the xattr is really stored.
+        let acl = PosixAcl::from_aces([
+            ace(PosixTag::UserObj, PosixPerm::all(), -1),
+            ace(PosixTag::User, rx, 1234),
+            ace(PosixTag::GroupObj, rx, -1),
+            ace(PosixTag::Mask, rx, -1),
+            ace(PosixTag::Other, rx, -1),
+        ]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("helper"), b"data").unwrap();
+        std::fs::set_permissions(
+            src.join("helper"),
+            std::fs::Permissions::from_mode(0o6755),
+        )
+        .unwrap();
+        let f = std::fs::File::open(src.join("helper")).unwrap();
+        if fsetacl_posix(f.as_fd(), &acl.access_bytes().unwrap(), None).is_err()
+        {
+            return; // no POSIX ACLs here (an NFSv4-ACL dataset, say)
+        }
+        let src_acl = fgetxattr(f.as_fd(), "system.posix_acl_access").unwrap();
+        assert_eq!(
+            std::fs::metadata(src.join("helper"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o6755,
+            "setting an ACL must not disturb the source's setid bits"
+        );
+
+        let dst = tmp.path().join("dst");
+        copytree(&src, &dst, &CopyTreeConfig::default()).unwrap();
+
+        let copied = std::fs::File::open(dst.join("helper")).unwrap();
+        assert_eq!(
+            fgetxattr(copied.as_fd(), "system.posix_acl_access").unwrap(),
+            src_acl,
+            "the access ACL is copied"
+        );
+        // No chmod is issued for an ACL-bearing file, so the source's setid
+        // bits are not carried; the ACL governs the rwx bits.
+        assert_eq!(
+            copied.metadata().unwrap().permissions().mode() & 0o7000,
+            0,
+            "an ACL-bearing file must not be chmod'd (aclmode=restricted safe)"
+        );
+    }
+
+    // A destination subdirectory is owner-only while its contents are written,
+    // as the destination root is, and takes the source's mode afterwards.
+    #[test]
+    fn subdirectory_mode_is_applied_after_its_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/f"), b"x").unwrap();
+        std::fs::set_permissions(
+            src.join("sub"),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+
+        // The callback fires before each entry is copied, so when the walk
+        // reaches sub/f the destination's `sub` exists but is not yet complete.
+        let mut mid_copy = None;
+        let cfg = CopyTreeConfig {
+            reporting_increment: 1,
+            ..Default::default()
+        };
+        copytree_reporting(&src, &dst, &cfg, &mut |p| {
+            if p.current.ends_with("sub/f") {
+                mid_copy = Some(
+                    std::fs::metadata(dst.join("sub"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o7777,
+                );
+            }
+        })
+        .unwrap();
+
+        assert_eq!(mid_copy, Some(0o700), "sub was reachable mid-copy");
+        assert_eq!(
+            std::fs::metadata(dst.join("sub"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o777
+        );
+    }
+
+    // A read-only source subdirectory must not make the destination copy of it
+    // read-only before its children exist.
+    #[test]
+    fn copies_into_read_only_subdirectory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/f"), b"hi").unwrap();
+        std::fs::set_permissions(
+            src.join("sub"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+
+        let res = copytree(&src, &dst, &CopyTreeConfig::default());
+        let dst_mode = std::fs::metadata(dst.join("sub"))
+            .ok()
+            .map(|m| m.permissions().mode() & 0o7777);
+
+        // Restore write so the tempdir cleanup can remove both trees.
+        for d in [src.join("sub"), dst.join("sub")] {
+            let _ = std::fs::set_permissions(
+                d,
+                std::fs::Permissions::from_mode(0o755),
+            );
+        }
+        let stats = res.expect("read-only subdirectory should be copied into");
+        assert_eq!(stats.files, 1);
+        assert_eq!(std::fs::read(dst.join("sub/f")).unwrap(), b"hi");
+        // The restrictive mode is still applied — just last.
+        assert_eq!(dst_mode, Some(0o555));
     }
 
     #[test]
@@ -1046,6 +1238,33 @@ mod shutil {
         );
         // Primary pass copied `top`; the traverse pass copied the mount's file.
         assert_eq!(stats.files, 2);
+    }
+
+    // A source file the copier cannot read fails the copy; it must not be left
+    // out of the destination under a successful return.
+    #[test]
+    fn unreadable_source_file_fails_the_copy() {
+        // CAP_DAC_OVERRIDE reads it regardless of the mode.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("secret"), b"data").unwrap();
+        std::fs::set_permissions(
+            src.join("secret"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        let err = copytree(&src, &dst, &CopyTreeConfig::default()).unwrap_err();
+        assert!(
+            matches!(err, Error::Errno(Errno::EACCES | Errno::EPERM)),
+            "unexpected error: {err:?}"
+        );
+        assert!(!dst.join("secret").exists());
     }
 }
 

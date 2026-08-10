@@ -6,7 +6,8 @@
 //! required to agree on serialization (both `space_around` modes), raw and
 //! interpolated `get`, the typed getters, and — crucially — whether the document
 //! is accepted or rejected at all. The corpus is a curated table of every parsing
-//! subtlety plus a large batch of seeded-random documents.
+//! subtlety, a large batch of seeded-random documents, and a set of files read
+//! from disk, where `configparser` applies universal newlines.
 //!
 //! Like `test/zfs.rs`, this suite **skips** (returns early) when `python3` is not
 //! available, so `cargo test` stays green in a bare sandbox. CI sets
@@ -147,9 +148,10 @@ fn parse_stream(data: &[u8]) -> Oracle {
     }
 }
 
-fn run_oracle(py: &str, doc: &str) -> Oracle {
+/// Run the oracle over `doc`, or over a file when `args` carries `--path`.
+fn run_oracle(py: &str, doc: &str, args: &[&str]) -> Oracle {
     let mut cmd = Command::new(py);
-    cmd.arg(oracle_script());
+    cmd.arg(oracle_script()).args(args);
     if let Some(lib) = std::env::var_os("TRUENAS_ROS_CPYTHON_LIB") {
         cmd.env("PYTHONPATH", lib);
     }
@@ -171,7 +173,7 @@ fn run_oracle(py: &str, doc: &str) -> Oracle {
 // ---- the differential assertions ------------------------------------------
 
 fn assert_doc(py: &str, doc: &str, check_typed: bool) {
-    let oracle = run_oracle(py, doc);
+    let oracle = run_oracle(py, doc, &[]);
 
     let mut rraw = ConfigFile::raw();
     let raw_res = rraw.read_str(doc);
@@ -210,29 +212,7 @@ fn assert_doc(py: &str, doc: &str, check_typed: bool) {
     assert_serialization(&rraw.to_string_with(false), &tight, doc, "tight");
     assert_serialization(&rnew.write_string(), &spaced, doc, "interp-spaced");
 
-    for p in &probes {
-        // Interpolated get() through the interpolating parser.
-        match &p.get {
-            OResult::Err => assert!(
-                rnew.get(&p.section, &p.option).is_err(),
-                "expected get() error at [{}] {} in {doc:?}",
-                p.section,
-                p.option
-            ),
-            OResult::Ok(v) => assert_eq!(
-                rnew.get(&p.section, &p.option).unwrap().as_deref(),
-                Some(v.as_str()),
-                "get() mismatch at [{}] {} in {doc:?}",
-                p.section,
-                p.option
-            ),
-        }
-        if check_typed {
-            assert_int(&rnew, p, doc);
-            assert_float(&rnew, p, doc);
-            assert_bool(&rnew, p, doc);
-        }
-    }
+    assert_probes(&rnew, &probes, doc, check_typed);
 
     // Rust's serialization must itself reparse to the same bytes (write/parse
     // symmetry); combined with the parity above this pins full round-tripping.
@@ -246,6 +226,38 @@ fn assert_doc(py: &str, doc: &str, check_typed: bool) {
         s1,
         "serialization is not idempotent for {doc:?}"
     );
+}
+
+/// Compare every probe the oracle reported against an interpolating `cfg`.
+fn assert_probes(
+    cfg: &ConfigFile,
+    probes: &[Probe],
+    doc: &str,
+    check_typed: bool,
+) {
+    for p in probes {
+        // Interpolated get() through the interpolating parser.
+        match &p.get {
+            OResult::Err => assert!(
+                cfg.get(&p.section, &p.option).is_err(),
+                "expected get() error at [{}] {} in {doc:?}",
+                p.section,
+                p.option
+            ),
+            OResult::Ok(v) => assert_eq!(
+                cfg.get(&p.section, &p.option).unwrap().as_deref(),
+                Some(v.as_str()),
+                "get() mismatch at [{}] {} in {doc:?}",
+                p.section,
+                p.option
+            ),
+        }
+        if check_typed {
+            assert_int(cfg, p, doc);
+            assert_float(cfg, p, doc);
+            assert_bool(cfg, p, doc);
+        }
+    }
 }
 
 fn assert_serialization(got: &str, want: &[u8], doc: &str, which: &str) {
@@ -354,6 +366,10 @@ const CURATED: &[&str] = &[
     "[DEFAULT]\nbase = /srv\n[s]\np = %(base)s/data\n", // interpolation
     "[s]\na = 1\nb = %(a)s%(a)s\nc = %(b)s\n", // chained interpolation
     "[s]\nbad = 50%\n",   // invalid interpolation → get() errs
+    // A '\r' is not a line break on this path: `read_string` wraps the text in
+    // a StringIO with newline='\n'. The same bytes in a file are FILE_CORPUS.
+    "[s]\rk = v\rj = w\r",
+    "[s]\r\nk = v\r\n",
     // Documents `configparser` rejects (Rust must reject them too):
     "k = v\n",                      // no section header
     "[s]\n[s]\n",                   // duplicate section
@@ -456,4 +472,97 @@ fn random_corpus_matches_configparser() {
         // and interpolated get(), not the numeric/boolean converters.
         assert_doc(&py, &doc, false);
     }
+}
+
+// ---- corpus 3: files, read through universal newlines ----------------------
+
+/// Documents whose line endings only matter on disk: `configparser.read()`
+/// opens the file with universal newlines, so every `\r\n` and lone `\r` is a
+/// line break — unlike the `read_string` path the corpora above exercise.
+const FILE_CORPUS: &[&str] = &[
+    "[s]\rk = v\rj = w\r",       // classic-Mac CR endings
+    "[s]\r\nk = v\r\nj = w\r\n", // CRLF endings
+    "[DEFAULT]\rd = 1\r[s]\nk = %(d)s\r\n", // endings mixed in one file
+    "[s]\rk = one\r  two\r",     // a CR-separated multi-line value
+    "[s]\nk = v\r",              // a bare '\r' terminating the file
+    "k = v\r[s]\r",              // rejected: option before any section
+];
+
+#[test]
+fn file_line_endings_match_configparser_read() {
+    let Some(py) = python() else {
+        eprintln!("skipping: python3 not available");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.conf");
+    for doc in FILE_CORPUS {
+        std::fs::write(&path, doc).unwrap();
+        let args = ["--path", path.to_str().unwrap()];
+        let mut rraw = ConfigFile::raw();
+        let raw_res = rraw.read_path(&path);
+        let mut rnew = ConfigFile::new();
+        let new_res = rnew.read_path(&path);
+
+        let (spaced, tight, probes) = match run_oracle(&py, "", &args) {
+            Oracle::ParseErr => {
+                assert!(
+                    raw_res.is_err(),
+                    "python rejected but rust(raw) accepted file {doc:?}"
+                );
+                assert!(
+                    new_res.is_err(),
+                    "python rejected but rust(new) accepted file {doc:?}"
+                );
+                continue;
+            }
+            Oracle::Ok {
+                spaced,
+                tight,
+                probes,
+            } => (spaced, tight, probes),
+        };
+
+        raw_res.unwrap_or_else(|e| {
+            panic!("python accepted but rust rejected file {doc:?}: {e:?}")
+        });
+        new_res.unwrap_or_else(|e| {
+            panic!("python accepted but rust rejected file {doc:?}: {e:?}")
+        });
+        assert_serialization(&rraw.write_string(), &spaced, doc, "spaced");
+        assert_serialization(&rraw.to_string_with(false), &tight, doc, "tight");
+        assert_probes(&rnew, &probes, doc, true);
+    }
+}
+
+// ---- corpus 4: lookups the document never defines --------------------------
+
+#[test]
+fn absent_section_lookup_matches_configparser() {
+    let Some(py) = python() else {
+        eprintln!("skipping: python3 not available");
+        return;
+    };
+    let doc = "[DEFAULT]\nport = 8080\n[server]\nport = 9000\n";
+    // `sever` is a typo for `server`: `configparser` raises NoSectionError
+    // instead of serving the DEFAULT value. DEFAULT is addressable by name.
+    #[rustfmt::skip]
+    let args = [
+        "--probe", "sever", "port",
+        "--probe", "nosuch", "nosuch",
+        "--probe", "DEFAULT", "port",
+        "--probe", "server", "port",
+    ];
+    let Oracle::Ok { probes, .. } = run_oracle(&py, doc, &args) else {
+        panic!("python rejected {doc:?}");
+    };
+
+    let mut cfg = ConfigFile::new();
+    cfg.read_str(doc).unwrap();
+    assert_probes(&cfg, &probes, doc, true);
+
+    // `get_raw` has no error channel, so an absent section reads as absent.
+    assert_eq!(cfg.get_raw("sever", "port"), None);
+    assert_eq!(cfg.get_raw("server", "port"), Some("9000"));
+    assert_eq!(cfg.get_raw("DEFAULT", "port"), Some("8080"));
 }

@@ -112,20 +112,28 @@ fn parse_aces(data: &[u8], is_default: bool) -> Result<Vec<PosixAce>> {
     Ok(out)
 }
 
-fn encode_aces(aces: &[PosixAce]) -> Vec<u8> {
+fn encode_aces(aces: &[PosixAce]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(HDR_SZ + aces.len() * ACE_SZ);
     out.extend_from_slice(&VERSION.to_le_bytes());
     for a in aces {
         let xid = if a.tag.is_special() {
             SPECIAL_ID
         } else {
-            a.id as u32
+            match u32::try_from(a.id) {
+                Ok(xid) if xid != SPECIAL_ID => xid,
+                _ => {
+                    return Err(Error::Validation(format!(
+                        "POSIX ACL entry id {} is not a valid uid/gid",
+                        a.id
+                    )))
+                }
+            }
         };
         out.extend_from_slice(&(a.tag as u16).to_le_bytes());
         out.extend_from_slice(&a.perms.bits().to_le_bytes());
         out.extend_from_slice(&xid.to_le_bytes());
     }
-    out
+    Ok(out)
 }
 
 impl PosixAcl {
@@ -170,15 +178,16 @@ impl PosixAcl {
         }
     }
 
-    /// Raw bytes for `system.posix_acl_access`.
-    pub fn access_bytes(&self) -> Vec<u8> {
+    /// Raw bytes for `system.posix_acl_access`. Errors if a named entry's id
+    /// is not a valid uid/gid.
+    pub fn access_bytes(&self) -> Result<Vec<u8>> {
         encode_aces(&self.access)
     }
 
     /// Raw bytes for `system.posix_acl_default`, or `None` if there is no
-    /// default ACL.
-    pub fn default_bytes(&self) -> Option<Vec<u8>> {
-        self.default.as_deref().map(encode_aces)
+    /// default ACL. Errors if a named entry's id is not a valid uid/gid.
+    pub fn default_bytes(&self) -> Result<Option<Vec<u8>>> {
+        self.default.as_deref().map(encode_aces).transpose()
     }
 
     /// True if the access ACL was synthesised from mode bits and there is no
@@ -223,7 +232,9 @@ impl PosixAcl {
         })
     }
 
-    /// Structural validation (matching the C `posixacl_valid`).
+    /// Structural validation: the C `posixacl_valid` tag rules plus the
+    /// checks the kernel makes in `posix_acl_valid` (permission bits confined
+    /// to rwx, entries in canonical tag order).
     pub(crate) fn validate(&self, is_dir: bool) -> Result<()> {
         validate_entries(&self.access, "access")?;
         if let Some(default) = &self.default {
@@ -264,29 +275,59 @@ pub(crate) fn synthesize_from_mode(mode: u32) -> PosixAcl {
     }
 }
 
+/// Check that a named USER/GROUP entry carries an id the wire format can hold:
+/// a 32-bit value other than the sentinel the kernel reads back as "no id"
+/// (`uid_valid`, `include/linux/uidgid.h`).
+fn validate_named_id(
+    id: i64,
+    label: &str,
+    tag: &str,
+    kind: &str,
+) -> Result<()> {
+    if id < 0 {
+        return Err(Error::Validation(format!(
+            "{label} ACL: named {tag} entry has no {kind}"
+        )));
+    }
+    if u32::try_from(id).is_err() || id == SPECIAL_ID as i64 {
+        return Err(Error::Validation(format!(
+            "{label} ACL: named {tag} entry {kind} {id} is not a valid {kind}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_entries(aces: &[PosixAce], label: &str) -> Result<()> {
     let (mut user_obj, mut group_obj, mut other, mut mask, mut named) =
         (0u32, 0u32, 0u32, 0u32, 0u32);
+    // The tag values ascend in the canonical entry order (USER_OBJ, USER,
+    // GROUP_OBJ, GROUP, MASK, OTHER), so — given the tag counts checked
+    // below — a non-decreasing tag value is exactly the sequence the
+    // kernel's state machine accepts (`fs/posix_acl.c:posix_acl_valid`).
+    let mut prev_tag = 0u16;
     for a in aces {
+        if !PosixPerm::all().contains(a.perms) {
+            return Err(Error::Validation(format!(
+                "{label} ACL: entry has permission bits outside rwx"
+            )));
+        }
+        if (a.tag as u16) < prev_tag {
+            return Err(Error::Validation(format!(
+                "{label} ACL entries are not in canonical tag order"
+            )));
+        }
+        prev_tag = a.tag as u16;
         match a.tag {
             PosixTag::UserObj => user_obj += 1,
             PosixTag::GroupObj => group_obj += 1,
             PosixTag::Other => other += 1,
             PosixTag::Mask => mask += 1,
             PosixTag::User => {
-                if a.id < 0 {
-                    return Err(Error::Validation(format!(
-                        "{label} ACL: named USER entry has no uid"
-                    )));
-                }
+                validate_named_id(a.id, label, "USER", "uid")?;
                 named += 1;
             }
             PosixTag::Group => {
-                if a.id < 0 {
-                    return Err(Error::Validation(format!(
-                        "{label} ACL: named GROUP entry has no gid"
-                    )));
-                }
+                validate_named_id(a.id, label, "GROUP", "gid")?;
                 named += 1;
             }
         }
@@ -324,6 +365,80 @@ fn validate_entries(aces: &[PosixAce], label: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn ace(tag: PosixTag, id: i64) -> PosixAce {
+        PosixAce {
+            tag,
+            perms: PosixPerm::READ,
+            id,
+            default: false,
+        }
+    }
+
+    /// A minimal valid access ACL whose named USER entry carries `id`.
+    fn named_user(id: i64) -> PosixAcl {
+        PosixAcl::from_aces([
+            ace(PosixTag::UserObj, -1),
+            ace(PosixTag::User, id),
+            ace(PosixTag::GroupObj, -1),
+            ace(PosixTag::Mask, -1),
+            ace(PosixTag::Other, -1),
+        ])
+    }
+
+    #[test]
+    fn validate_rejects_unrepresentable_named_ids() {
+        assert!(named_user(1000).validate(false).is_ok());
+        assert!(named_user(u32::MAX as i64 - 1).validate(false).is_ok());
+        // The sentinel the kernel reads back as "no id".
+        assert!(named_user(SPECIAL_ID as i64).validate(false).is_err());
+        // Wider than the 32-bit wire field.
+        assert!(named_user(u32::MAX as i64 + 1).validate(false).is_err());
+        assert!(named_user(-1).validate(false).is_err());
+    }
+
+    #[test]
+    fn encoding_an_unrepresentable_named_id_errors() {
+        assert!(named_user(1000).access_bytes().is_ok());
+        assert!(named_user(SPECIAL_ID as i64).access_bytes().is_err());
+        assert!(named_user(u32::MAX as i64 + 1).access_bytes().is_err());
+        // A special entry's `id` is never encoded.
+        assert!(PosixAcl::from_aces([ace(PosixTag::UserObj, i64::MAX)])
+            .access_bytes()
+            .is_ok());
+        // The default list is encoded by the same rules.
+        let mut acl = named_user(1000);
+        acl.default = Some(vec![PosixAce {
+            default: true,
+            ..ace(PosixTag::Group, u32::MAX as i64 + 1)
+        }]);
+        assert!(acl.default_bytes().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_what_the_kernel_rejects() {
+        let mut acl = named_user(1000);
+        acl.access.reverse();
+        let e = acl.validate(false).unwrap_err().to_string();
+        assert!(e.contains("canonical tag order"), "{e}");
+        // A default list the kernel would refuse is rejected by validate.
+        let mut acl = named_user(1000);
+        acl.default = Some(
+            [PosixTag::Other, PosixTag::UserObj, PosixTag::GroupObj]
+                .map(|tag| PosixAce {
+                    default: true,
+                    ..ace(tag, -1)
+                })
+                .to_vec(),
+        );
+        let e = acl.validate(true).unwrap_err().to_string();
+        assert!(e.contains("default ACL entries are not"), "{e}");
+        // Permission bits outside rwx.
+        let mut acl = named_user(1000);
+        acl.access[0].perms = PosixPerm::from_bits_retain(0x8);
+        let e = acl.validate(false).unwrap_err().to_string();
+        assert!(e.contains("outside rwx"), "{e}");
+    }
+
     #[test]
     fn synthesize_from_mode_matches_getfacl() {
         let acl = synthesize_from_mode(0o644);
@@ -336,7 +451,7 @@ mod tests {
         assert_eq!(acl.access[2].tag, PosixTag::Other);
         assert_eq!(acl.access[2].perms, PosixPerm::READ);
         // 4-byte version header + 3 * 8-byte entries.
-        assert_eq!(acl.access_bytes().len(), 28);
+        assert_eq!(acl.access_bytes().unwrap().len(), 28);
     }
 
     #[test]

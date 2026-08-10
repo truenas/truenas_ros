@@ -195,7 +195,8 @@ impl ConfigFile {
     /// A missing file is an error here (use [`read_paths`](Self::read_paths) for
     /// `configparser.read()`'s skip-missing behavior). A symlink anywhere in
     /// `path` yields [`Error::SymlinkInPath`]; non-UTF-8 content yields
-    /// [`Error::Parse`].
+    /// [`Error::Parse`]. Line endings are decoded with universal newlines, as
+    /// `configparser.read()` gets from `open(filename)`.
     pub fn read_path(&mut self, path: &Path) -> Result<()> {
         let text = read_file_to_string(path)?;
         parse::read(self, &path.display().to_string(), &text)
@@ -204,7 +205,8 @@ impl ConfigFile {
     /// Read each path in turn, **skipping** any that cannot be opened (missing,
     /// unreadable, or containing a symlink component), and return the paths
     /// actually read — the behavior of `configparser.read([...])`. A file that
-    /// opens but fails to parse (or is not UTF-8) still returns an error.
+    /// opens but fails to parse (or is not UTF-8) still returns an error. Line
+    /// endings are decoded as in [`read_path`](Self::read_path).
     pub fn read_paths<I>(&mut self, paths: I) -> Result<Vec<PathBuf>>
     where
         I: IntoIterator<Item = PathBuf>,
@@ -290,7 +292,8 @@ impl ConfigFile {
     }
 
     /// The raw (un-interpolated) value of `option` in `section`, falling back to
-    /// `DEFAULT`. Returns `None` if the option is absent or valueless.
+    /// `DEFAULT`. Returns `None` if the option is absent or valueless, or if the
+    /// section does not exist.
     pub fn get_raw(&self, section: &str, option: &str) -> Option<&str> {
         let key = optionxform(option);
         self.raw_lookup(section, &key).and_then(|v| v.as_deref())
@@ -299,9 +302,11 @@ impl ConfigFile {
     /// The value of `option` in `section`, with `%(name)s` interpolation applied
     /// (unless this is a [`raw`](Self::raw) config), falling back to `DEFAULT`.
     ///
-    /// Returns `Ok(None)` if the option is absent or valueless, or `Err` if
+    /// Returns `Ok(None)` if the option is absent or valueless, and `Err` if the
+    /// section does not exist (`configparser` raises `NoSectionError`) or if
     /// interpolation fails.
     pub fn get(&self, section: &str, option: &str) -> Result<Option<String>> {
+        self.require_section(section)?;
         let key = optionxform(option);
         let raw = match self.raw_lookup(section, &key) {
             Some(Some(s)) => s,
@@ -479,14 +484,26 @@ impl ConfigFile {
 
     // --- internals -------------------------------------------------------
 
-    /// Section-over-DEFAULT raw lookup (the `configparser` `ChainMap` order).
-    fn raw_lookup(&self, section: &str, key: &str) -> Option<&Option<String>> {
-        if let Some(opts) = self.sections.get(section) {
-            if let Some(v) = opts.get(key) {
-                return Some(v);
-            }
+    /// Whether `section` can be addressed at all: `DEFAULT` always can, even
+    /// with no `sections` entry of its own. Any other name that was never
+    /// defined is an error, as `configparser` raises `NoSectionError`.
+    fn require_section(&self, section: &str) -> Result<()> {
+        if section == DEFAULT_SECTION || self.sections.contains(section) {
+            Ok(())
+        } else {
+            Err(Error::Validation(format!("no such section: {section:?}")))
         }
-        self.defaults.get(key)
+    }
+
+    /// Section-over-DEFAULT raw lookup (the `configparser` `ChainMap` order).
+    /// A section that does not exist inherits nothing: DEFAULT is only reachable
+    /// through a section that does, or under its own name.
+    fn raw_lookup(&self, section: &str, key: &str) -> Option<&Option<String>> {
+        match self.sections.get(section) {
+            Some(opts) => opts.get(key).or_else(|| self.defaults.get(key)),
+            None if section == DEFAULT_SECTION => self.defaults.get(key),
+            None => None,
+        }
     }
 
     /// The merged (DEFAULT, then section-override) raw values used both for
@@ -508,7 +525,8 @@ fn optionxform(option: &str) -> String {
     option.to_lowercase()
 }
 
-/// Read a whole file to a UTF-8 `String`, opened symlink-safely.
+/// Read a whole file to a UTF-8 `String`, opened symlink-safely, with line
+/// endings translated by [`universal_newlines`].
 fn read_file_to_string(path: &Path) -> Result<String> {
     let mut file = safe_open(
         AT_FDCWD,
@@ -519,6 +537,21 @@ fn read_file_to_string(path: &Path) -> Result<String> {
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)
         .map_err(|e| Errno::try_from(e).unwrap_or(Errno::EIO))?;
-    String::from_utf8(buf)
-        .map_err(|_| Error::Parse("config file is not valid UTF-8".into()))
+    let text = String::from_utf8(buf)
+        .map_err(|_| Error::Parse("config file is not valid UTF-8".into()))?;
+    Ok(universal_newlines(text))
+}
+
+/// Translate `\r\n` and a lone `\r` to `\n`, the universal-newline decoding
+/// Python's `open(filename)` — and so `configparser.read()` — applies.
+///
+/// Only the file entry points need this: `read_string`, which
+/// [`ConfigFile::read_str`] mirrors, wraps the text in a `StringIO` with
+/// `newline='\n'`, which passes `\r` through verbatim.
+fn universal_newlines(text: String) -> String {
+    if text.contains('\r') {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        text
+    }
 }

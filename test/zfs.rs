@@ -66,7 +66,11 @@ fn nfs4_codec_and_named_user_roundtrip() {
     // Whatever the fresh file carries (it may inherit entries from the parent),
     // our codec reproduces the kernel's exact bytes.
     let raw0 = fgetxattr(f.as_fd(), "system.nfs4_acl_xdr").unwrap();
-    assert_eq!(acl.to_xattr(), raw0, "codec must round-trip live ZFS bytes");
+    assert_eq!(
+        acl.to_xattr().unwrap(),
+        raw0,
+        "codec must round-trip live ZFS bytes"
+    );
 
     // Append a named-user ALLOW to ZFS's own (valid) entries and write it back.
     let uid = 8_675_309;
@@ -96,7 +100,11 @@ fn nfs4_codec_and_named_user_roundtrip() {
         .iter()
         .any(|a| a.who_type == Nfs4Who::Named && a.who_id == uid));
     let raw = fgetxattr(f.as_fd(), "system.nfs4_acl_xdr").unwrap();
-    assert_eq!(back.to_xattr(), raw, "encoder must match kernel bytes");
+    assert_eq!(
+        back.to_xattr().unwrap(),
+        raw,
+        "encoder must match kernel bytes"
+    );
 
     // Removing the ACL restores triviality.
     fsetacl(f.as_fd(), None).expect("fsetacl None");
@@ -152,7 +160,11 @@ fn posix_named_user_roundtrip_on_zfs() {
         .iter()
         .any(|a| a.tag == PosixTag::User && a.id == uid));
     let raw = fgetxattr(f.as_fd(), "system.posix_acl_access").unwrap();
-    assert_eq!(back.access_bytes(), raw, "encoder must match kernel bytes");
+    assert_eq!(
+        back.access_bytes().unwrap(),
+        raw,
+        "encoder must match kernel bytes"
+    );
 
     let _ = fsetacl(f.as_fd(), None);
     let _ = std::fs::remove_file(&path);

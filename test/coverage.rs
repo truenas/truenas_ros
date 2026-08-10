@@ -428,8 +428,9 @@ mod mount {
     use truenas_ros::mount::{
         fsconfig, is_zfs_snapshot, listmount, mount_setattr, move_mount,
         open_mount_by_id, open_tree, statmount, statmount_path, umount,
-        umount2, FsConfig, MntFlags, MntPropagation, MountAttr, MountSetattr,
-        MoveMountFlags, OpenTreeFlags, StatmountMask, UmountOptions, LSMT_ROOT,
+        umount2, Atime, FsConfig, MntFlags, MntPropagation, MountAttr,
+        MountSetattr, MoveMountFlags, OpenTreeFlags, StatmountMask,
+        UmountOptions, LSMT_ROOT,
     };
     use truenas_ros::sync_fs::{statx, AtFlags, OFlag, StatxMask};
     use truenas_ros::{Error, AT_FDCWD};
@@ -502,6 +503,42 @@ mod mount {
         assert!(umount(dir.path(), UmountOptions::default()).is_err());
     }
 
+    /// The mountpoint of a mount with no children of its own, so a recursive
+    /// umount of it has nothing to tear down. `None` if the namespace has no
+    /// such mount or its mountpoint is unreadable.
+    fn leaf_mountpoint() -> Option<String> {
+        listmount(LSMT_ROOT, false)
+            .unwrap()
+            .into_iter()
+            .find_map(|id| {
+                listmount(id, false).ok().filter(|kids| kids.is_empty())?;
+                statmount(id, StatmountMask::MNT_POINT).ok()?.mnt_point
+            })
+    }
+
+    #[test]
+    fn recursive_umount_rejects_a_symlinked_mountpoint() {
+        let Some(point) = leaf_mountpoint() else {
+            panic!("no childless mount in this namespace");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("l");
+        std::os::unix::fs::symlink(&point, &link).unwrap();
+        // The symlink is not itself a mountpoint, so validation fails before
+        // any umount2 — a syscall error here would mean it got that far.
+        assert!(matches!(
+            umount(
+                &link,
+                UmountOptions {
+                    recursive: true,
+                    ..Default::default()
+                }
+            )
+            .unwrap_err(),
+            Error::Validation(_)
+        ));
+    }
+
     #[test]
     fn privileged_wrappers_are_callable() {
         // These need CAP_SYS_ADMIN; unprivileged they return an error. We only
@@ -518,6 +555,7 @@ mod mount {
         let attr = MountSetattr::new()
             .set(MountAttr::RDONLY)
             .clear(MountAttr::NODEV)
+            .atime(Atime::Noatime)
             .propagation(MntPropagation::MS_SLAVE)
             .idmap(anchor.as_fd());
         let _ = mount_setattr(AT_FDCWD, "/", AtFlags::empty(), &attr);
@@ -583,7 +621,7 @@ mod acl {
                 1000,
             )],
         };
-        let back = Nfs4Acl::from_xattr(&acl.to_xattr()).unwrap();
+        let back = Nfs4Acl::from_xattr(&acl.to_xattr().unwrap()).unwrap();
         assert_eq!(back.aces[0].who_type, Nfs4Who::Named);
         assert_eq!(back.aces[0].who_id, 1000);
         assert_eq!(back.acl_flags, acl.acl_flags);
@@ -774,6 +812,12 @@ mod acl {
         );
         aces.push(p_ace(PosixTag::Mask, -1, false));
         assert!(validate_acl(AclTarget::AssumeDir, &posix(aces)).is_ok());
+        // Entries out of canonical tag order → rejected, as the kernel would.
+        let mut unsorted = PosixAcl::from_aces(valid_access());
+        unsorted.access.reverse();
+        assert!(
+            validate_acl(AclTarget::AssumeDir, &Acl::Posix(unsorted)).is_err()
+        );
     }
 
     #[test]
@@ -801,12 +845,12 @@ mod acl {
         }));
         let acl = PosixAcl::from_aces(aces);
         assert!(acl.default.is_some());
-        assert!(acl.default_bytes().is_some());
+        assert!(acl.default_bytes().unwrap().is_some());
         assert!(!acl.trivial());
         // Round-trip through the wire codec.
         let round = PosixAcl::from_xattr(
-            &acl.access_bytes(),
-            acl.default_bytes().as_deref(),
+            &acl.access_bytes().unwrap(),
+            acl.default_bytes().unwrap().as_deref(),
         )
         .unwrap();
         assert_eq!(round.access.len(), 3);
@@ -878,7 +922,8 @@ mod acl {
             p_ace(PosixTag::GroupObj, -1, false),
             p_ace(PosixTag::Other, -1, false),
         ])
-        .access_bytes();
+        .access_bytes()
+        .unwrap();
         let default = PosixAcl::from_aces(vec![
             p_ace(PosixTag::UserObj, -1, true),
             p_ace(PosixTag::GroupObj, -1, true),
@@ -888,7 +933,7 @@ mod acl {
         let _ = fsetacl_posix(
             d.as_fd(),
             &access,
-            default.default_bytes().as_deref(),
+            default.default_bytes().unwrap().as_deref(),
         );
         let _ = fsetacl_posix(d.as_fd(), &access, None);
         // NFS4 low-level (empty, trivially valid): fails on a non-NFS4 fs but
@@ -897,7 +942,8 @@ mod acl {
             acl_flags: Nfs4AclFlag::empty(),
             aces: vec![],
         }
-        .to_xattr();
+        .to_xattr()
+        .unwrap();
         let _ = fsetacl_nfs4(d.as_fd(), &nfs4);
     }
 }
@@ -1136,7 +1182,7 @@ mod fsiter {
     }
 
     #[test]
-    fn unreadable_regular_file_is_skipped() {
+    fn unreadable_regular_file_fails_the_walk() {
         use std::os::unix::fs::PermissionsExt;
         // Root bypasses mode bits, so this only holds unprivileged.
         if unsafe { libc::getuid() } == 0 {
@@ -1148,15 +1194,28 @@ mod fsiter {
         std::fs::write(&bad, b"y").unwrap();
         std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000))
             .unwrap();
-        // "bad" hits the EACCES branch (retry O_RDONLY, still denied → skip).
-        let names: Vec<_> =
-            FsIterBuilder::new(dir.path(), fs_source(dir.path()))
-                .build()
-                .unwrap()
-                .map(|e| e.unwrap().name().to_string_lossy().into_owned())
-                .collect();
-        assert!(names.contains(&"ok".to_string()));
+        // "bad" hits the EACCES branch (retry O_RDONLY, still denied).
+        let mut it = FsIterBuilder::new(dir.path(), fs_source(dir.path()))
+            .build()
+            .unwrap();
+        let mut names = Vec::new();
+        let mut err = None;
+        for res in it.by_ref() {
+            match res {
+                Ok(e) => names.push(e.name().to_string_lossy().into_owned()),
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert!(
+            matches!(err, Some(Error::Errno(Errno::EACCES))),
+            "unexpected outcome: {err:?}"
+        );
         assert!(!names.contains(&"bad".to_string()));
+        // The error is fatal to the walk.
+        assert!(it.next().is_none());
     }
 
     #[test]

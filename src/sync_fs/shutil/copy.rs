@@ -117,8 +117,13 @@ pub fn copyfile(
 /// Copy the source's access permissions to the destination.
 ///
 /// If the source carries an access ACL xattr (POSIX access or the ZFS NFS4
-/// blob) those are copied and `fchmod` is skipped; otherwise `mode` is applied
-/// with `fchmod`.
+/// blob) it is copied and `fchmod` is skipped, since the ACL is authoritative
+/// for the destination's permissions; otherwise `mode` is applied with
+/// `fchmod`.
+///
+/// The ACL is authoritative on ZFS `aclmode=restricted`, where a `chmod` of an
+/// object holding a non-trivial ACL is rejected with `EPERM` (`zfs_setattr`).
+/// Mirrors `truenas_os` copy.py.
 pub fn copy_permissions(
     src: BorrowedFd<'_>,
     dst: BorrowedFd<'_>,
