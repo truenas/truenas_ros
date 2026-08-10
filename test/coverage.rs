@@ -1487,9 +1487,9 @@ mod shutil {
     use std::os::unix::fs::PermissionsExt;
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::shutil::{
-        clonefile, copy_permissions, copy_xattrs, copyfile, copysendfile,
-        copytree, copyuserspace, CopyFlags, CopyTreeConfig, CopyTreeOp,
-        MAX_RW_SZ,
+        clonefile, copy_permissions, copy_setid, copy_xattrs, copyfile,
+        copysendfile, copytree, copyuserspace, CopyFlags, CopyTreeConfig,
+        CopyTreeOp, MAX_RW_SZ,
     };
 
     fn pair(src: &[u8]) -> (tempfile::TempDir, std::fs::File, std::fs::File) {
@@ -1562,6 +1562,26 @@ mod shutil {
         let (_dir, s, d) = pair(b"x");
         copy_permissions(s.as_fd(), d.as_fd(), &[], 0o640).unwrap();
         assert_eq!(d.metadata().unwrap().permissions().mode() & 0o777, 0o640);
+    }
+
+    #[test]
+    fn copy_permissions_withholds_setid_for_copy_setid() {
+        let mode =
+            |f: &std::fs::File| f.metadata().unwrap().permissions().mode();
+        let (_dir, s, d) = pair(b"x");
+        // copy_permissions applies the rwx bits but withholds setid.
+        copy_permissions(s.as_fd(), d.as_fd(), &[], 0o104755).unwrap();
+        assert_eq!(mode(&d) & 0o7777, 0o755);
+        // copy_setid does nothing when the source has no setid bits...
+        copy_setid(d.as_fd(), &[], 0o100755).unwrap();
+        assert_eq!(mode(&d) & 0o7777, 0o755);
+        // ...leaves an ACL-backed destination alone (the ACL governs mode)...
+        let acl = vec!["system.posix_acl_access".to_string()];
+        copy_setid(d.as_fd(), &acl, 0o104755).unwrap();
+        assert_eq!(mode(&d) & 0o7777, 0o755);
+        // ...and otherwise applies them.
+        copy_setid(d.as_fd(), &[], 0o104755).unwrap();
+        assert_eq!(mode(&d) & 0o7777, 0o4755);
     }
 
     #[test]

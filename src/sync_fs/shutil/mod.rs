@@ -20,9 +20,11 @@
 mod copy;
 
 pub use copy::{
-    clonefile, copy_permissions, copy_xattrs, copyfile, copysendfile,
-    copyuserspace, MAX_RW_SZ,
+    clonefile, copy_permissions, copy_setid, copy_xattrs, copyfile,
+    copysendfile, copyuserspace, MAX_RW_SZ,
 };
+
+use copy::SETID_BITS;
 
 use crate::errno::{retry_on_eintr, Errno};
 use crate::error::{Error, Result};
@@ -31,7 +33,8 @@ use crate::path::TnPath;
 use crate::sync_fs::iter::{EntryType, FsIterBuilder};
 use crate::sync_fs::xattr::flistxattr;
 use crate::sync_fs::{
-    openat2, statx, AtFlags, OFlag, OpenHow, ResolveFlag, Statx,
+    openat2, renameat2, statx, AtFlags, OFlag, OpenHow, RenameFlags,
+    ResolveFlag, Statx,
 };
 use crate::sync_fs::{Mode, StatxMask};
 use crate::AT_FDCWD;
@@ -196,15 +199,34 @@ pub fn copytree_reporting(
             .flags(DIR_OFLAGS)
             .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
     )?;
-    // Create the destination root owner-only (0o700) for the duration of the
+    // `mkdirat` has no resolve-flag mechanism, so it must never be handed a
+    // multi-component path: every component but the last would resolve with
+    // symlinks followed, and the root could land outside the intended tree.
+    // Open the parent with RESOLVE_NO_SYMLINKS and create the final component
+    // against that handle, as the rest of this module does for every name.
+    let dst_parent = dst
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let dst_name = dst.file_name().ok_or_else(|| {
+        Error::Validation("destination path has no file name".into())
+    })?;
+    let dst_parent_fd = openat2(
+        AT_FDCWD,
+        dst_parent,
+        OpenHow::new()
+            .flags(DIR_OFLAGS)
+            .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
+    )?;
+    // Hold the destination root owner-only (0o700) for the duration of the
     // copy. Its real mode — which may be broader — is applied only at the end,
     // so group/other are never granted access to the files being written before
     // the copy completes. Owner keeps write, so children stay creatable even
     // when the source root is not owner-writable.
-    mkdir_at(AT_FDCWD, dst.as_os_str(), 0o700, config.exist_ok)?;
+    mkdir_at(dst_parent_fd.as_fd(), dst_name, 0o700, config.exist_ok)?;
     let dst_root = openat2(
-        AT_FDCWD,
-        dst,
+        dst_parent_fd.as_fd(),
+        dst_name,
         OpenHow::new()
             .flags(DIR_OFLAGS)
             .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
@@ -213,6 +235,15 @@ pub fn copytree_reporting(
     // — applied to the primary pass and every traversed child mount.
     let dst_self_st =
         statx(dst_root.as_fd(), "", AtFlags::AT_EMPTY_PATH, META_MASK)?;
+    // `mkdir_at` sets the mode only for a root it creates; with `exist_ok` it
+    // swallows EEXIST, so a pre-existing root keeps whatever mode it had.
+    // Narrow it when that mode grants group or other access, which is what
+    // makes the 0o700 hold above true of an existing root too. Where an ACL
+    // governs the mode (ZFS aclmode=restricted) the chmod is rejected; there
+    // the ACL is authoritative for visibility, so proceed rather than refuse.
+    if dst_self_st.mode() & 0o077 != 0 {
+        ok_if_acl_governed(fchmod_fd(dst_root.as_fd(), 0o700))?;
+    }
 
     let c_fn = select_copy_fn(config.op);
     let mut stats = CopyTreeStats::default();
@@ -501,28 +532,88 @@ fn make_file(
     config: &CopyTreeConfig,
     c_fn: CopyFn,
 ) -> Result<u64> {
-    let mut flags =
-        OFlag::O_RDWR | OFlag::O_NOFOLLOW | OFlag::O_CREAT | OFlag::O_TRUNC;
-    if !config.exist_ok {
-        flags |= OFlag::O_EXCL;
-    }
+    // Always `O_EXCL`, so the data only ever lands in an inode this copy
+    // created rather than one already at the name. With `exist_ok` an existing
+    // entry is replaced by filling a fresh inode under a temporary name and
+    // renaming it into place below, not opened and truncated.
     // Created owner-private (0o600) until copy_permissions sets the real mode.
-    let dfd = openat2(
-        parent,
-        name,
-        OpenHow::new()
-            .flags(flags)
-            .mode(Mode::from_bits_truncate(0o600))
-            .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
-    )?;
+    let how = OpenHow::new()
+        .flags(
+            OFlag::O_RDWR | OFlag::O_NOFOLLOW | OFlag::O_CREAT | OFlag::O_EXCL,
+        )
+        .mode(Mode::from_bits_truncate(0o600))
+        .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS);
+    let (dfd, tmp_name) = match openat2(parent, name, how) {
+        Ok(fd) => (fd, None),
+        Err(Errno::EEXIST) if config.exist_ok => {
+            let (tmp, fd) = create_temp(parent, how)?;
+            (fd, Some(tmp))
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let res = copy_into(dfd.as_fd(), src, src_st, config, c_fn);
+    let Some(tmp) = tmp_name else {
+        return res;
+    };
+    // One step from the temporary name to the destination name, so a reader
+    // sees either the entry that was there or the finished copy, never a
+    // partial one.
+    let res = res.and_then(|n| {
+        renameat2(parent, tmp.as_os_str(), parent, name, RenameFlags::empty())?;
+        Ok(n)
+    });
+    if res.is_err() {
+        let _ = unlink_at(parent, &tmp);
+    }
+    res
+}
+
+/// Copy `src`'s data then metadata into the destination file just created at
+/// `dfd`, returning the number of data bytes written. The data lands first: an
+/// unprivileged write to a regular file makes the kernel drop its
+/// setuid/setgid bits and `security.capability`, and it would bump the
+/// timestamps.
+fn copy_into(
+    dfd: BorrowedFd<'_>,
+    src: BorrowedFd<'_>,
+    src_st: &Statx,
+    config: &CopyTreeConfig,
+    c_fn: CopyFn,
+) -> Result<u64> {
     let xattrs = list_xattrs(src, config)?;
-    let n = c_fn(src, dfd.as_fd()).map_err(Error::from)?;
-    // Metadata after the data: an unprivileged write to a regular file makes the
-    // kernel drop its setuid/setgid bits and `security.capability`, and it would
-    // bump the timestamps.
-    copy_metadata(src, dfd.as_fd(), &xattrs, src_st, config)?;
-    apply_timestamps(dfd.as_fd(), src_st, config)?;
+    let n = c_fn(src, dfd).map_err(Error::from)?;
+    copy_metadata(src, dfd, &xattrs, src_st, config)?;
+    apply_timestamps(dfd, src_st, config)?;
     Ok(n)
+}
+
+/// Create a file under a fresh random name in `dir`, with the same `how` as the
+/// destination it will be renamed over.
+///
+/// The name is 128 bits from `getrandom(2)`, so a single `O_EXCL` create is
+/// collision-free in practice — no retry loop and no shared counter. Its length
+/// is fixed rather than derived from the destination name, which would risk
+/// `ENAMETOOLONG` for a name already near `NAME_MAX`.
+fn create_temp(
+    dir: BorrowedFd<'_>,
+    how: OpenHow,
+) -> Result<(OsString, OwnedFd)> {
+    let mut rand = [0u8; 16];
+    // getrandom fully fills any request of <= 256 bytes (flags 0), so on success
+    // the whole buffer is populated; only the error case needs handling.
+    retry_on_eintr(|| unsafe {
+        libc::getrandom(rand.as_mut_ptr().cast(), rand.len(), 0)
+    })?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name = String::from(".copytree.tmp.");
+    for b in rand {
+        name.push(char::from(HEX[(b >> 4) as usize]));
+        name.push(char::from(HEX[(b & 0x0f) as usize]));
+    }
+    let name = OsString::from(name);
+    let fd = openat2(dir, name.as_os_str(), how)?;
+    Ok((name, fd))
 }
 
 fn make_symlink(
@@ -561,12 +652,15 @@ fn make_special(
     // `mknodat`'s mode is umask-masked, so the exact permission bits are
     // restored below; `rdev` is 0 for FIFOs/sockets and the device number for
     // block/character devices. The `S_IFMT` bits in `mode` select the type.
+    // setid is masked at creation — `vfs_mknod` passes it through, and it must
+    // not land before the node's ownership is settled.
+    let mode = src_st.mode() as libc::mode_t;
     let res = name.with_tn_path(|n| {
         retry_on_eintr(|| unsafe {
             libc::mknodat(
                 parent.as_raw_fd(),
                 n.as_ptr(),
-                src_st.mode() as libc::mode_t,
+                mode & !SETID_BITS,
                 src_st.rdev(),
             )
         })
@@ -577,36 +671,57 @@ fn make_special(
         Err(e) => return Err(e.into()),
     }
 
-    // Ownership before the mode, as in `copy_metadata` — the chown clears the
-    // setuid/setgid bits of a non-directory. Ownership failures always
-    // propagate (matching `copy_metadata`).
+    // Pin the new node and set every attribute below through this handle, so
+    // the name resolves exactly once and cannot be redirected between the
+    // mknod and these calls. `O_PATH` because a FIFO or device must not be
+    // opened for I/O (that would block on a peer, or run the device's `open`
+    // method), and it is all the `AT_EMPTY_PATH` calls need.
+    let node = openat2(
+        parent,
+        name,
+        OpenHow::new()
+            .flags(OFlag::O_PATH | OFlag::O_NOFOLLOW)
+            .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
+    )?;
+    // Confirm the handle is on the node `mknodat` created — same type and
+    // device number, and a single link — so a different object at the name is
+    // not the one adjusted below.
+    let node_st = statx(node.as_fd(), "", AtFlags::AT_EMPTY_PATH, META_MASK)?;
+    let ifmt = libc::S_IFMT as u16;
+    if node_st.mode() & ifmt != src_st.mode() & ifmt
+        || node_st.rdev() != src_st.rdev()
+        || node_st.nlink() != 1
+    {
+        return Err(Error::Validation(format!(
+            "destination special file {name:?} changed during the copy"
+        )));
+    }
+
+    // Ownership before the mode: a chown clears the setuid/setgid bits of a
+    // non-directory (even for root), so setid can only follow it. Ownership
+    // failures always propagate (matching `copy_metadata`).
     if config.flags.contains(CopyFlags::OWNER) {
-        name.with_tn_path(|n| {
-            retry_on_eintr(|| unsafe {
-                libc::fchownat(
-                    parent.as_raw_fd(),
-                    n.as_ptr(),
-                    src_st.uid(),
-                    src_st.gid(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            })
-        })??;
+        retry_on_eintr(|| unsafe {
+            libc::fchownat(
+                node.as_raw_fd(),
+                c"".as_ptr(),
+                src_st.uid(),
+                src_st.gid(),
+                libc::AT_EMPTY_PATH,
+            )
+        })?;
     }
     if config.flags.contains(CopyFlags::PERMISSIONS) {
-        let r = name
-            .with_tn_path(|n| {
-                retry_on_eintr(|| unsafe {
-                    libc::fchmodat(
-                        parent.as_raw_fd(),
-                        n.as_ptr(),
-                        src_st.mode() as libc::mode_t & 0o7777,
-                        0,
-                    )
-                })
-            })?
-            .map(drop)
-            .map_err(Error::from);
+        // setid follows ownership: apply it only when ownership was preserved.
+        // Where an ACL governs the node's mode (ZFS aclmode=restricted) the
+        // chmod is rejected; the ACL is authoritative, so treat it as applied
+        // rather than aborting the whole copy over one node.
+        let perm = if config.flags.contains(CopyFlags::OWNER) {
+            mode & 0o7777
+        } else {
+            mode & 0o7777 & !SETID_BITS
+        };
+        let r = ok_if_acl_governed(fchmod_fd(node.as_fd(), perm));
         guard(config, r)?;
     }
     if config.flags.contains(CopyFlags::TIMESTAMPS) {
@@ -622,19 +737,16 @@ fn make_special(
                 tv_nsec: m.nsec as i64,
             },
         ];
-        let r = name
-            .with_tn_path(|n| {
-                retry_on_eintr(|| unsafe {
-                    libc::utimensat(
-                        parent.as_raw_fd(),
-                        n.as_ptr(),
-                        times.as_ptr(),
-                        libc::AT_SYMLINK_NOFOLLOW,
-                    )
-                })
-            })?
-            .map(drop)
-            .map_err(Error::from);
+        let r = retry_on_eintr(|| unsafe {
+            libc::utimensat(
+                node.as_raw_fd(),
+                c"".as_ptr(),
+                times.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        })
+        .map(drop)
+        .map_err(Error::from);
         guard(config, r)?;
     }
     Ok(())
@@ -661,6 +773,7 @@ fn copy_metadata(
     src_st: &Statx,
     config: &CopyTreeConfig,
 ) -> Result<()> {
+    let mode = src_st.mode() as u32;
     // Ownership is applied first: chowning a non-directory makes the kernel
     // clear its setuid/setgid bits and any `security.capability`, so the mode
     // and the xattrs have to land after it. Ownership failures always propagate
@@ -671,13 +784,18 @@ fn copy_metadata(
         })?;
     }
     if config.flags.contains(CopyFlags::PERMISSIONS) {
-        guard(
-            config,
-            copy_permissions(src, dst, xattrs, src_st.mode() as u32),
-        )?;
+        guard(config, copy_permissions(src, dst, xattrs, mode))?;
     }
     if config.flags.contains(CopyFlags::XATTRS) {
         guard(config, copy_xattrs(src, dst, xattrs))?;
+    }
+    // setid belongs only to a destination that carries the source's ownership,
+    // and `fchown` clears it, so it is applied last and only when ownership was
+    // preserved.
+    if config.flags.contains(CopyFlags::OWNER)
+        && config.flags.contains(CopyFlags::PERMISSIONS)
+    {
+        guard(config, copy_setid(dst, xattrs, mode))?;
     }
     Ok(())
 }
@@ -734,6 +852,44 @@ fn mkdir_at(
         Err(Errno::EEXIST) if exist_ok => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Set `mode` on the file `fd` refers to, where `fd` may be an `O_PATH` handle.
+/// `fchmod(2)` rejects those (`fdget` masks `FMODE_PATH`), so this goes through
+/// `fchmodat2(2)`'s empty-path form, which resolves the handle's own path and
+/// never re-resolves a name. `fchmodat2` is a raw syscall because `libc`
+/// exposes no wrapper for it.
+fn fchmod_fd(fd: BorrowedFd<'_>, mode: libc::mode_t) -> Result<()> {
+    retry_on_eintr(|| unsafe {
+        libc::syscall(
+            libc::SYS_fchmodat2,
+            fd.as_raw_fd(),
+            c"".as_ptr(),
+            mode as libc::c_uint,
+            libc::AT_EMPTY_PATH,
+        )
+    })?;
+    Ok(())
+}
+
+/// Treat a chmod rejected because an ACL governs the object's mode as done.
+/// On ZFS `aclmode=restricted` the mode is derived from a non-trivial ACL and
+/// `fchmod` returns `EPERM`; the ACL is then authoritative, so a copy should
+/// proceed rather than fail over a mode it cannot set.
+fn ok_if_acl_governed(r: Result<()>) -> Result<()> {
+    match r {
+        Err(Error::Errno(Errno::EPERM)) => Ok(()),
+        other => other,
+    }
+}
+
+fn unlink_at(dirfd: BorrowedFd<'_>, name: &OsStr) -> Result<()> {
+    name.with_tn_path(|c| {
+        retry_on_eintr(|| unsafe {
+            libc::unlinkat(dirfd.as_raw_fd(), c.as_ptr(), 0)
+        })
+    })??;
+    Ok(())
 }
 
 fn read_link_fd(fd: BorrowedFd<'_>) -> Result<PathBuf> {
