@@ -7,6 +7,10 @@ serializes, and reads it. The Rust test (``test/configparser_compat.rs``) drives
 this over a large corpus and asserts byte-for-byte and behavior parity, so this
 script is the single source of truth for "same behavior as Python".
 
+Usage: ``configparser_oracle.py [--path FILE] [--probe SECTION OPTION]...``,
+where ``--path`` parses ``FILE`` with ``read()`` instead of the document on
+stdin and ``--probe`` adds a lookup to the probe list.
+
 Stdlib only. To pin a specific ``configparser`` (e.g. the reviewed CPython
 checkout), the Rust harness may set ``PYTHONPATH`` and/or pick the interpreter
 via ``TRUENAS_ROS_PYTHON``; this script itself just ``import configparser``.
@@ -66,13 +70,44 @@ def emit_result(out, fn):
     emit(out, format_value(value).encode("utf-8"))
 
 
+def parse_args(argv):
+    """Return ``(path, extra_probes)``.
+
+    ``--path FILE`` reads that file, which ``read()`` opens with universal
+    newlines; without it the document comes from stdin via ``read_string()``.
+    Each ``--probe SECTION OPTION`` adds a probe the parser would not report
+    itself, so lookups in a section the document never defines are compared
+    too.
+    """
+    path = None
+    probes = []
+    args = iter(argv)
+    for arg in args:
+        if arg == "--path":
+            path = next(args)
+        elif arg == "--probe":
+            probes.append((next(args), next(args)))
+        else:
+            sys.exit("unknown argument: %r" % arg)
+    return path, probes
+
+
+def load(parser, path, doc):
+    """Feed `parser` the file at `path`, or `doc` when `path` is None."""
+    if path is None:
+        parser.read_string(doc)
+    else:
+        parser.read(path)
+
+
 def main():
     out = sys.stdout.buffer
+    path, extra_probes = parse_args(sys.argv[1:])
     doc = sys.stdin.buffer.read().decode("utf-8")
 
     raw = configparser.RawConfigParser()
     try:
-        raw.read_string(doc)
+        load(raw, path, doc)
     except Exception:
         emit(out, b"err")
         out.flush()
@@ -85,7 +120,7 @@ def main():
     # A separate interpolating parser backs get()/getint/getfloat/getboolean.
     cp = configparser.ConfigParser()
     try:
-        cp.read_string(doc)
+        load(cp, path, doc)
     except Exception:
         emit(out, b"0")
         out.flush()
@@ -95,6 +130,7 @@ def main():
     for section in cp.sections():
         for option in cp.options(section):
             probes.append((section, option))
+    probes.extend(extra_probes)
 
     emit(out, str(len(probes)).encode("ascii"))
     for section, option in probes:
