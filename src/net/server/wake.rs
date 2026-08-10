@@ -28,6 +28,10 @@ where
         // poke means a shutdown request and/or replies handed back by offloaded
         // workers; deliver those, then re-arm (unless we're shutting down).
         if !self.core.stopping() {
+            // Fire finished fs offloads first, so a continuation that answers
+            // its request via a `Deferred` has that reply drained in this pass.
+            #[cfg(feature = "uring-fs")]
+            self.drain_fs_offloads()?;
             self.drain_injections()?;
             self.drain_handshake_outcomes()?;
             if self.core.engine.shared.graceful.load(Ordering::Acquire)
@@ -36,6 +40,35 @@ where
                 self.begin_drain()?;
             }
             self.core.arm_wake()?;
+        }
+        Ok(())
+    }
+
+    /// Deliver the results of finished fs offload jobs ([`FsConn::offload`] and
+    /// the hybrid directory lister) that workers pushed onto the fs completion
+    /// queue and signalled by poking this wake. Each fires with a fresh
+    /// owner-scoped `FsConn` whose facade cannot `open`, so a continuation for
+    /// a possibly-gone connection cannot mint a new file. Without this drain the
+    /// server would never resolve an offloaded request and would leak the walk's
+    /// `DIR*`; the standalone host drains the same way from its own wake.
+    #[cfg(feature = "uring-fs")]
+    fn drain_fs_offloads(&mut self) -> errno::Result<()> {
+        let completions = match self.fs.as_mut() {
+            Some(fs) => fs.take_pool_completions(),
+            None => return Ok(()),
+        };
+        let (fd_xattr_ok, ftruncate_ok) = (self.fd_xattr_ok, self.ftruncate_ok);
+        for (owner, deliver, any) in completions {
+            let Some(fs) = self.fs.as_mut() else { break };
+            let mut conn = crate::uring_fs::core::FsConn::new(
+                fs,
+                &mut self.core.engine,
+                owner,
+                fd_xattr_ok,
+                ftruncate_ok,
+                false,
+            );
+            deliver(any, &mut conn);
         }
         Ok(())
     }

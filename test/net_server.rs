@@ -5603,6 +5603,103 @@ fn fs_static_file_server_open_read_reply() {
     assert_eq!(second, b"the second file");
 }
 
+/// A directory listing replies through the wake drain. The handler lists on the
+/// ring via `open_dir`/`next_batch`, both delivered by off-loop worker jobs
+/// that poke the wake, and answers with the entry count via its `Deferred`.
+/// The reply only arrives if `on_wake` drains the fs offload pool; without that
+/// drain the completion is stranded, the request never answers, and the client
+/// read times out. The socket read timeout makes that regression a failure
+/// rather than a hang.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn fs_dir_listing_replies_through_the_wake_drain() {
+    use std::rc::Rc;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    use truenas_ros::uring_fs::{Anchor, Personality};
+
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..3 {
+        std::fs::write(dir.path().join(format!("f{i}")), b"x").unwrap();
+    }
+
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+
+    let pc = Arc::clone(&pers);
+    let body = move |mut req: Request<'_, ()>| -> Response {
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close; // built without an fs pool
+        };
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        fs.open_dir(who, &anchor, move |res, fs| {
+            let walk = match res {
+                Ok(w) => Rc::new(w),
+                Err(_) => return deferred.close(),
+            };
+            // Hold the walk alive through the batch delivery: the `keep` clone
+            // rides in the continuation, so the `DIR*` is not dropped mid-flight.
+            let keep = Rc::clone(&walk);
+            fs.next_batch(&walk, move |res, _fs| {
+                let _keep = keep;
+                match res {
+                    Ok(batch) => {
+                        deferred.reply(echo_frame(
+                            batch.names.len().to_string().as_bytes(),
+                        ));
+                    }
+                    Err(_) => deferred.close(),
+                }
+            });
+        });
+        Response::Defer(permit)
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let cfg = ServerConfig {
+        pool_size: 16,
+        fs_files: 8,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    pers.set(server.register_self().expect("register_self"))
+        .unwrap();
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let mut s = connect_tcp(v4)?;
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        send_framed(&mut s, b"list")?;
+        let reply = recv_framed(&mut s); // times out if the drain is missing
+        drop(s);
+        stop.shutdown(); // unconditional: unblock serve_forever even on timeout
+        reply
+    });
+    server.serve_forever().expect("serve_forever dir-listing");
+    let reply = client.join().unwrap().expect("client io");
+    assert_eq!(reply, b"3", "listing counted the three entries and replied");
+}
+
 /// `FsConn::fgetxattr_as_root` reads an xattr under the reactor's ambient
 /// (root) credentials (`sqe.personality = 0`) — the sanctioned privileged-read
 /// path for a `trusted.*`/`security.*` attribute a request's own identity
