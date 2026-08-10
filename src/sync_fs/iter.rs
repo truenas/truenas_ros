@@ -414,7 +414,7 @@ impl FsIter {
     /// Returns `Ok(None)` for entries that are silently pruned.
     fn process(&mut self, dirent: &DirEntry) -> Result<Option<Entry>> {
         let is_dir_hint = dirent.d_type == libc::DT_DIR;
-        let is_lnk = dirent.d_type == libc::DT_LNK;
+        let mut is_lnk = dirent.d_type == libc::DT_LNK;
         // A FIFO/socket/device that `readdir` already identified: open it
         // `O_PATH` so the walk never issues a blocking read-open (a writer-less
         // FIFO would hang forever) and never runs a device's `open` method.
@@ -449,6 +449,21 @@ impl FsIter {
         let (fd, is_mount) =
             match openat2(dfd, name, how(open_flags, ITER_RESOLVE)) {
                 Ok(fd) => (fd, false),
+                // A symlink `readdir` didn't flag (`DT_UNKNOWN`): a readable
+                // open of one fails `ELOOP` under `O_NOFOLLOW`. Grab an
+                // `O_PATH` handle so the walk classifies it as a symlink,
+                // exactly as it would from a `DT_LNK` hint.
+                Err(Errno::ELOOP) if !is_dir_hint && !is_lnk => {
+                    if !self.include_symlinks {
+                        return Ok(None);
+                    }
+                    is_lnk = true;
+                    match openat2(dfd, name, how(OPATH_OFLAGS, ITER_RESOLVE)) {
+                        Ok(fd) => (fd, false),
+                        Err(Errno::ELOOP | Errno::ENOENT) => return Ok(None),
+                        Err(e) => return Err(e.into()),
+                    }
+                }
                 // Symlink swap or delete raced us — prune this entry.
                 Err(Errno::ELOOP | Errno::ENOENT) => return Ok(None),
                 // Crosses a mount boundary.
@@ -474,7 +489,8 @@ impl FsIter {
                     }
                 }
                 // Per-file access denial on a regular file: retry O_RDONLY so
-                // the caller still gets a usable fd; skip if that also fails.
+                // the caller still gets a usable fd; a denial that survives the
+                // retry fails the walk.
                 Err(Errno::EPERM | Errno::EACCES)
                     if !is_dir_hint && !is_lnk =>
                 {
@@ -482,7 +498,8 @@ impl FsIter {
                         OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
                     match openat2(dfd, name, how(flags, ITER_RESOLVE)) {
                         Ok(fd) => (fd, false),
-                        Err(_) => return Ok(None),
+                        Err(Errno::ELOOP | Errno::ENOENT) => return Ok(None),
+                        Err(e) => return Err(e.into()),
                     }
                 }
                 Err(e) => return Err(e.into()),
@@ -897,5 +914,61 @@ impl Drop for Dir {
     fn drop(&mut self) {
         // SAFETY: `self.0` is a live DIR stream; closedir closes its fd.
         unsafe { libc::closedir(self.0.as_ptr()) };
+    }
+}
+
+/// Classification of an entry `readdir` reported as `DT_UNKNOWN` — the case a
+/// filesystem that does not fill `d_type` produces for every entry. Driven from
+/// here because feeding `process` a hand-built [`DirEntry`] needs this module's
+/// internals; no mountable filesystem reaches it unprivileged.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fs_source(p: &Path) -> String {
+        crate::mount::statmount_path(p)
+            .ok()
+            .and_then(|sm| sm.sb_source)
+            .unwrap_or_else(|| "x".to_string())
+    }
+
+    /// Offer `name` to `it` as `readdir` would on such a filesystem.
+    fn process_unknown(it: &mut FsIter, name: &str) -> Result<Option<Entry>> {
+        it.process(&DirEntry {
+            d_type: libc::DT_UNKNOWN,
+            d_ino: 0,
+            name: OsString::from(name),
+        })
+    }
+
+    #[test]
+    fn dt_unknown_symlink_is_yielded_as_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("target"), b"t").unwrap();
+        std::os::unix::fs::symlink("target", dir.path().join("link")).unwrap();
+        std::os::unix::fs::symlink("gone", dir.path().join("dangling"))
+            .unwrap();
+
+        let mut it = FsIterBuilder::new(dir.path(), fs_source(dir.path()))
+            .include_symlinks(true)
+            .build()
+            .unwrap();
+        for (name, target) in [("link", "target"), ("dangling", "gone")] {
+            let entry = process_unknown(&mut it, name)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name} not yielded"));
+            assert!(entry.is_symlink());
+            assert_eq!(entry.read_link().unwrap().as_os_str(), target);
+        }
+
+        // A regular file on the same path still opens readably.
+        let entry = process_unknown(&mut it, "target").unwrap().unwrap();
+        assert!(entry.is_regular());
+
+        // Without `include_symlinks`, links are pruned as a `DT_LNK` hint is.
+        let mut it = FsIterBuilder::new(dir.path(), fs_source(dir.path()))
+            .build()
+            .unwrap();
+        assert!(process_unknown(&mut it, "link").unwrap().is_none());
     }
 }

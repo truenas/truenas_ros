@@ -1144,7 +1144,7 @@ mod fsiter {
     }
 
     #[test]
-    fn unreadable_regular_file_is_skipped() {
+    fn unreadable_regular_file_fails_the_walk() {
         use std::os::unix::fs::PermissionsExt;
         // Root bypasses mode bits, so this only holds unprivileged.
         if unsafe { libc::getuid() } == 0 {
@@ -1156,15 +1156,28 @@ mod fsiter {
         std::fs::write(&bad, b"y").unwrap();
         std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000))
             .unwrap();
-        // "bad" hits the EACCES branch (retry O_RDONLY, still denied → skip).
-        let names: Vec<_> =
-            FsIterBuilder::new(dir.path(), fs_source(dir.path()))
-                .build()
-                .unwrap()
-                .map(|e| e.unwrap().name().to_string_lossy().into_owned())
-                .collect();
-        assert!(names.contains(&"ok".to_string()));
+        // "bad" hits the EACCES branch (retry O_RDONLY, still denied).
+        let mut it = FsIterBuilder::new(dir.path(), fs_source(dir.path()))
+            .build()
+            .unwrap();
+        let mut names = Vec::new();
+        let mut err = None;
+        for res in it.by_ref() {
+            match res {
+                Ok(e) => names.push(e.name().to_string_lossy().into_owned()),
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert!(
+            matches!(err, Some(Error::Errno(Errno::EACCES))),
+            "unexpected outcome: {err:?}"
+        );
         assert!(!names.contains(&"bad".to_string()));
+        // The error is fatal to the walk.
+        assert!(it.next().is_none());
     }
 
     #[test]

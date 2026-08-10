@@ -3,8 +3,9 @@
 //! Driven by [`crate::sync_fs::iter::FsIter`]: the source tree is walked depth-first
 //! within a single filesystem, and each entry is recreated under the
 //! destination — cloning file data (with a `sendfile`/userspace fallback) and
-//! preserving ACLs, xattrs, ownership, and nanosecond timestamps. Directory
-//! timestamps are stamped on ascent (after their children are written).
+//! preserving ACLs, xattrs, ownership, and nanosecond timestamps. Directories
+//! are created owner-only and get their own metadata on ascent, once their
+//! children have been written.
 //!
 //! [`CopyTreeConfig::traverse`] extends the copy across mount boundaries: after
 //! the primary filesystem, each child mount nested under `src` is copied into
@@ -276,15 +277,16 @@ fn copy_one_mount(
     stats: &mut CopyTreeStats,
     counter: &mut u64,
 ) -> Result<()> {
-    let src_root_st = statx(src_root, "", AtFlags::AT_EMPTY_PATH, META_MASK)?;
-    // fsiter never yields the start directory, so its metadata is applied here,
-    // deferred to *after* the walk so children are created while the root is
+    // fsiter never yields the start directory, so the root gets a frame of its
+    // own, popped after the walk — children are then created while the root is
     // still writable and its timestamps are not bumped by those writes.
-    let root_xattrs = list_xattrs(src_root, config)?;
-
-    // (source dir path, destination dir fd, source statx for ascent timestamps)
-    let mut frames: Vec<(PathBuf, OwnedFd, Statx)> =
-        vec![(src_path.to_path_buf(), dst_root, src_root_st)];
+    let mut frames = vec![DirFrame {
+        src_path: src_path.to_path_buf(),
+        src: reopen_dir(src_root)?,
+        src_st: statx(src_root, "", AtFlags::AT_EMPTY_PATH, META_MASK)?,
+        xattrs: list_xattrs(src_root, config)?,
+        dst: dst_root,
+    }];
 
     let mut it = FsIterBuilder::new(src_path, fs_name)
         .include_symlinks(true)
@@ -304,12 +306,11 @@ fn copy_one_mount(
             });
         }
 
-        // Ascend: pop finished directories, stamping their timestamps.
-        while frames.last().unwrap().0.as_path() != entry.parent() {
-            let (_, dfd, st) = frames.pop().unwrap();
-            apply_timestamps(dfd.as_fd(), &st, config)?;
+        // Ascend: pop finished directories, stamping their metadata.
+        while frames.last().unwrap().src_path.as_path() != entry.parent() {
+            finish_dir(frames.pop().unwrap(), config)?;
         }
-        let parent_dst = frames.last().unwrap().1.as_fd();
+        let parent_dst = frames.last().unwrap().dst.as_fd();
         let st = *entry.statx();
 
         match entry.file_type() {
@@ -323,15 +324,15 @@ fn copy_one_mount(
                     it.skip_descent();
                     continue;
                 }
-                let dfd = make_dir(
-                    parent_dst,
-                    entry.name(),
-                    entry.fd(),
-                    &st,
-                    config,
-                )?;
+                let dfd = make_dir(parent_dst, entry.name(), config)?;
                 stats.dirs += 1;
-                frames.push((entry.path(), dfd, st));
+                frames.push(DirFrame {
+                    src_path: entry.path(),
+                    src: reopen_dir(entry.fd())?,
+                    src_st: st,
+                    xattrs: list_xattrs(entry.fd(), config)?,
+                    dst: dfd,
+                });
             }
             EntryType::File => {
                 let n = make_file(
@@ -359,24 +360,50 @@ fn copy_one_mount(
         }
     }
 
-    // Stamp subdirectory timestamps (permissions/owner were applied on
-    // descent), deepest first, down to the root frame.
-    while frames.len() > 1 {
-        let (_, dfd, st) = frames.pop().unwrap();
-        apply_timestamps(dfd.as_fd(), &st, config)?;
+    // Stamp the directories still open, deepest first, ending with the mount
+    // root now that every child exists.
+    while let Some(frame) = frames.pop() {
+        finish_dir(frame, config)?;
     }
-    // Finalise the mount root last, now that every child exists: permissions,
-    // xattrs, and owner, then timestamps.
-    let (_, dst_root, src_root_st) = frames.pop().unwrap();
+    Ok(())
+}
+
+/// One level of the destination-side directory stack. The destination directory
+/// is owner-only (0o700) while it is on the stack; the source's metadata is
+/// applied by [`finish_dir`] when it is popped, so the source fd and xattr names
+/// are held here for that long.
+struct DirFrame {
+    src_path: PathBuf,
+    src: OwnedFd,
+    src_st: Statx,
+    xattrs: Vec<String>,
+    dst: OwnedFd,
+}
+
+/// Apply a finished destination directory's metadata: permissions, xattrs and
+/// owner, then timestamps last (a chmod or a chown would otherwise bump ctime,
+/// and the children already written bumped mtime).
+fn finish_dir(frame: DirFrame, config: &CopyTreeConfig) -> Result<()> {
     copy_metadata(
-        src_root,
-        dst_root.as_fd(),
-        &root_xattrs,
-        &src_root_st,
+        frame.src.as_fd(),
+        frame.dst.as_fd(),
+        &frame.xattrs,
+        &frame.src_st,
         config,
     )?;
-    apply_timestamps(dst_root.as_fd(), &src_root_st, config)?;
-    Ok(())
+    apply_timestamps(frame.dst.as_fd(), &frame.src_st, config)
+}
+
+/// Reopen a directory the walk owns, giving the caller an fd that outlives the
+/// walk's own.
+fn reopen_dir(fd: BorrowedFd<'_>) -> Result<OwnedFd> {
+    Ok(openat2(
+        fd,
+        ".",
+        OpenHow::new()
+            .flags(DIR_OFLAGS)
+            .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
+    )?)
 }
 
 /// Copy each child mount nested under `src` into the matching directory under
@@ -452,26 +479,18 @@ fn traverse_child_mounts(
 fn make_dir(
     parent: BorrowedFd<'_>,
     name: &OsStr,
-    src: BorrowedFd<'_>,
-    src_st: &Statx,
     config: &CopyTreeConfig,
 ) -> Result<OwnedFd> {
-    mkdir_at(
-        parent,
-        name,
-        src_st.mode() as libc::mode_t & 0o7777,
-        config.exist_ok,
-    )?;
-    let dfd = openat2(
+    // Created owner-only (0o700), as the destination root is; the source's
+    // mode is applied by `finish_dir` on ascent, once the contents have landed.
+    mkdir_at(parent, name, 0o700, config.exist_ok)?;
+    Ok(openat2(
         parent,
         name,
         OpenHow::new()
             .flags(OFlag::O_DIRECTORY | OFlag::O_RDONLY | OFlag::O_NOFOLLOW)
             .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
-    )?;
-    let xattrs = list_xattrs(src, config)?;
-    copy_metadata(src, dfd.as_fd(), &xattrs, src_st, config)?;
-    Ok(dfd)
+    )?)
 }
 
 fn make_file(
@@ -497,9 +516,11 @@ fn make_file(
             .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
     )?;
     let xattrs = list_xattrs(src, config)?;
-    copy_metadata(src, dfd.as_fd(), &xattrs, src_st, config)?;
     let n = c_fn(src, dfd.as_fd()).map_err(Error::from)?;
-    // Timestamps last, after the data write (which would otherwise bump mtime).
+    // Metadata after the data: an unprivileged write to a regular file makes the
+    // kernel drop its setuid/setgid bits and `security.capability`, and it would
+    // bump the timestamps.
+    copy_metadata(src, dfd.as_fd(), &xattrs, src_st, config)?;
     apply_timestamps(dfd.as_fd(), src_st, config)?;
     Ok(n)
 }
@@ -556,6 +577,22 @@ fn make_special(
         Err(e) => return Err(e.into()),
     }
 
+    // Ownership before the mode, as in `copy_metadata` — the chown clears the
+    // setuid/setgid bits of a non-directory. Ownership failures always
+    // propagate (matching `copy_metadata`).
+    if config.flags.contains(CopyFlags::OWNER) {
+        name.with_tn_path(|n| {
+            retry_on_eintr(|| unsafe {
+                libc::fchownat(
+                    parent.as_raw_fd(),
+                    n.as_ptr(),
+                    src_st.uid(),
+                    src_st.gid(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            })
+        })??;
+    }
     if config.flags.contains(CopyFlags::PERMISSIONS) {
         let r = name
             .with_tn_path(|n| {
@@ -571,20 +608,6 @@ fn make_special(
             .map(drop)
             .map_err(Error::from);
         guard(config, r)?;
-    }
-    // Ownership failures always propagate (matching `copy_metadata`).
-    if config.flags.contains(CopyFlags::OWNER) {
-        name.with_tn_path(|n| {
-            retry_on_eintr(|| unsafe {
-                libc::fchownat(
-                    parent.as_raw_fd(),
-                    n.as_ptr(),
-                    src_st.uid(),
-                    src_st.gid(),
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            })
-        })??;
     }
     if config.flags.contains(CopyFlags::TIMESTAMPS) {
         let a = src_st.atime();
@@ -638,6 +661,15 @@ fn copy_metadata(
     src_st: &Statx,
     config: &CopyTreeConfig,
 ) -> Result<()> {
+    // Ownership is applied first: chowning a non-directory makes the kernel
+    // clear its setuid/setgid bits and any `security.capability`, so the mode
+    // and the xattrs have to land after it. Ownership failures always propagate
+    // (matching the `truenas_os` C extension).
+    if config.flags.contains(CopyFlags::OWNER) {
+        retry_on_eintr(|| unsafe {
+            libc::fchown(dst.as_raw_fd(), src_st.uid(), src_st.gid())
+        })?;
+    }
     if config.flags.contains(CopyFlags::PERMISSIONS) {
         guard(
             config,
@@ -646,13 +678,6 @@ fn copy_metadata(
     }
     if config.flags.contains(CopyFlags::XATTRS) {
         guard(config, copy_xattrs(src, dst, xattrs))?;
-    }
-    // Ownership failures always propagate (matching the `truenas_os` C
-    // extension).
-    if config.flags.contains(CopyFlags::OWNER) {
-        retry_on_eintr(|| unsafe {
-            libc::fchown(dst.as_raw_fd(), src_st.uid(), src_st.gid())
-        })?;
     }
     Ok(())
 }
