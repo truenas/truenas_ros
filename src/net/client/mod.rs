@@ -350,9 +350,12 @@ where
             // its cancel of the linked op does the work; only count this one.
             Some(Op::LinkTimeout) => {}
             // A standalone TIMEOUT armed by `next_event_timeout`, which reaps its
-            // own deadline inline and cancel-reaps a pending one before returning
-            // — one reaching dispatch is a harmless stray (already counted off).
-            Some(Op::Deadline) => {}
+            // own deadline inline and cancel-reaps a pending one before
+            // returning — one reaching dispatch is the stray a call that unwound
+            // left behind (see `deadline_inflight`). It is already counted off;
+            // consuming it here retires the flag too, since the next call must
+            // not wait for a completion that has been reaped.
+            Some(Op::Deadline) => self.deadline_inflight = false,
             // The cancel control op, and any unrecognized tag.
             Some(Op::Cancel) | None => {}
             // Server-only tags: never issued here, so a completion carrying one

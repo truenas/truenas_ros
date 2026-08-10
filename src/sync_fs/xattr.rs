@@ -32,6 +32,11 @@ tn_bitflags! {
 pub fn fgetxattr<Fd: AsFd>(fd: Fd, name: &str) -> errno::Result<Vec<u8>> {
     let name = cstr(name)?;
     let raw = fd.as_fd().as_raw_fd();
+    // A value that grows between the size probe and the read yields ERANGE;
+    // retry a bounded number of times, over-allocating on retry so a steadily
+    // growing value converges rather than spinning.
+    const SIZE_RETRIES: u32 = 4;
+    let mut tries = 0u32;
     loop {
         // Probe the current size.
         let size = retry_on_eintr(|| unsafe {
@@ -40,8 +45,14 @@ pub fn fgetxattr<Fd: AsFd>(fd: Fd, name: &str) -> errno::Result<Vec<u8>> {
         if size > XATTR_SIZE_MAX {
             return Err(Errno::E2BIG);
         }
-        // Allocate at least one byte so the pointer is valid.
-        let mut buf = vec![0u8; size.max(1)];
+        // Allocate at least one byte so the pointer is valid; on a retry add
+        // half again so the read can absorb further growth.
+        let cap = if tries == 0 {
+            size.max(1)
+        } else {
+            (size + size / 2).clamp(1, XATTR_SIZE_MAX)
+        };
+        let mut buf = vec![0u8; cap];
         let read = retry_on_eintr(|| unsafe {
             libc::fgetxattr(
                 raw,
@@ -55,8 +66,12 @@ pub fn fgetxattr<Fd: AsFd>(fd: Fd, name: &str) -> errno::Result<Vec<u8>> {
                 buf.truncate(n as usize);
                 return Ok(buf);
             }
-            // The value grew between the probe and the read; retry.
-            Err(Errno::ERANGE) => continue,
+            Err(Errno::ERANGE) => {
+                tries += 1;
+                if tries >= SIZE_RETRIES {
+                    return Err(Errno::ERANGE);
+                }
+            }
             Err(e) => return Err(e),
         }
     }

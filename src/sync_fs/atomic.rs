@@ -46,9 +46,11 @@ impl Default for AtomicWriteOptions {
 /// filesystem), written, `fsync`ed, then moved into place with `renameat2` —
 /// either a plain rename (new file), an atomic `RENAME_EXCHANGE` (replacing an
 /// existing file so readers never see a partial write), or `RENAME_NOREPLACE`
-/// (with [`AtomicWriteOptions::noclobber`]). The target is only replaced if
-/// `write_fn` returns `Ok`; on error the temporary file is removed and `target`
-/// is left untouched. Every path component is opened with `RESOLVE_NO_SYMLINKS`.
+/// (with [`AtomicWriteOptions::noclobber`]). The parent directory is `fsync`ed
+/// last, so the entry the rename publishes survives a crash. The target is only
+/// replaced if `write_fn` returns `Ok`; on error the temporary file is removed
+/// and `target` is left untouched. Every path component is opened with
+/// `RESOLVE_NO_SYMLINKS`.
 ///
 /// `write_fn` receives the temporary [`File`] directly, so it can use the full
 /// [`std::io`] API (or anything built on it).
@@ -118,22 +120,61 @@ where
         return Err(Errno::try_from(e).unwrap_or(Errno::EIO).into());
     }
 
-    // Move into place with the semantics chosen above.
-    let flags = if opts.noclobber {
-        RenameFlags::RENAME_NOREPLACE
-    } else if existing.is_some() {
-        RenameFlags::RENAME_EXCHANGE
-    } else {
-        RenameFlags::empty()
+    // Move into place.
+    if let Err(e) =
+        rename_into_place(dir, tmp_name.as_os_str(), name, opts.noclobber)
+    {
+        let _ = unlinkat(dir, &tmp_name);
+        return Err(e);
+    }
+    // The new directory entry (and the removal of the replaced one) is only
+    // durable once the directory itself is synced.
+    fsync_dir(dir)?;
+    Ok(())
+}
+
+/// Move `tmp_name` onto `name` within `dir`, choosing the `renameat2` mode from
+/// the destination's state as it stands immediately before the rename.
+///
+/// `RENAME_EXCHANGE` needs an existing destination (`ENOENT` otherwise) and
+/// displaces a directory found there rather than refusing it, so it is used
+/// only for a non-directory destination; a plain rename covers a missing
+/// destination and fails `EISDIR` on a directory. The probe races other
+/// writers, so an `ENOENT` from the exchange falls back to the plain rename —
+/// the destination it would have replaced is gone either way.
+fn rename_into_place(
+    dir: BorrowedFd<'_>,
+    tmp_name: &OsStr,
+    name: &OsStr,
+    noclobber: bool,
+) -> Result<()> {
+    if noclobber {
+        renameat2(dir, tmp_name, dir, name, RenameFlags::RENAME_NOREPLACE)?;
+        return Ok(());
+    }
+    let replacing = match statx(
+        dir,
+        name,
+        AtFlags::AT_SYMLINK_NOFOLLOW,
+        StatxMask::BASIC_STATS,
+    ) {
+        Ok(st) => !st.is_dir(),
+        Err(Errno::ENOENT) => false,
+        Err(e) => return Err(e.into()),
     };
-    if let Err(e) = renameat2(dir, tmp_name.as_os_str(), dir, name, flags) {
-        let _ = unlinkat(dir, &tmp_name);
-        return Err(e.into());
+    if replacing {
+        match renameat2(dir, tmp_name, dir, name, RenameFlags::RENAME_EXCHANGE)
+        {
+            // The old target now sits at the temp name; remove it.
+            Ok(()) => {
+                let _ = unlinkat(dir, tmp_name);
+                return Ok(());
+            }
+            Err(Errno::ENOENT) => {}
+            Err(e) => return Err(e.into()),
+        }
     }
-    // After EXCHANGE the old target now sits at the temp name; remove it.
-    if existing.is_some() && !opts.noclobber {
-        let _ = unlinkat(dir, &tmp_name);
-    }
+    renameat2(dir, tmp_name, dir, name, RenameFlags::empty())?;
     Ok(())
 }
 
@@ -209,6 +250,12 @@ fn set_owner_and_mode(
     Ok(())
 }
 
+/// `fsync` a directory fd, committing the entries created and removed in it.
+fn fsync_dir(dir: BorrowedFd<'_>) -> Result<()> {
+    retry_on_eintr(|| unsafe { libc::fsync(dir.as_raw_fd()) })?;
+    Ok(())
+}
+
 fn unlinkat(dir: BorrowedFd<'_>, name: &OsStr) -> Result<()> {
     name.with_tn_path(|c| {
         retry_on_eintr(|| unsafe {
@@ -216,4 +263,23 @@ fn unlinkat(dir: BorrowedFd<'_>, name: &OsStr) -> Result<()> {
         })
     })??;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    #[test]
+    fn fsync_dir_reports_a_failed_sync() {
+        // A pipe has nothing to commit, so fsync rejects it with EINVAL.
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let _write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        assert!(matches!(
+            fsync_dir(read_end.as_fd()),
+            Err(Error::Errno(Errno::EINVAL))
+        ));
+    }
 }

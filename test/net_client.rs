@@ -339,6 +339,54 @@ fn tcp_pipelined() {
 }
 
 #[test]
+fn tcp_empty_pdu_rejected() {
+    // An empty request PDU is refused up front: a zero-length IORING_OP_SEND
+    // completes `res == 0`, which the core reads as a fatal send failure, so a
+    // degenerate input would otherwise tear down a healthy connection, which
+    // stays usable here.
+    with_server(echo, |v4| {
+        let mut client = Client::new(ClientConfig::default(), client_framer())
+            .map_err(to_io)?;
+        let conn =
+            client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
+
+        for empty in [Vec::new(), Vec::with_capacity(64)] {
+            let e = client
+                .send(conn, empty)
+                .expect_err("an empty PDU is not a request");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e:?}");
+        }
+        let e = client
+            .request(conn, Vec::new())
+            .expect_err("request rejects it through send");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e:?}");
+        assert!(client.is_open(conn), "the connection is untouched");
+
+        // A real request on the same connection still round-trips: the rejected
+        // PDUs left no queued bytes and no request awaiting a reply.
+        let id = client.send(conn, frame(b"after"))?;
+        match client.next_event()? {
+            Some(Event::Reply {
+                conn: c,
+                id: rid,
+                body,
+                ..
+            }) => {
+                assert_eq!((c, rid), (conn, id));
+                assert_eq!(&body[..], b"after", "echoed body");
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "expected Reply, got {other:?}"
+                )))
+            }
+        }
+        client.close_now(conn);
+        Ok(())
+    });
+}
+
+#[test]
 fn tcp_multi_conn_fanout() {
     // Open N connections (non-blocking), drive them all up on one ring, send a
     // distinct request on each, and confirm every reply maps back to the right
@@ -1179,6 +1227,8 @@ fn ktls_rejected_handshake() {
     {
         Ok(c) => c,
         Err(e) if ktls_connect_unsupported(&e) => {
+            // Unblock the helper's accept() so the join below returns.
+            let _ = TcpStream::connect(v4);
             server.join().ok();
             return;
         }
@@ -1239,6 +1289,8 @@ fn ktls_handshake_timeout() {
     {
         Ok(c) => c,
         Err(e) if ktls_connect_unsupported(&e) => {
+            // Unblock the helper's accept() so the join below returns.
+            let _ = TcpStream::connect(v4);
             server.join().ok();
             return;
         }

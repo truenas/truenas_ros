@@ -770,6 +770,62 @@ mod io {
     }
 
     #[test]
+    fn atomic_write_follows_a_target_that_changes_while_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config");
+
+        // A target unlinked while write_fn runs is created afresh.
+        atomic_replace(&target, b"v1", AtomicWriteOptions::default()).unwrap();
+        atomic_write(&target, AtomicWriteOptions::default(), |f| {
+            std::fs::remove_file(&target)?;
+            f.write_all(b"v2")
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"v2");
+
+        // A target that appears while write_fn runs is replaced.
+        std::fs::remove_file(&target).unwrap();
+        atomic_write(&target, AtomicWriteOptions::default(), |f| {
+            std::fs::write(&target, b"other")?;
+            f.write_all(b"v3")
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"v3");
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "config")
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+    }
+
+    #[test]
+    fn atomic_write_refuses_a_directory_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config");
+        atomic_replace(&target, b"v1", AtomicWriteOptions::default()).unwrap();
+
+        let err = atomic_write(&target, AtomicWriteOptions::default(), |f| {
+            std::fs::remove_file(&target)?;
+            std::fs::create_dir(&target)?;
+            std::fs::write(target.join("kept"), b"x")?;
+            f.write_all(b"v2")
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::Errno(Errno::EISDIR)), "{err:?}");
+
+        // The directory stays where it is, with nothing left beside it.
+        assert_eq!(std::fs::read(target.join("kept")).unwrap(), b"x");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "config")
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+    }
+
+    #[test]
     fn atomic_write_closure_and_noclobber() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("f");
