@@ -18,6 +18,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [dependencies]
 libc = { version = "0.2.155", features = ["extra_traits"] }
 bitflags = "2.6"
+# HTTP/1.1 request-head tokenizer for the `http` codec: sans-io, zero-dep,
+# no runtime opinions (the same parser hyper uses internally). The rest of
+# the codec — framing, keep-alive, serialization, hardening — is ours.
+httparse = { version = "1.10", optional = true }
 
 # loom (a concurrency permutation checker) backs the SQ/CQ ordering test in
 # src/uring/ring.rs. Pulled ONLY under `--cfg loom`, so normal builds keep the
@@ -65,6 +69,11 @@ uring = []
 net-core = ["uring"]
 net-server = ["net-core"]
 net-client = ["net-core"]
+# HTTP/1.1 codec over the `net::server` protocol seam (`src/http`): a framer
+# + request/response vocabulary, not a server — the reactor stays in charge.
+# Head tokenizing is `httparse`; framing, 100-continue, keep-alive,
+# serialization, and smuggling hardening are implemented here.
+http = ["net-server", "dep:httparse"]
 # The io_uring filesystem reactor: files opened into a fixed-descriptor
 # pool, every op stamped with a registered personality (kernel-enforced
 # per-op identity), anchored path resolution. Off by default and absent from
@@ -89,6 +98,7 @@ full = [
     "configfile",
     "net-server",
     "net-client",
+    "http",
 ]
 
 [dev-dependencies]
@@ -175,3 +185,9 @@ required-features = ["net-server"]
 [[example]]
 name = "tcp_client"
 required-features = ["net-server", "net-client"]
+
+# Consumer-facing example: the `http` codec on the reactor — a minimal
+# HTTP/1.1 endpoint exercising keep-alive, bodies, and 100-continue.
+[[example]]
+name = "http_hello"
+required-features = ["http"]

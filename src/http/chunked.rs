@@ -1,0 +1,414 @@
+//! `Transfer-Encoding: chunked` — an incremental, resumable scanner over the
+//! wire form, plus the one-shot decoder the glue runs once a body is fully
+//! framed. Everything is a pure function of `(bytes, state)` — no I/O, no
+//! config — and the scanner and decoder share one state machine ([`run`]),
+//! so the framer's progress oracle and the glue's decoder can never disagree
+//! about where a chunked message ends.
+//!
+//! Strictness (RFC 9112 §7.1): hex chunk sizes with checked arithmetic
+//! (overflow is a 400, not a wraparound), CRLF line endings only, chunk
+//! extensions parsed and ignored (a recipient MUST ignore unrecognized
+//! extensions), trailer field names token-validated. Every line is capped
+//! ([`CHUNK_LINE_MAX`], [`TRAILER_LINE_MAX`]) so a peer can neither wedge
+//! the scanner short of a terminator nor drip an unbounded "line", and the
+//! whole trailer section is capped ([`TRAILER_MAX`] → 431, the oversized-
+//! header-fields answer).
+
+use super::head::HeaderView;
+
+/// Chunk-size line cap (hex digits + optional extensions, CRLF excluded).
+/// Real chunk-size lines are under 20 bytes; the headroom is for extensions,
+/// which are ignored but must still terminate.
+pub(crate) const CHUNK_LINE_MAX: usize = 256;
+
+/// Single trailer field-line cap. Checksum trailers (the real-world use:
+/// `x-amz-checksum-*`) are well under 100 bytes.
+pub(crate) const TRAILER_LINE_MAX: usize = 1024;
+
+/// Whole trailer section cap, terminator included.
+pub(crate) const TRAILER_MAX: usize = 8 * 1024;
+
+/// Where the scanner stands inside the chunk stream.
+#[derive(Debug, Clone, Copy, Default)]
+enum State {
+    /// At the start of a chunk-size line.
+    #[default]
+    Size,
+    /// Inside a chunk's payload, `remaining` bytes still to consume.
+    Data {
+        /// Payload bytes of the current chunk not yet consumed.
+        remaining: usize,
+    },
+    /// Expecting the CRLF that closes a chunk's payload.
+    DataCrlf,
+    /// In the trailer section (after the zero-size chunk), consuming field
+    /// lines until the empty line.
+    Trailer,
+    /// The terminator has been consumed; the message's extent is final.
+    Done,
+}
+
+/// Resumable scan state. Offsets index the body region (the bytes after the
+/// head) from its start; the region only ever grows while a scan is live, so
+/// they stay valid across calls.
+#[derive(Debug, Default)]
+pub(crate) struct ChunkScan {
+    /// Bytes fully scanned — the resume point, and the message extent once
+    /// [`State::Done`] is reached.
+    pub consumed: usize,
+    /// Decoded payload bytes seen so far — the entity size, so far. The
+    /// framer reads this to enforce its decoded-body cap mid-stream.
+    pub decoded: usize,
+    /// Trailer-section bytes seen so far (for the [`TRAILER_MAX`] cap).
+    trailer_bytes: usize,
+    state: State,
+}
+
+/// A CRLF search bounded by a line cap.
+enum Find {
+    /// Line of this length, CRLF next.
+    At(usize),
+    /// No CRLF yet, and the cap not yet exceeded.
+    NeedMore,
+    /// Enough bytes have arrived that a compliant CRLF can no longer appear.
+    TooLong,
+}
+
+fn find_crlf(rest: &[u8], max_line: usize) -> Find {
+    let window = rest.len().min(max_line + 2);
+    if let Some(i) = rest[..window].windows(2).position(|w| w == b"\r\n") {
+        return Find::At(i);
+    }
+    if rest.len() >= max_line + 2 {
+        Find::TooLong
+    } else {
+        Find::NeedMore
+    }
+}
+
+/// Parse a chunk-size line: `1*HEXDIG`, then nothing or an (ignored)
+/// extension introduced by `;` after optional whitespace. Checked
+/// arithmetic — a size that overflows `usize` is malformed, full stop.
+fn parse_size_line(line: &[u8]) -> Option<usize> {
+    let mut digits = 0usize;
+    let mut n = 0usize;
+    for &b in line {
+        let d = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => break,
+        };
+        digits += 1;
+        n = n.checked_mul(16)?.checked_add(usize::from(d))?;
+    }
+    if digits == 0 {
+        return None;
+    }
+    let rest = trim_ows_start(&line[digits..]);
+    if rest.is_empty() || rest[0] == b';' {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+fn trim_ows_start(mut v: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = v {
+        v = rest;
+    }
+    v
+}
+
+/// RFC 9110 `token` bytes — the same set the response serializer enforces on
+/// handler-emitted header names, here applied to trailer names off the wire.
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Split a trailer field line into `(name, value)`. `None` when the name is
+/// empty, not a token, or the colon is missing — the line is malformed.
+fn split_trailer(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    let colon = line.iter().position(|&b| b == b':')?;
+    if colon == 0 || !line[..colon].iter().all(|&b| is_token_byte(b)) {
+        return None;
+    }
+    Some((&line[..colon], line[colon + 1..].trim_ascii()))
+}
+
+/// The one state machine under both [`scan`] and [`decode`]: advance over
+/// `body` from where `s` left off, reporting payload spans and validated
+/// trailer lines to the sinks. `Ok(Some(extent))` — the message occupies
+/// exactly the first `extent` bytes of `body`; `Ok(None)` — need more bytes;
+/// `Err(status)` — malformed (400) or oversized trailers (431).
+fn run<'b>(
+    body: &'b [u8],
+    s: &mut ChunkScan,
+    on_payload: &mut impl FnMut(&'b [u8]),
+    on_trailer: &mut impl FnMut(&'b [u8]),
+) -> Result<Option<usize>, u16> {
+    loop {
+        if matches!(s.state, State::Done) {
+            return Ok(Some(s.consumed));
+        }
+        let Some(rest) = body.get(s.consumed..) else {
+            // The buffer shrank beneath the resume point — a caller contract
+            // break (the accumulate buffer only grows), not wire data.
+            return Err(400);
+        };
+        match s.state {
+            State::Done => unreachable!("handled above"),
+            State::Size => match find_crlf(rest, CHUNK_LINE_MAX) {
+                Find::NeedMore => return Ok(None),
+                Find::TooLong => return Err(400),
+                Find::At(i) => {
+                    let size = parse_size_line(&rest[..i]).ok_or(400u16)?;
+                    s.consumed += i + 2;
+                    s.state = if size == 0 {
+                        State::Trailer
+                    } else {
+                        State::Data { remaining: size }
+                    };
+                }
+            },
+            State::Data { remaining } => {
+                let take = remaining.min(rest.len());
+                if take > 0 {
+                    on_payload(&rest[..take]);
+                    s.consumed += take;
+                    s.decoded += take;
+                }
+                if take == remaining {
+                    s.state = State::DataCrlf;
+                } else {
+                    s.state = State::Data {
+                        remaining: remaining - take,
+                    };
+                    return Ok(None);
+                }
+            }
+            State::DataCrlf => {
+                if rest.len() < 2 {
+                    return Ok(None);
+                }
+                if &rest[..2] != b"\r\n" {
+                    return Err(400);
+                }
+                s.consumed += 2;
+                s.state = State::Size;
+            }
+            State::Trailer => match find_crlf(rest, TRAILER_LINE_MAX) {
+                Find::NeedMore => return Ok(None),
+                Find::TooLong => return Err(431),
+                Find::At(i) => {
+                    s.trailer_bytes += i + 2;
+                    if s.trailer_bytes > TRAILER_MAX {
+                        return Err(431);
+                    }
+                    let line = &rest[..i];
+                    s.consumed += i + 2;
+                    if line.is_empty() {
+                        s.state = State::Done;
+                    } else if split_trailer(line).is_some() {
+                        on_trailer(line);
+                    } else {
+                        return Err(400);
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// Advance the scan over `body` (the byte region after the head), resuming
+/// from where the previous call stopped. See [`run`] for the verdicts.
+pub(crate) fn scan(
+    body: &[u8],
+    s: &mut ChunkScan,
+) -> Result<Option<usize>, u16> {
+    run(body, s, &mut |_| {}, &mut |_| {})
+}
+
+/// One-shot decode of a fully framed chunked message: the de-chunked entity
+/// plus the parsed trailer fields. The framer's scan already accepted these
+/// exact bytes as a complete message, so any failure here is a codec bug —
+/// callers answer it as one (500), never as a client error.
+pub(crate) fn decode(
+    wire: &[u8],
+) -> Result<(Vec<u8>, Vec<HeaderView<'_>>), ()> {
+    let mut s = ChunkScan::default();
+    let mut entity = Vec::with_capacity(wire.len());
+    let mut lines: Vec<&[u8]> = Vec::new();
+    match run(
+        wire,
+        &mut s,
+        &mut |p| entity.extend_from_slice(p),
+        &mut |l| lines.push(l),
+    ) {
+        Ok(Some(extent)) if extent == wire.len() => {}
+        _ => return Err(()),
+    }
+    let mut trailers = Vec::with_capacity(lines.len());
+    for line in lines {
+        let (name, value) = split_trailer(line).ok_or(())?;
+        let name = std::str::from_utf8(name).map_err(|_| ())?;
+        trailers.push(HeaderView { name, value });
+    }
+    Ok((entity, trailers))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default boto3-over-TLS PutObject body, byte-for-byte as captured
+    /// on the dev box (boto3 1.37.9): one HTTP chunk wrapping the whole
+    /// aws-chunked entity, whose checksum trailer is *inside* the entity;
+    /// the HTTP layer terminates bare.
+    fn botocore_wire() -> Vec<u8> {
+        let mut wire = b"8e\r\n64\r\n".to_vec();
+        wire.extend_from_slice(&[b'A'; 100]);
+        wire.extend_from_slice(
+            b"\r\n0\r\nx-amz-checksum-crc32:lZe8jQ==\r\n\r\n\r\n0\r\n\r\n",
+        );
+        assert_eq!(wire.len(), 153);
+        wire
+    }
+
+    fn botocore_entity() -> Vec<u8> {
+        let mut entity = b"64\r\n".to_vec();
+        entity.extend_from_slice(&[b'A'; 100]);
+        entity.extend_from_slice(
+            b"\r\n0\r\nx-amz-checksum-crc32:lZe8jQ==\r\n\r\n",
+        );
+        assert_eq!(entity.len(), 0x8e);
+        entity
+    }
+
+    #[test]
+    fn botocore_golden() {
+        let wire = botocore_wire();
+        let mut s = ChunkScan::default();
+        assert_eq!(scan(&wire, &mut s), Ok(Some(153)));
+        assert_eq!(s.decoded, 0x8e);
+        let (entity, trailers) = decode(&wire).expect("decodes");
+        // The HTTP band de-chunks its own layer only: the aws-chunked
+        // entity passes through untouched, and there are no HTTP trailers.
+        assert_eq!(entity, botocore_entity());
+        assert!(trailers.is_empty());
+    }
+
+    #[test]
+    fn resumes_at_every_split_point() {
+        // Sans-io parsers fail on resumption, not on well-formed input:
+        // drip the golden body one byte at a time through a single
+        // persistent scan and assert the verdicts and extent.
+        let wire = botocore_wire();
+        let mut s = ChunkScan::default();
+        for cut in 0..wire.len() {
+            assert_eq!(scan(&wire[..cut], &mut s), Ok(None), "cut {cut}");
+            assert!(s.consumed <= cut);
+        }
+        assert_eq!(scan(&wire, &mut s), Ok(Some(wire.len())));
+        assert_eq!(s.decoded, 0x8e);
+    }
+
+    #[test]
+    fn multi_chunk_and_empty_entity() {
+        let (entity, trailers) =
+            decode(b"3\r\nfoo\r\n4\r\nbars\r\n0\r\n\r\n").expect("decodes");
+        assert_eq!(entity, b"foobars");
+        assert!(trailers.is_empty());
+        let (entity, trailers) = decode(b"0\r\n\r\n").expect("decodes");
+        assert!(entity.is_empty());
+        assert!(trailers.is_empty());
+    }
+
+    #[test]
+    fn trailers_parsed_and_trimmed() {
+        let (entity, trailers) =
+            decode(b"0\r\nx-amz-checksum-crc32: abc==\r\nx-two:v\r\n\r\n")
+                .expect("decodes");
+        assert!(entity.is_empty());
+        assert_eq!(trailers.len(), 2);
+        assert_eq!(trailers[0].name, "x-amz-checksum-crc32");
+        assert_eq!(trailers[0].value, b"abc==");
+        assert_eq!(trailers[1].name, "x-two");
+        assert_eq!(trailers[1].value, b"v");
+    }
+
+    #[test]
+    fn extensions_ignored() {
+        let (entity, _) =
+            decode(b"5;name=val\r\nhello\r\n0\r\n\r\n").expect("decodes");
+        assert_eq!(entity, b"hello");
+        let (entity, _) =
+            decode(b"5 ;x\r\nhello\r\n0\r\n\r\n").expect("decodes");
+        assert_eq!(entity, b"hello");
+    }
+
+    fn scan_err(wire: &[u8]) -> u16 {
+        scan(wire, &mut ChunkScan::default())
+            .expect_err("expected a scan error")
+    }
+
+    #[test]
+    fn malformed_is_400() {
+        // Non-hex size; garbage after digits; bare-LF line; missing CRLF
+        // after payload; size overflow (17 hex digits).
+        assert_eq!(scan_err(b"zz\r\n"), 400);
+        assert_eq!(scan_err(b"5x\r\nhello\r\n0\r\n\r\n"), 400);
+        assert_eq!(scan_err(b"5\nhello\r\n0\r\n\r\n"), 400);
+        assert_eq!(scan_err(b"3\r\nfooXX0\r\n\r\n"), 400);
+        assert_eq!(scan_err(b"FFFFFFFFFFFFFFFFF\r\n"), 400);
+        // Trailer lines: no colon, empty name, non-token name.
+        assert_eq!(scan_err(b"0\r\nbadline\r\n\r\n"), 400);
+        assert_eq!(scan_err(b"0\r\n:v\r\n\r\n"), 400);
+        assert_eq!(scan_err(b"0\r\nbad name:v\r\n\r\n"), 400);
+    }
+
+    #[test]
+    fn line_caps() {
+        // A chunk-size "line" that never terminates dies at the cap...
+        let mut junk = b"1;".to_vec();
+        junk.extend_from_slice(&[b'a'; CHUNK_LINE_MAX + 2]);
+        assert_eq!(scan_err(&junk), 400);
+        // ...an oversized single trailer line answers 431...
+        let mut t = b"0\r\nx: ".to_vec();
+        t.extend_from_slice(&[b'v'; TRAILER_LINE_MAX + 2]);
+        assert_eq!(scan_err(&t), 431);
+        // ...and so does a trailer section over the section cap.
+        let mut t = b"0\r\n".to_vec();
+        let line = [b"x: ".as_slice(), &[b'v'; 96], b"\r\n"].concat();
+        while t.len() <= TRAILER_MAX + line.len() {
+            t.extend_from_slice(&line);
+        }
+        t.extend_from_slice(b"\r\n");
+        assert_eq!(scan_err(&t), 431);
+    }
+
+    #[test]
+    fn decode_rejects_trailing_garbage() {
+        // decode requires the message to occupy the wire exactly — the
+        // framer only ever hands it a complete extent.
+        assert!(decode(b"0\r\n\r\nEXTRA").is_err());
+        assert!(decode(b"0\r\n").is_err());
+    }
+}

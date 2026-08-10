@@ -75,3 +75,6 @@ pub mod uring_fs;
 
 #[cfg(feature = "net-core")]
 pub mod net;
+
+#[cfg(feature = "http")]
+pub mod http;
