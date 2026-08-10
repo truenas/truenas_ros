@@ -5909,6 +5909,13 @@ fn fs_file_carries_personality_and_as_root() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
+    // Both reads below go through the reactor's fd-based xattr ops,
+    // which need Linux >= 6.13. Without them every read is
+    // `EOPNOTSUPP` and the expected values never appear, so skip
+    // rather than fail on an older kernel — the QEMU job has it.
+    if !server.supports_fd_xattr() {
+        return;
+    }
     pers.set(server.register_self().expect("register_self"))
         .unwrap();
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
@@ -6637,6 +6644,13 @@ fn fs_as_root_reads_trusted_xattr_across_privilege() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("bind with fs pool: {e}"),
     };
+    // Both assertions below read an xattr through the reactor, which needs
+    // fixed-file xattr support (Linux >= 6.13). Without it every read returns
+    // `EOPNOTSUPP` and the expected values never appear, so skip rather than
+    // fail on an older kernel — the QEMU job runs a kernel that has it.
+    if !server.supports_fd_xattr() {
+        return;
+    }
     let _root = server.register_self().expect("register_self");
     let broker = match CredBroker::spawn(&[&server]) {
         Ok(b) => b,

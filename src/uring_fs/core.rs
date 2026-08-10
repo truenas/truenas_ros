@@ -20,7 +20,8 @@
 
 use super::query_dir::SharedPool;
 use super::{
-    statx_at_flags, Anchor, File, FsOutcome, Leaf, Personality, ReplyTo,
+    statx_at_flags, Anchor, File, FsOutcome, Leaf, Personality,
+    PrivilegedXattrs, ReplyTo, RwFlags,
 };
 use crate::errno::{retry_on_eintr, Errno};
 use crate::sync_fs::openat2::RawOpenHow;
@@ -228,6 +229,9 @@ pub(crate) struct FsCore {
     /// Reactor-side continuations for in-flight offloads, keyed by token.
     offload_reg: HashMap<u64, OffloadEntry>,
     next_offload: u64,
+    /// Attribute names whose `FSETXATTR` runs under ambient credentials rather
+    /// than the request identity. Empty by default — see [`PrivilegedXattrs`].
+    priv_xattrs: PrivilegedXattrs,
 }
 
 impl FsCore {
@@ -244,7 +248,15 @@ impl FsCore {
             completions: Arc::new(Mutex::new(VecDeque::new())),
             offload_reg: HashMap::new(),
             next_offload: 0,
+            priv_xattrs: PrivilegedXattrs::default(),
         }
+    }
+
+    /// Install the ambient-credential xattr policy. Setup-time only: the hosts
+    /// expose it through a `&mut self` setter, and their run loops also take
+    /// `&mut self`, so it cannot change while operations are in flight.
+    pub(crate) fn set_privileged_xattrs(&mut self, policy: PrivilegedXattrs) {
+        self.priv_xattrs = policy;
     }
 
     /// Set the offload pool's warm floor and growth ceiling. Replaces the
@@ -367,6 +379,13 @@ impl FsCore {
     }
 
     /// Stage a `READV`/`WRITEV` (per `tag`) against an open file.
+    ///
+    /// `rw_flags` is the `RWF_*` set — the same field `preadv2`/`pwritev2`
+    /// take, which these opcodes read directly, so the flagged form is not a
+    /// separate op. `0` is the plain `preadv`/`pwritev` behaviour. The kernel
+    /// validates the set at prep and fails the whole operation with
+    /// `EOPNOTSUPP` for anything this file's filesystem does not implement, so
+    /// an unsupported flag is never silently dropped.
     #[allow(clippy::too_many_arguments)] // an inject unpacked, not an API
     pub(crate) fn submit_rw(
         &mut self,
@@ -376,6 +395,7 @@ impl FsCore {
         file: Arc<OwnedFd>,
         mut bufs: Vec<Vec<u8>>,
         off: u64,
+        rw_flags: u32,
         waiter: FsWaiter,
     ) {
         let Some(op_slot) = self.op_free.pop() else {
@@ -417,6 +437,8 @@ impl FsCore {
             sqe.addr = iov_ptr;
             sqe.len = iov_len;
             sqe.off_addr2 = off;
+            // The `preadv2`/`pwritev2` flag word. Zero for the plain forms.
+            sqe.op_flags = rw_flags;
             sqe.personality = pers;
         });
         if let Err(err) = staged {
@@ -481,8 +503,16 @@ impl FsCore {
     ///
     /// Fail-closed on `pers == 0`: an fd-op under the ring owner's ambient
     /// (root) credentials is a privilege this surface must never grant
-    /// implicitly. The one sanctioned ambient-root path is
-    /// [`FsCore::submit_fgetxattr_as_root`].
+    /// implicitly. The sanctioned ambient-root paths are
+    /// [`FsCore::submit_fgetxattr_as_root`] and, for writes, the
+    /// [`PrivilegedXattrs`] allowlist consulted below.
+    ///
+    /// **The allowlist is the only place a write is promoted to ambient
+    /// credentials, and the promotion is keyed on the attribute name alone.**
+    /// It lives here rather than at the call sites so no public entry point
+    /// can name a personality of 0 or pick its own privilege: callers pass the
+    /// request identity, and an `FSETXATTR` of an allowlisted name — and
+    /// nothing else — is rewritten to `0`.
     #[allow(clippy::too_many_arguments)] // an inject unpacked, not an API
     pub(crate) fn submit_fd_meta(
         &mut self,
@@ -501,6 +531,14 @@ impl FsCore {
             fail(waiter, Errno::EINVAL, vec![value]);
             return;
         }
+        // An allowlisted attribute is metadata the *server* owns, which the
+        // request identity has no privilege to write (the `trusted.` namespace
+        // is CAP_SYS_ADMIN-gated). Everything else keeps `pers`, including
+        // every non-xattr fd-op and every unlisted name.
+        let pers = match (tag, name.as_deref()) {
+            (TAG_FSETXATTR, Some(n)) if self.priv_xattrs.permits(n) => 0,
+            _ => pers,
+        };
         self.stage_fd_meta(
             eng, tag, pers, file, name, value, off, len64, aux32, waiter,
         );
@@ -702,6 +740,84 @@ impl FsCore {
                 }
                 _ => debug_assert!(false, "not a path-op tag {tag:#x}"),
             }
+        });
+        if let Err(err) = staged {
+            self.fail_op(op_slot, err);
+        }
+    }
+
+    /// `LINKAT` with `AT_EMPTY_PATH`: give the already-open `file` a name at
+    /// `a2 / n2`. This is the only linkat form that can name an **unnamed**
+    /// inode, so it is how an `O_TMPFILE` is materialized — the publish step of
+    /// a durable create.
+    ///
+    /// Two kernel rules govern whether it succeeds, and neither is discoverable
+    /// from the error alone:
+    ///
+    /// - The file must have been opened `O_TMPFILE` **without `O_EXCL`**.
+    ///   `O_EXCL` is precisely the "never link this" opt-out: only the
+    ///   non-`O_EXCL` path sets `I_LINKABLE` (`fs/namei.c:4084`), and
+    ///   `vfs_link` rejects a zero-`i_nlink` inode without it (`:4979`) —
+    ///   surfacing as `ENOENT`.
+    /// - `AT_EMPTY_PATH` requires `fd_file(f)->f_cred == current_cred()` or
+    ///   `CAP_DAC_READ_SEARCH` (`fs/namei.c:2631`). io_uring captures the
+    ///   personality's `struct cred *` as the file's `f_cred` at open time, so
+    ///   **`pers` must carry the credentials that opened `file`**. The check is
+    ///   a pointer comparison and `register_personality` stores
+    ///   `get_current_cred()`, so ids registered from unchanged process
+    ///   credentials alias and are interchangeable; brokered ids, each minted
+    ///   after a `setresuid`, are distinct objects even for one uid. Mismatch
+    ///   is `ENOENT`, not `EPERM`.
+    ///
+    /// `IOSQE_FIXED_FILE` is deliberately never set: `io_linkat_prep` rejects a
+    /// fixed file outright with `-EBADF`. Plain-fd `File` satisfies that by
+    /// construction.
+    pub(crate) fn submit_linkat_file(
+        &mut self,
+        eng: &mut Engine,
+        pers: u16,
+        file: Arc<OwnedFd>,
+        a2: Anchor,
+        n2: CString,
+        waiter: FsWaiter,
+    ) {
+        // Like every name-resolving op: personality 0 would resolve `n2` and
+        // create the link as ambient root. Fail closed.
+        if pers == 0 {
+            fail(waiter, Errno::EINVAL, Vec::new());
+            return;
+        }
+        let Some(op_slot) = self.op_free.pop() else {
+            fail(waiter, Errno::EBUSY, Vec::new());
+            return;
+        };
+
+        let entry = &mut self.ops[op_slot as usize];
+        let gen32 = entry.generation as u32;
+        let e = &mut entry.state;
+        e.state = FsOpState::InFlight { tag: TAG_LINKAT };
+        e.waiter = Some(waiter);
+        // The empty source path AT_EMPTY_PATH resolves against `sqe.fd`. Owned
+        // by the entry like any other path payload: the kernel reads it at
+        // execution, which is after this call returns.
+        e.path = Some(CString::default());
+        e.path2 = Some(n2);
+        let old_fd = file.as_raw_fd();
+        let new_dfd = a2.raw_fd();
+        e.file = Some(file);
+        e.anchor2 = Some(a2);
+        let p1 = e.path.as_ref().expect("just set").as_ptr() as u64;
+        let p2 = e.path2.as_ref().expect("just set").as_ptr() as u64;
+
+        let ud = pack_raw(TAG_LINKAT, op_slot, gen32);
+        let staged = eng.stage(ud, |sqe| {
+            sqe.opcode = IORING_OP_LINKAT;
+            sqe.fd = old_fd; // the open file itself, not a dirfd
+            sqe.addr = p1; // ""
+            sqe.off_addr2 = p2; // destination leaf
+            sqe.len = new_dfd as u32; // destination dirfd (kernel packing)
+            sqe.op_flags = AtFlags::AT_EMPTY_PATH.bits() as u32;
+            sqe.personality = pers;
         });
         if let Err(err) = staged {
             self.fail_op(op_slot, err);
@@ -1051,7 +1167,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        self.rw(TAG_READV, who, f, bufs, off, on_done);
+        self.rw(TAG_READV, who, f, bufs, off, RwFlags::empty(), on_done);
     }
 
     /// Single-buffer positional read (`pread(2)`).
@@ -1065,7 +1181,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        self.rw(TAG_READV, who, f, vec![buf], off, on_done);
+        self.rw(TAG_READV, who, f, vec![buf], off, RwFlags::empty(), on_done);
     }
 
     /// Vectored positional write (`pwritev(2)`) as `who`.
@@ -1079,7 +1195,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        self.rw(TAG_WRITEV, who, f, bufs, off, on_done);
+        self.rw(TAG_WRITEV, who, f, bufs, off, RwFlags::empty(), on_done);
     }
 
     /// Single-buffer positional write (`pwrite(2)`).
@@ -1093,7 +1209,52 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        self.rw(TAG_WRITEV, who, f, vec![buf], off, on_done);
+        self.rw(
+            TAG_WRITEV,
+            who,
+            f,
+            vec![buf],
+            off,
+            RwFlags::empty(),
+            on_done,
+        );
+    }
+
+    /// Scattered positional read with per-operation flags (`preadv2(2)`).
+    /// See [`RwFlags`] — an unsupported flag fails the read with
+    /// `EOPNOTSUPP` rather than being ignored.
+    #[allow(clippy::too_many_arguments)]
+    pub fn preadv2<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        bufs: Vec<Vec<u8>>,
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.rw(TAG_READV, who, f, bufs, off, flags, on_done);
+    }
+
+    /// Gathered positional write with per-operation flags (`pwritev2(2)`).
+    /// [`RwFlags::RWF_DSYNC`] makes the write itself durable, which can stand
+    /// in for a following `fdatasync` — worth measuring on ZFS, where a
+    /// synchronous write goes through the ZIL.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pwritev2<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        bufs: Vec<Vec<u8>>,
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.rw(TAG_WRITEV, who, f, bufs, off, flags, on_done);
     }
 
     /// Flush `f`'s data and metadata (`fsync`) as `who`.
@@ -1509,6 +1670,31 @@ impl<'a> FsConn<'a> {
         );
     }
 
+    /// Give the already-open `f` a name at `new_leaf` in `new`
+    /// (`linkat` with `AT_EMPTY_PATH`) — the publish step for an `O_TMPFILE`
+    /// create. See [`FsHandle::linkat_file`](crate::uring_fs::FsHandle::linkat_file)
+    /// for the two kernel requirements (`O_TMPFILE` without `O_EXCL`, and the
+    /// *same* personality that opened `f`), both of which fail as `ENOENT`.
+    pub fn linkat_file<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        new: &Anchor,
+        new_leaf: Leaf<'_>,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.fs.submit_linkat_file(
+            self.eng,
+            who.0,
+            f.fd,
+            new.clone(),
+            new_leaf.to_cstring(),
+            embed(self.owner, on_done),
+        );
+    }
+
     /// Close `f`: drop the handle. Its fd closes once the last reference (this
     /// handle plus any op still parking a clone) drops — close-last by
     /// ownership. Fire-and-forget; there is no completion callback.
@@ -1518,6 +1704,7 @@ impl<'a> FsConn<'a> {
 
     // ---- private submit helpers ----------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn rw<F>(
         &mut self,
         tag: u8,
@@ -1525,6 +1712,7 @@ impl<'a> FsConn<'a> {
         f: File,
         bufs: Vec<Vec<u8>>,
         off: u64,
+        rw_flags: RwFlags,
         on_done: F,
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
@@ -1536,6 +1724,7 @@ impl<'a> FsConn<'a> {
             f.fd,
             bufs,
             off,
+            rw_flags.bits(),
             embed(self.owner, on_done),
         );
     }
@@ -2421,6 +2610,7 @@ mod routing_fuzz {
             arc,
             vec![vec![0u8; 16]],
             0,
+            0,
             chan(&tx),
         );
         drop(caller);
@@ -2447,6 +2637,7 @@ mod routing_fuzz {
             1,
             arc,
             vec![vec![0u8; 16]],
+            0,
             0,
             chan(&tx),
         );
@@ -2483,6 +2674,7 @@ mod routing_fuzz {
                 1,
                 arc,
                 vec![vec![0u8; 16]],
+                0,
                 0,
                 chan(&tx),
             );
@@ -2574,6 +2766,7 @@ mod routing_fuzz {
                         1,
                         arc,
                         vec![vec![0u8; 16]],
+                        0,
                         0,
                         chan(&tx),
                     );

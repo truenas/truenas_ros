@@ -36,8 +36,18 @@ truenas_ros = { version = "0.1", default-features = false, features = ["sync-fs"
 An io_uring stack lives alongside the blocking bindings, off by default:
 `net-server` / `net-client` (stream roles over a shared reactor core, with
 kernel-TLS, splice, and peer-credential support) and `uring-fs` (a filesystem
-reactor with per-op credential impersonation — currently a design stub). Both
-sit on the internal `uring` engine feature; see the crate docs.
+reactor whose every operation runs under a kernel-enforced identity). Both sit
+on the internal `uring` engine feature; see the crate docs.
+
+`uring-fs` covers opens, vectored I/O (including the `preadv2`/`pwritev2` flag
+forms), sync, the metadata and extended-attribute ops, the directory-entry
+family, and enriched directory listing — off-loop through a blocking handle, or
+on the reactor thread through completion callbacks. Beyond plain syscall
+wrappers it provides what a storage service needs and cannot easily build
+itself: path resolution the caller cannot weaken (`open_confined`), confined
+`mkdir -p` (`mkdir_path`), `O_TMPFILE` publication (`linkat_file`), and an
+allowlist that lets a server keep its own metadata in the `trusted.` namespace,
+where local users cannot read or alter it.
 
 ## Examples
 

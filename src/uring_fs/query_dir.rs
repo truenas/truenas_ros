@@ -96,6 +96,19 @@ pub struct QueryOptions {
     pub acl_name: CString,
     /// Entries per yielded batch (clamped to at least 1).
     pub clump: usize,
+    /// Drop entries that live on a **different filesystem** from the directory
+    /// being listed — a mount point, which on ZFS means a child dataset or a
+    /// `.zfs/snapshot` automount.
+    ///
+    /// `readdir` honours no `RESOLVE_*` flags, so a walk has no equivalent of
+    /// [`CONFINED_RESOLVE`](crate::uring_fs::CONFINED_RESOLVE)'s
+    /// `RESOLVE_NO_XDEV`: a nested mount simply appears as an ordinary entry.
+    /// Setting this restores the same rule on the listing side, so a tree that
+    /// is meant to be one filesystem lists as one filesystem.
+    ///
+    /// Requires [`EnrichSpec::STATX`] (the device number comes from `statx`);
+    /// without it the option cannot be honoured and is ignored.
+    pub same_device_only: bool,
 }
 
 impl Default for QueryOptions {
@@ -106,6 +119,7 @@ impl Default for QueryOptions {
             xattr_ns: XattrNamespaces::USER,
             acl_name: c"".to_owned(),
             clump: 1,
+            same_device_only: false,
         }
     }
 }
@@ -141,6 +155,10 @@ pub struct QueryDir {
     h: FsHandle,
     who: Personality,
     dir: Anchor,
+    /// The listed directory's device, for
+    /// [`QueryOptions::same_device_only`]. `None` if it could not be
+    /// determined, in which case nothing is filtered.
+    dir_dev: Option<u64>,
     opts: QueryOptions,
 }
 
@@ -258,22 +276,34 @@ impl QueryDir {
             })
             .collect();
 
-        // Collect each entry's statx and opened fd.
+        // Collect each entry's statx and opened fd, dropping anything that
+        // crossed a mount point when the caller asked for one filesystem.
+        // Filtering here — before the xattr reads below — also means a nested
+        // dataset costs no further work.
+        let cross_dev = |st: Option<&Statx>| match (self.dir_dev, st) {
+            (Some(dev), Some(st)) => st.dev() != dev,
+            // No device for the directory, or no statx for the entry: nothing
+            // to compare, so nothing is dropped.
+            _ => false,
+        };
         let opened: Vec<Opened> = requested
             .into_iter()
-            .map(|p| {
+            .filter_map(|p| {
                 let statx = p.statx.and_then(pending_statx);
+                if self.opts.same_device_only && cross_dev(statx.as_ref()) {
+                    return None;
+                }
                 let is_dir = statx
                     .as_ref()
                     .map(Statx::is_dir)
                     .unwrap_or(p.dtype == libc::DT_DIR);
                 let file = p.open.and_then(pending_file);
-                Opened {
+                Some(Opened {
                     name: p.name,
                     is_dir,
                     statx,
                     file,
-                }
+                })
             })
             .collect();
 
@@ -631,11 +661,25 @@ pub fn query_directory(
         return Err(e.into());
     }
 
+    // The directory's own device, so an entry on a different one is
+    // recognisable as a mount point. Taken from the readable fd we just
+    // opened, before it drops.
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `dir_read` is live here; `st` is a valid out-pointer.
+    let dir_dev =
+        if unsafe { libc::fstat(dir_read.as_raw_fd(), st.as_mut_ptr()) } == 0 {
+            // SAFETY: fstat succeeded, so `st` is initialized.
+            Some(unsafe { st.assume_init() }.st_dev)
+        } else {
+            None
+        };
+
     Ok(QueryDir {
         dp,
         h: h.clone(),
         who,
         dir: dir.clone(),
+        dir_dev,
         opts: QueryOptions {
             clump: opts.clump.max(1),
             ..opts

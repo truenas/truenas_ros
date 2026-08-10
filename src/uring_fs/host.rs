@@ -7,7 +7,7 @@ use super::core::{
     deliver_embedded, deliver_pool_completions, FsCore, FsWaiter, TAG_CANCEL,
     TAG_WAKE,
 };
-use super::{FsHandle, FsInject, FsOutcome, Personality};
+use super::{FsHandle, FsInject, FsOutcome, Personality, PrivilegedXattrs};
 use crate::errno::{self, Errno};
 use crate::uring::engine::Engine;
 use crate::uring::probe::probe_op_supported;
@@ -241,6 +241,18 @@ impl UringFs {
         Ok(Personality(id))
     }
 
+    /// Declare which extended attributes are written under this reactor's
+    /// ambient credentials rather than the requesting [`Personality`] — see
+    /// [`PrivilegedXattrs`] for the rules and the reasoning.
+    ///
+    /// Setup-time only, and enforced as such: [`UringFs::run`] borrows `&mut
+    /// self` for the lifetime of the loop, so this cannot be called while
+    /// operations are in flight. Replaces any previous policy; the default
+    /// permits nothing.
+    pub fn set_privileged_xattrs(&mut self, policy: PrivilegedXattrs) {
+        self.fs.set_privileged_xattrs(policy);
+    }
+
     /// A `Send + Sync` handle for submitting operations from other threads.
     pub fn handle(&self) -> FsHandle {
         FsHandle {
@@ -358,6 +370,7 @@ impl UringFs {
                     file,
                     bufs,
                     off,
+                    rw_flags,
                     reply,
                 } => self.fs.submit_rw(
                     &mut self.eng,
@@ -366,6 +379,7 @@ impl UringFs {
                     file,
                     bufs,
                     off,
+                    rw_flags,
                     FsWaiter::Channel(reply),
                 ),
                 FsInject::Fsync {
@@ -440,6 +454,20 @@ impl UringFs {
                     len_arg,
                     FsWaiter::Channel(reply),
                 ),
+                FsInject::LinkatFile {
+                    pers,
+                    file,
+                    a2,
+                    n2,
+                    reply,
+                } => self.fs.submit_linkat_file(
+                    &mut self.eng,
+                    pers,
+                    file,
+                    a2,
+                    n2,
+                    FsWaiter::Channel(reply),
+                ),
             }
         }
     }
@@ -483,6 +511,7 @@ impl UringFs {
                     (Some(reply), vec![value])
                 }
                 FsInject::PathOp { reply, .. } => (Some(reply), Vec::new()),
+                FsInject::LinkatFile { reply, .. } => (Some(reply), Vec::new()),
             };
             if let Some(reply) = reply {
                 let _ = reply.send(FsOutcome::new(
