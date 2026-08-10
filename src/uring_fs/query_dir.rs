@@ -135,8 +135,12 @@ impl QueryDir {
                 };
             }
             // SAFETY: `ent` is a valid `dirent`; `d_name` is NUL-terminated.
+            // `addr_of!` avoids forming a `&[c_char; 256]` over a record that
+            // may be shorter than the full array.
             let (bytes, dtype) = unsafe {
-                let name = CStr::from_ptr((*ent).d_name.as_ptr());
+                let name = CStr::from_ptr(
+                    std::ptr::addr_of!((*ent).d_name).cast::<libc::c_char>(),
+                );
                 (name.to_bytes().to_vec(), (*ent).d_type)
             };
             if bytes == b"." || bytes == b".." {
@@ -391,22 +395,17 @@ pub fn query_directory(
 /// on the worker's own thread, never sent.
 type Job = Box<dyn FnOnce() + Send>;
 
-/// A fixed pool of worker threads that run blocking fs work — directory walks
-/// ([`query`](QueryPool::query)) and byte-range copies
-/// ([`copy_file_range`](QueryPool::copy_file_range)) — off the caller's thread.
-/// Each method enqueues a job and returns immediately with a handle; up to
-/// `workers` jobs run concurrently, so one caller thread can fan out many and
-/// then collect them. Dropping the pool closes the queue and joins the workers.
+/// A fixed pool of worker threads running `Box<dyn FnOnce() + Send>` jobs, the
+/// shared machinery behind both the off-loop [`QueryPool`] helpers and the
+/// on-loop `FsConn::offload` path. It runs whatever job it is handed under the
+/// reactor's ambient credentials; any per-`who` permission check belongs to the
+/// job, not the pool.
 ///
 /// The canonical std threadpool (the Rust Book design): worker threads share
 /// one `Arc<Mutex<mpsc::Receiver<Job>>>` and hold the lock only across job
-/// pickup, so pickup is serialized while the jobs run in parallel. Security is
-/// automatic — a walk opens its directory under its own `who` (the
-/// list-permission check), so `EACCES` surfaces as an error batch.
-/// A fixed pool of worker threads running `Box<dyn FnOnce() + Send>` jobs — the
-/// shared machinery behind both the off-loop [`QueryPool`] helpers and the
-/// on-loop `FsConn::offload` path. Dropping it closes the queue (each worker's
-/// `recv` then returns `Err` and it exits) and joins the workers.
+/// pickup, so pickup is serialized while the jobs run in parallel. Dropping it
+/// closes the queue (each worker's `recv` then returns `Err` and it exits) and
+/// joins the workers.
 pub(crate) struct WorkerPool {
     jobs: Option<mpsc::Sender<Job>>,
     workers: Vec<thread::JoinHandle<()>>,
@@ -414,22 +413,40 @@ pub(crate) struct WorkerPool {
 
 impl WorkerPool {
     /// Spawn `workers` (at least 1) threads pulling jobs off a shared queue.
+    /// Panics if a thread cannot be spawned, for off-loop callers that build
+    /// the pool up front ([`QueryPool::new`]); the reactor path uses the
+    /// fallible [`WorkerPool::try_new`] and degrades instead.
     pub(crate) fn new(workers: usize) -> WorkerPool {
+        Self::try_new(workers).expect("spawn fs worker")
+    }
+
+    /// Spawn `workers` (at least 1) threads, returning the spawn error rather
+    /// than panicking. On a partial failure the threads already spawned are
+    /// shut down (queue closed, joined) before returning, so none is orphaned.
+    pub(crate) fn try_new(workers: usize) -> std::io::Result<WorkerPool> {
         let (jobs, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
-        let workers = (0..workers.max(1))
-            .map(|_| {
-                let rx = Arc::clone(&rx);
-                thread::Builder::new()
-                    .name("truenas-fs-worker".into())
-                    .spawn(move || worker_loop(&rx))
-                    .expect("spawn fs worker")
-            })
-            .collect();
-        WorkerPool {
-            jobs: Some(jobs),
-            workers,
+        let mut handles = Vec::with_capacity(workers.max(1));
+        for _ in 0..workers.max(1) {
+            let rx = Arc::clone(&rx);
+            match thread::Builder::new()
+                .name("truenas-fs-worker".into())
+                .spawn(move || worker_loop(&rx))
+            {
+                Ok(h) => handles.push(h),
+                Err(e) => {
+                    drop(jobs); // close the queue so spawned workers exit
+                    for h in handles {
+                        let _ = h.join();
+                    }
+                    return Err(e);
+                }
+            }
         }
+        Ok(WorkerPool {
+            jobs: Some(jobs),
+            workers: handles,
+        })
     }
 
     /// Enqueue `job` (a no-op if the pool is already dropping).
@@ -452,7 +469,15 @@ impl Drop for WorkerPool {
 }
 
 /// A [`WorkerPool`] bound to an [`FsHandle`] for the off-loop directory-listing
-/// and byte-copy helpers.
+/// ([`query`](QueryPool::query)) and byte-range copy
+/// ([`copy_file_range`](QueryPool::copy_file_range)) helpers. Each method
+/// enqueues a job and returns immediately with a handle; up to `workers` jobs
+/// run concurrently, so one caller thread can fan out many and then collect
+/// them.
+///
+/// A walk opens its directory under its own `who` (the list-permission check),
+/// so `EACCES` surfaces as an error batch rather than a listing taken under the
+/// reactor's ambient credentials.
 pub struct QueryPool {
     pool: WorkerPool,
     h: FsHandle,
@@ -603,6 +628,11 @@ impl Iterator for QueryHandle {
 
 /// A worker: pick up jobs (lock held only across `recv`) and run each unlocked,
 /// so `K` workers run `K` jobs concurrently. Exits when the queue closes.
+///
+/// Each job runs under `catch_unwind`, so a panicking job retires only itself,
+/// not the worker: the pool keeps draining, and a later `submit` is not
+/// silently dropped onto a dead thread. Any handle the job owned (a `SendDir`)
+/// still closes as its unwinding frame drops.
 fn worker_loop(rx: &Mutex<mpsc::Receiver<Job>>) {
     loop {
         let job = {
@@ -612,7 +642,7 @@ fn worker_loop(rx: &Mutex<mpsc::Receiver<Job>>) {
         let Ok(job) = job else {
             return; // queue closed — the pool is dropping
         };
-        job();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
     }
 }
 

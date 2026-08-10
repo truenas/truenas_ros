@@ -22,7 +22,7 @@ use super::query_dir::WorkerPool;
 use super::{
     statx_at_flags, Anchor, File, FsOutcome, Leaf, Personality, ReplyTo,
 };
-use crate::errno::Errno;
+use crate::errno::{retry_on_eintr, Errno};
 use crate::sync_fs::openat2::RawOpenHow;
 use crate::sync_fs::{
     AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, Statx, StatxMask,
@@ -260,11 +260,24 @@ impl FsCore {
         Arc::clone(&self.completions)
     }
 
-    /// Submit `job` to the offload pool (spawned on first use).
+    /// Submit `job` to the offload pool (spawned on first use). If a worker
+    /// thread cannot be spawned (pid/memory pressure), run `job` inline rather
+    /// than panic on the reactor and take every connection down: the job still
+    /// pushes its completion and pokes the wake, so delivery is unchanged, only
+    /// synchronous: a degraded loop, not a dead one.
     fn submit_offload(&mut self, job: Box<dyn FnOnce() + Send>) {
-        self.pool
-            .get_or_insert_with(|| WorkerPool::new(OFFLOAD_WORKERS))
-            .submit(job);
+        if self.pool.is_none() {
+            match WorkerPool::try_new(OFFLOAD_WORKERS) {
+                Ok(pool) => self.pool = Some(pool),
+                Err(_) => {
+                    job();
+                    return;
+                }
+            }
+        }
+        if let Some(pool) = self.pool.as_ref() {
+            pool.submit(job);
+        }
     }
 
     /// Take every finished offload paired with its owner + continuation. The
@@ -1535,9 +1548,32 @@ impl<'a> FsConn<'a> {
 /// A `*mut DIR` handed between the reactor and a worker thread. Sound only
 /// because the walk gives it to exactly one thread at a time (reactor -> worker
 /// for a batch, worker -> reactor on delivery) and never shares it concurrently.
+///
+/// Owns the `DIR*`: dropping it `closedir`s the handle, so a batch result that
+/// is never delivered (the walk dropped mid-flight, or a worker job unwinds)
+/// reclaims the fd instead of leaking it. Ownership is passed on, rather than
+/// duplicated, with [`SendDir::into_raw`].
 struct SendDir(*mut libc::DIR);
 // SAFETY: single-owner-at-a-time hand-off, never aliased across threads.
 unsafe impl Send for SendDir {}
+
+impl SendDir {
+    /// Take the `DIR*` out, leaving the wrapper null so its `Drop` is inert,
+    /// for handing ownership to a [`DirWalkInner`].
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    fn into_raw(mut self) -> *mut libc::DIR {
+        std::mem::replace(&mut self.0, std::ptr::null_mut())
+    }
+}
+
+impl Drop for SendDir {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: a live DIR* from fdopendir, owned here, closed once.
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+}
 
 struct DirWalkInner {
     /// The open directory. `null` while a readdir batch runs on a worker.
@@ -1639,32 +1675,39 @@ impl FsConn<'_> {
         self.open(who, anchor, c".", how, move |done, conn| {
             match done.file() {
                 Some(dir) => conn.offload(
-                    move || {
-                        // Worker: dup the authorized fd and fdopendir the dup (which
-                        // closedir/readdir then own; `dir` closes its own fd as it
-                        // drops here). No permission re-check — opened under `who`.
+                    move || -> crate::Result<SendDir> {
+                        // Worker: dup the authorized fd and fdopendir the dup
+                        // (which closedir/readdir then own; `dir` closes its own
+                        // fd as it drops here). No permission re-check, opened
+                        // under `who`. The errno is read here, on the worker's
+                        // own thread, and the dup closed if fdopendir declines
+                        // it (glibc leaves it open on failure).
                         // SAFETY: `dir` is a live fd for the dup; fdopendir takes
                         // ownership of the fresh dup.
-                        let dup = unsafe { libc::dup(dir.as_raw_fd()) };
-                        SendDir(unsafe { libc::fdopendir(dup) })
-                    },
-                    move |sdir: SendDir, conn| {
-                        if sdir.0.is_null() {
-                            on_ready(Err(Errno::last().into()), conn);
-                        } else {
-                            on_ready(
-                                Ok(DirWalk {
-                                    inner: Rc::new(RefCell::new(
-                                        DirWalkInner {
-                                            dp: sdir.0,
-                                            in_flight: false,
-                                            dropped: false,
-                                        },
-                                    )),
-                                }),
-                                conn,
-                            );
+                        let dup = retry_on_eintr(|| unsafe {
+                            libc::dup(dir.as_raw_fd())
+                        })?;
+                        let dp = unsafe { libc::fdopendir(dup) };
+                        if dp.is_null() {
+                            let e = Errno::last();
+                            // SAFETY: fdopendir failed, so `dup` is still ours.
+                            unsafe { libc::close(dup) };
+                            return Err(e.into());
                         }
+                        Ok(SendDir(dp))
+                    },
+                    move |res: crate::Result<SendDir>, conn| match res {
+                        Ok(sdir) => on_ready(
+                            Ok(DirWalk {
+                                inner: Rc::new(RefCell::new(DirWalkInner {
+                                    dp: sdir.into_raw(),
+                                    in_flight: false,
+                                    dropped: false,
+                                })),
+                            }),
+                            conn,
+                        ),
+                        Err(e) => on_ready(Err(e), conn),
                     },
                 ),
                 None => {
@@ -1681,8 +1724,14 @@ impl FsConn<'_> {
     /// Read the next batch of entry names for `walk` off-loop — one job per walk
     /// (pull-style, natural backpressure) — delivering a [`NameBatch`] to
     /// `on_batch` on the reactor thread. The per-name enrichment the caller does
-    /// (open + fgetxattr) stays on-loop. Calling again while a batch is still in
-    /// flight yields `EBUSY`.
+    /// (open + fgetxattr) stays on-loop.
+    ///
+    /// Calling again while a batch is still in flight yields `EBUSY`, delivered
+    /// **synchronously** on the calling stack; every other outcome arrives
+    /// later from the pool drain, so a caller must not assume `on_batch` always
+    /// runs on a fresh turn. A batch that fails mid-`readdir` delivers the error
+    /// and drops the names already read: `readdir` cannot rewind, so the walk is
+    /// restart-recoverable, not resumable from the failed batch.
     pub fn next_batch<F>(&mut self, walk: &DirWalk, on_batch: F)
     where
         F: FnOnce(crate::Result<NameBatch>, &mut FsConn<'_>) + 'static,
@@ -1704,51 +1753,65 @@ impl FsConn<'_> {
             move || {
                 // Force whole-capture of the `Send` wrapper: 2021 disjoint
                 // captures would otherwise capture just its `*mut DIR` field and
-                // make the job `!Send`. Re-binding the whole value pins it.
+                // make the job `!Send`. Re-binding the whole value pins it, and
+                // the same `sdir` is handed back so its ownership is unbroken:
+                // never a second wrapper over one `DIR*`.
                 let sdir = sdir;
                 let dp = sdir.0;
                 let mut names = Vec::with_capacity(DIR_BATCH);
                 let mut eod = false;
+                let mut err = None;
                 while names.len() < DIR_BATCH {
                     Errno::clear();
                     // SAFETY: `dp` is a live DIR*; the returned pointer is valid
                     // until the next readdir/closedir, copied out immediately.
                     let ent = unsafe { libc::readdir(dp) };
                     if ent.is_null() {
-                        eod = true;
+                        // NULL is end-of-directory only with errno untouched; a
+                        // set errno is a failed getdents refill (EIO on a bad
+                        // block, ESTALE on NFS, the directory removed underneath)
+                        // and must surface, not read back as an empty directory.
+                        match Errno::last_raw() {
+                            0 => eod = true,
+                            _ => err = Some(Errno::last()),
+                        }
                         break;
                     }
-                    // SAFETY: `ent` is a valid dirent, NUL-terminated d_name.
+                    // SAFETY: `ent` is a valid dirent, NUL-terminated d_name;
+                    // `addr_of!` avoids forming a `&[c_char; 256]` over a record
+                    // that may be shorter than the full array.
                     let name = unsafe {
-                        CStr::from_ptr((*ent).d_name.as_ptr())
-                            .to_bytes()
-                            .to_vec()
+                        CStr::from_ptr(
+                            std::ptr::addr_of!((*ent).d_name)
+                                .cast::<libc::c_char>(),
+                        )
+                        .to_bytes()
+                        .to_vec()
                     };
                     if name == b"." || name == b".." {
                         continue;
                     }
                     names.push(name);
                 }
-                (NameBatch { names, eod }, SendDir(dp))
-            },
-            move |(batch, sdir): (NameBatch, SendDir), conn| {
-                let deliver = {
-                    let mut b = inner.borrow_mut();
-                    if b.dropped {
-                        // Walk dropped mid-batch: close the DIR* here and drop
-                        // the batch (the caller is gone).
-                        // SAFETY: live DIR*, closed exactly once.
-                        unsafe { libc::closedir(sdir.0) };
-                        false
-                    } else {
-                        b.dp = sdir.0;
-                        b.in_flight = false;
-                        true
-                    }
+                let batch = match err {
+                    Some(e) => Err(e.into()),
+                    None => Ok(NameBatch { names, eod }),
                 };
-                if deliver {
-                    on_batch(Ok(batch), conn);
+                (batch, sdir)
+            },
+            move |(batch, sdir): (crate::Result<NameBatch>, SendDir), conn| {
+                let mut b = inner.borrow_mut();
+                if b.dropped {
+                    // Walk dropped mid-batch: `sdir` drops here, closing the
+                    // DIR*, and the batch is discarded (the caller is gone).
+                    drop(b);
+                    drop(sdir);
+                    return;
                 }
+                b.dp = sdir.into_raw();
+                b.in_flight = false;
+                drop(b);
+                on_batch(batch, conn);
             },
         );
     }
@@ -1875,6 +1938,67 @@ mod hybrid_tests {
             || *count.borrow() == 8,
         );
         assert_eq!(*count.borrow(), 8);
+    }
+
+    #[test]
+    fn a_failed_readdir_is_an_error_not_end_of_directory() {
+        // Point the DIR*'s fd at a non-directory (`dup2` over it, keeping the fd
+        // number valid so parallel tests and the walk's own `closedir` are
+        // unaffected): the next `readdir` fails `ENOTDIR` and returns NULL with
+        // errno set. That must be delivered as an error, not an empty
+        // end-of-directory batch that reads as a complete listing of nothing.
+        let (mut eng, mut fs, me) = setup();
+        let dir = fixture(3);
+        let anchor = Anchor::open(dir.path()).unwrap();
+        struct S {
+            walk: Option<DirWalk>,
+            result: Option<crate::Result<NameBatch>>,
+        }
+        let st: Rc<RefCell<S>> = Rc::new(RefCell::new(S {
+            walk: None,
+            result: None,
+        }));
+        let st2 = st.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                c.open_dir(me, &anchor, move |res, conn| {
+                    let walk = res.expect("open_dir");
+                    // SAFETY: `dp` is the live DIR* just handed back; redirect
+                    // its fd to /dev/null so the next readdir sees a non-dir.
+                    let dirfd = unsafe { libc::dirfd(walk.inner.borrow().dp) };
+                    assert!(dirfd >= 0);
+                    let null = unsafe { libc::open(c"/dev/null".as_ptr(), 0) };
+                    assert!(null >= 0, "open /dev/null");
+                    assert_eq!(
+                        unsafe { libc::dup2(null, dirfd) },
+                        dirfd,
+                        "dup2 onto dirfd"
+                    );
+                    unsafe { libc::close(null) };
+                    st2.borrow_mut().walk = Some(walk);
+                    let st3 = st2.clone();
+                    let b = st2.borrow();
+                    conn.next_batch(
+                        b.walk.as_ref().unwrap(),
+                        move |res, _c| {
+                            st3.borrow_mut().result = Some(res);
+                        },
+                    );
+                });
+            },
+            || st.borrow().result.is_some(),
+        );
+        let s = st.borrow();
+        assert!(
+            matches!(
+                s.result.as_ref().unwrap(),
+                Err(crate::Error::Errno(Errno::ENOTDIR))
+            ),
+            "readdir failure delivered as Err(ENOTDIR), got {:?}",
+            s.result.as_ref().unwrap()
+        );
     }
 
     #[test]
