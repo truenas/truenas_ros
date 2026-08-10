@@ -36,8 +36,9 @@
 //!   botocore requests have), `Host` enforcement (missing on HTTP/1.1, or
 //!   duplicated → 400), head-size cap (431), body cap (413), chunk-line and
 //!   trailer caps (400/431), version check (505). On the write side, the
-//!   response-splitting guards: non-token header names and CR/LF-bearing
-//!   values are dropped, out-of-range statuses become 500, and bodyless
+//!   response-splitting guards: non-token header names and values with a
+//!   byte outside RFC 9110's field-value grammar are dropped, out-of-range
+//!   statuses become 500, and bodyless
 //!   statuses (1xx/204/304) never carry content.
 //!
 //! # Scope (v1)

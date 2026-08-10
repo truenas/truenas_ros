@@ -4,8 +4,9 @@
 //! could desynchronize framing from the actual byte stream would reintroduce
 //! the smuggling class the head parser screens out. The same policy covers
 //! the header bytes themselves: names that are not RFC 9110 tokens and
-//! values carrying CR/LF/NUL are dropped too, so handler-echoed input can
-//! never split a response, and statuses that don't fit the three-digit
+//! values with any byte outside RFC 9110's field-value grammar are dropped
+//! too, so handler-echoed input can never split a response, and statuses
+//! that don't fit the three-digit
 //! status-line grammar are replaced with 500.
 
 use std::borrow::Cow;
@@ -153,7 +154,8 @@ impl HttpResponse {
     /// Append a header. `Content-Length`, `Connection`, `Date`, and
     /// `Transfer-Encoding` are codec-owned and ignored here (see module
     /// docs). Also ignored: names that are not RFC 9110 tokens and values
-    /// containing CR, LF, or NUL — serializing those verbatim would let
+    /// with a byte outside RFC 9110 §5.5's field-value grammar (CR, LF, NUL,
+    /// the other C0 controls, or DEL) — serializing those verbatim would let
     /// handler-echoed bytes terminate the field line early and inject
     /// response framing (response splitting).
     ///
@@ -230,10 +232,14 @@ fn is_token(name: &str) -> bool {
         })
 }
 
-/// CR, LF, or NUL in a field value ends the field line before the serializer
-/// meant it to — the write-side twin of the parser's smuggling screens.
+/// Whether a field value carries a byte a serialized field line may not.
+/// RFC 9110 §5.5 admits only field-vchar (VCHAR `0x21..=0x7E` / obs-text
+/// `0x80..=0xFF`), SP, and HTAB; every other byte is rejected — the CR/LF/NUL
+/// that split a response, and the rest of the C0 controls and DEL, which S3
+/// echoes verbatim in `x-amz-meta-*`. The write-side twin of the parser's
+/// smuggling screens; mirrors httparse's request-side header-value map.
 fn has_field_break(value: &[u8]) -> bool {
-    value.iter().any(|&b| matches!(b, b'\r' | b'\n' | b'\0'))
+    value.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f)
 }
 
 /// The `Connection` header the response should carry, if any: HTTP/1.1
@@ -477,6 +483,35 @@ mod tests {
         assert!(!s.contains("x-colon"));
         // Exactly one response head on the wire.
         assert_eq!(s.matches("HTTP/1.1").count(), 1);
+    }
+
+    #[test]
+    fn field_value_restricted_to_rfc9110_grammar() {
+        // Beyond CR/LF/NUL, the other C0 controls and DEL can't ride into a
+        // field line; HTAB, SP, VCHAR, and obs-text may.
+        let resp = HttpResponse::new(200)
+            .header("x-vt", &b"a\x0bb"[..]) // vertical tab
+            .header("x-ff", &b"a\x0cb"[..]) // form feed
+            .header("x-soh", &b"a\x01b"[..]) // C0 control
+            .header("x-us", &b"a\x1fb"[..]) // unit separator
+            .header("x-del", &b"a\x7fb"[..]) // DEL
+            .header("x-tab", &b"a\tb"[..]) // HTAB — allowed
+            .header("x-obs", &b"caf\xe9"[..]) // obs-text — allowed
+            .header("x-ok", "plain");
+        let out = serialize(&resp, false, date(), ConnHeader::None);
+        let has =
+            |needle: &[u8]| out.windows(needle.len()).any(|w| w == needle);
+        for dropped in [&b"x-vt"[..], b"x-ff", b"x-soh", b"x-us", b"x-del"] {
+            assert!(
+                !has(dropped),
+                "{} not dropped",
+                String::from_utf8_lossy(dropped)
+            );
+        }
+        // Allowed values survive verbatim, in wire form.
+        assert!(has(b"x-tab: a\tb\r\n"));
+        assert!(has(b"x-obs: caf\xe9\r\n"));
+        assert!(has(b"x-ok: plain\r\n"));
     }
 
     #[test]
