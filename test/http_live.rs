@@ -1,0 +1,403 @@
+//! Integration tests for the `http` codec through the **real** reactor —
+//! live loopback TCP, exercising the full ring path (multishot accept →
+//! recv-header → the http framer → recv/scan → delivery → handler →
+//! serialize → send → keep-alive re-arm). The codec's unit tests drive
+//! `frame`/`step` as plain functions; these pin the seams only a socket can
+//! prove: the interim `100 Continue` flushing **before** the body is sent,
+//! farewell responses arriving as bytes before FIN (never a slam), buffer
+//! accumulate/consume across requests on one connection, and the owned-body
+//! handoff a large chunked dance takes.
+//!
+//! Like `test/net_server.rs`, these **skip** (return early) when io_uring is
+//! unavailable — the CI/dev sandbox blocks the io_uring syscalls
+//! (ENOSYS/EPERM/EACCES), so `cargo test` stays green in a bare sandbox. Set
+//! `TRUENAS_ROS_REQUIRE_IO_URING=1` (as CI on a real kernel does) to turn a
+//! skip into a hard failure so coverage can't silently vanish.
+//!
+//! `Server` is `!Send` (its ring is single-thread-owned), so it stays on the
+//! test thread running `serve_forever`; the client runs on a spawned thread
+//! and stops the server via the `Send` [`ShutdownHandle`] when done.
+#![cfg(all(target_os = "linux", feature = "http"))]
+
+use std::io::{self, Read, Write};
+use std::net::{SocketAddrV4, TcpStream};
+use std::thread;
+use std::time::Duration;
+
+use truenas_ros::http::{protocol, HttpConfig, HttpRequest, HttpResponse};
+use truenas_ros::net::server::{Incoming, Server, ServerAddr, ShutdownHandle};
+use truenas_ros::{Errno, Error};
+
+/// Errors that mean "io_uring is unavailable here" — an environmental skip.
+///
+/// Deliberately *excludes* `EINVAL`: for io_uring that means the kernel
+/// rejected our setup arguments — a real bug we want to fail on, not skip.
+fn is_unavailable(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::Errno(Errno::EPERM | Errno::ENOSYS | Errno::EACCES)
+    )
+}
+
+fn should_skip(e: &Error) -> bool {
+    if is_unavailable(e) {
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_IO_URING").is_none(),
+            "TRUENAS_ROS_REQUIRE_IO_URING set but io_uring unavailable: {e}"
+        );
+        return true;
+    }
+    false
+}
+
+struct ShutdownOnDrop(ShutdownHandle);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
+
+/// Retry a connect for up to ~1s while the server thread starts up.
+fn retry<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut last = None;
+    for _ in 0..50 {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last = Some(e);
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    Err(last.unwrap())
+}
+
+fn connect_tcp(addr: SocketAddrV4) -> io::Result<TcpStream> {
+    let s = retry(|| TcpStream::connect(addr))?;
+    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+    Ok(s)
+}
+
+/// Bind an http server with the shared echo handler, run the client closure
+/// against its address on a spawned thread, and serve until the client stops
+/// it. `None` means io_uring is unavailable (the caller returns — a skip).
+///
+/// The handler: `GET /hi` answers `hello`; `PUT /echo` answers the request
+/// body verbatim, with the surfaced trailer names joined into an
+/// `x-trailers` response header (so a client can assert exactly which
+/// trailers reached [`HttpRequest::trailers`]); `HEAD` requests answer like
+/// GET (the codec elides the body); anything else is a 404.
+fn with_http_server<T: Send + 'static>(
+    client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
+) -> Option<T> {
+    let handler =
+        |mut req: HttpRequest<'_>, _: &mut ()| match (req.method, req.target) {
+            ("GET", "/hi") | ("HEAD", "/hi") => {
+                HttpResponse::new(200).body("hello")
+            }
+            ("PUT", "/echo") => {
+                let names: Vec<&str> =
+                    req.trailers.iter().map(|t| t.name).collect();
+                let body = req.body.take();
+                HttpResponse::new(200)
+                    .header("x-trailers", names.join(","))
+                    .body(body)
+            }
+            _ => HttpResponse::new(404).body("not found\n"),
+        };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = protocol(
+        HttpConfig::default(),
+        |_inc: Incoming<'_>| Some(()),
+        handler,
+    );
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return None,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let join = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        let r = client(v4);
+        stop.shutdown();
+        r
+    });
+    server.serve_forever().expect("serve_forever");
+    Some(join.join().expect("client thread").expect("client io"))
+}
+
+/// Read one HTTP response off the stream: the head byte-by-byte to its
+/// CRLFCRLF (no over-read — the connection may carry the next response),
+/// then exactly `Content-Length` body bytes. Returns
+/// `(status, head text, body)`.
+fn read_response<R: Read>(s: &mut R) -> io::Result<(u16, String, Vec<u8>)> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if s.read(&mut byte)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "eof inside response head",
+            ));
+        }
+        head.push(byte[0]);
+        assert!(head.len() <= 64 * 1024, "unterminated response head");
+    }
+    let head = String::from_utf8(head).expect("response head is ascii");
+    let status: u16 = head
+        .strip_prefix("HTTP/1.1 ")
+        .and_then(|r| r.get(..3))
+        .expect("status line")
+        .parse()
+        .expect("numeric status");
+    let len: usize = head
+        .lines()
+        .find_map(|l| l.strip_prefix("Content-Length:"))
+        .map(|v| v.trim().parse().expect("numeric length"))
+        .unwrap_or(0);
+    let mut body = vec![0u8; len];
+    s.read_exact(&mut body)?;
+    Ok((status, head, body))
+}
+
+/// Assert the peer half-closed cleanly: the next read returns EOF.
+fn assert_eof<R: Read>(s: &mut R) -> io::Result<()> {
+    let mut b = [0u8; 1];
+    assert_eq!(s.read(&mut b)?, 0, "expected EOF, got more bytes");
+    Ok(())
+}
+
+#[test]
+fn get_keepalive_then_close() {
+    // Two GETs on one connection prove accumulate/consume re-arms; a third
+    // with `Connection: close` gets its response and then a clean FIN.
+    let Some(()) = with_http_server(|v4| {
+        let mut s = connect_tcp(v4)?;
+        for _ in 0..2 {
+            s.write_all(b"GET /hi HTTP/1.1\r\nHost: t\r\n\r\n")?;
+            let (status, head, body) = read_response(&mut s)?;
+            assert_eq!(status, 200);
+            assert!(head.contains("\r\nDate: "), "Date header missing");
+            assert!(!head.contains("\r\nConnection:"), "keep-alive is bare");
+            assert_eq!(body, b"hello");
+        }
+        s.write_all(
+            b"GET /hi HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )?;
+        let (status, head, body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert!(head.contains("\r\nConnection: close\r\n"));
+        assert_eq!(body, b"hello");
+        assert_eof(&mut s)?;
+        Ok(())
+    }) else {
+        return; // io_uring unavailable
+    };
+}
+
+#[test]
+fn content_length_put_roundtrips() {
+    // A small body (inline delivery) and a 100 KiB body (placed — at the
+    // default 64 KiB threshold the reactor reads it into its own
+    // allocation) both reach the handler intact and echo back.
+    let Some(()) = with_http_server(|v4| {
+        let mut s = connect_tcp(v4)?;
+        for body in [b"hello".to_vec(), vec![b'B'; 100 * 1024]] {
+            let head = format!(
+                "PUT /echo HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            s.write_all(head.as_bytes())?;
+            s.write_all(&body)?;
+            let (status, _, echoed) = read_response(&mut s)?;
+            assert_eq!(status, 200);
+            assert_eq!(echoed, body);
+        }
+        Ok(())
+    }) else {
+        return; // io_uring unavailable
+    };
+}
+
+#[test]
+fn chunked_put_and_trailers() {
+    let Some(()) = with_http_server(|v4| {
+        let mut s = connect_tcp(v4)?;
+        // Multi-chunk, bare terminator: stitched entity, no trailers.
+        s.write_all(
+            b"PUT /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n\
+              3\r\nfoo\r\n4\r\nbars\r\n0\r\n\r\n",
+        )?;
+        let (status, head, body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert!(head.contains("\r\nx-trailers: \r\n"), "no trailers");
+        assert_eq!(body, b"foobars");
+        // A genuine trailer is surfaced; a forbidden one (Content-Length,
+        // RFC 9110 §6.5.1's framing set) is consumed but never shown.
+        s.write_all(
+            b"PUT /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n\
+              3\r\nabc\r\n0\r\nContent-Length: 9\r\nx-amz-checksum-crc32: ok==\r\n\r\n",
+        )?;
+        let (status, head, body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert!(
+            head.contains("\r\nx-trailers: x-amz-checksum-crc32\r\n"),
+            "trailer set wrong: {head}"
+        );
+        assert_eq!(body, b"abc");
+        Ok(())
+    }) else {
+        return; // io_uring unavailable
+    };
+}
+
+#[test]
+fn expect_dance_flushes_interim_before_body() {
+    // The ordering only a socket can prove: the client sends the head
+    // alone and BLOCKS reading the interim — if the codec didn't flush
+    // `100 Continue` before seeing any body byte, this read would hang
+    // (and fail on the 10s timeout). Only then is the body sent.
+    let Some(()) = with_http_server(|v4| {
+        let mut s = connect_tcp(v4)?;
+        s.write_all(
+            b"PUT /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n",
+        )?;
+        let mut interim = [0u8; 25];
+        s.read_exact(&mut interim)?;
+        assert_eq!(&interim[..], b"HTTP/1.1 100 Continue\r\n\r\n");
+        s.write_all(b"hello")?;
+        let (status, _, body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello");
+        Ok(())
+    }) else {
+        return; // io_uring unavailable
+    };
+}
+
+#[test]
+fn botocore_golden_streaming_put() {
+    // The default boto3-over-TLS PutObject shape, byte-for-byte as captured
+    // on the dev box (boto3 1.37.9): Expect + TE chunked, one HTTP chunk
+    // wrapping the aws-chunked entity, checksum trailer *inside* the
+    // entity, bare HTTP terminator. The codec de-chunks its own layer only
+    // — the aws-chunked entity must reach the handler untouched, and no
+    // HTTP trailers exist.
+    let Some(()) = with_http_server(|v4| {
+        let mut s = connect_tcp(v4)?;
+        s.write_all(
+            b"PUT /echo HTTP/1.1\r\n\
+              Host: 127.0.0.1:9711\r\n\
+              Expect: 100-continue\r\n\
+              Transfer-Encoding: chunked\r\n\
+              Content-Encoding: aws-chunked\r\n\
+              X-Amz-Trailer: x-amz-checksum-crc32\r\n\
+              X-Amz-Decoded-Content-Length: 100\r\n\
+              X-Amz-Content-SHA256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\n\r\n",
+        )?;
+        let mut interim = [0u8; 25];
+        s.read_exact(&mut interim)?;
+        assert_eq!(&interim[..], b"HTTP/1.1 100 Continue\r\n\r\n");
+
+        let mut wire = b"8e\r\n64\r\n".to_vec();
+        wire.extend_from_slice(&[b'A'; 100]);
+        wire.extend_from_slice(
+            b"\r\n0\r\nx-amz-checksum-crc32:lZe8jQ==\r\n\r\n\r\n0\r\n\r\n",
+        );
+        assert_eq!(wire.len(), 153);
+        s.write_all(&wire)?;
+
+        let mut entity = b"64\r\n".to_vec();
+        entity.extend_from_slice(&[b'A'; 100]);
+        entity.extend_from_slice(
+            b"\r\n0\r\nx-amz-checksum-crc32:lZe8jQ==\r\n\r\n",
+        );
+        let (status, head, body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert!(head.contains("\r\nx-trailers: \r\n"), "no HTTP trailers");
+        assert_eq!(body, entity);
+        Ok(())
+    }) else {
+        return; // io_uring unavailable
+    };
+}
+
+#[test]
+fn farewells_are_real_responses() {
+    // A failed connection gets a real HTTP response and then a clean FIN —
+    // never a bare slam. Each case is its own connection; read_to_end
+    // terminates because the server flush-closes.
+    let Some(()) = with_http_server(|v4| {
+        // Malformed head: 400 with the diagnostic body.
+        let mut s = connect_tcp(v4)?;
+        s.write_all(b"NOT HTTP\r\n\r\n")?;
+        let mut all = Vec::new();
+        s.read_to_end(&mut all)?;
+        let text = String::from_utf8_lossy(&all);
+        assert!(text.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{text}");
+        assert!(text.contains("\r\nConnection: close\r\n"));
+        assert!(text.ends_with("error 400\n"));
+
+        // A head that outruns the 16 KiB cap: 431. Sent in one write so
+        // the reactor consumes every byte before the verdict (no unread
+        // tail to turn the close into an RST).
+        let mut s = connect_tcp(v4)?;
+        let mut req = b"GET / HTTP/1.1\r\nHost: t\r\nX-Pad: ".to_vec();
+        req.extend(std::iter::repeat_n(b'a', 17 * 1024));
+        s.write_all(&req)?;
+        let mut all = Vec::new();
+        s.read_to_end(&mut all)?;
+        let text = String::from_utf8_lossy(&all);
+        assert!(text.starts_with("HTTP/1.1 431 "), "{text}");
+
+        // A dying HEAD: the status and Content-Length arrive, the body is
+        // elided (a HEAD response must not carry content).
+        let mut s = connect_tcp(v4)?;
+        s.write_all(
+            b"HEAD /hi HTTP/1.1\r\nHost: t\r\nContent-Length: 99999999999\r\n\r\n",
+        )?;
+        let mut all = Vec::new();
+        s.read_to_end(&mut all)?;
+        let text = String::from_utf8_lossy(&all);
+        assert!(text.starts_with("HTTP/1.1 413 "), "{text}");
+        assert!(text.contains("\r\nContent-Length: 10\r\n"));
+        assert!(text.ends_with("\r\n\r\n"), "farewell body not elided");
+        Ok(())
+    }) else {
+        return; // io_uring unavailable
+    };
+}
+
+#[test]
+fn large_chunked_dance_takes_the_handoff_path() {
+    // A 100 KiB single-chunk dance body: over the 64 KiB placement
+    // threshold, delivered body-only, so the reactor hands its buffer to
+    // the codec and the entity is de-chunked in place (the owned-body
+    // path). Content equality end to end is the live proof; the zero-copy
+    // pointer identity is pinned by the unit tests.
+    let Some(()) = with_http_server(|v4| {
+        let payload = vec![b'C'; 100 * 1024];
+        let mut s = connect_tcp(v4)?;
+        s.write_all(
+            b"PUT /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )?;
+        let mut interim = [0u8; 25];
+        s.read_exact(&mut interim)?;
+        assert_eq!(&interim[..], b"HTTP/1.1 100 Continue\r\n\r\n");
+        let mut wire = format!("{:x}\r\n", payload.len()).into_bytes();
+        wire.extend_from_slice(&payload);
+        wire.extend_from_slice(b"\r\n0\r\n\r\n");
+        s.write_all(&wire)?;
+        let (status, _, body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert_eq!(body, payload);
+        Ok(())
+    }) else {
+        return; // io_uring unavailable
+    };
+}

@@ -166,6 +166,15 @@ path = "test/net_server.rs"
 name = "net_client"
 path = "test/net_client.rs"
 
+# HTTP codec through the real reactor. Live loopback tests (keep-alive, the
+# 100-continue interim flush ordering, chunked bodies + trailers, farewell-
+# then-FIN semantics, the owned-body handoff); skip automatically when
+# io_uring is unavailable (sandbox/old kernel). Set
+# TRUENAS_ROS_REQUIRE_IO_URING=1 to make that a hard failure instead.
+[[test]]
+name = "http_live"
+path = "test/http_live.rs"
+
 # io_uring fs reactor. Live tests against a tempdir (opens, vectored I/O,
 # personality registration, fixed-slot lifecycle); skip automatically when
 # io_uring is unavailable (sandbox/old kernel). Set
