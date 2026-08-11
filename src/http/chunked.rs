@@ -17,6 +17,7 @@
 //! header-fields answer).
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 use super::head::HeaderView;
 
@@ -177,16 +178,18 @@ fn forbidden_trailer(name: &[u8]) -> bool {
         .any(|f| name.eq_ignore_ascii_case(f.as_bytes()))
 }
 
-/// The one state machine under both [`scan`] and [`decode`]: advance over
-/// `body` from where `s` left off, reporting payload spans and validated
-/// trailer lines to the sinks. `Ok(Some(extent))` — the message occupies
-/// exactly the first `extent` bytes of `body`; `Ok(None)` — need more bytes;
+/// The one state machine under [`scan`], [`decode`], and [`compact`]:
+/// advance over `body` from where `s` left off, reporting payload spans and
+/// validated trailer lines to the sinks **as ranges into `body`** — so an
+/// in-place caller can record positions without borrowing against a buffer
+/// it means to mutate. `Ok(Some(extent))` — the message occupies exactly the
+/// first `extent` bytes of `body`; `Ok(None)` — need more bytes;
 /// `Err(status)` — malformed (400) or oversized trailers (431).
-fn run<'b>(
-    body: &'b [u8],
+fn run(
+    body: &[u8],
     s: &mut ChunkScan,
-    on_payload: &mut impl FnMut(&'b [u8]),
-    on_trailer: &mut impl FnMut(&'b [u8]),
+    on_payload: &mut impl FnMut(Range<usize>),
+    on_trailer: &mut impl FnMut(Range<usize>),
 ) -> Result<Option<usize>, u16> {
     loop {
         if matches!(s.state, State::Done) {
@@ -215,7 +218,7 @@ fn run<'b>(
             State::Data { remaining } => {
                 let take = remaining.min(rest.len());
                 if take > 0 {
-                    on_payload(&rest[..take]);
+                    on_payload(s.consumed..s.consumed + take);
                     s.consumed += take;
                     s.decoded += take;
                 }
@@ -246,6 +249,7 @@ fn run<'b>(
                     if s.trailer_bytes > TRAILER_MAX {
                         return Err(431);
                     }
+                    let start = s.consumed;
                     let line = &rest[..i];
                     s.consumed += i + 2;
                     if line.is_empty() {
@@ -255,7 +259,7 @@ fn run<'b>(
                             // Forbidden names (framing/routing/credentials)
                             // are consumed but never surfaced.
                             Some((name, _)) if forbidden_trailer(name) => {}
-                            Some(_) => on_trailer(line),
+                            Some(_) => on_trailer(start..start + i),
                             None => return Err(400),
                         }
                     }
@@ -304,7 +308,8 @@ pub(crate) fn decode(
     match run(
         wire,
         &mut s,
-        &mut |p| {
+        &mut |r| {
+            let p = &wire[r];
             entity = match std::mem::replace(&mut entity, Entity::Empty) {
                 Entity::Empty => Entity::Span(p),
                 Entity::Span(first) => {
@@ -319,7 +324,7 @@ pub(crate) fn decode(
                 }
             };
         },
-        &mut |l| lines.push(l),
+        &mut |r| lines.push(&wire[r]),
     ) {
         Ok(Some(extent)) if extent == wire.len() => {}
         _ => return Err(()),
@@ -336,6 +341,91 @@ pub(crate) fn decode(
         Entity::Stitched(v) => Cow::Owned(v),
     };
     Ok((entity, trailers))
+}
+
+/// The de-chunked layout of a wire buffer after [`compact`]: where the
+/// entity now lies inside it, plus the trailer lines copied out of it (tiny,
+/// usually none) — copied so the buffer itself is free to move on as the
+/// entity's own allocation while the views borrow this struct instead.
+pub(crate) struct Compacted {
+    /// Entity offset within the wire buffer.
+    pub start: usize,
+    /// Entity length.
+    pub len: usize,
+    /// Verbatim trailer field lines, copied out of the wire (CRLF stripped).
+    trailer_lines: Vec<Vec<u8>>,
+}
+
+impl Compacted {
+    /// The trailer views, borrowing this struct rather than the wire buffer
+    /// — the reason the lines were copied out. The scan validated every line
+    /// already, so a failure here is a codec bug (callers answer 500).
+    pub(crate) fn trailers(&self) -> Result<Vec<HeaderView<'_>>, ()> {
+        let mut out = Vec::with_capacity(self.trailer_lines.len());
+        for line in &self.trailer_lines {
+            let (name, value) = split_trailer(line).ok_or(())?;
+            let name = std::str::from_utf8(name).map_err(|_| ())?;
+            out.push(HeaderView { name, value });
+        }
+        Ok(out)
+    }
+}
+
+/// The in-place twin of [`decode`], for a caller that **owns** the wire
+/// buffer: walk the same state machine, then make the entity contiguous
+/// inside `wire` without leaving the allocation. A single-payload message
+/// (the default botocore shape) moves no bytes at all — the entity is
+/// reported where it lies; a multi-payload message compacts its spans over
+/// the framing bytes with overlapping moves. The single-span, bare-trailer
+/// path allocates nothing. The framer's scan accepted these exact bytes as a
+/// complete message, so any failure is a codec bug — callers answer it as
+/// one (500), never as a client error.
+pub(crate) fn compact(wire: &mut [u8]) -> Result<Compacted, ()> {
+    let mut s = ChunkScan::default();
+    let mut first: Option<Range<usize>> = None;
+    // Empty Vecs never allocate: these stay unallocated unless the message
+    // is multi-chunk / carries trailers.
+    let mut rest_spans: Vec<Range<usize>> = Vec::new();
+    let mut trailer_lines: Vec<Vec<u8>> = Vec::new();
+    {
+        let w: &[u8] = wire;
+        match run(
+            w,
+            &mut s,
+            &mut |r| {
+                if first.is_none() {
+                    first = Some(r);
+                } else {
+                    rest_spans.push(r);
+                }
+            },
+            &mut |r| trailer_lines.push(w[r].to_vec()),
+        ) {
+            Ok(Some(extent)) if extent == w.len() => {}
+            _ => return Err(()),
+        }
+    }
+    let Some(head_span) = first else {
+        return Ok(Compacted {
+            start: 0,
+            len: 0,
+            trailer_lines,
+        });
+    };
+    let start = head_span.start;
+    let mut end = head_span.end;
+    for r in rest_spans {
+        // The destination never overtakes the source (framing bytes precede
+        // every span), and overlapping moves are copy_within's contract.
+        wire.copy_within(r.clone(), end);
+        end += r.len();
+    }
+    debug_assert_eq!(end - start, s.decoded);
+    Ok(Compacted {
+        start,
+        len: end - start,
+        trailer_lines,
+    })
 }
 
 #[cfg(test)]
@@ -500,5 +590,66 @@ mod tests {
         // framer only ever hands it a complete extent.
         assert!(decode(b"0\r\n\r\nEXTRA").is_err());
         assert!(decode(b"0\r\n").is_err());
+    }
+
+    #[test]
+    fn compact_single_chunk_moves_nothing() {
+        // The default botocore shape is one payload span: compact reports
+        // the entity where it lies and the wire is byte-for-byte untouched.
+        let mut wire = botocore_wire();
+        let orig = wire.clone();
+        let c = compact(&mut wire).expect("compacts");
+        assert_eq!(wire, orig, "single span: no byte moved");
+        assert_eq!((c.start, c.len), (4, 0x8e), "entity after \"8e\\r\\n\"");
+        assert_eq!(&wire[c.start..c.start + c.len], botocore_entity());
+        assert!(c.trailers().expect("parses").is_empty());
+    }
+
+    #[test]
+    fn compact_multi_chunk_stays_in_the_allocation() {
+        let mut wire = b"3\r\nfoo\r\n4\r\nbars\r\n0\r\n\r\n".to_vec();
+        let p0 = wire.as_ptr() as usize;
+        let c = compact(&mut wire).expect("compacts");
+        assert_eq!(&wire[c.start..c.start + c.len], b"foobars");
+        assert_eq!(c.start, 3, "entity abuts the first span's position");
+        assert_eq!(wire.as_ptr() as usize, p0, "no reallocation");
+    }
+
+    #[test]
+    fn compact_agrees_with_decode() {
+        // The in-place twin against the copying oracle, across the shapes
+        // that matter: golden, multi-chunk, empty entity, trailers (with
+        // the forbidden set dropped), extensions.
+        let shapes: Vec<Vec<u8>> = vec![
+            botocore_wire(),
+            b"3\r\nfoo\r\n4\r\nbars\r\n0\r\n\r\n".to_vec(),
+            b"0\r\n\r\n".to_vec(),
+            b"0\r\nx-amz-checksum-crc32: abc==\r\nx-two:v\r\n\r\n".to_vec(),
+            b"3\r\nabc\r\n0\r\nContent-Length: 9\r\nx-ok: v\r\n\r\n".to_vec(),
+            b"5;name=val\r\nhello\r\n0\r\n\r\n".to_vec(),
+        ];
+        for wire in shapes {
+            let (entity, trailers) = decode(&wire).expect("decodes");
+            let mut w = wire.clone();
+            let c = compact(&mut w).expect("compacts");
+            assert_eq!(
+                &w[c.start..c.start + c.len],
+                &entity[..],
+                "entity mismatch for {wire:?}"
+            );
+            let ct = c.trailers().expect("parses");
+            assert_eq!(ct.len(), trailers.len());
+            for (a, b) in ct.iter().zip(trailers.iter()) {
+                assert_eq!(a.name, b.name);
+                assert_eq!(a.value, b.value);
+            }
+        }
+    }
+
+    #[test]
+    fn compact_rejects_what_decode_rejects() {
+        assert!(compact(&mut b"0\r\n\r\nEXTRA".to_vec()).is_err());
+        assert!(compact(&mut b"0\r\n".to_vec()).is_err());
+        assert!(compact(&mut b"zz\r\n".to_vec()).is_err());
     }
 }
