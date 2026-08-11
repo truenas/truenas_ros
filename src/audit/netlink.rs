@@ -28,7 +28,13 @@ const NLMSG_ERROR: u16 = 0x2;
 /// The fixed `nlmsghdr` size, 4-byte aligned: len(u32) type(u16) flags(u16)
 /// seq(u32) pid(u32).
 const NLMSG_HDRLEN: usize = 16;
-/// Cap on one audit message (libaudit's `MAX_AUDIT_MESSAGE_LENGTH`).
+/// `AUDIT_MESSAGE_TEXT_MAX` (`include/uapi/linux/audit.h`). The kernel formats
+/// a user-space record as `msg='%.*s'` with this as the precision
+/// (`kernel/audit.c`); longer text is truncated there.
+const AUDIT_MESSAGE_TEXT_MAX: usize = 8560;
+/// libaudit's `MAX_AUDIT_MESSAGE_LENGTH`, which bounds the datagram rather
+/// than the text. The kernel carries it only as a comment in
+/// `include/uapi/linux/audit.h`.
 const MAX_AUDIT_MESSAGE_LENGTH: usize = 8970;
 /// How long to wait for the ack. The kernel acks promptly, so this is only a
 /// safety net against wedging the caller.
@@ -37,14 +43,14 @@ const ACK_TIMEOUT_MS: libc::c_int = 1000;
 /// whose `poll` timed out on an earlier send can still be queued ahead of ours.
 const ACK_SCAN_LIMIT: usize = 4;
 
-/// The largest record text one message can carry (the netlink cap less the
-/// header and the trailing NUL).
-///
-/// Note the kernel applies a second, smaller limit when it *formats* the log
-/// line: it wraps the text as `msg='<text>'` and truncates at
-/// `AUDIT_MESSAGE_TEXT_MAX` (8560 bytes, `linux/audit.h`). Records comfortably
-/// under that are the only ones guaranteed to survive intact.
-pub const MAX_RECORD_LEN: usize = MAX_AUDIT_MESSAGE_LENGTH - NLMSG_HDRLEN - 1;
+/// The largest record text `send_text` accepts. Bounded by the kernel's text
+/// limit, not the datagram's, so longer text is rejected `EMSGSIZE` rather
+/// than truncated in the log.
+pub const MAX_RECORD_LEN: usize = AUDIT_MESSAGE_TEXT_MAX;
+
+/// A full-length record, framed with its header and trailing NUL, fits one
+/// datagram.
+const _: () = assert!(MAX_RECORD_LEN + NLMSG_HDRLEN < MAX_AUDIT_MESSAGE_LENGTH);
 
 /// The outcome of one emit attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -231,19 +237,29 @@ impl AuditSocket {
             }
 
             let mut buf = [0u8; 256];
-            // SAFETY: recvfrom(2) writes up to `buf.len()` bytes into `buf`;
-            // null source-address pointers mean "don't report the peer".
-            // Returns bytes read or -1.
+            let mut src: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            let mut srclen =
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+            // SAFETY: recvfrom(2) writes up to `buf.len()` bytes into `buf` and
+            // the peer address into `src` (with `srclen` in/out); both are valid
+            // for the call. Returns bytes read or -1.
             let n = retry_on_eintr(|| unsafe {
                 libc::recvfrom(
                     self.fd.as_raw_fd(),
                     buf.as_mut_ptr().cast(),
                     buf.len(),
                     0,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
+                    std::ptr::addr_of_mut!(src).cast(),
+                    &mut srclen,
                 )
             })? as usize;
+            // The kernel sends from port id 0. Any other port is a userspace
+            // peer: skip rather than attribute the ack to it.
+            if srclen as usize != std::mem::size_of::<libc::sockaddr_nl>()
+                || src.nl_pid != 0
+            {
+                continue;
+            }
             if n < NLMSG_HDRLEN {
                 continue; // runt: not an ack we can attribute
             }
@@ -337,12 +353,6 @@ mod tests {
         assert_eq!(addr.nl_family, libc::AF_NETLINK as libc::sa_family_t);
         assert_eq!(addr.nl_pid, 0);
         assert_eq!(addr.nl_groups, 0);
-    }
-
-    #[test]
-    fn record_length_bounds_match_the_netlink_cap() {
-        // The advertised cap plus the header and NUL is exactly libaudit's.
-        assert_eq!(MAX_RECORD_LEN + NLMSG_HDRLEN + 1, MAX_AUDIT_MESSAGE_LENGTH);
     }
 
     #[test]
