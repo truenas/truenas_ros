@@ -411,7 +411,7 @@ mod xattr {
                 assert!(flistxattr(f.as_fd())
                     .unwrap()
                     .iter()
-                    .any(|s| s == "user.big"));
+                    .any(|s| s.as_bytes() == b"user.big"));
             }
             // Some filesystems impose a smaller per-value limit.
             Err(Errno::E2BIG | Errno::ENOSPC) => {}
@@ -1576,7 +1576,7 @@ mod shutil {
         copy_setid(d.as_fd(), &[], 0o100755).unwrap();
         assert_eq!(mode(&d) & 0o7777, 0o755);
         // ...leaves an ACL-backed destination alone (the ACL governs mode)...
-        let acl = vec!["system.posix_acl_access".to_string()];
+        let acl = vec![c"system.posix_acl_access".to_owned()];
         copy_setid(d.as_fd(), &acl, 0o104755).unwrap();
         assert_eq!(mode(&d) & 0o7777, 0o755);
         // ...and otherwise applies them.
@@ -1600,8 +1600,10 @@ mod shutil {
             return; // user xattrs unsupported here
         }
         // A system/ACL name in the list must be skipped without error.
-        let names =
-            vec!["user.keep".to_string(), "system.posix_acl_access".into()];
+        let names = vec![
+            c"user.keep".to_owned(),
+            c"system.posix_acl_access".to_owned(),
+        ];
         copy_xattrs(s.as_fd(), d.as_fd(), &names).unwrap();
         assert_eq!(fgetxattr(d.as_fd(), "user.keep").unwrap(), b"v");
         assert!(fgetxattr(d.as_fd(), "system.posix_acl_access").is_err());

@@ -1589,6 +1589,59 @@ fn query_directory_discovers_user_xattrs() {
     });
 }
 
+/// A discovered attribute whose name is not UTF-8 is enriched under `who`: its
+/// bytes reach `fgetxattr` verbatim, so the value comes back rather than the
+/// attribute being dropped over a lossy name.
+#[test]
+fn query_directory_discovers_non_utf8_name() {
+    use std::ffi::CString;
+    use truenas_ros::uring_fs::{
+        query_directory, EnrichSpec, QueryOptions, XattrNamespaces,
+    };
+
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("a.txt"), b"aa").unwrap();
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        // A `user.` name whose trailing bytes are not valid UTF-8.
+        let name = CString::new(&b"user.\xff\xfe"[..]).unwrap();
+
+        let set_ok = {
+            let how = OpenHow::new().flags(OFlag::O_RDWR);
+            let f = h.open(me, &anchor, "a.txt", how).unwrap();
+            let (res, _) = h.fsetxattr(me, &f, &name, b"present".to_vec(), 0);
+            h.close(f).unwrap();
+            res.is_ok()
+        };
+        if !set_ok {
+            return; // fd xattrs unsupported, or the fs rejects the name
+        }
+
+        let opts = QueryOptions {
+            spec: EnrichSpec::XATTR_LIST,
+            xattr_ns: XattrNamespaces::USER,
+            ..Default::default()
+        };
+        let mut q = query_directory(&h, me, &anchor, opts).unwrap();
+        let mut found = None;
+        while let Some(batch) = q.next() {
+            for e in batch.unwrap() {
+                if e.name.as_bytes() == b"a.txt" {
+                    for (n, v) in e.xattrs {
+                        if n.as_bytes() == b"user.\xff\xfe" {
+                            found = v;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            found.as_deref(),
+            Some(&b"present"[..]),
+            "non-UTF-8 name enriched with its value, not dropped"
+        );
+    });
+}
+
 /// A discovered value larger than the initial buffer is refetched at its true
 /// size, not silently truncated or dropped.
 #[test]
@@ -1636,6 +1689,57 @@ fn query_directory_discovers_large_value() {
             found.as_deref(),
             Some(big.as_slice()),
             "the whole value is refetched"
+        );
+    });
+}
+
+/// An explicitly requested value larger than the initial buffer is returned at
+/// its true size, not reported absent: the ERANGE the fixed buffer yields must
+/// not read as "no such attribute".
+#[test]
+fn query_directory_explicit_large_value() {
+    use truenas_ros::uring_fs::{
+        query_directory, EnrichSpec, QueryOptions, XattrNamespaces,
+    };
+
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("big.bin"), b"x").unwrap();
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let name = xattr_name("user.blob");
+        let big = vec![0xcdu8; 8192]; // twice the 4096-byte explicit buffer
+
+        let set_ok = {
+            let how = OpenHow::new().flags(OFlag::O_RDWR);
+            let f = h.open(me, &anchor, "big.bin", how).unwrap();
+            let (res, _) = h.fsetxattr(me, &f, &name, big.clone(), 0);
+            h.close(f).unwrap();
+            res.is_ok()
+        };
+        if !set_ok {
+            return; // fd xattrs unsupported, or the fs rejects the value size
+        }
+
+        let opts = QueryOptions {
+            spec: EnrichSpec::XATTR,
+            xattr_names: vec![name.clone()],
+            xattr_ns: XattrNamespaces::empty(),
+            ..Default::default()
+        };
+        let mut q = query_directory(&h, me, &anchor, opts).unwrap();
+        let mut found = None;
+        while let Some(batch) = q.next() {
+            for e in batch.unwrap() {
+                if e.name.as_bytes() == b"big.bin" {
+                    // The explicit name keeps its slot, in request order.
+                    assert_eq!(e.xattrs[0].0, name);
+                    found = e.xattrs[0].1.clone();
+                }
+            }
+        }
+        assert_eq!(
+            found.as_deref(),
+            Some(big.as_slice()),
+            "the whole explicit value is returned, not reported absent"
         );
     });
 }

@@ -566,18 +566,30 @@ impl QueryDir {
             })
             .collect();
 
-        // Assemble each entry. Explicit xattrs keep their `None`-on-absent
-        // shape; a discovered value larger than the initial buffer is refetched
-        // at its true size under `who`, and one `who` cannot read is dropped.
-        // The fd is held until any refetch finishes, then dropped (each
-        // in-flight op keeps its own reference).
+        // Assemble each entry. Explicit xattrs keep their slot, with a `None`
+        // value when absent; any value larger than the initial buffer, explicit
+        // or discovered, is refetched at its true size under `who`, and a
+        // discovered attribute `who` cannot read is dropped. The fd is held
+        // until any refetch finishes, then dropped (each in-flight op keeps its
+        // own reference).
         reading
             .into_iter()
             .map(|p| {
                 let mut xattrs: Vec<(CString, Option<Vec<u8>>)> = p
                     .xattrs
                     .into_iter()
-                    .map(|(xn, pend)| (xn, pend.and_then(pending_bytes)))
+                    .map(|(xn, pend)| {
+                        let val = match pend.map(pending_discovered) {
+                            Some(DiscRead::Got(v)) => Some(v),
+                            Some(DiscRead::Grow) => {
+                                p.file.as_ref().and_then(|f| {
+                                    refetch_grow(&self.h, who, f, &xn)
+                                })
+                            }
+                            Some(DiscRead::Drop) | None => None,
+                        };
+                        (xn, val)
+                    })
                     .collect();
                 let acl = p.acl.and_then(pending_bytes);
                 for (dn, pend) in p.discovered {
@@ -697,7 +709,6 @@ fn discover_names(
             .filter(|n| {
                 namespace_of(n.as_bytes()).is_some_and(|ns| want.intersects(ns))
             })
-            .filter_map(|n| CString::new(n).ok())
             .filter(|c| !explicit.iter().any(|e| e == c))
             .collect(),
         Err(_) => Vec::new(),
@@ -737,22 +748,45 @@ fn pending_discovered(p: FsPending) -> DiscRead {
     }
 }
 
-/// Refetch a discovered attribute whose value outgrew [`DISCOVER_BUF`]: size-
-/// probe then read at that size under `who`, bounded to [`XATTR_SIZE_MAX`].
-/// `None` if it became unreadable or exceeds the cap.
+/// Refetch an attribute whose value outgrew its initial buffer: probe the size
+/// and read at that size under `who`, bounded to [`XATTR_SIZE_MAX`]. A value
+/// growing between probe and read yields `ERANGE` (rewritten to `E2BIG` once the
+/// buffer reaches the cap, `fs/xattr.c`), so retry a bounded number of times,
+/// over-allocating on retry so a steadily growing value converges. `None` if it
+/// became unreadable or exceeds the cap. Mirrors the sync `fgetxattr` retry.
 fn refetch_grow(
     h: &FsHandle,
     who: Personality,
     f: &File,
     name: &CStr,
 ) -> Option<Vec<u8>> {
-    let (size, _) = h.fgetxattr(who, f, name, Vec::new());
-    let size = size.ok()?;
-    if size > XATTR_SIZE_MAX {
-        return None;
+    const SIZE_RETRIES: u32 = 4;
+    let mut tries = 0u32;
+    loop {
+        let (size, _) = h.fgetxattr(who, f, name, Vec::new());
+        let size = size.ok()?;
+        if size > XATTR_SIZE_MAX {
+            return None;
+        }
+        // Read at the probed size; on retry add half again so a value that
+        // grew since the probe still fits without another round trip.
+        let cap = if tries == 0 {
+            size.max(1)
+        } else {
+            (size + size / 2).clamp(1, XATTR_SIZE_MAX)
+        };
+        let (n, buf) = h.fgetxattr(who, f, name, vec![0u8; cap]);
+        match n {
+            Ok(n) => return buf.get(..n).map(<[u8]>::to_vec),
+            Err(crate::Error::Errno(Errno::ERANGE | Errno::E2BIG)) => {
+                tries += 1;
+                if tries >= SIZE_RETRIES {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
     }
-    let (n, buf) = h.fgetxattr(who, f, name, vec![0u8; size]);
-    buf.get(..n.ok()?).map(<[u8]>::to_vec)
 }
 
 /// List the extended-attribute names on `f` (all namespaces), sorted. Runs a
@@ -760,10 +794,7 @@ fn refetch_grow(
 /// caller is not privileged to see (`trusted.*` without `CAP_SYS_ADMIN`) are
 /// omitted by the kernel.
 pub(crate) fn list_xattr_names(f: &File) -> crate::Result<Vec<CString>> {
-    let mut names: Vec<CString> = flistxattr(f.fd.as_fd())?
-        .into_iter()
-        .filter_map(|n| CString::new(n).ok())
-        .collect();
+    let mut names: Vec<CString> = flistxattr(f.fd.as_fd())?;
     names.sort();
     names.dedup();
     Ok(names)
@@ -785,7 +816,6 @@ pub(crate) fn scan_xattrs(
         .filter(|n| {
             namespace_of(n.as_bytes()).is_some_and(|ns| want.intersects(ns))
         })
-        .filter_map(|n| CString::new(n).ok())
         .collect();
     names.sort();
     names.dedup();

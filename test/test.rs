@@ -108,13 +108,51 @@ mod xattr {
                 let got = fgetxattr(file.as_fd(), name).unwrap();
                 assert_eq!(got, b"value");
                 let names = flistxattr(file.as_fd()).unwrap();
-                assert!(names.iter().any(|n| n == name));
+                assert!(names.iter().any(|n| n.as_bytes() == name.as_bytes()));
             }
             // Some filesystems (e.g. certain tmpfs configs) reject user
             // xattrs; treat that as "not applicable" rather than a failure.
             Err(Errno::EOPNOTSUPP) => {}
             Err(e) => panic!("fsetxattr failed unexpectedly: {e}"),
         }
+    }
+
+    // An xattr name need not be UTF-8; `flistxattr` must return its bytes
+    // verbatim so the follow-up `fgetxattr` addresses the real attribute.
+    #[test]
+    fn non_utf8_name_listed_verbatim() {
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, b"data").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        // A `user.` name whose trailing bytes are not valid UTF-8. The sync
+        // `fsetxattr` wrapper takes `&str`, so plant it through raw `libc`.
+        let name = CString::new(&b"user.\xff\xfe"[..]).unwrap();
+        // SAFETY: `file` is live; `name`/value pointers are valid for the call.
+        let rc = unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                b"v".as_ptr().cast(),
+                1,
+                0,
+            )
+        };
+        if rc != 0 {
+            // tmpfs and some configs reject `user.` xattrs; not applicable.
+            return;
+        }
+        let names = flistxattr(file.as_fd()).unwrap();
+        assert!(
+            names.iter().any(|n| n.as_bytes() == b"user.\xff\xfe"),
+            "non-UTF-8 name not returned verbatim: {names:?}"
+        );
     }
 
     #[test]
@@ -889,6 +927,58 @@ mod shutil {
         copytree, copytree_reporting, CopyTreeConfig,
     };
     use truenas_ros::Error;
+
+    // An xattr name need not be UTF-8 (the kernel checks length and namespace
+    // only, and ZFS validates names solely on the dir path under `utf8only`).
+    // The copier must address such a name by its bytes and carry it across.
+    #[test]
+    fn copies_xattr_with_non_utf8_name() {
+        use std::os::fd::AsRawFd;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("f"), b"data").unwrap();
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(src.join("f"))
+            .unwrap();
+        let name = std::ffi::CString::new(&b"user.caf\xe9\xff"[..]).unwrap();
+        // SAFETY: `f` is live; `name`/value pointers are valid for the call.
+        let rc = unsafe {
+            libc::fsetxattr(
+                f.as_raw_fd(),
+                name.as_ptr(),
+                b"v".as_ptr().cast(),
+                1,
+                0,
+            )
+        };
+        if rc != 0 {
+            return; // the filesystem rejects `user.` xattrs here
+        }
+        drop(f);
+
+        let dst = tmp.path().join("dst");
+        copytree(&src, &dst, &CopyTreeConfig::default()).unwrap();
+
+        let d = std::fs::File::open(dst.join("f")).unwrap();
+        let mut buf = [0u8; 8];
+        // SAFETY: `d` is live; `name` and `buf` are valid for the call.
+        let n = unsafe {
+            libc::fgetxattr(
+                d.as_raw_fd(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        assert_eq!(
+            (n, &buf[..1.max(n.max(0) as usize)]),
+            (1, &b"v"[..]),
+            "a non-UTF-8 xattr name must survive the copy verbatim",
+        );
+    }
 
     // A writer-less FIFO in the source must be recreated by type, not read as a
     // regular file (which would block the copy forever).
