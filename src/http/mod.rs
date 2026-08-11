@@ -36,8 +36,9 @@
 //!   botocore requests have), `Host` enforcement (missing on HTTP/1.1, or
 //!   duplicated → 400), head-size cap (431), body cap (413), chunk-line and
 //!   trailer caps (400/431), version check (505). On the write side, the
-//!   response-splitting guards: non-token header names and CR/LF-bearing
-//!   values are dropped, out-of-range statuses become 500, and bodyless
+//!   response-splitting guards: non-token header names and values with a
+//!   byte outside RFC 9110's field-value grammar are dropped, out-of-range
+//!   statuses become 500, and bodyless
 //!   statuses (1xx/204/304) never carry content.
 //!
 //! # Scope (v1)
@@ -77,3 +78,63 @@ pub use framer::{HttpConfig, HttpConn};
 pub use head::{HeaderView, Version};
 pub use protocol::{protocol, HttpRequest};
 pub use response::{HttpResponse, IntoBytes};
+
+/// Pure codec entry points exposed to the fuzz crate (`fuzz/`) under `__fuzz`
+/// only — the `http` analogue of the net stack's `frame_step` re-export.
+/// Never part of the stable API.
+///
+/// Fuzz targets to add under `fuzz/fuzz_targets/` (with matching `[[bin]]`
+/// entries in `fuzz/Cargo.toml`): `http_frame` driving [`fuzz::drive_frame`],
+/// `http_head` driving [`fuzz::head_facts`], and `http_chunked` driving
+/// [`fuzz::chunk_scan`] then [`fuzz::chunk_decode`]. B-http's generators are a
+/// ready seed corpus.
+#[cfg(feature = "__fuzz")]
+pub mod fuzz {
+    use std::borrow::Cow;
+
+    use super::chunked::{self, ChunkScan};
+    use super::framer::{frame, HttpConfig, HttpConn};
+    use super::head::{frame_facts, HeaderView};
+    use crate::net::Framing;
+
+    /// Drive the framing state machine over `data`, feeding progressively
+    /// longer prefixes so the resumable phases (chunk scan, head re-parse) run
+    /// exactly as a drip-fed socket drives them. Returns the terminal verdict.
+    pub fn drive_frame(data: &[u8]) -> Framing {
+        let cfg = HttpConfig::default();
+        let mut conn = HttpConn::new(());
+        let mut verdict = Framing::More;
+        for end in 0..=data.len() {
+            verdict = frame(&data[..end], &mut conn, &cfg);
+            if !matches!(verdict, Framing::More) {
+                break;
+            }
+        }
+        verdict
+    }
+
+    /// Run the head tokenizer and semantic rules over `data`, returning the
+    /// head length, the expect-continue flag, and whether the body verdict was
+    /// `Ok` (the body enum itself stays crate-private); `Err` is the
+    /// die-with status.
+    pub fn head_facts(data: &[u8]) -> Result<Option<(usize, bool, bool)>, u16> {
+        Ok(frame_facts(data)?
+            .map(|f| (f.len, f.expects_continue, f.body.is_ok())))
+    }
+
+    /// Resumable chunk scan over a body region: `Ok(Some(extent))` once the
+    /// message completes, `Ok(None)` for need-more, `Err(status)` for
+    /// malformed or oversized input.
+    pub fn chunk_scan(body: &[u8]) -> Result<Option<usize>, u16> {
+        chunked::scan(body, &mut ChunkScan::default())
+    }
+
+    /// One-shot decode of a fully framed chunked body into its entity bytes
+    /// and trailer fields.
+    #[allow(clippy::result_unit_err)]
+    pub fn chunk_decode(
+        body: &[u8],
+    ) -> Result<(Cow<'_, [u8]>, Vec<HeaderView<'_>>), ()> {
+        chunked::decode(body)
+    }
+}

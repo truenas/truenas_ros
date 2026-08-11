@@ -43,9 +43,21 @@ pub struct HeaderView<'a> {
     pub value: &'a [u8],
 }
 
-/// A completely tokenized request head, borrowed from the connection buffer.
-/// (Its length is not carried: the glue always parses exactly the head bytes
-/// the framer declared, so the span is the input itself.)
+impl HeaderView<'_> {
+    /// The filler a caller uses to initialize a fixed `[HeaderView; N]` before
+    /// [`parse_head`] overwrites the first `n` slots. Its targets are
+    /// `'static`, so the array adopts whatever buffer lifetime the parse needs.
+    pub(crate) const EMPTY: HeaderView<'static> = HeaderView {
+        name: "",
+        value: &[],
+    };
+}
+
+/// A completely tokenized request head. Method and target borrow the
+/// connection buffer; the header index borrows a fixed array the caller owns
+/// (so tokenizing a head allocates nothing). (Its length is not carried: the
+/// glue always parses exactly the head bytes the framer declared, so the span
+/// is the input itself.)
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Head<'a> {
     /// Request method, verbatim (`httparse` guarantees a valid token).
@@ -54,8 +66,8 @@ pub(crate) struct Head<'a> {
     pub target: &'a str,
     /// Protocol version.
     pub version: Version,
-    /// Headers in wire order.
-    pub headers: Vec<HeaderView<'a>>,
+    /// Headers in wire order, borrowed from the caller's array.
+    pub headers: &'a [HeaderView<'a>],
 }
 
 /// The facts framing needs from a complete head — everything [`frame`]
@@ -127,21 +139,31 @@ fn host_check<'h>(
 }
 
 /// Tokenize a (possibly incomplete) request head into the full [`Head`] view.
+/// The header index is written into `headers`, which the caller owns, so the
+/// parse needs no heap allocation; the returned head borrows the first `n`
+/// filled slots.
 ///
 /// `Ok(None)` means "need more bytes"; `Ok(Some(head))` is a complete head;
 /// `Err(status)` is the response status the connection should die with.
-pub(crate) fn parse_head(buf: &[u8]) -> Result<Option<Head<'_>>, u16> {
+pub(crate) fn parse_head<'a, 'buf>(
+    buf: &'buf [u8],
+    headers: &'a mut [HeaderView<'buf>; MAX_HEADERS],
+) -> Result<Option<Head<'a>>, u16> {
     let mut slots = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let Some((req, _len, version)) = tokenize(buf, &mut slots)? else {
         return Ok(None);
     };
+    let n = req.headers.len();
+    for (dst, h) in headers.iter_mut().zip(req.headers.iter()) {
+        *dst = view(h);
+    }
     Ok(Some(Head {
         // Complete parses always carry method/path; treat absence as malformed
         // rather than panicking on a tokenizer contract we don't control.
         method: req.method.ok_or(400u16)?,
         target: req.path.ok_or(400u16)?,
         version,
-        headers: req.headers.iter().map(view).collect(),
+        headers: &headers[..n],
     }))
 }
 
@@ -342,68 +364,104 @@ fn parse_content_length(v: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
-    fn complete(buf: &[u8]) -> Head<'_> {
-        parse_head(buf).expect("parse ok").expect("head complete")
+    /// Parse a complete head and run `f` against it. The header array must
+    /// outlive the borrow, so the helper owns it and hands the head to a
+    /// closure rather than returning it.
+    fn complete<R>(buf: &[u8], f: impl FnOnce(&Head<'_>) -> R) -> R {
+        let mut headers: [HeaderView<'_>; MAX_HEADERS] =
+            [HeaderView::EMPTY; MAX_HEADERS];
+        let head = parse_head(buf, &mut headers)
+            .expect("parse ok")
+            .expect("head complete");
+        f(&head)
     }
 
     #[test]
     fn simple_get() {
-        let h = complete(
+        complete(
             b"GET /bucket/key?list-type=2 HTTP/1.1\r\nHost: s\r\n\r\n",
+            |h| {
+                assert_eq!(h.method, "GET");
+                assert_eq!(h.target, "/bucket/key?list-type=2");
+                assert_eq!(h.version, Version::Http11);
+                assert_eq!(h.body(), Ok(BodyKind::Known(0)));
+                assert!(h.keep_alive());
+                assert_eq!(h.header("host"), Some(&b"s"[..]));
+                assert_eq!(h.header("HOST"), Some(&b"s"[..]));
+            },
         );
-        assert_eq!(h.method, "GET");
-        assert_eq!(h.target, "/bucket/key?list-type=2");
-        assert_eq!(h.version, Version::Http11);
-        assert_eq!(h.body(), Ok(BodyKind::Known(0)));
-        assert!(h.keep_alive());
-        assert_eq!(h.header("host"), Some(&b"s"[..]));
-        assert_eq!(h.header("HOST"), Some(&b"s"[..]));
     }
 
     #[test]
     fn partial_then_complete() {
         let full = b"PUT /k HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\n";
+        let mut headers: [HeaderView<'_>; MAX_HEADERS] =
+            [HeaderView::EMPTY; MAX_HEADERS];
         for cut in 0..full.len() {
-            assert!(parse_head(&full[..cut]).expect("partial ok").is_none());
+            assert!(parse_head(&full[..cut], &mut headers)
+                .expect("partial ok")
+                .is_none());
         }
         let facts = frame_facts(full).expect("parse ok").expect("complete");
         assert_eq!(facts.len, full.len());
-        assert_eq!(complete(full).body(), Ok(BodyKind::Known(5)));
+        complete(full, |h| assert_eq!(h.body(), Ok(BodyKind::Known(5))));
     }
 
     #[test]
     fn malformed_is_400() {
-        assert_eq!(parse_head(b"GET\x00/ HTTP/1.1\r\n\r\n"), Err(400));
+        let mut headers: [HeaderView<'_>; MAX_HEADERS] =
+            [HeaderView::EMPTY; MAX_HEADERS];
+        assert_eq!(
+            parse_head(b"GET\x00/ HTTP/1.1\r\n\r\n", &mut headers),
+            Err(400)
+        );
     }
 
     #[test]
     fn version_gate() {
-        assert_eq!(parse_head(b"GET / HTTP/2.0\r\n\r\n"), Err(505));
-        let h10 = complete(b"GET / HTTP/1.0\r\n\r\n");
-        assert_eq!(h10.version, Version::Http10);
-        assert!(!h10.keep_alive());
+        let mut headers: [HeaderView<'_>; MAX_HEADERS] =
+            [HeaderView::EMPTY; MAX_HEADERS];
+        assert_eq!(
+            parse_head(b"GET / HTTP/2.0\r\n\r\n", &mut headers),
+            Err(505)
+        );
+        complete(b"GET / HTTP/1.0\r\n\r\n", |h10| {
+            assert_eq!(h10.version, Version::Http10);
+            assert!(!h10.keep_alive());
+        });
     }
 
     #[test]
     fn host_enforcement() {
+        let mut headers: [HeaderView<'_>; MAX_HEADERS] =
+            [HeaderView::EMPTY; MAX_HEADERS];
         // HTTP/1.1 without Host: 400 (RFC 9112 §3.2).
-        assert_eq!(parse_head(b"GET / HTTP/1.1\r\n\r\n"), Err(400));
+        assert_eq!(
+            parse_head(b"GET / HTTP/1.1\r\n\r\n", &mut headers),
+            Err(400)
+        );
         // HTTP/1.0 predates Host; absence is fine.
-        assert!(parse_head(b"GET / HTTP/1.0\r\n\r\n").is_ok());
+        assert!(parse_head(b"GET / HTTP/1.0\r\n\r\n", &mut headers).is_ok());
         // Duplicate Host: 400 on any version.
         assert_eq!(
-            parse_head(b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"),
+            parse_head(
+                b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+                &mut headers
+            ),
             Err(400)
         );
         assert_eq!(
-            parse_head(b"GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n"),
+            parse_head(
+                b"GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n",
+                &mut headers
+            ),
             Err(400)
         );
     }
 
     #[test]
     fn transfer_encoding_rules() {
-        let body = |req: &[u8]| complete(req).body();
+        let body = |req: &[u8]| complete(req, |h| h.body());
         // TE chunked alone: the chunked framing path.
         assert_eq!(
             body(b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"),
@@ -464,15 +522,15 @@ mod tests {
 
     #[test]
     fn duplicate_content_length_rules() {
-        let dup = complete(
+        complete(
             b"PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\n",
+            |dup| assert_eq!(dup.body(), Err(400)),
         );
-        assert_eq!(dup.body(), Err(400));
         // Duplicate CL stays fatal even when TE would win the framing.
-        let dup_te = complete(
+        complete(
             b"PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n",
+            |dup_te| assert_eq!(dup_te.body(), Err(400)),
         );
-        assert_eq!(dup_te.body(), Err(400));
     }
 
     #[test]
@@ -489,44 +547,47 @@ mod tests {
 
     #[test]
     fn expect_and_connection_tokens() {
-        let h = complete(
+        complete(
             b"PUT / HTTP/1.1\r\nHost: h\r\nExpect: 100-Continue\r\nConnection: foo, Close\r\nContent-Length: 1\r\n\r\n",
+            |h| {
+                assert!(h.expects_continue());
+                assert!(!h.keep_alive());
+            },
         );
-        assert!(h.expects_continue());
-        assert!(!h.keep_alive());
-        let h10 = complete(b"GET / HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n");
-        assert!(h10.keep_alive());
+        complete(b"GET / HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n", |h10| {
+            assert!(h10.keep_alive())
+        });
     }
 
     #[test]
     fn list_fields_combine_across_lines() {
         // Connection tokens count on any field line (RFC 9110 §5.3).
-        let h = complete(
+        complete(
             b"GET / HTTP/1.1\r\nHost: h\r\nConnection: upgrade\r\nConnection: close\r\n\r\n",
+            |h| assert!(!h.keep_alive()),
         );
-        assert!(!h.keep_alive());
-        let h10 = complete(
+        complete(
             b"GET / HTTP/1.0\r\nConnection: foo\r\nConnection: keep-alive\r\n\r\n",
+            |h10| assert!(h10.keep_alive()),
         );
-        assert!(h10.keep_alive());
         // Expect: honored as a list member or on a later field line.
-        let list = complete(
+        complete(
             b"PUT / HTTP/1.1\r\nHost: h\r\nExpect: ext, 100-continue\r\nContent-Length: 1\r\n\r\n",
+            |list| assert!(list.expects_continue()),
         );
-        assert!(list.expects_continue());
-        let second = complete(
+        complete(
             b"PUT / HTTP/1.1\r\nHost: h\r\nExpect: ext\r\nExpect: 100-continue\r\nContent-Length: 1\r\n\r\n",
+            |second| assert!(second.expects_continue()),
         );
-        assert!(second.expects_continue());
     }
 
     #[test]
     fn expect_ignored_on_http10() {
         // RFC 9110 §10.1.1: a 1.0 client can't parse an interim response.
-        let h = complete(
+        complete(
             b"PUT / HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 1\r\n\r\n",
+            |h| assert!(!h.expects_continue()),
         );
-        assert!(!h.expects_continue());
     }
 
     #[test]
@@ -539,10 +600,12 @@ mod tests {
             b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
         ];
         for req in reqs {
-            let head = complete(req);
-            let facts = frame_facts(req).expect("parse ok").expect("complete");
-            assert_eq!(facts.body, head.body());
-            assert_eq!(facts.expects_continue, head.expects_continue());
+            complete(req, |head| {
+                let facts =
+                    frame_facts(req).expect("parse ok").expect("complete");
+                assert_eq!(facts.body, head.body());
+                assert_eq!(facts.expects_continue, head.expects_continue());
+            });
         }
         // Error and partial verdicts agree too.
         assert_eq!(frame_facts(b"GET / HTTP/1.1\r\n\r\n").err(), Some(400));

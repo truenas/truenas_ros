@@ -16,14 +16,15 @@ use crate::net::ClientAddr;
 use super::chunked;
 use super::date::HttpDate;
 use super::framer::{frame, HttpConfig, HttpConn, Phase};
-use super::head::{parse_head, Head, HeaderView, Version};
+use super::head::{parse_head, Head, HeaderView, Version, MAX_HEADERS};
 use super::response::{serialize, ConnHeader, HttpResponse};
 
 /// One HTTP request, as handed to the consumer's handler.
 ///
 /// Everything borrows from the connection buffer (or the codec's head stash
-/// on the 100-continue path) — no per-request allocation beyond the header
-/// index. `raw_head` is the head block verbatim, byte-for-byte as the client
+/// on the 100-continue path); the header index is a slice into a fixed array
+/// on the caller's stack, so a request costs no per-request heap allocation.
+/// `raw_head` is the head block verbatim, byte-for-byte as the client
 /// sent it: signature schemes that canonicalize "headers as sent" (SigV4)
 /// read from here, never from a cooked view. `#[non_exhaustive]`, so future
 /// context becomes a field addition rather than a breaking change.
@@ -120,7 +121,9 @@ fn dispatch<U, H>(
 where
     H: FnMut(HttpRequest<'_>, &mut U) -> HttpResponse,
 {
-    match parse_head(head_bytes) {
+    let mut headers: [HeaderView<'_>; MAX_HEADERS] =
+        [HeaderView::EMPTY; MAX_HEADERS];
+    match parse_head(head_bytes, &mut headers) {
         // The framer completed on these exact bytes (or on the stash it
         // parsed once already); a divergence here is a codec bug, answered
         // as such.
@@ -131,7 +134,7 @@ where
                     method: h.method,
                     target: h.target,
                     version: h.version,
-                    headers: &h.headers,
+                    headers: h.headers,
                     body,
                     raw_head: head_bytes,
                     trailers,

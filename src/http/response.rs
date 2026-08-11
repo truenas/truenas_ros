@@ -4,8 +4,9 @@
 //! could desynchronize framing from the actual byte stream would reintroduce
 //! the smuggling class the head parser screens out. The same policy covers
 //! the header bytes themselves: names that are not RFC 9110 tokens and
-//! values carrying CR/LF/NUL are dropped too, so handler-echoed input can
-//! never split a response, and statuses that don't fit the three-digit
+//! values with any byte outside RFC 9110's field-value grammar are dropped
+//! too, so handler-echoed input can never split a response, and statuses
+//! that don't fit the three-digit
 //! status-line grammar are replaced with 500.
 
 use std::borrow::Cow;
@@ -25,7 +26,7 @@ use super::date::HttpDate;
 #[derive(Debug)]
 pub struct HttpResponse {
     pub(crate) status: u16,
-    pub(crate) headers: Vec<(Cow<'static, str>, Cow<'static, [u8]>)>,
+    pub(crate) headers: Headers,
     pub(crate) body: Cow<'static, [u8]>,
     pub(crate) close: bool,
 }
@@ -77,6 +78,59 @@ impl IntoBytes for Cow<'static, [u8]> {
     }
 }
 
+/// A response header pair: name and undecoded value, both `Cow<'static, _>`
+/// so a response built from literals borrows rather than allocates.
+pub(crate) type Header = (Cow<'static, str>, Cow<'static, [u8]>);
+
+/// Inline capacity for [`Headers`]. Every response this codec emits carries
+/// well under this many fields, so the common case never touches the heap.
+const INLINE_HEADERS: usize = 8;
+
+/// Response headers, stored inline until they spill. The first
+/// [`INLINE_HEADERS`] pairs live in a stack array; only fields past that go to
+/// `spilled`, whose backing `Vec` stays unallocated until then. The common
+/// case — an S3 200 carries a handful of fields — allocates nothing for its
+/// headers.
+#[derive(Debug)]
+pub(crate) struct Headers {
+    /// The first fields, in wire order; `inline_len` slots are filled.
+    inline: [Option<Header>; INLINE_HEADERS],
+    /// How many `inline` slots are filled.
+    inline_len: usize,
+    /// Fields past the inline capacity; empty (and unallocated) until spill.
+    spilled: Vec<Header>,
+}
+
+impl Default for Headers {
+    fn default() -> Self {
+        Headers {
+            inline: std::array::from_fn(|_| None),
+            inline_len: 0,
+            spilled: Vec::new(),
+        }
+    }
+}
+
+impl Headers {
+    /// Append a pair in wire order, spilling to the heap past the inline cap.
+    fn push(&mut self, h: Header) {
+        if self.inline_len < INLINE_HEADERS {
+            self.inline[self.inline_len] = Some(h);
+            self.inline_len += 1;
+        } else {
+            self.spilled.push(h);
+        }
+    }
+
+    /// The stored pairs in wire order.
+    fn iter(&self) -> impl Iterator<Item = &Header> {
+        self.inline[..self.inline_len]
+            .iter()
+            .map(|slot| slot.as_ref().expect("slot below len is filled"))
+            .chain(&self.spilled)
+    }
+}
+
 impl HttpResponse {
     /// Start a response with `status` (e.g. `200`), empty body, no headers.
     ///
@@ -91,7 +145,7 @@ impl HttpResponse {
             } else {
                 500
             },
-            headers: Vec::new(),
+            headers: Headers::default(),
             body: Cow::Borrowed(&[]),
             close: false,
         }
@@ -100,7 +154,8 @@ impl HttpResponse {
     /// Append a header. `Content-Length`, `Connection`, `Date`, and
     /// `Transfer-Encoding` are codec-owned and ignored here (see module
     /// docs). Also ignored: names that are not RFC 9110 tokens and values
-    /// containing CR, LF, or NUL — serializing those verbatim would let
+    /// with a byte outside RFC 9110 §5.5's field-value grammar (CR, LF, NUL,
+    /// the other C0 controls, or DEL) — serializing those verbatim would let
     /// handler-echoed bytes terminate the field line early and inject
     /// response framing (response splitting).
     ///
@@ -177,10 +232,14 @@ fn is_token(name: &str) -> bool {
         })
 }
 
-/// CR, LF, or NUL in a field value ends the field line before the serializer
-/// meant it to — the write-side twin of the parser's smuggling screens.
+/// Whether a field value carries a byte a serialized field line may not.
+/// RFC 9110 §5.5 admits only field-vchar (VCHAR `0x21..=0x7E` / obs-text
+/// `0x80..=0xFF`), SP, and HTAB; every other byte is rejected — the CR/LF/NUL
+/// that split a response, and the rest of the C0 controls and DEL, which S3
+/// echoes verbatim in `x-amz-meta-*`. The write-side twin of the parser's
+/// smuggling screens; mirrors httparse's request-side header-value map.
 fn has_field_break(value: &[u8]) -> bool {
-    value.iter().any(|&b| matches!(b, b'\r' | b'\n' | b'\0'))
+    value.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f)
 }
 
 /// The `Connection` header the response should carry, if any: HTTP/1.1
@@ -239,7 +298,7 @@ pub(crate) fn serialize(
         }
         ConnHeader::Close => out.extend_from_slice(b"Connection: close\r\n"),
     }
-    for (name, value) in &resp.headers {
+    for (name, value) in resp.headers.iter() {
         write!(out, "{name}: ").unwrap();
         out.extend_from_slice(value);
         out.extend_from_slice(b"\r\n");
@@ -281,6 +340,14 @@ fn reason(status: u16) -> &'static str {
 }
 
 #[cfg(test)]
+impl HttpResponse {
+    /// Whether the headers still fit the inline array (no heap spill yet).
+    fn headers_inline(&self) -> bool {
+        self.headers.spilled.is_empty()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -307,6 +374,33 @@ mod tests {
              x-amz-request-id: abc123\r\n\
              \r\n\
              hello"
+        );
+    }
+
+    #[test]
+    fn headers_inline_then_spill_in_order() {
+        // Distinct names so the wire order is checkable across the spill.
+        let names: [&str; INLINE_HEADERS + 1] = [
+            "x-0", "x-1", "x-2", "x-3", "x-4", "x-5", "x-6", "x-7", "x-8",
+        ];
+        let mut r = HttpResponse::new(200);
+        for (i, n) in names.iter().enumerate() {
+            r = r.header(*n, "v");
+            // Inline until the array fills; the pair past the cap spills.
+            assert_eq!(r.headers_inline(), i < INLINE_HEADERS, "after {i}");
+        }
+        let out = serialize(&r, false, date(), ConnHeader::None);
+        let s = text(&out);
+        let positions: Vec<usize> = names
+            .iter()
+            .map(|n| {
+                s.find(&format!("{n}: v"))
+                    .unwrap_or_else(|| panic!("{n} missing:\n{s}"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "push order not preserved:\n{s}"
         );
     }
 
@@ -389,6 +483,35 @@ mod tests {
         assert!(!s.contains("x-colon"));
         // Exactly one response head on the wire.
         assert_eq!(s.matches("HTTP/1.1").count(), 1);
+    }
+
+    #[test]
+    fn field_value_restricted_to_rfc9110_grammar() {
+        // Beyond CR/LF/NUL, the other C0 controls and DEL can't ride into a
+        // field line; HTAB, SP, VCHAR, and obs-text may.
+        let resp = HttpResponse::new(200)
+            .header("x-vt", &b"a\x0bb"[..]) // vertical tab
+            .header("x-ff", &b"a\x0cb"[..]) // form feed
+            .header("x-soh", &b"a\x01b"[..]) // C0 control
+            .header("x-us", &b"a\x1fb"[..]) // unit separator
+            .header("x-del", &b"a\x7fb"[..]) // DEL
+            .header("x-tab", &b"a\tb"[..]) // HTAB — allowed
+            .header("x-obs", &b"caf\xe9"[..]) // obs-text — allowed
+            .header("x-ok", "plain");
+        let out = serialize(&resp, false, date(), ConnHeader::None);
+        let has =
+            |needle: &[u8]| out.windows(needle.len()).any(|w| w == needle);
+        for dropped in [&b"x-vt"[..], b"x-ff", b"x-soh", b"x-us", b"x-del"] {
+            assert!(
+                !has(dropped),
+                "{} not dropped",
+                String::from_utf8_lossy(dropped)
+            );
+        }
+        // Allowed values survive verbatim, in wire form.
+        assert!(has(b"x-tab: a\tb\r\n"));
+        assert!(has(b"x-obs: caf\xe9\r\n"));
+        assert!(has(b"x-ok: plain\r\n"));
     }
 
     #[test]

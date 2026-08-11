@@ -92,9 +92,10 @@ http = ["net-server", "dep:httparse"]
 # `sync-fs` for the shared OpenHow/ResolveFlag vocabulary; combine with
 # `net-server` for the in-server reactor (`ServerConfig::fs_files`).
 uring-fs = ["uring", "sync-fs", "xattr"]
-# Internal: exposes the pure `frame_step` framing decision to the fuzz crate
-# (`fuzz/`). Not for consumers; implies `net-server` (where `frame_step` lives).
-__fuzz = ["net-server"]
+# Internal: exposes pure framing decisions to the fuzz crate (`fuzz/`) — the
+# net stack's `frame_step`, and the `http` codec's framer/head/chunked entry
+# points (`http::fuzz`). Not for consumers; implies the modules those live in.
+__fuzz = ["net-server", "http"]
 full = [
     "sync-fs",
     "xattr",
