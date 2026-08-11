@@ -168,6 +168,11 @@ pub(crate) enum Phase {
     Fail {
         /// Response status for the farewell (400/413/431/501/505).
         status: u16,
+        /// Whether the dying request was a HEAD, recorded when the failure
+        /// is declared — the last moment the head bytes are reliably at
+        /// hand. By delivery time the dance may have consumed them, leaving
+        /// only body bytes, and body bytes are client-chosen.
+        head_only: bool,
     },
 }
 
@@ -199,10 +204,16 @@ impl<U> std::fmt::Debug for HttpConn<U> {
     }
 }
 
-/// Fail the connection: remember the farewell status and deliver everything
-/// buffered as a degenerate message so the glue runs exactly once more.
-fn fail(phase: &mut Phase, buf_len: usize, status: u16) -> Framing {
-    *phase = Phase::Fail { status };
+/// Fail the connection: remember the farewell status (and whether the dying
+/// request was a HEAD) and deliver everything buffered as a degenerate
+/// message so the glue runs exactly once more.
+fn fail(
+    phase: &mut Phase,
+    buf_len: usize,
+    status: u16,
+    head_only: bool,
+) -> Framing {
+    *phase = Phase::Fail { status, head_only };
     Framing::Complete {
         header_len: buf_len,
         body_len: 0,
@@ -273,77 +284,102 @@ pub(crate) fn frame<U>(
             scan_step(buf, conn, cfg)
         }
         Phase::ChunkedBody { .. } => scan_step(buf, conn, cfg),
-        Phase::Head => match frame_facts(buf) {
-            Err(status) => fail(&mut conn.phase, buf.len(), status),
-            Ok(None) => {
-                if buf.len() > cfg.max_head {
-                    fail(&mut conn.phase, buf.len(), 431)
-                } else {
-                    Framing::More
+        Phase::Head => {
+            // In this phase the buffer front IS the head region, so the
+            // method prefix is sound to read here — unlike at delivery,
+            // where the dance may have consumed the head already.
+            let head_only = buf.starts_with(b"HEAD ");
+            match frame_facts(buf) {
+                Err(status) => {
+                    fail(&mut conn.phase, buf.len(), status, head_only)
+                }
+                Ok(None) => {
+                    if buf.len() > cfg.max_head {
+                        fail(&mut conn.phase, buf.len(), 431, head_only)
+                    } else {
+                        Framing::More
+                    }
+                }
+                Ok(Some(facts)) => {
+                    if facts.len > cfg.max_head {
+                        return fail(
+                            &mut conn.phase,
+                            buf.len(),
+                            431,
+                            head_only,
+                        );
+                    }
+                    let body = match facts.body {
+                        Ok(b) => b,
+                        Err(status) => {
+                            return fail(
+                                &mut conn.phase,
+                                buf.len(),
+                                status,
+                                head_only,
+                            )
+                        }
+                    };
+                    match body {
+                        BodyKind::Known(body_len) => {
+                            if body_len > cfg.max_body {
+                                return fail(
+                                    &mut conn.phase,
+                                    buf.len(),
+                                    413,
+                                    head_only,
+                                );
+                            }
+                            if facts.expects_continue && body_len > 0 {
+                                let head_len = facts.len;
+                                conn.phase = Phase::ExpectHead {
+                                    head: buf[..head_len].to_vec(),
+                                    body: BodyKind::Known(body_len),
+                                };
+                                Framing::Complete {
+                                    header_len: head_len,
+                                    body_len: 0,
+                                }
+                            } else {
+                                Framing::Complete {
+                                    header_len: facts.len,
+                                    body_len,
+                                }
+                            }
+                        }
+                        BodyKind::Chunked => {
+                            if facts.expects_continue {
+                                // Chunked always dances when asked: the
+                                // extent is unknown, so there is no "empty
+                                // body" way out, and the client is waiting
+                                // for the 100 before it sends even the
+                                // terminal chunk.
+                                let head_len = facts.len;
+                                conn.phase = Phase::ExpectHead {
+                                    head: buf[..head_len].to_vec(),
+                                    body: BodyKind::Chunked,
+                                };
+                                Framing::Complete {
+                                    header_len: head_len,
+                                    body_len: 0,
+                                }
+                            } else {
+                                conn.phase = Phase::ChunkedBody {
+                                    stash: None,
+                                    head_len: facts.len,
+                                    scan: ChunkScan::default(),
+                                };
+                                // Scan immediately: the whole body may
+                                // already be buffered, and `More` would
+                                // stall waiting for bytes that will never
+                                // come.
+                                scan_step(buf, conn, cfg)
+                            }
+                        }
+                    }
                 }
             }
-            Ok(Some(facts)) => {
-                if facts.len > cfg.max_head {
-                    return fail(&mut conn.phase, buf.len(), 431);
-                }
-                let body = match facts.body {
-                    Ok(b) => b,
-                    Err(status) => {
-                        return fail(&mut conn.phase, buf.len(), status)
-                    }
-                };
-                match body {
-                    BodyKind::Known(body_len) => {
-                        if body_len > cfg.max_body {
-                            return fail(&mut conn.phase, buf.len(), 413);
-                        }
-                        if facts.expects_continue && body_len > 0 {
-                            let head_len = facts.len;
-                            conn.phase = Phase::ExpectHead {
-                                head: buf[..head_len].to_vec(),
-                                body: BodyKind::Known(body_len),
-                            };
-                            Framing::Complete {
-                                header_len: head_len,
-                                body_len: 0,
-                            }
-                        } else {
-                            Framing::Complete {
-                                header_len: facts.len,
-                                body_len,
-                            }
-                        }
-                    }
-                    BodyKind::Chunked => {
-                        if facts.expects_continue {
-                            // Chunked always dances when asked: the extent
-                            // is unknown, so there is no "empty body" way
-                            // out, and the client is waiting for the 100
-                            // before it sends even the terminal chunk.
-                            let head_len = facts.len;
-                            conn.phase = Phase::ExpectHead {
-                                head: buf[..head_len].to_vec(),
-                                body: BodyKind::Chunked,
-                            };
-                            Framing::Complete {
-                                header_len: head_len,
-                                body_len: 0,
-                            }
-                        } else {
-                            conn.phase = Phase::ChunkedBody {
-                                stash: None,
-                                head_len: facts.len,
-                                scan: ChunkScan::default(),
-                            };
-                            // Scan immediately: the whole body may already
-                            // be buffered, and `More` would stall waiting
-                            // for bytes that will never come.
-                            scan_step(buf, conn, cfg)
-                        }
-                    }
-                }
-            }
-        },
+        }
     }
 }
 
@@ -363,21 +399,29 @@ fn scan_step<U>(
     } = &mut conn.phase
     else {
         // Caller invariant; degrade like the other impossible phases.
-        return fail(&mut conn.phase, buf.len(), 500);
+        // Nothing about the request is knowable here, so no HEAD flag.
+        return fail(&mut conn.phase, buf.len(), 500, false);
+    };
+    // The head bytes are still at hand — stashed by the dance, or at the
+    // buffer front when the head was never consumed. Read the method now;
+    // at delivery the buffer may hold body bytes alone.
+    let head_only = match stash {
+        Some(h) => h.starts_with(b"HEAD "),
+        None => buf.starts_with(b"HEAD "),
     };
     let header_len = *head_len;
     let body = buf.get(header_len..).unwrap_or(&[]);
     match chunked::scan(body, scan) {
-        Err(status) => fail(&mut conn.phase, buf.len(), status),
+        Err(status) => fail(&mut conn.phase, buf.len(), status, head_only),
         Ok(None) => {
             let decoded = scan.decoded;
             let consumed = scan.consumed;
             if decoded > cfg.max_body {
-                fail(&mut conn.phase, buf.len(), 413)
+                fail(&mut conn.phase, buf.len(), 413, head_only)
             } else if consumed
                 > cfg.max_body.saturating_add(CHUNK_WIRE_OVERHEAD)
             {
-                fail(&mut conn.phase, buf.len(), 400)
+                fail(&mut conn.phase, buf.len(), 400, head_only)
             } else {
                 Framing::More
             }
@@ -385,7 +429,7 @@ fn scan_step<U>(
         Ok(Some(extent)) => {
             let decoded = scan.decoded;
             if decoded > cfg.max_body {
-                return fail(&mut conn.phase, buf.len(), 413);
+                return fail(&mut conn.phase, buf.len(), 413, head_only);
             }
             let stash = stash.take();
             conn.phase = Phase::ChunkedDone { stash };
@@ -555,7 +599,7 @@ mod tests {
                 body_len: 0
             }
         );
-        assert!(matches!(c.phase, Phase::Fail { status: 400 }));
+        assert!(matches!(c.phase, Phase::Fail { status: 400, .. }));
     }
 
     #[test]
@@ -569,7 +613,7 @@ mod tests {
                 body_len: 0
             }
         );
-        assert!(matches!(c.phase, Phase::Fail { status: 400 }));
+        assert!(matches!(c.phase, Phase::Fail { status: 400, .. }));
     }
 
     #[test]
@@ -589,7 +633,7 @@ mod tests {
                 body_len: 0
             }
         );
-        assert!(matches!(c.phase, Phase::Fail { status: 431 }));
+        assert!(matches!(c.phase, Phase::Fail { status: 431, .. }));
 
         // A head that completes in one arrival but lands over the cap.
         let mut c = conn();
@@ -603,7 +647,7 @@ mod tests {
                 body_len: 0
             }
         );
-        assert!(matches!(c.phase, Phase::Fail { status: 431 }));
+        assert!(matches!(c.phase, Phase::Fail { status: 431, .. }));
     }
 
     #[test]
@@ -621,7 +665,7 @@ mod tests {
                 body_len: 0
             }
         );
-        assert!(matches!(c.phase, Phase::Fail { status: 413 }));
+        assert!(matches!(c.phase, Phase::Fail { status: 413, .. }));
     }
 
     #[test]
@@ -730,7 +774,7 @@ mod tests {
                 body_len: 0
             }
         );
-        assert!(matches!(c.phase, Phase::Fail { status: 413 }));
+        assert!(matches!(c.phase, Phase::Fail { status: 413, .. }));
     }
 
     #[test]
@@ -750,7 +794,7 @@ mod tests {
             raw.extend_from_slice(b"1\r\nX\r\n");
         }
         frame(&raw, &mut c, &small);
-        assert!(matches!(c.phase, Phase::Fail { status: 400 }));
+        assert!(matches!(c.phase, Phase::Fail { status: 400, .. }));
     }
 
     #[test]
@@ -761,7 +805,7 @@ mod tests {
         let mut raw = head.to_vec();
         raw.extend_from_slice(b"FFFFFFFFFFFFFFFFF\r\n");
         frame(&raw, &mut c, &cfg());
-        assert!(matches!(c.phase, Phase::Fail { status: 400 }));
+        assert!(matches!(c.phase, Phase::Fail { status: 400, .. }));
     }
 
     #[test]
@@ -769,7 +813,7 @@ mod tests {
         let mut c = conn();
         let req = b"PUT /k HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
         frame(req, &mut c, &cfg());
-        assert!(matches!(c.phase, Phase::Fail { status: 501 }));
+        assert!(matches!(c.phase, Phase::Fail { status: 501, .. }));
     }
 
     #[test]
