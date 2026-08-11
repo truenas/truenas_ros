@@ -24,12 +24,13 @@ use crate::errno::{retry_on_eintr, Errno};
 use crate::sync_fs::xattr::{flistxattr, XATTR_SIZE_MAX};
 use crate::sync_fs::{AtFlags, OFlag, OpenHow, Statx, StatxMask};
 use bitflags::bitflags;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt;
 use std::os::fd::{AsFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -79,6 +80,12 @@ bitflags! {
         const SECURITY = 0b0100;
         /// The `system.` namespace (ACLs; e.g. `system.posix_acl_access`,
         /// `system.nfs4_acl_xdr`).
+        ///
+        /// On an `acltype=nfsv4` dataset ZFS lists `system.nfs4_acl_xdr` only
+        /// when the ACL is **not** trivial (`zpl_xattr_list`), and almost every
+        /// object carries a trivial one — so discovery alone is not a reliable
+        /// way to pick ACLs up. Ask for [`EnrichSpec::ACL`] instead, which
+        /// fetches [`QueryOptions::acl_name`] directly.
         const SYSTEM = 0b1000;
     }
 }
@@ -210,6 +217,14 @@ pub struct DirEntry {
     pub xattrs: Vec<(CString, Option<Vec<u8>>)>,
     /// The ACL xattr value, when [`EnrichSpec::ACL`] was requested and present.
     pub acl: Option<Vec<u8>>,
+    /// Discovery could not report every attribute: the `flistxattr` itself
+    /// failed (a name list past `XATTR_LIST_MAX` yields `E2BIG`), an op slot
+    /// was unavailable, or a value known to be readable could not be refetched.
+    /// It separates "this entry has no extended attributes" from "the listing
+    /// could not be completed", which are otherwise both an empty
+    /// [`xattrs`](Self::xattrs). Never set for an attribute `who` simply cannot
+    /// read — that is a deliberate drop, not a failure.
+    pub xattrs_incomplete: bool,
 }
 
 /// A running directory query. Pull enriched batches with [`next`](QueryDir::next)
@@ -494,6 +509,7 @@ impl QueryDir {
                 let mut xattrs = Vec::new();
                 let mut acl = None;
                 let mut discovered = Vec::new();
+                let mut incomplete = false;
                 match &p.file {
                     Some(f) => {
                         if spec.contains(EnrichSpec::XATTR) {
@@ -531,9 +547,20 @@ impl QueryDir {
                                 } else {
                                     &[]
                                 };
-                            for dn in
-                                discover_names(f, self.opts.xattr_ns, explicit)
-                            {
+                            // The ACL was fetched above into `acl`; discovering
+                            // it again would spend a second op and a second
+                            // 64 KiB buffer on the same bytes.
+                            let fetched_acl = spec
+                                .contains(EnrichSpec::ACL)
+                                .then_some(self.opts.acl_name.as_c_str());
+                            let (names, listed) = discover_names(
+                                f,
+                                self.opts.xattr_ns,
+                                explicit,
+                                fetched_acl,
+                            );
+                            incomplete |= !listed;
+                            for dn in names {
                                 let pend = self
                                     .h
                                     .start_fgetxattr(
@@ -543,6 +570,9 @@ impl QueryDir {
                                         vec![0u8; DISCOVER_BUF],
                                     )
                                     .ok();
+                                // No op slot: the attribute exists but was
+                                // never read, which is not "absent".
+                                incomplete |= pend.is_none();
                                 discovered.push((dn, pend));
                             }
                         }
@@ -562,31 +592,50 @@ impl QueryDir {
                     xattrs,
                     acl,
                     discovered,
+                    incomplete,
                 }
             })
             .collect();
 
-        // Assemble each entry. Explicit xattrs keep their `None`-on-absent
-        // shape; a discovered value larger than the initial buffer is refetched
-        // at its true size under `who`, and one `who` cannot read is dropped.
-        // The fd is held until any refetch finishes, then dropped (each
-        // in-flight op keeps its own reference).
+        // Assemble each entry. Explicit xattrs keep their slot, with a `None`
+        // value when absent; any value larger than the initial buffer, explicit
+        // or discovered, is refetched at its true size under `who`, and a
+        // discovered attribute `who` cannot read is dropped. The fd is held
+        // until any refetch finishes, then dropped (each in-flight op keeps its
+        // own reference).
         reading
             .into_iter()
             .map(|p| {
                 let mut xattrs: Vec<(CString, Option<Vec<u8>>)> = p
                     .xattrs
                     .into_iter()
-                    .map(|(xn, pend)| (xn, pend.and_then(pending_bytes)))
+                    .map(|(xn, pend)| {
+                        let val = match pend.map(pending_discovered) {
+                            Some(DiscRead::Got(v)) => Some(v),
+                            Some(DiscRead::Grow) => {
+                                p.file.as_ref().and_then(|f| {
+                                    refetch_grow(&self.h, who, f, &xn)
+                                })
+                            }
+                            Some(DiscRead::Drop) | None => None,
+                        };
+                        (xn, val)
+                    })
                     .collect();
                 let acl = p.acl.and_then(pending_bytes);
+                let mut incomplete = p.incomplete;
                 for (dn, pend) in p.discovered {
                     let val = match pend.map(pending_discovered) {
                         Some(DiscRead::Got(v)) => Some(v),
-                        Some(DiscRead::Grow) => p
-                            .file
-                            .as_ref()
-                            .and_then(|f| refetch_grow(&self.h, who, f, &dn)),
+                        Some(DiscRead::Grow) => {
+                            // `ERANGE` proved the value readable and oversized,
+                            // so losing it now is a failed read, not a denial.
+                            let v = p.file.as_ref().and_then(|f| {
+                                refetch_grow(&self.h, who, f, &dn)
+                            });
+                            incomplete |= v.is_none();
+                            v
+                        }
                         Some(DiscRead::Drop) | None => None,
                     };
                     if let Some(v) = val {
@@ -599,6 +648,7 @@ impl QueryDir {
                     statx: p.statx,
                     xattrs,
                     acl,
+                    xattrs_incomplete: incomplete,
                 }
             })
             .collect()
@@ -636,6 +686,9 @@ struct Reading {
     xattrs: Vec<(CString, Option<FsPending>)>,
     acl: Option<FsPending>,
     discovered: Vec<(CString, Option<FsPending>)>,
+    /// Discovery already lost something for this entry (see
+    /// [`DirEntry::xattrs_incomplete`]).
+    incomplete: bool,
 }
 
 /// Await a `statx` twin: `Some(Statx)` on success, else `None`.
@@ -682,29 +735,38 @@ fn namespace_of(name: &[u8]) -> Option<XattrNamespaces> {
 }
 
 /// `flistxattr` the entry, keep names in the requested namespaces, drop any
-/// already named explicitly, and return them sorted (stable output). Runs on
-/// the caller's own thread (the same thread that reads the directory), at that
-/// thread's privilege: it only proposes candidates, the per-value `who` read is
-/// the authoritative gate.
+/// already fetched (the `explicit` names and `fetched_acl`), and return them
+/// sorted (stable output) along with whether the listing itself succeeded. Runs
+/// on the caller's own thread (the same thread that reads the directory), at
+/// that thread's privilege: it only proposes candidates, the per-value `who`
+/// read is the authoritative gate.
+///
+/// A failed `flistxattr` returns no names and `false`, so the caller can tell
+/// it apart from an entry that genuinely has none.
 fn discover_names(
     f: &File,
     want: XattrNamespaces,
     explicit: &[CString],
-) -> Vec<CString> {
-    let mut names: Vec<CString> = match flistxattr(f.fd.as_fd()) {
-        Ok(list) => list
-            .into_iter()
-            .filter(|n| {
-                namespace_of(n.as_bytes()).is_some_and(|ns| want.intersects(ns))
-            })
-            .filter_map(|n| CString::new(n).ok())
-            .filter(|c| !explicit.iter().any(|e| e == c))
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+    fetched_acl: Option<&CStr>,
+) -> (Vec<CString>, bool) {
+    let (mut names, listed): (Vec<CString>, bool) =
+        match flistxattr(f.fd.as_fd()) {
+            Ok(list) => (
+                list.into_iter()
+                    .filter(|n| {
+                        namespace_of(n.as_bytes())
+                            .is_some_and(|ns| want.intersects(ns))
+                    })
+                    .filter(|c| !explicit.iter().any(|e| e == c))
+                    .filter(|c| fetched_acl != Some(c.as_c_str()))
+                    .collect(),
+                true,
+            ),
+            Err(_) => (Vec::new(), false),
+        };
     names.sort();
     names.dedup();
-    names
+    (names, listed)
 }
 
 /// A discovered attribute's value read outcome.
@@ -737,22 +799,45 @@ fn pending_discovered(p: FsPending) -> DiscRead {
     }
 }
 
-/// Refetch a discovered attribute whose value outgrew [`DISCOVER_BUF`]: size-
-/// probe then read at that size under `who`, bounded to [`XATTR_SIZE_MAX`].
-/// `None` if it became unreadable or exceeds the cap.
+/// Refetch an attribute whose value outgrew its initial buffer: probe the size
+/// and read at that size under `who`, bounded to [`XATTR_SIZE_MAX`]. A value
+/// growing between probe and read yields `ERANGE` (rewritten to `E2BIG` once the
+/// buffer reaches the cap, `fs/xattr.c`), so retry a bounded number of times,
+/// over-allocating on retry so a steadily growing value converges. `None` if it
+/// became unreadable or exceeds the cap. Mirrors the sync `fgetxattr` retry.
 fn refetch_grow(
     h: &FsHandle,
     who: Personality,
     f: &File,
     name: &CStr,
 ) -> Option<Vec<u8>> {
-    let (size, _) = h.fgetxattr(who, f, name, Vec::new());
-    let size = size.ok()?;
-    if size > XATTR_SIZE_MAX {
-        return None;
+    const SIZE_RETRIES: u32 = 4;
+    let mut tries = 0u32;
+    loop {
+        let (size, _) = h.fgetxattr(who, f, name, Vec::new());
+        let size = size.ok()?;
+        if size > XATTR_SIZE_MAX {
+            return None;
+        }
+        // Read at the probed size; on retry add half again so a value that
+        // grew since the probe still fits without another round trip.
+        let cap = if tries == 0 {
+            size.max(1)
+        } else {
+            (size + size / 2).clamp(1, XATTR_SIZE_MAX)
+        };
+        let (n, buf) = h.fgetxattr(who, f, name, vec![0u8; cap]);
+        match n {
+            Ok(n) => return buf.get(..n).map(<[u8]>::to_vec),
+            Err(crate::Error::Errno(Errno::ERANGE | Errno::E2BIG)) => {
+                tries += 1;
+                if tries >= SIZE_RETRIES {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
     }
-    let (n, buf) = h.fgetxattr(who, f, name, vec![0u8; size]);
-    buf.get(..n.ok()?).map(<[u8]>::to_vec)
 }
 
 /// List the extended-attribute names on `f` (all namespaces), sorted. Runs a
@@ -760,10 +845,7 @@ fn refetch_grow(
 /// caller is not privileged to see (`trusted.*` without `CAP_SYS_ADMIN`) are
 /// omitted by the kernel.
 pub(crate) fn list_xattr_names(f: &File) -> crate::Result<Vec<CString>> {
-    let mut names: Vec<CString> = flistxattr(f.fd.as_fd())?
-        .into_iter()
-        .filter_map(|n| CString::new(n).ok())
-        .collect();
+    let mut names: Vec<CString> = flistxattr(f.fd.as_fd())?;
     names.sort();
     names.dedup();
     Ok(names)
@@ -785,7 +867,6 @@ pub(crate) fn scan_xattrs(
         .filter(|n| {
             namespace_of(n.as_bytes()).is_some_and(|ns| want.intersects(ns))
         })
-        .filter_map(|n| CString::new(n).ok())
         .collect();
     names.sort();
     names.dedup();
@@ -1065,11 +1146,27 @@ impl PoolShared {
     }
 }
 
+thread_local! {
+    /// Set for the lifetime of a pool worker thread. [`WorkerPool::drop`] can
+    /// run on a worker when a job drops the pool's last `Arc`; the flag tells
+    /// that `Drop` not to join the workers — this thread is one of them, so the
+    /// join would wait on itself.
+    static ON_POOL_WORKER: Cell<bool> = const { Cell::new(false) };
+}
+
 impl Drop for WorkerPool {
     fn drop(&mut self) {
         let mut g = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.closed = true;
         self.shared.cv.notify_all();
+        // Running on a pool worker (a job dropped the pool's last `Arc`): this
+        // thread is itself counted in `total`, so waiting the workers out here
+        // would wait on this very thread forever. Each worker owns an
+        // `Arc<PoolShared>`, so they exit and reclaim the shared state on their
+        // own once `closed` is set, with no join needed.
+        if ON_POOL_WORKER.with(Cell::get) {
+            return;
+        }
         // Wait for every worker to drain and exit, so none touches the shared
         // state after this returns (join-on-drop without tracking handles).
         while g.total > 0 {
@@ -1097,12 +1194,18 @@ pub(crate) struct SharedPool {
     pool: OnceLock<WorkerPool>,
     floor: usize,
     ceiling: usize,
+    /// Set once the lazy spawn has failed. Whatever stopped a thread from
+    /// starting (`EAGAIN`, an RLIMIT, a cgroup pids cap) will still be true on
+    /// the next job, so remember it and run inline instead of re-attempting a
+    /// full floor spawn per submit.
+    spawn_failed: AtomicBool,
 }
 
 impl fmt::Debug for SharedPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SharedPool")
             .field("spawned", &self.pool.get().is_some())
+            .field("spawn_failed", &self.spawn_failed.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -1116,6 +1219,7 @@ impl SharedPool {
             pool: OnceLock::new(),
             floor,
             ceiling: ceiling.max(floor),
+            spawn_failed: AtomicBool::new(false),
         })
     }
 
@@ -1126,6 +1230,9 @@ impl SharedPool {
         if let Some(pool) = self.pool.get() {
             return pool.submit(job);
         }
+        if self.spawn_failed.load(Ordering::Relaxed) {
+            return job(); // already known unspawnable; don't retry per job
+        }
         match WorkerPool::try_elastic(self.floor, self.ceiling) {
             Ok(pool) => {
                 let _ = self.pool.set(pool);
@@ -1133,7 +1240,10 @@ impl SharedPool {
                     pool.submit(job);
                 }
             }
-            Err(_) => job(),
+            Err(_) => {
+                self.spawn_failed.store(true, Ordering::Relaxed);
+                job();
+            }
         }
     }
 }
@@ -1307,6 +1417,9 @@ impl Iterator for QueryHandle {
 /// silently dropped onto a dead thread. Any handle the job owned (a `SendDir`)
 /// still closes as its unwinding frame drops.
 fn worker_loop(shared: &Arc<PoolShared>) {
+    // Mark this thread so a `WorkerPool::drop` triggered here (a job dropping
+    // the pool's last `Arc`) does not try to join the pool it belongs to.
+    ON_POOL_WORKER.with(|w| w.set(true));
     loop {
         let job = {
             let mut g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1724,5 +1837,32 @@ mod pool_tests {
             cv.notify_all();
         }
         assert_eq!(total, 2, "fixed pool stayed at its worker count");
+    }
+
+    /// A job that ends up holding the pool's last `Arc` drops it on the worker
+    /// it runs on, landing `WorkerPool::drop` there; that drop must not join the
+    /// pool (it would wait on the running worker itself). Mirrors a
+    /// `QueryPool::query` job outliving the reactor and every handle.
+    #[test]
+    fn dpool_query_job_holding_the_last_pool_arc_wedges_a_worker() {
+        let pool = SharedPool::new(1, 1);
+        // The job's own clone; once the outer `pool` drops it becomes the last.
+        let held = Arc::clone(&pool);
+        let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        pool.submit(Box::new(move || {
+            proceed_rx.recv().ok();
+            // Last `Arc` -> `SharedPool::drop` -> `WorkerPool::drop`, here on
+            // the worker running this job.
+            drop(held);
+            // Reached only if that drop returned rather than self-joining.
+            done_tx.send(()).ok();
+        }));
+        drop(pool); // only the job's clone keeps the pool alive now
+        proceed_tx.send(()).ok();
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "a job dropping the pool's last Arc wedged its worker",
+        );
     }
 }

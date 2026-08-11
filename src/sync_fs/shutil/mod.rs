@@ -38,7 +38,7 @@ use crate::sync_fs::{
 };
 use crate::sync_fs::{Mode, StatxMask};
 use crate::AT_FDCWD;
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
@@ -407,7 +407,7 @@ struct DirFrame {
     src_path: PathBuf,
     src: OwnedFd,
     src_st: Statx,
-    xattrs: Vec<String>,
+    xattrs: Vec<CString>,
     dst: OwnedFd,
 }
 
@@ -755,7 +755,7 @@ fn make_special(
 fn list_xattrs(
     fd: BorrowedFd<'_>,
     config: &CopyTreeConfig,
-) -> Result<Vec<String>> {
+) -> Result<Vec<CString>> {
     if config
         .flags
         .intersects(CopyFlags::PERMISSIONS | CopyFlags::XATTRS)
@@ -769,7 +769,7 @@ fn list_xattrs(
 fn copy_metadata(
     src: BorrowedFd<'_>,
     dst: BorrowedFd<'_>,
-    xattrs: &[String],
+    xattrs: &[CString],
     src_st: &Statx,
     config: &CopyTreeConfig,
 ) -> Result<()> {

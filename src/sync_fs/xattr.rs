@@ -5,8 +5,9 @@
 //! buffer-sizing and retry behaviour and enforce TrueNAS's 2 MiB per-value cap.
 
 use crate::errno::{self, retry_on_eintr, Errno};
-use crate::path::cstr;
-use std::os::fd::{AsFd, AsRawFd};
+use crate::path::TnPath;
+use std::ffi::{CStr, CString};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 
 /// Maximum extended-attribute value size accepted (2 MiB), matching the C
 /// extension's `TRUENAS_XATTR_SIZE_MAX`.
@@ -27,11 +28,21 @@ tn_bitflags! {
 
 /// Read the extended attribute `name` from an open file descriptor.
 ///
+/// `name` is any [`TnPath`] — a `&str` for a literal, or the [`CStr`] that
+/// [`flistxattr`] returns for a discovered attribute whose bytes need not be
+/// UTF-8.
+///
 /// Returns `Err(Errno::ENODATA)` if the attribute is absent and
 /// `Err(Errno::E2BIG)` if its value exceeds [`XATTR_SIZE_MAX`].
-pub fn fgetxattr<Fd: AsFd>(fd: Fd, name: &str) -> errno::Result<Vec<u8>> {
-    let name = cstr(name)?;
+pub fn fgetxattr<Fd: AsFd, N: ?Sized + TnPath>(
+    fd: Fd,
+    name: &N,
+) -> errno::Result<Vec<u8>> {
     let raw = fd.as_fd().as_raw_fd();
+    name.with_tn_path(|name| fgetxattr_cstr(raw, name))?
+}
+
+fn fgetxattr_cstr(raw: RawFd, name: &CStr) -> errno::Result<Vec<u8>> {
     // A value that grows between the size probe and the read yields ERANGE;
     // retry a bounded number of times, over-allocating on retry so a steadily
     // growing value converges rather than spinning.
@@ -80,41 +91,50 @@ pub fn fgetxattr<Fd: AsFd>(fd: Fd, name: &str) -> errno::Result<Vec<u8>> {
 /// Set the extended attribute `name` to `value` on an open file descriptor.
 ///
 /// `value` longer than [`XATTR_SIZE_MAX`] is rejected with `Err(Errno::E2BIG)`.
-pub fn fsetxattr<Fd: AsFd>(
+pub fn fsetxattr<Fd: AsFd, N: ?Sized + TnPath>(
     fd: Fd,
-    name: &str,
+    name: &N,
     value: &[u8],
     flags: XattrFlags,
 ) -> errno::Result<()> {
     if value.len() > XATTR_SIZE_MAX {
         return Err(Errno::E2BIG);
     }
-    let name = cstr(name)?;
     let raw = fd.as_fd().as_raw_fd();
-    retry_on_eintr(|| unsafe {
-        libc::fsetxattr(
-            raw,
-            name.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            flags.bits(),
-        )
-    })?;
+    name.with_tn_path(|name| {
+        retry_on_eintr(|| unsafe {
+            libc::fsetxattr(
+                raw,
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                flags.bits(),
+            )
+        })
+    })??;
     Ok(())
 }
 
 /// Remove the extended attribute `name` from an open file descriptor.
 ///
 /// Returns `Err(Errno::ENODATA)` if the attribute is absent.
-pub fn fremovexattr<Fd: AsFd>(fd: Fd, name: &str) -> errno::Result<()> {
-    let name = cstr(name)?;
+pub fn fremovexattr<Fd: AsFd, N: ?Sized + TnPath>(
+    fd: Fd,
+    name: &N,
+) -> errno::Result<()> {
     let raw = fd.as_fd().as_raw_fd();
-    retry_on_eintr(|| unsafe { libc::fremovexattr(raw, name.as_ptr()) })?;
+    name.with_tn_path(|name| {
+        retry_on_eintr(|| unsafe { libc::fremovexattr(raw, name.as_ptr()) })
+    })??;
     Ok(())
 }
 
 /// List the names of the extended attributes on an open file descriptor.
-pub fn flistxattr<Fd: AsFd>(fd: Fd) -> errno::Result<Vec<String>> {
+///
+/// Names are returned as [`CString`]s carrying the kernel's raw bytes. An xattr
+/// name need not be UTF-8 (the `user.` namespace accepts arbitrary bytes), and
+/// the value is the NUL-terminated string the fd-xattr syscalls take directly.
+pub fn flistxattr<Fd: AsFd>(fd: Fd) -> errno::Result<Vec<CString>> {
     let raw = fd.as_fd().as_raw_fd();
     let mut buf = vec![0u8; 256];
     let len = loop {
@@ -132,9 +152,11 @@ pub fn flistxattr<Fd: AsFd>(fd: Fd) -> errno::Result<Vec<String>> {
             Err(e) => return Err(e),
         }
     };
+    // The kernel returns the names NUL-separated; each non-empty segment
+    // carries no interior NUL, so it is a valid `CString` verbatim.
     Ok(buf[..len]
         .split(|&b| b == 0)
         .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .filter_map(|s| CString::new(s).ok())
         .collect())
 }

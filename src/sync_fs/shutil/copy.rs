@@ -6,6 +6,7 @@
 use crate::errno::{self, retry_on_eintr, Errno};
 use crate::error::Result;
 use crate::sync_fs::xattr::{fgetxattr, fsetxattr, XattrFlags};
+use std::ffi::{CStr, CString};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr;
 
@@ -13,24 +14,24 @@ use std::ptr;
 /// `sendfile` throughput.
 pub const MAX_RW_SZ: usize = 0x7FFF_FFFF & !0xFFF;
 
-const POSIX_ACCESS: &str = "system.posix_acl_access";
-const POSIX_DEFAULT: &str = "system.posix_acl_default";
-const NFS4_ACL: &str = "system.nfs4_acl_xdr";
+const POSIX_ACCESS: &CStr = c"system.posix_acl_access";
+const POSIX_DEFAULT: &CStr = c"system.posix_acl_default";
+const NFS4_ACL: &CStr = c"system.nfs4_acl_xdr";
 
-const ACL_XATTRS: [&str; 3] = [POSIX_ACCESS, POSIX_DEFAULT, NFS4_ACL];
+const ACL_XATTRS: [&CStr; 3] = [POSIX_ACCESS, POSIX_DEFAULT, NFS4_ACL];
 // ACLs that govern the file's own access (the POSIX *default* ACL only affects
 // new children, so it is excluded).
-const ACCESS_ACL_XATTRS: [&str; 2] = [POSIX_ACCESS, NFS4_ACL];
+const ACCESS_ACL_XATTRS: [&CStr; 2] = [POSIX_ACCESS, NFS4_ACL];
 
 // The mode bits that grant the file's own owner (or group) identity to whoever
 // executes it. Split out of the rest of the mode because they are only
 // meaningful alongside that ownership — see [`copy_setid`].
 pub(super) const SETID_BITS: libc::mode_t = libc::S_ISUID | libc::S_ISGID;
 
-fn has_access_acl(xattr_names: &[String]) -> bool {
+fn has_access_acl(xattr_names: &[CString]) -> bool {
     xattr_names
         .iter()
-        .any(|n| ACCESS_ACL_XATTRS.contains(&n.as_str()))
+        .any(|n| ACCESS_ACL_XATTRS.contains(&n.as_c_str()))
 }
 
 /// Block-level clone via `copy_file_range(2)`. Fails with `EXDEV` across
@@ -141,7 +142,7 @@ pub fn copyfile(
 pub fn copy_permissions(
     src: BorrowedFd<'_>,
     dst: BorrowedFd<'_>,
-    xattr_names: &[String],
+    xattr_names: &[CString],
     mode: u32,
 ) -> Result<()> {
     if !has_access_acl(xattr_names) {
@@ -155,10 +156,10 @@ pub fn copy_permissions(
     }
     for name in xattr_names
         .iter()
-        .filter(|n| ACCESS_ACL_XATTRS.contains(&n.as_str()))
+        .filter(|n| ACCESS_ACL_XATTRS.contains(&n.as_c_str()))
     {
-        let buf = fgetxattr(src, name)?;
-        fsetxattr(dst, name, &buf, XattrFlags::empty())?;
+        let buf = fgetxattr(src, name.as_c_str())?;
+        fsetxattr(dst, name.as_c_str(), &buf, XattrFlags::empty())?;
     }
     Ok(())
 }
@@ -175,7 +176,7 @@ pub fn copy_permissions(
 /// the mode follows the ACL, and an `fchmod` could discard it.
 pub fn copy_setid(
     dst: BorrowedFd<'_>,
-    xattr_names: &[String],
+    xattr_names: &[CString],
     mode: u32,
 ) -> Result<()> {
     let mode = mode as libc::mode_t & 0o7777;
@@ -190,14 +191,16 @@ pub fn copy_setid(
 pub fn copy_xattrs(
     src: BorrowedFd<'_>,
     dst: BorrowedFd<'_>,
-    xattr_names: &[String],
+    xattr_names: &[CString],
 ) -> Result<()> {
     for name in xattr_names {
-        if ACL_XATTRS.contains(&name.as_str()) || name.starts_with("system") {
+        if ACL_XATTRS.contains(&name.as_c_str())
+            || name.as_bytes().starts_with(b"system")
+        {
             continue;
         }
-        let buf = fgetxattr(src, name)?;
-        fsetxattr(dst, name, &buf, XattrFlags::empty())?;
+        let buf = fgetxattr(src, name.as_c_str())?;
+        fsetxattr(dst, name.as_c_str(), &buf, XattrFlags::empty())?;
     }
     Ok(())
 }

@@ -108,6 +108,11 @@ impl Nfs4Flag {
     /// The two "inheritable to a child" bits.
     const INHERITABLE: Nfs4Flag =
         Nfs4Flag::FILE_INHERIT.union(Nfs4Flag::DIRECTORY_INHERIT);
+    /// The audit/alarm qualifiers ZFS cannot represent: it masks the on-disk
+    /// ACE flags with `NFS41_FLAGS` on both encode and decode (`zpl_xattr.c`),
+    /// which excludes these two, so a set bit is silently lost on write.
+    const UNREPRESENTABLE: Nfs4Flag =
+        Nfs4Flag::SUCCESSFUL_ACCESS.union(Nfs4Flag::FAILED_ACCESS);
 }
 
 tn_bitflags! {
@@ -353,6 +358,15 @@ impl Nfs4Acl {
                         .into(),
                 ));
             }
+            // Refusing beats accepting a write that reads back as 0x00.
+            if a.ace_flags.intersects(Nfs4Flag::UNREPRESENTABLE) {
+                return Err(Error::Validation(
+                    "SUCCESSFUL_ACCESS/FAILED_ACCESS cannot be stored: ZFS \
+                     masks them out of the ACE flags it writes, so they would \
+                     read back cleared"
+                        .into(),
+                ));
+            }
             if is_dir
                 && a.ace_flags.contains(Nfs4Flag::INHERIT_ONLY)
                 && !a.ace_flags.intersects(Nfs4Flag::INHERITABLE)
@@ -388,11 +402,22 @@ impl Nfs4Acl {
             ));
         }
         if is_dir && !has_inheritable {
-            return Err(Error::Validation(
+            // ZFS's own trivial directory ACL carries no inheritance flags, so
+            // it lands here — a get-modify-set of a stock directory fails at
+            // the set. Say so, rather than restating the rule: the caller has
+            // to add an inheritable ACE, and needs to know the bytes it just
+            // read cannot simply be written back.
+            return Err(Error::Validation(if self.trivial() {
+                "directory ACL must contain at least one ACE with \
+                 FILE_INHERIT or DIRECTORY_INHERIT; this is the trivial ACL \
+                 ZFS synthesises from the mode bits, which carries none and \
+                 so cannot be written back unchanged"
+                    .into()
+            } else {
                 "directory ACL must contain at least one ACE with \
                  FILE_INHERIT or DIRECTORY_INHERIT"
-                    .into(),
-            ));
+                    .to_string()
+            }));
         }
         Ok(())
     }
@@ -449,6 +474,46 @@ mod tests {
                 who_id,
             }],
         }
+    }
+
+    /// ZFS masks SUCCESSFUL_ACCESS/FAILED_ACCESS out of the ACE flags it
+    /// writes, so accepting them means writing 0x30 and reading back 0x00.
+    #[test]
+    fn validate_rejects_flags_zfs_cannot_store() {
+        for f in [
+            Nfs4Flag::SUCCESSFUL_ACCESS,
+            Nfs4Flag::FAILED_ACCESS,
+            Nfs4Flag::SUCCESSFUL_ACCESS.union(Nfs4Flag::FAILED_ACCESS),
+        ] {
+            let mut acl = named_user(1000);
+            acl.aces[0].ace_flags = f;
+            let e = acl.validate(false).unwrap_err().to_string();
+            assert!(e.contains("cannot be stored"), "unexpected error: {e}");
+        }
+        // The flags ZFS does keep are unaffected.
+        let mut acl = named_user(1000);
+        acl.aces[0].ace_flags = Nfs4Flag::IDENTIFIER_GROUP;
+        assert!(acl.validate(false).is_ok());
+    }
+
+    /// The trivial directory ACL ZFS puts on every directory carries no
+    /// inheritance flags, so a get-modify-set fails at the set. The error must
+    /// say that, not just restate the rule.
+    #[test]
+    fn trivial_directory_acl_is_rejected_with_a_specific_error() {
+        let mut acl = named_user(1000);
+        acl.acl_flags = Nfs4AclFlag::ACL_IS_TRIVIAL;
+        let e = acl.validate(true).unwrap_err().to_string();
+        assert!(e.contains("trivial"), "unexpected error: {e}");
+        assert!(e.contains("written back"), "unexpected error: {e}");
+        // A non-trivial directory ACL still gets the plain rule.
+        let plain = named_user(1000).validate(true).unwrap_err().to_string();
+        assert!(!plain.contains("trivial"), "unexpected error: {plain}");
+        // And an inheritable ACE satisfies the rule either way.
+        let mut ok = named_user(1000);
+        ok.acl_flags = Nfs4AclFlag::ACL_IS_TRIVIAL;
+        ok.aces[0].ace_flags = Nfs4Flag::DIRECTORY_INHERIT;
+        assert!(ok.validate(true).is_ok());
     }
 
     #[test]

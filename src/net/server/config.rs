@@ -13,6 +13,12 @@ use std::time::Duration;
 
 /// The largest usable pool slot (the `user_data` codec reserves 24 bits).
 const MAX_POOL: u32 = 0x00ff_ffff;
+
+/// Ceiling on the fs offload pool's own thread count. Not a kernel limit — a
+/// sanity bound, since every one of these is a real OS thread spawned by one
+/// reactor for work that has no io_uring opcode.
+#[cfg(feature = "uring-fs")]
+const MAX_OFFLOAD_THREADS: usize = 1024;
 /// Upper bound on `max_in_flight_requests` (bounds per-connection read-ahead).
 const MAX_IN_FLIGHT: usize = 4096;
 /// Upper bound on `max_send_coalesce` (the kernel's `UIO_MAXIOV` — the most
@@ -281,6 +287,19 @@ impl ServerConfig {
                 "fs_files * 2 must not exceed {MAX_POOL}"
             )));
         }
+        // The floor spawns eagerly on the reactor thread at first use, so an
+        // absurd value is a thread storm rather than a slow server. Bound both
+        // ends here so it fails as a clean Validation at construction.
+        #[cfg(feature = "uring-fs")]
+        if self.fs_offload_floor == 0
+            || self.fs_offload_floor > self.fs_offload_ceiling
+            || self.fs_offload_ceiling > MAX_OFFLOAD_THREADS
+        {
+            return Err(Error::Validation(format!(
+                "fs_offload_floor must be in \
+                 1..=fs_offload_ceiling..={MAX_OFFLOAD_THREADS}"
+            )));
+        }
         if self.max_request_bytes == 0
             || self.max_request_bytes > i32::MAX as usize
         {
@@ -367,5 +386,39 @@ impl Listen {
 impl From<ServerAddr> for Listen {
     fn from(addr: ServerAddr) -> Listen {
         Listen { addr, tls: false }
+    }
+}
+
+#[cfg(all(test, feature = "uring-fs"))]
+mod tests {
+    use super::*;
+
+    fn addrs() -> Vec<Listen> {
+        vec![Listen::from(ServerAddr::Unix("/tmp/x".into()))]
+    }
+
+    /// The offload bounds spawn real threads on the reactor thread at first
+    /// use, so they are bounded at construction like every other sizing knob.
+    #[test]
+    fn validate_bounds_the_offload_pool() {
+        let a = addrs();
+        assert!(ServerConfig::default().validate(&a).is_ok());
+        for (floor, ceiling) in [
+            (0, 8),                       // a floor of zero
+            (9, 8),                       // floor above ceiling
+            (1, MAX_OFFLOAD_THREADS + 1), // ceiling past the cap
+            (usize::MAX, usize::MAX),     // the thread storm
+        ] {
+            let cfg = ServerConfig {
+                fs_offload_floor: floor,
+                fs_offload_ceiling: ceiling,
+                ..ServerConfig::default()
+            };
+            let e = cfg.validate(&a).unwrap_err().to_string();
+            assert!(
+                e.contains("fs_offload_floor"),
+                "({floor}, {ceiling}) accepted or wrong error: {e}"
+            );
+        }
     }
 }
