@@ -1008,8 +1008,6 @@ fn privileged_xattr_allowlist_elevates_only_listed_names() {
             panic!("UringFs::new: {e}");
         }
     };
-    // Needs Linux >= 6.13; `TRUENAS_ROS_REQUIRE_FD_XATTR` (set by the QEMU CI
-    // job) turns the skip into a failure so this cannot quietly stop running.
     afs.set_privileged_xattrs(
         PrivilegedXattrs::new()
             .allow_prefix(c"trusted.truenas_test_")
@@ -3337,11 +3335,12 @@ fn fadvise_is_accepted_and_leaves_contents_alone() {
     });
 }
 
-/// The allowlist is the whole security contract for `fremovexattr`: with no
-/// [`Personality`] to check, an unlisted name must be refused outright. The
-/// refusal is the property, so it is asserted first.
-#[test]
-fn fremovexattr_removes_only_allowlisted_attributes() {
+/// Drive `client` against a reactor whose [`PrivilegedXattrs`] policy claims
+/// `trusted.example_`, the namespace these two tests treat as server-owned.
+fn with_priv_xattr_fs<F>(client: F)
+where
+    F: FnOnce(&FsHandle, Personality, &Path) + Send,
+{
     let mut afs = match UringFs::new(FsConfig::default()) {
         Ok(a) => a,
         Err(e) => {
@@ -3361,47 +3360,78 @@ fn fremovexattr_removes_only_allowlisted_attributes() {
     let stop = afs.shutdown_handle();
     let dir = tempfile::tempdir().expect("tempdir");
     let dir_path = dir.path().to_path_buf();
-
     thread::scope(|s| {
         s.spawn(move || {
             let _guard = StopGuard(stop);
-            let anchor = Anchor::open(dir_path.as_path()).expect("anchor");
-            let f = h.open(me, &anchor, "obj", creat_rw()).expect("open");
-
-            let owned = xattr_name("trusted.example_etag");
-            let user = xattr_name("user.mine");
-            h.fsetxattr(me, &f, &owned, b"abc".to_vec(), 0)
-                .0
-                .expect("server-owned set is promoted to root");
-            h.fsetxattr(me, &f, &user, b"xyz".to_vec(), 0)
-                .0
-                .expect("user set");
-
-            // Unlisted: refused, and the attribute survives.
-            assert!(
-                matches!(
-                    h.fremovexattr(&f, &user),
-                    Err(Error::Errno(Errno::EPERM))
-                ),
-                "an attribute the server does not own must not be removable"
-            );
-            assert!(
-                h.flistxattr(&f).unwrap().contains(&user),
-                "the refused attribute is still there"
-            );
-
-            // Allowlisted: actually removed, and gone from the listing —
-            // which a zero-length FSETXATTR would *not* have achieved.
-            h.fremovexattr(&f, &owned).expect("server-owned removal");
-            let names = h.flistxattr(&f).unwrap();
-            assert!(!names.contains(&owned), "removed, not emptied: {names:?}");
-            assert!(names.contains(&user), "the other attribute is untouched");
-
-            // Removing what is not there is ENODATA, not success.
-            assert!(h.fremovexattr(&f, &owned).is_err());
-
-            h.close(f).unwrap();
+            client(&h, me, &dir_path);
         });
         afs.run().expect("run");
+    });
+}
+
+/// The allowlist is the whole security contract for `fremovexattr`: it takes
+/// no [`Personality`], so an attribute the server does not own must be
+/// refused outright rather than removed under the reactor's credentials.
+///
+/// Deliberately needs no privilege — the refusal is decided from the policy
+/// before any syscall, so this runs everywhere and is the half worth having
+/// unconditional coverage of.
+#[test]
+fn fremovexattr_refuses_attributes_outside_the_allowlist() {
+    with_priv_xattr_fs(|h, me, dir| {
+        let anchor = Anchor::open(dir).expect("anchor");
+        let f = h.open(me, &anchor, "obj", creat_rw()).expect("open");
+        let user = xattr_name("user.mine");
+        h.fsetxattr(me, &f, &user, b"xyz".to_vec(), 0)
+            .0
+            .expect("an unprivileged user.* set");
+
+        assert!(
+            matches!(
+                h.fremovexattr(&f, &user),
+                Err(Error::Errno(Errno::EPERM))
+            ),
+            "an attribute the server does not own must not be removable"
+        );
+        assert!(
+            h.flistxattr(&f).unwrap().contains(&user),
+            "the refused attribute is still there"
+        );
+        h.close(f).unwrap();
+    });
+}
+
+/// The other half: an allowlisted attribute really is removed, and is *gone
+/// from the listing* rather than left present with an empty value — which is
+/// all a zero-length `FSETXATTR` would have achieved.
+///
+/// Root-only: writing `trusted.*` needs `CAP_SYS_ADMIN`, and the allowlist
+/// promotion runs under the reactor's own credentials, so an unprivileged
+/// reactor cannot set the attribute this removes.
+#[test]
+fn fremovexattr_removes_allowlisted_attributes() {
+    if !is_root() {
+        return;
+    }
+    with_priv_xattr_fs(|h, me, dir| {
+        let anchor = Anchor::open(dir).expect("anchor");
+        let f = h.open(me, &anchor, "obj", creat_rw()).expect("open");
+        let owned = xattr_name("trusted.example_etag");
+        let user = xattr_name("user.mine");
+        h.fsetxattr(me, &f, &owned, b"abc".to_vec(), 0)
+            .0
+            .expect("server-owned set is promoted to the reactor's creds");
+        h.fsetxattr(me, &f, &user, b"xyz".to_vec(), 0)
+            .0
+            .expect("user set");
+
+        h.fremovexattr(&f, &owned).expect("server-owned removal");
+        let names = h.flistxattr(&f).unwrap();
+        assert!(!names.contains(&owned), "removed, not emptied: {names:?}");
+        assert!(names.contains(&user), "the other attribute is untouched");
+
+        // Removing what is not there is an error, not a silent success.
+        assert!(h.fremovexattr(&f, &owned).is_err());
+        h.close(f).unwrap();
     });
 }

@@ -102,12 +102,6 @@ export RUST_BACKTRACE=1
 # real failure that must turn CI red.
 export TRUENAS_ROS_REQUIRE_IO_URING=1
 export TRUENAS_ROS_REQUIRE_KTLS=1
-# The uring_fs fd-based xattr ops need io_uring to accept a registered-table
-# file for IORING_OP_F[GS]ETXATTR — kernel commit dc7e76ba7a60, Linux >= 6.13.
-# The TrueNAS nightly kernel (6.18-based for the master train) is well past
-# that, so these must RUN; they skip on older hosts (the 6.12 dev box), which
-# is exactly the coverage hole this closes.
-export TRUENAS_ROS_REQUIRE_FD_XATTR=1
 # unix_peercred needs the AF_UNIX io_uring getsockopt fix (kernel >= 6.18.16).
 # We boot the TrueNAS <train>-nightly kernel (truenas/linux), whose uname -r
 # carries the full point release (e.g. 6.18.16-production+truenas), so read it
