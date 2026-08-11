@@ -316,20 +316,19 @@ fn encode_nv(out: &mut String, key: &str, value: &str) {
     }
 }
 
-/// libaudit's `audit_value_needs_encoding`: a `"`, any control or space byte
-/// (`< 0x21`), or `0x7f`. An empty value is encoded too, so it cannot be
-/// confused with a bare token.
+/// The kernel's rule, from `audit_string_contains_control` (`kernel/audit.c`):
+/// a `"`, or any byte outside `0x21..=0x7e`. The kernel walks the value as
+/// `unsigned char`, so that range excludes `0x7f` and `0x80..=0xff` alike. An
+/// empty value is encoded too, so it cannot be confused with a bare token.
 ///
-/// One deliberate addition: `'` also forces encoding. The kernel wraps a
-/// user-space record's text in `msg='…'`, so an apostrophe inside a value
-/// closes that quote early and truncates the record as parsers see it —
-/// libaudit has the same hole, and hex-encoding closes it at no cost
-/// (`auparse` decodes hex transparently).
+/// One addition: `'` also forces encoding. The kernel wraps a user-space
+/// record's text in `msg='…'` (`kernel/audit.c`) and does not encode an
+/// apostrophe itself, so one inside a value closes that quote early.
 fn needs_encoding(value: &str) -> bool {
     value.is_empty()
         || value
             .bytes()
-            .any(|b| b == b'"' || b == b'\'' || b < 0x21 || b == 0x7f)
+            .any(|b| b == b'"' || b == b'\'' || !(0x21..=0x7e).contains(&b))
 }
 
 /// Keep a field name usable as an audit key (no spaces, `=`, or quotes): map
@@ -363,6 +362,20 @@ mod tests {
             needs_encoding("a b") && needs_encoding("\"") && needs_encoding("")
         );
         assert!(!needs_encoding("admin") && !needs_encoding("API_KEY"));
+    }
+
+    #[test]
+    fn high_bytes_are_encoded_like_the_kernel_encodes_them() {
+        assert!(needs_encoding("café"));
+        let mut b = String::new();
+        encode_nv(&mut b, "acct", "café");
+        // UTF-8 'é' is C3 A9; the whole value goes to hex, unquoted.
+        assert_eq!(b, "acct=636166C3A9");
+        assert!(!b.contains('"'));
+        // The boundary: 0x7e is clean, 0x7f and 0x80 are not.
+        assert!(!needs_encoding("~"));
+        assert!(needs_encoding("\u{7f}"));
+        assert!(needs_encoding(core::str::from_utf8(&[0xC2, 0x80]).unwrap()));
     }
 
     #[test]
