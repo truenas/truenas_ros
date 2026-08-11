@@ -93,7 +93,15 @@ fn respond(
     resp: HttpResponse,
     dates: &mut DateCache,
 ) -> Response {
-    let keep = head.keep_alive() && !resp.close;
+    // A head carrying both Content-Length and Transfer-Encoding frames as
+    // chunked here because the transfer coding wins under RFC 9112 section
+    // 6.3. A front end that prefers Content-Length would frame the same
+    // bytes with a different boundary, and that difference is the CL.TE
+    // smuggling primitive. Keep the coding preference for client
+    // compatibility and make the exchange non pipelinable instead. The
+    // reply drops keep alive so no pipelined request rides behind a
+    // smuggled prefix on this connection.
+    let keep = head.keep_alive() && !resp.close && !head.cl_te_conflict();
     let conn = match (keep, head.version) {
         (true, Version::Http11) => ConnHeader::None,
         (true, Version::Http10) => ConnHeader::KeepAlive,
@@ -446,6 +454,43 @@ mod tests {
             &mut closer,
         );
         assert!(matches!(resp, Response::ReplyClose(_)));
+    }
+
+    #[test]
+    fn cl_te_conflict_forces_connection_close() {
+        // This head carries both Content-Length and Transfer-Encoding, and
+        // it frames as chunked because the transfer coding wins. The pair
+        // is the CL.TE smuggling differential, so the reply must drop keep
+        // alive and the connection cannot be reused behind a smuggled
+        // prefix. The body still decodes by the chunked framing.
+        let head = b"PUT /k HTTP/1.1\r\nHost: h\r\n\
+                     Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut raw = head.to_vec();
+        raw.extend_from_slice(b"5\r\nhello\r\n0\r\n\r\n");
+        let mut handler = |req: HttpRequest<'_>, _: &mut ()| {
+            assert_eq!(&req.body[..], b"hello", "TE framing still wins");
+            HttpResponse::new(200)
+        };
+        let resp = roundtrip(&raw, &mut HttpConn::new(()), &mut handler);
+        assert!(
+            matches!(resp, Response::ReplyClose(_)),
+            "CL plus TE must farewell, got {resp:?}"
+        );
+        assert!(text(&resp).contains("Connection: close\r\n"));
+
+        // A chunked request without a Content-Length is no conflict and it
+        // stays keep alive. The forced close is specific to the pair.
+        let head =
+            b"PUT /k HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut raw = head.to_vec();
+        raw.extend_from_slice(b"5\r\nhello\r\n0\r\n\r\n");
+        let mut ok = |_: HttpRequest<'_>, _: &mut ()| HttpResponse::new(200);
+        let resp = roundtrip(&raw, &mut HttpConn::new(()), &mut ok);
+        assert!(
+            matches!(resp, Response::Reply(_)),
+            "TE only stays keep alive, got {resp:?}"
+        );
+        assert!(!text(&resp).contains("Connection: close"));
     }
 
     #[test]
