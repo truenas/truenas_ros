@@ -42,6 +42,7 @@ default = [
     "idmap",
     "shutil",
     "configfile",
+    "audit",
 ]
 
 # Blocking filesystem bindings (the `sync_fs` umbrella): `sync-fs` is the base
@@ -57,6 +58,14 @@ fsiter = ["sync-fs", "mount"]
 idmap = []
 shutil = ["fsiter", "xattr"]
 configfile = ["sync-fs"]
+# Kernel audit records over `NETLINK_AUDIT` (`src/audit`): the libaudit
+# replacement — a PAM-shaped event description plus a synchronous send, so a
+# service's own events land in audit.log next to PAM's. Standalone (its own
+# socket, no `sync-fs` vocabulary) and dependency-free, so it rides in
+# `default` like `configfile`. Deliberately ships no queue or thread: the send
+# can block on kernel-audit backpressure, and shedding that load is the
+# embedding application's policy — see the module docs.
+audit = []
 # The shared io_uring engine (`src/uring`): raw UAPI, ring, SQE staging,
 # wake, slot generations, the user_data codec. Internal — enabled transitively
 # by the domains built on it (the net stack today, uring-fs next); not a
@@ -96,6 +105,7 @@ full = [
     "idmap",
     "shutil",
     "configfile",
+    "audit",
     "net-server",
     "net-client",
     "http",
@@ -132,6 +142,14 @@ path = "test/zfs.rs"
 [[test]]
 name = "configparser_compat"
 path = "test/configparser_compat.rs"
+
+# Kernel audit. Sends real records over NETLINK_AUDIT; skips automatically when
+# the socket cannot be opened (sandbox/old kernel) and tolerates a missing
+# CAP_AUDIT_WRITE (the kernel reports that as a benign "unavailable", not an
+# error). Set TRUENAS_ROS_REQUIRE_AUDIT=1 to make either a hard failure.
+[[test]]
+name = "audit"
+path = "test/audit.rs"
 
 # io_uring stream server. Live loopback tests; skip automatically when io_uring
 # is unavailable (sandbox/old kernel). Set TRUENAS_ROS_REQUIRE_IO_URING=1 to

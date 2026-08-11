@@ -102,7 +102,7 @@ jobs:
       run: |
         cargo build --no-default-features
         for f in sync-fs xattr mount acl fhandle fsiter idmap shutil \
-                 configfile uring net-server net-client uring-fs; do
+                 configfile audit uring net-server net-client uring-fs; do
           cargo build --no-default-features --features "$f"
         done
         cargo build --all-features

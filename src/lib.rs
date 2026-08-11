@@ -18,9 +18,10 @@
 //! umbrella modules: [`sync_fs`] (blocking fs bindings — features `sync-fs`,
 //! `xattr`, `acl`, `fhandle`, `fsiter`, `shutil`), [`mount`] (mount topology
 //! and idmapped-mount support — features `mount`, `idmap`), [`configfile`],
-//! the io_uring `net` stack (`net-core`/`net-server`/`net-client`), and the
-//! io_uring fs reactor `uring_fs` (`uring-fs`); `full` enables all but the
-//! still-landing fs reactor.
+//! [`audit`] (kernel audit records over `NETLINK_AUDIT`), the io_uring `net`
+//! stack (`net-core`/`net-server`/`net-client`), and the io_uring fs reactor
+//! `uring_fs` (`uring-fs`); `full` enables all but the still-landing fs
+//! reactor.
 #![cfg(target_os = "linux")]
 #![allow(non_camel_case_types)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -66,6 +67,9 @@ pub mod mount;
 
 #[cfg(feature = "configfile")]
 pub mod configfile;
+
+#[cfg(feature = "audit")]
+pub mod audit;
 
 #[cfg(feature = "uring")]
 mod uring;
