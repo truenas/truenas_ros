@@ -71,7 +71,11 @@ fuzz_target!(|input: (u8, u64, u64, u64, u64, Option<u64>)| {
                 buffered < total,
                 "ReadBody: buffered {buffered} >= total {total}"
             );
-            assert_eq!(want, total - buffered, "ReadBody: want != total-buffered");
+            assert_eq!(
+                want,
+                total - buffered,
+                "ReadBody: want != total-buffered"
+            );
             assert!(want > 0, "ReadBody: zero want");
             if place {
                 // arm_body_recv computes prefix = buffered - header_len and

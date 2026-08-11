@@ -83,11 +83,11 @@ pub use response::{HttpResponse, IntoBytes};
 /// only — the `http` analogue of the net stack's `frame_step` re-export.
 /// Never part of the stable API.
 ///
-/// Fuzz targets to add under `fuzz/fuzz_targets/` (with matching `[[bin]]`
-/// entries in `fuzz/Cargo.toml`): `http_frame` driving [`fuzz::drive_frame`],
-/// `http_head` driving [`fuzz::head_facts`], and `http_chunked` driving
-/// [`fuzz::chunk_scan`] then [`fuzz::chunk_decode`]. B-http's generators are a
-/// ready seed corpus.
+/// The targets under `fuzz/fuzz_targets/`: `http_frame` driving
+/// [`fuzz::drive_frame`], `http_head` driving [`fuzz::head_facts`], and
+/// `http_chunked` driving [`fuzz::chunk_scan`] then [`fuzz::chunk_decode`],
+/// each asserting the codec's delivery-safety and agreement invariants —
+/// seeded under `fuzz/corpus/` with the golden botocore shapes.
 #[cfg(feature = "__fuzz")]
 pub mod fuzz {
     use std::borrow::Cow;
