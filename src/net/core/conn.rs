@@ -486,11 +486,28 @@ impl<U> Connection<U> {
 
     /// `(header, body, peer, state)` for a complete message, borrow-split for
     /// the body handler call. A placed body is moved out of `body_buf`; an
-    /// inline body borrows `buf`.
+    /// inline body borrows `buf` — except a **body-only** message (an http
+    /// 100-continue dance body, delivered with `header_len == 0`) whose
+    /// extent is exactly the buffered bytes: at or over `handoff_threshold`,
+    /// the accumulate buffer itself is handed over, so the handler's
+    /// [`Body::take`] is as free as a placed body's. The same "large bodies
+    /// arrive owned" policy as placement — and gated the same way, because
+    /// the reactor grows a fresh buffer afterwards.
     pub(crate) fn deliver_parts(
         &mut self,
+        handoff_threshold: Option<usize>,
     ) -> (&[u8], Body<'_>, &ClientAddr, &mut U) {
         let placed = self.body_buf.take();
+        if placed.is_none()
+            && self.header_len == 0
+            && self.recv_buf.len() == self.body_len
+            && matches!(handoff_threshold, Some(t) if self.body_len >= t)
+        {
+            let buf = std::mem::take(&mut self.recv_buf);
+            // `consume` drains `frame_len().min(buf.len())` = 0 afterwards,
+            // so the handoff composes with the normal delivery epilogue.
+            return (&[], Body::placed(buf), &self.peer, &mut self.state);
+        }
         let (header, rest) = self.recv_buf.split_at(self.header_len);
         let body = match placed {
             Some(bytes) => Body::placed(bytes),
@@ -891,7 +908,7 @@ mod tests {
         unsafe { std::ptr::write_bytes(ptr, 0xCD, want) };
         assert_eq!(c.recv_result(want as i32), RecvOutcome::Complete);
         {
-            let (header, mut body, _addr, _state) = c.deliver_parts();
+            let (header, mut body, _addr, _state) = c.deliver_parts(None);
             assert_eq!(header.len(), 4);
             assert_eq!(body.len(), 100);
             assert!(body[..30].iter().all(|&b| b == 0), "copied prefix");
@@ -903,6 +920,68 @@ mod tests {
         }
         c.consume();
         assert_eq!(c.buffered(), 0, "placed body never re-enters buf");
+    }
+
+    #[test]
+    fn body_only_delivery_hands_over_the_buffer() {
+        // The http dance shape: the head was consumed with a previous
+        // delivery, the framer declared `Complete { 0, body_len }`, and the
+        // whole extent is buffered. At or over the handoff threshold the
+        // accumulate buffer itself moves out — ownership, not bytes.
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        c.arm_recv(100, true);
+        let ptr = c.recv_ptr() as *mut u8;
+        // SAFETY: recv_ptr points at the 100 reserved-but-uninit bytes.
+        unsafe { std::ptr::write_bytes(ptr, 0xEE, 100) };
+        assert_eq!(c.recv_result(100), RecvOutcome::Complete);
+        c.set_frame(0, 100);
+        let p0 = c.recv_buf.as_ptr() as usize;
+        {
+            let (header, mut body, _addr, _state) = c.deliver_parts(Some(64));
+            assert!(header.is_empty());
+            assert_eq!(body.len(), 100);
+            let owned = body.take();
+            assert_eq!(owned.as_ptr() as usize, p0, "the buffer itself moved");
+            assert!(owned.iter().all(|&b| b == 0xEE));
+        }
+        c.consume();
+        assert_eq!(c.buffered(), 0, "handoff composes with consume");
+
+        // Below the threshold the delivery stays inline (borrowed).
+        c.arm_recv(10, true);
+        let ptr = c.recv_ptr() as *mut u8;
+        // SAFETY: as above — 10 reserved bytes.
+        unsafe { std::ptr::write_bytes(ptr, 0xAA, 10) };
+        assert_eq!(c.recv_result(10), RecvOutcome::Complete);
+        c.set_frame(0, 10);
+        let p_small = c.recv_buf.as_ptr() as usize;
+        {
+            let (_h, mut body, _addr, _state) = c.deliver_parts(Some(64));
+            assert_eq!(body.len(), 10);
+            let copied = body.take();
+            assert_ne!(
+                copied.as_ptr() as usize,
+                p_small,
+                "small body copies out of the retained buffer"
+            );
+        }
+        c.consume();
+        assert_eq!(c.buffered(), 0);
+
+        // A pipelined remainder blocks the handoff — the tail belongs to
+        // the next message.
+        c.arm_recv(120, true);
+        let ptr = c.recv_ptr() as *mut u8;
+        // SAFETY: as above — 120 reserved bytes.
+        unsafe { std::ptr::write_bytes(ptr, 0xBB, 120) };
+        assert_eq!(c.recv_result(120), RecvOutcome::Complete);
+        c.set_frame(0, 100);
+        {
+            let (_h, body, _addr, _state) = c.deliver_parts(Some(64));
+            assert_eq!(body.len(), 100);
+        }
+        c.consume();
+        assert_eq!(c.buffered(), 20, "remainder kept for the next message");
     }
 
     #[test]

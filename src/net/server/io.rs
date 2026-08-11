@@ -122,7 +122,8 @@ where
                 tx: self.mailbox.inject_tx.clone(),
                 shared: Arc::clone(&self.core.engine.shared),
             };
-            let (header, body, peer, state) = conn.deliver_parts();
+            let (header, body, peer, state) =
+                conn.deliver_parts(self.core.cfg.body_placement_threshold);
             // The fs facade borrows the engine and the fs tables — fields
             // disjoint from `self.core.table` (which `conn` holds) and
             // `self.handlers`, so all three borrows coexist for the handler

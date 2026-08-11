@@ -42,8 +42,10 @@ pub struct HttpRequest<'a> {
     /// The request body (complete — bounded by [`HttpConfig::max_body`]).
     /// Deref for in-place reads; [`Body::take`] moves the bytes out — a
     /// zero-copy move when the reactor placed the body in its own
-    /// allocation, so a handler that keeps the payload (an S3 PUT) never
-    /// pays a second copy.
+    /// allocation, and for a chunked body delivered owned (the 100-continue
+    /// dance path at or over the placement threshold) an in-place truncate
+    /// of the de-chunked wire — so a handler that keeps the payload (an S3
+    /// PUT) never pays a second copy.
     pub body: Body<'a>,
     /// The head block verbatim, including the terminating CRLFCRLF.
     pub raw_head: &'a [u8],
@@ -155,7 +157,7 @@ where
 /// adapter), so tests exercise the real dance/keep-alive/farewell code.
 fn step<U, H>(
     header: &[u8],
-    body: Body<'_>,
+    mut body: Body<'_>,
     peer: &ClientAddr,
     conn: &mut HttpConn<U>,
     handler: &mut H,
@@ -187,13 +189,36 @@ where
         }
         // A complete chunked message: de-chunk the wire extent, then
         // dispatch the entity against the in-buffer head or the dance's
-        // stash. A single-chunk message decodes to a borrow of the wire
-        // (no copy — the shape default botocore sends); only stitched
-        // multi-chunk entities carry their own allocation. The framer's
-        // scan accepted these exact bytes, so a decode failure is a codec
+        // stash. When the reactor handed the wire allocation over (the
+        // dance delivers the body alone, and large bodies arrive owned),
+        // de-chunk **in place**: ownership moves and the entity stays in
+        // the same allocation — the single-chunk shape default botocore
+        // sends moves no bytes at all, and the handler's take() truncates
+        // instead of copying. A borrowed delivery keeps the borrowing
+        // paths: a single-chunk entity is a borrow of the wire, only
+        // stitched multi-chunk entities allocate. The framer's scan
+        // accepted these exact bytes, so a de-chunk failure is a codec
         // bug, answered as one.
         Phase::ChunkedDone { stash } => {
             let head_bytes = stash.as_deref().unwrap_or(header);
+            if let Some(mut wire) = body.try_take_owned() {
+                return match chunked::compact(&mut wire) {
+                    Ok(c) => match c.trailers() {
+                        Ok(trailers) => dispatch(
+                            head_bytes,
+                            Body::owned_range(wire, c.start, c.len),
+                            &trailers,
+                            peer,
+                            &mut conn.state,
+                            handler,
+                        ),
+                        Err(()) => {
+                            farewell(500, head_bytes.starts_with(b"HEAD "))
+                        }
+                    },
+                    Err(()) => farewell(500, head_bytes.starts_with(b"HEAD ")),
+                };
+            }
             match chunked::decode(&body) {
                 Ok((entity, trailers)) => {
                     let entity = match entity {
@@ -663,6 +688,96 @@ mod tests {
         let resp = step(
             head,
             Body::placed(b"hello".to_vec()),
+            &p,
+            &mut conn,
+            &mut handler,
+        );
+        assert!(matches!(resp, Response::Reply(_)));
+    }
+
+    #[test]
+    fn owned_dance_body_takes_from_the_same_allocation() {
+        // The reactor hands the dance's body-only delivery its buffer (at
+        // or over the placement threshold); the de-chunked entity must
+        // reach the handler's take() from that same allocation — ownership
+        // moved, bytes didn't (single chunk), nothing allocated. The A3
+        // contract, pointer-checked, on the golden botocore shape.
+        let head = b"PUT /bkt/k HTTP/1.1\r\n\
+                     Host: h\r\n\
+                     Expect: 100-continue\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n";
+        let mut wire = b"8e\r\n64\r\n".to_vec();
+        wire.extend_from_slice(&[b'A'; 100]);
+        wire.extend_from_slice(
+            b"\r\n0\r\nx-amz-checksum-crc32:lZe8jQ==\r\n\r\n\r\n0\r\n\r\n",
+        );
+        let mut entity = b"64\r\n".to_vec();
+        entity.extend_from_slice(&[b'A'; 100]);
+        entity.extend_from_slice(
+            b"\r\n0\r\nx-amz-checksum-crc32:lZe8jQ==\r\n\r\n",
+        );
+        let p0 = wire.as_ptr() as usize;
+
+        let mut conn = HttpConn::new(());
+        let p = peer();
+        let mut handler = |mut req: HttpRequest<'_>, _: &mut ()| {
+            let owned = req.body.take();
+            assert_eq!(owned, entity);
+            assert_eq!(
+                owned.as_ptr() as usize,
+                p0,
+                "entity taken from the delivered allocation"
+            );
+            assert!(req.trailers.is_empty());
+            HttpResponse::new(200)
+        };
+        frame(head, &mut conn, &cfg());
+        step(head, Body::inline(b""), &p, &mut conn, &mut handler);
+        assert_eq!(
+            frame(&wire, &mut conn, &cfg()),
+            Framing::Complete {
+                header_len: 0,
+                body_len: wire.len()
+            }
+        );
+        let resp = step(b"", Body::placed(wire), &p, &mut conn, &mut handler);
+        assert!(matches!(resp, Response::Reply(_)));
+        assert!(text(&resp).starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(matches!(conn.phase, Phase::Head));
+    }
+
+    #[test]
+    fn owned_delivery_surfaces_trailers_and_drops_forbidden() {
+        // A non-dance chunked message delivered with the wire owned: the
+        // in-place path must surface genuine trailers (copied aside, so the
+        // entity can own the allocation) and still drop the forbidden set.
+        let head =
+            b"PUT /t HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut raw = head.to_vec();
+        raw.extend_from_slice(
+            b"3\r\nabc\r\n0\r\nContent-Length: 9\r\nx-amz-checksum-crc32: lZe8jQ==\r\n\r\n",
+        );
+        let mut conn = HttpConn::new(());
+        let verdict = frame(&raw, &mut conn, &cfg());
+        let Framing::Complete {
+            header_len,
+            body_len,
+        } = verdict
+        else {
+            panic!("expected complete, got {verdict:?}");
+        };
+        assert_eq!(header_len, head.len());
+        let p = peer();
+        let mut handler = |mut req: HttpRequest<'_>, _: &mut ()| {
+            assert_eq!(req.body.take(), b"abc");
+            assert_eq!(req.trailers.len(), 1);
+            assert_eq!(req.trailers[0].name, "x-amz-checksum-crc32");
+            assert_eq!(req.trailers[0].value, b"lZe8jQ==");
+            HttpResponse::new(200)
+        };
+        let resp = step(
+            &raw[..header_len],
+            Body::placed(raw[header_len..header_len + body_len].to_vec()),
             &p,
             &mut conn,
             &mut handler,

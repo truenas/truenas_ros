@@ -208,8 +208,12 @@ pub struct ServerConfig {
     /// buffer's idle high-water mark. Applies when the body still has bytes
     /// to read at the frame verdict (always, for `Need`-style framers; a
     /// `More`-style framer that already over-read the whole body delivers it
-    /// inline, where [`Body::take`] falls back to a copy). `None` disables
-    /// placement. Default 64 KiB.
+    /// inline, where [`Body::take`] falls back to a copy — except a
+    /// **body-only** message at or over this threshold whose extent is
+    /// exactly the buffered bytes, which hands the accumulate buffer itself
+    /// over: the shape the http 100-continue dance delivers chunked bodies
+    /// in, so those arrive owned too). `None` disables placement. Default
+    /// 64 KiB.
     pub body_placement_threshold: Option<usize>,
 }
 

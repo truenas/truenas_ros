@@ -182,9 +182,12 @@ pub enum CloseReason {
 /// Dereferences to `[u8]` for in-place reads. [`Body::take`] yields the bytes
 /// as an owned `Vec<u8>` — a zero-copy move when the body was **placed** in
 /// its own allocation (bodies at or over
-/// `ServerConfig::body_placement_threshold`), a copy-out otherwise — so a
-/// handler that offloads work writes one pattern that is never wrong:
-/// `let payload = body.take();`. After `take` the body reads as empty.
+/// `ServerConfig::body_placement_threshold`), an in-place truncate when the
+/// body owns a **window** of a larger wire buffer (no allocation, at most one
+/// overlapping move — how the http codec delivers a de-chunked entity), and a
+/// copy-out otherwise — so a handler that offloads work writes one pattern
+/// that is never wrong: `let payload = body.take();`. After `take` the body
+/// reads as empty.
 pub struct Body<'a> {
     inner: BodyInner<'a>,
 }
@@ -192,8 +195,15 @@ pub struct Body<'a> {
 enum BodyInner<'a> {
     /// Borrowed from the connection's accumulate buffer.
     Inline(&'a [u8]),
-    /// Placed in its own allocation; `None` once taken.
-    Placed(Option<Vec<u8>>),
+    /// Owns an allocation in which the body is the `start..start + len`
+    /// window — the whole allocation for a placed body; a sub-window when a
+    /// codec carved the payload out of a larger wire message (the bytes
+    /// around the window are dead framing). `None` once taken.
+    Owned {
+        buf: Option<Vec<u8>>,
+        start: usize,
+        len: usize,
+    },
 }
 
 impl<'a> Body<'a> {
@@ -204,13 +214,34 @@ impl<'a> Body<'a> {
     }
 
     pub(crate) fn placed(bytes: Vec<u8>) -> Body<'a> {
+        let len = bytes.len();
+        Body::owned_range(bytes, 0, len)
+    }
+
+    /// A body owning `bytes` whose payload is the `start..start + len`
+    /// window. [`Body::take`] truncates to the window in place — ownership
+    /// moves, the allocation doesn't.
+    pub(crate) fn owned_range(
+        bytes: Vec<u8>,
+        start: usize,
+        len: usize,
+    ) -> Body<'a> {
+        debug_assert!(
+            start.checked_add(len).is_some_and(|end| end <= bytes.len()),
+            "window out of bounds"
+        );
         Body {
-            inner: BodyInner::Placed(Some(bytes)),
+            inner: BodyInner::Owned {
+                buf: Some(bytes),
+                start,
+                len,
+            },
         }
     }
 
-    /// Take ownership of the body bytes: a zero-copy move when placed, a copy
-    /// otherwise. The body reads as empty afterwards.
+    /// Take ownership of the body bytes: a zero-copy move when placed, an
+    /// in-place truncate (no allocation) when the body owns a window of a
+    /// larger buffer, a copy otherwise. The body reads as empty afterwards.
     pub fn take(&mut self) -> Vec<u8> {
         match &mut self.inner {
             BodyInner::Inline(bytes) => {
@@ -218,7 +249,33 @@ impl<'a> Body<'a> {
                 *bytes = &[];
                 out
             }
-            BodyInner::Placed(bytes) => bytes.take().unwrap_or_default(),
+            BodyInner::Owned { buf, start, len } => match buf.take() {
+                Some(mut v) => {
+                    if *start > 0 {
+                        // Overlapping move within the same allocation; the
+                        // window becomes the prefix, the tail is dropped.
+                        v.copy_within(*start..*start + *len, 0);
+                    }
+                    v.truncate(*len);
+                    *len = 0;
+                    v
+                }
+                None => Vec::new(),
+            },
+        }
+    }
+
+    /// The full backing allocation, when this body owns one — window
+    /// position discarded, every byte included — or `None` for an inline
+    /// body. The codec-side seam for in-place transforms over a delivered
+    /// wire message (the http chunked path); handlers use [`Body::take`].
+    pub(crate) fn try_take_owned(&mut self) -> Option<Vec<u8>> {
+        match &mut self.inner {
+            BodyInner::Inline(_) => None,
+            BodyInner::Owned { buf, len, .. } => {
+                *len = 0;
+                buf.take()
+            }
         }
     }
 }
@@ -228,8 +285,12 @@ impl std::ops::Deref for Body<'_> {
     fn deref(&self) -> &[u8] {
         match &self.inner {
             BodyInner::Inline(bytes) => bytes,
-            BodyInner::Placed(Some(bytes)) => bytes,
-            BodyInner::Placed(None) => &[],
+            BodyInner::Owned {
+                buf: Some(v),
+                start,
+                len,
+            } => &v[*start..*start + *len],
+            BodyInner::Owned { buf: None, .. } => &[],
         }
     }
 }
@@ -238,7 +299,7 @@ impl std::fmt::Debug for Body<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Body")
             .field("len", &self.len())
-            .field("placed", &matches!(self.inner, BodyInner::Placed(_)))
+            .field("placed", &matches!(self.inner, BodyInner::Owned { .. }))
             .finish()
     }
 }
@@ -358,5 +419,47 @@ mod tests {
         );
         // total length < prefix width is malformed.
         assert_eq!(h(&[0, 1], &mut ()), Framing::Invalid);
+    }
+
+    #[test]
+    fn owned_range_take_truncates_in_place() {
+        // The wire form around a windowed body is dead framing; take()
+        // compacts to the window without leaving the allocation.
+        let wire = b"5\r\nhello\r\n0\r\n\r\n".to_vec();
+        let p0 = wire.as_ptr() as usize;
+        let mut b = Body::owned_range(wire, 3, 5);
+        assert_eq!(&b[..], b"hello");
+        let v = b.take();
+        assert_eq!(v, b"hello");
+        assert_eq!(v.as_ptr() as usize, p0, "same allocation, no copy-out");
+        assert!(b.is_empty());
+        assert_eq!(b.take(), Vec::<u8>::new(), "second take is empty");
+    }
+
+    #[test]
+    fn placed_take_is_a_move() {
+        let bytes = vec![7u8; 32];
+        let p0 = bytes.as_ptr() as usize;
+        let mut b = Body::placed(bytes);
+        assert_eq!(&b[..], &[7u8; 32][..]);
+        let v = b.take();
+        assert_eq!(v.as_ptr() as usize, p0);
+    }
+
+    #[test]
+    fn try_take_owned_returns_the_backing_allocation() {
+        let wire = b"5\r\nhello\r\n0\r\n\r\n".to_vec();
+        let p0 = wire.as_ptr() as usize;
+        let mut b = Body::placed(wire);
+        let w = b
+            .try_take_owned()
+            .expect("owned body hands its buffer over");
+        assert_eq!(w.as_ptr() as usize, p0);
+        assert_eq!(w.len(), 15);
+        assert!(b.is_empty());
+        // Inline bodies have no allocation to hand over, and are untouched.
+        let mut b = Body::inline(b"abc");
+        assert!(b.try_take_owned().is_none());
+        assert_eq!(&b[..], b"abc");
     }
 }
