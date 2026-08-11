@@ -230,7 +230,7 @@ where
         // placed, a copy when inline).
         let (header, body) = {
             let c = self.core.table.conn_mut(slot);
-            let (h, mut b, _peer, _state) = c.deliver_parts();
+            let (h, mut b, _peer, _state) = c.deliver_parts(None);
             (h.to_vec(), b.take())
         };
         self.core.table.conn_mut(slot).consume();
