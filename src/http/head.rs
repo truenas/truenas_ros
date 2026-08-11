@@ -262,6 +262,30 @@ impl Head<'_> {
             }
         }
     }
+
+    /// Whether this head carried both a `Content-Length` and a
+    /// `Transfer-Encoding` field. The codec resolves the pair by letting the
+    /// transfer coding win, per the receiver rule in RFC 9112 section 6.3,
+    /// and ignores the length. A front end that prefers the length instead
+    /// would frame the same bytes with a different message boundary, and
+    /// that difference is the CL.TE request smuggling primitive. The server
+    /// keeps the coding preference for client compatibility, since botocore
+    /// sends exactly this pair, and instead makes the exchange non
+    /// pipelinable. The response glue forces the connection to close on a
+    /// conflict, so no later request shares the connection with a smuggled
+    /// prefix.
+    pub fn cl_te_conflict(&self) -> bool {
+        let mut has_cl = false;
+        let mut has_te = false;
+        for h in self.views() {
+            if h.name.eq_ignore_ascii_case("content-length") {
+                has_cl = true;
+            } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+                has_te = true;
+            }
+        }
+        has_cl && has_te
+    }
 }
 
 /// Whether any comma-separated element of any `name` field line equals
