@@ -48,6 +48,7 @@ use std::mem::size_of;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 /// Default warm floor of worker threads backing [`FsConn::offload`]; the pool
 /// is spawned on first use and grows to [`OFFLOAD_CEILING`] under saturation.
@@ -1939,16 +1940,20 @@ impl FsConn<'_> {
     /// The generic escape hatch for work with no io_uring op (readdir,
     /// `fdopendir`, an ioctl): the reactor stays free while the job runs, and
     /// the continuation resumes on-loop like any completion callback.
+    /// `on_done` receives a [`thread::Result`] because a panicking job must
+    /// still deliver: the completion carries the panic, so the continuation
+    /// runs, the registration is retired, and any reactor-side state the caller
+    /// holds is released instead of stranded.
     pub fn offload<R, J, F>(&mut self, job: J, on_done: F)
     where
         J: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
-        F: FnOnce(R, &mut FsConn<'_>) + 'static,
+        F: FnOnce(thread::Result<R>, &mut FsConn<'_>) + 'static,
     {
         let deliver: OffloadDeliver = Box::new(move |any, conn| {
             // The token pairs this continuation with the job that produced
-            // exactly an `R`, so the downcast cannot mismatch.
-            if let Ok(r) = any.downcast::<R>() {
+            // exactly this `thread::Result<R>`, so the downcast cannot mismatch.
+            if let Ok(r) = any.downcast::<thread::Result<R>>() {
                 on_done(*r, conn);
             }
         });
@@ -1956,7 +1961,9 @@ impl FsConn<'_> {
         let sink = self.fs.completion_sink();
         let wake = Arc::clone(&self.eng.shared);
         self.fs.submit_offload(Box::new(move || {
-            let r = job();
+            // Push and poke unconditionally: an unwind past either one would
+            // leave `offload_reg` holding a continuation that never fires.
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
             sink.lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push_back((token, Box::new(r)));
@@ -1964,6 +1971,20 @@ impl FsConn<'_> {
             // re-arms the READ, so no poke is lost — the inject-path pattern).
             wake.wake.poke();
         }));
+    }
+
+    /// [`offload`](Self::offload) for a job that already yields a
+    /// [`crate::Result`], mapping a panicked job to `EIO` so the continuation
+    /// keeps its ordinary signature.
+    fn offload_result<T, J, F>(&mut self, job: J, on_done: F)
+    where
+        J: FnOnce() -> crate::Result<T> + Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(crate::Result<T>, &mut FsConn<'_>) + 'static,
+    {
+        self.offload(job, move |r: thread::Result<crate::Result<T>>, conn| {
+            on_done(r.unwrap_or_else(|_| Err(Errno::EIO.into())), conn);
+        });
     }
 
     /// Offload a `flistxattr` of `f` to the pool and deliver its attribute
@@ -1976,7 +1997,10 @@ impl FsConn<'_> {
     where
         F: FnOnce(crate::Result<Vec<CString>>, &mut FsConn<'_>) + 'static,
     {
-        self.offload(move || super::query_dir::list_xattr_names(&f), on_done);
+        self.offload_result(
+            move || super::query_dir::list_xattr_names(&f),
+            on_done,
+        );
     }
 
     /// Copy `len` bytes from `src[off_src..]` to `dst[off_dst..]`, trying a
@@ -2003,7 +2027,7 @@ impl FsConn<'_> {
     ) where
         F: FnOnce(crate::Result<u64>, &mut FsConn<'_>) + 'static,
     {
-        self.offload(
+        self.offload_result(
             move || {
                 super::query_dir::clone_or_copy_range(
                     &src, &dst, off_src, off_dst, len,
@@ -2028,10 +2052,10 @@ impl FsConn<'_> {
                 drop(f);
                 Err(Errno::EPERM.into())
             };
-            self.offload(job, on_done);
+            self.offload_result(job, on_done);
             return;
         }
-        self.offload(move || remove_xattr_blocking(&f, &name), on_done);
+        self.offload_result(move || remove_xattr_blocking(&f, &name), on_done);
     }
 
     /// Open `anchor` itself readable **under `who`** on the ring (the DAC /
@@ -2071,18 +2095,23 @@ impl FsConn<'_> {
                         }
                         Ok(SendDir(dp))
                     },
-                    move |res: crate::Result<SendDir>, conn| match res {
-                        Ok(sdir) => on_ready(
-                            Ok(DirWalk {
-                                inner: Rc::new(RefCell::new(DirWalkInner {
-                                    dp: sdir.into_raw(),
-                                    in_flight: false,
-                                    dropped: false,
-                                })),
-                            }),
-                            conn,
-                        ),
-                        Err(e) => on_ready(Err(e), conn),
+                    move |res: thread::Result<crate::Result<SendDir>>, conn| {
+                        match res {
+                            Ok(Ok(sdir)) => on_ready(
+                                Ok(DirWalk {
+                                    inner: Rc::new(RefCell::new(
+                                        DirWalkInner {
+                                            dp: sdir.into_raw(),
+                                            in_flight: false,
+                                            dropped: false,
+                                        },
+                                    )),
+                                }),
+                                conn,
+                            ),
+                            Ok(Err(e)) => on_ready(Err(e), conn),
+                            Err(_) => on_ready(Err(Errno::EIO.into()), conn),
+                        }
                     },
                 ),
                 None => {
@@ -2174,7 +2203,16 @@ impl FsConn<'_> {
                 };
                 (batch, sdir)
             },
-            move |(batch, sdir): (crate::Result<NameBatch>, SendDir), conn| {
+            move |res: thread::Result<(crate::Result<NameBatch>, SendDir)>,
+                  conn| {
+                // A panicking job unwound its frame, which dropped `SendDir`
+                // and closed the DIR* with it: there is no handle to hand back,
+                // so `dp` stays null and the walk reads as finished rather than
+                // permanently busy.
+                let (batch, sdir) = match res {
+                    Ok((batch, sdir)) => (batch, Some(sdir)),
+                    Err(_) => (Err(Errno::EIO.into()), None),
+                };
                 let mut b = inner.borrow_mut();
                 if b.dropped {
                     // Walk dropped mid-batch: `sdir` drops here, closing the
@@ -2183,7 +2221,7 @@ impl FsConn<'_> {
                     drop(sdir);
                     return;
                 }
-                b.dp = sdir.into_raw();
+                b.dp = sdir.map_or(std::ptr::null_mut(), SendDir::into_raw);
                 b.in_flight = false;
                 drop(b);
                 on_batch(batch, conn);
@@ -2289,11 +2327,46 @@ mod hybrid_tests {
             &mut eng,
             &mut fs,
             move |c| {
-                c.offload(|| 6u64 * 7, move |r, _c| *g2.borrow_mut() = Some(r));
+                c.offload(|| 6u64 * 7, move |r, _c| *g2.borrow_mut() = r.ok());
             },
             || got.borrow().is_some(),
         );
         assert_eq!(*got.borrow(), Some(42));
+    }
+
+    /// A panicking job must still deliver. Before, `push_back`/`poke` sat after
+    /// `job()`, so an unwind skipped both: the continuation never ran, the
+    /// `offload_reg` entry was never retired, and anything the continuation
+    /// would have released (a walk's `in_flight`) stayed held forever.
+    #[test]
+    fn offload_delivers_even_when_the_job_panics() {
+        let (mut eng, mut fs, _me) = setup();
+        let got: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
+        let g2 = got.clone();
+        // The worker's own `catch_unwind` prints the panic; keep it quiet.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                c.offload(
+                    || -> u64 { panic!("job blew up") },
+                    move |r, _c| *g2.borrow_mut() = Some(r.is_err()),
+                );
+            },
+            || got.borrow().is_some(),
+        );
+        std::panic::set_hook(prev);
+        assert_eq!(
+            *got.borrow(),
+            Some(true),
+            "the continuation must run, carrying the panic"
+        );
+        assert!(
+            fs.offload_reg.is_empty(),
+            "a panicked job must not strand its registry entry"
+        );
     }
 
     #[test]
@@ -2307,7 +2380,13 @@ mod hybrid_tests {
             move |c| {
                 for _ in 0..8 {
                     let c3 = c2.clone();
-                    c.offload(|| (), move |(), _c| *c3.borrow_mut() += 1);
+                    c.offload(
+                        || (),
+                        move |r, _c| {
+                            r.expect("a unit job never panics");
+                            *c3.borrow_mut() += 1;
+                        },
+                    );
                 }
             },
             || *count.borrow() == 8,
