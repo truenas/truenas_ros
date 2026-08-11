@@ -162,12 +162,13 @@ where
 {
     match std::mem::replace(&mut conn.phase, Phase::Head) {
         // The framer's farewell: everything buffered was delivered as a
-        // degenerate message; answer and flush-close. The method can't be
-        // parsed out of a head that failed, but a HEAD prefix is enough to
-        // honor the no-content rule for the requests that had one.
-        Phase::Fail { status } => {
-            farewell(status, header.starts_with(b"HEAD "))
-        }
+        // degenerate message; answer and flush-close. The HEAD flag rides
+        // in the phase from the moment the failure was declared — after the
+        // dance the head bytes are consumed and the delivered bytes are the
+        // client's body, so sniffing them here would let a body that spells
+        // "HEAD " force an incomplete farewell (and a real HEAD's farewell
+        // grow a body its client would read as the next response).
+        Phase::Fail { status, head_only } => farewell(status, head_only),
         // Dance message 1: the head alone. Queue the interim line verbatim
         // (Reply sends raw bytes) and advance the phase; the framer will
         // declare the body next.
@@ -440,7 +441,7 @@ mod tests {
         let mut conn = HttpConn::new(());
         let junk = b"NOT HTTP\r\n\r\n";
         frame(junk, &mut conn, &cfg());
-        assert!(matches!(conn.phase, Phase::Fail { status: 400 }));
+        assert!(matches!(conn.phase, Phase::Fail { status: 400, .. }));
         let p = peer();
         let mut unreached =
             |_: HttpRequest<'_>, _: &mut ()| panic!("handler must not run");
@@ -459,7 +460,7 @@ mod tests {
         let mut conn = HttpConn::new(());
         let req = b"HEAD /x HTTP/1.1\r\nHost: h\r\nContent-Length: 99999999999\r\n\r\n";
         frame(req, &mut conn, &cfg());
-        assert!(matches!(conn.phase, Phase::Fail { status: 413 }));
+        assert!(matches!(conn.phase, Phase::Fail { status: 413, .. }));
         let p = peer();
         let mut unreached =
             |_: HttpRequest<'_>, _: &mut ()| panic!("handler must not run");
@@ -467,6 +468,65 @@ mod tests {
         let s = text(&resp);
         assert!(s.starts_with("HTTP/1.1 413"));
         // The HEAD contract: length declared, no body bytes.
+        assert!(s.contains("Content-Length: 10\r\n"));
+        assert!(s.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn farewell_after_dance_ignores_body_bytes() {
+        // After the interim the head is consumed; a failing scan delivers
+        // body bytes alone. A body crafted to begin "HEAD " must not turn
+        // the farewell into a bodyless HEAD response — a declared
+        // Content-Length with no content is an incomplete message.
+        let head = b"PUT /k HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut conn = HttpConn::new(());
+        let p = peer();
+        let mut unreached =
+            |_: HttpRequest<'_>, _: &mut ()| panic!("handler must not run");
+        frame(head, &mut conn, &cfg());
+        step(head, Body::inline(b""), &p, &mut conn, &mut unreached);
+        // Message 2: garbage chunk framing that happens to spell "HEAD ".
+        let body = b"HEAD /x HTTP/1.1\r\n\r\n";
+        frame(body, &mut conn, &cfg());
+        assert!(matches!(
+            conn.phase,
+            Phase::Fail {
+                status: 400,
+                head_only: false
+            }
+        ));
+        let resp = step(body, Body::inline(b""), &p, &mut conn, &mut unreached);
+        let s = text(&resp);
+        assert!(s.starts_with("HTTP/1.1 400"));
+        // The PUT's farewell carries its diagnostic body.
+        assert!(s.ends_with("error 400\n"));
+    }
+
+    #[test]
+    fn head_farewell_elides_body_after_dance() {
+        // The converse: a real HEAD whose dance fails must still elide the
+        // farewell body, even though the delivered bytes no longer start
+        // with the method.
+        let head = b"HEAD /k HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut conn = HttpConn::new(());
+        let p = peer();
+        let mut unreached =
+            |_: HttpRequest<'_>, _: &mut ()| panic!("handler must not run");
+        frame(head, &mut conn, &cfg());
+        step(head, Body::inline(b""), &p, &mut conn, &mut unreached);
+        // Message 2: a malformed chunk-size line kills the scan.
+        let body = b"zz\r\n";
+        frame(body, &mut conn, &cfg());
+        assert!(matches!(
+            conn.phase,
+            Phase::Fail {
+                status: 400,
+                head_only: true
+            }
+        ));
+        let resp = step(body, Body::inline(b""), &p, &mut conn, &mut unreached);
+        let s = text(&resp);
+        assert!(s.starts_with("HTTP/1.1 400"));
         assert!(s.contains("Content-Length: 10\r\n"));
         assert!(s.ends_with("\r\n\r\n"));
     }
