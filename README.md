@@ -32,6 +32,7 @@ truenas_ros = { version = "0.1", default-features = false, features = ["sync-fs"
 | `idmap` | idmapped-mount user namespaces via `clone3` (`create_idmap_userns`, cached `idmap_userns`) — lives at `mount::idmap` |
 | `shutil` | metadata-preserving recursive `copytree` + copy / clone primitives |
 | `configfile` | INI config files byte-for-byte compatible with Python's `configparser`, read symlink-safely and written atomically |
+| `audit` | Kernel audit records over `NETLINK_AUDIT` — PAM-shaped `key=value` events sent straight to `auditd`, replacing libaudit |
 
 An io_uring stack lives alongside the blocking bindings, off by default:
 `net-server` / `net-client` (stream roles over a shared reactor core, with
