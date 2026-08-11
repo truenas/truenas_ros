@@ -49,9 +49,12 @@ pub struct HttpRequest<'a> {
     pub raw_head: &'a [u8],
     /// Trailer fields from a chunked body (RFC 9112 §7.1.2), parsed but not
     /// interpreted; empty for non-chunked requests and for chunked bodies
-    /// whose trailer section is bare. (botocore's checksum trailer rides
-    /// *inside* the aws-chunked entity, not here — this surfaces genuine
-    /// HTTP trailers for whichever clients send them.)
+    /// whose trailer section is bare. Names forbidden in trailers —
+    /// framing, routing, and credentials (RFC 9110 §6.5.1) — are dropped by
+    /// the codec and never appear here, so merging these with the headers
+    /// cannot rewrite either. (botocore's checksum trailer rides *inside*
+    /// the aws-chunked entity, not here — this surfaces genuine HTTP
+    /// trailers for whichever clients send them.)
     pub trailers: &'a [HeaderView<'a>],
     /// The peer's identity.
     pub peer: &'a ClientAddr,

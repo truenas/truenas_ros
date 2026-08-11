@@ -8,7 +8,9 @@
 //! Strictness (RFC 9112 §7.1): hex chunk sizes with checked arithmetic
 //! (overflow is a 400, not a wraparound), CRLF line endings only, chunk
 //! extensions parsed and ignored (a recipient MUST ignore unrecognized
-//! extensions), trailer field names token-validated. Every line is capped
+//! extensions), trailer field names token-validated (with the
+//! framing/routing/credential set dropped — [`FORBIDDEN_TRAILERS`]). Every
+//! line is capped
 //! ([`CHUNK_LINE_MAX`], [`TRAILER_LINE_MAX`]) so a peer can neither wedge
 //! the scanner short of a terminator nor drip an unbounded "line", and the
 //! whole trailer section is capped ([`TRAILER_MAX`] → 431, the oversized-
@@ -155,6 +157,26 @@ fn split_trailer(line: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((&line[..colon], line[colon + 1..].trim_ascii()))
 }
 
+/// Field names that must not ride in a trailer section (RFC 9110 §6.5.1):
+/// message framing, routing, and credentials. A conforming sender never puts
+/// these there, and surfacing them tempts any consumer that merges headers
+/// and trailers into letting a trailer rewrite framing or auth after the
+/// body — so a well-formed line bearing one is consumed and dropped, never
+/// surfaced.
+const FORBIDDEN_TRAILERS: [&str; 5] = [
+    "transfer-encoding",
+    "content-length",
+    "host",
+    "authorization",
+    "cookie",
+];
+
+fn forbidden_trailer(name: &[u8]) -> bool {
+    FORBIDDEN_TRAILERS
+        .iter()
+        .any(|f| name.eq_ignore_ascii_case(f.as_bytes()))
+}
+
 /// The one state machine under both [`scan`] and [`decode`]: advance over
 /// `body` from where `s` left off, reporting payload spans and validated
 /// trailer lines to the sinks. `Ok(Some(extent))` — the message occupies
@@ -228,10 +250,14 @@ fn run<'b>(
                     s.consumed += i + 2;
                     if line.is_empty() {
                         s.state = State::Done;
-                    } else if split_trailer(line).is_some() {
-                        on_trailer(line);
                     } else {
-                        return Err(400);
+                        match split_trailer(line) {
+                            // Forbidden names (framing/routing/credentials)
+                            // are consumed but never surfaced.
+                            Some((name, _)) if forbidden_trailer(name) => {}
+                            Some(_) => on_trailer(line),
+                            None => return Err(400),
+                        }
                     }
                 }
             },
@@ -395,6 +421,27 @@ mod tests {
         assert_eq!(trailers[0].value, b"abc==");
         assert_eq!(trailers[1].name, "x-two");
         assert_eq!(trailers[1].value, b"v");
+    }
+
+    #[test]
+    fn forbidden_trailer_fields_dropped() {
+        // Framing, routing, and credential names cannot ride in trailers
+        // (RFC 9110 §6.5.1): well-formed lines bearing them are consumed
+        // but never surfaced, so a consumer merging headers and trailers
+        // cannot have its framing or auth rewritten after the body.
+        let wire = b"0\r\n\
+            Content-Length: 999\r\n\
+            Transfer-Encoding: chunked\r\n\
+            HOST: evil\r\n\
+            Authorization: Basic abc\r\n\
+            Cookie: sid=1\r\n\
+            x-amz-checksum-crc32: ok==\r\n\r\n";
+        let (entity, trailers) = decode(wire).expect("decodes");
+        assert!(entity.is_empty());
+        assert_eq!(trailers.len(), 1);
+        assert_eq!(trailers[0].name, "x-amz-checksum-crc32");
+        // The scan sees the same message extent (shared state machine).
+        assert_eq!(scan(wire, &mut ChunkScan::default()), Ok(Some(wire.len())));
     }
 
     #[test]

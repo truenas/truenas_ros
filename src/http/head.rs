@@ -8,10 +8,14 @@
 //! head means — [`frame_facts`] merely skips building the header index the
 //! framer would throw away.
 
-/// Header-count cap handed to `httparse`. S3 requests carry many `x-amz-*`
-/// headers but AWS caps user metadata at 2 KiB total; 96 slots is comfortable
-/// headroom, and overflow maps to 431 rather than a parse wedge.
-pub(crate) const MAX_HEADERS: usize = 96;
+/// Header-count cap handed to `httparse`. Sized for S3: AWS caps user
+/// metadata at 2 KiB total, but short keys can spread that budget across
+/// ~130 `x-amz-meta-*` fields, on top of the auth/content/standard fields a
+/// signed request carries — so 96 slots rejected requests inside AWS's own
+/// limits. 160 covers the worst legitimate shape with headroom (the arrays
+/// this sizes are transient stack frames, 32 B a slot), and overflow maps
+/// to 431 rather than a parse wedge.
+pub(crate) const MAX_HEADERS: usize = 160;
 
 /// How a request's body is framed on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,6 +378,19 @@ mod tests {
             .expect("parse ok")
             .expect("head complete");
         f(&head)
+    }
+
+    #[test]
+    fn metadata_heavy_request_fits_the_slots() {
+        // AWS's 2 KiB metadata budget spread across 130 short keys — the
+        // worst legitimate S3 shape — must parse, not 431 on slot count.
+        let mut req = b"PUT /b/k HTTP/1.1\r\nHost: h\r\n".to_vec();
+        for i in 0..130 {
+            req.extend_from_slice(format!("x-amz-meta-{i}: v\r\n").as_bytes());
+        }
+        req.extend_from_slice(b"\r\n");
+        let facts = frame_facts(&req).expect("parses").expect("complete");
+        assert_eq!(facts.len, req.len());
     }
 
     #[test]
