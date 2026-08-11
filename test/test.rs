@@ -259,6 +259,18 @@ mod acl {
     };
     use truenas_ros::sync_fs::xattr::fgetxattr;
 
+    /// Skip a live-fixture check. `TRUENAS_ROS_REQUIRE_ZFS` (the same gate
+    /// `test/zfs.rs` uses) turns the skip into a failure, so a fixture on the
+    /// wrong dataset type is caught where CI provisions one and ignored where
+    /// it does not.
+    #[track_caller]
+    fn require_zfs(why: &str) {
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_ZFS").is_none(),
+            "TRUENAS_ROS_REQUIRE_ZFS is set but {why}"
+        );
+    }
+
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)
@@ -363,7 +375,8 @@ mod acl {
                 let raw = fgetxattr(f.as_fd(), "system.nfs4_acl_xdr").unwrap();
                 assert_eq!(acl.to_xattr().unwrap(), raw);
             }
-            Ok(Acl::Posix(_)) => panic!("expected an NFS4 ACL"),
+            // The fixture path exists but is not on an NFSv4-ACL dataset.
+            Ok(Acl::Posix(_)) => require_zfs("/NFSV4ACL is not NFSv4-ACL"),
             Err(_) => {} // filesystem may not support NFS4 ACLs here
         }
     }
@@ -380,7 +393,8 @@ mod acl {
                     fgetxattr(f.as_fd(), "system.posix_acl_access").unwrap();
                 assert_eq!(acl.access_bytes().unwrap(), raw);
             }
-            Ok(Acl::Nfs4(_)) => panic!("expected a POSIX ACL"),
+            // The fixture path exists but is not on a POSIX-ACL dataset.
+            Ok(Acl::Nfs4(_)) => require_zfs("/POSIXACL is not POSIX-ACL"),
             Err(_) => {}
         }
     }

@@ -18,6 +18,17 @@ use truenas_ros::sync_fs::acl::{
 };
 use truenas_ros::sync_fs::xattr::fgetxattr;
 
+/// Skip the calling test. `TRUENAS_ROS_REQUIRE_ZFS` turns the skip into a
+/// failure, so a fixture that stopped being provisioned cannot report a green
+/// suite that tested nothing.
+#[track_caller]
+fn skip(why: &str) {
+    assert!(
+        std::env::var_os("TRUENAS_ROS_REQUIRE_ZFS").is_none(),
+        "TRUENAS_ROS_REQUIRE_ZFS is set but {why}"
+    );
+}
+
 /// Resolve an ACL-typed dataset directory, or `None` to skip the test.
 fn dataset(env_var: &str, fallback: &str) -> Option<PathBuf> {
     let dir = std::env::var_os(env_var)
@@ -50,7 +61,7 @@ fn scratch_file(dir: &Path, tag: &str) -> (PathBuf, std::fs::File) {
 #[test]
 fn nfs4_codec_and_named_user_roundtrip() {
     let Some(dir) = nfs4_dir() else {
-        return;
+        return skip("no NFSv4-ACL dataset");
     };
     let (path, f) = scratch_file(&dir, "nfs4");
 
@@ -60,7 +71,9 @@ fn nfs4_codec_and_named_user_roundtrip() {
         // than fail (e.g. a placeholder `/NFSV4ACL` dir on a non-ZFS host).
         _ => {
             let _ = std::fs::remove_file(&path);
-            return;
+            return skip(
+                "the NFSv4 dataset path is not an NFSv4-ACL filesystem",
+            );
         }
     };
     // Whatever the fresh file carries (it may inherit entries from the parent),
@@ -118,7 +131,7 @@ fn nfs4_codec_and_named_user_roundtrip() {
 #[test]
 fn posix_named_user_roundtrip_on_zfs() {
     let Some(dir) = posix_dir() else {
-        return;
+        return skip("no POSIX-ACL dataset");
     };
     let (path, f) = scratch_file(&dir, "posix");
 
@@ -128,7 +141,9 @@ fn posix_named_user_roundtrip_on_zfs() {
         // Not a POSIX-ACL filesystem here — skip.
         _ => {
             let _ = std::fs::remove_file(&path);
-            return;
+            return skip(
+                "the POSIX dataset path is not a POSIX-ACL filesystem",
+            );
         }
     };
     assert!(acl.trivial());
@@ -173,7 +188,7 @@ fn posix_named_user_roundtrip_on_zfs() {
 #[test]
 fn posix_default_acl_on_directory() {
     let Some(dir) = posix_dir() else {
-        return;
+        return skip("no POSIX-ACL dataset");
     };
     let sub = dir.join(format!("rostest_dir_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&sub);
@@ -184,7 +199,9 @@ fn posix_default_acl_on_directory() {
         Ok(Acl::Posix(a)) => a,
         _ => {
             let _ = std::fs::remove_dir_all(&sub);
-            return;
+            return skip(
+                "the POSIX dataset path is not a POSIX-ACL filesystem",
+            );
         }
     };
     // Access entries plus a default (inheritable) copy of them.
@@ -212,14 +229,14 @@ fn zfs_snapshot_is_detected() {
     let (Some(dir), Ok(ds)) =
         (nfs4_dir(), std::env::var("TRUENAS_ROS_NFS4_DS"))
     else {
-        return;
+        return skip("no NFSv4 dataset or TRUENAS_ROS_NFS4_DS unset");
     };
     let snap = format!("{ds}@rostest_{}", std::process::id());
     let zfs =
         |args: &[&str]| std::process::Command::new("zfs").args(args).status();
     let _ = zfs(&["destroy", "-r", &snap]);
     if !matches!(zfs(&["snapshot", &snap]), Ok(s) if s.success()) {
-        return; // couldn't snapshot (not root / not our dataset)
+        return skip("could not snapshot (not root, or not our dataset)");
     }
     let snap_dir = format!("rostest_{}", std::process::id());
     let snap_path = dir.join(".zfs/snapshot").join(&snap_dir);
