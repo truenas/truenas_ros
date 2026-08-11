@@ -181,6 +181,12 @@ pub(crate) const IORING_OP_FALLOCATE: u8 = 17;
 /// (`op_flags`) = `AT_*`, `sqe.addr2` = the `struct statx` the kernel
 /// writes **at completion** (so the buffer must live until the CQE).
 pub(crate) const IORING_OP_STATX: u8 = 21;
+/// `posix_fadvise` on an open file. `sqe.off` = offset, `sqe.addr` = length
+/// (the kernel falls back to `sqe.len` only when `addr` is 0), and
+/// `sqe.fadvise_advice` (`op_flags`) = the `POSIX_FADV_*` advice
+/// (`io_uring/advise.c`, `io_fadvise_prep`). `buf_index` and `splice_fd_in`
+/// must be zero or the op is rejected `EINVAL`.
+pub(crate) const IORING_OP_FADVISE: u8 = 24;
 pub(crate) const IORING_OP_SENDMSG: u8 = 9;
 pub(crate) const IORING_OP_RECVMSG: u8 = 10;
 /// One-shot readiness poll. Used to wait for a splice's non-blocking pool

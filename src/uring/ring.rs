@@ -421,6 +421,50 @@ impl Ring {
         Ok(())
     }
 
+    /// Stage `n` SQEs guaranteed contiguous within a single submission and
+    /// joined into one `IOSQE_IO_LINK` chain: the kernel runs them strictly in
+    /// order, and the first failure short-circuits the rest (each survivor
+    /// still posts `-ECANCELED`, so one CQE per SQE holds either way).
+    ///
+    /// `fill(i, sqe)` fills link `i`; the link flag is OR-ed in *after* the
+    /// caller's fill, so per-op flags such as [`IOSQE_FIXED_FILE`] survive. As
+    /// with [`push_sqe_linked`](Ring::push_sqe_linked), already-staged SQEs are
+    /// flushed *first* when fewer than `n` slots are free, so no intervening
+    /// submit can split the chain — a split chain is not a slow chain, it is a
+    /// silently unordered one.
+    #[cfg(feature = "uring-fs")]
+    pub(crate) fn push_sqe_chain(
+        &mut self,
+        n: usize,
+        mut fill: impl FnMut(usize, &mut IoUringSqe),
+    ) -> errno::Result<()> {
+        debug_assert!(n > 0, "a chain needs at least one link");
+        let need = u32::try_from(n).map_err(|_| Errno::EINVAL)?;
+        if self.rings.free_sqes(self.sq_tail) < need {
+            self.submit()?;
+            if self.rings.free_sqes(self.sq_tail) < need {
+                return Err(Errno::EBUSY);
+            }
+        }
+        for i in 0..n {
+            // `need` slots were just guaranteed free, so every reservation
+            // succeeds.
+            let idx = self
+                .rings
+                .try_reserve(self.sq_tail)
+                .expect("slots reserved above");
+            self.rings.fill_sqe(idx, |sqe| {
+                fill(i, sqe);
+                if i + 1 < n {
+                    sqe.flags |= IOSQE_IO_LINK;
+                }
+            });
+            self.rings.advance(&mut self.sq_tail);
+            self.to_submit += 1;
+        }
+        Ok(())
+    }
+
     /// Pop one completion, or `None` if the CQ is empty.
     pub(crate) fn reap(&mut self) -> Option<IoUringCqe> {
         self.rings.reap(&mut self.cq_head)
@@ -460,6 +504,24 @@ impl Ring {
             Err(e) => return Err(e),
         }
         Ok(())
+    }
+
+    /// Read back a staged (not yet submitted) SQE, for tests that assert on the
+    /// bytes actually handed to the kernel rather than on the staging call's
+    /// return. Same soundness premise as [`reset_staging`](Ring::reset_staging):
+    /// with no `io_uring_enter`, the kernel has not read these slots.
+    #[cfg(all(test, feature = "uring-fs"))]
+    pub(crate) fn staged_sqe(&self, i: u32) -> IoUringSqe {
+        assert!(i < self.to_submit, "SQE {i} is not staged");
+        let idx = (i & self.rings.sq_mask) as usize;
+        #[cfg(not(loom))]
+        // SAFETY: idx < sq_entries, and the slot is staged-but-unpublished, so
+        // no concurrent writer exists and the kernel has not read it.
+        unsafe {
+            *self.rings.sqes.add(idx)
+        }
+        #[cfg(loom)]
+        self.rings.sqes[idx].with(|sqe| unsafe { *sqe })
     }
 
     /// Rewind SQE staging to empty, so a test that only *stages* SQEs can reuse

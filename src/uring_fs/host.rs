@@ -7,82 +7,18 @@ use super::core::{
     deliver_embedded, deliver_pool_completions, FsCore, FsWaiter, TAG_CANCEL,
     TAG_WAKE,
 };
-use super::{FsHandle, FsInject, FsOutcome, Personality};
+use super::{FsHandle, FsInject, FsOutcome, Personality, PrivilegedXattrs};
 use crate::errno::{self, Errno};
 use crate::uring::engine::Engine;
 use crate::uring::probe::probe_op_supported;
-use crate::uring::ring::Ring;
 use crate::uring::sys::{
-    register_personality, IoUringCqe, IORING_CQE_F_MORE, IORING_OP_FGETXATTR,
-    IORING_OP_FTRUNCATE, IORING_OP_OPENAT2, IOSQE_FIXED_FILE,
+    register_personality, IoUringCqe, IORING_CQE_F_MORE, IORING_OP_OPENAT2,
 };
 use crate::uring::user_data::{pack_raw, unpack_raw, SLOT_MASK, TAG_FS_DOMAIN};
 use crate::uring::wake::LoopShared;
 use std::fmt;
-use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
-
-/// Does this kernel accept a **registered-table file** for the fd-based
-/// xattr ops?
-///
-/// This cannot be answered by [`probe_op_supported`]: `FGETXATTR` is
-/// "supported" on every kernel since 5.19 — it just rejected
-/// `IOSQE_FIXED_FILE` with `-EBADF` until Linux 6.13, because the check
-/// belonged to the *path* variants but sat in a helper both shared
-/// (kernel commit `dc7e76ba7a60`, "IORING_OP_F[GS]ETXATTR is fine with
-/// REQ_F_FIXED_FILE"). Only attempting the real combination distinguishes
-/// them, so this builds a throwaway ring over an anonymous `memfd` — no
-/// filesystem is touched and the reactor's own table is untouched — and
-/// asks for an attribute that does not exist. Anything other than `EBADF`
-/// (`ENODATA`, `EOPNOTSUPP`, success) means the fixed-file path works.
-pub(crate) fn probe_fixed_file_xattr() -> bool {
-    let Ok(mut ring) = Ring::new(4) else {
-        return false;
-    };
-    if ring.register_pool(1).is_err() {
-        return false;
-    }
-    // SAFETY: a valid NUL-terminated name; memfd_create returns a fresh fd
-    // or -1.
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_memfd_create,
-            c"truenas_ros-xattr-probe".as_ptr(),
-            libc::MFD_CLOEXEC,
-        )
-    };
-    let Ok(fd) = Errno::result(fd) else {
-        return false;
-    };
-    // SAFETY: a fresh owned fd from memfd_create.
-    let memfd = unsafe { crate::fd::owned_from_raw(fd as std::os::fd::RawFd) };
-    if ring.install_file(0, memfd.as_raw_fd()).is_err() {
-        return false;
-    }
-    let name = c"user.truenas_ros_probe";
-    if ring
-        .push_sqe(|sqe| {
-            sqe.opcode = IORING_OP_FGETXATTR;
-            sqe.flags = IOSQE_FIXED_FILE;
-            sqe.fd = 0;
-            sqe.addr = name.as_ptr() as u64;
-            sqe.off_addr2 = 0; // size query: no value buffer
-            sqe.len = 0;
-            sqe.user_data = 1;
-        })
-        .is_err()
-    {
-        return false;
-    }
-    if ring.submit_and_wait(1).is_err() {
-        return false;
-    }
-    match ring.reap() {
-        Some(cqe) => cqe.res != -libc::EBADF,
-        None => false,
-    }
-}
 
 /// Sizing for an [`UringFs`].
 #[derive(Clone, Copy, Debug)]
@@ -139,13 +75,6 @@ pub struct UringFs {
     fs: FsCore,
     inject_tx: mpsc::Sender<FsInject>,
     inject_rx: mpsc::Receiver<FsInject>,
-    /// `IORING_OP_FTRUNCATE` (Linux ≥ 6.9) — above this crate's other
-    /// io_uring floors, so its absence disables just that call rather than
-    /// failing construction.
-    ftruncate_ok: bool,
-    /// Fixed-file `FGETXATTR`/`FSETXATTR` (Linux ≥ 6.13); see
-    /// [`probe_fixed_file_xattr`].
-    fd_xattr_ok: bool,
     eng: Engine,
 }
 
@@ -195,22 +124,13 @@ impl UringFs {
                     .into(),
             ));
         }
-        let ftruncate_ok = probe_op_supported(&eng.ring, IORING_OP_FTRUNCATE);
-        let fd_xattr_ok = probe_fixed_file_xattr();
         let (inject_tx, inject_rx) = mpsc::channel();
         Ok(UringFs {
             fs: FsCore::new(cfg.ops),
             inject_tx,
             inject_rx,
-            ftruncate_ok,
-            fd_xattr_ok,
             eng,
         })
-    }
-
-    /// Whether this kernel supports [`FsHandle::ftruncate`] (Linux ≥ 6.9).
-    pub fn supports_ftruncate(&self) -> bool {
-        self.ftruncate_ok
     }
 
     /// This reactor's ring descriptor — handed to the credential broker so
@@ -218,15 +138,6 @@ impl UringFs {
     /// ring fd plus its personality table is a credential capability).
     pub(crate) fn ring_fd(&self) -> std::os::fd::RawFd {
         self.eng.ring.raw_fd()
-    }
-
-    /// Whether this kernel supports [`FsHandle::fgetxattr`] /
-    /// [`FsHandle::fsetxattr`] on an open [`File`](super::File)
-    /// (Linux ≥ 6.13 — before that, io_uring rejected a registered-table
-    /// file for these ops). Where it is false those two calls return
-    /// `EOPNOTSUPP`; everything else in the API works normally.
-    pub fn supports_fd_xattr(&self) -> bool {
-        self.fd_xattr_ok
     }
 
     /// Register the calling process's **current** credentials as a
@@ -241,13 +152,23 @@ impl UringFs {
         Ok(Personality(id))
     }
 
+    /// Declare which extended attributes are written under this reactor's
+    /// ambient credentials rather than the requesting [`Personality`] — see
+    /// [`PrivilegedXattrs`] for the rules and the reasoning.
+    ///
+    /// Setup-time only, and enforced as such: [`UringFs::run`] borrows `&mut
+    /// self` for the lifetime of the loop, so this cannot be called while
+    /// operations are in flight. Replaces any previous policy; the default
+    /// permits nothing.
+    pub fn set_privileged_xattrs(&mut self, policy: PrivilegedXattrs) {
+        self.fs.set_privileged_xattrs(policy);
+    }
+
     /// A `Send + Sync` handle for submitting operations from other threads.
     pub fn handle(&self) -> FsHandle {
         FsHandle {
             tx: self.inject_tx.clone(),
             shared: self.eng.shared.clone(),
-            ftruncate_ok: self.ftruncate_ok,
-            fd_xattr_ok: self.fd_xattr_ok,
             pool: self.fs.pool_handle(),
         }
     }
@@ -296,7 +217,6 @@ impl UringFs {
         if tag & TAG_FS_DOMAIN == 0 {
             return Ok(()); // not ours (nothing stages such tags today)
         }
-        let (fd_xattr_ok, ftruncate_ok) = (self.fd_xattr_ok, self.ftruncate_ok);
         match tag {
             TAG_WAKE => {
                 if !self.eng.stopping() {
@@ -306,13 +226,7 @@ impl UringFs {
                 // Fire on-loop deliveries from finished off-loop pool jobs
                 // (`FsConn::offload` and the hybrid lister). Additive: the
                 // `FsHandle` path never touches the pool.
-                deliver_pool_completions(
-                    &mut self.fs,
-                    &mut self.eng,
-                    fd_xattr_ok,
-                    ftruncate_ok,
-                    true,
-                );
+                deliver_pool_completions(&mut self.fs, &mut self.eng, true);
             }
             TAG_CANCEL => {}
             // Deliver a completion. An `FsHandle` op parks a channel waiter
@@ -322,14 +236,7 @@ impl UringFs {
             _ => {
                 let reaped =
                     self.fs.on_cqe(&mut self.eng, tag, slot, gen32, cqe.res);
-                deliver_embedded(
-                    &mut self.fs,
-                    &mut self.eng,
-                    reaped,
-                    fd_xattr_ok,
-                    ftruncate_ok,
-                    true,
-                );
+                deliver_embedded(&mut self.fs, &mut self.eng, reaped, true);
             }
         }
         Ok(())
@@ -358,6 +265,7 @@ impl UringFs {
                     file,
                     bufs,
                     off,
+                    rw_flags,
                     reply,
                 } => self.fs.submit_rw(
                     &mut self.eng,
@@ -366,6 +274,7 @@ impl UringFs {
                     file,
                     bufs,
                     off,
+                    rw_flags,
                     FsWaiter::Channel(reply),
                 ),
                 FsInject::Fsync {
@@ -418,6 +327,9 @@ impl UringFs {
                     value,
                     FsWaiter::Channel(reply),
                 ),
+                FsInject::FRemoveXattr { file, name, reply } => {
+                    self.fs.remove_priv_xattr(file, name, reply)
+                }
                 FsInject::PathOp {
                     tag,
                     pers,
@@ -438,6 +350,20 @@ impl UringFs {
                     n2,
                     flags,
                     len_arg,
+                    FsWaiter::Channel(reply),
+                ),
+                FsInject::LinkatFile {
+                    pers,
+                    file,
+                    a2,
+                    n2,
+                    reply,
+                } => self.fs.submit_linkat_file(
+                    &mut self.eng,
+                    pers,
+                    file,
+                    a2,
+                    n2,
                     FsWaiter::Channel(reply),
                 ),
             }
@@ -482,7 +408,11 @@ impl UringFs {
                 FsInject::FdMetaAsRoot { reply, value, .. } => {
                     (Some(reply), vec![value])
                 }
+                FsInject::FRemoveXattr { reply, .. } => {
+                    (Some(reply), Vec::new())
+                }
                 FsInject::PathOp { reply, .. } => (Some(reply), Vec::new()),
+                FsInject::LinkatFile { reply, .. } => (Some(reply), Vec::new()),
             };
             if let Some(reply) = reply {
                 let _ = reply.send(FsOutcome::new(
@@ -511,7 +441,7 @@ mod tests {
     use crate::uring::ring::Ring;
     use crate::uring::sys::{
         io_uring_setup, unregister_personality, IoUringParams,
-        IORING_OP_FSETXATTR, IORING_SETUP_SINGLE_ISSUER,
+        IORING_OP_FGETXATTR, IORING_OP_FSETXATTR, IORING_SETUP_SINGLE_ISSUER,
     };
     use crate::uring_fs::{Anchor, FsConfig, Personality};
     use std::ffi::CString;
@@ -622,7 +552,8 @@ mod tests {
 
     /// Pin the xattr SQE field packing — `addr` = name, `addr2` = value,
     /// `len` = size, `xattr_flags` = flags — independently of the
-    /// fixed-file gate that [`probe_fixed_file_xattr`] handles.
+    /// fd-based xattr ops, which need no capability gate at this crate’s 6.18
+    /// kernel floor.
     ///
     /// Deliberately submitted against a **real** fd: the encoding is what
     /// this test is for, and a real fd works on every kernel since 5.19, so

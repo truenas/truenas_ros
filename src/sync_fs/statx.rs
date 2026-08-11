@@ -255,9 +255,49 @@ impl Statx {
         self.0.stx_mnt_id
     }
 
-    /// Subvolume identifier (e.g. ZFS dataset id).
+    /// Subvolume identifier — **btrfs only**.
+    ///
+    /// A btrfs inode number is unique only within its subvolume, so two files
+    /// in different subvolumes of one filesystem can share an `st_ino`. btrfs
+    /// works around that by giving each subvolume its own *anonymous* device
+    /// number, which restores a unique `(dev, ino)` but costs `st_dev` its
+    /// usual meaning: one mount then reports many devices, and a caller using
+    /// `st_dev` to detect mount boundaries is misled.
+    /// [`StatxMask::SUBVOL`] exposes the subvolume id directly so `(subvol,
+    /// ino)` can be formed without inferring it from a synthetic device.
+    ///
+    /// **btrfs is the only filesystem in the kernel that fills this**
+    /// (`fs/btrfs/inode.c`, `btrfs_getattr`). ZFS in particular does not, so
+    /// this is *not* a way to identify a dataset — use the device number, or
+    /// [`StatxAttr::MOUNT_ROOT`] in [`attributes`](Self::attributes) to
+    /// recognise a mount root.
+    ///
+    /// Returns the raw field, so an unreported value reads as `0` rather than
+    /// as absent. Check [`mask`](Self::mask) for [`StatxMask::SUBVOL`] to
+    /// tell the two apart.
     pub fn subvol(&self) -> u64 {
         self.0.stx_subvol
+    }
+
+    /// The inode's change cookie — the NFSv4 change attribute, a per-inode
+    /// counter the kernel bumps on every content or metadata modification.
+    ///
+    /// `None` unless [`StatxMask::CHANGE_COOKIE`] was requested *and* the
+    /// filesystem supplied it (the kernel reports what it actually filled in
+    /// [`mask`](Self::mask), so an unsupported filesystem is distinguishable
+    /// from an unmodified file rather than silently reading as `0`).
+    ///
+    /// This is the exact validator for anything derived from a file and
+    /// cached elsewhere — a checksum, a parsed ACL, a directory's sorted
+    /// entry list. Comparing it beats comparing `(size, mtime)`, which is a
+    /// timestamp-granularity heuristic. Note the value is only meaningful
+    /// within one filesystem instance: it is not preserved across a
+    /// `send`/`recv` to another pool, so a *persisted* cookie is worth
+    /// corroborating with size and mtime.
+    pub fn change_cookie(&self) -> Option<u64> {
+        self.mask()
+            .contains(StatxMask::CHANGE_COOKIE)
+            .then_some(self.0.stx_change_cookie)
     }
 
     /// Last access time.

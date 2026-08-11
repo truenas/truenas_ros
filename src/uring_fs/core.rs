@@ -20,7 +20,8 @@
 
 use super::query_dir::SharedPool;
 use super::{
-    statx_at_flags, Anchor, File, FsOutcome, Leaf, Personality, ReplyTo,
+    statx_at_flags, Anchor, File, FsOutcome, Leaf, Personality,
+    PrivilegedXattrs, ReplyTo, RwFlags,
 };
 use crate::errno::{retry_on_eintr, Errno};
 use crate::sync_fs::openat2::RawOpenHow;
@@ -32,10 +33,11 @@ use crate::uring::engine::Engine;
 use crate::uring::slots::SlotEntry;
 use crate::uring::sys::{
     IoUringCqe, IORING_FSYNC_DATASYNC, IORING_OP_ASYNC_CANCEL,
-    IORING_OP_FALLOCATE, IORING_OP_FGETXATTR, IORING_OP_FSETXATTR,
-    IORING_OP_FSYNC, IORING_OP_FTRUNCATE, IORING_OP_LINKAT, IORING_OP_MKDIRAT,
-    IORING_OP_OPENAT2, IORING_OP_READV, IORING_OP_RENAMEAT, IORING_OP_STATX,
-    IORING_OP_SYMLINKAT, IORING_OP_UNLINKAT, IORING_OP_WRITEV,
+    IORING_OP_FADVISE, IORING_OP_FALLOCATE, IORING_OP_FGETXATTR,
+    IORING_OP_FSETXATTR, IORING_OP_FSYNC, IORING_OP_FTRUNCATE,
+    IORING_OP_LINKAT, IORING_OP_MKDIRAT, IORING_OP_OPENAT2, IORING_OP_READV,
+    IORING_OP_RENAMEAT, IORING_OP_STATX, IORING_OP_SYMLINKAT,
+    IORING_OP_UNLINKAT, IORING_OP_WRITEV,
 };
 use crate::uring::user_data::{pack_raw, unpack_raw};
 use std::any::Any;
@@ -73,6 +75,7 @@ pub(crate) const TAG_SYMLINKAT: u8 = 0x8C;
 pub(crate) const TAG_LINKAT: u8 = 0x8D;
 pub(crate) const TAG_FGETXATTR: u8 = 0x8E;
 pub(crate) const TAG_FSETXATTR: u8 = 0x8F;
+pub(crate) const TAG_FADVISE: u8 = 0x90;
 /// The standalone host's wake tag (an embedded host reuses its own).
 pub(crate) const TAG_WAKE: u8 = 0x9D;
 /// Tags `ASYNC_CANCEL` ops (and the teardown drain); completions ignored.
@@ -120,6 +123,21 @@ where
 /// completion would (see [`deliver`]).
 fn fail(waiter: FsWaiter, err: Errno, bufs: Vec<Vec<u8>>) {
     deliver(Some(waiter), Err(err), bufs, None, None);
+}
+
+/// `fremovexattr(2)` on `f`. Blocking, because io_uring has no opcode for it:
+/// the kernel's xattr ops are get/set only, and an `IORING_OP_FSETXATTR` with
+/// a zero-length value does **not** remove — `__vfs_setxattr` substitutes an
+/// empty value for `size == 0` (`fs/xattr.c`, commented "empty EA, do not
+/// remove"), leaving an attribute that still lists. Removal reaches a
+/// filesystem as `handler->set(…, NULL, 0, XATTR_REPLACE)` only from the
+/// `removexattr` syscalls, which io_uring cannot reach.
+fn remove_xattr_blocking(f: &File, name: &CStr) -> crate::Result<()> {
+    let raw = f.as_raw_fd();
+    // SAFETY: `f` is borrowed for the call, so `raw` is live; `name` is a
+    // NUL-terminated C string.
+    retry_on_eintr(|| unsafe { libc::fremovexattr(raw, name.as_ptr()) })?;
+    Ok(())
 }
 
 /// One in-flight (or free) fs operation. Owns everything the kernel can see.
@@ -228,6 +246,9 @@ pub(crate) struct FsCore {
     /// Reactor-side continuations for in-flight offloads, keyed by token.
     offload_reg: HashMap<u64, OffloadEntry>,
     next_offload: u64,
+    /// Attribute names whose `FSETXATTR` runs under ambient credentials rather
+    /// than the request identity. Empty by default — see [`PrivilegedXattrs`].
+    priv_xattrs: PrivilegedXattrs,
 }
 
 impl FsCore {
@@ -244,7 +265,15 @@ impl FsCore {
             completions: Arc::new(Mutex::new(VecDeque::new())),
             offload_reg: HashMap::new(),
             next_offload: 0,
+            priv_xattrs: PrivilegedXattrs::default(),
         }
+    }
+
+    /// Install the ambient-credential xattr policy. Setup-time only: the hosts
+    /// expose it through a `&mut self` setter, and their run loops also take
+    /// `&mut self`, so it cannot change while operations are in flight.
+    pub(crate) fn set_privileged_xattrs(&mut self, policy: PrivilegedXattrs) {
+        self.priv_xattrs = policy;
     }
 
     /// Set the offload pool's warm floor and growth ceiling. Replaces the
@@ -288,6 +317,48 @@ impl FsCore {
     /// than take the reactor down; see [`SharedPool::submit`].
     fn submit_offload(&mut self, job: Box<dyn FnOnce() + Send>) {
         self.pool.submit(job);
+    }
+
+    /// Remove a **server-owned** extended attribute on the blocking pool,
+    /// gated on the [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs)
+    /// allowlist. Refuses anything unlisted with `EPERM`.
+    ///
+    /// This is the one fs mutation in the module that carries no
+    /// [`Personality`], and the allowlist is what makes that defensible
+    /// rather than a hole. There is no `IORING_OP_*REMOVEXATTR`, and a
+    /// zero-length `FSETXATTR` sets an empty attribute instead of removing
+    /// one (see [`remove_xattr_blocking`]) — so the call can only run on a
+    /// pool thread, under the reactor's own credentials, with no way for the
+    /// kernel to check it against a request identity. Restricting it to
+    /// attributes the *server* owns keeps the promotion keyed on the name
+    /// alone, exactly as the `FSETXATTR` promotion in
+    /// [`FsCore::submit_fd_meta`] is: a caller can clear the metadata this
+    /// reactor wrote, and nothing else.
+    pub(crate) fn remove_priv_xattr(
+        &mut self,
+        file: Arc<OwnedFd>,
+        name: CString,
+        reply: ReplyTo,
+    ) {
+        if !self.priv_xattrs.permits(&name) {
+            let _ = reply.send(FsOutcome::new(
+                Err(Errno::EPERM),
+                Vec::new(),
+                None,
+                None,
+            ));
+            return;
+        }
+        self.submit_offload(Box::new(move || {
+            let raw = file.as_raw_fd();
+            // SAFETY: the closure owns `file` for the syscall's duration, so
+            // `raw` is live; `name` is NUL-terminated.
+            let res = retry_on_eintr(|| unsafe {
+                libc::fremovexattr(raw, name.as_ptr())
+            })
+            .map(|_| 0i32);
+            let _ = reply.send(FsOutcome::new(res, Vec::new(), None, None));
+        }));
     }
 
     /// Take every finished offload paired with its owner + continuation. The
@@ -367,6 +438,13 @@ impl FsCore {
     }
 
     /// Stage a `READV`/`WRITEV` (per `tag`) against an open file.
+    ///
+    /// `rw_flags` is the `RWF_*` set — the same field `preadv2`/`pwritev2`
+    /// take, which these opcodes read directly, so the flagged form is not a
+    /// separate op. `0` is the plain `preadv`/`pwritev` behaviour. The kernel
+    /// validates the set at prep and fails the whole operation with
+    /// `EOPNOTSUPP` for anything this file's filesystem does not implement, so
+    /// an unsupported flag is never silently dropped.
     #[allow(clippy::too_many_arguments)] // an inject unpacked, not an API
     pub(crate) fn submit_rw(
         &mut self,
@@ -376,6 +454,7 @@ impl FsCore {
         file: Arc<OwnedFd>,
         mut bufs: Vec<Vec<u8>>,
         off: u64,
+        rw_flags: u32,
         waiter: FsWaiter,
     ) {
         let Some(op_slot) = self.op_free.pop() else {
@@ -417,6 +496,8 @@ impl FsCore {
             sqe.addr = iov_ptr;
             sqe.len = iov_len;
             sqe.off_addr2 = off;
+            // The `preadv2`/`pwritev2` flag word. Zero for the plain forms.
+            sqe.op_flags = rw_flags;
             sqe.personality = pers;
         });
         if let Err(err) = staged {
@@ -481,8 +562,16 @@ impl FsCore {
     ///
     /// Fail-closed on `pers == 0`: an fd-op under the ring owner's ambient
     /// (root) credentials is a privilege this surface must never grant
-    /// implicitly. The one sanctioned ambient-root path is
-    /// [`FsCore::submit_fgetxattr_as_root`].
+    /// implicitly. The sanctioned ambient-root paths are
+    /// [`FsCore::submit_fgetxattr_as_root`] and, for writes, the
+    /// [`PrivilegedXattrs`] allowlist consulted below.
+    ///
+    /// **The allowlist is the only place a write is promoted to ambient
+    /// credentials, and the promotion is keyed on the attribute name alone.**
+    /// It lives here rather than at the call sites so no public entry point
+    /// can name a personality of 0 or pick its own privilege: callers pass the
+    /// request identity, and an `FSETXATTR` of an allowlisted name — and
+    /// nothing else — is rewritten to `0`.
     #[allow(clippy::too_many_arguments)] // an inject unpacked, not an API
     pub(crate) fn submit_fd_meta(
         &mut self,
@@ -501,6 +590,14 @@ impl FsCore {
             fail(waiter, Errno::EINVAL, vec![value]);
             return;
         }
+        // An allowlisted attribute is metadata the *server* owns, which the
+        // request identity has no privilege to write (the `trusted.` namespace
+        // is CAP_SYS_ADMIN-gated). Everything else keeps `pers`, including
+        // every non-xattr fd-op and every unlisted name.
+        let pers = match (tag, name.as_deref()) {
+            (TAG_FSETXATTR, Some(n)) if self.priv_xattrs.permits(n) => 0,
+            _ => pers,
+        };
         self.stage_fd_meta(
             eng, tag, pers, file, name, value, off, len64, aux32, waiter,
         );
@@ -587,6 +684,14 @@ impl FsCore {
                     sqe.off_addr2 = off; // offset
                     sqe.addr = len64; // length (kernel packing)
                     sqe.len = aux32; // mode
+                }
+                TAG_FADVISE => {
+                    sqe.opcode = IORING_OP_FADVISE;
+                    sqe.off_addr2 = off; // offset
+                                         // Length rides in `addr`; the kernel consults `len` only
+                                         // when `addr` is 0, and 0 already means "to end of file".
+                    sqe.addr = len64;
+                    sqe.op_flags = aux32; // POSIX_FADV_* advice
                 }
                 TAG_FGETXATTR | TAG_FSETXATTR => {
                     sqe.opcode = if tag == TAG_FGETXATTR {
@@ -702,6 +807,84 @@ impl FsCore {
                 }
                 _ => debug_assert!(false, "not a path-op tag {tag:#x}"),
             }
+        });
+        if let Err(err) = staged {
+            self.fail_op(op_slot, err);
+        }
+    }
+
+    /// `LINKAT` with `AT_EMPTY_PATH`: give the already-open `file` a name at
+    /// `a2 / n2`. This is the only linkat form that can name an **unnamed**
+    /// inode, so it is how an `O_TMPFILE` is materialized — the publish step of
+    /// a durable create.
+    ///
+    /// Two kernel rules govern whether it succeeds, and neither is discoverable
+    /// from the error alone:
+    ///
+    /// - The file must have been opened `O_TMPFILE` **without `O_EXCL`**.
+    ///   `O_EXCL` is precisely the "never link this" opt-out: only the
+    ///   non-`O_EXCL` path sets `I_LINKABLE` (`fs/namei.c:4084`), and
+    ///   `vfs_link` rejects a zero-`i_nlink` inode without it (`:4979`) —
+    ///   surfacing as `ENOENT`.
+    /// - `AT_EMPTY_PATH` requires `fd_file(f)->f_cred == current_cred()` or
+    ///   `CAP_DAC_READ_SEARCH` (`fs/namei.c:2631`). io_uring captures the
+    ///   personality's `struct cred *` as the file's `f_cred` at open time, so
+    ///   **`pers` must carry the credentials that opened `file`**. The check is
+    ///   a pointer comparison and `register_personality` stores
+    ///   `get_current_cred()`, so ids registered from unchanged process
+    ///   credentials alias and are interchangeable; brokered ids, each minted
+    ///   after a `setresuid`, are distinct objects even for one uid. Mismatch
+    ///   is `ENOENT`, not `EPERM`.
+    ///
+    /// `IOSQE_FIXED_FILE` is deliberately never set: `io_linkat_prep` rejects a
+    /// fixed file outright with `-EBADF`. Plain-fd `File` satisfies that by
+    /// construction.
+    pub(crate) fn submit_linkat_file(
+        &mut self,
+        eng: &mut Engine,
+        pers: u16,
+        file: Arc<OwnedFd>,
+        a2: Anchor,
+        n2: CString,
+        waiter: FsWaiter,
+    ) {
+        // Like every name-resolving op: personality 0 would resolve `n2` and
+        // create the link as ambient root. Fail closed.
+        if pers == 0 {
+            fail(waiter, Errno::EINVAL, Vec::new());
+            return;
+        }
+        let Some(op_slot) = self.op_free.pop() else {
+            fail(waiter, Errno::EBUSY, Vec::new());
+            return;
+        };
+
+        let entry = &mut self.ops[op_slot as usize];
+        let gen32 = entry.generation as u32;
+        let e = &mut entry.state;
+        e.state = FsOpState::InFlight { tag: TAG_LINKAT };
+        e.waiter = Some(waiter);
+        // The empty source path AT_EMPTY_PATH resolves against `sqe.fd`. Owned
+        // by the entry like any other path payload: the kernel reads it at
+        // execution, which is after this call returns.
+        e.path = Some(CString::default());
+        e.path2 = Some(n2);
+        let old_fd = file.as_raw_fd();
+        let new_dfd = a2.raw_fd();
+        e.file = Some(file);
+        e.anchor2 = Some(a2);
+        let p1 = e.path.as_ref().expect("just set").as_ptr() as u64;
+        let p2 = e.path2.as_ref().expect("just set").as_ptr() as u64;
+
+        let ud = pack_raw(TAG_LINKAT, op_slot, gen32);
+        let staged = eng.stage(ud, |sqe| {
+            sqe.opcode = IORING_OP_LINKAT;
+            sqe.fd = old_fd; // the open file itself, not a dirfd
+            sqe.addr = p1; // ""
+            sqe.off_addr2 = p2; // destination leaf
+            sqe.len = new_dfd as u32; // destination dirfd (kernel packing)
+            sqe.op_flags = AtFlags::AT_EMPTY_PATH.bits() as u32;
+            sqe.personality = pers;
         });
         if let Err(err) = staged {
             self.fail_op(op_slot, err);
@@ -950,8 +1133,6 @@ pub struct FsConn<'a> {
     fs: &'a mut FsCore,
     eng: &'a mut Engine,
     owner: Owner,
-    fd_xattr_ok: bool,
-    ftruncate_ok: bool,
     root: bool,
 }
 
@@ -967,33 +1148,14 @@ impl<'a> FsConn<'a> {
         fs: &'a mut FsCore,
         eng: &'a mut Engine,
         owner: Owner,
-        fd_xattr_ok: bool,
-        ftruncate_ok: bool,
         root: bool,
     ) -> FsConn<'a> {
         FsConn {
             fs,
             eng,
             owner,
-            fd_xattr_ok,
-            ftruncate_ok,
             root,
         }
-    }
-
-    /// Fire `on_done` now with a synthesized error and no ring op — used when a
-    /// fd op is unsupported on this kernel.
-    fn fail_now<F>(&mut self, err: Errno, bufs: Vec<Vec<u8>>, on_done: F)
-    where
-        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
-    {
-        let done = FsDone {
-            result: Err(err),
-            bufs,
-            file: None,
-            stat: None,
-        };
-        on_done(done, self);
     }
 
     /// Open `path` relative to `anchor` as `who`; fire `on_done` with the new
@@ -1051,7 +1213,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        self.rw(TAG_READV, who, f, bufs, off, on_done);
+        self.rw(TAG_READV, who, f, bufs, off, RwFlags::empty(), on_done);
     }
 
     /// Single-buffer positional read (`pread(2)`).
@@ -1065,7 +1227,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        self.rw(TAG_READV, who, f, vec![buf], off, on_done);
+        self.rw(TAG_READV, who, f, vec![buf], off, RwFlags::empty(), on_done);
     }
 
     /// Vectored positional write (`pwritev(2)`) as `who`.
@@ -1079,7 +1241,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        self.rw(TAG_WRITEV, who, f, bufs, off, on_done);
+        self.rw(TAG_WRITEV, who, f, bufs, off, RwFlags::empty(), on_done);
     }
 
     /// Single-buffer positional write (`pwrite(2)`).
@@ -1093,7 +1255,52 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        self.rw(TAG_WRITEV, who, f, vec![buf], off, on_done);
+        self.rw(
+            TAG_WRITEV,
+            who,
+            f,
+            vec![buf],
+            off,
+            RwFlags::empty(),
+            on_done,
+        );
+    }
+
+    /// Scattered positional read with per-operation flags (`preadv2(2)`).
+    /// See [`RwFlags`] — an unsupported flag fails the read with
+    /// `EOPNOTSUPP` rather than being ignored.
+    #[allow(clippy::too_many_arguments)]
+    pub fn preadv2<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        bufs: Vec<Vec<u8>>,
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.rw(TAG_READV, who, f, bufs, off, flags, on_done);
+    }
+
+    /// Gathered positional write with per-operation flags (`pwritev2(2)`).
+    /// [`RwFlags::RWF_DSYNC`] makes the write itself durable, which can stand
+    /// in for a following `fdatasync` — worth measuring on ZFS, where a
+    /// synchronous write goes through the ZIL.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pwritev2<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        bufs: Vec<Vec<u8>>,
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.rw(TAG_WRITEV, who, f, bufs, off, flags, on_done);
     }
 
     /// Flush `f`'s data and metadata (`fsync`) as `who`.
@@ -1233,9 +1440,6 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        if !self.fd_xattr_ok {
-            return self.fail_now(Errno::EOPNOTSUPP, vec![buf], on_done);
-        }
         self.fd_meta(
             TAG_FGETXATTR,
             who,
@@ -1264,9 +1468,6 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        if !self.fd_xattr_ok {
-            return self.fail_now(Errno::EOPNOTSUPP, vec![buf], on_done);
-        }
         self.fs.submit_fgetxattr_as_root(
             self.eng,
             f.fd,
@@ -1288,9 +1489,6 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        if !self.fd_xattr_ok {
-            return self.fail_now(Errno::EOPNOTSUPP, vec![value], on_done);
-        }
         self.fd_meta(
             TAG_FSETXATTR,
             who,
@@ -1314,9 +1512,6 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        if !self.ftruncate_ok {
-            return self.fail_now(Errno::EOPNOTSUPP, Vec::new(), on_done);
-        }
         self.fd_meta(
             TAG_FTRUNCATE,
             who,
@@ -1352,6 +1547,34 @@ impl<'a> FsConn<'a> {
             off,
             len,
             mode as u32,
+            on_done,
+        );
+    }
+
+    /// Advise the kernel how a range of `f` will be used (`posix_fadvise`);
+    /// `len` of 0 means to the end of the file. See
+    /// [`Advice`](crate::uring_fs::Advice) — on ZFS these reach the ARC, not
+    /// just the page cache.
+    pub fn fadvise<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        off: u64,
+        len: u64,
+        advice: crate::uring_fs::Advice,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.fd_meta(
+            TAG_FADVISE,
+            who,
+            f,
+            None,
+            Vec::new(),
+            off,
+            len,
+            advice as u32,
             on_done,
         );
     }
@@ -1509,6 +1732,31 @@ impl<'a> FsConn<'a> {
         );
     }
 
+    /// Give the already-open `f` a name at `new_leaf` in `new`
+    /// (`linkat` with `AT_EMPTY_PATH`) — the publish step for an `O_TMPFILE`
+    /// create. See [`FsHandle::linkat_file`](crate::uring_fs::FsHandle::linkat_file)
+    /// for the two kernel requirements (`O_TMPFILE` without `O_EXCL`, and the
+    /// *same* personality that opened `f`), both of which fail as `ENOENT`.
+    pub fn linkat_file<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        new: &Anchor,
+        new_leaf: Leaf<'_>,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.fs.submit_linkat_file(
+            self.eng,
+            who.0,
+            f.fd,
+            new.clone(),
+            new_leaf.to_cstring(),
+            embed(self.owner, on_done),
+        );
+    }
+
     /// Close `f`: drop the handle. Its fd closes once the last reference (this
     /// handle plus any op still parking a clone) drops — close-last by
     /// ownership. Fire-and-forget; there is no completion callback.
@@ -1518,6 +1766,7 @@ impl<'a> FsConn<'a> {
 
     // ---- private submit helpers ----------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn rw<F>(
         &mut self,
         tag: u8,
@@ -1525,6 +1774,7 @@ impl<'a> FsConn<'a> {
         f: File,
         bufs: Vec<Vec<u8>>,
         off: u64,
+        rw_flags: RwFlags,
         on_done: F,
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
@@ -1536,6 +1786,7 @@ impl<'a> FsConn<'a> {
             f.fd,
             bufs,
             off,
+            rw_flags.bits(),
             embed(self.owner, on_done),
         );
     }
@@ -1726,6 +1977,61 @@ impl FsConn<'_> {
         F: FnOnce(crate::Result<Vec<CString>>, &mut FsConn<'_>) + 'static,
     {
         self.offload(move || super::query_dir::list_xattr_names(&f), on_done);
+    }
+
+    /// Copy `len` bytes from `src[off_src..]` to `dst[off_dst..]`, trying a
+    /// metadata-only block clone first (`FICLONERANGE` — on a pool with ZFS
+    /// block cloning this moves no data) and falling back to a real copy when
+    /// the clone is refused. Delivers the bytes copied.
+    ///
+    /// This is how an embedded handler assembles a large object from parts
+    /// without leaving the loop;
+    /// [`QueryPool::copy_file_range`](super::query_dir::QueryPool::copy_file_range)
+    /// is the off-loop twin.
+    ///
+    /// Takes no [`Personality`] because both endpoints are already-open
+    /// [`File`]s and the kernel authorizes the copy from their open modes,
+    /// which were established under the identity that opened them.
+    pub fn copy_file_range<F>(
+        &mut self,
+        src: File,
+        dst: File,
+        off_src: u64,
+        off_dst: u64,
+        len: u64,
+        on_done: F,
+    ) where
+        F: FnOnce(crate::Result<u64>, &mut FsConn<'_>) + 'static,
+    {
+        self.offload(
+            move || {
+                super::query_dir::clone_or_copy_range(
+                    &src, &dst, off_src, off_dst, len,
+                )
+            },
+            on_done,
+        );
+    }
+
+    /// Remove a **server-owned** extended attribute from `f`
+    /// (`fremovexattr`), or `EPERM` if `name` is not one the reactor's
+    /// [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs) policy claims.
+    ///
+    /// Takes no [`Personality`] — see `FsCore::remove_priv_xattr` for why
+    /// the allowlist has to stand in for one here.
+    pub fn fremovexattr<F>(&mut self, f: File, name: CString, on_done: F)
+    where
+        F: FnOnce(crate::Result<()>, &mut FsConn<'_>) + 'static,
+    {
+        if !self.fs.priv_xattrs.permits(&name) {
+            let job = move || {
+                drop(f);
+                Err(Errno::EPERM.into())
+            };
+            self.offload(job, on_done);
+            return;
+        }
+        self.offload(move || remove_xattr_blocking(&f, &name), on_done);
     }
 
     /// Open `anchor` itself readable **under `who`** on the ring (the DAC /
@@ -1919,7 +2225,7 @@ mod hybrid_tests {
     ) {
         eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm_wake");
         {
-            let mut c = FsConn::new(fs, eng, OWNER0, true, false, true);
+            let mut c = FsConn::new(fs, eng, OWNER0, true);
             kickoff(&mut c);
         }
         let mut guard = 0u32;
@@ -1936,7 +2242,7 @@ mod hybrid_tests {
                 if tag == TAG_WAKE {
                     eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm");
                     for (o, deliver, any) in fs.take_pool_completions() {
-                        let mut c = FsConn::new(fs, eng, o, true, false, true);
+                        let mut c = FsConn::new(fs, eng, o, true);
                         deliver(any, &mut c);
                     }
                     continue;
@@ -1946,7 +2252,7 @@ mod hybrid_tests {
                 }
                 if let Some((cb, d, o)) = fs.on_cqe(eng, tag, slot, g, cqe.res)
                 {
-                    let mut c = FsConn::new(fs, eng, o, true, false, true);
+                    let mut c = FsConn::new(fs, eng, o, true);
                     cb(d, &mut c);
                 }
             }
@@ -2268,13 +2574,10 @@ fn deliver(
 pub(crate) fn deliver_pool_completions(
     fs: &mut FsCore,
     eng: &mut Engine,
-    fd_xattr_ok: bool,
-    ftruncate_ok: bool,
     root: bool,
 ) {
     for (owner, deliver, any) in fs.take_pool_completions() {
-        let mut conn =
-            FsConn::new(fs, eng, owner, fd_xattr_ok, ftruncate_ok, root);
+        let mut conn = FsConn::new(fs, eng, owner, root);
         deliver(any, &mut conn);
     }
 }
@@ -2287,13 +2590,10 @@ pub(crate) fn deliver_embedded(
     fs: &mut FsCore,
     eng: &mut Engine,
     reaped: Option<(EmbeddedCb, FsDone, Owner)>,
-    fd_xattr_ok: bool,
-    ftruncate_ok: bool,
     root: bool,
 ) {
     if let Some((cb, done, owner)) = reaped {
-        let mut conn =
-            FsConn::new(fs, eng, owner, fd_xattr_ok, ftruncate_ok, root);
+        let mut conn = FsConn::new(fs, eng, owner, root);
         cb(done, &mut conn);
     }
 }
@@ -2421,6 +2721,7 @@ mod routing_fuzz {
             arc,
             vec![vec![0u8; 16]],
             0,
+            0,
             chan(&tx),
         );
         drop(caller);
@@ -2447,6 +2748,7 @@ mod routing_fuzz {
             1,
             arc,
             vec![vec![0u8; 16]],
+            0,
             0,
             chan(&tx),
         );
@@ -2483,6 +2785,7 @@ mod routing_fuzz {
                 1,
                 arc,
                 vec![vec![0u8; 16]],
+                0,
                 0,
                 chan(&tx),
             );
@@ -2574,6 +2877,7 @@ mod routing_fuzz {
                         1,
                         arc,
                         vec![vec![0u8; 16]],
+                        0,
                         0,
                         chan(&tx),
                     );

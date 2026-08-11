@@ -6076,8 +6076,8 @@ fn fs_metadata_ops_rename_truncate_xattr() {
     };
     pers.set(server.register_self().expect("register_self"))
         .unwrap();
-    let do_xattr = xattr_set && server.supports_fd_xattr();
-    let do_truncate = server.supports_ftruncate();
+    let do_xattr = xattr_set;
+    let do_truncate = true;
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };

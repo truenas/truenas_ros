@@ -14,8 +14,10 @@
 //! is the DAC/list-permission check (`EACCES` if `who` cannot list), so
 //! enumeration never runs under the reactor's ambient root.
 //!
-//! Entries come in raw `readdir` order (unsorted); a caller needing S3-style
-//! lexicographic order sorts each page itself.
+//! Entries come in raw `readdir` order unless [`QueryOptions::order`] asks
+//! for otherwise; see [`Order`] for what the ordered modes cost, and
+//! [`query_tree`](super::query_tree::query_tree) to walk a whole subtree in
+//! path order.
 
 use super::{Anchor, File, FsHandle, FsPending, Leaf, Personality};
 use crate::errno::{retry_on_eintr, Errno};
@@ -96,6 +98,47 @@ pub struct QueryOptions {
     pub acl_name: CString,
     /// Entries per yielded batch (clamped to at least 1).
     pub clump: usize,
+    /// Drop entries that live on a **different filesystem** from the directory
+    /// being listed — a mount point, which on ZFS means a child dataset or a
+    /// `.zfs/snapshot` automount.
+    ///
+    /// `readdir` honours no `RESOLVE_*` flags, so a walk has no equivalent of
+    /// [`CONFINED_RESOLVE`](crate::uring_fs::CONFINED_RESOLVE)'s
+    /// `RESOLVE_NO_XDEV`: a nested mount simply appears as an ordinary entry.
+    /// Setting this restores the same rule on the listing side, so a tree that
+    /// is meant to be one filesystem lists as one filesystem.
+    ///
+    /// Requires [`EnrichSpec::STATX`] (the device number comes from `statx`);
+    /// without it the option cannot be honoured and is ignored.
+    pub same_device_only: bool,
+    /// The `statx` mask requested for each entry when [`EnrichSpec::STATX`] is
+    /// set. Defaults to [`StatxMask::BASIC_STATS`]; widen it to ask for fields
+    /// the basic set omits — notably [`StatxMask::CHANGE_COOKIE`], which costs
+    /// nothing extra here because the `statx` runs either way and gives a
+    /// caller an exact validator for anything it caches per entry (see
+    /// [`Statx::change_cookie`]).
+    pub statx_mask: StatxMask,
+    /// The order entries are yielded in. Defaults to [`Order::Readdir`] — see
+    /// [`Order`] for what the ordered modes cost.
+    pub order: Order,
+    /// Yield only entries whose name starts with these bytes.
+    ///
+    /// Applied during the `readdir` pass, **before** any enrichment, so a
+    /// filtered-out entry costs neither a `statx` nor an open. A batch is
+    /// still filled to `clump` kept entries, so a short batch still means
+    /// end-of-directory.
+    pub name_prefix: Option<Vec<u8>>,
+    /// Skip entries up to and including this key, in the active [`Order`].
+    ///
+    /// These bytes are compared as a **literal key**, not as a bare name: to
+    /// resume past the directory `a` under [`Order::ByPathBytes`], pass `a/`
+    /// — exactly where `a/` sorts — rather than `a`, which is where a *file*
+    /// named `a` sorts.
+    ///
+    /// Ignored under [`Order::Readdir`], which has no order to be "after".
+    /// Note this prunes *after* the directory has been read and sorted — it
+    /// resumes a listing, it does not make resuming cheap.
+    pub start_after: Option<Vec<u8>>,
 }
 
 impl Default for QueryOptions {
@@ -106,8 +149,46 @@ impl Default for QueryOptions {
             xattr_ns: XattrNamespaces::USER,
             acl_name: c"".to_owned(),
             clump: 1,
+            same_device_only: false,
+            statx_mask: StatxMask::BASIC_STATS,
+            order: Order::Readdir,
+            name_prefix: None,
+            start_after: None,
         }
     }
+}
+
+/// The order [`QueryDir::next`] yields entries in.
+///
+/// [`Order::Readdir`] streams: a batch costs one `readdir` of `clump` names.
+/// **Both ordered modes read the whole directory before the first batch**, so
+/// they cost one full `getdents` sweep plus an O(n log n) sort up front, and
+/// hold every name in memory for the life of the [`QueryDir`]. That is
+/// inherent — the smallest name cannot be known without seeing them all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Order {
+    /// Whatever the filesystem returns. On ZFS that is hash order, not
+    /// alphabetical. Cheapest, and the only streaming mode.
+    #[default]
+    Readdir,
+    /// Byte order of the entry names.
+    ByName,
+    /// Byte order of the entry names **with a `/` appended to directories**,
+    /// which is the order the *full paths* beneath this directory compare in.
+    ///
+    /// This is the difference between sorting names and sorting keys, and it
+    /// is not cosmetic. `/` is `0x2F`, so a bare-name sort puts the directory
+    /// `a` before `a-1.txt` and `a.txt`, and a depth-first walk would then
+    /// emit `a/b.txt` before both — while their full paths order
+    /// `a-1.txt` < `a.txt` < `a/b.txt`. Appending the separator that will
+    /// actually follow the directory name restores agreement, so sorting each
+    /// directory this way and recursing in that order yields a subtree in
+    /// global path order with no global sort.
+    ///
+    /// Directory-ness comes from the `readdir` `d_type`; entries reported as
+    /// `DT_UNKNOWN` are resolved with a `statx` before sorting, since guessing
+    /// would silently reorder them.
+    ByPathBytes,
 }
 
 /// One enriched directory entry. Which fields are populated depends on the
@@ -141,7 +222,15 @@ pub struct QueryDir {
     h: FsHandle,
     who: Personality,
     dir: Anchor,
+    /// The listed directory's device, for
+    /// [`QueryOptions::same_device_only`]. `None` if it could not be
+    /// determined, in which case nothing is filtered.
+    dir_dev: Option<u64>,
     opts: QueryOptions,
+    /// Ordered modes only: every kept name in the directory, sorted, read on
+    /// the first [`QueryDir::next`] and drained a `clump` at a time after.
+    /// `None` until that first call; `Some(empty)` once exhausted.
+    sorted: Option<VecDeque<(OsString, u8)>>,
 }
 
 impl fmt::Debug for QueryDir {
@@ -167,19 +256,117 @@ impl QueryDir {
     // yields fallible batches the caller drives.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<crate::Result<Vec<DirEntry>>> {
-        match self.read_clump() {
+        match self.next_names() {
             Ok(names) if names.is_empty() => None,
             Ok(names) => Some(Ok(self.enrich(names))),
             Err(e) => Some(Err(e)),
         }
     }
 
-    /// Read up to `clump` entry names (with their `d_type`), skipping `.`/`..`.
-    /// Fewer than `clump` (or an empty `Vec`) marks end-of-directory.
-    fn read_clump(&mut self) -> crate::Result<Vec<(OsString, u8)>> {
-        let clump = self.opts.clump;
-        let mut out = Vec::with_capacity(clump);
-        while out.len() < clump {
+    /// The next `clump` names to enrich. Streams straight off `readdir` under
+    /// [`Order::Readdir`]; under an ordered mode the whole directory is read
+    /// and sorted on the first call and drained from there after.
+    fn next_names(&mut self) -> crate::Result<Vec<(OsString, u8)>> {
+        if self.opts.order == Order::Readdir {
+            return self.read_clump(self.opts.clump);
+        }
+        if self.sorted.is_none() {
+            self.sorted = Some(self.read_all_sorted()?);
+        }
+        // Filled directly above if it was empty, so the queue is present.
+        let q = self.sorted.as_mut().expect("sorted buffer filled");
+        let take = self.opts.clump.min(q.len());
+        Ok(q.drain(..take).collect())
+    }
+
+    /// Read the entire directory, resolve any `DT_UNKNOWN` needed for the
+    /// sort, sort, and drop everything up to `start_after`.
+    fn read_all_sorted(&mut self) -> crate::Result<VecDeque<(OsString, u8)>> {
+        let mut all = self.read_clump(usize::MAX)?;
+        match self.opts.order {
+            // `next_names` only reaches here for an ordered mode.
+            Order::Readdir => {}
+            Order::ByName => {
+                all.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()))
+            }
+            Order::ByPathBytes => {
+                self.resolve_unknown_dtypes(&mut all);
+                all.sort_by(|a, b| {
+                    cmp_path_bytes(
+                        a.0.as_bytes(),
+                        a.1 == libc::DT_DIR,
+                        b.0.as_bytes(),
+                        b.1 == libc::DT_DIR,
+                    )
+                });
+            }
+        }
+        if let Some(after) = &self.opts.start_after {
+            // `after` is a literal key, never a bare name needing a separator
+            // synthesized for it: a caller resuming past the directory `a`
+            // passes `a/`, which is exactly where `a/` sorts. Hence `false`.
+            let cut = match self.opts.order {
+                Order::ByPathBytes => all.partition_point(|(n, d)| {
+                    cmp_path_bytes(
+                        n.as_bytes(),
+                        *d == libc::DT_DIR,
+                        after,
+                        false,
+                    )
+                    .is_le()
+                }),
+                _ => all.partition_point(|(n, _)| n.as_bytes() <= &after[..]),
+            };
+            all.drain(..cut);
+        }
+        Ok(all.into())
+    }
+
+    /// Give every `DT_UNKNOWN` entry a real `d_type` with a scatter-gathered
+    /// `statx`, so [`Order::ByPathBytes`] never has to guess whether a name
+    /// carries a trailing separator. An entry whose `statx` fails keeps
+    /// `DT_UNKNOWN` and sorts as a non-directory — the same answer guessing
+    /// would have given, but only where the kernel could tell us nothing.
+    fn resolve_unknown_dtypes(&self, all: &mut [(OsString, u8)]) {
+        let pending: Vec<(usize, FsPending)> = all
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, d))| *d == libc::DT_UNKNOWN)
+            .filter_map(|(i, (name, _))| {
+                let leaf = Leaf::new(name.as_bytes()).ok()?;
+                let p = self
+                    .h
+                    .start_statx(
+                        self.who,
+                        &self.dir,
+                        leaf,
+                        AtFlags::AT_SYMLINK_NOFOLLOW,
+                        StatxMask::TYPE,
+                    )
+                    .ok()?;
+                Some((i, p))
+            })
+            .collect();
+        for (i, p) in pending {
+            if let Some(st) = pending_statx(p) {
+                all[i].1 = if st.is_dir() {
+                    libc::DT_DIR
+                } else {
+                    libc::DT_REG
+                };
+            }
+        }
+    }
+
+    /// Read up to `limit` kept entry names (with their `d_type`), skipping
+    /// `.`/`..` and anything [`QueryOptions::name_prefix`] excludes. Fewer
+    /// than `limit` (or an empty `Vec`) marks end-of-directory.
+    fn read_clump(
+        &mut self,
+        limit: usize,
+    ) -> crate::Result<Vec<(OsString, u8)>> {
+        let mut out = Vec::with_capacity(limit.min(self.opts.clump));
+        while out.len() < limit {
             Errno::clear();
             // SAFETY: `dp` is a live `DIR*`; the returned pointer is valid until
             // the next `readdir`/`closedir` — copied out immediately below.
@@ -200,6 +387,16 @@ impl QueryDir {
                 (name.to_bytes().to_vec(), (*ent).d_type)
             };
             if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            // Pushed down into the readdir pass: an unwanted name costs no
+            // statx, no open and no xattr read.
+            if self
+                .opts
+                .name_prefix
+                .as_ref()
+                .is_some_and(|p| !bytes.starts_with(p))
+            {
                 continue;
             }
             out.push((OsStr::from_bytes(&bytes).to_os_string(), dtype));
@@ -230,7 +427,7 @@ impl QueryDir {
                                 &self.dir,
                                 leaf,
                                 AtFlags::AT_SYMLINK_NOFOLLOW,
-                                StatxMask::BASIC_STATS,
+                                self.opts.statx_mask,
                             )
                             .ok()
                     })
@@ -258,22 +455,34 @@ impl QueryDir {
             })
             .collect();
 
-        // Collect each entry's statx and opened fd.
+        // Collect each entry's statx and opened fd, dropping anything that
+        // crossed a mount point when the caller asked for one filesystem.
+        // Filtering here — before the xattr reads below — also means a nested
+        // dataset costs no further work.
+        let cross_dev = |st: Option<&Statx>| match (self.dir_dev, st) {
+            (Some(dev), Some(st)) => st.dev() != dev,
+            // No device for the directory, or no statx for the entry: nothing
+            // to compare, so nothing is dropped.
+            _ => false,
+        };
         let opened: Vec<Opened> = requested
             .into_iter()
-            .map(|p| {
+            .filter_map(|p| {
                 let statx = p.statx.and_then(pending_statx);
+                if self.opts.same_device_only && cross_dev(statx.as_ref()) {
+                    return None;
+                }
                 let is_dir = statx
                     .as_ref()
                     .map(Statx::is_dir)
                     .unwrap_or(p.dtype == libc::DT_DIR);
                 let file = p.open.and_then(pending_file);
-                Opened {
+                Some(Opened {
                     name: p.name,
                     is_dir,
                     statx,
                     file,
-                }
+                })
             })
             .collect();
 
@@ -602,6 +811,33 @@ pub(crate) fn scan_xattrs(
     Ok(out)
 }
 
+/// Compare two entries the way their **full paths** compare: a directory is
+/// ordered as though its name already carried the `/` that will separate it
+/// from its children. See [`Order::ByPathBytes`] for why that is the only
+/// ordering under which per-directory sorting composes into a correctly
+/// ordered walk.
+///
+/// The trailing separator is synthesized during the comparison rather than by
+/// building a key, so sorting a directory allocates nothing per entry.
+fn cmp_path_bytes(
+    a: &[u8],
+    a_dir: bool,
+    b: &[u8],
+    b_dir: bool,
+) -> std::cmp::Ordering {
+    let (la, lb) = (a.len() + usize::from(a_dir), b.len() + usize::from(b_dir));
+    // Past its name, an entry's only remaining key byte is its trailing `/`,
+    // which is reachable only when the entry is a directory.
+    let byte = |s: &[u8], i: usize| if i < s.len() { s[i] } else { b'/' };
+    for i in 0..la.min(lb) {
+        match byte(a, i).cmp(&byte(b, i)) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    la.cmp(&lb)
+}
+
 /// Start listing `dir` as `who`, enriching each entry per `opts`. Opening the
 /// directory `O_RDONLY|O_DIRECTORY` under `who` **is** the list-permission
 /// check — returns `EACCES` when `who` cannot list `dir`. Pull enriched batches
@@ -631,15 +867,30 @@ pub fn query_directory(
         return Err(e.into());
     }
 
+    // The directory's own device, so an entry on a different one is
+    // recognisable as a mount point. Taken from the readable fd we just
+    // opened, before it drops.
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `dir_read` is live here; `st` is a valid out-pointer.
+    let dir_dev =
+        if unsafe { libc::fstat(dir_read.as_raw_fd(), st.as_mut_ptr()) } == 0 {
+            // SAFETY: fstat succeeded, so `st` is initialized.
+            Some(unsafe { st.assume_init() }.st_dev)
+        } else {
+            None
+        };
+
     Ok(QueryDir {
         dp,
         h: h.clone(),
         who,
         dir: dir.clone(),
+        dir_dev,
         opts: QueryOptions {
             clump: opts.clump.max(1),
             ..opts
         },
+        sorted: None,
     })
 }
 
@@ -1142,6 +1393,45 @@ const MAX_CHUNK: usize = 0x7FFF_FFFF & !0xFFF;
 /// (short only at source EOF). Standalone here because `sync_fs::shutil` is a
 /// separate feature (unreachable under `uring-fs`) and its `clonefile` is
 /// whole-file only.
+/// Clone `len` bytes from `src[off_src..]` to `dst[off_dst..]`, preferring a
+/// metadata-only block clone and falling back to a real copy.
+///
+/// **Blocking — for a pool thread, never the reactor.** `FICLONERANGE` is
+/// metadata-only on a reflink-capable filesystem, but it still takes
+/// filesystem locks and can wait on dirty data, so even the fast path must
+/// not run on the loop.
+///
+/// Needs no [`Personality`]: both endpoints are already-open [`File`]s, and
+/// the kernel authorizes the copy from *their* open modes — which were
+/// established under the identity that opened them — rather than from the
+/// calling thread's credentials.
+pub(crate) fn clone_or_copy_range(
+    src: &File,
+    dst: &File,
+    off_src: u64,
+    off_dst: u64,
+    len: u64,
+) -> crate::Result<u64> {
+    let fcr = FileCloneRange {
+        src_fd: src.as_raw_fd() as i64,
+        src_offset: off_src,
+        src_length: len,
+        dest_offset: off_dst,
+    };
+    // SAFETY: both fds are live for the call; `&fcr` is a valid
+    // `file_clone_range` for the ioctl's duration.
+    if unsafe { libc::ioctl(dst.as_raw_fd(), FICLONERANGE, &fcr) } == 0 {
+        return Ok(len);
+    }
+    copy_file_range_blocking(
+        src.as_raw_fd(),
+        dst.as_raw_fd(),
+        off_src,
+        off_dst,
+        len,
+    )
+}
+
 fn copy_file_range_blocking(
     src: RawFd,
     dst: RawFd,
@@ -1221,6 +1511,126 @@ fn copy_range_rw(
         remaining -= r as u64;
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    /// Sort `(name, is_dir)` pairs the way [`Order::ByPathBytes`] does and
+    /// return the resulting keys, so a case reads as the paths it stands for.
+    fn keys(entries: &[(&str, bool)]) -> Vec<String> {
+        let mut v = entries.to_vec();
+        v.sort_by(|a, b| {
+            cmp_path_bytes(a.0.as_bytes(), a.1, b.0.as_bytes(), b.1)
+        });
+        v.into_iter()
+            .map(|(n, d)| if d { format!("{n}/") } else { n.to_string() })
+            .collect()
+    }
+
+    /// The inversion the whole comparator exists for. `/` is `0x2F`, above
+    /// both `-` (`0x2D`) and `.` (`0x2E`), so the directory `a` belongs
+    /// *between* `a.txt` and `aa.txt` — not first, where its bare name sorts.
+    /// Getting this wrong reorders a walk against true path order, which is
+    /// how keys go missing at a page boundary.
+    #[test]
+    fn a_directory_sorts_where_its_trailing_separator_puts_it() {
+        assert_eq!(
+            keys(&[
+                ("a", true),
+                ("a-1.txt", false),
+                ("a.txt", false),
+                ("aa.txt", false)
+            ]),
+            ["a-1.txt", "a.txt", "a/", "aa.txt"],
+        );
+
+        // What a bare-name sort would have produced, for contrast: the
+        // directory leads, so a depth-first walk would emit everything under
+        // `a/` before `a-1.txt`.
+        let mut bare = ["a", "a-1.txt", "a.txt", "aa.txt"];
+        bare.sort_unstable();
+        assert_eq!(bare, ["a", "a-1.txt", "a.txt", "aa.txt"]);
+    }
+
+    /// Several entries sharing a prefix, each differing only in what follows
+    /// it — `.` vs `/` vs end-of-name — so every branch of the synthesized
+    /// trailing byte is exercised against a real neighbour.
+    #[test]
+    fn separator_ranks_against_dot_at_every_position() {
+        assert_eq!(
+            keys(&[("b", true), ("b..", false), ("b.", true)]),
+            ["b..", "b./", "b/"],
+        );
+    }
+
+    /// A file and a directory of the same name cannot coexist in one
+    /// directory, but the comparator is still asked to order them (a walk
+    /// merging sources, a caller sorting a synthetic list). The file sorts
+    /// first: its key is a strict prefix of the directory's.
+    #[test]
+    fn same_name_file_precedes_directory() {
+        assert_eq!(keys(&[("a", true), ("a", false)]), ["a", "a/"]);
+    }
+
+    /// A name that is a prefix of another orders by length once the shared
+    /// bytes run out, with the separator counted as part of the key.
+    #[test]
+    fn prefix_names_order_by_the_synthesized_key_length() {
+        assert_eq!(
+            keys(&[("ab", false), ("a", false), ("a", true)]),
+            ["a", "a/", "ab"],
+        );
+        // `a/` vs `ab`: `/` (0x2F) < `b` (0x62), so the directory leads.
+        assert_eq!(
+            cmp_path_bytes(b"a", true, b"ab", false),
+            std::cmp::Ordering::Less,
+        );
+    }
+
+    /// Identical inputs compare equal, so the sort is well-formed (a
+    /// comparator that never reports `Equal` can violate sort invariants).
+    #[test]
+    fn identical_entries_compare_equal() {
+        assert_eq!(
+            cmp_path_bytes(b"x", false, b"x", false),
+            std::cmp::Ordering::Equal,
+        );
+        assert_eq!(
+            cmp_path_bytes(b"x", true, b"x", true),
+            std::cmp::Ordering::Equal,
+        );
+    }
+
+    /// The ordering agrees with comparing fully-built keys, on a spread of
+    /// names chosen around the separator's neighbourhood in byte space.
+    #[test]
+    fn matches_comparing_materialized_keys() {
+        let names = [
+            "a", "a-", "a.", "a/", "a0", "aa", "", "-", ".", "z", "a.b", "a-b",
+        ];
+        let key = |n: &str, d: bool| {
+            let mut k = n.to_string();
+            if d {
+                k.push('/');
+            }
+            k
+        };
+        for a in names {
+            for b in names {
+                for ad in [false, true] {
+                    for bd in [false, true] {
+                        assert_eq!(
+                            cmp_path_bytes(a.as_bytes(), ad, b.as_bytes(), bd),
+                            key(a, ad).cmp(&key(b, bd)),
+                            "({a:?},{ad}) vs ({b:?},{bd})",
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -37,8 +37,69 @@ truenas_ros = { version = "0.1", default-features = false, features = ["sync-fs"
 An io_uring stack lives alongside the blocking bindings, off by default:
 `net-server` / `net-client` (stream roles over a shared reactor core, with
 kernel-TLS, splice, and peer-credential support) and `uring-fs` (a filesystem
-reactor with per-op credential impersonation — currently a design stub). Both
-sit on the internal `uring` engine feature; see the crate docs.
+reactor whose every operation runs under a kernel-enforced identity). Both sit
+on the internal `uring` engine feature; see the crate docs.
+
+`uring-fs` covers opens, vectored I/O (including the `preadv2`/`pwritev2` flag
+forms), sync, the metadata and extended-attribute ops, cache advice
+(`fadvise`), the directory-entry family, and directory listing and subtree
+walks — off-loop through a blocking handle, or on the reactor thread through
+completion callbacks. Beyond plain syscall wrappers it provides what a storage
+service needs and cannot easily build itself: path resolution the caller cannot
+weaken (`open_confined`), confined `mkdir -p` (`mkdir_path`), `O_TMPFILE`
+publication (`linkat_file`), and an allowlist that lets a server keep its own
+metadata in the `trusted.` namespace, where local users cannot read or alter
+it.
+
+### Identity
+
+Every `uring-fs` operation carries a `Personality` — a kernel-registered
+credential snapshot stamped into the SQE, under which the kernel itself
+performs the permission check. There is no ambient-identity variant: the
+daemon's own identity is minted explicitly with `UringFs::register_self`, and
+acting as an authenticated peer goes through `CredBroker`, a forked process
+that impersonates a user just long enough to snapshot their credentials, so
+the reactor process never changes identity itself. Wrap it in an
+`IdentityCache` to register once per identity rather than once per connection.
+
+```rust
+use truenas_ros::uring_fs::{AsUser, CredBroker, FsConfig, UringFs};
+
+// Every ring first, then the broker (it inherits the ring fds), then threads.
+let afs = UringFs::new(FsConfig::default())?;
+let broker = CredBroker::spawn(&[&afs])?;   // main loses CAP_SETUID here
+let creds = broker.handle(0)?;
+let who = creds.register(&AsUser::new(1000, 1000).groups(vec![4, 27]))?;
+```
+
+A brokered personality carries the user's authority and no elevated
+capability. Where a service must resolve a path on behalf of a user entitled
+to the object but not to traverse every directory above it, opt in with a
+capability mask — bounded by a ceiling fixed at spawn, before the privilege
+drop, so it cannot be widened later:
+
+```rust
+use truenas_ros::uring_fs::Caps;
+
+let broker = CredBroker::spawn_with_caps(&[&afs], Caps::DAC_READ_SEARCH)?;
+let who = creds.register(&AsUser::new(1000, 1000).caps(Caps::DAC_READ_SEARCH))?;
+```
+
+`Caps::DAC_READ_SEARCH` is the only capability the allowlist will mint, and it
+is broad: it grants traverse and read over the whole filesystem, and on ZFS it
+overrides an explicit NFSv4 ACL deny. It does not grant any write, execute, or
+delete. Read its docs before reaching for it.
+
+### Listing and walking
+
+`query_directory` lists one directory, optionally enriching each entry with
+`statx` and extended attributes scatter-gathered on the ring. `query_tree`
+walks a subtree depth-first, descending only through descriptors it already
+holds. Both can order entries by the bytes their *full paths* compare by
+(`Order::ByPathBytes`), which is the ordering under which per-directory
+sorting composes into a correctly ordered walk; a walk yields a `TreeCursor`
+that resumes a later walk exactly where this one stopped, with nothing
+repeated and nothing skipped.
 
 ## Examples
 
@@ -79,7 +140,10 @@ cfg.write_path("/etc/app.conf".as_ref(), opts)?;
 
 ## Requirements
 
-- A TrueNAS kernel version
+- A TrueNAS kernel, 6.18 or newer. That floor is assumed rather than probed:
+  every io_uring operation this crate issues predates it, so there are no
+  runtime capability checks and no calls that disable themselves on an older
+  kernel.
 - Rust 1.97 or newer
 
 ## Testing

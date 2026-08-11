@@ -77,11 +77,21 @@
 //!   is acceptable under the stated model — main runs as root, so a
 //!   compromised main is already root-equivalent — but the guarantee is "no
 //!   forged *root* identity," not "no forging."
-//! - **A minted personality carries no elevated capability.** Dropping to
-//!   the user's uid clears the effective capability set (the kernel's
-//!   setuid fixup), so the snapshot has the user's authority and no
+//! - **A minted personality carries no elevated capability unless the
+//!   broker was spawned to allow one.** Dropping to the user's uid clears
+//!   the *effective* capability set (the kernel's setuid fixup), so by
+//!   default the snapshot has the user's authority and no
 //!   `CAP_DAC_OVERRIDE` — the kernel's own permission checks then bind the
 //!   daemon exactly as they would bind the user.
+//!   [`CredBroker::spawn_with_caps`] widens that deliberately, bounded by a
+//!   ceiling fixed before the privilege drop; see [`Caps`].
+//!
+//!   Precisely: it is the *effective* set that is empty. The snapshot's
+//!   *permitted* set still holds whatever the broker had, because the
+//!   window's `setresuid(uid, uid, 0)` keeps saved-uid 0 and the kernel
+//!   clears permitted only when all three uids leave root. That is inert —
+//!   authorization reads effective, and no io_uring operation raises
+//!   effective from permitted — but it is the accurate statement.
 
 use super::{Personality, UringFs};
 use crate::errno::{self, retry_on_eintr, Errno};
@@ -127,10 +137,98 @@ const RING_FD_BASE: RawFd = 4;
 const OP_REGISTER: u8 = 1;
 const OP_UNREGISTER: u8 = 2;
 
-/// Request header: `op`, `ring`, `ngroups`, `uid`, `gid`, then `ngroups`
-/// group ids. (`uid` doubles as the personality id for `OP_UNREGISTER`.)
-const HDR_LEN: usize = 12;
+/// Request header: `op`, `ring`, `ngroups`, `uid`, `gid`, `caps`, then
+/// `ngroups` group ids. (`uid` doubles as the personality id for
+/// `OP_UNREGISTER`.) Both ends compile from this crate, so the layout is an
+/// in-tree detail, not a stable ABI.
+const HDR_LEN: usize = 16;
 const MAX_REQ: usize = HDR_LEN + 4 * MAX_GROUPS;
+
+tn_bitflags! {
+    /// Capabilities a minted [`Personality`] may carry, on top of the
+    /// identity's own authority.
+    ///
+    /// Empty by default, and empty is the only value that needs no privilege
+    /// policy — a personality with no capability is bound by the kernel's
+    /// permission checks exactly as the user would be. Anything else is an
+    /// escalation, so it must be allowed twice: once by the mask given to
+    /// [`CredBroker::spawn_with_caps`] (fixed before the privilege drop, out
+    /// of a compromised main's reach) and again per request via
+    /// [`AsUser::caps`].
+    ///
+    /// **The bit values are the kernel's own capability numbers**, so a mask
+    /// is exactly the low word of `cap_effective` that the broker installs.
+    ///
+    /// # Why only `DAC_READ_SEARCH`
+    ///
+    /// As with [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs), the
+    /// refusals are the point:
+    ///
+    /// - `CAP_DAC_OVERRIDE` bypasses write and execute checks too, so a
+    ///   personality carrying it could create, unlink, and rename anywhere —
+    ///   there is no filesystem state a caller could not reach.
+    /// - `CAP_FOWNER` bypasses the owner check for `chmod`/`chown`/`utimes`
+    ///   and for setting attributes on files the identity does not own.
+    ///   Server-owned metadata already has a narrower answer in
+    ///   `PrivilegedXattrs`.
+    /// - `CAP_CHOWN` would let a caller give away or claim file ownership.
+    /// - `CAP_SYS_ADMIN` needs no explanation.
+    ///
+    /// Add one only with the same treatment this one gets: the precise
+    /// kernel semantics, verified against the source, written down.
+    pub struct Caps: u32 {
+        /// `CAP_DAC_READ_SEARCH` — **read the whole filesystem**.
+        ///
+        /// Granted to a service that must resolve a path on behalf of a user
+        /// who is entitled to the object but not to traverse every directory
+        /// above it. Verified against Linux 6.18 and OpenZFS 2.4.3:
+        ///
+        /// - **Directories:** grants search *and* `readdir`, on any
+        ///   directory, whatever its mode or ACL. The only condition is that
+        ///   the request carry no write bit (`fs/namei.c:478`).
+        /// - **Regular files:** grants read — but only when the request is
+        ///   *exactly* read (`fs/namei.c:492` tests `mask == MAY_READ`). So
+        ///   `O_RDONLY` on a mode-`0000` file succeeds while `O_RDWR` on the
+        ///   same file still fails `EACCES`. Surprising, and load-bearing.
+        /// - **Never** grants execute, any write, or a way past a read-only
+        ///   mount, an immutable flag, or LSM policy.
+        /// - **On ZFS with NFSv4 ACLs it overrides an explicit DENY entry**,
+        ///   at two independent layers. `zpl_permission` short-circuits on
+        ///   the capability *before the ACL is read at all*
+        ///   (`module/os/linux/zfs/zpl_xattr.c`, "Skip reading ACL if
+        ///   requested permissions are fully satisfied by capabilities"), and
+        ///   the slower `zfs_zaccess` path reaches
+        ///   `secpolicy_vnode_access2` (`module/os/linux/zfs/policy.c`),
+        ///   which reimplements the same directory/file rules as the VFS. An
+        ///   NFSv4 `deny` ACE is not a boundary against this capability.
+        /// - **It does not grant delete.** An explicit `ACE_DELETE` /
+        ///   `ACE_DELETE_CHILD` denial bottoms out in
+        ///   `secpolicy_vnode_remove`, which wants `CAP_FOWNER`
+        ///   (`module/os/linux/zfs/zfs_acl.c`). Nor does it defeat the
+        ///   dataset-level refusals — read-only, `ZFS_IMMUTABLE`,
+        ///   `ZFS_NOUNLINK`, quarantine — which clear `check_privs` and so
+        ///   never reach a capability check at all.
+        /// - **Namespace caveat.** ZFS's fast path uses a bare `capable()`
+        ///   (init user namespace), where the VFS uses
+        ///   `capable_wrt_inode_uidgid` (the inode's namespace, plus a
+        ///   uid/gid mapping check re-run per path component). The two agree
+        ///   for a reactor in the initial namespace, which is the only
+        ///   supported configuration today; they would diverge under an
+        ///   idmapped mount (see [`crate::mount::idmap`]).
+        /// - It also satisfies the `linkat(AT_EMPTY_PATH)` check
+        ///   (`fs/namei.c:2632`), so a personality holding it can publish an
+        ///   `O_TMPFILE` opened under a *different* personality — lifting the
+        ///   one-[`Lease`]-per-create rule described on
+        ///   [`FsHandle::linkat_file`](crate::uring_fs::FsHandle::linkat_file).
+        ///
+        /// There is no narrower capability: `CAP_DAC_OVERRIDE` and
+        /// `CAP_DAC_READ_SEARCH` are the only two DAC bypasses Linux defines,
+        /// and neither grants directory search without also granting file
+        /// read.
+        /// (`CAP_DAC_READ_SEARCH` is capability number 2, hence bit 2.)
+        DAC_READ_SEARCH = 0x0000_0004;
+    }
+}
 
 /// The identity to impersonate: everything the kernel consults for a
 /// filesystem permission check.
@@ -151,15 +249,17 @@ pub struct AsUser {
     /// Primary group id.
     pub gid: u32,
     groups: Vec<u32>,
+    caps: Caps,
 }
 
 impl AsUser {
-    /// A new identity with no supplementary groups.
+    /// A new identity with no supplementary groups and no capability.
     pub fn new(uid: u32, gid: u32) -> AsUser {
         AsUser {
             uid,
             gid,
             groups: Vec::new(),
+            caps: Caps::empty(),
         }
     }
 
@@ -175,6 +275,23 @@ impl AsUser {
     /// The supplementary groups, sorted and deduplicated.
     pub fn group_list(&self) -> &[u32] {
         &self.groups
+    }
+
+    /// Request capabilities on top of this identity's own authority — see
+    /// [`Caps`], and note that the broker's spawn-time mask is the ceiling.
+    ///
+    /// This participates in equality and hashing for the same reason the
+    /// group list does: it changes what the identity may do, so
+    /// [`IdentityCache`] must mint a *separate* personality rather than hand
+    /// back one registered for the same uid without it.
+    pub fn caps(mut self, caps: Caps) -> AsUser {
+        self.caps = caps;
+        self
+    }
+
+    /// The capabilities requested for this identity.
+    pub fn cap_set(&self) -> Caps {
+        self.caps
     }
 }
 
@@ -570,6 +687,35 @@ impl CredBroker {
     pub fn spawn<R: BrokerReactor + ?Sized>(
         reactors: &[&R],
     ) -> crate::Result<CredBroker> {
+        CredBroker::spawn_with_caps(reactors, Caps::empty())
+    }
+
+    /// [`spawn`](Self::spawn), but permitting brokered personalities to carry
+    /// capabilities from `allowed`.
+    ///
+    /// `allowed` is a **ceiling fixed here**, before the privilege drop, and
+    /// the broker enforces it on every request: a registration asking for
+    /// anything outside it fails `EPERM`. That placement is the security
+    /// property. Main can already ask the broker to mint any non-root
+    /// identity (see the module boundary note), so a per-request capability
+    /// with no spawn-time bound would let a compromised main hand itself
+    /// `CAP_DAC_READ_SEARCH` — read access to every file on the system. A
+    /// ceiling chosen before the fork cannot be widened by anything that
+    /// happens to main afterwards.
+    ///
+    /// `Caps::empty()` — what [`spawn`](Self::spawn) passes — reproduces the
+    /// capability-free behaviour exactly, including skipping the `capset`
+    /// entirely inside the impersonation window.
+    ///
+    /// Capabilities are applied only on the impersonation path. A request
+    /// whose identity already matches the broker's own is refused `EPERM`
+    /// when it asks for any: that path mints the daemon's *own* credentials,
+    /// and handing them extra authority is what [`UringFs::register_self`]
+    /// and this whole process boundary exist to prevent.
+    pub fn spawn_with_caps<R: BrokerReactor + ?Sized>(
+        reactors: &[&R],
+        allowed: Caps,
+    ) -> crate::Result<CredBroker> {
         if reactors.is_empty() || reactors.len() > MAX_RINGS {
             return Err(crate::Error::Validation(format!(
                 "a broker serves 1..={MAX_RINGS} rings, got {}",
@@ -636,7 +782,14 @@ impl CredBroker {
             // The child must not run any destructor belonging to the parent
             // (they would free memory the parent still owns and flush its
             // buffers a second time), so `broker_main` ends in `_exit`.
-            broker_main(child_end.as_raw_fd(), &ring_fds, req, groups, scratch);
+            broker_main(
+                child_end.as_raw_fd(),
+                &ring_fds,
+                allowed,
+                req,
+                groups,
+                scratch,
+            );
         }
         // SAFETY: `CLONE_PIDFD` wrote a fresh owned pidfd for the child.
         let pidfd = unsafe { crate::fd::owned_from_raw(pidfd) };
@@ -708,6 +861,7 @@ impl CredBroker {
         req[2..4].copy_from_slice(&(who.groups.len() as u16).to_le_bytes());
         req[4..8].copy_from_slice(&who.uid.to_le_bytes());
         req[8..12].copy_from_slice(&who.gid.to_le_bytes());
+        req[12..16].copy_from_slice(&who.caps.bits().to_le_bytes());
         for (i, g) in who.groups.iter().enumerate() {
             let at = HDR_LEN + 4 * i;
             req[at..at + 4].copy_from_slice(&g.to_le_bytes());
@@ -751,23 +905,73 @@ fn recv_reply(sock: RawFd) -> errno::Result<i64> {
     Ok(i64::from_le_bytes(buf))
 }
 
+/// `_LINUX_CAPABILITY_VERSION_3`: two 32-bit words per set.
+const VERSION_3: u32 = 0x2008_0522;
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+/// Set the calling process's **effective** set to exactly `caps`, inside the
+/// impersonation window, leaving permitted and inheritable untouched.
+///
+/// Only effective is written, and that is deliberate rather than sloppy:
+///
+/// - Effective is the set the kernel actually consults —
+///   `cap_capable_helper` tests `cap_raised(cred->cap_effective, cap)` — so
+///   it is the whole of what the snapshot needs.
+/// - Permitted **must not** be narrowed here. `capset` can only ever drop
+///   from permitted, never restore it, so trimming it inside the window
+///   would strip the broker's own `CAP_SETUID` for good and wedge every
+///   later request. Permitted is inert for authorization; nothing in an
+///   io_uring operation raises effective from it.
+///
+/// This works without `PR_SET_KEEPCAPS` because the window's
+/// `setresuid(uid, uid, 0)` keeps saved-uid 0: the kernel clears *permitted*
+/// only when real, effective and saved uid all leave root
+/// (`cap_emulate_setxuid`), so permitted survives the drop with effective
+/// emptied — leaving exactly the headroom this raises back.
+fn raise_effective_caps(caps: Caps) -> errno::Result<()> {
+    let mut hdr = CapHeader {
+        version: VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapData::default(); 2];
+    // SAFETY: capget fills two CapData words for VERSION_3.
+    Errno::result(unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            std::ptr::addr_of_mut!(hdr),
+            data.as_mut_ptr(),
+        )
+    })?;
+    // `Caps` bits are kernel capability numbers, all below 32, so the mask is
+    // the low word verbatim. The high word is left as read.
+    data[0].effective = caps.bits();
+    // SAFETY: capset reads the same two-word layout back.
+    Errno::result(unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            std::ptr::addr_of_mut!(hdr),
+            data.as_ptr(),
+        )
+    })?;
+    Ok(())
+}
+
 /// Drop `CAP_SETUID`/`CAP_SETGID` from every capability set of the calling
 /// process. Succeeds trivially where they were not held.
 fn drop_setid_caps() -> errno::Result<()> {
-    #[repr(C)]
-    struct CapHeader {
-        version: u32,
-        pid: i32,
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    struct CapData {
-        effective: u32,
-        permitted: u32,
-        inheritable: u32,
-    }
-    // `_LINUX_CAPABILITY_VERSION_3`: two 32-bit words per set.
-    const VERSION_3: u32 = 0x2008_0522;
     // `<linux/capability.h>`; `libc` exposes neither constant.
     const CAP_SETGID: u32 = 6;
     const CAP_SETUID: u32 = 7;
@@ -815,6 +1019,7 @@ fn drop_setid_caps() -> errno::Result<()> {
 fn broker_main(
     sock: RawFd,
     ring_fds: &[RawFd],
+    allowed: Caps,
     req: Vec<u8>,
     groups: Vec<u32>,
     scratch: Vec<libc::gid_t>,
@@ -825,7 +1030,7 @@ fn broker_main(
     // image. Contain it here and exit non-zero; under `panic = "abort"` the
     // child aborts instead, which is equally safe.
     let ok = std::panic::catch_unwind(move || {
-        broker_loop(nrings, req, groups, scratch)
+        broker_loop(nrings, allowed, req, groups, scratch)
     })
     .is_ok();
     // SAFETY: `_exit` never runs atexit handlers or destructors — exactly what
@@ -842,6 +1047,7 @@ fn broker_main(
 /// thread held at fork time. The loop is then truly allocation-free.
 fn broker_loop(
     nrings: usize,
+    allowed: Caps,
     mut req: Vec<u8>,
     mut groups: Vec<u32>,
     mut scratch: Vec<libc::gid_t>,
@@ -860,11 +1066,30 @@ fn broker_loop(
         let ngroups = usize::from(u16::from_le_bytes([req[2], req[3]]));
         let uid = u32::from_le_bytes([req[4], req[5], req[6], req[7]]);
         let gid = u32::from_le_bytes([req[8], req[9], req[10], req[11]]);
+        let caps_bits =
+            u32::from_le_bytes([req[12], req[13], req[14], req[15]]);
 
-        if ring >= nrings || ngroups > MAX_GROUPS || n < HDR_LEN + 4 * ngroups {
+        // Exact length, not a lower bound: a datagram truncated by the
+        // fixed-size receive buffer must be refused, never read as though the
+        // missing tail were zeroes.
+        if ring >= nrings || ngroups > MAX_GROUPS || n != HDR_LEN + 4 * ngroups
+        {
             let _ = reply(SOCK_FD, -(libc::EINVAL as i64));
             continue;
         }
+        // An unknown bit is a newer client against an older broker, or a
+        // corrupt request; either way it is not something to silently mask
+        // off, because the caller would then get a personality weaker than it
+        // asked for and discover it as an EACCES far from here.
+        let caps = match Caps::from_bits(caps_bits) {
+            Some(c) if allowed.contains(c) => c,
+            // Outside the spawn-time ceiling, or not a capability this build
+            // knows how to mint.
+            _ => {
+                let _ = reply(SOCK_FD, -(libc::EPERM as i64));
+                continue;
+            }
+        };
         let ring_fd = RING_FD_BASE + ring as RawFd;
 
         let res: i64 = match op {
@@ -878,7 +1103,14 @@ fn broker_loop(
                         req[at + 3],
                     ]);
                 }
-                register_as(ring_fd, uid, gid, &groups[..ngroups], &mut scratch)
+                register_as(
+                    ring_fd,
+                    uid,
+                    gid,
+                    caps,
+                    &groups[..ngroups],
+                    &mut scratch,
+                )
             }
             OP_UNREGISTER => match u16::try_from(uid) {
                 // The id rides in the uid field; freeing needs no creds.
@@ -1038,14 +1270,16 @@ fn raw_getegid() -> u32 {
 /// Ordering is load-bearing. Groups and gids are set while still
 /// privileged; the uid drop comes last and keeps **saved-uid 0** so the
 /// window can be closed again. As euid leaves 0 the kernel's setuid fixup
-/// clears the effective capability set — which is what guarantees the
-/// snapshot carries the user's authority and no `CAP_DAC_OVERRIDE`.
+/// clears the effective capability set — which is what leaves the snapshot
+/// carrying the user's authority and no `CAP_DAC_OVERRIDE`, unless `caps`
+/// asks for something the spawn-time policy allowed.
 /// Nothing else runs inside the window: no allocation, no logging, no
 /// fallible work that could unwind.
 fn register_as(
     ring_fd: RawFd,
     uid: u32,
     gid: u32,
+    caps: Caps,
     groups: &[u32],
     scratch: &mut [libc::gid_t],
 ) -> i64 {
@@ -1054,6 +1288,12 @@ fn register_as(
     // process takes, where `setgroups` would fail even for an unchanged
     // list (it always demands CAP_SETGID).
     if !needs_impersonation(uid, gid, groups, scratch) {
+        // No transition means no setuid fixup, so the broker's own effective
+        // set would go into the snapshot untouched. Granting capabilities
+        // here would hand out the daemon's own authority under another name.
+        if !caps.is_empty() {
+            return -(libc::EPERM as i64);
+        }
         return match crate::uring::sys::register_personality(ring_fd) {
             Ok(id) => i64::from(id),
             Err(e) => -(e as i32 as i64),
@@ -1106,6 +1346,17 @@ fn register_as(
     if raw_geteuid() != uid || raw_getegid() != gid {
         revert();
         return -(libc::EINVAL as i64);
+    }
+
+    // Raise the requested capabilities into the *effective* set the snapshot
+    // is about to capture. Ordered after the euid check on purpose: the
+    // credentials being elevated must already be proven to be the requested
+    // identity's, never root's.
+    if !caps.is_empty() {
+        if let Err(e) = raise_effective_caps(caps) {
+            revert();
+            return -(e as i32 as i64);
+        }
     }
 
     let out = match crate::uring::sys::register_personality(ring_fd) {
@@ -1185,14 +1436,40 @@ mod tests {
         }
         let Ok(ring) = Ring::new(4) else { return };
         let mut scratch = [0 as libc::gid_t; 8];
-        let out =
-            register_as(ring.raw_fd(), u32::MAX, u32::MAX, &[], &mut scratch);
+        let out = register_as(
+            ring.raw_fd(),
+            u32::MAX,
+            u32::MAX,
+            Caps::empty(),
+            &[],
+            &mut scratch,
+        );
         assert!(out < 0, "sentinel uid/gid must be refused, got id {out}");
         // The window was reverted: we are root again, able to impersonate a
         // real (non-sentinel) uid on the same ring.
         assert_eq!(raw_geteuid(), 0, "euid restored after refusal");
-        let ok = register_as(ring.raw_fd(), 65534, 65534, &[], &mut scratch);
+        let ok = register_as(
+            ring.raw_fd(),
+            65534,
+            65534,
+            Caps::empty(),
+            &[],
+            &mut scratch,
+        );
         assert!(ok > 0, "a real uid still registers after the refusal: {ok}");
+
+        // The sentinel is refused *before* any capability is raised, so a
+        // capability request cannot smuggle one past the euid post-condition.
+        let out = register_as(
+            ring.raw_fd(),
+            u32::MAX,
+            u32::MAX,
+            Caps::DAC_READ_SEARCH,
+            &[],
+            &mut scratch,
+        );
+        assert!(out < 0, "sentinel plus caps must still be refused: {out}");
+        assert_eq!(raw_geteuid(), 0, "euid restored after the caps refusal");
     }
 
     /// Pin the kernel behaviour that shapes this whole module: an io_uring

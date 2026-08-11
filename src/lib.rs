@@ -20,8 +20,8 @@
 //! and idmapped-mount support — features `mount`, `idmap`), [`configfile`],
 //! [`audit`] (kernel audit records over `NETLINK_AUDIT`), the io_uring `net`
 //! stack (`net-core`/`net-server`/`net-client`), and the io_uring fs reactor
-//! `uring_fs` (`uring-fs`); `full` enables all but the still-landing fs
-//! reactor.
+//! [`uring_fs`] (`uring-fs`). `full` enables everything except `uring-fs`,
+//! which is opted into on its own.
 #![cfg(target_os = "linux")]
 #![allow(non_camel_case_types)]
 #![deny(unsafe_op_in_unsafe_fn)]
