@@ -291,6 +291,22 @@ pub(crate) fn frame<U>(
             let head_only = buf.starts_with(b"HEAD ");
             match frame_facts(buf) {
                 Err(status) => {
+                    // The parse-time screens (malformed, Host, version) run
+                    // before the head-size cap can, because the cap needs
+                    // the head's extent and a failed parse has none. When
+                    // the buffer already exceeds the cap and no verdict was
+                    // reachable within it, the promised 431 wins over the
+                    // screen that only fired on past-the-cap bytes; a
+                    // screen that fires within the cap keeps its more
+                    // specific status. (One bounded re-parse, only on a
+                    // connection that is already dying.)
+                    let status = if buf.len() > cfg.max_head
+                        && matches!(frame_facts(&buf[..cfg.max_head]), Ok(None))
+                    {
+                        431
+                    } else {
+                        status
+                    };
                     fail(&mut conn.phase, buf.len(), status, head_only)
                 }
                 Ok(None) => {
@@ -648,6 +664,28 @@ mod tests {
             }
         );
         assert!(matches!(c.phase, Phase::Fail { status: 431, .. }));
+    }
+
+    #[test]
+    fn over_cap_head_keeps_the_promised_431() {
+        // A host-less head is a 400, but this one only completes past the
+        // cap — no verdict was reachable within it, so the cap's promised
+        // 431 wins over the screen that fired on past-the-cap bytes.
+        let small = HttpConfig {
+            max_head: 64,
+            max_body: 1024,
+        };
+        let mut c = conn();
+        let mut req = b"GET / HTTP/1.1\r\nX-Pad: ".to_vec();
+        req.extend(std::iter::repeat_n(b'a', 60));
+        req.extend_from_slice(b"\r\n\r\n");
+        frame(&req, &mut c, &small);
+        assert!(matches!(c.phase, Phase::Fail { status: 431, .. }));
+
+        // The same screen within the cap keeps its specific status.
+        let mut c = conn();
+        frame(b"GET / HTTP/1.1\r\nX-P: a\r\n\r\n", &mut c, &small);
+        assert!(matches!(c.phase, Phase::Fail { status: 400, .. }));
     }
 
     #[test]
