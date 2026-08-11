@@ -80,9 +80,81 @@ impl fmt::Display for HttpDate {
     }
 }
 
+/// A cache of the rendered `Date` value, keyed by the unix second. HTTP
+/// dates have one-second resolution and handlers run single-threaded on
+/// their reactor, so re-running the calendar math and formatting per
+/// response (~750 ns) is waste: the glue owns one of these per protocol
+/// instance (= per reactor) and re-renders only when the second changes.
+/// Pure like the rest of the module — the caller supplies the seconds, so
+/// serialization stays deterministic and testable.
+#[derive(Debug)]
+pub(crate) struct DateCache {
+    /// The second the buffer holds; `None` until the first render.
+    sec: Option<i64>,
+    /// Rendered length. IMF-fixdate is 29 bytes for four-digit years; the
+    /// buffer leaves room for the degenerate years an arbitrary `i64`
+    /// second can name (±12 digits), which cannot overflow it.
+    len: usize,
+    text: [u8; 40],
+    /// Renders performed — pins the caching in tests.
+    #[cfg(test)]
+    renders: usize,
+}
+
+// Manual: `Default` is not derivable past 32-element arrays.
+impl Default for DateCache {
+    fn default() -> Self {
+        DateCache {
+            sec: None,
+            len: 0,
+            text: [0; 40],
+            #[cfg(test)]
+            renders: 0,
+        }
+    }
+}
+
+impl DateCache {
+    /// The rendered IMF-fixdate for `secs`, re-rendered only when the
+    /// second differs from the previous call.
+    pub(crate) fn get(&mut self, secs: i64) -> &[u8] {
+        if self.sec != Some(secs) {
+            let mut cur = std::io::Cursor::new(&mut self.text[..]);
+            // Infallible: the widest renderable year fits the buffer (see
+            // the field doc), and a Cursor over `&mut [u8]` errors only on
+            // overflow.
+            std::io::Write::write_fmt(
+                &mut cur,
+                format_args!("{}", HttpDate::from_unix(secs)),
+            )
+            .expect("rendered date fits the buffer");
+            self.len = cur.position() as usize;
+            self.sec = Some(secs);
+            #[cfg(test)]
+            {
+                self.renders += 1;
+            }
+        }
+        &self.text[..self.len]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_renders_once_per_second() {
+        let mut c = DateCache::default();
+        assert_eq!(c.get(784_111_777), b"Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(c.get(784_111_777), b"Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(c.renders, 1, "same second must not re-render");
+        assert_eq!(c.get(784_111_778), b"Sun, 06 Nov 1994 08:49:38 GMT");
+        assert_eq!(c.renders, 2);
+        // Going backwards re-renders too (a stepped clock stays correct).
+        assert_eq!(c.get(0), b"Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(c.renders, 3);
+    }
 
     #[test]
     fn rfc_reference_date() {

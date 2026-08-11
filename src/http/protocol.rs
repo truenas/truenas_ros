@@ -14,7 +14,7 @@ use crate::net::server::{Body, Incoming, Protocol, Request, Response};
 use crate::net::ClientAddr;
 
 use super::chunked;
-use super::date::HttpDate;
+use super::date::DateCache;
 use super::framer::{frame, HttpConfig, HttpConn, Phase};
 use super::head::{parse_head, Head, HeaderView, Version, MAX_HEADERS};
 use super::response::{serialize, ConnHeader, HttpResponse};
@@ -77,24 +77,30 @@ impl std::fmt::Debug for HttpRequest<'_> {
 
 /// Wall-clock seconds for the `Date` header; the one impurity, kept at the
 /// edge so everything under it stays deterministic.
-fn now() -> HttpDate {
-    let secs = SystemTime::now()
+fn now_secs() -> i64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    HttpDate::from_unix(secs)
+        .unwrap_or(0)
 }
 
 /// Serialize `resp` against what `head` negotiated and pick the reactor
-/// verdict: keep-alive replies, farewells flush-close.
-fn respond(head: &Head<'_>, resp: HttpResponse) -> Response {
+/// verdict: keep-alive replies, farewells flush-close. `dates` is the
+/// per-reactor cache rendering the `Date` value once a second, not once a
+/// response.
+fn respond(
+    head: &Head<'_>,
+    resp: HttpResponse,
+    dates: &mut DateCache,
+) -> Response {
     let keep = head.keep_alive() && !resp.close;
     let conn = match (keep, head.version) {
         (true, Version::Http11) => ConnHeader::None,
         (true, Version::Http10) => ConnHeader::KeepAlive,
         (false, _) => ConnHeader::Close,
     };
-    let bytes = serialize(&resp, head.method == "HEAD", now(), conn);
+    let bytes =
+        serialize(&resp, head.method == "HEAD", dates.get(now_secs()), conn);
     if keep {
         Response::Reply(bytes)
     } else {
@@ -107,9 +113,14 @@ fn respond(head: &Head<'_>, resp: HttpResponse) -> Response {
 /// elided when the dying request was a HEAD (`head_only`), whose responses
 /// must not carry content lest the client read the body bytes as the next
 /// response's head.
-fn farewell(status: u16, head_only: bool) -> Response {
+fn farewell(status: u16, head_only: bool, dates: &mut DateCache) -> Response {
     let resp = HttpResponse::new(status).body(format!("error {status}\n"));
-    Response::ReplyClose(serialize(&resp, head_only, now(), ConnHeader::Close))
+    Response::ReplyClose(serialize(
+        &resp,
+        head_only,
+        dates.get(now_secs()),
+        ConnHeader::Close,
+    ))
 }
 
 /// Parse a delivered head and run the consumer's handler against it — the
@@ -121,6 +132,7 @@ fn dispatch<U, H>(
     trailers: &[HeaderView<'_>],
     peer: &ClientAddr,
     state: &mut U,
+    dates: &mut DateCache,
     handler: &mut H,
 ) -> Response
 where
@@ -132,7 +144,9 @@ where
         // The framer completed on these exact bytes (or on the stash it
         // parsed once already); a divergence here is a codec bug, answered
         // as such.
-        Err(_) | Ok(None) => farewell(500, head_bytes.starts_with(b"HEAD ")),
+        Err(_) | Ok(None) => {
+            farewell(500, head_bytes.starts_with(b"HEAD "), dates)
+        }
         Ok(Some(h)) => {
             let resp = handler(
                 HttpRequest {
@@ -147,7 +161,7 @@ where
                 },
                 state,
             );
-            respond(&h, resp)
+            respond(&h, resp, dates)
         }
     }
 }
@@ -160,6 +174,7 @@ fn step<U, H>(
     mut body: Body<'_>,
     peer: &ClientAddr,
     conn: &mut HttpConn<U>,
+    dates: &mut DateCache,
     handler: &mut H,
 ) -> Response
 where
@@ -173,7 +188,7 @@ where
         // client's body, so sniffing them here would let a body that spells
         // "HEAD " force an incomplete farewell (and a real HEAD's farewell
         // grow a body its client would read as the next response).
-        Phase::Fail { status, head_only } => farewell(status, head_only),
+        Phase::Fail { status, head_only } => farewell(status, head_only, dates),
         // Dance message 1: the head alone. Queue the interim line verbatim
         // (Reply sends raw bytes) and advance the phase; the framer will
         // declare the body next.
@@ -185,7 +200,7 @@ where
         // chunked dance never lands here — the framer morphs ExpectBody
         // into the scan phase before declaring anything.)
         Phase::ExpectBody { head: stash, .. } => {
-            dispatch(&stash, body, &[], peer, &mut conn.state, handler)
+            dispatch(&stash, body, &[], peer, &mut conn.state, dates, handler)
         }
         // A complete chunked message: de-chunk the wire extent, then
         // dispatch the entity against the in-buffer head or the dance's
@@ -210,13 +225,18 @@ where
                             &trailers,
                             peer,
                             &mut conn.state,
+                            dates,
                             handler,
                         ),
-                        Err(()) => {
-                            farewell(500, head_bytes.starts_with(b"HEAD "))
-                        }
+                        Err(()) => farewell(
+                            500,
+                            head_bytes.starts_with(b"HEAD "),
+                            dates,
+                        ),
                     },
-                    Err(()) => farewell(500, head_bytes.starts_with(b"HEAD ")),
+                    Err(()) => {
+                        farewell(500, head_bytes.starts_with(b"HEAD "), dates)
+                    }
                 };
             }
             match chunked::decode(&body) {
@@ -231,10 +251,13 @@ where
                         &trailers,
                         peer,
                         &mut conn.state,
+                        dates,
                         handler,
                     )
                 }
-                Err(()) => farewell(500, head_bytes.starts_with(b"HEAD ")),
+                Err(()) => {
+                    farewell(500, head_bytes.starts_with(b"HEAD "), dates)
+                }
             }
         }
         // Mid-scan delivery cannot happen (the framer only answers `More`
@@ -242,10 +265,11 @@ where
         Phase::ChunkedBody { stash, .. } => farewell(
             500,
             stash.as_deref().unwrap_or(header).starts_with(b"HEAD "),
+            dates,
         ),
         // The normal path: head + body in one message.
         Phase::Head => {
-            dispatch(header, body, &[], peer, &mut conn.state, handler)
+            dispatch(header, body, &[], peer, &mut conn.state, dates, handler)
         }
     }
 }
@@ -274,6 +298,10 @@ where
     A: FnMut(Incoming<'_>) -> Option<U>,
     H: FnMut(HttpRequest<'_>, &mut U) -> HttpResponse,
 {
+    // One date cache per protocol instance — instances are per reactor and
+    // handlers run on the reactor thread, so the `Date` value renders once
+    // a second instead of once a response, with no synchronization.
+    let mut dates = DateCache::default();
     Protocol {
         accept: move |inc: Incoming<'_>| accept(inc).map(HttpConn::new),
         header: move |buf: &[u8], conn: &mut HttpConn<U>| {
@@ -287,7 +315,7 @@ where
                 state: conn,
                 ..
             } = req;
-            step(header, body, peer, conn, &mut handler)
+            step(header, body, peer, conn, &mut dates, &mut handler)
         },
     }
 }
@@ -296,6 +324,22 @@ where
 mod tests {
     use super::*;
     use crate::net::Framing;
+
+    /// [`step`] with a throwaway date cache — the tests assert nothing
+    /// about `Date` freshness, and the cache's own behavior is pinned in
+    /// `date.rs`.
+    fn drive<U, H>(
+        header: &[u8],
+        body: Body<'_>,
+        peer: &ClientAddr,
+        conn: &mut HttpConn<U>,
+        handler: &mut H,
+    ) -> Response
+    where
+        H: FnMut(HttpRequest<'_>, &mut U) -> HttpResponse,
+    {
+        step(header, body, peer, conn, &mut DateCache::default(), handler)
+    }
 
     fn peer() -> ClientAddr {
         ClientAddr::Inet("127.0.0.1:9000".parse().unwrap())
@@ -333,7 +377,7 @@ mod tests {
         };
         assert_eq!(header_len + body_len, raw.len());
         let p = peer();
-        step(
+        drive(
             &raw[..header_len],
             Body::inline(&raw[header_len..]),
             &p,
@@ -441,7 +485,7 @@ mod tests {
             }
         );
         let interim =
-            step(head, Body::inline(b""), &p, &mut conn, &mut handler);
+            drive(head, Body::inline(b""), &p, &mut conn, &mut handler);
         match &interim {
             Response::Reply(bytes) => {
                 assert_eq!(bytes.as_slice(), b"HTTP/1.1 100 Continue\r\n\r\n");
@@ -458,7 +502,8 @@ mod tests {
                 body_len: 3
             }
         );
-        let resp = step(b"", Body::inline(b"abc"), &p, &mut conn, &mut handler);
+        let resp =
+            drive(b"", Body::inline(b"abc"), &p, &mut conn, &mut handler);
         assert!(matches!(resp, Response::Reply(_)));
         assert!(text(&resp).starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(matches!(conn.phase, Phase::Head));
@@ -473,7 +518,8 @@ mod tests {
         let p = peer();
         let mut unreached =
             |_: HttpRequest<'_>, _: &mut ()| panic!("handler must not run");
-        let resp = step(junk, Body::inline(b""), &p, &mut conn, &mut unreached);
+        let resp =
+            drive(junk, Body::inline(b""), &p, &mut conn, &mut unreached);
         assert!(matches!(resp, Response::ReplyClose(_)));
         let s = text(&resp);
         assert!(s.starts_with("HTTP/1.1 400 Bad Request\r\n"));
@@ -492,7 +538,7 @@ mod tests {
         let p = peer();
         let mut unreached =
             |_: HttpRequest<'_>, _: &mut ()| panic!("handler must not run");
-        let resp = step(req, Body::inline(b""), &p, &mut conn, &mut unreached);
+        let resp = drive(req, Body::inline(b""), &p, &mut conn, &mut unreached);
         let s = text(&resp);
         assert!(s.starts_with("HTTP/1.1 413"));
         // The HEAD contract: length declared, no body bytes.
@@ -512,7 +558,7 @@ mod tests {
         let mut unreached =
             |_: HttpRequest<'_>, _: &mut ()| panic!("handler must not run");
         frame(head, &mut conn, &cfg());
-        step(head, Body::inline(b""), &p, &mut conn, &mut unreached);
+        drive(head, Body::inline(b""), &p, &mut conn, &mut unreached);
         // Message 2: garbage chunk framing that happens to spell "HEAD ".
         let body = b"HEAD /x HTTP/1.1\r\n\r\n";
         frame(body, &mut conn, &cfg());
@@ -523,7 +569,8 @@ mod tests {
                 head_only: false
             }
         ));
-        let resp = step(body, Body::inline(b""), &p, &mut conn, &mut unreached);
+        let resp =
+            drive(body, Body::inline(b""), &p, &mut conn, &mut unreached);
         let s = text(&resp);
         assert!(s.starts_with("HTTP/1.1 400"));
         // The PUT's farewell carries its diagnostic body.
@@ -541,7 +588,7 @@ mod tests {
         let mut unreached =
             |_: HttpRequest<'_>, _: &mut ()| panic!("handler must not run");
         frame(head, &mut conn, &cfg());
-        step(head, Body::inline(b""), &p, &mut conn, &mut unreached);
+        drive(head, Body::inline(b""), &p, &mut conn, &mut unreached);
         // Message 2: a malformed chunk-size line kills the scan.
         let body = b"zz\r\n";
         frame(body, &mut conn, &cfg());
@@ -552,7 +599,8 @@ mod tests {
                 head_only: true
             }
         ));
-        let resp = step(body, Body::inline(b""), &p, &mut conn, &mut unreached);
+        let resp =
+            drive(body, Body::inline(b""), &p, &mut conn, &mut unreached);
         let s = text(&resp);
         assert!(s.starts_with("HTTP/1.1 400"));
         assert!(s.contains("Content-Length: 10\r\n"));
@@ -644,7 +692,7 @@ mod tests {
             }
         );
         let interim =
-            step(head, Body::inline(b""), &p, &mut conn, &mut handler);
+            drive(head, Body::inline(b""), &p, &mut conn, &mut handler);
         assert!(matches!(
             &interim,
             Response::Reply(b) if b.as_slice() == b"HTTP/1.1 100 Continue\r\n\r\n"
@@ -658,7 +706,7 @@ mod tests {
                 body_len: wire.len()
             }
         );
-        let resp = step(b"", Body::inline(&wire), &p, &mut conn, &mut handler);
+        let resp = drive(b"", Body::inline(&wire), &p, &mut conn, &mut handler);
         assert!(matches!(resp, Response::Reply(_)));
         assert!(text(&resp).starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(matches!(conn.phase, Phase::Head));
@@ -685,7 +733,7 @@ mod tests {
             }
         );
         let p = peer();
-        let resp = step(
+        let resp = drive(
             head,
             Body::placed(b"hello".to_vec()),
             &p,
@@ -732,7 +780,7 @@ mod tests {
             HttpResponse::new(200)
         };
         frame(head, &mut conn, &cfg());
-        step(head, Body::inline(b""), &p, &mut conn, &mut handler);
+        drive(head, Body::inline(b""), &p, &mut conn, &mut handler);
         assert_eq!(
             frame(&wire, &mut conn, &cfg()),
             Framing::Complete {
@@ -740,7 +788,7 @@ mod tests {
                 body_len: wire.len()
             }
         );
-        let resp = step(b"", Body::placed(wire), &p, &mut conn, &mut handler);
+        let resp = drive(b"", Body::placed(wire), &p, &mut conn, &mut handler);
         assert!(matches!(resp, Response::Reply(_)));
         assert!(text(&resp).starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(matches!(conn.phase, Phase::Head));
@@ -775,7 +823,7 @@ mod tests {
             assert_eq!(req.trailers[0].value, b"lZe8jQ==");
             HttpResponse::new(200)
         };
-        let resp = step(
+        let resp = drive(
             &raw[..header_len],
             Body::placed(raw[header_len..header_len + body_len].to_vec()),
             &p,

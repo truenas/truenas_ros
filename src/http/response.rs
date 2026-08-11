@@ -11,6 +11,9 @@
 
 use std::borrow::Cow;
 
+// Serialization takes the rendered date bytes; only the tests build an
+// `HttpDate` themselves.
+#[cfg(test)]
 use super::date::HttpDate;
 
 /// A response under construction, returned by the consumer's handler.
@@ -255,8 +258,10 @@ pub(crate) enum ConnHeader {
 }
 
 /// Serialize to wire bytes. `head_only` elides the body while keeping its
-/// `Content-Length` (the HEAD contract); `date` is injected by the caller so
-/// this stays a pure function.
+/// `Content-Length` (the HEAD contract); `date` is the rendered IMF-fixdate
+/// value, injected by the caller so this stays a pure function (and so the
+/// glue's per-reactor [`DateCache`](super::date::DateCache) renders it once
+/// a second, not once a response).
 ///
 /// 1xx/204/304 responses never carry content (RFC 9110 §6.4.1): body bytes
 /// are elided regardless of `head_only`, and so is `Content-Length` — a
@@ -266,7 +271,7 @@ pub(crate) enum ConnHeader {
 pub(crate) fn serialize(
     resp: &HttpResponse,
     head_only: bool,
-    date: HttpDate,
+    date: &[u8],
     conn: ConnHeader,
 ) -> Vec<u8> {
     use std::io::Write;
@@ -287,7 +292,9 @@ pub(crate) fn serialize(
     // Vec<u8> Write is infallible; unwraps here cannot fire.
     write!(out, "HTTP/1.1 {} {}\r\n", resp.status, reason(resp.status))
         .unwrap();
-    write!(out, "Date: {date}\r\n").unwrap();
+    out.extend_from_slice(b"Date: ");
+    out.extend_from_slice(date);
+    out.extend_from_slice(b"\r\n");
     if !bodyless {
         write!(out, "Content-Length: {}\r\n", resp.body.len()).unwrap();
     }
@@ -351,9 +358,9 @@ impl HttpResponse {
 mod tests {
     use super::*;
 
-    fn date() -> HttpDate {
+    fn date() -> Vec<u8> {
         // Sun, 06 Nov 1994 08:49:37 GMT — recognizable in assertions.
-        HttpDate::from_unix(784_111_777)
+        HttpDate::from_unix(784_111_777).to_string().into_bytes()
     }
 
     fn text(bytes: &[u8]) -> &str {
@@ -365,7 +372,7 @@ mod tests {
         let resp = HttpResponse::new(200)
             .header("x-amz-request-id", "abc123")
             .body("hello");
-        let out = serialize(&resp, false, date(), ConnHeader::None);
+        let out = serialize(&resp, false, &date(), ConnHeader::None);
         assert_eq!(
             text(&out),
             "HTTP/1.1 200 OK\r\n\
@@ -389,7 +396,7 @@ mod tests {
             // Inline until the array fills; the pair past the cap spills.
             assert_eq!(r.headers_inline(), i < INLINE_HEADERS, "after {i}");
         }
-        let out = serialize(&r, false, date(), ConnHeader::None);
+        let out = serialize(&r, false, &date(), ConnHeader::None);
         let s = text(&out);
         let positions: Vec<usize> = names
             .iter()
@@ -407,7 +414,7 @@ mod tests {
     #[test]
     fn head_elides_body_keeps_length() {
         let resp = HttpResponse::new(200).body("hello");
-        let out = serialize(&resp, true, date(), ConnHeader::None);
+        let out = serialize(&resp, true, &date(), ConnHeader::None);
         let s = text(&out);
         assert!(s.contains("Content-Length: 5\r\n"));
         assert!(s.ends_with("\r\n\r\n"));
@@ -416,11 +423,11 @@ mod tests {
     #[test]
     fn connection_variants() {
         let resp = HttpResponse::new(204);
-        let close = serialize(&resp, false, date(), ConnHeader::Close);
+        let close = serialize(&resp, false, &date(), ConnHeader::Close);
         assert!(text(&close).contains("Connection: close\r\n"));
-        let ka = serialize(&resp, false, date(), ConnHeader::KeepAlive);
+        let ka = serialize(&resp, false, &date(), ConnHeader::KeepAlive);
         assert!(text(&ka).contains("Connection: keep-alive\r\n"));
-        let none = serialize(&resp, false, date(), ConnHeader::None);
+        let none = serialize(&resp, false, &date(), ConnHeader::None);
         assert!(!text(&none).contains("Connection:"));
     }
 
@@ -432,7 +439,7 @@ mod tests {
             .header("Transfer-Encoding", "chunked")
             .header("date", "yesterday")
             .body("ok");
-        let out = serialize(&resp, false, date(), ConnHeader::None);
+        let out = serialize(&resp, false, &date(), ConnHeader::None);
         let s = text(&out);
         assert!(s.contains("Content-Length: 2\r\n"));
         assert!(!s.contains("999"));
@@ -443,8 +450,12 @@ mod tests {
 
     #[test]
     fn unknown_status_empty_reason() {
-        let out =
-            serialize(&HttpResponse::new(299), false, date(), ConnHeader::None);
+        let out = serialize(
+            &HttpResponse::new(299),
+            false,
+            &date(),
+            ConnHeader::None,
+        );
         assert!(text(&out).starts_with("HTTP/1.1 299 \r\n"));
     }
 
@@ -473,7 +484,7 @@ mod tests {
             .header("x-colon:", "v")
             .header("", "v")
             .header("x-ok", "kept");
-        let out = serialize(&resp, false, date(), ConnHeader::None);
+        let out = serialize(&resp, false, &date(), ConnHeader::None);
         let s = text(&out);
         assert!(s.contains("x-ok: kept\r\n"));
         assert!(!s.contains("location"));
@@ -498,7 +509,7 @@ mod tests {
             .header("x-tab", &b"a\tb"[..]) // HTAB — allowed
             .header("x-obs", &b"caf\xe9"[..]) // obs-text — allowed
             .header("x-ok", "plain");
-        let out = serialize(&resp, false, date(), ConnHeader::None);
+        let out = serialize(&resp, false, &date(), ConnHeader::None);
         let has =
             |needle: &[u8]| out.windows(needle.len()).any(|w| w == needle);
         for dropped in [&b"x-vt"[..], b"x-ff", b"x-soh", b"x-us", b"x-del"] {
@@ -520,14 +531,18 @@ mod tests {
         // and no Content-Length is emitted at all.
         for status in [100, 204, 304] {
             let resp = HttpResponse::new(status).body("diagnostic");
-            let out = serialize(&resp, false, date(), ConnHeader::None);
+            let out = serialize(&resp, false, &date(), ConnHeader::None);
             let s = text(&out);
             assert!(!s.contains("Content-Length"), "{status}: {s}");
             assert!(s.ends_with("\r\n\r\n"), "{status}: {s}");
         }
         // A 200 with an empty body still declares its length.
-        let ok =
-            serialize(&HttpResponse::new(200), false, date(), ConnHeader::None);
+        let ok = serialize(
+            &HttpResponse::new(200),
+            false,
+            &date(),
+            ConnHeader::None,
+        );
         assert!(text(&ok).contains("Content-Length: 0\r\n"));
     }
 }
