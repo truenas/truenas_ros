@@ -95,9 +95,11 @@
 
 use super::{Personality, UringFs};
 use crate::errno::{self, retry_on_eintr, Errno};
+use crate::sync::{Arc, Mutex};
 use std::ffi::c_void;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::sync::{Arc, Mutex, OnceLock};
+
+use super::single_flight::SingleFlight;
 
 /// The largest supplementary-group list a registration may carry.
 ///
@@ -505,17 +507,7 @@ pub struct IdentityCache {
 #[derive(Debug)]
 struct CacheInner {
     creds: CredHandle,
-    live: Mutex<std::collections::HashMap<AsUser, Arc<IdSlot>>>,
-}
-
-/// One identity's cache slot: the registered entry once minted, plus a gate
-/// that single-flights the mint so concurrent callers for the *same* identity
-/// register it once — without holding the shared map lock across the broker
-/// round-trip.
-#[derive(Debug)]
-struct IdSlot {
-    cell: OnceLock<Arc<IdEntry>>,
-    gate: Mutex<()>,
+    live: SingleFlight<AsUser, Arc<IdEntry>>,
 }
 
 impl IdentityCache {
@@ -524,7 +516,7 @@ impl IdentityCache {
         IdentityCache {
             inner: Arc::new(CacheInner {
                 creds,
-                live: Mutex::new(std::collections::HashMap::new()),
+                live: SingleFlight::new(),
             }),
         }
     }
@@ -536,54 +528,17 @@ impl IdentityCache {
     /// registration (they serialize on that identity's gate), but the shared
     /// map lock is held only for an O(1) slot lookup — never across the broker
     /// round-trip — so cache hits and registrations of *other* identities are
-    /// not blocked behind one mint.
+    /// not blocked behind one mint. That protocol lives in `SingleFlight`
+    /// (`uring_fs/single_flight.rs`), where it is model-checked without a
+    /// broker to fork.
     pub fn acquire(&self, who: &AsUser) -> crate::Result<Lease> {
-        // Brief map lock: find or create this identity's slot, then release.
-        let slot = {
-            let mut live = self.inner.live.lock().map_err(|_| Errno::EIO)?;
-            live.entry(who.clone())
-                .or_insert_with(|| {
-                    Arc::new(IdSlot {
-                        cell: OnceLock::new(),
-                        gate: Mutex::new(()),
-                    })
-                })
-                .clone()
-        };
-        // Fast path: already registered — no lock, no broker call.
-        if let Some(entry) = slot.cell.get() {
-            return Ok(Lease(entry.clone()));
-        }
-        // Slow path: single-flight the mint on this identity's gate (the map
-        // lock is not held, so other identities and hits proceed). Re-check
-        // under the gate — a racing caller may have just filled the cell.
-        let _mint = slot.gate.lock().map_err(|_| Errno::EIO)?;
-        if let Some(entry) = slot.cell.get() {
-            return Ok(Lease(entry.clone()));
-        }
-        let id = match self.inner.creds.register(who) {
-            Ok(id) => id,
-            Err(e) => {
-                // A failed mint must not leave its slot behind: nothing ever
-                // fills or removes an empty slot, so a daemon whose broker is
-                // down (or which is handed identities the broker refuses) would
-                // otherwise grow the map by one entry per attempt, forever.
-                // Remove only if the map still holds *this* slot — a concurrent
-                // `invalidate` + `acquire` may already have replaced it.
-                if let Ok(mut live) = self.inner.live.lock() {
-                    if live.get(who).is_some_and(|s| Arc::ptr_eq(s, &slot)) {
-                        live.remove(who);
-                    }
-                }
-                return Err(e);
-            }
-        };
-        let entry = Arc::new(IdEntry {
-            id,
-            creds: self.inner.creds.clone(),
-        });
-        // Set can't fail: we hold the gate, so no one else filled it.
-        let _ = slot.cell.set(entry.clone());
+        let creds = &self.inner.creds;
+        let entry = self.inner.live.get_or_try_init(who, || {
+            Ok(Arc::new(IdEntry {
+                id: creds.register(who)?,
+                creds: creds.clone(),
+            }))
+        })?;
         Ok(Lease(entry))
     }
 
@@ -591,29 +546,21 @@ impl IdentityCache {
     /// [`acquire`](Self::acquire) mints a fresh one. Outstanding leases are
     /// unaffected and retire the old id when they drop.
     pub fn invalidate(&self, who: &AsUser) {
-        if let Ok(mut live) = self.inner.live.lock() {
-            live.remove(who);
-        }
+        self.inner.live.invalidate(who);
     }
 
     /// Forget every cached identity (a wholesale directory-services
     /// change). Existing leases keep working, as in
     /// [`invalidate`](Self::invalidate).
     pub fn invalidate_all(&self) {
-        if let Ok(mut live) = self.inner.live.lock() {
-            live.clear();
-        }
+        self.inner.live.clear();
     }
 
     /// How many distinct identities are currently cached and registered. An
     /// identity whose mint is still in flight does not count (one that failed
     /// leaves nothing behind at all).
     pub fn len(&self) -> usize {
-        self.inner
-            .live
-            .lock()
-            .map(|m| m.values().filter(|s| s.cell.get().is_some()).count())
-            .unwrap_or(0)
+        self.inner.live.len()
     }
 
     /// Whether no identity is cached.
