@@ -136,15 +136,28 @@ pub fn copyfile(
     }
 }
 
-/// Copy the source's access permissions to the destination.
+/// Copy the source's permissions to the destination.
 ///
 /// If the source carries an access ACL xattr (POSIX access or the ZFS NFS4
 /// blob) it is copied and `fchmod` is skipped, since the ACL is authoritative
 /// for the destination's permissions; otherwise `mode` is applied with
 /// `fchmod`.
 ///
+/// A POSIX **default** ACL travels either way. It is not an access check on
+/// this object at all — it is the template children inherit — so it is a
+/// separate xattr from the access ACL, and a directory can carry one with no
+/// access ACL at all. [`copy_xattrs`] skips the whole `system.` namespace, so
+/// if it is not copied here it is not copied anywhere.
+///
 /// The ACL is authoritative on ZFS `aclmode=restricted`, where a `chmod` of an
 /// object holding a non-trivial ACL is rejected with `EPERM` (`zfs_setattr`).
+/// A destination can hold such an ACL without the source having one — it
+/// inherits from the destination parent — and on `acltype=nfsv4` the source's
+/// own ACL is invisible to `flistxattr`, so the `fchmod` branch is the one
+/// taken. An `EPERM` there means the destination's ACL already governs its
+/// mode, which is the outcome this function wants; it is treated as applied
+/// rather than failing the copy, matching [`super::copytree`]'s
+/// destination-root and special-node `chmod` sites.
 /// Mirrors `truenas_os` copy.py.
 ///
 /// `S_ISUID`/`S_ISGID` are withheld — they belong to [`copy_setid`], which
@@ -180,14 +193,21 @@ pub fn copy_permissions(
     xattr_names: &[CString],
     mode: u32,
 ) -> Result<()> {
+    if xattr_names.iter().any(|n| n.as_c_str() == POSIX_DEFAULT) {
+        let buf = fgetxattr(src, POSIX_DEFAULT)?;
+        fsetxattr(dst, POSIX_DEFAULT, &buf, XattrFlags::empty())?;
+    }
     if !has_access_acl(xattr_names) {
-        retry_on_eintr(|| unsafe {
-            libc::fchmod(
-                dst.as_raw_fd(),
-                mode as libc::mode_t & 0o7777 & !SETID_BITS,
-            )
-        })?;
-        return Ok(());
+        return super::ok_if_acl_governed(
+            retry_on_eintr(|| unsafe {
+                libc::fchmod(
+                    dst.as_raw_fd(),
+                    mode as libc::mode_t & 0o7777 & !SETID_BITS,
+                )
+            })
+            .map(drop)
+            .map_err(Into::into),
+        );
     }
     for name in xattr_names
         .iter()
@@ -208,7 +228,11 @@ pub fn copy_permissions(
 /// not preserved. `fchown` clears setid itself (`chown(2)`), so this runs last.
 ///
 /// A destination whose permissions came from an ACL xattr is left alone: there
-/// the mode follows the ACL, and an `fchmod` could discard it.
+/// the mode follows the ACL, and an `fchmod` could discard it. A destination
+/// governed by an ACL it *inherited* refuses the `fchmod` with `EPERM`, which
+/// is tolerated for the reason [`copy_permissions`] gives — and here the
+/// tolerated outcome is a destination without setid, a reduction in what the
+/// copy grants, never an increase.
 pub fn copy_setid(
     dst: BorrowedFd<'_>,
     xattr_names: &[CString],
@@ -218,8 +242,11 @@ pub fn copy_setid(
     if mode & SETID_BITS == 0 || has_access_acl(xattr_names) {
         return Ok(());
     }
-    retry_on_eintr(|| unsafe { libc::fchmod(dst.as_raw_fd(), mode) })?;
-    Ok(())
+    super::ok_if_acl_governed(
+        retry_on_eintr(|| unsafe { libc::fchmod(dst.as_raw_fd(), mode) })
+            .map(drop)
+            .map_err(Into::into),
+    )
 }
 
 /// Copy the source's xattrs to the destination, less the two namespaces a data

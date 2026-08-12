@@ -1358,6 +1358,76 @@ mod shutil {
         );
     }
 
+    // A directory's default ACL is the template its children inherit, and it
+    // is a different xattr from the access ACL. copy_xattrs skips the whole
+    // `system.` namespace, so if copy_permissions does not carry it, nothing
+    // does. The source's access ACL is left trivial on purpose: that is the
+    // branch which sets the mode and returns, and it has to carry the default
+    // too.
+    #[cfg(feature = "acl")]
+    #[test]
+    fn a_directory_default_acl_is_carried_to_the_copy() {
+        use std::os::fd::AsFd;
+        use truenas_ros::sync_fs::acl::{
+            fsetacl_posix, PosixAce, PosixAcl, PosixPerm, PosixTag,
+        };
+        use truenas_ros::sync_fs::xattr::fgetxattr;
+
+        let ace = |tag, perms, id, default| PosixAce {
+            tag,
+            perms,
+            id,
+            default,
+        };
+        let rwx = PosixPerm::all();
+        let rx = PosixPerm::READ | PosixPerm::EXECUTE;
+        // Trivial access half, and a default half carrying a named user so it
+        // cannot be folded back into mode bits.
+        let acl = PosixAcl::from_aces([
+            ace(PosixTag::UserObj, rwx, -1, false),
+            ace(PosixTag::GroupObj, rx, -1, false),
+            ace(PosixTag::Other, rx, -1, false),
+            ace(PosixTag::UserObj, rwx, -1, true),
+            ace(PosixTag::User, rwx, 1234, true),
+            ace(PosixTag::GroupObj, rx, -1, true),
+            ace(PosixTag::Mask, rwx, -1, true),
+            ace(PosixTag::Other, rx, -1, true),
+        ]);
+        let access = acl.access_bytes().unwrap();
+        let default = acl.default_bytes().unwrap().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        // A nested directory too: the root gets its metadata from its own
+        // frame, everything below it on ascent.
+        std::fs::create_dir(src.join("nested")).unwrap();
+        std::fs::write(src.join("nested/child"), b"data").unwrap();
+
+        for dir in [src.clone(), src.join("nested")] {
+            let d = std::fs::File::open(&dir).unwrap();
+            if fsetacl_posix(d.as_fd(), &access, Some(&default)).is_err() {
+                return; // no POSIX ACLs here (an NFSv4-ACL dataset, say)
+            }
+        }
+        let d = std::fs::File::open(&src).unwrap();
+        let src_default =
+            fgetxattr(d.as_fd(), "system.posix_acl_default").unwrap();
+
+        let dst = tmp.path().join("dst");
+        copytree(&src, &dst, &CopyTreeConfig::default()).unwrap();
+
+        for dir in [dst.clone(), dst.join("nested")] {
+            let copied = std::fs::File::open(&dir).unwrap();
+            assert_eq!(
+                fgetxattr(copied.as_fd(), "system.posix_acl_default").unwrap(),
+                src_default,
+                "{dir:?} must carry the default ACL governing what its \
+                 children inherit"
+            );
+        }
+    }
+
     // The sticky bit has no ACL representation, and no chmod runs on the ACL
     // path, so an ACL-bearing sticky directory arrives without S_ISVTX. The
     // bit is given up to keep the ACL: on ZFS a chmod rewrites the ACL to
