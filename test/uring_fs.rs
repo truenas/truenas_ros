@@ -3601,17 +3601,25 @@ fn fremovexattr_removes_allowlisted_attributes() {
     });
 }
 
-/// A subtree that cannot be *opened* for a non-permission reason — here fd
-/// exhaustion (`EMFILE`) — must surface as an error, not vanish from the walk
-/// the way the readdir path already refuses to. A silently dropped subtree is
-/// data loss for the recursive delete/copy this walk backs.
+/// A subtree that cannot be *opened* for a non-permission reason must surface
+/// as an error, not vanish from the walk the way the readdir path already
+/// refuses to. A silently dropped subtree is data loss for the recursive
+/// delete/copy this walk backs.
+///
+/// The trigger is a real race: a directory is yielded, and the descent into it
+/// is deferred to the next call so `skip_descent` can cancel it — swap the
+/// directory for a regular file inside that window and the deferred
+/// `O_DIRECTORY` open fails `ENOTDIR`. Deliberately a *local* provocation.
+/// Exhausting the fd table would do it too, but the fd table belongs to the
+/// process and `cargo test` runs tests as threads in one, so a walk that
+/// dup-bombs starves whatever else is running: under a 1024 fd limit that
+/// reliably fails an unrelated test in this binary, and picks a different one
+/// each run.
 #[test]
 fn descend_open_failure_surfaces_rather_than_dropping_the_subtree() {
     with_fs(FsConfig::default(), |h, me, dir, _stop| {
         std::fs::create_dir(dir.join("sub")).unwrap();
-        for i in 0..4 {
-            std::fs::write(dir.join(format!("sub/f{i}.txt")), b"x").unwrap();
-        }
+        std::fs::write(dir.join("sub/f.txt"), b"x").unwrap();
         std::fs::write(dir.join("z.txt"), b"x").unwrap();
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
 
@@ -3620,30 +3628,25 @@ fn descend_open_failure_surfaces_rather_than_dropping_the_subtree() {
         // "sub/" sorts before "z.txt"; its descent is deferred to the next call.
         assert_eq!(t.next().expect("some").expect("ok").key(), b"sub/");
 
-        // Exhaust the fd table so the deferred open of "sub" gets EMFILE.
-        let mut hogs: Vec<i32> = Vec::new();
-        loop {
-            let fd = unsafe { libc::dup(1) };
-            if fd < 0 {
-                break;
-            }
-            hogs.push(fd);
-        }
-        let next = t.next(); // triggers descend("sub")
-        for fd in hogs {
-            unsafe { libc::close(fd) };
-        }
+        // The window: replace the directory with a regular file of the same
+        // name, so the deferred open of "sub" cannot be a directory open.
+        std::fs::remove_file(dir.join("sub/f.txt")).unwrap();
+        std::fs::remove_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub"), b"x").unwrap();
 
-        match next {
-            Some(Err(Error::Errno(e))) => {
-                assert!(
-                    matches!(e, Errno::EMFILE | Errno::ENFILE),
-                    "fd exhaustion should surface as EMFILE/ENFILE, got {e:?}"
-                );
-            }
+        match t.next() {
+            // triggers descend("sub")
+            Some(Err(Error::Errno(Errno::ENOTDIR))) => {}
             other => panic!(
                 "an unopenable subtree must surface an error, got {other:?}"
             ),
         }
+        // The error is per-subtree, not fatal: the walk carries on in the
+        // parent with the sibling it had already read.
+        assert_eq!(
+            t.next().expect("some").expect("ok").key(),
+            b"z.txt",
+            "a surfaced descend failure must not end the walk"
+        );
     });
 }
