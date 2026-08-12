@@ -34,6 +34,16 @@ fn has_access_acl(xattr_names: &[CString]) -> bool {
         .any(|n| ACCESS_ACL_XATTRS.contains(&n.as_c_str()))
 }
 
+/// Whether `name` lives in a namespace [`copy_xattrs`] refuses to carry.
+///
+/// The dot is part of the prefix: `system` and `security` are namespace names,
+/// and matching them bare would also swallow an attribute merely starting with
+/// those letters.
+fn is_reserved_namespace(name: &CString) -> bool {
+    let bytes = name.as_bytes();
+    bytes.starts_with(b"system.") || bytes.starts_with(b"security.")
+}
+
 /// Block-level clone via `copy_file_range(2)`. Fails with `EXDEV` across
 /// filesystems / ZFS pools.
 pub fn clonefile(
@@ -139,6 +149,31 @@ pub fn copyfile(
 ///
 /// `S_ISUID`/`S_ISGID` are withheld — they belong to [`copy_setid`], which
 /// applies them once the destination carries the source's ownership.
+///
+/// # The sticky bit on an ACL-bearing directory
+///
+/// `S_ISVTX` is a mode bit with no ACL representation, and on the ACL path no
+/// `fchmod` runs, so a sticky source directory that also carries an access ACL
+/// produces a destination with `S_ISVTX` clear. **This is deliberate, not an
+/// oversight.**
+///
+/// Restoring it would mean an `fchmod` on exactly the objects this branch
+/// exists to keep away from one, and on ZFS a `chmod` is never just a mode
+/// change — `zfs_acl_chmod_setattr` rewrites the ACL to agree with the new
+/// mode. Under the **default** `aclmode=discard` it replaces it with a fresh
+/// empty one (`zfs_acl_alloc`), under `groupmask` it trims the ALLOW entries,
+/// and even `passthrough` re-splits the mode-representing ACEs; only
+/// `restricted` refuses outright with `EPERM` (`zfs_setattr`). So re-stamping
+/// one bit would, on a stock dataset, destroy the ACL the copy just
+/// transported. A dropped sticky bit is a visible, repairable difference on a
+/// directory an admin can `chmod +t`; a silently discarded ACL is neither.
+///
+/// The [`copy_setid`] path withholds `S_ISUID`/`S_ISGID` from an ACL-bearing
+/// destination for the same reason, and the special-node path
+/// ([`super::copy_metadata`]'s `mknod` sibling) does run an `fchmod`, but only
+/// because a device node cannot carry an ACL for it to damage — there the
+/// `chmod` is wrapped so an ACL-governed refusal is tolerated rather than
+/// failing the copy.
 pub fn copy_permissions(
     src: BorrowedFd<'_>,
     dst: BorrowedFd<'_>,
@@ -187,15 +222,33 @@ pub fn copy_setid(
     Ok(())
 }
 
-/// Copy non-ACL, non-`system.*` xattrs from source to destination.
+/// Copy the source's xattrs to the destination, less the two namespaces a data
+/// copy has no business re-stamping.
+///
+/// `system.*` is skipped because the ACLs live there and [`copy_permissions`]
+/// owns them. `security.*` is skipped because it is where the kernel keeps
+/// authority, not data: `security.capability` is a file capability set, so
+/// copying it verbatim would transplant privilege onto a destination whose
+/// content came from the source — `cap_setuid+ep` on a binary the caller
+/// chose. The kernel gates the write on `CAP_SETFCAP` (`cap_convert_nscap`)
+/// rather than forbidding it, so a `copytree` running as root would carry it
+/// across; the ordering in [`super::copy_metadata`] deliberately lets the
+/// `fchown` strip that attribute, and re-adding it here would undo exactly
+/// that. `security.ima`/`.evm` are skipped for the same reason and because an
+/// EVM HMAC covers the inode it was computed over, so a copied one is invalid
+/// anyway; an LSM label belongs to whatever policy owns the destination.
+///
+/// This matches the refusal the asynchronous side already makes:
+/// `PrivilegedXattrs::allow_prefix` rejects the whole `security.` prefix.
+/// `truenas_os` copy.py and `cp --preserve=xattr` both copy the namespace —
+/// this is a deliberate divergence.
 pub fn copy_xattrs(
     src: BorrowedFd<'_>,
     dst: BorrowedFd<'_>,
     xattr_names: &[CString],
 ) -> Result<()> {
     for name in xattr_names {
-        if ACL_XATTRS.contains(&name.as_c_str())
-            || name.as_bytes().starts_with(b"system")
+        if ACL_XATTRS.contains(&name.as_c_str()) || is_reserved_namespace(name)
         {
             continue;
         }
