@@ -21,15 +21,17 @@
 
 use super::{Anchor, File, FsHandle, FsPending, Leaf, Personality};
 use crate::errno::{retry_on_eintr, Errno};
-use crate::sync_fs::xattr::{flistxattr, XATTR_SIZE_MAX};
+use crate::sync_fs::xattr::{
+    flistxattr, xattr_retry_cap, XATTR_SIZE_MAX, XATTR_SIZE_RETRIES,
+};
 use crate::sync_fs::{AtFlags, OFlag, OpenHow, Statx, StatxMask};
 use bitflags::bitflags;
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::ffi::{CStr, CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsString};
 use std::fmt;
 use std::os::fd::{AsFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 // The worker pool is loom-modelled (see `loom_tests` at the bottom), so its
 // primitives come from `crate::sync` — std's outside `--cfg loom`.
 use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -415,7 +417,7 @@ impl QueryDir {
             {
                 continue;
             }
-            out.push((OsStr::from_bytes(&bytes).to_os_string(), dtype));
+            out.push((OsString::from_vec(bytes), dtype));
         }
         Ok(out)
     }
@@ -812,7 +814,6 @@ fn refetch_grow(
     f: &File,
     name: &CStr,
 ) -> Option<Vec<u8>> {
-    const SIZE_RETRIES: u32 = 4;
     let mut tries = 0u32;
     loop {
         let (size, _) = h.fgetxattr(who, f, name, Vec::new());
@@ -820,19 +821,13 @@ fn refetch_grow(
         if size > XATTR_SIZE_MAX {
             return None;
         }
-        // Read at the probed size; on retry add half again so a value that
-        // grew since the probe still fits without another round trip.
-        let cap = if tries == 0 {
-            size.max(1)
-        } else {
-            (size + size / 2).clamp(1, XATTR_SIZE_MAX)
-        };
+        let cap = xattr_retry_cap(size, tries);
         let (n, buf) = h.fgetxattr(who, f, name, vec![0u8; cap]);
         match n {
             Ok(n) => return buf.get(..n).map(<[u8]>::to_vec),
             Err(crate::Error::Errno(Errno::ERANGE | Errno::E2BIG)) => {
                 tries += 1;
-                if tries >= SIZE_RETRIES {
+                if tries >= XATTR_SIZE_RETRIES {
                     return None;
                 }
             }

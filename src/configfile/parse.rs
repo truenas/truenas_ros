@@ -43,6 +43,30 @@ fn py_rstrip(s: &str) -> &str {
     s.trim_end_matches(is_py_space)
 }
 
+/// The current section as a duplicate-detection key.
+///
+/// Stands in for the section's name, which is what `configparser` keys
+/// `elements_added` by. The substitution is sound because the mapping is
+/// injective within one read: section indices are only ever appended, a
+/// repeated header is rejected before it gets here, and a section literally
+/// named DEFAULT is routed to [`Cur::Default`] rather than given an index.
+/// Being `Copy`, it costs no allocation per option line.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum SectionId {
+    Default,
+    At(usize),
+}
+
+impl SectionId {
+    fn of(cur: &Cur) -> SectionId {
+        match cur {
+            // Unreachable: an option with no open section is rejected above.
+            Cur::None | Cur::Default => SectionId::Default,
+            Cur::Section(i) => SectionId::At(*i),
+        }
+    }
+}
+
 /// Which section subsequent option/continuation lines belong to.
 enum Cur {
     None,
@@ -67,7 +91,7 @@ pub(super) fn read(
     // Fresh per read, so a section/option only conflicts within this document —
     // matching `configparser`'s per-`_read` `elements_added`.
     let mut added_sections: HashSet<String> = HashSet::new();
-    let mut added_options: HashSet<(String, String)> = HashSet::new();
+    let mut added_options: HashSet<(SectionId, String)> = HashSet::new();
     // Non-fatal option-syntax errors are collected and reported together at the
     // end (like `configparser`'s accumulated `ParsingError`).
     let mut parse_errors: Vec<String> = Vec::new();
@@ -105,10 +129,10 @@ pub(super) fn read(
             && optname.is_some()
             && cur_indent > indent_level;
         if is_continuation {
-            let name = optname.clone().unwrap();
+            let name = optname.as_deref().unwrap();
             let opts =
                 cur_opts(&mut work_default, &mut work_sections, &cur).unwrap();
-            match opts.get_mut(&name) {
+            match opts.get_mut(name) {
                 Some(Some(lines)) => lines.push(clean.to_string()),
                 _ => {
                     return Err(Error::Parse(format!(
@@ -157,8 +181,7 @@ pub(super) fn read(
             continue;
         }
 
-        let sect_name = current_section_name(&cur, &work_sections);
-        let dup_key = (sect_name, key.clone());
+        let dup_key = (SectionId::of(&cur), key.clone());
         if added_options.contains(&dup_key) {
             return Err(Error::Parse(format!(
                 "{source}:{lineno}: duplicate option {key:?}"
@@ -194,18 +217,6 @@ fn cur_opts<'a>(
         Cur::None => None,
         Cur::Default => Some(work_default),
         Cur::Section(i) => Some(&mut work_sections.entries[*i].1),
-    }
-}
-
-/// The name of the current section (used to key duplicate-option detection).
-fn current_section_name(
-    cur: &Cur,
-    work_sections: &Ordered<Ordered<Acc>>,
-) -> String {
-    match cur {
-        Cur::None => String::new(),
-        Cur::Default => DEFAULT_SECTION.to_string(),
-        Cur::Section(i) => work_sections.entries[*i].0.clone(),
     }
 }
 

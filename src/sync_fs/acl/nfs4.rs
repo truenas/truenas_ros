@@ -181,6 +181,17 @@ pub struct Nfs4Acl {
     pub aces: Vec<Nfs4Ace>,
 }
 
+/// Read the XDR wire's big-endian word at `i`.
+///
+/// Deliberately local, and not worth folding together with the readers in
+/// `acl::posix`, `sync_fs::iter`, `sync_fs::fhandle` or `uring_fs::query_tree`
+/// even though all five look alike. They do not agree on byte order — this one
+/// is big-endian because XDR is, the POSIX xattr is little-endian because the
+/// kernel writes it that way, and the resume tokens are native-endian because
+/// nothing outside the host reads them — so a shared reader is three readers,
+/// which is what these already are. It would also have to live somewhere all
+/// of `acl`, `fsiter`, `fhandle` and `uring-fs` can reach, and each of those
+/// is required to build on its own.
 #[inline]
 fn be32(b: &[u8], i: usize) -> u32 {
     u32::from_be_bytes(b[i..i + 4].try_into().unwrap())

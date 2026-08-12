@@ -42,11 +42,31 @@ pub fn fgetxattr<Fd: AsFd, N: ?Sized + TnPath>(
     name.with_tn_path(|name| fgetxattr_cstr(raw, name))?
 }
 
+/// How many times a value that keeps growing under the reader is re-probed
+/// before giving up.
+pub(crate) const XATTR_SIZE_RETRIES: u32 = 4;
+
+/// Buffer size for attempt `tries` at reading a value the kernel just sized at
+/// `size`.
+///
+/// At least one byte, so the pointer handed to the kernel is valid even for an
+/// empty value; from the first retry onward, half again, so a value growing
+/// steadily under the reader converges instead of spinning at exactly its last
+/// observed size. The async reader in `uring_fs::query_dir` runs the same
+/// policy over the ring, and the two are only comparable if they share this.
+pub(crate) fn xattr_retry_cap(size: usize, tries: u32) -> usize {
+    if tries == 0 {
+        size.max(1)
+    } else {
+        (size + size / 2).clamp(1, XATTR_SIZE_MAX)
+    }
+}
+
 fn fgetxattr_cstr(raw: RawFd, name: &CStr) -> errno::Result<Vec<u8>> {
     // A value that grows between the size probe and the read yields ERANGE;
     // retry a bounded number of times, over-allocating on retry so a steadily
     // growing value converges rather than spinning.
-    const SIZE_RETRIES: u32 = 4;
+    const SIZE_RETRIES: u32 = XATTR_SIZE_RETRIES;
     let mut tries = 0u32;
     loop {
         // Probe the current size.
@@ -56,13 +76,7 @@ fn fgetxattr_cstr(raw: RawFd, name: &CStr) -> errno::Result<Vec<u8>> {
         if size > XATTR_SIZE_MAX {
             return Err(Errno::E2BIG);
         }
-        // Allocate at least one byte so the pointer is valid; on a retry add
-        // half again so the read can absorb further growth.
-        let cap = if tries == 0 {
-            size.max(1)
-        } else {
-            (size + size / 2).clamp(1, XATTR_SIZE_MAX)
-        };
+        let cap = xattr_retry_cap(size, tries);
         let mut buf = vec![0u8; cap];
         let read = retry_on_eintr(|| unsafe {
             libc::fgetxattr(

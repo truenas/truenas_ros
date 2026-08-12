@@ -152,12 +152,9 @@ fn create_userns_fd(uid_text: &str, gid_text: &str) -> Result<OwnedFd> {
             0u32,
         );
     }
-    loop {
-        let r = unsafe { libc::waitpid(pid, ptr::null_mut(), 0) };
-        if r >= 0 || Errno::last() != Errno::EINTR {
-            break;
-        }
-    }
+    // SAFETY: waitpid on our own child; a NULL status pointer is allowed.
+    let _ =
+        retry_on_eintr(|| unsafe { libc::waitpid(pid, ptr::null_mut(), 0) });
     // SAFETY: closing our owned pidfd.
     unsafe { libc::close(pidfd) };
 
