@@ -72,14 +72,12 @@ pub const MAX_DEPTH: usize = 2048;
 
 /// Magic prefixing a [`TreeCursor::to_bytes`] blob (`"TnTc"`, host-endian).
 const CURSOR_MAGIC: u32 = u32::from_ne_bytes(*b"TnTc");
-/// The original [`TreeCursor`] format: a bare key.
-const CURSOR_V1: u16 = 1;
-/// The [`TreeCursor`] format carrying [`TreeCursor::skips_subtree`], written
-/// only when that bit is set so an ordinary token stays byte-identical to what
-/// [`CURSOR_V1`] produced.
-const CURSOR_V2: u16 = 2;
-/// [`CURSOR_V2`] flag: the key names a directory the caller pruned, so a resume
-/// must step over its subtree instead of entering it.
+/// On-disk [`TreeCursor`] format version. A blob declaring anything else is
+/// refused rather than guessed at: the token is persisted by whoever holds it
+/// and handed back later, so a format that changed under it must fail loudly.
+const CURSOR_VERSION: u16 = 1;
+/// Flag: the key names a directory the caller pruned, so a resume must step
+/// over its subtree instead of entering it.
 const CURSOR_FLAG_SKIP: u16 = 1 << 0;
 
 /// One entry from a [`QueryTree`], with where it sits in the subtree.
@@ -209,22 +207,22 @@ impl TreeCursor {
         self.key.is_empty()
     }
 
-    /// Serialize to a self-describing blob (magic, version, length-prefixed
-    /// raw bytes) suitable for persisting. Paths are stored as bytes, so
-    /// non-UTF-8 names round-trip exactly.
+    /// Serialize to a self-describing blob suitable for persisting: magic,
+    /// version, flags, then the length-prefixed key. Paths are stored as
+    /// bytes, so non-UTF-8 names round-trip exactly.
     ///
-    /// A cursor with no [`skips_subtree`](Self::skips_subtree) bit emits the
-    /// original version-1 blob byte for byte, so tokens already persisted by
-    /// an older build stay valid in both directions.
+    /// Exactly one blob encodes a given cursor, so two tokens naming the same
+    /// position compare equal as bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
+        let flags = if self.skip_subtree {
+            CURSOR_FLAG_SKIP
+        } else {
+            0
+        };
         let mut out = Vec::with_capacity(12 + self.key.len());
         out.extend_from_slice(&CURSOR_MAGIC.to_ne_bytes());
-        if self.skip_subtree {
-            out.extend_from_slice(&CURSOR_V2.to_ne_bytes());
-            out.extend_from_slice(&CURSOR_FLAG_SKIP.to_ne_bytes());
-        } else {
-            out.extend_from_slice(&CURSOR_V1.to_ne_bytes());
-        }
+        out.extend_from_slice(&CURSOR_VERSION.to_ne_bytes());
+        out.extend_from_slice(&flags.to_ne_bytes());
         out.extend_from_slice(&(self.key.len() as u32).to_ne_bytes());
         out.extend_from_slice(&self.key);
         out
@@ -237,7 +235,7 @@ impl TreeCursor {
         let bad = |why: &str| {
             Err(crate::Error::Validation(format!("tree cursor: {why}")))
         };
-        if data.len() < 10 {
+        if data.len() < 12 {
             return bad("truncated header");
         }
         let magic = u32::from_ne_bytes(data[0..4].try_into().unwrap());
@@ -245,36 +243,21 @@ impl TreeCursor {
             return bad(&format!("not a cursor blob (magic {magic:#010x})"));
         }
         let version = u16::from_ne_bytes(data[4..6].try_into().unwrap());
-        // The flags field is what v2 added, so the body starts two bytes later.
-        let (flags, body) = match version {
-            CURSOR_V1 => (0, 6),
-            CURSOR_V2 => {
-                if data.len() < 12 {
-                    return bad("truncated flags");
-                }
-                (u16::from_ne_bytes(data[6..8].try_into().unwrap()), 8)
-            }
-            v => return bad(&format!("unsupported version {v}")),
-        };
+        if version != CURSOR_VERSION {
+            return bad(&format!("unsupported version {version}"));
+        }
+        let flags = u16::from_ne_bytes(data[6..8].try_into().unwrap());
         // Refuse a bit this build does not understand rather than silently
         // resuming with a meaning the writer did not intend.
         if flags & !CURSOR_FLAG_SKIP != 0 {
             return bad(&format!("unknown flags {flags:#06x}"));
         }
-        // One encoding per cursor: `to_bytes` writes v2 only to carry a flag,
-        // so a flagless v2 blob is a value that would re-encode as v1. Refuse
-        // it rather than let two blobs mean the same position.
-        if version == CURSOR_V2 && flags == 0 {
-            return bad("version 2 with no flags is not canonical");
-        }
-        let len = u32::from_ne_bytes(data[body..body + 4].try_into().unwrap())
-            as usize;
-        let start = body + 4;
-        if data.len() != start + len {
+        let len = u32::from_ne_bytes(data[8..12].try_into().unwrap()) as usize;
+        if data.len() != 12 + len {
             return bad("length does not match the blob");
         }
         Ok(TreeCursor {
-            key: data[start..].to_vec(),
+            key: data[12..].to_vec(),
             skip_subtree: flags & CURSOR_FLAG_SKIP != 0,
         })
     }
@@ -403,11 +386,17 @@ impl QueryTree {
 
     /// The next entry in path order, or `None` at the end of the subtree.
     ///
-    /// A subtree the walk's identity may not enter (`EACCES`/`EPERM`) is
-    /// **skipped**, matching the per-entry permission behavior elsewhere in
-    /// this module. Any other failure to open or read a level — fd
-    /// exhaustion, I/O, a mount not crossed — is surfaced as `Some(Err)`, so
-    /// an incomplete walk is never mistaken for a fully listed one.
+    /// A subtree with nothing left to list is **skipped**: one this identity
+    /// may not enter (`EACCES`/`EPERM`), matching the per-entry permission
+    /// behavior elsewhere in this module, or one removed out from under the
+    /// walk (`ENOENT`). Any failure that leaves the walk *unable to see* what
+    /// is there — fd exhaustion, I/O, a mount not crossed, a directory
+    /// replaced by something else — is surfaced as `Some(Err)`, so an
+    /// incomplete walk is never mistaken for a fully listed one. See
+    /// [`is_subtree_skip`] for which is which and why.
+    ///
+    /// A surfaced descent failure is per-subtree, not terminal: the walk
+    /// resumes in the parent on the next call.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<crate::Result<TreeEntry>> {
         if self.fatal {
@@ -460,7 +449,7 @@ impl QueryTree {
     }
 
     /// Open `path`'s directory relative to the current top frame and push it.
-    /// A directory the walk's identity may not enter (`EACCES`/`EPERM`) is
+    /// A directory that is forbidden or already gone ([`is_subtree_skip`]) is
     /// skipped silently; any other open failure is returned so the walk does
     /// not continue as though the subtree were empty.
     fn descend(&mut self, path: &[u8]) -> crate::Result<()> {
@@ -492,18 +481,36 @@ impl QueryTree {
                 self.stack.push(frame);
                 Ok(())
             }
-            // A forbidden subtree drops out of the listing; a failing walk
+            // A subtree with nothing to list drops out quietly; a failing walk
             // (fd exhaustion, I/O, a mount point not crossed) must not.
-            Err(e) if is_permission_skip(&e) => Ok(()),
+            Err(e) if is_subtree_skip(&e) => Ok(()),
             Err(e) => Err(e),
         }
     }
 }
 
-/// Whether an open failure means "this identity may not enter this subtree"
-/// (skipped, as documented) rather than "the walk is failing" (surfaced).
-fn is_permission_skip(e: &crate::Error) -> bool {
-    matches!(e, crate::Error::Errno(Errno::EACCES | Errno::EPERM))
+/// Whether failing to open a level means **there is nothing there to list**,
+/// so the subtree drops out quietly, rather than **the walk cannot see what is
+/// there**, which has to surface.
+///
+/// * `EACCES`/`EPERM` — this identity may not enter. The documented
+///   per-identity behaviour: a permission-filtered listing, matching how a
+///   denial surfaces per-entry elsewhere in this module.
+/// * `ENOENT` — the directory was removed between the parent's `readdir` and
+///   the deferred descent. There is no subtree left to list, and a walk over a
+///   live tree hits this routinely, so failing the whole listing over one
+///   ordinary race would make the walk unusable on anything being written to.
+///
+/// `ENOTDIR` is deliberately **not** here even though it is also a race. The
+/// name still exists, but as something other than a directory — and the walk
+/// has already emitted it with a directory key, so the listing now contains a
+/// claim the filesystem contradicts. That is worth telling the caller about;
+/// a vanished entry is not.
+fn is_subtree_skip(e: &crate::Error) -> bool {
+    matches!(
+        e,
+        crate::Error::Errno(Errno::EACCES | Errno::EPERM | Errno::ENOENT)
+    )
 }
 
 /// Open one directory level and build its frame.
@@ -665,19 +672,19 @@ pub fn query_tree(
 mod tests {
     use super::*;
 
-    /// Both halves of the descent contract. A subtree this identity may not
-    /// enter drops out of the listing, as the docs promise; everything else —
-    /// fd exhaustion, a mount not crossed, I/O — is a failing walk and must
-    /// surface, or a partial listing reads as a complete one. The integration
-    /// side of this lives in `test/uring_fs.rs`, which forces a real `EMFILE`;
-    /// this pins the predicate itself, including on an unprivileged runner
-    /// where root cannot provoke an `EACCES`.
+    /// Both halves of the descent contract. A subtree with nothing left to
+    /// list drops out quietly; anything that leaves the walk unable to see
+    /// what is there must surface, or a partial listing reads as a complete
+    /// one. Pinned here as a predicate because the interesting errnos are
+    /// awkward to provoke for real — fd exhaustion is process-wide, `EACCES`
+    /// needs a non-root runner — while the integration side in
+    /// `test/uring_fs.rs` drives the two races end to end.
     #[test]
-    fn only_a_permission_denial_skips_a_subtree() {
-        for e in [Errno::EACCES, Errno::EPERM] {
+    fn a_subtree_is_skipped_only_when_nothing_is_left_to_list() {
+        for e in [Errno::EACCES, Errno::EPERM, Errno::ENOENT] {
             assert!(
-                is_permission_skip(&crate::Error::Errno(e)),
-                "{e:?} is the documented per-identity skip"
+                is_subtree_skip(&crate::Error::Errno(e)),
+                "{e:?} leaves no subtree to list, so it drops out quietly"
             );
         }
         for e in [
@@ -687,15 +694,20 @@ mod tests {
             Errno::EIO,
             Errno::ENOMEM,
             Errno::ELOOP,
+            // The name is still there, but no longer a directory — and the
+            // walk already emitted it with a directory key, so the caller is
+            // holding a claim the filesystem now contradicts.
+            Errno::ENOTDIR,
         ] {
             assert!(
-                !is_permission_skip(&crate::Error::Errno(e)),
-                "{e:?} means the walk is failing, not that a subtree is closed"
+                !is_subtree_skip(&crate::Error::Errno(e)),
+                "{e:?} means the walk cannot see the subtree, not that it is \
+                 empty"
             );
         }
         assert!(
-            !is_permission_skip(&crate::Error::Validation("x".into())),
-            "a non-errno failure is never a permission skip"
+            !is_subtree_skip(&crate::Error::Validation("x".into())),
+            "a non-errno failure is never a quiet skip"
         );
     }
 
@@ -726,9 +738,9 @@ mod tests {
         trailing.push(0);
         assert!(TreeCursor::from_bytes(&trailing).is_err());
 
-        // A v2 blob cut off inside the flags field it added.
-        let short_v2 = TreeCursor::from_key("x/").skipping_subtree().to_bytes();
-        assert!(TreeCursor::from_bytes(&short_v2[..7]).is_err());
+        // Cut off inside the flags word.
+        let short = TreeCursor::from_key("x/").skipping_subtree().to_bytes();
+        assert!(TreeCursor::from_bytes(&short[..9]).is_err());
         // A flag this build does not know is refused, not ignored: resuming
         // with a meaning the writer did not intend would mis-list silently.
         let mut unknown =
@@ -738,36 +750,23 @@ mod tests {
     }
 
     /// The skip bit is what makes folding and paging compose, so it has to
-    /// survive the round-trip — and cost nothing when unset. A token without
-    /// it must stay byte-identical to the version-1 blob, so a cursor already
-    /// persisted by an older build still decodes and this build's ordinary
-    /// tokens still decode there.
+    /// survive the round-trip and it has to be part of the cursor's identity
+    /// — two cursors on the same key that resume differently are not the same
+    /// cursor, and must not encode to the same bytes.
     #[test]
-    fn the_skip_bit_round_trips_without_disturbing_the_v1_format() {
+    fn the_skip_bit_survives_a_round_trip_and_distinguishes_two_cursors() {
         let plain = TreeCursor::from_key("a/");
-        assert!(!plain.skips_subtree());
-        assert_eq!(
-            u16::from_ne_bytes(plain.to_bytes()[4..6].try_into().unwrap()),
-            CURSOR_V1,
-            "a cursor with no skip bit must still write version 1"
-        );
-        assert_eq!(plain.to_bytes().len(), 10 + 2);
-
         let folded = TreeCursor::from_key("a/").skipping_subtree();
+        assert!(!plain.skips_subtree());
         assert!(folded.skips_subtree());
-        assert_ne!(folded, plain, "the bit is part of the cursor's identity");
-        let blob = folded.to_bytes();
-        assert_eq!(
-            u16::from_ne_bytes(blob[4..6].try_into().unwrap()),
-            CURSOR_V2
-        );
-        let back = TreeCursor::from_bytes(&blob).expect("round trip");
-        assert_eq!(back, folded);
-        assert_eq!(back.key(), b"a/");
+        assert_ne!(folded, plain);
+        assert_ne!(folded.to_bytes(), plain.to_bytes());
 
-        // A v1 blob decodes with the bit clear, which is the old behaviour.
-        let v1 = TreeCursor::from_bytes(&plain.to_bytes()).expect("v1");
-        assert!(!v1.skips_subtree());
+        for c in [&plain, &folded] {
+            let back = TreeCursor::from_bytes(&c.to_bytes()).expect("decode");
+            assert_eq!(&back, c, "cursor does not round-trip");
+            assert_eq!(back.key(), b"a/");
+        }
 
         // Nothing to skip past on a file key, so the bit does not attach.
         assert!(!TreeCursor::from_key("a.txt")

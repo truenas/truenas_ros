@@ -3,13 +3,11 @@
 //! Fuzz the subtree-walk resume cursor.
 //!
 //! Same provenance as the iterator cookie — persisted, handed back later — and
-//! the same exact framing: magic, version, a `u32` length, then that many raw
-//! key bytes, with a length disagreeing with the blob rejected. Version 2
-//! inserts a `u16` of flags and is written *only* to carry one, so the
-//! encoding stays canonical — one blob per cursor. That is what makes the
-//! round trip strict: anything accepted must re-encode byte-identically,
-//! which catches both a flag dropped on decode and a flagless v2 blob
-//! accepted as an alias for the v1 form.
+//! the same exact framing: magic, version, a `u16` of flags, a `u32` length,
+//! then that many raw key bytes, with a length disagreeing with the blob
+//! rejected. Exactly one blob encodes a given cursor, so the round trip is
+//! strict: anything accepted must re-encode byte-identically, which catches a
+//! flag dropped on decode as readily as a mangled key.
 //!
 //! The key itself is a `/`-separated path that drives the walk's descent, so it
 //! is also checked here that a cursor built directly from arbitrary bytes

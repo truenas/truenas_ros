@@ -154,8 +154,8 @@ pub fn copyfile(
 ///
 /// `S_ISVTX` is a mode bit with no ACL representation, and on the ACL path no
 /// `fchmod` runs, so a sticky source directory that also carries an access ACL
-/// produces a destination with `S_ISVTX` clear. **This is deliberate, not an
-/// oversight.**
+/// produces a destination with `S_ISVTX` clear. The bit is given up on
+/// purpose: carrying it costs the ACL.
 ///
 /// Restoring it would mean an `fchmod` on exactly the objects this branch
 /// exists to keep away from one, and on ZFS a `chmod` is never just a mode
@@ -231,11 +231,11 @@ pub fn copy_setid(
 /// copying it verbatim would transplant privilege onto a destination whose
 /// content came from the source — `cap_setuid+ep` on a binary the caller
 /// chose. The kernel gates the write on `CAP_SETFCAP` (`cap_convert_nscap`)
-/// rather than forbidding it, so a `copytree` running as root would carry it
-/// across; the ordering in [`super::copy_metadata`] deliberately lets the
-/// `fchown` strip that attribute, and re-adding it here would undo exactly
-/// that. `security.ima`/`.evm` are skipped for the same reason and because an
-/// EVM HMAC covers the inode it was computed over, so a copied one is invalid
+/// rather than forbidding it, so a `copytree` running as root can carry it
+/// across — and [`super::copy_metadata`] orders the `fchown` so the kernel
+/// strips the attribute, which only holds if nothing puts it back afterwards.
+/// `security.ima`/`.evm` are skipped for the same reason and because an EVM
+/// HMAC covers the inode it was computed over, so a copied one is invalid
 /// anyway; an LSM label belongs to whatever policy owns the destination.
 ///
 /// This matches the refusal the asynchronous side already makes:

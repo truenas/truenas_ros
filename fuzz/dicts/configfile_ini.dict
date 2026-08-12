@@ -1,0 +1,13 @@
+# src/configfile — the configparser-compatible grammar. See the note in
+# http.dict on escapes: only \\ , \" and \xAB are understood.
+section_open="["
+section_close="]"
+assign="="
+assign_colon=":"
+comment_hash="#"
+comment_semi=";"
+default_section="[DEFAULT]"
+interp_open="%("
+interp_close=")s"
+interp_escape="%%"
+continuation="\x0a "

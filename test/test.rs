@@ -1359,9 +1359,9 @@ mod shutil {
     }
 
     // The sticky bit has no ACL representation, and no chmod runs on the ACL
-    // path, so an ACL-bearing sticky directory arrives without S_ISVTX. That
-    // is the decided trade, not an oversight: on ZFS a chmod rewrites the ACL
-    // to match the mode — under the default aclmode=discard it replaces it
+    // path, so an ACL-bearing sticky directory arrives without S_ISVTX. The
+    // bit is given up to keep the ACL: on ZFS a chmod rewrites the ACL to
+    // match the mode — under the default aclmode=discard it replaces it
     // outright — so restoring one bit would destroy the ACL the copy just
     // carried. Pinned here so the trade stays a decision.
     #[test]

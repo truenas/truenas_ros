@@ -1,0 +1,11 @@
+# src/sync_fs/acl/posix.rs — system.posix_acl_access: a u32 version then
+# 8-byte entries of {u16 tag, u16 perm, u32 id}.
+version_2="\x02\x00\x00\x00"
+tag_user_obj="\x01\x00"
+tag_user="\x02\x00"
+tag_group_obj="\x04\x00"
+tag_group="\x08\x00"
+tag_mask="\x10\x00"
+tag_other="\x20\x00"
+perm_rwx="\x07\x00"
+undefined_id="\xff\xff\xff\xff"

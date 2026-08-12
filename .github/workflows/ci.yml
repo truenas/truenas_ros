@@ -112,25 +112,37 @@ jobs:
         RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
 
     # The fuzz crate is self-rooted (its own workspace), so nothing above ever
-    # compiles it — a target could bit-rot against an API change and no one would
-    # know until someone ran a campaign by hand. Build every target, then replay
-    # the checked-in seed corpora with `-runs=0`: a deterministic regression pass
-    # over known-interesting inputs, no time budget, seconds to run. Finding *new*
-    # bugs is a job for a real campaign, not for CI.
-    - name: fuzz (build + replay seed corpora)
+    # compiles it — a target could bit-rot against an API change and no one
+    # would know until someone ran a campaign by hand. Building every target is
+    # what this step is really for.
+    #
+    # The short run after it is a smoke test, not a regression suite: ten
+    # seconds is enough to catch a harness that builds but aborts immediately
+    # (a bad assertion, a panic on the empty input), and nothing more. It
+    # explores a different slice each time and is not expected to reproduce
+    # anything in particular — regressions belong in `cargo test`, where a
+    # failure names the invariant instead of printing a hex blob. Real
+    # bug-finding wants a campaign, not a CI job.
+    #
+    # A target with tracked seeds starts from them; the rest start from empty.
+    - name: fuzz (build + smoke)
       run: |
         rustup toolchain install nightly --profile minimal
         command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
         cd fuzz
         cargo +nightly fuzz build
         for t in $(cargo +nightly fuzz list); do
-          if [ -d "corpus/$t" ]; then
-            echo "::group::replay $t"
-            cargo +nightly fuzz run "$t" "corpus/$t" -- -runs=0
-            echo "::endgroup::"
-          else
-            echo "::warning::no seed corpus for fuzz target $t"
-          fi
+          # Targets share a dictionary where they share a wire format.
+          dict=dicts/$t.dict
+          case "$t" in http_*) dict=dicts/http.dict ;; esac
+          args=""
+          [ -f "$dict" ] && args="-dict=$dict"
+          seeds=""
+          [ -d "corpus/$t" ] && seeds="corpus/$t"
+          echo "::group::smoke $t"
+          # shellcheck disable=SC2086
+          cargo +nightly fuzz run "$t" $seeds -- -max_total_time=10 -print_final_stats=1 $args
+          echo "::endgroup::"
         done
 
     # Each feature alone proves the per-subsystem gates and dependency edges

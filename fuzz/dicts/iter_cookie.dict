@@ -1,0 +1,5 @@
+# src/sync_fs/iter.rs — resume cookie: magic, version, per-level entries.
+magic="TnCk"
+version_1="\x01\x00"
+depth_1="\x01\x00\x00\x00"
+sep="/"

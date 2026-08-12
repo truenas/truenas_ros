@@ -1,0 +1,7 @@
+# src/sync_fs/acl/nfs4.rs — system.nfs4_acl_xdr: 8-byte header then 20-byte
+# ACEs of {type, flag, iflag, access_mask, who_id}.
+ace_type_allow="\x00\x00\x00\x00"
+ace_type_deny="\x00\x00\x00\x01"
+iflag_special="\x00\x00\x00\x01"
+who_owner="\x00\x00\x00\x00"
+count_1="\x00\x00\x00\x01"
