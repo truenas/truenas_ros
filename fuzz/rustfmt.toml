@@ -1,0 +1,4 @@
+# The fuzz harnesses are a separate workspace, so the crate root's config does
+# not reach them and `cargo fmt` here would silently reflow every target to
+# rustfmt's 100-column default. Keep them at the library's width.
+max_width = 80

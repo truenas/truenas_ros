@@ -32,7 +32,8 @@ fn value_is_safe(v: &str) -> bool {
     }
     !v.is_empty()
         && v.len() % 2 == 0
-        && v.bytes().all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
+        && v.bytes()
+            .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
 }
 
 fuzz_target!(|input: (
@@ -115,8 +116,7 @@ fuzz_target!(|input: (
             .split_once('=')
             .unwrap_or_else(|| panic!("token is not key=value: {token:?}"));
         assert!(
-            key.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+            key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
             "key was not sanitized: {key:?}"
         );
         if i == 0 {
@@ -138,10 +138,7 @@ fuzz_target!(|input: (
                 "the record must close with the outcome: {msg:?}"
             );
         } else {
-            assert!(
-                value_is_safe(value),
-                "unsafe value for {key}: {value:?}"
-            );
+            assert!(value_is_safe(value), "unsafe value for {key}: {value:?}");
         }
     }
 

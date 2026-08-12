@@ -34,9 +34,7 @@ fuzz_target!(|data: &[u8]| {
     // whose `who_id` is not a valid uid/gid, and a decoded one always is (the
     // wire field is a u32 widened to i64), so a failure here is a real
     // read-but-cannot-write asymmetry.
-    let enc = acl
-        .to_xattr()
-        .expect("a decoded ACL must be re-encodable");
+    let enc = acl.to_xattr().expect("a decoded ACL must be re-encodable");
     assert_eq!(
         enc.len(),
         HDR_SZ + ACE_SZ * acl.aces.len(),
@@ -73,8 +71,7 @@ fuzz_target!(|data: &[u8]| {
             .to_xattr()
             .expect("an inherited ACL must be re-encodable");
         assert_eq!(
-            Nfs4Acl::from_xattr(&cenc)
-                .expect("inherited ACL must re-decode"),
+            Nfs4Acl::from_xattr(&cenc).expect("inherited ACL must re-decode"),
             child,
             "inherited ACL does not round-trip"
         );

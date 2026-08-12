@@ -48,8 +48,13 @@ jobs:
           fuzz/target
         key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
 
+    # The fuzz crate is its own workspace, so `--all` here does not reach it and
+    # a stray `cargo fmt` run from inside it would silently reflow every target
+    # to rustfmt's 100-column default. Check it explicitly.
     - name: rustfmt
-      run: cargo fmt --all --check
+      run: |
+        cargo fmt --all --check
+        cargo fmt --all --check --manifest-path fuzz/Cargo.toml
 
     - name: clippy
       run: cargo clippy --all-features --all-targets -- -D warnings

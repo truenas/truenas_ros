@@ -67,9 +67,5 @@ fuzz_target!(|input: &[u8]| {
     // exactly, and encoding again is a fixed point.
     let again = FileHandle::from_bytes(&enc, mount_id, unique_mount_id)
         .expect("an encoded handle must decode");
-    assert_eq!(
-        again.to_bytes(),
-        enc,
-        "encoding is not a fixed point"
-    );
+    assert_eq!(again.to_bytes(), enc, "encoding is not a fixed point");
 });

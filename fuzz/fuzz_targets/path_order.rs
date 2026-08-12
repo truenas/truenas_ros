@@ -36,10 +36,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let mut names = rest.split(|&b| b == 0xff);
     let mut next = |bit: u8| -> Entry {
-        (
-            names.next().unwrap_or_default().to_vec(),
-            flags & bit != 0,
-        )
+        (names.next().unwrap_or_default().to_vec(), flags & bit != 0)
     };
     let (a, b, c) = (next(1), next(2), next(4));
 
@@ -87,7 +84,8 @@ fuzz_target!(|data: &[u8]| {
     let mut all = vec![a, b, c];
     all.sort_by(cmp);
     assert!(
-        all.windows(2).all(|w| cmp(&w[0], &w[1]) != Ordering::Greater),
+        all.windows(2)
+            .all(|w| cmp(&w[0], &w[1]) != Ordering::Greater),
         "sort_by left the entries out of order: {all:?}"
     );
 });

@@ -1002,6 +1002,35 @@ fn drop_setid_caps() -> errno::Result<()> {
             data.as_ptr(),
         )
     })?;
+    // Effective/permitted/inheritable are not the whole story: a process whose
+    // real or effective uid is 0 has its permitted set recomputed as
+    // `cap_combine(cap_bset, cap_inheritable)` on the next `execve` (the
+    // kernel's `handle_privileged_root`, security/commoncap.c), so a bounding
+    // set that still holds these caps hands them straight back after any exec.
+    // Drop them from the bounding set too, so the drop survives an exec.
+    //
+    // `PR_CAPBSET_DROP` needs `CAP_SETPCAP`, which an unprivileged caller does
+    // not have. Testing `PR_CAPBSET_READ` first would not help: the bounding
+    // set of an ordinary process is *full*, so the read reports the cap present
+    // and the drop then fails `EPERM`. Key the tolerance on the uid instead,
+    // because that is what the kernel's recompute is keyed on — a reactor that
+    // is not root has nothing to regain, so a refused drop costs it nothing.
+    // A root reactor that cannot drop really has lost the guarantee this
+    // module promises, so there the error surfaces and `spawn` fails.
+    const PR_CAPBSET_DROP: libc::c_long = 24;
+    let is_root = raw_getuid() == 0 || raw_geteuid() == 0;
+    for cap in [CAP_SETUID, CAP_SETGID] {
+        // SAFETY: prctl with scalar arguments.
+        let rc = unsafe {
+            libc::syscall(libc::SYS_prctl, PR_CAPBSET_DROP, cap as libc::c_long)
+        };
+        if rc != 0 {
+            let e = Errno::last();
+            if is_root || e != Errno::EPERM {
+                return Err(e);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1323,6 +1352,11 @@ fn raw_geteuid() -> u32 {
     unsafe { libc::syscall(libc::SYS_geteuid) as u32 }
 }
 
+fn raw_getuid() -> u32 {
+    // SAFETY: `getuid` takes no arguments and cannot fail.
+    unsafe { libc::syscall(libc::SYS_getuid) as u32 }
+}
+
 fn raw_getegid() -> u32 {
     // SAFETY: `getegid` takes no arguments and cannot fail.
     unsafe { libc::syscall(libc::SYS_getegid) as u32 }
@@ -1539,6 +1573,90 @@ mod tests {
         );
         assert!(out < 0, "sentinel plus caps must still be refused: {out}");
         assert_eq!(raw_geteuid(), 0, "euid restored after the caps refusal");
+    }
+
+    /// `drop_setid_caps` must clear CAP_SETUID/CAP_SETGID from the **bounding
+    /// set**, not only effective/permitted/inheritable. A process whose real or
+    /// effective uid is 0 regains its bounding set into `permitted` on the next
+    /// `execve` (`handle_privileged_root`, `security/commoncap.c`), so a
+    /// bounding set that still carried these caps would undo the drop the
+    /// module promises is permanent. Root-only: the drop needs the caps present
+    /// and CAP_SETPCAP to leave the bounding set. Done in a forked child
+    /// because the drop is irreversible.
+    #[test]
+    fn drop_setid_caps_clears_the_bounding_set() {
+        const CAP_SETGID: libc::c_long = 6;
+        const CAP_SETUID: libc::c_long = 7;
+        const PR_CAPBSET_READ: libc::c_long = 23;
+        if raw_geteuid() != 0 {
+            return;
+        }
+        // SAFETY: fork; the child only makes async-signal-safe syscalls and
+        // `_exit`s, so it is sound from a threaded test harness.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            let ok = drop_setid_caps().is_ok();
+            // SAFETY: prctl with scalar arguments.
+            let u = unsafe {
+                libc::syscall(libc::SYS_prctl, PR_CAPBSET_READ, CAP_SETUID)
+            };
+            // SAFETY: prctl with scalar arguments.
+            let g = unsafe {
+                libc::syscall(libc::SYS_prctl, PR_CAPBSET_READ, CAP_SETGID)
+            };
+            // SAFETY: `_exit` in a forked child; runs no destructors.
+            unsafe { libc::_exit(i32::from(!(ok && u == 0 && g == 0))) }
+        }
+        let mut status = 0;
+        // SAFETY: valid pid and status pointer.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "CAP_SETUID/CAP_SETGID must be gone from the bounding set after \
+             drop_setid_caps, else a uid-0 execve restores them"
+        );
+    }
+
+    /// The other half of the bounding-set drop: an unprivileged caller must
+    /// still get `Ok`.
+    ///
+    /// `spawn`'s contract says a process that was already unprivileged simply
+    /// has nothing to drop, and `drop_setid_caps` failing makes `spawn` fatal.
+    /// `PR_CAPBSET_DROP` needs `CAP_SETPCAP`, and an ordinary process's
+    /// bounding set is *full* — so reading the cap first and dropping only when
+    /// present would `EPERM` here rather than skip. The uid is what the
+    /// kernel's regain path is keyed on, so it is what the tolerance is keyed
+    /// on. Root-only because it has to shed privilege to test the shed.
+    #[test]
+    fn drop_setid_caps_tolerates_an_unprivileged_caller() {
+        if raw_geteuid() != 0 {
+            return;
+        }
+        // SAFETY: fork; the child only makes async-signal-safe syscalls and
+        // `_exit`s, so it is sound from a threaded test harness.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            // Become nobody: no CAP_SETPCAP, but a still-full bounding set.
+            // SAFETY: scalar arguments; the child exits either way.
+            let dropped = unsafe {
+                libc::syscall(libc::SYS_setresuid, 65534, 65534, 65534)
+            };
+            let ok = dropped == 0 && drop_setid_caps().is_ok();
+            // SAFETY: `_exit` in a forked child; runs no destructors.
+            unsafe { libc::_exit(i32::from(!ok)) }
+        }
+        let mut status = 0;
+        // SAFETY: valid pid and status pointer.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "an unprivileged drop_setid_caps must succeed: spawn treats a \
+             failure as fatal, and a non-root reactor has nothing to regain"
+        );
     }
 
     /// Pin the kernel behaviour that shapes this whole module: an io_uring

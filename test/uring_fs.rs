@@ -3341,6 +3341,67 @@ fn paging_with_a_cursor_reproduces_the_walk_exactly() {
     });
 }
 
+/// `skip_descent` and `cursor` are both documented delimiter primitives, so
+/// the obvious composition of them — fold a directory into a common prefix,
+/// then page — has to work. It is the page boundary that makes it hard: the
+/// walk emits a directory *before* its contents, so a cursor sitting on a
+/// folded directory is positioned at the start of the subtree the caller just
+/// said to skip. Resuming there must not re-enter it, and must not re-emit
+/// the directory either.
+#[test]
+fn a_folded_subtree_stays_folded_across_a_page_boundary() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        make_tree(&dir);
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        // What one uninterrupted walk yields when every directory is pruned.
+        let expected = ["a-1.txt", "a.txt", "a/", "aa.txt", "z/"];
+
+        for page in 1..=expected.len() {
+            let mut paged: Vec<String> = Vec::new();
+            let mut resume: Option<TreeCursor> = None;
+            loop {
+                let mut t = query_tree(
+                    &h,
+                    me,
+                    &anchor,
+                    TreeOptions {
+                        resume: resume.clone(),
+                        ..Default::default()
+                    },
+                )
+                .expect("query_tree");
+                let mut n = 0;
+                while n < page {
+                    match t.next() {
+                        Some(e) => {
+                            let e = e.expect("entry");
+                            let is_dir = e.is_dir();
+                            paged.push(String::from_utf8(e.key()).unwrap());
+                            if is_dir {
+                                t.skip_descent();
+                            }
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+                // Round-trip the token, since a real pager persists it.
+                let blob = t.cursor().to_bytes();
+                resume = Some(
+                    TreeCursor::from_bytes(&blob).expect("cursor decodes"),
+                );
+            }
+            assert_eq!(
+                paged, expected,
+                "folding every directory, {page} entries at a time"
+            );
+        }
+    });
+}
+
 /// A cursor survives serialization, so a listing can be resumed by a later
 /// request — or a later process — and not just within one walk.
 #[test]
@@ -3537,5 +3598,55 @@ fn fremovexattr_removes_allowlisted_attributes() {
         // Removing what is not there is an error, not a silent success.
         assert!(h.fremovexattr(&f, &owned).is_err());
         h.close(f).unwrap();
+    });
+}
+
+/// A subtree that cannot be *opened* for a non-permission reason must surface
+/// as an error, not vanish from the walk the way the readdir path already
+/// refuses to. A silently dropped subtree is data loss for the recursive
+/// delete/copy this walk backs.
+///
+/// The trigger is a real race: a directory is yielded, and the descent into it
+/// is deferred to the next call so `skip_descent` can cancel it — swap the
+/// directory for a regular file inside that window and the deferred
+/// `O_DIRECTORY` open fails `ENOTDIR`. Deliberately a *local* provocation.
+/// Exhausting the fd table would do it too, but the fd table belongs to the
+/// process and `cargo test` runs tests as threads in one, so a walk that
+/// dup-bombs starves whatever else is running: under a 1024 fd limit that
+/// reliably fails an unrelated test in this binary, and picks a different one
+/// each run.
+#[test]
+fn descend_open_failure_surfaces_rather_than_dropping_the_subtree() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/f.txt"), b"x").unwrap();
+        std::fs::write(dir.join("z.txt"), b"x").unwrap();
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+
+        let mut t = query_tree(&h, me, &anchor, TreeOptions::default())
+            .expect("query_tree");
+        // "sub/" sorts before "z.txt"; its descent is deferred to the next call.
+        assert_eq!(t.next().expect("some").expect("ok").key(), b"sub/");
+
+        // The window: replace the directory with a regular file of the same
+        // name, so the deferred open of "sub" cannot be a directory open.
+        std::fs::remove_file(dir.join("sub/f.txt")).unwrap();
+        std::fs::remove_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub"), b"x").unwrap();
+
+        match t.next() {
+            // triggers descend("sub")
+            Some(Err(Error::Errno(Errno::ENOTDIR))) => {}
+            other => panic!(
+                "an unopenable subtree must surface an error, got {other:?}"
+            ),
+        }
+        // The error is per-subtree, not fatal: the walk carries on in the
+        // parent with the sibling it had already read.
+        assert_eq!(
+            t.next().expect("some").expect("ok").key(),
+            b"z.txt",
+            "a surfaced descend failure must not end the walk"
+        );
     });
 }

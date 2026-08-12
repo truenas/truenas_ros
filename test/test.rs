@@ -935,6 +935,7 @@ mod mount_helpers {
 
 #[cfg(feature = "shutil")]
 mod shutil {
+    use std::ffi::CStr;
     use std::os::unix::fs::PermissionsExt;
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::shutil::{
@@ -991,6 +992,89 @@ mod shutil {
             (n, &buf[..1.max(n.max(0) as usize)]),
             (1, &b"v"[..]),
             "a non-UTF-8 xattr name must survive the copy verbatim",
+        );
+    }
+
+    // `security.capability` is a file capability set, so carrying it across a
+    // copy would stamp privilege onto a destination whose content came from the
+    // source. The kernel permits the write (it only asks for `CAP_SETFCAP`), so
+    // refusing it is the copier's job — the same refusal the asynchronous side
+    // makes in `PrivilegedXattrs::allow_prefix`. The `user.` attribute alongside
+    // it must still arrive, or this would pass on a copy that did nothing.
+    #[test]
+    fn a_file_capability_does_not_survive_a_copy() {
+        use std::os::fd::AsRawFd;
+        // `struct vfs_cap_data`, VFS_CAP_REVISION_2 with the effective bit and
+        // CAP_SETUID (7) permitted: magic_etc, then two {permitted,inheritable}
+        // words, all little-endian.
+        const CAP_SETUID_EP: [u8; 20] = [
+            0x01, 0x00, 0x00, 0x02, // VFS_CAP_REVISION_2 | EFFECTIVE
+            0x80, 0x00, 0x00, 0x00, // permitted  = 1 << CAP_SETUID
+            0x00, 0x00, 0x00, 0x00, // inheritable
+            0x00, 0x00, 0x00, 0x00, // permitted  (high word)
+            0x00, 0x00, 0x00, 0x00, // inheritable (high word)
+        ];
+        let setxattr = |fd: &std::fs::File, name: &CStr, val: &[u8]| -> i32 {
+            // SAFETY: `fd` is live; name and value pointers are valid here.
+            unsafe {
+                libc::fsetxattr(
+                    fd.as_raw_fd(),
+                    name.as_ptr(),
+                    val.as_ptr().cast(),
+                    val.len(),
+                    0,
+                )
+            }
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("bin"), b"#!/bin/sh\n").unwrap();
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(src.join("bin"))
+            .unwrap();
+        if setxattr(&f, c"security.capability", &CAP_SETUID_EP) != 0 {
+            return; // needs CAP_SETFCAP, or the fs has no security namespace
+        }
+        if setxattr(&f, c"user.marker", b"v") != 0 {
+            return; // the filesystem rejects `user.` xattrs here
+        }
+        drop(f);
+
+        let dst = tmp.path().join("dst");
+        copytree(&src, &dst, &CopyTreeConfig::default()).unwrap();
+
+        let d = std::fs::File::open(dst.join("bin")).unwrap();
+        let getxattr = |name: &CStr| -> (isize, i32) {
+            let mut buf = [0u8; 32];
+            // SAFETY: `d` is live; name and buffer are valid for the call.
+            let n = unsafe {
+                libc::fgetxattr(
+                    d.as_raw_fd(),
+                    name.as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                )
+            };
+            (
+                n,
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            )
+        };
+
+        let (n, err) = getxattr(c"security.capability");
+        assert_eq!(
+            (n, err),
+            (-1, libc::ENODATA),
+            "a file capability must not be transplanted onto the copy"
+        );
+        assert_eq!(
+            getxattr(c"user.marker").0,
+            1,
+            "the copy dropped every xattr, so the check above proves nothing"
         );
     }
 
@@ -1271,6 +1355,83 @@ mod shutil {
             copied.metadata().unwrap().permissions().mode() & 0o7000,
             0,
             "an ACL-bearing file must not be chmod'd (aclmode=restricted safe)"
+        );
+    }
+
+    // The sticky bit has no ACL representation, and no chmod runs on the ACL
+    // path, so an ACL-bearing sticky directory arrives without S_ISVTX. That
+    // is the decided trade, not an oversight: on ZFS a chmod rewrites the ACL
+    // to match the mode — under the default aclmode=discard it replaces it
+    // outright — so restoring one bit would destroy the ACL the copy just
+    // carried. Pinned here so the trade stays a decision.
+    #[test]
+    fn an_acl_bearing_sticky_directory_arrives_without_the_sticky_bit() {
+        use std::os::fd::AsFd;
+        use truenas_ros::sync_fs::acl::{
+            fsetacl_posix, PosixAce, PosixAcl, PosixPerm, PosixTag,
+        };
+        use truenas_ros::sync_fs::xattr::fgetxattr;
+
+        let ace = |tag, perms, id| PosixAce {
+            tag,
+            perms,
+            id,
+            default: false,
+        };
+        let rwx = PosixPerm::all();
+        // A named user and a mask, so the ACL cannot fold back into the mode.
+        let acl = PosixAcl::from_aces([
+            ace(PosixTag::UserObj, rwx, -1),
+            ace(PosixTag::User, rwx, 1234),
+            ace(PosixTag::GroupObj, rwx, -1),
+            ace(PosixTag::Mask, rwx, -1),
+            ace(PosixTag::Other, rwx, -1),
+        ]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        // The classic sticky shape: a world-writable shared directory.
+        std::fs::create_dir(src.join("shared")).unwrap();
+        std::fs::write(src.join("shared/f"), b"x").unwrap();
+        std::fs::set_permissions(
+            src.join("shared"),
+            std::fs::Permissions::from_mode(0o1777),
+        )
+        .unwrap();
+        let d = std::fs::File::open(src.join("shared")).unwrap();
+        if fsetacl_posix(d.as_fd(), &acl.access_bytes().unwrap(), None).is_err()
+        {
+            return; // no POSIX ACLs here (an NFSv4-ACL dataset, say)
+        }
+        let src_acl = fgetxattr(d.as_fd(), "system.posix_acl_access").unwrap();
+        assert_eq!(
+            std::fs::metadata(src.join("shared"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o1000,
+            0o1000,
+            "setting an ACL must not disturb the source's sticky bit"
+        );
+
+        let dst = tmp.path().join("dst");
+        copytree(&src, &dst, &CopyTreeConfig::default()).unwrap();
+
+        let copied = std::fs::File::open(dst.join("shared")).unwrap();
+        assert_eq!(
+            fgetxattr(copied.as_fd(), "system.posix_acl_access").unwrap(),
+            src_acl,
+            "the directory's access ACL is what the copy preserves"
+        );
+        assert_eq!(
+            std::fs::metadata(dst.join("shared"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o1000,
+            0,
+            "S_ISVTX is given up to keep the ACL intact; see copy_permissions"
         );
     }
 
