@@ -1,5 +1,11 @@
 /target
-/corpus
 /artifacts
 /coverage
 Cargo.lock
+
+# `corpus/` IS tracked — the seeds under it are checked in so CI can replay
+# them as a regression suite and so a fresh run does not have to rediscover
+# magic numbers (`TnCk`, `TnTc`), the ACL length relation, or the INI grammar
+# by chance. What a local fuzzing run *adds* to those directories is not:
+# libFuzzer names its own finds by SHA1, so ignore anything shaped like one.
+/corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]

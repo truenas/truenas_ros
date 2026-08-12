@@ -1,0 +1,7 @@
+# Fuzz seeds are byte fixtures, not text. An http seed ends in the chunked
+# terminator's CRLF CRLF, an ACL blob is little-endian binary, a resume cookie
+# carries a native-endian magic — none of it survives EOL normalization, and a
+# checkout under core.autocrlf would silently corrupt the corpus. Marking the
+# tree binary also stops the whitespace checks from reporting protocol bytes as
+# stray blank lines at EOF.
+fuzz/corpus/** binary

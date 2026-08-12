@@ -1038,6 +1038,102 @@ fn broker_main(
     unsafe { libc::_exit(if ok { 0 } else { 1 }) }
 }
 
+/// One validated broker request header.
+///
+/// `Copy` and free of owned fields on purpose: the broker loop is
+/// allocation-free (see `broker_loop`), so decoding must not allocate.
+///
+/// `pub` only so the `__fuzz` seam in the parent module can re-export it;
+/// `broker` is a private module, so this is unreachable without that seam.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Req {
+    /// `OP_REGISTER` or `OP_UNREGISTER`; anything else is rejected downstream.
+    pub op: u8,
+    /// Ring index, already checked against the broker's ring count.
+    pub ring: usize,
+    /// Supplementary group count, already checked against `MAX_GROUPS` and
+    /// against the datagram's exact length.
+    pub ngroups: usize,
+    /// The identity's uid — or, for `OP_UNREGISTER`, the personality id.
+    pub uid: u32,
+    /// The identity's gid.
+    pub gid: u32,
+    /// Requested capabilities, already checked to be a subset of the
+    /// spawn-time ceiling.
+    pub caps: Caps,
+}
+
+/// Decode and validate one request datagram, or return the negated errno the
+/// broker replies with.
+///
+/// This is the privilege boundary: the child runs with `CAP_SETUID` and mints
+/// personalities from whatever this accepts, so every field is checked before
+/// it reaches `register_as`. Split out from `broker_loop` so the check is
+/// pure and can be driven by `fuzz/fuzz_targets/broker_request.rs`.
+///
+/// Allocation-free, like its caller.
+pub fn decode_request(
+    req: &[u8],
+    nrings: usize,
+    allowed: Caps,
+) -> std::result::Result<Req, i64> {
+    if req.len() < HDR_LEN {
+        return Err(-(libc::EINVAL as i64));
+    }
+    let op = req[0];
+    let ring = usize::from(req[1]);
+    let ngroups = usize::from(u16::from_le_bytes([req[2], req[3]]));
+    let uid = u32::from_le_bytes([req[4], req[5], req[6], req[7]]);
+    let gid = u32::from_le_bytes([req[8], req[9], req[10], req[11]]);
+    let caps_bits = u32::from_le_bytes([req[12], req[13], req[14], req[15]]);
+
+    // Exact length, not a lower bound: a datagram truncated by the fixed-size
+    // receive buffer must be refused, never read as though the missing tail
+    // were zeroes.
+    if ring >= nrings
+        || ngroups > MAX_GROUPS
+        || req.len() != HDR_LEN + 4 * ngroups
+    {
+        return Err(-(libc::EINVAL as i64));
+    }
+    // An unknown bit is a newer client against an older broker, or a corrupt
+    // request; either way it is not something to silently mask off, because the
+    // caller would then get a personality weaker than it asked for and discover
+    // it as an EACCES far from here.
+    let caps = match Caps::from_bits(caps_bits) {
+        Some(c) if allowed.contains(c) => c,
+        // Outside the spawn-time ceiling, or not a capability this build knows
+        // how to mint.
+        _ => return Err(-(libc::EPERM as i64)),
+    };
+    Ok(Req {
+        op,
+        ring,
+        ngroups,
+        uid,
+        gid,
+        caps,
+    })
+}
+
+/// Copy the request's `ngroups` supplementary gids into `out`.
+///
+/// `req` must be a datagram [`decode_request`] accepted with this `ngroups`,
+/// which fixes its length at `HDR_LEN + 4 * ngroups`. Writes into the caller's
+/// scratch buffer rather than returning a `Vec`, so the broker loop stays
+/// allocation-free.
+pub fn decode_groups(req: &[u8], ngroups: usize, out: &mut [u32]) {
+    for (i, g) in out.iter_mut().take(ngroups).enumerate() {
+        let at = HDR_LEN + 4 * i;
+        *g = u32::from_le_bytes([
+            req[at],
+            req[at + 1],
+            req[at + 2],
+            req[at + 3],
+        ]);
+    }
+}
+
 /// The broker's request loop, split out so a panic in it is catchable at the
 /// `_exit` boundary (see [`broker_main`]).
 ///
@@ -1057,36 +1153,17 @@ fn broker_loop(
             Ok(0) | Err(_) => break, // parent closed, or a fatal IPC error
             Ok(n) => n,
         };
-        if n < HDR_LEN {
-            let _ = reply(SOCK_FD, -(libc::EINVAL as i64));
-            continue;
-        }
-        let op = req[0];
-        let ring = usize::from(req[1]);
-        let ngroups = usize::from(u16::from_le_bytes([req[2], req[3]]));
-        let uid = u32::from_le_bytes([req[4], req[5], req[6], req[7]]);
-        let gid = u32::from_le_bytes([req[8], req[9], req[10], req[11]]);
-        let caps_bits =
-            u32::from_le_bytes([req[12], req[13], req[14], req[15]]);
-
-        // Exact length, not a lower bound: a datagram truncated by the
-        // fixed-size receive buffer must be refused, never read as though the
-        // missing tail were zeroes.
-        if ring >= nrings || ngroups > MAX_GROUPS || n != HDR_LEN + 4 * ngroups
-        {
-            let _ = reply(SOCK_FD, -(libc::EINVAL as i64));
-            continue;
-        }
-        // An unknown bit is a newer client against an older broker, or a
-        // corrupt request; either way it is not something to silently mask
-        // off, because the caller would then get a personality weaker than it
-        // asked for and discover it as an EACCES far from here.
-        let caps = match Caps::from_bits(caps_bits) {
-            Some(c) if allowed.contains(c) => c,
-            // Outside the spawn-time ceiling, or not a capability this build
-            // knows how to mint.
-            _ => {
-                let _ = reply(SOCK_FD, -(libc::EPERM as i64));
+        let Req {
+            op,
+            ring,
+            ngroups,
+            uid,
+            gid,
+            caps,
+        } = match decode_request(&req[..n], nrings, allowed) {
+            Ok(r) => r,
+            Err(errno) => {
+                let _ = reply(SOCK_FD, errno);
                 continue;
             }
         };
@@ -1094,15 +1171,7 @@ fn broker_loop(
 
         let res: i64 = match op {
             OP_REGISTER if uid != 0 => {
-                for (i, g) in groups.iter_mut().take(ngroups).enumerate() {
-                    let at = HDR_LEN + 4 * i;
-                    *g = u32::from_le_bytes([
-                        req[at],
-                        req[at + 1],
-                        req[at + 2],
-                        req[at + 3],
-                    ]);
-                }
+                decode_groups(&req[..n], ngroups, &mut groups);
                 register_as(
                     ring_fd,
                     uid,
@@ -1418,7 +1487,7 @@ fn revert() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::uring::ring::Ring;

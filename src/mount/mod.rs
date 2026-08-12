@@ -46,6 +46,10 @@ pub use move_mount::{move_mount, MoveMountFlags};
 pub use open_tree::{open_tree, OpenTreeFlags};
 #[cfg(feature = "mount")]
 pub use setattr::{mount_setattr, MountSetattr};
+/// The reply decoder, for the fuzz crate only — `statmount` is a private
+/// module, so its `__fuzz` seam needs lifting to `mount::fuzz` to be reachable.
+#[cfg(all(feature = "mount", feature = "__fuzz"))]
+pub use statmount::fuzz;
 #[cfg(feature = "mount")]
 pub use statmount::{statmount, SbFlags, Statmount, StatmountMask};
 #[cfg(feature = "mount")]

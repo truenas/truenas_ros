@@ -107,7 +107,22 @@ fn parse_aces(data: &[u8], is_default: bool) -> Result<Vec<PosixAce>> {
             .map_err(|_| Error::Parse("unknown POSIX ACL tag".into()))?;
         let perms = PosixPerm::from_bits_retain(le16(data, p + 2));
         let xid = le32(data, p + 4);
-        let id = if xid == SPECIAL_ID { -1 } else { xid as i64 };
+        // Read `e_id` exactly as the kernel does (`fs/posix_acl.c`): a special
+        // tag's id field is written as `ACL_UNDEFINED_ID` and ignored on the
+        // way back in (`posix_acl_from_xattr` does not even load it), so it
+        // carries no id whatever the wire says. A *named* tag holding the
+        // sentinel is malformed — `encode_aces` cannot write it back, so
+        // accepting it would decode a blob we can never re-emit.
+        let id = if tag.is_special() {
+            -1
+        } else if xid == SPECIAL_ID {
+            return Err(Error::Parse(
+                "POSIX ACL named entry carries the undefined-id sentinel"
+                    .into(),
+            ));
+        } else {
+            xid as i64
+        };
         out.push(PosixAce {
             tag,
             perms,
@@ -378,6 +393,42 @@ mod tests {
             id,
             default: false,
         }
+    }
+
+    /// A 4-byte version-2 header followed by one raw entry.
+    fn blob(tag: u16, xid: u32) -> Vec<u8> {
+        let mut b = VERSION.to_le_bytes().to_vec();
+        b.extend_from_slice(&tag.to_le_bytes());
+        b.extend_from_slice(&PosixPerm::READ.bits().to_le_bytes());
+        b.extend_from_slice(&xid.to_le_bytes());
+        b
+    }
+
+    /// `e_id` is read exactly as `fs/posix_acl.c` reads it: ignored for a
+    /// special tag, and never the undefined sentinel on a named one. Both
+    /// halves keep decode and encode symmetric — without them `from_xattr`
+    /// accepts blobs `access_bytes` either refuses or re-emits differently.
+    #[test]
+    fn entry_ids_decode_the_way_the_kernel_writes_them() {
+        // A named entry holding ACL_UNDEFINED_ID has no id to encode back.
+        let named = blob(PosixTag::User as u16, SPECIAL_ID);
+        assert!(PosixAcl::from_xattr(&named, None).is_err());
+
+        // A special entry's id field is ignored, so a stray value normalizes
+        // to -1 and re-encodes as the sentinel rather than round-tripping.
+        let stray = blob(PosixTag::Mask as u16, 5);
+        let acl = PosixAcl::from_xattr(&stray, None).expect("mask decodes");
+        assert_eq!(acl.access[0].id, -1);
+        let out = acl.access_bytes().expect("decoded ACL re-encodes");
+        assert_eq!(out, blob(PosixTag::Mask as u16, SPECIAL_ID));
+        // ...and normalization is a fixed point from there.
+        assert_eq!(
+            PosixAcl::from_xattr(&out, None)
+                .unwrap()
+                .access_bytes()
+                .unwrap(),
+            out
+        );
     }
 
     #[test]

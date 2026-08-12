@@ -209,6 +209,29 @@ pub use broker::{
 };
 pub use host::{FsConfig, ShutdownHandle, UringFs};
 
+/// The credential-broker request decoder, exposed to the fuzz crate (`fuzz/`)
+/// under `__fuzz` only — `broker` is a private module. Never part of the stable
+/// API.
+///
+/// Driven by `fuzz/fuzz_targets/broker_request.rs`. This is the sharpest
+/// privilege boundary in the crate: the broker child holds `CAP_SETUID` and
+/// mints personalities from whatever [`decode_request`](fuzz::decode_request)
+/// accepts, so the target asserts that an accepted request is always within the
+/// ring count, the group cap, the exact declared length, and the spawn-time
+/// capability ceiling.
+#[cfg(feature = "__fuzz")]
+pub mod fuzz {
+    pub use super::broker::{decode_groups, decode_request, Req};
+
+    /// [`Leaf::to_cstring`](super::Leaf) is crate-internal, but
+    /// `fuzz/fuzz_targets/path_leaf.rs` needs it to prove its
+    /// `expect("validated: no interior NUL")` unreachable for every name
+    /// [`Leaf::new`](super::Leaf::new) accepts.
+    pub fn leaf_to_cstring(leaf: super::Leaf<'_>) -> std::ffi::CString {
+        leaf.to_cstring()
+    }
+}
+
 use crate::errno::{retry_on_eintr, Errno};
 use crate::fd::owned_from_raw;
 use crate::path::TnPath;
@@ -221,8 +244,11 @@ use crate::uring::wake::LoopShared;
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
-use std::sync::mpsc;
-use std::sync::Arc;
+// The inject channel and the shared flags are loom-modelled (see
+// `loom_tests` at the bottom), so these come from `crate::sync` — std's
+// outside `--cfg loom`.
+use crate::sync::mpsc;
+use crate::sync::Arc;
 
 /// The `AT_*` flags an async `statx` submits. `statx` follows a terminal
 /// symlink unless told not to; the confined surface inverts that, forcing
@@ -814,9 +840,19 @@ pub(crate) enum FsInject {
 /// An operation submitted with [`FsHandle::start_preadv`] (the
 /// non-blocking twin of the blocking conveniences): hold it, do other work,
 /// then [`wait`](FsPending::wait) for the outcome.
-#[derive(Debug)]
+// loom's channel types are `Debug` only when their payload is; std's are
+// unconditionally. Derive normally, and hand-write the one-line impl for a
+// model build rather than widen `FsOutcome`/`FsInject`'s bounds to suit it.
+#[cfg_attr(not(loom), derive(Debug))]
 pub struct FsPending {
     rx: mpsc::Receiver<FsOutcome>,
+}
+
+#[cfg(loom)]
+impl fmt::Debug for FsPending {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FsPending").finish_non_exhaustive()
+    }
 }
 
 impl FsPending {
@@ -885,13 +921,21 @@ impl FsPending {
 /// Every operation (except [`close`](FsHandle::close) — see the module docs)
 /// takes the [`Personality`] it runs as. Calls made while the loop is
 /// shutting down (or after it stopped) fail with `ECONNABORTED`.
-#[derive(Clone, Debug)]
+#[cfg_attr(not(loom), derive(Debug))]
+#[derive(Clone)]
 pub struct FsHandle {
     pub(crate) tx: mpsc::Sender<FsInject>,
     pub(crate) shared: Arc<LoopShared>,
     /// This reactor's shared blocking-work pool, for the off-loop
     /// [`QueryPool`](query_dir::QueryPool) and generic offloaded work.
     pub(crate) pool: Arc<query_dir::SharedPool>,
+}
+
+#[cfg(loom)]
+impl fmt::Debug for FsHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FsHandle").finish_non_exhaustive()
+    }
 }
 
 impl FsHandle {
@@ -1978,7 +2022,7 @@ impl FsHandle {
     // caller gets back (buffers, lease), not an error-path allocation to shrink.
     #[allow(clippy::result_large_err)]
     pub(crate) fn send(&self, msg: FsInject) -> Result<(), FsInject> {
-        use std::sync::atomic::Ordering;
+        use crate::sync::atomic::Ordering;
         if self.shared.stop.load(Ordering::Acquire) {
             return Err(msg);
         }
@@ -2000,9 +2044,67 @@ impl FsHandle {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+
+    /// The liveness half of the inject-vs-shutdown race: a caller that got an
+    /// `Ok` from [`FsHandle::send`] and is parked in [`FsHandle::call`] on its
+    /// reply channel must be woken when the loop goes away, not left there.
+    ///
+    /// What wakes it is ownership, not a notification — dropping the inject
+    /// receiver drops whatever was still queued, and each queued `FsInject`
+    /// carries the `ReplyTo::Sync` sender for its own reply. So the reply
+    /// channel disconnects and `recv` returns an error `call` maps to
+    /// `ECONNABORTED`.
+    ///
+    /// This is deliberately a real-threads test rather than a loom model:
+    /// loom's `mpsc` has no sender count, so a disconnected `recv` blocks in
+    /// its scheduler instead of returning `Err` (see the `loom_tests` note).
+    #[test]
+    fn shutdown_disconnects_a_queued_injects_reply() {
+        let (tx, rx) = mpsc::channel();
+        let shared = Arc::new(crate::uring::wake::LoopShared {
+            stop: std::sync::atomic::AtomicBool::new(false),
+            graceful: std::sync::atomic::AtomicBool::new(false),
+            grace_ms: std::sync::atomic::AtomicU64::new(0),
+            wake: crate::uring::wake::WakeHandle::new().expect("eventfd"),
+        });
+        let h = FsHandle {
+            tx,
+            shared,
+            pool: query_dir::SharedPool::new(1, 1),
+        };
+
+        // SAFETY: dup(2) returns a fresh owned descriptor or -1; stderr is
+        // always open in a test process.
+        let raw = unsafe { libc::dup(2) };
+        assert!(raw >= 0, "dup(2) failed");
+        // SAFETY: fresh owned fd from dup().
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(raw) });
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+        h.send(FsInject::Fsync {
+            pers: 0,
+            file,
+            datasync: false,
+            offset: 0,
+            length: 0,
+            reply: ReplyTo::Sync(reply_tx),
+        })
+        // `send`'s error *is* the un-sent message, which has no `Debug`, so
+        // check the discriminant rather than unwrapping.
+        .map_err(|_| ())
+        .expect("the loop has not stopped yet, so this is accepted");
+
+        // The loop goes away with the inject still queued.
+        drop(rx);
+
+        assert!(
+            reply_rx.recv().is_err(),
+            "a queued inject's caller was left parked after the loop went away"
+        );
+    }
 
     /// The elevation decision is a pure prefix match, so it is testable on any
     /// kernel — unlike the privileged write itself, which needs 6.13 plus root
@@ -2038,5 +2140,118 @@ mod tests {
         assert!(p.permits(c"trusted.a_one"));
         assert!(p.permits(c"trusted.b_two"));
         assert!(!p.permits(c"trusted.c_three"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// loom model of the inject-vs-shutdown race
+// ---------------------------------------------------------------------------
+//
+// Run with:  RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
+//
+// `FsHandle::send` is a check-then-act against a flag another thread sets:
+//
+//   caller (FsHandle::send)                loop (host.rs / ShutdownHandle)
+//   if stop.load(Acquire) { return Err }   stop.store(true, Release)
+//   tx.send(msg)?                          wake.poke()
+//   wake.poke()                            ...final drain of the receiver...
+//
+// The window between the load and the send is real: a caller can pass the
+// check, the loop can decide to stop, and the message can land afterwards. The
+// contract that makes that safe is not "the race cannot happen" but **an `Ok`
+// from `send` never leaves its caller parked** — either the loop drains the
+// message, or the inject receiver is dropped, which drops the queued message
+// and with it the `ReplyTo` sender, so the caller's `rx.recv()` in `call`
+// returns a disconnect it maps to `ECONNABORTED`.
+//
+// Note what this does *not* prove. The Acquire on the stop load has no payload
+// behind it — the shutdown side publishes only the flag — so weakening it to
+// Relaxed changes nothing this model can observe. What is verified here is the
+// liveness contract, not a memory-ordering one; loom reports a violation as a
+// deadlock on the reply channel.
+//
+// This model drives the real `send`. What it cannot drive is the reactor's
+// teardown, which lives in `host.rs` around real io_uring work — so the loop
+// side is a stand-in that performs the same two steps in the same order.
+#[cfg(loom)]
+mod loom_tests {
+    use super::*;
+    use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use crate::uring::wake::{LoopShared, WakeHandle};
+
+    fn bounded_model(f: impl Fn() + Sync + Send + 'static) {
+        let mut b = loom::model::Builder::new();
+        b.preemption_bound = Some(3);
+        b.check(f);
+    }
+
+    /// A throwaway fd for the inject payload. Every `FsInject` variant carries
+    /// one; which fd it is does not matter, only that it is owned and closes
+    /// with the message.
+    fn scratch_fd() -> Arc<OwnedFd> {
+        // SAFETY: dup(2) returns a fresh owned descriptor or -1; stderr is
+        // always open in a test process.
+        let raw = unsafe { libc::dup(2) };
+        assert!(raw >= 0, "dup(2) failed in the model");
+        // SAFETY: fresh owned fd from dup().
+        Arc::new(unsafe { crate::fd::owned_from_raw(raw) })
+    }
+
+    fn handle() -> (FsHandle, mpsc::Receiver<FsInject>, Arc<LoopShared>) {
+        let (tx, rx) = mpsc::channel();
+        let shared = Arc::new(LoopShared {
+            stop: AtomicBool::new(false),
+            graceful: AtomicBool::new(false),
+            grace_ms: AtomicU64::new(0),
+            wake: WakeHandle::new().expect("the model's wake never fails"),
+        });
+        let h = FsHandle {
+            tx,
+            shared: Arc::clone(&shared),
+            pool: query_dir::SharedPool::new(1, 1),
+        };
+        (h, rx, shared)
+    }
+
+    /// An `Ok` from `send` is honoured: the message is on the queue, so the
+    /// loop's final drain finds it. An `Err` hands the message back intact so
+    /// the caller can recover the buffers it moved in. Neither outcome may
+    /// leave a message accepted-but-undrainable.
+    // The liveness property this file's shutdown race really turns on — an
+    // accepted inject whose receiver is dropped disconnects the caller's reply
+    // channel, so `call` returns `ECONNABORTED` instead of parking — is **not
+    // modelled here**. loom's `mpsc` tracks a message count and no sender
+    // count (`loom-0.7.2/src/sync/mpsc.rs`), so `recv()` on a disconnected
+    // channel blocks in its scheduler and is reported as a deadlock rather
+    // than returning `Err`. Disconnect is unrepresentable, so the property is
+    // covered by a real-threads test instead:
+    // `shutdown_disconnects_a_queued_injects_reply`.
+
+    /// Once `stop` is visible to the caller, `send` refuses and gives the
+    /// message back rather than queueing onto a loop that will never drain.
+    #[test]
+    fn loom_inject_after_stop_is_refused() {
+        bounded_model(|| {
+            let (h, rx, shared) = handle();
+            let (reply_tx, _reply_rx) = mpsc::channel();
+
+            shared.stop.store(true, Ordering::Release);
+            let refused = h
+                .send(FsInject::Fsync {
+                    pers: 0,
+                    file: scratch_fd(),
+                    datasync: false,
+                    offset: 0,
+                    length: 0,
+                    reply: ReplyTo::Sync(reply_tx),
+                })
+                .is_err();
+
+            assert!(refused, "send accepted an inject after stop was set");
+            assert!(
+                rx.try_recv().is_err(),
+                "a refused inject was queued anyway"
+            );
+        });
     }
 }

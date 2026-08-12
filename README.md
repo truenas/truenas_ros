@@ -158,6 +158,61 @@ environment:
   parity. They skip if `python3` is unavailable; set
   `TRUENAS_ROS_REQUIRE_PYTHON=1` (as CI does) to make a missing interpreter a
   hard failure instead.
+- **io_uring tests** (`test/net_*.rs`, `test/uring_fs.rs`, `test/http_live.rs`)
+  skip when a ring cannot be created; `TRUENAS_ROS_REQUIRE_IO_URING=1` makes
+  that a hard failure.
+
+### Fuzzing
+
+Everything in the library that decodes bytes it did not write has a fuzz target
+under [`fuzz/`](fuzz): the ACL wire formats, the INI parser, the `statmount`
+reply, the file-handle and resume-cursor codecs, the audit record encoder, the
+path checks, the credential-broker request header, and the net/http framing.
+It is a separate, self-rooted crate, so it never touches the library's
+`libc`+`bitflags` charter or its MSRV.
+
+```sh
+cargo install cargo-fuzz
+cd fuzz
+cargo +nightly fuzz build                                  # compile every target
+cargo +nightly fuzz run acl_nfs4 corpus/acl_nfs4 -- -runs=0  # replay the seeds
+cargo +nightly fuzz run statmount_parse -- -max_total_time=300   # a real campaign
+```
+
+Targets assert **properties**, not just the absence of a panic — decode/encode
+idempotence, total ordering, injection safety, or a privilege check holding —
+so read a target's `//!` header for what it actually claims. Seed corpora are
+checked in under `fuzz/corpus/`, both as a regression suite and because a
+fuzzer will not otherwise guess a magic number like `TnCk` or the exact length
+relation an ACL blob has to satisfy. CI builds every target and replays the
+seeds; finding new bugs is a job for a real campaign.
+
+### Model checking
+
+Cross-thread protocols that cannot be settled by timing-based tests are
+verified with [loom](https://docs.rs/loom), which enumerates the interleavings
+the memory model permits. Models live in `loom_tests` modules beside the code
+they check, and are compiled only under `--cfg loom`:
+
+```sh
+RUSTFLAGS="--cfg loom" cargo test --lib --features uring    loom_
+RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
+```
+
+Covered: the SQ/CQ ring's acquire/release discipline, the graceful-drain flag
+publication, the offload pool's lifecycle (growth, idle retirement, drop
+quiescence, the self-join guard, lazy-init races), and the offload completion
+handoff. `src/sync.rs` is the std/loom shim — outside a model build it is a
+plain re-export, so none of this costs anything in a shipped binary.
+
+Two limits are worth knowing before adding a model. loom caps a model at 5
+threads and explores exhaustively, so models must stay small; the heavier ones
+here run under a preemption bound, which makes them bounded rather than
+exhaustive proofs. And loom only models what it provides — its `mpsc` has no
+sender count, so channel disconnect is not expressible, and
+`Condvar::wait_timeout` never reports a timeout, so timeout-predicated branches
+need an explicit `cfg(loom)` seam. Properties that fall outside those limits
+are tested with real threads instead, and say so where they live.
 
 ## License
 

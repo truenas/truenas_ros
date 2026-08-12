@@ -260,30 +260,45 @@ impl AuditSocket {
             {
                 continue;
             }
-            if n < NLMSG_HDRLEN {
-                continue; // runt: not an ack we can attribute
+            match decode_ack(&buf[..n], seq) {
+                Some(verdict) => return verdict,
+                None => continue, // not attributable to `seq`; keep scanning
             }
-            if u32::from_ne_bytes([buf[8], buf[9], buf[10], buf[11]]) != seq {
-                continue; // an earlier record's ack, arriving late
-            }
-            let ty = u16::from_ne_bytes([buf[4], buf[5]]);
-            if ty == NLMSG_ERROR && n >= NLMSG_HDRLEN + 4 {
-                // An NLMSG_ERROR carries a negative errno immediately after
-                // the header (0 for a plain ack).
-                let err =
-                    i32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]);
-                return match err.unsigned_abs() as i32 {
-                    0 => Ok(SendStatus::Delivered),
-                    libc::EPERM | libc::ECONNREFUSED => {
-                        Ok(SendStatus::Unavailable)
-                    }
-                    e => Err(Errno::from_raw(e)),
-                };
-            }
-            return Ok(SendStatus::Delivered);
         }
         Ok(SendStatus::Delivered)
     }
+}
+
+/// Interpret one received netlink datagram as an ack for `seq`.
+///
+/// `None` means the datagram is not attributable to `seq` — a runt, or an
+/// earlier record's ack arriving late — so the scan should keep reading.
+/// `Some` is terminal: `error == 0` is success, `-EPERM`/`-ECONNREFUSED` is
+/// benign unavailability, and any other negative errno is an error.
+///
+/// Split out from [`AuditSocket::read_ack`] so the decode is pure and can be
+/// driven by `fuzz/fuzz_targets/audit_ack.rs` — the bytes come off a socket the
+/// kernel shares with every other netlink peer, and the length guards here are
+/// the only thing standing between a short datagram and an out-of-bounds index.
+pub(super) fn decode_ack(buf: &[u8], seq: u32) -> Option<Result<SendStatus>> {
+    if buf.len() < NLMSG_HDRLEN {
+        return None; // runt: not an ack we can attribute
+    }
+    if u32::from_ne_bytes([buf[8], buf[9], buf[10], buf[11]]) != seq {
+        return None; // an earlier record's ack, arriving late
+    }
+    let ty = u16::from_ne_bytes([buf[4], buf[5]]);
+    if ty == NLMSG_ERROR && buf.len() >= NLMSG_HDRLEN + 4 {
+        // An NLMSG_ERROR carries a negative errno immediately after the header
+        // (0 for a plain ack).
+        let err = i32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        return Some(match err.unsigned_abs() as i32 {
+            0 => Ok(SendStatus::Delivered),
+            libc::EPERM | libc::ECONNREFUSED => Ok(SendStatus::Unavailable),
+            e => Err(Errno::from_raw(e)),
+        });
+    }
+    Some(Ok(SendStatus::Delivered))
 }
 
 /// Serialize one `nlmsghdr` plus its NUL-terminated payload into `buf`.

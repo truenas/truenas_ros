@@ -1,0 +1,6 @@
+PUT /b/k HTTP/1.1
+Host: s3.local
+Content-Length: 5
+Expect: 100-continue
+
+hello

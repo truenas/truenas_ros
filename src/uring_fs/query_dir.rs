@@ -30,9 +30,10 @@ use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt;
 use std::os::fd::{AsFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
-use std::thread;
+// The worker pool is loom-modelled (see `loom_tests` at the bottom), so its
+// primitives come from `crate::sync` — std's outside `--cfg loom`.
+use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use crate::sync::{mpsc, thread, Arc, Condvar, Mutex, OnceCell};
 use std::time::{Duration, Instant};
 
 bitflags! {
@@ -919,6 +920,27 @@ fn cmp_path_bytes(
     la.cmp(&lb)
 }
 
+/// The listing comparator exposed to the fuzz crate (`fuzz/`) under `__fuzz`
+/// only. Never part of the stable API.
+///
+/// Driven by `fuzz/fuzz_targets/path_order.rs`. `cmp_path_bytes` orders
+/// attacker-named directory entries and its result feeds `sort_by` and
+/// `partition_point`, so it must be a **total order** — since Rust 1.81 an
+/// inconsistent comparator is a `sort_by` panic, and here it would also cut a
+/// resume boundary in the wrong place.
+#[cfg(feature = "__fuzz")]
+pub mod fuzz {
+    /// Compare two directory entries by their full-path ordering.
+    pub fn cmp_path_bytes(
+        a: &[u8],
+        a_dir: bool,
+        b: &[u8],
+        b_dir: bool,
+    ) -> std::cmp::Ordering {
+        super::cmp_path_bytes(a, a_dir, b, b_dir)
+    }
+}
+
 /// Start listing `dir` as `who`, enriching each entry per `opts`. Opening the
 /// directory `O_RDONLY|O_DIRECTORY` under `who` **is** the list-permission
 /// check — returns `EACCES` when `who` cannot list `dir`. Pull enriched batches
@@ -1011,6 +1033,9 @@ struct PoolShared {
     last_spawn_us: AtomicU64,
     cooldown: Duration,
     idle_timeout: Duration,
+    /// Model-only: how many idle retirements to grant (see [`idle_expired`]).
+    #[cfg(loom)]
+    retire_next_idle: AtomicUsize,
 }
 
 /// An elastic pool of worker threads running `Box<dyn FnOnce() + Send>` jobs,
@@ -1072,6 +1097,8 @@ impl WorkerPool {
             last_spawn_us: AtomicU64::new(0),
             cooldown,
             idle_timeout,
+            #[cfg(loom)]
+            retire_next_idle: AtomicUsize::new(0),
         });
         let pool = WorkerPool {
             shared: Arc::clone(&shared),
@@ -1127,6 +1154,20 @@ impl WorkerPool {
 }
 
 impl PoolShared {
+    /// Model-only: let the next `n` workers to wake take the retire branch
+    /// instead of looping. Standing in for a clock loom does not have — see
+    /// [`idle_expired`].
+    ///
+    /// A budget rather than a one-shot on purpose: with only one retirement
+    /// granted the retiring worker is never the last, so a model could not
+    /// tell a pool that correctly refuses to retire its final worker from one
+    /// that does not.
+    #[cfg(loom)]
+    fn retire_idle_workers(&self, n: usize) {
+        self.retire_next_idle.store(n, Ordering::Relaxed);
+        self.cv.notify_all();
+    }
+
     /// True at most once per [`cooldown`](Self::cooldown), claiming the slot so
     /// concurrent submits do not all spawn at once.
     fn claim_spawn_slot(&self) -> bool {
@@ -1146,12 +1187,22 @@ impl PoolShared {
     }
 }
 
+// Set for the lifetime of a pool worker thread. `WorkerPool::drop` can run on
+// a worker when a job drops the pool's last `Arc`; the flag tells that `Drop`
+// not to join the workers — this thread is one of them, so the join would wait
+// on itself.
+//
+// Under loom this must be loom's thread-local, not std's: loom multiplexes
+// every modelled thread onto one OS thread, so a std `thread_local!` would let
+// a worker's flag leak into the main thread and make `Drop` skip a join it
+// really needed. (loom's macro takes no `const` initializer.)
+#[cfg(not(loom))]
 thread_local! {
-    /// Set for the lifetime of a pool worker thread. [`WorkerPool::drop`] can
-    /// run on a worker when a job drops the pool's last `Arc`; the flag tells
-    /// that `Drop` not to join the workers — this thread is one of them, so the
-    /// join would wait on itself.
     static ON_POOL_WORKER: Cell<bool> = const { Cell::new(false) };
+}
+#[cfg(loom)]
+loom::thread_local! {
+    static ON_POOL_WORKER: Cell<bool> = Cell::new(false);
 }
 
 impl Drop for WorkerPool {
@@ -1191,7 +1242,7 @@ fn spawn_worker(shared: &Arc<PoolShared>) -> std::io::Result<()> {
 /// threads spawn on the first submit, and if a worker cannot be spawned the job
 /// runs inline (a degraded loop, not a dead one).
 pub(crate) struct SharedPool {
-    pool: OnceLock<WorkerPool>,
+    pool: OnceCell<WorkerPool>,
     floor: usize,
     ceiling: usize,
     /// Set once the lazy spawn has failed. Whatever stopped a thread from
@@ -1204,7 +1255,7 @@ pub(crate) struct SharedPool {
 impl fmt::Debug for SharedPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SharedPool")
-            .field("spawned", &self.pool.get().is_some())
+            .field("spawned", &self.pool.is_set())
             .field("spawn_failed", &self.spawn_failed.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
@@ -1216,7 +1267,7 @@ impl SharedPool {
     pub(crate) fn new(floor: usize, ceiling: usize) -> Arc<SharedPool> {
         let floor = floor.max(1);
         Arc::new(SharedPool {
-            pool: OnceLock::new(),
+            pool: OnceCell::new(),
             floor,
             ceiling: ceiling.max(floor),
             spawn_failed: AtomicBool::new(false),
@@ -1227,18 +1278,27 @@ impl SharedPool {
     /// drops the surplus pool (its `Drop` joins the idle workers); a spawn
     /// failure runs the job inline rather than take the reactor down.
     pub(crate) fn submit(&self, job: Job) {
-        if let Some(pool) = self.pool.get() {
-            return pool.submit(job);
+        // `job` is `FnOnce`, so it can only be handed to one arm; take it back
+        // out of the cell when the pool was not there to receive it.
+        let mut job = Some(job);
+        if let Some(()) = self
+            .pool
+            .with(|pool| pool.submit(job.take().expect("first use")))
+        {
+            return;
         }
+        let job = job.expect("untouched when the cell was empty");
         if self.spawn_failed.load(Ordering::Relaxed) {
             return job(); // already known unspawnable; don't retry per job
         }
         match WorkerPool::try_elastic(self.floor, self.ceiling) {
             Ok(pool) => {
-                let _ = self.pool.set(pool);
-                if let Some(pool) = self.pool.get() {
-                    pool.submit(job);
-                }
+                // A lost race just drops the surplus pool here; its `Drop`
+                // joins the workers it started before they can touch anything.
+                self.pool.set(pool);
+                let mut job = Some(job);
+                self.pool
+                    .with(|pool| pool.submit(job.take().expect("first use")));
             }
             Err(_) => {
                 self.spawn_failed.store(true, Ordering::Relaxed);
@@ -1407,6 +1467,38 @@ impl Iterator for QueryHandle {
     }
 }
 
+/// Whether a `wait_timeout` return means the worker has been idle long enough
+/// to retire.
+///
+/// In production this is just the condvar's own answer. Under `--cfg loom`
+/// there is no clock and `Condvar::wait_timeout` always reports
+/// `timed_out() == false`, which would make the retire branch below — the one
+/// that decrements `total` *without* notifying, unlike the closing path —
+/// unreachable in a model. The seam lets a model ask for the retirement
+/// directly, so the interleaving that branch relies on can actually be
+/// explored. See [`PoolShared::retire_next_idle`].
+#[cfg(not(loom))]
+fn idle_expired(
+    wait: &std::sync::WaitTimeoutResult,
+    _shared: &Arc<PoolShared>,
+) -> bool {
+    wait.timed_out()
+}
+
+#[cfg(loom)]
+fn idle_expired(
+    _wait: &loom::sync::WaitTimeoutResult,
+    shared: &Arc<PoolShared>,
+) -> bool {
+    // The model arms a budget; each waking worker consumes one.
+    shared
+        .retire_next_idle
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            n.checked_sub(1)
+        })
+        .is_ok()
+}
+
 /// A worker: wait for a job, run it, repeat; `K` workers run `K` jobs
 /// concurrently. A burst worker idle past the idle timeout retires (never below
 /// the floor); on shutdown every worker drains the queue and exits, decrementing
@@ -1435,7 +1527,7 @@ fn worker_loop(shared: &Arc<PoolShared>) {
                     .wait_timeout(g, shared.idle_timeout)
                     .unwrap_or_else(|e| e.into_inner());
                 g = guard;
-                if wait.timed_out()
+                if idle_expired(&wait, shared)
                     && g.queue.is_empty()
                     && !g.closed
                     && g.total > shared.floor
@@ -1626,7 +1718,7 @@ fn copy_range_rw(
     Ok(total)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod order_tests {
     use super::*;
 
@@ -1746,7 +1838,7 @@ mod order_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod pool_tests {
     use super::*;
 
@@ -1864,5 +1956,267 @@ mod pool_tests {
             done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "a job dropping the pool's last Arc wedged its worker",
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// loom models of the offload pool's lifecycle
+// ---------------------------------------------------------------------------
+//
+// Run with:  RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
+//
+// Three protocols live in this file that no amount of timing-based testing can
+// settle, because their correctness is an argument about lock ordering rather
+// than about elapsed time:
+//
+//  * `total` is accounted under the mutex but `running` is bumped outside it,
+//    so growth reads two counters at different synchronization points;
+//  * `Drop` waits for `total` to reach zero, while one of the two paths that
+//    decrements it — the idle retire — does so **without** notifying;
+//  * a job can drop the pool's last `Arc`, re-entering `Drop` on a worker that
+//    is itself counted in `total`, which is what `ON_POOL_WORKER` exists for.
+//
+// The models are deliberately tiny: loom is exhaustive, and `loom::MAX_THREADS`
+// is 5 including the main thread. `cooldown` is zero throughout because
+// `claim_spawn_slot` reads an `Instant`, which loom does not model — so growth
+// is always permitted here rather than throttled.
+#[cfg(loom)]
+mod loom_tests {
+    use super::*;
+
+    const ZERO: Duration = Duration::ZERO;
+
+    /// Run a model under a preemption bound rather than exhaustively.
+    ///
+    /// Three threads parking and signalling on one mutex/condvar is past the
+    /// point where full exploration terminates in useful time. A preemption
+    /// bound keeps every interleaving with at most `N` forced context switches
+    /// — the region where essentially all real concurrency bugs live — and
+    /// drops the deeper ones. **These are bounded proofs, not exhaustive
+    /// ones**, unlike the ring's SPSC model, which is small enough to explore
+    /// in full. Each was checked against a deliberately broken variant to
+    /// confirm the bound still catches the bug it is there to catch.
+    fn bounded_model_with(
+        preemptions: usize,
+        f: impl Fn() + Sync + Send + 'static,
+    ) {
+        let mut b = loom::model::Builder::new();
+        b.preemption_bound = Some(preemptions);
+        b.check(f);
+    }
+
+    fn bounded_model(f: impl Fn() + Sync + Send + 'static) {
+        bounded_model_with(3, f);
+    }
+
+    fn pool(floor: usize, ceiling: usize) -> WorkerPool {
+        WorkerPool::try_elastic_tuned(floor, ceiling, ZERO, ZERO)
+            .expect("the model's pool always spawns")
+    }
+
+    fn counting_job(n: &Arc<AtomicUsize>) -> Job {
+        let n = Arc::clone(n);
+        Box::new(move || {
+            n.fetch_add(1, Ordering::Relaxed);
+        })
+    }
+
+    /// Every submitted job runs exactly once, and `Drop` does not return until
+    /// the queue is empty and every worker has exited — the guarantee that lets
+    /// a job borrow reactor state.
+    #[test]
+    fn loom_pool_lifecycle() {
+        loom::model(|| {
+            let ran = Arc::new(AtomicUsize::new(0));
+            let p = pool(1, 1);
+            let shared = Arc::clone(&p.shared);
+
+            p.submit(counting_job(&ran));
+            p.submit(counting_job(&ran));
+            drop(p);
+
+            // `Drop` returned, so its contract must hold in full.
+            let g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(g.closed, "Drop returned without closing the pool");
+            assert_eq!(g.total, 0, "Drop returned with workers still live");
+            assert!(
+                g.queue.is_empty(),
+                "Drop returned with {} jobs still queued",
+                g.queue.len()
+            );
+            drop(g);
+            assert_eq!(
+                ran.load(Ordering::Relaxed),
+                2,
+                "a queued job was dropped on the floor"
+            );
+        });
+    }
+
+    /// Growth never exceeds the ceiling, and a grown pool still drains and
+    /// joins cleanly. `running` is read Relaxed while `total` is read under the
+    /// lock, so the saturation test can see a stale pair — that may cost a
+    /// spawn opportunity, but it must never overshoot.
+    #[test]
+    fn loom_pool_growth_respects_the_ceiling() {
+        bounded_model(|| {
+            let ran = Arc::new(AtomicUsize::new(0));
+            let p = pool(1, 2);
+            let shared = Arc::clone(&p.shared);
+
+            p.submit(counting_job(&ran));
+            p.submit(counting_job(&ran));
+            {
+                let g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+                assert!(
+                    g.total <= shared.ceiling,
+                    "pool grew to {} past its ceiling {}",
+                    g.total,
+                    shared.ceiling
+                );
+            }
+            drop(p);
+
+            let g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(g.total, 0, "Drop returned with workers still live");
+            drop(g);
+            assert_eq!(ran.load(Ordering::Relaxed), 2, "a job was lost");
+        });
+    }
+
+    /// An idle burst worker retires by decrementing `total` and returning
+    /// **without** notifying, unlike the closing path. `Drop` is waiting for
+    /// `total` to reach zero, so a retirement that took the count to zero
+    /// silently would strand it forever.
+    ///
+    /// Two guards prevent that, and this model pins the fact that they are
+    /// **individually sufficient**: `!g.closed` refuses to retire at all once
+    /// `Drop` has run, and `g.total > shared.floor` refuses to retire the last
+    /// worker regardless. Delete either one and the model still passes; delete
+    /// both and loom reports the deadlock. Worth knowing before anyone
+    /// "simplifies" the condition — the redundancy is the safety margin, not
+    /// clutter.
+    ///
+    /// loom's `wait_timeout` never reports a timeout, so the retirements are
+    /// requested through the `retire_next_idle` seam instead of a clock.
+    #[test]
+    fn loom_pool_idle_retire_cannot_strand_drop() {
+        // Four threads on one condvar; a tighter bound keeps this in
+        // seconds while still covering the retire-vs-close ordering.
+        bounded_model_with(2, || {
+            let p = pool(1, 2);
+            let shared = Arc::clone(&p.shared);
+
+            // Force a second worker to exist so one is above the floor and
+            // therefore eligible to retire.
+            {
+                let mut g =
+                    shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+                g.total += 1;
+            }
+            spawn_worker(&shared).expect("the model's worker always spawns");
+
+            // Race the retirement against the drop.
+            let s = Arc::clone(&shared);
+            let retire = loom::thread::spawn(move || s.retire_idle_workers(2));
+            drop(p);
+            retire.join().expect("retire requester");
+
+            let g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                g.total, 0,
+                "Drop returned while {} worker(s) were still live",
+                g.total
+            );
+        });
+    }
+
+    /// A job may drop the pool's last `Arc`, which runs `WorkerPool::drop` on a
+    /// worker thread that is itself counted in `total`. Joining there would
+    /// wait on this very thread forever; `ON_POOL_WORKER` is what prevents it.
+    /// loom reports the deadlock if that guard stops working.
+    #[test]
+    fn loom_pool_self_join_is_avoided() {
+        bounded_model(|| {
+            let ran = Arc::new(AtomicUsize::new(0));
+            let cell: Arc<Mutex<Option<WorkerPool>>> =
+                Arc::new(Mutex::new(Some(pool(1, 1))));
+            let shared = {
+                let g = cell.lock().unwrap_or_else(|e| e.into_inner());
+                Arc::clone(&g.as_ref().expect("just built").shared)
+            };
+
+            let c = Arc::clone(&cell);
+            let n = Arc::clone(&ran);
+            {
+                let g = cell.lock().unwrap_or_else(|e| e.into_inner());
+                g.as_ref().expect("just built").submit(Box::new(move || {
+                    // The pool's last owner is this cell; taking it here runs
+                    // `WorkerPool::drop` on a pool worker. Drop *before*
+                    // marking the job done, so `ran == 1` means the pool has
+                    // certainly been dropped by one side or the other.
+                    let taken =
+                        c.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    drop(taken);
+                    n.fetch_add(1, Ordering::Relaxed);
+                }));
+            }
+
+            // Whoever still holds it drops it; one of the two paths is the
+            // worker's, which is the interesting one. Take it out and release
+            // the cell before dropping: `WorkerPool::drop` waits for the
+            // workers, and one of them may be blocked on this very lock.
+            let taken = cell.lock().unwrap_or_else(|e| e.into_inner()).take();
+            drop(taken);
+
+            // If we dropped the pool, `Drop` already joined and the job has
+            // run. If the worker did, it retired without a join and may still
+            // be in flight — so wait for it rather than racing its epilogue.
+            while ran.load(Ordering::Relaxed) == 0 {
+                loom::thread::yield_now();
+            }
+
+            // The workers reclaim the shared state on their own once `closed`
+            // is set, with no join — so `total` need not be zero here, but the
+            // pool must be closed and no thread may be stuck. loom reports the
+            // self-join as a deadlock if `ON_POOL_WORKER` stops working.
+            let g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(g.closed, "dropping the pool did not close it");
+        });
+    }
+
+    /// Two first-submits race the lazy init: each may build a full pool, and
+    /// the loser's is dropped inline (joining the workers it started). Exactly
+    /// one pool ends up installed, and **neither job is lost**.
+    #[test]
+    fn loom_shared_pool_init() {
+        bounded_model(|| {
+            let ran = Arc::new(AtomicUsize::new(0));
+            let sp = SharedPool::new(1, 1);
+
+            let (a, b) = (Arc::clone(&sp), Arc::clone(&sp));
+            let (ra, rb) = (Arc::clone(&ran), Arc::clone(&ran));
+            let t = loom::thread::spawn(move || {
+                a.submit(Box::new(move || {
+                    ra.fetch_add(1, Ordering::Relaxed);
+                }));
+            });
+            b.submit(Box::new(move || {
+                rb.fetch_add(1, Ordering::Relaxed);
+            }));
+            t.join().expect("racing submitter");
+
+            assert!(sp.pool.is_set(), "no pool was installed");
+            // Dropping the *last* `Arc` drops the installed pool, whose `Drop`
+            // drains the queue and joins — so by here both jobs have run. `b`
+            // is still holding one, so it has to go first.
+            drop(b);
+            drop(sp);
+            assert_eq!(
+                ran.load(Ordering::Relaxed),
+                2,
+                "a job was lost to the init race"
+            );
+        });
     }
 }

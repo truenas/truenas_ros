@@ -47,7 +47,10 @@ use std::ffi::{CStr, CString};
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+// The offload sink and the `DIR*` handoff are loom-modelled (see
+// `loom_tests` at the bottom), so these come from `crate::sync` — std's
+// outside `--cfg loom`.
+use crate::sync::{Arc, Mutex};
 use std::thread;
 
 /// Default warm floor of worker threads backing [`FsConn::offload`]; the pool
@@ -2230,7 +2233,7 @@ impl FsConn<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod hybrid_tests {
     use super::*;
     use crate::uring::sys::register_personality;
@@ -2685,11 +2688,12 @@ pub(crate) fn deliver_embedded(
 /// once (never early — a parked clone outlives a dropped caller — never leaked),
 /// and stale/wrong-tag/recycled completions are inert. `ROUTING_FUZZ_SEEDS=N`
 /// overrides the seed count.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod routing_fuzz {
     use super::*;
+    use crate::sync::mpsc;
     use std::os::fd::RawFd;
-    use std::sync::{mpsc, Weak};
+    use std::sync::Weak;
 
     const OP_SLOTS: u32 = 32;
     // The ring is sized far above any run's staged SQEs, so `push_sqe` never
@@ -3066,5 +3070,137 @@ mod routing_fuzz {
             (0..OP_SLOTS).collect::<Vec<_>>(),
             "op slots leaked or double-freed (seed {seed})"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// loom model of the offload completion handoff
+// ---------------------------------------------------------------------------
+//
+// Run with:  RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
+//
+// A worker finishing an offload pushes its result under the `completions`
+// mutex and then pokes the wake eventfd (`FsConn::offload`, above); the loop
+// wakes, drains the queue with `take_pool_completions`, and re-arms the READ.
+// The claim in that code — "counting eventfd; the loop re-arms the READ, so no
+// poke is lost" — is a lost-wakeup argument, and until now nothing tested it.
+//
+// The order matters in one direction only: push *then* poke. Poke first and a
+// loop can wake, find the queue empty, drain nothing, and park again while the
+// result it was woken for is pushed behind it — the continuation in
+// `offload_reg` then never fires, and the caller waits forever.
+//
+// The eventfd is the `cfg(loom)` counter in `crate::uring::wake`, so what this
+// proves is conditional on a real eventfd accumulating pokes the same way.
+#[cfg(loom)]
+mod loom_tests {
+    use super::*;
+    use crate::uring::wake::WakeHandle;
+
+    fn bounded_model(f: impl Fn() + Sync + Send + 'static) {
+        let mut b = loom::model::Builder::new();
+        b.preemption_bound = Some(3);
+        b.check(f);
+    }
+
+    /// A completion pushed concurrently with a drain is never stranded: the
+    /// loop either drains it on this pass, or is left with a pending poke that
+    /// makes its next armed READ complete immediately.
+    #[test]
+    fn loom_offload_wakeup_loses_nothing() {
+        bounded_model(|| {
+            let mut fs = FsCore::new(4);
+            let sink = fs.completion_sink();
+            let wake = Arc::new(
+                WakeHandle::new().expect("the model's wake never fails"),
+            );
+
+            // Two workers finishing at once, as `FsConn::offload` leaves them:
+            // push under the lock, then poke.
+            let mut workers = Vec::new();
+            for token in 0..2u64 {
+                let (s, w) = (Arc::clone(&sink), Arc::clone(&wake));
+                workers.push(loom::thread::spawn(move || {
+                    s.lock().unwrap_or_else(|e| e.into_inner()).push_back((
+                        token,
+                        Box::new(token) as Box<dyn Any + Send>,
+                    ));
+                    w.poke();
+                }));
+            }
+
+            // The loop: wake, drain, re-arm — repeatedly, as the reactor does.
+            // `take_pool_completions` discards tokens with no registered
+            // continuation, so count what actually came off the queue instead.
+            let mut seen = 0usize;
+            while seen < 2 {
+                wake.drain();
+                seen += {
+                    let mut q = sink.lock().unwrap_or_else(|e| e.into_inner());
+                    q.drain(..).count()
+                };
+            }
+
+            for w in workers {
+                w.join().expect("worker");
+            }
+
+            // Nothing left behind, and the registry is untouched because no
+            // continuation was registered for these tokens.
+            assert!(
+                sink.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+                "a completion was left on the queue"
+            );
+            assert!(
+                fs.take_pool_completions().is_empty(),
+                "an unregistered token produced a delivery"
+            );
+        });
+    }
+
+    /// A completion whose continuation *is* registered comes back out of
+    /// `take_pool_completions` exactly once, and the registry entry is
+    /// consumed with it — a second drain must not fire it again.
+    #[test]
+    fn loom_offload_delivers_each_completion_once() {
+        bounded_model(|| {
+            let mut fs = FsCore::new(4);
+            // `Owner` is `Option<(slot, generation)>`; `None` scopes the
+            // continuation to the reactor rather than to a connection.
+            let token = fs.register_offload(
+                None,
+                Box::new(|_any, _conn| {
+                    unreachable!("not invoked in the model")
+                }),
+            );
+            let sink = fs.completion_sink();
+            let wake = Arc::new(
+                WakeHandle::new().expect("the model's wake never fails"),
+            );
+
+            let (s, w) = (Arc::clone(&sink), Arc::clone(&wake));
+            let worker = loom::thread::spawn(move || {
+                s.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back((token, Box::new(()) as Box<dyn Any + Send>));
+                w.poke();
+            });
+
+            let mut delivered = 0usize;
+            while delivered == 0 {
+                wake.drain();
+                delivered += fs.take_pool_completions().len();
+            }
+            worker.join().expect("worker");
+
+            assert_eq!(
+                delivered, 1,
+                "the completion was delivered {delivered} times"
+            );
+            assert!(
+                fs.take_pool_completions().is_empty(),
+                "the continuation fired twice for one completion"
+            );
+        });
     }
 }

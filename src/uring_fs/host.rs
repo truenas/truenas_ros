@@ -9,6 +9,7 @@ use super::core::{
 };
 use super::{FsHandle, FsInject, FsOutcome, Personality, PrivilegedXattrs};
 use crate::errno::{self, Errno};
+use crate::sync::{mpsc, Arc};
 use crate::uring::engine::Engine;
 use crate::uring::probe::probe_op_supported;
 use crate::uring::sys::{
@@ -18,7 +19,6 @@ use crate::uring::user_data::{pack_raw, unpack_raw, SLOT_MASK, TAG_FS_DOMAIN};
 use crate::uring::wake::LoopShared;
 use std::fmt;
 use std::sync::atomic::Ordering;
-use std::sync::{mpsc, Arc};
 
 /// Sizing for an [`UringFs`].
 #[derive(Clone, Copy, Debug)]
@@ -433,7 +433,7 @@ impl UringFs {
 /// registration gate, the explicit-index install `res` convention, and
 /// stale-token/stale-personality inertness. Environmental skips follow the
 /// integration suites' discipline (`TRUENAS_ROS_REQUIRE_IO_URING`).
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::sync_fs::openat2::RawOpenHow;

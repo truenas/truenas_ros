@@ -42,6 +42,12 @@ mod error;
 pub mod fd;
 pub mod path;
 
+// std's synchronization primitives, or loom's under `--cfg loom`. A plain
+// re-export outside a model run — see the module docs. Only the subsystems
+// with loom models import from here; the rest use `std::sync` directly.
+#[cfg(any(feature = "uring", feature = "uring-fs"))]
+pub(crate) mod sync;
+
 // The shared `clone3` fork helper (pidfd + signal-handler reset), used by the
 // credential broker and the idmapped-mount userns builder.
 #[cfg(any(feature = "idmap", feature = "uring-fs"))]
