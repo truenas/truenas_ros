@@ -1,0 +1,10 @@
+# src/uring_fs/query_tree.rs — magic, version, flags, u32 length, key bytes.
+magic="TnTc"
+version_1="\x01\x00"
+flags_none="\x00\x00"
+flags_skip_subtree="\x01\x00"
+len_0="\x00\x00\x00\x00"
+len_2="\x02\x00\x00\x00"
+sep="/"
+key_dir="a/"
+key_nested="a/b/"

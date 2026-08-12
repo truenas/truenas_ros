@@ -163,6 +163,27 @@ mod path_tests {
         assert_eq!(n, 2000);
     }
 
+    /// The `[u8]` conversion writes into a `MaybeUninit<[u8; 1024]>` with a
+    /// manual NUL and falls back to the heap when the name does not fit, so
+    /// the interesting lengths are the ones either side of that boundary —
+    /// where an off-by-one writes past the array. Every length must yield a
+    /// `CStr` carrying exactly the input bytes, whichever arm ran.
+    ///
+    /// The `tn_path` fuzz target sweeps this under AddressSanitizer, where an
+    /// overrun is a crash rather than a wrong length; pinned here too because
+    /// a short fuzz run starts from small inputs and does not reach 1 KiB.
+    #[test]
+    fn stack_to_heap_boundary_carries_the_bytes_exactly() {
+        for len in [0, 1, 1022, 1023, 1024, 1025, 1026, 4096] {
+            let name = vec![b'a'; len];
+            let got = name
+                .as_slice()
+                .with_tn_path(|c| c.to_bytes().to_vec())
+                .unwrap_or_else(|e| panic!("len {len} refused: {e}"));
+            assert_eq!(got, name, "len {len} did not round-trip");
+        }
+    }
+
     #[test]
     fn every_impl_materialises_a_cstr() {
         let want = b"pth".to_vec();

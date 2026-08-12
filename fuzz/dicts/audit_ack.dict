@@ -1,0 +1,6 @@
+# src/audit/netlink.rs — a NETLINK_AUDIT NLMSG_ERROR ack.
+nlmsg_error="\x02\x00"
+nlm_f_request="\x01\x00"
+nlm_f_ack="\x04\x00"
+hdrlen_16="\x10\x00\x00\x00"
+err_ok="\x00\x00\x00\x00"

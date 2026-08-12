@@ -1,0 +1,5 @@
+# src/uring_fs/broker.rs — 16-byte request header then ngroups u32s.
+op_register="\x01"
+op_unregister="\x02"
+uid_root="\x00\x00\x00\x00"
+uid_sentinel="\xff\xff\xff\xff"

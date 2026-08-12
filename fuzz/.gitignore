@@ -1,11 +1,20 @@
-/target
-/artifacts
-/coverage
+target
+artifacts
+coverage
 Cargo.lock
 
-# `corpus/` IS tracked — the seeds under it are checked in so CI can replay
-# them as a regression suite and so a fresh run does not have to rediscover
-# magic numbers (`TnCk`, `TnTc`), the ACL length relation, or the INI grammar
-# by chance. What a local fuzzing run *adds* to those directories is not:
-# libFuzzer names its own finds by SHA1, so ignore anything shaped like one.
+# `corpus/` is a generated artifact, not source: cargo-fuzz scaffolds it into
+# this file, and it belongs there. Seeds cannot be reviewed as a diff, encode
+# host byte order, and drift silently when a wire format changes — and over
+# equal-length runs they moved coverage 0-5%, because libFuzzer recovers a
+# magic from comparison interception in seconds. An input worth keeping
+# becomes a unit test beside the decoder; a token hint goes in `dicts/`.
+#
+# The http corpora are the exception, tracked and owned with the codec.
+/corpus/*
+!/corpus/http_chunked/
+!/corpus/http_frame/
+!/corpus/http_head/
+# What a local run *adds* to those is still an artifact: libFuzzer names its
+# own finds by SHA1, so ignore anything shaped like one.
 /corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]

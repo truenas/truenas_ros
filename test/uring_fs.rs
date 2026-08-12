@@ -3609,12 +3609,13 @@ fn fremovexattr_removes_allowlisted_attributes() {
 /// The trigger is a real race: a directory is yielded, and the descent into it
 /// is deferred to the next call so `skip_descent` can cancel it — swap the
 /// directory for a regular file inside that window and the deferred
-/// `O_DIRECTORY` open fails `ENOTDIR`. Deliberately a *local* provocation.
-/// Exhausting the fd table would do it too, but the fd table belongs to the
-/// process and `cargo test` runs tests as threads in one, so a walk that
-/// dup-bombs starves whatever else is running: under a 1024 fd limit that
-/// reliably fails an unrelated test in this binary, and picks a different one
-/// each run.
+/// `O_DIRECTORY` open fails `ENOTDIR`.
+///
+/// Keep any provocation here *local* to the walk. `cargo test` runs a
+/// binary's tests as threads in one process, so anything that exhausts a
+/// process-wide resource — the fd table above all — starves whatever else is
+/// running rather than only this test, and fails a different innocent test on
+/// each run depending on the fd limit.
 #[test]
 fn descend_open_failure_surfaces_rather_than_dropping_the_subtree() {
     with_fs(FsConfig::default(), |h, me, dir, _stop| {
@@ -3648,5 +3649,36 @@ fn descend_open_failure_surfaces_rather_than_dropping_the_subtree() {
             b"z.txt",
             "a surfaced descend failure must not end the walk"
         );
+    });
+}
+
+/// The other side of that race, and the common one: a directory removed
+/// between the parent's `readdir` and the deferred descent leaves no subtree
+/// to list, so it drops out quietly rather than failing the walk. Any walk
+/// over a tree being written to hits this routinely, and a recursive copy that
+/// aborted every time a directory went away underneath it would be unusable.
+#[test]
+fn a_subtree_removed_under_the_walk_is_skipped_quietly() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/f.txt"), b"x").unwrap();
+        std::fs::write(dir.join("z.txt"), b"x").unwrap();
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+
+        let mut t = query_tree(&h, me, &anchor, TreeOptions::default())
+            .expect("query_tree");
+        assert_eq!(t.next().expect("some").expect("ok").key(), b"sub/");
+
+        // Same deferred-descent window as the ENOTDIR case, but the entry is
+        // gone rather than replaced.
+        std::fs::remove_file(dir.join("sub/f.txt")).unwrap();
+        std::fs::remove_dir(dir.join("sub")).unwrap();
+
+        assert_eq!(
+            t.next().expect("some").expect("ok").key(),
+            b"z.txt",
+            "a vanished subtree must not fail the walk"
+        );
+        assert!(t.next().is_none(), "the walk ends after the last sibling");
     });
 }

@@ -1,0 +1,15 @@
+# src/http — shared by http_head, http_frame and http_chunked.
+# libFuzzer's dictionary parser understands only \\ , \" and \xAB, so CR and
+# LF are spelled out rather than written \r and \n.
+crlf="\x0d\x0a"
+head_end="\x0d\x0a\x0d\x0a"
+get="GET / HTTP/1.1\x0d\x0a"
+put="PUT / HTTP/1.1\x0d\x0a"
+host="Host: h\x0d\x0a"
+content_length="Content-Length: "
+transfer_encoding="Transfer-Encoding: chunked\x0d\x0a"
+expect="Expect: 100-continue\x0d\x0a"
+connection_close="Connection: close\x0d\x0a"
+chunk_terminator="0\x0d\x0a\x0d\x0a"
+chunk_ext=";"
+trailer="x-amz-checksum-crc32:"

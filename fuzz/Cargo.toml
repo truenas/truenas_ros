@@ -6,7 +6,9 @@
 # kTLS test deps): it does NOT touch the library's libc+bitflags charter or its
 # 1.97 MSRV. Run with a nightly toolchain:
 #   cargo +nightly fuzz run framer_length_prefix
-#   cargo +nightly fuzz run statmount_parse corpus/statmount_parse -- -runs=0
+#   cargo +nightly fuzz run tree_cursor -- -dict=dicts/tree_cursor.dict
+# No corpus is checked in; regressions live in the library's own tests. See
+# the Fuzzing section of the top-level README for why.
 [package]
 name = "truenas_ros-fuzz"
 version = "0.0.0"

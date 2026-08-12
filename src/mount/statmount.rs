@@ -510,4 +510,46 @@ mod tests {
         // No MNT_OPTS bit at all → None.
         assert_eq!(base(StatmountMask::MNT_BASIC).mount_opts(), None);
     }
+
+    /// A string-array count is declared by the reply, not derived from it, so
+    /// it must never size an allocation on its own: `u32::MAX` options would
+    /// reserve ~96 GiB before a byte is read. The real bound is what remains
+    /// of the string area, since every string costs at least its terminator.
+    ///
+    /// Found by the `statmount_parse` fuzz target; kept here because the
+    /// property is about the decoder, not about any one byte sequence.
+    #[test]
+    fn a_declared_string_count_cannot_size_an_allocation() {
+        let mut words = synth(b"/", b"/mnt", b"zfs", b"tank/ds");
+        // SAFETY: `synth` returns a buffer at least `STR_BASE` bytes long and
+        // 8-byte aligned, whose every field is an integer.
+        let hdr = unsafe { &mut *words.as_mut_ptr().cast::<RawStatmount>() };
+        hdr.mask |= StatmountMask::OPT_ARRAY.bits();
+        // The array starts past everything the reply actually carries, and
+        // claims the largest count the field can express.
+        hdr.opt_array = (hdr.size as usize - STR_BASE) as u32;
+        hdr.opt_num = u32::MAX;
+
+        let sm = parse(&words);
+        // The clamp is what keeps this from aborting on a 96 GiB reserve; the
+        // decode itself yields nothing, because nothing is there.
+        assert_eq!(
+            sm.opt_array.as_deref(),
+            Some(&[][..]),
+            "a count past the string area must decode to no strings"
+        );
+
+        // The same count with the array pointed *inside* the strings reads
+        // only what is really there and stops at the end of the buffer.
+        let hdr = unsafe { &mut *words.as_mut_ptr().cast::<RawStatmount>() };
+        hdr.opt_array = 0;
+        hdr.opt_num = u32::MAX;
+        let sm = parse(&words);
+        let opts = sm.opt_array.expect("OPT_ARRAY is set");
+        assert_eq!(
+            opts,
+            ["/", "/mnt", "zfs", "tank/ds"],
+            "the run must stop at the end of the reply, not at the count"
+        );
+    }
 }

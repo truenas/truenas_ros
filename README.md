@@ -174,18 +174,47 @@ It is a separate, self-rooted crate, so it never touches the library's
 ```sh
 cargo install cargo-fuzz
 cd fuzz
-cargo +nightly fuzz build                                  # compile every target
-cargo +nightly fuzz run acl_nfs4 corpus/acl_nfs4 -- -runs=0  # replay the seeds
-cargo +nightly fuzz run statmount_parse -- -max_total_time=300   # a real campaign
+cargo +nightly fuzz build                          # compile every target
+cargo +nightly fuzz run statmount_parse -- -max_total_time=300
+cargo +nightly fuzz run tree_cursor -- -dict=dicts/tree_cursor.dict
 ```
 
 Targets assert **properties**, not just the absence of a panic — decode/encode
 idempotence, total ordering, injection safety, or a privilege check holding —
-so read a target's `//!` header for what it actually claims. Seed corpora are
-checked in under `fuzz/corpus/`, both as a regression suite and because a
-fuzzer will not otherwise guess a magic number like `TnCk` or the exact length
-relation an ACL blob has to satisfy. CI builds every target and replays the
-seeds; finding new bugs is a job for a real campaign.
+so read a target's `//!` header for what it actually claims.
+
+**The corpus is a generated artifact, not source**, which is cargo-fuzz's own
+default (`fuzz/corpus/` is in its scaffolded `.gitignore`) and worth keeping
+for three reasons. Seed files are opaque in review, so nobody can tell a good
+seed from a corrupt one. They encode host byte order, because several of these
+formats use native-endian magics. And they drift silently: change a format and
+the seeds still load, they just stop covering the path they were written for.
+
+The `http_*` corpora are the exception — tracked, and owned with the codec.
+
+What seeds were doing here, measured over equal 45s runs, was 0–5%:
+
+| target | from seeds | from empty |
+| --- | --- | --- |
+| `statmount_parse` | 457 | 448 |
+| `configfile_ini` | 1050 | 998 |
+| `acl_nfs4` | 224 | 224 |
+| `tree_cursor` | 78 | 78 |
+
+libFuzzer recovers a magic like `TnCk` from comparison interception in seconds,
+so the usual argument for checking seeds in — that a fuzzer will never guess
+one — does not hold. Where a token hint is genuinely wanted, it goes in
+[`fuzz/dicts/`](fuzz/dicts) as plain reviewable text.
+
+**Regressions belong in `cargo test`, not in a corpus.** When a target finds
+something, fix it and pin the input as a unit test beside the code, where the
+assertion names the invariant instead of leaving a hex blob to be re-derived —
+`a_declared_string_count_cannot_size_an_allocation` in `mount/statmount.rs` and
+`entry_ids_decode_the_way_the_kernel_writes_them` in `sync_fs/acl/posix.rs` are
+both fuzz findings that now run in every `cargo test`. CI builds every target
+and gives each ten seconds, from its seeds where it has them. That catches a
+harness which builds but aborts on any input; it is not a regression suite.
+Finding new bugs is a job for a real campaign.
 
 ### Model checking
 
