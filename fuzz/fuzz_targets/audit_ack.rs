@@ -73,10 +73,9 @@ fuzz_target!(|data: &[u8]| {
     } else {
         let err = i32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]);
         match verdict {
-            Ok(SendStatus::Delivered) => assert_eq!(
-                err, 0,
-                "a non-zero errno was reported as delivered"
-            ),
+            Ok(SendStatus::Delivered) => {
+                assert_eq!(err, 0, "a non-zero errno was reported as delivered")
+            }
             Ok(SendStatus::Unavailable) => assert!(
                 matches!(
                     err.unsigned_abs() as i32,
@@ -84,10 +83,9 @@ fuzz_target!(|data: &[u8]| {
                 ),
                 "errno {err} is not the benign-unavailability class"
             ),
-            Err(_) => assert_ne!(
-                err, 0,
-                "a zero errno was reported as a failure"
-            ),
+            Err(_) => {
+                assert_ne!(err, 0, "a zero errno was reported as a failure")
+            }
         }
     }
 

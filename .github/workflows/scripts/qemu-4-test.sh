@@ -102,6 +102,12 @@ export RUST_BACKTRACE=1
 # real failure that must turn CI red.
 export TRUENAS_ROS_REQUIRE_IO_URING=1
 export TRUENAS_ROS_REQUIRE_KTLS=1
+# The ZFS-ACL suites (test/zfs.rs and the live-fixture ACL checks in
+# test/test.rs) skip when their datasets are absent. Those datasets were
+# provisioned above, so force the suites to RUN: a skip now means provisioning
+# silently degraded (wrong acltype, unmounted) and must turn CI red rather than
+# pass green having tested nothing.
+export TRUENAS_ROS_REQUIRE_ZFS=1
 # unix_peercred needs the AF_UNIX io_uring getsockopt fix (kernel >= 6.18.16).
 # We boot the TrueNAS <train>-nightly kernel (truenas/linux), whose uname -r
 # carries the full point release (e.g. 6.18.16-production+truenas), so read it

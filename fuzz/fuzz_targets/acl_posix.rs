@@ -81,9 +81,7 @@ fuzz_target!(|data: &[u8]| {
         "decode/encode is not idempotent"
     );
     assert_eq!(
-        again
-            .access_bytes()
-            .expect("re-decoded ACL must re-encode"),
+        again.access_bytes().expect("re-decoded ACL must re-encode"),
         aenc,
         "access encoding is not a fixed point"
     );

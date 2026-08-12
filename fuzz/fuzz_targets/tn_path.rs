@@ -30,10 +30,7 @@ fuzz_target!(|data: &[u8]| {
                 !has_interior_nul,
                 "a name with an interior NUL was silently converted: {data:?}"
             );
-            assert_eq!(
-                bytes, data,
-                "the CStr does not carry the input bytes"
-            );
+            assert_eq!(bytes, data, "the CStr does not carry the input bytes");
         }
         Err(_) => assert!(
             has_interior_nul,
@@ -42,7 +39,11 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // `len`/`is_empty` describe the same bytes the conversion sees.
-    assert_eq!(TnPath::len(data), data.len(), "len disagrees with the input");
+    assert_eq!(
+        TnPath::len(data),
+        data.len(),
+        "len disagrees with the input"
+    );
     assert_eq!(
         TnPath::is_empty(data),
         data.is_empty(),
@@ -60,8 +61,7 @@ fuzz_target!(|data: &[u8]| {
         );
         if let Ok(bytes) = via_str {
             assert_eq!(
-                bytes,
-                data,
+                bytes, data,
                 "the str impl produced different bytes than [u8]"
             );
         }
