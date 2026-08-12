@@ -213,6 +213,7 @@ fn assert_doc(py: &str, doc: &str, check_typed: bool) {
     assert_serialization(&rnew.write_string(), &spaced, doc, "interp-spaced");
 
     assert_probes(&rnew, &probes, doc, check_typed);
+    assert_option_order(&rnew, &probes, doc);
 
     // Rust's serialization must itself reparse to the same bytes (write/parse
     // symmetry); combined with the parity above this pins full round-tripping.
@@ -257,6 +258,32 @@ fn assert_probes(
             assert_float(cfg, p, doc);
             assert_bool(cfg, p, doc);
         }
+    }
+}
+
+/// `options()` must agree with `configparser.options` on *order*, not just on
+/// membership: the oracle emits its probes by walking `cp.options(section)`
+/// for each section in turn, so the probe list is that order verbatim.
+///
+/// CPython copies the section and `update`s it with the defaults, putting the
+/// section's own keys first and appending the `DEFAULT` keys it did not
+/// override — the reverse of `items()`, which starts from the defaults. The
+/// two really do disagree upstream, so nothing here can be shared between
+/// them.
+fn assert_option_order(cfg: &ConfigFile, probes: &[Probe], doc: &str) {
+    let mut want: Vec<(&str, Vec<&str>)> = Vec::new();
+    for p in probes {
+        match want.last_mut() {
+            Some((s, opts)) if *s == p.section => opts.push(&p.option),
+            _ => want.push((&p.section, vec![&p.option])),
+        }
+    }
+    for (section, opts) in want {
+        assert_eq!(
+            cfg.options(section).unwrap_or_default(),
+            opts,
+            "options({section:?}) order mismatch in {doc:?}"
+        );
     }
 }
 
@@ -366,6 +393,15 @@ const CURATED: &[&str] = &[
     "[DEFAULT]\nbase = /srv\n[s]\np = %(base)s/data\n", // interpolation
     "[s]\na = 1\nb = %(a)s%(a)s\nc = %(b)s\n", // chained interpolation
     "[s]\nbad = 50%\n",   // invalid interpolation → get() errs
+    // U+001C..U+001F are whitespace to CPython's strip and to `re`'s \s, but
+    // not to Unicode's White_Space that Rust's trim implements. They are the
+    // only four code points the two definitions disagree on, so they fence a
+    // key, a value, and a continuation line here.
+    "[s]\nk\u{1c} = v\n",
+    "[s]\nk = \u{1f}v\u{1e}\n",
+    "[s]\n\u{1d}k = v\n",
+    "[s]\nk = one\n\u{1c}two\n",
+    "[s]\nk =\u{1c}\n",
     // A '\r' is not a line break on this path: `read_string` wraps the text in
     // a StringIO with newline='\n'. The same bytes in a file are FILE_CORPUS.
     "[s]\rk = v\rj = w\r",

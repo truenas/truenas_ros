@@ -16,6 +16,33 @@ use std::collections::HashSet;
 /// list of (stripped) lines that are joined at the end.
 type Acc = Option<Vec<String>>;
 
+/// Whitespace as CPython counts it, which is not what Rust counts.
+///
+/// `str.strip()`, `str.isspace()` and `re`'s `\s` all go through
+/// `Py_UNICODE_ISSPACE`, which includes U+001C..U+001F — the file, group,
+/// record and unit separators. Unicode's `White_Space` property, which
+/// `char::is_whitespace` implements, does not. Compared across every code
+/// point those four are the *only* disagreement in either direction, so
+/// widening by exactly them makes the two definitions identical.
+///
+/// It matters because every strip in the read loop is a strip `configparser`
+/// also performs: a key or value fenced by one of these bytes otherwise parses
+/// to a different string here than there, and `get` and `write_string` both
+/// inherit the difference.
+fn is_py_space(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}')
+}
+
+/// `str.strip()`.
+fn py_strip(s: &str) -> &str {
+    s.trim_matches(is_py_space)
+}
+
+/// `str.rstrip()`.
+fn py_rstrip(s: &str) -> &str {
+    s.trim_end_matches(is_py_space)
+}
+
 /// Which section subsequent option/continuation lines belong to.
 enum Cur {
     None,
@@ -49,7 +76,7 @@ pub(super) fn read(
     // per '\n', with no spurious trailing empty line when the text ends in '\n'.
     for (idx, line) in text.split_inclusive('\n').enumerate() {
         let lineno = idx + 1;
-        let trimmed = line.trim();
+        let trimmed = py_strip(line);
         let is_full_comment =
             trimmed.starts_with('#') || trimmed.starts_with(';');
         let clean = if is_full_comment { "" } else { trimmed };
@@ -72,7 +99,7 @@ pub(super) fn read(
         }
 
         // Continuation depth is measured on the raw (un-stripped) line.
-        let cur_indent = line.chars().take_while(|c| c.is_whitespace()).count();
+        let cur_indent = line.chars().take_while(|c| is_py_space(*c)).count();
 
         let is_continuation = !matches!(cur, Cur::None)
             && optname.is_some()
@@ -211,13 +238,13 @@ fn parse_option(
 ) -> Option<(&str, Option<&str>)> {
     match clean.find(['=', ':']) {
         Some(p) => {
-            let key = clean[..p].trim_end();
-            let value = clean[p + 1..].trim();
+            let key = py_rstrip(&clean[..p]);
+            let value = py_strip(&clean[p + 1..]);
             Some((key, Some(value)))
         }
         None => {
             if allow_no_value {
-                Some((clean.trim_end(), None))
+                Some((py_rstrip(clean), None))
             } else {
                 None
             }
@@ -230,7 +257,7 @@ fn parse_option(
 fn join(acc: Acc) -> Option<String> {
     acc.map(|lines| {
         let mut s = lines.join("\n");
-        s.truncate(s.trim_end().len());
+        s.truncate(py_rstrip(&s).len());
         s
     })
 }

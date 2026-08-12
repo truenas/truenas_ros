@@ -15,6 +15,10 @@ use crate::error::{Error, Result};
 /// blow ~800 bytes up to 10¹⁰), so the depth limit alone does not stop an
 /// untrusted config from exhausting memory. Bounding the accumulated output
 /// does — 1 MiB is far beyond any real interpolated value.
+///
+/// CPython has no such cap, so this rejects a handful of documents it would
+/// resolve. That is the point: the alternative to rejecting them is resolving
+/// them, and the input is a config file the process did not write.
 const MAX_INTERPOLATION_OUTPUT: usize = 1 << 20;
 
 /// Interpolate `value` for `option`, resolving `%(name)s` against `map` (the
