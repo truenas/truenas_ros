@@ -508,14 +508,18 @@ impl FsIter {
         let st = statx(fd.as_fd(), "", ITER_AT, ITER_MASK)?;
         let is_dir = st.is_dir();
 
-        // Skip files created after the cutoff (0 disables). Mountpoints and
-        // directories are never btime-filtered.
-        if !is_mount
-            && !is_dir
-            && self.btime_cutoff != 0
-            && st.btime().sec > self.btime_cutoff
-        {
-            return Ok(None);
+        // Mountpoints and directories are never btime-filtered.
+        if !is_mount && !is_dir {
+            match btime_skips(&st, self.btime_cutoff) {
+                Some(true) => return Ok(None),
+                Some(false) => {}
+                None => {
+                    return Err(Error::Validation(format!(
+                        "btime_cutoff is set but {name:?} is on a filesystem \
+                         that reports no birth time"
+                    )))
+                }
+            }
         }
 
         let file_type = if is_mount {
@@ -646,6 +650,10 @@ impl FsIterBuilder {
     }
 
     /// Skip files whose birth time is newer than `epoch_secs` (0 disables).
+    ///
+    /// Requires a filesystem that reports one. Where `statx` leaves
+    /// `STATX_BTIME` clear the walk fails, rather than yielding files it
+    /// cannot show are old enough; ZFS always reports it.
     pub fn btime_cutoff(mut self, epoch_secs: i64) -> Self {
         self.btime_cutoff = epoch_secs;
         self
@@ -773,6 +781,28 @@ impl FsIterBuilder {
 fn is_dot(name: &OsStr) -> bool {
     let b = name.as_bytes();
     b == b"." || b == b".."
+}
+
+/// The birth-time cutoff decision for one entry: `Some(true)` to skip it,
+/// `Some(false)` to keep it, `None` when the filesystem reported no birth
+/// time and the question therefore has no answer.
+///
+/// The mask check is what makes the filter honest, and dropping it is the
+/// tempting simplification. A filesystem that records no birth time leaves
+/// `STATX_BTIME` clear and `stx_btime` zero, so a bare compare reads every
+/// file as born at the epoch, keeps all of them, and looks exactly like a
+/// cutoff nothing happened to exceed. The caller cannot tell the two apart,
+/// which is why this reports the third case rather than guessing. ZFS fills
+/// the field unconditionally (`zpl_getattr_impl`, `zpl_inode.c:502`), so on a
+/// dataset `None` never happens.
+fn btime_skips(st: &Statx, cutoff: i64) -> Option<bool> {
+    if cutoff == 0 {
+        return Some(false);
+    }
+    if !st.mask().contains(StatxMask::BTIME) {
+        return None;
+    }
+    Some(st.btime().sec > cutoff)
 }
 
 fn dup_cloexec(fd: BorrowedFd<'_>) -> errno::Result<OwnedFd> {
@@ -924,12 +954,41 @@ impl Drop for Dir {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync_fs::StatxRaw;
 
     fn fs_source(p: &Path) -> String {
         crate::mount::statmount_path(p)
             .ok()
             .and_then(|sm| sm.sb_source)
             .unwrap_or_else(|| "x".to_string())
+    }
+
+    /// A `Statx` reporting `btime` at `sec`, or leaving `STATX_BTIME` clear
+    /// when `reported` is false — which no filesystem to hand does, so the
+    /// cutoff's fail-open case is only reachable from here.
+    fn with_btime(reported: bool, sec: i64) -> Statx {
+        // SAFETY: `StatxRaw` is a #[repr(C)] POD of integers; all-zero is the
+        // "kernel filled in nothing" state this builds up from.
+        let mut raw: StatxRaw = unsafe { std::mem::zeroed() };
+        raw.stx_mask = StatxMask::BASIC_STATS.bits();
+        if reported {
+            raw.stx_mask |= StatxMask::BTIME.bits();
+        }
+        raw.stx_btime.tv_sec = sec;
+        Statx::from_raw(raw)
+    }
+
+    #[test]
+    fn a_cutoff_refuses_a_filesystem_with_no_birth_time() {
+        // Reported: the cutoff decides, and both answers are reachable.
+        assert_eq!(btime_skips(&with_btime(true, 500), 100), Some(true));
+        assert_eq!(btime_skips(&with_btime(true, 50), 100), Some(false));
+        // Not reported: stx_btime is zero, so a compare would read "born at
+        // the epoch" and keep the file. Refuse instead of answering wrongly.
+        assert_eq!(btime_skips(&with_btime(false, 0), 100), None);
+        // A zero cutoff disables the filter, so an absent btime is no
+        // obstacle — nothing was asked of it.
+        assert_eq!(btime_skips(&with_btime(false, 0), 0), Some(false));
     }
 
     /// Offer `name` to `it` as `readdir` would on such a filesystem.

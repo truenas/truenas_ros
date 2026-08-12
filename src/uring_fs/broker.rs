@@ -325,14 +325,10 @@ impl Drop for BrokerInner {
                 0u32,
             );
         }
-        loop {
-            // SAFETY: waitpid on our child pid; a NULL status pointer is
-            // allowed.
-            let r = unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) };
-            if r >= 0 || Errno::last() != Errno::EINTR {
-                break;
-            }
-        }
+        // SAFETY: waitpid on our child pid; a NULL status pointer is allowed.
+        let _ = retry_on_eintr(|| unsafe {
+            libc::waitpid(self.pid, std::ptr::null_mut(), 0)
+        });
         // `pidfd` and `sock` (OwnedFd) close after this body.
     }
 }

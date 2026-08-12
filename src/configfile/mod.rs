@@ -273,13 +273,22 @@ impl ConfigFile {
     /// The option keys visible in `section` (its own keys plus inherited
     /// `DEFAULT` keys), or `None` if the section does not exist. Keys are
     /// lowercased.
+    ///
+    /// The section's own keys come first, in file order, then the `DEFAULT`
+    /// keys it did not override. That is `configparser.options`, which copies
+    /// the section and `update`s it with the defaults — the opposite order
+    /// from [`items`](Self::items), which builds up from the defaults instead.
+    /// The two disagree in CPython and so they disagree here.
     pub fn options(&self, section: &str) -> Option<Vec<String>> {
         let opts = self.sections.get(section)?;
-        let mut merged = self.defaults.clone();
-        for (k, v) in opts.iter() {
-            merged.insert(k, v.clone());
-        }
-        Some(merged.keys().map(str::to_string).collect())
+        let mut merged: Vec<String> = opts.keys().map(str::to_string).collect();
+        merged.extend(
+            self.defaults
+                .keys()
+                .filter(|k| !opts.contains(k))
+                .map(str::to_string),
+        );
+        Some(merged)
     }
 
     /// Whether `option` is set in `section` or inherited from `DEFAULT`.
@@ -323,6 +332,21 @@ impl ConfigFile {
 
     /// [`get`](Self::get), parsed as an integer (`configparser.getint`).
     /// `Ok(None)` if absent; `Err` if the value is not a valid integer.
+    ///
+    /// # Where this and `int()` part company
+    ///
+    /// The conversion is Rust's. `configparser` hands the string to `int()`,
+    /// which additionally accepts underscores between digits (`1_000`), any
+    /// Unicode decimal digit (`١٢٣`), and a magnitude no machine integer
+    /// holds; [`get_float`](Self::get_float) inherits the first two from
+    /// `float()`. All three are errors here, and matching them would mean an
+    /// arbitrary-precision integer and a port of Python's numeric-literal
+    /// grammar for values a config file does not plausibly contain.
+    ///
+    /// Every difference runs the same way — Python accepts something this
+    /// rejects. Neither getter returns a *different* number from the one
+    /// `configparser` would, so a value that converts here converts there to
+    /// the same thing.
     pub fn get_int(&self, section: &str, option: &str) -> Result<Option<i64>> {
         match self.get(section, option)? {
             None => Ok(None),

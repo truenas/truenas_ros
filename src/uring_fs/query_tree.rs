@@ -393,7 +393,7 @@ impl QueryTree {
     /// is there — fd exhaustion, I/O, a mount not crossed, a directory
     /// replaced by something else — is surfaced as `Some(Err)`, so an
     /// incomplete walk is never mistaken for a fully listed one. See
-    /// [`is_subtree_skip`] for which is which and why.
+    /// `is_subtree_skip` for which is which and why.
     ///
     /// A surfaced descent failure is per-subtree, not terminal: the walk
     /// resumes in the parent on the next call.

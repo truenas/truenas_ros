@@ -643,6 +643,25 @@ fn make_symlink(
 /// data would block (FIFO) or run a device's `open` method. Metadata is set
 /// directly on the new node (no data fd exists for these types), each attribute
 /// gated on its copy flag.
+///
+/// # Ownership, mode and timestamps only
+///
+/// Extended attributes and ACLs are not carried onto a special node, and
+/// routing this through [`copy_xattrs`] would not carry them either. The node
+/// is pinned with `O_PATH` for the reason above, and the whole `f*xattr`
+/// family refuses an `O_PATH` descriptor with `EBADF`: for an empty path
+/// `path_setxattrat` resolves the fd through `fdget` (`fs/xattr.c:757`), which
+/// masks out `FMODE_PATH`. `setxattrat` with `AT_EMPTY_PATH` is the same call
+/// — `getname_maybe_null` returns NULL for an empty name (`fs/namei.c:233`),
+/// landing on that branch. `fchmodat2` is not subject to this, which is why
+/// the mode below can be set through the handle and the xattrs cannot.
+///
+/// What is left is re-resolving the name (which reopens the redirect window
+/// the pin exists to close) or `/proc/self/fd/N`. Neither is worth it for what
+/// is missed: the VFS already refuses `user.*` on anything that is not a
+/// regular file or a directory (`xattr_permission`, `fs/xattr.c:154`), and
+/// [`copy_xattrs`] skips `system.` and `security.` by charter, so the gap is
+/// `trusted.*` plus any ACL the source node carries.
 fn make_special(
     parent: BorrowedFd<'_>,
     name: &OsStr,

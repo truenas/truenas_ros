@@ -16,6 +16,57 @@ use std::collections::HashSet;
 /// list of (stripped) lines that are joined at the end.
 type Acc = Option<Vec<String>>;
 
+/// Whitespace as CPython counts it, which is not what Rust counts.
+///
+/// `str.strip()`, `str.isspace()` and `re`'s `\s` all go through
+/// `Py_UNICODE_ISSPACE`, which includes U+001C..U+001F — the file, group,
+/// record and unit separators. Unicode's `White_Space` property, which
+/// `char::is_whitespace` implements, does not. Compared across every code
+/// point those four are the *only* disagreement in either direction, so
+/// widening by exactly them makes the two definitions identical.
+///
+/// It matters because every strip in the read loop is a strip `configparser`
+/// also performs: a key or value fenced by one of these bytes otherwise parses
+/// to a different string here than there, and `get` and `write_string` both
+/// inherit the difference.
+fn is_py_space(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}')
+}
+
+/// `str.strip()`.
+fn py_strip(s: &str) -> &str {
+    s.trim_matches(is_py_space)
+}
+
+/// `str.rstrip()`.
+fn py_rstrip(s: &str) -> &str {
+    s.trim_end_matches(is_py_space)
+}
+
+/// The current section as a duplicate-detection key.
+///
+/// Stands in for the section's name, which is what `configparser` keys
+/// `elements_added` by. The substitution is sound because the mapping is
+/// injective within one read: section indices are only ever appended, a
+/// repeated header is rejected before it gets here, and a section literally
+/// named DEFAULT is routed to [`Cur::Default`] rather than given an index.
+/// Being `Copy`, it costs no allocation per option line.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum SectionId {
+    Default,
+    At(usize),
+}
+
+impl SectionId {
+    fn of(cur: &Cur) -> SectionId {
+        match cur {
+            // Unreachable: an option with no open section is rejected above.
+            Cur::None | Cur::Default => SectionId::Default,
+            Cur::Section(i) => SectionId::At(*i),
+        }
+    }
+}
+
 /// Which section subsequent option/continuation lines belong to.
 enum Cur {
     None,
@@ -40,7 +91,7 @@ pub(super) fn read(
     // Fresh per read, so a section/option only conflicts within this document —
     // matching `configparser`'s per-`_read` `elements_added`.
     let mut added_sections: HashSet<String> = HashSet::new();
-    let mut added_options: HashSet<(String, String)> = HashSet::new();
+    let mut added_options: HashSet<(SectionId, String)> = HashSet::new();
     // Non-fatal option-syntax errors are collected and reported together at the
     // end (like `configparser`'s accumulated `ParsingError`).
     let mut parse_errors: Vec<String> = Vec::new();
@@ -49,7 +100,7 @@ pub(super) fn read(
     // per '\n', with no spurious trailing empty line when the text ends in '\n'.
     for (idx, line) in text.split_inclusive('\n').enumerate() {
         let lineno = idx + 1;
-        let trimmed = line.trim();
+        let trimmed = py_strip(line);
         let is_full_comment =
             trimmed.starts_with('#') || trimmed.starts_with(';');
         let clean = if is_full_comment { "" } else { trimmed };
@@ -72,16 +123,16 @@ pub(super) fn read(
         }
 
         // Continuation depth is measured on the raw (un-stripped) line.
-        let cur_indent = line.chars().take_while(|c| c.is_whitespace()).count();
+        let cur_indent = line.chars().take_while(|c| is_py_space(*c)).count();
 
         let is_continuation = !matches!(cur, Cur::None)
             && optname.is_some()
             && cur_indent > indent_level;
         if is_continuation {
-            let name = optname.clone().unwrap();
+            let name = optname.as_deref().unwrap();
             let opts =
                 cur_opts(&mut work_default, &mut work_sections, &cur).unwrap();
-            match opts.get_mut(&name) {
+            match opts.get_mut(name) {
                 Some(Some(lines)) => lines.push(clean.to_string()),
                 _ => {
                     return Err(Error::Parse(format!(
@@ -130,8 +181,7 @@ pub(super) fn read(
             continue;
         }
 
-        let sect_name = current_section_name(&cur, &work_sections);
-        let dup_key = (sect_name, key.clone());
+        let dup_key = (SectionId::of(&cur), key.clone());
         if added_options.contains(&dup_key) {
             return Err(Error::Parse(format!(
                 "{source}:{lineno}: duplicate option {key:?}"
@@ -170,18 +220,6 @@ fn cur_opts<'a>(
     }
 }
 
-/// The name of the current section (used to key duplicate-option detection).
-fn current_section_name(
-    cur: &Cur,
-    work_sections: &Ordered<Ordered<Acc>>,
-) -> String {
-    match cur {
-        Cur::None => String::new(),
-        Cur::Default => DEFAULT_SECTION.to_string(),
-        Cur::Section(i) => work_sections.entries[*i].0.clone(),
-    }
-}
-
 /// Match a section header `[name]` against a stripped line, returning `name`.
 ///
 /// Mirrors `configparser`'s `SECTCRE = \[(?P<header>.+)\]` matched with
@@ -211,13 +249,13 @@ fn parse_option(
 ) -> Option<(&str, Option<&str>)> {
     match clean.find(['=', ':']) {
         Some(p) => {
-            let key = clean[..p].trim_end();
-            let value = clean[p + 1..].trim();
+            let key = py_rstrip(&clean[..p]);
+            let value = py_strip(&clean[p + 1..]);
             Some((key, Some(value)))
         }
         None => {
             if allow_no_value {
-                Some((clean.trim_end(), None))
+                Some((py_rstrip(clean), None))
             } else {
                 None
             }
@@ -230,7 +268,7 @@ fn parse_option(
 fn join(acc: Acc) -> Option<String> {
     acc.map(|lines| {
         let mut s = lines.join("\n");
-        s.truncate(s.trim_end().len());
+        s.truncate(py_rstrip(&s).len());
         s
     })
 }

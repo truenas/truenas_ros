@@ -98,6 +98,7 @@ pub(crate) unsafe fn clone3_fork(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::errno::retry_on_eintr;
 
     extern "C" fn dummy_handler(_sig: libc::c_int) {}
 
@@ -137,12 +138,9 @@ mod tests {
         }
 
         let mut status = 0;
-        loop {
-            let r = unsafe { libc::waitpid(pid, &mut status, 0) };
-            if r >= 0 || Errno::last() != Errno::EINTR {
-                break;
-            }
-        }
+        // SAFETY: waitpid on our own child, writing through a live local.
+        let _ =
+            retry_on_eintr(|| unsafe { libc::waitpid(pid, &mut status, 0) });
         // Restore the parent's original disposition and close the pidfd.
         // SAFETY: restoring the saved sigaction; closing our owned pidfd.
         unsafe {
