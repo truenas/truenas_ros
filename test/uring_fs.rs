@@ -3341,6 +3341,67 @@ fn paging_with_a_cursor_reproduces_the_walk_exactly() {
     });
 }
 
+/// `skip_descent` and `cursor` are both documented delimiter primitives, so
+/// the obvious composition of them — fold a directory into a common prefix,
+/// then page — has to work. It is the page boundary that makes it hard: the
+/// walk emits a directory *before* its contents, so a cursor sitting on a
+/// folded directory is positioned at the start of the subtree the caller just
+/// said to skip. Resuming there must not re-enter it, and must not re-emit
+/// the directory either.
+#[test]
+fn a_folded_subtree_stays_folded_across_a_page_boundary() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        make_tree(&dir);
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        // What one uninterrupted walk yields when every directory is pruned.
+        let expected = ["a-1.txt", "a.txt", "a/", "aa.txt", "z/"];
+
+        for page in 1..=expected.len() {
+            let mut paged: Vec<String> = Vec::new();
+            let mut resume: Option<TreeCursor> = None;
+            loop {
+                let mut t = query_tree(
+                    &h,
+                    me,
+                    &anchor,
+                    TreeOptions {
+                        resume: resume.clone(),
+                        ..Default::default()
+                    },
+                )
+                .expect("query_tree");
+                let mut n = 0;
+                while n < page {
+                    match t.next() {
+                        Some(e) => {
+                            let e = e.expect("entry");
+                            let is_dir = e.is_dir();
+                            paged.push(String::from_utf8(e.key()).unwrap());
+                            if is_dir {
+                                t.skip_descent();
+                            }
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+                // Round-trip the token, since a real pager persists it.
+                let blob = t.cursor().to_bytes();
+                resume = Some(
+                    TreeCursor::from_bytes(&blob).expect("cursor decodes"),
+                );
+            }
+            assert_eq!(
+                paged, expected,
+                "folding every directory, {page} entries at a time"
+            );
+        }
+    });
+}
+
 /// A cursor survives serialization, so a listing can be resumed by a later
 /// request — or a later process — and not just within one walk.
 #[test]
@@ -3537,5 +3598,52 @@ fn fremovexattr_removes_allowlisted_attributes() {
         // Removing what is not there is an error, not a silent success.
         assert!(h.fremovexattr(&f, &owned).is_err());
         h.close(f).unwrap();
+    });
+}
+
+/// A subtree that cannot be *opened* for a non-permission reason — here fd
+/// exhaustion (`EMFILE`) — must surface as an error, not vanish from the walk
+/// the way the readdir path already refuses to. A silently dropped subtree is
+/// data loss for the recursive delete/copy this walk backs.
+#[test]
+fn descend_open_failure_surfaces_rather_than_dropping_the_subtree() {
+    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        for i in 0..4 {
+            std::fs::write(dir.join(format!("sub/f{i}.txt")), b"x").unwrap();
+        }
+        std::fs::write(dir.join("z.txt"), b"x").unwrap();
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+
+        let mut t = query_tree(&h, me, &anchor, TreeOptions::default())
+            .expect("query_tree");
+        // "sub/" sorts before "z.txt"; its descent is deferred to the next call.
+        assert_eq!(t.next().expect("some").expect("ok").key(), b"sub/");
+
+        // Exhaust the fd table so the deferred open of "sub" gets EMFILE.
+        let mut hogs: Vec<i32> = Vec::new();
+        loop {
+            let fd = unsafe { libc::dup(1) };
+            if fd < 0 {
+                break;
+            }
+            hogs.push(fd);
+        }
+        let next = t.next(); // triggers descend("sub")
+        for fd in hogs {
+            unsafe { libc::close(fd) };
+        }
+
+        match next {
+            Some(Err(Error::Errno(e))) => {
+                assert!(
+                    matches!(e, Errno::EMFILE | Errno::ENFILE),
+                    "fd exhaustion should surface as EMFILE/ENFILE, got {e:?}"
+                );
+            }
+            other => panic!(
+                "an unopenable subtree must surface an error, got {other:?}"
+            ),
+        }
     });
 }
