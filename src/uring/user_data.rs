@@ -33,7 +33,7 @@ pub(crate) fn unpack_raw(user_data: u64) -> (u8, u32, u32) {
     (tag, slot, generation)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 

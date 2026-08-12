@@ -74,3 +74,21 @@ mod record;
 
 pub use netlink::{AuditSocket, SendStatus, MAX_RECORD_LEN};
 pub use record::{AuditEvent, AuditPrincipal, AuditType};
+
+/// The netlink ack decoder, exposed to the fuzz crate (`fuzz/`) under `__fuzz`
+/// only — `netlink` is a private module. Never part of the stable API.
+///
+/// Driven by `fuzz/fuzz_targets/audit_ack.rs`: the bytes arrive on a socket
+/// every netlink peer can write to, so the decoder's length guards must hold
+/// for a datagram of any shape.
+#[cfg(feature = "__fuzz")]
+pub mod fuzz {
+    /// Interpret one received netlink datagram as an ack for `seq`; `None`
+    /// means "not attributable, keep scanning".
+    pub fn decode_ack(
+        buf: &[u8],
+        seq: u32,
+    ) -> Option<crate::errno::Result<super::SendStatus>> {
+        super::netlink::decode_ack(buf, seq)
+    }
+}

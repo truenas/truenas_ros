@@ -34,13 +34,18 @@ jobs:
         rustup component add clippy rustfmt
         rustup default stable
 
+    # `~/.cargo/bin` is in the cache for cargo-fuzz: installing it is a
+    # from-source build of a whole binary, which would otherwise be the slowest
+    # step in this job on every run.
     - name: Cache cargo
       uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
+          ~/.cargo/bin
           target
+          fuzz/target
         key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
 
     - name: rustfmt
@@ -83,16 +88,45 @@ jobs:
         TRUENAS_ROS_REQUIRE_PYTHON: "1"
         TRUENAS_ROS_REQUIRE_IO_URING: "1"
 
-    # The SQ/CQ memory-ordering model (src/uring/ring.rs) is gated on
-    # `#[cfg(loom)]`: loom substitutes std's atomics/UnsafeCell with its own
-    # permutation-checking versions, so it cannot ride along with the `cargo test`
-    # above — it needs its own build under `--cfg loom` and is invisible to every
-    # other step (including clippy). The model is deliberately tiny (a 2-slot ring,
-    # one issuer + one mock kernel) so exploring every user<->kernel interleaving of
-    # the ring index words stays sub-second. `uring` is the minimal feature that
-    # compiles the engine. cfg(loom) is registered in Cargo.toml's [lints.rust].
-    - name: loom (SQ/CQ memory-ordering model)
-      run: RUSTFLAGS="--cfg loom" cargo test --lib --features uring sq_cq_ordering
+    # The concurrency models are gated on `#[cfg(loom)]`: loom substitutes std's
+    # atomics/locks/UnsafeCell with its own permutation-checking versions, so they
+    # cannot ride along with the `cargo test` above — they need their own build
+    # under `--cfg loom` and are invisible to every other step (including clippy).
+    # Every model lives in a `loom_tests` module, so one name filter selects them
+    # all. Each is deliberately tiny (loom is exhaustive, and its MAX_THREADS is 5
+    # including the main thread); the heavier ones run under a preemption bound,
+    # which their doc comments call out as making them bounded rather than
+    # exhaustive proofs. cfg(loom) is registered in Cargo.toml's [lints.rust].
+    #
+    # Two invocations because the models span two feature sets: the SQ/CQ ring
+    # model needs only the shared engine, the pool/offload/inject ones need the
+    # fs reactor.
+    - name: loom (concurrency models)
+      run: |
+        RUSTFLAGS="--cfg loom" cargo test --lib --features uring    loom_
+        RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
+
+    # The fuzz crate is self-rooted (its own workspace), so nothing above ever
+    # compiles it — a target could bit-rot against an API change and no one would
+    # know until someone ran a campaign by hand. Build every target, then replay
+    # the checked-in seed corpora with `-runs=0`: a deterministic regression pass
+    # over known-interesting inputs, no time budget, seconds to run. Finding *new*
+    # bugs is a job for a real campaign, not for CI.
+    - name: fuzz (build + replay seed corpora)
+      run: |
+        rustup toolchain install nightly --profile minimal
+        command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
+        cd fuzz
+        cargo +nightly fuzz build
+        for t in $(cargo +nightly fuzz list); do
+          if [ -d "corpus/$t" ]; then
+            echo "::group::replay $t"
+            cargo +nightly fuzz run "$t" "corpus/$t" -- -runs=0
+            echo "::endgroup::"
+          else
+            echo "::warning::no seed corpus for fuzz target $t"
+          fi
+        done
 
     # Each feature alone proves the per-subsystem gates and dependency edges
     # (acl without shutil, idmap alone, …); `uring` alone proves the shared
@@ -102,7 +136,8 @@ jobs:
       run: |
         cargo build --no-default-features
         for f in sync-fs xattr mount acl fhandle fsiter idmap shutil \
-                 configfile audit uring net-server net-client uring-fs; do
+                 configfile audit uring net-server net-client uring-fs \
+                 http __fuzz; do
           cargo build --no-default-features --features "$f"
         done
         cargo build --all-features

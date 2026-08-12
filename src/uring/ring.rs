@@ -510,7 +510,7 @@ impl Ring {
     /// bytes actually handed to the kernel rather than on the staging call's
     /// return. Same soundness premise as [`reset_staging`](Ring::reset_staging):
     /// with no `io_uring_enter`, the kernel has not read these slots.
-    #[cfg(all(test, feature = "uring-fs"))]
+    #[cfg(all(test, not(loom), feature = "uring-fs"))]
     pub(crate) fn staged_sqe(&self, i: u32) -> IoUringSqe {
         assert!(i < self.to_submit, "SQE {i} is not staged");
         let idx = (i & self.rings.sq_mask) as usize;
@@ -541,7 +541,7 @@ impl Ring {
     /// still 0 and no staged SQE was ever read. The assert enforces exactly
     /// that — `to_submit` and `sq_tail` both count every staged SQE, and only
     /// [`submit`](Ring::submit) parts them.
-    #[cfg(all(test, feature = "uring-fs"))]
+    #[cfg(all(test, not(loom), feature = "uring-fs"))]
     pub(crate) fn reset_staging(&mut self) {
         assert_eq!(
             self.to_submit, self.sq_tail,

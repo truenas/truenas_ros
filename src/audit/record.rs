@@ -318,17 +318,20 @@ fn encode_nv(out: &mut String, key: &str, value: &str) {
 
 /// The kernel's rule, from `audit_string_contains_control` (`kernel/audit.c`):
 /// a `"`, or any byte outside `0x21..=0x7e`. The kernel walks the value as
-/// `unsigned char`, so that range excludes `0x7f` and `0x80..=0xff` alike. An
-/// empty value is encoded too, so it cannot be confused with a bare token.
+/// `unsigned char`, so that range excludes `0x7f` and `0x80..=0xff` alike.
+///
+/// An empty value contains no such byte, so — like the kernel's loop, which
+/// simply does not run — it is *not* encoded, and [`encode_nv`] renders it as
+/// `key=""`. Encoding it instead would hex-encode zero bytes and emit a bare
+/// `key=`, which is the ambiguous unquoted form, not the safe one.
 ///
 /// One addition: `'` also forces encoding. The kernel wraps a user-space
 /// record's text in `msg='…'` (`kernel/audit.c`) and does not encode an
 /// apostrophe itself, so one inside a value closes that quote early.
 fn needs_encoding(value: &str) -> bool {
-    value.is_empty()
-        || value
-            .bytes()
-            .any(|b| b == b'"' || b == b'\'' || !(0x21..=0x7e).contains(&b))
+    value
+        .bytes()
+        .any(|b| b == b'"' || b == b'\'' || !(0x21..=0x7e).contains(&b))
 }
 
 /// Keep a field name usable as an audit key (no spaces, `=`, or quotes): map
@@ -358,10 +361,35 @@ mod tests {
         encode_nv(&mut b, "x", "a b"); // space -> encode
         encode_nv(&mut b, "y", "he\"llo"); // quote -> encode
         assert_eq!(b, "acct=\"admin\" x=612062 y=6865226C6C6F");
-        assert!(
-            needs_encoding("a b") && needs_encoding("\"") && needs_encoding("")
-        );
+        assert!(needs_encoding("a b") && needs_encoding("\""));
         assert!(!needs_encoding("admin") && !needs_encoding("API_KEY"));
+    }
+
+    /// The kernel's `audit_string_contains_control` loop does not run for a
+    /// zero-length value, so an empty string is *clean* and takes the quoted
+    /// form. Encoding it instead would hex-encode nothing and emit a bare
+    /// `key=` — the ambiguous unquoted shape, not the safe one.
+    #[test]
+    fn an_empty_value_is_the_quoted_empty_string() {
+        assert!(!needs_encoding(""));
+        let mut b = String::new();
+        encode_nv(&mut b, "acct", "");
+        assert_eq!(b, "acct=\"\"");
+
+        // Through a whole event: an empty `addr` must not collapse the field
+        // into a bare token that a reader would take as an unquoted value.
+        let event = AuditEvent {
+            service: "svc",
+            verb: "op",
+            principal: AuditPrincipal {
+                addr: Some(""),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut msg = String::new();
+        event.write_message(&mut msg);
+        assert_eq!(msg, "op=svc:op addr=\"\" res=failed");
     }
 
     #[test]

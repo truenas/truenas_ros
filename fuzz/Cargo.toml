@@ -1,8 +1,12 @@
-# Fuzz harnesses for the net stack's framing and the http codec. A separate,
-# unpublished dev-only crate (like the bench crate / kTLS test deps): it does
-# NOT touch the library's libc+bitflags charter or its 1.97 MSRV. Run with a
-# nightly toolchain:
+# Fuzz harnesses for every decoder in the library that eats bytes it did not
+# write: the net stack's framing, the http codec, the NFSv4/POSIX.1e ACL wire
+# formats, the INI parser, the statmount reply, the file-handle and resume-
+# cursor codecs, the audit record encoder, the path checks, and the credential
+# broker's request header. A separate, unpublished dev-only crate (like the
+# kTLS test deps): it does NOT touch the library's libc+bitflags charter or its
+# 1.97 MSRV. Run with a nightly toolchain:
 #   cargo +nightly fuzz run framer_length_prefix
+#   cargo +nightly fuzz run statmount_parse corpus/statmount_parse -- -runs=0
 [package]
 name = "truenas_ros-fuzz"
 version = "0.0.0"
@@ -14,11 +18,19 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+# `broker_request` and `audit_ack` assert against the same `errno`/`EPERM`
+# constants the code under test uses. Already the library's own dependency, so
+# this adds no footprint.
+libc = "0.2.155"
 
 [dependencies.truenas_ros]
 path = ".."
-# `__fuzz` implies `net-server` and `http`, exposing the pure `frame_step`
-# and the http codec's framer/head/chunked entry points (`http::fuzz`).
+# `__fuzz` implies every module the targets drive and exposes the four
+# internals that are not already public: `frame_step`, the http codec's
+# framer/head/chunked (`http::fuzz`), the statmount reply parser
+# (`mount::fuzz`), the listing comparator (`uring_fs::query_dir::fuzz`), the
+# broker request decoder and `Leaf::to_cstring` (`uring_fs::fuzz`), and the
+# netlink ack decoder (`audit::fuzz`).
 features = ["__fuzz"]
 
 # Self-rooted so it never gets pulled into a parent workspace.
@@ -59,6 +71,97 @@ bench = false
 [[bin]]
 name = "http_chunked"
 path = "fuzz_targets/http_chunked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "acl_nfs4"
+path = "fuzz_targets/acl_nfs4.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "acl_posix"
+path = "fuzz_targets/acl_posix.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "configfile_ini"
+path = "fuzz_targets/configfile_ini.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "statmount_parse"
+path = "fuzz_targets/statmount_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fhandle_bytes"
+path = "fuzz_targets/fhandle_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "iter_cookie"
+path = "fuzz_targets/iter_cookie.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tree_cursor"
+path = "fuzz_targets/tree_cursor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit_record"
+path = "fuzz_targets/audit_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path_leaf"
+path = "fuzz_targets/path_leaf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path_order"
+path = "fuzz_targets/path_order.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tn_path"
+path = "fuzz_targets/tn_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "broker_request"
+path = "fuzz_targets/broker_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit_ack"
+path = "fuzz_targets/audit_ack.rs"
 test = false
 doc = false
 bench = false

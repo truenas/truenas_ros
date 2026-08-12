@@ -201,6 +201,29 @@ impl Statmount {
     }
 }
 
+/// The reply decoder exposed to the fuzz crate (`fuzz/`) under `__fuzz` only —
+/// the `mount` analogue of the net stack's `frame_step` re-export. Never part
+/// of the stable API.
+///
+/// Driven by `fuzz/fuzz_targets/statmount_parse.rs`: [`parse`](fuzz::parse)
+/// reinterprets a caller-supplied word array as a `struct statmount` and walks
+/// its string area by the offsets the header declares, so a reply whose `size`,
+/// offsets, or `*_num` counts disagree with the buffer must still decode
+/// without reading out of bounds.
+#[cfg(feature = "__fuzz")]
+pub mod fuzz {
+    /// Decode a `statmount` reply from its raw word buffer, or `None` if the
+    /// buffer is too short to hold the fixed header.
+    ///
+    /// The inner `parse` reads `RawStatmount` off the front unchecked — a
+    /// precondition [`statmount`](super::statmount) discharges by allocating
+    /// 1 KiB. Enforcing it here keeps this entry point safe for *any* fuzzer
+    /// input, so a short buffer is a `None` rather than an out-of-bounds read.
+    pub fn parse(words: &[u64]) -> Option<super::Statmount> {
+        (words.len() * 8 >= super::STR_BASE).then(|| super::parse(words))
+    }
+}
+
 /// Retrieve detailed information about the mount identified by `mnt_id`,
 /// requesting the field groups named in `mask`.
 ///
@@ -274,8 +297,15 @@ fn parse(words: &[u64]) -> Statmount {
 
     // A run of `count` NUL-terminated strings starting at `offset` into `str`.
     let get_str_array = |offset: u32, count: u32| -> Vec<String> {
-        let mut out = Vec::with_capacity(count as usize);
-        let mut pos = STR_BASE + offset as usize;
+        let start = STR_BASE + offset as usize;
+        // `count` is header-declared, so reserving against it directly would
+        // let a reply claiming `u32::MAX` strings ask for ~100 GiB before a
+        // single byte is read. Each string consumes at least its terminator,
+        // so what remains of the string area is the real bound.
+        let mut out = Vec::with_capacity(
+            (count as usize).min(bytes.len().saturating_sub(start)),
+        );
+        let mut pos = start;
         for _ in 0..count {
             if pos >= bytes.len() {
                 break;

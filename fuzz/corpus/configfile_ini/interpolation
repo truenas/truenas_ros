@@ -1,0 +1,6 @@
+[DEFAULT]
+root = /srv
+
+[app]
+data = %(root)s/data
+log = %(data)s/log

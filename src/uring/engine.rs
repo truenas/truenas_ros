@@ -8,9 +8,11 @@ use crate::errno;
 use crate::uring::probe::probe_op_supported;
 use crate::uring::ring::Ring;
 use crate::uring::sys::*;
-use crate::uring::wake::{create_eventfd, LoopShared, WakeHandle};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use crate::uring::wake::{LoopShared, WakeHandle};
+// `LoopShared` is loom-modelled (see `src/uring/wake.rs`), so the engine
+// builds it from `crate::sync` — std's outside `--cfg loom`.
+use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::sync::Arc;
 
 /// Longest chain [`Engine::stage_chain`] will stage. A cap rather than an
 /// open-ended count because every link is one more SQE that must be staged
@@ -70,9 +72,7 @@ impl Engine {
             stop: AtomicBool::new(false),
             graceful: AtomicBool::new(false),
             grace_ms: AtomicU64::new(0),
-            wake: WakeHandle {
-                fd: create_eventfd()?,
-            },
+            wake: WakeHandle::new()?,
         });
         Ok(Engine {
             shared,
@@ -228,14 +228,14 @@ impl Engine {
     /// Rewind SQE staging and the in-flight count, so a staging-only test can
     /// reuse one engine across iterations. See [`Ring::reset_staging`] for the
     /// conditions that make the rewind sound.
-    #[cfg(all(test, feature = "uring-fs"))]
+    #[cfg(all(test, not(loom), feature = "uring-fs"))]
     pub(crate) fn reset_staging(&mut self) {
         self.ring.reset_staging();
         self.inflight = 0;
     }
 
     /// Read back a staged (not yet submitted) SQE. See [`Ring::staged_sqe`].
-    #[cfg(all(test, feature = "uring-fs"))]
+    #[cfg(all(test, not(loom), feature = "uring-fs"))]
     pub(crate) fn staged_sqe(&self, i: u32) -> IoUringSqe {
         self.ring.staged_sqe(i)
     }
@@ -250,7 +250,7 @@ impl Engine {
     }
 }
 
-#[cfg(all(test, feature = "uring-fs"))]
+#[cfg(all(test, not(loom), feature = "uring-fs"))]
 mod tests {
     use super::*;
 

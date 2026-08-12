@@ -23,10 +23,13 @@ bitflags = "2.6"
 # the codec — framing, keep-alive, serialization, hardening — is ours.
 httparse = { version = "1.10", optional = true }
 
-# loom (a concurrency permutation checker) backs the SQ/CQ ordering test in
-# src/uring/ring.rs. Pulled ONLY under `--cfg loom`, so normal builds keep the
-# libc+bitflags charter untouched.
-#   Run: RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs sq_cq
+# loom (a concurrency permutation checker) backs the `loom_tests` modules: the
+# SQ/CQ ordering model in src/uring/ring.rs, the graceful-drain publication in
+# src/uring/wake.rs, and the offload pool / completion sink / inject models in
+# src/uring_fs. Pulled ONLY under `--cfg loom`, so normal builds keep the
+# libc+bitflags charter untouched — see src/sync.rs for the std/loom shim.
+#   Run: RUSTFLAGS="--cfg loom" cargo test --lib --features uring    loom_
+#        RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
@@ -92,10 +95,24 @@ http = ["net-server", "dep:httparse"]
 # `sync-fs` for the shared OpenHow/ResolveFlag vocabulary; combine with
 # `net-server` for the in-server reactor (`ServerConfig::fs_files`).
 uring-fs = ["uring", "sync-fs", "xattr"]
-# Internal: exposes pure framing decisions to the fuzz crate (`fuzz/`) — the
-# net stack's `frame_step`, and the `http` codec's framer/head/chunked entry
-# points (`http::fuzz`). Not for consumers; implies the modules those live in.
-__fuzz = ["net-server", "http"]
+# Internal: exposes pure decode/framing entry points to the fuzz crate
+# (`fuzz/`) — the net stack's `frame_step`, the `http` codec's
+# framer/head/chunked (`http::fuzz`), `statmount`'s reply parser
+# (`mount::statmount::fuzz`), and the listing name comparator
+# (`uring_fs::query_dir::fuzz`). Everything else the targets drive is already
+# public; this list implies the modules all of it lives in. Not for consumers,
+# and deliberately absent from `default` and `full`.
+__fuzz = [
+    "net-server",
+    "http",
+    "acl",
+    "configfile",
+    "fhandle",
+    "mount",
+    "audit",
+    "fsiter",
+    "uring-fs",
+]
 full = [
     "sync-fs",
     "xattr",

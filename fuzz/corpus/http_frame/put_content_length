@@ -1,0 +1,5 @@
+PUT /bucket/key HTTP/1.1
+Host: s3.local
+Content-Length: 5
+
+hello
