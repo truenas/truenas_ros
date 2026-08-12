@@ -1814,6 +1814,75 @@ mod configfile {
     use truenas_ros::sync_fs::AtomicWriteOptions;
     use truenas_ros::Error;
 
+    // Two halves: a name `set` accepts must survive `write_string` +
+    // `read_str` unchanged, and one it cannot must be refused rather than
+    // written. Rejecting everything would satisfy the first half alone.
+    #[test]
+    fn an_option_name_that_cannot_round_trip_is_refused() {
+        let hostile = [
+            "x\n[global]\nadmin", // splits the record; injects a section
+            "[global]",           // read back as a header on its own
+            "a=b",                // re-split at the delimiter
+            "a:b",                // ... and at the other one
+            "  indented",         // folded into the previous option's value
+            "trailing ",          // stripped back off
+            "# nope",             // read back as a comment
+            ";nope",
+            "",
+            "has\rcr", // a line break once read_path applies universal newlines
+        ];
+        for name in hostile {
+            let mut cfg = ConfigFile::new();
+            cfg.add_section("app").unwrap();
+            cfg.set("app", "first", Some("1")).unwrap();
+            assert!(
+                cfg.set("app", name, Some("v")).is_err(),
+                "set accepted an option name it cannot read back: {name:?}"
+            );
+        }
+
+        // The screen is not simply refusing everything: ordinary names, and
+        // the awkward-but-safe ones, still go through and still round-trip.
+        let benign = ["plain", "with space", "dot.sep", "pct%%", "0", "x[y]"];
+        for name in benign {
+            let mut cfg = ConfigFile::raw();
+            cfg.add_section("app").unwrap();
+            cfg.set("app", name, Some("v")).unwrap();
+            let mut back = ConfigFile::raw();
+            back.read_str(&cfg.write_string()).unwrap_or_else(|e| {
+                panic!("{name:?} wrote a document that will not reparse: {e:?}")
+            });
+            assert_eq!(back.sections(), vec!["app"], "for {name:?}");
+            assert_eq!(
+                back.get_raw("app", name),
+                Some("v"),
+                "{name:?} did not survive the round trip"
+            );
+        }
+    }
+
+    // A section name carrying a line break closes its header early, and the
+    // remainder becomes a section of its own.
+    #[test]
+    fn a_section_name_that_cannot_round_trip_is_refused() {
+        for name in ["x]\n[global", "", "a\rb"] {
+            let mut cfg = ConfigFile::new();
+            assert!(
+                cfg.add_section(name).is_err(),
+                "add_section accepted {name:?}"
+            );
+        }
+        // A `]` inside or at the end is fine: a header runs to the *last* one.
+        for name in ["a]b", "a]", " padded "] {
+            let mut cfg = ConfigFile::raw();
+            cfg.add_section(name).unwrap();
+            cfg.set(name, "k", Some("v")).unwrap();
+            let mut back = ConfigFile::raw();
+            back.read_str(&cfg.write_string()).unwrap();
+            assert_eq!(back.sections(), vec![name], "for {name:?}");
+        }
+    }
+
     // A shallow-but-wide interpolation (one value referencing another ~2000
     // times, each ~1 KiB) expands past the output budget; the getter must error
     // rather than build a multi-megabyte string. The input stays shallow so

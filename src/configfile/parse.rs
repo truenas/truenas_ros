@@ -43,6 +43,59 @@ fn py_rstrip(s: &str) -> &str {
     s.trim_end_matches(is_py_space)
 }
 
+/// Why this loop would not read `key` back as the name it was given, or
+/// `None` if it round-trips. Each arm names its own reason.
+///
+/// Keys are written verbatim — by [`super::write`], and by CPython's
+/// `_write_section` (`Lib/configparser.py:961`), which re-indents a newline
+/// in the *value* and does nothing to the key — so a name carrying this
+/// loop's syntax parses back as something else.
+///
+/// Screened at [`super::ConfigFile::set`] rather than at write time, since
+/// that is the only way in: keys from [`read`] are safe by construction,
+/// because this loop splits on lines, splits at the first delimiter, and
+/// strips.
+///
+/// The `[` rule is blunter than [`section_header`], which also wants a
+/// closing `]` past the first column, so `[]x` is refused though it would
+/// survive. A second copy of the header rule would be free to drift from the
+/// one that decides.
+pub(super) fn key_fault(key: &str) -> Option<&'static str> {
+    if key.is_empty() {
+        Some("is empty")
+    } else if key.contains(['\n', '\r']) {
+        Some("contains a line break")
+    } else if key.contains(['=', ':']) {
+        Some("contains a key/value delimiter")
+    } else if key.starts_with(is_py_space) || key.ends_with(is_py_space) {
+        Some("is surrounded by whitespace")
+    } else if key.starts_with('[') {
+        Some("would be read back as a section header")
+    } else if key.starts_with('#') || key.starts_with(';') {
+        Some("would be read back as a comment")
+    } else {
+        None
+    }
+}
+
+/// Why `[name]` would not be read back as this section, or `None` if it
+/// round-trips. Companion to [`key_fault`].
+///
+/// Less is forbidden than for a key: a header is delimited on both sides and
+/// [`section_header`] takes the *last* `]`, so a name containing, ending in,
+/// or padded around one survives. Only a line break, which closes the header
+/// early and leaves the rest to be read as its own section, and the empty
+/// name, which writes `[]` and is not a header at all.
+pub(super) fn section_fault(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        Some("is empty")
+    } else if name.contains(['\n', '\r']) {
+        Some("contains a line break")
+    } else {
+        None
+    }
+}
+
 /// The current section as a duplicate-detection key.
 ///
 /// Stands in for the section's name, which is what `configparser` keys
