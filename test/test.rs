@@ -21,7 +21,7 @@ mod fs {
 
     #[test]
     fn openat2_then_statx_by_fd() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         let path = dir.path().join("file");
         std::fs::write(&path, b"hello").unwrap();
 
@@ -43,7 +43,7 @@ mod fs {
 
     #[test]
     fn openat2_no_symlinks_rejects_symlink() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         let target = dir.path().join("target");
         std::fs::write(&target, b"x").unwrap();
         let link = dir.path().join("link");
@@ -58,7 +58,7 @@ mod fs {
 
     #[test]
     fn renameat2_noreplace_and_exchange() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         let a = dir.path().join("a");
         let b = dir.path().join("b");
         std::fs::write(&a, b"aaa").unwrap();
@@ -93,7 +93,7 @@ mod xattr {
 
     #[test]
     fn set_get_list_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         let path = dir.path().join("file");
         std::fs::write(&path, b"data").unwrap();
         let file = std::fs::OpenOptions::new()
@@ -123,7 +123,7 @@ mod xattr {
     fn non_utf8_name_listed_verbatim() {
         use std::ffi::CString;
         use std::os::fd::AsRawFd;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         let path = dir.path().join("file");
         std::fs::write(&path, b"data").unwrap();
         let file = std::fs::OpenOptions::new()
@@ -157,7 +157,7 @@ mod xattr {
 
     #[test]
     fn missing_xattr_is_enodata() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         let path = dir.path().join("file");
         std::fs::write(&path, b"data").unwrap();
         let file = std::fs::File::open(&path).unwrap();
@@ -412,7 +412,7 @@ mod fhandle {
 
     #[test]
     fn name_to_handle_roundtrip_and_reopen() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         let path = dir.path().join("file");
         std::fs::write(&path, b"handle me").unwrap();
 
@@ -500,7 +500,7 @@ mod fsiter {
 
     #[test]
     fn walks_whole_tree_depth_first() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
         std::fs::write(dir.path().join("a/f1"), b"1").unwrap();
         std::fs::write(dir.path().join("a/b/f2"), b"22").unwrap();
@@ -521,7 +521,7 @@ mod fsiter {
     fn special_files_classify_without_hanging() {
         use std::os::unix::ffi::OsStrExt;
         use truenas_ros::sync_fs::iter::EntryType;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         std::fs::write(dir.path().join("regular"), b"hi").unwrap();
         let fifo = dir.path().join("pipe");
         let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
@@ -542,7 +542,7 @@ mod fsiter {
 
     #[test]
     fn skip_descent_prunes_subtree() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("keep")).unwrap();
         std::fs::create_dir_all(dir.path().join("prune/hidden")).unwrap();
         std::fs::write(dir.path().join("keep/f"), b"x").unwrap();
@@ -569,7 +569,7 @@ mod fsiter {
 
     #[test]
     fn yielded_fd_is_usable_and_self_closing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         std::fs::write(dir.path().join("data"), b"hello world").unwrap();
 
         let it = FsIterBuilder::new(dir.path(), fs_source(dir.path()))
@@ -591,7 +591,7 @@ mod fsiter {
 
     #[test]
     fn symlinks_skipped_by_default_included_on_request() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         std::fs::write(dir.path().join("target"), b"t").unwrap();
         std::os::unix::fs::symlink("target", dir.path().join("link")).unwrap();
 
@@ -656,7 +656,7 @@ mod fsiter {
 
     #[test]
     fn cookie_resume_is_complete_and_skips_descended_dirs() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         let root = dir.path();
         sample_tree(root);
         let full = walk_names(root);
@@ -681,7 +681,7 @@ mod fsiter {
 
     #[test]
     fn cookie_resume_recovers_after_deleted_directory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         let root = dir.path();
         sample_tree(root);
         let (_prefix, cookie) = walk_to_f_ab1(root);
@@ -801,7 +801,7 @@ mod io {
 
     #[test]
     fn atomic_replace_creates_replaces_and_leaves_no_temp() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         let target = dir.path().join("config");
 
         atomic_replace(&target, b"v1", AtomicWriteOptions::default()).unwrap();
@@ -823,7 +823,7 @@ mod io {
 
     #[test]
     fn atomic_write_follows_a_target_that_changes_while_writing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         let target = dir.path().join("config");
 
         // A target unlinked while write_fn runs is created afresh.
@@ -854,7 +854,7 @@ mod io {
 
     #[test]
     fn atomic_write_refuses_a_directory_target() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         let target = dir.path().join("config");
         atomic_replace(&target, b"v1", AtomicWriteOptions::default()).unwrap();
 
@@ -879,7 +879,7 @@ mod io {
 
     #[test]
     fn atomic_write_closure_and_noclobber() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         let target = dir.path().join("f");
         atomic_write(&target, AtomicWriteOptions::default(), |f| {
             f.write_all(b"hello ")?;
@@ -900,7 +900,7 @@ mod io {
 
     #[test]
     fn safe_open_rejects_symlink_in_path() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("real")).unwrap();
         std::fs::write(dir.path().join("real/file"), b"x").unwrap();
         std::os::unix::fs::symlink("real", dir.path().join("link")).unwrap();
@@ -949,7 +949,7 @@ mod shutil {
     #[test]
     fn copies_xattr_with_non_utf8_name() {
         use std::os::fd::AsRawFd;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("f"), b"data").unwrap();
@@ -1027,7 +1027,7 @@ mod shutil {
             }
         };
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("bin"), b"#!/bin/sh\n").unwrap();
@@ -1084,7 +1084,7 @@ mod shutil {
     fn recreates_special_files_by_type() {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::FileTypeExt;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("f"), b"data").unwrap();
@@ -1107,7 +1107,7 @@ mod shutil {
     #[test]
     fn preserves_setid_bits_on_files_and_specials() {
         use std::os::unix::ffi::OsStrExt;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("helper"), b"data").unwrap();
@@ -1144,7 +1144,7 @@ mod shutil {
     fn setid_withheld_when_ownership_is_not_preserved() {
         use std::os::unix::ffi::OsStrExt;
         use truenas_ros::sync_fs::shutil::CopyFlags;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("helper"), b"data").unwrap();
@@ -1187,7 +1187,7 @@ mod shutil {
     #[test]
     fn special_file_mode_is_not_applied_through_a_symlink() {
         use std::os::unix::ffi::OsStrExt;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir(&src).unwrap();
         let fifo = src.join("pipe");
@@ -1233,7 +1233,7 @@ mod shutil {
     fn existing_destination_file_is_replaced_not_reused() {
         use std::io::Read;
         use std::os::unix::fs::MetadataExt;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("secret"), b"SECRET-KEY-MATERIAL").unwrap();
@@ -1265,7 +1265,7 @@ mod shutil {
     // copy fails either way, but nothing may be created outside the tree.
     #[test]
     fn destination_root_is_not_created_through_a_symlink() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("f"), b"data").unwrap();
@@ -1315,7 +1315,7 @@ mod shutil {
             ace(PosixTag::Other, rx, -1),
         ]);
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("helper"), b"data").unwrap();
@@ -1396,7 +1396,7 @@ mod shutil {
         let access = acl.access_bytes().unwrap();
         let default = acl.default_bytes().unwrap().unwrap();
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir(&src).unwrap();
         // A nested directory too: the root gets its metadata from its own
@@ -1458,7 +1458,7 @@ mod shutil {
             ace(PosixTag::Other, rwx, -1),
         ]);
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir(&src).unwrap();
         // The classic sticky shape: a world-writable shared directory.
@@ -1509,7 +1509,7 @@ mod shutil {
     // as the destination root is, and takes the source's mode afterwards.
     #[test]
     fn subdirectory_mode_is_applied_after_its_contents() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
         std::fs::create_dir_all(src.join("sub")).unwrap();
@@ -1555,7 +1555,7 @@ mod shutil {
     // read-only before its children exist.
     #[test]
     fn copies_into_read_only_subdirectory() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
         std::fs::create_dir_all(src.join("sub")).unwrap();
@@ -1587,7 +1587,7 @@ mod shutil {
 
     #[test]
     fn copies_tree_with_content_and_metadata() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
         std::fs::create_dir_all(src.join("sub")).unwrap();
@@ -1638,7 +1638,7 @@ mod shutil {
     #[test]
     fn skips_metadata_when_flags_cleared() {
         use truenas_ros::sync_fs::shutil::CopyFlags;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("s");
         let dst = tmp.path().join("d");
         std::fs::create_dir(&src).unwrap();
@@ -1656,7 +1656,7 @@ mod shutil {
 
     #[test]
     fn reporting_callback_fires_periodically_and_finally() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir_all(src.join("d1/d2")).unwrap();
         std::fs::write(src.join("a"), b"a").unwrap();
@@ -1701,7 +1701,7 @@ mod shutil {
 
     #[test]
     fn traverse_without_child_mounts_matches_plain_copy() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir_all(src.join("sub")).unwrap();
         std::fs::write(src.join("sub/f"), b"x").unwrap();
@@ -1727,7 +1727,7 @@ mod shutil {
         use std::os::unix::ffi::OsStrExt;
         use truenas_ros::libc;
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
         std::fs::create_dir_all(src.join("child")).unwrap();
@@ -1787,7 +1787,7 @@ mod shutil {
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = truenas_ros::tempdir().unwrap();
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
         std::fs::create_dir(&src).unwrap();
@@ -1904,7 +1904,7 @@ mod configfile {
 
     #[test]
     fn write_path_is_atomic_with_mode_and_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         let path = dir.path().join("app.conf");
         let mut cfg = ConfigFile::new();
         cfg.add_section("main").unwrap();
@@ -1939,7 +1939,7 @@ mod configfile {
 
     #[test]
     fn read_path_errors_on_missing_read_paths_skips() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         let present = dir.path().join("a.conf");
         std::fs::write(&present, b"[s]\nk = v\n").unwrap();
         let missing = dir.path().join("nope.conf");
@@ -1956,7 +1956,7 @@ mod configfile {
 
     #[test]
     fn read_path_rejects_symlinked_component() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("real")).unwrap();
         std::fs::write(dir.path().join("real/c.conf"), b"[s]\nk=v\n").unwrap();
         std::os::unix::fs::symlink("real", dir.path().join("link")).unwrap();
@@ -1969,7 +1969,7 @@ mod configfile {
 
     #[test]
     fn on_disk_bytes_are_stable_across_reparse() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = truenas_ros::tempdir().unwrap();
         let path = dir.path().join("s.conf");
         let mut cfg = ConfigFile::raw();
         cfg.read_str("[a]\nx = 1\n[b]\ny = two words\n").unwrap();
