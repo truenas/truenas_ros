@@ -83,7 +83,7 @@ where
     F: FnOnce(FsHandle, Personality, PathBuf, ShutdownHandle) + Send,
 {
     pin_umask();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = truenas_ros::tempdir().expect("tempdir");
     let mut afs = match UringFs::new(cfg) {
         Ok(a) => a,
         Err(e) => {
@@ -325,7 +325,7 @@ fn validation_and_errno_mapping() {
 #[test]
 fn stale_personality_from_other_ring_is_einval() {
     // Two reactors: an id registered on ring A names nothing on ring B.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = truenas_ros::tempdir().unwrap();
     let afs_a = match UringFs::new(FsConfig::default()) {
         Ok(a) => a,
         Err(e) => {
@@ -918,7 +918,7 @@ fn o_tmpfile_with_o_excl_is_unlinkable() {
 #[test]
 fn linkat_file_accepts_any_id_for_the_same_credentials() {
     pin_umask();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = truenas_ros::tempdir().expect("tempdir");
     let mut afs = match UringFs::new(FsConfig::default()) {
         Ok(a) => a,
         Err(e) => {
@@ -998,7 +998,14 @@ fn privileged_xattr_allowlist_elevates_only_listed_names() {
         return;
     }
     pin_umask();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = truenas_ros::tempdir().expect("tempdir");
+    // `tempdir` creates the directory 0700; the unprivileged identity must
+    // traverse it, and reaching the file is not what this test probes.
+    std::fs::set_permissions(
+        dir.path(),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("open up the scratch dir");
     let mut afs = match UringFs::new(FsConfig::default()) {
         Ok(a) => a,
         Err(e) => {
@@ -1412,7 +1419,7 @@ where
     F: FnOnce(&FsHandle, &CredHandle, Personality, &Path) + Send,
 {
     pin_umask();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = truenas_ros::tempdir().expect("tempdir");
     // These tests drive ops as an impersonated user, who must be able to
     // traverse this directory and — for the ones that create as that user —
     // write in it. A fresh tempdir is only owner-writable, so widen it once
@@ -2978,8 +2985,8 @@ fn change_cookie_moves_on_writes_and_not_on_reads() {
         };
 
         let Some(first) = cookie(&f) else {
-            // No i_version on this filesystem — tmpfs, where `tempfile` puts
-            // its directory by default, is one. Point `TMPDIR` at a ZFS
+            // No i_version on this filesystem — tmpfs, where `tempdir`
+            // lands by default, is one. Point `TMPDIR` at a ZFS
             // dataset to actually exercise this.
             eprintln!(
                 "skipping: no change cookie on the filesystem backing {}",
@@ -3523,7 +3530,7 @@ where
     let me = afs.register_self().expect("register_self");
     let h = afs.handle();
     let stop = afs.shutdown_handle();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = truenas_ros::tempdir().expect("tempdir");
     let dir_path = dir.path().to_path_buf();
     thread::scope(|s| {
         s.spawn(move || {

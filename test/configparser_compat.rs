@@ -530,7 +530,7 @@ fn file_line_endings_match_configparser_read() {
         eprintln!("skipping: python3 not available");
         return;
     };
-    let dir = tempfile::tempdir().unwrap();
+    let dir = truenas_ros::tempdir().unwrap();
     let path = dir.path().join("c.conf");
     for doc in FILE_CORPUS {
         std::fs::write(&path, doc).unwrap();

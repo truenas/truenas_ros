@@ -1002,7 +1002,7 @@ mod tests {
 
     #[test]
     fn dt_unknown_symlink_is_yielded_as_a_symlink() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir().unwrap();
         std::fs::write(dir.path().join("target"), b"t").unwrap();
         std::os::unix::fs::symlink("target", dir.path().join("link")).unwrap();
         std::os::unix::fs::symlink("gone", dir.path().join("dangling"))

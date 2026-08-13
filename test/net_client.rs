@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -823,18 +823,18 @@ fn tcp_splice_bad_fd() {
 // ---- kernel TLS (kTLS) connect --------------------------------------------
 //
 // A real end-to-end TLS handshake around the client's kernel-TLS transport:
-// the server runs `SSL_accept` in its handshake worker, the client runs
-// `SSL_connect` in its own — exactly the split a real consumer implements. The
-// library brings no TLS crate; these tests use OpenSSL as a dev-dependency.
+// the server worker drives `truenas_ktls` (the packaged accept side), the
+// client runs `SSL_connect` in its own worker — exactly the split a real
+// consumer implements. The library brings no TLS crate; the client side uses
+// OpenSSL as a dev-dependency, raw, because the crate has no connect role.
 // Skips when the kernel lacks the `tls` ULP (or `FIXED_FD_INSTALL`), or when
 // libssl cannot engage kTLS at all ([`ktls_engages`] — Ubuntu ships OpenSSL
 // 3.0 without `enable-ktls`); force on a known-good host with
 // `TRUENAS_ROS_REQUIRE_KTLS`.
 
 use foreign_types::ForeignType; // Ssl::as_ptr for the raw BIO/SSL_connect path
-use openssl::ssl::{
-    Ssl, SslAcceptor, SslContext, SslMethod, SslOptions, SslVerifyMode,
-};
+use openssl::ssl::{Ssl, SslContext, SslMethod, SslOptions, SslVerifyMode};
+use truenas_ktls::Acceptor;
 
 const SSL_OP_ENABLE_KTLS: u64 = 1 << 3; // SSL_OP_BIT(3); no named crate const
 const BIO_NOCLOSE: libc::c_int = 0;
@@ -898,30 +898,24 @@ fn self_signed() -> (Vec<u8>, Vec<u8>) {
     )
 }
 
-/// A kTLS-enabled OpenSSL server acceptor: `SSL_OP_ENABLE_KTLS` + no session
-/// tickets (no post-handshake server write to perturb the installed sequence).
-fn ktls_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> SslAcceptor {
-    use openssl::pkey::PKey;
-    use openssl::x509::X509;
-    let mut b = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
-    b.set_private_key(&PKey::private_key_from_pem(key_pem).unwrap())
-        .unwrap();
-    b.set_certificate(&X509::from_pem(cert_pem).unwrap())
-        .unwrap();
-    b.check_private_key().unwrap();
-    b.set_options(SslOptions::from_bits_retain(SSL_OP_ENABLE_KTLS));
-    b.set_num_tickets(0).unwrap();
-    b.build()
+/// Build a [`truenas_ktls::Acceptor`] over a throwaway cert. The acceptor is
+/// built from PEM files, read eagerly, so the directory may drop on return;
+/// kTLS installation and ticket disablement live inside the crate.
+fn ktls_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> Acceptor {
+    let dir = truenas_ros::tempdir().unwrap();
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&cert, cert_pem).unwrap();
+    std::fs::write(&key, key_pem).unwrap();
+    Acceptor::from_pem_files(&cert, &key).unwrap()
 }
 
-/// The server's handshake worker: run the blocking server TLS handshake on the
-/// furnished fd over a socket BIO (so OpenSSL installs kTLS on the socket),
-/// confirm kTLS engaged both directions, then close the furnished fd (the pool
-/// descriptor keeps the kTLS socket).
-fn ktls_server_handshake(
-    fd: RawFd,
-    acceptor: &SslAcceptor,
-) -> Result<(), String> {
+/// The server's handshake worker: run the blocking server TLS handshake on
+/// the furnished fd through `truenas_ktls` — which installs kernel TLS on the
+/// socket and refuses the connection unless the readback shows it engaged
+/// both directions — then close the furnished fd (the pool descriptor keeps
+/// the kTLS socket).
+fn ktls_server_handshake(fd: RawFd, acceptor: &Acceptor) -> Result<(), String> {
     // This worker owns the furnished fd: EVERY return path must close it (the
     // set_tls_handshake contract), or each failed handshake leaks a process fd.
     struct FdCloser(RawFd);
@@ -932,29 +926,20 @@ fn ktls_server_handshake(
         }
     }
     let _fd_owner = FdCloser(fd);
-    // SSL_accept wants a blocking socket; io_uring recv/send ignore O_NONBLOCK.
+    // The handshake wants a blocking socket; io_uring recv/send ignore
+    // O_NONBLOCK.
     // SAFETY: fcntl on a live fd.
     unsafe {
         let fl = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK);
     }
-    let ssl = Ssl::new(acceptor.context()).map_err(|e| e.to_string())?;
-    // SAFETY: a BIO_NOCLOSE socket BIO over `fd`; SSL owns the BIO (freed on
-    // drop), and `fd` outlives `ssl` here.
-    let rc = unsafe {
-        let bio = openssl_sys::BIO_new_socket(fd, BIO_NOCLOSE);
-        if bio.is_null() {
-            return Err("BIO_new_socket".into());
-        }
-        openssl_sys::SSL_set_bio(ssl.as_ptr(), bio, bio);
-        openssl_sys::SSL_accept(ssl.as_ptr())
-    };
-    if rc != 1 {
-        return Err(format!("SSL_accept returned {rc}"));
-    }
-    confirm_ktls(fd)?;
-    drop(ssl); // BIO_NOCLOSE → fd not closed; kTLS stays on the socket
-    Ok(()) // _fd_owner closes the furnished fd
+    // SAFETY: `fd` stays open for the borrow — `_fd_owner` closes it only on
+    // return.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    acceptor
+        .accept(borrowed)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// A kTLS-enabled OpenSSL client context: `SSL_OP_ENABLE_KTLS` + no cert
@@ -1029,14 +1014,14 @@ fn confirm_ktls(fd: RawFd) -> Result<(), String> {
     Ok(())
 }
 
-/// `SSL_OP_ENABLE_KTLS` is best-effort: when OpenSSL cannot install kTLS it
-/// silently falls back to userspace TLS records — a libssl built without
-/// `enable-ktls` (Debian/Ubuntu only enable it from 3.2), a TLS 1.3 RX gap
-/// (OpenSSL < 3.2), or a kernel missing the `tls` module. The handshake then
-/// completes but `confirm_ktls` fails, every worker rejects, and the data-path
-/// tests would fail rather than skip. Probe once with a loopback handshake —
-/// the same acceptor, client context, and confirmation the tests use — so
-/// those tests can skip when this host's OpenSSL cannot engage kTLS.
+/// kTLS installation is best-effort in libssl: a build without `enable-ktls`
+/// (Debian/Ubuntu only enable it from 3.2), a TLS 1.3 RX gap (OpenSSL < 3.2),
+/// or a kernel missing the `tls` module all fall back to userspace records.
+/// The handshake then completes but the acceptor's readback (server side) and
+/// `confirm_ktls` (client side) refuse, every worker rejects, and the
+/// data-path tests would fail rather than skip. Probe once with a loopback
+/// handshake — the same acceptor, client context, and confirmation the tests
+/// use — so those tests can skip when this host's OpenSSL cannot engage kTLS.
 fn ktls_engages() -> &'static Result<(), String> {
     static PROBE: std::sync::OnceLock<Result<(), String>> =
         std::sync::OnceLock::new();
@@ -1098,8 +1083,8 @@ fn ktls_openssl_unsupported() -> bool {
     }
 }
 
-/// Bind a kTLS `net::server` echo server whose handshake worker runs
-/// `SSL_accept`, run `client` on a spawned thread against its resolved address,
+/// Bind a kTLS `net::server` echo server whose handshake worker drives
+/// `truenas_ktls`, run `client` on a spawned thread against its resolved address,
 /// and propagate the client's result. The kTLS mirror of [`with_server`]; skips
 /// cleanly when io_uring, the kernel TLS ULP, or OpenSSL-side kTLS is
 /// unavailable.

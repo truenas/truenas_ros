@@ -523,7 +523,7 @@ mod tests {
             return;
         };
         ring.register_pool(4).expect("register pool");
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir().unwrap();
         let path =
             CString::new(dir.path().join("f").as_os_str().as_bytes()).unwrap();
         let how = RawOpenHow {
@@ -564,7 +564,7 @@ mod tests {
         let Some(mut ring) = ring_or_skip(8) else {
             return;
         };
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir().unwrap();
         let path = dir.path().join("x");
         std::fs::write(&path, b"body").unwrap();
         let file = std::fs::File::open(&path).unwrap();
@@ -610,7 +610,7 @@ mod tests {
     /// the kernel refusing the stamp, surfaced as the op's error.
     #[test]
     fn stale_token_and_stale_personality_are_inert() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir().unwrap();
         std::fs::write(dir.path().join("f"), b"data").unwrap();
         let mut afs = match UringFs::new(FsConfig::default()) {
             Ok(a) => a,

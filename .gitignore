@@ -1,4 +1,8 @@
 # Cargo build artifacts
 /target
 
-# Cargo.lock is committed (this crate ships a binary-relevant CI); keep it.
+# Not committed: the truenas_ktls dev-dependency tracks a branch, and a
+# committed lockfile would freeze it at a recorded revision until a manual
+# `cargo update`. A fresh resolve follows the branch; no CI step passes
+# --locked.
+Cargo.lock

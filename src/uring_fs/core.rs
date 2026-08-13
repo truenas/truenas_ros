@@ -2300,8 +2300,8 @@ mod hybrid_tests {
         }
     }
 
-    fn fixture(n: usize) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn fixture(n: usize) -> crate::TempDir {
+        let dir = crate::tempdir().expect("tempdir");
         for i in 0..n {
             let p = dir.path().join(format!("f{i}"));
             std::fs::write(&p, b"x").unwrap();

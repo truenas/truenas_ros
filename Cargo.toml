@@ -2,7 +2,7 @@
 name = "truenas_ros"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.97"
+rust-version = "1.97.1"
 license = "MIT"
 description = "Idiomatic Rust bindings for modern Linux filesystem/mount syscalls, ACLs, and related utilities (the Rust equivalent of truenas_pyos)."
 categories = ["os::unix-apis", "filesystem"]
@@ -138,7 +138,6 @@ full = [
 ]
 
 [dev-dependencies]
-tempfile = "3"
 # net splice tests only: a raw `pipe()` as the splice target. `libc` is
 # already the library's normal dependency, so this adds no new footprint.
 libc = { version = "0.2.155", features = ["extra_traits"] }
@@ -146,7 +145,17 @@ libc = { version = "0.2.155", features = ["extra_traits"] }
 # transport. The library itself pulls no TLS crate — the consumer brings one.
 openssl = "0.10"
 openssl-sys = "0.9"
-foreign-types = "0.3" # ForeignType::as_ptr for the raw SSL_accept BIO dance
+foreign-types = "0.3" # ForeignType::as_ptr for the raw SSL_connect BIO dance
+
+# The accept-side worker the kTLS tests hand to set_tls_handshake: a blocking
+# server handshake that installs kernel TLS and refuses the connection unless
+# the readback shows it engaged both directions. The client-side SSL_connect
+# dance stays raw OpenSSL — the crate has no connect role. Branch-tracked
+# with no committed lockfile, so a fresh resolve follows the sibling's
+# master and drift between the repos surfaces in the next CI run.
+[dev-dependencies.truenas_ktls]
+git = "https://github.com/truenas/truenas_ros_utils"
+branch = "master"
 
 [[test]]
 name = "test"

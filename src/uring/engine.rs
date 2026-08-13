@@ -371,7 +371,7 @@ mod tests {
         let Some(mut eng) = engine_or_skip() else {
             return;
         };
-        let d = tempfile::tempdir().expect("tempdir");
+        let d = crate::tempdir().expect("tempdir");
         let p = d.path();
         std::fs::create_dir(p.join("s")).unwrap();
         std::fs::create_dir(p.join("o")).unwrap();

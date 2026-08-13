@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn atomic_write_does_not_follow_or_adopt_a_planted_symlink() {
         use std::os::unix::fs::MetadataExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tempdir().unwrap();
         let outside = dir.path().join("outside");
         std::fs::write(&outside, b"outside").unwrap();
 

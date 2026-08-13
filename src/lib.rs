@@ -41,6 +41,7 @@ pub mod errno;
 mod error;
 pub mod fd;
 pub mod path;
+pub mod tempdir;
 
 // std's synchronization primitives, or loom's under `--cfg loom`. A plain
 // re-export outside a model run — see the module docs. Only the subsystems
@@ -57,6 +58,7 @@ pub use errno::Errno;
 pub use error::{Error, Result};
 pub use fd::AT_FDCWD;
 pub use path::TnPath;
+pub use tempdir::{tempdir, TempDir};
 
 #[cfg(any(
     feature = "sync-fs",
