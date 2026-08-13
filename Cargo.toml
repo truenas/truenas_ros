@@ -75,6 +75,13 @@ configfile = ["sync-fs"]
 # can block on kernel-audit backpressure, and shedding that load is the
 # embedding application's policy — see the module docs.
 audit = []
+# `memfd_secret(2)`-backed protected memory for long-lived in-process secrets
+# (`src/secrets.rs`): pages removed from the kernel direct map, kept off swap,
+# and absent from core dumps, plus a fail-closed availability probe and a
+# volatile burn. Standalone and dependency-free (a raw syscall over `libc`), but
+# use-case-specific — for daemons that hold secrets (the S3 server's SigV4
+# credential table) — so opt-in like the net roles rather than riding `default`.
+secrets = []
 # The shared io_uring engine (`src/uring`): raw UAPI, ring, SQE staging,
 # wake, slot generations, the user_data codec. Internal — enabled transitively
 # by the domains built on it (the net stack today, uring-fs next); not a
