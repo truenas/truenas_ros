@@ -418,8 +418,7 @@ impl ConfigFile {
     // --- mutation --------------------------------------------------------
 
     /// Add an empty section. Errors if it already exists, is named `DEFAULT`,
-    /// or could not be read back as itself (see
-    /// [`set`](Self::set#option-names-are-screened)).
+    /// or could not be read back as itself (see [`set`](Self::set)).
     pub fn add_section(&mut self, name: &str) -> Result<()> {
         if let Some(why) = parse::section_fault(name) {
             return Err(Error::Validation(format!(

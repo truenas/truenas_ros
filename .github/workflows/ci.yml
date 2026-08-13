@@ -149,15 +149,31 @@ jobs:
     # (acl without shutil, idmap alone, …); `uring` alone proves the shared
     # engine builds severed from the net stack (the seam the async fs reactor
     # relies on); each net role alone proves the role gates.
-    - name: feature-matrix builds
+    #
+    # Through clippy with `-D warnings`, not `cargo build`, because a warning
+    # is only visible in the feature set that produces it: an item every other
+    # build uses is dead code in the one subsystem that does not, and the
+    # `--all-features` clippy above can never see it. `-D warnings` after `--`
+    # binds to this crate alone, so a warning in a dependency is not our build
+    # failure.
+    - name: feature-matrix (deny warnings)
       run: |
-        cargo build --no-default-features
+        cargo clippy --no-default-features -- -D warnings
         for f in sync-fs xattr mount acl fhandle fsiter idmap shutil \
                  configfile audit secrets uring net-server net-client \
                  uring-fs http __fuzz; do
-          cargo build --no-default-features --features "$f"
+          echo "::group::clippy --features $f"
+          cargo clippy --no-default-features --features "$f" -- -D warnings
+          echo "::endgroup::"
         done
+        cargo clippy --all-features -- -D warnings
+        # A real build (clippy stops at check) of the shape everything ships.
         cargo build --all-features
 
-    - name: docs
+    # `--no-deps` keeps RUSTDOCFLAGS off the dependencies, so `-D warnings`
+    # here is this crate's own doc build: a link to an item the reader cannot
+    # reach, a redundant target, broken markup.
+    - name: docs (deny warnings)
       run: cargo doc --all-features --no-deps
+      env:
+        RUSTDOCFLAGS: "-D warnings"

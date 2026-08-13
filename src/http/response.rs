@@ -180,7 +180,7 @@ impl HttpResponse {
 
     /// Set the body. `Content-Length` follows automatically; for a HEAD
     /// request the bytes are measured but not sent. On a bodyless status
-    /// (1xx/204/304) the bytes are never sent — see [`serialize`]. Static
+    /// (1xx/204/304) the bytes are never sent — see `serialize`. Static
     /// bytes are stored as a borrow — no copy.
     pub fn body(mut self, body: impl IntoBytes) -> Self {
         self.body = body.into_bytes();

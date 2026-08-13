@@ -183,7 +183,7 @@ pub fn copyfile(
 ///
 /// The [`copy_setid`] path withholds `S_ISUID`/`S_ISGID` from an ACL-bearing
 /// destination for the same reason, and the special-node path
-/// ([`super::copy_metadata`]'s `mknod` sibling) does run an `fchmod`, but only
+/// (`copy_metadata`'s `mknod` sibling) does run an `fchmod`, but only
 /// because a device node cannot carry an ACL for it to damage — there the
 /// `chmod` is wrapped so an ACL-governed refusal is tolerated rather than
 /// failing the copy.
@@ -259,7 +259,7 @@ pub fn copy_setid(
 /// content came from the source — `cap_setuid+ep` on a binary the caller
 /// chose. The kernel gates the write on `CAP_SETFCAP` (`cap_convert_nscap`)
 /// rather than forbidding it, so a `copytree` running as root can carry it
-/// across — and [`super::copy_metadata`] orders the `fchown` so the kernel
+/// across — and `copy_metadata` orders the `fchown` so the kernel
 /// strips the attribute, which only holds if nothing puts it back afterwards.
 /// `security.ima`/`.evm` are skipped for the same reason and because an EVM
 /// HMAC covers the inode it was computed over, so a copied one is invalid
