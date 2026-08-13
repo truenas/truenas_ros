@@ -509,6 +509,33 @@ mod tests {
     }
 
     #[test]
+    fn head_declaration_rides_the_request_method() {
+        // One handler, two requests: the declaration reaches the wire on the
+        // HEAD and is dropped on the GET. The method decides, so a handler
+        // that declares a length unconditionally still cannot promise bytes
+        // a GET will not send.
+        let mut handler = |_: HttpRequest<'_>, _: &mut ()| {
+            HttpResponse::new(200).head_content_length(4096)
+        };
+        let head = roundtrip(
+            b"HEAD /x HTTP/1.1\r\nHost: h\r\n\r\n",
+            &mut HttpConn::new(()),
+            &mut handler,
+        );
+        let s = text(&head);
+        assert!(s.contains("Content-Length: 4096\r\n"), "{s}");
+        assert!(s.ends_with("\r\n\r\n"), "{s}");
+        let get = roundtrip(
+            b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n",
+            &mut HttpConn::new(()),
+            &mut handler,
+        );
+        let s = text(&get);
+        assert!(s.contains("Content-Length: 0\r\n"), "{s}");
+        assert!(!s.contains("4096"), "{s}");
+    }
+
+    #[test]
     fn expect_dance_through_the_real_glue() {
         let head =
             b"PUT /k HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n";

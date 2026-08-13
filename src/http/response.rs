@@ -2,7 +2,10 @@
 //! owns the framing-critical headers — `Content-Length`, `Connection`,
 //! `Date` — and silently drops consumer attempts to set them: a handler that
 //! could desynchronize framing from the actual byte stream would reintroduce
-//! the smuggling class the head parser screens out. The same policy covers
+//! the smuggling class the head parser screens out. The single exception is
+//! [`HttpResponse::head_content_length`], honored only when the request was
+//! a HEAD, where the protocol forbids a body outright and so leaves nothing
+//! for a declared length to desynchronize. The same policy covers
 //! the header bytes themselves: names that are not RFC 9110 tokens and
 //! values with any byte outside RFC 9110's field-value grammar are dropped
 //! too, so handler-echoed input can never split a response, and statuses
@@ -32,6 +35,10 @@ pub struct HttpResponse {
     pub(crate) headers: Headers,
     pub(crate) body: Cow<'static, [u8]>,
     pub(crate) close: bool,
+    /// The `Content-Length` to report when this answers a HEAD, set by
+    /// [`HttpResponse::head_content_length`]; ignored on every other
+    /// request, where the measured body is the only truth.
+    pub(crate) head_len: Option<u64>,
 }
 
 /// Conversion into stored response bytes — the `Cow`-aware analogue of
@@ -151,6 +158,7 @@ impl HttpResponse {
             headers: Headers::default(),
             body: Cow::Borrowed(&[]),
             close: false,
+            head_len: None,
         }
     }
 
@@ -184,6 +192,29 @@ impl HttpResponse {
     /// bytes are stored as a borrow — no copy.
     pub fn body(mut self, body: impl IntoBytes) -> Self {
         self.body = body.into_bytes();
+        self
+    }
+
+    /// Declare the `Content-Length` this response reports **when it answers
+    /// a HEAD**, in place of the measured body length. Ignored otherwise,
+    /// and ignored on a bodyless status (1xx/204/304), which carries no
+    /// `Content-Length` at all.
+    ///
+    /// A HEAD answer is the one place a declared length cannot desynchronize
+    /// framing: RFC 9110 §9.3.2 forbids content on it, the serializer elides
+    /// the body regardless, and the client reads zero body bytes whatever
+    /// the header says. So the usual codec-owned rule
+    /// ([`HttpResponse::header`] drops a `Content-Length` outright) can be
+    /// relaxed here without opening the smuggling class it exists to close —
+    /// and only here, which is why this is a typed method on the HEAD path
+    /// rather than a header a handler may set.
+    ///
+    /// The requirement is S3's: `HeadObject` reports the object's size,
+    /// which a handler with no bytes in hand cannot express by measuring
+    /// anything. Whether the request was a HEAD is decided by the parsed
+    /// request method, never by the handler.
+    pub fn head_content_length(mut self, len: u64) -> Self {
+        self.head_len = Some(len);
         self
     }
 
@@ -258,10 +289,12 @@ pub(crate) enum ConnHeader {
 }
 
 /// Serialize to wire bytes. `head_only` elides the body while keeping its
-/// `Content-Length` (the HEAD contract); `date` is the rendered IMF-fixdate
-/// value, injected by the caller so this stays a pure function (and so the
-/// glue's per-reactor [`DateCache`](super::date::DateCache) renders it once
-/// a second, not once a response).
+/// `Content-Length` (the HEAD contract), or reporting
+/// [`HttpResponse::head_content_length`] in its place when the handler
+/// declared one; `date` is the rendered IMF-fixdate value, injected by the
+/// caller so this stays a pure function (and so the glue's per-reactor
+/// [`DateCache`](super::date::DateCache) renders it once a second, not once
+/// a response).
 ///
 /// 1xx/204/304 responses never carry content (RFC 9110 §6.4.1): body bytes
 /// are elided regardless of `head_only`, and so is `Content-Length` — a
@@ -296,7 +329,13 @@ pub(crate) fn serialize(
     out.extend_from_slice(date);
     out.extend_from_slice(b"\r\n");
     if !bodyless {
-        write!(out, "Content-Length: {}\r\n", resp.body.len()).unwrap();
+        // A declared length is honored only on the HEAD path, where no body
+        // bytes follow to disagree with it.
+        let declared = match resp.head_len {
+            Some(len) if head_only => len,
+            _ => resp.body.len() as u64,
+        };
+        write!(out, "Content-Length: {declared}\r\n").unwrap();
     }
     match conn {
         ConnHeader::None => {}
@@ -418,6 +457,46 @@ mod tests {
         let s = text(&out);
         assert!(s.contains("Content-Length: 5\r\n"));
         assert!(s.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn head_declaration_reports_a_length_with_no_bytes() {
+        // HeadObject's shape: the object's size, no bytes in hand.
+        let resp = HttpResponse::new(200).head_content_length(4096);
+        let out = serialize(&resp, true, &date(), ConnHeader::None);
+        let s = text(&out);
+        assert!(s.contains("Content-Length: 4096\r\n"), "{s}");
+        assert!(s.ends_with("\r\n\r\n"), "{s}");
+    }
+
+    #[test]
+    fn head_declaration_is_ignored_off_the_head_path() {
+        // The same response answering a GET reports what it actually
+        // carries. A declaration that outlived its HEAD would promise bytes
+        // the serializer never writes, and the client would read the next
+        // response's head as this one's body.
+        let resp = HttpResponse::new(200)
+            .head_content_length(4096)
+            .body("hello");
+        let out = serialize(&resp, false, &date(), ConnHeader::None);
+        let s = text(&out);
+        assert!(s.contains("Content-Length: 5\r\n"), "{s}");
+        assert!(!s.contains("4096"), "{s}");
+        assert!(s.ends_with("\r\n\r\nhello"), "{s}");
+    }
+
+    #[test]
+    fn head_declaration_does_not_revive_a_bodyless_status() {
+        // 1xx/204/304 carry no Content-Length at all, and a HEAD asking for
+        // one changes nothing — S3 answers a conditional HeadObject with a
+        // bare 304.
+        for status in [100, 204, 304] {
+            let resp = HttpResponse::new(status).head_content_length(4096);
+            let out = serialize(&resp, true, &date(), ConnHeader::None);
+            let s = text(&out);
+            assert!(!s.contains("Content-Length"), "{status}: {s}");
+            assert!(s.ends_with("\r\n\r\n"), "{status}: {s}");
+        }
     }
 
     #[test]

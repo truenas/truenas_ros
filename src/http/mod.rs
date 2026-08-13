@@ -25,9 +25,12 @@
 //!   [`Response::ReplyClose`](crate::net::server::Response::ReplyClose) —
 //!   the flush-then-close farewell the reactor already implements.
 //! - **Serialization** (`response`): status line, headers, IMF-fixdate
-//!   `Date`, automatic `Content-Length`, HEAD body elision. Header names,
-//!   values, and bodies are `Cow<'static, _>` — responses built from
-//!   literals allocate nothing until serialization.
+//!   `Date`, automatic `Content-Length`, HEAD body elision — with
+//!   [`HttpResponse::head_content_length`] the one way a handler may
+//!   declare a length itself, honored only on a HEAD, where the protocol
+//!   sends no bytes for it to contradict. Header names, values, and bodies
+//!   are `Cow<'static, _>` — responses built from literals allocate nothing
+//!   until serialization.
 //! - **Hardening**: request-smuggling screens (duplicate `Content-Length` →
 //!   400; `Transfer-Encoding` where `chunked` is absent, repeated, or
 //!   non-final → 400; codings before a final `chunked` → 501; TE on
