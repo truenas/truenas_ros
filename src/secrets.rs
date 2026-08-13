@@ -1,20 +1,21 @@
 //! `memfd_secret(2)`-backed protected memory for long-lived in-process
 //! secrets: the pages are removed from the kernel direct map, kept off swap,
-//! and excluded from core dumps (on TrueNAS, from a support bundle). The
-//! mapping is automatically `VM_LOCKED | VM_DONTDUMP` — no separate
-//! `mlock`/`madvise` — and counts against `RLIMIT_MEMLOCK`.
+//! and excluded from core dumps (on TrueNAS, from a support bundle).
+//! `secretmem_mmap_prepare` stamps the VMA `VM_LOCKED | VM_DONTDUMP` itself
+//! (`mm/secretmem.c:131`) — no separate `mlock`/`madvise` — and charges it
+//! against `RLIMIT_MEMLOCK` (`:128`).
 //!
 //! This is memory-access hardening, not at-rest encryption: a usable secret is
 //! plaintext in the region while the process runs; what it removes are the
 //! offline paths (dump, swap, cross-process kernel read). A value copied on
-//! into ordinary memory (a hasher's state) is the caller's to [`scrub`]. A
-//! `fork(2)` after construction shares the pages with the child (`MAP_SHARED`),
-//! so build regions after the last fork.
+//! into ordinary memory (a hasher's state) is the caller's to [`scrub`].
+//!
+//! A forked child gets no mapping: construction marks the VMA `VM_DONTCOPY`,
+//! so a region built before a fork stays the parent's alone.
 //!
 //! [`SecretMem::available`] probes secretmem (default-on, but arm64 also gates
 //! on `can_set_direct_map()` and seccomp can block the syscall) so a daemon can
 //! fail closed; construction returns [`Errno::ENOSYS`] when it is unavailable.
-//! The kernel guarantees are asserted in the QEMU job, not container CI.
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{compiler_fence, Ordering};
@@ -35,6 +36,17 @@ fn memfd_secret() -> Result<OwnedFd> {
     Ok(unsafe { crate::fd::owned_from_raw(ret as RawFd) })
 }
 
+/// Whether a failed `memfd_secret` means the kernel cannot do this at all,
+/// rather than not right now — the answer a daemon disables secret handling
+/// on, for the rest of its life.
+///
+/// `ENOSYS` is the missing syscall and `EPERM` a seccomp filter denying it;
+/// both hold for the whole process. `EMFILE`/`ENFILE`/`ENOMEM` describe the
+/// instant the probe ran.
+fn unsupported(e: Errno) -> bool {
+    matches!(e, Errno::ENOSYS | Errno::EPERM)
+}
+
 /// The system page size, the granularity secretmem allocates in.
 fn page_size() -> usize {
     // SAFETY: `sysconf` with a valid name reads no memory and returns a long.
@@ -51,14 +63,14 @@ fn page_size() -> usize {
 /// Sized up to whole pages so every mapped byte is backed (an unbacked
 /// secretmem page faults `SIGBUS`), but the slices expose exactly `len`. Fill
 /// it once via [`as_mut_slice`](Self::as_mut_slice), then treat it as
-/// read-only; drop scrubs and unmaps. The memfd is closed once mapped — the
+/// read-only; drop unmaps. The memfd is closed once mapped — the
 /// mapping keeps the memory alive, leaving no reopenable handle in
 /// `/proc/self/fd`. Pack many secrets into one region to spare `RLIMIT_MEMLOCK`.
 pub struct SecretMem {
     ptr: *mut u8,
     /// Requested length (`≤ mapped`).
     len: usize,
-    /// Page-rounded mapped length, for `munmap`/scrub.
+    /// Page-rounded mapped length, for `munmap`.
     mapped: usize,
 }
 
@@ -79,8 +91,9 @@ impl SecretMem {
             .checked_next_multiple_of(page)
             .ok_or(Errno::EINVAL)?;
         let fd = memfd_secret()?;
-        // ftruncate to the page-rounded length, not `len`, or the tail page
-        // SIGBUSes on first touch.
+        // Size the file to the whole mapping: `secretmem_fault` SIGBUSes a
+        // fault at or past `i_size` (`mm/secretmem.c:61`), and a zero-length
+        // request is one page here by the `max(1)` above.
         // SAFETY: `fd` is our live memfd; `mapped` fits an `off_t`.
         let t =
             unsafe { libc::ftruncate(fd.as_raw_fd(), mapped as libc::off_t) };
@@ -102,6 +115,17 @@ impl SecretMem {
         if p == libc::MAP_FAILED {
             return Err(Errno::last());
         }
+        // Keep the region out of forked children. secretmem mandates
+        // `MAP_SHARED` (`secretmem_mmap_prepare` rejects a private mapping,
+        // `mm/secretmem.c:125`), so `VM_DONTCOPY` is the only thing standing
+        // between a child and the same folios.
+        // SAFETY: our own mapping, exactly `mapped` bytes, still live.
+        if unsafe { libc::madvise(p, mapped, libc::MADV_DONTFORK) } < 0 {
+            let e = Errno::last();
+            // SAFETY: as above; nothing else has the mapping yet.
+            unsafe { libc::munmap(p, mapped) };
+            return Err(e);
+        }
         // The mapping holds its own inode reference, so drop the fd now: no
         // reopenable handle to the secret lingers in `/proc/self/fd`.
         drop(fd);
@@ -112,11 +136,21 @@ impl SecretMem {
         })
     }
 
-    /// Whether `memfd_secret(2)` is usable here. Call at start-up to fail
-    /// closed; `false` means no `CONFIG_SECRETMEM`, it was disabled, the arch
-    /// gate is unmet, or seccomp blocks it.
+    /// Whether this kernel supports `memfd_secret(2)`. Call at start-up to
+    /// fail closed; `false` means no `CONFIG_SECRETMEM`, it was disabled, the
+    /// arch gate is unmet, or seccomp blocks the syscall.
+    ///
+    /// Support, not headroom. `RLIMIT_MEMLOCK` is charged when the region is
+    /// mapped, not when the syscall is made (`mlock_future_ok` from
+    /// `secretmem_mmap_prepare`, `mm/secretmem.c:128`, and bypassed entirely
+    /// under `CAP_IPC_LOCK`, `mm/mmap.c:233`), so a `true` here does not
+    /// promise the next [`with_capacity`](Self::with_capacity) fits the
+    /// limit — that surfaces as `EAGAIN` from the allocation itself.
     pub fn available() -> bool {
-        memfd_secret().is_ok()
+        match memfd_secret() {
+            Ok(_) => true,
+            Err(e) => !unsupported(e),
+        }
     }
 
     /// The secret bytes, read-only; length is the requested `len`.
@@ -153,17 +187,15 @@ impl std::fmt::Debug for SecretMem {
 
 impl Drop for SecretMem {
     fn drop(&mut self) {
-        // Scrub before unmap: the kernel zeroes secretmem on free, but this
-        // makes the secret gone the instant we return.
-        // SAFETY: our live mapping right up to the `munmap` that releases it.
-        unsafe {
-            scrub(self.ptr, self.mapped);
-            libc::munmap(self.ptr.cast(), self.mapped);
-        }
+        // Unmap only: `secretmem_free_folio` zeroes the folio on last free
+        // (`folio_zero_segment`, `mm/secretmem.c:153-157`), so the bytes do
+        // not outlive the mapping.
+        // SAFETY: our live mapping, released exactly once.
+        unsafe { libc::munmap(self.ptr.cast(), self.mapped) };
     }
 }
 
-/// One secret in its own region, scrubbed on drop.
+/// One secret in its own region.
 ///
 /// The single-value wrapper over [`SecretMem`] (redacted [`Debug`], no
 /// `Clone`), mirroring `truenas_pam::Secret`. One memfd and a locked page each,
@@ -207,7 +239,7 @@ impl std::fmt::Debug for Secret {
 /// A per-byte `write_volatile` plus a compiler fence — the same primitives
 /// `zeroize` uses internally, and what `truenas_pam::Secret` uses. A plain
 /// store to soon-dead memory is a dead store the compiler will drop; a volatile
-/// one it must keep. For burning a transient buffer a secret passed through.
+/// one it must keep. Use it on a transient buffer a secret passed through.
 ///
 /// # Safety
 ///
@@ -293,6 +325,151 @@ mod tests {
         assert_eq!(s.as_bytes(), b"AKsecret/keymaterial");
         assert_eq!(format!("{s:?}"), "Secret(..)");
         assert_eq!(format!("{:?}", Some(&s)), "Some(Secret(..))");
+    }
+
+    /// The three flags the region is for: `lo` (`VM_LOCKED`, off swap) and
+    /// `dd` (`VM_DONTDUMP`, out of core dumps) from `secretmem_mmap_prepare`,
+    /// and `dc` (`VM_DONTCOPY`) from the fork barrier.
+    ///
+    /// Nothing else here would notice a kernel that kept `memfd_secret`
+    /// working and stopped setting them.
+    #[test]
+    fn the_mapping_is_locked_and_undumpable() {
+        if !secretmem_or_skip() {
+            return;
+        }
+        let mem = SecretMem::with_capacity(64).expect("secret region");
+        let flags = vm_flags_of(mem.as_slice().as_ptr() as usize)
+            .expect("no smaps entry for the region");
+        for want in ["lo", "dd", "dc"] {
+            assert!(
+                flags.split_whitespace().any(|f| f == want),
+                "secretmem VMA is missing {want:?}: {flags:?}"
+            );
+        }
+    }
+
+    /// `VmFlags:` for whichever `/proc/self/smaps` region contains `addr`.
+    fn vm_flags_of(addr: usize) -> Option<String> {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
+        let mut in_region = false;
+        for line in smaps.lines() {
+            if let Some(range) = line.split(' ').next() {
+                if let Some((lo, hi)) = range.split_once('-') {
+                    if let (Ok(lo), Ok(hi)) = (
+                        usize::from_str_radix(lo, 16),
+                        usize::from_str_radix(hi, 16),
+                    ) {
+                        in_region = addr >= lo && addr < hi;
+                    }
+                }
+            }
+            if in_region {
+                if let Some(f) = line.strip_prefix("VmFlags:") {
+                    return Some(f.trim().to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// A forked child reaches neither the mapping nor the parent's bytes,
+    /// and its teardown runs without faulting on what it does not have.
+    #[test]
+    fn a_forked_child_cannot_reach_the_region() {
+        if !secretmem_or_skip() {
+            return;
+        }
+        let mut mem = SecretMem::with_capacity(64).expect("secret region");
+        mem.as_mut_slice().fill(0xAB);
+        let addr = mem.as_slice().as_ptr() as usize;
+
+        // SAFETY: the child only reads /proc, writes a byte to a pipe and
+        // `_exit`s — no allocation, no Rust destructor.
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let mapped = u8::from(vm_flags_of(addr).is_some());
+            // SAFETY: the child's own copy, dropped exactly once — the
+            // teardown a forked worker runs.
+            unsafe { std::ptr::drop_in_place(&mut mem) };
+            unsafe {
+                libc::close(fds[0]);
+                libc::write(fds[1], std::ptr::addr_of!(mapped).cast(), 1);
+                libc::_exit(0)
+            };
+        }
+        let mut got = 1u8;
+        let mut st = 0;
+        let n = unsafe {
+            libc::close(fds[1]);
+            let n = libc::read(fds[0], std::ptr::addr_of_mut!(got).cast(), 1);
+            libc::close(fds[0]);
+            libc::waitpid(pid, &mut st, 0);
+            n
+        };
+        // Status first: a child that faulted never reported, and its
+        // silence would otherwise read as the mapping assertion failing.
+        assert!(
+            libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0,
+            "the child's teardown faulted: status {st}"
+        );
+        assert_eq!(n, 1, "the child exited without reporting");
+        assert_eq!(got, 0, "the child inherited the secret's mapping");
+        assert!(
+            mem.as_slice().iter().all(|&b| b == 0xAB),
+            "the child's teardown reached the parent's secret"
+        );
+    }
+
+    /// Construction errors when no region can be made, rather than handing
+    /// back ordinary memory that would swap and appear in dumps.
+    ///
+    /// Forced by exhausting a child's descriptor table, a kernel with
+    /// secretmem being unable to stop having it. The probe should still
+    /// report support: a full fd table is the instant, not the kernel.
+    #[test]
+    fn construction_fails_closed_when_no_region_can_be_made() {
+        if !secretmem_or_skip() {
+            return;
+        }
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let lim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: a valid rlimit for a limit this process may lower.
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
+            let no_fallback = SecretMem::with_capacity(32).is_err()
+                && Secret::new(b"k").is_err();
+            // Still "supported": the fd table is full, the kernel is fine.
+            let still_supported = SecretMem::available();
+            // SAFETY: async-signal-safe exit with the verdict as the status.
+            unsafe {
+                libc::_exit(i32::from(!(no_fallback && still_supported)))
+            };
+        }
+        let mut st = 0;
+        unsafe { libc::waitpid(pid, &mut st, 0) };
+        assert!(
+            libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0,
+            "construction did not fail closed under fd exhaustion"
+        );
+    }
+
+    #[test]
+    fn only_a_permanent_error_means_unsupported() {
+        // ENOSYS: no CONFIG_SECRETMEM. EPERM: seccomp denied the syscall.
+        assert!(unsupported(Errno::ENOSYS));
+        assert!(unsupported(Errno::EPERM));
+        // Transient: the kernel supports it, this instant could not do it.
+        for e in [Errno::EMFILE, Errno::ENFILE, Errno::ENOMEM] {
+            assert!(!unsupported(e), "{e:?} read as unsupported");
+        }
     }
 
     #[test]

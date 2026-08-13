@@ -140,6 +140,7 @@ full = [
     "net-server",
     "net-client",
     "http",
+    "secrets",
 ]
 
 [dev-dependencies]
@@ -173,6 +174,13 @@ path = "test/zfs.rs"
 [[test]]
 name = "configparser_compat"
 path = "test/configparser_compat.rs"
+
+# memfd_secret-backed protected memory through its public surface, across a
+# real fork. Skips when the kernel has no secretmem; the QEMU job arms
+# TRUENAS_ROS_REQUIRE_SECRETMEM so a skip there is a failure.
+[[test]]
+name = "secrets"
+path = "test/secrets.rs"
 
 # Kernel audit. Sends real records over NETLINK_AUDIT; skips automatically when
 # the socket cannot be opened (sandbox/old kernel) and tolerates a missing
