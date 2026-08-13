@@ -77,6 +77,9 @@ pub mod configfile;
 #[cfg(feature = "audit")]
 pub mod audit;
 
+#[cfg(feature = "secrets")]
+pub mod secrets;
+
 #[cfg(feature = "uring")]
 mod uring;
 

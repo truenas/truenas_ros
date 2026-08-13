@@ -102,6 +102,11 @@ export RUST_BACKTRACE=1
 # real failure that must turn CI red.
 export TRUENAS_ROS_REQUIRE_IO_URING=1
 export TRUENAS_ROS_REQUIRE_KTLS=1
+# memfd_secret (CONFIG_SECRETMEM, default-on) backs the `secrets` module's
+# protected memory. On the x86_64 appliance kernel it is always usable
+# (`can_set_direct_map()` is unconditionally true), so force the secrets tests
+# to RUN: a skip means secretmem regressed or was disabled and must turn CI red.
+export TRUENAS_ROS_REQUIRE_SECRETMEM=1
 # The ZFS-ACL suites (test/zfs.rs and the live-fixture ACL checks in
 # test/test.rs) skip when their datasets are absent. Those datasets were
 # provisioned above, so force the suites to RUN: a skip now means provisioning
