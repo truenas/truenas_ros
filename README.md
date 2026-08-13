@@ -234,15 +234,14 @@ quiescence, the self-join guard, lazy-init races), and the offload completion
 handoff. `src/sync.rs` is the std/loom shim — outside a model build it is a
 plain re-export, so none of this costs anything in a shipped binary.
 
-When one of these fails, `LOOM_CHECKPOINT_FILE` is how you get a tractable
-repro: loom records the failing schedule and a later run replays it rather than
-exploring from the start again. Set the interval too — it defaults to 20,000
-iterations, and every model here finishes well inside that, so on its own the
-file is never written:
+When one of these fails, loom's exploration is deterministic, so re-running the
+model alone reproduces the same failure at the same iteration; the models are
+small enough that a fresh run reaches it quickly. Narrow to the one model and
+set `LOOM_LOG` to print the interleaving that failed:
 
 ```sh
-RUSTFLAGS="--cfg loom" LOOM_CHECKPOINT_FILE=/tmp/loom.json \
-  LOOM_CHECKPOINT_INTERVAL=1 cargo test --lib --features uring-fs loom_the_one
+RUSTFLAGS="--cfg loom" LOOM_LOG=trace \
+  cargo test --lib --features uring-fs loom_the_one
 ```
 
 Two limits are worth knowing before adding a model. loom caps a model at 5
