@@ -176,6 +176,21 @@ impl SecretMem {
     }
 }
 
+/// Read the region as a byte slice — lets a generic packed store borrow from a
+/// `memfd_secret` arena the same way it borrows from a `Vec`.
+impl AsRef<[u8]> for SecretMem {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+/// Write access for filling the region once at construction.
+impl AsMut<[u8]> for SecretMem {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+}
+
 /// Prints the mapping length only, never the bytes.
 impl std::fmt::Debug for SecretMem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
