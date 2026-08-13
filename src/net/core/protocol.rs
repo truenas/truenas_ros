@@ -269,6 +269,7 @@ impl<'a> Body<'a> {
     /// position discarded, every byte included — or `None` for an inline
     /// body. The codec-side seam for in-place transforms over a delivered
     /// wire message (the http chunked path); handlers use [`Body::take`].
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub(crate) fn try_take_owned(&mut self) -> Option<Vec<u8>> {
         match &mut self.inner {
             BodyInner::Inline(_) => None,

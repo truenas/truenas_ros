@@ -29,15 +29,23 @@
 //! Models are also capped at [`loom::MAX_THREADS`] (5, including the main
 //! thread), which is why every model in this crate is deliberately tiny.
 
+// `atomic` and `Arc` serve both engines; the parking primitives and
+// [`OnceCell`] are the fs reactor's, except that a loom build also wires
+// `WakeHandle`'s eventfd stand-in onto `Mutex`/`Condvar`. Gating each name on
+// the exact cross-product of that and `--cfg loom` costs more than it says,
+// so the unused ones are allowed through instead.
+#[cfg_attr(not(feature = "uring-fs"), allow(unused_imports))]
 #[cfg(loom)]
-pub(crate) use loom::sync::{atomic, mpsc, Arc, Condvar, Mutex};
-#[cfg(loom)]
-pub(crate) use loom::thread;
-
+pub(crate) use loom::{
+    sync::{atomic, mpsc, Arc, Condvar, Mutex},
+    thread,
+};
+#[cfg_attr(not(feature = "uring-fs"), allow(unused_imports))]
 #[cfg(not(loom))]
-pub(crate) use std::sync::{atomic, mpsc, Arc, Condvar, Mutex};
-#[cfg(not(loom))]
-pub(crate) use std::thread;
+pub(crate) use std::{
+    sync::{atomic, mpsc, Arc, Condvar, Mutex},
+    thread,
+};
 
 /// A write-once cell: [`std::sync::OnceLock`] in production, a mutex-backed
 /// stand-in under loom.
@@ -46,6 +54,7 @@ pub(crate) use std::thread;
 /// clones out rather than borrowing, and [`with`](Self::with) runs a closure
 /// against a borrow — because a `Mutex<Option<T>>` cannot produce a `&T` that
 /// outlives its guard. Both callers already wanted one of those two shapes.
+#[cfg_attr(not(feature = "uring-fs"), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct OnceCell<T> {
     #[cfg(not(loom))]
@@ -54,6 +63,7 @@ pub(crate) struct OnceCell<T> {
     inner: Mutex<Option<T>>,
 }
 
+#[cfg_attr(not(feature = "uring-fs"), allow(dead_code))]
 impl<T> OnceCell<T> {
     /// An empty cell.
     pub(crate) fn new() -> OnceCell<T> {

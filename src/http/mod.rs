@@ -10,11 +10,11 @@
 //! supply. The head tokenizer is `httparse` (sans-io, allocation-free, the
 //! same parser hyper embeds); everything above tokens is implemented here:
 //!
-//! - **Framing** ([`framer`]): a per-connection state machine mapping HTTP
+//! - **Framing** (`framer`): a per-connection state machine mapping HTTP
 //!   message boundaries onto [`Framing`](crate::net::server::Framing)
 //!   verdicts — scan (`More`) until the head completes, then declare the
 //!   body from `Content-Length`, or walk a `Transfer-Encoding: chunked`
-//!   stream ([`chunked`]) until its terminal chunk lands.
+//!   stream (`chunked`) until its terminal chunk lands.
 //! - **`Expect: 100-continue`** as a two-message dance: the head is delivered
 //!   as a zero-body message, the glue replies with raw interim bytes
 //!   (`Response::Reply` sends verbatim), and the framer then frames the body
@@ -24,7 +24,7 @@
 //!   closes unless `Connection: keep-alive`. Close maps onto
 //!   [`Response::ReplyClose`](crate::net::server::Response::ReplyClose) —
 //!   the flush-then-close farewell the reactor already implements.
-//! - **Serialization** ([`response`]): status line, headers, IMF-fixdate
+//! - **Serialization** (`response`): status line, headers, IMF-fixdate
 //!   `Date`, automatic `Content-Length`, HEAD body elision. Header names,
 //!   values, and bodies are `Cow<'static, _>` — responses built from
 //!   literals allocate nothing until serialization.

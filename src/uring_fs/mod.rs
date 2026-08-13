@@ -1264,7 +1264,7 @@ impl FsHandle {
     /// collect the metadata with
     /// [`FsPending::wait_statx`](FsPending::wait_statx). The non-blocking twin of
     /// [`statx`](Self::statx), for scattering per-entry metadata (see
-    /// [`query_directory`](crate::uring_fs::query_directory)).
+    /// [`query_directory`]).
     pub fn start_statx(
         &self,
         who: Personality,
@@ -1500,7 +1500,7 @@ impl FsHandle {
 
     /// Enumerate the extended attributes of `f` in the namespaces `ns`, read
     /// their values under `who`, and return `(name, value)` for only those
-    /// `who` can read (see [`XattrNamespaces`](query_dir::XattrNamespaces)).
+    /// `who` can read (see [`XattrNamespaces`]).
     ///
     /// The candidate `flistxattr` runs at this thread's privilege; the per-value
     /// read under `who` is the authoritative gate, so an attribute `who` cannot

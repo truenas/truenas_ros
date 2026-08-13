@@ -55,14 +55,14 @@ pub struct ServerConfig {
     /// blocking work (`readdir`/`fdopendir`, byte copies), which has no io_uring
     /// opcode and so cannot run on the ring. Per server/ring; size it to the I/O
     /// concurrency you expect for listings and copies. Default
-    /// [`OFFLOAD_FLOOR`](crate::uring_fs::core::OFFLOAD_FLOOR).
+    /// `uring_fs::core::OFFLOAD_FLOOR`.
     #[cfg(feature = "uring-fs")]
     pub fs_offload_floor: usize,
     /// Ceiling the offload pool grows to when every worker is blocked (a cold or
     /// huge directory, an NFS/FUSE backing, a stalled copy), so one stalled walk
     /// does not head-of-line-block the rest; burst threads retire when idle. Per
     /// server/ring. Default
-    /// [`OFFLOAD_CEILING`](crate::uring_fs::core::OFFLOAD_CEILING).
+    /// `uring_fs::core::OFFLOAD_CEILING`.
     #[cfg(feature = "uring-fs")]
     pub fs_offload_ceiling: usize,
     /// Maximum bytes accepted for one message (header + body), a memory guard

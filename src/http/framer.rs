@@ -65,7 +65,7 @@ pub struct HttpConfig {
     /// `Content-Length`, or for chunked requests the **decoded** entity size
     /// (enforced mid-stream as chunks arrive, not after buffering). Exceeding
     /// it answers `413 Content Too Large` and closes; a chunked wire extent
-    /// more than [`CHUNK_WIRE_OVERHEAD`] past this cap answers 400. Bodies
+    /// more than `CHUNK_WIRE_OVERHEAD` past this cap answers 400. Bodies
     /// above the cap belong to the (planned) splice path, not the connection
     /// buffer. Raising it past the reactor's message cap requires raising
     /// [`ServerConfig::max_request_bytes`] in step (see
