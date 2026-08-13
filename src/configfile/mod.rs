@@ -417,8 +417,15 @@ impl ConfigFile {
 
     // --- mutation --------------------------------------------------------
 
-    /// Add an empty section. Errors if it already exists or is named `DEFAULT`.
+    /// Add an empty section. Errors if it already exists, is named `DEFAULT`,
+    /// or could not be read back as itself (see
+    /// [`set`](Self::set#option-names-are-screened)).
     pub fn add_section(&mut self, name: &str) -> Result<()> {
+        if let Some(why) = parse::section_fault(name) {
+            return Err(Error::Validation(format!(
+                "section name {name:?} {why}"
+            )));
+        }
         if name == DEFAULT_SECTION {
             return Err(Error::Validation(format!(
                 "invalid section name: {name:?}"
@@ -439,18 +446,38 @@ impl ConfigFile {
     /// The section must already exist, or be `DEFAULT`. For an interpolating
     /// config, a value with invalid `%` syntax is rejected (matching
     /// `ConfigParser.set`).
+    ///
+    /// # Option names are screened
+    ///
+    /// A name [`write_string`](Self::write_string) could not emit and read
+    /// back as itself is rejected: one containing a line break or a `=`/`:`
+    /// delimiter, surrounded by whitespace, or opening with `[`, `#` or `;`.
+    /// `parse::key_fault` has the rules.
+    ///
+    /// `configparser` screens the value and the argument types, never the
+    /// name (`RawConfigParser.set`, `Lib/configparser.py:922`), so INI syntax
+    /// in a name reaches its output intact: on CPython 3.13
+    /// `set(s, "[global]", v)` writes a file that reads back carrying a
+    /// section the caller never asked for. Storing externally-supplied names
+    /// as options there is an injection primitive. Values keep
+    /// `configparser`'s behaviour exactly.
     pub fn set(
         &mut self,
         section: &str,
         option: &str,
         value: Option<&str>,
     ) -> Result<()> {
+        let key = optionxform(option);
+        if let Some(why) = parse::key_fault(&key) {
+            return Err(Error::Validation(format!(
+                "option name {option:?} {why}"
+            )));
+        }
         if self.interp == Interp::Basic {
             if let Some(v) = value {
                 interp::validate_set(v)?;
             }
         }
-        let key = optionxform(option);
         let slot = if section == DEFAULT_SECTION {
             &mut self.defaults
         } else {

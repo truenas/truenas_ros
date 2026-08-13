@@ -17,10 +17,8 @@
 //!   `OnceLock::get` returns. [`OnceCell`] therefore exposes a closure-taking
 //!   [`with`](OnceCell::with) instead, which both builds can implement;
 //!   production still holds a real `OnceLock` behind it, so the fast path is
-//!   the same single acquire load it always was. Only the offload pool's lazy
-//!   init uses this — the broker's `IdSlot` keeps its plain `OnceLock`,
-//!   because minting an identity means IPC to a forked child and so cannot be
-//!   modelled anyway.
+//!   the same single acquire load it always was. The offload pool's lazy init
+//!   and the identity cache's per-key slot both use it.
 //! * **Timeouts.** `loom::sync::Condvar::wait_timeout` never reports a
 //!   timeout — it delegates to `wait` and hardcodes `timed_out() == false`.
 //!   Any branch predicated on a timeout is unreachable in a model and needs an

@@ -16,9 +16,8 @@ use crate::error::{Error, Result};
 /// untrusted config from exhausting memory. Bounding the accumulated output
 /// does — 1 MiB is far beyond any real interpolated value.
 ///
-/// CPython has no such cap, so this rejects a handful of documents it would
-/// resolve. That is the point: the alternative to rejecting them is resolving
-/// them, and the input is a config file the process did not write.
+/// CPython caps only the recursion depth, so a document `configparser`
+/// resolves can be rejected here.
 const MAX_INTERPOLATION_OUTPUT: usize = 1 << 20;
 
 /// Interpolate `value` for `option`, resolving `%(name)s` against `map` (the

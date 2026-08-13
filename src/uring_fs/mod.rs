@@ -176,6 +176,9 @@
 //! server drives the core this way.
 
 mod broker;
+// The mint-once-per-key protocol behind `IdentityCache`, kept separate so it
+// can be model-checked without a broker process to fork.
+mod single_flight;
 // `pub(crate)` so an embedding host (a server driving `FsCore` on its own
 // can drive an `FsCore` on the server's own ring; the standalone host is
 // `uring_fs`'s own `UringFs`.
