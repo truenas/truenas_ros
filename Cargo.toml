@@ -30,14 +30,8 @@ httparse = { version = "1.10", optional = true }
 # the libc+bitflags charter untouched — see src/sync.rs for the std/loom shim.
 #   Run: RUSTFLAGS="--cfg loom" cargo test --lib --features uring    loom_
 #        RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
-#
-# `checkpoint` backs LOOM_CHECKPOINT_FILE, which records a failing schedule for
-# a later run to replay. Set LOOM_CHECKPOINT_INTERVAL with it: the store runs
-# every interval iterations, default 20_000 (loom-0.7.2 src/model.rs:84), and
-# every model here finishes well inside that. serde comes with the feature and
-# stays under cfg(loom).
 [target.'cfg(loom)'.dependencies]
-loom = { version = "0.7", features = ["checkpoint"] }
+loom = { version = "0.7" }
 
 [features]
 # Default enables the implemented subsystems; more join as phases land.
