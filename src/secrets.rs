@@ -250,6 +250,33 @@ impl std::fmt::Debug for Secret {
 
 pub use crate::scrub::scrub;
 
+/// `VmFlags:` for whichever `/proc/self/smaps` region contains `addr` —
+/// how a test proves what backs a mapping. Crate-visible so the
+/// `configfile` staging test can hold a region and check the same flags.
+#[cfg(test)]
+pub(crate) fn vm_flags_of(addr: usize) -> Option<String> {
+    let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
+    let mut in_region = false;
+    for line in smaps.lines() {
+        if let Some(range) = line.split(' ').next() {
+            if let Some((lo, hi)) = range.split_once('-') {
+                if let (Ok(lo), Ok(hi)) = (
+                    usize::from_str_radix(lo, 16),
+                    usize::from_str_radix(hi, 16),
+                ) {
+                    in_region = addr >= lo && addr < hi;
+                }
+            }
+        }
+        if in_region {
+            if let Some(f) = line.strip_prefix("VmFlags:") {
+                return Some(f.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,30 +372,6 @@ mod tests {
                 "secretmem VMA is missing {want:?}: {flags:?}"
             );
         }
-    }
-
-    /// `VmFlags:` for whichever `/proc/self/smaps` region contains `addr`.
-    fn vm_flags_of(addr: usize) -> Option<String> {
-        let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
-        let mut in_region = false;
-        for line in smaps.lines() {
-            if let Some(range) = line.split(' ').next() {
-                if let Some((lo, hi)) = range.split_once('-') {
-                    if let (Ok(lo), Ok(hi)) = (
-                        usize::from_str_radix(lo, 16),
-                        usize::from_str_radix(hi, 16),
-                    ) {
-                        in_region = addr >= lo && addr < hi;
-                    }
-                }
-            }
-            if in_region {
-                if let Some(f) = line.strip_prefix("VmFlags:") {
-                    return Some(f.trim().to_string());
-                }
-            }
-        }
-        None
     }
 
     /// A forked child reaches neither the mapping nor the parent's bytes,

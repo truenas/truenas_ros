@@ -142,15 +142,13 @@ pub(super) fn read(
         default: Ordered::new(),
         sections: Ordered::new(),
         dups: HashSet::new(),
+        added_sections: HashSet::new(),
         scrub: cfg.scrub,
     };
 
     let mut cur = Cur::None;
     let mut optname: Option<String> = None;
     let mut indent_level: usize = 0;
-    // Fresh per read, so a section/option only conflicts within this document —
-    // matching `configparser`'s per-`_read` `elements_added`.
-    let mut added_sections: HashSet<String> = HashSet::new();
     // Non-fatal option-syntax errors are collected and reported together at the
     // end (like `configparser`'s accumulated `ParsingError`).
     let mut parse_errors: Vec<String> = Vec::new();
@@ -206,12 +204,18 @@ pub(super) fn read(
         if let Some(header) = section_header(clean) {
             if header == DEFAULT_SECTION {
                 cur = Cur::Default;
-            } else if added_sections.contains(header) {
-                return Err(Error::Parse(format!(
-                    "{source}:{lineno}: duplicate section {header:?}"
-                )));
+            } else if work.added_sections.contains(header) {
+                // The name is withheld from a scrubbed configuration's
+                // error like the duplicate-option key below: in a
+                // credentials file it is an identifier that must not
+                // reach a log.
+                return Err(Error::Parse(if cfg.scrub {
+                    format!("{source}:{lineno}: duplicate section")
+                } else {
+                    format!("{source}:{lineno}: duplicate section {header:?}")
+                }));
             } else {
-                added_sections.insert(header.to_string());
+                work.added_sections.insert(header.to_string());
                 work.sections.insert(header, Ordered::new());
                 cur = Cur::Section(work.sections.position(header).unwrap());
             }
@@ -240,11 +244,12 @@ pub(super) fn read(
             continue;
         }
 
-        let dup_key = (SectionId::of(&cur), key.clone());
+        let mut dup_key = (SectionId::of(&cur), key.clone());
         if work.dups.contains(&dup_key) {
             // The key is withheld from a scrubbed configuration's error: in
             // a credentials file it is an identifier that must not reach a
-            // log.
+            // log. Both copies of it — the line's and the lookup tuple's —
+            // are burned.
             let msg = if cfg.scrub {
                 format!("{source}:{lineno}: duplicate option")
             } else {
@@ -253,6 +258,7 @@ pub(super) fn read(
             let mut key = key;
             if cfg.scrub {
                 super::scrub_string(&mut key);
+                super::scrub_string(&mut dup_key.1);
             }
             return Err(Error::Parse(msg));
         }
@@ -339,9 +345,13 @@ fn parse_option(
 struct Work {
     default: Ordered<Acc>,
     sections: Ordered<Ordered<Acc>>,
-    /// Per-read duplicate detection (`configparser`'s `elements_added`);
-    /// holds a clone of every option key.
+    /// Per-read duplicate detection (`configparser`'s `elements_added`,
+    /// fresh each read so a conflict is within one document); holds a
+    /// clone of every option key.
     dups: HashSet<(SectionId, String)>,
+    /// Its section-name half: a clone of every section name, held here so
+    /// a scrubbed read burns them on drop.
+    added_sections: HashSet<String>,
     scrub: bool,
 }
 
@@ -351,15 +361,12 @@ impl Drop for Work {
             return;
         }
         scrub_acc(&mut self.default);
-        for (name, opts) in &mut self.sections.entries {
-            super::scrub_string(name);
-            scrub_acc(opts);
-        }
-        for (mut key, _) in self.sections.index.drain() {
-            super::scrub_string(&mut key);
-        }
+        self.sections.scrub_with(scrub_acc);
         for (_, mut key) in self.dups.drain() {
             super::scrub_string(&mut key);
+        }
+        for mut name in self.added_sections.drain() {
+            super::scrub_string(&mut name);
         }
     }
 }
@@ -367,17 +374,13 @@ impl Drop for Work {
 /// Burn one working section: keys (the index's copies included) and every
 /// accumulated value line.
 fn scrub_acc(opts: &mut Ordered<Acc>) {
-    for (key, acc) in &mut opts.entries {
-        super::scrub_string(key);
+    opts.scrub_with(|acc| {
         if let Some(lines) = acc {
             for line in lines {
                 super::scrub_string(line);
             }
         }
-    }
-    for (mut key, _) in opts.index.drain() {
-        super::scrub_string(&mut key);
-    }
+    });
 }
 
 /// Join accumulated value lines with `\n` and rstrip, matching
@@ -404,15 +407,6 @@ fn join(acc: Acc, scrub: bool) -> Option<String> {
 /// displaced earlier value — is burned as it is released.
 fn merge(cfg: &mut ConfigFile, work: &mut Work) {
     let scrub = work.scrub;
-    let scrub_displaced = |displaced: Option<Option<String>>| {
-        if let Some(mut old) = displaced {
-            if scrub {
-                if let Some(old) = old.as_mut() {
-                    super::scrub_string(old);
-                }
-            }
-        }
-    };
     let mut default = std::mem::take(&mut work.default);
     for (mut key, _) in default.index.drain() {
         if scrub {
@@ -420,7 +414,10 @@ fn merge(cfg: &mut ConfigFile, work: &mut Work) {
         }
     }
     for (mut key, acc) in default.entries {
-        scrub_displaced(cfg.defaults.insert(&key, join(acc, scrub)));
+        super::scrub_displaced(
+            scrub,
+            cfg.defaults.insert(&key, join(acc, scrub)),
+        );
         if scrub {
             super::scrub_string(&mut key);
         }
@@ -442,7 +439,10 @@ fn merge(cfg: &mut ConfigFile, work: &mut Work) {
             }
         }
         for (mut key, acc) in opts.entries {
-            scrub_displaced(target.insert(&key, join(acc, scrub)));
+            super::scrub_displaced(
+                scrub,
+                target.insert(&key, join(acc, scrub)),
+            );
             if scrub {
                 super::scrub_string(&mut key);
             }
