@@ -17,7 +17,11 @@ mod renameat2;
 #[cfg(feature = "sync-fs")]
 mod safe_open;
 #[cfg(feature = "sync-fs")]
+mod statfs;
+#[cfg(feature = "sync-fs")]
 mod statx;
+#[cfg(feature = "sync-fs")]
+mod zfsattr;
 
 #[cfg(feature = "acl")]
 pub mod acl;
@@ -39,10 +43,14 @@ pub use renameat2::{renameat2, RenameFlags};
 #[cfg(feature = "sync-fs")]
 pub use safe_open::safe_open;
 #[cfg(feature = "sync-fs")]
+pub use statfs::{fstatfs, Statfs};
+#[cfg(feature = "sync-fs")]
 pub use statx::{
     makedev, statx, Statx, StatxAttr, StatxMask, StatxRaw, StatxTimestamp,
     StatxTimestampRaw,
 };
+#[cfg(feature = "sync-fs")]
+pub use zfsattr::{fget_zfs_attrs, fset_zfs_attrs, ZfsAttr};
 
 #[cfg(feature = "sync-fs")]
 tn_bitflags! {

@@ -243,13 +243,13 @@ use crate::fd::owned_from_raw;
 use crate::path::TnPath;
 use crate::sync_fs::openat2::RawOpenHow;
 use crate::sync_fs::{
-    AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, Statx, StatxMask,
-    StatxRaw,
+    AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, Statfs, Statx,
+    StatxMask, StatxRaw, ZfsAttr,
 };
 use crate::uring::wake::LoopShared;
 use std::ffi::{CStr, CString};
 use std::fmt;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 // The inject channel and the shared flags are loom-modelled (see
 // `loom_tests` at the bottom), so these come from `crate::sync` — std's
 // outside `--cfg loom`.
@@ -667,6 +667,18 @@ impl Anchor {
 
     pub(crate) fn raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()
+    }
+}
+
+/// Borrow the anchor's dirfd.
+///
+/// It is an `O_PATH` descriptor, so it names a directory without granting
+/// access to it: most fd-taking calls refuse one (`fsync` gets `EINVAL` from
+/// `empty_fops`), while path-resolving and `f_path`-only calls accept it.
+/// [`fstatfs`](crate::sync_fs::fstatfs) is in the second group.
+impl AsFd for Anchor {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
     }
 }
 
@@ -1426,6 +1438,67 @@ impl FsHandle {
     /// special kernel version.
     pub fn flistxattr(&self, f: &File) -> crate::Result<Vec<CString>> {
         query_dir::list_xattr_names(f)
+    }
+
+    /// Filesystem statistics for the mount `f` lives on.
+    ///
+    /// Runs inline on the calling thread — this handle is already off the
+    /// reactor, so there is nothing to offload it *from*, exactly as
+    /// [`flistxattr`](Self::flistxattr) does. io_uring has no `statfs`
+    /// opcode, so the on-loop [`FsConn`] twin has to
+    /// take a pool thread; here the caller supplies one by being one.
+    pub fn fstatfs(&self, f: &File) -> crate::Result<Statfs> {
+        Ok(crate::sync_fs::fstatfs(&*f.fd)?)
+    }
+
+    /// Filesystem statistics for the mount `anchor` lives on — capacity for a
+    /// whole tree without opening anything in it.
+    ///
+    /// An [`Anchor`] is an `O_PATH` descriptor, which most fd-taking calls
+    /// reject; this one does not, because the kernel resolves through
+    /// `f_path` and never consults `f_op` (`fd_statfs`, `fs/statfs.c`). So a
+    /// bucket's free space costs no open.
+    pub fn fstatfs_anchor(&self, anchor: &Anchor) -> crate::Result<Statfs> {
+        Ok(crate::sync_fs::fstatfs(anchor)?)
+    }
+
+    /// Read `f`'s ZFS attributes.
+    ///
+    /// `f` must have been opened for real I/O — the ioctl needs an
+    /// `f_op->unlocked_ioctl`, which an `O_PATH` descriptor lacks. `ENOTTY`
+    /// off ZFS.
+    ///
+    /// For `IMMUTABLE`/`APPENDONLY` alone, prefer
+    /// [`fstatx`](Self::fstatx): `statx` reports both through
+    /// [`StatxAttr`](crate::sync_fs::StatxAttr) with no ioctl, and a listing
+    /// already pays for that stat.
+    pub fn fget_zfs_attrs(&self, f: &File) -> crate::Result<ZfsAttr> {
+        Ok(crate::sync_fs::fget_zfs_attrs(&*f.fd)?)
+    }
+
+    /// Replace `f`'s ZFS attributes with `attrs`. **The mask is absolute**:
+    /// visible bits absent from `attrs` are cleared, so read with
+    /// [`fget_zfs_attrs`](Self::fget_zfs_attrs) and modify that rather than
+    /// writing a constant.
+    ///
+    /// Note the missing [`Personality`], for the same reason
+    /// [`fremovexattr`](Self::fremovexattr) has none: the kernel checks the
+    /// *calling thread's* credentials for an ioctl, and this thread carries
+    /// the reactor's, not a request identity's. Whether a given caller may
+    /// lock a given file is therefore a policy question this API cannot
+    /// answer — and it matters, because `ZfsAttr::NOUNLINK` needs only
+    /// ownership to clear while `IMMUTABLE` needs `CAP_LINUX_IMMUTABLE`.
+    /// Do not expose this to a request identity without a gate above it.
+    ///
+    /// Setting `IMMUTABLE` also makes the file's extended attributes
+    /// read-only (`may_write_xattr`, `fs/xattr.c`), so write any metadata
+    /// that belongs with a locked object *before* locking it.
+    pub fn fset_zfs_attrs(
+        &self,
+        f: &File,
+        attrs: ZfsAttr,
+    ) -> crate::Result<()> {
+        Ok(crate::sync_fs::fset_zfs_attrs(&*f.fd, attrs)?)
     }
 
     /// Remove a **server-owned** extended attribute from `f`, or `EPERM` if

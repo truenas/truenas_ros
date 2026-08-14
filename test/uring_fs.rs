@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 use truenas_ros::sync_fs::{
-    AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, StatxMask,
+    AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, StatxAttr,
+    StatxMask, ZfsAttr,
 };
 use truenas_ros::uring_fs::{
     query_directory, query_tree, Advice, Anchor, AsUser, Caps, CredBroker,
@@ -28,6 +29,37 @@ use truenas_ros::uring_fs::{
     ShutdownHandle, TreeCursor, TreeOptions, UringFs,
 };
 use truenas_ros::{Errno, Error};
+
+/// A ZFS dataset directory to work in, or `None` to skip.
+///
+/// Resolved like `test/zfs.rs` does: the env vars the CI provisioning script
+/// exports, then the `/NFSV4ACL` / `/POSIXACL` convention. Any ZFS dataset
+/// serves — the attribute ioctls do not care about `acltype`.
+///
+/// `TRUENAS_ROS_REQUIRE_ZFS` turns the skip into a failure, so a runner that
+/// stopped provisioning a dataset goes red instead of reporting a green suite
+/// that exercised nothing.
+#[track_caller]
+fn zfs_dir_or_skip() -> Option<PathBuf> {
+    for var in ["TRUENAS_ROS_NFS4_DATASET", "TRUENAS_ROS_POSIX_DATASET"] {
+        if let Some(d) = std::env::var_os(var).map(PathBuf::from) {
+            if d.is_dir() {
+                return Some(d);
+            }
+        }
+    }
+    for fallback in ["/NFSV4ACL", "/POSIXACL"] {
+        let d = PathBuf::from(fallback);
+        if d.is_dir() {
+            return Some(d);
+        }
+    }
+    assert!(
+        std::env::var_os("TRUENAS_ROS_REQUIRE_ZFS").is_none(),
+        "TRUENAS_ROS_REQUIRE_ZFS is set but no ZFS dataset is present"
+    );
+    None
+}
 
 /// Single-buffer read, over the reactor's only read op.
 ///
@@ -288,6 +320,116 @@ fn round_trip_write_fsync_read() {
         assert_eq!(n.expect("pread"), 5);
         assert_eq!(&buf, b"world");
         h.close(f).expect("close 2");
+    });
+}
+
+/// `fstatfs` answers for the mount, from a file and from an anchor alike, and
+/// the two agree because they name the same filesystem. The anchor form is
+/// the one that matters: an `Anchor` is `O_PATH`, which `fsync` refuses, so
+/// this pins that `fstatfs` accepts it and a caller need not open anything to
+/// ask a whole tree's capacity.
+#[test]
+fn fstatfs_answers_from_a_file_and_from_an_anchor() {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let f = h.open(me, &anchor, "sf.bin", creat_rw()).expect("open");
+
+        let by_anchor = h.fstatfs_anchor(&anchor).expect("statfs by anchor");
+        let by_file = h.fstatfs(&f).expect("statfs by file");
+
+        assert!(by_anchor.block_size() > 0, "a unit is always reported");
+        assert_eq!(
+            by_anchor.block_size(),
+            by_file.block_size(),
+            "same filesystem, same unit"
+        );
+        assert_eq!(
+            by_anchor.total_blocks(),
+            by_file.total_blocks(),
+            "same filesystem, same size"
+        );
+        assert!(by_anchor.total_blocks() > 0);
+        assert!(by_anchor.available_blocks() <= by_anchor.free_blocks());
+        assert_eq!(
+            by_anchor.total_bytes(),
+            by_anchor.total_blocks() * by_anchor.block_size()
+        );
+        h.close(f).expect("close");
+    });
+}
+
+/// The immutability claim, exercised rather than asserted: set `IMMUTABLE`
+/// through the reactor and the file becomes undeletable *and* its xattrs
+/// unwritable — enforcement the VFS applies, so no protocol routes around it.
+///
+/// Needs a real ZFS dataset — a tmpfs tempdir answers the ioctl `ENOTTY` — so
+/// it resolves one and skips loudly under `TRUENAS_ROS_REQUIRE_ZFS`, which
+/// the QEMU job arms. Unprivileged, the `EPERM` on setting the flag is itself
+/// the property under test and is asserted rather than skipped.
+#[test]
+fn an_immutable_file_cannot_be_unlinked_or_relabelled() {
+    let Some(ds) = zfs_dir_or_skip() else {
+        return;
+    };
+    with_fs(test_cfg(), |h, me, _dir, _stop| {
+        let anchor = Anchor::open(ds.as_path()).expect("anchor");
+        let f = h.open(me, &anchor, "locked.bin", creat_rw()).expect("open");
+        let (n, _) = pwrite1(&h, me, &f, b"retained".to_vec(), 0);
+        assert_eq!(n.expect("write"), 8);
+
+        let before = h
+            .fget_zfs_attrs(&f)
+            .expect("a ZFS dataset must answer the attribute ioctl");
+        assert_eq!(
+            before & ZfsAttr::IMMUTABLE,
+            ZfsAttr::empty(),
+            "a fresh file is not locked"
+        );
+
+        // Metadata has to land before the lock: an immutable inode refuses
+        // xattr writes (`may_write_xattr`, fs/xattr.c).
+        let name = xattr_name("user.retain-until");
+        let (res, _) = h.fsetxattr(me, &f, &name, b"2099-01-01".to_vec(), 0);
+        res.expect("xattr before locking");
+
+        match h.fset_zfs_attrs(&f, before | ZfsAttr::IMMUTABLE) {
+            Ok(()) => {}
+            // CAP_LINUX_IMMUTABLE is required, and its absence is the very
+            // property under test — so an unprivileged refusal is a pass for
+            // the half this can reach, not a skip of the whole test.
+            Err(Error::Errno(Errno::EPERM)) => {
+                assert!(!is_root(), "root was refused CAP_LINUX_IMMUTABLE");
+                h.close(f).expect("close");
+                return;
+            }
+            Err(e) => panic!("fset_zfs_attrs: {e}"),
+        }
+
+        // statx sees it without an ioctl — the free read path.
+        let st = h
+            .fstatx(me, &f, AtFlags::empty(), StatxMask::BASIC_STATS)
+            .expect("fstatx");
+        assert!(
+            st.attributes().contains(StatxAttr::IMMUTABLE),
+            "statx must report the lock"
+        );
+
+        // The lock holds against deletion and against relabelling.
+        let unlinked = h.unlinkat(me, &anchor, leaf("locked.bin"));
+        assert!(
+            matches!(unlinked, Err(Error::Errno(Errno::EPERM))),
+            "an immutable file must not unlink: {unlinked:?}"
+        );
+        let (res, _) = h.fsetxattr(me, &f, &name, b"2000-01-01".to_vec(), 0);
+        assert!(
+            matches!(res, Err(Error::Errno(Errno::EPERM))),
+            "an immutable file's xattrs must be sealed: {res:?}"
+        );
+
+        // Clear it so the tempdir can be torn down.
+        h.fset_zfs_attrs(&f, before).expect("unlock");
+        h.unlinkat(me, &anchor, leaf("locked.bin")).expect("unlink");
+        h.close(f).expect("close");
     });
 }
 
