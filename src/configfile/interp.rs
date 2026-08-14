@@ -22,13 +22,18 @@ const MAX_INTERPOLATION_OUTPUT: usize = 1 << 20;
 
 /// Interpolate `value` for `option`, resolving `%(name)s` against `map` (the
 /// merged section-over-DEFAULT raw values). Mirrors `before_get`.
+///
+/// Under `scrub`, error messages withhold the value fragment and the option
+/// names they would otherwise quote: an interpolation error from a secrets
+/// configuration may reach a log, and the fragment is the secret.
 pub(super) fn before_get(
     option: &str,
     value: &str,
     map: &Ordered<Option<String>>,
+    scrub: bool,
 ) -> Result<String> {
     let mut out = String::new();
-    interpolate(option, value, map, 1, &mut out)?;
+    interpolate(option, value, map, 1, &mut out, scrub)?;
     Ok(out)
 }
 
@@ -38,11 +43,14 @@ fn interpolate(
     map: &Ordered<Option<String>>,
     depth: u32,
     out: &mut String,
+    scrub: bool,
 ) -> Result<()> {
     if depth > MAX_INTERPOLATION_DEPTH {
-        return Err(Error::Parse(format!(
-            "interpolation too deeply recursive for {option:?}"
-        )));
+        return Err(Error::Parse(if scrub {
+            "interpolation too deeply recursive".into()
+        } else {
+            format!("interpolation too deeply recursive for {option:?}")
+        }));
     }
     let mut rest = rest;
     while !rest.is_empty() {
@@ -50,10 +58,17 @@ fn interpolate(
         // checking here bounds the total expansion regardless of which nested
         // reference is currently being resolved.
         if out.len() > MAX_INTERPOLATION_OUTPUT {
-            return Err(Error::Parse(format!(
-                "interpolation for {option:?} expanded past \
-                 {MAX_INTERPOLATION_OUTPUT} bytes"
-            )));
+            return Err(Error::Parse(if scrub {
+                format!(
+                    "interpolation expanded past \
+                     {MAX_INTERPOLATION_OUTPUT} bytes"
+                )
+            } else {
+                format!(
+                    "interpolation for {option:?} expanded past \
+                     {MAX_INTERPOLATION_OUTPUT} bytes"
+                )
+            }));
         }
         let p = match rest.find('%') {
             None => {
@@ -71,30 +86,41 @@ fn interpolate(
             }
             Some(b'(') => {
                 let (name, end) = key_ref(rest).ok_or_else(|| {
-                    Error::Parse(format!(
-                        "bad interpolation variable reference: {rest:?}"
-                    ))
+                    Error::Parse(if scrub {
+                        "bad interpolation variable reference".into()
+                    } else {
+                        format!(
+                            "bad interpolation variable reference: {rest:?}"
+                        )
+                    })
                 })?;
                 let var = optionxform(name);
                 rest = &rest[end..];
                 let value = match map.get(&var) {
                     Some(Some(s)) => s.clone(),
                     _ => {
-                        return Err(Error::Parse(format!(
-                            "interpolation references missing option {var:?}"
-                        )))
+                        return Err(Error::Parse(if scrub {
+                            "interpolation references a missing option".into()
+                        } else {
+                            format!(
+                                "interpolation references missing option \
+                                 {var:?}"
+                            )
+                        }))
                     }
                 };
                 if value.contains('%') {
-                    interpolate(option, &value, map, depth + 1, out)?;
+                    interpolate(option, &value, map, depth + 1, out, scrub)?;
                 } else {
                     out.push_str(&value);
                 }
             }
             _ => {
-                return Err(Error::Parse(format!(
-                    "'%' must be followed by '%' or '(' in {rest:?}"
-                )))
+                return Err(Error::Parse(if scrub {
+                    "'%' must be followed by '%' or '('".into()
+                } else {
+                    format!("'%' must be followed by '%' or '(' in {rest:?}")
+                }))
             }
         }
     }
@@ -103,8 +129,9 @@ fn interpolate(
 
 /// Validate that `value` is safe to store under basic interpolation, matching
 /// `BasicInterpolation.before_set`: after removing escaped `%%` and every valid
-/// `%(name)s`, no stray `%` may remain.
-pub(super) fn validate_set(value: &str) -> Result<()> {
+/// `%(name)s`, no stray `%` may remain. Under `scrub` the rejected value is
+/// withheld from the error, as in [`before_get`].
+pub(super) fn validate_set(value: &str, scrub: bool) -> Result<()> {
     let stripped = value.replace("%%", "");
     let mut rest = stripped.as_str();
     while let Some(p) = rest.find('%') {
@@ -115,9 +142,11 @@ pub(super) fn validate_set(value: &str) -> Result<()> {
                 continue;
             }
         }
-        return Err(Error::Validation(format!(
-            "invalid interpolation syntax in {value:?}"
-        )));
+        return Err(Error::Validation(if scrub {
+            "invalid interpolation syntax".into()
+        } else {
+            format!("invalid interpolation syntax in {value:?}")
+        }));
     }
     Ok(())
 }
