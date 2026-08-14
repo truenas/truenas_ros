@@ -18,5 +18,9 @@ document the wire formats in one place, and they help most exactly where
 interception helps least — multi-byte grammar tokens rather than a single
 `==` against a constant.
 
+libFuzzer's parser understands only `\\`, `\"` and `\xAB`. A `\r` or `\n` is a
+parse error, and the whole dictionary is then **silently ignored** — write
+those bytes as `\x0d` / `\x0a`.
+
 What does *not* belong here, or anywhere under version control: a corpus of
 seed files. See the `Fuzzing` section of the top-level README.
