@@ -361,13 +361,7 @@ impl Drop for Work {
             return;
         }
         scrub_acc(&mut self.default);
-        for (name, opts) in &mut self.sections.entries {
-            super::scrub_string(name);
-            scrub_acc(opts);
-        }
-        for (mut key, _) in self.sections.index.drain() {
-            super::scrub_string(&mut key);
-        }
+        self.sections.scrub_with(scrub_acc);
         for (_, mut key) in self.dups.drain() {
             super::scrub_string(&mut key);
         }
@@ -380,17 +374,13 @@ impl Drop for Work {
 /// Burn one working section: keys (the index's copies included) and every
 /// accumulated value line.
 fn scrub_acc(opts: &mut Ordered<Acc>) {
-    for (key, acc) in &mut opts.entries {
-        super::scrub_string(key);
+    opts.scrub_with(|acc| {
         if let Some(lines) = acc {
             for line in lines {
                 super::scrub_string(line);
             }
         }
-    }
-    for (mut key, _) in opts.index.drain() {
-        super::scrub_string(&mut key);
-    }
+    });
 }
 
 /// Join accumulated value lines with `\n` and rstrip, matching
@@ -417,15 +407,6 @@ fn join(acc: Acc, scrub: bool) -> Option<String> {
 /// displaced earlier value — is burned as it is released.
 fn merge(cfg: &mut ConfigFile, work: &mut Work) {
     let scrub = work.scrub;
-    let scrub_displaced = |displaced: Option<Option<String>>| {
-        if let Some(mut old) = displaced {
-            if scrub {
-                if let Some(old) = old.as_mut() {
-                    super::scrub_string(old);
-                }
-            }
-        }
-    };
     let mut default = std::mem::take(&mut work.default);
     for (mut key, _) in default.index.drain() {
         if scrub {
@@ -433,7 +414,10 @@ fn merge(cfg: &mut ConfigFile, work: &mut Work) {
         }
     }
     for (mut key, acc) in default.entries {
-        scrub_displaced(cfg.defaults.insert(&key, join(acc, scrub)));
+        super::scrub_displaced(
+            scrub,
+            cfg.defaults.insert(&key, join(acc, scrub)),
+        );
         if scrub {
             super::scrub_string(&mut key);
         }
@@ -455,7 +439,10 @@ fn merge(cfg: &mut ConfigFile, work: &mut Work) {
             }
         }
         for (mut key, acc) in opts.entries {
-            scrub_displaced(target.insert(&key, join(acc, scrub)));
+            super::scrub_displaced(
+                scrub,
+                target.insert(&key, join(acc, scrub)),
+            );
             if scrub {
                 super::scrub_string(&mut key);
             }

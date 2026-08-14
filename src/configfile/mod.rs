@@ -164,6 +164,21 @@ impl<V> Ordered<V> {
     fn keys(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|(k, _)| k.as_str())
     }
+
+    /// Burn the store at end of life: every key — the entries' and the
+    /// index's copies — and each value through `burn`. The one burn walk;
+    /// every scrubbing release goes through it so a missed copy cannot
+    /// drift in on one path. The index is drained, so only dropping the
+    /// map should follow.
+    fn scrub_with(&mut self, mut burn: impl FnMut(&mut V)) {
+        for (key, value) in &mut self.entries {
+            scrub_string(key);
+            burn(value);
+        }
+        for (mut key, _) in self.index.drain() {
+            scrub_string(&mut key);
+        }
+    }
 }
 
 /// An INI configuration, compatible with Python's `configparser`.
@@ -211,13 +226,7 @@ impl Drop for ConfigFile {
             return;
         }
         scrub_opts(&mut self.defaults);
-        for (name, opts) in &mut self.sections.entries {
-            scrub_string(name);
-            scrub_opts(opts);
-        }
-        for (mut key, _) in self.sections.index.drain() {
-            scrub_string(&mut key);
-        }
+        self.sections.scrub_with(scrub_opts);
     }
 }
 
@@ -237,14 +246,21 @@ fn scrub_string(s: &mut String) {
 /// Burn one section's storage: every key (the index's copies included) and
 /// every value.
 fn scrub_opts(opts: &mut Ordered<Option<String>>) {
-    for (key, value) in &mut opts.entries {
-        scrub_string(key);
+    opts.scrub_with(|value| {
         if let Some(value) = value {
             scrub_string(value);
         }
+    });
+}
+
+/// Burn a value displaced by an upsert. [`Ordered::insert`] hands the old
+/// value back rather than dropping it so this can run.
+fn scrub_displaced(scrub: bool, displaced: Option<Option<String>>) {
+    if !scrub {
+        return;
     }
-    for (mut key, _) in opts.index.drain() {
-        scrub_string(&mut key);
+    if let Some(Some(mut old)) = displaced {
+        scrub_string(&mut old);
     }
 }
 
@@ -390,29 +406,17 @@ impl ConfigFile {
     {
         let mut read = Vec::new();
         for path in paths {
-            if self.scrub {
-                match self.read_path_scrubbed(&path) {
-                    Ok(()) => read.push(path),
-                    // The same skip classes as below; a parse failure
-                    // still fails.
-                    Err(Error::Errno(_)) | Err(Error::SymlinkInPath { .. }) => {
-                        continue
-                    }
-                    Err(e) => return Err(e),
-                }
-                continue;
-            }
-            let text = match read_file_to_string(&path) {
-                Ok(text) => text,
-                // Could not open/read (missing, permissions, symlink): skip, as
-                // `configparser` skips any `OSError` from `open`.
+            match self.read_path(&path) {
+                Ok(()) => read.push(path),
+                // Could not open/read (missing, permissions, symlink):
+                // skip, as `configparser` skips any `OSError` from `open`
+                // and the read. A file that opens but fails to parse
+                // still fails.
                 Err(Error::Errno(_)) | Err(Error::SymlinkInPath { .. }) => {
                     continue
                 }
                 Err(e) => return Err(e),
-            };
-            parse::read(self, &path.display().to_string(), &text)?;
-            read.push(path);
+            }
         }
         Ok(read)
     }
@@ -521,12 +525,13 @@ impl ConfigFile {
         match self.interp {
             Interp::None => Ok(Some(raw.clone())),
             Interp::Basic => {
-                let mut map = self.merged_map(section);
-                let got = interp::before_get(&key, raw, &map, self.scrub);
-                if self.scrub {
-                    scrub_opts(&mut map);
-                }
-                Ok(Some(got?))
+                let merged = self.merged_map(section);
+                Ok(Some(interp::before_get(
+                    &key,
+                    raw,
+                    &merged.map,
+                    self.scrub,
+                )?))
             }
         }
     }
@@ -634,28 +639,21 @@ impl ConfigFile {
         if !self.sections.contains(section) {
             return Ok(None);
         }
-        let mut map = self.merged_map(section);
-        let walk = || -> Result<Vec<(String, String)>> {
-            let mut out = Vec::new();
-            for (k, v) in map.iter() {
-                let value = match v {
-                    None => String::new(),
-                    Some(s) => match self.interp {
-                        Interp::None => s.clone(),
-                        Interp::Basic => {
-                            interp::before_get(k, s, &map, self.scrub)?
-                        }
-                    },
-                };
-                out.push((k.to_string(), value));
-            }
-            Ok(out)
-        };
-        let out = walk();
-        if self.scrub {
-            scrub_opts(&mut map);
+        let merged = self.merged_map(section);
+        let mut out = Vec::new();
+        for (k, v) in merged.map.iter() {
+            let value = match v {
+                None => String::new(),
+                Some(s) => match self.interp {
+                    Interp::None => s.clone(),
+                    Interp::Basic => {
+                        interp::before_get(k, s, &merged.map, self.scrub)?
+                    }
+                },
+            };
+            out.push((k.to_string(), value));
         }
-        Ok(Some(out?))
+        Ok(Some(out))
     }
 
     // --- mutation --------------------------------------------------------
@@ -728,13 +726,7 @@ impl ConfigFile {
                 Error::Validation(format!("no such section: {section:?}"))
             })?
         };
-        if let Some(mut old) = slot.insert(&key, value.map(str::to_string)) {
-            if scrub {
-                if let Some(old) = old.as_mut() {
-                    scrub_string(old);
-                }
-            }
-        }
+        scrub_displaced(scrub, slot.insert(&key, value.map(str::to_string)));
         Ok(())
     }
 
@@ -830,24 +822,36 @@ impl ConfigFile {
     }
 
     /// The merged (DEFAULT, then section-override) raw values used both for
-    /// interpolation variable lookups and for [`items`](Self::items).
-    /// The temporary holds value clones; a scrubbed configuration's callers
-    /// burn it with [`scrub_opts`] after use, and a default clone displaced
-    /// by a section override is burned here rather than dropped.
-    fn merged_map(&self, section: &str) -> Ordered<Option<String>> {
+    /// interpolation variable lookups and for [`items`](Self::items), in a
+    /// guard. The temporary holds value clones: for a scrubbed
+    /// configuration the guard's drop burns them on every exit — a `?`
+    /// between building and reading it cannot leak them — and a default
+    /// clone displaced by a section override is burned at once.
+    fn merged_map(&self, section: &str) -> MergedMap {
         let mut map = self.defaults.clone();
         if let Some(opts) = self.sections.get(section) {
             for (k, v) in opts.iter() {
-                if let Some(mut old) = map.insert(k, v.clone()) {
-                    if self.scrub {
-                        if let Some(old) = old.as_mut() {
-                            scrub_string(old);
-                        }
-                    }
-                }
+                scrub_displaced(self.scrub, map.insert(k, v.clone()));
             }
         }
-        map
+        MergedMap {
+            map,
+            scrub: self.scrub,
+        }
+    }
+}
+
+/// See [`ConfigFile::merged_map`].
+struct MergedMap {
+    map: Ordered<Option<String>>,
+    scrub: bool,
+}
+
+impl Drop for MergedMap {
+    fn drop(&mut self) {
+        if self.scrub {
+            scrub_opts(&mut self.map);
+        }
     }
 }
 
@@ -871,10 +875,16 @@ impl Drop for ScrubVec {
     }
 }
 
-/// [`universal_newlines`] in place over a `Vec`: `\r\n` and a lone `\r`
-/// become `\n` with no reallocation, so no unscrubbed copy of the content
-/// is left behind. Bytes past the new length keep their old content, which
-/// is why the buffer is burned to capacity, not length.
+/// Translate `\r\n` and a lone `\r` to `\n` in place — the
+/// universal-newline decoding Python's `open(filename)`, and so
+/// `configparser.read()`, applies — with no reallocation, so no unscrubbed
+/// copy of the content is left behind. Bytes past the new length keep
+/// their old content, which is why a scrubbed buffer is burned to
+/// capacity, not length.
+///
+/// Only the file entry points translate: `read_string`, which
+/// [`ConfigFile::read_str`] mirrors, wraps the text in a `StringIO` with
+/// `newline='\n'`, which passes `\r` through verbatim.
 fn normalize_newlines(buf: &mut Vec<u8>) {
     let len = normalize_newlines_slice(buf);
     buf.truncate(len);
@@ -972,7 +982,7 @@ fn stage_secret_image(
 }
 
 /// Read a whole file to a UTF-8 `String`, opened symlink-safely, with line
-/// endings translated by [`universal_newlines`].
+/// endings translated by [`normalize_newlines`].
 fn read_file_to_string(path: &Path) -> Result<String> {
     let mut file = safe_open(
         AT_FDCWD,
@@ -983,23 +993,11 @@ fn read_file_to_string(path: &Path) -> Result<String> {
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)
         .map_err(|e| Errno::try_from(e).unwrap_or(Errno::EIO))?;
-    let text = String::from_utf8(buf)
-        .map_err(|_| Error::Parse("config file is not valid UTF-8".into()))?;
-    Ok(universal_newlines(text))
-}
-
-/// Translate `\r\n` and a lone `\r` to `\n`, the universal-newline decoding
-/// Python's `open(filename)` — and so `configparser.read()` — applies.
-///
-/// Only the file entry points need this: `read_string`, which
-/// [`ConfigFile::read_str`] mirrors, wraps the text in a `StringIO` with
-/// `newline='\n'`, which passes `\r` through verbatim.
-fn universal_newlines(text: String) -> String {
-    if text.contains('\r') {
-        text.replace("\r\n", "\n").replace('\r', "\n")
-    } else {
-        text
-    }
+    // `\r` and `\n` cannot fall inside a multi-byte UTF-8 sequence, so
+    // translating before the validity check changes nothing it decides.
+    normalize_newlines(&mut buf);
+    String::from_utf8(buf)
+        .map_err(|_| Error::Parse("config file is not valid UTF-8".into()))
 }
 
 #[cfg(test)]
@@ -1053,8 +1051,9 @@ mod tests {
         }
     }
 
-    /// The in-place newline translation must match the copying one byte
-    /// for byte — `\r\r\n` and a trailing `\r` included.
+    /// The in-place newline translation must match Python's two-pass
+    /// `str.replace` decoding byte for byte — `\r\r\n` and a trailing
+    /// `\r` included.
     #[test]
     fn normalize_newlines_matches_the_copying_translation() {
         for case in [
