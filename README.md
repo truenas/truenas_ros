@@ -31,7 +31,7 @@ truenas_ros = { version = "0.1", default-features = false, features = ["sync-fs"
 | `fsiter` | single-filesystem depth-first `Iterator` yielding owned entries |
 | `idmap` | idmapped-mount user namespaces via `clone3` (`create_idmap_userns`, cached `idmap_userns`) — lives at `mount::idmap` |
 | `shutil` | metadata-preserving recursive `copytree` + copy / clone primitives |
-| `configfile` | INI config files byte-for-byte compatible with Python's `configparser`, read symlink-safely and written atomically |
+| `configfile` | INI config files byte-for-byte compatible with Python's `configparser`, read symlink-safely and written atomically; an opt-in scrub-on-release mode for secret-bearing files (with `secrets`, the file image stages in `memfd_secret` memory) |
 | `audit` | Kernel audit records over `NETLINK_AUDIT` — PAM-shaped `key=value` events sent straight to `auditd`, replacing libaudit |
 
 An io_uring stack lives alongside the blocking bindings, off by default:
