@@ -22,6 +22,29 @@
 //! converters, unnamed sections, and inline comments (which `configparser` also
 //! disables by default).
 //!
+//! # Secret-bearing files
+//!
+//! A configuration built with [`ConfigFile::scrubbed`] burns every buffer
+//! this module allocates for it — the file image, the parse accumulators,
+//! and the stored keys and values — with a volatile zeroing pass as each is
+//! released, so dropping the configuration leaves no heap copies behind.
+//! With the `secrets` feature, [`ConfigFile::read_secret_path`] additionally
+//! stages the raw file image in `memfd_secret`-backed memory, off the
+//! ordinary heap entirely.
+//!
+//! The guarantee's edges are stated rather than implied. Stored values are
+//! ordinary heap memory while the configuration lives — swappable, and
+//! visible in a core dump — so a long-lived secret belongs in
+//! [`Secret`](crate::secrets::Secret), moved there promptly from
+//! [`get_raw`](ConfigFile::get_raw). Whatever an accessor returns
+//! ([`get`](ConfigFile::get), [`items`](ConfigFile::items),
+//! [`write_string`](ConfigFile::write_string)) is the caller's copy and the
+//! caller's to burn, as is a [`read_str`](ConfigFile::read_str) input
+//! buffer. Interpolation intermediates are not chased — [`raw`][ConfigFile::raw]
+//! is the secrets configuration — nor are transient key copies in parse
+//! control state, and the kernel's page cache retains what was read from
+//! disk regardless of anything a process does.
+//!
 //! ```
 //! use truenas_ros::configfile::ConfigFile;
 //!
@@ -100,24 +123,33 @@ impl<V> Ordered<V> {
         }
     }
 
-    fn insert(&mut self, key: &str, value: V) {
+    /// Upsert; a displaced value is returned, never silently dropped, so a
+    /// scrubbing caller can burn it.
+    fn insert(&mut self, key: &str, value: V) -> Option<V> {
         if let Some(&i) = self.index.get(key) {
-            self.entries[i].1 = value;
+            Some(std::mem::replace(&mut self.entries[i].1, value))
         } else {
             self.index.insert(key.to_string(), self.entries.len());
             self.entries.push((key.to_string(), value));
+            None
         }
     }
 
-    fn remove(&mut self, key: &str) -> Option<V> {
-        let i = self.index.remove(key)?;
-        let (_, v) = self.entries.remove(i);
-        // Entries after `i` shifted down by one; fix their recorded positions.
+    /// Remove, handing back both stored copies of the key (the index's and
+    /// the entry's) along with the value, so a scrubbing caller can burn
+    /// them.
+    fn remove(&mut self, key: &str) -> Option<(String, String, V)> {
+        let (index_key, i) = self.index.remove_entry(key)?;
+        let (entry_key, v) = self.entries.remove(i);
+        // Entries after `i` shifted down by one; fix their recorded positions
+        // in place (no key is cloned or displaced doing it).
         for pos in i..self.entries.len() {
-            let k = self.entries[pos].0.clone();
-            self.index.insert(k, pos);
+            if let Some(slot) = self.index.get_mut(self.entries[pos].0.as_str())
+            {
+                *slot = pos;
+            }
         }
-        Some(v)
+        Some((index_key, entry_key, v))
     }
 
     fn is_empty(&self) -> bool {
@@ -139,12 +171,80 @@ impl<V> Ordered<V> {
 /// [`raw`](Self::raw) (like `RawConfigParser`), populate it by reading a string
 /// or file, query it with the typed getters, and serialize it back with
 /// [`write_string`](Self::write_string) or [`write_path`](Self::write_path).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ConfigFile {
     defaults: Ordered<Option<String>>,
     sections: Ordered<Ordered<Option<String>>>,
     interp: Interp,
     allow_no_value: bool,
+    scrub: bool,
+}
+
+/// Prints the full structure for an ordinary configuration; a scrubbed one
+/// prints shape only — a secrets-bearing configuration reaching a log must
+/// not carry its values.
+impl std::fmt::Debug for ConfigFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.scrub {
+            return f
+                .debug_struct("ConfigFile")
+                .field("sections", &self.sections.entries.len())
+                .field("scrub", &true)
+                .finish_non_exhaustive();
+        }
+        f.debug_struct("ConfigFile")
+            .field("defaults", &self.defaults)
+            .field("sections", &self.sections)
+            .field("interp", &self.interp)
+            .field("allow_no_value", &self.allow_no_value)
+            .field("scrub", &self.scrub)
+            .finish()
+    }
+}
+
+/// Burning happens on release: whatever the configuration still holds when
+/// it drops is scrubbed here.
+impl Drop for ConfigFile {
+    fn drop(&mut self) {
+        if !self.scrub {
+            return;
+        }
+        scrub_opts(&mut self.defaults);
+        for (name, opts) in &mut self.sections.entries {
+            scrub_string(name);
+            scrub_opts(opts);
+        }
+        for (mut key, _) in self.sections.index.drain() {
+            scrub_string(&mut key);
+        }
+    }
+}
+
+/// Burn a string's whole allocation, spare capacity included — a truncated
+/// value keeps its old tail bytes past `len`.
+///
+/// Zero bytes are valid UTF-8, so the string stays sound until it drops.
+fn scrub_string(s: &mut String) {
+    // SAFETY: the vec's buffer is `capacity` writable bytes, and an
+    // all-zero prefix keeps the content valid UTF-8.
+    unsafe {
+        let v = s.as_mut_vec();
+        crate::scrub::scrub(v.as_mut_ptr(), v.capacity());
+    }
+}
+
+/// Burn one section's storage: every key (the index's copies included) and
+/// every value.
+fn scrub_opts(opts: &mut Ordered<Option<String>>) {
+    for (key, value) in &mut opts.entries {
+        scrub_string(key);
+        if let Some(value) = value {
+            scrub_string(value);
+        }
+    }
+    for (mut key, _) in opts.index.drain() {
+        scrub_string(&mut key);
+    }
 }
 
 impl Default for ConfigFile {
@@ -162,22 +262,37 @@ impl ConfigFile {
             sections: Ordered::new(),
             interp: Interp::Basic,
             allow_no_value: false,
+            scrub: false,
         }
     }
 
     /// Create an empty configuration with interpolation disabled, matching
     /// `configparser.RawConfigParser()`. Values round-trip verbatim.
     pub fn raw() -> Self {
-        ConfigFile {
-            interp: Interp::None,
-            ..Self::new()
-        }
+        let mut cfg = Self::new();
+        cfg.interp = Interp::None;
+        cfg
     }
 
     /// Allow keys with no value (a bare `key` with no `=`/`:`), matching
     /// `configparser`'s `allow_no_value=True`. Off by default.
     pub fn allow_no_value(mut self, yes: bool) -> Self {
         self.allow_no_value = yes;
+        self
+    }
+
+    /// Burn every buffer this configuration allocates — the file image,
+    /// parse accumulators, and stored keys and values — with a volatile
+    /// zeroing pass as each is released, the whole store included when the
+    /// configuration drops. For files that carry secrets; see the module
+    /// docs for exactly where the guarantee ends. Off by default.
+    ///
+    /// Parsing and every accessor behave identically either way, with one
+    /// exception: an error for a duplicate option names its position but
+    /// not the key, which in a credentials file is an identifier that must
+    /// not reach a log.
+    pub fn scrubbed(mut self, yes: bool) -> Self {
+        self.scrub = yes;
         self
     }
 
@@ -198,8 +313,93 @@ impl ConfigFile {
     /// [`Error::Parse`]. Line endings are decoded with universal newlines, as
     /// `configparser.read()` gets from `open(filename)`.
     pub fn read_path(&mut self, path: &Path) -> Result<()> {
+        if self.scrub {
+            return self.read_path_scrubbed(path);
+        }
         let text = read_file_to_string(path)?;
         parse::read(self, &path.display().to_string(), &text)
+    }
+
+    /// [`read_path`](Self::read_path) for a scrubbed configuration: one
+    /// buffer pre-sized from the file's length (no reallocation trail),
+    /// newlines normalized in place instead of by copy, and the buffer
+    /// burned to its full capacity on every exit — the UTF-8 and parse
+    /// failures included.
+    fn read_path_scrubbed(&mut self, path: &Path) -> Result<()> {
+        let mut file = safe_open(
+            AT_FDCWD,
+            path,
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        let len = file
+            .metadata()
+            .map_err(|e| Errno::try_from(e).unwrap_or(Errno::EIO))?
+            .len() as usize;
+        let mut buf = ScrubVec(Vec::with_capacity(len + 1));
+        file.read_to_end(&mut buf.0)
+            .map_err(|e| Errno::try_from(e).unwrap_or(Errno::EIO))?;
+        normalize_newlines(&mut buf.0);
+        let text = std::str::from_utf8(&buf.0).map_err(|_| {
+            Error::Parse("config file is not valid UTF-8".into())
+        })?;
+        parse::read(self, &path.display().to_string(), text)
+    }
+
+    /// Read and parse `path` with the raw file image staged in
+    /// `memfd_secret`-backed memory
+    /// ([`SecretMem`](crate::secrets::SecretMem)) — off the kernel's direct
+    /// map, off swap, absent from core dumps — and burned when the read
+    /// ends. The image never touches the ordinary heap.
+    ///
+    /// Reading this way marks the configuration
+    /// [`scrubbed`](Self::scrubbed): the parse output it produces will be
+    /// burned on release like the image was.
+    ///
+    /// Fails where `memfd_secret` is unavailable rather than degrading to
+    /// an ordinary read.
+    #[cfg(feature = "secrets")]
+    pub fn read_secret_path(&mut self, path: &Path) -> Result<()> {
+        self.scrub = true;
+        let mut file = safe_open(
+            AT_FDCWD,
+            path,
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        let len = file
+            .metadata()
+            .map_err(|e| Errno::try_from(e).unwrap_or(Errno::EIO))?
+            .len() as usize;
+        let source = path.display().to_string();
+        if len == 0 {
+            return parse::read(self, &source, "");
+        }
+        let mut mem = crate::secrets::SecretMem::with_capacity(len + 1)?;
+        let slice = mem.as_mut_slice();
+        let mut filled = 0;
+        loop {
+            let n = file
+                .read(&mut slice[filled..])
+                .map_err(|e| Errno::try_from(e).unwrap_or(Errno::EIO))?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+            if filled == slice.len() {
+                // More content than the size the open saw: the image no
+                // longer fits the staging region, so start over rather
+                // than parse a torn read.
+                return Err(Error::Validation(
+                    "config file grew while being read".into(),
+                ));
+            }
+        }
+        let content = normalize_newlines_slice(&mut slice[..filled]);
+        let text = std::str::from_utf8(&slice[..content]).map_err(|_| {
+            Error::Parse("config file is not valid UTF-8".into())
+        })?;
+        parse::read(self, &source, text)
     }
 
     /// Read each path in turn, **skipping** any that cannot be opened (missing,
@@ -213,6 +413,18 @@ impl ConfigFile {
     {
         let mut read = Vec::new();
         for path in paths {
+            if self.scrub {
+                match self.read_path_scrubbed(&path) {
+                    Ok(()) => read.push(path),
+                    // The same skip classes as below; a parse failure
+                    // still fails.
+                    Err(Error::Errno(_)) | Err(Error::SymlinkInPath { .. }) => {
+                        continue
+                    }
+                    Err(e) => return Err(e),
+                }
+                continue;
+            }
             let text = match read_file_to_string(&path) {
                 Ok(text) => text,
                 // Could not open/read (missing, permissions, symlink): skip, as
@@ -255,7 +467,15 @@ impl ConfigFile {
         path: &Path,
         opts: AtomicWriteOptions,
     ) -> Result<()> {
-        atomic_replace(path, self.write_string().as_bytes(), opts)
+        let mut text = self.write_string();
+        let result = atomic_replace(path, text.as_bytes(), opts);
+        // The serialization buffer carried every value; for a scrubbed
+        // configuration it is burned on both outcomes. (The page-cache copy
+        // the write itself creates is the file's, not this process's.)
+        if self.scrub {
+            scrub_string(&mut text);
+        }
+        result
     }
 
     // --- access ----------------------------------------------------------
@@ -324,8 +544,12 @@ impl ConfigFile {
         match self.interp {
             Interp::None => Ok(Some(raw.clone())),
             Interp::Basic => {
-                let map = self.merged_map(section);
-                Ok(Some(interp::before_get(&key, raw, &map)?))
+                let mut map = self.merged_map(section);
+                let got = interp::before_get(&key, raw, &map);
+                if self.scrub {
+                    scrub_opts(&mut map);
+                }
+                Ok(Some(got?))
             }
         }
     }
@@ -400,19 +624,26 @@ impl ConfigFile {
         if !self.sections.contains(section) {
             return Ok(None);
         }
-        let map = self.merged_map(section);
-        let mut out = Vec::new();
-        for (k, v) in map.iter() {
-            let value = match v {
-                None => String::new(),
-                Some(s) => match self.interp {
-                    Interp::None => s.clone(),
-                    Interp::Basic => interp::before_get(k, s, &map)?,
-                },
-            };
-            out.push((k.to_string(), value));
+        let mut map = self.merged_map(section);
+        let walk = || -> Result<Vec<(String, String)>> {
+            let mut out = Vec::new();
+            for (k, v) in map.iter() {
+                let value = match v {
+                    None => String::new(),
+                    Some(s) => match self.interp {
+                        Interp::None => s.clone(),
+                        Interp::Basic => interp::before_get(k, s, &map)?,
+                    },
+                };
+                out.push((k.to_string(), value));
+            }
+            Ok(out)
+        };
+        let out = walk();
+        if self.scrub {
+            scrub_opts(&mut map);
         }
-        Ok(Some(out))
+        Ok(Some(out?))
     }
 
     // --- mutation --------------------------------------------------------
@@ -477,6 +708,7 @@ impl ConfigFile {
                 interp::validate_set(v)?;
             }
         }
+        let scrub = self.scrub;
         let slot = if section == DEFAULT_SECTION {
             &mut self.defaults
         } else {
@@ -484,7 +716,13 @@ impl ConfigFile {
                 Error::Validation(format!("no such section: {section:?}"))
             })?
         };
-        slot.insert(&key, value.map(str::to_string));
+        if let Some(mut old) = slot.insert(&key, value.map(str::to_string)) {
+            if scrub {
+                if let Some(old) = old.as_mut() {
+                    scrub_string(old);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -511,7 +749,17 @@ impl ConfigFile {
 
     /// Remove a section and all its options; returns whether it existed.
     pub fn remove_section(&mut self, name: &str) -> bool {
-        self.sections.remove(name).is_some()
+        match self.sections.remove(name) {
+            Some((mut index_key, mut entry_key, mut opts)) => {
+                if self.scrub {
+                    scrub_string(&mut index_key);
+                    scrub_string(&mut entry_key);
+                    scrub_opts(&mut opts);
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     /// Remove an option from `section` (or `DEFAULT`); returns whether it
@@ -522,6 +770,7 @@ impl ConfigFile {
         option: &str,
     ) -> Result<bool> {
         let key = optionxform(option);
+        let scrub = self.scrub;
         let slot = if section == DEFAULT_SECTION {
             &mut self.defaults
         } else {
@@ -529,7 +778,19 @@ impl ConfigFile {
                 Error::Validation(format!("no such section: {section:?}"))
             })?
         };
-        Ok(slot.remove(&key).is_some())
+        match slot.remove(&key) {
+            Some((mut index_key, mut entry_key, mut value)) => {
+                if scrub {
+                    scrub_string(&mut index_key);
+                    scrub_string(&mut entry_key);
+                    if let Some(value) = value.as_mut() {
+                        scrub_string(value);
+                    }
+                }
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     // --- internals -------------------------------------------------------
@@ -558,11 +819,20 @@ impl ConfigFile {
 
     /// The merged (DEFAULT, then section-override) raw values used both for
     /// interpolation variable lookups and for [`items`](Self::items).
+    /// The temporary holds value clones; a scrubbed configuration's callers
+    /// burn it with [`scrub_opts`] after use, and a default clone displaced
+    /// by a section override is burned here rather than dropped.
     fn merged_map(&self, section: &str) -> Ordered<Option<String>> {
         let mut map = self.defaults.clone();
         if let Some(opts) = self.sections.get(section) {
             for (k, v) in opts.iter() {
-                map.insert(k, v.clone());
+                if let Some(mut old) = map.insert(k, v.clone()) {
+                    if self.scrub {
+                        if let Some(old) = old.as_mut() {
+                            scrub_string(old);
+                        }
+                    }
+                }
             }
         }
         map
@@ -573,6 +843,51 @@ impl ConfigFile {
 /// case-insensitively by lowercasing them (section names are left as-is).
 fn optionxform(option: &str) -> String {
     option.to_lowercase()
+}
+
+/// A read buffer burned to its full capacity when it drops, whichever way
+/// the read ends.
+struct ScrubVec(Vec<u8>);
+
+impl Drop for ScrubVec {
+    fn drop(&mut self) {
+        // SAFETY: the allocation is live and `capacity` bytes of it are
+        // writable.
+        unsafe {
+            crate::scrub::scrub(self.0.as_mut_ptr(), self.0.capacity());
+        }
+    }
+}
+
+/// [`universal_newlines`] in place over a `Vec`: `\r\n` and a lone `\r`
+/// become `\n` with no reallocation, so no unscrubbed copy of the content
+/// is left behind. Bytes past the new length keep their old content, which
+/// is why the buffer is burned to capacity, not length.
+fn normalize_newlines(buf: &mut Vec<u8>) {
+    let len = normalize_newlines_slice(buf);
+    buf.truncate(len);
+}
+
+/// [`normalize_newlines`] over a slice, returning the content's new length.
+/// `\r` and `\n` are ASCII, so the rewrite cannot fall inside a multi-byte
+/// UTF-8 sequence.
+fn normalize_newlines_slice(buf: &mut [u8]) -> usize {
+    if !buf.contains(&b'\r') {
+        return buf.len();
+    }
+    let mut w = 0;
+    let mut r = 0;
+    while r < buf.len() {
+        if buf[r] == b'\r' {
+            buf[w] = b'\n';
+            r += if buf.get(r + 1) == Some(&b'\n') { 2 } else { 1 };
+        } else {
+            buf[w] = buf[r];
+            r += 1;
+        }
+        w += 1;
+    }
+    w
 }
 
 /// Read a whole file to a UTF-8 `String`, opened symlink-safely, with line
@@ -603,5 +918,156 @@ fn universal_newlines(text: String) -> String {
         text.replace("\r\n", "\n").replace('\r', "\n")
     } else {
         text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The same document, default vs scrubbed: parsing, reading back, and
+    /// serialization must be indistinguishable — scrubbing changes when
+    /// buffers are burned, never what the configuration means.
+    #[test]
+    fn scrubbed_parses_identically() {
+        let doc = "[DEFAULT]\nshared = base\n\n[db]\npassword = hunter2\n\
+                   multi = one\n  two\n\n  three\n# comment\n[empty]\n";
+        let over = "[db]\npassword = swordfish\n";
+        let dir = crate::tempdir().unwrap();
+        let path = dir.path().join("cfg.ini");
+        // CRLF endings exercise the in-place translation against the
+        // copying one over a real read.
+        std::fs::write(&path, doc.replace('\n', "\r\n")).unwrap();
+
+        let mut plain = ConfigFile::raw();
+        plain.read_path(&path).unwrap();
+        plain.read_str(over).unwrap();
+        let mut scrubbed = ConfigFile::raw().scrubbed(true);
+        scrubbed.read_path(&path).unwrap();
+        scrubbed.read_str(over).unwrap();
+
+        assert_eq!(plain.sections(), scrubbed.sections());
+        assert_eq!(plain.items("db").unwrap(), scrubbed.items("db").unwrap());
+        assert_eq!(scrubbed.get_raw("db", "password"), Some("swordfish"));
+        assert_eq!(scrubbed.get_raw("db", "multi"), Some("one\ntwo\n\nthree"));
+        assert_eq!(plain.write_string(), scrubbed.write_string());
+    }
+
+    /// The burn covers the allocation's spare capacity: a truncated value
+    /// keeps its old tail bytes past `len`, and they must go too.
+    #[test]
+    fn scrub_string_burns_the_whole_allocation() {
+        let mut s = String::with_capacity(32);
+        s.push_str("supersecretvalue");
+        s.truncate(5);
+        scrub_string(&mut s);
+        // SAFETY: `scrub_string` wrote every capacity byte, so extending
+        // `len` over them reads initialized memory, and all-zero content
+        // is valid UTF-8.
+        unsafe {
+            let v = s.as_mut_vec();
+            let cap = v.capacity();
+            v.set_len(cap);
+            assert!(v.iter().all(|&b| b == 0), "unburned bytes remain");
+        }
+    }
+
+    /// The in-place newline translation must match the copying one byte
+    /// for byte — `\r\r\n` and a trailing `\r` included.
+    #[test]
+    fn normalize_newlines_matches_the_copying_translation() {
+        for case in [
+            "plain\n",
+            "a\r\nb",
+            "a\rb",
+            "\r\r\n",
+            "a\r",
+            "\r\n\r\n",
+            "mixed\r\nlone\rend",
+            "",
+        ] {
+            let want = case.replace("\r\n", "\n").replace('\r', "\n");
+            let mut buf = case.as_bytes().to_vec();
+            normalize_newlines(&mut buf);
+            assert_eq!(buf, want.as_bytes(), "case {case:?}");
+        }
+    }
+
+    /// A duplicate-option error from a scrubbed configuration must not
+    /// name the key: in a credentials file it is an identifier that must
+    /// not reach a log.
+    #[test]
+    fn a_duplicate_option_error_withholds_the_key_when_scrubbed() {
+        let doc = "[s]\nakid = 1\nakid = 2\n";
+        let mut plain = ConfigFile::raw();
+        let loud = plain.read_str(doc).unwrap_err().to_string();
+        assert!(loud.contains("akid"), "{loud}");
+        let mut scrubbed = ConfigFile::raw().scrubbed(true);
+        let quiet = scrubbed.read_str(doc).unwrap_err().to_string();
+        assert!(!quiet.contains("akid"), "{quiet}");
+        assert!(quiet.contains("duplicate option"), "{quiet}");
+    }
+
+    /// Debug output of a scrubbed configuration carries structure only; a
+    /// configuration holding secrets that reaches a log must not print
+    /// them.
+    #[test]
+    fn debug_redacts_a_scrubbed_configuration() {
+        let mut cfg = ConfigFile::raw().scrubbed(true);
+        cfg.read_str("[s]\nkey = hunter2\n").unwrap();
+        let redacted = format!("{cfg:?}");
+        assert!(!redacted.contains("hunter2"), "{redacted}");
+        let mut plain = ConfigFile::raw();
+        plain.read_str("[s]\nkey = hunter2\n").unwrap();
+        assert!(format!("{plain:?}").contains("hunter2"));
+    }
+
+    /// Overwrite, removal, and re-serialization behave identically in
+    /// scrub mode: the burn happens on release, never in semantics.
+    #[test]
+    fn scrubbed_mutation_keeps_behavior() {
+        let doc = "[a]\nx = 1\ny = 2\n\n[b]\nz = 3\n";
+        let mut plain = ConfigFile::raw();
+        let mut scrubbed = ConfigFile::raw().scrubbed(true);
+        for cfg in [&mut plain, &mut scrubbed] {
+            cfg.read_str(doc).unwrap();
+            cfg.set("a", "x", Some("overwritten")).unwrap();
+            assert!(cfg.remove_option("a", "y").unwrap());
+            assert!(cfg.remove_section("b"));
+        }
+        assert_eq!(plain.write_string(), scrubbed.write_string());
+        assert_eq!(scrubbed.get_raw("a", "x"), Some("overwritten"));
+    }
+
+    /// `read_secret_path` stages the image off-heap and yields the same
+    /// configuration, marked scrubbed.
+    #[cfg(feature = "secrets")]
+    #[test]
+    fn read_secret_path_parses_and_marks_scrubbed() {
+        if !crate::secrets::SecretMem::available() {
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_SECRETMEM").is_none(),
+                "memfd_secret unavailable but REQUIRE_SECRETMEM is set"
+            );
+            return;
+        }
+        let dir = crate::tempdir().unwrap();
+        let path = dir.path().join("cred.ini");
+        std::fs::write(&path, "[user]\r\nsecret_access_key = sw0rdf1sh\r\n")
+            .unwrap();
+        let mut cfg = ConfigFile::raw();
+        cfg.read_secret_path(&path).unwrap();
+        assert_eq!(cfg.get_raw("user", "secret_access_key"), Some("sw0rdf1sh"));
+        assert!(
+            !format!("{cfg:?}").contains("sw0rdf1sh"),
+            "reading through secret memory must mark the store scrubbed"
+        );
+
+        // An empty file parses to an empty configuration without staging.
+        let empty_path = dir.path().join("empty.ini");
+        std::fs::write(&empty_path, "").unwrap();
+        let mut empty = ConfigFile::raw();
+        empty.read_secret_path(&empty_path).unwrap();
+        assert!(empty.sections().is_empty());
     }
 }

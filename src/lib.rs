@@ -54,6 +54,11 @@ pub(crate) mod sync;
 #[cfg(any(feature = "idmap", feature = "uring-fs"))]
 mod clone3;
 
+// The volatile zeroing burn, shared by `secrets` (which re-exports it as its
+// public `scrub`) and `configfile`'s scrub-on-release mode.
+#[cfg(any(feature = "configfile", feature = "secrets"))]
+mod scrub;
+
 pub use errno::Errno;
 pub use error::{Error, Result};
 pub use fd::AT_FDCWD;
