@@ -23,11 +23,40 @@ use truenas_ros::sync_fs::{
 };
 use truenas_ros::uring_fs::{
     query_directory, query_tree, Advice, Anchor, AsUser, Caps, CredBroker,
-    CredHandle, EnrichSpec, FsConfig, FsHandle, IdentityCache, Leaf, Order,
-    Personality, PrivilegedXattrs, QueryOptions, RwFlags, ShutdownHandle,
-    TreeCursor, TreeOptions, UringFs,
+    CredHandle, EnrichSpec, File, FsConfig, FsHandle, IdentityCache, Leaf,
+    Order, Personality, PrivilegedXattrs, QueryOptions, RwFlags,
+    ShutdownHandle, TreeCursor, TreeOptions, UringFs,
 };
 use truenas_ros::{Errno, Error};
+
+/// Single-buffer read, over the reactor's only read op.
+///
+/// `uring_fs` exposes just the vectored, flagged forms — one shape to learn
+/// and one to audit — so the many tests that read a single buffer wrap it
+/// here rather than repeating `vec![..]` and `RwFlags::empty()` and then
+/// indexing the result.
+fn pread1(
+    h: &FsHandle,
+    who: Personality,
+    f: &File,
+    buf: Vec<u8>,
+    off: u64,
+) -> (Result<usize, Error>, Vec<u8>) {
+    let (res, mut bufs) = h.preadv2(who, f, vec![buf], off, RwFlags::empty());
+    (res, bufs.pop().unwrap_or_default())
+}
+
+/// Single-buffer write; the write-side twin of [`pread1`].
+fn pwrite1(
+    h: &FsHandle,
+    who: Personality,
+    f: &File,
+    buf: Vec<u8>,
+    off: u64,
+) -> (Result<usize, Error>, Vec<u8>) {
+    let (res, mut bufs) = h.pwritev2(who, f, vec![buf], off, RwFlags::empty());
+    (res, bufs.pop().unwrap_or_default())
+}
 
 /// A validated single component, for the many call sites that pass one.
 fn leaf(name: &str) -> Leaf<'_> {
@@ -74,6 +103,21 @@ fn pin_umask() {
         // SAFETY: umask cannot fail; it returns the previous mask.
         unsafe { libc::umask(0o022) };
     });
+}
+
+/// Reactor sizing for tests, deliberately **not** [`FsConfig::default`].
+///
+/// The default is sized for a server daemon, which costs roughly 400 KiB of
+/// `RLIMIT_MEMLOCK` per ring (see `FsConfig`'s docs). `cargo test` runs a
+/// binary's tests as threads in **one** process, so inheriting that default
+/// would have every concurrent test drawing on one locked-memory budget — and
+/// the failure lands on whichever test happens to create the ring that
+/// crosses the limit, not on the one that caused it.
+fn test_cfg() -> FsConfig {
+    FsConfig {
+        entries: 128,
+        ops: 128,
+    }
 }
 
 /// Build an `UringFs` over a fresh tempdir, register a self personality, run
@@ -128,15 +172,89 @@ fn mkfifo(dir: &Path, name: &str) -> String {
 
 // ---------------------------------------------------------------------------
 
+/// A close-on-exec pipe, returned `(read end, write end)`. Both are plain
+/// descriptors the caller closes; `splice_from_pipe` never adopts either.
+fn pipe_pair() -> (libc::c_int, libc::c_int) {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `pipe2` writes exactly two descriptors into `fds`.
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    assert_eq!(rc, 0, "pipe2: {}", std::io::Error::last_os_error());
+    (fds[0], fds[1])
+}
+
+/// `splice_from_pipe` moves pipe bytes into a file with no userspace buffer,
+/// honouring the destination offset — and reports a short move as a count
+/// rather than an error, which is what the resubmit contract rests on.
+///
+/// Bites three ways: drop the destination offset and the seeded bytes are
+/// overwritten at 0; leave `splice_off_in` at 0 instead of -1 and the kernel
+/// refuses a pipe source with `ESPIPE`; put the pipe in `sqe.fd` instead of
+/// `splice_fd_in` and it moves nothing.
+#[test]
+fn splice_from_a_pipe_lands_at_the_offset_and_reports_short_moves() {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let f = h
+            .open(me, &anchor, "spliced.bin", creat_rw())
+            .expect("open");
+
+        // Seed 16 bytes so a splice at offset 4 has to land *inside* existing
+        // content: an ignored offset shows up as clobbered leading bytes.
+        let (n, _) =
+            h.pwritev2(me, &f, vec![vec![b'.'; 16]], 0, RwFlags::empty());
+        assert_eq!(n.expect("seed"), 16);
+
+        let (rd, wr) = pipe_pair();
+        let body = b"SPLICED";
+        // SAFETY: writing our own buffer to our own pipe's write end.
+        let w = unsafe { libc::write(wr, body.as_ptr().cast(), body.len()) };
+        assert_eq!(w, body.len() as isize, "seed the pipe");
+        // Close the write end so the pipe is at EOF once drained, making both
+        // the short move and the follow-up zero deterministic.
+        // SAFETY: our own descriptor, not used again.
+        unsafe { libc::close(wr) };
+
+        // Ask for far more than the pipe holds.
+        let moved = h.splice_from_pipe(me, &f, rd, 4, 4096).expect("splice");
+        assert_eq!(
+            moved,
+            body.len() as u64,
+            "a pipe delivers what it has; short is progress, not failure"
+        );
+
+        // Drained: the next move is a clean zero, not an error.
+        let eof = h
+            .splice_from_pipe(me, &f, rd, 11, 4096)
+            .expect("splice eof");
+        assert_eq!(eof, 0, "drained pipe with the write end closed");
+        // SAFETY: our own descriptor, not used again.
+        unsafe { libc::close(rd) };
+
+        h.fsync(me, &f).expect("fsync");
+        h.close(f).expect("close");
+
+        let disk = std::fs::read(dir.join("spliced.bin")).expect("std read");
+        assert_eq!(disk.len(), 16, "a splice inside the file cannot extend it");
+        assert_eq!(&disk[..4], b"....", "bytes before the offset are intact");
+        assert_eq!(&disk[4..11], body, "the body landed at the offset");
+        assert_eq!(&disk[11..], b".....", "bytes after are intact");
+    });
+}
+
 #[test]
 fn round_trip_write_fsync_read() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
 
         // Write a new file through the reactor: two gathered buffers.
         let f = h.open(me, &anchor, "out.bin", creat_rw()).expect("open");
-        let (n, bufs) =
-            h.pwritev(me, &f, vec![b"hello ".to_vec(), b"world".to_vec()], 0);
+        let (n, bufs) = h.pwritev2(
+            me,
+            &f,
+            vec![b"hello ".to_vec(), b"world".to_vec()],
+            0,
+            RwFlags::empty(),
+        );
         assert_eq!(n.expect("writev"), 11);
         assert_eq!(bufs.len(), 2, "buffers round-trip");
         h.fsync(me, &f).expect("fsync");
@@ -153,15 +271,20 @@ fn round_trip_write_fsync_read() {
 
         // Read it back scattered: 4 + 4 + 8 byte buffers, 11 bytes total.
         let f = h.open(me, &anchor, "out.bin", rdonly()).expect("reopen");
-        let (n, bufs) =
-            h.preadv(me, &f, vec![vec![0u8; 4], vec![0u8; 4], vec![0u8; 8]], 0);
+        let (n, bufs) = h.preadv2(
+            me,
+            &f,
+            vec![vec![0u8; 4], vec![0u8; 4], vec![0u8; 8]],
+            0,
+            RwFlags::empty(),
+        );
         assert_eq!(n.expect("readv"), 11, "short only at EOF");
         assert_eq!(&bufs[0], b"hell");
         assert_eq!(&bufs[1], b"o wo");
         assert_eq!(&bufs[2][..3], b"rld");
 
         // Positional single-buffer read.
-        let (n, buf) = h.pread(me, &f, vec![0u8; 5], 6);
+        let (n, buf) = pread1(&h, me, &f, vec![0u8; 5], 6);
         assert_eq!(n.expect("pread"), 5);
         assert_eq!(&buf, b"world");
         h.close(f).expect("close 2");
@@ -170,13 +293,13 @@ fn round_trip_write_fsync_read() {
 
 #[test]
 fn ranged_fsync_syncs_a_byte_range_and_whole_file() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let f = h.open(me, &anchor, "ranged.bin", creat_rw()).expect("open");
 
         // Write 8 KiB so a sub-range fsync has a range to bound.
         let data = vec![0xABu8; 8192];
-        let (n, _) = h.pwrite(me, &f, data.clone(), 0);
+        let (n, _) = pwrite1(&h, me, &f, data.clone(), 0);
         assert_eq!(n.expect("pwrite"), 8192);
 
         // Sync just the first 4 KiB (fsync range form: off=0, len=4096), then a
@@ -200,7 +323,7 @@ fn ranged_fsync_syncs_a_byte_range_and_whole_file() {
 
 #[test]
 fn multi_component_and_beneath() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::create_dir(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/inner.txt"), b"beneath").unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
@@ -209,7 +332,7 @@ fn multi_component_and_beneath() {
         // walks); RESOLVE_BENEATH confines them in-kernel.
         let how = rdonly().resolve(ResolveFlag::RESOLVE_BENEATH);
         let f = h.open(me, &anchor, "sub/inner.txt", how).expect("open");
-        let (n, buf) = h.pread(me, &f, vec![0u8; 16], 0);
+        let (n, buf) = pread1(&h, me, &f, vec![0u8; 16], 0);
         assert_eq!(&buf[..n.unwrap()], b"beneath");
         h.close(f).unwrap();
 
@@ -248,7 +371,7 @@ fn multi_component_and_beneath() {
 
 #[test]
 fn fstatx_reports_open_file_metadata() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("m.bin"), vec![0u8; 4096]).unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let f = h.open(me, &anchor, "m.bin", rdonly()).expect("open");
@@ -263,7 +386,7 @@ fn fstatx_reports_open_file_metadata() {
 
 #[test]
 fn absolute_path_opts_out_of_confinement() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("abs.txt"), b"abs").unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let abs = dir.join("abs.txt"); // an absolute path
@@ -287,7 +410,7 @@ fn absolute_path_opts_out_of_confinement() {
 
 #[test]
 fn validation_and_errno_mapping() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).unwrap();
 
         // An empty path is a library-validation error; an absolute path is
@@ -316,7 +439,7 @@ fn validation_and_errno_mapping() {
         ));
         std::fs::write(dir.join("ro.txt"), b"ro").unwrap();
         let f = h.open(me, &anchor, "ro.txt", rdonly()).unwrap();
-        let (res, _buf) = h.pwrite(me, &f, b"nope".to_vec(), 0);
+        let (res, _buf) = pwrite1(&h, me, &f, b"nope".to_vec(), 0);
         assert!(matches!(res, Err(Error::Errno(Errno::EBADF))));
         h.close(f).unwrap();
     });
@@ -326,7 +449,7 @@ fn validation_and_errno_mapping() {
 fn stale_personality_from_other_ring_is_einval() {
     // Two reactors: an id registered on ring A names nothing on ring B.
     let dir = truenas_ros::tempdir().unwrap();
-    let afs_a = match UringFs::new(FsConfig::default()) {
+    let afs_a = match UringFs::new(test_cfg()) {
         Ok(a) => a,
         Err(e) => {
             if should_skip(&e) {
@@ -336,7 +459,7 @@ fn stale_personality_from_other_ring_is_einval() {
         }
     };
     let id_a = afs_a.register_self().unwrap();
-    let mut afs_b = UringFs::new(FsConfig::default()).unwrap();
+    let mut afs_b = UringFs::new(test_cfg()).unwrap();
     // Deliberately: nothing registered on B.
     let h = afs_b.handle();
     let stop = afs_b.shutdown_handle();
@@ -366,7 +489,7 @@ fn stale_personality_from_other_ring_is_einval() {
 // data arrives — no use-after-close.
 #[test]
 fn dropped_file_mid_op_completes_without_use_after_close() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         mkfifo(&dir, "fifo");
         let anchor = Anchor::open(dir.as_path()).unwrap();
 
@@ -375,7 +498,7 @@ fn dropped_file_mid_op_completes_without_use_after_close() {
         let how = OpenHow::new().flags(OFlag::O_RDWR);
         let f = h.open(me, &anchor, "fifo", how).expect("open fifo");
         let pending = h
-            .start_preadv(me, &f, vec![vec![0u8; 4]], 0)
+            .start_preadv2(me, &f, vec![vec![0u8; 4]], 0, RwFlags::empty())
             .expect("start readv");
         thread::sleep(Duration::from_millis(50)); // let it park in the kernel
 
@@ -402,13 +525,13 @@ fn dropped_file_mid_op_completes_without_use_after_close() {
 
 #[test]
 fn teardown_with_inflight_op() {
-    with_fs(FsConfig::default(), |h, me, dir, stop| {
+    with_fs(test_cfg(), |h, me, dir, stop| {
         mkfifo(&dir, "fifo");
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let how = OpenHow::new().flags(OFlag::O_RDWR);
         let f = h.open(me, &anchor, "fifo", how).expect("open fifo");
         let pending = h
-            .start_preadv(me, &f, vec![vec![0u8; 8]], 0)
+            .start_preadv2(me, &f, vec![vec![0u8; 8]], 0, RwFlags::empty())
             .expect("start readv");
         thread::sleep(Duration::from_millis(50));
 
@@ -419,7 +542,7 @@ fn teardown_with_inflight_op() {
         let (res, _bufs) = pending.wait();
         assert!(res.is_err(), "parked read must fail at teardown");
         // The token is now pointed at a dead loop; ops fail, drop is inert.
-        let (res, _buf) = h.pread(me, &f, vec![0u8; 4], 0);
+        let (res, _buf) = pread1(&h, me, &f, vec![0u8; 4], 0);
         assert!(matches!(res, Err(Error::Errno(Errno::ECONNABORTED))));
         drop(f);
     });
@@ -427,11 +550,7 @@ fn teardown_with_inflight_op() {
 
 #[test]
 fn concurrent_ops_across_threads() {
-    let cfg = FsConfig {
-        files: 8,
-        ..FsConfig::default()
-    };
-    with_fs(cfg, |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).unwrap();
         thread::scope(|s| {
             for i in 0..4usize {
@@ -442,19 +561,25 @@ fn concurrent_ops_across_threads() {
                     let name = name.as_str();
                     let payload = vec![i as u8 + 1; 4096 * (i + 1)];
                     let f = h.open(me, &anchor, name, creat_rw()).unwrap();
-                    let (n, _bufs) =
-                        h.pwritev(me, &f, vec![payload.clone()], 0);
+                    let (n, _bufs) = h.pwritev2(
+                        me,
+                        &f,
+                        vec![payload.clone()],
+                        0,
+                        RwFlags::empty(),
+                    );
                     assert_eq!(n.unwrap(), payload.len());
                     h.fsync(me, &f).unwrap();
                     h.close(f).unwrap();
                     // Verify through a fresh open + scattered read.
                     let f = h.open(me, &anchor, name, rdonly()).unwrap();
                     let half = payload.len() / 2;
-                    let (n, bufs) = h.preadv(
+                    let (n, bufs) = h.preadv2(
                         me,
                         &f,
                         vec![vec![0u8; half], vec![0u8; payload.len() - half]],
                         0,
+                        RwFlags::empty(),
                     );
                     assert_eq!(n.unwrap(), payload.len());
                     assert_eq!(&bufs[0], &payload[..half]);
@@ -468,12 +593,12 @@ fn concurrent_ops_across_threads() {
 
 #[test]
 fn write_pread_offsets() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let f = h.open(me, &anchor, "sparse", creat_rw()).unwrap();
-        let (n, _b) = h.pwrite(me, &f, b"tail".to_vec(), 100);
+        let (n, _b) = pwrite1(&h, me, &f, b"tail".to_vec(), 100);
         assert_eq!(n.unwrap(), 4);
-        let (n, buf) = h.pread(me, &f, vec![0u8; 8], 98);
+        let (n, buf) = pread1(&h, me, &f, vec![0u8; 8], 98);
         assert_eq!(n.unwrap(), 6, "2 hole bytes + 4 tail bytes to EOF");
         assert_eq!(&buf[..6], b"\0\0tail");
         h.close(f).unwrap();
@@ -487,11 +612,11 @@ fn write_pread_offsets() {
 fn open_metadata_close_workflow() {
     // The shape the API is built to encourage: open once, do every metadata
     // op against the resulting fd, close. No path is named after the open.
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let f = h.open(me, &anchor, "doc.bin", creat_rw()).unwrap();
 
-        let (n, _b) = h.pwrite(me, &f, vec![b'x'; 4096], 0);
+        let (n, _b) = pwrite1(&h, me, &f, vec![b'x'; 4096], 0);
         assert_eq!(n.unwrap(), 4096);
 
         // Extended attributes, by fd. (This is the DOS-attributes shape the
@@ -543,10 +668,10 @@ fn open_metadata_close_workflow() {
 
 #[test]
 fn ftruncate_by_fd_or_unsupported() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let f = h.open(me, &anchor, "t.bin", creat_rw()).unwrap();
-        let (n, _b) = h.pwrite(me, &f, vec![b'y'; 100], 0);
+        let (n, _b) = pwrite1(&h, me, &f, vec![b'y'; 100], 0);
         assert_eq!(n.unwrap(), 100);
 
         h.ftruncate(me, &f, 10).expect("ftruncate");
@@ -557,14 +682,11 @@ fn ftruncate_by_fd_or_unsupported() {
 
 #[test]
 fn fd_metadata_respects_close_last() {
-    // Metadata ops hold a file reference like data ops do: a close with one
-    // in flight must still be the file's last op (single-slot pool proves
-    // the slot is reclaimed, not leaked).
-    let cfg = FsConfig {
-        files: 1,
-        ..FsConfig::default()
-    };
-    with_fs(cfg, |h, me, dir, _stop| {
+    // Metadata ops hold a file reference like data ops do, so a close racing
+    // one in flight must still be the file's last op: the reactor parks an
+    // `Arc<OwnedFd>` clone for the duration, and the descriptor closes when
+    // that clone drops, not when the caller lets go.
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let f = h.open(me, &anchor, "a.bin", creat_rw()).unwrap();
         let name = xattr_name("user.k");
@@ -582,7 +704,7 @@ fn fd_metadata_respects_close_last() {
 
 #[test]
 fn statx_by_leaf_and_anchor() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("sized"), vec![0u8; 1234]).unwrap();
         std::fs::create_dir(dir.join("sub")).unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
@@ -678,7 +800,7 @@ fn leaf_validation_is_the_confinement() {
 
 #[test]
 fn directory_entry_ops() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).unwrap();
 
         // mkdir / rmdir
@@ -774,7 +896,7 @@ fn directory_entry_ops() {
 
 #[test]
 fn rename_across_two_anchors() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::create_dir(dir.join("src")).unwrap();
         std::fs::create_dir(dir.join("dst")).unwrap();
         std::fs::write(dir.join("src/f"), b"payload").unwrap();
@@ -803,7 +925,7 @@ fn rename_across_two_anchors() {
 /// stays empty while the data is being written.
 #[test]
 fn o_tmpfile_is_invisible_until_linkat_publishes_it() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
 
         // O_TMPFILE names the *directory*; the file it creates has no entry.
@@ -813,7 +935,7 @@ fn o_tmpfile_is_invisible_until_linkat_publishes_it() {
             .mode(Mode::from_bits_truncate(0o600));
         let f = h.open(me, &anchor, ".", how).expect("open O_TMPFILE");
 
-        let (n, _) = h.pwrite(me, &f, b"published atomically".to_vec(), 0);
+        let (n, _) = pwrite1(&h, me, &f, b"published atomically".to_vec(), 0);
         assert_eq!(n.expect("write"), 20);
         h.fdatasync(me, &f).expect("fdatasync");
 
@@ -841,7 +963,7 @@ fn o_tmpfile_is_invisible_until_linkat_publishes_it() {
 /// rename really does replace the old content atomically.
 #[test]
 fn linkat_file_cannot_replace_but_rename_can() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         std::fs::write(dir.join("object"), b"old").unwrap();
 
@@ -849,7 +971,7 @@ fn linkat_file_cannot_replace_but_rename_can() {
             .flags(OFlag::O_TMPFILE | OFlag::O_RDWR)
             .mode(Mode::from_bits_truncate(0o600));
         let f = h.open(me, &anchor, ".", how).expect("open O_TMPFILE");
-        let (n, _) = h.pwrite(me, &f, b"new".to_vec(), 0);
+        let (n, _) = pwrite1(&h, me, &f, b"new".to_vec(), 0);
         assert_eq!(n.expect("write"), 3);
 
         // Straight at the live name: refused.
@@ -886,7 +1008,7 @@ fn linkat_file_cannot_replace_but_rename_can() {
 /// the real cause — hence the test, and hence the warning in the docs.
 #[test]
 fn o_tmpfile_with_o_excl_is_unlinkable() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let how = OpenHow::new()
             .flags(OFlag::O_TMPFILE | OFlag::O_RDWR | OFlag::O_EXCL)
@@ -919,7 +1041,7 @@ fn o_tmpfile_with_o_excl_is_unlinkable() {
 fn linkat_file_accepts_any_id_for_the_same_credentials() {
     pin_umask();
     let dir = truenas_ros::tempdir().expect("tempdir");
-    let mut afs = match UringFs::new(FsConfig::default()) {
+    let mut afs = match UringFs::new(test_cfg()) {
         Ok(a) => a,
         Err(e) => {
             if should_skip(&e) {
@@ -943,7 +1065,7 @@ fn linkat_file_accepts_any_id_for_the_same_credentials() {
                 .flags(OFlag::O_TMPFILE | OFlag::O_RDWR)
                 .mode(Mode::from_bits_truncate(0o600));
             let f = h.open(opener, &anchor, ".", how).expect("open");
-            let (n, _) = h.pwrite(opener, &f, b"x".to_vec(), 0);
+            let (n, _) = pwrite1(&h, opener, &f, b"x".to_vec(), 0);
             assert_eq!(n.expect("write"), 1);
 
             h.linkat_file(linker, &f, &anchor, leaf("object"))
@@ -1006,7 +1128,7 @@ fn privileged_xattr_allowlist_elevates_only_listed_names() {
         std::fs::Permissions::from_mode(0o755),
     )
     .expect("open up the scratch dir");
-    let mut afs = match UringFs::new(FsConfig::default()) {
+    let mut afs = match UringFs::new(test_cfg()) {
         Ok(a) => a,
         Err(e) => {
             if should_skip(&e) {
@@ -1112,7 +1234,7 @@ fn privileged_xattr_allowlist_elevates_only_listed_names() {
 /// failure mode, so the degrade path is the assertion.
 #[test]
 fn preadv2_pwritev2_flags_apply_or_fail_loudly() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let f = h.open(me, &anchor, "rw2", creat_rw()).expect("open");
 
@@ -1154,7 +1276,7 @@ fn preadv2_pwritev2_flags_apply_or_fail_loudly() {
 /// succeeds through `open` fails through `open_confined`.
 #[test]
 fn open_confined_cannot_be_weakened_by_the_caller() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::create_dir(dir.join("inner")).unwrap();
         std::fs::write(dir.join("outside"), b"secret").unwrap();
         let inner = Anchor::open(dir.join("inner").as_path()).unwrap();
@@ -1196,7 +1318,7 @@ fn open_confined_cannot_be_weakened_by_the_caller() {
 /// what exists, and refuses to build a path that would leave the anchor.
 #[test]
 fn mkdir_path_creates_confined_and_is_idempotent() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let mode = Mode::from_bits_truncate(0o755);
 
@@ -1242,7 +1364,7 @@ fn mkdir_path_creates_confined_and_is_idempotent() {
 /// self-skips where the root filesystem has no child mounts.
 #[test]
 fn confined_open_refuses_to_cross_a_mount_point() {
-    with_fs(FsConfig::default(), |h, me, _dir, _stop| {
+    with_fs(test_cfg(), |h, me, _dir, _stop| {
         let root = Anchor::open("/").expect("anchor /");
         let root_dev = std::fs::metadata("/").unwrap().dev();
 
@@ -1278,7 +1400,7 @@ fn confined_open_refuses_to_cross_a_mount_point() {
 /// and assert the staging directory is still empty.
 #[test]
 fn abandoned_tmpfile_leaves_nothing_behind() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::create_dir(dir.join("staging")).unwrap();
         let staging = Anchor::open(dir.join("staging").as_path()).unwrap();
         let how = OpenHow::new()
@@ -1287,7 +1409,7 @@ fn abandoned_tmpfile_leaves_nothing_behind() {
 
         for _ in 0..8 {
             let f = h.open(me, &staging, ".", how).expect("open O_TMPFILE");
-            let (n, _) = h.pwrite(me, &f, vec![b'x'; 4096], 0);
+            let (n, _) = pwrite1(&h, me, &f, vec![b'x'; 4096], 0);
             assert_eq!(n.expect("write"), 4096);
             drop(f); // the upload is abandoned mid-flight
         }
@@ -1304,7 +1426,7 @@ fn abandoned_tmpfile_leaves_nothing_behind() {
 /// the tree. Uses a real mount boundary; self-skips without one.
 #[test]
 fn listing_can_be_confined_to_one_filesystem() {
-    with_fs(FsConfig::default(), |h, me, _dir, _stop| {
+    with_fs(test_cfg(), |h, me, _dir, _stop| {
         let root = Anchor::open("/").expect("anchor /");
         let root_dev = std::fs::metadata("/").unwrap().dev();
         let crossings: Vec<String> = std::fs::read_dir("/")
@@ -1361,7 +1483,7 @@ fn listing_can_be_confined_to_one_filesystem() {
 fn metadata_ops_carry_the_personality() {
     // Every metadata op stamps sqe.personality; an id this ring never
     // registered must fail at submission rather than running as the daemon.
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("f"), b"x").unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let bogus = Personality::from_raw(4242).unwrap();
@@ -1431,7 +1553,7 @@ where
     .expect("chmod tempdir");
     // The ring must exist before the broker forks: it inherits the fd,
     // because an io_uring descriptor cannot be sent over a unix socket.
-    let mut afs = match UringFs::new(FsConfig::default()) {
+    let mut afs = match UringFs::new(test_cfg()) {
         Ok(a) => a,
         Err(e) => {
             if should_skip(&e) {
@@ -1479,7 +1601,7 @@ fn query_directory_lists_and_enriches() {
         query_directory, DirEntry, EnrichSpec, QueryOptions,
     };
 
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("a.txt"), b"aa").unwrap();
         std::fs::write(dir.join("b.txt"), vec![0u8; 100]).unwrap();
         std::fs::write(dir.join("c.txt"), vec![0u8; 4096]).unwrap();
@@ -1540,7 +1662,7 @@ fn query_directory_discovers_user_xattrs() {
         query_directory, EnrichSpec, QueryOptions, XattrNamespaces,
     };
 
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("a.txt"), b"aa").unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
 
@@ -1606,7 +1728,7 @@ fn query_directory_discovers_non_utf8_name() {
         query_directory, EnrichSpec, QueryOptions, XattrNamespaces,
     };
 
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("a.txt"), b"aa").unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
         // A `user.` name whose trailing bytes are not valid UTF-8.
@@ -1657,7 +1779,7 @@ fn query_directory_discovers_large_value() {
         query_directory, EnrichSpec, QueryOptions, XattrNamespaces,
     };
 
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("big.bin"), b"x").unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let big = vec![0xabu8; 5000]; // larger than the 4096-byte buffer
@@ -1709,7 +1831,7 @@ fn query_directory_explicit_large_value() {
         query_directory, EnrichSpec, QueryOptions, XattrNamespaces,
     };
 
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("big.bin"), b"x").unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let name = xattr_name("user.blob");
@@ -1840,7 +1962,7 @@ fn query_pool_discovers_xattrs() {
         EnrichSpec, QueryOptions, QueryPool, XattrNamespaces,
     };
 
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("p.txt"), b"hi").unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let set_ok = {
@@ -1931,7 +2053,7 @@ fn query_directory_drop_closes_dir_fd() {
     use std::ffi::CString;
     use truenas_ros::uring_fs::{query_directory, EnrichSpec, QueryOptions};
 
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         for i in 0..6 {
             std::fs::write(dir.join(format!("f{i}")), b"x").unwrap();
         }
@@ -1978,7 +2100,7 @@ fn fs_handle_query_xattrs_reads_user_namespace() {
     use std::collections::BTreeMap;
     use truenas_ros::uring_fs::XattrNamespaces;
 
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("f.txt"), b"hi").unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let how = OpenHow::new().flags(OFlag::O_RDWR);
@@ -2134,7 +2256,7 @@ fn query_pool_lists_directory() {
     use std::ffi::CString;
     use truenas_ros::uring_fs::{EnrichSpec, QueryOptions, QueryPool};
 
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         for n in ["x.txt", "y.txt", "z.txt"] {
             std::fs::write(dir.join(n), b"hi").unwrap();
         }
@@ -2173,7 +2295,7 @@ fn query_pool_runs_multiple_listings() {
         EnrichSpec, QueryHandle, QueryOptions, QueryPool,
     };
 
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let d1 = dir.join("d1");
         let d2 = dir.join("d2");
         std::fs::create_dir(&d1).unwrap();
@@ -2222,7 +2344,7 @@ fn query_pool_runs_multiple_listings() {
 fn pool_copy_file_range_whole() {
     use truenas_ros::uring_fs::QueryPool;
 
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let content: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
         std::fs::write(dir.join("src"), &content).unwrap();
         std::fs::write(dir.join("dst"), b"").unwrap();
@@ -2252,7 +2374,7 @@ fn pool_copy_file_range_whole() {
 fn pool_copy_file_range_ranged_offload() {
     use truenas_ros::uring_fs::QueryPool;
 
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         // src byte i = (i / 100): three 100-byte runs of 0, 1, 2.
         let content: Vec<u8> = (0..300u32).map(|i| (i / 100) as u8).collect();
         std::fs::write(dir.join("src"), &content).unwrap();
@@ -2327,7 +2449,7 @@ fn broker_registers_own_identity_unprivileged() {
         std::fs::write(dir.join("f"), b"brokered").unwrap();
         let anchor = Anchor::open(dir).unwrap();
         let f = h.open(id, &anchor, "f", rdonly()).expect("open as self");
-        let (n, buf) = h.pread(id, &f, vec![0u8; 16], 0);
+        let (n, buf) = pread1(h, id, &f, vec![0u8; 16], 0);
         assert_eq!(&buf[..n.unwrap()], b"brokered");
         h.close(f).unwrap();
         creds.unregister(id).expect("unregister");
@@ -2403,7 +2525,7 @@ fn impersonated_open_obeys_dac() {
 
         // A world-readable file is fine as that user.
         let f = h.open(user, &anchor, "public", rdonly()).expect("open");
-        let (n, buf) = h.pread(user, &f, vec![0u8; 16], 0);
+        let (n, buf) = pread1(h, user, &f, vec![0u8; 16], 0);
         assert_eq!(&buf[..n.unwrap()], b"everyone");
         h.close(f).unwrap();
 
@@ -2477,7 +2599,8 @@ fn impersonated_create_is_owned_by_the_user() {
         // O_CREAT under the personality: the file belongs to the user, not
         // to the (root) daemon that actually issued the syscall.
         let f = h.open(user, &anchor, "theirs", creat_rw()).expect("create");
-        let (n, _b) = h.pwritev(user, &f, vec![b"mine".to_vec()], 0);
+        let (n, _b) =
+            h.pwritev2(user, &f, vec![b"mine".to_vec()], 0, RwFlags::empty());
         assert_eq!(n.unwrap(), 4);
         h.close(f).unwrap();
         let md = std::fs::metadata(dir.join("theirs")).unwrap();
@@ -2779,7 +2902,7 @@ fn large_ad_group_list_round_trips() {
             let f = h.open(id, &sub, "f", rdonly()).unwrap_or_else(|e| {
                 panic!("group {marker} (entry {} of {n}) lost: {e}", n - 1)
             });
-            let (got, buf) = h.pread(id, &f, vec![0u8; 8], 0);
+            let (got, buf) = pread1(h, id, &f, vec![0u8; 8], 0);
             assert_eq!(&buf[..got.unwrap()], b"deep");
             h.close(f).unwrap();
             creds.unregister(id).unwrap();
@@ -2844,7 +2967,7 @@ fn list_names(
 /// the order the full paths actually compare in.
 #[test]
 fn path_order_places_a_directory_after_its_dotted_siblings() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::create_dir(dir.join("a")).expect("mkdir a");
         for f in ["a-1.txt", "a.txt", "aa.txt"] {
             std::fs::write(dir.join(f), b"x").expect("write");
@@ -2880,7 +3003,7 @@ fn path_order_places_a_directory_after_its_dotted_siblings() {
 /// end-of-directory rather than "the filter ate this one".
 #[test]
 fn name_prefix_filters_without_shortening_batches() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         for i in 0..5 {
             std::fs::write(dir.join(format!("keep-{i}")), b"x").expect("write");
             std::fs::write(dir.join(format!("drop-{i}")), b"x").expect("write");
@@ -2921,7 +3044,7 @@ fn name_prefix_filters_without_shortening_batches() {
 /// `a`, where a file of that name would sort.
 #[test]
 fn start_after_resumes_a_path_ordered_listing_without_gaps() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::create_dir(dir.join("a")).expect("mkdir a");
         for f in ["a-1.txt", "a.txt", "aa.txt"] {
             std::fs::write(dir.join(f), b"x").expect("write");
@@ -2971,7 +3094,7 @@ fn start_after_resumes_a_path_ordered_listing_without_gaps() {
 /// [`Statx::change_cookie`] is an `Option` rather than a bare `u64`.
 #[test]
 fn change_cookie_moves_on_writes_and_not_on_reads() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let how = OpenHow::new()
             .flags(OFlag::O_RDWR | OFlag::O_CREAT)
@@ -2995,12 +3118,12 @@ fn change_cookie_moves_on_writes_and_not_on_reads() {
             return;
         };
 
-        let (n, _) = h.pwrite(me, &f, b"hello".to_vec(), 0);
+        let (n, _) = pwrite1(&h, me, &f, b"hello".to_vec(), 0);
         assert_eq!(n.expect("write"), 5);
         let after_write = cookie(&f).expect("cookie still reported");
         assert_ne!(after_write, first, "a write must move the change cookie");
 
-        let (n, _) = h.pread(me, &f, vec![0u8; 5], 0);
+        let (n, _) = pread1(&h, me, &f, vec![0u8; 5], 0);
         assert_eq!(n.expect("read"), 5);
         assert_eq!(
             cookie(&f).expect("cookie still reported"),
@@ -3065,7 +3188,7 @@ fn dac_read_search_traverses_a_directory_the_identity_cannot_search() {
         let f = h
             .open(elevated, &anchor, "vault/inner", rdonly())
             .expect("DAC_READ_SEARCH should traverse the 0700 directory");
-        let (n, buf) = h.pread(elevated, &f, vec![0u8; 6], 0);
+        let (n, buf) = pread1(h, elevated, &f, vec![0u8; 6], 0);
         assert_eq!(n.expect("read"), 6);
         assert_eq!(&buf[..6], b"secret", "and it reads the file, too");
         h.close(f).unwrap();
@@ -3223,7 +3346,7 @@ fn walk_keys(
 /// property a naive bare-name sort breaks.
 #[test]
 fn tree_walk_emits_the_subtree_in_global_path_order() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         make_tree(&dir);
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let keys = walk_keys(
@@ -3266,7 +3389,7 @@ fn tree_walk_emits_the_subtree_in_global_path_order() {
 /// non-recursive listing a delimiter asks for, and they must agree.
 #[test]
 fn depth_one_and_skip_descent_both_stop_at_the_top_level() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         make_tree(&dir);
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let expected = ["a-1.txt", "a.txt", "a/", "aa.txt", "z/"];
@@ -3306,7 +3429,7 @@ fn depth_one_and_skip_descent_both_stop_at_the_top_level() {
 /// gets wrong.
 #[test]
 fn paging_with_a_cursor_reproduces_the_walk_exactly() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         make_tree(&dir);
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let full = walk_keys(&h, me, &anchor, TreeOptions::default());
@@ -3357,7 +3480,7 @@ fn paging_with_a_cursor_reproduces_the_walk_exactly() {
 /// the directory either.
 #[test]
 fn a_folded_subtree_stays_folded_across_a_page_boundary() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         make_tree(&dir);
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         // What one uninterrupted walk yields when every directory is pruned.
@@ -3413,7 +3536,7 @@ fn a_folded_subtree_stays_folded_across_a_page_boundary() {
 /// request — or a later process — and not just within one walk.
 #[test]
 fn a_serialized_cursor_resumes_the_walk() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         make_tree(&dir);
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let full = walk_keys(&h, me, &anchor, TreeOptions::default());
@@ -3445,7 +3568,7 @@ fn a_serialized_cursor_resumes_the_walk() {
 /// a way out of it, whether it points outside or back inside.
 #[test]
 fn the_walk_does_not_follow_symlinks_out_of_the_tree() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::create_dir(dir.join("real")).unwrap();
         std::fs::write(dir.join("real/inside.txt"), b"x").unwrap();
         std::os::unix::fs::symlink("/etc", dir.join("escape")).unwrap();
@@ -3478,10 +3601,10 @@ fn the_walk_does_not_follow_symlinks_out_of_the_tree() {
 /// length form.
 #[test]
 fn fadvise_is_accepted_and_leaves_contents_alone() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let f = h.open(me, &anchor, "adv.bin", creat_rw()).expect("open");
-        let (n, _) = h.pwrite(me, &f, b"0123456789".to_vec(), 0);
+        let (n, _) = pwrite1(&h, me, &f, b"0123456789".to_vec(), 0);
         assert_eq!(n.expect("write"), 10);
 
         for advice in [
@@ -3500,7 +3623,7 @@ fn fadvise_is_accepted_and_leaves_contents_alone() {
         h.fadvise(me, &f, 0, 0, Advice::DontNeed).expect("dontneed");
         h.fadvise(me, &f, 4, 6, Advice::DontNeed).expect("ranged");
 
-        let (n, buf) = h.pread(me, &f, vec![0u8; 10], 0);
+        let (n, buf) = pread1(&h, me, &f, vec![0u8; 10], 0);
         assert_eq!(n.expect("read"), 10);
         assert_eq!(&buf[..10], b"0123456789", "advice must not alter data");
         h.close(f).unwrap();
@@ -3513,7 +3636,7 @@ fn with_priv_xattr_fs<F>(client: F)
 where
     F: FnOnce(&FsHandle, Personality, &Path) + Send,
 {
-    let mut afs = match UringFs::new(FsConfig::default()) {
+    let mut afs = match UringFs::new(test_cfg()) {
         Ok(a) => a,
         Err(e) => {
             if should_skip(&e) {
@@ -3625,7 +3748,7 @@ fn fremovexattr_removes_allowlisted_attributes() {
 /// each run depending on the fd limit.
 #[test]
 fn descend_open_failure_surfaces_rather_than_dropping_the_subtree() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::create_dir(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/f.txt"), b"x").unwrap();
         std::fs::write(dir.join("z.txt"), b"x").unwrap();
@@ -3666,7 +3789,7 @@ fn descend_open_failure_surfaces_rather_than_dropping_the_subtree() {
 /// aborted every time a directory went away underneath it would be unusable.
 #[test]
 fn a_subtree_removed_under_the_walk_is_skipped_quietly() {
-    with_fs(FsConfig::default(), |h, me, dir, _stop| {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::create_dir(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/f.txt"), b"x").unwrap();
         std::fs::write(dir.join("z.txt"), b"x").unwrap();

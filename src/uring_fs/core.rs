@@ -36,8 +36,8 @@ use crate::uring::sys::{
     IORING_OP_FADVISE, IORING_OP_FALLOCATE, IORING_OP_FGETXATTR,
     IORING_OP_FSETXATTR, IORING_OP_FSYNC, IORING_OP_FTRUNCATE,
     IORING_OP_LINKAT, IORING_OP_MKDIRAT, IORING_OP_OPENAT2, IORING_OP_READV,
-    IORING_OP_RENAMEAT, IORING_OP_STATX, IORING_OP_SYMLINKAT,
-    IORING_OP_UNLINKAT, IORING_OP_WRITEV,
+    IORING_OP_RENAMEAT, IORING_OP_SPLICE, IORING_OP_STATX, IORING_OP_SYMLINKAT,
+    IORING_OP_UNLINKAT, IORING_OP_WRITEV, SPLICE_F_MOVE,
 };
 use crate::uring::user_data::{pack_raw, unpack_raw};
 use std::any::Any;
@@ -45,7 +45,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
 // The offload sink and the `DIR*` handoff are loom-modelled (see
 // `loom_tests` at the bottom), so these come from `crate::sync` — std's
@@ -80,6 +80,7 @@ pub(crate) const TAG_LINKAT: u8 = 0x8D;
 pub(crate) const TAG_FGETXATTR: u8 = 0x8E;
 pub(crate) const TAG_FSETXATTR: u8 = 0x8F;
 pub(crate) const TAG_FADVISE: u8 = 0x90;
+pub(crate) const TAG_SPLICE: u8 = 0x91;
 /// The standalone host's wake tag (an embedded host reuses its own).
 pub(crate) const TAG_WAKE: u8 = 0x9D;
 /// Tags `ASYNC_CANCEL` ops (and the teardown drain); completions ignored.
@@ -697,6 +698,21 @@ impl FsCore {
                     sqe.addr = len64;
                     sqe.op_flags = aux32; // POSIX_FADV_* advice
                 }
+                TAG_SPLICE => {
+                    sqe.opcode = IORING_OP_SPLICE;
+                    // `sqe.fd` (set above) is the *output* — the file being
+                    // written. The input rides in `splice_fd_in`, which
+                    // overlays `file_index`; it is a plain descriptor, so
+                    // `SPLICE_F_FD_IN_FIXED` stays clear.
+                    sqe.file_index = len64 as u32; // the pipe's read end
+                    sqe.off_addr2 = off; // destination offset
+                    sqe.len = aux32; // bytes to move
+                                     // A pipe has no position: `splice_off_in` must be -1, or
+                                     // `do_splice` refuses it `ESPIPE`. `fd_meta` leaves `addr`
+                                     // holding a name pointer, so overwrite it.
+                    sqe.addr = u64::MAX;
+                    sqe.op_flags = SPLICE_F_MOVE;
+                }
                 TAG_FGETXATTR | TAG_FSETXATTR => {
                     sqe.opcode = if tag == TAG_FGETXATTR {
                         IORING_OP_FGETXATTR
@@ -1206,70 +1222,6 @@ impl<'a> FsConn<'a> {
         );
     }
 
-    /// Vectored positional read (`preadv(2)`) as `who`.
-    pub fn preadv<F>(
-        &mut self,
-        who: Personality,
-        f: File,
-        bufs: Vec<Vec<u8>>,
-        off: u64,
-        on_done: F,
-    ) where
-        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
-    {
-        self.rw(TAG_READV, who, f, bufs, off, RwFlags::empty(), on_done);
-    }
-
-    /// Single-buffer positional read (`pread(2)`).
-    pub fn pread<F>(
-        &mut self,
-        who: Personality,
-        f: File,
-        buf: Vec<u8>,
-        off: u64,
-        on_done: F,
-    ) where
-        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
-    {
-        self.rw(TAG_READV, who, f, vec![buf], off, RwFlags::empty(), on_done);
-    }
-
-    /// Vectored positional write (`pwritev(2)`) as `who`.
-    pub fn pwritev<F>(
-        &mut self,
-        who: Personality,
-        f: File,
-        bufs: Vec<Vec<u8>>,
-        off: u64,
-        on_done: F,
-    ) where
-        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
-    {
-        self.rw(TAG_WRITEV, who, f, bufs, off, RwFlags::empty(), on_done);
-    }
-
-    /// Single-buffer positional write (`pwrite(2)`).
-    pub fn pwrite<F>(
-        &mut self,
-        who: Personality,
-        f: File,
-        buf: Vec<u8>,
-        off: u64,
-        on_done: F,
-    ) where
-        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
-    {
-        self.rw(
-            TAG_WRITEV,
-            who,
-            f,
-            vec![buf],
-            off,
-            RwFlags::empty(),
-            on_done,
-        );
-    }
-
     /// Scattered positional read with per-operation flags (`preadv2(2)`).
     /// See [`RwFlags`] — an unsupported flag fails the read with
     /// `EOPNOTSUPP` rather than being ignored.
@@ -1579,6 +1531,52 @@ impl<'a> FsConn<'a> {
             off,
             len,
             advice as u32,
+            on_done,
+        );
+    }
+
+    /// Move up to `len` bytes from `pipe`'s read end into `f` at `off`,
+    /// without a userspace buffer (`IORING_OP_SPLICE`).
+    ///
+    /// This is the ingest half of a zero-copy body path: whoever fills the
+    /// pipe (a socket splice, a `vmsplice`) never materializes the bytes, and
+    /// neither does this. `pipe` is a plain descriptor the caller keeps open
+    /// until the completion fires — it is **not** taken into the fixed-file
+    /// pool, so it does not consume a `FsConfig::files` slot.
+    ///
+    /// # Short moves are normal
+    ///
+    /// A pipe delivers what it has, so a completion carrying fewer than `len`
+    /// bytes is ordinary progress, not end of input: resubmit the remainder.
+    /// [`FsDone::result`] is the byte count either way — the kernel's
+    /// `req_set_fail` on a short move (`io_splice`, `io_uring/splice.c`)
+    /// governs only whether an `IOSQE_IO_LINK` chain continues, which this
+    /// does not use.
+    ///
+    /// Splice cannot hash what it moves — nothing passes through userspace.
+    /// A body that needs an ETag has to be read conventionally, which is the
+    /// tradeoff this exists to let a caller make per request.
+    pub fn splice_from_pipe<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        pipe: RawFd,
+        off: u64,
+        len: u32,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.fd_meta(
+            TAG_SPLICE,
+            who,
+            f,
+            None,
+            Vec::new(),
+            off,
+            // Carried to `splice_fd_in`; see the `TAG_SPLICE` staging arm.
+            pipe as u32 as u64,
+            len,
             on_done,
         );
     }
