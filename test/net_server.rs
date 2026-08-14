@@ -5462,7 +5462,7 @@ fn fs_static_file_server_open_read_reply() {
     use std::ffi::CString;
     use std::sync::OnceLock;
     use truenas_ros::sync_fs::{OFlag, OpenHow};
-    use truenas_ros::uring_fs::{Anchor, Personality};
+    use truenas_ros::uring_fs::{Anchor, Personality, RwFlags};
 
     let dir = truenas_ros::tempdir().unwrap();
     std::fs::write(dir.path().join("hello.txt"), b"contents of hello").unwrap();
@@ -5496,18 +5496,25 @@ fn fs_static_file_server_open_read_reply() {
                 deferred.close(); // open failed (ENOENT/EACCES — the personality working)
                 return;
             };
-            fs.pread(who, file.clone(), vec![0u8; 4096], 0, move |done, fs| {
-                fs.close(file); // fire-and-forget: free the slot
-                match done.result() {
-                    Ok(n) => {
-                        let mut buf =
-                            done.into_bufs().pop().unwrap_or_default();
-                        buf.truncate(n as usize);
-                        deferred.reply(echo_frame(&buf));
+            fs.preadv2(
+                who,
+                file.clone(),
+                vec![vec![0u8; 4096]],
+                0,
+                RwFlags::empty(),
+                move |done, fs| {
+                    fs.close(file); // fire-and-forget: free the slot
+                    match done.result() {
+                        Ok(n) => {
+                            let mut buf =
+                                done.into_bufs().pop().unwrap_or_default();
+                            buf.truncate(n as usize);
+                            deferred.reply(echo_frame(&buf));
+                        }
+                        Err(_) => deferred.close(),
                     }
-                    Err(_) => deferred.close(),
-                }
-            });
+                },
+            );
         });
         Response::Defer(permit)
     };
@@ -6327,7 +6334,9 @@ fn fs_broker_personality_gates_open() {
     use std::os::unix::ffi::OsStrExt;
     use std::sync::OnceLock;
     use truenas_ros::sync_fs::{OFlag, OpenHow};
-    use truenas_ros::uring_fs::{Anchor, AsUser, CredBroker, Personality};
+    use truenas_ros::uring_fs::{
+        Anchor, AsUser, CredBroker, Personality, RwFlags,
+    };
 
     if !is_root() {
         return; // the broker cannot become another uid without CAP_SETUID
@@ -6381,19 +6390,26 @@ fn fs_broker_personality_gates_open() {
                 deferred.reply(echo_frame(b"denied"));
                 return;
             };
-            fs.pread(who, file.clone(), vec![0u8; 64], 0, move |d, fs| {
-                fs.close(file);
-                match d.result() {
-                    Ok(n) => {
-                        let mut out = b"read:".to_vec();
-                        let mut v = d.into_bufs().pop().unwrap_or_default();
-                        v.truncate(n as usize);
-                        out.extend_from_slice(&v);
-                        deferred.reply(echo_frame(&out));
+            fs.preadv2(
+                who,
+                file.clone(),
+                vec![vec![0u8; 64]],
+                0,
+                RwFlags::empty(),
+                move |d, fs| {
+                    fs.close(file);
+                    match d.result() {
+                        Ok(n) => {
+                            let mut out = b"read:".to_vec();
+                            let mut v = d.into_bufs().pop().unwrap_or_default();
+                            v.truncate(n as usize);
+                            out.extend_from_slice(&v);
+                            deferred.reply(echo_frame(&out));
+                        }
+                        Err(_) => deferred.reply(echo_frame(b"read-err")),
                     }
-                    Err(_) => deferred.reply(echo_frame(b"read-err")),
-                }
-            });
+                },
+            );
         });
         Response::Defer(permit)
     };
@@ -6648,7 +6664,7 @@ fn fs_fd_reclaimed_on_connection_close_midchain() {
     use std::sync::OnceLock;
     use std::time::Duration;
     use truenas_ros::sync_fs::{OFlag, OpenHow};
-    use truenas_ros::uring_fs::{Anchor, Personality};
+    use truenas_ros::uring_fs::{Anchor, Personality, RwFlags};
 
     let dir = truenas_ros::tempdir().unwrap();
     let fifo = dir.path().join("f.fifo");
@@ -6695,9 +6711,16 @@ fn fs_fd_reclaimed_on_connection_close_midchain() {
             // data): it parks the file's `Arc` in the op entry. The peer will
             // disconnect with this read still in flight.
             deferred.reply(echo_frame(b"opened"));
-            fs.pread(who, file.clone(), vec![0u8; 16], 0, move |_d, fs| {
-                fs.close(file); // never reached — the read blocks forever
-            });
+            fs.preadv2(
+                who,
+                file.clone(),
+                vec![vec![0u8; 16]],
+                0,
+                RwFlags::empty(),
+                move |_d, fs| {
+                    fs.close(file); // never reached — the read blocks forever
+                },
+            );
         });
         Response::Defer(permit)
     };

@@ -20,25 +20,66 @@ use crate::uring::wake::LoopShared;
 use std::fmt;
 use std::sync::atomic::Ordering;
 
-/// Sizing for an [`UringFs`].
+/// Sizing for an [`UringFs`], defaulted for a **server**: a request handler
+/// fans out many independent operations and collects their completions. Both
+/// fields are public; a consumer with a different shape sets its own.
+///
+/// There is deliberately no open-file count here. Files are plain
+/// reference-counted descriptors (`Arc<OwnedFd>`) and no fs operation sets
+/// `IOSQE_FIXED_FILE`, so the reactor registers no fixed-file pool and has no
+/// ceiling of its own to configure — the limit on concurrently open files is
+/// the process's `RLIMIT_NOFILE`.
+///
+/// # `entries` and `ops` bound different things
+///
+/// `entries` is the submission queue, and `io_uring_enter` **consumes** SQEs
+/// into kernel-side requests, freeing the slots. Staging past a full queue
+/// therefore flushes and continues rather than failing, so `entries` sets how
+/// much work rides on one `io_uring_enter` — a batching knob, not a ceiling.
+///
+/// `ops` is the table an in-flight operation holds a slot in until its
+/// completion reaps, so **`ops` is the real concurrency ceiling**, and
+/// exhausting it is what fails a fan-out with `EBUSY`. It should exceed
+/// `entries`, not match it.
+///
+/// # Only `entries` costs locked memory
+///
+/// A ring's queues are charged against `RLIMIT_MEMLOCK` — `__io_account_mem`
+/// (`io_uring/rsrc.c:39-47`) tests `rlimit(RLIMIT_MEMLOCK)` with **no
+/// capability bypass, so running as root does not exempt it**. The cost is
+/// about `entries × 96` bytes (a 64-byte SQE array plus a double-sized
+/// completion queue), so the default is roughly 400 KiB per reactor against a
+/// common 8 MiB limit; measured, the 22nd concurrent default-sized ring fails
+/// `ENOMEM`.
+///
+/// `ops` is ordinary heap — about 180 bytes per slot, so the default costs
+/// ~5.8 MiB of RSS, allocated once at construction — and is not accounted
+/// against any limit. That asymmetry is why the two defaults differ by 8×:
+/// raising concurrency is cheap, raising the batch size is not.
+///
+/// One reactor sits well inside 8 MiB. Several (a `reuse_port` reactor per
+/// core), or a consumer that also registers buffers, must raise the limit
+/// (`LimitMEMLOCK=` in the unit, or `setrlimit` before the first
+/// [`UringFs::new`]) — the symptom otherwise is a bare `ENOMEM` from ring
+/// creation with nothing pointing at the cause.
 #[derive(Clone, Copy, Debug)]
 pub struct FsConfig {
-    /// Submission-queue depth (rounded up to a power of two by the kernel).
+    /// Submission-queue depth (rounded up to a power of two by the kernel) —
+    /// how much work rides on one `io_uring_enter`. The field that costs
+    /// `RLIMIT_MEMLOCK`; see the type docs.
     pub entries: u32,
-    /// Fixed-file pool slots — the maximum number of concurrently open
-    /// files. Opening with the pool exhausted fails `ENFILE`.
-    pub files: u32,
     /// Op-table slots — the maximum number of concurrently in-flight
-    /// operations. Submitting past it fails `EBUSY`.
+    /// operations, and the ceiling a fan-out actually hits: submitting past
+    /// it fails `EBUSY` however deep the ring is. Plain heap at ~180 bytes a
+    /// slot, so this is the cheap axis to raise.
     pub ops: u32,
 }
 
 impl Default for FsConfig {
     fn default() -> FsConfig {
         FsConfig {
-            entries: 128,
-            files: 64,
-            ops: 128,
+            entries: 4096,
+            ops: 32768,
         }
     }
 }
@@ -96,16 +137,12 @@ impl Drop for UringFs {
 }
 
 impl UringFs {
-    /// Build the ring, register the sparse fixed-file pool, and probe the
-    /// kernel (`OPENAT2` as the canary for the op set). Fails with
-    /// `Validation` on an unsupported kernel and with the underlying errno
-    /// where io_uring itself is unavailable.
+    /// Build the ring and probe the kernel (`OPENAT2` as the canary for the
+    /// op set). Fails with `Validation` on an unsupported kernel and with the
+    /// underlying errno where io_uring itself is unavailable.
+    ///
+    /// No fixed-file pool is registered: fs ops name files by raw descriptor.
     pub fn new(cfg: FsConfig) -> crate::Result<UringFs> {
-        if cfg.files == 0 {
-            return Err(crate::Error::Validation(
-                "FsConfig::files must be at least 1".into(),
-            ));
-        }
         if cfg.ops < 2 || u64::from(cfg.ops) > SLOT_MASK {
             return Err(crate::Error::Validation(
                 "FsConfig::ops must be in 2..=SLOT_MASK".into(),
@@ -116,7 +153,7 @@ impl UringFs {
                 "FsConfig::entries must be at least 4".into(),
             ));
         }
-        let eng = Engine::new(cfg.entries, cfg.files)?;
+        let eng = Engine::without_pool(cfg.entries)?;
         if !probe_op_supported(&eng.ring, IORING_OP_OPENAT2) {
             return Err(crate::Error::Validation(
                 "uring_fs requires io_uring OPENAT2 (Linux >= 5.6); this \
@@ -443,7 +480,7 @@ mod tests {
         io_uring_setup, unregister_personality, IoUringParams,
         IORING_OP_FGETXATTR, IORING_OP_FSETXATTR, IORING_SETUP_SINGLE_ISSUER,
     };
-    use crate::uring_fs::{Anchor, FsConfig, Personality};
+    use crate::uring_fs::{Anchor, FsConfig, Personality, RwFlags};
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
@@ -612,7 +649,14 @@ mod tests {
     fn stale_token_and_stale_personality_are_inert() {
         let dir = crate::tempdir().unwrap();
         std::fs::write(dir.path().join("f"), b"data").unwrap();
-        let mut afs = match UringFs::new(FsConfig::default()) {
+        // Not `FsConfig::default()`: that is server-sized and costs ~400 KiB
+        // of RLIMIT_MEMLOCK per ring, and `cargo test` runs this alongside
+        // every other test in one process.
+        let cfg = FsConfig {
+            entries: 128,
+            ops: 128,
+        };
+        let mut afs = match UringFs::new(cfg) {
             Ok(a) => a,
             Err(crate::Error::Errno(e)) if skip_unavailable(e) => return,
             Err(e) => panic!("UringFs::new: {e}"),
@@ -630,14 +674,21 @@ mod tests {
 
                 // A plain read works (files are real fds now — there is no
                 // stale `{slot, generation}` token left to forge).
-                let (res, buf) = h.pread(me, &f, vec![0u8; 4], 0);
+                let (res, bufs) =
+                    h.preadv2(me, &f, vec![vec![0u8; 4]], 0, RwFlags::empty());
                 assert_eq!(res.unwrap(), 4);
-                assert_eq!(&buf, b"data");
+                assert_eq!(&bufs[0], b"data");
 
                 // A personality nothing registered: the kernel refuses the
                 // SQE at init; the caller sees EINVAL.
                 let bogus = Personality(4242);
-                let (res, _b) = h.pread(bogus, &f, vec![0u8; 4], 0);
+                let (res, _b) = h.preadv2(
+                    bogus,
+                    &f,
+                    vec![vec![0u8; 4]],
+                    0,
+                    RwFlags::empty(),
+                );
                 assert!(matches!(res, Err(crate::Error::Errno(Errno::EINVAL))));
 
                 h.close(f).unwrap();

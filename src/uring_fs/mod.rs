@@ -34,7 +34,7 @@
 //! an inject channel and park on a per-call reply channel:
 //!
 //! ```no_run
-//! use truenas_ros::uring_fs::{Anchor, UringFs, FsConfig};
+//! use truenas_ros::uring_fs::{Anchor, UringFs, FsConfig, RwFlags};
 //! use truenas_ros::sync_fs::{OFlag, OpenHow};
 //!
 //! let mut afs = UringFs::new(FsConfig::default())?;
@@ -46,8 +46,9 @@
 //! let worker = std::thread::spawn(move || -> truenas_ros::Result<()> {
 //!     let how = OpenHow::new().flags(OFlag::O_RDONLY);
 //!     let f = handle.open(me, &anchor, "docs/readme.txt", how)?;
-//!     let (n, buf) = handle.pread(me, &f, vec![0u8; 4096], 0);
-//!     let _ = (n?, buf);
+//!     let (n, bufs) =
+//!         handle.preadv2(me, &f, vec![vec![0u8; 4096]], 0, RwFlags::empty());
+//!     let _ = (n?, bufs);
 //!     handle.close(f)?;
 //!     stop.shutdown();
 //!     Ok(())
@@ -66,12 +67,14 @@
 //! # Naming
 //!
 //! Method names follow their syscalls. The **`p`** prefix means *positional*
-//! — [`pread`](FsHandle::pread)/[`pwrite`](FsHandle::pwrite) and their
-//! vectored [`preadv`](FsHandle::preadv)/[`pwritev`](FsHandle::pwritev)
-//! forms take an explicit file offset, exactly as `pread(2)`/`pwritev(2)` do.
-//! Every data op here is positional: ops carry their own offset rather than
-//! advance a shared file position, so there is no offsetless `read`/`write`
-//! and no `seek`. The **`at`** suffix is reserved for its usual meaning, the
+//! — [`preadv2`](FsHandle::preadv2)/[`pwritev2`](FsHandle::pwritev2) take an
+//! explicit file offset, exactly as `preadv2(2)`/`pwritev2(2)` do. Every data
+//! op here is positional: ops carry their own offset rather than advance a
+//! shared file position, so there is no offsetless `read`/`write` and no
+//! `seek`. Those two are also the *whole* data surface — a single-buffer or
+//! unflagged variant would be a second spelling of one submission, so pass a
+//! one-element `bufs` and [`RwFlags::empty()`]. The **`at`** suffix is
+//! reserved for its usual meaning, the
 //! dirfd-relative syscall family ([`renameat`](FsHandle::renameat),
 //! [`unlinkat`](FsHandle::unlinkat), [`mkdirat`](FsHandle::mkdirat), …), where
 //! the anchor dirfd is what the name refers to.
@@ -81,10 +84,10 @@
 //! The API is fd-first, so that `open → metadata → close` is the natural
 //! shape and a file is named exactly once:
 //!
-//! - **On an open [`File`]:** [`preadv`](FsHandle::preadv) /
-//!   [`pwritev`](FsHandle::pwritev) (+ the `pread`/`pwrite` k=1 forms, and the
-//!   [`preadv2`](FsHandle::preadv2) / [`pwritev2`](FsHandle::pwritev2) forms
-//!   carrying [`RwFlags`]), [`fsync`](FsHandle::fsync) /
+//! - **On an open [`File`]:** [`preadv2`](FsHandle::preadv2) /
+//!   [`pwritev2`](FsHandle::pwritev2) (vectored, carrying [`RwFlags`]),
+//!   [`splice_from_pipe`](FsHandle::splice_from_pipe) for a body that never
+//!   enters userspace, [`fsync`](FsHandle::fsync) /
 //!   [`fdatasync`](FsHandle::fdatasync),
 //!   [`fgetxattr`](FsHandle::fgetxattr) / [`fsetxattr`](FsHandle::fsetxattr) /
 //!   [`fremovexattr`](FsHandle::fremovexattr),
@@ -840,8 +843,8 @@ pub(crate) enum FsInject {
     },
 }
 
-/// An operation submitted with [`FsHandle::start_preadv`] (the
-/// non-blocking twin of the blocking conveniences): hold it, do other work,
+/// An operation submitted with [`FsHandle::start_preadv2`] (the
+/// non-blocking twin of the blocking forms): hold it, do other work,
 /// then [`wait`](FsPending::wait) for the outcome.
 // loom's channel types are `Debug` only when their payload is; std's are
 // unconditionally. Derive normally, and hand-write the one-line impl for a
@@ -910,7 +913,7 @@ impl FsPending {
     /// Block until a single-buffer operation completes, returning the byte
     /// count and that buffer — the shape
     /// [`start_fgetxattr`](FsHandle::start_fgetxattr) needs, and the
-    /// one-buffer convenience for [`start_preadv`](FsHandle::start_preadv).
+    /// one-buffer convenience for [`start_preadv2`](FsHandle::start_preadv2).
     pub fn wait_buf(self) -> (crate::Result<usize>, Vec<u8>) {
         let (res, mut bufs) = self.wait();
         (res, bufs.pop().unwrap_or_default())
@@ -1106,67 +1109,18 @@ impl FsHandle {
         Ok(cur)
     }
 
-    /// Vectored positional read as `who` — `preadv(2)` semantics: fill each
+    /// Vectored positional read as `who` — `preadv2(2)` semantics: fill each
     /// buffer up to its current `len()`, in order, starting at file offset
     /// `off`. Returns the byte count (short only at end-of-file) and the
     /// buffers.
-    pub fn preadv(
-        &self,
-        who: Personality,
-        f: &File,
-        bufs: Vec<Vec<u8>>,
-        off: u64,
-    ) -> (crate::Result<usize>, Vec<Vec<u8>>) {
-        self.rw(core::TAG_READV, who, f, bufs, off, RwFlags::empty())
-    }
-
-    /// Single-buffer positional read — `pread(2)`; the one-vector
-    /// [`preadv`](Self::preadv).
-    pub fn pread(
-        &self,
-        who: Personality,
-        f: &File,
-        buf: Vec<u8>,
-        off: u64,
-    ) -> (crate::Result<usize>, Vec<u8>) {
-        let (res, mut bufs) =
-            self.rw(core::TAG_READV, who, f, vec![buf], off, RwFlags::empty());
-        (res, bufs.pop().unwrap_or_default())
-    }
-
-    /// Vectored positional write as `who` — `pwritev(2)` semantics: write
-    /// each buffer's `len()` bytes, in order, starting at `off`. Returns
-    /// bytes written and the buffers.
-    pub fn pwritev(
-        &self,
-        who: Personality,
-        f: &File,
-        bufs: Vec<Vec<u8>>,
-        off: u64,
-    ) -> (crate::Result<usize>, Vec<Vec<u8>>) {
-        self.rw(core::TAG_WRITEV, who, f, bufs, off, RwFlags::empty())
-    }
-
-    /// Single-buffer positional write — `pwrite(2)`; the one-vector
-    /// [`pwritev`](Self::pwritev).
-    pub fn pwrite(
-        &self,
-        who: Personality,
-        f: &File,
-        buf: Vec<u8>,
-        off: u64,
-    ) -> (crate::Result<usize>, Vec<u8>) {
-        let (res, mut bufs) =
-            self.rw(core::TAG_WRITEV, who, f, vec![buf], off, RwFlags::empty());
-        (res, bufs.pop().unwrap_or_default())
-    }
-
-    /// Vectored positional read with per-operation flags — `preadv2(2)`.
     ///
-    /// The flagged twin of [`preadv`](Self::preadv); see [`RwFlags`] for what
-    /// the flags mean and which ones a given filesystem actually implements.
-    /// An unsupported flag fails the read with `EOPNOTSUPP` rather than being
-    /// quietly ignored, so support is discoverable per call.
+    /// See [`RwFlags`] for what the flags mean and which ones a given
+    /// filesystem actually implements; an unsupported flag fails the read
+    /// with `EOPNOTSUPP` rather than being quietly ignored, so support is
+    /// discoverable per call. Pass [`RwFlags::empty()`] for plain `preadv(2)`
+    /// behaviour, and a one-element `bufs` for a single-buffer read — this is
+    /// the whole read surface, so there is one shape to learn and one to
+    /// audit.
     pub fn preadv2(
         &self,
         who: Personality,
@@ -1178,14 +1132,16 @@ impl FsHandle {
         self.rw(core::TAG_READV, who, f, bufs, off, flags)
     }
 
-    /// Vectored positional write with per-operation flags — `pwritev2(2)`.
+    /// Vectored positional write as `who` — `pwritev2(2)` semantics: write
+    /// each buffer's `len()` bytes, in order, starting at `off`. Returns
+    /// bytes written and the buffers.
     ///
-    /// The flagged twin of [`pwritev`](Self::pwritev).
     /// [`RwFlags::RWF_DSYNC`] makes the write itself durable and can therefore
     /// replace a following [`fdatasync`](Self::fdatasync) — one operation
     /// instead of two. Whether that is *faster* is a filesystem question worth
     /// measuring: on ZFS a synchronous write goes through the ZIL, which for
-    /// large writes can cost more than a single trailing sync.
+    /// large writes can cost more than a single trailing sync. Pass
+    /// [`RwFlags::empty()`] for plain `pwritev(2)` behaviour.
     pub fn pwritev2(
         &self,
         who: Personality,
@@ -1201,28 +1157,26 @@ impl FsHandle {
     /// collects the outcome. (The seam the dropped-mid-op lifecycle needs:
     /// the token can be dropped while this op is in flight — the orphan
     /// close cancels it and the pending wait observes `ECANCELED`.)
-    pub fn start_preadv(
+    pub fn start_preadv2(
         &self,
         who: Personality,
         f: &File,
         bufs: Vec<Vec<u8>>,
         off: u64,
+        flags: RwFlags,
     ) -> crate::Result<FsPending> {
-        self.start_rw(core::TAG_READV, who, f, bufs, off, RwFlags::empty())
+        self.start_rw(core::TAG_READV, who, f, bufs, off, flags)
     }
 
     /// Start a vectored write without blocking — the write-side twin of
-    /// [`start_preadv`](Self::start_preadv).
+    /// [`start_preadv2`](Self::start_preadv2).
     ///
     /// Without this, an off-loop caller writing a large object must use the
-    /// blocking [`pwritev`](Self::pwritev) and park a thread for every write
+    /// blocking [`pwritev2`](Self::pwritev2) and park a thread for every write
     /// in flight. Issuing several of these and then collecting them lets one
     /// thread keep many writes on the ring at once, which is the whole reason
     /// the reactor exists.
-    ///
-    /// `flags` is the `preadv2`/`pwritev2` set; pass [`RwFlags::empty`] for
-    /// plain `pwritev` behaviour.
-    pub fn start_pwritev(
+    pub fn start_pwritev2(
         &self,
         who: Personality,
         f: &File,
@@ -1561,6 +1515,45 @@ impl FsHandle {
         advice: Advice,
     ) -> crate::Result<()> {
         self.fd_meta_unit(core::TAG_FADVISE, who, f, off, len, advice as u32)
+    }
+
+    /// Move up to `len` bytes from `pipe`'s read end into `f` at `off`,
+    /// without a userspace buffer (`IORING_OP_SPLICE`). Returns the number of
+    /// bytes moved.
+    ///
+    /// The ingest half of a zero-copy body path: whoever fills the pipe never
+    /// materializes the bytes, and neither does this. `pipe` is a plain
+    /// descriptor the caller keeps open across the call — it is **not** taken
+    /// into the fixed-file pool and costs no [`FsConfig`] slot.
+    ///
+    /// # A short move is ordinary progress
+    ///
+    /// A pipe delivers what it has, so **a returned count below `len` means
+    /// resubmit the remainder** — it does not mean end of input, and it is
+    /// not an error. (The kernel's `req_set_fail` on a short move —
+    /// `io_splice`, `io_uring/splice.c` — decides only whether an
+    /// `IOSQE_IO_LINK` chain continues, and this issues no chain.)
+    ///
+    /// Nothing passes through userspace, so nothing can hash the bytes in
+    /// transit. A body that needs an ETag computed on ingest has to be read
+    /// conventionally instead.
+    pub fn splice_from_pipe(
+        &self,
+        who: Personality,
+        f: &File,
+        pipe: RawFd,
+        off: u64,
+        len: u32,
+    ) -> crate::Result<u64> {
+        self.fd_meta_count(
+            core::TAG_SPLICE,
+            who,
+            f,
+            off,
+            // Carried to `splice_fd_in`; see the `TAG_SPLICE` staging arm.
+            pipe as u32 as u64,
+            len,
+        )
     }
 
     // ---- statx: the one path-resolving metadata op ---------------------
@@ -1936,6 +1929,21 @@ impl FsHandle {
         len64: u64,
         aux32: u32,
     ) -> crate::Result<()> {
+        self.fd_meta_count(tag, who, f, off, len64, aux32)
+            .map(|_| ())
+    }
+
+    /// [`fd_meta_unit`](Self::fd_meta_unit) for the ops whose result is a
+    /// byte count rather than a bare success.
+    fn fd_meta_count(
+        &self,
+        tag: u8,
+        who: Personality,
+        f: &File,
+        off: u64,
+        len64: u64,
+        aux32: u32,
+    ) -> crate::Result<u64> {
         let (tx, rx) = mpsc::channel();
         let out = self.call(
             FsInject::FdMeta {
@@ -1951,7 +1959,9 @@ impl FsHandle {
             },
             &rx,
         )?;
-        out.res.map(|_| ()).map_err(Into::into)
+        // `map_res` turns every negative result into `Err`, so the `Ok` arm is
+        // a non-negative count.
+        out.res.map(|n| n as u64).map_err(Into::into)
     }
 
     fn statx_inner(

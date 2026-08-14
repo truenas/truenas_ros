@@ -2,19 +2,24 @@
 
 Idiomatic Rust bindings for modern Linux filesystem and mount syscalls that
 glibc does not wrap, plus NFS4/POSIX1E ACLs, a filesystem iterator,
-idmapped-mount user namespaces, symlink-safe / atomic file I/O, and a
-`configparser`-compatible config-file parser.
+idmapped-mount user namespaces, symlink-safe / atomic file I/O, kernel audit
+records, and a `configparser`-compatible config-file parser. Alongside them,
+an opt-in io_uring stack: stream networking, an HTTP/1.1 codec, and a
+filesystem reactor that stamps every operation with a kernel-enforced
+identity.
 
 This is the Rust equivalent of the Python `truenas_pyos` library. It is
-targeted only for TrueNAS kernel versions and depends only on `libc` and
-`bitflags`. It calls the kernel directly — glibc does not wrap most of these
-syscalls — exposing `bitflags`-typed flag sets, an `Errno`-based `Result`, and
-`OwnedFd` / `BorrowedFd` descriptor ownership.
+targeted only for TrueNAS kernel versions and depends on `libc` and
+`bitflags`, with `httparse` the single exception, optional and reached only by
+the `http` feature's request-head tokenizer. It calls the kernel directly —
+glibc does not wrap most of these syscalls — exposing `bitflags`-typed flag
+sets, an `Errno`-based `Result`, and `OwnedFd` / `BorrowedFd` descriptor
+ownership.
 
 ## Features
 
-Every feature is on by default. To pick a subset, set `default-features =
-false` and re-enable what you need (or use `full`):
+The features in the table below are on by default. To pick a subset, set
+`default-features = false` and re-enable what you need:
 
 ```toml
 [dependencies]
@@ -34,17 +39,26 @@ truenas_ros = { version = "0.1", default-features = false, features = ["sync-fs"
 | `configfile` | INI config files byte-for-byte compatible with Python's `configparser`, read symlink-safely and written atomically; an opt-in scrub-on-release mode for secret-bearing files (with `secrets`, the file image stages in `memfd_secret` memory) |
 | `audit` | Kernel audit records over `NETLINK_AUDIT` — PAM-shaped `key=value` events sent straight to `auditd`, replacing libaudit |
 
-An io_uring stack lives alongside the blocking bindings, off by default:
-`net-server` / `net-client` (stream roles over a shared reactor core, with
-kernel-TLS, splice, and peer-credential support) and `uring-fs` (a filesystem
-reactor whose every operation runs under a kernel-enforced identity). Both sit
-on the internal `uring` engine feature; see the crate docs.
+Three more are opt-in. An io_uring stack lives alongside the blocking
+bindings: `net-server` / `net-client` (stream roles over a shared reactor
+core, with kernel-TLS, splice, and peer-credential support), `http` (an
+HTTP/1.1 codec over the server's protocol seam — a framer and a vocabulary,
+not a server), and `uring-fs` (a filesystem reactor whose every operation runs
+under a kernel-enforced identity). All sit on the internal `uring` engine
+feature; see the crate docs. `secrets` is separate: `memfd_secret(2)`-backed
+protected memory for long-lived in-process secrets, off swap and absent from
+core dumps, wanted only by a daemon that holds any.
 
-`uring-fs` covers opens, vectored I/O (including the `preadv2`/`pwritev2` flag
-forms), sync, the metadata and extended-attribute ops, cache advice
-(`fadvise`), the directory-entry family, and directory listing and subtree
-walks — off-loop through a blocking handle, or on the reactor thread through
-completion callbacks. Beyond plain syscall wrappers it provides what a storage
+`full` is the default set plus the net roles, `http`, and `secrets`. It never
+includes `uring-fs`, which needs a credential broker forked before the daemon
+starts threads and so has to be chosen deliberately.
+
+`uring-fs` covers opens, vectored positional I/O (`preadv2` / `pwritev2`),
+`splice` from a pipe into a file, sync, the metadata and extended-attribute
+ops, cache advice (`fadvise`), the directory-entry family, and directory
+listing and subtree walks — off-loop through a blocking handle, or on the
+reactor thread through completion callbacks. Beyond plain syscall wrappers it
+provides what a storage
 service needs and cannot easily build itself: path resolution the caller cannot
 weaken (`open_confined`), confined `mkdir -p` (`mkdir_path`), `O_TMPFILE`
 publication (`linkat_file`), and an allowlist that lets a server keep its own
@@ -140,34 +154,42 @@ cfg.write_path("/etc/app.conf".as_ref(), opts)?;
 
 ## Requirements
 
-- A TrueNAS kernel, 6.18 or newer. That floor is assumed rather than probed:
-  every io_uring operation this crate issues predates it, so there are no
-  runtime capability checks and no calls that disable themselves on an older
-  kernel.
+- A TrueNAS kernel, 6.18 or newer. The floor itself is assumed rather than
+  probed — every io_uring operation this crate issues predates it — but
+  behaviour that needs a later point release is probed and fails loudly rather
+  than degrading: a server configured for `unix_peercred` refuses to start
+  below 6.18.16 (the `AF_UNIX` cmd fix), `UringFs::new` probes `OPENAT2`, and
+  `SecretMem::available` reports whether `memfd_secret` is compiled in.
 - Rust 1.97 or newer
 
 ## Testing
 
-`cargo test --all-features` runs the suite. Some tests adapt to their
-environment:
+`cargo test --all-features` runs the suite. Tests whose fixture may be absent
+skip rather than fail, which would let a mis-provisioned runner pass green
+having tested nothing — so every skip is gated on a `TRUENAS_ROS_REQUIRE_*`
+variable that CI arms, turning the skip back into a hard failure:
 
-- **ZFS / privileged tests** (`test/zfs.rs`) skip unless an ACL-typed ZFS
-  dataset is present; CI provisions one in a QEMU VM job.
-- **`configparser` differential tests** (`test/configparser_compat.rs`) spawn
-  the real Python `configparser` and assert byte-for-byte and behavioral
-  parity. They skip if `python3` is unavailable; set
-  `TRUENAS_ROS_REQUIRE_PYTHON=1` (as CI does) to make a missing interpreter a
-  hard failure instead.
-- **io_uring tests** (`test/net_*.rs`, `test/uring_fs.rs`, `test/http_live.rs`)
-  skip when a ring cannot be created; `TRUENAS_ROS_REQUIRE_IO_URING=1` makes
-  that a hard failure.
+| Set to `1` | Forces |
+|---|---|
+| `TRUENAS_ROS_REQUIRE_PYTHON` | the `configparser` differential tests (`test/configparser_compat.rs`), which spawn the real Python `configparser` and assert byte-for-byte and behavioural parity |
+| `TRUENAS_ROS_REQUIRE_IO_URING` | the io_uring suites (`test/net_*.rs`, `test/uring_fs.rs`, `test/http_live.rs`), which otherwise skip when a ring cannot be created |
+| `TRUENAS_ROS_REQUIRE_KTLS` | the kernel-TLS data path, which needs the `tls` ULP *and* an OpenSSL built with `enable-ktls` |
+| `TRUENAS_ROS_REQUIRE_PEERCRED` | `unix_peercred`, which needs Linux ≥ 6.18.16 |
+| `TRUENAS_ROS_REQUIRE_ZFS` | the ACL suites needing a provisioned ACL-typed ZFS dataset (`test/zfs.rs`) |
+| `TRUENAS_ROS_REQUIRE_SECRETMEM` | the `secrets` tests (`test/secrets.rs`), which need `CONFIG_SECRETMEM` |
+| `TRUENAS_ROS_REQUIRE_AUDIT` | the audit tests (`test/audit.rs`), which need a `NETLINK_AUDIT` socket |
+
+Anything privileged or ZFS-backed is proven in a QEMU job booting a real
+TrueNAS kernel against real datasets, not on a dev box: a local pass on tmpfs
+says nothing about `aclmode`, mount propagation, or `open_by_handle_at`.
 
 ### Fuzzing
 
 Everything in the library that decodes bytes it did not write has a fuzz target
 under [`fuzz/`](fuzz): the ACL wire formats, the INI parser, the `statmount`
-reply, the file-handle and resume-cursor codecs, the audit record encoder, the
-path checks, the credential-broker request header, and the net/http framing.
+reply, the file-handle and resume-cursor codecs, the audit record encoder and
+its netlink ack decoder, the path checks, the credential-broker request
+header, and the net/http framing.
 It is a separate, self-rooted crate, so it never touches the library's
 `libc`+`bitflags` charter or its MSRV.
 
@@ -228,10 +250,12 @@ RUSTFLAGS="--cfg loom" cargo test --lib --features uring    loom_
 RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
 ```
 
-Covered: the SQ/CQ ring's acquire/release discipline, the graceful-drain flag
-publication, the offload pool's lifecycle (growth, idle retirement, drop
-quiescence, the self-join guard, lazy-init races), and the offload completion
-handoff. `src/sync.rs` is the std/loom shim — outside a model build it is a
+Covered: the SQ/CQ ring's acquire/release discipline, the wake eventfd's poke
+accumulation, the graceful-drain flag publication, the inject path's refusal
+after shutdown, the offload pool's lifecycle (growth, idle retirement, drop
+quiescence, the self-join guard, lazy-init races), the offload completion
+handoff, and the credential cache's single-flight mint. `src/sync.rs` is the
+std/loom shim — outside a model build it is a
 plain re-export, so none of this costs anything in a shipped binary.
 
 When one of these fails, loom's exploration is deterministic, so re-running the

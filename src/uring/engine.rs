@@ -61,6 +61,20 @@ impl Engine {
         })
     }
 
+    /// [`Engine::new`] without the fixed-file pool, for a host whose
+    /// descriptors are plain fds.
+    ///
+    /// The pool exists for the net roles, which name sockets by registered
+    /// slot: multishot accept auto-allocates into it
+    /// (`IORING_FILE_INDEX_ALLOC`) and every socket op carries
+    /// `IOSQE_FIXED_FILE`. The fs reactor names files by raw descriptor
+    /// (`Arc<OwnedFd>`) and sets that flag nowhere, so registering a pool for
+    /// it reserves kernel state nothing can draw on.
+    #[cfg(feature = "uring-fs")]
+    pub(crate) fn without_pool(entries: u32) -> crate::Result<Engine> {
+        Self::assemble(Ring::new(entries)?, |_| Ok(()))
+    }
+
     fn assemble(
         ring: Ring,
         register: impl FnOnce(&Ring) -> errno::Result<()>,
