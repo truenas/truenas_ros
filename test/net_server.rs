@@ -5776,6 +5776,280 @@ fn fs_conn_flistxattr_lists_file_xattrs() {
     );
 }
 
+/// `FsConn::fstatfs`/`fstatfs_anchor` answer on-loop: each offloads to the
+/// pool (io_uring has no statfs opcode) and delivers through the completion
+/// sink. Both name the same filesystem, so their answers must agree — and the
+/// anchor form proves an `O_PATH` descriptor is accepted, which is what lets a
+/// caller ask a whole tree's capacity without opening anything inside it.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn fs_conn_fstatfs_agrees_from_file_and_anchor() {
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality};
+
+    let dir = truenas_ros::tempdir().unwrap();
+    std::fs::write(dir.path().join("f.txt"), b"x").unwrap();
+
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+
+    let pc = Arc::clone(&pers);
+    let body = move |mut req: Request<'_, ()>| -> Response {
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let how = OpenHow::new().flags(OFlag::O_RDONLY);
+        // `open` first: a continuation resumed from an offload gets an
+        // `FsConn` that cannot open (net/server/wake.rs), so the ring op has
+        // to lead and the offloads chain behind it.
+        fs.open(who, &anchor.clone(), c"f.txt", how, move |done, fs| {
+            let Some(file) = done.file() else {
+                return deferred.reply(echo_frame(
+                    format!("OPEN {:?}", done.result()).as_bytes(),
+                ));
+            };
+            fs.fstatfs(file, move |by_file, fs| {
+                let by_file = match by_file {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return deferred
+                            .reply(echo_frame(format!("FILE {e}").as_bytes()))
+                    }
+                };
+                // offload -> offload: the second continuation still reaches
+                // the pool, and an O_PATH anchor is a valid target.
+                fs.fstatfs_anchor(&anchor, move |by_anchor, _fs| {
+                    let msg = match by_anchor {
+                        Ok(a) => {
+                            let ok = a.block_size() > 0
+                                && a.total_blocks() > 0
+                                && a.block_size() == by_file.block_size()
+                                && a.total_blocks() == by_file.total_blocks()
+                                && a.available_blocks() <= a.free_blocks()
+                                && a.total_bytes()
+                                    == a.total_blocks() * a.block_size();
+                            format!(
+                                "{} bs={} total={}",
+                                if ok { "agree" } else { "DISAGREE" },
+                                a.block_size(),
+                                a.total_blocks()
+                            )
+                        }
+                        Err(e) => format!("ANCHOR {e}"),
+                    };
+                    deferred.reply(echo_frame(msg.as_bytes()));
+                });
+            });
+        });
+        Response::Defer(permit)
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let cfg = ServerConfig {
+        pool_size: 16,
+        fs_files: 8,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    pers.set(server.register_self().expect("register_self"))
+        .unwrap();
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let mut s = connect_tcp(v4)?;
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        send_framed(&mut s, b"statfs")?;
+        let reply = recv_framed(&mut s);
+        drop(s);
+        stop.shutdown();
+        reply
+    });
+    server.serve_forever().expect("serve_forever fstatfs");
+    let reply = client.join().unwrap().expect("client io");
+    let text = String::from_utf8_lossy(&reply);
+    assert!(
+        text.starts_with("agree "),
+        "file and anchor must report one filesystem: {text:?}"
+    );
+}
+
+/// `FsConn::fget_zfs_attrs`/`fset_zfs_attrs` on-loop: read the mask, set
+/// `IMMUTABLE`, read it back, and restore — each hop an offload delivered
+/// through the completion sink.
+///
+/// Needs a real ZFS dataset; on tmpfs the ioctl is `ENOTTY`. Resolved the way
+/// `test/zfs.rs` does, and skipped loudly under `TRUENAS_ROS_REQUIRE_ZFS` so a
+/// runner that stopped provisioning one goes red rather than reporting a green
+/// suite that exercised nothing.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn fs_conn_zfs_attrs_round_trip_through_the_pool() {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    use truenas_ros::sync_fs::{OFlag, OpenHow, ZfsAttr};
+    use truenas_ros::uring_fs::{Anchor, Personality};
+
+    let ds = ["TRUENAS_ROS_NFS4_DATASET", "TRUENAS_ROS_POSIX_DATASET"]
+        .iter()
+        .filter_map(|v| std::env::var_os(v).map(PathBuf::from))
+        .chain(["/NFSV4ACL", "/POSIXACL"].iter().map(PathBuf::from))
+        .find(|d| d.is_dir());
+    let Some(ds) = ds else {
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_ZFS").is_none(),
+            "TRUENAS_ROS_REQUIRE_ZFS is set but no ZFS dataset is present"
+        );
+        return;
+    };
+    let fp = ds.join("ros-fsconn-zfsattr.bin");
+    let _ = std::fs::remove_file(&fp);
+    std::fs::write(&fp, b"x").unwrap();
+
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let anchor = match Anchor::open(ds.as_path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+
+    let pc = Arc::clone(&pers);
+    let body = move |mut req: Request<'_, ()>| -> Response {
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let how = OpenHow::new().flags(OFlag::O_RDWR);
+        fs.open(
+            who,
+            &anchor,
+            c"ros-fsconn-zfsattr.bin",
+            how,
+            move |done, fs| {
+                let Some(file) = done.file() else {
+                    return deferred.reply(echo_frame(
+                        format!("OPEN {:?}", done.result()).as_bytes(),
+                    ));
+                };
+                let f2 = file.clone();
+                let f3 = file.clone();
+                fs.fget_zfs_attrs(file, move |before, fs| {
+                    let before = match before {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return deferred.reply(echo_frame(
+                                format!("GET {e}").as_bytes(),
+                            ))
+                        }
+                    };
+                    fs.fset_zfs_attrs(
+                        f2,
+                        before | ZfsAttr::IMMUTABLE,
+                        move |set, fs| {
+                            if let Err(e) = set {
+                                return deferred.reply(echo_frame(
+                                    format!("SET {e}").as_bytes(),
+                                ));
+                            }
+                            fs.fget_zfs_attrs(f3.clone(), move |after, fs| {
+                                let locked = matches!(&after, Ok(a)
+                                    if a.contains(ZfsAttr::IMMUTABLE));
+                                // Restore before answering, or the dataset is
+                                // left with an undeletable file.
+                                fs.fset_zfs_attrs(f3, before, move |r, _fs| {
+                                    let msg = if !locked {
+                                        format!("NOTLOCKED {after:?}")
+                                    } else if r.is_err() {
+                                        "UNLOCK-FAILED".to_string()
+                                    } else {
+                                        "locked-then-restored".to_string()
+                                    };
+                                    deferred.reply(echo_frame(msg.as_bytes()));
+                                });
+                            });
+                        },
+                    );
+                });
+            },
+        );
+        Response::Defer(permit)
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let cfg = ServerConfig {
+        pool_size: 16,
+        fs_files: 8,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    pers.set(server.register_self().expect("register_self"))
+        .unwrap();
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let mut s = connect_tcp(v4)?;
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        send_framed(&mut s, b"attrs")?;
+        let reply = recv_framed(&mut s);
+        drop(s);
+        stop.shutdown();
+        reply
+    });
+    server.serve_forever().expect("serve_forever zfs attrs");
+    let reply = client.join().unwrap().expect("client io");
+    let text = String::from_utf8_lossy(&reply).into_owned();
+    let _ = std::fs::remove_file(&fp);
+    // Unprivileged, setting IMMUTABLE is refused — which is the property
+    // under test, so assert that rather than treating it as a skip.
+    if text.starts_with("SET ") {
+        assert!(
+            text.contains("EPERM") && !is_root(),
+            "only an unprivileged caller may be refused: {text:?}"
+        );
+        return;
+    }
+    assert_eq!(text, "locked-then-restored", "round trip through the pool");
+}
+
 /// `FsConn::fgetxattr_as_root` reads an xattr under the reactor's ambient
 /// (root) credentials (`sqe.personality = 0`) — the sanctioned privileged-read
 /// path for a `trusted.*`/`security.*` attribute a request's own identity

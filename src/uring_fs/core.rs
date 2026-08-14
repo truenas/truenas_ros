@@ -26,8 +26,8 @@ use super::{
 use crate::errno::{retry_on_eintr, Errno};
 use crate::sync_fs::openat2::RawOpenHow;
 use crate::sync_fs::{
-    AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, Statx, StatxMask,
-    StatxRaw,
+    AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, Statfs, Statx,
+    StatxMask, StatxRaw, ZfsAttr,
 };
 use crate::uring::engine::Engine;
 use crate::uring::slots::SlotEntry;
@@ -2000,6 +2000,78 @@ impl FsConn<'_> {
     {
         self.offload_result(
             move || super::query_dir::list_xattr_names(&f),
+            on_done,
+        );
+    }
+
+    /// Filesystem statistics for the mount `f` lives on, delivered on the
+    /// loop.
+    ///
+    /// io_uring has no `statfs` opcode, so this takes a pool thread and
+    /// returns through the completion sink like any other offload.
+    pub fn fstatfs<F>(&mut self, f: File, on_done: F)
+    where
+        F: FnOnce(crate::Result<Statfs>, &mut FsConn<'_>) + 'static,
+    {
+        self.offload_result(
+            move || Ok(crate::sync_fs::fstatfs(&*f.fd)?),
+            on_done,
+        );
+    }
+
+    /// Filesystem statistics for the mount `anchor` lives on — a whole tree's
+    /// capacity without opening anything inside it.
+    ///
+    /// Takes an `O_PATH` descriptor, which most fd-taking calls reject:
+    /// `fd_statfs` resolves through `f_path` and never consults `f_op`
+    /// (`fs/statfs.c`), unlike `fsync` or the ZFS attribute ioctls.
+    pub fn fstatfs_anchor<F>(&mut self, anchor: &Anchor, on_done: F)
+    where
+        F: FnOnce(crate::Result<Statfs>, &mut FsConn<'_>) + 'static,
+    {
+        let anchor = anchor.clone();
+        self.offload_result(
+            move || Ok(crate::sync_fs::fstatfs(&anchor)?),
+            on_done,
+        );
+    }
+
+    /// Read `f`'s ZFS attributes, delivered on the loop.
+    ///
+    /// `f` must be opened for real I/O (an `O_PATH` descriptor has no
+    /// `f_op->unlocked_ioctl`); `ENOTTY` off ZFS. For `IMMUTABLE`/
+    /// `APPENDONLY` alone prefer [`fstatx`](Self::fstatx), which reports both
+    /// via `statx` with no ioctl and no pool thread.
+    pub fn fget_zfs_attrs<F>(&mut self, f: File, on_done: F)
+    where
+        F: FnOnce(crate::Result<ZfsAttr>, &mut FsConn<'_>) + 'static,
+    {
+        self.offload_result(
+            move || Ok(crate::sync_fs::fget_zfs_attrs(&*f.fd)?),
+            on_done,
+        );
+    }
+
+    /// Replace `f`'s ZFS attributes with `attrs`. **The mask is absolute** —
+    /// visible bits absent from `attrs` are cleared, so modify what
+    /// [`fget_zfs_attrs`](Self::fget_zfs_attrs) returned.
+    ///
+    /// Takes no [`Personality`], as [`fremovexattr`](Self::fremovexattr) does
+    /// not: an ioctl is checked against the *calling* thread's credentials,
+    /// and that thread is the reactor's pool, not a request identity. So the
+    /// kernel cannot decide whether this caller may lock this file, and
+    /// something above must. `ZfsAttr::NOUNLINK` in particular needs only
+    /// ownership to clear, where `IMMUTABLE` needs `CAP_LINUX_IMMUTABLE`.
+    ///
+    /// Setting `IMMUTABLE` also seals the file's extended attributes
+    /// (`may_write_xattr`, `fs/xattr.c`) — write metadata that belongs with a
+    /// locked object before locking it.
+    pub fn fset_zfs_attrs<F>(&mut self, f: File, attrs: ZfsAttr, on_done: F)
+    where
+        F: FnOnce(crate::Result<()>, &mut FsConn<'_>) + 'static,
+    {
+        self.offload_result(
+            move || Ok(crate::sync_fs::fset_zfs_attrs(&*f.fd, attrs)?),
             on_done,
         );
     }
