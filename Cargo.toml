@@ -30,6 +30,7 @@ httparse = { version = "1.10", optional = true }
 # the libc+bitflags charter untouched — see src/sync.rs for the std/loom shim.
 #   Run: RUSTFLAGS="--cfg loom" cargo test --lib --features uring    loom_
 #        RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
+#        RUSTFLAGS="--cfg loom" cargo test --lib --features http     loom_
 [target.'cfg(loom)'.dependencies]
 loom = { version = "0.7" }
 

@@ -8,8 +8,13 @@
 //! reactor.
 
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::PoisonError;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// The answer cell is cross-thread state (a worker fills it, the loop takes
+// it), so it rides `crate::sync` — std in production, loom's in the model
+// below, which is what lets the model see the fill/redeliver ordering.
+use crate::sync::{Arc, Mutex};
 
 use crate::net::server::{
     Body, DeferPermit, Deferred, Incoming, Protocol, Request, Responder,
@@ -205,7 +210,7 @@ impl HttpDeferred {
     /// duplicated off-thread.
     pub fn reply(self, resp: HttpResponse) {
         // The cell write happens-before the redeliver's channel send, so
-        // the completion pass observes it.
+        // the completion pass observes it (modelled by `loom_tests`).
         *self.answer.lock().unwrap_or_else(PoisonError::into_inner) =
             Some(resp);
         self.inner.redeliver();
@@ -1578,5 +1583,84 @@ mod tests {
         };
         let next = b"GET /next HTTP/1.1\r\nHost: h\r\n\r\n";
         assert!(matches!(frame(next, &mut conn, &cfg()), Framing::More));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// loom model of the parked reply hand-off
+// ---------------------------------------------------------------------------
+//
+// Run with:  RUSTFLAGS="--cfg loom" cargo test --lib --features http loom_
+//
+// The park's cross-thread protocol, the one edge in this module two threads
+// share:
+//
+//   worker (HttpDeferred::reply)        loop (drain, then step on Parked)
+//   *answer.lock() = Some(resp)         wake.drain()
+//   tx.send(Redeliver); wake.poke()     rx.try_recv() -> Redeliver
+//                                       answer.lock().take()
+//
+// The cell is filled before the redeliver is sent, and the completion pass
+// takes the cell only after consuming the wake, so a `reply` can never be
+// observed as a redrive. Break either half — fill after the send, or take
+// before the wake — and a schedule exists where the completion pass takes
+// `None`: the handler reruns against a consumed handle and the worker's
+// response is lost. The model drives the real `defer`/`reply`/`step`, with
+// the loop's recv order supplied by the probe.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use crate::net::server::Body;
+    use crate::net::ClientAddr;
+    use crate::sync::thread;
+
+    fn unreached(_: HttpRequest<'_>, _: &mut ()) -> HttpVerdict {
+        panic!("worker reply surfaced as a redrive")
+    }
+
+    #[test]
+    fn loom_worker_reply_is_never_a_redrive() {
+        loom::model(|| {
+            let (responder, probe) = Responder::test_responder_with_probe();
+            let peer = ClientAddr::Inet("127.0.0.1:9000".parse().unwrap());
+            let req = HttpRequest {
+                method: "GET",
+                target: "/",
+                version: Version::Http11,
+                headers: &[],
+                body: Body::inline(b""),
+                raw_head: b"GET / HTTP/1.1\r\nHost: h\r\n\r\n",
+                trailers: &[],
+                peer: &peer,
+                responder,
+            };
+            let (deferred, permit) = req.defer();
+            let HttpDeferPermit {
+                permit: _permit,
+                req: parked,
+            } = permit;
+            let mut conn: HttpConn<()> = HttpConn::new(());
+            conn.phase = Phase::Parked { req: parked };
+
+            let worker = thread::spawn(move || {
+                deferred.reply(HttpResponse::new(204));
+            });
+
+            probe.recv_redeliver();
+            let resp = step(
+                b"",
+                Body::inline(b""),
+                &peer,
+                Responder::test_responder(),
+                &mut conn,
+                &mut DateCache::default(),
+                &mut unreached,
+            );
+            let Response::Reply(bytes) = resp else {
+                panic!("expected the worker's reply, got {resp:?}");
+            };
+            assert!(bytes.starts_with(b"HTTP/1.1 204"));
+            worker.join().unwrap();
+        });
     }
 }

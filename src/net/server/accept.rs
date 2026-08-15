@@ -12,11 +12,11 @@ use crate::net::core::protocol::{ClientAddr, Framing, PeerCred, ServerAddr};
 use crate::net::core::sock;
 use crate::net::core::table::PendingPeer;
 use crate::net::server::protocol::{Incoming, Request, Response};
+use crate::sync::Arc;
 use crate::uring::sys::*;
 use std::mem::size_of;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 // The admission path runs the accept handler and, once a connection is
 // installed, enters the pump — so this block carries the full handler bounds.

@@ -255,6 +255,7 @@ cargo clippy --all-features --all-targets -- -D warnings
 cargo test --all-features --no-fail-fast
 RUSTFLAGS="--cfg loom" cargo test --lib --features uring    loom_
 RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
+RUSTFLAGS="--cfg loom" cargo test --lib --features http     loom_
 (cd fuzz && cargo +nightly fuzz build)
 ```
 

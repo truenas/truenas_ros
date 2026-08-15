@@ -9,10 +9,10 @@ use crate::net::core::protocol::{ClientAddr, CloseReason};
 use crate::net::server::{
     Deferred, Protocol, PushHandle, Server, ShutdownHandle, StatsHandle,
 };
+use crate::sync::Arc;
 use crate::uring::wake::LoopShared;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
-use std::sync::Arc;
 
 /// The ticket a kTLS handshake worker uses to hand a connection back to the
 /// server once the handshake finishes (or fails).

@@ -26,10 +26,10 @@ use crate::net::core::config::CoreConfig;
 use crate::net::core::conn::{pack, unpack, Op};
 use crate::net::core::handles::{stat, CloseHook, StatsInner};
 use crate::net::core::table::ConnTable;
+use crate::sync::Arc;
 use crate::uring::engine::Engine;
 use crate::uring::sys::*;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 /// Every stream-level timeout pad the kernel reads asynchronously
 /// (per-connection buffers live in `Connection`; the wake eventfd's landing

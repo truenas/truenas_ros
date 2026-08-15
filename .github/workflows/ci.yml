@@ -103,13 +103,14 @@ jobs:
     # which their doc comments call out as making them bounded rather than
     # exhaustive proofs. cfg(loom) is registered in Cargo.toml's [lints.rust].
     #
-    # Two invocations because the models span two feature sets: the SQ/CQ ring
-    # model needs only the shared engine, the pool/offload/inject ones need the
-    # fs reactor.
+    # Three invocations because the models span three feature sets: the SQ/CQ
+    # ring model needs only the shared engine, the pool/offload/inject ones need
+    # the fs reactor, and the parked-reply hand-off model needs the http glue.
     - name: loom (concurrency models)
       run: |
         RUSTFLAGS="--cfg loom" cargo test --lib --features uring    loom_
         RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
+        RUSTFLAGS="--cfg loom" cargo test --lib --features http     loom_
 
     # The fuzz crate is self-rooted (its own workspace), so nothing above ever
     # compiles it — a target could bit-rot against an API change and no one
