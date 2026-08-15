@@ -34,7 +34,7 @@ use crate::net::server::{Response, ServerConfig};
 use crate::net::Framing;
 
 use super::chunked::{self, ChunkScan};
-use super::head::{frame_facts, BodyKind};
+use super::head::{frame_facts, method_is_head, BodyKind};
 
 /// Fixed wire-overhead allowance for chunk framing on top of
 /// [`HttpConfig::max_body`]: a chunked message whose **wire** extent exceeds
@@ -306,7 +306,7 @@ pub(crate) fn frame<U>(
             // In this phase the buffer front IS the head region, so the
             // method prefix is sound to read here — unlike at delivery,
             // where the dance may have consumed the head already.
-            let head_only = buf.starts_with(b"HEAD ");
+            let head_only = method_is_head(buf);
             match frame_facts(buf) {
                 Err(status) => {
                     // The parse-time screens (malformed, Host, version) run
@@ -440,8 +440,8 @@ fn scan_step<U>(
     // buffer front when the head was never consumed. Read the method now;
     // at delivery the buffer may hold body bytes alone.
     let head_only = match stash {
-        Some(h) => h.starts_with(b"HEAD "),
-        None => buf.starts_with(b"HEAD "),
+        Some(h) => method_is_head(h),
+        None => method_is_head(buf),
     };
     let header_len = *head_len;
     let body = buf.get(header_len..).unwrap_or(&[]);
@@ -464,6 +464,12 @@ fn scan_step<U>(
             let decoded = scan.decoded;
             if decoded > cfg.max_body {
                 return fail(&mut conn.phase, buf.len(), 413, head_only);
+            }
+            // A single arrival can complete without ever taking the Ok(None)
+            // branch above, so the wire cap must hold here too — or the same
+            // bytes pass or fail on TCP segmentation alone.
+            if extent > cfg.max_body.saturating_add(CHUNK_WIRE_OVERHEAD) {
+                return fail(&mut conn.phase, buf.len(), 400, head_only);
             }
             let stash = stash.take();
             conn.phase = Phase::ChunkedDone { stash };
@@ -851,6 +857,69 @@ mod tests {
         }
         frame(&raw, &mut c, &small);
         assert!(matches!(c.phase, Phase::Fail { status: 400, .. }));
+    }
+
+    #[test]
+    fn chunked_wire_overhead_fails_400_on_completion() {
+        // The same wire shape with its terminal chunk in the same call: the
+        // scan completes rather than reporting progress, and the wire cap
+        // must fire on the completion branch too — the verdict cannot
+        // depend on how the bytes were segmented.
+        let mut c = conn();
+        let small = HttpConfig {
+            max_head: 1024,
+            max_body: 4096,
+        };
+        let head =
+            b"PUT /k HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut raw = head.to_vec();
+        for _ in 0..4000 {
+            raw.extend_from_slice(b"1\r\nX\r\n");
+        }
+        raw.extend_from_slice(b"0\r\n\r\n");
+        frame(&raw, &mut c, &small);
+        assert!(matches!(c.phase, Phase::Fail { status: 400, .. }));
+    }
+
+    #[test]
+    fn head_flag_survives_leading_empty_lines() {
+        // httparse skips empty lines before the request line (RFC 9112
+        // §2.2), so `\r\nHEAD ...` parses as a HEAD; the failure flag must
+        // agree, or this farewell carries a body the client reads as the
+        // next response's head.
+        let mut c = conn();
+        let req = b"\r\nHEAD /x HTTP/1.1\r\nHost: h\r\nContent-Length: 99999999999\r\n\r\n";
+        frame(req, &mut c, &cfg());
+        assert!(matches!(
+            c.phase,
+            Phase::Fail {
+                status: 413,
+                head_only: true
+            }
+        ));
+
+        // Bare LF, dying on a screen that parses no facts (missing Host):
+        // the flag is judged from the method bytes alone.
+        let mut c = conn();
+        frame(b"\nHEAD / HTTP/1.1\r\n\r\n", &mut c, &cfg());
+        assert!(matches!(
+            c.phase,
+            Phase::Fail {
+                status: 400,
+                head_only: true
+            }
+        ));
+
+        // A non-HEAD behind the same empty line keeps its farewell body.
+        let mut c = conn();
+        frame(b"\r\nGET / HTTP/1.1\r\n\r\n", &mut c, &cfg());
+        assert!(matches!(
+            c.phase,
+            Phase::Fail {
+                status: 400,
+                head_only: false
+            }
+        ));
     }
 
     #[test]

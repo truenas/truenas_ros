@@ -19,7 +19,7 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
-use super::head::HeaderView;
+use super::head::{has_field_break, is_token_byte, HeaderView};
 
 /// Chunk-size line cap (hex digits + optional extensions, CRLF excluded).
 /// Real chunk-size lines are under 20 bytes; the headroom is for extensions,
@@ -125,37 +125,22 @@ fn trim_ows_start(mut v: &[u8]) -> &[u8] {
     v
 }
 
-/// RFC 9110 `token` bytes — the same set the response serializer enforces on
-/// handler-emitted header names, here applied to trailer names off the wire.
-fn is_token_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric()
-        || matches!(
-            b,
-            b'!' | b'#'
-                | b'$'
-                | b'%'
-                | b'&'
-                | b'\''
-                | b'*'
-                | b'+'
-                | b'-'
-                | b'.'
-                | b'^'
-                | b'_'
-                | b'`'
-                | b'|'
-                | b'~'
-        )
-}
-
 /// Split a trailer field line into `(name, value)`. `None` when the name is
-/// empty, not a token, or the colon is missing — the line is malformed.
+/// empty, not a token, the colon is missing, or the value carries a control
+/// byte — the line is malformed. The value screen is load-bearing: lines are
+/// delimited on CRLF only, so a bare LF or CR *inside* a value would let a
+/// permitted-named trailer carry a forbidden field line past the name-only
+/// [`FORBIDDEN_TRAILERS`] screen.
 fn split_trailer(line: &[u8]) -> Option<(&[u8], &[u8])> {
     let colon = line.iter().position(|&b| b == b':')?;
     if colon == 0 || !line[..colon].iter().all(|&b| is_token_byte(b)) {
         return None;
     }
-    Some((&line[..colon], line[colon + 1..].trim_ascii()))
+    let value = line[colon + 1..].trim_ascii();
+    if has_field_break(value) {
+        return None;
+    }
+    Some((&line[..colon], value))
 }
 
 /// Field names that must not ride in a trailer section (RFC 9110 §6.5.1):
@@ -562,6 +547,25 @@ mod tests {
         assert_eq!(scan_err(b"0\r\nbadline\r\n\r\n"), 400);
         assert_eq!(scan_err(b"0\r\n:v\r\n\r\n"), 400);
         assert_eq!(scan_err(b"0\r\nbad name:v\r\n\r\n"), 400);
+    }
+
+    #[test]
+    fn a_trailer_value_cannot_carry_a_field_line() {
+        // A bare LF or CR inside a value smuggles a forbidden field past
+        // the name-only screen the moment any consumer splits the surfaced
+        // value on line breaks; RFC 9110 §5.5 admits no control byte in a
+        // field value, so the line is malformed, not data.
+        assert_eq!(
+            scan_err(b"0\r\nx-ok: v\nAuthorization: Basic Zm9v\r\n\r\n"),
+            400
+        );
+        assert_eq!(scan_err(b"0\r\nx-ok: v\rHost: evil\r\n\r\n"), 400);
+        assert_eq!(scan_err(b"0\r\nx-ok: a\x00b\r\n\r\n"), 400);
+        assert_eq!(scan_err(b"0\r\nx-ok: a\x7fb\r\n\r\n"), 400);
+        // Horizontal tab is the one control byte a value admits.
+        let (_, trailers) =
+            decode(b"0\r\nx-ok: a\tb\r\n\r\n").expect("decodes");
+        assert_eq!(trailers[0].value, b"a\tb");
     }
 
     #[test]

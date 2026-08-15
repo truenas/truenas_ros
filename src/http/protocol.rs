@@ -20,7 +20,9 @@ use crate::net::ClientAddr;
 use super::chunked;
 use super::date::DateCache;
 use super::framer::{frame, HttpConfig, HttpConn, Phase};
-use super::head::{parse_head, Head, HeaderView, Version, MAX_HEADERS};
+use super::head::{
+    method_is_head, parse_head, Head, HeaderView, Version, MAX_HEADERS,
+};
 use super::response::{serialize, ConnHeader, HttpResponse};
 
 /// One HTTP request, as handed to the consumer's handler.
@@ -319,11 +321,9 @@ where
         // The framer completed on these exact bytes (or on the stash it
         // parsed once already); a divergence here is a codec bug, answered
         // as such.
-        Err(_) | Ok(None) => Dispatched::Done(farewell(
-            500,
-            head_bytes.starts_with(b"HEAD "),
-            dates,
-        )),
+        Err(_) | Ok(None) => {
+            Dispatched::Done(farewell(500, method_is_head(head_bytes), dates))
+        }
         Ok(Some(h)) => match handler(
             HttpRequest {
                 method: h.method,
@@ -362,9 +362,7 @@ fn respond_parked(
     match parse_head(head_bytes, &mut headers) {
         // These bytes parsed when the request was first dispatched; a
         // divergence on the same bytes is a codec bug.
-        Err(_) | Ok(None) => {
-            farewell(500, head_bytes.starts_with(b"HEAD "), dates)
-        }
+        Err(_) | Ok(None) => farewell(500, method_is_head(head_bytes), dates),
         Ok(Some(h)) => respond(&h, resp, dates),
     }
 }
@@ -458,15 +456,11 @@ where
                             );
                             settle(conn, d)
                         }
-                        Err(()) => farewell(
-                            500,
-                            head_bytes.starts_with(b"HEAD "),
-                            dates,
-                        ),
+                        Err(()) => {
+                            farewell(500, method_is_head(head_bytes), dates)
+                        }
                     },
-                    Err(()) => {
-                        farewell(500, head_bytes.starts_with(b"HEAD "), dates)
-                    }
+                    Err(()) => farewell(500, method_is_head(head_bytes), dates),
                 };
             }
             match chunked::decode(&body) {
@@ -487,16 +481,14 @@ where
                     );
                     settle(conn, d)
                 }
-                Err(()) => {
-                    farewell(500, head_bytes.starts_with(b"HEAD "), dates)
-                }
+                Err(()) => farewell(500, method_is_head(head_bytes), dates),
             }
         }
         // Mid-scan delivery cannot happen (the framer only answers `More`
         // in this phase); total for the same reason as Fail above.
         Phase::ChunkedBody { stash, .. } => farewell(
             500,
-            stash.as_deref().unwrap_or(header).starts_with(b"HEAD "),
+            method_is_head(stash.as_deref().unwrap_or(header)),
             dates,
         ),
         // The normal path: head + body in one message.

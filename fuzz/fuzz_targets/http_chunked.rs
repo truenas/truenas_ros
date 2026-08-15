@@ -44,6 +44,17 @@ fuzz_target!(|data: &[u8]| {
                     "forbidden trailer {:?} surfaced",
                     t.name
                 );
+                // No control byte in a surfaced value (RFC 9110 §5.5): a
+                // bare LF/CR would carry a forbidden field line past the
+                // name-only screen above.
+                assert!(
+                    !t.value
+                        .iter()
+                        .any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f),
+                    "trailer {:?} value carries a control byte: {:?}",
+                    t.name,
+                    t.value
+                );
             }
         }
         // Incomplete: the decoder must agree (it requires the message to

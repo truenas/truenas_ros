@@ -171,6 +171,20 @@ pub(crate) fn parse_head<'a, 'buf>(
     }))
 }
 
+/// Whether raw head bytes name the `HEAD` method. `httparse` skips empty
+/// lines before the request line (RFC 9112 §2.2 robustness), so this must
+/// skip them too: judging the method from byte 0 would call `\r\nHEAD ...`
+/// a non-HEAD, and its farewell would carry a body the client reads as the
+/// next response's head. Usable on heads no facts were parsed from (the
+/// malformed / missing-Host / bad-version failures), where the parsed
+/// method does not exist.
+pub(crate) fn method_is_head(mut head: &[u8]) -> bool {
+    while let [b'\r', b'\n', rest @ ..] | [b'\n', rest @ ..] = head {
+        head = rest;
+    }
+    head.starts_with(b"HEAD ")
+}
+
 /// Tokenize a (possibly incomplete) request head into just the
 /// [`FrameFacts`] the framer consumes — same rules as [`parse_head`], no
 /// header-index allocation.
@@ -370,6 +384,42 @@ fn body_from<'h>(
         return Ok(BodyKind::Known(0));
     };
     parse_content_length(value).map(BodyKind::Known).ok_or(400)
+}
+
+/// RFC 9110 `token` bytes — the field-name grammar. `httparse` enforces it
+/// on request header names; the codec applies the same set to trailer names
+/// off the wire and to handler-emitted response header names, so the two
+/// sides cannot disagree about which names are valid.
+pub(crate) fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Whether a field value carries a byte a field line may not. RFC 9110 §5.5
+/// admits only field-vchar (VCHAR `0x21..=0x7E` / obs-text `0x80..=0xFF`),
+/// SP, and HTAB; every other byte is rejected — the CR/LF/NUL that split a
+/// field line, and the rest of the C0 controls and DEL. Applied to
+/// handler-emitted response values (which S3 echoes verbatim from
+/// `x-amz-meta-*`) and to trailer values off the wire; mirrors httparse's
+/// request-side header-value map.
+pub(crate) fn has_field_break(value: &[u8]) -> bool {
+    value.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f)
 }
 
 /// Strict `Content-Length`: ASCII digits only, no sign, no whitespace beyond
