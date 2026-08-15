@@ -113,6 +113,31 @@ impl std::fmt::Debug for Responder {
     }
 }
 
+#[cfg(test)]
+impl Responder {
+    /// A live responder backed by a throwaway channel and wake — for unit
+    /// tests that drive protocol glue (the http `step`) without a reactor.
+    /// The receiver is dropped, so outcomes sent through handles minted
+    /// from this responder vanish silently — the injection channel's
+    /// behavior is the net layer's own tests' business, not the glue's.
+    pub(crate) fn test_responder() -> Responder {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let (tx, _rx) = mpsc::channel();
+        let shared = Arc::new(LoopShared {
+            stop: AtomicBool::new(false),
+            graceful: AtomicBool::new(false),
+            grace_ms: AtomicU64::new(0),
+            wake: crate::uring::wake::WakeHandle::new().expect("eventfd"),
+        });
+        let token = Token {
+            slot: 0,
+            generation: 1,
+            req_id: 0,
+        };
+        Responder { token, tx, shared }
+    }
+}
+
 /// An owned, `Send` handle that delivers a deferred reply from any thread.
 ///
 /// Obtained from [`Responder::defer`]. Call [`Deferred::reply`] exactly once

@@ -8,9 +8,13 @@
 //! reactor.
 
 use std::borrow::Cow;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::net::server::{Body, Incoming, Protocol, Request, Response};
+use crate::net::server::{
+    Body, DeferPermit, Deferred, Incoming, Protocol, Request, Responder,
+    Response,
+};
 use crate::net::ClientAddr;
 
 use super::chunked;
@@ -60,6 +64,44 @@ pub struct HttpRequest<'a> {
     pub trailers: &'a [HeaderView<'a>],
     /// The peer's identity.
     pub peer: &'a ClientAddr,
+    /// The reply ticket, consumed by [`HttpRequest::defer`].
+    responder: Responder,
+}
+
+impl HttpRequest<'_> {
+    /// Park this request for deferred completion: retain the head verbatim,
+    /// the body (an owned move when the reactor placed it), and the
+    /// trailers, and detach the `Send` completion handle. Move the
+    /// [`HttpDeferred`] into your worker and return the permit as
+    /// [`HttpVerdict::Defer`]. Only a [`protocol_deferrable`] handler has a
+    /// verdict to return it through.
+    pub fn defer(self) -> (HttpDeferred, HttpDeferPermit) {
+        let HttpRequest {
+            mut body,
+            raw_head,
+            trailers,
+            responder,
+            ..
+        } = self;
+        let (deferred, permit) = responder.defer();
+        let answer = Arc::new(Mutex::new(None));
+        let req = Box::new(ParkedRequest {
+            head: raw_head.to_vec(),
+            body: body.take(),
+            trailers: trailers
+                .iter()
+                .map(|h| (Box::from(h.name), h.value.to_vec()))
+                .collect(),
+            answer: Arc::clone(&answer),
+        });
+        (
+            HttpDeferred {
+                answer,
+                inner: deferred,
+            },
+            HttpDeferPermit { permit, req },
+        )
+    }
 }
 
 impl std::fmt::Debug for HttpRequest<'_> {
@@ -74,6 +116,116 @@ impl std::fmt::Debug for HttpRequest<'_> {
             .finish_non_exhaustive()
     }
 }
+
+/// A request retained across a park: everything a redelivery needs to
+/// re-present the identical request view, plus the answer cell a worker's
+/// [`HttpDeferred::reply`] fills. Fully owned — the connection buffer it was
+/// parsed from is recycled while the request is parked.
+pub(crate) struct ParkedRequest {
+    /// The head block verbatim (`raw_head`), re-parsed at completion so no
+    /// negotiated fact is copied aside where it could drift.
+    head: Vec<u8>,
+    /// The body, taken owned at [`HttpRequest::defer`] (zero-copy when the
+    /// reactor placed it).
+    body: Vec<u8>,
+    /// Owned trailer fields.
+    trailers: Vec<(Box<str>, Vec<u8>)>,
+    /// `Some` once a worker chose [`HttpDeferred::reply`]; the redelivery
+    /// serializes it instead of re-running the handler.
+    answer: Arc<Mutex<Option<HttpResponse>>>,
+}
+
+impl std::fmt::Debug for ParkedRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParkedRequest")
+            .field("head_len", &self.head.len())
+            .field("body_len", &self.body.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A deferrable handler's decision for one request.
+// The verdict is built and consumed within one dispatch — it never rests
+// anywhere — so boxing the response to level the variant sizes would buy
+// nothing but a per-response allocation on the hot path.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum HttpVerdict {
+    /// Answer now — exactly what a [`protocol`] handler returns.
+    Respond(HttpResponse),
+    /// The request is parked; the detached [`HttpDeferred`] completes it.
+    Defer(HttpDeferPermit),
+}
+
+impl From<HttpResponse> for HttpVerdict {
+    fn from(resp: HttpResponse) -> Self {
+        HttpVerdict::Respond(resp)
+    }
+}
+
+/// Proof that [`HttpRequest::defer`] was called for this request, carrying
+/// the retained request. Returning it as [`HttpVerdict::Defer`] files the
+/// request into the connection's parked phase; the inner permit's token is
+/// verified at delivery exactly as for a raw
+/// [`Response::Defer`](crate::net::server::Response::Defer), so a permit
+/// stashed from another request closes the connection instead of parking
+/// one nothing could resolve.
+#[derive(Debug)]
+#[must_use = "return HttpVerdict::Defer(permit) from the handler"]
+pub struct HttpDeferPermit {
+    permit: DeferPermit,
+    req: Box<ParkedRequest>,
+}
+
+/// An owned, `Send` completion handle for a parked HTTP request. Exactly one
+/// of the three methods consumes it; dropping it unresolved closes the
+/// connection (the inner net handle's drop), so a lost or panicked worker
+/// cannot leak a parked slot.
+#[must_use = "dropping an HttpDeferred unresolved closes the connection"]
+pub struct HttpDeferred {
+    answer: Arc<Mutex<Option<HttpResponse>>>,
+    inner: Deferred,
+}
+
+impl HttpDeferred {
+    /// Re-dispatch the retained request through the handler on the server
+    /// thread: the second invocation sees the identical request view — for
+    /// a worker that warmed the state the first pass was missing. The rerun
+    /// may respond, defer again, or close.
+    pub fn redrive(self) {
+        self.inner.redeliver();
+    }
+
+    /// Complete the request with `resp`, built on the worker. Serialization
+    /// still happens on the server thread against the request's own
+    /// negotiated head facts — HEAD body elision, keep-alive vs close, the
+    /// smuggling forced-close, the `Date` cache — so no response policy is
+    /// duplicated off-thread.
+    pub fn reply(self, resp: HttpResponse) {
+        // The cell write happens-before the redeliver's channel send, so
+        // the completion pass observes it.
+        *self.answer.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(resp);
+        self.inner.redeliver();
+    }
+
+    /// Close the connection without a response.
+    pub fn close(self) {
+        self.inner.close();
+    }
+}
+
+impl std::fmt::Debug for HttpDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpDeferred").finish_non_exhaustive()
+    }
+}
+
+// Moved into worker threads.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<HttpDeferred>();
+};
 
 /// Wall-clock seconds for the `Date` header; the one impurity, kept at the
 /// edge so everything under it stays deterministic.
@@ -131,20 +283,35 @@ fn farewell(status: u16, head_only: bool, dates: &mut DateCache) -> Response {
     ))
 }
 
+/// What one handler invocation produced: a reactor verdict, or a park to
+/// file into the connection's phase.
+enum Dispatched {
+    Done(Response),
+    Park {
+        permit: DeferPermit,
+        req: Box<ParkedRequest>,
+    },
+}
+
 /// Parse a delivered head and run the consumer's handler against it — the
-/// shared tail of the normal path and the 100-continue dance, so the two
-/// hand handlers an identical request view by construction.
+/// shared tail of the normal path, the 100-continue dance, and a parked
+/// request's redelivery, so all three hand handlers an identical request
+/// view by construction.
+// The parts are the request itself plus the ticket, the connection state,
+// and the serialization context; bundling them would be artificial here.
+#[allow(clippy::too_many_arguments)]
 fn dispatch<U, H>(
     head_bytes: &[u8],
     body: Body<'_>,
     trailers: &[HeaderView<'_>],
     peer: &ClientAddr,
+    responder: Responder,
     state: &mut U,
     dates: &mut DateCache,
     handler: &mut H,
-) -> Response
+) -> Dispatched
 where
-    H: FnMut(HttpRequest<'_>, &mut U) -> HttpResponse,
+    H: FnMut(HttpRequest<'_>, &mut U) -> HttpVerdict,
 {
     let mut headers: [HeaderView<'_>; MAX_HEADERS] =
         [HeaderView::EMPTY; MAX_HEADERS];
@@ -152,42 +319,83 @@ where
         // The framer completed on these exact bytes (or on the stash it
         // parsed once already); a divergence here is a codec bug, answered
         // as such.
+        Err(_) | Ok(None) => Dispatched::Done(farewell(
+            500,
+            head_bytes.starts_with(b"HEAD "),
+            dates,
+        )),
+        Ok(Some(h)) => match handler(
+            HttpRequest {
+                method: h.method,
+                target: h.target,
+                version: h.version,
+                headers: h.headers,
+                body,
+                raw_head: head_bytes,
+                trailers,
+                peer,
+                responder,
+            },
+            state,
+        ) {
+            HttpVerdict::Respond(resp) => {
+                Dispatched::Done(respond(&h, resp, dates))
+            }
+            HttpVerdict::Defer(p) => Dispatched::Park {
+                permit: p.permit,
+                req: p.req,
+            },
+        },
+    }
+}
+
+/// Serialize a worker-built reply against the parked request's own head —
+/// the same [`respond`] policy the inline path applies, so keep-alive, HEAD
+/// elision, and the smuggling forced-close cannot fork between the two.
+fn respond_parked(
+    head_bytes: &[u8],
+    resp: HttpResponse,
+    dates: &mut DateCache,
+) -> Response {
+    let mut headers: [HeaderView<'_>; MAX_HEADERS] =
+        [HeaderView::EMPTY; MAX_HEADERS];
+    match parse_head(head_bytes, &mut headers) {
+        // These bytes parsed when the request was first dispatched; a
+        // divergence on the same bytes is a codec bug.
         Err(_) | Ok(None) => {
             farewell(500, head_bytes.starts_with(b"HEAD "), dates)
         }
-        Ok(Some(h)) => {
-            let resp = handler(
-                HttpRequest {
-                    method: h.method,
-                    target: h.target,
-                    version: h.version,
-                    headers: h.headers,
-                    body,
-                    raw_head: head_bytes,
-                    trailers,
-                    peer,
-                },
-                state,
-            );
-            respond(&h, resp, dates)
-        }
+        Ok(Some(h)) => respond(&h, resp, dates),
     }
 }
 
 /// One delivered message against the connection's phase — the entire `body`
-/// handler as a plain function (the closure in [`protocol`] is a one-line
-/// adapter), so tests exercise the real dance/keep-alive/farewell code.
+/// handler as a plain function (the closure in [`protocol_deferrable`] is a
+/// one-line adapter), so tests exercise the real
+/// dance/keep-alive/park/farewell code.
 fn step<U, H>(
     header: &[u8],
     mut body: Body<'_>,
     peer: &ClientAddr,
+    responder: Responder,
     conn: &mut HttpConn<U>,
     dates: &mut DateCache,
     handler: &mut H,
 ) -> Response
 where
-    H: FnMut(HttpRequest<'_>, &mut U) -> HttpResponse,
+    H: FnMut(HttpRequest<'_>, &mut U) -> HttpVerdict,
 {
+    /// File a park into the phase, or pass the verdict through — the shared
+    /// tail of every dispatching arm.
+    fn settle<U>(conn: &mut HttpConn<U>, d: Dispatched) -> Response {
+        match d {
+            Dispatched::Done(resp) => resp,
+            Dispatched::Park { permit, req } => {
+                conn.phase = Phase::Parked { req };
+                Response::Defer(permit)
+            }
+        }
+    }
     match std::mem::replace(&mut conn.phase, Phase::Head) {
         // The framer's farewell: everything buffered was delivered as a
         // degenerate message; answer and flush-close. The HEAD flag rides
@@ -208,7 +416,17 @@ where
         // chunked dance never lands here — the framer morphs ExpectBody
         // into the scan phase before declaring anything.)
         Phase::ExpectBody { head: stash, .. } => {
-            dispatch(&stash, body, &[], peer, &mut conn.state, dates, handler)
+            let d = dispatch(
+                &stash,
+                body,
+                &[],
+                peer,
+                responder,
+                &mut conn.state,
+                dates,
+                handler,
+            );
+            settle(conn, d)
         }
         // A complete chunked message: de-chunk the wire extent, then
         // dispatch the entity against the in-buffer head or the dance's
@@ -227,15 +445,19 @@ where
             if let Some(mut wire) = body.try_take_owned() {
                 return match chunked::compact(&mut wire) {
                     Ok(c) => match c.trailers() {
-                        Ok(trailers) => dispatch(
-                            head_bytes,
-                            Body::owned_range(wire, c.start, c.len),
-                            &trailers,
-                            peer,
-                            &mut conn.state,
-                            dates,
-                            handler,
-                        ),
+                        Ok(trailers) => {
+                            let d = dispatch(
+                                head_bytes,
+                                Body::owned_range(wire, c.start, c.len),
+                                &trailers,
+                                peer,
+                                responder,
+                                &mut conn.state,
+                                dates,
+                                handler,
+                            );
+                            settle(conn, d)
+                        }
                         Err(()) => farewell(
                             500,
                             head_bytes.starts_with(b"HEAD "),
@@ -253,15 +475,17 @@ where
                         Cow::Borrowed(span) => Body::inline(span),
                         Cow::Owned(v) => Body::placed(v),
                     };
-                    dispatch(
+                    let d = dispatch(
                         head_bytes,
                         entity,
                         &trailers,
                         peer,
+                        responder,
                         &mut conn.state,
                         dates,
                         handler,
-                    )
+                    );
+                    settle(conn, d)
                 }
                 Err(()) => {
                     farewell(500, head_bytes.starts_with(b"HEAD "), dates)
@@ -277,23 +501,82 @@ where
         ),
         // The normal path: head + body in one message.
         Phase::Head => {
-            dispatch(header, body, &[], peer, &mut conn.state, dates, handler)
+            let d = dispatch(
+                header,
+                body,
+                &[],
+                peer,
+                responder,
+                &mut conn.state,
+                dates,
+                handler,
+            );
+            settle(conn, d)
+        }
+        // A parked request's completion, arriving as a redelivery (the frame
+        // is empty; everything real was retained at the park). A worker
+        // `reply` left the response in the cell — serialize it against the
+        // retained head. Otherwise this is a `redrive`: run the handler
+        // again over the identical request view; it may respond, park
+        // again, or close.
+        Phase::Parked { req } => {
+            let ParkedRequest {
+                head,
+                body: parked,
+                trailers,
+                answer,
+            } = *req;
+            let chosen =
+                answer.lock().unwrap_or_else(PoisonError::into_inner).take();
+            match chosen {
+                Some(resp) => respond_parked(&head, resp, dates),
+                None => {
+                    let views: Vec<HeaderView<'_>> = trailers
+                        .iter()
+                        .map(|(n, v)| HeaderView { name: n, value: v })
+                        .collect();
+                    let d = dispatch(
+                        &head,
+                        Body::placed(parked),
+                        &views,
+                        peer,
+                        responder,
+                        &mut conn.state,
+                        dates,
+                        handler,
+                    );
+                    settle(conn, d)
+                }
+            }
         }
     }
 }
 
-/// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint.
+/// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint whose handler
+/// may **park** a request for deferred completion.
 ///
 /// `accept` is the standard admission hook returning the consumer's
-/// per-connection state `U`; `handler` is invoked once per request with the
-/// parsed [`HttpRequest`] view and `&mut U`, and returns the
-/// [`HttpResponse`] to serialize. Handlers run on the server thread —
-/// compute inline like any reactor `body` handler. (`Response::Defer`
-/// offload for HTTP handlers is a planned follow-up on this seam.)
+/// per-connection state `U`; `handler` runs once per delivery with the
+/// parsed [`HttpRequest`] view and `&mut U`, and returns an
+/// [`HttpVerdict`]: [`Respond`](HttpVerdict::Respond) answers inline
+/// (exactly a [`protocol`] handler), or — after [`HttpRequest::defer`] —
+/// [`Defer`](HttpVerdict::Defer) parks the request while the reactor keeps
+/// polling. The worker then completes it through the [`HttpDeferred`]:
+/// [`redrive`](HttpDeferred::redrive) re-runs the handler on the server
+/// thread once state is warm, [`reply`](HttpDeferred::reply) delivers a
+/// worker-built response (serialized on the server thread), and
+/// [`close`](HttpDeferred::close) hangs up. Handlers still run on the
+/// server thread and must not block.
+///
+/// Intended for the default `max_in_flight_requests == 1`: while a request
+/// is parked nothing later is read or delivered, so reply order is request
+/// order. Above that cap the framer still holds pipelined requests back
+/// during a park, but the armed read-ahead then carries `request_timeout`
+/// while parked — run deferrable endpoints at the default cap.
 // Same shape and rationale as `length_prefixed`: the three opaque closures
 // ARE the signature; boxing them would put dyn dispatch on the hot path.
 #[allow(clippy::type_complexity)]
-pub fn protocol<U, A, H>(
+pub fn protocol_deferrable<U, A, H>(
     cfg: HttpConfig,
     mut accept: A,
     mut handler: H,
@@ -304,7 +587,7 @@ pub fn protocol<U, A, H>(
 >
 where
     A: FnMut(Incoming<'_>) -> Option<U>,
-    H: FnMut(HttpRequest<'_>, &mut U) -> HttpResponse,
+    H: FnMut(HttpRequest<'_>, &mut U) -> HttpVerdict,
 {
     // One date cache per protocol instance — instances are per reactor and
     // handlers run on the reactor thread, so the `Date` value renders once
@@ -321,11 +604,47 @@ where
                 body,
                 peer,
                 state: conn,
+                responder,
                 ..
             } = req;
-            step(header, body, peer, conn, &mut dates, &mut handler)
+            step(
+                header,
+                body,
+                peer,
+                responder,
+                conn,
+                &mut dates,
+                &mut handler,
+            )
         },
     }
+}
+
+/// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint.
+///
+/// `accept` is the standard admission hook returning the consumer's
+/// per-connection state `U`; `handler` is invoked once per request with the
+/// parsed [`HttpRequest`] view and `&mut U`, and returns the
+/// [`HttpResponse`] to serialize. Handlers run on the server thread —
+/// compute inline like any reactor `body` handler; a handler that must
+/// wait on other threads uses [`protocol_deferrable`] instead.
+#[allow(clippy::type_complexity)]
+pub fn protocol<U, A, H>(
+    cfg: HttpConfig,
+    accept: A,
+    mut handler: H,
+) -> Protocol<
+    impl FnMut(Incoming<'_>) -> Option<HttpConn<U>>,
+    impl FnMut(&[u8], &mut HttpConn<U>) -> crate::net::Framing,
+    impl FnMut(Request<'_, HttpConn<U>>) -> Response,
+>
+where
+    A: FnMut(Incoming<'_>) -> Option<U>,
+    H: FnMut(HttpRequest<'_>, &mut U) -> HttpResponse,
+{
+    protocol_deferrable(cfg, accept, move |req: HttpRequest<'_>, state| {
+        HttpVerdict::Respond(handler(req, state))
+    })
 }
 
 #[cfg(test)]
@@ -333,9 +652,10 @@ mod tests {
     use super::*;
     use crate::net::Framing;
 
-    /// [`step`] with a throwaway date cache — the tests assert nothing
-    /// about `Date` freshness, and the cache's own behavior is pinned in
-    /// `date.rs`.
+    /// [`step`] with a throwaway date cache and responder — the tests assert
+    /// nothing about `Date` freshness (pinned in `date.rs`) or the injection
+    /// channel (pinned in the net-layer tests). Plain-response handlers ride
+    /// the same `Respond` wrapper [`protocol`] applies.
     fn drive<U, H>(
         header: &[u8],
         body: Body<'_>,
@@ -346,7 +666,31 @@ mod tests {
     where
         H: FnMut(HttpRequest<'_>, &mut U) -> HttpResponse,
     {
-        step(header, body, peer, conn, &mut DateCache::default(), handler)
+        drive_verdict(header, body, peer, conn, &mut |req, state| {
+            HttpVerdict::Respond(handler(req, state))
+        })
+    }
+
+    /// [`drive`] for verdict handlers — the park tests' entry.
+    fn drive_verdict<U, H>(
+        header: &[u8],
+        body: Body<'_>,
+        peer: &ClientAddr,
+        conn: &mut HttpConn<U>,
+        handler: &mut H,
+    ) -> Response
+    where
+        H: FnMut(HttpRequest<'_>, &mut U) -> HttpVerdict,
+    {
+        step(
+            header,
+            body,
+            peer,
+            Responder::test_responder(),
+            conn,
+            &mut DateCache::default(),
+            handler,
+        )
     }
 
     fn peer() -> ClientAddr {
@@ -903,5 +1247,318 @@ mod tests {
             &mut handler,
         );
         assert!(matches!(resp, Response::Reply(_)));
+    }
+
+    // ---- parking ----
+
+    use std::cell::RefCell;
+
+    /// [`roundtrip`] for verdict handlers.
+    fn roundtrip_verdict<U>(
+        raw: &[u8],
+        conn: &mut HttpConn<U>,
+        handler: &mut impl FnMut(HttpRequest<'_>, &mut U) -> HttpVerdict,
+    ) -> Response {
+        let verdict = frame(raw, conn, &cfg());
+        let Framing::Complete {
+            header_len,
+            body_len,
+        } = verdict
+        else {
+            panic!("expected a complete frame, got {verdict:?}");
+        };
+        assert_eq!(header_len + body_len, raw.len());
+        let p = peer();
+        drive_verdict(
+            &raw[..header_len],
+            Body::inline(&raw[header_len..]),
+            &p,
+            conn,
+            handler,
+        )
+    }
+
+    /// A parked request's completion: the redelivery is an empty frame
+    /// against the parked phase.
+    fn complete_parked<U>(
+        conn: &mut HttpConn<U>,
+        handler: &mut impl FnMut(HttpRequest<'_>, &mut U) -> HttpVerdict,
+    ) -> Response {
+        let p = peer();
+        drive_verdict(b"", Body::inline(b""), &p, conn, handler)
+    }
+
+    /// A handler for completions that must not re-run the handler (a worker
+    /// `reply` was left in the cell).
+    fn unreached_verdict<U>(_: HttpRequest<'_>, _: &mut U) -> HttpVerdict {
+        panic!("handler must not run when a worker reply is present")
+    }
+
+    #[test]
+    fn park_and_redrive_identical_view() {
+        let head = b"PUT /k HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\n";
+        let mut raw = head.to_vec();
+        raw.extend_from_slice(b"hello");
+        let mut conn = HttpConn::new(0u32);
+        let parked: RefCell<Option<HttpDeferred>> = RefCell::new(None);
+        let mut handler = |req: HttpRequest<'_>, hits: &mut u32| {
+            *hits += 1;
+            match *hits {
+                1 => {
+                    assert_eq!(req.method, "PUT");
+                    assert_eq!(&req.body[..], b"hello");
+                    let (deferred, permit) = req.defer();
+                    parked.borrow_mut().replace(deferred);
+                    HttpVerdict::Defer(permit)
+                }
+                _ => {
+                    // The redelivered view is the first one, byte for byte.
+                    assert_eq!(req.method, "PUT");
+                    assert_eq!(req.target, "/k");
+                    assert_eq!(req.raw_head, &head[..]);
+                    assert_eq!(&req.body[..], b"hello");
+                    assert!(req.trailers.is_empty());
+                    HttpVerdict::Respond(HttpResponse::new(200).body("done"))
+                }
+            }
+        };
+        let resp = roundtrip_verdict(&raw, &mut conn, &mut handler);
+        assert!(matches!(resp, Response::Defer(_)), "got {resp:?}");
+        assert!(matches!(conn.phase, Phase::Parked { .. }));
+        // The worker warms its state and asks for the rerun.
+        parked.borrow_mut().take().expect("parked").redrive();
+        let done = complete_parked(&mut conn, &mut handler);
+        assert!(matches!(done, Response::Reply(_)), "got {done:?}");
+        assert!(text(&done).starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text(&done).ends_with("\r\n\r\ndone"));
+        assert_eq!(conn.state, 2, "one park, one rerun");
+        assert!(matches!(conn.phase, Phase::Head));
+    }
+
+    /// Park a HEAD; the worker replies with a declared length. The
+    /// completion must apply the HEAD contract — length on the wire, no
+    /// body bytes — proving the reply serializes against the parked head.
+    #[test]
+    fn worker_reply_keeps_the_head_contract() {
+        let head = b"HEAD /x HTTP/1.1\r\nHost: h\r\n\r\n";
+        let mut conn = HttpConn::new(());
+        let parked: RefCell<Option<HttpDeferred>> = RefCell::new(None);
+        let mut park_once = |req: HttpRequest<'_>, _: &mut ()| {
+            let (deferred, permit) = req.defer();
+            parked.borrow_mut().replace(deferred);
+            HttpVerdict::Defer(permit)
+        };
+        let resp = roundtrip_verdict(head, &mut conn, &mut park_once);
+        assert!(matches!(resp, Response::Defer(_)));
+        parked
+            .borrow_mut()
+            .take()
+            .expect("parked")
+            .reply(HttpResponse::new(200).head_content_length(4096));
+        let done = complete_parked(&mut conn, &mut unreached_verdict);
+        assert!(matches!(done, Response::Reply(_)), "got {done:?}");
+        let s = text(&done);
+        assert!(s.contains("Content-Length: 4096\r\n"), "{s}");
+        assert!(s.ends_with("\r\n\r\n"), "{s}");
+    }
+
+    /// A parked CL+TE request (the smuggling differential): the worker's
+    /// reply must still force the connection closed, exactly as the inline
+    /// path would.
+    #[test]
+    fn worker_reply_keeps_the_smuggling_close() {
+        let head = b"PUT /k HTTP/1.1\r\nHost: h\r\n\
+                     Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut raw = head.to_vec();
+        raw.extend_from_slice(b"5\r\nhello\r\n0\r\n\r\n");
+        let mut conn = HttpConn::new(());
+        let parked: RefCell<Option<HttpDeferred>> = RefCell::new(None);
+        let mut park_once = |req: HttpRequest<'_>, _: &mut ()| {
+            assert_eq!(&req.body[..], b"hello", "TE framing still wins");
+            let (deferred, permit) = req.defer();
+            parked.borrow_mut().replace(deferred);
+            HttpVerdict::Defer(permit)
+        };
+        let resp = roundtrip_verdict(&raw, &mut conn, &mut park_once);
+        assert!(matches!(resp, Response::Defer(_)));
+        parked
+            .borrow_mut()
+            .take()
+            .expect("parked")
+            .reply(HttpResponse::new(200));
+        let done = complete_parked(&mut conn, &mut unreached_verdict);
+        assert!(
+            matches!(done, Response::ReplyClose(_)),
+            "CL plus TE must farewell after a park too, got {done:?}"
+        );
+        assert!(text(&done).contains("Connection: close\r\n"));
+    }
+
+    /// HTTP/1.0 negotiated keep-alive survives a park: the worker's reply
+    /// still echoes `Connection: keep-alive` and stays open.
+    #[test]
+    fn worker_reply_keeps_http10_keepalive() {
+        let head = b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n";
+        let mut conn = HttpConn::new(());
+        let parked: RefCell<Option<HttpDeferred>> = RefCell::new(None);
+        let mut park_once = |req: HttpRequest<'_>, _: &mut ()| {
+            let (deferred, permit) = req.defer();
+            parked.borrow_mut().replace(deferred);
+            HttpVerdict::Defer(permit)
+        };
+        let resp = roundtrip_verdict(head, &mut conn, &mut park_once);
+        assert!(matches!(resp, Response::Defer(_)));
+        parked
+            .borrow_mut()
+            .take()
+            .expect("parked")
+            .reply(HttpResponse::new(200));
+        let done = complete_parked(&mut conn, &mut unreached_verdict);
+        assert!(matches!(done, Response::Reply(_)));
+        assert!(text(&done).contains("Connection: keep-alive\r\n"));
+    }
+
+    /// A park through the 100-continue dance: the redelivered view carries
+    /// the stashed head and the dance's body.
+    #[test]
+    fn park_through_the_dance() {
+        let head = b"PUT /k HTTP/1.1\r\nHost: h\r\n\
+                     Expect: 100-continue\r\nContent-Length: 3\r\n\r\n";
+        let mut conn = HttpConn::new(0u32);
+        let p = peer();
+        let parked: RefCell<Option<HttpDeferred>> = RefCell::new(None);
+        let mut handler = |req: HttpRequest<'_>, hits: &mut u32| {
+            *hits += 1;
+            assert_eq!(req.raw_head, &head[..]);
+            assert_eq!(&req.body[..], b"abc");
+            match *hits {
+                1 => {
+                    let (deferred, permit) = req.defer();
+                    parked.borrow_mut().replace(deferred);
+                    HttpVerdict::Defer(permit)
+                }
+                _ => HttpVerdict::Respond(HttpResponse::new(200)),
+            }
+        };
+        // Message 1: the head alone → the interim; the handler never runs.
+        assert_eq!(
+            frame(head, &mut conn, &cfg()),
+            Framing::Complete {
+                header_len: head.len(),
+                body_len: 0
+            }
+        );
+        let interim =
+            drive_verdict(head, Body::inline(b""), &p, &mut conn, &mut handler);
+        assert!(matches!(&interim, Response::Reply(b)
+            if b.as_slice() == b"HTTP/1.1 100 Continue\r\n\r\n"));
+        // Message 2: the body → the park.
+        assert_eq!(
+            frame(b"abc", &mut conn, &cfg()),
+            Framing::Complete {
+                header_len: 0,
+                body_len: 3
+            }
+        );
+        let resp = drive_verdict(
+            b"",
+            Body::inline(b"abc"),
+            &p,
+            &mut conn,
+            &mut handler,
+        );
+        assert!(matches!(resp, Response::Defer(_)));
+        parked.borrow_mut().take().expect("parked").redrive();
+        let done = complete_parked(&mut conn, &mut handler);
+        assert!(matches!(done, Response::Reply(_)));
+        assert!(text(&done).starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(conn.state, 2);
+    }
+
+    /// Chunked trailers survive a park: the redelivered view re-presents
+    /// them from the retained copies.
+    #[test]
+    fn park_preserves_chunked_trailers() {
+        let head =
+            b"PUT /t HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut raw = head.to_vec();
+        raw.extend_from_slice(
+            b"3\r\nabc\r\n0\r\nx-amz-checksum-crc32: lZe8jQ==\r\n\r\n",
+        );
+        let mut conn = HttpConn::new(0u32);
+        let parked: RefCell<Option<HttpDeferred>> = RefCell::new(None);
+        let mut handler = |req: HttpRequest<'_>, hits: &mut u32| {
+            *hits += 1;
+            assert_eq!(&req.body[..], b"abc");
+            assert_eq!(req.trailers.len(), 1);
+            assert_eq!(req.trailers[0].name, "x-amz-checksum-crc32");
+            assert_eq!(req.trailers[0].value, b"lZe8jQ==");
+            match *hits {
+                1 => {
+                    let (deferred, permit) = req.defer();
+                    parked.borrow_mut().replace(deferred);
+                    HttpVerdict::Defer(permit)
+                }
+                _ => HttpVerdict::Respond(HttpResponse::new(200)),
+            }
+        };
+        let resp = roundtrip_verdict(&raw, &mut conn, &mut handler);
+        assert!(matches!(resp, Response::Defer(_)));
+        parked.borrow_mut().take().expect("parked").redrive();
+        let done = complete_parked(&mut conn, &mut handler);
+        assert!(matches!(done, Response::Reply(_)));
+        assert_eq!(conn.state, 2);
+    }
+
+    /// A redriven handler may park again: the second park files a fresh
+    /// retained request and completes like the first.
+    #[test]
+    fn a_redrive_may_park_again() {
+        let head = b"GET /slow HTTP/1.1\r\nHost: h\r\n\r\n";
+        let mut conn = HttpConn::new(0u32);
+        let parked: RefCell<Option<HttpDeferred>> = RefCell::new(None);
+        let mut handler = |req: HttpRequest<'_>, hits: &mut u32| {
+            *hits += 1;
+            match *hits {
+                1 | 2 => {
+                    let (deferred, permit) = req.defer();
+                    parked.borrow_mut().replace(deferred);
+                    HttpVerdict::Defer(permit)
+                }
+                _ => panic!("the second park replied from the worker"),
+            }
+        };
+        let resp = roundtrip_verdict(head, &mut conn, &mut handler);
+        assert!(matches!(resp, Response::Defer(_)));
+        parked.borrow_mut().take().expect("first park").redrive();
+        let again = complete_parked(&mut conn, &mut handler);
+        assert!(matches!(again, Response::Defer(_)), "got {again:?}");
+        assert!(matches!(conn.phase, Phase::Parked { .. }));
+        parked
+            .borrow_mut()
+            .take()
+            .expect("second park")
+            .reply(HttpResponse::new(204));
+        let done = complete_parked(&mut conn, &mut unreached_verdict);
+        assert!(matches!(done, Response::Reply(_)));
+        assert!(text(&done).starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(conn.state, 2);
+    }
+
+    /// While a request is parked the framer holds pipelined bytes unframed,
+    /// so a later request cannot be answered around the parked one.
+    #[test]
+    fn parked_phase_holds_framing() {
+        let mut conn = HttpConn::new(());
+        conn.phase = Phase::Parked {
+            req: Box::new(ParkedRequest {
+                head: b"GET / HTTP/1.1\r\nHost: h\r\n\r\n".to_vec(),
+                body: Vec::new(),
+                trailers: Vec::new(),
+                answer: Arc::new(Mutex::new(None)),
+            }),
+        };
+        let next = b"GET /next HTTP/1.1\r\nHost: h\r\n\r\n";
+        assert!(matches!(frame(next, &mut conn, &cfg()), Framing::More));
     }
 }

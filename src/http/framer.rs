@@ -174,6 +174,17 @@ pub(crate) enum Phase {
         /// only body bytes, and body bytes are client-chosen.
         head_only: bool,
     },
+    /// A request is parked for deferred completion
+    /// ([`HttpRequest::defer`](super::protocol::HttpRequest::defer)): the
+    /// retained request rides here until the worker's outcome redelivers it.
+    /// The framer holds later pipelined bytes unframed for the park's
+    /// duration, so reply order stays request order even above the default
+    /// in-flight cap of one.
+    Parked {
+        /// The retained request plus the answer cell a worker's
+        /// [`reply`](super::protocol::HttpDeferred::reply) fills.
+        req: Box<super::protocol::ParkedRequest>,
+    },
 }
 
 /// Per-connection codec state wrapping the consumer's own state `U`.
@@ -235,6 +246,13 @@ pub(crate) fn frame<U>(
             header_len: buf.len(),
             body_len: 0,
         },
+        // A parked request owns the connection until its worker outcome
+        // redelivers it: hold pipelined bytes unframed. At the default
+        // in-flight cap of one the reactor never asks (delivery and reads
+        // are gated while a request is outstanding); above it, this arm is
+        // what keeps a later request from being answered around a parked
+        // earlier one.
+        Phase::Parked { .. } => Framing::More,
         // A declared-but-undelivered chunked message: same class of
         // scheduling surprise as Fail above (the glue's step runs between
         // verdicts and resets the phase). Degrade to a degenerate delivery;
