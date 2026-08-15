@@ -401,3 +401,170 @@ fn large_chunked_dance_takes_the_handoff_path() {
         return; // io_uring unavailable
     };
 }
+
+/// Bind a **deferrable** http server: `/warm` parks on a cold shared cache
+/// and a worker warms it then redrives; `/deadline` parks and the worker
+/// replies 503 directly; `/drop` parks and the worker drops the handle;
+/// `/hi` answers inline. `None` means io_uring is unavailable (a skip).
+fn with_parking_server<T: Send + 'static>(
+    client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
+) -> Option<T> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use truenas_ros::http::{protocol_deferrable, HttpVerdict};
+
+    let cache = Arc::new(AtomicBool::new(false));
+    let handler = move |req: HttpRequest<'_>, _: &mut ()| {
+        match (req.method, req.target) {
+            ("GET", "/hi") => {
+                HttpVerdict::Respond(HttpResponse::new(200).body("hello"))
+            }
+            ("GET", "/warm") => {
+                if cache.load(Ordering::Acquire) {
+                    HttpVerdict::Respond(HttpResponse::new(200).body("warm"))
+                } else {
+                    // Cold: park, warm the cache off-thread, redrive. The
+                    // second invocation takes the inline path above.
+                    let (deferred, permit) = req.defer();
+                    let cache = Arc::clone(&cache);
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(10));
+                        cache.store(true, Ordering::Release);
+                        deferred.redrive();
+                    });
+                    HttpVerdict::Defer(permit)
+                }
+            }
+            ("GET", "/deadline") => {
+                // The worker misses its deadline and answers 503 itself —
+                // built off-thread, serialized on the server thread.
+                let (deferred, permit) = req.defer();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(10));
+                    deferred.reply(
+                        HttpResponse::new(503)
+                            .header("retry-after", "1")
+                            .body("slow down\n"),
+                    );
+                });
+                HttpVerdict::Defer(permit)
+            }
+            ("GET", "/drop") => {
+                // A lost worker: the dropped handle must close the parked
+                // connection rather than leak its slot.
+                let (deferred, permit) = req.defer();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(10));
+                    drop(deferred);
+                });
+                HttpVerdict::Defer(permit)
+            }
+            _ => HttpVerdict::Respond(HttpResponse::new(404).body("no\n")),
+        }
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = protocol_deferrable(
+        HttpConfig::default(),
+        |_inc: Incoming<'_>| Some(()),
+        handler,
+    );
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return None,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let join = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        let r = client(v4);
+        stop.shutdown();
+        r
+    });
+    server.serve_forever().expect("serve_forever");
+    Some(join.join().expect("client thread").expect("client io"))
+}
+
+#[test]
+fn park_redrive_completes_in_one_round_trip() {
+    // The cold-miss pattern end to end: the first request parks while the
+    // worker warms the cache, then redrives — ONE write, ONE response, no
+    // error leg. The second request takes the warm inline path.
+    let Some(()) = with_parking_server(|v4| {
+        let mut s = connect_tcp(v4)?;
+        s.write_all(b"GET /warm HTTP/1.1\r\nHost: t\r\n\r\n")?;
+        let (status, _head, body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"warm");
+        s.write_all(b"GET /warm HTTP/1.1\r\nHost: t\r\n\r\n")?;
+        let (status, _head, body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"warm");
+        Ok(())
+    }) else {
+        return; // io_uring unavailable
+    };
+}
+
+#[test]
+fn worker_reply_answers_and_keeps_alive() {
+    // A worker-built 503 serializes on the server thread with the request's
+    // head facts, and the connection keeps serving afterward.
+    let Some(()) = with_parking_server(|v4| {
+        let mut s = connect_tcp(v4)?;
+        s.write_all(b"GET /deadline HTTP/1.1\r\nHost: t\r\n\r\n")?;
+        let (status, head, body) = read_response(&mut s)?;
+        assert_eq!(status, 503);
+        assert!(head.contains("retry-after: 1\r\n"), "{head}");
+        assert_eq!(body, b"slow down\n");
+        s.write_all(b"GET /hi HTTP/1.1\r\nHost: t\r\n\r\n")?;
+        let (status, _head, body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello");
+        Ok(())
+    }) else {
+        return; // io_uring unavailable
+    };
+}
+
+#[test]
+fn dropped_handle_closes_the_parked_connection() {
+    // No response bytes, just a close — the drop path cannot leak the slot
+    // and must not invent a reply.
+    let Some(()) = with_parking_server(|v4| {
+        let mut s = connect_tcp(v4)?;
+        s.write_all(b"GET /drop HTTP/1.1\r\nHost: t\r\n\r\n")?;
+        let mut buf = Vec::new();
+        match s.read_to_end(&mut buf) {
+            Ok(_) => assert!(buf.is_empty(), "expected no bytes, got {buf:?}"),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::ConnectionReset),
+        }
+        Ok(())
+    }) else {
+        return; // io_uring unavailable
+    };
+}
+
+#[test]
+fn pipelined_requests_answer_in_order_across_a_park() {
+    // Two pipelined requests where the FIRST parks: the parked one must
+    // answer first — the codec holds the second back for the park's
+    // duration, so a later request can never be answered around an earlier
+    // parked one.
+    let Some(()) = with_parking_server(|v4| {
+        let mut s = connect_tcp(v4)?;
+        s.write_all(
+            b"GET /warm HTTP/1.1\r\nHost: t\r\n\r\n\
+              GET /hi HTTP/1.1\r\nHost: t\r\n\r\n",
+        )?;
+        let (status, _head, body) = read_response(&mut s)?;
+        assert_eq!((status, body.as_slice()), (200, b"warm".as_ref()));
+        let (status, _head, body) = read_response(&mut s)?;
+        assert_eq!((status, body.as_slice()), (200, b"hello".as_ref()));
+        Ok(())
+    }) else {
+        return; // io_uring unavailable
+    };
+}
