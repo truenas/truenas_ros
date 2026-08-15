@@ -381,6 +381,11 @@ impl ConfigFile {
     #[cfg(feature = "secrets")]
     pub fn read_secret_path(&mut self, path: &Path) -> Result<()> {
         self.scrub = true;
+        // Read secrets verbatim. Interpolation would route a value through
+        // `before_get`, whose growing accumulator orphans partial-plaintext
+        // copies in freed heap the scrub-on-drop never reaches; the module
+        // doc already names raw the secrets configuration.
+        self.interp = Interp::None;
         let source = path.display().to_string();
         match stage_secret_image(path)? {
             None => parse::read(self, &source, ""),
@@ -1175,6 +1180,38 @@ mod tests {
         let mut empty = ConfigFile::raw();
         empty.read_secret_path(&empty_path).unwrap();
         assert!(empty.sections().is_empty());
+    }
+
+    /// `read_secret_path` reads verbatim even from a default (interpolating)
+    /// configuration: a secret value must not route through `before_get`,
+    /// whose growing accumulator orphans partial-plaintext copies in freed
+    /// heap the scrub-on-drop never reaches.
+    #[cfg(feature = "secrets")]
+    #[test]
+    fn read_secret_path_reads_verbatim_from_a_default_config() {
+        if !crate::secrets::SecretMem::available() {
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_SECRETMEM").is_none(),
+                "memfd_secret unavailable but REQUIRE_SECRETMEM is set"
+            );
+            return;
+        }
+        let dir = crate::tempdir().unwrap();
+        let path = dir.path().join("cred.ini");
+        // `%(user)s` reads back differently verbatim vs interpolated, so the
+        // value tells the two modes apart.
+        std::fs::write(
+            &path,
+            "[db]\r\nurl = postgres://%(user)s@h\r\nuser = svc\r\n",
+        )
+        .unwrap();
+        let mut cfg = ConfigFile::new();
+        cfg.read_secret_path(&path).unwrap();
+        assert_eq!(
+            cfg.get("db", "url").unwrap().as_deref(),
+            Some("postgres://%(user)s@h"),
+            "a secret value must be read verbatim, not interpolated"
+        );
     }
 
     /// The staged image really is `memfd_secret` memory: its VMA carries
