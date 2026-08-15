@@ -18,6 +18,7 @@ use std::borrow::Cow;
 // `HttpDate` themselves.
 #[cfg(test)]
 use super::date::HttpDate;
+use super::head::{has_field_break, is_token_byte};
 
 /// A response under construction, returned by the consumer's handler.
 ///
@@ -239,41 +240,12 @@ fn is_codec_owned(name: &str) -> bool {
         || name.eq_ignore_ascii_case("transfer-encoding")
 }
 
-/// RFC 9110 `token` — the field-name grammar `httparse` enforces on the
-/// request side, applied to what handlers emit. Anything else (spaces,
-/// colons, CTLs) could rewrite the field line it rides in.
+/// RFC 9110 `token` (a non-empty run of [`is_token_byte`]s) — the field-name
+/// grammar `httparse` enforces on the request side, applied to what handlers
+/// emit. Anything else (spaces, colons, CTLs) could rewrite the field line
+/// it rides in.
 fn is_token(name: &str) -> bool {
-    !name.is_empty()
-        && name.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(
-                    b,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
-}
-
-/// Whether a field value carries a byte a serialized field line may not.
-/// RFC 9110 §5.5 admits only field-vchar (VCHAR `0x21..=0x7E` / obs-text
-/// `0x80..=0xFF`), SP, and HTAB; every other byte is rejected — the CR/LF/NUL
-/// that split a response, and the rest of the C0 controls and DEL, which S3
-/// echoes verbatim in `x-amz-meta-*`. The write-side twin of the parser's
-/// smuggling screens; mirrors httparse's request-side header-value map.
-fn has_field_break(value: &[u8]) -> bool {
-    value.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f)
+    !name.is_empty() && name.bytes().all(is_token_byte)
 }
 
 /// The `Connection` header the response should carry, if any: HTTP/1.1

@@ -16,8 +16,8 @@ use crate::net::core::reactor::{
     Enacted, Gate, RecvStep, SendStep, SpliceStep,
 };
 use crate::net::server::protocol::{DetachContext, Request, Response};
+use crate::sync::Arc;
 use crate::uring::sys::*;
-use std::sync::Arc;
 
 // The stages that run the consumer's framer/body handler — the only bounds
 // this file needs (the accept handler never runs here).

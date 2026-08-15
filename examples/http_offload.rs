@@ -93,7 +93,7 @@ fn main() -> truenas_ros::Result<()> {
         HttpConfig::default(),
         |_: Incoming<'_>| Some(()),
         handler,
-    );
+    )?;
     let mut server = Server::bind([addr], proto)?;
     println!("listening on {:?}", server.local_addrs());
     server.serve_forever()

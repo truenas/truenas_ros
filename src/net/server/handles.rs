@@ -10,11 +10,11 @@ use crate::net::core::handles::{StatsInner, Token};
 use crate::net::core::protocol::CloseReason;
 #[cfg(doc)]
 use crate::net::server::protocol::Response;
+use crate::sync::Arc;
 use crate::uring::wake::LoopShared;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Proof that [`Responder::defer`] was called for this request.
@@ -121,20 +121,58 @@ impl Responder {
     /// from this responder vanish silently — the injection channel's
     /// behavior is the net layer's own tests' business, not the glue's.
     pub(crate) fn test_responder() -> Responder {
-        use std::sync::atomic::{AtomicBool, AtomicU64};
-        let (tx, _rx) = mpsc::channel();
+        Self::test_wired().0
+    }
+
+    fn test_wired() -> (Responder, mpsc::Receiver<Injected>) {
+        // `crate::sync` atomics, matching `LoopShared`'s fields, so this
+        // constructs under `--cfg loom` too.
+        use crate::sync::atomic::{AtomicBool, AtomicU64};
+        let (tx, rx) = mpsc::channel();
         let shared = Arc::new(LoopShared {
             stop: AtomicBool::new(false),
             graceful: AtomicBool::new(false),
             grace_ms: AtomicU64::new(0),
-            wake: crate::uring::wake::WakeHandle::new().expect("eventfd"),
+            wake: crate::uring::wake::WakeHandle::new().expect("wake"),
         });
         let token = Token {
             slot: 0,
             generation: 1,
             req_id: 0,
         };
-        Responder { token, tx, shared }
+        (Responder { token, tx, shared }, rx)
+    }
+
+    /// [`test_responder`](Self::test_responder) keeping the loop side: the
+    /// injection receiver and the wake, so a model consumes a worker outcome
+    /// exactly as the reactor's drain does. Model-only, because the blocking
+    /// half rides [`WakeHandle`]'s loom stand-in.
+    #[cfg(loom)]
+    pub(crate) fn test_responder_with_probe() -> (Responder, RedeliverProbe) {
+        let (responder, rx) = Self::test_wired();
+        let shared = Arc::clone(&responder.shared);
+        (responder, RedeliverProbe { rx, shared })
+    }
+}
+
+/// The loop side of a [`Responder::test_responder_with_probe`] pair.
+#[cfg(all(test, loom))]
+pub(crate) struct RedeliverProbe {
+    rx: mpsc::Receiver<Injected>,
+    shared: Arc<LoopShared>,
+}
+
+#[cfg(all(test, loom))]
+impl RedeliverProbe {
+    /// Consume the worker's outcome the way the loop does: block on the
+    /// wake (the armed `READ`), then take the queued injection — asserting
+    /// it is the redelivery the http completion pass runs on.
+    pub(crate) fn recv_redeliver(&self) {
+        self.shared.wake.drain();
+        assert!(
+            matches!(self.rx.try_recv(), Ok(Injected::Redeliver(_))),
+            "wake poked with no redelivery queued"
+        );
     }
 }
 

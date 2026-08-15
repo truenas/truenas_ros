@@ -456,6 +456,7 @@ use crate::net::core::handles::HandshakeOutcome;
 use crate::net::core::probe::{probe_ktls, probe_tcp_cmd, probe_unix_peercred};
 use crate::net::core::reactor::{KernelPads, Reactor};
 use crate::net::core::sock;
+use crate::sync::Arc;
 use crate::uring::engine::Engine;
 use crate::uring::sys::*;
 use handles::Injected;
@@ -463,7 +464,6 @@ use listen::listen_socket;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Kernel cap on SQ ring entries.

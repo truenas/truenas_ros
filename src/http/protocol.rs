@@ -8,8 +8,13 @@
 //! reactor.
 
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::PoisonError;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// The answer cell is cross-thread state (a worker fills it, the loop takes
+// it), so it rides `crate::sync` — std in production, loom's in the model
+// below, which is what lets the model see the fill/redeliver ordering.
+use crate::sync::{Arc, Mutex};
 
 use crate::net::server::{
     Body, DeferPermit, Deferred, Incoming, Protocol, Request, Responder,
@@ -20,7 +25,9 @@ use crate::net::ClientAddr;
 use super::chunked;
 use super::date::DateCache;
 use super::framer::{frame, HttpConfig, HttpConn, Phase};
-use super::head::{parse_head, Head, HeaderView, Version, MAX_HEADERS};
+use super::head::{
+    method_is_head, parse_head, Head, HeaderView, Version, MAX_HEADERS,
+};
 use super::response::{serialize, ConnHeader, HttpResponse};
 
 /// One HTTP request, as handed to the consumer's handler.
@@ -203,7 +210,7 @@ impl HttpDeferred {
     /// duplicated off-thread.
     pub fn reply(self, resp: HttpResponse) {
         // The cell write happens-before the redeliver's channel send, so
-        // the completion pass observes it.
+        // the completion pass observes it (modelled by `loom_tests`).
         *self.answer.lock().unwrap_or_else(PoisonError::into_inner) =
             Some(resp);
         self.inner.redeliver();
@@ -319,11 +326,9 @@ where
         // The framer completed on these exact bytes (or on the stash it
         // parsed once already); a divergence here is a codec bug, answered
         // as such.
-        Err(_) | Ok(None) => Dispatched::Done(farewell(
-            500,
-            head_bytes.starts_with(b"HEAD "),
-            dates,
-        )),
+        Err(_) | Ok(None) => {
+            Dispatched::Done(farewell(500, method_is_head(head_bytes), dates))
+        }
         Ok(Some(h)) => match handler(
             HttpRequest {
                 method: h.method,
@@ -362,9 +367,7 @@ fn respond_parked(
     match parse_head(head_bytes, &mut headers) {
         // These bytes parsed when the request was first dispatched; a
         // divergence on the same bytes is a codec bug.
-        Err(_) | Ok(None) => {
-            farewell(500, head_bytes.starts_with(b"HEAD "), dates)
-        }
+        Err(_) | Ok(None) => farewell(500, method_is_head(head_bytes), dates),
         Ok(Some(h)) => respond(&h, resp, dates),
     }
 }
@@ -458,15 +461,11 @@ where
                             );
                             settle(conn, d)
                         }
-                        Err(()) => farewell(
-                            500,
-                            head_bytes.starts_with(b"HEAD "),
-                            dates,
-                        ),
+                        Err(()) => {
+                            farewell(500, method_is_head(head_bytes), dates)
+                        }
                     },
-                    Err(()) => {
-                        farewell(500, head_bytes.starts_with(b"HEAD "), dates)
-                    }
+                    Err(()) => farewell(500, method_is_head(head_bytes), dates),
                 };
             }
             match chunked::decode(&body) {
@@ -487,16 +486,14 @@ where
                     );
                     settle(conn, d)
                 }
-                Err(()) => {
-                    farewell(500, head_bytes.starts_with(b"HEAD "), dates)
-                }
+                Err(()) => farewell(500, method_is_head(head_bytes), dates),
             }
         }
         // Mid-scan delivery cannot happen (the framer only answers `More`
         // in this phase); total for the same reason as Fail above.
         Phase::ChunkedBody { stash, .. } => farewell(
             500,
-            stash.as_deref().unwrap_or(header).starts_with(b"HEAD "),
+            method_is_head(stash.as_deref().unwrap_or(header)),
             dates,
         ),
         // The normal path: head + body in one message.
@@ -573,6 +570,9 @@ where
 /// order. Above that cap the framer still holds pipelined requests back
 /// during a park, but the armed read-ahead then carries `request_timeout`
 /// while parked — run deferrable endpoints at the default cap.
+///
+/// Errors when `cfg` fails [`HttpConfig::validate`] — a codec that can
+/// admit no request is refused here, not discovered one 431 at a time.
 // Same shape and rationale as `length_prefixed`: the three opaque closures
 // ARE the signature; boxing them would put dyn dispatch on the hot path.
 #[allow(clippy::type_complexity)]
@@ -580,20 +580,23 @@ pub fn protocol_deferrable<U, A, H>(
     cfg: HttpConfig,
     mut accept: A,
     mut handler: H,
-) -> Protocol<
-    impl FnMut(Incoming<'_>) -> Option<HttpConn<U>>,
-    impl FnMut(&[u8], &mut HttpConn<U>) -> crate::net::Framing,
-    impl FnMut(Request<'_, HttpConn<U>>) -> Response,
+) -> crate::Result<
+    Protocol<
+        impl FnMut(Incoming<'_>) -> Option<HttpConn<U>>,
+        impl FnMut(&[u8], &mut HttpConn<U>) -> crate::net::Framing,
+        impl FnMut(Request<'_, HttpConn<U>>) -> Response,
+    >,
 >
 where
     A: FnMut(Incoming<'_>) -> Option<U>,
     H: FnMut(HttpRequest<'_>, &mut U) -> HttpVerdict,
 {
+    cfg.validate()?;
     // One date cache per protocol instance — instances are per reactor and
     // handlers run on the reactor thread, so the `Date` value renders once
     // a second instead of once a response, with no synchronization.
     let mut dates = DateCache::default();
-    Protocol {
+    Ok(Protocol {
         accept: move |inc: Incoming<'_>| accept(inc).map(HttpConn::new),
         header: move |buf: &[u8], conn: &mut HttpConn<U>| {
             frame(buf, conn, &cfg)
@@ -617,7 +620,7 @@ where
                 &mut handler,
             )
         },
-    }
+    })
 }
 
 /// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint.
@@ -628,15 +631,19 @@ where
 /// [`HttpResponse`] to serialize. Handlers run on the server thread —
 /// compute inline like any reactor `body` handler; a handler that must
 /// wait on other threads uses [`protocol_deferrable`] instead.
+///
+/// Errors when `cfg` fails [`HttpConfig::validate`].
 #[allow(clippy::type_complexity)]
 pub fn protocol<U, A, H>(
     cfg: HttpConfig,
     accept: A,
     mut handler: H,
-) -> Protocol<
-    impl FnMut(Incoming<'_>) -> Option<HttpConn<U>>,
-    impl FnMut(&[u8], &mut HttpConn<U>) -> crate::net::Framing,
-    impl FnMut(Request<'_, HttpConn<U>>) -> Response,
+) -> crate::Result<
+    Protocol<
+        impl FnMut(Incoming<'_>) -> Option<HttpConn<U>>,
+        impl FnMut(&[u8], &mut HttpConn<U>) -> crate::net::Framing,
+        impl FnMut(Request<'_, HttpConn<U>>) -> Response,
+    >,
 >
 where
     A: FnMut(Incoming<'_>) -> Option<U>,
@@ -736,6 +743,22 @@ mod tests {
             conn,
             handler,
         )
+    }
+
+    #[test]
+    fn protocol_rejects_a_codec_that_admits_nothing() {
+        // The validator runs when the protocol is built, so a zero cap is
+        // a construction error, not a server that 431s/413s every request.
+        let bad = HttpConfig {
+            max_head: 0,
+            max_body: 1024,
+        };
+        assert!(protocol(
+            bad,
+            |_: Incoming<'_>| Some(()),
+            |_: HttpRequest<'_>, _: &mut ()| HttpResponse::new(200),
+        )
+        .is_err());
     }
 
     #[test]
@@ -1560,5 +1583,84 @@ mod tests {
         };
         let next = b"GET /next HTTP/1.1\r\nHost: h\r\n\r\n";
         assert!(matches!(frame(next, &mut conn, &cfg()), Framing::More));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// loom model of the parked reply hand-off
+// ---------------------------------------------------------------------------
+//
+// Run with:  RUSTFLAGS="--cfg loom" cargo test --lib --features http loom_
+//
+// The park's cross-thread protocol, the one edge in this module two threads
+// share:
+//
+//   worker (HttpDeferred::reply)        loop (drain, then step on Parked)
+//   *answer.lock() = Some(resp)         wake.drain()
+//   tx.send(Redeliver); wake.poke()     rx.try_recv() -> Redeliver
+//                                       answer.lock().take()
+//
+// The cell is filled before the redeliver is sent, and the completion pass
+// takes the cell only after consuming the wake, so a `reply` can never be
+// observed as a redrive. Break either half — fill after the send, or take
+// before the wake — and a schedule exists where the completion pass takes
+// `None`: the handler reruns against a consumed handle and the worker's
+// response is lost. The model drives the real `defer`/`reply`/`step`, with
+// the loop's recv order supplied by the probe.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use crate::net::server::Body;
+    use crate::net::ClientAddr;
+    use crate::sync::thread;
+
+    fn unreached(_: HttpRequest<'_>, _: &mut ()) -> HttpVerdict {
+        panic!("worker reply surfaced as a redrive")
+    }
+
+    #[test]
+    fn loom_worker_reply_is_never_a_redrive() {
+        loom::model(|| {
+            let (responder, probe) = Responder::test_responder_with_probe();
+            let peer = ClientAddr::Inet("127.0.0.1:9000".parse().unwrap());
+            let req = HttpRequest {
+                method: "GET",
+                target: "/",
+                version: Version::Http11,
+                headers: &[],
+                body: Body::inline(b""),
+                raw_head: b"GET / HTTP/1.1\r\nHost: h\r\n\r\n",
+                trailers: &[],
+                peer: &peer,
+                responder,
+            };
+            let (deferred, permit) = req.defer();
+            let HttpDeferPermit {
+                permit: _permit,
+                req: parked,
+            } = permit;
+            let mut conn: HttpConn<()> = HttpConn::new(());
+            conn.phase = Phase::Parked { req: parked };
+
+            let worker = thread::spawn(move || {
+                deferred.reply(HttpResponse::new(204));
+            });
+
+            probe.recv_redeliver();
+            let resp = step(
+                b"",
+                Body::inline(b""),
+                &peer,
+                Responder::test_responder(),
+                &mut conn,
+                &mut DateCache::default(),
+                &mut unreached,
+            );
+            let Response::Reply(bytes) = resp else {
+                panic!("expected the worker's reply, got {resp:?}");
+            };
+            assert!(bytes.starts_with(b"HTTP/1.1 204"));
+            worker.join().unwrap();
+        });
     }
 }

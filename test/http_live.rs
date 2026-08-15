@@ -111,7 +111,8 @@ fn with_http_server<T: Send + 'static>(
         HttpConfig::default(),
         |_inc: Incoming<'_>| Some(()),
         handler,
-    );
+    )
+    .expect("codec config is valid");
     let mut server = match Server::bind([addr], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return None,
@@ -467,7 +468,8 @@ fn with_parking_server<T: Send + 'static>(
         HttpConfig::default(),
         |_inc: Incoming<'_>| Some(()),
         handler,
-    );
+    )
+    .expect("codec config is valid");
     let mut server = match Server::bind([addr], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return None,
