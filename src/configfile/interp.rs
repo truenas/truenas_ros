@@ -6,7 +6,7 @@
 //! [`MAX_INTERPOLATION_DEPTH`](super::MAX_INTERPOLATION_DEPTH)), and any other
 //! `%` sequence is a syntax error.
 
-use super::{optionxform, Ordered, MAX_INTERPOLATION_DEPTH};
+use super::{optionxform, MergedView, MAX_INTERPOLATION_DEPTH};
 use crate::error::{Error, Result};
 
 /// Cap on the total interpolated output for one value. [`MAX_INTERPOLATION_DEPTH`]
@@ -29,7 +29,7 @@ const MAX_INTERPOLATION_OUTPUT: usize = 1 << 20;
 pub(super) fn before_get(
     option: &str,
     value: &str,
-    map: &Ordered<Option<String>>,
+    map: &MergedView<'_>,
     scrub: bool,
 ) -> Result<String> {
     let mut out = String::new();
@@ -40,7 +40,7 @@ pub(super) fn before_get(
 fn interpolate(
     option: &str,
     rest: &str,
-    map: &Ordered<Option<String>>,
+    map: &MergedView<'_>,
     depth: u32,
     out: &mut String,
     scrub: bool,
@@ -97,7 +97,7 @@ fn interpolate(
                 let var = optionxform(name);
                 rest = &rest[end..];
                 let value = match map.get(&var) {
-                    Some(Some(s)) => s.clone(),
+                    Some(Some(s)) => s,
                     _ => {
                         return Err(Error::Parse(if scrub {
                             "interpolation references a missing option".into()
@@ -110,9 +110,9 @@ fn interpolate(
                     }
                 };
                 if value.contains('%') {
-                    interpolate(option, &value, map, depth + 1, out, scrub)?;
+                    interpolate(option, value, map, depth + 1, out, scrub)?;
                 } else {
-                    out.push_str(&value);
+                    out.push_str(value);
                 }
             }
             _ => {
@@ -128,27 +128,41 @@ fn interpolate(
 }
 
 /// Validate that `value` is safe to store under basic interpolation, matching
-/// `BasicInterpolation.before_set`: after removing escaped `%%` and every valid
-/// `%(name)s`, no stray `%` may remain. Under `scrub` the rejected value is
-/// withheld from the error, as in [`before_get`].
+/// `BasicInterpolation.before_set`: with escaped `%%` and every valid
+/// `%(name)s` removed, no stray `%` may remain. Under `scrub` the rejected
+/// value is withheld from the error, as in [`before_get`].
+///
+/// The `%%` removal is global before the scan (a `%%` inside a reference name
+/// is stripped too), so it is done with `replace`, not scanned in place — the
+/// left-to-right equivalent disagrees with `configparser` on inputs like
+/// `%(%%)s`. `replace` copies `value`; under `scrub` that copy holds the
+/// secret, so it is burned before returning rather than freed in the clear.
 pub(super) fn validate_set(value: &str, scrub: bool) -> Result<()> {
-    let stripped = value.replace("%%", "");
-    let mut rest = stripped.as_str();
-    while let Some(p) = rest.find('%') {
-        let at = &rest[p..];
-        if at.as_bytes().get(1) == Some(&b'(') {
-            if let Some((_, end)) = key_ref(at) {
-                rest = &at[end..];
-                continue;
+    let mut stripped = value.replace("%%", "");
+    let outcome = {
+        let mut rest = stripped.as_str();
+        loop {
+            let Some(p) = rest.find('%') else {
+                break Ok(());
+            };
+            let at = &rest[p..];
+            if at.as_bytes().get(1) == Some(&b'(') {
+                if let Some((_, end)) = key_ref(at) {
+                    rest = &at[end..];
+                    continue;
+                }
             }
+            break Err(Error::Validation(if scrub {
+                "invalid interpolation syntax".into()
+            } else {
+                format!("invalid interpolation syntax in {value:?}")
+            }));
         }
-        return Err(Error::Validation(if scrub {
-            "invalid interpolation syntax".into()
-        } else {
-            format!("invalid interpolation syntax in {value:?}")
-        }));
+    };
+    if scrub {
+        super::scrub_string(&mut stripped);
     }
-    Ok(())
+    outcome
 }
 
 /// Parse a `%(name)s` reference at the start of `s` (which begins with `%(`),
@@ -164,4 +178,51 @@ fn key_ref(s: &str) -> Option<(&str, usize)> {
         return None;
     }
     Some((&s[2..close], close + 2))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The stored value must, after escaped `%%` and every `%(name)s`, hold no
+    // stray `%`. Each `Some` accepts (returns Ok), each None-shaped input
+    // rejects; `%%` neighbouring a reference must not change the verdict.
+    #[test]
+    fn validate_set_accepts_and_rejects() {
+        for ok in [
+            "",
+            "no percents",
+            "%%",
+            "100%% sure",
+            "%(name)s",
+            "%(a)s and %(b)s",
+            "%%%(name)s", // an escaped `%` then a reference
+            "%(a%%b)s",   // `%%` inside a name strips to a valid `%(ab)s`
+            "%(name)%%s", // `%%` strips to bridge the `)s` terminator
+            "trailing %%",
+        ] {
+            assert!(validate_set(ok, false).is_ok(), "{ok:?} should pass");
+        }
+        for bad in [
+            "50% off",    // a stray `%`
+            "%",          // a lone `%`
+            "%(unclosed", // no `)s`
+            "%(a)b",      // `)` not followed by `s`
+            "%()s",       // empty name
+            "%(%%)s",     // `%%` strips to an empty name
+            "%%%",        // escaped pair then a stray `%`
+            "%(a)s%",     // stray `%` after a valid reference
+        ] {
+            assert!(validate_set(bad, false).is_err(), "{bad:?} should fail");
+        }
+    }
+
+    // Under scrub the rejected value never reaches the error text.
+    #[test]
+    fn validate_set_withholds_the_value_when_scrubbed() {
+        let err = validate_set("secret 50% value", true).unwrap_err();
+        assert!(!format!("{err}").contains("secret"), "{err}");
+        let err = validate_set("secret 50% value", false).unwrap_err();
+        assert!(format!("{err}").contains("secret"), "{err}");
+    }
 }

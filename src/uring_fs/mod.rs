@@ -620,18 +620,7 @@ impl Anchor {
     /// Wrap an already-open directory fd (any readable or `O_PATH` directory
     /// works as a dirfd). Fails `Validation` if `fd` is not a directory.
     pub fn from_fd(fd: OwnedFd) -> crate::Result<Anchor> {
-        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: `fd` is live; `st` is a valid out-pointer for fstat.
-        Errno::result(unsafe {
-            libc::fstat(fd.as_fd().as_raw_fd(), st.as_mut_ptr())
-        })?;
-        // SAFETY: fstat succeeded, so `st` is initialized.
-        let st = unsafe { st.assume_init() };
-        if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
-            return Err(crate::Error::Validation(
-                "Anchor::from_fd: not a directory".into(),
-            ));
-        }
+        ensure_dir(fd.as_fd().as_raw_fd())?;
         Ok(Anchor(Arc::new(fd)))
     }
 
@@ -651,23 +640,31 @@ impl Anchor {
     /// personality, with the kernel's confinement applied — becomes the anchor
     /// for the next step of a walk, without a second `open` from a path.
     pub fn from_file(f: &File) -> crate::Result<Anchor> {
-        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: the file's fd is live for the duration of this call; `st` is
-        // a valid out-pointer for fstat.
-        Errno::result(unsafe { libc::fstat(f.as_raw_fd(), st.as_mut_ptr()) })?;
-        // SAFETY: fstat succeeded, so `st` is initialized.
-        let st = unsafe { st.assume_init() };
-        if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
-            return Err(crate::Error::Validation(
-                "Anchor::from_file: not a directory".into(),
-            ));
-        }
+        ensure_dir(f.as_raw_fd())?;
         Ok(Anchor(f.fd.clone()))
     }
 
     pub(crate) fn raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()
     }
+}
+
+/// Fail `Validation` unless `raw` names a directory. The anchor constructors
+/// share it so the "stat the fd, reject a non-directory" check cannot drift
+/// between them.
+fn ensure_dir(raw: RawFd) -> crate::Result<()> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `raw` is a live fd for the duration of this call; `st` is a
+    // valid out-pointer for fstat.
+    Errno::result(unsafe { libc::fstat(raw, st.as_mut_ptr()) })?;
+    // SAFETY: fstat succeeded, so `st` is initialized.
+    let st = unsafe { st.assume_init() };
+    if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(crate::Error::Validation(
+            "anchor fd is not a directory".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Borrow the anchor's dirfd.

@@ -58,46 +58,66 @@ impl<K: Clone + Eq + Hash, V: Clone> SingleFlight<K, V> {
         key: &K,
         mint: impl FnOnce() -> crate::Result<V>,
     ) -> crate::Result<V> {
-        let slot = {
-            let mut live = self.live.lock().map_err(|_| Errno::EIO)?;
-            live.entry(key.clone())
-                .or_insert_with(|| Arc::new(Slot::empty()))
-                .clone()
-        };
-        // Fast path: already minted — no gate, no mint.
-        if let Some(v) = slot.cell.with(V::clone) {
-            return Ok(v);
-        }
-        // Re-check under the gate: a racing caller may have filled the cell
-        // while we waited, and re-minting is a second registration.
-        let _mint = slot.gate.lock().map_err(|_| Errno::EIO)?;
-        if let Some(v) = slot.cell.with(V::clone) {
-            return Ok(v);
-        }
-        let value = match mint() {
-            Ok(v) => v,
-            Err(e) => {
-                // Only if the map still holds *this* slot — a concurrent
-                // `invalidate` may have replaced it, and that one is not
-                // ours to drop.
-                if let Ok(mut live) = self.live.lock() {
-                    if live.get(key).is_some_and(|s| Arc::ptr_eq(s, &slot)) {
-                        live.remove(key);
-                    }
-                }
-                return Err(e);
+        // `mint` runs at most once, but the slot we mint on may be evicted
+        // out from under us before we reach it (see the re-check below), so
+        // hold it in an `Option` and retry onto the map's current slot.
+        let mut mint = Some(mint);
+        loop {
+            let slot = {
+                let mut live = self.live.lock().map_err(|_| Errno::EIO)?;
+                live.entry(key.clone())
+                    .or_insert_with(|| Arc::new(Slot::empty()))
+                    .clone()
+            };
+            // Fast path: already minted — no gate, no mint.
+            if let Some(v) = slot.cell.with(V::clone) {
+                return Ok(v);
             }
-        };
-        // Cannot fail: the gate is held and the re-check above found it empty.
-        slot.cell.set(value.clone());
-        // The failure path shares this `Arc` with everyone queued on the
-        // gate, so its `ptr_eq` check cannot spare a slot that is about to be
-        // filled. Put it back, or the value is unreachable and the next
-        // caller mints a duplicate. `or_insert_with` so a newer slot wins.
-        if let Ok(mut live) = self.live.lock() {
-            live.entry(key.clone()).or_insert_with(|| slot.clone());
+            // Re-check under the gate: a racing caller may have filled the
+            // cell while we waited, and re-minting is a second registration.
+            let _mint = slot.gate.lock().map_err(|_| Errno::EIO)?;
+            if let Some(v) = slot.cell.with(V::clone) {
+                return Ok(v);
+            }
+            // Confirm the map still holds *this* slot before minting on it. A
+            // failed mint evicts its slot, and a caller arriving after that
+            // installs a fresh one — so a slot cloned before the eviction is
+            // now orphaned, and minting on it would let the map's current
+            // slot mint the key a second time. Restart onto the current slot
+            // instead; its fast path or gate then joins that mint rather than
+            // duplicating it.
+            {
+                let live = self.live.lock().map_err(|_| Errno::EIO)?;
+                if !live.get(key).is_some_and(|s| Arc::ptr_eq(s, &slot)) {
+                    continue;
+                }
+            }
+            let value = match (mint.take().expect("mint runs at most once"))() {
+                Ok(v) => v,
+                Err(e) => {
+                    // Only if the map still holds *this* slot — a concurrent
+                    // `invalidate` may have replaced it, and that one is not
+                    // ours to drop.
+                    if let Ok(mut live) = self.live.lock() {
+                        if live.get(key).is_some_and(|s| Arc::ptr_eq(s, &slot))
+                        {
+                            live.remove(key);
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+            // Cannot fail: the gate is held and the re-check found it empty.
+            slot.cell.set(value.clone());
+            // Confirmed above to be the map's slot, and the gate we hold keeps
+            // eviction-on-failure of it out, so this re-affirms rather than
+            // races a replacement. `or_insert_with` so a newer slot still wins
+            // if an `invalidate` replaced it during the mint.
+            if let Ok(mut live) = self.live.lock() {
+                live.entry(key.clone()).or_insert_with(|| slot.clone());
+            }
+            return Ok(value);
         }
-        Ok(value)
     }
 
     /// Forget `key`, so the next [`get_or_try_init`](Self::get_or_try_init)
@@ -263,6 +283,45 @@ mod loom_tests {
                 .unwrap();
             assert_eq!(again, 42, "a live value was orphaned by a failed mint");
             assert_eq!(count(&mints), 1, "one key minted more than once");
+        });
+    }
+
+    /// The double-mint a two-thread model cannot reach: a failing mint evicts
+    /// its slot, a second caller is still queued on it, and a third arrives
+    /// after the eviction and installs a fresh slot. Even then the key is
+    /// minted at most once, and one live value remains.
+    ///
+    /// Negative control: delete the slot-identity re-check under the gate.
+    #[test]
+    fn loom_a_failed_mint_cannot_double_mint() {
+        bounded_model(|| {
+            let s: Arc<SingleFlight<u32, u32>> = Arc::new(SingleFlight::new());
+            let mints = counter();
+
+            let s1 = s.clone();
+            let a = thread::spawn(move || {
+                let _ = s1.get_or_try_init(&1, || Err(Errno::EIO.into()));
+            });
+            let (s2, c2) = (s.clone(), mints.clone());
+            let b = thread::spawn(move || {
+                let _ = s2.get_or_try_init(&1, || {
+                    bump(&c2);
+                    Ok(42)
+                });
+            });
+            let (s3, c3) = (s.clone(), mints.clone());
+            let c = thread::spawn(move || {
+                let _ = s3.get_or_try_init(&1, || {
+                    bump(&c3);
+                    Ok(42)
+                });
+            });
+
+            a.join().unwrap();
+            b.join().unwrap();
+            c.join().unwrap();
+            assert!(count(&mints) <= 1, "key minted {} times", count(&mints));
+            assert_eq!(s.len(), 1, "the minted value must remain live");
         });
     }
 }
