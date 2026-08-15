@@ -91,6 +91,16 @@ fn find_crlf(rest: &[u8], max_line: usize) -> Find {
     }
 }
 
+/// Whether a CRLF-delimited line (size or trailer) carries a bare CR or LF.
+/// The chunked grammar terminates these lines with CRLF only (RFC 9112
+/// §7.1). Since [`find_crlf`] stops at the first CRLF, a bare CR or LF
+/// earlier in the line — a chunk extension is the usual place — must be
+/// rejected here rather than left in place, or a recipient that treats a
+/// lone LF as a line ending could frame the body differently.
+fn line_has_bare_crlf(line: &[u8]) -> bool {
+    line.iter().any(|&b| matches!(b, b'\r' | b'\n'))
+}
+
 /// Parse a chunk-size line: `1*HEXDIG`, then nothing or an (ignored)
 /// extension introduced by `;` after optional whitespace. Checked
 /// arithmetic — a size that overflows `usize` is malformed, full stop.
@@ -191,6 +201,9 @@ fn run(
                 Find::NeedMore => return Ok(None),
                 Find::TooLong => return Err(400),
                 Find::At(i) => {
+                    if line_has_bare_crlf(&rest[..i]) {
+                        return Err(400);
+                    }
                     let size = parse_size_line(&rest[..i]).ok_or(400u16)?;
                     s.consumed += i + 2;
                     s.state = if size == 0 {
@@ -237,6 +250,9 @@ fn run(
                     let start = s.consumed;
                     let line = &rest[..i];
                     s.consumed += i + 2;
+                    if line_has_bare_crlf(line) {
+                        return Err(400);
+                    }
                     if line.is_empty() {
                         s.state = State::Done;
                     } else {
@@ -586,6 +602,21 @@ mod tests {
         }
         t.extend_from_slice(b"\r\n");
         assert_eq!(scan_err(&t), 431);
+    }
+
+    #[test]
+    fn bare_cr_or_lf_in_a_size_or_trailer_line_is_400() {
+        // A bare CR or LF earlier in a size line, usually inside a chunk
+        // extension, is rejected rather than left in place: the line is
+        // CRLF-terminated, and accepting it would let an LF-tolerant peer
+        // frame the body differently.
+        assert_eq!(scan_err(b"1;x\n1\r\nA\r\n0\r\n\r\n"), 400);
+        assert_eq!(scan_err(b"1;a\rb\r\nA\r\n0\r\n\r\n"), 400);
+        assert_eq!(scan_err(b"2;\nxx\r\n0\r\n\r\n"), 400);
+        // The same rule on a trailer line, including a leading bare CR that
+        // trimming the value would otherwise hide.
+        assert_eq!(scan_err(b"0\r\nx-ok: \rvalue\r\n\r\n"), 400);
+        assert_eq!(scan_err(b"0\r\nx-a\n: 1\r\n\r\n"), 400);
     }
 
     #[test]
