@@ -35,9 +35,10 @@ use super::response::{serialize, ConnHeader, HttpResponse};
 /// Everything borrows from the connection buffer (or the codec's head stash
 /// on the 100-continue path); the header index is a slice into a fixed array
 /// on the caller's stack, so a request costs no per-request heap allocation.
-/// `raw_head` is the head block verbatim, byte-for-byte as the client
-/// sent it: signature schemes that canonicalize "headers as sent" (SigV4)
-/// read from here, never from a cooked view. `#[non_exhaustive]`, so future
+/// `raw_head` is the head block verbatim, byte-for-byte as the client sent
+/// it, kept for the diagnostic echo in a `SignatureDoesNotMatch` reply;
+/// SigV4 canonicalizes from the parsed [`headers`](HttpRequest::headers)
+/// views, not this block (see the field). `#[non_exhaustive]`, so future
 /// context becomes a field addition rather than a breaking change.
 #[non_exhaustive]
 pub struct HttpRequest<'a> {
@@ -58,7 +59,14 @@ pub struct HttpRequest<'a> {
     /// of the de-chunked wire — so a handler that keeps the payload (an S3
     /// PUT) never pays a second copy.
     pub body: Body<'a>,
-    /// The head block verbatim, including the terminating CRLFCRLF.
+    /// The head block verbatim, including the terminating CRLFCRLF — the
+    /// diagnostic to echo in a `SignatureDoesNotMatch` reply. Build the SigV4
+    /// canonical request from [`headers`](HttpRequest::headers) (borrows into
+    /// this buffer, values verbatim minus edge-trim), never by re-splitting
+    /// this block: the tokenizer accepts a bare LF as a line terminator
+    /// (RFC 9112 §2.2), so a CRLF-strict re-parse would draw header
+    /// boundaries the request is not served on — the header-smuggling
+    /// differential the parsed view does not have.
     pub raw_head: &'a [u8],
     /// Trailer fields from a chunked body (RFC 9112 §7.1.2), parsed but not
     /// interpreted; empty for non-chunked requests and for chunked bodies

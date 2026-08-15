@@ -73,9 +73,10 @@
 //! streaming sends are planned follow-ups on the same seam.
 //!
 //! The raw head block is preserved and handed to the handler verbatim
-//! ([`HttpRequest::raw_head`]) — SigV4's canonical request is built from
-//! header bytes as sent, so the codec never gets between the S3 layer and
-//! the wire.
+//! ([`HttpRequest::raw_head`]) for diagnostics; SigV4 canonicalizes from the
+//! parsed header views — borrows into that same buffer, values as sent — not
+//! by re-parsing the raw block, so the codec never gets between the S3 layer
+//! and the wire.
 
 mod chunked;
 mod date;
