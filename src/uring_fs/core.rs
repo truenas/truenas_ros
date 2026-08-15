@@ -2694,9 +2694,9 @@ fn map_res(res: i32) -> Result<i32, Errno> {
 /// Route a completed op's outcome to its channel waiter. A gone caller (a
 /// dropped receiver — a `File`/future dropped before awaiting) simply
 /// orphans the op; nothing to do. (A successful `open` does NOT route through
-/// here — its arm in `on_cqe` handles the gone-receiver case by staging a
-/// close, so the freshly-opened slot isn't leaked when no `File` gets
-/// built.)
+/// here — `on_cqe` wraps its fd in an `Arc<OwnedFd>`, and a gone receiver
+/// drops that `Arc`, which closes the fd. No close op is staged, and there is
+/// no slot to leak.)
 fn deliver(
     waiter: Option<FsWaiter>,
     res: Result<i32, Errno>,

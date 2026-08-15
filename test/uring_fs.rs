@@ -3613,6 +3613,53 @@ fn paging_with_a_cursor_reproduces_the_walk_exactly() {
     });
 }
 
+/// Resuming a listing must tolerate a subtree that vanished between pages, the
+/// same way the forward walk tolerates one removed mid-walk: the walk emits a
+/// directory before its contents, so a page can end on `a/c/` with the resume
+/// about to re-open it. If `a/c` is gone by then, the rebuild must skip its
+/// subtree and advance to the next sibling, not fail the whole listing.
+#[test]
+fn a_subtree_removed_between_pages_is_skipped_not_fatal() {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        make_tree(&dir);
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let full = walk_keys(&h, me, &anchor, TreeOptions::default());
+        // `a/c/` is emitted before its contents, so removing it once yielded
+        // drops only `a/c/d.txt`.
+        let expected: Vec<String> =
+            full.iter().filter(|k| *k != "a/c/d.txt").cloned().collect();
+
+        let mut paged: Vec<String> = Vec::new();
+        let mut resume: Option<TreeCursor> = None;
+        let mut removed = false;
+        loop {
+            let mut t = query_tree(
+                &h,
+                me,
+                &anchor,
+                TreeOptions {
+                    resume: resume.clone(),
+                    ..Default::default()
+                },
+            )
+            .expect("query_tree resumes across the removed subtree");
+            let Some(e) = t.next() else { break };
+            let key = String::from_utf8(e.expect("entry").key()).unwrap();
+            if key == "a/c/" && !removed {
+                // The next page re-opens `a/c`; remove it first so the rebuild
+                // hits ENOENT on that level (the walk has not descended into it
+                // yet — a directory is emitted before its contents).
+                std::fs::remove_dir_all(dir.join("a/c")).unwrap();
+                removed = true;
+            }
+            paged.push(key);
+            resume = Some(t.cursor());
+        }
+        assert!(removed, "a/c/ was never yielded");
+        assert_eq!(paged, expected);
+    });
+}
+
 /// `skip_descent` and `cursor` are both documented delimiter primitives, so
 /// the obvious composition of them — fold a directory into a common prefix,
 /// then page — has to work. It is the page boundary that makes it hard: the

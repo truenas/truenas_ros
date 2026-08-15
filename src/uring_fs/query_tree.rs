@@ -636,7 +636,7 @@ pub fn query_tree(
         let mut level_opts = opts.entries.clone();
         level_opts.name_prefix = None;
         let anchor = stack.last().expect("stack is non-empty").anchor.clone();
-        let frame = open_frame(
+        match open_frame(
             h,
             who,
             &anchor,
@@ -644,14 +644,27 @@ pub fn query_tree(
             path.clone(),
             level_opts,
             cut_for(depth + 1),
-        )
-        .map_err(|_| crate::Error::IteratorRestore {
-            depth,
-            path: std::path::PathBuf::from(
-                String::from_utf8_lossy(&path).into_owned(),
-            ),
-        })?;
-        stack.push(frame);
+        ) {
+            Ok(frame) => stack.push(frame),
+            // A level the forward walk would have skipped — this identity may
+            // not enter it (EACCES/EPERM), or it was removed between pages
+            // (ENOENT) — cannot be re-entered on resume either. The parent
+            // frame is already cut to start after this component
+            // (`cut_for(depth)`, applied when it was opened), so stopping the
+            // descent here resumes at the component's next sibling: exactly
+            // the subtree skip `descend()` makes on the forward walk. A
+            // failure that is not a subtree skip (fd exhaustion, I/O) still
+            // cannot restore the saved position.
+            Err(e) if is_subtree_skip(&e) => break,
+            Err(_) => {
+                return Err(crate::Error::IteratorRestore {
+                    depth,
+                    path: std::path::PathBuf::from(
+                        String::from_utf8_lossy(&path).into_owned(),
+                    ),
+                })
+            }
+        }
     }
 
     Ok(QueryTree {
