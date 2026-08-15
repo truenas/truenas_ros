@@ -308,6 +308,23 @@ enum Dispatched {
     },
 }
 
+/// Re-parse a head the framer already accepted into the caller's array, or
+/// the `500` farewell a re-parse divergence (a codec bug) is answered with.
+/// Shared by the inline dispatch and the parked completion so the header-count
+/// cap and the farewell shape cannot drift between them.
+fn reparse_or_farewell<'a, 'buf>(
+    head_bytes: &'buf [u8],
+    headers: &'a mut [HeaderView<'buf>; MAX_HEADERS],
+    dates: &mut DateCache,
+) -> std::result::Result<Head<'a>, Response> {
+    match parse_head(head_bytes, headers) {
+        Err(_) | Ok(None) => {
+            Err(farewell(500, method_is_head(head_bytes), dates))
+        }
+        Ok(Some(h)) => Ok(h),
+    }
+}
+
 /// Parse a delivered head and run the consumer's handler against it — the
 /// shared tail of the normal path, the 100-continue dance, and a parked
 /// request's redelivery, so all three hand handlers an identical request
@@ -330,34 +347,30 @@ where
 {
     let mut headers: [HeaderView<'_>; MAX_HEADERS] =
         [HeaderView::EMPTY; MAX_HEADERS];
-    match parse_head(head_bytes, &mut headers) {
-        // The framer completed on these exact bytes (or on the stash it
-        // parsed once already); a divergence here is a codec bug, answered
-        // as such.
-        Err(_) | Ok(None) => {
-            Dispatched::Done(farewell(500, method_is_head(head_bytes), dates))
+    let h = match reparse_or_farewell(head_bytes, &mut headers, dates) {
+        Ok(h) => h,
+        Err(resp) => return Dispatched::Done(resp),
+    };
+    match handler(
+        HttpRequest {
+            method: h.method,
+            target: h.target,
+            version: h.version,
+            headers: h.headers,
+            body,
+            raw_head: head_bytes,
+            trailers,
+            peer,
+            responder,
+        },
+        state,
+    ) {
+        HttpVerdict::Respond(resp) => {
+            Dispatched::Done(respond(&h, resp, dates))
         }
-        Ok(Some(h)) => match handler(
-            HttpRequest {
-                method: h.method,
-                target: h.target,
-                version: h.version,
-                headers: h.headers,
-                body,
-                raw_head: head_bytes,
-                trailers,
-                peer,
-                responder,
-            },
-            state,
-        ) {
-            HttpVerdict::Respond(resp) => {
-                Dispatched::Done(respond(&h, resp, dates))
-            }
-            HttpVerdict::Defer(p) => Dispatched::Park {
-                permit: p.permit,
-                req: p.req,
-            },
+        HttpVerdict::Defer(p) => Dispatched::Park {
+            permit: p.permit,
+            req: p.req,
         },
     }
 }
@@ -372,11 +385,9 @@ fn respond_parked(
 ) -> Response {
     let mut headers: [HeaderView<'_>; MAX_HEADERS] =
         [HeaderView::EMPTY; MAX_HEADERS];
-    match parse_head(head_bytes, &mut headers) {
-        // These bytes parsed when the request was first dispatched; a
-        // divergence on the same bytes is a codec bug.
-        Err(_) | Ok(None) => farewell(500, method_is_head(head_bytes), dates),
-        Ok(Some(h)) => respond(&h, resp, dates),
+    match reparse_or_farewell(head_bytes, &mut headers, dates) {
+        Ok(h) => respond(&h, resp, dates),
+        Err(farewell) => farewell,
     }
 }
 
