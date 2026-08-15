@@ -353,7 +353,7 @@ impl ConfigFile {
             OFlag::O_RDONLY | OFlag::O_CLOEXEC,
             Mode::empty(),
         )?;
-        let len = regular_file_len(&file)?;
+        let len = regular_file_len(&file, path)?;
         let mut buf = ScrubVec(vec![0u8; len + 1]);
         let filled = read_filled(&mut file, &mut buf.0)?;
         buf.0.truncate(filled);
@@ -395,11 +395,12 @@ impl ConfigFile {
         }
     }
 
-    /// Read each path in turn, **skipping** any that cannot be opened (missing,
-    /// unreadable, or containing a symlink component), and return the paths
-    /// actually read — the behavior of `configparser.read([...])`. A file that
-    /// opens but fails to parse (or is not UTF-8) still returns an error. Line
-    /// endings are decoded as in [`read_path`](Self::read_path).
+    /// Read each path in turn, **skipping** any that cannot be used — missing,
+    /// unreadable, a symlink component, or not a regular file — and return the
+    /// paths actually read, the behavior of `configparser.read([...])`. A file
+    /// that opens but fails to parse (or is not UTF-8) still returns an error,
+    /// and so does one that grows mid-read. Line endings are decoded as in
+    /// [`read_path`](Self::read_path).
     pub fn read_paths<I>(&mut self, paths: I) -> Result<Vec<PathBuf>>
     where
         I: IntoIterator<Item = PathBuf>,
@@ -408,13 +409,16 @@ impl ConfigFile {
         for path in paths {
             match self.read_path(&path) {
                 Ok(()) => read.push(path),
-                // Could not open/read (missing, permissions, symlink):
-                // skip, as `configparser` skips any `OSError` from `open`
-                // and the read. A file that opens but fails to parse
-                // still fails.
-                Err(Error::Errno(_)) | Err(Error::SymlinkInPath { .. }) => {
-                    continue
-                }
+                // Unusable candidate — missing, permissions, a symlink
+                // component, or a non-regular file (a scrubbed read refuses
+                // one, `read_path`'s doc): skip it, as `configparser` skips
+                // any `OSError` from `open`, so one bad entry cannot deny the
+                // whole load (including files already parsed). A file that
+                // opens but fails to parse — or grows mid-read
+                // (`Error::Validation`) — still aborts.
+                Err(Error::Errno(_))
+                | Err(Error::SymlinkInPath { .. })
+                | Err(Error::NotRegularFile { .. }) => continue,
                 Err(e) => return Err(e),
             }
         }
@@ -525,13 +529,8 @@ impl ConfigFile {
         match self.interp {
             Interp::None => Ok(Some(raw.clone())),
             Interp::Basic => {
-                let merged = self.merged_map(section);
-                Ok(Some(interp::before_get(
-                    &key,
-                    raw,
-                    &merged.map,
-                    self.scrub,
-                )?))
+                let view = self.merged_view(section);
+                Ok(Some(interp::before_get(&key, raw, &view, self.scrub)?))
             }
         }
     }
@@ -639,15 +638,15 @@ impl ConfigFile {
         if !self.sections.contains(section) {
             return Ok(None);
         }
-        let merged = self.merged_map(section);
+        let view = self.merged_view(section);
         let mut out = Vec::new();
-        for (k, v) in merged.map.iter() {
+        for (k, v) in view.iter() {
             let value = match v {
                 None => String::new(),
                 Some(s) => match self.interp {
-                    Interp::None => s.clone(),
+                    Interp::None => s.to_string(),
                     Interp::Basic => {
-                        interp::before_get(k, s, &merged.map, self.scrub)?
+                        interp::before_get(k, s, &view, self.scrub)?
                     }
                 },
             };
@@ -822,36 +821,63 @@ impl ConfigFile {
     }
 
     /// The merged (DEFAULT, then section-override) raw values used both for
-    /// interpolation variable lookups and for [`items`](Self::items), in a
-    /// guard. The temporary holds value clones: for a scrubbed
-    /// configuration the guard's drop burns them on every exit — a `?`
-    /// between building and reading it cannot leak them — and a default
-    /// clone displaced by a section override is burned at once.
-    fn merged_map(&self, section: &str) -> MergedMap {
-        let mut map = self.defaults.clone();
+    /// interpolation variable lookups and for [`items`](Self::items).
+    ///
+    /// The view borrows its keys and values from the configuration rather
+    /// than cloning them: interpolation needs only lookup and iteration, so
+    /// cloning the whole DEFAULT map plus every section value per `get` would
+    /// be pure overhead on the read path — and, under scrub, a transient
+    /// plaintext copy of every value to burn. The borrows live as long as the
+    /// `&self` every reader holds.
+    fn merged_view(&self, section: &str) -> MergedView<'_> {
+        let mut view = MergedView::default();
+        for (k, v) in self.defaults.iter() {
+            view.upsert(k, v.as_deref());
+        }
         if let Some(opts) = self.sections.get(section) {
             for (k, v) in opts.iter() {
-                scrub_displaced(self.scrub, map.insert(k, v.clone()));
+                view.upsert(k, v.as_deref());
             }
         }
-        MergedMap {
-            map,
-            scrub: self.scrub,
-        }
+        view
     }
 }
 
-/// See [`ConfigFile::merged_map`].
-struct MergedMap {
-    map: Ordered<Option<String>>,
-    scrub: bool,
+/// A read-only merged view of a section over `DEFAULT` ([`merged_view`]),
+/// borrowing key and value from the configuration. Section entries shadow
+/// `DEFAULT`; insertion order is preserved (DEFAULT keys first, then
+/// section-only additions) so [`items`](ConfigFile::items) serializes as
+/// `configparser` does.
+///
+/// [`merged_view`]: ConfigFile::merged_view
+#[derive(Default)]
+pub(super) struct MergedView<'a> {
+    entries: Vec<(&'a str, Option<&'a str>)>,
+    index: std::collections::HashMap<&'a str, usize>,
 }
 
-impl Drop for MergedMap {
-    fn drop(&mut self) {
-        if self.scrub {
-            scrub_opts(&mut self.map);
+impl<'a> MergedView<'a> {
+    fn upsert(&mut self, key: &'a str, value: Option<&'a str>) {
+        if let Some(&i) = self.index.get(key) {
+            self.entries[i].1 = value;
+        } else {
+            self.index.insert(key, self.entries.len());
+            self.entries.push((key, value));
         }
+    }
+
+    /// The value for `key`: outer `Some` means the key is present, inner
+    /// `Some` that it carries a value (a valueless option reads as
+    /// `Some(None)`).
+    pub(super) fn get(&self, key: &str) -> Option<Option<&'a str>> {
+        self.index.get(key).map(|&i| self.entries[i].1)
+    }
+
+    /// Merged `(key, value)` pairs in insertion order.
+    pub(super) fn iter(
+        &self,
+    ) -> impl Iterator<Item = (&'a str, Option<&'a str>)> + '_ {
+        self.entries.iter().copied()
     }
 }
 
@@ -916,14 +942,14 @@ fn normalize_newlines_slice(buf: &mut [u8]) -> usize {
 /// file has one: for anything else — a FIFO, a device, a proc file — the
 /// stat size does not describe the content, and a wrong pre-size either
 /// refuses a whole read as a grow or silently reads as empty.
-fn regular_file_len(file: &std::fs::File) -> Result<usize> {
+fn regular_file_len(file: &std::fs::File, path: &Path) -> Result<usize> {
     let meta = file
         .metadata()
         .map_err(|e| Errno::try_from(e).unwrap_or(Errno::EIO))?;
     if !meta.file_type().is_file() {
-        return Err(Error::Validation(
-            "config file is not a regular file".into(),
-        ));
+        return Err(Error::NotRegularFile {
+            path: path.to_path_buf(),
+        });
     }
     Ok(meta.len() as usize)
 }
@@ -970,7 +996,7 @@ fn stage_secret_image(
         OFlag::O_RDONLY | OFlag::O_CLOEXEC,
         Mode::empty(),
     )?;
-    let len = regular_file_len(&file)?;
+    let len = regular_file_len(&file, path)?;
     if len == 0 {
         return Ok(None);
     }
@@ -1239,6 +1265,36 @@ mod tests {
         assert!(!quiet.to_string().contains("50%"), "{quiet}");
     }
 
+    #[test]
+    fn interpolation_resolves_across_the_merged_view() {
+        // The merged view a `get` interpolates against: `%(host)s` falls back
+        // to DEFAULT while `%(base)s` takes the section's override, and
+        // `%(url)s` resolves recursively through a value that itself
+        // interpolates. Values verified against CPython `configparser`.
+        let doc = "[DEFAULT]\n\
+                   host = example.com\n\
+                   base = /srv\n\
+                   [site]\n\
+                   base = /var/www\n\
+                   url = http://%(host)s%(base)s\n\
+                   nested = %(url)s/index\n";
+        let mut cfg = ConfigFile::new();
+        cfg.read_str(doc).unwrap();
+        assert_eq!(
+            cfg.get("site", "url").unwrap().as_deref(),
+            Some("http://example.com/var/www")
+        );
+        assert_eq!(
+            cfg.get("site", "nested").unwrap().as_deref(),
+            Some("http://example.com/var/www/index")
+        );
+        // A DEFAULT-only key is inherited by the section.
+        assert_eq!(
+            cfg.get("site", "host").unwrap().as_deref(),
+            Some("example.com")
+        );
+    }
+
     /// A scrubbed read refuses a non-regular file: its stat size cannot
     /// pre-size the staging buffer, so it would stage a torn image or
     /// read as silently empty. The plain read keeps `configparser`'s
@@ -1259,5 +1315,24 @@ mod tests {
                 secret.read_secret_path(dev_null).unwrap_err().to_string();
             assert!(err.contains("not a regular file"), "{err}");
         }
+    }
+
+    #[test]
+    fn read_paths_skips_a_non_regular_file() {
+        // A non-regular candidate is skipped like a missing one, so one
+        // unusable path — an ops /dev/null slot, or an attacker-planted FIFO —
+        // cannot deny a whole multi-file load, and a file already parsed stays
+        // loaded. Exercised on a scrubbed config, which refuses a non-regular
+        // file; the grow-guard (also `Validation`) still aborts.
+        let dir = crate::tempdir().unwrap();
+        let good = dir.path().join("creds.ini");
+        std::fs::write(&good, "[user]\r\nkey = sw0rdf1sh\r\n").unwrap();
+
+        let mut cfg = ConfigFile::raw().scrubbed(true);
+        let read = cfg
+            .read_paths([good.clone(), PathBuf::from("/dev/null")])
+            .expect("a non-regular path is skipped, not fatal");
+        assert_eq!(read, vec![good]);
+        assert_eq!(cfg.get_raw("user", "key"), Some("sw0rdf1sh"));
     }
 }

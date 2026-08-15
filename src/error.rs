@@ -54,6 +54,15 @@ pub enum Error {
         /// The path that contained a symlink component.
         path: PathBuf,
     },
+
+    /// A path that must name a regular file named something else — a FIFO,
+    /// device, socket, or directory — whose stat size does not describe any
+    /// content to read. Distinct from [`Validation`](Error::Validation) so a
+    /// multi-file read can skip one unusable candidate without aborting.
+    NotRegularFile {
+        /// The path that is not a regular file.
+        path: PathBuf,
+    },
 }
 
 impl From<Errno> for Error {
@@ -85,6 +94,9 @@ impl fmt::Display for Error {
             ),
             Error::SymlinkInPath { path } => {
                 write!(f, "symlink in path: {}", path.display())
+            }
+            Error::NotRegularFile { path } => {
+                write!(f, "not a regular file: {}", path.display())
             }
         }
     }
