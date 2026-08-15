@@ -54,7 +54,7 @@ fn handle(req: HttpRequest<'_>, session: &mut Session) -> HttpResponse {
 }
 
 fn main() -> truenas_ros::Result<()> {
-    let proto = protocol(HttpConfig::default(), admit, handle);
+    let proto = protocol(HttpConfig::default(), admit, handle)?;
     let addr = [ServerAddr::Tcp("127.0.0.1:8080".parse().unwrap())];
     let mut server = Server::bind(addr, proto)?;
     println!("listening on {:?}", server.local_addrs());

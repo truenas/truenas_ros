@@ -88,13 +88,16 @@ impl Default for HttpConfig {
 }
 
 impl HttpConfig {
-    /// Reject a configuration that cannot admit any request: both caps must be
-    /// non-zero. Consumers who raise [`max_body`](HttpConfig::max_body) should
-    /// keep [`ServerConfig::max_request_bytes`] at or above
-    /// [`min_request_bytes`](HttpConfig::min_request_bytes) too, or a request
-    /// the codec would answer 413/431 is instead cut off with a raw close and
-    /// no HTTP response; that cross-check needs the reactor config, so it lives
-    /// at server construction, while this checks the codec caps in isolation.
+    /// Reject a configuration that cannot admit any request: both caps must
+    /// be non-zero. [`protocol`](super::protocol()) and
+    /// [`protocol_deferrable`](super::protocol_deferrable()) run this at
+    /// construction. The reactor cross-check stays the consumer's: the codec
+    /// never sees [`ServerConfig`], so whoever raises
+    /// [`max_body`](HttpConfig::max_body) must keep
+    /// [`ServerConfig::max_request_bytes`] at or above
+    /// [`min_request_bytes`](HttpConfig::min_request_bytes) in step, or a
+    /// request the codec would answer 413/431 is instead cut off with a raw
+    /// close and no HTTP response.
     pub fn validate(&self) -> crate::Result<()> {
         if self.max_head == 0 {
             return Err(crate::Error::Validation(

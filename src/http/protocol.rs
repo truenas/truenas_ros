@@ -565,6 +565,9 @@ where
 /// order. Above that cap the framer still holds pipelined requests back
 /// during a park, but the armed read-ahead then carries `request_timeout`
 /// while parked — run deferrable endpoints at the default cap.
+///
+/// Errors when `cfg` fails [`HttpConfig::validate`] — a codec that can
+/// admit no request is refused here, not discovered one 431 at a time.
 // Same shape and rationale as `length_prefixed`: the three opaque closures
 // ARE the signature; boxing them would put dyn dispatch on the hot path.
 #[allow(clippy::type_complexity)]
@@ -572,20 +575,23 @@ pub fn protocol_deferrable<U, A, H>(
     cfg: HttpConfig,
     mut accept: A,
     mut handler: H,
-) -> Protocol<
-    impl FnMut(Incoming<'_>) -> Option<HttpConn<U>>,
-    impl FnMut(&[u8], &mut HttpConn<U>) -> crate::net::Framing,
-    impl FnMut(Request<'_, HttpConn<U>>) -> Response,
+) -> crate::Result<
+    Protocol<
+        impl FnMut(Incoming<'_>) -> Option<HttpConn<U>>,
+        impl FnMut(&[u8], &mut HttpConn<U>) -> crate::net::Framing,
+        impl FnMut(Request<'_, HttpConn<U>>) -> Response,
+    >,
 >
 where
     A: FnMut(Incoming<'_>) -> Option<U>,
     H: FnMut(HttpRequest<'_>, &mut U) -> HttpVerdict,
 {
+    cfg.validate()?;
     // One date cache per protocol instance — instances are per reactor and
     // handlers run on the reactor thread, so the `Date` value renders once
     // a second instead of once a response, with no synchronization.
     let mut dates = DateCache::default();
-    Protocol {
+    Ok(Protocol {
         accept: move |inc: Incoming<'_>| accept(inc).map(HttpConn::new),
         header: move |buf: &[u8], conn: &mut HttpConn<U>| {
             frame(buf, conn, &cfg)
@@ -609,7 +615,7 @@ where
                 &mut handler,
             )
         },
-    }
+    })
 }
 
 /// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint.
@@ -620,15 +626,19 @@ where
 /// [`HttpResponse`] to serialize. Handlers run on the server thread —
 /// compute inline like any reactor `body` handler; a handler that must
 /// wait on other threads uses [`protocol_deferrable`] instead.
+///
+/// Errors when `cfg` fails [`HttpConfig::validate`].
 #[allow(clippy::type_complexity)]
 pub fn protocol<U, A, H>(
     cfg: HttpConfig,
     accept: A,
     mut handler: H,
-) -> Protocol<
-    impl FnMut(Incoming<'_>) -> Option<HttpConn<U>>,
-    impl FnMut(&[u8], &mut HttpConn<U>) -> crate::net::Framing,
-    impl FnMut(Request<'_, HttpConn<U>>) -> Response,
+) -> crate::Result<
+    Protocol<
+        impl FnMut(Incoming<'_>) -> Option<HttpConn<U>>,
+        impl FnMut(&[u8], &mut HttpConn<U>) -> crate::net::Framing,
+        impl FnMut(Request<'_, HttpConn<U>>) -> Response,
+    >,
 >
 where
     A: FnMut(Incoming<'_>) -> Option<U>,
@@ -728,6 +738,22 @@ mod tests {
             conn,
             handler,
         )
+    }
+
+    #[test]
+    fn protocol_rejects_a_codec_that_admits_nothing() {
+        // The validator runs when the protocol is built, so a zero cap is
+        // a construction error, not a server that 431s/413s every request.
+        let bad = HttpConfig {
+            max_head: 0,
+            max_body: 1024,
+        };
+        assert!(protocol(
+            bad,
+            |_: Incoming<'_>| Some(()),
+            |_: HttpRequest<'_>, _: &mut ()| HttpResponse::new(200),
+        )
+        .is_err());
     }
 
     #[test]
