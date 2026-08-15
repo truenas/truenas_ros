@@ -92,6 +92,35 @@ pub(crate) struct FrameFacts {
     pub expects_continue: bool,
 }
 
+/// Whether `tok` is an `HTTP-version` (RFC 9110 §2.5): the uppercase name
+/// `HTTP`, a slash, then one digit, a dot, and one digit.
+fn is_http_version(tok: &[u8]) -> bool {
+    matches!(
+        tok,
+        [b'H', b'T', b'T', b'P', b'/', major, b'.', minor]
+            if major.is_ascii_digit() && minor.is_ascii_digit()
+    )
+}
+
+/// The status for a request line `httparse` rejected as `Error::Version`. It
+/// compares the eight version bytes against `HTTP/1.0` and `HTTP/1.1` and
+/// rejects everything else the same way — a real but unsupported version
+/// like `HTTP/2.0`, and the byte soup of a malformed request line alike.
+/// Answering 505 for the latter tells the client to retry at a lower HTTP
+/// version it never named, so read the version token off the request line
+/// and answer 505 only when it is a well-formed `HTTP/<DIGIT>.<DIGIT>`.
+fn version_status(buf: &[u8]) -> u16 {
+    let line_end = buf
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(buf.len());
+    let line = &buf[..line_end];
+    match line.iter().rposition(|&b| b == b' ') {
+        Some(sp) if is_http_version(&line[sp + 1..]) => 505,
+        _ => 400,
+    }
+}
+
 /// Shared tokenize step: `httparse` plus the version and Host checks every
 /// caller applies. `Ok(None)` means "need more bytes"; `Err(status)` is the
 /// response status the connection should die with (400 malformed / Host
@@ -105,9 +134,9 @@ fn tokenize<'s, 'b>(
         Ok(httparse::Status::Complete(len)) => len,
         Ok(httparse::Status::Partial) => return Ok(None),
         Err(httparse::Error::TooManyHeaders) => return Err(431),
-        // The tokenizer only admits literal `HTTP/1.x` version strings, so
-        // an HTTP/2 (or other) request line surfaces here, not below.
-        Err(httparse::Error::Version) => return Err(505),
+        // `httparse` reports both a real unsupported version and a malformed
+        // request line as `Error::Version`; separate them (505 vs 400).
+        Err(httparse::Error::Version) => return Err(version_status(buf)),
         Err(_) => return Err(400),
     };
     let version = match req.version {
@@ -520,6 +549,26 @@ mod tests {
             assert_eq!(h10.version, Version::Http10);
             assert!(!h10.keep_alive());
         });
+    }
+
+    #[test]
+    fn malformed_request_line_is_400_not_505() {
+        let status = |buf: &[u8]| {
+            let mut headers = [HeaderView::EMPTY; MAX_HEADERS];
+            parse_head(buf, &mut headers).err()
+        };
+        // A non-version token or a lowercase name where the version belongs
+        // is a malformed request line, not an unsupported version: 400, so
+        // the client is not told to retry at a version it never used.
+        assert_eq!(status(b"GET / XYZZY\r\nHost: h\r\n\r\n"), Some(400));
+        assert_eq!(status(b"GET / http/1.1\r\nHost: h\r\n\r\n"), Some(400));
+        // A well-formed but unsupported version keeps its 505.
+        for v in [&b"HTTP/2.0"[..], b"HTTP/9.9", b"HTTP/1.2"] {
+            let mut buf = b"GET / ".to_vec();
+            buf.extend_from_slice(v);
+            buf.extend_from_slice(b"\r\nHost: h\r\n\r\n");
+            assert_eq!(status(&buf), Some(505), "{v:?}");
+        }
     }
 
     #[test]
