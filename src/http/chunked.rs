@@ -30,7 +30,10 @@ pub(crate) const CHUNK_LINE_MAX: usize = 256;
 /// `x-amz-checksum-*`) are well under 100 bytes.
 pub(crate) const TRAILER_LINE_MAX: usize = 1024;
 
-/// Whole trailer section cap, terminator included.
+/// Whole trailer section cap, terminator included. This byte bound is also
+/// the field-count bound: the smallest field line runs a few bytes, so the
+/// cap admits at most a couple of thousand trailers before answering 431,
+/// which is why there is no separate count cap.
 pub(crate) const TRAILER_MAX: usize = 8 * 1024;
 
 /// Where the scanner stands inside the chunk stream.
