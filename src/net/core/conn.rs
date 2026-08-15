@@ -498,8 +498,13 @@ impl<U> Connection<U> {
         handoff_threshold: Option<usize>,
     ) -> (&[u8], Body<'_>, &ClientAddr, &mut U) {
         let placed = self.body_buf.take();
+        // `body_len > 0` keeps a zero-length frame (a redelivery, where the
+        // original bytes were already consumed) out of the handoff: with a
+        // zero threshold it would otherwise `take` the accumulate buffer while
+        // a read-ahead recv may be writing into its spare capacity.
         if placed.is_none()
             && self.header_len == 0
+            && self.body_len > 0
             && self.recv_buf.len() == self.body_len
             && matches!(handoff_threshold, Some(t) if self.body_len >= t)
         {

@@ -102,8 +102,14 @@ where
 
     /// Run the body handler for the current message, drop the request from the
     /// recv buffer, and act on the [`Response`]: queue a reply (and start
-    /// sending), park for a deferred reply, or close.
-    fn deliver_one(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
+    /// sending), park for a deferred reply, or close. Also the re-entry point
+    /// for [`Deferred::redeliver`], where the current frame is empty and the
+    /// handler works from its own retained state.
+    pub(super) fn deliver_one(
+        &mut self,
+        slot: u32,
+        generation: u32,
+    ) -> errno::Result<()> {
         // Borrow-split: `self.handlers`, `self.core.table`, and `self.mailbox` are
         // disjoint fields; within the connection, buf/addr (immutable) vs
         // userdata (mutable). The Responder holds owned channel clones.

@@ -113,6 +113,31 @@ impl std::fmt::Debug for Responder {
     }
 }
 
+#[cfg(test)]
+impl Responder {
+    /// A live responder backed by a throwaway channel and wake — for unit
+    /// tests that drive protocol glue (the http `step`) without a reactor.
+    /// The receiver is dropped, so outcomes sent through handles minted
+    /// from this responder vanish silently — the injection channel's
+    /// behavior is the net layer's own tests' business, not the glue's.
+    pub(crate) fn test_responder() -> Responder {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let (tx, _rx) = mpsc::channel();
+        let shared = Arc::new(LoopShared {
+            stop: AtomicBool::new(false),
+            graceful: AtomicBool::new(false),
+            grace_ms: AtomicU64::new(0),
+            wake: crate::uring::wake::WakeHandle::new().expect("eventfd"),
+        });
+        let token = Token {
+            slot: 0,
+            generation: 1,
+            req_id: 0,
+        };
+        Responder { token, tx, shared }
+    }
+}
+
 /// An owned, `Send` handle that delivers a deferred reply from any thread.
 ///
 /// Obtained from [`Responder::defer`]. Call [`Deferred::reply`] exactly once
@@ -167,6 +192,21 @@ impl Deferred {
     pub fn close(mut self) {
         self.done = true;
         let _ = self.tx.send(Injected::Close(self.token));
+        self.shared.wake.poke();
+    }
+
+    /// Re-deliver this request to the body handler instead of supplying bytes
+    /// — for protocol glue that retained the request in its connection state
+    /// (`&mut U`) and completes it on the server thread, where the state and
+    /// the serialization context live. The handler runs again with an empty
+    /// frame (the original bytes were consumed at first delivery), counted as
+    /// a fresh delivery; it may reply, defer again, or close. Rides the same
+    /// token gauntlet as a reply: a redelivery for a request already answered,
+    /// or whose connection closed or slot was recycled, is dropped safely.
+    /// Consumes the handle.
+    pub fn redeliver(mut self) {
+        self.done = true;
+        let _ = self.tx.send(Injected::Redeliver(self.token));
         self.shared.wake.poke();
     }
 }
@@ -463,6 +503,10 @@ pub(super) enum Injected {
     /// Close the connection (explicit worker decision, or a dropped/lost
     /// [`Deferred`]).
     Close(Token),
+    /// Run the body handler again for this request ([`Deferred::redeliver`])
+    /// — the frame is empty; the consumer's protocol glue retained what it
+    /// needs in its connection state.
+    Redeliver(Token),
     /// An unsolicited push ([`PushHandle::push`]) — not tied to any request.
     Push {
         slot: u32,

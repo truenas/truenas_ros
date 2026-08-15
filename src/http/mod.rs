@@ -20,6 +20,14 @@
 //!   (`Response::Reply` sends verbatim), and the framer then frames the body
 //!   as a second message against the stashed head. No reactor extension
 //!   needed.
+//! - **Deferred completion** ([`protocol_deferrable`]): a handler may
+//!   **park** a request ([`HttpRequest::defer`]) while a worker thread
+//!   resolves what it needs; the retained request is redelivered on the
+//!   server thread — re-running the handler once state is warm
+//!   ([`HttpDeferred::redrive`]) or serializing a worker-built response
+//!   ([`HttpDeferred::reply`]) — so the reactor never blocks and response
+//!   policy never runs off-thread. Rides the reactor's
+//!   [`Response::Defer`](crate::net::server::Response::Defer) machinery.
 //! - **Keep-alive**: HTTP/1.1 persists unless `Connection: close`; HTTP/1.0
 //!   closes unless `Connection: keep-alive`. Close maps onto
 //!   [`Response::ReplyClose`](crate::net::server::Response::ReplyClose) —
@@ -79,7 +87,10 @@ mod response;
 pub use date::HttpDate;
 pub use framer::{HttpConfig, HttpConn};
 pub use head::{HeaderView, Version};
-pub use protocol::{protocol, HttpRequest};
+pub use protocol::{
+    protocol, protocol_deferrable, HttpDeferPermit, HttpDeferred, HttpRequest,
+    HttpVerdict,
+};
 pub use response::{HttpResponse, IntoBytes};
 
 /// Pure codec entry points exposed to the fuzz crate (`fuzz/`) under `__fuzz`
