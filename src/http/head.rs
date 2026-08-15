@@ -636,6 +636,124 @@ mod tests {
         );
     }
 
+    // Head-grammar edge cases. Several assert screens the tokenizer
+    // (httparse) enforces rather than this module, so they also guard against
+    // a parser upgrade quietly loosening them.
+
+    fn head_err(buf: &[u8]) -> Option<u16> {
+        let mut headers = [HeaderView::EMPTY; MAX_HEADERS];
+        parse_head(buf, &mut headers).err()
+    }
+
+    fn head_ok(buf: &[u8]) -> bool {
+        let mut headers = [HeaderView::EMPTY; MAX_HEADERS];
+        matches!(parse_head(buf, &mut headers), Ok(Some(_)))
+    }
+
+    #[test]
+    fn obsolete_line_folding_is_rejected() {
+        // Obsolete line folding (RFC 9112 §5.2) is rejected; here the folded
+        // value would otherwise reconstruct to a Transfer-Encoding of
+        // "chunked", a hidden-header vector.
+        assert_eq!(
+            head_err(b"GET /t HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chun\r\n ked\r\n\r\n"),
+            Some(400)
+        );
+    }
+
+    #[test]
+    fn header_field_spacing_is_rejected() {
+        // Whitespace before the colon (RFC 9112 §5.1) or before the first
+        // header name is rejected; both are classic proxy-differential
+        // smuggling shapes.
+        assert_eq!(
+            head_err(
+                b"GET / HTTP/1.1\r\nHost: a\r\nContent-Length : 5\r\n\r\n"
+            ),
+            Some(400)
+        );
+        assert_eq!(
+            head_err(
+                b"GET / HTTP/1.1\r\nHost: a\r\nContent-Length\t: 5\r\n\r\n"
+            ),
+            Some(400)
+        );
+        assert_eq!(head_err(b"GET / HTTP/1.1\r\n Host: a\r\n\r\n"), Some(400));
+    }
+
+    #[test]
+    fn control_bytes_in_a_header_value_are_rejected() {
+        // A bare CR, NUL, or other C0 control byte in a value is rejected —
+        // any of them could split or truncate the field line — while obs-text
+        // (0x80..=0xFF) is allowed.
+        let bad: &[&[u8]] = &[
+            b"GET / HTTP/1.1\r\nHost: a\r\nX: v\rTransfer-Encoding: chunked\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a\r\nX: a\x00b\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a\r\nX: a\x01b\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a\r\nX: a\x7fb\r\n\r\n",
+        ];
+        for b in bad {
+            assert_eq!(head_err(b), Some(400), "{b:?}");
+        }
+        // obs-text is accepted (the value is bytes, never assumed UTF-8).
+        assert!(head_ok(b"GET / HTTP/1.1\r\nHost: a\r\nX: \xc3\xa9\r\n\r\n"));
+    }
+
+    #[test]
+    fn empty_header_name_is_rejected() {
+        // A colon with no preceding name is not a valid field line.
+        assert_eq!(
+            head_err(b"GET / HTTP/1.1\r\nHost: a\r\n: v\r\n\r\n"),
+            Some(400)
+        );
+    }
+
+    #[test]
+    fn comma_list_content_length_is_rejected() {
+        // A comma-separated Content-Length is rejected outright, even when
+        // the values agree: it is the shape that desyncs a first-element-wins
+        // parser from a last-element-wins one.
+        assert!(parse_content_length(b"5, 6").is_none());
+        assert!(parse_content_length(b"0, 0").is_none());
+    }
+
+    #[test]
+    fn duplicate_host_is_case_insensitive() {
+        // Two Host lines differing only in case still count as duplicates.
+        assert_eq!(
+            head_err(b"GET /t HTTP/1.1\r\nhost: evil\r\nHost: good\r\n\r\n"),
+            Some(400)
+        );
+    }
+
+    #[test]
+    fn header_slot_overflow_is_431() {
+        // More header lines than the parser has slots for answers 431 rather
+        // than failing some other way.
+        let mut buf = b"GET /b/k HTTP/1.1\r\nHost: h\r\n".to_vec();
+        for i in 0..MAX_HEADERS {
+            buf.extend_from_slice(format!("x-h-{i}: v\r\n").as_bytes());
+        }
+        buf.extend_from_slice(b"\r\n");
+        assert_eq!(head_err(&buf), Some(431));
+    }
+
+    #[test]
+    fn request_target_byte_classes() {
+        // A NUL or otherwise invalid-UTF-8 request target is rejected; a valid
+        // UTF-8 target (such as an S3 key) is accepted, since it is exposed as
+        // a &str.
+        assert_eq!(
+            head_err(b"GET /a\x00b HTTP/1.1\r\nHost: h\r\n\r\n"),
+            Some(400)
+        );
+        assert_eq!(
+            head_err(b"GET /a\xffb HTTP/1.1\r\nHost: h\r\n\r\n"),
+            Some(400)
+        );
+        assert!(head_ok(b"GET /caf\xc3\xa9 HTTP/1.1\r\nHost: h\r\n\r\n"));
+    }
+
     #[test]
     fn expect_and_connection_tokens() {
         complete(

@@ -619,6 +619,97 @@ mod tests {
         assert_eq!(scan_err(b"0\r\nx-a\n: 1\r\n\r\n"), 400);
     }
 
+    // Edge cases for the size, footer, and trailer grammar.
+
+    #[test]
+    fn empty_chunk_size_line_is_400() {
+        // A CRLF where a chunk size is expected has no hex digit; treating it
+        // as a zero-size terminator would leave a stray CRLF in front of the
+        // next message.
+        assert_eq!(scan_err(b"\r\n\r\n"), 400);
+        assert_eq!(scan_err(b"1\r\nZ\r\n\r\n\r\n"), 400);
+    }
+
+    #[test]
+    fn chunk_data_shorter_than_declared_is_400() {
+        // Five bytes declared, three supplied: the footer check sees "0\r"
+        // instead of CRLF, so the message is malformed, not complete.
+        assert_eq!(scan_err(b"5\r\nabc\r\n0\r\n\r\n"), 400);
+    }
+
+    #[test]
+    fn chunk_size_radix_and_sign_is_400() {
+        // A chunk size is bare hex: no 0x prefix, no sign, no leading space.
+        // 0x0 is the case a lax parser could misread as the terminator.
+        assert_eq!(scan_err(b"0x5\r\nhello\r\n0\r\n\r\n"), 400);
+        assert_eq!(scan_err(b"0x0\r\n\r\n"), 400);
+        assert_eq!(scan_err(b"+5\r\nhello\r\n0\r\n\r\n"), 400);
+        assert_eq!(scan_err(b"-5\r\nhello\r\n0\r\n\r\n"), 400);
+        assert_eq!(scan_err(b" 5\r\nhello\r\n0\r\n\r\n"), 400);
+    }
+
+    #[test]
+    fn max_chunk_size_is_accepted_awaiting_payload() {
+        // Sixteen hex digits is usize::MAX: parsed without overflow, then
+        // awaiting payload. The size parse does not bound the body — the
+        // decoded-size cap does — and seventeen digits overflow to 400.
+        assert_eq!(
+            scan(b"ffffffffffffffff\r\n", &mut ChunkScan::default()),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn chunk_footer_requires_exact_crlf() {
+        // Both bytes of a chunk's trailing CRLF are checked, including when
+        // the two arrive in separate reads.
+        assert_eq!(scan_err(b"3\r\nabcX\r\n1a\r\n"), 400); // first byte
+        assert_eq!(scan_err(b"3\r\nabc\rX\r\n1a\r\n"), 400); // second byte
+        let mut s = ChunkScan::default();
+        assert_eq!(scan(b"3\r\nabc\r", &mut s), Ok(None));
+        assert_eq!(scan(b"3\r\nabc\rX\r\n", &mut s), Err(400));
+    }
+
+    #[test]
+    fn scan_does_not_grow_past_the_terminal_chunk() {
+        // Once the terminal chunk is seen the extent is fixed; bytes of a
+        // following pipelined message are not absorbed into it.
+        let mut s = ChunkScan::default();
+        assert_eq!(scan(b"0\r\n\r\n", &mut s), Ok(Some(5)));
+        assert_eq!(
+            scan(b"0\r\n\r\nGET /next HTTP/1.1\r\n\r\n", &mut s),
+            Ok(Some(5))
+        );
+    }
+
+    #[test]
+    fn lf_only_line_endings_never_complete() {
+        // LF-only line endings are not CRLF, so the scan keeps asking for
+        // more and never completes on a lone LF.
+        assert_eq!(
+            scan(b"5\nhello\n0\n\n", &mut ChunkScan::default()),
+            Ok(None)
+        );
+        assert_eq!(scan(b"0\n\n", &mut ChunkScan::default()), Ok(None));
+    }
+
+    #[test]
+    fn resumes_through_a_trailer_section() {
+        // Feed a multi-chunk body with a trailer section one byte at a time
+        // through a single scan: every prefix asks for more, then the whole
+        // extent completes, and the trailer-section byte count is not
+        // double-counted across re-entry.
+        let wire = b"3\r\nfoo\r\n4\r\nbars\r\n0\r\nx-a: 1\r\nx-b: 2\r\n\r\n";
+        let mut s = ChunkScan::default();
+        for cut in 0..wire.len() {
+            assert_eq!(scan(&wire[..cut], &mut s), Ok(None), "cut {cut}");
+        }
+        assert_eq!(scan(wire, &mut s), Ok(Some(wire.len())));
+        let (entity, trailers) = decode(wire).expect("decodes");
+        assert_eq!(&entity[..], b"foobars");
+        assert_eq!(trailers.len(), 2);
+    }
+
     #[test]
     fn decode_rejects_trailing_garbage() {
         // decode requires the message to occupy the wire exactly — the
