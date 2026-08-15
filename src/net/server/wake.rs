@@ -324,7 +324,8 @@ where
                 Injected::Reply(t, _)
                 | Injected::ReplyClose(t, _)
                 | Injected::Done(t)
-                | Injected::Close(t) => *t,
+                | Injected::Close(t)
+                | Injected::Redeliver(t) => *t,
                 Injected::Push { .. }
                 | Injected::PushClose { .. }
                 | Injected::DetachResume { .. }
@@ -392,6 +393,25 @@ where
                         token.generation as u32,
                         CloseReason::WorkerClosed,
                     )?;
+                }
+                Injected::Redeliver(_) => {
+                    // The worker asks for a second delivery instead of
+                    // supplying bytes: retire the parked request's in-flight
+                    // count, then run the body handler again over the (empty)
+                    // current frame — the protocol glue retained the request
+                    // in its connection state. `deliver_one` mints a fresh
+                    // req_id and enacts the returned `Response` exactly as a
+                    // first delivery would, so the rerun may reply, defer
+                    // again, or close. Runs during graceful drain like a
+                    // `Reply` — the drain's promise is that deferred work
+                    // finishes — and the pump then closes the connection once
+                    // the reply flushes.
+                    {
+                        let conn = self.core.table.conn_mut(token.slot);
+                        conn.outstanding = conn.outstanding.saturating_sub(1);
+                    }
+                    self.deliver_one(token.slot, token.generation as u32)?;
+                    self.pump(token.slot, token.generation as u32)?;
                 }
                 Injected::Push { .. }
                 | Injected::PushClose { .. }

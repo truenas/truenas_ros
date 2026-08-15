@@ -48,7 +48,11 @@ pub enum Response {
     /// so "deferred" cannot be claimed without an actual [`Deferred`] existing
     /// to eventually resolve (or drop-close) the request. The permit's routing
     /// token is verified at delivery; one stashed from a different request
-    /// closes the connection instead of parking an unresolvable request.
+    /// closes the connection instead of parking an unresolvable request. The
+    /// worker resolves the park one of three ways: [`Deferred::reply`] with
+    /// the bytes, [`Deferred::redeliver`] to run the body handler again on the
+    /// server thread (for protocol glue that retained the request in its
+    /// connection state), or [`Deferred::close`].
     Defer(DeferPermit),
     /// **Detach** the connection: hand its socket fd to your own worker for a
     /// blocking operation (e.g. ZFS send/recv), then resume or close it. Carries

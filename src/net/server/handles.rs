@@ -169,6 +169,21 @@ impl Deferred {
         let _ = self.tx.send(Injected::Close(self.token));
         self.shared.wake.poke();
     }
+
+    /// Re-deliver this request to the body handler instead of supplying bytes
+    /// — for protocol glue that retained the request in its connection state
+    /// (`&mut U`) and completes it on the server thread, where the state and
+    /// the serialization context live. The handler runs again with an empty
+    /// frame (the original bytes were consumed at first delivery), counted as
+    /// a fresh delivery; it may reply, defer again, or close. Rides the same
+    /// token gauntlet as a reply: a redelivery for a request already answered,
+    /// or whose connection closed or slot was recycled, is dropped safely.
+    /// Consumes the handle.
+    pub fn redeliver(mut self) {
+        self.done = true;
+        let _ = self.tx.send(Injected::Redeliver(self.token));
+        self.shared.wake.poke();
+    }
 }
 
 impl Drop for Deferred {
@@ -463,6 +478,10 @@ pub(super) enum Injected {
     /// Close the connection (explicit worker decision, or a dropped/lost
     /// [`Deferred`]).
     Close(Token),
+    /// Run the body handler again for this request ([`Deferred::redeliver`])
+    /// — the frame is empty; the consumer's protocol glue retained what it
+    /// needs in its connection state.
+    Redeliver(Token),
     /// An unsolicited push ([`PushHandle::push`]) — not tied to any request.
     Push {
         slot: u32,

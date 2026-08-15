@@ -682,6 +682,140 @@ fn tcp_deferred_drop_closes() {
     }
 }
 
+#[test]
+fn tcp_redelivered_request() {
+    // A body handler stashes the request in its connection state, defers, and
+    // the worker asks for a SECOND delivery via `Deferred::redeliver` instead
+    // of supplying bytes — the pattern protocol glue (http) uses to complete a
+    // parked request on the server thread. The rerun sees the stash, replies,
+    // and keep-alive continues: two messages each make the full
+    // park-and-redeliver round trip on one connection.
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    type Stash = Option<Vec<u8>>;
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(None::<Vec<u8>>),
+        header: length_prefix_header::<Stash>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: |req: Request<'_, Stash>| {
+            let Request {
+                body,
+                responder,
+                state,
+                ..
+            } = req;
+            match state.take() {
+                // Second delivery: the frame is empty; answer from the stash.
+                Some(stashed) => {
+                    Response::Reply(echo_frame(&stashed.to_ascii_uppercase()))
+                }
+                // First delivery: retain the request, park, redeliver later.
+                None => {
+                    *state = Some(body.to_vec());
+                    let (deferred, permit) = responder.defer();
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(10));
+                        deferred.redeliver();
+                    });
+                    Response::Defer(permit)
+                }
+            }
+        },
+    };
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stats = server.stats_handle();
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        let msgs: &[&[u8]] = &[b"hello", b"world"];
+        let r = connect_tcp(v4).and_then(|s| framed_roundtrips(s, msgs));
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    let replies = client.join().expect("thread join").expect("client io");
+    assert_eq!(replies, vec![b"HELLO".to_vec(), b"WORLD".to_vec()]);
+    // Each message was delivered twice (park, then redelivery) and answered
+    // exactly once.
+    let s = stats.snapshot();
+    assert_eq!(s.requests, 4, "two deliveries per message");
+    assert_eq!(s.deferred, 2, "one park per message");
+    assert_eq!(s.replies, 2, "one reply per message");
+}
+
+#[test]
+fn tcp_stale_redeliver_dropped() {
+    // A handler answers INLINE while leaking a `Deferred` whose worker later
+    // calls `redeliver()`. The request was never opened as deferred, so the
+    // late redelivery must be inert — no extra handler run, no extra reply —
+    // and the connection stays healthy for a second round trip.
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: |req: Request<'_, ()>| {
+            let Request {
+                body, responder, ..
+            } = req;
+            let reply = echo_frame(&body);
+            let (deferred, permit) = responder.defer();
+            let _ = permit; // answered inline: the Deferred goes stale
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(30));
+                deferred.redeliver();
+            });
+            Response::Reply(reply)
+        },
+    };
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stats = server.stats_handle();
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        let r = (|| -> io::Result<Vec<u8>> {
+            let mut s = connect_tcp(v4)?;
+            let first = framed_roundtrips(&mut s, &[b"one"])?;
+            // Let the stale redeliver fire against the answered request.
+            thread::sleep(Duration::from_millis(60));
+            let second = framed_roundtrips(&mut s, &[b"two"])?;
+            Ok([first, second].concat().concat())
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    let bytes = client.join().expect("thread join").expect("client io");
+    assert_eq!(bytes, b"onetwo".to_vec());
+    // The stale redelivery ran no handler and sent nothing.
+    let s = stats.snapshot();
+    assert_eq!(s.requests, 2, "no handler rerun from the stale redeliver");
+    assert_eq!(s.replies, 2);
+}
+
 /// Borrow a furnished detach fd as a BLOCKING stream WITHOUT owning it — the
 /// `Detached` handle owns and closes it, so this must not (hence `ManuallyDrop`,
 /// whose drop is a no-op). The fd inherits the pool socket's non-blocking mode,
