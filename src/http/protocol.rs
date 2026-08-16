@@ -28,7 +28,9 @@ use super::framer::{frame, HttpConfig, HttpConn, Phase};
 use super::head::{
     method_is_head, parse_head, Head, HeaderView, Version, MAX_HEADERS,
 };
-use super::response::{serialize, ConnHeader, HttpResponse};
+use super::response::{
+    serialize, serialize_reply, ConnHeader, HttpResponse, Serialized,
+};
 
 /// One HTTP request, as handed to the consumer's handler.
 ///
@@ -268,18 +270,33 @@ fn respond(
     // compatibility and make the exchange non pipelinable instead. The
     // reply drops keep alive so no pipelined request rides behind a
     // smuggled prefix on this connection.
-    let keep = head.keep_alive() && !resp.close && !head.cl_te_conflict();
+    let (keep_alive, cl_te_conflict) = head.response_disposition();
+    let keep = keep_alive && !resp.close && !cl_te_conflict;
     let conn = match (keep, head.version) {
         (true, Version::Http11) => ConnHeader::None,
         (true, Version::Http10) => ConnHeader::KeepAlive,
         (false, _) => ConnHeader::Close,
     };
-    let bytes =
-        serialize(&resp, head.method == "HEAD", dates.get(now_secs()), conn);
-    if keep {
-        Response::Reply(bytes)
-    } else {
-        Response::ReplyClose(bytes)
+    let head_only = head.method == "HEAD";
+    match serialize_reply(resp, head_only, dates.get(now_secs()), conn) {
+        // A response with a body hands its head and body as separate segments,
+        // scattered vectored so the body is never copied into the head buffer;
+        // a HEAD or bodyless response is just the head. Keep-alive vs close is
+        // the same disposition either way.
+        Serialized::Split {
+            head: head_bytes,
+            body,
+        } => Response::ReplyVectored {
+            segments: vec![head_bytes, body],
+            close: !keep,
+        },
+        Serialized::HeadOnly(bytes) => {
+            if keep {
+                Response::Reply(bytes)
+            } else {
+                Response::ReplyClose(bytes)
+            }
+        }
     }
 }
 
@@ -727,14 +744,32 @@ mod tests {
         HttpConfig::default()
     }
 
-    /// Reply bytes as text, whatever the verdict.
-    fn text(resp: &Response) -> &str {
-        match resp {
-            Response::Reply(b) | Response::ReplyClose(b) => {
-                std::str::from_utf8(b).expect("responses are ascii here")
-            }
+    /// Reply bytes as text, whatever the verdict — a vectored reply is
+    /// flattened, since on the wire its segments are one contiguous PDU.
+    fn text(resp: &Response) -> String {
+        let bytes = match resp {
+            Response::Reply(b) | Response::ReplyClose(b) => b.clone(),
+            Response::ReplyVectored { segments, .. } => segments.concat(),
             other => panic!("expected reply bytes, got {other:?}"),
-        }
+        };
+        String::from_utf8(bytes).expect("responses are ascii here")
+    }
+
+    /// A keep-alive reply (`Reply`, or a vectored reply that keeps serving).
+    fn is_keep(resp: &Response) -> bool {
+        matches!(
+            resp,
+            Response::Reply(_) | Response::ReplyVectored { close: false, .. }
+        )
+    }
+
+    /// A flush-close reply (`ReplyClose`, or a vectored reply that closes).
+    fn is_close(resp: &Response) -> bool {
+        matches!(
+            resp,
+            Response::ReplyClose(_)
+                | Response::ReplyVectored { close: true, .. }
+        )
     }
 
     /// Frame one complete single-message request and run the glue on it,
@@ -794,7 +829,7 @@ mod tests {
             &mut conn,
             &mut handler,
         );
-        assert!(matches!(resp, Response::Reply(_)));
+        assert!(is_keep(&resp));
         let s = text(&resp);
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("Content-Length: 5\r\n"));
@@ -802,6 +837,56 @@ mod tests {
         assert!(s.ends_with("\r\n\r\nhello"));
         assert_eq!(conn.state, 1);
         assert!(matches!(conn.phase, Phase::Head));
+    }
+
+    #[test]
+    fn a_body_response_splits_head_and_body_into_segments() {
+        // A response carrying a body is handed over as separate head and body
+        // segments (sent vectored, never concatenated); flattened they are a
+        // well-formed response with the body after the head.
+        let mut handler = |_: HttpRequest<'_>, _: &mut ()| {
+            HttpResponse::new(200).body("hello, body")
+        };
+        let resp = roundtrip(
+            b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n",
+            &mut HttpConn::new(()),
+            &mut handler,
+        );
+        let Response::ReplyVectored { segments, close } = &resp else {
+            panic!("a body response must be vectored, got {resp:?}");
+        };
+        assert!(!close, "keep-alive request → no close");
+        assert_eq!(segments.len(), 2, "head + body");
+        assert!(segments[0].starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(
+            segments[0].ends_with(b"\r\n\r\n"),
+            "head ends at blank line"
+        );
+        assert_eq!(segments[1], b"hello, body", "body is its own segment");
+        let s = text(&resp);
+        assert!(s.contains("Content-Length: 11\r\n"));
+        assert!(s.ends_with("\r\n\r\nhello, body"));
+    }
+
+    #[test]
+    fn a_bodyless_response_stays_one_buffer() {
+        // No body (an empty-body 200, and a status that forbids one) → a
+        // single head buffer, not a vectored reply.
+        let mut empty = |_: HttpRequest<'_>, _: &mut ()| HttpResponse::new(200);
+        let resp = roundtrip(
+            b"GET / HTTP/1.1\r\nHost: h\r\n\r\n",
+            &mut HttpConn::new(()),
+            &mut empty,
+        );
+        assert!(matches!(resp, Response::Reply(_)), "empty body: {resp:?}");
+        let mut no_content =
+            |_: HttpRequest<'_>, _: &mut ()| HttpResponse::new(204);
+        let resp = roundtrip(
+            b"GET / HTTP/1.1\r\nHost: h\r\n\r\n",
+            &mut HttpConn::new(()),
+            &mut no_content,
+        );
+        assert!(matches!(resp, Response::Reply(_)), "204: {resp:?}");
     }
 
     #[test]
@@ -813,7 +898,7 @@ mod tests {
             &mut HttpConn::new(()),
             &mut ok,
         );
-        assert!(matches!(resp, Response::ReplyClose(_)));
+        assert!(is_close(&resp));
         assert!(text(&resp).contains("Connection: close\r\n"));
         // HTTP/1.0 with negotiated keep-alive echoes it.
         let resp = roundtrip(
@@ -821,7 +906,7 @@ mod tests {
             &mut HttpConn::new(()),
             &mut ok,
         );
-        assert!(matches!(resp, Response::Reply(_)));
+        assert!(is_keep(&resp));
         assert!(text(&resp).contains("Connection: keep-alive\r\n"));
         // HTTP/1.1 with Connection: close farewells.
         let resp = roundtrip(
@@ -829,7 +914,7 @@ mod tests {
             &mut HttpConn::new(()),
             &mut ok,
         );
-        assert!(matches!(resp, Response::ReplyClose(_)));
+        assert!(is_close(&resp));
         assert!(text(&resp).contains("Connection: close\r\n"));
         // Handler-forced close overrides negotiated keep-alive.
         let mut closer =
@@ -839,7 +924,7 @@ mod tests {
             &mut HttpConn::new(()),
             &mut closer,
         );
-        assert!(matches!(resp, Response::ReplyClose(_)));
+        assert!(is_close(&resp));
     }
 
     #[test]
@@ -858,10 +943,7 @@ mod tests {
             HttpResponse::new(200)
         };
         let resp = roundtrip(&raw, &mut HttpConn::new(()), &mut handler);
-        assert!(
-            matches!(resp, Response::ReplyClose(_)),
-            "CL plus TE must farewell, got {resp:?}"
-        );
+        assert!(is_close(&resp), "CL plus TE must farewell, got {resp:?}");
         assert!(text(&resp).contains("Connection: close\r\n"));
 
         // A chunked request without a Content-Length is no conflict and it
@@ -872,10 +954,7 @@ mod tests {
         raw.extend_from_slice(b"5\r\nhello\r\n0\r\n\r\n");
         let mut ok = |_: HttpRequest<'_>, _: &mut ()| HttpResponse::new(200);
         let resp = roundtrip(&raw, &mut HttpConn::new(()), &mut ok);
-        assert!(
-            matches!(resp, Response::Reply(_)),
-            "TE only stays keep alive, got {resp:?}"
-        );
+        assert!(is_keep(&resp), "TE only stays keep alive, got {resp:?}");
         assert!(!text(&resp).contains("Connection: close"));
     }
 
@@ -962,7 +1041,7 @@ mod tests {
         );
         let resp =
             drive(b"", Body::inline(b"abc"), &p, &mut conn, &mut handler);
-        assert!(matches!(resp, Response::Reply(_)));
+        assert!(is_keep(&resp));
         assert!(text(&resp).starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(matches!(conn.phase, Phase::Head));
     }
@@ -978,7 +1057,7 @@ mod tests {
             |_: HttpRequest<'_>, _: &mut ()| panic!("handler must not run");
         let resp =
             drive(junk, Body::inline(b""), &p, &mut conn, &mut unreached);
-        assert!(matches!(resp, Response::ReplyClose(_)));
+        assert!(is_close(&resp));
         let s = text(&resp);
         assert!(s.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(s.contains("Connection: close\r\n"));
@@ -1079,7 +1158,7 @@ mod tests {
         };
         let mut conn = HttpConn::new(0u32);
         let resp = roundtrip(&raw, &mut conn, &mut handler);
-        assert!(matches!(resp, Response::Reply(_)));
+        assert!(is_keep(&resp));
         assert_eq!(conn.state, 1);
         assert!(matches!(conn.phase, Phase::Head));
     }
@@ -1100,7 +1179,7 @@ mod tests {
             HttpResponse::new(200)
         };
         let resp = roundtrip(&raw, &mut HttpConn::new(()), &mut handler);
-        assert!(matches!(resp, Response::Reply(_)));
+        assert!(is_keep(&resp));
     }
 
     #[test]
@@ -1165,7 +1244,7 @@ mod tests {
             }
         );
         let resp = drive(b"", Body::inline(&wire), &p, &mut conn, &mut handler);
-        assert!(matches!(resp, Response::Reply(_)));
+        assert!(is_keep(&resp));
         assert!(text(&resp).starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(matches!(conn.phase, Phase::Head));
     }
@@ -1198,7 +1277,7 @@ mod tests {
             &mut conn,
             &mut handler,
         );
-        assert!(matches!(resp, Response::Reply(_)));
+        assert!(is_keep(&resp));
     }
 
     #[test]
@@ -1247,7 +1326,7 @@ mod tests {
             }
         );
         let resp = drive(b"", Body::placed(wire), &p, &mut conn, &mut handler);
-        assert!(matches!(resp, Response::Reply(_)));
+        assert!(is_keep(&resp));
         assert!(text(&resp).starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(matches!(conn.phase, Phase::Head));
     }
@@ -1288,7 +1367,7 @@ mod tests {
             &mut conn,
             &mut handler,
         );
-        assert!(matches!(resp, Response::Reply(_)));
+        assert!(is_keep(&resp));
     }
 
     // ---- parking ----
@@ -1370,7 +1449,7 @@ mod tests {
         // The worker warms its state and asks for the rerun.
         parked.borrow_mut().take().expect("parked").redrive();
         let done = complete_parked(&mut conn, &mut handler);
-        assert!(matches!(done, Response::Reply(_)), "got {done:?}");
+        assert!(is_keep(&done), "got {done:?}");
         assert!(text(&done).starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(text(&done).ends_with("\r\n\r\ndone"));
         assert_eq!(conn.state, 2, "one park, one rerun");
@@ -1398,7 +1477,7 @@ mod tests {
             .expect("parked")
             .reply(HttpResponse::new(200).head_content_length(4096));
         let done = complete_parked(&mut conn, &mut unreached_verdict);
-        assert!(matches!(done, Response::Reply(_)), "got {done:?}");
+        assert!(is_keep(&done), "got {done:?}");
         let s = text(&done);
         assert!(s.contains("Content-Length: 4096\r\n"), "{s}");
         assert!(s.ends_with("\r\n\r\n"), "{s}");
@@ -1430,7 +1509,7 @@ mod tests {
             .reply(HttpResponse::new(200));
         let done = complete_parked(&mut conn, &mut unreached_verdict);
         assert!(
-            matches!(done, Response::ReplyClose(_)),
+            is_close(&done),
             "CL plus TE must farewell after a park too, got {done:?}"
         );
         assert!(text(&done).contains("Connection: close\r\n"));
@@ -1456,7 +1535,7 @@ mod tests {
             .expect("parked")
             .reply(HttpResponse::new(200));
         let done = complete_parked(&mut conn, &mut unreached_verdict);
-        assert!(matches!(done, Response::Reply(_)));
+        assert!(is_keep(&done));
         assert!(text(&done).contains("Connection: keep-alive\r\n"));
     }
 
@@ -1512,7 +1591,7 @@ mod tests {
         assert!(matches!(resp, Response::Defer(_)));
         parked.borrow_mut().take().expect("parked").redrive();
         let done = complete_parked(&mut conn, &mut handler);
-        assert!(matches!(done, Response::Reply(_)));
+        assert!(is_keep(&done));
         assert!(text(&done).starts_with("HTTP/1.1 200 OK\r\n"));
         assert_eq!(conn.state, 2);
     }
@@ -1548,7 +1627,7 @@ mod tests {
         assert!(matches!(resp, Response::Defer(_)));
         parked.borrow_mut().take().expect("parked").redrive();
         let done = complete_parked(&mut conn, &mut handler);
-        assert!(matches!(done, Response::Reply(_)));
+        assert!(is_keep(&done));
         assert_eq!(conn.state, 2);
     }
 
@@ -1582,7 +1661,7 @@ mod tests {
             .expect("second park")
             .reply(HttpResponse::new(204));
         let done = complete_parked(&mut conn, &mut unreached_verdict);
-        assert!(matches!(done, Response::Reply(_)));
+        assert!(is_keep(&done));
         assert!(text(&done).starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(conn.state, 2);
     }

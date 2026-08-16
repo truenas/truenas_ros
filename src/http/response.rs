@@ -279,21 +279,58 @@ pub(crate) fn serialize(
     date: &[u8],
     conn: ConnHeader,
 ) -> Vec<u8> {
+    let bodyless = matches!(resp.status, 100..=199 | 204 | 304);
+    let body_cap = if head_only || bodyless {
+        0
+    } else {
+        resp.body.len()
+    };
+    let mut out = Vec::with_capacity(head_capacity(resp) + body_cap);
+    write_head(&mut out, resp, head_only, date, conn);
+    if !head_only && !bodyless {
+        out.extend_from_slice(&resp.body);
+    }
+    out
+}
+
+/// The response head (status line through the terminating blank line) alone,
+/// no body — for [`serialize_reply`]'s split path, where the body rides its
+/// own send segment instead of being copied in here.
+pub(crate) fn serialize_head(
+    resp: &HttpResponse,
+    head_only: bool,
+    date: &[u8],
+    conn: ConnHeader,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(head_capacity(resp));
+    write_head(&mut out, resp, head_only, date, conn);
+    out
+}
+
+/// Head-buffer capacity estimate (status line + `Date` + `Content-Length` +
+/// `Connection` + the consumer headers + terminators); the body is accounted
+/// separately by [`serialize`].
+fn head_capacity(resp: &HttpResponse) -> usize {
+    128 + resp
+        .headers
+        .iter()
+        .map(|(n, v)| n.len() + v.len() + 4)
+        .sum::<usize>()
+}
+
+/// Write the response head into `out`: status line, `Date`, `Content-Length`
+/// (elided for 1xx/204/304), the `Connection` header, the consumer headers,
+/// and the terminating blank line. No body.
+fn write_head(
+    out: &mut Vec<u8>,
+    resp: &HttpResponse,
+    head_only: bool,
+    date: &[u8],
+    conn: ConnHeader,
+) {
     use std::io::Write;
 
     let bodyless = matches!(resp.status, 100..=199 | 204 | 304);
-    let mut out = Vec::with_capacity(
-        128 + resp
-            .headers
-            .iter()
-            .map(|(n, v)| n.len() + v.len() + 4)
-            .sum::<usize>()
-            + if head_only || bodyless {
-                0
-            } else {
-                resp.body.len()
-            },
-    );
     // Vec<u8> Write is infallible; unwraps here cannot fire.
     write!(out, "HTTP/1.1 {} {}\r\n", resp.status, reason(resp.status))
         .unwrap();
@@ -322,10 +359,45 @@ pub(crate) fn serialize(
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"\r\n");
-    if !head_only && !bodyless {
-        out.extend_from_slice(&resp.body);
+}
+
+/// A serialized response, ready to hand the reactor as a reply.
+pub(crate) enum Serialized {
+    /// The head alone — a HEAD or bodyless (1xx/204/304) response carries no
+    /// body, so there is one buffer and nothing to scatter.
+    HeadOnly(Vec<u8>),
+    /// Head and body as separate buffers, sent vectored so the body is never
+    /// copied into the head buffer.
+    Split {
+        /// The response head (status line through the blank line).
+        head: Vec<u8>,
+        /// The response body, its own send segment.
+        body: Vec<u8>,
+    },
+}
+
+/// Serialize `resp` into a head buffer and, when the response carries a body,
+/// the body as its own segment — so the send path scatters head + body with
+/// one vectored write rather than copying the body into the head buffer.
+/// Whether a second iovec is worth it is the reactor's business, not the
+/// codec's: this always splits, keeping the serializer free of transport
+/// policy. Consumes `resp` so the split moves the owned body without copying.
+pub(crate) fn serialize_reply(
+    resp: HttpResponse,
+    head_only: bool,
+    date: &[u8],
+    conn: ConnHeader,
+) -> Serialized {
+    let bodyless = matches!(resp.status, 100..=199 | 204 | 304);
+    if head_only || bodyless || resp.body.is_empty() {
+        Serialized::HeadOnly(serialize_head(&resp, head_only, date, conn))
+    } else {
+        let head = serialize_head(&resp, head_only, date, conn);
+        Serialized::Split {
+            head,
+            body: resp.body.into_owned(),
+        }
     }
-    out
 }
 
 /// Reason phrase for the statuses this stack emits; empty for the rest

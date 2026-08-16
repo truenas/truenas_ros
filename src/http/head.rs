@@ -297,6 +297,11 @@ impl Head<'_> {
     /// default and any `Connection` header tokens. `Connection` is
     /// list-typed: tokens count no matter which field line carries them
     /// (RFC 9110 §5.3 — repeated field lines are one combined list).
+    ///
+    /// At runtime the glue reads this via
+    /// [`response_disposition`](Self::response_disposition); the method remains
+    /// as the tests' oracle asserting the one-pass read agrees.
+    #[cfg(test)]
     pub fn keep_alive(&self) -> bool {
         match self.version {
             Version::Http11 => !has_token(self.views(), "connection", b"close"),
@@ -317,6 +322,11 @@ impl Head<'_> {
     /// pipelinable. The response glue forces the connection to close on a
     /// conflict, so no later request shares the connection with a smuggled
     /// prefix.
+    ///
+    /// At runtime the glue reads this via
+    /// [`response_disposition`](Self::response_disposition); the method remains
+    /// as the tests' oracle.
+    #[cfg(test)]
     pub fn cl_te_conflict(&self) -> bool {
         let mut has_cl = false;
         let mut has_te = false;
@@ -328,6 +338,39 @@ impl Head<'_> {
             }
         }
         has_cl && has_te
+    }
+
+    /// The two facts the response glue needs, resolved in a single pass over
+    /// the header list: `(keep_alive, cl_te_conflict)`. Equivalent to
+    /// [`keep_alive`](Self::keep_alive) and
+    /// [`cl_te_conflict`](Self::cl_te_conflict) (kept as the oracle), computed
+    /// together so `respond` walks the headers once rather than twice.
+    pub fn response_disposition(&self) -> (bool, bool) {
+        let mut conn_close = false;
+        let mut conn_keep = false;
+        let mut has_cl = false;
+        let mut has_te = false;
+        for h in self.views() {
+            if h.name.eq_ignore_ascii_case("connection") {
+                for t in h.value.split(|&b| b == b',') {
+                    let t = t.trim_ascii();
+                    if t.eq_ignore_ascii_case(b"close") {
+                        conn_close = true;
+                    } else if t.eq_ignore_ascii_case(b"keep-alive") {
+                        conn_keep = true;
+                    }
+                }
+            } else if h.name.eq_ignore_ascii_case("content-length") {
+                has_cl = true;
+            } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+                has_te = true;
+            }
+        }
+        let keep_alive = match self.version {
+            Version::Http11 => !conn_close,
+            Version::Http10 => conn_keep,
+        };
+        (keep_alive, has_cl && has_te)
     }
 }
 
@@ -815,6 +858,33 @@ mod tests {
         complete(b"GET / HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n", |h10| {
             assert!(h10.keep_alive())
         });
+    }
+
+    #[test]
+    fn response_disposition_agrees_with_the_oracle() {
+        // The one-pass method must equal the two individual walks across the
+        // keep-alive and CL/TE shapes that decide the response disposition.
+        let cases: &[&[u8]] = &[
+            b"GET / HTTP/1.1\r\nHost: h\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: h\r\nConnection: keep-alive, foo\r\n\r\n",
+            b"GET / HTTP/1.0\r\n\r\n",
+            b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
+            b"GET / HTTP/1.0\r\nConnection: close\r\n\r\n",
+            b"PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\n",
+            b"PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ];
+        for c in cases {
+            complete(c, |h| {
+                assert_eq!(
+                    h.response_disposition(),
+                    (h.keep_alive(), h.cl_te_conflict()),
+                    "{c:?}"
+                );
+            });
+        }
     }
 
     #[test]
