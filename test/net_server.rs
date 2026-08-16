@@ -172,6 +172,66 @@ fn tcp_echo() {
 }
 
 #[test]
+fn tcp_vectored_reply() {
+    // A `ReplyVectored`'s segments reach the client concatenated in order (one
+    // vectored write), and the reply retires its `outstanding` count exactly
+    // once — only the last segment is `is_reply` — so keep-alive keeps
+    // serving: three sequential roundtrips are not stranded behind the
+    // read-ahead cap. A wrong `is_reply` count would wedge the second.
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: |req: Request<'_, ()>| {
+            let Request { body, .. } = req;
+            // Echo as two segments: the length prefix, then the payload.
+            let payload = body[..].to_vec();
+            let prefix = (payload.len() as u32).to_be_bytes().to_vec();
+            Response::ReplyVectored {
+                segments: vec![prefix, payload],
+                close: false,
+            }
+        },
+    };
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = connect_tcp(v4).and_then(|s| {
+            framed_roundtrips(
+                s,
+                &[b"one" as &[u8], b"two", b"the third message"],
+            )
+        });
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    let echoes = client.join().expect("thread join").expect("client io");
+    assert_eq!(
+        echoes,
+        vec![
+            b"one".to_vec(),
+            b"two".to_vec(),
+            b"the third message".to_vec(),
+        ]
+    );
+}
+
+#[test]
 fn unix_echo() {
     let dir = truenas_ros::tempdir().unwrap();
     let path = dir.path().join("echo.sock");

@@ -18,7 +18,9 @@ use crate::net::core::protocol::{
 /// on the server thread (an **empty** reply means "answered, nothing to send":
 /// useful for one-way/notification messages; the connection stays open and
 /// reads continue). `ReplyClose` sends a **final** reply and then closes once
-/// it has flushed (the server speaks last). `Defer` hands the reply off to be
+/// it has flushed (the server speaks last). `ReplyVectored` is either of those
+/// sent as ordered segments gathered in one vectored write, so a header and its
+/// payload need not be concatenated. `Defer` hands the reply off to be
 /// delivered later from another thread via a [`Deferred`] detached from the
 /// request's [`Responder`], letting the server thread return immediately to
 /// polling; `Close` ends the connection without replying.
@@ -43,6 +45,27 @@ pub enum Response {
     /// — **not** `idle_timeout`/`request_timeout`, which no longer apply once
     /// flush-closing — so set one of those when serving untrusted peers.
     ReplyClose(Vec<u8>),
+    /// Send this reply as an ordered sequence of byte segments, scattered to
+    /// the socket with a single vectored write — so a protocol can hand the
+    /// server a header and a payload as separate buffers instead of
+    /// concatenating them (an HTTP head + body, an SMB read header + file
+    /// data, an NFS reply header + data). Protocol-neutral: the server never
+    /// inspects the boundaries, it just gathers them. Empty segments are
+    /// skipped; an all-empty reply sends nothing (a one-way message).
+    ///
+    /// `close` selects the disposition: `false` behaves like [`Reply`] (keep
+    /// serving), `true` like [`ReplyClose`] (flush everything queued, then
+    /// close, reported as [`CloseReason::HandlerClosed`]).
+    ///
+    /// [`Reply`]: Response::Reply
+    /// [`ReplyClose`]: Response::ReplyClose
+    ReplyVectored {
+        /// The reply's byte segments, in send order.
+        segments: Vec<Vec<u8>>,
+        /// Close the connection once the reply (and everything queued before
+        /// it) has flushed.
+        close: bool,
+    },
     /// The reply will arrive later through a [`Deferred`]. Carries the
     /// [`DeferPermit`] proof minted by **this request's** [`Responder::defer`],
     /// so "deferred" cannot be claimed without an actual [`Deferred`] existing

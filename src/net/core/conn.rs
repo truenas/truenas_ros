@@ -718,6 +718,30 @@ impl<U> Connection<U> {
         self.enqueue(bytes, true);
     }
 
+    /// Queue a multi-segment reply, sent vectored (the segments are separate
+    /// buffers `arm_send` gathers). The whole reply is one logical response:
+    /// only its **last non-empty** segment is flagged `is_reply`, so
+    /// `advance_sent` retires the request's `outstanding` count exactly once,
+    /// when the final segment flushes — not once per segment. Empty segments
+    /// are dropped. Returns whether any bytes were queued; an all-empty reply
+    /// queues nothing (a one-way message), for which the caller must not bump
+    /// `outstanding`.
+    pub(crate) fn enqueue_reply_segments(
+        &mut self,
+        segments: Vec<Vec<u8>>,
+    ) -> bool {
+        let Some(last) = segments.iter().rposition(|s| !s.is_empty()) else {
+            return false;
+        };
+        for (i, seg) in segments.into_iter().enumerate() {
+            if seg.is_empty() {
+                continue;
+            }
+            self.enqueue(seg, i == last);
+        }
+        true
+    }
+
     /// Queue a pushed PDU (FIFO behind everything already queued; pushes
     /// never count against the read-ahead cap).
     pub(crate) fn enqueue_push(&mut self, bytes: Vec<u8>) {

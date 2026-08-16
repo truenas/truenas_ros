@@ -256,6 +256,31 @@ where
                 }
                 self.core.drive_flush_close(slot, generation)
             }
+            // One logical reply sent as vectored segments (a header + payload
+            // the protocol handed over separately). Mirrors Reply/ReplyClose:
+            // bump `outstanding` once iff any bytes are queued — the segment
+            // helper flags only the last non-empty segment, so the retire
+            // count stays one — then keep serving or flush-close on `close`.
+            Response::ReplyVectored { segments, close } => {
+                let queued = {
+                    let conn = self.core.table.conn_mut(slot);
+                    let queued = conn.enqueue_reply_segments(segments);
+                    if queued {
+                        conn.outstanding += 1;
+                    }
+                    if close {
+                        conn.close_on_flush = Some(CloseReason::HandlerClosed);
+                    }
+                    queued
+                };
+                if close {
+                    self.core.drive_flush_close(slot, generation)
+                } else if queued {
+                    self.core.kick_send(slot, generation)
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 

@@ -226,14 +226,22 @@ impl IdmapCache {
         gid_map: &[IdmapEntry],
     ) -> Result<OwnedFd> {
         let key = (key_of(uid_map), key_of(gid_map));
-        let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(fd) = guard.get(&key) {
-            return dup(fd);
+        // Hold the map lock only for the O(1) lookup, never across the mint:
+        // a slow namespace creation for one key must not block a lookup of
+        // any other, and must not wedge every idmapped mount if it stalls.
+        {
+            let guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(fd) = guard.get(&key) {
+                return dup(fd);
+            }
         }
+        // Minting outside the lock lets two callers race the same key; both
+        // create a namespace, and the keep-the-winner insert drops the
+        // loser's fd, reclaiming its namespace. Redundant creation is rare
+        // and bounded — the key space is a handful of mount configs.
         let fd = create_idmap_userns(uid_map, gid_map)?;
-        let out = dup(&fd)?;
-        guard.insert(key, fd);
-        Ok(out)
+        let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        dup(guard.entry(key).or_insert(fd))
     }
 
     /// Drop every cached namespace. Fds returned earlier stay valid; the next
