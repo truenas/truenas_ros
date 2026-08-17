@@ -379,8 +379,9 @@ pub(crate) enum Serialized {
     Split {
         /// The response head (status line through the blank line).
         head: Vec<u8>,
-        /// The response body, its own send segment.
-        body: Vec<u8>,
+        /// The response body, its own send segment: owned bytes moved,
+        /// `'static` bytes borrowed — the handler's storage either way.
+        body: Cow<'static, [u8]>,
     },
 }
 
@@ -389,8 +390,8 @@ pub(crate) enum Serialized {
 /// one vectored write rather than copying the body into the head buffer.
 /// A HEAD response, a bodyless status (1xx/204/304), or an empty body has
 /// nothing to scatter and yields [`Serialized::HeadOnly`]; any other response
-/// splits. Consumes `resp` so an owned body moves into its segment without
-/// copying (a borrowed body is materialized once by `into_owned`).
+/// splits. Consumes `resp` so the body — owned or `'static` — rides into its
+/// segment as stored, without a copy.
 pub(crate) fn serialize_reply(
     resp: HttpResponse,
     head_only: bool,
@@ -404,7 +405,7 @@ pub(crate) fn serialize_reply(
         let head = serialize_head(&resp, head_only, date, conn);
         Serialized::Split {
             head,
-            body: resp.body.into_owned(),
+            body: resp.body,
         }
     }
 }
@@ -676,5 +677,36 @@ mod tests {
             ConnHeader::None,
         );
         assert!(text(&ok).contains("Content-Length: 0\r\n"));
+    }
+
+    #[test]
+    fn split_sends_a_static_body_by_reference() {
+        // The zero-copy contract: a `'static` body rides into its segment as
+        // the same bytes at the same address. A copy reintroduced anywhere in
+        // serialize_reply moves the pointer and fails here.
+        static BODY: &[u8] = b"hello, body";
+        let resp = HttpResponse::new(200).body(BODY);
+        let Serialized::Split { body, .. } =
+            serialize_reply(resp, false, &date(), ConnHeader::None)
+        else {
+            panic!("a bodied response must split");
+        };
+        assert_eq!(body.as_ptr(), BODY.as_ptr());
+        assert_eq!(&body[..], BODY);
+    }
+
+    #[test]
+    fn split_moves_an_owned_body_without_copying() {
+        // Same contract for the owned shape: the handler's allocation is the
+        // segment — moved, not reallocated.
+        let owned = b"hello, body".to_vec();
+        let ptr = owned.as_ptr();
+        let resp = HttpResponse::new(200).body(owned);
+        let Serialized::Split { body, .. } =
+            serialize_reply(resp, false, &date(), ConnHeader::None)
+        else {
+            panic!("a bodied response must split");
+        };
+        assert_eq!(body.as_ptr(), ptr);
     }
 }

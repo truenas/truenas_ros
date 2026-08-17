@@ -5,6 +5,7 @@
 use crate::errno::Errno;
 #[cfg(all(doc, feature = "net-server"))]
 use crate::net::server::{DeferPermit, Deferred, PushHandle, Response, Server};
+use std::borrow::Cow;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
 use std::path::PathBuf;
@@ -302,6 +303,66 @@ impl std::fmt::Debug for Body<'_> {
             .field("len", &self.len())
             .field("placed", &matches!(self.inner, BodyInner::Owned { .. }))
             .finish()
+    }
+}
+
+/// One outgoing reply segment's bytes: an owned buffer, or a borrow that
+/// lives for the whole process. The send queue holds a segment until the
+/// peer drains it — across partial writes and suspended sends — so a
+/// borrowed segment must outlive every retry; `'static` is the bound that
+/// makes pinning it free, and it is exactly what a canned reply body or
+/// protocol constant already has. Anything shorter-lived must be owned.
+///
+/// Constructed via `From`/`Into`: `Vec<u8>`, `String`, `&'static [u8]`,
+/// `&'static str`, and `Cow<'static, [u8]>` all convert without copying.
+/// Dereferences to `[u8]`.
+///
+/// Opaque rather than a `Cow` alias so a shared-buffer representation (one
+/// cached body serving many connections at once) can arrive without
+/// changing the segment type.
+#[derive(Debug)]
+pub struct SendBuf(Cow<'static, [u8]>);
+
+impl std::ops::Deref for SendBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<Vec<u8>> for SendBuf {
+    fn from(bytes: Vec<u8>) -> Self {
+        SendBuf(Cow::Owned(bytes))
+    }
+}
+
+impl From<String> for SendBuf {
+    fn from(s: String) -> Self {
+        SendBuf(Cow::Owned(s.into_bytes()))
+    }
+}
+
+impl From<&'static [u8]> for SendBuf {
+    fn from(bytes: &'static [u8]) -> Self {
+        SendBuf(Cow::Borrowed(bytes))
+    }
+}
+
+impl<const N: usize> From<&'static [u8; N]> for SendBuf {
+    fn from(bytes: &'static [u8; N]) -> Self {
+        SendBuf(Cow::Borrowed(bytes))
+    }
+}
+
+impl From<&'static str> for SendBuf {
+    fn from(s: &'static str) -> Self {
+        SendBuf(Cow::Borrowed(s.as_bytes()))
+    }
+}
+
+impl From<Cow<'static, [u8]>> for SendBuf {
+    fn from(bytes: Cow<'static, [u8]>) -> Self {
+        SendBuf(bytes)
     }
 }
 

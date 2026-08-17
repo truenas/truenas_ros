@@ -431,7 +431,7 @@ mod wake;
 pub use crate::net::core::handles::AcceptDeferral;
 pub use crate::net::core::protocol::{
     length_prefix_header, Body, ClientAddr, CloseReason, Endian, Framing,
-    PeerCred, PrefixWidth, ServerAddr,
+    PeerCred, PrefixWidth, SendBuf, ServerAddr,
 };
 pub use config::{Listen, ServerConfig};
 pub use handles::{

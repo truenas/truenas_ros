@@ -287,7 +287,7 @@ fn respond(
             head: head_bytes,
             body,
         } => Response::ReplyVectored {
-            segments: vec![head_bytes, body],
+            segments: vec![head_bytes.into(), body.into()],
             close: !keep,
         },
         Serialized::HeadOnly(bytes) => {
@@ -749,7 +749,12 @@ mod tests {
     fn text(resp: &Response) -> String {
         let bytes = match resp {
             Response::Reply(b) | Response::ReplyClose(b) => b.clone(),
-            Response::ReplyVectored { segments, .. } => segments.concat(),
+            Response::ReplyVectored { segments, .. } => {
+                segments.iter().fold(Vec::new(), |mut all, seg| {
+                    all.extend_from_slice(seg);
+                    all
+                })
+            }
             other => panic!("expected reply bytes, got {other:?}"),
         };
         String::from_utf8(bytes).expect("responses are ascii here")
@@ -862,7 +867,7 @@ mod tests {
             segments[0].ends_with(b"\r\n\r\n"),
             "head ends at blank line"
         );
-        assert_eq!(segments[1], b"hello, body", "body is its own segment");
+        assert_eq!(&segments[1][..], b"hello, body", "body is its own segment");
         let s = text(&resp);
         assert!(s.contains("Content-Length: 11\r\n"));
         assert!(s.ends_with("\r\n\r\nhello, body"));

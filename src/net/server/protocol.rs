@@ -9,7 +9,7 @@ use super::{Deferred, Detached, PushHandle, Server};
 use crate::net::core::protocol::CloseReason;
 use crate::net::core::protocol::{
     length_prefix_header, Body, ClientAddr, Endian, Framing, PrefixWidth,
-    ServerAddr,
+    SendBuf, ServerAddr,
 };
 
 /// A body handler's decision for one request.
@@ -49,9 +49,12 @@ pub enum Response {
     /// the socket with a single vectored write — so a protocol can hand the
     /// server a header and a payload as separate buffers instead of
     /// concatenating them (an HTTP head + body, an SMB read header + file
-    /// data, an NFS reply header + data). Protocol-neutral: the server never
-    /// inspects the boundaries, it just gathers them. Empty segments are
-    /// skipped; an all-empty reply sends nothing (a one-way message).
+    /// data, an NFS reply header + data). Each segment is a [`SendBuf`]:
+    /// owned bytes move, `'static` bytes are sent by reference — a canned
+    /// body or protocol constant is never copied. Protocol-neutral: the
+    /// server never inspects the boundaries, it just gathers them. Empty
+    /// segments are skipped; an all-empty reply sends nothing (a one-way
+    /// message).
     ///
     /// `close` selects the disposition: `false` behaves like [`Reply`] (keep
     /// serving), `true` like [`ReplyClose`] (flush everything queued, then
@@ -61,7 +64,7 @@ pub enum Response {
     /// [`ReplyClose`]: Response::ReplyClose
     ReplyVectored {
         /// The reply's byte segments, in send order.
-        segments: Vec<Vec<u8>>,
+        segments: Vec<SendBuf>,
         /// Close the connection once the reply (and everything queued before
         /// it) has flushed.
         close: bool,

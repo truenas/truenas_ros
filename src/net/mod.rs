@@ -16,7 +16,7 @@ pub mod client;
 // Shared public vocabulary, surfaced at the `net::` root (independent of role).
 pub use core::{
     length_prefix_header, Body, ClientAddr, CloseReason, Endian, Framing,
-    PeerCred, PrefixWidth, ServerAddr,
+    PeerCred, PrefixWidth, SendBuf, ServerAddr,
 };
 
 // The client role's public surface, surfaced at the `net::` root.

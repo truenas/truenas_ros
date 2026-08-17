@@ -24,5 +24,5 @@ pub(crate) mod table;
 
 pub use protocol::{
     length_prefix_header, Body, ClientAddr, CloseReason, Endian, Framing,
-    PeerCred, PrefixWidth, ServerAddr,
+    PeerCred, PrefixWidth, SendBuf, ServerAddr,
 };

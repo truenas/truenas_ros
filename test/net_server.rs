@@ -192,7 +192,7 @@ fn tcp_vectored_reply() {
             let payload = body[..].to_vec();
             let prefix = (payload.len() as u32).to_be_bytes().to_vec();
             Response::ReplyVectored {
-                segments: vec![prefix, payload],
+                segments: vec![prefix.into(), payload.into()],
                 close: false,
             }
         },
