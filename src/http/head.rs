@@ -345,6 +345,12 @@ impl Head<'_> {
     /// [`keep_alive`](Self::keep_alive) and
     /// [`cl_te_conflict`](Self::cl_te_conflict) (kept as the oracle), computed
     /// together so `respond` walks the headers once rather than twice.
+    ///
+    /// The `Connection` read below open-codes `has_token`'s RFC 9110 §5.3
+    /// list grammar (comma split, OWS trim, case-fold) rather than calling
+    /// it, so the walk stays single-pass; a grammar change in `has_token`
+    /// must land here too, and `response_disposition_agrees_with_the_oracle`
+    /// is the fence that catches drift between the two readers.
     pub fn response_disposition(&self) -> (bool, bool) {
         let mut conn_close = false;
         let mut conn_keep = false;

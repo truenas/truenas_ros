@@ -79,38 +79,63 @@ fn connect_tcp(addr: SocketAddrV4) -> io::Result<TcpStream> {
     Ok(s)
 }
 
-/// Bind an http server with the shared echo handler, run the client closure
-/// against its address on a spawned thread, and serve until the client stops
-/// it. `None` means io_uring is unavailable (the caller returns — a skip).
-///
-/// The handler: `GET /hi` answers `hello`; `PUT /echo` answers the request
-/// body verbatim, with the surfaced trailer names joined into an
-/// `x-trailers` response header (so a client can assert exactly which
-/// trailers reached [`HttpRequest::trailers`]); `HEAD` requests answer like
-/// GET (the codec elides the body); anything else is a 404.
+/// The shared echo handler behind [`with_http_server`] and
+/// [`with_ktls_http_server`]: `GET /hi` answers `hello`; `GET /big` the
+/// 6 MiB patterned owned body ([`big_body`]); `GET /canned` a `'static`
+/// body (served from a borrowed reply segment); `HEAD /sized` a bare 200
+/// declaring `Content-Length: 4096` with no bytes in hand (the HeadObject
+/// shape); `PUT /echo` answers the request body verbatim, with the surfaced
+/// trailer names joined into an `x-trailers` response header (so a client
+/// can assert exactly which trailers reached [`HttpRequest::trailers`]);
+/// other `HEAD` requests answer like GET (the codec elides the body);
+/// anything else is a 404.
+fn echo_handler(mut req: HttpRequest<'_>, _: &mut ()) -> HttpResponse {
+    match (req.method, req.target) {
+        ("GET", "/hi") | ("HEAD", "/hi") => {
+            HttpResponse::new(200).body("hello")
+        }
+        ("GET", "/big") => HttpResponse::new(200).body(big_body()),
+        ("GET", "/canned") => HttpResponse::new(200).body(CANNED),
+        ("HEAD", "/sized") => HttpResponse::new(200).head_content_length(4096),
+        ("PUT", "/echo") => {
+            let names: Vec<&str> =
+                req.trailers.iter().map(|t| t.name).collect();
+            let body = req.body.take();
+            HttpResponse::new(200)
+                .header("x-trailers", names.join(","))
+                .body(body)
+        }
+        _ => HttpResponse::new(404).body("not found\n"),
+    }
+}
+
+/// A canned `'static` reply body — served from a borrowed segment, the path
+/// a real handler's fixed error/health bodies take.
+const CANNED: &str = "a canned static body, sent by reference";
+
+/// A 6 MiB body, sized so a stalled reader forces a short send completion:
+/// above what the kernel will buffer for a peer that isn't reading —
+/// `tcp_wmem[2]` caps the send buffer at 4 MiB by default, and a stalled
+/// reader's window stays near `tcp_rmem[1]` — and below the server's 8 MiB
+/// `max_send_backlog`, so the reply is admissible. Patterned (not constant)
+/// so truncation, reordering, or a send-cursor slip shows up as a byte
+/// mismatch rather than a length that happens to agree.
+fn big_body() -> Vec<u8> {
+    (0..6 * 1024 * 1024).map(|i| (i % 251) as u8).collect()
+}
+
+/// Bind an http server with the shared [`echo_handler`], run the client
+/// closure against its address on a spawned thread, and serve until the
+/// client stops it. `None` means io_uring is unavailable (the caller
+/// returns — a skip).
 fn with_http_server<T: Send + 'static>(
     client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
 ) -> Option<T> {
-    let handler =
-        |mut req: HttpRequest<'_>, _: &mut ()| match (req.method, req.target) {
-            ("GET", "/hi") | ("HEAD", "/hi") => {
-                HttpResponse::new(200).body("hello")
-            }
-            ("PUT", "/echo") => {
-                let names: Vec<&str> =
-                    req.trailers.iter().map(|t| t.name).collect();
-                let body = req.body.take();
-                HttpResponse::new(200)
-                    .header("x-trailers", names.join(","))
-                    .body(body)
-            }
-            _ => HttpResponse::new(404).body("not found\n"),
-        };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = protocol(
         HttpConfig::default(),
         |_inc: Incoming<'_>| Some(()),
-        handler,
+        echo_handler,
     )
     .expect("codec config is valid");
     let mut server = match Server::bind([addr], proto) {
@@ -132,11 +157,10 @@ fn with_http_server<T: Send + 'static>(
     Some(join.join().expect("client thread").expect("client io"))
 }
 
-/// Read one HTTP response off the stream: the head byte-by-byte to its
-/// CRLFCRLF (no over-read — the connection may carry the next response),
-/// then exactly `Content-Length` body bytes. Returns
-/// `(status, head text, body)`.
-fn read_response<R: Read>(s: &mut R) -> io::Result<(u16, String, Vec<u8>)> {
+/// Read one response head off the stream, byte-by-byte to its CRLFCRLF (no
+/// over-read — the connection may carry more). Returns `(status, head
+/// text)`; any body is left unread (a HEAD answer has none to read).
+fn read_head<R: Read>(s: &mut R) -> io::Result<(u16, String)> {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
@@ -156,6 +180,13 @@ fn read_response<R: Read>(s: &mut R) -> io::Result<(u16, String, Vec<u8>)> {
         .expect("status line")
         .parse()
         .expect("numeric status");
+    Ok((status, head))
+}
+
+/// Read one HTTP response off the stream: the head ([`read_head`]), then
+/// exactly `Content-Length` body bytes. Returns `(status, head text, body)`.
+fn read_response<R: Read>(s: &mut R) -> io::Result<(u16, String, Vec<u8>)> {
+    let (status, head) = read_head(s)?;
     let len: usize = head
         .lines()
         .find_map(|l| l.strip_prefix("Content-Length:"))
@@ -568,5 +599,270 @@ fn pipelined_requests_answer_in_order_across_a_park() {
         Ok(())
     }) else {
         return; // io_uring unavailable
+    };
+}
+
+#[test]
+fn head_declared_length_reaches_the_wire_bodiless() {
+    // HeadObject's live shape: a 200 HEAD answer declares the paired GET's
+    // Content-Length while sending no body bytes — and the connection stays
+    // framed, proven by a follow-up GET answering on the same connection
+    // (any stray body byte would land inside the GET's status line).
+    let Some(()) = with_http_server(|v4| {
+        let mut s = connect_tcp(v4)?;
+        s.write_all(b"HEAD /sized HTTP/1.1\r\nHost: t\r\n\r\n")?;
+        let (status, head) = read_head(&mut s)?;
+        assert_eq!(status, 200);
+        assert!(head.contains("\r\nContent-Length: 4096\r\n"), "{head}");
+        s.write_all(b"GET /hi HTTP/1.1\r\nHost: t\r\n\r\n")?;
+        let (status, _, body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello");
+        Ok(())
+    }) else {
+        return; // io_uring unavailable
+    };
+}
+
+// ---- the codec over kernel TLS (kTLS) -----------------------------------
+//
+// The transport S3 ships on. Everything above proves the codec over plain
+// TCP; these prove the same seams over the kernel-TLS transport, whose send
+// path is structurally different: a plain send carries MSG_WAITALL (the
+// kernel flushes the whole gather, one full-length CQE), but the kernel TLS
+// sendmsg rejects that flag (`submit_send`, src/net/core/reactor/io.rs), so
+// a bodied kTLS reply is a multi-iovec SENDMSG that blocks on an io-wq
+// worker until the peer drains it — and only `send_timeout`'s linked
+// timeout interrupts it, surfacing a partial completion the reactor's
+// re-submit path must carry. Scaffolding shared with `test/net_server.rs` —
+// see `test/support/ktls.rs`.
+
+#[path = "support/ktls.rs"]
+mod ktls;
+
+use std::sync::Arc;
+
+use ktls::{
+    ktls_acceptor, ktls_openssl_unsupported, ktls_server_handshake,
+    ktls_unsupported, self_signed, tls_connect,
+};
+use truenas_ros::http::HttpConn;
+use truenas_ros::net::server::{Listen, ServerConfig};
+
+/// [`with_http_server`] over a kTLS listener: the same [`echo_handler`]
+/// behind `Listen::tls`, with the `truenas_ktls` handshake worker minting
+/// the connection state (`AcceptDeferral::ready` is the admission — the
+/// accept handler does not run for kTLS connections). `None` means io_uring
+/// or kTLS is unavailable here (the caller returns — a skip; a hard failure
+/// under `TRUENAS_ROS_REQUIRE_KTLS`).
+fn with_ktls_http_server<T: Send + 'static>(
+    cfg: ServerConfig,
+    client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
+) -> Option<T> {
+    if ktls_openssl_unsupported() {
+        return None;
+    }
+    let (cert, key) = self_signed();
+    let acceptor = Arc::new(ktls_acceptor(&cert, &key));
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = protocol(
+        HttpConfig::default(),
+        |_inc: Incoming<'_>| Some(()),
+        echo_handler,
+    )
+    .expect("codec config is valid");
+    let mut server = match Server::with_config([Listen::tls(addr)], cfg, proto)
+    {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) || ktls_unsupported(&e) => return None,
+        Err(e) => panic!("bind: {e}"),
+    };
+    server.set_tls_handshake(move |fd, _inc, deferral| {
+        let acceptor = Arc::clone(&acceptor);
+        thread::spawn(move || match ktls_server_handshake(fd, &acceptor) {
+            Ok(()) => deferral.ready(HttpConn::new(())),
+            Err(_) => deferral.reject(),
+        });
+    });
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let join = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        let r = client(v4);
+        stop.shutdown();
+        r
+    });
+    server.serve_forever().expect("serve_forever");
+    Some(join.join().expect("client thread").expect("client io"))
+}
+
+/// One slow `/big` exchange on a fresh TLS connection: request, then crawl
+/// the first ~1.5 MiB slower than the send can flush it — the kernel
+/// absorbs ~4 MiB (`tcp_wmem[2]`) and the rest sits in the blocked send,
+/// so a 500 ms `send_timeout` cancel lands mid-body — then drain. Returns
+/// the stream (for follow-up requests) and the body read.
+fn fetch_big_slowly(
+    v4: SocketAddrV4,
+    expected_len: usize,
+) -> io::Result<(openssl::ssl::SslStream<TcpStream>, Vec<u8>)> {
+    let mut s = tls_connect(v4)?;
+    s.write_all(b"GET /big HTTP/1.1\r\nHost: t\r\n\r\n")?;
+    let (status, head) = read_head(&mut s)?;
+    assert_eq!(status, 200);
+    let len: usize = head
+        .lines()
+        .find_map(|l| l.strip_prefix("Content-Length:"))
+        .map(|v| v.trim().parse().expect("numeric length"))
+        .expect("Content-Length on /big");
+    assert_eq!(len, expected_len, "declared length");
+    let mut body = vec![0u8; len];
+    let mut got = 0;
+    for _ in 0..12 {
+        thread::sleep(Duration::from_millis(40));
+        let upto = (got + 128 * 1024).min(len);
+        s.read_exact(&mut body[got..upto])?;
+        got = upto;
+    }
+    s.read_exact(&mut body[got..])?;
+    Ok((s, body))
+}
+
+#[test]
+fn ktls_vectored_bodies_arrive_intact() {
+    // The S3 GET shape: head + body as two iovecs in one SENDMSG over kTLS.
+    // The client drains the 6 MiB body ([`big_body`]) slower than the
+    // 500 ms `send_timeout` flushes it, so the linked timeout cancels the
+    // io-wq-blocked send mid-flight and the reactor re-submits the tail
+    // from the partial CQE: every byte must arrive exactly once. The canned
+    // body then rides the borrowed segment, and two more requests prove
+    // each reply retired its read-ahead slot (a wrong retire count wedges
+    // them).
+    //
+    // A reclaim (EOF) is retried on a fresh connection: a cancel window in
+    // which the blocked send happened to write nothing closes the
+    // connection as SendTimeout even though this client drains throughout —
+    // rare, timing-dependent, and a server-policy question rather than a
+    // data-path defect. A byte mismatch is NEVER retried; corruption fails
+    // on the spot.
+    let cfg = ServerConfig {
+        send_timeout: Some(Duration::from_millis(500)),
+        ..ServerConfig::default()
+    };
+    let Some(()) = with_ktls_http_server(cfg, |v4| {
+        let expected = big_body();
+        let mut attempt = 0;
+        let (mut s, body) = loop {
+            attempt += 1;
+            match fetch_big_slowly(v4, expected.len()) {
+                Ok(pair) => break pair,
+                Err(e)
+                    if e.kind() == io::ErrorKind::UnexpectedEof
+                        && attempt < 3 =>
+                {
+                    eprintln!(
+                        "send_timeout reclaimed a draining client \
+                         (attempt {attempt}); retrying"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        if body != expected {
+            let at = body
+                .iter()
+                .zip(&expected)
+                .position(|(a, b)| a != b)
+                .expect("lengths equal yet bytes differ");
+            panic!("6 MiB body corrupted at byte {at}");
+        }
+        s.write_all(b"GET /canned HTTP/1.1\r\nHost: t\r\n\r\n")?;
+        let (status, _, body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert_eq!(body, CANNED.as_bytes());
+        for _ in 0..2 {
+            s.write_all(b"GET /hi HTTP/1.1\r\nHost: t\r\n\r\n")?;
+            let (status, _, body) = read_response(&mut s)?;
+            assert_eq!(status, 200);
+            assert_eq!(body, b"hello");
+        }
+        Ok(())
+    }) else {
+        return; // io_uring or kTLS unavailable
+    };
+}
+
+#[test]
+fn ktls_chunked_put_and_trailers_roundtrip() {
+    // The boto3-over-TLS upload shape: a chunked PUT whose records the
+    // kernel decrypts before the framer sees them. Each write is its own
+    // TLS record, so chunk reassembly provably spans record boundaries,
+    // and the trailer still surfaces.
+    let Some(()) = with_ktls_http_server(ServerConfig::default(), |v4| {
+        let mut s = tls_connect(v4)?;
+        s.write_all(
+            b"PUT /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )?;
+        s.write_all(b"3\r\nfoo\r\n")?;
+        s.write_all(b"4\r\nbars\r\n")?;
+        s.write_all(b"0\r\nx-amz-checksum-crc32: ok==\r\n\r\n")?;
+        let (status, head, body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert!(
+            head.contains("\r\nx-trailers: x-amz-checksum-crc32\r\n"),
+            "trailer set wrong: {head}"
+        );
+        assert_eq!(body, b"foobars");
+        Ok(())
+    }) else {
+        return; // io_uring or kTLS unavailable
+    };
+}
+
+#[test]
+fn ktls_expect_dance_flushes_interim_before_body() {
+    // Same ordering proof as the plain-TCP test, over kTLS: the interim
+    // must arrive (as its own TLS record) before any body byte is sent, or
+    // this read hangs into its timeout.
+    let Some(()) = with_ktls_http_server(ServerConfig::default(), |v4| {
+        let mut s = tls_connect(v4)?;
+        s.write_all(
+            b"PUT /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n",
+        )?;
+        let mut interim = [0u8; 25];
+        s.read_exact(&mut interim)?;
+        assert_eq!(&interim[..], b"HTTP/1.1 100 Continue\r\n\r\n");
+        s.write_all(b"hello")?;
+        let (status, _, body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello");
+        Ok(())
+    }) else {
+        return; // io_uring or kTLS unavailable
+    };
+}
+
+#[test]
+fn ktls_farewells_arrive_before_the_close() {
+    // A malformed request over TLS still gets the real 400 + Connection:
+    // close before the connection dies. The kernel-TLS close is a plain FIN
+    // (no close_notify), so after the full farewell the client sees either
+    // EOF or a truncation error — both prove the bytes beat the FIN.
+    let Some(()) = with_ktls_http_server(ServerConfig::default(), |v4| {
+        let mut s = tls_connect(v4)?;
+        s.write_all(b"NOT HTTP\r\n\r\n")?;
+        let (status, head, body) = read_response(&mut s)?;
+        assert_eq!(status, 400);
+        assert!(head.contains("\r\nConnection: close\r\n"), "{head}");
+        assert_eq!(body, b"error 400\n");
+        let mut b = [0u8; 1];
+        match s.read(&mut b) {
+            Ok(0) | Err(_) => {}
+            Ok(n) => panic!("{n} bytes after the farewell"),
+        }
+        Ok(())
+    }) else {
+        return; // io_uring or kTLS unavailable
     };
 }

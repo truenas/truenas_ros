@@ -279,7 +279,7 @@ pub(crate) fn serialize(
     date: &[u8],
     conn: ConnHeader,
 ) -> Vec<u8> {
-    let bodyless = matches!(resp.status, 100..=199 | 204 | 304);
+    let bodyless = status_is_bodyless(resp.status);
     let body_cap = if head_only || bodyless {
         0
     } else {
@@ -318,6 +318,14 @@ fn head_capacity(resp: &HttpResponse) -> usize {
         .sum::<usize>()
 }
 
+/// Whether `status` forbids a response body (RFC 9110 §6.4.1): 1xx, 204, and
+/// 304 carry neither body bytes nor a `Content-Length`. The head/body/reply
+/// serializers share this one predicate so their framing decisions cannot
+/// drift apart.
+fn status_is_bodyless(status: u16) -> bool {
+    matches!(status, 100..=199 | 204 | 304)
+}
+
 /// Write the response head into `out`: status line, `Date`, `Content-Length`
 /// (elided for 1xx/204/304), the `Connection` header, the consumer headers,
 /// and the terminating blank line. No body.
@@ -330,7 +338,7 @@ fn write_head(
 ) {
     use std::io::Write;
 
-    let bodyless = matches!(resp.status, 100..=199 | 204 | 304);
+    let bodyless = status_is_bodyless(resp.status);
     // Vec<u8> Write is infallible; unwraps here cannot fire.
     write!(out, "HTTP/1.1 {} {}\r\n", resp.status, reason(resp.status))
         .unwrap();
@@ -371,31 +379,33 @@ pub(crate) enum Serialized {
     Split {
         /// The response head (status line through the blank line).
         head: Vec<u8>,
-        /// The response body, its own send segment.
-        body: Vec<u8>,
+        /// The response body, its own send segment: owned bytes moved,
+        /// `'static` bytes borrowed — the handler's storage either way.
+        body: Cow<'static, [u8]>,
     },
 }
 
 /// Serialize `resp` into a head buffer and, when the response carries a body,
 /// the body as its own segment — so the send path scatters head + body with
 /// one vectored write rather than copying the body into the head buffer.
-/// Whether a second iovec is worth it is the reactor's business, not the
-/// codec's: this always splits, keeping the serializer free of transport
-/// policy. Consumes `resp` so the split moves the owned body without copying.
+/// A HEAD response, a bodyless status (1xx/204/304), or an empty body has
+/// nothing to scatter and yields [`Serialized::HeadOnly`]; any other response
+/// splits. Consumes `resp` so the body — owned or `'static` — rides into its
+/// segment as stored, without a copy.
 pub(crate) fn serialize_reply(
     resp: HttpResponse,
     head_only: bool,
     date: &[u8],
     conn: ConnHeader,
 ) -> Serialized {
-    let bodyless = matches!(resp.status, 100..=199 | 204 | 304);
+    let bodyless = status_is_bodyless(resp.status);
     if head_only || bodyless || resp.body.is_empty() {
         Serialized::HeadOnly(serialize_head(&resp, head_only, date, conn))
     } else {
         let head = serialize_head(&resp, head_only, date, conn);
         Serialized::Split {
             head,
-            body: resp.body.into_owned(),
+            body: resp.body,
         }
     }
 }
@@ -667,5 +677,36 @@ mod tests {
             ConnHeader::None,
         );
         assert!(text(&ok).contains("Content-Length: 0\r\n"));
+    }
+
+    #[test]
+    fn split_sends_a_static_body_by_reference() {
+        // The zero-copy contract: a `'static` body rides into its segment as
+        // the same bytes at the same address. A copy reintroduced anywhere in
+        // serialize_reply moves the pointer and fails here.
+        static BODY: &[u8] = b"hello, body";
+        let resp = HttpResponse::new(200).body(BODY);
+        let Serialized::Split { body, .. } =
+            serialize_reply(resp, false, &date(), ConnHeader::None)
+        else {
+            panic!("a bodied response must split");
+        };
+        assert_eq!(body.as_ptr(), BODY.as_ptr());
+        assert_eq!(&body[..], BODY);
+    }
+
+    #[test]
+    fn split_moves_an_owned_body_without_copying() {
+        // Same contract for the owned shape: the handler's allocation is the
+        // segment — moved, not reallocated.
+        let owned = b"hello, body".to_vec();
+        let ptr = owned.as_ptr();
+        let resp = HttpResponse::new(200).body(owned);
+        let Serialized::Split { body, .. } =
+            serialize_reply(resp, false, &date(), ConnHeader::None)
+        else {
+            panic!("a bodied response must split");
+        };
+        assert_eq!(body.as_ptr(), ptr);
     }
 }

@@ -14,7 +14,7 @@
 //! chunk read while scanning), then the frame-declared body is read, then the
 //! delivered message is drained and any pipelined remainder is re-framed.
 
-use super::protocol::{Body, ClientAddr, CloseReason};
+use super::protocol::{Body, ClientAddr, CloseReason, SendBuf};
 use crate::uring::user_data::{pack_raw, unpack_raw};
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -130,10 +130,26 @@ pub(crate) fn unpack(user_data: u64) -> (Option<Op>, u32, u32) {
     (Op::from_u8(tag), slot, generation)
 }
 
+/// What one outgoing PDU is, for read-ahead accounting. A vectored reply is
+/// several PDUs but one logical response, so only its final segment retires
+/// the request's `outstanding` slot; the earlier segments are `ReplyPart` and
+/// count as neither a reply nor a push.
+#[derive(Clone, Copy)]
+enum SendKind {
+    /// The last (or only) segment of a request reply: retires one read-ahead
+    /// slot and tallies one reply.
+    ReplyLast,
+    /// A non-final segment of a vectored reply (e.g. the head): already part
+    /// of a reply the final segment will retire, so it tallies nothing.
+    ReplyPart,
+    /// An out-of-band pushed PDU.
+    Push,
+}
+
 /// One outgoing PDU: a request reply or a push.
 struct SendItem {
-    bytes: Vec<u8>,
-    is_reply: bool,
+    bytes: SendBuf,
+    kind: SendKind,
 }
 
 /// A connection's receive transport, installed at setup (mirrors the kernel's
@@ -715,12 +731,12 @@ impl<U> Connection<U> {
     /// Queue a request reply (FIFO, production order; frees a
     /// `max_in_flight` read-ahead slot once fully sent).
     pub(crate) fn enqueue_reply(&mut self, bytes: Vec<u8>) {
-        self.enqueue(bytes, true);
+        self.enqueue(bytes, SendKind::ReplyLast);
     }
 
     /// Queue a multi-segment reply, sent vectored (the segments are separate
     /// buffers `arm_send` gathers). The whole reply is one logical response:
-    /// only its **last non-empty** segment is flagged `is_reply`, so
+    /// only its **last non-empty** segment is [`SendKind::ReplyLast`], so
     /// `advance_sent` retires the request's `outstanding` count exactly once,
     /// when the final segment flushes — not once per segment. Empty segments
     /// are dropped. Returns whether any bytes were queued; an all-empty reply
@@ -728,7 +744,7 @@ impl<U> Connection<U> {
     /// `outstanding`.
     pub(crate) fn enqueue_reply_segments(
         &mut self,
-        segments: Vec<Vec<u8>>,
+        segments: Vec<SendBuf>,
     ) -> bool {
         let Some(last) = segments.iter().rposition(|s| !s.is_empty()) else {
             return false;
@@ -737,7 +753,14 @@ impl<U> Connection<U> {
             if seg.is_empty() {
                 continue;
             }
-            self.enqueue(seg, i == last);
+            self.enqueue(
+                seg,
+                if i == last {
+                    SendKind::ReplyLast
+                } else {
+                    SendKind::ReplyPart
+                },
+            );
         }
         true
     }
@@ -745,12 +768,13 @@ impl<U> Connection<U> {
     /// Queue a pushed PDU (FIFO behind everything already queued; pushes
     /// never count against the read-ahead cap).
     pub(crate) fn enqueue_push(&mut self, bytes: Vec<u8>) {
-        self.enqueue(bytes, false);
+        self.enqueue(bytes, SendKind::Push);
     }
 
-    fn enqueue(&mut self, bytes: Vec<u8>, is_reply: bool) {
+    fn enqueue(&mut self, bytes: impl Into<SendBuf>, kind: SendKind) {
+        let bytes = bytes.into();
         self.queued_bytes += bytes.len();
-        self.send_queue.push_back(SendItem { bytes, is_reply });
+        self.send_queue.push_back(SendItem { bytes, kind });
     }
 
     /// Whether any PDU is queued (or being sent).
@@ -822,10 +846,11 @@ impl<U> Connection<U> {
             self.front_sent = 0;
             let item = self.send_queue.pop_front().unwrap();
             self.queued_bytes -= item.bytes.len();
-            if item.is_reply {
-                progress.replies += 1;
-            } else {
-                progress.pushes += 1;
+            match item.kind {
+                SendKind::ReplyLast => progress.replies += 1,
+                SendKind::Push => progress.pushes += 1,
+                // Tallied by the reply's final ReplyLast segment.
+                SendKind::ReplyPart => {}
             }
         }
         progress
@@ -886,9 +911,9 @@ mod tests {
     #[test]
     fn send_gather_and_advance() {
         let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 2);
-        c.enqueue(vec![1; 10], true);
-        c.enqueue(vec![2; 20], false);
-        c.enqueue(vec![3; 30], true);
+        c.enqueue(vec![1; 10], SendKind::ReplyLast);
+        c.enqueue(vec![2; 20], SendKind::Push);
+        c.enqueue(vec![3; 30], SendKind::ReplyLast);
         assert_eq!(c.queued_bytes(), 60);
 
         // Gather caps at max_send_coalesce (2): PDUs 1+2 armed, PDU 3 waits.
@@ -906,10 +931,42 @@ mod tests {
         assert!(!c.has_pending_send());
 
         // A completion never advances past what was armed.
-        c.enqueue(vec![4; 8], true);
+        c.enqueue(vec![4; 8], SendKind::ReplyLast);
         assert_eq!(c.arm_send(), 8);
         let p = c.advance_sent(usize::MAX);
         assert_eq!((p.replies, p.armed_remaining), (1, 0));
+    }
+
+    #[test]
+    fn vectored_reply_head_counts_as_one_reply_no_push() {
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 2);
+        // A vectored reply: head + body as separate segments. The head is a
+        // non-final segment; it must not be tallied as a push.
+        assert!(c.enqueue_reply_segments(vec![
+            vec![b'H'; 12].into(),
+            vec![b'B'; 40].into(),
+        ]));
+        assert_eq!(c.arm_send(), 12 + 40);
+        let p = c.advance_sent(12 + 40);
+        assert_eq!((p.replies, p.pushes, p.armed_remaining), (1, 0, 0));
+    }
+
+    #[test]
+    fn a_static_segment_is_armed_at_its_own_address() {
+        // A `'static` segment is sent from where it lives: the armed iovec
+        // must point at the static bytes themselves, proving no copy sits
+        // anywhere between enqueue and the gather.
+        static BODY: &[u8] = b"the canned body, sent by reference";
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 2);
+        assert!(
+            c.enqueue_reply_segments(vec![vec![b'H'; 8].into(), BODY.into()])
+        );
+        assert_eq!(c.arm_send(), 8 + BODY.len());
+        assert_eq!(c.send_iovs[1].iov_base as *const u8, BODY.as_ptr());
+        assert_eq!(c.send_iovs[1].iov_len, BODY.len());
+        let p = c.advance_sent(8 + BODY.len());
+        assert_eq!((p.replies, p.pushes), (1, 0));
+        assert_eq!(c.queued_bytes(), 0);
     }
 
     #[test]
