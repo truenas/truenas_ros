@@ -202,7 +202,12 @@ pub struct HttpConn<U> {
 }
 
 impl<U> HttpConn<U> {
-    pub(crate) fn new(state: U) -> Self {
+    /// A fresh connection's protocol state around the consumer's `state` —
+    /// what the glue's accept wrapper mints for every plain connection.
+    /// Public for the one admission that wrapper cannot cover: a kTLS
+    /// listener's handshake worker, where the accept handler does not run
+    /// and `AcceptDeferral::ready` takes the connection state directly.
+    pub fn new(state: U) -> Self {
         Self {
             phase: Phase::Head,
             state,
