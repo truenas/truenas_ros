@@ -6068,6 +6068,123 @@ fn fs_conn_zfs_attrs_round_trip_through_the_pool() {
     assert_eq!(text, "locked-then-restored", "round trip through the pool");
 }
 
+/// The batched-blocking-offload consumer shape, end to end: the
+/// credential-checked open runs on the ring as a personality-stamped SQE,
+/// then ONE `FsConn::offload_result` job runs the whole blocking metadata
+/// tail — `statx` plus two xattr reads on the already-authorized fd (`File`
+/// is `AsFd`) — and the delivery arrives through the wake path's
+/// `drain_fs_offloads` on an owner-scoped continuation facade.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn fs_conn_offload_result_batches_statx_and_xattrs_in_one_job() {
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    use truenas_ros::sync_fs::xattr::fgetxattr;
+    use truenas_ros::sync_fs::{statx, AtFlags, OFlag, OpenHow, StatxMask};
+    use truenas_ros::uring_fs::{Anchor, Personality};
+
+    let dir = truenas_ros::tempdir().unwrap();
+    let fp = dir.path().join("f.txt");
+    std::fs::write(&fp, b"hello object").unwrap();
+    if !set_user_xattr(&fp, b"user.a", b"1")
+        || !set_user_xattr(&fp, b"user.b", b"22")
+    {
+        return; // this fs refuses user xattrs
+    }
+
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+
+    let pc = Arc::clone(&pers);
+    let body = move |mut req: Request<'_, ()>| -> Response {
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let how = OpenHow::new().flags(OFlag::O_RDONLY);
+        fs.open(who, &anchor, c"f.txt", how, move |done, fs| {
+            let Some(file) = done.file() else {
+                return deferred.close();
+            };
+            fs.offload_result(
+                move || {
+                    let st = statx(
+                        &file,
+                        c"",
+                        AtFlags::AT_EMPTY_PATH,
+                        StatxMask::BASIC_STATS,
+                    )?;
+                    let a = fgetxattr(&file, "user.a")?;
+                    let b = fgetxattr(&file, "user.b")?;
+                    Ok((st.size(), a, b))
+                },
+                move |res, _fs| match res {
+                    Ok((size, a, b)) => {
+                        let msg = format!(
+                            "{size}:{}:{}",
+                            String::from_utf8_lossy(&a),
+                            String::from_utf8_lossy(&b),
+                        );
+                        deferred.reply(echo_frame(msg.as_bytes()));
+                    }
+                    Err(_) => deferred.close(),
+                },
+            );
+        });
+        Response::Defer(permit)
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let cfg = ServerConfig {
+        pool_size: 16,
+        fs_files: 8,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    pers.set(server.register_self().expect("register_self"))
+        .unwrap();
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let mut s = connect_tcp(v4)?;
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        send_framed(&mut s, b"head")?;
+        let reply = recv_framed(&mut s);
+        drop(s);
+        stop.shutdown();
+        reply
+    });
+    server
+        .serve_forever()
+        .expect("serve_forever offload_result");
+    let reply = client.join().unwrap().expect("client io");
+    assert_eq!(
+        String::from_utf8_lossy(&reply),
+        "12:1:22",
+        "one job returned size and both xattr values"
+    );
+}
+
 /// `FsConn::fgetxattr_as_root` reads an xattr under the reactor's ambient
 /// (root) credentials (`sqe.personality = 0`) — the sanctioned privileged-read
 /// path for a `trusted.*`/`security.*` attribute a request's own identity

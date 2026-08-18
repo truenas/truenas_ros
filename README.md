@@ -63,7 +63,8 @@ service needs and cannot easily build itself: path resolution the caller cannot
 weaken (`open_confined`), confined `mkdir -p` (`mkdir_path`), `O_TMPFILE`
 publication (`linkat_file`), and an allowlist that lets a server keep its own
 metadata in the `trusted.` namespace, where local users cannot read or alter
-it.
+it — and a blocking-offload seam that runs a request's opcode-less metadata
+tail as one pool job, delivered back on the reactor thread.
 
 ### Identity
 
