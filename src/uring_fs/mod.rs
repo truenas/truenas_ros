@@ -107,10 +107,13 @@
 //! - **[`linkat_file`](FsHandle::linkat_file)** is the exception that gives an
 //!   *already-open* file a name (`AT_EMPTY_PATH`) — the only way to name an
 //!   `O_TMPFILE`, and so the commit step of a durable create.
+//! - **Blocking tails** ([`FsConn::offload_result`]) operate on the open
+//!   [`File`] too: it is [`AsFd`], so a pool job makes blocking fd-based
+//!   calls on it — descriptors, never names.
 //!
 //! # Building on top: durable create, confinement, server-owned metadata
 //!
-//! Three facilities exist because a service storing data on behalf of remote
+//! Four facilities exist because a service storing data on behalf of remote
 //! users needs them and cannot assemble them safely from the raw ops:
 //!
 //! - **Durable create.** Open `O_TMPFILE` (no `O_EXCL`), write, sync, then
@@ -131,6 +134,10 @@
 //!   `trusted.*` attributes be written under the reactor's own credentials, so
 //!   a service can keep metadata that the user who owns the file can neither
 //!   read, change, nor see.
+//! - **Batched blocking offload.** [`FsConn::offload_result`] runs the
+//!   blocking, opcode-less part of a request as one pool job — one job per
+//!   request tail, not one per call — and delivers its `crate::Result` back
+//!   on the loop. The job contract lives at [`offload`](FsConn::offload).
 //!
 //! # Acting as other users
 //!
@@ -182,6 +189,10 @@ mod broker;
 // The mint-once-per-key protocol behind `IdentityCache`, kept separate so it
 // can be model-checked without a broker process to fork.
 mod single_flight;
+// The elastic blocking-work pool behind `FsConn::offload` and the off-loop
+// helpers — generic machinery, kept apart from the fs-domain modules that
+// submit to it.
+pub(crate) mod offload_pool;
 // `pub(crate)` so an embedding host (a server driving `FsCore` on its own
 // can drive an `FsCore` on the server's own ring; the standalone host is
 // `uring_fs`'s own `UringFs`.
@@ -711,6 +722,19 @@ impl File {
     }
 }
 
+/// Borrow the file's descriptor — what lets a pool job
+/// ([`FsConn::offload_result`]) run blocking fd-based calls
+/// ([`statx`](crate::sync_fs::statx),
+/// [`fgetxattr`](crate::sync_fs::xattr::fgetxattr)) against a descriptor the
+/// ring opened under a [`Personality`]: the access decision was made at that
+/// open, so an fd-based call needs no identity re-attached. The `File` (or a
+/// clone) keeps the fd open for at least the borrow.
+impl AsFd for File {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
 /// What crosses the reply channel for one completed operation.
 pub(crate) struct FsOutcome {
     /// Mapped CQE result (`res` on success, `Errno` from `-res`).
@@ -943,7 +967,7 @@ pub struct FsHandle {
     pub(crate) shared: Arc<LoopShared>,
     /// This reactor's shared blocking-work pool, for the off-loop
     /// [`QueryPool`](query_dir::QueryPool) and generic offloaded work.
-    pub(crate) pool: Arc<query_dir::SharedPool>,
+    pub(crate) pool: Arc<offload_pool::SharedPool>,
 }
 
 #[cfg(loom)]
@@ -2156,7 +2180,7 @@ mod tests {
         let h = FsHandle {
             tx,
             shared,
-            pool: query_dir::SharedPool::new(1, 1),
+            pool: offload_pool::SharedPool::new(1, 1),
         };
 
         // SAFETY: dup(2) returns a fresh owned descriptor or -1; stderr is
@@ -2291,7 +2315,7 @@ mod loom_tests {
         let h = FsHandle {
             tx,
             shared: Arc::clone(&shared),
-            pool: query_dir::SharedPool::new(1, 1),
+            pool: offload_pool::SharedPool::new(1, 1),
         };
         (h, rx, shared)
     }

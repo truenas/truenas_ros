@@ -18,7 +18,7 @@
 //!   `(tag, op-slot, generation)`; an op entry frees only at its own single
 //!   terminal CQE, so a stale / duplicate / wrong-tag completion is rejected.
 
-use super::query_dir::SharedPool;
+use super::offload_pool::SharedPool;
 use super::{
     statx_at_flags, Anchor, File, FsOutcome, Leaf, Personality,
     PrivilegedXattrs, ReplyTo, RwFlags,
@@ -1945,6 +1945,37 @@ impl FsConn<'_> {
     /// still deliver: the completion carries the panic, so the continuation
     /// runs, the registration is retired, and any reactor-side state the caller
     /// holds is released instead of stranded.
+    ///
+    /// The consumer shape this exists for: batch a request's whole blocking
+    /// metadata tail into **one job** — several synchronous calls, one pool
+    /// round trip, one delivery. [`statx`](crate::sync_fs::statx) plus
+    /// [`fgetxattr`](crate::sync_fs::xattr::fgetxattr) reads before streaming
+    /// a body, [`fsetxattr`](crate::sync_fs::xattr::fsetxattr) writes after
+    /// one. A cached metadata syscall costs less than any round trip, so the
+    /// win comes from paying one handoff per batch rather than one per call.
+    ///
+    /// The job contract — every derived facility above and
+    /// [`offload_result`](Self::offload_result) share it:
+    ///
+    /// - **Jobs take open [`File`]s or descriptors, never names.** The
+    ///   credential-checked step — the open, any path op — runs first on the
+    ///   ring as a personality-stamped SQE; the job then runs at the
+    ///   reactor's **ambient credentials** against the already-authorized fd,
+    ///   and the kernel checks nothing in it against a request identity. See
+    ///   [`fset_zfs_attrs`](Self::fset_zfs_attrs) and
+    ///   `FsCore::remove_priv_xattr` for the same reasoning.
+    /// - **Never mutate thread-wide state from a job** — credentials
+    ///   (`setfsuid`), umask, signal dispositions. The workers are shared
+    ///   with every consumer of the pool, the reactor's privileged offloads
+    ///   included.
+    /// - **An offload is never cancelled.** `cancel_owned_by` sweeps ring
+    ///   ops only; the job always runs to completion and its delivery always
+    ///   fires, possibly for an owner that is gone — a continuation must
+    ///   already tolerate that (its facade cannot `open`, and a deferred
+    ///   reply is generation-checked).
+    /// - **The registry and pool queue are uncapped.** Bound in-flight jobs
+    ///   upstream, at the request cap. A failed worker spawn runs the job
+    ///   inline on the loop rather than lose it (`SharedPool`).
     pub fn offload<R, J, F>(&mut self, job: J, on_done: F)
     where
         J: FnOnce() -> R + Send + 'static,
@@ -1977,7 +2008,15 @@ impl FsConn<'_> {
     /// [`offload`](Self::offload) for a job that already yields a
     /// [`crate::Result`], mapping a panicked job to `EIO` so the continuation
     /// keeps its ordinary signature.
-    fn offload_result<T, J, F>(&mut self, job: J, on_done: F)
+    ///
+    /// This is the shape every derived facility here uses and the one a
+    /// consumer batching its own blocking tail should reach for; the job
+    /// contract is [`offload`](Self::offload)'s. Reach for `offload` itself
+    /// only when the continuation must inspect the panic payload. Not a
+    /// second spelling of one submission: the primitive delivers the raw
+    /// [`thread::Result`], and this is the normalization everything built on
+    /// it shares.
+    pub fn offload_result<T, J, F>(&mut self, job: J, on_done: F)
     where
         J: FnOnce() -> crate::Result<T> + Send + 'static,
         T: Send + 'static,
@@ -2391,6 +2430,21 @@ mod hybrid_tests {
         dir
     }
 
+    /// Run `f` with panic printing silenced, serialized against every other
+    /// hook-swapping test: the hook is process-global and tests run as
+    /// threads in one binary, so two unserialized swaps can interleave and
+    /// strand the silent hook. Keep assertions outside `f` — a panic inside
+    /// it leaves the hook silenced for the rest of the run.
+    fn with_silent_panics<R>(f: impl FnOnce() -> R) -> R {
+        static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serialized = HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let r = f();
+        std::panic::set_hook(prev);
+        r
+    }
+
     #[test]
     fn offload_delivers_result_on_loop() {
         let (mut eng, mut fs, _me) = setup();
@@ -2416,21 +2470,19 @@ mod hybrid_tests {
         let (mut eng, mut fs, _me) = setup();
         let got: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
         let g2 = got.clone();
-        // The worker's own `catch_unwind` prints the panic; keep it quiet.
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        drive(
-            &mut eng,
-            &mut fs,
-            move |c| {
-                c.offload(
-                    || -> u64 { panic!("job blew up") },
-                    move |r, _c| *g2.borrow_mut() = Some(r.is_err()),
-                );
-            },
-            || got.borrow().is_some(),
-        );
-        std::panic::set_hook(prev);
+        with_silent_panics(|| {
+            drive(
+                &mut eng,
+                &mut fs,
+                move |c| {
+                    c.offload(
+                        || -> u64 { panic!("job blew up") },
+                        move |r, _c| *g2.borrow_mut() = Some(r.is_err()),
+                    );
+                },
+                || got.borrow().is_some(),
+            );
+        });
         assert_eq!(
             *got.borrow(),
             Some(true),
@@ -2439,6 +2491,50 @@ mod hybrid_tests {
         assert!(
             fs.offload_reg.is_empty(),
             "a panicked job must not strand its registry entry"
+        );
+    }
+
+    /// `offload_result` maps a panicked job to exactly `EIO` — the documented
+    /// contract — while an `Ok` job in the same drive passes its value
+    /// through untouched, and neither strands its registry entry.
+    #[test]
+    fn offload_result_maps_a_panicked_job_to_eio() {
+        let (mut eng, mut fs, _me) = setup();
+        let ok: Rc<RefCell<Option<crate::Result<u64>>>> =
+            Rc::new(RefCell::new(None));
+        let bad: Rc<RefCell<Option<crate::Result<u64>>>> =
+            Rc::new(RefCell::new(None));
+        let (o2, b2) = (ok.clone(), bad.clone());
+        with_silent_panics(|| {
+            drive(
+                &mut eng,
+                &mut fs,
+                move |c| {
+                    c.offload_result(
+                        || Ok(41u64),
+                        move |r, _c| *o2.borrow_mut() = Some(r),
+                    );
+                    c.offload_result(
+                        || -> crate::Result<u64> { panic!("job blew up") },
+                        move |r, _c| *b2.borrow_mut() = Some(r),
+                    );
+                },
+                || ok.borrow().is_some() && bad.borrow().is_some(),
+            );
+        });
+        assert!(
+            matches!(*ok.borrow(), Some(Ok(41))),
+            "the Ok job's value passes through: {:?}",
+            ok.borrow()
+        );
+        assert!(
+            matches!(*bad.borrow(), Some(Err(crate::Error::Errno(Errno::EIO)))),
+            "a panicked job is exactly EIO: {:?}",
+            bad.borrow()
+        );
+        assert!(
+            fs.offload_reg.is_empty(),
+            "no continuation may be stranded in the registry"
         );
     }
 
