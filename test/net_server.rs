@@ -1143,6 +1143,769 @@ fn tcp_detach_drop_closes() {
     }
 }
 
+#[test]
+fn tcp_deferred_worker_close_ends_the_connection() {
+    // `Deferred::close` is the worker deciding the request is fatal — distinct
+    // from dropping the handle, which closes only because a lost worker must
+    // not leak the parked slot. Both end the connection and both report
+    // `WorkerClosed`, so a test of the drop path says nothing about whether
+    // the deliberate one works. The close is also final: a request answered
+    // this way is gone, so the pipelined follower behind it is not served.
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: |req: Request<'_, ()>| {
+            let Request {
+                body, responder, ..
+            } = req;
+            if &body[..] == b"fatal" {
+                let (deferred, permit) = responder.defer();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(10));
+                    deferred.close(); // deliberate, not a dropped handle
+                });
+                Response::Defer(permit)
+            } else {
+                Response::Reply(echo_frame(&body))
+            }
+        },
+    };
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let reasons = close_reason_channel(&mut server);
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<Vec<u8>> {
+            let mut s = connect_tcp(v4)?;
+            send_framed(&mut s, b"ping")?;
+            assert_eq!(
+                recv_framed(&mut s)?,
+                b"ping",
+                "serving before the close"
+            );
+            let _ = send_framed(&mut s, b"fatal");
+            let mut tail = Vec::new();
+            s.read_to_end(&mut tail)?;
+            Ok(tail)
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    match client.join().expect("thread join") {
+        Ok(tail) => assert!(
+            tail.is_empty(),
+            "a closed request must send nothing, got {tail:?}"
+        ),
+        Err(e) => assert_eq!(e.kind(), io::ErrorKind::ConnectionReset),
+    }
+    assert_eq!(
+        reasons.try_recv().ok(),
+        Some(CloseReason::WorkerClosed),
+        "a worker-side close is reported as WorkerClosed",
+    );
+}
+
+#[test]
+fn handle_types_are_debug() {
+    // The reply/push/detach handles are what a consumer holds when something
+    // goes wrong in its own worker, so they are what lands in its logs. Each
+    // is `finish_non_exhaustive` and each deliberately withholds its channel
+    // and routing token — a `Debug` that printed the token would put a
+    // forgeable routing capability in a log file.
+    use std::sync::mpsc;
+    let (seen_tx, seen_rx) = mpsc::channel::<(&'static str, String)>();
+    let worker_tx = seen_tx.clone();
+    let detach_tx = seen_tx.clone();
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |req: Request<'_, ()>| {
+            let Request {
+                body, responder, ..
+            } = req;
+            if &body[..] == b"detach" {
+                return Response::Detach(responder.detach());
+            }
+            // `push_handle` borrows, so it can be minted before `defer`
+            // consumes the responder.
+            let push = responder.push_handle();
+            let _ = seen_tx.send(("push", format!("{push:?}")));
+            let _ = seen_tx.send(("responder", format!("{responder:?}")));
+            let (deferred, permit) = responder.defer();
+            let worker_tx = worker_tx.clone();
+            thread::spawn(move || {
+                let _ = worker_tx.send(("deferred", format!("{deferred:?}")));
+                deferred.reply(echo_frame(b"ok"));
+            });
+            Response::Defer(permit)
+        },
+    };
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    server.set_detach_handler(move |_ctx, detached| {
+        let _ = detach_tx.send(("detached", format!("{detached:?}")));
+        detached.close();
+    });
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            send_framed(&mut s, b"handles")?;
+            assert_eq!(recv_framed(&mut s)?, b"ok");
+            let _ = send_framed(&mut s, b"detach");
+            let mut tail = Vec::new();
+            let _ = s.read_to_end(&mut tail);
+            Ok(())
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join").expect("client io");
+
+    let seen: std::collections::HashMap<&str, String> =
+        seen_rx.try_iter().collect();
+    for name in ["responder", "deferred", "push", "detached"] {
+        let rendered = seen
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} was never formatted"));
+        assert!(
+            rendered.ends_with(".. }"),
+            "{name}'s Debug must stay non-exhaustive: {rendered}"
+        );
+        assert!(
+            !rendered.contains("token") && !rendered.contains("Token"),
+            "{name}'s Debug must not print its routing token: {rendered}"
+        );
+    }
+    assert!(
+        seen["responder"].starts_with("Responder {"),
+        "unexpected shape: {}",
+        seen["responder"]
+    );
+    assert!(
+        seen["deferred"].starts_with("Deferred {"),
+        "unexpected shape: {}",
+        seen["deferred"]
+    );
+    // The routable handles name their slot, which is what makes one log line
+    // traceable to one connection.
+    for name in ["push", "detached"] {
+        assert!(
+            seen[name].contains("slot"),
+            "{name}'s Debug should name its slot: {}",
+            seen[name]
+        );
+    }
+}
+
+#[test]
+fn push_of_an_empty_payload_is_a_no_op() {
+    // An empty push is dropped at the handle rather than travelling to the
+    // loop, so it never reaches the send queue. That matters because the
+    // server frames nothing itself: a zero-length PDU handed to the socket
+    // would be an empty write the peer cannot distinguish from a stall, and a
+    // queued empty push would still consume backlog accounting. The client
+    // must see exactly the one real push.
+    use std::sync::Mutex;
+    let stash: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
+    let for_body = Arc::clone(&stash);
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |req: Request<'_, ()>| {
+            *for_body.lock().unwrap() = Some(req.responder.push_handle());
+            Response::Reply(echo_frame(b"ok"))
+        },
+    };
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<Vec<u8>> {
+            let mut s = connect_tcp(v4)?;
+            send_framed(&mut s, b"sub")?;
+            assert_eq!(recv_framed(&mut s)?, b"ok");
+            let push = stash.lock().unwrap().clone().expect("stashed handle");
+            push.push(Vec::new()); // dropped at the handle
+            push.push(echo_frame(b"real"));
+            // If the empty push had been queued it would arrive first and this
+            // frame read would desynchronise.
+            recv_framed(&mut s)
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    let got = client.join().expect("thread join").expect("client io");
+    assert_eq!(got, b"real", "an empty push must not reach the wire");
+}
+
+#[test]
+fn shutdown_graceful_with_zero_grace_is_a_hard_shutdown() {
+    // `shutdown_graceful(0)` is documented as exactly `shutdown()`. The
+    // distinction is not cosmetic: the graceful path arms a grace-period
+    // TIMEOUT op and waits for connections to quiesce, so a zero duration
+    // taken literally would arm a timer that fires immediately — or, worse,
+    // a drain with no deadline at all. Delegating instead means a caller
+    // computing a grace from configuration cannot accidentally hang the
+    // shutdown by configuring zero.
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
+    };
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        // Serve one request so the loop is definitely running, hold the
+        // connection open, then stop with a zero grace: a drain that waited
+        // for this connection to quiesce would never return.
+        let r = (|| -> io::Result<TcpStream> {
+            let mut s = connect_tcp(v4)?;
+            send_framed(&mut s, b"ping")?;
+            assert_eq!(recv_framed(&mut s)?, b"ping");
+            Ok(s)
+        })();
+        stop.shutdown_graceful(Duration::ZERO);
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    // Reaching here at all is the assertion: an open connection did not hold
+    // the loop open, because zero grace degraded to a hard stop.
+    let held = client.join().expect("thread join").expect("client io");
+    drop(held);
+}
+
+#[test]
+fn tls_listener_without_a_handshake_handler_is_rejected() {
+    // A kTLS listener cannot serve itself: the accept handler does not run for
+    // kTLS connections, so `set_tls_handshake` IS the admission decision as
+    // well as the handshake. Construction cannot catch a missing one — the
+    // handler is installed after `bind` returns — so `serve_forever` refuses
+    // to start rather than accept connections it can only drop. Fail-fast at
+    // startup, not per connection at runtime.
+    use truenas_ros::net::server::Listen;
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
+    };
+    let mut server = match Server::bind([Listen::tls(addr)], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        // A kernel without FIXED_FD_INSTALL rejects the listener earlier, with
+        // its own validation message — environmental, not the case under test.
+        Err(Error::Validation(m)) if m.contains("FIXED_FD_INSTALL") => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    // Deliberately no `set_tls_handshake`.
+    match server.serve_forever() {
+        Err(Error::Validation(m)) => assert!(
+            m.contains("set_tls_handshake"),
+            "expected the error to name the missing handler, got {m:?}",
+        ),
+        Err(e) => panic!("expected a validation error, got {e}"),
+        Ok(()) => panic!("a kTLS listener with no handshake handler served"),
+    }
+}
+
+#[test]
+fn server_debug_reports_its_listeners() {
+    // `Server`'s own `Debug` is what ends up in a consumer's startup log or
+    // panic message, and it is the only way to see the resolved listener list
+    // after an ephemeral `:0` bind. Bound but never served: `Drop` tears the
+    // ring down on its own.
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
+    };
+    let server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(bound) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let rendered = format!("{server:?}");
+    assert!(
+        rendered.starts_with("Server {"),
+        "unexpected Debug shape: {rendered}"
+    );
+    assert!(
+        rendered.contains(&bound.port().to_string()),
+        "Debug should report the resolved listener, not the requested :0: \
+         {rendered}"
+    );
+    assert!(
+        rendered.ends_with(".. }"),
+        "Server is #[non_exhaustive] in spirit; its Debug must stay open: \
+         {rendered}"
+    );
+}
+
+#[test]
+fn tcp6_echo() {
+    // IPv6 is not just IPv4 with a longer address here: the listener asks
+    // for `AF_INET6` and sets
+    // `IPV6_V6ONLY`, and the per-connection peer fetch has to request exactly
+    // `sockaddr_in6`'s size — the kernel's `SO_PEERNAME` rejects an optlen
+    // LARGER than the actual address, and the completion then requires the
+    // returned length to match exactly, failing closed otherwise. So an
+    // address-family size mistake does not corrupt an address, it sheds every
+    // connection. A round-trip proves the sizing on both sides, and the peer
+    // handed to the accept handler proves it parsed as a real V6 address
+    // rather than something salvaged from a short pad.
+    use std::net::SocketAddrV6;
+    let (peer_tx, peer_rx) = std::sync::mpsc::channel::<ClientAddr>();
+    let addr = ServerAddr::Tcp6("[::1]:0".parse::<SocketAddrV6>().unwrap());
+    let proto = Protocol {
+        accept: move |inc: Incoming<'_>| {
+            let _ = peer_tx.send(inc.peer.clone());
+            Some(())
+        },
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
+    };
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        // A host with IPv6 compiled out or ::1 absent is environmental, like
+        // the io_uring skip above.
+        Err(Error::Errno(Errno::EAFNOSUPPORT | Errno::EADDRNOTAVAIL)) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp6(v6) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp6");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let msgs: &[&[u8]] = &[b"hello", b"world"];
+        let r = retry(|| TcpStream::connect(v6)).and_then(|s| {
+            s.set_read_timeout(Some(Duration::from_secs(10)))?;
+            framed_roundtrips(s, msgs)
+        });
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    let replies = client.join().expect("thread join").expect("client io");
+    assert_eq!(replies, vec![b"hello".to_vec(), b"world".to_vec()]);
+
+    match peer_rx.try_recv().expect("accept handler ran") {
+        ClientAddr::Inet(std::net::SocketAddr::V6(p)) => {
+            assert_eq!(p.ip(), &std::net::Ipv6Addr::LOCALHOST);
+            assert_ne!(p.port(), 0, "a real ephemeral peer port");
+        }
+        other => panic!("expected an IPv6 peer, got {other:?}"),
+    }
+}
+
+/// Collect the close reasons a server reports, so a test can assert not just
+/// that a connection died but that it died for the documented reason.
+fn close_reason_channel<U>(
+    server: &mut Server<
+        U,
+        impl FnMut(Incoming<'_>) -> Option<U>,
+        impl FnMut(&[u8], &mut U) -> Framing,
+        impl FnMut(Request<'_, U>) -> Response,
+    >,
+) -> std::sync::mpsc::Receiver<CloseReason> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    server.set_close_hook(move |_peer, reason, _state| {
+        let _ = tx.send(reason);
+    });
+    rx
+}
+
+#[test]
+fn tcp_detach_without_a_handler_closes() {
+    // A body handler returns `Response::Detach` on a server that never called
+    // `set_detach_handler` — a misconfiguration. The fd is furnished by the
+    // kernel before anything notices, so the loop has to close the alias it
+    // will not use, reattach the parked connection to `Serving`, and tear it
+    // down; leaking the alias would pin the socket open past the close.
+    // Reported as `HandlerClosed`, distinguishing the misconfig from an install
+    // failure (`RecvError`) and from shutdown (`ShuttingDown`).
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: |req: Request<'_, ()>| Response::Detach(req.responder.detach()),
+    };
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    // Deliberately no `set_detach_handler`.
+    let reasons = close_reason_channel(&mut server);
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<Vec<u8>> {
+            let mut s = connect_tcp(v4)?;
+            let _ = send_framed(&mut s, b"detach");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf)?;
+            Ok(buf)
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    match client.join().expect("thread join") {
+        Ok(buf) => assert!(buf.is_empty(), "expected clean EOF, got {buf:?}"),
+        Err(e) => assert_eq!(e.kind(), io::ErrorKind::ConnectionReset),
+    }
+    assert_eq!(
+        reasons.try_recv().ok(),
+        Some(CloseReason::HandlerClosed),
+        "a detach with no handler registered is a handler-side close",
+    );
+}
+
+#[test]
+fn tcp_detach_with_a_foreign_permit_closes() {
+    // `DetachPermit` proves `Responder::detach` ran, but only its token proves
+    // it ran for THIS request. A handler that mints a permit on one request,
+    // stashes it in the connection state, and returns it on a later one is
+    // claiming a detach the loop cannot route: the request it names is already
+    // answered. The token check must reject it and close, rather than park a
+    // request nothing can ever resolve.
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| {
+            Some(None::<truenas_ros::net::server::DetachPermit>)
+        },
+        header: length_prefix_header::<
+            Option<truenas_ros::net::server::DetachPermit>,
+        >(PrefixWidth::U32, Endian::Big, false),
+        body: |req: Request<
+            '_,
+            Option<truenas_ros::net::server::DetachPermit>,
+        >| {
+            let Request {
+                body,
+                state,
+                responder,
+                ..
+            } = req;
+            if &body[..] == b"stash" {
+                // Mint this request's permit and keep it; answer normally, so
+                // the request it is stamped with is retired.
+                *state = Some(responder.detach());
+                Response::Reply(echo_frame(b"stashed"))
+            } else {
+                // Replay the earlier request's permit against this one.
+                Response::Detach(state.take().expect("stashed first"))
+            }
+        },
+    };
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    // Registered, so the close cannot be blamed on a missing handler.
+    server.set_detach_handler(|_ctx, detached| {
+        panic!("a foreign permit must never reach the detach handler: {detached:?}");
+    });
+    let reasons = close_reason_channel(&mut server);
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<Vec<u8>> {
+            let mut s = connect_tcp(v4)?;
+            send_framed(&mut s, b"stash")?;
+            let first = recv_framed(&mut s)?;
+            assert_eq!(first, b"stashed", "the minting request is answered");
+            let _ = send_framed(&mut s, b"replay");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf)?;
+            Ok(buf)
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    match client.join().expect("thread join") {
+        Ok(buf) => assert!(buf.is_empty(), "expected clean EOF, got {buf:?}"),
+        Err(e) => assert_eq!(e.kind(), io::ErrorKind::ConnectionReset),
+    }
+    assert_eq!(
+        reasons.try_recv().ok(),
+        Some(CloseReason::HandlerClosed),
+        "a permit from another request closes the connection",
+    );
+}
+
+#[test]
+fn tcp_detach_on_an_unsettled_connection_closes() {
+    // Detach hands the raw socket to a worker, so the bytes that follow belong
+    // to the fd rather than the framer. It is only safe on a fully settled
+    // connection — nothing in flight and nothing buffered past this request.
+    // A pipelined second message still sitting in the server's buffer is
+    // exactly that: the worker would consume bytes the framer already owns, so
+    // the loop must close instead.
+    //
+    // The framer has to be a scanning one for this to arise. A fixed-width
+    // length prefix asks for exact byte counts, so a pipelined follower stays
+    // in the socket and never reaches the buffer — the connection reads as
+    // settled. `lsp_header` scans for a `\r\n\r\n` terminator and so consumes
+    // opportunistically, which is what leaves the second message buffered.
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: lsp_header,
+        body: |req: Request<'_, ()>| Response::Detach(req.responder.detach()),
+    };
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    server.set_detach_handler(|_ctx, detached| {
+        panic!("an unsettled connection must not detach: {detached:?}");
+    });
+    let reasons = close_reason_channel(&mut server);
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<Vec<u8>> {
+            let mut s = connect_tcp(v4)?;
+            // Two complete LSP-framed messages in one write, so the scanning
+            // framer buffers the second while the first is being handled.
+            let mut pipelined = b"Content-Length: 6\r\n\r\ndetach".to_vec();
+            pipelined.extend_from_slice(b"Content-Length: 8\r\n\r\ntrailing");
+            let _ = s.write_all(&pipelined);
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf)?;
+            Ok(buf)
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    match client.join().expect("thread join") {
+        Ok(buf) => assert!(buf.is_empty(), "expected clean EOF, got {buf:?}"),
+        Err(e) => assert_eq!(e.kind(), io::ErrorKind::ConnectionReset),
+    }
+    assert_eq!(
+        reasons.try_recv().ok(),
+        Some(CloseReason::HandlerClosed),
+        "detaching with a frame still buffered closes the connection",
+    );
+}
+
+#[test]
+fn protocol_context_types_are_debug() {
+    // `Incoming`, `Request` and `DetachContext` are `#[non_exhaustive]`, so a
+    // consumer cannot build one to print — their `Debug` impls are reachable
+    // only from inside a live handler. They are the types that end up in a
+    // consumer's error logs, and each one
+    // deliberately withholds fields: `Request` prints `header_len` rather than
+    // the header, and neither it nor `DetachContext` prints the connection
+    // state, which is where an application keeps its secrets. Assert the shape
+    // and those omissions, not merely that formatting does not panic.
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
+    let accept_tx = tx.clone();
+    let detach_tx = tx.clone();
+    let proto = Protocol {
+        accept: move |inc: Incoming<'_>| {
+            let _ = accept_tx.send(("incoming".into(), format!("{inc:?}")));
+            Some(String::from("s3cret-state"))
+        },
+        header: length_prefix_header::<String>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |req: Request<'_, String>| {
+            let rendered = format!("{req:?}");
+            let _ = detach_tx.send(("request".into(), rendered));
+            if &req.body[..] == b"detach" {
+                Response::Detach(req.responder.detach())
+            } else {
+                Response::Reply(echo_frame(b"ok"))
+            }
+        },
+    };
+    // `Protocol`'s own `Debug` is reachable from outside; check it before the
+    // server takes ownership.
+    assert_eq!(format!("{proto:?}"), "Protocol { .. }");
+
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ctx_tx = tx.clone();
+    server.set_detach_handler(move |ctx, detached| {
+        let _ = ctx_tx.send(("detach_ctx".into(), format!("{ctx:?}")));
+        detached.close();
+    });
+    drop(tx);
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            send_framed(&mut s, b"hello")?;
+            let _ = recv_framed(&mut s)?;
+            let _ = send_framed(&mut s, b"detach");
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            Ok(())
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join").expect("client io");
+
+    // `try_iter`, not `iter`: the sender clones live in handler closures the
+    // server still owns, so waiting for the channel to hang up would deadlock.
+    // Every send happened before `serve_forever` returned.
+    let rendered: std::collections::HashMap<String, String> =
+        rx.try_iter().collect();
+    let incoming = rendered.get("incoming").expect("accept handler ran");
+    assert!(
+        incoming.starts_with("Incoming {") && incoming.contains("peer"),
+        "Incoming Debug should name its peer: {incoming}"
+    );
+    assert!(
+        incoming.contains("listener_addr"),
+        "Incoming Debug should name the listener it arrived on: {incoming}"
+    );
+    assert!(
+        incoming.ends_with(".. }"),
+        "Incoming is #[non_exhaustive]; its Debug must stay open: {incoming}"
+    );
+
+    let request = rendered.get("request").expect("body handler ran");
+    assert!(
+        request.starts_with("Request {") && request.contains("header_len"),
+        "Request Debug should report header_len, not the header: {request}"
+    );
+    assert!(
+        !request.contains("s3cret-state"),
+        "Request Debug must not print the connection state: {request}"
+    );
+
+    let ctx = rendered.get("detach_ctx").expect("detach handler ran");
+    assert!(
+        ctx.starts_with("DetachContext {") && ctx.contains("peer"),
+        "DetachContext Debug should name its peer: {ctx}"
+    );
+    assert!(
+        !ctx.contains("s3cret-state"),
+        "DetachContext Debug must not print the connection state: {ctx}"
+    );
+}
+
 /// A `[tag: u8][len: u32 BE]` framer for the splice tests: tag `S` diverts the
 /// next `len` body bytes straight to `pipe_wr` via `Framing::SpliceBody`
 /// (zero-copy, never buffered); tag `C` is a normal control frame whose `len`
@@ -2709,6 +3472,493 @@ fn tcp_deferred_reply_close_empty_flushes_queued() {
     assert_eq!(
         reasons.lock().unwrap().as_slice(),
         &[CloseReason::WorkerClosed],
+    );
+}
+
+/// A throwaway protocol for the construction-time validation cases, which are
+/// rejected before any socket or ring exists and so never reach io_uring.
+// Three opaque closure types in the return, for the same reason
+// `net::server::length_prefixed` carries this allow: they cannot be
+// type-aliased on stable, and the signature IS the type.
+#[allow(clippy::type_complexity)]
+fn noop_protocol() -> Protocol<
+    impl FnMut(Incoming<'_>) -> Option<()>,
+    impl FnMut(&[u8], &mut ()) -> Framing,
+    impl FnMut(Request<'_, ()>) -> Response,
+> {
+    Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
+    }
+}
+
+#[test]
+fn server_config_bounds_are_rejected_at_construction() {
+    // `ServerConfig::validate` runs as the first statement of `with_config`,
+    // before a socket or a ring exists, so every case here is reachable with
+    // no io_uring at all. Each knob is checked for the message it produces,
+    // not merely that it errored: an out-of-range value accepted here becomes
+    // a truncated completion token or a thread storm much later, and the
+    // message is the only thing naming the knob that was wrong.
+    use truenas_ros::net::server::Listen;
+    let tcp =
+        || ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let expect = |addrs: Vec<Listen>, cfg: ServerConfig, needle: &str| {
+        match Server::with_config(addrs, cfg, noop_protocol()) {
+            Err(Error::Validation(m)) => assert!(
+                m.contains(needle),
+                "expected a validation error mentioning {needle:?}, got {m:?}",
+            ),
+            Err(e) => {
+                panic!("expected a validation error for {needle:?}, got {e}")
+            }
+            Ok(_) => panic!("expected {needle:?} to be rejected"),
+        }
+    };
+
+    // The listener list itself.
+    expect(Vec::new(), ServerConfig::default(), "listener count");
+    expect(
+        (0..257).map(|_| Listen::from(tcp())).collect(),
+        ServerConfig::default(),
+        "listener count",
+    );
+    // kTLS rides the TCP stack; a Unix listener cannot carry it.
+    expect(
+        vec![Listen::tls(ServerAddr::Unix("/tmp/ktls-validate".into()))],
+        ServerConfig::default(),
+        "kTLS listeners must be TCP",
+    );
+
+    // Numeric knobs, each at both ends of its range where it has two.
+    let one = || vec![Listen::from(tcp())];
+    for (cfg, needle) in [
+        (
+            ServerConfig {
+                pool_size: 0,
+                ..ServerConfig::default()
+            },
+            "pool_size",
+        ),
+        (
+            ServerConfig {
+                pool_size: 0x0100_0000, // one past the 24-bit slot ceiling
+                ..ServerConfig::default()
+            },
+            "pool_size",
+        ),
+        (
+            ServerConfig {
+                max_request_bytes: 0,
+                ..ServerConfig::default()
+            },
+            "max_request_bytes",
+        ),
+        (
+            ServerConfig {
+                max_request_bytes: usize::MAX,
+                ..ServerConfig::default()
+            },
+            "max_request_bytes",
+        ),
+        (
+            ServerConfig {
+                max_send_backlog: 0,
+                ..ServerConfig::default()
+            },
+            "max_send_backlog must be non-zero",
+        ),
+        (
+            ServerConfig {
+                max_send_coalesce: 0,
+                ..ServerConfig::default()
+            },
+            "max_send_coalesce",
+        ),
+        (
+            ServerConfig {
+                max_send_coalesce: usize::MAX,
+                ..ServerConfig::default()
+            },
+            "max_send_coalesce",
+        ),
+        (
+            ServerConfig {
+                max_in_flight_requests: 0,
+                ..ServerConfig::default()
+            },
+            "max_in_flight_requests",
+        ),
+        (
+            ServerConfig {
+                max_in_flight_requests: usize::MAX,
+                ..ServerConfig::default()
+            },
+            "max_in_flight_requests",
+        ),
+    ] {
+        expect(one(), cfg, needle);
+    }
+
+    // A timeout knob is optional, but `Some(0)` is never what anyone means:
+    // it would expire the moment it was armed.
+    let zero = Duration::ZERO;
+    for (cfg, needle) in [
+        (
+            ServerConfig {
+                idle_timeout: Some(zero),
+                ..ServerConfig::default()
+            },
+            "idle_timeout must be non-zero",
+        ),
+        (
+            ServerConfig {
+                send_timeout: Some(zero),
+                ..ServerConfig::default()
+            },
+            "send_timeout must be non-zero",
+        ),
+        (
+            ServerConfig {
+                request_timeout: Some(zero),
+                ..ServerConfig::default()
+            },
+            "request_timeout must be non-zero",
+        ),
+        (
+            ServerConfig {
+                tls_handshake_timeout: Some(zero),
+                ..ServerConfig::default()
+            },
+            "tls_handshake_timeout must be non-zero",
+        ),
+        (
+            ServerConfig {
+                keepalive: Some(zero),
+                ..ServerConfig::default()
+            },
+            "keepalive must be non-zero",
+        ),
+        (
+            ServerConfig {
+                tcp_user_timeout: Some(zero),
+                ..ServerConfig::default()
+            },
+            "tcp_user_timeout must be non-zero",
+        ),
+    ] {
+        expect(one(), cfg, needle);
+    }
+}
+
+#[cfg(feature = "uring-fs")]
+#[test]
+fn server_config_fs_pool_bounds_are_rejected_at_construction() {
+    // The fs knobs carry their own bounds for reasons the generic ones do not:
+    // each fs file needs two op slots and an op-slot index shares the 24-bit
+    // `user_data` slot field, so an oversized `fs_files` would truncate a
+    // completion token rather than fail; and the offload floor spawns eagerly
+    // on the reactor thread, so an absurd value is a thread storm at first use.
+    // Both must fail here, at construction, where the message still names the
+    // knob.
+    use truenas_ros::net::server::Listen;
+    let one = || {
+        vec![Listen::from(ServerAddr::Tcp(
+            "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
+        ))]
+    };
+    let expect = |cfg: ServerConfig, needle: &str| match Server::with_config(
+        one(),
+        cfg,
+        noop_protocol(),
+    ) {
+        Err(Error::Validation(m)) => assert!(
+            m.contains(needle),
+            "expected a validation error mentioning {needle:?}, got {m:?}",
+        ),
+        Err(e) => panic!("expected a validation error for {needle:?}, got {e}"),
+        Ok(_) => panic!("expected {needle:?} to be rejected"),
+    };
+
+    expect(
+        ServerConfig {
+            fs_files: 0x0080_0000, // *2 lands one past the 24-bit ceiling
+            ..ServerConfig::default()
+        },
+        "fs_files",
+    );
+    expect(
+        ServerConfig {
+            fs_offload_floor: 0,
+            ..ServerConfig::default()
+        },
+        "fs_offload_floor",
+    );
+    expect(
+        ServerConfig {
+            fs_offload_floor: 4,
+            fs_offload_ceiling: 2, // floor above ceiling
+            ..ServerConfig::default()
+        },
+        "fs_offload_floor",
+    );
+    expect(
+        ServerConfig {
+            fs_offload_ceiling: 1025, // past MAX_OFFLOAD_THREADS
+            ..ServerConfig::default()
+        },
+        "fs_offload_floor",
+    );
+}
+
+#[test]
+fn tcp_deferred_worker_completes_with_nothing() {
+    // `Deferred::reply` with an EMPTY body is the one-way case: the worker
+    // finished, there is nothing to send, and the request must simply be
+    // retired. It travels as its own outcome rather than as an empty reply,
+    // because a queued reply has its in-flight count retired when the send
+    // flushes and here no send will ever happen — so the count is dropped
+    // where the outcome lands instead. Get that wrong and the connection
+    // keeps a phantom request forever, which the request cap would eventually
+    // stall on. Proven by continuing to serve afterwards: a leaked count would
+    // still be outstanding.
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: |req: Request<'_, ()>| {
+            let Request {
+                body, responder, ..
+            } = req;
+            if &body[..] == b"oneway" {
+                let (deferred, permit) = responder.defer();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(10));
+                    deferred.reply(Vec::new()); // completed, nothing to send
+                });
+                Response::Defer(permit)
+            } else {
+                Response::Reply(echo_frame(&body))
+            }
+        },
+    };
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<Vec<u8>> {
+            let mut s = connect_tcp(v4)?;
+            // Several one-way requests in a row: each must retire its own
+            // in-flight count, or the cap stalls the connection well before
+            // the round-trip below completes.
+            for _ in 0..4 {
+                send_framed(&mut s, b"oneway")?;
+            }
+            send_framed(&mut s, b"ping")?;
+            recv_framed(&mut s)
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    let reply = client.join().expect("thread join").expect("client io");
+    assert_eq!(
+        reply, b"ping",
+        "one-way deferrals must retire their in-flight count and keep serving",
+    );
+}
+
+#[test]
+fn tcp_push_close_after_the_peer_is_gone_is_inert() {
+    // A `PushHandle` outlives the connection it names — that is the point of a
+    // long-lived handle — so a `close` can always arrive after the peer has
+    // already vanished, or after the slot has been recycled onto somebody
+    // else. It must be inert rather than tearing down whoever holds the slot
+    // now. Here the subscriber disconnects, a second client takes its place,
+    // and only then does the stale handle fire.
+    use std::sync::Mutex;
+    let stash: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let handle_for_body = Arc::clone(&stash);
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |req: Request<'_, ()>| {
+            let Request {
+                body, responder, ..
+            } = req;
+            if &body[..] == b"sub" {
+                *handle_for_body.lock().unwrap() =
+                    Some(responder.push_handle());
+            }
+            Response::Reply(echo_frame(&body))
+        },
+    };
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<Vec<u8>> {
+            let mut first = connect_tcp(v4)?;
+            send_framed(&mut first, b"sub")?;
+            assert_eq!(recv_framed(&mut first)?, b"sub");
+            drop(first); // the handle's connection is gone
+            thread::sleep(Duration::from_millis(100)); // let the close land
+
+            // A fresh connection, likely onto the recycled slot.
+            let mut second = connect_tcp(v4)?;
+            send_framed(&mut second, b"hello")?;
+            assert_eq!(recv_framed(&mut second)?, b"hello");
+
+            // Fire the stale handle: it names a dead connection (and possibly
+            // this one's slot at an older generation).
+            stash.lock().unwrap().take().expect("stashed").close();
+            thread::sleep(Duration::from_millis(100));
+
+            // The survivor is untouched.
+            send_framed(&mut second, b"still-here")?;
+            recv_framed(&mut second)
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    let reply = client.join().expect("thread join").expect("client io");
+    assert_eq!(
+        reply, b"still-here",
+        "a stale PushHandle::close must not disturb the slot's new owner",
+    );
+}
+
+#[test]
+fn tcp_push_close_during_a_detach_window_lands_at_resume() {
+    // A `PushHandle::close` arriving while the connection is parked under a
+    // detach worker cannot act immediately: the worker owns the raw stream, so
+    // writing the queued farewell or tearing the socket down would corrupt its
+    // transfer. It is recorded and enacted at resume — after the pushes held
+    // during the same window, which ride ahead of it. So the client must see
+    // every held push, in order, and *then* EOF, with the close attributed to
+    // the push side rather than to the worker.
+    use std::sync::mpsc;
+    use std::sync::Mutex;
+    let push_slot: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
+    let (parked_tx, parked_rx) = mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    let resume_rx = Arc::new(Mutex::new(Some(resume_rx)));
+
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let stash = Arc::clone(&push_slot);
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |req: Request<'_, ()>| match &req.body[..] {
+            b"sub" => {
+                *stash.lock().unwrap() = Some(req.responder.push_handle());
+                Response::Reply(echo_frame(b"ok"))
+            }
+            b"detach" => Response::Detach(req.responder.detach()),
+            other => Response::Reply(echo_frame(other)),
+        },
+    };
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    {
+        let resume_rx = Arc::clone(&resume_rx);
+        server.set_detach_handler(move |_ctx, detached| {
+            let parked_tx = parked_tx.clone();
+            let rx = resume_rx.lock().unwrap().take().expect("one detach");
+            thread::spawn(move || {
+                parked_tx.send(()).expect("parked signal");
+                rx.recv().expect("resume signal"); // hold the detach open
+                detached.resume();
+            });
+        });
+    }
+    let reasons = close_reason_channel(&mut server);
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<Vec<u8>> {
+            let mut s = connect_tcp(v4)?;
+            send_framed(&mut s, b"sub")?;
+            assert_eq!(recv_framed(&mut s)?, b"ok");
+            send_framed(&mut s, b"detach")?;
+            parked_rx.recv().expect("parked");
+
+            let push =
+                push_slot.lock().unwrap().clone().expect("stashed handle");
+            push.push(echo_frame(b"farewell"));
+            push.close(); // lands during the detach window
+                          // Let the loop drain both injections while still parked.
+            thread::sleep(Duration::from_millis(150));
+            resume_tx.send(()).expect("resume signal");
+
+            // The held push flushes first...
+            assert_eq!(
+                recv_framed(&mut s)?,
+                b"farewell",
+                "a push queued before the close must still be delivered",
+            );
+            // ...then the recorded close is enacted.
+            let mut tail = Vec::new();
+            s.read_to_end(&mut tail)?;
+            Ok(tail)
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    match client.join().expect("thread join") {
+        Ok(tail) => assert!(tail.is_empty(), "expected EOF, got {tail:?}"),
+        Err(e) => assert_eq!(e.kind(), io::ErrorKind::ConnectionReset),
+    }
+    assert_eq!(
+        reasons.try_recv().ok(),
+        Some(CloseReason::PushClosed),
+        "a close held across a detach is still a push-side close",
     );
 }
 

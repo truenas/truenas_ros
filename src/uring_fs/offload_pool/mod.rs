@@ -117,17 +117,13 @@ impl WorkerPool {
             shared: Arc::clone(&shared),
         };
         for _ in 0..floor {
-            {
+            // Spawn under the lock and count only on success -- see `submit`.
+            let spawned = {
                 let mut g =
                     shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-                g.total += 1; // account the worker before it can exit
-            }
-            if let Err(e) = spawn_worker(&shared) {
-                {
-                    let mut g =
-                        shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-                    g.total -= 1;
-                }
+                spawn_worker(&shared).map(|()| g.total += 1)
+            };
+            if let Err(e) = spawned {
                 drop(pool); // closes and waits for the workers already started
                 return Err(e);
             }
@@ -138,31 +134,30 @@ impl WorkerPool {
     /// Enqueue `job`, growing the pool by one worker if it is saturated and the
     /// cooldown has elapsed (a no-op if the pool is already dropping).
     pub(crate) fn submit(&self, job: Job) {
-        let grow = {
-            let mut g =
-                self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if g.closed {
-                return;
-            }
-            g.queue.push_back(job);
-            self.shared.cv.notify_one();
-            let saturated =
-                self.shared.running.load(Ordering::Relaxed) >= g.total;
-            let grow = saturated
-                && g.total < self.shared.ceiling
-                && self.shared.claim_spawn_slot();
-            if grow {
-                g.total += 1; // reserve the slot before releasing the lock
-            }
-            grow
-        };
-        if grow && spawn_worker(&self.shared).is_err() {
-            // Spawn failed: return the reserved slot. The job still runs when a
-            // busy worker frees up.
-            let mut g =
-                self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
-            g.total -= 1;
+        let mut g = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.closed {
+            return;
         }
+        g.queue.push_back(job);
+        self.shared.cv.notify_one();
+        let saturated = self.shared.running.load(Ordering::Relaxed) >= g.total;
+        // Spawn under the lock, counting the worker only once it has started.
+        // Reserving the slot first and handing it back on failure would put a
+        // third decrement of `total` on a path with none of the guards the
+        // idle retire has: `Drop` waits for `total` to reach zero, and a
+        // reserved slot has no worker exit coming to signal on its behalf, so
+        // a submit racing a drop could lower the count in silence and park
+        // `Drop` on the condvar forever. Counting only what exists leaves a
+        // failed spawn touching no shared state. The cost is holding the lock
+        // across a thread creation, bounded by the growth cooldown.
+        if saturated
+            && g.total < self.shared.ceiling
+            && self.shared.claim_spawn_slot()
+            && spawn_worker(&self.shared).is_ok()
+        {
+            g.total += 1;
+        }
+        // A failed spawn leaves the job queued for a busy worker to pick up.
     }
 }
 
