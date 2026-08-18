@@ -336,11 +336,19 @@ where
             if !self.core.table.slot_matches(token.slot, token.generation) {
                 continue; // connection gone (or slot recycled)
             }
-            if self.core.table.conn(token.slot).close_on_flush.is_some() {
+            {
+                let conn = self.core.table.conn(token.slot);
                 // Flush-closing: the farewell is final — a worker outcome
                 // landing after it is dropped, exactly like a late push (the
-                // request it resolves dies with the connection).
-                continue;
+                // request it resolves dies with the connection). `closing` is
+                // the same rule for the teardown that does not flush, and
+                // `pump_gate` already refuses one for it. A `redeliver` slipped
+                // past here re-enters the body handler mid-teardown, and a
+                // `Response::Detach` from that rerun parks the slot with an op
+                // still outstanding, which `on_closed` then frees untracked.
+                if conn.closing || conn.close_on_flush.is_some() {
+                    continue;
+                }
             }
             if !self
                 .core

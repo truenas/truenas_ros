@@ -3573,6 +3573,24 @@ fn server_config_bounds_are_rejected_at_construction() {
             },
             "max_send_backlog must be non-zero",
         ),
+        // `listen(2)` takes a signed backlog but compares it unsigned, so a
+        // negative value is reinterpreted as enormous and silently clamped to
+        // somaxconn rather than rejected; zero listens but accepts almost
+        // nothing. Neither is what any caller meant.
+        (
+            ServerConfig {
+                backlog: 0,
+                ..ServerConfig::default()
+            },
+            "backlog must be positive",
+        ),
+        (
+            ServerConfig {
+                backlog: -1,
+                ..ServerConfig::default()
+            },
+            "backlog must be positive",
+        ),
         (
             ServerConfig {
                 max_send_coalesce: 0,

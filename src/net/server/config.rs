@@ -313,6 +313,12 @@ impl ServerConfig {
                 "idle_timeout must be non-zero".into(),
             ));
         }
+        if self.backlog <= 0 {
+            // `listen(2)` takes a signed backlog but compares it unsigned, so a
+            // negative value is reinterpreted as enormous and silently clamped
+            // to somaxconn; zero leaves a listener that accepts almost nothing.
+            return Err(Error::Validation("backlog must be positive".into()));
+        }
         if self.max_send_backlog == 0 {
             return Err(Error::Validation(
                 "max_send_backlog must be non-zero".into(),
