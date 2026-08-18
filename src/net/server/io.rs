@@ -208,7 +208,13 @@ where
                 // stream that follows belongs to the fd, not the framer).
                 let settled = {
                     let conn = self.core.table.conn(slot);
-                    !conn.recving
+                    // `closing`/`ops`: a teardown already in flight owns this
+                    // slot's remaining completions, and parking it as
+                    // `Detaching` would take it out of the state those
+                    // completions are accounted against.
+                    !conn.closing
+                        && conn.ops == 0
+                        && !conn.recving
                         && !conn.sending
                         && !conn.splicing
                         && !conn.splice_polling
@@ -339,6 +345,16 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         // Kernel completion → low 32 bits. The slot is `Detaching`, not
         // `Serving`, so `slot_matches_cqe` doesn't apply — check directly.
         if self.core.table.generation_low(slot) != generation {
+            if res >= 0 {
+                // The kernel furnished the fd before the slot was recycled, so
+                // declining it here still leaks it unless we close it. Every
+                // path that does not hand the fd to a `Detached` owns closing
+                // it — this one included.
+                // SAFETY: `res` is the freshly installed fd, owned by us and
+                // consumed by nobody (the pool socket survives on the direct
+                // descriptor).
+                unsafe { libc::close(res) };
+            }
             return Ok(()); // slot recycled under a stale completion
         }
         // Close instead of handing off on: install failure/cancel, shutdown, or
@@ -364,15 +380,17 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             }
             return Ok(()); // no longer detaching (stale)
         }
-        // Hand off: take the connection out (the slot is momentarily `Empty`, as
-        // the kTLS install→park does), build the fd-owning handle, run the
-        // handler, and park.
+        // Hand off. Park first, then run the handler against the parked slot,
+        // as the kTLS install→park does (`park_tls` precedes its handshake
+        // handler): the connection must not leave the table across consumer
+        // code — see `park_detached_in_place`.
         let gen64 = self.core.table.generation(slot);
-        let Some(mut conn) = self.core.table.take_detaching(slot) else {
-            // SAFETY: nobody will consume the fd; close the alias.
+        if !self.core.table.park_detached_in_place(slot) {
+            // No longer detaching (stale): nobody will consume the fd.
+            // SAFETY: `res` is the freshly installed fd, owned and unconsumed.
             unsafe { libc::close(res) };
             return Ok(());
-        };
+        }
         // SAFETY: `res` is a fresh owned fd materialized by FIXED_FD_INSTALL.
         let fd = unsafe { owned_from_raw(res) };
         let detached = Detached {
@@ -383,8 +401,9 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             shared: Arc::clone(&self.core.engine.shared),
             done: false,
         };
-        // Disjoint-field borrow: `self.handlers` vs the local `conn`.
+        // Disjoint-field borrow: `self.handlers` vs `self.core.table`.
         let handler = self.handlers.detach.as_mut().expect("checked is_some");
+        let conn = self.core.table.detached_conn_mut(slot);
         handler(
             DetachContext {
                 peer: &conn.peer,
@@ -392,7 +411,6 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             },
             detached,
         );
-        self.core.table.park_detached(slot, conn);
         Ok(())
     }
 }

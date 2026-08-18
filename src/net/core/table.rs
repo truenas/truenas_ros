@@ -446,31 +446,40 @@ impl<U> ConnTable<U> {
         e.state = SlotState::Detaching(conn);
     }
 
-    /// Take the detaching connection out (leaving the slot momentarily `Empty`,
-    /// as the kTLS install→park transition does) so the fd-install completion
-    /// can hand its peer/state to the detach handler, then `park_detached` it.
-    /// `None` if the slot is not `Detaching` (a stale completion).
-    pub(crate) fn take_detaching(
-        &mut self,
-        slot: u32,
-    ) -> Option<Box<Connection<U>>> {
-        let e = self.slots.get_mut(slot as usize)?;
-        if !matches!(e.state, SlotState::Detaching(_)) {
-            return None;
-        }
-        match std::mem::replace(&mut e.state, SlotState::Empty) {
-            SlotState::Detaching(conn) => Some(conn),
-            _ => unreachable!(),
-        }
+    /// Move a `Detaching` slot to `Detached` without taking the connection out,
+    /// so the detach handler can be run against the parked slot rather than
+    /// across an `Empty` one. Returns whether the slot was `Detaching` (a stale
+    /// completion gets `false`, unchanged).
+    ///
+    /// The connection never leaves the table, so an unwinding handler cannot
+    /// strand the slot `Empty` with its generation un-bumped — which would let
+    /// a later accept reuse it at a generation retained handles still match.
+    pub(crate) fn park_detached_in_place(&mut self, slot: u32) -> bool {
+        let Some(e) = self.slots.get_mut(slot as usize) else {
+            return false;
+        };
+        let conn = match std::mem::replace(&mut e.state, SlotState::Empty) {
+            SlotState::Detaching(conn) => conn,
+            other => {
+                e.state = other;
+                return false;
+            }
+        };
+        e.state = SlotState::Detached(conn);
+        true
     }
 
-    /// Park a detached connection across the consumer's worker.
-    pub(crate) fn park_detached(
+    /// The parked connection of a `Detached` slot. Panics on any other state —
+    /// callers reach this only just after `park_detached_in_place` returned
+    /// `true`.
+    pub(crate) fn detached_conn_mut(
         &mut self,
         slot: u32,
-        conn: Box<Connection<U>>,
-    ) {
-        self.slots[slot as usize].state = SlotState::Detached(conn);
+    ) -> &mut Connection<U> {
+        match &mut self.slots[slot as usize].state {
+            SlotState::Detached(conn) => conn,
+            _ => panic!("detached_conn_mut on non-detached slot {slot}"),
+        }
     }
 
     /// Move a `Detaching`/`Detached` connection back to `Serving` in place (the
