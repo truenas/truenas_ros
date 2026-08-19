@@ -18,7 +18,7 @@
 //!   `(tag, op-slot, generation)`; an op entry frees only at its own single
 //!   terminal CQE, so a stale / duplicate / wrong-tag completion is rejected.
 
-use super::offload_pool::SharedPool;
+use super::offload_pool::{OffloadBounds, SharedPool};
 use super::{
     statx_at_flags, Anchor, File, FsOutcome, Leaf, Personality,
     PrivilegedXattrs, ReplyTo, RwFlags,
@@ -56,32 +56,26 @@ use std::thread;
 /// Default warm floor of worker threads backing [`FsConn::offload`]; the pool
 /// is spawned on first use and grows to [`OFFLOAD_CEILING`] under saturation.
 ///
-/// One, because the floor is **resident**: these threads spawn on first use
-/// and the idle retire never takes the pool below them, so the floor is a
-/// standing cost paid by every reactor whether or not it ever offloads. A
-/// deployment picks its own reactor count (one per core under `SO_REUSEPORT`
-/// is the usual shape) and this default is multiplied by it, so anything
-/// larger sizes the *machine* from inside a library that cannot see the
-/// deployment. One keeps a thread warm so the first offload does not pay a
-/// spawn; growth covers the rest.
-pub(crate) const OFFLOAD_FLOOR: usize = 1;
+/// Four, so a small burst of concurrent listings is served without waiting on
+/// a thread spawn: growth is rate-limited to one worker per millisecond, so a
+/// pool starting at one takes three to reach four. This is the pool's only
+/// resident cost, paid per ring once anything offloads.
+pub(crate) const OFFLOAD_FLOOR: usize = 4;
 /// Default ceiling the offload pool grows to under sustained blocking work
 /// (opcode-less `readdir`/`fdopendir`/copy).
 ///
-/// Deliberately modest for the same reason as the floor: it is per reactor and
-/// multiplied by a reactor count the library does not choose. It bounds how
-/// many *concurrently stalled* walks one reactor can absorb before they
-/// head-of-line-block each other, which is the property worth buying, and a
-/// deployment that genuinely needs deeper blocking concurrency should say so
-/// rather than inherit it.
+/// Generous on purpose: it caps how many *concurrently stalled* operations one
+/// ring absorbs before they queue behind each other, which is the whole reason
+/// the pool exists, and a stalled `readdir` against a cold NFS or FUSE backing
+/// can take seconds. These are not resident. A worker exists only while a job
+/// is blocked on it, growth is throttled to one spawn per millisecond, and a
+/// burst worker retires after `OFFLOAD_IDLE_TIMEOUT` idle, so the ceiling is
+/// reached only by load that genuinely wants it.
 ///
-/// Size both explicitly for the deployment via
-/// [`ServerConfig::fs_offload_floor`](crate::net::server::ServerConfig::fs_offload_floor)
-/// and
-/// [`ServerConfig::fs_offload_ceiling`](crate::net::server::ServerConfig::fs_offload_ceiling),
-/// budgeting `ceiling x reactors` for the peak and `floor x reactors` for the
-/// idle residency.
-pub(crate) const OFFLOAD_CEILING: usize = 8;
+/// Every bound here is per ring. A deployment running several multiplies them,
+/// and can size all three through
+/// [`OffloadBounds`](crate::uring_fs::OffloadBounds).
+pub(crate) const OFFLOAD_CEILING: usize = 64;
 /// Names per off-loop `readdir` batch in [`FsConn::next_batch`].
 const DIR_BATCH: usize = 256;
 
@@ -278,7 +272,7 @@ pub(crate) struct FsCore {
 }
 
 impl FsCore {
-    pub(crate) fn new(op_slots: u32) -> FsCore {
+    pub(crate) fn new(op_slots: u32, offload: OffloadBounds) -> FsCore {
         FsCore {
             ops: (0..op_slots)
                 .map(|_| SlotEntry {
@@ -287,7 +281,7 @@ impl FsCore {
                 })
                 .collect(),
             op_free: (0..op_slots).rev().collect(),
-            pool: SharedPool::new(OFFLOAD_FLOOR, OFFLOAD_CEILING),
+            pool: SharedPool::new(offload),
             completions: Arc::new(Mutex::new(VecDeque::new())),
             offload_reg: HashMap::new(),
             next_offload: 0,
@@ -300,15 +294,6 @@ impl FsCore {
     /// `&mut self`, so it cannot change while operations are in flight.
     pub(crate) fn set_privileged_xattrs(&mut self, policy: PrivilegedXattrs) {
         self.priv_xattrs = policy;
-    }
-
-    /// Set the offload pool's warm floor and growth ceiling. Replaces the
-    /// (unspawned) pool, so call it at setup before minting any
-    /// [`FsHandle`](super::FsHandle); sizes the per-reactor thread budget for
-    /// opcode-less blocking work.
-    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
-    pub(crate) fn set_offload_bounds(&mut self, floor: usize, ceiling: usize) {
-        self.pool = SharedPool::new(floor, ceiling);
     }
 
     // ---- off-loop offload: run a blocking job, deliver its result on-loop ----
@@ -1997,6 +1982,12 @@ impl FsConn<'_> {
     /// - **The registry and pool queue are uncapped.** Bound in-flight jobs
     ///   upstream, at the request cap. A failed worker spawn runs the job
     ///   inline on the loop rather than lose it (`SharedPool`).
+    /// - **A job runs on an ordinary thread stack** (std's default, moved by
+    ///   `RUST_MIN_STACK` like any other). Bound a job's recursion or keep it
+    ///   on the heap as the jobs here do: a panicking job is caught and
+    ///   retires alone, but an *overflowing* one is a `SIGSEGV` that
+    ///   `catch_unwind` cannot catch and that aborts the process, so it is the
+    ///   one job-side mistake the pool cannot contain.
     pub fn offload<R, J, F>(&mut self, job: J, on_done: F)
     where
         J: FnOnce() -> R + Send + 'static,
@@ -2378,7 +2369,7 @@ mod hybrid_tests {
 
     fn setup() -> (Engine, FsCore, Personality) {
         let eng = Engine::new(256, 128).expect("engine");
-        let fs = FsCore::new(256);
+        let fs = FsCore::new(256, OffloadBounds::default());
         let me = Personality(
             register_personality(eng.ring.raw_fd()).expect("personality"),
         );
@@ -2977,7 +2968,7 @@ mod routing_fuzz {
         let Some(mut eng) = engine_or_skip() else {
             return;
         };
-        let mut core = FsCore::new(8);
+        let mut core = FsCore::new(8, OffloadBounds::default());
 
         // (A) caller drops BEFORE the CQE: the op's parked clone keeps the fd.
         let arc = Arc::new(unsafe { crate::fd::owned_from_raw(synth_fd()) });
@@ -3041,7 +3032,7 @@ mod routing_fuzz {
         let Some(mut eng) = engine_or_skip() else {
             return;
         };
-        let mut core = FsCore::new(8);
+        let mut core = FsCore::new(8, OffloadBounds::default());
         let (tx, _rx) = mpsc::channel::<FsOutcome>();
         let mut weaks = Vec::new();
         // Four in-flight rw ops, each parking a fd whose caller already dropped.
@@ -3103,7 +3094,7 @@ mod routing_fuzz {
 
     fn run_one(eng: &mut Engine, anchor: &Anchor, seed: u64) {
         let mut rng = Rng::new(seed);
-        let mut core = FsCore::new(OP_SLOTS);
+        let mut core = FsCore::new(OP_SLOTS, OffloadBounds::default());
         let (tx, rx) = mpsc::channel::<FsOutcome>();
         // Weak refs to every synthesized fd - `upgrade() == None` means closed.
         let mut tracked: Vec<Weak<OwnedFd>> = Vec::new();
@@ -3296,7 +3287,7 @@ mod loom_tests {
     #[test]
     fn loom_offload_wakeup_loses_nothing() {
         bounded_model(|| {
-            let mut fs = FsCore::new(4);
+            let mut fs = FsCore::new(4, OffloadBounds::default());
             let sink = fs.completion_sink();
             let wake = Arc::new(
                 WakeHandle::new().expect("the model's wake never fails"),
@@ -3351,7 +3342,7 @@ mod loom_tests {
     #[test]
     fn loom_offload_delivers_each_completion_once() {
         bounded_model(|| {
-            let mut fs = FsCore::new(4);
+            let mut fs = FsCore::new(4, OffloadBounds::default());
             // `Owner` is `Option<(slot, generation)>`; `None` scopes the
             // continuation to the reactor rather than to a connection.
             let token = fs.register_offload(

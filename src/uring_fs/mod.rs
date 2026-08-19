@@ -193,6 +193,7 @@ mod single_flight;
 // helpers - generic machinery, kept apart from the fs-domain modules that
 // submit to it.
 pub(crate) mod offload_pool;
+pub use offload_pool::OffloadBounds;
 // `pub(crate)` so an embedding host (a server driving `FsCore` on its own
 // can drive an `FsCore` on the server's own ring; the standalone host is
 // `uring_fs`'s own `UringFs`.
@@ -2180,7 +2181,10 @@ mod tests {
         let h = FsHandle {
             tx,
             shared,
-            pool: offload_pool::SharedPool::new(1, 1),
+            pool: offload_pool::SharedPool::new(OffloadBounds {
+                floor: 1,
+                ceiling: 1,
+            }),
         };
 
         // SAFETY: dup(2) returns a fresh owned descriptor or -1; stderr is
@@ -2315,7 +2319,10 @@ mod loom_tests {
         let h = FsHandle {
             tx,
             shared: Arc::clone(&shared),
-            pool: offload_pool::SharedPool::new(1, 1),
+            pool: offload_pool::SharedPool::new(OffloadBounds {
+                floor: 1,
+                ceiling: 1,
+            }),
         };
         (h, rx, shared)
     }

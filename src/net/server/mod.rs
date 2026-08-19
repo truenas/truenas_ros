@@ -699,9 +699,13 @@ where
             // on raw fds (`Arc<OwnedFd>`), never `IOSQE_FIXED_FILE`, so
             // `fs_files` sizes only the fs op table (`fs_ops = fs_files * 2`),
             // not any registered file pool.
-            let mut fs = crate::uring_fs::core::FsCore::new(fs_ops);
-            fs.set_offload_bounds(cfg.fs_offload_floor, cfg.fs_offload_ceiling);
-            fs
+            crate::uring_fs::core::FsCore::new(
+                fs_ops,
+                crate::uring_fs::OffloadBounds {
+                    floor: cfg.fs_offload_floor,
+                    ceiling: cfg.fs_offload_ceiling,
+                },
+            )
         });
         #[cfg_attr(not(feature = "uring-fs"), allow(unused_mut))]
         let mut core =
