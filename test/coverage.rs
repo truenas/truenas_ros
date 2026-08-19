@@ -157,7 +157,7 @@ mod path_tests {
 
     #[test]
     fn heap_fallback_for_long_paths() {
-        // Longer than the 1024-byte stack buffer → heap CString path.
+        // Longer than the 1024-byte stack buffer -> heap CString path.
         let long = "a".repeat(2000);
         let n = long.as_str().with_tn_path(|c| c.to_bytes().len()).unwrap();
         assert_eq!(n, 2000);
@@ -165,7 +165,7 @@ mod path_tests {
 
     /// The `[u8]` conversion writes into a `MaybeUninit<[u8; 1024]>` with a
     /// manual NUL and falls back to the heap when the name does not fit, so
-    /// the interesting lengths are the ones either side of that boundary —
+    /// the interesting lengths are the ones either side of that boundary --
     /// where an off-by-one writes past the array. Every length must yield a
     /// `CStr` carrying exactly the input bytes, whichever arm ran.
     ///
@@ -314,13 +314,13 @@ mod fs {
         assert!(!a.exists());
         assert_eq!(std::fs::read(&b).unwrap(), b"data");
 
-        // EXCHANGE with a missing partner → ENOENT.
+        // EXCHANGE with a missing partner -> ENOENT.
         assert_eq!(
             renameat2(AT_FDCWD, &b, AT_FDCWD, &c, RenameFlags::RENAME_EXCHANGE)
                 .unwrap_err(),
             Errno::ENOENT
         );
-        // NOREPLACE | EXCHANGE is contradictory → EINVAL.
+        // NOREPLACE | EXCHANGE is contradictory -> EINVAL.
         assert_eq!(
             renameat2(
                 AT_FDCWD,
@@ -381,14 +381,14 @@ mod xattr {
         }
         let n = "user.tn";
         fsetxattr(f.as_fd(), n, b"v1", XattrFlags::XATTR_CREATE).unwrap();
-        // CREATE again → EEXIST, value unchanged.
+        // CREATE again -> EEXIST, value unchanged.
         assert_eq!(
             fsetxattr(f.as_fd(), n, b"v2", XattrFlags::XATTR_CREATE)
                 .unwrap_err(),
             Errno::EEXIST
         );
         assert_eq!(fgetxattr(f.as_fd(), n).unwrap(), b"v1");
-        // REPLACE existing → ok; REPLACE missing → ENODATA.
+        // REPLACE existing -> ok; REPLACE missing -> ENODATA.
         fsetxattr(f.as_fd(), n, b"v3", XattrFlags::XATTR_REPLACE).unwrap();
         assert_eq!(fgetxattr(f.as_fd(), n).unwrap(), b"v3");
         assert_eq!(
@@ -401,7 +401,7 @@ mod xattr {
             .unwrap_err(),
             Errno::ENODATA
         );
-        // Remove, then get / re-remove both → ENODATA.
+        // Remove, then get / re-remove both -> ENODATA.
         fremovexattr(f.as_fd(), n).unwrap();
         assert_eq!(fgetxattr(f.as_fd(), n).unwrap_err(), Errno::ENODATA);
         assert_eq!(fremovexattr(f.as_fd(), n).unwrap_err(), Errno::ENODATA);
@@ -508,7 +508,7 @@ mod mount {
     fn umount_error_paths() {
         assert!(umount2("/no/such/mount/xyz", MntFlags::empty()).is_err());
         let dir = truenas_ros::tempdir().unwrap();
-        // Recursive umount of a non-mountpoint → validation error.
+        // Recursive umount of a non-mountpoint -> validation error.
         assert!(matches!(
             umount(
                 dir.path(),
@@ -520,7 +520,7 @@ mod mount {
             .unwrap_err(),
             Error::Validation(_)
         ));
-        // Non-recursive umount of a non-mountpoint → syscall error.
+        // Non-recursive umount of a non-mountpoint -> syscall error.
         assert!(umount(dir.path(), UmountOptions::default()).is_err());
     }
 
@@ -546,7 +546,7 @@ mod mount {
         let link = dir.path().join("l");
         std::os::unix::fs::symlink(&point, &link).unwrap();
         // The symlink is not itself a mountpoint, so validation fails before
-        // any umount2 — a syscall error here would mean it got that far.
+        // any umount2 - a syscall error here would mean it got that far.
         assert!(matches!(
             umount(
                 &link,
@@ -585,7 +585,7 @@ mod mount {
     #[test]
     fn fsconfig_variants_reach_the_syscall() {
         // fsopen needs CAP_SYS_ADMIN; drive fsconfig against a plain fd instead
-        // — each command fails at the syscall but every match arm is exercised.
+        // -- each command fails at the syscall but every match arm is exercised.
         let f = std::fs::File::open("/").unwrap();
         let fd = f.as_fd();
         let _ = fsconfig(fd, FsConfig::Flag { key: "ro" });
@@ -690,7 +690,7 @@ mod acl {
         let child = acl.generate_inherited_acl(true).unwrap();
         assert!(child.aces[0].ace_flags.contains(Nfs4Flag::INHERITED));
         assert_eq!(child.acl_flags, Nfs4AclFlag::ACL_IS_DIR);
-        // A non-inheritable parent ACE → error.
+        // A non-inheritable parent ACE -> error.
         let plain = Nfs4Acl {
             acl_flags: Nfs4AclFlag::empty(),
             aces: vec![n_ace(
@@ -705,7 +705,7 @@ mod acl {
 
     #[test]
     fn nfs4_validate_directory_rules() {
-        // DENY for a special principal → rejected.
+        // DENY for a special principal -> rejected.
         assert!(validate_acl(
             AclTarget::AssumeDir,
             &nfs4(
@@ -719,7 +719,7 @@ mod acl {
             )
         )
         .is_err());
-        // INHERIT_ONLY without an inheritable bit → rejected.
+        // INHERIT_ONLY without an inheritable bit -> rejected.
         assert!(validate_acl(
             AclTarget::AssumeDir,
             &nfs4(
@@ -733,7 +733,7 @@ mod acl {
             )
         )
         .is_err());
-        // Directory ACL with no inheritable ACE → rejected.
+        // Directory ACL with no inheritable ACE -> rejected.
         assert!(validate_acl(
             AclTarget::AssumeDir,
             &nfs4(
@@ -747,8 +747,8 @@ mod acl {
             )
         )
         .is_err());
-        // A valid, inheritable directory ACL → ok; an empty ACL on a
-        // directory → err (no inheritable ACE, matching the C).
+        // A valid, inheritable directory ACL -> ok; an empty ACL on a
+        // directory -> err (no inheritable ACE, matching the C).
         assert!(validate_acl(
             AclTarget::AssumeDir,
             &nfs4(
@@ -814,7 +814,7 @@ mod acl {
         assert!(
             validate_acl(AclTarget::AssumeDir, &posix(valid_access())).is_ok()
         );
-        // Missing each required tag → rejected.
+        // Missing each required tag -> rejected.
         for skip in [PosixTag::UserObj, PosixTag::GroupObj, PosixTag::Other] {
             let aces: Vec<_> = valid_access()
                 .into_iter()
@@ -825,7 +825,7 @@ mod acl {
                 "missing {skip:?} should be rejected"
             );
         }
-        // Named USER without MASK → rejected; with MASK → ok.
+        // Named USER without MASK -> rejected; with MASK -> ok.
         let mut aces = valid_access();
         aces.push(p_ace(PosixTag::User, 1000, false));
         assert!(
@@ -833,7 +833,7 @@ mod acl {
         );
         aces.push(p_ace(PosixTag::Mask, -1, false));
         assert!(validate_acl(AclTarget::AssumeDir, &posix(aces)).is_ok());
-        // Entries out of canonical tag order → rejected, as the kernel would.
+        // Entries out of canonical tag order -> rejected, as the kernel would.
         let mut unsorted = PosixAcl::from_aces(valid_access());
         unsorted.access.reverse();
         assert!(
@@ -903,7 +903,7 @@ mod acl {
         std::fs::write(&p, b"x").unwrap();
         let f = std::fs::File::open(&p).unwrap();
         match fgetacl(f.as_fd()) {
-            // POSIX fs with no access xattr → synthesised from the mode bits.
+            // POSIX fs with no access xattr -> synthesised from the mode bits.
             Ok(Acl::Posix(a)) => assert!(a.trivial()),
             Ok(Acl::Nfs4(_)) => {}
             Err(_) => {} // ACLs disabled entirely on this filesystem
@@ -1027,7 +1027,7 @@ mod fhandle {
         let root = std::fs::File::open("/").unwrap();
         match h.open(root.as_fd(), OFlag::O_RDONLY) {
             // Mount-id mismatch (expected), or a fluke match then a syscall
-            // errno (e.g. seccomp ENOSYS) — never success.
+            // errno (e.g. seccomp ENOSYS) - never success.
             Err(Error::Validation(_)) | Err(Error::Errno(_)) => {}
             other => panic!("unexpected: {other:?}"),
         }
@@ -1276,7 +1276,7 @@ mod fsiter {
         }])
         .to_bytes();
         assert!(Cookie::from_bytes(&good).is_ok());
-        // A byte lopped off ⇒ truncated; a byte added ⇒ trailing garbage.
+        // A byte lopped off => truncated; a byte added => trailing garbage.
         let mut truncated = good.clone();
         truncated.pop();
         assert!(matches!(
@@ -1308,14 +1308,14 @@ mod fsiter {
         };
         let full = walk(FsIterBuilder::new(root, fs_source(root)));
 
-        // Empty cookie ⇒ no resume ⇒ full walk.
+        // Empty cookie => no resume => full walk.
         let empty = walk(
             FsIterBuilder::new(root, fs_source(root))
                 .resume_from(Cookie::default()),
         );
         assert_eq!(empty, full);
 
-        // A single-level (root-only) cookie re-reads root from the start ⇒
+        // A single-level (root-only) cookie re-reads root from the start =>
         // also a full walk (the root inode must match).
         let ck = Cookie::from(vec![DirStackEntry {
             path: root.to_path_buf(),
@@ -1547,7 +1547,7 @@ mod shutil {
         assert_eq!(copysendfile(s.as_fd(), d.as_fd()).unwrap(), 6);
         drop(d);
         assert_eq!(std::fs::read(dir.path().join("d")).unwrap(), b"abcdef");
-        // Empty source: sendfile transfers nothing → userspace fallback → 0.
+        // Empty source: sendfile transfers nothing -> userspace fallback -> 0.
         let (_d2, s2, d2) = pair(b"");
         assert_eq!(copysendfile(s2.as_fd(), d2.as_fd()).unwrap(), 0);
     }
@@ -1656,7 +1656,7 @@ mod shutil {
             .unwrap();
             assert_eq!(stats.files, 2);
             assert_eq!(std::fs::read(dst.join("a")).unwrap(), vec![1u8; 100]);
-            // exist_ok = false on an existing destination → error.
+            // exist_ok = false on an existing destination -> error.
             assert!(copytree(
                 &src,
                 &dst,
@@ -1728,7 +1728,7 @@ mod shutil {
         let stats = res.expect("read-only-rooted copytree should succeed");
         assert_eq!(stats.files, 1);
         assert_eq!(std::fs::read(dst.join("child")).unwrap(), b"hi");
-        // The root's restrictive mode is still applied — just last.
+        // The root's restrictive mode is still applied - just last.
         assert_eq!(
             std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
             0o555

@@ -55,8 +55,8 @@ pub enum Error {
         path: PathBuf,
     },
 
-    /// A path that must name a regular file named something else — a FIFO,
-    /// device, socket, or directory — whose stat size does not describe any
+    /// A path that must name a regular file named something else - a FIFO,
+    /// device, socket, or directory - whose stat size does not describe any
     /// content to read. Distinct from [`Validation`](Error::Validation) so a
     /// multi-file read can skip one unusable candidate without aborting.
     NotRegularFile {

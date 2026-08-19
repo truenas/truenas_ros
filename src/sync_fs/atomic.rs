@@ -44,7 +44,7 @@ impl Default for AtomicWriteOptions {
 /// Atomically create or replace `target` with content written by `write_fn`.
 ///
 /// A temporary file is created alongside `target` (same directory, so the same
-/// filesystem), written, `fsync`ed, then moved into place with `renameat2` —
+/// filesystem), written, `fsync`ed, then moved into place with `renameat2` --
 /// either a plain rename (new file), an atomic `RENAME_EXCHANGE` (replacing an
 /// existing file so readers never see a partial write), or `RENAME_NOREPLACE`
 /// (with [`AtomicWriteOptions::noclobber`]). The parent directory is `fsync`ed
@@ -146,7 +146,7 @@ where
 /// displaces a directory found there rather than refusing it, so it is used
 /// only for a non-directory destination; a plain rename covers a missing
 /// destination and fails `EISDIR` on a directory. The probe races other
-/// writers, so an `ENOENT` from the exchange falls back to the plain rename —
+/// writers, so an `ENOENT` from the exchange falls back to the plain rename --
 /// the destination it would have replaced is gone either way.
 fn rename_into_place(
     dir: BorrowedFd<'_>,
@@ -197,7 +197,7 @@ pub fn atomic_replace(
 /// Create a uniquely-named temporary file beside `target_name` in `dir`.
 ///
 /// The suffix is 128 random bits from `getrandom(2)`, so a single
-/// `O_CREAT | O_EXCL` open is collision-free in practice — no retry loop and no
+/// `O_CREAT | O_EXCL` open is collision-free in practice - no retry loop and no
 /// shared counter. A collision (never expected) simply surfaces as `EEXIST`.
 fn create_temp(
     dir: BorrowedFd<'_>,

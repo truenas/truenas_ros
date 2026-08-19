@@ -1,4 +1,4 @@
-//! `open_tree(2)` — clone or reference a mount tree.
+//! `open_tree(2)` - clone or reference a mount tree.
 
 use crate::errno::{self, retry_on_eintr};
 use crate::fd::owned_from_raw;

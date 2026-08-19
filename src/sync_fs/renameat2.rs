@@ -1,4 +1,4 @@
-//! `renameat2(2)` — rename with flags (exchange / no-replace / whiteout).
+//! `renameat2(2)` - rename with flags (exchange / no-replace / whiteout).
 
 use crate::errno::{self, retry_on_eintr};
 use crate::path::TnPath;

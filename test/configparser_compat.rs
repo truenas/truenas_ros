@@ -4,7 +4,7 @@
 //! Each corpus document is fed to the real `configparser` (via
 //! `test/support/configparser_oracle.py`) and to [`ConfigFile`]; the results are
 //! required to agree on serialization (both `space_around` modes), raw and
-//! interpolated `get`, the typed getters, and — crucially — whether the document
+//! interpolated `get`, the typed getters, and - crucially - whether the document
 //! is accepted or rejected at all. The corpus is a curated table of every parsing
 //! subtlety, a large batch of seeded-random documents, and a set of files read
 //! from disk, where `configparser` applies universal newlines.
@@ -54,7 +54,7 @@ enum Oracle {
     },
 }
 
-/// Resolve the interpreter, returning `None` (→ skip) if it cannot run.
+/// Resolve the interpreter, returning `None` (-> skip) if it cannot run.
 fn python() -> Option<String> {
     let py = std::env::var("TRUENAS_ROS_PYTHON")
         .unwrap_or_else(|_| "python3".to_string());
@@ -267,7 +267,7 @@ fn assert_probes(
 ///
 /// CPython copies the section and `update`s it with the defaults, putting the
 /// section's own keys first and appending the `DEFAULT` keys it did not
-/// override — the reverse of `items()`, which starts from the defaults. The
+/// override - the reverse of `items()`, which starts from the defaults. The
 /// two really do disagree upstream, so nothing here can be shared between
 /// them.
 fn assert_option_order(cfg: &ConfigFile, probes: &[Probe], doc: &str) {
@@ -392,7 +392,7 @@ const CURATED: &[&str] = &[
     "[s]\npct = 100%%\n", // '%%' escapes to '%'
     "[DEFAULT]\nbase = /srv\n[s]\np = %(base)s/data\n", // interpolation
     "[s]\na = 1\nb = %(a)s%(a)s\nc = %(b)s\n", // chained interpolation
-    "[s]\nbad = 50%\n",   // invalid interpolation → get() errs
+    "[s]\nbad = 50%\n",   // invalid interpolation -> get() errs
     // U+001C..U+001F are whitespace to CPython's strip and to `re`'s \s, but
     // not to Unicode's White_Space that Rust's trim implements. They are the
     // only four code points the two definitions disagree on, so they fence a
@@ -514,7 +514,7 @@ fn random_corpus_matches_configparser() {
 
 /// Documents whose line endings only matter on disk: `configparser.read()`
 /// opens the file with universal newlines, so every `\r\n` and lone `\r` is a
-/// line break — unlike the `read_string` path the corpora above exercise.
+/// line break - unlike the `read_string` path the corpora above exercise.
 const FILE_CORPUS: &[&str] = &[
     "[s]\rk = v\rj = w\r",       // classic-Mac CR endings
     "[s]\r\nk = v\r\nj = w\r\n", // CRLF endings

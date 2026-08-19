@@ -1,11 +1,11 @@
 //! Wiring the `net::server` handlers as standalone functions rather than
-//! inline closures — in particular the `accept` handler.
+//! inline closures - in particular the `accept` handler.
 //!
 //! The `accept` handler's contract is `fn(Incoming<'_>) -> Option<U>`, where
 //! `U` is your per-connection state type: `Some(state)` admits the connection
 //! and attaches `state`; `None` rejects it (accepted then closed before any
 //! read). A plain `fn` satisfies the `FnMut` bound, so it can be used directly
-//! — and so can the `header` and `body` handlers.
+//! -- and so can the `header` and `body` handlers.
 //!
 //! Run (loopback only):
 //!   cargo run --example tcp_accept_fn --features net-server
@@ -39,7 +39,7 @@ struct Session {
 /// The accept handler as a standalone function.
 ///
 /// Its signature *is* the `accept` contract:
-/// `fn(Incoming<'_>) -> Option<U>` (here `U = Session`) — the [`Incoming`]
+/// `fn(Incoming<'_>) -> Option<U>` (here `U = Session`) - the [`Incoming`]
 /// carries the peer's identity plus the listener it arrived on. `None`
 /// rejects the connection (accepted then closed before any read);
 /// `Some(state)` admits it with per-connection state. The peer address is

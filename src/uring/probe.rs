@@ -1,7 +1,7 @@
 //! Generic opcode-support probing. `IORING_REGISTER_PROBE` is a control
 //! syscall on an already-built ring (available far below every kernel floor
 //! this crate imposes) that reports per-opcode support without executing
-//! anything — the construction-time alternative to discovering a missing
+//! anything - the construction-time alternative to discovering a missing
 //! opcode as a mysterious per-op `-EINVAL` at runtime. Domain-specific probes
 //! (socket commands, the TLS ULP) live with their domains; this is the shared
 //! mechanism.
@@ -10,7 +10,7 @@ use crate::uring::ring::Ring;
 use crate::uring::sys::*;
 
 /// Whether this kernel's io_uring supports `opcode`. Any register failure
-/// reads as "unsupported" — fail closed; callers turn `false` into a clear
+/// reads as "unsupported" - fail closed; callers turn `false` into a clear
 /// validation error (or record it and degrade, where the op is optional).
 pub(crate) fn probe_op_supported(ring: &Ring, opcode: u8) -> bool {
     #[repr(C)]

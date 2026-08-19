@@ -1,4 +1,4 @@
-//! `net` — io_uring stream networking: a shared reactor core with server and
+//! `net` - io_uring stream networking: a shared reactor core with server and
 //! client roles.
 //!
 //! Three modules share the design: [`core`] holds the role-agnostic reactor

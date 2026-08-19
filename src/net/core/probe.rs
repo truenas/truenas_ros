@@ -38,7 +38,7 @@ pub(crate) fn fill_getsockopt_cmd(
 /// `prot->ioctl` guard rejected every socket command on `AF_UNIX` (whose
 /// `struct proto` has no ioctl) with `EOPNOTSUPP` until the cmd_net fix
 /// (6.18.16 in the 6.18 series). Probing a throwaway socketpair through the
-/// just-created — and otherwise idle — ring turns "every unix connection
+/// just-created - and otherwise idle - ring turns "every unix connection
 /// mysteriously shed" into an immediate, actionable construction error.
 pub(crate) fn probe_unix_peercred(ring: &mut Ring) -> crate::Result<()> {
     let mut fds = [0i32; 2];
@@ -77,7 +77,7 @@ pub(crate) fn probe_unix_peercred(ring: &mut Ring) -> crate::Result<()> {
             return Err(e.into());
         }
         // `submit_and_wait` returns without a completion only on CQ
-        // backpressure — impossible on this idle ring — so this cannot spin.
+        // backpressure - impossible on this idle ring - so this cannot spin.
         if let Some(cqe) = ring.reap() {
             break cqe.res;
         }
@@ -87,7 +87,7 @@ pub(crate) fn probe_unix_peercred(ring: &mut Ring) -> crate::Result<()> {
     }
     Err(Error::Validation(format!(
         "unix_peercred requires io_uring socket commands on AF_UNIX \
-         (Linux ≥ 6.18.16, the cmd_net ioctl-guard fix); probe got {}",
+         (Linux >= 6.18.16, the cmd_net ioctl-guard fix); probe got {}",
         if res < 0 {
             Errno::from_raw(-res).to_string()
         } else {
@@ -97,12 +97,12 @@ pub(crate) fn probe_unix_peercred(ring: &mut Ring) -> crate::Result<()> {
 }
 
 /// Probe whether this kernel serves the socket `GETSOCKOPT` `URING_CMD`
-/// (Linux ≥ 6.8) — the exact command every TCP accept's per-connection
+/// (Linux >= 6.8) - the exact command every TCP accept's per-connection
 /// `SO_PEERNAME` fetch issues. Probing the real command (not the older
 /// `SIOCOUTQ`, which landed a release earlier) is what makes this guarantee
 /// hold: a `SO_TYPE` getsockopt on a fresh, unconnected TCP socket needs no
 /// bind/connect and returns the 4-byte type where supported, completing with
-/// `-EOPNOTSUPP` where not — turning "every TCP connection mysteriously shed"
+/// `-EOPNOTSUPP` where not - turning "every TCP connection mysteriously shed"
 /// into an immediate, actionable construction error.
 pub(crate) fn probe_tcp_cmd(ring: &mut Ring) -> crate::Result<()> {
     // SAFETY: standard socket() call; result checked against the sentinel.
@@ -133,7 +133,7 @@ pub(crate) fn probe_tcp_cmd(ring: &mut Ring) -> crate::Result<()> {
             return Err(e.into());
         }
         // `submit_and_wait` returns without a completion only on CQ
-        // backpressure — impossible on this idle ring — so this cannot spin.
+        // backpressure - impossible on this idle ring - so this cannot spin.
         if let Some(cqe) = ring.reap() {
             break cqe.res;
         }
@@ -144,7 +144,7 @@ pub(crate) fn probe_tcp_cmd(ring: &mut Ring) -> crate::Result<()> {
         return Ok(());
     }
     Err(Error::Validation(format!(
-        "TCP listeners require io_uring socket GETSOCKOPT commands (Linux ≥ \
+        "TCP listeners require io_uring socket GETSOCKOPT commands (Linux >= \
          6.8) for per-connection peer addresses; probe got {}",
         Errno::from_raw(-res)
     )))
@@ -153,7 +153,7 @@ pub(crate) fn probe_tcp_cmd(ring: &mut Ring) -> crate::Result<()> {
 /// Probe whether this kernel has the TLS ULP (the `tls` module / `CONFIG_TLS`)
 /// that kernel-TLS listeners require. Attaching `TCP_ULP="tls"` to a fresh,
 /// unconnected TCP socket returns `ENOPROTOOPT` when the ULP is absent and
-/// something else (`ENOTCONN` — the ULP init wants an established socket) when
+/// something else (`ENOTCONN` - the ULP init wants an established socket) when
 /// present, so it distinguishes availability without a handshake. Turns "every
 /// kTLS connection mysteriously shed" into a clear construction error.
 pub(crate) fn probe_ktls() -> crate::Result<()> {
@@ -183,10 +183,10 @@ pub(crate) fn probe_ktls() -> crate::Result<()> {
     // non-established socket with `ENOTCONN` (net/tls: `tls_init` checks
     // `sk_state == TCP_ESTABLISHED`). Every other result means it is absent:
     // an unregistered ULP name (`CONFIG_TLS=n`, or the `tls` module isn't
-    // loaded — the common case) reports `ENOENT` from
+    // loaded - the common case) reports `ENOENT` from
     // `__tcp_ulp_find_autoload`, not `ENOPROTOOPT`; a kernel with no TCP_ULP
     // support at all reports `ENOPROTOOPT`. Treating `ENOENT` as success would
-    // defeat this gate — every kTLS connection would then be silently shed at
+    // defeat this gate - every kTLS connection would then be silently shed at
     // its first recv.
     if err == Errno::ENOTCONN {
         return Ok(());

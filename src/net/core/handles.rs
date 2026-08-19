@@ -17,14 +17,14 @@ use std::sync::mpsc;
 /// The ticket a kTLS handshake worker uses to hand a connection back to the
 /// server once the handshake finishes (or fails).
 ///
-/// Furnished — with a real socket fd — to the [`Server::set_tls_handshake`]
+/// Furnished - with a real socket fd - to the [`Server::set_tls_handshake`]
 /// handler for one accepted connection. Move it (and the fd) to your own
 /// worker, run the TLS handshake (which installs kTLS on the socket), and call
 /// [`AcceptDeferral::ready`] with the per-connection state on success, or
 /// [`AcceptDeferral::reject`] on failure. Dropping it without either **rejects**
 /// the connection, so a panicked/lost worker can't leak the parked slot. The
 /// state `U` crosses to the loop thread here (hence `Send` when `U: Send`), but
-/// only once, before serving begins — there is never concurrent access.
+/// only once, before serving begins - there is never concurrent access.
 #[must_use = "call ready(state) or reject(), or the connection is dropped"]
 pub struct AcceptDeferral<U> {
     pub(crate) slot: u32,
@@ -65,7 +65,7 @@ impl<U> AcceptDeferral<U> {
 impl<U> Drop for AcceptDeferral<U> {
     fn drop(&mut self) {
         if !self.done {
-            self.send(Err(())); // lost worker → shed the parked connection
+            self.send(Err(())); // lost worker -> shed the parked connection
         }
     }
 }
@@ -127,8 +127,8 @@ pub(crate) use stat;
 
 /// Routing key for a deferred reply: which pool slot, which connection
 /// generation (so a reply for a recycled slot is dropped), and which request on
-/// that connection (so a reply for a request that was already answered — e.g. a
-/// worker outliving an inline reply — is dropped instead of duplicated).
+/// that connection (so a reply for a request that was already answered - e.g. a
+/// worker outliving an inline reply - is dropped instead of duplicated).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Token {
     pub(crate) slot: u32,

@@ -11,7 +11,7 @@ use std::path::Path;
 /// the path.
 ///
 /// Uses `openat2(RESOLVE_NO_SYMLINKS)`, so a symlink at *any* component fails
-/// with [`Error::SymlinkInPath`] (rather than being followed) — closing the
+/// with [`Error::SymlinkInPath`] (rather than being followed) - closing the
 /// TOCTOU window a plain `open` would leave. The `openat2` descriptor is handed
 /// straight to [`File`] through its `From<OwnedFd>` impl, so the result offers
 /// the full [`std::fs::File`] API with no extra wrapping.

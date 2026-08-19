@@ -15,7 +15,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 
 /// Maximum size of the opaque handle data (`MAX_HANDLE_SZ`).
 const MAX_HANDLE_SZ: usize = 128;
-/// `offsetof(struct file_handle, f_handle)` — the `handle_bytes` + `handle_type`
+/// `offsetof(struct file_handle, f_handle)` - the `handle_bytes` + `handle_type`
 /// header.
 const HEADER_SZ: usize = 8;
 /// Sentinel mount id for an uninitialised handle.

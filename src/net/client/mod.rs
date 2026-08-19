@@ -1,4 +1,4 @@
-//! `net::client` — the outbound stream client role on the shared reactor core.
+//! `net::client` - the outbound stream client role on the shared reactor core.
 //!
 //! A [`Client`] embeds the shared reactor core (the same io_uring engine the
 //! server drives) and adds outbound connection establishment, a framed
@@ -42,7 +42,7 @@ const MAX_RING_ENTRIES: u32 = 32768;
 ///
 /// Parameterized by the per-connection state `U` and the framer `F` (given the
 /// bytes accumulated so far and the connection's state, it decides how to frame
-/// the next reply — see [`Framing`]). Holds the ring, so it is `!Send`/`!Sync`.
+/// the next reply - see [`Framing`]). Holds the ring, so it is `!Send`/`!Sync`.
 pub struct Client<U, F>
 where
     F: FnMut(&[u8], &mut U) -> Framing,
@@ -69,7 +69,7 @@ where
     tls_connect: Option<TlsConnectFn>,
     // The channel client kTLS handshake workers hand their outcome back on,
     // drained in `on_wake` (the outbound, state-free twin of the server's
-    // mailbox handshake channel — a poke on the shared wake eventfd delivers it).
+    // mailbox handshake channel - a poke on the shared wake eventfd delivers it).
     handshake_tx: mpsc::Sender<HandshakeResult>,
     handshake_rx: mpsc::Receiver<HandshakeResult>,
     // Connections parked mid-kTLS-handshake (in `TlsConnecting`): live work that
@@ -87,7 +87,7 @@ where
     cfg: ClientConfig,
     // The `next_event_timeout` deadline's timespec: a durable, client-owned
     // landing pad (rewritten each call), so a `Deadline` still staged when a
-    // fatal ring error unwinds the call outlives `Drop`'s reap — unlike a
+    // fatal ring error unwinds the call outlives `Drop`'s reap - unlike a
     // stack box. Kept off the shared `KernelPads` so it can never alias the
     // core's own timers.
     deadline_pad: Box<KernelTimespec>,
@@ -105,8 +105,8 @@ where
 {
     /// Set up the ring and pool for a client with the given config and reply
     /// `framer`. Mirrors `Server::with_config`'s engine build. Fails skippably
-    /// (like `Server::bind`) where io_uring is unavailable — an
-    /// `ENOSYS`/`EPERM`/`EACCES` [`Errno`](crate::Errno) — so a caller can treat
+    /// (like `Server::bind`) where io_uring is unavailable - an
+    /// `ENOSYS`/`EPERM`/`EACCES` [`Errno`](crate::Errno) - so a caller can treat
     /// that as an environment skip.
     pub fn new(config: ClientConfig, framer: F) -> crate::Result<Self> {
         config.validate()?;
@@ -130,15 +130,15 @@ where
             .next_power_of_two()
             .min(MAX_RING_ENTRIES);
         // The shared engine: ring + pool + wake + the `FIXED_FD_INSTALL`
-        // probe (Linux >= 6.8 — furnishes the real fd behind a kTLS
+        // probe (Linux >= 6.8 - furnishes the real fd behind a kTLS
         // handshake). The TLS ULP is what makes kTLS work at all; probe it
         // once and keep the flag (a runtime decision, like the server's
-        // detach) — a `tls` connect on a kernel missing either fails cleanly,
+        // detach) - a `tls` connect on a kernel missing either fails cleanly,
         // while a plain-TCP client is unaffected.
         let engine = Engine::new(entries, config.pool_size)?;
         let ktls_supported = probe_ktls().is_ok();
 
-        let ts_of = connect::ts_of; // shared duration → timespec clamp
+        let ts_of = connect::ts_of; // shared duration -> timespec clamp
         let pads = Box::new(KernelPads {
             deadline: KernelTimespec::default(),
             // Client-unused (only a server arms accept retries). The connect
@@ -188,15 +188,15 @@ where
     /// socket fd (materialized from the pool descriptor), a
     /// [`TlsConnectContext`] (which connection, and the endpoint it dialed), and
     /// a [`ConnectDeferral`]. Move the fd and the deferral to your own worker
-    /// (never block the loop thread), run the client TLS handshake there — which
-    /// installs kTLS on the socket (e.g. OpenSSL with `SSL_OP_ENABLE_KTLS`) —
+    /// (never block the loop thread), run the client TLS handshake there - which
+    /// installs kTLS on the socket (e.g. OpenSSL with `SSL_OP_ENABLE_KTLS`) --
     /// then call [`ConnectDeferral::ready`] on success or
     /// [`ConnectDeferral::reject`] on failure. Close the furnished fd once the
     /// handshake is done; the connection is then served over the pool descriptor
     /// (kTLS lives on the shared socket).
     ///
     /// Unlike the server's handshake handler, no per-connection state crosses
-    /// here — the client already holds it (from `connect`), so the deferral is
+    /// here - the client already holds it (from `connect`), so the deferral is
     /// state-free and the handler needs no `U: Send` bound.
     pub fn set_tls_handshake<H>(&mut self, handler: H)
     where
@@ -205,7 +205,7 @@ where
         self.tls_connect = Some(Box::new(handler));
     }
 
-    /// Whether the client has no live work left — no connections serving or
+    /// Whether the client has no live work left - no connections serving or
     /// connecting, and no kTLS handshake parked. The only op that may still be
     /// in flight is the wake READ (armed once a kTLS handshake is ever parked
     /// and then kept armed): `inflight` equals exactly its 0-or-1 contribution.
@@ -217,7 +217,7 @@ where
 
     /// A wake poke was heard (a handshake worker handed back an outcome): drain
     /// the outcomes, then re-arm the wake READ if any handshake is still parked
-    /// (else leave it disarmed — the just-completed READ is not renewed).
+    /// (else leave it disarmed - the just-completed READ is not renewed).
     pub(super) fn on_wake(&mut self) -> crate::errno::Result<()> {
         self.wake_armed = false;
         self.drain_handshake_outcomes()?;
@@ -236,7 +236,7 @@ where
     }
 
     /// The per-connection state `U` for `conn`, or `None` if it is not an open
-    /// serving connection — e.g. to stash a framing sink the reply framer reads.
+    /// serving connection - e.g. to stash a framing sink the reply framer reads.
     pub fn conn_state(&mut self, conn: ConnId) -> Option<&mut U> {
         let (slot, generation) = conn.parts();
         if self.core.table.slot_matches(slot, generation) {
@@ -247,7 +247,7 @@ where
     }
 
     /// Gracefully close `conn`: flush anything already queued to send, force
-    /// the FIN, then reclaim the slot — surfaced as an [`Event::Closed`]. A
+    /// the FIN, then reclaim the slot - surfaced as an [`Event::Closed`]. A
     /// stale/unknown `conn` is a no-op.
     pub fn close(&mut self, conn: ConnId) {
         let (slot, generation) = conn.parts();
@@ -351,7 +351,7 @@ where
             Some(Op::LinkTimeout) => {}
             // A standalone TIMEOUT armed by `next_event_timeout`, which reaps its
             // own deadline inline and cancel-reaps a pending one before
-            // returning — one reaching dispatch is the stray a call that unwound
+            // returning - one reaching dispatch is the stray a call that unwound
             // left behind (see `deadline_inflight`). It is already counted off;
             // consuming it here retires the flag too, since the next call must
             // not wait for a completion that has been reaped.
@@ -359,7 +359,7 @@ where
             // The cancel control op, and any unrecognized tag.
             Some(Op::Cancel) | None => {}
             // Server-only tags: never issued here, so a completion carrying one
-            // is a routing bug — panic, don't ignore.
+            // is a routing bug - panic, don't ignore.
             Some(
                 Op::Accept
                 | Op::AcceptRetry
@@ -373,7 +373,7 @@ where
 
     /// The CLOSE that reclaims a connection's descriptor completed. Capture the
     /// stashed close reason and the pre-free generation, let the core reclaim
-    /// the slot, then — if a serving connection was actually reclaimed — emit
+    /// the slot, then - if a serving connection was actually reclaimed - emit
     /// [`Event::Closed`] and drop the connection's correlation queue. A
     /// connect-failure CLOSE (the slot was `Connecting`, never serving) frees
     /// silently: `ConnectFailed` was already emitted.

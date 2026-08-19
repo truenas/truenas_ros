@@ -4,11 +4,11 @@
 //! These send **real records** to the kernel audit subsystem. Three
 //! environments are tolerated, because all three are legitimate:
 //!
-//! * no `NETLINK_AUDIT` at all (a sandbox, or audit compiled out) — the socket
+//! * no `NETLINK_AUDIT` at all (a sandbox, or audit compiled out) - the socket
 //!   cannot open, and the suite skips;
-//! * a socket but no `CAP_AUDIT_WRITE` — the kernel answers `EPERM`, surfaced
+//! * a socket but no `CAP_AUDIT_WRITE` - the kernel answers `EPERM`, surfaced
 //!   as [`SendStatus::Unavailable`], which is a pass;
-//! * the real thing — records are accepted and land in `audit.log`
+//! * the real thing - records are accepted and land in `audit.log`
 //!   (`ausearch -m TEST,TRUSTED_APP -ts recent` to see them).
 //!
 //! Set `TRUENAS_ROS_REQUIRE_AUDIT=1` to turn the first two into hard failures,

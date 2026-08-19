@@ -2,19 +2,19 @@
 //! ([`crate::uring_fs`]) and the idmapped-mount user-namespace builder
 //! ([`crate::mount`]).
 //!
-//! Both fork a child *without* `CLONE_VM` — a plain copy-on-write
-//! address-space copy, like `fork` — but need two things `libc::fork` cannot
+//! Both fork a child *without* `CLONE_VM` - a plain copy-on-write
+//! address-space copy, like `fork` - but need two things `libc::fork` cannot
 //! give:
 //!
-//! - **`CLONE_PIDFD`** — a pidfd for the child, written atomically at
+//! - **`CLONE_PIDFD`** - a pidfd for the child, written atomically at
 //!   creation (no `fork`-then-`pidfd_open` reuse race), for race-free
 //!   wait/signal.
-//! - **`CLONE_CLEAR_SIGHAND`** — the child's inherited signal handlers reset
+//! - **`CLONE_CLEAR_SIGHAND`** - the child's inherited signal handlers reset
 //!   to `SIG_DFL`. For a **fork-without-exec** child this is load-bearing,
 //!   not a nicety: otherwise a signal delivered to the child runs the
 //!   *parent's* handler code inside the child. In the credential broker that
-//!   handler could fire inside the impersonation window — executing parent
-//!   code at the impersonated identity — so clearing handlers is a soundness
+//!   handler could fire inside the impersonation window - executing parent
+//!   code at the impersonated identity - so clearing handlers is a soundness
 //!   requirement.
 //!
 //! **This does not relax the fork-before-threads rule; it sharpens it.** A
@@ -34,7 +34,7 @@ pub(crate) const CLONE_NEWUSER: u64 = 0x1000_0000;
 /// `clone3` flag: place a pidfd for the child in `clone_args.pidfd`.
 const CLONE_PIDFD: u64 = 0x0000_1000;
 /// `clone3` flag: reset the child's signal handlers to `SIG_DFL` (Linux
-/// ≥ 5.5). `libc` does not expose it.
+/// >= 5.5). `libc` does not expose it.
 const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
 
 /// Kernel `struct clone_args` (VER2, 88 bytes).
@@ -57,7 +57,7 @@ const _: () = assert!(core::mem::size_of::<CloneArgs>() == 88);
 
 /// Fork via `clone3`, always with `CLONE_PIDFD | CLONE_CLEAR_SIGHAND` plus
 /// `extra_flags`, using `exit_signal` (0 = send **no** signal to the parent
-/// on child exit — the parent learns of death through the pidfd instead).
+/// on child exit - the parent learns of death through the pidfd instead).
 ///
 /// Writes the child's pidfd to `*pidfd_out`, and returns `0` in the child /
 /// the child pid in the parent (exactly like `fork`).

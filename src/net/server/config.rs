@@ -14,14 +14,14 @@ use std::time::Duration;
 /// The largest usable pool slot (the `user_data` codec reserves 24 bits).
 const MAX_POOL: u32 = 0x00ff_ffff;
 
-/// Ceiling on the fs offload pool's own thread count. Not a kernel limit — a
+/// Ceiling on the fs offload pool's own thread count. Not a kernel limit - a
 /// sanity bound, since every one of these is a real OS thread spawned by one
 /// reactor for work that has no io_uring opcode.
 #[cfg(feature = "uring-fs")]
 const MAX_OFFLOAD_THREADS: usize = 1024;
 /// Upper bound on `max_in_flight_requests` (bounds per-connection read-ahead).
 const MAX_IN_FLIGHT: usize = 4096;
-/// Upper bound on `max_send_coalesce` (the kernel's `UIO_MAXIOV` — the most
+/// Upper bound on `max_send_coalesce` (the kernel's `UIO_MAXIOV` - the most
 /// iovecs one `msghdr` may carry).
 const MAX_SEND_COALESCE: usize = 1024;
 /// Upper bound on listeners per server (the index rides the `user_data`
@@ -32,12 +32,12 @@ const MAX_LISTENERS: usize = 256;
 #[derive(Clone, Copy, Debug)]
 pub struct ServerConfig {
     /// Maximum concurrent connections (size of the registered-file pool),
-    /// per **server** — one ring/thread; a `reuse_port` multicore deployment
+    /// per **server** - one ring/thread; a `reuse_port` multicore deployment
     /// multiplies it by the server count, but the kernel's reuseport hash is
     /// load-blind, so size each ring's pool for a skewed share rather than
     /// the even split. Worst-case buffer memory is bounded by roughly
-    /// `pool_size × max_request_bytes` (every slot held by a near-cap
-    /// request, plus per-socket kernel buffers) — the defaults give a
+    /// `pool_size x max_request_bytes` (every slot held by a near-cap
+    /// request, plus per-socket kernel buffers) - the defaults give a
     /// ~512 MiB ceiling. Empty slots are near-free (~32 bytes each), so
     /// headroom costs nothing at idle.
     pub pool_size: u32,
@@ -53,46 +53,56 @@ pub struct ServerConfig {
     pub fs_files: u32,
     /// Warm floor of offload worker threads for the embedded fs reactor's
     /// blocking work (`readdir`/`fdopendir`, byte copies), which has no io_uring
-    /// opcode and so cannot run on the ring. Per server/ring; size it to the I/O
-    /// concurrency you expect for listings and copies. Default
+    /// opcode and so cannot run on the ring. Default
     /// `uring_fs::core::OFFLOAD_FLOOR`.
+    ///
+    /// **Per server/ring, and resident.** These spawn on first use and the idle
+    /// retire never goes below them, so a `reuse_port` deployment pays
+    /// `floor x servers` threads standing by whether or not they offload. The
+    /// default is deliberately one: the library cannot see how many rings you
+    /// will run, so sizing the machine is yours. Raise it when a ring's first
+    /// listings should not pay a thread spawn.
     #[cfg(feature = "uring-fs")]
     pub fs_offload_floor: usize,
     /// Ceiling the offload pool grows to when every worker is blocked (a cold or
     /// huge directory, an NFS/FUSE backing, a stalled copy), so one stalled walk
-    /// does not head-of-line-block the rest; burst threads retire when idle. Per
-    /// server/ring. Default
-    /// `uring_fs::core::OFFLOAD_CEILING`.
+    /// does not head-of-line-block the rest; burst threads retire when idle.
+    /// Default `uring_fs::core::OFFLOAD_CEILING`.
+    ///
+    /// **Per server/ring**, so the peak thread count is `ceiling x servers`.
+    /// What it really buys is how many *concurrently stalled* operations one
+    /// ring absorbs before they queue behind each other. Size it to that, not
+    /// to request volume, and budget the product against the machine.
     #[cfg(feature = "uring-fs")]
     pub fs_offload_ceiling: usize,
     /// Maximum bytes accepted for one message (header + body), a memory guard
     /// that also bounds header scanning. Enforced strictly for length-prefixed
     /// frames; for a `More`/delimiter-scanning framer the accumulate buffer can
-    /// transiently reach `max_request_bytes` plus one chunk read (~4 KiB) — the
-    /// chunk lands before the next over-cap check closes the connection — so
+    /// transiently reach `max_request_bytes` plus one chunk read (~4 KiB) - the
+    /// chunk lands before the next over-cap check closes the connection - so
     /// budget that slack if a scanning framer's peak allocation matters.
     pub max_request_bytes: usize,
     /// `listen(2)` backlog.
     pub backlog: i32,
     /// For `AF_UNIX`, unlink a stale socket path before binding.
     pub unlink_unix: bool,
-    /// If set, close a connection left idle — armed for the next request with no
-    /// bytes yet received — for longer than this, reclaiming its pool slot.
+    /// If set, close a connection left idle - armed for the next request with no
+    /// bytes yet received - for longer than this, reclaiming its pool slot.
     /// `None` (the default) keeps idle connections open indefinitely. Enforced
     /// by a kernel `LINK_TIMEOUT` on the idle recv, so an idle connection costs
     /// no timer wakeups until it either sends or expires. Serving the peer
     /// counts as activity: a completed send (a deferred reply flushing, a
     /// push) restarts the quiet interval, so the connection is reaped only
     /// after a full `idle_timeout` of neither receiving from nor sending to
-    /// the peer — never in the instant after a reply it was still waiting on.
+    /// the peer - never in the instant after a reply it was still waiting on.
     /// Does not interrupt a message already in progress (see `request_timeout`
     /// to bound that).
     pub idle_timeout: Option<Duration>,
     /// If set, close a connection whose in-progress request is not fully
     /// received within this duration, reclaiming its pool slot. Bounds a peer
-    /// that sends part of a frame — e.g. a valid length prefix — then stalls,
+    /// that sends part of a frame - e.g. a valid length prefix - then stalls,
     /// which `idle_timeout` does not cover (a half-sent request is not idle).
-    /// One of the slow-loris guards — see the module *Capacity and overload*
+    /// One of the slow-loris guards - see the module *Capacity and overload*
     /// section for how it pairs with `idle_timeout` and `tls_handshake_timeout`.
     ///
     /// Bounds only the *receipt* of a request from the peer, **never its
@@ -100,32 +110,32 @@ pub struct ServerConfig {
     /// timer, so one offloaded via [`Response::Defer`] to a worker may run
     /// arbitrarily long without the connection being closed. While a deferred
     /// reply is outstanding, a parked read-ahead recv's `idle_timeout` likewise
-    /// does not reap the connection — the pending reply is allowed to arrive.
+    /// does not reap the connection - the pending reply is allowed to arrive.
     /// (The clock still rides a *pipelined* connection's recv reading the **next**
     /// request's bytes, so a peer that starts a further request and then stalls
     /// is reclaimed as usual.)
     ///
     /// Enforced by a kernel `LINK_TIMEOUT` on every in-progress recv, so it
-    /// costs no wakeups unless a request actually stalls. For an exact read — a
-    /// length-prefixed body or a `Need` header remainder — it bounds the whole
+    /// costs no wakeups unless a request actually stalls. For an exact read - a
+    /// length-prefixed body or a `Need` header remainder - it bounds the whole
     /// transfer; for a `More`/delimiter scan or a segmented kTLS body it bounds
     /// inactivity between reads (a steadily progressing transfer resets it, a
     /// stalled one is reclaimed). `None` (the default) never times a request out.
     ///
     /// A **spliced** body ([`Framing::SpliceBody`]) is clocked the same way:
     /// on plain TCP the clock rides the readiness poll between splice chunks;
-    /// over kTLS it is linked to each record's splice — which otherwise
+    /// over kTLS it is linked to each record's splice - which otherwise
     /// blocks an io-wq worker with no recv for any timeout to cancel, leaving
     /// a stalled peer pinning the slot forever. On the kTLS path the kernel
     /// cannot distinguish a stalled *peer* from a stalled *consumer* (a full
     /// destination pipe blocks the same op), so a consumer draining slower
-    /// than one record per period is evicted too — size accordingly.
+    /// than one record per period is evicted too - size accordingly.
     ///
     /// [`Framing::SpliceBody`]: super::Framing::SpliceBody
     pub request_timeout: Option<Duration>,
     /// Maximum requests in flight per connection before read-ahead pauses.
     /// `1` (the default) is strict sequential keep-alive: one request is fully
-    /// answered before the next is read. `N > 1` **pipelines** — while a request
+    /// answered before the next is read. `N > 1` **pipelines** - while a request
     /// is deferred to a worker, up to `N-1` further requests are read and
     /// processed, so responses can complete out of order. In that mode the
     /// consumer's protocol must carry request ids and correlate replies itself;
@@ -133,7 +143,7 @@ pub struct ServerConfig {
     pub max_in_flight_requests: usize,
     /// If set, close a connection whose in-flight send makes no progress for
     /// this long (a kernel `LINK_TIMEOUT` on each send op). This reclaims the
-    /// pool slot from a peer that stops reading while a reply is outstanding —
+    /// pool slot from a peer that stops reading while a reply is outstanding --
     /// without it such a connection is held until server shutdown, since TCP
     /// zero-window probing never gives up on its own. The clock resets on
     /// progress: a slow-but-draining peer is not cut off, only a stalled one.
@@ -142,9 +152,9 @@ pub struct ServerConfig {
     /// If set, shed a kTLS connection whose handshake has not completed within
     /// this duration. Between furnishing the real fd to
     /// [`Server::set_tls_handshake`] and the worker calling back, the slot is
-    /// parked — it holds a pool descriptor but has no in-flight recv/send, so
+    /// parked - it holds a pool descriptor but has no in-flight recv/send, so
     /// neither `idle_timeout` nor `request_timeout` (both linked to a recv) can
-    /// reach it. The kTLS-park slow-loris guard — see the module *Capacity and
+    /// reach it. The kTLS-park slow-loris guard - see the module *Capacity and
     /// overload* section.
     ///
     /// A standalone kernel `TIMEOUT` bounds the park; on expiry the slot is shed
@@ -153,15 +163,15 @@ pub struct ServerConfig {
     /// with no deadline of its own. `None` (the default) never times a handshake
     /// out; ignored for non-TLS listeners.
     pub tls_handshake_timeout: Option<Duration>,
-    /// Set `TCP_NODELAY` on TCP listeners — inherited by every accepted
-    /// connection on Linux — so each reply PDU is sent immediately rather than
+    /// Set `TCP_NODELAY` on TCP listeners - inherited by every accepted
+    /// connection on Linux - so each reply PDU is sent immediately rather than
     /// Nagle-delayed. Defaults to `true`: this server writes whole framed
     /// messages, for which Nagle only adds latency (notably when several
     /// pipelined replies are sent back-to-back). Ignored for `AF_UNIX`.
     pub nodelay: bool,
     /// Set `SO_REUSEPORT` on TCP listeners, letting several independent
     /// `Server`s (one ring/thread each) bind the same address and have the
-    /// kernel load-balance incoming connections across them — the shared-nothing
+    /// kernel load-balance incoming connections across them - the shared-nothing
     /// multi-core recipe. Each server keeps its own `pool_size` pool, and a
     /// full pool parks only that server's listener while the reuseport hash
     /// keeps routing its share there (no rebalancing to emptier rings), so
@@ -183,7 +193,7 @@ pub struct ServerConfig {
     /// via an io_uring socket command) before running the accept handler,
     /// delivering them as [`ClientAddr::Unix`]`{ cred: Some(..) }` for local
     /// authentication. Requires a kernel that accepts socket commands on
-    /// `AF_UNIX` — Linux ≥ 6.18.16 (the interface exists since 6.7 but was
+    /// `AF_UNIX` - Linux >= 6.18.16 (the interface exists since 6.7 but was
     /// rejected with `EOPNOTSUPP` on `AF_UNIX` until the cmd_net ioctl-guard
     /// fix); [`Server::with_config`] probes once at construction and fails
     /// with a validation error on unsupported kernels. If a per-connection
@@ -194,11 +204,11 @@ pub struct ServerConfig {
     /// Maximum bytes queued to send on one connection before a **push**
     /// ([`PushHandle::push`]) closes it as a slow consumer
     /// ([`CloseReason::SendBacklog`]). Request replies are not evicted by this
-    /// bound — they are already limited by `max_in_flight_requests`. Default
+    /// bound - they are already limited by `max_in_flight_requests`. Default
     /// 8 MiB.
     pub max_send_backlog: usize,
     /// Maximum queued PDUs (replies and pushes) gathered into one `SENDMSG`
-    /// — writev-style reply coalescing. Sends stay one op at a time per
+    /// -- writev-style reply coalescing. Sends stay one op at a time per
     /// connection in FIFO PDU order, and only PDUs *already queued* when the
     /// send is armed are gathered, so a lone reply is never delayed; what
     /// changes is that a burst of pipelined replies leaves in one syscall/op
@@ -208,13 +218,13 @@ pub struct ServerConfig {
     /// (`UIO_MAXIOV`).
     pub max_send_coalesce: usize,
     /// Read message bodies at least this large into their **own** allocation
-    /// instead of the connection's accumulate buffer — delivered through
+    /// instead of the connection's accumulate buffer - delivered through
     /// [`Body::take`] as a zero-copy owned `Vec<u8>`, which makes deferring
     /// MB-scale payloads to workers copy-free, and bounds the accumulate
     /// buffer's idle high-water mark. Applies when the body still has bytes
     /// to read at the frame verdict (always, for `Need`-style framers; a
     /// `More`-style framer that already over-read the whole body delivers it
-    /// inline, where [`Body::take`] falls back to a copy — except a
+    /// inline, where [`Body::take`] falls back to a copy - except a
     /// **body-only** message at or over this threshold whose extent is
     /// exactly the buffered bytes, which hands the accumulate buffer itself
     /// over: the shape the http 100-continue dance delivers chunked bodies
@@ -254,7 +264,7 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    /// Construction-time validation of the knobs and the listener list —
+    /// Construction-time validation of the knobs and the listener list --
     /// [`Server::with_config`] fails with a validation error on the first
     /// violated bound, before any socket or ring is created.
     pub(super) fn validate(&self, addrs: &[Listen]) -> crate::Result<()> {
@@ -280,7 +290,7 @@ impl ServerConfig {
         // is packed into the same 24-bit `user_data` slot field as a pool slot.
         // Bound it here so an oversized `fs_files` fails as a clean Validation
         // rather than truncating a completion token later (`MAX_POOL` is that
-        // 24-bit ceiling — the `user_data::SLOT_MASK`).
+        // 24-bit ceiling - the `user_data::SLOT_MASK`).
         #[cfg(feature = "uring-fs")]
         if u64::from(self.fs_files).saturating_mul(2) > u64::from(MAX_POOL) {
             return Err(Error::Validation(format!(
@@ -314,9 +324,11 @@ impl ServerConfig {
             ));
         }
         if self.backlog <= 0 {
-            // `listen(2)` takes a signed backlog but compares it unsigned, so a
-            // negative value is reinterpreted as enormous and silently clamped
-            // to somaxconn; zero leaves a listener that accepts almost nothing.
+            // `listen(2)` takes a signed backlog but compares it unsigned
+            // (`__sys_listen_socket`, net/socket.c: `if ((unsigned int)backlog >
+            // somaxconn) backlog = somaxconn`), so a negative value is
+            // reinterpreted as enormous and silently clamped to somaxconn; zero
+            // leaves a listener that accepts almost nothing.
             return Err(Error::Validation("backlog must be positive".into()));
         }
         if self.max_send_backlog == 0 {

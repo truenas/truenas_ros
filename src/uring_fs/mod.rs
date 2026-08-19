@@ -7,13 +7,13 @@
 //! data op runs against that fd. Two rules shape the whole API:
 //!
 //! - **Personality is mandatory.** Every consumer-staged operation carries a
-//!   [`Personality`] — a kernel-registered credential snapshot stamped into
+//!   [`Personality`] - a kernel-registered credential snapshot stamped into
 //!   the SQE, under which the kernel itself performs its permission checks
 //!   (`override_creds` around issue, io-wq included). There is no
 //!   ambient-identity variant: the daemon's own identity is minted like any
 //!   other via [`UringFs::register_self`], and `sqe.personality = 0` (the
 //!   ring owner's ambient creds) is unreachable from this API. Only
-//!   [`FsHandle::close`] is exempt — teardown consults no credentials and
+//!   [`FsHandle::close`] is exempt - teardown consults no credentials and
 //!   must be stageable from [`File`]'s `Drop`.
 //! - **Resolution is anchored.** No call takes an absolute path. [`Anchor`]
 //!   is a long-lived real directory fd; `open` resolves a **relative**,
@@ -25,7 +25,7 @@
 //!
 //! **Standalone** ([`UringFs`]) owns its own ring and loop. The core is
 //! host-agnostic: an embedding host can drive the same core on its own ring
-//! via [`FsConn`] callbacks — under the `net-server` feature the io_uring net
+//! via [`FsConn`] callbacks - under the `net-server` feature the io_uring net
 //! server does this, interleaving fs and socket ops on one ring.
 //!
 //! The standalone loop is synchronous and single-threaded ([`UringFs::run`],
@@ -60,28 +60,28 @@
 //!
 //! Buffers are **owned round-trips**: a `Vec<u8>` moves in with the request
 //! and comes back with the result, because the kernel may touch it until the
-//! completion reaps — even if the caller lost interest. Reads fill each
+//! completion reaps - even if the caller lost interest. Reads fill each
 //! buffer up to its current `len()`; the returned count says how much is
 //! valid (short only at end-of-file).
 //!
 //! # Naming
 //!
 //! Method names follow their syscalls. The **`p`** prefix means *positional*
-//! — [`preadv2`](FsHandle::preadv2)/[`pwritev2`](FsHandle::pwritev2) take an
+//! -- [`preadv2`](FsHandle::preadv2)/[`pwritev2`](FsHandle::pwritev2) take an
 //! explicit file offset, exactly as `preadv2(2)`/`pwritev2(2)` do. Every data
 //! op here is positional: ops carry their own offset rather than advance a
 //! shared file position, so there is no offsetless `read`/`write` and no
-//! `seek`. Those two are also the *whole* data surface — a single-buffer or
+//! `seek`. Those two are also the *whole* data surface - a single-buffer or
 //! unflagged variant would be a second spelling of one submission, so pass a
 //! one-element `bufs` and [`RwFlags::empty()`]. The **`at`** suffix is
 //! reserved for its usual meaning, the
 //! dirfd-relative syscall family ([`renameat`](FsHandle::renameat),
-//! [`unlinkat`](FsHandle::unlinkat), [`mkdirat`](FsHandle::mkdirat), …), where
-//! the anchor dirfd is what the name refers to.
+//! [`unlinkat`](FsHandle::unlinkat), [`mkdirat`](FsHandle::mkdirat), ...),
+//! where the anchor dirfd is what the name refers to.
 //!
 //! # What operates on what
 //!
-//! The API is fd-first, so that `open → metadata → close` is the natural
+//! The API is fd-first, so that `open -> metadata -> close` is the natural
 //! shape and a file is named exactly once:
 //!
 //! - **On an open [`File`]:** [`preadv2`](FsHandle::preadv2) /
@@ -95,21 +95,21 @@
 //!   [`fadvise`](FsHandle::fadvise), and [`close`](FsHandle::close).
 //! - **[`statx`](FsHandle::statx)** resolves a name against an anchor; for an
 //!   already-open file, [`fstatx`](FsHandle::fstatx) stats it directly
-//!   (`STATX` with `AT_EMPTY_PATH` on the plain fd — the `fstat` equivalent),
+//!   (`STATX` with `AT_EMPTY_PATH` on the plain fd - the `fstat` equivalent),
 //!   as does [`statx_anchor`](FsHandle::statx_anchor) for an anchor's own
 //!   dirfd.
-//! - **Directory entries** — [`mkdirat`](FsHandle::mkdirat),
+//! - **Directory entries** - [`mkdirat`](FsHandle::mkdirat),
 //!   [`unlinkat`](FsHandle::unlinkat), [`rmdirat`](FsHandle::rmdirat),
 //!   [`renameat`](FsHandle::renameat), [`symlinkat`](FsHandle::symlinkat),
-//!   [`linkat`](FsHandle::linkat) — take an [`Anchor`] plus a validated
+//!   [`linkat`](FsHandle::linkat) - take an [`Anchor`] plus a validated
 //!   [`Leaf`]. These have no fd-only form in any kernel (you cannot unlink
 //!   an fd); dirfd-plus-name *is* their fd-based shape.
 //! - **[`linkat_file`](FsHandle::linkat_file)** is the exception that gives an
-//!   *already-open* file a name (`AT_EMPTY_PATH`) — the only way to name an
+//!   *already-open* file a name (`AT_EMPTY_PATH`) - the only way to name an
 //!   `O_TMPFILE`, and so the commit step of a durable create.
 //! - **Blocking tails** ([`FsConn::offload_result`]) operate on the open
 //!   [`File`] too: it is [`AsFd`], so a pool job makes blocking fd-based
-//!   calls on it — descriptors, never names.
+//!   calls on it - descriptors, never names.
 //!
 //! # Building on top: durable create, confinement, server-owned metadata
 //!
@@ -120,7 +120,7 @@
 //!   [`linkat_file`](FsHandle::linkat_file) to a private name and
 //!   [`renameat`](FsHandle::renameat) onto the target. Nothing is visible
 //!   until the rename, which replaces atomically, so a reader sees the old
-//!   file or the new one and never a partial write — and an abandoned or
+//!   file or the new one and never a partial write - and an abandoned or
 //!   crashed create leaves *nothing* to clean up, because an unnamed inode
 //!   simply disappears. (Do not fuse these into an
 //!   [`IOSQE_IO_LINK`](crate::uring_fs) chain: filesystem opcodes do not break
@@ -128,21 +128,21 @@
 //! - **Confinement.** [`open_confined`](FsHandle::open_confined) applies
 //!   [`CONFINED_RESOLVE`] in a way the caller cannot weaken, and
 //!   [`mkdir_path`](FsHandle::mkdir_path) creates a nested path the only sound
-//!   way — alternating confined walks with single-[`Leaf`] `mkdirat`s, because
+//!   way - alternating confined walks with single-[`Leaf`] `mkdirat`s, because
 //!   `mkdirat` itself honours no resolve flags.
 //! - **Server-owned metadata.** [`PrivilegedXattrs`] lets declared
 //!   `trusted.*` attributes be written under the reactor's own credentials, so
 //!   a service can keep metadata that the user who owns the file can neither
 //!   read, change, nor see.
 //! - **Batched blocking offload.** [`FsConn::offload_result`] runs the
-//!   blocking, opcode-less part of a request as one pool job — one job per
-//!   request tail, not one per call — and delivers its `crate::Result` back
+//!   blocking, opcode-less part of a request as one pool job - one job per
+//!   request tail, not one per call - and delivers its `crate::Result` back
 //!   on the loop. The job contract lives at [`offload`](FsConn::offload).
 //!
 //! # Acting as other users
 //!
 //! [`UringFs::register_self`] mints the daemon's own identity. To act as an
-//! *authenticated peer*, use the [`CredBroker`] — a tiny forked process
+//! *authenticated peer*, use the [`CredBroker`] - a tiny forked process
 //! that impersonates a user just long enough to snapshot their credentials,
 //! so the reactor process never changes identity itself:
 //!
@@ -150,13 +150,13 @@
 //! use truenas_ros::uring_fs::{AsUser, UringFs, CredBroker, FsConfig};
 //!
 //! // Every ring first, then the broker (it inherits the ring fds), then
-//! // threads. Both halves of that ordering are load-bearing — see
+//! // threads. Both halves of that ordering are load-bearing - see
 //! // `CredBroker::spawn`.
 //! let afs = UringFs::new(FsConfig::default())?;
 //! let broker = CredBroker::spawn(&[&afs])?; // main loses CAP_SETUID here
 //! let creds = broker.handle(0)?;
 //!
-//! // … a session authenticates as uid 1000 …
+//! // ... a session authenticates as uid 1000 ...
 //! let who = creds.register(&AsUser::new(1000, 1000).groups(vec![4, 27]))?;
 //! // Every op stamped `who` is checked by the kernel as that user; when
 //! // the session ends:
@@ -171,7 +171,7 @@
 //!
 //! A brokered personality carries that user's authority and nothing more.
 //! Where a service must resolve a path for a user entitled to the object but
-//! not to traverse every directory above it, opt in with [`Caps`] — allowed
+//! not to traverse every directory above it, opt in with [`Caps`] - allowed
 //! by a ceiling fixed at [`CredBroker::spawn_with_caps`], before the
 //! privilege drop, so nothing that happens to the reactor afterwards can
 //! widen it. Read [`Caps::DAC_READ_SEARCH`] first: it is a whole-filesystem
@@ -190,7 +190,7 @@ mod broker;
 // can be model-checked without a broker process to fork.
 mod single_flight;
 // The elastic blocking-work pool behind `FsConn::offload` and the off-loop
-// helpers — generic machinery, kept apart from the fs-domain modules that
+// helpers - generic machinery, kept apart from the fs-domain modules that
 // submit to it.
 pub(crate) mod offload_pool;
 // `pub(crate)` so an embedding host (a server driving `FsCore` on its own
@@ -198,8 +198,8 @@ pub(crate) mod offload_pool;
 // `uring_fs`'s own `UringFs`.
 pub(crate) mod core;
 // Exported unconditionally, not just with `net-server`. `FsConn` is the
-// callback submission facade — the only way to run several operations back to
-// back without parking a thread between them — and an out-of-tree consumer
+// callback submission facade - the only way to run several operations back to
+// back without parking a thread between them - and an out-of-tree consumer
 // driving a standalone [`UringFs`] needs it exactly as much as an embedded
 // server does. Gating it on the server role made the whole on-loop surface
 // unreachable for anyone else.
@@ -227,7 +227,7 @@ pub use broker::{
 pub use host::{FsConfig, ShutdownHandle, UringFs};
 
 /// The credential-broker request decoder, exposed to the fuzz crate (`fuzz/`)
-/// under `__fuzz` only — `broker` is a private module. Never part of the stable
+/// under `__fuzz` only - `broker` is a private module. Never part of the stable
 /// API.
 ///
 /// Driven by `fuzz/fuzz_targets/broker_request.rs`. This is the sharpest
@@ -262,7 +262,7 @@ use std::ffi::{CStr, CString};
 use std::fmt;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 // The inject channel and the shared flags are loom-modelled (see
-// `loom_tests` at the bottom), so these come from `crate::sync` — std's
+// `loom_tests` at the bottom), so these come from `crate::sync` - std's
 // outside `--cfg loom`.
 use crate::sync::mpsc;
 use crate::sync::Arc;
@@ -270,8 +270,8 @@ use crate::sync::Arc;
 /// The `AT_*` flags an async `statx` submits. `statx` follows a terminal
 /// symlink unless told not to; the confined surface inverts that, forcing
 /// `AT_SYMLINK_NOFOLLOW` by default so a peer-planted leaf symlink can't
-/// redirect the stat out of the anchor. Passing `AT_SYMLINK_FOLLOW` — which
-/// `statx` does not take natively — is the caller's opt-in to follow (stat the
+/// redirect the stat out of the anchor. Passing `AT_SYMLINK_FOLLOW` - which
+/// `statx` does not take natively - is the caller's opt-in to follow (stat the
 /// target), mirroring `linkat`; it is stripped before the syscall.
 pub(crate) fn statx_at_flags(flags: AtFlags) -> u32 {
     let follow = flags.contains(AtFlags::AT_SYMLINK_FOLLOW)
@@ -287,11 +287,11 @@ pub(crate) fn statx_at_flags(flags: AtFlags) -> u32 {
 /// Resolution rules that keep a path inside its [`Anchor`], as a set a caller
 /// can demand rather than merely receive by default.
 ///
-/// - `RESOLVE_BENEATH` — no component may resolve above the anchor, and an
+/// - `RESOLVE_BENEATH` - no component may resolve above the anchor, and an
 ///   absolute path is refused rather than resolved from `/`.
-/// - `RESOLVE_NO_SYMLINKS` — no symlink is followed, anywhere in the path, so
+/// - `RESOLVE_NO_SYMLINKS` - no symlink is followed, anywhere in the path, so
 ///   a link planted inside the tree cannot redirect out of it.
-/// - `RESOLVE_NO_XDEV` — resolution may not cross a mount point. On ZFS that
+/// - `RESOLVE_NO_XDEV` - resolution may not cross a mount point. On ZFS that
 ///   means a nested dataset, or a `.zfs/snapshot` automount, terminates the
 ///   walk instead of silently serving files from another filesystem.
 ///
@@ -302,14 +302,14 @@ pub const CONFINED_RESOLVE: ResolveFlag = ResolveFlag::RESOLVE_BENEATH
     .union(ResolveFlag::RESOLVE_NO_XDEV);
 
 /// Validate an open's `(path, how)` pair and produce the payloads an
-/// `OPENAT2` inject carries — shared by the blocking [`FsHandle::open`] and the
+/// `OPENAT2` inject carries - shared by the blocking [`FsHandle::open`] and the
 /// async `rt` handle so both surfaces enforce identical rules.
 ///
 /// The path may be **multi-component** and is resolved by the kernel against
 /// the anchor dirfd. It is **confined to the anchor by default**
 /// (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, applied when the caller set no
-/// `resolve` policy of its own). A caller that sets its own `resolve` — e.g.
-/// dropping `RESOLVE_BENEATH` — opts out of confinement and may then pass an
+/// `resolve` policy of its own). A caller that sets its own `resolve` - e.g.
+/// dropping `RESOLVE_BENEATH` - opts out of confinement and may then pass an
 /// **absolute** path, which the kernel resolves from the filesystem root
 /// (ignoring the dirfd), per `openat2(2)`. Opens return a real fd, so
 /// `O_CLOEXEC` is accepted.
@@ -337,8 +337,8 @@ pub(crate) fn open_parts<P: ?Sized + TnPath>(
 
 /// A registered io_uring personality: a kernel-held snapshot of one
 /// identity's credentials (fsuid/fsgid, supplementary groups, capabilities,
-/// LSM label), stamped into every SQE this module submits. The kernel — not
-/// the library — performs each operation's permission checks under it.
+/// LSM label), stamped into every SQE this module submits. The kernel - not
+/// the library - performs each operation's permission checks under it.
 ///
 /// Mint one for the calling process with [`UringFs::register_self`]. Ids are
 /// ring-local and never 0 (the kernel's allocator starts at 1), so a
@@ -353,7 +353,7 @@ impl Personality {
         self.0
     }
 
-    /// Name an id registered elsewhere on **this** ring — the form a
+    /// Name an id registered elsewhere on **this** ring - the form a
     /// credential broker's reply takes once it has registered an identity
     /// on the reactor's behalf. Returns `None` for `0`, which is not a valid
     /// personality: **`sqe.personality == 0` means "no credential override",
@@ -368,7 +368,7 @@ impl Personality {
     /// registered fails its operation with `EINVAL` at submission (the kernel
     /// resolves the id and refuses rather than falling back to ambient
     /// credentials). An id from a *different* ring is equally meaningless
-    /// here — personalities are ring-local.
+    /// here - personalities are ring-local.
     pub fn from_raw(id: u16) -> Option<Personality> {
         (id != 0).then_some(Personality(id))
     }
@@ -377,14 +377,14 @@ impl Personality {
 tn_bitflags! {
     /// Per-operation flags for the `preadv2`/`pwritev2` forms
     /// ([`FsHandle::preadv2`], [`FsHandle::pwritev2`] and their [`FsConn`]
-    /// twins) — the kernel's `RWF_*` set, carried in the SQE's read/write
+    /// twins) - the kernel's `RWF_*` set, carried in the SQE's read/write
     /// flags field.
     ///
     /// These are not a separate opcode: `READV`/`WRITEV` already read this
     /// field, so the flagged forms cost nothing extra. An **unsupported flag
     /// fails the operation** with `EOPNOTSUPP` at submission rather than being
     /// ignored (`kiocb_set_rw_flags`), which makes support detectable per call
-    /// — there is nothing to probe up front, and a silently-dropped durability
+    /// -- there is nothing to probe up front, and a silently-dropped durability
     /// flag is impossible.
     ///
     /// Support is per-filesystem and narrower than the flag list suggests.
@@ -395,7 +395,7 @@ tn_bitflags! {
     /// | [`RWF_DSYNC`](Self::RWF_DSYNC), [`RWF_SYNC`](Self::RWF_SYNC) | yes | `Ok` | the durability pair |
     /// | [`RWF_APPEND`](Self::RWF_APPEND), [`RWF_NOAPPEND`](Self::RWF_NOAPPEND) | yes | `Ok` | |
     /// | [`RWF_ATOMIC`](Self::RWF_ATOMIC) | **no** | `EOPNOTSUPP` | needs `FMODE_CAN_ATOMIC_WRITE`, which ZFS does not set |
-    /// | [`RWF_DONTCACHE`](Self::RWF_DONTCACHE) | **no** | `EOPNOTSUPP` | needs `FOP_DONTCACHE` (Linux ≥ 6.14), which ZFS does not set |
+    /// | [`RWF_DONTCACHE`](Self::RWF_DONTCACHE) | **no** | `EOPNOTSUPP` | needs `FOP_DONTCACHE` (Linux >= 6.14), which ZFS does not set |
     /// | [`RWF_NOWAIT`](Self::RWF_NOWAIT) | **no** | `EOPNOTSUPP` | needs `FMODE_NOWAIT` on the file; io_uring drives its own non-blocking attempt regardless |
     /// | [`RWF_HIPRI`](Self::RWF_HIPRI) | **no** | `EINVAL` | requires an `IOPOLL` ring, which this reactor does not create |
     ///
@@ -433,7 +433,7 @@ const TRUSTED_NS: &[u8] = b"trusted.";
 /// credentials instead of the request's [`Personality`].
 ///
 /// The reactor normally refuses `personality == 0` on every fd operation,
-/// because that is "no credential override" — the op would run as the daemon
+/// because that is "no credential override" - the op would run as the daemon
 /// (root) rather than the requesting identity. Reads have one sanctioned
 /// exception already ([`FsHandle::fgetxattr_as_root`]); this is its write-side
 /// counterpart, and it is an allowlist rather than a blanket permit because a
@@ -441,8 +441,8 @@ const TRUSTED_NS: &[u8] = b"trusted.";
 ///
 /// # Why it exists
 ///
-/// A server that stores its own metadata about a file — and needs that
-/// metadata to survive users who can write the file itself — has to put it
+/// A server that stores its own metadata about a file - and needs that
+/// metadata to survive users who can write the file itself - has to put it
 /// somewhere unprivileged code cannot reach. On ZFS the `trusted.` namespace
 /// is exactly that: get, set, **and list** are all gated on `CAP_SYS_ADMIN`,
 /// so an unprivileged local, SMB, or NFS user cannot read it, change it, or
@@ -455,7 +455,7 @@ const TRUSTED_NS: &[u8] = b"trusted.";
 /// refusals are the point:
 ///
 /// - `security.` would permit writing `security.capability`, which grants file
-///   capabilities — a direct privilege-escalation primitive.
+///   capabilities - a direct privilege-escalation primitive.
 /// - `system.` holds the ACLs (`system.posix_acl_access`,
 ///   `system.nfs4_acl_xdr`); writing those as root would let a caller grant
 ///   itself access it was just denied.
@@ -465,7 +465,7 @@ const TRUSTED_NS: &[u8] = b"trusted.";
 /// # Scope
 ///
 /// The policy is set on the reactor before it runs and cannot change while it
-/// does — [`UringFs::run`] takes `&mut self`, so the borrow checker, not a
+/// does - [`UringFs::run`] takes `&mut self`, so the borrow checker, not a
 /// convention, prevents a later call. An empty policy (the default) permits
 /// nothing.
 ///
@@ -493,7 +493,7 @@ impl PrivilegedXattrs {
     /// Permit attributes whose name begins with `prefix`.
     ///
     /// Errors unless `prefix` is under `trusted.` and names at least one byte
-    /// beyond it — see the type docs for why the other namespaces are refused,
+    /// beyond it - see the type docs for why the other namespaces are refused,
     /// and why a bare `trusted.` (which would cover the whole namespace) is
     /// too broad to accept.
     pub fn allow_prefix(mut self, prefix: &CStr) -> crate::Result<Self> {
@@ -516,7 +516,7 @@ impl PrivilegedXattrs {
     }
 }
 
-/// Cache advice for [`FsHandle::fadvise`] — the `POSIX_FADV_*` values.
+/// Cache advice for [`FsHandle::fadvise`] - the `POSIX_FADV_*` values.
 ///
 /// On ZFS these are not page-cache-only hints: `zpl_fadvise`
 /// (`module/os/linux/zfs/zpl_file.c`) maps [`WillNeed`](Self::WillNeed) to a
@@ -525,8 +525,8 @@ impl PrivilegedXattrs {
 /// this is the API that reaches the cache that actually matters here.
 ///
 /// It has no `preadv2`/`pwritev2` equivalent. [`RwFlags::RWF_DONTCACHE`] would
-/// cover the drop half more cheaply — no second syscall, no window where the
-/// pages linger — but ZFS does not set `FOP_DONTCACHE`, so it fails
+/// cover the drop half more cheaply - no second syscall, no window where the
+/// pages linger - but ZFS does not set `FOP_DONTCACHE`, so it fails
 /// `EOPNOTSUPP` (see the [`RwFlags`] support table). There is no read-ahead
 /// flag at all, so [`WillNeed`](Self::WillNeed) has no equivalent even in
 /// principle.
@@ -535,7 +535,7 @@ impl PrivilegedXattrs {
 pub enum Advice {
     /// No advice; resets any previously set pattern for the range.
     Normal = 0,
-    /// Expect random access — read-ahead is of little use.
+    /// Expect random access - read-ahead is of little use.
     Random = 1,
     /// Expect sequential access, so read further ahead. Worth setting on the
     /// read side of a streamed object.
@@ -551,15 +551,15 @@ pub enum Advice {
     NoReuse = 5,
 }
 
-/// A validated **single path component** — the only name a directory-entry
+/// A validated **single path component** - the only name a directory-entry
 /// operation will accept.
 ///
 /// This is a security boundary, not decoration. The `*at` opcodes honour no
 /// `RESOLVE_*` flags, so a name containing `/` or `..` would walk wherever
 /// it pleased, out of the anchor and across the filesystem; confining them
 /// to one component is what makes an [`Anchor`] an actual confinement.
-/// (Multi-component resolution exists in exactly one place —
-/// [`FsHandle::open`] — where `RESOLVE_BENEATH` lets the *kernel* enforce
+/// (Multi-component resolution exists in exactly one place --
+/// [`FsHandle::open`] - where `RESOLVE_BENEATH` lets the *kernel* enforce
 /// containment.)
 ///
 /// Rejected: empty, `.`, `..`, anything containing `/` or an interior NUL.
@@ -600,18 +600,18 @@ impl<'a> Leaf<'a> {
 /// A long-lived **real** directory fd that anchors every path resolution.
 ///
 /// The fs API exposes no absolute-path calls: `open` resolves relative to an
-/// `Anchor` (kernel constraint, not style — io_uring's path ops reject
+/// `Anchor` (kernel constraint, not style - io_uring's path ops reject
 /// fixed-table dirfds, so anchors must be real fds). Bootstrap one at setup
 /// time with [`Anchor::open`] (the single absolute open, outside the async
 /// surface) or wrap an existing directory fd with [`Anchor::from_fd`].
 ///
 /// Cloning is cheap (`Arc`); an in-flight open holds a clone, so the dirfd
-/// can never close — or be reused by another file — under a submitted op.
+/// can never close - or be reused by another file - under a submitted op.
 #[derive(Clone, Debug)]
 pub struct Anchor(Arc<OwnedFd>);
 
 impl Anchor {
-    /// Open a directory as an anchor (`O_PATH | O_DIRECTORY | O_CLOEXEC`) —
+    /// Open a directory as an anchor (`O_PATH | O_DIRECTORY | O_CLOEXEC`) --
     /// a plain blocking syscall for setup time, and this module's one
     /// absolute-path entry point.
     pub fn open<P: ?Sized + TnPath>(path: &P) -> crate::Result<Anchor> {
@@ -636,7 +636,7 @@ impl Anchor {
     }
 
     /// Wrap an already-open fd (shared) as a resolution anchor **without** the
-    /// directory check — used internally to statx a plain file fd
+    /// directory check - used internally to statx a plain file fd
     /// (`AT_EMPTY_PATH`), where the anchor *is* the fd being stat'd, not a
     /// dirfd. Not for path resolution.
     pub(crate) fn from_shared(fd: Arc<OwnedFd>) -> Anchor {
@@ -647,8 +647,8 @@ impl Anchor {
     /// rather than duplicating it. Fails `Validation` if `f` is not a
     /// directory, like [`from_fd`](Self::from_fd).
     ///
-    /// This is how a directory opened *through the reactor* — under a
-    /// personality, with the kernel's confinement applied — becomes the anchor
+    /// This is how a directory opened *through the reactor* - under a
+    /// personality, with the kernel's confinement applied - becomes the anchor
     /// for the next step of a walk, without a second `open` from a path.
     pub fn from_file(f: &File) -> crate::Result<Anchor> {
         ensure_dir(f.as_raw_fd())?;
@@ -693,7 +693,7 @@ impl AsFd for Anchor {
 /// An open file: a real OS file descriptor, reference-counted so the reactor
 /// can keep it alive across an in-flight op even after the caller drops this
 /// handle (each submitted op parks its own clone loop-side until the CQE). The
-/// fd closes when the last clone — this handle plus any op still holding one —
+/// fd closes when the last clone - this handle plus any op still holding one --
 /// drops, which gives close-last ordering by construction; [`FsHandle::close`]
 /// simply drops the handle. Cheap to [`Clone`].
 #[derive(Clone)]
@@ -722,7 +722,7 @@ impl File {
     }
 }
 
-/// Borrow the file's descriptor — what lets a pool job
+/// Borrow the file's descriptor - what lets a pool job
 /// ([`FsConn::offload_result`]) run blocking fd-based calls
 /// ([`statx`](crate::sync_fs::statx),
 /// [`fgetxattr`](crate::sync_fs::xattr::fgetxattr)) against a descriptor the
@@ -767,7 +767,7 @@ impl FsOutcome {
 
 /// Where a completed op's [`FsOutcome`] goes: the blocking mpsc reply channel
 /// of the [`FsHandle`] path. The send is non-blocking, and a gone receiver (an
-/// abandoned call) makes it a no-op — the outcome and its buffers are simply
+/// abandoned call) makes it a no-op - the outcome and its buffers are simply
 /// dropped, which is safe because delivery happens only after the CQE reaped,
 /// when the kernel is done with them.
 pub(crate) enum ReplyTo {
@@ -777,7 +777,7 @@ pub(crate) enum ReplyTo {
 impl ReplyTo {
     /// Deliver the outcome (consuming the endpoint; nothing blocks).
     /// Returns `Err(out)` when the receiver is already gone (an abandoned
-    /// call, a dropped future) — most sites ignore it, but a successful
+    /// call, a dropped future) - most sites ignore it, but a successful
     /// `open` uses it to detect that no [`File`] will be built to
     /// orphan-close the slot, and stages the close itself.
     pub(crate) fn send(self, out: FsOutcome) -> Result<(), FsOutcome> {
@@ -843,8 +843,8 @@ pub(crate) enum FsInject {
         value: Vec<u8>,
         reply: ReplyTo,
     },
-    /// Remove a server-owned extended attribute. Off the ring — io_uring has
-    /// no removal opcode — so the loop gates it on [`PrivilegedXattrs`] and
+    /// Remove a server-owned extended attribute. Off the ring - io_uring has
+    /// no removal opcode - so the loop gates it on [`PrivilegedXattrs`] and
     /// hands it to the blocking pool
     /// (see `FsCore::remove_priv_xattr`).
     FRemoveXattr {
@@ -909,7 +909,7 @@ impl FsPending {
     }
 
     /// Block until the op completes and hand back its **full** [`FsOutcome`]
-    /// (result, buffers, opened file, `statx` buffer) — for callers that need
+    /// (result, buffers, opened file, `statx` buffer) - for callers that need
     /// more than [`wait`](Self::wait)'s byte count (an `open`'s `File`, a
     /// `statx`'s buffer, an `fgetxattr`'s value). A loop shut down mid-flight
     /// yields `ECONNABORTED`.
@@ -921,8 +921,8 @@ impl FsPending {
     /// its [`File`].
     ///
     /// [`wait`](Self::wait) reports only a byte count, which an open does not
-    /// have — so without this the non-blocking open could be issued but never
-    /// collected. Errors as any open does (`ENOENT`, `EACCES`, …), or
+    /// have - so without this the non-blocking open could be issued but never
+    /// collected. Errors as any open does (`ENOENT`, `EACCES`, ...), or
     /// `ECONNABORTED` if the reactor stopped first.
     pub fn wait_file(self) -> crate::Result<File> {
         let out = self.into_outcome()?;
@@ -944,7 +944,7 @@ impl FsPending {
     }
 
     /// Block until a single-buffer operation completes, returning the byte
-    /// count and that buffer — the shape
+    /// count and that buffer - the shape
     /// [`start_fgetxattr`](FsHandle::start_fgetxattr) needs, and the
     /// one-buffer convenience for [`start_preadv2`](FsHandle::start_preadv2).
     pub fn wait_buf(self) -> (crate::Result<usize>, Vec<u8>) {
@@ -957,7 +957,7 @@ impl FsPending {
 /// to the loop and park on a per-call reply channel. Clone freely; one loop
 /// serves any number of handle threads.
 ///
-/// Every operation (except [`close`](FsHandle::close) — see the module docs)
+/// Every operation (except [`close`](FsHandle::close) - see the module docs)
 /// takes the [`Personality`] it runs as. Calls made while the loop is
 /// shutting down (or after it stopped) fail with `ECONNABORTED`.
 #[cfg_attr(not(loom), derive(Debug))]
@@ -978,12 +978,12 @@ impl fmt::Debug for FsHandle {
 }
 
 impl FsHandle {
-    /// Open `path` — **relative**, resolved against `anchor` under the
-    /// kernel's checks as `who` — returning a real fd as a [`File`].
+    /// Open `path` - **relative**, resolved against `anchor` under the
+    /// kernel's checks as `who` - returning a real fd as a [`File`].
     ///
     /// `how` is the same [`OpenHow`] the blocking
     /// [`openat2`](crate::sync_fs::openat2) takes; `O_CLOEXEC` is accepted.
-    /// Open failures (`ENOENT`, `EACCES` — the personality *working*) come
+    /// Open failures (`ENOENT`, `EACCES` - the personality *working*) come
     /// back as `Errno` errors.
     ///
     /// **Confined to `anchor` by default.** When `how` carries no `resolve`
@@ -991,7 +991,7 @@ impl FsHandle {
     /// component or a symlink that would leave `anchor` is rejected
     /// (`"../../etc/shadow"` cannot walk out of the share) and no symlink is
     /// followed. A caller that sets its own `resolve` is trusted and left
-    /// untouched — pass e.g. just [`RESOLVE_BENEATH`] to allow in-tree
+    /// untouched - pass e.g. just [`RESOLVE_BENEATH`] to allow in-tree
     /// symlinks. The personality's DAC binds every access regardless; the
     /// metadata ops are separately single-component-confined by [`Leaf`].
     ///
@@ -1040,7 +1040,7 @@ impl FsHandle {
     /// weaken**.
     ///
     /// [`open`](Self::open) confines by default but yields to a caller that
-    /// supplies its own `resolve` — reasonable for a general-purpose opener,
+    /// supplies its own `resolve` - reasonable for a general-purpose opener,
     /// and wrong when confinement is a security property of the surrounding
     /// system rather than a convenience. This form unions the confinement
     /// flags into whatever `how` asks for, so extra restrictions compose but
@@ -1049,7 +1049,7 @@ impl FsHandle {
     /// Use it wherever the path component comes from a remote peer. The three
     /// escapes it forecloses are `..` walking above `anchor`, a symlink
     /// redirecting out of the tree, and resolution crossing into a different
-    /// filesystem — the last being how a nested dataset or a `.zfs/snapshot`
+    /// filesystem - the last being how a nested dataset or a `.zfs/snapshot`
     /// automount would otherwise be served as though it were part of the tree.
     pub fn open_confined<P: ?Sized + TnPath>(
         &self,
@@ -1066,7 +1066,7 @@ impl FsHandle {
     }
 
     /// Create every missing directory along `path` beneath `anchor`, returning
-    /// an [`Anchor`] for the deepest one — `mkdir -p`, confined.
+    /// an [`Anchor`] for the deepest one - `mkdir -p`, confined.
     ///
     /// Existing components are left alone (`EEXIST` is success, as `mkdir -p`
     /// treats it), so this is idempotent and safe to race: two callers
@@ -1075,8 +1075,8 @@ impl FsHandle {
     /// # Why this is a primitive rather than caller code
     ///
     /// It cannot be written as one operation, and the obvious shortcut is
-    /// unsafe. `mkdirat` honours **no** `RESOLVE_*` flags — that is precisely
-    /// why [`Leaf`] exists — so handing it `"a/b/c"` would resolve the
+    /// unsafe. `mkdirat` honours **no** `RESOLVE_*` flags - that is precisely
+    /// why [`Leaf`] exists - so handing it `"a/b/c"` would resolve the
     /// intermediate components with no confinement at all. The only sound
     /// construction alternates confined `openat2` walks with single-component
     /// `mkdirat`s, one round trip per component, which every consumer would
@@ -1142,7 +1142,7 @@ impl FsHandle {
         Ok(cur)
     }
 
-    /// Vectored positional read as `who` — `preadv2(2)` semantics: fill each
+    /// Vectored positional read as `who` - `preadv2(2)` semantics: fill each
     /// buffer up to its current `len()`, in order, starting at file offset
     /// `off`. Returns the byte count (short only at end-of-file) and the
     /// buffers.
@@ -1151,7 +1151,7 @@ impl FsHandle {
     /// filesystem actually implements; an unsupported flag fails the read
     /// with `EOPNOTSUPP` rather than being quietly ignored, so support is
     /// discoverable per call. Pass [`RwFlags::empty()`] for plain `preadv(2)`
-    /// behaviour, and a one-element `bufs` for a single-buffer read — this is
+    /// behaviour, and a one-element `bufs` for a single-buffer read - this is
     /// the whole read surface, so there is one shape to learn and one to
     /// audit.
     pub fn preadv2(
@@ -1165,12 +1165,12 @@ impl FsHandle {
         self.rw(core::TAG_READV, who, f, bufs, off, flags)
     }
 
-    /// Vectored positional write as `who` — `pwritev2(2)` semantics: write
+    /// Vectored positional write as `who` - `pwritev2(2)` semantics: write
     /// each buffer's `len()` bytes, in order, starting at `off`. Returns
     /// bytes written and the buffers.
     ///
     /// [`RwFlags::RWF_DSYNC`] makes the write itself durable and can therefore
-    /// replace a following [`fdatasync`](Self::fdatasync) — one operation
+    /// replace a following [`fdatasync`](Self::fdatasync) - one operation
     /// instead of two. Whether that is *faster* is a filesystem question worth
     /// measuring: on ZFS a synchronous write goes through the ZIL, which for
     /// large writes can cost more than a single trailing sync. Pass
@@ -1188,7 +1188,7 @@ impl FsHandle {
 
     /// Start a vectored read without blocking; the returned [`FsPending`]
     /// collects the outcome. (The seam the dropped-mid-op lifecycle needs:
-    /// the token can be dropped while this op is in flight — the orphan
+    /// the token can be dropped while this op is in flight - the orphan
     /// close cancels it and the pending wait observes `ECANCELED`.)
     pub fn start_preadv2(
         &self,
@@ -1201,7 +1201,7 @@ impl FsHandle {
         self.start_rw(core::TAG_READV, who, f, bufs, off, flags)
     }
 
-    /// Start a vectored write without blocking — the write-side twin of
+    /// Start a vectored write without blocking - the write-side twin of
     /// [`start_preadv2`](Self::start_preadv2).
     ///
     /// Without this, an off-loop caller writing a large object must use the
@@ -1332,7 +1332,7 @@ impl FsHandle {
         self.sync(who, f, false, 0, 0)
     }
 
-    /// Flush `f`'s data (and only essential metadata) — `fdatasync`.
+    /// Flush `f`'s data (and only essential metadata) - `fdatasync`.
     pub fn fdatasync(&self, who: Personality, f: &File) -> crate::Result<()> {
         self.sync(who, f, true, 0, 0)
     }
@@ -1341,7 +1341,7 @@ impl FsHandle {
     /// selects `fdatasync` semantics), mirroring `truenas_pyos`'s ranged
     /// `prep_fsync`. The kernel syncs `[offset, offset + length]` via
     /// `vfs_fsync_range`; `offset == 0 && length == 0` syncs the whole file.
-    /// `length` is the SQE's 32-bit field (≤ ~4 GiB per call); a nonzero
+    /// `length` is the SQE's 32-bit field (<= ~4 GiB per call); a nonzero
     /// `offset` with `length == 0` is a single-byte range at `offset`, **not**
     /// through end-of-file.
     pub fn fsync_range(
@@ -1428,7 +1428,7 @@ impl FsHandle {
     /// replace. The value is returned alongside the result, like every
     /// owned buffer here.
     ///
-    /// Needs Linux ≥ 6.13, like [`fgetxattr`](Self::fgetxattr).
+    /// Needs Linux >= 6.13, like [`fgetxattr`](Self::fgetxattr).
     pub fn fsetxattr(
         &self,
         who: Personality,
@@ -1463,7 +1463,7 @@ impl FsHandle {
 
     /// Filesystem statistics for the mount `f` lives on.
     ///
-    /// Runs inline on the calling thread — this handle is already off the
+    /// Runs inline on the calling thread - this handle is already off the
     /// reactor, so there is nothing to offload it *from*, exactly as
     /// [`flistxattr`](Self::flistxattr) does. io_uring has no `statfs`
     /// opcode, so the on-loop [`FsConn`] twin has to
@@ -1472,7 +1472,7 @@ impl FsHandle {
         Ok(crate::sync_fs::fstatfs(&*f.fd)?)
     }
 
-    /// Filesystem statistics for the mount `anchor` lives on — capacity for a
+    /// Filesystem statistics for the mount `anchor` lives on - capacity for a
     /// whole tree without opening anything in it.
     ///
     /// An [`Anchor`] is an `O_PATH` descriptor, which most fd-taking calls
@@ -1485,7 +1485,7 @@ impl FsHandle {
 
     /// Read `f`'s ZFS attributes.
     ///
-    /// `f` must have been opened for real I/O — the ioctl needs an
+    /// `f` must have been opened for real I/O - the ioctl needs an
     /// `f_op->unlocked_ioctl`, which an `O_PATH` descriptor lacks. `ENOTTY`
     /// off ZFS.
     ///
@@ -1507,7 +1507,7 @@ impl FsHandle {
     /// *calling thread's* credentials for an ioctl, and this thread carries
     /// the reactor's, not a request identity's. Whether a given caller may
     /// lock a given file is therefore a policy question this API cannot
-    /// answer — and it matters, because `ZfsAttr::NOUNLINK` needs only
+    /// answer - and it matters, because `ZfsAttr::NOUNLINK` needs only
     /// ownership to clear while `IMMUTABLE` needs `CAP_LINUX_IMMUTABLE`.
     /// Do not expose this to a request identity without a gate above it.
     ///
@@ -1532,7 +1532,7 @@ impl FsHandle {
     /// thread under the reactor's own credentials. The allowlist stands in
     /// for the identity check: a caller may clear metadata this reactor
     /// wrote, and nothing else. To let a *user* remove their own attribute,
-    /// do it on a thread that holds their credentials — this API cannot.
+    /// do it on a thread that holds their credentials - this API cannot.
     pub fn fremovexattr(&self, f: &File, name: &CStr) -> crate::Result<()> {
         let (tx, rx) = mpsc::channel();
         let out = self.call(
@@ -1566,7 +1566,7 @@ impl FsHandle {
 
     /// Set the open file's length (`ftruncate`).
     ///
-    /// Requires `IORING_OP_FTRUNCATE` (Linux ≥ 6.9) — the one op above this
+    /// Requires `IORING_OP_FTRUNCATE` (Linux >= 6.9) - the one op above this
     /// crate's other io_uring floors. Where the kernel lacks it,
     /// [`UringFs::new`] leaves it disabled and this returns `EOPNOTSUPP`
     /// without touching the ring.
@@ -1581,7 +1581,7 @@ impl FsHandle {
 
     /// Manipulate the open file's allocated blocks (`fallocate`): `mode` is
     /// 0 to preallocate, or a `libc::FALLOC_FL_*` combination (punch hole,
-    /// zero range, collapse, …).
+    /// zero range, collapse, ...).
     pub fn fallocate(
         &self,
         who: Personality,
@@ -1617,15 +1617,15 @@ impl FsHandle {
     ///
     /// The ingest half of a zero-copy body path: whoever fills the pipe never
     /// materializes the bytes, and neither does this. `pipe` is a plain
-    /// descriptor the caller keeps open across the call — it is **not** taken
+    /// descriptor the caller keeps open across the call - it is **not** taken
     /// into the fixed-file pool and costs no [`FsConfig`] slot.
     ///
     /// # A short move is ordinary progress
     ///
     /// A pipe delivers what it has, so **a returned count below `len` means
-    /// resubmit the remainder** — it does not mean end of input, and it is
-    /// not an error. (The kernel's `req_set_fail` on a short move —
-    /// `io_splice`, `io_uring/splice.c` — decides only whether an
+    /// resubmit the remainder** - it does not mean end of input, and it is
+    /// not an error. (The kernel's `req_set_fail` on a short move --
+    /// `io_splice`, `io_uring/splice.c` - decides only whether an
     /// `IOSQE_IO_LINK` chain continues, and this issues no chain.)
     ///
     /// Nothing passes through userspace, so nothing can hash the bytes in
@@ -1673,7 +1673,7 @@ impl FsHandle {
         self.statx_inner(who, anchor, leaf.to_cstring(), flags, mask)
     }
 
-    /// Stat the anchor directory itself (`AT_EMPTY_PATH` on its dirfd) —
+    /// Stat the anchor directory itself (`AT_EMPTY_PATH` on its dirfd) --
     /// the closest thing to an fd-based statx this interface can offer.
     pub fn statx_anchor(
         &self,
@@ -1692,7 +1692,7 @@ impl FsHandle {
     }
 
     /// Statx an **open file** by its descriptor
-    /// (`statx(fd, "", AT_EMPTY_PATH)`) — the `fstat` equivalent. No path is
+    /// (`statx(fd, "", AT_EMPTY_PATH)`) - the `fstat` equivalent. No path is
     /// resolved (no name TOCTOU); the metadata is exactly this fd's.
     pub fn fstatx(
         &self,
@@ -1737,7 +1737,7 @@ impl FsHandle {
         self.path_op(core::TAG_UNLINKAT, who, anchor, leaf, None, None, 0, 0)
     }
 
-    /// Remove the (empty) directory `leaf` from `anchor` — `unlinkat` with
+    /// Remove the (empty) directory `leaf` from `anchor` - `unlinkat` with
     /// `AT_REMOVEDIR`, the only flag the kernel accepts here.
     pub fn rmdirat(
         &self,
@@ -1759,7 +1759,7 @@ impl FsHandle {
 
     /// Rename `old_leaf` in `old` to `new_leaf` in `new` (the anchors may be
     /// the same, and must be on one filesystem). `flags` takes
-    /// [`RenameFlags`] — `RENAME_NOREPLACE`, `RENAME_EXCHANGE`, ….
+    /// [`RenameFlags`] - `RENAME_NOREPLACE`, `RENAME_EXCHANGE`, ....
     pub fn renameat(
         &self,
         who: Personality,
@@ -1785,7 +1785,7 @@ impl FsHandle {
     ///
     /// `target` is link *content*: it is stored verbatim and never resolved
     /// at creation, so it is deliberately not a [`Leaf`] and may be any
-    /// path. What it resolves to later is decided by whoever follows it —
+    /// path. What it resolves to later is decided by whoever follows it --
     /// with the follower's credentials, not the creator's.
     pub fn symlinkat<P: ?Sized + TnPath>(
         &self,
@@ -1851,7 +1851,7 @@ impl FsHandle {
     ///
     /// This is how an `O_TMPFILE` file is materialized: it is the only link
     /// form that can name an inode which has no name yet, and it is therefore
-    /// the publish step of a durable create — write and sync an invisible file,
+    /// the publish step of a durable create - write and sync an invisible file,
     /// then make it appear, already complete, in one atomic operation. A
     /// failure before this point leaves nothing behind at all: dropping the
     /// [`File`] releases the last reference to an unnamed inode, so there is no
@@ -1878,7 +1878,7 @@ impl FsHandle {
     ///
     ///   The kernel accepts [`Caps::DAC_READ_SEARCH`] as the alternative to
     ///   that pointer match, so a personality carrying it can publish a file
-    ///   opened under a *different* one — useful when a create genuinely
+    ///   opened under a *different* one - useful when a create genuinely
     ///   cannot be held inside a single lease. It is a broad capability for a
     ///   narrow problem, though; prefer the one-[`Lease`] rule.
     pub fn linkat_file(
@@ -1903,8 +1903,8 @@ impl FsHandle {
     }
 
     /// Close the file. This drops the handle's reference-counted fd; the
-    /// descriptor is closed once the last clone — this handle plus any op still
-    /// in flight on it — is dropped, so an in-flight op never races the close
+    /// descriptor is closed once the last clone - this handle plus any op still
+    /// in flight on it - is dropped, so an in-flight op never races the close
     /// and no explicit ring op is needed. Returns `Result` to sit alongside
     /// the fallible ops, but never fails.
     pub fn close(&self, f: File) -> crate::Result<()> {
@@ -1956,7 +1956,7 @@ impl FsHandle {
         });
         if let Err(msg) = sent {
             // Loop gone: hand the caller's buffers back, as the completion
-            // path does — the owned-round-trip contract holds on failure too.
+            // path does - the owned-round-trip contract holds on failure too.
             let bufs = match msg {
                 FsInject::Rw { bufs, .. } => bufs,
                 _ => Vec::new(),
@@ -2125,7 +2125,7 @@ impl FsHandle {
     /// the un-sent message is handed back as `Err(msg)` so a caller can recover
     /// the owned buffers it moved in; the error is always `ECONNABORTED`.
     /// (`pub(crate)`: the async `rt` handle submits through the same path.)
-    // The Err IS the un-sent message, by design — its size is the payload the
+    // The Err IS the un-sent message, by design - its size is the payload the
     // caller gets back (buffers, lease), not an error-path allocation to shrink.
     #[allow(clippy::result_large_err)]
     pub(crate) fn send(&self, msg: FsInject) -> Result<(), FsInject> {
@@ -2134,7 +2134,7 @@ impl FsHandle {
             return Err(msg);
         }
         if let Err(e) = self.tx.send(msg) {
-            return Err(e.0); // SendError(msg) — the loop is gone
+            return Err(e.0); // SendError(msg) - the loop is gone
         }
         self.shared.wake.poke();
         Ok(())
@@ -2159,7 +2159,7 @@ mod tests {
     /// `Ok` from [`FsHandle::send`] and is parked in [`FsHandle::call`] on its
     /// reply channel must be woken when the loop goes away, not left there.
     ///
-    /// What wakes it is ownership, not a notification — dropping the inject
+    /// What wakes it is ownership, not a notification - dropping the inject
     /// receiver drops whatever was still queued, and each queued `FsInject`
     /// carries the `ReplyTo::Sync` sender for its own reply. So the reply
     /// channel disconnects and `recv` returns an error `call` maps to
@@ -2214,7 +2214,7 @@ mod tests {
     }
 
     /// The elevation decision is a pure prefix match, so it is testable on any
-    /// kernel — unlike the privileged write itself, which needs 6.13 plus root
+    /// kernel - unlike the privileged write itself, which needs 6.13 plus root
     /// and therefore only runs in the QEMU job.
     #[test]
     fn privileged_xattrs_matches_only_listed_prefixes() {
@@ -2266,19 +2266,19 @@ mod tests {
 // The window between the load and the send is real: a caller can pass the
 // check, the loop can decide to stop, and the message can land afterwards. The
 // contract that makes that safe is not "the race cannot happen" but **an `Ok`
-// from `send` never leaves its caller parked** — either the loop drains the
+// from `send` never leaves its caller parked** - either the loop drains the
 // message, or the inject receiver is dropped, which drops the queued message
 // and with it the `ReplyTo` sender, so the caller's `rx.recv()` in `call`
 // returns a disconnect it maps to `ECONNABORTED`.
 //
 // Note what this does *not* prove. The Acquire on the stop load has no payload
-// behind it — the shutdown side publishes only the flag — so weakening it to
+// behind it - the shutdown side publishes only the flag - so weakening it to
 // Relaxed changes nothing this model can observe. What is verified here is the
 // liveness contract, not a memory-ordering one; loom reports a violation as a
 // deadlock on the reply channel.
 //
 // This model drives the real `send`. What it cannot drive is the reactor's
-// teardown, which lives in `host.rs` around real io_uring work — so the loop
+// teardown, which lives in `host.rs` around real io_uring work - so the loop
 // side is a stand-in that performs the same two steps in the same order.
 #[cfg(loom)]
 mod loom_tests {
@@ -2324,9 +2324,9 @@ mod loom_tests {
     /// loop's final drain finds it. An `Err` hands the message back intact so
     /// the caller can recover the buffers it moved in. Neither outcome may
     /// leave a message accepted-but-undrainable.
-    // The liveness property this file's shutdown race really turns on — an
+    // The liveness property this file's shutdown race really turns on - an
     // accepted inject whose receiver is dropped disconnects the caller's reply
-    // channel, so `call` returns `ECONNABORTED` instead of parking — is **not
+    // channel, so `call` returns `ECONNABORTED` instead of parking - is **not
     // modelled here**. loom's `mpsc` tracks a message count and no sender
     // count (`loom-0.7.2/src/sync/mpsc.rs`), so `recv()` on a disconnected
     // channel blocks in its scheduler and is reported as a deadlock rather

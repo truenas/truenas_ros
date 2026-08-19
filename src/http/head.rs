@@ -1,17 +1,17 @@
 //! Request-head analysis: `httparse` tokenizing plus the semantic checks the
-//! tokenizer deliberately leaves to the server — body length, smuggling
+//! tokenizer deliberately leaves to the server - body length, smuggling
 //! rules, Host enforcement, keep-alive, `Expect`. Pure functions over byte
 //! slices. The framer (to place message boundaries) calls [`frame_facts`] and
 //! the glue (to build the [`HttpRequest`](super::HttpRequest) view) calls
 //! [`parse_head`]; both run the same tokenizer and the same semantic rules
 //! over the same header views, so the two can never disagree about what a
-//! head means — [`frame_facts`] merely skips building the header index the
+//! head means - [`frame_facts`] merely skips building the header index the
 //! framer would throw away.
 
 /// Header-count cap handed to `httparse`. Sized for S3: AWS caps user
 /// metadata at 2 KiB total, but short keys can spread that budget across
 /// ~130 `x-amz-meta-*` fields, on top of the auth/content/standard fields a
-/// signed request carries — so 96 slots rejected requests inside AWS's own
+/// signed request carries - so 96 slots rejected requests inside AWS's own
 /// limits. 160 covers the worst legitimate shape with headroom (the arrays
 /// this sizes are transient stack frames, 32 B a slot), and overflow maps
 /// to 431 rather than a parse wedge.
@@ -30,9 +30,9 @@ pub(crate) enum BodyKind {
 /// HTTP version of a parsed request head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Version {
-    /// HTTP/1.0 — closes by default; persists only on `Connection: keep-alive`.
+    /// HTTP/1.0 - closes by default; persists only on `Connection: keep-alive`.
     Http10,
-    /// HTTP/1.1 — persists by default; closes on `Connection: close`.
+    /// HTTP/1.1 - persists by default; closes on `Connection: close`.
     Http11,
 }
 
@@ -74,7 +74,7 @@ pub(crate) struct Head<'a> {
     pub headers: &'a [HeaderView<'a>],
 }
 
-/// The facts framing needs from a complete head — everything [`frame`]
+/// The facts framing needs from a complete head - everything [`frame`]
 /// consumes, computed without allocating the header index [`parse_head`]
 /// builds (the framer would discard it unread).
 ///
@@ -87,12 +87,12 @@ pub(crate) struct FrameFacts {
     /// (431 before the body verdict) exactly as it would with a full parse.
     pub body: Result<BodyKind, u16>,
     /// Whether the 100-continue dance applies: an HTTP/1.1 request carrying
-    /// the `100-continue` expectation (RFC 9110 §10.1.1 forbids interim
+    /// the `100-continue` expectation (RFC 9110 sec. 10.1.1 forbids interim
     /// responses to HTTP/1.0 clients, which would parse one as final).
     pub expects_continue: bool,
 }
 
-/// Whether `tok` is an `HTTP-version` (RFC 9110 §2.5): the uppercase name
+/// Whether `tok` is an `HTTP-version` (RFC 9110 sec. 2.5): the uppercase name
 /// `HTTP`, a slash, then one digit, a dot, and one digit.
 fn is_http_version(tok: &[u8]) -> bool {
     matches!(
@@ -104,7 +104,7 @@ fn is_http_version(tok: &[u8]) -> bool {
 
 /// The status for a request line `httparse` rejected as `Error::Version`. It
 /// compares the eight version bytes against `HTTP/1.0` and `HTTP/1.1` and
-/// rejects everything else the same way — a real but unsupported version
+/// rejects everything else the same way - a real but unsupported version
 /// like `HTTP/2.0`, and the byte soup of a malformed request line alike.
 /// Answering 505 for the latter tells the client to retry at a lower HTTP
 /// version it never named, so read the version token off the request line
@@ -155,7 +155,7 @@ fn view<'b>(h: &httparse::Header<'b>) -> HeaderView<'b> {
     }
 }
 
-/// RFC 9112 §3.2: an HTTP/1.1 request without a `Host` field, or any request
+/// RFC 9112 sec. 3.2: an HTTP/1.1 request without a `Host` field, or any request
 /// with more than one, MUST be answered 400. Enforced at tokenize time so a
 /// Host-less request never reaches routing code (virtual-hosted S3 derives
 /// the bucket from `Host`).
@@ -201,7 +201,7 @@ pub(crate) fn parse_head<'a, 'buf>(
 }
 
 /// Whether raw head bytes name the `HEAD` method. `httparse` skips empty
-/// lines before the request line (RFC 9112 §2.2 robustness), so this must
+/// lines before the request line (RFC 9112 sec. 2.2 robustness), so this must
 /// skip them too: judging the method from byte 0 would call `\r\nHEAD ...`
 /// a non-HEAD, and its farewell would carry a body the client reads as the
 /// next response's head. Usable on heads no facts were parsed from (the
@@ -215,7 +215,7 @@ pub(crate) fn method_is_head(mut head: &[u8]) -> bool {
 }
 
 /// Tokenize a (possibly incomplete) request head into just the
-/// [`FrameFacts`] the framer consumes — same rules as [`parse_head`], no
+/// [`FrameFacts`] the framer consumes - same rules as [`parse_head`], no
 /// header-index allocation.
 pub(crate) fn frame_facts(buf: &[u8]) -> Result<Option<FrameFacts>, u16> {
     let mut slots = [httparse::EMPTY_HEADER; MAX_HEADERS];
@@ -250,25 +250,25 @@ impl Head<'_> {
             .map(|h| h.value)
     }
 
-    /// The declared body framing, applying RFC 9112 §6.3's receiver rules
+    /// The declared body framing, applying RFC 9112 sec. 6.3's receiver rules
     /// plus the codec's own screens:
     ///
-    /// - `Transfer-Encoding` with `chunked` as the sole coding → chunked; a
+    /// - `Transfer-Encoding` with `chunked` as the sole coding -> chunked; a
     ///   lone well-formed `Content-Length` sent alongside is **ignored** (TE
-    ///   wins — the receiver rule; verified by wire capture, default
+    ///   wins - the receiver rule; verified by wire capture, default
     ///   botocore-over-TLS sends exactly this pair, CL carrying the
     ///   *decoded* length);
-    /// - codings before a final `chunked` (`gzip, chunked`) → 501 (framing
+    /// - codings before a final `chunked` (`gzip, chunked`) -> 501 (framing
     ///   is determinable, the coding is unimplemented);
-    /// - `chunked` missing, repeated, or non-final → 400 (body length
-    ///   unknowable — the smuggling class);
-    /// - `Transfer-Encoding` on HTTP/1.0 → 400 (RFC 9112 §6.1: treat the
+    /// - `chunked` missing, repeated, or non-final -> 400 (body length
+    ///   unknowable - the smuggling class);
+    /// - `Transfer-Encoding` on HTTP/1.0 -> 400 (RFC 9112 sec. 6.1: treat the
     ///   framing as faulty);
-    /// - multiple `Content-Length` values → 400 even when they agree (and
-    ///   even alongside TE) — agreement is what a smuggling payload would
+    /// - multiple `Content-Length` values -> 400 even when they agree (and
+    ///   even alongside TE) - agreement is what a smuggling payload would
     ///   fake;
-    /// - non-digit / overflowing `Content-Length` → 400;
-    /// - neither header → `Known(0)` (no body).
+    /// - non-digit / overflowing `Content-Length` -> 400;
+    /// - neither header -> `Known(0)` (no body).
     ///
     /// At runtime the framer reads this via [`FrameFacts`]; the method
     /// remains as the tests' oracle asserting the two paths agree.
@@ -279,10 +279,10 @@ impl Head<'_> {
 
     /// Whether the client asked for a `100 Continue` interim response.
     ///
-    /// True only for HTTP/1.1: RFC 9110 §10.1.1 says a server MUST ignore
+    /// True only for HTTP/1.1: RFC 9110 sec. 10.1.1 says a server MUST ignore
     /// the expectation on an HTTP/1.0 request (and MUST NOT send interim
     /// responses to a 1.0 client that would parse one as final). `Expect` is
-    /// a list-typed field, so the token is honored wherever it appears —
+    /// a list-typed field, so the token is honored wherever it appears --
     /// any field line, any list position.
     ///
     /// At runtime the framer reads this via [`FrameFacts`]; the method
@@ -296,7 +296,7 @@ impl Head<'_> {
     /// Whether the connection persists after this exchange, per the version
     /// default and any `Connection` header tokens. `Connection` is
     /// list-typed: tokens count no matter which field line carries them
-    /// (RFC 9110 §5.3 — repeated field lines are one combined list).
+    /// (RFC 9110 sec. 5.3 - repeated field lines are one combined list).
     ///
     /// At runtime the glue reads this via
     /// [`response_disposition`](Self::response_disposition); the method remains
@@ -346,7 +346,7 @@ impl Head<'_> {
     /// [`cl_te_conflict`](Self::cl_te_conflict) (kept as the oracle), computed
     /// together so `respond` walks the headers once rather than twice.
     ///
-    /// The `Connection` read below open-codes `has_token`'s RFC 9110 §5.3
+    /// The `Connection` read below open-codes `has_token`'s RFC 9110 sec. 5.3
     /// list grammar (comma split, OWS trim, case-fold) rather than calling
     /// it, so the walk stays single-pass; a grammar change in `has_token`
     /// must land here too, and `response_disposition_agrees_with_the_oracle`
@@ -381,7 +381,7 @@ impl Head<'_> {
 }
 
 /// Whether any comma-separated element of any `name` field line equals
-/// `token` (ASCII case-insensitive) — the RFC 9110 §5.3 combined-list read
+/// `token` (ASCII case-insensitive) - the RFC 9110 sec. 5.3 combined-list read
 /// of a repeatable list-typed field.
 fn has_token<'h>(
     headers: impl Iterator<Item = HeaderView<'h>>,
@@ -398,7 +398,7 @@ fn has_token<'h>(
 }
 
 /// The body-framing rules (documented on [`Head::body`]), over any header
-/// view sequence — one pass, no allocation. `Transfer-Encoding` is
+/// view sequence - one pass, no allocation. `Transfer-Encoding` is
 /// list-typed, so codings combine across repeated field lines exactly like
 /// `Connection` tokens do.
 fn body_from<'h>(
@@ -418,7 +418,7 @@ fn body_from<'h>(
                 let t = t.trim_ascii();
                 if t.is_empty() {
                     // Empty list elements are parsed and ignored
-                    // (RFC 9110 §5.6.1).
+                    // (RFC 9110 sec. 5.6.1).
                     continue;
                 }
                 if t.eq_ignore_ascii_case(b"chunked") {
@@ -447,8 +447,8 @@ fn body_from<'h>(
         if te_chunked != 1 || !te_last_chunked {
             return Err(400);
         }
-        // TE wins over a Content-Length sent alongside (the RFC 9112 §6.3
-        // receiver rule) — but the CL must at least be well-formed; a
+        // TE wins over a Content-Length sent alongside (the RFC 9112 sec. 6.3
+        // receiver rule) - but the CL must at least be well-formed; a
         // malformed one is a broken client, not a framing choice.
         if length.is_some_and(|v| parse_content_length(v).is_none()) {
             return Err(400);
@@ -464,7 +464,7 @@ fn body_from<'h>(
     parse_content_length(value).map(BodyKind::Known).ok_or(400)
 }
 
-/// RFC 9110 `token` bytes — the field-name grammar. `httparse` enforces it
+/// RFC 9110 `token` bytes - the field-name grammar. `httparse` enforces it
 /// on request header names; the codec applies the same set to trailer names
 /// off the wire and to handler-emitted response header names, so the two
 /// sides cannot disagree about which names are valid.
@@ -489,9 +489,9 @@ pub(crate) fn is_token_byte(b: u8) -> bool {
         )
 }
 
-/// Whether a field value carries a byte a field line may not. RFC 9110 §5.5
+/// Whether a field value carries a byte a field line may not. RFC 9110 sec. 5.5
 /// admits only field-vchar (VCHAR `0x21..=0x7E` / obs-text `0x80..=0xFF`),
-/// SP, and HTAB; every other byte is rejected — the CR/LF/NUL that split a
+/// SP, and HTAB; every other byte is rejected - the CR/LF/NUL that split a
 /// field line, and the rest of the C0 controls and DEL. Applied to
 /// handler-emitted response values (which S3 echoes verbatim from
 /// `x-amz-meta-*`) and to trailer values off the wire; mirrors httparse's
@@ -534,8 +534,8 @@ mod tests {
 
     #[test]
     fn metadata_heavy_request_fits_the_slots() {
-        // AWS's 2 KiB metadata budget spread across 130 short keys — the
-        // worst legitimate S3 shape — must parse, not 431 on slot count.
+        // AWS's 2 KiB metadata budget spread across 130 short keys - the
+        // worst legitimate S3 shape - must parse, not 431 on slot count.
         let mut req = b"PUT /b/k HTTP/1.1\r\nHost: h\r\n".to_vec();
         for i in 0..130 {
             req.extend_from_slice(format!("x-amz-meta-{i}: v\r\n").as_bytes());
@@ -624,7 +624,7 @@ mod tests {
     fn host_enforcement() {
         let mut headers: [HeaderView<'_>; MAX_HEADERS] =
             [HeaderView::EMPTY; MAX_HEADERS];
-        // HTTP/1.1 without Host: 400 (RFC 9112 §3.2).
+        // HTTP/1.1 without Host: 400 (RFC 9112 sec. 3.2).
         assert_eq!(
             parse_head(b"GET / HTTP/1.1\r\n\r\n", &mut headers),
             Err(400)
@@ -656,7 +656,7 @@ mod tests {
             body(b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"),
             Ok(BodyKind::Chunked)
         );
-        // TE + CL together: TE wins, CL ignored — the shape default
+        // TE + CL together: TE wins, CL ignored - the shape default
         // botocore-over-TLS actually sends (captured 2026-08-07).
         assert_eq!(
             body(b"PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n"),
@@ -692,7 +692,7 @@ mod tests {
             body(b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding:\r\n\r\n"),
             Err(400)
         );
-        // TE on HTTP/1.0: faulty framing (RFC 9112 §6.1).
+        // TE on HTTP/1.0: faulty framing (RFC 9112 sec. 6.1).
         assert_eq!(
             body(b"PUT / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n"),
             Err(400)
@@ -750,8 +750,8 @@ mod tests {
 
     #[test]
     fn obsolete_line_folding_is_rejected() {
-        // Obsolete line folding (RFC 9112 §5.2) is rejected; here the folded
-        // value would otherwise reconstruct to a Transfer-Encoding of
+        // Obsolete line folding (RFC 9112 sec. 5.2) is rejected; here the
+        // folded value would otherwise reconstruct to a Transfer-Encoding of
         // "chunked", a hidden-header vector.
         assert_eq!(
             head_err(b"GET /t HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chun\r\n ked\r\n\r\n"),
@@ -761,7 +761,7 @@ mod tests {
 
     #[test]
     fn header_field_spacing_is_rejected() {
-        // Whitespace before the colon (RFC 9112 §5.1) or before the first
+        // Whitespace before the colon (RFC 9112 sec. 5.1) or before the first
         // header name is rejected; both are classic proxy-differential
         // smuggling shapes.
         assert_eq!(
@@ -781,8 +781,8 @@ mod tests {
 
     #[test]
     fn control_bytes_in_a_header_value_are_rejected() {
-        // A bare CR, NUL, or other C0 control byte in a value is rejected —
-        // any of them could split or truncate the field line — while obs-text
+        // A bare CR, NUL, or other C0 control byte in a value is rejected --
+        // any of them could split or truncate the field line - while obs-text
         // (0x80..=0xFF) is allowed.
         let bad: &[&[u8]] = &[
             b"GET / HTTP/1.1\r\nHost: a\r\nX: v\rTransfer-Encoding: chunked\r\n\r\n",
@@ -895,7 +895,7 @@ mod tests {
 
     #[test]
     fn list_fields_combine_across_lines() {
-        // Connection tokens count on any field line (RFC 9110 §5.3).
+        // Connection tokens count on any field line (RFC 9110 sec. 5.3).
         complete(
             b"GET / HTTP/1.1\r\nHost: h\r\nConnection: upgrade\r\nConnection: close\r\n\r\n",
             |h| assert!(!h.keep_alive()),
@@ -917,7 +917,7 @@ mod tests {
 
     #[test]
     fn expect_ignored_on_http10() {
-        // RFC 9110 §10.1.1: a 1.0 client can't parse an interim response.
+        // RFC 9110 sec. 10.1.1: a 1.0 client can't parse an interim response.
         complete(
             b"PUT / HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 1\r\n\r\n",
             |h| assert!(!h.expects_continue()),

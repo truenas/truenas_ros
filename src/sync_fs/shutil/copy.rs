@@ -25,7 +25,7 @@ const ACCESS_ACL_XATTRS: [&CStr; 2] = [POSIX_ACCESS, NFS4_ACL];
 
 // The mode bits that grant the file's own owner (or group) identity to whoever
 // executes it. Split out of the rest of the mode because they are only
-// meaningful alongside that ownership — see [`copy_setid`].
+// meaningful alongside that ownership - see [`copy_setid`].
 pub(super) const SETID_BITS: libc::mode_t = libc::S_ISUID | libc::S_ISGID;
 
 fn has_access_acl(xattr_names: &[CString]) -> bool {
@@ -144,15 +144,15 @@ pub fn copyfile(
 /// `fchmod`.
 ///
 /// A POSIX **default** ACL travels either way. It is not an access check on
-/// this object at all — it is the template children inherit — so it is a
+/// this object at all - it is the template children inherit - so it is a
 /// separate xattr from the access ACL, and a directory can carry one with no
 /// access ACL at all. [`copy_xattrs`] skips the whole `system.` namespace, so
 /// if it is not copied here it is not copied anywhere.
 ///
 /// The ACL is authoritative on ZFS `aclmode=restricted`, where a `chmod` of an
 /// object holding a non-trivial ACL is rejected with `EPERM` (`zfs_setattr`).
-/// A destination can hold such an ACL without the source having one — it
-/// inherits from the destination parent — and on `acltype=nfsv4` the source's
+/// A destination can hold such an ACL without the source having one - it
+/// inherits from the destination parent - and on `acltype=nfsv4` the source's
 /// own ACL is invisible to `flistxattr`, so the `fchmod` branch is the one
 /// taken. An `EPERM` there means the destination's ACL already governs its
 /// mode, which is the outcome this function wants; it is treated as applied
@@ -160,7 +160,7 @@ pub fn copyfile(
 /// destination-root and special-node `chmod` sites.
 /// Mirrors `truenas_os` copy.py.
 ///
-/// `S_ISUID`/`S_ISGID` are withheld — they belong to [`copy_setid`], which
+/// `S_ISUID`/`S_ISGID` are withheld - they belong to [`copy_setid`], which
 /// applies them once the destination carries the source's ownership.
 ///
 /// # The sticky bit on an ACL-bearing directory
@@ -172,7 +172,7 @@ pub fn copyfile(
 ///
 /// Restoring it would mean an `fchmod` on exactly the objects this branch
 /// exists to keep away from one, and on ZFS a `chmod` is never just a mode
-/// change — `zfs_acl_chmod_setattr` rewrites the ACL to agree with the new
+/// change - `zfs_acl_chmod_setattr` rewrites the ACL to agree with the new
 /// mode. Under the **default** `aclmode=discard` it replaces it with a fresh
 /// empty one (`zfs_acl_alloc`), under `groupmask` it trims the ALLOW entries,
 /// and even `passthrough` re-splits the mode-representing ACEs; only
@@ -184,7 +184,7 @@ pub fn copyfile(
 /// The [`copy_setid`] path withholds `S_ISUID`/`S_ISGID` from an ACL-bearing
 /// destination for the same reason, and the special-node path
 /// (`copy_metadata`'s `mknod` sibling) does run an `fchmod`, but only
-/// because a device node cannot carry an ACL for it to damage — there the
+/// because a device node cannot carry an ACL for it to damage - there the
 /// `chmod` is wrapped so an ACL-governed refusal is tolerated rather than
 /// failing the copy.
 pub fn copy_permissions(
@@ -230,7 +230,7 @@ pub fn copy_permissions(
 /// A destination whose permissions came from an ACL xattr is left alone: there
 /// the mode follows the ACL, and an `fchmod` could discard it. A destination
 /// governed by an ACL it *inherited* refuses the `fchmod` with `EPERM`, which
-/// is tolerated for the reason [`copy_permissions`] gives — and here the
+/// is tolerated for the reason [`copy_permissions`] gives - and here the
 /// tolerated outcome is a destination without setid, a reduction in what the
 /// copy grants, never an increase.
 pub fn copy_setid(
@@ -256,10 +256,10 @@ pub fn copy_setid(
 /// owns them. `security.*` is skipped because it is where the kernel keeps
 /// authority, not data: `security.capability` is a file capability set, so
 /// copying it verbatim would transplant privilege onto a destination whose
-/// content came from the source — `cap_setuid+ep` on a binary the caller
+/// content came from the source - `cap_setuid+ep` on a binary the caller
 /// chose. The kernel gates the write on `CAP_SETFCAP` (`cap_convert_nscap`)
 /// rather than forbidding it, so a `copytree` running as root can carry it
-/// across — and `copy_metadata` orders the `fchown` so the kernel
+/// across - and `copy_metadata` orders the `fchown` so the kernel
 /// strips the attribute, which only holds if nothing puts it back afterwards.
 /// `security.ima`/`.evm` are skipped for the same reason and because an EVM
 /// HMAC covers the inode it was computed over, so a copied one is invalid
@@ -267,7 +267,7 @@ pub fn copy_setid(
 ///
 /// This matches the refusal the asynchronous side already makes:
 /// `PrivilegedXattrs::allow_prefix` rejects the whole `security.` prefix.
-/// `truenas_os` copy.py and `cp --preserve=xattr` both copy the namespace —
+/// `truenas_os` copy.py and `cp --preserve=xattr` both copy the namespace --
 /// this is a deliberate divergence.
 pub fn copy_xattrs(
     src: BorrowedFd<'_>,

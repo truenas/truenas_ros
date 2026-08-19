@@ -1,4 +1,4 @@
-//! `truenas_ros` — idiomatic Rust bindings for modern Linux filesystem and
+//! `truenas_ros` - idiomatic Rust bindings for modern Linux filesystem and
 //! mount syscalls that glibc does not wrap, plus NFS4/POSIX1E ACLs, a
 //! filesystem iterator, idmapped-mount user namespaces, and symlink-safe /
 //! atomic file I/O.
@@ -15,9 +15,9 @@
 //! # Features and layout
 //!
 //! Functionality is split into per-subsystem Cargo features grouped under
-//! umbrella modules: [`sync_fs`] (blocking fs bindings — features `sync-fs`,
+//! umbrella modules: [`sync_fs`] (blocking fs bindings - features `sync-fs`,
 //! `xattr`, `acl`, `fhandle`, `fsiter`, `shutil`), [`mount`] (mount topology
-//! and idmapped-mount support — features `mount`, `idmap`), [`configfile`],
+//! and idmapped-mount support - features `mount`, `idmap`), [`configfile`],
 //! [`audit`] (kernel audit records over `NETLINK_AUDIT`), the io_uring `net`
 //! stack (`net-core`/`net-server`/`net-client`), and the io_uring fs reactor
 //! [`uring_fs`] (`uring-fs`). `full` enables everything except `uring-fs`,
@@ -44,7 +44,7 @@ pub mod path;
 pub mod tempdir;
 
 // std's synchronization primitives, or loom's under `--cfg loom`. A plain
-// re-export outside a model run — see the module docs. Only the subsystems
+// re-export outside a model run - see the module docs. Only the subsystems
 // with loom models import from here; the rest use `std::sync` directly.
 #[cfg(any(feature = "uring", feature = "uring-fs"))]
 pub(crate) mod sync;

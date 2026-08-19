@@ -67,7 +67,7 @@ fn a_child_dropping_its_last_handle_leaves_the_parent_signing() {
     let pid = fork_now();
     if pid == 0 {
         // Both handles go here, so the child's refcount reaches zero and
-        // `SecretMem::drop` runs — the teardown of a forked worker.
+        // `SecretMem::drop` runs - the teardown of a forked worker.
         drop(worker);
         drop(key);
         // SAFETY: async-signal-safe exit; nothing buffered to flush.
@@ -104,7 +104,7 @@ fn a_forked_child_cannot_read_the_key() {
         // SAFETY: deliberately reading an address this process should not
         // have. Faulting is the pass condition; the parent checks the signal.
         let first = unsafe { std::ptr::read_volatile(addr as *const u8) };
-        // Reached only if the mapping was inherited, which is the failure —
+        // Reached only if the mapping was inherited, which is the failure --
         // exit non-zero, and make the read observable so it is not elided.
         unsafe { libc::_exit(if first == KEY[0] { 2 } else { 3 }) };
     }

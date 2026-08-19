@@ -1,4 +1,4 @@
-//! `statmount(2)` — detailed information about a single mount.
+//! `statmount(2)` - detailed information about a single mount.
 
 use super::{
     MntIdReq, MntPropagation, MountAttr, MNT_ID_REQ_SIZE_VER1, SYS_STATMOUNT,
@@ -9,7 +9,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
 tn_bitflags! {
-    /// `STATMOUNT_*` — fields requested from / returned by `statmount`
+    /// `STATMOUNT_*` - fields requested from / returned by `statmount`
     /// (the full 6.18 set, through the uid/gid maps).
     pub struct StatmountMask: u64 {
         /// Superblock basics (`sb_dev_*`, `sb_magic`, `sb_flags`).
@@ -201,7 +201,7 @@ impl Statmount {
     }
 }
 
-/// The reply decoder exposed to the fuzz crate (`fuzz/`) under `__fuzz` only —
+/// The reply decoder exposed to the fuzz crate (`fuzz/`) under `__fuzz` only --
 /// the `mount` analogue of the net stack's `frame_step` re-export. Never part
 /// of the stable API.
 ///
@@ -215,7 +215,7 @@ pub mod fuzz {
     /// Decode a `statmount` reply from its raw word buffer, or `None` if the
     /// buffer is too short to hold the fixed header.
     ///
-    /// The inner `parse` reads `RawStatmount` off the front unchecked — a
+    /// The inner `parse` reads `RawStatmount` off the front unchecked - a
     /// precondition [`statmount`](super::statmount) discharges by allocating
     /// 1 KiB. Enforcing it here keeps this entry point safe for *any* fuzzer
     /// input, so a short buffer is a `None` rather than an out-of-bounds read.
@@ -267,7 +267,7 @@ fn parse(words: &[u64]) -> Statmount {
     let hdr = unsafe { &*words.as_ptr().cast::<RawStatmount>() };
     // SAFETY: same allocation, reinterpreted as bytes for string extraction.
     // Clamp to the kernel-reported `size` (never past the allocation) so string
-    // offsets are bounded by what the kernel actually wrote — the safety is then
+    // offsets are bounded by what the kernel actually wrote - the safety is then
     // local, not contingent on the buffer having been zero-initialised.
     let written = (hdr.size as usize).min(words.len() * 8);
     let bytes = unsafe {
@@ -284,9 +284,9 @@ fn parse(words: &[u64]) -> Statmount {
         let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
         tail[..end].to_vec()
     };
-    // The kernel emits the mount point as raw dentry bytes — `statmount_mnt_point`
+    // The kernel emits the mount point as raw dentry bytes - `statmount_mnt_point`
     // writes it through `seq_path_root` with an empty escape set
-    // (fs/namespace.c) — so carry it as a path without a UTF-8 round-trip;
+    // (fs/namespace.c) - so carry it as a path without a UTF-8 round-trip;
     // substituting U+FFFD would yield a different, still-openable path.
     let get_path = |offset: u32| -> PathBuf {
         PathBuf::from(OsString::from_vec(get_bytes(offset)))
@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn mount_opts_prefixes_ro_rw_only_with_sb_basic() {
-        // MNT_OPTS + SB_BASIC → synthetic ro/rw prefix.
+        // MNT_OPTS + SB_BASIC -> synthetic ro/rw prefix.
         let mut sm = base(StatmountMask::MNT_OPTS | StatmountMask::SB_BASIC);
         sm.sb_flags = Some(SbFlags::empty());
         sm.mnt_opts_raw = Some("noatime".into());
@@ -495,19 +495,19 @@ mod tests {
         sm.sb_flags = Some(SbFlags::RDONLY);
         assert_eq!(sm.mount_opts().as_deref(), Some("ro,noatime"));
 
-        // Empty raw opts → just the prefix.
+        // Empty raw opts -> just the prefix.
         sm.mnt_opts_raw = Some(String::new());
         assert_eq!(sm.mount_opts().as_deref(), Some("ro"));
 
-        // MNT_OPTS without SB_BASIC → raw opts, no prefix...
+        // MNT_OPTS without SB_BASIC -> raw opts, no prefix...
         let mut sm2 = base(StatmountMask::MNT_OPTS);
         sm2.mnt_opts_raw = Some("noatime".into());
         assert_eq!(sm2.mount_opts().as_deref(), Some("noatime"));
-        // ...and empty raw opts → None.
+        // ...and empty raw opts -> None.
         sm2.mnt_opts_raw = Some(String::new());
         assert_eq!(sm2.mount_opts(), None);
 
-        // No MNT_OPTS bit at all → None.
+        // No MNT_OPTS bit at all -> None.
         assert_eq!(base(StatmountMask::MNT_BASIC).mount_opts(), None);
     }
 

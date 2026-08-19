@@ -7,7 +7,7 @@
 //! kernel-shared head/tail words.
 //!
 //! The four kernel-shared index words and the two entry arrays live behind
-//! [`SqCqRings`] — one home for the ordering discipline. In production its
+//! [`SqCqRings`] - one home for the ordering discipline. In production its
 //! atomics are `*const AtomicU32` into the mmap and the accessors inline to the
 //! exact loads/stores/derefs the ring used before. Under `--cfg loom` the same
 //! accessors run against owned `loom` atomics and `loom::cell::UnsafeCell`
@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// accessors ([`try_reserve`](SqCqRings::try_reserve), [`fill_sqe`](SqCqRings::fill_sqe),
 /// [`advance`](SqCqRings::advance), [`reap`](SqCqRings::reap)) take the caller's
 /// private ring mirrors by value / `&mut` so `SqCqRings` itself needs no interior
-/// mutable bookkeeping — which lets a loom test share it behind an `Arc` between
+/// mutable bookkeeping - which lets a loom test share it behind an `Arc` between
 /// the user thread and a mock-kernel thread.
 ///
 /// Production (`cfg(not(loom))`): the four words are `*const AtomicU32` into the
@@ -430,7 +430,7 @@ impl Ring {
     /// caller's fill, so per-op flags such as [`IOSQE_FIXED_FILE`] survive. As
     /// with [`push_sqe_linked`](Ring::push_sqe_linked), already-staged SQEs are
     /// flushed *first* when fewer than `n` slots are free, so no intervening
-    /// submit can split the chain — a split chain is not a slow chain, it is a
+    /// submit can split the chain - a split chain is not a slow chain, it is a
     /// silently unordered one.
     #[cfg(feature = "uring-fs")]
     pub(crate) fn push_sqe_chain(
@@ -539,7 +539,7 @@ impl Ring {
     /// Sound only because nothing was ever submitted: the kernel advances the
     /// SQ head solely inside `io_uring_enter`, so with no enter the head is
     /// still 0 and no staged SQE was ever read. The assert enforces exactly
-    /// that — `to_submit` and `sq_tail` both count every staged SQE, and only
+    /// that - `to_submit` and `sq_tail` both count every staged SQE, and only
     /// [`submit`](Ring::submit) parts them.
     #[cfg(all(test, not(loom), feature = "uring-fs"))]
     pub(crate) fn reset_staging(&mut self) {
@@ -557,7 +557,7 @@ impl Ring {
 ///
 /// Holds raw pointers into the mmap'd rings (in the mmap bookkeeping and, in
 /// production, inside [`SqCqRings`]), which makes it automatically `!Send`/
-/// `!Sync` — the type system then forbids sharing the ring across threads (see
+/// `!Sync` - the type system then forbids sharing the ring across threads (see
 /// the crate's single-ring-per-thread decision).
 pub(crate) struct Ring {
     fd: OwnedFd,
@@ -675,7 +675,7 @@ mod loom_tests {
     }
 
     // The mock kernel: consume every published SQE, and for each post one CQE
-    // echoing its `user_data`. Mirrors the kernel's ordering exactly — Acquire
+    // echoing its `user_data`. Mirrors the kernel's ordering exactly - Acquire
     // the words it reads (sq_tail), Release the words it publishes (sq_head so
     // the slot is reusable; cq_tail so the CQE is visible).
     fn mock_kernel(k: &SqCqRings, n: u32) {
@@ -708,7 +708,7 @@ mod loom_tests {
     #[test]
     fn sq_cq_ordering_spsc() {
         loom::model(|| {
-            // Keep tiny — loom is exhaustive. Two ops over a 2-slot ring
+            // Keep tiny - loom is exhaustive. Two ops over a 2-slot ring
             // exercises publish/consume of distinct SQEs and CQEs.
             const N: u32 = 2;
             let rings = Arc::new(SqCqRings::new_owned(2, 2));

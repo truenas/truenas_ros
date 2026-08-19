@@ -1,9 +1,9 @@
-//! The `NETLINK_AUDIT` socket — one `nlmsghdr` per record, then the kernel's
+//! The `NETLINK_AUDIT` socket - one `nlmsghdr` per record, then the kernel's
 //! `NLMSG_ERROR` ack.
 //!
 //! Writing needs `CAP_AUDIT_WRITE`; without it (or with kernel audit compiled
 //! out / nobody listening) the kernel replies `EPERM`/`ECONNREFUSED`, which is
-//! reported as [`SendStatus::Unavailable`] — a benign no-op, matching
+//! reported as [`SendStatus::Unavailable`] - a benign no-op, matching
 //! libaudit's `audit_send_user_message`. That distinction is what lets a
 //! caller's loop treat an unaudited host as "nothing to do" rather than a
 //! failure to retry.
@@ -60,7 +60,7 @@ pub enum SendStatus {
     /// Not proof that it was logged: with `audit_enabled == 0` the kernel acks
     /// success and discards every user message except `AUDIT_USER_AVC`.
     Delivered,
-    /// Audit is benignly unavailable — no `CAP_AUDIT_WRITE` (`EPERM`), or
+    /// Audit is benignly unavailable - no `CAP_AUDIT_WRITE` (`EPERM`), or
     /// kernel audit compiled out / nobody listening (`ECONNREFUSED`). A no-op,
     /// not an error.
     Unavailable,
@@ -80,7 +80,7 @@ pub enum SendStatus {
 /// in `TASK_UNINTERRUPTIBLE` in its own syscall context. That stall is gated on
 /// backlog depth, **not** on the socket's `O_NONBLOCK` flag, so it cannot be
 /// avoided by making the socket non-blocking or by polling for writability.
-/// Do not call this from a latency-critical thread — give it a thread of its
+/// Do not call this from a latency-critical thread - give it a thread of its
 /// own, or a work loop that tolerates the stall.
 pub struct AuditSocket {
     fd: OwnedFd,
@@ -103,7 +103,7 @@ impl fmt::Debug for AuditSocket {
 impl AuditSocket {
     /// Open the audit netlink socket.
     ///
-    /// Succeeds without `CAP_AUDIT_WRITE` — the capability is checked per
+    /// Succeeds without `CAP_AUDIT_WRITE` - the capability is checked per
     /// message, and a send without it reports
     /// [`SendStatus::Unavailable`] rather than failing.
     pub fn open() -> Result<AuditSocket> {
@@ -156,7 +156,7 @@ impl AuditSocket {
     }
 
     /// Report that `n` records were dropped before reaching this socket, so
-    /// the log shows the gap rather than silently missing events — the kernel
+    /// the log shows the gap rather than silently missing events - the kernel
     /// signals its own overflow the same way.
     ///
     /// A convenience for an application queueing records ahead of this socket:
@@ -217,8 +217,8 @@ impl AuditSocket {
     /// `-EPERM`/`-ECONNREFUSED` is benign unavailability, any other negative
     /// errno is an error.
     ///
-    /// Acks carrying a different sequence number are stale — a previous send
-    /// whose `poll` timed out — and are skipped rather than misattributed. A
+    /// Acks carrying a different sequence number are stale - a previous send
+    /// whose `poll` timed out - and are skipped rather than misattributed. A
     /// timeout is treated as delivered rather than wedging the caller.
     fn read_ack(&self, seq: u32) -> Result<SendStatus> {
         for _ in 0..ACK_SCAN_LIMIT {
@@ -271,13 +271,13 @@ impl AuditSocket {
 
 /// Interpret one received netlink datagram as an ack for `seq`.
 ///
-/// `None` means the datagram is not attributable to `seq` — a runt, or an
-/// earlier record's ack arriving late — so the scan should keep reading.
+/// `None` means the datagram is not attributable to `seq` - a runt, or an
+/// earlier record's ack arriving late - so the scan should keep reading.
 /// `Some` is terminal: `error == 0` is success, `-EPERM`/`-ECONNREFUSED` is
 /// benign unavailability, and any other negative errno is an error.
 ///
 /// Split out from [`AuditSocket::read_ack`] so the decode is pure and can be
-/// driven by `fuzz/fuzz_targets/audit_ack.rs` — the bytes come off a socket the
+/// driven by `fuzz/fuzz_targets/audit_ack.rs` - the bytes come off a socket the
 /// kernel shares with every other netlink peer, and the length guards here are
 /// the only thing standing between a short datagram and an out-of-bounds index.
 pub(super) fn decode_ack(buf: &[u8], seq: u32) -> Option<Result<SendStatus>> {

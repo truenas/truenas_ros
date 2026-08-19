@@ -1,4 +1,4 @@
-//! `mount_setattr(2)` — change mount attributes / propagation / idmap.
+//! `mount_setattr(2)` - change mount attributes / propagation / idmap.
 
 use super::{Atime, MntPropagation, MountAttr};
 use crate::errno::{self, retry_on_eintr};
@@ -65,7 +65,7 @@ impl<'fd> MountSetattr<'fd> {
 
     /// Select the atime policy, replacing any already requested. Clears
     /// [`MountAttr::__ATIME`] and sets just this policy's bits, which is the
-    /// only encoding the kernel accepts — including for [`Atime::Relatime`],
+    /// only encoding the kernel accepts - including for [`Atime::Relatime`],
     /// whose bits are none.
     pub fn atime(mut self, atime: Atime) -> Self {
         self.attr_set &= !MountAttr::__ATIME.bits();

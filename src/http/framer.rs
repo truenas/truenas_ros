@@ -1,7 +1,7 @@
 //! The HTTP framing state machine: a per-connection [`Phase`] plus the pure
 //! [`frame`] step mapping accumulated bytes onto [`Framing`] verdicts. All
 //! decisions live here so the step stays a pure function of
-//! `(buffer, phase, config)` — fuzzable exactly like the reactor's own
+//! `(buffer, phase, config)` - fuzzable exactly like the reactor's own
 //! `frame_step`.
 //!
 //! Three shapes of exchange exist:
@@ -14,8 +14,8 @@
 //!   the head bytes stashed in the phase; the glue replies with the raw
 //!   interim line and advances the phase; the framer then declares the body
 //!   as a second message (`Complete { 0, body_len }`) paired with the stash.
-//! - **Chunked** (`Transfer-Encoding: chunked` — what default S3 SDKs send
-//!   over TLS): the body's extent isn't declared, it's discovered — the
+//! - **Chunked** (`Transfer-Encoding: chunked` - what default S3 SDKs send
+//!   over TLS): the body's extent isn't declared, it's discovered - the
 //!   framer keeps a resumable [`ChunkScan`] in the phase and answers `More`
 //!   until the terminal chunk lands, then declares the whole wire extent as
 //!   the message body. The glue de-chunks on delivery. Composes with the
@@ -26,7 +26,7 @@
 //! Malformed input transitions to [`Phase::Fail`] and delivers whatever is
 //! buffered as a degenerate message, so the glue can send a real error
 //! response and flush-close ([`Response::ReplyClose`]) rather than slamming
-//! the connection — the "HTTP error before hanging up" case the reactor's
+//! the connection - the "HTTP error before hanging up" case the reactor's
 //! close semantics were designed for.
 
 #[cfg(doc)]
@@ -40,8 +40,8 @@ use super::head::{frame_facts, method_is_head, BodyKind};
 /// [`HttpConfig::max_body`]: a chunked message whose **wire** extent exceeds
 /// `max_body + CHUNK_WIRE_OVERHEAD` fails 400 even while its decoded size is
 /// still in bounds. The only way there is pathological framing (one-byte
-/// chunks, jumbo extensions) — real clients chunk at 64 KiB or more, a few
-/// hundred bytes of overhead per megabyte — so this reads as abuse, not
+/// chunks, jumbo extensions) - real clients chunk at 64 KiB or more, a few
+/// hundred bytes of overhead per megabyte - so this reads as abuse, not
 /// content size, hence 400 rather than 413.
 pub(crate) const CHUNK_WIRE_OVERHEAD: usize = 16 * 1024;
 
@@ -116,7 +116,7 @@ impl HttpConfig {
     /// message this codec admits reaches the framer intact:
     /// `max_head + max_body + CHUNK_WIRE_OVERHEAD` (the last term because a
     /// chunked body's wire form may legitimately exceed its decoded size).
-    /// A reactor cap below this leaves a dead band — requests the codec
+    /// A reactor cap below this leaves a dead band - requests the codec
     /// would accept (or answer 413/431) that the reactor instead kills with
     /// a raw close and no HTTP response.
     pub fn min_request_bytes(&self) -> usize {
@@ -172,7 +172,7 @@ pub(crate) enum Phase {
         /// Response status for the farewell (400/413/431/501/505).
         status: u16,
         /// Whether the dying request was a HEAD, recorded when the failure
-        /// is declared — the last moment the head bytes are reliably at
+        /// is declared - the last moment the head bytes are reliably at
         /// hand. By delivery time the dance may have consumed them, leaving
         /// only body bytes, and body bytes are client-chosen.
         head_only: bool,
@@ -202,7 +202,7 @@ pub struct HttpConn<U> {
 }
 
 impl<U> HttpConn<U> {
-    /// A fresh connection's protocol state around the consumer's `state` —
+    /// A fresh connection's protocol state around the consumer's `state` --
     /// what the glue's accept wrapper mints for every plain connection.
     /// Public for the one admission that wrapper cannot cover: a kTLS
     /// listener's handshake worker, where the accept handler does not run
@@ -248,7 +248,7 @@ pub(crate) fn frame<U>(
 ) -> Framing {
     match &conn.phase {
         // Already failed: deliver the remainder so the glue can farewell.
-        // (Normally unreachable — ReplyClose retires the recv side — but
+        // (Normally unreachable - ReplyClose retires the recv side - but
         // total, so a scheduling surprise degrades to a repeat verdict.)
         Phase::Fail { .. } => Framing::Complete {
             header_len: buf.len(),
@@ -272,7 +272,7 @@ pub(crate) fn frame<U>(
         },
         // The dance's second message with a declared length: the body
         // alone, head already stashed. ExpectHead is handled identically in
-        // defense: the glue advances ExpectHead → ExpectBody before the
+        // defense: the glue advances ExpectHead -> ExpectBody before the
         // framer can run again, but if that invariant ever bends, the
         // verdict is the same either way.
         Phase::ExpectHead {
@@ -312,7 +312,7 @@ pub(crate) fn frame<U>(
         Phase::ChunkedBody { .. } => scan_step(buf, conn, cfg),
         Phase::Head => {
             // In this phase the buffer front IS the head region, so the
-            // method prefix is sound to read here — unlike at delivery,
+            // method prefix is sound to read here - unlike at delivery,
             // where the dance may have consumed the head already.
             let head_only = method_is_head(buf);
             match frame_facts(buf) {
@@ -444,7 +444,7 @@ fn scan_step<U>(
         // Nothing about the request is knowable here, so no HEAD flag.
         return fail(&mut conn.phase, buf.len(), 500, false);
     };
-    // The head bytes are still at hand — stashed by the dance, or at the
+    // The head bytes are still at hand - stashed by the dance, or at the
     // buffer front when the head was never consumed. Read the method now;
     // at delivery the buffer may hold body bytes alone.
     let head_only = match stash {
@@ -474,7 +474,7 @@ fn scan_step<U>(
                 return fail(&mut conn.phase, buf.len(), 413, head_only);
             }
             // A single arrival can complete without ever taking the Ok(None)
-            // branch above, so the wire cap must hold here too — or the same
+            // branch above, so the wire cap must hold here too - or the same
             // bytes pass or fail on TCP segmentation alone.
             if extent > cfg.max_body.saturating_add(CHUNK_WIRE_OVERHEAD) {
                 return fail(&mut conn.phase, buf.len(), 400, head_only);
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn expect_on_http10_is_ignored() {
-        // RFC 9110 §10.1.1: no interim responses to a 1.0 client — the
+        // RFC 9110 sec. 10.1.1: no interim responses to a 1.0 client - the
         // request frames as one ordinary message, no dance.
         let mut c = conn();
         let req =
@@ -701,7 +701,7 @@ mod tests {
     #[test]
     fn over_cap_head_keeps_the_promised_431() {
         // A host-less head is a 400, but this one only completes past the
-        // cap — no verdict was reachable within it, so the cap's promised
+        // cap - no verdict was reachable within it, so the cap's promised
         // 431 wins over the screen that fired on past-the-cap bytes.
         let small = HttpConfig {
             max_head: 64,
@@ -741,7 +741,7 @@ mod tests {
     #[test]
     fn chunked_single_arrival() {
         // Head + whole chunked body in one buffer: the framer must scan and
-        // complete in the same call (`More` would stall — no bytes follow).
+        // complete in the same call (`More` would stall - no bytes follow).
         let mut c = conn();
         let head =
             b"PUT /k HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
@@ -871,7 +871,7 @@ mod tests {
     fn chunked_wire_overhead_fails_400_on_completion() {
         // The same wire shape with its terminal chunk in the same call: the
         // scan completes rather than reporting progress, and the wire cap
-        // must fire on the completion branch too — the verdict cannot
+        // must fire on the completion branch too - the verdict cannot
         // depend on how the bytes were segmented.
         let mut c = conn();
         let small = HttpConfig {
@@ -892,7 +892,7 @@ mod tests {
     #[test]
     fn head_flag_survives_leading_empty_lines() {
         // httparse skips empty lines before the request line (RFC 9112
-        // §2.2), so `\r\nHEAD ...` parses as a HEAD; the failure flag must
+        // sec. 2.2), so `\r\nHEAD ...` parses as a HEAD; the failure flag must
         // agree, or this farewell carries a body the client reads as the
         // next response's head.
         let mut c = conn();
@@ -953,7 +953,7 @@ mod tests {
     fn pipelined_next_head_frames_cleanly() {
         let mut c = conn();
         // After a complete message is consumed, the framer starts over on
-        // the remaining bytes — simulate the reactor's consume-and-recheck.
+        // the remaining bytes - simulate the reactor's consume-and-recheck.
         let two = b"GET /a HTTP/1.1\r\nHost: h\r\n\r\nGET /b HTTP/1.1\r\nHost: h\r\n\r\n";
         let first = b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n".len();
         assert_eq!(

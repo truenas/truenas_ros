@@ -1,17 +1,17 @@
 //! Offloading the body handler to a worker pool with `Response::Defer`.
 //!
-//! The library ships **no** thread pool — you bring your own (rayon, tokio, a
-//! threadpool crate, …). This example uses a tiny std one to stay dependency
+//! The library ships **no** thread pool - you bring your own (rayon, tokio, a
+//! threadpool crate, ...). This example uses a tiny std one to stay dependency
 //! free. The pattern:
 //!
 //!  1. the body handler copies the OWNED inputs a worker needs (never a borrow
-//!     of connection state — that stays on the ring thread, so nothing to lock),
+//!     of connection state - that stays on the ring thread, so nothing to lock),
 //!  2. detaches a `Deferred` from its `Responder` and hands it to the pool,
 //!  3. returns `Response::Defer`, so the single io_uring thread goes straight
 //!     back to polling instead of blocking on the work.
 //!
 //! The worker computes the reply and calls `Deferred::reply`, which queues it and
-//! wakes the server; the server sends it on the originating connection — or drops
+//! wakes the server; the server sends it on the originating connection - or drops
 //! it safely if that connection closed while the worker ran (the `Deferred`
 //! carries a slot+generation token, not a pointer).
 //!
@@ -37,7 +37,7 @@ fn frame(payload: &[u8]) -> Vec<u8> {
 
 /// A minimal fixed-size worker pool built from std: one channel per worker,
 /// round-robin dispatch (so no receiver is shared under a lock). A real service
-/// would use rayon/tokio/etc. — the server doesn't care which.
+/// would use rayon/tokio/etc. - the server doesn't care which.
 struct Pool {
     txs: Vec<mpsc::Sender<Box<dyn FnOnce() + Send>>>,
     next: AtomicUsize,

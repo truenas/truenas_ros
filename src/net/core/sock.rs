@@ -18,7 +18,7 @@ pub(crate) struct SockAddr {
     pub len: libc::socklen_t,
 }
 
-/// `offsetof(struct sockaddr_un, sun_path)` — `sun_family` is the only field
+/// `offsetof(struct sockaddr_un, sun_path)` - `sun_family` is the only field
 /// before it, so this is `sizeof(sockaddr_un) - sizeof(sun_path)` (== 2).
 fn sun_path_offset() -> usize {
     size_of::<libc::sockaddr_un>() - 108
@@ -109,8 +109,8 @@ pub(crate) fn build_sockaddr(addr: &ServerAddr) -> crate::Result<SockAddr> {
     Ok(SockAddr { storage, len })
 }
 
-/// Decode an `AF_INET`/`AF_INET6` `sockaddr_storage` — dispatched on its own
-/// `ss_family` — into a `SocketAddr`. `None` for any other family. The one
+/// Decode an `AF_INET`/`AF_INET6` `sockaddr_storage` - dispatched on its own
+/// `ss_family` - into a `SocketAddr`. `None` for any other family. The one
 /// unsafe sockaddr decoder: `parse_peer`, `peer_from_fd`, and `local_addr`
 /// all funnel through here.
 pub(crate) fn parse_inet(
@@ -139,7 +139,7 @@ pub(crate) fn parse_inet(
             Some(SocketAddr::V6(SocketAddrV6::new(
                 Ipv6Addr::from(sin6.sin6_addr.s6_addr),
                 u16::from_be(sin6.sin6_port),
-                // Verbatim (no swap) — see `build_sockaddr`: std treats
+                // Verbatim (no swap) - see `build_sockaddr`: std treats
                 // `sin6_flowinfo` as an opaque pass-through in both
                 // directions, and interop (comparing against std's
                 // `peer_addr()`) requires matching that.
@@ -161,8 +161,8 @@ pub(crate) fn parse_peer(
         // separately by the server before the accept handler runs.
         ServerAddr::Unix(_) => Some(ClientAddr::Unix { cred: None }),
         // TCP listeners: decode by the address's own family. A pad that does
-        // not parse as `AF_INET`/`AF_INET6` — a short or rewritten peer-name
-        // result, e.g. from a cgroup getsockopt BPF program — yields `None` so
+        // not parse as `AF_INET`/`AF_INET6` - a short or rewritten peer-name
+        // result, e.g. from a cgroup getsockopt BPF program - yields `None` so
         // the caller sheds, rather than fabricating a local `Unix` identity for
         // a remote peer (fail closed, matching `peer_from_fd`).
         ServerAddr::Tcp(_) | ServerAddr::Tcp6(_) => {
@@ -171,12 +171,12 @@ pub(crate) fn parse_peer(
     }
 }
 
-/// The peer address of a connected socket via `getpeername(2)` — used for
+/// The peer address of a connected socket via `getpeername(2)` - used for
 /// kTLS connections, whose peer is read from the furnished real fd rather
 /// than an accept buffer. kTLS listeners are validated TCP, so the peer MUST
 /// parse as `AF_INET`/`AF_INET6`; a getpeername failure (e.g. `ENOTCONN`
 /// after an early RST) or any other family returns `None` and the caller
-/// sheds — fail CLOSED, like the `SO_PEERNAME` accept path. Returning a
+/// sheds - fail CLOSED, like the `SO_PEERNAME` accept path. Returning a
 /// fabricated identity here (a `Unix { cred: None }` fallback) would let a
 /// remote TCP peer read as a local unix one to per-listener policy and audit
 /// hooks.
@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn flowinfo_passes_through_unswapped() {
         // std stores `sin6_flowinfo` verbatim in both its to-C and from-C
-        // conversions, so this module must too — a byte swap on either side
+        // conversions, so this module must too - a byte swap on either side
         // makes the kernel see a different flow label than the same
         // SocketAddrV6 bound via std::net, and makes peers surfaced in
         // ClientAddr compare unequal to std's `peer_addr()` for the very

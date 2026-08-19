@@ -2,9 +2,9 @@
 //! expose, and the three syscall wrappers (`io_uring_setup`/`enter`/`register`).
 //!
 //! Every struct here mirrors `include/uapi/linux/io_uring.h` byte-for-byte; the
-//! `const _: () = assert!(size_of…)` guards catch any layout drift at compile
-//! time. This is the crate's only direct contact with the io_uring kernel ABI —
-//! the analogue of the local `#[repr(C)]` structs + raw `libc::syscall` in
+//! `const _: () = assert!(size_of...)` guards catch any layout drift at compile
+//! time. This is the crate's only direct contact with the io_uring kernel ABI
+//! -- the analogue of the local `#[repr(C)]` structs + raw `libc::syscall` in
 //! `namespace.rs`.
 
 // A raw-ABI module: some constants document the kernel interface without being
@@ -18,10 +18,10 @@ use std::os::fd::{OwnedFd, RawFd};
 use std::ptr;
 
 // -------------------------------------------------------------------------
-// Structs (offsets/sizes verified against io_uring.h; identical on 6.12–6.18)
+// Structs (offsets/sizes verified against io_uring.h; identical on 6.12-6.18)
 // -------------------------------------------------------------------------
 
-/// `struct io_uring_sqe` — a submission-queue entry (64 bytes).
+/// `struct io_uring_sqe` - a submission-queue entry (64 bytes).
 ///
 /// The kernel struct is a stack of same-sized unions; we flatten it to one
 /// field per union (the overlay we actually use). Every field lands at its
@@ -47,7 +47,7 @@ pub(crate) struct IoUringSqe {
 const _: () = assert!(core::mem::size_of::<IoUringSqe>() == 64);
 const _: () = assert!(core::mem::align_of::<IoUringSqe>() == 8);
 
-/// `struct io_uring_cqe` — a completion-queue entry (16 bytes).
+/// `struct io_uring_cqe` - a completion-queue entry (16 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct IoUringCqe {
@@ -57,7 +57,7 @@ pub(crate) struct IoUringCqe {
 }
 const _: () = assert!(core::mem::size_of::<IoUringCqe>() == 16);
 
-/// `struct io_sqring_offsets` (40 bytes) — byte offsets into the SQ mmap.
+/// `struct io_sqring_offsets` (40 bytes) - byte offsets into the SQ mmap.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct IoSqringOffsets {
@@ -73,7 +73,7 @@ pub(crate) struct IoSqringOffsets {
 }
 const _: () = assert!(core::mem::size_of::<IoSqringOffsets>() == 40);
 
-/// `struct io_cqring_offsets` (40 bytes) — byte offsets into the CQ mmap.
+/// `struct io_cqring_offsets` (40 bytes) - byte offsets into the CQ mmap.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct IoCqringOffsets {
@@ -89,7 +89,7 @@ pub(crate) struct IoCqringOffsets {
 }
 const _: () = assert!(core::mem::size_of::<IoCqringOffsets>() == 40);
 
-/// `struct io_uring_params` (120 bytes) — in/out argument to `io_uring_setup`.
+/// `struct io_uring_params` (120 bytes) - in/out argument to `io_uring_setup`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct IoUringParams {
@@ -106,7 +106,7 @@ pub(crate) struct IoUringParams {
 }
 const _: () = assert!(core::mem::size_of::<IoUringParams>() == 120);
 
-/// `struct io_uring_rsrc_register` (32 bytes) — arg for `IORING_REGISTER_FILES2`.
+/// `struct io_uring_rsrc_register` (32 bytes) - arg for `IORING_REGISTER_FILES2`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct IoUringRsrcRegister {
@@ -118,7 +118,7 @@ pub(crate) struct IoUringRsrcRegister {
 }
 const _: () = assert!(core::mem::size_of::<IoUringRsrcRegister>() == 32);
 
-/// `struct io_uring_file_index_range` (16 bytes) — arg for
+/// `struct io_uring_file_index_range` (16 bytes) - arg for
 /// `IORING_REGISTER_FILE_ALLOC_RANGE`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -129,7 +129,7 @@ pub(crate) struct IoUringFileIndexRange {
 }
 const _: () = assert!(core::mem::size_of::<IoUringFileIndexRange>() == 16);
 
-/// `struct io_uring_rsrc_update` (16 bytes) — arg for
+/// `struct io_uring_rsrc_update` (16 bytes) - arg for
 /// `IORING_REGISTER_FILES_UPDATE`. `data` points to an array of `nr_args` fds to
 /// install starting at registered-file slot `offset`; the kernel `fget`s its own
 /// reference to each, so the caller may close the fd after the call returns.
@@ -144,7 +144,7 @@ pub(crate) struct IoUringRsrcUpdate {
 #[cfg(any(feature = "net-client", feature = "uring-fs"))]
 const _: () = assert!(core::mem::size_of::<IoUringRsrcUpdate>() == 16);
 
-/// `struct __kernel_timespec` — the 16-byte timespec io_uring timeout ops read
+/// `struct __kernel_timespec` - the 16-byte timespec io_uring timeout ops read
 /// from `sqe.addr`. The kernel copies it at prep time, so it need only be valid
 /// at submission.
 #[repr(C)]
@@ -174,7 +174,7 @@ pub(crate) const IORING_OP_FSYNC: u8 = 3;
 /// packing: `sqe.off` = offset, **`sqe.addr` = length**, **`sqe.len` =
 /// mode** (`FALLOC_FL_*`). Always io-wq (`REQ_F_FORCE_ASYNC`).
 pub(crate) const IORING_OP_FALLOCATE: u8 = 17;
-/// `statx` — **path-based only**: `sqe.fd` is a real dirfd (the prep
+/// `statx` - **path-based only**: `sqe.fd` is a real dirfd (the prep
 /// rejects fixed files) and the path is `getname`d at prep, so there is no
 /// statx of a registered-table file. `AT_EMPTY_PATH` with an empty path
 /// stats the dirfd itself. `sqe.len` = mask, `sqe.statx_flags`
@@ -206,7 +206,7 @@ pub(crate) const IORING_OP_LINK_TIMEOUT: u8 = 15;
 pub(crate) const IORING_OP_CONNECT: u8 = 16;
 pub(crate) const IORING_OP_CLOSE: u8 = 19;
 pub(crate) const IORING_OP_READ: u8 = 22;
-/// `openat2(2)` as a ring op: `fd` = dirfd (a REAL fd — the prep rejects
+/// `openat2(2)` as a ring op: `fd` = dirfd (a REAL fd - the prep rejects
 /// fixed dirfds with `-EBADF`), `addr` = path, `addr2` = `&open_how`,
 /// `len` = `sizeof(open_how)` (24), and `file_index` = slot+1 installs the
 /// opened file directly into the registered table (CQE `res` = 0 on an
@@ -215,14 +215,14 @@ pub(crate) const IORING_OP_READ: u8 = 22;
 pub(crate) const IORING_OP_OPENAT2: u8 = 28;
 pub(crate) const IORING_OP_SEND: u8 = 26;
 pub(crate) const IORING_OP_RECV: u8 = 27;
-/// Move bytes between a pipe and another fd without a userspace copy — used to
+/// Move bytes between a pipe and another fd without a userspace copy - used to
 /// splice a framed message body straight from the socket to a consumer pipe.
 pub(crate) const IORING_OP_SPLICE: u8 = 30;
 pub(crate) const IORING_OP_SHUTDOWN: u8 = 34;
 pub(crate) const IORING_OP_URING_CMD: u8 = 46;
 /// Materialize a real (installed) fd from a direct/registered descriptor
-/// (Linux ≥ 6.8). The new fd rides in the CQE `res`; flags go in
-/// `install_fd_flags`, which overlays `op_flags` (the @28 union) here — left
+/// (Linux >= 6.8). The new fd rides in the CQE `res`; flags go in
+/// `install_fd_flags`, which overlays `op_flags` (the @28 union) here - left
 /// zero for the default `O_CLOEXEC`.
 pub(crate) const IORING_OP_FIXED_FD_INSTALL: u8 = 54;
 
@@ -241,14 +241,14 @@ pub(crate) const TLS_GET_RECORD_TYPE: i32 = 2;
 /// delivers as plain bytes; anything else is a control record we shed on).
 pub(crate) const TLS_RECORD_TYPE_DATA: u8 = 23;
 
-/// `SOCKET_URING_OP_SIOCOUTQ` — `URING_CMD` sub-op: bytes queued to send
+/// `SOCKET_URING_OP_SIOCOUTQ` - `URING_CMD` sub-op: bytes queued to send
 /// (`prot->ioctl(sk, SIOCOUTQ)`); takes no operands, CQE `res` = the count or
 /// `-errno`. Used only as a construction-time capability probe: it answers
 /// "does this kernel route socket `URING_CMD`s for this protocol?" with no
 /// bind/connect needed.
 pub(crate) const SOCKET_URING_OP_SIOCOUTQ: u32 = 1;
 
-/// `SOCKET_URING_OP_GETSOCKOPT` — `URING_CMD` sub-op on a socket (`cmd_net.c`;
+/// `SOCKET_URING_OP_GETSOCKOPT` - `URING_CMD` sub-op on a socket (`cmd_net.c`;
 /// `SOL_SOCKET` only). The cmd SQE overlays fields we already declare:
 /// `cmd_op` @8 (`off_addr2` low half), `level` @16 / `optname` @20 (`addr` low/
 /// high halves on LE), `optlen` @44 (`file_index`), `optval` @48 (`addr3`).
@@ -275,7 +275,7 @@ pub(crate) const IORING_OP_SYMLINKAT: u8 = 38;
 pub(crate) const IORING_OP_LINKAT: u8 = 39;
 
 // Extended attributes. The `f*` forms take `needs_file` and **do** accept
-// registered-table files (`IOSQE_FIXED_FILE`) — while still performing a
+// registered-table files (`IOSQE_FIXED_FILE`) - while still performing a
 // full per-op credential check in `xattr_permission`. The path-based forms
 // (`SETXATTR = 42`, `GETXATTR = 44`) are deliberately absent: the kernel
 // hardcodes their resolution to `AT_FDCWD` + `LOOKUP_FOLLOW`, which cannot
@@ -283,12 +283,12 @@ pub(crate) const IORING_OP_LINKAT: u8 = 39;
 /// `fd` = file, `addr` = name, `addr2` = value, `len` = size,
 /// `op_flags` = `XATTR_CREATE`/`XATTR_REPLACE`.
 pub(crate) const IORING_OP_FSETXATTR: u8 = 41;
-/// `fd` = file, `addr` = name, `addr2` = value buffer (written at issue —
+/// `fd` = file, `addr` = name, `addr2` = value buffer (written at issue --
 /// must live to the CQE), `len` = size; `op_flags` must be 0. CQE `res` is
 /// the attribute's size.
 pub(crate) const IORING_OP_FGETXATTR: u8 = 43;
 /// Truncate an fd (**`sqe.off` = the new length**; every other operand
-/// must be zero). Linux ≥ 6.9 — the one op above this crate's other
+/// must be zero). Linux >= 6.9 - the one op above this crate's other
 /// io_uring floors, so it is probed individually.
 pub(crate) const IORING_OP_FTRUNCATE: u8 = 55;
 
@@ -300,7 +300,7 @@ pub(crate) const IORING_FSYNC_DATASYNC: u32 = 1;
 pub(crate) const IOSQE_FIXED_FILE: u8 = 1 << 0;
 
 /// `sqe.flags`: link the following SQE to this one, so it runs only after this
-/// completes — used to attach a trailing `IORING_OP_LINK_TIMEOUT` that bounds
+/// completes - used to attach a trailing `IORING_OP_LINK_TIMEOUT` that bounds
 /// this op's lifetime.
 pub(crate) const IOSQE_IO_LINK: u8 = 1 << 2;
 
@@ -312,7 +312,7 @@ pub(crate) const IORING_FILE_INDEX_ALLOC: u32 = u32::MAX;
 
 /// `sqe.op_flags` for ASYNC_CANCEL. `ANY` matches every outstanding request;
 /// `ALL` cancels all matches, not just the first; `FD`+`FD_FIXED` key the match
-/// on the SQE's `fd` read as a registered (fixed) descriptor index — so a
+/// on the SQE's `fd` read as a registered (fixed) descriptor index - so a
 /// single cancel reaps a connection's recv and send together, whatever their
 /// opcode.
 pub(crate) const IORING_ASYNC_CANCEL_ALL: u32 = 1 << 0;
@@ -323,7 +323,7 @@ pub(crate) const IORING_ASYNC_CANCEL_FD_FIXED: u32 = 1 << 3;
 /// `splice(2)` flags in `sqe.op_flags` (the `splice_flags` overlay) for
 /// `IORING_OP_SPLICE`: `MOVE` moves pages rather than copying, and `FD_IN_FIXED`
 /// marks the **input** fd (`splice_fd_in`, overlaying `file_index`) as a
-/// registered/fixed descriptor — set when splicing FROM the connection's pool
+/// registered/fixed descriptor - set when splicing FROM the connection's pool
 /// socket.
 pub(crate) const SPLICE_F_MOVE: u32 = 1;
 pub(crate) const SPLICE_F_FD_IN_FIXED: u32 = 1 << 31;
@@ -345,7 +345,7 @@ pub(crate) const IORING_OFF_CQ_RING: i64 = 0x0800_0000;
 pub(crate) const IORING_OFF_SQES: i64 = 0x1000_0000;
 
 // `io_uring_register` opcodes + flags.
-/// Install fds into an already-registered file table at chosen slots — a client
+/// Install fds into an already-registered file table at chosen slots - a client
 /// places a freshly-`connect`ed socket into its pool this way (the server's pool
 /// is auto-allocated by multishot accept; a client must update explicitly).
 #[cfg(any(feature = "net-client", feature = "uring-fs"))]
@@ -353,7 +353,7 @@ pub(crate) const IORING_REGISTER_FILES_UPDATE: u32 = 6;
 pub(crate) const IORING_REGISTER_PROBE: u32 = 8;
 /// Snapshot the **calling task's** credentials (fsuid/fsgid, groups,
 /// capabilities, keyrings, LSM label) into a ring-local personality; the
-/// syscall's return value **is** the id (`u16`, never 0 — the personalities
+/// syscall's return value **is** the id (`u16`, never 0 - the personalities
 /// xarray is `XA_FLAGS_ALLOC1`, allocated cyclically with no immediate
 /// reuse). Stamped into `sqe.personality`, it runs that op under the
 /// snapshot via `override_creds` (inline and io-wq alike).
@@ -364,17 +364,17 @@ pub(crate) const IORING_REGISTER_FILES2: u32 = 13;
 pub(crate) const IORING_REGISTER_FILE_ALLOC_RANGE: u32 = 25;
 pub(crate) const IORING_RSRC_REGISTER_SPARSE: u32 = 1 << 0;
 
-/// `io_uring_setup` flag: restrict submission — and `io_uring_register`, via
-/// the `-EEXIST` gate in `register.c` — to the creating task. **Never set by
+/// `io_uring_setup` flag: restrict submission - and `io_uring_register`, via
+/// the `-EEXIST` gate in `register.c` - to the creating task. **Never set by
 /// this crate's rings**: the fs reactor's credential broker must be able to
-/// register personalities on a ring from outside (fs-reactor design §6.3).
+/// register personalities on a ring from outside (fs-reactor design sec. 6.3).
 /// Declared for the regression probe that pins the gate's behavior.
 pub(crate) const IORING_SETUP_SINGLE_ISSUER: u32 = 1 << 12;
 
 // `io_uring_probe_op.flags`: the opcode is supported by this kernel.
 pub(crate) const IO_URING_OP_SUPPORTED: u16 = 1 << 0;
 
-/// `struct io_uring_probe_op` (8 bytes) — one per-opcode entry filled by
+/// `struct io_uring_probe_op` (8 bytes) - one per-opcode entry filled by
 /// `IORING_REGISTER_PROBE`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -450,7 +450,7 @@ pub(crate) fn io_uring_enter(
 }
 
 /// `io_uring_register(2)`: raw form returning the syscall's value. Most
-/// register opcodes return 0 on success, but a few return data —
+/// register opcodes return 0 on success, but a few return data --
 /// `REGISTER_PERSONALITY`'s return *is* the personality id.
 ///
 /// # Safety
@@ -492,7 +492,7 @@ pub(crate) unsafe fn io_uring_register(
 
 /// Register the calling task's current credentials as a ring personality and
 /// return its id. The kernel guarantees a nonzero id (`XA_FLAGS_ALLOC1` on
-/// the personalities xarray) — 0 remains the "submitter's ambient creds" SQE
+/// the personalities xarray) - 0 remains the "submitter's ambient creds" SQE
 /// sentinel; a 0 return is refused here so the invariant is load-bearing.
 pub(crate) fn register_personality(ring_fd: RawFd) -> errno::Result<u16> {
     // SAFETY: REGISTER_PERSONALITY takes no argument (NULL, nr_args 0); the
@@ -529,7 +529,7 @@ pub(crate) fn unregister_personality(
     }
 }
 
-/// Register a sparse (all-`-1`) file table of `count` slots — the connection
+/// Register a sparse (all-`-1`) file table of `count` slots - the connection
 /// "pool" that multishot accept auto-allocates into.
 pub(crate) fn register_files_sparse(
     ring_fd: RawFd,
@@ -561,7 +561,7 @@ pub(crate) fn register_file_alloc_range(
     let range = IoUringFileIndexRange { off, len, resv: 0 };
     // SAFETY: FILE_ALLOC_RANGE reads one `io_uring_file_index_range` via its
     // own sizeof; the kernel requires `nr_args == 0` (register.c: `if (!arg ||
-    // nr_args) break` → -EINVAL).
+    // nr_args) break` -> -EINVAL).
     unsafe {
         io_uring_register(
             ring_fd,

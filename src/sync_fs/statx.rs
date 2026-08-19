@@ -1,4 +1,4 @@
-//! `statx(2)` — extended file attributes.
+//! `statx(2)` - extended file attributes.
 
 use super::AtFlags;
 use crate::errno::{self, retry_on_eintr};
@@ -8,7 +8,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 tn_bitflags! {
-    /// `STATX_*` — the set of fields requested from / returned by `statx`.
+    /// `STATX_*` - the set of fields requested from / returned by `statx`.
     pub struct StatxMask: u32 {
         /// Want/got the file type bits of `stx_mode`.
         TYPE = 0x0000_0001;
@@ -54,7 +54,7 @@ tn_bitflags! {
 }
 
 tn_bitflags! {
-    /// `STATX_ATTR_*` — flags reported in [`Statx::attributes`].
+    /// `STATX_ATTR_*` - flags reported in [`Statx::attributes`].
     pub struct StatxAttr: u64 {
         /// The file is compressed by the filesystem.
         COMPRESSED = 0x0000_0004;
@@ -255,7 +255,7 @@ impl Statx {
         self.0.stx_mnt_id
     }
 
-    /// Subvolume identifier — **btrfs only**.
+    /// Subvolume identifier - **btrfs only**.
     ///
     /// A btrfs inode number is unique only within its subvolume, so two files
     /// in different subvolumes of one filesystem can share an `st_ino`. btrfs
@@ -268,7 +268,7 @@ impl Statx {
     ///
     /// **btrfs is the only filesystem in the kernel that fills this**
     /// (`fs/btrfs/inode.c`, `btrfs_getattr`). ZFS in particular does not, so
-    /// this is *not* a way to identify a dataset — use the device number, or
+    /// this is *not* a way to identify a dataset - use the device number, or
     /// [`StatxAttr::MOUNT_ROOT`] in [`attributes`](Self::attributes) to
     /// recognise a mount root.
     ///
@@ -279,7 +279,7 @@ impl Statx {
         self.0.stx_subvol
     }
 
-    /// The inode's change cookie — the NFSv4 change attribute, a per-inode
+    /// The inode's change cookie - the NFSv4 change attribute, a per-inode
     /// counter the kernel bumps on every content or metadata modification.
     ///
     /// `None` unless [`StatxMask::CHANGE_COOKIE`] was requested *and* the
@@ -288,7 +288,7 @@ impl Statx {
     /// from an unmodified file rather than silently reading as `0`).
     ///
     /// This is the exact validator for anything derived from a file and
-    /// cached elsewhere — a checksum, a parsed ACL, a directory's sorted
+    /// cached elsewhere - a checksum, a parsed ACL, a directory's sorted
     /// entry list. Comparing it beats comparing `(size, mtime)`, which is a
     /// timestamp-granularity heuristic. Note the value is only meaningful
     /// within one filesystem instance: it is not preserved across a

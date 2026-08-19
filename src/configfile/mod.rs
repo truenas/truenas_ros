@@ -25,8 +25,8 @@
 //! # Secret-bearing files
 //!
 //! A configuration built with [`ConfigFile::scrubbed`] burns every buffer
-//! this module allocates for it — the file image, the parse accumulators,
-//! the stored keys and values, and the serialization buffer — with a
+//! this module allocates for it - the file image, the parse accumulators,
+//! the stored keys and values, and the serialization buffer - with a
 //! volatile zeroing pass as each is released, so dropping the
 //! configuration leaves no heap copies behind.
 //! With the `secrets` feature, [`ConfigFile::read_secret_path`] additionally
@@ -34,15 +34,15 @@
 //! ordinary heap entirely.
 //!
 //! The guarantee's edges are stated rather than implied. Stored values are
-//! ordinary heap memory while the configuration lives — swappable, and
-//! visible in a core dump — so a long-lived secret belongs in
+//! ordinary heap memory while the configuration lives - swappable, and
+//! visible in a core dump - so a long-lived secret belongs in
 //! [`Secret`](crate::secrets::Secret), moved there promptly from
 //! [`get_raw`](ConfigFile::get_raw). Whatever an accessor returns
 //! ([`get`](ConfigFile::get), [`items`](ConfigFile::items),
 //! [`write_string`](ConfigFile::write_string)) is the caller's copy and the
 //! caller's to burn, as is a [`read_str`](ConfigFile::read_str) input
-//! buffer. Interpolation intermediates are not chased — [`raw`][ConfigFile::raw]
-//! is the secrets configuration — nor are transient key copies in parse
+//! buffer. Interpolation intermediates are not chased - [`raw`][ConfigFile::raw]
+//! is the secrets configuration - nor are transient key copies in parse
 //! control state, and the kernel's page cache retains what was read from
 //! disk regardless of anything a process does.
 //!
@@ -86,8 +86,8 @@ enum Interp {
 
 /// A minimal insertion-ordered, string-keyed map.
 ///
-/// `entries` preserves insertion order — the Python `dict`-assignment semantics
-/// `configparser`'s ordering relies on — and `index` maps each key to its
+/// `entries` preserves insertion order - the Python `dict`-assignment semantics
+/// `configparser`'s ordering relies on - and `index` maps each key to its
 /// position so lookups and the upsert [`insert`](Ordered::insert) are O(1)
 /// rather than a scan. Without the index, parsing an untrusted config with very
 /// many keys in one section would be quadratic.
@@ -165,8 +165,8 @@ impl<V> Ordered<V> {
         self.entries.iter().map(|(k, _)| k.as_str())
     }
 
-    /// Burn the store at end of life: every key — the entries' and the
-    /// index's copies — and each value through `burn`. The one burn walk;
+    /// Burn the store at end of life: every key - the entries' and the
+    /// index's copies - and each value through `burn`. The one burn walk;
     /// every scrubbing release goes through it so a missed copy cannot
     /// drift in on one path. The index is drained, so only dropping the
     /// map should follow.
@@ -197,7 +197,7 @@ pub struct ConfigFile {
 }
 
 /// Prints the full structure for an ordinary configuration; a scrubbed one
-/// prints shape only — a secrets-bearing configuration reaching a log must
+/// prints shape only - a secrets-bearing configuration reaching a log must
 /// not carry its values.
 impl std::fmt::Debug for ConfigFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -230,7 +230,7 @@ impl Drop for ConfigFile {
     }
 }
 
-/// Burn a string's whole allocation, spare capacity included — a truncated
+/// Burn a string's whole allocation, spare capacity included - a truncated
 /// value keeps its old tail bytes past `len`.
 ///
 /// Zero bytes are valid UTF-8, so the string stays sound until it drops.
@@ -298,16 +298,16 @@ impl ConfigFile {
         self
     }
 
-    /// Burn every buffer this configuration allocates — the file image,
-    /// parse accumulators, and stored keys and values — with a volatile
+    /// Burn every buffer this configuration allocates - the file image,
+    /// parse accumulators, and stored keys and values - with a volatile
     /// zeroing pass as each is released, the whole store included when the
     /// configuration drops. For files that carry secrets; see the module
     /// docs for exactly where the guarantee ends. Off by default.
     ///
     /// Parsing and every accessor behave identically either way, with two
-    /// exceptions. Error messages withhold what came out of the file —
+    /// exceptions. Error messages withhold what came out of the file --
     /// the value a typed getter or interpolation would quote, and the
-    /// duplicated key or section name a parse error would name — since
+    /// duplicated key or section name a parse error would name - since
     /// for a credentials file none of it may reach a log. And a scrubbed
     /// read refuses a non-regular file, whose stat size cannot pre-size
     /// the single burned buffer.
@@ -344,7 +344,7 @@ impl ConfigFile {
     /// fixed buffer sized from the file's length (never reallocated, so
     /// no freed copy escapes the burn), newlines normalized in place
     /// instead of by copy, and the buffer burned to its full capacity on
-    /// every exit — the UTF-8 and parse failures included. Only a
+    /// every exit - the UTF-8 and parse failures included. Only a
     /// regular file is accepted; see [`regular_file_len`].
     fn read_path_scrubbed(&mut self, path: &Path) -> Result<()> {
         let mut file = safe_open(
@@ -366,14 +366,14 @@ impl ConfigFile {
 
     /// Read and parse `path` with the raw file image staged in
     /// `memfd_secret`-backed memory
-    /// ([`SecretMem`](crate::secrets::SecretMem)) — off the kernel's direct
-    /// map, off swap, absent from core dumps — and burned when the read
+    /// ([`SecretMem`](crate::secrets::SecretMem)) - off the kernel's direct
+    /// map, off swap, absent from core dumps - and burned when the read
     /// ends. The image never touches the ordinary heap.
     ///
     /// Reading this way marks the configuration
     /// [`scrubbed`](Self::scrubbed): the parse output it produces will be
     /// burned on release like the image was. Only a regular file is
-    /// accepted — nothing else has a stat size the staging region can be
+    /// accepted - nothing else has a stat size the staging region can be
     /// sized from.
     ///
     /// Fails where `memfd_secret` is unavailable rather than degrading to
@@ -400,8 +400,8 @@ impl ConfigFile {
         }
     }
 
-    /// Read each path in turn, **skipping** any that cannot be used — missing,
-    /// unreadable, a symlink component, or not a regular file — and return the
+    /// Read each path in turn, **skipping** any that cannot be used - missing,
+    /// unreadable, a symlink component, or not a regular file - and return the
     /// paths actually read, the behavior of `configparser.read([...])`. A file
     /// that opens but fails to parse (or is not UTF-8) still returns an error,
     /// and so does one that grows mid-read. Line endings are decoded as in
@@ -414,13 +414,13 @@ impl ConfigFile {
         for path in paths {
             match self.read_path(&path) {
                 Ok(()) => read.push(path),
-                // Unusable candidate — missing, permissions, a symlink
+                // Unusable candidate - missing, permissions, a symlink
                 // component, or a non-regular file (a scrubbed read refuses
                 // one, `read_path`'s doc): skip it, as `configparser` skips
                 // any `OSError` from `open`, so one bad entry cannot deny the
                 // whole load (including files already parsed). A file that
-                // opens but fails to parse — or grows mid-read
-                // (`Error::Validation`) — still aborts.
+                // opens but fails to parse - or grows mid-read
+                // (`Error::Validation`) - still aborts.
                 Err(Error::Errno(_))
                 | Err(Error::SymlinkInPath { .. })
                 | Err(Error::NotRegularFile { .. }) => continue,
@@ -439,7 +439,7 @@ impl ConfigFile {
     }
 
     /// Serialize like [`write_string`](Self::write_string), choosing whether the
-    /// delimiter is padded with spaces (`key = value` vs `key=value`) — matching
+    /// delimiter is padded with spaces (`key = value` vs `key=value`) - matching
     /// `configparser.write(space_around_delimiters=...)`.
     pub fn to_string_with(&self, space_around_delimiters: bool) -> String {
         write::to_string(self, space_around_delimiters)
@@ -486,7 +486,7 @@ impl ConfigFile {
     ///
     /// The section's own keys come first, in file order, then the `DEFAULT`
     /// keys it did not override. That is `configparser.options`, which copies
-    /// the section and `update`s it with the defaults — the opposite order
+    /// the section and `update`s it with the defaults - the opposite order
     /// from [`items`](Self::items), which builds up from the defaults instead.
     /// The two disagree in CPython and so they disagree here.
     pub fn options(&self, section: &str) -> Option<Vec<String>> {
@@ -553,15 +553,15 @@ impl ConfigFile {
     /// arbitrary-precision integer and a port of Python's numeric-literal
     /// grammar for values a config file does not plausibly contain.
     ///
-    /// Every difference runs the same way — Python accepts something this
+    /// Every difference runs the same way - Python accepts something this
     /// rejects. Neither getter returns a *different* number from the one
     /// `configparser` would, so a value that converts here converts there to
     /// the same thing.
     pub fn get_int(&self, section: &str, option: &str) -> Result<Option<i64>> {
         match self.get(section, option)? {
             None => Ok(None),
-            // The value is withheld from a scrubbed configuration's error —
-            // on such a configuration it is the secret — and the
+            // The value is withheld from a scrubbed configuration's error --
+            // on such a configuration it is the secret - and the
             // module-made copy is burned whichever way the parse goes.
             Some(mut v) => {
                 let res = v.trim().parse::<i64>().map(Some).map_err(|_| {
@@ -831,7 +831,7 @@ impl ConfigFile {
     /// The view borrows its keys and values from the configuration rather
     /// than cloning them: interpolation needs only lookup and iteration, so
     /// cloning the whole DEFAULT map plus every section value per `get` would
-    /// be pure overhead on the read path — and, under scrub, a transient
+    /// be pure overhead on the read path - and, under scrub, a transient
     /// plaintext copy of every value to burn. The borrows live as long as the
     /// `&self` every reader holds.
     fn merged_view(&self, section: &str) -> MergedView<'_> {
@@ -906,9 +906,9 @@ impl Drop for ScrubVec {
     }
 }
 
-/// Translate `\r\n` and a lone `\r` to `\n` in place — the
+/// Translate `\r\n` and a lone `\r` to `\n` in place - the
 /// universal-newline decoding Python's `open(filename)`, and so
-/// `configparser.read()`, applies — with no reallocation, so no unscrubbed
+/// `configparser.read()`, applies - with no reallocation, so no unscrubbed
 /// copy of the content is left behind. Bytes past the new length keep
 /// their old content, which is why a scrubbed buffer is burned to
 /// capacity, not length.
@@ -944,7 +944,7 @@ fn normalize_newlines_slice(buf: &mut [u8]) -> usize {
 }
 
 /// The length a scrubbed read sizes its one buffer from. Only a regular
-/// file has one: for anything else — a FIFO, a device, a proc file — the
+/// file has one: for anything else - a FIFO, a device, a proc file - the
 /// stat size does not describe the content, and a wrong pre-size either
 /// refuses a whole read as a grow or silently reads as empty.
 fn regular_file_len(file: &std::fs::File, path: &Path) -> Result<usize> {
@@ -960,8 +960,8 @@ fn regular_file_len(file: &std::fs::File, path: &Path) -> Result<usize> {
 }
 
 /// Read to end-of-file into a fixed region sized for it, returning the
-/// bytes filled. The region is never grown: content past its end — the
-/// file grew after it was sized — is refused rather than read torn or
+/// bytes filled. The region is never grown: content past its end - the
+/// file grew after it was sized - is refused rather than read torn or
 /// reallocated over, which would leave the original buffer freed
 /// unburned. `Interrupted` is retried, as `read_to_end` retries it.
 fn read_filled(file: &mut std::fs::File, buf: &mut [u8]) -> Result<usize> {
@@ -986,8 +986,8 @@ fn read_filled(file: &mut std::fs::File, buf: &mut [u8]) -> Result<usize> {
     }
 }
 
-/// Open `path` symlink-safely and stage its image — newline-normalized in
-/// place — in `memfd_secret` memory, returning the region and the
+/// Open `path` symlink-safely and stage its image - newline-normalized in
+/// place - in `memfd_secret` memory, returning the region and the
 /// content's length, or `None` for an empty file. Split from
 /// [`ConfigFile::read_secret_path`] so a test can hold the staged region
 /// and check what backs it.
@@ -1036,7 +1036,7 @@ mod tests {
     use super::*;
 
     /// The same document, default vs scrubbed: parsing, reading back, and
-    /// serialization must be indistinguishable — scrubbing changes when
+    /// serialization must be indistinguishable - scrubbing changes when
     /// buffers are burned, never what the configuration means.
     #[test]
     fn scrubbed_parses_identically() {
@@ -1083,7 +1083,7 @@ mod tests {
     }
 
     /// The in-place newline translation must match Python's two-pass
-    /// `str.replace` decoding byte for byte — `\r\r\n` and a trailing
+    /// `str.replace` decoding byte for byte - `\r\r\n` and a trailing
     /// `\r` included.
     #[test]
     fn normalize_newlines_matches_the_copying_translation() {
@@ -1247,7 +1247,7 @@ mod tests {
     }
 
     /// A typed getter's parse error must not quote the value out of a
-    /// scrubbed configuration — the value is the secret.
+    /// scrubbed configuration - the value is the secret.
     #[test]
     fn typed_getter_errors_withhold_the_value_when_scrubbed() {
         let doc = "[s]\nn = sw0rdf1sh\n";
@@ -1357,7 +1357,7 @@ mod tests {
     #[test]
     fn read_paths_skips_a_non_regular_file() {
         // A non-regular candidate is skipped like a missing one, so one
-        // unusable path — an ops /dev/null slot, or an attacker-planted FIFO —
+        // unusable path - an ops /dev/null slot, or an attacker-planted FIFO --
         // cannot deny a whole multi-file load, and a file already parsed stays
         // loaded. Exercised on a scrubbed config, which refuses a non-regular
         // file; the grow-guard (also `Validation`) still aborts.

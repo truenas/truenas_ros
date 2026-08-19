@@ -11,8 +11,8 @@ identity.
 This is the Rust equivalent of the Python `truenas_pyos` library. It is
 targeted only for TrueNAS kernel versions and depends on `libc` and
 `bitflags`, with `httparse` the single exception, optional and reached only by
-the `http` feature's request-head tokenizer. It calls the kernel directly —
-glibc does not wrap most of these syscalls — exposing `bitflags`-typed flag
+the `http` feature's request-head tokenizer. It calls the kernel directly --
+glibc does not wrap most of these syscalls - exposing `bitflags`-typed flag
 sets, an `Errno`-based `Result`, and `OwnedFd` / `BorrowedFd` descriptor
 ownership.
 
@@ -31,18 +31,18 @@ truenas_ros = { version = "0.1", default-features = false, features = ["sync-fs"
 | `sync-fs` | `statx`, `openat2`, `renameat2`; `safe_open`, `atomic_write` / `atomic_replace` (the `sync_fs` umbrella root; the features below through `shutil` are its submodules) |
 | `xattr` | `fgetxattr` / `fsetxattr` / `flistxattr` / `fremovexattr` |
 | `mount` | `statmount`, `listmount`, `iter_mount`, `open_tree`, `move_mount`, `mount_setattr`, `fsopen` / `fsconfig` / `fsmount`, `umount2`; higher-level `statmount_path`, `iter_mountinfo`, `umount` |
-| `acl` | NFS4 (`system.nfs4_acl_xdr`) and POSIX1E ACLs — decode / encode / validate + `fgetacl` / `fsetacl` |
+| `acl` | NFS4 (`system.nfs4_acl_xdr`) and POSIX1E ACLs - decode / encode / validate + `fgetacl` / `fsetacl` |
 | `fhandle` | `name_to_handle_at` / `open_by_handle_at` (`FileHandle`) |
 | `fsiter` | single-filesystem depth-first `Iterator` yielding owned entries |
-| `idmap` | idmapped-mount user namespaces via `clone3` (`create_idmap_userns`, cached `idmap_userns`) — lives at `mount::idmap` |
+| `idmap` | idmapped-mount user namespaces via `clone3` (`create_idmap_userns`, cached `idmap_userns`) - lives at `mount::idmap` |
 | `shutil` | metadata-preserving recursive `copytree` + copy / clone primitives |
 | `configfile` | INI config files byte-for-byte compatible with Python's `configparser`, read symlink-safely and written atomically; an opt-in scrub-on-release mode for secret-bearing files (with `secrets`, the file image stages in `memfd_secret` memory) |
-| `audit` | Kernel audit records over `NETLINK_AUDIT` — PAM-shaped `key=value` events sent straight to `auditd`, replacing libaudit |
+| `audit` | Kernel audit records over `NETLINK_AUDIT` - PAM-shaped `key=value` events sent straight to `auditd`, replacing libaudit |
 
 Three more are opt-in. An io_uring stack lives alongside the blocking
 bindings: `net-server` / `net-client` (stream roles over a shared reactor
 core, with kernel-TLS, splice, and peer-credential support), `http` (an
-HTTP/1.1 codec over the server's protocol seam — a framer and a vocabulary,
+HTTP/1.1 codec over the server's protocol seam - a framer and a vocabulary,
 not a server), and `uring-fs` (a filesystem reactor whose every operation runs
 under a kernel-enforced identity). All sit on the internal `uring` engine
 feature; see the crate docs. `secrets` is separate: `memfd_secret(2)`-backed
@@ -56,19 +56,19 @@ starts threads and so has to be chosen deliberately.
 `uring-fs` covers opens, vectored positional I/O (`preadv2` / `pwritev2`),
 `splice` from a pipe into a file, sync, the metadata and extended-attribute
 ops, cache advice (`fadvise`), the directory-entry family, and directory
-listing and subtree walks — off-loop through a blocking handle, or on the
+listing and subtree walks - off-loop through a blocking handle, or on the
 reactor thread through completion callbacks. Beyond plain syscall wrappers it
 provides what a storage
 service needs and cannot easily build itself: path resolution the caller cannot
 weaken (`open_confined`), confined `mkdir -p` (`mkdir_path`), `O_TMPFILE`
 publication (`linkat_file`), and an allowlist that lets a server keep its own
 metadata in the `trusted.` namespace, where local users cannot read or alter
-it — and a blocking-offload seam that runs a request's opcode-less metadata
+it - and a blocking-offload seam that runs a request's opcode-less metadata
 tail as one pool job, delivered back on the reactor thread.
 
 ### Identity
 
-Every `uring-fs` operation carries a `Personality` — a kernel-registered
+Every `uring-fs` operation carries a `Personality` - a kernel-registered
 credential snapshot stamped into the SQE, under which the kernel itself
 performs the permission check. There is no ambient-identity variant: the
 daemon's own identity is minted explicitly with `UringFs::register_self`, and
@@ -90,7 +90,7 @@ let who = creds.register(&AsUser::new(1000, 1000).groups(vec![4, 27]))?;
 A brokered personality carries the user's authority and no elevated
 capability. Where a service must resolve a path on behalf of a user entitled
 to the object but not to traverse every directory above it, opt in with a
-capability mask — bounded by a ceiling fixed at spawn, before the privilege
+capability mask - bounded by a ceiling fixed at spawn, before the privilege
 drop, so it cannot be widened later:
 
 ```rust
@@ -134,7 +134,7 @@ println!("{} bytes", st.size());
 
 Read and write an INI config file. Parsing matches Python's `configparser`
 exactly (verified by a differential test against the real `configparser`), but
-files are read symlink-safely and written atomically with an explicit mode —
+files are read symlink-safely and written atomically with an explicit mode --
 durability and safety that `configparser` itself leaves to the caller:
 
 ```rust
@@ -147,7 +147,7 @@ assert_eq!(cfg.get("server", "host")?.as_deref(), Some("localhost"));
 assert_eq!(cfg.get_int("server", "port")?, Some(8080));
 
 // Write it back atomically (temp file + fsync + rename), resolving no
-// symlinks, with an explicit mode — none of which configparser does itself:
+// symlinks, with an explicit mode - none of which configparser does itself:
 cfg.set_int("server", "port", 9090)?;
 let opts = AtomicWriteOptions { mode: 0o600, ..Default::default() };
 cfg.write_path("/etc/app.conf".as_ref(), opts)?;
@@ -156,7 +156,7 @@ cfg.write_path("/etc/app.conf".as_ref(), opts)?;
 ## Requirements
 
 - A TrueNAS kernel, 6.18 or newer. The floor itself is assumed rather than
-  probed — every io_uring operation this crate issues predates it — but
+  probed - every io_uring operation this crate issues predates it - but
   behaviour that needs a later point release is probed and fails loudly rather
   than degrading: a server configured for `unix_peercred` refuses to start
   below 6.18.16 (the `AF_UNIX` cmd fix), `UringFs::new` probes `OPENAT2`, and
@@ -167,7 +167,7 @@ cfg.write_path("/etc/app.conf".as_ref(), opts)?;
 
 `cargo test --all-features` runs the suite. Tests whose fixture may be absent
 skip rather than fail, which would let a mis-provisioned runner pass green
-having tested nothing — so every skip is gated on a `TRUENAS_ROS_REQUIRE_*`
+having tested nothing - so every skip is gated on a `TRUENAS_ROS_REQUIRE_*`
 variable that CI arms, turning the skip back into a hard failure:
 
 | Set to `1` | Forces |
@@ -175,7 +175,7 @@ variable that CI arms, turning the skip back into a hard failure:
 | `TRUENAS_ROS_REQUIRE_PYTHON` | the `configparser` differential tests (`test/configparser_compat.rs`), which spawn the real Python `configparser` and assert byte-for-byte and behavioural parity |
 | `TRUENAS_ROS_REQUIRE_IO_URING` | the io_uring suites (`test/net_*.rs`, `test/uring_fs.rs`, `test/http_live.rs`), which otherwise skip when a ring cannot be created |
 | `TRUENAS_ROS_REQUIRE_KTLS` | the kernel-TLS data path, which needs the `tls` ULP *and* an OpenSSL built with `enable-ktls` |
-| `TRUENAS_ROS_REQUIRE_PEERCRED` | `unix_peercred`, which needs Linux ≥ 6.18.16 |
+| `TRUENAS_ROS_REQUIRE_PEERCRED` | `unix_peercred`, which needs Linux >= 6.18.16 |
 | `TRUENAS_ROS_REQUIRE_ZFS` | the ACL suites needing a provisioned ACL-typed ZFS dataset (`test/zfs.rs`) |
 | `TRUENAS_ROS_REQUIRE_SECRETMEM` | the `secrets` tests (`test/secrets.rs`), which need `CONFIG_SECRETMEM` |
 | `TRUENAS_ROS_REQUIRE_AUDIT` | the audit tests (`test/audit.rs`), which need a `NETLINK_AUDIT` socket |
@@ -202,8 +202,8 @@ cargo +nightly fuzz run statmount_parse -- -max_total_time=300
 cargo +nightly fuzz run tree_cursor -- -dict=dicts/tree_cursor.dict
 ```
 
-Targets assert **properties**, not just the absence of a panic — decode/encode
-idempotence, total ordering, injection safety, or a privilege check holding —
+Targets assert **properties**, not just the absence of a panic - decode/encode
+idempotence, total ordering, injection safety, or a privilege check holding --
 so read a target's `//!` header for what it actually claims.
 
 **The corpus is a generated artifact, not source**, which is cargo-fuzz's own
@@ -213,9 +213,9 @@ seed from a corrupt one. They encode host byte order, because several of these
 formats use native-endian magics. And they drift silently: change a format and
 the seeds still load, they just stop covering the path they were written for.
 
-The `http_*` corpora are the exception — tracked, and owned with the codec.
+The `http_*` corpora are the exception - tracked, and owned with the codec.
 
-What seeds were doing here, measured over equal 45s runs, was 0–5%:
+What seeds were doing here, measured over equal 45s runs, was 0-5%:
 
 | target | from seeds | from empty |
 | --- | --- | --- |
@@ -225,13 +225,13 @@ What seeds were doing here, measured over equal 45s runs, was 0–5%:
 | `tree_cursor` | 78 | 78 |
 
 libFuzzer recovers a magic like `TnCk` from comparison interception in seconds,
-so the usual argument for checking seeds in — that a fuzzer will never guess
-one — does not hold. Where a token hint is genuinely wanted, it goes in
+so the usual argument for checking seeds in - that a fuzzer will never guess
+one - does not hold. Where a token hint is genuinely wanted, it goes in
 [`fuzz/dicts/`](fuzz/dicts) as plain reviewable text.
 
 **Regressions belong in `cargo test`, not in a corpus.** When a target finds
 something, fix it and pin the input as a unit test beside the code, where the
-assertion names the invariant instead of leaving a hex blob to be re-derived —
+assertion names the invariant instead of leaving a hex blob to be re-derived --
 `a_declared_string_count_cannot_size_an_allocation` in `mount/statmount.rs` and
 `entry_ids_decode_the_way_the_kernel_writes_them` in `sync_fs/acl/posix.rs` are
 both fuzz findings that now run in every `cargo test`. CI builds every target
@@ -256,7 +256,7 @@ accumulation, the graceful-drain flag publication, the inject path's refusal
 after shutdown, the offload pool's lifecycle (growth, idle retirement, drop
 quiescence, the self-join guard, lazy-init races), the offload completion
 handoff, and the credential cache's single-flight mint. `src/sync.rs` is the
-std/loom shim — outside a model build it is a
+std/loom shim - outside a model build it is a
 plain re-export, so none of this costs anything in a shipped binary.
 
 When one of these fails, loom's exploration is deterministic, so re-running the
@@ -272,7 +272,7 @@ RUSTFLAGS="--cfg loom" LOOM_LOG=trace \
 Two limits are worth knowing before adding a model. loom caps a model at 5
 threads and explores exhaustively, so models must stay small; the heavier ones
 here run under a preemption bound, which makes them bounded rather than
-exhaustive proofs. And loom only models what it provides — its `mpsc` has no
+exhaustive proofs. And loom only models what it provides - its `mpsc` has no
 sender count, so channel disconnect is not expressible, and
 `Condvar::wait_timeout` never reports a timeout, so timeout-predicated branches
 need an explicit `cfg(loom)` seam. Properties that fall outside those limits
@@ -280,4 +280,4 @@ are tested with real threads instead, and say so where they live.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT - see [`LICENSE`](LICENSE).

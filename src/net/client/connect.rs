@@ -1,4 +1,4 @@
-//! Outbound connection establishment — the one client-specific subsystem.
+//! Outbound connection establishment - the one client-specific subsystem.
 //!
 //! `connect_socket` creates the non-blocking client socket (CPython
 //! `_connect_sock` mechanics, minus DNS), which is installed into the pool and
@@ -22,7 +22,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 /// Build a `__kernel_timespec` from a duration, clamping so an over-large value
-/// can't wrap `tv_sec` negative — the kernel rejects that and cancels the
+/// can't wrap `tv_sec` negative - the kernel rejects that and cancels the
 /// timeout's linked op, inverting "never" into "instantly".
 pub(super) fn ts_of(d: Duration) -> KernelTimespec {
     KernelTimespec {
@@ -34,7 +34,7 @@ pub(super) fn ts_of(d: Duration) -> KernelTimespec {
 /// Create a non-blocking client stream socket for `domain` and apply the
 /// `cfg`'s TCP options (skipped for unix), optionally binding a local address
 /// first. **`SOCK_NONBLOCK` is load-bearing**: the reply-body splice path's
-/// `-EAGAIN` → readiness-poll slow-loris guard honors the file's `O_NONBLOCK`.
+/// `-EAGAIN` -> readiness-poll slow-loris guard honors the file's `O_NONBLOCK`.
 fn connect_socket(
     domain: libc::c_int,
     cfg: &super::ClientConfig,
@@ -90,7 +90,7 @@ fn connect_socket(
     Ok(fd)
 }
 
-/// The `ClientAddr` for a dialed address — the client knows its peer, so no
+/// The `ClientAddr` for a dialed address - the client knows its peer, so no
 /// post-connect peer fetch is needed.
 fn peer_of(addr: &ServerAddr) -> ClientAddr {
     match addr {
@@ -105,7 +105,7 @@ where
     F: FnMut(&[u8], &mut U) -> Framing,
 {
     /// Dial `addr` with a default `U`, blocking until the connection is
-    /// established, and return its [`ConnId`] — already `Serving`, so `send`
+    /// established, and return its [`ConnId`] - already `Serving`, so `send`
     /// and `request` work on it immediately (the simple
     /// `connect()?`/`request()?` path).
     ///
@@ -113,8 +113,8 @@ where
     /// for other connections seen meanwhile for a later
     /// [`next_event`](Client::next_event). Returns `Err` if the connect fails
     /// (refused, timed out, unreachable) or on a synchronous setup failure
-    /// (socket/bind, a full pool, or the ring). For the non-blocking form —
-    /// readiness delivered as an [`Event`] — see
+    /// (socket/bind, a full pool, or the ring). For the non-blocking form --
+    /// readiness delivered as an [`Event`] - see
     /// [`connect_start`](Client::connect_start).
     pub fn connect(
         &mut self,
@@ -168,7 +168,7 @@ where
         if opts.tls {
             // A `tls` connect needs the handshake hook plus a kernel that can
             // furnish a real fd (`FIXED_FD_INSTALL`, Linux >= 6.8) and run kTLS
-            // (the TLS ULP) — fail cleanly here rather than mid-handshake.
+            // (the TLS ULP) - fail cleanly here rather than mid-handshake.
             if self.tls_connect.is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -268,8 +268,8 @@ where
     }
 
     /// The blocking half of [`connect_with_state`](Client::connect_with_state):
-    /// pump the ring until `conn` reaches [`Event::Connected`] (→ `Ok(conn)`)
-    /// or [`Event::ConnectFailed`] (→ `Err`), buffering every *other*
+    /// pump the ring until `conn` reaches [`Event::Connected`] (-> `Ok(conn)`)
+    /// or [`Event::ConnectFailed`] (-> `Err`), buffering every *other*
     /// connection's events for a later [`next_event`](Client::next_event)
     /// exactly as [`request`](Client::request) does. The connect op is in
     /// flight when this is called, so the pump always resolves to one of the
@@ -299,9 +299,9 @@ where
         out
     }
 
-    /// An `IORING_OP_CONNECT` completed: `res == 0` established the connection —
+    /// An `IORING_OP_CONNECT` completed: `res == 0` established the connection --
     /// install it, emit [`Event::Connected`], and arm its first reply recv;
-    /// `res < 0` failed — emit [`Event::ConnectFailed`] and reclaim the slot
+    /// `res < 0` failed - emit [`Event::ConnectFailed`] and reclaim the slot
     /// (closing the installed descriptor).
     pub(super) fn on_connect(
         &mut self,
@@ -309,7 +309,7 @@ where
         generation: u32,
         res: i32,
     ) -> errno::Result<()> {
-        // Kernel completion → low 32 bits. A recycled slot (stale completion)
+        // Kernel completion -> low 32 bits. A recycled slot (stale completion)
         // no longer matches; a `Connecting` slot cannot recycle underneath us
         // (`reserve_connecting` skips non-`Empty` slots), so this only guards
         // an out-of-order stale CQE.
@@ -345,7 +345,7 @@ where
         } else {
             // Report the failure, then reclaim: the slot stays `Connecting`
             // (non-`Empty`, so no concurrent connect can grab it) until the
-            // CLOSE frees it — closing the installed descriptor. A cancelled
+            // CLOSE frees it - closing the installed descriptor. A cancelled
             // connect is the linked connect-timeout firing.
             let gen64 = self.core.table.generation(slot);
             let err = if res == -libc::ECANCELED {
@@ -358,7 +358,7 @@ where
                 err,
             });
             // Close the pool descriptor; `on_closed` frees the (non-serving)
-            // slot when it completes. No SHUTDOWN — the connect never
+            // slot when it completes. No SHUTDOWN - the connect never
             // established, so there is no FIN owed.
             self.core
                 .stage(pack(Op::Close, slot, generation), move |sqe| {

@@ -1,5 +1,5 @@
 //! Multi-core serving: N independent single-ring servers on one address via
-//! `SO_REUSEPORT` — the shared-nothing io_uring answer to a work-stealing
+//! `SO_REUSEPORT` - the shared-nothing io_uring answer to a work-stealing
 //! runtime.
 //!
 //! Each thread owns one [`Server`] (and thus one ring): rings are never shared
@@ -49,7 +49,7 @@ fn worker(
         reuse_port: true, // all workers bind the same address
         ..ServerConfig::default()
     };
-    // The protocol is constructed per worker — closures need not be Clone.
+    // The protocol is constructed per worker - closures need not be Clone.
     let proto = length_prefixed(
         PrefixWidth::U32,
         Endian::Big,

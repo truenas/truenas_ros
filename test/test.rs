@@ -998,7 +998,7 @@ mod shutil {
     // `security.capability` is a file capability set, so carrying it across a
     // copy would stamp privilege onto a destination whose content came from the
     // source. The kernel permits the write (it only asks for `CAP_SETFCAP`), so
-    // refusing it is the copier's job — the same refusal the asynchronous side
+    // refusing it is the copier's job - the same refusal the asynchronous side
     // makes in `PrivilegedXattrs::allow_prefix`. The `user.` attribute alongside
     // it must still arrive, or this would pass on a copy that did nothing.
     #[test]
@@ -1102,7 +1102,7 @@ mod shutil {
 
     // The kernel clears S_ISUID/S_ISGID when a non-directory is chowned
     // (`chown_common`, fs/open.c), so the copy must apply ownership before the
-    // mode for a setuid/setgid file — and for a special file — to keep both
+    // mode for a setuid/setgid file - and for a special file - to keep both
     // bits.
     #[test]
     fn preserves_setid_bits_on_files_and_specials() {
@@ -1214,7 +1214,7 @@ mod shutil {
         assert_eq!(
             std::fs::metadata(&victim).unwrap().permissions().mode() & 0o7777,
             0o600,
-            "victim's mode changed — the destination name was followed"
+            "victim's mode changed - the destination name was followed"
         );
         assert_eq!(std::fs::read(&victim).unwrap(), b"victim-content");
 
@@ -1431,8 +1431,8 @@ mod shutil {
     // The sticky bit has no ACL representation, and no chmod runs on the ACL
     // path, so an ACL-bearing sticky directory arrives without S_ISVTX. The
     // bit is given up to keep the ACL: on ZFS a chmod rewrites the ACL to
-    // match the mode — under the default aclmode=discard it replaces it
-    // outright — so restoring one bit would destroy the ACL the copy just
+    // match the mode - under the default aclmode=discard it replaces it
+    // outright - so restoring one bit would destroy the ACL the copy just
     // carried. Pinned here so the trade stays a decision.
     #[test]
     fn an_acl_bearing_sticky_directory_arrives_without_the_sticky_bit() {
@@ -1581,7 +1581,7 @@ mod shutil {
         let stats = res.expect("read-only subdirectory should be copied into");
         assert_eq!(stats.files, 1);
         assert_eq!(std::fs::read(dst.join("sub/f")).unwrap(), b"hi");
-        // The restrictive mode is still applied — just last.
+        // The restrictive mode is still applied - just last.
         assert_eq!(dst_mode, Some(0o555));
     }
 
@@ -1663,7 +1663,7 @@ mod shutil {
         std::fs::write(src.join("d1/b"), b"bb").unwrap();
         std::fs::write(src.join("d1/d2/c"), b"ccc").unwrap();
 
-        // increment=1 → one callback per entry (5) plus the final call.
+        // increment=1 -> one callback per entry (5) plus the final call.
         let mut calls = 0u32;
         let mut last = None;
         let cfg = CopyTreeConfig {
@@ -1686,7 +1686,7 @@ mod shutil {
         assert_eq!(calls, 6, "5 entries at increment 1, plus the final call");
         assert_eq!(last.unwrap(), stats, "final call carries completed stats");
 
-        // increment=0 → only the final call fires.
+        // increment=0 -> only the final call fires.
         let mut calls0 = 0u32;
         let cfg0 = CopyTreeConfig {
             reporting_increment: 0,
@@ -1715,7 +1715,7 @@ mod shutil {
             ..Default::default()
         };
         let trav = copytree(&src, &tmp.path().join("d2"), &cfg).unwrap();
-        // No child mounts nested under a tempdir → traverse is a no-op.
+        // No child mounts nested under a tempdir -> traverse is a no-op.
         assert_eq!(plain, trav);
         assert_eq!(trav.dirs, 1);
         assert_eq!(trav.files, 2);
@@ -1747,7 +1747,7 @@ mod shutil {
             )
         };
         if rc != 0 {
-            return; // unprivileged sandbox → EPERM
+            return; // unprivileged sandbox -> EPERM
         }
         // Lazy-unmount on the way out, even on panic, before the tempdir is
         // removed.

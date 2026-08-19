@@ -1,11 +1,11 @@
-//! Describing an event and rendering its record text — pure string work, no
+//! Describing an event and rendering its record text - pure string work, no
 //! syscalls, so every rule below is unit tested directly.
 //!
 //! The field layout mirrors linux-PAM's (`op=<service>:<verb>`, `acct=`,
-//! `addr=`, … `res=success|failed`), so a record built here sits beside PAM's
+//! `addr=`, ... `res=success|failed`), so a record built here sits beside PAM's
 //! in `/var/log/audit/audit.log` and answers the same `ausearch`/`aureport`
 //! queries. Values are libaudit-encoded: a clean value is `key="value"`, a
-//! value needing encoding becomes `key=HEX` (uppercase, unquoted) — the shape
+//! value needing encoding becomes `key=HEX` (uppercase, unquoted) - the shape
 //! `auparse` decodes transparently.
 
 use std::fmt::Write;
@@ -14,7 +14,7 @@ use std::fmt::Write;
 /// selects on.
 ///
 /// The values are the userspace message range, `AUDIT_FIRST_USER_MSG` ..=
-/// `AUDIT_LAST_USER_MSG` (`linux/audit.h`) — the types a process holding
+/// `AUDIT_LAST_USER_MSG` (`linux/audit.h`) - the types a process holding
 /// `CAP_AUDIT_WRITE` may originate. The kernel uapi header names only the few
 /// it treats specially, so the constants below carry the audit-userspace names
 /// from `audit-records.h`; the numbers are what matters on the wire.
@@ -27,100 +27,100 @@ use std::fmt::Write;
 pub struct AuditType(u16);
 
 impl AuditType {
-    /// `AUDIT_USER_AUTH` — user-space authentication (PAM's `auth` phase).
+    /// `AUDIT_USER_AUTH` - user-space authentication (PAM's `auth` phase).
     pub const USER_AUTH: AuditType = AuditType(1100);
-    /// `AUDIT_USER_ACCT` — user-space authorization (PAM's `account` phase);
+    /// `AUDIT_USER_ACCT` - user-space authorization (PAM's `account` phase);
     /// the type for an access denial.
     pub const USER_ACCT: AuditType = AuditType(1101);
-    /// `AUDIT_USER_MGMT` — a user-account attribute changed.
+    /// `AUDIT_USER_MGMT` - a user-account attribute changed.
     pub const USER_MGMT: AuditType = AuditType(1102);
-    /// `AUDIT_CRED_ACQ` — a user credential was acquired.
+    /// `AUDIT_CRED_ACQ` - a user credential was acquired.
     pub const CRED_ACQ: AuditType = AuditType(1103);
-    /// `AUDIT_CRED_DISP` — a user credential was disposed of.
+    /// `AUDIT_CRED_DISP` - a user credential was disposed of.
     pub const CRED_DISP: AuditType = AuditType(1104);
-    /// `AUDIT_USER_START` — a user session started.
+    /// `AUDIT_USER_START` - a user session started.
     pub const USER_START: AuditType = AuditType(1105);
-    /// `AUDIT_USER_END` — a user session ended.
+    /// `AUDIT_USER_END` - a user session ended.
     pub const USER_END: AuditType = AuditType(1106);
-    /// `AUDIT_USER_AVC` — a user-space AVC (MAC) message. The one user type
+    /// `AUDIT_USER_AVC` - a user-space AVC (MAC) message. The one user type
     /// the kernel still records while auditing is otherwise disabled.
     pub const USER_AVC: AuditType = AuditType(1107);
-    /// `AUDIT_USER_CHAUTHTOK` — an account password or PIN changed.
+    /// `AUDIT_USER_CHAUTHTOK` - an account password or PIN changed.
     pub const USER_CHAUTHTOK: AuditType = AuditType(1108);
-    /// `AUDIT_USER_ERR` — an account state error.
+    /// `AUDIT_USER_ERR` - an account state error.
     pub const USER_ERR: AuditType = AuditType(1109);
-    /// `AUDIT_CRED_REFR` — a user credential was refreshed.
+    /// `AUDIT_CRED_REFR` - a user credential was refreshed.
     pub const CRED_REFR: AuditType = AuditType(1110);
-    /// `AUDIT_USYS_CONFIG` — a user-space system configuration change.
+    /// `AUDIT_USYS_CONFIG` - a user-space system configuration change.
     pub const USYS_CONFIG: AuditType = AuditType(1111);
-    /// `AUDIT_USER_LOGIN` — a user logged in.
+    /// `AUDIT_USER_LOGIN` - a user logged in.
     pub const USER_LOGIN: AuditType = AuditType(1112);
-    /// `AUDIT_USER_LOGOUT` — a user logged out.
+    /// `AUDIT_USER_LOGOUT` - a user logged out.
     pub const USER_LOGOUT: AuditType = AuditType(1113);
-    /// `AUDIT_ADD_USER` — a user account was added.
+    /// `AUDIT_ADD_USER` - a user account was added.
     pub const ADD_USER: AuditType = AuditType(1114);
-    /// `AUDIT_DEL_USER` — a user account was deleted.
+    /// `AUDIT_DEL_USER` - a user account was deleted.
     pub const DEL_USER: AuditType = AuditType(1115);
-    /// `AUDIT_ADD_GROUP` — a group account was added.
+    /// `AUDIT_ADD_GROUP` - a group account was added.
     pub const ADD_GROUP: AuditType = AuditType(1116);
-    /// `AUDIT_DEL_GROUP` — a group account was deleted.
+    /// `AUDIT_DEL_GROUP` - a group account was deleted.
     pub const DEL_GROUP: AuditType = AuditType(1117);
-    /// `AUDIT_DAC_CHECK` — a user-space DAC decision.
+    /// `AUDIT_DAC_CHECK` - a user-space DAC decision.
     pub const DAC_CHECK: AuditType = AuditType(1118);
-    /// `AUDIT_CHGRP_ID` — a user-space group ID changed.
+    /// `AUDIT_CHGRP_ID` - a user-space group ID changed.
     pub const CHGRP_ID: AuditType = AuditType(1119);
-    /// `AUDIT_TEST` — reserved for testing that the audit path works.
+    /// `AUDIT_TEST` - reserved for testing that the audit path works.
     pub const TEST: AuditType = AuditType(1120);
-    /// `AUDIT_TRUSTED_APP` — a trusted application's own event, free-form
+    /// `AUDIT_TRUSTED_APP` - a trusted application's own event, free-form
     /// text. The catch-all for a service auditing its own operations, and the
     /// [`Default`].
     pub const TRUSTED_APP: AuditType = AuditType(1121);
-    /// `AUDIT_USER_SELINUX_ERR` — a user-space SELinux error.
+    /// `AUDIT_USER_SELINUX_ERR` - a user-space SELinux error.
     pub const USER_SELINUX_ERR: AuditType = AuditType(1122);
-    /// `AUDIT_USER_CMD` — a shell command and its arguments.
+    /// `AUDIT_USER_CMD` - a shell command and its arguments.
     pub const USER_CMD: AuditType = AuditType(1123);
-    /// `AUDIT_USER_TTY` — non-ICANON TTY input. Framed differently by the
+    /// `AUDIT_USER_TTY` - non-ICANON TTY input. Framed differently by the
     /// kernel (raw data, not `key=value` text), so it is not what this module
-    /// builds — listed for completeness.
+    /// builds - listed for completeness.
     pub const USER_TTY: AuditType = AuditType(1124);
-    /// `AUDIT_CHUSER_ID` — supplemental data for a changed user ID.
+    /// `AUDIT_CHUSER_ID` - supplemental data for a changed user ID.
     pub const CHUSER_ID: AuditType = AuditType(1125);
-    /// `AUDIT_GRP_AUTH` — authentication against a group password.
+    /// `AUDIT_GRP_AUTH` - authentication against a group password.
     pub const GRP_AUTH: AuditType = AuditType(1126);
-    /// `AUDIT_SYSTEM_BOOT` — the system booted.
+    /// `AUDIT_SYSTEM_BOOT` - the system booted.
     pub const SYSTEM_BOOT: AuditType = AuditType(1127);
-    /// `AUDIT_SYSTEM_SHUTDOWN` — the system shut down.
+    /// `AUDIT_SYSTEM_SHUTDOWN` - the system shut down.
     pub const SYSTEM_SHUTDOWN: AuditType = AuditType(1128);
-    /// `AUDIT_SYSTEM_RUNLEVEL` — the system runlevel changed.
+    /// `AUDIT_SYSTEM_RUNLEVEL` - the system runlevel changed.
     pub const SYSTEM_RUNLEVEL: AuditType = AuditType(1129);
-    /// `AUDIT_SERVICE_START` — a daemon started.
+    /// `AUDIT_SERVICE_START` - a daemon started.
     pub const SERVICE_START: AuditType = AuditType(1130);
-    /// `AUDIT_SERVICE_STOP` — a daemon stopped.
+    /// `AUDIT_SERVICE_STOP` - a daemon stopped.
     pub const SERVICE_STOP: AuditType = AuditType(1131);
-    /// `AUDIT_GRP_MGMT` — a group-account attribute changed.
+    /// `AUDIT_GRP_MGMT` - a group-account attribute changed.
     pub const GRP_MGMT: AuditType = AuditType(1132);
-    /// `AUDIT_GRP_CHAUTHTOK` — a group password or PIN changed.
+    /// `AUDIT_GRP_CHAUTHTOK` - a group password or PIN changed.
     pub const GRP_CHAUTHTOK: AuditType = AuditType(1133);
-    /// `AUDIT_MAC_CHECK` — a user-space MAC decision.
+    /// `AUDIT_MAC_CHECK` - a user-space MAC decision.
     pub const MAC_CHECK: AuditType = AuditType(1134);
-    /// `AUDIT_ACCT_LOCK` — an account was locked by an administrator.
+    /// `AUDIT_ACCT_LOCK` - an account was locked by an administrator.
     pub const ACCT_LOCK: AuditType = AuditType(1135);
-    /// `AUDIT_ACCT_UNLOCK` — an account was unlocked by an administrator.
+    /// `AUDIT_ACCT_UNLOCK` - an account was unlocked by an administrator.
     pub const ACCT_UNLOCK: AuditType = AuditType(1136);
-    /// `AUDIT_USER_DEVICE` — a user-space hotplug device change.
+    /// `AUDIT_USER_DEVICE` - a user-space hotplug device change.
     pub const USER_DEVICE: AuditType = AuditType(1137);
-    /// `AUDIT_SOFTWARE_UPDATE` — a software update event.
+    /// `AUDIT_SOFTWARE_UPDATE` - a software update event.
     pub const SOFTWARE_UPDATE: AuditType = AuditType(1138);
 
     /// First/last of the two userspace message ranges (`linux/audit.h`:
-    /// `AUDIT_FIRST_USER_MSG`/`AUDIT_LAST_USER_MSG` and their `…MSG2` twins).
+    /// `AUDIT_FIRST_USER_MSG`/`AUDIT_LAST_USER_MSG` and their `...MSG2` twins).
     const FIRST_USER_MSG: u16 = 1100;
     const LAST_USER_MSG: u16 = 1199;
     const FIRST_USER_MSG2: u16 = 2100;
     const LAST_USER_MSG2: u16 = 2999;
 
     /// Wrap a raw `AUDIT_*` number, rejecting anything outside the userspace
-    /// ranges with [`Errno::EINVAL`] — those types are the kernel's own or
+    /// ranges with [`Errno::EINVAL`] - those types are the kernel's own or
     /// need `CAP_AUDIT_CONTROL`, and sending one only earns an `EINVAL`/`EPERM`
     /// ack (or, worse, a control message we never meant to send).
     ///
@@ -142,7 +142,7 @@ impl AuditType {
 }
 
 impl Default for AuditType {
-    /// [`AuditType::TRUSTED_APP`] — a service's own free-form event.
+    /// [`AuditType::TRUSTED_APP`] - a service's own free-form event.
     fn default() -> Self {
         AuditType::TRUSTED_APP
     }
@@ -151,8 +151,8 @@ impl Default for AuditType {
 /// The principal an event describes, in linux-PAM's vocabulary.
 ///
 /// Every field is optional: an unauthenticated or anonymous event still
-/// audits, just with fewer fields. Anything outside this vocabulary —
-/// credential ids, object names, operation arguments — goes on the event as a
+/// audits, just with fewer fields. Anything outside this vocabulary --
+/// credential ids, object names, operation arguments - goes on the event as a
 /// plain [`AuditEvent::fields`] entry.
 ///
 /// The kernel prefixes every user-space record with the *sending* process's
@@ -160,21 +160,21 @@ impl Default for AuditType {
 /// service acted **for**, never the service's own process identity.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AuditPrincipal<'a> {
-    /// Account name, emitted as `acct=` — the field `ausearch -ua` matches.
+    /// Account name, emitted as `acct=` - the field `ausearch -ua` matches.
     pub user: Option<&'a str>,
     /// The account's Unix uid, emitted as `acct_uid=`. Deliberately *not*
     /// `uid=`: the kernel already stamps that with the sending process's uid,
     /// and a second `uid=` inside the message would collide with it.
     pub uid: Option<u32>,
-    /// Client origin, emitted as `addr=` — e.g. `10.0.0.5:5234`, `unix:uid=0`.
+    /// Client origin, emitted as `addr=` - e.g. `10.0.0.5:5234`, `unix:uid=0`.
     pub addr: Option<&'a str>,
-    /// Credential class, emitted as `cred=` — e.g. `API_KEY`, `USER_SESSION`.
+    /// Credential class, emitted as `cred=` - e.g. `API_KEY`, `USER_SESSION`.
     pub cred: Option<&'a str>,
 }
 
 /// One audit event: what happened, to whom, and whether it worked.
 ///
-/// Borrowed throughout, so describing an event allocates nothing — the record
+/// Borrowed throughout, so describing an event allocates nothing - the record
 /// text is rendered straight into a caller-owned buffer by
 /// [`write_message`](Self::write_message), or into its own by
 /// [`AuditSocket::send`](super::AuditSocket::send).
@@ -204,7 +204,7 @@ pub struct AuditPrincipal<'a> {
 pub struct AuditEvent<'a> {
     /// The record's `AUDIT_*` class (what `ausearch -m` selects on).
     pub kind: AuditType,
-    /// Operation namespace — emitted as `op=<service>:<verb>`, PAM-style.
+    /// Operation namespace - emitted as `op=<service>:<verb>`, PAM-style.
     pub service: &'a str,
     /// The operation itself, e.g. `authentication`, `session_close`, `method`.
     pub verb: &'a str,
@@ -213,7 +213,7 @@ pub struct AuditEvent<'a> {
     /// Extra fields, emitted in order after the principal and before `res=`.
     /// Keys are sanitized and values encoded, so neither can split the record.
     pub fields: &'a [(&'a str, &'a str)],
-    /// Emitted as `res=success` or `res=failed` — what `ausearch --success`
+    /// Emitted as `res=success` or `res=failed` - what `ausearch --success`
     /// filters on. PAM writes it last; so does this.
     pub success: bool,
 }
@@ -271,8 +271,8 @@ impl AuditEvent<'_> {
     }
 }
 
-/// Append one `key=value` field, sanitizing the key. The common case — a key
-/// already made of `[A-Za-z0-9_]` — borrows it as-is; only a key needing
+/// Append one `key=value` field, sanitizing the key. The common case - a key
+/// already made of `[A-Za-z0-9_]` - borrows it as-is; only a key needing
 /// repair allocates.
 fn push_field(out: &mut String, key: &str, value: &str) {
     if key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
@@ -320,13 +320,13 @@ fn encode_nv(out: &mut String, key: &str, value: &str) {
 /// a `"`, or any byte outside `0x21..=0x7e`. The kernel walks the value as
 /// `unsigned char`, so that range excludes `0x7f` and `0x80..=0xff` alike.
 ///
-/// An empty value contains no such byte, so — like the kernel's loop, which
-/// simply does not run — it is *not* encoded, and [`encode_nv`] renders it as
+/// An empty value contains no such byte, so - like the kernel's loop, which
+/// simply does not run - it is *not* encoded, and [`encode_nv`] renders it as
 /// `key=""`. Encoding it instead would hex-encode zero bytes and emit a bare
 /// `key=`, which is the ambiguous unquoted form, not the safe one.
 ///
 /// One addition: `'` also forces encoding. The kernel wraps a user-space
-/// record's text in `msg='…'` (`kernel/audit.c`) and does not encode an
+/// record's text in `msg='...'` (`kernel/audit.c`) and does not encode an
 /// apostrophe itself, so one inside a value closes that quote early.
 fn needs_encoding(value: &str) -> bool {
     value
@@ -368,7 +368,7 @@ mod tests {
     /// The kernel's `audit_string_contains_control` loop does not run for a
     /// zero-length value, so an empty string is *clean* and takes the quoted
     /// form. Encoding it instead would hex-encode nothing and emit a bare
-    /// `key=` — the ambiguous unquoted shape, not the safe one.
+    /// `key=` - the ambiguous unquoted shape, not the safe one.
     #[test]
     fn an_empty_value_is_the_quoted_empty_string() {
         assert!(!needs_encoding(""));

@@ -4,9 +4,9 @@
 //! kernel-touched landing pads; the role wrappers (`net::server` and
 //! `net::client`) own admission/listen/connect/protocol on top of it.
 //!
-//! The engine is split by lifecycle stage across the submodules — `io` (the
+//! The engine is split by lifecycle stage across the submodules - `io` (the
 //! request data plane's submission/completion helpers), `close` (teardown),
-//! `wake` (the wake arm and drain quiescence check) — plus this file's SQE
+//! `wake` (the wake arm and drain quiescence check) - plus this file's SQE
 //! staging and slot bookkeeping every stage shares.
 
 mod close;
@@ -42,14 +42,14 @@ pub(crate) struct KernelPads {
     pub(crate) deadline: KernelTimespec,
     /// Fixed accept-retry backoff (`ACCEPT_RETRY_MS`).
     pub(crate) accept_retry: KernelTimespec,
-    /// Relative idle timeout — meaningful iff `cfg.idle_timeout` is set.
+    /// Relative idle timeout - meaningful iff `cfg.idle_timeout` is set.
     pub(crate) idle_timeout: KernelTimespec,
-    /// Relative send timeout — meaningful iff `cfg.send_timeout` is set.
+    /// Relative send timeout - meaningful iff `cfg.send_timeout` is set.
     pub(crate) send_timeout: KernelTimespec,
-    /// Relative request-receive timeout — meaningful iff `cfg.request_timeout`
+    /// Relative request-receive timeout - meaningful iff `cfg.request_timeout`
     /// is set.
     pub(crate) request_timeout: KernelTimespec,
-    /// Relative kTLS handshake timeout — meaningful iff
+    /// Relative kTLS handshake timeout - meaningful iff
     /// `cfg.tls_handshake_timeout` is set (bounds the parked-handshake slot).
     pub(crate) tls_handshake: KernelTimespec,
 }
@@ -59,7 +59,7 @@ pub(crate) struct KernelPads {
 /// one as `core` and drives it with its own admission/connect/protocol code.
 ///
 /// Field order is load-bearing: `table` is declared before `engine` so the
-/// connection buffers drop first — freed before the engine's ring is unmapped
+/// connection buffers drop first - freed before the engine's ring is unmapped
 /// and its pool descriptors close (the kernel must never touch a freed
 /// buffer).
 pub(crate) struct Reactor<U> {
@@ -95,7 +95,7 @@ pub(crate) struct Reactor<U> {
     /// Whether this reactor actually has an fs pool to sweep. Only a server
     /// built with `fs_files > 0` sets it; a client (which drains nothing) and a
     /// pool-less server leave it false, so `close_conn` never records into
-    /// `fs_closed` for them — otherwise a client would grow that Vec unbounded.
+    /// `fs_closed` for them - otherwise a client would grow that Vec unbounded.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) has_fs_pool: bool,
     /// The shared io_uring engine (ring, in-flight accounting, wake, stop
@@ -154,12 +154,12 @@ impl<U> Reactor<U> {
         self.engine.stage_linked(head_ud, head, tail_ud, tail)
     }
 
-    /// Cancel every outstanding op, then reap until nothing is in flight —
+    /// Cancel every outstanding op, then reap until nothing is in flight --
     /// [`Engine::cancel_and_reap_all`] under the stream tag vocabulary, with
     /// the stream-specific sweep: a `FIXED_FD_INSTALL` (kTLS handshake or
     /// detach) that completed during this non-dispatching drain never reaches
     /// `on_fd_install`/`on_detach_install`, which own the furnished fd's
-    /// close — so close it here, or a teardown racing an install leaks a real
+    /// close - so close it here, or a teardown racing an install leaks a real
     /// process fd (it survives the ring's own close; matters when the process
     /// outlives the owner).
     pub(crate) fn cancel_and_reap_all(&mut self) -> errno::Result<()> {
@@ -194,13 +194,13 @@ impl<U> Reactor<U> {
 
     /// Teardown drain for a role's `Drop`: cancel and reap every in-flight op
     /// so the kernel holds no reference to a connection buffer before the
-    /// buffers are freed. If the drain itself fails — a hard `io_uring_enter`
+    /// buffers are freed. If the drain itself fails - a hard `io_uring_enter`
     /// error (not `EBUSY`/`EAGAIN`, which are retried) that returns with ops
-    /// still in flight — leak the kernel-visible buffers instead of freeing
+    /// still in flight - leak the kernel-visible buffers instead of freeing
     /// them: the ring fd still closes as the engine drops (cancelling the ops),
     /// but now against permanently-valid memory. Mirrors the `mem::forget` the
     /// peercred probe uses when `io_uring_enter` fails under it.
-    /// Returns `true` if the drain failed and the buffers were leaked — an
+    /// Returns `true` if the drain failed and the buffers were leaked - an
     /// embedding host with its own kernel-visible buffers on this ring (the
     /// server's fs op table) must then leak those too.
     pub(crate) fn drain_or_leak(&mut self) -> bool {

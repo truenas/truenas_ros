@@ -1,4 +1,4 @@
-//! ZFS file attributes — the upper half of `z_pflags`, by descriptor.
+//! ZFS file attributes - the upper half of `z_pflags`, by descriptor.
 //!
 //! These are the DOS/NFSv4 attribute bits ZFS keeps per file and exposes
 //! through a pair of its own ioctls. Two of them enforce object immutability
@@ -10,26 +10,26 @@
 //!   (`fs/namei.c`) refuses to unlink or rename an `IS_IMMUTABLE` inode
 //!   before any filesystem code runs. An SMB or NFS client cannot route
 //!   around that, and `may_write_xattr` (`fs/xattr.c`) rejects xattr writes
-//!   on such an inode for the same reason — so **any metadata a caller wants
+//!   on such an inode for the same reason - so **any metadata a caller wants
 //!   alongside an immutable file must be written before the flag is set.**
 //! - Setting or clearing either one needs `CAP_LINUX_IMMUTABLE`
 //!   (`zpl_file.c`), so an unprivileged identity cannot lift its own lock.
 //!
-//! `NOUNLINK` reads like the closer match for a retention lock — alter but do
-//! not delete — and is a trap: the same handler gates it on file *ownership*
+//! `NOUNLINK` reads like the closer match for a retention lock - alter but do
+//! not delete - and is a trap: the same handler gates it on file *ownership*
 //! only, with no capability, so whoever owns the file can clear it and
 //! delete. Where the point is that the owner must not be able to, `IMMUTABLE`
 //! is the flag with teeth.
 //!
-//! Unlike `FS_IOC_SETFLAGS` — which reaches only immutable, append, nodump
-//! and projinherit — one ioctl here carries every bit.
+//! Unlike `FS_IOC_SETFLAGS` - which reaches only immutable, append, nodump
+//! and projinherit - one ioctl here carries every bit.
 
 use crate::errno::{self, retry_on_eintr};
 use std::os::fd::{AsFd, AsRawFd};
 
-/// `_IOR(0x83, 1, uint64_t)` — read the visible attribute mask.
+/// `_IOR(0x83, 1, uint64_t)` - read the visible attribute mask.
 const ZFS_IOC_GETDOSFLAGS: libc::c_ulong = 0x8008_8301;
-/// `_IOW(0x83, 2, uint64_t)` — write it.
+/// `_IOW(0x83, 2, uint64_t)` - write it.
 const ZFS_IOC_SETDOSFLAGS: libc::c_ulong = 0x4008_8302;
 
 tn_bitflags! {
@@ -44,7 +44,7 @@ tn_bitflags! {
         /// File may not be written to. Presented to SMB clients as the
         /// READONLY DOS attribute; toggling does not affect existing opens.
         READONLY = 0x0000_0001_0000_0000;
-        /// HIDDEN DOS attribute — hides the file from SMB clients.
+        /// HIDDEN DOS attribute - hides the file from SMB clients.
         HIDDEN = 0x0000_0002_0000_0000;
         /// SYSTEM DOS attribute. Presented to SMB clients; no local effect.
         SYSTEM = 0x0000_0004_0000_0000;
@@ -56,7 +56,7 @@ tn_bitflags! {
         /// every protocol; needs `CAP_LINUX_IMMUTABLE` to set or clear.
         IMMUTABLE = 0x0000_0010_0000_0000;
         /// File may be altered but not deleted. **Clearable by the file's
-        /// owner** — see the module docs before using it as a lock.
+        /// owner** - see the module docs before using it as a lock.
         NOUNLINK = 0x0000_0020_0000_0000;
         /// File may only be opened with `O_APPEND`. Needs
         /// `CAP_LINUX_IMMUTABLE` to set or clear.
@@ -80,7 +80,7 @@ tn_bitflags! {
 ///
 /// [`statx`](super::statx) already reports `IMMUTABLE`/`APPENDONLY` through
 /// [`StatxAttr`](super::StatxAttr) without an ioctl or a writable
-/// descriptor — prefer it when those two are all that is wanted, since it
+/// descriptor - prefer it when those two are all that is wanted, since it
 /// rides a listing's existing stat pass.
 pub fn fget_zfs_attrs<Fd: AsFd>(fd: Fd) -> errno::Result<ZfsAttr> {
     let raw_fd = fd.as_fd().as_raw_fd();
@@ -96,7 +96,7 @@ pub fn fget_zfs_attrs<Fd: AsFd>(fd: Fd) -> errno::Result<ZfsAttr> {
 /// **The mask is absolute, not a delta**: every visible bit absent from
 /// `attrs` is cleared. Read with [`fget_zfs_attrs`] and modify what comes
 /// back rather than writing a bare constant, or unrelated attributes another
-/// protocol set — a client's ARCHIVE or HIDDEN bit — are silently dropped.
+/// protocol set - a client's ARCHIVE or HIDDEN bit - are silently dropped.
 ///
 /// Changing `IMMUTABLE` or `APPENDONLY` requires `CAP_LINUX_IMMUTABLE`
 /// (`EPERM` without it); every change also requires ownership of the file or
@@ -129,7 +129,7 @@ mod tests {
     }
 
     /// The bits are the upper half of `z_pflags`, and the set is exactly
-    /// ZFS's `ZFS_DOS_FL_USER_VISIBLE` — the mask the setter validates
+    /// ZFS's `ZFS_DOS_FL_USER_VISIBLE` - the mask the setter validates
     /// against. A bit added here that ZFS does not accept would fail at
     /// runtime with `EOPNOTSUPP` on every set.
     #[test]

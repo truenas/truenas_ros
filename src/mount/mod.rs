@@ -1,4 +1,4 @@
-//! Mount topology and idmapped-mount support — the `mount` umbrella.
+//! Mount topology and idmapped-mount support - the `mount` umbrella.
 //!
 //! Feature `mount` (this module's root): `statmount`, `listmount`,
 //! `iter_mount`, `open_tree`, `move_mount`, `mount_setattr`,
@@ -46,7 +46,7 @@ pub use move_mount::{move_mount, MoveMountFlags};
 pub use open_tree::{open_tree, OpenTreeFlags};
 #[cfg(feature = "mount")]
 pub use setattr::{mount_setattr, MountSetattr};
-/// The reply decoder, for the fuzz crate only — `statmount` is a private
+/// The reply decoder, for the fuzz crate only - `statmount` is a private
 /// module, so its `__fuzz` seam needs lifting to `mount::fuzz` to be reachable.
 #[cfg(all(feature = "mount", feature = "__fuzz"))]
 pub use statmount::fuzz;
@@ -91,7 +91,7 @@ tn_bitflags! {
 
 #[cfg(feature = "mount")]
 tn_enum! {
-    /// A mount's atime update policy — the value the
+    /// A mount's atime update policy - the value the
     /// [`MountAttr::__ATIME`] bits hold. Exactly one applies at a time, so
     /// [`MountSetattr::atime`] takes this rather than a flag.
     pub enum Atime: u64 {

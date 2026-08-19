@@ -1,4 +1,4 @@
-//! POSIX1E ACLs (`system.posix_acl_access` / `_default`) — little-endian.
+//! POSIX1E ACLs (`system.posix_acl_access` / `_default`) - little-endian.
 
 use crate::error::{Error, Result};
 
@@ -111,7 +111,7 @@ fn parse_aces(data: &[u8], is_default: bool) -> Result<Vec<PosixAce>> {
         // tag's id field is written as `ACL_UNDEFINED_ID` and ignored on the
         // way back in (`posix_acl_from_xattr` does not even load it), so it
         // carries no id whatever the wire says. A *named* tag holding the
-        // sentinel is malformed — `encode_aces` cannot write it back, so
+        // sentinel is malformed - `encode_aces` cannot write it back, so
         // accepting it would decode a blob we can never re-emit.
         let id = if tag.is_special() {
             -1
@@ -322,8 +322,8 @@ fn validate_entries(aces: &[PosixAce], label: &str) -> Result<()> {
     let (mut user_obj, mut group_obj, mut other, mut mask, mut named) =
         (0u32, 0u32, 0u32, 0u32, 0u32);
     // The tag values ascend in the canonical entry order (USER_OBJ, USER,
-    // GROUP_OBJ, GROUP, MASK, OTHER), so — given the tag counts checked
-    // below — a non-decreasing tag value is exactly the sequence the
+    // GROUP_OBJ, GROUP, MASK, OTHER), so - given the tag counts checked
+    // below - a non-decreasing tag value is exactly the sequence the
     // kernel's state machine accepts (`fs/posix_acl.c:posix_acl_valid`).
     let mut prev_tag = 0u16;
     for a in aces {
@@ -406,7 +406,7 @@ mod tests {
 
     /// `e_id` is read exactly as `fs/posix_acl.c` reads it: ignored for a
     /// special tag, and never the undefined sentinel on a named one. Both
-    /// halves keep decode and encode symmetric — without them `from_xattr`
+    /// halves keep decode and encode symmetric - without them `from_xattr`
     /// accepts blobs `access_bytes` either refuses or re-emits differently.
     #[test]
     fn entry_ids_decode_the_way_the_kernel_writes_them() {

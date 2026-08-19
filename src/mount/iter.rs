@@ -44,7 +44,7 @@ pub fn iter_mount(
 /// Open the mount point of the mount identified by `mnt_id`.
 ///
 /// `flags` are ordinary open flags (typically `OFlag::O_DIRECTORY`). Fails
-/// `ENXIO` if `statmount` reports no mount point — the mount has no path
+/// `ENXIO` if `statmount` reports no mount point - the mount has no path
 /// reachable from the caller's root.
 pub fn open_mount_by_id(mnt_id: u64, flags: OFlag) -> errno::Result<OwnedFd> {
     let sm = statmount(mnt_id, StatmountMask::MNT_POINT)?;
