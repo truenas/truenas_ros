@@ -7,7 +7,9 @@ use super::core::{
     deliver_embedded, deliver_pool_completions, FsCore, FsWaiter, TAG_CANCEL,
     TAG_WAKE,
 };
-use super::{FsHandle, FsInject, FsOutcome, Personality, PrivilegedXattrs};
+use super::{
+    FsHandle, FsInject, FsOutcome, OffloadBounds, Personality, PrivilegedXattrs,
+};
 use crate::errno::{self, Errno};
 use crate::sync::{mpsc, Arc};
 use crate::uring::engine::Engine;
@@ -73,6 +75,9 @@ pub struct FsConfig {
     /// it fails `EBUSY` however deep the ring is. Plain heap at ~180 bytes a
     /// slot, so this is the cheap axis to raise.
     pub ops: u32,
+    /// Sizing for the blocking-offload pool that backs `FsConn::offload` and
+    /// the hybrid lister. Per ring; see [`OffloadBounds`].
+    pub offload: OffloadBounds,
 }
 
 impl Default for FsConfig {
@@ -80,6 +85,7 @@ impl Default for FsConfig {
         FsConfig {
             entries: 4096,
             ops: 32768,
+            offload: OffloadBounds::default(),
         }
     }
 }
@@ -163,7 +169,7 @@ impl UringFs {
         }
         let (inject_tx, inject_rx) = mpsc::channel();
         Ok(UringFs {
-            fs: FsCore::new(cfg.ops),
+            fs: FsCore::new(cfg.ops, cfg.offload),
             inject_tx,
             inject_rx,
             eng,
@@ -655,6 +661,7 @@ mod tests {
         let cfg = FsConfig {
             entries: 128,
             ops: 128,
+            ..FsConfig::default()
         };
         let mut afs = match UringFs::new(cfg) {
             Ok(a) => a,

@@ -12,6 +12,33 @@ use std::time::{Duration, Instant};
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{thread, Arc, Condvar, Mutex, OnceCell};
 
+/// Per-ring sizing for the blocking-offload pool: how many worker threads it
+/// keeps warm, how far it grows, and how much native stack each worker gets.
+///
+/// Every field is per ring, so a deployment running several multiplies them.
+/// Only `floor` is resident; workers above it exist while a job is blocked on
+/// them and retire when idle, so the ceiling is a limit rather than a
+/// reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OffloadBounds {
+    /// Warm workers, spawned on first use and never retired below. Resident,
+    /// so this is a standing per-ring cost. At least 1.
+    pub floor: usize,
+    /// Growth limit under saturation: how many concurrently stalled jobs one
+    /// ring absorbs before they queue behind each other. Raised to `floor` if
+    /// smaller.
+    pub ceiling: usize,
+}
+
+impl Default for OffloadBounds {
+    fn default() -> OffloadBounds {
+        OffloadBounds {
+            floor: crate::uring_fs::core::OFFLOAD_FLOOR,
+            ceiling: crate::uring_fs::core::OFFLOAD_CEILING,
+        }
+    }
+}
+
 /// A boxed unit of work a pool worker runs. Every job is `Send` and
 /// self-contained (it captures its own inputs and result channel), so the pool
 /// is generic - the `!Send` `QueryDir` is built and driven *inside* the job,
@@ -74,12 +101,10 @@ impl WorkerPool {
     /// under saturation, using the default cooldown and idle timeout. Returns
     /// the spawn error rather than panicking.
     pub(crate) fn try_elastic(
-        floor: usize,
-        ceiling: usize,
+        bounds: OffloadBounds,
     ) -> std::io::Result<WorkerPool> {
         Self::try_elastic_tuned(
-            floor,
-            ceiling,
+            bounds,
             OFFLOAD_SPAWN_COOLDOWN,
             OFFLOAD_IDLE_TIMEOUT,
         )
@@ -89,13 +114,12 @@ impl WorkerPool {
     /// a partial spawn failure the workers already started are shut down and
     /// waited for before returning, so none is orphaned.
     pub(crate) fn try_elastic_tuned(
-        floor: usize,
-        ceiling: usize,
+        bounds: OffloadBounds,
         cooldown: Duration,
         idle_timeout: Duration,
     ) -> std::io::Result<WorkerPool> {
-        let floor = floor.max(1);
-        let ceiling = ceiling.max(floor);
+        let floor = bounds.floor.max(1);
+        let ceiling = bounds.ceiling.max(floor);
         let shared = Arc::new(PoolShared {
             inner: Mutex::new(PoolInner {
                 queue: VecDeque::new(),
@@ -239,16 +263,6 @@ fn spawn_worker(shared: &Arc<PoolShared>) -> std::io::Result<()> {
     let shared = Arc::clone(shared);
     thread::Builder::new()
         .name("truenas-fs-worker".into())
-        // Blocking jobs run a shallow native stack: `query_tree` walks a heap
-        // `Vec<Frame>` bounded by MAX_DEPTH, `enrich` is iterative, and the
-        // metadata offloads are single syscalls, so cap the stack well under
-        // the default. That default is std's own (`DEFAULT_MIN_STACK_SIZE`,
-        // 2 MiB, overridable by RUST_MIN_STACK), not the 8 MiB `ulimit -s`
-        // glibc gives the main thread. The pool's bounds are per ring and a
-        // `reuse_port` deployment runs many, so the reservation is multiplied
-        // by a factor this library does not choose. Cheap insurance against a
-        // deployment that sizes up.
-        .stack_size(512 * 1024)
         .spawn(move || worker_loop(&shared))
         .map(|_| ())
 }
@@ -260,8 +274,7 @@ fn spawn_worker(shared: &Arc<PoolShared>) -> std::io::Result<()> {
 /// runs inline (a degraded loop, not a dead one).
 pub(crate) struct SharedPool {
     pool: OnceCell<WorkerPool>,
-    floor: usize,
-    ceiling: usize,
+    bounds: OffloadBounds,
     /// Epoch for [`retry_spawn_us`](Self::retry_spawn_us).
     epoch: Instant,
     /// Micros since `epoch` before the lazy spawn is attempted again, or `0`
@@ -294,14 +307,16 @@ impl fmt::Debug for SharedPool {
 }
 
 impl SharedPool {
-    /// A shared pool with warm floor `floor` and growth ceiling `ceiling` (each
-    /// at least 1); no threads spawn until the first [`submit`](Self::submit).
-    pub(crate) fn new(floor: usize, ceiling: usize) -> Arc<SharedPool> {
-        let floor = floor.max(1);
+    /// A shared pool sized by `bounds`; no threads spawn until the first
+    /// [`submit`](Self::submit).
+    pub(crate) fn new(bounds: OffloadBounds) -> Arc<SharedPool> {
+        let floor = bounds.floor.max(1);
         Arc::new(SharedPool {
             pool: OnceCell::new(),
-            floor,
-            ceiling: ceiling.max(floor),
+            bounds: OffloadBounds {
+                floor,
+                ceiling: bounds.ceiling.max(floor),
+            },
             epoch: Instant::now(),
             retry_spawn_us: AtomicU64::new(0),
         })
@@ -325,7 +340,7 @@ impl SharedPool {
         if now < self.retry_spawn_us.load(Ordering::Relaxed) {
             return job(); // backing off a recent failure; don't retry per job
         }
-        match WorkerPool::try_elastic(self.floor, self.ceiling) {
+        match WorkerPool::try_elastic(self.bounds) {
             Ok(pool) => {
                 // A lost race just drops the surplus pool here; its `Drop`
                 // joins the workers it started before they can touch anything.
@@ -433,6 +448,11 @@ mod pool_tests {
     use super::*;
     use crate::sync::mpsc;
 
+    /// Bounds with the defaults' stack size and explicit floor/ceiling.
+    fn bounds(floor: usize, ceiling: usize) -> OffloadBounds {
+        OffloadBounds { floor, ceiling }
+    }
+
     /// The elastic pool grows past its floor when every worker is blocked, up to
     /// the ceiling, then retires the burst workers once they sit idle.
     #[test]
@@ -440,8 +460,7 @@ mod pool_tests {
         // Floor 1, ceiling 4; no growth cooldown (deterministic under the
         // start-synchronised submits below) and a quick idle timeout.
         let pool = WorkerPool::try_elastic_tuned(
-            1,
-            4,
+            bounds(1, 4),
             Duration::ZERO,
             Duration::from_millis(50),
         )
@@ -493,7 +512,7 @@ mod pool_tests {
     /// A fixed pool (`floor == ceiling`) never grows, even when saturated.
     #[test]
     fn fixed_pool_does_not_grow() {
-        let pool = WorkerPool::try_elastic(2, 2).unwrap();
+        let pool = WorkerPool::try_elastic(bounds(2, 2)).unwrap();
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let (started_tx, started_rx) = mpsc::channel::<()>();
         for _ in 0..2 {
@@ -528,7 +547,7 @@ mod pool_tests {
     /// `QueryPool::query` job outliving the reactor and every handle.
     #[test]
     fn dpool_query_job_holding_the_last_pool_arc_wedges_a_worker() {
-        let pool = SharedPool::new(1, 1);
+        let pool = SharedPool::new(bounds(1, 1));
         // The job's own clone; once the outer `pool` drops it becomes the last.
         let held = Arc::clone(&pool);
         let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
@@ -577,6 +596,11 @@ mod loom_tests {
 
     const ZERO: Duration = Duration::ZERO;
 
+    /// Bounds with the defaults' stack size and explicit floor/ceiling.
+    fn bounds(floor: usize, ceiling: usize) -> OffloadBounds {
+        OffloadBounds { floor, ceiling }
+    }
+
     /// Run a model under a preemption bound rather than exhaustively.
     ///
     /// Three threads parking and signalling on one mutex/condvar is past the
@@ -601,7 +625,7 @@ mod loom_tests {
     }
 
     fn pool(floor: usize, ceiling: usize) -> WorkerPool {
-        WorkerPool::try_elastic_tuned(floor, ceiling, ZERO, ZERO)
+        WorkerPool::try_elastic_tuned(bounds(floor, ceiling), ZERO, ZERO)
             .expect("the model's pool always spawns")
     }
 
@@ -783,7 +807,7 @@ mod loom_tests {
     fn loom_shared_pool_init() {
         bounded_model(|| {
             let ran = Arc::new(AtomicUsize::new(0));
-            let sp = SharedPool::new(1, 1);
+            let sp = SharedPool::new(bounds(1, 1));
 
             let (a, b) = (Arc::clone(&sp), Arc::clone(&sp));
             let (ra, rb) = (Arc::clone(&ran), Arc::clone(&ran));

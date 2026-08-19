@@ -56,12 +56,10 @@ pub struct ServerConfig {
     /// opcode and so cannot run on the ring. Default
     /// `uring_fs::core::OFFLOAD_FLOOR`.
     ///
-    /// **Per server/ring, and resident.** These spawn on first use and the idle
-    /// retire never goes below them, so a `reuse_port` deployment pays
-    /// `floor x servers` threads standing by whether or not they offload. The
-    /// default is deliberately one: the library cannot see how many rings you
-    /// will run, so sizing the machine is yours. Raise it when a ring's first
-    /// listings should not pay a thread spawn.
+    /// **Per server/ring, and resident.** These spawn on first use and the
+    /// idle retire never goes below them, so this is the pool's standing cost,
+    /// multiplied by however many servers a deployment runs. Lower it if a
+    /// ring's first listings can afford to wait on a thread spawn.
     #[cfg(feature = "uring-fs")]
     pub fs_offload_floor: usize,
     /// Ceiling the offload pool grows to when every worker is blocked (a cold or
@@ -69,10 +67,11 @@ pub struct ServerConfig {
     /// does not head-of-line-block the rest; burst threads retire when idle.
     /// Default `uring_fs::core::OFFLOAD_CEILING`.
     ///
-    /// **Per server/ring**, so the peak thread count is `ceiling x servers`.
-    /// What it really buys is how many *concurrently stalled* operations one
-    /// ring absorbs before they queue behind each other. Size it to that, not
-    /// to request volume, and budget the product against the machine.
+    /// **Per server/ring**, so the peak is `ceiling x servers` - but only
+    /// under load that actually stalls that many operations at once: workers
+    /// spawn on demand, one per millisecond, and retire when idle. Size it to
+    /// how many concurrently blocked operations one ring should absorb before
+    /// they queue, not to request volume.
     #[cfg(feature = "uring-fs")]
     pub fs_offload_ceiling: usize,
     /// Maximum bytes accepted for one message (header + body), a memory guard

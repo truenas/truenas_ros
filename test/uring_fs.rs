@@ -149,6 +149,7 @@ fn test_cfg() -> FsConfig {
     FsConfig {
         entries: 128,
         ops: 128,
+        ..FsConfig::default()
     }
 }
 
