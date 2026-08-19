@@ -1,4 +1,4 @@
-//! The engine: one ring plus the state every domain shares — SQE staging with
+//! The engine: one ring plus the state every domain shares - SQE staging with
 //! in-flight accounting, the wake eventfd, and the cancel-everything
 //! teardown. Tag vocabularies stay with the domains: every method that names
 //! an op takes its `user_data` as a parameter, so the engine never interprets
@@ -10,7 +10,7 @@ use crate::uring::ring::Ring;
 use crate::uring::sys::*;
 use crate::uring::wake::{LoopShared, WakeHandle};
 // `LoopShared` is loom-modelled (see `src/uring/wake.rs`), so the engine
-// builds it from `crate::sync` — std's outside `--cfg loom`.
+// builds it from `crate::sync` - std's outside `--cfg loom`.
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::Arc;
 
@@ -20,8 +20,8 @@ use crate::sync::Arc;
 /// has to unwind.
 ///
 /// Four covers the deepest shape built only from opcodes that actually
-/// fail-fast — `openat2 → writev → writev → close`. It is deliberately *not*
-/// sized for a durable publish tail (`write → fsync → link → rename`): three
+/// fail-fast - `openat2 -> writev -> writev -> close`. It is deliberately *not*
+/// sized for a durable publish tail (`write -> fsync -> link -> rename`): three
 /// of those four links cannot break a chain, so that sequence must be driven
 /// from completions instead. See [`Engine::stage_chain`].
 #[cfg(feature = "uring-fs")]
@@ -29,7 +29,7 @@ pub(crate) const MAX_CHAIN_LINKS: usize = 4;
 
 /// The role-agnostic io_uring engine a domain stack embeds. Field order is
 /// load-bearing: the embedding struct declares its buffer-owning tables
-/// before the engine, and `ring` is this struct's last field — so every
+/// before the engine, and `ring` is this struct's last field - so every
 /// kernel-visible buffer drops before the ring is unmapped and its pool
 /// descriptors close (the kernel must never touch a freed buffer).
 pub(crate) struct Engine {
@@ -42,8 +42,8 @@ pub(crate) struct Engine {
     pub(crate) wake_buf: Box<u64>,
     /// Operations currently in flight on the ring.
     pub(crate) inflight: u64,
-    /// Whether the kernel supports `IORING_OP_FIXED_FD_INSTALL` (Linux ≥ 6.8;
-    /// probed at construction) — required to furnish real fds (kTLS
+    /// Whether the kernel supports `IORING_OP_FIXED_FD_INSTALL` (Linux >= 6.8;
+    /// probed at construction) - required to furnish real fds (kTLS
     /// handshakes, connection detach).
     pub(crate) fixed_fd_install: bool,
     /// Declared last so it drops after everything above; see the struct doc.
@@ -162,14 +162,14 @@ impl Engine {
     /// | family | breaks the chain? |
     /// |---|---|
     /// | `rw.c`, `splice.c`, `openclose.c`, `nop.c` | yes |
-    /// | `fs.c` — linkat/renameat/unlinkat/mkdirat/symlinkat | **no** |
-    /// | `sync.c` — fsync/fallocate/sync_file_range | **no** |
-    /// | `statx.c`, `xattr.c` — statx, f/getxattr, f/setxattr | **no** |
+    /// | `fs.c` - linkat/renameat/unlinkat/mkdirat/symlinkat | **no** |
+    /// | `sync.c` - fsync/fallocate/sync_file_range | **no** |
+    /// | `statx.c`, `xattr.c` - statx, f/getxattr, f/setxattr | **no** |
     /// | any op failing at submission (bad fd, bad prep) | yes |
     ///
     /// An fs op that fails sets its result and stops; its successors run
     /// regardless. Chaining `linkat` to `renameat` and expecting the rename to
-    /// be skipped is therefore wrong, and dangerously so — see
+    /// be skipped is therefore wrong, and dangerously so - see
     /// `linked_fs_ops_do_not_break_the_chain`, which pins the behaviour.
     /// Sequence fs ops from completions instead.
     #[cfg(feature = "uring-fs")]
@@ -193,7 +193,7 @@ impl Engine {
     /// Arm the wake-eventfd `READ` under the domain's wake tag. Reading the
     /// 8-byte counter directly (rather than polling the fd) auto-arms
     /// io_uring's internal fast-poll and completes only once the fd is
-    /// readable, draining the counter to 0 in the same op — no separate poll
+    /// readable, draining the counter to 0 in the same op - no separate poll
     /// SQE, no follow-up `read()` syscall.
     pub(crate) fn arm_wake(&mut self, user_data: u64) -> errno::Result<()> {
         let fd = self.shared.wake.as_raw_fd();
@@ -322,7 +322,7 @@ mod tests {
         }
     }
 
-    /// A one-link chain is legal and carries no link flag — it is just an op,
+    /// A one-link chain is legal and carries no link flag - it is just an op,
     /// which keeps callers from special-casing degenerate chains.
     #[test]
     fn single_link_chain_is_unlinked() {
@@ -372,7 +372,7 @@ mod tests {
     /// `IOSQE_IO_LINK` cancels successors only when the failing op calls the
     /// kernel's `req_set_fail()`. `io_uring/rw.c`, `splice.c`, `openclose.c`
     /// and `nop.c` do; **`fs.c` (linkat/renameat/unlinkat/mkdirat/symlinkat)
-    /// and `sync.c` (fsync/fallocate) do not** — they set the result and stop.
+    /// and `sync.c` (fsync/fallocate) do not** - they set the result and stop.
     /// So a link that fails `EEXIST` is followed by a rename that runs anyway.
     ///
     /// The consequence is why the durable-create commit is *not* built as a
@@ -438,7 +438,7 @@ mod tests {
         assert_eq!(
             std::fs::read(p.join("o/key")).unwrap(),
             b"unrelated",
-            "and it clobbered the target with an unrelated file — exactly the \
+            "and it clobbered the target with an unrelated file - exactly the \
              corruption that rules chains out for the commit path"
         );
         eng.inflight = 0;

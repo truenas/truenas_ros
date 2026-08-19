@@ -1,4 +1,4 @@
-//! Layer 0 callback substrate — a self-contained, compiling design probe.
+//! Layer 0 callback substrate - a self-contained, compiling design probe.
 //!
 //! A completion-callback model for the FS reactor on the io_uring net-server
 //! base, distilled to the part that actually stresses the borrow checker:
@@ -10,7 +10,7 @@
 //! runs each op with one real syscall against a temp dir, so the
 //! ownership/borrow structure is exactly what the real reactor would have,
 //! while the demo genuinely creates files (and shows link fail-fast leaving no
-//! half-written object behind). No futures anywhere — a request's terminal
+//! half-written object behind). No futures anywhere - a request's terminal
 //! action is a plain boxed closure; the callback layer needs no async runtime.
 //!
 //! Run: `cargo run --example fs_callback_layer0`
@@ -126,7 +126,7 @@ impl Staging {
     }
 
     /// A kernel-linked run (IOSQE_IO_LINK across all but the last): ordered and
-    /// fail-fast — the tail is cancelled if any op fails. This is the atomic
+    /// fail-fast - the tail is cancelled if any op fails. This is the atomic
     /// write -> fsync -> rename -> dirfsync tail.
     fn linked_run(&mut self, items: Vec<(OpSpec, Callback)>, key: ReqKey) {
         let n = items.len();
@@ -151,7 +151,7 @@ struct ReqState {
     final_path: CString,
     body: Vec<u8>,
     failed: bool,
-    /// Terminal side effect — a plain closure, NOT a future.
+    /// Terminal side effect - a plain closure, NOT a future.
     done: Option<Done>,
 }
 impl ReqState {
@@ -203,7 +203,7 @@ impl Core {
     }
 
     /// Retrieve + recycle the slot for a completion. A stale/foreign token
-    /// (wrong generation, or already reaped) returns None and is inert — the
+    /// (wrong generation, or already reaped) returns None and is inert - the
     /// property the routing/close-last fuzzer checks.
     fn take_op(&mut self, tok: OpToken) -> Option<(Callback, ReqKey)> {
         let e = self.slots.get_mut(tok.slot() as usize)?;
@@ -235,7 +235,7 @@ impl Reactor {
     }
 
     /// Execute staged ops into completions. A linked run runs in order and
-    /// severs its tail (-ECANCELED) on the first failure — the mock's stand-in
+    /// severs its tail (-ECANCELED) on the first failure - the mock's stand-in
     /// for IOSQE_IO_LINK.
     fn flush(&mut self) {
         let runs = std::mem::take(&mut self.staging.runs);
@@ -265,7 +265,7 @@ impl Reactor {
 
     /// Fire each completion's callback with ONLY its own request state + the
     /// stage buffer. `reqs` and `staging` are disjoint fields, so the reactor
-    /// hands out &mut to each at once — the borrow split that makes this legal.
+    /// hands out &mut to each at once - the borrow split that makes this legal.
     fn drain(&mut self) {
         while let Some(comp) = self.core.cq.pop_front() {
             let Some((cb, key)) = self.core.take_op(comp.token) else {

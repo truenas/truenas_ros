@@ -1,7 +1,7 @@
 //! The fs core: the op table (owner of every kernel-visible payload from
 //! submission to completion), plain reference-counted file descriptors
 //! (`File = Arc<OwnedFd>`, close-last by ownership), the SQE builders, and
-//! completion routing. A host owns the engine and drives this —
+//! completion routing. A host owns the engine and drives this --
 //! [`super::UringFs`] standalone, or a `net` server sharing its ring (which is
 //! also what [`FsConn`] submits through).
 //!
@@ -9,11 +9,11 @@
 //!
 //! - **The kernel must never touch freed memory.** Buffers, iovec arrays,
 //!   paths, `open_how` pads, and anchor dirfds live in the op entry from
-//!   submission until the CQE reaps — even when the caller lost interest.
+//!   submission until the CQE reaps - even when the caller lost interest.
 //! - **Close-last by ownership.** An open returns an `Arc<OwnedFd>`; each op in
 //!   flight against it parks its own clone in the op entry until that op's CQE,
-//!   so the fd closes only when the last reference — the caller's handle and
-//!   every in-flight op — drops. No explicit close op, no reusable slot index.
+//!   so the fd closes only when the last reference - the caller's handle and
+//!   every in-flight op - drops. No explicit close op, no reusable slot index.
 //! - **Op-slot generations make stale completions inert.** `user_data` packs
 //!   `(tag, op-slot, generation)`; an op entry frees only at its own single
 //!   terminal CQE, so a stale / duplicate / wrong-tag completion is rejected.
@@ -48,7 +48,7 @@ use std::mem::size_of;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
 // The offload sink and the `DIR*` handoff are loom-modelled (see
-// `loom_tests` at the bottom), so these come from `crate::sync` — std's
+// `loom_tests` at the bottom), so these come from `crate::sync` - std's
 // outside `--cfg loom`.
 use crate::sync::{Arc, Mutex};
 use std::thread;
@@ -79,13 +79,13 @@ pub(crate) const OFFLOAD_FLOOR: usize = 1;
 /// [`ServerConfig::fs_offload_floor`](crate::net::server::ServerConfig::fs_offload_floor)
 /// and
 /// [`ServerConfig::fs_offload_ceiling`](crate::net::server::ServerConfig::fs_offload_ceiling),
-/// budgeting `ceiling × reactors` for the peak and `floor × reactors` for the
+/// budgeting `ceiling x reactors` for the peak and `floor x reactors` for the
 /// idle residency.
 pub(crate) const OFFLOAD_CEILING: usize = 8;
 /// Names per off-loop `readdir` batch in [`FsConn::next_batch`].
 const DIR_BATCH: usize = 256;
 
-// fs op tags (the 0x80 domain; fs-reactor design §13).
+// fs op tags (the 0x80 domain; fs-reactor design sec. 13).
 pub(crate) const TAG_OPEN: u8 = 0x80;
 pub(crate) const TAG_READV: u8 = 0x81;
 pub(crate) const TAG_WRITEV: u8 = 0x82;
@@ -109,8 +109,8 @@ pub(crate) const TAG_CANCEL: u8 = 0x9E;
 
 /// A completed embedded op's callback, fired **inline on the loop thread** by
 /// the embedding host (a `net` server) with the outcome and a fresh [`FsConn`]
-/// for chaining. Dropping it without firing drops its captured continuation —
-/// which closes the connection — so a submission failure needs no error path.
+/// for chaining. Dropping it without firing drops its captured continuation --
+/// which closes the connection - so a submission failure needs no error path.
 pub(crate) type EmbeddedCb = Box<dyn FnOnce(FsDone, &mut FsConn<'_>)>;
 
 /// An opaque per-op **owner** tag: the embedding host's connection identity
@@ -131,7 +131,7 @@ pub(crate) enum FsWaiter {
     },
 }
 
-/// Box a consumer callback as an owner-stamped embedded waiter — the one shape
+/// Box a consumer callback as an owner-stamped embedded waiter - the one shape
 /// every [`FsConn`] submit method hands the core.
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 fn embed<F>(owner: Owner, on_done: F) -> FsWaiter
@@ -144,8 +144,8 @@ where
     }
 }
 
-/// Report an early submission failure — the SQE never staged (slot exhaustion,
-/// an unusable file) — handing the caller's payloads back exactly as a
+/// Report an early submission failure - the SQE never staged (slot exhaustion,
+/// an unusable file) - handing the caller's payloads back exactly as a
 /// completion would (see [`deliver`]).
 fn fail(waiter: FsWaiter, err: Errno, bufs: Vec<Vec<u8>>) {
     deliver(Some(waiter), Err(err), bufs, None, None);
@@ -153,10 +153,10 @@ fn fail(waiter: FsWaiter, err: Errno, bufs: Vec<Vec<u8>>) {
 
 /// `fremovexattr(2)` on `f`. Blocking, because io_uring has no opcode for it:
 /// the kernel's xattr ops are get/set only, and an `IORING_OP_FSETXATTR` with
-/// a zero-length value does **not** remove — `__vfs_setxattr` substitutes an
+/// a zero-length value does **not** remove - `__vfs_setxattr` substitutes an
 /// empty value for `size == 0` (`fs/xattr.c`, commented "empty EA, do not
 /// remove"), leaving an attribute that still lists. Removal reaches a
-/// filesystem as `handler->set(…, NULL, 0, XATTR_REPLACE)` only from the
+/// filesystem as `handler->set(..., NULL, 0, XATTR_REPLACE)` only from the
 /// `removexattr` syscalls, which io_uring cannot reach.
 fn remove_xattr_blocking(f: &File, name: &CStr) -> crate::Result<()> {
     let raw = f.as_raw_fd();
@@ -182,9 +182,9 @@ struct FsOpEntry {
     /// Secondary path payload (the destination leaf of rename/link, the
     /// link path of symlinkat).
     path2: Option<CString>,
-    /// `OPENAT2` `open_how` pad — boxed for a stable address.
+    /// `OPENAT2` `open_how` pad - boxed for a stable address.
     how: Option<Box<RawOpenHow>>,
-    /// `STATX` result pad — **the kernel writes it at completion**, so it
+    /// `STATX` result pad - **the kernel writes it at completion**, so it
     /// must live until the CQE reaps.
     stat: Option<Box<StatxRaw>>,
     /// Keeps a path op's dirfd alive (and its fd number un-reused) while
@@ -193,7 +193,7 @@ struct FsOpEntry {
     /// The second dirfd of a rename/link.
     anchor2: Option<Anchor>,
     /// The file an fd-op targets, parked here so its descriptor stays open
-    /// (and un-reused) until the CQE reaps — the caller may drop its
+    /// (and un-reused) until the CQE reaps - the caller may drop its
     /// `File` mid-op. Dropping this on `clear` gives close-last ordering.
     file: Option<Arc<OwnedFd>>,
 }
@@ -273,7 +273,7 @@ pub(crate) struct FsCore {
     offload_reg: HashMap<u64, OffloadEntry>,
     next_offload: u64,
     /// Attribute names whose `FSETXATTR` runs under ambient credentials rather
-    /// than the request identity. Empty by default — see [`PrivilegedXattrs`].
+    /// than the request identity. Empty by default - see [`PrivilegedXattrs`].
     priv_xattrs: PrivilegedXattrs,
 }
 
@@ -353,7 +353,7 @@ impl FsCore {
     /// [`Personality`], and the allowlist is what makes that defensible
     /// rather than a hole. There is no `IORING_OP_*REMOVEXATTR`, and a
     /// zero-length `FSETXATTR` sets an empty attribute instead of removing
-    /// one (see [`remove_xattr_blocking`]) — so the call can only run on a
+    /// one (see [`remove_xattr_blocking`]) - so the call can only run on a
     /// pool thread, under the reactor's own credentials, with no way for the
     /// kernel to check it against a request identity. Restricting it to
     /// attributes the *server* owns keeps the promotion keyed on the name
@@ -421,7 +421,7 @@ impl FsCore {
         waiter: FsWaiter,
     ) {
         // A name-resolving op with personality 0 would run under the ring
-        // owner's ambient (root) credentials — the identity this surface must
+        // owner's ambient (root) credentials - the identity this surface must
         // never grant implicitly. `Personality` cannot be 0 by construction, so
         // this only catches an internal misuse; fail closed regardless.
         if pers == 0 {
@@ -465,7 +465,7 @@ impl FsCore {
 
     /// Stage a `READV`/`WRITEV` (per `tag`) against an open file.
     ///
-    /// `rw_flags` is the `RWF_*` set — the same field `preadv2`/`pwritev2`
+    /// `rw_flags` is the `RWF_*` set - the same field `preadv2`/`pwritev2`
     /// take, which these opcodes read directly, so the flagged form is not a
     /// separate op. `0` is the plain `preadv`/`pwritev` behaviour. The kernel
     /// validates the set at prep and fails the whole operation with
@@ -596,8 +596,8 @@ impl FsCore {
     /// credentials, and the promotion is keyed on the attribute name alone.**
     /// It lives here rather than at the call sites so no public entry point
     /// can name a personality of 0 or pick its own privilege: callers pass the
-    /// request identity, and an `FSETXATTR` of an allowlisted name — and
-    /// nothing else — is rewritten to `0`.
+    /// request identity, and an `FSETXATTR` of an allowlisted name - and
+    /// nothing else - is rewritten to `0`.
     #[allow(clippy::too_many_arguments)] // an inject unpacked, not an API
     pub(crate) fn submit_fd_meta(
         &mut self,
@@ -630,11 +630,11 @@ impl FsCore {
     }
 
     /// Read xattr `name` from `file` under the reactor's **ambient root**
-    /// (`sqe.personality = 0`) — the sole sanctioned `pers = 0` fd-op. For a
+    /// (`sqe.personality = 0`) - the sole sanctioned `pers = 0` fd-op. For a
     /// privileged `trusted.*`/`security.*` read a request's own identity cannot
     /// perform: `sqe.personality` (not the fd's open-time cred) governs
     /// `fgetxattr`'s `CAP_SYS_ADMIN` check, and `0` runs as the ring owner
-    /// (root). Deliberate — every other fd-op path fails closed on `pers == 0`.
+    /// (root). Deliberate - every other fd-op path fails closed on `pers == 0`.
     pub(crate) fn submit_fgetxattr_as_root(
         &mut self,
         eng: &mut Engine,
@@ -721,7 +721,7 @@ impl FsCore {
                 }
                 TAG_SPLICE => {
                     sqe.opcode = IORING_OP_SPLICE;
-                    // `sqe.fd` (set above) is the *output* — the file being
+                    // `sqe.fd` (set above) is the *output* - the file being
                     // written. The input rides in `splice_fd_in`, which
                     // overlays `file_index`; it is a plain descriptor, so
                     // `SPLICE_F_FD_IN_FIXED` stays clear.
@@ -756,11 +756,11 @@ impl FsCore {
     /// Stage a path op: `STATX`, or one of the directory-entry ops. Every
     /// dirfd is a real fd from an [`Anchor`] (the kernel rejects fixed-table
     /// dirfds on all of these), and every name has already been validated
-    /// as a single component by `Leaf` — except a symlink's target, which is
+    /// as a single component by `Leaf` - except a symlink's target, which is
     /// link content and never resolved, and `STATX`'s empty-path form.
     /// `flags` becomes `sqe.op_flags` (`AT_*`/`RENAME_*`); `len_arg` becomes
     /// `sqe.len` where the op wants a scalar there (statx mask, mkdir mode)
-    /// — for rename/link `sqe.len` is the *second dirfd* instead, per the
+    /// -- for rename/link `sqe.len` is the *second dirfd* instead, per the
     /// kernel's packing, and `len_arg` is unused.
     #[allow(clippy::too_many_arguments)] // an inject unpacked, not an API
     pub(crate) fn submit_path_op(
@@ -856,7 +856,7 @@ impl FsCore {
 
     /// `LINKAT` with `AT_EMPTY_PATH`: give the already-open `file` a name at
     /// `a2 / n2`. This is the only linkat form that can name an **unnamed**
-    /// inode, so it is how an `O_TMPFILE` is materialized — the publish step of
+    /// inode, so it is how an `O_TMPFILE` is materialized - the publish step of
     /// a durable create.
     ///
     /// Two kernel rules govern whether it succeeds, and neither is discoverable
@@ -865,7 +865,7 @@ impl FsCore {
     /// - The file must have been opened `O_TMPFILE` **without `O_EXCL`**.
     ///   `O_EXCL` is precisely the "never link this" opt-out: only the
     ///   non-`O_EXCL` path sets `I_LINKABLE` (`fs/namei.c:4084`), and
-    ///   `vfs_link` rejects a zero-`i_nlink` inode without it (`:4979`) —
+    ///   `vfs_link` rejects a zero-`i_nlink` inode without it (`:4979`) --
     ///   surfacing as `ENOENT`.
     /// - `AT_EMPTY_PATH` requires `fd_file(f)->f_cred == current_cred()` or
     ///   `CAP_DAC_READ_SEARCH` (`fs/namei.c:2631`). io_uring captures the
@@ -938,7 +938,7 @@ impl FsCore {
     /// own completion is ignored ([`TAG_CANCEL`], which `on_cqe` drops); the
     /// cancelled op completes with `ECANCELED` and its CQE runs `take_op` like
     /// any other, dropping the parked `Arc` (close-last). Takes no op-table slot
-    /// — nothing routes its completion — but goes through `eng.stage` so the
+    /// -- nothing routes its completion - but goes through `eng.stage` so the
     /// engine's in-flight accounting stays correct. Best-effort: a stage failure
     /// (ring full) is dropped; server teardown still reaps the op.
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
@@ -950,12 +950,12 @@ impl FsCore {
         });
     }
 
-    /// Cancel every in-flight op owned by `owner` — the connection-teardown
+    /// Cancel every in-flight op owned by `owner` - the connection-teardown
     /// sweep. Replaces the removed `close_owned_by`: with plain-fd files a
     /// connection's fds close by `Arc`-drop, but an op still **in flight** parks
     /// its fd until the CQE, and a closed connection's op is otherwise never
     /// cancelled (a never-completing read would pin the fd until server
-    /// teardown). Cancelling — not force-dropping the entry — is required: the
+    /// teardown). Cancelling - not force-dropping the entry - is required: the
     /// kernel op may still touch the fd or a buffer, so the entry must live
     /// until its (now-`ECANCELED`) CQE reaps it.
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
@@ -1011,7 +1011,7 @@ impl FsCore {
 
         // A successful OPENAT2 returns a real fd as its result; wrap it in an
         // `Arc<OwnedFd>`. If nobody takes it (a gone channel receiver, or a
-        // dropped embedded callback) the `Arc` drops and the fd closes — no
+        // dropped embedded callback) the `Arc` drops and the fd closes - no
         // leak, no explicit close op. The op entry's parked `file` `Arc` (for
         // an fd op) was already dropped by `take_op`'s `clear`, giving
         // close-last ordering by ownership.
@@ -1044,7 +1044,7 @@ impl FsCore {
     }
 
     /// Teardown-drain routing: reply and free, but never stage (the drain is
-    /// cancelling everything; deferred closes are moot — the ring teardown
+    /// cancelling everything; deferred closes are moot - the ring teardown
     /// closes the whole registered table).
     pub(crate) fn on_drain_cqe(&mut self, cqe: &IoUringCqe) {
         let (tag, op_slot, gen32) = unpack_raw(cqe.user_data);
@@ -1055,13 +1055,13 @@ impl FsCore {
             return;
         };
         let Completed { waiter, bufs, stat } = done;
-        // Teardown: the loop is dying — just report the outcome and hand any
+        // Teardown: the loop is dying - just report the outcome and hand any
         // buffers back. A file's fd is released when its op entry (and thus its
         // parked `Arc`) is dropped with the ring teardown.
         deliver(waiter, map_res(cqe.res), bufs, None, stat);
     }
 
-    /// Leak the op table without dropping it — used ONLY when a teardown
+    /// Leak the op table without dropping it - used ONLY when a teardown
     /// drain failed with ops possibly still in flight. The kernel may still
     /// write into a `READV`/`FGETXATTR` destination or the boxed `STATX`
     /// buffer until its CQE reaps, so freeing those here would be a
@@ -1075,7 +1075,7 @@ impl FsCore {
     // ---- internals -----------------------------------------------------
 
     /// Take a completed op entry out: returns its waiter and payloads and
-    /// frees the slot (generation bumped) — the freed-before-fire rule.
+    /// frees the slot (generation bumped) - the freed-before-fire rule.
     fn take_op(
         &mut self,
         tag: u8,
@@ -1104,7 +1104,7 @@ impl FsCore {
 
     /// Fail a just-reserved op entry before its SQE ever reached the kernel:
     /// report and free (buffers go back to the caller, as on completion). A
-    /// stage failure never fires an embedded callback — `let _ =` drops it,
+    /// stage failure never fires an embedded callback - `let _ =` drops it,
     /// closing the connection via its captured `Deferred`.
     fn fail_op(&mut self, op_slot: u32, err: Errno) {
         let entry = &mut self.ops[op_slot as usize];
@@ -1144,7 +1144,7 @@ impl FsDone {
         self.result.map_err(Into::into)
     }
 
-    /// The freshly opened file — present only for a successful `open`.
+    /// The freshly opened file - present only for a successful `open`.
     pub fn file(&self) -> Option<File> {
         self.file.clone()
     }
@@ -1154,7 +1154,7 @@ impl FsDone {
         self.bufs
     }
 
-    /// The `statx` metadata — present only for a successful `statx`.
+    /// The `statx` metadata - present only for a successful `statx`.
     pub fn stat(&self) -> Option<Statx> {
         self.stat.as_deref().copied().map(Statx::from_raw)
     }
@@ -1165,7 +1165,7 @@ impl FsDone {
 /// the server's ring, checked as the [`Personality`] passed to it, and its
 /// completion fires the `on_done` callback **inline on the loop thread**.
 ///
-/// **Re-entrancy:** callbacks run inside dispatch — never block, and drive the
+/// **Re-entrancy:** callbacks run inside dispatch - never block, and drive the
 /// ring only through this facade. A submission or argument-validation failure
 /// drops `on_done` (and the continuation it captured, closing the connection),
 /// so these methods return `()`.
@@ -1244,7 +1244,7 @@ impl<'a> FsConn<'a> {
     }
 
     /// Scattered positional read with per-operation flags (`preadv2(2)`).
-    /// See [`RwFlags`] — an unsupported flag fails the read with
+    /// See [`RwFlags`] - an unsupported flag fails the read with
     /// `EOPNOTSUPP` rather than being ignored.
     #[allow(clippy::too_many_arguments)]
     pub fn preadv2<F>(
@@ -1263,7 +1263,7 @@ impl<'a> FsConn<'a> {
 
     /// Gathered positional write with per-operation flags (`pwritev2(2)`).
     /// [`RwFlags::RWF_DSYNC`] makes the write itself durable, which can stand
-    /// in for a following `fdatasync` — worth measuring on ZFS, where a
+    /// in for a following `fdatasync` - worth measuring on ZFS, where a
     /// synchronous write goes through the ZIL.
     #[allow(clippy::too_many_arguments)]
     pub fn pwritev2<F>(
@@ -1406,7 +1406,7 @@ impl<'a> FsConn<'a> {
     }
 
     /// Read extended attribute `name` from `f` into `buf` as `who`. Needs
-    /// Linux ≥ 6.13; fails closed (`EOPNOTSUPP`) otherwise.
+    /// Linux >= 6.13; fails closed (`EOPNOTSUPP`) otherwise.
     pub fn fgetxattr<F>(
         &mut self,
         who: Personality,
@@ -1431,11 +1431,11 @@ impl<'a> FsConn<'a> {
     }
 
     /// Read extended attribute `name` from `f` under the reactor's **ambient
-    /// root** — no `who`. The one sanctioned privileged read: for a
+    /// root** - no `who`. The one sanctioned privileged read: for a
     /// `trusted.*`/`security.*` attribute a request's own identity cannot see
     /// (`sqe.personality`, not the fd's open-time cred, governs `fgetxattr`'s
     /// `CAP_SYS_ADMIN` check; `personality = 0` runs as the ring owner, root).
-    /// Needs Linux ≥ 6.13; fails closed (`EOPNOTSUPP`) otherwise.
+    /// Needs Linux >= 6.13; fails closed (`EOPNOTSUPP`) otherwise.
     pub fn fgetxattr_as_root<F>(
         &mut self,
         f: File,
@@ -1479,7 +1479,7 @@ impl<'a> FsConn<'a> {
         );
     }
 
-    /// Set `f`'s length to `len` (`ftruncate`). Needs Linux ≥ 6.9.
+    /// Set `f`'s length to `len` (`ftruncate`). Needs Linux >= 6.9.
     pub fn ftruncate<F>(
         &mut self,
         who: Personality,
@@ -1530,7 +1530,7 @@ impl<'a> FsConn<'a> {
 
     /// Advise the kernel how a range of `f` will be used (`posix_fadvise`);
     /// `len` of 0 means to the end of the file. See
-    /// [`Advice`](crate::uring_fs::Advice) — on ZFS these reach the ARC, not
+    /// [`Advice`](crate::uring_fs::Advice) - on ZFS these reach the ARC, not
     /// just the page cache.
     pub fn fadvise<F>(
         &mut self,
@@ -1562,19 +1562,19 @@ impl<'a> FsConn<'a> {
     /// This is the ingest half of a zero-copy body path: whoever fills the
     /// pipe (a socket splice, a `vmsplice`) never materializes the bytes, and
     /// neither does this. `pipe` is a plain descriptor the caller keeps open
-    /// until the completion fires — it is **not** taken into the fixed-file
+    /// until the completion fires - it is **not** taken into the fixed-file
     /// pool, so it does not consume a `FsConfig::files` slot.
     ///
     /// # Short moves are normal
     ///
     /// A pipe delivers what it has, so a completion carrying fewer than `len`
     /// bytes is ordinary progress, not end of input: resubmit the remainder.
-    /// [`FsDone::result`] is the byte count either way — the kernel's
+    /// [`FsDone::result`] is the byte count either way - the kernel's
     /// `req_set_fail` on a short move (`io_splice`, `io_uring/splice.c`)
     /// governs only whether an `IOSQE_IO_LINK` chain continues, which this
     /// does not use.
     ///
-    /// Splice cannot hash what it moves — nothing passes through userspace.
+    /// Splice cannot hash what it moves - nothing passes through userspace.
     /// A body that needs an ETag has to be read conventionally, which is the
     /// tradeoff this exists to let a caller make per request.
     pub fn splice_from_pipe<F>(
@@ -1756,7 +1756,7 @@ impl<'a> FsConn<'a> {
     }
 
     /// Give the already-open `f` a name at `new_leaf` in `new`
-    /// (`linkat` with `AT_EMPTY_PATH`) — the publish step for an `O_TMPFILE`
+    /// (`linkat` with `AT_EMPTY_PATH`) - the publish step for an `O_TMPFILE`
     /// create. See [`FsHandle::linkat_file`](crate::uring_fs::FsHandle::linkat_file)
     /// for the two kernel requirements (`O_TMPFILE` without `O_EXCL`, and the
     /// *same* personality that opened `f`), both of which fail as `ENOENT`.
@@ -1781,7 +1781,7 @@ impl<'a> FsConn<'a> {
     }
 
     /// Close `f`: drop the handle. Its fd closes once the last reference (this
-    /// handle plus any op still parking a clone) drops — close-last by
+    /// handle plus any op still parking a clone) drops - close-last by
     /// ownership. Fire-and-forget; there is no completion callback.
     pub fn close(&mut self, f: File) {
         drop(f);
@@ -1968,30 +1968,30 @@ impl FsConn<'_> {
     /// holds is released instead of stranded.
     ///
     /// The consumer shape this exists for: batch a request's whole blocking
-    /// metadata tail into **one job** — several synchronous calls, one pool
+    /// metadata tail into **one job** - several synchronous calls, one pool
     /// round trip, one delivery. [`statx`](crate::sync_fs::statx) plus
     /// [`fgetxattr`](crate::sync_fs::xattr::fgetxattr) reads before streaming
     /// a body, [`fsetxattr`](crate::sync_fs::xattr::fsetxattr) writes after
     /// one. A cached metadata syscall costs less than any round trip, so the
     /// win comes from paying one handoff per batch rather than one per call.
     ///
-    /// The job contract — every derived facility above and
+    /// The job contract - every derived facility above and
     /// [`offload_result`](Self::offload_result) share it:
     ///
     /// - **Jobs take open [`File`]s or descriptors, never names.** The
-    ///   credential-checked step — the open, any path op — runs first on the
+    ///   credential-checked step - the open, any path op - runs first on the
     ///   ring as a personality-stamped SQE; the job then runs at the
     ///   reactor's **ambient credentials** against the already-authorized fd,
     ///   and the kernel checks nothing in it against a request identity. See
     ///   [`fset_zfs_attrs`](Self::fset_zfs_attrs) and
     ///   `FsCore::remove_priv_xattr` for the same reasoning.
-    /// - **Never mutate thread-wide state from a job** — credentials
+    /// - **Never mutate thread-wide state from a job** - credentials
     ///   (`setfsuid`), umask, signal dispositions. The workers are shared
     ///   with every consumer of the pool, the reactor's privileged offloads
     ///   included.
     /// - **An offload is never cancelled.** `cancel_owned_by` sweeps ring
     ///   ops only; the job always runs to completion and its delivery always
-    ///   fires, possibly for an owner that is gone — a continuation must
+    ///   fires, possibly for an owner that is gone - a continuation must
     ///   already tolerate that (its facade cannot `open`, and a deferred
     ///   reply is generation-checked).
     /// - **The registry and pool queue are uncapped.** Bound in-flight jobs
@@ -2021,7 +2021,7 @@ impl FsConn<'_> {
                 .unwrap_or_else(|e| e.into_inner())
                 .push_back((token, Box::new(r)));
             // Wake the loop to drain the completion (counting eventfd; the loop
-            // re-arms the READ, so no poke is lost — the inject-path pattern).
+            // re-arms the READ, so no poke is lost - the inject-path pattern).
             wake.wake.poke();
         }));
     }
@@ -2079,7 +2079,7 @@ impl FsConn<'_> {
         );
     }
 
-    /// Filesystem statistics for the mount `anchor` lives on — a whole tree's
+    /// Filesystem statistics for the mount `anchor` lives on - a whole tree's
     /// capacity without opening anything inside it.
     ///
     /// Takes an `O_PATH` descriptor, which most fd-taking calls reject:
@@ -2112,7 +2112,7 @@ impl FsConn<'_> {
         );
     }
 
-    /// Replace `f`'s ZFS attributes with `attrs`. **The mask is absolute** —
+    /// Replace `f`'s ZFS attributes with `attrs`. **The mask is absolute** --
     /// visible bits absent from `attrs` are cleared, so modify what
     /// [`fget_zfs_attrs`](Self::fget_zfs_attrs) returned.
     ///
@@ -2124,7 +2124,7 @@ impl FsConn<'_> {
     /// ownership to clear, where `IMMUTABLE` needs `CAP_LINUX_IMMUTABLE`.
     ///
     /// Setting `IMMUTABLE` also seals the file's extended attributes
-    /// (`may_write_xattr`, `fs/xattr.c`) — write metadata that belongs with a
+    /// (`may_write_xattr`, `fs/xattr.c`) - write metadata that belongs with a
     /// locked object before locking it.
     pub fn fset_zfs_attrs<F>(&mut self, f: File, attrs: ZfsAttr, on_done: F)
     where
@@ -2137,7 +2137,7 @@ impl FsConn<'_> {
     }
 
     /// Copy `len` bytes from `src[off_src..]` to `dst[off_dst..]`, trying a
-    /// metadata-only block clone first (`FICLONERANGE` — on a pool with ZFS
+    /// metadata-only block clone first (`FICLONERANGE` - on a pool with ZFS
     /// block cloning this moves no data) and falling back to a real copy when
     /// the clone is refused. Delivers the bytes copied.
     ///
@@ -2174,7 +2174,7 @@ impl FsConn<'_> {
     /// (`fremovexattr`), or `EPERM` if `name` is not one the reactor's
     /// [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs) policy claims.
     ///
-    /// Takes no [`Personality`] — see `FsCore::remove_priv_xattr` for why
+    /// Takes no [`Personality`] - see `FsCore::remove_priv_xattr` for why
     /// the allowlist has to stand in for one here.
     pub fn fremovexattr<F>(&mut self, f: File, name: CString, on_done: F)
     where
@@ -2258,8 +2258,8 @@ impl FsConn<'_> {
         });
     }
 
-    /// Read the next batch of entry names for `walk` off-loop — one job per walk
-    /// (pull-style, natural backpressure) — delivering a [`NameBatch`] to
+    /// Read the next batch of entry names for `walk` off-loop - one job per walk
+    /// (pull-style, natural backpressure) - delivering a [`NameBatch`] to
     /// `on_batch` on the reactor thread. The per-name enrichment the caller does
     /// (open + fgetxattr) stays on-loop.
     ///
@@ -2386,8 +2386,8 @@ mod hybrid_tests {
     }
 
     /// Build a fresh owner-scoped `FsConn`, run `kickoff` on it, then drive the
-    /// loop — firing embedded completions and pool deliveries, re-arming the
-    /// wake — until `done`. Mirrors the standalone host's run_loop.
+    /// loop - firing embedded completions and pool deliveries, re-arming the
+    /// wake - until `done`. Mirrors the standalone host's run_loop.
     fn drive(
         eng: &mut Engine,
         fs: &mut FsCore,
@@ -2454,7 +2454,7 @@ mod hybrid_tests {
     /// Run `f` with panic printing silenced, serialized against every other
     /// hook-swapping test: the hook is process-global and tests run as
     /// threads in one binary, so two unserialized swaps can interleave and
-    /// strand the silent hook. Keep assertions outside `f` — a panic inside
+    /// strand the silent hook. Keep assertions outside `f` - a panic inside
     /// it leaves the hook silenced for the rest of the run.
     fn with_silent_panics<R>(f: impl FnOnce() -> R) -> R {
         static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2515,8 +2515,8 @@ mod hybrid_tests {
         );
     }
 
-    /// `offload_result` maps a panicked job to exactly `EIO` — the documented
-    /// contract — while an `Ok` job in the same drive passes its value
+    /// `offload_result` maps a panicked job to exactly `EIO` - the documented
+    /// contract - while an `Ok` job in the same drive passes its value
     /// through untouched, and neither strands its registry entry.
     #[test]
     fn offload_result_maps_a_panicked_job_to_eio() {
@@ -2660,7 +2660,7 @@ mod hybrid_tests {
                 c.open_dir(me, &anchor, move |res, _c| {
                     let walk = res.expect("open_dir");
                     // Snapshot the inner, then drop `walk` at the end of this
-                    // closure (no batch in flight → Drop closes the DIR* now).
+                    // closure (no batch in flight -> Drop closes the DIR* now).
                     *cap2.borrow_mut() = Some(walk.inner.clone());
                 });
             },
@@ -2809,9 +2809,9 @@ fn map_res(res: i32) -> Result<i32, Errno> {
 }
 
 /// Route a completed op's outcome to its channel waiter. A gone caller (a
-/// dropped receiver — a `File`/future dropped before awaiting) simply
+/// dropped receiver - a `File`/future dropped before awaiting) simply
 /// orphans the op; nothing to do. (A successful `open` does NOT route through
-/// here — `on_cqe` wraps its fd in an `Arc<OwnedFd>`, and a gone receiver
+/// here - `on_cqe` wraps its fd in an `Arc<OwnedFd>`, and a gone receiver
 /// drops that `Arc`, which closes the fd. No close op is staged, and there is
 /// no slot to leak.)
 fn deliver(
@@ -2826,7 +2826,7 @@ fn deliver(
             let _ = tx.send(FsOutcome::new(res, bufs, file, stat));
         }
         // Submission failure / teardown of an embedded op: drop the callback
-        // unfired — dropping the continuation it captured closes the
+        // unfired - dropping the continuation it captured closes the
         // connection (see [`EmbeddedCb`]). Nothing else routes it.
         Some(FsWaiter::Embedded { cb, .. }) => {
             drop(cb);
@@ -2872,7 +2872,7 @@ pub(crate) fn deliver_embedded(
 /// fuzzer drives fuzzed submit/complete schedules against a real (never-flushed)
 /// `Engine`, feeds a mix of correct and anomalous CQEs, and asserts: op slots
 /// free exactly once (`op_free` reconciles), every synthesized fd closes exactly
-/// once (never early — a parked clone outlives a dropped caller — never leaked),
+/// once (never early - a parked clone outlives a dropped caller - never leaked),
 /// and stale/wrong-tag/recycled completions are inert. `ROUTING_FUZZ_SEEDS=N`
 /// overrides the seed count.
 #[cfg(all(test, not(loom)))]
@@ -2884,7 +2884,7 @@ mod routing_fuzz {
 
     const OP_SLOTS: u32 = 32;
     // The ring is sized far above any run's staged SQEs, so `push_sqe` never
-    // flushes to the kernel — routing runs purely in userspace.
+    // flushes to the kernel - routing runs purely in userspace.
     const RING_ENTRIES: u32 = 1024;
     const POOL: u32 = 8;
 
@@ -2950,7 +2950,7 @@ mod routing_fuzz {
         (free, ops)
     }
 
-    /// In-flight ops as `(tag, slot, generation-low)` — the CQEs a real kernel
+    /// In-flight ops as `(tag, slot, generation-low)` - the CQEs a real kernel
     /// could deliver.
     fn inflight(c: &FsCore) -> Vec<(u8, u32, u32)> {
         c.ops
@@ -3060,7 +3060,7 @@ mod routing_fuzz {
                 chan(&tx),
             );
         }
-        // Teardown reaps each in-flight op via the drain path → parked Arcs drop.
+        // Teardown reaps each in-flight op via the drain path -> parked Arcs drop.
         for (tag, slot, gen) in inflight(&core) {
             let cqe = IoUringCqe {
                 user_data: pack_raw(tag, slot, gen),
@@ -3105,7 +3105,7 @@ mod routing_fuzz {
         let mut rng = Rng::new(seed);
         let mut core = FsCore::new(OP_SLOTS);
         let (tx, rx) = mpsc::channel::<FsOutcome>();
-        // Weak refs to every synthesized fd — `upgrade() == None` means closed.
+        // Weak refs to every synthesized fd - `upgrade() == None` means closed.
         let mut tracked: Vec<Weak<OwnedFd>> = Vec::new();
         // Caller-held files, dropped at fuzzed points (and all at the end).
         let mut held: Vec<File> = Vec::new();
@@ -3193,7 +3193,7 @@ mod routing_fuzz {
                     }
                 }
                 6 => {
-                    // An anomalous completion — MUST mutate nothing.
+                    // An anomalous completion - MUST mutate nothing.
                     let fly = inflight(&core);
                     let snap = snapshot(&core);
                     match rng.below(3) {
@@ -3224,7 +3224,7 @@ mod routing_fuzz {
                 _ => {}
             }
             // Occasionally drop a caller file mid-flight (parked clone must hold
-            // the fd until its own CQE — the close-last guarantee).
+            // the fd until its own CQE - the close-last guarantee).
             if !held.is_empty() && rng.below(3) == 0 {
                 let i = rng.below(held.len() as u32) as usize;
                 held.swap_remove(i);
@@ -3269,12 +3269,12 @@ mod routing_fuzz {
 // A worker finishing an offload pushes its result under the `completions`
 // mutex and then pokes the wake eventfd (`FsConn::offload`, above); the loop
 // wakes, drains the queue with `take_pool_completions`, and re-arms the READ.
-// The claim in that code — "counting eventfd; the loop re-arms the READ, so no
-// poke is lost" — is a lost-wakeup argument, and until now nothing tested it.
+// The claim in that code - "counting eventfd; the loop re-arms the READ, so no
+// poke is lost" - is a lost-wakeup argument, and until now nothing tested it.
 //
 // The order matters in one direction only: push *then* poke. Poke first and a
 // loop can wake, find the queue empty, drain nothing, and park again while the
-// result it was woken for is pushed behind it — the continuation in
+// result it was woken for is pushed behind it - the continuation in
 // `offload_reg` then never fires, and the caller waits forever.
 //
 // The eventfd is the `cfg(loom)` counter in `crate::uring::wake`, so what this
@@ -3316,7 +3316,7 @@ mod loom_tests {
                 }));
             }
 
-            // The loop: wake, drain, re-arm — repeatedly, as the reactor does.
+            // The loop: wake, drain, re-arm - repeatedly, as the reactor does.
             // `take_pool_completions` discards tokens with no registered
             // continuation, so count what actually came off the queue instead.
             let mut seen = 0usize;
@@ -3347,7 +3347,7 @@ mod loom_tests {
 
     /// A completion whose continuation *is* registered comes back out of
     /// `take_pool_completions` exactly once, and the registry entry is
-    /// consumed with it — a second drain must not fire it again.
+    /// consumed with it - a second drain must not fire it again.
     #[test]
     fn loom_offload_delivers_each_completion_once() {
         bounded_model(|| {

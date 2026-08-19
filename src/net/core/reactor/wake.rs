@@ -15,8 +15,8 @@ impl<U> Reactor<U> {
         }
     }
 
-    /// Arm the wake-eventfd `READ` under the stream wake tag (the mechanics —
-    /// and why a direct counter read beats a poll — live in
+    /// Arm the wake-eventfd `READ` under the stream wake tag (the mechanics --
+    /// and why a direct counter read beats a poll - live in
     /// [`crate::uring::engine::Engine::arm_wake`]).
     pub(crate) fn arm_wake(&mut self) -> errno::Result<()> {
         self.engine.arm_wake(pack(Op::Wake, 0, 0))

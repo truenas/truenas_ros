@@ -1,7 +1,7 @@
 //! The `http` codec on the io_uring reactor: a minimal HTTP/1.1 endpoint.
 //!
-//! Wires `http::protocol` — accept, per-connection state, and a request
-//! handler — onto a loopback `net::server`. Everything HTTP (framing,
+//! Wires `http::protocol` - accept, per-connection state, and a request
+//! handler - onto a loopback `net::server`. Everything HTTP (framing,
 //! keep-alive, 100-continue, error farewells) is the codec's job; this file
 //! is only routing.
 //!

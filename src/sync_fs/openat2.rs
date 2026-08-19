@@ -1,4 +1,4 @@
-//! `openat2(2)` — open with fine-grained path-resolution control.
+//! `openat2(2)` - open with fine-grained path-resolution control.
 
 use super::{Mode, OFlag};
 use crate::errno::{self, retry_on_eintr};

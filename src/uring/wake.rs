@@ -1,6 +1,6 @@
 //! The wake eventfd and the cross-thread loop flags it serves: the one block
 //! of state shared (`Arc`) between a loop thread and every cross-thread
-//! handle a domain mints (shutdown handles, deferred replies, pushes, …).
+//! handle a domain mints (shutdown handles, deferred replies, pushes, ...).
 
 use crate::errno;
 #[cfg(not(loom))]
@@ -8,7 +8,7 @@ use crate::errno::Errno;
 #[cfg(not(loom))]
 use crate::fd::owned_from_raw;
 // `LoopShared`'s flags are loom-modelled (`loom_graceful_publication`), so the
-// atomics come from `crate::sync` — std's outside `--cfg loom`.
+// atomics come from `crate::sync` - std's outside `--cfg loom`.
 use crate::sync::atomic::{AtomicBool, AtomicU64};
 #[cfg(not(loom))]
 use std::ffi::c_void;
@@ -35,7 +35,7 @@ pub(crate) struct LoopShared {
 ///
 /// Under `--cfg loom` the fd is replaced by a counter plus a condvar. A real
 /// eventfd cannot be used in a model: `loom::model` re-runs its closure once
-/// per interleaving — thousands of times — and each run would open another
+/// per interleaving - thousands of times - and each run would open another
 /// descriptor. The stand-in reproduces the two properties the no-lost-wakeup
 /// argument actually rests on: pokes **accumulate**, and a drain takes the
 /// whole count at once. Anything a model proves is therefore conditional on
@@ -110,7 +110,7 @@ impl WakeHandle {
         }
     }
 
-    /// Model-only: what the loop's armed `READ` does when it completes — block
+    /// Model-only: what the loop's armed `READ` does when it completes - block
     /// until the counter is non-zero, then drain it to 0 in one go. Returns
     /// the count consumed.
     ///
@@ -171,7 +171,7 @@ mod loom_tests {
     }
 
     /// Observing `graceful` must imply observing the grace period it was
-    /// published with — including against a racing hard `shutdown()`, which
+    /// published with - including against a racing hard `shutdown()`, which
     /// writes a different flag through the same shared block.
     #[test]
     fn loom_graceful_publication() {
@@ -213,7 +213,7 @@ mod loom_tests {
 
     /// Pokes accumulate rather than coalescing to a single edge, and a drain
     /// takes the whole count. This is the eventfd property the "no poke is
-    /// lost" argument rests on — modelled here, assumed of the kernel.
+    /// lost" argument rests on - modelled here, assumed of the kernel.
     #[test]
     fn loom_wake_pokes_accumulate() {
         loom::model(|| {

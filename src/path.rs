@@ -1,4 +1,4 @@
-//! The [`TnPath`] trait — passing Rust paths to syscalls as C strings.
+//! The [`TnPath`] trait - passing Rust paths to syscalls as C strings.
 //!
 //! It converts `str`/`OsStr`/`Path`/`[u8]`/
 //! `CStr` into a NUL-terminated `CStr` with a stack buffer for short paths and

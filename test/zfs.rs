@@ -1,5 +1,5 @@
 //! Privileged, ZFS-backed integration tests: real NFSv4 and POSIX ACLs on ZFS
-//! datasets, plus ZFS snapshot detection — the paths that a plain tmpfs cannot
+//! datasets, plus ZFS snapshot detection - the paths that a plain tmpfs cannot
 //! exercise.
 //!
 //! Each test resolves its dataset directory from, in order: the
@@ -67,7 +67,7 @@ fn nfs4_codec_and_named_user_roundtrip() {
 
     let acl = match fgetacl(f.as_fd()) {
         Ok(Acl::Nfs4(a)) => a,
-        // The path exists but isn't an NFS4-ACL filesystem here — skip rather
+        // The path exists but isn't an NFS4-ACL filesystem here - skip rather
         // than fail (e.g. a placeholder `/NFSV4ACL` dir on a non-ZFS host).
         _ => {
             let _ = std::fs::remove_file(&path);
@@ -138,7 +138,7 @@ fn posix_named_user_roundtrip_on_zfs() {
     // Fresh file: a trivial ACL synthesised from the mode bits.
     let acl = match fgetacl(f.as_fd()) {
         Ok(Acl::Posix(a)) => a,
-        // Not a POSIX-ACL filesystem here — skip.
+        // Not a POSIX-ACL filesystem here - skip.
         _ => {
             let _ = std::fs::remove_file(&path);
             return skip(

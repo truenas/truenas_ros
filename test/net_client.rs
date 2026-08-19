@@ -1,4 +1,4 @@
-//! Integration tests for the `net::client` module — a live loopback client
+//! Integration tests for the `net::client` module - a live loopback client
 //! driving a real in-process [`net::server`](truenas_ros::net::server) over a
 //! 4-byte big-endian length prefix. Beyond the basic echo round-trip they cover
 //! the feature-complete plain-TCP surface: blocking vs. non-blocking connect,
@@ -7,7 +7,7 @@
 //! bounded [`next_event_timeout`](Client::next_event_timeout) pump, and
 //! stale-`ConnId` safety.
 //!
-//! These are client↔server *interop* tests, so they need both roles built —
+//! These are client<->server *interop* tests, so they need both roles built --
 //! hence the `net-server` gate alongside `net-client`. Like `test/net_server.rs`
 //! they **skip** (return early) when io_uring is unavailable (the CI/dev sandbox
 //! blocks the io_uring syscalls with ENOSYS/EPERM/EACCES); set
@@ -40,7 +40,7 @@ use truenas_ros::net::server::{
 use truenas_ros::net::{ClientAddr, CloseReason, Framing};
 use truenas_ros::{Errno, Error};
 
-/// Errors that mean "io_uring is unavailable here" — an environmental skip.
+/// Errors that mean "io_uring is unavailable here" - an environmental skip.
 /// Excludes `EINVAL` (a real setup bug we want to fail on).
 fn is_unavailable(e: &Error) -> bool {
     matches!(
@@ -79,7 +79,7 @@ fn echo(_header: &[u8], body: &[u8], _peer: &ClientAddr) -> Option<Vec<u8>> {
 
 /// A server handler that replies with a bare 4-byte length prefix declaring a
 /// 100-byte body it never sends. The client, having read the prefix, arms a
-/// (non-idle) body recv that carries the core request clock — so its
+/// (non-idle) body recv that carries the core request clock - so its
 /// `response_timeout` fires and evicts the stalled connection. A normal echo
 /// handler can't express a partial frame; a hand-built prefix can.
 fn stalled_reply(_h: &[u8], _b: &[u8], _p: &ClientAddr) -> Option<Vec<u8>> {
@@ -164,7 +164,7 @@ fn echo_client(v4: SocketAddrV4, msgs: &[&[u8]]) -> io::Result<Vec<Vec<u8>>> {
     }
 
     // Graceful close, then drive it to the Closed event (the idle reply recv is
-    // cancelled and the teardown reclaims the slot — no other traffic is
+    // cancelled and the teardown reclaims the slot - no other traffic is
     // expected on an echo connection).
     client.close(conn);
     match client.next_event()? {
@@ -205,7 +205,7 @@ fn tcp_echo_roundtrip() {
 
 #[test]
 fn tcp_keepalive() {
-    // Several requests on ONE connection — proves the connection is reused
+    // Several requests on ONE connection - proves the connection is reused
     // (each request's reply is FIFO-correlated to it).
     let msgs: Vec<Vec<u8>> =
         (0..12).map(|i| format!("req-{i}").into_bytes()).collect();
@@ -553,7 +553,7 @@ fn tcp_body_placement() {
 fn tcp_next_event_timeout() {
     // A bounded wait on an idle-but-open connection (no idle_timeout): the
     // deadline fires, `next_event_timeout` returns None, and the connection is
-    // left open — repeatable, so the deadline is fully reaped each call.
+    // left open - repeatable, so the deadline is fully reaped each call.
     with_server(echo, |v4| {
         let mut client = Client::new(ClientConfig::default(), client_framer())
             .map_err(to_io)?;
@@ -699,7 +699,7 @@ fn splice_framer() -> impl FnMut(&[u8], &mut RawFd) -> Framing {
 #[test]
 fn tcp_splice_body() {
     // A large reply body splices straight from the socket to a blocking pipe
-    // write end (stashed in `U`) — zero-copy, never buffered — surfacing as
+    // write end (stashed in `U`) - zero-copy, never buffered - surfacing as
     // `Event::Splice{body_len}`; a reader thread drains exactly that many bytes
     // off the pipe read end and checks them intact.
     let mut fds = [0 as libc::c_int; 2];
@@ -781,7 +781,7 @@ fn tcp_splice_bad_fd() {
     // SAFETY: `pipe(2)` fills {read, write}.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
     let (pipe_rd, pipe_wr) = (fds[0], fds[1]);
-    // SAFETY: make the write end non-blocking — the rejected case.
+    // SAFETY: make the write end non-blocking - the rejected case.
     unsafe {
         let fl = libc::fcntl(pipe_wr, libc::F_GETFL);
         libc::fcntl(pipe_wr, libc::F_SETFL, fl | libc::O_NONBLOCK);
@@ -824,11 +824,11 @@ fn tcp_splice_bad_fd() {
 //
 // A real end-to-end TLS handshake around the client's kernel-TLS transport:
 // the server worker drives `truenas_ktls` (the packaged accept side), the
-// client runs `SSL_connect` in its own worker — exactly the split a real
+// client runs `SSL_connect` in its own worker - exactly the split a real
 // consumer implements. The library brings no TLS crate; the client side uses
 // OpenSSL as a dev-dependency, raw, because the crate has no connect role.
 // Skips when the kernel lacks the `tls` ULP (or `FIXED_FD_INSTALL`), or when
-// libssl cannot engage kTLS at all ([`ktls_engages`] — Ubuntu ships OpenSSL
+// libssl cannot engage kTLS at all ([`ktls_engages`] - Ubuntu ships OpenSSL
 // 3.0 without `enable-ktls`); force on a known-good host with
 // `TRUENAS_ROS_REQUIRE_KTLS`.
 
@@ -842,7 +842,7 @@ const SOL_TLS: libc::c_int = 282;
 const TLS_TX: libc::c_int = 1;
 const TLS_RX: libc::c_int = 2;
 
-/// True when the `kTLS ... TLS ULP` server-bind validation fires — the kernel
+/// True when the `kTLS ... TLS ULP` server-bind validation fires - the kernel
 /// lacks `CONFIG_TLS`. Force the test on known-good hosts with
 /// `TRUENAS_ROS_REQUIRE_KTLS`.
 fn ktls_unsupported(e: &Error) -> bool {
@@ -858,7 +858,7 @@ fn ktls_unsupported(e: &Error) -> bool {
 }
 
 /// True when a `tls` connect fails because this kernel can't furnish the fd
-/// (`FIXED_FD_INSTALL`) or run kTLS (the ULP) — the client-side skip for the
+/// (`FIXED_FD_INSTALL`) or run kTLS (the ULP) - the client-side skip for the
 /// raw-listener kTLS tests (the echo test skips at the server's bind instead).
 fn ktls_connect_unsupported(e: &io::Error) -> bool {
     let unsupported = e.kind() == io::ErrorKind::Unsupported;
@@ -911,9 +911,9 @@ fn ktls_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> Acceptor {
 }
 
 /// The server's handshake worker: run the blocking server TLS handshake on
-/// the furnished fd through `truenas_ktls` — which installs kernel TLS on the
+/// the furnished fd through `truenas_ktls` - which installs kernel TLS on the
 /// socket and refuses the connection unless the readback shows it engaged
-/// both directions — then close the furnished fd (the pool descriptor keeps
+/// both directions - then close the furnished fd (the pool descriptor keeps
 /// the kTLS socket).
 fn ktls_server_handshake(fd: RawFd, acceptor: &Acceptor) -> Result<(), String> {
     // This worker owns the furnished fd: EVERY return path must close it (the
@@ -933,7 +933,7 @@ fn ktls_server_handshake(fd: RawFd, acceptor: &Acceptor) -> Result<(), String> {
         let fl = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK);
     }
-    // SAFETY: `fd` stays open for the borrow — `_fd_owner` closes it only on
+    // SAFETY: `fd` stays open for the borrow - `_fd_owner` closes it only on
     // return.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     acceptor
@@ -955,7 +955,7 @@ fn ktls_client_ctx() -> SslContext {
 /// (`SSL_connect`) on the furnished fd over a socket BIO (so OpenSSL installs
 /// kTLS on the socket), confirm kTLS engaged both directions, then close the
 /// furnished fd. The mirror of `ktls_server_handshake`, `SSL_connect` for
-/// `SSL_accept` — exactly what a `Client::set_tls_handshake` worker does.
+/// `SSL_accept` - exactly what a `Client::set_tls_handshake` worker does.
 fn ktls_client_handshake(fd: RawFd, ctx: &SslContext) -> Result<(), String> {
     struct FdCloser(RawFd);
     impl Drop for FdCloser {
@@ -987,7 +987,7 @@ fn ktls_client_handshake(fd: RawFd, ctx: &SslContext) -> Result<(), String> {
         return Err(format!("SSL_connect returned {rc}"));
     }
     confirm_ktls(fd)?;
-    drop(ssl); // BIO_NOCLOSE → fd not closed; kTLS stays on the socket
+    drop(ssl); // BIO_NOCLOSE -> fd not closed; kTLS stays on the socket
     Ok(()) // _fd_owner closes the furnished fd
 }
 
@@ -1020,8 +1020,8 @@ fn confirm_ktls(fd: RawFd) -> Result<(), String> {
 /// The handshake then completes but the acceptor's readback (server side) and
 /// `confirm_ktls` (client side) refuse, every worker rejects, and the
 /// data-path tests would fail rather than skip. Probe once with a loopback
-/// handshake — the same acceptor, client context, and confirmation the tests
-/// use — so those tests can skip when this host's OpenSSL cannot engage kTLS.
+/// handshake - the same acceptor, client context, and confirmation the tests
+/// use - so those tests can skip when this host's OpenSSL cannot engage kTLS.
 fn ktls_engages() -> &'static Result<(), String> {
     static PROBE: std::sync::OnceLock<Result<(), String>> =
         std::sync::OnceLock::new();
@@ -1063,7 +1063,7 @@ fn ktls_engages() -> &'static Result<(), String> {
 }
 
 /// The OpenSSL-side skip for the kTLS data-path tests: `false` when this host
-/// engages kTLS end to end, `true` (with a visible note) when it cannot — or
+/// engages kTLS end to end, `true` (with a visible note) when it cannot - or
 /// a hard failure when `TRUENAS_ROS_REQUIRE_KTLS` says skipping is forbidden.
 fn ktls_openssl_unsupported() -> bool {
     match ktls_engages() {
@@ -1178,7 +1178,7 @@ fn ktls_echo_roundtrip() {
 
 #[test]
 fn ktls_rejected_handshake() {
-    // The client's handshake worker calls `reject()` → `Event::ConnectFailed`.
+    // The client's handshake worker calls `reject()` -> `Event::ConnectFailed`.
     // A raw TCP peer suffices (the reject is client-local): the TCP connect
     // completes, the fd is furnished, and the worker rejects.
     let mut client = match Client::new(ClientConfig::default(), client_framer())
@@ -1237,7 +1237,7 @@ fn ktls_rejected_handshake() {
 #[test]
 fn ktls_handshake_timeout() {
     // The worker never calls back (it holds the deferral): the client's
-    // `tls_handshake_timeout` fires → `ConnectFailed{ETIMEDOUT}`, and the parked
+    // `tls_handshake_timeout` fires -> `ConnectFailed{ETIMEDOUT}`, and the parked
     // slot is reclaimed (a later `next_event` finds no work left).
     let cfg = ClientConfig {
         tls_handshake_timeout: Some(Duration::from_millis(250)),
@@ -1248,7 +1248,7 @@ fn ktls_handshake_timeout() {
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("client new: {e}"),
     };
-    // Buffer the deferral (never resolving → no reject-shed) and close the fd;
+    // Buffer the deferral (never resolving -> no reject-shed) and close the fd;
     // only the timeout can reclaim the parked slot. Released when keep_rx drops.
     let (keep_tx, keep_rx) = std::sync::mpsc::channel();
     client.set_tls_handshake(move |fd, _c, deferral| {
@@ -1300,7 +1300,7 @@ fn ktls_handshake_timeout() {
     );
     assert!(!client.is_open(conn), "the parked slot was reclaimed");
     // With the parked handshake shed and no connections, the next event is
-    // `None` — the leftover armed wake never wedges it.
+    // `None` - the leftover armed wake never wedges it.
     assert!(
         client.next_event().expect("drain").is_none(),
         "no work left after the timeout shed"

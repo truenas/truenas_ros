@@ -1,4 +1,4 @@
-//! `listmount(2)` — enumerate mount ids beneath a mount.
+//! `listmount(2)` - enumerate mount ids beneath a mount.
 
 use super::{MntIdReq, MNT_ID_REQ_SIZE_VER1, SYS_LISTMOUNT};
 use crate::errno::{self, retry_on_eintr};
@@ -12,7 +12,7 @@ const BATCH: usize = 1024;
 /// List the mount ids beneath `mnt_id` (use [`LSMT_ROOT`] for the whole
 /// namespace).
 ///
-/// With `reverse`, later mounts are listed first — the order wanted for
+/// With `reverse`, later mounts are listed first - the order wanted for
 /// recursive unmount (children before parents).
 ///
 /// See [`listmount(2)`](https://man7.org/linux/man-pages/man2/listmount.2.html).

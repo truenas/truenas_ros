@@ -1,4 +1,4 @@
-//! `fsopen(2)` / `fsconfig(2)` / `fsmount(2)` — the mount-context API.
+//! `fsopen(2)` / `fsconfig(2)` / `fsmount(2)` - the mount-context API.
 
 use super::MountAttr;
 use crate::errno::{self, retry_on_eintr};

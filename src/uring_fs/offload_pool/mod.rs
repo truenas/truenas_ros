@@ -1,5 +1,5 @@
-//! The reactor's elastic blocking-work pool — [`WorkerPool`] and its
-//! lazily-spawned per-reactor handle [`SharedPool`] — with its unit tests
+//! The reactor's elastic blocking-work pool - [`WorkerPool`] and its
+//! lazily-spawned per-reactor handle [`SharedPool`] - with its unit tests
 //! and loom models in place. The job contract consumers program against
 //! lives at `FsConn::offload`; the type docs below cover the mechanics.
 
@@ -8,13 +8,13 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 // The pool is loom-modelled (`loom_tests` below), so its primitives come
-// from `crate::sync` — std's outside `--cfg loom`.
+// from `crate::sync` - std's outside `--cfg loom`.
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{thread, Arc, Condvar, Mutex, OnceCell};
 
 /// A boxed unit of work a pool worker runs. Every job is `Send` and
 /// self-contained (it captures its own inputs and result channel), so the pool
-/// is generic — the `!Send` `QueryDir` is built and driven *inside* the job,
+/// is generic - the `!Send` `QueryDir` is built and driven *inside* the job,
 /// on the worker's own thread, never sent.
 pub(crate) type Job = Box<dyn FnOnce() + Send>;
 
@@ -163,7 +163,7 @@ impl WorkerPool {
 
 impl PoolShared {
     /// Model-only: let the next `n` workers to wake take the retire branch
-    /// instead of looping. Standing in for a clock loom does not have — see
+    /// instead of looping. Standing in for a clock loom does not have - see
     /// [`idle_expired`].
     ///
     /// A budget rather than a one-shot on purpose: with only one retirement
@@ -196,7 +196,7 @@ impl PoolShared {
 
 // Set for the lifetime of a pool worker thread. `WorkerPool::drop` can run on
 // a worker when a job drops the pool's last `Arc`; the flag tells that `Drop`
-// not to join the workers — this thread is one of them, so the join would wait
+// not to join the workers - this thread is one of them, so the join would wait
 // on itself.
 //
 // Under loom this must be loom's thread-local, not std's: loom multiplexes
@@ -350,8 +350,8 @@ impl SharedPool {
 ///
 /// In production this is just the condvar's own answer. Under `--cfg loom`
 /// there is no clock and `Condvar::wait_timeout` always reports
-/// `timed_out() == false`, which would make the retire branch below — the one
-/// that decrements `total` *without* notifying, unlike the closing path —
+/// `timed_out() == false`, which would make the retire branch below - the one
+/// that decrements `total` *without* notifying, unlike the closing path --
 /// unreachable in a model. The seam lets a model ask for the retirement
 /// directly, so the interleaving that branch relies on can actually be
 /// explored. See [`PoolShared::retire_next_idle`].
@@ -563,13 +563,13 @@ mod pool_tests {
 //  * `total` is accounted under the mutex but `running` is bumped outside it,
 //    so growth reads two counters at different synchronization points;
 //  * `Drop` waits for `total` to reach zero, while one of the two paths that
-//    decrements it — the idle retire — does so **without** notifying;
+//    decrements it - the idle retire - does so **without** notifying;
 //  * a job can drop the pool's last `Arc`, re-entering `Drop` on a worker that
 //    is itself counted in `total`, which is what `ON_POOL_WORKER` exists for.
 //
 // The models are deliberately tiny: loom is exhaustive, and `loom::MAX_THREADS`
 // is 5 including the main thread. `cooldown` is zero throughout because
-// `claim_spawn_slot` reads an `Instant`, which loom does not model — so growth
+// `claim_spawn_slot` reads an `Instant`, which loom does not model - so growth
 // is always permitted here rather than throttled.
 #[cfg(loom)]
 mod loom_tests {
@@ -582,7 +582,7 @@ mod loom_tests {
     /// Three threads parking and signalling on one mutex/condvar is past the
     /// point where full exploration terminates in useful time. A preemption
     /// bound keeps every interleaving with at most `N` forced context switches
-    /// — the region where essentially all real concurrency bugs live — and
+    /// - the region where essentially all real concurrency bugs live - and
     /// drops the deeper ones. **These are bounded proofs, not exhaustive
     /// ones**, unlike the ring's SPSC model, which is small enough to explore
     /// in full. Each was checked against a deliberately broken variant to
@@ -613,7 +613,7 @@ mod loom_tests {
     }
 
     /// Every submitted job runs exactly once, and `Drop` does not return until
-    /// the queue is empty and every worker has exited — the guarantee that lets
+    /// the queue is empty and every worker has exited - the guarantee that lets
     /// a job borrow reactor state.
     #[test]
     fn loom_pool_lifecycle() {
@@ -646,7 +646,7 @@ mod loom_tests {
 
     /// Growth never exceeds the ceiling, and a grown pool still drains and
     /// joins cleanly. `running` is read Relaxed while `total` is read under the
-    /// lock, so the saturation test can see a stale pair — that may cost a
+    /// lock, so the saturation test can see a stale pair - that may cost a
     /// spawn opportunity, but it must never overshoot.
     #[test]
     fn loom_pool_growth_respects_the_ceiling() {
@@ -685,7 +685,7 @@ mod loom_tests {
     /// `Drop` has run, and `g.total > shared.floor` refuses to retire the last
     /// worker regardless. Delete either one and the model still passes; delete
     /// both and loom reports the deadlock. Worth knowing before anyone
-    /// "simplifies" the condition — the redundancy is the safety margin, not
+    /// "simplifies" the condition - the redundancy is the safety margin, not
     /// clutter.
     ///
     /// loom's `wait_timeout` never reports a timeout, so the retirements are
@@ -762,13 +762,13 @@ mod loom_tests {
 
             // If we dropped the pool, `Drop` already joined and the job has
             // run. If the worker did, it retired without a join and may still
-            // be in flight — so wait for it rather than racing its epilogue.
+            // be in flight - so wait for it rather than racing its epilogue.
             while ran.load(Ordering::Relaxed) == 0 {
                 loom::thread::yield_now();
             }
 
             // The workers reclaim the shared state on their own once `closed`
-            // is set, with no join — so `total` need not be zero here, but the
+            // is set, with no join - so `total` need not be zero here, but the
             // pool must be closed and no thread may be stuck. loom reports the
             // self-join as a deadlock if `ON_POOL_WORKER` stops working.
             let g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -799,7 +799,7 @@ mod loom_tests {
 
             assert!(sp.pool.is_set(), "no pool was installed");
             // Dropping the *last* `Arc` drops the installed pool, whose `Drop`
-            // drains the queue and joins — so by here both jobs have run. `b`
+            // drains the queue and joins - so by here both jobs have run. `b`
             // is still holding one, so it has to go first.
             drop(b);
             drop(sp);

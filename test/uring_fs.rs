@@ -1,10 +1,10 @@
-//! Integration tests for the `uring_fs` io_uring reactor — live data and
+//! Integration tests for the `uring_fs` io_uring reactor - live data and
 //! metadata ops against a tempdir, every one stamped with a self personality
 //! and resolved against an [`Anchor`] (there is no unstamped or
 //! absolute-path variant to test).
 //!
 //! Like `test/net_server.rs`, these **skip** (return early) when io_uring is
-//! unavailable — a bare sandbox blocks the syscalls (ENOSYS/EPERM/EACCES) —
+//! unavailable - a bare sandbox blocks the syscalls (ENOSYS/EPERM/EACCES) --
 //! and `TRUENAS_ROS_REQUIRE_IO_URING=1` turns that skip into a hard failure.
 //!
 //! `UringFs` is `!Send` (single-thread ring), so the harness runs the loop on
@@ -34,7 +34,7 @@ use truenas_ros::{Errno, Error};
 ///
 /// Resolved like `test/zfs.rs` does: the env vars the CI provisioning script
 /// exports, then the `/NFSV4ACL` / `/POSIXACL` convention. Any ZFS dataset
-/// serves — the attribute ioctls do not care about `acltype`.
+/// serves - the attribute ioctls do not care about `acltype`.
 ///
 /// `TRUENAS_ROS_REQUIRE_ZFS` turns the skip into a failure, so a runner that
 /// stopped provisioning a dataset goes red instead of reporting a green suite
@@ -63,8 +63,8 @@ fn zfs_dir_or_skip() -> Option<PathBuf> {
 
 /// Single-buffer read, over the reactor's only read op.
 ///
-/// `uring_fs` exposes just the vectored, flagged forms — one shape to learn
-/// and one to audit — so the many tests that read a single buffer wrap it
+/// `uring_fs` exposes just the vectored, flagged forms - one shape to learn
+/// and one to audit - so the many tests that read a single buffer wrap it
 /// here rather than repeating `vec![..]` and `RwFlags::empty()` and then
 /// indexing the result.
 fn pread1(
@@ -99,7 +99,7 @@ fn xattr_name(name: &str) -> CString {
     CString::new(name).unwrap()
 }
 
-/// Errors that mean "io_uring is unavailable here" — an environmental skip.
+/// Errors that mean "io_uring is unavailable here" - an environmental skip.
 /// Deliberately excludes `EINVAL` (a rejected setup argument is a real bug).
 fn should_skip(e: &Error) -> bool {
     let unavailable = matches!(
@@ -124,8 +124,8 @@ impl Drop for StopGuard {
 }
 
 /// Pin a known umask for the whole binary. Several tests assert on the mode
-/// of something they create — `mkdirat`'s mode argument, or a setup file an
-/// impersonated user has to be able to read — and the kernel masks every one
+/// of something they create - `mkdirat`'s mode argument, or a setup file an
+/// impersonated user has to be able to read - and the kernel masks every one
 /// of those with the umask the suite happens to inherit. Left alone, a
 /// developer or CI runner at 0077 fails those tests for a reason that has
 /// nothing to do with the code under test.
@@ -142,7 +142,7 @@ fn pin_umask() {
 /// The default is sized for a server daemon, which costs roughly 400 KiB of
 /// `RLIMIT_MEMLOCK` per ring (see `FsConfig`'s docs). `cargo test` runs a
 /// binary's tests as threads in **one** process, so inheriting that default
-/// would have every concurrent test drawing on one locked-memory budget — and
+/// would have every concurrent test drawing on one locked-memory budget - and
 /// the failure lands on whichever test happens to create the ring that
 /// crosses the limit, not on the one that caused it.
 fn test_cfg() -> FsConfig {
@@ -215,7 +215,7 @@ fn pipe_pair() -> (libc::c_int, libc::c_int) {
 }
 
 /// `splice_from_pipe` moves pipe bytes into a file with no userspace buffer,
-/// honouring the destination offset — and reports a short move as a count
+/// honouring the destination offset - and reports a short move as a count
 /// rather than an error, which is what the resubmit contract rests on.
 ///
 /// Bites three ways: drop the destination offset and the seeded bytes are
@@ -360,9 +360,9 @@ fn fstatfs_answers_from_a_file_and_from_an_anchor() {
 
 /// The immutability claim, exercised rather than asserted: set `IMMUTABLE`
 /// through the reactor and the file becomes undeletable *and* its xattrs
-/// unwritable — enforcement the VFS applies, so no protocol routes around it.
+/// unwritable - enforcement the VFS applies, so no protocol routes around it.
 ///
-/// Needs a real ZFS dataset — a tmpfs tempdir answers the ioctl `ENOTTY` — so
+/// Needs a real ZFS dataset - a tmpfs tempdir answers the ioctl `ENOTTY` - so
 /// it resolves one and skips loudly under `TRUENAS_ROS_REQUIRE_ZFS`, which
 /// the QEMU job arms. Unprivileged, the `EPERM` on setting the flag is itself
 /// the property under test and is asserted rather than skipped.
@@ -395,7 +395,7 @@ fn an_immutable_file_cannot_be_unlinked_or_relabelled() {
         match h.fset_zfs_attrs(&f, before | ZfsAttr::IMMUTABLE) {
             Ok(()) => {}
             // CAP_LINUX_IMMUTABLE is required, and its absence is the very
-            // property under test — so an unprivileged refusal is a pass for
+            // property under test - so an unprivileged refusal is a pass for
             // the half this can reach, not a skip of the whole test.
             Err(Error::Errno(Errno::EPERM)) => {
                 assert!(!is_root(), "root was refused CAP_LINUX_IMMUTABLE");
@@ -405,7 +405,7 @@ fn an_immutable_file_cannot_be_unlinked_or_relabelled() {
             Err(e) => panic!("fset_zfs_attrs: {e}"),
         }
 
-        // statx sees it without an ioctl — the free read path.
+        // statx sees it without an ioctl - the free read path.
         let st = h
             .fstatx(me, &f, AtFlags::empty(), StatxMask::BASIC_STATS)
             .expect("fstatx");
@@ -492,7 +492,7 @@ fn multi_component_and_beneath() {
             Err(Error::Errno(Errno::EXDEV)) => {}
             other => panic!("default open must confine `..`, got {other:?}"),
         }
-        // …and does not follow a symlink (NO_SYMLINKS → ELOOP), so a
+        // ...and does not follow a symlink (NO_SYMLINKS -> ELOOP), so a
         // peer-planted link can't redirect the open out of the share.
         std::os::unix::fs::symlink("/etc/hostname", dir.join("out")).unwrap();
         match h.open(me, &anchor, "out", rdonly()) {
@@ -517,7 +517,7 @@ fn fstatx_reports_open_file_metadata() {
         std::fs::write(dir.join("m.bin"), vec![0u8; 4096]).unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let f = h.open(me, &anchor, "m.bin", rdonly()).expect("open");
-        // fstat-by-fd: no path resolved — the metadata is exactly this fd's.
+        // fstat-by-fd: no path resolved - the metadata is exactly this fd's.
         let st = h
             .fstatx(me, &f, AtFlags::empty(), StatxMask::BASIC_STATS)
             .expect("fstatx");
@@ -622,13 +622,13 @@ fn stale_personality_from_other_ring_is_einval() {
     drop(afs_a); // ring A (and its registration) outlived the use on B
 }
 
-// Files are plain reference-counted fds now — there is no per-file pool to
+// Files are plain reference-counted fds now - there is no per-file pool to
 // exhaust (`ENFILE`), and dropping a token does NOT cancel in-flight ops: the
 // reactor keeps the fd alive (via the op entry's parked `Arc<OwnedFd>`) until
 // the op completes, then the fd closes with the last reference (close-last by
 // ownership). This test covers that cancel-safety property: a parked read
 // whose only caller token is dropped mid-flight still completes correctly when
-// data arrives — no use-after-close.
+// data arrives - no use-after-close.
 #[test]
 fn dropped_file_mid_op_completes_without_use_after_close() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -636,7 +636,7 @@ fn dropped_file_mid_op_completes_without_use_after_close() {
         let anchor = Anchor::open(dir.as_path()).unwrap();
 
         // O_RDWR on a FIFO opens immediately and keeps a writer attached, so a
-        // read with no data parks — an op genuinely in flight.
+        // read with no data parks - an op genuinely in flight.
         let how = OpenHow::new().flags(OFlag::O_RDWR);
         let f = h.open(me, &anchor, "fifo", how).expect("open fifo");
         let pending = h
@@ -864,7 +864,7 @@ fn statx_by_leaf_and_anchor() {
         // SAFETY: geteuid is always safe.
         assert_eq!(st.uid(), unsafe { libc::geteuid() });
 
-        // The anchor itself, via AT_EMPTY_PATH — the closest to fd-based
+        // The anchor itself, via AT_EMPTY_PATH - the closest to fd-based
         // statx this interface can offer.
         let st = h
             .statx_anchor(me, &anchor, AtFlags::empty(), StatxMask::BASIC_STATS)
@@ -1062,7 +1062,7 @@ fn rename_across_two_anchors() {
 }
 
 /// An `O_TMPFILE` create is invisible until `linkat` names it, and complete the
-/// instant it becomes visible — the durable-publish property an object store
+/// instant it becomes visible - the durable-publish property an object store
 /// needs. Also pins that the file really has no name beforehand: the directory
 /// stays empty while the data is being written.
 #[test]
@@ -1071,7 +1071,7 @@ fn o_tmpfile_is_invisible_until_linkat_publishes_it() {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
 
         // O_TMPFILE names the *directory*; the file it creates has no entry.
-        // Deliberately no O_EXCL — that is the "never linkable" opt-out.
+        // Deliberately no O_EXCL - that is the "never linkable" opt-out.
         let how = OpenHow::new()
             .flags(OFlag::O_TMPFILE | OFlag::O_RDWR)
             .mode(Mode::from_bits_truncate(0o600));
@@ -1147,7 +1147,7 @@ fn linkat_file_cannot_replace_but_rename_can() {
 /// `O_EXCL` with `O_TMPFILE` is the "this inode may never be linked" opt-out:
 /// the kernel withholds `I_LINKABLE`, and `vfs_link` then refuses an inode
 /// whose link count is zero. The failure is `ENOENT`, which says nothing about
-/// the real cause — hence the test, and hence the warning in the docs.
+/// the real cause - hence the test, and hence the warning in the docs.
 #[test]
 fn o_tmpfile_with_o_excl_is_unlinkable() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -1172,7 +1172,7 @@ fn o_tmpfile_with_o_excl_is_unlinkable() {
 
 /// Which personality may publish an `O_TMPFILE`?
 ///
-/// `AT_EMPTY_PATH` demands `f_cred == current_cred()` — a **pointer**
+/// `AT_EMPTY_PATH` demands `f_cred == current_cred()` - a **pointer**
 /// comparison (`fs/namei.c:2631`). io_uring's `register_personality` stores
 /// `get_current_cred()`, so two registrations taken from unchanged credentials
 /// reference the same `struct cred`. This pins the consequence: two
@@ -1220,7 +1220,7 @@ fn linkat_file_accepts_any_id_for_the_same_credentials() {
 
 /// The allowlist's *refusals* are the security property, so they get the test.
 /// `security.` would grant file capabilities, `system.` would rewrite ACLs, and
-/// `user.` needs no privilege at all — none may be elevated. A bare `trusted.`
+/// `user.` needs no privilege at all - none may be elevated. A bare `trusted.`
 /// is refused too: it would cover the entire namespace.
 #[test]
 fn privileged_xattr_prefixes_refuse_dangerous_namespaces() {
@@ -1251,10 +1251,10 @@ fn privileged_xattr_prefixes_refuse_dangerous_namespaces() {
 
 /// An allowlisted `trusted.*` write is elevated to the reactor's ambient
 /// credentials; an unlisted name in the same namespace, through the same call,
-/// is not — and unprivileged callers cannot even see the elevated name.
+/// is not - and unprivileged callers cannot even see the elevated name.
 ///
 /// Requires privilege to be meaningful (the `trusted.` namespace is
-/// `CAP_SYS_ADMIN`-gated), so it skips when not root — and skips on kernels
+/// `CAP_SYS_ADMIN`-gated), so it skips when not root - and skips on kernels
 /// below 6.13, where fd-based xattrs are unavailable.
 #[test]
 fn privileged_xattr_allowlist_elevates_only_listed_names() {
@@ -1370,8 +1370,8 @@ fn privileged_xattr_allowlist_elevates_only_listed_names() {
     });
 }
 
-/// `preadv2`/`pwritev2` round-trip with a durability flag, and — the part that
-/// matters — an *unsupported* flag fails the operation instead of being
+/// `preadv2`/`pwritev2` round-trip with a durability flag, and - the part that
+/// matters - an *unsupported* flag fails the operation instead of being
 /// silently dropped. A durability flag that no-ops would be the worst possible
 /// failure mode, so the degrade path is the assertion.
 #[test]
@@ -1524,7 +1524,7 @@ fn confined_open_refuses_to_cross_a_mount_point() {
 
         let how = OpenHow::new().flags(OFlag::O_PATH | OFlag::O_DIRECTORY);
 
-        // Without NO_XDEV the crossing is allowed — it is an ordinary open.
+        // Without NO_XDEV the crossing is allowed - it is an ordinary open.
         h.open(me, &root, name.as_str(), how)
             .unwrap_or_else(|e| panic!("plain open of /{name}: {e}"));
 
@@ -1537,7 +1537,7 @@ fn confined_open_refuses_to_cross_a_mount_point() {
     });
 }
 
-/// An abandoned upload leaves nothing to clean up — the property that removes
+/// An abandoned upload leaves nothing to clean up - the property that removes
 /// the need for a temp-file sweeper. Drop the file instead of committing it
 /// and assert the staging directory is still empty.
 #[test]
@@ -1564,7 +1564,7 @@ fn abandoned_tmpfile_leaves_nothing_behind() {
 }
 
 /// `readdir` honours no `RESOLVE_*` flags, so the listing side needs its own
-/// mount check — otherwise a nested dataset lists as though it were part of
+/// mount check - otherwise a nested dataset lists as though it were part of
 /// the tree. Uses a real mount boundary; self-skips without one.
 #[test]
 fn listing_can_be_confined_to_one_filesystem() {
@@ -1685,7 +1685,7 @@ where
     pin_umask();
     let dir = truenas_ros::tempdir().expect("tempdir");
     // These tests drive ops as an impersonated user, who must be able to
-    // traverse this directory and — for the ones that create as that user —
+    // traverse this directory and - for the ones that create as that user --
     // write in it. A fresh tempdir is only owner-writable, so widen it once
     // here rather than in each test.
     std::fs::set_permissions(
@@ -2189,7 +2189,7 @@ fn query_directory_enumeration_obeys_dac() {
 }
 
 /// Dropping a `QueryDir` mid-walk closes its directory fd (RAII), not at some
-/// later teardown — verified against `/proc/self/fd`.
+/// later teardown - verified against `/proc/self/fd`.
 #[test]
 fn query_directory_drop_closes_dir_fd() {
     use std::ffi::CString;
@@ -2220,8 +2220,8 @@ fn query_directory_drop_closes_dir_fd() {
         drop(q);
         // `Drop` closes the `DIR*` (and its dup fd) synchronously via `closedir`.
         // The freed fd *number* can be reused by the reactor thread running
-        // concurrently, so assert the fd no longer names our directory — closed
-        // (`Err`) or reused for something else (a different target) — rather than
+        // concurrently, so assert the fd no longer names our directory - closed
+        // (`Err`) or reused for something else (a different target) - rather than
         // that the number is merely absent, which fd reuse would race.
         match std::fs::read_link(&link) {
             Err(_) => {}
@@ -2458,7 +2458,7 @@ fn query_pool_runs_multiple_listings() {
             same_device_only: false,
             ..Default::default()
         };
-        // Submit BOTH from this one thread before collecting either — the pool
+        // Submit BOTH from this one thread before collecting either - the pool
         // runs the walks (up to 2 concurrently), decoupled from the caller.
         let h1 = pool.query(me, a1, mk_opts());
         let h2 = pool.query(me, a2, mk_opts());
@@ -2498,14 +2498,14 @@ fn pool_copy_file_range_whole() {
             .open(me, &anchor, "dst", OpenHow::new().flags(OFlag::O_RDWR))
             .unwrap();
         let pool = QueryPool::new(h);
-        // Clones inline on a block-cloning fs, else offloads a byte copy —
+        // Clones inline on a block-cloning fs, else offloads a byte copy --
         // either way the bytes land.
         let n = match pool
             .copy_file_range(&src, &dst, 0, 0, content.len() as u64)
             .wait()
         {
             Ok(n) => n,
-            Err(_) => return, // fs doesn't support the copy here — skip
+            Err(_) => return, // fs doesn't support the copy here - skip
         };
         assert_eq!(n, content.len() as u64);
         assert_eq!(std::fs::read(dir.join("dst")).unwrap(), content);
@@ -2543,13 +2543,13 @@ fn pool_copy_file_range_ranged_offload() {
     });
 }
 
-/// A uid/gid pair that exists nowhere — no files, no group memberships —
+/// A uid/gid pair that exists nowhere - no files, no group memberships --
 /// so a personality for it has exactly the authority "other" grants.
 const NOBODY_UID: u32 = 65_534;
 const NOBODY_GID: u32 = 65_534;
 
 /// The identity a test can actually register: root impersonates anyone, an
-/// unprivileged runner can only ask for what it already holds — *including*
+/// unprivileged runner can only ask for what it already holds - *including*
 /// its supplementary groups. Naming uid/gid alone would request an empty
 /// group list, and dropping a group is itself a privileged change, so the
 /// broker's `setgroups` would fail with `EPERM`.
@@ -2601,7 +2601,7 @@ fn broker_registers_own_identity_unprivileged() {
 #[test]
 fn broker_refuses_uid_zero() {
     with_broker(|_h, creds, _me, _dir| {
-        // A root personality would carry the daemon's capabilities — the
+        // A root personality would carry the daemon's capabilities - the
         // exact thing the broker exists to prevent.
         assert!(matches!(
             creds.register(&AsUser::new(0, 0)),
@@ -2790,7 +2790,7 @@ fn impersonated_trusted_xattr_is_denied() {
 
         // trusted.* needs CAP_SYS_ADMIN, which the personality lacks. Note
         // the kernel's masquerade: an unprivileged *read* reports ENODATA
-        // ("no such attribute"), not EPERM — it hides the attribute's
+        // ("no such attribute"), not EPERM - it hides the attribute's
         // existence rather than its contents.
         let (res, _v) = h.fgetxattr(user, &f, &trusted, vec![0u8; 16]);
         assert!(
@@ -2879,7 +2879,7 @@ fn identity_cache_registers_once_per_identity() {
         let cache = IdentityCache::new(creds.clone());
         let who = registerable_user();
 
-        // Many "connections" for one identity → one registration.
+        // Many "connections" for one identity -> one registration.
         let leases: Vec<_> = (0..8)
             .map(|_| cache.acquire(&who).expect("acquire"))
             .collect();
@@ -2907,7 +2907,7 @@ fn identity_cache_registers_once_per_identity() {
         let f = h.open(id, &anchor, "c", creat_rw()).expect("open");
         h.close(f).unwrap();
 
-        // Every lease is gone, but the cache map holds the last reference —
+        // Every lease is gone, but the cache map holds the last reference --
         // so the id survives and the next acquire reuses it rather than
         // paying for a fresh registration.
         drop(leases);
@@ -2938,7 +2938,7 @@ fn identity_cache_invalidation_reregisters_without_disturbing_leases() {
         let old_id = old.personality();
 
         // A directory-services change: forget the snapshot. Work already
-        // under way must not be disturbed — this is the property that lets
+        // under way must not be disturbed - this is the property that lets
         // re-registration happen while requests are in flight.
         cache.invalidate(&who);
         assert_eq!(cache.len(), 0);
@@ -3001,7 +3001,7 @@ fn large_ad_group_list_round_trips() {
     // winbindd imposes no small ceiling (Samba grows its buffer and
     // retries), and an AD Kerberos PAC carries on the order of 1000 group
     // SIDs, so the wire format and the impersonation window must handle a
-    // list of that size — not just the handful a POSIX user has.
+    // list of that size - not just the handful a POSIX user has.
     if !is_root() {
         return; // setgroups with a foreign list needs CAP_SETGID
     }
@@ -3025,7 +3025,7 @@ fn large_ad_group_list_round_trips() {
             let dirname = format!("g{n}");
             std::fs::create_dir(dir.join(&dirname)).unwrap();
             std::fs::write(dir.join(&dirname).join("f"), b"deep").unwrap();
-            // SAFETY: valid path; chown to root:marker, mode 0710 — only a
+            // SAFETY: valid path; chown to root:marker, mode 0710 - only a
             // member of `marker` can traverse it.
             let cpath = CString::new(dir.join(&dirname).as_os_str().as_bytes())
                 .unwrap();
@@ -3056,7 +3056,7 @@ fn large_ad_group_list_round_trips() {
 
 #[test]
 fn personality_zero_is_not_constructible() {
-    // `sqe.personality == 0` means "no credential override" — an op stamped
+    // `sqe.personality == 0` means "no credential override" - an op stamped
     // with it runs as the reactor thread (the root daemon), bypassing the
     // whole per-op identity model. The public constructor must refuse 0 so
     // that path is unreachable, as the module docs claim.
@@ -3141,7 +3141,7 @@ fn path_order_places_a_directory_after_its_dotted_siblings() {
 }
 
 /// `name_prefix` drops entries during the `readdir` pass, and a batch is still
-/// filled to `clump` *kept* entries — so a short batch keeps meaning
+/// filled to `clump` *kept* entries - so a short batch keeps meaning
 /// end-of-directory rather than "the filter ate this one".
 #[test]
 fn name_prefix_filters_without_shortening_batches() {
@@ -3182,7 +3182,7 @@ fn name_prefix_filters_without_shortening_batches() {
 
 /// `start_after` resumes an ordered listing exactly at the cut, with no key
 /// repeated and none skipped. The cursor is a **literal key**, so resuming
-/// past the directory `a` means passing `a/` — where `a/` sorts — rather than
+/// past the directory `a` means passing `a/` - where `a/` sorts - rather than
 /// `a`, where a file of that name would sort.
 #[test]
 fn start_after_resumes_a_path_ordered_listing_without_gaps() {
@@ -3231,7 +3231,7 @@ fn start_after_resumes_a_path_ordered_listing_without_gaps() {
 /// does **not** move when the file is merely read. A cookie that advanced on
 /// reads would invalidate every cache entry on every access.
 ///
-/// Skips where the filesystem does not supply one — the kernel reports that
+/// Skips where the filesystem does not supply one - the kernel reports that
 /// by leaving the bit out of the returned mask, which is why
 /// [`Statx::change_cookie`] is an `Option` rather than a bare `u64`.
 #[test]
@@ -3250,7 +3250,7 @@ fn change_cookie_moves_on_writes_and_not_on_reads() {
         };
 
         let Some(first) = cookie(&f) else {
-            // No i_version on this filesystem — tmpfs, where `tempdir`
+            // No i_version on this filesystem - tmpfs, where `tempdir`
             // lands by default, is one. Point `TMPDIR` at a ZFS
             // dataset to actually exercise this.
             eprintln!(
@@ -3343,7 +3343,7 @@ fn dac_read_search_traverses_a_directory_the_identity_cannot_search() {
 /// `CAP_DAC_READ_SEARCH` grants a *pure* read and nothing wider: `fs/namei.c`
 /// tests `mask == MAY_READ` with exact equality, so adding a write bit drops
 /// out of the grant entirely. `O_RDONLY` succeeds on a file `O_RDWR` cannot
-/// even open — asymmetric enough to be worth pinning.
+/// even open - asymmetric enough to be worth pinning.
 #[test]
 fn dac_read_search_grants_o_rdonly_but_not_o_rdwr() {
     if !is_root() {
@@ -3387,8 +3387,8 @@ fn dac_read_search_grants_o_rdonly_but_not_o_rdwr() {
 }
 
 /// The spawn-time mask is a ceiling the broker enforces, not a hint the caller
-/// may exceed. This is the property that keeps a compromised main — which can
-/// already mint any non-root identity — from minting itself read access to
+/// may exceed. This is the property that keeps a compromised main - which can
+/// already mint any non-root identity - from minting itself read access to
 /// every file on the system.
 #[test]
 fn spawn_time_mask_is_a_ceiling_on_requested_caps() {
@@ -3417,7 +3417,7 @@ fn spawn_time_mask_is_a_ceiling_on_requested_caps() {
 
 /// `caps` participates in `AsUser`'s identity, so the cache mints a separate
 /// personality rather than handing back one registered without them. Getting
-/// this wrong would silently serve whichever variant was requested first —
+/// this wrong would silently serve whichever variant was requested first --
 /// either leaking a capability or withholding one, depending on the order.
 #[test]
 fn identity_cache_keys_on_the_capability_set() {
@@ -3484,7 +3484,7 @@ fn walk_keys(
 
 /// Per-directory sorting composes into global path order. Note where `a/`
 /// lands: after `a.txt` because `/` outranks `.`, and its whole subtree
-/// follows immediately — `a/c/d.txt` still precedes `aa.txt`, which is the
+/// follows immediately - `a/c/d.txt` still precedes `aa.txt`, which is the
 /// property a naive bare-name sort breaks.
 #[test]
 fn tree_walk_emits_the_subtree_in_global_path_order() {
@@ -3519,7 +3519,7 @@ fn tree_walk_emits_the_subtree_in_global_path_order() {
         );
 
         // The same set, sorted independently as flat byte strings, must agree
-        // — that is what "global path order" means, and it is checked here
+        // -- that is what "global path order" means, and it is checked here
         // rather than trusted from the literal above.
         let mut sorted = keys.clone();
         sorted.sort();
@@ -3566,7 +3566,7 @@ fn depth_one_and_skip_descent_both_stop_at_the_top_level() {
 
 /// The pagination property, and the reason the cursor is key-based rather
 /// than a directory offset: paging through the tree must reproduce the whole
-/// walk **exactly** — no key repeated, none skipped — including when a page
+/// walk **exactly** - no key repeated, none skipped - including when a page
 /// boundary falls on a directory, which is the case a position-based cursor
 /// gets wrong.
 #[test]
@@ -3577,7 +3577,7 @@ fn paging_with_a_cursor_reproduces_the_walk_exactly() {
         let full = walk_keys(&h, me, &anchor, TreeOptions::default());
 
         // Every page size from 1 up, so the boundary lands on each entry in
-        // turn — files, directories, and the last entry of a level alike.
+        // turn - files, directories, and the last entry of a level alike.
         for page in 1..=full.len() {
             let mut paged: Vec<String> = Vec::new();
             let mut resume: Option<TreeCursor> = None;
@@ -3648,7 +3648,7 @@ fn a_subtree_removed_between_pages_is_skipped_not_fatal() {
             if key == "a/c/" && !removed {
                 // The next page re-opens `a/c`; remove it first so the rebuild
                 // hits ENOENT on that level (the walk has not descended into it
-                // yet — a directory is emitted before its contents).
+                // yet - a directory is emitted before its contents).
                 std::fs::remove_dir_all(dir.join("a/c")).unwrap();
                 removed = true;
             }
@@ -3661,8 +3661,8 @@ fn a_subtree_removed_between_pages_is_skipped_not_fatal() {
 }
 
 /// `skip_descent` and `cursor` are both documented delimiter primitives, so
-/// the obvious composition of them — fold a directory into a common prefix,
-/// then page — has to work. It is the page boundary that makes it hard: the
+/// the obvious composition of them - fold a directory into a common prefix,
+/// then page - has to work. It is the page boundary that makes it hard: the
 /// walk emits a directory *before* its contents, so a cursor sitting on a
 /// folded directory is positioned at the start of the subtree the caller just
 /// said to skip. Resuming there must not re-enter it, and must not re-emit
@@ -3722,7 +3722,7 @@ fn a_folded_subtree_stays_folded_across_a_page_boundary() {
 }
 
 /// A cursor survives serialization, so a listing can be resumed by a later
-/// request — or a later process — and not just within one walk.
+/// request - or a later process - and not just within one walk.
 #[test]
 fn a_serialized_cursor_resumes_the_walk() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -3753,7 +3753,7 @@ fn a_serialized_cursor_resumes_the_walk() {
 }
 
 /// Descent resolves one component against the descriptor the walk already
-/// holds, under `CONFINED_RESOLVE` — so a symlink planted in the tree is not
+/// holds, under `CONFINED_RESOLVE` - so a symlink planted in the tree is not
 /// a way out of it, whether it points outside or back inside.
 #[test]
 fn the_walk_does_not_follow_symlinks_out_of_the_tree() {
@@ -3766,7 +3766,7 @@ fn the_walk_does_not_follow_symlinks_out_of_the_tree() {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let keys = walk_keys(&h, me, &anchor, TreeOptions::default());
 
-        // The links are yielded as entries — they exist — but neither is
+        // The links are yielded as entries - they exist - but neither is
         // descended into, so nothing from /etc and no second copy of
         // `real/`'s contents appears.
         assert!(keys.contains(&"real/".to_string()));
@@ -3785,7 +3785,7 @@ fn the_walk_does_not_follow_symlinks_out_of_the_tree() {
 // ---- fadvise / fremovexattr / copy_file_range ------------------------------
 
 /// `fadvise` is advisory, so the assertion is that it is *accepted* and does
-/// not disturb the file — both advices ZFS implements natively (`WILLNEED` is
+/// not disturb the file - both advices ZFS implements natively (`WILLNEED` is
 /// a `dmu_prefetch`, `DONTNEED` a `dmu_evict_range`) plus the whole-file `0`
 /// length form.
 #[test]
@@ -3806,7 +3806,7 @@ fn fadvise_is_accepted_and_leaves_contents_alone() {
             h.fadvise(me, &f, 0, 10, advice)
                 .unwrap_or_else(|e| panic!("fadvise {advice:?}: {e}"));
         }
-        // Length 0 means "to end of file" — the form used after syncing a
+        // Length 0 means "to end of file" - the form used after syncing a
         // whole object, and the one most likely to be mis-encoded since the
         // kernel reads the length from `addr`, not `len`.
         h.fadvise(me, &f, 0, 0, Advice::DontNeed).expect("dontneed");
@@ -3857,7 +3857,7 @@ where
 /// no [`Personality`], so an attribute the server does not own must be
 /// refused outright rather than removed under the reactor's credentials.
 ///
-/// Deliberately needs no privilege — the refusal is decided from the policy
+/// Deliberately needs no privilege - the refusal is decided from the policy
 /// before any syscall, so this runs everywhere and is the half worth having
 /// unconditional coverage of.
 #[test]
@@ -3886,7 +3886,7 @@ fn fremovexattr_refuses_attributes_outside_the_allowlist() {
 }
 
 /// The other half: an allowlisted attribute really is removed, and is *gone
-/// from the listing* rather than left present with an empty value — which is
+/// from the listing* rather than left present with an empty value - which is
 /// all a zero-length `FSETXATTR` would have achieved.
 ///
 /// Root-only: writing `trusted.*` needs `CAP_SYS_ADMIN`, and the allowlist
@@ -3926,13 +3926,13 @@ fn fremovexattr_removes_allowlisted_attributes() {
 /// delete/copy this walk backs.
 ///
 /// The trigger is a real race: a directory is yielded, and the descent into it
-/// is deferred to the next call so `skip_descent` can cancel it — swap the
+/// is deferred to the next call so `skip_descent` can cancel it - swap the
 /// directory for a regular file inside that window and the deferred
 /// `O_DIRECTORY` open fails `ENOTDIR`.
 ///
 /// Keep any provocation here *local* to the walk. `cargo test` runs a
 /// binary's tests as threads in one process, so anything that exhausts a
-/// process-wide resource — the fd table above all — starves whatever else is
+/// process-wide resource - the fd table above all - starves whatever else is
 /// running rather than only this test, and fails a different innocent test on
 /// each run depending on the fd limit.
 #[test]

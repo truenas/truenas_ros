@@ -1,6 +1,6 @@
 //! The accept arc: multishot-accept completions, per-connection peer-identity
 //! fetches (`SO_PEERNAME` / `SO_PEERCRED`), the accept handler, connection
-//! installation — and the kTLS variant that furnishes a real fd and parks the
+//! installation - and the kTLS variant that furnishes a real fd and parks the
 //! slot across the consumer's handshake.
 
 use super::Server;
@@ -19,7 +19,7 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
 
 // The admission path runs the accept handler and, once a connection is
-// installed, enters the pump — so this block carries the full handler bounds.
+// installed, enters the pump - so this block carries the full handler bounds.
 impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn>
 where
     AcceptFn: FnMut(Incoming<'_>) -> Option<U>,
@@ -49,11 +49,11 @@ where
         }
         let e = Errno::from_raw(-cqe.res);
         if e == Errno::ENFILE {
-            // A full fixed-file table reports ENFILE — but so does a
+            // A full fixed-file table reports ENFILE - but so does a
             // system-wide file-table exhaustion. Park only when the pool
             // really is full, where the next Close re-arms the accept via
             // `reclaim_slot`; with free slots no slot-free event is coming,
-            // so a park would idle the listener forever — back off and
+            // so a park would idle the listener forever - back off and
             // retry like any other transient shortage instead.
             if self.core.table.has_free_slot() {
                 stat!(self.core, accept_retries);
@@ -65,11 +65,11 @@ where
                 }
             }
         } else if accept_error_is_fatal(e) {
-            // A broken listener/setup (EBADF/EINVAL/…): retrying can't help.
+            // A broken listener/setup (EBADF/EINVAL/...): retrying can't help.
             return Err(e);
         } else {
-            // Transient (ENOMEM/ENOBUFS/ECONNABORTED/EMFILE/EINTR/…): never
-            // fatal — re-arm after a backoff so a sustained resource shortage
+            // Transient (ENOMEM/ENOBUFS/ECONNABORTED/EMFILE/EINTR/...): never
+            // fatal - re-arm after a backoff so a sustained resource shortage
             // can't spin the loop at 100% CPU (matches Samba's accept throttle
             // and tokio's never-die accept). No accepted connection to shed.
             stat!(self.core, accept_retries);
@@ -92,9 +92,9 @@ where
         if self.listeners[lidx as usize].tls {
             return self.submit_fd_install(slot, lidx);
         }
-        // Peer identity is fetched per connection — race-free, unlike a
+        // Peer identity is fetched per connection - race-free, unlike a
         // peer-address buffer shared across a multishot accept's completions
-        // — and the accept handler runs from that fetch's completion.
+        // -- and the accept handler runs from that fetch's completion.
         match self.listeners[lidx as usize].addr {
             ServerAddr::Tcp(_) | ServerAddr::Tcp6(_) => {
                 self.submit_peername(slot, lidx)
@@ -125,7 +125,7 @@ where
                 sqe.fd = slot as i32;
                 sqe.flags = IOSQE_FIXED_FILE;
                 // Default install flags: `install_fd_flags` overlays `op_flags`
-                // (left 0 here) → `O_CLOEXEC` on the furnished fd.
+                // (left 0 here) -> `O_CLOEXEC` on the furnished fd.
             })
     }
 
@@ -140,7 +140,7 @@ where
         res: i32,
     ) -> errno::Result<()> {
         // Generation before take (see `on_peer_fetch`): don't clear a recycled
-        // slot's fresh state on a stale completion. Kernel completion → low 32.
+        // slot's fresh state on a stale completion. Kernel completion -> low 32.
         if self.core.table.generation_low(slot) != generation {
             return Ok(()); // slot recycled under us
         }
@@ -161,7 +161,7 @@ where
             return self.core.submit_teardown(slot, generation, true);
         }
         // Derive the peer from the real fd (getpeername is a cheap in-kernel
-        // read, fine on the loop thread). Fail CLOSED on any failure — the
+        // read, fine on the loop thread). Fail CLOSED on any failure - the
         // peer reset between accept and install, or the fd is not the TCP
         // socket a kTLS listener guarantees: shed rather than deliver the
         // consumer's handshake handler a connection with a wrong identity
@@ -211,7 +211,7 @@ where
             ),
             None => {
                 // Guarded at serve_forever, so unreachable in practice.
-                drop(deferral); // → reject via Drop, drained next wake
+                drop(deferral); // -> reject via Drop, drained next wake
                                 // SAFETY: close the furnished fd we won't use.
                 unsafe { libc::close(fd) };
             }
@@ -236,9 +236,9 @@ where
             let Some(peer) = self.core.table.take_tls_parked(slot) else {
                 continue; // not parked (already resolved); outcome moot
             };
-            // Resolved in time — cancel the handshake timeout so it doesn't fire
+            // Resolved in time - cancel the handshake timeout so it doesn't fire
             // later and find the slot no longer parked. No-op unless armed. The
-            // cancel targets a kernel op's user_data → low 32 bits.
+            // cancel targets a kernel op's user_data -> low 32 bits.
             self.cancel_handshake_timeout(slot, generation as u32)?;
             match result {
                 Ok(u) if !self.core.draining => {
@@ -294,11 +294,11 @@ where
         })
     }
 
-    /// A parked kTLS slot's handshake timeout fired (or was cancelled — the
+    /// A parked kTLS slot's handshake timeout fired (or was cancelled - the
     /// result is irrelevant): if the slot is still parked at this generation the
     /// worker did not call back in time, so shed it (a late `ready()`/`reject()`
     /// then hits the bumped generation and is dropped). Otherwise it already
-    /// resolved (or the slot recycled) — nothing to do.
+    /// resolved (or the slot recycled) - nothing to do.
     pub(super) fn on_handshake_timeout(
         &mut self,
         slot: u32,
@@ -425,7 +425,7 @@ where
     /// the connection on a failed fetch, or run the deferred accept path with
     /// the peer identity. The stored [`PendingPeer`] variant says which fetch
     /// this was (the op and its landing pad are always set together), so one
-    /// completion skeleton serves both — only the result validation and the
+    /// completion skeleton serves both - only the result validation and the
     /// pad parsing differ.
     pub(super) fn on_peer_fetch(
         &mut self,
@@ -435,7 +435,7 @@ where
     ) -> errno::Result<()> {
         // Check the generation BEFORE taking the state: a stale completion for
         // a recycled slot must not clear the new incarnation's pending fetch
-        // (matches `drain_handshake_outcomes`). Kernel completion →
+        // (matches `drain_handshake_outcomes`). Kernel completion ->
         // compare only the low 32 bits the op's user_data carried.
         if self.core.table.generation_low(slot) != generation {
             return Ok(()); // slot recycled under us
@@ -446,7 +446,7 @@ where
         let (listener, peer) = match pending {
             PendingPeer::Cred { listener, pad } => {
                 if res != size_of::<libc::ucred>() as i32 {
-                    // Fetch failed: fail closed — never deliver a
+                    // Fetch failed: fail closed - never deliver a
                     // credential-less connection when peercred was asked
                     // for. (Kernel support itself was verified by the
                     // startup probe.)
@@ -464,9 +464,9 @@ where
             }
             PendingPeer::Name { listener, pad } => {
                 // res = the address length written, or -errno (e.g. the peer
-                // already reset — `ENOTCONN`). Require EXACTLY the requested
-                // family size (16/28): a short or rewritten result — as a
-                // cgroup getsockopt BPF program can produce — is not a
+                // already reset - `ENOTCONN`). Require EXACTLY the requested
+                // family size (16/28): a short or rewritten result - as a
+                // cgroup getsockopt BPF program can produce - is not a
                 // trustworthy address, so fail closed. `parse_peer` then
                 // re-checks the family, so a correct-length-but-rewritten pad
                 // also sheds rather than reading as a local `Unix` peer.
@@ -497,7 +497,7 @@ where
     }
 }
 
-// Arming the listener (and its retry backoff) runs no handler code —
+// Arming the listener (and its retry backoff) runs no handler code --
 // bounds-free, so the teardown path can re-arm a parked accept.
 impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     /// Arm a short backoff `TIMEOUT`; its completion re-arms `lidx`'s accept.
@@ -530,20 +530,20 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
 }
 
 /// Whether an accept error means the listener/setup is broken (retrying can't
-/// help → propagate) rather than a transient resource shortage (retry with
+/// help -> propagate) rather than a transient resource shortage (retry with
 /// backoff). Conservative: only genuinely unrecoverable errnos are fatal;
-/// everything else — `ENOMEM`/`ENOBUFS`/`ECONNABORTED`/`EMFILE`/`EINTR`/… — is
-/// treated as transient so a resource storm can't kill the server.
+/// everything else - `ENOMEM`/`ENOBUFS`/`ECONNABORTED`/`EMFILE`/`EINTR`/... -
+/// is treated as transient so a resource storm can't kill the server.
 ///
-/// The fatal set is exactly the structural errors — the listener fd or the
+/// The fatal set is exactly the structural errors - the listener fd or the
 /// accept SQE itself is wrong, so every re-arm fails identically:
-/// * `EBADF` — the listener descriptor is not a valid open fd (closed, or never
+/// * `EBADF` - the listener descriptor is not a valid open fd (closed, or never
 ///   registered).
-/// * `EINVAL` — the socket is not `listen()`ing, or the accept arguments are
+/// * `EINVAL` - the socket is not `listen()`ing, or the accept arguments are
 ///   malformed.
-/// * `EFAULT` — an address/length argument points outside our address space (a
+/// * `EFAULT` - an address/length argument points outside our address space (a
 ///   bug in how the SQE was built).
-/// * `ENOTSOCK` — the descriptor is not a socket (the wrong fd was registered).
+/// * `ENOTSOCK` - the descriptor is not a socket (the wrong fd was registered).
 ///
 /// Everything else can succeed on a later accept, so it backs off rather than
 /// propagating: resource pressure (`ENOMEM`/`ENOBUFS`/`EMFILE`/`ENFILE`),

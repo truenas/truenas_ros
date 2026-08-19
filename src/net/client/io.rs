@@ -1,5 +1,5 @@
 //! The client's request/reply data plane: the reply-framer pump skeleton, the
-//! recv/send/splice completion wrappers (their heavy bookkeeping is core — see
+//! recv/send/splice completion wrappers (their heavy bookkeeping is core - see
 //! [`Reactor`](crate::net::core::reactor)), reply delivery into the event queue,
 //! and the caller-facing `send`/`request`/`next_event` pump.
 //!
@@ -23,7 +23,7 @@ use std::time::Duration;
 
 /// An in-flight body splice's delivery context, snapshotted when the splice is
 /// armed and emitted as [`Event::Splice`] once the body finishes moving to the
-/// sink fd — the header would otherwise be gone (the core `consume`s it on
+/// sink fd - the header would otherwise be gone (the core `consume`s it on
 /// completion). One per splicing connection (the pump gates the recv side while
 /// splicing).
 pub(super) struct PendingSplice {
@@ -69,7 +69,7 @@ where
                 Enacted::Done => {
                     // If this iteration armed a body splice
                     // (`Framing::SpliceBody`), correlate it and snapshot its
-                    // header now — the `Event::Splice` emitted when the body
+                    // header now - the `Event::Splice` emitted when the body
                     // finishes moving needs them, but the core `consume`s the
                     // header then. The pump gate stops on `splicing`, so a
                     // `splicing` connection here was armed this iteration.
@@ -92,7 +92,7 @@ where
     /// oldest request awaiting a reply on this connection (FIFO) and snapshot the
     /// buffered header + body length, stashed until the body finishes moving
     /// (`deliver_splice` then emits [`Event::Splice`]). A splice with no request
-    /// awaiting it is an unsolicited push — stashed with
+    /// awaiting it is an unsolicited push - stashed with
     /// [`RequestId::UNSOLICITED`] when the caller opted in, otherwise a protocol
     /// violation that closes the connection (the in-flight splice is cancelled).
     fn begin_splice(
@@ -129,7 +129,7 @@ where
 
     /// A reply recv completed (`RecvHeader`/`RecvBody`). All the completion
     /// bookkeeping is core; the returned [`RecvStep`] drives the delivery/pump
-    /// tail — a completed body delivers then pumps, a completed header re-pumps.
+    /// tail - a completed body delivers then pumps, a completed header re-pumps.
     pub(super) fn on_recv(
         &mut self,
         slot: u32,
@@ -161,7 +161,7 @@ where
         }
     }
 
-    /// A reply-body splice completed (`Op::SpliceRecv`) — for a framer that
+    /// A reply-body splice completed (`Op::SpliceRecv`) - for a framer that
     /// returned [`Framing::SpliceBody`]. The body never entered the buffer (it
     /// went straight to the caller's sink fd), so a fully moved body emits an
     /// [`Event::Splice`] (the header stayed buffered/snapshotted; only the body
@@ -204,7 +204,7 @@ where
     /// oldest request awaiting a reply on this connection (FIFO), copy out the
     /// header and move out the (owned) body, drop the frame from the buffer, and
     /// queue the event. A reply with no request awaiting it is an unsolicited
-    /// push — surfaced with [`RequestId::UNSOLICITED`] when the caller opted in,
+    /// push - surfaced with [`RequestId::UNSOLICITED`] when the caller opted in,
     /// otherwise a protocol violation that closes the connection.
     fn deliver_reply(
         &mut self,
@@ -247,10 +247,10 @@ where
     /// [`RequestId`] (the reply is FIFO-correlated to it). `WouldBlock` when the
     /// per-connection in-flight cap (`max_in_flight`) or the send backlog
     /// (`max_send_backlog`) is reached; `NotConnected` for a stale/unconnected
-    /// handle; `InvalidInput` for an empty `pdu` — a request holds a correlation
+    /// handle; `InvalidInput` for an empty `pdu` - a request holds a correlation
     /// slot until its reply arrives, so (unlike a server reply, where empty means
     /// "answered, nothing to send") there is no "send nothing" request. The `pdu`
-    /// is sent verbatim — frame it yourself.
+    /// is sent verbatim - frame it yourself.
     pub fn send(
         &mut self,
         conn: ConnId,
@@ -299,8 +299,8 @@ where
     /// error.
     ///
     /// Because this blocks until *this* connection replies, other connections'
-    /// events accumulate in memory meanwhile. With untrusted peers — especially
-    /// `expect_server_push` connections, which may stream unsolicited PDUs — a
+    /// events accumulate in memory meanwhile. With untrusted peers - especially
+    /// `expect_server_push` connections, which may stream unsolicited PDUs - a
     /// peer that withholds this reply while another floods events can grow that
     /// buffer without bound. Drive such workloads with
     /// [`next_event`](Client::next_event) /
@@ -368,15 +368,15 @@ where
     }
 
     /// Like [`next_event`](Client::next_event) but bounded: return the next
-    /// [`Event`] if one becomes ready within `dur`, else `Ok(None)` — "no event
+    /// [`Event`] if one becomes ready within `dur`, else `Ok(None)` - "no event
     /// within `dur`". A `None` here does **not** mean "no connections left" (as
     /// it does for `next_event`); the connections stay open and untouched, so
     /// call again to keep waiting.
     ///
     /// Buffered events are drained first (an immediate return). Otherwise a
     /// standalone `IORING_OP_TIMEOUT` is armed over the client's own deadline
-    /// pad — never a shared core pad, so a repeated call can't alias one still
-    /// in flight — and the ring is pumped until either an event is produced or
+    /// pad - never a shared core pad, so a repeated call can't alias one still
+    /// in flight - and the ring is pumped until either an event is produced or
     /// the deadline fires. If an event wins the race, the still-pending deadline
     /// is cancelled and reaped before returning, so it never leaks into a later
     /// call.
@@ -384,7 +384,7 @@ where
         &mut self,
         dur: Duration,
     ) -> io::Result<Option<Event>> {
-        // Ready events return at once — no deadline, no blocking.
+        // Ready events return at once - no deadline, no blocking.
         if let Some(ev) = self.events.pop_front() {
             return Ok(Some(ev));
         }
@@ -393,7 +393,7 @@ where
             return Ok(None);
         }
         // A prior call that unwound on a fatal ring error (a `?` below) returns
-        // with its deadline still in flight — the `deadline_pad` is durable for
+        // with its deadline still in flight - the `deadline_pad` is durable for
         // exactly this reason. Reap it before staging a new one so two
         // identical-`user_data` deadlines never coexist: a stale one reaped by
         // this call would be counted as ours and return a premature `None`.
@@ -423,7 +423,7 @@ where
             while let Some(cqe) = self.core.engine.ring.reap() {
                 let (op, _, _) = unpack(cqe.user_data);
                 if matches!(op, Some(Op::Deadline)) {
-                    // Not multishot — count it off exactly as `dispatch` would.
+                    // Not multishot - count it off exactly as `dispatch` would.
                     self.core.engine.inflight =
                         self.core.engine.inflight.saturating_sub(1);
                     fired = true;
@@ -439,7 +439,7 @@ where
                 break None;
             }
             // A completion that produced no event (e.g. a send finishing) and
-            // no deadline yet: wait again — the deadline still bounds the wait.
+            // no deadline yet: wait again - the deadline still bounds the wait.
         };
         // An event won the race: the deadline is still in flight. Cancel and
         // reap it so it can't fire on a later call (its pad is rewritten then).
@@ -451,7 +451,7 @@ where
     }
 
     /// Cancel the still-pending `next_event_timeout` deadline (identified by its
-    /// `user_data`) and reap until its terminal completion is seen — so the pad
+    /// `user_data`) and reap until its terminal completion is seen - so the pad
     /// is free to rewrite next call and `inflight` stays exact. Any real events
     /// reaped meanwhile are dispatched (queued for a later `next_event`). A
     /// cancel completing `-ENOENT` matched nothing, so the deadline is already
@@ -510,7 +510,7 @@ mod tests {
     type Framer = fn(&[u8], &mut ()) -> Framing;
 
     /// A client for a white-box deadline test, or `None` where io_uring is
-    /// unavailable — the environment skip the integration suites also take.
+    /// unavailable - the environment skip the integration suites also take.
     fn client() -> Option<Client<(), Framer>> {
         fn framer(_buf: &[u8], _state: &mut ()) -> Framing {
             Framing::More

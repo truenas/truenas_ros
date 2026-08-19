@@ -1,6 +1,6 @@
 //! The per-connection request data plane's ROLE half: the header-framer pump
 //! skeleton, the recv/send/splice completion wrappers (their heavy bookkeeping
-//! is core — see [`Reactor`](crate::net::core::reactor)), request delivery to
+//! is core - see [`Reactor`](crate::net::core::reactor)), request delivery to
 //! the body handler, and the detach install/handoff. What stays here is exactly
 //! the code that runs consumer closures (the framer, the body handler, the
 //! detach hook) or touches server-only fields (`handlers`, `mailbox`).
@@ -19,7 +19,7 @@ use crate::net::server::protocol::{DetachContext, Request, Response};
 use crate::sync::Arc;
 use crate::uring::sys::*;
 
-// The stages that run the consumer's framer/body handler — the only bounds
+// The stages that run the consumer's framer/body handler - the only bounds
 // this file needs (the accept handler never runs here).
 impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn>
 where
@@ -29,7 +29,7 @@ where
     /// The per-connection read/deliver pump: consult the header framer on the
     /// accumulated bytes and either read more, deliver a buffered request, or
     /// close. In pipelined mode it delivers every already-buffered request and
-    /// arms the next recv — up to the `max_in_flight_requests` cap — so a
+    /// arms the next recv - up to the `max_in_flight_requests` cap - so a
     /// deferred request doesn't stall reading the client's next ones.
     ///
     /// A thin skeleton over the core: [`Reactor::pump_gate`] runs the loop-top
@@ -63,7 +63,7 @@ where
 
     /// A recv completed; `op` says which kind (`RecvHeader`/`RecvBody`). All
     /// the completion bookkeeping is core ([`Reactor::on_recv_complete`]); the
-    /// returned [`RecvStep`] drives the delivery/pump tail — a completed body
+    /// returned [`RecvStep`] drives the delivery/pump tail - a completed body
     /// delivers then pumps, a completed header re-pumps, everything else is
     /// self-contained.
     pub(super) fn on_recv(
@@ -86,7 +86,7 @@ where
     /// A body splice completed (`Op::SpliceRecv`). All the completion
     /// bookkeeping is core ([`Reactor::on_splice_recv_complete`]); a fully moved
     /// body pumps the next frame. The body never entered the buffer, so there is
-    /// **no** `deliver_one` — the framer that returned `SpliceBody` was the
+    /// **no** `deliver_one` - the framer that returned `SpliceBody` was the
     /// per-frame consumer hook.
     pub(super) fn on_splice_recv(
         &mut self,
@@ -113,8 +113,8 @@ where
         // Borrow-split: `self.handlers`, `self.core.table`, and `self.mailbox` are
         // disjoint fields; within the connection, buf/addr (immutable) vs
         // userdata (mutable). The Responder holds owned channel clones.
-        // The token carries the FULL u64 generation — a worker may retain it
-        // across recycles — whereas the kernel routing used the low 32 bits.
+        // The token carries the FULL u64 generation - a worker may retain it
+        // across recycles - whereas the kernel routing used the low 32 bits.
         let gen64 = self.core.table.generation(slot);
         let (resp, req_id) = {
             let conn = self.core.table.conn_mut(slot);
@@ -130,7 +130,7 @@ where
             };
             let (header, body, peer, state) =
                 conn.deliver_parts(self.core.cfg.body_placement_threshold);
-            // The fs facade borrows the engine and the fs tables — fields
+            // The fs facade borrows the engine and the fs tables - fields
             // disjoint from `self.core.table` (which `conn` holds) and
             // `self.handlers`, so all three borrows coexist for the handler
             // call. `None` when no fs pool was configured.
@@ -168,7 +168,7 @@ where
                 CloseReason::HandlerClosed,
             ),
             Response::Defer(permit) => {
-                // The permit type proves defer() was called — but only its
+                // The permit type proves defer() was called - but only its
                 // token proves it was called for THIS request. A stashed
                 // permit returned for a later request has no live Deferred
                 // carrying that request's id, so parking it would wedge the
@@ -248,7 +248,7 @@ where
             Response::ReplyClose(bytes) => {
                 // The server speaks last: queue the final PDU (nothing, when
                 // empty) and mark the flush-close. The pump gate retires the
-                // recv side — buffered pipelined requests are discarded —
+                // recv side - buffered pipelined requests are discarded --
                 // and the connection closes once the send queue drains
                 // (`drive_flush_close` now, or `on_send` when it empties).
                 // Reported as `HandlerClosed`, like `Response::Close`.
@@ -264,9 +264,9 @@ where
             }
             // One logical reply sent as vectored segments (a header + payload
             // the protocol handed over separately). Mirrors Reply/ReplyClose:
-            // bump `outstanding` once iff any bytes are queued — the segment
+            // bump `outstanding` once iff any bytes are queued - the segment
             // helper flags only the last non-empty segment, so the retire
-            // count stays one — then keep serving or flush-close on `close`.
+            // count stays one - then keep serving or flush-close on `close`.
             Response::ReplyVectored { segments, close } => {
                 let queued = {
                     let conn = self.core.table.conn_mut(slot);
@@ -290,9 +290,9 @@ where
         }
     }
 
-    /// A send completed (`Op::Send`). All the completion bookkeeping — the
+    /// A send completed (`Op::Send`). All the completion bookkeeping - the
     /// gather-advance accounting, the partial-send re-arm, the next-batch kick,
-    /// the flush-close finish — is core ([`Reactor::on_send_complete`]); a fully
+    /// the flush-close finish - is core ([`Reactor::on_send_complete`]); a fully
     /// flushed gather resumes the pump.
     pub(super) fn on_send(
         &mut self,
@@ -307,7 +307,7 @@ where
     }
 }
 
-// Recv/send submission and transport checks — no handler runs here, so no
+// Recv/send submission and transport checks - no handler runs here, so no
 // closure bounds.
 impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     /// Materialize a real fd from the pool descriptor for a `body`-handler
@@ -342,14 +342,14 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         generation: u32,
         res: i32,
     ) -> errno::Result<()> {
-        // Kernel completion → low 32 bits. The slot is `Detaching`, not
-        // `Serving`, so `slot_matches_cqe` doesn't apply — check directly.
+        // Kernel completion -> low 32 bits. The slot is `Detaching`, not
+        // `Serving`, so `slot_matches_cqe` doesn't apply - check directly.
         if self.core.table.generation_low(slot) != generation {
             if res >= 0 {
                 // The kernel furnished the fd before the slot was recycled, so
                 // declining it here still leaks it unless we close it. Every
                 // path that does not hand the fd to a `Detached` owns closing
-                // it — this one included.
+                // it - this one included.
                 // SAFETY: `res` is the freshly installed fd, owned by us and
                 // consumed by nobody (the pool socket survives on the direct
                 // descriptor).
@@ -381,9 +381,9 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             return Ok(()); // no longer detaching (stale)
         }
         // Hand off. Park first, then run the handler against the parked slot,
-        // as the kTLS install→park does (`park_tls` precedes its handshake
+        // as the kTLS install->park does (`park_tls` precedes its handshake
         // handler): the connection must not leave the table across consumer
-        // code — see `park_detached_in_place`.
+        // code - see `park_detached_in_place`.
         let gen64 = self.core.table.generation(slot);
         let Some(conn) = self.core.table.park_detached_in_place(slot) else {
             // No longer detaching (stale): nobody will consume the fd.

@@ -1,7 +1,7 @@
 //! Idmapped-mount user namespaces.
 //!
 //! [`create_idmap_userns`] builds a user namespace populated with the given
-//! uid/gid maps and returns an owning fd that pins it — suitable for
+//! uid/gid maps and returns an owning fd that pins it - suitable for
 //! `mount_setattr(MOUNT_ATTR_IDMAP)`. [`IdmapCache`] adds a caller-owned cache
 //! so the (relatively expensive) namespace creation happens at most once per
 //! distinct map set.
@@ -39,7 +39,7 @@ pub struct IdmapEntry {
 
 impl IdmapEntry {
     /// Construct a validated mapping. `length` must be at least 1, and neither
-    /// `inside + length` nor `outside + length` may exceed 2³².
+    /// `inside + length` nor `outside + length` may exceed 2^3^2.
     pub fn new(inside: u32, outside: u32, length: u32) -> Result<Self> {
         if length == 0 {
             return Err(Error::Validation("length must be >= 1".into()));
@@ -119,7 +119,7 @@ fn create_userns_fd(uid_text: &str, gid_text: &str) -> Result<OwnedFd> {
         )
     }?;
     if pid == 0 {
-        // CHILD: async-signal-safe only — no allocation, no locks, no panics.
+        // CHILD: async-signal-safe only - no allocation, no locks, no panics.
         // Block until the parent SIGKILLs us (uncatchable, bypasses pause()).
         loop {
             // SAFETY: pause() is async-signal-safe.
@@ -202,7 +202,7 @@ fn dup(fd: &OwnedFd) -> Result<OwnedFd> {
 /// Creating a user namespace is comparatively expensive; an `IdmapCache` runs
 /// [`create_idmap_userns`] at most once per distinct map set and hands out
 /// independent `dup`s of the pinned namespace fd. A returned fd therefore
-/// outlives its cache entry — dropping it never affects the cache or other
+/// outlives its cache entry - dropping it never affects the cache or other
 /// callers, and [`IdmapCache::clear`] (or dropping the whole cache) releases the
 /// originals without disturbing fds already handed out.
 #[derive(Debug, Default)]
@@ -238,7 +238,7 @@ impl IdmapCache {
         // Minting outside the lock lets two callers race the same key; both
         // create a namespace, and the keep-the-winner insert drops the
         // loser's fd, reclaiming its namespace. Redundant creation is rare
-        // and bounded — the key space is a handful of mount configs.
+        // and bounded - the key space is a handful of mount configs.
         let fd = create_idmap_userns(uid_map, gid_map)?;
         let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         dup(guard.entry(key).or_insert(fd))

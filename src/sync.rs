@@ -3,7 +3,7 @@
 //!
 //! Under `cfg(not(loom))` every item here is a plain re-export, so the
 //! compiled artifact is byte-for-byte what importing `std::sync` directly
-//! would produce — this module costs nothing outside a model run. Under
+//! would produce - this module costs nothing outside a model run. Under
 //! `--cfg loom` the same names resolve to loom's permutation-checking
 //! versions, which is what lets [`loom::model`] explore every interleaving a
 //! protocol admits. See `src/uring/ring.rs` for the older, per-field form of
@@ -20,7 +20,7 @@
 //!   the same single acquire load it always was. The offload pool's lazy init
 //!   and the identity cache's per-key slot both use it.
 //! * **Timeouts.** `loom::sync::Condvar::wait_timeout` never reports a
-//!   timeout — it delegates to `wait` and hardcodes `timed_out() == false`.
+//!   timeout - it delegates to `wait` and hardcodes `timed_out() == false`.
 //!   Any branch predicated on a timeout is unreachable in a model and needs an
 //!   explicit seam; the offload pool's idle-retire path has one.
 //! * **Clocks.** `Instant` is not modelled. Code that throttles on elapsed
@@ -50,9 +50,9 @@ pub(crate) use std::{
 /// A write-once cell: [`std::sync::OnceLock`] in production, a mutex-backed
 /// stand-in under loom.
 ///
-/// The API is deliberately narrower than `OnceLock`'s — [`get`](Self::get)
+/// The API is deliberately narrower than `OnceLock`'s - [`get`](Self::get)
 /// clones out rather than borrowing, and [`with`](Self::with) runs a closure
-/// against a borrow — because a `Mutex<Option<T>>` cannot produce a `&T` that
+/// against a borrow - because a `Mutex<Option<T>>` cannot produce a `&T` that
 /// outlives its guard. Both callers already wanted one of those two shapes.
 #[cfg_attr(not(feature = "uring-fs"), allow(dead_code))]
 #[derive(Debug)]
@@ -97,7 +97,7 @@ impl<T> OnceCell<T> {
     ///
     /// Under loom the cell's lock is held for the duration of `f`. That is a
     /// coarser interleaving than production, where `OnceLock::get` borrows
-    /// without locking — deliberately so: what the lazy-init models need to
+    /// without locking - deliberately so: what the lazy-init models need to
     /// explore is the race to *fill* the cell, and concurrency *through* an
     /// already-filled one is covered by the models that drive the inner type
     /// directly.

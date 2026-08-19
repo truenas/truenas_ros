@@ -14,7 +14,7 @@ use crate::net::core::protocol::{
 
 /// A body handler's decision for one request.
 ///
-/// `Reply` is the synchronous fast path — the handler computed the reply inline
+/// `Reply` is the synchronous fast path - the handler computed the reply inline
 /// on the server thread (an **empty** reply means "answered, nothing to send":
 /// useful for one-way/notification messages; the connection stays open and
 /// reads continue). `ReplyClose` sends a **final** reply and then closes once
@@ -29,28 +29,28 @@ pub enum Response {
     /// Send this reply now. An empty vector sends nothing (a one-way message):
     /// the request is complete and the connection keeps serving.
     Reply(Vec<u8>),
-    /// Send this reply, then close the connection once it — and everything
-    /// queued before it — has flushed. For protocols where the server speaks
-    /// last: a WebSocket Close acknowledgement (RFC 6455 §5.5.1 — the server
+    /// Send this reply, then close the connection once it - and everything
+    /// queued before it - has flushed. For protocols where the server speaks
+    /// last: a WebSocket Close acknowledgement (RFC 6455 sec. 5.5.1 - the server
     /// closes the TCP connection first), an HTTP error before hanging up, an
     /// SMB "no protocol supported" negotiate reply. The recv side is retired
     /// at once: nothing further is read or delivered, buffered pipelined
     /// requests are discarded, and later worker outcomes and pushes for this
-    /// connection are dropped — nothing follows the farewell. An **empty**
+    /// connection are dropped - nothing follows the farewell. An **empty**
     /// vector queues no PDU and closes after flushing what is already queued
     /// (unlike [`Response::Close`], which tears down without flushing). The
     /// close hook reports [`CloseReason::HandlerClosed`]. Because the recv side
     /// is retired at once, a peer that stops reading before the farewell drains
     /// is reclaimed only by `ServerConfig::send_timeout` (or `tcp_user_timeout`)
-    /// — **not** `idle_timeout`/`request_timeout`, which no longer apply once
-    /// flush-closing — so set one of those when serving untrusted peers.
+    /// -- **not** `idle_timeout`/`request_timeout`, which no longer apply once
+    /// flush-closing - so set one of those when serving untrusted peers.
     ReplyClose(Vec<u8>),
     /// Send this reply as an ordered sequence of byte segments, scattered to
-    /// the socket with a single vectored write — so a protocol can hand the
+    /// the socket with a single vectored write - so a protocol can hand the
     /// server a header and a payload as separate buffers instead of
     /// concatenating them (an HTTP head + body, an SMB read header + file
     /// data, an NFS reply header + data). Each segment is a [`SendBuf`]:
-    /// owned bytes move, `'static` bytes are sent by reference — a canned
+    /// owned bytes move, `'static` bytes are sent by reference - a canned
     /// body or protocol constant is never copied. Protocol-neutral: the
     /// server never inspects the boundaries, it just gathers them. Empty
     /// segments are skipped; an all-empty reply sends nothing (a one-way
@@ -85,7 +85,7 @@ pub enum Response {
     /// the [`DetachPermit`] proof minted by **this request's**
     /// [`Responder::detach`]; the loop materializes a real fd and delivers it,
     /// with a [`Detached`] handle, to the [`Server::set_detach_handler`] handler.
-    /// The permit's token is verified at delivery — one from a different request
+    /// The permit's token is verified at delivery - one from a different request
     /// closes the connection instead. Only valid on a fully settled connection
     /// (no other request in flight, nothing buffered past this one); otherwise
     /// the connection is closed.
@@ -100,14 +100,14 @@ pub enum Response {
 /// than a breaking signature change; destructure with `..`.
 #[non_exhaustive]
 pub struct Incoming<'a> {
-    /// The peer's identity (fetched per connection — race-free).
+    /// The peer's identity (fetched per connection - race-free).
     pub peer: &'a ClientAddr,
     /// Resolved bind address of the listener this connection arrived on
-    /// (the same values [`Server::local_addrs`] reports) — the hook for
+    /// (the same values [`Server::local_addrs`] reports) - the hook for
     /// per-listener policy. Deliberately the listener's address, not the
     /// connection's local address: on a wildcard bind the two differ, and
     /// `getsockname` needs `SOCKET_URING_OP_GETSOCKNAME` (newer than the
-    /// target kernel) — a possible future `local_addr` field.
+    /// target kernel) - a possible future `local_addr` field.
     pub listener_addr: &'a ServerAddr,
 }
 
@@ -129,7 +129,7 @@ impl std::fmt::Debug for Incoming<'_> {
 pub struct DetachContext<'a, U> {
     /// The peer's identity.
     pub peer: &'a ClientAddr,
-    /// The connection's state — where the `body` handler that returned
+    /// The connection's state - where the `body` handler that returned
     /// [`Response::Detach`] stashed what the worker should do.
     pub state: &'a mut U,
 }
@@ -144,7 +144,7 @@ impl<U> std::fmt::Debug for DetachContext<'_, U> {
 
 /// One framed request, as handed to the `body` handler.
 ///
-/// Fields are public and borrow independently — `body` can be
+/// Fields are public and borrow independently - `body` can be
 /// [taken](Body::take) while `state` is mutably borrowed, because field
 /// accesses split. `#[non_exhaustive]`, so future context becomes a field
 /// addition rather than a breaking signature change; destructure with `..`.
@@ -152,7 +152,7 @@ impl<U> std::fmt::Debug for DetachContext<'_, U> {
 pub struct Request<'a, U> {
     /// The frame header the framer declared (`header_len` bytes).
     pub header: &'a [u8],
-    /// The message body — deref for in-place reads, [`Body::take`] to move
+    /// The message body - deref for in-place reads, [`Body::take`] to move
     /// the bytes to a worker (zero-copy when placed).
     pub body: Body<'a>,
     /// The peer's identity.
@@ -163,7 +163,7 @@ pub struct Request<'a, U> {
     /// [`Responder::defer`] to offload; also mints
     /// [`PushHandle`](Responder::push_handle)s.
     pub responder: Responder,
-    /// The request-bound fs submission facade — `Some` when the server was
+    /// The request-bound fs submission facade - `Some` when the server was
     /// built with an fs pool (`ServerConfig::fs_files`), else `None`. Take it
     /// (`req.fs.take()`) to open/read/stat files on the server's own ring under
     /// a per-request [`Personality`](crate::uring_fs::Personality): the first
@@ -190,14 +190,14 @@ impl<U> std::fmt::Debug for Request<'_, U> {
 /// fixed-width length prefix, or directly for a custom `header` framer (e.g. an
 /// LSP-style variable header) and/or per-connection state.
 pub struct Protocol<AcceptFn, HeaderFn, BodyFn> {
-    /// Admission: [`Incoming`]` → Option<U>`, once per accepted connection.
+    /// Admission: [`Incoming`]` -> Option<U>`, once per accepted connection.
     /// `None` rejects the connection (closed before any read); `Some(state)`
     /// accepts and stores `state` as the connection's `U`.
     pub accept: AcceptFn,
     /// Framing: given the bytes accumulated so far and the connection's state,
     /// decide what to read next or where the message boundary is.
     pub header: HeaderFn,
-    /// Application: [`Request`]` → `[`Response`]. Reply synchronously
+    /// Application: [`Request`]` -> `[`Response`]. Reply synchronously
     /// ([`Response::Reply`]), offload via [`Request::responder`] and return
     /// [`Response::Defer`], or [`Response::Close`].
     pub body: BodyFn,
@@ -212,14 +212,14 @@ impl<AcceptFn, HeaderFn, BodyFn> std::fmt::Debug
 }
 
 /// Build a stateless [`Protocol`] for a fixed-width length prefix: the caller
-/// supplies only a `(header, body, peer) → Option<reply>` handler (no
+/// supplies only a `(header, body, peer) -> Option<reply>` handler (no
 /// per-connection state, every connection accepted).
 ///
 /// The handler's return maps onto [`Response`] without inverting it:
-/// `Some(bytes)` sends exactly those bytes (frame the reply yourself — it
+/// `Some(bytes)` sends exactly those bytes (frame the reply yourself - it
 /// goes out verbatim), `Some` of an **empty** vector sends nothing and keeps
 /// serving (the one-way case, as [`Response::Reply`] documents), and `None`
-/// closes the connection — the bare handler's [`Response::Close`].
+/// closes the connection - the bare handler's [`Response::Close`].
 // The lint scores the three opaque closures in the generic return; they can't
 // be type-aliased on stable (`impl Trait` in a type alias is unstable), and
 // boxing them would put dyn dispatch on the hot path. Nothing is hidden here:

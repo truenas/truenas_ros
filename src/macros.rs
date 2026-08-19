@@ -3,17 +3,17 @@
 //!
 //! Beyond a plain `bitflags!` / enum definition, they add a `= <literal>`
 //! form, because many constants we need (`STATMOUNT_*`, `LISTMOUNT_*`,
-//! `FSCONFIG_*`, `OPEN_TREE_*`, `MOVE_MOUNT_*`, newer `STATX_*`, …) are not
+//! `FSCONFIG_*`, `OPEN_TREE_*`, `MOVE_MOUNT_*`, newer `STATX_*`, ...) are not
 //! exposed by the `libc` crate and must be hardcoded from the kernel uapi
 //! headers.
 
 /// Define a `bitflags`-based flag type.
 ///
 /// Each flag is written as one of:
-/// * `FLAG;` — value taken from `libc::FLAG`.
-/// * `FLAG = 0x1;` — explicit kernel-header value (annotate with a
+/// * `FLAG;` - value taken from `libc::FLAG`.
+/// * `FLAG = 0x1;` - explicit kernel-header value (annotate with a
 ///   `// <header>:<line>` comment at the use site).
-/// * `FLAG as u64;` — `libc::FLAG` cast to the container type (for libc type
+/// * `FLAG as u64;` - `libc::FLAG` cast to the container type (for libc type
 ///   mismatches).
 #[allow(unused_macros)]
 macro_rules! tn_bitflags {

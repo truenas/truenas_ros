@@ -1,4 +1,4 @@
-//! `move_mount(2)` — attach a detached mount, or move a mount.
+//! `move_mount(2)` - attach a detached mount, or move a mount.
 
 use crate::errno::{self, retry_on_eintr};
 use crate::path::TnPath;

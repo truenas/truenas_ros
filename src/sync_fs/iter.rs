@@ -8,16 +8,16 @@
 //! caller's own bookkeeping (there is no internal callback).
 //!
 //! This is a from-scratch Rust rewrite, not a translation of the `truenas_os` C
-//! extension's manual directory-stack / fd-recycling machinery — but it does
+//! extension's manual directory-stack / fd-recycling machinery - but it does
 //! reproduce that extension's **recovery-cookie** resume feature natively (see
 //! [`Cookie`]).
 //!
 //! # Resuming an interrupted traversal
 //!
-//! [`FsIter::cookie`] snapshots the current directory stack as a [`Cookie`] —
+//! [`FsIter::cookie`] snapshots the current directory stack as a [`Cookie`] --
 //! an ordered list of `(path, inode)` levels from the root down. Persist it
 //! (via [`Cookie::to_bytes`]) alongside [`FsIter::stats`] every so often, and a
-//! later run — even a fresh process after a crash — can resume *near* where it
+//! later run - even a fresh process after a crash - can resume *near* where it
 //! left off:
 //!
 //! ```no_run
@@ -33,7 +33,7 @@
 //! Resume is **best-effort / at-least-once**: ancestor directories continue at
 //! the exact position they were interrupted, but the single deepest saved
 //! directory is re-read from its start, so a few of its already-processed
-//! entries may be yielded again — de-duplicate downstream if you need
+//! entries may be yielded again - de-duplicate downstream if you need
 //! exactly-once. If a saved directory no longer exists or changed inode,
 //! [`FsIterBuilder::build`] returns [`Error::IteratorRestore`]; recover by
 //! [`Cookie::truncate`]-ing to that `depth` and rebuilding.
@@ -81,7 +81,7 @@ pub enum EntryType {
     /// A child mountpoint (only with `include_mountpoints`; fd is `O_PATH`,
     /// never descended into).
     Mountpoint,
-    /// A special file — a FIFO, socket, or block/character device. Its `fd` is
+    /// A special file - a FIFO, socket, or block/character device. Its `fd` is
     /// not for data I/O (a FIFO read would block, a socket can't be opened that
     /// way); read the type/mode from [`Entry::statx`] and recreate it by type
     /// rather than copying contents.
@@ -108,7 +108,7 @@ pub struct DirStackEntry {
 /// [`FsIter::cookie`], as ordered `(path, inode)` levels from the root down.
 ///
 /// Pass one back to [`FsIterBuilder::resume_from`] to continue a traversal
-/// where it left off (best-effort — see the module docs). Persist it across
+/// where it left off (best-effort - see the module docs). Persist it across
 /// process restarts with [`Cookie::to_bytes`] / [`Cookie::from_bytes`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Cookie(Vec<DirStackEntry>);
@@ -246,7 +246,7 @@ pub struct IterState {
 /// An entry produced by [`FsIter`].
 ///
 /// Carries the entry's [`Statx`] metadata and an open [`OwnedFd`] to the object
-/// it names. The fd closes automatically when the `Entry` is dropped — callers
+/// it names. The fd closes automatically when the `Entry` is dropped - callers
 /// never close it manually. Use [`Entry::fd`] to borrow it during the entry's
 /// lifetime, or [`Entry::into_fd`] to take ownership.
 #[derive(Debug)]
@@ -312,7 +312,7 @@ impl Entry {
     /// Borrow the entry's open file descriptor.
     ///
     /// For [`EntryType::Symlink`], [`EntryType::Mountpoint`], and
-    /// [`EntryType::Special`] this is not a data-I/O fd — it is an `O_PATH`
+    /// [`EntryType::Special`] this is not a data-I/O fd - it is an `O_PATH`
     /// handle (a special file may instead be a non-blocking one) usable with
     /// `statx` and [`Entry::read_link`]. Read file data only from an
     /// [`EntryType::File`] fd.
@@ -390,7 +390,7 @@ impl FsIter {
             .collect()
     }
 
-    /// Capture a resume [`Cookie`] for the current position — the directory
+    /// Capture a resume [`Cookie`] for the current position - the directory
     /// stack as `(path, inode)` levels. Persist it (see [`Cookie::to_bytes`])
     /// to later [`resume_from`](FsIterBuilder::resume_from) near here.
     pub fn cookie(&self) -> Cookie {
@@ -432,8 +432,8 @@ impl FsIter {
         } else {
             // A regular file, or an entry whose type `readdir` didn't report
             // (`DT_UNKNOWN`). Open it readably, but add `O_NONBLOCK`: if it is
-            // really a FIFO — a filesystem that doesn't fill `d_type`, or an
-            // entry swapped under us between `readdir` and here — the open
+            // really a FIFO - a filesystem that doesn't fill `d_type`, or an
+            // entry swapped under us between `readdir` and here - the open
             // returns immediately instead of blocking on an absent writer.
             // `O_NONBLOCK` has no effect on regular-file reads, so a regular
             // file's handed-back fd behaves normally.
@@ -464,7 +464,7 @@ impl FsIter {
                         Err(e) => return Err(e.into()),
                     }
                 }
-                // Symlink swap or delete raced us — prune this entry.
+                // Symlink swap or delete raced us - prune this entry.
                 Err(Errno::ELOOP | Errno::ENOENT) => return Ok(None),
                 // Crosses a mount boundary.
                 Err(Errno::EXDEV) => {
@@ -582,7 +582,7 @@ impl Iterator for FsIter {
             let dirent = match read {
                 Ok(Some(d)) => d,
                 Ok(None) => {
-                    // Directory exhausted — ascend.
+                    // Directory exhausted - ascend.
                     self.stack.pop();
                     continue;
                 }
@@ -817,7 +817,7 @@ fn dup_cloexec(fd: BorrowedFd<'_>) -> errno::Result<OwnedFd> {
 /// re-opening and inode-validating each saved directory level so iteration
 /// continues inside the deepest one. Intermediate directories are consumed from
 /// their parent's stream (never re-yielded); the deepest frame is left freshly
-/// opened, so `next` re-reads it from the start — the best-effort part of the
+/// opened, so `next` re-reads it from the start - the best-effort part of the
 /// contract (see the module docs). A level whose saved child can no longer be
 /// found (deleted, or its inode changed) yields [`Error::IteratorRestore`]
 /// carrying that depth.
@@ -855,7 +855,7 @@ fn restore_stack(
             ) {
                 Ok(fd) => fd,
                 // Recycled onto a non-dir, now a mountpoint, or raced away:
-                // keep scanning — the real directory may be further along.
+                // keep scanning - the real directory may be further along.
                 Err(
                     Errno::ENOTDIR
                     | Errno::EXDEV
@@ -947,7 +947,7 @@ impl Drop for Dir {
     }
 }
 
-/// Classification of an entry `readdir` reported as `DT_UNKNOWN` — the case a
+/// Classification of an entry `readdir` reported as `DT_UNKNOWN` - the case a
 /// filesystem that does not fill `d_type` produces for every entry. Driven from
 /// here because feeding `process` a hand-built [`DirEntry`] needs this module's
 /// internals; no mountable filesystem reaches it unprivileged.
@@ -964,7 +964,7 @@ mod tests {
     }
 
     /// A `Statx` reporting `btime` at `sec`, or leaving `STATX_BTIME` clear
-    /// when `reported` is false — which no filesystem to hand does, so the
+    /// when `reported` is false - which no filesystem to hand does, so the
     /// cutoff's fail-open case is only reachable from here.
     fn with_btime(reported: bool, sec: i64) -> Statx {
         // SAFETY: `StatxRaw` is a #[repr(C)] POD of integers; all-zero is the
@@ -987,7 +987,7 @@ mod tests {
         // the epoch" and keep the file. Refuse instead of answering wrongly.
         assert_eq!(btime_skips(&with_btime(false, 0), 100), None);
         // A zero cutoff disables the filter, so an absent btime is no
-        // obstacle — nothing was asked of it.
+        // obstacle - nothing was asked of it.
         assert_eq!(btime_skips(&with_btime(false, 0), 0), Some(false));
     }
 

@@ -4,13 +4,13 @@
 //! There is no io_uring `getdents`/`readdir` op, so the **name feed** is a
 //! `readdir` pass over the directory fd on the caller's own thread (no worker,
 //! no channel). [`QueryDir::next`] reads the next `clump` names, then enriches
-//! them by **scattering non-blocking reactor ops** — `statx` (path-based) and
-//! `fgetxattr` on an opened entry fd — through the [`FsHandle`] `start_*` twins:
+//! them by **scattering non-blocking reactor ops** - `statx` (path-based) and
+//! `fgetxattr` on an opened entry fd - through the [`FsHandle`] `start_*` twins:
 //! all of a clump's ops are submitted before any is waited on, so they run
 //! concurrently on the ring. The directory `DIR*` is held open across `next`
 //! calls (incremental; nothing is buffered up front) and closed on `Drop`.
 //!
-//! The directory is opened **under the caller's [`Personality`]** — that open
+//! The directory is opened **under the caller's [`Personality`]** - that open
 //! is the DAC/list-permission check (`EACCES` if `who` cannot list), so
 //! enumeration never runs under the reactor's ambient root.
 //!
@@ -32,8 +32,8 @@ use std::ffi::{CStr, CString, OsString};
 use std::fmt;
 use std::os::fd::{AsFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-// `Arc` and the reply channels come from `crate::sync` — std's outside
-// `--cfg loom` — so this file compiles in the pool's loom model build.
+// `Arc` and the reply channels come from `crate::sync` - std's outside
+// `--cfg loom` - so this file compiles in the pool's loom model build.
 use crate::sync::{mpsc, Arc};
 
 bitflags! {
@@ -84,7 +84,7 @@ bitflags! {
         ///
         /// On an `acltype=nfsv4` dataset ZFS lists `system.nfs4_acl_xdr` only
         /// when the ACL is **not** trivial (`zpl_xattr_list`), and almost every
-        /// object carries a trivial one — so discovery alone is not a reliable
+        /// object carries a trivial one - so discovery alone is not a reliable
         /// way to pick ACLs up. Ask for [`EnrichSpec::ACL`] instead, which
         /// fetches [`QueryOptions::acl_name`] directly.
         const SYSTEM = 0b1000;
@@ -107,7 +107,7 @@ pub struct QueryOptions {
     /// Entries per yielded batch (clamped to at least 1).
     pub clump: usize,
     /// Drop entries that live on a **different filesystem** from the directory
-    /// being listed — a mount point, which on ZFS means a child dataset or a
+    /// being listed - a mount point, which on ZFS means a child dataset or a
     /// `.zfs/snapshot` automount.
     ///
     /// `readdir` honours no `RESOLVE_*` flags, so a walk has no equivalent of
@@ -121,12 +121,12 @@ pub struct QueryOptions {
     pub same_device_only: bool,
     /// The `statx` mask requested for each entry when [`EnrichSpec::STATX`] is
     /// set. Defaults to [`StatxMask::BASIC_STATS`]; widen it to ask for fields
-    /// the basic set omits — notably [`StatxMask::CHANGE_COOKIE`], which costs
+    /// the basic set omits - notably [`StatxMask::CHANGE_COOKIE`], which costs
     /// nothing extra here because the `statx` runs either way and gives a
     /// caller an exact validator for anything it caches per entry (see
     /// [`Statx::change_cookie`]).
     pub statx_mask: StatxMask,
-    /// The order entries are yielded in. Defaults to [`Order::Readdir`] — see
+    /// The order entries are yielded in. Defaults to [`Order::Readdir`] - see
     /// [`Order`] for what the ordered modes cost.
     pub order: Order,
     /// Yield only entries whose name starts with these bytes.
@@ -140,11 +140,11 @@ pub struct QueryOptions {
     ///
     /// These bytes are compared as a **literal key**, not as a bare name: to
     /// resume past the directory `a` under [`Order::ByPathBytes`], pass `a/`
-    /// — exactly where `a/` sorts — rather than `a`, which is where a *file*
+    /// -- exactly where `a/` sorts - rather than `a`, which is where a *file*
     /// named `a` sorts.
     ///
     /// Ignored under [`Order::Readdir`], which has no order to be "after".
-    /// Note this prunes *after* the directory has been read and sorted — it
+    /// Note this prunes *after* the directory has been read and sorted - it
     /// resumes a listing, it does not make resuming cheap.
     pub start_after: Option<Vec<u8>>,
 }
@@ -172,7 +172,7 @@ impl Default for QueryOptions {
 /// **Both ordered modes read the whole directory before the first batch**, so
 /// they cost one full `getdents` sweep plus an O(n log n) sort up front, and
 /// hold every name in memory for the life of the [`QueryDir`]. That is
-/// inherent — the smallest name cannot be known without seeing them all.
+/// inherent - the smallest name cannot be known without seeing them all.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Order {
     /// Whatever the filesystem returns. On ZFS that is hash order, not
@@ -187,7 +187,7 @@ pub enum Order {
     /// This is the difference between sorting names and sorting keys, and it
     /// is not cosmetic. `/` is `0x2F`, so a bare-name sort puts the directory
     /// `a` before `a-1.txt` and `a.txt`, and a depth-first walk would then
-    /// emit `a/b.txt` before both — while their full paths order
+    /// emit `a/b.txt` before both - while their full paths order
     /// `a-1.txt` < `a.txt` < `a/b.txt`. Appending the separator that will
     /// actually follow the directory name restores agreement, so sorting each
     /// directory this way and recursing in that order yields a subtree in
@@ -224,7 +224,7 @@ pub struct DirEntry {
     /// It separates "this entry has no extended attributes" from "the listing
     /// could not be completed", which are otherwise both an empty
     /// [`xattrs`](Self::xattrs). Never set for an attribute `who` simply cannot
-    /// read — that is a deliberate drop, not a failure.
+    /// read - that is a deliberate drop, not a failure.
     pub xattrs_incomplete: bool,
 }
 
@@ -341,7 +341,7 @@ impl QueryDir {
     /// Give every `DT_UNKNOWN` entry a real `d_type` with a scatter-gathered
     /// `statx`, so [`Order::ByPathBytes`] never has to guess whether a name
     /// carries a trailing separator. An entry whose `statx` fails keeps
-    /// `DT_UNKNOWN` and sorts as a non-directory — the same answer guessing
+    /// `DT_UNKNOWN` and sorts as a non-directory - the same answer guessing
     /// would have given, but only where the kernel could tell us nothing.
     fn resolve_unknown_dtypes(&self, all: &mut [(OsString, u8)]) {
         let pending: Vec<(usize, FsPending)> = all
@@ -385,7 +385,7 @@ impl QueryDir {
         while out.len() < limit {
             Errno::clear();
             // SAFETY: `dp` is a live `DIR*`; the returned pointer is valid until
-            // the next `readdir`/`closedir` — copied out immediately below.
+            // the next `readdir`/`closedir` - copied out immediately below.
             let ent = unsafe { libc::readdir(self.dp) };
             if ent.is_null() {
                 return match Errno::last_raw() {
@@ -473,7 +473,7 @@ impl QueryDir {
 
         // Collect each entry's statx and opened fd, dropping anything that
         // crossed a mount point when the caller asked for one filesystem.
-        // Filtering here — before the xattr reads below — also means a nested
+        // Filtering here - before the xattr reads below - also means a nested
         // dataset costs no further work.
         let cross_dev = |st: Option<&Statx>| match (self.dir_dev, st) {
             (Some(dev), Some(st)) => st.dev() != dev,
@@ -918,7 +918,7 @@ fn cmp_path_bytes(
 ///
 /// Driven by `fuzz/fuzz_targets/path_order.rs`. `cmp_path_bytes` orders
 /// attacker-named directory entries and its result feeds `sort_by` and
-/// `partition_point`, so it must be a **total order** — since Rust 1.81 an
+/// `partition_point`, so it must be a **total order** - since Rust 1.81 an
 /// inconsistent comparator is a `sort_by` panic, and here it would also cut a
 /// resume boundary in the wrong place.
 #[cfg(feature = "__fuzz")]
@@ -936,7 +936,7 @@ pub mod fuzz {
 
 /// Start listing `dir` as `who`, enriching each entry per `opts`. Opening the
 /// directory `O_RDONLY|O_DIRECTORY` under `who` **is** the list-permission
-/// check — returns `EACCES` when `who` cannot list `dir`. Pull enriched batches
+/// check - returns `EACCES` when `who` cannot list `dir`. Pull enriched batches
 /// with [`QueryDir::next`].
 pub fn query_directory(
     h: &FsHandle,
@@ -950,7 +950,7 @@ pub fn query_directory(
     let list_how = OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY);
     let dir_read = h.open(who, dir, ".", list_how)?;
 
-    // `fdopendir`/`closedir` take ownership of the fd, so hand them a dup —
+    // `fdopendir`/`closedir` take ownership of the fd, so hand them a dup --
     // `dir_read` then drops here, closing its own fd; the `DIR*` owns the dup.
     // SAFETY: `dir_read` is a live fd for the dup call.
     let dup = retry_on_eintr(|| unsafe { libc::dup(dir_read.as_raw_fd()) })?;
@@ -1024,7 +1024,7 @@ impl QueryPool {
     }
 
     /// Enqueue a listing of `dir` as `who` and return immediately. Pull its
-    /// enriched batches from the [`QueryHandle`]. Non-blocking — just enqueues.
+    /// enriched batches from the [`QueryHandle`]. Non-blocking - just enqueues.
     pub fn query(
         &self,
         who: Personality,
@@ -1042,7 +1042,7 @@ impl QueryPool {
                         }
                     }
                 }
-                // A failed open (e.g. `EACCES` — the list-permission check)
+                // A failed open (e.g. `EACCES` - the list-permission check)
                 // surfaces as a single error batch.
                 Err(e) => {
                     let _ = out.send(Err(e));
@@ -1053,7 +1053,7 @@ impl QueryPool {
     }
 
     /// Copy `len` bytes from `src[off_src..]` to `dst[off_dst..]`. First tries an
-    /// **inline block clone** (`FICLONERANGE`) on the caller's thread —
+    /// **inline block clone** (`FICLONERANGE`) on the caller's thread --
     /// metadata-only on a reflink-capable filesystem (ZFS
     /// `feature@block_cloning`: a block-pointer copy + BRT refcount, no data
     /// I/O), so it moves nothing and returns a resolved [`CopyHandle`]. If the
@@ -1070,7 +1070,7 @@ impl QueryPool {
         len: u64,
     ) -> CopyHandle {
         // 1. Inline `FICLONERANGE`: on ZFS this is metadata-only (no data I/O),
-        //    so run it here, not on the pool — there is no io_uring op for it
+        //    so run it here, not on the pool - there is no io_uring op for it
         //    (a direct `ioctl`). Caveat: a freshly written, still-dirty source
         //    with `zfs_bclone_wait_dirty=1` can make this wait ~5s for a TXG
         //    sync (`zfs_vnops.c`); an existing/synced source won't.
@@ -1085,11 +1085,11 @@ impl QueryPool {
         let cloned =
             unsafe { libc::ioctl(dst.as_raw_fd(), FICLONERANGE, &fcr) };
         if cloned == 0 {
-            // Clone succeeded — no bytes moved; `len` now shares blocks.
+            // Clone succeeded - no bytes moved; `len` now shares blocks.
             return CopyHandle::Ready(Ok(len));
         }
         // 2. Clone rejected (misaligned `EINVAL`, `EOPNOTSUPP`, cross-dataset
-        //    `EXDEV`, dirty-no-wait `EAGAIN`, …) → offload a real byte copy
+        //    `EXDEV`, dirty-no-wait `EAGAIN`, ...) -> offload a real byte copy
         //    (clone-first `copy_file_range` with an `EXDEV` byte-copy fallback).
         let (out, rx) = mpsc::channel();
         let src = src.clone();
@@ -1137,7 +1137,7 @@ impl QueryHandle {
     }
 
     /// The next batch if one is already available, without blocking. `None`
-    /// means "nothing ready yet" *or* "finished" — [`next`](Self::next)
+    /// means "nothing ready yet" *or* "finished" - [`next`](Self::next)
     /// distinguishes them by blocking.
     pub fn try_next(&self) -> Option<crate::Result<Vec<DirEntry>>> {
         self.rx.try_recv().ok()
@@ -1163,7 +1163,7 @@ pub enum CopyHandle {
 }
 
 impl CopyHandle {
-    /// The bytes copied — instant for an inline clone, else blocking until the
+    /// The bytes copied - instant for an inline clone, else blocking until the
     /// offloaded copy finishes (`ECONNABORTED` if the pool was dropped first).
     pub fn wait(self) -> crate::Result<u64> {
         match self {
@@ -1175,7 +1175,7 @@ impl CopyHandle {
     }
 }
 
-/// `struct file_clone_range` (`linux/fs.h`) — the `FICLONERANGE` ioctl argument.
+/// `struct file_clone_range` (`linux/fs.h`) - the `FICLONERANGE` ioctl argument.
 #[repr(C)]
 struct FileCloneRange {
     src_fd: i64,
@@ -1202,14 +1202,14 @@ const MAX_CHUNK: usize = 0x7FFF_FFFF & !0xFFF;
 /// Clone `len` bytes from `src[off_src..]` to `dst[off_dst..]`, preferring a
 /// metadata-only block clone and falling back to a real copy.
 ///
-/// **Blocking — for a pool thread, never the reactor.** `FICLONERANGE` is
+/// **Blocking - for a pool thread, never the reactor.** `FICLONERANGE` is
 /// metadata-only on a reflink-capable filesystem, but it still takes
 /// filesystem locks and can wait on dirty data, so even the fast path must
 /// not run on the loop.
 ///
 /// Needs no [`Personality`]: both endpoints are already-open [`File`]s, and
-/// the kernel authorizes the copy from *their* open modes — which were
-/// established under the identity that opened them — rather than from the
+/// the kernel authorizes the copy from *their* open modes - which were
+/// established under the identity that opened them - rather than from the
 /// calling thread's credentials.
 pub(crate) fn clone_or_copy_range(
     src: &File,
@@ -1337,7 +1337,7 @@ mod order_tests {
 
     /// The inversion the whole comparator exists for. `/` is `0x2F`, above
     /// both `-` (`0x2D`) and `.` (`0x2E`), so the directory `a` belongs
-    /// *between* `a.txt` and `aa.txt` — not first, where its bare name sorts.
+    /// *between* `a.txt` and `aa.txt` - not first, where its bare name sorts.
     /// Getting this wrong reorders a walk against true path order, which is
     /// how keys go missing at a page boundary.
     #[test]
@@ -1361,7 +1361,7 @@ mod order_tests {
     }
 
     /// Several entries sharing a prefix, each differing only in what follows
-    /// it — `.` vs `/` vs end-of-name — so every branch of the synthesized
+    /// it - `.` vs `/` vs end-of-name - so every branch of the synthesized
     /// trailing byte is exercised against a real neighbour.
     #[test]
     fn separator_ranks_against_dot_at_every_position() {

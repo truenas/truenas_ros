@@ -2,7 +2,7 @@
 //! secrets: the pages are removed from the kernel direct map, kept off swap,
 //! and excluded from core dumps (on TrueNAS, from a support bundle).
 //! `secretmem_mmap_prepare` stamps the VMA `VM_LOCKED | VM_DONTDUMP` itself
-//! (`mm/secretmem.c:131`) — no separate `mlock`/`madvise` — and charges it
+//! (`mm/secretmem.c:131`) - no separate `mlock`/`madvise` - and charges it
 //! against `RLIMIT_MEMLOCK` (`:128`).
 //!
 //! This is memory-access hardening, not at-rest encryption: a usable secret is
@@ -36,7 +36,7 @@ fn memfd_secret() -> Result<OwnedFd> {
 }
 
 /// Whether a failed `memfd_secret` means the kernel cannot do this at all,
-/// rather than not right now — the answer a daemon disables secret handling
+/// rather than not right now - the answer a daemon disables secret handling
 /// on, for the rest of its life.
 ///
 /// `ENOSYS` is the missing syscall and `EPERM` a seccomp filter denying it;
@@ -62,12 +62,12 @@ fn page_size() -> usize {
 /// Sized up to whole pages so every mapped byte is backed (an unbacked
 /// secretmem page faults `SIGBUS`), but the slices expose exactly `len`. Fill
 /// it once via [`as_mut_slice`](Self::as_mut_slice), then treat it as
-/// read-only; drop unmaps. The memfd is closed once mapped — the
+/// read-only; drop unmaps. The memfd is closed once mapped - the
 /// mapping keeps the memory alive, leaving no reopenable handle in
 /// `/proc/self/fd`. Pack many secrets into one region to spare `RLIMIT_MEMLOCK`.
 pub struct SecretMem {
     ptr: *mut u8,
-    /// Requested length (`≤ mapped`).
+    /// Requested length (`<= mapped`).
     len: usize,
     /// Page-rounded mapped length, for `munmap`.
     mapped: usize,
@@ -100,7 +100,7 @@ impl SecretMem {
             return Err(Errno::last());
         }
         // SAFETY: null placement, `mapped > 0`, live memfd, offset 0.
-        // `MAP_SHARED` is mandatory — secretmem rejects `MAP_PRIVATE`.
+        // `MAP_SHARED` is mandatory - secretmem rejects `MAP_PRIVATE`.
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -144,7 +144,7 @@ impl SecretMem {
     /// `secretmem_mmap_prepare`, `mm/secretmem.c:128`, and bypassed entirely
     /// under `CAP_IPC_LOCK`, `mm/mmap.c:233`), so a `true` here does not
     /// promise the next [`with_capacity`](Self::with_capacity) fits the
-    /// limit — that surfaces as `EAGAIN` from the allocation itself.
+    /// limit - that surfaces as `EAGAIN` from the allocation itself.
     pub fn available() -> bool {
         match memfd_secret() {
             Ok(_) => true,
@@ -154,11 +154,11 @@ impl SecretMem {
 
     /// The secret bytes, read-only; length is the requested `len`.
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: live mapping of `mapped ≥ len`; borrow tied to `&self`.
+        // SAFETY: live mapping of `mapped >= len`; borrow tied to `&self`.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
-    /// The secret bytes, writable — for filling at construction.
+    /// The secret bytes, writable - for filling at construction.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: as `as_slice`; `&mut self` proves exclusive access.
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
@@ -175,7 +175,7 @@ impl SecretMem {
     }
 }
 
-/// Read the region as a byte slice — lets a generic packed store borrow from a
+/// Read the region as a byte slice - lets a generic packed store borrow from a
 /// `memfd_secret` arena the same way it borrows from a `Vec`.
 impl AsRef<[u8]> for SecretMem {
     fn as_ref(&self) -> &[u8] {
@@ -250,7 +250,7 @@ impl std::fmt::Debug for Secret {
 
 pub use crate::scrub::scrub;
 
-/// `VmFlags:` for whichever `/proc/self/smaps` region contains `addr` —
+/// `VmFlags:` for whichever `/proc/self/smaps` region contains `addr` --
 /// how a test proves what backs a mapping. Crate-visible so the
 /// `configfile` staging test can hold a region and check the same flags.
 #[cfg(test)]
@@ -308,7 +308,7 @@ mod tests {
         if !secretmem_or_skip() {
             return;
         }
-        // Access runs after `with_capacity` closed the fd — also proving the
+        // Access runs after `with_capacity` closed the fd - also proving the
         // mapping outlives it.
         let mut mem = SecretMem::with_capacity(40).expect("secret region");
         assert_eq!(mem.len(), 40);
@@ -386,14 +386,14 @@ mod tests {
         let addr = mem.as_slice().as_ptr() as usize;
 
         // SAFETY: the child only reads /proc, writes a byte to a pipe and
-        // `_exit`s — no allocation, no Rust destructor.
+        // `_exit`s - no allocation, no Rust destructor.
         let mut fds = [0i32; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             let mapped = u8::from(vm_flags_of(addr).is_some());
-            // SAFETY: the child's own copy, dropped exactly once — the
+            // SAFETY: the child's own copy, dropped exactly once - the
             // teardown a forked worker runs.
             unsafe { std::ptr::drop_in_place(&mut mem) };
             unsafe {

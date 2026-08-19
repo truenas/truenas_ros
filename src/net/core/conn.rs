@@ -1,9 +1,9 @@
 //! Per-connection state and the `user_data` completion-routing codec.
 //!
-//! A [`Connection`] owns every buffer the kernel touches on its behalf — one
+//! A [`Connection`] owns every buffer the kernel touches on its behalf - one
 //! accumulating receive buffer, the queued send PDUs, and the send gather's
 //! `iovec`s/`msghdr` (recvs are plain `RECV` ops whose destination rides in
-//! the SQE; only multi-PDU send gathers need a `msghdr`) — plus the caller's
+//! the SQE; only multi-PDU send gathers need a `msghdr`) - plus the caller's
 //! per-connection state `U`. Connections are stored boxed
 //! (`Box<Connection<U>>`) in the server's slab, so their addresses are stable:
 //! the kernel-visible pointers set up here stay valid from SQE submission
@@ -44,19 +44,19 @@ pub(crate) enum Op {
     /// resource node).
     Shutdown = 10,
     /// A `SO_PEERNAME` fetch (`URING_CMD`) between a TCP accept and the
-    /// accept handler — per-connection, race-free peer addresses.
+    /// accept handler - per-connection, race-free peer addresses.
     Peername = 11,
     /// A `FIXED_FD_INSTALL` that materializes a real fd for a kTLS listener's
     /// connection, furnished to the consumer's handshake worker.
     FdInstall = 12,
     /// A backoff `TIMEOUT` after a transient accept error, whose completion
     /// re-arms that listener's multishot accept (the slot field is the
-    /// listener index) — avoids a hot spin under resource pressure.
+    /// listener index) - avoids a hot spin under resource pressure.
     AcceptRetry = 13,
     /// A standalone `TIMEOUT` bounding a `TlsParked` slot's handshake; on
     /// expiry, if the slot is still parked, it is shed (`tls_handshake_timeout`).
     HandshakeTimeout = 14,
-    /// A `FIXED_FD_INSTALL` for a `body`-handler connection **detach** — like
+    /// A `FIXED_FD_INSTALL` for a `body`-handler connection **detach** - like
     /// `FdInstall` but from a `Serving` slot, furnishing the real fd to the
     /// consumer's detach worker (`Response::Detach`).
     DetachInstall = 15,
@@ -71,8 +71,8 @@ pub(crate) enum Op {
     /// The `LINK_TIMEOUT` linked to a recv as its idle/request clock. Distinct
     /// from the generic `LinkTimeout` (sends, splices) because its completion
     /// disambiguates a short recv: a cancelled `MSG_WAITALL` recv that had
-    /// consumed bytes completes with `res = done_io > 0` — bit-identical to a
-    /// peer FIN mid-frame — and only this CQE (`-ETIME` fired vs `-ECANCELED`
+    /// consumed bytes completes with `res = done_io > 0` - bit-identical to a
+    /// peer FIN mid-frame - and only this CQE (`-ETIME` fired vs `-ECANCELED`
     /// the recv won) tells a timeout from a truncation (`on_recv_clock`).
     RecvClock = 18,
     /// A standalone `TIMEOUT` bounding a kTLS body splice's inactivity. A
@@ -82,7 +82,7 @@ pub(crate) enum Op {
     /// is the only clock that reaches it (`arm_splice_deadline`).
     SpliceDeadline = 19,
     /// An `IORING_OP_CONNECT` establishing an outbound connection on a socket
-    /// installed into the pool. Client-only — the server never dials out (its
+    /// installed into the pool. Client-only - the server never dials out (its
     /// `dispatch` routes this tag to `unreachable!`), so the shared codec keeps
     /// one `Op`. Constructed by `from_u8` under every role, so no dead code.
     Connect = 20,
@@ -117,7 +117,7 @@ impl Op {
     }
 }
 
-/// Encode `(op, slot, generation)` into an SQE `user_data` token — the
+/// Encode `(op, slot, generation)` into an SQE `user_data` token - the
 /// stream vocabulary over the shared raw codec. Stream tags stay inside the
 /// `0x00..=0x7F` domain (`user_data::TAG_FS_DOMAIN` marks the other half).
 pub(crate) fn pack(op: Op, slot: u32, generation: u32) -> u64 {
@@ -159,7 +159,7 @@ pub(crate) enum Transport {
     /// Plain TCP/unix: `IORING_OP_RECV` straight into the destination.
     Plain,
     /// Kernel TLS: `IORING_OP_RECVMSG` with a control buffer, so the record
-    /// type can be read — a plain recv returns `-EIO` on any non-data record.
+    /// type can be read - a plain recv returns `-EIO` on any non-data record.
     /// Boxed so plain connections carry none of this weight.
     Ktls(Box<KtlsRecv>),
 }
@@ -211,7 +211,7 @@ impl KtlsRecv {
 
     /// The TLS record content type of the just-completed recv, read from the
     /// `TLS_GET_RECORD_TYPE` control message. `None` if the control buffer was
-    /// truncated (`MSG_CTRUNC`) or carried no such message — either way the
+    /// truncated (`MSG_CTRUNC`) or carried no such message - either way the
     /// caller treats a non-`application_data` result as a control record.
     fn record_type(&self) -> Option<u8> {
         if self.msg.msg_flags & libc::MSG_CTRUNC != 0 {
@@ -241,7 +241,7 @@ impl KtlsRecv {
 ///
 /// In pipelined mode a recv and a send can be in flight at once; the two
 /// directions are fully independent (the recv destination rides in its own
-/// SQE, the send gather has its own `iovec`s/`msghdr`) — the same "two
+/// SQE, the send gather has its own `iovec`s/`msghdr`) - the same "two
 /// independent handles over one fd" shape as tokio's `ReadHalf`/`WriteHalf`.
 pub(crate) struct Connection<U> {
     pub peer: ClientAddr,
@@ -265,7 +265,7 @@ pub(crate) struct Connection<U> {
     recv_into_body: bool, // the in-flight recv targets `body_buf`, not `buf`
     // ---- spliced body ----
     // A framed body spliced straight from the socket to a consumer fd
-    // (`Framing::SpliceBody`) instead of read into a buffer — zero-copy. The fd
+    // (`Framing::SpliceBody`) instead of read into a buffer - zero-copy. The fd
     // is borrowed (consumer-owned). `splicing` is a distinct in-flight flag
     // because a splice's SQE `fd` is the pipe, not the socket, so `close_conn`'s
     // fd-keyed cancel can't reach it (it cancels the splice by `user_data`).
@@ -299,11 +299,11 @@ pub(crate) struct Connection<U> {
     send_msg: libc::msghdr,
     // ---- scheduling / lifecycle (owned by the server's state machine) ----
     pub recving: bool, // a recv op is in flight
-    // The in-flight recv is an idle header read (armed with nothing buffered —
-    // parked for the next request). Captured at arm time — a property of the
+    // The in-flight recv is an idle header read (armed with nothing buffered --
+    // parked for the next request). Captured at arm time - a property of the
     // armed read; a kTLS continuation clears it (mid-message is never idle).
     pub recv_idle: bool,
-    // The peer was served — a send (reply or push) completed — since the idle
+    // The peer was served - a send (reply or push) completed - since the idle
     // clock was last armed. The clock runs from recv ARM time, so on a
     // pipelined connection it keeps counting while a deferred reply is
     // produced and flushed; a fire whose interval saw a completed send
@@ -314,8 +314,8 @@ pub(crate) struct Connection<U> {
     // ---- recv clock pairing (short-read disambiguation) ----
     // Whether the in-flight recv carries a linked idle/request clock
     // (`Op::RecvClock`). A cancelled `MSG_WAITALL` recv that had consumed
-    // bytes completes with `res = done_io > 0` — indistinguishable from a
-    // peer FIN mid-frame — so classification waits for the clock's own CQE
+    // bytes completes with `res = done_io > 0` - indistinguishable from a
+    // peer FIN mid-frame - so classification waits for the clock's own CQE
     // (`-ETIME` = it fired). All three fields are (re)set at recv arm time.
     pub recv_clock_armed: bool,
     // The current pair's clock CQE result, when it reaped before the recv's
@@ -330,12 +330,12 @@ pub(crate) struct Connection<U> {
     // (its worker owns the raw stream, so it cannot be torn down mid-detach):
     // evict with `SendBacklog` when the worker resumes it.
     pub evict_on_resume: bool,
-    // A flush-close is pending: the connection's FINAL PDU (if any) is queued —
+    // A flush-close is pending: the connection's FINAL PDU (if any) is queued --
     // close with this reason once the send queue fully drains. Set by
     // `Response::ReplyClose`, `Deferred::reply_close`, and `PushHandle::close`
     // ("the server speaks last": a WebSocket Close ack, an HTTP error before
     // hanging up, an SMB negotiate failure). While set, the recv side is
-    // retired — nothing is delivered or re-armed — and later injected
+    // retired - nothing is delivered or re-armed - and later injected
     // outcomes/pushes for this connection are dropped: nothing follows the
     // farewell. On a detached connection it is only marked; the close lands at
     // resume (like `evict_on_resume`).
@@ -343,16 +343,16 @@ pub(crate) struct Connection<U> {
     // The reason this connection began closing, stashed by `close_conn` so the
     // client can report it in `Event::Closed` when the slot is reclaimed. The
     // server reports closes through its close hook and never reads this, so the
-    // field (and its write) are net-client-only — no dead-code weight on the
+    // field (and its write) are net-client-only - no dead-code weight on the
     // server build.
     #[cfg(feature = "net-client")]
     pub close_reason: Option<CloseReason>,
     pub sending: bool, // a send op is in flight
     pub closing: bool, // being torn down; completions just decrement `ops`
-    // A teardown is owed once the recv/send in flight at close time — cancelled
-    // there — have drained. Deferring the index-freeing CLOSE until then keeps
+    // A teardown is owed once the recv/send in flight at close time - cancelled
+    // there - have drained. Deferring the index-freeing CLOSE until then keeps
     // it the connection's LAST op, so the kernel can't reuse the descriptor's
-    // index under a surviving op (a use-after-free — see `close_conn`).
+    // index under a surviving op (a use-after-free - see `close_conn`).
     pub teardown_deferred: bool,
     pub teardown_shutdown_first: bool, // SHUTDOWN-first for the deferred teardown
     pub outstanding: u32, // delivered-but-not-yet-fully-sent requests (read-ahead cap)
@@ -360,7 +360,7 @@ pub(crate) struct Connection<U> {
     next_req_id: u64, // per-connection request id, assigned as requests deliver
     // Requests answered via `Response::Defer`, awaiting their worker's single
     // outcome. A `Deferred` whose request is not (or no longer) in this set is
-    // stale and its outcome is dropped — this is what makes a duplicate or
+    // stale and its outcome is dropped - this is what makes a duplicate or
     // outlived `Deferred` inert rather than a double reply or bogus close.
     open_req_ids: Vec<u64>,
 }
@@ -464,8 +464,8 @@ impl<U> Connection<U> {
     }
 
     /// After a kTLS recv completes, the record's TLS content type (from the
-    /// control message). `Some(23)` is `application_data`; any other value —
-    /// or `None` (truncated / absent cmsg) — is a control record the server
+    /// control message). `Some(23)` is `application_data`; any other value --
+    /// or `None` (truncated / absent cmsg) - is a control record the server
     /// closes on. Meaningless (and unused) for a plain connection.
     pub(crate) fn ktls_record_type(&self) -> Option<u8> {
         match &self.transport {
@@ -519,12 +519,12 @@ impl<U> Connection<U> {
 
     /// `(header, body, peer, state)` for a complete message, borrow-split for
     /// the body handler call. A placed body is moved out of `body_buf`; an
-    /// inline body borrows `buf` — except a **body-only** message (an http
+    /// inline body borrows `buf` - except a **body-only** message (an http
     /// 100-continue dance body, delivered with `header_len == 0`) whose
     /// extent is exactly the buffered bytes: at or over `handoff_threshold`,
     /// the accumulate buffer itself is handed over, so the handler's
     /// [`Body::take`] is as free as a placed body's. The same "large bodies
-    /// arrive owned" policy as placement — and gated the same way, because
+    /// arrive owned" policy as placement - and gated the same way, because
     /// the reactor grows a fresh buffer afterwards.
     pub(crate) fn deliver_parts(
         &mut self,
@@ -566,8 +566,8 @@ impl<U> Connection<U> {
     }
 
     /// Bytes of the current message (header + body). `frame_step` proves the
-    /// sum fits `max_request_bytes` (≤ `i32::MAX`) before any `set_frame`, so
-    /// the `saturating_add` never saturates in a reachable state — it is a
+    /// sum fits `max_request_bytes` (<= `i32::MAX`) before any `set_frame`, so
+    /// the `saturating_add` never saturates in a reachable state - it is a
     /// defence-in-depth guard against a future caller that skips that check.
     pub(crate) fn frame_len(&self) -> usize {
         self.header_len.saturating_add(self.body_len)
@@ -597,7 +597,7 @@ impl<U> Connection<U> {
     /// The destination is **spare capacity**, exactly like a placed body: the
     /// kernel initializes it and `recv_result` sets the length from the CQE
     /// count (a `resize` here would memset up to `want` bytes the kernel
-    /// immediately overwrites — pure hot-path waste, since the zeros are
+    /// immediately overwrites - pure hot-path waste, since the zeros are
     /// never observable: the framer runs only while no recv is armed, an
     /// exact read either fills the whole region or closes the connection,
     /// and a chunk read exposes only the bytes that arrived).
@@ -644,7 +644,7 @@ impl<U> Connection<U> {
                 unsafe { body.as_mut_ptr().add(self.recv_at) as u64 }
             }
             // The accumulate buffer's cursor likewise points into spare
-            // capacity (`recv_at` sits at — or, mid-kTLS-continuation, past —
+            // capacity (`recv_at` sits at - or, mid-kTLS-continuation, past --
             // the length). SAFETY: `arm_recv` reserved through
             // `recv_at + recv_want`, so the offset stays within the
             // allocation.
@@ -658,7 +658,7 @@ impl<U> Connection<U> {
     ///
     /// kTLS exact reads have one extra healthy shape: io_uring cannot
     /// `MSG_WAITALL`-accumulate a `RECVMSG` that carries a control buffer
-    /// (`io_recvmsg` sets `min_ret` only when `msg_controllen == 0` —
+    /// (`io_recvmsg` sets `min_ret` only when `msg_controllen == 0` --
     /// io_uring/net.c), so the completion delivers however many fully-arrived
     /// records the TLS layer had and stops. A short, positive,
     /// `application_data` read therefore advances the cursor and returns
@@ -672,8 +672,8 @@ impl<U> Connection<U> {
                     self.finish_body_recv();
                 } else {
                     // SAFETY: `[0, recv_at)` was initialized before arming,
-                    // and the exact completion — together with any earlier
-                    // kTLS partials that advanced `recv_at` — proves the
+                    // and the exact completion - together with any earlier
+                    // kTLS partials that advanced `recv_at` - proves the
                     // kernel wrote the armed region up to this end.
                     unsafe {
                         self.recv_buf.set_len(self.recv_at + self.recv_want)
@@ -716,7 +716,7 @@ impl<U> Connection<U> {
         self.recv_into_body = false;
         if let Some(body) = &mut self.body_buf {
             // SAFETY: capacity is at least `body_len` and bytes `[0, body_len)` are
-            // initialized — the prefix by `extend_from_slice`, the rest by the
+            // initialized - the prefix by `extend_from_slice`, the rest by the
             // kernel (the exact `MSG_WAITALL` recv completed with the full
             // count).
             unsafe { body.set_len(self.body_len) };
@@ -728,7 +728,7 @@ impl<U> Connection<U> {
     /// Arm a zero-copy body splice: record the borrowed destination `fd` and
     /// the full body length still to move. `submit_splice_recv` sets the
     /// scheduling flags and stages the op; `advance_splice` tracks the cursor
-    /// across partial completions (a socket→pipe splice, like a kTLS recv,
+    /// across partial completions (a socket->pipe splice, like a kTLS recv,
     /// can't carry `MSG_WAITALL`, so it may complete short).
     pub(crate) fn arm_splice(&mut self, fd: RawFd, body_len: usize) {
         self.splice_fd = fd;
@@ -736,7 +736,7 @@ impl<U> Connection<U> {
     }
 
     /// Account `n` spliced bytes; returns `true` once the whole body has moved
-    /// (the cursor reached zero). `saturating_sub` is defence-in-depth — a
+    /// (the cursor reached zero). `saturating_sub` is defence-in-depth - a
     /// completion never reports more than the armed remainder.
     pub(crate) fn advance_splice(&mut self, n: usize) -> bool {
         self.splice_remaining = self.splice_remaining.saturating_sub(n);
@@ -755,7 +755,7 @@ impl<U> Connection<U> {
     /// buffers `arm_send` gathers). The whole reply is one logical response:
     /// only its **last non-empty** segment is [`SendKind::ReplyLast`], so
     /// `advance_sent` retires the request's `outstanding` count exactly once,
-    /// when the final segment flushes — not once per segment. Empty segments
+    /// when the final segment flushes - not once per segment. Empty segments
     /// are dropped. Returns whether any bytes were queued; an all-empty reply
     /// queues nothing (a one-way message), for which the caller must not bump
     /// `outstanding`.
@@ -804,7 +804,7 @@ impl<U> Connection<U> {
         self.queued_bytes
     }
 
-    /// Point the send `msghdr` at up to `max_send_coalesce` queued PDUs — a
+    /// Point the send `msghdr` at up to `max_send_coalesce` queued PDUs - a
     /// writev-style gather starting at the front PDU's unsent tail. Whole-PDU
     /// FIFO order is preserved; only already-queued PDUs are gathered, so a
     /// lone reply is never delayed. Records and returns the armed byte count.
@@ -878,12 +878,12 @@ impl<U> Connection<U> {
         ptr::addr_of!(self.send_msg) as u64
     }
 
-    /// The armed gather's lone segment when it has exactly one — the plain
+    /// The armed gather's lone segment when it has exactly one - the plain
     /// `SEND` fast path (no per-op `msghdr` import): `(ptr, len)`.
     ///
     /// The length is clamped to `i32::MAX`, never cast-wrapped: an SQE length
     /// is `u32` and a CQE result `i32` (the kernel itself clamps every iter at
-    /// `MAX_RW_COUNT`), so a ≥ 4 GiB PDU would otherwise wrap — worst case to
+    /// `MAX_RW_COUNT`), so a >= 4 GiB PDU would otherwise wrap - worst case to
     /// a 0-byte send that reads as a fatal `SendError`. A clamped send
     /// completes short and the re-submit carries the tail, exactly like any
     /// partial send.
@@ -902,7 +902,7 @@ impl<U> Connection<U> {
 pub(crate) enum RecvOutcome {
     /// The armed read is satisfied (exact: full count; chunk: some bytes).
     Complete,
-    /// kTLS only: a clean partial — the completion consumed the
+    /// kTLS only: a clean partial - the completion consumed the
     /// fully-arrived `application_data` records but the remainder is still
     /// in flight. The cursor advanced; re-arm for the rest.
     Again,
@@ -1030,7 +1030,7 @@ mod tests {
         // The http dance shape: the head was consumed with a previous
         // delivery, the framer declared `Complete { 0, body_len }`, and the
         // whole extent is buffered. At or over the handoff threshold the
-        // accumulate buffer itself moves out — ownership, not bytes.
+        // accumulate buffer itself moves out - ownership, not bytes.
         let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
         c.arm_recv(100, true);
         let ptr = c.recv_ptr() as *mut u8;
@@ -1053,7 +1053,7 @@ mod tests {
         // Below the threshold the delivery stays inline (borrowed).
         c.arm_recv(10, true);
         let ptr = c.recv_ptr() as *mut u8;
-        // SAFETY: as above — 10 reserved bytes.
+        // SAFETY: as above - 10 reserved bytes.
         unsafe { std::ptr::write_bytes(ptr, 0xAA, 10) };
         assert_eq!(c.recv_result(10), RecvOutcome::Complete);
         c.set_frame(0, 10);
@@ -1071,11 +1071,11 @@ mod tests {
         c.consume();
         assert_eq!(c.buffered(), 0);
 
-        // A pipelined remainder blocks the handoff — the tail belongs to
+        // A pipelined remainder blocks the handoff - the tail belongs to
         // the next message.
         c.arm_recv(120, true);
         let ptr = c.recv_ptr() as *mut u8;
-        // SAFETY: as above — 120 reserved bytes.
+        // SAFETY: as above - 120 reserved bytes.
         unsafe { std::ptr::write_bytes(ptr, 0xBB, 120) };
         assert_eq!(c.recv_result(120), RecvOutcome::Complete);
         c.set_frame(0, 100);
@@ -1109,7 +1109,7 @@ mod tests {
         // Force this test to be revisited whenever a variant is added: the
         // compiler errors here, and the count assert below then proves the
         // new variant is reachable through `from_u8` (i.e. was added to its
-        // table — `SpliceRecv`'s token doubles as an ASYNC_CANCEL match key,
+        // table - `SpliceRecv`'s token doubles as an ASYNC_CANCEL match key,
         // so a `from_u8` gap silently breaks mid-splice teardown).
         const OP_COUNT: usize = {
             match Op::Accept {

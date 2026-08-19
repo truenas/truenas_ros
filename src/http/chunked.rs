@@ -1,19 +1,19 @@
-//! `Transfer-Encoding: chunked` — an incremental, resumable scanner over the
+//! `Transfer-Encoding: chunked` - an incremental, resumable scanner over the
 //! wire form, plus the one-shot decoder the glue runs once a body is fully
-//! framed. Everything is a pure function of `(bytes, state)` — no I/O, no
-//! config — and the scanner and decoder share one state machine ([`run`]),
+//! framed. Everything is a pure function of `(bytes, state)` - no I/O, no
+//! config - and the scanner and decoder share one state machine ([`run`]),
 //! so the framer's progress oracle and the glue's decoder can never disagree
 //! about where a chunked message ends.
 //!
-//! Strictness (RFC 9112 §7.1): hex chunk sizes with checked arithmetic
+//! Strictness (RFC 9112 sec. 7.1): hex chunk sizes with checked arithmetic
 //! (overflow is a 400, not a wraparound), CRLF line endings only, chunk
 //! extensions parsed and ignored (a recipient MUST ignore unrecognized
 //! extensions), trailer field names token-validated (with the
-//! framing/routing/credential set dropped — [`FORBIDDEN_TRAILERS`]). Every
+//! framing/routing/credential set dropped - [`FORBIDDEN_TRAILERS`]). Every
 //! line is capped
 //! ([`CHUNK_LINE_MAX`], [`TRAILER_LINE_MAX`]) so a peer can neither wedge
 //! the scanner short of a terminator nor drip an unbounded "line", and the
-//! whole trailer section is capped ([`TRAILER_MAX`] → 431, the oversized-
+//! whole trailer section is capped ([`TRAILER_MAX`] -> 431, the oversized-
 //! header-fields answer).
 
 use std::borrow::Cow;
@@ -61,10 +61,10 @@ enum State {
 /// they stay valid across calls.
 #[derive(Debug, Default)]
 pub(crate) struct ChunkScan {
-    /// Bytes fully scanned — the resume point, and the message extent once
+    /// Bytes fully scanned - the resume point, and the message extent once
     /// [`State::Done`] is reached.
     pub consumed: usize,
-    /// Decoded payload bytes seen so far — the entity size, so far. The
+    /// Decoded payload bytes seen so far - the entity size, so far. The
     /// framer reads this to enforce its decoded-body cap mid-stream.
     pub decoded: usize,
     /// Trailer-section bytes seen so far (for the [`TRAILER_MAX`] cap).
@@ -96,8 +96,8 @@ fn find_crlf(rest: &[u8], max_line: usize) -> Find {
 
 /// Whether a CRLF-delimited line (size or trailer) carries a bare CR or LF.
 /// The chunked grammar terminates these lines with CRLF only (RFC 9112
-/// §7.1). Since [`find_crlf`] stops at the first CRLF, a bare CR or LF
-/// earlier in the line — a chunk extension is the usual place — must be
+/// sec. 7.1). Since [`find_crlf`] stops at the first CRLF, a bare CR or LF
+/// earlier in the line - a chunk extension is the usual place - must be
 /// rejected here rather than left in place, or a recipient that treats a
 /// lone LF as a line ending could frame the body differently.
 fn line_has_bare_crlf(line: &[u8]) -> bool {
@@ -106,7 +106,7 @@ fn line_has_bare_crlf(line: &[u8]) -> bool {
 
 /// Parse a chunk-size line: `1*HEXDIG`, then nothing or an (ignored)
 /// extension introduced by `;` after optional whitespace. Checked
-/// arithmetic — a size that overflows `usize` is malformed, full stop.
+/// arithmetic - a size that overflows `usize` is malformed, full stop.
 fn parse_size_line(line: &[u8]) -> Option<usize> {
     let mut digits = 0usize;
     let mut n = 0usize;
@@ -140,7 +140,7 @@ fn trim_ows_start(mut v: &[u8]) -> &[u8] {
 
 /// Split a trailer field line into `(name, value)`. `None` when the name is
 /// empty, not a token, the colon is missing, or the value carries a control
-/// byte — the line is malformed. The value screen is load-bearing: lines are
+/// byte - the line is malformed. The value screen is load-bearing: lines are
 /// delimited on CRLF only, so a bare LF or CR *inside* a value would let a
 /// permitted-named trailer carry a forbidden field line past the name-only
 /// [`FORBIDDEN_TRAILERS`] screen.
@@ -156,11 +156,11 @@ fn split_trailer(line: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((&line[..colon], value))
 }
 
-/// Field names that must not ride in a trailer section (RFC 9110 §6.5.1):
+/// Field names that must not ride in a trailer section (RFC 9110 sec. 6.5.1):
 /// message framing, routing, and credentials. A conforming sender never puts
 /// these there, and surfacing them tempts any consumer that merges headers
 /// and trailers into letting a trailer rewrite framing or auth after the
-/// body — so a well-formed line bearing one is consumed and dropped, never
+/// body - so a well-formed line bearing one is consumed and dropped, never
 /// surfaced.
 const FORBIDDEN_TRAILERS: [&str; 5] = [
     "transfer-encoding",
@@ -178,11 +178,11 @@ fn forbidden_trailer(name: &[u8]) -> bool {
 
 /// The one state machine under [`scan`], [`decode`], and [`compact`]:
 /// advance over `body` from where `s` left off, reporting payload spans and
-/// validated trailer lines to the sinks **as ranges into `body`** — so an
+/// validated trailer lines to the sinks **as ranges into `body`** - so an
 /// in-place caller can record positions without borrowing against a buffer
-/// it means to mutate. `Ok(Some(extent))` — the message occupies exactly the
-/// first `extent` bytes of `body`; `Ok(None)` — need more bytes;
-/// `Err(status)` — malformed (400) or oversized trailers (431).
+/// it means to mutate. `Ok(Some(extent))` - the message occupies exactly the
+/// first `extent` bytes of `body`; `Ok(None)` - need more bytes;
+/// `Err(status)` - malformed (400) or oversized trailers (431).
 fn run(
     body: &[u8],
     s: &mut ChunkScan,
@@ -194,7 +194,7 @@ fn run(
             return Ok(Some(s.consumed));
         }
         let Some(rest) = body.get(s.consumed..) else {
-            // The buffer shrank beneath the resume point — a caller contract
+            // The buffer shrank beneath the resume point - a caller contract
             // break (the accumulate buffer only grows), not wire data.
             return Err(400);
         };
@@ -289,7 +289,7 @@ pub(crate) fn scan(
 enum Entity<'b> {
     /// No payload seen yet.
     Empty,
-    /// Exactly one payload span so far — still zero-copy.
+    /// Exactly one payload span so far - still zero-copy.
     Span(&'b [u8]),
     /// Multiple spans, stitched into an owned buffer.
     Stitched(Vec<u8>),
@@ -297,10 +297,10 @@ enum Entity<'b> {
 
 /// One-shot decode of a fully framed chunked message: the de-chunked entity
 /// plus the parsed trailer fields. A single-chunk message borrows its
-/// payload straight from `wire` (`Cow::Borrowed`) — no copy; only multi-chunk
+/// payload straight from `wire` (`Cow::Borrowed`) - no copy; only multi-chunk
 /// messages stitch into an owned buffer. The framer's scan already accepted
 /// these exact bytes as a complete message, so any failure here is a codec
-/// bug — callers answer it as one (500), never as a client error.
+/// bug - callers answer it as one (500), never as a client error.
 pub(crate) fn decode(
     wire: &[u8],
 ) -> Result<(Cow<'_, [u8]>, Vec<HeaderView<'_>>), ()> {
@@ -349,7 +349,7 @@ pub(crate) fn decode(
 
 /// The de-chunked layout of a wire buffer after [`compact`]: where the
 /// entity now lies inside it, plus the trailer lines copied out of it (tiny,
-/// usually none) — copied so the buffer itself is free to move on as the
+/// usually none) - copied so the buffer itself is free to move on as the
 /// entity's own allocation while the views borrow this struct instead.
 pub(crate) struct Compacted {
     /// Entity offset within the wire buffer.
@@ -362,7 +362,7 @@ pub(crate) struct Compacted {
 
 impl Compacted {
     /// The trailer views, borrowing this struct rather than the wire buffer
-    /// — the reason the lines were copied out. The scan validated every line
+    /// -- the reason the lines were copied out. The scan validated every line
     /// already, so a failure here is a codec bug (callers answer 500).
     pub(crate) fn trailers(&self) -> Result<Vec<HeaderView<'_>>, ()> {
         let mut out = Vec::with_capacity(self.trailer_lines.len());
@@ -378,11 +378,11 @@ impl Compacted {
 /// The in-place twin of [`decode`], for a caller that **owns** the wire
 /// buffer: walk the same state machine, then make the entity contiguous
 /// inside `wire` without leaving the allocation. A single-payload message
-/// (the default botocore shape) moves no bytes at all — the entity is
+/// (the default botocore shape) moves no bytes at all - the entity is
 /// reported where it lies; a multi-payload message compacts its spans over
 /// the framing bytes with overlapping moves. The single-span, bare-trailer
 /// path allocates nothing. The framer's scan accepted these exact bytes as a
-/// complete message, so any failure is a codec bug — callers answer it as
+/// complete message, so any failure is a codec bug - callers answer it as
 /// one (500), never as a client error.
 pub(crate) fn compact(wire: &mut [u8]) -> Result<Compacted, ()> {
     let mut s = ChunkScan::default();
@@ -471,7 +471,7 @@ mod tests {
         // entity passes through untouched, and there are no HTTP trailers.
         assert_eq!(&entity[..], botocore_entity());
         assert!(trailers.is_empty());
-        // One HTTP chunk → the entity is a borrow of the wire, not a copy.
+        // One HTTP chunk -> the entity is a borrow of the wire, not a copy.
         assert!(matches!(entity, Cow::Borrowed(_)));
     }
 
@@ -520,7 +520,7 @@ mod tests {
     #[test]
     fn forbidden_trailer_fields_dropped() {
         // Framing, routing, and credential names cannot ride in trailers
-        // (RFC 9110 §6.5.1): well-formed lines bearing them are consumed
+        // (RFC 9110 sec. 6.5.1): well-formed lines bearing them are consumed
         // but never surfaced, so a consumer merging headers and trailers
         // cannot have its framing or auth rewritten after the body.
         let wire = b"0\r\n\
@@ -572,7 +572,7 @@ mod tests {
     fn a_trailer_value_cannot_carry_a_field_line() {
         // A bare LF or CR inside a value smuggles a forbidden field past
         // the name-only screen the moment any consumer splits the surfaced
-        // value on line breaks; RFC 9110 §5.5 admits no control byte in a
+        // value on line breaks; RFC 9110 sec. 5.5 admits no control byte in a
         // field value, so the line is malformed, not data.
         assert_eq!(
             scan_err(b"0\r\nx-ok: v\nAuthorization: Basic Zm9v\r\n\r\n"),
@@ -654,8 +654,8 @@ mod tests {
     #[test]
     fn max_chunk_size_is_accepted_awaiting_payload() {
         // Sixteen hex digits is usize::MAX: parsed without overflow, then
-        // awaiting payload. The size parse does not bound the body — the
-        // decoded-size cap does — and seventeen digits overflow to 400.
+        // awaiting payload. The size parse does not bound the body - the
+        // decoded-size cap does - and seventeen digits overflow to 400.
         assert_eq!(
             scan(b"ffffffffffffffff\r\n", &mut ChunkScan::default()),
             Ok(None)
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_trailing_garbage() {
-        // decode requires the message to occupy the wire exactly — the
+        // decode requires the message to occupy the wire exactly - the
         // framer only ever hands it a complete extent.
         assert!(decode(b"0\r\n\r\nEXTRA").is_err());
         assert!(decode(b"0\r\n").is_err());

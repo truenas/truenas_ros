@@ -28,7 +28,7 @@ tn_bitflags! {
 
 /// Read the extended attribute `name` from an open file descriptor.
 ///
-/// `name` is any [`TnPath`] — a `&str` for a literal, or the [`CStr`] that
+/// `name` is any [`TnPath`] - a `&str` for a literal, or the [`CStr`] that
 /// [`flistxattr`] returns for a discovered attribute whose bytes need not be
 /// UTF-8.
 ///

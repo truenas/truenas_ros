@@ -5,7 +5,7 @@ use std::sync::atomic::{compiler_fence, Ordering};
 
 /// Overwrite `len` bytes at `p` with zeroes so the optimizer cannot elide it.
 ///
-/// A per-byte `write_volatile` plus a compiler fence — the same primitives
+/// A per-byte `write_volatile` plus a compiler fence - the same primitives
 /// `zeroize` uses internally, and what `truenas_pam::Secret` uses. A plain
 /// store to soon-dead memory is a dead store the compiler will drop; a
 /// volatile one it must keep. Use it on a transient buffer a secret passed

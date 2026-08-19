@@ -1,6 +1,6 @@
 //! The consumer-facing response type and its wire serialization. The codec
-//! owns the framing-critical headers — `Content-Length`, `Connection`,
-//! `Date` — and silently drops consumer attempts to set them: a handler that
+//! owns the framing-critical headers - `Content-Length`, `Connection`,
+//! `Date` - and silently drops consumer attempts to set them: a handler that
 //! could desynchronize framing from the actual byte stream would reintroduce
 //! the smuggling class the head parser screens out. The single exception is
 //! [`HttpResponse::head_content_length`], honored only when the request was
@@ -42,7 +42,7 @@ pub struct HttpResponse {
     pub(crate) head_len: Option<u64>,
 }
 
-/// Conversion into stored response bytes — the `Cow`-aware analogue of
+/// Conversion into stored response bytes - the `Cow`-aware analogue of
 /// `Into<Vec<u8>>` for [`HttpResponse::header`] values and
 /// [`HttpResponse::body`]. (`Into<Cow<'static, [u8]>>` alone would reject
 /// the `&'static str` and `String` shapes handlers pass most, since std
@@ -100,7 +100,7 @@ const INLINE_HEADERS: usize = 8;
 /// Response headers, stored inline until they spill. The first
 /// [`INLINE_HEADERS`] pairs live in a stack array; only fields past that go to
 /// `spilled`, whose backing `Vec` stays unallocated until then. The common
-/// case — an S3 200 carries a handful of fields — allocates nothing for its
+/// case - an S3 200 carries a handful of fields - allocates nothing for its
 /// headers.
 #[derive(Debug)]
 pub(crate) struct Headers {
@@ -145,7 +145,7 @@ impl Headers {
 impl HttpResponse {
     /// Start a response with `status` (e.g. `200`), empty body, no headers.
     ///
-    /// The status line's grammar is exactly three digits (RFC 9112 §4); a
+    /// The status line's grammar is exactly three digits (RFC 9112 sec. 4); a
     /// status outside `100..=999` would serialize as a head no client can
     /// parse, so it is replaced with `500` here rather than desynchronizing
     /// the connection at the wire.
@@ -166,12 +166,12 @@ impl HttpResponse {
     /// Append a header. `Content-Length`, `Connection`, `Date`, and
     /// `Transfer-Encoding` are codec-owned and ignored here (see module
     /// docs). Also ignored: names that are not RFC 9110 tokens and values
-    /// with a byte outside RFC 9110 §5.5's field-value grammar (CR, LF, NUL,
-    /// the other C0 controls, or DEL) — serializing those verbatim would let
+    /// with a byte outside RFC 9110 sec. 5.5's field-value grammar (CR, LF, NUL,
+    /// the other C0 controls, or DEL) - serializing those verbatim would let
     /// handler-echoed bytes terminate the field line early and inject
     /// response framing (response splitting).
     ///
-    /// A `&'static str` name and a static value are stored as borrows —
+    /// A `&'static str` name and a static value are stored as borrows --
     /// no allocation.
     pub fn header(
         mut self,
@@ -189,8 +189,8 @@ impl HttpResponse {
 
     /// Set the body. `Content-Length` follows automatically; for a HEAD
     /// request the bytes are measured but not sent. On a bodyless status
-    /// (1xx/204/304) the bytes are never sent — see `serialize`. Static
-    /// bytes are stored as a borrow — no copy.
+    /// (1xx/204/304) the bytes are never sent - see `serialize`. Static
+    /// bytes are stored as a borrow - no copy.
     pub fn body(mut self, body: impl IntoBytes) -> Self {
         self.body = body.into_bytes();
         self
@@ -202,11 +202,11 @@ impl HttpResponse {
     /// `Content-Length` at all.
     ///
     /// A HEAD answer is the one place a declared length cannot desynchronize
-    /// framing: RFC 9110 §9.3.2 forbids content on it, the serializer elides
+    /// framing: RFC 9110 sec. 9.3.2 forbids content on it, the serializer elides
     /// the body regardless, and the client reads zero body bytes whatever
     /// the header says. So the usual codec-owned rule
     /// ([`HttpResponse::header`] drops a `Content-Length` outright) can be
-    /// relaxed here without opening the smuggling class it exists to close —
+    /// relaxed here without opening the smuggling class it exists to close --
     /// and only here, which is why this is a typed method on the HEAD path
     /// rather than a header a handler may set.
     ///
@@ -240,7 +240,7 @@ fn is_codec_owned(name: &str) -> bool {
         || name.eq_ignore_ascii_case("transfer-encoding")
 }
 
-/// RFC 9110 `token` (a non-empty run of [`is_token_byte`]s) — the field-name
+/// RFC 9110 `token` (a non-empty run of [`is_token_byte`]s) - the field-name
 /// grammar `httparse` enforces on the request side, applied to what handlers
 /// emit. Anything else (spaces, colons, CTLs) could rewrite the field line
 /// it rides in.
@@ -268,8 +268,8 @@ pub(crate) enum ConnHeader {
 /// [`DateCache`](super::date::DateCache) renders it once a second, not once
 /// a response).
 ///
-/// 1xx/204/304 responses never carry content (RFC 9110 §6.4.1): body bytes
-/// are elided regardless of `head_only`, and so is `Content-Length` — a
+/// 1xx/204/304 responses never carry content (RFC 9110 sec. 6.4.1): body bytes
+/// are elided regardless of `head_only`, and so is `Content-Length` - a
 /// client reads zero body bytes after these statuses no matter what the
 /// header claims, so emitting one would desynchronize the next response on
 /// the connection.
@@ -294,7 +294,7 @@ pub(crate) fn serialize(
 }
 
 /// The response head (status line through the terminating blank line) alone,
-/// no body — for [`serialize_reply`]'s split path, where the body rides its
+/// no body - for [`serialize_reply`]'s split path, where the body rides its
 /// own send segment instead of being copied in here.
 pub(crate) fn serialize_head(
     resp: &HttpResponse,
@@ -318,8 +318,8 @@ fn head_capacity(resp: &HttpResponse) -> usize {
         .sum::<usize>()
 }
 
-/// Whether `status` forbids a response body (RFC 9110 §6.4.1): 1xx, 204, and
-/// 304 carry neither body bytes nor a `Content-Length`. The head/body/reply
+/// Whether `status` forbids a response body (RFC 9110 sec. 6.4.1): 1xx, 204,
+/// and 304 carry neither body bytes nor a `Content-Length`. The head/body/reply
 /// serializers share this one predicate so their framing decisions cannot
 /// drift apart.
 fn status_is_bodyless(status: u16) -> bool {
@@ -371,7 +371,7 @@ fn write_head(
 
 /// A serialized response, ready to hand the reactor as a reply.
 pub(crate) enum Serialized {
-    /// The head alone — a HEAD or bodyless (1xx/204/304) response carries no
+    /// The head alone - a HEAD or bodyless (1xx/204/304) response carries no
     /// body, so there is one buffer and nothing to scatter.
     HeadOnly(Vec<u8>),
     /// Head and body as separate buffers, sent vectored so the body is never
@@ -380,17 +380,17 @@ pub(crate) enum Serialized {
         /// The response head (status line through the blank line).
         head: Vec<u8>,
         /// The response body, its own send segment: owned bytes moved,
-        /// `'static` bytes borrowed — the handler's storage either way.
+        /// `'static` bytes borrowed - the handler's storage either way.
         body: Cow<'static, [u8]>,
     },
 }
 
 /// Serialize `resp` into a head buffer and, when the response carries a body,
-/// the body as its own segment — so the send path scatters head + body with
+/// the body as its own segment - so the send path scatters head + body with
 /// one vectored write rather than copying the body into the head buffer.
 /// A HEAD response, a bodyless status (1xx/204/304), or an empty body has
 /// nothing to scatter and yields [`Serialized::HeadOnly`]; any other response
-/// splits. Consumes `resp` so the body — owned or `'static` — rides into its
+/// splits. Consumes `resp` so the body - owned or `'static` - rides into its
 /// segment as stored, without a copy.
 pub(crate) fn serialize_reply(
     resp: HttpResponse,
@@ -452,7 +452,7 @@ mod tests {
     use super::*;
 
     fn date() -> Vec<u8> {
-        // Sun, 06 Nov 1994 08:49:37 GMT — recognizable in assertions.
+        // Sun, 06 Nov 1994 08:49:37 GMT - recognizable in assertions.
         HttpDate::from_unix(784_111_777).to_string().into_bytes()
     }
 
@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn head_declaration_does_not_revive_a_bodyless_status() {
         // 1xx/204/304 carry no Content-Length at all, and a HEAD asking for
-        // one changes nothing — S3 answers a conditional HeadObject with a
+        // one changes nothing - S3 answers a conditional HeadObject with a
         // bare 304.
         for status in [100, 204, 304] {
             let resp = HttpResponse::new(status).head_content_length(4096);
@@ -604,7 +604,7 @@ mod tests {
 
     #[test]
     fn splitting_attempts_dropped() {
-        // CR/LF (or NUL) in a value, and non-token names, are dropped whole —
+        // CR/LF (or NUL) in a value, and non-token names, are dropped whole --
         // the response-splitting guard.
         let resp = HttpResponse::new(302)
             .header(
@@ -639,8 +639,8 @@ mod tests {
             .header("x-soh", &b"a\x01b"[..]) // C0 control
             .header("x-us", &b"a\x1fb"[..]) // unit separator
             .header("x-del", &b"a\x7fb"[..]) // DEL
-            .header("x-tab", &b"a\tb"[..]) // HTAB — allowed
-            .header("x-obs", &b"caf\xe9"[..]) // obs-text — allowed
+            .header("x-tab", &b"a\tb"[..]) // HTAB - allowed
+            .header("x-obs", &b"caf\xe9"[..]) // obs-text - allowed
             .header("x-ok", "plain");
         let out = serialize(&resp, false, &date(), ConnHeader::None);
         let has =
@@ -698,7 +698,7 @@ mod tests {
     #[test]
     fn split_moves_an_owned_body_without_copying() {
         // Same contract for the owned shape: the handler's allocation is the
-        // segment — moved, not reallocated.
+        // segment - moved, not reallocated.
         let owned = b"hello, body".to_vec();
         let ptr = owned.as_ptr();
         let resp = HttpResponse::new(200).body(owned);

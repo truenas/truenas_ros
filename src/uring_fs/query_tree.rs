@@ -1,17 +1,17 @@
 //! [`query_tree`]: a **resumable, path-ordered, recursive** walk over a
 //! directory subtree, built from the single-directory [`QueryDir`] machinery.
 //!
-//! Each level is an ordinary [`query_directory`] listing — same enrichment,
+//! Each level is an ordinary [`query_directory`] listing - same enrichment,
 //! same scatter-gathered `statx`/`fgetxattr` on the ring, same
-//! [`Personality`] — so this module adds only three things: descent, order
+//! [`Personality`] - so this module adds only three things: descent, order
 //! that composes across levels, and a cursor.
 //!
 //! # Ordering
 //!
 //! Every level is read with [`Order::ByPathBytes`], which is not optional and
 //! is forced regardless of what the caller put in [`QueryOptions`]. Sorting
-//! each directory by the bytes its *full path* will compare by — a directory
-//! ordered as though it already carried its trailing `/` — is exactly the
+//! each directory by the bytes its *full path* will compare by - a directory
+//! ordered as though it already carried its trailing `/` - is exactly the
 //! condition under which per-directory sorting composes into a subtree
 //! emitted in global path order. There is no global sort, and the tree is
 //! never materialized: the walk holds one sorted name list per level on the
@@ -28,14 +28,14 @@
 //! the caller can retry from a surviving ancestor.
 //!
 //! It deliberately diverges on **one** point, and it is the important one.
-//! `FsIter`'s [`Cookie`](crate::sync_fs::iter::Cookie) records a *position* —
-//! `(path, inode)` per level — and its resume is documented as best-effort:
+//! `FsIter`'s [`Cookie`](crate::sync_fs::iter::Cookie) records a *position* --
+//! `(path, inode)` per level - and its resume is documented as best-effort:
 //! the deepest saved directory is re-read from the start, so entries can be
 //! yielded twice. That is the right trade for a scanner that de-duplicates
 //! downstream. It is the wrong one for a paginated listing, where a repeated
 //! key is a protocol violation.
 //!
-//! [`TreeCursor`] records a *key* instead — the last path emitted — and
+//! [`TreeCursor`] records a *key* instead - the last path emitted - and
 //! resume is an exact seek: each level is opened with
 //! [`QueryOptions::start_after`] set to the component the walk descended
 //! through, so nothing before the cut is read, enriched, or emitted, and
@@ -45,7 +45,7 @@
 //!
 //! The key carries one bit alongside it, because a key alone cannot say
 //! everything the walk needs. A directory is emitted before its contents, so
-//! the key `"D/"` is the position *before* `D`'s subtree — right after
+//! the key `"D/"` is the position *before* `D`'s subtree - right after
 //! yielding `D`, wrong after [`skip_descent`](QueryTree::skip_descent) folded
 //! `D` away, and unfixable by rewriting the key (`"D"` sorts ahead of the
 //! directory's own key and re-emits it). [`TreeCursor::skips_subtree`]
@@ -101,7 +101,7 @@ impl TreeEntry {
         &self.parent
     }
 
-    /// This entry's path relative to the walk root — `parent/name`, or just
+    /// This entry's path relative to the walk root - `parent/name`, or just
     /// `name` at the top level. No trailing `/`, even for a directory; see
     /// [`key`](Self::key) for the form that sorts and resumes correctly.
     pub fn path(&self) -> Vec<u8> {
@@ -121,7 +121,7 @@ impl TreeEntry {
     ///
     /// This is the form the walk orders by and the form a [`TreeCursor`]
     /// carries, so a caller resuming after this entry should hand this value
-    /// — not [`path`](Self::path) — to [`TreeCursor::from_key`].
+    /// -- not [`path`](Self::path) - to [`TreeCursor::from_key`].
     pub fn key(&self) -> Vec<u8> {
         let mut k = self.path();
         if self.entry.is_dir {
@@ -156,7 +156,7 @@ impl TreeEntry {
 ///
 /// The key alone cannot express every position the walk can be in. A directory
 /// is emitted *before* its contents, so the key `"D/"` means "just before
-/// `D`'s subtree" — which is what a resume needs after yielding `D`, and the
+/// `D`'s subtree" - which is what a resume needs after yielding `D`, and the
 /// opposite of what it needs after [`skip_descent`](QueryTree::skip_descent)
 /// folded `D` into a common prefix. Nor can the key be rewritten to say so:
 /// `"D"` sorts *before* the directory's own key and would re-emit `D` itself.
@@ -169,7 +169,7 @@ pub struct TreeCursor {
 
 impl TreeCursor {
     /// A cursor positioned just after `key`, which must be an entry's
-    /// [`TreeEntry::key`] — trailing `/` included when it named a directory,
+    /// [`TreeEntry::key`] - trailing `/` included when it named a directory,
     /// since that is what decides where the resume point sorts.
     ///
     /// Resuming from this descends into a directory key; pair it with
@@ -182,7 +182,7 @@ impl TreeCursor {
     }
 
     /// This cursor, but resuming *past* the directory its key names rather
-    /// than inside it — the persisted form of
+    /// than inside it - the persisted form of
     /// [`skip_descent`](QueryTree::skip_descent). A no-op on a key that does
     /// not name a directory.
     pub fn skipping_subtree(mut self) -> TreeCursor {
@@ -276,7 +276,7 @@ impl TreeCursor {
 /// rest governs the walk.
 #[derive(Clone, Debug)]
 pub struct TreeOptions {
-    /// Per-level listing options — enrichment, `clump`, `statx_mask`,
+    /// Per-level listing options - enrichment, `clump`, `statx_mask`,
     /// `same_device_only`.
     ///
     /// Two fields are overridden by the walk and ignored here:
@@ -288,7 +288,7 @@ pub struct TreeOptions {
     /// [`name_prefix`](QueryOptions::name_prefix) applies **only to the root
     /// level**. A subtree walk is normally rooted at the parent of the prefix
     /// being served, with the prefix's last partial component filtering that
-    /// first level — applying it further down would filter names that the
+    /// first level - applying it further down would filter names that the
     /// caller's prefix has nothing to say about.
     pub entries: QueryOptions,
     /// How many levels to descend. `1` lists the root directory only, which
@@ -332,7 +332,7 @@ pub struct QueryTree {
     opts: TreeOptions,
     stack: Vec<Frame>,
     /// The directory just yielded, waiting to be descended into on the next
-    /// call — deferred so [`skip_descent`](Self::skip_descent) can cancel it
+    /// call - deferred so [`skip_descent`](Self::skip_descent) can cancel it
     /// before the descent costs an `open`. Holds its relative path.
     pending: Option<Vec<u8>>,
     /// The key most recently emitted, for [`cursor`](Self::cursor).
@@ -366,13 +366,13 @@ impl QueryTree {
     /// records it, so a page boundary landing on a folded directory does not
     /// re-open the subtree on the next page.
     pub fn skip_descent(&mut self) {
-        // Only a cancelled descent counts. Called after a file — where there
-        // was nothing to descend into — this must not mark the cursor, or the
+        // Only a cancelled descent counts. Called after a file - where there
+        // was nothing to descend into - this must not mark the cursor, or the
         // resume would step past a key it should merely resume after.
         self.skip_subtree |= self.pending.take().is_some();
     }
 
-    /// A cursor positioned after the last entry yielded — persist it to
+    /// A cursor positioned after the last entry yielded - persist it to
     /// resume a later walk exactly here. Empty before the first entry.
     ///
     /// Carries the effect of a [`skip_descent`](Self::skip_descent) made since
@@ -390,8 +390,8 @@ impl QueryTree {
     /// may not enter (`EACCES`/`EPERM`), matching the per-entry permission
     /// behavior elsewhere in this module, or one removed out from under the
     /// walk (`ENOENT`). Any failure that leaves the walk *unable to see* what
-    /// is there — fd exhaustion, I/O, a mount not crossed, a directory
-    /// replaced by something else — is surfaced as `Some(Err)`, so an
+    /// is there - fd exhaustion, I/O, a mount not crossed, a directory
+    /// replaced by something else - is surfaced as `Some(Err)`, so an
     /// incomplete walk is never mistaken for a fully listed one. See
     /// `is_subtree_skip` for which is which and why.
     ///
@@ -493,16 +493,16 @@ impl QueryTree {
 /// so the subtree drops out quietly, rather than **the walk cannot see what is
 /// there**, which has to surface.
 ///
-/// * `EACCES`/`EPERM` — this identity may not enter. The documented
+/// * `EACCES`/`EPERM` - this identity may not enter. The documented
 ///   per-identity behaviour: a permission-filtered listing, matching how a
 ///   denial surfaces per-entry elsewhere in this module.
-/// * `ENOENT` — the directory was removed between the parent's `readdir` and
+/// * `ENOENT` - the directory was removed between the parent's `readdir` and
 ///   the deferred descent. There is no subtree left to list, and a walk over a
 ///   live tree hits this routinely, so failing the whole listing over one
 ///   ordinary race would make the walk unusable on anything being written to.
 ///
 /// `ENOTDIR` is deliberately **not** here even though it is also a race. The
-/// name still exists, but as something other than a directory — and the walk
+/// name still exists, but as something other than a directory - and the walk
 /// has already emitted it with a directory key, so the listing now contains a
 /// claim the filesystem contradicts. That is worth telling the caller about;
 /// a vanished entry is not.
@@ -516,7 +516,7 @@ fn is_subtree_skip(e: &crate::Error) -> bool {
 /// Open one directory level and build its frame.
 ///
 /// The open is `O_DIRECTORY | O_NOFOLLOW` under [`CONFINED_RESOLVE`], so the
-/// kernel — not this code — refuses a symlink, a `..`, or a crossing into
+/// kernel - not this code - refuses a symlink, a `..`, or a crossing into
 /// another filesystem, and it resolves a single component against a
 /// descriptor the walk already holds.
 fn open_frame(
@@ -565,7 +565,7 @@ pub fn query_tree(
     let comps = cursor.components();
 
     // A cursor ending in `/` named a **directory**, which the walk emits
-    // *before* its contents — so what it owes is that directory's subtree,
+    // *before* its contents - so what it owes is that directory's subtree,
     // and the resume descends through every component and starts the deepest
     // level at its beginning. A cursor naming a file owes only what follows
     // the file, so the deepest level is its parent, cut at the file itself.
@@ -574,8 +574,8 @@ pub fn query_tree(
     //
     // A pruned directory is the third case, and it is why the bit exists: the
     // caller folded it into a common prefix, so the walk owes what follows the
-    // whole subtree. That resumes like a file cursor — the deepest level is
-    // the parent — but cut past `D/` rather than at `D`, since the directory
+    // whole subtree. That resumes like a file cursor - the deepest level is
+    // the parent - but cut past `D/` rather than at `D`, since the directory
     // sorts at its slashed key and cutting at the bare name would re-emit it.
     let skip = cursor.skips_subtree();
     let into_dir = cursor.key().ends_with(b"/") && !skip;
@@ -601,7 +601,7 @@ pub fn query_tree(
             // been emitted, so start from its first entry.
             return None;
         }
-        // The deepest level of a file cursor — cut at the file. (Or a level
+        // The deepest level of a file cursor - cut at the file. (Or a level
         // `max_depth` stopped the descent at, where the component is a
         // directory we cannot enter, so cut past it.) A pruned directory is
         // cut past too: `skip` is only ever set for a key ending in `/`, so
@@ -646,9 +646,9 @@ pub fn query_tree(
             cut_for(depth + 1),
         ) {
             Ok(frame) => stack.push(frame),
-            // A level the forward walk would have skipped — this identity may
+            // A level the forward walk would have skipped - this identity may
             // not enter it (EACCES/EPERM), or it was removed between pages
-            // (ENOENT) — cannot be re-entered on resume either. The parent
+            // (ENOENT) - cannot be re-entered on resume either. The parent
             // frame is already cut to start after this component
             // (`cut_for(depth)`, applied when it was opened), so stopping the
             // descent here resumes at the component's next sibling: exactly
@@ -689,8 +689,8 @@ mod tests {
     /// list drops out quietly; anything that leaves the walk unable to see
     /// what is there must surface, or a partial listing reads as a complete
     /// one. Pinned here as a predicate because the interesting errnos are
-    /// awkward to provoke for real — fd exhaustion is process-wide, `EACCES`
-    /// needs a non-root runner — while the integration side in
+    /// awkward to provoke for real - fd exhaustion is process-wide, `EACCES`
+    /// needs a non-root runner - while the integration side in
     /// `test/uring_fs.rs` drives the two races end to end.
     #[test]
     fn a_subtree_is_skipped_only_when_nothing_is_left_to_list() {
@@ -707,7 +707,7 @@ mod tests {
             Errno::EIO,
             Errno::ENOMEM,
             Errno::ELOOP,
-            // The name is still there, but no longer a directory — and the
+            // The name is still there, but no longer a directory - and the
             // walk already emitted it with a directory key, so the caller is
             // holding a claim the filesystem now contradicts.
             Errno::ENOTDIR,
@@ -764,7 +764,7 @@ mod tests {
 
     /// The skip bit is what makes folding and paging compose, so it has to
     /// survive the round-trip and it has to be part of the cursor's identity
-    /// — two cursors on the same key that resume differently are not the same
+    /// -- two cursors on the same key that resume differently are not the same
     /// cursor, and must not encode to the same bytes.
     #[test]
     fn the_skip_bit_survives_a_round_trip_and_distinguishes_two_cursors() {

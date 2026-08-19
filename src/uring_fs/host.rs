@@ -1,6 +1,6 @@
 //! The standalone host: [`UringFs`] owns the engine and the fs core, runs
 //! the completion loop on its thread, and mints the cross-thread handles.
-//! (The core is host-agnostic — a `net` server is the other host, driving the
+//! (The core is host-agnostic - a `net` server is the other host, driving the
 //! same [`FsCore`] on its own ring.)
 
 use super::core::{
@@ -27,7 +27,7 @@ use std::sync::atomic::Ordering;
 /// There is deliberately no open-file count here. Files are plain
 /// reference-counted descriptors (`Arc<OwnedFd>`) and no fs operation sets
 /// `IOSQE_FIXED_FILE`, so the reactor registers no fixed-file pool and has no
-/// ceiling of its own to configure — the limit on concurrently open files is
+/// ceiling of its own to configure - the limit on concurrently open files is
 /// the process's `RLIMIT_NOFILE`.
 ///
 /// # `entries` and `ops` bound different things
@@ -35,7 +35,7 @@ use std::sync::atomic::Ordering;
 /// `entries` is the submission queue, and `io_uring_enter` **consumes** SQEs
 /// into kernel-side requests, freeing the slots. Staging past a full queue
 /// therefore flushes and continues rather than failing, so `entries` sets how
-/// much work rides on one `io_uring_enter` — a batching knob, not a ceiling.
+/// much work rides on one `io_uring_enter` - a batching knob, not a ceiling.
 ///
 /// `ops` is the table an in-flight operation holds a slot in until its
 /// completion reaps, so **`ops` is the real concurrency ceiling**, and
@@ -44,31 +44,31 @@ use std::sync::atomic::Ordering;
 ///
 /// # Only `entries` costs locked memory
 ///
-/// A ring's queues are charged against `RLIMIT_MEMLOCK` — `__io_account_mem`
+/// A ring's queues are charged against `RLIMIT_MEMLOCK` - `__io_account_mem`
 /// (`io_uring/rsrc.c:39-47`) tests `rlimit(RLIMIT_MEMLOCK)` with **no
 /// capability bypass, so running as root does not exempt it**. The cost is
-/// about `entries × 96` bytes (a 64-byte SQE array plus a double-sized
+/// about `entries x 96` bytes (a 64-byte SQE array plus a double-sized
 /// completion queue), so the default is roughly 400 KiB per reactor against a
 /// common 8 MiB limit; measured, the 22nd concurrent default-sized ring fails
 /// `ENOMEM`.
 ///
-/// `ops` is ordinary heap — about 180 bytes per slot, so the default costs
-/// ~5.8 MiB of RSS, allocated once at construction — and is not accounted
-/// against any limit. That asymmetry is why the two defaults differ by 8×:
+/// `ops` is ordinary heap - about 180 bytes per slot, so the default costs
+/// ~5.8 MiB of RSS, allocated once at construction - and is not accounted
+/// against any limit. That asymmetry is why the two defaults differ by 8x:
 /// raising concurrency is cheap, raising the batch size is not.
 ///
 /// One reactor sits well inside 8 MiB. Several (a `reuse_port` reactor per
 /// core), or a consumer that also registers buffers, must raise the limit
 /// (`LimitMEMLOCK=` in the unit, or `setrlimit` before the first
-/// [`UringFs::new`]) — the symptom otherwise is a bare `ENOMEM` from ring
+/// [`UringFs::new`]) - the symptom otherwise is a bare `ENOMEM` from ring
 /// creation with nothing pointing at the cause.
 #[derive(Clone, Copy, Debug)]
 pub struct FsConfig {
-    /// Submission-queue depth (rounded up to a power of two by the kernel) —
+    /// Submission-queue depth (rounded up to a power of two by the kernel) --
     /// how much work rides on one `io_uring_enter`. The field that costs
     /// `RLIMIT_MEMLOCK`; see the type docs.
     pub entries: u32,
-    /// Op-table slots — the maximum number of concurrently in-flight
+    /// Op-table slots - the maximum number of concurrently in-flight
     /// operations, and the ceiling a fan-out actually hits: submitting past
     /// it fails `EBUSY` however deep the ring is. Plain heap at ~180 bytes a
     /// slot, so this is the cheap axis to raise.
@@ -111,7 +111,7 @@ impl ShutdownHandle {
 pub struct UringFs {
     // Field order is load-bearing (as in the net roles): `fs` owns every
     // kernel-visible buffer and is declared before `eng`, so those buffers
-    // drop before the engine unmaps the ring — the kernel must never touch a
+    // drop before the engine unmaps the ring - the kernel must never touch a
     // freed buffer.
     fs: FsCore,
     inject_tx: mpsc::Sender<FsInject>,
@@ -128,8 +128,8 @@ impl fmt::Debug for UringFs {
 impl Drop for UringFs {
     fn drop(&mut self) {
         // On the normal path `run` already drained, so this is a cheap no-op
-        // (nothing in flight → `cancel_and_reap_all` returns at once). On an
-        // early drop, or a panic unwinding out of `run`, drain here — and if
+        // (nothing in flight -> `cancel_and_reap_all` returns at once). On an
+        // early drop, or a panic unwinding out of `run`, drain here - and if
         // that drain fails, leak the op buffers rather than free them under a
         // still-live kernel op (mirrors the net `Server::drop`).
         let _ = self.drain_or_leak();
@@ -170,7 +170,7 @@ impl UringFs {
         })
     }
 
-    /// This reactor's ring descriptor — handed to the credential broker so
+    /// This reactor's ring descriptor - handed to the credential broker so
     /// it can register personalities on this ring (and to nothing else: a
     /// ring fd plus its personality table is a credential capability).
     pub(crate) fn ring_fd(&self) -> std::os::fd::RawFd {
@@ -178,11 +178,11 @@ impl UringFs {
     }
 
     /// Register the calling process's **current** credentials as a
-    /// [`Personality`] — the identity every subsequent operation must name.
+    /// [`Personality`] - the identity every subsequent operation must name.
     ///
     /// Unprivileged: registering your own credentials needs no capability.
     /// The snapshot is frozen at this call (a later `setgroups`/capability
-    /// drop does not update it — register again for a fresh one). Ids are
+    /// drop does not update it - register again for a fresh one). Ids are
     /// kernel-allocated from 1 upward, cyclically, without immediate reuse.
     pub fn register_self(&self) -> crate::Result<Personality> {
         let id = register_personality(self.eng.ring.raw_fd())?;
@@ -190,7 +190,7 @@ impl UringFs {
     }
 
     /// Declare which extended attributes are written under this reactor's
-    /// ambient credentials rather than the requesting [`Personality`] — see
+    /// ambient credentials rather than the requesting [`Personality`] - see
     /// [`PrivilegedXattrs`] for the rules and the reasoning.
     ///
     /// Setup-time only, and enforced as such: [`UringFs::run`] borrows `&mut
@@ -520,8 +520,8 @@ mod tests {
         assert_eq!(register_personality(fd), Ok(4), "cyclic, no reuse");
     }
 
-    /// §6.3 of the fs-reactor design: a `SINGLE_ISSUER` ring refuses
-    /// registration from any task but its creator with `-EEXIST` — the flag
+    /// sec. 6.3 of the fs-reactor design: a `SINGLE_ISSUER` ring refuses
+    /// registration from any task but its creator with `-EEXIST` - the flag
     /// our rings must never set (the credential broker registers from
     /// outside). Pin both directions.
     #[test]
@@ -532,7 +532,7 @@ mod tests {
         };
         let fd = match io_uring_setup(4, &mut p) {
             Ok(fd) => fd,
-            // EINVAL: kernel predates the flag (< 6.0) — nothing to pin.
+            // EINVAL: kernel predates the flag (< 6.0) - nothing to pin.
             Err(Errno::EINVAL) => return,
             Err(e) if skip_unavailable(e) => return,
             Err(e) => panic!("io_uring_setup: {e}"),
@@ -553,7 +553,7 @@ mod tests {
 
     /// The explicit-index install convention: `OPENAT2` with
     /// `file_index = slot + 1` completes with `res == 0` (not an fd number).
-    /// Raw-ring test on purpose — it pins the kernel, not our plumbing.
+    /// Raw-ring test on purpose - it pins the kernel, not our plumbing.
     #[test]
     fn explicit_index_install_res_is_zero() {
         let Some(mut ring) = ring_or_skip(8) else {
@@ -587,9 +587,9 @@ mod tests {
         );
     }
 
-    /// Pin the xattr SQE field packing — `addr` = name, `addr2` = value,
-    /// `len` = size, `xattr_flags` = flags — independently of the
-    /// fd-based xattr ops, which need no capability gate at this crate’s 6.18
+    /// Pin the xattr SQE field packing - `addr` = name, `addr2` = value,
+    /// `len` = size, `xattr_flags` = flags - independently of the
+    /// fd-based xattr ops, which need no capability gate at this crate's 6.18
     /// kernel floor.
     ///
     /// Deliberately submitted against a **real** fd: the encoding is what
@@ -643,7 +643,7 @@ mod tests {
 
     /// A forged/stale token (recycled generation) is inert: the op fails
     /// `EBADF` without touching the slot's current occupant. And a
-    /// personality id nothing registered fails `EINVAL` at submission —
+    /// personality id nothing registered fails `EINVAL` at submission --
     /// the kernel refusing the stamp, surfaced as the op's error.
     #[test]
     fn stale_token_and_stale_personality_are_inert() {
@@ -672,7 +672,7 @@ mod tests {
                 let how = OpenHow::new().flags(OFlag::O_RDONLY);
                 let f = h.open(me, &anchor, "f", how).unwrap();
 
-                // A plain read works (files are real fds now — there is no
+                // A plain read works (files are real fds now - there is no
                 // stale `{slot, generation}` token left to forge).
                 let (res, bufs) =
                     h.preadv2(me, &f, vec![vec![0u8; 4]], 0, RwFlags::empty());

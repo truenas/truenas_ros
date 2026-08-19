@@ -1,10 +1,10 @@
 //! Detaching a connection to a worker for a blocking op on the socket fd.
 //!
 //! `Response::Detach` hands the connection's socket fd to your own worker for a
-//! blocking operation ON the socket — the motivating case is ZFS send/recv,
+//! blocking operation ON the socket - the motivating case is ZFS send/recv,
 //! where `lzc_send`/`lzc_receive` block in a `/dev/zfs` ioctl while the kernel
 //! streams DMU records straight over the fd. The library ships no worker pool
-//! and no ZFS bindings — you bring both. The pattern:
+//! and no ZFS bindings - you bring both. The pattern:
 //!
 //!  1. the body handler stashes what to do in the per-connection state and
 //!     returns `Response::Detach(responder.detach())`;
@@ -44,11 +44,11 @@ fn frame(payload: &[u8]) -> Vec<u8> {
 /// kernel streams the record stream over the socket). Here: echo raw bytes off
 /// the fd until the peer half-closes. Returns whether it finished cleanly.
 fn run_transfer(fd: RawFd) -> bool {
-    // Borrow the furnished fd WITHOUT owning it — the `Detached` owns and closes
+    // Borrow the furnished fd WITHOUT owning it - the `Detached` owns and closes
     // it. The fd inherits the pool socket's non-blocking mode; a blocking op
     // must clear it first (a real ZFS ioctl needs a blocking fd too). NOTE:
     // the fd shares the pool socket's file DESCRIPTION, so this flag change
-    // outlives the detach — `Detached::resume` restores `O_NONBLOCK` itself
+    // outlives the detach - `Detached::resume` restores `O_NONBLOCK` itself
     // before handing the connection back (the server relies on it for the
     // spliced-body slow-loris guard), so a worker need not undo it; other
     // file-status flags a worker sets DO stick and are its own to restore.

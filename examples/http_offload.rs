@@ -1,4 +1,4 @@
-//! Parking an HTTP request with `protocol_deferrable` — the cold-miss
+//! Parking an HTTP request with `protocol_deferrable` - the cold-miss
 //! pattern.
 //!
 //! A handler that needs state only another thread can produce (an identity
@@ -7,11 +7,11 @@
 //!
 //!  1. the handler calls [`HttpRequest::defer`], which retains the request
 //!     (head verbatim, body owned) and detaches a `Send` [`HttpDeferred`],
-//!  2. it returns `HttpVerdict::Defer(permit)` — the server thread goes
+//!  2. it returns `HttpVerdict::Defer(permit)` - the server thread goes
 //!     straight back to polling,
 //!  3. the worker resolves what it needed, then either
-//!     [`HttpDeferred::redrive`]s — the handler runs again on the server
-//!     thread over the identical request, now hitting its warm state — or,
+//!     [`HttpDeferred::redrive`]s - the handler runs again on the server
+//!     thread over the identical request, now hitting its warm state - or,
 //!     past its own deadline, builds an error and [`HttpDeferred::reply`]s
 //!     it (serialized on the server thread, so response policy never runs
 //!     off-thread).
@@ -20,7 +20,7 @@
 //!
 //!   cargo run --example http_offload --features http
 //!
-//! Then: `curl -i http://127.0.0.1:8080/user/alice` — the first request for
+//! Then: `curl -i http://127.0.0.1:8080/user/alice` - the first request for
 //! a name parks ~50 ms while the "directory" resolves, repeats answer from
 //! the warm cache; `/user/slow` always misses its deadline and answers 503.
 //!
@@ -44,7 +44,7 @@ use truenas_ros::net::server::{Incoming, Server, ServerAddr};
 /// shape that matters here is lock-for-a-lookup, never lock-across-work.
 type Cache = Arc<Mutex<HashMap<String, u32>>>;
 
-/// The slow lookup a worker runs — stands in for NSS/LDAP/a database.
+/// The slow lookup a worker runs - stands in for NSS/LDAP/a database.
 fn resolve(name: &str) -> Option<u32> {
     thread::sleep(Duration::from_millis(50));
     if name == "slow" {
@@ -64,7 +64,7 @@ fn main() -> truenas_ros::Result<()> {
                 HttpResponse::new(404).body("try /user/<name>\n"),
             );
         };
-        // Fast path: a warm cache answers inline — including the second
+        // Fast path: a warm cache answers inline - including the second
         // invocation of a redriven request.
         if let Some(uid) = cache.lock().unwrap().get(name) {
             return HttpVerdict::Respond(

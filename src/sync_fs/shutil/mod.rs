@@ -2,7 +2,7 @@
 //!
 //! Driven by [`crate::sync_fs::iter::FsIter`]: the source tree is walked depth-first
 //! within a single filesystem, and each entry is recreated under the
-//! destination — cloning file data (with a `sendfile`/userspace fallback) and
+//! destination - cloning file data (with a `sendfile`/userspace fallback) and
 //! preserving ACLs, xattrs, ownership, and nanosecond timestamps. Directories
 //! are created owner-only and get their own metadata on ascent, once their
 //! children have been written.
@@ -94,7 +94,7 @@ pub struct CopyTreeConfig {
     pub exist_ok: bool,
     /// Also copy child mounts nested under `src`, as a post-pass after the
     /// primary filesystem (see [`copytree`]). Each child mount's destination
-    /// directory must already exist — it is opened, not created, so the data
+    /// directory must already exist - it is opened, not created, so the data
     /// lands on the intended destination mount rather than its parent.
     pub traverse: bool,
     /// Per-file copy strategy.
@@ -138,7 +138,7 @@ pub struct CopyTreeStats {
 /// A progress snapshot passed to a [`copytree_reporting`] callback.
 #[derive(Clone, Copy, Debug)]
 pub struct CopyTreeProgress<'a> {
-    /// Running totals copied so far — cumulative across the primary filesystem
+    /// Running totals copied so far - cumulative across the primary filesystem
     /// and any traversed child mounts.
     pub stats: CopyTreeStats,
     /// Source path of the entry most recently walked (the destination root on
@@ -165,7 +165,7 @@ fn select_copy_fn(op: CopyTreeOp) -> CopyFn {
 /// By default the copy stays within `src`'s own filesystem. With
 /// [`CopyTreeConfig::traverse`], each child mount nested under `src` is also
 /// copied, as a post-pass, into the correspondingly-named destination directory
-/// — which **must already exist** (it is opened, not created, so the data lands
+/// -- which **must already exist** (it is opened, not created, so the data lands
 /// on the intended destination mount rather than its parent).
 ///
 /// For progress reporting, use [`copytree_reporting`].
@@ -219,7 +219,7 @@ pub fn copytree_reporting(
             .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
     )?;
     // Hold the destination root owner-only (0o700) for the duration of the
-    // copy. Its real mode — which may be broader — is applied only at the end,
+    // copy. Its real mode - which may be broader - is applied only at the end,
     // so group/other are never granted access to the files being written before
     // the copy completes. Owner keeps write, so children stay creatable even
     // when the source root is not owner-writable.
@@ -232,7 +232,7 @@ pub fn copytree_reporting(
             .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
     )?;
     // dev+ino of the destination root, so the walk never copies dst into itself
-    // — applied to the primary pass and every traversed child mount.
+    // -- applied to the primary pass and every traversed child mount.
     let dst_self_st =
         statx(dst_root.as_fd(), "", AtFlags::AT_EMPTY_PATH, META_MASK)?;
     // `mkdir_at` sets the mode only for a root it creates; with `exist_ok` it
@@ -309,7 +309,7 @@ fn copy_one_mount(
     counter: &mut u64,
 ) -> Result<()> {
     // fsiter never yields the start directory, so the root gets a frame of its
-    // own, popped after the walk — children are then created while the root is
+    // own, popped after the walk - children are then created while the root is
     // still writable and its timestamps are not bumped by those writes.
     let mut frames = vec![DirFrame {
         src_path: src_path.to_path_buf(),
@@ -592,7 +592,7 @@ fn copy_into(
 /// destination it will be renamed over.
 ///
 /// The name is 128 bits from `getrandom(2)`, so a single `O_EXCL` create is
-/// collision-free in practice — no retry loop and no shared counter. Its length
+/// collision-free in practice - no retry loop and no shared counter. Its length
 /// is fixed rather than derived from the destination name, which would risk
 /// `ENAMETOOLONG` for a name already near `NAME_MAX`.
 fn create_temp(
@@ -639,7 +639,7 @@ fn make_symlink(
 }
 
 /// Recreate a special file (FIFO, socket, or block/character device) by type
-/// rather than copying contents — a special file has none, and opening one for
+/// rather than copying contents - a special file has none, and opening one for
 /// data would block (FIFO) or run a device's `open` method. Metadata is set
 /// directly on the new node (no data fd exists for these types), each attribute
 /// gated on its copy flag.
@@ -652,7 +652,7 @@ fn make_symlink(
 /// family refuses an `O_PATH` descriptor with `EBADF`: for an empty path
 /// `path_setxattrat` resolves the fd through `fdget` (`fs/xattr.c:757`), which
 /// masks out `FMODE_PATH`. `setxattrat` with `AT_EMPTY_PATH` is the same call
-/// — `getname_maybe_null` returns NULL for an empty name (`fs/namei.c:233`),
+/// -- `getname_maybe_null` returns NULL for an empty name (`fs/namei.c:233`),
 /// landing on that branch. `fchmodat2` is not subject to this, which is why
 /// the mode below can be set through the handle and the xattrs cannot.
 ///
@@ -671,7 +671,7 @@ fn make_special(
     // `mknodat`'s mode is umask-masked, so the exact permission bits are
     // restored below; `rdev` is 0 for FIFOs/sockets and the device number for
     // block/character devices. The `S_IFMT` bits in `mode` select the type.
-    // setid is masked at creation — `vfs_mknod` passes it through, and it must
+    // setid is masked at creation - `vfs_mknod` passes it through, and it must
     // not land before the node's ownership is settled.
     let mode = src_st.mode() as libc::mode_t;
     let res = name.with_tn_path(|n| {
@@ -702,8 +702,8 @@ fn make_special(
             .flags(OFlag::O_PATH | OFlag::O_NOFOLLOW)
             .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
     )?;
-    // Confirm the handle is on the node `mknodat` created — same type and
-    // device number, and a single link — so a different object at the name is
+    // Confirm the handle is on the node `mknodat` created - same type and
+    // device number, and a single link - so a different object at the name is
     // not the one adjusted below.
     let node_st = statx(node.as_fd(), "", AtFlags::AT_EMPTY_PATH, META_MASK)?;
     let ifmt = libc::S_IFMT as u16;

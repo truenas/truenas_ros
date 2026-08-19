@@ -69,7 +69,7 @@ impl<K: Clone + Eq + Hash, V: Clone> SingleFlight<K, V> {
                     .or_insert_with(|| Arc::new(Slot::empty()))
                     .clone()
             };
-            // Fast path: already minted — no gate, no mint.
+            // Fast path: already minted - no gate, no mint.
             if let Some(v) = slot.cell.with(V::clone) {
                 return Ok(v);
             }
@@ -81,7 +81,7 @@ impl<K: Clone + Eq + Hash, V: Clone> SingleFlight<K, V> {
             }
             // Confirm the map still holds *this* slot before minting on it. A
             // failed mint evicts its slot, and a caller arriving after that
-            // installs a fresh one — so a slot cloned before the eviction is
+            // installs a fresh one - so a slot cloned before the eviction is
             // now orphaned, and minting on it would let the map's current
             // slot mint the key a second time. Restart onto the current slot
             // instead; its fast path or gate then joins that mint rather than
@@ -95,7 +95,7 @@ impl<K: Clone + Eq + Hash, V: Clone> SingleFlight<K, V> {
             let value = match (mint.take().expect("mint runs at most once"))() {
                 Ok(v) => v,
                 Err(e) => {
-                    // Only if the map still holds *this* slot — a concurrent
+                    // Only if the map still holds *this* slot - a concurrent
                     // `invalidate` may have replaced it, and that one is not
                     // ours to drop.
                     if let Ok(mut live) = self.live.lock() {
@@ -193,7 +193,7 @@ mod loom_tests {
     use super::*;
     use crate::sync::thread;
 
-    /// Two threads, three with main — loom caps a model at 5. The preemption
+    /// Two threads, three with main - loom caps a model at 5. The preemption
     /// bound makes these bounded rather than exhaustive.
     fn bounded_model(f: impl Fn() + Sync + Send + 'static) {
         let mut b = loom::model::Builder::new();

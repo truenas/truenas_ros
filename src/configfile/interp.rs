@@ -11,10 +11,10 @@ use crate::error::{Error, Result};
 
 /// Cap on the total interpolated output for one value. [`MAX_INTERPOLATION_DEPTH`]
 /// bounds nesting depth but not the branching factor: B references per level
-/// over D levels expand to Bᴰ bytes (ten options each referencing the prior ten
-/// blow ~800 bytes up to 10¹⁰), so the depth limit alone does not stop an
+/// over D levels expand to B^D bytes (ten options each referencing the prior
+/// ten blow ~800 bytes up to 10^1^0), so the depth limit alone does not stop an
 /// untrusted config from exhausting memory. Bounding the accumulated output
-/// does — 1 MiB is far beyond any real interpolated value.
+/// does - 1 MiB is far beyond any real interpolated value.
 ///
 /// CPython caps only the recursion depth, so a document `configparser`
 /// resolves can be rejected here.
@@ -133,7 +133,7 @@ fn interpolate(
 /// value is withheld from the error, as in [`before_get`].
 ///
 /// The `%%` removal is global before the scan (a `%%` inside a reference name
-/// is stripped too), so it is done with `replace`, not scanned in place — the
+/// is stripped too), so it is done with `replace`, not scanned in place - the
 /// left-to-right equivalent disagrees with `configparser` on inputs like
 /// `%(%%)s`. `replace` copies `value`; under `scrub` that copy holds the
 /// secret, so it is burned before returning rather than freed in the clear.

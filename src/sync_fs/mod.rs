@@ -1,4 +1,4 @@
-//! Blocking (synchronous) filesystem bindings — the `sync_fs` umbrella.
+//! Blocking (synchronous) filesystem bindings - the `sync_fs` umbrella.
 //!
 //! The umbrella root is the base syscall layer (feature `sync-fs`): [`statx`],
 //! [`openat2`], [`renameat2`], [`safe_open`], atomic writes, and the shared

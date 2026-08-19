@@ -1,6 +1,6 @@
 //! Glue: build a [`net::server::Protocol`](Protocol) from an HTTP handler.
 //! The `header` handler is the framer step; the `body` handler drives the
-//! phase machine — pairing stashed heads with their bodies, sending the
+//! phase machine - pairing stashed heads with their bodies, sending the
 //! `100 Continue` interim, serializing responses, and mapping keep-alive
 //! onto [`Response::Reply`] vs [`Response::ReplyClose`]. The whole body
 //! handler lives in [`step`], a plain function over the delivered message
@@ -12,7 +12,7 @@ use std::sync::PoisonError;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // The answer cell is cross-thread state (a worker fills it, the loop takes
-// it), so it rides `crate::sync` — std in production, loom's in the model
+// it), so it rides `crate::sync` - std in production, loom's in the model
 // below, which is what lets the model see the fill/redeliver ordering.
 use crate::sync::{Arc, Mutex};
 
@@ -53,30 +53,30 @@ pub struct HttpRequest<'a> {
     pub version: Version,
     /// Parsed header index, wire order preserved.
     pub headers: &'a [HeaderView<'a>],
-    /// The request body (complete — bounded by [`HttpConfig::max_body`]).
-    /// Deref for in-place reads; [`Body::take`] moves the bytes out — a
+    /// The request body (complete - bounded by [`HttpConfig::max_body`]).
+    /// Deref for in-place reads; [`Body::take`] moves the bytes out - a
     /// zero-copy move when the reactor placed the body in its own
     /// allocation, and for a chunked body delivered owned (the 100-continue
     /// dance path at or over the placement threshold) an in-place truncate
-    /// of the de-chunked wire — so a handler that keeps the payload (an S3
+    /// of the de-chunked wire - so a handler that keeps the payload (an S3
     /// PUT) never pays a second copy.
     pub body: Body<'a>,
-    /// The head block verbatim, including the terminating CRLFCRLF — the
+    /// The head block verbatim, including the terminating CRLFCRLF - the
     /// diagnostic to echo in a `SignatureDoesNotMatch` reply. Build the SigV4
     /// canonical request from [`headers`](HttpRequest::headers) (borrows into
     /// this buffer, values verbatim minus edge-trim), never by re-splitting
     /// this block: the tokenizer accepts a bare LF as a line terminator
-    /// (RFC 9112 §2.2), so a CRLF-strict re-parse would draw header
-    /// boundaries the request is not served on — the header-smuggling
+    /// (RFC 9112 sec. 2.2), so a CRLF-strict re-parse would draw header
+    /// boundaries the request is not served on - the header-smuggling
     /// differential the parsed view does not have.
     pub raw_head: &'a [u8],
-    /// Trailer fields from a chunked body (RFC 9112 §7.1.2), parsed but not
+    /// Trailer fields from a chunked body (RFC 9112 sec. 7.1.2), parsed but not
     /// interpreted; empty for non-chunked requests and for chunked bodies
-    /// whose trailer section is bare. Names forbidden in trailers —
-    /// framing, routing, and credentials (RFC 9110 §6.5.1) — are dropped by
+    /// whose trailer section is bare. Names forbidden in trailers --
+    /// framing, routing, and credentials (RFC 9110 sec. 6.5.1) - are dropped by
     /// the codec and never appear here, so merging these with the headers
     /// cannot rewrite either. (botocore's checksum trailer rides *inside*
-    /// the aws-chunked entity, not here — this surfaces genuine HTTP
+    /// the aws-chunked entity, not here - this surfaces genuine HTTP
     /// trailers for whichever clients send them.)
     pub trailers: &'a [HeaderView<'a>],
     /// The peer's identity.
@@ -136,7 +136,7 @@ impl std::fmt::Debug for HttpRequest<'_> {
 
 /// A request retained across a park: everything a redelivery needs to
 /// re-present the identical request view, plus the answer cell a worker's
-/// [`HttpDeferred::reply`] fills. Fully owned — the connection buffer it was
+/// [`HttpDeferred::reply`] fills. Fully owned - the connection buffer it was
 /// parsed from is recycled while the request is parked.
 pub(crate) struct ParkedRequest {
     /// The head block verbatim (`raw_head`), re-parsed at completion so no
@@ -162,13 +162,13 @@ impl std::fmt::Debug for ParkedRequest {
 }
 
 /// A deferrable handler's decision for one request.
-// The verdict is built and consumed within one dispatch — it never rests
-// anywhere — so boxing the response to level the variant sizes would buy
+// The verdict is built and consumed within one dispatch - it never rests
+// anywhere - so boxing the response to level the variant sizes would buy
 // nothing but a per-response allocation on the hot path.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum HttpVerdict {
-    /// Answer now — exactly what a [`protocol`] handler returns.
+    /// Answer now - exactly what a [`protocol`] handler returns.
     Respond(HttpResponse),
     /// The request is parked; the detached [`HttpDeferred`] completes it.
     Defer(HttpDeferPermit),
@@ -206,7 +206,7 @@ pub struct HttpDeferred {
 
 impl HttpDeferred {
     /// Re-dispatch the retained request through the handler on the server
-    /// thread: the second invocation sees the identical request view — for
+    /// thread: the second invocation sees the identical request view - for
     /// a worker that warmed the state the first pass was missing. The rerun
     /// may respond, defer again, or close.
     pub fn redrive(self) {
@@ -215,8 +215,8 @@ impl HttpDeferred {
 
     /// Complete the request with `resp`, built on the worker. Serialization
     /// still happens on the server thread against the request's own
-    /// negotiated head facts — HEAD body elision, keep-alive vs close, the
-    /// smuggling forced-close, the `Date` cache — so no response policy is
+    /// negotiated head facts - HEAD body elision, keep-alive vs close, the
+    /// smuggling forced-close, the `Date` cache - so no response policy is
     /// duplicated off-thread.
     pub fn reply(self, resp: HttpResponse) {
         // The cell write happens-before the redeliver's channel send, so
@@ -301,7 +301,7 @@ fn respond(
 }
 
 /// The farewell for a connection the framer failed: a real status line, then
-/// flush-close. Tiny text body so a captured trace is self-explanatory —
+/// flush-close. Tiny text body so a captured trace is self-explanatory --
 /// elided when the dying request was a HEAD (`head_only`), whose responses
 /// must not carry content lest the client read the body bytes as the next
 /// response's head.
@@ -342,7 +342,7 @@ fn reparse_or_farewell<'a, 'buf>(
     }
 }
 
-/// Parse a delivered head and run the consumer's handler against it — the
+/// Parse a delivered head and run the consumer's handler against it - the
 /// shared tail of the normal path, the 100-continue dance, and a parked
 /// request's redelivery, so all three hand handlers an identical request
 /// view by construction.
@@ -392,7 +392,7 @@ where
     }
 }
 
-/// Serialize a worker-built reply against the parked request's own head —
+/// Serialize a worker-built reply against the parked request's own head --
 /// the same [`respond`] policy the inline path applies, so keep-alive, HEAD
 /// elision, and the smuggling forced-close cannot fork between the two.
 fn respond_parked(
@@ -408,7 +408,7 @@ fn respond_parked(
     }
 }
 
-/// One delivered message against the connection's phase — the entire `body`
+/// One delivered message against the connection's phase - the entire `body`
 /// handler as a plain function (the closure in [`protocol_deferrable`] is a
 /// one-line adapter), so tests exercise the real
 /// dance/keep-alive/park/farewell code.
@@ -424,7 +424,7 @@ fn step<U, H>(
 where
     H: FnMut(HttpRequest<'_>, &mut U) -> HttpVerdict,
 {
-    /// File a park into the phase, or pass the verdict through — the shared
+    /// File a park into the phase, or pass the verdict through - the shared
     /// tail of every dispatching arm.
     fn settle<U>(conn: &mut HttpConn<U>, d: Dispatched) -> Response {
         match d {
@@ -438,7 +438,7 @@ where
     match std::mem::replace(&mut conn.phase, Phase::Head) {
         // The framer's farewell: everything buffered was delivered as a
         // degenerate message; answer and flush-close. The HEAD flag rides
-        // in the phase from the moment the failure was declared — after the
+        // in the phase from the moment the failure was declared - after the
         // dance the head bytes are consumed and the delivered bytes are the
         // client's body, so sniffing them here would let a body that spells
         // "HEAD " force an incomplete farewell (and a real HEAD's farewell
@@ -452,7 +452,7 @@ where
             Response::Reply(b"HTTP/1.1 100 Continue\r\n\r\n".to_vec())
         }
         // Dance message 2: the body alone, paired with the stash. (A
-        // chunked dance never lands here — the framer morphs ExpectBody
+        // chunked dance never lands here - the framer morphs ExpectBody
         // into the scan phase before declaring anything.)
         Phase::ExpectBody { head: stash, .. } => {
             let d = dispatch(
@@ -472,7 +472,7 @@ where
         // stash. When the reactor handed the wire allocation over (the
         // dance delivers the body alone, and large bodies arrive owned),
         // de-chunk **in place**: ownership moves and the entity stays in
-        // the same allocation — the single-chunk shape default botocore
+        // the same allocation - the single-chunk shape default botocore
         // sends moves no bytes at all, and the handler's take() truncates
         // instead of copying. A borrowed delivery keeps the borrowing
         // paths: a single-chunk entity is a borrow of the wire, only
@@ -548,7 +548,7 @@ where
         }
         // A parked request's completion, arriving as a redelivery (the frame
         // is empty; everything real was retained at the park). A worker
-        // `reply` left the response in the cell — serialize it against the
+        // `reply` left the response in the cell - serialize it against the
         // retained head. Otherwise this is a `redrive`: run the handler
         // again over the identical request view; it may respond, park
         // again, or close.
@@ -592,7 +592,7 @@ where
 /// per-connection state `U`; `handler` runs once per delivery with the
 /// parsed [`HttpRequest`] view and `&mut U`, and returns an
 /// [`HttpVerdict`]: [`Respond`](HttpVerdict::Respond) answers inline
-/// (exactly a [`protocol`] handler), or — after [`HttpRequest::defer`] —
+/// (exactly a [`protocol`] handler), or - after [`HttpRequest::defer`] --
 /// [`Defer`](HttpVerdict::Defer) parks the request while the reactor keeps
 /// polling. The worker then completes it through the [`HttpDeferred`]:
 /// [`redrive`](HttpDeferred::redrive) re-runs the handler on the server
@@ -605,9 +605,9 @@ where
 /// is parked nothing later is read or delivered, so reply order is request
 /// order. Above that cap the framer still holds pipelined requests back
 /// during a park, but the armed read-ahead then carries `request_timeout`
-/// while parked — run deferrable endpoints at the default cap.
+/// while parked - run deferrable endpoints at the default cap.
 ///
-/// Errors when `cfg` fails [`HttpConfig::validate`] — a codec that can
+/// Errors when `cfg` fails [`HttpConfig::validate`] - a codec that can
 /// admit no request is refused here, not discovered one 431 at a time.
 // Same shape and rationale as `length_prefixed`: the three opaque closures
 // ARE the signature; boxing them would put dyn dispatch on the hot path.
@@ -628,7 +628,7 @@ where
     H: FnMut(HttpRequest<'_>, &mut U) -> HttpVerdict,
 {
     cfg.validate()?;
-    // One date cache per protocol instance — instances are per reactor and
+    // One date cache per protocol instance - instances are per reactor and
     // handlers run on the reactor thread, so the `Date` value renders once
     // a second instead of once a response, with no synchronization.
     let mut dates = DateCache::default();
@@ -664,7 +664,7 @@ where
 /// `accept` is the standard admission hook returning the consumer's
 /// per-connection state `U`; `handler` is invoked once per request with the
 /// parsed [`HttpRequest`] view and `&mut U`, and returns the
-/// [`HttpResponse`] to serialize. Handlers run on the server thread —
+/// [`HttpResponse`] to serialize. Handlers run on the server thread --
 /// compute inline like any reactor `body` handler; a handler that must
 /// wait on other threads uses [`protocol_deferrable`] instead.
 ///
@@ -695,7 +695,7 @@ mod tests {
     use super::*;
     use crate::net::Framing;
 
-    /// [`step`] with a throwaway date cache and responder — the tests assert
+    /// [`step`] with a throwaway date cache and responder - the tests assert
     /// nothing about `Date` freshness (pinned in `date.rs`) or the injection
     /// channel (pinned in the net-layer tests). Plain-response handlers ride
     /// the same `Respond` wrapper [`protocol`] applies.
@@ -714,7 +714,7 @@ mod tests {
         })
     }
 
-    /// [`drive`] for verdict handlers — the park tests' entry.
+    /// [`drive`] for verdict handlers - the park tests' entry.
     fn drive_verdict<U, H>(
         header: &[u8],
         body: Body<'_>,
@@ -744,7 +744,7 @@ mod tests {
         HttpConfig::default()
     }
 
-    /// Reply bytes as text, whatever the verdict — a vectored reply is
+    /// Reply bytes as text, whatever the verdict - a vectored reply is
     /// flattened, since on the wire its segments are one contiguous PDU.
     fn text(resp: &Response) -> String {
         let bytes = match resp {
@@ -860,7 +860,7 @@ mod tests {
         let Response::ReplyVectored { segments, close } = &resp else {
             panic!("a body response must be vectored, got {resp:?}");
         };
-        assert!(!close, "keep-alive request → no close");
+        assert!(!close, "keep-alive request -> no close");
         assert_eq!(segments.len(), 2, "head + body");
         assert!(segments[0].starts_with(b"HTTP/1.1 200 OK\r\n"));
         assert!(
@@ -875,7 +875,7 @@ mod tests {
 
     #[test]
     fn a_bodyless_response_stays_one_buffer() {
-        // No body (an empty-body 200, and a status that forbids one) → a
+        // No body (an empty-body 200, and a status that forbids one) -> a
         // single head buffer, not a vectored reply.
         let mut empty = |_: HttpRequest<'_>, _: &mut ()| HttpResponse::new(200);
         let resp = roundtrip(
@@ -1018,7 +1018,7 @@ mod tests {
             HttpResponse::new(200)
         };
 
-        // Message 1: the head alone → the interim, and the phase advances.
+        // Message 1: the head alone -> the interim, and the phase advances.
         assert_eq!(
             frame(head, &mut conn, &cfg()),
             Framing::Complete {
@@ -1092,7 +1092,7 @@ mod tests {
     fn farewell_after_dance_ignores_body_bytes() {
         // After the interim the head is consumed; a failing scan delivers
         // body bytes alone. A body crafted to begin "HEAD " must not turn
-        // the farewell into a bodyless HEAD response — a declared
+        // the farewell into a bodyless HEAD response - a declared
         // Content-Length with no content is an incomplete message.
         let head = b"PUT /k HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n";
         let mut conn = HttpConn::new(());
@@ -1193,7 +1193,7 @@ mod tests {
         // dev box (boto3 1.37.9): Expect + TE chunked, one HTTP chunk
         // wrapping the aws-chunked entity, checksum trailer *inside* the
         // entity, bare HTTP terminator. The HTTP band de-chunks its own
-        // layer only — the aws-chunked entity must pass through untouched.
+        // layer only - the aws-chunked entity must pass through untouched.
         let head = b"PUT /bkt/hello.txt HTTP/1.1\r\n\
                      Host: 127.0.0.1:9711\r\n\
                      Expect: 100-continue\r\n\
@@ -1225,7 +1225,7 @@ mod tests {
             HttpResponse::new(200)
         };
 
-        // Message 1: the head alone → the interim, and the phase advances.
+        // Message 1: the head alone -> the interim, and the phase advances.
         assert_eq!(
             frame(head, &mut conn, &cfg()),
             Framing::Complete {
@@ -1289,7 +1289,7 @@ mod tests {
     fn owned_dance_body_takes_from_the_same_allocation() {
         // The reactor hands the dance's body-only delivery its buffer (at
         // or over the placement threshold); the de-chunked entity must
-        // reach the handler's take() from that same allocation — ownership
+        // reach the handler's take() from that same allocation - ownership
         // moved, bytes didn't (single chunk), nothing allocated. The A3
         // contract, pointer-checked, on the golden botocore shape.
         let head = b"PUT /bkt/k HTTP/1.1\r\n\
@@ -1462,8 +1462,8 @@ mod tests {
     }
 
     /// Park a HEAD; the worker replies with a declared length. The
-    /// completion must apply the HEAD contract — length on the wire, no
-    /// body bytes — proving the reply serializes against the parked head.
+    /// completion must apply the HEAD contract - length on the wire, no
+    /// body bytes - proving the reply serializes against the parked head.
     #[test]
     fn worker_reply_keeps_the_head_contract() {
         let head = b"HEAD /x HTTP/1.1\r\nHost: h\r\n\r\n";
@@ -1566,7 +1566,7 @@ mod tests {
                 _ => HttpVerdict::Respond(HttpResponse::new(200)),
             }
         };
-        // Message 1: the head alone → the interim; the handler never runs.
+        // Message 1: the head alone -> the interim; the handler never runs.
         assert_eq!(
             frame(head, &mut conn, &cfg()),
             Framing::Complete {
@@ -1578,7 +1578,7 @@ mod tests {
             drive_verdict(head, Body::inline(b""), &p, &mut conn, &mut handler);
         assert!(matches!(&interim, Response::Reply(b)
             if b.as_slice() == b"HTTP/1.1 100 Continue\r\n\r\n"));
-        // Message 2: the body → the park.
+        // Message 2: the body -> the park.
         assert_eq!(
             frame(b"abc", &mut conn, &cfg()),
             Framing::Complete {
@@ -1705,8 +1705,8 @@ mod tests {
 //
 // The cell is filled before the redeliver is sent, and the completion pass
 // takes the cell only after consuming the wake, so a `reply` can never be
-// observed as a redrive. Break either half — fill after the send, or take
-// before the wake — and a schedule exists where the completion pass takes
+// observed as a redrive. Break either half - fill after the send, or take
+// before the wake - and a schedule exists where the completion pass takes
 // `None`: the handler reruns against a consumed handle and the worker's
 // response is lost. The model drives the real `defer`/`reply`/`step`, with
 // the loop's recv order supplied by the probe.

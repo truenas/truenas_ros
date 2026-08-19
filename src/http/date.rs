@@ -1,5 +1,5 @@
-//! IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) from a unix timestamp —
-//! the one date shape RFC 9110 §5.6.7 requires servers to *send*. Pure
+//! IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) from a unix timestamp --
+//! the one date shape RFC 9110 sec. 5.6.7 requires servers to *send*. Pure
 //! arithmetic (Howard Hinnant's civil-from-days), no clock access: the
 //! caller supplies the seconds so serialization stays deterministic and
 //! testable.
@@ -85,7 +85,7 @@ impl fmt::Display for HttpDate {
 /// their reactor, so re-running the calendar math and formatting per
 /// response (~750 ns) is waste: the glue owns one of these per protocol
 /// instance (= per reactor) and re-renders only when the second changes.
-/// Pure like the rest of the module — the caller supplies the seconds, so
+/// Pure like the rest of the module - the caller supplies the seconds, so
 /// serialization stays deterministic and testable.
 #[derive(Debug)]
 pub(crate) struct DateCache {
@@ -93,10 +93,10 @@ pub(crate) struct DateCache {
     sec: Option<i64>,
     /// Rendered length. IMF-fixdate is 29 bytes for four-digit years; the
     /// buffer leaves room for the degenerate years an arbitrary `i64`
-    /// second can name (±12 digits), which cannot overflow it.
+    /// second can name (+/-12 digits), which cannot overflow it.
     len: usize,
     text: [u8; 40],
-    /// Renders performed — pins the caching in tests.
+    /// Renders performed - pins the caching in tests.
     #[cfg(test)]
     renders: usize,
 }

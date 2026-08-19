@@ -1,6 +1,6 @@
 //! The [`Errno`] error-number type and its `errno`-based [`Result`] (Linux-only).
 //!
-//! Low-level syscall wrappers in this crate return [`Result<T>`] — an alias for
+//! Low-level syscall wrappers in this crate return [`Result<T>`] - an alias for
 //! `Result<T, Errno>`. The rich crate-level [`crate::Error`] wraps `Errno` via
 //! `From` so `?` bridges the two layers.
 
@@ -246,8 +246,8 @@ impl ErrnoSentinel for *mut c_void {
 /// Runs `f`, retrying while it fails with [`Errno::EINTR`].
 ///
 /// This mirrors the syscall loop in the `truenas_os` C extension. Unlike those
-/// Python bindings we have no interpreter signal check to poll, so — like the
-/// Rust standard library — we simply retry `EINTR` unconditionally.
+/// Python bindings we have no interpreter signal check to poll, so - like the
+/// Rust standard library - we simply retry `EINTR` unconditionally.
 #[inline]
 #[allow(dead_code)] // unused only when no feature module is compiled
 pub(crate) fn retry_on_eintr<S, F>(mut f: F) -> Result<S>

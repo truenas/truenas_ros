@@ -1,4 +1,4 @@
-//! NFS4 ACLs (`system.nfs4_acl_xdr`) — big-endian XDR wire format.
+//! NFS4 ACLs (`system.nfs4_acl_xdr`) - big-endian XDR wire format.
 
 use crate::error::{Error, Result};
 
@@ -185,10 +185,10 @@ pub struct Nfs4Acl {
 ///
 /// Deliberately local, and not worth folding together with the readers in
 /// `acl::posix`, `sync_fs::iter`, `sync_fs::fhandle` or `uring_fs::query_tree`
-/// even though all five look alike. They do not agree on byte order — this one
+/// even though all five look alike. They do not agree on byte order - this one
 /// is big-endian because XDR is, the POSIX xattr is little-endian because the
 /// kernel writes it that way, and the resume tokens are native-endian because
-/// nothing outside the host reads them — so a shared reader is three readers,
+/// nothing outside the host reads them - so a shared reader is three readers,
 /// which is what these already are. It would also have to live somewhere all
 /// of `acl`, `fsiter`, `fhandle` and `uring-fs` can reach, and each of those
 /// is required to build on its own.
@@ -414,7 +414,7 @@ impl Nfs4Acl {
         }
         if is_dir && !has_inheritable {
             // ZFS's own trivial directory ACL carries no inheritance flags, so
-            // it lands here — a get-modify-set of a stock directory fails at
+            // it lands here - a get-modify-set of a stock directory fails at
             // the set. Say so, rather than restating the rule: the caller has
             // to add an inheritable ACE, and needs to know the bytes it just
             // read cannot simply be written back.

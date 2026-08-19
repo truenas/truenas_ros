@@ -1,10 +1,10 @@
-//! Integration tests for the `net::server` module — live loopback echo over
+//! Integration tests for the `net::server` module - live loopback echo over
 //! TCP and AF_UNIX with a 4-byte big-endian length-prefix framing, exercising
-//! the full ring path (multishot accept → recv-header → frame → recv-body →
-//! handler → send → keep-alive).
+//! the full ring path (multishot accept -> recv-header -> frame -> recv-body ->
+//! handler -> send -> keep-alive).
 //!
 //! Like `test/zfs.rs` and `test/configparser_compat.rs`, these **skip** (return
-//! early) when io_uring is unavailable — the CI/dev sandbox blocks the io_uring
+//! early) when io_uring is unavailable - the CI/dev sandbox blocks the io_uring
 //! syscalls (ENOSYS/EPERM/EACCES), so `cargo test` stays green in a bare
 //! sandbox. Set `TRUENAS_ROS_REQUIRE_IO_URING=1` (as CI on a real kernel does)
 //! to turn a skip into a hard failure so coverage can't silently vanish.
@@ -31,10 +31,10 @@ use truenas_ros::net::server::{
 };
 use truenas_ros::{Errno, Error};
 
-/// Errors that mean "io_uring is unavailable here" — an environmental skip.
+/// Errors that mean "io_uring is unavailable here" - an environmental skip.
 ///
 /// Deliberately *excludes* `EINVAL`: for io_uring that means the kernel rejected
-/// our setup arguments — a real bug we want to fail on, not skip.
+/// our setup arguments - a real bug we want to fail on, not skip.
 fn is_unavailable(e: &Error) -> bool {
     matches!(
         e,
@@ -53,9 +53,9 @@ fn should_skip(e: &Error) -> bool {
     false
 }
 
-/// `unix_peercred` needs io_uring socket commands on `AF_UNIX` (Linux ≥
+/// `unix_peercred` needs io_uring socket commands on `AF_UNIX` (Linux >=
 /// 6.18.16); on older kernels `with_config`'s startup probe fails with a
-/// validation error. Environmental, like `should_skip` — but force the test
+/// validation error. Environmental, like `should_skip` - but force the test
 /// on known-good hosts with `TRUENAS_ROS_REQUIRE_PEERCRED`.
 fn peercred_unsupported(e: &Error) -> bool {
     let unsupported = matches!(e, Error::Validation(m) if m.contains("unix_peercred requires"));
@@ -84,7 +84,7 @@ fn echo(_header: &[u8], body: &[u8], _peer: &ClientAddr) -> Option<Vec<u8>> {
 
 /// Consumer-side LSP framer: `Framing::More` until the `\r\n\r\n` header
 /// terminator, then parse the `Content-Length` body length. This is the kind of
-/// variable-length-header framer a caller writes — the server ships no such
+/// variable-length-header framer a caller writes - the server ships no such
 /// protocol-specific (text) parser.
 fn lsp_header(buf: &[u8], _state: &mut ()) -> Framing {
     let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
@@ -136,7 +136,7 @@ fn framed_roundtrips<S: Read + Write>(
         send_framed(&mut s, m)?;
         echoes.push(recv_framed(&mut s)?);
     }
-    drop(s); // close → keep-alive ends (server recv-header gets EOF)
+    drop(s); // close -> keep-alive ends (server recv-header gets EOF)
     Ok(echoes)
 }
 
@@ -175,7 +175,7 @@ fn tcp_echo() {
 fn tcp_vectored_reply() {
     // A `ReplyVectored`'s segments reach the client concatenated in order (one
     // vectored write), and the reply retires its `outstanding` count exactly
-    // once — only the last segment is `is_reply` — so keep-alive keeps
+    // once - only the last segment is `is_reply` - so keep-alive keeps
     // serving: three sequential roundtrips are not stranded behind the
     // read-ahead cap. A wrong `is_reply` count would wedge the second.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -262,7 +262,7 @@ fn unix_echo() {
 
 #[test]
 fn tcp_keepalive() {
-    // Several messages on ONE connection — proves the connection is reused.
+    // Several messages on ONE connection - proves the connection is reused.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let mut server = match Server::bind(
         [addr],
@@ -301,9 +301,9 @@ fn tcp_keepalive() {
 #[test]
 fn tcp_split_segments() {
     // Send the length prefix one byte at a time and the body in two halves,
-    // each write flushed with a gap — so recv-header and recv-body each span
+    // each write flushed with a gap - so recv-header and recv-body each span
     // multiple TCP segments. This passes only if MSG_WAITALL accumulates the
-    // short reads in-kernel (without it, recv-header returns 1 < 4 → close).
+    // short reads in-kernel (without it, recv-header returns 1 < 4 -> close).
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let mut server = match Server::bind(
         [addr],
@@ -388,7 +388,7 @@ fn tcp_many_concurrent() {
 
 #[test]
 fn tcp_sequential_slot_reuse() {
-    // Tiny pool, connections opened one at a time (never exceeding capacity) —
+    // Tiny pool, connections opened one at a time (never exceeding capacity) --
     // forces slot recycling and the per-slot generation bump.
     const N: usize = 20;
     let cfg = ServerConfig {
@@ -426,14 +426,14 @@ fn tcp_sequential_slot_reuse() {
 
 #[test]
 fn tcp_bare_close_with_inflight_sibling_reuses_slot() {
-    // SECURITY regression — fixed-slot reuse use-after-free / cross-connection
+    // SECURITY regression - fixed-slot reuse use-after-free / cross-connection
     // corruption. When a connection is torn down on a bare-CLOSE path while an
     // op is still in flight on its descriptor, that op pins the kernel resource
     // node: the CLOSE frees the table slot and bitmap bit at issue and biases
     // the next accept to that same index, but the pinned op keeps the old
     // socket and its buffers alive. A reuse-accept then reaches
     // `accept_connection` and overwrites the still-`Serving` slot (freed only
-    // at ops==0) — dropping the live connection under the in-flight op, and,
+    // at ops==0) - dropping the live connection under the in-flight op, and,
     // because the generation never bumps on reuse-without-free, later steering
     // that op's completion onto whatever connection now holds the slot. The fix
     // cancels the in-flight op and defers the CLOSE until it reaps, so the slot
@@ -441,8 +441,8 @@ fn tcp_bare_close_with_inflight_sibling_reuses_slot() {
     //
     // Repro with a wide, deterministic window: a subscriber triggers a large
     // push to itself, then half-closes its WRITE side (the server's idle recv
-    // sees EOF → PeerClosed, a bare close) while keeping its READ side open and
-    // never reading — so the push send stalls in flight, pinning the slot
+    // sees EOF -> PeerClosed, a bare close) while keeping its READ side open
+    // and never reading - so the push send stalls in flight, pinning the slot
     // indefinitely. A fresh echo then reuses the freed index. Without the fix
     // the reuse corrupts the connection (wrong reply, a loop panic, or a hang);
     // with it, every echo gets its own correct reply and the server stays live.
@@ -452,7 +452,7 @@ fn tcp_bare_close_with_inflight_sibling_reuses_slot() {
     const PUSH: usize = 16 * 1024 * 1024; // stalls in flight (peer never reads it)
     let sub_handle: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
     let cfg = ServerConfig {
-        pool_size: 4, // small → the freed index is reused
+        pool_size: 4, // small -> the freed index is reused
         max_send_backlog: 64 * 1024 * 1024, // keep the push queued, don't evict it
         ..ServerConfig::default()
     };
@@ -510,8 +510,8 @@ fn tcp_bare_close_with_inflight_sibling_reuses_slot() {
                 assert_eq!(recv_framed(&mut sub)?, b"ok");
                 send_framed(&mut sub, b"push")?;
                 assert_eq!(recv_framed(&mut sub)?, b"ok");
-                // Half-close our WRITE side: the server's idle recv sees EOF →
-                // PeerClosed, a bare close — but the large push to us is still
+                // Half-close our WRITE side: the server's idle recv sees EOF ->
+                // PeerClosed, a bare close - but the large push to us is still
                 // draining into our socket and we never read it, so its send
                 // stays in flight and pins the descriptor.
                 sub.shutdown(Shutdown::Write)?;
@@ -538,7 +538,7 @@ fn tcp_bare_close_with_inflight_sibling_reuses_slot() {
 fn tcp_lsp_framing() {
     // LSP-style variable header: `Content-Length: N\r\n\r\n<body>`. The caller's
     // `lsp_header` framer scans for `\r\n\r\n` (via Framing::More chunk reads)
-    // then reads exactly N body bytes — a header the old fixed-size model can't
+    // then reads exactly N body bytes - a header the old fixed-size model can't
     // express. The body handler re-frames its reply the same way.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
@@ -642,7 +642,7 @@ fn tcp_deferred_offload() {
     // The body handler offloads work to another thread (standing in for a real
     // pool) and returns `Response::Defer`, freeing the server thread to keep
     // polling. The worker computes the reply and hands it back via the
-    // `Deferred`; the server sends it on the next wake, and keep-alive resumes —
+    // `Deferred`; the server sends it on the next wake, and keep-alive resumes --
     // proven by a second round-trip on the same connection.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
@@ -656,8 +656,8 @@ fn tcp_deferred_offload() {
             let Request {
                 body, responder, ..
             } = req;
-            // Move OWNED inputs to the worker — never a borrow of connection
-            // state — then detach the reply handle and return to the loop.
+            // Move OWNED inputs to the worker - never a borrow of connection
+            // state - then detach the reply handle and return to the loop.
             let input = body.to_vec();
             let (deferred, permit) = responder.defer();
             thread::spawn(move || {
@@ -728,7 +728,7 @@ fn tcp_deferred_drop_closes() {
             let mut s = connect_tcp(v4)?;
             let _ = send_framed(&mut s, b"hi"); // may race the close; ignore
             let mut buf = Vec::new();
-            s.read_to_end(&mut buf)?; // dropped Deferred closed us → EOF
+            s.read_to_end(&mut buf)?; // dropped Deferred closed us -> EOF
             Ok(buf)
         })();
         stop.shutdown();
@@ -746,7 +746,7 @@ fn tcp_deferred_drop_closes() {
 fn tcp_redelivered_request() {
     // A body handler stashes the request in its connection state, defers, and
     // the worker asks for a SECOND delivery via `Deferred::redeliver` instead
-    // of supplying bytes — the pattern protocol glue (http) uses to complete a
+    // of supplying bytes - the pattern protocol glue (http) uses to complete a
     // parked request on the server thread. The rerun sees the stash, replies,
     // and keep-alive continues: two messages each make the full
     // park-and-redeliver round trip on one connection.
@@ -818,7 +818,7 @@ fn tcp_redelivered_request() {
 fn tcp_stale_redeliver_dropped() {
     // A handler answers INLINE while leaking a `Deferred` whose worker later
     // calls `redeliver()`. The request was never opened as deferred, so the
-    // late redelivery must be inert — no extra handler run, no extra reply —
+    // late redelivery must be inert - no extra handler run, no extra reply --
     // and the connection stays healthy for a second round trip.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
@@ -876,7 +876,7 @@ fn tcp_stale_redeliver_dropped() {
     assert_eq!(s.replies, 2);
 }
 
-/// Borrow a furnished detach fd as a BLOCKING stream WITHOUT owning it — the
+/// Borrow a furnished detach fd as a BLOCKING stream WITHOUT owning it - the
 /// `Detached` handle owns and closes it, so this must not (hence `ManuallyDrop`,
 /// whose drop is a no-op). The fd inherits the pool socket's non-blocking mode,
 /// so a blocking op must clear it first.
@@ -963,8 +963,8 @@ fn tcp_detach_resume() {
 fn tcp_detach_resume_restores_nonblocking() {
     // The furnished fd shares the pool socket's FILE DESCRIPTION, so a worker
     // clearing O_NONBLOCK for its blocking transfer (as any blocking helper
-    // does) would otherwise leave the resumed connection's socket blocking —
-    // silently disabling the splice path's EAGAIN → readiness-poll slow-loris
+    // does) would otherwise leave the resumed connection's socket blocking --
+    // silently disabling the splice path's EAGAIN -> readiness-poll slow-loris
     // guard (`tcp_splice_read` takes its wait mode from the file's
     // O_NONBLOCK). `Detached::resume` must restore the flag itself. Observed
     // through a worker-held dup() of the furnished fd: same file description,
@@ -1115,7 +1115,7 @@ fn tcp_detach_drop_closes() {
     };
     server.set_detach_handler(|_ctx, detached| {
         thread::spawn(move || {
-            drop(detached); // lost worker → Drop closes the connection
+            drop(detached); // lost worker -> Drop closes the connection
         });
     });
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
@@ -1129,7 +1129,7 @@ fn tcp_detach_drop_closes() {
             let mut s = connect_tcp(v4)?;
             let _ = send_framed(&mut s, b"detach");
             let mut buf = Vec::new();
-            s.read_to_end(&mut buf)?; // dropped Detached closed us → EOF
+            s.read_to_end(&mut buf)?; // dropped Detached closed us -> EOF
             Ok(buf)
         })();
         stop.shutdown();
@@ -1145,7 +1145,7 @@ fn tcp_detach_drop_closes() {
 
 #[test]
 fn tcp_deferred_worker_close_ends_the_connection() {
-    // `Deferred::close` is the worker deciding the request is fatal — distinct
+    // `Deferred::close` is the worker deciding the request is fatal - distinct
     // from dropping the handle, which closes only because a lost worker must
     // not leak the parked slot. Both end the connection and both report
     // `WorkerClosed`, so a test of the drop path says nothing about whether
@@ -1225,7 +1225,7 @@ fn handle_types_are_debug() {
     // The reply/push/detach handles are what a consumer holds when something
     // goes wrong in its own worker, so they are what lands in its logs. Each
     // is `finish_non_exhaustive` and each deliberately withholds its channel
-    // and routing token — a `Debug` that printed the token would put a
+    // and routing token - a `Debug` that printed the token would put a
     // forgeable routing capability in a log file.
     use std::sync::mpsc;
     let (seen_tx, seen_rx) = mpsc::channel::<(&'static str, String)>();
@@ -1389,7 +1389,7 @@ fn shutdown_graceful_with_zero_grace_is_a_hard_shutdown() {
     // `shutdown_graceful(0)` is documented as exactly `shutdown()`. The
     // distinction is not cosmetic: the graceful path arms a grace-period
     // TIMEOUT op and waits for connections to quiesce, so a zero duration
-    // taken literally would arm a timer that fires immediately — or, worse,
+    // taken literally would arm a timer that fires immediately - or, worse,
     // a drain with no deadline at all. Delegating instead means a caller
     // computing a grace from configuration cannot accidentally hang the
     // shutdown by configuring zero.
@@ -1439,8 +1439,8 @@ fn shutdown_graceful_with_zero_grace_is_a_hard_shutdown() {
 fn tls_listener_without_a_handshake_handler_is_rejected() {
     // A kTLS listener cannot serve itself: the accept handler does not run for
     // kTLS connections, so `set_tls_handshake` IS the admission decision as
-    // well as the handshake. Construction cannot catch a missing one — the
-    // handler is installed after `bind` returns — so `serve_forever` refuses
+    // well as the handshake. Construction cannot catch a missing one - the
+    // handler is installed after `bind` returns - so `serve_forever` refuses
     // to start rather than accept connections it can only drop. Fail-fast at
     // startup, not per connection at runtime.
     use truenas_ros::net::server::Listen;
@@ -1458,7 +1458,7 @@ fn tls_listener_without_a_handshake_handler_is_rejected() {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         // A kernel without FIXED_FD_INSTALL rejects the listener earlier, with
-        // its own validation message — environmental, not the case under test.
+        // its own validation message - environmental, not the case under test.
         Err(Error::Validation(m)) if m.contains("FIXED_FD_INSTALL") => return,
         Err(e) => panic!("bind: {e}"),
     };
@@ -1519,7 +1519,7 @@ fn tcp6_echo() {
     // IPv6 is not just IPv4 with a longer address here: the listener asks
     // for `AF_INET6` and sets
     // `IPV6_V6ONLY`, and the per-connection peer fetch has to request exactly
-    // `sockaddr_in6`'s size — the kernel's `SO_PEERNAME` rejects an optlen
+    // `sockaddr_in6`'s size - the kernel's `SO_PEERNAME` rejects an optlen
     // LARGER than the actual address, and the completion then requires the
     // returned length to match exactly, failing closed otherwise. So an
     // address-family size mistake does not corrupt an address, it sheds every
@@ -1598,7 +1598,7 @@ fn close_reason_channel<U>(
 #[test]
 fn tcp_detach_without_a_handler_closes() {
     // A body handler returns `Response::Detach` on a server that never called
-    // `set_detach_handler` — a misconfiguration. The fd is furnished by the
+    // `set_detach_handler` - a misconfiguration. The fd is furnished by the
     // kernel before anything notices, so the loop has to close the alias it
     // will not use, reattach the parked connection to `Serving`, and tear it
     // down; leaking the alias would pin the socket open past the close.
@@ -1735,14 +1735,14 @@ fn tcp_detach_with_a_foreign_permit_closes() {
 fn tcp_detach_on_an_unsettled_connection_closes() {
     // Detach hands the raw socket to a worker, so the bytes that follow belong
     // to the fd rather than the framer. It is only safe on a fully settled
-    // connection — nothing in flight and nothing buffered past this request.
+    // connection - nothing in flight and nothing buffered past this request.
     // A pipelined second message still sitting in the server's buffer is
     // exactly that: the worker would consume bytes the framer already owns, so
     // the loop must close instead.
     //
     // The framer has to be a scanning one for this to arise. A fixed-width
     // length prefix asks for exact byte counts, so a pipelined follower stays
-    // in the socket and never reaches the buffer — the connection reads as
+    // in the socket and never reaches the buffer - the connection reads as
     // settled. `lsp_header` scans for a `\r\n\r\n` terminator and so consumes
     // opportunistically, which is what leaves the second message buffered.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -1797,7 +1797,7 @@ fn tcp_detach_on_an_unsettled_connection_closes() {
 #[test]
 fn protocol_context_types_are_debug() {
     // `Incoming`, `Request` and `DetachContext` are `#[non_exhaustive]`, so a
-    // consumer cannot build one to print — their `Debug` impls are reachable
+    // consumer cannot build one to print - their `Debug` impls are reachable
     // only from inside a live handler. They are the types that end up in a
     // consumer's error logs, and each one
     // deliberately withholds fields: `Request` prints `header_len` rather than
@@ -1945,12 +1945,12 @@ fn splice_frame<W: Write>(s: &mut W, tag: u8, body: &[u8]) -> io::Result<()> {
 #[test]
 fn tcp_splice_body_recv() {
     // A framer diverts a DATA frame's body straight from the socket to a
-    // consumer pipe with IORING_OP_SPLICE — zero-copy, the body never enters
-    // the connection buffer — while CONTROL frames deliver to the body handler
+    // consumer pipe with IORING_OP_SPLICE - zero-copy, the body never enters
+    // the connection buffer - while CONTROL frames deliver to the body handler
     // as usual. Proves: (a) the spliced bytes arrive intact on the pipe; (b) a
     // body several times the pipe capacity drives the partial-splice resubmit
-    // path and end-to-end backpressure (the ring never blocks — an io-wq worker
-    // does — while the reader drains); (c) keep-alive framing resumes after the
+    // path and end-to-end backpressure (the ring never blocks - an io-wq worker
+    // does - while the reader drains); (c) keep-alive framing resumes after the
     // splice (a control frame still echoes on the same connection).
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills the two-element array with {read, write} fds.
@@ -2012,7 +2012,7 @@ fn tcp_splice_body_recv() {
         let r = (|| -> io::Result<Vec<u8>> {
             let mut s = connect_tcp(v4)?;
             splice_frame(&mut s, b'S', &payload)?; // spliced to the pipe
-            splice_frame(&mut s, b'C', b"ping")?; // control frame → echo
+            splice_frame(&mut s, b'C', b"ping")?; // control frame -> echo
             recv_framed(&mut s) // keep-alive resumed after the splice
         })();
         stop.shutdown();
@@ -2022,7 +2022,7 @@ fn tcp_splice_body_recv() {
     server.serve_forever().expect("serve_forever");
     // Close the write end BEFORE joining the reader: if anything upstream
     // delivered the body short, the reader then sees EOF and its `n > 0`
-    // assertion fires with a real diagnostic — instead of blocking forever in
+    // assertion fires with a real diagnostic - instead of blocking forever in
     // read() on a pipe this process still holds open (a hang, not a failure).
     // SAFETY: closing the test-owned write end (the server only borrowed it).
     unsafe { libc::close(pipe_wr) };
@@ -2033,7 +2033,7 @@ fn tcp_splice_body_recv() {
 
 #[test]
 fn tcp_splice_body_close_mid_splice() {
-    // Teardown while a body splice is genuinely IN FLIGHT — the security-critical
+    // Teardown while a body splice is genuinely IN FLIGHT - the security-critical
     // path. A splice's SQE fd is the consumer pipe, not the socket, so the
     // fd-keyed teardown cancel can't reach it: `close_conn` must cancel the
     // splice by its user_data and defer the index-freeing CLOSE until it reaps
@@ -2042,15 +2042,15 @@ fn tcp_splice_body_close_mid_splice() {
     //
     // Pin the splice in flight deterministically: a tiny pipe with NO reader, and
     // a body larger than it. The first splice fills the pipe; the next parks in
-    // the kernel `wait_for_space` (pipe full, never drained) — an in-flight
+    // the kernel `wait_for_space` (pipe full, never drained) - an in-flight
     // splice blocked on an io-wq worker. A graceful drain deliberately does NOT
     // touch an in-flight splice (`begin_drain`'s quiesced test skips `splicing`
-    // — it cannot tell this wedged transfer from a healthy one, and truncating
+    // -- it cannot tell this wedged transfer from a healthy one, and truncating
     // a healthy one is the bug in `tcp_graceful_drain_lets_healthy_splice_finish`).
     // So the wedged splice is reclaimed only when the grace Deadline escalates to
     // a hard stop: this test proves that escalation's `cancel_and_reap_all` can
     // cancel a splice BLOCKED in io-wq (whose SQE fd is the pipe, not the socket)
-    // rather than hanging on it — `serve_forever` returns promptly.
+    // rather than hanging on it - `serve_forever` returns promptly.
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills {read, write}.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
@@ -2130,7 +2130,7 @@ fn tcp_splice_body_close_mid_poll() {
     // and parks on the poll indefinitely. As with an in-flight splice, a graceful
     // drain leaves the parked poll alone (`splice_polling` reads as in-flight
     // work); the grace Deadline escalation then reaps it. This proves escalation
-    // doesn't hang on a parked splice poll — `serve_forever` returns promptly.
+    // doesn't hang on a parked splice poll - `serve_forever` returns promptly.
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills {read, write}.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
@@ -2261,7 +2261,7 @@ fn tcp_splice_body_request_timeout_reclaims_stall() {
 fn tcp_graceful_drain_lets_healthy_splice_finish() {
     // `shutdown_graceful`'s contract: work in flight runs to completion
     // within the grace. A body mid-splice IS in-flight work even though
-    // `recving` is false — the drain sweep must not classify it quiesced and
+    // `recving` is false - the drain sweep must not classify it quiesced and
     // cancel it (that silently truncates the body in the consumer's pipe).
     // Regression test: begin a drain while a splice is parked on its
     // readiness poll mid-body, then let the client finish; the FULL body must
@@ -2315,7 +2315,7 @@ fn tcp_graceful_drain_lets_healthy_splice_finish() {
             thread::sleep(Duration::from_millis(100)); // let the sweep run
             s.write_all(&sent[BODY / 2..])?; // finish the transfer
 
-            // The body completes and only THEN does the drain close us —
+            // The body completes and only THEN does the drain close us --
             // well inside the grace (no Deadline escalation involved).
             let mut buf = Vec::new();
             s.read_to_end(&mut buf)?;
@@ -2348,9 +2348,9 @@ fn tcp_graceful_drain_lets_healthy_splice_finish() {
 fn tcp_splice_body_nonblocking_pipe_rejected() {
     // A NON-BLOCKING destination breaks the splice path's contract two ways:
     // `do_splice` promotes the output fd's O_NONBLOCK to SPLICE_F_NONBLOCK,
-    // so a full pipe fails the splice with EAGAIN before the socket is read —
+    // so a full pipe fails the splice with EAGAIN before the socket is read --
     // indistinguishable from "socket empty", which would spin the readiness
-    // poll hot (POLLIN completes instantly, splice EAGAINs again) — and the
+    // poll hot (POLLIN completes instantly, splice EAGAINs again) - and the
     // designed blocking-pipe backpressure never engages. The server refuses
     // the fd at body start: `CloseReason::SpliceBadFd`, kernel never sees it.
     use std::sync::Mutex;
@@ -2358,7 +2358,7 @@ fn tcp_splice_body_nonblocking_pipe_rejected() {
     // SAFETY: `pipe(2)` fills {read, write}.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
     let (pipe_rd, pipe_wr) = (fds[0], fds[1]);
-    // SAFETY: flag the write end non-blocking — the misuse under test.
+    // SAFETY: flag the write end non-blocking - the misuse under test.
     unsafe {
         let fl = libc::fcntl(pipe_wr, libc::F_GETFL);
         libc::fcntl(pipe_wr, libc::F_SETFL, fl | libc::O_NONBLOCK);
@@ -2434,7 +2434,7 @@ fn tcp_send_timeout_reclaims_slot() {
     // A peer that requests a huge reply and then never reads it parks a
     // MSG_WAITALL send forever (TCP zero-window probing never gives up). With
     // `send_timeout`, the linked timeout cancels the stalled send and the
-    // connection's pool slot is reclaimed — proven with pool_size=1: a second
+    // connection's pool slot is reclaimed - proven with pool_size=1: a second
     // client can only ever be served if the first slot was actually freed.
     const BIG: usize = 8 * 1024 * 1024; // far beyond the socket send buffer
     let cfg = ServerConfig {
@@ -2507,7 +2507,7 @@ fn tcp_send_timeout_reclaims_slot() {
 
 #[test]
 fn tcp_one_way_notification() {
-    // `Response::Reply(empty)` means "answered, nothing to send" — a one-way
+    // `Response::Reply(empty)` means "answered, nothing to send" - a one-way
     // message. The connection stays open and the next request is served.
     // Full Protocol here; `tcp_builder_close_and_one_way` covers the same
     // contract through the `length_prefixed` builder (`Some(empty)` one-way,
@@ -2559,7 +2559,7 @@ fn tcp_one_way_notification() {
 #[test]
 fn tcp_builder_close_and_one_way() {
     // The `length_prefixed` builder's Option contract: `Some(empty)` is the
-    // one-way case (sends nothing, keeps serving — same as Response::Reply's
+    // one-way case (sends nothing, keeps serving - same as Response::Reply's
     // documented empty semantics), `None` is the close signal.
     use std::sync::Mutex;
     let reasons = Arc::new(Mutex::new(Vec::new()));
@@ -2618,7 +2618,7 @@ fn tcp_builder_close_and_one_way() {
 #[test]
 fn tcp_length_prefix_overflow_rejected() {
     // A u64 length prefix of !0 once wrapped the header+body usize total past
-    // the TooLarge guard (release) or panicked the loop on the add (debug) —
+    // the TooLarge guard (release) or panicked the loop on the add (debug) --
     // a remote crash from one 8-byte message. It must instead close that
     // connection as TooLarge and keep serving others.
     use std::sync::Mutex;
@@ -2674,8 +2674,8 @@ fn tcp_length_prefix_overflow_rejected() {
 fn tcp_need_overflow_rejected() {
     // A custom framer that echoes a hostile wire length as `Framing::Need(n)`
     // (the LSP pattern with an unvalidated Content-Length): the server must
-    // bound the requested read against max_request_bytes up front — both the
-    // overflowing and the merely-huge shape — not allocate n bytes.
+    // bound the requested read against max_request_bytes up front - both the
+    // overflowing and the merely-huge shape - not allocate n bytes.
     use std::sync::Mutex;
     let reasons = Arc::new(Mutex::new(Vec::new()));
     let proto = Protocol {
@@ -2737,7 +2737,7 @@ fn tcp_need_overflow_rejected() {
 fn tcp_stale_deferred_dropped() {
     // A handler that mints a Deferred but then answers inline: the worker's
     // late reply is for a request that was already answered, so it must be
-    // dropped (per-request token gating) — not sent as a spurious extra PDU,
+    // dropped (per-request token gating) - not sent as a spurious extra PDU,
     // and its Drop-close must not kill the healthy connection.
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
@@ -2753,7 +2753,7 @@ fn tcp_stale_deferred_dropped() {
                 thread::sleep(Duration::from_millis(30));
                 deferred.reply(echo_frame(b"late")); // must be dropped
             });
-            // Answer inline anyway — the Deferred above is now stale.
+            // Answer inline anyway - the Deferred above is now stale.
             Response::Reply(echo_frame(b"inline"))
         },
     };
@@ -2795,7 +2795,7 @@ fn tcp_stale_deferred_dropped() {
 fn tcp_mismatched_defer_permit_closes() {
     // A DeferPermit is stamped with its request's token and verified at
     // delivery: stashing one and returning it for a LATER request (whose own
-    // defer() was never called) must close the connection — not park a
+    // defer() was never called) must close the connection - not park a
     // request nothing can ever resolve, wedging the slot until shutdown.
     use std::sync::Mutex;
     let reasons = Arc::new(Mutex::new(Vec::new()));
@@ -2937,7 +2937,7 @@ fn tcp_reuse_port_and_options() {
 #[test]
 fn unix_peercred_auth() {
     // With `unix_peercred`, the accept handler receives the peer's SO_PEERCRED
-    // (fetched via an io_uring socket URING_CMD — Linux ≥ 6.7; this host is
+    // (fetched via an io_uring socket URING_CMD - Linux >= 6.7; this host is
     // newer) before running, and can authenticate on it. The body echoes the
     // credentials back and the client checks them against its real ids.
     let dir = truenas_ros::tempdir().unwrap();
@@ -3080,9 +3080,9 @@ fn tcp_push_backlog_evicts() {
     // A subscriber that stops reading: pushes accumulate until
     // max_send_backlog, then the connection is evicted with SendBacklog.
     use std::sync::Mutex;
-    // Each push must exceed what the kernel alone can absorb — sndbuf
+    // Each push must exceed what the kernel alone can absorb - sndbuf
     // autotunes up to tcp_wmem[2] (typically 4 MiB) plus the peer's ~128 KiB
-    // initial window — because a fully-absorbed WAITALL send completes and
+    // initial window - because a fully-absorbed WAITALL send completes and
     // leaves the library queue empty. At 32 MiB the first push is still
     // (partially) queued when the second arrives (`queued_bytes` counts the
     // whole front PDU until fully sent), so the second deterministically
@@ -3156,7 +3156,7 @@ fn tcp_push_backlog_evicts() {
             send_framed(&mut publisher, b"push")?;
             assert_eq!(recv_framed(&mut publisher)?, b"ok");
             thread::sleep(Duration::from_millis(50)); // let it stall
-                                                      // Second push: queued bytes would exceed the backlog cap → evict.
+                                                      // Second push: queued bytes would exceed the backlog cap -> evict.
             send_framed(&mut publisher, b"push")?;
             assert_eq!(recv_framed(&mut publisher)?, b"ok");
             thread::sleep(Duration::from_millis(100)); // let eviction land
@@ -3178,7 +3178,7 @@ fn tcp_push_backlog_evicts() {
 #[test]
 fn tcp_push_held_across_detach() {
     // PushHandle's contract is "usable for the connection's lifetime". While
-    // the connection is DETACHED its raw stream belongs to the worker — a
+    // the connection is DETACHED its raw stream belongs to the worker - a
     // push must neither write mid-detach (corrupting the worker's transfer)
     // nor be silently dropped: it queues against the parked connection and
     // flushes, FIFO, when the worker resumes it.
@@ -3238,7 +3238,7 @@ fn tcp_push_held_across_detach() {
             send_framed(&mut s, b"detach")?;
             parked_rx.recv().expect("parked");
             // The connection is parked with a worker: push now. These must be
-            // HELD (not written — the worker owns the stream — and not
+            // HELD (not written - the worker owns the stream - and not
             // dropped), then flushed in order at resume.
             let push =
                 push_slot.lock().unwrap().clone().expect("stashed handle");
@@ -3272,8 +3272,8 @@ fn tcp_push_held_across_detach() {
 #[test]
 fn tcp_reply_close_replies_then_closes() {
     // `Response::ReplyClose`: the server speaks last. The client gets the
-    // reply and then EOF — no idle-timeout wait, no relying on the peer to
-    // hang up (RFC 6455 §5.5.1-style close handshakes need exactly this).
+    // reply and then EOF - no idle-timeout wait, no relying on the peer to
+    // hang up (RFC 6455 sec. 5.5.1-style close handshakes need exactly this).
     // A second request pipelined behind the first is discarded undelivered:
     // the farewell retires the recv side.
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3316,7 +3316,7 @@ fn tcp_reply_close_replies_then_closes() {
         let _stop = ShutdownOnDrop(stop.clone());
         let r = (|| -> io::Result<()> {
             let mut s = connect_tcp(v4)?;
-            // Two requests in one write: only the first is served — the
+            // Two requests in one write: only the first is served - the
             // farewell is final.
             let mut wire = Vec::new();
             send_framed(&mut wire, b"bye")?;
@@ -3349,7 +3349,7 @@ fn tcp_reply_close_replies_then_closes() {
 
 #[test]
 fn tcp_deferred_reply_close() {
-    // `Deferred::reply_close`: the worker speaks last — its final PDU is
+    // `Deferred::reply_close`: the worker speaks last - its final PDU is
     // sent, then the connection closes (WorkerClosed), exactly like the
     // inline `Response::ReplyClose` but from another thread.
     use std::sync::Mutex;
@@ -3413,7 +3413,7 @@ fn tcp_deferred_reply_close() {
 #[test]
 fn tcp_deferred_reply_close_empty_flushes_queued() {
     // An EMPTY `reply_close` queues no PDU of its own but still flushes
-    // whatever is already queued before closing — here a push the worker
+    // whatever is already queued before closing - here a push the worker
     // issued just before it (both ride the same FIFO injection queue, so
     // the order is deterministic). `Response::Close` would drop that push.
     use std::sync::Mutex;
@@ -3740,7 +3740,7 @@ fn tcp_deferred_worker_completes_with_nothing() {
     // finished, there is nothing to send, and the request must simply be
     // retired. It travels as its own outcome rather than as an empty reply,
     // because a queued reply has its in-flight count retired when the send
-    // flushes and here no send will ever happen — so the count is dropped
+    // flushes and here no send will ever happen - so the count is dropped
     // where the outcome lands instead. Get that wrong and the connection
     // keeps a phantom request forever, which the request cap would eventually
     // stall on. Proven by continuing to serve afterwards: a leaked count would
@@ -3806,8 +3806,8 @@ fn tcp_deferred_worker_completes_with_nothing() {
 
 #[test]
 fn tcp_push_close_after_the_peer_is_gone_is_inert() {
-    // A `PushHandle` outlives the connection it names — that is the point of a
-    // long-lived handle — so a `close` can always arrive after the peer has
+    // A `PushHandle` outlives the connection it names - that is the point of a
+    // long-lived handle - so a `close` can always arrive after the peer has
     // already vanished, or after the slot has been recycled onto somebody
     // else. It must be inert rather than tearing down whoever holds the slot
     // now. Here the subscriber disconnects, a second client takes its place,
@@ -3884,7 +3884,7 @@ fn tcp_push_close_during_a_detach_window_lands_at_resume() {
     // A `PushHandle::close` arriving while the connection is parked under a
     // detach worker cannot act immediately: the worker owns the raw stream, so
     // writing the queued farewell or tearing the socket down would corrupt its
-    // transfer. It is recorded and enacted at resume — after the pushes held
+    // transfer. It is recorded and enacted at resume - after the pushes held
     // during the same window, which ride ahead of it. So the client must see
     // every held push, in order, and *then* EOF, with the close attributed to
     // the push side rather than to the worker.
@@ -4049,7 +4049,7 @@ fn tcp_push_close_kicks_subscriber() {
             send_framed(&mut admin, b"kick")?;
             assert_eq!(recv_framed(&mut admin)?, b"kicked");
 
-            // The subscriber gets the farewell, then EOF — and nothing
+            // The subscriber gets the farewell, then EOF - and nothing
             // after the farewell (the too-late push was dropped).
             assert_eq!(recv_framed(&mut sub)?, b"farewell");
             let mut rest = Vec::new();
@@ -4153,7 +4153,7 @@ fn tcp_stats_counts() {
     assert_eq!(s.recv_ops, 2 * s.requests, "recv_ops: {s:?}");
 }
 
-/// Deferring echo handler that `take()`s the body — the one-pattern
+/// Deferring echo handler that `take()`s the body - the one-pattern
 /// placement consumer (zero-copy when placed, copy fallback inline).
 fn take_and_defer_echo(body: &mut Body, responder: Responder) -> Response {
     let payload = body.take();
@@ -4410,7 +4410,7 @@ fn multi_listener_unix_and_tcp() {
 #[test]
 fn multi_listener_per_port_policy() {
     // Two TCP listeners on one server; accept admits connections on the first
-    // port and rejects the second — the listener argument drives policy.
+    // port and rejects the second - the listener argument drives policy.
     use std::sync::Mutex;
     let addrs = [
         ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap()),
@@ -4461,7 +4461,7 @@ fn multi_listener_per_port_policy() {
             // Rejected port: no echo comes back. A short read must NOT yield
             // the payload (rejected means no reply); EOF, reset, or a plain
             // timeout with no data all confirm "not admitted". (This asserts
-            // policy without depending on the reject-close reaching us — see
+            // policy without depending on the reject-close reaching us - see
             // the close-propagation note on the ignored tests.)
             let mut no = connect_tcp(b)?;
             no.set_read_timeout(Some(Duration::from_millis(300)))?;
@@ -4495,7 +4495,7 @@ fn multi_listener_per_port_policy() {
 #[test]
 fn tcp_peername_is_per_connection() {
     // Peer addresses are fetched per connection (SO_PEERNAME), not read from
-    // a buffer shared across a multishot accept's completions — so a burst of
+    // a buffer shared across a multishot accept's completions - so a burst of
     // simultaneous connects must each see THEIR OWN source address echoed
     // back. (A single shared address buffer would misattribute under a burst.)
     const N: usize = 8;
@@ -4600,14 +4600,14 @@ fn multi_listener_pool_full_rearm() {
             send_framed(&mut holder, b"hold")?;
             assert_eq!(recv_framed(&mut holder)?, b"hold");
             // Pool is full: one attempt on B is shed (accepted then closed by
-            // the kernel — ENFILE — terminating B's multishot accept). Use a
+            // the kernel - ENFILE - terminating B's multishot accept). Use a
             // short timeout because a connection can also land in B's listen
             // backlog unaccepted, where a read would block indefinitely; that
             // it does not get served is the point.
             let mut shed = connect_tcp(b)?;
             shed.set_read_timeout(Some(Duration::from_millis(200)))?;
             let mut byte = [0u8; 1];
-            let _ = shed.read(&mut byte); // EOF / reset / timeout — all "shed"
+            let _ = shed.read(&mut byte); // EOF / reset / timeout - all "shed"
             drop(shed);
             drop(holder); // free the only slot
             thread::sleep(Duration::from_millis(150)); // close + deferred re-arm
@@ -4630,7 +4630,7 @@ fn tcp_reply_coalescing() {
     // A burst of deferred replies released together is gathered into fewer
     // SENDMSG ops (writev coalescing): 16 pipelined requests all defer; one
     // worker answers all 16 at once; the client must receive every payload
-    // intact (order-independent — deferred replies may egress out of request
+    // intact (order-independent - deferred replies may egress out of request
     // order) and the stats must show send_ops < replies.
     use std::sync::Mutex;
     const N: usize = 16;
@@ -4764,7 +4764,7 @@ fn tcp_graceful_shutdown_drains() {
             let reply = recv_framed(&mut busy)?;
             assert_eq!(reply, b"WORK");
             // ...then the drained connection closes (EOF), as does the idle one
-            // — well before the 5s grace deadline.
+            // -- well before the 5s grace deadline.
             let mut b = [0u8; 1];
             assert_eq!(busy.read(&mut b)?, 0, "busy conn should see EOF");
             assert_eq!(idle.read(&mut b)?, 0, "idle conn should see EOF");
@@ -4787,8 +4787,8 @@ fn tcp_graceful_deadline_escalates() {
     // A worker that never resolves its Deferred: the graceful drain cannot
     // complete, so the grace deadline must escalate to a hard stop and
     // serve_forever must still return. The handler parks each Deferred in
-    // `keep_rx` and never resolves it — rather than `mem::forget`, which leaks
-    // its channel Sender + Arc and trips LeakSanitizer — releasing it only at
+    // `keep_rx` and never resolves it - rather than `mem::forget`, which leaks
+    // its channel Sender + Arc and trips LeakSanitizer - releasing it only at
     // test end, long after the drain has been forced to escalate.
     let (keep_tx, keep_rx) = std::sync::mpsc::channel();
     let proto = Protocol {
@@ -4823,7 +4823,7 @@ fn tcp_graceful_deadline_escalates() {
             send_framed(&mut s, b"stuck")?;
             thread::sleep(Duration::from_millis(30));
             stop.shutdown_graceful(Duration::from_millis(300));
-            // Keep the socket open (returned) — its EOF only arrives when the
+            // Keep the socket open (returned) - its EOF only arrives when the
             // abandoned connection's descriptor closes at server teardown.
             Ok(s)
         })()
@@ -4844,20 +4844,20 @@ fn tcp_graceful_deadline_escalates() {
     let mut buf = Vec::new();
     let n = s.read_to_end(&mut buf).unwrap_or(buf.len());
     assert_eq!(n, 0, "unexpected data after abandon: {buf:?}");
-    drop(keep_rx); // release the held (never-resolved) Deferreds — no leak
+    drop(keep_rx); // release the held (never-resolved) Deferreds - no leak
 }
 
 #[test]
 fn tcp_graceful_drains_pipelined_deferred_reply() {
     // Regression: in pipelined mode a connection can hold a deferred reply
     // in flight AND a read-ahead recv parked at once. Graceful shutdown must
-    // still deliver that reply — `begin_drain` cancels the parked recv, but the
+    // still deliver that reply - `begin_drain` cancels the parked recv, but the
     // connection must finish its outstanding work before closing; tearing it
     // down would drop the reply. At the default
     // `max_in_flight_requests` the read-ahead is never armed during a defer, so
     // this shape is pipelined-only.
     let cfg = ServerConfig {
-        max_in_flight_requests: 2, // pipelined → read-ahead armed during a defer
+        max_in_flight_requests: 2, // pipelined -> read-ahead armed during a defer
         ..ServerConfig::default()
     };
     let proto = Protocol {
@@ -4924,7 +4924,7 @@ fn tcp_idle_timeout_keeps_pipelined_deferred_reply() {
     // the idle-timeout cancellation instead of the drain one): in pipelined mode
     // a connection can hold a deferred reply in flight AND a parked read-ahead
     // recv at once. When `idle_timeout` fires on that read-ahead recv the
-    // connection is NOT idle — it still owes the deferred reply — so it must
+    // connection is NOT idle - it still owes the deferred reply - so it must
     // finish that work, not be reaped (reaping it would drop the reply: once
     // `closing`, `kick_send`'s `!closing` guard swallows the queued send).
     // A perfectly normal request/response client (send one request, await its
@@ -4934,13 +4934,13 @@ fn tcp_idle_timeout_keeps_pipelined_deferred_reply() {
     //
     // `WORK` being an exact multiple of `IDLE` also lands the final clock
     // expiry in a photo-finish with the reply's flush and the client's
-    // immediate next request — the served-since-arm rule keeps every ordering
+    // immediate next request - the served-since-arm rule keeps every ordering
     // of that race alive (pinned deterministically, with wide margins, by
     // `tcp_idle_clock_resets_on_served_reply`).
     const IDLE: Duration = Duration::from_millis(100);
     const WORK: Duration = Duration::from_millis(400); // outlives IDLE 4x
     let cfg = ServerConfig {
-        max_in_flight_requests: 2, // pipelined → read-ahead armed during a defer
+        max_in_flight_requests: 2, // pipelined -> read-ahead armed during a defer
         idle_timeout: Some(IDLE),
         ..ServerConfig::default()
     };
@@ -4987,7 +4987,7 @@ fn tcp_idle_timeout_keeps_pipelined_deferred_reply() {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         (|| -> io::Result<()> {
             let mut s = connect_tcp(v4)?;
-            // Send one request, then just wait for its reply — the read-ahead
+            // Send one request, then just wait for its reply - the read-ahead
             // recv parks and its idle timeout fires long before the worker
             // replies. Were the server to close the connection here, this read
             // would hit EOF; the reply must instead still arrive.
@@ -5014,11 +5014,11 @@ fn tcp_idle_timeout_keeps_pipelined_deferred_reply() {
 
 #[test]
 fn tcp_idle_clock_resets_on_served_reply() {
-    // Regression — the deterministic form of the race its sibling above only
+    // Regression - the deterministic form of the race its sibling above only
     // hits on a slow box: the idle clock rides the
     // parked read-ahead recv from ARM time, so while a deferred reply is
     // produced and flushed the clock keeps counting. Serving that reply is
-    // activity — the quiet interval must restart — yet a guard that only asks
+    // activity - the quiet interval must restart - yet a guard that only asks
     // "owes work NOW?" sees nothing outstanding at the next expiry and reaps
     // the connection out from under a client it served moments ago (the
     // client's follow-up request then hits EOF/reset).
@@ -5026,14 +5026,14 @@ fn tcp_idle_clock_resets_on_served_reply() {
     // Timeline pinned here, margins in the hundreds of ms so a loaded VM
     // cannot flip any edge: the read-ahead parks at ~0 with the clock running;
     // the deferred reply flushes at ~WORK (300 ms); the stale clock expires at
-    // ~IDLE (600 ms) — an interval that SAW a served reply, so it must re-arm
-    // a fresh quiet interval, not reap — and the client's second request lands
+    // ~IDLE (600 ms) - an interval that SAW a served reply, so it must re-arm
+    // a fresh quiet interval, not reap - and the client's second request lands
     // at ~700 ms, inside that fresh interval, and must be answered.
     const IDLE: Duration = Duration::from_millis(600);
     const WORK: Duration = Duration::from_millis(300);
     const CLIENT_PAUSE: Duration = Duration::from_millis(400);
     let cfg = ServerConfig {
-        max_in_flight_requests: 2, // pipelined → read-ahead parks during defer
+        max_in_flight_requests: 2, // pipelined -> read-ahead parks during defer
         idle_timeout: Some(IDLE),
         ..ServerConfig::default()
     };
@@ -5106,7 +5106,7 @@ fn tcp_default_config_never_times_out_a_deferred_request() {
     // via `Response::Defer` must never be timed out, however long the worker
     // runs. At the default `max_in_flight_requests` (1) no read-ahead recv is
     // armed while a defer is outstanding, so even with `idle_timeout` set well
-    // below the worker's duration nothing fires — the reply still arrives.
+    // below the worker's duration nothing fires - the reply still arrives.
     const IDLE: Duration = Duration::from_millis(100);
     const WORK: Duration = Duration::from_millis(500); // 5x the idle timeout
     let cfg = ServerConfig {
@@ -5155,7 +5155,7 @@ fn tcp_default_config_never_times_out_a_deferred_request() {
             let mut s = connect_tcp(v4)?;
             send_framed(&mut s, b"slow")?;
             // The worker sleeps far longer than idle_timeout; the reply must
-            // still come back — the handled request is never timed out.
+            // still come back - the handled request is never timed out.
             assert_eq!(recv_framed(&mut s)?, b"slow");
             Ok(())
         })()
@@ -5218,18 +5218,18 @@ fn tcp_close_hook_reasons() {
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         (|| -> io::Result<()> {
-            // (a) clean keep-alive EOF → PeerClosed
+            // (a) clean keep-alive EOF -> PeerClosed
             let mut a = connect_tcp(v4)?;
             send_framed(&mut a, b"hi")?;
             assert_eq!(recv_framed(&mut a)?, b"hi");
             drop(a);
-            // (b) handler says close → HandlerClosed
+            // (b) handler says close -> HandlerClosed
             let mut b = connect_tcp(v4)?;
             send_framed(&mut b, b"close")?;
             let mut buf = Vec::new();
             b.read_to_end(&mut buf)?; // closed without a reply
             assert!(buf.is_empty());
-            // (c) parked past idle_timeout → IdleTimeout
+            // (c) parked past idle_timeout -> IdleTimeout
             let mut c = connect_tcp(v4)?;
             let mut one = [0u8; 1];
             assert_eq!(c.read(&mut one)?, 0, "idle conn should be closed");
@@ -5325,7 +5325,7 @@ fn tcp_pipelined_out_of_order() {
     // Pipelined (max_in_flight > 1): the client sends several requests without
     // waiting; each is deferred to a worker that finishes in REVERSE order. With
     // read-ahead the server reads and defers all of them before any reply, so
-    // replies egress out of request order — proving recv is decoupled from send.
+    // replies egress out of request order - proving recv is decoupled from send.
     // The body carries a 1-byte id the client matches replies against.
     const N: u8 = 4;
     let cfg = ServerConfig {
@@ -5346,7 +5346,7 @@ fn tcp_pipelined_out_of_order() {
             let id = body[0];
             let (deferred, permit) = responder.defer();
             thread::spawn(move || {
-                // Higher ids sleep less → replies come back reversed.
+                // Higher ids sleep less -> replies come back reversed.
                 thread::sleep(Duration::from_millis(u64::from(N - id) * 40));
                 deferred.reply(echo_frame(&[id]));
             });
@@ -5388,7 +5388,7 @@ fn tcp_pipelined_out_of_order() {
 
     server.serve_forever().expect("serve_forever");
     let order = client.join().expect("thread join").expect("client io");
-    // Deterministic reversal from the inverse delays — the last request sent is
+    // Deterministic reversal from the inverse delays - the last request sent is
     // answered first, which can only happen if reads ran ahead of sends.
     assert_eq!(order, vec![3, 2, 1, 0]);
 }
@@ -5396,7 +5396,7 @@ fn tcp_pipelined_out_of_order() {
 #[test]
 fn tcp_pipelined_backpressure() {
     // A tight cap with more pipelined requests than the cap: read-ahead must
-    // pause at the cap and resume as replies drain — every request answered,
+    // pause at the cap and resume as replies drain - every request answered,
     // none dropped or deadlocked.
     const N: u8 = 12;
     let cfg = ServerConfig {
@@ -5467,7 +5467,7 @@ fn tcp_large_response() {
     // A response far larger than the socket send buffer exercises the WAITALL
     // send: io_uring accumulates the short writes in-kernel and delivers the
     // whole PDU in one op. The client reads it all back and checks it. (Runs in
-    // the default sequential mode — the WAITALL send is orthogonal to pipelining.)
+    // the default sequential mode - the WAITALL send is orthogonal to pipelining.)
     const SIZE: usize = 2 * 1024 * 1024; // >> the default socket sndbuf
     let proto = length_prefixed(
         PrefixWidth::U32,
@@ -5513,7 +5513,7 @@ fn tcp_large_response() {
 
 #[test]
 fn tcp_reject() {
-    // `accept` returns None → the connection is accepted then immediately closed
+    // `accept` returns None -> the connection is accepted then immediately closed
     // before any read; the client observes a clean EOF with no reply.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
@@ -5541,7 +5541,7 @@ fn tcp_reject() {
             let mut s = connect_tcp(v4)?;
             let _ = send_framed(&mut s, b"hello"); // may fail on a reset; ignore
             let mut buf = Vec::new();
-            s.read_to_end(&mut buf)?; // rejected → EOF, no data
+            s.read_to_end(&mut buf)?; // rejected -> EOF, no data
             Ok(buf)
         })();
         stop.shutdown();
@@ -5563,7 +5563,7 @@ fn server_close_reaches_peer_while_another_idles() {
     // another connection sits idle on a parked recv. A bare CLOSE of a direct
     // descriptor only drops the ring's file-table reference; the socket's
     // fput (and thus the FIN) can be deferred while the idle connection's
-    // in-flight recv pins the ring's resource node — so the closed peer would
+    // in-flight recv pins the ring's resource node - so the closed peer would
     // hang fully connected. The pre-close SHUTDOWN fixes that; this is the
     // regression guard.
     let proto = Protocol {
@@ -5631,7 +5631,7 @@ fn server_close_reaches_peer_while_another_idles() {
     client.join().expect("thread join");
 }
 
-/// Block on a read and assert the server closes an idle connection promptly — a
+/// Block on a read and assert the server closes an idle connection promptly - a
 /// clean EOF (orderly close) or a reset. The stream's existing read timeout
 /// turns a server that never closes into a failure rather than a hang.
 fn expect_idle_close(s: &mut TcpStream) -> io::Result<()> {
@@ -5645,7 +5645,7 @@ fn expect_idle_close(s: &mut TcpStream) -> io::Result<()> {
     }
     assert!(
         start.elapsed() < Duration::from_secs(2),
-        "idle close took too long ({:?}) — timer may not be firing",
+        "idle close took too long ({:?}) - timer may not be firing",
         start.elapsed()
     );
     Ok(())
@@ -5654,7 +5654,7 @@ fn expect_idle_close(s: &mut TcpStream) -> io::Result<()> {
 #[test]
 fn tcp_idle_timeout() {
     // With an idle timeout set, a connection left waiting for its next request
-    // is closed and its slot reclaimed — while an in-flight request is never
+    // is closed and its slot reclaimed - while an in-flight request is never
     // interrupted. Covers both idle recvs: after a completed round-trip, and a
     // connection that sends nothing at all.
     let cfg = ServerConfig {
@@ -5704,8 +5704,8 @@ fn timeouts_duration_max_mean_never() {
     // `Duration::MAX` (and anything >= 2^63 seconds) must mean "never fires",
     // not "fires instantly": the kernel-timespec conversion clamps tv_sec. An
     // unclamped `as i64` cast wraps negative, LINK_TIMEOUT prep then fails
-    // -EINVAL and takes its linked recv down -ECANCELED — misreported as
-    // IdleTimeout/RequestTimeout — closing every connection at its first
+    // -EINVAL and takes its linked recv down -ECANCELED - misreported as
+    // IdleTimeout/RequestTimeout - closing every connection at its first
     // parked read: the server could not hold a single client.
     let cfg = ServerConfig {
         idle_timeout: Some(Duration::MAX),
@@ -5737,7 +5737,7 @@ fn timeouts_duration_max_mean_never() {
             send_framed(&mut s, b"still here")?;
             assert_eq!(recv_framed(&mut s)?, b"still here");
             // Hold the REQUEST clock across a wait too: prefix now, body
-            // later — the split parks the body recv with its linked clock.
+            // later - the split parks the body recv with its linked clock.
             let mut frame = echo_frame(b"split");
             let body = frame.split_off(4);
             s.write_all(&frame)?;
@@ -5759,7 +5759,7 @@ fn tcp_request_timeout_reclaims_stalled_body() {
     // SECURITY (slow-loris): a peer that sends a valid length prefix and then
     // withholds the body must not pin its pool slot. `request_timeout` bounds
     // an in-progress request even though `idle_timeout` (unset here) never
-    // would — the connection is not idle, it is mid-frame. An idle keep-alive
+    // would - the connection is not idle, it is mid-frame. An idle keep-alive
     // connection is left untouched (that is `idle_timeout`'s job, not this).
     let cfg = ServerConfig {
         request_timeout: Some(Duration::from_millis(200)),
@@ -5814,8 +5814,8 @@ fn tcp_request_timeout_partial_body_reports_request_timeout() {
     // Close-reason fidelity for the slow-loris guard: a peer that trickles
     // SOME body bytes then stalls must be reported as RequestTimeout, not
     // TruncatedMessage. A LINK_TIMEOUT-cancelled MSG_WAITALL recv that had
-    // consumed bytes completes with res = done_io > 0 (io_sendrecv_fail) —
-    // bit-identical to a peer FIN mid-frame — so the server pairs the recv
+    // consumed bytes completes with res = done_io > 0 (io_sendrecv_fail) --
+    // bit-identical to a peer FIN mid-frame - so the server pairs the recv
     // completion with its clock CQE (-ETIME vs -ECANCELED) to classify.
     // Operators tuning slow-loris defenses read these reasons; "the peer
     // vanished mid-message" for a live, merely-stalled peer sends them
@@ -5877,7 +5877,7 @@ fn request_timeout_reclaims_stalled_more_scan() {
     // SECURITY (slow-loris, chunk-read path): a `More`/delimiter framer reads
     // in chunks that complete on any byte, so the request clock bounds them by
     // inactivity. A peer that sends a partial header (no `\r\n\r\n`) then stalls
-    // has its non-idle chunk read time out and its slot reclaimed — the
+    // has its non-idle chunk read time out and its slot reclaimed - the
     // `idle_timeout` clock (unset here) would never fire mid-scan.
     let cfg = ServerConfig {
         request_timeout: Some(Duration::from_millis(200)),
@@ -5976,8 +5976,8 @@ fn retry<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
 
 // ---- kernel TLS (kTLS) --------------------------------------------------
 //
-// The handshake/probe scaffolding — throwaway cert, `truenas_ktls` acceptor,
-// OpenSSL client, and the ULP/engagement skip machinery — is shared with
+// The handshake/probe scaffolding - throwaway cert, `truenas_ktls` acceptor,
+// OpenSSL client, and the ULP/engagement skip machinery - is shared with
 // `test/http_live.rs`; see `test/support/ktls.rs`.
 
 #[path = "support/ktls.rs"]
@@ -5990,7 +5990,7 @@ use ktls::{
 /// Shuts the server down when dropped. Every test here runs `serve_forever`
 /// on the test thread and drives the client from a spawned thread, so a
 /// panicking client (a failed assert, an I/O expect) would otherwise skip
-/// its shutdown call and strand the server — hanging the whole test binary
+/// its shutdown call and strand the server - hanging the whole test binary
 /// instead of going red. A clone of the handle in this guard makes the
 /// panic surface through `client.join()`.
 struct ShutdownOnDrop(ShutdownHandle);
@@ -6079,7 +6079,7 @@ fn ktls_echo_roundtrip() {
 #[test]
 fn ktls_rejected_handshake_sheds() {
     // A handshake that fails (the client speaks plaintext, not TLS) must reject
-    // cleanly — the worker calls deferral.reject(), the slot is shed — and the
+    // cleanly - the worker calls deferral.reject(), the slot is shed - and the
     // server keeps serving later TLS connections.
     if ktls_openssl_unsupported() {
         return;
@@ -6120,7 +6120,7 @@ fn ktls_rejected_handshake_sheds() {
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop); // shuts down even if this panics
         (|| -> io::Result<()> {
-            // Plaintext junk → the server's SSL_accept fails → reject → shed.
+            // Plaintext junk -> the server's SSL_accept fails -> reject -> shed.
             let mut bad = connect_tcp(v4)?;
             bad.set_read_timeout(Some(Duration::from_secs(3)))?;
             let _ = bad.write_all(b"not a TLS ClientHello\r\n\r\n");
@@ -6150,7 +6150,7 @@ fn ktls_rejected_handshake_sheds() {
 #[test]
 fn ktls_handshake_timeout_sheds_parked_slot() {
     // SECURITY: a kTLS connection whose handshake never completes (the
-    // consumer's worker never calls back) parks a pool slot — it holds a
+    // consumer's worker never calls back) parks a pool slot - it holds a
     // descriptor but has no in-flight recv/send, so neither idle_timeout nor
     // request_timeout (both linked to a recv) can reach it. With
     // `tls_handshake_timeout` set the park is bounded: the slot is shed. Here
@@ -6177,7 +6177,7 @@ fn ktls_handshake_timeout_sheds_parked_slot() {
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
         Err(e) => panic!("bind: {e}"),
     };
-    // Buffer each deferral (never resolving it → no reject-shed) and close the
+    // Buffer each deferral (never resolving it -> no reject-shed) and close the
     // fd we won't use; the held deferrals are released when `keep_rx` drops.
     let (keep_tx, keep_rx) = std::sync::mpsc::channel();
     server.set_tls_handshake(move |fd, _inc, deferral| {
@@ -6194,7 +6194,7 @@ fn ktls_handshake_timeout_sheds_parked_slot() {
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
                                                   // Connect (raw TCP); the server furnishes the fd and parks. We never
-                                                  // handshake — the park timeout must shed each slot.
+                                                  // handshake - the park timeout must shed each slot.
         let peers: Vec<_> =
             (0..3).map(|_| connect_tcp(v4).expect("connect")).collect();
         let t0 = Instant::now();
@@ -6218,10 +6218,10 @@ fn ktls_handshake_timeout_sheds_parked_slot() {
 
 #[test]
 fn ktls_close_notify_reports_tls_control() {
-    // A polite TLS client ends its session with close_notify — on the wire a
+    // A polite TLS client ends its session with close_notify - on the wire a
     // 2-byte alert record. The server's parked exact header read completes
-    // SHORT with record type 21 (alert), which must classify as TlsControl —
-    // the documented reason for a peer's clean TLS close — not as
+    // SHORT with record type 21 (alert), which must classify as TlsControl --
+    // the documented reason for a peer's clean TLS close - not as
     // TruncatedMessage.
     use std::sync::Mutex;
     if ktls_openssl_unsupported() {
@@ -6301,7 +6301,7 @@ fn tcp_splice_body_over_ktls() {
     // A body splices zero-copy off a SOFTWARE kTLS socket, in the clear: the
     // kernel routes the splice through `tls_sw_splice_read`, which decrypts.
     //
-    // The subtle case this pins down is the recvmsg→splice handoff. kTLS
+    // The subtle case this pins down is the recvmsg->splice handoff. kTLS
     // decrypts a whole TLS record at a time, so when the 5-byte header read
     // lands inside a record that also carries body bytes, the kernel decrypts
     // the entire record, hands us 5 bytes, and stashes the record's ~16 KiB
@@ -6422,7 +6422,7 @@ fn tcp_splice_body_over_ktls() {
     let (off, got) = reader.join().expect("reader join");
     assert_eq!(
         off, BODY,
-        "kTLS splice moved {off} of {BODY} body bytes — rx_list truncation?"
+        "kTLS splice moved {off} of {BODY} body bytes - rx_list truncation?"
     );
     assert_eq!(got, expected, "kTLS spliced body content mismatch");
     // SAFETY: closing the test-owned write end (the server only borrowed it).
@@ -6432,8 +6432,8 @@ fn tcp_splice_body_over_ktls() {
 #[test]
 fn ktls_splice_body_slow_but_progressing_survives() {
     // The other half of the watchdog contract (the race the standalone-timeout
-    // design must NOT lose): a kTLS splice that keeps making progress — even
-    // slowly, spanning several `request_timeout` periods — must run to
+    // design must NOT lose): a kTLS splice that keeps making progress - even
+    // slowly, spanning several `request_timeout` periods - must run to
     // completion. The watchdog re-arms on progress (`splice_remaining` fell
     // below its watermark) and only cancels on a full period of ZERO progress,
     // so a steadily-fed transfer is never mistaken for a stall.
@@ -6579,13 +6579,13 @@ fn ktls_splice_body_slow_but_progressing_survives() {
 #[test]
 fn ktls_splice_body_stall_reclaimed() {
     // SECURITY (slow-loris, kTLS splice): `tls_sw_splice_read` blocks an
-    // io-wq worker waiting for the next TLS record — it honors only
+    // io-wq worker waiting for the next TLS record - it honors only
     // SPLICE_F_NONBLOCK (which the server must not set) and, unlike
-    // `tcp_splice_read`, never the socket's O_NONBLOCK — so the plain-TCP
-    // EAGAIN → readiness-poll path that carries the request clock NEVER runs
+    // `tcp_splice_read`, never the socket's O_NONBLOCK - so the plain-TCP
+    // EAGAIN -> readiness-poll path that carries the request clock NEVER runs
     // for kTLS. The clock is therefore linked to the kTLS splice itself: a
     // peer that completes the handshake, sends a SpliceBody header, and then
-    // goes silent must be reclaimed by `request_timeout` — not pin its pool
+    // goes silent must be reclaimed by `request_timeout` - not pin its pool
     // slot plus a kernel io-wq thread until full shutdown (pool_size such
     // clients would deny all service, immune to every other timeout).
     use std::sync::Mutex;
@@ -6661,7 +6661,7 @@ fn ktls_splice_body_stall_reclaimed() {
             let t0 = Instant::now();
             let mut one = [0u8; 1];
             // Server closes us at the clock: EOF, reset, or a TLS-layer
-            // error — anything but a hang (the underlying socket carries a
+            // error - anything but a hang (the underlying socket carries a
             // 10s read timeout that would surface as an error here).
             match s.read(&mut one) {
                 Ok(0) | Err(_) => {}
@@ -6737,8 +6737,8 @@ fn server_builds_with_fs_pool() {
 
 /// The M4 headline: a static-file server. Each request names a file; the body
 /// handler opens it on the server's own ring under a per-connection
-/// [`Personality`], reads it, and replies with its contents — all inline on the
-/// loop thread via `Request::fs` and the `Deferred` reuse (open → read → reply,
+/// [`Personality`], reads it, and replies with its contents - all inline on the
+/// loop thread via `Request::fs` and the `Deferred` reuse (open -> read -> reply,
 /// no worker thread, no blocking the ring). Two requests on one keep-alive
 /// connection prove the fixed-file slot is opened and freed per request rather
 /// than leaked.
@@ -6779,7 +6779,7 @@ fn fs_static_file_server_open_read_reply() {
         let how = OpenHow::new().flags(OFlag::O_RDONLY);
         fs.open(who, &anchor, &path, how, move |done, fs| {
             let Some(file) = done.file() else {
-                deferred.close(); // open failed (ENOENT/EACCES — the personality working)
+                deferred.close(); // open failed (ENOENT/EACCES - the personality working)
                 return;
             };
             fs.preadv2(
@@ -7064,7 +7064,7 @@ fn fs_conn_flistxattr_lists_file_xattrs() {
 
 /// `FsConn::fstatfs`/`fstatfs_anchor` answer on-loop: each offloads to the
 /// pool (io_uring has no statfs opcode) and delivers through the completion
-/// sink. Both name the same filesystem, so their answers must agree — and the
+/// sink. Both name the same filesystem, so their answers must agree - and the
 /// anchor form proves an `O_PATH` descriptor is accepted, which is what lets a
 /// caller ask a whole tree's capacity without opening anything inside it.
 #[cfg(feature = "uring-fs")]
@@ -7183,7 +7183,7 @@ fn fs_conn_fstatfs_agrees_from_file_and_anchor() {
 }
 
 /// `FsConn::fget_zfs_attrs`/`fset_zfs_attrs` on-loop: read the mask, set
-/// `IMMUTABLE`, read it back, and restore — each hop an offload delivered
+/// `IMMUTABLE`, read it back, and restore - each hop an offload delivered
 /// through the completion sink.
 ///
 /// Needs a real ZFS dataset; on tmpfs the ioctl is `ENOTTY`. Resolved the way
@@ -7324,7 +7324,7 @@ fn fs_conn_zfs_attrs_round_trip_through_the_pool() {
     let reply = client.join().unwrap().expect("client io");
     let text = String::from_utf8_lossy(&reply).into_owned();
     let _ = std::fs::remove_file(&fp);
-    // Unprivileged, setting IMMUTABLE is refused — which is the property
+    // Unprivileged, setting IMMUTABLE is refused - which is the property
     // under test, so assert that rather than treating it as a skip.
     if text.starts_with("SET ") {
         assert!(
@@ -7339,8 +7339,8 @@ fn fs_conn_zfs_attrs_round_trip_through_the_pool() {
 /// The batched-blocking-offload consumer shape, end to end: the
 /// credential-checked open runs on the ring as a personality-stamped SQE,
 /// then ONE `FsConn::offload_result` job runs the whole blocking metadata
-/// tail — `statx` plus two xattr reads on the already-authorized fd (`File`
-/// is `AsFd`) — and the delivery arrives through the wake path's
+/// tail - `statx` plus two xattr reads on the already-authorized fd (`File`
+/// is `AsFd`) - and the delivery arrives through the wake path's
 /// `drain_fs_offloads` on an owner-scoped continuation facade.
 #[cfg(feature = "uring-fs")]
 #[test]
@@ -7454,11 +7454,11 @@ fn fs_conn_offload_result_batches_statx_and_xattrs_in_one_job() {
 }
 
 /// `FsConn::fgetxattr_as_root` reads an xattr under the reactor's ambient
-/// (root) credentials (`sqe.personality = 0`) — the sanctioned privileged-read
+/// (root) credentials (`sqe.personality = 0`) - the sanctioned privileged-read
 /// path for a `trusted.*`/`security.*` attribute a request's own identity
 /// can't see. Here it reads a seeded `user.*` value end to end; the full
 /// privilege boundary (a non-root peer vs. a root-only xattr) isn't reproduced,
-/// since on this root dev host the peer identity is itself root — the point is
+/// since on this root dev host the peer identity is itself root - the point is
 /// exercising the `personality = 0` SQE path end to end.
 #[cfg(feature = "uring-fs")]
 #[test]
@@ -7500,7 +7500,7 @@ fn fs_file_carries_personality_and_as_root() {
                 deferred.close();
                 return;
             };
-            // Read the seeded xattr under ambient root (personality 0) — no
+            // Read the seeded xattr under ambient root (personality 0) - no
             // `who`. On this root host the peer is itself root, so this
             // exercises the `personality = 0` SQE path end to end rather than a
             // privilege boundary.
@@ -7587,10 +7587,10 @@ fn set_user_xattr(path: &Path, name: &[u8], value: &[u8]) -> bool {
 
 /// The rest of the embedded op sweep over the ring: `renameat` (the
 /// `submit_path_op` two-anchor route), `ftruncate` (the `submit_fd_meta`
-/// route), and an `fgetxattr` read — each stamped with the per-connection
+/// route), and an `fgetxattr` read - each stamped with the per-connection
 /// personality, driven from the body handler and resolved through a
-/// `Deferred`. The two version-gated ops (`ftruncate` ≥ 6.9, fixed-file xattr
-/// ≥ 6.13) run only where the server reports support; `renameat` always does.
+/// `Deferred`. The two version-gated ops (`ftruncate` >= 6.9, fixed-file xattr
+/// >= 6.13) run only where the server reports support; `renameat` always does.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_metadata_ops_rename_truncate_xattr() {
@@ -7763,7 +7763,7 @@ fn fs_metadata_ops_rename_truncate_xattr() {
 }
 
 /// The connection-close owned-file sweep. A handler opens a file on every
-/// request and **never closes it** — a deliberate leak. Across many sequential
+/// request and **never closes it** - a deliberate leak. Across many sequential
 /// connections (each opening one file, then dropping), the tiny fs pool would
 /// exhaust after `fs_files` opens if the files were not reclaimed; the sweep
 /// closes each connection's still-open files as it closes, so slots recycle and
@@ -7839,13 +7839,13 @@ fn fs_owned_files_swept_on_connection_close() {
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<Vec<Vec<u8>>> {
         // Sequential connections, each opening one (never-closed) file, then
-        // closing — the sweep must reclaim its slot before the pool exhausts.
+        // closing - the sweep must reclaim its slot before the pool exhausts.
         let mut replies = Vec::with_capacity(N);
         for _ in 0..N {
             let mut s = connect_tcp(v4)?;
             send_framed(&mut s, b"open")?;
             replies.push(recv_framed(&mut s)?);
-            drop(s); // close → triggers the owned-file sweep
+            drop(s); // close -> triggers the owned-file sweep
         }
         stop.shutdown();
         Ok(replies)
@@ -7856,7 +7856,7 @@ fn fs_owned_files_swept_on_connection_close() {
     for (i, r) in replies.iter().enumerate() {
         assert_eq!(
             r, b"opened",
-            "connection {i} opened a file — the sweep must have freed the \
+            "connection {i} opened a file - the sweep must have freed the \
              earlier connections' slots (else the pool exhausts at fs_files)"
         );
     }
@@ -7864,8 +7864,8 @@ fn fs_owned_files_swept_on_connection_close() {
 
 /// A completion callback's facade must **refuse** `open`. That refusal is what
 /// makes the owned-file sweep total: `close_conn` records a closing connection
-/// exactly once, so a file minted by a continuation — which can run after its
-/// connection was already swept — would hold its pool slot until server
+/// exactly once, so a file minted by a continuation - which can run after its
+/// connection was already swept - would hold its pool slot until server
 /// teardown, and a peer aborting mid-chain could exhaust `fs_files` for
 /// everyone.
 ///
@@ -7874,7 +7874,7 @@ fn fs_owned_files_swept_on_connection_close() {
 /// refused, dropping the callback and with it the `Deferred`, so the connection
 /// closes unanswered: the client must see EOF, never `chained`. Flip either
 /// `FsConn::new` call site to `root: true` and the reply appears instead.
-/// Looping well past `fs_files` keeps the sweep honest at the same time — every
+/// Looping well past `fs_files` keeps the sweep honest at the same time - every
 /// connection leaves its first file open.
 #[cfg(feature = "uring-fs")]
 #[test]
@@ -7914,8 +7914,8 @@ fn fs_continuation_cannot_open_a_new_file() {
                 return;
             }
             // Deliberate misuse: a continuation may not mint a new file. The
-            // facade refuses, which drops this closure — and the `Deferred` it
-            // carries — so the connection closes with no reply. (The file the
+            // facade refuses, which drops this closure - and the `Deferred` it
+            // carries - so the connection closes with no reply. (The file the
             // chain already holds is left open on purpose; the sweep owns it.)
             fs.open(who, &a2, &second, how, move |_d, _fs| {
                 deferred.reply(echo_frame(b"chained"));
@@ -7970,7 +7970,7 @@ fn fs_continuation_cannot_open_a_new_file() {
                 String::from_utf8_lossy(b)
             ),
             // A clean close, not a stall: the read must end at EOF/reset, not
-            // time out — a timeout would pass this test for the wrong reason.
+            // time out - a timeout would pass this test for the wrong reason.
             Err(e) => assert!(
                 matches!(
                     e.kind(),
@@ -7984,7 +7984,7 @@ fn fs_continuation_cannot_open_a_new_file() {
     }
 }
 
-/// `true` iff running as root — the broker can only impersonate another uid
+/// `true` iff running as root - the broker can only impersonate another uid
 /// with `CAP_SETUID`.
 #[cfg(feature = "uring-fs")]
 fn is_root() -> bool {
@@ -7995,7 +7995,7 @@ fn is_root() -> bool {
 /// The end-to-end proof that a server acts as *authenticated peers*: the
 /// personality genuinely gates namespace access, it is not a stamp. The
 /// credential broker (spawned on the **server's** ring) registers an
-/// unprivileged uid; the handler then opens a root-owned `0600` file two ways —
+/// unprivileged uid; the handler then opens a root-owned `0600` file two ways --
 /// under the daemon's own personality it opens and reads back, under the peer's
 /// it is refused (`EACCES`, so `done.file()` is `None`). Pure `open` + `pread`,
 /// so it runs live wherever io_uring + root are available (no xattr / 6.13
@@ -8018,7 +8018,7 @@ fn fs_broker_personality_gates_open() {
     if !is_root() {
         return; // the broker cannot become another uid without CAP_SETUID
     }
-    // A uid/gid that owns nothing here — its personality has only what "other"
+    // A uid/gid that owns nothing here - its personality has only what "other"
     // grants, and "other" is nothing on a 0600 file.
     const NOBODY_UID: u32 = 65_534;
     const NOBODY_GID: u32 = 65_534;
@@ -8053,7 +8053,7 @@ fn fs_broker_personality_gates_open() {
         let anchor = anchor.clone();
         let ro = OpenHow::new().flags(OFlag::O_RDONLY);
         // Open the 0600 file as the daemon (`as-root`) or the peer, then, if it
-        // opened, read it back — proving the daemon both opens AND reads while
+        // opened, read it back - proving the daemon both opens AND reads while
         // the peer is refused at open.
         let who = if cmd == b"as-root" {
             root_pers
@@ -8063,7 +8063,7 @@ fn fs_broker_personality_gates_open() {
         let path = CString::new("secret.txt").unwrap();
         fs.open(who, &anchor, &path, ro, move |done, fs| {
             let Some(file) = done.file() else {
-                // EACCES — the personality gated the open.
+                // EACCES - the personality gated the open.
                 deferred.reply(echo_frame(b"denied"));
                 return;
             };
@@ -8106,7 +8106,7 @@ fn fs_broker_personality_gates_open() {
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     // The ring must exist before the broker forks (it inherits the fd), and the
-    // broker must fork before any threads — so build, register, spawn, all
+    // broker must fork before any threads - so build, register, spawn, all
     // before the client thread below.
     let mut server = match Server::with_config([addr], cfg, protocol) {
         Ok(s) => s,
@@ -8148,7 +8148,7 @@ fn fs_broker_personality_gates_open() {
     );
     assert_eq!(
         peer, b"denied",
-        "the unprivileged peer is refused at open — the personality gates DAC"
+        "the unprivileged peer is refused at open - the personality gates DAC"
     );
 }
 
@@ -8188,7 +8188,7 @@ fn fs_as_root_reads_trusted_xattr_across_privilege() {
     let f = dir.path().join("t.txt");
     std::fs::write(&f, b"body").unwrap();
     let cpath = CString::new(f.as_os_str().as_bytes()).unwrap();
-    // World-readable so the unprivileged peer can OPEN it — the boundary under
+    // World-readable so the unprivileged peer can OPEN it - the boundary under
     // test is the xattr `CAP_SYS_ADMIN` check, not DAC on open.
     // SAFETY: valid path; chmod cannot corrupt memory.
     assert_eq!(unsafe { libc::chmod(cpath.as_ptr(), 0o644) }, 0);
@@ -8328,7 +8328,7 @@ fn fs_as_root_reads_trusted_xattr_across_privilege() {
 /// connection closes. A handler opens a FIFO and submits a read that blocks
 /// forever (no writer sends data), then the peer disconnects before the read
 /// completes. Plain-fd files close by `Arc`-drop, but an in-flight op parks the
-/// fd until its CQE — so the connection-teardown sweep (`cancel_owned_by`)
+/// fd until its CQE - so the connection-teardown sweep (`cancel_owned_by`)
 /// cancels the op; it completes `ECANCELED`, the parked `Arc` drops, and the fd
 /// closes without waiting for whole-server teardown. Validates the Arc-model
 /// replacement for the old `close_owned_by`.
@@ -8395,7 +8395,7 @@ fn fs_fd_reclaimed_on_connection_close_midchain() {
                 0,
                 RwFlags::empty(),
                 move |_d, fs| {
-                    fs.close(file); // never reached — the read blocks forever
+                    fs.close(file); // never reached - the read blocks forever
                 },
             );
         });

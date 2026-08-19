@@ -1,7 +1,7 @@
-//! Integration tests for the `http` codec through the **real** reactor —
-//! live loopback TCP, exercising the full ring path (multishot accept →
-//! recv-header → the http framer → recv/scan → delivery → handler →
-//! serialize → send → keep-alive re-arm). The codec's unit tests drive
+//! Integration tests for the `http` codec through the **real** reactor --
+//! live loopback TCP, exercising the full ring path (multishot accept ->
+//! recv-header -> the http framer -> recv/scan -> delivery -> handler ->
+//! serialize -> send -> keep-alive re-arm). The codec's unit tests drive
 //! `frame`/`step` as plain functions; these pin the seams only a socket can
 //! prove: the interim `100 Continue` flushing **before** the body is sent,
 //! farewell responses arriving as bytes before FIN (never a slam), buffer
@@ -9,7 +9,7 @@
 //! handoff a large chunked dance takes.
 //!
 //! Like `test/net_server.rs`, these **skip** (return early) when io_uring is
-//! unavailable — the CI/dev sandbox blocks the io_uring syscalls
+//! unavailable - the CI/dev sandbox blocks the io_uring syscalls
 //! (ENOSYS/EPERM/EACCES), so `cargo test` stays green in a bare sandbox. Set
 //! `TRUENAS_ROS_REQUIRE_IO_URING=1` (as CI on a real kernel does) to turn a
 //! skip into a hard failure so coverage can't silently vanish.
@@ -28,10 +28,10 @@ use truenas_ros::http::{protocol, HttpConfig, HttpRequest, HttpResponse};
 use truenas_ros::net::server::{Incoming, Server, ServerAddr, ShutdownHandle};
 use truenas_ros::{Errno, Error};
 
-/// Errors that mean "io_uring is unavailable here" — an environmental skip.
+/// Errors that mean "io_uring is unavailable here" - an environmental skip.
 ///
 /// Deliberately *excludes* `EINVAL`: for io_uring that means the kernel
-/// rejected our setup arguments — a real bug we want to fail on, not skip.
+/// rejected our setup arguments - a real bug we want to fail on, not skip.
 fn is_unavailable(e: &Error) -> bool {
     matches!(
         e,
@@ -109,14 +109,14 @@ fn echo_handler(mut req: HttpRequest<'_>, _: &mut ()) -> HttpResponse {
     }
 }
 
-/// A canned `'static` reply body — served from a borrowed segment, the path
+/// A canned `'static` reply body - served from a borrowed segment, the path
 /// a real handler's fixed error/health bodies take.
 const CANNED: &str = "a canned static body, sent by reference";
 
 /// A 6 MiB body, sized so a stalled reader forces a short send completion:
-/// above what the kernel will buffer for a peer that isn't reading —
+/// above what the kernel will buffer for a peer that isn't reading --
 /// `tcp_wmem[2]` caps the send buffer at 4 MiB by default, and a stalled
-/// reader's window stays near `tcp_rmem[1]` — and below the server's 8 MiB
+/// reader's window stays near `tcp_rmem[1]` - and below the server's 8 MiB
 /// `max_send_backlog`, so the reply is admissible. Patterned (not constant)
 /// so truncation, reordering, or a send-cursor slip shows up as a byte
 /// mismatch rather than a length that happens to agree.
@@ -127,7 +127,7 @@ fn big_body() -> Vec<u8> {
 /// Bind an http server with the shared [`echo_handler`], run the client
 /// closure against its address on a spawned thread, and serve until the
 /// client stops it. `None` means io_uring is unavailable (the caller
-/// returns — a skip).
+/// returns - a skip).
 fn with_http_server<T: Send + 'static>(
     client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
 ) -> Option<T> {
@@ -158,7 +158,7 @@ fn with_http_server<T: Send + 'static>(
 }
 
 /// Read one response head off the stream, byte-by-byte to its CRLFCRLF (no
-/// over-read — the connection may carry more). Returns `(status, head
+/// over-read - the connection may carry more). Returns `(status, head
 /// text)`; any body is left unread (a HEAD answer has none to read).
 fn read_head<R: Read>(s: &mut R) -> io::Result<(u16, String)> {
     let mut head = Vec::new();
@@ -234,7 +234,7 @@ fn get_keepalive_then_close() {
 
 #[test]
 fn content_length_put_roundtrips() {
-    // A small body (inline delivery) and a 100 KiB body (placed — at the
+    // A small body (inline delivery) and a 100 KiB body (placed - at the
     // default 64 KiB threshold the reactor reads it into its own
     // allocation) both reach the handler intact and echo back.
     let Some(()) = with_http_server(|v4| {
@@ -270,7 +270,7 @@ fn chunked_put_and_trailers() {
         assert!(head.contains("\r\nx-trailers: \r\n"), "no trailers");
         assert_eq!(body, b"foobars");
         // A genuine trailer is surfaced; a forbidden one (Content-Length,
-        // RFC 9110 §6.5.1's framing set) is consumed but never shown.
+        // RFC 9110 sec. 6.5.1's framing set) is consumed but never shown.
         s.write_all(
             b"PUT /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n\
               3\r\nabc\r\n0\r\nContent-Length: 9\r\nx-amz-checksum-crc32: ok==\r\n\r\n",
@@ -291,7 +291,7 @@ fn chunked_put_and_trailers() {
 #[test]
 fn expect_dance_flushes_interim_before_body() {
     // The ordering only a socket can prove: the client sends the head
-    // alone and BLOCKS reading the interim — if the codec didn't flush
+    // alone and BLOCKS reading the interim - if the codec didn't flush
     // `100 Continue` before seeing any body byte, this read would hang
     // (and fail on the 10s timeout). Only then is the body sent.
     let Some(()) = with_http_server(|v4| {
@@ -318,7 +318,7 @@ fn botocore_golden_streaming_put() {
     // on the dev box (boto3 1.37.9): Expect + TE chunked, one HTTP chunk
     // wrapping the aws-chunked entity, checksum trailer *inside* the
     // entity, bare HTTP terminator. The codec de-chunks its own layer only
-    // — the aws-chunked entity must reach the handler untouched, and no
+    // -- the aws-chunked entity must reach the handler untouched, and no
     // HTTP trailers exist.
     let Some(()) = with_http_server(|v4| {
         let mut s = connect_tcp(v4)?;
@@ -361,7 +361,7 @@ fn botocore_golden_streaming_put() {
 
 #[test]
 fn farewells_are_real_responses() {
-    // A failed connection gets a real HTTP response and then a clean FIN —
+    // A failed connection gets a real HTTP response and then a clean FIN --
     // never a bare slam. Each case is its own connection; read_to_end
     // terminates because the server flush-closes.
     let Some(()) = with_http_server(|v4| {
@@ -468,7 +468,7 @@ fn with_parking_server<T: Send + 'static>(
                 }
             }
             ("GET", "/deadline") => {
-                // The worker misses its deadline and answers 503 itself —
+                // The worker misses its deadline and answers 503 itself --
                 // built off-thread, serialized on the server thread.
                 let (deferred, permit) = req.defer();
                 thread::spawn(move || {
@@ -523,7 +523,7 @@ fn with_parking_server<T: Send + 'static>(
 #[test]
 fn park_redrive_completes_in_one_round_trip() {
     // The cold-miss pattern end to end: the first request parks while the
-    // worker warms the cache, then redrives — ONE write, ONE response, no
+    // worker warms the cache, then redrives - ONE write, ONE response, no
     // error leg. The second request takes the warm inline path.
     let Some(()) = with_parking_server(|v4| {
         let mut s = connect_tcp(v4)?;
@@ -564,7 +564,7 @@ fn worker_reply_answers_and_keeps_alive() {
 
 #[test]
 fn dropped_handle_closes_the_parked_connection() {
-    // No response bytes, just a close — the drop path cannot leak the slot
+    // No response bytes, just a close - the drop path cannot leak the slot
     // and must not invent a reply.
     let Some(()) = with_parking_server(|v4| {
         let mut s = connect_tcp(v4)?;
@@ -583,7 +583,7 @@ fn dropped_handle_closes_the_parked_connection() {
 #[test]
 fn pipelined_requests_answer_in_order_across_a_park() {
     // Two pipelined requests where the FIRST parks: the parked one must
-    // answer first — the codec holds the second back for the park's
+    // answer first - the codec holds the second back for the park's
     // duration, so a later request can never be answered around an earlier
     // parked one.
     let Some(()) = with_parking_server(|v4| {
@@ -605,7 +605,7 @@ fn pipelined_requests_answer_in_order_across_a_park() {
 #[test]
 fn head_declared_length_reaches_the_wire_bodiless() {
     // HeadObject's live shape: a 200 HEAD answer declares the paired GET's
-    // Content-Length while sending no body bytes — and the connection stays
+    // Content-Length while sending no body bytes - and the connection stays
     // framed, proven by a follow-up GET answering on the same connection
     // (any stray body byte would land inside the GET's status line).
     let Some(()) = with_http_server(|v4| {
@@ -632,9 +632,9 @@ fn head_declared_length_reaches_the_wire_bodiless() {
 // kernel flushes the whole gather, one full-length CQE), but the kernel TLS
 // sendmsg rejects that flag (`submit_send`, src/net/core/reactor/io.rs), so
 // a bodied kTLS reply is a multi-iovec SENDMSG that blocks on an io-wq
-// worker until the peer drains it — and only `send_timeout`'s linked
+// worker until the peer drains it - and only `send_timeout`'s linked
 // timeout interrupts it, surfacing a partial completion the reactor's
-// re-submit path must carry. Scaffolding shared with `test/net_server.rs` —
+// re-submit path must carry. Scaffolding shared with `test/net_server.rs` --
 // see `test/support/ktls.rs`.
 
 #[path = "support/ktls.rs"]
@@ -651,9 +651,9 @@ use truenas_ros::net::server::{Listen, ServerConfig};
 
 /// [`with_http_server`] over a kTLS listener: the same [`echo_handler`]
 /// behind `Listen::tls`, with the `truenas_ktls` handshake worker minting
-/// the connection state (`AcceptDeferral::ready` is the admission — the
+/// the connection state (`AcceptDeferral::ready` is the admission - the
 /// accept handler does not run for kTLS connections). `None` means io_uring
-/// or kTLS is unavailable here (the caller returns — a skip; a hard failure
+/// or kTLS is unavailable here (the caller returns - a skip; a hard failure
 /// under `TRUENAS_ROS_REQUIRE_KTLS`).
 fn with_ktls_http_server<T: Send + 'static>(
     cfg: ServerConfig,
@@ -699,9 +699,9 @@ fn with_ktls_http_server<T: Send + 'static>(
 }
 
 /// One slow `/big` exchange on a fresh TLS connection: request, then crawl
-/// the first ~1.5 MiB slower than the send can flush it — the kernel
+/// the first ~1.5 MiB slower than the send can flush it - the kernel
 /// absorbs ~4 MiB (`tcp_wmem[2]`) and the rest sits in the blocked send,
-/// so a 500 ms `send_timeout` cancel lands mid-body — then drain. Returns
+/// so a 500 ms `send_timeout` cancel lands mid-body - then drain. Returns
 /// the stream (for follow-up requests) and the body read.
 fn fetch_big_slowly(
     v4: SocketAddrV4,
@@ -742,7 +742,7 @@ fn ktls_vectored_bodies_arrive_intact() {
     //
     // A reclaim (EOF) is retried on a fresh connection: a cancel window in
     // which the blocked send happened to write nothing closes the
-    // connection as SendTimeout even though this client drains throughout —
+    // connection as SendTimeout even though this client drains throughout --
     // rare, timing-dependent, and a server-policy question rather than a
     // data-path defect. A byte mismatch is NEVER retried; corruption fails
     // on the spot.
@@ -848,7 +848,7 @@ fn ktls_farewells_arrive_before_the_close() {
     // A malformed request over TLS still gets the real 400 + Connection:
     // close before the connection dies. The kernel-TLS close is a plain FIN
     // (no close_notify), so after the full farewell the client sees either
-    // EOF or a truncation error — both prove the bytes beat the FIN.
+    // EOF or a truncation error - both prove the bytes beat the FIN.
     let Some(()) = with_ktls_http_server(ServerConfig::default(), |v4| {
         let mut s = tls_connect(v4)?;
         s.write_all(b"NOT HTTP\r\n\r\n")?;

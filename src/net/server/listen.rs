@@ -34,11 +34,11 @@ pub(crate) fn listen_socket(
     // TCP-only options. Everything set on the listener here is inherited by
     // accepted sockets on Linux, which is what makes per-connection behavior
     // (NODELAY, keepalive, user timeout) configurable at all for direct
-    // descriptors — the server never holds an accepted connection as a normal
+    // descriptors - the server never holds an accepted connection as a normal
     // fd it could setsockopt.
     // Force single-stack on every IPv6 listener (as Samba does): otherwise the
     // platform default (`net.ipv6.bindv6only`) may accept v4-mapped peers on a
-    // `::` bind — which would parse as spurious IPv6 addresses — and collide
+    // `::` bind - which would parse as spurious IPv6 addresses - and collide
     // with a separate IPv4 listener on the same port.
     if matches!(addr, ServerAddr::Tcp6(_)) {
         set_opt(&fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 1)?;
@@ -54,7 +54,7 @@ pub(crate) fn listen_socket(
         if let Some(idle) = cfg.keepalive {
             set_opt(&fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
             // TCP_KEEPIDLE is whole seconds and must be >= 1; the config doc
-            // promises fractional durations round UP (2.5s → 3), so probing
+            // promises fractional durations round UP (2.5s -> 3), so probing
             // never starts before the configured idle window.
             let secs =
                 idle.as_secs()

@@ -17,12 +17,12 @@ const MAX_SEND_COALESCE: usize = 1024;
 pub struct ClientConfig {
     /// Maximum concurrent connections (size of the registered-file pool).
     pub pool_size: u32,
-    /// Maximum bytes accepted for one reply (header + body) — a memory guard
+    /// Maximum bytes accepted for one reply (header + body) - a memory guard
     /// that also bounds header scanning. Projects to the engine's request cap.
     pub max_reply_bytes: usize,
     /// Maximum requests in flight per connection before [`send`] returns
     /// `WouldBlock`. `1` (the default) is strict request/reply: one request is
-    /// answered before the next is sent. `N > 1` pipelines — the connection's
+    /// answered before the next is sent. `N > 1` pipelines - the connection's
     /// protocol must then carry ids so replies (delivered in FIFO order) can be
     /// correlated.
     ///
@@ -59,7 +59,7 @@ pub struct ClientConfig {
     /// out.
     ///
     /// This bounds a reply that stalls partway through. It does *not* bound a
-    /// server that accepts the request and then sends nothing at all — until the
+    /// server that accepts the request and then sends nothing at all - until the
     /// first reply byte the read is idle, so that case is bounded by
     /// [`idle_timeout`](Self::idle_timeout). Set both to fully guard against a
     /// hostile server (the same two-phase split the server role uses). A framer
@@ -74,8 +74,8 @@ pub struct ClientConfig {
     pub send_timeout: Option<Duration>,
     /// If set, close a connection left idle for longer than this, reclaiming its
     /// slot. "Idle" includes a connection awaiting a reply whose first byte has
-    /// not arrived, so this — not [`response_timeout`](Self::response_timeout),
-    /// which bounds an *in-progress* reply — is what bounds a server that
+    /// not arrived, so this - not [`response_timeout`](Self::response_timeout),
+    /// which bounds an *in-progress* reply - is what bounds a server that
     /// accepts a request and then goes silent. `None` (the default) keeps idle
     /// connections open.
     pub idle_timeout: Option<Duration>,
@@ -84,7 +84,7 @@ pub struct ClientConfig {
     /// if the worker does not call back within this duration. `None` (the default)
     /// never times a handshake out.
     pub tls_handshake_timeout: Option<Duration>,
-    /// Whether the server may send unsolicited PDUs (pushes) — a reply arriving
+    /// Whether the server may send unsolicited PDUs (pushes) - a reply arriving
     /// with no request awaiting it. `false` (the default) treats one as a
     /// protocol violation and closes the connection; `true` surfaces it as an
     /// [`Event::Reply`](super::Event::Reply) with

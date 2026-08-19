@@ -1,7 +1,7 @@
 //! Connection teardown: close reasons, the SHUTDOWN-then-CLOSE FIN forcing,
 //! op-count draining so the kernel never touches freed buffers, and slot
 //! release. Beyond the close hook (a boxed dyn on the reactor), no user code
-//! runs here — so it is fully core.
+//! runs here - so it is fully core.
 
 use super::Reactor;
 use crate::errno::{self, Errno};
@@ -33,7 +33,7 @@ impl<U> Reactor<U> {
             // Record it for the fs owned-file sweep (drained after the reap
             // loop): a handler may have opened files on the shared ring under
             // this connection and never closed them. Only when this reactor has
-            // an fs pool to sweep — a client (or a pool-less server) drains
+            // an fs pool to sweep - a client (or a pool-less server) drains
             // nothing, so recording would grow the Vec unbounded. `fs_closed`
             // is a field disjoint from `self.table` (which `conn` holds).
             #[cfg(all(feature = "net-server", feature = "uring-fs"))]
@@ -41,7 +41,7 @@ impl<U> Reactor<U> {
                 self.fs_closed.push((slot, gen64));
             }
             // Stash the reason for the client's `Event::Closed` (emitted when
-            // the slot is reclaimed). Client-only — the server reports closes
+            // the slot is reclaimed). Client-only - the server reports closes
             // through its hook below and never reads this back.
             #[cfg(feature = "net-client")]
             {
@@ -55,7 +55,7 @@ impl<U> Reactor<U> {
             }
         }
         // Retire the kTLS-splice inactivity watchdog if one is armed: it is not
-        // an `ops`-counted op, so nothing else reaps it — an uncancelled timer
+        // an `ops`-counted op, so nothing else reaps it - an uncancelled timer
         // would keep `inflight` up (delaying an idle `serve_forever`'s exit)
         // until it expired. A no-op when none is armed.
         self.cancel_splice_deadline(slot, generation)?;
@@ -73,7 +73,7 @@ impl<U> Reactor<U> {
         // send racing the idle recv) pins the fixed descriptor's kernel rsrc
         // node. CLOSE frees the table slot and bitmap bit at issue and biases
         // the allocator to hand that index to the next accept, yet the pinned
-        // node keeps the old socket — and its recv buffer — alive under the
+        // node keeps the old socket - and its recv buffer - alive under the
         // surviving op. That accept can then reuse the index while our slot is
         // still `Serving` (freed only at `ops == 0`), and `accept_connection`
         // would overwrite the live connection: a use-after-free of the recv
@@ -91,11 +91,11 @@ impl<U> Reactor<U> {
             conn.teardown_deferred = true;
             conn.teardown_shutdown_first = shutdown_first;
             // One fd-keyed cancel catches an in-flight recv, send, and/or splice
-            // readiness poll — all ride the socket slot. The SPLICE itself does
+            // readiness poll - all ride the socket slot. The SPLICE itself does
             // NOT: its SQE `fd` is the consumer pipe, so it is unreachable by the
             // fd cancel and must be cancelled by its own `user_data`. Whichever
             // ops were live each drive `op_done`, which submits the deferred
-            // teardown once the last drains — keeping CLOSE the last op.
+            // teardown once the last drains - keeping CLOSE the last op.
             if recving || sending || splice_polling {
                 self.submit_cancel(slot, generation)?;
             }
@@ -112,7 +112,7 @@ impl<U> Reactor<U> {
     /// and/or send) so a deferred teardown can run once they reap. One
     /// `ASYNC_CANCEL` keyed on the fixed fd catches both regardless of opcode;
     /// a linked idle/request timeout is cancelled along with its recv. The
-    /// cancel is a control op — it is not counted in `conn.ops`, and its own
+    /// cancel is a control op - it is not counted in `conn.ops`, and its own
     /// completion is ignored; the cancelled recv/send drive `op_done`, which
     /// submits the teardown once the last of them drains.
     fn submit_cancel(
@@ -129,9 +129,9 @@ impl<U> Reactor<U> {
         })
     }
 
-    /// Cancel an in-flight body splice by its `user_data`. Unlike a recv/send —
+    /// Cancel an in-flight body splice by its `user_data`. Unlike a recv/send --
     /// both keyed on the socket slot, so `submit_cancel`'s fd cancel reaps them
-    /// — a splice's SQE `fd` is the consumer pipe, so only a `user_data` match
+    /// -- a splice's SQE `fd` is the consumer pipe, so only a `user_data` match
     /// reaches it: cancel-by-user_data (no `CANCEL_FD` flag) with `sqe.addr`
     /// set to the splice's token. Like `submit_cancel` it is an uncounted
     /// control op; the splice's own `-ECANCELED` completion drives `op_done`,
@@ -192,7 +192,7 @@ impl<U> Reactor<U> {
             }
             // SECURITY: a non-idle exact read (body / `Need` remainder) is the
             // only recv that carries the request clock, so an ECANCELED there
-            // is it firing — the slow-loris reclaim (see `request_timeout`).
+            // is it firing - the slow-loris reclaim (see `request_timeout`).
             if !was_idle && self.cfg.request_timeout.is_some() {
                 return CloseReason::RequestTimeout;
             }
@@ -222,7 +222,7 @@ impl<U> Reactor<U> {
     ///
     /// `shutdown_first` inserts a `SHUTDOWN` before the `CLOSE`. A bare CLOSE
     /// of a direct (pool) descriptor only drops the ring's file-table
-    /// reference; the socket's final `fput` — which sends the peer's FIN — can
+    /// reference; the socket's final `fput` - which sends the peer's FIN - can
     /// be deferred while another connection's in-flight op pins the ring's
     /// resource node, so a server-initiated close of a *still-connected* peer
     /// (reject, idle/send timeout, eviction, handler close) could leave it
@@ -239,8 +239,8 @@ impl<U> Reactor<U> {
         shutdown_first: bool,
     ) -> errno::Result<()> {
         // Count the teardown as one op on the connection (if it has one), so
-        // the slot is freed only after it — and any recv/send still in flight
-        // — have reaped. When it is SHUTDOWN then CLOSE, one count still covers
+        // the slot is freed only after it - and any recv/send still in flight
+        // -- have reaped. When it is SHUTDOWN then CLOSE, one count still covers
         // both: `on_shutdown` submits the CLOSE without re-counting, and
         // `on_closed` does the single decrement.
         if let Some(conn) = self.table.get_conn_mut(slot) {
@@ -259,7 +259,7 @@ impl<U> Reactor<U> {
     }
 
     /// Stage the `CLOSE` that reclaims a direct descriptor (and, once it
-    /// reaps, the slot). Does not touch `ops` — the teardown is counted in
+    /// reaps, the slot). Does not touch `ops` - the teardown is counted in
     /// `submit_teardown`.
     fn submit_close(
         &mut self,
@@ -273,7 +273,7 @@ impl<U> Reactor<U> {
         })
     }
 
-    /// A pre-close `SHUTDOWN` completed. Its result is irrelevant — a peer
+    /// A pre-close `SHUTDOWN` completed. Its result is irrelevant - a peer
     /// that vanished mid-flight yields `-ENOTCONN`, which is fine; any owed FIN
     /// is out. Submit the CLOSE. The slot cannot recycle between the two ops
     /// (release happens only in `on_closed`), so no generation recheck.
@@ -302,7 +302,7 @@ impl<U> Reactor<U> {
     }
 
     /// Account one completed recv/send op. Returns `true` if the connection is
-    /// still active (keep processing), `false` if it is being torn down — in
+    /// still active (keep processing), `false` if it is being torn down - in
     /// which case, if this was its last op, the slot is freed here.
     pub(crate) fn op_done(&mut self, slot: u32) -> errno::Result<bool> {
         let (closing, teardown_ready, empty) = {
@@ -312,7 +312,7 @@ impl<U> Reactor<U> {
                 conn.closing,
                 // The last recv/send/splice/readiness-poll cancelled by a
                 // deferred close just reaped (the splice is cancelled by
-                // user_data, the rest by the fd — see `close_conn`).
+                // user_data, the rest by the fd - see `close_conn`).
                 conn.teardown_deferred
                     && !conn.recving
                     && !conn.sending
@@ -328,7 +328,7 @@ impl<U> Reactor<U> {
         // deferred its teardown; submit it now that they have drained, so the
         // index-freeing CLOSE is the connection's last op (see `close_conn`).
         // Check this before `empty`: the drained sibling leaves `ops == 0`, but
-        // the slot must not be reclaimed — the teardown re-counts it.
+        // the slot must not be reclaimed - the teardown re-counts it.
         if teardown_ready {
             self.submit_deferred_teardown(slot)?;
             return Ok(false);
@@ -342,7 +342,7 @@ impl<U> Reactor<U> {
     /// Free a fully-reaped slot, run the drain-quiescence check, and flag the
     /// role loop to re-arm any listener parked on a full pool (the pool now has
     /// a free slot). The re-arm itself is a role concern (it touches the
-    /// listeners) — the loop drains `pool_freed` after dispatch and never while
+    /// listeners) - the loop drains `pool_freed` after dispatch and never while
     /// tearing down, so the flag being set during `cancel_and_reap_all` is inert.
     fn reclaim_slot(&mut self, slot: u32) -> errno::Result<()> {
         self.free_slot(slot);

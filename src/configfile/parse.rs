@@ -19,7 +19,7 @@ type Acc = Option<Vec<String>>;
 /// Whitespace as CPython counts it, which is not what Rust counts.
 ///
 /// `str.strip()`, `str.isspace()` and `re`'s `\s` all go through
-/// `Py_UNICODE_ISSPACE`, which includes U+001C..U+001F — the file, group,
+/// `Py_UNICODE_ISSPACE`, which includes U+001C..U+001F - the file, group,
 /// record and unit separators. Unicode's `White_Space` property, which
 /// `char::is_whitespace` implements, does not. Compared across every code
 /// point those four are the *only* disagreement in either direction, so
@@ -46,9 +46,9 @@ fn py_rstrip(s: &str) -> &str {
 /// Why this loop would not read `key` back as the name it was given, or
 /// `None` if it round-trips. Each arm names its own reason.
 ///
-/// Keys are written verbatim — by [`super::write`], and by CPython's
+/// Keys are written verbatim - by [`super::write`], and by CPython's
 /// `_write_section` (`Lib/configparser.py:961`), which re-indents a newline
-/// in the *value* and does nothing to the key — so a name carrying this
+/// in the *value* and does nothing to the key - so a name carrying this
 /// loop's syntax parses back as something else.
 ///
 /// Screened at [`super::ConfigFile::set`] rather than at write time, since
@@ -135,8 +135,8 @@ pub(super) fn read(
     text: &str,
 ) -> Result<()> {
     let allow_no_value = cfg.allow_no_value;
-    // The working state lives in a guard: on every exit — the error returns
-    // included — a scrubbed configuration's accumulated keys and values are
+    // The working state lives in a guard: on every exit - the error returns
+    // included - a scrubbed configuration's accumulated keys and values are
     // burned rather than dropped.
     let mut work = Work {
         default: Ordered::new(),
@@ -248,7 +248,7 @@ pub(super) fn read(
         if work.dups.contains(&dup_key) {
             // The key is withheld from a scrubbed configuration's error: in
             // a credentials file it is an identifier that must not reach a
-            // log. Both copies of it — the line's and the lookup tuple's —
+            // log. Both copies of it - the line's and the lookup tuple's --
             // are burned.
             let msg = if cfg.scrub {
                 format!("{source}:{lineno}: duplicate option")
@@ -339,7 +339,7 @@ fn parse_option(
 }
 
 /// The parse's working state. A guard: when a scrubbed configuration's
-/// read exits — the error paths included — whatever accumulated here is
+/// read exits - the error paths included - whatever accumulated here is
 /// burned rather than dropped. [`merge`] empties it on success, so the
 /// burn then covers only what merging left behind.
 struct Work {
@@ -403,8 +403,8 @@ fn join(acc: Acc, scrub: bool) -> Option<String> {
 ///
 /// Existing `cfg` sections/keys keep their position and are overridden in
 /// place; new ones are appended in first-appearance order. Under scrub,
-/// every working copy consumed here — accumulator lines, key copies, a
-/// displaced earlier value — is burned as it is released.
+/// every working copy consumed here - accumulator lines, key copies, a
+/// displaced earlier value - is burned as it is released.
 fn merge(cfg: &mut ConfigFile, work: &mut Work) {
     let scrub = work.scrub;
     let mut default = std::mem::take(&mut work.default);

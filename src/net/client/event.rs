@@ -16,7 +16,7 @@ const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
 /// generation, so a handle retained past the connection's close never aliases a
 /// later connection recycled into the same slot.
 ///
-/// Packed into a `u64` — the slot in the low 24 bits (identical to the kernel
+/// Packed into a `u64` - the slot in the low 24 bits (identical to the kernel
 /// routing codec) and the generation above it. The generation is the
 /// full loop-side counter (used for the `slot_matches` liveness check); a
 /// client runs on one thread and never approaches 2^40 recycles on a single
@@ -44,7 +44,7 @@ pub struct RequestId(pub(super) u64);
 
 impl RequestId {
     /// The id reported for a reply that arrived with no request awaiting it on
-    /// its connection — an unsolicited server push (only expected when
+    /// its connection - an unsolicited server push (only expected when
     /// [`ClientConfig::expect_server_push`](super::ClientConfig::expect_server_push)
     /// is set).
     pub const UNSOLICITED: RequestId = RequestId(u64::MAX);
@@ -53,7 +53,7 @@ impl RequestId {
 /// A completion the caller drains from [`next_event`](super::Client::next_event).
 ///
 /// `#[non_exhaustive]`: further variants (e.g. a spliced-body notification)
-/// slot in without a breaking change — destructure with `..`.
+/// slot in without a breaking change - destructure with `..`.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Event {
@@ -63,7 +63,7 @@ pub enum Event {
         /// The connection that came up.
         conn: ConnId,
     },
-    /// An outbound connect failed (refused, timed out, unreachable, …); its
+    /// An outbound connect failed (refused, timed out, unreachable, ...); its
     /// slot has been reclaimed and the [`ConnId`] is now stale.
     ConnectFailed {
         /// The connection that failed to come up.
@@ -86,7 +86,7 @@ pub enum Event {
     },
     /// A framed reply whose **body** was spliced straight to the caller's sink
     /// fd (a framer returned [`Framing`](crate::net::Framing)`::SpliceBody`)
-    /// instead of read into a buffer — zero-copy. The body never enters an
+    /// instead of read into a buffer - zero-copy. The body never enters an
     /// event; it already went to the sink fd (a blocking pipe write end the
     /// caller stashed in `U`). `header` is the buffered header bytes and
     /// `body_len` the number of bytes moved to the sink.

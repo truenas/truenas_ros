@@ -4,7 +4,7 @@
 //! 32..64 = the low 32 bits of the slot's generation. The codec is one
 //! mechanism with domain-owned tag vocabularies on top: the stream stack
 //! (`net`) assigns its `Op` tags inside `0x00..=0x7F`, and the fs domain owns
-//! `0x80..=0xFF` ([`TAG_FS_DOMAIN`]) — so a loop hosting both routes a
+//! `0x80..=0xFF` ([`TAG_FS_DOMAIN`]) - so a loop hosting both routes a
 //! completion to its domain with a single bit test, before either domain
 //! decodes the tag any further. Each domain hand-writes its own dispatch
 //! `match` over its tags; nothing here interprets them.
@@ -15,7 +15,7 @@ pub(crate) const SLOT_MASK: u64 = 0x00ff_ffff;
 /// The tag-byte bit that marks a completion as belonging to the fs domain.
 /// Stream tags stay below it; a host loop tests `user_data as u8 &
 /// TAG_FS_DOMAIN` before its stream `match` (whose unknown-tag arm silently
-/// ignores — it must never swallow another domain's completions).
+/// ignores - it must never swallow another domain's completions).
 pub(crate) const TAG_FS_DOMAIN: u8 = 0x80;
 
 /// Encode `(tag, slot, generation-low)` into an SQE `user_data` token.

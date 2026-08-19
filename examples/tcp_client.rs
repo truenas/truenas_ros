@@ -7,7 +7,7 @@
 //! entirely in one process:
 //!
 //!  1. an echo `net::server` is bound on an ephemeral loopback port and run on
-//!     its own thread — both roles are `!Send` (one ring each), so they cannot
+//!     its own thread - both roles are `!Send` (one ring each), so they cannot
 //!     share a thread; it hands its resolved address and a `ShutdownHandle`
 //!     (both `Send`) back through a channel;
 //!  2. the client opens several connections at once with `connect_start`
@@ -21,7 +21,7 @@
 //! Run (loopback only):
 //!   cargo run --example tcp_client --features net-server,net-client
 //!
-//! It prints the echoes and exits 0 — no external server or client needed.
+//! It prints the echoes and exits 0 - no external server or client needed.
 
 use std::collections::HashMap;
 use std::io;
@@ -36,7 +36,7 @@ use truenas_ros::net::server::{
 };
 
 /// Frame a payload with a 4-byte big-endian length prefix (not counting
-/// itself) — the wire format both roles share here.
+/// itself) - the wire format both roles share here.
 fn frame(payload: &[u8]) -> Vec<u8> {
     let mut pdu = (payload.len() as u32).to_be_bytes().to_vec();
     pdu.extend_from_slice(payload);
@@ -95,7 +95,7 @@ fn main() -> io::Result<()> {
     // `connect_start` is non-blocking: it returns a ConnId immediately and the
     // connection comes up later as an `Event::Connected`. Firing several before
     // pumping drives them all up on the one ring. Label each so the output is
-    // readable ("conn #0", …) rather than an opaque handle.
+    // readable ("conn #0", ...) rather than an opaque handle.
     const CONNS: usize = 3;
     let mut label: HashMap<ConnId, usize> = HashMap::new();
     for i in 0..CONNS {

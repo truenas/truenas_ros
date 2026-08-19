@@ -75,7 +75,7 @@ pub fn fgetacl<Fd: AsFd>(fd: Fd) -> Result<Acl> {
         Ok(bytes) => Ok(Acl::Nfs4(Nfs4Acl::from_xattr(&bytes)?)),
         // Present but empty (NFS4 filesystem, no ACL set).
         Err(Errno::ENODATA) => Ok(Acl::Nfs4(Nfs4Acl::from_xattr(&[])?)),
-        // Not an NFS4 filesystem — try POSIX.
+        // Not an NFS4 filesystem - try POSIX.
         Err(Errno::EOPNOTSUPP) => fgetacl_posix(fd),
         Err(e) => Err(e.into()),
     }
@@ -173,7 +173,7 @@ fn fremoveacl(fd: BorrowedFd<'_>) -> Result<()> {
     // Probe for the NFS4 xattr to decide the filesystem's ACL type.
     match fgetxattr(fd, nfs4::NFS4_ACL_XATTR) {
         Ok(_) => ignore_enodata(fremovexattr(fd, nfs4::NFS4_ACL_XATTR)),
-        // NFS4 filesystem, no ACL present — nothing to remove.
+        // NFS4 filesystem, no ACL present - nothing to remove.
         Err(Errno::ENODATA) => Ok(()),
         Err(Errno::EOPNOTSUPP) => {
             // POSIX filesystem: remove access then default (ENODATA ignored).

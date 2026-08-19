@@ -1,4 +1,4 @@
-//! `fstatfs(2)` — filesystem-wide space and limits, by descriptor.
+//! `fstatfs(2)` - filesystem-wide space and limits, by descriptor.
 //!
 //! Deliberately fd-only. There is no path-taking form here: this module's
 //! callers already hold a descriptor for the thing they are asking about, and
@@ -6,8 +6,8 @@
 //! [`crate::sync_fs`] surface has otherwise avoided.
 //!
 //! [`statx`](super::statx) cannot answer this. Its fields are per-inode by
-//! construction — `stx_blocks` is the blocks allocated to *that file*, and
-//! `stx_blksize` its preferred I/O size — and no `STATX_*` request bit asks
+//! construction - `stx_blocks` is the blocks allocated to *that file*, and
+//! `stx_blksize` its preferred I/O size - and no `STATX_*` request bit asks
 //! about the filesystem. The two answer different scopes.
 
 use crate::errno::{self, retry_on_eintr};
@@ -18,7 +18,7 @@ use std::os::fd::{AsFd, AsRawFd};
 ///
 /// Block counts are in units of [`block_size`](Self::block_size), which on ZFS
 /// is the dataset's `recordsize` (`zfsvfs->z_max_blksz`, `zfs_statvfs` in
-/// `module/os/linux/zfs/zfs_vfsops.c`) — **not** a fixed 4096. Take the unit
+/// `module/os/linux/zfs/zfs_vfsops.c`) - **not** a fixed 4096. Take the unit
 /// from this struct rather than assuming one, or the byte figures are wrong by
 /// whatever factor the dataset was tuned to.
 #[derive(Clone, Copy, Debug)]
@@ -95,8 +95,8 @@ impl Statfs {
 
 /// Filesystem statistics for the mount `fd` lives on.
 ///
-/// `fd` may be an `O_PATH` descriptor — including an
-/// `Anchor` — because the kernel resolves
+/// `fd` may be an `O_PATH` descriptor - including an
+/// `Anchor` - because the kernel resolves
 /// through `f_path` and never consults `f_op` (`fd_statfs`, `fs/statfs.c`).
 /// That is not true of every fd-taking call here: `fsync` and the ZFS
 /// attribute ioctls both need a descriptor opened for real I/O.

@@ -1,6 +1,6 @@
 //! The cross-thread contract: every handle that lets other threads talk to
-//! the single-threaded server loop — deferred replies, pushes, the kTLS
-//! handshake hand-back, shutdown, stats — plus the wake eventfd and routing
+//! the single-threaded server loop - deferred replies, pushes, the kTLS
+//! handshake hand-back, shutdown, stats - plus the wake eventfd and routing
 //! tokens they ride on. Every hand-off is a queue send + an eventfd poke.
 
 #[cfg(doc)]
@@ -22,7 +22,7 @@ use std::time::Duration;
 /// Only obtainable from [`Responder::defer`], and stamped with that request's
 /// routing token: returning [`Response::Defer`]`(permit)` guarantees a
 /// [`Deferred`] exists whose reply, explicit close, or drop will eventually
-/// resolve the parked request. The token is verified at delivery — a permit
+/// resolve the parked request. The token is verified at delivery - a permit
 /// stashed from an earlier request and returned for a different one proves
 /// no such `Deferred` exists, so the server closes the connection (reported
 /// as [`CloseReason::HandlerClosed`]) rather than park a request nothing
@@ -51,9 +51,9 @@ pub struct DetachPermit {
 ///
 /// On the synchronous path, ignore it and return [`Response::Reply`]. To offload
 /// the work, call [`Responder::defer`] to detach an owned, `Send` [`Deferred`],
-/// move it into your worker (thread pool, async runtime, …), and return
+/// move it into your worker (thread pool, async runtime, ...), and return
 /// [`Response::Defer`] with the accompanying [`DeferPermit`]. The library provides
-/// no worker pool — that is the consumer's choice; it provides only the safe
+/// no worker pool - that is the consumer's choice; it provides only the safe
 /// hand-back path.
 pub struct Responder {
     pub(super) token: Token,
@@ -81,7 +81,7 @@ impl Responder {
 
     /// A long-lived, `Clone + Send + Sync` handle for **pushing** unsolicited
     /// PDUs to this connection later (server-initiated messages: notifications,
-    /// pub/sub events, SMB-style breaks). Independent of this request — stash it
+    /// pub/sub events, SMB-style breaks). Independent of this request - stash it
     /// in shared state and use it from any thread for the connection's
     /// lifetime; pushes to a connection that has closed are dropped safely.
     pub fn push_handle(&self) -> PushHandle {
@@ -115,10 +115,10 @@ impl std::fmt::Debug for Responder {
 
 #[cfg(test)]
 impl Responder {
-    /// A live responder backed by a throwaway channel and wake — for unit
+    /// A live responder backed by a throwaway channel and wake - for unit
     /// tests that drive protocol glue (the http `step`) without a reactor.
     /// The receiver is dropped, so outcomes sent through handles minted
-    /// from this responder vanish silently — the injection channel's
+    /// from this responder vanish silently - the injection channel's
     /// behavior is the net layer's own tests' business, not the glue's.
     pub(crate) fn test_responder() -> Responder {
         Self::test_wired().0
@@ -165,7 +165,7 @@ pub(crate) struct RedeliverProbe {
 #[cfg(all(test, loom))]
 impl RedeliverProbe {
     /// Consume the worker's outcome the way the loop does: block on the
-    /// wake (the armed `READ`), then take the queued injection — asserting
+    /// wake (the armed `READ`), then take the queued injection - asserting
     /// it is the redelivery the http completion pass runs on.
     pub(crate) fn recv_redeliver(&self) {
         self.shared.wake.drain();
@@ -180,14 +180,14 @@ impl RedeliverProbe {
 ///
 /// Obtained from [`Responder::defer`]. Call [`Deferred::reply`] exactly once
 /// with the reply PDU (an **empty** reply completes the request without sending
-/// anything — the one-way case; [`Deferred::reply_close`] sends a final PDU
+/// anything - the one-way case; [`Deferred::reply_close`] sends a final PDU
 /// and then closes; [`Deferred::close`] closes the connection; dropping
 /// without any of these closes it too, so a lost worker can't leak a parked
 /// connection). The reply is queued and the server loop woken; it is sent on
 /// the originating connection **iff that connection is still open and this
 /// request is still awaiting its reply**. A reply for a request that was
 /// already answered, or whose connection closed (or pool slot was recycled)
-/// while the worker ran, is dropped safely — which is exactly why the ticket is
+/// while the worker ran, is dropped safely - which is exactly why the ticket is
 /// a slot+generation+request token, not a pointer into the connection.
 #[must_use = "dropping a Deferred without replying closes the connection"]
 pub struct Deferred {
@@ -213,8 +213,8 @@ impl Deferred {
         self.shared.wake.poke();
     }
 
-    /// Deliver the reply and then close the connection once it — and
-    /// everything queued before it — has flushed: the deferred twin of
+    /// Deliver the reply and then close the connection once it - and
+    /// everything queued before it - has flushed: the deferred twin of
     /// [`Response::ReplyClose`] (the worker speaks last). An empty reply
     /// queues no PDU and closes after flushing what is already queued. The
     /// close hook reports [`CloseReason::WorkerClosed`], as for
@@ -234,7 +234,7 @@ impl Deferred {
     }
 
     /// Re-deliver this request to the body handler instead of supplying bytes
-    /// — for protocol glue that retained the request in its connection state
+    /// -- for protocol glue that retained the request in its connection state
     /// (`&mut U`) and completes it on the server thread, where the state and
     /// the serialization context live. The handler runs again with an empty
     /// frame (the original bytes were consumed at first delivery), counted as
@@ -263,7 +263,7 @@ impl Drop for Deferred {
 /// The ticket a **detach** worker uses to hand a connection back to the server
 /// after its blocking operation on the furnished fd.
 ///
-/// Furnished — owning a real socket fd aliasing the pool socket — to the
+/// Furnished - owning a real socket fd aliasing the pool socket - to the
 /// [`Server::set_detach_handler`] handler for one detached connection. Move it
 /// to your own worker, do the blocking work on [`Detached::raw_fd`] (e.g.
 /// `lzc_send`/`lzc_receive`), then call [`Detached::resume`] to re-arm serving
@@ -294,11 +294,11 @@ impl Detached {
     ///
     /// The furnished fd **shares the pool socket's file description**, so any
     /// file-status flag the worker changed on it outlives the detach. The one
-    /// that matters is `O_NONBLOCK` — a worker doing a blocking transfer
+    /// that matters is `O_NONBLOCK` - a worker doing a blocking transfer
     /// typically clears it, and a resumed connection whose socket went
-    /// blocking would defeat the splice path's `-EAGAIN` → readiness-poll
+    /// blocking would defeat the splice path's `-EAGAIN` -> readiness-poll
     /// slow-loris guard (`tcp_splice_read` takes its wait mode from the
-    /// file's `O_NONBLOCK`) — so `resume` restores `O_NONBLOCK` itself before
+    /// file's `O_NONBLOCK`) - so `resume` restores `O_NONBLOCK` itself before
     /// handing the connection back. Recv/send are unaffected either way
     /// (io_uring passes `MSG_DONTWAIT` per op).
     pub fn resume(mut self) {
@@ -349,7 +349,7 @@ impl Detached {
 impl Drop for Detached {
     fn drop(&mut self) {
         if !self.done {
-            self.signal(false); // lost worker → close the parked connection
+            self.signal(false); // lost worker -> close the parked connection
         }
     }
 }
@@ -373,7 +373,7 @@ impl std::fmt::Debug for Deferred {
 /// connection, obtained from [`Responder::push_handle`].
 ///
 /// A push is a complete, caller-framed PDU queued behind any pending replies
-/// (FIFO, one `MSG_WAITALL` send at a time — pushes never interleave with
+/// (FIFO, one `MSG_WAITALL` send at a time - pushes never interleave with
 /// replies mid-PDU). Fire-and-forget: a push to a connection that has closed
 /// (or was recycled) is dropped, and a push that would overflow
 /// `ServerConfig::max_send_backlog` closes the connection as a slow consumer.
@@ -397,7 +397,7 @@ impl PushHandle {
     /// Backpressure note: pushes cross to the loop on an **unbounded** internal
     /// channel, drained on each wake. `ServerConfig::max_send_backlog` bounds
     /// the bytes queued *on a connection* (evicting a slow reader), but not this
-    /// channel — a producer that sustainedly pushes faster than the single loop
+    /// channel - a producer that sustainedly pushes faster than the single loop
     /// thread drains grows memory without limit. Deferred replies are self-
     /// limiting (at most `max_in_flight_requests` outstanding per connection);
     /// only pushes are open-ended, so pace them to the loop or gate them behind
@@ -414,10 +414,10 @@ impl PushHandle {
         self.shared.wake.poke();
     }
 
-    /// Close this connection, from any thread, outside any request cycle —
+    /// Close this connection, from any thread, outside any request cycle --
     /// session revocation, an administrative kick, a cross-connection
     /// takeover (an SMB `PreviousSessionId`-style teardown). Everything
-    /// already queued — including pushes issued before this call — flushes
+    /// already queued - including pushes issued before this call - flushes
     /// first (whole-PDU FIFO, bounded by `ServerConfig::send_timeout` when
     /// set); nothing further is read, delivered, or queued after it. The
     /// close hook reports [`CloseReason::PushClosed`].
@@ -425,8 +425,8 @@ impl PushHandle {
     /// Fire-and-forget like [`PushHandle::push`]: closing a connection that
     /// has already closed (or whose slot was recycled) is a no-op, as are
     /// repeat calls. On a connection parked under a detach worker the close
-    /// lands at [`Detached::resume`] — after the pushes held during the
-    /// window — since the worker owns the raw stream mid-detach
+    /// lands at [`Detached::resume`] - after the pushes held during the
+    /// window - since the worker owns the raw stream mid-detach
     /// ([`Detached::close`] is the worker's own path).
     pub fn close(&self) {
         let _ = self.tx.send(Injected::PushClose {
@@ -488,7 +488,7 @@ pub struct ServerStats {
     /// Pushed PDUs fully sent.
     pub pushes: u64,
     /// Send operations completed. With reply coalescing one op can carry
-    /// several PDUs, so this is ≤ `replies + pushes`.
+    /// several PDUs, so this is <= `replies + pushes`.
     pub send_ops: u64,
     /// Receive operations that completed with data (header and body reads).
     pub recv_ops: u64,
@@ -542,19 +542,19 @@ pub(super) enum Injected {
     /// [`Deferred`]).
     Close(Token),
     /// Run the body handler again for this request ([`Deferred::redeliver`])
-    /// — the frame is empty; the consumer's protocol glue retained what it
+    /// -- the frame is empty; the consumer's protocol glue retained what it
     /// needs in its connection state.
     Redeliver(Token),
-    /// An unsolicited push ([`PushHandle::push`]) — not tied to any request.
+    /// An unsolicited push ([`PushHandle::push`]) - not tied to any request.
     Push {
         slot: u32,
         generation: u64,
         bytes: Vec<u8>,
     },
     /// Close the connection once everything already queued on it has flushed
-    /// ([`PushHandle::close`]) — not tied to any request.
+    /// ([`PushHandle::close`]) - not tied to any request.
     PushClose { slot: u32, generation: u64 },
-    /// A detached connection's worker signalled **resume** — re-arm serving.
+    /// A detached connection's worker signalled **resume** - re-arm serving.
     DetachResume { slot: u32, generation: u64 },
     /// A detached connection's worker signalled **close** (or dropped its
     /// [`Detached`] handle unresolved).
@@ -582,8 +582,8 @@ impl ShutdownHandle {
     }
 
     /// Stop the server **gracefully**: accepting stops and idle connections
-    /// close immediately, but requests already in flight — reads in progress,
-    /// work deferred to workers, and queued replies — are allowed to finish
+    /// close immediately, but requests already in flight - reads in progress,
+    /// work deferred to workers, and queued replies - are allowed to finish
     /// (each connection closes as it quiesces; keep-alive does not admit new
     /// requests). If the drain has not completed within `grace`, whatever
     /// remains is cancelled as in [`ShutdownHandle::shutdown`]. A zero `grace`

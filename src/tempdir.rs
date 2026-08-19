@@ -1,4 +1,4 @@
-//! `mkdtemp(3)` — a scratch directory, removed when its handle drops.
+//! `mkdtemp(3)` - a scratch directory, removed when its handle drops.
 
 use crate::errno::{self, Errno};
 use std::ffi::OsString;
@@ -58,7 +58,7 @@ mod tests {
     use super::*;
 
     /// The directory must exist, be a directory, and carry mkdtemp's
-    /// 0700 — scratch readable by other users would leak test content.
+    /// 0700 - scratch readable by other users would leak test content.
     #[test]
     fn creates_a_private_directory() {
         use std::os::unix::fs::PermissionsExt;
