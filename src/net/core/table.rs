@@ -446,39 +446,30 @@ impl<U> ConnTable<U> {
         e.state = SlotState::Detaching(conn);
     }
 
-    /// Move a `Detaching` slot to `Detached` without taking the connection out,
-    /// so the detach handler can be run against the parked slot rather than
-    /// across an `Empty` one. Returns whether the slot was `Detaching` (a stale
-    /// completion gets `false`, unchanged).
+    /// Move a `Detaching` slot to `Detached` and hand back the parked
+    /// connection, so the detach handler runs against the slot rather than
+    /// across an `Empty` one. `None` if the slot was not `Detaching` (a stale
+    /// completion), leaving it unchanged.
     ///
     /// The connection never leaves the table, so an unwinding handler cannot
     /// strand the slot `Empty` with its generation un-bumped — which would let
     /// a later accept reuse it at a generation retained handles still match.
-    pub(crate) fn park_detached_in_place(&mut self, slot: u32) -> bool {
-        let Some(e) = self.slots.get_mut(slot as usize) else {
-            return false;
-        };
+    pub(crate) fn park_detached_in_place(
+        &mut self,
+        slot: u32,
+    ) -> Option<&mut Connection<U>> {
+        let e = self.slots.get_mut(slot as usize)?;
         let conn = match std::mem::replace(&mut e.state, SlotState::Empty) {
             SlotState::Detaching(conn) => conn,
             other => {
                 e.state = other;
-                return false;
+                return None;
             }
         };
         e.state = SlotState::Detached(conn);
-        true
-    }
-
-    /// The parked connection of a `Detached` slot. Panics on any other state —
-    /// callers reach this only just after `park_detached_in_place` returned
-    /// `true`.
-    pub(crate) fn detached_conn_mut(
-        &mut self,
-        slot: u32,
-    ) -> &mut Connection<U> {
-        match &mut self.slots[slot as usize].state {
-            SlotState::Detached(conn) => conn,
-            _ => panic!("detached_conn_mut on non-detached slot {slot}"),
+        match &mut e.state {
+            SlotState::Detached(conn) => Some(conn),
+            _ => unreachable!("just stored"),
         }
     }
 

@@ -385,12 +385,12 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         // handler): the connection must not leave the table across consumer
         // code — see `park_detached_in_place`.
         let gen64 = self.core.table.generation(slot);
-        if !self.core.table.park_detached_in_place(slot) {
+        let Some(conn) = self.core.table.park_detached_in_place(slot) else {
             // No longer detaching (stale): nobody will consume the fd.
             // SAFETY: `res` is the freshly installed fd, owned and unconsumed.
             unsafe { libc::close(res) };
             return Ok(());
-        }
+        };
         // SAFETY: `res` is a fresh owned fd materialized by FIXED_FD_INSTALL.
         let fd = unsafe { owned_from_raw(res) };
         let detached = Detached {
@@ -403,7 +403,6 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         };
         // Disjoint-field borrow: `self.handlers` vs `self.core.table`.
         let handler = self.handlers.detach.as_mut().expect("checked is_some");
-        let conn = self.core.table.detached_conn_mut(slot);
         handler(
             DetachContext {
                 peer: &conn.peer,

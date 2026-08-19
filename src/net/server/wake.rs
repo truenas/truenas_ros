@@ -254,7 +254,7 @@ where
                     else {
                         continue; // connection gone (or slot recycled)
                     };
-                    if conn.closing || conn.close_on_flush.is_some() {
+                    if conn.teardown_owns_slot() {
                         continue; // already closing (repeat close: a no-op)
                     }
                     conn.close_on_flush = Some(CloseReason::PushClosed);
@@ -346,7 +346,7 @@ where
                 // past here re-enters the body handler mid-teardown, and a
                 // `Response::Detach` from that rerun parks the slot with an op
                 // still outstanding, which `on_closed` then frees untracked.
-                if conn.closing || conn.close_on_flush.is_some() {
+                if conn.teardown_owns_slot() {
                     continue;
                 }
             }

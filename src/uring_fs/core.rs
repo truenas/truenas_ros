@@ -55,12 +55,33 @@ use std::thread;
 
 /// Default warm floor of worker threads backing [`FsConn::offload`]; the pool
 /// is spawned on first use and grows to [`OFFLOAD_CEILING`] under saturation.
-pub(crate) const OFFLOAD_FLOOR: usize = 4;
+///
+/// One, because the floor is **resident**: these threads spawn on first use
+/// and the idle retire never takes the pool below them, so the floor is a
+/// standing cost paid by every reactor whether or not it ever offloads. A
+/// deployment picks its own reactor count (one per core under `SO_REUSEPORT`
+/// is the usual shape) and this default is multiplied by it, so anything
+/// larger sizes the *machine* from inside a library that cannot see the
+/// deployment. One keeps a thread warm so the first offload does not pay a
+/// spawn; growth covers the rest.
+pub(crate) const OFFLOAD_FLOOR: usize = 1;
 /// Default ceiling the offload pool grows to under sustained blocking work
-/// (opcode-less `readdir`/`fdopendir`/copy). Blocked-on-I/O threads are cheap,
-/// so the cap is generous; a `reuse_port` multicore deployment multiplies it by
-/// the server count.
-pub(crate) const OFFLOAD_CEILING: usize = 64;
+/// (opcode-less `readdir`/`fdopendir`/copy).
+///
+/// Deliberately modest for the same reason as the floor: it is per reactor and
+/// multiplied by a reactor count the library does not choose. It bounds how
+/// many *concurrently stalled* walks one reactor can absorb before they
+/// head-of-line-block each other, which is the property worth buying, and a
+/// deployment that genuinely needs deeper blocking concurrency should say so
+/// rather than inherit it.
+///
+/// Size both explicitly for the deployment via
+/// [`ServerConfig::fs_offload_floor`](crate::net::server::ServerConfig::fs_offload_floor)
+/// and
+/// [`ServerConfig::fs_offload_ceiling`](crate::net::server::ServerConfig::fs_offload_ceiling),
+/// budgeting `ceiling × reactors` for the peak and `floor × reactors` for the
+/// idle residency.
+pub(crate) const OFFLOAD_CEILING: usize = 8;
 /// Names per off-loop `readdir` batch in [`FsConn::next_batch`].
 const DIR_BATCH: usize = 256;
 

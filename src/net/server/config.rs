@@ -53,16 +53,26 @@ pub struct ServerConfig {
     pub fs_files: u32,
     /// Warm floor of offload worker threads for the embedded fs reactor's
     /// blocking work (`readdir`/`fdopendir`, byte copies), which has no io_uring
-    /// opcode and so cannot run on the ring. Per server/ring; size it to the I/O
-    /// concurrency you expect for listings and copies. Default
+    /// opcode and so cannot run on the ring. Default
     /// `uring_fs::core::OFFLOAD_FLOOR`.
+    ///
+    /// **Per server/ring, and resident.** These spawn on first use and the idle
+    /// retire never goes below them, so a `reuse_port` deployment pays
+    /// `floor × servers` threads standing by whether or not they offload. The
+    /// default is deliberately one: the library cannot see how many rings you
+    /// will run, so sizing the machine is yours. Raise it when a ring's first
+    /// listings should not pay a thread spawn.
     #[cfg(feature = "uring-fs")]
     pub fs_offload_floor: usize,
     /// Ceiling the offload pool grows to when every worker is blocked (a cold or
     /// huge directory, an NFS/FUSE backing, a stalled copy), so one stalled walk
-    /// does not head-of-line-block the rest; burst threads retire when idle. Per
-    /// server/ring. Default
-    /// `uring_fs::core::OFFLOAD_CEILING`.
+    /// does not head-of-line-block the rest; burst threads retire when idle.
+    /// Default `uring_fs::core::OFFLOAD_CEILING`.
+    ///
+    /// **Per server/ring**, so the peak thread count is `ceiling × servers`.
+    /// What it really buys is how many *concurrently stalled* operations one
+    /// ring absorbs before they queue behind each other. Size it to that, not
+    /// to request volume, and budget the product against the machine.
     #[cfg(feature = "uring-fs")]
     pub fs_offload_ceiling: usize,
     /// Maximum bytes accepted for one message (header + body), a memory guard
@@ -314,9 +324,11 @@ impl ServerConfig {
             ));
         }
         if self.backlog <= 0 {
-            // `listen(2)` takes a signed backlog but compares it unsigned, so a
-            // negative value is reinterpreted as enormous and silently clamped
-            // to somaxconn; zero leaves a listener that accepts almost nothing.
+            // `listen(2)` takes a signed backlog but compares it unsigned
+            // (`__sys_listen_socket`, net/socket.c: `if ((unsigned int)backlog >
+            // somaxconn) backlog = somaxconn`), so a negative value is
+            // reinterpreted as enormous and silently clamped to somaxconn; zero
+            // leaves a listener that accepts almost nothing.
             return Err(Error::Validation("backlog must be positive".into()));
         }
         if self.max_send_backlog == 0 {

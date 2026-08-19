@@ -366,6 +366,23 @@ pub(crate) struct Connection<U> {
 }
 
 impl<U> Connection<U> {
+    /// Whether a teardown already owns this connection's remaining
+    /// completions: either the flushing kind (`close_on_flush`, the farewell
+    /// is final) or the immediate kind (`closing`, a SHUTDOWN/CLOSE is staged).
+    ///
+    /// A late arrival for such a connection (a worker outcome, a redelivery,
+    /// a stashed recv) must be dropped rather than acted on: the teardown
+    /// path is what will free the slot, and re-entering the connection can
+    /// walk it into a state that path does not account for.
+    ///
+    /// Deliberately not used at every site that tests one of the two flags.
+    /// Some check only `close_on_flush` because the immediate case cannot
+    /// reach them, and swapping this predicate in there would be a behaviour
+    /// change, not a refactor. Analyse the site before widening it.
+    pub(crate) fn teardown_owns_slot(&self) -> bool {
+        self.closing || self.close_on_flush.is_some()
+    }
+
     /// Allocate a connection with per-connection state `state` and a send
     /// gather of up to `max_send_coalesce` PDUs. Returned boxed so its interior
     /// addresses never move.

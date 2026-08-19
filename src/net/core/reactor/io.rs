@@ -807,7 +807,7 @@ impl<U> Reactor<U> {
         let fired = res == -libc::ETIME;
         let was_idle = {
             let conn = self.table.conn_mut(slot);
-            if conn.closing || conn.close_on_flush.is_some() {
+            if conn.teardown_owns_slot() {
                 // Torn down by another path while the stash waited (the close
                 // already ran with that path's reason), or a flush-close
                 // arrived meanwhile — its farewell flush owns the teardown,
