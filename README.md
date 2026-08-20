@@ -46,10 +46,10 @@ HTTP/1.1 codec over the server's protocol seam - a framer and a vocabulary,
 not a server; combined with `uring-fs`, its handler may also be handed the
 reactor's per-request fs facade via `protocol_fs`, so an HTTP service serves
 from the server's own ring), and `uring-fs` (a filesystem reactor whose every
-operation runs under a kernel-enforced identity). All sit on the internal `uring` engine
-feature; see the crate docs. `secrets` is separate: `memfd_secret(2)`-backed
-protected memory for long-lived in-process secrets, off swap and absent from
-core dumps, wanted only by a daemon that holds any.
+operation runs under a kernel-enforced identity). All sit on the internal
+`uring` engine feature; see the crate docs. `secrets` is separate:
+`memfd_secret(2)`-backed protected memory for long-lived in-process secrets,
+off swap and absent from core dumps, wanted only by a daemon that holds any.
 
 `full` is the default set plus the net roles, `http`, and `secrets`. It never
 includes `uring-fs`, which needs a credential broker forked before the daemon

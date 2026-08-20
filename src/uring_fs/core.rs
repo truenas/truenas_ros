@@ -67,13 +67,16 @@ pub(crate) const OFFLOAD_FLOOR: usize = 4;
 /// Generous on purpose: it caps how many *concurrently stalled* operations one
 /// ring absorbs before they queue behind each other, which is the whole reason
 /// the pool exists, and a stalled `readdir` against a cold NFS or FUSE backing
-/// can take seconds. These are not resident. A worker exists only while a job
-/// is blocked on it, growth is throttled to one spawn per millisecond, and a
-/// burst worker retires after `OFFLOAD_IDLE_TIMEOUT` idle, so the ceiling is
-/// reached only by load that genuinely wants it.
+/// can take seconds. Only the floor is resident, growth is throttled to one
+/// spawn per millisecond, and a burst worker retires once it has sat idle for
+/// `OFFLOAD_IDLE_TIMEOUT` - the keep-alive policy of tokio's blocking pool
+/// (`KEEP_ALIVE`, `runtime/blocking/pool.rs`). Retirement being idle-keyed
+/// means bursts recurring inside that window hold the recent high-water mark
+/// of workers, not the instantaneous blocked count; plan standing cost by the
+/// burst peak, not the average.
 ///
-/// Every bound here is per ring. A deployment running several multiplies them,
-/// and can size all three through
+/// Every bound here is per ring. A deployment running several multiplies
+/// them, and sizes both through
 /// [`OffloadBounds`](crate::uring_fs::OffloadBounds).
 pub(crate) const OFFLOAD_CEILING: usize = 64;
 /// Names per off-loop `readdir` batch in [`FsConn::next_batch`].

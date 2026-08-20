@@ -146,11 +146,10 @@ fn pin_umask() {
 /// the failure lands on whichever test happens to create the ring that
 /// crosses the limit, not on the one that caused it.
 fn test_cfg() -> FsConfig {
-    FsConfig {
-        entries: 128,
-        ops: 128,
-        ..FsConfig::default()
-    }
+    let mut cfg = FsConfig::default();
+    cfg.entries = 128;
+    cfg.ops = 128;
+    cfg
 }
 
 /// Build an `UringFs` over a fresh tempdir, register a self personality, run

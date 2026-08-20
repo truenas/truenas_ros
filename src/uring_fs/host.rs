@@ -64,7 +64,11 @@ use std::sync::atomic::Ordering;
 /// (`LimitMEMLOCK=` in the unit, or `setrlimit` before the first
 /// [`UringFs::new`]) - the symptom otherwise is a bare `ENOMEM` from ring
 /// creation with nothing pointing at the cause.
+///
+/// `#[non_exhaustive]`, so a future knob is a field addition rather than a
+/// breaking change; build one by mutating [`FsConfig::default`].
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct FsConfig {
     /// Submission-queue depth (rounded up to a power of two by the kernel) --
     /// how much work rides on one `io_uring_enter`. The field that costs

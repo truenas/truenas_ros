@@ -13,13 +13,17 @@ use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{thread, Arc, Condvar, Mutex, OnceCell};
 
 /// Per-ring sizing for the blocking-offload pool: how many worker threads it
-/// keeps warm, how far it grows, and how much native stack each worker gets.
+/// keeps warm and how far it grows.
 ///
 /// Every field is per ring, so a deployment running several multiplies them.
 /// Only `floor` is resident; workers above it exist while a job is blocked on
 /// them and retire when idle, so the ceiling is a limit rather than a
 /// reservation.
+///
+/// `#[non_exhaustive]`, so a future knob is a field addition rather than a
+/// breaking change; build one by mutating [`OffloadBounds::default`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct OffloadBounds {
     /// Warm workers, spawned on first use and never retired below. Resident,
     /// so this is a standing per-ring cost. At least 1.
@@ -462,7 +466,7 @@ mod pool_tests {
     use super::*;
     use crate::sync::mpsc;
 
-    /// Bounds with the defaults' stack size and explicit floor/ceiling.
+    /// Bounds with explicit floor and ceiling.
     fn bounds(floor: usize, ceiling: usize) -> OffloadBounds {
         OffloadBounds { floor, ceiling }
     }
@@ -652,7 +656,7 @@ mod loom_tests {
 
     const ZERO: Duration = Duration::ZERO;
 
-    /// Bounds with the defaults' stack size and explicit floor/ceiling.
+    /// Bounds with explicit floor and ceiling.
     fn bounds(floor: usize, ceiling: usize) -> OffloadBounds {
         OffloadBounds { floor, ceiling }
     }
