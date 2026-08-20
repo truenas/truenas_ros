@@ -3251,6 +3251,27 @@ mod routing_fuzz {
     }
 }
 
+#[cfg(all(test, not(loom)))]
+mod pool_identity_tests {
+    use super::*;
+
+    /// A ring has exactly one offload pool: the handle minted for off-loop
+    /// submitters is the core's own pool object, not a copy built from its
+    /// bounds. Pins the construction-time invariant - any future path that
+    /// replaces `FsCore::pool` after a handle was minted (a setter, a
+    /// builder) splits the floor..ceiling thread budget across two live
+    /// pools, and fails here.
+    #[test]
+    fn a_pool_handle_is_the_core_pool_itself() {
+        let core = FsCore::new(4, OffloadBounds::default());
+        let handle = core.pool_handle();
+        assert!(
+            Arc::ptr_eq(&handle, &core.pool),
+            "pool_handle minted a different pool object"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // loom model of the offload completion handoff
 // ---------------------------------------------------------------------------
