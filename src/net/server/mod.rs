@@ -983,6 +983,31 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             .ok_or_else(|| crate::Error::from(errno::Errno::EINVAL))
     }
 
+    /// Declare which extended attributes this server's embedded fs reactor
+    /// writes under its **own ambient credentials** rather than a request's
+    /// [`Personality`](crate::uring_fs::Personality) - the allowlist behind
+    /// the [`FsConn::fsetxattr`](crate::uring_fs::FsConn::fsetxattr)
+    /// promotion and the whole of
+    /// [`FsConn::fremovexattr`](crate::uring_fs::FsConn::fremovexattr). See
+    /// [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs) for the rules
+    /// (prefixes must sit under `trusted.`) and the reasoning.
+    ///
+    /// Setup-time only, and enforced as such: [`Server::serve_forever`]
+    /// borrows `&mut self` for the lifetime of the loop, so this cannot be
+    /// called while operations are in flight - the same discipline as the
+    /// standalone host's setter. Replaces any previous policy; the default
+    /// permits nothing. Inert on a server built without an fs pool
+    /// ([`ServerConfig::fs_files`] of 0): there is no reactor to police.
+    #[cfg(feature = "uring-fs")]
+    pub fn set_privileged_xattrs(
+        &mut self,
+        policy: crate::uring_fs::PrivilegedXattrs,
+    ) {
+        if let Some(fs) = self.fs.as_mut() {
+            fs.set_privileged_xattrs(policy);
+        }
+    }
+
     /// Install a hook invoked once per connection as it begins closing:
     /// `(peer, reason, &mut state)` - for logging/metrics; the state is dropped
     /// with the connection shortly after. Connections that never passed

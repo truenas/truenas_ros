@@ -7453,6 +7453,174 @@ fn fs_conn_offload_result_batches_statx_and_xattrs_in_one_job() {
     );
 }
 
+/// Read `name` off `path` with `libc::getxattr`, `None` on any failure -
+/// the out-of-band witness for the privileged-xattr policy test below.
+#[cfg(feature = "uring-fs")]
+fn get_xattr_raw(path: &Path, name: &std::ffi::CStr) -> Option<Vec<u8>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let mut buf = vec![0u8; 256];
+    // SAFETY: valid NUL-terminated path/name and an owned out-buffer.
+    let n = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    Some(buf)
+}
+
+/// `Server::set_privileged_xattrs` reaches the embedded reactor. With a
+/// policy allowing `trusted.test_`: a covered `fsetxattr` through the
+/// request facade lands (promoted to the reactor's own credentials), an
+/// **uncovered** `fremovexattr` stays `EPERM`, and a **covered**
+/// `fremovexattr` succeeds - the leg that bites, since that path is gated
+/// on the allowlist alone and fails `EPERM` under the default empty policy
+/// whether or not the caller is privileged. The `trusted.` namespace needs
+/// `CAP_SYS_ADMIN`: unprivileged, the covered write's refusal is itself the
+/// asserted property (the promotion escalates to the daemon's own identity,
+/// which has nothing to escalate to). The qemu lane runs as root and takes
+/// the full path.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn server_privileged_xattr_policy_reaches_the_embedded_reactor() {
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality, PrivilegedXattrs};
+
+    let dir = truenas_ros::tempdir().unwrap();
+    let fp = dir.path().join("f.txt");
+    std::fs::write(&fp, b"x").unwrap();
+    if is_root() && !set_user_xattr(&fp, b"trusted.probe", b"1") {
+        return; // this fs refuses trusted xattrs even to root
+    }
+
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+
+    let pc = Arc::clone(&pers);
+    let body = move |mut req: Request<'_, ()>| -> Response {
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let how = OpenHow::new().flags(OFlag::O_RDONLY);
+        fs.open(who, &anchor, c"f.txt", how, move |done, fs| {
+            let Some(file) = done.file() else {
+                return deferred.reply(echo_frame(
+                    format!("OPEN {:?}", done.result()).as_bytes(),
+                ));
+            };
+            let f2 = file.clone();
+            let f3 = file.clone();
+            fs.fsetxattr(
+                who,
+                file,
+                c"trusted.test_x",
+                b"v1".to_vec(),
+                0,
+                move |set, fs| {
+                    if let Err(e) = set.result() {
+                        return deferred
+                            .reply(echo_frame(format!("SET {e}").as_bytes()));
+                    }
+                    fs.fremovexattr(
+                        f2,
+                        c"trusted.other".into(),
+                        move |out, fs| {
+                            if out.is_ok() {
+                                return deferred
+                                    .reply(echo_frame(b"UNCOVERED-REMOVED"));
+                            }
+                            fs.fremovexattr(
+                                f3,
+                                c"trusted.test_x".into(),
+                                move |cov, _fs| match cov {
+                                    Ok(()) => deferred
+                                        .reply(echo_frame(b"policy-enforced")),
+                                    Err(e) => deferred.reply(echo_frame(
+                                        format!("RM-COVERED {e}").as_bytes(),
+                                    )),
+                                },
+                            );
+                        },
+                    );
+                },
+            );
+        });
+        Response::Defer(permit)
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let cfg = ServerConfig {
+        pool_size: 16,
+        fs_files: 8,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    server.set_privileged_xattrs(
+        PrivilegedXattrs::new()
+            .allow_prefix(c"trusted.test_")
+            .expect("a trusted.-rooted prefix is accepted"),
+    );
+    pers.set(server.register_self().expect("register_self"))
+        .unwrap();
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let mut s = connect_tcp(v4)?;
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        send_framed(&mut s, b"go")?;
+        let reply = recv_framed(&mut s);
+        drop(s);
+        stop.shutdown();
+        reply
+    });
+    server.serve_forever().expect("serve_forever priv xattrs");
+    let reply = client.join().unwrap().expect("client io");
+    let text = String::from_utf8_lossy(&reply).into_owned();
+    if text.starts_with("SET ") {
+        assert!(
+            text.contains("EPERM") && !is_root(),
+            "only an unprivileged daemon may be refused: {text:?}"
+        );
+        return;
+    }
+    assert_eq!(text, "policy-enforced", "unexpected chain result");
+    // Out of band: the covered remove really removed - `trusted.test_x` is
+    // gone while the probe attribute survives (so absence is not ENOTSUP).
+    assert!(get_xattr_raw(&fp, c"trusted.probe").is_some());
+    assert!(get_xattr_raw(&fp, c"trusted.test_x").is_none());
+}
+
 /// `FsConn::fgetxattr_as_root` reads an xattr under the reactor's ambient
 /// (root) credentials (`sqe.personality = 0`) - the sanctioned privileged-read
 /// path for a `trusted.*`/`security.*` attribute a request's own identity

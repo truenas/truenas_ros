@@ -315,6 +315,17 @@ fn farewell(status: u16, head_only: bool, dates: &mut DateCache) -> Response {
     ))
 }
 
+/// The per-delivery fs facade threaded through [`step`] to every dispatching
+/// arm: the reactor's request-bound
+/// [`FsConn`](crate::uring_fs::FsConn) (`None` when the server has no fs
+/// pool) under `uring-fs`.
+#[cfg(feature = "uring-fs")]
+pub(crate) type FsSlot<'a> = Option<crate::uring_fs::FsConn<'a>>;
+/// Without `uring-fs`: a zero-sized placeholder, so [`dispatch`]/[`step`]
+/// keep one shape and the handler bound one arity in both builds.
+#[cfg(not(feature = "uring-fs"))]
+pub(crate) type FsSlot<'a> = std::marker::PhantomData<&'a ()>;
+
 /// What one handler invocation produced: a reactor verdict, or a park to
 /// file into the connection's phase.
 enum Dispatched {
@@ -355,12 +366,13 @@ fn dispatch<U, H>(
     trailers: &[HeaderView<'_>],
     peer: &ClientAddr,
     responder: Responder,
+    fs: FsSlot<'_>,
     state: &mut U,
     dates: &mut DateCache,
     handler: &mut H,
 ) -> Dispatched
 where
-    H: FnMut(HttpRequest<'_>, &mut U) -> HttpVerdict,
+    H: FnMut(HttpRequest<'_>, &mut U, FsSlot<'_>) -> HttpVerdict,
 {
     let mut headers: [HeaderView<'_>; MAX_HEADERS] =
         [HeaderView::EMPTY; MAX_HEADERS];
@@ -381,6 +393,7 @@ where
             responder,
         },
         state,
+        fs,
     ) {
         HttpVerdict::Respond(resp) => {
             Dispatched::Done(respond(&h, resp, dates))
@@ -412,17 +425,22 @@ fn respond_parked(
 /// handler as a plain function (the closure in [`protocol_deferrable`] is a
 /// one-line adapter), so tests exercise the real
 /// dance/keep-alive/park/farewell code.
+// The parts are the delivered message, its reply ticket and fs facade, the
+// connection state, and the serialization context; bundling them would be
+// artificial here (the same shape `dispatch` allows).
+#[allow(clippy::too_many_arguments)]
 fn step<U, H>(
     header: &[u8],
     mut body: Body<'_>,
     peer: &ClientAddr,
     responder: Responder,
+    fs: FsSlot<'_>,
     conn: &mut HttpConn<U>,
     dates: &mut DateCache,
     handler: &mut H,
 ) -> Response
 where
-    H: FnMut(HttpRequest<'_>, &mut U) -> HttpVerdict,
+    H: FnMut(HttpRequest<'_>, &mut U, FsSlot<'_>) -> HttpVerdict,
 {
     /// File a park into the phase, or pass the verdict through - the shared
     /// tail of every dispatching arm.
@@ -461,6 +479,7 @@ where
                 &[],
                 peer,
                 responder,
+                fs,
                 &mut conn.state,
                 dates,
                 handler,
@@ -491,6 +510,7 @@ where
                                 &trailers,
                                 peer,
                                 responder,
+                                fs,
                                 &mut conn.state,
                                 dates,
                                 handler,
@@ -516,6 +536,7 @@ where
                         &trailers,
                         peer,
                         responder,
+                        fs,
                         &mut conn.state,
                         dates,
                         handler,
@@ -540,6 +561,7 @@ where
                 &[],
                 peer,
                 responder,
+                fs,
                 &mut conn.state,
                 dates,
                 handler,
@@ -574,6 +596,7 @@ where
                         &views,
                         peer,
                         responder,
+                        fs,
                         &mut conn.state,
                         dates,
                         handler,
@@ -583,6 +606,127 @@ where
             }
         }
     }
+}
+
+/// The shared constructor behind [`protocol`], [`protocol_deferrable`], and
+/// `protocol_fs`: one body closure, one [`step`], with the handler taking
+/// the per-delivery [`FsSlot`] so the phase machine keeps a single shape.
+/// Each public constructor adapts its own handler bound down to this one --
+/// only `protocol_fs` is feature-gated, so every feature builds alone.
+#[allow(clippy::type_complexity)]
+fn build<U, A, H>(
+    cfg: HttpConfig,
+    mut accept: A,
+    mut handler: H,
+) -> crate::Result<
+    Protocol<
+        impl FnMut(Incoming<'_>) -> Option<HttpConn<U>>,
+        impl FnMut(&[u8], &mut HttpConn<U>) -> crate::net::Framing,
+        impl FnMut(Request<'_, HttpConn<U>>) -> Response,
+    >,
+>
+where
+    A: FnMut(Incoming<'_>) -> Option<U>,
+    H: FnMut(HttpRequest<'_>, &mut U, FsSlot<'_>) -> HttpVerdict,
+{
+    cfg.validate()?;
+    // One date cache per protocol instance - instances are per reactor and
+    // handlers run on the reactor thread, so the `Date` value renders once
+    // a second instead of once a response, with no synchronization.
+    let mut dates = DateCache::default();
+    Ok(Protocol {
+        accept: move |inc: Incoming<'_>| accept(inc).map(HttpConn::new),
+        header: move |buf: &[u8], conn: &mut HttpConn<U>| {
+            frame(buf, conn, &cfg)
+        },
+        body: move |req: Request<'_, HttpConn<U>>| {
+            #[cfg(feature = "uring-fs")]
+            let fs = req.fs;
+            #[cfg(not(feature = "uring-fs"))]
+            let fs = FsSlot::default();
+            let Request {
+                header,
+                body,
+                peer,
+                state: conn,
+                responder,
+                ..
+            } = req;
+            step(
+                header,
+                body,
+                peer,
+                responder,
+                fs,
+                conn,
+                &mut dates,
+                &mut handler,
+            )
+        },
+    })
+}
+
+/// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint whose handler may
+/// also reach the server's **request-bound fs facade**.
+///
+/// The handler is [`protocol_deferrable`]'s with one more argument: the
+/// reactor's per-request [`FsConn`](crate::uring_fs::FsConn) - `Some` when
+/// the server was built with an fs pool
+/// ([`ServerConfig::fs_files`](crate::net::server::ServerConfig::fs_files)),
+/// else `None`. A `Protocol` is built before its `Server`, so this
+/// constructor cannot check; for a handler that asked for this constructor,
+/// `None` is a deployment misconfiguration, and answering `500` is the
+/// honest response.
+///
+/// The consumer's model, in full:
+///
+/// - **The facade is per delivery.** It borrows the reactor for the call and
+///   cannot be stored; every invocation of the handler - first delivery or
+///   redelivery - receives a fresh one.
+/// - **Fs work parks the request.** Take the facade, then
+///   [`HttpRequest::defer`] the request (defer consumes it), capture the
+///   [`HttpDeferred`] in the op's continuation, and return
+///   [`HttpVerdict::Defer`]; the continuation, or a later offload delivery,
+///   resolves it via [`HttpDeferred::reply`].
+/// - **A continuation cannot `open`.**
+///   [`open`](crate::uring_fs::FsConn::open) works only on the facade
+///   handed to the handler itself; on the one a continuation or offload
+///   delivery receives it is refused (the owning connection may be gone,
+///   and a file opened for it would leak). A handler whose second `open`
+///   depends on a first op's result parks its progress in the connection
+///   state `U` and calls [`HttpDeferred::redrive`]: redelivery re-enters
+///   the handler with a fresh, open-capable facade.
+/// - **Offload jobs are never cancelled**
+///   ([`FsConn::offload`](crate::uring_fs::FsConn::offload)): a delivery
+///   may fire for a request that is gone, and a resolved [`HttpDeferred`]
+///   for a vanished request is a generation-checked no-op rather than a
+///   hazard.
+///
+/// The parking discipline is [`protocol_deferrable`]'s, including its
+/// `max_in_flight_requests` guidance. Errors when `cfg` fails
+/// [`HttpConfig::validate`].
+#[cfg(feature = "uring-fs")]
+#[allow(clippy::type_complexity)]
+pub fn protocol_fs<U, A, H>(
+    cfg: HttpConfig,
+    accept: A,
+    handler: H,
+) -> crate::Result<
+    Protocol<
+        impl FnMut(Incoming<'_>) -> Option<HttpConn<U>>,
+        impl FnMut(&[u8], &mut HttpConn<U>) -> crate::net::Framing,
+        impl FnMut(Request<'_, HttpConn<U>>) -> Response,
+    >,
+>
+where
+    A: FnMut(Incoming<'_>) -> Option<U>,
+    H: FnMut(
+        HttpRequest<'_>,
+        &mut U,
+        Option<crate::uring_fs::FsConn<'_>>,
+    ) -> HttpVerdict,
+{
+    build(cfg, accept, handler)
 }
 
 /// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint whose handler
@@ -614,7 +758,7 @@ where
 #[allow(clippy::type_complexity)]
 pub fn protocol_deferrable<U, A, H>(
     cfg: HttpConfig,
-    mut accept: A,
+    accept: A,
     mut handler: H,
 ) -> crate::Result<
     Protocol<
@@ -627,36 +771,13 @@ where
     A: FnMut(Incoming<'_>) -> Option<U>,
     H: FnMut(HttpRequest<'_>, &mut U) -> HttpVerdict,
 {
-    cfg.validate()?;
-    // One date cache per protocol instance - instances are per reactor and
-    // handlers run on the reactor thread, so the `Date` value renders once
-    // a second instead of once a response, with no synchronization.
-    let mut dates = DateCache::default();
-    Ok(Protocol {
-        accept: move |inc: Incoming<'_>| accept(inc).map(HttpConn::new),
-        header: move |buf: &[u8], conn: &mut HttpConn<U>| {
-            frame(buf, conn, &cfg)
+    build(
+        cfg,
+        accept,
+        move |req: HttpRequest<'_>, state: &mut U, _fs: FsSlot<'_>| {
+            handler(req, state)
         },
-        body: move |req: Request<'_, HttpConn<U>>| {
-            let Request {
-                header,
-                body,
-                peer,
-                state: conn,
-                responder,
-                ..
-            } = req;
-            step(
-                header,
-                body,
-                peer,
-                responder,
-                conn,
-                &mut dates,
-                &mut handler,
-            )
-        },
-    })
+    )
 }
 
 /// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint.
@@ -666,7 +787,9 @@ where
 /// parsed [`HttpRequest`] view and `&mut U`, and returns the
 /// [`HttpResponse`] to serialize. Handlers run on the server thread --
 /// compute inline like any reactor `body` handler; a handler that must
-/// wait on other threads uses [`protocol_deferrable`] instead.
+/// wait on other threads uses [`protocol_deferrable`] instead, and one
+/// that must also touch the filesystem, `protocol_fs` (with the
+/// `uring-fs` feature).
 ///
 /// Errors when `cfg` fails [`HttpConfig::validate`].
 #[allow(clippy::type_complexity)]
@@ -730,9 +853,10 @@ mod tests {
             body,
             peer,
             Responder::test_responder(),
+            FsSlot::default(),
             conn,
             &mut DateCache::default(),
-            handler,
+            &mut |req, state, _fs: FsSlot<'_>| handler(req, state),
         )
     }
 
@@ -1717,7 +1841,7 @@ mod loom_tests {
     use crate::net::ClientAddr;
     use crate::sync::thread;
 
-    fn unreached(_: HttpRequest<'_>, _: &mut ()) -> HttpVerdict {
+    fn unreached(_: HttpRequest<'_>, _: &mut (), _: FsSlot<'_>) -> HttpVerdict {
         panic!("worker reply surfaced as a redrive")
     }
 
@@ -1755,6 +1879,7 @@ mod loom_tests {
                 Body::inline(b""),
                 &peer,
                 Responder::test_responder(),
+                FsSlot::default(),
                 &mut conn,
                 &mut DateCache::default(),
                 &mut unreached,
