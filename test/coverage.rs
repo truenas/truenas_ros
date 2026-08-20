@@ -6,8 +6,8 @@
 // ------------------------------------------------------------------ errno/error
 mod errno_error {
     use std::io;
-    use truenas_ros::errno::{Errno, ErrnoSentinel};
     use truenas_ros::Error;
+    use truenas_ros::errno::{Errno, ErrnoSentinel};
 
     #[test]
     fn from_raw_known_and_unknown() {
@@ -81,30 +81,36 @@ mod errno_error {
         );
         assert!(format!("{}", Error::Validation("bad".into())).contains("bad"));
         assert!(format!("{}", Error::Parse("boom".into())).contains("boom"));
-        assert!(format!(
-            "{}",
-            Error::IteratorRestore {
-                depth: 3,
-                path: PathBuf::from("/x")
-            }
-        )
-        .contains("depth 3"));
-        assert!(format!(
-            "{}",
-            Error::MountSourceMismatch {
-                expected: "a".into(),
-                found: "b".into(),
-                path: PathBuf::from("/m"),
-            }
-        )
-        .contains("mismatch"));
-        assert!(format!(
-            "{}",
-            Error::SymlinkInPath {
-                path: PathBuf::from("/l")
-            }
-        )
-        .contains("symlink"));
+        assert!(
+            format!(
+                "{}",
+                Error::IteratorRestore {
+                    depth: 3,
+                    path: PathBuf::from("/x")
+                }
+            )
+            .contains("depth 3")
+        );
+        assert!(
+            format!(
+                "{}",
+                Error::MountSourceMismatch {
+                    expected: "a".into(),
+                    found: "b".into(),
+                    path: PathBuf::from("/m"),
+                }
+            )
+            .contains("mismatch")
+        );
+        assert!(
+            format!(
+                "{}",
+                Error::SymlinkInPath {
+                    path: PathBuf::from("/l")
+                }
+            )
+            .contains("symlink")
+        );
     }
 
     #[test]
@@ -201,12 +207,12 @@ mod path_tests {
 // --------------------------------------------------------------------------- fs
 #[cfg(feature = "sync-fs")]
 mod fs {
+    use truenas_ros::AT_FDCWD;
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::{
-        makedev, openat2, renameat2, statx, AtFlags, Mode, OFlag, OpenHow,
-        RenameFlags, ResolveFlag, StatxMask,
+        AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, StatxMask,
+        makedev, openat2, renameat2, statx,
     };
-    use truenas_ros::AT_FDCWD;
 
     #[test]
     fn statx_accessors_match_std_metadata() {
@@ -246,17 +252,21 @@ mod fs {
         std::fs::write(dir.path().join("t"), b"x").unwrap();
         std::os::unix::fs::symlink("t", dir.path().join("l")).unwrap();
         let link = dir.path().join("l");
-        assert!(statx(AT_FDCWD, &link, AtFlags::empty(), StatxMask::TYPE)
+        assert!(
+            statx(AT_FDCWD, &link, AtFlags::empty(), StatxMask::TYPE)
+                .unwrap()
+                .is_regular()
+        );
+        assert!(
+            statx(
+                AT_FDCWD,
+                &link,
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+                StatxMask::TYPE
+            )
             .unwrap()
-            .is_regular());
-        assert!(statx(
-            AT_FDCWD,
-            &link,
-            AtFlags::AT_SYMLINK_NOFOLLOW,
-            StatxMask::TYPE
-        )
-        .unwrap()
-        .is_symlink());
+            .is_symlink()
+        );
     }
 
     #[test]
@@ -341,8 +351,8 @@ mod xattr {
     use std::os::fd::AsFd;
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::xattr::{
-        fgetxattr, flistxattr, fremovexattr, fsetxattr, XattrFlags,
-        XATTR_SIZE_MAX,
+        XATTR_SIZE_MAX, XattrFlags, fgetxattr, flistxattr, fremovexattr,
+        fsetxattr,
     };
 
     fn tmp() -> (truenas_ros::TempDir, std::fs::File) {
@@ -429,10 +439,12 @@ mod xattr {
         match fsetxattr(f.as_fd(), "user.big", &val, XattrFlags::empty()) {
             Ok(()) => {
                 assert_eq!(fgetxattr(f.as_fd(), "user.big").unwrap(), val);
-                assert!(flistxattr(f.as_fd())
-                    .unwrap()
-                    .iter()
-                    .any(|s| s.as_bytes() == b"user.big"));
+                assert!(
+                    flistxattr(f.as_fd())
+                        .unwrap()
+                        .iter()
+                        .any(|s| s.as_bytes() == b"user.big")
+                );
             }
             // Some filesystems impose a smaller per-value limit.
             Err(Errno::E2BIG | Errno::ENOSPC) => {}
@@ -447,14 +459,14 @@ mod mount {
     use std::os::fd::AsFd;
     use std::path::Path;
     use truenas_ros::mount::{
-        fsconfig, is_zfs_snapshot, listmount, mount_setattr, move_mount,
-        open_mount_by_id, open_tree, statmount, statmount_path, umount,
-        umount2, Atime, FsConfig, MntFlags, MntPropagation, MountAttr,
+        Atime, FsConfig, LSMT_ROOT, MntFlags, MntPropagation, MountAttr,
         MountSetattr, MoveMountFlags, OpenTreeFlags, StatmountMask,
-        UmountOptions, LSMT_ROOT,
+        UmountOptions, fsconfig, is_zfs_snapshot, listmount, mount_setattr,
+        move_mount, open_mount_by_id, open_tree, statmount, statmount_path,
+        umount, umount2,
     };
-    use truenas_ros::sync_fs::{statx, AtFlags, OFlag, StatxMask};
-    use truenas_ros::{Error, AT_FDCWD};
+    use truenas_ros::sync_fs::{AtFlags, OFlag, StatxMask, statx};
+    use truenas_ros::{AT_FDCWD, Error};
 
     fn root_id() -> u64 {
         statx(AT_FDCWD, "/", AtFlags::empty(), StatxMask::MNT_ID_UNIQUE)
@@ -614,12 +626,12 @@ mod mount {
 #[cfg(feature = "acl")]
 mod acl {
     use std::os::fd::AsFd;
-    use truenas_ros::sync_fs::acl::{
-        fgetacl, fsetacl, validate_acl, Acl, AclTarget, Nfs4Ace, Nfs4AceType,
-        Nfs4Acl, Nfs4AclFlag, Nfs4Flag, Nfs4Perm, Nfs4Who, PosixAce, PosixAcl,
-        PosixPerm, PosixTag,
-    };
     use truenas_ros::Error;
+    use truenas_ros::sync_fs::acl::{
+        Acl, AclTarget, Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag, Nfs4Flag,
+        Nfs4Perm, Nfs4Who, PosixAce, PosixAcl, PosixPerm, PosixTag, fgetacl,
+        fsetacl, validate_acl,
+    };
 
     fn nfs4(aces: Vec<Nfs4Ace>, flags: Nfs4AclFlag) -> Acl {
         Acl::Nfs4(Nfs4Acl {
@@ -706,67 +718,77 @@ mod acl {
     #[test]
     fn nfs4_validate_directory_rules() {
         // DENY for a special principal -> rejected.
-        assert!(validate_acl(
-            AclTarget::AssumeDir,
-            &nfs4(
-                vec![n_ace(
-                    Nfs4AceType::Deny,
-                    Nfs4Flag::empty(),
-                    Nfs4Who::Everyone,
-                    -1
-                )],
-                Nfs4AclFlag::empty()
+        assert!(
+            validate_acl(
+                AclTarget::AssumeDir,
+                &nfs4(
+                    vec![n_ace(
+                        Nfs4AceType::Deny,
+                        Nfs4Flag::empty(),
+                        Nfs4Who::Everyone,
+                        -1
+                    )],
+                    Nfs4AclFlag::empty()
+                )
             )
-        )
-        .is_err());
+            .is_err()
+        );
         // INHERIT_ONLY without an inheritable bit -> rejected.
-        assert!(validate_acl(
-            AclTarget::AssumeDir,
-            &nfs4(
-                vec![n_ace(
-                    Nfs4AceType::Allow,
-                    Nfs4Flag::INHERIT_ONLY,
-                    Nfs4Who::Owner,
-                    -1
-                )],
-                Nfs4AclFlag::empty()
+        assert!(
+            validate_acl(
+                AclTarget::AssumeDir,
+                &nfs4(
+                    vec![n_ace(
+                        Nfs4AceType::Allow,
+                        Nfs4Flag::INHERIT_ONLY,
+                        Nfs4Who::Owner,
+                        -1
+                    )],
+                    Nfs4AclFlag::empty()
+                )
             )
-        )
-        .is_err());
+            .is_err()
+        );
         // Directory ACL with no inheritable ACE -> rejected.
-        assert!(validate_acl(
-            AclTarget::AssumeDir,
-            &nfs4(
-                vec![n_ace(
-                    Nfs4AceType::Allow,
-                    Nfs4Flag::empty(),
-                    Nfs4Who::Owner,
-                    -1
-                )],
-                Nfs4AclFlag::empty()
+        assert!(
+            validate_acl(
+                AclTarget::AssumeDir,
+                &nfs4(
+                    vec![n_ace(
+                        Nfs4AceType::Allow,
+                        Nfs4Flag::empty(),
+                        Nfs4Who::Owner,
+                        -1
+                    )],
+                    Nfs4AclFlag::empty()
+                )
             )
-        )
-        .is_err());
+            .is_err()
+        );
         // A valid, inheritable directory ACL -> ok; an empty ACL on a
         // directory -> err (no inheritable ACE, matching the C).
-        assert!(validate_acl(
-            AclTarget::AssumeDir,
-            &nfs4(
-                vec![n_ace(
-                    Nfs4AceType::Allow,
-                    Nfs4Flag::FILE_INHERIT | Nfs4Flag::DIRECTORY_INHERIT,
-                    Nfs4Who::Owner,
-                    -1
-                )],
-                Nfs4AclFlag::empty()
+        assert!(
+            validate_acl(
+                AclTarget::AssumeDir,
+                &nfs4(
+                    vec![n_ace(
+                        Nfs4AceType::Allow,
+                        Nfs4Flag::FILE_INHERIT | Nfs4Flag::DIRECTORY_INHERIT,
+                        Nfs4Who::Owner,
+                        -1
+                    )],
+                    Nfs4AclFlag::empty()
+                )
             )
-        )
-        .is_ok());
-        assert!(validate_acl(
-            AclTarget::AssumeDir,
-            &nfs4(vec![], Nfs4AclFlag::empty())
-        )
-        .is_err());
+            .is_ok()
+        );
+        assert!(
+            validate_acl(
+                AclTarget::AssumeDir,
+                &nfs4(vec![], Nfs4AclFlag::empty())
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -974,11 +996,11 @@ mod acl {
 mod fhandle {
     use std::os::fd::AsFd;
     use truenas_ros::errno::Errno;
-    use truenas_ros::sync_fs::fhandle::{
-        name_to_handle_at, FhFlags, FileHandle,
-    };
     use truenas_ros::sync_fs::OFlag;
-    use truenas_ros::{Error, AT_FDCWD};
+    use truenas_ros::sync_fs::fhandle::{
+        FhFlags, FileHandle, name_to_handle_at,
+    };
+    use truenas_ros::{AT_FDCWD, Error};
 
     #[test]
     fn from_bytes_validates_lengths() {
@@ -1005,9 +1027,11 @@ mod fhandle {
         assert_eq!(h.mount_id(), 42);
         assert!(h.unique_mount_id());
         assert_eq!(h.to_bytes(), vec![0u8; 8]);
-        assert!(!FileHandle::from_bytes(&[0u8; 8], 42, false)
-            .unwrap()
-            .unique_mount_id());
+        assert!(
+            !FileHandle::from_bytes(&[0u8; 8], 42, false)
+                .unwrap()
+                .unique_mount_id()
+        );
     }
 
     #[test]
@@ -1077,8 +1101,8 @@ mod fsiter {
     use truenas_ros::sync_fs::iter::{
         Cookie, DirStackEntry, EntryType, FsIterBuilder,
     };
-    use truenas_ros::sync_fs::{statx, AtFlags, OFlag, StatxMask};
-    use truenas_ros::{Error, AT_FDCWD};
+    use truenas_ros::sync_fs::{AtFlags, OFlag, StatxMask, statx};
+    use truenas_ros::{AT_FDCWD, Error};
 
     /// The mount source of `p`, so the fsiter source-check matches on kernels
     /// that report `sb_source`. Where it is not reported (e.g. the TrueNAS 6.12
@@ -1387,10 +1411,10 @@ mod io {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::{
-        atomic_replace, atomic_write, safe_open, AtomicWriteOptions, Mode,
-        OFlag,
+        AtomicWriteOptions, Mode, OFlag, atomic_replace, atomic_write,
+        safe_open,
     };
-    use truenas_ros::{Error, AT_FDCWD};
+    use truenas_ros::{AT_FDCWD, Error};
 
     #[test]
     fn atomic_write_sets_mode_and_preserves_owner() {
@@ -1508,9 +1532,9 @@ mod shutil {
     use std::os::unix::fs::PermissionsExt;
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::shutil::{
-        clonefile, copy_permissions, copy_setid, copy_xattrs, copyfile,
-        copysendfile, copytree, copyuserspace, CopyFlags, CopyTreeConfig,
-        CopyTreeOp, MAX_RW_SZ,
+        CopyFlags, CopyTreeConfig, CopyTreeOp, MAX_RW_SZ, clonefile,
+        copy_permissions, copy_setid, copy_xattrs, copyfile, copysendfile,
+        copytree, copyuserspace,
     };
 
     fn pair(
@@ -1609,7 +1633,7 @@ mod shutil {
 
     #[test]
     fn copy_xattrs_skips_acl_and_system() {
-        use truenas_ros::sync_fs::xattr::{fgetxattr, fsetxattr, XattrFlags};
+        use truenas_ros::sync_fs::xattr::{XattrFlags, fgetxattr, fsetxattr};
         let dir = truenas_ros::tempdir().unwrap();
         std::fs::write(dir.path().join("s"), b"x").unwrap();
         let s = std::fs::OpenOptions::new()
@@ -1657,15 +1681,17 @@ mod shutil {
             assert_eq!(stats.files, 2);
             assert_eq!(std::fs::read(dst.join("a")).unwrap(), vec![1u8; 100]);
             // exist_ok = false on an existing destination -> error.
-            assert!(copytree(
-                &src,
-                &dst,
-                &CopyTreeConfig {
-                    exist_ok: false,
-                    ..Default::default()
-                }
-            )
-            .is_err());
+            assert!(
+                copytree(
+                    &src,
+                    &dst,
+                    &CopyTreeConfig {
+                        exist_ok: false,
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+            );
         }
     }
 
@@ -1744,8 +1770,8 @@ mod shutil {
 
 #[cfg(feature = "configfile")]
 mod configfile {
-    use truenas_ros::configfile::ConfigFile;
     use truenas_ros::Error;
+    use truenas_ros::configfile::ConfigFile;
 
     #[test]
     fn writes_global_section_byte_exact() {

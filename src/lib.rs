@@ -63,7 +63,7 @@ pub use errno::Errno;
 pub use error::{Error, Result};
 pub use fd::AT_FDCWD;
 pub use path::TnPath;
-pub use tempdir::{tempdir, TempDir};
+pub use tempdir::{TempDir, tempdir};
 
 #[cfg(any(
     feature = "sync-fs",

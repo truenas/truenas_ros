@@ -21,9 +21,9 @@
 
 use super::offload_pool::{Job, SharedPool};
 use super::{Anchor, File, FsHandle, FsPending, Leaf, Personality};
-use crate::errno::{retry_on_eintr, Errno};
+use crate::errno::{Errno, retry_on_eintr};
 use crate::sync_fs::xattr::{
-    flistxattr, xattr_retry_cap, XATTR_SIZE_MAX, XATTR_SIZE_RETRIES,
+    XATTR_SIZE_MAX, XATTR_SIZE_RETRIES, flistxattr, xattr_retry_cap,
 };
 use crate::sync_fs::{AtFlags, OFlag, OpenHow, Statx, StatxMask};
 use bitflags::bitflags;
@@ -34,7 +34,7 @@ use std::os::fd::{AsFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 // `Arc` and the reply channels come from `crate::sync` - std's outside
 // `--cfg loom` - so this file compiles in the pool's loom model build.
-use crate::sync::{mpsc, Arc};
+use crate::sync::{Arc, mpsc};
 
 bitflags! {
     /// What to fetch for each directory entry. `STATX` is cheap (a path-based

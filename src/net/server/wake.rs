@@ -4,10 +4,10 @@
 //! `READ` and the drain-quiescence check are role-agnostic and live on
 //! [`Reactor`](crate::net::core::reactor); the delivery here is server code.
 
-use super::handles::Injected;
 use super::Server;
+use super::handles::Injected;
 use crate::errno;
-use crate::net::core::conn::{pack, Op};
+use crate::net::core::conn::{Op, pack};
 use crate::net::core::protocol::{CloseReason, Framing};
 use crate::net::core::table::SlotState;
 use crate::net::server::protocol::{Incoming, Request, Response};

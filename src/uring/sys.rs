@@ -11,7 +11,7 @@
 // referenced, and several kernel-struct fields are reserved/unused by us.
 #![allow(dead_code)]
 
-use crate::errno::{self, retry_on_eintr, Errno};
+use crate::errno::{self, Errno, retry_on_eintr};
 use crate::fd::owned_from_raw;
 use std::ffi::c_void;
 use std::os::fd::{OwnedFd, RawFd};

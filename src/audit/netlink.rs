@@ -13,7 +13,7 @@
 //! binding is under 200 lines.
 
 use super::record::{AuditEvent, AuditType};
-use crate::errno::{retry_on_eintr, Errno, Result};
+use crate::errno::{Errno, Result, retry_on_eintr};
 use std::fmt;
 use std::fmt::Write as _;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -206,7 +206,7 @@ impl AuditSocket {
         match sent {
             Ok(_) => {}
             Err(Errno::EPERM | Errno::ECONNREFUSED) => {
-                return Ok(SendStatus::Unavailable)
+                return Ok(SendStatus::Unavailable);
             }
             Err(e) => return Err(e),
         }

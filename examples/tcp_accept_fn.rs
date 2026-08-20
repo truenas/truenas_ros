@@ -18,8 +18,8 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 use truenas_ros::net::server::{
-    length_prefix_header, ClientAddr, Endian, Incoming, PrefixWidth, Protocol,
-    Request, Response, Server, ServerAddr, ServerConfig,
+    ClientAddr, Endian, Incoming, PrefixWidth, Protocol, Request, Response,
+    Server, ServerAddr, ServerConfig, length_prefix_header,
 };
 
 /// Prepend a 4-byte BE length so the client can length-delimit the reply.

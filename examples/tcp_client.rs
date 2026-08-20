@@ -31,8 +31,8 @@ use truenas_ros::net::client::{
     Client, ClientConfig, ConnId, ConnectOpts, Event, RequestId,
 };
 use truenas_ros::net::server::{
-    length_prefix_header, length_prefixed, ClientAddr, Endian, PrefixWidth,
-    Server, ServerAddr, ShutdownHandle,
+    ClientAddr, Endian, PrefixWidth, Server, ServerAddr, ShutdownHandle,
+    length_prefix_header, length_prefixed,
 };
 
 /// Frame a payload with a 4-byte big-endian length prefix (not counting

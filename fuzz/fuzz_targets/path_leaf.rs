@@ -13,7 +13,7 @@
 //! it accepts must convert without panicking.
 
 use libfuzzer_sys::fuzz_target;
-use truenas_ros::uring_fs::{fuzz::leaf_to_cstring, Leaf};
+use truenas_ros::uring_fs::{Leaf, fuzz::leaf_to_cstring};
 
 fuzz_target!(|data: &[u8]| {
     let Ok(leaf) = Leaf::new(data) else {

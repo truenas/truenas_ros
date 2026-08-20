@@ -27,8 +27,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use truenas_ros::uring_fs::{
-    fuzz::{decode_groups, decode_request},
     Caps, MAX_GROUPS, MAX_RINGS,
+    fuzz::{decode_groups, decode_request},
 };
 
 /// `HDR_LEN` from `src/uring_fs/broker.rs`.

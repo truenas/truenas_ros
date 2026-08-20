@@ -217,7 +217,7 @@ mod tests {
     /// directly. Contrast `fsync`, which `empty_fops` refuses with `EINVAL`.
     #[test]
     fn an_o_path_descriptor_is_enough() {
-        use super::super::{openat2, OFlag, OpenHow};
+        use super::super::{OFlag, OpenHow, openat2};
         let dir = crate::tempdir().unwrap();
         let how = OpenHow::new().flags(OFlag::O_PATH | OFlag::O_DIRECTORY);
         let fd =

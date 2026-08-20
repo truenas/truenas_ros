@@ -1,13 +1,13 @@
 //! Higher-level mount helpers built on `statmount`/`listmount`/`umount2`.
 
 use super::{
-    listmount, statmount, umount2, MntFlags, Statmount, StatmountMask,
+    MntFlags, Statmount, StatmountMask, listmount, statmount, umount2,
 };
+use crate::AT_FDCWD;
 use crate::errno::{self, Errno};
 use crate::error::{Error, Result};
-use crate::sync_fs::{openat2, statx, AtFlags, OFlag, OpenHow, ResolveFlag};
+use crate::sync_fs::{AtFlags, OFlag, OpenHow, ResolveFlag, openat2, statx};
 use crate::sync_fs::{StatxAttr, StatxMask};
-use crate::AT_FDCWD;
 use std::os::fd::AsFd;
 use std::path::Path;
 
@@ -56,7 +56,7 @@ pub fn statmount_path(path: &Path) -> Result<Statmount> {
         Err(Errno::ELOOP) => {
             return Err(Error::SymlinkInPath {
                 path: path.to_path_buf(),
-            })
+            });
         }
         Err(e) => return Err(e.into()),
     };

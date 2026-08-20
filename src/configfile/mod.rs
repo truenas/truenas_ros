@@ -59,12 +59,12 @@ mod interp;
 mod parse;
 mod write;
 
+use crate::AT_FDCWD;
 use crate::errno::Errno;
 use crate::error::{Error, Result};
 use crate::sync_fs::{
-    atomic_replace, safe_open, AtomicWriteOptions, Mode, OFlag,
+    AtomicWriteOptions, Mode, OFlag, atomic_replace, safe_open,
 };
-use crate::AT_FDCWD;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -717,10 +717,10 @@ impl ConfigFile {
                 "option name {option:?} {why}"
             )));
         }
-        if self.interp == Interp::Basic {
-            if let Some(v) = value {
-                interp::validate_set(v, self.scrub)?;
-            }
+        if self.interp == Interp::Basic
+            && let Some(v) = value
+        {
+            interp::validate_set(v, self.scrub)?;
         }
         let scrub = self.scrub;
         let slot = if section == DEFAULT_SECTION {
@@ -971,7 +971,7 @@ fn read_filled(file: &mut std::fs::File, buf: &mut [u8]) -> Result<usize> {
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                return Err(Errno::try_from(e).unwrap_or(Errno::EIO).into())
+                return Err(Errno::try_from(e).unwrap_or(Errno::EIO).into());
             }
         };
         if n == 0 {

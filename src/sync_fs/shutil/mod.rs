@@ -20,24 +20,24 @@
 mod copy;
 
 pub use copy::{
-    clonefile, copy_permissions, copy_setid, copy_xattrs, copyfile,
-    copysendfile, copyuserspace, MAX_RW_SZ,
+    MAX_RW_SZ, clonefile, copy_permissions, copy_setid, copy_xattrs, copyfile,
+    copysendfile, copyuserspace,
 };
 
 use copy::SETID_BITS;
 
-use crate::errno::{retry_on_eintr, Errno};
+use crate::AT_FDCWD;
+use crate::errno::{Errno, retry_on_eintr};
 use crate::error::{Error, Result};
 use crate::mount;
 use crate::path::TnPath;
 use crate::sync_fs::iter::{EntryType, FsIterBuilder};
 use crate::sync_fs::xattr::flistxattr;
 use crate::sync_fs::{
-    openat2, renameat2, statx, AtFlags, OFlag, OpenHow, RenameFlags,
-    ResolveFlag, Statx,
+    AtFlags, OFlag, OpenHow, RenameFlags, ResolveFlag, Statx, openat2,
+    renameat2, statx,
 };
 use crate::sync_fs::{Mode, StatxMask};
-use crate::AT_FDCWD;
 use std::ffi::{CString, OsStr, OsString};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;

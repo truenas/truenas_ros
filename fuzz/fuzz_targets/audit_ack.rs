@@ -15,7 +15,7 @@
 //! stale success would mean an audit record silently lost.
 
 use libfuzzer_sys::fuzz_target;
-use truenas_ros::audit::{fuzz::decode_ack, SendStatus};
+use truenas_ros::audit::{SendStatus, fuzz::decode_ack};
 
 /// `NLMSG_HDRLEN`.
 const HDRLEN: usize = 16;

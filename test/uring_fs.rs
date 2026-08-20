@@ -23,10 +23,10 @@ use truenas_ros::sync_fs::{
     StatxMask, ZfsAttr,
 };
 use truenas_ros::uring_fs::{
-    query_directory, query_tree, Advice, Anchor, AsUser, Caps, CredBroker,
-    CredHandle, EnrichSpec, File, FsConfig, FsHandle, IdentityCache, Leaf,
-    Order, Personality, PrivilegedXattrs, QueryOptions, RwFlags,
-    ShutdownHandle, TreeCursor, TreeOptions, UringFs,
+    Advice, Anchor, AsUser, Caps, CredBroker, CredHandle, EnrichSpec, File,
+    FsConfig, FsHandle, IdentityCache, Leaf, Order, Personality,
+    PrivilegedXattrs, QueryOptions, RwFlags, ShutdownHandle, TreeCursor,
+    TreeOptions, UringFs, query_directory, query_tree,
 };
 use truenas_ros::{Errno, Error};
 
@@ -42,10 +42,10 @@ use truenas_ros::{Errno, Error};
 #[track_caller]
 fn zfs_dir_or_skip() -> Option<PathBuf> {
     for var in ["TRUENAS_ROS_NFS4_DATASET", "TRUENAS_ROS_POSIX_DATASET"] {
-        if let Some(d) = std::env::var_os(var).map(PathBuf::from) {
-            if d.is_dir() {
-                return Some(d);
-            }
+        if let Some(d) = std::env::var_os(var).map(PathBuf::from)
+            && d.is_dir()
+        {
+            return Some(d);
         }
     }
     for fallback in ["/NFSV4ACL", "/POSIXACL"] {
@@ -1740,7 +1740,7 @@ fn query_directory_lists_and_enriches() {
     use std::collections::BTreeMap;
     use std::ffi::CString;
     use truenas_ros::uring_fs::{
-        query_directory, DirEntry, EnrichSpec, QueryOptions,
+        DirEntry, EnrichSpec, QueryOptions, query_directory,
     };
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -1801,7 +1801,7 @@ fn query_directory_lists_and_enriches() {
 fn query_directory_discovers_user_xattrs() {
     use std::collections::BTreeMap;
     use truenas_ros::uring_fs::{
-        query_directory, EnrichSpec, QueryOptions, XattrNamespaces,
+        EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
     };
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -1867,7 +1867,7 @@ fn query_directory_discovers_user_xattrs() {
 fn query_directory_discovers_non_utf8_name() {
     use std::ffi::CString;
     use truenas_ros::uring_fs::{
-        query_directory, EnrichSpec, QueryOptions, XattrNamespaces,
+        EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
     };
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -1918,7 +1918,7 @@ fn query_directory_discovers_non_utf8_name() {
 #[test]
 fn query_directory_discovers_large_value() {
     use truenas_ros::uring_fs::{
-        query_directory, EnrichSpec, QueryOptions, XattrNamespaces,
+        EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
     };
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -1970,7 +1970,7 @@ fn query_directory_discovers_large_value() {
 #[test]
 fn query_directory_explicit_large_value() {
     use truenas_ros::uring_fs::{
-        query_directory, EnrichSpec, QueryOptions, XattrNamespaces,
+        EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
     };
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -2023,7 +2023,7 @@ fn query_directory_explicit_large_value() {
 fn query_directory_discovery_drops_unreadable_trusted() {
     use std::collections::BTreeMap;
     use truenas_ros::uring_fs::{
-        query_directory, EnrichSpec, QueryOptions, XattrNamespaces,
+        EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
     };
 
     if !is_root() {
@@ -2148,7 +2148,7 @@ fn query_pool_discovers_xattrs() {
 fn query_directory_enumeration_obeys_dac() {
     use std::ffi::CString;
     use truenas_ros::errno::Errno;
-    use truenas_ros::uring_fs::{query_directory, EnrichSpec, QueryOptions};
+    use truenas_ros::uring_fs::{EnrichSpec, QueryOptions, query_directory};
 
     if !is_root() {
         return; // the broker cannot become another uid without CAP_SETUID
@@ -2193,7 +2193,7 @@ fn query_directory_enumeration_obeys_dac() {
 #[test]
 fn query_directory_drop_closes_dir_fd() {
     use std::ffi::CString;
-    use truenas_ros::uring_fs::{query_directory, EnrichSpec, QueryOptions};
+    use truenas_ros::uring_fs::{EnrichSpec, QueryOptions, query_directory};
 
     with_fs(test_cfg(), |h, me, dir, _stop| {
         for i in 0..6 {

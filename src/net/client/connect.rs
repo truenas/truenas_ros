@@ -9,7 +9,7 @@
 use super::{Client, ConnId, ConnectOpts, Event};
 use crate::errno::{self, Errno};
 use crate::fd::owned_from_raw;
-use crate::net::core::conn::{pack, Connection, Op};
+use crate::net::core::conn::{Connection, Op, pack};
 use crate::net::core::protocol::{ClientAddr, Framing, ServerAddr};
 use crate::net::core::sock::{build_sockaddr, set_opt};
 use crate::net::core::table::PendingConnect;
@@ -279,17 +279,17 @@ where
         let out = loop {
             match self.next_event()? {
                 Some(Event::Connected { conn: c }) if c == conn => {
-                    break Ok(conn)
+                    break Ok(conn);
                 }
                 Some(Event::ConnectFailed { conn: c, err }) if c == conn => {
-                    break Err(err.into())
+                    break Err(err.into());
                 }
                 Some(ev) => stash.push_back(ev),
                 None => {
                     break Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "connection ended before it was established",
-                    ))
+                    ));
                 }
             }
         };

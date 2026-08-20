@@ -21,11 +21,11 @@
 //! Payloads over 64 bytes are offloaded; smaller ones are answered inline.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use truenas_ros::net::server::{
-    length_prefix_header, Endian, Incoming, PrefixWidth, Protocol, Request,
-    Response, Server, ServerAddr,
+    Endian, Incoming, PrefixWidth, Protocol, Request, Response, Server,
+    ServerAddr, length_prefix_header,
 };
 
 /// Frame a payload with a 4-byte BE length prefix.

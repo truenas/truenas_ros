@@ -24,8 +24,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use truenas_ros::net::server::{
-    length_prefixed, ClientAddr, Endian, PrefixWidth, Server, ServerAddr,
-    ServerConfig, ShutdownHandle,
+    ClientAddr, Endian, PrefixWidth, Server, ServerAddr, ServerConfig,
+    ShutdownHandle, length_prefixed,
 };
 
 /// Frame a payload with a 4-byte BE length prefix.

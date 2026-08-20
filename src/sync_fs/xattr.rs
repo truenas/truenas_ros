@@ -4,7 +4,7 @@
 //! extension's
 //! buffer-sizing and retry behaviour and enforce TrueNAS's 2 MiB per-value cap.
 
-use crate::errno::{self, retry_on_eintr, Errno};
+use crate::errno::{self, Errno, retry_on_eintr};
 use crate::path::TnPath;
 use std::ffi::{CStr, CString};
 use std::os::fd::{AsFd, AsRawFd, RawFd};

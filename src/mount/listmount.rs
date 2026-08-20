@@ -1,6 +1,6 @@
 //! `listmount(2)` - enumerate mount ids beneath a mount.
 
-use super::{MntIdReq, MNT_ID_REQ_SIZE_VER1, SYS_LISTMOUNT};
+use super::{MNT_ID_REQ_SIZE_VER1, MntIdReq, SYS_LISTMOUNT};
 use crate::errno::{self, retry_on_eintr};
 
 /// Sentinel `mnt_id` selecting the root of the mount namespace.

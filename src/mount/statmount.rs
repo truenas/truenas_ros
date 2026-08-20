@@ -1,9 +1,9 @@
 //! `statmount(2)` - detailed information about a single mount.
 
 use super::{
-    MntIdReq, MntPropagation, MountAttr, MNT_ID_REQ_SIZE_VER1, SYS_STATMOUNT,
+    MNT_ID_REQ_SIZE_VER1, MntIdReq, MntPropagation, MountAttr, SYS_STATMOUNT,
 };
-use crate::errno::{self, retry_on_eintr, Errno};
+use crate::errno::{self, Errno, retry_on_eintr};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;

@@ -13,8 +13,8 @@
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use truenas_ros::sync_fs::acl::{
-    fgetacl, fsetacl, Acl, Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag,
-    Nfs4Flag, Nfs4Perm, Nfs4Who, PosixAce, PosixAcl, PosixPerm, PosixTag,
+    Acl, Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag, Nfs4Flag, Nfs4Perm,
+    Nfs4Who, PosixAce, PosixAcl, PosixPerm, PosixTag, fgetacl, fsetacl,
 };
 use truenas_ros::sync_fs::xattr::fgetxattr;
 
@@ -108,10 +108,11 @@ fn nfs4_codec_and_named_user_roundtrip() {
         other => panic!("expected nfs4, got {other:?}"),
     };
     assert!(!back.trivial());
-    assert!(back
-        .aces
-        .iter()
-        .any(|a| a.who_type == Nfs4Who::Named && a.who_id == uid));
+    assert!(
+        back.aces
+            .iter()
+            .any(|a| a.who_type == Nfs4Who::Named && a.who_id == uid)
+    );
     let raw = fgetxattr(f.as_fd(), "system.nfs4_acl_xdr").unwrap();
     assert_eq!(
         back.to_xattr().unwrap(),
@@ -170,10 +171,11 @@ fn posix_named_user_roundtrip_on_zfs() {
         Ok(Acl::Posix(a)) => a,
         other => panic!("expected posix, got {other:?}"),
     };
-    assert!(back
-        .access
-        .iter()
-        .any(|a| a.tag == PosixTag::User && a.id == uid));
+    assert!(
+        back.access
+            .iter()
+            .any(|a| a.tag == PosixTag::User && a.id == uid)
+    );
     let raw = fgetxattr(f.as_fd(), "system.posix_acl_access").unwrap();
     assert_eq!(
         back.access_bytes().unwrap(),

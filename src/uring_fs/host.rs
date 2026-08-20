@@ -4,20 +4,20 @@
 //! same [`FsCore`] on its own ring.)
 
 use super::core::{
-    deliver_embedded, deliver_pool_completions, FsCore, FsWaiter, TAG_CANCEL,
-    TAG_WAKE,
+    FsCore, FsWaiter, TAG_CANCEL, TAG_WAKE, deliver_embedded,
+    deliver_pool_completions,
 };
 use super::{
     FsHandle, FsInject, FsOutcome, OffloadBounds, Personality, PrivilegedXattrs,
 };
 use crate::errno::{self, Errno};
-use crate::sync::{mpsc, Arc};
+use crate::sync::{Arc, mpsc};
 use crate::uring::engine::Engine;
 use crate::uring::probe::probe_op_supported;
 use crate::uring::sys::{
-    register_personality, IoUringCqe, IORING_CQE_F_MORE, IORING_OP_OPENAT2,
+    IORING_CQE_F_MORE, IORING_OP_OPENAT2, IoUringCqe, register_personality,
 };
-use crate::uring::user_data::{pack_raw, unpack_raw, SLOT_MASK, TAG_FS_DOMAIN};
+use crate::uring::user_data::{SLOT_MASK, TAG_FS_DOMAIN, pack_raw, unpack_raw};
 use crate::uring::wake::LoopShared;
 use std::fmt;
 use std::sync::atomic::Ordering;
@@ -487,8 +487,8 @@ mod tests {
     use crate::sync_fs::{OFlag, OpenHow};
     use crate::uring::ring::Ring;
     use crate::uring::sys::{
-        io_uring_setup, unregister_personality, IoUringParams,
         IORING_OP_FGETXATTR, IORING_OP_FSETXATTR, IORING_SETUP_SINGLE_ISSUER,
+        IoUringParams, io_uring_setup, unregister_personality,
     };
     use crate::uring_fs::{Anchor, FsConfig, Personality, RwFlags};
     use std::ffi::CString;

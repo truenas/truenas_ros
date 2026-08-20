@@ -98,11 +98,10 @@ impl<K: Clone + Eq + Hash, V: Clone> SingleFlight<K, V> {
                     // Only if the map still holds *this* slot - a concurrent
                     // `invalidate` may have replaced it, and that one is not
                     // ours to drop.
-                    if let Ok(mut live) = self.live.lock() {
-                        if live.get(key).is_some_and(|s| Arc::ptr_eq(s, &slot))
-                        {
-                            live.remove(key);
-                        }
+                    if let Ok(mut live) = self.live.lock()
+                        && live.get(key).is_some_and(|s| Arc::ptr_eq(s, &slot))
+                    {
+                        live.remove(key);
                     }
                     return Err(e);
                 }

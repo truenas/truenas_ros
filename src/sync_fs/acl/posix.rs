@@ -146,7 +146,7 @@ fn encode_aces(aces: &[PosixAce]) -> Result<Vec<u8>> {
                     return Err(Error::Validation(format!(
                         "POSIX ACL entry id {} is not a valid uid/gid",
                         a.id
-                    )))
+                    )));
                 }
             }
         };
@@ -469,9 +469,11 @@ mod tests {
         assert!(named_user(SPECIAL_ID as i64).access_bytes().is_err());
         assert!(named_user(u32::MAX as i64 + 1).access_bytes().is_err());
         // A special entry's `id` is never encoded.
-        assert!(PosixAcl::from_aces([ace(PosixTag::UserObj, i64::MAX)])
-            .access_bytes()
-            .is_ok());
+        assert!(
+            PosixAcl::from_aces([ace(PosixTag::UserObj, i64::MAX)])
+                .access_bytes()
+                .is_ok()
+        );
         // The default list is encoded by the same rules.
         let mut acl = named_user(1000);
         acl.default = Some(vec![PosixAce {
@@ -523,20 +525,24 @@ mod tests {
 
     #[test]
     fn trivial_only_when_synthesized_and_no_default() {
-        assert!(!PosixAcl::from_aces([PosixAce {
-            tag: PosixTag::UserObj,
-            perms: PosixPerm::READ,
-            id: -1,
-            default: false,
-        }])
-        .trivial());
+        assert!(
+            !PosixAcl::from_aces([PosixAce {
+                tag: PosixTag::UserObj,
+                perms: PosixPerm::READ,
+                id: -1,
+                default: false,
+            }])
+            .trivial()
+        );
         assert!(synthesize_from_mode(0o600).trivial());
     }
 
     #[test]
     fn generate_inherited_needs_a_default_acl() {
-        assert!(synthesize_from_mode(0o755)
-            .generate_inherited_acl(true)
-            .is_err());
+        assert!(
+            synthesize_from_mode(0o755)
+                .generate_inherited_acl(true)
+                .is_err()
+        );
     }
 }

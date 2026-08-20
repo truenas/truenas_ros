@@ -3,9 +3,9 @@
 //! These operate on open file descriptors and a single source/destination
 //! pair; [`super::copytree`] composes them across a tree.
 
-use crate::errno::{self, retry_on_eintr, Errno};
+use crate::errno::{self, Errno, retry_on_eintr};
 use crate::error::Result;
-use crate::sync_fs::xattr::{fgetxattr, fsetxattr, XattrFlags};
+use crate::sync_fs::xattr::{XattrFlags, fgetxattr, fsetxattr};
 use std::ffi::{CStr, CString};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr;

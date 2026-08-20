@@ -1,6 +1,6 @@
 //! Symlink-safe open (`safe_open`).
 
-use super::{openat2, Mode, OFlag, OpenHow, ResolveFlag};
+use super::{Mode, OFlag, OpenHow, ResolveFlag, openat2};
 use crate::errno::Errno;
 use crate::error::{Error, Result};
 use std::fs::File;

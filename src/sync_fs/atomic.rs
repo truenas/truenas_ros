@@ -1,13 +1,13 @@
 //! Atomic, symlink-safe file replacement (`atomic_write` / `atomic_replace`).
 
 use super::{
-    openat2, renameat2, statx, AtFlags, Mode, OFlag, OpenHow, RenameFlags,
-    ResolveFlag, StatxMask,
+    AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, StatxMask,
+    openat2, renameat2, statx,
 };
-use crate::errno::{retry_on_eintr, Errno};
+use crate::AT_FDCWD;
+use crate::errno::{Errno, retry_on_eintr};
 use crate::error::{Error, Result};
 use crate::path::TnPath;
-use crate::AT_FDCWD;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, Permissions};
 use std::io::{self, Write};
@@ -83,7 +83,7 @@ where
         Err(Errno::ELOOP) => {
             return Err(Error::SymlinkInPath {
                 path: parent.to_path_buf(),
-            })
+            });
         }
         Err(e) => return Err(e.into()),
     };

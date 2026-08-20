@@ -57,8 +57,8 @@
 //! the depth at which the chain broke.
 
 use super::{
-    query_dir::{query_directory, DirEntry, Order, QueryDir, QueryOptions},
-    Anchor, File, FsHandle, Personality, CONFINED_RESOLVE,
+    Anchor, CONFINED_RESOLVE, File, FsHandle, Personality,
+    query_dir::{DirEntry, Order, QueryDir, QueryOptions, query_directory},
 };
 use crate::errno::Errno;
 use crate::sync_fs::{OFlag, OpenHow};
@@ -406,10 +406,10 @@ impl QueryTree {
             // Enter the directory yielded last time, unless the caller said
             // not to. Done here rather than at yield time so a pruned
             // directory costs no `open` at all.
-            if let Some(path) = self.pending.take() {
-                if let Err(e) = self.descend(&path) {
-                    return Some(Err(e));
-                }
+            if let Some(path) = self.pending.take()
+                && let Err(e) = self.descend(&path)
+            {
+                return Some(Err(e));
             }
 
             let frame = self.stack.last_mut()?;
@@ -662,7 +662,7 @@ pub fn query_tree(
                     path: std::path::PathBuf::from(
                         String::from_utf8_lossy(&path).into_owned(),
                     ),
-                })
+                });
             }
         }
     }
@@ -782,9 +782,11 @@ mod tests {
         }
 
         // Nothing to skip past on a file key, so the bit does not attach.
-        assert!(!TreeCursor::from_key("a.txt")
-            .skipping_subtree()
-            .skips_subtree());
+        assert!(
+            !TreeCursor::from_key("a.txt")
+                .skipping_subtree()
+                .skips_subtree()
+        );
     }
 
     /// A directory key's trailing `/` must not become an empty component, or

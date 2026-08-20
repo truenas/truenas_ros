@@ -1,7 +1,7 @@
 [package]
 name = "truenas_ros"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.97.1"
 license = "MIT"
 description = "Idiomatic Rust bindings for modern Linux filesystem/mount syscalls, ACLs, and related utilities (the Rust equivalent of truenas_pyos)."

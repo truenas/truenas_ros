@@ -69,14 +69,13 @@ pub(crate) fn listen_socket(
         }
     }
 
-    if let ServerAddr::Unix(path) = addr {
-        if cfg.unlink_unix {
-            if let Ok(c) = CString::new(path.as_os_str().as_bytes()) {
-                // SAFETY: best-effort unlink of a valid NUL-terminated path;
-                // failure (e.g. ENOENT) is intentionally ignored.
-                unsafe { libc::unlink(c.as_ptr()) };
-            }
-        }
+    if let ServerAddr::Unix(path) = addr
+        && cfg.unlink_unix
+        && let Ok(c) = CString::new(path.as_os_str().as_bytes())
+    {
+        // SAFETY: best-effort unlink of a valid NUL-terminated path;
+        // failure (e.g. ENOENT) is intentionally ignored.
+        unsafe { libc::unlink(c.as_ptr()) };
     }
 
     let sa = build_sockaddr(addr)?;

@@ -7,11 +7,11 @@
 //! client's `self.framer` (not a handler bundle) and a delivered message becomes
 //! an [`Event::Reply`] via `deliver_reply` rather than a body-handler call.
 
+use super::Client;
 use super::connect::ts_of;
 use super::event::{ConnId, Event, RequestId};
-use super::Client;
 use crate::errno;
-use crate::net::core::conn::{pack, unpack, Op};
+use crate::net::core::conn::{Op, pack, unpack};
 use crate::net::core::protocol::{Body, CloseReason, Framing};
 use crate::net::core::reactor::{
     Enacted, Gate, RecvStep, SendStep, SpliceStep,
@@ -325,17 +325,17 @@ where
                     break Err(io::Error::new(
                         io::ErrorKind::ConnectionReset,
                         format!("connection closed before reply: {reason:?}"),
-                    ))
+                    ));
                 }
                 Some(Event::ConnectFailed { conn: c, err }) if c == conn => {
-                    break Err(io::Error::from(err))
+                    break Err(io::Error::from(err));
                 }
                 Some(ev) => stash.push_back(ev),
                 None => {
                     break Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "no reply before all connections ended",
-                    ))
+                    ));
                 }
             }
         };
@@ -498,10 +498,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Errno;
     use crate::net::client::{ClientConfig, ConnectOpts};
     use crate::net::core::protocol::ServerAddr;
     use crate::uring::sys::IoUringCqe;
-    use crate::Errno;
     use std::net::{SocketAddr, TcpListener};
     use std::thread;
     use std::time::Instant;

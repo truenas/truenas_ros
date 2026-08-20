@@ -5,8 +5,8 @@
 
 use super::Server;
 use crate::errno::{self, Errno};
-use crate::net::core::conn::{pack, Connection, Op};
-use crate::net::core::handles::{stat, AcceptDeferral, HandshakeOutcome};
+use crate::net::core::conn::{Connection, Op, pack};
+use crate::net::core::handles::{AcceptDeferral, HandshakeOutcome, stat};
 use crate::net::core::probe::fill_getsockopt_cmd;
 use crate::net::core::protocol::{ClientAddr, Framing, PeerCred, ServerAddr};
 use crate::net::core::sock;
@@ -212,7 +212,7 @@ where
             None => {
                 // Guarded at serve_forever, so unreachable in practice.
                 drop(deferral); // -> reject via Drop, drained next wake
-                                // SAFETY: close the furnished fd we won't use.
+                // SAFETY: close the furnished fd we won't use.
                 unsafe { libc::close(fd) };
             }
         }

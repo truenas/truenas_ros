@@ -38,14 +38,14 @@
 //! [`FsIterBuilder::build`] returns [`Error::IteratorRestore`]; recover by
 //! [`Cookie::truncate`]-ing to that `depth` and rebuilding.
 
-use crate::errno::{self, retry_on_eintr, Errno};
+use crate::AT_FDCWD;
+use crate::errno::{self, Errno, retry_on_eintr};
 use crate::error::{Error, Result};
 use crate::fd::owned_from_raw;
-use crate::mount::{statmount, StatmountMask};
+use crate::mount::{StatmountMask, statmount};
 use crate::sync_fs::{
-    openat2, statx, AtFlags, OFlag, OpenHow, ResolveFlag, Statx, StatxMask,
+    AtFlags, OFlag, OpenHow, ResolveFlag, Statx, StatxMask, openat2, statx,
 };
-use crate::AT_FDCWD;
 use std::ffi::{CStr, OsStr, OsString};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -517,7 +517,7 @@ impl FsIter {
                     return Err(Error::Validation(format!(
                         "btime_cutoff is set but {name:?} is on a filesystem \
                          that reports no birth time"
-                    )))
+                    )));
                 }
             }
         }
@@ -720,14 +720,14 @@ impl FsIterBuilder {
             StatmountMask::SB_BASIC | StatmountMask::SB_SOURCE,
         ) {
             Ok(sm) => {
-                if let Some(source) = sm.sb_source {
-                    if source != self.filesystem_name {
-                        return Err(Error::MountSourceMismatch {
-                            expected: self.filesystem_name,
-                            found: source,
-                            path: root_path,
-                        });
-                    }
+                if let Some(source) = sm.sb_source
+                    && source != self.filesystem_name
+                {
+                    return Err(Error::MountSourceMismatch {
+                        expected: self.filesystem_name,
+                        found: source,
+                        path: root_path,
+                    });
                 }
             }
             // Kernel too old to report sb_source: skip validation.

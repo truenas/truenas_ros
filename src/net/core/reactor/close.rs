@@ -5,7 +5,7 @@
 
 use super::Reactor;
 use crate::errno::{self, Errno};
-use crate::net::core::conn::{pack, Op};
+use crate::net::core::conn::{Op, pack};
 use crate::net::core::protocol::CloseReason;
 use crate::uring::sys::*;
 

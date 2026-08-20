@@ -1,7 +1,7 @@
 //! The volatile zeroing burn shared by [`secrets`](crate::secrets) (which
 //! re-exports it) and `configfile`'s scrub-on-release mode.
 
-use std::sync::atomic::{compiler_fence, Ordering};
+use std::sync::atomic::{Ordering, compiler_fence};
 
 /// Overwrite `len` bytes at `p` with zeroes so the optimizer cannot elide it.
 ///

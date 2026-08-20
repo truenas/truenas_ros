@@ -10,7 +10,7 @@ use crate::errno::{self, retry_on_eintr};
 use crate::error::{Error, Result};
 use crate::fd::owned_from_raw;
 use crate::path::TnPath;
-use crate::sync_fs::{statx, AtFlags, OFlag, StatxMask};
+use crate::sync_fs::{AtFlags, OFlag, StatxMask, statx};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 
 /// Maximum size of the opaque handle data (`MAX_HANDLE_SZ`).

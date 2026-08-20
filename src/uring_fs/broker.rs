@@ -94,7 +94,7 @@
 //!   effective from permitted - but it is the accurate statement.
 
 use super::{Personality, UringFs};
-use crate::errno::{self, retry_on_eintr, Errno};
+use crate::errno::{self, Errno, retry_on_eintr};
 use crate::sync::{Arc, Mutex};
 use std::ffi::c_void;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -1398,11 +1398,11 @@ fn register_as(
     // is about to capture. Ordered after the euid check on purpose: the
     // credentials being elevated must already be proven to be the requested
     // identity's, never root's.
-    if !caps.is_empty() {
-        if let Err(e) = raise_effective_caps(caps) {
-            revert();
-            return -(e as i32 as i64);
-        }
+    if !caps.is_empty()
+        && let Err(e) = raise_effective_caps(caps)
+    {
+        revert();
+        return -(e as i32 as i64);
     }
 
     let out = match crate::uring::sys::register_personality(ring_fd) {

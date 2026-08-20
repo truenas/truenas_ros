@@ -50,11 +50,7 @@ fn unsupported(e: Errno) -> bool {
 fn page_size() -> usize {
     // SAFETY: `sysconf` with a valid name reads no memory and returns a long.
     let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if n > 0 {
-        n as usize
-    } else {
-        4096
-    }
+    if n > 0 { n as usize } else { 4096 }
 }
 
 /// A `memfd_secret`-backed region holding `len` secret bytes.
@@ -258,20 +254,15 @@ pub(crate) fn vm_flags_of(addr: usize) -> Option<String> {
     let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
     let mut in_region = false;
     for line in smaps.lines() {
-        if let Some(range) = line.split(' ').next() {
-            if let Some((lo, hi)) = range.split_once('-') {
-                if let (Ok(lo), Ok(hi)) = (
-                    usize::from_str_radix(lo, 16),
-                    usize::from_str_radix(hi, 16),
-                ) {
-                    in_region = addr >= lo && addr < hi;
-                }
-            }
+        if let Some(range) = line.split(' ').next()
+            && let Some((lo, hi)) = range.split_once('-')
+            && let (Ok(lo), Ok(hi)) =
+                (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
+        {
+            in_region = addr >= lo && addr < hi;
         }
-        if in_region {
-            if let Some(f) = line.strip_prefix("VmFlags:") {
-                return Some(f.trim().to_string());
-            }
+        if in_region && let Some(f) = line.strip_prefix("VmFlags:") {
+            return Some(f.trim().to_string());
         }
     }
     None
