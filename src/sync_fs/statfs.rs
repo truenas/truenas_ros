@@ -87,6 +87,28 @@ impl Statfs {
         self.0.f_type
     }
 
+    /// Filesystem id (`f_fsid`), as its two raw `int` halves, verbatim.
+    ///
+    /// This accessor exists because the libc crate keeps `fsid_t`'s only
+    /// field private, so the value [`raw`](Self::raw) hands back is opaque -
+    /// a consumer cannot read it at all without an unsafe cast of its own.
+    /// How the halves combine into one id is the caller's semantic, so none
+    /// is imposed: ZFS, for instance, stores the objset guid's low 32 bits
+    /// in `val[0]` and high 32 bits in `val[1]` (`zfs_statvfs`,
+    /// `module/os/linux/zfs/zfs_vfsops.c`).
+    pub fn fsid(&self) -> [i32; 2] {
+        const _: () = assert!(
+            std::mem::size_of::<libc::fsid_t>()
+                == std::mem::size_of::<[i32; 2]>()
+                && std::mem::align_of::<libc::fsid_t>()
+                    == std::mem::align_of::<[i32; 2]>()
+        );
+        // SAFETY: glibc's fsid_t is exactly `int __val[2]` (bits/types.h);
+        // size and alignment are pinned above, and any bit pattern is a
+        // valid [i32; 2].
+        unsafe { *(&self.0.f_fsid as *const libc::fsid_t).cast::<[i32; 2]>() }
+    }
+
     /// The raw kernel `struct statfs`.
     pub fn raw(&self) -> &libc::statfs {
         &self.0
@@ -143,6 +165,21 @@ mod tests {
             st.total_blocks() * st.block_size(),
             "bytes derive from the reported unit, not an assumed 4096"
         );
+    }
+
+    /// The fsid halves are stable per mount: repeat calls agree, and a
+    /// subdirectory reports its filesystem's id, not its own - which is what
+    /// lets a consumer key state on the pair.
+    #[test]
+    fn fsid_is_stable_across_calls_and_paths() {
+        let dir = crate::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let a = fstatfs(File::open(dir.path()).unwrap()).unwrap();
+        let b = fstatfs(File::open(dir.path()).unwrap()).unwrap();
+        let c = fstatfs(File::open(&sub).unwrap()).unwrap();
+        assert_eq!(a.fsid(), b.fsid(), "same target, same id");
+        assert_eq!(a.fsid(), c.fsid(), "same filesystem, same id");
     }
 
     /// An `O_PATH` descriptor works, which is what lets an `Anchor` be asked

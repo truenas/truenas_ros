@@ -28,6 +28,12 @@
 //!   ([`HttpDeferred::reply`]) - so the reactor never blocks and response
 //!   policy never runs off-thread. Rides the reactor's
 //!   [`Response::Defer`](crate::net::server::Response::Defer) machinery.
+//! - **Filesystem access** (`protocol_fs`, with the `uring-fs` feature): the
+//!   same deferrable handler is additionally handed the reactor's
+//!   per-request fs facade, so an HTTP service can open, stat, and read on
+//!   the server's own ring under a per-request personality - parking the
+//!   request while ops run and completing it through the captured
+//!   [`HttpDeferred`].
 //! - **Keep-alive**: HTTP/1.1 persists unless `Connection: close`; HTTP/1.0
 //!   closes unless `Connection: keep-alive`. Close maps onto
 //!   [`Response::ReplyClose`](crate::net::server::Response::ReplyClose) --
@@ -88,6 +94,8 @@ mod response;
 pub use date::HttpDate;
 pub use framer::{HttpConfig, HttpConn};
 pub use head::{HeaderView, Version};
+#[cfg(feature = "uring-fs")]
+pub use protocol::protocol_fs;
 pub use protocol::{
     protocol, protocol_deferrable, HttpDeferPermit, HttpDeferred, HttpRequest,
     HttpVerdict,
