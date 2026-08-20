@@ -10,7 +10,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use truenas_ros::net::server::{
-    length_prefix_header, Endian, Framing, PrefixWidth,
+    Endian, Framing, PrefixWidth, length_prefix_header,
 };
 
 const WIDTHS: [(PrefixWidth, usize); 4] = [

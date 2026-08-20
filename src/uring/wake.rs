@@ -156,8 +156,8 @@ impl WakeHandle {
 #[cfg(loom)]
 mod loom_tests {
     use super::*;
-    use crate::sync::atomic::Ordering;
     use crate::sync::Arc;
+    use crate::sync::atomic::Ordering;
 
     const GRACE_MS: u64 = 30_000;
 

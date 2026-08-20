@@ -6,7 +6,7 @@
 //! [`MAX_INTERPOLATION_DEPTH`](super::MAX_INTERPOLATION_DEPTH)), and any other
 //! `%` sequence is a syntax error.
 
-use super::{optionxform, MergedView, MAX_INTERPOLATION_DEPTH};
+use super::{MAX_INTERPOLATION_DEPTH, MergedView, optionxform};
 use crate::error::{Error, Result};
 
 /// Cap on the total interpolated output for one value. [`MAX_INTERPOLATION_DEPTH`]
@@ -106,7 +106,7 @@ fn interpolate(
                                 "interpolation references missing option \
                                  {var:?}"
                             )
-                        }))
+                        }));
                     }
                 };
                 if value.contains('%') {
@@ -120,7 +120,7 @@ fn interpolate(
                     "'%' must be followed by '%' or '('".into()
                 } else {
                     format!("'%' must be followed by '%' or '(' in {rest:?}")
-                }))
+                }));
             }
         }
     }
@@ -146,11 +146,11 @@ pub(super) fn validate_set(value: &str, scrub: bool) -> Result<()> {
                 break Ok(());
             };
             let at = &rest[p..];
-            if at.as_bytes().get(1) == Some(&b'(') {
-                if let Some((_, end)) = key_ref(at) {
-                    rest = &at[end..];
-                    continue;
-                }
+            if at.as_bytes().get(1) == Some(&b'(')
+                && let Some((_, end)) = key_ref(at)
+            {
+                rest = &at[end..];
+                continue;
             }
             break Err(Error::Validation(if scrub {
                 "invalid interpolation syntax".into()

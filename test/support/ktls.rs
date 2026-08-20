@@ -41,7 +41,7 @@ pub fn self_signed() -> (Vec<u8>, Vec<u8>) {
     use openssl::hash::MessageDigest;
     use openssl::pkey::PKey;
     use openssl::rsa::Rsa;
-    use openssl::x509::{X509NameBuilder, X509};
+    use openssl::x509::{X509, X509NameBuilder};
     let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
     let mut name = X509NameBuilder::new().unwrap();
     name.append_entry_by_text("CN", "localhost").unwrap();

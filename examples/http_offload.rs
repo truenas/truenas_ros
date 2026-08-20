@@ -35,7 +35,7 @@ use std::thread;
 use std::time::Duration;
 
 use truenas_ros::http::{
-    protocol_deferrable, HttpConfig, HttpRequest, HttpResponse, HttpVerdict,
+    HttpConfig, HttpRequest, HttpResponse, HttpVerdict, protocol_deferrable,
 };
 use truenas_ros::net::server::{Incoming, Server, ServerAddr};
 

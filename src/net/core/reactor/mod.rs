@@ -19,12 +19,12 @@ pub(crate) use io::{Enacted, Gate, RecvStep, SendStep, SpliceStep};
 /// the fuzz harness (`fuzz/fuzz_targets/framing_arithmetic.rs`). Not part of
 /// the stable API.
 #[cfg(feature = "__fuzz")]
-pub use io::{frame_step, FrameStep};
+pub use io::{FrameStep, frame_step};
 
 use crate::errno;
 use crate::net::core::config::CoreConfig;
-use crate::net::core::conn::{pack, unpack, Op};
-use crate::net::core::handles::{stat, CloseHook, StatsInner};
+use crate::net::core::conn::{Op, pack, unpack};
+use crate::net::core::handles::{CloseHook, StatsInner, stat};
 use crate::net::core::table::ConnTable;
 use crate::sync::Arc;
 use crate::uring::engine::Engine;

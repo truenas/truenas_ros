@@ -8,7 +8,7 @@
 //! structures and only merged into `cfg` once the whole document parses, so a
 //! parse error leaves the target untouched.
 
-use super::{optionxform, ConfigFile, Ordered, DEFAULT_SECTION};
+use super::{ConfigFile, DEFAULT_SECTION, Ordered, optionxform};
 use crate::error::{Error, Result};
 use std::collections::HashSet;
 
@@ -166,15 +166,14 @@ pub(super) fn read(
             // A truly blank line (not a comment) extends an open multi-line
             // value with an empty line; the join at the end rstrips trailing
             // blanks away.
-            if !is_full_comment {
-                if let (Some(opts), Some(name)) = (
+            if !is_full_comment
+                && let (Some(opts), Some(name)) = (
                     cur_opts(&mut work.default, &mut work.sections, &cur),
                     optname.as_deref(),
-                ) {
-                    if let Some(Some(lines)) = opts.get_mut(name) {
-                        lines.push(String::new());
-                    }
-                }
+                )
+                && let Some(Some(lines)) = opts.get_mut(name)
+            {
+                lines.push(String::new());
             }
             continue;
         }
@@ -195,7 +194,7 @@ pub(super) fn read(
                     return Err(Error::Parse(format!(
                         "{source}:{lineno}: continuation line for a key with \
                          no value"
-                    )))
+                    )));
                 }
             }
             continue;

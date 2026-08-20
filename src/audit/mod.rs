@@ -72,7 +72,7 @@
 mod netlink;
 mod record;
 
-pub use netlink::{AuditSocket, SendStatus, MAX_RECORD_LEN};
+pub use netlink::{AuditSocket, MAX_RECORD_LEN, SendStatus};
 pub use record::{AuditEvent, AuditPrincipal, AuditType};
 
 /// The netlink ack decoder, exposed to the fuzz crate (`fuzz/`) under `__fuzz`

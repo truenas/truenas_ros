@@ -6,7 +6,7 @@
 
 use super::Reactor;
 use crate::errno::{self, Errno};
-use crate::net::core::conn::{pack, Op, RecvOutcome};
+use crate::net::core::conn::{Op, RecvOutcome, pack};
 use crate::net::core::handles::stat;
 use crate::net::core::protocol::{CloseReason, Framing};
 use crate::uring::sys::*;

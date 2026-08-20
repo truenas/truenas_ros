@@ -97,8 +97,8 @@ pub use head::{HeaderView, Version};
 #[cfg(feature = "uring-fs")]
 pub use protocol::protocol_fs;
 pub use protocol::{
-    protocol, protocol_deferrable, HttpDeferPermit, HttpDeferred, HttpRequest,
-    HttpVerdict,
+    HttpDeferPermit, HttpDeferred, HttpRequest, HttpVerdict, protocol,
+    protocol_deferrable,
 };
 pub use response::{HttpResponse, IntoBytes};
 
@@ -116,8 +116,8 @@ pub mod fuzz {
     use std::borrow::Cow;
 
     use super::chunked::{self, ChunkScan};
-    use super::framer::{frame, HttpConfig, HttpConn};
-    use super::head::{frame_facts, HeaderView};
+    use super::framer::{HttpConfig, HttpConn, frame};
+    use super::head::{HeaderView, frame_facts};
     use crate::net::Framing;
 
     /// Drive the framing state machine over `data`, feeding progressively

@@ -34,29 +34,29 @@ mod util;
 
 #[cfg(feature = "mount")]
 pub use fsmount::{
-    fsconfig, fsmount, fsopen, FsConfig, FsConfigCmd, FsmountFlags, FsopenFlags,
+    FsConfig, FsConfigCmd, FsmountFlags, FsopenFlags, fsconfig, fsmount, fsopen,
 };
 #[cfg(feature = "mount")]
-pub use iter::{iter_mount, open_mount_by_id, MountIter};
+pub use iter::{MountIter, iter_mount, open_mount_by_id};
 #[cfg(feature = "mount")]
-pub use listmount::{listmount, LSMT_ROOT};
+pub use listmount::{LSMT_ROOT, listmount};
 #[cfg(feature = "mount")]
-pub use move_mount::{move_mount, MoveMountFlags};
+pub use move_mount::{MoveMountFlags, move_mount};
 #[cfg(feature = "mount")]
-pub use open_tree::{open_tree, OpenTreeFlags};
+pub use open_tree::{OpenTreeFlags, open_tree};
 #[cfg(feature = "mount")]
-pub use setattr::{mount_setattr, MountSetattr};
+pub use setattr::{MountSetattr, mount_setattr};
 /// The reply decoder, for the fuzz crate only - `statmount` is a private
 /// module, so its `__fuzz` seam needs lifting to `mount::fuzz` to be reachable.
 #[cfg(all(feature = "mount", feature = "__fuzz"))]
 pub use statmount::fuzz;
 #[cfg(feature = "mount")]
-pub use statmount::{statmount, SbFlags, Statmount, StatmountMask};
+pub use statmount::{SbFlags, Statmount, StatmountMask, statmount};
 #[cfg(feature = "mount")]
-pub use umount::{umount2, MntFlags};
+pub use umount::{MntFlags, umount2};
 #[cfg(feature = "mount")]
 pub use util::{
-    is_zfs_snapshot, iter_mountinfo, statmount_path, umount, UmountOptions,
+    UmountOptions, is_zfs_snapshot, iter_mountinfo, statmount_path, umount,
 };
 
 #[cfg(feature = "mount")]

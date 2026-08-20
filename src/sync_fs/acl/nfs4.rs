@@ -267,7 +267,7 @@ impl Nfs4Acl {
                     _ => {
                         return Err(Error::Parse(
                             "invalid NFS4 special principal".into(),
-                        ))
+                        ));
                     }
                 };
                 (w, -1)

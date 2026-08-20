@@ -24,10 +24,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use truenas_ros::net::server::{
-    length_prefix_header, length_prefixed, Body, ClientAddr, CloseReason,
-    DeferPermit, Deferred, Endian, Framing, Incoming, PeerCred, PrefixWidth,
-    Protocol, PushHandle, Request, Responder, Response, Server, ServerAddr,
-    ServerConfig, ShutdownHandle,
+    Body, ClientAddr, CloseReason, DeferPermit, Deferred, Endian, Framing,
+    Incoming, PeerCred, PrefixWidth, Protocol, PushHandle, Request, Responder,
+    Response, Server, ServerAddr, ServerConfig, ShutdownHandle,
+    length_prefix_header, length_prefixed,
 };
 use truenas_ros::{Errno, Error};
 
@@ -516,8 +516,8 @@ fn tcp_bare_close_with_inflight_sibling_reuses_slot() {
                 // stays in flight and pins the descriptor.
                 sub.shutdown(Shutdown::Write)?;
                 thread::sleep(Duration::from_millis(15)); // let the bare close land
-                                                          // Reuse the just-freed index with a fresh echo; the reply must
-                                                          // be its own, and the server must stay healthy.
+                // Reuse the just-freed index with a fresh echo; the reply must
+                // be its own, and the server must stay healthy.
                 let want = format!("echo-{i}");
                 let mut c = connect_tcp(v4)?;
                 send_framed(&mut c, want.as_bytes())?;
@@ -1695,7 +1695,9 @@ fn tcp_detach_with_a_foreign_permit_closes() {
     };
     // Registered, so the close cannot be blamed on a missing handler.
     server.set_detach_handler(|_ctx, detached| {
-        panic!("a foreign permit must never reach the detach handler: {detached:?}");
+        panic!(
+            "a foreign permit must never reach the detach handler: {detached:?}"
+        );
     });
     let reasons = close_reason_channel(&mut server);
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
@@ -3156,7 +3158,7 @@ fn tcp_push_backlog_evicts() {
             send_framed(&mut publisher, b"push")?;
             assert_eq!(recv_framed(&mut publisher)?, b"ok");
             thread::sleep(Duration::from_millis(50)); // let it stall
-                                                      // Second push: queued bytes would exceed the backlog cap -> evict.
+            // Second push: queued bytes would exceed the backlog cap -> evict.
             send_framed(&mut publisher, b"push")?;
             assert_eq!(recv_framed(&mut publisher)?, b"ok");
             thread::sleep(Duration::from_millis(100)); // let eviction land
@@ -3182,8 +3184,8 @@ fn tcp_push_held_across_detach() {
     // push must neither write mid-detach (corrupting the worker's transfer)
     // nor be silently dropped: it queues against the parked connection and
     // flushes, FIFO, when the worker resumes it.
-    use std::sync::mpsc;
     use std::sync::Mutex;
+    use std::sync::mpsc;
     let push_slot: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
     let (parked_tx, parked_rx) = mpsc::channel::<()>();
     let (resume_tx, resume_rx) = mpsc::channel::<()>();
@@ -3276,8 +3278,8 @@ fn tcp_reply_close_replies_then_closes() {
     // hang up (RFC 6455 sec. 5.5.1-style close handshakes need exactly this).
     // A second request pipelined behind the first is discarded undelivered:
     // the farewell retires the recv side.
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let delivered = Arc::new(AtomicUsize::new(0));
     let reasons = Arc::new(Mutex::new(Vec::new()));
     let proto = Protocol {
@@ -3888,8 +3890,8 @@ fn tcp_push_close_during_a_detach_window_lands_at_resume() {
     // during the same window, which ride ahead of it. So the client must see
     // every held push, in order, and *then* EOF, with the close attributed to
     // the push side rather than to the worker.
-    use std::sync::mpsc;
     use std::sync::Mutex;
+    use std::sync::mpsc;
     let push_slot: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
     let (parked_tx, parked_rx) = mpsc::channel::<()>();
     let (resume_tx, resume_rx) = mpsc::channel::<()>();
@@ -3949,7 +3951,7 @@ fn tcp_push_close_during_a_detach_window_lands_at_resume() {
                 push_slot.lock().unwrap().clone().expect("stashed handle");
             push.push(echo_frame(b"farewell"));
             push.close(); // lands during the detach window
-                          // Let the loop drain both injections while still parked.
+            // Let the loop drain both injections while still parked.
             thread::sleep(Duration::from_millis(150));
             resume_tx.send(()).expect("resume signal");
 
@@ -4611,7 +4613,7 @@ fn multi_listener_pool_full_rearm() {
             drop(shed);
             drop(holder); // free the only slot
             thread::sleep(Duration::from_millis(150)); // close + deferred re-arm
-                                                       // B's accept re-armed on the freed slot; a fresh connection serves.
+            // B's accept re-armed on the freed slot; a fresh connection serves.
             let mut ok = connect_tcp(b)?;
             send_framed(&mut ok, b"revived")?;
             assert_eq!(recv_framed(&mut ok)?, b"revived");
@@ -6193,8 +6195,8 @@ fn ktls_handshake_timeout_sheds_parked_slot() {
 
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
-                                                  // Connect (raw TCP); the server furnishes the fd and parks. We never
-                                                  // handshake - the park timeout must shed each slot.
+        // Connect (raw TCP); the server furnishes the fd and parks. We never
+        // handshake - the park timeout must shed each slot.
         let peers: Vec<_> =
             (0..3).map(|_| connect_tcp(v4).expect("connect")).collect();
         let t0 = Instant::now();
@@ -7108,7 +7110,7 @@ fn fs_conn_fstatfs_agrees_from_file_and_anchor() {
                     Ok(v) => v,
                     Err(e) => {
                         return deferred
-                            .reply(echo_frame(format!("FILE {e}").as_bytes()))
+                            .reply(echo_frame(format!("FILE {e}").as_bytes()));
                     }
                 };
                 // offload -> offload: the second continuation still reaches
@@ -7250,7 +7252,7 @@ fn fs_conn_zfs_attrs_round_trip_through_the_pool() {
                         Err(e) => {
                             return deferred.reply(echo_frame(
                                 format!("GET {e}").as_bytes(),
-                            ))
+                            ));
                         }
                     };
                     fs.fset_zfs_attrs(
@@ -7348,7 +7350,7 @@ fn fs_conn_offload_result_batches_statx_and_xattrs_in_one_job() {
     use std::sync::OnceLock;
     use std::time::Duration;
     use truenas_ros::sync_fs::xattr::fgetxattr;
-    use truenas_ros::sync_fs::{statx, AtFlags, OFlag, OpenHow, StatxMask};
+    use truenas_ros::sync_fs::{AtFlags, OFlag, OpenHow, StatxMask, statx};
     use truenas_ros::uring_fs::{Anchor, Personality};
 
     let dir = truenas_ros::tempdir().unwrap();

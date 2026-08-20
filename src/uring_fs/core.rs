@@ -20,10 +20,10 @@
 
 use super::offload_pool::{OffloadBounds, SharedPool};
 use super::{
-    statx_at_flags, Anchor, File, FsOutcome, Leaf, Personality,
-    PrivilegedXattrs, ReplyTo, RwFlags,
+    Anchor, File, FsOutcome, Leaf, Personality, PrivilegedXattrs, ReplyTo,
+    RwFlags, statx_at_flags,
 };
-use crate::errno::{retry_on_eintr, Errno};
+use crate::errno::{Errno, retry_on_eintr};
 use crate::sync_fs::openat2::RawOpenHow;
 use crate::sync_fs::{
     AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, Statfs, Statx,
@@ -32,12 +32,12 @@ use crate::sync_fs::{
 use crate::uring::engine::Engine;
 use crate::uring::slots::SlotEntry;
 use crate::uring::sys::{
-    IoUringCqe, IORING_FSYNC_DATASYNC, IORING_OP_ASYNC_CANCEL,
-    IORING_OP_FADVISE, IORING_OP_FALLOCATE, IORING_OP_FGETXATTR,
-    IORING_OP_FSETXATTR, IORING_OP_FSYNC, IORING_OP_FTRUNCATE,
-    IORING_OP_LINKAT, IORING_OP_MKDIRAT, IORING_OP_OPENAT2, IORING_OP_READV,
-    IORING_OP_RENAMEAT, IORING_OP_SPLICE, IORING_OP_STATX, IORING_OP_SYMLINKAT,
-    IORING_OP_UNLINKAT, IORING_OP_WRITEV, SPLICE_F_MOVE,
+    IORING_FSYNC_DATASYNC, IORING_OP_ASYNC_CANCEL, IORING_OP_FADVISE,
+    IORING_OP_FALLOCATE, IORING_OP_FGETXATTR, IORING_OP_FSETXATTR,
+    IORING_OP_FSYNC, IORING_OP_FTRUNCATE, IORING_OP_LINKAT, IORING_OP_MKDIRAT,
+    IORING_OP_OPENAT2, IORING_OP_READV, IORING_OP_RENAMEAT, IORING_OP_SPLICE,
+    IORING_OP_STATX, IORING_OP_SYMLINKAT, IORING_OP_UNLINKAT, IORING_OP_WRITEV,
+    IoUringCqe, SPLICE_F_MOVE,
 };
 use crate::uring::user_data::{pack_raw, unpack_raw};
 use std::any::Any;
@@ -702,8 +702,8 @@ impl FsCore {
                 TAG_FADVISE => {
                     sqe.opcode = IORING_OP_FADVISE;
                     sqe.off_addr2 = off; // offset
-                                         // Length rides in `addr`; the kernel consults `len` only
-                                         // when `addr` is 0, and 0 already means "to end of file".
+                    // Length rides in `addr`; the kernel consults `len` only
+                    // when `addr` is 0, and 0 already means "to end of file".
                     sqe.addr = len64;
                     sqe.op_flags = aux32; // POSIX_FADV_* advice
                 }
@@ -716,9 +716,9 @@ impl FsCore {
                     sqe.file_index = len64 as u32; // the pipe's read end
                     sqe.off_addr2 = off; // destination offset
                     sqe.len = aux32; // bytes to move
-                                     // A pipe has no position: `splice_off_in` must be -1, or
-                                     // `do_splice` refuses it `ESPIPE`. `fd_meta` leaves `addr`
-                                     // holding a name pointer, so overwrite it.
+                    // A pipe has no position: `splice_off_in` must be -1, or
+                    // `do_splice` refuses it `ESPIPE`. `fd_meta` leaves `addr`
+                    // holding a name pointer, so overwrite it.
                     sqe.addr = u64::MAX;
                     sqe.op_flags = SPLICE_F_MOVE;
                 }
@@ -3055,9 +3055,9 @@ mod routing_fuzz {
             );
         }
         // Teardown reaps each in-flight op via the drain path -> parked Arcs drop.
-        for (tag, slot, gen) in inflight(&core) {
+        for (tag, slot, generation) in inflight(&core) {
             let cqe = IoUringCqe {
-                user_data: pack_raw(tag, slot, gen),
+                user_data: pack_raw(tag, slot, generation),
                 res: -libc::ECANCELED,
                 flags: 0,
             };

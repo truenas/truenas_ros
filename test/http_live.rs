@@ -24,7 +24,7 @@ use std::net::{SocketAddrV4, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-use truenas_ros::http::{protocol, HttpConfig, HttpRequest, HttpResponse};
+use truenas_ros::http::{HttpConfig, HttpRequest, HttpResponse, protocol};
 use truenas_ros::net::server::{Incoming, Server, ServerAddr, ShutdownHandle};
 use truenas_ros::{Errno, Error};
 
@@ -441,9 +441,9 @@ fn large_chunked_dance_takes_the_handoff_path() {
 fn with_parking_server<T: Send + 'static>(
     client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
 ) -> Option<T> {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use truenas_ros::http::{protocol_deferrable, HttpVerdict};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use truenas_ros::http::{HttpVerdict, protocol_deferrable};
 
     let cache = Arc::new(AtomicBool::new(false));
     let handler = move |req: HttpRequest<'_>, _: &mut ()| {
@@ -953,7 +953,7 @@ fn http_handler_reads_a_file_through_one_batched_job() {
     use std::sync::{Arc, OnceLock};
     use truenas_ros::http::HttpVerdict;
     use truenas_ros::sync_fs::xattr::fgetxattr;
-    use truenas_ros::sync_fs::{statx, AtFlags, OFlag, OpenHow, StatxMask};
+    use truenas_ros::sync_fs::{AtFlags, OFlag, OpenHow, StatxMask, statx};
     use truenas_ros::uring_fs::{Anchor, Personality};
 
     let dir = truenas_ros::tempdir().unwrap();

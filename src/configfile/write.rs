@@ -6,7 +6,7 @@
 //! order and a trailing blank line, embedded newlines in a value are re-indented
 //! with a tab, and (with `allow_no_value`) a valueless key is written bare.
 
-use super::{ConfigFile, Ordered, DEFAULT_SECTION};
+use super::{ConfigFile, DEFAULT_SECTION, Ordered};
 
 /// The serialization buffer. For a scrubbed configuration each growth
 /// reallocates through a burn of the old allocation, so no plaintext

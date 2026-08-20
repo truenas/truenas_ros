@@ -16,8 +16,8 @@
 #![cfg(all(target_os = "linux", feature = "audit"))]
 
 use truenas_ros::audit::{
-    AuditEvent, AuditPrincipal, AuditSocket, AuditType, SendStatus,
-    MAX_RECORD_LEN,
+    AuditEvent, AuditPrincipal, AuditSocket, AuditType, MAX_RECORD_LEN,
+    SendStatus,
 };
 use truenas_ros::errno::Errno;
 

@@ -13,7 +13,7 @@
 //! (e.g. a u64 length prefix near `u64::MAX`) from crashing the loop.
 
 use libfuzzer_sys::fuzz_target;
-use truenas_ros::net::server::{frame_step, FrameStep, Framing};
+use truenas_ros::net::server::{FrameStep, Framing, frame_step};
 
 fuzz_target!(|input: (u8, u64, u64, u64, u64, Option<u64>)| {
     let (sel, a, b, buffered, max_request_bytes, threshold) = input;

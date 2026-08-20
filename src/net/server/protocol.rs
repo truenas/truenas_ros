@@ -8,8 +8,8 @@ use super::{Deferred, Detached, PushHandle, Server};
 #[cfg(doc)]
 use crate::net::core::protocol::CloseReason;
 use crate::net::core::protocol::{
-    length_prefix_header, Body, ClientAddr, Endian, Framing, PrefixWidth,
-    SendBuf, ServerAddr,
+    Body, ClientAddr, Endian, Framing, PrefixWidth, SendBuf, ServerAddr,
+    length_prefix_header,
 };
 
 /// A body handler's decision for one request.

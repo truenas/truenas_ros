@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 // The pool is loom-modelled (`loom_tests` below), so its primitives come
 // from `crate::sync` - std's outside `--cfg loom`.
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use crate::sync::{thread, Arc, Condvar, Mutex, OnceCell};
+use crate::sync::{Arc, Condvar, Mutex, OnceCell, thread};
 
 /// Per-ring sizing for the blocking-offload pool: how many worker threads it
 /// keeps warm and how far it grows.

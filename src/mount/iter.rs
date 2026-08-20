@@ -1,10 +1,10 @@
 //! Lazy iteration over mounts (`iter_mount`) and opening a mount by id.
 
 use super::listmount::listmount;
-use super::statmount::{statmount, Statmount, StatmountMask};
-use crate::errno;
-use crate::sync_fs::{openat2, OFlag, OpenHow};
+use super::statmount::{Statmount, StatmountMask, statmount};
 use crate::AT_FDCWD;
+use crate::errno;
+use crate::sync_fs::{OFlag, OpenHow, openat2};
 use std::os::fd::OwnedFd;
 
 /// Iterator over [`Statmount`] records, produced by [`iter_mount`].

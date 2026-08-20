@@ -11,8 +11,8 @@ use crate::uring::sys::*;
 use crate::uring::wake::{LoopShared, WakeHandle};
 // `LoopShared` is loom-modelled (see `src/uring/wake.rs`), so the engine
 // builds it from `crate::sync` - std's outside `--cfg loom`.
-use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::Arc;
+use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Longest chain [`Engine::stage_chain`] will stage. A cap rather than an
 /// open-ended count because every link is one more SQE that must be staged

@@ -4,7 +4,7 @@
 
 use super::Reactor;
 use crate::errno;
-use crate::net::core::conn::{pack, Op};
+use crate::net::core::conn::{Op, pack};
 use std::sync::atomic::Ordering;
 
 impl<U> Reactor<U> {

@@ -430,8 +430,8 @@ mod wake;
 
 pub use crate::net::core::handles::AcceptDeferral;
 pub use crate::net::core::protocol::{
-    length_prefix_header, Body, ClientAddr, CloseReason, Endian, Framing,
-    PeerCred, PrefixWidth, SendBuf, ServerAddr,
+    Body, ClientAddr, CloseReason, Endian, Framing, PeerCred, PrefixWidth,
+    SendBuf, ServerAddr, length_prefix_header,
 };
 pub use config::{Listen, ServerConfig};
 pub use handles::{
@@ -439,7 +439,7 @@ pub use handles::{
     ServerStats, ShutdownHandle, StatsHandle,
 };
 pub use protocol::{
-    length_prefixed, DetachContext, Incoming, Protocol, Request, Response,
+    DetachContext, Incoming, Protocol, Request, Response, length_prefixed,
 };
 
 /// The pure framing decision, re-exported only under the `__fuzz` feature for
@@ -447,11 +447,11 @@ pub use protocol::{
 /// lives in `net::core` now (the engine that enacts it is core); re-exported
 /// here to keep the `net::server` fuzz path stable.
 #[cfg(feature = "__fuzz")]
-pub use crate::net::core::reactor::{frame_step, FrameStep};
+pub use crate::net::core::reactor::{FrameStep, frame_step};
 
 use crate::errno::{self};
 use crate::error::Error;
-use crate::net::core::conn::{unpack, Op};
+use crate::net::core::conn::{Op, unpack};
 use crate::net::core::handles::HandshakeOutcome;
 use crate::net::core::probe::{probe_ktls, probe_tcp_cmd, probe_unix_peercred};
 use crate::net::core::reactor::{KernelPads, Reactor};
@@ -819,7 +819,7 @@ where
         if self.core.fs_closed.is_empty() {
             return;
         }
-        let owners: Vec<(u32, u64)> = self.core.fs_closed.drain(..).collect();
+        let owners: Vec<(u32, u64)> = std::mem::take(&mut self.core.fs_closed);
         if let Some(fs) = self.fs.as_mut() {
             for owner in owners {
                 fs.cancel_owned_by(&mut self.core.engine, owner);
@@ -1085,10 +1085,8 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Drop
         // flight, so leak the fs op buffers alongside the connection buffers
         // rather than free memory the kernel might yet write into.
         #[cfg(feature = "uring-fs")]
-        if leaked {
-            if let Some(fs) = self.fs.as_mut() {
-                fs.leak();
-            }
+        if leaked && let Some(fs) = self.fs.as_mut() {
+            fs.leak();
         }
         let _ = leaked;
     }

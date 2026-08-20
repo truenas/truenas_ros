@@ -23,7 +23,7 @@ pub use config::ClientConfig;
 pub use event::{ConnId, ConnectOpts, Event, RequestId};
 pub use tls::{ConnectDeferral, TlsConnectContext};
 
-use crate::net::core::conn::{unpack, Op};
+use crate::net::core::conn::{Op, unpack};
 use crate::net::core::probe::probe_ktls;
 use crate::net::core::protocol::{CloseReason, Framing};
 use crate::net::core::reactor::{KernelPads, Reactor};

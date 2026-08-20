@@ -34,8 +34,8 @@ use truenas_ros::net::client::{
     Client, ClientConfig, ConnId, ConnectOpts, Event, RequestId,
 };
 use truenas_ros::net::server::{
-    length_prefixed, Endian, Listen, PrefixWidth, Server, ServerAddr,
-    ShutdownHandle,
+    Endian, Listen, PrefixWidth, Server, ServerAddr, ShutdownHandle,
+    length_prefixed,
 };
 use truenas_ros::net::{ClientAddr, CloseReason, Framing};
 use truenas_ros::{Errno, Error};
@@ -175,7 +175,7 @@ fn echo_client(v4: SocketAddrV4, msgs: &[&[u8]]) -> io::Result<Vec<Vec<u8>>> {
         Some(other) => {
             return Err(io::Error::other(format!(
                 "unexpected event after close: {other:?}"
-            )))
+            )));
         }
     }
     assert!(!client.is_open(conn), "connection should be closed");
@@ -329,7 +329,7 @@ fn tcp_pipelined() {
                 other => {
                     return Err(io::Error::other(format!(
                         "expected Reply, got {other:?}"
-                    )))
+                    )));
                 }
             }
         }
@@ -378,7 +378,7 @@ fn tcp_empty_pdu_rejected() {
             other => {
                 return Err(io::Error::other(format!(
                     "expected Reply, got {other:?}"
-                )))
+                )));
             }
         }
         client.close_now(conn);
@@ -419,7 +419,7 @@ fn tcp_multi_conn_fanout() {
                 other => {
                     return Err(io::Error::other(format!(
                         "expected Connected, got {other:?}"
-                    )))
+                    )));
                 }
             }
         }
@@ -450,7 +450,7 @@ fn tcp_multi_conn_fanout() {
                 other => {
                     return Err(io::Error::other(format!(
                         "expected Reply, got {other:?}"
-                    )))
+                    )));
                 }
             }
         }
@@ -488,7 +488,7 @@ fn tcp_response_timeout() {
             other => {
                 return Err(io::Error::other(format!(
                     "expected Closed(RequestTimeout), got {other:?}"
-                )))
+                )));
             }
         }
         Ok(())
@@ -520,7 +520,7 @@ fn tcp_idle_timeout() {
             other => {
                 return Err(io::Error::other(format!(
                     "expected Closed(IdleTimeout), got {other:?}"
-                )))
+                )));
             }
         }
         assert!(!client.is_open(conn), "the idle connection was reaped");
@@ -596,7 +596,7 @@ fn tcp_stale_connid() {
             Some(other) => {
                 return Err(io::Error::other(format!(
                     "unexpected event: {other:?}"
-                )))
+                )));
             }
         }
 
@@ -761,7 +761,7 @@ fn tcp_splice_body() {
             other => {
                 return Err(io::Error::other(format!(
                     "expected Splice, got {other:?}"
-                )))
+                )));
             }
         }
         client.close_now(conn);
@@ -808,7 +808,7 @@ fn tcp_splice_bad_fd() {
             other => {
                 return Err(io::Error::other(format!(
                     "expected Closed(SpliceBadFd), got {other:?}"
-                )))
+                )));
             }
         }
         Ok(())
@@ -877,7 +877,7 @@ fn self_signed() -> (Vec<u8>, Vec<u8>) {
     use openssl::hash::MessageDigest;
     use openssl::pkey::PKey;
     use openssl::rsa::Rsa;
-    use openssl::x509::{X509NameBuilder, X509};
+    use openssl::x509::{X509, X509NameBuilder};
     let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
     let mut name = X509NameBuilder::new().unwrap();
     name.append_entry_by_text("CN", "localhost").unwrap();
@@ -1379,7 +1379,7 @@ fn ktls_splice_body() {
             other => {
                 return Err(io::Error::other(format!(
                     "expected Splice over kTLS, got {other:?}"
-                )))
+                )));
             }
         }
         client.close_now(conn);

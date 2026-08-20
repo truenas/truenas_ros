@@ -28,8 +28,8 @@ use std::net::TcpStream;
 use std::os::fd::{FromRawFd, RawFd};
 use std::thread;
 use truenas_ros::net::server::{
-    length_prefix_header, Endian, Incoming, PrefixWidth, Protocol, Request,
-    Response, Server, ServerAddr,
+    Endian, Incoming, PrefixWidth, Protocol, Request, Response, Server,
+    ServerAddr, length_prefix_header,
 };
 
 /// Frame a payload with a 4-byte BE length prefix.

@@ -13,7 +13,7 @@
 //! happen in the parent; the child only `pause()`s (async-signal-safe) until it
 //! is killed.
 
-use crate::errno::{self, retry_on_eintr, Errno};
+use crate::errno::{self, Errno, retry_on_eintr};
 use crate::error::{Error, Result};
 use crate::fd::owned_from_raw;
 use std::collections::HashMap;

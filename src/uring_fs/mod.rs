@@ -208,13 +208,13 @@ pub use core::{DirWalk, FsConn, FsDone, NameBatch};
 
 pub mod query_dir;
 pub use query_dir::{
-    query_directory, CopyHandle, DirEntry, EnrichSpec, Order, QueryDir,
-    QueryHandle, QueryOptions, QueryPool, XattrNamespaces,
+    CopyHandle, DirEntry, EnrichSpec, Order, QueryDir, QueryHandle,
+    QueryOptions, QueryPool, XattrNamespaces, query_directory,
 };
 
 pub mod query_tree;
 pub use query_tree::{
-    query_tree, QueryTree, TreeCursor, TreeEntry, TreeOptions,
+    QueryTree, TreeCursor, TreeEntry, TreeOptions, query_tree,
 };
 // `pub(crate)` so a `net` server can reuse the fixed-file-xattr capability
 // probe (the 6.13 floor is not visible to `REGISTER_PROBE`); the standalone
@@ -239,7 +239,7 @@ pub use host::{FsConfig, ShutdownHandle, UringFs};
 /// capability ceiling.
 #[cfg(feature = "__fuzz")]
 pub mod fuzz {
-    pub use super::broker::{decode_groups, decode_request, Req};
+    pub use super::broker::{Req, decode_groups, decode_request};
 
     /// [`Leaf::to_cstring`](super::Leaf) is crate-internal, but
     /// `fuzz/fuzz_targets/path_leaf.rs` needs it to prove its
@@ -250,7 +250,7 @@ pub mod fuzz {
     }
 }
 
-use crate::errno::{retry_on_eintr, Errno};
+use crate::errno::{Errno, retry_on_eintr};
 use crate::fd::owned_from_raw;
 use crate::path::TnPath;
 use crate::sync_fs::openat2::RawOpenHow;
@@ -265,8 +265,8 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 // The inject channel and the shared flags are loom-modelled (see
 // `loom_tests` at the bottom), so these come from `crate::sync` - std's
 // outside `--cfg loom`.
-use crate::sync::mpsc;
 use crate::sync::Arc;
+use crate::sync::mpsc;
 
 /// The `AT_*` flags an async `statx` submits. `statx` follows a terminal
 /// symlink unless told not to; the confined surface inverts that, forcing

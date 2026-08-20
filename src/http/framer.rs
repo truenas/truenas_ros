@@ -29,12 +29,12 @@
 //! the connection - the "HTTP error before hanging up" case the reactor's
 //! close semantics were designed for.
 
+use crate::net::Framing;
 #[cfg(doc)]
 use crate::net::server::{Response, ServerConfig};
-use crate::net::Framing;
 
 use super::chunked::{self, ChunkScan};
-use super::head::{frame_facts, method_is_head, BodyKind};
+use super::head::{BodyKind, frame_facts, method_is_head};
 
 /// Fixed wire-overhead allowance for chunk framing on top of
 /// [`HttpConfig::max_body`]: a chunked message whose **wire** extent exceeds
@@ -359,7 +359,7 @@ pub(crate) fn frame<U>(
                                 buf.len(),
                                 status,
                                 head_only,
-                            )
+                            );
                         }
                     };
                     match body {
@@ -504,18 +504,22 @@ mod tests {
     #[test]
     fn validate_rejects_zero_caps() {
         assert!(HttpConfig::default().validate().is_ok());
-        assert!(HttpConfig {
-            max_head: 0,
-            max_body: 1024,
-        }
-        .validate()
-        .is_err());
-        assert!(HttpConfig {
-            max_head: 1024,
-            max_body: 0,
-        }
-        .validate()
-        .is_err());
+        assert!(
+            HttpConfig {
+                max_head: 0,
+                max_body: 1024,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            HttpConfig {
+                max_head: 1024,
+                max_body: 0,
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]

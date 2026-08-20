@@ -567,9 +567,11 @@ mod tests {
         let mut headers: [HeaderView<'_>; MAX_HEADERS] =
             [HeaderView::EMPTY; MAX_HEADERS];
         for cut in 0..full.len() {
-            assert!(parse_head(&full[..cut], &mut headers)
-                .expect("partial ok")
-                .is_none());
+            assert!(
+                parse_head(&full[..cut], &mut headers)
+                    .expect("partial ok")
+                    .is_none()
+            );
         }
         let facts = frame_facts(full).expect("parse ok").expect("complete");
         assert_eq!(facts.len, full.len());

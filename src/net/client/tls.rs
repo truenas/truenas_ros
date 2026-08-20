@@ -11,17 +11,17 @@
 //! **state-free** - it signals only success or failure. That drops the `U: Send`
 //! bound the server's `AcceptDeferral` needs.
 
-use super::event::{ConnId, Event};
 use super::Client;
+use super::event::{ConnId, Event};
 use crate::errno::{self, Errno};
-use crate::net::core::conn::{pack, Connection, Op};
+use crate::net::core::conn::{Connection, Op, pack};
 use crate::net::core::protocol::{ClientAddr, Framing, ServerAddr};
 use crate::net::core::table::PendingConnect;
 use crate::uring::sys::*;
 use crate::uring::wake::LoopShared;
 use std::os::fd::RawFd;
 use std::sync::atomic::Ordering;
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 
 /// The client kTLS handshake handler ([`Client::set_tls_handshake`]):
 /// `(furnished_fd, context, deferral)`, once per `tls` connect after its TCP
@@ -180,8 +180,8 @@ where
             return self.core.submit_teardown(slot, generation, true);
         }
         let fd = res; // a real O_CLOEXEC process fd aliasing the pool socket
-                      // Take the pending out of `Connecting` and re-park it as `TlsConnecting`
-                      // (holding `U` + peer + dialed address) across the handshake.
+        // Take the pending out of `Connecting` and re-park it as `TlsConnecting`
+        // (holding `U` + peer + dialed address) across the handshake.
         let Some(pending) = self.core.table.take_connecting(slot) else {
             // Not connecting (stale - reaped at teardown): close the furnished
             // fd nobody will consume.
@@ -237,7 +237,7 @@ where
                 // Guarded at connect time (a `tls` connect requires the hook),
                 // so unreachable in practice.
                 drop(deferral); // -> reject via Drop, drained next wake
-                                // SAFETY: close the furnished fd we won't use.
+                // SAFETY: close the furnished fd we won't use.
                 unsafe { libc::close(fd) };
             }
         }

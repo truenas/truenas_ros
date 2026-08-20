@@ -15,8 +15,8 @@
 //! stream can make the framer declare a message the caps would not.
 
 use libfuzzer_sys::fuzz_target;
-use truenas_ros::http::fuzz::drive_frame;
 use truenas_ros::http::HttpConfig;
+use truenas_ros::http::fuzz::drive_frame;
 use truenas_ros::net::Framing;
 
 fuzz_target!(|data: &[u8]| {

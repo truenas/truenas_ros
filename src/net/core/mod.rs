@@ -23,6 +23,6 @@ pub(crate) mod sock;
 pub(crate) mod table;
 
 pub use protocol::{
-    length_prefix_header, Body, ClientAddr, CloseReason, Endian, Framing,
-    PeerCred, PrefixWidth, SendBuf, ServerAddr,
+    Body, ClientAddr, CloseReason, Endian, Framing, PeerCred, PrefixWidth,
+    SendBuf, ServerAddr, length_prefix_header,
 };

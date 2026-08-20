@@ -37,13 +37,13 @@
 #[cfg_attr(not(feature = "uring-fs"), allow(unused_imports))]
 #[cfg(loom)]
 pub(crate) use loom::{
-    sync::{atomic, mpsc, Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, atomic, mpsc},
     thread,
 };
 #[cfg_attr(not(feature = "uring-fs"), allow(unused_imports))]
 #[cfg(not(loom))]
 pub(crate) use std::{
-    sync::{atomic, mpsc, Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, atomic, mpsc},
     thread,
 };
 

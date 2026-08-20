@@ -4,12 +4,12 @@
 #[cfg(feature = "sync-fs")]
 mod fs {
     use std::os::fd::AsFd;
+    use truenas_ros::AT_FDCWD;
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::{
-        openat2, renameat2, statx, AtFlags, OFlag, OpenHow, RenameFlags,
-        ResolveFlag, StatxMask,
+        AtFlags, OFlag, OpenHow, RenameFlags, ResolveFlag, StatxMask, openat2,
+        renameat2, statx,
     };
-    use truenas_ros::AT_FDCWD;
 
     #[test]
     fn statx_dot_is_a_directory() {
@@ -88,7 +88,7 @@ mod xattr {
     use std::os::fd::AsFd;
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::xattr::{
-        fgetxattr, flistxattr, fsetxattr, XattrFlags,
+        XattrFlags, fgetxattr, flistxattr, fsetxattr,
     };
 
     #[test]
@@ -170,13 +170,14 @@ mod xattr {
 #[cfg(feature = "mount")]
 mod mount {
     use std::os::fd::AsFd;
+    use truenas_ros::AT_FDCWD;
     use truenas_ros::errno::Errno;
     use truenas_ros::mount::{
-        fsconfig, fsmount, fsopen, iter_mount, listmount, statmount, FsConfig,
-        FsmountFlags, FsopenFlags, MountAttr, StatmountMask, LSMT_ROOT,
+        FsConfig, FsmountFlags, FsopenFlags, LSMT_ROOT, MountAttr,
+        StatmountMask, fsconfig, fsmount, fsopen, iter_mount, listmount,
+        statmount,
     };
-    use truenas_ros::sync_fs::{statx, AtFlags, StatxMask};
-    use truenas_ros::AT_FDCWD;
+    use truenas_ros::sync_fs::{AtFlags, StatxMask, statx};
 
     fn root_mnt_id() -> u64 {
         statx(AT_FDCWD, "/", AtFlags::empty(), StatxMask::MNT_ID_UNIQUE)
@@ -254,8 +255,8 @@ mod mount {
 mod acl {
     use std::os::fd::AsFd;
     use truenas_ros::sync_fs::acl::{
-        fgetacl, Acl, Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag, Nfs4Flag,
-        Nfs4Perm, Nfs4Who, PosixAcl, PosixPerm, PosixTag,
+        Acl, Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag, Nfs4Flag, Nfs4Perm,
+        Nfs4Who, PosixAcl, PosixPerm, PosixTag, fgetacl,
     };
     use truenas_ros::sync_fs::xattr::fgetxattr;
 
@@ -296,9 +297,11 @@ mod acl {
         assert_eq!(acl.aces[0].who_type, Nfs4Who::Owner);
         assert_eq!(acl.aces[0].who_id, -1);
         assert_eq!(acl.aces[0].ace_type, Nfs4AceType::Allow);
-        assert!(acl.aces[0]
-            .access_mask
-            .contains(Nfs4Perm::READ_DATA | Nfs4Perm::WRITE_OWNER));
+        assert!(
+            acl.aces[0]
+                .access_mask
+                .contains(Nfs4Perm::READ_DATA | Nfs4Perm::WRITE_OWNER)
+        );
         // GROUP@ carries IDENTIFIER_GROUP.
         assert_eq!(acl.aces[1].who_type, Nfs4Who::Group);
         assert!(acl.aces[1].ace_flags.contains(Nfs4Flag::IDENTIFIER_GROUP));
@@ -405,10 +408,10 @@ mod fhandle {
     use std::os::fd::AsFd;
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::fhandle::{
-        name_to_handle_at, FhFlags, FileHandle,
+        FhFlags, FileHandle, name_to_handle_at,
     };
-    use truenas_ros::sync_fs::{statx, AtFlags, OFlag, StatxMask};
-    use truenas_ros::{Error, AT_FDCWD};
+    use truenas_ros::sync_fs::{AtFlags, OFlag, StatxMask, statx};
+    use truenas_ros::{AT_FDCWD, Error};
 
     #[test]
     fn name_to_handle_roundtrip_and_reopen() {
@@ -473,9 +476,9 @@ mod fhandle {
 #[cfg(feature = "fsiter")]
 mod fsiter {
     use std::collections::BTreeSet;
-    use truenas_ros::sync_fs::iter::FsIterBuilder;
-    use truenas_ros::sync_fs::{statx, AtFlags, StatxMask};
     use truenas_ros::Error;
+    use truenas_ros::sync_fs::iter::FsIterBuilder;
+    use truenas_ros::sync_fs::{AtFlags, StatxMask, statx};
 
     /// The mount source of `p`, so the fsiter source-check matches on kernels
     /// that report `sb_source`. Where it is not reported (e.g. the TrueNAS 6.12
@@ -715,11 +718,11 @@ mod fsiter {
 #[cfg(feature = "idmap")]
 mod namespace {
     use std::os::fd::AsRawFd;
+    use truenas_ros::Error;
     use truenas_ros::errno::Errno;
     use truenas_ros::mount::idmap::{
-        create_idmap_userns, IdmapCache, IdmapEntry,
+        IdmapCache, IdmapEntry, create_idmap_userns,
     };
-    use truenas_ros::Error;
 
     fn nsfs_link(fd: std::os::fd::RawFd) -> String {
         std::fs::read_link(format!("/proc/self/fd/{fd}"))
@@ -794,10 +797,10 @@ mod io {
     use std::io::Write;
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::{
-        atomic_replace, atomic_write, safe_open, AtomicWriteOptions, Mode,
-        OFlag,
+        AtomicWriteOptions, Mode, OFlag, atomic_replace, atomic_write,
+        safe_open,
     };
-    use truenas_ros::{Error, AT_FDCWD};
+    use truenas_ros::{AT_FDCWD, Error};
 
     #[test]
     fn atomic_replace_creates_replaces_and_leaves_no_temp() {
@@ -916,7 +919,7 @@ mod io {
 #[cfg(feature = "mount")]
 mod mount_helpers {
     use std::path::Path;
-    use truenas_ros::mount::{iter_mountinfo, statmount_path, LSMT_ROOT};
+    use truenas_ros::mount::{LSMT_ROOT, iter_mountinfo, statmount_path};
 
     #[test]
     fn statmount_path_of_root() {
@@ -937,11 +940,11 @@ mod mount_helpers {
 mod shutil {
     use std::ffi::CStr;
     use std::os::unix::fs::PermissionsExt;
+    use truenas_ros::Error;
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::shutil::{
-        copytree, copytree_reporting, CopyTreeConfig,
+        CopyTreeConfig, copytree, copytree_reporting,
     };
-    use truenas_ros::Error;
 
     // An xattr name need not be UTF-8 (the kernel checks length and namespace
     // only, and ZFS validates names solely on the dir path under `utf8only`).
@@ -1294,7 +1297,7 @@ mod shutil {
     fn acl_bearing_file_is_copied_without_chmod() {
         use std::os::fd::AsFd;
         use truenas_ros::sync_fs::acl::{
-            fsetacl_posix, PosixAce, PosixAcl, PosixPerm, PosixTag,
+            PosixAce, PosixAcl, PosixPerm, PosixTag, fsetacl_posix,
         };
         use truenas_ros::sync_fs::xattr::fgetxattr;
 
@@ -1369,7 +1372,7 @@ mod shutil {
     fn a_directory_default_acl_is_carried_to_the_copy() {
         use std::os::fd::AsFd;
         use truenas_ros::sync_fs::acl::{
-            fsetacl_posix, PosixAce, PosixAcl, PosixPerm, PosixTag,
+            PosixAce, PosixAcl, PosixPerm, PosixTag, fsetacl_posix,
         };
         use truenas_ros::sync_fs::xattr::fgetxattr;
 
@@ -1438,7 +1441,7 @@ mod shutil {
     fn an_acl_bearing_sticky_directory_arrives_without_the_sticky_bit() {
         use std::os::fd::AsFd;
         use truenas_ros::sync_fs::acl::{
-            fsetacl_posix, PosixAce, PosixAcl, PosixPerm, PosixTag,
+            PosixAce, PosixAcl, PosixPerm, PosixTag, fsetacl_posix,
         };
         use truenas_ros::sync_fs::xattr::fgetxattr;
 
@@ -1810,9 +1813,9 @@ mod shutil {
 #[cfg(feature = "configfile")]
 mod configfile {
     use std::os::unix::fs::PermissionsExt;
+    use truenas_ros::Error;
     use truenas_ros::configfile::ConfigFile;
     use truenas_ros::sync_fs::AtomicWriteOptions;
-    use truenas_ros::Error;
 
     // Two halves: a name `set` accepts must survive `write_string` +
     // `read_str` unchanged, and one it cannot must be refused rather than

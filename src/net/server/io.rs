@@ -5,12 +5,12 @@
 //! the code that runs consumer closures (the framer, the body handler, the
 //! detach hook) or touches server-only fields (`handlers`, `mailbox`).
 
-use super::handles::{Detached, Responder};
 use super::Server;
+use super::handles::{Detached, Responder};
 use crate::errno::{self, Errno};
 use crate::fd::owned_from_raw;
-use crate::net::core::conn::{pack, Op};
-use crate::net::core::handles::{stat, Token};
+use crate::net::core::conn::{Op, pack};
+use crate::net::core::handles::{Token, stat};
 use crate::net::core::protocol::{CloseReason, Framing};
 use crate::net::core::reactor::{
     Enacted, Gate, RecvStep, SendStep, SpliceStep,

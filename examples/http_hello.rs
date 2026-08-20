@@ -19,9 +19,9 @@
 //! `ServerConfig::max_request_bytes` of at least
 //! `HttpConfig::min_request_bytes()`.
 
-use truenas_ros::http::{protocol, HttpConfig, HttpRequest, HttpResponse};
-use truenas_ros::net::server::{Incoming, Server, ServerAddr};
+use truenas_ros::http::{HttpConfig, HttpRequest, HttpResponse, protocol};
 use truenas_ros::net::ClientAddr;
+use truenas_ros::net::server::{Incoming, Server, ServerAddr};
 
 /// Per-connection state: just a request counter, to show keep-alive reuse.
 struct Session {

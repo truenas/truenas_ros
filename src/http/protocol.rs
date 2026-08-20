@@ -16,20 +16,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // below, which is what lets the model see the fill/redeliver ordering.
 use crate::sync::{Arc, Mutex};
 
+use crate::net::ClientAddr;
 use crate::net::server::{
     Body, DeferPermit, Deferred, Incoming, Protocol, Request, Responder,
     Response,
 };
-use crate::net::ClientAddr;
 
 use super::chunked;
 use super::date::DateCache;
-use super::framer::{frame, HttpConfig, HttpConn, Phase};
+use super::framer::{HttpConfig, HttpConn, Phase, frame};
 use super::head::{
-    method_is_head, parse_head, Head, HeaderView, Version, MAX_HEADERS,
+    Head, HeaderView, MAX_HEADERS, Version, method_is_head, parse_head,
 };
 use super::response::{
-    serialize, serialize_reply, ConnHeader, HttpResponse, Serialized,
+    ConnHeader, HttpResponse, Serialized, serialize, serialize_reply,
 };
 
 /// One HTTP request, as handed to the consumer's handler.
@@ -936,12 +936,14 @@ mod tests {
             max_head: 0,
             max_body: 1024,
         };
-        assert!(protocol(
-            bad,
-            |_: Incoming<'_>| Some(()),
-            |_: HttpRequest<'_>, _: &mut ()| HttpResponse::new(200),
-        )
-        .is_err());
+        assert!(
+            protocol(
+                bad,
+                |_: Incoming<'_>| Some(()),
+                |_: HttpRequest<'_>, _: &mut ()| HttpResponse::new(200),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1837,8 +1839,8 @@ mod tests {
 #[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
-    use crate::net::server::Body;
     use crate::net::ClientAddr;
+    use crate::net::server::Body;
     use crate::sync::thread;
 
     fn unreached(_: HttpRequest<'_>, _: &mut (), _: FsSlot<'_>) -> HttpVerdict {

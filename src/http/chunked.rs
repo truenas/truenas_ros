@@ -19,7 +19,7 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
-use super::head::{has_field_break, is_token_byte, HeaderView};
+use super::head::{HeaderView, has_field_break, is_token_byte};
 
 /// Chunk-size line cap (hex digits + optional extensions, CRLF excluded).
 /// Real chunk-size lines are under 20 bytes; the headroom is for extensions,

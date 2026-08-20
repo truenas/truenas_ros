@@ -35,22 +35,22 @@ pub mod shutil;
 pub mod xattr;
 
 #[cfg(feature = "sync-fs")]
-pub use atomic::{atomic_replace, atomic_write, AtomicWriteOptions};
+pub use atomic::{AtomicWriteOptions, atomic_replace, atomic_write};
 #[cfg(feature = "sync-fs")]
-pub use openat2::{openat2, OpenHow, ResolveFlag};
+pub use openat2::{OpenHow, ResolveFlag, openat2};
 #[cfg(feature = "sync-fs")]
-pub use renameat2::{renameat2, RenameFlags};
+pub use renameat2::{RenameFlags, renameat2};
 #[cfg(feature = "sync-fs")]
 pub use safe_open::safe_open;
 #[cfg(feature = "sync-fs")]
-pub use statfs::{fstatfs, Statfs};
+pub use statfs::{Statfs, fstatfs};
 #[cfg(feature = "sync-fs")]
 pub use statx::{
-    makedev, statx, Statx, StatxAttr, StatxMask, StatxRaw, StatxTimestamp,
-    StatxTimestampRaw,
+    Statx, StatxAttr, StatxMask, StatxRaw, StatxTimestamp, StatxTimestampRaw,
+    makedev, statx,
 };
 #[cfg(feature = "sync-fs")]
-pub use zfsattr::{fget_zfs_attrs, fset_zfs_attrs, ZfsAttr};
+pub use zfsattr::{ZfsAttr, fget_zfs_attrs, fset_zfs_attrs};
 
 #[cfg(feature = "sync-fs")]
 tn_bitflags! {
