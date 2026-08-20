@@ -935,26 +935,11 @@ where
     Some(join.join().expect("client thread").expect("client io"))
 }
 
-/// `libc::setxattr`, returning whether it stuck - the "does this filesystem
-/// take user xattrs" probe (`test/net_server.rs` precedent).
 #[cfg(feature = "uring-fs")]
-fn set_user_xattr(path: &std::path::Path, name: &[u8], value: &[u8]) -> bool {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
-    let cname = CString::new(name).unwrap();
-    // SAFETY: valid NUL-terminated path/name and a value+len for setxattr.
-    let r = unsafe {
-        libc::setxattr(
-            cpath.as_ptr(),
-            cname.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-        )
-    };
-    r == 0
-}
+#[path = "support/xattr.rs"]
+mod xattr_probe;
+#[cfg(feature = "uring-fs")]
+use xattr_probe::set_user_xattr;
 
 /// The S3 GET preamble through the HTTP codec: the handler takes the
 /// facade, parks the request, opens under the server's personality on the

@@ -116,6 +116,12 @@ export TRUENAS_ROS_REQUIRE_SECRETMEM=1
 # silently degraded (wrong acltype, unmounted) and must turn CI red rather than
 # pass green having tested nothing.
 export TRUENAS_ROS_REQUIRE_ZFS=1
+# Every scratch filesystem in this VM takes xattrs - the ZFS datasets above,
+# and tmpfs registers a user.* handler (shmem_user_xattr_handler, mm/shmem.c)
+# - and the run is root, so the trusted.* probe in the privileged-policy
+# fixture must also stick. Force the xattr fixtures to RUN; a refusal means
+# the fixture landed somewhere degraded and must turn CI red.
+export TRUENAS_ROS_REQUIRE_XATTRS=1
 # unix_peercred needs the AF_UNIX io_uring getsockopt fix (kernel >= 6.18.16).
 # We boot the TrueNAS <train>-nightly kernel (truenas/linux), whose uname -r
 # carries the full point release (e.g. 6.18.16-production+truenas), so read it
