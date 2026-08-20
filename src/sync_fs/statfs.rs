@@ -87,26 +87,39 @@ impl Statfs {
         self.0.f_type
     }
 
-    /// Filesystem id (`f_fsid`), as its two raw `int` halves, verbatim.
+    /// Filesystem id (`f_fsid`), as its two raw halves, unsigned.
     ///
     /// This accessor exists because the libc crate keeps `fsid_t`'s only
     /// field private, so the value [`raw`](Self::raw) hands back is opaque -
     /// a consumer cannot read it at all without an unsafe cast of its own.
-    /// How the halves combine into one id is the caller's semantic, so none
-    /// is imposed: ZFS, for instance, stores the objset guid's low 32 bits
-    /// in `val[0]` and high 32 bits in `val[1]` (`zfs_statvfs`,
-    /// `module/os/linux/zfs/zfs_vfsops.c`).
-    pub fn fsid(&self) -> [i32; 2] {
+    ///
+    /// The halves are `u32` because that is how they are produced: ZFS packs
+    /// the objset guid's low 32 bits into `val[0]` and high 32 bits into
+    /// `val[1]`, both written as `uint32_t` (`zfs_statvfs`,
+    /// `module/os/linux/zfs/zfs_vfsops.c`), making the one-id recombination
+    /// `(u64::from(id[1]) << 32) | u64::from(id[0])`. Handing out the
+    /// kernel's signed `int` instead would sign-extend a high-bit `val[0]`
+    /// across the whole upper word of that expression, so any two
+    /// filesystems sharing a low half would collide.
+    ///
+    /// The id names the mount for its lifetime, no longer: ZFS derives it
+    /// from `ds_fsid_guid`, "a 56-bit ID that can change to avoid
+    /// collisions" (`include/sys/dsl_dataset.h`), reassigned when a dataset
+    /// opens into an in-core collision (`unique_insert` in
+    /// `dsl_dataset_hold_obj`, `module/zfs/dsl_dataset.c`) - so an
+    /// export/import can change it. State that must recognise a dataset
+    /// across mounts should key on the dataset's own guid instead.
+    pub fn fsid(&self) -> [u32; 2] {
         const _: () = assert!(
             std::mem::size_of::<libc::fsid_t>()
-                == std::mem::size_of::<[i32; 2]>()
+                == std::mem::size_of::<[u32; 2]>()
                 && std::mem::align_of::<libc::fsid_t>()
-                    == std::mem::align_of::<[i32; 2]>()
+                    == std::mem::align_of::<[u32; 2]>()
         );
         // SAFETY: glibc's fsid_t is exactly `int __val[2]` (bits/types.h);
         // size and alignment are pinned above, and any bit pattern is a
-        // valid [i32; 2].
-        unsafe { *(&self.0.f_fsid as *const libc::fsid_t).cast::<[i32; 2]>() }
+        // valid [u32; 2].
+        unsafe { *(&self.0.f_fsid as *const libc::fsid_t).cast::<[u32; 2]>() }
     }
 
     /// The raw kernel `struct statfs`.
@@ -167,17 +180,35 @@ mod tests {
         );
     }
 
-    /// The fsid halves are stable per mount: repeat calls agree, and a
-    /// subdirectory reports its filesystem's id, not its own - which is what
-    /// lets a consumer key state on the pair.
+    /// `f_fsid` read independently: path-based `statfs(2)` straight from
+    /// libc, so the accessor is checked against the kernel rather than
+    /// against a second run of itself.
+    fn statfs_fsid_by_path(path: &std::path::Path) -> [u32; 2] {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut buf = MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: valid NUL-terminated path and a statfs out-buffer.
+        let r = unsafe { libc::statfs(c.as_ptr(), buf.as_mut_ptr()) };
+        assert_eq!(r, 0, "statfs({})", path.display());
+        // SAFETY: `statfs` succeeded, so it initialised the whole struct;
+        // the cast is the one `fsid` itself justifies.
+        let st = unsafe { buf.assume_init() };
+        unsafe { *(&st.f_fsid as *const libc::fsid_t).cast::<[u32; 2]>() }
+    }
+
+    /// The accessor reports the kernel's value - pinned against an
+    /// independent path-based `statfs(2)`, not against itself - and the id
+    /// names the mount: repeat calls and a subdirectory agree. (Stable for
+    /// the mount's lifetime only; see `fsid`'s docs.)
     #[test]
-    fn fsid_is_stable_across_calls_and_paths() {
+    fn fsid_matches_the_kernel_and_names_the_mount() {
         let dir = crate::tempdir().unwrap();
         let sub = dir.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
         let a = fstatfs(File::open(dir.path()).unwrap()).unwrap();
         let b = fstatfs(File::open(dir.path()).unwrap()).unwrap();
         let c = fstatfs(File::open(&sub).unwrap()).unwrap();
+        assert_eq!(a.fsid(), statfs_fsid_by_path(dir.path()), "vs the kernel");
         assert_eq!(a.fsid(), b.fsid(), "same target, same id");
         assert_eq!(a.fsid(), c.fsid(), "same filesystem, same id");
     }

@@ -7732,26 +7732,11 @@ fn fs_file_carries_personality_and_as_root() {
     assert_eq!(reply, b"secret");
 }
 
-/// Set a `user.*` xattr from the test side; `false` if the filesystem refuses
-/// user xattrs (unusual `/tmp`) so the caller can skip the xattr assertion.
 #[cfg(feature = "uring-fs")]
-fn set_user_xattr(path: &Path, name: &[u8], value: &[u8]) -> bool {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
-    let cname = CString::new(name).unwrap();
-    // SAFETY: valid NUL-terminated path/name and a value+len for setxattr.
-    let r = unsafe {
-        libc::setxattr(
-            cpath.as_ptr(),
-            cname.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-        )
-    };
-    r == 0
-}
+#[path = "support/xattr.rs"]
+mod xattr_probe;
+#[cfg(feature = "uring-fs")]
+use xattr_probe::set_user_xattr;
 
 /// The rest of the embedded op sweep over the ring: `renameat` (the
 /// `submit_path_op` two-anchor route), `ftruncate` (the `submit_fd_meta`

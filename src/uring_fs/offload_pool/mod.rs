@@ -13,13 +13,17 @@ use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::{thread, Arc, Condvar, Mutex, OnceCell};
 
 /// Per-ring sizing for the blocking-offload pool: how many worker threads it
-/// keeps warm, how far it grows, and how much native stack each worker gets.
+/// keeps warm and how far it grows.
 ///
 /// Every field is per ring, so a deployment running several multiplies them.
 /// Only `floor` is resident; workers above it exist while a job is blocked on
 /// them and retire when idle, so the ceiling is a limit rather than a
 /// reservation.
+///
+/// `#[non_exhaustive]`, so a future knob is a field addition rather than a
+/// breaking change; build one by mutating [`OffloadBounds::default`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct OffloadBounds {
     /// Warm workers, spawned on first use and never retired below. Resident,
     /// so this is a standing per-ring cost. At least 1.
@@ -218,22 +222,31 @@ impl PoolShared {
     }
 }
 
-// Set for the lifetime of a pool worker thread. `WorkerPool::drop` can run on
-// a worker when a job drops the pool's last `Arc`; the flag tells that `Drop`
-// not to join the workers - this thread is one of them, so the join would wait
-// on itself.
+// The identity of the pool this thread is a worker of (`Arc::as_ptr` of its
+// `PoolShared`), or null off the pools. `WorkerPool::drop` can run on a
+// worker when a job drops a pool's last `Arc`; the identity tells that `Drop`
+// whether the join it wants would wait on the current thread itself (its own
+// pool - skip it, the workers exit on `closed` alone) or only on other
+// threads (a different pool - join it like any thread would). A bare "am I a
+// worker" flag cannot tell those apart and leaks the exemption to every pool
+// in the process. Tokio's blocking workers carry the same identity by
+// entering their runtime's context at spawn (`spawn_thread`,
+// `runtime/blocking/pool.rs`), and a foreign runtime dropped on one of them
+// is likewise waited out (`Receiver::wait`, `runtime/blocking/shutdown.rs`).
 //
 // Under loom this must be loom's thread-local, not std's: loom multiplexes
-// every modelled thread onto one OS thread, so a std `thread_local!` would let
-// a worker's flag leak into the main thread and make `Drop` skip a join it
-// really needed. (loom's macro takes no `const` initializer.)
+// every modelled thread onto one OS thread, so a std `thread_local!` would
+// let a worker's identity leak into the main thread and make `Drop` skip a
+// join it really needed. (loom's macro takes no `const` initializer.)
 #[cfg(not(loom))]
 thread_local! {
-    static ON_POOL_WORKER: Cell<bool> = const { Cell::new(false) };
+    static ON_POOL_WORKER: Cell<*const PoolShared> =
+        const { Cell::new(std::ptr::null()) };
 }
 #[cfg(loom)]
 loom::thread_local! {
-    static ON_POOL_WORKER: Cell<bool> = Cell::new(false);
+    static ON_POOL_WORKER: Cell<*const PoolShared> =
+        Cell::new(std::ptr::null());
 }
 
 impl Drop for WorkerPool {
@@ -241,12 +254,16 @@ impl Drop for WorkerPool {
         let mut g = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.closed = true;
         self.shared.cv.notify_all();
-        // Running on a pool worker (a job dropped the pool's last `Arc`): this
-        // thread is itself counted in `total`, so waiting the workers out here
-        // would wait on this very thread forever. Each worker owns an
-        // `Arc<PoolShared>`, so they exit and reclaim the shared state on their
-        // own once `closed` is set, with no join needed.
-        if ON_POOL_WORKER.with(Cell::get) {
+        // Running on one of THIS pool's workers (a job dropped the pool's
+        // last `Arc`): the thread is itself counted in `total`, so waiting
+        // the workers out here would wait on this very thread forever. Each
+        // worker owns an `Arc<PoolShared>`, so they exit and reclaim the
+        // shared state on their own once `closed` is set, with no join
+        // needed. A different pool's worker gets no exemption - this pool's
+        // `total` does not count that thread, and skipping the join there
+        // would silently void the contract below for every cross-pool drop
+        // (`try_elastic_tuned`'s partial-failure unwind relies on it).
+        if ON_POOL_WORKER.with(Cell::get) == Arc::as_ptr(&self.shared) {
             return;
         }
         // Wait for every worker to drain and exit, so none touches the shared
@@ -402,9 +419,10 @@ fn idle_expired(
 /// silently dropped onto a dead thread. Any handle the job owned (a `SendDir`)
 /// still closes as its unwinding frame drops.
 fn worker_loop(shared: &Arc<PoolShared>) {
-    // Mark this thread so a `WorkerPool::drop` triggered here (a job dropping
-    // the pool's last `Arc`) does not try to join the pool it belongs to.
-    ON_POOL_WORKER.with(|w| w.set(true));
+    // Mark this thread with the pool it serves, so a `WorkerPool::drop`
+    // triggered here (a job dropping a pool's last `Arc`) can tell its own
+    // pool (must not self-join) from any other (joined as usual).
+    ON_POOL_WORKER.with(|w| w.set(Arc::as_ptr(shared)));
     loop {
         let job = {
             let mut g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -448,7 +466,7 @@ mod pool_tests {
     use super::*;
     use crate::sync::mpsc;
 
-    /// Bounds with the defaults' stack size and explicit floor/ceiling.
+    /// Bounds with explicit floor and ceiling.
     fn bounds(floor: usize, ceiling: usize) -> OffloadBounds {
         OffloadBounds { floor, ceiling }
     }
@@ -567,6 +585,48 @@ mod pool_tests {
             "a job dropping the pool's last Arc wedged its worker",
         );
     }
+
+    /// A worker of one pool dropping the last handle of a *different* pool
+    /// joins that pool like any other thread would: the self-join exemption
+    /// is keyed to the worker's own pool, not to being any pool's worker.
+    /// Asserted by order, not timing - were the exemption over-broad, the
+    /// drop would return while B's job is still blocked, and the first
+    /// `recv_timeout` below would see "b joined" arrive early.
+    #[test]
+    fn dpool_foreign_pool_dropped_on_a_worker_is_still_joined() {
+        let a = WorkerPool::try_elastic(bounds(1, 1)).unwrap();
+        let b = WorkerPool::try_elastic(bounds(1, 1)).unwrap();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (order_tx, order_rx) = mpsc::channel::<&'static str>();
+
+        let ot = order_tx.clone();
+        b.submit(Box::new(move || {
+            started_tx.send(()).ok();
+            release_rx.recv().ok();
+            ot.send("b job finished").ok();
+        }));
+        started_rx.recv().expect("B's worker picked up its job");
+
+        a.submit(Box::new(move || {
+            // B's last handle: dropping it here must wait out B's job.
+            drop(b);
+            order_tx.send("b joined").ok();
+        }));
+
+        // The join cannot complete while B's job is parked on `release_rx`,
+        // so nothing may arrive yet; "b joined" now means the exemption
+        // wrongly fired for a foreign pool.
+        match order_rx.recv_timeout(Duration::from_millis(200)) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(step) => panic!("foreign drop returned early: got {step:?}"),
+            Err(e) => panic!("a worker died: {e}"),
+        }
+        release_tx.send(()).expect("B's job is waiting on this");
+        let five = Duration::from_secs(5);
+        assert_eq!(order_rx.recv_timeout(five), Ok("b job finished"));
+        assert_eq!(order_rx.recv_timeout(five), Ok("b joined"));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -596,7 +656,7 @@ mod loom_tests {
 
     const ZERO: Duration = Duration::ZERO;
 
-    /// Bounds with the defaults' stack size and explicit floor/ceiling.
+    /// Bounds with explicit floor and ceiling.
     fn bounds(floor: usize, ceiling: usize) -> OffloadBounds {
         OffloadBounds { floor, ceiling }
     }
@@ -797,6 +857,34 @@ mod loom_tests {
             // self-join as a deadlock if `ON_POOL_WORKER` stops working.
             let g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
             assert!(g.closed, "dropping the pool did not close it");
+        });
+    }
+
+    /// A job may instead drop the last `Arc` of a pool it is NOT a worker
+    /// of. No exemption applies there: the drop joins that pool's workers
+    /// like any thread would, so the full `Drop` contract holds even when
+    /// teardown happens to run on some other pool's worker. Keyed on pool
+    /// identity - a bare "am I a worker" flag skips this join, and the
+    /// asserts below see the un-joined worker.
+    #[test]
+    fn loom_pool_foreign_drop_still_joins() {
+        bounded_model(|| {
+            let a = pool(1, 1);
+            let b = pool(1, 1);
+            let b_shared = Arc::clone(&b.shared);
+
+            // B's last handle moves into a job running on A's worker.
+            a.submit(Box::new(move || drop(b)));
+
+            // A's own drop joins its worker, so the job above has finished -
+            // and with it B's drop, whose contract must have held in full.
+            drop(a);
+            let g = b_shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(g.closed, "foreign drop did not close the pool");
+            assert_eq!(
+                g.total, 0,
+                "foreign drop returned with workers still live"
+            );
         });
     }
 

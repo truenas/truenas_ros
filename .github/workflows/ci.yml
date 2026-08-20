@@ -76,10 +76,13 @@ jobs:
         echo "kernel=$(uname -r) uid=$(id -u) RLIMIT_MEMLOCK=$(ulimit -l) KiB"
 
     # The ZFS-backed and privileged tests skip automatically here (no datasets,
-    # unprivileged); the QEMU VM job exercises them for real. Two otherwise-
+    # unprivileged); the QEMU VM job exercises them for real. Three otherwise-
     # silent skips are turned into hard failures: the configparser differential
-    # tests (REQUIRE_PYTHON) and the net server/client tests (REQUIRE_IO_URING,
-    # backed by the ring probe above that guarantees they can actually run).
+    # tests (REQUIRE_PYTHON), the net server/client tests (REQUIRE_IO_URING,
+    # backed by the ring probe above that guarantees they can actually run),
+    # and the user-xattr fixtures (REQUIRE_XATTRS: the runner's scratch
+    # filesystems take `user.*` unprivileged, so a refusal means the flagship
+    # xattr paths would go green having tested nothing).
     #
     # The kTLS data-path tests are deliberately NOT forced here: this runner's
     # kernel has the tls ULP, but Ubuntu builds OpenSSL 3.0 without
@@ -92,6 +95,7 @@ jobs:
       env:
         TRUENAS_ROS_REQUIRE_PYTHON: "1"
         TRUENAS_ROS_REQUIRE_IO_URING: "1"
+        TRUENAS_ROS_REQUIRE_XATTRS: "1"
 
     # The concurrency models are gated on `#[cfg(loom)]`: loom substitutes std's
     # atomics/locks/UnsafeCell with its own permutation-checking versions, so they
