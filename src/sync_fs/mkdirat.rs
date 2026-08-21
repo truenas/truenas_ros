@@ -6,31 +6,48 @@ use std::os::fd::{AsFd, AsRawFd};
 
 use super::Mode;
 
-/// Create `path` (relative to `dirfd`) with permission bits `mode`,
-/// which the caller's umask still masks.
+/// Create the directory `name` **directly inside** `dirfd`, with
+/// permission bits `mode`, which the caller's umask still masks.
 ///
-/// **There is no resolve-flag form.** `openat2` takes `RESOLVE_BENEATH`
-/// and friends; `mkdirat` takes none, and no successor syscall provides
-/// them - the kernel's newest additions (`setxattrat`, `getxattrat`,
-/// `open_tree_attr`, `file_setattr`) add no directory-creating call. A
-/// caller that needs the guarantee gets it by construction rather than
-/// by flag: resolve one component at a time against a descriptor it
-/// already holds, so there is no multi-component path for a symlink to
-/// redirect. That is the same discipline [`openat2`](super::openat2)
-/// callers follow for the walk itself.
+/// **There is no resolve-flag form, so this takes a single component
+/// and refuses everything else with `EINVAL`.** `openat2` takes
+/// `RESOLVE_BENEATH` and friends; `mkdirat` takes none, and no successor
+/// syscall provides them - the kernel's newest additions
+/// (`setxattrat`, `getxattrat`, `open_tree_attr`, `file_setattr`) add no
+/// directory-creating call. With a multi-component path every component
+/// but the last resolves with symlinks followed, so one planted by
+/// whoever owns an intermediate directory puts the new directory
+/// somewhere else entirely; an absolute path ignores `dirfd` outright.
+/// The check is what makes that unrepresentable rather than merely
+/// documented, and it mirrors [`uring_fs::Leaf`](crate::uring_fs::Leaf),
+/// which enforces the same rule in the type for the async sibling.
+///
+/// To build a nested tree, alternate this with a confined walk -
+/// [`openat2`](super::openat2) under `RESOLVE_BENEATH |
+/// RESOLVE_NO_SYMLINKS` - so each component is created against a
+/// descriptor already proven to be inside the anchor. See
+/// `a_component_at_a_time_builds_a_tree`.
+///
+/// Rejected: empty, `.`, `..`, and anything containing `/`.
 ///
 /// `EEXIST` is a normal answer wherever two writers may create the same
 /// tree, and is the caller's to interpret: this reports what the kernel
 /// said and invents no idempotence the syscall does not have.
 ///
 /// See [`mkdirat(2)`](https://man7.org/linux/man-pages/man2/mkdirat.2.html).
-pub fn mkdirat<P, Fd>(dirfd: Fd, path: &P, mode: Mode) -> errno::Result<()>
+pub fn mkdirat<P, Fd>(dirfd: Fd, name: &P, mode: Mode) -> errno::Result<()>
 where
     P: ?Sized + TnPath,
     Fd: AsFd,
 {
     let raw = dirfd.as_fd().as_raw_fd();
-    path.with_tn_path(|cstr| {
+    name.with_tn_path(|cstr| {
+        let b = cstr.to_bytes();
+        // A `CStr` cannot carry an interior NUL, so `Leaf`'s remaining
+        // rejections are the whole set.
+        if b.is_empty() || b == b"." || b == b".." || b.contains(&b'/') {
+            return Err(errno::Errno::EINVAL);
+        }
         retry_on_eintr(|| unsafe {
             libc::syscall(libc::SYS_mkdirat, raw, cstr.as_ptr(), mode.bits())
         })
@@ -105,13 +122,58 @@ mod tests {
         assert_eq!(got.permissions().mode() & 0o777, 0o700);
     }
 
+    /// The escape the single-component rule exists to prevent. With `a` a
+    /// symlink pointing out of the anchor, a two-component path resolves `a`
+    /// with symlinks followed and creates the directory at its target. The
+    /// assertion is about where the directory landed, not merely which errno
+    /// came back: with the guard removed the call returns `Ok(())` and
+    /// `outside/escaped` exists, which is what the second assert refuses.
     #[test]
-    fn a_missing_parent_is_enoent() {
+    fn a_planted_symlink_cannot_carry_the_create_out_of_the_anchor() {
+        let tmp = tempdir().unwrap();
+        let anchor_path = tmp.path().join("anchor");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&anchor_path).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, anchor_path.join("a")).unwrap();
+        let anchor = dir_fd(&anchor_path);
+        assert_eq!(
+            mkdirat(&anchor, "a/escaped", Mode::from_bits_truncate(0o755)),
+            Err(errno::Errno::EINVAL)
+        );
+        assert!(
+            !outside.join("escaped").exists(),
+            "a multi-component path must not create outside the anchor"
+        );
+    }
+
+    /// An absolute path ignores `dirfd` altogether, so it is refused for the
+    /// same reason and never reaches the syscall.
+    #[test]
+    fn an_absolute_path_is_refused() {
+        let tmp = tempdir().unwrap();
+        let outside = tmp.path().join("abs-target");
+        let root = dir_fd(tmp.path());
+        let abs = outside.to_str().expect("utf-8 tempdir");
+        assert_eq!(
+            mkdirat(&root, abs, Mode::from_bits_truncate(0o755)),
+            Err(errno::Errno::EINVAL)
+        );
+        assert!(!outside.exists(), "dirfd must not be bypassed");
+    }
+
+    /// The rest of the rejected set, which is [`crate::uring_fs::Leaf`]'s
+    /// minus the interior NUL a `CStr` cannot carry.
+    #[test]
+    fn the_non_component_names_are_refused() {
         let tmp = tempdir().unwrap();
         let root = dir_fd(tmp.path());
-        assert_eq!(
-            mkdirat(&root, "absent/child", Mode::from_bits_truncate(0o755)),
-            Err(errno::Errno::ENOENT)
-        );
+        for name in ["", ".", "..", "a/b", "./a", "../a", "a/"] {
+            assert_eq!(
+                mkdirat(&root, name, Mode::from_bits_truncate(0o755)),
+                Err(errno::Errno::EINVAL),
+                "{name:?} is not a single component"
+            );
+        }
     }
 }

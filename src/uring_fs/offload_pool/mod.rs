@@ -313,6 +313,51 @@ fn shutdown_expired(
         .is_ok()
 }
 
+/// The deadline `Drop`'s bounded wait runs against.
+///
+/// Passing [`SHUTDOWN_DETACH_AFTER`] to each `wait_timeout` would restart the
+/// clock on every wake, and every worker exit notifies - so a pool of `n`
+/// workers with one wedged member bounds the wait at `n x
+/// SHUTDOWN_DETACH_AFTER` rather than at `SHUTDOWN_DETACH_AFTER`, and a
+/// spurious wake bounds it at nothing. That defeats the reason the wait is
+/// bounded at all: `Drop` runs wherever the last handle falls, including on a
+/// thread serving requests, and two minutes there is the harm this is
+/// supposed to prevent. Detaching a pool that is still draining is sound (see
+/// `Drop`), so the deadline is absolute.
+///
+/// Under `--cfg loom` there is no clock (`src/sync.rs`), and none is needed:
+/// `wait_timeout` never times out there, so the detach is driven by
+/// [`shutdown_expired`]'s model seam and the remaining duration is never read
+/// for its value.
+#[cfg(not(loom))]
+struct ShutdownClock(Instant);
+
+#[cfg(not(loom))]
+impl ShutdownClock {
+    fn start() -> ShutdownClock {
+        ShutdownClock(Instant::now())
+    }
+
+    /// What is left of the budget; zero once it is spent.
+    fn remaining(&self) -> Duration {
+        SHUTDOWN_DETACH_AFTER.saturating_sub(self.0.elapsed())
+    }
+}
+
+#[cfg(loom)]
+struct ShutdownClock;
+
+#[cfg(loom)]
+impl ShutdownClock {
+    fn start() -> ShutdownClock {
+        ShutdownClock
+    }
+
+    fn remaining(&self) -> Duration {
+        SHUTDOWN_DETACH_AFTER
+    }
+}
+
 impl Drop for WorkerPool {
     fn drop(&mut self) {
         let mut g = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -341,14 +386,20 @@ impl Drop for WorkerPool {
         // their own with nothing left to signal. The wait buys quiescence, not
         // soundness, which is why it is worth bounding.
         //
-        // The timeout restarts on every wake, which is what we want: each
-        // worker exit notifies, so a pool that is making progress is never
-        // detached and only a genuinely stuck one runs the clock out.
+        // One deadline for the whole wait, not one per wake: every worker exit
+        // notifies, so re-passing the full timeout would multiply the bound by
+        // the worker count and a spurious wake would remove it entirely. See
+        // [`ShutdownClock`].
+        let clock = ShutdownClock::start();
         while g.total > 0 {
+            let left = clock.remaining();
+            if left.is_zero() {
+                break; // detached: they exit on `closed` alone
+            }
             let (guard, wait) = self
                 .shared
                 .cv
-                .wait_timeout(g, SHUTDOWN_DETACH_AFTER)
+                .wait_timeout(g, left)
                 .unwrap_or_else(|e| e.into_inner());
             g = guard;
             if shutdown_expired(&wait, &self.shared) {

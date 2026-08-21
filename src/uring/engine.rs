@@ -459,6 +459,37 @@ mod tests {
         }
     }
 
+    /// **Personality ids are per-ring and both spaces start at 1**, so the
+    /// first registration on any two rings gets the same id and a crossed
+    /// `Personality` resolves to a live registration instead of failing.
+    ///
+    /// `xa_init_flags(&ctx->personalities, XA_FLAGS_ALLOC1)`
+    /// (`io_uring/io_uring.c:367`) gives each ring its own allocator, and
+    /// submission looks the id up in this ring's table alone -
+    /// `xa_load(&ctx->personalities, personality)`, refusing with `EINVAL`
+    /// only on a miss (`io_uring.c:2269-2273`). The consequence is that
+    /// ring-locality makes a crossed id succeed *wrongly* rather than fail,
+    /// which is why `Personality` documents the pairing as the caller's to
+    /// keep. If this ever starts failing, the kernel gained a shared or
+    /// ring-tagged id space and that warning can be revisited.
+    #[test]
+    fn personality_ids_alias_across_rings() {
+        use crate::uring::sys::register_personality;
+        let (Some(a), Some(b)) = (engine_or_skip(), engine_or_skip()) else {
+            return;
+        };
+        let (ida, idb) = (
+            register_personality(a.ring.raw_fd()).expect("register on a"),
+            register_personality(b.ring.raw_fd()).expect("register on b"),
+        );
+        assert_eq!(
+            ida, idb,
+            "two rings' first registrations share an id, so an id minted on \
+             one names a live registration on the other"
+        );
+        assert_ne!(ida, 0, "the allocator starts at 1; 0 means no override");
+    }
+
     /// Out-of-range lengths are rejected *before* anything is staged, so a
     /// rejected chain cannot leave a partial chain in the SQ.
     #[test]
