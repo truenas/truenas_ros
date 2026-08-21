@@ -287,6 +287,21 @@ where
                     Ok(())
                 }
             }
+            // A file-sourced body: queue the head as a non-final segment,
+            // install the tail, and issue the first read. The final chunk's
+            // `ReplyLast` retires the reply, so the read-ahead cap holds
+            // pipelined requests until the body completes and a flush-close
+            // waits for it (the dry checks are tail-guarded).
+            #[cfg(feature = "uring-fs")]
+            Response::ReplyFile {
+                head,
+                file,
+                offset,
+                len,
+                close,
+            } => self.begin_file_reply(
+                slot, generation, head, file, offset, len, close,
+            ),
         }
     }
 
@@ -300,7 +315,13 @@ where
         generation: u32,
         res: i32,
     ) -> errno::Result<()> {
-        match self.core.on_send_complete(slot, generation, res)? {
+        let step = self.core.on_send_complete(slot, generation, res)?;
+        // Flushed tail chunks just recycled their buffers into the spare
+        // pool (`advance_sent`); a read that was waiting on one can go now.
+        // A no-op on a closed connection or without an active tail.
+        #[cfg(feature = "uring-fs")]
+        self.drive_file_tail(slot, generation)?;
+        match step {
             SendStep::Pump => self.pump(slot, generation),
             SendStep::Done => Ok(()),
         }
@@ -411,5 +432,228 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             detached,
         );
         Ok(())
+    }
+
+    /// Enact [`Response::ReplyFile`]: queue the head, install the tail, and
+    /// issue the first read. Refusals are loud - a close, never a short
+    /// body: no fs pool to read on, or a body already streaming (a second
+    /// tail's chunks would interleave with the first's on the wire).
+    #[cfg(feature = "uring-fs")]
+    #[allow(clippy::too_many_arguments)] // a Response variant unpacked
+    pub(super) fn begin_file_reply(
+        &mut self,
+        slot: u32,
+        generation: u32,
+        head: Vec<u8>,
+        file: crate::uring_fs::File,
+        offset: u64,
+        len: u64,
+        close: bool,
+    ) -> errno::Result<()> {
+        if self.fs.is_none() {
+            return self.core.close_conn(
+                slot,
+                generation,
+                CloseReason::FileBody(Errno::EOPNOTSUPP),
+            );
+        }
+        if self.core.table.conn(slot).tail_active() {
+            return self.core.close_conn(
+                slot,
+                generation,
+                CloseReason::FileBody(Errno::EBUSY),
+            );
+        }
+        // Nothing to stream: the head is the whole reply (mirrors the
+        // ReplyVectored disposition, including the empty one-way case).
+        if len == 0 {
+            let queued = {
+                let conn = self.core.table.conn_mut(slot);
+                let queued = !head.is_empty();
+                if queued {
+                    conn.outstanding += 1;
+                    conn.enqueue_reply(head);
+                }
+                if close {
+                    conn.close_on_flush = Some(CloseReason::HandlerClosed);
+                }
+                queued
+            };
+            return if close {
+                self.core.drive_flush_close(slot, generation)
+            } else if queued {
+                self.core.kick_send(slot, generation)
+            } else {
+                Ok(())
+            };
+        }
+        {
+            let conn = self.core.table.conn_mut(slot);
+            conn.outstanding += 1;
+            // Head first - the diversion is not yet on - then the tail; its
+            // chunks follow as reads complete, the last one `ReplyLast`.
+            conn.enqueue_reply_head(head);
+            conn.install_file_tail(file, offset, len);
+            if close {
+                conn.close_on_flush = Some(CloseReason::HandlerClosed);
+            }
+        }
+        // The dry checks are tail-guarded, so a flush-close armed here waits
+        // for the last chunk rather than truncating the body.
+        if close {
+            self.core.drive_flush_close(slot, generation)?;
+        } else {
+            self.core.kick_send(slot, generation)?;
+        }
+        self.drive_file_tail(slot, generation)
+    }
+
+    /// Issue the tail's next read when it is idle, bytes remain, and a chunk
+    /// buffer is free - at install, after each read completes, and after
+    /// sends flush (which recycle buffers). Reads are clamped to
+    /// `min(fs_body_chunk, unread)`, and a missing buffer just waits for a
+    /// flush to recycle one: that wait is the body's memory bound. A full fs
+    /// op table or staging failure sheds THIS connection
+    /// ([`CloseReason::FileBody`]), never the server.
+    #[cfg(feature = "uring-fs")]
+    pub(super) fn drive_file_tail(
+        &mut self,
+        slot: u32,
+        generation: u32,
+    ) -> errno::Result<()> {
+        let chunk = self.cfg.fs_body_chunk;
+        {
+            let Some(conn) = self.core.table.get_conn_mut(slot) else {
+                return Ok(()); // closed or parked under a stale call
+            };
+            if conn.closing {
+                return Ok(()); // teardown owns the slot
+            }
+            let Some(tail) = conn.file_tail.as_ref() else {
+                return Ok(()); // no body streaming
+            };
+            if tail.reading || tail.unread == 0 {
+                return Ok(()); // busy, or the last chunk is already queued
+            }
+        }
+        let Some(buf) = self.core.table.conn_mut(slot).tail_take_buf(chunk)
+        else {
+            return Ok(()); // all buffers queued/sending; a flush recycles one
+        };
+        let gen64 = self.core.table.generation(slot);
+        let staged = {
+            // Disjoint fields: `self.fs`, `self.core.engine`,
+            // `self.core.table` - the same split `deliver_one` relies on.
+            let fs = self.fs.as_mut().expect("tail exists only with a pool");
+            let conn = self.core.table.conn_mut(slot);
+            let tail = conn.file_tail.as_mut().expect("checked above");
+            let want = tail.unread.min(chunk as u64) as usize;
+            let r = fs.submit_pump_read(
+                &mut self.core.engine,
+                &tail.file,
+                buf,
+                want,
+                tail.next_offset,
+                (slot, gen64),
+            );
+            if r.is_ok() {
+                tail.reading = true;
+            }
+            r
+        };
+        if let Err(e) = staged {
+            return self.core.close_conn(
+                slot,
+                generation,
+                CloseReason::FileBody(e),
+            );
+        }
+        Ok(())
+    }
+
+    /// A pump read completed ([`ReapedFs`](crate::uring_fs::core::ReapedFs)
+    /// `::Pump`): advance the tail and queue the chunk. A stale owner - the
+    /// connection closed or its slot recycled while the read was in flight
+    /// (the closed-connection sweep's cancel, or a completion racing
+    /// teardown) - is dropped; the op entry already freed and its parked fd
+    /// clone dropped with it.
+    #[cfg(feature = "uring-fs")]
+    pub(super) fn on_pump_read(
+        &mut self,
+        owner: (u32, u64),
+        done: crate::uring_fs::core::FsDone,
+    ) -> errno::Result<()> {
+        let (slot, gen64) = owner;
+        if self.core.table.generation(slot) != gen64 {
+            return Ok(()); // slot recycled under the read
+        }
+        let generation = gen64 as u32;
+        let res = {
+            let Some(conn) = self.core.table.get_conn_mut(slot) else {
+                return Ok(()); // parked (detaching) or already freed
+            };
+            // Only `closing` stops the tail - deliberately NOT
+            // `teardown_owns_slot()`: with `close_on_flush` set the tail IS
+            // the farewell body (the flush-close dry checks wait on it), so
+            // a pending flush-close must keep streaming, never drop chunks.
+            if conn.closing {
+                return Ok(()); // teardown owns the slot; the sweep cancelled us
+            }
+            let Some(tail) = conn.file_tail.as_mut() else {
+                return Ok(()); // tail already shed
+            };
+            tail.reading = false;
+            done.raw_result()
+        };
+        let n = match res {
+            Err(e) => {
+                return self.core.close_conn(
+                    slot,
+                    generation,
+                    CloseReason::FileBody(e),
+                );
+            }
+            Ok(n) => n as u64,
+        };
+        if n == 0 {
+            // EOF before the declared length: the file shrank after the
+            // header committed to a Content-Length. The framing cannot
+            // renegotiate, so close mid-body - the peer sees a truncated
+            // transfer, never a short body presented as complete.
+            return self.core.close_conn(
+                slot,
+                generation,
+                CloseReason::FileBodyTruncated,
+            );
+        }
+        let mut bufs = done.into_bufs();
+        let mut buf = bufs.pop().expect("a pump read carries exactly one buf");
+        // SAFETY: the op's iovec targeted this Vec's spare capacity with
+        // `iov_len >= n`, and the CQE count proves the kernel initialized
+        // the first `n` bytes (the stream recv path's discipline).
+        unsafe { buf.set_len(n as usize) };
+        let last = {
+            let conn = self.core.table.conn_mut(slot);
+            let tail = conn.file_tail.as_mut().expect("checked above");
+            tail.next_offset += n;
+            // `n <= iov_len = min(chunk, unread)`, so this never underflows;
+            // a short read just leaves more for the next iteration, which
+            // continues from the offset actually reached.
+            tail.unread -= n;
+            let last = tail.unread == 0;
+            conn.enqueue_file_chunk(buf, last);
+            if last {
+                // The body is fully queued: retire the tail and release the
+                // PDUs the diversion held behind it.
+                conn.finish_file_tail();
+            }
+            last
+        };
+        self.core.kick_send(slot, generation)?;
+        if last {
+            Ok(())
+        } else {
+            self.drive_file_tail(slot, generation)
+        }
     }
 }

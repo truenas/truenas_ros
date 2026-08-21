@@ -290,6 +290,22 @@ fn respond(
             segments: vec![head_bytes.into(), body.into()],
             close: !keep,
         },
+        // A file-sourced body: the reactor streams it behind the head
+        // (`HttpResponse::file_body`). The serializer already applied the
+        // HEAD/bodyless elisions, so a tail reaching here always streams.
+        #[cfg(feature = "uring-fs")]
+        Serialized::FileTail {
+            head: head_bytes,
+            file,
+            offset,
+            len,
+        } => Response::ReplyFile {
+            head: head_bytes,
+            file,
+            offset,
+            len,
+            close: !keep,
+        },
         Serialized::HeadOnly(bytes) => {
             if keep {
                 Response::Reply(bytes)
@@ -1129,6 +1145,66 @@ mod tests {
         let s = text(&get);
         assert!(s.contains("Content-Length: 0\r\n"), "{s}");
         assert!(!s.contains("4096"), "{s}");
+    }
+
+    #[cfg(feature = "uring-fs")]
+    #[test]
+    fn a_file_body_response_becomes_a_reply_file() {
+        fn dev_null() -> crate::uring_fs::File {
+            let fd: std::os::fd::OwnedFd =
+                std::fs::File::open("/dev/null").expect("open").into();
+            crate::uring_fs::File::new(crate::sync::Arc::new(fd))
+        }
+        let mut handler = |_: HttpRequest<'_>, _: &mut ()| {
+            HttpResponse::new(200).file_body(dev_null(), 32, 1024)
+        };
+        // GET: the reactor streams the tail; the head already carries the
+        // declared length, and the range is the handler's.
+        let resp = roundtrip(
+            b"GET /f HTTP/1.1\r\nHost: h\r\n\r\n",
+            &mut HttpConn::new(()),
+            &mut handler,
+        );
+        let Response::ReplyFile {
+            head,
+            offset,
+            len,
+            close,
+            ..
+        } = &resp
+        else {
+            panic!("a file body must stream, got {resp:?}");
+        };
+        assert!(!close, "keep-alive request keeps serving");
+        assert_eq!((*offset, *len), (32, 1024));
+        let s = std::str::from_utf8(head).unwrap();
+        assert!(s.contains("Content-Length: 1024\r\n"), "{s}");
+        assert!(s.ends_with("\r\n\r\n"), "{s}");
+
+        // Connection: close rides into the tail's disposition.
+        let resp = roundtrip(
+            b"GET /f HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+            &mut HttpConn::new(()),
+            &mut handler,
+        );
+        assert!(
+            matches!(resp, Response::ReplyFile { close: true, .. }),
+            "{resp:?}"
+        );
+
+        // HEAD: the length is declared, nothing streams (the handle-drop
+        // proof is pinned beside `serialize_reply`).
+        let resp = roundtrip(
+            b"HEAD /f HTTP/1.1\r\nHost: h\r\n\r\n",
+            &mut HttpConn::new(()),
+            &mut handler,
+        );
+        let Response::Reply(bytes) = &resp else {
+            panic!("a HEAD must not stream, got {resp:?}");
+        };
+        let s = std::str::from_utf8(bytes).unwrap();
+        assert!(s.contains("Content-Length: 1024\r\n"), "{s}");
+        assert!(s.ends_with("\r\n\r\n"), "{s}");
     }
 
     #[test]

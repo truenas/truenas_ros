@@ -3734,6 +3734,128 @@ fn server_config_fs_pool_bounds_are_rejected_at_construction() {
         },
         "fs_offload_floor",
     );
+    // The body chunk sizes two kernel-visible buffers per streaming
+    // connection and its read result must fit a CQE's i32.
+    expect(
+        ServerConfig {
+            fs_body_chunk: 0, // below the 4 KiB floor
+            ..ServerConfig::default()
+        },
+        "fs_body_chunk",
+    );
+    expect(
+        ServerConfig {
+            fs_body_chunk: 16 * 1024 * 1024 + 1, // past the 16 MiB ceiling
+            ..ServerConfig::default()
+        },
+        "fs_body_chunk",
+    );
+}
+
+/// `Response::ReplyFile` on a server built WITHOUT an fs pool must refuse
+/// loudly - close before any reply byte - never send the head and then a
+/// body it has no reactor to read. The `File` comes from a standalone
+/// `UringFs` host: an open fd is host-independent, which is exactly the
+/// misconfiguration shape (files wired over from one reactor into a server
+/// missing `fs_files`).
+#[cfg(feature = "uring-fs")]
+#[test]
+fn file_reply_without_an_fs_pool_sheds_loudly() {
+    use std::sync::{Mutex, mpsc};
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, FsConfig, UringFs};
+
+    let dir = truenas_ros::tempdir().unwrap();
+    std::fs::write(dir.path().join("f"), b"never sent").unwrap();
+
+    // Mint a File on a standalone host, then stop it - the fd survives.
+    let mut cfg = FsConfig::default();
+    cfg.entries = 128;
+    cfg.ops = 128;
+    let mut afs = match UringFs::new(cfg) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("UringFs::new: {e}"),
+    };
+    let who = afs.register_self().expect("register_self");
+    let handle = afs.handle();
+    let stop_fs = afs.shutdown_handle();
+    let anchor = Anchor::open(dir.path()).expect("anchor");
+    let (ftx, frx) = mpsc::channel();
+    thread::scope(|sc| {
+        sc.spawn(move || {
+            let r = handle.open(
+                who,
+                &anchor,
+                c"f",
+                OpenHow::new().flags(OFlag::O_RDONLY),
+            );
+            let _ = ftx.send(r);
+            stop_fs.shutdown();
+        });
+        afs.run().expect("fs host run");
+    });
+    let file = frx.recv().expect("open outcome").expect("open");
+
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let file_slot = Mutex::new(Some(file));
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |_req: Request<'_, ()>| Response::ReplyFile {
+            head: b"HEAD".to_vec(),
+            file: file_slot.lock().unwrap().take().expect("one request"),
+            offset: 0,
+            len: 10,
+            close: false,
+        },
+    };
+    // `fs_files` stays 0: that IS the configuration under test.
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    {
+        let reasons = Arc::clone(&reasons);
+        server.set_close_hook(move |_addr, reason, _state: &mut ()| {
+            reasons.lock().unwrap().push(reason);
+        });
+    }
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            let mut msg = 3u32.to_be_bytes().to_vec();
+            msg.extend_from_slice(b"abc");
+            s.write_all(&msg)?;
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf)?;
+            assert!(
+                buf.is_empty(),
+                "refusal must be a close, not a short body: {buf:?}"
+            );
+            Ok(())
+        })();
+        stop.shutdown();
+        r
+    });
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("client join").expect("client io");
+    assert_eq!(
+        reasons.lock().unwrap().as_slice(),
+        &[CloseReason::FileBody(Errno::EOPNOTSUPP)],
+        "the pool-less server must shed with the errno in the reason"
+    );
 }
 
 #[test]

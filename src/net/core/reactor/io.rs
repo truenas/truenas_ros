@@ -273,7 +273,10 @@ impl<U> Reactor<U> {
     ) -> errno::Result<()> {
         let dry = {
             let conn = self.table.conn(slot);
-            !conn.sending && !conn.has_pending_send()
+            // An active file tail owes bytes even when the queue reads dry
+            // (its next chunk is still being read); closing here would
+            // truncate the farewell body.
+            !conn.sending && !conn.has_pending_send() && !conn.tail_active()
         };
         if dry {
             let reason = self
@@ -1191,9 +1194,13 @@ impl<U> Reactor<U> {
         // left to submit the teardown.
         let flush = {
             let conn = self.table.conn_mut(slot);
+            // `tail_active`: a streaming body's queue can read dry between
+            // chunks (the next read still in flight) - the flush-close waits
+            // for the tail's last chunk, or it would truncate the farewell.
             if conn.close_on_flush.is_some()
                 && !conn.sending
                 && !conn.has_pending_send()
+                && !conn.tail_active()
             {
                 conn.close_on_flush.take()
             } else {

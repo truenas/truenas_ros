@@ -19,6 +19,13 @@ const MAX_POOL: u32 = 0x00ff_ffff;
 /// reactor for work that has no io_uring opcode.
 #[cfg(feature = "uring-fs")]
 const MAX_OFFLOAD_THREADS: usize = 1024;
+/// Bounds for `fs_body_chunk`: below 4 KiB a multi-GB body is all per-op
+/// overhead; above 16 MiB two buffers per streaming connection stop being
+/// "bounded" in any useful sense (and a read result must fit an i32).
+#[cfg(feature = "uring-fs")]
+const MIN_FS_BODY_CHUNK: usize = 4096;
+#[cfg(feature = "uring-fs")]
+const MAX_FS_BODY_CHUNK: usize = 16 * 1024 * 1024;
 /// Upper bound on `max_in_flight_requests` (bounds per-connection read-ahead).
 const MAX_IN_FLIGHT: usize = 4096;
 /// Upper bound on `max_send_coalesce` (the kernel's `UIO_MAXIOV` - the most
@@ -74,6 +81,23 @@ pub struct ServerConfig {
     /// they queue, not to request volume.
     #[cfg(feature = "uring-fs")]
     pub fs_offload_ceiling: usize,
+    /// Chunk size for file-sourced reply bodies (`Response::ReplyFile`): each
+    /// body read moves at most this many bytes, into one of two buffers the
+    /// connection cycles (one reading while one sends). Default 256 KiB;
+    /// validated to 4 KiB..=16 MiB.
+    ///
+    /// **Worst-case memory is `pool_size x 2 x fs_body_chunk`** (every
+    /// connection mid-body with both buffers live) - at the defaults, 512 x
+    /// 2 x 256 KiB = 256 MiB - the same shape as the ingress ceiling
+    /// `pool_size x max_request_bytes` documented on
+    /// [`pool_size`](ServerConfig::pool_size). The buffer count is fixed at
+    /// two, not configurable: on ZFS every ring read is punted to an io-wq
+    /// worker (`zpl_file.c` sets no `FMODE_NOWAIT`), so a deeper pipeline
+    /// would only deepen that bounded worker class's queue - and it is the
+    /// count of connections mid-body, not the per-connection depth, that
+    /// multiplies the load.
+    #[cfg(feature = "uring-fs")]
+    pub fs_body_chunk: usize,
     /// Maximum bytes accepted for one message (header + body), a memory guard
     /// that also bounds header scanning. Enforced strictly for length-prefixed
     /// frames; for a `More`/delimiter-scanning framer the accumulate buffer can
@@ -242,6 +266,8 @@ impl Default for ServerConfig {
             fs_offload_floor: crate::uring_fs::core::OFFLOAD_FLOOR,
             #[cfg(feature = "uring-fs")]
             fs_offload_ceiling: crate::uring_fs::core::OFFLOAD_CEILING,
+            #[cfg(feature = "uring-fs")]
+            fs_body_chunk: 256 * 1024,
             max_request_bytes: 1024 * 1024,
             backlog: 128,
             unlink_unix: true,
@@ -285,15 +311,22 @@ impl ServerConfig {
                 "pool_size must be in 1..={MAX_POOL}"
             )));
         }
-        // Each fs file needs two op slots (`fs_files * 2`), and an op-slot index
-        // is packed into the same 24-bit `user_data` slot field as a pool slot.
-        // Bound it here so an oversized `fs_files` fails as a clean Validation
-        // rather than truncating a completion token later (`MAX_POOL` is that
-        // 24-bit ceiling - the `user_data::SLOT_MASK`).
+        // The op table holds two slots per fs file plus one per connection
+        // (the reply path's body read - a file tail keeps at most one in
+        // flight), and an op-slot index is packed into the same 24-bit
+        // `user_data` slot field as a pool slot. Bound the sum here so an
+        // oversized configuration fails as a clean Validation rather than
+        // truncating a completion token later (`MAX_POOL` is that 24-bit
+        // ceiling - the `user_data::SLOT_MASK`).
         #[cfg(feature = "uring-fs")]
-        if u64::from(self.fs_files).saturating_mul(2) > u64::from(MAX_POOL) {
+        if self.fs_files > 0
+            && u64::from(self.fs_files)
+                .saturating_mul(2)
+                .saturating_add(u64::from(self.pool_size))
+                > u64::from(MAX_POOL)
+        {
             return Err(Error::Validation(format!(
-                "fs_files * 2 must not exceed {MAX_POOL}"
+                "fs_files * 2 + pool_size must not exceed {MAX_POOL}"
             )));
         }
         // The floor spawns eagerly on the reactor thread at first use, so an
@@ -307,6 +340,19 @@ impl ServerConfig {
             return Err(Error::Validation(format!(
                 "fs_offload_floor must be in \
                  1..=fs_offload_ceiling..={MAX_OFFLOAD_THREADS}"
+            )));
+        }
+        // A chunk sizes one of two per-connection body buffers, and a read's
+        // result rides a CQE's i32 - bound both ends so a pathological value
+        // fails at construction (the worst case, `pool_size x 2 x
+        // fs_body_chunk`, is documented on the field).
+        #[cfg(feature = "uring-fs")]
+        if self.fs_body_chunk < MIN_FS_BODY_CHUNK
+            || self.fs_body_chunk > MAX_FS_BODY_CHUNK
+        {
+            return Err(Error::Validation(format!(
+                "fs_body_chunk must be in \
+                 {MIN_FS_BODY_CHUNK}..={MAX_FS_BODY_CHUNK}"
             )));
         }
         if self.max_request_bytes == 0
