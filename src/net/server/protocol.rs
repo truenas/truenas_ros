@@ -69,6 +69,49 @@ pub enum Response {
         /// it) has flushed.
         close: bool,
     },
+    /// Send `head`, then stream exactly `len` bytes of `file` from `offset`
+    /// as the rest of this reply - a response body sourced from a descriptor
+    /// instead of memory, read on the server's own ring in bounded chunks
+    /// (`ServerConfig::fs_body_chunk`) and sent as they arrive, so the copy
+    /// in flight is bounded by the chunk size, never the body size.
+    ///
+    /// Requires an fs pool (`ServerConfig::fs_files`); without one the
+    /// connection is closed ([`CloseReason::FileBody`]) rather than a short
+    /// body sent. `len` is a contract, not a hint: the protocol already
+    /// framed it (an HTTP `Content-Length`), so reads are clamped to it - a
+    /// file *grown* mid-send is invisible - and a read returning EOF before
+    /// `len` closes the connection mid-body
+    /// ([`CloseReason::FileBodyTruncated`]): the framing cannot renegotiate
+    /// a length already sent, and a short body presented as complete would
+    /// be a lie. `len == 0` behaves as [`Reply`](Response::Reply)`(head)`.
+    ///
+    /// While the body streams, every other PDU for this connection (a push,
+    /// a pipelined request's deferred reply) queues behind it - nothing may
+    /// interleave mid-body - and one body streams at a time: a second
+    /// `ReplyFile` while one is active closes the connection. `close`
+    /// matches [`ReplyVectored`](Response::ReplyVectored)'s: `true`
+    /// flush-closes once the body (and everything queued before it) drains.
+    /// While flush-closing no recv is armed, so a peer that stops reading
+    /// mid-body is reclaimed only by `ServerConfig::send_timeout` (or
+    /// `tcp_user_timeout`) - set one when serving untrusted peers; a
+    /// multi-GB body pins the slot for the transfer either way.
+    #[cfg(feature = "uring-fs")]
+    ReplyFile {
+        /// The reply's leading bytes (the protocol's header), sent before
+        /// the file bytes.
+        head: Vec<u8>,
+        /// The source file. Reference-counted: the reactor and each
+        /// in-flight read hold it, so the fd cannot close under a read
+        /// even once the handler's clone is gone.
+        file: crate::uring_fs::File,
+        /// File offset the body starts at (a range is an offset and a
+        /// length - no separate mechanism).
+        offset: u64,
+        /// Exactly how many bytes to send.
+        len: u64,
+        /// Close the connection once the reply has fully flushed.
+        close: bool,
+    },
     /// The reply will arrive later through a [`Deferred`]. Carries the
     /// [`DeferPermit`] proof minted by **this request's** [`Responder::defer`],
     /// so "deferred" cannot be claimed without an actual [`Deferred`] existing

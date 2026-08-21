@@ -115,6 +115,24 @@
 //! (bodies splice decrypted); see [`Framing::SpliceBody`] for the framer
 //! contract and timeout interaction.
 //!
+//! The egress mirror is a **reply body sourced from a file**
+//! ([`Response::ReplyFile`]; HTTP handlers reach it as
+//! `HttpResponse::file_body`): the reactor reads the declared range on its
+//! own ring in `ServerConfig::fs_body_chunk`-sized chunks - two buffers per
+//! connection, one reading while the previous one sends - so a multi-GB
+//! download costs two chunk buffers, never its own size. Requires the
+//! embedded fs pool (`ServerConfig::fs_files`). Deliberately `preadv2` +
+//! send rather than a splice: egress splice would need a pipe intermediary
+//! (a second hop, and a pipe per in-flight response), and over kTLS - the
+//! appliance default - encryption copies the plaintext into record buffers
+//! regardless, so the bounded-buffer copy is the mechanism's whole cost.
+//! On ZFS every one of these reads is punted to an io-wq worker
+//! (`zpl_file.c` sets neither `FMODE_NOWAIT` nor `FMODE_BUF_RASYNC`), which
+//! is why the per-connection pipeline depth is fixed at two and the chunk
+//! *size* is the knob; it is the count of connections mid-body that
+//! multiplies the load on that bounded worker class, and `pool_size` bounds
+//! it.
+//!
 //! # Server push
 //!
 //! [`Responder::push_handle`] returns a `Clone + Send + Sync` [`PushHandle`]
@@ -600,10 +618,18 @@ where
             + u32::from(cfg.tls_handshake_timeout.is_some());
         // Op-table size for the embedded fs reactor (0 when disabled/absent):
         // enough in-flight fs SQEs that a burst of opens+reads doesn't force a
-        // mid-batch flush. Sized against `fs_files` since each open is
-        // typically followed by a read/close on that file.
+        // mid-batch flush. `fs_files * 2` covers handler-driven work (each
+        // open is typically followed by a read/close on that file), plus one
+        // slot per connection for the reply path's body reads: a file tail
+        // keeps at most one read in flight, so `pool_size` bounds them
+        // exactly and a full pool of streaming bodies cannot exhaust the
+        // table out from under handler ops.
         #[cfg(feature = "uring-fs")]
-        let fs_ops = cfg.fs_files.saturating_mul(2);
+        let fs_ops = if cfg.fs_files > 0 {
+            cfg.fs_files.saturating_mul(2).saturating_add(cfg.pool_size)
+        } else {
+            0
+        };
         #[cfg(not(feature = "uring-fs"))]
         let fs_ops = 0u32;
         let entries = cfg
@@ -848,19 +874,30 @@ where
         // of the fs tables has ended.
         #[cfg(feature = "uring-fs")]
         if cqe.user_data as u8 & crate::uring::user_data::TAG_FS_DOMAIN != 0 {
-            if let Some(fs) = self.fs.as_mut() {
-                let (tag, fslot, fgen) =
-                    crate::uring::user_data::unpack_raw(cqe.user_data);
-                let reaped =
-                    fs.on_cqe(&mut self.core.engine, tag, fslot, fgen, cqe.res);
+            use crate::uring_fs::core::ReapedFs;
+            let Some(fs) = self.fs.as_mut() else {
+                return Ok(());
+            };
+            let (tag, fslot, fgen) =
+                crate::uring::user_data::unpack_raw(cqe.user_data);
+            match fs.on_cqe(&mut self.core.engine, tag, fslot, fgen, cqe.res) {
+                // A reply-path pump read: routed here rather than through a
+                // callback, so the tail advances with the whole loop in hand.
+                ReapedFs::Pump(done, owner) => {
+                    self.on_pump_read(owner, done)?;
+                }
                 // Continuation facade `root: false`: no new `open` (the owning
                 // connection may be gone; its file would leak).
-                crate::uring_fs::core::deliver_embedded(
-                    fs,
-                    &mut self.core.engine,
-                    reaped,
-                    false,
-                );
+                reaped => {
+                    if let Some(fs) = self.fs.as_mut() {
+                        crate::uring_fs::core::deliver_embedded(
+                            fs,
+                            &mut self.core.engine,
+                            reaped,
+                            false,
+                        );
+                    }
+                }
             }
             return Ok(());
         }

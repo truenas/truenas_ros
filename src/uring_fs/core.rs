@@ -126,6 +126,28 @@ pub(crate) enum FsWaiter {
         owner: Owner,
         cb: EmbeddedCb,
     },
+    /// A reactor-pump read (a `net` server streaming a file into a response
+    /// body): no callback - [`FsCore::on_cqe`] hands the outcome back as
+    /// [`ReapedFs::Pump`] and the host routes it to the owning connection
+    /// itself, with the full loop state in hand. Cancelled by owner exactly
+    /// like `Embedded`, so connection teardown reaches an in-flight body
+    /// read through the same sweep.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    Pump {
+        owner: (u32, u64),
+    },
+}
+
+/// A routed fs-domain CQE, from [`FsCore::on_cqe`]: nothing left to do (a
+/// channel op delivered in place, or an inert stale completion), an embedded
+/// callback + outcome for the host to fire once its borrow of the fs tables
+/// has ended, or a pump read's outcome for the host to route to its owning
+/// connection.
+pub(crate) enum ReapedFs {
+    None,
+    Embedded(EmbeddedCb, FsDone, Owner),
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    Pump(FsDone, (u32, u64)),
 }
 
 /// Box a consumer callback as an owner-stamped embedded waiter - the one shape
@@ -517,6 +539,70 @@ impl FsCore {
         if let Err(err) = staged {
             self.fail_op(op_slot, err);
         }
+    }
+
+    /// Stage a reactor-pump `READV`: one positional read of up to `want`
+    /// bytes at `off` into `buf`'s spare capacity, completing back through
+    /// [`ReapedFs::Pump`] rather than a callback - the submission path for
+    /// reads the *reply* path issues itself (a file-sourced response body),
+    /// outside any handler delivery.
+    ///
+    /// `buf` arrives empty with `capacity() >= want`; the kernel initializes
+    /// the spare capacity and the host sets the length from the CQE count --
+    /// the stream recv path's discipline, so no byte is zeroed only to be
+    /// overwritten. No personality is stamped (the SQE is zeroed): the read
+    /// runs as the ring's own credentials, because the access decision was
+    /// made at the file's open and an fd read re-checks nothing.
+    ///
+    /// Unlike the waiter-carrying submissions, a failure is returned to the
+    /// caller (`EBUSY` on a full op table, or the staging error): there is no
+    /// callback whose drop could report it, and a silently dropped pump read
+    /// would strand its connection mid-body with nothing left to re-drive it.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    pub(crate) fn submit_pump_read(
+        &mut self,
+        eng: &mut Engine,
+        file: &File,
+        mut buf: Vec<u8>,
+        want: usize,
+        off: u64,
+        owner: (u32, u64),
+    ) -> Result<(), Errno> {
+        debug_assert!(buf.is_empty() && buf.capacity() >= want);
+        let Some(op_slot) = self.op_free.pop() else {
+            return Err(Errno::EBUSY);
+        };
+        // The iovec targets the Vec's spare capacity; computed before the
+        // move below, and the heap block's address survives the move.
+        let iov = vec![libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: want,
+        }];
+        let raw_fd = file.as_raw_fd();
+        let entry = &mut self.ops[op_slot as usize];
+        let gen32 = entry.generation as u32;
+        let e = &mut entry.state;
+        e.state = FsOpState::InFlight { tag: TAG_READV };
+        e.waiter = Some(FsWaiter::Pump { owner });
+        e.bufs = vec![buf];
+        e.iov = iov;
+        // Park the fd so it stays open until the CQE even if the connection
+        // drops its `File` mid-op (close-last by ownership).
+        e.file = Some(Arc::clone(&file.fd));
+        let iov_ptr = e.iov.as_ptr() as u64;
+        let ud = pack_raw(TAG_READV, op_slot, gen32);
+        let staged = eng.stage(ud, |sqe| {
+            sqe.opcode = IORING_OP_READV;
+            sqe.fd = raw_fd;
+            sqe.addr = iov_ptr;
+            sqe.len = 1;
+            sqe.off_addr2 = off;
+        });
+        if let Err(err) = staged {
+            self.fail_op(op_slot, err);
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Stage an `FSYNC` (`datasync` selects `fdatasync`). `offset`/`length`
@@ -967,6 +1053,9 @@ impl FsCore {
                     {
                         Some(pack_raw(tag, i as u32, entry.generation as u32))
                     }
+                    Some(FsWaiter::Pump { owner: o }) if *o == owner => {
+                        Some(pack_raw(tag, i as u32, entry.generation as u32))
+                    }
                     _ => None,
                 }
             })
@@ -981,8 +1070,10 @@ impl FsCore {
     /// Route one fs-domain CQE. `tag` is the unpacked op tag; a generation
     /// mismatch makes the completion inert (op entries free only at their own
     /// terminal CQE). An **off-loop** (channel) op is delivered here and returns
-    /// `None`; an **embedded** (on-loop) op hands back its callback + outcome
-    /// for the host to fire once its borrow of the fs tables has ended.
+    /// [`ReapedFs::None`]; an **embedded** (on-loop) op hands back its
+    /// callback and outcome for the host to fire once its borrow of the fs
+    /// tables has ended; a **pump** read hands back its outcome and owner
+    /// for the host to route itself.
     pub(crate) fn on_cqe(
         &mut self,
         _eng: &mut Engine,
@@ -990,12 +1081,16 @@ impl FsCore {
         op_slot: u32,
         gen32: u32,
         res: i32,
-    ) -> Option<(EmbeddedCb, FsDone, Owner)> {
+    ) -> ReapedFs {
         if tag == TAG_CANCEL {
-            return None; // an ASYNC_CANCEL's own completion; nothing to route
+            // An ASYNC_CANCEL's own completion; nothing to route.
+            return ReapedFs::None;
         }
-        let Completed { waiter, bufs, stat } =
-            self.take_op(tag, op_slot, gen32)?;
+        let Some(Completed { waiter, bufs, stat }) =
+            self.take_op(tag, op_slot, gen32)
+        else {
+            return ReapedFs::None;
+        };
 
         // A successful OPENAT2 returns a real fd as its result; wrap it in an
         // `Arc<OwnedFd>`. If nobody takes it (a gone channel receiver, or a
@@ -1015,9 +1110,9 @@ impl FsCore {
         match waiter {
             Some(FsWaiter::Channel(tx)) => {
                 let _ = tx.send(FsOutcome::new(result, bufs, file, stat));
-                None
+                ReapedFs::None
             }
-            Some(FsWaiter::Embedded { owner, cb }) => Some((
+            Some(FsWaiter::Embedded { owner, cb }) => ReapedFs::Embedded(
                 cb,
                 FsDone {
                     result,
@@ -1026,8 +1121,17 @@ impl FsCore {
                     stat,
                 },
                 owner,
-            )),
-            None => None,
+            ),
+            Some(FsWaiter::Pump { owner }) => ReapedFs::Pump(
+                FsDone {
+                    result,
+                    bufs,
+                    file: file.map(File::new),
+                    stat,
+                },
+                owner,
+            ),
+            None => ReapedFs::None,
         }
     }
 
@@ -1130,6 +1234,14 @@ impl FsDone {
     /// The op's result: a byte count / `0`, or the errno it failed with.
     pub fn result(&self) -> crate::Result<i32> {
         self.result.map_err(Into::into)
+    }
+
+    /// The raw result, errno unwrapped - for the reply-path pump, which maps
+    /// a failure to a [`CloseReason`](crate::net::server::CloseReason)
+    /// carrying the errno itself.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn raw_result(&self) -> Result<i32, Errno> {
+        self.result
     }
 
     /// The freshly opened file - present only for a successful `open`.
@@ -2415,7 +2527,8 @@ mod hybrid_tests {
                 if tag == TAG_CANCEL || tag & TAG_FS_DOMAIN == 0 {
                     continue;
                 }
-                if let Some((cb, d, o)) = fs.on_cqe(eng, tag, slot, g, cqe.res)
+                if let ReapedFs::Embedded(cb, d, o) =
+                    fs.on_cqe(eng, tag, slot, g, cqe.res)
                 {
                     let mut c = FsConn::new(fs, eng, o, true);
                     cb(d, &mut c);
@@ -2826,6 +2939,11 @@ fn deliver(
             drop(cb);
             drop((bufs, file, stat));
         }
+        // A pump read has no callback to drop and nowhere to route from here:
+        // on a teardown drain the owning connection is dying with the loop,
+        // and on a staging failure (`fail_op`) `submit_pump_read` reports the
+        // error to its caller synchronously. The payloads just drop.
+        Some(FsWaiter::Pump { .. }) => drop((bufs, file, stat)),
         None => {}
     }
 }
@@ -2846,18 +2964,26 @@ pub(crate) fn deliver_pool_completions(
 }
 
 /// Fire an embedded on-loop completion reaped by [`FsCore::on_cqe`] with a
-/// fresh owner-scoped [`FsConn`]; a no-op when `on_cqe` returned `None` (a
-/// channel op already delivered, or an inert stale CQE). Shared by the host and
-/// the net server so the CQE hand-back is written once.
+/// fresh owner-scoped [`FsConn`]; a no-op when `on_cqe` returned
+/// [`ReapedFs::None`] (a channel op already delivered, or an inert stale
+/// CQE). Shared by the host and the net server so the CQE hand-back is
+/// written once. A [`ReapedFs::Pump`] never reaches here: only the net
+/// server submits pump reads, and its dispatch routes them before this call.
 pub(crate) fn deliver_embedded(
     fs: &mut FsCore,
     eng: &mut Engine,
-    reaped: Option<(EmbeddedCb, FsDone, Owner)>,
+    reaped: ReapedFs,
     root: bool,
 ) {
-    if let Some((cb, done, owner)) = reaped {
-        let mut conn = FsConn::new(fs, eng, owner, root);
-        cb(done, &mut conn);
+    match reaped {
+        ReapedFs::Embedded(cb, done, owner) => {
+            let mut conn = FsConn::new(fs, eng, owner, root);
+            cb(done, &mut conn);
+        }
+        ReapedFs::Pump(..) => {
+            unreachable!("pump reads are routed by the net server")
+        }
+        ReapedFs::None => {}
     }
 }
 
@@ -3251,6 +3377,154 @@ mod routing_fuzz {
             (0..OP_SLOTS).collect::<Vec<_>>(),
             "op slots leaked or double-freed (seed {seed})"
         );
+    }
+
+    // ---- reply-path pump reads (`FsWaiter::Pump`) ----
+
+    #[test]
+    fn a_pump_read_routes_back_with_its_owner_and_bytes() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(4, OffloadBounds::default());
+        let dir = crate::tempdir().expect("tempdir");
+        let p = dir.path().join("f");
+        std::fs::write(&p, b"0123456789").unwrap();
+        let fd: std::os::fd::OwnedFd = std::fs::File::open(&p).unwrap().into();
+        let file = File::new(Arc::new(fd));
+
+        core.submit_pump_read(
+            &mut eng,
+            &file,
+            Vec::with_capacity(8),
+            8,
+            2,
+            (3, 77),
+        )
+        .expect("submit");
+        // The op parks its own fd clone (close-last): caller + op.
+        assert_eq!(Arc::strong_count(&file.fd), 2);
+
+        eng.ring.submit_and_wait(1).expect("submit_and_wait");
+        let cqe = eng.ring.reap().expect("cqe");
+        let (tag, slot, g) = unpack_raw(cqe.user_data);
+        assert_eq!(tag, TAG_READV);
+        let ReapedFs::Pump(done, owner) =
+            core.on_cqe(&mut eng, tag, slot, g, cqe.res)
+        else {
+            panic!("a pump read must route as ReapedFs::Pump");
+        };
+        assert_eq!(owner, (3, 77), "the owner survives the round trip");
+        assert!(matches!(done.result(), Ok(8)), "{:?}", done.result());
+        // The parked clone dropped with the op entry (close-last).
+        assert_eq!(Arc::strong_count(&file.fd), 1);
+        let mut bufs = done.into_bufs();
+        let mut b = bufs.pop().expect("the read's buffer comes back");
+        assert!(bufs.is_empty());
+        // SAFETY: the CQE count proves the kernel wrote 8 bytes into the
+        // spare capacity the iovec targeted.
+        unsafe { b.set_len(8) };
+        assert_eq!(&b[..], b"23456789", "read from the requested offset");
+    }
+
+    #[test]
+    fn a_full_op_table_refuses_a_pump_read_synchronously() {
+        // The shed-one-connection discipline needs the error in hand at
+        // submit time: there is no callback whose drop could report it, and
+        // a silently dropped pump read would strand its connection mid-body
+        // with nothing left to re-drive it.
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(1, OffloadBounds::default());
+        let dir = crate::tempdir().expect("tempdir");
+        let p = dir.path().join("f");
+        std::fs::write(&p, b"abcd").unwrap();
+        let fd: std::os::fd::OwnedFd = std::fs::File::open(&p).unwrap().into();
+        let file = File::new(Arc::new(fd));
+        let submit = |core: &mut FsCore, eng: &mut Engine| {
+            core.submit_pump_read(
+                eng,
+                &file,
+                Vec::with_capacity(4),
+                4,
+                0,
+                (0, 1),
+            )
+        };
+
+        submit(&mut core, &mut eng).expect("first read takes the only op slot");
+        assert_eq!(
+            submit(&mut core, &mut eng),
+            Err(Errno::EBUSY),
+            "a full table must refuse, not drop"
+        );
+        // Draining the first read frees the slot for the next.
+        eng.ring.submit_and_wait(1).expect("submit_and_wait");
+        let cqe = eng.ring.reap().expect("cqe");
+        let (tag, slot, g) = unpack_raw(cqe.user_data);
+        assert!(matches!(
+            core.on_cqe(&mut eng, tag, slot, g, cqe.res),
+            ReapedFs::Pump(..)
+        ));
+        submit(&mut core, &mut eng).expect("freed slot serves the next");
+    }
+
+    #[test]
+    fn cancel_owned_by_reaches_a_pump_read() {
+        // Connection teardown's sweep cancels fs ops by owner; a pump read
+        // parked on an empty pipe (never completing on its own) must be
+        // reaped by exactly that path, and its parked fd clone released.
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(4, OffloadBounds::default());
+        let mut fds = [0i32; 2];
+        // SAFETY: `pipe(2)` fills {read, write}.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        // SAFETY: fds[0] is the fresh read end, owned here; fds[1] (the
+        // write end, kept open so the read never EOFs) closes at the end.
+        let file =
+            File::new(Arc::new(unsafe { crate::fd::owned_from_raw(fds[0]) }));
+
+        // `u64::MAX` offset = "the file position": a pipe rejects real
+        // offsets with ESPIPE.
+        core.submit_pump_read(
+            &mut eng,
+            &file,
+            Vec::with_capacity(8),
+            8,
+            u64::MAX,
+            (5, 9),
+        )
+        .expect("submit");
+        assert_eq!(Arc::strong_count(&file.fd), 2, "op parks its clone");
+        core.cancel_owned_by(&mut eng, (5, 9));
+
+        // Reap until the read's own CQE routes (the cancel's is inert).
+        let reaped = loop {
+            eng.ring.submit_and_wait(1).expect("submit_and_wait");
+            let Some(cqe) = eng.ring.reap() else {
+                continue;
+            };
+            let (tag, slot, g) = unpack_raw(cqe.user_data);
+            match core.on_cqe(&mut eng, tag, slot, g, cqe.res) {
+                ReapedFs::None => continue,
+                other => break other,
+            }
+        };
+        let ReapedFs::Pump(done, owner) = reaped else {
+            panic!("the cancelled read must still route as Pump");
+        };
+        assert_eq!(owner, (5, 9));
+        assert!(
+            matches!(done.result(), Err(crate::Error::Errno(Errno::ECANCELED))),
+            "an owner cancel reaps the parked read: {:?}",
+            done.result()
+        );
+        assert_eq!(Arc::strong_count(&file.fd), 1, "clone released");
+        // SAFETY: closing the test-owned write end.
+        unsafe { libc::close(fds[1]) };
     }
 }
 

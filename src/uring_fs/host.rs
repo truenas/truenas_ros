@@ -277,9 +277,11 @@ impl UringFs {
             }
             TAG_CANCEL => {}
             // Deliver a completion. An `FsHandle` op parks a channel waiter
-            // (routed inside `on_cqe`, returns `None`); an embedded on-loop op
-            // (`FsConn`) hands its callback back to fire here with a fresh
-            // owner-scoped `FsConn`.
+            // (routed inside `on_cqe`, which then reaps nothing); an embedded
+            // on-loop op (`FsConn`) hands its callback back to fire here with
+            // a fresh owner-scoped `FsConn`. A pump read cannot reap here --
+            // only a `net` server submits those - and `deliver_embedded`
+            // treats one as unreachable.
             _ => {
                 let reaped =
                     self.fs.on_cqe(&mut self.eng, tag, slot, gen32, cqe.res);

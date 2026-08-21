@@ -150,6 +150,53 @@ enum SendKind {
 struct SendItem {
     bytes: SendBuf,
     kind: SendKind,
+    /// A file-tail chunk whose `Vec` returns to the tail's spare pool once
+    /// flushed - never a consumer PDU, whose allocation the consumer chose.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    reclaim: bool,
+}
+
+/// Chunk buffers a file-sourced response body cycles through: one being
+/// read into while the previous one sends. Fixed rather than configurable:
+/// on ZFS every ring read is an io-wq punt, so a deeper pipeline only
+/// deepens the bounded worker class's queue - the chunk *size* is the knob
+/// (`fs_body_chunk`), not the count.
+#[cfg(all(feature = "net-server", feature = "uring-fs"))]
+const FILE_TAIL_BUFS: u8 = 2;
+
+/// A file-sourced response body mid-stream (`Response::ReplyFile`): the
+/// reply path reads `unread` more bytes from `file` in bounded chunks, each
+/// entering the send queue as its own segment, the final one `ReplyLast` so
+/// the reply retires exactly once. While a tail is active every OTHER
+/// enqueue (a push, a deferred reply for a pipelined request) is diverted to
+/// `pending` - its bytes would otherwise land between two chunks of this
+/// body on the wire - and released in arrival order once the last chunk is
+/// queued.
+#[cfg(all(feature = "net-server", feature = "uring-fs"))]
+pub(crate) struct FileTail {
+    /// The source file. Each in-flight read parks its own fd clone, so
+    /// dropping this with the tail (or the connection) never closes the fd
+    /// under a read.
+    pub(crate) file: crate::uring_fs::File,
+    /// File offset of the next read.
+    pub(crate) next_offset: u64,
+    /// Bytes of the declared body no read has returned yet. Every read is
+    /// clamped to `min(chunk, unread)`: the header's Content-Length is a
+    /// snapshot, and an unclamped read of a file grown mid-send would push
+    /// bytes past the declared length - which a keep-alive peer parses as
+    /// the start of the next response (a framing desync).
+    pub(crate) unread: u64,
+    /// A pump read is in flight. At most one: chunks must enter the send
+    /// queue in offset order, and a single outstanding read makes that
+    /// order structural instead of re-sorted.
+    pub(crate) reading: bool,
+    /// Recycled chunk buffers (length 0, capacity one chunk), refilled by
+    /// [`Connection::advance_sent`] as flushed chunks pop.
+    spare: Vec<Vec<u8>>,
+    /// Buffers minted so far, capped at [`FILE_TAIL_BUFS`].
+    created: u8,
+    /// PDUs diverted while this tail is active (see the struct docs).
+    pending: Vec<SendItem>,
 }
 
 /// A connection's receive transport, installed at setup (mirrors the kernel's
@@ -355,6 +402,11 @@ pub(crate) struct Connection<U> {
     // index under a surviving op (a use-after-free - see `close_conn`).
     pub teardown_deferred: bool,
     pub teardown_shutdown_first: bool, // SHUTDOWN-first for the deferred teardown
+    // A file-sourced response body mid-stream, driven by the server's reply
+    // path (`Response::ReplyFile`). Server-only: a client never installs one,
+    // so its `tail_active()` is constantly false there.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) file_tail: Option<FileTail>,
     pub outstanding: u32, // delivered-but-not-yet-fully-sent requests (read-ahead cap)
     pub ops: u32, // in-flight recv+send+close ops; free the slot only at 0
     next_req_id: u64, // per-connection request id, assigned as requests deliver
@@ -432,6 +484,8 @@ impl<U> Connection<U> {
             closing: false,
             teardown_deferred: false,
             teardown_shutdown_first: false,
+            #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+            file_tail: None,
             outstanding: 0,
             ops: 0,
             next_req_id: 0,
@@ -791,7 +845,114 @@ impl<U> Connection<U> {
     fn enqueue(&mut self, bytes: impl Into<SendBuf>, kind: SendKind) {
         let bytes = bytes.into();
         self.queued_bytes += bytes.len();
-        self.send_queue.push_back(SendItem { bytes, kind });
+        let item = SendItem {
+            bytes,
+            kind,
+            #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+            reclaim: false,
+        };
+        // Mid-file-tail, any other PDU would land between two chunks of the
+        // streaming body on the wire; hold it (still counted in
+        // `queued_bytes`, so the backlog bound sees it) until the tail's
+        // last chunk is queued.
+        #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+        if let Some(tail) = self.file_tail.as_mut() {
+            tail.pending.push(item);
+            return;
+        }
+        self.send_queue.push_back(item);
+    }
+
+    /// Install a file tail: the reply path streams `len` bytes of `file`
+    /// from `offset` behind whatever is already queued. The caller enqueued
+    /// the reply's head first (as a non-final segment) and checked no tail
+    /// is active.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn install_file_tail(
+        &mut self,
+        file: crate::uring_fs::File,
+        offset: u64,
+        len: u64,
+    ) {
+        debug_assert!(self.file_tail.is_none(), "one tail at a time");
+        self.file_tail = Some(FileTail {
+            file,
+            next_offset: offset,
+            unread: len,
+            reading: false,
+            spare: Vec::new(),
+            created: 0,
+            pending: Vec::new(),
+        });
+    }
+
+    /// Whether a file-sourced body is still being produced (its last chunk
+    /// not yet queued). While true, a queue that reads dry can still owe
+    /// bytes - the flush-close dry checks consult this.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn tail_active(&self) -> bool {
+        self.file_tail.is_some()
+    }
+
+    /// Without a server-side fs pool no tail can exist; the flush-close dry
+    /// checks compile to their old shape.
+    #[cfg(not(all(feature = "net-server", feature = "uring-fs")))]
+    pub(crate) fn tail_active(&self) -> bool {
+        false
+    }
+
+    /// A chunk buffer for the tail's next read: a recycled spare, or a fresh
+    /// one while under the [`FILE_TAIL_BUFS`] cap - `None` when every buffer
+    /// is still queued or sending (the read waits for a flush to recycle
+    /// one; that wait is the body's memory bound).
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn tail_take_buf(&mut self, chunk: usize) -> Option<Vec<u8>> {
+        let tail = self.file_tail.as_mut()?;
+        if let Some(buf) = tail.spare.pop() {
+            return Some(buf);
+        }
+        if tail.created < FILE_TAIL_BUFS {
+            tail.created += 1;
+            return Some(Vec::with_capacity(chunk));
+        }
+        None
+    }
+
+    /// Queue the leading segment of a reply whose final segment arrives
+    /// later (a file tail's head): a non-final part, so the reply retires
+    /// exactly once - when the tail's last chunk flushes. Call before
+    /// [`Connection::install_file_tail`], while the diversion is still off.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn enqueue_reply_head(&mut self, bytes: Vec<u8>) {
+        if !bytes.is_empty() {
+            self.enqueue(bytes, SendKind::ReplyPart);
+        }
+    }
+
+    /// Queue one tail chunk (bypassing the diversion - it IS the tail).
+    /// `last` marks the final chunk `ReplyLast`, retiring the reply's
+    /// read-ahead slot when it flushes.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn enqueue_file_chunk(&mut self, bytes: Vec<u8>, last: bool) {
+        self.queued_bytes += bytes.len();
+        self.send_queue.push_back(SendItem {
+            bytes: bytes.into(),
+            kind: if last {
+                SendKind::ReplyLast
+            } else {
+                SendKind::ReplyPart
+            },
+            reclaim: true,
+        });
+    }
+
+    /// Retire the tail (its last chunk is queued) and release the PDUs the
+    /// diversion held, in arrival order, behind it.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn finish_file_tail(&mut self) {
+        if let Some(tail) = self.file_tail.take() {
+            self.send_queue.extend(tail.pending);
+        }
     }
 
     /// Whether any PDU is queued (or being sent).
@@ -868,6 +1029,21 @@ impl<U> Connection<U> {
                 SendKind::Push => progress.pushes += 1,
                 // Tallied by the reply's final ReplyLast segment.
                 SendKind::ReplyPart => {}
+            }
+            // A flushed tail chunk's buffer returns to the spare pool for
+            // the next read; past the cap it drops instead. The cap matters
+            // in pipelined mode: a finished tail's last chunks can still be
+            // flushing when the NEXT request installs a new tail, and
+            // recycling them on top of the new tail's own two would grow a
+            // connection past the documented two-buffer bound.
+            #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+            if item.reclaim
+                && let Some(tail) = self.file_tail.as_mut()
+                && tail.spare.len() < FILE_TAIL_BUFS as usize
+                && let Some(mut buf) = item.bytes.take_owned()
+            {
+                buf.clear();
+                tail.spare.push(buf);
             }
         }
         progress
@@ -1169,5 +1345,117 @@ mod tests {
     #[test]
     fn unknown_op_tag() {
         assert_eq!(unpack(0xff).0, None);
+    }
+
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    #[test]
+    fn file_tail_diverts_reclaims_and_releases_in_order() {
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        let fd: std::os::fd::OwnedFd =
+            std::fs::File::open("/dev/null").expect("open").into();
+        let file = crate::uring_fs::File::new(crate::sync::Arc::new(fd));
+
+        // Head first (the diversion is not yet on), then the tail.
+        c.enqueue_reply_head(b"HEAD".to_vec());
+        c.install_file_tail(file, 0, 20);
+        assert!(c.tail_active());
+
+        // Exactly two buffers exist; a third read must wait for a recycle.
+        let b0 = c.tail_take_buf(8).expect("first buffer");
+        let p0 = b0.as_ptr() as usize;
+        let b1 = c.tail_take_buf(8).expect("second buffer");
+        assert!(c.tail_take_buf(8).is_none(), "capped at two");
+        drop(b1);
+
+        // Mid-tail enqueues divert - their bytes may not land between two
+        // chunks on the wire - but stay in the backlog accounting.
+        c.enqueue_push(b"PU".to_vec());
+        c.enqueue_reply(b"RRR".to_vec());
+        assert_eq!(c.queued_bytes(), 4 + 2 + 3);
+
+        // The tail's own chunks go straight through.
+        let mut chunk0 = b0;
+        chunk0.extend_from_slice(&[b'a'; 8]);
+        c.enqueue_file_chunk(chunk0, false);
+        assert_eq!(c.arm_send(), 4 + 8, "head + chunk, no diverted bytes");
+        let p = c.advance_sent(12);
+        assert_eq!(
+            (p.replies, p.pushes),
+            (0, 0),
+            "nothing retires before the last chunk"
+        );
+        // The flushed chunk's allocation recycled into the spare pool.
+        let recycled = c.tail_take_buf(8).expect("recycled buffer");
+        assert_eq!(recycled.as_ptr() as usize, p0, "same allocation");
+        assert!(recycled.is_empty());
+
+        // The final chunk retires the tail; the diverted PDUs follow in
+        // arrival order behind it.
+        let mut last = recycled;
+        last.extend_from_slice(&[b'z'; 12]);
+        c.enqueue_file_chunk(last, true);
+        c.finish_file_tail();
+        assert!(!c.tail_active());
+        assert_eq!(c.arm_send(), 12 + 2 + 3);
+        assert_eq!(c.send_iovs[0].iov_len, 12);
+        assert_eq!(c.send_iovs[1].iov_len, 2, "push held until the tail");
+        assert_eq!(c.send_iovs[2].iov_len, 3, "deferred reply after it");
+        let p = c.advance_sent(12 + 2 + 3);
+        assert_eq!(
+            (p.replies, p.pushes),
+            (2, 1),
+            "the tail's reply, the diverted reply, and the push"
+        );
+        assert_eq!(c.queued_bytes(), 0);
+        assert!(!c.has_pending_send());
+    }
+
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    #[test]
+    fn a_late_flushing_chunk_never_grows_the_next_tails_pool() {
+        // Pipelined shape: tail A retired but its chunks still queued when
+        // tail B installs on the same connection. A's buffers recycle into
+        // B's spare only up to the cap; past it they drop - so however the
+        // handoff interleaves, a connection's pool never grows beyond
+        // FILE_TAIL_BUFS spares plus FILE_TAIL_BUFS mints.
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        let file = || {
+            let fd: std::os::fd::OwnedFd =
+                std::fs::File::open("/dev/null").expect("open").into();
+            crate::uring_fs::File::new(crate::sync::Arc::new(fd))
+        };
+        let mk = |b: u8| {
+            let mut v = Vec::with_capacity(4);
+            v.extend_from_slice(&[b; 4]);
+            v
+        };
+        c.install_file_tail(file(), 0, 12);
+        let (c0, c1, c2) = (mk(b'a'), mk(b'b'), mk(b'c'));
+        let (p0, p1) = (c0.as_ptr() as usize, c1.as_ptr() as usize);
+        c.enqueue_file_chunk(c0, false);
+        c.enqueue_file_chunk(c1, false);
+        c.enqueue_file_chunk(c2, true);
+        c.finish_file_tail();
+        // B installs while A's three chunks are still queued.
+        c.install_file_tail(file(), 0, 8);
+        assert_eq!(c.arm_send(), 12);
+        let _ = c.advance_sent(12);
+        // Exactly two of A's flushed chunks recycled (spare LIFO), then B
+        // mints its own two, then nothing: four takes, never five. Without
+        // the spare cap the third flushed chunk would recycle too and a
+        // fifth take would succeed.
+        let t1 = c.tail_take_buf(4).expect("recycled one");
+        let t2 = c.tail_take_buf(4).expect("recycled two");
+        let taken = [t1.as_ptr() as usize, t2.as_ptr() as usize];
+        assert!(
+            taken.contains(&p0) && taken.contains(&p1),
+            "the first two flushed chunks are the recycled pair"
+        );
+        let _t3 = c.tail_take_buf(4).expect("first mint");
+        let _t4 = c.tail_take_buf(4).expect("second mint");
+        assert!(
+            c.tail_take_buf(4).is_none(),
+            "the third flushed chunk dropped at the spare cap"
+        );
     }
 }

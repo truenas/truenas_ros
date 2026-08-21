@@ -162,6 +162,18 @@ pub enum CloseReason {
     RecvError(Errno),
     /// A send failed with this errno.
     SendError(Errno),
+    /// A file-sourced reply body (`Response::ReplyFile`) could not run or
+    /// failed mid-stream: the server has no fs pool, a second file body
+    /// arrived while one was active, the fs op table was full or staging
+    /// failed (`EBUSY` - shedding this one connection, never the server),
+    /// or a body read failed with this errno.
+    FileBody(Errno),
+    /// A file-sourced reply body hit EOF before its declared length: the
+    /// file shrank after the header committed to a Content-Length, which
+    /// the framing cannot renegotiate. The connection closes mid-body so
+    /// the peer sees a truncated transfer rather than a short body
+    /// presented as complete.
+    FileBodyTruncated,
     /// A kTLS connection delivered a non-`application_data` record (a
     /// post-handshake handshake message, TLS 1.3 KeyUpdate, or alert). The
     /// server closes rather than handle it (renegotiation/rekey are out of
@@ -322,6 +334,18 @@ impl std::fmt::Debug for Body<'_> {
 /// changing the segment type.
 #[derive(Debug)]
 pub struct SendBuf(Cow<'static, [u8]>);
+
+impl SendBuf {
+    /// The owned allocation back out, for buffer recycling (a flushed
+    /// file-tail chunk); `None` for a borrowed `'static` segment.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn take_owned(self) -> Option<Vec<u8>> {
+        match self.0 {
+            Cow::Owned(v) => Some(v),
+            Cow::Borrowed(_) => None,
+        }
+    }
+}
 
 impl std::ops::Deref for SendBuf {
     type Target = [u8];

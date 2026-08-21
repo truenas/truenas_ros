@@ -34,12 +34,42 @@ use super::head::{has_field_break, is_token_byte};
 pub struct HttpResponse {
     pub(crate) status: u16,
     pub(crate) headers: Headers,
-    pub(crate) body: Cow<'static, [u8]>,
+    pub(crate) body: BodySource,
     pub(crate) close: bool,
     /// The `Content-Length` to report when this answers a HEAD, set by
     /// [`HttpResponse::head_content_length`]; ignored on every other
     /// request, where the measured body is the only truth.
     pub(crate) head_len: Option<u64>,
+}
+
+/// Where a response's body comes from: bytes in hand, or a file the reactor
+/// streams behind the head. One source per response - [`HttpResponse::body`]
+/// and [`HttpResponse::file_body`] both set it, last call wins - so the
+/// serializer has exactly one origin to frame.
+#[derive(Debug)]
+pub(crate) enum BodySource {
+    /// Buffered bytes (the only source without `uring-fs`).
+    Bytes(Cow<'static, [u8]>),
+    /// `len` bytes of `file` from `offset`, read and sent in bounded chunks
+    /// by the reactor's reply path ([`HttpResponse::file_body`]).
+    #[cfg(feature = "uring-fs")]
+    File {
+        file: crate::uring_fs::File,
+        offset: u64,
+        len: u64,
+    },
+}
+
+impl BodySource {
+    /// The `Content-Length` a GET of this source declares: measured for
+    /// bytes, the caller's contract for a file.
+    fn declared_len(&self) -> u64 {
+        match self {
+            BodySource::Bytes(b) => b.len() as u64,
+            #[cfg(feature = "uring-fs")]
+            BodySource::File { len, .. } => *len,
+        }
+    }
 }
 
 /// Conversion into stored response bytes - the `Cow`-aware analogue of
@@ -157,7 +187,7 @@ impl HttpResponse {
                 500
             },
             headers: Headers::default(),
-            body: Cow::Borrowed(&[]),
+            body: BodySource::Bytes(Cow::Borrowed(&[])),
             close: false,
             head_len: None,
         }
@@ -190,9 +220,54 @@ impl HttpResponse {
     /// Set the body. `Content-Length` follows automatically; for a HEAD
     /// request the bytes are measured but not sent. On a bodyless status
     /// (1xx/204/304) the bytes are never sent - see `serialize`. Static
-    /// bytes are stored as a borrow - no copy.
+    /// bytes are stored as a borrow - no copy. A response has one body
+    /// source: this and [`HttpResponse::file_body`] set the same slot, last
+    /// call wins.
     pub fn body(mut self, body: impl IntoBytes) -> Self {
-        self.body = body.into_bytes();
+        self.body = BodySource::Bytes(body.into_bytes());
+        self
+    }
+
+    /// Send `len` bytes of `file` starting at `offset` as this response's
+    /// body, read on the server's ring and sent in bounded chunks
+    /// (`ServerConfig::fs_body_chunk`) rather than buffered - so a
+    /// multi-GB body costs two chunk buffers, never its own size. A range
+    /// is an `offset`/`len`; no separate mechanism.
+    ///
+    /// `len` is mandatory and IS the `Content-Length` - a snapshot the
+    /// reply is held to. Reads are clamped to it, so a file *grown*
+    /// mid-send is invisible; a file that *shrinks* below it closes the
+    /// connection mid-body
+    /// ([`CloseReason`](crate::net::server::CloseReason)
+    /// `::FileBodyTruncated`) - the framing cannot renegotiate a declared
+    /// length, and a short body presented as complete would be a lie.
+    ///
+    /// The elision rules are [`body`](HttpResponse::body)'s: on a HEAD the
+    /// length is declared
+    /// ([`head_content_length`](HttpResponse::head_content_length) still
+    /// overrides it) and **no
+    /// read is issued**; on a bodyless status (1xx/204/304) the handle is
+    /// dropped unread and nothing is sent. One body, one origin: this and
+    /// `body` set the same slot, last call wins.
+    ///
+    /// The handle moves into the response and the reactor holds it until
+    /// the last chunk flushes or the connection dies - dropping the
+    /// caller's other clones never closes the fd under an in-flight read.
+    /// Serving this requires the server's fs pool
+    /// (`ServerConfig::fs_files`); without one the connection is closed at
+    /// reply time rather than a short body sent. A peer that stops reading
+    /// mid-body is reclaimed only by `ServerConfig::send_timeout` or
+    /// `tcp_user_timeout` (TCP zero-window probing never gives up on its
+    /// own), and a large body pins the connection's slot for the duration
+    /// -- set both when serving untrusted peers.
+    #[cfg(feature = "uring-fs")]
+    pub fn file_body(
+        mut self,
+        file: crate::uring_fs::File,
+        offset: u64,
+        len: u64,
+    ) -> Self {
+        self.body = BodySource::File { file, offset, len };
         self
     }
 
@@ -280,16 +355,16 @@ pub(crate) fn serialize(
     conn: ConnHeader,
 ) -> Vec<u8> {
     let bodyless = status_is_bodyless(resp.status);
-    let body_cap = if head_only || bodyless {
-        0
-    } else {
-        resp.body.len()
+    // Only in-hand bytes can ride this by-ref serializer; a file-sourced
+    // body serializes as its head alone (the reactor streams the bytes --
+    // that path goes through `serialize_reply`).
+    let body: &[u8] = match &resp.body {
+        BodySource::Bytes(b) if !head_only && !bodyless => b,
+        _ => &[],
     };
-    let mut out = Vec::with_capacity(head_capacity(resp) + body_cap);
+    let mut out = Vec::with_capacity(head_capacity(resp) + body.len());
     write_head(&mut out, resp, head_only, date, conn);
-    if !head_only && !bodyless {
-        out.extend_from_slice(&resp.body);
-    }
+    out.extend_from_slice(body);
     out
 }
 
@@ -347,10 +422,12 @@ fn write_head(
     out.extend_from_slice(b"\r\n");
     if !bodyless {
         // A declared length is honored only on the HEAD path, where no body
-        // bytes follow to disagree with it.
+        // bytes follow to disagree with it. A file-sourced body's `len` is
+        // the caller's contract on both paths: a HEAD declares the length a
+        // GET would have sent (RFC 9110 sec. 9.3.2) without reading a byte.
         let declared = match resp.head_len {
             Some(len) if head_only => len,
-            _ => resp.body.len() as u64,
+            _ => resp.body.declared_len(),
         };
         write!(out, "Content-Length: {declared}\r\n").unwrap();
     }
@@ -383,15 +460,31 @@ pub(crate) enum Serialized {
         /// `'static` bytes borrowed - the handler's storage either way.
         body: Cow<'static, [u8]>,
     },
+    /// Head plus a file-sourced tail: the reactor streams `len` bytes of
+    /// `file` from `offset` behind the head
+    /// ([`HttpResponse::file_body`] -> `Response::ReplyFile`).
+    #[cfg(feature = "uring-fs")]
+    FileTail {
+        /// The response head (status line through the blank line).
+        head: Vec<u8>,
+        /// The body's source file, moved to the reactor.
+        file: crate::uring_fs::File,
+        /// File offset the body starts at.
+        offset: u64,
+        /// Exactly the declared `Content-Length`.
+        len: u64,
+    },
 }
 
 /// Serialize `resp` into a head buffer and, when the response carries a body,
 /// the body as its own segment - so the send path scatters head + body with
 /// one vectored write rather than copying the body into the head buffer.
 /// A HEAD response, a bodyless status (1xx/204/304), or an empty body has
-/// nothing to scatter and yields [`Serialized::HeadOnly`]; any other response
-/// splits. Consumes `resp` so the body - owned or `'static` - rides into its
-/// segment as stored, without a copy.
+/// nothing to scatter and yields [`Serialized::HeadOnly`]; a byte body
+/// splits; a file body becomes [`Serialized::FileTail`] for the reactor to
+/// stream. Consumes `resp` so a byte body - owned or `'static` - rides into
+/// its segment as stored, without a copy, and a file body's handle moves
+/// instead of cloning.
 pub(crate) fn serialize_reply(
     resp: HttpResponse,
     head_only: bool,
@@ -399,13 +492,32 @@ pub(crate) fn serialize_reply(
     conn: ConnHeader,
 ) -> Serialized {
     let bodyless = status_is_bodyless(resp.status);
-    if head_only || bodyless || resp.body.is_empty() {
-        Serialized::HeadOnly(serialize_head(&resp, head_only, date, conn))
-    } else {
-        let head = serialize_head(&resp, head_only, date, conn);
-        Serialized::Split {
-            head,
-            body: resp.body,
+    let head = serialize_head(&resp, head_only, date, conn);
+    match resp.body {
+        BodySource::Bytes(body) => {
+            if head_only || bodyless || body.is_empty() {
+                Serialized::HeadOnly(head)
+            } else {
+                Serialized::Split { head, body }
+            }
+        }
+        // A HEAD (its length was declared by `write_head`) or a bodyless
+        // status drops the handle unread - no read is ever issued for a
+        // response that sends no body - and a zero-length body has nothing
+        // to stream.
+        #[cfg(feature = "uring-fs")]
+        BodySource::File { file, offset, len } => {
+            if head_only || bodyless || len == 0 {
+                drop(file);
+                Serialized::HeadOnly(head)
+            } else {
+                Serialized::FileTail {
+                    head,
+                    file,
+                    offset,
+                    len,
+                }
+            }
         }
     }
 }
@@ -708,5 +820,129 @@ mod tests {
             panic!("a bodied response must split");
         };
         assert_eq!(body.as_ptr(), ptr);
+    }
+}
+
+#[cfg(all(test, feature = "uring-fs", not(loom)))]
+mod file_body_tests {
+    use super::*;
+    use crate::http::HttpDate;
+    use crate::sync::Arc;
+    use crate::uring_fs::File;
+    use std::os::fd::OwnedFd;
+
+    fn date() -> Vec<u8> {
+        HttpDate::from_unix(784_111_777).to_string().into_bytes()
+    }
+
+    fn text(bytes: &[u8]) -> &str {
+        std::str::from_utf8(bytes).expect("responses are ascii here")
+    }
+
+    /// A file handle plus the `Arc` behind it, so a test can prove the
+    /// handle was dropped (strong count back to 1) - the "no read is ever
+    /// issued" half of the elision contract, observable without a reactor.
+    fn probe_file() -> (File, Arc<OwnedFd>) {
+        let fd: OwnedFd = std::fs::File::open("/dev/null")
+            .expect("open /dev/null")
+            .into();
+        let arc = Arc::new(fd);
+        (File::new(Arc::clone(&arc)), arc)
+    }
+
+    #[test]
+    fn a_get_streams_the_declared_range() {
+        let (file, _held) = probe_file();
+        let resp = HttpResponse::new(200).file_body(file, 7, 4096);
+        let Serialized::FileTail {
+            head, offset, len, ..
+        } = serialize_reply(resp, false, &date(), ConnHeader::None)
+        else {
+            panic!("a file body must stream");
+        };
+        let s = text(&head);
+        assert!(s.contains("Content-Length: 4096\r\n"), "{s}");
+        assert!(s.ends_with("\r\n\r\n"), "{s}");
+        assert_eq!((offset, len), (7, 4096), "the range is the caller's");
+    }
+
+    #[test]
+    fn a_head_declares_the_length_and_drops_the_handle_unread() {
+        // The HEAD contract: the length a GET would have sent goes on the
+        // wire, no byte is read, and the handle is released - the strong
+        // count proves `serialize_reply` dropped it rather than parking it
+        // anywhere a read could still be issued from.
+        let (file, held) = probe_file();
+        let resp = HttpResponse::new(200).file_body(file, 0, 4096);
+        let Serialized::HeadOnly(head) =
+            serialize_reply(resp, true, &date(), ConnHeader::None)
+        else {
+            panic!("a HEAD must not stream");
+        };
+        let s = text(&head);
+        assert!(s.contains("Content-Length: 4096\r\n"), "{s}");
+        assert!(s.ends_with("\r\n\r\n"), "{s}");
+        assert_eq!(Arc::strong_count(&held), 1, "handle dropped unread");
+    }
+
+    #[test]
+    fn head_content_length_still_overrides_on_the_head_path() {
+        let (file, _held) = probe_file();
+        let resp = HttpResponse::new(200)
+            .head_content_length(9)
+            .file_body(file, 0, 4096);
+        let Serialized::HeadOnly(head) =
+            serialize_reply(resp, true, &date(), ConnHeader::None)
+        else {
+            panic!("a HEAD must not stream");
+        };
+        assert!(text(&head).contains("Content-Length: 9\r\n"));
+    }
+
+    #[test]
+    fn bodyless_statuses_drop_the_handle_and_the_length() {
+        for status in [100, 204, 304] {
+            let (file, held) = probe_file();
+            let resp = HttpResponse::new(status).file_body(file, 0, 4096);
+            let Serialized::HeadOnly(head) =
+                serialize_reply(resp, false, &date(), ConnHeader::None)
+            else {
+                panic!("{status}: a bodyless status must not stream");
+            };
+            assert!(!text(&head).contains("Content-Length"), "{status}");
+            assert_eq!(Arc::strong_count(&held), 1, "{status}: dropped");
+        }
+    }
+
+    #[test]
+    fn a_zero_length_file_body_is_a_plain_head() {
+        let (file, held) = probe_file();
+        let resp = HttpResponse::new(200).file_body(file, 0, 0);
+        let Serialized::HeadOnly(head) =
+            serialize_reply(resp, false, &date(), ConnHeader::None)
+        else {
+            panic!("nothing to stream");
+        };
+        assert!(text(&head).contains("Content-Length: 0\r\n"));
+        assert_eq!(Arc::strong_count(&held), 1);
+    }
+
+    #[test]
+    fn one_body_one_origin_last_call_wins() {
+        let (file, _held) = probe_file();
+        let resp = HttpResponse::new(200).body("bytes").file_body(file, 0, 3);
+        assert!(matches!(
+            serialize_reply(resp, false, &date(), ConnHeader::None),
+            Serialized::FileTail { len: 3, .. }
+        ));
+        let (file, held) = probe_file();
+        let resp = HttpResponse::new(200).file_body(file, 0, 3).body("bytes");
+        let Serialized::Split { body, .. } =
+            serialize_reply(resp, false, &date(), ConnHeader::None)
+        else {
+            panic!("the byte body won");
+        };
+        assert_eq!(&body[..], b"bytes");
+        assert_eq!(Arc::strong_count(&held), 1, "overwritten handle dropped");
     }
 }

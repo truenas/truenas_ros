@@ -1105,3 +1105,533 @@ fn http_redrive_hands_back_an_open_capable_facade() {
         return; // io_uring unavailable
     };
 }
+
+// ---------------------------------------------------------------------------
+// `HttpResponse::file_body`: fd-sourced response bodies, streamed by the
+// reactor's reply path in bounded chunks.
+
+/// A deterministic pattern any hole, reorder, or overrun shows up in.
+#[cfg(feature = "uring-fs")]
+fn patterned(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// The property the whole seam exists for: a body spanning many chunks
+/// (default `fs_body_chunk` 256 KiB, plus an odd remainder for the final
+/// short chunk) served byte-exact through the codec - with a HEAD of the
+/// same resource declaring the length and sending nothing, keep-alive
+/// surviving the stream, and a `Connection: close` GET flushing the WHOLE
+/// body before the farewell (the tail-guarded flush-close).
+#[cfg(feature = "uring-fs")]
+#[test]
+fn http_file_body_streams_a_multi_chunk_file() {
+    use std::sync::{Arc, OnceLock};
+    use truenas_ros::http::HttpVerdict;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality};
+
+    const SIZE: usize = 3 * 256 * 1024 + 12_345;
+    let dir = truenas_ros::tempdir().unwrap();
+    let content = patterned(SIZE);
+    std::fs::write(dir.path().join("obj"), &content).unwrap();
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+
+    let pc = Arc::clone(&pers);
+    let handler: FsHandler<()> = Box::new(move |req, _state, fs| {
+        if req.target == "/small" {
+            return HttpVerdict::Respond(HttpResponse::new(200).body("after"));
+        }
+        let Some(mut fs) = fs else {
+            return HttpVerdict::Respond(HttpResponse::new(500));
+        };
+        let (deferred, permit) = req.defer();
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let how = OpenHow::new().flags(OFlag::O_RDONLY);
+        fs.open(who, &anchor, c"obj", how, move |done, _fs| {
+            match done.file() {
+                Some(file) => deferred.reply(HttpResponse::new(200).file_body(
+                    file,
+                    0,
+                    SIZE as u64,
+                )),
+                None => deferred.close(),
+            }
+        });
+        HttpVerdict::Defer(permit)
+    });
+
+    let Some(()) = with_http_fs_server(
+        || (),
+        handler,
+        pers,
+        move |v4| {
+            let mut s = connect_tcp(v4)?;
+            s.set_read_timeout(Some(Duration::from_secs(10)))?;
+            // HEAD: the length is declared, no body byte follows - the next
+            // request on this same connection parses only if that held.
+            s.write_all(b"HEAD /obj HTTP/1.1\r\nHost: t\r\n\r\n")?;
+            let (status, head) = read_head(&mut s)?;
+            assert_eq!(status, 200);
+            assert!(
+                head.contains(&format!("Content-Length: {SIZE}\r\n")),
+                "{head}"
+            );
+            // GET: the streamed body, byte-exact.
+            s.write_all(b"GET /obj HTTP/1.1\r\nHost: t\r\n\r\n")?;
+            let (status, _head, body) = read_response(&mut s)?;
+            assert_eq!(status, 200);
+            assert_eq!(body.len(), SIZE);
+            assert_eq!(body, content, "streamed bytes match the file");
+            // Keep-alive survived the stream.
+            s.write_all(b"GET /small HTTP/1.1\r\nHost: t\r\n\r\n")?;
+            let (status, _head, body) = read_response(&mut s)?;
+            assert_eq!(status, 200);
+            assert_eq!(body, b"after");
+            // A farewell GET: the whole body must flush before the close.
+            s.write_all(
+                b"GET /obj HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+            )?;
+            let (status, head, body) = read_response(&mut s)?;
+            assert_eq!(status, 200);
+            assert!(head.contains("Connection: close\r\n"), "{head}");
+            assert_eq!(body, content, "farewell body complete before close");
+            assert_eof(&mut s)?;
+            Ok(())
+        },
+    ) else {
+        return; // io_uring unavailable
+    };
+}
+
+/// A range is an offset and a length - and a `File` handle stashed across
+/// requests serves one **inline** (no park): the first request opens and
+/// stashes, the second replies `file_body` straight from the handler.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn http_file_body_serves_a_range_from_a_stashed_handle() {
+    use std::sync::{Arc, Mutex, OnceLock};
+    use truenas_ros::http::HttpVerdict;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, File, Personality};
+
+    const SIZE: usize = 4096;
+    let dir = truenas_ros::tempdir().unwrap();
+    let content = patterned(SIZE);
+    std::fs::write(dir.path().join("obj"), &content).unwrap();
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let stash: Arc<Mutex<Option<File>>> = Arc::new(Mutex::new(None));
+
+    let pc = Arc::clone(&pers);
+    let st = Arc::clone(&stash);
+    let handler: FsHandler<()> = Box::new(move |req, _state, fs| {
+        if req.target == "/range" {
+            // Inline: the handle held from the previous request answers
+            // without a park - the handler-side shape of a preamble that
+            // already opened the object.
+            let file = st.lock().unwrap().take().expect("stashed by /open");
+            return HttpVerdict::Respond(
+                HttpResponse::new(200).file_body(file, 100, 1000),
+            );
+        }
+        let Some(mut fs) = fs else {
+            return HttpVerdict::Respond(HttpResponse::new(500));
+        };
+        let (deferred, permit) = req.defer();
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let how = OpenHow::new().flags(OFlag::O_RDONLY);
+        let st = Arc::clone(&st);
+        fs.open(who, &anchor, c"obj", how, move |done, _fs| {
+            match done.file() {
+                Some(file) => {
+                    *st.lock().unwrap() = Some(file);
+                    deferred.reply(HttpResponse::new(200).body("opened"));
+                }
+                None => deferred.close(),
+            }
+        });
+        HttpVerdict::Defer(permit)
+    });
+
+    let Some(()) = with_http_fs_server(
+        || (),
+        handler,
+        pers,
+        move |v4| {
+            let mut s = connect_tcp(v4)?;
+            s.set_read_timeout(Some(Duration::from_secs(5)))?;
+            s.write_all(b"GET /open HTTP/1.1\r\nHost: t\r\n\r\n")?;
+            let (status, _head, body) = read_response(&mut s)?;
+            assert_eq!((status, &body[..]), (200, &b"opened"[..]));
+            s.write_all(b"GET /range HTTP/1.1\r\nHost: t\r\n\r\n")?;
+            let (status, head, body) = read_response(&mut s)?;
+            assert_eq!(status, 200);
+            assert!(head.contains("Content-Length: 1000\r\n"), "{head}");
+            assert_eq!(body, content[100..1100], "the requested range");
+            Ok(())
+        },
+    ) else {
+        return; // io_uring unavailable
+    };
+}
+
+/// A file grown after the length was declared: reads clamp to the declared
+/// length, so exactly `len` bytes arrive and the NEXT request on the same
+/// connection still parses - unclamped, the surplus would arrive as the
+/// start of the next response (a framing desync).
+#[cfg(feature = "uring-fs")]
+#[test]
+fn http_file_body_clamps_a_file_grown_mid_reply() {
+    use std::io::Write as _;
+    use std::sync::{Arc, OnceLock};
+    use truenas_ros::http::HttpVerdict;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality};
+
+    const SIZE: usize = 256 * 1024 + 10;
+    let dir = truenas_ros::tempdir().unwrap();
+    let content = patterned(SIZE);
+    let fp = dir.path().join("obj");
+    std::fs::write(&fp, &content).unwrap();
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+
+    let pc = Arc::clone(&pers);
+    let handler: FsHandler<()> = Box::new(move |req, _state, fs| {
+        if req.target == "/small" {
+            return HttpVerdict::Respond(HttpResponse::new(200).body("after"));
+        }
+        let Some(mut fs) = fs else {
+            return HttpVerdict::Respond(HttpResponse::new(500));
+        };
+        let (deferred, permit) = req.defer();
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let how = OpenHow::new().flags(OFlag::O_RDONLY);
+        let fp = fp.clone();
+        fs.open(who, &anchor, c"obj", how, move |done, _fs| {
+            match done.file() {
+                Some(file) => {
+                    // Grow the file between the open and the reply: the
+                    // declared length is a snapshot; the surplus must never
+                    // reach the wire.
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&fp)
+                        .and_then(|mut f| f.write_all(b"SURPLUS-NEVER-SENT"))
+                        .expect("append");
+                    deferred.reply(HttpResponse::new(200).file_body(
+                        file,
+                        0,
+                        SIZE as u64,
+                    ));
+                }
+                None => deferred.close(),
+            }
+        });
+        HttpVerdict::Defer(permit)
+    });
+
+    let Some(()) = with_http_fs_server(
+        || (),
+        handler,
+        pers,
+        move |v4| {
+            let mut s = connect_tcp(v4)?;
+            s.set_read_timeout(Some(Duration::from_secs(10)))?;
+            s.write_all(b"GET /obj HTTP/1.1\r\nHost: t\r\n\r\n")?;
+            let (status, _head, body) = read_response(&mut s)?;
+            assert_eq!(status, 200);
+            assert_eq!(body, content, "exactly the declared length");
+            // Nothing leaked past the declared length: the next request on
+            // this connection frames cleanly.
+            s.write_all(b"GET /small HTTP/1.1\r\nHost: t\r\n\r\n")?;
+            let (status, _head, body) = read_response(&mut s)?;
+            assert_eq!((status, &body[..]), (200, &b"after"[..]));
+            Ok(())
+        },
+    ) else {
+        return; // io_uring unavailable
+    };
+}
+
+/// A file truncated after the length was declared: the read hits EOF short
+/// of the contract, and the only honest answer is a mid-body close - the
+/// client sees a truncated transfer, never a short body framed as complete.
+/// (The first read also comes back short - the file shrank below one chunk
+/// -- so this pins short-read continuation and EOF classification at once.)
+#[cfg(feature = "uring-fs")]
+#[test]
+fn http_file_body_truncation_closes_mid_body() {
+    use std::io::Read as _;
+    use std::sync::{Arc, OnceLock};
+    use truenas_ros::http::HttpVerdict;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality};
+
+    const SIZE: usize = 300_000;
+    const SHRUNK: usize = 100_000;
+    let dir = truenas_ros::tempdir().unwrap();
+    let content = patterned(SIZE);
+    let fp = dir.path().join("obj");
+    std::fs::write(&fp, &content).unwrap();
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+
+    let pc = Arc::clone(&pers);
+    let handler: FsHandler<()> = Box::new(move |req, _state, fs| {
+        let Some(mut fs) = fs else {
+            return HttpVerdict::Respond(HttpResponse::new(500));
+        };
+        let (deferred, permit) = req.defer();
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let how = OpenHow::new().flags(OFlag::O_RDONLY);
+        let fp = fp.clone();
+        fs.open(who, &anchor, c"obj", how, move |done, _fs| {
+            match done.file() {
+                Some(file) => {
+                    // Shrink after the open: the declared length becomes a
+                    // promise the file can no longer keep.
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&fp)
+                        .and_then(|f| f.set_len(SHRUNK as u64))
+                        .expect("truncate");
+                    deferred.reply(HttpResponse::new(200).file_body(
+                        file,
+                        0,
+                        SIZE as u64,
+                    ));
+                }
+                None => deferred.close(),
+            }
+        });
+        HttpVerdict::Defer(permit)
+    });
+
+    let Some(()) = with_http_fs_server(
+        || (),
+        handler,
+        pers,
+        move |v4| {
+            let mut s = connect_tcp(v4)?;
+            s.set_read_timeout(Some(Duration::from_secs(10)))?;
+            s.write_all(b"GET /obj HTTP/1.1\r\nHost: t\r\n\r\n")?;
+            let (status, head) = read_head(&mut s)?;
+            assert_eq!(status, 200);
+            assert!(
+                head.contains(&format!("Content-Length: {SIZE}\r\n")),
+                "{head}"
+            );
+            let mut got = Vec::new();
+            s.read_to_end(&mut got)?;
+            assert!(
+                got.len() < SIZE,
+                "the transfer must be visibly truncated, got all {SIZE}"
+            );
+            assert_eq!(
+                got,
+                content[..got.len()],
+                "what did arrive is the true prefix"
+            );
+            Ok(())
+        },
+    ) else {
+        return; // io_uring unavailable
+    };
+}
+
+/// A file-sourced body over kernel TLS is nothing special - chunks are
+/// plaintext buffers on the ordinary send path, encrypted in the kernel --
+/// so the same multi-chunk stream arrives byte-exact and the connection
+/// serves the next request. Worth proving once, which is what this is.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn ktls_file_body_streams_intact() {
+    use std::sync::OnceLock;
+    use truenas_ros::http::{HttpVerdict, protocol_fs};
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality};
+
+    if ktls_openssl_unsupported() {
+        return;
+    }
+    const SIZE: usize = 2 * 256 * 1024 + 4_321;
+    let dir = truenas_ros::tempdir().unwrap();
+    let content = patterned(SIZE);
+    std::fs::write(dir.path().join("obj"), &content).unwrap();
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+
+    let pc = Arc::clone(&pers);
+    let proto = protocol_fs(
+        HttpConfig::default(),
+        |_inc: Incoming<'_>| Some(()),
+        move |req: HttpRequest<'_>, _state: &mut (), fs| {
+            if req.target == "/small" {
+                return HttpVerdict::Respond(
+                    HttpResponse::new(200).body("after"),
+                );
+            }
+            let Some(mut fs) = fs else {
+                return HttpVerdict::Respond(HttpResponse::new(500));
+            };
+            let (deferred, permit) = req.defer();
+            let who = *pc.get().expect("personality set before serving");
+            let anchor = anchor.clone();
+            let how = OpenHow::new().flags(OFlag::O_RDONLY);
+            fs.open(who, &anchor, c"obj", how, move |done, _fs| {
+                match done.file() {
+                    Some(file) => deferred.reply(
+                        HttpResponse::new(200).file_body(file, 0, SIZE as u64),
+                    ),
+                    None => deferred.close(),
+                }
+            });
+            HttpVerdict::Defer(permit)
+        },
+    )
+    .expect("codec config is valid");
+
+    let (cert, key) = self_signed();
+    let acceptor = Arc::new(ktls_acceptor(&cert, &key));
+    let cfg = ServerConfig {
+        pool_size: 16,
+        fs_files: 8,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([Listen::tls(addr)], cfg, proto)
+    {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    pers.set(server.register_self().expect("register_self"))
+        .unwrap();
+    server.set_tls_handshake(move |fd, _inc, deferral| {
+        let acceptor = Arc::clone(&acceptor);
+        thread::spawn(move || match ktls_server_handshake(fd, &acceptor) {
+            Ok(()) => deferral.ready(HttpConn::new(())),
+            Err(_) => deferral.reject(),
+        });
+    });
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let join = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        let r = (|| -> io::Result<()> {
+            let mut s = tls_connect(v4)?;
+            s.write_all(b"GET /obj HTTP/1.1\r\nHost: t\r\n\r\n")?;
+            let (status, _head, body) = read_response(&mut s)?;
+            assert_eq!(status, 200);
+            assert_eq!(body, content, "kTLS-streamed bytes match the file");
+            s.write_all(b"GET /small HTTP/1.1\r\nHost: t\r\n\r\n")?;
+            let (status, _head, body) = read_response(&mut s)?;
+            assert_eq!((status, &body[..]), (200, &b"after"[..]));
+            Ok(())
+        })();
+        stop.shutdown();
+        r
+    });
+    server.serve_forever().expect("serve_forever");
+    join.join().expect("client thread").expect("client io");
+}
+
+/// A request pipelined behind a streaming body is answered after it, in
+/// order: both requests ride one write, and the second reply follows the
+/// full first body on the wire.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn http_file_body_holds_a_pipelined_request_until_the_body_completes() {
+    use std::sync::{Arc, OnceLock};
+    use truenas_ros::http::HttpVerdict;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality};
+
+    const SIZE: usize = 2 * 256 * 1024 + 777;
+    let dir = truenas_ros::tempdir().unwrap();
+    let content = patterned(SIZE);
+    std::fs::write(dir.path().join("obj"), &content).unwrap();
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+
+    let pc = Arc::clone(&pers);
+    let handler: FsHandler<()> = Box::new(move |req, _state, fs| {
+        if req.target == "/small" {
+            return HttpVerdict::Respond(HttpResponse::new(200).body("after"));
+        }
+        let Some(mut fs) = fs else {
+            return HttpVerdict::Respond(HttpResponse::new(500));
+        };
+        let (deferred, permit) = req.defer();
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let how = OpenHow::new().flags(OFlag::O_RDONLY);
+        fs.open(who, &anchor, c"obj", how, move |done, _fs| {
+            match done.file() {
+                Some(file) => deferred.reply(HttpResponse::new(200).file_body(
+                    file,
+                    0,
+                    SIZE as u64,
+                )),
+                None => deferred.close(),
+            }
+        });
+        HttpVerdict::Defer(permit)
+    });
+
+    let Some(()) = with_http_fs_server(
+        || (),
+        handler,
+        pers,
+        move |v4| {
+            let mut s = connect_tcp(v4)?;
+            s.set_read_timeout(Some(Duration::from_secs(10)))?;
+            // Both requests in one write: the second is buffered behind the
+            // streaming reply and answered after it.
+            s.write_all(
+                b"GET /obj HTTP/1.1\r\nHost: t\r\n\r\n\
+                  GET /small HTTP/1.1\r\nHost: t\r\n\r\n",
+            )?;
+            let (status, _head, body) = read_response(&mut s)?;
+            assert_eq!(status, 200);
+            assert_eq!(body, content, "first: the full streamed body");
+            let (status, _head, body) = read_response(&mut s)?;
+            assert_eq!((status, &body[..]), (200, &b"after"[..]));
+            Ok(())
+        },
+    ) else {
+        return; // io_uring unavailable
+    };
+}
