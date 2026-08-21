@@ -64,6 +64,62 @@ Do not reopen these without a reason that is new.
   `cmp_path_bytes` must stay a total order - `sort_by` panics on an
   inconsistent comparator, and the names come from whoever owns the directory.
 
+### The file-body reply path
+
+- **A body's range is bounded at `begin_file_reply`, never in the submit
+  path.** `offset` reaches `sqe.off_addr2` and the kernel reads it as a signed
+  `loff_t`, so the bound is `offset + len <= i64::MAX` - the sum, because
+  `next_offset` walks to it. Down in `submit_pump_read` `u64::MAX` is the
+  *correct* idiom for a stream file with no position, which
+  `cancel_owned_by_reaches_a_pump_read` reads a pipe with; a guard there breaks
+  it. What the sentinel does on a regular file is
+  `io_kiocb_update_pos` (`io_uring/rw.c:484-490`) substituting `f_pos` and
+  `rw.c:670-671` writing it back - a read that succeeds from the wrong place.
+- **A second `ReplyFile` queues, it does not shed.** One tail at a time is
+  structural, but the first response's head and `Content-Length` are already on
+  the wire when the second arrives, so closing destroys the request that did
+  nothing wrong. It rides the same diversion as every other PDU, in one list
+  (`PendingItem`) so ordering survives.
+- **The tail advance takes the buffer, not a length.**
+  `Connection::advance_file_tail(buf)` derives the count from `buf.len()`, so
+  the requested length is not in scope and cannot be used by mistake. A short
+  read continues from the offset it reached; short reads are ordinary on ZFS,
+  where every ring read is an io-wq punt.
+- **A full op table parks the read; it does not close the connection.** A
+  missing chunk buffer already waits for a flush, so a missing op slot waits
+  too (`Server::parked_tails`, re-driven once per completing fs op).
+- **`op_free` is one unpartitioned list, and partitioning it is not the fix.**
+  The table is `fs_ops + pool_size`. Handler ops cannot be starved by bodies:
+  `FileTail::reading` gates body reads to one per connection and connections
+  never exceed `pool_size`, so at least `fs_ops` slots always remain -
+  pigeonhole, not arithmetic. The other direction is what parking handles.
+- **The `fs_ops + pool_size <= MAX_POOL` bound is about field *width*.** An
+  op-slot index is packed into the 24-bit `user_data` slot field
+  (`user_data::SLOT_MASK`); `TAG_FS_DOMAIN` keeping the two tag vocabularies
+  disjoint is true and irrelevant to it.
+
+### The offload pool
+
+- **`WorkerPool::drop` waits `SHUTDOWN_DETACH_AFTER` and then detaches.**
+  Detaching is sound because `Job` is `Box<dyn FnOnce() + Send>` and therefore
+  `'static` - no job holds a borrow of what the dropper frees - and each worker
+  owns an `Arc<PoolShared>`. The wait buys quiescence, not soundness.
+  **Shutdown is not the reason it is bounded**: FUSE (`fs/fuse/dev.c:212`) and
+  sunrpc (`net/sunrpc/sched.c:346`) wait `TASK_KILLABLE`, so a supervisor's
+  SIGKILL reaps a wedged worker at process exit. The case with no backstop is
+  mid-run - `Drop` runs wherever the last handle falls, including on another
+  pool's worker or a request thread.
+- **`ON_POOL_WORKER` carries the pool's identity, not a bare flag.** A bare
+  "am I a worker" leaks the self-join exemption to every pool in the process.
+
+### Where a poisoned lock fails closed
+
+- **`SingleFlight`'s `get_or_try_init` returning `EIO` on a poisoned map is the
+  whole story.** All three of its map acquisitions use `?`, so a poisoned
+  `live` fails every `acquire` - including cache hits, since the fast path sits
+  behind that lock. There is no state where invalidation is skipped *and* a
+  stale identity is still served.
+
 ## Validating against the platform
 
 **Any change under `src/uring/`, `src/uring_fs/`, `src/sync_fs/` or
