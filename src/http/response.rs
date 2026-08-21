@@ -250,6 +250,14 @@ impl HttpResponse {
     /// dropped unread and nothing is sent. One body, one origin: this and
     /// `body` set the same slot, last call wins.
     ///
+    /// `offset + len` must fit in an `i64`: the offset reaches the ring as a
+    /// signed `loff_t`, where `u64::MAX` is io_uring's "read from the file's
+    /// own position" sentinel and would serve the wrong bytes behind a correct
+    /// `Content-Length`. A range that does not fit closes the connection
+    /// ([`CloseReason`](crate::net::server::CloseReason)`::FileBody`) rather
+    /// than reaching the kernel - which is what a suffix range computed as
+    /// `size - n` looks like once it has wrapped, so clamp that at zero.
+    ///
     /// The handle moves into the response and the reactor holds it until
     /// the last chunk flushes or the connection dies - dropping the
     /// caller's other clones never closes the fd under an in-flight read.

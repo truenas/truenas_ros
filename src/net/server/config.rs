@@ -324,10 +324,10 @@ impl ServerConfig {
                 "pool_size must be in 1..={MAX_POOL}"
             )));
         }
-        // The op table holds two slots per fs file plus one per connection
-        // (the reply path's body read - a file tail keeps at most one in
-        // flight), and an op-slot index is packed into the same 24-bit
-        // `user_data` slot field as a pool slot. Bound the sum here so an
+        // The op table holds the handler's whole budget (`fs_ops`) plus one
+        // slot per connection for the reply path's body read - a file tail
+        // keeps at most one in flight - and an op-slot index is packed into
+        // the 24-bit `user_data` slot field. Bound the sum here so an
         // oversized configuration fails as a clean Validation rather than
         // truncating a completion token later (`MAX_POOL` is that 24-bit
         // ceiling - the `user_data::SLOT_MASK`).
@@ -364,6 +364,27 @@ impl ServerConfig {
             return Err(Error::Validation(format!(
                 "fs_body_chunk must be in \
                  {MIN_FS_BODY_CHUNK}..={MAX_FS_BODY_CHUNK}"
+            )));
+        }
+        // A body chunk is queued whole and counts toward `queued_bytes`, which
+        // is what a push is measured against before it is accepted
+        // (`wake.rs`, `CloseReason::SendBacklog`). So a connection streaming a
+        // body can exceed the backlog on its own chunks alone, and a push
+        // arriving mid-body would evict a transfer that is keeping up. Both of
+        // a tail's buffers can be queued at once, so the backlog has to cover
+        // them - which at the defaults it does, 512 KiB against 8 MiB.
+        #[cfg(feature = "uring-fs")]
+        if self.fs_ops > 0
+            && usize::from(crate::net::core::conn::FILE_TAIL_BUFS)
+                .saturating_mul(self.fs_body_chunk)
+                > self.max_send_backlog
+        {
+            return Err(Error::Validation(format!(
+                "max_send_backlog must cover a tail's queued chunks: \
+                 {} x fs_body_chunk ({}) exceeds {}",
+                crate::net::core::conn::FILE_TAIL_BUFS,
+                self.fs_body_chunk,
+                self.max_send_backlog
             )));
         }
         if self.max_request_bytes == 0
