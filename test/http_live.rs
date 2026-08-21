@@ -1726,11 +1726,16 @@ fn http_file_body_waits_for_an_op_slot() {
             // Take every op slot the table has (`fs_ops + pool_size` = 2).
             // `u64::MAX` because a pipe refuses a real offset (ESPIPE) and
             // takes the file-position sentinel instead.
+            //
+            // The buffer needs a LENGTH, not just capacity: `submit_rw` sets
+            // `iov_len` from `buf.len()`, so a `Vec::with_capacity(8)` asks
+            // the kernel for zero bytes, completes immediately, and pins no
+            // slot at all - which leaves the wait below unexercised.
             for _ in 0..2 {
                 fs.preadv2(
                     who,
                     pipe.clone(),
-                    vec![Vec::with_capacity(8)],
+                    vec![vec![0u8; 8]],
                     u64::MAX,
                     RwFlags::empty(),
                     |_done, _fs| {},
@@ -1783,6 +1788,180 @@ fn http_file_body_waits_for_an_op_slot() {
                 "{head}"
             );
             assert_eq!(body, content, "the whole object, after waiting");
+            Ok(())
+        },
+    ) else {
+        return; // io_uring unavailable
+    };
+}
+
+/// A freed op slot reaches the **parked body** before the completion's own
+/// continuation can take it back.
+///
+/// `Server::on_cqe` calls `redrive_parked_tail()` between `fs.on_cqe(...)`
+/// (which returns the slot) and `match reaped` (which fires the handler
+/// continuation). That statement order is the whole anti-starvation property,
+/// and it reads like post-dispatch bookkeeping, so a refactor moving it below
+/// the dispatch is entirely plausible. `http_file_body_waits_for_an_op_slot`
+/// does not catch that: its pinned reads complete into `|_done, _fs| {}`, so
+/// nothing competes for the slot they free and the test passes with the two
+/// statements in either order.
+///
+/// Here the pinned reads' continuations re-submit, so the freed slot is
+/// contended by exactly the party the ordering exists to beat. Swap the two
+/// statements in `on_cqe` and the re-submitted read wins the slot, the body
+/// never gets one, and this fails on the client's read timeout.
+///
+/// The continuations capture no `HttpDeferred`, so the one that loses the race
+/// (which, with the ordering correct, is the re-submit) is dropped harmlessly
+/// rather than closing the connection.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn http_a_freed_op_slot_reaches_the_parked_body_first() {
+    use std::io::Write as _;
+    use std::sync::mpsc;
+    use std::sync::{Arc, OnceLock};
+    use truenas_ros::http::HttpVerdict;
+    use truenas_ros::net::server::ServerConfig;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, File, Personality, RwFlags};
+
+    const SIZE: usize = 300_000; // more than one 256 KiB chunk
+    let dir = truenas_ros::tempdir().unwrap();
+    let content = patterned(SIZE);
+    std::fs::write(dir.path().join("obj"), &content).unwrap();
+    let fifo = dir.path().join("fifo");
+    let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+        .expect("path has no NUL");
+    // SAFETY: a fresh path in a private tempdir; 0o600 is the mode.
+    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0, "mkfifo");
+
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let (armed_tx, armed_rx) = mpsc::channel::<()>();
+
+    let pc = Arc::clone(&pers);
+    let handler: FsHandler<()> = Box::new(move |req, _state, fs| {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let Some(mut fs) = fs else {
+            return HttpVerdict::Respond(HttpResponse::new(500));
+        };
+        let (deferred, permit) = req.defer();
+        let who = *pc.get().expect("personality set before serving");
+        let armed = armed_tx.clone();
+        type Held = (
+            Option<File>,
+            Option<File>,
+            Option<truenas_ros::http::HttpDeferred>,
+        );
+        let held: Rc<RefCell<Held>> =
+            Rc::new(RefCell::new((None, None, Some(deferred))));
+        let fifo_how = OpenHow::new().flags(OFlag::O_RDWR);
+        let obj_how = OpenHow::new().flags(OFlag::O_RDONLY);
+
+        /// Pin one op slot with a fifo read whose completion immediately
+        /// asks for the slot back. `again` bounds the chain so a lost race
+        /// does not spin; one re-submit is all the contention the ordering
+        /// has to survive.
+        fn pin(
+            fs: &mut truenas_ros::uring_fs::FsConn<'_>,
+            who: Personality,
+            pipe: File,
+            again: bool,
+        ) {
+            let p = pipe.clone();
+            fs.preadv2(
+                who,
+                pipe,
+                // Length, not capacity: `submit_rw` sets `iov_len` from
+                // `buf.len()`, so a `Vec::with_capacity(8)` asks for ZERO
+                // bytes and the read completes at once, pinning nothing.
+                vec![vec![0u8; 8]],
+                u64::MAX, // a pipe refuses a real offset (ESPIPE)
+                RwFlags::empty(),
+                move |_done, fs| {
+                    if again {
+                        // Contend for the slot this completion just freed.
+                        // Losing is fine: nothing here captures the reply,
+                        // so a dropped callback closes nothing.
+                        pin(fs, who, p, false);
+                    }
+                },
+            );
+        }
+
+        fn finish(
+            fs: &mut truenas_ros::uring_fs::FsConn<'_>,
+            who: Personality,
+            held: &Rc<RefCell<Held>>,
+            armed: &mpsc::Sender<()>,
+        ) {
+            let mut h = held.borrow_mut();
+            let (pipe, obj, deferred) = &mut *h;
+            let (Some(pipe), Some(obj)) = (pipe.as_ref(), obj.take()) else {
+                return; // the other open has not landed yet
+            };
+            // Take every op slot the table has (`fs_ops + pool_size` = 2).
+            for _ in 0..2 {
+                pin(fs, who, pipe.clone(), true);
+            }
+            deferred
+                .take()
+                .expect("one finisher")
+                .reply(HttpResponse::new(200).file_body(obj, 0, SIZE as u64));
+            let _ = armed.send(());
+        }
+
+        let (h1, a1) = (Rc::clone(&held), armed.clone());
+        fs.open(who, &anchor, c"fifo", fifo_how, move |done, fs| {
+            h1.borrow_mut().0 = Some(done.file().expect("fifo opens"));
+            finish(fs, who, &h1, &a1);
+        });
+        let (h2, a2) = (Rc::clone(&held), armed);
+        fs.open(who, &anchor, c"obj", obj_how, move |done, fs| {
+            h2.borrow_mut().1 = Some(done.file().expect("obj opens"));
+            finish(fs, who, &h2, &a2);
+        });
+        HttpVerdict::Defer(permit)
+    });
+
+    let Some(()) = with_http_fs_server_cfg(
+        ServerConfig {
+            pool_size: 1,
+            fs_ops: 1,
+            ..ServerConfig::default()
+        },
+        || (),
+        handler,
+        pers,
+        move |v4| {
+            let mut s = connect_tcp(v4)?;
+            s.set_read_timeout(Some(Duration::from_secs(20)))?;
+            s.write_all(b"GET /obj HTTP/1.1\r\nHost: t\r\n\r\n")?;
+            armed_rx.recv().expect("handler armed the table");
+            // Release exactly one pinned read. Its completion frees one slot
+            // and its continuation asks for that slot back; the body must
+            // get it first.
+            let mut w = std::fs::OpenOptions::new().write(true).open(&fifo)?;
+            w.write_all(b"go")?;
+            drop(w);
+
+            let (status, head, body) = read_response(&mut s)?;
+            assert_eq!(status, 200);
+            assert!(
+                head.contains(&format!("Content-Length: {SIZE}\r\n")),
+                "{head}"
+            );
+            assert_eq!(
+                body, content,
+                "the parked body won the freed slot and streamed whole"
+            );
             Ok(())
         },
     ) else {

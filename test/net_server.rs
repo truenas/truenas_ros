@@ -8846,7 +8846,98 @@ fn fs_broker_personality_gates_open() {
 /// proof that `setup_ring` + `with_ring` is the same server, constructed in
 /// two halves on two threads.
 ///
-/// Root-only (the broker needs `CAP_SETUID`); skipped otherwise.
+/// A ring created **before** the thread that will serve on it, mapped and
+/// driven by that thread, serves real requests.
+///
+/// This is the unprivileged half of the multi-reactor recipe: `setup_ring`
+/// builds each ring on this thread with no other thread alive, then each
+/// worker takes one and calls `Server::with_ring`, which does the mapping on
+/// the thread that will drive it. Nothing here needs a credential broker, so
+/// it runs on `ci.yml`'s unprivileged runner - the job that gates merges,
+/// where `fs_broker_serves_rings_mapped_on_worker_threads` can only skip.
+///
+/// Two rings, so the per-ring construction is exercised more than once and
+/// the servers are proven independent rather than aliased.
+#[test]
+fn rings_created_before_the_threads_that_serve_them() {
+    use std::sync::mpsc;
+
+    const RINGS: usize = 2;
+    let cfg = ServerConfig {
+        pool_size: 4,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+
+    // Every ring first, on this thread, with no other thread alive yet.
+    let mut rings = Vec::new();
+    for _ in 0..RINGS {
+        match setup_ring([addr.clone()], &cfg) {
+            Ok(r) => rings.push(r),
+            Err(e) if should_skip(&e) => return,
+            Err(e) => panic!("setup_ring: {e}"),
+        }
+    }
+
+    let (tx, rx) = mpsc::channel::<(usize, SocketAddrV4, ShutdownHandle)>();
+    let mut workers = Vec::new();
+    for (i, ring) in rings.into_iter().enumerate() {
+        let (addr, tx) = (addr.clone(), tx.clone());
+        workers.push(thread::spawn(move || {
+            // Answer with this ring's index, so a reply proves which server
+            // served it and two rings cannot be one.
+            let body = move |mut req: Request<'_, ()>| -> Response {
+                let got = req.body.take();
+                let mut out = got;
+                out.extend_from_slice(format!("@{i}").as_bytes());
+                Response::Reply(echo_frame(&out))
+            };
+            let protocol = Protocol {
+                accept: |_: Incoming<'_>| Some(()),
+                header: length_prefix_header::<()>(
+                    PrefixWidth::U32,
+                    Endian::Big,
+                    false,
+                ),
+                body,
+            };
+            let mut server = Server::with_ring([addr], cfg, protocol, ring)
+                .expect("with_ring on a ring created by another thread");
+            let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+                panic!("expected Tcp");
+            };
+            tx.send((i, v4, server.shutdown_handle())).unwrap();
+            server.serve_forever().expect("serve_forever");
+        }));
+    }
+    drop(tx);
+
+    let mut served = 0usize;
+    for (i, v4, stop) in rx.iter() {
+        let mut s = connect_tcp(v4).expect("connect");
+        send_framed(&mut s, b"ping").expect("send");
+        let got = recv_framed(&mut s).expect("recv");
+        drop(s);
+        stop.shutdown();
+        assert_eq!(
+            got,
+            format!("ping@{i}").into_bytes(),
+            "ring {i} served its own request on the thread that mapped it"
+        );
+        served += 1;
+    }
+    assert_eq!(served, RINGS, "every ring served");
+    for w in workers {
+        w.join().expect("worker");
+    }
+}
+
+/// Root-only, because the **broker** half needs `CAP_SETUID` to become
+/// another uid. The skip is loud: `TRUENAS_ROS_REQUIRE_CRED_BROKER=1` (armed
+/// in the QEMU job, which runs as root) turns a mis-provisioned runner red
+/// instead of green. The unprivileged half of the same feature - a ring
+/// created on one thread and mapped, built and driven on another - is covered
+/// without privilege by `rings_created_before_the_threads_that_serve_them`.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_broker_serves_rings_mapped_on_worker_threads() {
@@ -8860,7 +8951,12 @@ fn fs_broker_serves_rings_mapped_on_worker_threads() {
     };
 
     if !is_root() {
-        return; // the broker cannot become another uid without CAP_SETUID
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_CRED_BROKER").is_none(),
+            "TRUENAS_ROS_REQUIRE_CRED_BROKER is set but this process is not \
+             root: the broker cannot become another uid without CAP_SETUID"
+        );
+        return;
     }
     const NOBODY_UID: u32 = 65_534;
     const NOBODY_GID: u32 = 65_534;

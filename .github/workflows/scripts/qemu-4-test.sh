@@ -122,13 +122,19 @@ export TRUENAS_ROS_REQUIRE_ZFS=1
 # fixture must also stick. Force the xattr fixtures to RUN; a refusal means
 # the fixture landed somewhere degraded and must turn CI red.
 export TRUENAS_ROS_REQUIRE_XATTRS=1
-# `setup-test-zfs.sh` mounted /POSIXACL and /NFSV4ACL, so this VM has the
-# top-level mount boundary the RESOLVE_NO_XDEV tests need. Force them to RUN:
-# both return early where no top-level directory sits on another filesystem, so
-# on a single-filesystem runner they assert nothing at all - and the rule they
-# pin (the kernel refusing to walk off a filesystem, rather than the caller
-# conventionally not doing it) is the whole point of confining a listing.
+# `setup-test-zfs.sh` mounted /POSIXACL and /NFSV4ACL, so this VM has a REAL
+# mount boundary for the RESOLVE_NO_XDEV tests to cross. That is what this
+# demands: every Linux host has /proc, /sys, /dev and /run as top-level mounts,
+# so "some boundary exists" is never false and would gate nothing. Crossing
+# into procfs also proves nothing about the platform the product ships - the
+# rule these tests pin (the kernel refusing to walk off a filesystem, rather
+# than the caller conventionally not doing it) has to be pinned against ZFS.
 export TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY=1
+# This job runs as root over ssh, which is the only place the credential
+# broker can actually become another uid (CAP_SETUID). Force the multi-reactor
+# broker test to RUN: unprivileged ci.yml can only skip it, so without this the
+# headline multi-ring feature is gated by a test that never executes.
+export TRUENAS_ROS_REQUIRE_CRED_BROKER=1
 # unix_peercred needs the AF_UNIX io_uring getsockopt fix (kernel >= 6.18.16).
 # We boot the TrueNAS <train>-nightly kernel (truenas/linux), whose uname -r
 # carries the full point release (e.g. 6.18.16-production+truenas), so read it
