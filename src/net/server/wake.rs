@@ -12,6 +12,7 @@ use crate::net::core::protocol::{CloseReason, Framing};
 use crate::net::core::table::SlotState;
 use crate::net::server::protocol::{Incoming, Request, Response};
 use crate::uring::sys::*;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
 
 // Wake-driven work can re-enter any stage - kTLS accept outcomes install
@@ -71,6 +72,34 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     /// finish, and arm the grace-period deadline that escalates to a hard stop.
     fn begin_drain(&mut self) -> errno::Result<()> {
         self.core.draining = true;
+
+        // Refuse new connections now, not when the listener fd closes at
+        // drop. Cancelling the multishot accept below only stops this loop
+        // dequeuing; the kernel keeps completing handshakes into the backlog
+        // (and the in-flight accept holds a reference to the socket, so even
+        // closing the fd would change nothing until that cancel lands), and
+        // every such client waits on a server that will never answer.
+        // `shutdown(SHUT_RD)` acts on the socket itself. A TCP listener
+        // leaves TCP_LISTEN: `inet_shutdown` -> `tcp_disconnect` ->
+        // `tcp_set_state(TCP_CLOSE)` unhashes it (`inet_unhash`, which also
+        // takes it out of its `reuse_port` group), then
+        // `inet_csk_listen_stop` resets what it had queued (or hands it to
+        // a sibling when `tcp_migrate_req` is on), so a connect is refused
+        // at once or lands on a sibling. A unix listener stays TCP_LISTEN
+        // with RCV_SHUTDOWN set: `unix_stream_connect` refuses from here
+        // on, but the kernel does not touch what it had already queued.
+        // The state change wakes the armed accept: the TCP one fails with
+        // -EINVAL on its own; the unix one dequeues the queued embryos
+        // (accept does not check RCV_SHUTDOWN), which `accept_connection`
+        // sheds, then waits again until the cancel below ends it with
+        // -ECANCELED. `on_accept` ignores both while draining. Best effort:
+        // a failure leaves the old behaviour, the backlog filling until the
+        // fd closes.
+        for l in &self.listeners {
+            // SAFETY: `l.fd` is a live listening socket this server owns;
+            // shutdown(2) touches no memory.
+            unsafe { libc::shutdown(l.fd.as_raw_fd(), libc::SHUT_RD) };
+        }
 
         // Stop accepting: cancel each listener's multishot accept by its
         // user_data. If one was parked as `deferred` (pool full) the cancel
