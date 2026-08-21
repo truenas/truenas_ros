@@ -19,8 +19,11 @@
 //! `xattr`, `acl`, `fhandle`, `fsiter`, `shutil`), [`mount`] (mount topology
 //! and idmapped-mount support - features `mount`, `idmap`), [`configfile`],
 //! [`audit`] (kernel audit records over `NETLINK_AUDIT`), the io_uring `net`
-//! stack (`net-core`/`net-server`/`net-client`), and the io_uring fs reactor
-//! [`uring_fs`] (`uring-fs`). `full` enables everything except `uring-fs`,
+//! stack (`net-core`/`net-server`/`net-client`) with the [`http`] codec over
+//! it (`http`), the io_uring fs reactor [`uring_fs`] (`uring-fs`), and two
+//! pieces for a daemon's `main`: [`secrets`] (`memfd_secret`-backed memory,
+//! `secrets`) and [`signal`] (block the signals a daemon acts on and receive
+//! them as values, `signal`). `full` enables everything except `uring-fs`,
 //! which is opted into on its own.
 #![cfg(target_os = "linux")]
 #![allow(non_camel_case_types)]

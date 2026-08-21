@@ -16,7 +16,13 @@
 //! asked and on the thread that asks. A signal that arrives at a thread
 //! which has it unblocked takes its default action - for `SIGTERM` that is
 //! the process ending - which is why the order matters: block first, then
-//! spawn.
+//! spawn. The mask is copied into every task created from the thread that
+//! holds it, a forked process as much as a thread (`CLONE_CLEAR_SIGHAND`
+//! resets handlers, not the mask), so a child forked after [`block`] with
+//! no thread of its own waiting on the set never takes those signals'
+//! default action either. For the credential broker that is the point: it
+//! ignores a cgroup-wide `SIGTERM` and keeps minting identities while the
+//! daemon drains, dying when the daemon drops it.
 //!
 //! ```no_run
 //! use std::time::Duration;
@@ -46,10 +52,11 @@ use std::time::Duration;
 
 /// The signals a daemon acts on.
 ///
-/// Deliberately the daemon vocabulary and nothing more: the realtime range
-/// and the fault signals have no place in a set a thread waits on.
+/// Deliberately the daemon vocabulary and nothing more, and closed: the
+/// realtime range and the fault signals have no place in a set a thread
+/// waits on, and `SIGCHLD` is displaced by the pidfd every child here is
+/// forked with. A [`Blocked`] yields only signals its own set named.
 #[repr(i32)]
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Signal {
     /// `SIGHUP` - reload.
@@ -96,16 +103,27 @@ impl TryFrom<i32> for Signal {
 }
 
 /// A set of signals (`sigset_t`), built only from [`Signal`]s.
+///
+/// Equality is membership: every set starts from the all-zero pattern and
+/// `sigaddset`/`sigdelset` only flip single bits, so two sets with the same
+/// members are the same bytes.
 #[repr(transparent)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SigSet(libc::sigset_t);
+
+impl Default for SigSet {
+    fn default() -> SigSet {
+        SigSet::empty()
+    }
+}
 
 impl SigSet {
     /// The empty set.
     pub fn empty() -> SigSet {
-        let mut set = MaybeUninit::<libc::sigset_t>::uninit();
-        // SAFETY: `sigemptyset` initializes the whole set; it cannot fail
-        // for a valid pointer.
+        let mut set = MaybeUninit::<libc::sigset_t>::zeroed();
+        // SAFETY: `zeroed` already initialized every byte (all-zero is the
+        // empty set); `sigemptyset` rewrites the words the kernel reads and
+        // cannot fail for a valid pointer.
         unsafe {
             libc::sigemptyset(set.as_mut_ptr());
             SigSet(set.assume_init())
@@ -159,9 +177,13 @@ impl std::fmt::Debug for SigSet {
     }
 }
 
-/// Who sent a signal, when the kernel knows: `kill(2)`, `sigqueue(3)` and
-/// `tgkill(2)` record the sender; a signal the kernel raised itself has
-/// none.
+/// Who sent a signal, as the siginfo reports it. For `kill(2)` and
+/// `tgkill(2)` (`SI_USER`, `SI_TKILL`) the kernel stamps the sender's pid
+/// and real uid itself. For `SI_QUEUE` it relays what the sender wrote:
+/// `sigqueue(3)` fills its own pid and real uid, but `rt_sigqueueinfo(2)`
+/// accepts any values there, so under `SI_QUEUE` this is the sender's
+/// claim. Informational in every case, never an authorization input. A
+/// signal the kernel raised itself has no sender.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sender {
     /// The sending process.
@@ -175,7 +197,8 @@ pub struct Sender {
 pub struct Delivered {
     /// Which signal.
     pub signal: Signal,
-    /// Who sent it, where the kernel recorded a sender.
+    /// Who sent it, where the siginfo carries a sender; see [`Sender`] for
+    /// which origins the kernel vouches for.
     pub sender: Option<Sender>,
 }
 
@@ -189,9 +212,12 @@ fn sender_of(code: i32, pid: libc::pid_t, uid: libc::uid_t) -> Option<Sender> {
 impl Delivered {
     fn from_siginfo(info: &libc::siginfo_t) -> Result<Delivered> {
         let signal = Signal::try_from(info.si_signo)?;
-        // SAFETY: `si_pid`/`si_uid` read the `_kill` member of the union,
-        // which is the live member exactly for the codes `sender_of`
-        // accepts; for any other code the values are discarded unread.
+        // SAFETY: the call filled every byte of `info`, so the two union
+        // fields hold initialized integers whatever `si_code` is, which is
+        // all the getters need. The values name a sender only for the codes
+        // `sender_of` keeps: `SI_USER` (the `_kill` layout) and
+        // `SI_QUEUE`/`SI_TKILL` (the `_rt` layout) both begin with
+        // `_pid, _uid`, the offsets the getters read.
         let (pid, uid) = unsafe { (info.si_pid(), info.si_uid()) };
         Ok(Delivered {
             signal,
@@ -345,9 +371,16 @@ impl SignalFd {
             events: libc::POLLIN,
             revents: 0,
         };
-        let ms = timeout.map_or(-1, poll_ms_of);
-        // SAFETY: one valid pollfd, live for the call.
-        let n = retry_on_eintr(|| unsafe { libc::poll(&mut pfd, 1, ms) })?;
+        // `ppoll(2)` rather than `poll(2)`: a timespec reaches as far as
+        // `sigtimedwait`'s does, where poll's int milliseconds stop at
+        // about 24 days and would report a timeout that never passed.
+        let ts = timeout.map(timespec_of);
+        let tsp = ts.as_ref().map_or(ptr::null(), |t| t as *const _);
+        // SAFETY: one valid pollfd and a timespec (or null) that live for
+        // the call; a null sigmask leaves the mask alone.
+        let n = retry_on_eintr(|| unsafe {
+            libc::ppoll(&mut pfd, 1, tsp, ptr::null())
+        })?;
         if n == 0 {
             return Ok(None);
         }
@@ -370,18 +403,11 @@ impl AsRawFd for SignalFd {
 fn timespec_of(d: Duration) -> libc::timespec {
     libc::timespec {
         // Clamp rather than wrap: a negative tv_sec is EINVAL, and
-        // i64::MAX seconds is "never" for any practical purpose.
-        tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
-        tv_nsec: libc::c_long::from(d.subsec_nanos()),
+        // time_t::MAX seconds is "never" for any practical purpose.
+        tv_sec: d.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
+        // Below 1e9, so it fits whatever width tv_nsec has.
+        tv_nsec: d.subsec_nanos() as libc::c_long,
     }
-}
-
-fn poll_ms_of(d: Duration) -> libc::c_int {
-    // Round up so a sub-millisecond timeout is not a busy poll, and clamp
-    // to what poll(2) can express.
-    let ms =
-        d.as_millis() + u128::from(!d.subsec_nanos().is_multiple_of(1_000_000));
-    ms.min(libc::c_int::MAX as u128) as libc::c_int
 }
 
 #[cfg(all(test, not(loom)))]
@@ -428,6 +454,26 @@ mod tests {
         assert!(set.contains(Signal::Int));
         assert_eq!(format!("{set:?}"), "{Int, Term}");
         assert_eq!(format!("{:?}", SigSet::empty()), "{}");
+        assert_eq!(set, SigSet::of([Signal::Int, Signal::Term]));
+        assert_eq!(SigSet::default(), SigSet::empty());
+        assert_ne!(set, SigSet::empty());
+    }
+
+    /// The calling thread's mask. A null new set leaves the mask alone and
+    /// `how` unread, so this is a pure query.
+    fn mask_here() -> SigSet {
+        let mut out = MaybeUninit::<libc::sigset_t>::zeroed();
+        // SAFETY: no new set; `out` is writable and filled on a zero return.
+        let rc = unsafe {
+            libc::pthread_sigmask(
+                libc::SIG_BLOCK,
+                ptr::null(),
+                out.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "pthread_sigmask");
+        // SAFETY: a zero return means the call filled `out`.
+        SigSet(unsafe { out.assume_init() })
     }
 
     /// A signal raised at this thread after blocking is dequeued by `wait`
@@ -488,6 +534,13 @@ mod tests {
     fn a_thread_spawned_after_block_inherits_the_mask() {
         let blocked = block(SigSet::of([Signal::Int])).expect("block");
         let t = std::thread::spawn(move || {
+            // Checked before raising: were the mask not inherited, the
+            // raise would end the whole test process rather than fail
+            // this test.
+            assert!(
+                mask_here().contains(Signal::Int),
+                "the spawned thread inherits the blocked set"
+            );
             raise_here(Signal::Int);
             blocked.wait().expect("wait").signal
         });
@@ -496,9 +549,10 @@ mod tests {
 
     #[test]
     fn timeouts_clamp_instead_of_wrapping() {
-        assert_eq!(timespec_of(Duration::MAX).tv_sec, libc::time_t::MAX);
-        assert_eq!(poll_ms_of(Duration::MAX), libc::c_int::MAX);
-        assert_eq!(poll_ms_of(Duration::from_nanos(1)), 1, "rounds up");
-        assert_eq!(poll_ms_of(Duration::from_millis(7)), 7);
+        let ts = timespec_of(Duration::MAX);
+        assert_eq!(ts.tv_sec, libc::time_t::MAX);
+        assert_eq!(ts.tv_nsec, 999_999_999);
+        let ts = timespec_of(Duration::from_millis(1_500));
+        assert_eq!((ts.tv_sec, ts.tv_nsec), (1, 500_000_000));
     }
 }
