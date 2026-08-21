@@ -55,9 +55,8 @@ receives them as values on one thread (`sigwaitinfo`, or a `signalfd` for a
 poll loop), so no handler is ever installed and the reactors never see one.
 
 `full` is the default set plus the net roles, `http`, `secrets`, and
-`signal`. It never
-includes `uring-fs`, which needs a credential broker forked before the daemon
-starts threads and so has to be chosen deliberately.
+`signal`. It never includes `uring-fs`, which needs a credential broker
+forked before the daemon starts threads and so has to be chosen deliberately.
 
 `uring-fs` covers opens, vectored positional I/O (`preadv2` / `pwritev2`),
 `splice` from a pipe into a file, sync, the metadata and extended-attribute
