@@ -647,8 +647,13 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             );
             if r.is_ok() {
                 tail.reading = true;
-                tail.parked = false;
             }
+            // `parked` is NOT cleared here: it is the parked list's dedup
+            // key, and this connection's entry is still queued. Clearing it
+            // without removing the entry would let the same connection be
+            // pushed a second time. `redrive_parked_tail` pops and clears
+            // together; the entry it then drives finds `reading` set and
+            // returns, which is the ordinary no-op.
             r
         };
         if let Err(e) = staged {
@@ -662,12 +667,21 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     }
 
     /// Re-drive the connection at the head of `parked_tails` - the one that
-    /// found the op table full. Called once per completing fs op, which is
-    /// exactly how many slots just freed. Stale entries (the connection closed
-    /// or its slot was recycled) are discarded on the way past, and a tail
-    /// that finds the table full again simply parks itself at the back.
+    /// found the op table full. Stale entries (the connection closed or its
+    /// slot was recycled) are discarded on the way past.
+    ///
+    /// Called once per completing fs-domain CQE, which is **not** the same as
+    /// once per freed slot: `FsCore::on_cqe` returns early for a cancel
+    /// completion and for a stale-generation miss, and neither frees
+    /// anything. So the free-slot check comes first - popping the
+    /// longest-waiting connection when there is nothing to give it would
+    /// re-park it at the back and hand its turn to whoever is behind it,
+    /// which is the starvation this list exists to prevent.
     #[cfg(feature = "uring-fs")]
     pub(super) fn redrive_parked_tail(&mut self) -> errno::Result<()> {
+        if !self.fs.as_ref().is_some_and(|fs| fs.has_free_op()) {
+            return Ok(());
+        }
         while let Some((slot, gen64)) = self.parked_tails.pop_front() {
             if self.core.table.generation(slot) != gen64 {
                 continue; // slot recycled under the wait

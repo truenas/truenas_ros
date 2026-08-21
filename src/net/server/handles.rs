@@ -527,6 +527,11 @@ pub struct ServerStats {
     /// Transient accept errors (resource pressure) that triggered a backoff
     /// re-arm instead of terminating the server.
     pub accept_retries: u64,
+    /// Listeners whose `shutdown(SHUT_RD)` failed at the start of a graceful
+    /// drain. Non-zero means refuse-on-connect did not take effect for that
+    /// listener: its backlog keeps filling with clients nobody will answer
+    /// until the fd closes at server drop.
+    pub drain_listener_shutdown_failed: u64,
     /// Connections fully closed (slot released).
     pub closed: u64,
     /// Connections currently live.
@@ -566,6 +571,9 @@ impl StatsHandle {
             rejected: s.rejected.load(Ordering::Relaxed),
             shed: s.shed.load(Ordering::Relaxed),
             accept_retries: s.accept_retries.load(Ordering::Relaxed),
+            drain_listener_shutdown_failed: s
+                .drain_listener_shutdown_failed
+                .load(Ordering::Relaxed),
             closed: s.closed.load(Ordering::Relaxed),
             active: s.active.load(Ordering::Relaxed) as u32,
             requests: s.requests.load(Ordering::Relaxed),
@@ -674,9 +682,24 @@ impl ShutdownHandle {
     /// drain), idle connections close immediately, but requests already in
     /// flight - reads in progress, work deferred to workers, and queued
     /// replies - are allowed to finish (each connection closes as it
-    /// quiesces; keep-alive does not admit new requests). The listeners
-    /// leave the listening state at once, so a replacement server can bind
-    /// the same address while this one drains. If the drain has not
+    /// quiesces; keep-alive does not admit new requests).
+    ///
+    /// **Whether a replacement server can bind the same address during the
+    /// drain depends on the address family.** A TCP listener can be replaced,
+    /// but not because it stops listening: `__inet_bind` set
+    /// `SOCK_BINDPORT_LOCK` for the explicit port
+    /// (`net/ipv4/af_inet.c:557`), and `tcp_set_state`'s `TCP_CLOSE` arm
+    /// skips `inet_put_port` while that is set (`net/ipv4/tcp.c:2998-3000`),
+    /// so the draining socket keeps its port reservation until its fd
+    /// closes. The rebind succeeds only because both sockets carry
+    /// `SO_REUSEADDR`, which this crate sets for every TCP listener
+    /// (`listen.rs`). A **Unix** listener cannot be replaced: it stays
+    /// `TCP_LISTEN` with `RCV_SHUTDOWN` (see `begin_drain`), and its address
+    /// is a filesystem node that `shutdown(2)` does not remove - so a bind
+    /// to the same path fails `EADDRINUSE` for the whole grace period unless
+    /// the replacement unlinks it first (`ServerConfig::unlink_unix`).
+    ///
+    /// If the drain has not
     /// completed within `grace`, whatever remains is cancelled as in
     /// [`ShutdownHandle::shutdown`]. A zero `grace` is exactly `shutdown()`.
     /// Safe to call from any thread; a concurrent hard `shutdown` wins.

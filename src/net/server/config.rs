@@ -370,19 +370,30 @@ impl ServerConfig {
         // is what a push is measured against before it is accepted
         // (`wake.rs`, `CloseReason::SendBacklog`). So a connection streaming a
         // body can exceed the backlog on its own chunks alone, and a push
-        // arriving mid-body would evict a transfer that is keeping up. Both of
-        // a tail's buffers can be queued at once, so the backlog has to cover
-        // them - which at the defaults it does, 512 KiB against 8 MiB.
+        // arriving mid-body would evict a transfer that is keeping up.
+        //
+        // The count is `FILE_TAIL_BUF_PEAK`, not `FILE_TAIL_BUFS`: the mint
+        // cap and the recycled-spare cap are independent, so a tail owns
+        // twice its mint cap and can queue all of it. At the defaults that is
+        // 1 MiB against 8 MiB.
+        //
+        // It bounds ONE tail's chunks and nothing else. A reply head, PDUs
+        // released from a retired tail's diversion, and an earlier pipelined
+        // body's chunks not yet flushed are all queued too, and they scale
+        // with `max_in_flight_requests` rather than with anything here. A
+        // consumer that pushes against a deeply pipelined connection still
+        // has to size the backlog for its own traffic; what this refuses is
+        // the configuration where a single body cannot coexist with a push.
         #[cfg(feature = "uring-fs")]
         if self.fs_ops > 0
-            && usize::from(crate::net::core::conn::FILE_TAIL_BUFS)
+            && usize::from(crate::net::core::conn::FILE_TAIL_BUF_PEAK)
                 .saturating_mul(self.fs_body_chunk)
                 > self.max_send_backlog
         {
             return Err(Error::Validation(format!(
                 "max_send_backlog must cover a tail's queued chunks: \
                  {} x fs_body_chunk ({}) exceeds {}",
-                crate::net::core::conn::FILE_TAIL_BUFS,
+                crate::net::core::conn::FILE_TAIL_BUF_PEAK,
                 self.fs_body_chunk,
                 self.max_send_backlog
             )));

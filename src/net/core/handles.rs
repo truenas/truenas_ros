@@ -94,6 +94,7 @@ pub(crate) struct StatsInner {
     pub(crate) rejected: AtomicU64,
     pub(crate) shed: AtomicU64,
     pub(crate) accept_retries: AtomicU64,
+    pub(crate) drain_listener_shutdown_failed: AtomicU64,
     pub(crate) closed: AtomicU64,
     pub(crate) active: AtomicU64,
     pub(crate) requests: AtomicU64,

@@ -586,9 +586,11 @@ pub struct Server<U, AcceptFn, HeaderFn, BodyFn> {
     // Cross-thread work, delivered by a wake poke and drained in `on_wake`.
     mailbox: Mailbox<U>,
     // Connections whose next body read is waiting on a free fs op slot, in
-    // arrival order. A completing fs op frees exactly one slot and re-drives
-    // exactly one of these; a stale entry (the connection closed, or its slot
-    // was recycled) is discarded on the way past.
+    // arrival order. A freed slot re-drives exactly one of these; a stale
+    // entry (the connection closed, or its slot was recycled) is discarded on
+    // the way past. `FileTail::parked` is the dedup key that holds the length
+    // to one entry per connection - see its doc before changing where it is
+    // set or cleared.
     #[cfg(feature = "uring-fs")]
     parked_tails: std::collections::VecDeque<(u32, u64)>,
     // Server-only tuning: the pool/listen/socket knobs the engine does not read

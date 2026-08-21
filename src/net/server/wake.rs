@@ -8,6 +8,7 @@ use super::Server;
 use super::handles::Injected;
 use crate::errno;
 use crate::net::core::conn::{Op, pack};
+use crate::net::core::handles::stat;
 use crate::net::core::protocol::{CloseReason, Framing};
 use crate::net::core::table::SlotState;
 use crate::net::server::protocol::{Incoming, Request, Response};
@@ -95,10 +96,28 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         // -ECANCELED. `on_accept` ignores both while draining. Best effort:
         // a failure leaves the old behaviour, the backlog filling until the
         // fd closes.
+        //
+        // **`draining` must already be set when this runs.** The `-EINVAL`
+        // the TCP accept completes with is classified *fatal* by
+        // `accept_error_is_fatal`, and the only thing that keeps it from
+        // ending `serve_forever` with an error is `on_accept`'s early return
+        // for a draining server. Shutting a listener down from any path that
+        // has not set the flag turns a graceful drain into a failed one.
+        debug_assert!(
+            self.core.draining,
+            "listeners are shut down only once `draining` is set: the \
+             accept's -EINVAL is fatal to `on_accept` otherwise"
+        );
         for l in &self.listeners {
             // SAFETY: `l.fd` is a live listening socket this server owns;
             // shutdown(2) touches no memory.
-            unsafe { libc::shutdown(l.fd.as_raw_fd(), libc::SHUT_RD) };
+            let rc = unsafe { libc::shutdown(l.fd.as_raw_fd(), libc::SHUT_RD) };
+            if rc != 0 {
+                // Best effort, but not silent: refuse-on-connect did not take
+                // effect for this listener and its backlog keeps filling
+                // until the fd closes, which an operator cannot otherwise see.
+                stat!(self.core, drain_listener_shutdown_failed);
+            }
         }
 
         // Stop accepting: cancel each listener's multishot accept by its

@@ -540,7 +540,13 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
 /// * `EBADF` - the listener descriptor is not a valid open fd (closed, or never
 ///   registered).
 /// * `EINVAL` - the socket is not `listen()`ing, or the accept arguments are
-///   malformed.
+///   malformed. **A graceful drain produces this routinely** and it is not
+///   fatal there: `begin_drain`'s `shutdown(SHUT_RD)` drives a TCP listener
+///   to `TCP_CLOSE`, which completes the armed multishot accept `-EINVAL`.
+///   What keeps it from ending the server is `on_accept` returning early for
+///   a draining server, *before* this classification is consulted - so
+///   `draining` must be set before any listener is shut down. See the
+///   assertion in `begin_drain`.
 /// * `EFAULT` - an address/length argument points outside our address space (a
 ///   bug in how the SQE was built).
 /// * `ENOTSOCK` - the descriptor is not a socket (the wrong fd was registered).
