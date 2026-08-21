@@ -77,6 +77,14 @@ audit = []
 # use-case-specific — for daemons that hold secrets (the S3 server's SigV4
 # credential table) — so opt-in like the net roles rather than riding `default`.
 secrets = []
+# Process signals for a daemon (`src/signal.rs`): block a set on the main
+# thread before any thread exists, then receive them as values on one thread
+# (`sigwaitinfo`, or a `signalfd` for a poll loop). No handler is ever
+# installed, so nothing runs in signal context and the reactors never see a
+# signal - the shape `net::server` documents. Standalone and dependency-free;
+# opt-in like `secrets` because only a daemon's `main` has any business with
+# process-global signal state.
+signal = []
 # The shared io_uring engine (`src/uring`): raw UAPI, ring, SQE staging,
 # wake, slot generations, the user_data codec. Internal — enabled transitively
 # by the domains built on it (the net stack today, uring-fs next); not a
@@ -132,6 +140,7 @@ full = [
     "shutil",
     "configfile",
     "audit",
+    "signal",
     "net-server",
     "net-client",
     "http",
