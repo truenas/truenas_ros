@@ -365,13 +365,14 @@
 //! # Shutdown
 //!
 //! [`ShutdownHandle::shutdown`] stops immediately: all in-flight operations
-//! are cancelled. [`ShutdownHandle::shutdown_graceful`] drains instead:
-//! accepting stops and idle connections close at once, while requests already
-//! in flight - reads in progress, deferred worker replies, queued sends --
-//! run to completion, each connection closing as it quiesces; if the drain
-//! outlives the grace period, the remainder is cancelled. For visibility into
-//! why connections close (clean EOF, malformed input, timeouts, errors,
-//! shutdown), install a [`Server::set_close_hook`] - it receives
+//! are cancelled. [`ShutdownHandle::shutdown_graceful`] drains instead: the
+//! listeners are shut down so a new connect is refused at once, idle
+//! connections close, and requests already in flight - reads in progress,
+//! deferred worker replies, queued sends - run to completion, each
+//! connection closing as it quiesces; if the drain outlives the grace
+//! period, the remainder is cancelled. For visibility into why connections
+//! close (clean EOF, malformed input, timeouts, errors, shutdown), install a
+//! [`Server::set_close_hook`] - it receives
 //! `(peer, `[`CloseReason`]`, &mut state)` once per connection as it begins
 //! closing.
 //!

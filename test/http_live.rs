@@ -520,6 +520,140 @@ fn with_parking_server<T: Send + 'static>(
     Some(join.join().expect("client thread").expect("client io"))
 }
 
+/// Every reply written during a drain says `Connection: close`: the drain
+/// closes the connection once the reply is out and admits no further request
+/// on it, so the peer must not reuse it. Here the reply is a worker's, for a
+/// request parked before the drain began (the idle connection's EOF marks
+/// that moment), and a second request pipelined behind it is dropped with
+/// the close rather than answered.
+#[test]
+fn replies_during_drain_say_connection_close() {
+    use std::sync::mpsc;
+    use truenas_ros::http::{HttpDeferred, HttpVerdict, protocol_deferrable};
+
+    let (park_tx, park_rx) = mpsc::channel::<HttpDeferred>();
+    let handler = move |req: HttpRequest<'_>, _: &mut ()| match (
+        req.method, req.target,
+    ) {
+        ("GET", "/park") => {
+            let (deferred, permit) = req.defer();
+            park_tx.send(deferred).expect("the test holds the receiver");
+            HttpVerdict::Defer(permit)
+        }
+        _ => HttpVerdict::Respond(HttpResponse::new(200).body("hello")),
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = protocol_deferrable(
+        HttpConfig::default(),
+        |_inc: Incoming<'_>| Some(()),
+        handler,
+    )
+    .expect("codec config is valid");
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let join = thread::spawn(move || -> io::Result<()> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        let mut idle = connect_tcp(v4)?;
+        idle.write_all(b"GET /hi HTTP/1.1\r\nHost: t\r\n\r\n")?;
+        let (status, head, _) = read_response(&mut idle)?;
+        assert_eq!(status, 200);
+        assert!(!head.contains("\r\nConnection:"), "bare before the drain");
+
+        let mut parked = connect_tcp(v4)?;
+        parked.write_all(
+            b"GET /park HTTP/1.1\r\nHost: t\r\n\r\n\
+              GET /hi HTTP/1.1\r\nHost: t\r\n\r\n",
+        )?;
+        let deferred = park_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the request parked");
+
+        stop.shutdown_graceful(Duration::from_secs(5));
+        assert_eof(&mut idle)?;
+
+        deferred.reply(HttpResponse::new(200).body("late"));
+        let (status, head, body) = read_response(&mut parked)?;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"late");
+        assert!(
+            head.contains("\r\nConnection: close\r\n"),
+            "a reply during the drain must say close: {head}"
+        );
+        // The pipelined GET is never answered: the connection is done.
+        assert_eof(&mut parked)?;
+        Ok(())
+    });
+    server.serve_forever().expect("serve_forever");
+    join.join().expect("client thread").expect("client io");
+}
+
+/// The handler that starts the drain still says close on its own reply:
+/// the flag is read after the handler returns, not before it runs, so an
+/// admin shutdown endpoint does not answer keep-alive and then vanish.
+#[test]
+fn a_handler_that_starts_the_drain_still_says_close() {
+    use std::sync::{Arc, OnceLock};
+
+    let stop_cell: Arc<OnceLock<ShutdownHandle>> = Arc::new(OnceLock::new());
+    let in_handler = Arc::clone(&stop_cell);
+    let handler = move |req: HttpRequest<'_>, _: &mut ()| match (
+        req.method, req.target,
+    ) {
+        ("POST", "/shutdown") => {
+            in_handler
+                .get()
+                .expect("handle set before serving")
+                .shutdown_graceful(Duration::from_secs(5));
+            HttpResponse::new(200).body("draining")
+        }
+        _ => HttpResponse::new(200).body("hello"),
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = protocol(
+        HttpConfig::default(),
+        |_inc: Incoming<'_>| Some(()),
+        handler,
+    )
+    .expect("codec config is valid");
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    stop_cell.set(stop.clone()).expect("set once");
+    let join = thread::spawn(move || -> io::Result<()> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        let mut s = connect_tcp(v4)?;
+        s.write_all(b"GET /hi HTTP/1.1\r\nHost: t\r\n\r\n")?;
+        let (status, head, _) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert!(!head.contains("\r\nConnection:"), "bare before the drain");
+        s.write_all(b"POST /shutdown HTTP/1.1\r\nHost: t\r\n\r\n")?;
+        let (status, head, body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"draining");
+        assert!(
+            head.contains("\r\nConnection: close\r\n"),
+            "the reply that started the drain must say close: {head}"
+        );
+        assert_eof(&mut s)?;
+        Ok(())
+    });
+    server.serve_forever().expect("serve_forever");
+    join.join().expect("client thread").expect("client io");
+}
+
 #[test]
 fn park_redrive_completes_in_one_round_trip() {
     // The cold-miss pattern end to end: the first request parks while the
@@ -659,6 +793,17 @@ fn with_ktls_http_server<T: Send + 'static>(
     cfg: ServerConfig,
     client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
 ) -> Option<T> {
+    with_ktls_http_server_handle(cfg, move |v4, _stop| client(v4))
+}
+
+/// [`with_ktls_http_server`] for a client that drives the server's
+/// lifecycle itself: it also receives the [`ShutdownHandle`].
+fn with_ktls_http_server_handle<T: Send + 'static>(
+    cfg: ServerConfig,
+    client: impl FnOnce(SocketAddrV4, ShutdownHandle) -> io::Result<T>
+    + Send
+    + 'static,
+) -> Option<T> {
     if ktls_openssl_unsupported() {
         return None;
     }
@@ -690,7 +835,7 @@ fn with_ktls_http_server<T: Send + 'static>(
     let stop = server.shutdown_handle();
     let join = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
-        let r = client(v4);
+        let r = client(v4, stop.clone());
         stop.shutdown();
         r
     });
@@ -787,6 +932,66 @@ fn ktls_vectored_bodies_arrive_intact() {
             assert_eq!(status, 200);
             assert_eq!(body, b"hello");
         }
+        Ok(())
+    }) else {
+        return; // io_uring or kTLS unavailable
+    };
+}
+
+/// Assert the peer closed: a clean EOF, or the unexpected-EOF OpenSSL
+/// reports when a kernel-TLS peer closes without a close_notify.
+fn assert_tls_eof<R: Read>(s: &mut R) -> io::Result<()> {
+    let mut b = [0u8; 1];
+    match s.read(&mut b) {
+        Ok(0) => Ok(()),
+        Ok(n) => panic!("expected EOF, got {n} byte(s)"),
+        Err(e)
+            if e.kind() == io::ErrorKind::UnexpectedEof
+                || e.kind() == io::ErrorKind::ConnectionReset
+                || e.to_string().to_ascii_lowercase().contains("eof") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The drain's `Connection: close` over kTLS, on the inline reply path. A
+/// PUT parked in the 100-continue dance is in-flight work (its body read is
+/// armed, so the sweep leaves it alone): the drain begins (the idle TLS
+/// connection's close marks it), the body arrives, and the echo must say
+/// close before the connection goes away.
+#[test]
+fn ktls_replies_during_drain_say_connection_close() {
+    let cfg = truenas_ros::net::server::ServerConfig::default();
+    let Some(()) = with_ktls_http_server_handle(cfg, |v4, stop| {
+        let mut idle = ktls::tls_connect(v4)?;
+        idle.write_all(b"GET /hi HTTP/1.1\r\nHost: t\r\n\r\n")?;
+        let (status, head, body) = read_response(&mut idle)?;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello");
+        assert!(!head.contains("\r\nConnection:"), "bare before the drain");
+
+        let mut mid = ktls::tls_connect(v4)?;
+        mid.write_all(
+            b"PUT /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\
+              Expect: 100-continue\r\n\r\n",
+        )?;
+        let (status, _) = read_head(&mut mid)?;
+        assert_eq!(status, 100, "the dance parks the body read");
+
+        stop.shutdown_graceful(Duration::from_secs(5));
+        assert_tls_eof(&mut idle)?;
+
+        mid.write_all(b"hello")?;
+        let (status, head, body) = read_response(&mut mid)?;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"hello");
+        assert!(
+            head.contains("\r\nConnection: close\r\n"),
+            "a reply during the drain must say close: {head}"
+        );
+        assert_tls_eof(&mut mid)?;
         Ok(())
     }) else {
         return; // io_uring or kTLS unavailable

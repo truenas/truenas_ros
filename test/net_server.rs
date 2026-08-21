@@ -5445,6 +5445,203 @@ fn tcp_multicore_two_rings() {
     w1.join().expect("worker 1 join");
 }
 
+/// A drain refuses new connections instead of quietly accepting them into a
+/// backlog nobody will ever read: `shutdown_graceful` shuts every listener
+/// down first, so a connect from then on fails with `ECONNREFUSED` while the
+/// request already in flight still finishes. The idle connection's EOF is
+/// the "drain has begun" signal (the idle sweep runs after the listeners are
+/// shut), so nothing here waits on a timer.
+#[test]
+fn graceful_drain_refuses_new_connections() {
+    let (park_tx, park_rx) = std::sync::mpsc::channel::<Deferred>();
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |req: Request<'_, ()>| -> Response {
+            if &req.body[..] == b"park" {
+                let (deferred, permit) = req.responder.defer();
+                park_tx.send(deferred).expect("the test holds the receiver");
+                Response::Defer(permit)
+            } else {
+                Response::Reply(echo_frame(&req.body))
+            }
+        },
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<()> {
+        let _stop = ShutdownOnDrop(stop.clone());
+        // Idle between requests: the sweep closes it, marking the drain.
+        let mut idle = connect_tcp(v4)?;
+        send_framed(&mut idle, b"ping")?;
+        assert_eq!(recv_framed(&mut idle)?, b"ping");
+        // Parked in a worker: in-flight work that holds the drain open.
+        let mut parked = connect_tcp(v4)?;
+        send_framed(&mut parked, b"park")?;
+        let deferred = park_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the request parked");
+
+        stop.shutdown_graceful(Duration::from_secs(5));
+        let mut b = [0u8; 1];
+        assert_eq!(idle.read(&mut b)?, 0, "the sweep closes the idle peer");
+
+        // The listeners are shut: refused, not queued.
+        match TcpStream::connect(v4) {
+            Err(e) => assert_eq!(
+                e.kind(),
+                io::ErrorKind::ConnectionRefused,
+                "a connect during the drain failed some other way: {e}"
+            ),
+            Ok(_) => panic!("a connect during the drain was queued"),
+        }
+
+        // The parked request completes, then its connection closes.
+        deferred.reply(echo_frame(b"park"));
+        assert_eq!(recv_framed(&mut parked)?, b"park");
+        assert_eq!(parked.read(&mut b)?, 0, "closed once nothing is owed");
+        Ok(())
+    });
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("client thread").expect("client io");
+}
+
+/// Draining one `reuse_port` sibling must not take the address down: its
+/// shut listener leaves the kernel's reuseport group while the server is
+/// still alive and draining, so every new connect lands on the survivor and
+/// is served rather than queued on a ring that will never read it. The
+/// drained ring is held open by a parked request for the whole check, so
+/// what the test proves is `shutdown(2)`, not the fd closing at drop.
+#[test]
+fn draining_one_reuse_port_sibling_leaves_the_other_serving() {
+    type Ready = Result<(SocketAddrV4, ShutdownHandle), Error>;
+    fn worker(
+        idx: u8,
+        addr: SocketAddrV4,
+        ready: std::sync::mpsc::Sender<Ready>,
+        park_tx: std::sync::mpsc::Sender<Deferred>,
+    ) {
+        let cfg = ServerConfig {
+            reuse_port: true,
+            ..ServerConfig::default()
+        };
+        let proto = Protocol {
+            accept: |_: Incoming<'_>| Some(()),
+            header: length_prefix_header::<()>(
+                PrefixWidth::U32,
+                Endian::Big,
+                false,
+            ),
+            // Echoes are tagged with the ring that served them; "park"
+            // defers so the test can hold that ring open while it drains.
+            body: move |req: Request<'_, ()>| -> Response {
+                if &req.body[..] == b"park" {
+                    let (deferred, permit) = req.responder.defer();
+                    park_tx
+                        .send(deferred)
+                        .expect("the test holds the receiver");
+                    return Response::Defer(permit);
+                }
+                let mut out = vec![idx];
+                out.extend_from_slice(&req.body);
+                Response::Reply(echo_frame(&out))
+            },
+        };
+        let mut server =
+            match Server::with_config([ServerAddr::Tcp(addr)], cfg, proto) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = ready.send(Err(e));
+                    return;
+                }
+            };
+        let ServerAddr::Tcp(bound) = server.local_addrs().remove(0) else {
+            panic!("expected Tcp");
+        };
+        let stop = server.shutdown_handle();
+        let _ = ready.send(Ok((bound, stop)));
+        server.serve_forever().expect("serve_forever");
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (park_tx, park_rx) = std::sync::mpsc::channel::<Deferred>();
+    let (tx0, park0) = (tx.clone(), park_tx.clone());
+    let w0 = thread::spawn(move || {
+        worker(0, "127.0.0.1:0".parse().unwrap(), tx0, park0);
+    });
+    let (addr, stop0) = match rx.recv().expect("worker 0") {
+        Ok(v) => v,
+        Err(e) if should_skip(&e) => {
+            w0.join().unwrap();
+            return;
+        }
+        Err(e) => panic!("bind: {e}"),
+    };
+    let w1 = thread::spawn(move || worker(1, addr, tx, park_tx));
+    let (_, stop1) = rx.recv().expect("worker 1").expect("second bind");
+
+    // Two connections that ring 0 answered: one to park on it, one to idle
+    // on it. The kernel hashes each new connection across the group, so a
+    // bounded number of tries finds them (each try is a coin flip).
+    let mut on_ring0 = Vec::new();
+    for _ in 0..64 {
+        let mut s = connect_tcp(addr).expect("connect");
+        send_framed(&mut s, b"which").expect("send");
+        let reply = recv_framed(&mut s).expect("recv");
+        if reply[0] == 0 {
+            on_ring0.push(s);
+            if on_ring0.len() == 2 {
+                break;
+            }
+        }
+    }
+    let [mut parked0, mut idle0]: [TcpStream; 2] = on_ring0
+        .try_into()
+        .expect("the kernel never balanced two connections onto ring 0");
+    send_framed(&mut parked0, b"park").expect("send");
+    let deferred = park_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the request parked on ring 0");
+
+    stop0.shutdown_graceful(Duration::from_secs(5));
+    let mut b = [0u8; 1];
+    assert_eq!(idle0.read(&mut b).expect("read"), 0, "ring 0's idle sweep");
+
+    // Ring 0 is alive, draining, and out of the group: the survivor takes
+    // every new connection.
+    for i in 0..16 {
+        let msg = format!("m{i}");
+        let mut s = TcpStream::connect(addr)
+            .expect("a connect while a sibling drains must succeed");
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        send_framed(&mut s, msg.as_bytes()).expect("send");
+        let reply = recv_framed(&mut s)
+            .expect("served by the survivor, not queued on the drained ring");
+        assert_eq!(reply[0], 1, "connection {i} landed on the drained ring");
+        assert_eq!(&reply[1..], msg.as_bytes());
+    }
+
+    // Release ring 0: its parked request completes and the drain ends.
+    deferred.reply(echo_frame(b"park"));
+    assert_eq!(recv_framed(&mut parked0).expect("recv"), b"park");
+    assert_eq!(parked0.read(&mut b).expect("read"), 0, "ring 0 closed it");
+    w0.join().expect("worker 0 join");
+    stop1.shutdown_graceful(Duration::from_secs(5));
+    w1.join().expect("worker 1 join");
+}
+
 #[test]
 fn tcp_pipelined_out_of_order() {
     // Pipelined (max_in_flight > 1): the client sends several requests without

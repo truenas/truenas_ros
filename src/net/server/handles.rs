@@ -61,7 +61,52 @@ pub struct Responder {
     pub(super) shared: Arc<LoopShared>,
 }
 
+/// A `draining()` probe that outlives the [`Responder`] it came from, for
+/// glue that must read the flag after a handler consumed the responder.
+/// The HTTP codec is its only consumer.
+#[cfg(feature = "http")]
+pub(crate) struct DrainProbe {
+    shared: Arc<LoopShared>,
+}
+
+#[cfg(feature = "http")]
+impl DrainProbe {
+    pub(crate) fn draining(&self) -> bool {
+        self.shared.graceful.load(Ordering::Acquire)
+            || self.shared.stop.load(Ordering::Acquire)
+    }
+}
+
 impl Responder {
+    /// Whether the server has been asked to stop, gracefully or not.
+    ///
+    /// Advisory: the shutdown thread sets the flag and the loop acts on it
+    /// when it next wakes. Once draining, the loop reads no new request off
+    /// this connection, but requests already buffered are still delivered
+    /// (each sees `true` here), and the connection closes only once nothing
+    /// is left outstanding. `true` therefore does not make this reply the
+    /// connection's last. A protocol that wants it to be must return a close
+    /// disposition - [`Response::ReplyClose`] or
+    /// [`Response::ReplyVectored`]` { close: true }` - which retires the
+    /// recv side and discards the buffered rest, and should say so on the
+    /// wire if it can (HTTP sends `Connection: close` and flush-closes), so
+    /// the peer does not reuse a connection about to go away and race the
+    /// close with its next request. A close forced this way is the
+    /// handler's verdict, so the close hook reports
+    /// [`CloseReason::HandlerClosed`], not `ShuttingDown`, which is kept for
+    /// connections the drain itself closes.
+    pub fn draining(&self) -> bool {
+        self.shared.graceful.load(Ordering::Acquire)
+            || self.shared.stop.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "http")]
+    pub(crate) fn drain_probe(&self) -> DrainProbe {
+        DrainProbe {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
     /// Detach an owned, `Send` handle for delivering this request's reply later
     /// from any thread, plus the [`DeferPermit`] proof to return as
     /// [`Response::Defer`]`(permit)`. Move the [`Deferred`] into your worker;
@@ -122,6 +167,13 @@ impl Responder {
     /// behavior is the net layer's own tests' business, not the glue's.
     pub(crate) fn test_responder() -> Responder {
         Self::test_wired().0
+    }
+
+    /// [`Responder::test_responder`] whose server is already draining.
+    pub(crate) fn test_responder_draining() -> Responder {
+        let r = Self::test_wired().0;
+        r.shared.graceful.store(true, Ordering::Release);
+        r
     }
 
     fn test_wired() -> (Responder, mpsc::Receiver<Injected>) {
@@ -581,14 +633,18 @@ impl ShutdownHandle {
         self.shared.wake.poke();
     }
 
-    /// Stop the server **gracefully**: accepting stops and idle connections
-    /// close immediately, but requests already in flight - reads in progress,
-    /// work deferred to workers, and queued replies - are allowed to finish
-    /// (each connection closes as it quiesces; keep-alive does not admit new
-    /// requests). If the drain has not completed within `grace`, whatever
-    /// remains is cancelled as in [`ShutdownHandle::shutdown`]. A zero `grace`
-    /// is exactly `shutdown()`. Safe to call from any thread; a concurrent
-    /// hard `shutdown` wins. Infallible, like [`ShutdownHandle::shutdown`].
+    /// Stop the server **gracefully**: every listener is shut down so a new
+    /// connect is refused at once (not queued in a backlog nobody will
+    /// drain), idle connections close immediately, but requests already in
+    /// flight - reads in progress, work deferred to workers, and queued
+    /// replies - are allowed to finish (each connection closes as it
+    /// quiesces; keep-alive does not admit new requests). The listeners
+    /// leave the listening state at once, so a replacement server can bind
+    /// the same address while this one drains. If the drain has not
+    /// completed within `grace`, whatever remains is cancelled as in
+    /// [`ShutdownHandle::shutdown`]. A zero `grace` is exactly `shutdown()`.
+    /// Safe to call from any thread; a concurrent hard `shutdown` wins.
+    /// Infallible, like [`ShutdownHandle::shutdown`].
     pub fn shutdown_graceful(&self, grace: Duration) {
         if grace.is_zero() {
             return self.shutdown();

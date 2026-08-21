@@ -153,7 +153,10 @@ pub enum CloseReason {
     /// The `send_timeout` fired while a reply was stalled (peer not reading).
     SendTimeout,
     /// Closed by shutdown (graceful drain, or the connection quiesced during
-    /// one).
+    /// one). A protocol that answers its last request with its own farewell
+    /// once draining (HTTP's `Connection: close`) reports that close as the
+    /// handler's, [`CloseReason::HandlerClosed`], since it returned the
+    /// flush-close.
     ShuttingDown,
     /// A push overflowed `ServerConfig::max_send_backlog` - the peer is not
     /// draining its socket (slow-consumer eviction).

@@ -256,11 +256,15 @@ fn now_secs() -> i64 {
 /// Serialize `resp` against what `head` negotiated and pick the reactor
 /// verdict: keep-alive replies, farewells flush-close. `dates` is the
 /// per-reactor cache rendering the `Date` value once a second, not once a
-/// response.
+/// response. `draining` forces the close: the reply goes out with a close
+/// disposition, so the reactor discards anything buffered behind it and
+/// closes once it is sent, and the head says so rather than let the peer
+/// find out on its next request.
 fn respond(
     head: &Head<'_>,
     resp: HttpResponse,
     dates: &mut DateCache,
+    draining: bool,
 ) -> Response {
     // A head carrying both Content-Length and Transfer-Encoding frames as
     // chunked here because the transfer coding wins under RFC 9112 section
@@ -271,7 +275,7 @@ fn respond(
     // reply drops keep alive so no pipelined request rides behind a
     // smuggled prefix on this connection.
     let (keep_alive, cl_te_conflict) = head.response_disposition();
-    let keep = keep_alive && !resp.close && !cl_te_conflict;
+    let keep = keep_alive && !resp.close && !cl_te_conflict && !draining;
     let conn = match (keep, head.version) {
         (true, Version::Http11) => ConnHeader::None,
         (true, Version::Http10) => ConnHeader::KeepAlive,
@@ -396,6 +400,10 @@ where
         Ok(h) => h,
         Err(resp) => return Dispatched::Done(resp),
     };
+    // Minted before the responder moves into the handler, read after it
+    // returns: a handler that starts the drain itself (an admin shutdown
+    // endpoint) still sends the close with its own reply.
+    let drain = responder.drain_probe();
     match handler(
         HttpRequest {
             method: h.method,
@@ -412,7 +420,7 @@ where
         fs,
     ) {
         HttpVerdict::Respond(resp) => {
-            Dispatched::Done(respond(&h, resp, dates))
+            Dispatched::Done(respond(&h, resp, dates, drain.draining()))
         }
         HttpVerdict::Defer(p) => Dispatched::Park {
             permit: p.permit,
@@ -428,11 +436,12 @@ fn respond_parked(
     head_bytes: &[u8],
     resp: HttpResponse,
     dates: &mut DateCache,
+    draining: bool,
 ) -> Response {
     let mut headers: [HeaderView<'_>; MAX_HEADERS] =
         [HeaderView::EMPTY; MAX_HEADERS];
     match reparse_or_farewell(head_bytes, &mut headers, dates) {
-        Ok(h) => respond(&h, resp, dates),
+        Ok(h) => respond(&h, resp, dates, draining),
         Err(farewell) => farewell,
     }
 }
@@ -482,6 +491,13 @@ where
         // (Reply sends raw bytes) and advance the phase; the framer will
         // declare the body next.
         Phase::ExpectHead { head, body } => {
+            // A drain reads no body this connection has not started: the
+            // interim would invite one and the connection would then close
+            // under it. Refuse now, with a close, so the peer retries
+            // elsewhere instead of sending into a connection that is gone.
+            if responder.draining() {
+                return farewell(503, method_is_head(&head), dates);
+            }
             conn.phase = Phase::ExpectBody { head, body };
             Response::Reply(b"HTTP/1.1 100 Continue\r\n\r\n".to_vec())
         }
@@ -600,7 +616,9 @@ where
             let chosen =
                 answer.lock().unwrap_or_else(PoisonError::into_inner).take();
             match chosen {
-                Some(resp) => respond_parked(&head, resp, dates),
+                Some(resp) => {
+                    respond_parked(&head, resp, dates, responder.draining())
+                }
                 None => {
                     let views: Vec<HeaderView<'_>> = trailers
                         .iter()
@@ -1251,6 +1269,43 @@ mod tests {
         assert!(is_keep(&resp));
         assert!(text(&resp).starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(matches!(conn.phase, Phase::Head));
+    }
+
+    /// While draining, the dance's first message is refused with a close
+    /// instead of being invited to send a body the drain will not read.
+    #[test]
+    fn dance_while_draining_is_refused_not_invited() {
+        let head =
+            b"PUT /k HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n";
+        let mut conn = HttpConn::new(());
+        let p = peer();
+        assert_eq!(
+            frame(head, &mut conn, &cfg()),
+            Framing::Complete {
+                header_len: head.len(),
+                body_len: 0
+            }
+        );
+        let resp = step(
+            head,
+            Body::inline(b""),
+            &p,
+            Responder::test_responder_draining(),
+            FsSlot::default(),
+            &mut conn,
+            &mut DateCache::default(),
+            &mut |_: HttpRequest<'_>, _: &mut (), _fs: FsSlot<'_>| {
+                panic!("the handler must not run: no body was read")
+            },
+        );
+        assert!(is_close(&resp), "a refusal, not the keep-alive interim");
+        let s = text(&resp);
+        assert!(s.starts_with("HTTP/1.1 503 "), "{s}");
+        assert!(s.contains("Connection: close\r\n"), "{s}");
+        assert!(
+            matches!(conn.phase, Phase::Head),
+            "the dance is over, nothing waits for a body"
+        );
     }
 
     #[test]
