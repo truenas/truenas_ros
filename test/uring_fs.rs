@@ -1499,6 +1499,40 @@ fn mkdir_path_creates_confined_and_is_idempotent() {
     });
 }
 
+/// Top-level directories that genuinely sit on another filesystem - the
+/// fixture the `RESOLVE_NO_XDEV` tests need.
+///
+/// `symlink_metadata`, not `metadata`: a followed symlink reports its TARGET's
+/// device, so on a usr-merged root `/lib -> usr/lib` qualifies while being an
+/// ordinary symlink on the root filesystem. The opens under test resolve with
+/// `RESOLVE_NO_SYMLINKS`, so such a candidate dies `ELOOP` before the
+/// confinement is ever reached.
+///
+/// `TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY=1` turns an empty result into a
+/// failure. Without a boundary these tests return having asserted nothing, so
+/// a runner that quietly has none passes green having tested the one thing the
+/// tests exist for on neither shape of host. The QEMU job provisions
+/// `/POSIXACL` and `/NFSV4ACL` (`setup-test-zfs.sh`) and arms it.
+fn mount_crossings() -> Vec<String> {
+    let root_dev = std::fs::metadata("/").unwrap().dev();
+    let found: Vec<String> = std::fs::read_dir("/")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| {
+            let md = std::fs::symlink_metadata(e.path()).ok()?;
+            (md.is_dir() && md.dev() != root_dev)
+                .then(|| e.file_name().into_string().ok())?
+        })
+        .collect();
+    assert!(
+        !found.is_empty()
+            || std::env::var_os("TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY").is_none(),
+        "TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY is set but no top-level directory \
+         is on another filesystem: the confinement tests would assert nothing"
+    );
+    found
+}
+
 /// `RESOLVE_NO_XDEV` is what makes "this tree is one filesystem" a rule the
 /// kernel enforces rather than a convention: a walk that would step onto
 /// another mount fails instead of quietly serving files from it. Uses a real
@@ -1508,17 +1542,7 @@ fn mkdir_path_creates_confined_and_is_idempotent() {
 fn confined_open_refuses_to_cross_a_mount_point() {
     with_fs(test_cfg(), |h, me, _dir, _stop| {
         let root = Anchor::open("/").expect("anchor /");
-        let root_dev = std::fs::metadata("/").unwrap().dev();
-
-        // Find a top-level directory that lives on a different filesystem.
-        let Some(name) =
-            std::fs::read_dir("/").unwrap().flatten().find_map(|e| {
-                let p = e.path();
-                let md = std::fs::metadata(&p).ok()?;
-                (md.is_dir() && md.dev() != root_dev)
-                    .then(|| e.file_name().into_string().ok())?
-            })
-        else {
+        let Some(name) = mount_crossings().into_iter().next() else {
             return; // single-filesystem host: nothing to cross
         };
 
@@ -1570,16 +1594,7 @@ fn abandoned_tmpfile_leaves_nothing_behind() {
 fn listing_can_be_confined_to_one_filesystem() {
     with_fs(test_cfg(), |h, me, _dir, _stop| {
         let root = Anchor::open("/").expect("anchor /");
-        let root_dev = std::fs::metadata("/").unwrap().dev();
-        let crossings: Vec<String> = std::fs::read_dir("/")
-            .unwrap()
-            .flatten()
-            .filter_map(|e| {
-                let md = std::fs::metadata(e.path()).ok()?;
-                (md.is_dir() && md.dev() != root_dev)
-                    .then(|| e.file_name().into_string().ok())?
-            })
-            .collect();
+        let crossings = mount_crossings();
         if crossings.is_empty() {
             return; // single-filesystem host
         }
