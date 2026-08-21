@@ -75,7 +75,7 @@ pub enum Response {
     /// (`ServerConfig::fs_body_chunk`) and sent as they arrive, so the copy
     /// in flight is bounded by the chunk size, never the body size.
     ///
-    /// Requires an fs pool (`ServerConfig::fs_files`); without one the
+    /// Requires an fs pool (`ServerConfig::fs_ops`); without one the
     /// connection is closed ([`CloseReason::FileBody`]) rather than a short
     /// body sent. `len` is a contract, not a hint: the protocol already
     /// framed it (an HTTP `Content-Length`), so reads are clamped to it - a
@@ -207,7 +207,7 @@ pub struct Request<'a, U> {
     /// [`PushHandle`](Responder::push_handle)s.
     pub responder: Responder,
     /// The request-bound fs submission facade - `Some` when the server was
-    /// built with an fs pool (`ServerConfig::fs_files`), else `None`. Take it
+    /// built with an fs pool (`ServerConfig::fs_ops`), else `None`. Take it
     /// (`req.fs.take()`) to open/read/stat files on the server's own ring under
     /// a per-request [`Personality`](crate::uring_fs::Personality): the first
     /// op parks the request through a [`Deferred`](Responder::defer) the

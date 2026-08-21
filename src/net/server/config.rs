@@ -48,16 +48,29 @@ pub struct ServerConfig {
     /// ~512 MiB ceiling. Empty slots are near-free (~32 bytes each), so
     /// headroom costs nothing at idle.
     pub pool_size: u32,
-    /// Maximum concurrently-open files for the embedded fs reactor
+    /// Op-table slots for the embedded fs reactor
     /// ([`Request::fs`](super::Request::fs)), or `0` (the default) to disable
     /// it. When non-zero the server drives an `uring_fs` reactor on this same
-    /// ring, sizing its op table for up to `fs_files` concurrent open files
-    /// (`fs_files * 2` op slots). Those files are plain raw fds
-    /// (`Arc<OwnedFd>`), not registered-table slots, so a
-    /// protocol handler can do filesystem work bound to a request, stamped
-    /// with the connection's personality. Requires the `uring-fs` feature.
+    /// ring, and this is the maximum number of **concurrently in-flight fs
+    /// operations** a handler may have — the same axis as
+    /// [`FsConfig::ops`](crate::uring_fs::FsConfig::ops), and the ceiling a
+    /// fan-out actually hits: submitting past it fails `EBUSY` however deep
+    /// the ring is.
+    ///
+    /// **It bounds operations, not open files.** Files are plain raw fds
+    /// (`Arc<OwnedFd>`) closed by `Arc`-drop, never registered-table slots,
+    /// so nothing here caps how many a handler holds — only how many ops it
+    /// may have outstanding at once. A linked chain counts each of its SQEs,
+    /// so size this against the deepest chain a handler submits times the
+    /// connections that can be mid-chain, not against a file count.
+    ///
+    /// Plain heap at ~180 bytes a slot, so this is the cheap axis to raise:
+    /// 1024 slots is 184 KiB, 128K is 23 MiB. The server adds `pool_size`
+    /// slots of its own on top, one per connection for the reply path's body
+    /// reads, so a full pool of streaming bodies cannot exhaust the table out
+    /// from under handler ops. Requires the `uring-fs` feature.
     #[cfg(feature = "uring-fs")]
-    pub fs_files: u32,
+    pub fs_ops: u32,
     /// Warm floor of offload worker threads for the embedded fs reactor's
     /// blocking work (`readdir`/`fdopendir`, byte copies), which has no io_uring
     /// opcode and so cannot run on the ring. Default
@@ -261,7 +274,7 @@ impl Default for ServerConfig {
         ServerConfig {
             pool_size: 512,
             #[cfg(feature = "uring-fs")]
-            fs_files: 0,
+            fs_ops: 0,
             #[cfg(feature = "uring-fs")]
             fs_offload_floor: crate::uring_fs::core::OFFLOAD_FLOOR,
             #[cfg(feature = "uring-fs")]
@@ -319,14 +332,12 @@ impl ServerConfig {
         // truncating a completion token later (`MAX_POOL` is that 24-bit
         // ceiling - the `user_data::SLOT_MASK`).
         #[cfg(feature = "uring-fs")]
-        if self.fs_files > 0
-            && u64::from(self.fs_files)
-                .saturating_mul(2)
-                .saturating_add(u64::from(self.pool_size))
+        if self.fs_ops > 0
+            && u64::from(self.fs_ops).saturating_add(u64::from(self.pool_size))
                 > u64::from(MAX_POOL)
         {
             return Err(Error::Validation(format!(
-                "fs_files * 2 + pool_size must not exceed {MAX_POOL}"
+                "fs_ops + pool_size must not exceed {MAX_POOL}"
             )));
         }
         // The floor spawns eagerly on the reactor thread at first use, so an

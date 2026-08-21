@@ -3680,9 +3680,9 @@ fn server_config_bounds_are_rejected_at_construction() {
 #[test]
 fn server_config_fs_pool_bounds_are_rejected_at_construction() {
     // The fs knobs carry their own bounds for reasons the generic ones do not:
-    // each fs file needs two op slots and an op-slot index shares the 24-bit
-    // `user_data` slot field, so an oversized `fs_files` would truncate a
-    // completion token rather than fail; and the offload floor spawns eagerly
+    // an op-slot index shares the 24-bit `user_data` slot field, so an
+    // oversized `fs_ops` would truncate a completion token rather than fail;
+    // and the offload floor spawns eagerly
     // on the reactor thread, so an absurd value is a thread storm at first use.
     // Both must fail here, at construction, where the message still names the
     // knob.
@@ -3707,10 +3707,11 @@ fn server_config_fs_pool_bounds_are_rejected_at_construction() {
 
     expect(
         ServerConfig {
-            fs_files: 0x0080_0000, // *2 lands one past the 24-bit ceiling
+            // Plus the default `pool_size`, one past the 24-bit ceiling.
+            fs_ops: 0x00ff_ffff,
             ..ServerConfig::default()
         },
-        "fs_files",
+        "fs_ops",
     );
     expect(
         ServerConfig {
@@ -3757,7 +3758,7 @@ fn server_config_fs_pool_bounds_are_rejected_at_construction() {
 /// body it has no reactor to read. The `File` comes from a standalone
 /// `UringFs` host: an open fd is host-independent, which is exactly the
 /// misconfiguration shape (files wired over from one reactor into a server
-/// missing `fs_files`).
+/// missing `fs_ops`).
 #[cfg(feature = "uring-fs")]
 #[test]
 fn file_reply_without_an_fs_pool_sheds_loudly() {
@@ -3815,7 +3816,7 @@ fn file_reply_without_an_fs_pool_sheds_loudly() {
             close: false,
         },
     };
-    // `fs_files` stays 0: that IS the configuration under test.
+    // `fs_ops` stays 0: that IS the configuration under test.
     let mut server = match Server::bind([addr], proto) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
@@ -6826,14 +6827,14 @@ fn ktls_splice_body_stall_reclaimed() {
 #[cfg(feature = "uring-fs")]
 #[test]
 fn server_builds_with_fs_pool() {
-    // A server with `fs_files` set registers ONE shared fixed-file table of
-    // `pool_size + fs_files` slots, with auto-allocation confined to the
-    // connection pool `[0, pool_size)`. Constructing it exercises
-    // `register_pool_with_fs` on a real ring (the fs ops themselves land in
-    // later M4 steps); a plain echo still serves over the same ring.
+    // A server with `fs_ops` set drives an fs reactor on the same ring, its
+    // op table sized `fs_ops + pool_size`. Open files are plain raw fds, not
+    // registered-table slots, so the connection pool stays `pool_size`.
+    // Constructing it exercises that path on a real ring; a plain echo still
+    // serves over the same ring.
     let cfg = ServerConfig {
         pool_size: 16,
-        fs_files: 8,
+        fs_ops: 16,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -6939,7 +6940,7 @@ fn fs_static_file_server_open_read_reply() {
     };
     let cfg = ServerConfig {
         pool_size: 16,
-        fs_files: 8,
+        fs_ops: 16,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -7039,7 +7040,7 @@ fn fs_dir_listing_replies_through_the_wake_drain() {
     };
     let cfg = ServerConfig {
         pool_size: 16,
-        fs_files: 8,
+        fs_ops: 16,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -7149,7 +7150,7 @@ fn fs_conn_flistxattr_lists_file_xattrs() {
     };
     let cfg = ServerConfig {
         pool_size: 16,
-        fs_files: 8,
+        fs_ops: 16,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -7273,7 +7274,7 @@ fn fs_conn_fstatfs_agrees_from_file_and_anchor() {
     };
     let cfg = ServerConfig {
         pool_size: 16,
-        fs_files: 8,
+        fs_ops: 16,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -7420,7 +7421,7 @@ fn fs_conn_zfs_attrs_round_trip_through_the_pool() {
     };
     let cfg = ServerConfig {
         pool_size: 16,
-        fs_files: 8,
+        fs_ops: 16,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -7542,7 +7543,7 @@ fn fs_conn_offload_result_batches_statx_and_xattrs_in_one_job() {
     };
     let cfg = ServerConfig {
         pool_size: 16,
-        fs_files: 8,
+        fs_ops: 16,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -7699,7 +7700,7 @@ fn server_privileged_xattr_policy_reaches_the_embedded_reactor() {
     };
     let cfg = ServerConfig {
         pool_size: 16,
-        fs_files: 8,
+        fs_ops: 16,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -7827,7 +7828,7 @@ fn fs_file_carries_personality_and_as_root() {
     };
     let cfg = ServerConfig {
         pool_size: 8,
-        fs_files: 4,
+        fs_ops: 8,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -7977,7 +7978,7 @@ fn fs_metadata_ops_rename_truncate_xattr() {
     };
     let cfg = ServerConfig {
         pool_size: 8,
-        fs_files: 8,
+        fs_ops: 16,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -8041,10 +8042,9 @@ fn fs_metadata_ops_rename_truncate_xattr() {
 
 /// The connection-close owned-file sweep. A handler opens a file on every
 /// request and **never closes it** - a deliberate leak. Across many sequential
-/// connections (each opening one file, then dropping), the tiny fs pool would
-/// exhaust after `fs_files` opens if the files were not reclaimed; the sweep
-/// closes each connection's still-open files as it closes, so slots recycle and
-/// every open succeeds. (Mirrors `tcp_sequential_slot_reuse`: a small pool with
+/// connections (each opening one file, then dropping), the process would run
+/// out of descriptors if the files were not reclaimed; the sweep closes each
+/// connection's still-open files as it closes, so every open succeeds. (Mirrors `tcp_sequential_slot_reuse`: a small pool with
 /// slack absorbs the asynchronous close, so one-at-a-time connections never
 /// outrun the sweep.)
 #[cfg(feature = "uring-fs")]
@@ -8099,7 +8099,7 @@ fn fs_owned_files_swept_on_connection_close() {
     };
     let cfg = ServerConfig {
         pool_size: 8,
-        fs_files: 4, // far fewer than N: reuse across closes is mandatory
+        fs_ops: 8, // far fewer than N: reuse across closes is mandatory
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -8134,7 +8134,7 @@ fn fs_owned_files_swept_on_connection_close() {
         assert_eq!(
             r, b"opened",
             "connection {i} opened a file - the sweep must have freed the \
-             earlier connections' slots (else the pool exhausts at fs_files)"
+             earlier connections' descriptors (else the process runs out)"
         );
     }
 }
@@ -8143,7 +8143,7 @@ fn fs_owned_files_swept_on_connection_close() {
 /// makes the owned-file sweep total: `close_conn` records a closing connection
 /// exactly once, so a file minted by a continuation - which can run after its
 /// connection was already swept - would hold its pool slot until server
-/// teardown, and a peer aborting mid-chain could exhaust `fs_files` for
+/// teardown, and a peer aborting mid-chain could leak descriptors for
 /// everyone.
 ///
 /// The handler opens a file and, from the completion, tries to open a *second*
@@ -8151,7 +8151,7 @@ fn fs_owned_files_swept_on_connection_close() {
 /// refused, dropping the callback and with it the `Deferred`, so the connection
 /// closes unanswered: the client must see EOF, never `chained`. Flip either
 /// `FsConn::new` call site to `root: true` and the reply appears instead.
-/// Looping well past `fs_files` keeps the sweep honest at the same time - every
+/// Looping well past the pool keeps the sweep honest at the same time - every
 /// connection leaves its first file open.
 #[cfg(feature = "uring-fs")]
 #[test]
@@ -8211,7 +8211,7 @@ fn fs_continuation_cannot_open_a_new_file() {
     };
     let cfg = ServerConfig {
         pool_size: 8,
-        fs_files: 2, // < N: the sweep must recycle between connections
+        fs_ops: 4, // < N: the sweep must recycle between connections
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -8378,7 +8378,7 @@ fn fs_broker_personality_gates_open() {
     };
     let cfg = ServerConfig {
         pool_size: 8,
-        fs_files: 8,
+        fs_ops: 16,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -8558,7 +8558,7 @@ fn fs_as_root_reads_trusted_xattr_across_privilege() {
     };
     let cfg = ServerConfig {
         pool_size: 8,
-        fs_files: 8,
+        fs_ops: 16,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -8689,7 +8689,7 @@ fn fs_fd_reclaimed_on_connection_close_midchain() {
     };
     let cfg = ServerConfig {
         pool_size: 8,
-        fs_files: 4,
+        fs_ops: 8,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());

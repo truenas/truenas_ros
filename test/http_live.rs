@@ -883,7 +883,7 @@ type FsHandler<U> = Box<
 >;
 
 /// [`with_http_server`]'s sibling for `protocol_fs`: an fs pool
-/// (`fs_files: 8`) on the server ring, the caller's per-connection state
+/// (`fs_ops: 16`) on the server ring, the caller's per-connection state
 /// and handler, and the server's own personality registered into `pers`
 /// before serving. `None` means io_uring is unavailable (a skip).
 #[cfg(feature = "uring-fs")]
@@ -910,7 +910,7 @@ where
     .expect("codec config is valid");
     let cfg = ServerConfig {
         pool_size: 16,
-        fs_files: 8,
+        fs_ops: 16,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -1521,7 +1521,7 @@ fn ktls_file_body_streams_intact() {
     let acceptor = Arc::new(ktls_acceptor(&cert, &key));
     let cfg = ServerConfig {
         pool_size: 16,
-        fs_files: 8,
+        fs_ops: 16,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());

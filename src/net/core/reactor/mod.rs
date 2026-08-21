@@ -93,7 +93,7 @@ pub(crate) struct Reactor<U> {
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) fs_closed: Vec<(u32, u64)>,
     /// Whether this reactor actually has an fs pool to sweep. Only a server
-    /// built with `fs_files > 0` sets it; a client (which drains nothing) and a
+    /// built with `fs_ops > 0` sets it; a client (which drains nothing) and a
     /// pool-less server leave it false, so `close_conn` never records into
     /// `fs_closed` for them - otherwise a client would grow that Vec unbounded.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
