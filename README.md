@@ -47,11 +47,15 @@ not a server; combined with `uring-fs`, its handler may also be handed the
 reactor's per-request fs facade via `protocol_fs`, so an HTTP service serves
 from the server's own ring), and `uring-fs` (a filesystem reactor whose every
 operation runs under a kernel-enforced identity). All sit on the internal
-`uring` engine feature; see the crate docs. `secrets` is separate:
-`memfd_secret(2)`-backed protected memory for long-lived in-process secrets,
-off swap and absent from core dumps, wanted only by a daemon that holds any.
+`uring` engine feature; see the crate docs. Two more stand alone, both for
+a daemon's `main`: `secrets` is `memfd_secret(2)`-backed protected memory
+for long-lived in-process secrets, off swap and absent from core dumps; and
+`signal` blocks the signals a daemon acts on before any thread exists and
+receives them as values on one thread (`sigwaitinfo`, or a `signalfd` for a
+poll loop), so no handler is ever installed and the reactors never see one.
 
-`full` is the default set plus the net roles, `http`, and `secrets`. It never
+`full` is the default set plus the net roles, `http`, `secrets`, and
+`signal`. It never
 includes `uring-fs`, which needs a credential broker forked before the daemon
 starts threads and so has to be chosen deliberately.
 

@@ -298,7 +298,10 @@
 //!   and from the kernel's own task-work notifications - is simply retried.
 //!   Consumers integrate signals the standard daemon way: block them
 //!   process-wide, `sigwait` on a dedicated thread, and call
-//!   [`ShutdownHandle::shutdown`] (an eventfd poke).
+//!   [`ShutdownHandle::shutdown`] (an eventfd poke). The `signal` feature
+//!   packages exactly that - `signal::block` on the main thread before any
+//!   thread exists, then `Blocked::wait` or a `SignalFd` on the one thread
+//!   that receives - and still installs no handler anywhere.
 //!
 //! # Safety model
 //!

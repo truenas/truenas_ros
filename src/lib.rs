@@ -87,6 +87,9 @@ pub mod audit;
 #[cfg(feature = "secrets")]
 pub mod secrets;
 
+#[cfg(feature = "signal")]
+pub mod signal;
+
 #[cfg(feature = "uring")]
 mod uring;
 

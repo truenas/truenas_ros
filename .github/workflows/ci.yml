@@ -165,8 +165,8 @@ jobs:
       run: |
         cargo clippy --no-default-features -- -D warnings
         for f in sync-fs xattr mount acl fhandle fsiter idmap shutil \
-                 configfile audit secrets uring net-server net-client \
-                 uring-fs http __fuzz; do
+                 configfile audit secrets signal uring net-server \
+                 net-client uring-fs http __fuzz; do
           echo "::group::clippy --features $f"
           cargo clippy --no-default-features --features "$f" -- -D warnings
           echo "::endgroup::"
