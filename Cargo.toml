@@ -101,7 +101,7 @@ http = ["net-server", "dep:httparse"]
 # credential broker forked before the daemon starts threads, so it is opt-in
 # rather than something `full` turns on underneath a consumer. Depends on
 # `sync-fs` for the shared OpenHow/ResolveFlag vocabulary; combine with
-# `net-server` for the in-server reactor (`ServerConfig::fs_files`).
+# `net-server` for the in-server reactor (`ServerConfig::fs_ops`).
 uring-fs = ["uring", "sync-fs", "xattr"]
 # Internal: exposes pure decode/framing entry points to the fuzz crate
 # (`fuzz/`) — the net stack's `frame_step`, the `http` codec's

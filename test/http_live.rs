@@ -888,6 +888,37 @@ type FsHandler<U> = Box<
 /// before serving. `None` means io_uring is unavailable (a skip).
 #[cfg(feature = "uring-fs")]
 fn with_http_fs_server<U, T>(
+    state: impl FnMut() -> U + 'static,
+    handler: FsHandler<U>,
+    pers: std::sync::Arc<
+        std::sync::OnceLock<truenas_ros::uring_fs::Personality>,
+    >,
+    client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
+) -> Option<T>
+where
+    U: 'static,
+    T: Send + 'static,
+{
+    use truenas_ros::net::server::ServerConfig;
+
+    with_http_fs_server_cfg(
+        ServerConfig {
+            pool_size: 16,
+            fs_ops: 16,
+            ..ServerConfig::default()
+        },
+        state,
+        handler,
+        pers,
+        client,
+    )
+}
+
+/// [`with_http_fs_server`] with the server's tuning spelled out - for the
+/// tests whose subject IS a bound (an op table small enough to run out).
+#[cfg(feature = "uring-fs")]
+fn with_http_fs_server_cfg<U, T>(
+    cfg: truenas_ros::net::server::ServerConfig,
     mut state: impl FnMut() -> U + 'static,
     handler: FsHandler<U>,
     pers: std::sync::Arc<
@@ -900,7 +931,6 @@ where
     T: Send + 'static,
 {
     use truenas_ros::http::protocol_fs;
-    use truenas_ros::net::server::ServerConfig;
 
     let proto = protocol_fs(
         HttpConfig::default(),
@@ -908,11 +938,6 @@ where
         handler,
     )
     .expect("codec config is valid");
-    let cfg = ServerConfig {
-        pool_size: 16,
-        fs_ops: 16,
-        ..ServerConfig::default()
-    };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let mut server = match Server::with_config([addr], cfg, proto) {
         Ok(s) => s,
@@ -1279,6 +1304,389 @@ fn http_file_body_serves_a_range_from_a_stashed_handle() {
             assert_eq!(status, 200);
             assert!(head.contains("Content-Length: 1000\r\n"), "{head}");
             assert_eq!(body, content[100..1100], "the requested range");
+            Ok(())
+        },
+    ) else {
+        return; // io_uring unavailable
+    };
+}
+
+/// A range whose start the caller's arithmetic wrapped is refused before it
+/// reaches the ring, and refusing sheds that one connection rather than the
+/// server.
+///
+/// `u64::MAX` is `-1`, io_uring's "use the file's own position" sentinel: for a
+/// regular file `io_kiocb_update_pos` (linux `io_uring/rw.c:484-490`) would
+/// read `f_pos` in place of the offset asked for and `rw.c:670-671` would write
+/// the new position back, so the read would SUCCEED from the wrong place and
+/// move a position shared with every other holder of the descriptor - behind a
+/// `Content-Length` already on the wire. A start past `i64::MAX` that is not
+/// the sentinel fails much later, in `rw_verify_area`, which is also after the
+/// head has committed. `bytes=-N` past the object size is how either arrives:
+/// computing the start as `size - N` wraps in `u64` rather than clamping.
+///
+/// The last assertion is the one that matters: a *later* connection is served.
+/// A closed connection alone cannot tell a clean shed from the reactor thread
+/// dying on the overflow, which is what an unguarded advance does in debug.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn http_file_body_refuses_a_wrapped_range() {
+    use std::io::Read as _;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use truenas_ros::http::HttpVerdict;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, File, Personality};
+
+    const SIZE: usize = 4096;
+    let dir = truenas_ros::tempdir().unwrap();
+    let content = patterned(SIZE);
+    std::fs::write(dir.path().join("obj"), &content).unwrap();
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let stash: Arc<Mutex<Vec<File>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let pc = Arc::clone(&pers);
+    let st = Arc::clone(&stash);
+    let handler: FsHandler<()> = Box::new(move |req, _state, fs| {
+        // Each target answers inline from a handle the previous `/open`
+        // stashed, so the range reaches `begin_file_reply` with nothing else
+        // in flight.
+        let range = match req.target {
+            // `size - N` for a suffix range one byte past the object.
+            "/sentinel" => Some((u64::MAX, 8)),
+            // Not the sentinel, but the sum still walks past `i64::MAX`.
+            "/sum" => Some((i64::MAX as u64, 8)),
+            "/ok" => Some((0, SIZE as u64)),
+            _ => None,
+        };
+        if let Some((offset, len)) = range {
+            let file = st.lock().unwrap().pop().expect("stashed by /open");
+            return HttpVerdict::Respond(
+                HttpResponse::new(200).file_body(file, offset, len),
+            );
+        }
+        let Some(mut fs) = fs else {
+            return HttpVerdict::Respond(HttpResponse::new(500));
+        };
+        let (deferred, permit) = req.defer();
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let how = OpenHow::new().flags(OFlag::O_RDONLY);
+        let st = Arc::clone(&st);
+        fs.open(who, &anchor, c"obj", how, move |done, _fs| {
+            match done.file() {
+                Some(file) => {
+                    st.lock().unwrap().push(file);
+                    deferred.reply(HttpResponse::new(200).body("opened"));
+                }
+                None => deferred.close(),
+            }
+        });
+        HttpVerdict::Defer(permit)
+    });
+
+    let Some(()) = with_http_fs_server(
+        || (),
+        handler,
+        pers,
+        move |v4| {
+            // Each refusal gets its own connection: the shed is the point.
+            for target in ["/sentinel", "/sum"] {
+                let mut s = connect_tcp(v4)?;
+                s.set_read_timeout(Some(Duration::from_secs(10)))?;
+                s.write_all(b"GET /open HTTP/1.1\r\nHost: t\r\n\r\n")?;
+                let (status, _head, body) = read_response(&mut s)?;
+                assert_eq!((status, &body[..]), (200, &b"opened"[..]));
+
+                let req = format!("GET {target} HTTP/1.1\r\nHost: t\r\n\r\n");
+                s.write_all(req.as_bytes())?;
+                let mut got = Vec::new();
+                s.read_to_end(&mut got)?;
+                assert!(
+                    got.is_empty(),
+                    "{target} must be refused before the head commits, \
+                     got {} bytes",
+                    got.len()
+                );
+            }
+
+            // The server is still there, and the reply path still streams.
+            let mut s = connect_tcp(v4)?;
+            s.set_read_timeout(Some(Duration::from_secs(10)))?;
+            s.write_all(b"GET /open HTTP/1.1\r\nHost: t\r\n\r\n")?;
+            let (status, _head, body) = read_response(&mut s)?;
+            assert_eq!((status, &body[..]), (200, &b"opened"[..]));
+            s.write_all(b"GET /ok HTTP/1.1\r\nHost: t\r\n\r\n")?;
+            let (status, head, body) = read_response(&mut s)?;
+            assert_eq!(status, 200);
+            assert!(
+                head.contains(&format!("Content-Length: {SIZE}\r\n")),
+                "{head}"
+            );
+            assert_eq!(body, content, "a sound range still serves");
+            Ok(())
+        },
+    ) else {
+        return; // io_uring unavailable
+    };
+}
+
+/// A body read that finds the op table full WAITS for a slot instead of
+/// severing the transfer.
+///
+/// The table is `fs_ops + pool_size`, one free list shared by handler ops and
+/// the reply path's body reads, and nothing reserves either side's share. A
+/// missing chunk buffer waits for a flush to recycle one, so a missing op slot
+/// waits too: the same class of transient shortage must not get opposite
+/// verdicts, one of them fatal to a multi-GB download mid-stream.
+///
+/// Both slots are pinned here by reads on a FIFO that cannot complete until
+/// the client writes to it, which is what a handler fan-out looks like from
+/// the reply path. The object must still arrive whole.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn http_file_body_waits_for_an_op_slot() {
+    use std::io::Write as _;
+    use std::sync::mpsc;
+    use std::sync::{Arc, OnceLock};
+    use truenas_ros::http::HttpVerdict;
+    use truenas_ros::net::server::ServerConfig;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality, RwFlags};
+
+    const SIZE: usize = 300_000; // more than one 256 KiB chunk
+    let dir = truenas_ros::tempdir().unwrap();
+    let content = patterned(SIZE);
+    std::fs::write(dir.path().join("obj"), &content).unwrap();
+    let fifo = dir.path().join("fifo");
+    let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+        .expect("path has no NUL");
+    // SAFETY: a fresh path in a private tempdir; 0o600 is the mode.
+    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0, "mkfifo");
+
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    // The handler says when the reply has been handed over, so the client
+    // releases the pinned reads only after the body has had its chance to
+    // park - not before, which would leave the wait unexercised.
+    let (armed_tx, armed_rx) = mpsc::channel::<()>();
+
+    let pc = Arc::clone(&pers);
+    let handler: FsHandler<()> = Box::new(move |req, _state, fs| {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let Some(mut fs) = fs else {
+            return HttpVerdict::Respond(HttpResponse::new(500));
+        };
+        let (deferred, permit) = req.defer();
+        let who = *pc.get().expect("personality set before serving");
+        let armed = armed_tx.clone();
+        // Both opens are issued HERE: a continuation's facade cannot open
+        // (`root: false`), so the second handle cannot be fetched from the
+        // first's callback. Whichever completes second does the work.
+        type Held = (
+            Option<truenas_ros::uring_fs::File>,
+            Option<truenas_ros::uring_fs::File>,
+            Option<truenas_ros::http::HttpDeferred>,
+        );
+        let held: Rc<RefCell<Held>> =
+            Rc::new(RefCell::new((None, None, Some(deferred))));
+        // O_RDWR so the open does not wait for a writer and the reads below
+        // never see EOF.
+        let fifo_how = OpenHow::new().flags(OFlag::O_RDWR);
+        let obj_how = OpenHow::new().flags(OFlag::O_RDONLY);
+
+        // A free `fn`, not a closure: it is called from two `'static`
+        // continuations and captures nothing.
+        fn finish(
+            fs: &mut truenas_ros::uring_fs::FsConn<'_>,
+            who: Personality,
+            held: &Rc<RefCell<Held>>,
+            armed: &mpsc::Sender<()>,
+        ) {
+            let mut h = held.borrow_mut();
+            let (pipe, obj, deferred) = &mut *h;
+            let (Some(pipe), Some(obj)) = (pipe.as_ref(), obj.take()) else {
+                return; // the other open has not landed yet
+            };
+            // Take every op slot the table has (`fs_ops + pool_size` = 2).
+            // `u64::MAX` because a pipe refuses a real offset (ESPIPE) and
+            // takes the file-position sentinel instead.
+            for _ in 0..2 {
+                fs.preadv2(
+                    who,
+                    pipe.clone(),
+                    vec![Vec::with_capacity(8)],
+                    u64::MAX,
+                    RwFlags::empty(),
+                    |_done, _fs| {},
+                );
+            }
+            deferred
+                .take()
+                .expect("one finisher")
+                .reply(HttpResponse::new(200).file_body(obj, 0, SIZE as u64));
+            let _ = armed.send(());
+        }
+
+        let (h1, a1) = (Rc::clone(&held), armed.clone());
+        fs.open(who, &anchor, c"fifo", fifo_how, move |done, fs| {
+            h1.borrow_mut().0 = Some(done.file().expect("fifo opens"));
+            finish(fs, who, &h1, &a1);
+        });
+        let (h2, a2) = (Rc::clone(&held), armed);
+        fs.open(who, &anchor, c"obj", obj_how, move |done, fs| {
+            h2.borrow_mut().1 = Some(done.file().expect("obj opens"));
+            finish(fs, who, &h2, &a2);
+        });
+        HttpVerdict::Defer(permit)
+    });
+
+    let Some(()) = with_http_fs_server_cfg(
+        ServerConfig {
+            pool_size: 1,
+            fs_ops: 1,
+            ..ServerConfig::default()
+        },
+        || (),
+        handler,
+        pers,
+        move |v4| {
+            let mut s = connect_tcp(v4)?;
+            s.set_read_timeout(Some(Duration::from_secs(20)))?;
+            s.write_all(b"GET /obj HTTP/1.1\r\nHost: t\r\n\r\n")?;
+            // Wait for the reply to be handed over, then release the pinned
+            // reads: their completions are what re-drive the parked body.
+            armed_rx.recv().expect("handler armed the table");
+            let mut w = std::fs::OpenOptions::new().write(true).open(&fifo)?;
+            w.write_all(b"go")?;
+            drop(w);
+
+            let (status, head, body) = read_response(&mut s)?;
+            assert_eq!(status, 200);
+            assert!(
+                head.contains(&format!("Content-Length: {SIZE}\r\n")),
+                "{head}"
+            );
+            assert_eq!(body, content, "the whole object, after waiting");
+            Ok(())
+        },
+    ) else {
+        return; // io_uring unavailable
+    };
+}
+
+/// Pipelined file bodies are served, in order, all of them.
+///
+/// One tail at a time is structural - two bodies' chunks would interleave on
+/// the wire - but shedding the connection to enforce that destroys the FIRST
+/// response, which is already committed: the client gets nothing, not even
+/// body one. Every other PDU in this position queues behind the tail, and so
+/// does a file body.
+///
+/// Answered INLINE from handles a preamble stashed, not through `defer`:
+/// pipelining lets replies complete out of request order (`net::server`, the
+/// Pipelining section), which HTTP/1.1 forbids, so a deferred reply at
+/// `max_in_flight_requests > 1` is a consumer-protocol mismatch rather than
+/// anything to do with the tail.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn http_pipelined_file_bodies_queue_instead_of_killing_the_connection() {
+    use std::sync::{Arc, Mutex, OnceLock};
+    use truenas_ros::http::HttpVerdict;
+    use truenas_ros::net::server::ServerConfig;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, File, Personality};
+
+    const SIZE: usize = 300_000; // more than one 256 KiB chunk
+    const REQUESTS: usize = 3;
+    let dir = truenas_ros::tempdir().unwrap();
+    let content = patterned(SIZE);
+    std::fs::write(dir.path().join("obj"), &content).unwrap();
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let stash: Arc<Mutex<Vec<File>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let pc = Arc::clone(&pers);
+    let st = Arc::clone(&stash);
+    let handler: FsHandler<()> = Box::new(move |req, _state, fs| {
+        if req.target == "/obj" {
+            let file = st.lock().unwrap().pop().expect("stashed by /open");
+            return HttpVerdict::Respond(HttpResponse::new(200).file_body(
+                file,
+                0,
+                SIZE as u64,
+            ));
+        }
+        let Some(mut fs) = fs else {
+            return HttpVerdict::Respond(HttpResponse::new(500));
+        };
+        let (deferred, permit) = req.defer();
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let how = OpenHow::new().flags(OFlag::O_RDONLY);
+        let st = Arc::clone(&st);
+        fs.open(who, &anchor, c"obj", how, move |done, _fs| {
+            match done.file() {
+                Some(file) => {
+                    st.lock().unwrap().push(file);
+                    deferred.reply(HttpResponse::new(200).body("opened"));
+                }
+                None => deferred.close(),
+            }
+        });
+        HttpVerdict::Defer(permit)
+    });
+
+    let Some(()) = with_http_fs_server_cfg(
+        ServerConfig {
+            pool_size: 16,
+            fs_ops: 16,
+            // The whole point: read-ahead deep enough that request two is
+            // delivered while request one's body is still streaming.
+            max_in_flight_requests: 2,
+            ..ServerConfig::default()
+        },
+        || (),
+        handler,
+        pers,
+        move |v4| {
+            let mut s = connect_tcp(v4)?;
+            s.set_read_timeout(Some(Duration::from_secs(20)))?;
+            // One handle per pipelined GET, stashed one request at a time.
+            for _ in 0..REQUESTS {
+                s.write_all(b"GET /open HTTP/1.1\r\nHost: t\r\n\r\n")?;
+                let (status, _head, body) = read_response(&mut s)?;
+                assert_eq!((status, &body[..]), (200, &b"opened"[..]));
+            }
+            // All of them in one write, so they are genuinely pipelined.
+            let mut reqs = Vec::new();
+            for _ in 0..REQUESTS {
+                reqs.extend_from_slice(b"GET /obj HTTP/1.1\r\nHost: t\r\n\r\n");
+            }
+            s.write_all(&reqs)?;
+            for i in 0..REQUESTS {
+                let (status, head, body) = read_response(&mut s)?;
+                assert_eq!(status, 200, "response {i}");
+                assert!(
+                    head.contains(&format!("Content-Length: {SIZE}\r\n")),
+                    "response {i}: {head}"
+                );
+                assert_eq!(body, content, "response {i} body");
+            }
             Ok(())
         },
     ) else {

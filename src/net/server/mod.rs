@@ -572,6 +572,12 @@ pub struct Server<U, AcceptFn, HeaderFn, BodyFn> {
     listeners: Vec<Listener>,
     // Cross-thread work, delivered by a wake poke and drained in `on_wake`.
     mailbox: Mailbox<U>,
+    // Connections whose next body read is waiting on a free fs op slot, in
+    // arrival order. A completing fs op frees exactly one slot and re-drives
+    // exactly one of these; a stale entry (the connection closed, or its slot
+    // was recycled) is discarded on the way past.
+    #[cfg(feature = "uring-fs")]
+    parked_tails: std::collections::VecDeque<(u32, u64)>,
     // Server-only tuning: the pool/listen/socket knobs the engine does not read
     // (the engine-read subset is projected into `core.cfg`).
     cfg: ServerConfig,
@@ -805,6 +811,8 @@ where
         Ok(Server {
             #[cfg(feature = "uring-fs")]
             fs,
+            #[cfg(feature = "uring-fs")]
+            parked_tails: std::collections::VecDeque::new(),
             core,
             handlers: Handlers {
                 accept: protocol.accept,
@@ -939,7 +947,19 @@ where
             };
             let (tag, fslot, fgen) =
                 crate::uring::user_data::unpack_raw(cqe.user_data);
-            match fs.on_cqe(&mut self.core.engine, tag, fslot, fgen, cqe.res) {
+            let reaped =
+                fs.on_cqe(&mut self.core.engine, tag, fslot, fgen, cqe.res);
+            // `on_cqe` has returned this op's slot to the table. Offer it to
+            // the connection that has been waiting longest for one BEFORE this
+            // completion's own continuation can take it back, or a connection
+            // streaming a large body would recycle the same slot indefinitely
+            // while a parked one never advanced. Handler ops cannot be starved
+            // by this: a tail keeps at most one read in flight
+            // (`FileTail::reading`) and there are at most `pool_size`
+            // connections, so a table of `fs_ops + pool_size` always leaves
+            // `fs_ops` slots for them.
+            self.redrive_parked_tail()?;
+            match reaped {
                 // A reply-path pump read: routed here rather than through a
                 // callback, so the tail advances with the whole loop in hand.
                 ReapedFs::Pump(done, owner) => {

@@ -162,7 +162,30 @@ struct SendItem {
 /// deepens the bounded worker class's queue - the chunk *size* is the knob
 /// (`fs_body_chunk`), not the count.
 #[cfg(all(feature = "net-server", feature = "uring-fs"))]
-const FILE_TAIL_BUFS: u8 = 2;
+pub(crate) const FILE_TAIL_BUFS: u8 = 2;
+
+/// A `Response::ReplyFile` that arrived while another body was still
+/// streaming, held until that one retires. One body at a time is structural -
+/// two tails' chunks would interleave on the wire - so a second one queues
+/// behind the current body, through the same diversion every other PDU uses.
+#[cfg(all(feature = "net-server", feature = "uring-fs"))]
+pub(crate) struct PendingFile {
+    pub(crate) head: Vec<u8>,
+    pub(crate) file: crate::uring_fs::File,
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+    pub(crate) close: bool,
+}
+
+/// One entry in a tail's diversion, in arrival order: bytes already framed, or
+/// a file body still to be installed. Both kinds have to share one list -
+/// splitting them would let a reply queued after a deferred body reach the
+/// wire before it, which for a pipelined peer is a response out of order.
+#[cfg(all(feature = "net-server", feature = "uring-fs"))]
+enum PendingItem {
+    Pdu(SendItem),
+    File(PendingFile),
+}
 
 /// A file-sourced response body mid-stream (`Response::ReplyFile`): the
 /// reply path reads `unread` more bytes from `file` in bounded chunks, each
@@ -195,8 +218,14 @@ pub(crate) struct FileTail {
     spare: Vec<Vec<u8>>,
     /// Buffers minted so far, capped at [`FILE_TAIL_BUFS`].
     created: u8,
-    /// PDUs diverted while this tail is active (see the struct docs).
-    pending: Vec<SendItem>,
+    /// PDUs and deferred file bodies diverted while this tail is active, in
+    /// arrival order (see the struct docs).
+    pending: Vec<PendingItem>,
+    /// The next read is waiting on an fs op slot rather than in flight. The
+    /// reply path records the connection in its parked list and re-drives it
+    /// when a slot frees; the flag keeps one connection from being recorded
+    /// twice (`drive_file_tail` is called from three places).
+    pub(crate) parked: bool,
 }
 
 /// A connection's receive transport, installed at setup (mirrors the kernel's
@@ -407,6 +436,13 @@ pub(crate) struct Connection<U> {
     // so its `tail_active()` is constantly false there.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) file_tail: Option<FileTail>,
+    // The file body the retiring tail handed on, and whatever was queued
+    // behind it - both consumed by the reply path's install, which is where a
+    // read can actually be issued.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    next_file: Option<PendingFile>,
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    next_file_pending: Vec<PendingItem>,
     pub outstanding: u32, // delivered-but-not-yet-fully-sent requests (read-ahead cap)
     pub ops: u32, // in-flight recv+send+close ops; free the slot only at 0
     next_req_id: u64, // per-connection request id, assigned as requests deliver
@@ -486,6 +522,10 @@ impl<U> Connection<U> {
             teardown_shutdown_first: false,
             #[cfg(all(feature = "net-server", feature = "uring-fs"))]
             file_tail: None,
+            #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+            next_file: None,
+            #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+            next_file_pending: Vec::new(),
             outstanding: 0,
             ops: 0,
             next_req_id: 0,
@@ -857,7 +897,7 @@ impl<U> Connection<U> {
         // last chunk is queued.
         #[cfg(all(feature = "net-server", feature = "uring-fs"))]
         if let Some(tail) = self.file_tail.as_mut() {
-            tail.pending.push(item);
+            tail.pending.push(PendingItem::Pdu(item));
             return;
         }
         self.send_queue.push_back(item);
@@ -882,7 +922,10 @@ impl<U> Connection<U> {
             reading: false,
             spare: Vec::new(),
             created: 0,
-            pending: Vec::new(),
+            // Anything that arrived behind this body while it waited its
+            // turn stays behind it.
+            pending: std::mem::take(&mut self.next_file_pending),
+            parked: false,
         });
     }
 
@@ -946,12 +989,90 @@ impl<U> Connection<U> {
         });
     }
 
-    /// Retire the tail (its last chunk is queued) and release the PDUs the
-    /// diversion held, in arrival order, behind it.
+    /// Advance the tail past a completed body read and queue its bytes as the
+    /// next chunk; `true` when that was the last of the declared length, which
+    /// also retires the tail and releases the diversion.
+    ///
+    /// The advance is `buf.len()` and nothing else - the count the read
+    /// ACTUALLY returned, which is why the requested length is not a parameter
+    /// here. A short read must leave the rest for the next iteration and
+    /// continue from the offset it reached; advancing by the length asked for
+    /// would skip the unread bytes and send whatever the next read landed on in
+    /// their place, a body correct in its framing and wrong in its content.
+    /// That is the failure the deliberate absence of `IOSQE_IO_LINK` on the
+    /// read exists to prevent, and short reads are ordinary on ZFS, where every
+    /// ring read is punted to an io-wq worker.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn advance_file_tail(&mut self, buf: Vec<u8>) -> bool {
+        let n = buf.len() as u64;
+        let last = {
+            let tail = self.file_tail.as_mut().expect("a tail is streaming");
+            // `n <= iov_len = min(chunk, unread)`, so this never underflows,
+            // and the advance never passes `offset + len` - which
+            // `begin_file_reply` bounded at `i64::MAX` before the first read.
+            tail.next_offset += n;
+            tail.unread -= n;
+            tail.unread == 0
+        };
+        self.enqueue_file_chunk(buf, last);
+        if last {
+            self.finish_file_tail();
+        }
+        last
+    }
+
+    /// Retire the tail (its last chunk is queued) and release what the
+    /// diversion held behind it, in arrival order - up to the first deferred
+    /// file body, which cannot simply be queued: it has to be installed as the
+    /// next tail, and only the reply path can issue its read. That one is left
+    /// in [`take_queued_file_reply`](Self::take_queued_file_reply), and
+    /// anything behind it waits for it, so responses keep request order.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) fn finish_file_tail(&mut self) {
-        if let Some(tail) = self.file_tail.take() {
-            self.send_queue.extend(tail.pending);
+        let Some(tail) = self.file_tail.take() else {
+            return;
+        };
+        let mut rest = tail.pending.into_iter();
+        for item in rest.by_ref() {
+            match item {
+                PendingItem::Pdu(pdu) => self.send_queue.push_back(pdu),
+                PendingItem::File(next) => {
+                    self.next_file = Some(next);
+                    break;
+                }
+            }
+        }
+        self.next_file_pending = rest.collect();
+    }
+
+    /// Hold a `ReplyFile` that arrived while a body was already streaming.
+    /// The caller has counted it in `outstanding` - it is an answered request
+    /// either way, and the read-ahead cap must see it.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn defer_file_reply(&mut self, next: PendingFile) {
+        self.file_tail
+            .as_mut()
+            .expect("only deferred behind an active tail")
+            .pending
+            .push(PendingItem::File(next));
+    }
+
+    /// The file body the last tail handed on, if any - installed by the reply
+    /// path, which is the only place a read can be issued.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn take_queued_file_reply(&mut self) -> Option<PendingFile> {
+        self.next_file.take()
+    }
+
+    /// Release a deferred file body's followers without installing it - the
+    /// connection is closing, so nothing more will be read or sent.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn drop_queued_file_reply(&mut self) {
+        self.next_file = None;
+        for item in std::mem::take(&mut self.next_file_pending) {
+            if let PendingItem::Pdu(pdu) = item {
+                self.send_queue.push_back(pdu);
+            }
         }
     }
 
@@ -1408,6 +1529,35 @@ mod tests {
         );
         assert_eq!(c.queued_bytes(), 0);
         assert!(!c.has_pending_send());
+    }
+
+    /// A short read continues from the offset it REACHED. The declared length
+    /// is a promise about the body's size, not about how many bytes any one
+    /// read returns, so the tail's cursor tracks the count actually delivered.
+    /// Advance by the length asked for instead and the unread bytes are
+    /// skipped, with the next read's bytes framed in their place.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    #[test]
+    fn a_short_read_continues_from_the_offset_it_reached() {
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        let fd: std::os::fd::OwnedFd =
+            std::fs::File::open("/dev/null").expect("open").into();
+        let file = crate::uring_fs::File::new(crate::sync::Arc::new(fd));
+        // A range of 300 bytes starting 1000 in.
+        c.install_file_tail(file, 1000, 300);
+
+        // 200 bytes came back where a whole chunk was asked for.
+        assert!(!c.advance_file_tail(vec![b'a'; 200]), "100 still owed");
+        {
+            let t = c.file_tail.as_ref().expect("still streaming");
+            assert_eq!(t.next_offset, 1200, "advanced by the count read");
+            assert_eq!(t.unread, 100, "the rest is still owed");
+        }
+
+        // The remainder retires the tail exactly once.
+        assert!(c.advance_file_tail(vec![b'b'; 100]), "the declared length");
+        assert!(!c.tail_active(), "the last chunk retires the tail");
+        assert_eq!(c.queued_bytes(), 300, "both chunks queued, nothing else");
     }
 
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]

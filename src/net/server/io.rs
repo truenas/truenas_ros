@@ -9,6 +9,8 @@ use super::Server;
 use super::handles::{Detached, Responder};
 use crate::errno::{self, Errno};
 use crate::fd::owned_from_raw;
+#[cfg(feature = "uring-fs")]
+use crate::net::core::conn::PendingFile;
 use crate::net::core::conn::{Op, pack};
 use crate::net::core::handles::{Token, stat};
 use crate::net::core::protocol::{CloseReason, Framing};
@@ -435,9 +437,16 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     }
 
     /// Enact [`Response::ReplyFile`]: queue the head, install the tail, and
-    /// issue the first read. Refusals are loud - a close, never a short
-    /// body: no fs pool to read on, or a body already streaming (a second
-    /// tail's chunks would interleave with the first's on the wire).
+    /// issue the first read. Refusals are loud - a close, never a short body:
+    /// no fs pool to read on, or a range whose arithmetic wrapped.
+    ///
+    /// A body already streaming is NOT a refusal, and must not become one.
+    /// One tail at a time is structural (two tails' chunks would interleave on
+    /// the wire), but by the time a second arrives the first response is
+    /// committed - its head and `Content-Length` are on the wire - so shedding
+    /// the connection destroys that one too, and it is the one that did
+    /// nothing wrong. The second queues behind the current body through the
+    /// same diversion every other PDU uses, and installs when it retires.
     #[cfg(feature = "uring-fs")]
     #[allow(clippy::too_many_arguments)] // a Response variant unpacked
     pub(super) fn begin_file_reply(
@@ -455,13 +464,6 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
                 slot,
                 generation,
                 CloseReason::FileBody(Errno::EOPNOTSUPP),
-            );
-        }
-        if self.core.table.conn(slot).tail_active() {
-            return self.core.close_conn(
-                slot,
-                generation,
-                CloseReason::FileBody(Errno::EBUSY),
             );
         }
         // Nothing to stream: the head is the whole reply (mirrors the
@@ -487,13 +489,77 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
                 Ok(())
             };
         }
+        // Every offset this tail submits lands in `sqe.off_addr2`, which the
+        // kernel reads as a signed `loff_t`, so the range has to be bounded
+        // here - the one place an untrusted one enters. `u64::MAX` is `-1`,
+        // io_uring's "use the file's own position" sentinel: for a regular
+        // file `io_kiocb_update_pos` (linux `io_uring/rw.c:484-490`) would set
+        // `REQ_F_CUR_POS`, read `f_pos` in place of the offset asked for, and
+        // `rw.c:670-671` would write the new position back - a read that
+        // SUCCEEDS from the wrong place, mutating a position shared with every
+        // other holder of the descriptor, behind a correctly framed
+        // `Content-Length`. ZFS sets neither `FMODE_STREAM` nor
+        // `FMODE_UNSIGNED_OFFSET`, so neither kernel escape applies. Anything
+        // else past `i64::MAX` is refused by `rw_verify_area`
+        // (`fs/read_write.c:463`) - after the head has committed.
+        //
+        // A suffix range is how a wrapped value arrives: `bytes=-N` past the
+        // object size is legal, and computing the start as `size - N` wraps in
+        // `u64` rather than clamping at zero. The SUM is bounded, not just the
+        // start, because `next_offset` walks to `offset + len` - which is also
+        // what keeps the advance in `on_pump_read` from wrapping.
+        //
+        // The check belongs here and not in the submit path: down there
+        // `u64::MAX` is the correct idiom for a stream file with no position,
+        // which `cancel_owned_by_reaches_a_pump_read` reads a pipe with.
+        if offset
+            .checked_add(len)
+            .is_none_or(|end| end > i64::MAX as u64)
+        {
+            return self.core.close_conn(
+                slot,
+                generation,
+                CloseReason::FileBody(Errno::EINVAL),
+            );
+        }
+        let next = PendingFile {
+            head,
+            file,
+            offset,
+            len,
+            close,
+        };
+        // Counted outstanding here rather than at install, so it is counted
+        // exactly once either way: the read-ahead cap must see an answered
+        // request whether its body starts now or waits its turn.
+        let conn = self.core.table.conn_mut(slot);
+        conn.outstanding += 1;
+        if conn.tail_active() {
+            // A body is already streaming: hold this one behind it, in
+            // arrival order with the PDUs the same diversion is holding.
+            conn.defer_file_reply(next);
+            return Ok(());
+        }
+        self.install_file_reply(slot, generation, next)
+    }
+
+    /// Queue a file reply's head, install its tail, and issue the first read.
+    /// The count against the read-ahead cap is the caller's - a body deferred
+    /// behind another was counted when it was deferred.
+    #[cfg(feature = "uring-fs")]
+    fn install_file_reply(
+        &mut self,
+        slot: u32,
+        generation: u32,
+        next: PendingFile,
+    ) -> errno::Result<()> {
+        let close = next.close;
         {
             let conn = self.core.table.conn_mut(slot);
-            conn.outstanding += 1;
             // Head first - the diversion is not yet on - then the tail; its
             // chunks follow as reads complete, the last one `ReplyLast`.
-            conn.enqueue_reply_head(head);
-            conn.install_file_tail(file, offset, len);
+            conn.enqueue_reply_head(next.head);
+            conn.install_file_tail(next.file, next.offset, next.len);
             if close {
                 conn.close_on_flush = Some(CloseReason::HandlerClosed);
             }
@@ -508,13 +574,19 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         self.drive_file_tail(slot, generation)
     }
 
-    /// Issue the tail's next read when it is idle, bytes remain, and a chunk
-    /// buffer is free - at install, after each read completes, and after
-    /// sends flush (which recycle buffers). Reads are clamped to
-    /// `min(fs_body_chunk, unread)`, and a missing buffer just waits for a
-    /// flush to recycle one: that wait is the body's memory bound. A full fs
-    /// op table or staging failure sheds THIS connection
-    /// ([`CloseReason::FileBody`]), never the server.
+    /// Issue the tail's next read when it is idle, bytes remain, and both a
+    /// chunk buffer and an fs op slot are free - at install, after each read
+    /// completes, and after sends flush (which recycle buffers). Reads are
+    /// clamped to `min(fs_body_chunk, unread)`.
+    ///
+    /// Neither shortage is fatal, and deliberately so: they are the same kind
+    /// of transient. A missing buffer waits for a flush to recycle one - that
+    /// wait is the body's memory bound - and a full op table parks the
+    /// connection in `parked_tails` for the next completing fs op to re-drive.
+    /// Severing a multi-GB transfer because a handler fan-out momentarily took
+    /// the last slot would make the one shortage fatal and the other free.
+    /// A staging failure (the ring itself refused the SQE) still sheds THIS
+    /// connection ([`CloseReason::FileBody`]), never the server.
     #[cfg(feature = "uring-fs")]
     pub(super) fn drive_file_tail(
         &mut self,
@@ -536,11 +608,28 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
                 return Ok(()); // busy, or the last chunk is already queued
             }
         }
+        let gen64 = self.core.table.generation(slot);
+        // Before a buffer is committed to it: a submit that fails on a full
+        // table would drop the buffer with the op entry, and this path must be
+        // able to retry.
+        if !self
+            .fs
+            .as_ref()
+            .expect("tail exists only with a pool")
+            .has_free_op()
+        {
+            let conn = self.core.table.conn_mut(slot);
+            let tail = conn.file_tail.as_mut().expect("checked above");
+            if !tail.parked {
+                tail.parked = true;
+                self.parked_tails.push_back((slot, gen64));
+            }
+            return Ok(()); // a completing fs op frees a slot and re-drives us
+        }
         let Some(buf) = self.core.table.conn_mut(slot).tail_take_buf(chunk)
         else {
             return Ok(()); // all buffers queued/sending; a flush recycles one
         };
-        let gen64 = self.core.table.generation(slot);
         let staged = {
             // Disjoint fields: `self.fs`, `self.core.engine`,
             // `self.core.table` - the same split `deliver_one` relies on.
@@ -558,6 +647,7 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             );
             if r.is_ok() {
                 tail.reading = true;
+                tail.parked = false;
             }
             r
         };
@@ -567,6 +657,29 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
                 generation,
                 CloseReason::FileBody(e),
             );
+        }
+        Ok(())
+    }
+
+    /// Re-drive the connection at the head of `parked_tails` - the one that
+    /// found the op table full. Called once per completing fs op, which is
+    /// exactly how many slots just freed. Stale entries (the connection closed
+    /// or its slot was recycled) are discarded on the way past, and a tail
+    /// that finds the table full again simply parks itself at the back.
+    #[cfg(feature = "uring-fs")]
+    pub(super) fn redrive_parked_tail(&mut self) -> errno::Result<()> {
+        while let Some((slot, gen64)) = self.parked_tails.pop_front() {
+            if self.core.table.generation(slot) != gen64 {
+                continue; // slot recycled under the wait
+            }
+            match self.core.table.get_conn_mut(slot) {
+                Some(conn) if conn.file_tail.is_some() => {
+                    conn.file_tail.as_mut().expect("checked is_some").parked =
+                        false;
+                }
+                _ => continue, // parked, freed, or the tail is already shed
+            }
+            return self.drive_file_tail(slot, gen64 as u32);
         }
         Ok(())
     }
@@ -632,28 +745,27 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         // `iov_len >= n`, and the CQE count proves the kernel initialized
         // the first `n` bytes (the stream recv path's discipline).
         unsafe { buf.set_len(n as usize) };
-        let last = {
-            let conn = self.core.table.conn_mut(slot);
-            let tail = conn.file_tail.as_mut().expect("checked above");
-            tail.next_offset += n;
-            // `n <= iov_len = min(chunk, unread)`, so this never underflows;
-            // a short read just leaves more for the next iteration, which
-            // continues from the offset actually reached.
-            tail.unread -= n;
-            let last = tail.unread == 0;
-            conn.enqueue_file_chunk(buf, last);
-            if last {
-                // The body is fully queued: retire the tail and release the
-                // PDUs the diversion held behind it.
-                conn.finish_file_tail();
-            }
-            last
-        };
+        let last = self.core.table.conn_mut(slot).advance_file_tail(buf);
         self.core.kick_send(slot, generation)?;
-        if last {
-            Ok(())
-        } else {
-            self.drive_file_tail(slot, generation)
+        if !last {
+            return self.drive_file_tail(slot, generation);
+        }
+        // The retired tail may have been holding a file body that arrived
+        // behind it; install it now that the wire is free. A flush-close armed
+        // for the body that just finished makes that farewell final, so a body
+        // still queued behind it is dropped rather than sent after it.
+        let next = {
+            let conn = self.core.table.conn_mut(slot);
+            if conn.close_on_flush.is_some() {
+                conn.drop_queued_file_reply();
+                None
+            } else {
+                conn.take_queued_file_reply()
+            }
+        };
+        match next {
+            Some(next) => self.install_file_reply(slot, generation, next),
+            None => Ok(()),
         }
     }
 }

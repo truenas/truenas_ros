@@ -541,6 +541,15 @@ impl FsCore {
         }
     }
 
+    /// Whether the op table has a slot left. The reply path consults this
+    /// before committing a chunk buffer to a body read, so a full table parks
+    /// the tail (a completing op frees a slot and re-drives it) instead of
+    /// severing a transfer that has done nothing wrong.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    pub(crate) fn has_free_op(&self) -> bool {
+        !self.op_free.is_empty()
+    }
+
     /// Stage a reactor-pump `READV`: one positional read of up to `want`
     /// bytes at `off` into `buf`'s spare capacity, completing back through
     /// [`ReapedFs::Pump`] rather than a callback - the submission path for
@@ -3502,6 +3511,7 @@ mod routing_fuzz {
         core.cancel_owned_by(&mut eng, (5, 9));
 
         // Reap until the read's own CQE routes (the cancel's is inert).
+        //
         let reaped = loop {
             eng.ring.submit_and_wait(1).expect("submit_and_wait");
             let Some(cqe) = eng.ring.reap() else {
