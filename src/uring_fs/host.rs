@@ -14,6 +14,7 @@ use crate::errno::{self, Errno};
 use crate::sync::{Arc, mpsc};
 use crate::uring::engine::Engine;
 use crate::uring::probe::probe_op_supported;
+use crate::uring::ring::RingFd;
 use crate::uring::sys::{
     IORING_CQE_F_MORE, IORING_OP_OPENAT2, IoUringCqe, register_personality,
 };
@@ -153,6 +154,40 @@ impl UringFs {
     ///
     /// No fixed-file pool is registered: fs ops name files by raw descriptor.
     pub fn new(cfg: FsConfig) -> crate::Result<UringFs> {
+        Self::check(&cfg)?;
+        let ring = RingFd::setup(cfg.entries)?;
+        Self::build(cfg, ring)
+    }
+
+    /// Create the ring a reactor under `cfg` will run on, without building
+    /// the reactor.
+    ///
+    /// For a process that runs several reactors on several threads behind
+    /// one credential broker. The broker must inherit every ring fd at fork
+    /// and the fork must precede every thread, while a [`UringFs`] can only
+    /// be built on the thread that runs it. So create each ring here, on the
+    /// main thread, spawn the broker over the [`RingFd`]s, then build each
+    /// reactor on its own thread with [`UringFs::with_ring`].
+    pub fn setup_ring(cfg: &FsConfig) -> crate::Result<RingFd> {
+        Self::check(cfg)?;
+        Ok(RingFd::setup(cfg.entries)?)
+    }
+
+    /// As [`UringFs::new`], on a ring from [`UringFs::setup_ring`]. A ring
+    /// shallower than `cfg.entries` asks for is refused with `Validation`.
+    pub fn with_ring(cfg: FsConfig, ring: RingFd) -> crate::Result<UringFs> {
+        Self::check(&cfg)?;
+        if ring.sq_entries() < cfg.entries {
+            return Err(crate::Error::Validation(format!(
+                "ring has {} submission entries, FsConfig::entries asks for {}",
+                ring.sq_entries(),
+                cfg.entries
+            )));
+        }
+        Self::build(cfg, ring)
+    }
+
+    fn check(cfg: &FsConfig) -> crate::Result<()> {
         if cfg.ops < 2 || u64::from(cfg.ops) > SLOT_MASK {
             return Err(crate::Error::Validation(
                 "FsConfig::ops must be in 2..=SLOT_MASK".into(),
@@ -163,7 +198,11 @@ impl UringFs {
                 "FsConfig::entries must be at least 4".into(),
             ));
         }
-        let eng = Engine::without_pool(cfg.entries)?;
+        Ok(())
+    }
+
+    fn build(cfg: FsConfig, ring: RingFd) -> crate::Result<UringFs> {
+        let eng = Engine::without_pool_on(ring)?;
         if !probe_op_supported(&eng.ring, IORING_OP_OPENAT2) {
             return Err(crate::Error::Validation(
                 "uring_fs requires io_uring OPENAT2 (Linux >= 5.6); this \

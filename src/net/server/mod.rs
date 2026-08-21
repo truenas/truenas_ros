@@ -451,6 +451,7 @@ pub use crate::net::core::protocol::{
     Body, ClientAddr, CloseReason, Endian, Framing, PeerCred, PrefixWidth,
     SendBuf, ServerAddr, length_prefix_header,
 };
+pub use crate::uring::ring::RingFd;
 pub use config::{Listen, ServerConfig};
 pub use handles::{
     DeferPermit, Deferred, DetachPermit, Detached, PushHandle, Responder,
@@ -576,6 +577,63 @@ pub struct Server<U, AcceptFn, HeaderFn, BodyFn> {
     cfg: ServerConfig,
 }
 
+/// Create the ring a server for `addrs` under `cfg` will run on, without
+/// building the server.
+///
+/// For a process that runs several servers on several threads behind a
+/// credential broker. The broker must inherit every ring fd at fork and the
+/// fork must precede every thread, while a [`Server`] can only be built on
+/// the thread that runs it. So create each ring here, on the main thread,
+/// spawn the broker over the [`RingFd`]s, then build each server on its own
+/// thread with [`Server::with_ring`]. A process with one server needs none
+/// of this; [`Server::with_config`] creates its own ring.
+pub fn setup_ring(
+    addrs: impl IntoIterator<Item = impl Into<Listen>>,
+    cfg: &ServerConfig,
+) -> crate::Result<RingFd> {
+    let addrs: Vec<Listen> = addrs.into_iter().map(Into::into).collect();
+    cfg.validate(&addrs)?;
+    Ok(RingFd::setup(ring_entries(cfg, &addrs))?)
+}
+
+/// Op-table size for the embedded fs reactor (0 when disabled): the
+/// handler's own budget (`fs_ops`) plus one slot per connection for the
+/// reply path's body reads. A file tail keeps at most one read in flight,
+/// so `pool_size` bounds them exactly and a full pool of streaming bodies
+/// cannot exhaust the table out from under handler ops.
+#[cfg(feature = "uring-fs")]
+fn fs_op_slots(cfg: &ServerConfig) -> u32 {
+    if cfg.fs_ops > 0 {
+        cfg.fs_ops.saturating_add(cfg.pool_size)
+    } else {
+        0
+    }
+}
+
+/// Submission-queue depth for a server on `addrs` under `cfg`.
+fn ring_entries(cfg: &ServerConfig, addrs: &[Listen]) -> u32 {
+    // Peak SQEs a connection can hold at once: a recv, a concurrent send
+    // (only when pipelining), and a linked timeout on each timed op. Size
+    // the ring so a full pool's peak never forces a mid-batch flush (which
+    // would also split a linked op+timeout pair).
+    let per_conn = (if cfg.max_in_flight_requests > 1 { 2 } else { 1 })
+        + u32::from(
+            cfg.idle_timeout.is_some() || cfg.request_timeout.is_some(),
+        )
+        + u32::from(cfg.send_timeout.is_some())
+        + u32::from(cfg.tls_handshake_timeout.is_some());
+    #[cfg(feature = "uring-fs")]
+    let fs_op_slots = fs_op_slots(cfg);
+    #[cfg(not(feature = "uring-fs"))]
+    let fs_op_slots = 0u32;
+    cfg.pool_size
+        .saturating_mul(per_conn)
+        .saturating_add(1 + addrs.len() as u32)
+        .saturating_add(fs_op_slots)
+        .next_power_of_two()
+        .min(MAX_RING_ENTRIES)
+}
+
 impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn>
 where
     AcceptFn: FnMut(Incoming<'_>) -> Option<U>,
@@ -605,43 +663,46 @@ where
     ) -> crate::Result<Self> {
         let addrs: Vec<Listen> = addrs.into_iter().map(Into::into).collect();
         cfg.validate(&addrs)?;
+        let ring = RingFd::setup(ring_entries(&cfg, &addrs))?;
+        Self::build(addrs, cfg, protocol, ring)
+    }
 
-        // Peak SQEs a connection can hold at once: a recv, a concurrent send
-        // (only when pipelining), and a linked timeout on each timed op. Size
-        // the ring so a full pool's peak never forces a mid-batch flush (which
-        // would also split a linked op+timeout pair).
-        let per_conn = (if cfg.max_in_flight_requests > 1 { 2 } else { 1 })
-            + u32::from(
-                cfg.idle_timeout.is_some() || cfg.request_timeout.is_some(),
-            )
-            + u32::from(cfg.send_timeout.is_some())
-            + u32::from(cfg.tls_handshake_timeout.is_some());
-        // Op-table size for the embedded fs reactor (0 when disabled/absent):
-        // the handler's own budget (`fs_ops`) plus one slot per connection
-        // for the reply path's body reads. A file tail keeps at most one read
-        // in flight, so `pool_size` bounds them exactly and a full pool of
-        // streaming bodies cannot exhaust the table out from under handler
-        // ops.
-        #[cfg(feature = "uring-fs")]
-        let fs_op_slots = if cfg.fs_ops > 0 {
-            cfg.fs_ops.saturating_add(cfg.pool_size)
-        } else {
-            0
-        };
-        #[cfg(not(feature = "uring-fs"))]
-        let fs_op_slots = 0u32;
-        let entries = cfg
-            .pool_size
-            .saturating_mul(per_conn)
-            .saturating_add(1 + addrs.len() as u32)
-            .saturating_add(fs_op_slots)
-            .next_power_of_two()
-            .min(MAX_RING_ENTRIES);
+    /// As [`Server::with_config`], on a ring from [`setup_ring`].
+    ///
+    /// `addrs` and `cfg` must be the ones the ring was set up for. The ring
+    /// is sized from them, and one too shallow for this configuration is
+    /// refused with [`Error::Validation`] rather than run with a queue that
+    /// forces mid-batch flushes.
+    pub fn with_ring(
+        addrs: impl IntoIterator<Item = impl Into<Listen>>,
+        cfg: ServerConfig,
+        protocol: Protocol<AcceptFn, HeaderFn, BodyFn>,
+        ring: RingFd,
+    ) -> crate::Result<Self> {
+        let addrs: Vec<Listen> = addrs.into_iter().map(Into::into).collect();
+        cfg.validate(&addrs)?;
+        let need = ring_entries(&cfg, &addrs);
+        if ring.sq_entries() < need {
+            return Err(Error::Validation(format!(
+                "ring has {} submission entries, this configuration needs \
+                 {need}",
+                ring.sq_entries()
+            )));
+        }
+        Self::build(addrs, cfg, protocol, ring)
+    }
+
+    fn build(
+        addrs: Vec<Listen>,
+        cfg: ServerConfig,
+        protocol: Protocol<AcceptFn, HeaderFn, BodyFn>,
+        ring: RingFd,
+    ) -> crate::Result<Self> {
         // The shared engine: ring + connection pool + wake + the universal
         // probe. FS ops submit on raw fds (not the registered table), so the
         // pool holds only the `pool_size` connection slots regardless of
         // `fs_op_slots`.
-        let mut engine = Engine::new(entries, cfg.pool_size)?;
+        let mut engine = Engine::on_ring(ring, cfg.pool_size)?;
 
         // Fail fast - before binding - on kernels whose io_uring can't serve
         // the per-connection peer-identity fetches; otherwise every affected
@@ -724,7 +785,7 @@ where
             // sizes the fs op table alone and no registered file pool exists
             // to bound open files.
             crate::uring_fs::core::FsCore::new(
-                fs_op_slots,
+                fs_op_slots(&cfg),
                 crate::uring_fs::OffloadBounds {
                     floor: cfg.fs_offload_floor,
                     ceiling: cfg.fs_offload_ceiling,
@@ -1096,8 +1157,10 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
 }
 
 // A server with an fs pool can act as authenticated peers: the credential
-// broker registers personalities on its ring (built first, then the broker
-// inherits the ring fd - the same fork-before-threads ordering as `UringFs`).
+// broker registers personalities on its ring. The ring exists before the
+// broker forks and the fork precedes every thread (as for `UringFs`), so a
+// server built on main passes itself here; a server that will run on its
+// own thread passes the `RingFd` from `setup_ring` instead.
 #[cfg(feature = "uring-fs")]
 impl<U, AcceptFn, HeaderFn, BodyFn> crate::uring_fs::BrokerReactor
     for Server<U, AcceptFn, HeaderFn, BodyFn>

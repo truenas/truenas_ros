@@ -27,7 +27,7 @@ use truenas_ros::net::server::{
     Body, ClientAddr, CloseReason, DeferPermit, Deferred, Endian, Framing,
     Incoming, PeerCred, PrefixWidth, Protocol, PushHandle, Request, Responder,
     Response, Server, ServerAddr, ServerConfig, ShutdownHandle,
-    length_prefix_header, length_prefixed,
+    length_prefix_header, length_prefixed, setup_ring,
 };
 use truenas_ros::{Errno, Error};
 
@@ -8427,6 +8427,184 @@ fn fs_broker_personality_gates_open() {
         peer, b"denied",
         "the unprivileged peer is refused at open - the personality gates DAC"
     );
+}
+
+/// The multi-reactor shape: rings created on the main thread before the
+/// broker forks, servers built on worker threads after it, and the peer's
+/// personality minted on each ring before the thread that owns it has even
+/// mapped it. The broker's personalities then gate opens on every ring
+/// exactly as they do on a server that built its own ring, which is the
+/// proof that `setup_ring` + `with_ring` is the same server, constructed in
+/// two halves on two threads.
+///
+/// Root-only (the broker needs `CAP_SETUID`); skipped otherwise.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn fs_broker_serves_rings_mapped_on_worker_threads() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::OnceLock;
+    use std::sync::mpsc;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{
+        Anchor, AsUser, CredBroker, Personality, RwFlags,
+    };
+
+    if !is_root() {
+        return; // the broker cannot become another uid without CAP_SETUID
+    }
+    const NOBODY_UID: u32 = 65_534;
+    const NOBODY_GID: u32 = 65_534;
+    const RINGS: u8 = 2;
+
+    let dir = truenas_ros::tempdir().unwrap();
+    let secret = dir.path().join("secret.txt");
+    std::fs::write(&secret, b"topsecret").unwrap();
+    let cpath = CString::new(secret.as_os_str().as_bytes()).unwrap();
+    // SAFETY: valid path; chmod cannot corrupt memory.
+    assert_eq!(unsafe { libc::chmod(cpath.as_ptr(), 0o600) }, 0);
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+
+    let cfg = ServerConfig {
+        pool_size: 8,
+        fs_ops: 16,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+
+    // Every ring first, on this thread, with no other thread alive yet; then
+    // the broker over all of them.
+    let mut rings = Vec::new();
+    for _ in 0..RINGS {
+        match setup_ring([addr.clone()], &cfg) {
+            Ok(r) => rings.push(r),
+            Err(e) if should_skip(&e) => return,
+            Err(e) => panic!("setup_ring: {e}"),
+        }
+    }
+    let broker = match CredBroker::spawn(&rings.iter().collect::<Vec<_>>()) {
+        Ok(b) => b,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("CredBroker::spawn: {e}"),
+    };
+
+    // Each worker mints the peer on its still-unmapped ring, maps it, builds
+    // the server around it, and reports its address and stop handle before
+    // serving.
+    let (tx, rx) = mpsc::channel::<(usize, SocketAddrV4, ShutdownHandle)>();
+    let mut workers = Vec::new();
+    for (i, ring) in rings.into_iter().enumerate() {
+        let creds = broker.handle(i as u8).expect("broker handle");
+        let anchor = anchor.clone();
+        let addr = addr.clone();
+        let tx = tx.clone();
+        workers.push(thread::spawn(move || {
+            let cell: Arc<OnceLock<(Personality, Personality)>> =
+                Arc::new(OnceLock::new());
+            let pc = Arc::clone(&cell);
+            let body = move |mut req: Request<'_, ()>| -> Response {
+                let cmd = req.body.take();
+                let (deferred, permit) = req.responder.defer();
+                let Some(mut fs) = req.fs.take() else {
+                    return Response::Close;
+                };
+                let (root_pers, peer_pers) =
+                    *pc.get().expect("personalities set before serving");
+                let anchor = anchor.clone();
+                let ro = OpenHow::new().flags(OFlag::O_RDONLY);
+                let who = if cmd == b"as-root" {
+                    root_pers
+                } else {
+                    peer_pers
+                };
+                let path = CString::new("secret.txt").unwrap();
+                fs.open(who, &anchor, &path, ro, move |done, fs| {
+                    let Some(file) = done.file() else {
+                        deferred.reply(echo_frame(b"denied"));
+                        return;
+                    };
+                    fs.preadv2(
+                        who,
+                        file.clone(),
+                        vec![vec![0u8; 64]],
+                        0,
+                        RwFlags::empty(),
+                        move |d, fs| {
+                            fs.close(file);
+                            match d.result() {
+                                Ok(n) => {
+                                    let mut out = b"read:".to_vec();
+                                    let mut v =
+                                        d.into_bufs().pop().unwrap_or_default();
+                                    v.truncate(n as usize);
+                                    out.extend_from_slice(&v);
+                                    deferred.reply(echo_frame(&out));
+                                }
+                                Err(_) => {
+                                    deferred.reply(echo_frame(b"read-err"))
+                                }
+                            }
+                        },
+                    );
+                });
+                Response::Defer(permit)
+            };
+            let protocol = Protocol {
+                accept: |_: Incoming<'_>| Some(()),
+                header: length_prefix_header::<()>(
+                    PrefixWidth::U32,
+                    Endian::Big,
+                    false,
+                ),
+                body,
+            };
+            // The broker needs only the fd: the peer is minted on this ring
+            // before this thread maps it.
+            let peer_pers = creds
+                .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
+                .expect("register peer on a ring not yet mapped");
+            let mut server = Server::with_ring([addr], cfg, protocol, ring)
+                .expect("with_ring on a ring created by another thread");
+            let root_pers = server.register_self().expect("register_self");
+            cell.set((root_pers, peer_pers)).unwrap();
+            let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+                panic!("expected Tcp");
+            };
+            tx.send((i, v4, server.shutdown_handle())).unwrap();
+            server.serve_forever().expect("serve_forever");
+        }));
+    }
+    drop(tx);
+
+    // Drive each ring in turn: both identities, both verdicts, then stop it.
+    let mut served = 0u8;
+    for (i, v4, stop) in rx.iter() {
+        let mut s = connect_tcp(v4).expect("connect");
+        send_framed(&mut s, b"as-peer").expect("send");
+        let peer = recv_framed(&mut s).expect("recv");
+        send_framed(&mut s, b"as-root").expect("send");
+        let root = recv_framed(&mut s).expect("recv");
+        drop(s);
+        stop.shutdown();
+        assert_eq!(
+            root, b"read:topsecret",
+            "ring {i}: the daemon's own identity reads its 0600 file"
+        );
+        assert_eq!(
+            peer, b"denied",
+            "ring {i}: the peer is refused at open by a personality minted \
+             before the ring was mapped"
+        );
+        served += 1;
+    }
+    assert_eq!(served, RINGS, "every worker served");
+    for w in workers {
+        w.join().expect("worker");
+    }
 }
 
 /// Real privilege boundary for `fgetxattr_as_root`: a `trusted.*` attribute is

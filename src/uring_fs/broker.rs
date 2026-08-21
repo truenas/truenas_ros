@@ -54,7 +54,10 @@
 //! refuses to attach an io_uring file to a unix socket at all
 //! (`scm_fp_copy` -> `-EINVAL`, kernel commit `a4104821ad65`, which removed
 //! io_uring's own socket-GC handling). Inheritance is why every ring must
-//! exist before [`CredBroker::spawn`] is called.
+//! exist before [`CredBroker::spawn`] is called. Exist, not be mapped: a
+//! [`RingFd`] from `UringFs::setup_ring` or `net::server::setup_ring` is enough
+//! for the child to inherit, so a reactor that will live on its own thread
+//! is built after the fork, on that thread.
 //!
 //! `pidfd_getfd(2)` *would* lift that ordering rule - it installs through
 //! `receive_fd`, which has no io_uring exclusion - and is deliberately not
@@ -96,6 +99,7 @@
 use super::{Personality, UringFs};
 use crate::errno::{self, Errno, retry_on_eintr};
 use crate::sync::{Arc, Mutex};
+use crate::uring::ring::RingFd;
 use std::ffi::c_void;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
@@ -592,6 +596,16 @@ impl BrokerReactor for UringFs {
     }
 }
 
+// A ring created ahead of the reactor that will run it (`UringFs::setup_ring`,
+// `net::server::setup_ring`). The broker needs only the descriptor, which exists
+// from `io_uring_setup` on; mapping and driving it happen later, on the
+// thread that receives the `RingFd`.
+impl BrokerReactor for RingFd {
+    fn broker_ring_fd(&self) -> RawFd {
+        self.raw_fd()
+    }
+}
+
 impl CredBroker {
     /// Fork the broker process - which inherits `reactors`' ring
     /// descriptors - then permanently drop `CAP_SETUID`/`CAP_SETGID` from
@@ -603,7 +617,11 @@ impl CredBroker {
     ///    fds it inherits at `fork`, and there is no way to hand it one
     ///    afterwards: since Linux 6.8 an io_uring fd cannot be sent over a
     ///    unix socket (`SCM_RIGHTS` -> `EINVAL`). Build every [`UringFs`]
-    ///    first, then spawn one broker with all of them.
+    ///    first, then spawn one broker with all of them. Reactors that will
+    ///    run on their own threads cannot be built yet (see 2), so for those
+    ///    create the rings with `UringFs::setup_ring` or `net::server::setup_ring`,
+    ///    spawn the broker over the [`RingFd`]s, and build each reactor on its
+    ///    thread afterwards with `with_ring`.
     /// 2. **Call this before starting any threads.** Not a style
     ///    preference - a `fork` without `exec` keeps only the calling
     ///    thread, and any lock another thread held at that instant (glibc's

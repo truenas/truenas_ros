@@ -262,13 +262,71 @@ impl SqCqRings {
     }
 }
 
+/// A ring that exists but is not yet mapped: the `io_uring_setup(2)`
+/// descriptor plus the layout the kernel reported for it.
+///
+/// The half of ring construction that may happen on a thread other than the
+/// one that will drive the ring. It holds no pointers, so it is `Send`; the
+/// mapped, single-thread half (`Ring`) is built from it on the owning thread.
+/// The split exists for one caller: a process that runs several reactors on
+/// several threads but must fork its credential broker before any thread
+/// exists, with every ring fd already created for the child to inherit. Sound
+/// because these rings are never `IORING_SETUP_SINGLE_ISSUER`, so the kernel
+/// does not bind a ring to the task that created it.
+///
+/// The fd is a credential capability (anyone holding it can register
+/// personalities on the ring), so nothing here exposes it beyond what the
+/// broker needs.
+pub struct RingFd {
+    fd: OwnedFd,
+    params: IoUringParams,
+}
+
+impl RingFd {
+    /// `io_uring_setup(2)` for `entries` submission slots (rounded up to a
+    /// power of two by the kernel). Fails with `ENOSYS`/`EPERM` where io_uring
+    /// is unavailable (old kernel, seccomp, `kernel.io_uring_disabled`).
+    pub(crate) fn setup(entries: u32) -> errno::Result<RingFd> {
+        let mut params = IoUringParams::default();
+        let fd = io_uring_setup(entries, &mut params)?;
+        Ok(RingFd { fd, params })
+    }
+
+    /// The raw ring fd (for `io_uring_register`).
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    /// The submission-queue depth the kernel actually allocated.
+    pub(crate) fn sq_entries(&self) -> u32 {
+        self.params.sq_entries
+    }
+}
+
+impl std::fmt::Debug for RingFd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RingFd")
+            .field("fd", &self.fd.as_raw_fd())
+            .field("sq_entries", &self.params.sq_entries)
+            .finish()
+    }
+}
+
 impl Ring {
-    /// Create a ring sized for `entries` submission slots (rounded up to a power
-    /// of two by the kernel). Fails with `ENOSYS`/`EPERM` where io_uring is
-    /// unavailable (old kernel, seccomp, `kernel.io_uring_disabled`).
+    /// Create and map a ring sized for `entries` submission slots in one
+    /// step, on this thread. Production goes through [`RingFd::setup`] and
+    /// [`Ring::from_setup`] so the two halves can run on different threads;
+    /// the tests that only need a ring take this shortcut.
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn new(entries: u32) -> errno::Result<Ring> {
-        let mut p = IoUringParams::default();
-        let fd = io_uring_setup(entries, &mut p)?;
+        Ring::from_setup(RingFd::setup(entries)?)
+    }
+
+    /// Map the SQ, CQ and SQE regions of an already-created ring and take
+    /// ownership of it. Runs on the thread that will drive the ring; the
+    /// descriptor itself may have been created on any thread of the process.
+    pub(crate) fn from_setup(setup: RingFd) -> errno::Result<Ring> {
+        let RingFd { fd, params: p } = setup;
         let raw = fd.as_raw_fd();
 
         let single = p.features & IORING_FEAT_SINGLE_MMAP != 0;
@@ -635,6 +693,61 @@ fn mmap_region(len: usize, fd: RawFd, offset: i64) -> errno::Result<*mut u8> {
 unsafe fn field_ptr<T>(base: *mut u8, off: u32) -> *mut T {
     // SAFETY: caller guarantees `off` is in-bounds and aligned for `T`.
     unsafe { base.add(off as usize).cast::<T>() }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    /// The UAPI opcode of the no-op SQE: enough to prove a round trip.
+    const IORING_OP_NOP: u8 = 0;
+
+    fn setup_or_skip(entries: u32) -> Option<RingFd> {
+        match RingFd::setup(entries) {
+            Ok(r) => Some(r),
+            Err(e @ (Errno::ENOSYS | Errno::EPERM | Errno::EACCES)) => {
+                assert!(
+                    std::env::var_os("TRUENAS_ROS_REQUIRE_IO_URING").is_none(),
+                    "TRUENAS_ROS_REQUIRE_IO_URING set but io_uring \
+                     unavailable: {e}"
+                );
+                None
+            }
+            Err(e) => panic!("io_uring_setup: {e}"),
+        }
+    }
+
+    /// The created-not-mapped half holds no pointers and may cross threads.
+    #[test]
+    fn ring_fd_is_send() {
+        fn require_send<T: Send + Sync>(_: Option<&T>) {}
+        require_send::<RingFd>(None);
+    }
+
+    /// A ring created on one thread is mapped and driven on another, and the
+    /// completion comes back there: the property the multi-reactor setup
+    /// order rests on (rings created before the broker forks, mapped by the
+    /// threads spawned after it). Holds because the rings are never
+    /// `SINGLE_ISSUER`.
+    #[test]
+    fn ring_created_here_is_driven_on_another_thread() {
+        let Some(setup) = setup_or_skip(4) else {
+            return;
+        };
+        let worker = thread::spawn(move || -> errno::Result<u64> {
+            let mut ring = Ring::from_setup(setup)?;
+            ring.push_sqe(|sqe| {
+                sqe.opcode = IORING_OP_NOP;
+                sqe.user_data = 0x5eed;
+            })?;
+            ring.submit_and_wait(1)?;
+            let cqe = ring.reap().expect("a completion after waiting for one");
+            assert_eq!(cqe.res, 0, "a NOP completes with 0");
+            Ok(cqe.user_data)
+        });
+        assert_eq!(worker.join().unwrap().expect("ring io"), 0x5eed);
+    }
 }
 
 // ---------------------------------------------------------------------------
