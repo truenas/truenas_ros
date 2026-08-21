@@ -1663,7 +1663,7 @@ impl<'a> FsConn<'a> {
     /// pipe (a socket splice, a `vmsplice`) never materializes the bytes, and
     /// neither does this. `pipe` is a plain descriptor the caller keeps open
     /// until the completion fires - it is **not** taken into the fixed-file
-    /// pool, so it does not consume a `FsConfig::files` slot.
+    /// pool, so it does not consume a `FsConfig::ops` slot.
     ///
     /// # Short moves are normal
     ///

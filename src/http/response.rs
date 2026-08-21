@@ -254,7 +254,7 @@ impl HttpResponse {
     /// the last chunk flushes or the connection dies - dropping the
     /// caller's other clones never closes the fd under an in-flight read.
     /// Serving this requires the server's fs pool
-    /// (`ServerConfig::fs_files`); without one the connection is closed at
+    /// (`ServerConfig::fs_ops`); without one the connection is closed at
     /// reply time rather than a short body sent. A peer that stops reading
     /// mid-body is reclaimed only by `ServerConfig::send_timeout` or
     /// `tcp_user_timeout` (TCP zero-window probing never gives up on its

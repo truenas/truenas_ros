@@ -688,7 +688,7 @@ where
 /// The handler is [`protocol_deferrable`]'s with one more argument: the
 /// reactor's per-request [`FsConn`](crate::uring_fs::FsConn) - `Some` when
 /// the server was built with an fs pool
-/// ([`ServerConfig::fs_files`](crate::net::server::ServerConfig::fs_files)),
+/// ([`ServerConfig::fs_ops`](crate::net::server::ServerConfig::fs_ops)),
 /// else `None`. A `Protocol` is built before its `Server`, so this
 /// constructor cannot check; for a handler that asked for this constructor,
 /// `None` is a deployment misconfiguration, and answering `500` is the

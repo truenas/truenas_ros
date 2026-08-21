@@ -121,7 +121,7 @@
 //! own ring in `ServerConfig::fs_body_chunk`-sized chunks - two buffers per
 //! connection, one reading while the previous one sends - so a multi-GB
 //! download costs two chunk buffers, never its own size. Requires the
-//! embedded fs pool (`ServerConfig::fs_files`). Deliberately `preadv2` +
+//! embedded fs pool (`ServerConfig::fs_ops`). Deliberately `preadv2` +
 //! send rather than a splice: egress splice would need a pipe intermediary
 //! (a second hop, and a pipe per in-flight response), and over kTLS - the
 //! appliance default - encryption copies the plaintext into record buffers
@@ -552,7 +552,7 @@ struct Listener {
 /// (see [`Protocol`]). Holds raw ring pointers, so it is `!Send`/`!Sync`: the
 /// ring is owned by exactly one thread (single-ring-per-thread model).
 pub struct Server<U, AcceptFn, HeaderFn, BodyFn> {
-    // The embedded fs reactor's op/file tables, when `ServerConfig::fs_files`
+    // The embedded fs reactor's op/file tables, when `ServerConfig::fs_ops`
     // is set. Declared before `core` so its kernel-visible op buffers drop
     // before the ring is unmapped (same buffers-before-unmap invariant the
     // engine keeps internally). `None` = no fs pool. Read by the
@@ -617,32 +617,30 @@ where
             + u32::from(cfg.send_timeout.is_some())
             + u32::from(cfg.tls_handshake_timeout.is_some());
         // Op-table size for the embedded fs reactor (0 when disabled/absent):
-        // enough in-flight fs SQEs that a burst of opens+reads doesn't force a
-        // mid-batch flush. `fs_files * 2` covers handler-driven work (each
-        // open is typically followed by a read/close on that file), plus one
-        // slot per connection for the reply path's body reads: a file tail
-        // keeps at most one read in flight, so `pool_size` bounds them
-        // exactly and a full pool of streaming bodies cannot exhaust the
-        // table out from under handler ops.
+        // the handler's own budget (`fs_ops`) plus one slot per connection
+        // for the reply path's body reads. A file tail keeps at most one read
+        // in flight, so `pool_size` bounds them exactly and a full pool of
+        // streaming bodies cannot exhaust the table out from under handler
+        // ops.
         #[cfg(feature = "uring-fs")]
-        let fs_ops = if cfg.fs_files > 0 {
-            cfg.fs_files.saturating_mul(2).saturating_add(cfg.pool_size)
+        let fs_op_slots = if cfg.fs_ops > 0 {
+            cfg.fs_ops.saturating_add(cfg.pool_size)
         } else {
             0
         };
         #[cfg(not(feature = "uring-fs"))]
-        let fs_ops = 0u32;
+        let fs_op_slots = 0u32;
         let entries = cfg
             .pool_size
             .saturating_mul(per_conn)
             .saturating_add(1 + addrs.len() as u32)
-            .saturating_add(fs_ops)
+            .saturating_add(fs_op_slots)
             .next_power_of_two()
             .min(MAX_RING_ENTRIES);
         // The shared engine: ring + connection pool + wake + the universal
         // probe. FS ops submit on raw fds (not the registered table), so the
         // pool holds only the `pool_size` connection slots regardless of
-        // `fs_files`.
+        // `fs_op_slots`.
         let mut engine = Engine::new(entries, cfg.pool_size)?;
 
         // Fail fast - before binding - on kernels whose io_uring can't serve
@@ -720,13 +718,13 @@ where
         // The fs op table lives on this same ring; open files are plain raw fds
         // (`Arc<OwnedFd>`), not registered-table slots.
         #[cfg(feature = "uring-fs")]
-        let fs = (cfg.fs_files > 0).then(|| {
+        let fs = (cfg.fs_ops > 0).then(|| {
             // The plain-fd `FsCore` takes only an op-slot count: FS ops submit
-            // on raw fds (`Arc<OwnedFd>`), never `IOSQE_FIXED_FILE`, so
-            // `fs_files` sizes only the fs op table (`fs_ops = fs_files * 2`),
-            // not any registered file pool.
+            // on raw fds (`Arc<OwnedFd>`), never `IOSQE_FIXED_FILE`, so this
+            // sizes the fs op table alone and no registered file pool exists
+            // to bound open files.
             crate::uring_fs::core::FsCore::new(
-                fs_ops,
+                fs_op_slots,
                 crate::uring_fs::OffloadBounds {
                     floor: cfg.fs_offload_floor,
                     ceiling: cfg.fs_offload_ceiling,
@@ -741,7 +739,7 @@ where
         // on a client (which would never drain it).
         #[cfg(feature = "uring-fs")]
         {
-            core.has_fs_pool = cfg.fs_files > 0;
+            core.has_fs_pool = cfg.fs_ops > 0;
         }
         Ok(Server {
             #[cfg(feature = "uring-fs")]
@@ -1008,7 +1006,7 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     ///
     /// Unprivileged (registering your own creds needs no capability); the
     /// snapshot is frozen at this call. Only meaningful with an fs pool
-    /// (`ServerConfig::fs_files`); ids come from a credential broker for acting
+    /// (`ServerConfig::fs_ops`); ids come from a credential broker for acting
     /// as authenticated peers (see [`CredBroker`](crate::uring_fs::CredBroker),
     /// which also registers on this ring). Requires the `uring-fs` feature.
     #[cfg(feature = "uring-fs")]
@@ -1034,7 +1032,7 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     /// called while operations are in flight - the same discipline as the
     /// standalone host's setter. Replaces any previous policy; the default
     /// permits nothing. Inert on a server built without an fs pool
-    /// ([`ServerConfig::fs_files`] of 0): there is no reactor to police.
+    /// ([`ServerConfig::fs_ops`] of 0): there is no reactor to police.
     #[cfg(feature = "uring-fs")]
     pub fn set_privileged_xattrs(
         &mut self,
