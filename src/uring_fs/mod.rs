@@ -164,6 +164,12 @@
 //! # Ok::<(), truenas_ros::Error>(())
 //! ```
 //!
+//! Several reactors on several threads still need one broker, forked before
+//! any thread exists with every ring already created. [`UringFs::setup_ring`]
+//! (and `net::server::setup_ring` in the net stack) create the ring without the
+//! reactor: spawn the broker over the [`RingFd`]s, then build each reactor on
+//! its own thread with [`UringFs::with_ring`].
+//!
 //! Registering is not free (an IPC round trip plus the impersonation window),
 //! and every live id pins a kernel credential in a per-ring `u16` space, so
 //! wrap the broker in an [`IdentityCache`] to register once per *identity*
@@ -221,6 +227,7 @@ pub use query_tree::{
 // reactor is `UringFs`.
 pub(crate) mod host;
 
+pub use crate::uring::ring::RingFd;
 pub use broker::{
     AsUser, BrokerReactor, Caps, CredBroker, CredHandle, IdentityCache, Lease,
     MAX_GROUPS, MAX_RINGS,

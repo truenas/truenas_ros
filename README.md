@@ -89,6 +89,11 @@ let creds = broker.handle(0)?;
 let who = creds.register(&AsUser::new(1000, 1000).groups(vec![4, 27]))?;
 ```
 
+To run several reactors on several threads behind one broker, create their
+rings first (`UringFs::setup_ring`, `net::server::setup_ring`), spawn the broker
+over the `RingFd`s, then build each reactor on its own thread with
+`with_ring`. The fork still precedes every thread.
+
 A brokered personality carries the user's authority and no elevated
 capability. Where a service must resolve a path on behalf of a user entitled
 to the object but not to traverse every directory above it, opt in with a

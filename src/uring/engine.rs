@@ -6,7 +6,7 @@
 
 use crate::errno;
 use crate::uring::probe::probe_op_supported;
-use crate::uring::ring::Ring;
+use crate::uring::ring::{Ring, RingFd};
 use crate::uring::sys::*;
 use crate::uring::wake::{LoopShared, WakeHandle};
 // `LoopShared` is loom-modelled (see `src/uring/wake.rs`), so the engine
@@ -56,12 +56,21 @@ impl Engine {
     /// probes (socket commands, TLS ULP) run afterwards against
     /// [`Engine::ring`].
     pub(crate) fn new(entries: u32, pool_slots: u32) -> crate::Result<Engine> {
-        Self::assemble(Ring::new(entries)?, |ring| {
+        Self::on_ring(RingFd::setup(entries)?, pool_slots)
+    }
+
+    /// [`Engine::new`] over a ring created earlier, possibly on another
+    /// thread. The mapping happens here, on the thread that will drive it.
+    pub(crate) fn on_ring(
+        setup: RingFd,
+        pool_slots: u32,
+    ) -> crate::Result<Engine> {
+        Self::assemble(Ring::from_setup(setup)?, |ring| {
             ring.register_pool(pool_slots)
         })
     }
 
-    /// [`Engine::new`] without the fixed-file pool, for a host whose
+    /// [`Engine::on_ring`] without the fixed-file pool, for a host whose
     /// descriptors are plain fds.
     ///
     /// The pool exists for the net roles, which name sockets by registered
@@ -71,8 +80,8 @@ impl Engine {
     /// (`Arc<OwnedFd>`) and sets that flag nowhere, so registering a pool for
     /// it reserves kernel state nothing can draw on.
     #[cfg(feature = "uring-fs")]
-    pub(crate) fn without_pool(entries: u32) -> crate::Result<Engine> {
-        Self::assemble(Ring::new(entries)?, |_| Ok(()))
+    pub(crate) fn without_pool_on(setup: RingFd) -> crate::Result<Engine> {
+        Self::assemble(Ring::from_setup(setup)?, |_| Ok(()))
     }
 
     fn assemble(
