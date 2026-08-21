@@ -80,6 +80,10 @@ struct PoolShared {
     /// Model-only: how many idle retirements to grant (see [`idle_expired`]).
     #[cfg(loom)]
     retire_next_idle: AtomicUsize,
+    /// Model-only: let `Drop` take its detach branch (see
+    /// [`shutdown_expired`]).
+    #[cfg(loom)]
+    detach_next_drop: AtomicUsize,
 }
 
 /// An elastic pool of worker threads running `Box<dyn FnOnce() + Send>` jobs,
@@ -94,8 +98,10 @@ struct PoolShared {
 /// Growth is hysteretic: a worker spawns only when the pool is saturated
 /// (`running == total`) and at most once per cooldown, so a burst of fast
 /// cached jobs clears without thread churn while genuinely blocking work grows.
-/// Dropping the pool closes the queue and waits for every worker to exit, so no
-/// detached worker outlives the state it borrows.
+/// Dropping the pool closes the queue and waits for every worker to exit, so a
+/// job's effects are complete before the dropper proceeds - bounded by
+/// [`SHUTDOWN_DETACH_AFTER`], after which the remaining workers are left to
+/// exit on their own.
 pub(crate) struct WorkerPool {
     shared: Arc<PoolShared>,
 }
@@ -140,6 +146,8 @@ impl WorkerPool {
             idle_timeout,
             #[cfg(loom)]
             retire_next_idle: AtomicUsize::new(0),
+            #[cfg(loom)]
+            detach_next_drop: AtomicUsize::new(0),
         });
         let pool = WorkerPool {
             shared: Arc::clone(&shared),
@@ -204,6 +212,14 @@ impl PoolShared {
         self.cv.notify_all();
     }
 
+    /// Model-only: let the next `n` `Drop`s detach instead of waiting the
+    /// workers out. Standing in for a clock loom does not have - see
+    /// [`shutdown_expired`].
+    #[cfg(loom)]
+    fn detach_next_drop(&self, n: usize) {
+        self.detach_next_drop.store(n, Ordering::Relaxed);
+    }
+
     /// True at most once per [`cooldown`](Self::cooldown), claiming the slot so
     /// concurrent submits do not all spawn at once.
     ///
@@ -249,6 +265,54 @@ loom::thread_local! {
         Cell::new(std::ptr::null());
 }
 
+/// How long `WorkerPool::drop` waits for its workers before detaching them.
+///
+/// The wait exists so a job's effects are complete before the dropper
+/// proceeds; it is bounded because the dropping thread is not always one that
+/// can afford to block forever. `Drop` runs wherever the last handle falls -
+/// including on ANOTHER pool's worker, or on a thread serving requests - and
+/// an offload parked in a syscall against a wedged backing would otherwise
+/// consume that thread for the life of the process.
+///
+/// A process exiting has a backstop for that and a running one does not: FUSE
+/// (`fs/fuse/dev.c:212`) and sunrpc (`net/sunrpc/sched.c:346`) both wait
+/// `TASK_KILLABLE`, so a supervisor's SIGKILL reaps the wedged worker at
+/// teardown. Mid-run nothing does, and the symptom is a daemon quietly losing
+/// threads while systemd sees a healthy unit.
+///
+/// Long enough that a pool draining normally is never detached (workers exit
+/// as soon as they finish the job in hand), short enough to bound the damage.
+const SHUTDOWN_DETACH_AFTER: Duration = Duration::from_secs(2);
+
+/// Whether `Drop`'s bounded wait has run out and the remaining workers should
+/// be detached.
+///
+/// In production this is the condvar's own answer. Under `--cfg loom` there is
+/// no clock and `Condvar::wait_timeout` always reports `timed_out() == false`
+/// (`sync.rs`), so the detach branch would be unreachable in a model. The seam
+/// lets a model ask for the detach directly, the way [`idle_expired`] does for
+/// the idle retire.
+#[cfg(not(loom))]
+fn shutdown_expired(
+    wait: &std::sync::WaitTimeoutResult,
+    _shared: &Arc<PoolShared>,
+) -> bool {
+    wait.timed_out()
+}
+
+#[cfg(loom)]
+fn shutdown_expired(
+    _wait: &loom::sync::WaitTimeoutResult,
+    shared: &Arc<PoolShared>,
+) -> bool {
+    shared
+        .detach_next_drop
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            n.checked_sub(1)
+        })
+        .is_ok()
+}
+
 impl Drop for WorkerPool {
     fn drop(&mut self) {
         let mut g = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -266,10 +330,30 @@ impl Drop for WorkerPool {
         if ON_POOL_WORKER.with(Cell::get) == Arc::as_ptr(&self.shared) {
             return;
         }
-        // Wait for every worker to drain and exit, so none touches the shared
-        // state after this returns (join-on-drop without tracking handles).
+        // Wait for the workers to drain and exit, so none touches the shared
+        // state after this returns (join-on-drop without tracking handles) --
+        // but only up to `SHUTDOWN_DETACH_AFTER`, then leave them to it.
+        //
+        // Detaching is sound because `Job` is `Box<dyn FnOnce() + Send>`, hence
+        // `'static`: a job cannot hold a borrow of anything the dropper is
+        // about to free. Each worker owns an `Arc<PoolShared>`, so the shared
+        // state outlives them too, and `closed` is already set - they exit on
+        // their own with nothing left to signal. The wait buys quiescence, not
+        // soundness, which is why it is worth bounding.
+        //
+        // The timeout restarts on every wake, which is what we want: each
+        // worker exit notifies, so a pool that is making progress is never
+        // detached and only a genuinely stuck one runs the clock out.
         while g.total > 0 {
-            g = self.shared.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            let (guard, wait) = self
+                .shared
+                .cv
+                .wait_timeout(g, SHUTDOWN_DETACH_AFTER)
+                .unwrap_or_else(|e| e.into_inner());
+            g = guard;
+            if shutdown_expired(&wait, &self.shared) {
+                break; // detached: they exit on `closed` alone
+            }
         }
     }
 }
@@ -732,11 +816,20 @@ mod loom_tests {
     /// joins cleanly. `running` is read Relaxed while `total` is read under the
     /// lock, so the saturation test can see a stale pair - that may cost a
     /// spawn opportunity, but it must never overshoot.
+    ///
+    /// `pool(1, 1)`, deliberately: the shape is what makes the assertion bite.
+    /// `submit` reads `saturated` under the same guard that just queued the
+    /// job, so no worker can have picked that job up yet - with a ceiling of 2
+    /// and two submits, the second can never see `running >= total` and the
+    /// model is bounded at 2 whether the ceiling is checked or not. At a
+    /// ceiling of 1 the second submit does see the first job running, so
+    /// deleting the `g.total < ceiling` guard grows the pool to 2 and fails
+    /// here.
     #[test]
     fn loom_pool_growth_respects_the_ceiling() {
         bounded_model(|| {
             let ran = Arc::new(AtomicUsize::new(0));
-            let p = pool(1, 2);
+            let p = pool(1, 1);
             let shared = Arc::clone(&p.shared);
 
             p.submit(counting_job(&ran));
@@ -756,6 +849,46 @@ mod loom_tests {
             assert_eq!(g.total, 0, "Drop returned with workers still live");
             drop(g);
             assert_eq!(ran.load(Ordering::Relaxed), 2, "a job was lost");
+        });
+    }
+
+    /// `Drop` returns even when a worker never exits. The wait is what makes a
+    /// job's effects complete before the dropper proceeds, but the dropping
+    /// thread is not always one that can afford to block forever - `Drop` runs
+    /// wherever the last handle falls, including on another pool's worker - so
+    /// the wait is bounded and then detaches.
+    ///
+    /// Modelled with a worker counted in `total` that never exists, which is
+    /// what a real one parked in an uninterruptible syscall looks like from
+    /// here. Remove the detach and this model does not fail, it HANGS - loom
+    /// reports the deadlock, which is the negative control.
+    ///
+    /// loom's `wait_timeout` never reports a timeout, so the detach is
+    /// requested through the `detach_next_drop` seam instead of a clock.
+    #[test]
+    fn loom_pool_drop_detaches_a_worker_that_never_exits() {
+        bounded_model(|| {
+            let p = pool(1, 1);
+            let shared = Arc::clone(&p.shared);
+
+            // A worker that is counted but will never exit.
+            {
+                let mut g =
+                    shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+                g.total += 1;
+            }
+            shared.detach_next_drop(1);
+            drop(p);
+
+            // Reaching here at all is the property. The pool is still closed
+            // to new work, and the phantom worker is still counted - detaching
+            // gives up the wait, it does not falsify the books.
+            let g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(g.closed, "Drop returned without closing the pool");
+            assert!(
+                g.total > 0,
+                "the model's phantom worker cannot have exited"
+            );
         });
     }
 
