@@ -164,10 +164,46 @@ struct SendItem {
 #[cfg(all(feature = "net-server", feature = "uring-fs"))]
 pub(crate) const FILE_TAIL_BUFS: u8 = 2;
 
+/// Chunk buffers **one tail can own at once**, which is twice the mint cap:
+/// `tail_take_buf` counts only mints against `created`, so a spare recycled
+/// from the previous tail's late-flushing chunks is a buffer this tail did
+/// not mint and can still queue. Both caps are `FILE_TAIL_BUFS` and they are
+/// independent, so a tail hands out `FILE_TAIL_BUFS` recycled buffers and
+/// then `FILE_TAIL_BUFS` fresh ones before `tail_take_buf` returns `None`.
+///
+/// Pinned by `a_late_flushing_chunk_never_grows_the_next_tails_pool`, which
+/// asserts four successful takes and never five. Reads clamp to
+/// `fs_body_chunk`, so this many chunks is what one body can put in the send
+/// queue at once - which is what `ServerConfig::validate` must cover.
+#[cfg(all(feature = "net-server", feature = "uring-fs"))]
+pub(crate) const FILE_TAIL_BUF_PEAK: u8 = 2 * FILE_TAIL_BUFS;
+
 /// A `Response::ReplyFile` that arrived while another body was still
 /// streaming, held until that one retires. One body at a time is structural -
 /// two tails' chunks would interleave on the wire - so a second one queues
 /// behind the current body, through the same diversion every other PDU uses.
+///
+/// # Each one pins a descriptor for as long as the body in front streams
+///
+/// `file` is an `Arc<OwnedFd>`, so a queued body holds its fd open from the
+/// moment the handler answers until its turn comes - which for a multi-GB
+/// range on a slow link is minutes. The per-connection hold is therefore the
+/// active tail plus every deferred body, bounded by
+/// `max_in_flight_requests`, and the process-wide hold is that times
+/// `pool_size`. Nothing in `ServerConfig::validate` relates the product to
+/// anything, and at the extremes of the validated space (`MAX_IN_FLIGHT`
+/// 4096 x default `pool_size` 512) it is far past any `RLIMIT_NOFILE`.
+///
+/// That is a deployment-sizing constraint, not a bug to fix here: queueing
+/// rather than shedding is deliberate (the first response's head and
+/// `Content-Length` are already on the wire when the second arrives), and a
+/// cap chosen inside the library would be a different arbitrary number. But
+/// the exhaustion is process-wide and hits accept and every handler open,
+/// and the connections holding the descriptors are the ones making progress,
+/// so nothing sheds them. A consumer serving file bodies to pipelined
+/// clients has to size `max_in_flight_requests` x `pool_size` against its
+/// own fd limit; `CLAUDE.md`'s note about reproducing at `ulimit -Sn 1024`
+/// is where that bites first.
 #[cfg(all(feature = "net-server", feature = "uring-fs"))]
 pub(crate) struct PendingFile {
     pub(crate) head: Vec<u8>,
@@ -221,10 +257,18 @@ pub(crate) struct FileTail {
     /// PDUs and deferred file bodies diverted while this tail is active, in
     /// arrival order (see the struct docs).
     pending: Vec<PendingItem>,
-    /// The next read is waiting on an fs op slot rather than in flight. The
-    /// reply path records the connection in its parked list and re-drives it
-    /// when a slot frees; the flag keeps one connection from being recorded
-    /// twice (`drive_file_tail` is called from three places).
+    /// The connection has an entry in the reply path's parked list, waiting
+    /// for an fs op slot. **Set exactly when the entry is pushed and cleared
+    /// exactly when it is popped** - it is the list's dedup key
+    /// (`drive_file_tail` is called from three places), so clearing it
+    /// anywhere else lets the same connection be recorded twice, which
+    /// unbounds a list whose length is supposed to be capped by the
+    /// connection count and destroys its longest-waiting-first order.
+    ///
+    /// It therefore does **not** track whether a read is in flight; a tail
+    /// driven by some other path while its entry is still queued keeps the
+    /// flag until `redrive_parked_tail` pops it. `reading` is the field that
+    /// answers "is a read in flight".
     pub(crate) parked: bool,
 }
 
@@ -443,6 +487,14 @@ pub(crate) struct Connection<U> {
     next_file: Option<PendingFile>,
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     next_file_pending: Vec<PendingItem>,
+    // A deferred file body carries `close`. `close_on_flush` cannot be armed
+    // for it yet - the body in front is still streaming, and the flush-close
+    // dry checks would then belong to the wrong body - but the handler has
+    // already declared its reply final, so the recv side must stop admitting
+    // requests now rather than when the body eventually installs. Handed off
+    // to `close_on_flush` at install.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    deferred_close: bool,
     pub outstanding: u32, // delivered-but-not-yet-fully-sent requests (read-ahead cap)
     pub ops: u32, // in-flight recv+send+close ops; free the slot only at 0
     next_req_id: u64, // per-connection request id, assigned as requests deliver
@@ -526,6 +578,8 @@ impl<U> Connection<U> {
             next_file: None,
             #[cfg(all(feature = "net-server", feature = "uring-fs"))]
             next_file_pending: Vec::new(),
+            #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+            deferred_close: false,
             outstanding: 0,
             ops: 0,
             next_req_id: 0,
@@ -1050,6 +1104,7 @@ impl<U> Connection<U> {
     /// either way, and the read-ahead cap must see it.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) fn defer_file_reply(&mut self, next: PendingFile) {
+        self.deferred_close |= next.close;
         self.file_tail
             .as_mut()
             .expect("only deferred behind an active tail")
@@ -1057,23 +1112,70 @@ impl<U> Connection<U> {
             .push(PendingItem::File(next));
     }
 
+    /// Whether a reply the handler declared final is queued behind the active
+    /// body. The pump gate stops on this exactly as it stops on
+    /// `close_on_flush`: both mean no further request may be admitted, and
+    /// which of the two holds depends only on whether the closing reply's
+    /// body has reached the wire yet.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn has_deferred_close(&self) -> bool {
+        self.deferred_close
+    }
+
+    /// Without a server-side fs pool no body can be deferred.
+    #[cfg(not(all(feature = "net-server", feature = "uring-fs")))]
+    pub(crate) fn has_deferred_close(&self) -> bool {
+        false
+    }
+
     /// The file body the last tail handed on, if any - installed by the reply
     /// path, which is the only place a read can be issued.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) fn take_queued_file_reply(&mut self) -> Option<PendingFile> {
+        // Installing it arms `close_on_flush` from its own `close`, which
+        // takes the gate over from here.
+        self.deferred_close = false;
         self.next_file.take()
     }
 
-    /// Release a deferred file body's followers without installing it - the
-    /// connection is closing, so nothing more will be read or sent.
+    /// Drop a deferred file body **and everything queued behind it** - the
+    /// connection is flush-closing, so the deferred response will never be
+    /// sent.
+    ///
+    /// The followers go with it because a response's association with its
+    /// request is its position: queueing them here would put the next
+    /// response on the wire where the dropped one belonged, and the peer
+    /// would read it as the answer to a request it does not answer. That is
+    /// the same "response out of order" this diversion exists to prevent
+    /// ([`PendingItem`]), arriving by the close path instead of the send
+    /// path. A peer that sees the close knows what went unanswered and can
+    /// retry it; a peer that sees the wrong body cannot tell.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) fn drop_queued_file_reply(&mut self) {
+        // Every discarded item was charged to `outstanding` when it was
+        // delivered - a file body at `begin_file_reply`, an ordinary reply
+        // credited back only when its `ReplyLast` segment flushes. Nothing
+        // here will flush, so the charges are returned by hand or they leak:
+        // the read-ahead gate, the idle timeout's owes-work test and the
+        // drain's quiesced predicate all read `outstanding`.
+        let mut charged = u32::from(self.next_file.is_some());
         self.next_file = None;
+        // Whatever close a discarded body carried is subsumed by the
+        // `close_on_flush` that brought us here.
+        self.deferred_close = false;
         for item in std::mem::take(&mut self.next_file_pending) {
-            if let PendingItem::Pdu(pdu) = item {
-                self.send_queue.push_back(pdu);
+            match item {
+                PendingItem::File(_) => charged += 1,
+                // A reply retires on its final segment, so only that one
+                // carries a charge; `Push` segments carry none.
+                PendingItem::Pdu(pdu) => {
+                    if matches!(pdu.kind, SendKind::ReplyLast) {
+                        charged += 1;
+                    }
+                }
             }
         }
+        self.outstanding = self.outstanding.saturating_sub(charged);
     }
 
     /// Whether any PDU is queued (or being sent).

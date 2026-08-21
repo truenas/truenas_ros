@@ -1508,14 +1508,33 @@ fn mkdir_path_creates_confined_and_is_idempotent() {
 /// `RESOLVE_NO_SYMLINKS`, so such a candidate dies `ELOOP` before the
 /// confinement is ever reached.
 ///
-/// `TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY=1` turns an empty result into a
-/// failure. Without a boundary these tests return having asserted nothing, so
-/// a runner that quietly has none passes green having tested the one thing the
-/// tests exist for on neither shape of host. The QEMU job provisions
-/// `/POSIXACL` and `/NFSV4ACL` (`setup-test-zfs.sh`) and arms it.
+/// **Real mounts first, and the order is deterministic.** `/proc`, `/sys`,
+/// `/dev` and `/run` are top-level mounts on every Linux host, so "is the
+/// list empty" is a question that answers itself: an emptiness gate could
+/// never fire, and the boundary actually crossed would be whichever entry
+/// `read_dir` happened to yield first - in practice procfs, and a different
+/// pick from run to run.
+///
+/// What the QEMU job pays for is a pair of ZFS datasets (`setup-test-zfs.sh`
+/// mounts `/POSIXACL` and `/NFSV4ACL`), and those are the boundary worth
+/// crossing: a pseudo filesystem shares neither ZFS's mount semantics nor its
+/// ACL behaviour, so pinning `RESOLVE_NO_XDEV` against procfs proves nothing
+/// about the platform the product ships. So the pseudo mounts sort last, and
+/// `TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY=1` demands a **real** crossing rather
+/// than merely any crossing - which is what holds the runner to what the job
+/// provisions.
+///
+/// `symlink_metadata`, not `metadata`: a followed symlink reports its TARGET's
+/// device, so on a usr-merged root `/lib -> usr/lib` qualifies while being an
+/// ordinary symlink on the root filesystem. The opens under test resolve with
+/// `RESOLVE_NO_SYMLINKS`, so such a candidate dies `ELOOP` before the
+/// confinement is ever reached.
 fn mount_crossings() -> Vec<String> {
+    /// Always present, so their presence proves nothing about provisioning.
+    const PSEUDO: [&str; 4] = ["proc", "sys", "dev", "run"];
+
     let root_dev = std::fs::metadata("/").unwrap().dev();
-    let found: Vec<String> = std::fs::read_dir("/")
+    let mut found: Vec<String> = std::fs::read_dir("/")
         .unwrap()
         .flatten()
         .filter_map(|e| {
@@ -1524,11 +1543,21 @@ fn mount_crossings() -> Vec<String> {
                 .then(|| e.file_name().into_string().ok())?
         })
         .collect();
+    // Alphabetical, then a stable partition - so the chosen boundary is the
+    // same on every run of the same host.
+    found.sort();
+    found.sort_by_key(|n| PSEUDO.contains(&n.as_str()));
+    let real = found
+        .iter()
+        .filter(|n| !PSEUDO.contains(&n.as_str()))
+        .count();
     assert!(
-        !found.is_empty()
+        real > 0
             || std::env::var_os("TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY").is_none(),
-        "TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY is set but no top-level directory \
-         is on another filesystem: the confinement tests would assert nothing"
+        "TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY is set but the only top-level \
+         mounts are pseudo filesystems ({found:?}): the datasets \
+         setup-test-zfs.sh provisions are missing, and crossing into procfs \
+         says nothing about ZFS"
     );
     found
 }

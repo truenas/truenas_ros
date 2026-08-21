@@ -1244,13 +1244,18 @@ impl<U> Reactor<U> {
         // A pending flush-close (`close_on_flush`) retires the recv
         // side outright: the farewell PDU is final - buffered
         // pipelined requests are discarded, nothing is re-armed --
-        // and `on_send` closes once the queue drains.
+        // and `on_send` closes once the queue drains. A closing reply
+        // whose file body is still queued behind another one
+        // (`has_deferred_close`) has not armed that flag yet and stops
+        // the gate just the same: the handler declared the reply final
+        // when it returned it, not when its body reaches the wire.
         if conn.recving
             || conn.splicing
             || conn.splice_polling
             || conn.closing
             || conn.recv_close_stash.is_some()
             || conn.close_on_flush.is_some()
+            || conn.has_deferred_close()
         {
             return Ok(Gate::Stop);
         }

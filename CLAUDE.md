@@ -97,13 +97,51 @@ Do not reopen these without a reason that is new.
   op-slot index is packed into the 24-bit `user_data` slot field
   (`user_data::SLOT_MASK`); `TAG_FS_DOMAIN` keeping the two tag vocabularies
   disjoint is true and irrelevant to it.
+- **Dropping a stranded body drops everything queued behind it.** A response's
+  association with its request is its position, so releasing the followers into
+  the send queue puts the next response where the dropped one belonged and the
+  peer answers the wrong request - the same "response out of order" the
+  diversion exists to prevent, arriving by the close path.
+  `drop_queued_file_reply` also returns the discarded items' `outstanding`
+  charges by hand, because nothing will flush to credit them and the read-ahead
+  gate, the idle timeout's owes-work test and the drain's quiesced predicate
+  all read that counter.
+- **A close-carrying reply stops the recv gate when the handler returns it,
+  not when its body reaches the wire.** A deferred `ReplyFile{close}` cannot
+  arm `close_on_flush` - the flush-close dry checks would then belong to the
+  body still streaming in front of it - so `Connection::deferred_close` carries
+  the verdict until install hands it over. Without it the gate stays open and
+  the connection keeps answering requests behind a reply already declared
+  final.
+- **`FileTail::parked` is the parked list's dedup key: set on push, cleared on
+  pop, nowhere else.** It does not track whether a read is in flight
+  (`reading` does). Clearing it on a successful submit leaves the queue entry
+  behind, which lets one connection be recorded twice - unbounding a list whose
+  length is supposed to be capped by the connection count and destroying its
+  longest-waiting-first order. `redrive_parked_tail` also checks for a free
+  slot *before* popping, because `on_cqe` returns early for a cancel
+  completion and for a stale-generation miss and neither frees anything.
+- **The send-backlog check covers `2 x FILE_TAIL_BUFS` chunks, not
+  `FILE_TAIL_BUFS`.** The mint cap and the recycled-spare cap are independent
+  (`tail_take_buf` counts only mints against `created`), so one tail owns and
+  can queue twice its mint cap - which
+  `a_late_flushing_chunk_never_grows_the_next_tails_pool` pins at four takes,
+  never five. It bounds one tail's chunks and nothing else; a reply head, a
+  retired tail's released diversion and an earlier pipelined body's unflushed
+  chunks scale with `max_in_flight_requests` instead.
 
 ### The offload pool
 
-- **`WorkerPool::drop` waits `SHUTDOWN_DETACH_AFTER` and then detaches.**
+- **`WorkerPool::drop` waits `SHUTDOWN_DETACH_AFTER` *in total* and then
+  detaches.** The bound is a deadline computed once (`ShutdownClock`), not the
+  duration passed to each `wait_timeout`: every worker exit notifies, so
+  re-passing the full timeout would make the real bound `workers x
+  SHUTDOWN_DETACH_AFTER` - 128 s at the default ceiling, 2048 s at the
+  validated maximum - and a spurious wake would remove the bound entirely.
   Detaching is sound because `Job` is `Box<dyn FnOnce() + Send>` and therefore
   `'static` - no job holds a borrow of what the dropper frees - and each worker
-  owns an `Arc<PoolShared>`. The wait buys quiescence, not soundness.
+  owns an `Arc<PoolShared>`. The wait buys quiescence, not soundness, which is
+  why a still-draining pool may be detached rather than waited out.
   **Shutdown is not the reason it is bounded**: FUSE (`fs/fuse/dev.c:212`) and
   sunrpc (`net/sunrpc/sched.c:346`) wait `TASK_KILLABLE`, so a supervisor's
   SIGKILL reaps a wedged worker at process exit. The case with no backstop is
@@ -114,11 +152,18 @@ Do not reopen these without a reason that is new.
 
 ### Where a poisoned lock fails closed
 
-- **`SingleFlight`'s `get_or_try_init` returning `EIO` on a poisoned map is the
-  whole story.** All three of its map acquisitions use `?`, so a poisoned
-  `live` fails every `acquire` - including cache hits, since the fast path sits
-  behind that lock. There is no state where invalidation is skipped *and* a
-  stale identity is still served.
+- **`SingleFlight`'s `get_or_try_init` fails closed on a poisoned map because
+  of *where* the first acquisition sits, not because its poison handling is
+  uniform.** It is not uniform: of the four map acquisitions in that function,
+  `:67` and `:90` use `map_err(|_| Errno::EIO)?` while `:101` and `:115` use
+  `if let Ok(mut live)`, which swallows poison - and `invalidate`, `clear` and
+  `len` swallow it too. What makes the whole thing safe is that `:67` is the
+  **first** acquisition and precedes the cache-hit fast path at `:73`, so a
+  poisoned `live` fails every `acquire` before a stale identity can be served.
+  That is an ordering property. **Hoisting the fast path above the `:67` lock
+  is the obvious optimisation and it removes the guarantee**, so if that lock
+  moves, the fail-closed reasoning has to be re-established rather than
+  assumed.
 
 ## Validating against the platform
 
@@ -284,10 +329,9 @@ separate commits even when they ship together.
 
 Write for the next person changing the code, not to defend the last change.
 
-- No back-compatibility apparatus for consumers that do not exist. This library
-  has no external consumers yet; a format does not need two accepted versions,
-  and a doc comment should not claim that tokens "written by an older build"
-  still decode.
+- No back-compatibility apparatus for consumers that do not exist. A format
+  does not need two accepted versions, and a doc comment should not claim that
+  tokens "written by an older build" still decode.
 - Do not narrate past mistakes. "This is deliberate, not an oversight" and
   "the previous behaviour was X" are noise; state the constraint and the
   consequence, and let that stand on its own.
