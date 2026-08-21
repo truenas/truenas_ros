@@ -212,6 +212,17 @@ where
     /// of duplicated or misdelivered.
     fn drain_injections(&mut self) -> errno::Result<()> {
         while let Ok(msg) = self.mailbox.inject_rx.try_recv() {
+            // A control message is the consumer's own: it concerns no
+            // connection, so no liveness check, and it runs here, between
+            // completion batches, whatever the loop's state - a drain
+            // included. The hook is the consumer's code; what it does with
+            // the message is not this loop's business.
+            if let Injected::Control(message) = msg {
+                if let Some(hook) = self.handlers.control.as_mut() {
+                    hook(message);
+                }
+                continue;
+            }
             // Pushes are request-independent: no `take_deferred` gating, no
             // `outstanding` accounting - just the liveness + backlog checks.
             if let Injected::Push {
@@ -358,7 +369,8 @@ where
                 Injected::Push { .. }
                 | Injected::PushClose { .. }
                 | Injected::DetachResume { .. }
-                | Injected::DetachClose { .. } => {
+                | Injected::DetachClose { .. }
+                | Injected::Control(_) => {
                     unreachable!("handled above")
                 }
             };
@@ -453,7 +465,8 @@ where
                 Injected::Push { .. }
                 | Injected::PushClose { .. }
                 | Injected::DetachResume { .. }
-                | Injected::DetachClose { .. } => {
+                | Injected::DetachClose { .. }
+                | Injected::Control(_) => {
                     unreachable!("handled above")
                 }
             }

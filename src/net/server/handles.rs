@@ -611,6 +611,42 @@ pub(super) enum Injected {
     /// A detached connection's worker signalled **close** (or dropped its
     /// [`Detached`] handle unresolved).
     DetachClose { slot: u32, generation: u64 },
+    /// A consumer's own message for its control hook
+    /// ([`ControlHandle::send`]) - not tied to any connection.
+    Control(Box<dyn std::any::Any + Send>),
+}
+
+/// A `Clone + Send + Sync` handle for running a consumer's own work on the
+/// server thread ([`Server::control_handle`]).
+///
+/// The loop owns the protocol handlers and everything they capture, and
+/// runs them on one thread; nothing another thread holds can reach that
+/// state directly. A control message is the way in: it crosses on the
+/// injection channel, and the loop hands it to the hook installed with
+/// [`Server::set_control_hook`] between two batches of completions - so a
+/// swap the hook performs is never observed half-done by a request, and
+/// requests already answered keep sending through it. The hook was built on
+/// the loop thread, so it can share state with the handlers (an `Rc`) that
+/// the message itself, which must be `Send`, cannot carry.
+///
+/// Delivered during a graceful drain too (a reload applied to a draining
+/// server is harmless, and the consumer may want to know it was seen). After
+/// the server stops the message is dropped, silently, like a late push.
+#[derive(Clone, Debug)]
+pub struct ControlHandle {
+    pub(super) tx: mpsc::Sender<Injected>,
+    pub(super) shared: Arc<LoopShared>,
+}
+
+impl ControlHandle {
+    /// Queue `message` for the control hook and wake the loop. Messages
+    /// from one handle arrive in the order they were sent, interleaved
+    /// first-in first-out with deferred replies and pushes. Without a hook
+    /// installed the message is dropped when it is reached.
+    pub fn send(&self, message: Box<dyn std::any::Any + Send>) {
+        let _ = self.tx.send(Injected::Control(message));
+        self.shared.wake.poke();
+    }
 }
 
 /// A `Clone + Send + Sync` stop signal for a running [`Server`] (an extra
