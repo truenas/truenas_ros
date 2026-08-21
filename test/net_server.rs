@@ -24,10 +24,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use truenas_ros::net::server::{
-    Body, ClientAddr, CloseReason, DeferPermit, Deferred, Endian, Framing,
-    Incoming, PeerCred, PrefixWidth, Protocol, PushHandle, Request, Responder,
-    Response, Server, ServerAddr, ServerConfig, ShutdownHandle,
-    length_prefix_header, length_prefixed, setup_ring,
+    Body, ClientAddr, CloseReason, ControlHandle, DeferPermit, Deferred,
+    Endian, Framing, Incoming, PeerCred, PrefixWidth, Protocol, PushHandle,
+    Request, Responder, Response, Server, ServerAddr, ServerConfig,
+    ShutdownHandle, length_prefix_header, length_prefixed, setup_ring,
 };
 use truenas_ros::{Errno, Error};
 
@@ -1382,6 +1382,218 @@ fn push_of_an_empty_payload_is_a_no_op() {
     server.serve_forever().expect("serve_forever");
     let got = client.join().expect("thread join").expect("client io");
     assert_eq!(got, b"real", "an empty push must not reach the wire");
+}
+
+/// A server whose replies are prefixed with a tag the control hook can
+/// swap: the reload shape. The hook and the body handler share the tag
+/// through an `Rc`, which only works because both were built on the loop
+/// thread; the message that crosses threads is just the new tag. Each
+/// applied message is acknowledged with the thread it ran on.
+#[allow(clippy::type_complexity)]
+fn tagged_server() -> Option<(
+    Server<
+        (),
+        impl FnMut(Incoming<'_>) -> Option<()>,
+        impl FnMut(&[u8], &mut ()) -> Framing,
+        impl FnMut(Request<'_, ()>) -> Response,
+    >,
+    SocketAddrV4,
+    std::sync::mpsc::Receiver<(Vec<u8>, thread::ThreadId)>,
+)> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let tag: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(b"A".to_vec()));
+    let for_body = Rc::clone(&tag);
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |req: Request<'_, ()>| -> Response {
+            let mut out = for_body.borrow().clone();
+            out.extend_from_slice(&req.body);
+            Response::Reply(echo_frame(&out))
+        },
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return None,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+    server.set_control_hook(move |message| {
+        let new: Box<Vec<u8>> = message.downcast().expect("a tag");
+        *tag.borrow_mut() = *new;
+        ack_tx
+            .send((tag.borrow().clone(), thread::current().id()))
+            .expect("the test holds the receiver");
+    });
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    Some((server, v4, ack_rx))
+}
+
+/// A control message runs on the server thread, between requests, and two
+/// sent back to back apply in order: a request answered before the swap
+/// carries the old tag, one answered after it carries the new one, and
+/// nothing in between carries half of either.
+#[test]
+fn control_message_runs_on_the_server_thread_between_requests() {
+    let Some((mut server, v4, acks)) = tagged_server() else {
+        return;
+    };
+    let loop_thread = thread::current().id();
+    let control = server.control_handle();
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<()> {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let mut s = connect_tcp(v4)?;
+        send_framed(&mut s, b"1")?;
+        assert_eq!(recv_framed(&mut s)?, b"A1");
+        control.send(Box::new(b"B".to_vec()));
+        control.send(Box::new(b"C".to_vec()));
+        for expect in [b"B", b"C"] {
+            let (tag, ran_on) = acks
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the hook ran");
+            assert_eq!(tag, expect, "applied in the order sent");
+            assert_eq!(ran_on, loop_thread, "ran on the server thread");
+        }
+        send_framed(&mut s, b"2")?;
+        assert_eq!(recv_framed(&mut s)?, b"C2", "the swap reached the handler");
+        Ok(())
+    });
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("client thread").expect("client io");
+}
+
+/// A control message is still delivered while the server drains: the drain
+/// is held open by a parked request, the message applies, and the parked
+/// request's reply then carries the new tag.
+#[test]
+fn control_message_is_delivered_while_draining() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let tag: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(b"A".to_vec()));
+    let (park_tx, park_rx) = std::sync::mpsc::channel::<Deferred>();
+    let for_body = Rc::clone(&tag);
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |req: Request<'_, ()>| -> Response {
+            if &req.body[..] == b"park" {
+                let (deferred, permit) = req.responder.defer();
+                park_tx.send(deferred).expect("the test holds the receiver");
+                return Response::Defer(permit);
+            }
+            let mut out = for_body.borrow().clone();
+            out.extend_from_slice(&req.body);
+            Response::Reply(echo_frame(&out))
+        },
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+    let for_hook = Rc::clone(&tag);
+    server.set_control_hook(move |message| {
+        let new: Box<Vec<u8>> = message.downcast().expect("a tag");
+        *for_hook.borrow_mut() = *new;
+        ack_tx.send(()).expect("the test holds the receiver");
+    });
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let control = server.control_handle();
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<()> {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let mut idle = connect_tcp(v4)?;
+        send_framed(&mut idle, b"x")?;
+        assert_eq!(recv_framed(&mut idle)?, b"Ax");
+        let mut parked = connect_tcp(v4)?;
+        send_framed(&mut parked, b"park")?;
+        let deferred = park_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the request parked");
+        stop.shutdown_graceful(Duration::from_secs(5));
+        let mut b = [0u8; 1];
+        assert_eq!(idle.read(&mut b)?, 0, "the idle sweep marks the drain");
+        // Draining now. The message must still land.
+        control.send(Box::new(b"B".to_vec()));
+        ack_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the hook ran during the drain");
+        // Prove the swap is what the handler now sees: the parked request
+        // is redelivered after it, and its rerun (over an empty frame, as a
+        // redelivery is) reads the tag.
+        deferred.redeliver();
+        assert_eq!(recv_framed(&mut parked)?, b"B");
+        assert_eq!(parked.read(&mut b)?, 0, "closed once nothing is owed");
+        Ok(())
+    });
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("client thread").expect("client io");
+}
+
+/// After the server has stopped a control message goes nowhere: the send
+/// neither fails nor runs the hook, like a late push.
+#[test]
+fn control_message_after_shutdown_is_dropped() {
+    let Some((mut server, _v4, acks)) = tagged_server() else {
+        return;
+    };
+    let control = server.control_handle();
+    let stop = server.shutdown_handle();
+    stop.shutdown();
+    server.serve_forever().expect("serve_forever");
+    drop(server);
+    control.send(Box::new(b"late".to_vec()));
+    assert!(
+        acks.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the hook must not run after the server stopped"
+    );
+}
+
+/// A handle minted but never given a hook drops its messages rather than
+/// failing, and the server keeps serving.
+#[test]
+fn control_message_without_a_hook_is_dropped() {
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = length_prefixed(PrefixWidth::U32, Endian::Big, false, echo);
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let control: ControlHandle = server.control_handle();
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<()> {
+        let _stop = ShutdownOnDrop(stop.clone());
+        control.send(Box::new(42u32));
+        let mut s = connect_tcp(v4)?;
+        send_framed(&mut s, b"still here")?;
+        assert_eq!(recv_framed(&mut s)?, b"still here");
+        Ok(())
+    });
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("client thread").expect("client io");
 }
 
 #[test]

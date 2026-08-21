@@ -280,7 +280,9 @@
 //!   never a replacement.
 //! * **The event loop is deliberately synchronous - it is the reactor.**
 //!   Async consumers integrate at the offload boundary ([`Deferred`],
-//!   [`PushHandle`]: `Send` handles + the eventfd wake), e.g. spawning the
+//!   [`PushHandle`], [`ControlHandle`]: `Send` handles + the eventfd wake;
+//!   the last runs a consumer's own hook on the loop thread, which is how
+//!   configuration is swapped under a running server), e.g. spawning the
 //!   work onto a tokio runtime and replying from the task. The protocol loop
 //!   itself will not become async: every kernel-touched buffer stays owned by
 //!   loop-owned connection slots (nothing can be dropped mid-op, so io_uring's
@@ -458,8 +460,8 @@ pub use crate::net::core::protocol::{
 pub use crate::uring::ring::RingFd;
 pub use config::{Listen, ServerConfig};
 pub use handles::{
-    DeferPermit, Deferred, DetachPermit, Detached, PushHandle, Responder,
-    ServerStats, ShutdownHandle, StatsHandle,
+    ControlHandle, DeferPermit, Deferred, DetachPermit, Detached, PushHandle,
+    Responder, ServerStats, ShutdownHandle, StatsHandle,
 };
 pub use protocol::{
     DetachContext, Incoming, Protocol, Request, Response, length_prefixed,
@@ -526,7 +528,14 @@ struct Handlers<U, AcceptFn, HeaderFn, BodyFn> {
     /// Required iff a `body` handler ever returns [`Response::Detach`]
     /// ([`Server::set_detach_handler`]).
     detach: Option<DetachFn<U>>,
+    /// Runs each [`ControlHandle::send`] message on the loop thread
+    /// ([`Server::set_control_hook`]); without one the messages are dropped.
+    control: Option<ControlFn>,
 }
+
+/// The control hook: the message, on the loop thread, nothing else - the
+/// state it acts on is whatever it captured when it was built there.
+type ControlFn = Box<dyn FnMut(Box<dyn std::any::Any + Send>)>;
 
 /// Work injected by other threads, drained on each wake: deferred replies
 /// and pushes (`inject_*`), and kTLS handshake outcomes (`accept_*` - typed
@@ -824,6 +833,7 @@ where
                 body: protocol.body,
                 tls_handshake: None,
                 detach: None,
+                control: None,
             },
             listeners,
             mailbox: Mailbox {
@@ -1077,6 +1087,16 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         }
     }
 
+    /// A `Clone + Send + Sync` handle for running the control hook on this
+    /// server's thread from any other ([`ControlHandle::send`]). Take it
+    /// before [`Server::serve_forever`], like [`Server::shutdown_handle`].
+    pub fn control_handle(&self) -> ControlHandle {
+        ControlHandle {
+            tx: self.mailbox.inject_tx.clone(),
+            shared: Arc::clone(&self.core.engine.shared),
+        }
+    }
+
     /// A `Clone + Send + Sync` handle for reading this server's counters from
     /// any thread while it runs (see [`ServerStats`]).
     pub fn stats_handle(&self) -> StatsHandle {
@@ -1126,6 +1146,19 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         if let Some(fs) = self.fs.as_mut() {
             fs.set_privileged_xattrs(policy);
         }
+    }
+
+    /// Install the hook that receives every [`ControlHandle::send`] message,
+    /// on the loop thread, between two batches of completions. Built here,
+    /// before serving, it can share state with the protocol handlers (an
+    /// `Rc` both captured) and swap it in place; the message it is handed is
+    /// the `Send` part, which it downcasts. A message arriving with no hook
+    /// installed is dropped.
+    pub fn set_control_hook<F>(&mut self, hook: F)
+    where
+        F: FnMut(Box<dyn std::any::Any + Send>) + 'static,
+    {
+        self.handlers.control = Some(Box::new(hook));
     }
 
     /// Install a hook invoked once per connection as it begins closing:
