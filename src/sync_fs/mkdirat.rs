@@ -19,8 +19,9 @@ use super::Mode;
 /// whoever owns an intermediate directory puts the new directory
 /// somewhere else entirely; an absolute path ignores `dirfd` outright.
 /// The check is what makes that unrepresentable rather than merely
-/// documented, and it mirrors [`uring_fs::Leaf`](crate::uring_fs::Leaf),
-/// which enforces the same rule in the type for the async sibling.
+/// documented. It is [`path::component_defect`](crate::path::component_defect),
+/// the same rule [`uring_fs::Leaf`](crate::uring_fs::Leaf) enforces in the
+/// type for the async sibling.
 ///
 /// To build a nested tree, alternate this with a confined walk -
 /// [`openat2`](super::openat2) under `RESOLVE_BENEATH |
@@ -42,10 +43,7 @@ where
 {
     let raw = dirfd.as_fd().as_raw_fd();
     name.with_tn_path(|cstr| {
-        let b = cstr.to_bytes();
-        // A `CStr` cannot carry an interior NUL, so `Leaf`'s remaining
-        // rejections are the whole set.
-        if b.is_empty() || b == b"." || b == b".." || b.contains(&b'/') {
+        if crate::path::component_defect(cstr.to_bytes()).is_some() {
             return Err(errno::Errno::EINVAL);
         }
         retry_on_eintr(|| unsafe {

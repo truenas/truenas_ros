@@ -1484,18 +1484,39 @@ fn mkdir_path_creates_confined_and_is_idempotent() {
             .expect("extend an existing prefix");
         assert!(dir.join("a/b/other/deep").is_dir());
 
-        // Redundant separators name the same directories.
-        h.mkdir_path(me, &anchor, "a//b/", mode)
-            .expect("doubled and trailing slashes are tolerated");
-
-        // Confinement holds for every component, not just the first.
-        for bad in ["../escape", "a/../../escape", "/abs/path"] {
+        // Every component must be a plain name. `a/../b` is the one worth
+        // stating: `openat2` under CONFINED_RESOLVE resolves it safely, so
+        // it is refused for a different reason - a walk creating `b` cannot
+        // know what `a/..` will turn out to be, and a path that succeeded
+        // where the tree existed and failed where it did not would name two
+        // different things. Redundant separators go with them: they name
+        // the same directory, which makes them a caller assembling a path
+        // wrongly rather than a path meaning something unintended.
+        for bad in [
+            "../escape",
+            "a/../../escape",
+            "/abs/path",
+            "a/../b",
+            ".",
+            "..",
+            "./a",
+            "a/.",
+            "a//b",
+            "a/b/",
+            "",
+        ] {
             assert!(
                 h.mkdir_path(me, &anchor, bad, mode).is_err(),
                 "mkdir_path must refuse {bad:?}"
             );
         }
         assert!(!dir.parent().unwrap().join("escape").exists());
+        // Refused on shape, so refused whether or not the tree exists:
+        // `a/b/c` is there by now and `a/b/../b/c` still is not accepted.
+        assert!(
+            h.mkdir_path(me, &anchor, "a/b/../b/c", mode).is_err(),
+            "an existing tree does not make `..` acceptable"
+        );
     });
 }
 
