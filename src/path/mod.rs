@@ -1,11 +1,20 @@
-//! The [`TnPath`] trait - passing Rust paths to syscalls as C strings.
+//! Paths: handing them to syscalls, and deciding which ones may be handed
+//! at all.
 //!
-//! It converts `str`/`OsStr`/`Path`/`[u8]`/
-//! `CStr` into a NUL-terminated `CStr` with a stack buffer for short paths and
-//! a heap fallback for long ones, then hands it to a closure. An interior NUL
-//! byte yields [`Errno::EINVAL`].
+//! [`TnPath`] converts `str`/`OsStr`/`Path`/`[u8]`/`CStr` into a
+//! NUL-terminated `CStr` with a stack buffer for short paths and a heap
+//! fallback for long ones, then hands it to a closure. An interior NUL byte
+//! yields [`Errno::EINVAL`].
+//!
+//! [`component_defect`] and [`relative_defect`] are the shape rules the
+//! `*at` opcodes need, since none of them honours a `RESOLVE_*` flag. See
+//! [`Defect`] for what each refuses and why there is no normalisation here.
 
 use crate::errno::{Errno, Result};
+
+mod shape;
+
+pub use shape::{Defect, component_defect, components, relative_defect};
 use std::ffi::{CStr, CString, OsStr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;

@@ -1372,8 +1372,23 @@ impl<'a> FsConn<'a> {
     /// caller gets: an `O_PATH` handle to anchor against, or a directory
     /// it can `fsync`, which `O_PATH` cannot (`EBADF`).
     ///
+    /// That choice is the only one `how` has. `O_DIRECTORY` is forced -
+    /// what this answers with is a directory or it is nothing - and a
+    /// `how` carrying `O_CREAT` or `O_TMPFILE` is refused, because either
+    /// would answer with a file where the caller asked for the tree.
+    ///
     /// `EEXIST` is success at every component, so two callers building
     /// one tree both finish.
+    ///
+    /// An invalid argument drops `on_done`, closing the connection, as
+    /// [`open`](Self::open) does. `path` must name its components plainly
+    /// -- relative, no `.`, no `..`, no empty component - which is
+    /// [`path::relative_defect`](crate::path::relative_defect). `..` is
+    /// refused rather than resolved even though `openat2` would resolve it
+    /// safely under [`CONFINED_RESOLVE`]: what `a/..` names depends on what
+    /// `a` turned out to be, so it is not a thing this walk can create, and
+    /// a path that succeeded when the tree existed and failed when it did
+    /// not would mean two different things.
     ///
     /// # Why this is a primitive rather than caller code
     ///
@@ -1409,26 +1424,42 @@ impl<'a> FsConn<'a> {
             return;
         }
         let bytes = path.to_bytes();
-        if bytes.is_empty() || bytes[0] == b'/' {
+        // Judged on shape before anything is submitted, so the probe below
+        // cannot admit what the walk would refuse. See the doc above.
+        if crate::path::relative_defect(bytes).is_some() {
             return;
         }
-        // Validated before anything is submitted, so a path carrying a
-        // component `mkdirat` must not see fails whole rather than
-        // leaving half a tree.
-        let mut parts: VecDeque<CString> = VecDeque::new();
-        for part in bytes.split(|&b| b == b'/').filter(|p| !p.is_empty()) {
-            match Leaf::new(part) {
-                Ok(leaf) => parts.push_back(leaf.to_cstring()),
-                Err(_) => {
-                    return fail(
-                        embed(self.owner, on_done),
-                        Errno::EINVAL,
-                        Vec::new(),
-                    );
-                }
-            }
-        }
+        // Owned, because each component outlives the completion that
+        // consumes it. Every one is a `Leaf` by the check above.
+        let parts: VecDeque<CString> = crate::path::components(bytes)
+            .map(|p| CString::new(p).expect("no NUL: checked above"))
+            .collect();
         let mut raw = how.to_raw();
+        // Every open this makes - the probe, each intermediate, and the
+        // answer - must name a directory, so `O_DIRECTORY` is forced the
+        // way `CONFINED_RESOLVE` is. Two creation flags survive that and
+        // are refused outright:
+        //
+        // `O_CREAT` would otherwise have the probe create a *regular file*
+        // at the leaf and hand it back as though the tree had been built.
+        // The kernel does refuse the pair - "Block bugs where O_DIRECTORY |
+        // O_CREAT created regular files", `build_open_flags`,
+        // `fs/open.c:1278-1284` - but only at the syscall, which is after
+        // the walk has already created the tree beneath the leaf. Refusing
+        // at entry is what keeps a bad argument from leaving a partial one.
+        //
+        // `O_TMPFILE` is `__O_TMPFILE | O_DIRECTORY`, so raising
+        // `O_DIRECTORY` cannot exclude it and testing for it must mask the
+        // `O_DIRECTORY` half off - otherwise every plain directory open
+        // looks like one. It resolves the path as a directory and answers
+        // with an unnamed inode *inside* it, which is not the directory the
+        // caller asked for.
+        const TMPFILE_ONLY: i32 = libc::O_TMPFILE & !libc::O_DIRECTORY;
+        let refused = (libc::O_CREAT | TMPFILE_ONLY) as u64;
+        if raw.flags & refused != 0 {
+            return;
+        }
+        raw.flags |= libc::O_DIRECTORY as u64;
         raw.resolve |= CONFINED_RESOLVE.bits();
 
         let (start, want) = (anchor.clone(), path.to_owned());

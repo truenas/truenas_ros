@@ -603,24 +603,12 @@ impl<'a> Leaf<'a> {
         name: &'a S,
     ) -> crate::Result<Leaf<'a>> {
         let b = name.as_ref();
-        let bad = |why: &str| {
-            Err(crate::Error::Validation(format!(
-                "not a single path component ({why})"
-            )))
-        };
-        match b {
-            [] => return bad("empty"),
-            b"." => return bad("`.`"),
-            b".." => return bad("`..`"),
-            _ => {}
+        match crate::path::component_defect(b) {
+            Some(defect) => Err(crate::Error::Validation(format!(
+                "not a single path component ({defect})"
+            ))),
+            None => Ok(Leaf(b)),
         }
-        if b.contains(&b'/') {
-            return bad("contains `/`");
-        }
-        if b.contains(&0) {
-            return bad("contains NUL");
-        }
-        Ok(Leaf(b))
     }
 
     pub(crate) fn to_cstring(self) -> CString {
@@ -1128,16 +1116,16 @@ impl FsHandle {
     ) -> crate::Result<Anchor> {
         let cpath: CString = path.with_tn_path(|c| c.to_owned())?;
         let bytes = cpath.as_bytes();
-        if bytes.is_empty() {
-            return Err(crate::Error::Validation(
-                "uring_fs mkdir_path: empty path".into(),
-            ));
-        }
-        if bytes.first() == Some(&b'/') {
-            return Err(crate::Error::Validation(
-                "uring_fs mkdir_path: path must be relative to the anchor"
-                    .into(),
-            ));
+        // Judged before anything is opened, so the fast path cannot answer
+        // for a shape the walk would refuse: `a/../b` resolves under
+        // `RESOLVE_BENEATH` and would come back as a directory when the
+        // tree happens to exist, then fail when it does not. See
+        // [`path::Defect`](crate::path::Defect) for why `..` is refused
+        // rather than folded away.
+        if let Some(defect) = crate::path::relative_defect(bytes) {
+            return Err(crate::Error::Validation(format!(
+                "uring_fs mkdir_path: {defect}"
+            )));
         }
 
         // Fast path: the whole tree already exists, so one confined open

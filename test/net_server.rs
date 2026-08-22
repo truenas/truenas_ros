@@ -9515,3 +9515,218 @@ fn fs_conn_mkdir_path_builds_a_tree_and_answers_a_real_directory() {
     assert_eq!(again, b"ok", "an existing tree is not an error");
     assert!(dir.path().join("a/b/c").is_dir(), "the tree was created");
 }
+
+/// `FsConn::mkdir_path` refuses a path whose components it cannot rebuild,
+/// and refuses it on **shape** rather than on whether the kernel resolves
+/// it.
+///
+/// `a/../b` is the case worth pinning: `openat2` under `CONFINED_RESOLVE`
+/// resolves it, so a probe-first order would answer it with a directory
+/// wherever the tree happened to exist and refuse it everywhere else - one
+/// path meaning two things. A walk that has to create `b` cannot know what
+/// `a/..` names, so the answer is the same either way: refused, before
+/// anything is submitted.
+///
+/// An invalid argument drops `on_done`, which closes the connection, as
+/// `open` documents - so the assertion is that the peer sees EOF and no
+/// reply, and that nothing was created on the way.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn fs_conn_mkdir_path_refuses_a_path_it_cannot_rebuild() {
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    use truenas_ros::sync_fs::{Mode, OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality};
+
+    let dir = truenas_ros::tempdir().unwrap();
+    // `a` exists, so `a/../b` is a path the kernel WOULD resolve if the
+    // walk ever let it near `openat2`.
+    std::fs::create_dir(dir.path().join("a")).unwrap();
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+
+    let pc = Arc::clone(&pers);
+    let body = move |mut req: Request<'_, ()>| -> Response {
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let how = OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY);
+        let mode = Mode::from_bits_truncate(0o755);
+        fs.mkdir_path(who, &anchor, c"a/../b", mode, how, move |_d, _fs| {
+            // Never reached: the refusal drops this callback, and dropping
+            // the `Deferred` it holds is what closes the connection.
+            deferred.reply(echo_frame(b"unreachable"));
+        });
+        Response::Defer(permit)
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let cfg = ServerConfig {
+        pool_size: 16,
+        fs_ops: 16,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    pers.set(server.register_self().expect("register_self"))
+        .unwrap();
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<io::Result<Vec<u8>>> {
+        let out = (|| {
+            let mut s = connect_tcp(v4)?;
+            s.set_read_timeout(Some(Duration::from_secs(5)))?;
+            send_framed(&mut s, b"go")?;
+            Ok(recv_framed(&mut s))
+        })();
+        stop.shutdown();
+        out
+    });
+    server
+        .serve_forever()
+        .expect("serve_forever mkdir_path refusal");
+    let got = client.join().unwrap().expect("client io");
+    assert!(
+        got.is_err(),
+        "the refusal closes the connection; the peer must not get a reply"
+    );
+    assert!(
+        !dir.path().join("b").exists() && !dir.path().join("a/b").exists(),
+        "a refused path creates nothing"
+    );
+}
+/// `FsConn::mkdir_path` answers with a directory or with nothing: a `how`
+/// that would make the final open produce a *file* is refused.
+///
+/// `O_CREAT` is the case that bites. The probe opens the whole path, so
+/// with `a/b` present and `c` missing it would create a regular file `c`
+/// and hand it back as though the tree had been built - success, wrong
+/// object, nothing on the wire to say so. The kernel does refuse
+/// `O_DIRECTORY | O_CREAT` (`build_open_flags`, `fs/open.c:1278-1284`),
+/// but only at the syscall, by which point the walk has created the tree;
+/// the refusal here happens before anything is submitted.
+///
+/// `O_TMPFILE` is the case that hides: it is `__O_TMPFILE | O_DIRECTORY`,
+/// so forcing `O_DIRECTORY` does not exclude it and a naive
+/// `flags & O_TMPFILE` test matches every plain directory open.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn fs_conn_mkdir_path_refuses_a_how_that_would_answer_with_a_file() {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use truenas_ros::sync_fs::{Mode, OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality};
+
+    let dir = truenas_ros::tempdir().unwrap();
+    // The parents exist and the leaf does not - exactly the shape where an
+    // `O_CREAT` probe would succeed by creating a regular file.
+    std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+
+    // Which request is being served: 0 => O_CREAT, 1 => O_TMPFILE.
+    let nth = Arc::new(AtomicUsize::new(0));
+    let pc = Arc::clone(&pers);
+    let nc = Arc::clone(&nth);
+    let body = move |mut req: Request<'_, ()>| -> Response {
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let flags = match nc.fetch_add(1, Ordering::Relaxed) {
+            0 => OFlag::O_RDONLY | OFlag::O_CREAT,
+            _ => OFlag::O_RDWR | OFlag::O_TMPFILE,
+        };
+        let how = OpenHow::new()
+            .flags(flags)
+            .mode(Mode::from_bits_truncate(0o644));
+        let mode = Mode::from_bits_truncate(0o755);
+        fs.mkdir_path(who, &anchor, c"a/b/c", mode, how, move |_d, _fs| {
+            // Never reached: the refusal drops this, closing the connection.
+            deferred.reply(echo_frame(b"unreachable"));
+        });
+        Response::Defer(permit)
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let cfg = ServerConfig {
+        pool_size: 16,
+        fs_ops: 16,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    pers.set(server.register_self().expect("register_self"))
+        .unwrap();
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<[bool; 2]> {
+        let out = (|| {
+            let mut got = [false; 2];
+            for slot in got.iter_mut() {
+                let mut s = connect_tcp(v4)?;
+                s.set_read_timeout(Some(Duration::from_secs(5)))?;
+                send_framed(&mut s, b"go")?;
+                *slot = recv_framed(&mut s).is_err();
+            }
+            Ok(got)
+        })();
+        stop.shutdown();
+        out
+    });
+    server
+        .serve_forever()
+        .expect("serve_forever mkdir_path how");
+    let closed = client.join().unwrap().expect("client io");
+    assert_eq!(
+        closed,
+        [true, true],
+        "both O_CREAT and O_TMPFILE must be refused, closing the connection"
+    );
+    let leaf = dir.path().join("a/b/c");
+    assert!(
+        !leaf.exists(),
+        "a refused `how` must not leave anything at the leaf, least of all \
+         a regular file standing in for the directory"
+    );
+}
