@@ -9421,3 +9421,97 @@ fn fs_fd_reclaimed_on_connection_close_midchain() {
          after the connection closed (leaked until server teardown)"
     );
 }
+
+/// `FsConn::mkdir_path` builds a missing tree on-loop and hands back the
+/// deepest directory as a real descriptor.
+///
+/// Two requests, because the call is gated to the request-handler facade: the
+/// first walks a tree that does not exist, the second takes the fast path over
+/// the tree the first made. The reply is the `fsync` of the returned handle,
+/// which an `O_PATH` directory would answer `EBADF`.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn fs_conn_mkdir_path_builds_a_tree_and_answers_a_real_directory() {
+    use std::sync::OnceLock;
+    use std::time::Duration;
+    use truenas_ros::sync_fs::{Mode, OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality};
+
+    let dir = truenas_ros::tempdir().unwrap();
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+
+    let pc = Arc::clone(&pers);
+    let body = move |mut req: Request<'_, ()>| -> Response {
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let how = OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY);
+        let mode = Mode::from_bits_truncate(0o755);
+        fs.mkdir_path(who, &anchor, c"a/b/c", mode, how, move |done, fs| {
+            let Some(deepest) = done.file() else {
+                return deferred.close();
+            };
+            fs.fsync(who, deepest, move |res, _fs| match res.result() {
+                Ok(_) => deferred.reply(echo_frame(b"ok")),
+                Err(_) => deferred.close(),
+            });
+        });
+        Response::Defer(permit)
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let cfg = ServerConfig {
+        pool_size: 16,
+        fs_ops: 16,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    pers.set(server.register_self().expect("register_self"))
+        .unwrap();
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<(Vec<u8>, Vec<u8>)> {
+        // Shut down on every exit: one that skipped it would strand
+        // `serve_forever` and hang rather than fail.
+        let out = (|| {
+            let mut s = connect_tcp(v4)?;
+            s.set_read_timeout(Some(Duration::from_secs(5)))?;
+            // The walk: nothing of `a/b/c` exists yet.
+            send_framed(&mut s, b"walk")?;
+            let walked = recv_framed(&mut s)?;
+            // The fast path: the tree is whole, so one open settles it.
+            send_framed(&mut s, b"again")?;
+            let again = recv_framed(&mut s)?;
+            Ok((walked, again))
+        })();
+        stop.shutdown();
+        out
+    });
+    server.serve_forever().expect("serve_forever mkdir_path");
+    let (walked, again) = client.join().unwrap().expect("client io");
+    assert_eq!(walked, b"ok", "the walk answered a flushable directory");
+    assert_eq!(again, b"ok", "an existing tree is not an error");
+    assert!(dir.path().join("a/b/c").is_dir(), "the tree was created");
+}
