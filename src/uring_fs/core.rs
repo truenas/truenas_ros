@@ -20,8 +20,8 @@
 
 use super::offload_pool::{OffloadBounds, SharedPool};
 use super::{
-    Anchor, File, FsOutcome, Leaf, Personality, PrivilegedXattrs, ReplyTo,
-    RwFlags, statx_at_flags,
+    Anchor, CONFINED_RESOLVE, File, FsOutcome, Leaf, Personality,
+    PrivilegedXattrs, ReplyTo, RwFlags, statx_at_flags,
 };
 use crate::errno::{Errno, retry_on_eintr};
 use crate::sync_fs::openat2::RawOpenHow;
@@ -1240,6 +1240,17 @@ impl std::fmt::Debug for FsDone {
 
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 impl FsDone {
+    /// A completion no op produced - what a multi-step call answers
+    /// with when it refuses between steps.
+    pub(crate) fn failed(err: Errno) -> FsDone {
+        FsDone {
+            result: Err(err),
+            bufs: Vec::new(),
+            file: None,
+            stat: None,
+        }
+    }
+
     /// The op's result: a byte count / `0`, or the errno it failed with.
     pub fn result(&self) -> crate::Result<i32> {
         self.result.map_err(Into::into)
@@ -1348,6 +1359,117 @@ impl<'a> FsConn<'a> {
             anchor.clone(),
             path.to_owned(),
             raw,
+            embed(self.owner, on_done),
+        );
+    }
+
+    /// Create every missing directory along `path` beneath `anchor` as
+    /// `who`, then open the deepest one with `how` - `mkdir -p`,
+    /// confined, on the ring. The reactor twin of
+    /// [`FsHandle::mkdir_path`](crate::uring_fs::FsHandle::mkdir_path).
+    ///
+    /// `on_done` receives the final open, so `how` decides what the
+    /// caller gets: an `O_PATH` handle to anchor against, or a directory
+    /// it can `fsync`, which `O_PATH` cannot (`EBADF`).
+    ///
+    /// `EEXIST` is success at every component, so two callers building
+    /// one tree both finish.
+    ///
+    /// # Why this is a primitive rather than caller code
+    ///
+    /// `mkdirat` honours **no** `RESOLVE_*` flags - that is what [`Leaf`]
+    /// exists for - so handing it `"a/b/c"` would resolve the
+    /// intermediate components unconfined. The only sound construction
+    /// alternates confined `openat2` walks with single-component
+    /// `mkdirat`s, and each of those opens depends on the completion
+    /// before it. A consumer cannot write that loop: every step after
+    /// the first is a continuation, where [`open`](Self::open) is
+    /// refused. Keeping the walk here is what lets that refusal stand.
+    ///
+    /// `CONFINED_RESOLVE` is unioned in, not assigned: a caller may add
+    /// restrictions and may drop none. Unlike a plain open, this one
+    /// creates, and a create that escaped the anchor would leave a
+    /// directory somewhere the caller never named.
+    ///
+    /// Entry is `root`-gated like [`open`](Self::open), and for its
+    /// reason: the directory this hands back would outlive a connection
+    /// that has already gone.
+    pub fn mkdir_path<F>(
+        &mut self,
+        who: Personality,
+        anchor: &Anchor,
+        path: &CStr,
+        mode: Mode,
+        how: OpenHow,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        if !self.root {
+            return;
+        }
+        let bytes = path.to_bytes();
+        if bytes.is_empty() || bytes[0] == b'/' {
+            return;
+        }
+        // Validated before anything is submitted, so a path carrying a
+        // component `mkdirat` must not see fails whole rather than
+        // leaving half a tree.
+        let mut parts: VecDeque<CString> = VecDeque::new();
+        for part in bytes.split(|&b| b == b'/').filter(|p| !p.is_empty()) {
+            match Leaf::new(part) {
+                Ok(leaf) => parts.push_back(leaf.to_cstring()),
+                Err(_) => {
+                    return fail(
+                        embed(self.owner, on_done),
+                        Errno::EINVAL,
+                        Vec::new(),
+                    );
+                }
+            }
+        }
+        let mut raw = how.to_raw();
+        raw.resolve |= CONFINED_RESOLVE.bits();
+
+        let (start, want) = (anchor.clone(), path.to_owned());
+        let on_done: WalkDone = Box::new(on_done);
+        self.open_component(who, start.clone(), want, raw, move |res, conn| {
+            if res.file().is_some() {
+                return on_done(res, conn);
+            }
+            walk(conn, who, start, parts, mode, raw, on_done);
+        });
+    }
+
+    /// Submit an open that is not the request handler's own.
+    ///
+    /// [`open`](Self::open) refuses a continuation because the file it
+    /// produces has nowhere to go once the owning connection is gone
+    /// (`net/server/mod.rs`, the `root: false` facade). A walk's
+    /// intermediates never leave the walk - each is owned by the closure
+    /// that opened it and closes with the chain - so that leak cannot
+    /// arise here. The final open does reach the consumer, which is what
+    /// [`mkdir_path`](Self::mkdir_path) gates at entry instead.
+    ///
+    /// Stays private: every path this resolves is a single validated
+    /// component of one the caller already named, confined, under the
+    /// caller's own personality.
+    fn open_component<F>(
+        &mut self,
+        who: Personality,
+        anchor: Anchor,
+        path: CString,
+        how: RawOpenHow,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.fs.submit_open(
+            self.eng,
+            who.0,
+            anchor,
+            path,
+            how,
             embed(self.owner, on_done),
         );
     }
@@ -1980,6 +2102,57 @@ impl<'a> FsConn<'a> {
             embed(self.owner, on_done),
         );
     }
+}
+
+/// The callback a [`FsConn::mkdir_path`] walk carries between steps.
+///
+/// Boxed: the walk is a loop written as recursion, so a generic parameter
+/// would be a type that contains itself.
+type WalkDone = Box<dyn FnOnce(FsDone, &mut FsConn<'_>)>;
+
+/// One component: create it, open it, and recurse on what is left.
+///
+/// `cur` is the deepest directory reached so far, and the last component's
+/// open is the answer.
+fn walk(
+    conn: &mut FsConn<'_>,
+    who: Personality,
+    cur: Anchor,
+    mut parts: VecDeque<CString>,
+    mode: Mode,
+    how: RawOpenHow,
+    on_done: WalkDone,
+) {
+    let Some(part) = parts.pop_front() else {
+        // Entry validated a non-empty list. Answered rather than dropped:
+        // a dropped callback closes the connection.
+        return on_done(FsDone::failed(Errno::EINVAL), conn);
+    };
+    let bytes = part.clone().into_bytes();
+    let Ok(leaf) = Leaf::new(&bytes) else {
+        return on_done(FsDone::failed(Errno::EINVAL), conn);
+    };
+    let at = cur.clone();
+    conn.mkdirat(who, &at, leaf, mode, move |res, conn| {
+        match res.result() {
+            // `mkdir -p`'s rule, and the outcome of losing a race with
+            // another creator.
+            Ok(_) | Err(crate::Error::Errno(Errno::EEXIST)) => {}
+            Err(_) => return on_done(res, conn),
+        }
+        conn.open_component(who, cur, part, how, move |res, conn| {
+            let Some(f) = res.file() else {
+                return on_done(res, conn);
+            };
+            if parts.is_empty() {
+                return on_done(res, conn);
+            }
+            match Anchor::from_file(&f) {
+                Ok(next) => walk(conn, who, next, parts, mode, how, on_done),
+                Err(_) => on_done(FsDone::failed(Errno::EBADF), conn),
+            }
+        });
+    });
 }
 
 // ---- hybrid off-loop listing: threaded readdir + on-loop enrichment --------
