@@ -81,6 +81,10 @@ pub struct HttpRequest<'a> {
     pub trailers: &'a [HeaderView<'a>],
     /// The peer's identity.
     pub peer: &'a ClientAddr,
+    /// Where this delivery sits in the body. [`Stage::Whole`] for every
+    /// non-streaming builder; a streaming connection walks
+    /// `Open` -> `Window`* -> `End`.
+    pub stage: Stage,
     /// The reply ticket, consumed by [`HttpRequest::defer`].
     responder: Responder,
 }
@@ -161,6 +165,30 @@ impl std::fmt::Debug for ParkedRequest {
     }
 }
 
+/// Where a delivery sits in a body.
+///
+/// Every non-streaming builder delivers [`Stage::Whole`] and nothing else --
+/// the whole body, once, as those builders document. A streaming connection
+/// never delivers `Whole`: it opens with [`Stage::Open`] before a body byte
+/// exists, hands each chunk over as [`Stage::Window`], and closes with
+/// [`Stage::End`] once the terminal chunk and its trailers have landed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Stage {
+    /// The whole body arrived at once.
+    Whole,
+    /// A streamed body's head, before any body byte. The one place to
+    /// refuse a body the server does not want - and, when the client sent
+    /// `Expect: 100-continue`, refusing here means the interim line is never
+    /// sent at all rather than sent and then contradicted.
+    Open,
+    /// One chunk of a streamed body; `body` is this window's payload and
+    /// nothing is retained between windows.
+    Window,
+    /// A streamed body is complete and `trailers` are parsed. The response
+    /// belongs here.
+    End,
+}
+
 /// A deferrable handler's decision for one request.
 // The verdict is built and consumed within one dispatch - it never rests
 // anywhere - so boxing the response to level the variant sizes would buy
@@ -172,6 +200,12 @@ pub enum HttpVerdict {
     Respond(HttpResponse),
     /// The request is parked; the detached [`HttpDeferred`] completes it.
     Defer(HttpDeferPermit),
+    /// Accepted; read on. Only meaningful on a streamed delivery
+    /// ([`Stage::Open`] or [`Stage::Window`]) - it is how a consumer says
+    /// "no reply yet, send me the next window". Returning it from
+    /// [`Stage::Whole`] or [`Stage::End`] would leave the request
+    /// unanswered, so it closes the connection instead.
+    Continue,
 }
 
 impl From<HttpResponse> for HttpVerdict {
@@ -260,11 +294,52 @@ fn now_secs() -> i64 {
 /// disposition, so the reactor discards anything buffered behind it and
 /// closes once it is sent, and the head says so rather than let the peer
 /// find out on its next request.
+/// Force a reply to end the connection.
+///
+/// A response produced while a body is still arriving has abandoned the
+/// rest of it: nothing will read those bytes, so a keep-alive answer would
+/// leave the framer to take them for the next request - a desync that
+/// presents to the client as a spurious second response. The keep-alive
+/// disposition sits in a different field for each reply shape, which is why
+/// this exists rather than a match at each of the three call sites: the one
+/// that only handled `Response::Reply` silently missed every response with
+/// a body, because those are `ReplyVectored`.
+fn force_final(resp: Response) -> Response {
+    match resp {
+        Response::Reply(b) => Response::ReplyClose(b),
+        Response::ReplyVectored { segments, .. } => Response::ReplyVectored {
+            segments,
+            close: true,
+        },
+        #[cfg(feature = "uring-fs")]
+        Response::ReplyFile {
+            head,
+            file,
+            offset,
+            len,
+            ..
+        } => Response::ReplyFile {
+            head,
+            file,
+            offset,
+            len,
+            close: true,
+        },
+        // Already final, or not a reply at all.
+        other => other,
+    }
+}
+
 fn respond(
     head: &Head<'_>,
     resp: HttpResponse,
     dates: &mut DateCache,
     draining: bool,
+    // A reply made while a body is still arriving abandons the rest of it,
+    // so the connection cannot persist and the header must say so - a peer
+    // told keep-alive and then given EOF has to guess whether it was
+    // answered or cut off.
+    abandons_body: bool,
 ) -> Response {
     // A head carrying both Content-Length and Transfer-Encoding frames as
     // chunked here because the transfer coding wins under RFC 9112 section
@@ -275,7 +350,11 @@ fn respond(
     // reply drops keep alive so no pipelined request rides behind a
     // smuggled prefix on this connection.
     let (keep_alive, cl_te_conflict) = head.response_disposition();
-    let keep = keep_alive && !resp.close && !cl_te_conflict && !draining;
+    let keep = keep_alive
+        && !resp.close
+        && !cl_te_conflict
+        && !draining
+        && !abandons_body;
     let conn = match (keep, head.version) {
         (true, Version::Http11) => ConnHeader::None,
         (true, Version::Http10) => ConnHeader::KeepAlive,
@@ -350,6 +429,8 @@ pub(crate) type FsSlot<'a> = std::marker::PhantomData<&'a ()>;
 /// file into the connection's phase.
 enum Dispatched {
     Done(Response),
+    /// The consumer accepted a streamed delivery and wants the next one.
+    Continue,
     Park {
         permit: DeferPermit,
         req: Box<ParkedRequest>,
@@ -390,6 +471,7 @@ fn dispatch<U, H>(
     state: &mut U,
     dates: &mut DateCache,
     handler: &mut H,
+    stage: Stage,
 ) -> Dispatched
 where
     H: FnMut(HttpRequest<'_>, &mut U, FsSlot<'_>) -> HttpVerdict,
@@ -415,17 +497,33 @@ where
             trailers,
             peer,
             responder,
+            stage,
         },
         state,
         fs,
     ) {
         HttpVerdict::Respond(resp) => {
-            Dispatched::Done(respond(&h, resp, dates, drain.draining()))
+            Dispatched::Done(respond(
+                &h,
+                resp,
+                dates,
+                drain.draining(),
+                // A reply at Open or Window is a refusal: the body it
+                // declined is still coming and nothing will read it.
+                matches!(stage, Stage::Open | Stage::Window),
+            ))
         }
         HttpVerdict::Defer(p) => Dispatched::Park {
             permit: p.permit,
             req: p.req,
         },
+        // A delivery that owes a reply cannot be continued past: nothing
+        // would ever answer it, and the connection would hang until a
+        // timeout. Close rather than leak the slot.
+        HttpVerdict::Continue if matches!(stage, Stage::Whole | Stage::End) => {
+            Dispatched::Done(Response::Close)
+        }
+        HttpVerdict::Continue => Dispatched::Continue,
     }
 }
 
@@ -437,11 +535,12 @@ fn respond_parked(
     resp: HttpResponse,
     dates: &mut DateCache,
     draining: bool,
+    abandons_body: bool,
 ) -> Response {
     let mut headers: [HeaderView<'_>; MAX_HEADERS] =
         [HeaderView::EMPTY; MAX_HEADERS];
     match reparse_or_farewell(head_bytes, &mut headers, dates) {
-        Ok(h) => respond(&h, resp, dates, draining),
+        Ok(h) => respond(&h, resp, dates, draining, abandons_body),
         Err(farewell) => farewell,
     }
 }
@@ -469,13 +568,24 @@ where
 {
     /// File a park into the phase, or pass the verdict through - the shared
     /// tail of every dispatching arm.
-    fn settle<U>(conn: &mut HttpConn<U>, d: Dispatched) -> Response {
+    fn settle<U>(
+        conn: &mut HttpConn<U>,
+        d: Dispatched,
+        resume: Option<super::framer::StreamPark>,
+    ) -> Response {
         match d {
             Dispatched::Done(resp) => resp,
             Dispatched::Park { permit, req } => {
-                conn.phase = Phase::Parked { req };
+                conn.phase = Phase::Parked {
+                    req,
+                    resume: resume.map(Box::new),
+                };
                 Response::Defer(permit)
             }
+            // Only a streamed delivery produces this, and those arms handle
+            // it themselves - reaching here would mean a request went
+            // unanswered.
+            Dispatched::Continue => Response::Close,
         }
     }
     match std::mem::replace(&mut conn.phase, Phase::Head) {
@@ -515,8 +625,9 @@ where
                 &mut conn.state,
                 dates,
                 handler,
+                Stage::Whole,
             );
-            settle(conn, d)
+            settle(conn, d, None)
         }
         // A complete chunked message: de-chunk the wire extent, then
         // dispatch the entity against the in-buffer head or the dance's
@@ -546,8 +657,9 @@ where
                                 &mut conn.state,
                                 dates,
                                 handler,
+                                Stage::Whole,
                             );
-                            settle(conn, d)
+                            settle(conn, d, None)
                         }
                         Err(()) => {
                             farewell(500, method_is_head(head_bytes), dates)
@@ -572,8 +684,9 @@ where
                         &mut conn.state,
                         dates,
                         handler,
+                        Stage::Whole,
                     );
-                    settle(conn, d)
+                    settle(conn, d, None)
                 }
                 Err(()) => farewell(500, method_is_head(head_bytes), dates),
             }
@@ -597,8 +710,9 @@ where
                 &mut conn.state,
                 dates,
                 handler,
+                Stage::Whole,
             );
-            settle(conn, d)
+            settle(conn, d, None)
         }
         // A parked request's completion, arriving as a redelivery (the frame
         // is empty; everything real was retained at the park). A worker
@@ -606,7 +720,153 @@ where
         // retained head. Otherwise this is a `redrive`: run the handler
         // again over the identical request view; it may respond, park
         // again, or close.
-        Phase::Parked { req } => {
+        // A streamed body opens with its head and no bytes. This is the
+        // consumer's one chance to refuse before the peer commits to
+        // sending - and when the client asked for `100-continue`, the
+        // interim line is withheld until the consumer has actually
+        // accepted, so a refusal goes out *instead* of it rather than
+        // after inviting a body nobody wanted.
+        Phase::StreamOpen { head, expect } => {
+            if responder.draining() {
+                return farewell(503, method_is_head(&head), dates);
+            }
+            let next = Phase::StreamBody {
+                head: head.clone(),
+                chunk_left: 0,
+                after_payload: false,
+                decoded: 0,
+            };
+            let d = dispatch(
+                &head,
+                Body::inline(&[]),
+                &[],
+                peer,
+                responder,
+                fs,
+                &mut conn.state,
+                dates,
+                handler,
+                Stage::Open,
+            );
+            match d {
+                Dispatched::Continue => {
+                    conn.phase = next;
+                    if expect {
+                        Response::Reply(
+                            b"HTTP/1.1 100 Continue\r\n\r\n".to_vec(),
+                        )
+                    } else {
+                        Response::Reply(Vec::new())
+                    }
+                }
+                // Refused, or parked to decide off-thread. A refusal is
+                // final: the body it declined is still coming and nothing
+                // will read it, so the reply closes rather than leaves the
+                // connection framing a body against the next request.
+                Dispatched::Done(resp) => force_final(resp),
+                d => settle(
+                    conn,
+                    d,
+                    Some(super::framer::StreamPark {
+                        next,
+                        stage: Stage::Open,
+                    }),
+                ),
+            }
+        }
+        // One chunk of a streamed body. Nothing is retained between
+        // windows: the reactor's `consume` drops each one, which is what
+        // stops the body's size bounding what the server can accept.
+        Phase::StreamBody {
+            head,
+            chunk_left,
+            after_payload,
+            decoded,
+        } => {
+            let delivered = body.len();
+            // How much of this chunk is still owed. Mid-chunk the answer is
+            // carried; on a chunk's first window it comes from re-reading
+            // the size line, which is exactly what `header` holds. The
+            // framer cannot leave it here instead: it re-runs for the same
+            // window while the payload arrives, and a second run would then
+            // take the mid-chunk branch and declare a different message.
+            let owed = if chunk_left > 0 {
+                chunk_left
+            } else {
+                match chunked::step(header, after_payload) {
+                    chunked::Step::Chunk { payload, .. } => payload,
+                    // The framer accepted these bytes a moment ago, so a
+                    // disagreement is a codec bug; treat the window as the
+                    // whole chunk rather than desync on it.
+                    _ => delivered,
+                }
+            };
+            let left = owed.saturating_sub(delivered);
+            let next = Phase::StreamBody {
+                head: head.clone(),
+                chunk_left: left,
+                // Only a fully delivered chunk owes the CRLF that closes
+                // it; a split one is still mid-payload.
+                after_payload: left == 0,
+                // Counted here, once per delivery, because the framer
+                // re-runs for the same window while its bytes arrive.
+                decoded: decoded.saturating_add(delivered),
+            };
+            let d = dispatch(
+                &head,
+                body,
+                &[],
+                peer,
+                responder,
+                fs,
+                &mut conn.state,
+                dates,
+                handler,
+                Stage::Window,
+            );
+            match d {
+                Dispatched::Continue => {
+                    conn.phase = next;
+                    Response::Reply(Vec::new())
+                }
+                Dispatched::Done(resp) => force_final(resp),
+                d => settle(
+                    conn,
+                    d,
+                    Some(super::framer::StreamPark {
+                        next,
+                        stage: Stage::Window,
+                    }),
+                ),
+            }
+        }
+        // The terminal chunk: the delivered header IS the trailer section,
+        // so the trailers are parsed from it here rather than carried.
+        Phase::StreamDone { head } => {
+            // The terminal block is itself a complete (empty) chunked
+            // message, so the whole-message compactor parses its trailer
+            // section. It has to outlive the dispatch: the views borrow it.
+            let mut wire = header.to_vec();
+            let compacted = chunked::compact(&mut wire).ok();
+            let trailers = compacted
+                .as_ref()
+                .and_then(|c| c.trailers().ok())
+                .unwrap_or_default();
+            let d = dispatch(
+                &head,
+                Body::inline(&[]),
+                &trailers,
+                peer,
+                responder,
+                fs,
+                &mut conn.state,
+                dates,
+                handler,
+                Stage::End,
+            );
+            settle(conn, d, None)
+        }
+        Phase::Parked { req, resume } => {
             let ParkedRequest {
                 head,
                 body: parked,
@@ -617,13 +877,33 @@ where
                 answer.lock().unwrap_or_else(PoisonError::into_inner).take();
             match chosen {
                 Some(resp) => {
-                    respond_parked(&head, resp, dates, responder.draining())
+                    let out = respond_parked(
+                        &head,
+                        resp,
+                        dates,
+                        responder.draining(),
+                        // A park taken mid-body that answers has abandoned
+                        // the rest of it, exactly as an inline reply there
+                        // would have.
+                        resume.is_some(),
+                    );
+                    // A worker that answered mid-body abandoned a body the
+                    // peer is still sending. Nothing can read the rest, so
+                    // the reply is final: send it and flush-close, rather
+                    // than resume framing bytes that belong to a request
+                    // already answered.
+                    match resume {
+                        Some(_) => force_final(out),
+                        None => out,
+                    }
                 }
                 None => {
                     let views: Vec<HeaderView<'_>> = trailers
                         .iter()
                         .map(|(n, v)| HeaderView { name: n, value: v })
                         .collect();
+                    let stage =
+                        resume.as_ref().map_or(Stage::Whole, |r| r.stage);
                     let d = dispatch(
                         &head,
                         Body::placed(parked),
@@ -634,8 +914,17 @@ where
                         &mut conn.state,
                         dates,
                         handler,
+                        stage,
                     );
-                    settle(conn, d)
+                    match (d, resume) {
+                        // Redriven mid-body and content to read on: put the
+                        // streaming phase back, answer nothing.
+                        (Dispatched::Continue, Some(r)) => {
+                            conn.phase = r.next;
+                            Response::Reply(Vec::new())
+                        }
+                        (d, resume) => settle(conn, d, resume.map(|r| *r)),
+                    }
                 }
             }
         }
@@ -650,6 +939,7 @@ where
 #[allow(clippy::type_complexity)]
 fn build<U, A, H>(
     cfg: HttpConfig,
+    stream_cap: Option<u64>,
     mut accept: A,
     mut handler: H,
 ) -> crate::Result<
@@ -669,7 +959,12 @@ where
     // a second instead of once a response, with no synchronization.
     let mut dates = DateCache::default();
     Ok(Protocol {
-        accept: move |inc: Incoming<'_>| accept(inc).map(HttpConn::new),
+        accept: move |inc: Incoming<'_>| {
+            accept(inc).map(|state| match stream_cap {
+                Some(cap) => HttpConn::new_streaming(state, cap),
+                None => HttpConn::new(state),
+            })
+        },
         header: move |buf: &[u8], conn: &mut HttpConn<U>| {
             frame(buf, conn, &cfg)
         },
@@ -760,7 +1055,7 @@ where
         Option<crate::uring_fs::FsConn<'_>>,
     ) -> HttpVerdict,
 {
-    build(cfg, accept, handler)
+    build(cfg, None, accept, handler)
 }
 
 /// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint whose handler
@@ -807,11 +1102,102 @@ where
 {
     build(
         cfg,
+        None,
         accept,
         move |req: HttpRequest<'_>, state: &mut U, _fs: FsSlot<'_>| {
             handler(req, state)
         },
     )
+}
+
+/// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint that **streams**
+/// request bodies rather than buffering them.
+///
+/// A chunked body is delivered a chunk at a time instead of once when its
+/// terminal chunk lands, so the largest body the endpoint accepts stops
+/// being a buffer size. The handler walks [`Stage::Open`] (the head, before
+/// any body byte), then one [`Stage::Window`] per chunk, then
+/// [`Stage::End`] once the trailers are parsed - and answers with
+/// [`HttpVerdict::Continue`] until `End`, where the response belongs.
+///
+/// `max_body_bytes` bounds the decoded body, checked as each chunk is
+/// declared. It is a parameter rather than a field on [`HttpConfig`]
+/// because [`HttpConfig::max_body`] is the bound a *buffered* delivery
+/// checks before reading, and a streamed body has no declared size to check
+/// against; whoever knows the protocol above knows the number (an S3 front
+/// bounds a part at 5 GiB).
+///
+/// # What a streamed request does differently
+///
+/// - **A refusal closes the connection.** The body it declined is still
+///   being sent and nothing will read it, so a keep-alive reply would frame
+///   the remainder as the next request. That applies to a refusal at `Open`
+///   and to one mid-body alike.
+/// - **`Expect: 100-continue` is answered by the handler, not ahead of it.**
+///   The interim line is withheld until the handler returns
+///   [`HttpVerdict::Continue`] from `Open`, so a refusal goes out *instead*
+///   of the interim rather than after having invited a body.
+/// - **Nothing is retained between windows.** Each chunk's payload is
+///   dropped once the handler returns, so a handler that needs the body
+///   must consume it as it arrives.
+///
+/// Errors when `cfg` fails [`HttpConfig::validate`].
+#[allow(clippy::type_complexity)]
+pub fn protocol_streaming<U, A, H>(
+    cfg: HttpConfig,
+    max_body_bytes: u64,
+    accept: A,
+    mut handler: H,
+) -> crate::Result<
+    Protocol<
+        impl FnMut(Incoming<'_>) -> Option<HttpConn<U>>,
+        impl FnMut(&[u8], &mut HttpConn<U>) -> crate::net::Framing,
+        impl FnMut(Request<'_, HttpConn<U>>) -> Response,
+    >,
+>
+where
+    A: FnMut(Incoming<'_>) -> Option<U>,
+    H: FnMut(HttpRequest<'_>, &mut U) -> HttpVerdict,
+{
+    build(
+        cfg,
+        Some(max_body_bytes),
+        accept,
+        move |req: HttpRequest<'_>, state: &mut U, _fs: FsSlot<'_>| {
+            handler(req, state)
+        },
+    )
+}
+
+/// [`protocol_streaming`] with the per-request fs facade, as `protocol_fs`
+/// is to [`protocol_deferrable`] - a streaming handler that writes what it
+/// receives needs somewhere to put each window, and that is the ring the
+/// server already drives.
+///
+/// Errors when `cfg` fails [`HttpConfig::validate`].
+#[cfg(feature = "uring-fs")]
+#[allow(clippy::type_complexity)]
+pub fn protocol_streaming_fs<U, A, H>(
+    cfg: HttpConfig,
+    max_body_bytes: u64,
+    accept: A,
+    handler: H,
+) -> crate::Result<
+    Protocol<
+        impl FnMut(Incoming<'_>) -> Option<HttpConn<U>>,
+        impl FnMut(&[u8], &mut HttpConn<U>) -> crate::net::Framing,
+        impl FnMut(Request<'_, HttpConn<U>>) -> Response,
+    >,
+>
+where
+    A: FnMut(Incoming<'_>) -> Option<U>,
+    H: FnMut(
+        HttpRequest<'_>,
+        &mut U,
+        Option<crate::uring_fs::FsConn<'_>>,
+    ) -> HttpVerdict,
+{
+    build(cfg, Some(max_body_bytes), accept, handler)
 }
 
 /// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint.
@@ -1934,6 +2320,7 @@ mod tests {
     fn parked_phase_holds_framing() {
         let mut conn = HttpConn::new(());
         conn.phase = Phase::Parked {
+            resume: None,
             req: Box::new(ParkedRequest {
                 head: b"GET / HTTP/1.1\r\nHost: h\r\n\r\n".to_vec(),
                 body: Vec::new(),
@@ -1992,6 +2379,7 @@ mod loom_tests {
                 raw_head: b"GET / HTTP/1.1\r\nHost: h\r\n\r\n",
                 trailers: &[],
                 peer: &peer,
+                stage: Stage::Whole,
                 responder,
             };
             let (deferred, permit) = req.defer();
@@ -2000,7 +2388,10 @@ mod loom_tests {
                 req: parked,
             } = permit;
             let mut conn: HttpConn<()> = HttpConn::new(());
-            conn.phase = Phase::Parked { req: parked };
+            conn.phase = Phase::Parked {
+                req: parked,
+                resume: None,
+            };
 
             let worker = thread::spawn(move || {
                 deferred.reply(HttpResponse::new(204));

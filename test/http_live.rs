@@ -2427,3 +2427,232 @@ fn http_file_body_holds_a_pipelined_request_until_the_body_completes() {
         return; // io_uring unavailable
     };
 }
+
+/// Bind a **streaming** http server that reassembles what it is given and
+/// echoes it back, so the assertion is that a body delivered in pieces is
+/// the body that was sent. `None` means io_uring is unavailable (a skip).
+fn with_streaming_server<T: Send + 'static>(
+    max_body: u64,
+    client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
+) -> Option<T> {
+    use truenas_ros::http::{HttpVerdict, Stage, protocol_streaming};
+
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    // Per-connection state: what the windows have added up to, and how many
+    // of them there were - the count is what proves it streamed rather than
+    // arrived whole.
+    let proto = protocol_streaming(
+        HttpConfig::default(),
+        max_body,
+        |_inc: Incoming<'_>| Some((Vec::<u8>::new(), 0usize)),
+        |req: HttpRequest<'_>, state: &mut (Vec<u8>, usize)| match req.stage {
+            Stage::Open => {
+                state.0.clear();
+                state.1 = 0;
+                HttpVerdict::Continue
+            }
+            Stage::Window => {
+                state.0.extend_from_slice(&req.body[..]);
+                state.1 += 1;
+                HttpVerdict::Continue
+            }
+            Stage::End => {
+                let windows = state.1;
+                HttpVerdict::Respond(
+                    HttpResponse::new(200)
+                        .header("x-windows", windows.to_string())
+                        .body(std::mem::take(&mut state.0)),
+                )
+            }
+            Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
+        },
+    )
+    .expect("codec config is valid");
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return None,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let join = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = client(v4);
+        stop.shutdown();
+        r
+    });
+    server.serve_forever().expect("serve_forever");
+    Some(join.join().expect("client thread").expect("client io"))
+}
+
+/// A multi-chunk PUT, streamed. The body is larger than any single window
+/// and arrives in pieces the handler never sees together; what comes back
+/// has to be exactly what went out, and the window count has to show it was
+/// never assembled by the codec.
+#[test]
+fn a_streamed_body_arrives_in_windows_and_survives_them() {
+    let Some(()) = with_streaming_server(1 << 20, |v4| {
+        let mut s = connect_tcp(v4)?;
+        let mut payload = Vec::new();
+        for i in 0..5u32 {
+            payload.extend_from_slice(&[b'a' + (i as u8); 4096]);
+        }
+        let mut wire = b"PUT /echo HTTP/1.1\r\nHost: t\r\n\
+                         Transfer-Encoding: chunked\r\n\r\n"
+            .to_vec();
+        for part in payload.chunks(4096) {
+            wire.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            wire.extend_from_slice(part);
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        s.write_all(&wire)?;
+        let (status, head, body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert_eq!(body, payload, "every window's bytes, in order");
+        assert!(
+            head.to_ascii_lowercase().contains("x-windows: 5"),
+            "one delivery per chunk, not one for the body: {head}"
+        );
+        Ok(())
+    }) else {
+        return; // io_uring unavailable
+    };
+}
+
+/// A chunk larger than the window arrives in several windows. The bound on
+/// what this server buffers has to be one it picked: otherwise a peer that
+/// sends a single large chunk decides it, and `max_request_bytes` is the
+/// only thing standing between that and a megabyte per connection.
+#[test]
+fn one_oversized_chunk_is_delivered_in_several_windows() {
+    let Some(()) = with_streaming_server(4 << 20, |v4| {
+        let mut s = connect_tcp(v4)?;
+        // One chunk, three windows' worth.
+        let payload = vec![b'z'; 3 * 128 * 1024];
+        let mut wire = b"PUT /echo HTTP/1.1\r\nHost: t\r\n\
+                         Transfer-Encoding: chunked\r\n\r\n"
+            .to_vec();
+        wire.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+        wire.extend_from_slice(&payload);
+        wire.extend_from_slice(b"\r\n0\r\n\r\n");
+        s.write_all(&wire)?;
+        let (status, head, body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        assert_eq!(body, payload, "split and rejoined without loss");
+        assert!(
+            head.to_ascii_lowercase().contains("x-windows: 3"),
+            "one chunk, but three deliveries: {head}"
+        );
+        Ok(())
+    }) else {
+        return; // io_uring unavailable
+    };
+}
+
+/// The decoded cap is measured as chunks are declared, so a body that
+/// exceeds it is refused partway through rather than after being buffered --
+/// which is the point, since it is never buffered.
+#[test]
+fn a_streamed_body_over_the_cap_is_refused_mid_stream() {
+    let Some(()) = with_streaming_server(8192, |v4| {
+        let mut s = connect_tcp(v4)?;
+        let mut wire = b"PUT /echo HTTP/1.1\r\nHost: t\r\n\
+                         Transfer-Encoding: chunked\r\n\r\n"
+            .to_vec();
+        for _ in 0..4 {
+            wire.extend_from_slice(b"1000\r\n");
+            wire.extend_from_slice(&[b'x'; 0x1000]);
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        // The peer may be cut off mid-write once the server answers 413 and
+        // closes; that is the refusal working, not a test failure.
+        let _ = s.write_all(&wire);
+        let (status, _) = read_head(&mut s)?;
+        assert_eq!(status, 413, "refused as the cap was crossed");
+        Ok(())
+    }) else {
+        return; // io_uring unavailable
+    };
+}
+
+/// A handler that refuses partway through a body. The peer is still
+/// sending, and nothing will read the rest, so the reply has to be final:
+/// a keep-alive answer would leave the remaining chunks to be framed as the
+/// next request. The client must see the status and then EOF.
+#[test]
+fn a_handler_refusing_mid_body_ends_the_connection() {
+    use truenas_ros::http::{HttpVerdict, Stage, protocol_streaming};
+
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = protocol_streaming(
+        HttpConfig::default(),
+        1 << 20,
+        |_inc: Incoming<'_>| Some(0usize),
+        |req: HttpRequest<'_>, seen: &mut usize| match req.stage {
+            Stage::Open => HttpVerdict::Continue,
+            // Accept one window, then refuse - the shape a quota or a
+            // checksum failure has.
+            Stage::Window if *seen == 0 => {
+                *seen += 1;
+                HttpVerdict::Continue
+            }
+            Stage::Window => {
+                HttpVerdict::Respond(HttpResponse::new(413).body("too much"))
+            }
+            _ => HttpVerdict::Respond(HttpResponse::new(200)),
+        },
+    )
+    .expect("codec config is valid");
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let join = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            let mut wire = b"PUT /o HTTP/1.1\r\nHost: t\r\n\
+                             Transfer-Encoding: chunked\r\n\r\n"
+                .to_vec();
+            for _ in 0..4 {
+                wire.extend_from_slice(b"1000\r\n");
+                wire.extend_from_slice(&[b'x'; 0x1000]);
+                wire.extend_from_slice(b"\r\n");
+            }
+            wire.extend_from_slice(b"0\r\n\r\n");
+            // The refusal closes under us; a partial write is the mechanism
+            // working, not a failure.
+            let _ = s.write_all(&wire);
+            let (status, head1) = read_head(&mut s)?;
+            assert_eq!(status, 413, "the handler's refusal reached the peer");
+            assert!(
+                head1.to_ascii_lowercase().contains("connection: close"),
+                "a refusal has to announce the close, not just perform it - \
+                 a peer told keep-alive and then given EOF cannot tell \
+                 whether it was answered or cut off: {head1}"
+            );
+            // And then nothing: the connection is finished, so a read past
+            // the body sees EOF rather than another response.
+            let mut rest = Vec::new();
+            s.read_to_end(&mut rest)?;
+            assert!(
+                !rest.windows(4).any(|w| w == b"HTTP"),
+                "no second response was framed from the abandoned body"
+            );
+            Ok(())
+        })();
+        stop.shutdown();
+        r
+    });
+    server.serve_forever().expect("serve_forever");
+    join.join().expect("client thread").expect("client io");
+}

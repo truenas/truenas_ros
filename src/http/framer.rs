@@ -126,6 +126,17 @@ impl HttpConfig {
     }
 }
 
+/// The most body a single streamed delivery carries.
+///
+/// A bound this side picks, because the alternative is the peer's chunk
+/// size picking it. 128 KiB is what botocore sends over TLS
+/// (`httpsession.py`'s 128 KiB `BUFFER_SIZE`, which overrides urllib3's
+/// 16 KiB), so the common case is one window per chunk with no splitting;
+/// it clears one TLS record (`TLS_MAX_PAYLOAD_SIZE`, 16 KiB) by eight, which
+/// is what a kTLS recv needs before it will decrypt straight into the
+/// caller's pages; and it matches ZFS's default `recordsize`.
+pub(crate) const STREAM_WINDOW: usize = 128 * 1024;
+
 /// Where the connection stands between messages.
 #[derive(Debug)]
 pub(crate) enum Phase {
@@ -177,6 +188,44 @@ pub(crate) enum Phase {
         /// only body bytes, and body bytes are client-chosen.
         head_only: bool,
     },
+    /// A streamed body's head has been delivered on its own; the next call
+    /// hands the consumer its opening view, before a body byte arrives.
+    StreamOpen {
+        /// The head bytes, verbatim.
+        head: Vec<u8>,
+        /// The client asked for `100-continue`, so the glue owes an interim
+        /// line **if** the consumer accepts. Holding it until then is the
+        /// point of streaming: a rejection goes out instead of the interim,
+        /// rather than after inviting a body nobody wanted.
+        expect: bool,
+    },
+    /// A streamed body in progress: the body is declared a window at a
+    /// time, so the reactor's buffer never holds more than one and the
+    /// body's size stops bounding what the server can accept.
+    StreamBody {
+        /// The head every window is paired with.
+        head: Vec<u8>,
+        /// Payload still owed by the chunk being delivered, and zero
+        /// between chunks. A chunk larger than [`STREAM_WINDOW`] is handed
+        /// over in several windows rather than one - otherwise the peer's
+        /// choice of chunk size would decide how much this server buffers,
+        /// which is the client dictating a server bound.
+        chunk_left: usize,
+        /// A previous chunk's payload has been consumed, so the CRLF that
+        /// closes it is the next step's framing. Advanced by the glue on
+        /// delivery, never here: [`frame`] re-runs for the same chunk while
+        /// its payload is still arriving, and must answer the same way each
+        /// time.
+        after_payload: bool,
+        /// Decoded payload declared so far, for the mid-stream cap.
+        decoded: usize,
+    },
+    /// The terminal chunk was declared; its trailer section is the delivered
+    /// header and the next call finishes the request.
+    StreamDone {
+        /// The head this body belonged to.
+        head: Vec<u8>,
+    },
     /// A request is parked for deferred completion
     /// ([`HttpRequest::defer`](super::protocol::HttpRequest::defer)): the
     /// retained request rides here until the worker's outcome redelivers it.
@@ -187,7 +236,22 @@ pub(crate) enum Phase {
         /// The retained request plus the answer cell a worker's
         /// [`reply`](super::protocol::HttpDeferred::reply) fills.
         req: Box<super::protocol::ParkedRequest>,
+        /// What to put back when the park resolves, when the park was
+        /// taken mid-body. Without it the connection would return to
+        /// [`Phase::Head`] and the rest of the body would be framed as a
+        /// new request - a desync, not an error.
+        resume: Option<Box<StreamPark>>,
     },
+}
+
+/// A park taken mid-body: the phase to restore, and which stage the
+/// retained delivery belongs to so a redrive re-presents it as itself.
+#[derive(Debug)]
+pub(crate) struct StreamPark {
+    /// The phase the connection returns to once the park resolves.
+    pub(crate) next: Phase,
+    /// The stage the retained delivery was made at.
+    pub(crate) stage: super::protocol::Stage,
 }
 
 /// Per-connection codec state wrapping the consumer's own state `U`.
@@ -196,6 +260,18 @@ pub(crate) enum Phase {
 /// it through the reactor as the connection's protocol state.
 pub struct HttpConn<U> {
     pub(crate) phase: Phase,
+    /// Deliver bodies a chunk at a time rather than whole, bounding the
+    /// decoded body at this many bytes. Set by the streaming protocol
+    /// builder's accept wrapper; the other builders leave it `None` and keep
+    /// the single-delivery contract they document.
+    ///
+    /// The bound is the builder's to supply because a streaming codec has no
+    /// defensible default for it: streaming exists for bodies whose size is
+    /// not known in advance, so `max_body` - which a buffered delivery can
+    /// check before reading - has nothing to check against here. Refusing to
+    /// guess forces the decision to the call site that knows the protocol
+    /// above (an S3 front bounds a part at 5 GiB).
+    pub(crate) stream_cap: Option<u64>,
     /// The consumer's per-connection state, as returned by their accept
     /// handler.
     pub state: U,
@@ -210,6 +286,19 @@ impl<U> HttpConn<U> {
     pub fn new(state: U) -> Self {
         Self {
             phase: Phase::Head,
+            stream_cap: None,
+            state,
+        }
+    }
+
+    /// A connection whose bodies are delivered a chunk at a time, with the
+    /// decoded body bounded at `max_body_bytes`. The streaming builder's
+    /// accept wrapper mints these; see [`HttpConn::new`] for why the
+    /// constructor is public.
+    pub fn new_streaming(state: U, max_body_bytes: u64) -> Self {
+        Self {
+            phase: Phase::Head,
+            stream_cap: Some(max_body_bytes),
             state,
         }
     }
@@ -310,6 +399,16 @@ pub(crate) fn frame<U>(
             scan_step(buf, conn, cfg)
         }
         Phase::ChunkedBody { .. } => scan_step(buf, conn, cfg),
+        // The glue advances both of these at delivery, so the framer should
+        // not see them; degrade like the other impossible phases rather than
+        // stall a connection on a scheduling surprise.
+        Phase::StreamOpen { .. } | Phase::StreamDone { .. } => {
+            Framing::Complete {
+                header_len: buf.len(),
+                body_len: 0,
+            }
+        }
+        Phase::StreamBody { .. } => stream_step(buf, conn),
         Phase::Head => {
             // In this phase the buffer front IS the head region, so the
             // method prefix is sound to read here - unlike at delivery,
@@ -389,6 +488,22 @@ pub(crate) fn frame<U>(
                                 }
                             }
                         }
+                        BodyKind::Chunked if conn.stream_cap.is_some() => {
+                            // Streamed: the head goes out on its own so the
+                            // consumer can refuse before a body byte
+                            // arrives - and, when the client asked for it,
+                            // so the interim line is withheld until the
+                            // consumer has actually accepted.
+                            let head_len = facts.len;
+                            conn.phase = Phase::StreamOpen {
+                                head: buf[..head_len].to_vec(),
+                                expect: facts.expects_continue,
+                            };
+                            Framing::Complete {
+                                header_len: head_len,
+                                body_len: 0,
+                            }
+                        }
                         BodyKind::Chunked => {
                             if facts.expects_continue {
                                 // Chunked always dances when asked: the
@@ -429,6 +544,80 @@ pub(crate) fn frame<U>(
 /// onto [`Framing`]: `More` while the stream is mid-message (enforcing the
 /// decoded and wire caps as it goes), `Complete` for the full wire extent
 /// once the terminal chunk and trailers land.
+/// One chunk of a streamed body, declared as its own message.
+///
+/// The contrast with [`scan_step`] is the whole of Option C: that one holds
+/// the body until the terminal chunk lands and delivers it once, so the
+/// largest body the server can accept is a buffer size. This declares each
+/// chunk as it becomes locatable, the reactor's `consume` drops it, and the
+/// body's size stops being a memory question.
+///
+/// **Re-entrant on purpose.** `frame` runs again for the same chunk while
+/// its payload is still arriving, so nothing here may advance
+/// `after_payload` - the glue does that once the payload is delivered.
+fn stream_step<U>(buf: &[u8], conn: &mut HttpConn<U>) -> Framing {
+    let Phase::StreamBody {
+        head,
+        chunk_left,
+        after_payload,
+        decoded,
+    } = &conn.phase
+    else {
+        // Caller invariant; nothing about the request is knowable here.
+        return fail(&mut conn.phase, buf.len(), 500, false);
+    };
+    let head_only = method_is_head(head);
+    let (chunk_left, after_payload, decoded) =
+        (*chunk_left, *after_payload, *decoded);
+    // Mid-chunk: the framing was consumed with the first window, so what is
+    // left is payload and nothing else.
+    if chunk_left > 0 {
+        return Framing::Complete {
+            header_len: 0,
+            body_len: chunk_left.min(STREAM_WINDOW),
+        };
+    }
+    match chunked::step(buf, after_payload) {
+        chunked::Step::More => Framing::More,
+        chunked::Step::Bad(status) => {
+            fail(&mut conn.phase, buf.len(), status, head_only)
+        }
+        chunked::Step::Chunk { framing, payload } => {
+            // The cap is on the decoded body and is checked as each chunk is
+            // declared, not after buffering one - a streamed body is never
+            // buffered whole, so there is no "after" to check at.
+            let total = (decoded as u64).saturating_add(payload as u64);
+            let over = conn.stream_cap.is_some_and(|cap| total > cap);
+            if over {
+                return fail(&mut conn.phase, buf.len(), 413, head_only);
+            }
+            // `decoded` is advanced by the glue on delivery, for the same
+            // reason `after_payload` is: this runs again for the same chunk
+            // while its payload arrives, and advancing here would count the
+            // chunk once per re-entry.
+            Framing::Complete {
+                header_len: framing,
+                body_len: payload.min(STREAM_WINDOW),
+            }
+        }
+        chunked::Step::Last { framing } => {
+            let Phase::StreamBody { head, .. } =
+                std::mem::replace(&mut conn.phase, Phase::Head)
+            else {
+                unreachable!("matched StreamBody above");
+            };
+            conn.phase = Phase::StreamDone { head };
+            // A terminal chunk is only locatable once its whole trailer
+            // section is buffered, so this delivers immediately and the
+            // phase change cannot be re-entered.
+            Framing::Complete {
+                header_len: framing,
+                body_len: 0,
+            }
+        }
+    }
+}
+
 fn scan_step<U>(
     buf: &[u8],
     conn: &mut HttpConn<U>,
@@ -980,5 +1169,137 @@ mod tests {
     fn empty_buffer_wants_more() {
         let mut c = conn();
         assert_eq!(frame(b"", &mut c, &cfg()), Framing::More);
+    }
+
+    /// The shape boto3 sends over TLS, walked a chunk at a time: the head
+    /// goes out alone, each HTTP chunk is declared as its own message, and
+    /// the terminal chunk closes it. No verdict ever names more than one
+    /// chunk, which is what keeps the reactor's buffer off the body's size.
+    #[test]
+    fn a_streamed_body_is_declared_one_chunk_at_a_time() {
+        let mut c = HttpConn::new_streaming((), 1 << 20);
+        let head = b"PUT /o HTTP/1.1\r\nHost: t\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n";
+        // The head, alone.
+        assert_eq!(
+            frame(head, &mut c, &cfg()),
+            Framing::Complete {
+                header_len: head.len(),
+                body_len: 0
+            }
+        );
+        assert!(matches!(c.phase, Phase::StreamOpen { expect: false, .. }));
+
+        // The glue accepts and advances; from here the buffer holds body.
+        c.phase = Phase::StreamBody {
+            head: head.to_vec(),
+            chunk_left: 0,
+            after_payload: false,
+            decoded: 0,
+        };
+        let body = b"4\r\nAAAA\r\n3\r\nBBB\r\n0\r\n\r\n";
+        assert_eq!(
+            frame(body, &mut c, &cfg()),
+            Framing::Complete {
+                header_len: 3,
+                body_len: 4
+            },
+            "the first chunk's size line, then its payload"
+        );
+
+        // Consume it as the reactor would, and advance as the glue does.
+        let rest = &body[3 + 4..];
+        c.phase = Phase::StreamBody {
+            head: head.to_vec(),
+            chunk_left: 0,
+            after_payload: true,
+            decoded: 4,
+        };
+        assert_eq!(
+            frame(rest, &mut c, &cfg()),
+            Framing::Complete {
+                header_len: 5,
+                body_len: 3
+            },
+            "the CRLF closing the last payload rides in this chunk's framing"
+        );
+
+        let rest = &rest[5 + 3..];
+        c.phase = Phase::StreamBody {
+            head: head.to_vec(),
+            chunk_left: 0,
+            after_payload: true,
+            decoded: 7,
+        };
+        assert_eq!(
+            frame(rest, &mut c, &cfg()),
+            Framing::Complete {
+                header_len: rest.len(),
+                body_len: 0
+            },
+            "the terminal chunk, header only"
+        );
+        assert!(matches!(c.phase, Phase::StreamDone { .. }));
+    }
+
+    /// `frame` runs again for the same chunk while its payload is still
+    /// arriving, so it must answer the same way every time. Advancing
+    /// `after_payload` inside it would eat a second CRLF on the re-run and
+    /// mis-frame the body.
+    #[test]
+    fn a_streamed_chunk_is_declared_the_same_way_on_every_re_entry() {
+        let body = b"20000\r\n";
+        let mut c = HttpConn::new_streaming((), 1 << 20);
+        c.phase = Phase::StreamBody {
+            head: b"PUT / HTTP/1.1\r\nHost: t\r\n\r\n".to_vec(),
+            chunk_left: 0,
+            after_payload: false,
+            decoded: 0,
+        };
+        let first = frame(body, &mut c, &cfg());
+        assert_eq!(
+            first,
+            Framing::Complete {
+                header_len: 7,
+                body_len: 0x20000
+            }
+        );
+        // The payload has not arrived; the pump reads and re-frames.
+        for _ in 0..3 {
+            assert_eq!(frame(body, &mut c, &cfg()), first, "re-entrant");
+        }
+        // And no per-chunk state moved while it did. Counting the chunk on
+        // every re-entry would walk `decoded` toward the cap on a body that
+        // has not delivered a byte, refusing it partway through.
+        let Phase::StreamBody {
+            decoded,
+            after_payload,
+            ..
+        } = &c.phase
+        else {
+            panic!("still streaming");
+        };
+        assert_eq!(*decoded, 0, "the chunk is counted once, on delivery");
+        assert!(!*after_payload, "and the cursor has not moved either");
+    }
+
+    /// The decoded cap is checked as each chunk is declared, because a
+    /// streamed body is never buffered whole - there is no "after" to check
+    /// at. The bound is the builder's, not `max_body`.
+    #[test]
+    fn a_streamed_body_is_capped_as_it_is_declared() {
+        let mut c = HttpConn::new_streaming((), 6);
+        c.phase = Phase::StreamBody {
+            head: b"PUT / HTTP/1.1\r\nHost: t\r\n\r\n".to_vec(),
+            chunk_left: 0,
+            after_payload: false,
+            decoded: 4,
+        };
+        // 4 already declared, 3 more would be 7 against a cap of 6.
+        let v = frame(b"3\r\nBBB\r\n", &mut c, &cfg());
+        assert!(
+            matches!(c.phase, Phase::Fail { status: 413, .. }),
+            "over the cap mid-stream, got {v:?}"
+        );
     }
 }

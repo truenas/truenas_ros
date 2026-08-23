@@ -282,6 +282,81 @@ pub(crate) fn scan(
     run(body, s, &mut |_| {}, &mut |_| {})
 }
 
+/// One step of a **chunk-at-a-time** walk: where the next payload extent
+/// starts and how long it is, without scanning past it.
+///
+/// [`scan`] answers "is the whole message here yet", which requires holding
+/// the whole message. This answers "where is the next payload", which is
+/// what a caller streaming a body needs - it can consume each chunk and
+/// forget it, so the buffer never holds more than one.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum Step {
+    /// Not enough bytes to decide yet.
+    More,
+    /// `framing` bytes of chunk header precede `payload` bytes of data.
+    Chunk {
+        /// Bytes before the payload: the CRLF closing the previous chunk
+        /// when there was one, then the size line and its CRLF.
+        framing: usize,
+        /// Payload bytes, as the size line declared them.
+        payload: usize,
+    },
+    /// The terminal chunk and its trailer section together occupy `framing`
+    /// bytes. There is no payload and the body ends here.
+    Last {
+        /// Extent of the terminal chunk, including any trailer section and
+        /// the closing CRLF.
+        framing: usize,
+    },
+    /// Malformed, with the status to answer.
+    Bad(u16),
+}
+
+/// Locate the next chunk's payload. `after_payload` is set once a previous
+/// chunk's data has been consumed, because the CRLF that closes it is left
+/// for this call to eat - counting it as the *next* chunk's framing keeps
+/// the caller's cursor on a payload boundary at every step.
+pub(crate) fn step(buf: &[u8], after_payload: bool) -> Step {
+    let mut at = 0;
+    if after_payload {
+        match buf {
+            [b'\r', b'\n', ..] => at = 2,
+            // A prefix of CRLF may still become one.
+            [] | [b'\r'] => return Step::More,
+            _ => return Step::Bad(400),
+        }
+    }
+    let rest = &buf[at..];
+    match find_crlf(rest, CHUNK_LINE_MAX) {
+        Find::NeedMore => Step::More,
+        Find::TooLong => Step::Bad(400),
+        Find::At(nl) => {
+            let line = &rest[..nl];
+            if line_has_bare_crlf(line) {
+                return Step::Bad(400);
+            }
+            match parse_size_line(line) {
+                None => Step::Bad(400),
+                // A zero size line opens the terminal chunk, whose trailer
+                // section still has to be walked to its end. From here the
+                // remainder IS a complete (empty) chunked message, so the
+                // whole-message scanner answers it exactly.
+                Some(0) => match scan(rest, &mut ChunkScan::default()) {
+                    Ok(Some(extent)) => Step::Last {
+                        framing: at + extent,
+                    },
+                    Ok(None) => Step::More,
+                    Err(status) => Step::Bad(status),
+                },
+                Some(payload) => Step::Chunk {
+                    framing: at + nl + 2,
+                    payload,
+                },
+            }
+        }
+    }
+}
+
 /// Accumulator for the decoded entity: a message whose payload is one
 /// contiguous span (the single-chunk shape default botocore sends) stays a
 /// borrow of the wire; only a second span forces the stitch into an owned
@@ -546,6 +621,92 @@ mod tests {
         let (entity, _) =
             decode(b"5 ;x\r\nhello\r\n0\r\n\r\n").expect("decodes");
         assert_eq!(&entity[..], b"hello");
+    }
+
+    /// A chunk-at-a-time walk over the golden botocore wire: one payload
+    /// extent, then the terminal chunk with its trailer section. The whole
+    /// point is that neither answer needs the rest of the message present,
+    /// which is what lets a caller consume each chunk and forget it.
+    #[test]
+    fn step_walks_a_body_one_chunk_at_a_time() {
+        let wire = botocore_wire();
+        let first = step(&wire, false);
+        let Step::Chunk { framing, payload } = first else {
+            panic!("expected a payload extent, got {first:?}");
+        };
+        assert_eq!(framing, 4, "`8e\\r\\n` and nothing else");
+        assert_eq!(payload, 0x8e, "the size line's own declaration");
+        // Consume framing + payload; the CRLF closing it is the next step's.
+        let rest = &wire[framing + payload..];
+        assert_eq!(
+            step(rest, true),
+            Step::Last {
+                framing: rest.len()
+            }
+        );
+    }
+
+    /// The CRLF closing a payload belongs to the next step, so a caller's
+    /// cursor sits on a payload boundary at every point. Anything else there
+    /// is a framing error, not a short read.
+    #[test]
+    fn step_eats_the_crlf_that_closed_the_last_payload() {
+        assert_eq!(step(b"", true), Step::More);
+        assert_eq!(step(b"\r", true), Step::More, "a CRLF prefix may grow");
+        assert_eq!(step(b"XX4\r\n", true), Step::Bad(400));
+        assert_eq!(
+            step(b"\r\n4\r\n", true),
+            Step::Chunk {
+                framing: 5,
+                payload: 4
+            }
+        );
+    }
+
+    /// Sans-io parsers fail on resumption. Every prefix short of a decision
+    /// must answer `More` rather than guess, and the decision must not move
+    /// once it is reachable.
+    #[test]
+    fn step_resumes_at_every_split_point() {
+        let wire = botocore_wire();
+        let whole = step(&wire, false);
+        for cut in 0..4 {
+            assert_eq!(step(&wire[..cut], false), Step::More, "cut {cut}");
+        }
+        for cut in 4..=wire.len() {
+            assert_eq!(step(&wire[..cut], false), whole, "cut {cut}");
+        }
+    }
+
+    /// The shape boto3 actually sends over TLS: 128 KiB HTTP chunks wrapping
+    /// a 1 MiB aws-chunked stream. The walk sees only the outer layer - the
+    /// inner size line is payload here, and stripping it is the S3 band's.
+    #[test]
+    fn step_sees_only_the_outer_framing() {
+        let mut wire = b"20000\r\n".to_vec();
+        wire.extend_from_slice(b"100000\r\n");
+        wire.extend_from_slice(&[b'A'; 0x20000 - 8]);
+        wire.extend_from_slice(b"\r\n");
+        assert_eq!(
+            step(&wire, false),
+            Step::Chunk {
+                framing: 7,
+                payload: 0x20000
+            },
+            "the outer chunk, with the aws size line inside its payload"
+        );
+    }
+
+    /// A malformed size line is refused here rather than left for a reader
+    /// that might frame it differently - the same rule `scan` applies.
+    #[test]
+    fn step_refuses_what_scan_refuses() {
+        assert_eq!(step(b"zz\r\n", false), Step::Bad(400));
+        assert_eq!(step(b"\r\n", false), Step::Bad(400), "empty size line");
+        assert_eq!(step(b"4 junk\r\n", false), Step::Bad(400));
+        let mut long = b"1;".to_vec();
+        long.extend_from_slice(&[b'a'; CHUNK_LINE_MAX + 2]);
+        assert_eq!(step(&long, false), Step::Bad(400), "past the line cap");
     }
 
     fn scan_err(wire: &[u8]) -> u16 {
