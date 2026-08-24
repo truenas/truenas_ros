@@ -34,6 +34,17 @@
 //!   the server's own ring under a per-request personality - parking the
 //!   request while ops run and completing it through the captured
 //!   [`HttpDeferred`].
+//! - **Streamed bodies** ([`protocol_streaming`]): a chunked body may be
+//!   delivered a chunk at a time rather than once when its terminal chunk
+//!   lands, so the largest body an endpoint accepts stops being a buffer
+//!   size. The handler walks [`Stage::Open`] -> [`Stage::Window`]* ->
+//!   [`Stage::End`]. No reactor extension needed: an intermediate window is
+//!   answered with an empty `Reply`, which already means "answered, nothing
+//!   to send, keep serving", and a handler that must wait on a write parks
+//!   with [`HttpRequest::defer_stream`] and resolves with
+//!   [`HttpStreamDeferred::resume`] - a park that retains no window and
+//!   re-runs no handler, so a write straight from the receive buffer
+//!   (`FsConn::pwritev2_from`) stays copy-free end to end.
 //! - **Keep-alive**: HTTP/1.1 persists unless `Connection: close`; HTTP/1.0
 //!   closes unless `Connection: keep-alive`. Close maps onto
 //!   [`Response::ReplyClose`](crate::net::server::Response::ReplyClose) --
@@ -67,6 +78,11 @@
 //! own default message cap (raise them in step; see
 //! [`HttpConfig::min_request_bytes`]).
 //!
+//! A chunked body can instead be **streamed** ([`protocol_streaming`]),
+//! where none of those caps apply: the body is never held, so the bound is
+//! the one the builder supplies and it is measured as each chunk is
+//! declared. `Content-Length` bodies are always buffered.
+//!
 //! Chunked is not optional for an S3 front: verified by wire capture
 //! (boto3 1.37.9, 2026-08-07), the default modern SDK PUTs over TLS with
 //! `Transfer-Encoding: chunked` + `Content-Encoding: aws-chunked` and an
@@ -75,8 +91,11 @@
 //! the aws-chunked entity (chunk metadata and checksum trailer *inside* the
 //! body) passes through byte-for-byte for the S3 band to decode. Genuine
 //! HTTP trailer fields are parsed and surfaced ([`HttpRequest::trailers`])
-//! but not interpreted. Large streamed bodies (`Framing::SpliceBody`) and
-//! streaming sends are planned follow-ups on the same seam.
+//! but not interpreted. Streaming *sends* remain a follow-up on the same
+//! seam; `Framing::SpliceBody` is deliberately not used here, and its doc
+//! comment says why (over kTLS a splice moves one TLS record per op and the
+//! cap cannot be amortised, and a body carrying its own framing cannot be
+//! de-framed on the way past).
 //!
 //! The raw head block is preserved and handed to the handler verbatim
 //! ([`HttpRequest::raw_head`]) for diagnostics; SigV4 canonicalizes from the
@@ -94,12 +113,12 @@ mod response;
 pub use date::HttpDate;
 pub use framer::{HttpConfig, HttpConn};
 pub use head::{HeaderView, Version};
-#[cfg(feature = "uring-fs")]
-pub use protocol::protocol_fs;
 pub use protocol::{
-    HttpDeferPermit, HttpDeferred, HttpRequest, HttpVerdict, protocol,
-    protocol_deferrable,
+    HttpDeferPermit, HttpDeferred, HttpRequest, HttpStreamDeferred,
+    HttpVerdict, Stage, protocol, protocol_deferrable, protocol_streaming,
 };
+#[cfg(feature = "uring-fs")]
+pub use protocol::{protocol_fs, protocol_streaming_fs};
 pub use response::{HttpResponse, IntoBytes};
 
 /// Pure codec entry points exposed to the fuzz crate (`fuzz/`) under `__fuzz`

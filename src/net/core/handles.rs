@@ -105,6 +105,12 @@ pub(crate) struct StatsInner {
     pub(crate) recv_ops: AtomicU64,
     pub(crate) bytes_in: AtomicU64,
     pub(crate) bytes_out: AtomicU64,
+    /// Gauges, not counters: stored outright at each pool mutation rather
+    /// than incremented.
+    #[cfg(feature = "net-server")]
+    pub(crate) recv_bufs_lent: AtomicU64,
+    #[cfg(feature = "net-server")]
+    pub(crate) recv_bufs_total: AtomicU64,
 }
 
 /// Bump a stats counter (single-writer loop thread; Relaxed is sufficient).

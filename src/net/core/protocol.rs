@@ -91,6 +91,26 @@ pub enum Framing {
     /// full-offload mode (TOE-style) delivers a plain stream and is out of
     /// scope.
     ///
+    /// **Over kTLS a splice moves one TLS record and no more, and that cap
+    /// cannot be amortised.** `tls_sw_splice_read` (`net/tls/tls_sw.c`) has
+    /// no loop: it takes one record, splices
+    /// `min(rxm->full_len, len)` of it, and returns - so a body moves in
+    /// `TLS_MAX_PAYLOAD_SIZE` (`1 << 14`, `include/net/tls.h`) steps, each
+    /// blocking an io-wq worker. Queue depth does not help, because
+    /// `tls_rx_reader_acquire` admits one reader per socket at a time and a
+    /// blocked splice holds that gate while it waits for its record; the
+    /// per-connection ceiling is one record per round trip, strictly
+    /// serialised. Plain TCP has neither limit - `tcp_splice_read`
+    /// (`net/ipv4/tcp.c`) loops `while (tss.len)` - so this is a kTLS
+    /// property, not a splice one.
+    ///
+    /// **A body that carries its own framing belongs on
+    /// [`Framing::Complete`], not here.** Splice moves opaque bytes, so a
+    /// chunked transfer coding - or an inner encoding like `aws-chunked`,
+    /// whose size lines land at arbitrary offsets inside the outer chunks -
+    /// cannot be de-framed on the way past. The extent named here has to be
+    /// payload the consumer wants verbatim.
+    ///
     /// `fd` must be **blocking** (its `O_NONBLOCK` clear); a non-blocking
     /// destination is rejected with [`CloseReason::SpliceBadFd`] - see that
     /// variant for why. Backpressure is the pipe itself: a full pipe blocks
@@ -336,16 +356,45 @@ impl std::fmt::Debug for Body<'_> {
 /// cached body serving many connections at once) can arrive without
 /// changing the segment type.
 #[derive(Debug)]
-pub struct SendBuf(Cow<'static, [u8]>);
+pub struct SendBuf(Seg);
+
+#[derive(Debug)]
+enum Seg {
+    Cow(Cow<'static, [u8]>),
+    /// A file-body chunk the kernel filled in a ring buffer.
+    ///
+    /// Raw because the buffer belongs to the reactor's pool, not to this
+    /// segment: it is valid until the segment flushes and the id is handed
+    /// back, and the pool outlives every connection by field order
+    /// (`Reactor` declares `table` before its pools, so connections drop
+    /// first). Nothing else can name the id in the meantime - the kernel
+    /// hands a buffer to exactly one completion.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    Pooled {
+        ptr: *mut u8,
+        len: usize,
+        bid: u16,
+    },
+}
 
 impl SendBuf {
-    /// The owned allocation back out, for buffer recycling (a flushed
-    /// file-tail chunk); `None` for a borrowed `'static` segment.
+    /// A segment over `len` bytes of pool buffer `bid`.
+    ///
+    /// # Safety
+    /// `ptr` must address at least `len` initialized bytes of the buffer
+    /// the pool holds under `bid`, and that buffer must stay lent until
+    /// this segment is dropped or its id released.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
-    pub(crate) fn take_owned(self) -> Option<Vec<u8>> {
+    pub(crate) unsafe fn pooled(ptr: *mut u8, len: usize, bid: u16) -> SendBuf {
+        SendBuf(Seg::Pooled { ptr, len, bid })
+    }
+
+    /// The pool buffer id this segment holds, owed back once it flushes.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn pooled_bid(&self) -> Option<u16> {
         match self.0 {
-            Cow::Owned(v) => Some(v),
-            Cow::Borrowed(_) => None,
+            Seg::Pooled { bid, .. } => Some(bid),
+            Seg::Cow(_) => None,
         }
     }
 }
@@ -353,43 +402,51 @@ impl SendBuf {
 impl std::ops::Deref for SendBuf {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        &self.0
+        match &self.0 {
+            Seg::Cow(c) => c,
+            // SAFETY: the constructor's contract - `len` initialized bytes
+            // that stay valid while this segment lives.
+            #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+            Seg::Pooled { ptr, len, .. } => unsafe {
+                std::slice::from_raw_parts(*ptr, *len)
+            },
+        }
     }
 }
 
 impl From<Vec<u8>> for SendBuf {
     fn from(bytes: Vec<u8>) -> Self {
-        SendBuf(Cow::Owned(bytes))
+        SendBuf(Seg::Cow(Cow::Owned(bytes)))
     }
 }
 
 impl From<String> for SendBuf {
     fn from(s: String) -> Self {
-        SendBuf(Cow::Owned(s.into_bytes()))
+        SendBuf(Seg::Cow(Cow::Owned(s.into_bytes())))
     }
 }
 
 impl From<&'static [u8]> for SendBuf {
     fn from(bytes: &'static [u8]) -> Self {
-        SendBuf(Cow::Borrowed(bytes))
+        SendBuf(Seg::Cow(Cow::Borrowed(bytes)))
     }
 }
 
 impl<const N: usize> From<&'static [u8; N]> for SendBuf {
     fn from(bytes: &'static [u8; N]) -> Self {
-        SendBuf(Cow::Borrowed(bytes))
+        SendBuf(Seg::Cow(Cow::Borrowed(bytes)))
     }
 }
 
 impl From<&'static str> for SendBuf {
     fn from(s: &'static str) -> Self {
-        SendBuf(Cow::Borrowed(s.as_bytes()))
+        SendBuf(Seg::Cow(Cow::Borrowed(s.as_bytes())))
     }
 }
 
 impl From<Cow<'static, [u8]>> for SendBuf {
     fn from(bytes: Cow<'static, [u8]>) -> Self {
-        SendBuf(bytes)
+        SendBuf(Seg::Cow(bytes))
     }
 }
 

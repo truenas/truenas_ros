@@ -73,8 +73,13 @@ where
         slot: u32,
         generation: u32,
         res: i32,
+        cqe_flags: u32,
         op: Op,
     ) -> errno::Result<()> {
+        // A completion carrying `IORING_CQE_F_BUFFER` selected one from the
+        // pool: adopt it before the bytes are read, so the framer sees them
+        // where the kernel put them.
+        self.core.adopt_recv_buffer(slot, generation, cqe_flags);
         match self.core.on_recv_complete(slot, generation, res, op)? {
             RecvStep::Deliver => {
                 self.deliver_one(slot, generation)?;
@@ -130,6 +135,13 @@ where
                 tx: self.mailbox.inject_tx.clone(),
                 shared: Arc::clone(&self.core.engine.shared),
             };
+            // The leased form also hands out the recv claim, so a
+            // handler's `pwritev2_from` can write the body straight from
+            // the buffer.
+            #[cfg(feature = "uring-fs")]
+            let (header, body, peer, state, lease) = conn
+                .deliver_parts_leased(self.core.cfg.body_placement_threshold);
+            #[cfg(not(feature = "uring-fs"))]
             let (header, body, peer, state) =
                 conn.deliver_parts(self.core.cfg.body_placement_threshold);
             // The fs facade borrows the engine and the fs tables - fields
@@ -145,6 +157,7 @@ where
                     // Request-handler facade: `open` may mint a new file here.
                     true,
                 )
+                .with_recv_lease(lease)
             });
             (
                 (self.handlers.body)(Request {
@@ -162,6 +175,9 @@ where
         // The handler has taken what it needs; drop the request from the recv
         // buffer so the next request can be read into it.
         self.core.table.conn_mut(slot).consume();
+        // Nothing buffered means nothing to hold a buffer for: give it back
+        // so a connection waiting on its next request costs none.
+        self.core.release_recv_buffer(slot);
         stat!(self.core, requests);
         match resp {
             Response::Close => self.core.close_conn(
@@ -322,7 +338,7 @@ where
         // pool (`advance_sent`); a read that was waiting on one can go now.
         // A no-op on a closed connection or without an active tail.
         #[cfg(feature = "uring-fs")]
-        self.drive_file_tail(slot, generation)?;
+        self.drive_file_tail(slot, generation, false)?;
         match step {
             SendStep::Pump => self.pump(slot, generation),
             SendStep::Done => Ok(()),
@@ -571,7 +587,7 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         } else {
             self.core.kick_send(slot, generation)?;
         }
-        self.drive_file_tail(slot, generation)
+        self.drive_file_tail(slot, generation, false)
     }
 
     /// Issue the tail's next read when it is idle, bytes remain, and both a
@@ -587,13 +603,25 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     /// the last slot would make the one shortage fatal and the other free.
     /// A staging failure (the ring itself refused the SQE) still sheds THIS
     /// connection ([`CloseReason::FileBody`]), never the server.
+    ///
+    /// `owned` forces the read to bring its own buffer instead of selecting
+    /// from the ring - the retry path for a shortage the pool could not
+    /// grow past, so progress never waits on the pool.
     #[cfg(feature = "uring-fs")]
     pub(super) fn drive_file_tail(
         &mut self,
         slot: u32,
         generation: u32,
+        owned: bool,
     ) -> errno::Result<()> {
         let chunk = self.cfg.fs_body_chunk;
+        // The pool's shrink cadence: pressure is answered where the kernel
+        // reports it (`-ENOBUFS` in `on_pump_read`), but quiet has no
+        // completion to ride, so it is observed here, where every body read
+        // begins.
+        if let Some(p) = self.core.body_bufs.as_mut() {
+            p.rebalance();
+        }
         {
             let Some(conn) = self.core.table.get_conn_mut(slot) else {
                 return Ok(()); // closed or parked under a stale call
@@ -626,9 +654,19 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             }
             return Ok(()); // a completing fs op frees a slot and re-drives us
         }
-        let Some(buf) = self.core.table.conn_mut(slot).tail_take_buf(chunk)
-        else {
-            return Ok(()); // all buffers queued/sending; a flush recycles one
+        if !self.core.table.conn_mut(slot).tail_claim_chunk() {
+            return Ok(()); // this body's share is out; a flush frees one
+        }
+        // The ring picks the buffer when the read completes. Without one
+        // registered the read supplies its own, freed when the chunk
+        // flushes - the same degradation the recv path takes.
+        let dest = match (&self.core.body_bufs, owned) {
+            (Some(_), false) => crate::uring_fs::core::PumpDest::Group(
+                crate::uring::bufring::BGID_FILE_BODY,
+            ),
+            _ => crate::uring_fs::core::PumpDest::Owned(Vec::with_capacity(
+                chunk,
+            )),
         };
         let staged = {
             // Disjoint fields: `self.fs`, `self.core.engine`,
@@ -640,7 +678,7 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             let r = fs.submit_pump_read(
                 &mut self.core.engine,
                 &tail.file,
-                buf,
+                dest,
                 want,
                 tail.next_offset,
                 (slot, gen64),
@@ -657,6 +695,8 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             r
         };
         if let Err(e) = staged {
+            // The claim was taken for a read that never went out.
+            self.core.table.conn_mut(slot).tail_release_chunk();
             return self.core.close_conn(
                 slot,
                 generation,
@@ -693,7 +733,7 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
                 }
                 _ => continue, // parked, freed, or the tail is already shed
             }
-            return self.drive_file_tail(slot, gen64 as u32);
+            return self.drive_file_tail(slot, gen64 as u32, false);
         }
         Ok(())
     }
@@ -709,14 +749,23 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         &mut self,
         owner: (u32, u64),
         done: crate::uring_fs::core::FsDone,
+        bid: Option<u16>,
     ) -> errno::Result<()> {
         let (slot, gen64) = owner;
+        // The kernel consumed this completion's descriptor whatever happens
+        // below (`requeue_body_bid`'s doc has the citation), so every exit
+        // that does not queue the buffer into a send segment owes it back
+        // first - the aborted-download path (`conn.closing`) is the routine
+        // one, and it is exactly the exit a leak turns into a slow drain of
+        // the whole ring, one cancelled GET at a time.
         if self.core.table.generation(slot) != gen64 {
+            self.core.requeue_body_bid(bid);
             return Ok(()); // slot recycled under the read
         }
         let generation = gen64 as u32;
         let res = {
             let Some(conn) = self.core.table.get_conn_mut(slot) else {
+                self.core.requeue_body_bid(bid);
                 return Ok(()); // parked (detaching) or already freed
             };
             // Only `closing` stops the tail - deliberately NOT
@@ -724,16 +773,32 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             // the farewell body (the flush-close dry checks wait on it), so
             // a pending flush-close must keep streaming, never drop chunks.
             if conn.closing {
+                self.core.requeue_body_bid(bid);
                 return Ok(()); // teardown owns the slot; the sweep cancelled us
             }
             let Some(tail) = conn.file_tail.as_mut() else {
+                self.core.requeue_body_bid(bid);
                 return Ok(()); // tail already shed
             };
             tail.reading = false;
             done.raw_result()
         };
         let n = match res {
+            // A dry ring is pressure, not a failed transfer: the read never
+            // started and nothing was lost. Doubling converges on the burst
+            // in a few round trips; a pool that cannot grow further - its
+            // ceiling is already the physical bound, so only an allocation
+            // failure - re-issues the read with an owned buffer, so
+            // progress never waits on the pool.
+            Err(errno::Errno::ENOBUFS) => {
+                let grew =
+                    self.core.body_bufs.as_mut().is_some_and(|p| p.grow());
+                self.core.sync_recv_buf_stats();
+                self.core.table.conn_mut(slot).tail_release_chunk();
+                return self.drive_file_tail(slot, generation, !grew);
+            }
             Err(e) => {
+                self.core.requeue_body_bid(bid);
                 return self.core.close_conn(
                     slot,
                     generation,
@@ -747,22 +812,53 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             // header committed to a Content-Length. The framing cannot
             // renegotiate, so close mid-body - the peer sees a truncated
             // transfer, never a short body presented as complete.
+            self.core.requeue_body_bid(bid);
             return self.core.close_conn(
                 slot,
                 generation,
                 CloseReason::FileBodyTruncated,
             );
         }
-        let mut bufs = done.into_bufs();
-        let mut buf = bufs.pop().expect("a pump read carries exactly one buf");
-        // SAFETY: the op's iovec targeted this Vec's spare capacity with
-        // `iov_len >= n`, and the CQE count proves the kernel initialized
-        // the first `n` bytes (the stream recv path's discipline).
-        unsafe { buf.set_len(n as usize) };
-        let last = self.core.table.conn_mut(slot).advance_file_tail(buf);
+        let seg = match bid {
+            // The kernel filled a ring buffer and named it. The segment
+            // borrows it and the id goes back when the chunk flushes.
+            Some(bid) => {
+                let Some((ptr, _cap)) =
+                    self.core.body_bufs.as_mut().and_then(|p| p.addr_of(bid))
+                else {
+                    self.core.requeue_body_bid(Some(bid));
+                    return self.core.close_conn(
+                        slot,
+                        generation,
+                        CloseReason::FileBody(errno::Errno::EIO),
+                    );
+                };
+                if let Some(pool) = self.core.body_bufs.as_mut() {
+                    pool.lend(bid);
+                }
+                // SAFETY: `n` bytes of buffer `bid`, which stays lent until
+                // the chunk flushes and `advance_sent` hands the id back.
+                unsafe {
+                    crate::net::core::protocol::SendBuf::pooled(
+                        ptr, n as usize, bid,
+                    )
+                }
+            }
+            None => {
+                let mut bufs = done.into_bufs();
+                let mut buf =
+                    bufs.pop().expect("a pump read carries exactly one buf");
+                // SAFETY: the op's iovec targeted this Vec's spare capacity
+                // with `iov_len >= n`, and the CQE count proves the kernel
+                // initialized the first `n` bytes.
+                unsafe { buf.set_len(n as usize) };
+                crate::net::core::protocol::SendBuf::from(buf)
+            }
+        };
+        let last = self.core.table.conn_mut(slot).advance_file_tail(seg);
         self.core.kick_send(slot, generation)?;
         if !last {
-            return self.drive_file_tail(slot, generation);
+            return self.drive_file_tail(slot, generation, false);
         }
         // The retired tail may have been holding a file body that arrived
         // behind it; install it now that the wire is free. A flush-close armed

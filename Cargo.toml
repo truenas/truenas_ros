@@ -226,6 +226,14 @@ path = "test/net_client.rs"
 name = "http_live"
 path = "test/http_live.rs"
 
+# Does a streamed upload allocate per window? Its own binary because the
+# measurement is a process-wide allocation count, so anything else running
+# alongside it is noise. Skips when io_uring is unavailable;
+# TRUENAS_ROS_REQUIRE_IO_URING=1 makes that a hard failure.
+[[test]]
+name = "recv_alloc"
+path = "test/recv_alloc.rs"
+
 # io_uring fs reactor. Live tests against a tempdir (opens, vectored I/O,
 # personality registration, fixed-slot lifecycle); skip automatically when
 # io_uring is unavailable (sandbox/old kernel). Set

@@ -351,6 +351,13 @@ where
         if ktls {
             conn.install_ktls();
         }
+        // Draw recv buffers from the ring, if this server registered one.
+        // Set per connection rather than read from config on every arm, so
+        // a connection that had to fall back to owning its buffer stays
+        // fallen back.
+        if self.core.recv_bufs.is_some() {
+            conn.set_recv_pooled();
+        }
         self.core.table.install(slot, conn);
         stat!(self.core, accepted);
         self.core

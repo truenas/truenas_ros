@@ -99,18 +99,33 @@ pub struct ServerConfig {
     /// connection cycles (one reading while one sends). Default 256 KiB;
     /// validated to 4 KiB..=16 MiB.
     ///
-    /// **Worst-case memory is `pool_size x 2 x fs_body_chunk`** (every
-    /// connection mid-body with both buffers live) - at the defaults, 512 x
-    /// 2 x 256 KiB = 256 MiB - the same shape as the ingress ceiling
-    /// `pool_size x max_request_bytes` documented on
-    /// [`pool_size`](ServerConfig::pool_size). The buffer count is fixed at
-    /// two, not configurable: on ZFS every ring read is punted to an io-wq
-    /// worker (`zpl_file.c` sets no `FMODE_NOWAIT`), so a deeper pipeline
-    /// would only deepen that bounded worker class's queue - and it is the
-    /// count of connections mid-body, not the per-connection depth, that
-    /// multiplies the load.
+    /// Also the size of each buffer in the file-body ring
+    /// ([`fs_body_pool`](ServerConfig::fs_body_pool)), which the chunks
+    /// come from: resident memory tracks bodies in flight, not the
+    /// connection table, and `pool_size x 2 x fs_body_chunk` is the ceiling
+    /// only when every connection is mid-body at once. A connection holds
+    /// at most two chunks - one being read into while the previous one
+    /// sends - and that count is fixed, not configurable: on ZFS every ring
+    /// read is punted to an io-wq worker (`zpl_file.c` sets no
+    /// `FMODE_NOWAIT`), so a deeper pipeline would only deepen that bounded
+    /// worker class's queue, and it is the count of connections mid-body,
+    /// not the per-connection depth, that multiplies the load.
     #[cfg(feature = "uring-fs")]
     pub fs_body_chunk: usize,
+    /// Draw file-body chunk buffers from a registered provided-buffer ring
+    /// (`true`, the default), or have each read supply its own.
+    ///
+    /// There is nothing to size. The ring is registered once with room for
+    /// every chunk the server could have in flight at the same moment -
+    /// `pool_size` connections times the two-chunks-per-body cap, clamped
+    /// to the kernel's 32768-entry limit - and a descriptor slot is 16
+    /// bytes, so that headroom is not a memory commitment. Backing buffers
+    /// of [`fs_body_chunk`](ServerConfig::fs_body_chunk) bytes are
+    /// allocated as demand asks: starting small, doubling when a read finds
+    /// the ring dry, halving after idle rounds. Resident memory therefore
+    /// tracks bodies in flight, never the connection table.
+    #[cfg(feature = "uring-fs")]
+    pub fs_body_pool: bool,
     /// Maximum bytes accepted for one message (header + body), a memory guard
     /// that also bounds header scanning. Enforced strictly for length-prefixed
     /// frames; for a `More`/delimiter-scanning framer the accumulate buffer can
@@ -118,6 +133,27 @@ pub struct ServerConfig {
     /// chunk lands before the next over-cap check closes the connection - so
     /// budget that slack if a scanning framer's peak allocation matters.
     pub max_request_bytes: usize,
+    /// Draw receive buffers from a registered provided-buffer ring
+    /// (`true`, the default), or have every connection own its receive
+    /// buffer.
+    ///
+    /// A pooled connection holds a buffer only while a message is arriving:
+    /// the kernel picks one at *completion* (`IOSQE_BUFFER_SELECT`), so a
+    /// keep-alive connection parked on an idle recv holds none, and buffer
+    /// memory scales with concurrent arrivals rather than with
+    /// [`pool_size`](ServerConfig::pool_size). Watch
+    /// [`recv_bufs_lent`](super::ServerStats::recv_bufs_lent): at rest it
+    /// settles to zero however many connections are open.
+    ///
+    /// There is nothing to size here either. The ring is registered with a
+    /// descriptor slot per connection - no more messages can be arriving
+    /// than there are connections - and backing buffers are allocated as
+    /// demand asks, doubling when a completion finds the ring dry and
+    /// halving after idle rounds. A message that outgrows its buffer moves
+    /// to owned storage and carries on, and a kernel without
+    /// provided-buffer rings degrades to owned buffers rather than failing
+    /// to bind.
+    pub recv_pool: bool,
     /// `listen(2)` backlog.
     pub backlog: i32,
     /// For `AF_UNIX`, unlink a stale socket path before binding.
@@ -281,7 +317,10 @@ impl Default for ServerConfig {
             fs_offload_ceiling: crate::uring_fs::core::OFFLOAD_CEILING,
             #[cfg(feature = "uring-fs")]
             fs_body_chunk: 256 * 1024,
+            #[cfg(feature = "uring-fs")]
+            fs_body_pool: true,
             max_request_bytes: 1024 * 1024,
+            recv_pool: true,
             backlog: 128,
             unlink_unix: true,
             idle_timeout: None,
@@ -372,10 +411,10 @@ impl ServerConfig {
         // body can exceed the backlog on its own chunks alone, and a push
         // arriving mid-body would evict a transfer that is keeping up.
         //
-        // The count is `FILE_TAIL_BUF_PEAK`, not `FILE_TAIL_BUFS`: the mint
-        // cap and the recycled-spare cap are independent, so a tail owns
-        // twice its mint cap and can queue all of it. At the defaults that is
-        // 1 MiB against 8 MiB.
+        // The count is `FILE_TAIL_BUFS`, which is every chunk buffer the
+        // connection has: the pool lives on the connection and mints that
+        // many for its whole life, so a body can queue all of them and no
+        // more. At the defaults that is 512 KiB against 8 MiB.
         //
         // It bounds ONE tail's chunks and nothing else. A reply head, PDUs
         // released from a retired tail's diversion, and an earlier pipelined
@@ -386,14 +425,14 @@ impl ServerConfig {
         // the configuration where a single body cannot coexist with a push.
         #[cfg(feature = "uring-fs")]
         if self.fs_ops > 0
-            && usize::from(crate::net::core::conn::FILE_TAIL_BUF_PEAK)
+            && usize::from(crate::net::core::conn::FILE_TAIL_BUFS)
                 .saturating_mul(self.fs_body_chunk)
                 > self.max_send_backlog
         {
             return Err(Error::Validation(format!(
                 "max_send_backlog must cover a tail's queued chunks: \
                  {} x fs_body_chunk ({}) exceeds {}",
-                crate::net::core::conn::FILE_TAIL_BUF_PEAK,
+                crate::net::core::conn::FILE_TAIL_BUFS,
                 self.fs_body_chunk,
                 self.max_send_backlog
             )));

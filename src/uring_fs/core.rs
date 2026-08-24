@@ -37,7 +37,7 @@ use crate::uring::sys::{
     IORING_OP_FSYNC, IORING_OP_FTRUNCATE, IORING_OP_LINKAT, IORING_OP_MKDIRAT,
     IORING_OP_OPENAT2, IORING_OP_READV, IORING_OP_RENAMEAT, IORING_OP_SPLICE,
     IORING_OP_STATX, IORING_OP_SYMLINKAT, IORING_OP_UNLINKAT, IORING_OP_WRITEV,
-    IoUringCqe, SPLICE_F_MOVE,
+    IOSQE_BUFFER_SELECT, IoUringCqe, SPLICE_F_MOVE,
 };
 use crate::uring::user_data::{pack_raw, unpack_raw};
 use std::any::Any;
@@ -215,6 +215,16 @@ struct FsOpEntry {
     /// (and un-reused) until the CQE reaps - the caller may drop its
     /// `File` mid-op. Dropping this on `clear` gives close-last ordering.
     file: Option<Arc<OwnedFd>>,
+    /// A recv-pool buffer id this op's iovec points into (a leased write).
+    /// Rides out on [`FsDone`] so the net server can hand it back to the
+    /// pool - the buffer must outlive the DMA, and only the completion
+    /// knows when that is.
+    #[cfg(feature = "net-server")]
+    recv_lease: Option<u16>,
+    /// The byte count a leased write asked for, so a short completion can
+    /// be told apart from a full one at reap time.
+    #[cfg(feature = "net-server")]
+    lease_want: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -237,6 +247,10 @@ impl FsOpEntry {
             anchor: None,
             anchor2: None,
             file: None,
+            #[cfg(feature = "net-server")]
+            recv_lease: None,
+            #[cfg(feature = "net-server")]
+            lease_want: 0,
         }
     }
 
@@ -250,6 +264,11 @@ impl FsOpEntry {
         self.anchor = None;
         self.anchor2 = None;
         self.file = None;
+        #[cfg(feature = "net-server")]
+        {
+            self.recv_lease = None;
+            self.lease_want = 0;
+        }
         self.state = FsOpState::Free;
     }
 }
@@ -259,6 +278,10 @@ struct Completed {
     waiter: Option<FsWaiter>,
     bufs: Vec<Vec<u8>>,
     stat: Option<Box<StatxRaw>>,
+    #[cfg(feature = "net-server")]
+    recv_lease: Option<u16>,
+    #[cfg(feature = "net-server")]
+    lease_want: u32,
 }
 
 /// The fs domain's tables. The host owns the [`Engine`] and passes it in for
@@ -541,6 +564,72 @@ impl FsCore {
         }
     }
 
+    /// Stage a `WRITEV` whose single iovec points into a recv-pool buffer
+    /// the caller holds leased - nothing is parked in `bufs`, and the buffer
+    /// id rides the op entry out to [`FsDone`] so the net server hands it
+    /// back to the pool at completion. `Err` returns the waiter untouched
+    /// (a full op table or a refused SQE) for the caller to fall back with.
+    ///
+    /// # Safety-relevant contract (enforced by the caller)
+    /// `[src, src + len)` must stay valid and un-recycled until this op's
+    /// CQE: the connection surrenders its claim to the op rather than
+    /// releasing it, and the pool reissues the id only after the server
+    /// releases `FsDone`'s lease.
+    #[cfg(feature = "net-server")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit_pwritev2_leased(
+        &mut self,
+        eng: &mut Engine,
+        pers: u16,
+        file: Arc<OwnedFd>,
+        src: *const u8,
+        len: usize,
+        off: u64,
+        rw_flags: u32,
+        bid: u16,
+        waiter: FsWaiter,
+    ) -> Result<(), FsWaiter> {
+        let Some(op_slot) = self.op_free.pop() else {
+            return Err(waiter);
+        };
+        let raw_fd = file.as_raw_fd();
+        let entry = &mut self.ops[op_slot as usize];
+        let gen32 = entry.generation as u32;
+        entry.state.state = FsOpState::InFlight { tag: TAG_WRITEV };
+        entry.state.iov = vec![libc::iovec {
+            iov_base: src as *mut libc::c_void,
+            iov_len: len,
+        }];
+        entry.state.file = Some(file);
+        entry.state.recv_lease = Some(bid);
+        entry.state.lease_want = len as u32;
+        let iov_ptr = entry.state.iov.as_ptr() as u64;
+        let ud = pack_raw(TAG_WRITEV, op_slot, gen32);
+        let staged = eng.stage(ud, |sqe| {
+            sqe.opcode = IORING_OP_WRITEV;
+            sqe.fd = raw_fd;
+            sqe.addr = iov_ptr;
+            sqe.len = 1;
+            sqe.off_addr2 = off;
+            sqe.op_flags = rw_flags;
+            sqe.personality = pers;
+        });
+        match staged {
+            Ok(()) => {
+                entry.state.waiter = Some(waiter);
+                Ok(())
+            }
+            Err(_) => {
+                // Never in flight: unwind the entry and hand the waiter
+                // back, so the caller's fallback still owns its callback.
+                entry.state.clear();
+                entry.generation += 1;
+                self.op_free.push(op_slot);
+                Err(waiter)
+            }
+        }
+    }
+
     /// Whether the op table has a slot left. The reply path consults this
     /// before committing a chunk buffer to a body read, so a full table parks
     /// the tail (a completing op frees a slot and re-drives it) instead of
@@ -568,21 +657,37 @@ impl FsCore {
     /// callback whose drop could report it, and a silently dropped pump read
     /// would strand its connection mid-body with nothing left to re-drive it.
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    /// `dest` is either a buffer this side supplies, or a group id to let
+    /// the kernel pick one from a registered ring at completion.
+    ///
+    /// A provided buffer works here for the same reason it works on a recv:
+    /// `IORING_OP_READV` carries `buffer_select` (`io_uring/opdef.c`), and
+    /// the one extra rule is a single iovec - `io_iov_buffer_select_prep`
+    /// answers `-EINVAL` above one (`io_uring/rw.c`) - which this submit
+    /// already satisfies. The kernel reads the iovec for its *length* and
+    /// supplies the address itself, so `iov_base` is not dereferenced.
     pub(crate) fn submit_pump_read(
         &mut self,
         eng: &mut Engine,
         file: &File,
-        mut buf: Vec<u8>,
+        dest: PumpDest,
         want: usize,
         off: u64,
         owner: (u32, u64),
     ) -> Result<(), Errno> {
-        debug_assert!(buf.is_empty() && buf.capacity() >= want);
+        let (mut buf, bgid) = match dest {
+            PumpDest::Owned(b) => (b, None),
+            PumpDest::Group(g) => (Vec::new(), Some(g)),
+        };
+        debug_assert!(
+            bgid.is_some() || (buf.is_empty() && buf.capacity() >= want)
+        );
         let Some(op_slot) = self.op_free.pop() else {
             return Err(Errno::EBUSY);
         };
         // The iovec targets the Vec's spare capacity; computed before the
-        // move below, and the heap block's address survives the move.
+        // move below, and the heap block's address survives the move. Under
+        // buffer select only its length is read.
         let iov = vec![libc::iovec {
             iov_base: buf.as_mut_ptr().cast(),
             iov_len: want,
@@ -593,7 +698,11 @@ impl FsCore {
         let e = &mut entry.state;
         e.state = FsOpState::InFlight { tag: TAG_READV };
         e.waiter = Some(FsWaiter::Pump { owner });
-        e.bufs = vec![buf];
+        e.bufs = if bgid.is_some() {
+            Vec::new()
+        } else {
+            vec![buf]
+        };
         e.iov = iov;
         // Park the fd so it stays open until the CQE even if the connection
         // drops its `File` mid-op (close-last by ownership).
@@ -604,8 +713,12 @@ impl FsCore {
             sqe.opcode = IORING_OP_READV;
             sqe.fd = raw_fd;
             sqe.addr = iov_ptr;
-            sqe.len = 1;
+            sqe.len = 1; // one iovec: buffer select refuses more
             sqe.off_addr2 = off;
+            if let Some(g) = bgid {
+                sqe.flags |= IOSQE_BUFFER_SELECT;
+                sqe.buf_index = g;
+            }
         });
         if let Err(err) = staged {
             self.fail_op(op_slot, err);
@@ -1095,11 +1208,16 @@ impl FsCore {
             // An ASYNC_CANCEL's own completion; nothing to route.
             return ReapedFs::None;
         }
-        let Some(Completed { waiter, bufs, stat }) =
-            self.take_op(tag, op_slot, gen32)
-        else {
+        let Some(completed) = self.take_op(tag, op_slot, gen32) else {
             return ReapedFs::None;
         };
+        #[cfg(feature = "net-server")]
+        let recv_lease = completed.recv_lease;
+        #[cfg(feature = "net-server")]
+        let lease_want = completed.lease_want;
+        let Completed {
+            waiter, bufs, stat, ..
+        } = completed;
 
         // A successful OPENAT2 returns a real fd as its result; wrap it in an
         // `Arc<OwnedFd>`. If nobody takes it (a gone channel receiver, or a
@@ -1114,7 +1232,26 @@ impl FsCore {
         } else {
             None
         };
-        let result = map_res(res);
+        #[cfg_attr(not(feature = "net-server"), allow(unused_mut))]
+        let mut result = map_res(res);
+        // A short leased write is unrecoverable, so it must not look like
+        // success: the source was the connection's receive buffer, and this
+        // completion is what returns it to the pool - by the time a caller
+        // saw `Ok(n)` the unwritten bytes could hold another connection's
+        // request, so a retry from them writes someone else's data and a
+        // shrug stores a truncated object. ZFS makes the case real: a
+        // partial write returns its count with no error, by design
+        // (`zfs_write`, `module/zfs/zfs_vnops.c:1085-1094` - "it's at least
+        // a partial write, so it's successful"). The copy path stays
+        // retryable (`FsDone::into_bufs` hands the source back), which is
+        // the one honest asymmetry between the two.
+        #[cfg(feature = "net-server")]
+        if recv_lease.is_some()
+            && let Ok(n) = result
+            && (n as u32) < lease_want
+        {
+            result = Err(Errno::EIO);
+        }
 
         match waiter {
             Some(FsWaiter::Channel(tx)) => {
@@ -1128,6 +1265,8 @@ impl FsCore {
                     bufs,
                     file: file.map(File::new),
                     stat,
+                    #[cfg(feature = "net-server")]
+                    recv_lease,
                 },
                 owner,
             ),
@@ -1137,6 +1276,8 @@ impl FsCore {
                     bufs,
                     file: file.map(File::new),
                     stat,
+                    #[cfg(feature = "net-server")]
+                    recv_lease,
                 },
                 owner,
             ),
@@ -1155,7 +1296,9 @@ impl FsCore {
         let Some(done) = self.take_op(tag, op_slot, gen32) else {
             return;
         };
-        let Completed { waiter, bufs, stat } = done;
+        let Completed {
+            waiter, bufs, stat, ..
+        } = done;
         // Teardown: the loop is dying - just report the outcome and hand any
         // buffers back. A file's fd is released when its op entry (and thus its
         // parked `Arc`) is dropped with the ring teardown.
@@ -1196,6 +1339,10 @@ impl FsCore {
             waiter: e.waiter.take(),
             bufs: std::mem::take(&mut e.bufs),
             stat: e.stat.take(),
+            #[cfg(feature = "net-server")]
+            recv_lease: e.recv_lease,
+            #[cfg(feature = "net-server")]
+            lease_want: e.lease_want,
         };
         e.clear();
         entry.generation += 1;
@@ -1220,6 +1367,16 @@ impl FsCore {
     }
 }
 
+/// Where a pump read should land.
+#[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+pub(crate) enum PumpDest {
+    /// A buffer this side supplies and gets back on the completion.
+    Owned(Vec<u8>),
+    /// A registered buffer group; the kernel picks one at completion and
+    /// names it in `IORING_CQE_F_BUFFER`.
+    Group(u16),
+}
+
 /// The outcome handed to an embedded [`FsConn`] callback: the op's result plus
 /// anything it produced (buffers, a new open [`File`], or `statx` metadata).
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
@@ -1228,6 +1385,11 @@ pub struct FsDone {
     bufs: Vec<Vec<u8>>,
     file: Option<File>,
     stat: Option<Box<StatxRaw>>,
+    /// The recv-pool buffer id a leased write borrowed, owed back to the
+    /// pool now that the op is over. Routed by the net server's dispatch;
+    /// meaningless to any other consumer.
+    #[cfg(feature = "net-server")]
+    recv_lease: Option<u16>,
 }
 
 impl std::fmt::Debug for FsDone {
@@ -1248,7 +1410,17 @@ impl FsDone {
             bufs: Vec::new(),
             file: None,
             stat: None,
+            #[cfg(feature = "net-server")]
+            recv_lease: None,
         }
+    }
+
+    /// The recv-pool buffer a leased write borrowed, for the net server to
+    /// hand back. Taken by the dispatch before the callback runs, so a
+    /// consumer never sees it.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn take_recv_lease(&mut self) -> Option<u16> {
+        self.recv_lease.take()
     }
 
     /// The op's result: a byte count / `0`, or the errno it failed with.
@@ -1295,6 +1467,32 @@ pub struct FsConn<'a> {
     eng: &'a mut Engine,
     owner: Owner,
     root: bool,
+    /// The delivering connection's recv-buffer claim, when the request's
+    /// body still sits in one - what [`FsConn::pwritev2_from`] writes from
+    /// without copying. `None` outside delivery (completion facades) and on
+    /// unpooled connections.
+    #[cfg(feature = "net-server")]
+    lease: Option<RecvWriteLease<'a>>,
+}
+
+/// A view of the delivering connection's recv-pool claim, offered to the
+/// handler's fs facade for the duration of one delivery.
+///
+/// `taken` is a `Cell` because the handler holds the body as `&[u8]` -- a
+/// shared borrow of the same connection - for its whole run, so the flag
+/// that says "this claim now belongs to a write op" cannot go through
+/// `&mut`. The connection reads it at consume time and surrenders the claim
+/// to the op instead of recycling it.
+#[cfg(feature = "net-server")]
+pub(crate) struct RecvWriteLease<'a> {
+    /// Start of the claimed buffer.
+    pub(crate) ptr: *const u8,
+    /// Its full capacity, bounding what may be written from.
+    pub(crate) cap: usize,
+    /// The pool buffer id, recorded on the op for the completion release.
+    pub(crate) bid: u16,
+    /// Set when a write takes the claim; read by the connection at consume.
+    pub(crate) taken: &'a std::cell::Cell<bool>,
 }
 
 impl std::fmt::Debug for FsConn<'_> {
@@ -1316,7 +1514,21 @@ impl<'a> FsConn<'a> {
             eng,
             owner,
             root,
+            #[cfg(feature = "net-server")]
+            lease: None,
         }
+    }
+
+    /// Offer the delivering connection's recv-buffer claim for
+    /// [`pwritev2_from`](FsConn::pwritev2_from) to write from without
+    /// copying. Delivery-time only.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn with_recv_lease(
+        mut self,
+        lease: Option<RecvWriteLease<'a>>,
+    ) -> FsConn<'a> {
+        self.lease = lease;
+        self
     }
 
     /// Open `path` relative to `anchor` as `who`; fire `on_done` with the new
@@ -1540,6 +1752,110 @@ impl<'a> FsConn<'a> {
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
         self.rw(TAG_WRITEV, who, f, bufs, off, flags, on_done);
+    }
+
+    /// Write `src` - typically the request's own body - to `f` at `off`,
+    /// without copying it when it still sits in the connection's receive
+    /// buffer.
+    ///
+    /// When `src` lies inside the delivering connection's pooled claim and
+    /// no earlier write this delivery took it, the op's iovec points
+    /// straight at the buffer: the connection surrenders the claim to the
+    /// op instead of recycling it, and the pool gets the buffer back when
+    /// the write completes - zero copies, zero allocations. Anything else -
+    /// an unpooled connection, a placed or owned body, a second write in
+    /// one delivery, a full op table - falls back to `pwritev2` on a copy,
+    /// so the call degrades instead of failing.
+    ///
+    /// The one behavioural asymmetry between the two paths is the **short
+    /// write**, which ZFS returns as a success by design. On the copy path
+    /// the source comes back through [`FsDone::into_bufs`] and the caller
+    /// may retry the remainder; on the leased path the source is the
+    /// receive buffer and this completion returns it to the pool, so no
+    /// retry can ever be sound - a short leased write is therefore
+    /// surfaced as `Err(EIO)` rather than as an `Ok(n)` inviting one.
+    ///
+    /// One leased write per delivery: the claim is one buffer and the op
+    /// owns all of it once taken.
+    ///
+    /// # Pipelined ingest
+    ///
+    /// The lease outlives the delivery's verdict, so a streaming handler
+    /// need not park per window: submit the write and return
+    /// [`Continue`](crate::http::HttpVerdict::Continue), and the next
+    /// window is read while this one's DMA runs - each write's completion
+    /// releases its own buffer. The handler is the depth brake: track
+    /// writes in flight and, at its cap, park with
+    /// [`defer_stream`](crate::http::HttpRequest::defer_stream), resuming
+    /// from a completion once below it - stopping the reads is the whole
+    /// mechanism, since the socket buffer then fills and TCP slows the
+    /// sender. Keep the cap at or under the reactor's per-connection ring
+    /// headroom (`RECV_LEASE_DEPTH`, 4) or the excess degrades to copies,
+    /// and size `fs_ops` to cover `pool_size` x depth. At `Stage::End`,
+    /// wait for the outstanding completions with a plain
+    /// [`defer`](crate::http::HttpRequest::defer) and answer from the last
+    /// one; a failed window fails the request there.
+    pub fn pwritev2_from<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        src: &[u8],
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        #[cfg(feature = "net-server")]
+        {
+            let leased = match &self.lease {
+                Some(l) if !l.taken.get() => {
+                    let base = l.ptr as usize;
+                    let at = src.as_ptr() as usize;
+                    let fits = at >= base
+                        && at
+                            .checked_add(src.len())
+                            .is_some_and(|end| end <= base + l.cap);
+                    fits.then_some((l.bid, l.taken))
+                }
+                _ => None,
+            };
+            if let Some((bid, taken)) = leased {
+                let w = embed(self.owner, on_done);
+                match self.fs.submit_pwritev2_leased(
+                    self.eng,
+                    who.0,
+                    Arc::clone(&f.fd),
+                    src.as_ptr(),
+                    src.len(),
+                    off,
+                    flags.bits(),
+                    bid,
+                    w,
+                ) {
+                    Ok(()) => {
+                        taken.set(true);
+                        return;
+                    }
+                    Err(w) => {
+                        // The op table refused; the copy path takes the
+                        // same waiter so the callback survives the detour.
+                        self.fs.submit_rw(
+                            self.eng,
+                            TAG_WRITEV,
+                            who.0,
+                            f.fd,
+                            vec![src.to_vec()],
+                            off,
+                            flags.bits(),
+                            w,
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        self.pwritev2(who, f, vec![src.to_vec()], off, flags, on_done);
     }
 
     /// Flush `f`'s data and metadata (`fsync`) as `who`.
@@ -3305,6 +3621,74 @@ mod routing_fuzz {
         let _ = core.on_cqe(eng, t, s, g, res);
     }
 
+    /// A short leased write must not look like success: its source is the
+    /// connection's receive buffer, already on its way back to the pool by
+    /// the time any caller could react, so `Ok(n)` would invite a retry
+    /// from bytes that may hold another connection's request - and a
+    /// caller that shrugged would store a truncated object. ZFS returns
+    /// partial writes as successes by design (`zfs_write`,
+    /// `module/zfs/zfs_vnops.c:1085-1094`), so the case is real, and the
+    /// reap is the one place that still knows both the asked-for and the
+    /// written count.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_short_leased_write_is_an_error() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let buf = vec![7u8; 8192];
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+
+        // Short: the kernel wrote less than the lease asked for.
+        let (tx, rx) = mpsc::channel();
+        let staged = core.submit_pwritev2_leased(
+            &mut eng,
+            0,
+            Arc::clone(&file),
+            buf.as_ptr(),
+            buf.len(),
+            0,
+            0,
+            9,
+            chan(&tx),
+        );
+        assert!(staged.is_ok(), "staged");
+        let [(t, s, g)] = inflight(&core)[..] else {
+            panic!("one op in flight");
+        };
+        let _ = core.on_cqe(&mut eng, t, s, g, 4096);
+        let out = rx.try_recv().expect("delivered");
+        assert_eq!(
+            out.res,
+            Err(Errno::EIO),
+            "a short leased write surfaced as success"
+        );
+
+        // Full: the same submit at the written size is an ordinary success.
+        let (tx, rx) = mpsc::channel();
+        let staged = core.submit_pwritev2_leased(
+            &mut eng,
+            0,
+            file,
+            buf.as_ptr(),
+            buf.len(),
+            0,
+            0,
+            9,
+            chan(&tx),
+        );
+        assert!(staged.is_ok(), "staged");
+        let [(t, s, g)] = inflight(&core)[..] else {
+            panic!("one op in flight");
+        };
+        let _ = core.on_cqe(&mut eng, t, s, g, 8192);
+        let out = rx.try_recv().expect("delivered");
+        assert_eq!(out.res, Ok(8192), "a full leased write is untouched");
+    }
+
     #[test]
     fn close_last_parked_vs_caller() {
         let Some(mut eng) = engine_or_skip() else {
@@ -3609,7 +3993,7 @@ mod routing_fuzz {
         core.submit_pump_read(
             &mut eng,
             &file,
-            Vec::with_capacity(8),
+            PumpDest::Owned(Vec::with_capacity(8)),
             8,
             2,
             (3, 77),
@@ -3659,7 +4043,7 @@ mod routing_fuzz {
             core.submit_pump_read(
                 eng,
                 &file,
-                Vec::with_capacity(4),
+                PumpDest::Owned(Vec::with_capacity(4)),
                 4,
                 0,
                 (0, 1),
@@ -3705,7 +4089,7 @@ mod routing_fuzz {
         core.submit_pump_read(
             &mut eng,
             &file,
-            Vec::with_capacity(8),
+            PumpDest::Owned(Vec::with_capacity(8)),
             8,
             u64::MAX,
             (5, 9),

@@ -553,6 +553,25 @@ pub struct ServerStats {
     pub bytes_in: u64,
     /// Payload bytes sent.
     pub bytes_out: u64,
+    /// Ring buffers currently held - a connection mid-message, or a file
+    /// body's chunk in flight or queued - when
+    /// [`ServerConfig::recv_pool`](super::ServerConfig::recv_pool)
+    /// is set; always `0` otherwise.
+    ///
+    /// A buffer is held only while a message is arriving, so at rest this
+    /// settles to zero however many connections are open - that it does is
+    /// the property the pool exists for. A value that tracks the connection
+    /// count instead means buffers are not being handed back.
+    pub recv_bufs_lent: u32,
+    /// Buffers allocated across both registered rings (receive and file
+    /// body). Grows a doubling at a time when a completion finds a ring dry
+    /// and drains back after idle rounds, so a steady value is a pool at
+    /// its working set and a climbing one is a pool still finding it - but
+    /// one that climbs while [`recv_bufs_lent`](ServerStats::recv_bufs_lent)
+    /// stays flat is a **leak**, not sizing: ids are being stranded (the
+    /// kernel consumed their descriptors, nothing returned them) and the
+    /// pool is replacing them, which sizing noise never looks like.
+    pub recv_bufs_total: u32,
 }
 
 /// A `Clone + Send + Sync` handle for reading a running server's counters from
@@ -584,6 +603,8 @@ impl StatsHandle {
             recv_ops: s.recv_ops.load(Ordering::Relaxed),
             bytes_in: s.bytes_in.load(Ordering::Relaxed),
             bytes_out: s.bytes_out.load(Ordering::Relaxed),
+            recv_bufs_lent: s.recv_bufs_lent.load(Ordering::Relaxed) as u32,
+            recv_bufs_total: s.recv_bufs_total.load(Ordering::Relaxed) as u32,
         }
     }
 }
