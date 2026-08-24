@@ -173,6 +173,36 @@ Do not reopen these without a reason that is new.
   on growth succeeding - the recv path drops the connection back to owning
   its buffer, the pump path re-issues the read with an owned one - so a
   shortage can never come back twice.
+- **`post` writes a descriptor field by field and never `resv`.** Entry
+  zero's `resv` is not reserved - it is the ring's published tail, and the
+  kernel's only emptiness test is `tail == head`
+  (`io_ring_buffer_select`, `io_uring/kbuf.c:202-216`) - so a whole-struct
+  descriptor write zeroes the tail every `entries`-th post and the kernel
+  then reads a nearly full ring of unpublished descriptors, taking their
+  stale addresses verbatim as recv destinations. Found by external review
+  with the consequence demonstrated on this kernel (buffers re-selected
+  while lent); `a_post_never_touches_the_published_tail` pins it, and the
+  tail's release/acquire pairing has a loom model
+  (`loom_a_descriptor_is_published_before_the_tail_that_names_it`) because
+  the misordering is invisible to every functional test.
+- **Every completion carrying `IORING_CQE_F_BUFFER` owes its id back on
+  every exit path.** The kernel puts the kbuf with no guard on the result
+  (`io_req_rw_complete`, `io_uring/rw.c:591`), and an EOF read completes
+  `res = 0` with the flag set - measured - so the pump's abandon paths
+  (`Reactor::requeue_body_bid` at each early return in `on_pump_read`)
+  return the id or the ring drains one abandoned body at a time while
+  `recv_bufs_lent` stays flat. A read cancelled while *blocked* carries no
+  buffer (measured: io_uring recycles the selection at the `-EAGAIN`
+  punt), which is why cancellation alone cannot reproduce the leak and the
+  regression drives the EOF arm instead
+  (`a_truncated_body_close_returns_its_buffer`).
+- **A short leased write surfaces as `Err(EIO)`, never `Ok(n)`.** ZFS
+  returns partial writes as successes by design (`zfs_write`,
+  `module/zfs/zfs_vnops.c:1085-1094`), and by the time a leased caller saw
+  the count its source buffer is already back in the pool - a retry would
+  write another connection's bytes and a shrug stores a truncated object.
+  The copy path stays retryable (`into_bufs` hands the source back); that
+  asymmetry is documented on `pwritev2_from` rather than papered over.
 - **Rings are registered at the physical bound; there is no sizing knob.**
   A ring cannot be resized after registration (re-registering a live `bgid`
   is `-EEXIST`), so `ring_entries` sizes it to the most buffers real demand
@@ -259,6 +289,15 @@ Do not reopen these without a reason that is new.
   forgets the `BufPool` for the same reason it leaks the table.
 
 ### Leased writes (PUT windows straight to a file)
+
+- **A deferred stream open must release the withheld `100 Continue` on
+  resume** - both the `resume()` path and a redrive that returns
+  `Continue`. The interim is withheld pending the open decision and an
+  expecting client sends nothing until it arrives, so a park that swallows
+  it stalls every expecting PUT for the client's own timeout; deciding an
+  upload off-thread (authorization) is exactly what `defer_stream` at
+  `Open` is for. `StreamPark::expect_interim` carries it;
+  `a_deferred_stream_open_still_sends_the_interim` pins both routes.
 
 - **The write borrows the recv buffer; the claim is surrendered to the op,
   not pinned on the connection.** `deliver_one` consumes the message the

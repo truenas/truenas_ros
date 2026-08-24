@@ -221,6 +221,10 @@ struct FsOpEntry {
     /// knows when that is.
     #[cfg(feature = "net-server")]
     recv_lease: Option<u16>,
+    /// The byte count a leased write asked for, so a short completion can
+    /// be told apart from a full one at reap time.
+    #[cfg(feature = "net-server")]
+    lease_want: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -245,6 +249,8 @@ impl FsOpEntry {
             file: None,
             #[cfg(feature = "net-server")]
             recv_lease: None,
+            #[cfg(feature = "net-server")]
+            lease_want: 0,
         }
     }
 
@@ -261,6 +267,7 @@ impl FsOpEntry {
         #[cfg(feature = "net-server")]
         {
             self.recv_lease = None;
+            self.lease_want = 0;
         }
         self.state = FsOpState::Free;
     }
@@ -273,6 +280,8 @@ struct Completed {
     stat: Option<Box<StatxRaw>>,
     #[cfg(feature = "net-server")]
     recv_lease: Option<u16>,
+    #[cfg(feature = "net-server")]
+    lease_want: u32,
 }
 
 /// The fs domain's tables. The host owns the [`Engine`] and passes it in for
@@ -593,6 +602,7 @@ impl FsCore {
         }];
         entry.state.file = Some(file);
         entry.state.recv_lease = Some(bid);
+        entry.state.lease_want = len as u32;
         let iov_ptr = entry.state.iov.as_ptr() as u64;
         let ud = pack_raw(TAG_WRITEV, op_slot, gen32);
         let staged = eng.stage(ud, |sqe| {
@@ -1203,6 +1213,8 @@ impl FsCore {
         };
         #[cfg(feature = "net-server")]
         let recv_lease = completed.recv_lease;
+        #[cfg(feature = "net-server")]
+        let lease_want = completed.lease_want;
         let Completed {
             waiter, bufs, stat, ..
         } = completed;
@@ -1220,7 +1232,26 @@ impl FsCore {
         } else {
             None
         };
-        let result = map_res(res);
+        #[cfg_attr(not(feature = "net-server"), allow(unused_mut))]
+        let mut result = map_res(res);
+        // A short leased write is unrecoverable, so it must not look like
+        // success: the source was the connection's receive buffer, and this
+        // completion is what returns it to the pool - by the time a caller
+        // saw `Ok(n)` the unwritten bytes could hold another connection's
+        // request, so a retry from them writes someone else's data and a
+        // shrug stores a truncated object. ZFS makes the case real: a
+        // partial write returns its count with no error, by design
+        // (`zfs_write`, `module/zfs/zfs_vnops.c:1085-1094` - "it's at least
+        // a partial write, so it's successful"). The copy path stays
+        // retryable (`FsDone::into_bufs` hands the source back), which is
+        // the one honest asymmetry between the two.
+        #[cfg(feature = "net-server")]
+        if recv_lease.is_some()
+            && let Ok(n) = result
+            && (n as u32) < lease_want
+        {
+            result = Err(Errno::EIO);
+        }
 
         match waiter {
             Some(FsWaiter::Channel(tx)) => {
@@ -1310,6 +1341,8 @@ impl FsCore {
             stat: e.stat.take(),
             #[cfg(feature = "net-server")]
             recv_lease: e.recv_lease,
+            #[cfg(feature = "net-server")]
+            lease_want: e.lease_want,
         };
         e.clear();
         entry.generation += 1;
@@ -1732,8 +1765,15 @@ impl<'a> FsConn<'a> {
     /// the write completes - zero copies, zero allocations. Anything else -
     /// an unpooled connection, a placed or owned body, a second write in
     /// one delivery, a full op table - falls back to `pwritev2` on a copy,
-    /// so the call means the same thing everywhere and degrades instead of
-    /// failing.
+    /// so the call degrades instead of failing.
+    ///
+    /// The one behavioural asymmetry between the two paths is the **short
+    /// write**, which ZFS returns as a success by design. On the copy path
+    /// the source comes back through [`FsDone::into_bufs`] and the caller
+    /// may retry the remainder; on the leased path the source is the
+    /// receive buffer and this completion returns it to the pool, so no
+    /// retry can ever be sound - a short leased write is therefore
+    /// surfaced as `Err(EIO)` rather than as an `Ok(n)` inviting one.
     ///
     /// One leased write per delivery: the claim is one buffer and the op
     /// owns all of it once taken.
@@ -3579,6 +3619,74 @@ mod routing_fuzz {
     fn complete(core: &mut FsCore, eng: &mut Engine, t: u8, s: u32, g: u32) {
         let res = if t == TAG_OPEN { synth_fd() } else { 16 };
         let _ = core.on_cqe(eng, t, s, g, res);
+    }
+
+    /// A short leased write must not look like success: its source is the
+    /// connection's receive buffer, already on its way back to the pool by
+    /// the time any caller could react, so `Ok(n)` would invite a retry
+    /// from bytes that may hold another connection's request - and a
+    /// caller that shrugged would store a truncated object. ZFS returns
+    /// partial writes as successes by design (`zfs_write`,
+    /// `module/zfs/zfs_vnops.c:1085-1094`), so the case is real, and the
+    /// reap is the one place that still knows both the asked-for and the
+    /// written count.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_short_leased_write_is_an_error() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let buf = vec![7u8; 8192];
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+
+        // Short: the kernel wrote less than the lease asked for.
+        let (tx, rx) = mpsc::channel();
+        let staged = core.submit_pwritev2_leased(
+            &mut eng,
+            0,
+            Arc::clone(&file),
+            buf.as_ptr(),
+            buf.len(),
+            0,
+            0,
+            9,
+            chan(&tx),
+        );
+        assert!(staged.is_ok(), "staged");
+        let [(t, s, g)] = inflight(&core)[..] else {
+            panic!("one op in flight");
+        };
+        let _ = core.on_cqe(&mut eng, t, s, g, 4096);
+        let out = rx.try_recv().expect("delivered");
+        assert_eq!(
+            out.res,
+            Err(Errno::EIO),
+            "a short leased write surfaced as success"
+        );
+
+        // Full: the same submit at the written size is an ordinary success.
+        let (tx, rx) = mpsc::channel();
+        let staged = core.submit_pwritev2_leased(
+            &mut eng,
+            0,
+            file,
+            buf.as_ptr(),
+            buf.len(),
+            0,
+            0,
+            9,
+            chan(&tx),
+        );
+        assert!(staged.is_ok(), "staged");
+        let [(t, s, g)] = inflight(&core)[..] else {
+            panic!("one op in flight");
+        };
+        let _ = core.on_cqe(&mut eng, t, s, g, 8192);
+        let out = rx.try_recv().expect("delivered");
+        assert_eq!(out.res, Ok(8192), "a full leased write is untouched");
     }
 
     #[test]

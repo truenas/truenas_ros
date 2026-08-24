@@ -10257,3 +10257,144 @@ fn a_burst_of_file_bodies_grows_the_ring_instead_of_shedding() {
         "buffers outstanding after close: {s:?}"
     );
 }
+
+/// A pump completion that closes the connection must still return its
+/// buffer to the ring.
+///
+/// Every completion carrying `IORING_CQE_F_BUFFER` consumed its
+/// descriptor: the kernel puts the kbuf with no guard on the result
+/// (`io_req_rw_complete`, `io_uring/rw.c:591`), and an EOF read is the
+/// measured proof - it completes `res = 0` with the flag set and the
+/// ring's head advanced. So the truncated-body close (`n == 0`, the file
+/// shrank under a committed `Content-Length`) is a completion that both
+/// carries a buffer and abandons the transfer: exactly the exit class that
+/// must requeue. Skipping it strands the id, `recv_bufs_lent` stays
+/// innocently at zero while the pool replaces each loss with a fresh
+/// allocation, and the ring drains one abandoned body at a time. The same
+/// duty holds on the racier exits of that class (a completion landing on a
+/// closing or recycled slot), which share this arm's fix but cannot be
+/// scheduled deterministically from a test; `rw.c:591` is the authority
+/// that they owe the id all the same.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn a_truncated_body_close_returns_its_buffer() {
+    use std::sync::mpsc;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, FsConfig, UringFs};
+
+    const ROUNDS: usize = 20;
+    const CHUNK: usize = 32 * 1024;
+
+    let dir = truenas_ros::tempdir().unwrap();
+    // Half a chunk on disk, four chunks declared: read one short chunk,
+    // then hit EOF - a completion with a buffer and nothing in it.
+    std::fs::write(dir.path().join("obj"), vec![0x51u8; CHUNK / 2])
+        .expect("fixture");
+
+    let mut afs = match UringFs::new(FsConfig::default()) {
+        Ok(f) => f,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("UringFs::new: {e}"),
+    };
+    let who = afs.register_self().expect("register_self");
+    let handle = afs.handle();
+    let stop_fs = afs.shutdown_handle();
+    let anchor = Anchor::open(dir.path()).expect("anchor");
+    let (ftx, frx) = mpsc::channel();
+    thread::scope(|sc| {
+        sc.spawn(move || {
+            let r = handle.open(
+                who,
+                &anchor,
+                c"obj",
+                OpenHow::new().flags(OFlag::O_RDONLY),
+            );
+            let _ = ftx.send(r);
+            stop_fs.shutdown();
+        });
+        afs.run().expect("fs host run");
+    });
+    let file = frx.recv().expect("open outcome").expect("open");
+
+    let cfg = ServerConfig {
+        // Wide enough that a stranded-id drain has room to snowball: each
+        // loss forces a replacement, the ring doubles toward its 64-entry
+        // wall, and the gauge shows a climb no sizing noise can reach.
+        pool_size: 32,
+        fs_ops: 16,
+        fs_body_chunk: CHUNK,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |_req: Request<'_, ()>| Response::ReplyFile {
+            head: b"H".to_vec(),
+            file: file.clone(),
+            offset: 0,
+            len: (4 * CHUNK) as u64,
+            close: true,
+        },
+    };
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stats = server.stats_handle();
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        for i in 0..ROUNDS {
+            let mut s = connect_tcp(v4).expect("connect");
+            s.write_all(&1u32.to_be_bytes()).expect("len");
+            s.write_all(b"g").expect("req");
+            // The server sends the head and the short chunk, then closes
+            // mid-body on the EOF. Drain to the reset/EOF.
+            let mut sink = Vec::new();
+            let _ = s.read_to_end(&mut sink);
+            assert!(
+                sink.len() <= 1 + CHUNK / 2,
+                "round {i}: a truncated body was served whole"
+            );
+            drop(s);
+        }
+        // Let the closes retire, then check the ring survived.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let st = stats.snapshot();
+            if st.active == 0 && st.recv_bufs_lent == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "never settled: {st:?}");
+            thread::sleep(Duration::from_millis(10));
+        }
+        stop.shutdown();
+        stats.snapshot()
+    });
+
+    server.serve_forever().expect("serve_forever");
+    let s = client.join().expect("client thread");
+    assert!(s.recv_bufs_total > 0, "no ring registered: {s:?}");
+    assert_eq!(s.recv_bufs_lent, 0, "buffers outstanding: {s:?}");
+    // Both rings start at 8 and these sequential one-body rounds never
+    // need more (the recv side may even shrink), so the settled total sits
+    // at 16 or below. A stranded id per truncation drains the body ring
+    // dry every eight rounds, and each drain doubles it toward the wall -
+    // 20 rounds drove the total past 30 with the requeue removed - while
+    // `lent` stayed flat throughout, which is why the total is the only
+    // gauge that can see this.
+    assert!(
+        s.recv_bufs_total <= 20,
+        "the ring drained under truncated-body closes: {s:?}"
+    );
+}

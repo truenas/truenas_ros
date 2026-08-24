@@ -120,6 +120,11 @@ pub(crate) struct BufRing {
     /// How many buffers to keep allocated. Growth and shrink move this; the
     /// buffers follow.
     target: u16,
+    /// Ids with no buffer behind them, ready for growth to post. A stack
+    /// rather than a scan because growth runs on the `-ENOBUFS` path - the
+    /// one place already under load - and a per-step scan makes a doubling
+    /// quadratic in `entries`.
+    absent: Vec<u16>,
     posted: u16,
     lent: u16,
     /// Producer index. The kernel owns the consumer side and never writes
@@ -203,6 +208,7 @@ impl BufRing {
             ring: ptr.cast::<IoUringBuf>(),
             mapped,
             bufs: (0..entries).map(|_| None).collect(),
+            absent: (0..entries).rev().collect(),
             slots: vec![Slot::Absent; usize::from(entries)],
             entries,
             mask: entries - 1,
@@ -250,22 +256,30 @@ impl BufRing {
                 self.allocs += 1;
             }
         }
-        let addr = self.bufs[i].as_ref().expect("just allocated").as_ptr();
+        let addr = self.bufs[i].as_mut().expect("just allocated").as_mut_ptr();
         let slot = usize::from(self.tail & self.mask);
         // SAFETY: `slot < entries` and the mapping covers `entries`
-        // descriptors, so the write is in bounds. Entry zero's `resv` is the
-        // tail, which `commit` writes separately and after.
+        // descriptors, so the writes are in bounds.
+        //
+        // Field by field, **never `resv`**: on entry zero `resv` is not
+        // reserved - it is the ring's published tail, which only `commit`
+        // may store. A whole-struct write here zeroes it, and every
+        // `entries`-th post lands in slot zero, so the kernel would then
+        // see a tail rewound behind its head - which it reads as a nearly
+        // full ring, since `tail == head` is its only emptiness test
+        // (`io_ring_buffer_select`, `io_uring/kbuf.c:202-216`) - and select
+        // unpublished descriptors, taking their stale `addr` verbatim as a
+        // recv destination. `a_post_never_touches_the_published_tail` pins
+        // this.
         //
         // The ring cannot be overrun: every allocated id is posted at most
         // once at a time, so the number of descriptors the kernel has not
         // yet consumed is `posted`, which never exceeds `entries`.
         unsafe {
-            self.ring.add(slot).write(IoUringBuf {
-                addr: addr as u64,
-                len: self.buf_len as u32,
-                bid,
-                resv: 0,
-            });
+            let d = self.ring.add(slot);
+            (&raw mut (*d).addr).write(addr as u64);
+            (&raw mut (*d).len).write(self.buf_len as u32);
+            (&raw mut (*d).bid).write(bid);
         }
         self.tail = self.tail.wrapping_add(1);
         self.slots[i] = Slot::Posted;
@@ -297,6 +311,7 @@ impl BufRing {
         while self.allocated() < self.target {
             let Some(bid) = self.absent_id() else { break };
             if !self.post(bid) {
+                self.absent.push(bid);
                 break; // out of memory: hold what we have
             }
             posted_any = true;
@@ -306,12 +321,10 @@ impl BufRing {
         }
     }
 
-    /// The lowest id with no buffer behind it.
-    fn absent_id(&self) -> Option<u16> {
-        self.slots
-            .iter()
-            .position(|s| *s == Slot::Absent)
-            .map(|i| i as u16)
+    /// An id with no buffer behind it, taken. The caller posts it or, on
+    /// an allocation failure, hands it back.
+    fn absent_id(&mut self) -> Option<u16> {
+        self.absent.pop()
     }
 
     /// Where `bid`'s storage begins, if it has any.
@@ -321,9 +334,13 @@ impl BufRing {
     /// posted id is handed to exactly one op - `release` is owed once per
     /// completion carrying `IORING_CQE_F_BUFFER` - so no two writers ever
     /// hold the same range.
-    pub(crate) fn addr_of(&self, bid: u16) -> Option<*mut u8> {
-        let b = self.bufs.get(usize::from(bid))?.as_ref()?;
-        Some(b.as_ptr() as *mut u8)
+    pub(crate) fn addr_of(&mut self, bid: u16) -> Option<*mut u8> {
+        // `as_mut_ptr` from a mutable borrow: callers write through this
+        // pointer (a recv destination, the drain's in-place copy), and a
+        // pointer cast up from `&` is UB to write through under the borrow
+        // rules even where today's codegen is indifferent.
+        let b = self.bufs.get_mut(usize::from(bid))?.as_mut()?;
+        Some(b.as_mut_ptr())
     }
 
     /// Record that a completion selected `bid`.
@@ -367,6 +384,7 @@ impl BufRing {
             // fell while this buffer was out, so it is surplus and goes
             // back to the allocator rather than to the ring.
             self.bufs[i] = None;
+            self.absent.push(bid);
             return;
         }
         // At or under target: straight back into the ring, reusing the same
@@ -553,8 +571,9 @@ impl BufPool {
     }
 
     /// Where `bid` begins, and how large it is.
-    pub(crate) fn addr_of(&self, bid: u16) -> Option<(*mut u8, usize)> {
-        self.ring.addr_of(bid).map(|p| (p, self.ring.buf_len()))
+    pub(crate) fn addr_of(&mut self, bid: u16) -> Option<(*mut u8, usize)> {
+        let len = self.ring.buf_len();
+        self.ring.addr_of(bid).map(|p| (p, len))
     }
 
     /// Buffers posted and not yet picked.
@@ -685,7 +704,8 @@ mod tests {
         let Some(r) = ring() else {
             return;
         };
-        let br = BufRing::new(r.raw_fd(), 0, 64, 128, 2).expect("registers");
+        let mut br =
+            BufRing::new(r.raw_fd(), 0, 64, 128, 2).expect("registers");
         assert_eq!(br.entries(), 64, "room for 64");
         assert_eq!(br.allocated(), 2, "but only 2 allocated");
         assert!(br.addr_of(0).is_some(), "id 0 is backed");
@@ -725,6 +745,65 @@ mod tests {
         assert_eq!(br.lent(), 0);
         assert_eq!(br.free(), 4, "back in the ring");
         assert_eq!(br.addr_of(1), Some(before), "same storage, not a new one");
+    }
+
+    /// A post must never store to the published tail. Entry zero's `resv`
+    /// IS the tail, so this drives the ring until the next post lands in
+    /// descriptor slot zero, posts, and reads the tail cell back before
+    /// committing: a whole-struct descriptor write shows up here as the
+    /// tail rewound to zero - which the kernel, whose only emptiness test
+    /// is `tail == head`, reads as a nearly full ring of unpublished
+    /// descriptors.
+    #[test]
+    fn a_post_never_touches_the_published_tail() {
+        let Some(r) = ring() else {
+            return;
+        };
+        let mut br = BufRing::new(r.raw_fd(), 0, 4, 64, 3).expect("registers");
+        let tail_cell = |br: &BufRing| unsafe {
+            (*(&raw const (*br.ring).resv).cast::<AtomicU16>())
+                .load(Ordering::Acquire)
+        };
+        assert_eq!(tail_cell(&br), 3, "three posts published at setup");
+        // Free two ids without re-posting them (target below allocated).
+        br.set_target(1);
+        br.lend(0);
+        br.release(0); // freed, not re-posted: allocated >= target
+        br.lend(1);
+        br.release(1);
+        assert_eq!(br.allocated(), 1);
+        // Advance the tail to the wrap: this post lands in slot 3.
+        assert!(br.post(0), "repost id 0 into slot 3");
+        br.commit();
+        assert_eq!(tail_cell(&br), 4);
+        // The post under test: tail 4 & mask 3 = descriptor slot zero,
+        // where the descriptor overlays the tail cell.
+        assert!(br.post(1), "repost id 1 into slot 0");
+        assert_eq!(
+            tail_cell(&br),
+            4,
+            "a post into slot zero stored over the published tail"
+        );
+        br.commit();
+        assert_eq!(tail_cell(&br), 5, "commit alone advances it");
+    }
+
+    /// A second release of the same id is refused before it can re-post a
+    /// buffer another op still owns, or wrap the loan count. Pins the
+    /// debug-build guard, which is the build the gate runs; the
+    /// release-mode `if` beside it needs a release lane to reach, because
+    /// this assert fires first.
+    #[test]
+    #[should_panic(expected = "releasing a buffer nobody took")]
+    fn releasing_one_id_twice_is_refused() {
+        let Some(r) = ring() else {
+            panic!("releasing a buffer nobody took: skipped, no io_uring");
+        };
+        let mut br = BufRing::new(r.raw_fd(), 0, 4, 64, 4).expect("registers");
+        br.lend(1);
+        br.release(1);
+        assert_eq!(br.free(), 4, "the first release landed");
+        br.release(1); // the second owner
     }
 
     /// The steady-state path allocates nothing.
@@ -937,5 +1016,59 @@ mod tests {
         }
         assert!(p.target() >= 1, "never aims at nothing");
         assert!(p.free() >= 1, "and what it keeps is available");
+    }
+}
+
+// The publication protocol `commit` shares with the kernel, as a loom model.
+//
+// The real ring cannot run under loom (mmap, a registered fd), so the model
+// replicates the protocol's shape exactly: descriptor fields are plain
+// stores, the tail alone is `Release`, and the consumer - standing in for
+// `io_ring_buffer_select`, which pairs with `smp_load_acquire(&br->tail)`
+// (`io_uring/kbuf.c:202`) - acquires the tail and only then reads the
+// descriptor. The property is that a tail naming a descriptor
+// happens-after that descriptor's fields: weaken the store to `Relaxed`
+// and loom fails this model, which no functional test can, because the
+// misordering is invisible on x86 and the reader is the kernel.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use loom::cell::UnsafeCell;
+    use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicU16, Ordering};
+
+    struct Ring {
+        /// One descriptor's `addr` field: written plainly, like `post`.
+        addr: UnsafeCell<u64>,
+        /// The overlaid tail: stored `Release`, like `commit`.
+        tail: AtomicU16,
+    }
+
+    // SAFETY: the tail's release/acquire pair is the only synchronization,
+    // exactly as on the real ring; loom verifies the accesses race-free
+    // under it.
+    unsafe impl Sync for Ring {}
+
+    #[test]
+    fn loom_a_descriptor_is_published_before_the_tail_that_names_it() {
+        loom::model(|| {
+            let ring = Arc::new(Ring {
+                addr: UnsafeCell::new(0),
+                tail: AtomicU16::new(0),
+            });
+            let producer = Arc::clone(&ring);
+            let t = loom::thread::spawn(move || {
+                // `post`: the descriptor's fields...
+                producer.addr.with_mut(|p| unsafe { *p = 0xB0F });
+                // ...then `commit`: the tail, released.
+                producer.tail.store(1, Ordering::Release);
+            });
+            // The kernel's side: acquire the tail; a tail that names the
+            // descriptor must find its address already there.
+            if ring.tail.load(Ordering::Acquire) == 1 {
+                let addr = ring.addr.with(|p| unsafe { *p });
+                assert_eq!(addr, 0xB0F, "tail visible before its descriptor");
+            }
+            t.join().unwrap();
+        });
     }
 }

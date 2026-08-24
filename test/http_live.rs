@@ -2656,3 +2656,93 @@ fn a_handler_refusing_mid_body_ends_the_connection() {
     server.serve_forever().expect("serve_forever");
     join.join().expect("client thread").expect("client io");
 }
+
+/// A deferred stream open must still release the withheld `100 Continue`.
+///
+/// The interim is withheld pending the open decision, and an expecting
+/// client sends no body byte until it arrives - so a handler that defers
+/// that decision (an authorization check is the canonical case) and then
+/// resumes must emit it from the resume path, or every expecting PUT
+/// stalls for the client's own timeout against a server that thinks it is
+/// waiting for a body.
+#[test]
+fn a_deferred_stream_open_still_sends_the_interim() {
+    use truenas_ros::http::HttpStreamDeferred;
+
+    let Some(()) = with_streaming_deferring_server(|v4| {
+        let mut s = connect_tcp(v4)?;
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        s.write_all(
+            b"PUT /up HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\n\
+              Transfer-Encoding: chunked\r\n\r\n",
+        )?;
+        // The client's half of the dance: no body until the interim.
+        let mut interim = [0u8; 25];
+        s.read_exact(&mut interim)?;
+        assert_eq!(
+            &interim[..],
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+            "the deferred open swallowed the interim"
+        );
+        s.write_all(b"5\r\nhello\r\n0\r\n\r\n")?;
+        let (status, _head, _body) = read_response(&mut s)?;
+        assert_eq!(status, 200);
+        Ok(())
+    }) else {
+        return; // io_uring unavailable
+    };
+
+    /// A streaming server whose `Open` handler defers off-thread and
+    /// resumes a moment later - the review's reproducer shape.
+    fn with_streaming_deferring_server<T: Send + 'static>(
+        client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
+    ) -> Option<T> {
+        use truenas_ros::http::{HttpVerdict, Stage, protocol_streaming};
+
+        let addr =
+            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let proto = protocol_streaming(
+            HttpConfig::default(),
+            1 << 20,
+            |_inc: Incoming<'_>| Some(0usize),
+            |req: HttpRequest<'_>, seen: &mut usize| match req.stage {
+                Stage::Open => {
+                    let (d, permit, _body) = req.defer_stream();
+                    let d: HttpStreamDeferred = d;
+                    thread::spawn(move || {
+                        // The off-thread decision the park exists for.
+                        thread::sleep(Duration::from_millis(20));
+                        d.resume();
+                    });
+                    HttpVerdict::Defer(permit)
+                }
+                Stage::Window => {
+                    *seen += req.body.len();
+                    HttpVerdict::Continue
+                }
+                Stage::End => HttpVerdict::Respond(
+                    HttpResponse::new(200).header("x-bytes", seen.to_string()),
+                ),
+                Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
+            },
+        )
+        .expect("codec config is valid");
+        let mut server = match Server::bind([addr], proto) {
+            Ok(s) => s,
+            Err(e) if should_skip(&e) => return None,
+            Err(e) => panic!("bind: {e}"),
+        };
+        let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+            panic!("expected Tcp");
+        };
+        let stop = server.shutdown_handle();
+        let join = thread::spawn(move || {
+            let _stop = ShutdownOnDrop(stop.clone());
+            let r = client(v4);
+            stop.shutdown();
+            r
+        });
+        server.serve_forever().expect("serve_forever");
+        Some(join.join().expect("client thread").expect("client io"))
+    }
+}

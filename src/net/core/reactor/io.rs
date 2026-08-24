@@ -986,6 +986,29 @@ impl<U> Reactor<U> {
     /// its role wrapper enacts (`Deliver`/`Pump` re-enter role code; `Done` is
     /// self-contained). The two recv kinds share the whole skeleton and differ
     /// only in idle eligibility and the delivery tail.
+    /// Hand back a file-body buffer whose pump read will not queue it.
+    ///
+    /// Owed on **every** exit that saw `IORING_CQE_F_BUFFER`: the kernel
+    /// puts the kbuf and advances its head with no guard on the result
+    /// (`io_req_rw_complete`, `io_uring/rw.c:591`), so a failed, truncated
+    /// or stale-slot completion has taken its descriptor off the ring
+    /// exactly like a served one. An exit that skips this strands the id -
+    /// userspace still counts it posted, the kernel will never offer it
+    /// again, and the pool answers the shortfall by allocating a fresh
+    /// buffer per loss while `recv_bufs_lent` stays innocently at zero.
+    ///
+    /// Lend-then-release: `release` is the only repost, and its state
+    /// machine requires the loan recorded first.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn requeue_body_bid(&mut self, bid: Option<u16>) {
+        let Some(bid) = bid else { return };
+        if let Some(pool) = self.body_bufs.as_mut() {
+            pool.lend(bid);
+            pool.release(bid);
+        }
+        self.sync_recv_buf_stats();
+    }
+
     /// Answer a recv that found the pool dry (`-ENOBUFS`).
     ///
     /// The kernel picks a provided buffer at completion, so a shortage
@@ -1088,6 +1111,11 @@ impl<U> Reactor<U> {
             return;
         };
         let Some((ptr, cap)) = pool.addr_of(bid) else {
+            // An id outside the ring should be impossible, but the kernel
+            // consumed a descriptor either way; strand nothing.
+            pool.lend(bid);
+            pool.release(bid);
+            self.sync_recv_buf_stats();
             return;
         };
         pool.lend(bid);

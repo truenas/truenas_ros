@@ -252,6 +252,12 @@ pub(crate) struct StreamPark {
     pub(crate) next: Phase,
     /// The stage the retained delivery was made at.
     pub(crate) stage: super::protocol::Stage,
+    /// A withheld `100 Continue` the resume owes before any body byte can
+    /// arrive. Only an `Open` park can carry one: the client is holding
+    /// its body back for exactly this line, so a resume that answers with
+    /// silence leaves every expecting PUT stalled until the client's own
+    /// timeout.
+    pub(crate) expect_interim: bool,
 }
 
 /// Per-connection codec state wrapping the consumer's own state `U`.

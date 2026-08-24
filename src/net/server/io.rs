@@ -752,12 +752,20 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         bid: Option<u16>,
     ) -> errno::Result<()> {
         let (slot, gen64) = owner;
+        // The kernel consumed this completion's descriptor whatever happens
+        // below (`requeue_body_bid`'s doc has the citation), so every exit
+        // that does not queue the buffer into a send segment owes it back
+        // first - the aborted-download path (`conn.closing`) is the routine
+        // one, and it is exactly the exit a leak turns into a slow drain of
+        // the whole ring, one cancelled GET at a time.
         if self.core.table.generation(slot) != gen64 {
+            self.core.requeue_body_bid(bid);
             return Ok(()); // slot recycled under the read
         }
         let generation = gen64 as u32;
         let res = {
             let Some(conn) = self.core.table.get_conn_mut(slot) else {
+                self.core.requeue_body_bid(bid);
                 return Ok(()); // parked (detaching) or already freed
             };
             // Only `closing` stops the tail - deliberately NOT
@@ -765,9 +773,11 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             // the farewell body (the flush-close dry checks wait on it), so
             // a pending flush-close must keep streaming, never drop chunks.
             if conn.closing {
+                self.core.requeue_body_bid(bid);
                 return Ok(()); // teardown owns the slot; the sweep cancelled us
             }
             let Some(tail) = conn.file_tail.as_mut() else {
+                self.core.requeue_body_bid(bid);
                 return Ok(()); // tail already shed
             };
             tail.reading = false;
@@ -788,6 +798,7 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
                 return self.drive_file_tail(slot, generation, !grew);
             }
             Err(e) => {
+                self.core.requeue_body_bid(bid);
                 return self.core.close_conn(
                     slot,
                     generation,
@@ -801,6 +812,7 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             // header committed to a Content-Length. The framing cannot
             // renegotiate, so close mid-body - the peer sees a truncated
             // transfer, never a short body presented as complete.
+            self.core.requeue_body_bid(bid);
             return self.core.close_conn(
                 slot,
                 generation,
@@ -812,8 +824,9 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             // borrows it and the id goes back when the chunk flushes.
             Some(bid) => {
                 let Some((ptr, _cap)) =
-                    self.core.body_bufs.as_ref().and_then(|p| p.addr_of(bid))
+                    self.core.body_bufs.as_mut().and_then(|p| p.addr_of(bid))
                 else {
+                    self.core.requeue_body_bid(Some(bid));
                     return self.core.close_conn(
                         slot,
                         generation,

@@ -868,6 +868,10 @@ where
                     Some(super::framer::StreamPark {
                         next,
                         stage: Stage::Open,
+                        // The interim was withheld pending this very
+                        // decision; the resume owes it, or the client
+                        // never sends the body it is parked deciding on.
+                        expect_interim: expect,
                     }),
                 ),
             }
@@ -934,6 +938,9 @@ where
                     Some(super::framer::StreamPark {
                         next,
                         stage: Stage::Window,
+                        // Mid-body: any interim went out when the open was
+                        // answered.
+                        expect_interim: false,
                     }),
                 ),
             }
@@ -981,7 +988,15 @@ where
                 Some(ParkAnswer::Resume) => match resume {
                     Some(r) => {
                         conn.phase = r.next;
-                        Response::Reply(Vec::new())
+                        // A deferred open accepted: release the withheld
+                        // interim, or the expecting client holds its body
+                        // back until its own timeout and the stream this
+                        // resume opened never starts.
+                        Response::Reply(if r.expect_interim {
+                            b"HTTP/1.1 100 Continue\r\n\r\n".to_vec()
+                        } else {
+                            Vec::new()
+                        })
                     }
                     None => Response::Close,
                 },
@@ -1027,11 +1042,18 @@ where
                         stage,
                     );
                     match (d, resume) {
-                        // Redriven mid-body and content to read on: put the
-                        // streaming phase back, answer nothing.
+                        // Redriven and accepted with content to read on:
+                        // put the streaming phase back, and release any
+                        // interim a parked open was still withholding -
+                        // the redrive route owes it exactly as the resume
+                        // route does.
                         (Dispatched::Continue, Some(r)) => {
                             conn.phase = r.next;
-                            Response::Reply(Vec::new())
+                            Response::Reply(if r.expect_interim {
+                                b"HTTP/1.1 100 Continue\r\n\r\n".to_vec()
+                            } else {
+                                Vec::new()
+                            })
                         }
                         (d, resume) => settle(conn, d, resume.map(|r| *r)),
                     }

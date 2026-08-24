@@ -1734,6 +1734,14 @@ impl<U> Connection<U> {
             if item.reclaim {
                 self.chunk_out = self.chunk_out.saturating_sub(1);
                 if let Some(bid) = item.bytes.pooled_bid() {
+                    // The array bound and the queue bound are the same
+                    // constant on purpose: `tail_claim_chunk` refuses past
+                    // `FILE_TAIL_BUFS`, so no more than that many reclaim
+                    // segments can ever be queued, and a flush pass can
+                    // therefore never pop more. If the claim cap and this
+                    // array ever diverge, the `get_mut` below drops a bid
+                    // on the floor - a buffer the pool can neither reissue
+                    // nor free - which is what the assert is guarding.
                     debug_assert!(
                         (progress.freed as usize) < progress.freed_bids.len(),
                         "at most FILE_TAIL_BUFS chunks can be queued at once"
@@ -2186,6 +2194,48 @@ mod tests {
                 "round {round}: the flush released the share"
             );
         }
+    }
+
+    /// While a leased write holds the claim, every other way the buffer
+    /// could reach the pool must refuse: release, forfeit and promote are
+    /// the three, and any one of them re-posting the id puts the kernel
+    /// free to select it for another connection's recv while the write's
+    /// DMA still reads it.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    #[test]
+    fn a_leased_claim_is_refused_to_every_path_but_the_write() {
+        let mut rb = RecvBuf::default();
+        rb.set_pooled();
+        let buf = Box::leak(vec![0u8; 64].into_boxed_slice());
+        rb.install(RecvClaim {
+            bid: 3,
+            ptr: buf.as_mut_ptr(),
+            cap: 64,
+        });
+        rb.write_lease().expect("a claim leases").taken.set(true);
+        assert!(rb.release().is_none(), "release while leased");
+        assert!(rb.forfeit().is_none(), "forfeit while leased");
+        // Forfeit dropped the claim without surrendering the bid: the op's
+        // completion is the one release left, which is the point.
+    }
+
+    /// Promote under a lease is declared unreachable - no recv is armed
+    /// between the write's submit and the delivery's consume - so its guard
+    /// fails closed loudly rather than moving bytes out from under the DMA.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    #[test]
+    #[should_panic(expected = "promote under a leased write")]
+    fn promote_under_a_lease_fails_closed() {
+        let mut rb = RecvBuf::default();
+        rb.set_pooled();
+        let buf = Box::leak(vec![0u8; 64].into_boxed_slice());
+        rb.install(RecvClaim {
+            bid: 4,
+            ptr: buf.as_mut_ptr(),
+            cap: 64,
+        });
+        rb.write_lease().expect("a claim leases").taken.set(true);
+        let _ = rb.promote_for(0, 1 << 20);
     }
 
     /// A chunk can still be flushing when its tail retires. Its ring

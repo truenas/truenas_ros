@@ -566,7 +566,11 @@ pub struct ServerStats {
     /// Buffers allocated across both registered rings (receive and file
     /// body). Grows a doubling at a time when a completion finds a ring dry
     /// and drains back after idle rounds, so a steady value is a pool at
-    /// its working set and a climbing one is a pool still finding it.
+    /// its working set and a climbing one is a pool still finding it - but
+    /// one that climbs while [`recv_bufs_lent`](ServerStats::recv_bufs_lent)
+    /// stays flat is a **leak**, not sizing: ids are being stranded (the
+    /// kernel consumed their descriptors, nothing returned them) and the
+    /// pool is replacing them, which sizing noise never looks like.
     pub recv_bufs_total: u32,
 }
 
