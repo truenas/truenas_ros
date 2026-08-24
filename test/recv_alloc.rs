@@ -423,6 +423,19 @@ fn put_to_file_cost(
     mib: usize,
     wire_of: fn(&[u8]) -> Vec<u8>,
 ) -> Option<(usize, usize, bool)> {
+    put_to_file_cost_ranged(mib, wire_of, false)
+}
+
+/// [`put_to_file_cost`], optionally writing every window as **two** leased
+/// ranges - the shape a verifier that emits payload extents produces. Both
+/// ranges borrow the same claim, so the second must share the first's
+/// hold rather than fall to the copy path.
+#[cfg(feature = "uring-fs")]
+fn put_to_file_cost_ranged(
+    mib: usize,
+    wire_of: fn(&[u8]) -> Vec<u8>,
+    split: bool,
+) -> Option<(usize, usize, bool)> {
     use std::sync::OnceLock;
     use truenas_ros::http::HttpStreamDeferred;
     use truenas_ros::uring_fs::{Personality, RwFlags};
@@ -486,17 +499,48 @@ fn put_to_file_cost(
                 *off += req.body.len() as u64;
                 let (d, permit, body) = req.defer_stream();
                 let d: HttpStreamDeferred = d;
-                fs.pwritev2_from(
-                    who,
-                    file.clone(),
-                    &body,
-                    at,
-                    RwFlags::empty(),
-                    move |done, _fs| match done.result() {
-                        Ok(_) => d.resume(),
-                        Err(_) => d.fail(HttpResponse::new(500)),
-                    },
-                );
+                let half = if split && body.len() >= 2 {
+                    body.len() / 2
+                } else {
+                    body.len()
+                };
+                let ranges: Vec<(usize, usize)> = if half == body.len() {
+                    vec![(0, body.len())]
+                } else {
+                    vec![(0, half), (half, body.len())]
+                };
+                let d = std::rc::Rc::new(std::cell::RefCell::new(Some(d)));
+                let left = std::rc::Rc::new(std::cell::Cell::new(ranges.len()));
+                let failed = std::rc::Rc::new(std::cell::Cell::new(false));
+                for (start, end) in ranges {
+                    let (d, left, failed) = (
+                        std::rc::Rc::clone(&d),
+                        std::rc::Rc::clone(&left),
+                        std::rc::Rc::clone(&failed),
+                    );
+                    fs.pwritev2_from(
+                        who,
+                        file.clone(),
+                        &body[start..end],
+                        at + start as u64,
+                        RwFlags::empty(),
+                        move |done, _fs| {
+                            if done.result().is_err() {
+                                failed.set(true);
+                            }
+                            left.set(left.get() - 1);
+                            if left.get() == 0 {
+                                let d =
+                                    d.borrow_mut().take().expect("one taker");
+                                if failed.get() {
+                                    d.fail(HttpResponse::new(500));
+                                } else {
+                                    d.resume();
+                                }
+                            }
+                        },
+                    );
+                }
                 HttpVerdict::Defer(permit)
             }
             Stage::End => HttpVerdict::Respond(
@@ -590,6 +634,38 @@ fn a_streamed_put_writes_windows_without_copying_them() {
         "PUT-to-file cost scales with payload: 4 MiB cost {small} large \
          allocations, 16 MiB cost {large}. A copy fallback or a park that \
          retains the window looks exactly like this."
+    );
+}
+
+/// Two ranges of one window both write from the claim.
+///
+/// A verifier that emits payload extents hands the handler several ranges
+/// of the same window; each borrows the same claim, so all of them must
+/// share its hold - the buffer goes back when the last completes. A
+/// single-shot lease sends every range after the first to the copy path,
+/// which at two ranges per window is one ~64 KiB allocation-and-copy per
+/// window, scaling with the payload.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn a_multi_range_window_writes_every_range_from_the_claim() {
+    let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    fn wire(p: &[u8]) -> Vec<u8> {
+        chunked_put(p, 1024 * 1024)
+    }
+    let Some((small, _, ok_small)) = put_to_file_cost_ranged(4, wire, true)
+    else {
+        return; // io_uring unavailable
+    };
+    let Some((large, _, ok_large)) = put_to_file_cost_ranged(16, wire, true)
+    else {
+        return;
+    };
+    assert!(ok_small && ok_large, "file bytes differ from the upload");
+    assert!(
+        large <= small + 8,
+        "two-range PUT-to-file cost scales with payload: 4 MiB cost \
+         {small} large allocations, 16 MiB cost {large}. A range after the \
+         first is falling to the copy path instead of sharing the claim."
     );
 }
 

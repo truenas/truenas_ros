@@ -309,15 +309,20 @@ Do not reopen these without a reason that is new.
   `Open` is for. `StreamPark::expect_interim` carries it;
   `a_deferred_stream_open_still_sends_the_interim` pins both routes.
 
-- **The write borrows the recv buffer; the claim is surrendered to the op,
-  not pinned on the connection.** `deliver_one` consumes the message the
-  moment the handler returns - `Defer` included - so anything that must
-  outlive the handler cannot live on the connection. `pwritev2_from`'s
-  submit records the buffer id on the op; `RecvBuf::drain_front` sees the
-  lease at consume and takes the claim *without* releasing it (keeping only
-  the pipelined remainder, which is empty on the streaming hot path); the
-  op's completion carries the id out on `FsDone::take_recv_lease` and the
-  server dispatch hands it to the pool. Release and forfeit refuse while
+- **The write borrows the recv buffer; the claim is surrendered to its
+  writes, not pinned on the connection.** `deliver_one` consumes the
+  message the moment the handler returns - `Defer` included - so anything
+  that must outlive the handler cannot live on the connection. Every
+  in-bounds range a delivery submits shares one `Arc<LeaseHold>`; each
+  op parks a share, and `Arc::into_inner` at reap surfaces the id from
+  exactly the completion that dropped the last one, so N ranges of one
+  window all write zero-copy and the buffer cannot come back while a
+  sibling's DMA still reads it. The facade keeps only a `Weak`, so it
+  never delays the release. `RecvBuf::drain_front` sees the lease at
+  consume and takes the claim *without* releasing it (keeping only the
+  pipelined remainder, which is empty on the streaming hot path); the
+  surfaced id rides `FsDone::take_recv_lease` and the server dispatch
+  hands it to the pool. Release and forfeit refuse while
   leased for the same reason: two owners releasing one bid re-posts a
   buffer the kernel may hand to a recv while the write's DMA still reads
   it. The ring's own state machine catches the double-release
