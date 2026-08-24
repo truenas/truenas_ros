@@ -1478,6 +1478,19 @@ fn needs_impersonation(
     if cur.len() != groups.len() {
         return true;
     }
+    // Equal length plus one-way containment is not set equality once a gid
+    // repeats: a request for `[1, 1]` against a current `[1, 2]` satisfies
+    // both and takes the fast path, which registers the broker's *own*
+    // credentials - group 2 included - under the caller's name. A repeat is
+    // never something the fast path needs to serve, so it goes through the
+    // window, where `setgroups` installs exactly what was asked for.
+    // Quadratic over a supplementary list, and allocation-free, which the
+    // forked child requires.
+    let repeats =
+        |l: &[u32]| l.iter().enumerate().any(|(i, g)| l[..i].contains(g));
+    if repeats(groups) || repeats(cur) {
+        return true;
+    }
     groups.iter().any(|g| !cur.contains(g))
 }
 
@@ -1500,6 +1513,46 @@ fn revert() {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
+
+    /// A repeated gid must not buy the no-impersonation fast path.
+    ///
+    /// That path registers the broker's *own* credentials, so taking it for
+    /// a request whose group list only looks like the current one hands the
+    /// caller whatever the broker holds. Equal length plus one-way
+    /// containment satisfies `[1, 1]` against a current `[1, 2]` - same
+    /// count, every requested gid present - while the sets differ by group
+    /// 2. Driven on the predicate, since reaching the real path needs a
+    /// forked broker with CAP_SETUID.
+    #[test]
+    fn a_repeated_gid_does_not_take_the_no_impersonation_path() {
+        let me = crate::uring_fs::broker::raw_geteuid();
+        let my_gid = crate::uring_fs::broker::raw_getegid();
+        let mut scratch = [0u32; 64];
+        // As many entries as the process has, all of them one gid it
+        // really holds - equal in count, and a subset by containment.
+        let n = unsafe {
+            libc::syscall(
+                libc::SYS_getgroups,
+                scratch.len() as libc::c_long,
+                scratch.as_mut_ptr(),
+            )
+        };
+        if n < 2 {
+            return; // needs at least two supplementary groups to forge
+        }
+        let real = &scratch[..n as usize].to_vec();
+        let forged: Vec<u32> = vec![real[0]; real.len()];
+        if forged == *real {
+            return; // this process's groups are already all equal
+        }
+        let mut scratch2 = [0u32; 64];
+        assert!(
+            needs_impersonation(me, my_gid, &forged, &mut scratch2),
+            "a forged group list took the fast path: {forged:?} against \
+             {real:?}"
+        );
+    }
+
     use super::*;
     use crate::uring::ring::Ring;
     use std::mem::size_of;

@@ -370,8 +370,16 @@ Do not reopen these without a reason that is new.
   `header_len == 0 && len == body_len` predicate and takes the accumulate
   buffer as an owned `Vec` once per window. Chunked windows dodge it by
   carrying chunk-header bytes; pure payload does not.
-  `a_known_length_put_streams_without_copying` measures it - linear large
-  allocations with a full-window framer, flat with the buffered bound.
+  `a_known_length_put_streams_without_copying` measures it - linear
+  allocations with a full-window framer, flat with the buffered bound. It
+  counts from `MED` rather than `BIG`, because the buffered bound is also
+  what makes these windows small: the reactor fills the recv buffer a
+  `RECV_CHUNK` at a time, so a known-length window is about 4 KiB and a
+  per-window copy of one never reaches a 64 KiB counting threshold. That
+  size is also why a known-length body costs roughly thirty times the
+  dispatches of a chunked one carrying the same payload - raising it means
+  changing what the reactor arms for a streamed body, not what the framer
+  declares.
 
 ### The offload pool
 

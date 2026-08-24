@@ -1140,13 +1140,17 @@ where
                         .collect();
                     let stage =
                         resume.as_ref().map_or(Stage::Whole, |r| r.stage);
+                    // The handles are split because a redriven window that
+                    // exhausted a known length owes an End dispatch as well
+                    // (below), exactly as the inline path does.
+                    let mut fs = fs;
                     let d = dispatch(
                         &head,
                         Body::placed(parked),
                         &views,
                         peer,
-                        responder,
-                        fs,
+                        responder.split(),
+                        split_slot(&mut fs),
                         &mut conn.state,
                         dates,
                         handler,
@@ -1158,6 +1162,31 @@ where
                         // interim a parked open was still withholding -
                         // the redrive route owes it exactly as the resume
                         // route does.
+                        //
+                        // `StreamDone` is not a phase to restore. It marks a
+                        // known length already spent, so no wire remains to
+                        // frame an End delivery from - and the framer's
+                        // degrade arm would declare whatever is buffered,
+                        // i.e. the *next* pipelined request's head, as this
+                        // message's header. Dispatch End here instead, which
+                        // is what the resume route does with the same marker.
+                        (Dispatched::Continue, Some(r))
+                            if matches!(r.next, Phase::StreamDone { .. }) =>
+                        {
+                            let d = dispatch(
+                                &head,
+                                Body::inline(&[]),
+                                &[],
+                                peer,
+                                responder,
+                                fs,
+                                &mut conn.state,
+                                dates,
+                                handler,
+                                Stage::End,
+                            );
+                            settle(conn, d, None)
+                        }
                         (Dispatched::Continue, Some(r)) => {
                             conn.phase = r.next;
                             Response::Reply(if r.expect_interim {

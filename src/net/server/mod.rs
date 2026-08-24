@@ -840,7 +840,10 @@ where
                 ),
                 crate::uring::bufring::ring_entries(
                     cfg.pool_size.saturating_mul(
-                        crate::net::core::reactor::RECV_LEASE_DEPTH,
+                        // The write depth *plus the message arriving*: a
+                        // handler at the documented cap holds that many
+                        // leased buffers and is still being read into.
+                        crate::net::core::reactor::RECV_LEASE_DEPTH + 1,
                     ),
                 ),
             )

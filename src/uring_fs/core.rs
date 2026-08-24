@@ -1296,9 +1296,29 @@ impl FsCore {
         let Some(done) = self.take_op(tag, op_slot, gen32) else {
             return;
         };
+        #[cfg(feature = "net-server")]
+        let (recv_lease, lease_want) = (done.recv_lease, done.lease_want);
         let Completed {
             waiter, bufs, stat, ..
         } = done;
+        // A short leased write is unrecoverable on this path too, and the
+        // reason does not soften at teardown: the source was the
+        // connection's receive buffer, so a caller told `Ok(n)` cannot
+        // retry from bytes it no longer owns, and a caller that shrugs
+        // stores a truncated object. The live reap rewrites it; without the
+        // same rewrite here a drain is the one way to observe the count.
+        #[cfg(feature = "net-server")]
+        let res = {
+            let r = map_res(cqe.res);
+            match r {
+                Ok(n) if recv_lease.is_some() && (n as u32) < lease_want => {
+                    Err(Errno::EIO)
+                }
+                other => other,
+            }
+        };
+        #[cfg(not(feature = "net-server"))]
+        let res = map_res(cqe.res);
         // Teardown: the loop is dying - just report the outcome and hand any
         // buffers back. A file's fd is released when its op entry (and thus its
         // parked `Arc`) is dropped with the ring teardown - except an OPEN's,
@@ -1313,7 +1333,7 @@ impl FsCore {
         } else {
             None
         };
-        deliver(waiter, map_res(cqe.res), bufs, file, stat);
+        deliver(waiter, res, bufs, file, stat);
     }
 
     /// Leak the op table without dropping it - used ONLY when a teardown
@@ -3726,6 +3746,55 @@ mod routing_fuzz {
         let _ = core.on_cqe(&mut eng, t, s, g, 8192);
         let out = rx.try_recv().expect("delivered");
         assert_eq!(out.res, Ok(8192), "a full leased write is untouched");
+    }
+
+    /// The teardown drain answers a short leased write the same way the
+    /// live reap does.
+    ///
+    /// The reason does not soften at shutdown: the write's source was the
+    /// connection's receive buffer, so a caller handed `Ok(n)` cannot retry
+    /// from bytes it no longer owns, and one that shrugs stores a truncated
+    /// object. The drain is the only other path a leased completion can
+    /// take.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_drained_short_leased_write_is_an_error() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let buf = vec![7u8; 8192];
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        let (tx, rx) = mpsc::channel();
+        let staged = core.submit_pwritev2_leased(
+            &mut eng,
+            0,
+            file,
+            buf.as_ptr(),
+            buf.len(),
+            0,
+            0,
+            9,
+            chan(&tx),
+        );
+        assert!(staged.is_ok(), "staged");
+        let [(t, s, g)] = inflight(&core)[..] else {
+            panic!("one op in flight");
+        };
+        let cqe = IoUringCqe {
+            user_data: pack_raw(t, s, g),
+            res: 4096, // short of the 8192 the lease asked for
+            flags: 0,
+        };
+        core.on_drain_cqe(&cqe);
+        let out = rx.try_recv().expect("delivered");
+        assert_eq!(
+            out.res,
+            Err(Errno::EIO),
+            "a short leased write survived the drain as a success"
+        );
     }
 
     /// Teardown's drain owns the fd a successful open completes with.

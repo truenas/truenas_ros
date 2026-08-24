@@ -312,13 +312,27 @@ impl BufRing {
     }
 
     /// Make every descriptor written since the last commit visible.
+    ///
+    /// Production only. Under `cfg(loom)` there is no mapping to publish
+    /// into, and the cast below must not name loom's `AtomicU16`: that type
+    /// is eight bytes where the mapped `resv` field is two, at offset 14 of
+    /// a 16-byte descriptor, so the reference would cover memory past the
+    /// entry. `uring::ring` keeps the same separation by holding pointers
+    /// into the mapping only under `cfg(not(loom))`.
+    #[cfg(not(loom))]
     fn commit(&self) {
         // SAFETY: entry zero exists (`entries >= 1`) and its `resv` field is
         // where the kernel reads the producer tail from.
-        let tail =
-            unsafe { &*(&raw const (*self.ring).resv).cast::<AtomicU16>() };
+        let tail = unsafe {
+            &*(&raw const (*self.ring).resv)
+                .cast::<std::sync::atomic::AtomicU16>()
+        };
         publish_tail(tail, self.tail);
     }
+
+    /// Under loom the ring is not mapped, so there is nothing to publish.
+    #[cfg(loom)]
+    fn commit(&self) {}
 
     /// Keep `want` buffers allocated, posting or dropping to reach it.
     ///
@@ -440,32 +454,6 @@ impl BufRing {
     /// Buffers allocated, whether posted or lent.
     pub(crate) fn allocated(&self) -> u16 {
         self.posted + self.lent
-    }
-
-    /// Debug-only agreement check against the kernel's consumer head
-    /// (`IORING_REGISTER_PBUF_STATUS`): with nothing in flight and every
-    /// completion processed, the descriptors the kernel has not consumed
-    /// (`tail - head`) must equal the buffers this table holds `Posted`.
-    ///
-    /// A shortfall is a stranded id - a completion's buffer that was
-    /// neither adopted nor requeued - which **no gauge can see**: the slot
-    /// stays `Posted` here while the kernel's descriptor is gone, so the
-    /// ring quietly shrinks by one buffer per leak while `lent` and
-    /// `allocated` stay innocent. Meaningful only at a quiesced drain;
-    /// with ops in flight the two sides legitimately disagree.
-    #[cfg(debug_assertions)]
-    pub(crate) fn debug_assert_kernel_agrees(&self) {
-        let Ok(head) = pbuf_status_head(self.ring_fd, self.bgid) else {
-            return; // probe unsupported: diagnostic, not load-bearing
-        };
-        let unconsumed = self.tail.wrapping_sub(head as u16);
-        debug_assert_eq!(
-            unconsumed, self.posted,
-            "provided-buffer group {} desynced from the kernel: \
-             {unconsumed} descriptors unconsumed vs {} posted - a \
-             completion's buffer was neither adopted nor requeued",
-            self.bgid, self.posted
-        );
     }
 
     /// Buffers posted and not yet picked.
@@ -656,12 +644,6 @@ impl BufPool {
         self.ring.release(bid);
     }
 
-    /// Debug-only drain check: see [`BufRing::debug_assert_kernel_agrees`].
-    #[cfg(debug_assertions)]
-    pub(crate) fn debug_assert_kernel_agrees(&self) {
-        self.ring.debug_assert_kernel_agrees();
-    }
-
     /// Buffers posted and not yet picked.
     pub(crate) fn free(&self) -> u16 {
         self.ring.free()
@@ -682,16 +664,25 @@ impl BufPool {
     /// Doubling rather than stepping: the shortage says the pool is under
     /// its working set, and a workload that opened many connections at once
     /// would otherwise need one `-ENOBUFS` round trip per buffer to get
-    /// there. Returns whether the target actually rose - at the ring's
-    /// ceiling it cannot, and the caller falls back to owning a buffer.
+    /// there. Returns whether a buffer was actually added, since that - not
+    /// the target moving - is what lets the re-armed read find one.
+    ///
+    /// The doubling is measured from whichever of target and allocated is
+    /// larger. A shortage means every allocated buffer is lent, and an idle
+    /// stretch may have lowered the target below that count while they were
+    /// out; doubling the *target* would then land at or under what is
+    /// already allocated, add nothing, and report failure - which demotes
+    /// the connection to owned buffers for the rest of its life
+    /// (`set_recv_owned` is one-way). Growth has to be measured against
+    /// what the pool holds.
     pub(crate) fn grow(&mut self) -> bool {
         self.idle_rounds = 0;
-        let before = self.ring.target();
-        if before >= self.ring.entries() {
+        let allocated = self.ring.allocated();
+        let base = self.ring.target().max(allocated);
+        if base >= self.ring.entries() {
             return false;
         }
-        let allocated = self.ring.allocated();
-        self.ring.set_target(before.saturating_mul(2).max(1));
+        self.ring.set_target(base.saturating_mul(2).max(1));
         self.ring.allocated() > allocated
     }
 
@@ -1175,6 +1166,58 @@ mod tests {
             p.release(0);
         }
         assert_eq!(p.target(), grown, "never lowered while it was working");
+    }
+
+    /// A shortage while the target sits *below* what is allocated still
+    /// grows.
+    ///
+    /// An idle stretch lowers the target, and the surplus is given up only
+    /// as buffers cycle - so a pool that goes quiet and then busy can hold
+    /// more than it is aiming for, with every one of them lent. Measuring
+    /// the doubling from the target lands at or under that count, adds
+    /// nothing and reports failure, and the caller answers a reported
+    /// failure by demoting the connection to owned buffers for the rest of
+    /// its life.
+    #[test]
+    fn a_shortage_below_a_shrunk_target_still_grows() {
+        let Some(r) = ring() else {
+            return;
+        };
+        let Ok(mut p) = BufPool::new(r.raw_fd(), 5, 64, 64) else {
+            return;
+        };
+        // Idle it down first: the target falls, and the surplus is given
+        // up only in `release`, so nothing posted cycles and the pool goes
+        // on holding what it had.
+        for _ in 0..SHRINK_AFTER {
+            p.rebalance();
+        }
+        let allocated = p.allocated();
+        assert!(
+            p.target() < allocated,
+            "the fixture needs a target under what is held: {} vs {allocated}",
+            p.target()
+        );
+
+        // Then hand every one of them out, which is what a shortage means.
+        let held: Vec<u16> = (0..allocated)
+            .filter(|&b| p.take_lent(b).is_some())
+            .collect();
+        assert_eq!(
+            held.len(),
+            allocated as usize,
+            "the fixture has to lend them all"
+        );
+
+        assert!(
+            p.grow(),
+            "a dry ring holding {allocated} buffers reported no growth"
+        );
+        assert!(
+            p.allocated() > allocated,
+            "and added none: {} vs {allocated}",
+            p.allocated()
+        );
     }
 
     /// A growth that could not allocate reports failure, so the caller

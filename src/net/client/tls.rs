@@ -239,6 +239,14 @@ where
             // SAFETY: `fd` is the furnished fd we never delivered to a worker.
             unsafe { libc::close(fd) };
             self.parked_handshakes -= 1;
+            // Every connect resolves to exactly one of `Connected` or
+            // `ConnectFailed` - that is what `await_connect` blocks on - so
+            // tearing the slot down without emitting one leaves the caller
+            // waiting for an event that will never arrive.
+            self.events.push_back(Event::ConnectFailed {
+                conn: ConnId::new(slot, gen64),
+                err: Errno::ECONNABORTED,
+            });
             if let Some(p) = self.core.table.take_tls_connecting(slot) {
                 self.core.table.park_tls(slot, Box::new(p.peer));
                 let _ = self.core.submit_teardown(slot, generation, true);

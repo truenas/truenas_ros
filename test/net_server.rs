@@ -6598,7 +6598,12 @@ fn ktls_echo_roundtrip() {
                 assert_eq!(recv_framed(&mut s)?, msg, "kTLS echo mismatch");
             }
             // A larger payload spanning multiple TLS records still frames.
-            let big = vec![0x5au8; 40 * 1024];
+            // 512 KiB is above `RECV_POOL_BUF`, so the body is *placed* -
+            // read into its own allocation rather than the pool buffer -
+            // which is the arm the kTLS continuation's bound has to follow.
+            // Well under the 1 MiB `max_request_bytes` a server advertises,
+            // so this is an ordinary message, not an edge.
+            let big = vec![0x5au8; 512 * 1024];
             send_framed(&mut s, &big)?;
             assert_eq!(recv_framed(&mut s)?, big);
             Ok(())
@@ -6757,6 +6762,206 @@ fn ktls_ready_without_kernel_keys_is_shed() {
     client.join().expect("thread join");
     let s = stats.snapshot();
     assert!(s.shed >= 1, "the unkeyed connection was shed: {s:?}");
+    assert_eq!(s.replies, 0, "and nothing was answered: {s:?}");
+}
+
+/// A shutdown that lands while bytes are arriving must not abort.
+///
+/// Stopping the reactor reaps outstanding completions rather than
+/// dispatching them, so a recv the kernel has already chosen a provided
+/// buffer for is drained without that buffer ever being adopted. Its
+/// descriptor is consumed and the connection is going away, which is
+/// correct - but it means the kernel's consumer head and this side's
+/// posted count legitimately disagree at teardown, and any drain-time
+/// equality check between them fires on an ordinary shutdown. `Server`
+/// drains from `Drop`, where a panic aborts the process rather than
+/// failing a test, so such a check costs a crash on a correct path.
+#[test]
+fn a_shutdown_amid_arrivals_tears_down_quietly() {
+    let cfg = ServerConfig {
+        pool_size: 8,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = length_prefixed(
+        PrefixWidth::U32,
+        Endian::Big,
+        false,
+        |_h: &[u8], body: &[u8], _p: &ClientAddr| Some(echo_frame(body)),
+    );
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stats = server.stats_handle();
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || {
+        // One full round trip first, so the fixture is known to have been
+        // accepted and served before anything races - the shutdown below
+        // is deliberately concurrent and would otherwise be free to win
+        // before the first accept.
+        let mut first = connect_tcp(v4).expect("connect");
+        send_framed(&mut first, b"warmup").expect("send");
+        assert_eq!(recv_framed(&mut first).expect("echo"), b"warmup");
+
+        // Then several connections delivering at the moment the reactor
+        // stops, so a recv completes with a buffer already selected and is
+        // reaped rather than dispatched.
+        let mut socks = Vec::new();
+        for _ in 0..6 {
+            let mut s = connect_tcp(v4).expect("connect");
+            s.write_all(&64u32.to_be_bytes()).expect("prefix");
+            socks.push(s);
+        }
+        for s in socks.iter_mut() {
+            let _ = s.write_all(&[7u8; 64]);
+        }
+        stop.shutdown();
+        for s in socks.iter_mut() {
+            let _ = s.write_all(&64u32.to_be_bytes());
+            let _ = s.write_all(&[7u8; 64]);
+        }
+        thread::sleep(Duration::from_millis(50));
+        drop(socks);
+        drop(first);
+    });
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join");
+    // Reaching here at all is the assertion: the drop below must not abort.
+    let s = stats.snapshot();
+    assert!(s.replies >= 1, "the fixture was served: {s:?}");
+}
+
+/// Half a handshake is not a handshake: a socket the kernel keyed in only
+/// **one** direction passes the other direction's bytes in the clear, so
+/// `ready()` sheds it exactly as it sheds an unkeyed one.
+///
+/// The unkeyed case cannot see this distinction. A predicate that ORs the
+/// two directions instead of ANDing them still refuses a socket with no
+/// keys at all - passing `ktls_ready_without_kernel_keys_is_shed` - while
+/// admitting this one, whose TX side is plaintext on the wire. The hook
+/// installs the RX key only, leaving `tx_conf` at `TLS_BASE`, which is the
+/// shape a handshake library with a TLS 1.3 RX/TX gap produces.
+#[test]
+fn ktls_ready_with_only_one_direction_keyed_is_shed() {
+    const SOL_TLS: libc::c_int = 282;
+    const TLS_RX: libc::c_int = 2;
+    const TCP_ULP: libc::c_int = 31;
+    // `struct tls12_crypto_info_aes_gcm_128`. The contents do not matter -
+    // only that the kernel accepts them and sets `crypto_recv.info`.
+    #[repr(C)]
+    struct AesGcm128 {
+        version: u16,
+        cipher_type: u16,
+        iv: [u8; 8],
+        key: [u8; 16],
+        salt: [u8; 4],
+        rec_seq: [u8; 8],
+    }
+
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = length_prefixed(
+        PrefixWidth::U32,
+        Endian::Big,
+        false,
+        |_h: &[u8], body: &[u8], _p: &ClientAddr| Some(echo_frame(body)),
+    );
+    let mut server = match Server::bind(
+        [truenas_ros::net::server::Listen::tls(addr)],
+        proto,
+    ) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    server.set_tls_handshake(move |fd, _inc, deferral| {
+        thread::spawn(move || {
+            // Attach the ULP and key RX only, so everything the server
+            // sends goes out in the clear.
+            // SAFETY: setsockopt on the furnished fd this worker owns.
+            let keyed_one_way = unsafe {
+                let tls = b"tls\0";
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_TCP,
+                    TCP_ULP,
+                    tls.as_ptr().cast(),
+                    tls.len() as libc::socklen_t,
+                ) == 0
+                    && {
+                        let ci = AesGcm128 {
+                            version: 0x0303, // TLS_1_2_VERSION
+                            cipher_type: 51, // TLS_CIPHER_AES_GCM_128
+                            iv: [1; 8],
+                            key: [2; 16],
+                            salt: [3; 4],
+                            rec_seq: [0; 8],
+                        };
+                        libc::setsockopt(
+                            fd,
+                            SOL_TLS,
+                            TLS_RX,
+                            (&raw const ci).cast(),
+                            size_of::<AesGcm128>() as libc::socklen_t,
+                        ) == 0
+                    }
+            };
+            // SAFETY: the furnished fd is the worker's to close. The
+            // readback rides the deferral's own dup.
+            unsafe { libc::close(fd) };
+            if keyed_one_way {
+                deferral.ready(()); // "success" on a half-keyed socket
+            } else {
+                deferral.reject(); // this kernel would not key it
+            }
+        });
+    });
+    let stats = server.stats_handle();
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop);
+        (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            s.set_read_timeout(Some(Duration::from_secs(3)))?;
+            send_framed(&mut s, b"clear?")?;
+            let mut one = [0u8; 1];
+            match s.read(&mut one) {
+                Ok(0) => Ok(()),
+                Ok(_) => {
+                    panic!("a half-keyed ready() was served in the clear")
+                }
+                // WouldBlock is tolerated because an admitted half-keyed
+                // connection answers nothing either - the read alone cannot
+                // separate the two. The stats assertion below is what does.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        })()
+        .expect("client io");
+    });
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join");
+    let s = stats.snapshot();
+    // Shed, not installed-then-closed: under an OR predicate the connection
+    // is admitted, so `shed` stays 0 and the teardown counts as `closed`.
+    assert!(s.shed >= 1, "the half-keyed connection was shed: {s:?}");
     assert_eq!(s.replies, 0, "and nothing was answered: {s:?}");
 }
 
