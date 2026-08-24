@@ -39,14 +39,13 @@ const BIG: usize = 64 * 1024;
 
 static BIG_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
-/// The second threshold, for a path whose unit is smaller than [`BIG`].
+/// The second threshold, for costs whose unit is smaller than [`BIG`].
 ///
-/// A known-length window is bounded by what the recv already buffered, and
-/// the reactor fills that a `RECV_CHUNK` at a time - so those windows are
-/// around 4 KiB and a per-window copy never reaches `BIG`. Counting from
-/// half a chunk keeps the copy visible while staying above the framing and
-/// reply-building traffic, which is what a lower bar would drown the signal
-/// in.
+/// A copy or fallback need not move a full window at a time to matter -
+/// anything from a chunk read up scales with the payload all the same.
+/// Counting from half a `RECV_CHUNK` keeps such costs visible while
+/// staying above the framing and reply-building traffic, which is what a
+/// lower bar would drown the signal in.
 const MED: usize = 2 * 1024;
 
 static MED_ALLOCS: AtomicUsize = AtomicUsize::new(0);
@@ -636,15 +635,9 @@ fn a_streamed_put_at_botocore_chunks_still_does_not_copy() {
 /// regression this exists to catch is precisely a silent fall back to
 /// buffering.
 ///
-/// Counted from [`MED`], not [`BIG`], and moving it back would empty this
-/// test out: a known-length window is bounded by what the recv already
-/// buffered and the reactor fills that a `RECV_CHUNK` at a time, so these
-/// windows are around 4 KiB and a per-window copy of one never reaches
-/// `BIG` - against that threshold the measurement is 0 against 0, which
-/// holds nothing. (The same window size is why a known-length body takes
-/// roughly thirty times the dispatches of a chunked one carrying the same
-/// payload; changing it means changing what the reactor arms for a
-/// streamed body, which is a separate decision from what this measures.)
+/// Counted from [`MED`], the tighter of the allocator's two thresholds,
+/// so a fallback whose unit is smaller than a full window still registers
+/// rather than sliding under a 64 KiB bar.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_known_length_put_streams_without_copying() {

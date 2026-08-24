@@ -368,22 +368,23 @@ Do not reopen these without a reason that is new.
   marker (chunked never parks with it). Bytes buffered behind the tail
   are the next pipelined request's;
   `pipelined_known_length_streams_do_not_desync` pins the handoff.
-- **A known-length window is sized to the buffered bytes, never past
-  them.** A window the buffer cannot fill makes the reactor read the rest
-  into an owned allocation: the exact fill lands on `take_body_handoff`'s
-  `header_len == 0 && len == body_len` predicate and takes the accumulate
-  buffer as an owned `Vec` once per window. Chunked windows dodge it by
-  carrying chunk-header bytes; pure payload does not.
-  `a_known_length_put_streams_without_copying` measures it - linear
-  allocations with a full-window framer, flat with the buffered bound. It
-  counts from `MED` rather than `BIG`, because the buffered bound is also
-  what makes these windows small: the reactor fills the recv buffer a
-  `RECV_CHUNK` at a time, so a known-length window is about 4 KiB and a
-  per-window copy of one never reaches a 64 KiB counting threshold. That
-  size is also why a known-length body costs roughly thirty times the
-  dispatches of a chunked one carrying the same payload - raising it means
-  changing what the reactor arms for a streamed body, not what the framer
-  declares.
+- **A known-length window is a full `STREAM_WINDOW`, however little is
+  buffered.** The exact read that completes it draws from the recv pool:
+  `known_step` answers `More` on an empty buffer, which re-acquires a
+  claim, and the reactor refuses to place a frame one pool buffer can
+  serve - so the remainder arrives zero-copy and the feared owned-handoff
+  fires only on an unpooled connection, where a per-window `Vec` is the
+  degraded mode's ordinary cost. This replaces an earlier bound to the
+  buffered bytes, whose windows were `RECV_CHUNK`-sized in practice:
+  ~33x the deliveries, eventfd wakes and leased writes per payload,
+  measured at 31x the pokes and 21x the `io_uring_enter` calls, while the
+  owned-allocation cost it guarded against measured zero on a pooled
+  connection. The `remaining` bound is what keeps a pipelined next
+  request out of the exhausting window's tail.
+  `a_known_length_put_streams_without_copying` still measures allocation
+  flatness (from `MED`, the tighter of the counting allocator's two
+  thresholds), and `a_known_length_body_streams_above_one_window` pins
+  the full-window law.
 
 ### The offload pool
 
