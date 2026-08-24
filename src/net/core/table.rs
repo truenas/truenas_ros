@@ -504,6 +504,43 @@ impl<U> ConnTable<U> {
         self.active = 0;
     }
 
+    /// Take whatever pool buffer this slot's connection holds, whatever its
+    /// state and whatever is buffered in it, so the caller can return it
+    /// before the connection goes away.
+    ///
+    /// Unlike `Connection::release_recv_buf` this does not wait for the
+    /// buffer to be empty: its bytes die with the connection, and a buffer
+    /// not handed back is one the pool can never reissue *and* never retire
+    /// the group of - `BufPool::rebalance` retires only at `lent() == 0`.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn forfeit_recv_claim(
+        &mut self,
+        slot: u32,
+    ) -> Option<super::conn::RecvClaim> {
+        let e = self.slots.get_mut(slot as usize)?;
+        let conn = match &mut e.state {
+            SlotState::Serving(conn)
+            | SlotState::Detaching(conn)
+            | SlotState::Detached(conn) => conn,
+            _ => return None,
+        };
+        conn.forfeit_recv_buf()
+    }
+
+    /// Ring buffer ids still queued on this slot's connection, taken.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn drain_pooled_send_bids(&mut self, slot: u32) -> Vec<u16> {
+        let Some(e) = self.slots.get_mut(slot as usize) else {
+            return Vec::new();
+        };
+        match &mut e.state {
+            SlotState::Serving(conn)
+            | SlotState::Detaching(conn)
+            | SlotState::Detached(conn) => conn.drain_pooled_bids(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Empty the slot (whatever its state) and bump its generation so
     /// outstanding tokens go stale. Returns whether a live connection was freed
     /// -- `Serving` or a detach state (the caller counts those; peer fetches and

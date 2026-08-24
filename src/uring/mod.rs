@@ -19,6 +19,8 @@
 // code to prune.
 #![allow(dead_code)]
 
+#[cfg(feature = "net-server")]
+pub(crate) mod bufring;
 pub(crate) mod engine;
 pub(crate) mod probe;
 pub(crate) mod ring;

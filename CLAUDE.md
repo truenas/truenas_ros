@@ -121,14 +121,142 @@ Do not reopen these without a reason that is new.
   longest-waiting-first order. `redrive_parked_tail` also checks for a free
   slot *before* popping, because `on_cqe` returns early for a cancel
   completion and for a stale-generation miss and neither frees anything.
-- **The send-backlog check covers `2 x FILE_TAIL_BUFS` chunks, not
-  `FILE_TAIL_BUFS`.** The mint cap and the recycled-spare cap are independent
-  (`tail_take_buf` counts only mints against `created`), so one tail owns and
-  can queue twice its mint cap - which
-  `a_late_flushing_chunk_never_grows_the_next_tails_pool` pins at four takes,
-  never five. It bounds one tail's chunks and nothing else; a reply head, a
+- **Chunk buffers belong to the ring, not to a connection.** They are
+  provided buffers on their own group (`BGID_FILE_BODY`), selected by the
+  kernel when the read completes and handed back when the chunk reaches the
+  peer, so the memory tracks *bodies in flight* rather than the connection
+  table. A connection holds a *count* (`Connection::chunk_out`, capped at
+  `FILE_TAIL_BUFS`) and no storage. What a connection owned before -
+  `chunk_spare`, minted on its first file reply and held until it closed -
+  made the worst case `pool_size x 2 x fs_body_chunk`: 256 MiB at the
+  defaults and a gigabyte at ts3's megabyte chunk, resident whether or not
+  anything was streaming.
+  `serving_file_bodies_does_not_allocate_per_connection` measures it with
+  a counting allocator: 16 large allocations for 4 connections and 128
+  for 32 before, zero for both after.
+- **A provided buffer serves a file read.** `IORING_OP_READV` carries
+  `buffer_select` (`io_uring/opdef.c`) and the one extra rule is a single
+  iovec - `io_iov_buffer_select_prep` answers `-EINVAL` above one
+  (`io_uring/rw.c`) - which `submit_pump_read` already satisfied. The
+  destination does not have to be known at submit: it arrives with
+  `IORING_CQE_F_BUFFER` on the completion, which is before the chunk is
+  queued for send, and that is the only moment it is needed.
+- **The id rides out on `SendProgress`, because only the reactor holds the
+  pool.** `advance_sent` runs on `Connection`, which cannot reach it, so a
+  flushed chunk reports its buffer id and the reactor releases it. Teardown
+  drains whatever is still queued (`drain_pooled_send_bids` in `free_slot`)
+  for the same reason the recv claim is forfeited there: a buffer never
+  handed back can be neither reissued nor freed.
+- **The send-backlog check covers `FILE_TAIL_BUFS` chunks.** That is every
+  chunk buffer the connection has, so a body can queue all of them and no
+  more. It bounds one body's chunks and nothing else; a reply head, a
   retired tail's released diversion and an earlier pipelined body's unflushed
   chunks scale with `max_in_flight_requests` instead.
+
+### The recv buffer pool
+
+- **A provided buffer cannot be reserved at submit time.** The kernel picks
+  one when the op *completes*, not when it is armed
+  (`io_ring_buffer_select`, `io_uring/kbuf.c`), so any number of
+  `IOSQE_BUFFER_SELECT` recvs can be outstanding against a pool of any size
+  and `BufPool::lent` - which counts at completion - cannot see them coming.
+  Gating the submit on `lent < entries` therefore looks right, passes a
+  single-connection test, and sheds the fifth of five concurrent
+  connections. Shortage is reported by the kernel as `-ENOBUFS` on the
+  completion, and that is the only place it can be handled:
+  `recv_buffer_shortage` grows the pool and re-pumps; on the file-body
+  ring, `on_pump_read` does the same - a dry ring there is pressure, not a
+  failed transfer, and treating it as a read error closes the connection
+  mid-body (`a_burst_of_file_bodies_grows_the_ring_instead_of_shedding`
+  pins the distinction). Growth doubles rather than steps, because the
+  shortage says the pool is under its working set. Progress does not depend
+  on growth succeeding - the recv path drops the connection back to owning
+  its buffer, the pump path re-issues the read with an owned one - so a
+  shortage can never come back twice.
+- **Rings are registered at the physical bound; there is no sizing knob.**
+  A ring cannot be resized after registration (re-registering a live `bgid`
+  is `-EEXIST`), so `ring_entries` sizes it to the most buffers real demand
+  could ever hold at once - one per connection for recv, `FILE_TAIL_BUFS`
+  per connection for file bodies - clamped to the kernel's 32768-entry cap
+  (`io_uring/kbuf.c:633-637`). A descriptor slot is 16 bytes, so that
+  headroom is not memory; the backing buffers are, and they track demand
+  between `POOL_INITIAL` and the bound. An earlier ceiling knob defaulted
+  far below the bound, which turned an ordinary burst into the per-read
+  malloc fallback the ring exists to remove. `recv_pool` and `fs_body_pool`
+  are booleans, and everything else is derived.
+- **A pool buffer's size is a free parameter, because a message that
+  outgrows one promotes instead of being refused.** `RecvBuf::promote_for`
+  copies what is accumulated into owned storage and hands the buffer back,
+  so the cost of an oversized message is one copy bounded by the *buffer*,
+  not by the message. Without it `recv_pool_buf_len` had to be
+  `max_request_bytes + RECV_CHUNK` and the pool had to default off - the
+  size was chasing a cap that has nothing to do with how much a typical
+  message needs. `RECV_POOL_BUF` is 256 KiB so a streamed window
+  (`STREAM_WINDOW`, 128 KiB) fits with its framing and a pipelined
+  remainder - a buffer that could not hold one would push every window
+  into placement and the pool would carry heads and nothing that moves
+  data.
+- **The ring is a conveyor of descriptors, not a slab.** Each
+  `io_uring_buf` carries its own `addr` and `len`, so the ring is registered
+  once at its ceiling and buffers are allocated and posted behind it on
+  demand - SPDK's model
+  (`uring_sock_group_populate_buf_ring`, `module/sock/uring/uring.c`, which
+  refills entries every poll from an application callback). The payoff is
+  not elasticity but locality: **a buffer is freed only in
+  `BufRing::release`, which runs when the kernel has already handed it
+  back.** The slab-per-group alternative has to prove nothing anywhere in
+  the group is still lent before freeing the slab under it - a whole-pool
+  invariant guarding a use-after-free, where this asks a per-buffer
+  question.
+- **Shrinking lowers the target; the buffers follow as they cycle.** A
+  posted descriptor cannot be retracted - the kernel owns that entry until
+  it picks it - so surplus storage is given up in `release`, one buffer per
+  cycle. A pool going from busy to *quieter* returns its surplus promptly; a
+  pool going from busy to *silent* keeps it, because nothing is cycling.
+  That residue is bounded by the ring's ceiling and is no worse than the
+  per-connection buffer it replaces, which also never shrank.
+- **SPDK's own answer to an oversized message does not transfer.** It
+  queues several buffers on `sock->recv_stream` and lets the consumer gather
+  out of them, which works because that consumer reads into its own iovecs.
+  A head scan cannot: `httparse` needs the bytes contiguous, so a chain has
+  to be joined before framing and the join is the copy the ring exists to
+  avoid - hence promoting. What does transfer is SPDK's dry-ring fallback, a
+  plain `sock_readv` into the caller's buffer, which is the shape
+  `set_recv_owned` already had.
+- **A pooled connection does not place a body its buffer already covers,
+  and `RECV_POOL_BUF` is sized so that it does.** Placement buys a move on
+  delivery by allocating a buffer per body; a connection holding a pool
+  buffer big enough is paying for a second one. On a streamed upload that is
+  an allocation *per window* - `STREAM_WINDOW` is 128 KiB and
+  `body_placement_threshold` defaults to 64 KiB, so before this every window
+  was placed and the pool covered request heads and nothing carrying data.
+  `a_streamed_upload_does_not_allocate_per_window` measures it with a
+  counting allocator: 32 large allocations for 4 MiB and 128 for 16 MiB
+  before, zero for both after. `frame_step` cannot make this call - it is
+  deliberately state-free - so `enact_frame_step` downgrades `place`. The
+  trade is a copy for a handler that takes ownership of a body in that size
+  range, which is why the threshold still governs anything larger.
+- **A placed body must not also be handed a pool buffer.** It reads into
+  its own allocation, and the kernel clamps a selecting read down to the
+  buffer it picked (`io_ring_buffer_select`, `io_uring/kbuf.c`), so an exact
+  read longer than a pool buffer completes short of the declared frame and
+  the connection dies `TruncatedMessage`. Only reachable from a
+  `header_len: 0` frame - with a header buffered the connection already
+  holds a claim and asks for nothing - which is every message after the
+  first in a streaming codec. `a_placed_body_never_takes_a_pool_buffer`
+  carries its own framer for exactly that reason.
+- **Teardown forfeits the claim; it does not wait for the buffer to empty.**
+  `Connection::release_recv_buf` refuses while bytes are buffered, which is
+  right on the serving path and wrong on the closing one: a buffer never
+  handed back is one the pool can never reissue and never free, since
+  `release` is the only place either happens.
+  `ConnTable::forfeit_recv_claim` is the teardown form, and `free_slot` is
+  where it runs - before `table.free` drops the connection.
+- **A failed drain leaks the pool along with the connection buffers.**
+  Registered buffers are kernel-visible on the same ring; an op still in
+  flight names one by index, so unregistering the ring and freeing its
+  buffers hands the kernel freed pages to write into. `drain_or_leak`
+  forgets the `BufPool` for the same reason it leaks the table.
 
 ### The offload pool
 

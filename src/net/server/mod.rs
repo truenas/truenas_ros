@@ -813,9 +813,53 @@ where
                 },
             )
         });
-        #[cfg_attr(not(feature = "uring-fs"), allow(unused_mut))]
         let mut core =
             Reactor::from_parts(engine, cfg.pool_size, cfg.to_core(), pads);
+        // One group to start: the pool grows under pressure, so sizing it
+        // for a burst that may not come would just be memory held idle.
+        //
+        // Best-effort, deliberately: a kernel or sandbox that will not
+        // register a buffer ring gets a server whose connections own their
+        // receive buffers, which is the same fallback a pool that runs dry
+        // takes. Failing construction would turn a memory optimisation into
+        // a bind error.
+        // Both rings are registered at their physical bound - a descriptor
+        // slot per unit of the most concurrent demand possible - so growth
+        // never hits an artificial ceiling and the malloc fallback is
+        // reserved for a kernel that refuses the registration outright (or
+        // an allocation failure under real memory pressure). Descriptors
+        // are 16 bytes; the buffers behind them are allocated on demand.
+        if cfg.recv_pool {
+            // One buffer per connection: no more messages can be arriving
+            // at once than there are connections.
+            core.recv_bufs = crate::uring::bufring::BufPool::new(
+                core.engine.ring.raw_fd(),
+                crate::uring::bufring::BGID_RECV,
+                crate::net::core::reactor::recv_pool_buf_len(
+                    cfg.max_request_bytes,
+                ),
+                crate::uring::bufring::ring_entries(cfg.pool_size),
+            )
+            .ok();
+        }
+        // The file-body ring: its own group, because a group's buffers are
+        // interchangeable and a file chunk is not sized like a request.
+        // Two chunks per body is the per-connection cap, so `pool_size x 2`
+        // is the most that can be in flight at once.
+        #[cfg(feature = "uring-fs")]
+        if cfg.fs_ops > 0 && cfg.fs_body_pool {
+            core.body_bufs = crate::uring::bufring::BufPool::new(
+                core.engine.ring.raw_fd(),
+                crate::uring::bufring::BGID_FILE_BODY,
+                cfg.fs_body_chunk,
+                crate::uring::bufring::ring_entries(
+                    cfg.pool_size.saturating_mul(u32::from(
+                        crate::net::core::conn::FILE_TAIL_BUFS,
+                    )),
+                ),
+            )
+            .ok();
+        }
         // Only a server with an fs pool sweeps closed connections; tell the
         // shared reactor so `close_conn` records into `fs_closed` here and not
         // on a client (which would never drain it).
@@ -979,7 +1023,23 @@ where
                 // A reply-path pump read: routed here rather than through a
                 // callback, so the tail advances with the whole loop in hand.
                 ReapedFs::Pump(done, owner) => {
-                    self.on_pump_read(owner, done)?;
+                    // The buffer the kernel picked, if this read selected
+                    // one. Read here rather than inside `on_cqe` because
+                    // this is where the CQE still is - the fs core routes
+                    // by tag and never sees the flags.
+                    let bid = if cqe.flags
+                        & crate::uring::sys::IORING_CQE_F_BUFFER
+                        != 0
+                    {
+                        Some(
+                            (cqe.flags
+                                >> crate::uring::sys::IORING_CQE_BUFFER_SHIFT)
+                                as u16,
+                        )
+                    } else {
+                        None
+                    };
+                    self.on_pump_read(owner, done, bid)?;
                 }
                 // Continuation facade `root: false`: no new `open` (the owning
                 // connection may be gone; its file would leak).
@@ -1001,7 +1061,7 @@ where
             Some(Op::Accept) => self.on_accept(slot, &cqe)?,
             Some(Op::Wake) => self.on_wake()?,
             Some(op @ (Op::RecvHeader | Op::RecvBody)) => {
-                self.on_recv(slot, generation, cqe.res, op)?
+                self.on_recv(slot, generation, cqe.res, cqe.flags, op)?
             }
             // A framed body finished splicing straight to a consumer fd;
             // `cqe.res` is bytes moved (or `<= 0` on EOF/cancel/error/`EAGAIN`).

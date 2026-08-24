@@ -37,7 +37,7 @@ use crate::uring::sys::{
     IORING_OP_FSYNC, IORING_OP_FTRUNCATE, IORING_OP_LINKAT, IORING_OP_MKDIRAT,
     IORING_OP_OPENAT2, IORING_OP_READV, IORING_OP_RENAMEAT, IORING_OP_SPLICE,
     IORING_OP_STATX, IORING_OP_SYMLINKAT, IORING_OP_UNLINKAT, IORING_OP_WRITEV,
-    IoUringCqe, SPLICE_F_MOVE,
+    IOSQE_BUFFER_SELECT, IoUringCqe, SPLICE_F_MOVE,
 };
 use crate::uring::user_data::{pack_raw, unpack_raw};
 use std::any::Any;
@@ -568,21 +568,37 @@ impl FsCore {
     /// callback whose drop could report it, and a silently dropped pump read
     /// would strand its connection mid-body with nothing left to re-drive it.
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    /// `dest` is either a buffer this side supplies, or a group id to let
+    /// the kernel pick one from a registered ring at completion.
+    ///
+    /// A provided buffer works here for the same reason it works on a recv:
+    /// `IORING_OP_READV` carries `buffer_select` (`io_uring/opdef.c`), and
+    /// the one extra rule is a single iovec - `io_iov_buffer_select_prep`
+    /// answers `-EINVAL` above one (`io_uring/rw.c`) - which this submit
+    /// already satisfies. The kernel reads the iovec for its *length* and
+    /// supplies the address itself, so `iov_base` is not dereferenced.
     pub(crate) fn submit_pump_read(
         &mut self,
         eng: &mut Engine,
         file: &File,
-        mut buf: Vec<u8>,
+        dest: PumpDest,
         want: usize,
         off: u64,
         owner: (u32, u64),
     ) -> Result<(), Errno> {
-        debug_assert!(buf.is_empty() && buf.capacity() >= want);
+        let (mut buf, bgid) = match dest {
+            PumpDest::Owned(b) => (b, None),
+            PumpDest::Group(g) => (Vec::new(), Some(g)),
+        };
+        debug_assert!(
+            bgid.is_some() || (buf.is_empty() && buf.capacity() >= want)
+        );
         let Some(op_slot) = self.op_free.pop() else {
             return Err(Errno::EBUSY);
         };
         // The iovec targets the Vec's spare capacity; computed before the
-        // move below, and the heap block's address survives the move.
+        // move below, and the heap block's address survives the move. Under
+        // buffer select only its length is read.
         let iov = vec![libc::iovec {
             iov_base: buf.as_mut_ptr().cast(),
             iov_len: want,
@@ -593,7 +609,11 @@ impl FsCore {
         let e = &mut entry.state;
         e.state = FsOpState::InFlight { tag: TAG_READV };
         e.waiter = Some(FsWaiter::Pump { owner });
-        e.bufs = vec![buf];
+        e.bufs = if bgid.is_some() {
+            Vec::new()
+        } else {
+            vec![buf]
+        };
         e.iov = iov;
         // Park the fd so it stays open until the CQE even if the connection
         // drops its `File` mid-op (close-last by ownership).
@@ -604,8 +624,12 @@ impl FsCore {
             sqe.opcode = IORING_OP_READV;
             sqe.fd = raw_fd;
             sqe.addr = iov_ptr;
-            sqe.len = 1;
+            sqe.len = 1; // one iovec: buffer select refuses more
             sqe.off_addr2 = off;
+            if let Some(g) = bgid {
+                sqe.flags |= IOSQE_BUFFER_SELECT;
+                sqe.buf_index = g;
+            }
         });
         if let Err(err) = staged {
             self.fail_op(op_slot, err);
@@ -1218,6 +1242,16 @@ impl FsCore {
         self.op_free.push(op_slot);
         deliver(waiter, Err(err), bufs, None, None);
     }
+}
+
+/// Where a pump read should land.
+#[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+pub(crate) enum PumpDest {
+    /// A buffer this side supplies and gets back on the completion.
+    Owned(Vec<u8>),
+    /// A registered buffer group; the kernel picks one at completion and
+    /// names it in `IORING_CQE_F_BUFFER`.
+    Group(u16),
 }
 
 /// The outcome handed to an embedded [`FsConn`] callback: the op's result plus
@@ -3609,7 +3643,7 @@ mod routing_fuzz {
         core.submit_pump_read(
             &mut eng,
             &file,
-            Vec::with_capacity(8),
+            PumpDest::Owned(Vec::with_capacity(8)),
             8,
             2,
             (3, 77),
@@ -3659,7 +3693,7 @@ mod routing_fuzz {
             core.submit_pump_read(
                 eng,
                 &file,
-                Vec::with_capacity(4),
+                PumpDest::Owned(Vec::with_capacity(4)),
                 4,
                 0,
                 (0, 1),
@@ -3705,7 +3739,7 @@ mod routing_fuzz {
         core.submit_pump_read(
             &mut eng,
             &file,
-            Vec::with_capacity(8),
+            PumpDest::Owned(Vec::with_capacity(8)),
             8,
             u64::MAX,
             (5, 9),

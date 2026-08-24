@@ -13,6 +13,8 @@ mod close;
 mod io;
 mod wake;
 
+#[cfg(feature = "net-server")]
+pub(crate) use io::recv_pool_buf_len;
 pub(crate) use io::{Enacted, Gate, RecvStep, SendStep, SpliceStep};
 
 /// The pure framing decision, re-exported only under the `__fuzz` feature for
@@ -27,6 +29,8 @@ use crate::net::core::conn::{Op, pack, unpack};
 use crate::net::core::handles::{CloseHook, StatsInner, stat};
 use crate::net::core::table::ConnTable;
 use crate::sync::Arc;
+#[cfg(feature = "net-server")]
+use crate::uring::bufring::BufPool;
 use crate::uring::engine::Engine;
 use crate::uring::sys::*;
 use std::sync::atomic::Ordering;
@@ -98,6 +102,26 @@ pub(crate) struct Reactor<U> {
     /// `fs_closed` for them - otherwise a client would grow that Vec unbounded.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) has_fs_pool: bool,
+    /// Recv buffers drawn from a registered ring rather than owned per
+    /// connection.
+    ///
+    /// A connection takes one when data actually arrives and gives it back
+    /// once its message is consumed, so a keep-alive connection parked on an
+    /// idle recv holds nothing - `IOSQE_BUFFER_SELECT` has the kernel pick a
+    /// buffer at *completion* rather than at submit, which is the whole
+    /// reason this is a provided-buffer ring and not a free list.
+    ///
+    /// Declared after `table` so connections drop first: a claim points into
+    /// this pool's storage.
+    #[cfg(feature = "net-server")]
+    pub(crate) recv_bufs: Option<BufPool>,
+    /// Buffers a file-sourced response body is read into, on their own
+    /// group. Ring-global: every connection on this reactor draws from it,
+    /// so the memory tracks bodies in flight rather than the connection
+    /// table. Declared beside `recv_bufs` and after `table` for the same
+    /// reason - a queued send segment points into it.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) body_bufs: Option<BufPool>,
     /// The shared io_uring engine (ring, in-flight accounting, wake, stop
     /// flags). Declared last so the ring drops after `table`'s buffers.
     pub(crate) engine: Engine,
@@ -125,6 +149,10 @@ impl<U> Reactor<U> {
             fs_closed: Vec::new(),
             #[cfg(all(feature = "net-server", feature = "uring-fs"))]
             has_fs_pool: false,
+            #[cfg(feature = "net-server")]
+            recv_bufs: None,
+            #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+            body_bufs: None,
             engine,
         }
     }
@@ -180,6 +208,29 @@ impl<U> Reactor<U> {
     /// Empty a fully-reaped slot (bumping its generation) and account a
     /// closed connection if one was serving there.
     pub(crate) fn free_slot(&mut self, slot: u32) {
+        // Before the connection goes away, so its buffer can be reissued
+        // and its group can eventually be retired.
+        #[cfg(feature = "net-server")]
+        if let Some(claim) = self.table.forfeit_recv_claim(slot)
+            && let Some(pool) = self.recv_bufs.as_mut()
+        {
+            pool.release(claim.bid);
+            self.sync_recv_buf_stats();
+        }
+        // Segments still queued name ring buffers; the connection is about
+        // to go away and they are owed back.
+        #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+        {
+            let bids = self.table.drain_pooled_send_bids(slot);
+            if !bids.is_empty() {
+                if let Some(pool) = self.body_bufs.as_mut() {
+                    for bid in bids {
+                        pool.release(bid);
+                    }
+                }
+                self.sync_recv_buf_stats();
+            }
+        }
         if self.table.free(slot) {
             stat!(self, closed);
             self.stats
@@ -206,6 +257,17 @@ impl<U> Reactor<U> {
     pub(crate) fn drain_or_leak(&mut self) -> bool {
         if self.cancel_and_reap_all().is_err() {
             self.table.leak();
+            // Registered recv buffers are kernel-visible on this same ring:
+            // an op still in flight names one by index, so unmapping the
+            // group would hand the kernel freed pages to write into.
+            #[cfg(feature = "net-server")]
+            if let Some(pool) = self.recv_bufs.take() {
+                std::mem::forget(pool);
+            }
+            #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+            if let Some(pool) = self.body_bufs.take() {
+                std::mem::forget(pool);
+            }
             self.engine.leak_wake_buf();
             true
         } else {

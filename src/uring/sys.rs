@@ -362,7 +362,66 @@ pub(crate) const IORING_REGISTER_PERSONALITY: u32 = 9;
 pub(crate) const IORING_UNREGISTER_PERSONALITY: u32 = 10;
 pub(crate) const IORING_REGISTER_FILES2: u32 = 13;
 pub(crate) const IORING_REGISTER_FILE_ALLOC_RANGE: u32 = 25;
+/// Register a **provided-buffer ring**: a group of buffers the kernel picks
+/// from at issue time, rather than an address the SQE names. `arg` is one
+/// [`IoUringBufReg`], `nr_args` is 1.
+#[cfg(feature = "net-server")]
+pub(crate) const IORING_REGISTER_PBUF_RING: u32 = 22;
+/// Tear one down. Same argument shape; only `bgid` is read.
+#[cfg(feature = "net-server")]
+pub(crate) const IORING_UNREGISTER_PBUF_RING: u32 = 23;
+/// Report a group's consumer index, so buffer exhaustion is observable
+/// rather than only inferable from `-ENOBUFS`.
+#[cfg(feature = "net-server")]
+pub(crate) const IORING_REGISTER_PBUF_STATUS: u32 = 26;
 pub(crate) const IORING_RSRC_REGISTER_SPARSE: u32 = 1 << 0;
+
+/// `struct io_uring_buf_reg` - the argument to
+/// [`IORING_REGISTER_PBUF_RING`]. `ring_entries` must be a power of two and
+/// under 65536, and `flags` outside the two documented bits is rejected
+/// (`io_uring/kbuf.c`).
+#[cfg(feature = "net-server")]
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct IoUringBufReg {
+    /// Address of the caller-allocated ring (this crate does not use
+    /// `IOU_PBUF_RING_MMAP`, so the memory is ours).
+    pub(crate) ring_addr: u64,
+    pub(crate) ring_entries: u32,
+    pub(crate) bgid: u16,
+    pub(crate) flags: u16,
+    /// Only valid with incremental consumption, which this crate does not
+    /// use; the kernel rejects a non-zero value without it.
+    pub(crate) min_left: u32,
+    pub(crate) resv: [u32; 5],
+}
+
+/// One entry of a provided-buffer ring.
+///
+/// **The ring's producer `tail` is overlaid on entry zero's `resv`.** The
+/// kernel reads it from there, so the two share storage by design and a
+/// layout that separates them silently loses every publish.
+#[cfg(feature = "net-server")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct IoUringBuf {
+    pub(crate) addr: u64,
+    pub(crate) len: u32,
+    pub(crate) bid: u16,
+    /// Reserved - except on entry zero, where this is the ring's `tail`.
+    pub(crate) resv: u16,
+}
+
+/// SQE flag: take this op's buffer from the group named in `sqe.buf_group`
+/// instead of `sqe.addr`.
+#[cfg(any(feature = "net-server", feature = "uring-fs"))]
+pub(crate) const IOSQE_BUFFER_SELECT: u8 = 1 << 5;
+/// CQE flag: the upper 16 bits of `cqe.flags` carry the buffer id.
+#[cfg(feature = "net-server")]
+pub(crate) const IORING_CQE_F_BUFFER: u32 = 1 << 0;
+/// How far to shift `cqe.flags` to read that id.
+#[cfg(feature = "net-server")]
+pub(crate) const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 
 /// `io_uring_setup` flag: restrict submission - and `io_uring_register`, via
 /// the `-EEXIST` gate in `register.c` - to the creating task. **Never set by

@@ -1,0 +1,375 @@
+//! Does a streamed upload allocate per window?
+//!
+//! Its own test binary, and it has to be: the measurement is a process-wide
+//! allocation count, so anything else running in the same process is noise.
+//! One test, one server, one client.
+//!
+//! The property is the reason the recv buffer pool exists. A pool that only
+//! covered request heads would leave the upload path minting a buffer per
+//! window - at a 128 KiB window that is one allocation per 128 KiB of
+//! payload, tens of thousands of them on a multi-gigabyte PUT - and would be
+//! decorative. Measured rather than reasoned about, because the code path
+//! that decides it (`body_placement_threshold` vs the pool buffer's size)
+//! is three modules away from the allocation.
+#![cfg(all(target_os = "linux", feature = "http", feature = "net-server"))]
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::io::{self, Read, Write};
+use std::net::{SocketAddrV4, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::Duration;
+use truenas_ros::http::{
+    HttpConfig, HttpRequest, HttpResponse, HttpVerdict, Stage,
+    protocol_streaming,
+};
+use truenas_ros::net::server::{
+    Incoming, Server, ServerAddr, ServerConfig, ShutdownHandle,
+};
+use truenas_ros::{Errno, Error};
+
+/// Allocations of at least this size are counted.
+///
+/// Body buffers are the only thing on this path that reaches it: the window
+/// is 128 KiB and the placement threshold is 64 KiB, so a placed window
+/// lands here and nothing else does. Counting every allocation instead would
+/// drown the signal in the reply-building and framing traffic that is not
+/// what this measures.
+const BIG: usize = 64 * 1024;
+
+static BIG_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+
+/// The counter is process-global, so two measurements running at once
+/// report each other's allocations. Cargo runs a binary's tests as threads,
+/// so they have to take turns.
+static MEASURING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct Counting;
+
+// SAFETY: every method delegates to `System` unchanged; the counter is the
+// only addition and it touches no allocator state.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        if l.size() >= BIG {
+            BIG_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe { System.alloc(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        unsafe { System.dealloc(p, l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+        if new >= BIG {
+            BIG_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe { System.realloc(p, l, new) }
+    }
+}
+
+#[global_allocator]
+static A: Counting = Counting;
+
+fn is_unavailable(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::Errno(Errno::EPERM | Errno::ENOSYS | Errno::EACCES)
+    )
+}
+
+fn should_skip(e: &Error) -> bool {
+    if is_unavailable(e) {
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_IO_URING").is_none(),
+            "TRUENAS_ROS_REQUIRE_IO_URING set but io_uring unavailable: {e}"
+        );
+        return true;
+    }
+    false
+}
+
+struct ShutdownOnDrop(ShutdownHandle);
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
+
+/// One HTTP chunk of `n` bytes, framed for a chunked PUT.
+fn chunked_put(payload: &[u8], chunk: usize) -> Vec<u8> {
+    let mut wire = b"PUT /up HTTP/1.1\r\nHost: t\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n"
+        .to_vec();
+    for part in payload.chunks(chunk) {
+        wire.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+        wire.extend_from_slice(part);
+        wire.extend_from_slice(b"\r\n");
+    }
+    wire.extend_from_slice(b"0\r\n\r\n");
+    wire
+}
+
+fn read_status(s: &mut TcpStream) -> io::Result<u16> {
+    let mut buf = Vec::new();
+    let mut b = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        if s.read(&mut b)? == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"));
+        }
+        buf.push(b[0]);
+    }
+    let head = String::from_utf8_lossy(&buf).to_string();
+    head.split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .ok_or_else(|| io::Error::other(format!("no status in {head:?}")))
+}
+
+/// Upload `mib` MiB in 128 KiB chunks and answer how many large
+/// allocations the whole exchange cost.
+fn upload_cost(mib: usize) -> Option<usize> {
+    let cfg = ServerConfig {
+        pool_size: 8,
+        // A head cap, which is the configuration streaming creates: no
+        // single message is a whole body.
+        max_request_bytes: 512 * 1024,
+        ..ServerConfig::default()
+    };
+    let proto = protocol_streaming(
+        HttpConfig::default(),
+        1 << 30,
+        |_i: Incoming<'_>| Some(0usize),
+        |req: HttpRequest<'_>, seen: &mut usize| match req.stage {
+            Stage::Open => {
+                *seen = 0;
+                HttpVerdict::Continue
+            }
+            // Consume the window without keeping it - what a handler
+            // writing to a file does, and what makes the buffer reusable.
+            Stage::Window => {
+                *seen += req.body.len();
+                HttpVerdict::Continue
+            }
+            Stage::End => HttpVerdict::Respond(
+                HttpResponse::new(200).header("x-bytes", seen.to_string()),
+            ),
+            Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
+        },
+    )
+    .expect("codec config is valid");
+
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return None,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stats = server.stats_handle();
+    let stop = server.shutdown_handle();
+
+    let payload = vec![0x7eu8; mib * 1024 * 1024];
+    let wire = chunked_put(&payload, 128 * 1024);
+    drop(payload);
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let mut s = TcpStream::connect(v4).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        // Count only the exchange: everything before this is setup, and
+        // the wire buffer above is one allocation either way.
+        let before = BIG_ALLOCS.load(Ordering::Relaxed);
+        s.write_all(&wire).expect("write");
+        let status = read_status(&mut s).expect("status");
+        assert_eq!(status, 200, "upload refused");
+        let cost = BIG_ALLOCS.load(Ordering::Relaxed) - before;
+        drop(s);
+        stop.shutdown();
+        cost
+    });
+
+    server.serve_forever().expect("serve_forever");
+    let cost = client.join().expect("client thread");
+    let s = stats.snapshot();
+    assert!(
+        s.recv_bufs_total > 0,
+        "no recv buffer ring registered - this measured the owned-buffer \
+         fallback, not the pool: {s:?}"
+    );
+    Some(cost)
+}
+
+/// The cost of an upload must not scale with its size.
+///
+/// Doubling the payload doubles the windows, so a per-window allocation
+/// shows up as a doubled count. Comparing two runs rather than asserting an
+/// absolute number keeps the test honest about the fixed setup cost, which
+/// is neither zero nor interesting.
+#[test]
+fn a_streamed_upload_does_not_allocate_per_window() {
+    let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(small) = upload_cost(4) else {
+        return; // io_uring unavailable
+    };
+    let Some(large) = upload_cost(16) else {
+        return;
+    };
+    // 4 MiB is 32 windows, 16 MiB is 128 - so a per-window allocation would
+    // put 96 between them.
+    assert!(
+        large <= small + 8,
+        "upload cost scales with payload: 4 MiB cost {small} large \
+         allocations, 16 MiB cost {large}. A pool that covered request heads \
+         but not body windows would look exactly like this."
+    );
+}
+
+// ---- the download side ----------------------------------------------------
+
+/// Serve one file body per connection and answer how many large allocations
+/// `conns` connections cost.
+///
+/// Connections, not requests, is the axis that matters: chunk buffers used
+/// to be minted per connection and held until it closed, so the cost scaled
+/// with the connection table rather than with how many bodies were actually
+/// moving.
+#[cfg(feature = "uring-fs")]
+fn download_cost(warmup: usize, measured: usize) -> Option<usize> {
+    use std::io::Read as _;
+    use truenas_ros::net::server::{
+        Endian, PrefixWidth, Protocol, Request, Response, length_prefix_header,
+    };
+
+    const CHUNK: usize = 64 * 1024;
+    const SIZE: usize = 4 * CHUNK; // four chunk reads per body
+
+    let dir = std::env::temp_dir().join(format!("ros-dl-{warmup}-{measured}"));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("obj");
+    std::fs::write(&path, vec![0x41u8; SIZE]).expect("write fixture");
+
+    let cfg = ServerConfig {
+        pool_size: 32,
+        fs_ops: 16,
+        fs_body_chunk: CHUNK,
+        ..ServerConfig::default()
+    };
+    // One open through a standalone fs host, cloned per request: only an
+    // fs reactor can mint a `File`, but the fd is host-independent once
+    // open and `File` is an `Arc<OwnedFd>`.
+    let file = {
+        use truenas_ros::sync_fs::{OFlag, OpenHow};
+        use truenas_ros::uring_fs::{Anchor, FsConfig, UringFs};
+        let mut afs = match UringFs::new(FsConfig::default()) {
+            Ok(f) => f,
+            Err(e) if should_skip(&e) => return None,
+            Err(e) => panic!("UringFs::new: {e}"),
+        };
+        let who = afs.register_self().expect("register_self");
+        let handle = afs.handle();
+        let stop_fs = afs.shutdown_handle();
+        let anchor = Anchor::open(&dir).expect("anchor");
+        let (ftx, frx) = std::sync::mpsc::channel();
+        thread::scope(|sc| {
+            sc.spawn(move || {
+                let r = handle.open(
+                    who,
+                    &anchor,
+                    c"obj",
+                    OpenHow::new().flags(OFlag::O_RDONLY),
+                );
+                let _ = ftx.send(r);
+                stop_fs.shutdown();
+            });
+            afs.run().expect("fs host run");
+        });
+        frx.recv().expect("open outcome").expect("open")
+    };
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |_req: Request<'_, ()>| Response::ReplyFile {
+            head: Vec::new(),
+            file: file.clone(),
+            offset: 0,
+            len: SIZE as u64,
+            close: true,
+        },
+    };
+
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return None,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stats = server.stats_handle();
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        // Sized once, outside the measurement: a growing client buffer
+        // reallocates past the counting threshold several times per body and
+        // would be indistinguishable from the server allocating per read.
+        let mut got = vec![0u8; SIZE];
+        let one = |got: &mut [u8]| {
+            let mut s = TcpStream::connect(v4).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            s.write_all(&1u32.to_be_bytes()).expect("len");
+            s.write_all(b"g").expect("req");
+            s.read_exact(got).expect("body");
+            assert!(got.iter().all(|&b| b == 0x41), "intact");
+        };
+        for _ in 0..warmup {
+            one(&mut got);
+        }
+        let before = BIG_ALLOCS.load(Ordering::Relaxed);
+        for _ in 0..measured {
+            one(&mut got);
+        }
+        let cost = BIG_ALLOCS.load(Ordering::Relaxed) - before;
+        stop.shutdown();
+        cost
+    });
+
+    server.serve_forever().expect("serve_forever");
+    let cost = client.join().expect("client thread");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = stats.snapshot();
+    Some(cost)
+}
+
+/// Serving file bodies must not allocate per connection.
+///
+/// Chunk buffers came off a per-connection pool minted on the first file
+/// reply and held until close, so N connections cost N x FILE_TAIL_BUFS
+/// buffers of `fs_body_chunk` - `pool_size` x 2 x a megabyte in a real
+/// deployment, held whether or not anything was streaming. Drawn from the
+/// reactor's ring instead, the cost is flat in the connection count.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn serving_file_bodies_does_not_allocate_per_connection() {
+    let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    // Warm the pool first, then measure: growing the ring allocates, once,
+    // and that is not what this is about.
+    let Some(few) = download_cost(8, 4) else {
+        return; // io_uring unavailable
+    };
+    let Some(many) = download_cost(8, 32) else {
+        return;
+    };
+    assert!(
+        many <= few + 8,
+        "download cost scales with connections: 4 more cost {few} large \
+         allocations, 32 more cost {many}. Chunk buffers tied to connection \
+         lifetime look exactly like this."
+    );
+}

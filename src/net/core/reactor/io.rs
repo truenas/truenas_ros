@@ -9,11 +9,67 @@ use crate::errno::{self, Errno};
 use crate::net::core::conn::{Op, RecvOutcome, pack};
 use crate::net::core::handles::stat;
 use crate::net::core::protocol::{CloseReason, Framing};
+#[cfg(feature = "net-server")]
+use crate::uring::bufring::BufPool;
 use crate::uring::sys::*;
 use std::os::fd::RawFd;
 
 /// Bytes to request per chunked (`Framing::More`) recv.
 const RECV_CHUNK: usize = 4096;
+
+/// Point a staged recv at a provided-buffer group, if one was chosen.
+///
+/// `buf_index` is the union field the kernel reads as `buf_group`; the SQE's
+/// address is ignored once the flag is set, since the kernel supplies the
+/// buffer.
+#[cfg(feature = "net-server")]
+fn stamp_select(sqe: &mut IoUringSqe, select: Option<u16>) {
+    if let Some(bgid) = select {
+        sqe.flags |= IOSQE_BUFFER_SELECT;
+        sqe.buf_index = bgid;
+    }
+}
+
+/// Without the server role nothing registers a buffer ring, so `select` is
+/// always `None`.
+#[cfg(not(feature = "net-server"))]
+fn stamp_select(_sqe: &mut IoUringSqe, _select: Option<u16>) {}
+
+/// Working size of a pooled recv buffer, before the scanning read's slack.
+///
+/// A free parameter, not a derived bound: a message that outgrows its buffer
+/// promotes to owned storage (`RecvBuf::promote_for`) rather than being
+/// refused, so this trades one bounded copy on outsized messages against
+/// holding a large buffer per arrival on all of them.
+///
+/// **It has to cover a streamed body's window, or the pool is decorative.**
+/// `http::framer::STREAM_WINDOW` is 128 KiB and
+/// `body_placement_threshold` defaults to 64 KiB, so a window sits above
+/// the placement threshold: a buffer that could not hold one would send
+/// every window off to its own allocation and the pool would serve request
+/// heads and nothing that carries data. At 256 KiB a window plus its chunk
+/// header plus a pipelined remainder stay in the buffer, and the upload
+/// path allocates nothing per window.
+///
+/// It also clears the 16 KiB TLS record size kTLS zero-copy needs
+/// (`TLS_MAX_PAYLOAD_SIZE`, `include/net/tls.h`) many times over.
+#[cfg(feature = "net-server")]
+const RECV_POOL_BUF: usize = 256 * 1024;
+
+/// How large a pooled recv buffer is.
+///
+/// The `RECV_CHUNK` term is slack, not rounding: `pump_gate` closes a
+/// connection only *above* `max_request_bytes`, so a scanning
+/// (`Framing::More`) read can be armed at that offset and still ask for
+/// `RECV_CHUNK` more. Including it means a server whose cap already sits
+/// below the working size gets a buffer no legal read can overrun, so the
+/// promote path never fires there.
+#[cfg(feature = "net-server")]
+pub(crate) fn recv_pool_buf_len(max_request_bytes: usize) -> usize {
+    RECV_POOL_BUF
+        .min(max_request_bytes)
+        .saturating_add(RECV_CHUNK)
+}
 
 /// The action the pump takes for one framer [`Framing`] verdict - the output of
 /// [`frame_step`].
@@ -607,6 +663,52 @@ impl<U> Reactor<U> {
         exact: bool,
         place_body: bool,
     ) -> errno::Result<()> {
+        // A connection with no buffer acquires one with the read itself:
+        // `IOSQE_BUFFER_SELECT` has the kernel pick at completion, so an
+        // idle recv costs nothing until bytes actually land.
+        //
+        // Nothing is reserved here and nothing can be: the pick happens at
+        // completion, so every parked connection can have a selecting recv
+        // armed against a pool of any size. Arming one the pool cannot cover
+        // is therefore normal, not an error - `-ENOBUFS` comes back on the
+        // completion and `recv_buffer_shortage` grows and re-arms. The
+        // rebalance here is the pool's shrink cadence and its response to
+        // pressure it *can* see.
+        //
+        // A placed body is exempt: it reads into its own allocation, so it
+        // needs no buffer and must not be given one. The kernel clamps a
+        // selecting read to the buffer it picked
+        // (`io_ring_buffer_select`, `io_uring/kbuf.c`), so an exact read
+        // longer than a pool buffer would complete short of what the frame
+        // declared and close the connection as truncated.
+        #[cfg(feature = "net-server")]
+        let select = if !place_body && self.table.conn(slot).recv_needs_buffer()
+        {
+            let g = match self.recv_bufs.as_mut() {
+                Some(p) => {
+                    p.rebalance();
+                    Some(p.bgid())
+                }
+                None => None,
+            };
+            if g.is_none() {
+                self.table.conn_mut(slot).set_recv_owned();
+            }
+            self.sync_recv_buf_stats();
+            g
+        } else {
+            None
+        };
+        #[cfg(not(feature = "net-server"))]
+        let select: Option<u16> = None;
+        // A pool buffer is one fixed size and a message is not. Rather than
+        // size every buffer for the largest message the server accepts, a
+        // read that would overrun the one held moves what is accumulated
+        // into owned storage and gives the buffer back.
+        #[cfg(feature = "net-server")]
+        if !place_body {
+            self.promote_recv_buffer(slot, want);
+        }
         let conn = self.table.conn_mut(slot);
         // The connection is idle - parked for the next request - when this is a
         // header read with nothing yet accumulated. Only such reads carry the
@@ -618,8 +720,16 @@ impl<U> Reactor<U> {
             // remainder is computed from what `arm_body_recv` carved.
             conn.arm_body_recv()
         } else {
-            conn.arm_recv(want, exact);
-            want
+            let granted = conn.arm_recv(want, exact);
+            if granted < want && exact {
+                // Unreachable: the promote above leaves either a claim that
+                // covers this read or no claim at all. Reading less than the
+                // frame declared would deliver a short message as whole, so
+                // a promote that ever fails to fire fails closed here.
+                self.close_conn(slot, generation, CloseReason::TooLarge)?;
+                return Ok(());
+            }
+            granted
         };
         conn.recving = true;
         conn.recv_idle = idle;
@@ -680,6 +790,7 @@ impl<U> Reactor<U> {
                 sqe.addr = addr;
                 sqe.len = len;
                 sqe.op_flags = flags;
+                stamp_select(sqe, select);
             }),
             Some(ts) => self.stage_linked(
                 pack(op, slot, generation),
@@ -691,6 +802,7 @@ impl<U> Reactor<U> {
                     sqe.addr = addr;
                     sqe.len = len;
                     sqe.op_flags = flags;
+                    stamp_select(sqe, select);
                 },
                 pack(Op::RecvClock, slot, generation),
                 move |sqe| {
@@ -849,6 +961,126 @@ impl<U> Reactor<U> {
     /// its role wrapper enacts (`Deliver`/`Pump` re-enter role code; `Done` is
     /// self-contained). The two recv kinds share the whole skeleton and differ
     /// only in idle eligibility and the delivery tail.
+    /// Answer a recv that found the pool dry (`-ENOBUFS`).
+    ///
+    /// The kernel picks a provided buffer at completion, so a shortage
+    /// cannot be seen at submit and this is the only place it is reported.
+    /// Growing here sizes the pool to concurrent *arrivals*, which is the
+    /// quantity that actually bounds it - and bounds it at `pool_size`
+    /// buffers, no worse than the per-connection buffer the pool replaced.
+    ///
+    /// Progress does not depend on growth succeeding: a pool that will not
+    /// grow drops this connection back to owning its buffer, so the re-armed
+    /// read cannot come back `-ENOBUFS` a second time. Returns whether the
+    /// caller should re-arm.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn recv_buffer_shortage(&mut self, slot: u32) -> bool {
+        let grew = self.recv_bufs.as_mut().is_some_and(BufPool::grow);
+        if !grew {
+            self.table.conn_mut(slot).set_recv_owned();
+        }
+        self.sync_recv_buf_stats();
+        true
+    }
+
+    /// Hand back a pool buffer the next read has outgrown, so the read can
+    /// be armed against storage that fits.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn promote_recv_buffer(&mut self, slot: u32, want: usize) {
+        let at = self.table.conn(slot).buffered();
+        let Some(claim) = self.table.conn_mut(slot).promote_recv_buf(at, want)
+        else {
+            return;
+        };
+        if let Some(pool) = self.recv_bufs.as_mut() {
+            pool.release(claim.bid);
+        }
+        self.sync_recv_buf_stats();
+    }
+
+    /// Republish the pool gauges. Called wherever the pool's lend count or
+    /// group count can have moved - the numbers are cheap (a sum over a
+    /// handful of groups) and a gauge that is only mostly current is worse
+    /// than none, since the property it reports is "settles to zero".
+    #[cfg(feature = "net-server")]
+    pub(crate) fn sync_recv_buf_stats(&self) {
+        #[cfg_attr(not(feature = "uring-fs"), allow(unused_mut))]
+        let (mut lent, mut total) = match self.recv_bufs.as_ref() {
+            Some(p) => (u64::from(p.lent()), u64::from(p.allocated())),
+            None => (0, 0),
+        };
+        // Both pools report as one figure: an operator cares how much buffer
+        // memory the ring holds, not which group it sits in.
+        #[cfg(feature = "uring-fs")]
+        if let Some(p) = self.body_bufs.as_ref() {
+            lent += u64::from(p.lent());
+            total += u64::from(p.allocated());
+        }
+        self.stats
+            .recv_bufs_lent
+            .store(lent, std::sync::atomic::Ordering::Relaxed);
+        self.stats
+            .recv_bufs_total
+            .store(total, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Hand a connection's recv buffer back once nothing is buffered.
+    ///
+    /// Called after every consume: the point of the pool is that a
+    /// keep-alive connection waiting for its next request holds no buffer,
+    /// and this is where that happens.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn release_recv_buffer(&mut self, slot: u32) {
+        let Some(claim) = self.table.conn_mut(slot).release_recv_buf() else {
+            return;
+        };
+        if let Some(pool) = self.recv_bufs.as_mut() {
+            pool.release(claim.bid);
+        }
+        self.sync_recv_buf_stats();
+    }
+
+    /// Adopt the pool buffer a completion selected, if it carried one.
+    ///
+    /// `IORING_CQE_F_BUFFER` is the whole rule for whether a buffer was
+    /// taken: an op that failed before selecting one - `-ENOBUFS` above all
+    /// - carries nothing and owes nothing back.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn adopt_recv_buffer(
+        &mut self,
+        slot: u32,
+        generation: u32,
+        cqe_flags: u32,
+    ) {
+        if cqe_flags & IORING_CQE_F_BUFFER == 0 {
+            return;
+        }
+        let bid = (cqe_flags >> IORING_CQE_BUFFER_SHIFT) as u16;
+        let Some(pool) = self.recv_bufs.as_mut() else {
+            return;
+        };
+        let Some((ptr, cap)) = pool.addr_of(bid) else {
+            return;
+        };
+        pool.lend(bid);
+        // A guard, not a handled case: a slot is freed only once nothing is
+        // in flight on it, so a recv completion should never outlive its
+        // connection. It is here because the cost of being wrong is a panic
+        // (`conn_mut` on a slot that is not serving) or a buffer installed
+        // on whoever holds the slot now, and because the buffer is owed back
+        // either way - `on_recv_complete` makes the same check a moment
+        // later and by then it would be too late to return it.
+        if !self.table.slot_matches_cqe(slot, generation) {
+            pool.release(bid);
+            self.sync_recv_buf_stats();
+            return;
+        }
+        self.sync_recv_buf_stats();
+        self.table.conn_mut(slot).install_recv_buf(
+            crate::net::core::conn::RecvClaim { bid, ptr, cap },
+        );
+    }
+
     pub(crate) fn on_recv_complete(
         &mut self,
         slot: u32,
@@ -883,6 +1115,17 @@ impl<U> Reactor<U> {
         // that will never be armed.
         if self.table.conn(slot).close_on_flush.is_some() {
             return Ok(RecvStep::Done);
+        }
+        // Not a transfer outcome: the read never started, because the pool
+        // had no buffer to select. Grow (or fall back to owning one) and
+        // re-pump - the framer is pure over what is buffered, and nothing
+        // was received, so it re-arms exactly this read.
+        #[cfg(feature = "net-server")]
+        if res < 0
+            && Errno::from_raw(-res) == Errno::ENOBUFS
+            && self.recv_buffer_shortage(slot)
+        {
+            return Ok(RecvStep::Pump);
         }
         match self.table.conn_mut(slot).recv_result(res) {
             // EOF (half-close / keep-alive ended), truncation, cancel, error.
@@ -1177,6 +1420,17 @@ impl<U> Reactor<U> {
         };
         stat!(self, replies, u64::from(progress.replies));
         stat!(self, pushes, u64::from(progress.pushes));
+        // Chunks that reached the peer give their ring buffers back. Only
+        // here, because only the reactor holds the pool.
+        #[cfg(feature = "uring-fs")]
+        if progress.freed > 0 {
+            if let Some(pool) = self.body_bufs.as_mut() {
+                for &bid in &progress.freed_bids[..progress.freed as usize] {
+                    pool.release(bid);
+                }
+            }
+            self.sync_recv_buf_stats();
+        }
         if progress.armed_remaining > 0 {
             // Under WAITALL a short send happens on a mid-flight error or a
             // > 2 GiB gather (the kernel clamps every op at `MAX_RW_COUNT`,
@@ -1325,6 +1579,23 @@ impl<U> Reactor<U> {
                 body_len,
                 place,
             } => {
+                // Placement buys a move on delivery by allocating a buffer
+                // per body. A pooled connection already has one big enough,
+                // so paying for a second is pure churn - and on a streamed
+                // upload it is churn *per window*, which is the allocation
+                // this pool exists to remove. `frame_step` cannot see this:
+                // it is deliberately state-free, and this is connection
+                // state.
+                //
+                // The trade is a copy for a handler that wants to own the
+                // body (`Body::take` on a borrowed body copies, where a
+                // placed one moves). Handlers that stream a body out - the
+                // reason a body is this large - take nothing.
+                let place = place
+                    && !self
+                        .table
+                        .conn(slot)
+                        .recv_buf_covers(header_len.saturating_add(body_len));
                 self.table.conn_mut(slot).set_frame(header_len, body_len);
                 self.submit_recv(
                     slot,

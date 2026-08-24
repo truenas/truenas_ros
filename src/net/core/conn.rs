@@ -146,6 +146,278 @@ enum SendKind {
     Push,
 }
 
+/// A connection's hold on a pool buffer: which buffer, and where it lives.
+///
+/// Raw because the pool owns the allocation and outlives every connection
+/// drawing from it - `Reactor` declares `table` before `recv_bufs`, so
+/// connections drop first - and because `BufPool::rebalance` never retires a
+/// group while any buffer is lent, which a live claim counts as.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecvClaim {
+    /// The buffer id to hand back.
+    pub(crate) bid: u16,
+    /// Start of the buffer's storage.
+    pub(crate) ptr: *mut u8,
+    /// How much it holds.
+    pub(crate) cap: usize,
+}
+
+/// The bytes a connection has accumulated for the message it is framing.
+///
+/// A seam, not an abstraction for its own sake: this used to be a bare
+/// `Vec<u8>` reached through twenty-odd call sites - `len`, `reserve`,
+/// `drain`, `truncate`, `set_len`, and a raw destination pointer - scattered
+/// across the recv path. Gathering them here is what let the storage become
+/// a buffer drawn from the registered provided-buffer ring
+/// (`crate::uring::bufring`), held only while a message is arriving, without
+/// touching any of those sites. It derefs to `[u8]`, so every *read* of the
+/// buffer is unchanged; only the mutating operations are named here.
+#[derive(Default)]
+pub(crate) struct RecvBuf {
+    /// Backing storage when no pool is behind this role - the client, and a
+    /// server built without one. Empty and unallocated while a claim is
+    /// held, so it costs nothing to carry.
+    owned: Vec<u8>,
+    /// The pool buffer being accumulated into, when one is held.
+    claim: Option<RecvClaim>,
+    /// Set when this connection draws from a pool, so an armed recv with no
+    /// claim acquires one rather than growing `owned`.
+    pooled: bool,
+    /// Bytes filled. Tracked separately from `owned.len()` because the
+    /// kernel writes into space reserved past the tail and the count only
+    /// becomes known at completion.
+    filled: usize,
+}
+
+impl RecvBuf {
+    /// Bytes filled. Named as `Vec::len` was, so the sites this replaced
+    /// read the same.
+    pub(crate) fn len(&self) -> usize {
+        self.filled
+    }
+
+    /// Draw from the pool rather than owning storage.
+    pub(crate) fn set_pooled(&mut self) {
+        self.pooled = true;
+    }
+
+    /// Fall back to owning storage, for the rest of this connection's life.
+    ///
+    /// The pool refusing to grow is a memory-pressure signal, not a reason
+    /// to shed a connection: owning the buffer is what every connection did
+    /// before the pool existed, so this degrades to that rather than
+    /// failing. Per connection and one-way, so a pool under sustained
+    /// pressure does not re-try on every read; the next connection to be
+    /// accepted starts pooled again.
+    pub(crate) fn set_owned(&mut self) {
+        self.pooled = false;
+    }
+
+    /// Whether an armed recv must acquire a buffer - pool-backed, none
+    /// held, and nothing accumulated. The submit answers this by setting
+    /// `IOSQE_BUFFER_SELECT`.
+    ///
+    /// The `filled` term is what distinguishes a connection waiting to
+    /// acquire from one that has [`promoted`](RecvBuf::promote_for) off a
+    /// buffer mid-message: both are pooled and hold no claim, but the second
+    /// is accumulating into `owned` and a fresh claim would orphan it.
+    pub(crate) fn needs_buffer(&self) -> bool {
+        self.pooled && self.claim.is_none() && self.filled == 0
+    }
+
+    /// Adopt the buffer a completion selected.
+    pub(crate) fn install(&mut self, claim: RecvClaim) {
+        debug_assert!(self.claim.is_none(), "a claim would be leaked");
+        self.claim = Some(claim);
+        self.filled = 0;
+    }
+
+    /// Give the buffer up, for the caller to hand back to the pool. Only
+    /// once nothing is buffered: the bytes live in it.
+    ///
+    /// Also drops any storage a promote left behind, so one oversized
+    /// message does not leave the connection carrying its buffer for the
+    /// rest of its life - which is the retention the pool exists to end.
+    pub(crate) fn release(&mut self) -> Option<RecvClaim> {
+        if self.filled > 0 {
+            return None;
+        }
+        if self.pooled && !self.owned.is_empty() {
+            self.owned = Vec::new();
+        }
+        self.claim.take()
+    }
+
+    /// Whether the buffer in hand covers a whole message of `total` bytes.
+    ///
+    /// Only true of a pool buffer. Owned storage grows to whatever is asked
+    /// of it, so the question does not arise there - and answering `true`
+    /// would suppress placement for every connection, not just the ones
+    /// that have somewhere to put the body.
+    pub(crate) fn covers(&self, total: usize) -> bool {
+        self.claim.is_some_and(|c| c.cap >= total)
+    }
+
+    /// Move accumulation off a pool buffer that cannot hold what is about
+    /// to be read, handing the buffer back for the caller to return.
+    ///
+    /// A pool buffer is a fixed size and the message being framed is not:
+    /// the alternative to promoting is sizing every buffer for the largest
+    /// message the server accepts, which is what kept the pool off by
+    /// default. The copy is bounded by the buffer, not by the message - at
+    /// most one buffer's worth, once, on the read that overflows it - and
+    /// the connection then behaves exactly as an unpooled one for the rest
+    /// of the message.
+    ///
+    /// Chaining buffers instead is what SPDK's uring sock does
+    /// (`module/sock/uring/uring.c`, `sock->recv_stream`), and it works
+    /// there because its consumer gathers out of the list into its own
+    /// iovecs. A head scan cannot: `httparse` needs the bytes contiguous,
+    /// so a chain would have to be joined before framing and the join is
+    /// the copy this whole mechanism exists to avoid.
+    pub(crate) fn promote_for(
+        &mut self,
+        at: usize,
+        want: usize,
+    ) -> Option<RecvClaim> {
+        let c = self.claim?;
+        if at.saturating_add(want) <= c.cap {
+            return None;
+        }
+        self.owned.clear();
+        self.owned.reserve(at.saturating_add(want));
+        // SAFETY: `filled <= cap` by construction, and the pool outlives
+        // this connection - see `RecvClaim`.
+        self.owned.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(c.ptr, self.filled)
+        });
+        self.claim = None;
+        Some(c)
+    }
+
+    /// Give the buffer up whatever is in it - the connection is going away,
+    /// so the bytes have no reader left.
+    pub(crate) fn forfeit(&mut self) -> Option<RecvClaim> {
+        self.filled = 0;
+        self.claim.take()
+    }
+
+    /// Make room for `want` bytes past `at`, and answer how many were
+    /// granted.
+    ///
+    /// A claim cannot grow - it is one fixed buffer - so the grant is capped
+    /// at what remains of it. That cap is unreachable when the pool is sized
+    /// as `recv_pool_buf_len` computes: `at` cannot exceed
+    /// `max_request_bytes` (`pump_gate` closes the connection above it) and
+    /// `want` cannot exceed `RECV_CHUNK` for the one read that is not
+    /// already bounded by the frame. It is here because the alternative to a
+    /// bound is a write past the buffer, and the caller treats a short grant
+    /// on an exact read as fatal rather than reading less than it framed.
+    ///
+    /// Owned storage grows as the `Vec` this replaced did, so its grant is
+    /// always the full `want`.
+    pub(crate) fn reserve_at(&mut self, at: usize, want: usize) -> usize {
+        if let Some(c) = &self.claim {
+            return want.min(c.cap.saturating_sub(at));
+        }
+        if self.needs_buffer() {
+            return want; // the kernel supplies it
+        }
+        let need = at.saturating_add(want);
+        if need > self.owned.len() {
+            self.owned.resize(need, 0);
+        }
+        want
+    }
+
+    /// Destination for a recv writing at `at`.
+    /// Destination for a recv writing at `at`. Null when a buffer has yet
+    /// to be acquired - the SQE's address is ignored under
+    /// `IOSQE_BUFFER_SELECT`, since the kernel supplies it.
+    pub(crate) fn write_ptr(&mut self, at: usize) -> *mut u8 {
+        match &self.claim {
+            // SAFETY: `at` stays within the claim; the framer never
+            // accumulates past `max_request_bytes`, which sizes the buffer.
+            Some(c) => unsafe { c.ptr.add(at) },
+            None if self.needs_buffer() => std::ptr::null_mut(),
+            // SAFETY: `reserve_at` sized the backing to cover `at`.
+            None => unsafe { self.owned.as_mut_ptr().add(at) },
+        }
+    }
+
+    /// Record how far the kernel wrote, once a completion proves it.
+    pub(crate) fn set_filled(&mut self, filled: usize) {
+        self.filled = filled;
+    }
+
+    /// Drop `n` bytes from the front, keeping any pipelined remainder - the
+    /// next message then starts at offset zero.
+    pub(crate) fn drain_front(&mut self, n: usize) {
+        let n = n.min(self.filled);
+        if n == 0 {
+            return;
+        }
+        let rest = self.filled - n;
+        match &self.claim {
+            Some(c) if rest > 0 => {
+                // SAFETY: both ranges lie within `filled <= cap`, and
+                // `copy` is the overlapping form.
+                unsafe { std::ptr::copy(c.ptr.add(n), c.ptr, rest) };
+            }
+            Some(_) => {}
+            None => self.owned.copy_within(n..self.filled, 0),
+        }
+        self.filled = rest;
+    }
+
+    /// Forget everything past `n`.
+    pub(crate) fn truncate(&mut self, n: usize) {
+        self.filled = self.filled.min(n);
+    }
+
+    /// The whole buffer, moved out, leaving this empty - the delivery
+    /// handoff that gives a body-only message's storage to the handler
+    /// rather than copying it.
+    ///
+    /// This is the one operation a pool-backed buffer will not be able to
+    /// serve, since that memory belongs to the ring: it will answer `None`
+    /// and the body will be delivered borrowed, with a handler that wants to
+    /// own it paying the copy `Body::take` already documents.
+    pub(crate) fn take_owned(&mut self) -> Option<Vec<u8>> {
+        if self.claim.is_some() || self.pooled {
+            return None;
+        }
+        let mut v = std::mem::take(&mut self.owned);
+        v.truncate(self.filled);
+        self.filled = 0;
+        Some(v)
+    }
+}
+
+impl std::ops::Deref for RecvBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match &self.claim {
+            // SAFETY: `filled` never exceeds the claim's capacity, and the
+            // pool outlives this connection - see `RecvClaim`.
+            Some(c) => unsafe {
+                std::slice::from_raw_parts(c.ptr, self.filled)
+            },
+            None => &self.owned[..self.filled.min(self.owned.len())],
+        }
+    }
+}
+
+impl std::fmt::Debug for RecvBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecvBuf")
+            .field("pooled", &self.pooled)
+            .field("held", &self.claim.is_some())
+            .field("filled", &self.filled)
+            .finish()
+    }
+}
+
 /// One outgoing PDU: a request reply or a push.
 struct SendItem {
     bytes: SendBuf,
@@ -163,20 +435,6 @@ struct SendItem {
 /// (`fs_body_chunk`), not the count.
 #[cfg(all(feature = "net-server", feature = "uring-fs"))]
 pub(crate) const FILE_TAIL_BUFS: u8 = 2;
-
-/// Chunk buffers **one tail can own at once**, which is twice the mint cap:
-/// `tail_take_buf` counts only mints against `created`, so a spare recycled
-/// from the previous tail's late-flushing chunks is a buffer this tail did
-/// not mint and can still queue. Both caps are `FILE_TAIL_BUFS` and they are
-/// independent, so a tail hands out `FILE_TAIL_BUFS` recycled buffers and
-/// then `FILE_TAIL_BUFS` fresh ones before `tail_take_buf` returns `None`.
-///
-/// Pinned by `a_late_flushing_chunk_never_grows_the_next_tails_pool`, which
-/// asserts four successful takes and never five. Reads clamp to
-/// `fs_body_chunk`, so this many chunks is what one body can put in the send
-/// queue at once - which is what `ServerConfig::validate` must cover.
-#[cfg(all(feature = "net-server", feature = "uring-fs"))]
-pub(crate) const FILE_TAIL_BUF_PEAK: u8 = 2 * FILE_TAIL_BUFS;
 
 /// A `Response::ReplyFile` that arrived while another body was still
 /// streaming, held until that one retires. One body at a time is structural -
@@ -249,11 +507,6 @@ pub(crate) struct FileTail {
     /// queue in offset order, and a single outstanding read makes that
     /// order structural instead of re-sorted.
     pub(crate) reading: bool,
-    /// Recycled chunk buffers (length 0, capacity one chunk), refilled by
-    /// [`Connection::advance_sent`] as flushed chunks pop.
-    spare: Vec<Vec<u8>>,
-    /// Buffers minted so far, capped at [`FILE_TAIL_BUFS`].
-    created: u8,
     /// PDUs and deferred file bodies diverted while this tail is active, in
     /// arrival order (see the struct docs).
     pending: Vec<PendingItem>,
@@ -367,7 +620,9 @@ pub(crate) struct Connection<U> {
     pub peer: ClientAddr,
     pub state: U,
     // ---- recv side ----
-    recv_buf: Vec<u8>, // accumulated message bytes (+ pipelined remainder)
+    // Accumulated message bytes (+ pipelined remainder). Pool-backed when
+    // a pool is behind this role; owned otherwise. See `RecvBuf`.
+    recv_buf: RecvBuf,
     header_len: usize, // current message's header length (from the Complete verdict)
     body_len: usize,   // current message's body length
     recv_at: usize,    // destination offset the in-flight recv writes to
@@ -487,6 +742,19 @@ pub(crate) struct Connection<U> {
     next_file: Option<PendingFile>,
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     next_file_pending: Vec<PendingItem>,
+    /// Chunk buffers this connection currently holds - one being read into,
+    /// the rest queued or sending. Capped at [`FILE_TAIL_BUFS`], which is
+    /// the whole backpressure: a body cannot run ahead of the wire.
+    ///
+    /// **A count, not a pool.** The buffers belong to the reactor's ring and
+    /// are shared by every connection on it, so what a connection owns is a
+    /// share of that ring, not storage of its own. A per-connection pool -
+    /// which this used to be - made buffer memory scale with the connection
+    /// table rather than with how many bodies are actually moving:
+    /// `pool_size` x [`FILE_TAIL_BUFS`] x `fs_body_chunk`, held from a
+    /// connection's first file reply until it closes.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    chunk_out: u8,
     // A deferred file body carries `close`. `close_on_flush` cannot be armed
     // for it yet - the body in front is still streaming, and the flush-close
     // dry checks would then belong to the wrong body - but the handler has
@@ -534,7 +802,7 @@ impl<U> Connection<U> {
         Box::new(Connection {
             peer,
             state,
-            recv_buf: Vec::new(),
+            recv_buf: RecvBuf::default(),
             header_len: 0,
             body_len: 0,
             recv_at: 0,
@@ -578,6 +846,9 @@ impl<U> Connection<U> {
             next_file: None,
             #[cfg(all(feature = "net-server", feature = "uring-fs"))]
             next_file_pending: Vec::new(),
+            #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+            chunk_out: 0,
+            #[cfg(all(feature = "net-server", feature = "uring-fs"))]
             #[cfg(all(feature = "net-server", feature = "uring-fs"))]
             deferred_close: false,
             outstanding: 0,
@@ -688,8 +959,8 @@ impl<U> Connection<U> {
             && self.body_len > 0
             && self.recv_buf.len() == self.body_len
             && matches!(handoff_threshold, Some(t) if self.body_len >= t)
+            && let Some(buf) = self.recv_buf.take_owned()
         {
-            let buf = std::mem::take(&mut self.recv_buf);
             // `consume` drains `frame_len().min(buf.len())` = 0 afterwards,
             // so the handoff composes with the normal delivery epilogue.
             return (&[], Body::placed(buf), &self.peer, &mut self.state);
@@ -721,6 +992,52 @@ impl<U> Connection<U> {
         self.header_len.saturating_add(self.body_len)
     }
 
+    /// Whether an armed recv must acquire a pool buffer.
+    pub(crate) fn recv_needs_buffer(&self) -> bool {
+        self.recv_buf.needs_buffer()
+    }
+
+    /// Adopt the buffer a completion selected.
+    pub(crate) fn install_recv_buf(&mut self, claim: RecvClaim) {
+        self.recv_buf.install(claim);
+    }
+
+    /// Hand the recv buffer back once nothing is buffered, so the next read
+    /// acquires afresh and an idle connection holds none.
+    pub(crate) fn release_recv_buf(&mut self) -> Option<RecvClaim> {
+        self.recv_buf.release()
+    }
+
+    /// Draw recv buffers from a pool rather than owning them.
+    pub(crate) fn set_recv_pooled(&mut self) {
+        self.recv_buf.set_pooled();
+    }
+
+    /// Whether the pool buffer this connection holds already covers a
+    /// message of `total` bytes, so it needs no allocation of its own.
+    pub(crate) fn recv_buf_covers(&self, total: usize) -> bool {
+        self.recv_buf.covers(total)
+    }
+
+    /// Move accumulation off a pool buffer too small for the next read.
+    pub(crate) fn promote_recv_buf(
+        &mut self,
+        at: usize,
+        want: usize,
+    ) -> Option<RecvClaim> {
+        self.recv_buf.promote_for(at, want)
+    }
+
+    /// Surrender the pool buffer unconditionally, for teardown.
+    pub(crate) fn forfeit_recv_buf(&mut self) -> Option<RecvClaim> {
+        self.recv_buf.forfeit()
+    }
+
+    /// Give up on the pool and own the recv buffer instead.
+    pub(crate) fn set_recv_owned(&mut self) {
+        self.recv_buf.set_owned();
+    }
+
     /// Bytes already accumulated in `buf`.
     pub(crate) fn buffered(&self) -> usize {
         self.recv_buf.len()
@@ -731,7 +1048,7 @@ impl<U> Connection<U> {
     /// its header did), so at most `buf.len()` bytes are drained.
     pub(crate) fn consume(&mut self) {
         let drained = self.frame_len().min(self.recv_buf.len());
-        self.recv_buf.drain(..drained);
+        self.recv_buf.drain_front(drained);
         self.header_len = 0;
         self.body_len = 0;
     }
@@ -749,12 +1066,15 @@ impl<U> Connection<U> {
     /// never observable: the framer runs only while no recv is armed, an
     /// exact read either fills the whole region or closes the connection,
     /// and a chunk read exposes only the bytes that arrived).
-    pub(crate) fn arm_recv(&mut self, want: usize, exact: bool) {
+    /// Returns the length actually armed, which is `want` except against a
+    /// pool buffer with less room than that - see `RecvBuf::reserve_at`.
+    pub(crate) fn arm_recv(&mut self, want: usize, exact: bool) -> usize {
         self.recv_at = self.recv_buf.len();
+        let want = self.recv_buf.reserve_at(self.recv_at, want);
         self.recv_want = want;
         self.recv_exact = exact;
         self.recv_into_body = false;
-        self.recv_buf.reserve(want);
+        want
     }
 
     /// Arm a recv for the current message's body into its **own** allocation
@@ -796,7 +1116,7 @@ impl<U> Connection<U> {
             // the length). SAFETY: `arm_recv` reserved through
             // `recv_at + recv_want`, so the offset stays within the
             // allocation.
-            _ => unsafe { self.recv_buf.as_mut_ptr().add(self.recv_at) as u64 },
+            _ => self.recv_buf.write_ptr(self.recv_at) as u64,
         }
     }
 
@@ -819,13 +1139,10 @@ impl<U> Connection<U> {
                 if self.recv_into_body {
                     self.finish_body_recv();
                 } else {
-                    // SAFETY: `[0, recv_at)` was initialized before arming,
-                    // and the exact completion - together with any earlier
-                    // kTLS partials that advanced `recv_at` - proves the
-                    // kernel wrote the armed region up to this end.
-                    unsafe {
-                        self.recv_buf.set_len(self.recv_at + self.recv_want)
-                    };
+                    // The exact completion - with any earlier kTLS
+                    // partials that advanced `recv_at` - proves the kernel
+                    // wrote the armed region up to this end.
+                    self.recv_buf.set_filled(self.recv_at + self.recv_want);
                 }
                 return RecvOutcome::Complete;
             }
@@ -846,7 +1163,7 @@ impl<U> Connection<U> {
         } else if res > 0 {
             // SAFETY: the kernel wrote `res` bytes at the cursor (chunk reads
             // never target `body_buf`), all within the reserved region.
-            unsafe { self.recv_buf.set_len(self.recv_at + res as usize) };
+            self.recv_buf.set_filled(self.recv_at + res as usize);
             RecvOutcome::Complete
         } else {
             RecvOutcome::Failed
@@ -974,8 +1291,6 @@ impl<U> Connection<U> {
             next_offset: offset,
             unread: len,
             reading: false,
-            spare: Vec::new(),
-            created: 0,
             // Anything that arrived behind this body while it waited its
             // turn stays behind it.
             pending: std::mem::take(&mut self.next_file_pending),
@@ -998,21 +1313,45 @@ impl<U> Connection<U> {
         false
     }
 
-    /// A chunk buffer for the tail's next read: a recycled spare, or a fresh
-    /// one while under the [`FILE_TAIL_BUFS`] cap - `None` when every buffer
-    /// is still queued or sending (the read waits for a flush to recycle
-    /// one; that wait is the body's memory bound).
+    /// Claim this connection's share of the ring for one more chunk.
+    ///
+    /// `false` when it already holds [`FILE_TAIL_BUFS`] - one being read
+    /// into, the rest queued or sending. The read then waits for a flush,
+    /// and that wait is the body's memory bound. Nothing is allocated here:
+    /// the buffer comes from the reactor's ring, chosen by the kernel when
+    /// the read completes.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
-    pub(crate) fn tail_take_buf(&mut self, chunk: usize) -> Option<Vec<u8>> {
-        let tail = self.file_tail.as_mut()?;
-        if let Some(buf) = tail.spare.pop() {
-            return Some(buf);
+    pub(crate) fn tail_claim_chunk(&mut self) -> bool {
+        if self.file_tail.is_none() || self.chunk_out >= FILE_TAIL_BUFS {
+            return false;
         }
-        if tail.created < FILE_TAIL_BUFS {
-            tail.created += 1;
-            return Some(Vec::with_capacity(chunk));
+        self.chunk_out += 1;
+        true
+    }
+
+    /// Give a claim back without a chunk having been queued - a read that
+    /// failed or hit EOF.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn tail_release_chunk(&mut self) {
+        self.chunk_out = self.chunk_out.saturating_sub(1);
+    }
+
+    /// Pool buffer ids still sitting in the send queue, taken.
+    ///
+    /// Teardown: the connection is going away with segments that name ring
+    /// buffers, and a buffer never handed back is one the pool can neither
+    /// reissue nor free.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn drain_pooled_bids(&mut self) -> Vec<u16> {
+        let mut out = Vec::new();
+        for item in self.send_queue.drain(..) {
+            if let Some(bid) = item.bytes.pooled_bid() {
+                out.push(bid);
+            }
         }
-        None
+        self.queued_bytes = 0;
+        self.chunk_out = 0;
+        out
     }
 
     /// Queue the leading segment of a reply whose final segment arrives
@@ -1030,10 +1369,10 @@ impl<U> Connection<U> {
     /// `last` marks the final chunk `ReplyLast`, retiring the reply's
     /// read-ahead slot when it flushes.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
-    pub(crate) fn enqueue_file_chunk(&mut self, bytes: Vec<u8>, last: bool) {
+    pub(crate) fn enqueue_file_chunk(&mut self, bytes: SendBuf, last: bool) {
         self.queued_bytes += bytes.len();
         self.send_queue.push_back(SendItem {
-            bytes: bytes.into(),
+            bytes,
             kind: if last {
                 SendKind::ReplyLast
             } else {
@@ -1047,7 +1386,8 @@ impl<U> Connection<U> {
     /// next chunk; `true` when that was the last of the declared length, which
     /// also retires the tail and releases the diversion.
     ///
-    /// The advance is `buf.len()` and nothing else - the count the read
+    /// The advance is the segment's length and nothing else - the count the
+    /// read
     /// ACTUALLY returned, which is why the requested length is not a parameter
     /// here. A short read must leave the rest for the next iteration and
     /// continue from the offset it reached; advancing by the length asked for
@@ -1057,7 +1397,7 @@ impl<U> Connection<U> {
     /// read exists to prevent, and short reads are ordinary on ZFS, where every
     /// ring read is punted to an io-wq worker.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
-    pub(crate) fn advance_file_tail(&mut self, buf: Vec<u8>) -> bool {
+    pub(crate) fn advance_file_tail(&mut self, buf: SendBuf) -> bool {
         let n = buf.len() as u64;
         let last = {
             let tail = self.file_tail.as_mut().expect("a tail is streaming");
@@ -1230,6 +1570,10 @@ impl<U> Connection<U> {
             replies: 0,
             pushes: 0,
             armed_remaining: self.armed_bytes,
+            #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+            freed_bids: [0; FILE_TAIL_BUFS as usize],
+            #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+            freed: 0,
         };
         while n > 0 {
             let front_remaining = self
@@ -1253,20 +1597,26 @@ impl<U> Connection<U> {
                 // Tallied by the reply's final ReplyLast segment.
                 SendKind::ReplyPart => {}
             }
-            // A flushed tail chunk's buffer returns to the spare pool for
-            // the next read; past the cap it drops instead. The cap matters
-            // in pipelined mode: a finished tail's last chunks can still be
-            // flushing when the NEXT request installs a new tail, and
-            // recycling them on top of the new tail's own two would grow a
-            // connection past the documented two-buffer bound.
+            // A flushed tail chunk frees this connection's share of the
+            // ring, and its buffer goes back to the pool - which only the
+            // reactor can do, so the id rides out on the progress. Not
+            // conditioned on a tail being installed: a chunk can still be
+            // flushing after its tail retired.
             #[cfg(all(feature = "net-server", feature = "uring-fs"))]
-            if item.reclaim
-                && let Some(tail) = self.file_tail.as_mut()
-                && tail.spare.len() < FILE_TAIL_BUFS as usize
-                && let Some(mut buf) = item.bytes.take_owned()
-            {
-                buf.clear();
-                tail.spare.push(buf);
+            if item.reclaim {
+                self.chunk_out = self.chunk_out.saturating_sub(1);
+                if let Some(bid) = item.bytes.pooled_bid() {
+                    debug_assert!(
+                        (progress.freed as usize) < progress.freed_bids.len(),
+                        "at most FILE_TAIL_BUFS chunks can be queued at once"
+                    );
+                    if let Some(cell) =
+                        progress.freed_bids.get_mut(progress.freed as usize)
+                    {
+                        *cell = bid;
+                        progress.freed += 1;
+                    }
+                }
             }
         }
         progress
@@ -1318,6 +1668,14 @@ pub(crate) struct SendProgress {
     /// Bytes of the armed gather still unsent (> 0 only on a mid-flight
     /// error under `MSG_WAITALL`; the re-submit surfaces it).
     pub armed_remaining: usize,
+    /// Ring buffer ids whose segments flushed, owed back to the pool. Only
+    /// the reactor holds the pool, so they ride out to it here. Bounded by
+    /// [`FILE_TAIL_BUFS`], which is what caps a connection's chunks.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub freed_bids: [u16; FILE_TAIL_BUFS as usize],
+    /// How many of `freed_bids` are set.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub freed: u8,
 }
 
 #[cfg(test)]
@@ -1583,12 +1941,13 @@ mod tests {
         c.install_file_tail(file, 0, 20);
         assert!(c.tail_active());
 
-        // Exactly two buffers exist; a third read must wait for a recycle.
-        let b0 = c.tail_take_buf(8).expect("first buffer");
-        let p0 = b0.as_ptr() as usize;
-        let b1 = c.tail_take_buf(8).expect("second buffer");
-        assert!(c.tail_take_buf(8).is_none(), "capped at two");
-        drop(b1);
+        // A body holds at most two chunks at once; a third read waits for
+        // a flush. The buffers themselves come from the reactor's ring, so
+        // what is capped here is this connection's share of it.
+        assert!(c.tail_claim_chunk(), "first chunk");
+        assert!(c.tail_claim_chunk(), "second chunk");
+        assert!(!c.tail_claim_chunk(), "capped at two");
+        c.tail_release_chunk(); // the second read never happened
 
         // Mid-tail enqueues divert - their bytes may not land between two
         // chunks on the wire - but stay in the backlog accounting.
@@ -1597,9 +1956,7 @@ mod tests {
         assert_eq!(c.queued_bytes(), 4 + 2 + 3);
 
         // The tail's own chunks go straight through.
-        let mut chunk0 = b0;
-        chunk0.extend_from_slice(&[b'a'; 8]);
-        c.enqueue_file_chunk(chunk0, false);
+        c.enqueue_file_chunk(SendBuf::from(vec![b'a'; 8]), false);
         assert_eq!(c.arm_send(), 4 + 8, "head + chunk, no diverted bytes");
         let p = c.advance_sent(12);
         assert_eq!(
@@ -1607,16 +1964,13 @@ mod tests {
             (0, 0),
             "nothing retires before the last chunk"
         );
-        // The flushed chunk's allocation recycled into the spare pool.
-        let recycled = c.tail_take_buf(8).expect("recycled buffer");
-        assert_eq!(recycled.as_ptr() as usize, p0, "same allocation");
-        assert!(recycled.is_empty());
+        // The flush freed this connection's share, so a read can be armed
+        // again.
+        assert!(c.tail_claim_chunk(), "the flush freed a chunk");
 
         // The final chunk retires the tail; the diverted PDUs follow in
         // arrival order behind it.
-        let mut last = recycled;
-        last.extend_from_slice(&[b'z'; 12]);
-        c.enqueue_file_chunk(last, true);
+        c.enqueue_file_chunk(SendBuf::from(vec![b'z'; 12]), true);
         c.finish_file_tail();
         assert!(!c.tail_active());
         assert_eq!(c.arm_send(), 12 + 2 + 3);
@@ -1649,7 +2003,10 @@ mod tests {
         c.install_file_tail(file, 1000, 300);
 
         // 200 bytes came back where a whole chunk was asked for.
-        assert!(!c.advance_file_tail(vec![b'a'; 200]), "100 still owed");
+        assert!(
+            !c.advance_file_tail(SendBuf::from(vec![b'a'; 200])),
+            "100 still owed"
+        );
         {
             let t = c.file_tail.as_ref().expect("still streaming");
             assert_eq!(t.next_offset, 1200, "advanced by the count read");
@@ -1657,57 +2014,77 @@ mod tests {
         }
 
         // The remainder retires the tail exactly once.
-        assert!(c.advance_file_tail(vec![b'b'; 100]), "the declared length");
+        assert!(
+            c.advance_file_tail(SendBuf::from(vec![b'b'; 100])),
+            "the declared length"
+        );
         assert!(!c.tail_active(), "the last chunk retires the tail");
         assert_eq!(c.queued_bytes(), 300, "both chunks queued, nothing else");
     }
 
+    /// The pool outlives the body that minted it. A connection serving many
+    /// file responses mints `FILE_TAIL_BUFS` buffers **once** and cycles
+    /// them for the rest of its life. Scoped to `FileTail` instead, every
+    /// `ReplyFile` started from an empty pool and minted again - two fresh
+    /// allocations per response, and `fs_body_chunk` is a megabyte in a
+    /// realistic deployment.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     #[test]
-    fn a_late_flushing_chunk_never_grows_the_next_tails_pool() {
-        // Pipelined shape: tail A retired but its chunks still queued when
-        // tail B installs on the same connection. A's buffers recycle into
-        // B's spare only up to the cap; past it they drop - so however the
-        // handoff interleaves, a connection's pool never grows beyond
-        // FILE_TAIL_BUFS spares plus FILE_TAIL_BUFS mints.
+    fn chunk_buffers_outlive_the_body_that_minted_them() {
         let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
         let file = || {
             let fd: std::os::fd::OwnedFd =
                 std::fs::File::open("/dev/null").expect("open").into();
             crate::uring_fs::File::new(crate::sync::Arc::new(fd))
         };
-        let mk = |b: u8| {
-            let mut v = Vec::with_capacity(4);
-            v.extend_from_slice(&[b; 4]);
-            v
+        let serve = |c: &mut Connection<()>, buf: SendBuf| {
+            c.enqueue_file_chunk(buf, true);
+            c.finish_file_tail();
+            assert_eq!(c.arm_send(), 4);
+            let _ = c.advance_sent(4);
         };
-        c.install_file_tail(file(), 0, 12);
-        let (c0, c1, c2) = (mk(b'a'), mk(b'b'), mk(b'c'));
-        let (p0, p1) = (c0.as_ptr() as usize, c1.as_ptr() as usize);
-        c.enqueue_file_chunk(c0, false);
-        c.enqueue_file_chunk(c1, false);
-        c.enqueue_file_chunk(c2, true);
+
+        // A body claims a share, and the flush gives it back - so the
+        // next body starts from the same place however many ran before it.
+        for round in 0..3 {
+            c.install_file_tail(file(), 0, 4);
+            assert!(c.tail_claim_chunk(), "round {round}: claimed");
+            assert!(c.tail_claim_chunk(), "round {round}: and again");
+            assert!(!c.tail_claim_chunk(), "round {round}: capped at two");
+            c.tail_release_chunk();
+            serve(&mut c, SendBuf::from(b"aaaa".to_vec()));
+            assert_eq!(
+                c.chunk_out, 0,
+                "round {round}: the flush released the share"
+            );
+        }
+    }
+
+    /// A chunk can still be flushing when its tail retires. Its ring
+    /// buffer has to come back anyway: conditioning the release on a tail
+    /// being installed strands the buffer in the pool forever, where it can
+    /// be neither reissued nor freed.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    #[test]
+    fn a_chunk_outliving_its_tail_still_frees_its_buffer() {
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        let fd: std::os::fd::OwnedFd =
+            std::fs::File::open("/dev/null").expect("open").into();
+        let file = crate::uring_fs::File::new(crate::sync::Arc::new(fd));
+        c.install_file_tail(file, 0, 4);
+        assert!(c.tail_claim_chunk());
+        // SAFETY: a test buffer that outlives the segment.
+        let buf = Box::leak(Box::new([b'a'; 4]));
+        let seg = unsafe { SendBuf::pooled(buf.as_mut_ptr(), 4, 7) };
+        c.enqueue_file_chunk(seg, true);
+        // The tail retires with its chunk still queued, and nothing follows
+        // it - so at the flush there is no tail to hand anything to.
         c.finish_file_tail();
-        // B installs while A's three chunks are still queued.
-        c.install_file_tail(file(), 0, 8);
-        assert_eq!(c.arm_send(), 12);
-        let _ = c.advance_sent(12);
-        // Exactly two of A's flushed chunks recycled (spare LIFO), then B
-        // mints its own two, then nothing: four takes, never five. Without
-        // the spare cap the third flushed chunk would recycle too and a
-        // fifth take would succeed.
-        let t1 = c.tail_take_buf(4).expect("recycled one");
-        let t2 = c.tail_take_buf(4).expect("recycled two");
-        let taken = [t1.as_ptr() as usize, t2.as_ptr() as usize];
-        assert!(
-            taken.contains(&p0) && taken.contains(&p1),
-            "the first two flushed chunks are the recycled pair"
-        );
-        let _t3 = c.tail_take_buf(4).expect("first mint");
-        let _t4 = c.tail_take_buf(4).expect("second mint");
-        assert!(
-            c.tail_take_buf(4).is_none(),
-            "the third flushed chunk dropped at the spare cap"
-        );
+        assert!(!c.tail_active(), "no successor");
+        assert_eq!(c.arm_send(), 4);
+        let p = c.advance_sent(4);
+        assert_eq!(c.chunk_out, 0, "the share came back");
+        assert_eq!(p.freed, 1, "and the buffer id rode out to the pool");
+        assert_eq!(p.freed_bids[0], 7, "the one the segment held");
     }
 }
