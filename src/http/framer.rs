@@ -132,12 +132,18 @@ impl HttpConfig {
 /// The most body a single streamed delivery carries.
 ///
 /// A bound this side picks, because the alternative is the peer's chunk
-/// size picking it. 128 KiB is what botocore sends over TLS
-/// (`httpsession.py`'s 128 KiB `BUFFER_SIZE`, which overrides urllib3's
-/// 16 KiB), so the common case is one window per chunk with no splitting;
-/// it clears one TLS record (`TLS_MAX_PAYLOAD_SIZE`, 16 KiB) by eight, which
-/// is what a kTLS recv needs before it will decrypt straight into the
-/// caller's pages; and it matches ZFS's default `recordsize`.
+/// size picking it. 128 KiB clears one TLS record (`TLS_MAX_PAYLOAD_SIZE`,
+/// 16 KiB) by eight, which is what a kTLS recv needs before it will decrypt
+/// straight into the caller's pages, and it matches ZFS's default
+/// `recordsize`.
+///
+/// It is *not* the peer's framing size, and does not divide it. botocore
+/// frames aws-chunks at `httpchecksum.py`'s `_DEFAULT_CHUNK_SIZE` of 1 MiB;
+/// `httpsession.py`'s 128 KiB `BUFFER_SIZE` is urllib3's socket blocksize
+/// (`pool_manager_kwargs['blocksize']`), which is a different quantity. So
+/// the default client sends eight windows per chunk and only the first of
+/// the eight carries a chunk header - see `stream_step`, which sizes a
+/// mid-chunk window from `chunk_left` alone.
 pub(crate) const STREAM_WINDOW: usize = 128 * 1024;
 
 /// Where the connection stands between messages.
@@ -654,15 +660,19 @@ fn known_step<U>(buf: &[u8], conn: &mut HttpConn<U>) -> Framing {
     if buf.is_empty() {
         return Framing::More;
     }
-    // Sized to the buffered bytes, never past them: a window the buffer
-    // cannot fill would make the reactor read the rest into an owned
-    // allocation (placement / the body handoff), and the whole point of
-    // this phase is that windows deliver out of the recv pool. The
-    // `remaining` bound keeps a pipelined next request out of the tail.
+    // A full window per delivery, however little is buffered: the exact
+    // read that completes it draws from the recv pool - the `More` above
+    // re-acquires a claim when none is held, and the reactor refuses to
+    // place a frame one pool buffer can serve - so the remainder arrives
+    // zero-copy. Sizing windows to the buffered bytes instead makes them
+    // `RECV_CHUNK`-sized, ~33x the deliveries, wakes and leased writes for
+    // the same payload. The `remaining` bound keeps a pipelined next
+    // request out of the tail. (An unpooled connection reads the remainder
+    // into owned storage and the over-threshold handoff takes it per
+    // window - the degraded mode's ordinary cost.)
     Framing::Complete {
         header_len: 0,
-        body_len: remaining.min(STREAM_WINDOW as u64).min(buf.len() as u64)
-            as usize,
+        body_len: remaining.min(STREAM_WINDOW as u64) as usize,
     }
 }
 
@@ -1400,8 +1410,9 @@ mod tests {
         ));
 
         // The glue accepts and advances; windows count the length down,
-        // each sized to the buffered bytes so it delivers out of the
-        // recv pool rather than forcing an owned-allocation read.
+        // each a full window regardless of what is buffered - the exact
+        // read that completes one draws from the recv pool, and sizing to
+        // the buffered bytes instead shrinks every window to a chunk read.
         c.phase = Phase::StreamKnown {
             head: head.as_bytes().to_vec(),
             remaining: len as u64,
@@ -1420,9 +1431,10 @@ mod tests {
             frame(&burst[..7], &mut c, &cfg()),
             Framing::Complete {
                 header_len: 0,
-                body_len: 7
+                body_len: STREAM_WINDOW
             },
-            "a short buffer delivers short rather than forcing a read"
+            "a short buffer still declares a full window; the exact read \
+             completes it from the pool"
         );
         c.phase = Phase::StreamKnown {
             head: head.as_bytes().to_vec(),

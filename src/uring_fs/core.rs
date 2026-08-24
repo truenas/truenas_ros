@@ -215,17 +215,27 @@ struct FsOpEntry {
     /// (and un-reused) until the CQE reaps - the caller may drop its
     /// `File` mid-op. Dropping this on `clear` gives close-last ordering.
     file: Option<Arc<OwnedFd>>,
-    /// A recv-pool buffer id this op's iovec points into (a leased write).
-    /// Rides out on [`FsDone`] so the net server can hand it back to the
-    /// pool - the buffer must outlive the DMA, and only the completion
-    /// knows when that is.
+    /// This op's share of a leased recv-pool buffer (a leased write).
+    /// Several writes in one delivery may read from the same buffer, so
+    /// the id rides in an [`Arc`]: the buffer must outlive every DMA that
+    /// reads it, and only the completion that drops the *last* share knows
+    /// when that is - `Arc::into_inner` at reap surfaces the id exactly
+    /// once, on [`FsDone`], for the net server to hand back to the pool.
     #[cfg(feature = "net-server")]
-    recv_lease: Option<u16>,
+    recv_lease: Option<std::sync::Arc<LeaseHold>>,
     /// The byte count a leased write asked for, so a short completion can
     /// be told apart from a full one at reap time.
     #[cfg(feature = "net-server")]
     lease_want: u32,
 }
+
+/// One delivery's claim on a recv-pool buffer, shared by every leased
+/// write reading from it. Plain `std::sync` deliberately: nothing
+/// synchronizes *through* it - the refcount is the whole protocol - and
+/// loom neither models this path nor supplies `Weak`.
+#[cfg(feature = "net-server")]
+#[derive(Debug)]
+pub(crate) struct LeaseHold(pub(crate) u16);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum FsOpState {
@@ -279,7 +289,7 @@ struct Completed {
     bufs: Vec<Vec<u8>>,
     stat: Option<Box<StatxRaw>>,
     #[cfg(feature = "net-server")]
-    recv_lease: Option<u16>,
+    recv_lease: Option<std::sync::Arc<LeaseHold>>,
     #[cfg(feature = "net-server")]
     lease_want: u32,
 }
@@ -586,7 +596,7 @@ impl FsCore {
         len: usize,
         off: u64,
         rw_flags: u32,
-        bid: u16,
+        hold: std::sync::Arc<LeaseHold>,
         waiter: FsWaiter,
     ) -> Result<(), FsWaiter> {
         let Some(op_slot) = self.op_free.pop() else {
@@ -601,7 +611,7 @@ impl FsCore {
             iov_len: len,
         }];
         entry.state.file = Some(file);
-        entry.state.recv_lease = Some(bid);
+        entry.state.recv_lease = Some(hold);
         entry.state.lease_want = len as u32;
         let iov_ptr = entry.state.iov.as_ptr() as u64;
         let ud = pack_raw(TAG_WRITEV, op_slot, gen32);
@@ -1208,11 +1218,22 @@ impl FsCore {
             // An ASYNC_CANCEL's own completion; nothing to route.
             return ReapedFs::None;
         }
-        let Some(completed) = self.take_op(tag, op_slot, gen32) else {
+        #[cfg_attr(not(feature = "net-server"), allow(unused_mut))]
+        let Some(mut completed) = self.take_op(tag, op_slot, gen32) else {
             return ReapedFs::None;
         };
         #[cfg(feature = "net-server")]
-        let recv_lease = completed.recv_lease;
+        let leased = completed.recv_lease.is_some();
+        // The buffer goes back to the pool only when its LAST share drops:
+        // sibling writes in the same delivery may still be reading it, so
+        // the id surfaces from exactly one completion - `into_inner` on the
+        // final `Arc` - and rides out `None` from every other.
+        #[cfg(feature = "net-server")]
+        let recv_lease = completed
+            .recv_lease
+            .take()
+            .and_then(std::sync::Arc::into_inner)
+            .map(|h| h.0);
         #[cfg(feature = "net-server")]
         let lease_want = completed.lease_want;
         let Completed {
@@ -1246,7 +1267,7 @@ impl FsCore {
         // retryable (`FsDone::into_bufs` hands the source back), which is
         // the one honest asymmetry between the two.
         #[cfg(feature = "net-server")]
-        if recv_lease.is_some()
+        if leased
             && let Ok(n) = result
             && (n as u32) < lease_want
         {
@@ -1297,7 +1318,11 @@ impl FsCore {
             return;
         };
         #[cfg(feature = "net-server")]
-        let (recv_lease, lease_want) = (done.recv_lease, done.lease_want);
+        let mut done = done;
+        #[cfg(feature = "net-server")]
+        let leased = done.recv_lease.take().is_some();
+        #[cfg(feature = "net-server")]
+        let lease_want = done.lease_want;
         let Completed {
             waiter, bufs, stat, ..
         } = done;
@@ -1311,9 +1336,7 @@ impl FsCore {
         let res = {
             let r = map_res(cqe.res);
             match r {
-                Ok(n) if recv_lease.is_some() && (n as u32) < lease_want => {
-                    Err(Errno::EIO)
-                }
+                Ok(n) if leased && (n as u32) < lease_want => Err(Errno::EIO),
                 other => other,
             }
         };
@@ -1371,7 +1394,7 @@ impl FsCore {
             bufs: std::mem::take(&mut e.bufs),
             stat: e.stat.take(),
             #[cfg(feature = "net-server")]
-            recv_lease: e.recv_lease,
+            recv_lease: e.recv_lease.take(),
             #[cfg(feature = "net-server")]
             lease_want: e.lease_want,
         };
@@ -1504,6 +1527,12 @@ pub struct FsConn<'a> {
     /// unpooled connections.
     #[cfg(feature = "net-server")]
     lease: Option<RecvWriteLease<'a>>,
+    /// The shared hold minted by this delivery's first leased write, kept
+    /// as a `Weak` so the facade can hand later ranges a clone without
+    /// itself delaying the buffer's release - the strong counts are the
+    /// outstanding writes and nothing else.
+    #[cfg(feature = "net-server")]
+    lease_hold: Option<std::sync::Weak<LeaseHold>>,
 }
 
 /// A view of the delivering connection's recv-pool claim, offered to the
@@ -1548,6 +1577,8 @@ impl<'a> FsConn<'a> {
             root,
             #[cfg(feature = "net-server")]
             lease: None,
+            #[cfg(feature = "net-server")]
+            lease_hold: None,
         }
     }
 
@@ -1564,6 +1595,8 @@ impl<'a> FsConn<'a> {
             root: self.root,
             #[cfg(feature = "net-server")]
             lease: self.lease.take(),
+            #[cfg(feature = "net-server")]
+            lease_hold: self.lease_hold.take(),
         }
     }
 
@@ -1806,14 +1839,15 @@ impl<'a> FsConn<'a> {
     /// without copying it when it still sits in the connection's receive
     /// buffer.
     ///
-    /// When `src` lies inside the delivering connection's pooled claim and
-    /// no earlier write this delivery took it, the op's iovec points
-    /// straight at the buffer: the connection surrenders the claim to the
-    /// op instead of recycling it, and the pool gets the buffer back when
-    /// the write completes - zero copies, zero allocations. Anything else -
-    /// an unpooled connection, a placed or owned body, a second write in
-    /// one delivery, a full op table - falls back to `pwritev2` on a copy,
-    /// so the call degrades instead of failing.
+    /// When `src` lies inside the delivering connection's pooled claim,
+    /// the op's iovec points straight at the buffer: the connection
+    /// surrenders the claim to its writes instead of recycling it, and the
+    /// pool gets the buffer back when the last of them completes - zero
+    /// copies, zero allocations, for as many in-bounds ranges as one
+    /// delivery submits. Anything else - an unpooled connection, a placed
+    /// or owned body, a range outside the claim, a full op table - falls
+    /// back to `pwritev2` on a copy, so the call degrades instead of
+    /// failing.
     ///
     /// The one behavioural asymmetry between the two paths is the **short
     /// write**, which ZFS returns as a success by design. On the copy path
@@ -1834,8 +1868,9 @@ impl<'a> FsConn<'a> {
     /// against the same file, which has made no progress to hide the errno
     /// behind.
     ///
-    /// One leased write per delivery: the claim is one buffer and the op
-    /// owns all of it once taken.
+    /// Every leased write of a delivery shares the one claim: each holds a
+    /// share, and the completion that drops the last share is the one that
+    /// hands the buffer back. A short write fails its own op alone.
     ///
     /// # Pipelined ingest
     ///
@@ -1868,7 +1903,7 @@ impl<'a> FsConn<'a> {
         #[cfg(feature = "net-server")]
         {
             let leased = match &self.lease {
-                Some(l) if !l.taken.get() => {
+                Some(l) => {
                     let base = l.ptr as usize;
                     let at = src.as_ptr() as usize;
                     let fits = at >= base
@@ -1879,7 +1914,22 @@ impl<'a> FsConn<'a> {
                 }
                 _ => None,
             };
-            if let Some((bid, taken)) = leased {
+            // Every in-bounds range of one delivery shares the claim: the
+            // hold is minted on the first leased write and cloned for the
+            // rest, so the buffer goes back to the pool when the last of
+            // them completes. The facade keeps only a `Weak` - a strong
+            // clone here would withhold the release until the facade
+            // dropped, for no one's benefit. An upgrade can only fail if
+            // every holder already completed and released the buffer,
+            // which cannot happen while this delivery is still running its
+            // handler - but if it ever did, leasing again would write from
+            // a buffer the pool may have re-issued, so it falls to the
+            // copy path instead.
+            let hold = leased.and_then(|(bid, _)| match &self.lease_hold {
+                Some(w) => w.upgrade(),
+                None => Some(std::sync::Arc::new(LeaseHold(bid))),
+            });
+            if let (Some((_, taken)), Some(hold)) = (leased, hold) {
                 let w = embed(self.owner, on_done);
                 match self.fs.submit_pwritev2_leased(
                     self.eng,
@@ -1889,11 +1939,13 @@ impl<'a> FsConn<'a> {
                     src.len(),
                     off,
                     flags.bits(),
-                    bid,
+                    std::sync::Arc::clone(&hold),
                     w,
                 ) {
                     Ok(()) => {
                         taken.set(true);
+                        self.lease_hold =
+                            Some(std::sync::Arc::downgrade(&hold));
                         return;
                     }
                     Err(w) => {
@@ -3711,7 +3763,7 @@ mod routing_fuzz {
             buf.len(),
             0,
             0,
-            9,
+            std::sync::Arc::new(LeaseHold(9)),
             chan(&tx),
         );
         assert!(staged.is_ok(), "staged");
@@ -3736,7 +3788,7 @@ mod routing_fuzz {
             buf.len(),
             0,
             0,
-            9,
+            std::sync::Arc::new(LeaseHold(9)),
             chan(&tx),
         );
         assert!(staged.is_ok(), "staged");
@@ -3746,6 +3798,78 @@ mod routing_fuzz {
         let _ = core.on_cqe(&mut eng, t, s, g, 8192);
         let out = rx.try_recv().expect("delivered");
         assert_eq!(out.res, Ok(8192), "a full leased write is untouched");
+    }
+
+    /// N writes share one claim; the buffer surfaces from the last.
+    ///
+    /// Two leased writes read from one buffer, so releasing at the first
+    /// completion re-posts it while the sibling's DMA still reads it. The
+    /// id must ride out of exactly one completion - whichever drops the
+    /// last share - and a short write still fails its own op alone,
+    /// whether or not it is the one that releases.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn the_last_shared_lease_releases_the_buffer() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let buf = vec![7u8; 8192];
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        let hold = std::sync::Arc::new(LeaseHold(9));
+
+        for off in [0u64, 4096] {
+            let staged = core.submit_pwritev2_leased(
+                &mut eng,
+                0,
+                Arc::clone(&file),
+                // SAFETY: within `buf`, which outlives both submissions.
+                unsafe { buf.as_ptr().add(off as usize) },
+                4096,
+                off,
+                0,
+                std::sync::Arc::clone(&hold),
+                embed(Some((0, 0)), |_d, _fs| {}),
+            );
+            assert!(staged.is_ok(), "staged");
+        }
+        drop(hold); // as the facade does: only the ops hold shares now
+
+        let mut flight = inflight(&core);
+        flight.sort();
+        let [(ta, sa, ga), (tb, sb, gb)] = flight[..] else {
+            panic!("two ops in flight");
+        };
+        // First completion: SHORT. Its op fails EIO; the buffer is
+        // withheld because a sibling still reads it.
+        let ReapedFs::Embedded(_, mut a, _) =
+            core.on_cqe(&mut eng, ta, sa, ga, 100)
+        else {
+            panic!("an embedded waiter reaps embedded");
+        };
+        assert!(
+            matches!(a.result(), Err(crate::Error::Errno(Errno::EIO))),
+            "short fails its own op"
+        );
+        assert_eq!(
+            a.take_recv_lease(),
+            None,
+            "the buffer must not come back while a sibling reads it"
+        );
+        // Last completion: full. Its op succeeds and carries the id out.
+        let ReapedFs::Embedded(_, mut b, _) =
+            core.on_cqe(&mut eng, tb, sb, gb, 4096)
+        else {
+            panic!("an embedded waiter reaps embedded");
+        };
+        assert_eq!(b.result().ok(), Some(4096), "the sibling is unaffected");
+        assert_eq!(
+            b.take_recv_lease(),
+            Some(9),
+            "the last share surfaces the id exactly once"
+        );
     }
 
     /// The teardown drain answers a short leased write the same way the
@@ -3776,7 +3900,7 @@ mod routing_fuzz {
             buf.len(),
             0,
             0,
-            9,
+            std::sync::Arc::new(LeaseHold(9)),
             chan(&tx),
         );
         assert!(staged.is_ok(), "staged");

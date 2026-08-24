@@ -1691,22 +1691,37 @@ impl<U> Reactor<U> {
                 place,
             } => {
                 // Placement buys a move on delivery by allocating a buffer
-                // per body. A pooled connection already has one big enough,
-                // so paying for a second is pure churn - and on a streamed
-                // upload it is churn *per window*, which is the allocation
-                // this pool exists to remove. `frame_step` cannot see this:
-                // it is deliberately state-free, and this is connection
-                // state.
+                // per body. The pool makes that a bad trade twice over: a
+                // held claim big enough for the body means a second buffer
+                // is pure churn, and a connection with *no* claim gets one
+                // free with the read itself (the kernel picks at
+                // completion) - so placing there forfeits a zero-copy
+                // buffer to allocate a copied one. On a streamed upload the
+                // no-claim case is every mid-chunk window whose predecessor
+                // leased the claim to a write: at botocore's 1 MiB
+                // aws-chunks against a 128 KiB window that is seven windows
+                // in eight, each a placed allocation plus a full copy in
+                // `pwritev2_from`'s fallback. `frame_step` cannot see any
+                // of this: it is deliberately state-free, and this is
+                // connection state.
                 //
                 // The trade is a copy for a handler that wants to own the
                 // body (`Body::take` on a borrowed body copies, where a
                 // placed one moves). Handlers that stream a body out - the
-                // reason a body is this large - take nothing.
+                // reason a body is this large - take nothing. Placement
+                // remains for what the pool cannot serve: a body larger
+                // than one pool buffer, and a connection that fell back to
+                // owned storage.
+                let total = header_len.saturating_add(body_len);
+                let place =
+                    place && !self.table.conn(slot).recv_buf_covers(total);
+                #[cfg(feature = "net-server")]
                 let place = place
-                    && !self
-                        .table
-                        .conn(slot)
-                        .recv_buf_covers(header_len.saturating_add(body_len));
+                    && !(self.table.conn(slot).recv_needs_buffer()
+                        && self
+                            .recv_bufs
+                            .as_ref()
+                            .is_some_and(|pool| total <= pool.buf_len()));
                 self.table.conn_mut(slot).set_frame(header_len, body_len);
                 self.submit_recv(
                     slot,

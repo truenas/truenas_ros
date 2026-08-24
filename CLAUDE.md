@@ -259,19 +259,23 @@ Do not reopen these without a reason that is new.
   avoid - hence promoting. What does transfer is SPDK's dry-ring fallback, a
   plain `sock_readv` into the caller's buffer, which is the shape
   `set_recv_owned` already had.
-- **A pooled connection does not place a body its buffer already covers,
-  and `RECV_POOL_BUF` is sized so that it does.** Placement buys a move on
-  delivery by allocating a buffer per body; a connection holding a pool
-  buffer big enough is paying for a second one. On a streamed upload that is
-  an allocation *per window* - `STREAM_WINDOW` is 128 KiB and
-  `body_placement_threshold` defaults to 64 KiB, so before this every window
-  was placed and the pool covered request heads and nothing carrying data.
-  `a_streamed_upload_does_not_allocate_per_window` measures it with a
-  counting allocator: 32 large allocations for 4 MiB and 128 for 16 MiB
-  before, zero for both after. `frame_step` cannot make this call - it is
-  deliberately state-free - so `enact_frame_step` downgrades `place`. The
-  trade is a copy for a handler that takes ownership of a body in that size
-  range, which is why the threshold still governs anything larger.
+- **A pooled connection does not place a body the pool can serve** - one
+  its held claim already covers, or, with no claim, one that fits a pool
+  buffer (`RECV_POOL_BUF` is sized so a window does). Placement buys a move
+  on delivery by allocating a buffer per body; against a held claim the
+  second buffer is churn, and against no claim it forfeits the buffer the
+  read gets free (the kernel picks at completion) to allocate one
+  `pwritev2_from` must then copy. The no-claim case is the default client:
+  botocore frames 1 MiB aws-chunks, so seven windows in eight are mid-chunk
+  with the claim leased to the previous window's write - measured at 14
+  large allocations and 896 KiB copied per MiB, 87.5% of payload.
+  `a_streamed_upload_does_not_allocate_per_window` and
+  `a_streamed_put_at_botocore_chunks_still_does_not_copy` pin the two
+  cases. `frame_step` cannot make this call - it is deliberately
+  state-free - so `enact_frame_step` downgrades `place`. The trade is a
+  copy for a handler that takes ownership of a body in that size range,
+  which is why placement still governs anything a pool buffer cannot hold
+  and every unpooled connection.
 - **A placed body must not also be handed a pool buffer.** It reads into
   its own allocation, and the kernel clamps a selecting read down to the
   buffer it picked (`io_ring_buffer_select`, `io_uring/kbuf.c`), so an exact
@@ -305,15 +309,20 @@ Do not reopen these without a reason that is new.
   `Open` is for. `StreamPark::expect_interim` carries it;
   `a_deferred_stream_open_still_sends_the_interim` pins both routes.
 
-- **The write borrows the recv buffer; the claim is surrendered to the op,
-  not pinned on the connection.** `deliver_one` consumes the message the
-  moment the handler returns - `Defer` included - so anything that must
-  outlive the handler cannot live on the connection. `pwritev2_from`'s
-  submit records the buffer id on the op; `RecvBuf::drain_front` sees the
-  lease at consume and takes the claim *without* releasing it (keeping only
-  the pipelined remainder, which is empty on the streaming hot path); the
-  op's completion carries the id out on `FsDone::take_recv_lease` and the
-  server dispatch hands it to the pool. Release and forfeit refuse while
+- **The write borrows the recv buffer; the claim is surrendered to its
+  writes, not pinned on the connection.** `deliver_one` consumes the
+  message the moment the handler returns - `Defer` included - so anything
+  that must outlive the handler cannot live on the connection. Every
+  in-bounds range a delivery submits shares one `Arc<LeaseHold>`; each
+  op parks a share, and `Arc::into_inner` at reap surfaces the id from
+  exactly the completion that dropped the last one, so N ranges of one
+  window all write zero-copy and the buffer cannot come back while a
+  sibling's DMA still reads it. The facade keeps only a `Weak`, so it
+  never delays the release. `RecvBuf::drain_front` sees the lease at
+  consume and takes the claim *without* releasing it (keeping only the
+  pipelined remainder, which is empty on the streaming hot path); the
+  surfaced id rides `FsDone::take_recv_lease` and the server dispatch
+  hands it to the pool. Release and forfeit refuse while
   leased for the same reason: two owners releasing one bid re-posts a
   buffer the kernel may hand to a recv while the write's DMA still reads
   it. The ring's own state machine catches the double-release
@@ -364,22 +373,23 @@ Do not reopen these without a reason that is new.
   marker (chunked never parks with it). Bytes buffered behind the tail
   are the next pipelined request's;
   `pipelined_known_length_streams_do_not_desync` pins the handoff.
-- **A known-length window is sized to the buffered bytes, never past
-  them.** A window the buffer cannot fill makes the reactor read the rest
-  into an owned allocation: the exact fill lands on `take_body_handoff`'s
-  `header_len == 0 && len == body_len` predicate and takes the accumulate
-  buffer as an owned `Vec` once per window. Chunked windows dodge it by
-  carrying chunk-header bytes; pure payload does not.
-  `a_known_length_put_streams_without_copying` measures it - linear
-  allocations with a full-window framer, flat with the buffered bound. It
-  counts from `MED` rather than `BIG`, because the buffered bound is also
-  what makes these windows small: the reactor fills the recv buffer a
-  `RECV_CHUNK` at a time, so a known-length window is about 4 KiB and a
-  per-window copy of one never reaches a 64 KiB counting threshold. That
-  size is also why a known-length body costs roughly thirty times the
-  dispatches of a chunked one carrying the same payload - raising it means
-  changing what the reactor arms for a streamed body, not what the framer
-  declares.
+- **A known-length window is a full `STREAM_WINDOW`, however little is
+  buffered.** The exact read that completes it draws from the recv pool:
+  `known_step` answers `More` on an empty buffer, which re-acquires a
+  claim, and the reactor refuses to place a frame one pool buffer can
+  serve - so the remainder arrives zero-copy and the feared owned-handoff
+  fires only on an unpooled connection, where a per-window `Vec` is the
+  degraded mode's ordinary cost. This replaces an earlier bound to the
+  buffered bytes, whose windows were `RECV_CHUNK`-sized in practice:
+  ~33x the deliveries, eventfd wakes and leased writes per payload,
+  measured at 31x the pokes and 21x the `io_uring_enter` calls, while the
+  owned-allocation cost it guarded against measured zero on a pooled
+  connection. The `remaining` bound is what keeps a pipelined next
+  request out of the exhausting window's tail.
+  `a_known_length_put_streams_without_copying` still measures allocation
+  flatness (from `MED`, the tighter of the counting allocator's two
+  thresholds), and `a_known_length_body_streams_above_one_window` pins
+  the full-window law.
 
 ### The offload pool
 

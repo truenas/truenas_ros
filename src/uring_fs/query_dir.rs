@@ -710,9 +710,9 @@ fn pending_file(p: FsPending) -> Option<File> {
 /// `None` (absent / error / gone loop).
 fn pending_bytes(p: FsPending) -> Option<Vec<u8>> {
     let out = p.into_outcome().ok()?;
-    let n = out.res.ok()? as usize;
+    let n = usize::try_from(out.res.ok()?).ok()?;
     let buf = out.bufs.into_iter().next()?;
-    buf.get(..n).map(<[u8]>::to_vec)
+    narrow(buf, n)
 }
 
 /// Initial buffer for a discovered attribute's value read; larger values are
@@ -780,6 +780,23 @@ enum DiscRead {
     Drop,
 }
 
+/// Narrow an owned buffer to the `n` bytes the kernel filled.
+///
+/// The value is already *in* `buf`, so `truncate` reuses the allocation and the
+/// returned `Vec` is the one that went to the kernel. Slicing and copying it out
+/// instead costs a second allocation and a `memcpy` of the value, which at
+/// [`XATTR_SIZE_MAX`] is 2 MiB of each, per value read.
+///
+/// `None` if `n` is past what the buffer holds - `truncate` alone is silently a
+/// no-op there, and a count the buffer cannot account for is not a value.
+fn narrow(mut buf: Vec<u8>, n: usize) -> Option<Vec<u8>> {
+    if n > buf.len() {
+        return None;
+    }
+    buf.truncate(n);
+    Some(buf)
+}
+
 /// Classify a discovered attribute's `fgetxattr` outcome (see [`DiscRead`]).
 fn pending_discovered(p: FsPending) -> DiscRead {
     let Some(out) = p.into_outcome().ok() else {
@@ -790,7 +807,7 @@ fn pending_discovered(p: FsPending) -> DiscRead {
             .bufs
             .into_iter()
             .next()
-            .and_then(|b| b.get(..n as usize).map(<[u8]>::to_vec))
+            .and_then(|b| narrow(b, usize::try_from(n).ok()?))
         {
             Some(v) => DiscRead::Got(v),
             None => DiscRead::Drop,
@@ -822,7 +839,7 @@ fn refetch_grow(
         let cap = xattr_retry_cap(size, tries);
         let (n, buf) = h.fgetxattr(who, f, name, vec![0u8; cap]);
         match n {
-            Ok(n) => return buf.get(..n).map(<[u8]>::to_vec),
+            Ok(n) => return narrow(buf, n),
             Err(crate::Error::Errno(Errno::ERANGE | Errno::E2BIG)) => {
                 tries += 1;
                 if tries >= XATTR_SIZE_RETRIES {
@@ -1436,5 +1453,36 @@ mod order_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod narrow_tests {
+    use super::narrow;
+
+    /// The property, and the only one that distinguishes this from slicing the
+    /// value out: it comes back in the buffer that went to the kernel. Pointer
+    /// identity is the assertion, because length and contents look the same
+    /// either way.
+    #[test]
+    fn narrowing_reuses_the_buffer_instead_of_copying_it() {
+        let buf = vec![7u8; 4096];
+        let before = buf.as_ptr();
+        let got = narrow(buf, 10).expect("10 fits in 4096");
+        assert_eq!(got.as_ptr(), before, "the value was copied elsewhere");
+        assert_eq!(got.len(), 10);
+        assert_eq!(got.capacity(), 4096, "capacity shrank, so it reallocated");
+        assert!(got.iter().all(|&b| b == 7));
+    }
+
+    /// A count past the end must be refused, not ignored: `truncate` does
+    /// nothing there and would hand back the whole buffer as if the kernel had
+    /// filled it.
+    #[test]
+    fn a_count_past_the_end_is_refused_rather_than_ignored() {
+        assert!(narrow(vec![0u8; 16], 17).is_none());
+        assert!(narrow(vec![0u8; 16], usize::MAX).is_none());
+        assert_eq!(narrow(vec![0u8; 16], 16).map(|v| v.len()), Some(16));
+        assert_eq!(narrow(Vec::new(), 0).map(|v| v.len()), Some(0));
     }
 }
