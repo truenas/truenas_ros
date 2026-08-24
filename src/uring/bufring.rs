@@ -709,6 +709,16 @@ impl BufPool {
     /// That residue is bounded by the ring's ceiling and is no worse than
     /// what it replaces: a per-connection buffer that grew once stayed grown
     /// for the connection's life, and there were `pool_size` of them.
+    ///
+    /// The sample is taken at the arm sites, where the arming connection
+    /// itself holds no claim by definition - so a single serial connection
+    /// reads zero loans every time and walks the target down to one, which
+    /// for that workload is the right size; any second active connection
+    /// resets the count. The cost lands on the first burst after a quiet
+    /// stretch, one honest `-ENOBUFS` round trip per doubling back up.
+    /// Sampling a high-water mark since the last call instead would never
+    /// read zero on any serving workload, and a pool that can never see
+    /// idle never shrinks - so the sample stays instantaneous.
     pub(crate) fn rebalance(&mut self) {
         if self.ring.lent() > 0 {
             self.idle_rounds = 0;

@@ -1802,6 +1802,17 @@ impl<'a> FsConn<'a> {
     /// retry can ever be sound - a short leased write is therefore
     /// surfaced as `Err(EIO)` rather than as an `Ok(n)` inviting one.
     ///
+    /// The `EIO` carries no cause because none is knowable at this
+    /// completion: ZFS discards the breaking errno once
+    /// any progress was made (`zfs_write`, `module/zfs/zfs_vnops.c:1085-1094`
+    /// returns the partial count with no error), and io_uring folds a
+    /// post-progress errno into the positive count the same way
+    /// (`io_fixup_rw_res`, `io_uring/rw.c:563-574`) - so mapping the short
+    /// write to `ENOSPC` or `EDQUOT` would be a guess. A consumer that must
+    /// answer storage-full distinctly learns the cause from its next write
+    /// against the same file, which has made no progress to hide the errno
+    /// behind.
+    ///
     /// One leased write per delivery: the claim is one buffer and the op
     /// owns all of it once taken.
     ///

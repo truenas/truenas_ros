@@ -191,10 +191,15 @@ Do not reopen these without a reason that is new.
   `res = 0` with the flag set - measured - so the pump's abandon paths
   (`Reactor::requeue_body_bid` at each early return in `on_pump_read`)
   return the id or the ring drains one abandoned body at a time while
-  `recv_bufs_lent` stays flat. A read cancelled while *blocked* carries no
-  buffer (measured: io_uring recycles the selection at the `-EAGAIN`
-  punt), which is why cancellation alone cannot reproduce the leak and the
-  regression drives the EOF arm instead
+  `recv_bufs_lent` stays flat. A *socket* read cancelled while blocked
+  carries no buffer (measured: io_uring recycles the selection at the
+  `-EAGAIN` punt) - but only because a socket is pollable. A `READV` on a
+  regular file never is (`io_file_can_poll`, `io_uring/io_uring.h`), so
+  its kbuf is committed at selection (`io_should_commit`,
+  `io_uring/kbuf.c:183-189`) and a cancelled pump read *does* carry its
+  buffer - do not cite this entry to skip a requeue there. Cancellation
+  on the recv path cannot reproduce the leak, which is why the regression
+  drives the EOF arm instead
   (`a_truncated_body_close_returns_its_buffer`).
 - **A short leased write surfaces as `Err(EIO)`, never `Ok(n)`.** ZFS
   returns partial writes as successes by design (`zfs_write`,
