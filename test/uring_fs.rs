@@ -3731,6 +3731,76 @@ fn a_subtree_removed_between_pages_is_skipped_not_fatal() {
     });
 }
 
+/// The other half of the restore guard: a level that fails for a reason
+/// that is *not* a subtree skip aborts the resume.
+///
+/// `a_subtree_removed_between_pages_is_skipped_not_fatal` pins the skip
+/// half - EACCES/EPERM/ENOENT are levels the forward walk would have
+/// skipped too, so a resume that cannot re-enter them is still at the
+/// position it saved. Everything else is not: the cursor names a place the
+/// rebuild could not reach, so continuing from a shallower level would hand
+/// back a short listing with no error in it - which is data loss for the
+/// recursive copy and delete built on this.
+///
+/// Provoked by replacing the directory with a regular file between pages.
+/// The rebuild opens each level `O_DIRECTORY`, so the file answers ENOTDIR,
+/// which `is_subtree_skip` deliberately does not cover.
+#[test]
+fn a_level_that_became_a_file_between_pages_aborts_the_resume() {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        make_tree(&dir);
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+
+        let mut resume: Option<TreeCursor> = None;
+        let mut swapped = false;
+        loop {
+            let opened = query_tree(
+                &h,
+                me,
+                &anchor,
+                TreeOptions {
+                    resume: resume.clone(),
+                    ..Default::default()
+                },
+            );
+            if swapped {
+                // The page after the swap must refuse rather than resume
+                // somewhere shallower.
+                let err = match opened {
+                    Ok(_) => panic!(
+                        "a level the rebuild could not re-enter was resumed \
+                         past, not reported"
+                    ),
+                    Err(e) => e,
+                };
+                let truenas_ros::Error::IteratorRestore { path, .. } = &err
+                else {
+                    panic!("expected IteratorRestore, got {err:?}");
+                };
+                assert!(
+                    path.ends_with("c"),
+                    "the refusal names the level it could not rebuild: \
+                     {path:?}"
+                );
+                return;
+            }
+            let mut t = opened.expect("query_tree resumes");
+            let Some(e) = t.next() else {
+                panic!("a/c/ was never yielded");
+            };
+            let key = String::from_utf8(e.expect("entry").key()).unwrap();
+            if key == "a/c/" {
+                // The next page re-opens `a/c`. Replace it with a regular
+                // file so the rebuild's O_DIRECTORY open answers ENOTDIR.
+                std::fs::remove_dir_all(dir.join("a/c")).unwrap();
+                std::fs::write(dir.join("a/c"), b"").unwrap();
+                swapped = true;
+            }
+            resume = Some(t.cursor());
+        }
+    });
+}
+
 /// `skip_descent` and `cursor` are both documented delimiter primitives, so
 /// the obvious composition of them - fold a directory into a common prefix,
 /// then page - has to work. It is the page boundary that makes it hard: the

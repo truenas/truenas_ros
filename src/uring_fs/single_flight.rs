@@ -175,6 +175,67 @@ mod tests {
         assert_eq!(s.len(), 1);
     }
 
+    /// A key whose `Clone` can be made to panic, so the map lock can be
+    /// poisoned from inside `get_or_try_init` itself - `live.entry(k.clone())`
+    /// clones while the guard is alive.
+    #[derive(PartialEq, Eq, Hash)]
+    struct Bomb(u32, bool);
+
+    impl Clone for Bomb {
+        fn clone(&self) -> Bomb {
+            assert!(!self.1, "bomb");
+            Bomb(self.0, self.1)
+        }
+    }
+
+    /// A poisoned map fails **every** acquire, cache hits included.
+    ///
+    /// Poison handling in `get_or_try_init` is not uniform: the first map
+    /// acquisition reports `EIO`, the later ones swallow it. What makes
+    /// that safe is *position* - the first one precedes the cache-hit fast
+    /// path, so no stale identity is served out of a map whose consistency
+    /// the poison declared broken, and `IdentityCache::acquire` hands out
+    /// brokered identities from it.
+    ///
+    /// So this holds against the two edits that would quietly remove the
+    /// guarantee: making the first acquisition swallow poison like its
+    /// siblings, and lifting the fast path above it. A model on healthy
+    /// locks cannot see either.
+    #[test]
+    fn a_poisoned_map_fails_closed_before_the_cache_hit() {
+        let s: SingleFlight<Bomb, u32> = SingleFlight::new();
+        assert_eq!(
+            s.get_or_try_init(&Bomb(1, false), || Ok(10)).unwrap(),
+            10,
+            "the key is cached, so a later acquire could serve it from the \
+             fast path"
+        );
+
+        // Poison `live` from inside the first acquisition.
+        let poisoned =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = s.get_or_try_init(&Bomb(2, true), || Ok(0));
+            }));
+        assert!(poisoned.is_err(), "the fixture has to poison the map");
+
+        // The cached key must NOT come back now.
+        assert!(
+            matches!(
+                s.get_or_try_init(&Bomb(1, false), || Ok(10)),
+                Err(crate::Error::Errno(Errno::EIO))
+            ),
+            "a poisoned map served a cached identity"
+        );
+        // And a fresh key fails the same way rather than minting.
+        assert!(
+            matches!(
+                s.get_or_try_init(&Bomb(3, false), || panic!("must not mint")),
+                Err(crate::Error::Errno(Errno::EIO))
+            ),
+            "a poisoned map minted a new identity"
+        );
+    }
+
     #[test]
     fn invalidate_forces_the_next_mint() {
         let s = sf();

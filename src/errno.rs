@@ -263,6 +263,59 @@ where
     }
 }
 
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// Set `errno` and hand back the sentinel, as a failing syscall does.
+    fn fail_with(e: Errno) -> i32 {
+        // SAFETY: `__errno_location` returns this thread's errno slot.
+        unsafe { *libc::__errno_location() = e as i32 };
+        -1
+    }
+
+    /// `retry_on_eintr` retries `EINTR` and **nothing else**.
+    ///
+    /// It is the single retry primitive under the audit socket, the signal
+    /// fd's `ppoll`, the xattr calls, `openat2`, the credential broker's
+    /// request round trip and the atomic-write staging - every one of them
+    /// running in a daemon under signal load, which is exactly the traffic
+    /// no other test produces. Getting it wrong in one direction surfaces
+    /// spurious `EINTR` to all of them; in the other it spins forever on a
+    /// real error, so the call count is asserted as well as the result.
+    #[test]
+    fn eintr_is_retried_and_nothing_else_is() {
+        let calls = Cell::new(0);
+        let got = retry_on_eintr(|| {
+            calls.set(calls.get() + 1);
+            match calls.get() {
+                1 | 2 => fail_with(Errno::EINTR),
+                _ => 7,
+            }
+        });
+        assert_eq!(got, Ok(7), "the value after the interruptions");
+        assert_eq!(calls.get(), 3, "retried exactly the interrupted calls");
+
+        let calls = Cell::new(0);
+        let got = retry_on_eintr(|| {
+            calls.set(calls.get() + 1);
+            fail_with(Errno::EIO)
+        });
+        assert_eq!(got, Err(Errno::EIO), "a real error is returned");
+        assert_eq!(calls.get(), 1, "and is not retried - this would spin");
+
+        // Success first time round touches nothing.
+        let calls = Cell::new(0);
+        let got = retry_on_eintr(|| {
+            calls.set(calls.get() + 1);
+            0
+        });
+        assert_eq!(got, Ok(0));
+        assert_eq!(calls.get(), 1);
+    }
+}
+
 impl error::Error for Errno {}
 
 impl fmt::Display for Errno {

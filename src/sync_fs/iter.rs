@@ -974,6 +974,53 @@ impl Drop for Dir {
 /// internals; no mountable filesystem reaches it unprivileged.
 #[cfg(test)]
 mod tests {
+
+    /// A persisted cookie is attacker-adjacent input: it survives a crash
+    /// and a rebuild, and `from_bytes` sizes an allocation from a `u32`
+    /// read straight out of it. The depth bound has to be checked *before*
+    /// `Vec::with_capacity`, or a ten-byte blob declaring `u32::MAX`
+    /// entries reserves gigabytes - the same shape as
+    /// `a_declared_string_count_cannot_size_an_allocation` in
+    /// `mount/statmount.rs`. The version gate is the other half: a blob
+    /// from a format that no longer means what it says must be refused
+    /// rather than decoded.
+    #[test]
+    fn a_cookie_cannot_declare_a_version_or_a_depth_it_does_not_have() {
+        let good = Cookie::default().to_bytes();
+        assert!(
+            Cookie::from_bytes(&good).is_ok(),
+            "the fixture itself has to decode"
+        );
+
+        let mut wrong_version = good.clone();
+        wrong_version[4..6]
+            .copy_from_slice(&(COOKIE_VERSION + 1).to_ne_bytes());
+        assert!(
+            matches!(
+                Cookie::from_bytes(&wrong_version),
+                Err(Error::Validation(_))
+            ),
+            "an unknown cookie version must be refused, not decoded"
+        );
+
+        let mut huge = good.clone();
+        huge[6..10].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert!(
+            matches!(Cookie::from_bytes(&huge), Err(Error::Validation(_))),
+            "a declared depth past MAX_DEPTH must be refused before it \
+             sizes an allocation"
+        );
+
+        // The bound is inclusive of MAX_DEPTH and exclusive above it, and
+        // the refusal must not depend on the entries actually being there.
+        let mut at_bound = good.clone();
+        at_bound[6..10].copy_from_slice(&(MAX_DEPTH as u32 + 1).to_ne_bytes());
+        assert!(
+            matches!(Cookie::from_bytes(&at_bound), Err(Error::Validation(_))),
+            "one past the maximum depth is still refused"
+        );
+    }
+
     use super::*;
     use crate::sync_fs::StatxRaw;
 

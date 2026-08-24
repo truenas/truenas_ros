@@ -1904,6 +1904,158 @@ mod tests {
         assert!(matches!(conn.phase, Phase::Head));
     }
 
+    /// An expecting client on a *streaming* endpoint gets its interim when
+    /// the handler accepts at `Stage::Open`.
+    ///
+    /// Three routes owe the withheld interim and each carries its own
+    /// pin: the two deferred ones park first
+    /// (`a_deferred_stream_open_still_sends_the_interim`,
+    /// `a_redriven_stream_open_still_sends_the_interim`), and this is the
+    /// inline one. An interim withheld here stalls an expecting upload for
+    /// the client's own timeout.
+    #[test]
+    fn an_accepted_streamed_open_releases_the_withheld_interim() {
+        let head = b"PUT /up HTTP/1.1\r\nHost: h\r\n\
+                     Expect: 100-continue\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n";
+        let mut conn = HttpConn::new_streaming((), 1 << 20);
+        let p = peer();
+        assert_eq!(
+            frame(head, &mut conn, &cfg()),
+            Framing::Complete {
+                header_len: head.len(),
+                body_len: 0
+            }
+        );
+        let resp = drive_verdict(
+            head,
+            Body::inline(b""),
+            &p,
+            &mut conn,
+            &mut |req: HttpRequest<'_>, _: &mut ()| {
+                assert!(matches!(req.stage, Stage::Open));
+                HttpVerdict::Continue
+            },
+        );
+        assert_eq!(
+            text(&resp),
+            "HTTP/1.1 100 Continue\r\n\r\n",
+            "an accepted streamed open owes the interim it withheld"
+        );
+        assert!(
+            matches!(conn.phase, Phase::StreamBody { .. }),
+            "and the body phase is armed to receive what it just invited"
+        );
+    }
+
+    /// A refusal at `Stage::Open` goes out *instead of* the interim, and
+    /// closes.
+    ///
+    /// This is the whole point of dispatching the head before a body byte:
+    /// the peer has not committed yet. Answering while leaving the
+    /// connection open would let the declined body be framed as the next
+    /// request, and answering *after* a `100 Continue` would have invited a
+    /// body in order to refuse it.
+    ///
+    /// Two mechanisms close it here - `force_final` on this arm, and
+    /// `respond`'s own `abandons_body` disposition - so this asserts the
+    /// contract rather than either one, and it takes removing both to make
+    /// it fail.
+    #[test]
+    fn a_refused_streamed_open_answers_instead_of_inviting() {
+        let head = b"PUT /up HTTP/1.1\r\nHost: h\r\n\
+                     Expect: 100-continue\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n";
+        let mut conn = HttpConn::new_streaming((), 1 << 20);
+        let p = peer();
+        let _ = frame(head, &mut conn, &cfg());
+        let resp = drive_verdict(
+            head,
+            Body::inline(b""),
+            &p,
+            &mut conn,
+            &mut |_: HttpRequest<'_>, _: &mut ()| {
+                HttpVerdict::Respond(HttpResponse::new(403))
+            },
+        );
+        let s = text(&resp);
+        assert!(s.starts_with("HTTP/1.1 403 "), "{s}");
+        assert!(
+            !s.contains("100 Continue"),
+            "the refusal must replace the interim, not follow it: {s}"
+        );
+        assert!(is_close(&resp), "a declined body leaves nothing to frame");
+        assert!(s.contains("Connection: close\r\n"), "{s}");
+    }
+
+    /// A stream open during a drain is refused 503, not invited.
+    ///
+    /// The buffered twin is `dance_while_draining_is_refused_not_invited`,
+    /// and the reasoning is identical: a drain that accepts an upload it
+    /// will not read closes under a client mid-body, which the client
+    /// cannot tell from a truncation.
+    #[test]
+    fn a_streamed_open_while_draining_is_refused() {
+        let head = b"PUT /up HTTP/1.1\r\nHost: h\r\n\
+                     Expect: 100-continue\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n";
+        let mut conn = HttpConn::new_streaming((), 1 << 20);
+        let p = peer();
+        let _ = frame(head, &mut conn, &cfg());
+        let resp = step(
+            head,
+            Body::inline(b""),
+            &p,
+            Responder::test_responder_draining(),
+            FsSlot::default(),
+            &mut conn,
+            &mut DateCache::default(),
+            &mut |_: HttpRequest<'_>, _: &mut (), _fs: FsSlot<'_>| {
+                panic!("the handler must not run: the drain refuses first")
+            },
+        );
+        let s = text(&resp);
+        assert!(s.starts_with("HTTP/1.1 503 "), "{s}");
+        assert!(is_close(&resp), "a refusal, not the keep-alive interim");
+        assert!(
+            matches!(conn.phase, Phase::Head),
+            "nothing waits for a body that was never invited"
+        );
+    }
+
+    /// A delivery that owes a reply cannot be continued past.
+    ///
+    /// `Continue` is the streamed stages' verdict; at `Whole` or `End`
+    /// there is nothing further to read, so nothing would ever answer and
+    /// the connection would sit until a timeout. It closes instead, which
+    /// presents as slot exhaustion rather than a hang under load.
+    ///
+    /// Guarded twice - the `Stage`-testing arm in `dispatch` and `settle`'s
+    /// backstop - so this asserts the contract rather than either arm, and
+    /// it takes removing both to make it fail.
+    #[test]
+    fn continuing_past_a_delivery_that_owes_a_reply_closes() {
+        let head = b"GET /k HTTP/1.1\r\nHost: h\r\n\r\n";
+        let mut conn = HttpConn::new(());
+        let p = peer();
+        let _ = frame(head, &mut conn, &cfg());
+        let resp = drive_verdict(
+            head,
+            Body::inline(b""),
+            &p,
+            &mut conn,
+            &mut |req: HttpRequest<'_>, _: &mut ()| {
+                assert!(matches!(req.stage, Stage::Whole));
+                HttpVerdict::Continue
+            },
+        );
+        assert!(
+            matches!(resp, Response::Close),
+            "a Whole delivery answered with Continue owes a reply nobody \
+             will send"
+        );
+    }
+
     /// While draining, the dance's first message is refused with a close
     /// instead of being invited to send a body the drain will not read.
     #[test]

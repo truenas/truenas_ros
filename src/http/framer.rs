@@ -1148,6 +1148,42 @@ mod tests {
         assert!(matches!(c.phase, Phase::Fail { status: 413, .. }));
     }
 
+    /// The decoded cap holds on a *completing* arrival too.
+    ///
+    /// `chunked_decoded_over_cap_fails_413` drives the mid-stream branch,
+    /// where the scan answers `Ok(None)`; a body whose head, chunks and
+    /// terminator land in one read never passes through it. Without the
+    /// check on this arm the same bytes are accepted or refused on TCP
+    /// segmentation alone, which is a `max_body` bypass for any client
+    /// that can get its request into a single segment. The wire-cap twin
+    /// on this arm is pinned by `chunked_wire_overhead_fails_400_on_completion`.
+    #[test]
+    fn chunked_decoded_over_cap_fails_413_on_completion() {
+        let mut c = conn();
+        let small = HttpConfig {
+            max_head: 1024,
+            max_body: 10,
+        };
+        let head =
+            b"PUT /k HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut raw = head.to_vec();
+        // 11 decoded bytes, terminator included, all in one arrival.
+        raw.extend_from_slice(b"b\r\n0123456789A\r\n0\r\n\r\n");
+        assert_eq!(
+            frame(&raw, &mut c, &small),
+            Framing::Complete {
+                header_len: raw.len(),
+                body_len: 0
+            }
+        );
+        assert!(
+            matches!(c.phase, Phase::Fail { status: 413, .. }),
+            "a body that completes in one read still has to meet the cap: \
+             {:?}",
+            c.phase
+        );
+    }
+
     #[test]
     fn chunked_wire_overhead_fails_400() {
         // Decoded size stays in bounds but one-byte chunks inflate the wire

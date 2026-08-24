@@ -332,6 +332,65 @@ fn kernel_addr() -> libc::sockaddr_nl {
 mod tests {
     use super::*;
 
+    /// Build one `nlmsghdr` + `nlmsgerr` datagram by hand: `ty` at 4..6,
+    /// `seq` at 8..12, and the errno immediately after the 16-byte header.
+    fn ack(ty: u16, seq: u32, err: i32) -> Vec<u8> {
+        let mut b = vec![0u8; NLMSG_HDRLEN + 4];
+        b[4..6].copy_from_slice(&ty.to_ne_bytes());
+        b[8..12].copy_from_slice(&seq.to_ne_bytes());
+        b[16..20].copy_from_slice(&err.to_ne_bytes());
+        b
+    }
+
+    /// Every refusal `decode_ack` makes, on bytes that arrive from a socket
+    /// the kernel shares with every other netlink peer.
+    ///
+    /// The length guard is what stands between a short datagram and an
+    /// out-of-bounds index, and the sequence check is
+    /// what stops another peer's error being attributed to our record - a
+    /// failed audit send reported as delivered, or the reverse.
+    #[test]
+    fn an_ack_is_attributed_only_to_the_record_it_names() {
+        // Runt: shorter than the header, so nothing can be read from it.
+        for n in 0..NLMSG_HDRLEN {
+            assert!(
+                decode_ack(&vec![0u8; n], 7).is_none(),
+                "a {n}-byte datagram is not an attributable ack"
+            );
+        }
+        // Another record's ack, arriving late.
+        assert!(
+            decode_ack(&ack(NLMSG_ERROR, 6, 0), 7).is_none(),
+            "an ack for seq 6 must not answer seq 7"
+        );
+        // Ours, and the three dispositions it can carry.
+        assert!(matches!(
+            decode_ack(&ack(NLMSG_ERROR, 7, 0), 7),
+            Some(Ok(SendStatus::Delivered))
+        ));
+        for benign in [-libc::EPERM, -libc::ECONNREFUSED] {
+            assert!(
+                matches!(
+                    decode_ack(&ack(NLMSG_ERROR, 7, benign), 7),
+                    Some(Ok(SendStatus::Unavailable))
+                ),
+                "errno {benign} is unavailability, not failure"
+            );
+        }
+        assert!(
+            matches!(
+                decode_ack(&ack(NLMSG_ERROR, 7, -libc::EIO), 7),
+                Some(Err(Errno::EIO))
+            ),
+            "any other errno is the error it says it is"
+        );
+        // An NLMSG_ERROR truncated to the header alone carries no errno to
+        // read: it must not index past the buffer.
+        let mut short = ack(NLMSG_ERROR, 7, 0);
+        short.truncate(NLMSG_HDRLEN);
+        assert!(decode_ack(&short, 7).is_some());
+    }
+
     #[test]
     fn frame_lays_out_the_nlmsghdr() {
         let mut buf = Vec::new();

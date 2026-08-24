@@ -759,7 +759,11 @@ mod tests {
     /// A ring the kernel accepted, or `None` where io_uring is unavailable
     /// (a container without it). Skipping is loud in the caller.
     fn ring() -> Option<RingFd> {
-        RingFd::setup(8).ok()
+        match RingFd::setup(8) {
+            Ok(r) => Some(r),
+            Err(e) if crate::uring::setup_unavailable(e) => None,
+            Err(e) => panic!("io_uring_setup: {e}"),
+        }
     }
 
     /// Registration is where the ABI is easiest to get silently wrong: the

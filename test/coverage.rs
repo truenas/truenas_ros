@@ -3,6 +3,13 @@
 //! not reach across each subsystem.
 #![cfg(target_os = "linux")]
 
+// The `TRUENAS_ROS_REQUIRE_XATTRS` gate, shared with the live suites: a
+// filesystem that refuses xattrs must fail this suite loudly where CI arms
+// it, not skip the assertions behind the probe.
+#[cfg(feature = "xattr")]
+#[path = "support/xattr.rs"]
+mod xattr_probe;
+
 // ------------------------------------------------------------------ errno/error
 mod errno_error {
     use std::io;
@@ -373,7 +380,14 @@ mod xattr {
                 let _ = fremovexattr(f.as_fd(), "user.probe");
                 true
             }
-            Err(Errno::EOPNOTSUPP) => false,
+            Err(Errno::EOPNOTSUPP) => {
+                // Everything behind this probe is about to be skipped.
+                super::xattr_probe::refusal_is_allowed(
+                    "fsetxattr(user.probe)",
+                    Errno::EOPNOTSUPP,
+                );
+                false
+            }
             Err(e) => panic!("probe: {e}"),
         }
     }
@@ -1218,8 +1232,18 @@ mod fsiter {
         std::fs::write(&p, b"x").unwrap();
         let st =
             statx(AT_FDCWD, &p, AtFlags::empty(), StatxMask::BTIME).unwrap();
-        // Skip when the filesystem doesn't record a birth time.
+        // A filesystem with no birth time is a real case the builder
+        // handles (`a_cutoff_refuses_a_filesystem_with_no_birth_time` pins
+        // the refusal), so the skip is legitimate - but it takes the whole
+        // cutoff assertion with it, so a runner whose scratch filesystem
+        // reports no btime must say so rather than pass green.
         if !st.mask().contains(StatxMask::BTIME) || st.btime().sec <= 0 {
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_BTIME").is_none(),
+                "TRUENAS_ROS_REQUIRE_BTIME is set but {} reports no \
+                 birth time",
+                p.display()
+            );
             return;
         }
         let it = FsIterBuilder::new(dir.path(), fs_source(dir.path()))

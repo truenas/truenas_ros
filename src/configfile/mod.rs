@@ -1133,6 +1133,44 @@ mod tests {
         assert!(format!("{plain:?}").contains("hunter2"));
     }
 
+    /// Removing a non-last entry has to correct the recorded position of
+    /// everything after it.
+    ///
+    /// Every other removal test takes the last entry, where the fixup loop
+    /// is a no-op. `get`/`get_raw`/`has_option`/`set` all reach an entry
+    /// *through* `index`, so a stale position is not a crash - it is
+    /// `get_raw(s, "b")` quietly returning c's value, a silently mis-read
+    /// configuration - and the last key then indexes past the end.
+    #[test]
+    fn removing_a_middle_entry_keeps_the_rest_reachable() {
+        let mut cfg = ConfigFile::raw();
+        cfg.read_str("[s]\na = 1\nb = 2\nc = 3\n").expect("parses");
+        assert!(cfg.remove_option("s", "a").expect("section exists"));
+        assert_eq!(
+            cfg.options("s").expect("section exists"),
+            vec!["b".to_string(), "c".to_string()],
+            "order survives the removal"
+        );
+        assert_eq!(cfg.get_raw("s", "b").expect("present"), "2");
+        assert_eq!(cfg.get_raw("s", "c").expect("present"), "3");
+        // A write through the index must land on the key it names.
+        cfg.set("s", "c", Some("9")).expect("set");
+        assert_eq!(cfg.get_raw("s", "c").expect("present"), "9");
+        assert_eq!(
+            cfg.get_raw("s", "b").expect("present"),
+            "2",
+            "writing c must not land on b"
+        );
+
+        // The same for sections, whose index is the same structure.
+        let mut cfg = ConfigFile::raw();
+        cfg.read_str("[a]\nk = 1\n\n[b]\nk = 2\n\n[c]\nk = 3\n")
+            .expect("parses");
+        assert!(cfg.remove_section("a"));
+        assert_eq!(cfg.get_raw("b", "k").expect("present"), "2");
+        assert_eq!(cfg.get_raw("c", "k").expect("present"), "3");
+    }
+
     /// Overwrite, removal, and re-serialization behave identically in
     /// scrub mode: the burn happens on release, never in semantics.
     #[test]

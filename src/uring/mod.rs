@@ -19,6 +19,37 @@
 // code to prune.
 #![allow(dead_code)]
 
+/// Whether a ring that would not start is this environment rather than a
+/// defect - and, where CI arms `TRUENAS_ROS_REQUIRE_IO_URING`, not even
+/// that.
+///
+/// `EPERM`/`ENOSYS`/`EACCES` mean there is no io_uring here (an old kernel,
+/// seccomp, `kernel.io_uring_disabled`). `ENOMEM` is the memlock ceiling:
+/// every ring pins pages against `RLIMIT_MEMLOCK`, so a box running many
+/// test binaries at once exhausts it. **Everything else is a defect** -
+/// `EINVAL` above all, which is a rejected setup argument - and the caller
+/// must panic rather than skip every assertion behind it.
+///
+/// One definition, because the alternative is what it replaced: three
+/// unit-test skip helpers with three different ideas of "unavailable", one
+/// of which swallowed the lot with `.ok()` and took twenty-one tests with
+/// it.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn setup_unavailable(e: crate::errno::Errno) -> bool {
+    use crate::errno::Errno;
+    let environmental = matches!(
+        e,
+        Errno::EPERM | Errno::ENOSYS | Errno::EACCES | Errno::ENOMEM
+    );
+    if environmental {
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_IO_URING").is_none(),
+            "TRUENAS_ROS_REQUIRE_IO_URING set but io_uring unavailable: {e}"
+        );
+    }
+    environmental
+}
+
 #[cfg(feature = "net-server")]
 pub(crate) mod bufring;
 pub(crate) mod engine;
