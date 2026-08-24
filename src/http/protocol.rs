@@ -523,6 +523,18 @@ pub(crate) type FsSlot<'a> = Option<crate::uring_fs::FsConn<'a>>;
 #[cfg(not(feature = "uring-fs"))]
 pub(crate) type FsSlot<'a> = std::marker::PhantomData<&'a ()>;
 
+/// A second facade over the slot, for the one arm that dispatches twice
+/// (the window exhausting a known-length stream carries the End stage
+/// too). The recv-buffer claim moves to the split-off facade.
+#[cfg(feature = "uring-fs")]
+fn split_slot<'s>(fs: &'s mut FsSlot<'_>) -> FsSlot<'s> {
+    fs.as_mut().map(|c| c.reborrow())
+}
+#[cfg(not(feature = "uring-fs"))]
+fn split_slot<'s>(fs: &'s mut FsSlot<'_>) -> FsSlot<'s> {
+    *fs
+}
+
 /// What one handler invocation produced: a reactor verdict, or a park to
 /// file into the connection's phase.
 enum Dispatched {
@@ -824,15 +836,21 @@ where
         // interim line is withheld until the consumer has actually
         // accepted, so a refusal goes out *instead* of it rather than
         // after inviting a body nobody wanted.
-        Phase::StreamOpen { head, expect } => {
+        Phase::StreamOpen { head, expect, body } => {
             if responder.draining() {
                 return farewell(503, method_is_head(&head), dates);
             }
-            let next = Phase::StreamBody {
-                head: head.clone(),
-                chunk_left: 0,
-                after_payload: false,
-                decoded: 0,
+            let next = match body {
+                super::framer::StreamedBody::Chunked => Phase::StreamBody {
+                    head: head.clone(),
+                    chunk_left: 0,
+                    after_payload: false,
+                    decoded: 0,
+                },
+                super::framer::StreamedBody::Known(len) => Phase::StreamKnown {
+                    head: head.clone(),
+                    remaining: len,
+                },
             };
             let d = dispatch(
                 &head,
@@ -945,6 +963,74 @@ where
                 ),
             }
         }
+        // One window of a known-length streamed body: raw payload, no
+        // framing of its own, counted down against the declared length.
+        // The delivery that exhausts the length also carries the End
+        // stage: no wire byte is left to frame one from (the reactor
+        // refuses a zero-length message), so it runs here on the spot -
+        // or, if this window parks, when the park resumes.
+        Phase::StreamKnown { head, remaining } => {
+            let left = remaining.saturating_sub(body.len() as u64);
+            let mut fs = fs;
+            let d = dispatch(
+                &head,
+                body,
+                &[],
+                peer,
+                responder.split(),
+                split_slot(&mut fs),
+                &mut conn.state,
+                dates,
+                handler,
+                Stage::Window,
+            );
+            match d {
+                Dispatched::Continue if left == 0 => {
+                    let d = dispatch(
+                        &head,
+                        Body::inline(&[]),
+                        &[],
+                        peer,
+                        responder,
+                        fs,
+                        &mut conn.state,
+                        dates,
+                        handler,
+                        Stage::End,
+                    );
+                    settle(conn, d, None)
+                }
+                Dispatched::Continue => {
+                    conn.phase = Phase::StreamKnown {
+                        head,
+                        remaining: left,
+                    };
+                    Response::Reply(Vec::new())
+                }
+                Dispatched::Done(resp) => force_final(resp),
+                d => settle(
+                    conn,
+                    d,
+                    Some(super::framer::StreamPark {
+                        // An exhausted length owes only the End stage;
+                        // `StreamDone` is what the resume arm reads as
+                        // "dispatch it now, nothing further to frame".
+                        next: if left == 0 {
+                            Phase::StreamDone { head }
+                        } else {
+                            Phase::StreamKnown {
+                                head,
+                                remaining: left,
+                            }
+                        },
+                        stage: Stage::Window,
+                        // Mid-body: any interim went out when the open was
+                        // answered.
+                        expect_interim: false,
+                    }),
+                ),
+            }
+        }
         // The terminal chunk: the delivered header IS the trailer section,
         // so the trailers are parsed from it here rather than carried.
         Phase::StreamDone { head } => {
@@ -986,6 +1072,25 @@ where
                 // streaming phase to put back is a misuse of `defer_stream`
                 // outside a stream - nothing can be resumed, so close.
                 Some(ParkAnswer::Resume) => match resume {
+                    // A known-length stream whose exhausting window parked:
+                    // the length is fully consumed, so nothing remains to
+                    // frame an End delivery from. Dispatch it here instead,
+                    // off the resume itself.
+                    Some(r) if matches!(r.next, Phase::StreamDone { .. }) => {
+                        let d = dispatch(
+                            &head,
+                            Body::inline(&[]),
+                            &[],
+                            peer,
+                            responder,
+                            fs,
+                            &mut conn.state,
+                            dates,
+                            handler,
+                            Stage::End,
+                        );
+                        settle(conn, d, None)
+                    }
                     Some(r) => {
                         conn.phase = r.next;
                         // A deferred open accepted: release the withheld
@@ -1246,18 +1351,19 @@ where
 /// request bodies rather than buffering them.
 ///
 /// A chunked body is delivered a chunk at a time instead of once when its
-/// terminal chunk lands, so the largest body the endpoint accepts stops
-/// being a buffer size. The handler walks [`Stage::Open`] (the head, before
-/// any body byte), then one [`Stage::Window`] per chunk, then
-/// [`Stage::End`] once the trailers are parsed - and answers with
+/// terminal chunk lands, and a `Content-Length` body above one window a
+/// window at a time, so the largest body the endpoint accepts stops being
+/// a buffer size. The handler walks [`Stage::Open`] (the head, before any
+/// body byte), then [`Stage::Window`] per chunk or window, then
+/// [`Stage::End`] once any trailers are parsed - and answers with
 /// [`HttpVerdict::Continue`] until `End`, where the response belongs.
 ///
-/// `max_body_bytes` bounds the decoded body, checked as each chunk is
-/// declared. It is a parameter rather than a field on [`HttpConfig`]
-/// because [`HttpConfig::max_body`] is the bound a *buffered* delivery
-/// checks before reading, and a streamed body has no declared size to check
-/// against; whoever knows the protocol above knows the number (an S3 front
-/// bounds a part at 5 GiB).
+/// `max_body_bytes` bounds the body: for chunked the decoded size, checked
+/// as each chunk is declared; for `Content-Length` the declared length,
+/// checked at the head. It is a parameter rather than a field on
+/// [`HttpConfig`] because [`HttpConfig::max_body`] is the bound a
+/// *buffered* delivery checks before reading; whoever knows the protocol
+/// above knows this number (an S3 front bounds a part at 5 GiB).
 ///
 /// # What a streamed request does differently
 ///
@@ -1269,7 +1375,7 @@ where
 ///   The interim line is withheld until the handler returns
 ///   [`HttpVerdict::Continue`] from `Open`, so a refusal goes out *instead*
 ///   of the interim rather than after having invited a body.
-/// - **Nothing is retained between windows.** Each chunk's payload is
+/// - **Nothing is retained between windows.** Each window's payload is
 ///   dropped once the handler returns, so a handler that needs the body
 ///   must consume it as it arrives.
 ///

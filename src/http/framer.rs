@@ -66,9 +66,12 @@ pub struct HttpConfig {
     /// (enforced mid-stream as chunks arrive, not after buffering). Exceeding
     /// it answers `413 Content Too Large` and closes; a chunked wire extent
     /// more than `CHUNK_WIRE_OVERHEAD` past this cap answers 400. Bodies
-    /// above the cap belong to the (planned) splice path, not the connection
-    /// buffer. Raising it past the reactor's message cap requires raising
-    /// [`ServerConfig::max_request_bytes`] in step (see
+    /// above the cap belong on a streaming codec
+    /// ([`protocol_streaming`](super::protocol_streaming())), which bounds
+    /// them on its own and never holds one whole - on a streaming
+    /// connection this cap governs only the bodies small enough to arrive
+    /// as one delivery. Raising it past the reactor's message cap requires
+    /// raising [`ServerConfig::max_request_bytes`] in step (see
     /// [`HttpConfig::min_request_bytes`]), or the 413 path goes dead for
     /// the sizes in between.
     pub max_body: usize,
@@ -198,6 +201,18 @@ pub(crate) enum Phase {
         /// point of streaming: a rejection goes out instead of the interim,
         /// rather than after inviting a body nobody wanted.
         expect: bool,
+        /// Which body follows the open, so the glue restores the right
+        /// mid-body phase: a chunked body scans its own framing, a
+        /// known-length one counts down.
+        body: StreamedBody,
+    },
+    /// A known-length streamed body in progress: raw payload, delivered a
+    /// window at a time, with no framing of its own to scan.
+    StreamKnown {
+        /// The head every window is paired with.
+        head: Vec<u8>,
+        /// Payload bytes still owed by the declared length.
+        remaining: u64,
     },
     /// A streamed body in progress: the body is declared a window at a
     /// time, so the reactor's buffer never holds more than one and the
@@ -242,6 +257,17 @@ pub(crate) enum Phase {
         /// new request - a desync, not an error.
         resume: Option<Box<StreamPark>>,
     },
+}
+
+/// What a streamed open's body is framed as, decided at the head and
+/// carried so the open's delivery can restore the matching mid-body
+/// phase.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StreamedBody {
+    /// `Transfer-Encoding: chunked` — the body carries its own framing.
+    Chunked,
+    /// `Content-Length` — this many raw payload bytes and nothing else.
+    Known(u64),
 }
 
 /// A park taken mid-body: the phase to restore, and which stage the
@@ -415,6 +441,7 @@ pub(crate) fn frame<U>(
             }
         }
         Phase::StreamBody { .. } => stream_step(buf, conn),
+        Phase::StreamKnown { .. } => known_step(buf, conn),
         Phase::Head => {
             // In this phase the buffer front IS the head region, so the
             // method prefix is sound to read here - unlike at delivery,
@@ -469,6 +496,35 @@ pub(crate) fn frame<U>(
                     };
                     match body {
                         BodyKind::Known(body_len) => {
+                            // On a streaming connection a body above one
+                            // window streams: below that a whole delivery
+                            // is already a single pool-buffered read, so
+                            // there is nothing for a window to save. The
+                            // bound becomes the stream cap — the body
+                            // never sits in a buffer for `max_body` to
+                            // protect.
+                            if let Some(cap) = conn.stream_cap
+                                && body_len > STREAM_WINDOW
+                            {
+                                if body_len as u64 > cap {
+                                    return fail(
+                                        &mut conn.phase,
+                                        buf.len(),
+                                        413,
+                                        head_only,
+                                    );
+                                }
+                                let head_len = facts.len;
+                                conn.phase = Phase::StreamOpen {
+                                    head: buf[..head_len].to_vec(),
+                                    expect: facts.expects_continue,
+                                    body: StreamedBody::Known(body_len as u64),
+                                };
+                                return Framing::Complete {
+                                    header_len: head_len,
+                                    body_len: 0,
+                                };
+                            }
                             if body_len > cfg.max_body {
                                 return fail(
                                     &mut conn.phase,
@@ -504,6 +560,7 @@ pub(crate) fn frame<U>(
                             conn.phase = Phase::StreamOpen {
                                 head: buf[..head_len].to_vec(),
                                 expect: facts.expects_continue,
+                                body: StreamedBody::Chunked,
                             };
                             Framing::Complete {
                                 header_len: head_len,
@@ -561,6 +618,35 @@ pub(crate) fn frame<U>(
 /// **Re-entrant on purpose.** `frame` runs again for the same chunk while
 /// its payload is still arriving, so nothing here may advance
 /// `after_payload` - the glue does that once the payload is delivered.
+/// One step of a known-length streamed body: the next window, or the
+/// zero-byte delivery that hands the request to its `End`.
+fn known_step<U>(buf: &[u8], conn: &mut HttpConn<U>) -> Framing {
+    let Phase::StreamKnown { remaining, .. } = &conn.phase else {
+        // Caller invariant; nothing about the request is knowable here.
+        return fail(&mut conn.phase, 0, 500, false);
+    };
+    let remaining = *remaining;
+    if remaining == 0 {
+        // The glue retires this phase on the delivery that exhausts the
+        // length (a zero-length message cannot be framed), so a zero
+        // here is a codec bug, not a wire state.
+        return fail(&mut conn.phase, buf.len(), 500, false);
+    }
+    if buf.is_empty() {
+        return Framing::More;
+    }
+    // Sized to the buffered bytes, never past them: a window the buffer
+    // cannot fill would make the reactor read the rest into an owned
+    // allocation (placement / the body handoff), and the whole point of
+    // this phase is that windows deliver out of the recv pool. The
+    // `remaining` bound keeps a pipelined next request out of the tail.
+    Framing::Complete {
+        header_len: 0,
+        body_len: remaining.min(STREAM_WINDOW as u64).min(buf.len() as u64)
+            as usize,
+    }
+}
+
 fn stream_step<U>(buf: &[u8], conn: &mut HttpConn<U>) -> Framing {
     let Phase::StreamBody {
         head,
@@ -1181,6 +1267,165 @@ mod tests {
     /// goes out alone, each HTTP chunk is declared as its own message, and
     /// the terminal chunk closes it. No verdict ever names more than one
     /// chunk, which is what keeps the reactor's buffer off the body's size.
+    #[test]
+    fn a_known_length_body_streams_above_one_window() {
+        let mut c = HttpConn::new_streaming((), 1 << 30);
+        let len = STREAM_WINDOW * 2 + 5;
+        let head = format!(
+            "PUT /o HTTP/1.1\r\nHost: t\r\nContent-Length: {len}\r\n\r\n"
+        );
+        assert_eq!(
+            frame(head.as_bytes(), &mut c, &cfg()),
+            Framing::Complete {
+                header_len: head.len(),
+                body_len: 0
+            },
+            "the head goes out alone, exactly as a chunked open does"
+        );
+        assert!(matches!(
+            c.phase,
+            Phase::StreamOpen {
+                expect: false,
+                body: StreamedBody::Known(n),
+                ..
+            } if n == len as u64
+        ));
+
+        // The glue accepts and advances; windows count the length down,
+        // each sized to the buffered bytes so it delivers out of the
+        // recv pool rather than forcing an owned-allocation read.
+        c.phase = Phase::StreamKnown {
+            head: head.as_bytes().to_vec(),
+            remaining: len as u64,
+        };
+        assert_eq!(frame(&[], &mut c, &cfg()), Framing::More);
+        let burst = vec![0u8; STREAM_WINDOW + 9];
+        assert_eq!(
+            frame(&burst, &mut c, &cfg()),
+            Framing::Complete {
+                header_len: 0,
+                body_len: STREAM_WINDOW
+            },
+            "a full window caps the delivery"
+        );
+        assert_eq!(
+            frame(&burst[..7], &mut c, &cfg()),
+            Framing::Complete {
+                header_len: 0,
+                body_len: 7
+            },
+            "a short buffer delivers short rather than forcing a read"
+        );
+        c.phase = Phase::StreamKnown {
+            head: head.as_bytes().to_vec(),
+            remaining: 5,
+        };
+        assert_eq!(
+            frame(&burst, &mut c, &cfg()),
+            Framing::Complete {
+                header_len: 0,
+                body_len: 5
+            },
+            "the tail stops at the length; what follows is the next request"
+        );
+
+        // The glue retires the phase on the exhausting delivery itself;
+        // a zero remaining reaching the framer is a codec bug and gets
+        // the farewell, not a delivery that could eat pipelined bytes.
+        c.phase = Phase::StreamKnown {
+            head: head.as_bytes().to_vec(),
+            remaining: 0,
+        };
+        frame(b"GET /next HTTP/1.1\r\n", &mut c, &cfg());
+        assert!(matches!(c.phase, Phase::Fail { status: 500, .. }));
+    }
+
+    /// The boundary: at one window a whole delivery is one pool-buffered
+    /// read already, so nothing streams; one byte past it does.
+    #[test]
+    fn the_known_stream_threshold_is_one_window() {
+        let mut c = HttpConn::new_streaming((), 1 << 30);
+        let head = format!(
+            "PUT /o HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n",
+            STREAM_WINDOW
+        );
+        assert_eq!(
+            frame(head.as_bytes(), &mut c, &cfg()),
+            Framing::Complete {
+                header_len: head.len(),
+                body_len: STREAM_WINDOW
+            },
+            "at the window the body is delivered whole"
+        );
+
+        // On a plain connection nothing streams at any size the cap
+        // admits, so the streaming branch cannot leak into buffered
+        // servers.
+        let mut plain = conn();
+        let head = format!(
+            "PUT /o HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n",
+            STREAM_WINDOW + 1
+        );
+        assert!(matches!(
+            frame(head.as_bytes(), &mut plain, &cfg()),
+            Framing::Complete { body_len, .. } if body_len == STREAM_WINDOW + 1
+        ));
+    }
+
+    /// A declared length past the stream cap is refused at the head, and
+    /// `max_body` no longer bounds what streams.
+    #[test]
+    fn a_known_stream_is_bounded_by_the_stream_cap() {
+        let mut c = HttpConn::new_streaming((), 1 << 20);
+        let head = format!(
+            "PUT /o HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n",
+            (1 << 20) + 1
+        );
+        frame(head.as_bytes(), &mut c, &cfg());
+        assert!(matches!(c.phase, Phase::Fail { status: 413, .. }));
+
+        // Between max_body and the cap: streams rather than 413s.
+        let mut c = HttpConn::new_streaming((), 1 << 30);
+        let over_max_body = cfg().max_body + 1;
+        let head = format!(
+            "PUT /o HTTP/1.1\r\nHost: t\r\nContent-Length: \
+             {over_max_body}\r\n\r\n"
+        );
+        frame(head.as_bytes(), &mut c, &cfg());
+        assert!(
+            matches!(c.phase, Phase::StreamOpen { .. }),
+            "a streamed body is not the buffer max_body protects"
+        );
+    }
+
+    /// `Expect: 100-continue` on a streaming known-length body takes the
+    /// open — where the interim is withheld for the consumer's verdict —
+    /// never the buffered dance.
+    #[test]
+    fn an_expecting_known_stream_opens_instead_of_dancing() {
+        let mut c = HttpConn::new_streaming((), 1 << 30);
+        let head = format!(
+            "PUT /o HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\n\
+             Content-Length: {}\r\n\r\n",
+            STREAM_WINDOW + 1
+        );
+        assert_eq!(
+            frame(head.as_bytes(), &mut c, &cfg()),
+            Framing::Complete {
+                header_len: head.len(),
+                body_len: 0
+            }
+        );
+        assert!(matches!(
+            c.phase,
+            Phase::StreamOpen {
+                expect: true,
+                body: StreamedBody::Known(_),
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn a_streamed_body_is_declared_one_chunk_at_a_time() {
         let mut c = HttpConn::new_streaming((), 1 << 20);

@@ -1519,6 +1519,22 @@ impl<'a> FsConn<'a> {
         }
     }
 
+    /// A second facade over the same delivery, for a step that dispatches
+    /// twice (the window exhausting a known-length stream also carries the
+    /// End stage). The recv-buffer claim moves into the reborrow - the
+    /// first dispatch is the one with the body - so a leased write still
+    /// happens at most once per delivery.
+    pub(crate) fn reborrow(&mut self) -> FsConn<'_> {
+        FsConn {
+            fs: &mut *self.fs,
+            eng: &mut *self.eng,
+            owner: self.owner,
+            root: self.root,
+            #[cfg(feature = "net-server")]
+            lease: self.lease.take(),
+        }
+    }
+
     /// Offer the delivering connection's recv-buffer claim for
     /// [`pwritev2_from`](FsConn::pwritev2_from) to write from without
     /// copying. Delivery-time only.

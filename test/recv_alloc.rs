@@ -108,6 +108,17 @@ fn chunked_put(payload: &[u8], chunk: usize) -> Vec<u8> {
     wire
 }
 
+/// A `Content-Length` PUT: the head, then the raw payload.
+fn cl_put(payload: &[u8]) -> Vec<u8> {
+    let mut req = format!(
+        "PUT /o HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n",
+        payload.len()
+    )
+    .into_bytes();
+    req.extend_from_slice(payload);
+    req
+}
+
 fn read_status(s: &mut TcpStream) -> io::Result<u16> {
     let mut buf = Vec::new();
     let mut b = [0u8; 1];
@@ -385,12 +396,16 @@ fn serving_file_bodies_does_not_allocate_per_connection() {
 /// surrendered to the op, and the pool gets it back at the write's CQE. Any
 /// copy or allocation snuck back into that chain shows up in the count.
 #[cfg(feature = "uring-fs")]
-fn put_to_file_cost(mib: usize) -> Option<(usize, bool)> {
+fn put_to_file_cost(
+    mib: usize,
+    wire_of: fn(&[u8]) -> Vec<u8>,
+) -> Option<(usize, bool)> {
     use std::sync::OnceLock;
     use truenas_ros::http::HttpStreamDeferred;
     use truenas_ros::uring_fs::{Personality, RwFlags};
 
-    let dir = std::env::temp_dir().join(format!("ros-put-{mib}"));
+    let dir = std::env::temp_dir()
+        .join(format!("ros-put-{mib}-{:x}", wire_of as usize));
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("obj");
     let _ = std::fs::remove_file(&path);
@@ -490,7 +505,7 @@ fn put_to_file_cost(mib: usize) -> Option<(usize, bool)> {
     let stop = server.shutdown_handle();
 
     let payload = vec![0x9du8; mib * 1024 * 1024];
-    let wire = chunked_put(&payload, 128 * 1024);
+    let wire = wire_of(&payload);
 
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
@@ -535,10 +550,11 @@ fn put_to_file_cost(mib: usize) -> Option<(usize, bool)> {
 #[test]
 fn a_streamed_put_writes_windows_without_copying_them() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some((small, ok_small)) = put_to_file_cost(4) else {
+    let wire = |p: &[u8]| chunked_put(p, 128 * 1024);
+    let Some((small, ok_small)) = put_to_file_cost(4, wire) else {
         return; // io_uring unavailable
     };
-    let Some((large, ok_large)) = put_to_file_cost(16) else {
+    let Some((large, ok_large)) = put_to_file_cost(16, wire) else {
         return;
     };
     assert!(ok_small && ok_large, "file bytes differ from the upload");
@@ -550,6 +566,110 @@ fn a_streamed_put_writes_windows_without_copying_them() {
          allocations, 16 MiB cost {large}. A copy fallback or a park that \
          retains the window looks exactly like this."
     );
+}
+
+/// A `Content-Length` body above one window streams exactly as a chunked
+/// one: windows from the receive ring, leased writes, no copy and no
+/// per-window allocation. The harness's `Whole` arm answers 500, so a
+/// body this size that fails to stream fails the test outright — the
+/// regression this exists to catch is precisely a silent fall back to
+/// buffering.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn a_known_length_put_streams_without_copying() {
+    let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((small, ok_small)) = put_to_file_cost(4, cl_put) else {
+        return; // io_uring unavailable
+    };
+    let Some((large, ok_large)) = put_to_file_cost(16, cl_put) else {
+        return;
+    };
+    assert!(ok_small && ok_large, "file bytes differ from the upload");
+    assert!(
+        large <= small + 8,
+        "CL PUT-to-file cost scales with payload: 4 MiB cost {small}, \
+         16 MiB cost {large} large allocations. A copy fallback or a \
+         park that retains the window looks exactly like this."
+    );
+}
+
+/// Two known-length streamed PUTs pipelined on one connection.
+///
+/// The End handoff consumes zero bytes, so the second request's head —
+/// already buffered behind the first body — must frame cleanly rather
+/// than be eaten as a trailer section. Answered wrong, the connection
+/// desyncs and the second status never arrives.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn pipelined_known_length_streams_do_not_desync() {
+    use std::sync::atomic::AtomicUsize;
+
+    let opens = std::sync::Arc::new(AtomicUsize::new(0));
+    let ends = std::sync::Arc::new(AtomicUsize::new(0));
+    let (o, e) = (std::sync::Arc::clone(&opens), std::sync::Arc::clone(&ends));
+    let proto = truenas_ros::http::protocol_streaming_fs(
+        HttpConfig::default(),
+        1 << 30,
+        |_i: Incoming<'_>| Some(0u64),
+        move |req: HttpRequest<'_>, got: &mut u64, _fs| match req.stage {
+            Stage::Open => {
+                o.fetch_add(1, Ordering::Relaxed);
+                *got = 0;
+                HttpVerdict::Continue
+            }
+            Stage::Window => {
+                *got += req.body.len() as u64;
+                HttpVerdict::Continue
+            }
+            Stage::End => {
+                e.fetch_add(1, Ordering::Relaxed);
+                HttpVerdict::Respond(
+                    HttpResponse::new(200).header("x-bytes", got.to_string()),
+                )
+            }
+            Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
+        },
+    )
+    .expect("codec config");
+
+    let cfg = ServerConfig {
+        pool_size: 4,
+        max_request_bytes: 512 * 1024,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let mut s = TcpStream::connect(v4).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        // Both requests in one write: the second head sits in the buffer
+        // behind the first body when the End handoff runs.
+        let first = cl_put(&vec![0x51u8; 300 * 1024]);
+        let second = cl_put(&vec![0x52u8; 200 * 1024]);
+        let mut wire = first;
+        wire.extend_from_slice(&second);
+        s.write_all(&wire).expect("write");
+        let one = read_status(&mut s).expect("first status");
+        let two = read_status(&mut s).expect("second status");
+        stop.shutdown();
+        (one, two)
+    });
+
+    server.serve_forever().expect("serve_forever");
+    let (one, two) = client.join().expect("client thread");
+    assert_eq!((one, two), (200, 200));
+    assert_eq!(opens.load(Ordering::Relaxed), 2, "both requests opened");
+    assert_eq!(ends.load(Ordering::Relaxed), 2, "both requests ended");
 }
 
 // ---- pipelined ingest: K windows in flight per connection ------------------

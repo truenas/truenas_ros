@@ -347,6 +347,25 @@ Do not reopen these without a reason that is new.
   against zero inside the wall, which is
   `a_pipelined_put_overlaps_writes_with_arrivals`'s negative control.
   Descriptor slots are 16 bytes, so the headroom is free.
+- **A `Content-Length` body streams only above one window, and its End
+  stage rides the delivery that exhausts the length.** At or under
+  `STREAM_WINDOW` a whole delivery is one pool-buffered read already, so
+  streaming it would add Open/End dispatches and save nothing. Above it,
+  no wire byte remains to frame an End from and the reactor refuses a
+  zero-length message (`frame_step`, fuzz-pinned), so the exhausting
+  window's step dispatches End inline on `Continue` - or from the resume
+  when that window parked, with a restore phase of `StreamDone` as the
+  marker (chunked never parks with it). Bytes buffered behind the tail
+  are the next pipelined request's;
+  `pipelined_known_length_streams_do_not_desync` pins the handoff.
+- **A known-length window is sized to the buffered bytes, never past
+  them.** A window the buffer cannot fill makes the reactor read the rest
+  into an owned allocation: the exact fill lands on `take_body_handoff`'s
+  `header_len == 0 && len == body_len` predicate and takes the accumulate
+  buffer as an owned `Vec` once per window. Chunked windows dodge it by
+  carrying chunk-header bytes; pure payload does not.
+  `a_known_length_put_streams_without_copying` measures it - linear large
+  allocations with a full-window framer, flat with the buffered bound.
 
 ### The offload pool
 
