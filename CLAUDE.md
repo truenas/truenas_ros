@@ -6,11 +6,11 @@ merits rather than rediscovered.
 
 ## The crate's charter
 
-`libc` + `bitflags`, MSRV 1.97. A new runtime dependency is a design decision,
-not a convenience - the one exception (`httparse`, for the HTTP request-head
-tokenizer) is argued for in `Cargo.toml`. Dev-only crates in a separate,
-self-rooted workspace (`fuzz/`) do not count against this and do not have to
-hold the MSRV.
+`libc` + `bitflags`, MSRV 1.97.1. A new runtime dependency is a design
+decision, not a convenience - the one exception (`httparse`, for the HTTP
+request-head tokenizer) is argued for in `Cargo.toml`. Dev-only crates in a
+separate, self-rooted workspace (`fuzz/`) do not count against this and do
+not have to hold the MSRV.
 
 Every feature must build alone. `cargo build --no-default-features --features
 <one>` is part of the gate, because the per-subsystem gates and dependency
@@ -31,10 +31,11 @@ visibility. `__fuzz` is outside `default` and `full`. See
   *Validating against the platform* below for which revision of each is the
   one that counts.
 - Two CI workflows, and they prove different things:
-  - `ci.yml` - unprivileged `ubuntu-latest`. fmt, clippy, tests, the feature
-    matrix, loom, and the fuzz build. The hosted runner's fd limit is orders
-    of magnitude below a typical dev box's, so a test that leans on
-    descriptors fails here and nowhere else; reproduce with `ulimit -Sn 1024`.
+  - `ci.yml` - unprivileged `ubuntu-latest`. fmt, clippy, tests (debug and
+    release), the feature matrix, loom, and the fuzz build. The hosted
+    runner's fd limit is orders of magnitude below a typical dev box's, so
+    a test that leans on descriptors fails here and nowhere else; reproduce
+    with `ulimit -Sn 1024`.
   - `qemu-test.yml` - a real TrueNAS kernel in a VM, over ssh as root, with
     ZFS datasets (`scripts/qemu-*.sh`, staged 1..6). This is the authority for
     anything privileged: ACLs on a real dataset, mount/idmap,
@@ -191,10 +192,15 @@ Do not reopen these without a reason that is new.
   `res = 0` with the flag set - measured - so the pump's abandon paths
   (`Reactor::requeue_body_bid` at each early return in `on_pump_read`)
   return the id or the ring drains one abandoned body at a time while
-  `recv_bufs_lent` stays flat. A read cancelled while *blocked* carries no
-  buffer (measured: io_uring recycles the selection at the `-EAGAIN`
-  punt), which is why cancellation alone cannot reproduce the leak and the
-  regression drives the EOF arm instead
+  `recv_bufs_lent` stays flat. A *socket* read cancelled while blocked
+  carries no buffer (measured: io_uring recycles the selection at the
+  `-EAGAIN` punt) - but only because a socket is pollable. A `READV` on a
+  regular file never is (`io_file_can_poll`, `io_uring/io_uring.h`), so
+  its kbuf is committed at selection (`io_should_commit`,
+  `io_uring/kbuf.c:183-189`) and a cancelled pump read *does* carry its
+  buffer - do not cite this entry to skip a requeue there. Cancellation
+  on the recv path cannot reproduce the leak, which is why the regression
+  drives the EOF arm instead
   (`a_truncated_body_close_returns_its_buffer`).
 - **A short leased write surfaces as `Err(EIO)`, never `Ok(n)`.** ZFS
   returns partial writes as successes by design (`zfs_write`,
@@ -524,6 +530,18 @@ Prove a test bites before trusting it. Break the thing it guards, watch it
 fail, restore. This applies to loom models too - the negative control is the
 evidence that the model is checking anything.
 
+**A guard written as `debug_assert` plus an `if` needs a test per half, and
+the gate runs both builds.** `should_panic` on the assert covers the build
+that panics and is vacuous in the one that ships - it fails outright there,
+having nothing to catch - so those tests carry `#[cfg(debug_assertions)]` and
+a `#[cfg(not(debug_assertions))]` sibling asserts the `if`'s behaviour on
+*state* instead. That is not a formality where the `if` is what stands between
+a double release and two descriptors naming one buffer: see
+`releasing_one_id_twice_is_refused{,_without_asserts}` and
+`promote_under_a_lease_fails_closed{,_without_asserts}`. Note that release
+turns an arithmetic guard's failure from a panic into a wrap, so the state a
+sibling test asserts on is the wrapped value, not an abort.
+
 Know what your environment hides. Running as **root** means DAC never denies
 anything, so an `EACCES` path cannot be provoked directly - go through a
 brokered unprivileged personality, or pin the predicate as a unit test. A
@@ -590,6 +608,7 @@ cargo fmt --all --check
 cargo fmt --all --check --manifest-path fuzz/Cargo.toml   # its own workspace
 cargo clippy --all-features --all-targets -- -D warnings
 cargo test --all-features --no-fail-fast
+cargo test --release --all-features --no-fail-fast   # the guards that ship
 RUSTFLAGS="--cfg loom" cargo test --lib --features uring    loom_
 RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
 RUSTFLAGS="--cfg loom" cargo test --lib --features http     loom_

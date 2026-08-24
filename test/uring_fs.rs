@@ -104,7 +104,13 @@ fn xattr_name(name: &str) -> CString {
 fn should_skip(e: &Error) -> bool {
     let unavailable = matches!(
         e,
-        Error::Errno(Errno::EPERM | Errno::ENOSYS | Errno::EACCES)
+        // ENOMEM: rings pin pages against RLIMIT_MEMLOCK, so a loaded
+        // box exhausts it and ring creation fails - environmental, and
+        // the REQUIRE variable turns the skip red where it must not
+        // happen.
+        Error::Errno(
+            Errno::EPERM | Errno::ENOSYS | Errno::EACCES | Errno::ENOMEM
+        )
     );
     if unavailable {
         assert!(

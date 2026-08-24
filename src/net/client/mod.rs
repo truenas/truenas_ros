@@ -191,7 +191,10 @@ where
     /// (never block the loop thread), run the client TLS handshake there - which
     /// installs kTLS on the socket (e.g. OpenSSL with `SSL_OP_ENABLE_KTLS`) --
     /// then call [`ConnectDeferral::ready`] on success or
-    /// [`ConnectDeferral::reject`] on failure. Close the furnished fd once the
+    /// [`ConnectDeferral::reject`] on failure. `ready` confirms both TLS
+    /// directions actually hold kernel keys and fails the connect
+    /// otherwise, so a handshake that silently failed to install kTLS
+    /// cannot be served in the clear. Close the furnished fd once the
     /// handshake is done; the connection is then served over the pool descriptor
     /// (kTLS lives on the shared socket).
     ///

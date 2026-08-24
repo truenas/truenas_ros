@@ -78,8 +78,20 @@ where
     ) -> errno::Result<()> {
         // A completion carrying `IORING_CQE_F_BUFFER` selected one from the
         // pool: adopt it before the bytes are read, so the framer sees them
-        // where the kernel put them.
-        self.core.adopt_recv_buffer(slot, generation, cqe_flags);
+        // where the kernel put them. A refused adopt means the completion
+        // names a buffer the pool cannot vouch for, so its bytes cannot be
+        // located and framing from the (never-installed) claim would read
+        // garbage as the peer's - fail the read instead.
+        if !self.core.adopt_recv_buffer(slot, generation, cqe_flags) {
+            if self.core.table.slot_matches_cqe(slot, generation) {
+                return self.core.close_conn(
+                    slot,
+                    generation,
+                    CloseReason::RecvError(errno::Errno::EIO),
+                );
+            }
+            return Ok(());
+        }
         match self.core.on_recv_complete(slot, generation, res, op)? {
             RecvStep::Deliver => {
                 self.deliver_one(slot, generation)?;
@@ -823,19 +835,20 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             // The kernel filled a ring buffer and named it. The segment
             // borrows it and the id goes back when the chunk flushes.
             Some(bid) => {
+                // The verified pick: refused for an id the pool does not
+                // hold `Posted` - a descriptor desync. Nothing of the
+                // pool's is behind such an id, so there is nothing to
+                // requeue; the chunk's bytes cannot be located, so the
+                // body cannot continue.
                 let Some((ptr, _cap)) =
-                    self.core.body_bufs.as_mut().and_then(|p| p.addr_of(bid))
+                    self.core.body_bufs.as_mut().and_then(|p| p.take_lent(bid))
                 else {
-                    self.core.requeue_body_bid(Some(bid));
                     return self.core.close_conn(
                         slot,
                         generation,
                         CloseReason::FileBody(errno::Errno::EIO),
                     );
                 };
-                if let Some(pool) = self.core.body_bufs.as_mut() {
-                    pool.lend(bid);
-                }
                 // SAFETY: `n` bytes of buffer `bid`, which stays lent until
                 // the chunk flushes and `advance_sent` hands the id back.
                 unsafe {

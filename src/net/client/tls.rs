@@ -68,15 +68,31 @@ pub struct ConnectDeferral {
     tx: mpsc::Sender<HandshakeResult>,
     shared: Arc<LoopShared>,
     done: bool,
+    /// The deferral's own alias of the socket, for [`ready`]'s key
+    /// readback (`ConnectDeferral::ready`). A dup rather than the furnished
+    /// fd's number, because the worker owns that fd and may close it - a
+    /// number can be reused, an open description cannot.
+    sock: std::os::fd::OwnedFd,
 }
 
 impl ConnectDeferral {
     /// The handshake succeeded and kTLS is active on the socket: install the
     /// connection (with the state the caller supplied at connect) and begin
     /// serving it over the kernel-TLS transport. Consumes the handle.
+    ///
+    /// The worker's word is checked against the kernel before anything is
+    /// served: both TLS directions must actually hold keys
+    /// (`getsockopt(SOL_TLS, TLS_TX/TLS_RX)`), or the connect fails as if
+    /// rejected. A socket the kernel never keyed (a handshake library that
+    /// silently fell back to userspace records, or keyed only one
+    /// direction) passes bytes through in the clear, so serving it as
+    /// encrypted would publish plaintext framed as TLS.
     pub fn ready(mut self) {
         self.done = true;
-        self.send(true);
+        let keyed = crate::net::core::probe::ktls_keyed_both_ways(
+            std::os::fd::AsRawFd::as_raw_fd(&self.sock),
+        );
+        self.send(keyed);
     }
 
     /// The handshake failed (or the connection is unwanted): fail the connect
@@ -216,12 +232,26 @@ where
         // handler. Disjoint-field borrows: the handshake channel + shared flags
         // (for the deferral), the table (for the dialed address), and the hook.
         let gen64 = self.core.table.generation(slot);
+        // The deferral's own alias of the socket, for ready()'s key
+        // readback. Fail closed like the staging arm above: a connection
+        // whose keys can never be confirmed must not be servable.
+        let Some(sock) = crate::fd::dup_cloexec(fd) else {
+            // SAFETY: `fd` is the furnished fd we never delivered to a worker.
+            unsafe { libc::close(fd) };
+            self.parked_handshakes -= 1;
+            if let Some(p) = self.core.table.take_tls_connecting(slot) {
+                self.core.table.park_tls(slot, Box::new(p.peer));
+                let _ = self.core.submit_teardown(slot, generation, true);
+            }
+            return Ok(());
+        };
         let deferral = ConnectDeferral {
             slot,
             generation: gen64,
             tx: self.handshake_tx.clone(),
             shared: Arc::clone(&self.core.engine.shared),
             done: false,
+            sock,
         };
         let conn = ConnId::new(slot, gen64);
         match self.tls_connect.as_mut() {

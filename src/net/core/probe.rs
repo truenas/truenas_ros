@@ -1,6 +1,8 @@
-//! Construction-time kernel capability probes (and the getsockopt `URING_CMD`
-//! filler they share): fail fast with a clear validation error instead of
-//! mysteriously shedding every connection at accept time.
+//! Kernel capability probes: the construction-time ones (and the getsockopt
+//! `URING_CMD` filler they share), which fail fast with a clear validation
+//! error instead of mysteriously shedding every connection at accept time,
+//! and the per-handshake kTLS key readback a `ready()` runs before a
+//! connection is served as encrypted.
 
 use crate::errno::Errno;
 use crate::error::Error;
@@ -9,6 +11,41 @@ use crate::uring::ring::Ring;
 use crate::uring::sys::*;
 use std::mem::size_of;
 use std::os::fd::AsRawFd;
+
+/// Do the kernel's TLS TX **and** RX directions both hold keys on `fd`?
+///
+/// The per-direction oracle is `getsockopt(SOL_TLS, TLS_TX/TLS_RX)` with
+/// the 4-byte `tls_crypto_info` header: it answers 0 only once that
+/// direction's keys are installed, `-EBUSY` for a ULP with no keys, and
+/// `-ENOPROTOOPT` with no ULP at all (`do_tls_getsockopt_conf`,
+/// `net/tls/tls_main.c` - `TLS_CRYPTO_INFO_READY` gates the copy-out).
+///
+/// This is what stands between a worker's `ready()` word and the wire: a
+/// socket the kernel never keyed - or keyed in one direction - passes
+/// bytes through in the clear, so serving it as encrypted publishes
+/// plaintext. Measured on this kernel: ULP with no keys and RX-only both
+/// leave TX in the clear.
+pub(crate) fn ktls_keyed_both_ways(fd: std::os::fd::RawFd) -> bool {
+    let keyed = |dir: i32| {
+        // The 4-byte header form (version + cipher_type): the kernel
+        // refuses anything shorter and fills exactly this much when asked,
+        // so the probe needs no per-cipher sizing.
+        let mut info = [0u8; 4];
+        let mut len = info.len() as libc::socklen_t;
+        // SAFETY: writes at most `len` bytes into `info`.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                SOL_TLS,
+                dir,
+                info.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        rc == 0
+    };
+    keyed(TLS_TX) && keyed(TLS_RX)
+}
 
 /// Fill `sqe` as a `SOCKET_URING_OP_GETSOCKOPT(SOL_SOCKET, optname)` command
 /// reading `optlen` bytes into `optval` (which must be a stable address until

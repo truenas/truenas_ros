@@ -1263,7 +1263,10 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     /// your own worker (never block the ring thread), run the TLS handshake
     /// there - which installs kTLS on the socket (e.g. OpenSSL with
     /// `SSL_OP_ENABLE_KTLS`) - then call [`AcceptDeferral::ready`] with the
-    /// per-connection state, or [`AcceptDeferral::reject`] on failure. Close
+    /// per-connection state, or [`AcceptDeferral::reject`] on failure.
+    /// `ready` confirms both TLS directions actually hold kernel keys and
+    /// sheds the connection otherwise, so a handshake that silently failed
+    /// to install kTLS cannot be served in the clear. Close
     /// the furnished fd once the handshake is done; the connection is then
     /// served over the pool descriptor (kTLS lives on the shared socket).
     /// The per-connection state `U` must be `Send` (it crosses back from the

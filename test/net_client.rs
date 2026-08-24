@@ -45,7 +45,13 @@ use truenas_ros::{Errno, Error};
 fn is_unavailable(e: &Error) -> bool {
     matches!(
         e,
-        Error::Errno(Errno::EPERM | Errno::ENOSYS | Errno::EACCES)
+        // ENOMEM: rings pin pages against RLIMIT_MEMLOCK, so a loaded
+        // box exhausts it and ring creation fails - environmental, and
+        // the REQUIRE variable turns the skip red where it must not
+        // happen.
+        Error::Errno(
+            Errno::EPERM | Errno::ENOSYS | Errno::EACCES | Errno::ENOMEM
+        )
     )
 }
 
@@ -1231,6 +1237,70 @@ fn ktls_rejected_handshake() {
         other => panic!("expected ConnectFailed, got {other:?}"),
     }
     assert!(!client.is_open(conn), "a rejected connect is not open");
+    server.join().ok();
+}
+
+/// The client-side twin of the server's key readback: a worker's
+/// `ready()` on a socket the kernel never keyed fails the connect rather
+/// than installing a "kTLS" connection the kernel is passing through in
+/// the clear. A raw TCP peer suffices: the TCP connect completes, the fd
+/// is furnished, and the worker claims success without a handshake.
+#[test]
+fn ktls_ready_without_kernel_keys_fails_the_connect() {
+    let mut client = match Client::new(ClientConfig::default(), client_framer())
+    {
+        Ok(c) => c,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("client new: {e}"),
+    };
+    client.set_tls_handshake(|fd, _c, deferral| {
+        thread::spawn(move || {
+            // SAFETY: close the furnished fd we won't use; the readback
+            // rides the deferral's own dup, not a number that may be
+            // reused.
+            unsafe { libc::close(fd) };
+            deferral.ready();
+        });
+    });
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let SocketAddr::V4(v4) = listener.local_addr().unwrap() else {
+        unreachable!("bound v4");
+    };
+    let server = thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            thread::sleep(Duration::from_millis(500));
+            drop(stream);
+        }
+        drop(listener);
+    });
+
+    let conn = match client
+        .connect_start(ServerAddr::Tcp(v4), ConnectOpts::default().tls())
+    {
+        Ok(c) => c,
+        Err(e) if ktls_connect_unsupported(&e) => {
+            // Unblock the helper's accept() so the join below returns.
+            let _ = TcpStream::connect(v4);
+            server.join().ok();
+            return;
+        }
+        Err(e) => panic!("connect_start: {e}"),
+    };
+    match client.next_event().expect("next_event") {
+        Some(Event::ConnectFailed { conn: c, err }) => {
+            assert_eq!(c, conn, "ConnectFailed for the wrong connection");
+            assert_eq!(
+                err,
+                Errno::ECONNABORTED,
+                "an unkeyed ready() fails the connect"
+            );
+        }
+        other => panic!(
+            "a ready() with no kernel keys installed a connection: {other:?}"
+        ),
+    }
+    assert!(!client.is_open(conn), "an unkeyed connect is not open");
     server.join().ok();
 }
 

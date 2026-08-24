@@ -227,13 +227,22 @@ pub(crate) const IORING_OP_URING_CMD: u8 = 46;
 pub(crate) const IORING_OP_FIXED_FD_INSTALL: u8 = 54;
 
 // kTLS: values `libc` may not expose. The library only *probes* kTLS
-// availability (`TCP_ULP`) and reads the record-type control message on kTLS
-// recvs (`SOL_TLS`/`TLS_GET_RECORD_TYPE`); it never installs kTLS (the
-// consumer's handshake does that on a furnished fd).
+// availability (`TCP_ULP`), reads the record-type control message on kTLS
+// recvs (`SOL_TLS`/`TLS_GET_RECORD_TYPE`), and reads each direction's key
+// state back before serving a handshake worker's ready() (`TLS_TX`/
+// `TLS_RX`); it never installs kTLS (the consumer's handshake does that on
+// a furnished fd).
 /// `setsockopt(SOL_TCP, TCP_ULP, "tls")` attaches the kernel-TLS ULP.
 pub(crate) const TCP_ULP: i32 = 31;
 /// `getsockopt`/cmsg level for kernel TLS.
 pub(crate) const SOL_TLS: i32 = 282;
+/// `getsockopt(SOL_TLS, TLS_TX)` - readable only once the TX direction holds
+/// keys (`do_tls_getsockopt_conf`, `net/tls/tls_main.c`: refused `-EBUSY`
+/// until `TLS_CRYPTO_INFO_READY`), which makes it the per-direction oracle
+/// for whether the kernel is actually doing record crypto.
+pub(crate) const TLS_TX: i32 = 1;
+/// `getsockopt(SOL_TLS, TLS_RX)` - the RX half of the same oracle.
+pub(crate) const TLS_RX: i32 = 2;
 /// `cmsg_type` (level `SOL_TLS`) whose one-byte payload is the record's TLS
 /// content type.
 pub(crate) const TLS_GET_RECORD_TYPE: i32 = 2;
@@ -374,6 +383,42 @@ pub(crate) const IORING_UNREGISTER_PBUF_RING: u32 = 23;
 /// rather than only inferable from `-ENOBUFS`.
 #[cfg(feature = "net-server")]
 pub(crate) const IORING_REGISTER_PBUF_STATUS: u32 = 26;
+
+/// `struct io_uring_buf_status` - `IORING_REGISTER_PBUF_STATUS`'s in/out
+/// argument: `buf_group` in, the group's consumer `head` out, `resv`
+/// required zero (`io_register_pbuf_status`, `io_uring/kbuf.c:728-749`).
+#[repr(C)]
+#[cfg(feature = "net-server")]
+pub(crate) struct IoUringBufStatus {
+    pub buf_group: u32,
+    pub head: u32,
+    pub resv: [u32; 8],
+}
+
+/// The kernel's consumer head for provided-buffer group `bgid`: how many
+/// descriptors it has taken off that ring since registration, mod 2^16.
+#[cfg(feature = "net-server")]
+pub(crate) fn pbuf_status_head(
+    ring_fd: RawFd,
+    bgid: u16,
+) -> errno::Result<u32> {
+    let mut st = IoUringBufStatus {
+        buf_group: u32::from(bgid),
+        head: 0,
+        resv: [0; 8],
+    };
+    // SAFETY: `st` is a valid status struct with zero `resv`; the kernel
+    // reads `buf_group` and writes `head`.
+    unsafe {
+        io_uring_register(
+            ring_fd,
+            IORING_REGISTER_PBUF_STATUS,
+            (&raw mut st).cast(),
+            1,
+        )
+    }?;
+    Ok(st.head)
+}
 pub(crate) const IORING_RSRC_REGISTER_SPARSE: u32 = 1 << 0;
 
 /// `struct io_uring_buf_reg` - the argument to

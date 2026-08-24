@@ -187,6 +187,15 @@ where
             let _ = self.core.submit_teardown(slot, generation, true);
             return Err(e);
         }
+        // The deferral's own alias of the socket, for ready()'s key
+        // readback. Fail closed like the peer fetch above: a connection
+        // whose keys can never be confirmed must not be servable.
+        let Some(sock) = crate::fd::dup_cloexec(fd) else {
+            // SAFETY: close the freshly furnished fd we will not deliver.
+            unsafe { libc::close(fd) };
+            stat!(self.core, shed);
+            return self.core.submit_teardown(slot, generation, true);
+        };
         let deferral = AcceptDeferral {
             slot,
             // Channel handle: carry the full u64 generation (retained across the
@@ -195,6 +204,7 @@ where
             tx: self.mailbox.handshake_tx.clone(),
             shared: Arc::clone(&self.core.engine.shared),
             done: false,
+            sock,
         };
         match self.handlers.tls_handshake.as_mut() {
             // Disjoint fields: the handler runs while `self.listeners` is

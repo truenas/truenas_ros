@@ -292,17 +292,18 @@ pub(crate) struct StreamPark {
 /// it through the reactor as the connection's protocol state.
 pub struct HttpConn<U> {
     pub(crate) phase: Phase,
-    /// Deliver bodies a chunk at a time rather than whole, bounding the
-    /// decoded body at this many bytes. Set by the streaming protocol
-    /// builder's accept wrapper; the other builders leave it `None` and keep
-    /// the single-delivery contract they document.
+    /// Deliver bodies a chunk or window at a time rather than whole -
+    /// chunked always, known-length above one window - bounding the body at
+    /// this many bytes. Set by the streaming protocol builder's accept
+    /// wrapper; the other builders leave it `None` and keep the
+    /// single-delivery contract they document.
     ///
-    /// The bound is the builder's to supply because a streaming codec has no
-    /// defensible default for it: streaming exists for bodies whose size is
-    /// not known in advance, so `max_body` - which a buffered delivery can
-    /// check before reading - has nothing to check against here. Refusing to
-    /// guess forces the decision to the call site that knows the protocol
-    /// above (an S3 front bounds a part at 5 GiB).
+    /// The bound is the builder's to supply because the codec has no
+    /// defensible default for it: a streamed body never sits in a buffer
+    /// for `max_body` - the bound a buffered delivery checks before
+    /// reading - to protect. Refusing to guess forces the decision to the
+    /// call site that knows the protocol above (an S3 front bounds a part
+    /// at 5 GiB).
     pub(crate) stream_cap: Option<u64>,
     /// The consumer's per-connection state, as returned by their accept
     /// handler.
@@ -323,10 +324,10 @@ impl<U> HttpConn<U> {
         }
     }
 
-    /// A connection whose bodies are delivered a chunk at a time, with the
-    /// decoded body bounded at `max_body_bytes`. The streaming builder's
-    /// accept wrapper mints these; see [`HttpConn::new`] for why the
-    /// constructor is public.
+    /// A connection whose bodies stream - chunked a chunk at a time,
+    /// known-length a window at a time above one window - bounded at
+    /// `max_body_bytes`. The streaming builder's accept wrapper mints
+    /// these; see [`HttpConn::new`] for why the constructor is public.
     pub fn new_streaming(state: U, max_body_bytes: u64) -> Self {
         Self {
             phase: Phase::Head,

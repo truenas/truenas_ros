@@ -20,8 +20,9 @@ use std::sync::mpsc;
 /// Furnished - with a real socket fd - to the [`Server::set_tls_handshake`]
 /// handler for one accepted connection. Move it (and the fd) to your own
 /// worker, run the TLS handshake (which installs kTLS on the socket), and call
-/// [`AcceptDeferral::ready`] with the per-connection state on success, or
-/// [`AcceptDeferral::reject`] on failure. Dropping it without either **rejects**
+/// [`AcceptDeferral::ready`] with the per-connection state on success - which
+/// confirms the kernel actually holds both directions' keys before anything
+/// is served - or [`AcceptDeferral::reject`] on failure. Dropping it without either **rejects**
 /// the connection, so a panicked/lost worker can't leak the parked slot. The
 /// state `U` crosses to the loop thread here (hence `Send` when `U: Send`), but
 /// only once, before serving begins - there is never concurrent access.
@@ -32,15 +33,31 @@ pub struct AcceptDeferral<U> {
     pub(crate) tx: mpsc::Sender<HandshakeOutcome<U>>,
     pub(crate) shared: Arc<LoopShared>,
     pub(crate) done: bool,
+    /// The deferral's own alias of the socket, for [`ready`]'s key
+    /// readback (`AcceptDeferral::ready`). A dup rather than the furnished
+    /// fd's number, because the worker owns that fd and may close it - a
+    /// number can be reused, an open description cannot.
+    pub(crate) sock: std::os::fd::OwnedFd,
 }
 
 impl<U> AcceptDeferral<U> {
     /// The handshake succeeded and kTLS is active on the socket: install the
     /// connection with per-connection state `state` and begin serving it over
     /// the kernel-TLS transport. Consumes the handle.
+    ///
+    /// The worker's word is checked against the kernel before anything is
+    /// served: both TLS directions must actually hold keys
+    /// (`getsockopt(SOL_TLS, TLS_TX/TLS_RX)`), or the connection is shed as
+    /// if rejected. A socket the kernel never keyed (a handshake library
+    /// that silently fell back to userspace records, or keyed only one
+    /// direction) passes bytes through in the clear, so serving it as
+    /// encrypted would publish plaintext framed as TLS.
     pub fn ready(mut self, state: U) {
         self.done = true;
-        self.send(Ok(state));
+        let keyed = crate::net::core::probe::ktls_keyed_both_ways(
+            std::os::fd::AsRawFd::as_raw_fd(&self.sock),
+        );
+        self.send(if keyed { Ok(state) } else { Err(()) });
     }
 
     /// The handshake failed (or the connection is unwanted): shed it. Consumes

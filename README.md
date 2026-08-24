@@ -171,11 +171,13 @@ cfg.write_path("/etc/app.conf".as_ref(), opts)?;
   than degrading: a server configured for `unix_peercred` refuses to start
   below 6.18.16 (the `AF_UNIX` cmd fix), `UringFs::new` probes `OPENAT2`, and
   `SecretMem::available` reports whether `memfd_secret` is compiled in.
-- Rust 1.97 or newer
+- Rust 1.97.1 or newer
 
 ## Testing
 
-`cargo test --all-features` runs the suite. Tests whose fixture may be absent
+`cargo test --all-features` runs the suite, and the gate runs it again
+`--release`: `debug_assert` guards vanish there, so the release run is what
+covers their graceful `if` halves. Tests whose fixture may be absent
 skip rather than fail, which would let a mis-provisioned runner pass green
 having tested nothing - so every skip is gated on a `TRUENAS_ROS_REQUIRE_*`
 variable that CI arms, turning the skip back into a hard failure:

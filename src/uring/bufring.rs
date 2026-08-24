@@ -77,6 +77,14 @@
 use crate::errno::{self, Errno};
 use crate::uring::sys::*;
 use std::os::fd::RawFd;
+// The tail cell is `std`'s in production, reached through a raw pointer into
+// the mapping; under loom it is loom's, owned by value and carrying the model
+// state - the same split `uring::ring` makes, and for the same reason: the
+// ordering below is then one store that both the kernel path and the model
+// go through.
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicU16, Ordering};
+#[cfg(not(loom))]
 use std::sync::atomic::{AtomicU16, Ordering};
 
 /// The system page size; the granularity the ring must be aligned to.
@@ -84,6 +92,22 @@ fn page_size() -> usize {
     // SAFETY: `sysconf` with a valid name reads no memory and returns a long.
     let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if n > 0 { n as usize } else { 4096 }
+}
+
+/// Publish the producer tail.
+///
+/// `Release` so the kernel cannot observe a tail that names a descriptor
+/// whose fields it has not yet seen: it reads the tail with
+/// `smp_load_acquire` and only then the descriptor
+/// (`io_ring_buffer_select`, `io_uring/kbuf.c:202-216`).
+///
+/// A function rather than a store inside [`BufRing::commit`] so that the
+/// ordering exists once and the loom model drives *this* store. A model with
+/// its own copy of the pairing checks the memory model rather than the code -
+/// it passes with this weakened to `Relaxed`, which is the case it is for.
+#[inline]
+fn publish_tail(cell: &AtomicU16, tail: u16) {
+    cell.store(tail, Ordering::Release);
 }
 
 /// Where one buffer id stands.
@@ -288,15 +312,12 @@ impl BufRing {
     }
 
     /// Make every descriptor written since the last commit visible.
-    ///
-    /// The store is `Release` so the kernel cannot observe a tail that names
-    /// a descriptor whose address it has not yet seen.
     fn commit(&self) {
         // SAFETY: entry zero exists (`entries >= 1`) and its `resv` field is
         // where the kernel reads the producer tail from.
         let tail =
             unsafe { &*(&raw const (*self.ring).resv).cast::<AtomicU16>() };
-        tail.store(self.tail, Ordering::Release);
+        publish_tail(tail, self.tail);
     }
 
     /// Keep `want` buffers allocated, posting or dropping to reach it.
@@ -357,6 +378,28 @@ impl BufRing {
         self.lent += 1;
     }
 
+    /// Verify the kernel's pick and record the loan in one step: `bid` must
+    /// name a slot this table holds `Posted`, with storage behind it, or
+    /// nothing happens and the answer is `None`.
+    ///
+    /// `None` is a userspace/kernel descriptor desync - an id this table
+    /// never posted, or one it already lent - and it is a *refusal*, not an
+    /// assertion: the case is reachable without a bug on this side, so it
+    /// must not abort the reactor, and it must not fall through to serving
+    /// storage this table cannot vouch for - an absent slot has none, and a
+    /// lent one belongs to another op. There is also nothing to hand back
+    /// on this path: the storage the completion names is not this table's,
+    /// so the caller's only sound move is to fail the read the completion
+    /// answered.
+    pub(crate) fn take_lent(&mut self, bid: u16) -> Option<*mut u8> {
+        if self.slots.get(usize::from(bid)) != Some(&Slot::Posted) {
+            return None;
+        }
+        let ptr = self.addr_of(bid)?;
+        self.lend(bid);
+        Some(ptr)
+    }
+
     /// Hand `bid` back: re-post it, or drop it if the pool has shrunk past
     /// what it needs.
     ///
@@ -397,6 +440,32 @@ impl BufRing {
     /// Buffers allocated, whether posted or lent.
     pub(crate) fn allocated(&self) -> u16 {
         self.posted + self.lent
+    }
+
+    /// Debug-only agreement check against the kernel's consumer head
+    /// (`IORING_REGISTER_PBUF_STATUS`): with nothing in flight and every
+    /// completion processed, the descriptors the kernel has not consumed
+    /// (`tail - head`) must equal the buffers this table holds `Posted`.
+    ///
+    /// A shortfall is a stranded id - a completion's buffer that was
+    /// neither adopted nor requeued - which **no gauge can see**: the slot
+    /// stays `Posted` here while the kernel's descriptor is gone, so the
+    /// ring quietly shrinks by one buffer per leak while `lent` and
+    /// `allocated` stay innocent. Meaningful only at a quiesced drain;
+    /// with ops in flight the two sides legitimately disagree.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_assert_kernel_agrees(&self) {
+        let Ok(head) = pbuf_status_head(self.ring_fd, self.bgid) else {
+            return; // probe unsupported: diagnostic, not load-bearing
+        };
+        let unconsumed = self.tail.wrapping_sub(head as u16);
+        debug_assert_eq!(
+            unconsumed, self.posted,
+            "provided-buffer group {} desynced from the kernel: \
+             {unconsumed} descriptors unconsumed vs {} posted - a \
+             completion's buffer was neither adopted nor requeued",
+            self.bgid, self.posted
+        );
     }
 
     /// Buffers posted and not yet picked.
@@ -560,9 +629,26 @@ impl BufPool {
         self.ring.bgid()
     }
 
-    /// Record that a completion selected `bid` from this pool.
-    pub(crate) fn lend(&mut self, bid: u16) {
-        self.ring.lend(bid);
+    /// The most one buffer from this pool can hold.
+    ///
+    /// The ceiling on an **exact** selecting read: the kernel clamps a
+    /// selecting read down to the buffer it picks
+    /// (`io_ring_buffer_select`, `io_uring/kbuf.c`), so a read that asks
+    /// for more than this and insists on all of it completes short of what
+    /// it asked for. A caller in that position must take an owned buffer
+    /// instead of a pool one.
+    pub(crate) fn buf_len(&self) -> usize {
+        self.ring.buf_len()
+    }
+
+    /// Verify a completion's pick and record the loan
+    /// ([`BufRing::take_lent`]): the buffer's storage and its length, or
+    /// `None` for an id this pool does not hold `Posted` - a descriptor
+    /// desync the caller answers by failing the read, since nothing of the
+    /// pool's is behind the id.
+    pub(crate) fn take_lent(&mut self, bid: u16) -> Option<(*mut u8, usize)> {
+        let ptr = self.ring.take_lent(bid)?;
+        Some((ptr, self.ring.buf_len()))
     }
 
     /// Hand a buffer back.
@@ -570,10 +656,10 @@ impl BufPool {
         self.ring.release(bid);
     }
 
-    /// Where `bid` begins, and how large it is.
-    pub(crate) fn addr_of(&mut self, bid: u16) -> Option<(*mut u8, usize)> {
-        let len = self.ring.buf_len();
-        self.ring.addr_of(bid).map(|p| (p, len))
+    /// Debug-only drain check: see [`BufRing::debug_assert_kernel_agrees`].
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_assert_kernel_agrees(&self) {
+        self.ring.debug_assert_kernel_agrees();
     }
 
     /// Buffers posted and not yet picked.
@@ -604,8 +690,9 @@ impl BufPool {
         if before >= self.ring.entries() {
             return false;
         }
+        let allocated = self.ring.allocated();
         self.ring.set_target(before.saturating_mul(2).max(1));
-        self.ring.target() > before
+        self.ring.allocated() > allocated
     }
 
     /// Lower what the pool is trying to hold, once it has been idle for
@@ -622,6 +709,16 @@ impl BufPool {
     /// That residue is bounded by the ring's ceiling and is no worse than
     /// what it replaces: a per-connection buffer that grew once stayed grown
     /// for the connection's life, and there were `pool_size` of them.
+    ///
+    /// The sample is taken at the arm sites, where the arming connection
+    /// itself holds no claim by definition - so a single serial connection
+    /// reads zero loans every time and walks the target down to one, which
+    /// for that workload is the right size; any second active connection
+    /// resets the count. The cost lands on the first burst after a quiet
+    /// stretch, one honest `-ENOBUFS` round trip per doubling back up.
+    /// Sampling a high-water mark since the last call instead would never
+    /// read zero on any serving workload, and a pool that can never see
+    /// idle never shrinks - so the sample stays instantaneous.
     pub(crate) fn rebalance(&mut self) {
         if self.ring.lent() > 0 {
             self.idle_rounds = 0;
@@ -789,10 +886,14 @@ mod tests {
     }
 
     /// A second release of the same id is refused before it can re-post a
-    /// buffer another op still owns, or wrap the loan count. Pins the
-    /// debug-build guard, which is the build the gate runs; the
-    /// release-mode `if` beside it needs a release lane to reach, because
-    /// this assert fires first.
+    /// buffer another op still owns, or wrap the loan count.
+    ///
+    /// The `debug_assert` fires first, so this reaches only the debug half
+    /// of the guard and only in a debug build - in a release build
+    /// `should_panic` has nothing to catch. The `if` beside it is what
+    /// ships, and `releasing_one_id_twice_is_refused_without_asserts`
+    /// covers that.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "releasing a buffer nobody took")]
     fn releasing_one_id_twice_is_refused() {
@@ -804,6 +905,75 @@ mod tests {
         br.release(1);
         assert_eq!(br.free(), 4, "the first release landed");
         br.release(1); // the second owner
+    }
+
+    /// A bid the table never posted is refused, and nothing moves.
+    ///
+    /// The kernel naming such an id is a userspace/kernel descriptor
+    /// desync, reachable without a bug on this side, so it must not abort
+    /// the reactor in any build. There is also nothing to "hand back": no
+    /// storage of the table's is behind the id, so the only sound answer
+    /// is a refusal the caller turns into failing the read.
+    #[test]
+    fn a_bid_never_posted_is_refused_without_an_abort() {
+        let Some(r) = ring() else {
+            return;
+        };
+        let mut br = BufRing::new(r.raw_fd(), 0, 8, 64, 4).expect("registers");
+        let before = (br.free(), br.lent(), br.allocated());
+        assert_eq!(br.take_lent(7), None, "an absent id is refused");
+        assert_eq!(br.take_lent(200), None, "an out-of-range id is refused");
+        assert_eq!(
+            (br.free(), br.lent(), br.allocated()),
+            before,
+            "and the refusals moved nothing"
+        );
+    }
+
+    /// A bid that is already lent is the same desync with a worse
+    /// consequence: the storage belongs to another op, so a second loan
+    /// would hand two consumers one buffer. Refused, with the first loan
+    /// left standing.
+    #[test]
+    fn a_bid_already_lent_is_refused_not_reserved() {
+        let Some(r) = ring() else {
+            return;
+        };
+        let mut br = BufRing::new(r.raw_fd(), 0, 4, 64, 4).expect("registers");
+        assert!(br.take_lent(1).is_some(), "a posted id lends");
+        let before = (br.free(), br.lent(), br.allocated());
+        assert_eq!(br.take_lent(1), None, "a second pick of it is refused");
+        assert_eq!(
+            (br.free(), br.lent(), br.allocated()),
+            before,
+            "and the first loan stands"
+        );
+    }
+
+    /// The shipping half of the same refusal: with `debug_assertions` off
+    /// the `if` is the whole guard, and what it must do is nothing.
+    ///
+    /// A fall-through re-posts an id that is already `Posted`, so the ring
+    /// would carry two descriptors naming one buffer and the kernel would
+    /// hand it to two ops at once. It also decrements `lent` from zero,
+    /// which wraps rather than panics here, and a wrapped loan count reads
+    /// as a nearly empty pool. Asserted on state instead of a panic so the
+    /// test says the same thing in either build.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn releasing_one_id_twice_is_refused_without_asserts() {
+        let Some(r) = ring() else {
+            return;
+        };
+        let mut br = BufRing::new(r.raw_fd(), 0, 4, 64, 4).expect("registers");
+        br.lend(1);
+        br.release(1);
+        assert_eq!(br.free(), 4, "the first release landed");
+        let (free, lent, allocated) = (br.free(), br.lent(), br.allocated());
+        br.release(1); // the second owner
+        assert_eq!(br.free(), free, "a refused release posted nothing");
+        assert_eq!(br.lent(), lent, "and retired no loan");
+        assert_eq!(br.allocated(), allocated, "and allocated nothing");
     }
 
     /// The steady-state path allocates nothing.
@@ -974,7 +1144,7 @@ mod tests {
         assert_eq!(p.allocated(), grown, "but still holding it all");
         // One cycle per buffer is what hands the surplus back.
         for bid in 0..grown {
-            p.lend(bid);
+            assert!(p.take_lent(bid).is_some(), "a posted id lends");
             p.release(bid);
         }
         assert_eq!(p.allocated(), p.target(), "settled where it was aiming");
@@ -996,11 +1166,42 @@ mod tests {
                 p.rebalance();
             }
             // One buffer in use is enough to count as busy.
-            p.lend(0);
+            assert!(p.take_lent(0).is_some(), "a posted id lends");
             p.rebalance();
             p.release(0);
         }
         assert_eq!(p.target(), grown, "never lowered while it was working");
+    }
+
+    /// A growth that could not allocate reports failure, so the caller
+    /// takes its owned-buffer fallback.
+    ///
+    /// `post` is fallible on purpose, and the promise attached to that
+    /// fallback - the re-armed read cannot come back `-ENOBUFS` a second
+    /// time - is only kept if `grow` answers on buffers posted rather than
+    /// on the target it just raised. A `buf_len` no allocator can satisfy
+    /// makes every `post` fail without touching the ring.
+    #[test]
+    fn growth_that_allocates_nothing_reports_failure() {
+        let Some(r) = ring() else {
+            return;
+        };
+        let Ok(mut p) = BufPool::new(r.raw_fd(), 3, usize::MAX / 2, 64) else {
+            return;
+        };
+        assert_eq!(p.allocated(), 0, "nothing could be allocated at all");
+        for round in 0..3 {
+            assert!(
+                !p.grow(),
+                "round {round}: grow reported success with {} allocated",
+                p.allocated()
+            );
+            assert_eq!(
+                p.allocated(),
+                0,
+                "round {round}: still nothing behind the target"
+            );
+        }
     }
 
     /// The pool always keeps at least one buffer: dropping to zero would
@@ -1022,16 +1223,19 @@ mod tests {
 // The publication protocol `commit` shares with the kernel, as a loom model.
 //
 // The real ring cannot run under loom (mmap, a registered fd), so the model
-// replicates the protocol's shape exactly: descriptor fields are plain
-// stores, the tail alone is `Release`, and the consumer - standing in for
-// `io_ring_buffer_select`, which pairs with `smp_load_acquire(&br->tail)`
-// (`io_uring/kbuf.c:202`) - acquires the tail and only then reads the
+// stands in a plain cell for the mapping - but it publishes through
+// `publish_tail`, the same function `commit` calls, so the ordering under
+// test is the one that ships rather than a copy of it. Descriptor fields are
+// plain stores, and the consumer - standing in for `io_ring_buffer_select`,
+// which pairs with `smp_load_acquire(&br->tail)` (`io_uring/kbuf.c:202`) -
+// acquires the tail and only then reads the
 // descriptor. The property is that a tail naming a descriptor
 // happens-after that descriptor's fields: weaken the store to `Relaxed`
 // and loom fails this model, which no functional test can, because the
 // misordering is invisible on x86 and the reader is the kernel.
 #[cfg(all(test, loom))]
 mod loom_tests {
+    use super::publish_tail;
     use loom::cell::UnsafeCell;
     use loom::sync::Arc;
     use loom::sync::atomic::{AtomicU16, Ordering};
@@ -1039,7 +1243,7 @@ mod loom_tests {
     struct Ring {
         /// One descriptor's `addr` field: written plainly, like `post`.
         addr: UnsafeCell<u64>,
-        /// The overlaid tail: stored `Release`, like `commit`.
+        /// The overlaid tail, published by `commit`'s own store.
         tail: AtomicU16,
     }
 
@@ -1059,8 +1263,8 @@ mod loom_tests {
             let t = loom::thread::spawn(move || {
                 // `post`: the descriptor's fields...
                 producer.addr.with_mut(|p| unsafe { *p = 0xB0F });
-                // ...then `commit`: the tail, released.
-                producer.tail.store(1, Ordering::Release);
+                // ...then `commit`, through the store `commit` itself uses.
+                publish_tail(&producer.tail, 1);
             });
             // The kernel's side: acquire the tail; a tail that names the
             // descriptor must find its address already there.
