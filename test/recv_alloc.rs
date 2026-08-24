@@ -551,3 +551,293 @@ fn a_streamed_put_writes_windows_without_copying_them() {
          retains the window looks exactly like this."
     );
 }
+
+// ---- pipelined ingest: K windows in flight per connection ------------------
+
+/// Per-connection pipeline control shared with the write continuations.
+#[cfg(feature = "uring-fs")]
+struct PipeCtl {
+    inflight: AtomicUsize,
+    peak: AtomicUsize,
+    failed: std::sync::atomic::AtomicBool,
+    /// The window parked at the depth cap, resumed by the next completion.
+    parked: std::sync::Mutex<Option<truenas_ros::http::HttpStreamDeferred>>,
+    /// The End delivery, answered once every write has completed.
+    end: std::sync::Mutex<Option<truenas_ros::http::HttpDeferred>>,
+}
+
+/// Upload `mib` MiB on `conns` connections at write depth `k`, every window
+/// written to its connection's file with `pwritev2_from` and `Continue` --
+/// parking only at the cap. Answers (large allocations, all files matched,
+/// peak writes in flight observed).
+#[cfg(feature = "uring-fs")]
+#[allow(clippy::too_many_lines)]
+fn pipelined_put_cost(
+    mib: usize,
+    conns: usize,
+    k: usize,
+) -> Option<(usize, bool, usize)> {
+    use std::sync::OnceLock;
+    use truenas_ros::http::HttpDeferred;
+    use truenas_ros::uring_fs::{File, Personality, RwFlags};
+
+    let dir = std::env::temp_dir().join(format!("ros-pipe-{mib}-{conns}-{k}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    for i in 0..conns {
+        std::fs::write(dir.join(format!("obj{i}")), b"").expect("create");
+    }
+
+    // Pre-open one destination per connection through a standalone host.
+    let files: Vec<File> = {
+        use truenas_ros::sync_fs::{OFlag, OpenHow};
+        use truenas_ros::uring_fs::{Anchor, FsConfig, UringFs};
+        let mut afs = match UringFs::new(FsConfig::default()) {
+            Ok(f) => f,
+            Err(e) if should_skip(&e) => return None,
+            Err(e) => panic!("UringFs::new: {e}"),
+        };
+        let who = afs.register_self().expect("register_self");
+        let handle = afs.handle();
+        let stop_fs = afs.shutdown_handle();
+        let anchor = Anchor::open(&dir).expect("anchor");
+        let (ftx, frx) = std::sync::mpsc::channel();
+        thread::scope(|sc| {
+            sc.spawn(move || {
+                for i in 0..conns {
+                    let name =
+                        std::ffi::CString::new(format!("obj{i}")).unwrap();
+                    let r = handle.open(
+                        who,
+                        &anchor,
+                        name.as_c_str(),
+                        OpenHow::new().flags(OFlag::O_WRONLY),
+                    );
+                    let _ = ftx.send(r);
+                }
+                stop_fs.shutdown();
+            });
+            afs.run().expect("fs host run");
+        });
+        (0..conns)
+            .map(|_| frx.recv().expect("open outcome").expect("open"))
+            .collect()
+    };
+
+    let pers: std::sync::Arc<OnceLock<Personality>> =
+        std::sync::Arc::new(OnceLock::new());
+    let pc = std::sync::Arc::clone(&pers);
+    let peak_seen = std::sync::Arc::new(AtomicUsize::new(0));
+    let peak_out = std::sync::Arc::clone(&peak_seen);
+    let assigned = std::sync::Arc::new(AtomicUsize::new(0));
+
+    type St = (u64, std::sync::Arc<PipeCtl>, File);
+    let files_for_accept = files.clone();
+    let proto = truenas_ros::http::protocol_streaming_fs(
+        HttpConfig::default(),
+        1 << 30,
+        move |_i: Incoming<'_>| -> Option<St> {
+            let n = assigned.fetch_add(1, Ordering::Relaxed);
+            Some((
+                0,
+                std::sync::Arc::new(PipeCtl {
+                    inflight: AtomicUsize::new(0),
+                    peak: AtomicUsize::new(0),
+                    failed: std::sync::atomic::AtomicBool::new(false),
+                    parked: std::sync::Mutex::new(None),
+                    end: std::sync::Mutex::new(None),
+                }),
+                files_for_accept[n % files_for_accept.len()].clone(),
+            ))
+        },
+        move |req: HttpRequest<'_>, st: &mut St, fs| {
+            let (off, ctl, file) = st;
+            match req.stage {
+                Stage::Open => {
+                    *off = 0;
+                    HttpVerdict::Continue
+                }
+                Stage::Window => {
+                    let Some(mut fs) = fs else {
+                        return HttpVerdict::Respond(HttpResponse::new(500));
+                    };
+                    let who = *pc.get().expect("personality set");
+                    let at = *off;
+                    *off += req.body.len() as u64;
+                    let now = ctl.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+                    ctl.peak.fetch_max(now, Ordering::Relaxed);
+                    peak_out.fetch_max(now, Ordering::Relaxed);
+                    // The completion: release the depth slot, wake whoever
+                    // the cap parked, and settle End once everything landed.
+                    let done_ctl = std::sync::Arc::clone(ctl);
+                    let cont =
+                        move |done: truenas_ros::uring_fs::FsDone,
+                              _fs: &mut truenas_ros::uring_fs::FsConn<'_>| {
+                            if done.result().is_err() {
+                                done_ctl
+                                    .failed
+                                    .store(true, Ordering::Relaxed);
+                            }
+                            let left = done_ctl
+                                .inflight
+                                .fetch_sub(1, Ordering::Relaxed)
+                                - 1;
+                            if let Some(d) =
+                                done_ctl.parked.lock().unwrap().take()
+                            {
+                                d.resume();
+                            }
+                            let end: Option<HttpDeferred> = if left == 0 {
+                                done_ctl.end.lock().unwrap().take()
+                            } else {
+                                None
+                            };
+                            if let Some(d) = end {
+                                if done_ctl.failed.load(Ordering::Relaxed) {
+                                    d.reply(HttpResponse::new(500));
+                                } else {
+                                    d.reply(HttpResponse::new(200));
+                                }
+                            }
+                        };
+                    if now < k {
+                        // Below depth: float the write, keep reading.
+                        fs.pwritev2_from(
+                            who,
+                            file.clone(),
+                            &req.body,
+                            at,
+                            RwFlags::empty(),
+                            cont,
+                        );
+                        HttpVerdict::Continue
+                    } else {
+                        // At depth: same write, but brake the stream until
+                        // a completion frees a slot.
+                        let (d, permit, body) = req.defer_stream();
+                        *ctl.parked.lock().unwrap() = Some(d);
+                        fs.pwritev2_from(
+                            who,
+                            file.clone(),
+                            &body,
+                            at,
+                            RwFlags::empty(),
+                            cont,
+                        );
+                        HttpVerdict::Defer(permit)
+                    }
+                }
+                Stage::End => {
+                    if ctl.inflight.load(Ordering::Relaxed) == 0 {
+                        let code = if ctl.failed.load(Ordering::Relaxed) {
+                            500
+                        } else {
+                            200
+                        };
+                        return HttpVerdict::Respond(HttpResponse::new(code));
+                    }
+                    let (deferred, permit) = req.defer();
+                    *ctl.end.lock().unwrap() = Some(deferred);
+                    HttpVerdict::Defer(permit)
+                }
+                Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
+            }
+        },
+    )
+    .expect("codec config");
+
+    let cfg = ServerConfig {
+        pool_size: conns as u32,
+        fs_ops: 64,
+        max_request_bytes: 512 * 1024,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return None,
+        Err(e) => panic!("bind: {e}"),
+    };
+    pers.set(server.register_self().expect("register_self"))
+        .expect("set once");
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stats = server.stats_handle();
+    let stop = server.shutdown_handle();
+
+    let payload = vec![0xc3u8; mib * 1024 * 1024];
+    let wire = std::sync::Arc::new(chunked_put(&payload, 128 * 1024));
+    drop(payload);
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let before = BIG_ALLOCS.load(Ordering::Relaxed);
+        let uploads: Vec<_> = (0..conns)
+            .map(|_| {
+                let wire = std::sync::Arc::clone(&wire);
+                thread::spawn(move || {
+                    let mut s = TcpStream::connect(v4).expect("connect");
+                    s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+                    s.write_all(&wire).expect("write");
+                    let status = read_status(&mut s).expect("status");
+                    assert_eq!(status, 200, "upload refused");
+                })
+            })
+            .collect();
+        for u in uploads {
+            u.join().expect("upload thread");
+        }
+        let cost = BIG_ALLOCS.load(Ordering::Relaxed) - before;
+        stop.shutdown();
+        cost
+    });
+
+    server.serve_forever().expect("serve_forever");
+    let cost = client.join().expect("client thread");
+    let s = stats.snapshot();
+    assert!(s.recv_bufs_total > 0, "no ring: {s:?}");
+    assert_eq!(s.recv_bufs_lent, 0, "leases not returned: {s:?}");
+    let want = vec![0xc3u8; mib * 1024 * 1024];
+    let ok = (0..conns).all(|i| {
+        std::fs::read(dir.join(format!("obj{i}"))).expect("read back") == want
+    });
+    let peak = peak_seen.load(Ordering::Relaxed);
+    let _ = std::fs::remove_dir_all(&dir);
+    Some((cost, ok, peak))
+}
+
+/// A depth-2 pipelined PUT overlaps a window's write with the next window's
+/// arrival, copies nothing, allocates nothing per window, and the files
+/// come back byte-identical.
+///
+/// The peak-in-flight watermark is what proves the overlap is real: at
+/// depth 1 it cannot exceed one, at depth 2 the loopback client outruns the
+/// io-wq write punt and the watermark reaches two. The allocation scaling
+/// run is what proves the ring covered the depth - past the registration
+/// wall connections degrade to owned buffers and every window costs a
+/// copy, which is exactly what the depth-sized registration exists to
+/// prevent.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn a_pipelined_put_overlaps_writes_with_arrivals() {
+    let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((small, ok_small, peak2)) = pipelined_put_cost(4, 2, 2) else {
+        return; // io_uring unavailable
+    };
+    let Some((large, ok_large, _)) = pipelined_put_cost(16, 2, 2) else {
+        return;
+    };
+    let Some((_, ok_serial, peak1)) = pipelined_put_cost(4, 2, 1) else {
+        return;
+    };
+    assert!(ok_small && ok_large && ok_serial, "file bytes differ");
+    assert!(peak2 >= 2, "depth 2 never overlapped: peak {peak2}");
+    assert_eq!(peak1, 1, "depth 1 must not overlap: peak {peak1}");
+    assert!(
+        large <= small + 8,
+        "pipelined PUT cost scales with payload: 4 MiB cost {small}, \
+         16 MiB cost {large}. A ring registered below the write depth \
+         degrades connections to owned buffers and looks exactly like this."
+    );
+}

@@ -838,7 +838,11 @@ where
                 crate::net::core::reactor::recv_pool_buf_len(
                     cfg.max_request_bytes,
                 ),
-                crate::uring::bufring::ring_entries(cfg.pool_size),
+                crate::uring::bufring::ring_entries(
+                    cfg.pool_size.saturating_mul(
+                        crate::net::core::reactor::RECV_LEASE_DEPTH,
+                    ),
+                ),
             )
             .ok();
         }

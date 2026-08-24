@@ -13,9 +13,9 @@ mod close;
 mod io;
 mod wake;
 
-#[cfg(feature = "net-server")]
-pub(crate) use io::recv_pool_buf_len;
 pub(crate) use io::{Enacted, Gate, RecvStep, SendStep, SpliceStep};
+#[cfg(feature = "net-server")]
+pub(crate) use io::{RECV_LEASE_DEPTH, recv_pool_buf_len};
 
 /// The pure framing decision, re-exported only under the `__fuzz` feature for
 /// the fuzz harness (`fuzz/fuzz_targets/framing_arithmetic.rs`). Not part of

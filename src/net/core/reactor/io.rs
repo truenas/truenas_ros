@@ -56,6 +56,31 @@ fn stamp_select(_sqe: &mut IoUringSqe, _select: Option<u16>) {}
 #[cfg(feature = "net-server")]
 const RECV_POOL_BUF: usize = 256 * 1024;
 
+/// Recv-ring descriptor slots per connection.
+///
+/// One would cover arrivals alone - no more messages can be arriving at
+/// once than there are connections - but a leased write
+/// (`FsConn::pwritev2_from`) holds its buffer past the message's consume,
+/// until the write's CQE. A pipelined ingest handler (submit the window,
+/// return `Continue`, brake with `defer_stream` at its depth) therefore
+/// holds up to its write depth plus the one arriving, and the registration
+/// is the wall growth stops at: past it a connection degrades to owned
+/// buffers *permanently*, which reintroduces the per-window allocation and
+/// copy under exactly the load the ring exists for. Four covers a write
+/// depth sized to the bandwidth-delay product of ARC-latency writes at
+/// 128 KiB windows (~2-5), and a descriptor slot is 16 bytes, so the
+/// headroom costs nothing - backing buffers remain demand-allocated.
+///
+/// This is SPDK's backpressure shape, checked rather than recalled: the
+/// sock layer treats a dry provided-buffer ring as flow control, not error
+/// (`module/sock/uring/uring.c` re-arms on `-ENOBUFS` and lets the socket
+/// buffer fill until TCP closes the sender's window), and nvmf/tcp caps
+/// in-flight work with a per-connection resource pool
+/// (`lib/nvmf/tcp.c` `resource_count`). Here the brake is the handler's
+/// depth and the wall is this registration.
+#[cfg(feature = "net-server")]
+pub(crate) const RECV_LEASE_DEPTH: u32 = 4;
+
 /// How large a pooled recv buffer is.
 ///
 /// The `RECV_CHUNK` term is slack, not rounding: `pump_gate` closes a

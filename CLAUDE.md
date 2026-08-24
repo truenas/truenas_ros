@@ -285,6 +285,30 @@ Do not reopen these without a reason that is new.
   chain - 32/128 large allocations per 4/16 MiB with either fallback forced,
   zero with both in place, file bytes verified against the upload.
 
+- **Pipelined ingest is a handler pattern, not a reactor mode.** The lease
+  outlives the delivery's verdict, so a streaming handler floats each
+  window's write with `Continue` and brakes with `defer_stream` only at its
+  own depth cap - stopping the reads is the entire backpressure mechanism
+  (the socket buffer fills and TCP slows the sender), which is SPDK's shape:
+  its sock layer treats a dry provided-buffer ring as flow control, not
+  error (`module/sock/uring/uring.c`, the `-ENOBUFS` re-arm), and nvmf/tcp
+  caps in-flight work with a per-connection resource pool
+  (`lib/nvmf/tcp.c` `resource_count`). The cap exists for the tail, not the
+  steady state: write latency is a distribution, and during a txg stall an
+  uncapped connection eats the op table - whose write-path exhaustion sheds
+  connections - and runs the ring to its wall. At `Stage::End` the park is
+  a plain `defer` (an End park retains no resume state, so `resume()` there
+  closes by design) answered from the last completion.
+- **`RECV_LEASE_DEPTH` (4) is why the recv ring registers past one slot per
+  connection.** A leased write holds its buffer beyond its message's
+  consume, so a pipelined connection holds up to its depth plus the one
+  arriving. The registration is the wall growth stops at, and past it a
+  connection degrades to owned buffers *permanently* - measured at ~2 large
+  allocations per window (the owned growth plus the write's copy fallback)
+  against zero inside the wall, which is
+  `a_pipelined_put_overlaps_writes_with_arrivals`'s negative control.
+  Descriptor slots are 16 bytes, so the headroom is free.
+
 ### The offload pool
 
 - **`WorkerPool::drop` waits `SHUTDOWN_DETACH_AFTER` *in total* and then

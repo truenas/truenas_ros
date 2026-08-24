@@ -1737,6 +1737,24 @@ impl<'a> FsConn<'a> {
     ///
     /// One leased write per delivery: the claim is one buffer and the op
     /// owns all of it once taken.
+    ///
+    /// # Pipelined ingest
+    ///
+    /// The lease outlives the delivery's verdict, so a streaming handler
+    /// need not park per window: submit the write and return
+    /// [`Continue`](crate::http::HttpVerdict::Continue), and the next
+    /// window is read while this one's DMA runs - each write's completion
+    /// releases its own buffer. The handler is the depth brake: track
+    /// writes in flight and, at its cap, park with
+    /// [`defer_stream`](crate::http::HttpRequest::defer_stream), resuming
+    /// from a completion once below it - stopping the reads is the whole
+    /// mechanism, since the socket buffer then fills and TCP slows the
+    /// sender. Keep the cap at or under the reactor's per-connection ring
+    /// headroom (`RECV_LEASE_DEPTH`, 4) or the excess degrades to copies,
+    /// and size `fs_ops` to cover `pool_size` x depth. At `Stage::End`,
+    /// wait for the outstanding completions with a plain
+    /// [`defer`](crate::http::HttpRequest::defer) and answer from the last
+    /// one; a failed window fails the request there.
     pub fn pwritev2_from<F>(
         &mut self,
         who: Personality,
