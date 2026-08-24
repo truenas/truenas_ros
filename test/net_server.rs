@@ -10398,3 +10398,98 @@ fn a_truncated_body_close_returns_its_buffer() {
         "the ring drained under truncated-body closes: {s:?}"
     );
 }
+
+/// A two-phase length-prefixed framer: deliver the 4-byte prefix, then ask
+/// for the payload with `Framing::Need`. The payload read therefore starts
+/// with nothing buffered and no claim held, which is the state that reaches
+/// the pool-buffer decision.
+fn need_payload(buf: &[u8], pending: &mut usize) -> Framing {
+    if *pending > 0 {
+        if buf.len() < *pending {
+            return Framing::Need(*pending - buf.len());
+        }
+        let n = *pending;
+        *pending = 0;
+        return Framing::Complete {
+            header_len: 0,
+            body_len: n,
+        };
+    }
+    if buf.len() < 4 {
+        return Framing::Need(4 - buf.len());
+    }
+    *pending = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    Framing::Complete {
+        header_len: 4,
+        body_len: 0,
+    }
+}
+
+/// An exact read larger than one pool buffer takes an owned buffer.
+///
+/// `frame_step` admits a `Framing::Need(n)` up to `max_request_bytes` and
+/// turns it into an *exact* `ReadHeader`, and `ReadHeader` carries no
+/// placement flag - so without the size test at the arm this read is armed
+/// with `IOSQE_BUFFER_SELECT`, the kernel clamps it to the buffer it picked
+/// (`io_ring_buffer_select`, `io_uring/kbuf.c`), and the connection dies
+/// `TruncatedMessage` having answered nothing. Default config: the pool
+/// buffer is 266 240 bytes and `max_request_bytes` is 1 MiB, so every
+/// `Need` between them is in this window.
+#[test]
+fn an_exact_read_over_the_pool_buffer_takes_an_owned_one() {
+    const N: usize = 512 * 1024;
+    let cfg = ServerConfig {
+        pool_size: 8,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(0usize),
+        header: need_payload,
+        body: |req: Request<'_, usize>| {
+            if req.body.is_empty() {
+                return Response::Reply(Vec::new());
+            }
+            Response::Reply(req.body.to_vec())
+        },
+    };
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stats = server.stats_handle();
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<Vec<u8>> {
+            let mut s = connect_tcp(v4)?;
+            s.write_all(&(N as u32).to_be_bytes())?;
+            s.write_all(&vec![0x77u8; N])?;
+            let mut got = vec![0u8; N];
+            s.read_exact(&mut got)?;
+            Ok(got)
+        })();
+        stop.shutdown();
+        r
+    });
+    server.serve_forever().expect("serve_forever");
+    let got = client.join().expect("thread join");
+    let s = stats.snapshot();
+    assert_pool_registered(&s);
+    let got = got.unwrap_or_else(|e| {
+        panic!(
+            "a {N}-byte exact read took a pool buffer and was clamped to \
+             it, closing the connection: {e} / stats {s:?}"
+        )
+    });
+    assert_eq!(got.len(), N, "the whole payload came back");
+    assert!(got.iter().all(|&b| b == 0x77), "and unmangled");
+    assert_eq!(
+        s.recv_bufs_lent, 0,
+        "the pool settles back to nothing lent: {s:?}"
+    );
+}

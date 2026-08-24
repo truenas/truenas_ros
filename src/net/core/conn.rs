@@ -243,11 +243,17 @@ impl RecvBuf {
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) fn write_lease(
         &self,
+        extent: usize,
     ) -> Option<crate::uring_fs::core::RecvWriteLease<'_>> {
         let c = self.claim.as_ref()?;
         Some(crate::uring_fs::core::RecvWriteLease {
             ptr: c.ptr,
-            cap: c.cap,
+            // Bounded to the delivered message, never the buffer: bytes
+            // past the extent are the next pipelined request's - or a
+            // previous holder's, since a recycled buffer is not zeroed -
+            // so a slice reaching into them must fall to the copy path
+            // rather than be committed into a stored object.
+            cap: c.cap.min(extent),
             bid: c.bid,
             taken: &self.write_leased,
         })
@@ -393,6 +399,25 @@ impl RecvBuf {
     /// Record how far the kernel wrote, once a completion proves it.
     pub(crate) fn set_filled(&mut self, filled: usize) {
         self.filled = filled;
+    }
+
+    /// Does a recv armed to write `[at, at + want)` stay inside the storage
+    /// behind it? The claim's `cap` bounds a pool buffer; `owned.len()`
+    /// bounds owned storage, which `reserve_at` grew to cover the read. The
+    /// kTLS continuation re-arms without a fresh reserve, so this is the
+    /// check that its offset has not walked past the buffer - the exact
+    /// range `recv_ptr`'s SAFETY comment asserts and the initial arm's
+    /// pool-buffer refusal keeps true.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn armed_within(&self, at: usize, want: usize) -> bool {
+        let end = match at.checked_add(want) {
+            Some(e) => e,
+            None => return false,
+        };
+        match &self.claim {
+            Some(c) => end <= c.cap,
+            None => end <= self.owned.len(),
+        }
     }
 
     /// Drop `n` bytes from the front, keeping any pipelined remainder - the
@@ -1070,7 +1095,7 @@ impl<U> Connection<U> {
         {
             return (&[], Body::placed(buf), &self.peer, &mut self.state, None);
         }
-        let lease = self.recv_buf.write_lease();
+        let lease = self.recv_buf.write_lease(self.header_len + self.body_len);
         let (header, rest) = self.recv_buf.split_at(self.header_len);
         let body = match placed {
             Some(bytes) => Body::placed(bytes),
@@ -1301,6 +1326,17 @@ impl<U> Connection<U> {
     /// Bytes the armed (or continuing) recv still wants.
     pub(crate) fn recv_want(&self) -> usize {
         self.recv_want
+    }
+
+    /// Does the currently-armed recv range `[recv_at, recv_at + recv_want)`
+    /// stay inside the buffer behind it? A guard for the kTLS continuation,
+    /// which re-arms off the advanced cursor without a fresh reserve: with
+    /// the initial arm refusing a pool buffer too small for an exact read
+    /// (`submit_recv`), the range is always inside, and this makes that
+    /// checkable rather than assumed.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn recv_armed_within(&self) -> bool {
+        self.recv_buf.armed_within(self.recv_at, self.recv_want)
     }
 
     /// Complete a placed-body recv: the whole body is now initialized, so the
@@ -2212,11 +2248,36 @@ mod tests {
             ptr: buf.as_mut_ptr(),
             cap: 64,
         });
-        rb.write_lease().expect("a claim leases").taken.set(true);
+        rb.write_lease(64).expect("a claim leases").taken.set(true);
         assert!(rb.release().is_none(), "release while leased");
         assert!(rb.forfeit().is_none(), "forfeit while leased");
         // Forfeit dropped the claim without surrendering the bid: the op's
         // completion is the one release left, which is the point.
+    }
+
+    /// The lease is bounded to the delivered message, never the buffer.
+    ///
+    /// A recycled pool buffer is not zeroed, so bytes past the message are
+    /// a previous holder's - another connection's request, in the worst
+    /// case - and `pwritev2_from`'s containment gate reads this cap as the
+    /// line between "write straight from the ring" and "fall to the copy
+    /// path". A cap of the whole buffer would lease those bytes into a
+    /// stored object.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    #[test]
+    fn a_lease_never_reaches_past_the_delivered_message() {
+        let mut rb = RecvBuf::default();
+        rb.set_pooled();
+        let buf = Box::leak(vec![0u8; 256].into_boxed_slice());
+        rb.install(RecvClaim {
+            bid: 4,
+            ptr: buf.as_mut_ptr(),
+            cap: 256,
+        });
+        let lease = rb.write_lease(96).expect("a claim leases");
+        assert_eq!(lease.cap, 96, "the lease stops at the delivered message");
+        let whole = rb.write_lease(4096).expect("a claim leases");
+        assert_eq!(whole.cap, 256, "and never reaches past the buffer either");
     }
 
     /// Promote under a lease is declared unreachable - no recv is armed
@@ -2234,7 +2295,7 @@ mod tests {
             ptr: buf.as_mut_ptr(),
             cap: 64,
         });
-        rb.write_lease().expect("a claim leases").taken.set(true);
+        rb.write_lease(64).expect("a claim leases").taken.set(true);
         let _ = rb.promote_for(0, 1 << 20);
     }
 

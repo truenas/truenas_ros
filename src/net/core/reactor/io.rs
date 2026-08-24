@@ -394,6 +394,16 @@ impl<U> Reactor<U> {
         conn.recv_idle = false;
         conn.ops += 1;
         let want = conn.recv_want();
+        // The continuation re-arms off the advanced cursor with no fresh
+        // reserve, so `recv_ptr`'s SAFETY contract - the offset stays within
+        // the buffer - rests entirely on the initial arm having refused a
+        // pool buffer an exact read would overrun (`submit_recv`). Assert it
+        // here so a regression in that refusal is loud rather than a kernel
+        // write past the buffer.
+        debug_assert!(
+            conn.recv_armed_within(),
+            "kTLS continuation would arm past the recv buffer"
+        );
         let ptr = conn.recv_ptr();
         let addr = conn.arm_ktls_recv(ptr, want);
         // SECURITY: carry the request clock onto the continuation too (see
@@ -710,6 +720,18 @@ impl<U> Reactor<U> {
         let select = if !place_body && self.table.conn(slot).recv_needs_buffer()
         {
             let g = match self.recv_bufs.as_mut() {
+                // An exact read larger than one pool buffer must not take
+                // one, for the reason stated just above: the kernel clamps
+                // the selection and the read then completes short of what
+                // the frame declared. `promote_recv_buffer` below cannot
+                // cover this - it moves bytes out of a claim the connection
+                // already holds, and a connection reaches here precisely
+                // when it holds none - so the escape is to own the buffer,
+                // exactly as a placed body does. Reachable from
+                // `Framing::Need(n)`, which `frame_step` admits up to
+                // `max_request_bytes` and turns into an *exact*
+                // `ReadHeader`, where there is no placement to opt into.
+                Some(p) if exact && want > p.buf_len() => None,
                 Some(p) => {
                     p.rebalance();
                     Some(p.bgid())
@@ -1003,8 +1025,14 @@ impl<U> Reactor<U> {
     pub(crate) fn requeue_body_bid(&mut self, bid: Option<u16>) {
         let Some(bid) = bid else { return };
         if let Some(pool) = self.body_bufs.as_mut() {
-            pool.lend(bid);
-            pool.release(bid);
+            // The pick is verified before the loan is recorded: an id the
+            // pool does not hold `Posted` is a descriptor desync with
+            // nothing of the pool's behind it, so there is nothing to hand
+            // back - and a blind release would retire a loan some other op
+            // still holds, reposting a buffer out from under it.
+            if pool.take_lent(bid).is_some() {
+                pool.release(bid);
+            }
         }
         self.sync_recv_buf_stats();
     }
@@ -1096,29 +1124,36 @@ impl<U> Reactor<U> {
     /// `IORING_CQE_F_BUFFER` is the whole rule for whether a buffer was
     /// taken: an op that failed before selecting one - `-ENOBUFS` above all
     /// - carries nothing and owes nothing back.
+    ///
+    /// `false` means the completion is unusable: it names a buffer this
+    /// reactor cannot vouch for (a descriptor desync, or a flag with no
+    /// pool behind it), so its bytes cannot be located and the read it
+    /// answered must fail - the caller closes the connection rather than
+    /// framing from a buffer that was never installed.
     #[cfg(feature = "net-server")]
     pub(crate) fn adopt_recv_buffer(
         &mut self,
         slot: u32,
         generation: u32,
         cqe_flags: u32,
-    ) {
+    ) -> bool {
         if cqe_flags & IORING_CQE_F_BUFFER == 0 {
-            return;
+            return true;
         }
         let bid = (cqe_flags >> IORING_CQE_BUFFER_SHIFT) as u16;
         let Some(pool) = self.recv_bufs.as_mut() else {
-            return;
+            return false;
         };
-        let Some((ptr, cap)) = pool.addr_of(bid) else {
-            // An id outside the ring should be impossible, but the kernel
-            // consumed a descriptor either way; strand nothing.
-            pool.lend(bid);
-            pool.release(bid);
-            self.sync_recv_buf_stats();
-            return;
+        // The verified pick: `Posted`, storage behind it, loan recorded.
+        // Refused for an id the pool never posted or already lent - a
+        // userspace/kernel descriptor desync. There is nothing to strand
+        // *or* return on that path: the storage the completion names is not
+        // this pool's, and "handing it back" through the state machine
+        // would either abort (the id is not lent) or retire a loan some
+        // other op still holds.
+        let Some((ptr, cap)) = pool.take_lent(bid) else {
+            return false;
         };
-        pool.lend(bid);
         // A guard, not a handled case: a slot is freed only once nothing is
         // in flight on it, so a recv completion should never outlive its
         // connection. It is here because the cost of being wrong is a panic
@@ -1129,12 +1164,13 @@ impl<U> Reactor<U> {
         if !self.table.slot_matches_cqe(slot, generation) {
             pool.release(bid);
             self.sync_recv_buf_stats();
-            return;
+            return true;
         }
         self.sync_recv_buf_stats();
         self.table.conn_mut(slot).install_recv_buf(
             crate::net::core::conn::RecvClaim { bid, ptr, cap },
         );
+        true
     }
 
     pub(crate) fn on_recv_complete(
