@@ -594,6 +594,41 @@ fn a_streamed_put_writes_windows_without_copying_them() {
     );
 }
 
+/// The same guarantee at botocore's real chunk size.
+///
+/// A chunk of exactly one window is the single size at which every window
+/// carries its chunk header, so the connection always holds a recv claim
+/// and the cost of the no-claim arm is invisible - which is how a copy of
+/// seven windows in eight shipped. The default `aws s3 cp` frames 1 MiB
+/// aws-chunks (`httpchecksum.py`'s `_DEFAULT_CHUNK_SIZE`): eight windows
+/// per chunk, seven of them mid-chunk with the claim already leased to the
+/// previous window's write. Those must draw a fresh buffer from the ring,
+/// not be placed into an allocation `pwritev2_from` then copies.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn a_streamed_put_at_botocore_chunks_still_does_not_copy() {
+    let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    fn wire(p: &[u8]) -> Vec<u8> {
+        chunked_put(p, 1024 * 1024)
+    }
+    let Some((small, _, ok_small)) = put_to_file_cost(4, wire) else {
+        return; // io_uring unavailable
+    };
+    let Some((large, _, ok_large)) = put_to_file_cost(16, wire) else {
+        return;
+    };
+    assert!(ok_small && ok_large, "file bytes differ from the upload");
+    // Placed-and-copied mid-chunk windows cost exactly 14 large
+    // allocations per MiB (measured: 56 and 224 here before the no-claim
+    // suppression); flat means every window drew from the ring.
+    assert!(
+        large <= small + 8,
+        "PUT-to-file cost scales with payload at 1 MiB chunks: 4 MiB cost \
+         {small} large allocations, 16 MiB cost {large}. Mid-chunk windows \
+         are being placed and copied instead of drawing from the ring."
+    );
+}
+
 /// A `Content-Length` body above one window streams exactly as a chunked
 /// one: windows from the receive ring, leased writes, no copy and no
 /// per-window allocation. The harness's `Whole` arm answers 500, so a

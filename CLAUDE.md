@@ -259,19 +259,23 @@ Do not reopen these without a reason that is new.
   avoid - hence promoting. What does transfer is SPDK's dry-ring fallback, a
   plain `sock_readv` into the caller's buffer, which is the shape
   `set_recv_owned` already had.
-- **A pooled connection does not place a body its buffer already covers,
-  and `RECV_POOL_BUF` is sized so that it does.** Placement buys a move on
-  delivery by allocating a buffer per body; a connection holding a pool
-  buffer big enough is paying for a second one. On a streamed upload that is
-  an allocation *per window* - `STREAM_WINDOW` is 128 KiB and
-  `body_placement_threshold` defaults to 64 KiB, so before this every window
-  was placed and the pool covered request heads and nothing carrying data.
-  `a_streamed_upload_does_not_allocate_per_window` measures it with a
-  counting allocator: 32 large allocations for 4 MiB and 128 for 16 MiB
-  before, zero for both after. `frame_step` cannot make this call - it is
-  deliberately state-free - so `enact_frame_step` downgrades `place`. The
-  trade is a copy for a handler that takes ownership of a body in that size
-  range, which is why the threshold still governs anything larger.
+- **A pooled connection does not place a body the pool can serve** - one
+  its held claim already covers, or, with no claim, one that fits a pool
+  buffer (`RECV_POOL_BUF` is sized so a window does). Placement buys a move
+  on delivery by allocating a buffer per body; against a held claim the
+  second buffer is churn, and against no claim it forfeits the buffer the
+  read gets free (the kernel picks at completion) to allocate one
+  `pwritev2_from` must then copy. The no-claim case is the default client:
+  botocore frames 1 MiB aws-chunks, so seven windows in eight are mid-chunk
+  with the claim leased to the previous window's write - measured at 14
+  large allocations and 896 KiB copied per MiB, 87.5% of payload.
+  `a_streamed_upload_does_not_allocate_per_window` and
+  `a_streamed_put_at_botocore_chunks_still_does_not_copy` pin the two
+  cases. `frame_step` cannot make this call - it is deliberately
+  state-free - so `enact_frame_step` downgrades `place`. The trade is a
+  copy for a handler that takes ownership of a body in that size range,
+  which is why placement still governs anything a pool buffer cannot hold
+  and every unpooled connection.
 - **A placed body must not also be handed a pool buffer.** It reads into
   its own allocation, and the kernel clamps a selecting read down to the
   buffer it picked (`io_ring_buffer_select`, `io_uring/kbuf.c`), so an exact
