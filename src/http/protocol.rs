@@ -1016,7 +1016,10 @@ where
                         // `StreamDone` is what the resume arm reads as
                         // "dispatch it now, nothing further to frame".
                         next: if left == 0 {
-                            Phase::StreamDone { head }
+                            // A known-length body has no terminal block at
+                            // all; the End stage is dispatched from the
+                            // resume with nothing to parse.
+                            Phase::StreamDone { head, block_at: 0 }
                         } else {
                             Phase::StreamKnown {
                                 head,
@@ -1033,11 +1036,14 @@ where
         }
         // The terminal chunk: the delivered header IS the trailer section,
         // so the trailers are parsed from it here rather than carried.
-        Phase::StreamDone { head } => {
+        Phase::StreamDone { head, block_at } => {
             // The terminal block is itself a complete (empty) chunked
             // message, so the whole-message compactor parses its trailer
             // section. It has to outlive the dispatch: the views borrow it.
-            let mut wire = header.to_vec();
+            // `block_at` skips the CRLF that closed the last payload, which
+            // the compactor would read as an empty - malformed - size line
+            // and refuse, losing every trailer with it.
+            let mut wire = header[block_at.min(header.len())..].to_vec();
             let compacted = chunked::compact(&mut wire).ok();
             let trailers = compacted
                 .as_ref()

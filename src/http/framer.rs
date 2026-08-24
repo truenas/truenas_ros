@@ -240,6 +240,15 @@ pub(crate) enum Phase {
     StreamDone {
         /// The head this body belonged to.
         head: Vec<u8>,
+        /// Where the terminal block starts inside the delivered header.
+        ///
+        /// `chunked::step` counts a chunked body's framing from the CRLF
+        /// that closed the previous payload, so a terminal chunk arriving
+        /// after one is delivered as `\r\n0\r\n...`. The trailer parser
+        /// starts in its size state, where that leading empty line is a
+        /// malformed size line - so the offset travels with the phase
+        /// rather than being re-derived from the bytes.
+        block_at: usize,
     },
     /// A request is parked for deferred completion
     /// ([`HttpRequest::defer`](super::protocol::HttpRequest::defer)): the
@@ -699,7 +708,13 @@ fn stream_step<U>(buf: &[u8], conn: &mut HttpConn<U>) -> Framing {
             else {
                 unreachable!("matched StreamBody above");
             };
-            conn.phase = Phase::StreamDone { head };
+            // `chunked::step` counted `framing` from the CRLF that closed
+            // the previous payload; the terminal block itself starts after
+            // it.
+            conn.phase = Phase::StreamDone {
+                head,
+                block_at: if after_payload { 2 } else { 0 },
+            };
             // A terminal chunk is only locatable once its whole trailer
             // section is buffered, so this delivers immediately and the
             // phase change cannot be re-entered.

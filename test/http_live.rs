@@ -2493,6 +2493,83 @@ fn with_streaming_server<T: Send + 'static>(
     Some(join.join().expect("client thread").expect("client io"))
 }
 
+/// A streamed terminal chunk carries its trailers to `Stage::End`.
+///
+/// The trailer section is the whole point of the streaming path for an S3
+/// front: `X-Amz-Trailer` promises a checksum that only arrives after the
+/// last byte of payload, and a handler that never sees it cannot verify
+/// what it just wrote. The buffered path is pinned by
+/// `chunked_put_and_trailers`; this is the streamed twin, and it asserts on
+/// the trailer *reaching the handler* rather than on any framing detail.
+#[test]
+fn a_streamed_terminal_chunk_carries_its_trailers() {
+    use truenas_ros::http::{HttpVerdict, Stage, protocol_streaming};
+
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = protocol_streaming(
+        HttpConfig::default(),
+        1 << 20,
+        |_inc: Incoming<'_>| Some(()),
+        |req: HttpRequest<'_>, _s: &mut ()| match req.stage {
+            Stage::Open | Stage::Window => HttpVerdict::Continue,
+            Stage::End => {
+                // Name and value both, so a trailer that arrives empty is
+                // distinguishable from one that never arrived.
+                let seen: Vec<String> = req
+                    .trailers
+                    .iter()
+                    .map(|t| {
+                        format!(
+                            "{}={}",
+                            t.name,
+                            String::from_utf8_lossy(t.value)
+                        )
+                    })
+                    .collect();
+                HttpVerdict::Respond(
+                    HttpResponse::new(200).header("x-trailers", seen.join(",")),
+                )
+            }
+            Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
+        },
+    )
+    .expect("codec config is valid");
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let join = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<String> {
+            let mut s = connect_tcp(v4)?;
+            s.set_read_timeout(Some(Duration::from_secs(5)))?;
+            s.write_all(
+                b"PUT /up HTTP/1.1\r\nHost: t\r\n\
+                  Transfer-Encoding: chunked\r\n\
+                  X-Amz-Trailer: x-amz-checksum-crc32\r\n\r\n\
+                  4\r\nAAAA\r\n0\r\nx-amz-checksum-crc32: sQlaLQ==\r\n\r\n",
+            )?;
+            let (status, head, _body) = read_response(&mut s)?;
+            assert_eq!(status, 200);
+            Ok(head)
+        })();
+        stop.shutdown();
+        r
+    });
+    server.serve_forever().expect("serve_forever");
+    let head = join.join().expect("client thread").expect("client io");
+    assert!(
+        head.contains("x-trailers: x-amz-checksum-crc32=sQlaLQ=="),
+        "the streamed terminal chunk's trailer never reached the handler: \
+         {head}"
+    );
+}
+
 /// A multi-chunk PUT, streamed. The body is larger than any single window
 /// and arrives in pieces the handler never sees together; what comes back
 /// has to be exactly what went out, and the window count has to show it was
