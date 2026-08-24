@@ -6,11 +6,11 @@ merits rather than rediscovered.
 
 ## The crate's charter
 
-`libc` + `bitflags`, MSRV 1.97. A new runtime dependency is a design decision,
-not a convenience - the one exception (`httparse`, for the HTTP request-head
-tokenizer) is argued for in `Cargo.toml`. Dev-only crates in a separate,
-self-rooted workspace (`fuzz/`) do not count against this and do not have to
-hold the MSRV.
+`libc` + `bitflags`, MSRV 1.97.1. A new runtime dependency is a design
+decision, not a convenience - the one exception (`httparse`, for the HTTP
+request-head tokenizer) is argued for in `Cargo.toml`. Dev-only crates in a
+separate, self-rooted workspace (`fuzz/`) do not count against this and do
+not have to hold the MSRV.
 
 Every feature must build alone. `cargo build --no-default-features --features
 <one>` is part of the gate, because the per-subsystem gates and dependency
@@ -31,10 +31,11 @@ visibility. `__fuzz` is outside `default` and `full`. See
   *Validating against the platform* below for which revision of each is the
   one that counts.
 - Two CI workflows, and they prove different things:
-  - `ci.yml` - unprivileged `ubuntu-latest`. fmt, clippy, tests, the feature
-    matrix, loom, and the fuzz build. The hosted runner's fd limit is orders
-    of magnitude below a typical dev box's, so a test that leans on
-    descriptors fails here and nowhere else; reproduce with `ulimit -Sn 1024`.
+  - `ci.yml` - unprivileged `ubuntu-latest`. fmt, clippy, tests (debug and
+    release), the feature matrix, loom, and the fuzz build. The hosted
+    runner's fd limit is orders of magnitude below a typical dev box's, so
+    a test that leans on descriptors fails here and nowhere else; reproduce
+    with `ulimit -Sn 1024`.
   - `qemu-test.yml` - a real TrueNAS kernel in a VM, over ssh as root, with
     ZFS datasets (`scripts/qemu-*.sh`, staged 1..6). This is the authority for
     anything privileged: ACLs on a real dataset, mount/idmap,

@@ -1374,7 +1374,10 @@ where
 /// - **`Expect: 100-continue` is answered by the handler, not ahead of it.**
 ///   The interim line is withheld until the handler returns
 ///   [`HttpVerdict::Continue`] from `Open`, so a refusal goes out *instead*
-///   of the interim rather than after having invited a body.
+///   of the interim rather than after having invited a body. (A
+///   `Content-Length` body at or under one window takes the buffered path,
+///   where the interim invites at most one window's worth - there is no
+///   stream for a veto to save.)
 /// - **Nothing is retained between windows.** Each window's payload is
 ///   dropped once the handler returns, so a handler that needs the body
 ///   must consume it as it arrives.

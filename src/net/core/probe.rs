@@ -1,6 +1,8 @@
-//! Construction-time kernel capability probes (and the getsockopt `URING_CMD`
-//! filler they share): fail fast with a clear validation error instead of
-//! mysteriously shedding every connection at accept time.
+//! Kernel capability probes: the construction-time ones (and the getsockopt
+//! `URING_CMD` filler they share), which fail fast with a clear validation
+//! error instead of mysteriously shedding every connection at accept time,
+//! and the per-handshake kTLS key readback a `ready()` runs before a
+//! connection is served as encrypted.
 
 use crate::errno::Errno;
 use crate::error::Error;

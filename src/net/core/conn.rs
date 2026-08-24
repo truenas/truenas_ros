@@ -357,13 +357,14 @@ impl RecvBuf {
     /// granted.
     ///
     /// A claim cannot grow - it is one fixed buffer - so the grant is capped
-    /// at what remains of it. That cap is unreachable when the pool is sized
-    /// as `recv_pool_buf_len` computes: `at` cannot exceed
-    /// `max_request_bytes` (`pump_gate` closes the connection above it) and
-    /// `want` cannot exceed `RECV_CHUNK` for the one read that is not
-    /// already bounded by the frame. It is here because the alternative to a
-    /// bound is a write past the buffer, and the caller treats a short grant
-    /// on an exact read as fatal rather than reading less than it framed.
+    /// at what remains of it. That cap is unreachable as the reactor arms
+    /// reads: a read that would overrun a held claim is promoted to owned
+    /// storage first (`promote_recv_buffer`), and an exact read larger than
+    /// one pool buffer never takes one (`submit_recv` refuses the select),
+    /// so a claim is only ever asked for what it can hold. It is here
+    /// because the alternative to a bound is a write past the buffer, and
+    /// the caller treats a short grant on an exact read as fatal rather
+    /// than reading less than it framed.
     ///
     /// Owned storage grows as the `Vec` this replaced did, so its grant is
     /// always the full `want`.
@@ -1266,8 +1267,10 @@ impl<U> Connection<U> {
             // The accumulate buffer's cursor likewise points into spare
             // capacity (`recv_at` sits at - or, mid-kTLS-continuation, past --
             // the length). SAFETY: `arm_recv` reserved through
-            // `recv_at + recv_want`, so the offset stays within the
-            // allocation.
+            // `recv_at + recv_want`, and the kTLS continuation re-arms the
+            // same reserved range advanced by what completed
+            // (`recv_armed_within` asserts it), so the offset stays within
+            // the allocation.
             _ => self.recv_buf.write_ptr(self.recv_at) as u64,
         }
     }

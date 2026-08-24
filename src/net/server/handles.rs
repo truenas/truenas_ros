@@ -584,7 +584,10 @@ pub struct ServerStats {
     /// one that climbs while [`recv_bufs_lent`](ServerStats::recv_bufs_lent)
     /// stays flat is a **leak**, not sizing: ids are being stranded (the
     /// kernel consumed their descriptors, nothing returned them) and the
-    /// pool is replacing them, which sizing noise never looks like.
+    /// pool is replacing them, which sizing noise never looks like. That
+    /// signature needs traffic behind it - a strand on a quiet server
+    /// moves neither gauge, which is what the debug-build drain check
+    /// against the kernel's consumer head exists to catch.
     pub recv_bufs_total: u32,
 }
 

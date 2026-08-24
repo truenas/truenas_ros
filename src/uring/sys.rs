@@ -227,9 +227,11 @@ pub(crate) const IORING_OP_URING_CMD: u8 = 46;
 pub(crate) const IORING_OP_FIXED_FD_INSTALL: u8 = 54;
 
 // kTLS: values `libc` may not expose. The library only *probes* kTLS
-// availability (`TCP_ULP`) and reads the record-type control message on kTLS
-// recvs (`SOL_TLS`/`TLS_GET_RECORD_TYPE`); it never installs kTLS (the
-// consumer's handshake does that on a furnished fd).
+// availability (`TCP_ULP`), reads the record-type control message on kTLS
+// recvs (`SOL_TLS`/`TLS_GET_RECORD_TYPE`), and reads each direction's key
+// state back before serving a handshake worker's ready() (`TLS_TX`/
+// `TLS_RX`); it never installs kTLS (the consumer's handshake does that on
+// a furnished fd).
 /// `setsockopt(SOL_TCP, TCP_ULP, "tls")` attaches the kernel-TLS ULP.
 pub(crate) const TCP_ULP: i32 = 31;
 /// `getsockopt`/cmsg level for kernel TLS.

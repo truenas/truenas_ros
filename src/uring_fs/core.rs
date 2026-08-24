@@ -1498,7 +1498,8 @@ pub struct FsConn<'a> {
 pub(crate) struct RecvWriteLease<'a> {
     /// Start of the claimed buffer.
     pub(crate) ptr: *const u8,
-    /// Its full capacity, bounding what may be written from.
+    /// The leasable extent - the delivered message, never the whole
+    /// buffer - bounding what may be written from.
     pub(crate) cap: usize,
     /// The pool buffer id, recorded on the op for the completion release.
     pub(crate) bid: u16,

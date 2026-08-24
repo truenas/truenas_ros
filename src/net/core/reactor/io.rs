@@ -1019,8 +1019,11 @@ impl<U> Reactor<U> {
     /// again, and the pool answers the shortfall by allocating a fresh
     /// buffer per loss while `recv_bufs_lent` stays innocently at zero.
     ///
-    /// Lend-then-release: `release` is the only repost, and its state
-    /// machine requires the loan recorded first.
+    /// Lend-then-release through the verified pick
+    /// ([`BufPool::take_lent`](crate::uring::bufring::BufPool::take_lent)):
+    /// `release` is the only repost and requires the loan recorded first,
+    /// and a bid the pool does not hold `Posted` is dropped rather than
+    /// recorded, since nothing of the pool's is behind it.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) fn requeue_body_bid(&mut self, bid: Option<u16>) {
         let Some(bid) = bid else { return };

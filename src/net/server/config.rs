@@ -95,17 +95,17 @@ pub struct ServerConfig {
     #[cfg(feature = "uring-fs")]
     pub fs_offload_ceiling: usize,
     /// Chunk size for file-sourced reply bodies (`Response::ReplyFile`): each
-    /// body read moves at most this many bytes, into one of two buffers the
-    /// connection cycles (one reading while one sends). Default 256 KiB;
-    /// validated to 4 KiB..=16 MiB.
+    /// body read moves at most this many bytes, into a ring buffer the
+    /// kernel picks at completion. Default 256 KiB; validated to
+    /// 4 KiB..=16 MiB.
     ///
     /// Also the size of each buffer in the file-body ring
     /// ([`fs_body_pool`](ServerConfig::fs_body_pool)), which the chunks
     /// come from: resident memory tracks bodies in flight, not the
     /// connection table, and `pool_size x 2 x fs_body_chunk` is the ceiling
-    /// only when every connection is mid-body at once. A connection holds
-    /// at most two chunks - one being read into while the previous one
-    /// sends - and that count is fixed, not configurable: on ZFS every ring
+    /// only when every connection is mid-body at once. A connection has at
+    /// most two chunks out - one landing while the previous one sends -
+    /// and that count is fixed, not configurable: on ZFS every ring
     /// read is punted to an io-wq worker (`zpl_file.c` sets no
     /// `FMODE_NOWAIT`), so a deeper pipeline would only deepen that bounded
     /// worker class's queue, and it is the count of connections mid-body,
@@ -145,10 +145,11 @@ pub struct ServerConfig {
     /// [`recv_bufs_lent`](super::ServerStats::recv_bufs_lent): at rest it
     /// settles to zero however many connections are open.
     ///
-    /// There is nothing to size here either. The ring is registered with a
-    /// descriptor slot per connection - no more messages can be arriving
-    /// than there are connections - and backing buffers are allocated as
-    /// demand asks, doubling when a completion finds the ring dry and
+    /// There is nothing to size here either. The ring is registered with
+    /// descriptor slots for every buffer demand can hold at once - each
+    /// connection's arriving message plus the leased writes that may still
+    /// hold theirs (`RECV_LEASE_DEPTH`) - and backing buffers are allocated
+    /// as demand asks, doubling when a completion finds the ring dry and
     /// halving after idle rounds. A message that outgrows its buffer moves
     /// to owned storage and carries on, and a kernel without
     /// provided-buffer rings degrades to owned buffers rather than failing

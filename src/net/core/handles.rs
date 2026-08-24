@@ -20,8 +20,9 @@ use std::sync::mpsc;
 /// Furnished - with a real socket fd - to the [`Server::set_tls_handshake`]
 /// handler for one accepted connection. Move it (and the fd) to your own
 /// worker, run the TLS handshake (which installs kTLS on the socket), and call
-/// [`AcceptDeferral::ready`] with the per-connection state on success, or
-/// [`AcceptDeferral::reject`] on failure. Dropping it without either **rejects**
+/// [`AcceptDeferral::ready`] with the per-connection state on success - which
+/// confirms the kernel actually holds both directions' keys before anything
+/// is served - or [`AcceptDeferral::reject`] on failure. Dropping it without either **rejects**
 /// the connection, so a panicked/lost worker can't leak the parked slot. The
 /// state `U` crosses to the loop thread here (hence `Send` when `U: Send`), but
 /// only once, before serving begins - there is never concurrent access.
