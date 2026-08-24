@@ -6681,6 +6681,79 @@ fn ktls_rejected_handshake_sheds() {
     );
 }
 
+/// A worker's `ready()` alone does not make a socket encrypted: the
+/// deferral reads the kernel's per-direction key state back
+/// (`getsockopt(SOL_TLS, TLS_TX/TLS_RX)`) and sheds a connection whose
+/// keys the kernel does not hold. Without the readback a hook that never
+/// ran a handshake - or a library that silently fell back to userspace
+/// records - has the server framing plaintext as TLS; this test's client
+/// speaks bare TCP and must be shed unanswered.
+#[test]
+fn ktls_ready_without_kernel_keys_is_shed() {
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = length_prefixed(
+        PrefixWidth::U32,
+        Endian::Big,
+        false,
+        |_h: &[u8], body: &[u8], _p: &ClientAddr| Some(echo_frame(body)),
+    );
+    let mut server = match Server::bind(
+        [truenas_ros::net::server::Listen::tls(addr)],
+        proto,
+    ) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    server.set_tls_handshake(move |fd, _inc, deferral| {
+        thread::spawn(move || {
+            // No handshake at all: claim success on an untouched TCP
+            // socket. The furnished fd is closed first, as a worker done
+            // with it would - the readback rides the deferral's own dup,
+            // not a number that may be reused.
+            // SAFETY: the furnished fd is the worker's to close.
+            unsafe { libc::close(fd) };
+            deferral.ready(());
+        });
+    });
+    let stats = server.stats_handle();
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop); // shuts down even if this panics
+        (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            s.set_read_timeout(Some(Duration::from_secs(3)))?;
+            send_framed(&mut s, b"clear?")?;
+            let mut one = [0u8; 1];
+            match s.read(&mut one) {
+                Ok(0) => Ok(()), // shed: EOF, nothing served
+                Ok(_) => panic!(
+                    "a ready() with no kernel keys was served in the clear"
+                ),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        })()
+        .expect("client io");
+    });
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join");
+    let s = stats.snapshot();
+    assert!(s.shed >= 1, "the unkeyed connection was shed: {s:?}");
+    assert_eq!(s.replies, 0, "and nothing was answered: {s:?}");
+}
+
 #[test]
 fn ktls_handshake_timeout_sheds_parked_slot() {
     // SECURITY: a kTLS connection whose handshake never completes (the

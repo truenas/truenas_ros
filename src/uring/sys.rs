@@ -234,6 +234,13 @@ pub(crate) const IORING_OP_FIXED_FD_INSTALL: u8 = 54;
 pub(crate) const TCP_ULP: i32 = 31;
 /// `getsockopt`/cmsg level for kernel TLS.
 pub(crate) const SOL_TLS: i32 = 282;
+/// `getsockopt(SOL_TLS, TLS_TX)` - readable only once the TX direction holds
+/// keys (`do_tls_getsockopt_conf`, `net/tls/tls_main.c`: refused `-EBUSY`
+/// until `TLS_CRYPTO_INFO_READY`), which makes it the per-direction oracle
+/// for whether the kernel is actually doing record crypto.
+pub(crate) const TLS_TX: i32 = 1;
+/// `getsockopt(SOL_TLS, TLS_RX)` - the RX half of the same oracle.
+pub(crate) const TLS_RX: i32 = 2;
 /// `cmsg_type` (level `SOL_TLS`) whose one-byte payload is the record's TLS
 /// content type.
 pub(crate) const TLS_GET_RECORD_TYPE: i32 = 2;

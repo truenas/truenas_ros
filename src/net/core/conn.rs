@@ -408,7 +408,6 @@ impl RecvBuf {
     /// check that its offset has not walked past the buffer - the exact
     /// range `recv_ptr`'s SAFETY comment asserts and the initial arm's
     /// pool-buffer refusal keeps true.
-    #[cfg(feature = "net-server")]
     pub(crate) fn armed_within(&self, at: usize, want: usize) -> bool {
         let end = match at.checked_add(want) {
             Some(e) => e,
@@ -1334,7 +1333,6 @@ impl<U> Connection<U> {
     /// the initial arm refusing a pool buffer too small for an exact read
     /// (`submit_recv`), the range is always inside, and this makes that
     /// checkable rather than assumed.
-    #[cfg(feature = "net-server")]
     pub(crate) fn recv_armed_within(&self) -> bool {
         self.recv_buf.armed_within(self.recv_at, self.recv_want)
     }

@@ -12,6 +12,24 @@ pub const AT_FDCWD: BorrowedFd<'static> =
     // is never closed, so a `'static` borrow is sound.
     unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) };
 
+/// Duplicate `fd` into an owned, close-on-exec descriptor.
+///
+/// The dup aliases the same open file description, so socket state read
+/// through it (`getsockopt`) is the socket's regardless of what the
+/// original number is later reused for - which is why a handle that must
+/// outlive a caller-owned fd carries its own dup rather than the number.
+#[allow(dead_code)] // unused only when no feature module is compiled
+pub(crate) fn dup_cloexec(fd: RawFd) -> Option<OwnedFd> {
+    // SAFETY: `F_DUPFD_CLOEXEC` allocates a fresh descriptor >= 0; it
+    // reads no memory.
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return None;
+    }
+    // SAFETY: `dup` is fresh and owned by nobody else.
+    Some(unsafe { owned_from_raw(dup) })
+}
+
 /// Wraps a raw fd returned by a syscall into an [`OwnedFd`].
 ///
 /// # Safety
