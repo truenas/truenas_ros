@@ -1364,6 +1364,22 @@ fn register_as(
         };
     }
 
+    // The window's security reasoning holds from euid 0 and from nowhere
+    // else (`cap_emulate_setxuid`, `security/commoncap.c:1132-1136`): the
+    // effective capability set is cleared only when the *old* euid was
+    // root - which is what keeps the snapshot free of the broker's own
+    // authority - and a return to euid 0 refills effective from permitted,
+    // which is what makes saved-uid 0 the way back. A broker running at
+    // another euid with CAP_SETUID raised would stamp its whole effective
+    // set into every personality and park 0 in a saved-uid `revert` then
+    // escalates into root permanently. Refuse the window rather than enter
+    // it with reasoning that does not apply; a cross-identity request from
+    // a caller with no privilege fails EPERM either way (setgroups demands
+    // CAP_SETGID).
+    if raw_geteuid() != 0 {
+        return -(libc::EPERM as i64);
+    }
+
     // --- window opens ---
     // SAFETY: raw setgroups/setresgid/setresuid on a single-threaded
     // process; each is checked, and every exit path closes the window via

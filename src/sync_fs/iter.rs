@@ -644,6 +644,13 @@ impl FsIterBuilder {
     }
 
     /// Start iterating at a subdirectory relative to the mountpoint.
+    ///
+    /// Judged at [`build`](Self::build) by [`crate::path::relative_defect`]:
+    /// a path that is absolute, empty, or carries a `.`/`..`/empty
+    /// component is refused `EINVAL` there. Without that the joined walk
+    /// escapes the mountpoint - `../outside` resolves - and the only
+    /// confinement left is the mount-source check, which catches crossing
+    /// datasets and not `..` within one.
     pub fn relative_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.relative_path = Some(path.into());
         self
@@ -700,7 +707,21 @@ impl FsIterBuilder {
     /// Open the root and build the iterator.
     pub fn build(self) -> Result<FsIter> {
         let root_path = match &self.relative_path {
-            Some(rel) => self.mountpoint.join(rel),
+            Some(rel) => {
+                // The join below resolves whatever it is handed, so the
+                // shape is judged first: `../outside` joins to a path that
+                // walks out of the mountpoint, and the mount-source check
+                // further down only catches crossing to a different
+                // filesystem, not `..` within this one.
+                if crate::path::relative_defect(
+                    rel.as_os_str().as_encoded_bytes(),
+                )
+                .is_some()
+                {
+                    return Err(Errno::EINVAL.into());
+                }
+                self.mountpoint.join(rel)
+            }
             None => self.mountpoint.clone(),
         };
         // The root itself may be a mountpoint, so only NO_SYMLINKS here.

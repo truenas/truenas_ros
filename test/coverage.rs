@@ -1131,6 +1131,39 @@ mod fsiter {
         assert!(!names.contains(&"outside".to_string()));
     }
 
+    /// The screen `relative_path` documents: a shape that would walk out
+    /// of the mountpoint is refused at build, not resolved. The
+    /// mount-source check cannot stand in for this - it catches crossing
+    /// to a different filesystem, and `../outside` here stays on the same
+    /// one.
+    #[test]
+    fn a_relative_path_cannot_escape_the_mountpoint() {
+        let dir = truenas_ros::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tree/anchor/sub")).unwrap();
+        std::fs::create_dir_all(dir.path().join("tree/outside")).unwrap();
+        std::fs::write(dir.path().join("tree/outside/secret"), b"s").unwrap();
+        let anchor = dir.path().join("tree/anchor");
+        for rel in ["../outside", "sub/../../outside", "/etc", "a//b", ""] {
+            let err = FsIterBuilder::new(&anchor, fs_source(&anchor))
+                .relative_path(rel)
+                .build()
+                .map(|_| ())
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::Errno(Errno::EINVAL)),
+                "{rel:?} built: {err:?}"
+            );
+        }
+        // The screen does not over-reach: an honest subdirectory builds.
+        assert!(
+            FsIterBuilder::new(&anchor, fs_source(&anchor))
+                .relative_path("sub")
+                .build()
+                .is_ok(),
+            "a plain subdirectory still builds"
+        );
+    }
+
     #[test]
     fn build_on_a_file_is_enotdir() {
         let dir = truenas_ros::tempdir().unwrap();

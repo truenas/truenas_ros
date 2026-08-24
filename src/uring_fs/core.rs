@@ -1301,8 +1301,19 @@ impl FsCore {
         } = done;
         // Teardown: the loop is dying - just report the outcome and hand any
         // buffers back. A file's fd is released when its op entry (and thus its
-        // parked `Arc`) is dropped with the ring teardown.
-        deliver(waiter, map_res(cqe.res), bufs, None, stat);
+        // parked `Arc`) is dropped with the ring teardown - except an OPEN's,
+        // which arrives in `cqe.res` with nothing parked owning it (the live
+        // path is what builds the `Arc` from the result). Wrap it here too, so
+        // the waiter takes an owned file or its drop closes the descriptor
+        // instead of leaking it.
+        let file = if tag == TAG_OPEN && cqe.res >= 0 {
+            // SAFETY: `res` is a fresh fd OPENAT2 just returned; nothing else
+            // owns it.
+            Some(Arc::new(unsafe { crate::fd::owned_from_raw(cqe.res) }))
+        } else {
+            None
+        };
+        deliver(waiter, map_res(cqe.res), bufs, file, stat);
     }
 
     /// Leak the op table without dropping it - used ONLY when a teardown
@@ -3703,6 +3714,45 @@ mod routing_fuzz {
         let _ = core.on_cqe(&mut eng, t, s, g, 8192);
         let out = rx.try_recv().expect("delivered");
         assert_eq!(out.res, Ok(8192), "a full leased write is untouched");
+    }
+
+    /// Teardown's drain owns the fd a successful open completes with.
+    ///
+    /// The fd arrives in `cqe.res` and nothing parked owns it - the live
+    /// path is what wraps the result - so a drain that delivers the raw
+    /// count leaks the descriptor: the waiter is usually already gone at
+    /// teardown, and a number nobody owns is closed by nobody.
+    #[test]
+    fn a_drained_open_owns_its_fd() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        let (tx, rx) = mpsc::channel();
+        core.submit_fsync(&mut eng, 0, file, false, 0, 0, chan(&tx));
+        let [(_, s, g)] = inflight(&core)[..] else {
+            panic!("one op in flight");
+        };
+        // Re-tag the staged op as the OPEN whose completion carries an fd;
+        // the drain path reads only the tag and the result.
+        core.ops[s as usize].state.state =
+            FsOpState::InFlight { tag: TAG_OPEN };
+        let opened = synth_fd();
+        drop(rx); // as at teardown: nobody is left to take the outcome
+        let cqe = IoUringCqe {
+            user_data: pack_raw(TAG_OPEN, s, g),
+            res: opened,
+            flags: 0,
+        };
+        core.on_drain_cqe(&cqe);
+        // With no receiver, the owned file had nowhere to land, so its drop
+        // must have closed the descriptor rather than leaking it.
+        // SAFETY: `fcntl(F_GETFD)` probes a descriptor number, reads nothing.
+        let rc = unsafe { libc::fcntl(opened, libc::F_GETFD) };
+        assert_eq!(rc, -1, "the drained open's fd was closed, not leaked");
     }
 
     #[test]
