@@ -100,6 +100,20 @@ impl Responder {
             || self.shared.stop.load(Ordering::Acquire)
     }
 
+    /// A second responder for the same request, for the one dispatch step
+    /// that runs the handler twice (the window exhausting a known-length
+    /// stream carries the End stage too). The dispatches are sequential
+    /// and at most one may defer; the shared token keeps the
+    /// one-answer-per-request guard intact either way.
+    #[cfg(feature = "http")]
+    pub(crate) fn split(&self) -> Responder {
+        Responder {
+            token: self.token,
+            tx: self.tx.clone(),
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
     #[cfg(feature = "http")]
     pub(crate) fn drain_probe(&self) -> DrainProbe {
         DrainProbe {
