@@ -373,3 +373,181 @@ fn serving_file_bodies_does_not_allocate_per_connection() {
          lifetime look exactly like this."
     );
 }
+
+// ---- the write side: PUT windows straight to a file ------------------------
+
+/// Upload `mib` MiB as a streamed PUT whose handler writes every window to a
+/// real file with `pwritev2_from` + `defer_stream`, and answer (large
+/// allocations, file bytes matched).
+///
+/// This is the whole ingest path at once: kernel picks the recv buffer, the
+/// framer scans it in place, the handler's write borrows it, the claim is
+/// surrendered to the op, and the pool gets it back at the write's CQE. Any
+/// copy or allocation snuck back into that chain shows up in the count.
+#[cfg(feature = "uring-fs")]
+fn put_to_file_cost(mib: usize) -> Option<(usize, bool)> {
+    use std::sync::OnceLock;
+    use truenas_ros::http::HttpStreamDeferred;
+    use truenas_ros::uring_fs::{Personality, RwFlags};
+
+    let dir = std::env::temp_dir().join(format!("ros-put-{mib}"));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("obj");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, b"").expect("create");
+
+    // One pre-opened destination, cloned per request (the open path is not
+    // what this measures).
+    let file = {
+        use truenas_ros::sync_fs::{OFlag, OpenHow};
+        use truenas_ros::uring_fs::{Anchor, FsConfig, UringFs};
+        let mut afs = match UringFs::new(FsConfig::default()) {
+            Ok(f) => f,
+            Err(e) if should_skip(&e) => return None,
+            Err(e) => panic!("UringFs::new: {e}"),
+        };
+        let who = afs.register_self().expect("register_self");
+        let handle = afs.handle();
+        let stop_fs = afs.shutdown_handle();
+        let anchor = Anchor::open(&dir).expect("anchor");
+        let (ftx, frx) = std::sync::mpsc::channel();
+        thread::scope(|sc| {
+            sc.spawn(move || {
+                let r = handle.open(
+                    who,
+                    &anchor,
+                    c"obj",
+                    OpenHow::new().flags(OFlag::O_WRONLY),
+                );
+                let _ = ftx.send(r);
+                stop_fs.shutdown();
+            });
+            afs.run().expect("fs host run");
+        });
+        frx.recv().expect("open outcome").expect("open")
+    };
+
+    let pers: std::sync::Arc<OnceLock<Personality>> =
+        std::sync::Arc::new(OnceLock::new());
+    let pc = std::sync::Arc::clone(&pers);
+    let proto = truenas_ros::http::protocol_streaming_fs(
+        HttpConfig::default(),
+        1 << 30,
+        |_i: Incoming<'_>| Some(0u64),
+        move |req: HttpRequest<'_>, off: &mut u64, fs| match req.stage {
+            Stage::Open => {
+                *off = 0;
+                HttpVerdict::Continue
+            }
+            Stage::Window => {
+                let Some(mut fs) = fs else {
+                    return HttpVerdict::Respond(HttpResponse::new(500));
+                };
+                let who = *pc.get().expect("personality set");
+                let at = *off;
+                *off += req.body.len() as u64;
+                let (d, permit, body) = req.defer_stream();
+                let d: HttpStreamDeferred = d;
+                fs.pwritev2_from(
+                    who,
+                    file.clone(),
+                    &body,
+                    at,
+                    RwFlags::empty(),
+                    move |done, _fs| match done.result() {
+                        Ok(_) => d.resume(),
+                        Err(_) => d.fail(HttpResponse::new(500)),
+                    },
+                );
+                HttpVerdict::Defer(permit)
+            }
+            Stage::End => HttpVerdict::Respond(
+                HttpResponse::new(200).header("x-bytes", off.to_string()),
+            ),
+            Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
+        },
+    )
+    .expect("codec config");
+
+    let cfg = ServerConfig {
+        pool_size: 8,
+        fs_ops: 16,
+        max_request_bytes: 512 * 1024,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return None,
+        Err(e) => panic!("bind: {e}"),
+    };
+    pers.set(server.register_self().expect("register_self"))
+        .expect("set once");
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stats = server.stats_handle();
+    let stop = server.shutdown_handle();
+
+    let payload = vec![0x9du8; mib * 1024 * 1024];
+    let wire = chunked_put(&payload, 128 * 1024);
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let mut s = TcpStream::connect(v4).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        let before = BIG_ALLOCS.load(Ordering::Relaxed);
+        s.write_all(&wire).expect("write");
+        let status = read_status(&mut s).expect("status");
+        assert_eq!(status, 200, "upload refused");
+        let cost = BIG_ALLOCS.load(Ordering::Relaxed) - before;
+        drop(s);
+        stop.shutdown();
+        cost
+    });
+
+    server.serve_forever().expect("serve_forever");
+    let cost = client.join().expect("client thread");
+    let s = stats.snapshot();
+    assert!(
+        s.recv_bufs_total > 0,
+        "no recv ring registered - the lease path was never exercised: {s:?}"
+    );
+    assert_eq!(
+        s.recv_bufs_lent, 0,
+        "a leased buffer was never returned: {s:?}"
+    );
+    let written = std::fs::read(&path).expect("read back");
+    let matches = written == payload;
+    let _ = std::fs::remove_dir_all(&dir);
+    Some((cost, matches))
+}
+
+/// Writing a streamed PUT to a file must neither corrupt it nor allocate
+/// per window.
+///
+/// The windows are written from the receive buffer itself - the claim is
+/// surrendered to the write op and comes back to the pool at its CQE - and
+/// the stream park retains no copy. Byte-identical content proves the
+/// buffer was never recycled under the DMA; a flat allocation count proves
+/// neither the write nor the park fell back to copying.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn a_streamed_put_writes_windows_without_copying_them() {
+    let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((small, ok_small)) = put_to_file_cost(4) else {
+        return; // io_uring unavailable
+    };
+    let Some((large, ok_large)) = put_to_file_cost(16) else {
+        return;
+    };
+    assert!(ok_small && ok_large, "file bytes differ from the upload");
+    // 4 MiB is 32 windows, 16 MiB is 128: a per-window copy or park shows
+    // up as ~96 between them.
+    assert!(
+        large <= small + 8,
+        "PUT-to-file cost scales with payload: 4 MiB cost {small} large \
+         allocations, 16 MiB cost {large}. A copy fallback or a park that \
+         retains the window looks exactly like this."
+    );
+}

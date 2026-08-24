@@ -89,7 +89,7 @@ pub struct HttpRequest<'a> {
     responder: Responder,
 }
 
-impl HttpRequest<'_> {
+impl<'a> HttpRequest<'a> {
     /// Park this request for deferred completion: retain the head verbatim,
     /// the body (an owned move when the reactor placed it), and the
     /// trailers, and detach the `Send` completion handle. Move the
@@ -123,6 +123,50 @@ impl HttpRequest<'_> {
             HttpDeferPermit { permit, req },
         )
     }
+
+    /// Park a **streamed** delivery ([`Stage::Open`] or [`Stage::Window`])
+    /// while an async operation - typically a file write of this very
+    /// window - completes, without retaining the window.
+    ///
+    /// [`HttpRequest::defer`] copies the body into the park so
+    /// [`HttpDeferred::redrive`] can re-run the handler on it. A stream
+    /// park resolved by [`HttpStreamDeferred::resume`] never re-runs the
+    /// handler - the stream just moves to its next read - so the copy buys
+    /// nothing, and for a window written straight from the receive buffer
+    /// (`pwritev2_from`) it is the allocation the whole path exists to
+    /// remove. The head is still retained (it is small and
+    /// [`HttpStreamDeferred::fail`] serializes against it); the body is
+    /// not, which is why this deferral cannot redrive. The window itself
+    /// comes back to the caller: the park no longer holds it, and the
+    /// operation this deferral waits on is usually *of* those bytes - they
+    /// stay valid for the delivery (the reactor recycles the buffer only
+    /// after the write that borrows it completes).
+    pub fn defer_stream(
+        self,
+    ) -> (HttpStreamDeferred, HttpDeferPermit, Body<'a>) {
+        let HttpRequest {
+            raw_head,
+            responder,
+            body,
+            ..
+        } = self;
+        let (deferred, permit) = responder.defer();
+        let answer = Arc::new(Mutex::new(None));
+        let req = Box::new(ParkedRequest {
+            head: raw_head.to_vec(),
+            body: Vec::new(),
+            trailers: Vec::new(),
+            answer: Arc::clone(&answer),
+        });
+        (
+            HttpStreamDeferred {
+                answer,
+                inner: deferred,
+            },
+            HttpDeferPermit { permit, req },
+            body,
+        )
+    }
 }
 
 impl std::fmt::Debug for HttpRequest<'_> {
@@ -151,9 +195,21 @@ pub(crate) struct ParkedRequest {
     body: Vec<u8>,
     /// Owned trailer fields.
     trailers: Vec<(Box<str>, Vec<u8>)>,
-    /// `Some` once a worker chose [`HttpDeferred::reply`]; the redelivery
-    /// serializes it instead of re-running the handler.
-    answer: Arc<Mutex<Option<HttpResponse>>>,
+    /// `Some` once a worker chose [`HttpDeferred::reply`] or
+    /// [`HttpStreamDeferred::resume`]; the redelivery acts on it instead of
+    /// re-running the handler.
+    answer: Arc<Mutex<Option<ParkAnswer>>>,
+}
+
+/// What a worker decided for a parked request.
+pub(crate) enum ParkAnswer {
+    /// Serialize this response ([`HttpDeferred::reply`]). Boxed so the
+    /// resume variant does not carry a response-sized cell.
+    Reply(Box<HttpResponse>),
+    /// A streamed window is done with: put the streaming phase back and
+    /// answer nothing, without re-running the handler - which is what lets
+    /// a stream park retain no body ([`HttpRequest::defer_stream`]).
+    Resume,
 }
 
 impl std::fmt::Debug for ParkedRequest {
@@ -234,7 +290,7 @@ pub struct HttpDeferPermit {
 /// cannot leak a parked slot.
 #[must_use = "dropping an HttpDeferred unresolved closes the connection"]
 pub struct HttpDeferred {
-    answer: Arc<Mutex<Option<HttpResponse>>>,
+    answer: Arc<Mutex<Option<ParkAnswer>>>,
     inner: Deferred,
 }
 
@@ -256,13 +312,55 @@ impl HttpDeferred {
         // The cell write happens-before the redeliver's channel send, so
         // the completion pass observes it (modelled by `loom_tests`).
         *self.answer.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some(resp);
+            Some(ParkAnswer::Reply(Box::new(resp)));
         self.inner.redeliver();
     }
 
     /// Close the connection without a response.
     pub fn close(self) {
         self.inner.close();
+    }
+}
+
+/// The completion handle of a [`defer_stream`](HttpRequest::defer_stream)
+/// park: resume the stream, fail it, or close - never redrive, because the
+/// park retained no body to re-run the handler on.
+#[must_use = "dropping an HttpStreamDeferred unresolved closes the connection"]
+pub struct HttpStreamDeferred {
+    answer: Arc<Mutex<Option<ParkAnswer>>>,
+    inner: Deferred,
+}
+
+impl HttpStreamDeferred {
+    /// The parked window is dealt with: resume the stream at its next read.
+    /// The handler is not re-run; the next thing it sees is the next
+    /// window (or [`Stage::End`]).
+    pub fn resume(self) {
+        // The cell write happens-before the redeliver's channel send, so
+        // the completion pass observes it (modelled by `loom_tests`).
+        *self.answer.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(ParkAnswer::Resume);
+        self.inner.redeliver();
+    }
+
+    /// Refuse the stream with `resp` - a mid-body answer, so the reply is
+    /// forced final and the connection flush-closes, exactly as an inline
+    /// mid-body [`HttpVerdict::Respond`] would.
+    pub fn fail(self, resp: HttpResponse) {
+        *self.answer.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(ParkAnswer::Reply(Box::new(resp)));
+        self.inner.redeliver();
+    }
+
+    /// Close the connection without a response.
+    pub fn close(self) {
+        self.inner.close();
+    }
+}
+
+impl std::fmt::Debug for HttpStreamDeferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpStreamDeferred").finish_non_exhaustive()
     }
 }
 
@@ -876,7 +974,19 @@ where
             let chosen =
                 answer.lock().unwrap_or_else(PoisonError::into_inner).take();
             match chosen {
-                Some(resp) => {
+                // The stream's parked window is dealt with: back to reading,
+                // nothing to send, handler not re-run. A resume with no
+                // streaming phase to put back is a misuse of `defer_stream`
+                // outside a stream - nothing can be resumed, so close.
+                Some(ParkAnswer::Resume) => match resume {
+                    Some(r) => {
+                        conn.phase = r.next;
+                        Response::Reply(Vec::new())
+                    }
+                    None => Response::Close,
+                },
+                Some(ParkAnswer::Reply(resp)) => {
+                    let resp = *resp;
                     let out = respond_parked(
                         &head,
                         resp,

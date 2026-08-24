@@ -183,6 +183,13 @@ pub(crate) struct RecvBuf {
     /// Set when this connection draws from a pool, so an armed recv with no
     /// claim acquires one rather than growing `owned`.
     pooled: bool,
+    /// Set when a leased write took this claim: the buffer's bytes are a
+    /// file write's iovec until its CQE, so consume surrenders the claim to
+    /// the op instead of draining and recycling it. A `Cell` because the
+    /// handler that arms the write holds the body - a shared borrow of this
+    /// same connection - for its whole run.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    write_leased: std::cell::Cell<bool>,
     /// Bytes filled. Tracked separately from `owned.len()` because the
     /// kernel writes into space reserved past the tail and the count only
     /// becomes known at completion.
@@ -232,6 +239,20 @@ impl RecvBuf {
         self.filled = 0;
     }
 
+    /// The claim as a write lease, for a delivery's fs facade.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn write_lease(
+        &self,
+    ) -> Option<crate::uring_fs::core::RecvWriteLease<'_>> {
+        let c = self.claim.as_ref()?;
+        Some(crate::uring_fs::core::RecvWriteLease {
+            ptr: c.ptr,
+            cap: c.cap,
+            bid: c.bid,
+            taken: &self.write_leased,
+        })
+    }
+
     /// Give the buffer up, for the caller to hand back to the pool. Only
     /// once nothing is buffered: the bytes live in it.
     ///
@@ -240,6 +261,12 @@ impl RecvBuf {
     /// rest of its life - which is the retention the pool exists to end.
     pub(crate) fn release(&mut self) -> Option<RecvClaim> {
         if self.filled > 0 {
+            return None;
+        }
+        #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+        if self.write_leased.get() {
+            // A write op owns the buffer; it will be released through the
+            // completion's lease, never through the connection.
             return None;
         }
         if self.pooled && !self.owned.is_empty() {
@@ -280,6 +307,15 @@ impl RecvBuf {
         at: usize,
         want: usize,
     ) -> Option<RecvClaim> {
+        // Unreachable while a leased write holds the claim - no recv is
+        // armed between the write's submit and the delivery's consume - and
+        // moving the bytes out from under the DMA would tear the write, so
+        // fail closed on the impossible rather than corrupt on it.
+        #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+        if self.write_leased.get() {
+            debug_assert!(false, "promote under a leased write");
+            return None;
+        }
         let c = self.claim?;
         if at.saturating_add(want) <= c.cap {
             return None;
@@ -297,8 +333,17 @@ impl RecvBuf {
 
     /// Give the buffer up whatever is in it - the connection is going away,
     /// so the bytes have no reader left.
+    ///
+    /// `None` while a leased write holds the buffer: the op's completion
+    /// releases the id, and handing it back here as well would let the pool
+    /// reissue it under the DMA.
     pub(crate) fn forfeit(&mut self) -> Option<RecvClaim> {
         self.filled = 0;
+        #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+        if self.write_leased.get() {
+            self.claim = None;
+            return None;
+        }
         self.claim.take()
     }
 
@@ -353,6 +398,35 @@ impl RecvBuf {
     /// Drop `n` bytes from the front, keeping any pipelined remainder - the
     /// next message then starts at offset zero.
     pub(crate) fn drain_front(&mut self, n: usize) {
+        // A leased claim's bytes are a write op's iovec: the memmove below
+        // would tear the write, and recycling the buffer would hand it to
+        // the next recv while the DMA still reads it. Surrender the claim
+        // to the op - its completion releases the id - and keep only the
+        // pipelined remainder, copied out into owned storage. On the
+        // streaming hot path the remainder is empty (exact reads stop at
+        // the message boundary), so this costs nothing there.
+        #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+        if self.write_leased.get() {
+            let Some(c) = self.claim.take() else {
+                debug_assert!(false, "leased with no claim");
+                self.write_leased.set(false);
+                return;
+            };
+            let n = n.min(self.filled);
+            let rest = self.filled - n;
+            self.owned.clear();
+            if rest > 0 {
+                self.owned.reserve(rest);
+                // SAFETY: `[n, filled)` lies within the claim, which the
+                // write op keeps alive past this copy.
+                self.owned.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(c.ptr.add(n), rest)
+                });
+            }
+            self.filled = rest;
+            self.write_leased.set(false);
+            return;
+        }
         let n = n.min(self.filled);
         if n == 0 {
             return;
@@ -945,24 +1019,25 @@ impl<U> Connection<U> {
     /// [`Body::take`] is as free as a placed body's. The same "large bodies
     /// arrive owned" policy as placement - and gated the same way, because
     /// the reactor grows a fresh buffer afterwards.
+    // Dead only in a server-with-fs build that carries no client: the
+    // server's delivery takes the leased twin below and the client is the
+    // remaining caller.
+    #[cfg_attr(
+        all(
+            feature = "net-server",
+            feature = "uring-fs",
+            not(feature = "net-client")
+        ),
+        allow(dead_code)
+    )]
     pub(crate) fn deliver_parts(
         &mut self,
         handoff_threshold: Option<usize>,
     ) -> (&[u8], Body<'_>, &ClientAddr, &mut U) {
         let placed = self.body_buf.take();
-        // `body_len > 0` keeps a zero-length frame (a redelivery, where the
-        // original bytes were already consumed) out of the handoff: with a
-        // zero threshold it would otherwise `take` the accumulate buffer while
-        // a read-ahead recv may be writing into its spare capacity.
         if placed.is_none()
-            && self.header_len == 0
-            && self.body_len > 0
-            && self.recv_buf.len() == self.body_len
-            && matches!(handoff_threshold, Some(t) if self.body_len >= t)
-            && let Some(buf) = self.recv_buf.take_owned()
+            && let Some(buf) = self.take_body_handoff(handoff_threshold)
         {
-            // `consume` drains `frame_len().min(buf.len())` = 0 afterwards,
-            // so the handoff composes with the normal delivery epilogue.
             return (&[], Body::placed(buf), &self.peer, &mut self.state);
         }
         let (header, rest) = self.recv_buf.split_at(self.header_len);
@@ -971,6 +1046,59 @@ impl<U> Connection<U> {
             None => Body::inline(&rest[..self.body_len]),
         };
         (header, body, &self.peer, &mut self.state)
+    }
+
+    /// As [`deliver_parts`](Self::deliver_parts), plus the recv claim as a
+    /// write lease - the server's delivery form, where a handler's
+    /// `pwritev2_from` may write the body straight from the buffer. A twin
+    /// rather than one method because the lease shares `recv_buf` with the
+    /// body borrow, which the other callers' tuple shape has no room for.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn deliver_parts_leased(
+        &mut self,
+        handoff_threshold: Option<usize>,
+    ) -> (
+        &[u8],
+        Body<'_>,
+        &ClientAddr,
+        &mut U,
+        Option<crate::uring_fs::core::RecvWriteLease<'_>>,
+    ) {
+        let placed = self.body_buf.take();
+        if placed.is_none()
+            && let Some(buf) = self.take_body_handoff(handoff_threshold)
+        {
+            return (&[], Body::placed(buf), &self.peer, &mut self.state, None);
+        }
+        let lease = self.recv_buf.write_lease();
+        let (header, rest) = self.recv_buf.split_at(self.header_len);
+        let body = match placed {
+            Some(bytes) => Body::placed(bytes),
+            None => Body::inline(&rest[..self.body_len]),
+        };
+        (header, body, &self.peer, &mut self.state, lease)
+    }
+
+    /// The owned-buffer handoff predicate shared by both delivery forms.
+    ///
+    /// `body_len > 0` keeps a zero-length frame (a redelivery, where the
+    /// original bytes were already consumed) out of the handoff: with a
+    /// zero threshold it would otherwise `take` the accumulate buffer while
+    /// a read-ahead recv may be writing into its spare capacity. `consume`
+    /// drains `frame_len().min(buf.len())` = 0 afterwards, so the handoff
+    /// composes with the normal delivery epilogue.
+    fn take_body_handoff(
+        &mut self,
+        handoff_threshold: Option<usize>,
+    ) -> Option<Vec<u8>> {
+        if self.header_len == 0
+            && self.body_len > 0
+            && self.recv_buf.len() == self.body_len
+            && matches!(handoff_threshold, Some(t) if self.body_len >= t)
+        {
+            return self.recv_buf.take_owned();
+        }
+        None
     }
 
     /// `(peer, state)` borrow-split for the close hook.

@@ -1004,14 +1004,17 @@ impl<U> Reactor<U> {
     /// than none, since the property it reports is "settles to zero".
     #[cfg(feature = "net-server")]
     pub(crate) fn sync_recv_buf_stats(&self) {
-        #[cfg_attr(not(feature = "uring-fs"), allow(unused_mut))]
+        #[cfg_attr(
+            not(all(feature = "net-server", feature = "uring-fs")),
+            allow(unused_mut)
+        )]
         let (mut lent, mut total) = match self.recv_bufs.as_ref() {
             Some(p) => (u64::from(p.lent()), u64::from(p.allocated())),
             None => (0, 0),
         };
         // Both pools report as one figure: an operator cares how much buffer
         // memory the ring holds, not which group it sits in.
-        #[cfg(feature = "uring-fs")]
+        #[cfg(all(feature = "net-server", feature = "uring-fs"))]
         if let Some(p) = self.body_bufs.as_ref() {
             lent += u64::from(p.lent());
             total += u64::from(p.allocated());
@@ -1422,7 +1425,7 @@ impl<U> Reactor<U> {
         stat!(self, pushes, u64::from(progress.pushes));
         // Chunks that reached the peer give their ring buffers back. Only
         // here, because only the reactor holds the pool.
-        #[cfg(feature = "uring-fs")]
+        #[cfg(all(feature = "net-server", feature = "uring-fs"))]
         if progress.freed > 0 {
             if let Some(pool) = self.body_bufs.as_mut() {
                 for &bid in &progress.freed_bids[..progress.freed as usize] {

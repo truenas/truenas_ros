@@ -135,6 +135,13 @@ where
                 tx: self.mailbox.inject_tx.clone(),
                 shared: Arc::clone(&self.core.engine.shared),
             };
+            // The leased form also hands out the recv claim, so a
+            // handler's `pwritev2_from` can write the body straight from
+            // the buffer.
+            #[cfg(feature = "uring-fs")]
+            let (header, body, peer, state, lease) = conn
+                .deliver_parts_leased(self.core.cfg.body_placement_threshold);
+            #[cfg(not(feature = "uring-fs"))]
             let (header, body, peer, state) =
                 conn.deliver_parts(self.core.cfg.body_placement_threshold);
             // The fs facade borrows the engine and the fs tables - fields
@@ -150,6 +157,7 @@ where
                     // Request-handler facade: `open` may mint a new file here.
                     true,
                 )
+                .with_recv_lease(lease)
             });
             (
                 (self.handlers.body)(Request {

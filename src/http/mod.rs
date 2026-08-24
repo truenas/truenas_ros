@@ -41,7 +41,10 @@
 //!   [`Stage::End`]. No reactor extension needed: an intermediate window is
 //!   answered with an empty `Reply`, which already means "answered, nothing
 //!   to send, keep serving", and a handler that must wait on a write parks
-//!   with `Defer` and resolves with an empty `Deferred::reply`.
+//!   with [`HttpRequest::defer_stream`] and resolves with
+//!   [`HttpStreamDeferred::resume`] - a park that retains no window and
+//!   re-runs no handler, so a write straight from the receive buffer
+//!   (`FsConn::pwritev2_from`) stays copy-free end to end.
 //! - **Keep-alive**: HTTP/1.1 persists unless `Connection: close`; HTTP/1.0
 //!   closes unless `Connection: keep-alive`. Close maps onto
 //!   [`Response::ReplyClose`](crate::net::server::Response::ReplyClose) --
@@ -111,8 +114,8 @@ pub use date::HttpDate;
 pub use framer::{HttpConfig, HttpConn};
 pub use head::{HeaderView, Version};
 pub use protocol::{
-    HttpDeferPermit, HttpDeferred, HttpRequest, HttpVerdict, Stage, protocol,
-    protocol_deferrable, protocol_streaming,
+    HttpDeferPermit, HttpDeferred, HttpRequest, HttpStreamDeferred,
+    HttpVerdict, Stage, protocol, protocol_deferrable, protocol_streaming,
 };
 #[cfg(feature = "uring-fs")]
 pub use protocol::{protocol_fs, protocol_streaming_fs};

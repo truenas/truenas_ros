@@ -1043,7 +1043,20 @@ where
                 }
                 // Continuation facade `root: false`: no new `open` (the owning
                 // connection may be gone; its file would leak).
-                reaped => {
+                mut reaped => {
+                    // A leased write's buffer comes back to the pool here,
+                    // before the callback runs: the op is over whatever the
+                    // connection did in the meantime, and the pool - which
+                    // only this dispatch can reach - is the one owner left.
+                    if let crate::uring_fs::core::ReapedFs::Embedded(_, done, _) =
+                        &mut reaped
+                        && let Some(bid) = done.take_recv_lease()
+                    {
+                        if let Some(pool) = self.core.recv_bufs.as_mut() {
+                            pool.release(bid);
+                        }
+                        self.core.sync_recv_buf_stats();
+                    }
                     if let Some(fs) = self.fs.as_mut() {
                         crate::uring_fs::core::deliver_embedded(
                             fs,
