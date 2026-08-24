@@ -77,6 +77,14 @@
 use crate::errno::{self, Errno};
 use crate::uring::sys::*;
 use std::os::fd::RawFd;
+// The tail cell is `std`'s in production, reached through a raw pointer into
+// the mapping; under loom it is loom's, owned by value and carrying the model
+// state - the same split `uring::ring` makes, and for the same reason: the
+// ordering below is then one store that both the kernel path and the model
+// go through.
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicU16, Ordering};
+#[cfg(not(loom))]
 use std::sync::atomic::{AtomicU16, Ordering};
 
 /// The system page size; the granularity the ring must be aligned to.
@@ -84,6 +92,22 @@ fn page_size() -> usize {
     // SAFETY: `sysconf` with a valid name reads no memory and returns a long.
     let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if n > 0 { n as usize } else { 4096 }
+}
+
+/// Publish the producer tail.
+///
+/// `Release` so the kernel cannot observe a tail that names a descriptor
+/// whose fields it has not yet seen: it reads the tail with
+/// `smp_load_acquire` and only then the descriptor
+/// (`io_ring_buffer_select`, `io_uring/kbuf.c:202-216`).
+///
+/// A function rather than a store inside [`BufRing::commit`] so that the
+/// ordering exists once and the loom model drives *this* store. A model with
+/// its own copy of the pairing checks the memory model rather than the code -
+/// it passes with this weakened to `Relaxed`, which is the case it is for.
+#[inline]
+fn publish_tail(cell: &AtomicU16, tail: u16) {
+    cell.store(tail, Ordering::Release);
 }
 
 /// Where one buffer id stands.
@@ -288,15 +312,12 @@ impl BufRing {
     }
 
     /// Make every descriptor written since the last commit visible.
-    ///
-    /// The store is `Release` so the kernel cannot observe a tail that names
-    /// a descriptor whose address it has not yet seen.
     fn commit(&self) {
         // SAFETY: entry zero exists (`entries >= 1`) and its `resv` field is
         // where the kernel reads the producer tail from.
         let tail =
             unsafe { &*(&raw const (*self.ring).resv).cast::<AtomicU16>() };
-        tail.store(self.tail, Ordering::Release);
+        publish_tail(tail, self.tail);
     }
 
     /// Keep `want` buffers allocated, posting or dropping to reach it.
@@ -855,10 +876,14 @@ mod tests {
     }
 
     /// A second release of the same id is refused before it can re-post a
-    /// buffer another op still owns, or wrap the loan count. Pins the
-    /// debug-build guard, which is the build the gate runs; the
-    /// release-mode `if` beside it needs a release lane to reach, because
-    /// this assert fires first.
+    /// buffer another op still owns, or wrap the loan count.
+    ///
+    /// The `debug_assert` fires first, so this reaches only the debug half
+    /// of the guard and only in a debug build - in a release build
+    /// `should_panic` has nothing to catch. The `if` beside it is what
+    /// ships, and `releasing_one_id_twice_is_refused_without_asserts`
+    /// covers that.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "releasing a buffer nobody took")]
     fn releasing_one_id_twice_is_refused() {
@@ -913,6 +938,32 @@ mod tests {
             before,
             "and the first loan stands"
         );
+    }
+
+    /// The shipping half of the same refusal: with `debug_assertions` off
+    /// the `if` is the whole guard, and what it must do is nothing.
+    ///
+    /// A fall-through re-posts an id that is already `Posted`, so the ring
+    /// would carry two descriptors naming one buffer and the kernel would
+    /// hand it to two ops at once. It also decrements `lent` from zero,
+    /// which wraps rather than panics here, and a wrapped loan count reads
+    /// as a nearly empty pool. Asserted on state instead of a panic so the
+    /// test says the same thing in either build.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn releasing_one_id_twice_is_refused_without_asserts() {
+        let Some(r) = ring() else {
+            return;
+        };
+        let mut br = BufRing::new(r.raw_fd(), 0, 4, 64, 4).expect("registers");
+        br.lend(1);
+        br.release(1);
+        assert_eq!(br.free(), 4, "the first release landed");
+        let (free, lent, allocated) = (br.free(), br.lent(), br.allocated());
+        br.release(1); // the second owner
+        assert_eq!(br.free(), free, "a refused release posted nothing");
+        assert_eq!(br.lent(), lent, "and retired no loan");
+        assert_eq!(br.allocated(), allocated, "and allocated nothing");
     }
 
     /// The steady-state path allocates nothing.
@@ -1162,16 +1213,19 @@ mod tests {
 // The publication protocol `commit` shares with the kernel, as a loom model.
 //
 // The real ring cannot run under loom (mmap, a registered fd), so the model
-// replicates the protocol's shape exactly: descriptor fields are plain
-// stores, the tail alone is `Release`, and the consumer - standing in for
-// `io_ring_buffer_select`, which pairs with `smp_load_acquire(&br->tail)`
-// (`io_uring/kbuf.c:202`) - acquires the tail and only then reads the
+// stands in a plain cell for the mapping - but it publishes through
+// `publish_tail`, the same function `commit` calls, so the ordering under
+// test is the one that ships rather than a copy of it. Descriptor fields are
+// plain stores, and the consumer - standing in for `io_ring_buffer_select`,
+// which pairs with `smp_load_acquire(&br->tail)` (`io_uring/kbuf.c:202`) -
+// acquires the tail and only then reads the
 // descriptor. The property is that a tail naming a descriptor
 // happens-after that descriptor's fields: weaken the store to `Relaxed`
 // and loom fails this model, which no functional test can, because the
 // misordering is invisible on x86 and the reader is the kernel.
 #[cfg(all(test, loom))]
 mod loom_tests {
+    use super::publish_tail;
     use loom::cell::UnsafeCell;
     use loom::sync::Arc;
     use loom::sync::atomic::{AtomicU16, Ordering};
@@ -1179,7 +1233,7 @@ mod loom_tests {
     struct Ring {
         /// One descriptor's `addr` field: written plainly, like `post`.
         addr: UnsafeCell<u64>,
-        /// The overlaid tail: stored `Release`, like `commit`.
+        /// The overlaid tail, published by `commit`'s own store.
         tail: AtomicU16,
     }
 
@@ -1199,8 +1253,8 @@ mod loom_tests {
             let t = loom::thread::spawn(move || {
                 // `post`: the descriptor's fields...
                 producer.addr.with_mut(|p| unsafe { *p = 0xB0F });
-                // ...then `commit`: the tail, released.
-                producer.tail.store(1, Ordering::Release);
+                // ...then `commit`, through the store `commit` itself uses.
+                publish_tail(&producer.tail, 1);
             });
             // The kernel's side: acquire the tail; a tail that names the
             // descriptor must find its address already there.

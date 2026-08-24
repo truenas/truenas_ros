@@ -35,7 +35,13 @@ use truenas_ros::{Errno, Error};
 fn is_unavailable(e: &Error) -> bool {
     matches!(
         e,
-        Error::Errno(Errno::EPERM | Errno::ENOSYS | Errno::EACCES)
+        // ENOMEM: rings pin pages against RLIMIT_MEMLOCK, so a loaded
+        // box exhausts it and ring creation fails - environmental, and
+        // the REQUIRE variable turns the skip red where it must not
+        // happen.
+        Error::Errno(
+            Errno::EPERM | Errno::ENOSYS | Errno::EACCES | Errno::ENOMEM
+        )
     )
 }
 
@@ -2648,6 +2654,78 @@ fn a_handler_refusing_mid_body_ends_the_connection() {
                 !rest.windows(4).any(|w| w == b"HTTP"),
                 "no second response was framed from the abandoned body"
             );
+            Ok(())
+        })();
+        stop.shutdown();
+        r
+    });
+    server.serve_forever().expect("serve_forever");
+    join.join().expect("client thread").expect("client io");
+}
+
+/// The redrive twin of the resume test above: a deferred `Open` resolved
+/// by `HttpDeferred::redrive` - the handler re-runs and answers
+/// `Continue` - owes the withheld interim exactly as a `resume()` does.
+/// The two routes emit independently, so each carries its own pin;
+/// without this one an expecting client holds its body back for its own
+/// timeout.
+#[test]
+fn a_redriven_stream_open_still_sends_the_interim() {
+    use truenas_ros::http::{HttpVerdict, Stage, protocol_streaming};
+
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = protocol_streaming(
+        HttpConfig::default(),
+        1 << 20,
+        |_inc: Incoming<'_>| Some(0usize),
+        |req: HttpRequest<'_>, opened: &mut usize| match req.stage {
+            Stage::Open if *opened == 0 => {
+                *opened = 1;
+                let (d, permit) = req.defer();
+                thread::spawn(move || {
+                    // The off-thread decision, resolved by re-running the
+                    // handler rather than by resuming the stream.
+                    thread::sleep(Duration::from_millis(20));
+                    d.redrive();
+                });
+                HttpVerdict::Defer(permit)
+            }
+            Stage::Open => HttpVerdict::Continue,
+            Stage::Window => HttpVerdict::Continue,
+            Stage::End => HttpVerdict::Respond(HttpResponse::new(200)),
+            Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
+        },
+    )
+    .expect("codec config is valid");
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let join = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            s.set_read_timeout(Some(Duration::from_secs(5)))?;
+            s.write_all(
+                b"PUT /up HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\n\
+                  Transfer-Encoding: chunked\r\n\r\n",
+            )?;
+            // The client's half of the dance: no body until the interim.
+            let mut interim = [0u8; 25];
+            s.read_exact(&mut interim)?;
+            assert_eq!(
+                &interim[..],
+                b"HTTP/1.1 100 Continue\r\n\r\n",
+                "the redriven open swallowed the interim"
+            );
+            s.write_all(b"5\r\nhello\r\n0\r\n\r\n")?;
+            let (status, _head, _body) = read_response(&mut s)?;
+            assert_eq!(status, 200);
             Ok(())
         })();
         stop.shutdown();

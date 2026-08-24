@@ -97,6 +97,16 @@ jobs:
         TRUENAS_ROS_REQUIRE_IO_URING: "1"
         TRUENAS_ROS_REQUIRE_XATTRS: "1"
 
+    # The build that ships: `debug_assert` guards vanish here, so the release
+    # lane is what covers each guard's graceful `if` half (the `should_panic`
+    # tests cover the assert half and are `#[cfg(debug_assertions)]`).
+    - name: test (release)
+      run: cargo test --release --all-features
+      env:
+        TRUENAS_ROS_REQUIRE_PYTHON: "1"
+        TRUENAS_ROS_REQUIRE_IO_URING: "1"
+        TRUENAS_ROS_REQUIRE_XATTRS: "1"
+
     # The concurrency models are gated on `#[cfg(loom)]`: loom substitutes std's
     # atomics/locks/UnsafeCell with its own permutation-checking versions, so they
     # cannot ride along with the `cargo test` above — they need their own build

@@ -524,6 +524,18 @@ Prove a test bites before trusting it. Break the thing it guards, watch it
 fail, restore. This applies to loom models too - the negative control is the
 evidence that the model is checking anything.
 
+**A guard written as `debug_assert` plus an `if` needs a test per half, and
+the gate runs both builds.** `should_panic` on the assert covers the build
+that panics and is vacuous in the one that ships - it fails outright there,
+having nothing to catch - so those tests carry `#[cfg(debug_assertions)]` and
+a `#[cfg(not(debug_assertions))]` sibling asserts the `if`'s behaviour on
+*state* instead. That is not a formality where the `if` is what stands between
+a double release and two descriptors naming one buffer: see
+`releasing_one_id_twice_is_refused{,_without_asserts}` and
+`promote_under_a_lease_fails_closed{,_without_asserts}`. Note that release
+turns an arithmetic guard's failure from a panic into a wrap, so the state a
+sibling test asserts on is the wrapped value, not an abort.
+
 Know what your environment hides. Running as **root** means DAC never denies
 anything, so an `EACCES` path cannot be provoked directly - go through a
 brokered unprivileged personality, or pin the predicate as a unit test. A
@@ -590,6 +602,7 @@ cargo fmt --all --check
 cargo fmt --all --check --manifest-path fuzz/Cargo.toml   # its own workspace
 cargo clippy --all-features --all-targets -- -D warnings
 cargo test --all-features --no-fail-fast
+cargo test --release --all-features --no-fail-fast   # the guards that ship
 RUSTFLAGS="--cfg loom" cargo test --lib --features uring    loom_
 RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
 RUSTFLAGS="--cfg loom" cargo test --lib --features http     loom_

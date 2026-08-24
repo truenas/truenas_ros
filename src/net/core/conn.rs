@@ -2281,7 +2281,12 @@ mod tests {
     /// Promote under a lease is declared unreachable - no recv is armed
     /// between the write's submit and the delivery's consume - so its guard
     /// fails closed loudly rather than moving bytes out from under the DMA.
-    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    ///
+    /// Debug builds only: the `debug_assert` is what panics, and in a
+    /// release build `should_panic` has nothing to catch.
+    /// `promote_under_a_lease_fails_closed_without_asserts` covers the
+    /// `return None` that ships beside it.
+    #[cfg(all(debug_assertions, feature = "net-server", feature = "uring-fs"))]
     #[test]
     #[should_panic(expected = "promote under a leased write")]
     fn promote_under_a_lease_fails_closed() {
@@ -2295,6 +2300,39 @@ mod tests {
         });
         rb.write_lease(64).expect("a claim leases").taken.set(true);
         let _ = rb.promote_for(0, 1 << 20);
+    }
+
+    /// The shipping half of the same guard: `None`, and the claim left
+    /// where it was.
+    ///
+    /// Returning the claim here would hand the pool a bid whose buffer the
+    /// write's DMA is still reading, and clearing `claim` would strand it -
+    /// `release` is the only place a buffer is reissued or freed.
+    #[cfg(all(
+        not(debug_assertions),
+        feature = "net-server",
+        feature = "uring-fs"
+    ))]
+    #[test]
+    fn promote_under_a_lease_fails_closed_without_asserts() {
+        let mut rb = RecvBuf::default();
+        rb.set_pooled();
+        let buf = Box::leak(vec![0u8; 64].into_boxed_slice());
+        rb.install(RecvClaim {
+            bid: 4,
+            ptr: buf.as_mut_ptr(),
+            cap: 64,
+        });
+        rb.write_lease(64).expect("a claim leases").taken.set(true);
+        assert!(
+            rb.promote_for(0, 1 << 20).is_none(),
+            "promote under a lease must not surrender the claim"
+        );
+        assert_eq!(
+            rb.claim.map(|c| c.bid),
+            Some(4),
+            "and must leave it installed for the op's completion to release"
+        );
     }
 
     /// A chunk can still be flushing when its tail retires. Its ring
