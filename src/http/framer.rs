@@ -132,12 +132,18 @@ impl HttpConfig {
 /// The most body a single streamed delivery carries.
 ///
 /// A bound this side picks, because the alternative is the peer's chunk
-/// size picking it. 128 KiB is what botocore sends over TLS
-/// (`httpsession.py`'s 128 KiB `BUFFER_SIZE`, which overrides urllib3's
-/// 16 KiB), so the common case is one window per chunk with no splitting;
-/// it clears one TLS record (`TLS_MAX_PAYLOAD_SIZE`, 16 KiB) by eight, which
-/// is what a kTLS recv needs before it will decrypt straight into the
-/// caller's pages; and it matches ZFS's default `recordsize`.
+/// size picking it. 128 KiB clears one TLS record (`TLS_MAX_PAYLOAD_SIZE`,
+/// 16 KiB) by eight, which is what a kTLS recv needs before it will decrypt
+/// straight into the caller's pages, and it matches ZFS's default
+/// `recordsize`.
+///
+/// It is *not* the peer's framing size, and does not divide it. botocore
+/// frames aws-chunks at `httpchecksum.py`'s `_DEFAULT_CHUNK_SIZE` of 1 MiB;
+/// `httpsession.py`'s 128 KiB `BUFFER_SIZE` is urllib3's socket blocksize
+/// (`pool_manager_kwargs['blocksize']`), which is a different quantity. So
+/// the default client sends eight windows per chunk and only the first of
+/// the eight carries a chunk header - see `stream_step`, which sizes a
+/// mid-chunk window from `chunk_left` alone.
 pub(crate) const STREAM_WINDOW: usize = 128 * 1024;
 
 /// Where the connection stands between messages.
