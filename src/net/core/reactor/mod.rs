@@ -271,21 +271,6 @@ impl<U> Reactor<U> {
             self.engine.leak_wake_buf();
             true
         } else {
-            // Quiesced: every op reaped, every completion processed, so the
-            // kernel's view of each buffer group must match this side's. A
-            // disagreement here is a stranded id somewhere upstream, which
-            // nothing else can observe (the strand leaves every gauge
-            // flat). Debug builds only - the probe is diagnostic.
-            #[cfg(all(debug_assertions, feature = "net-server"))]
-            {
-                if let Some(pool) = self.recv_bufs.as_ref() {
-                    pool.debug_assert_kernel_agrees();
-                }
-                #[cfg(feature = "uring-fs")]
-                if let Some(pool) = self.body_bufs.as_ref() {
-                    pool.debug_assert_kernel_agrees();
-                }
-            }
             false
         }
     }

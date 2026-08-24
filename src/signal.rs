@@ -424,6 +424,45 @@ mod tests {
         assert_eq!(rc, 0, "pthread_kill");
     }
 
+    /// The sender fields are read out of a union, so which `si_code`
+    /// values are allowed to name a sender is a memory-safety-adjacent
+    /// question and not a formatting one: for anything else the same bytes
+    /// are `si_status`/`si_utime` (a `SIGCHLD`) or `si_addr` (a kernel
+    /// fault), and reporting them as a pid/uid fabricates an origin out of
+    /// unrelated data. `Delivered::sender` is what a caller authorizes on.
+    ///
+    /// Only the three accepted codes are reachable through the public API
+    /// (a raised signal is `SI_TKILL`), so the refusals are pinned on the
+    /// predicate directly.
+    #[test]
+    fn only_the_codes_that_carry_a_sender_report_one() {
+        for code in [libc::SI_USER, libc::SI_QUEUE, libc::SI_TKILL] {
+            assert_eq!(
+                sender_of(code, 42, 7),
+                Some(Sender { pid: 42, uid: 7 }),
+                "si_code {code} fills the sender fields"
+            );
+        }
+        // A kernel-raised fault carries `si_addr` in those bytes; a timer
+        // carries `si_timerid`/`si_overrun`; a child carries `si_status`
+        // and `si_utime`. None of them is a pid.
+        for code in [
+            libc::SI_KERNEL,
+            libc::SI_TIMER,
+            libc::SI_MESGQ,
+            libc::SI_ASYNCIO,
+            libc::SI_SIGIO,
+            libc::CLD_EXITED,
+            libc::CLD_KILLED,
+        ] {
+            assert_eq!(
+                sender_of(code, 42, 7),
+                None,
+                "si_code {code} does not name a sender"
+            );
+        }
+    }
+
     fn me() -> Sender {
         // SAFETY: pure getters.
         unsafe {

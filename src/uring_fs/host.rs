@@ -536,17 +536,49 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
 
-    fn skip_unavailable(e: Errno) -> bool {
-        let unavailable =
-            matches!(e, Errno::EPERM | Errno::ENOSYS | Errno::EACCES);
-        if unavailable {
-            assert!(
-                std::env::var_os("TRUENAS_ROS_REQUIRE_IO_URING").is_none(),
-                "TRUENAS_ROS_REQUIRE_IO_URING set but io_uring unavailable: \
-                 {e}"
-            );
-        }
-        unavailable
+    use crate::uring::setup_unavailable as skip_unavailable;
+
+    /// `FsConfig` is checked before a ring is ever created, and the `ops`
+    /// ceiling is a field-width bound, not a taste one: an op-slot index is
+    /// packed into `user_data`'s 24-bit slot field (`user_data::SLOT_MASK`),
+    /// so a table larger than the field aliases indices and routes a
+    /// completion to the wrong op entry - the wrong bytes delivered to the
+    /// wrong caller, or a payload freed under one. Nothing downstream
+    /// re-checks it.
+    ///
+    /// Runs even where io_uring is unavailable: `check` precedes
+    /// `RingFd::setup`.
+    #[test]
+    fn a_config_the_slot_field_cannot_index_is_refused() {
+        use crate::uring::user_data::SLOT_MASK;
+        let over = FsConfig {
+            ops: (SLOT_MASK + 1) as u32,
+            ..FsConfig::default()
+        };
+        assert!(
+            matches!(UringFs::new(over), Err(crate::Error::Validation(_))),
+            "an op table wider than the slot field must be refused"
+        );
+        assert!(
+            matches!(
+                UringFs::new(FsConfig {
+                    ops: 1,
+                    ..FsConfig::default()
+                }),
+                Err(crate::Error::Validation(_))
+            ),
+            "an op table with no room to make progress is refused"
+        );
+        assert!(
+            matches!(
+                UringFs::new(FsConfig {
+                    entries: 3,
+                    ..FsConfig::default()
+                }),
+                Err(crate::Error::Validation(_))
+            ),
+            "a submission ring below the floor is refused"
+        );
     }
 
     fn ring_or_skip(entries: u32) -> Option<Ring> {

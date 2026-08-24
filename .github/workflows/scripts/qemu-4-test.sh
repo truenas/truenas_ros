@@ -135,6 +135,18 @@ export TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY=1
 # broker test to RUN: unprivileged ci.yml can only skip it, so without this the
 # headline multi-ring feature is gated by a test that never executes.
 export TRUENAS_ROS_REQUIRE_CRED_BROKER=1
+# The audit suite sends REAL records over NETLINK_AUDIT. It tolerates three
+# environments - no socket, a socket without CAP_AUDIT_WRITE, and the real
+# thing - and only the third tests anything. This VM is the only place that
+# holds: the appliance kernel carries CONFIG_AUDIT and the job runs as root,
+# so records are actually accepted. Unprivileged ci.yml can only reach the
+# EPERM tolerance, which is why the gate is armed here and not there.
+export TRUENAS_ROS_REQUIRE_AUDIT=1
+# The fsiter birth-time cutoff is skipped wholesale on a filesystem that
+# reports no btime. ZFS records one (crtime) and so does tmpfs, so both
+# scratch filesystems in this VM report it: force the cutoff assertion to
+# RUN rather than let a degraded fixture pass green.
+export TRUENAS_ROS_REQUIRE_BTIME=1
 # unix_peercred needs the AF_UNIX io_uring getsockopt fix (kernel >= 6.18.16).
 # We boot the TrueNAS <train>-nightly kernel (truenas/linux), whose uname -r
 # carries the full point release (e.g. 6.18.16-production+truenas), so read it

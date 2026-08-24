@@ -83,14 +83,23 @@ where
         // located and framing from the (never-installed) claim would read
         // garbage as the peer's - fail the read instead.
         if !self.core.adopt_recv_buffer(slot, generation, cqe_flags) {
-            if self.core.table.slot_matches_cqe(slot, generation) {
-                return self.core.close_conn(
-                    slot,
-                    generation,
-                    CloseReason::RecvError(errno::Errno::EIO),
-                );
+            if !self.core.table.slot_matches_cqe(slot, generation) {
+                return Ok(()); // stale completion; the slot moved on
             }
-            return Ok(());
+            // Retire the op before closing, exactly as a completion does.
+            // `close_conn` defers teardown while `ops` is charged, so
+            // skipping this leaves the slot, its fixed descriptor and the
+            // socket held for the reactor's life, with the peer getting
+            // neither a reply nor a FIN.
+            self.core.table.conn_mut(slot).recving = false;
+            if !self.core.op_done(slot)? {
+                return Ok(()); // already tearing down
+            }
+            return self.core.close_conn(
+                slot,
+                generation,
+                CloseReason::RecvError(errno::Errno::EIO),
+            );
         }
         match self.core.on_recv_complete(slot, generation, res, op)? {
             RecvStep::Deliver => {

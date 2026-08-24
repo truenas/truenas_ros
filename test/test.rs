@@ -1,6 +1,11 @@
 //! Integration tests for `truenas_ros` (mirrors `src/`, nix convention).
 #![cfg(target_os = "linux")]
 
+// The `TRUENAS_ROS_REQUIRE_XATTRS` gate, shared with the live suites.
+#[cfg(feature = "xattr")]
+#[path = "support/xattr.rs"]
+mod xattr_probe;
+
 #[cfg(feature = "sync-fs")]
 mod fs {
     use std::os::fd::AsFd;
@@ -111,9 +116,79 @@ mod xattr {
                 assert!(names.iter().any(|n| n.as_bytes() == name.as_bytes()));
             }
             // Some filesystems (e.g. certain tmpfs configs) reject user
-            // xattrs; treat that as "not applicable" rather than a failure.
-            Err(Errno::EOPNOTSUPP) => {}
+            // xattrs. That is "not applicable" rather than a failure - but
+            // it skips every assertion above, so where CI arms the gate it
+            // is a failure instead.
+            Err(Errno::EOPNOTSUPP) => super::xattr_probe::refusal_is_allowed(
+                "fsetxattr(user.truenas_ros_test)",
+                Errno::EOPNOTSUPP,
+            ),
             Err(e) => panic!("fsetxattr failed unexpectedly: {e}"),
+        }
+    }
+
+    /// A name list larger than the initial buffer has to come back whole.
+    ///
+    /// `flistxattr` starts with 256 bytes and regrows on `ERANGE`, so the
+    /// fixture has to outgrow the first buffer for the regrow to run at
+    /// all. A truncated list is not an error to any caller - it is a
+    /// *shorter* list, and `shutil::copy_permissions` reads exactly that
+    /// list to decide whether the file carries an access ACL. Drop
+    /// `system.posix_acl_access` from it and the copy takes the `fchmod`
+    /// branch instead of transporting the ACL, which on ZFS rewrites or
+    /// discards it (`zfs_acl_chmod_setattr`) - the outcome the no-fchmod
+    /// decision exists to prevent.
+    #[test]
+    fn a_name_list_past_the_first_buffer_comes_back_whole() {
+        use std::os::fd::AsFd;
+        let dir = truenas_ros::tempdir().unwrap();
+        let path = dir.path().join("many");
+        std::fs::write(&path, b"x").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        // 20 names of ~26 bytes each: well past the 256-byte first try,
+        // well inside any filesystem's per-inode xattr room.
+        let mut want: Vec<String> = Vec::new();
+        for i in 0..20 {
+            let name = format!("user.padding_name_{i:02}");
+            match fsetxattr(
+                file.as_fd(),
+                name.as_str(),
+                b"",
+                XattrFlags::empty(),
+            ) {
+                Ok(()) => want.push(name),
+                Err(Errno::EOPNOTSUPP) => {
+                    super::xattr_probe::refusal_is_allowed(
+                        "fsetxattr(user.padding_name_*)",
+                        Errno::EOPNOTSUPP,
+                    );
+                    return;
+                }
+                // A filesystem that runs out of xattr room mid-way still
+                // proves the point with what it took, as long as the names
+                // outgrow the first buffer.
+                Err(Errno::ENOSPC) | Err(Errno::E2BIG) => break,
+                Err(e) => panic!("fsetxattr: {e}"),
+            }
+        }
+        let total: usize = want.iter().map(|n| n.len() + 1).sum();
+        assert!(
+            total > 256,
+            "the fixture has to outgrow the first buffer, got {total} bytes"
+        );
+
+        let got = flistxattr(file.as_fd()).expect("list");
+        for name in &want {
+            assert!(
+                got.iter().any(|g| g.as_bytes() == name.as_bytes()),
+                "{name} missing from a list of {} - the regrow dropped it",
+                got.len()
+            );
         }
     }
 
@@ -477,8 +552,9 @@ mod fhandle {
 mod fsiter {
     use std::collections::BTreeSet;
     use truenas_ros::Error;
+    use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::iter::FsIterBuilder;
-    use truenas_ros::sync_fs::{AtFlags, StatxMask, statx};
+    use truenas_ros::sync_fs::{AtFlags, OFlag, StatxMask, statx};
 
     /// The mount source of `p`, so the fsiter source-check matches on kernels
     /// that report `sb_source`. Where it is not reported (e.g. the TrueNAS 6.12
@@ -488,6 +564,50 @@ mod fsiter {
             .ok()
             .and_then(|sm| sm.sb_source)
             .unwrap_or_else(|| "x".to_string())
+    }
+
+    /// A walk that cannot open an entry surfaces the error and then stops.
+    ///
+    /// The iterator prunes exactly what has nothing left to list - the same
+    /// line `query_tree`'s `is_subtree_skip` draws - and everything else
+    /// has to reach the caller. `copytree` is built directly on this
+    /// (`let entry = res?`), so an error swallowed here is a partial tree
+    /// copied as if it were whole: data loss that reads as success.
+    ///
+    /// The `fatal` latch is the second half. Once a walk has failed its
+    /// directory stack describes a position it never reached, so continuing
+    /// to yield from it would produce a listing that is short *and* has no
+    /// error in it.
+    ///
+    /// Provoked with `ENOTDIR` (a regular file where a directory open is
+    /// demanded) rather than a permission denial, which running as root
+    /// cannot stage.
+    #[test]
+    fn a_walk_that_cannot_open_an_entry_reports_it_and_stops() {
+        let dir = truenas_ros::tempdir().unwrap();
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
+        std::fs::write(dir.path().join("g"), b"y").unwrap();
+
+        // Directories still open (the walk uses its own flags for those);
+        // a regular file opened `O_DIRECTORY` is ENOTDIR.
+        let mut it = FsIterBuilder::new(dir.path(), fs_source(dir.path()))
+            .file_open_flags(
+                OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY,
+            )
+            .build()
+            .unwrap();
+
+        let first = it.next().expect("the walk yields something");
+        assert!(
+            matches!(first, Err(Error::Errno(Errno::ENOTDIR))),
+            "an unopenable entry must surface, not be pruned: {first:?}"
+        );
+        assert!(
+            it.next().is_none(),
+            "a failed walk must stop rather than yield a short listing \
+             with no error in it"
+        );
+        assert!(it.next().is_none(), "and stay stopped");
     }
 
     fn names(dir: &std::path::Path) -> (BTreeSet<String>, u64, u64) {
@@ -946,6 +1066,77 @@ mod shutil {
         CopyTreeConfig, copytree, copytree_reporting,
     };
 
+    /// Two sibling subdirectories, so the walk has to *ascend* between
+    /// them.
+    ///
+    /// The ascent only runs with more than one subdirectory, and
+    /// `parent_dst` is read from the frame stack immediately after it - so
+    /// a frame left unpopped puts every
+    /// entry of the second subdirectory inside the first one's
+    /// destination (`src/b/2` landing at `dst/a/b/2`) and stamps the wrong
+    /// directory's mode. `copytree` still returns `Ok` with plausible
+    /// stats, so the misplacement is silent.
+    #[test]
+    fn sibling_subdirectories_land_beside_each_other() {
+        let tmp = truenas_ros::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("a")).unwrap();
+        std::fs::create_dir_all(src.join("b")).unwrap();
+        std::fs::write(src.join("a/1"), b"one").unwrap();
+        std::fs::write(src.join("b/2"), b"two").unwrap();
+        // Distinct modes, so a frame stamped onto the wrong directory shows.
+        std::fs::set_permissions(
+            src.join("a"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            src.join("b"),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+
+        let dst = tmp.path().join("dst");
+        copytree(&src, &dst, &CopyTreeConfig::default()).unwrap();
+
+        assert_eq!(std::fs::read(dst.join("a/1")).unwrap(), b"one");
+        assert_eq!(std::fs::read(dst.join("b/2")).unwrap(), b"two");
+        assert!(
+            !dst.join("a/b").exists(),
+            "the second subdirectory was copied inside the first"
+        );
+        let mode = |p: &std::path::Path| {
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!(mode(&dst.join("a")), 0o755, "a's mode landed on a");
+        assert_eq!(mode(&dst.join("b")), 0o750, "b's mode landed on b");
+    }
+
+    /// A destination *inside* the source is skipped rather than descended
+    /// into.
+    ///
+    /// Without the guard the walk descends into the tree it is filling and
+    /// copies its own output back into itself, which terminates only at the
+    /// walk's depth limit or when the filesystem fills - after writing an
+    /// exponentially duplicated tree. `copytree` advertises the skip; this
+    /// is what holds it.
+    #[test]
+    fn a_destination_inside_the_source_is_not_copied_into_itself() {
+        let tmp = truenas_ros::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/f"), b"x").unwrap();
+
+        let dst = src.join("backup");
+        copytree(&src, &dst, &CopyTreeConfig::default()).unwrap();
+
+        assert_eq!(std::fs::read(dst.join("sub/f")).unwrap(), b"x");
+        assert!(
+            !dst.join("backup").exists(),
+            "the copy descended into its own destination"
+        );
+    }
+
     // An xattr name need not be UTF-8 (the kernel checks length and namespace
     // only, and ZFS validates names solely on the dir path under `utf8only`).
     // The copier must address such a name by its bytes and carry it across.
@@ -973,7 +1164,11 @@ mod shutil {
             )
         };
         if rc != 0 {
-            return; // the filesystem rejects `user.` xattrs here
+            super::xattr_probe::refusal_is_allowed(
+                "fsetxattr(non-utf8 user name)",
+                std::io::Error::last_os_error(),
+            );
+            return;
         }
         drop(f);
 
@@ -1043,7 +1238,11 @@ mod shutil {
             return; // needs CAP_SETFCAP, or the fs has no security namespace
         }
         if setxattr(&f, c"user.marker", b"v") != 0 {
-            return; // the filesystem rejects `user.` xattrs here
+            super::xattr_probe::refusal_is_allowed(
+                "setxattr(user.marker)",
+                std::io::Error::last_os_error(),
+            );
+            return;
         }
         drop(f);
 

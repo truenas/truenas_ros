@@ -240,6 +240,15 @@ pub(crate) enum Phase {
     StreamDone {
         /// The head this body belonged to.
         head: Vec<u8>,
+        /// Where the terminal block starts inside the delivered header.
+        ///
+        /// `chunked::step` counts a chunked body's framing from the CRLF
+        /// that closed the previous payload, so a terminal chunk arriving
+        /// after one is delivered as `\r\n0\r\n...`. The trailer parser
+        /// starts in its size state, where that leading empty line is a
+        /// malformed size line - so the offset travels with the phase
+        /// rather than being re-derived from the bytes.
+        block_at: usize,
     },
     /// A request is parked for deferred completion
     /// ([`HttpRequest::defer`](super::protocol::HttpRequest::defer)): the
@@ -497,24 +506,33 @@ pub(crate) fn frame<U>(
                     };
                     match body {
                         BodyKind::Known(body_len) => {
-                            // On a streaming connection a body above one
-                            // window streams: below that a whole delivery
-                            // is already a single pool-buffered read, so
-                            // there is nothing for a window to save. The
-                            // bound becomes the stream cap — the body
-                            // never sits in a buffer for `max_body` to
-                            // protect.
-                            if let Some(cap) = conn.stream_cap
+                            // The streaming cap is what the endpoint says it
+                            // accepts, so it bounds every body on the
+                            // connection - not only the ones large enough to
+                            // stream. A body under one window takes the
+                            // buffered path, which is a delivery decision;
+                            // it does not make the declared bound optional,
+                            // and the chunked leg applies it per chunk
+                            // regardless of size.
+                            if conn
+                                .stream_cap
+                                .is_some_and(|cap| body_len as u64 > cap)
+                            {
+                                return fail(
+                                    &mut conn.phase,
+                                    buf.len(),
+                                    413,
+                                    head_only,
+                                );
+                            }
+                            // Above one window it streams; below it a whole
+                            // delivery is already a single pool-buffered
+                            // read, so there is nothing for a window to
+                            // save. Streaming also lifts `max_body`, which
+                            // bounds a buffer the body never sits in.
+                            if conn.stream_cap.is_some()
                                 && body_len > STREAM_WINDOW
                             {
-                                if body_len as u64 > cap {
-                                    return fail(
-                                        &mut conn.phase,
-                                        buf.len(),
-                                        413,
-                                        head_only,
-                                    );
-                                }
                                 let head_len = facts.len;
                                 conn.phase = Phase::StreamOpen {
                                     head: buf[..head_len].to_vec(),
@@ -699,7 +717,13 @@ fn stream_step<U>(buf: &[u8], conn: &mut HttpConn<U>) -> Framing {
             else {
                 unreachable!("matched StreamBody above");
             };
-            conn.phase = Phase::StreamDone { head };
+            // `chunked::step` counted `framing` from the CRLF that closed
+            // the previous payload; the terminal block itself starts after
+            // it.
+            conn.phase = Phase::StreamDone {
+                head,
+                block_at: if after_payload { 2 } else { 0 },
+            };
             // A terminal chunk is only locatable once its whole trailer
             // section is buffered, so this delivers immediately and the
             // phase change cannot be re-entered.
@@ -1131,6 +1155,89 @@ mod tests {
             }
         );
         assert!(matches!(c.phase, Phase::Fail { status: 413, .. }));
+    }
+
+    /// The decoded cap holds on a *completing* arrival too.
+    ///
+    /// `chunked_decoded_over_cap_fails_413` drives the mid-stream branch,
+    /// where the scan answers `Ok(None)`; a body whose head, chunks and
+    /// terminator land in one read never passes through it. Without the
+    /// check on this arm the same bytes are accepted or refused on TCP
+    /// segmentation alone, which is a `max_body` bypass for any client
+    /// that can get its request into a single segment. The wire-cap twin
+    /// on this arm is pinned by `chunked_wire_overhead_fails_400_on_completion`.
+    /// The streaming cap bounds a body under one window too.
+    ///
+    /// `max_body_bytes` is what the endpoint declares it accepts, and the
+    /// delivery decision - stream it, or buffer it because it fits one
+    /// window - is not what makes it apply. Gating the check on
+    /// `body_len > STREAM_WINDOW` leaves every smaller body bounded only by
+    /// `HttpConfig::max_body`, which is the buffer bound and is normally
+    /// much larger, so an endpoint that declared a 1 KiB limit takes 100
+    /// KiB. The chunked leg checks its cap per chunk regardless of size.
+    #[test]
+    fn a_known_body_under_one_window_still_meets_the_stream_cap() {
+        let cfg = HttpConfig {
+            max_head: 1024,
+            max_body: 8 * 1024 * 1024,
+        };
+        let over = 100 * 1024;
+        assert!(over < STREAM_WINDOW, "the point is a sub-window body");
+
+        let mut c = HttpConn::new_streaming((), 1024);
+        let head = format!(
+            "PUT /k HTTP/1.1\r\nHost: h\r\nContent-Length: {over}\r\n\r\n"
+        );
+        assert_eq!(
+            frame(head.as_bytes(), &mut c, &cfg),
+            Framing::Complete {
+                header_len: head.len(),
+                body_len: 0
+            }
+        );
+        assert!(
+            matches!(c.phase, Phase::Fail { status: 413, .. }),
+            "a {over}-byte body was admitted against a 1 KiB cap: {:?}",
+            c.phase
+        );
+
+        // And the legitimate case still frames: at the cap, not over it.
+        let mut c = HttpConn::new_streaming((), 1024);
+        let head =
+            b"PUT /k HTTP/1.1\r\nHost: h\r\nContent-Length: 1024\r\n\r\n";
+        let _ = frame(head, &mut c, &cfg);
+        assert!(
+            !matches!(c.phase, Phase::Fail { .. }),
+            "a body exactly at the cap is accepted: {:?}",
+            c.phase
+        );
+    }
+
+    #[test]
+    fn chunked_decoded_over_cap_fails_413_on_completion() {
+        let mut c = conn();
+        let small = HttpConfig {
+            max_head: 1024,
+            max_body: 10,
+        };
+        let head =
+            b"PUT /k HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut raw = head.to_vec();
+        // 11 decoded bytes, terminator included, all in one arrival.
+        raw.extend_from_slice(b"b\r\n0123456789A\r\n0\r\n\r\n");
+        assert_eq!(
+            frame(&raw, &mut c, &small),
+            Framing::Complete {
+                header_len: raw.len(),
+                body_len: 0
+            }
+        );
+        assert!(
+            matches!(c.phase, Phase::Fail { status: 413, .. }),
+            "a body that completes in one read still has to meet the cap: \
+             {:?}",
+            c.phase
+        );
     }
 
     #[test]

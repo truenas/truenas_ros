@@ -706,14 +706,7 @@ mod tests {
     fn setup_or_skip(entries: u32) -> Option<RingFd> {
         match RingFd::setup(entries) {
             Ok(r) => Some(r),
-            Err(e @ (Errno::ENOSYS | Errno::EPERM | Errno::EACCES)) => {
-                assert!(
-                    std::env::var_os("TRUENAS_ROS_REQUIRE_IO_URING").is_none(),
-                    "TRUENAS_ROS_REQUIRE_IO_URING set but io_uring \
-                     unavailable: {e}"
-                );
-                None
-            }
+            Err(e) if crate::uring::setup_unavailable(e) => None,
             Err(e) => panic!("io_uring_setup: {e}"),
         }
     }

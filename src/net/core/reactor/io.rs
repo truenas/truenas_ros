@@ -56,7 +56,11 @@ fn stamp_select(_sqe: &mut IoUringSqe, _select: Option<u16>) {}
 #[cfg(feature = "net-server")]
 const RECV_POOL_BUF: usize = 256 * 1024;
 
-/// Recv-ring descriptor slots per connection.
+/// The leased-write depth a connection may hold, in recv-ring buffers.
+///
+/// The ring registers this *plus one* per connection: the extra slot is the
+/// message arriving while the leases are outstanding, so a handler at the
+/// cap is not the thing that pushes its own connection over the wall.
 ///
 /// One would cover arrivals alone - no more messages can be arriving at
 /// once than there are connections - but a leased write
@@ -387,6 +391,28 @@ impl<U> Reactor<U> {
         generation: u32,
         op: Op,
     ) -> errno::Result<()> {
+        // The continuation re-arms off the advanced cursor with no fresh
+        // reserve, so `recv_ptr`'s SAFETY contract - the offset stays within
+        // the allocation - rests on the initial arm having refused a pool
+        // buffer an exact read would overrun (`submit_recv`). Checked in
+        // every build rather than asserted: what is on the other side is the
+        // kernel writing past that allocation, and a `debug_assert` is
+        // compiled out of the build that ships, so the case it exists for
+        // would be silent exactly where it matters. One `checked_add` and a
+        // comparison, before anything is armed or counted, so the refusal
+        // needs no unwind - closing is what this reactor answers every other
+        // unusable recv with.
+        if !self.table.conn(slot).recv_armed_within() {
+            debug_assert!(
+                false,
+                "kTLS continuation would arm past the recv buffer"
+            );
+            return self.close_conn(
+                slot,
+                generation,
+                CloseReason::RecvError(errno::Errno::EIO),
+            );
+        }
         let conn = self.table.conn_mut(slot);
         conn.recving = true;
         // A continuation is an active mid-message transfer regardless of how
@@ -394,16 +420,6 @@ impl<U> Reactor<U> {
         conn.recv_idle = false;
         conn.ops += 1;
         let want = conn.recv_want();
-        // The continuation re-arms off the advanced cursor with no fresh
-        // reserve, so `recv_ptr`'s SAFETY contract - the offset stays within
-        // the buffer - rests entirely on the initial arm having refused a
-        // pool buffer an exact read would overrun (`submit_recv`). Assert it
-        // here so a regression in that refusal is loud rather than a kernel
-        // write past the buffer.
-        debug_assert!(
-            conn.recv_armed_within(),
-            "kTLS continuation would arm past the recv buffer"
-        );
         let ptr = conn.recv_ptr();
         let addr = conn.arm_ktls_recv(ptr, want);
         // SECURITY: carry the request clock onto the continuation too (see

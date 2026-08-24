@@ -39,6 +39,18 @@ const BIG: usize = 64 * 1024;
 
 static BIG_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
+/// The second threshold, for a path whose unit is smaller than [`BIG`].
+///
+/// A known-length window is bounded by what the recv already buffered, and
+/// the reactor fills that a `RECV_CHUNK` at a time - so those windows are
+/// around 4 KiB and a per-window copy never reaches `BIG`. Counting from
+/// half a chunk keeps the copy visible while staying above the framing and
+/// reply-building traffic, which is what a lower bar would drown the signal
+/// in.
+const MED: usize = 2 * 1024;
+
+static MED_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+
 /// The counter is process-global, so two measurements running at once
 /// report each other's allocations. Cargo runs a binary's tests as threads,
 /// so they have to take turns.
@@ -53,6 +65,9 @@ unsafe impl GlobalAlloc for Counting {
         if l.size() >= BIG {
             BIG_ALLOCS.fetch_add(1, Ordering::Relaxed);
         }
+        if l.size() >= MED {
+            MED_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        }
         unsafe { System.alloc(l) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
@@ -61,6 +76,9 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
         if new >= BIG {
             BIG_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        }
+        if new >= MED {
+            MED_ALLOCS.fetch_add(1, Ordering::Relaxed);
         }
         unsafe { System.realloc(p, l, new) }
     }
@@ -405,7 +423,7 @@ fn serving_file_bodies_does_not_allocate_per_connection() {
 fn put_to_file_cost(
     mib: usize,
     wire_of: fn(&[u8]) -> Vec<u8>,
-) -> Option<(usize, bool)> {
+) -> Option<(usize, usize, bool)> {
     use std::sync::OnceLock;
     use truenas_ros::http::HttpStreamDeferred;
     use truenas_ros::uring_fs::{Personality, RwFlags};
@@ -518,17 +536,19 @@ fn put_to_file_cost(
         let mut s = TcpStream::connect(v4).expect("connect");
         s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
         let before = BIG_ALLOCS.load(Ordering::Relaxed);
+        let before_med = MED_ALLOCS.load(Ordering::Relaxed);
         s.write_all(&wire).expect("write");
         let status = read_status(&mut s).expect("status");
         assert_eq!(status, 200, "upload refused");
         let cost = BIG_ALLOCS.load(Ordering::Relaxed) - before;
+        let cost_med = MED_ALLOCS.load(Ordering::Relaxed) - before_med;
         drop(s);
         stop.shutdown();
-        cost
+        (cost, cost_med)
     });
 
     server.serve_forever().expect("serve_forever");
-    let cost = client.join().expect("client thread");
+    let (cost, cost_med) = client.join().expect("client thread");
     let s = stats.snapshot();
     assert!(
         s.recv_bufs_total > 0,
@@ -541,7 +561,7 @@ fn put_to_file_cost(
     let written = std::fs::read(&path).expect("read back");
     let matches = written == payload;
     let _ = std::fs::remove_dir_all(&dir);
-    Some((cost, matches))
+    Some((cost, cost_med, matches))
 }
 
 /// Writing a streamed PUT to a file must neither corrupt it nor allocate
@@ -557,10 +577,10 @@ fn put_to_file_cost(
 fn a_streamed_put_writes_windows_without_copying_them() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
     let wire = |p: &[u8]| chunked_put(p, 128 * 1024);
-    let Some((small, ok_small)) = put_to_file_cost(4, wire) else {
+    let Some((small, _, ok_small)) = put_to_file_cost(4, wire) else {
         return; // io_uring unavailable
     };
-    let Some((large, ok_large)) = put_to_file_cost(16, wire) else {
+    let Some((large, _, ok_large)) = put_to_file_cost(16, wire) else {
         return;
     };
     assert!(ok_small && ok_large, "file bytes differ from the upload");
@@ -580,22 +600,32 @@ fn a_streamed_put_writes_windows_without_copying_them() {
 /// body this size that fails to stream fails the test outright — the
 /// regression this exists to catch is precisely a silent fall back to
 /// buffering.
+///
+/// Counted from [`MED`], not [`BIG`], and moving it back would empty this
+/// test out: a known-length window is bounded by what the recv already
+/// buffered and the reactor fills that a `RECV_CHUNK` at a time, so these
+/// windows are around 4 KiB and a per-window copy of one never reaches
+/// `BIG` - against that threshold the measurement is 0 against 0, which
+/// holds nothing. (The same window size is why a known-length body takes
+/// roughly thirty times the dispatches of a chunked one carrying the same
+/// payload; changing it means changing what the reactor arms for a
+/// streamed body, which is a separate decision from what this measures.)
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_known_length_put_streams_without_copying() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some((small, ok_small)) = put_to_file_cost(4, cl_put) else {
+    let Some((_, small, ok_small)) = put_to_file_cost(4, cl_put) else {
         return; // io_uring unavailable
     };
-    let Some((large, ok_large)) = put_to_file_cost(16, cl_put) else {
+    let Some((_, large, ok_large)) = put_to_file_cost(16, cl_put) else {
         return;
     };
     assert!(ok_small && ok_large, "file bytes differ from the upload");
     assert!(
         large <= small + 8,
         "CL PUT-to-file cost scales with payload: 4 MiB cost {small}, \
-         16 MiB cost {large} large allocations. A copy fallback or a \
-         park that retains the window looks exactly like this."
+         16 MiB cost {large} allocations at or above MED. A copy fallback \
+         or a park that retains the window looks exactly like this."
     );
 }
 

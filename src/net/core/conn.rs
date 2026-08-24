@@ -1337,7 +1337,19 @@ impl<U> Connection<U> {
     /// (`submit_recv`), the range is always inside, and this makes that
     /// checkable rather than assumed.
     pub(crate) fn recv_armed_within(&self) -> bool {
-        self.recv_buf.armed_within(self.recv_at, self.recv_want)
+        // The same two arms as `recv_ptr`, because what this bounds is the
+        // allocation that call is about to name. A placed body reads into
+        // `body_buf` - reserved to `body_len` by `arm_body_recv`, which
+        // truncates the accumulate buffer to the header - so asking
+        // `recv_buf` about it inspects unrelated storage, and answers
+        // "outside" for every body larger than its own head.
+        match &self.body_buf {
+            Some(body) if self.recv_into_body => self
+                .recv_at
+                .checked_add(self.recv_want)
+                .is_some_and(|end| end <= body.capacity()),
+            _ => self.recv_buf.armed_within(self.recv_at, self.recv_want),
+        }
     }
 
     /// Complete a placed-body recv: the whole body is now initialized, so the

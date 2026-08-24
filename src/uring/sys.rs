@@ -384,41 +384,6 @@ pub(crate) const IORING_UNREGISTER_PBUF_RING: u32 = 23;
 #[cfg(feature = "net-server")]
 pub(crate) const IORING_REGISTER_PBUF_STATUS: u32 = 26;
 
-/// `struct io_uring_buf_status` - `IORING_REGISTER_PBUF_STATUS`'s in/out
-/// argument: `buf_group` in, the group's consumer `head` out, `resv`
-/// required zero (`io_register_pbuf_status`, `io_uring/kbuf.c:728-749`).
-#[repr(C)]
-#[cfg(feature = "net-server")]
-pub(crate) struct IoUringBufStatus {
-    pub buf_group: u32,
-    pub head: u32,
-    pub resv: [u32; 8],
-}
-
-/// The kernel's consumer head for provided-buffer group `bgid`: how many
-/// descriptors it has taken off that ring since registration, mod 2^16.
-#[cfg(feature = "net-server")]
-pub(crate) fn pbuf_status_head(
-    ring_fd: RawFd,
-    bgid: u16,
-) -> errno::Result<u32> {
-    let mut st = IoUringBufStatus {
-        buf_group: u32::from(bgid),
-        head: 0,
-        resv: [0; 8],
-    };
-    // SAFETY: `st` is a valid status struct with zero `resv`; the kernel
-    // reads `buf_group` and writes `head`.
-    unsafe {
-        io_uring_register(
-            ring_fd,
-            IORING_REGISTER_PBUF_STATUS,
-            (&raw mut st).cast(),
-            1,
-        )
-    }?;
-    Ok(st.head)
-}
 pub(crate) const IORING_RSRC_REGISTER_SPARSE: u32 = 1 << 0;
 
 /// `struct io_uring_buf_reg` - the argument to

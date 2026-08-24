@@ -1016,7 +1016,10 @@ where
                         // `StreamDone` is what the resume arm reads as
                         // "dispatch it now, nothing further to frame".
                         next: if left == 0 {
-                            Phase::StreamDone { head }
+                            // A known-length body has no terminal block at
+                            // all; the End stage is dispatched from the
+                            // resume with nothing to parse.
+                            Phase::StreamDone { head, block_at: 0 }
                         } else {
                             Phase::StreamKnown {
                                 head,
@@ -1033,11 +1036,14 @@ where
         }
         // The terminal chunk: the delivered header IS the trailer section,
         // so the trailers are parsed from it here rather than carried.
-        Phase::StreamDone { head } => {
+        Phase::StreamDone { head, block_at } => {
             // The terminal block is itself a complete (empty) chunked
             // message, so the whole-message compactor parses its trailer
             // section. It has to outlive the dispatch: the views borrow it.
-            let mut wire = header.to_vec();
+            // `block_at` skips the CRLF that closed the last payload, which
+            // the compactor would read as an empty - malformed - size line
+            // and refuse, losing every trailer with it.
+            let mut wire = header[block_at.min(header.len())..].to_vec();
             let compacted = chunked::compact(&mut wire).ok();
             let trailers = compacted
                 .as_ref()
@@ -1134,13 +1140,17 @@ where
                         .collect();
                     let stage =
                         resume.as_ref().map_or(Stage::Whole, |r| r.stage);
+                    // The handles are split because a redriven window that
+                    // exhausted a known length owes an End dispatch as well
+                    // (below), exactly as the inline path does.
+                    let mut fs = fs;
                     let d = dispatch(
                         &head,
                         Body::placed(parked),
                         &views,
                         peer,
-                        responder,
-                        fs,
+                        responder.split(),
+                        split_slot(&mut fs),
                         &mut conn.state,
                         dates,
                         handler,
@@ -1152,6 +1162,31 @@ where
                         // interim a parked open was still withholding -
                         // the redrive route owes it exactly as the resume
                         // route does.
+                        //
+                        // `StreamDone` is not a phase to restore. It marks a
+                        // known length already spent, so no wire remains to
+                        // frame an End delivery from - and the framer's
+                        // degrade arm would declare whatever is buffered,
+                        // i.e. the *next* pipelined request's head, as this
+                        // message's header. Dispatch End here instead, which
+                        // is what the resume route does with the same marker.
+                        (Dispatched::Continue, Some(r))
+                            if matches!(r.next, Phase::StreamDone { .. }) =>
+                        {
+                            let d = dispatch(
+                                &head,
+                                Body::inline(&[]),
+                                &[],
+                                peer,
+                                responder,
+                                fs,
+                                &mut conn.state,
+                                dates,
+                                handler,
+                                Stage::End,
+                            );
+                            settle(conn, d, None)
+                        }
                         (Dispatched::Continue, Some(r)) => {
                             conn.phase = r.next;
                             Response::Reply(if r.expect_interim {
@@ -1896,6 +1931,158 @@ mod tests {
         assert!(is_keep(&resp));
         assert!(text(&resp).starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(matches!(conn.phase, Phase::Head));
+    }
+
+    /// An expecting client on a *streaming* endpoint gets its interim when
+    /// the handler accepts at `Stage::Open`.
+    ///
+    /// Three routes owe the withheld interim and each carries its own
+    /// pin: the two deferred ones park first
+    /// (`a_deferred_stream_open_still_sends_the_interim`,
+    /// `a_redriven_stream_open_still_sends_the_interim`), and this is the
+    /// inline one. An interim withheld here stalls an expecting upload for
+    /// the client's own timeout.
+    #[test]
+    fn an_accepted_streamed_open_releases_the_withheld_interim() {
+        let head = b"PUT /up HTTP/1.1\r\nHost: h\r\n\
+                     Expect: 100-continue\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n";
+        let mut conn = HttpConn::new_streaming((), 1 << 20);
+        let p = peer();
+        assert_eq!(
+            frame(head, &mut conn, &cfg()),
+            Framing::Complete {
+                header_len: head.len(),
+                body_len: 0
+            }
+        );
+        let resp = drive_verdict(
+            head,
+            Body::inline(b""),
+            &p,
+            &mut conn,
+            &mut |req: HttpRequest<'_>, _: &mut ()| {
+                assert!(matches!(req.stage, Stage::Open));
+                HttpVerdict::Continue
+            },
+        );
+        assert_eq!(
+            text(&resp),
+            "HTTP/1.1 100 Continue\r\n\r\n",
+            "an accepted streamed open owes the interim it withheld"
+        );
+        assert!(
+            matches!(conn.phase, Phase::StreamBody { .. }),
+            "and the body phase is armed to receive what it just invited"
+        );
+    }
+
+    /// A refusal at `Stage::Open` goes out *instead of* the interim, and
+    /// closes.
+    ///
+    /// This is the whole point of dispatching the head before a body byte:
+    /// the peer has not committed yet. Answering while leaving the
+    /// connection open would let the declined body be framed as the next
+    /// request, and answering *after* a `100 Continue` would have invited a
+    /// body in order to refuse it.
+    ///
+    /// Two mechanisms close it here - `force_final` on this arm, and
+    /// `respond`'s own `abandons_body` disposition - so this asserts the
+    /// contract rather than either one, and it takes removing both to make
+    /// it fail.
+    #[test]
+    fn a_refused_streamed_open_answers_instead_of_inviting() {
+        let head = b"PUT /up HTTP/1.1\r\nHost: h\r\n\
+                     Expect: 100-continue\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n";
+        let mut conn = HttpConn::new_streaming((), 1 << 20);
+        let p = peer();
+        let _ = frame(head, &mut conn, &cfg());
+        let resp = drive_verdict(
+            head,
+            Body::inline(b""),
+            &p,
+            &mut conn,
+            &mut |_: HttpRequest<'_>, _: &mut ()| {
+                HttpVerdict::Respond(HttpResponse::new(403))
+            },
+        );
+        let s = text(&resp);
+        assert!(s.starts_with("HTTP/1.1 403 "), "{s}");
+        assert!(
+            !s.contains("100 Continue"),
+            "the refusal must replace the interim, not follow it: {s}"
+        );
+        assert!(is_close(&resp), "a declined body leaves nothing to frame");
+        assert!(s.contains("Connection: close\r\n"), "{s}");
+    }
+
+    /// A stream open during a drain is refused 503, not invited.
+    ///
+    /// The buffered twin is `dance_while_draining_is_refused_not_invited`,
+    /// and the reasoning is identical: a drain that accepts an upload it
+    /// will not read closes under a client mid-body, which the client
+    /// cannot tell from a truncation.
+    #[test]
+    fn a_streamed_open_while_draining_is_refused() {
+        let head = b"PUT /up HTTP/1.1\r\nHost: h\r\n\
+                     Expect: 100-continue\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n";
+        let mut conn = HttpConn::new_streaming((), 1 << 20);
+        let p = peer();
+        let _ = frame(head, &mut conn, &cfg());
+        let resp = step(
+            head,
+            Body::inline(b""),
+            &p,
+            Responder::test_responder_draining(),
+            FsSlot::default(),
+            &mut conn,
+            &mut DateCache::default(),
+            &mut |_: HttpRequest<'_>, _: &mut (), _fs: FsSlot<'_>| {
+                panic!("the handler must not run: the drain refuses first")
+            },
+        );
+        let s = text(&resp);
+        assert!(s.starts_with("HTTP/1.1 503 "), "{s}");
+        assert!(is_close(&resp), "a refusal, not the keep-alive interim");
+        assert!(
+            matches!(conn.phase, Phase::Head),
+            "nothing waits for a body that was never invited"
+        );
+    }
+
+    /// A delivery that owes a reply cannot be continued past.
+    ///
+    /// `Continue` is the streamed stages' verdict; at `Whole` or `End`
+    /// there is nothing further to read, so nothing would ever answer and
+    /// the connection would sit until a timeout. It closes instead, which
+    /// presents as slot exhaustion rather than a hang under load.
+    ///
+    /// Guarded twice - the `Stage`-testing arm in `dispatch` and `settle`'s
+    /// backstop - so this asserts the contract rather than either arm, and
+    /// it takes removing both to make it fail.
+    #[test]
+    fn continuing_past_a_delivery_that_owes_a_reply_closes() {
+        let head = b"GET /k HTTP/1.1\r\nHost: h\r\n\r\n";
+        let mut conn = HttpConn::new(());
+        let p = peer();
+        let _ = frame(head, &mut conn, &cfg());
+        let resp = drive_verdict(
+            head,
+            Body::inline(b""),
+            &p,
+            &mut conn,
+            &mut |req: HttpRequest<'_>, _: &mut ()| {
+                assert!(matches!(req.stage, Stage::Whole));
+                HttpVerdict::Continue
+            },
+        );
+        assert!(
+            matches!(resp, Response::Close),
+            "a Whole delivery answered with Continue owes a reply nobody \
+             will send"
+        );
     }
 
     /// While draining, the dance's first message is refused with a close
