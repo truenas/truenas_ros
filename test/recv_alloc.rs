@@ -1106,3 +1106,362 @@ fn a_pipelined_put_overlaps_writes_with_arrivals() {
          degrades connections to owned buffers and looks exactly like this."
     );
 }
+
+/// Upload on `conns` connections into ONE FIFO, floating every window's
+/// write with `Continue` and never braking - so leases pile until the pipe
+/// blocks the writes and the recv ring hits its registered bound. What
+/// happens next is `recv_shortage_retry`'s to decide, and this measures it:
+/// returns (shortage parks, large allocations, bytes drained, all 200s).
+///
+/// The test thread holds the FIFO's read end and does NOT drain until the
+/// run reaches its gate (parks observed, or every client byte written), so
+/// exhaustion is a phase the run provably enters, not a race it may dodge.
+#[cfg(feature = "uring-fs")]
+#[allow(clippy::too_many_lines)]
+fn exhaustion_put_cost(
+    retry: Option<Duration>,
+    per_conn: usize,
+) -> Option<(u64, usize, u64, bool)> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicBool;
+    use truenas_ros::http::HttpDeferred;
+    use truenas_ros::uring_fs::{File, Personality, RwFlags};
+
+    let dir = std::env::temp_dir().join(format!(
+        "ros-exh-{}-{per_conn}-{}",
+        retry.map_or(0, |d| d.as_millis()),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let fifo = dir.join("sink");
+    let cpath =
+        std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a plain mkfifo(3) on a path this test owns.
+    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0, "mkfifo");
+    // Hold the read end (nonblocking, so this open never waits and the
+    // drain loop can poll a stop flag) BEFORE the server opens the write
+    // end - a FIFO O_WRONLY open blocks until a reader exists.
+    // SAFETY: open(3) of the fifo just created; the fd is owned below.
+    let rfd = unsafe {
+        libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK)
+    };
+    assert!(rfd >= 0, "open fifo read end");
+    // SAFETY: `rfd` was just returned by open and is owned by nothing else.
+    let read_end = unsafe { OwnedFd::from_raw_fd(rfd) };
+    // One page of capacity: the first probe write fills it and every write
+    // after that BLOCKS in io-wq, holding its window's lease, until the
+    // drain makes room - which is the pinning this whole fixture exists
+    // for. SAFETY: fcntl(2) on the fd owned just above.
+    assert!(
+        unsafe { libc::fcntl(rfd, libc::F_SETPIPE_SZ, 4096) } >= 4096,
+        "shrink fifo"
+    );
+
+    let conns = 2usize;
+    // Pre-open the FIFO's write end through a standalone host, exactly as
+    // a handler's destination file would be.
+    let sink: File = {
+        use truenas_ros::sync_fs::{OFlag, OpenHow};
+        use truenas_ros::uring_fs::{Anchor, FsConfig, UringFs};
+        let mut afs = match UringFs::new(FsConfig::default()) {
+            Ok(f) => f,
+            Err(e) if should_skip(&e) => return None,
+            Err(e) => panic!("UringFs::new: {e}"),
+        };
+        let who = afs.register_self().expect("register_self");
+        let handle = afs.handle();
+        let stop_fs = afs.shutdown_handle();
+        let anchor = Anchor::open(&dir).expect("anchor");
+        let (ftx, frx) = std::sync::mpsc::channel();
+        thread::scope(|sc| {
+            sc.spawn(move || {
+                let name = std::ffi::CString::new("sink").unwrap();
+                let r = handle.open(
+                    who,
+                    &anchor,
+                    name.as_c_str(),
+                    OpenHow::new().flags(OFlag::O_WRONLY),
+                );
+                let _ = ftx.send(r);
+                stop_fs.shutdown();
+            });
+            afs.run().expect("fs host run");
+        });
+        frx.recv().expect("open outcome").expect("open fifo")
+    };
+
+    let pers: std::sync::Arc<OnceLock<Personality>> =
+        std::sync::Arc::new(OnceLock::new());
+    let pc = std::sync::Arc::clone(&pers);
+
+    type St = (std::sync::Arc<PipeCtl>, File);
+    let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let written_in = std::sync::Arc::clone(&written);
+    let sink_for_accept = sink.clone();
+    let proto = truenas_ros::http::protocol_streaming_fs(
+        HttpConfig::default(),
+        1 << 30,
+        move |_i: Incoming<'_>| -> Option<St> {
+            Some((
+                std::sync::Arc::new(PipeCtl {
+                    inflight: AtomicUsize::new(0),
+                    peak: AtomicUsize::new(0),
+                    failed: std::sync::atomic::AtomicBool::new(false),
+                    parked: std::sync::Mutex::new(None),
+                    end: std::sync::Mutex::new(None),
+                }),
+                sink_for_accept.clone(),
+            ))
+        },
+        move |req: HttpRequest<'_>, st: &mut St, fs| {
+            let (ctl, file) = st;
+            match req.stage {
+                Stage::Open => HttpVerdict::Continue,
+                Stage::Window => {
+                    let Some(mut fs) = fs else {
+                        return HttpVerdict::Respond(HttpResponse::new(500));
+                    };
+                    let who = *pc.get().expect("personality set");
+                    ctl.inflight.fetch_add(1, Ordering::Relaxed);
+                    let done_ctl = std::sync::Arc::clone(ctl);
+                    let done_written = std::sync::Arc::clone(&written_in);
+                    let cont =
+                        move |done: truenas_ros::uring_fs::FsDone,
+                              _fs: &mut truenas_ros::uring_fs::FsConn<
+                                  '_,
+                              >| {
+                            match done.result() {
+                                Err(_) => done_ctl
+                                    .failed
+                                    .store(true, Ordering::Relaxed),
+                                Ok(n) => {
+                                    done_written.fetch_add(
+                                        n as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                }
+                            }
+                            let left = done_ctl
+                                .inflight
+                                .fetch_sub(1, Ordering::Relaxed)
+                                - 1;
+                            let end: Option<HttpDeferred> = if left == 0 {
+                                done_ctl.end.lock().unwrap().take()
+                            } else {
+                                None
+                            };
+                            if let Some(d) = end {
+                                if done_ctl.failed.load(Ordering::Relaxed) {
+                                    d.reply(HttpResponse::new(500));
+                                } else {
+                                    d.reply(HttpResponse::new(200));
+                                }
+                            }
+                        };
+                    // Float EVERY window - no depth cap - and write only
+                    // its first page: a pipe write of at most PIPE_BUF is
+                    // atomic (all-or-block, pipe(7)), so it can never
+                    // complete short and trip the leased-write EIO rule,
+                    // while an in-bounds subrange still holds the WHOLE
+                    // window's lease until the pipe makes room. The FIFO
+                    // blocks the writes, the leases pile up: exactly the
+                    // pipelined-ingest shape that can reach the ring's
+                    // registered bound. A stream write has no position;
+                    // `u64::MAX` is the no-offset sentinel the kernel
+                    // maps to f_pos (`io_kiocb_update_pos`, io_uring/rw.c).
+                    let probe = 4096.min(req.body.len());
+                    fs.pwritev2_from(
+                        who,
+                        file.clone(),
+                        &req.body[..probe],
+                        u64::MAX,
+                        RwFlags::empty(),
+                        cont,
+                    );
+                    HttpVerdict::Continue
+                }
+                Stage::End => {
+                    if ctl.inflight.load(Ordering::Relaxed) == 0 {
+                        let code = if ctl.failed.load(Ordering::Relaxed) {
+                            500
+                        } else {
+                            200
+                        };
+                        return HttpVerdict::Respond(HttpResponse::new(code));
+                    }
+                    let (deferred, permit) = req.defer();
+                    *ctl.end.lock().unwrap() = Some(deferred);
+                    HttpVerdict::Defer(permit)
+                }
+                Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
+            }
+        },
+    )
+    .expect("codec config");
+
+    let cfg = ServerConfig {
+        pool_size: conns as u32,
+        fs_ops: 64,
+        max_request_bytes: 512 * 1024,
+        recv_shortage_retry: retry,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return None,
+        Err(e) => panic!("bind: {e}"),
+    };
+    pers.set(server.register_self().expect("register_self"))
+        .expect("set once");
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stats = server.stats_handle();
+    let stats_gate = stats.clone();
+    let stop = server.shutdown_handle();
+
+    let payload = vec![0xc3u8; per_conn];
+    let wire = std::sync::Arc::new(chunked_put(&payload, 128 * 1024));
+    drop(payload);
+
+    let drained = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let stop_drain = std::sync::Arc::new(AtomicBool::new(false));
+
+    // The drain: parked until the run PROVABLY exhausts the ring - parks
+    // observed when the knob is on, the lent gauge pinned at the ring's
+    // registered bound (`pool_size` recvs + `RECV_LEASE_DEPTH` leases per
+    // connection) when it is off - then empties the FIFO so the writes,
+    // and with them the leases, come home. Without the gate a fast drain
+    // lets the leases cycle and the run never enters the phase under
+    // test, so its assertions would hold vacuously.
+    let ring_bound = (conns * 5) as u32;
+    let gate_on_parks = retry.is_some();
+    let d_count = std::sync::Arc::clone(&drained);
+    let d_stop = std::sync::Arc::clone(&stop_drain);
+    let drain = thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let s = stats_gate.snapshot();
+            let gated = if gate_on_parks {
+                s.recv_shortage_parks > 0
+            } else {
+                s.recv_bufs_lent >= ring_bound
+            };
+            if gated || std::time::Instant::now() > deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mut buf = vec![0u8; 64 * 1024];
+        while !d_stop.load(Ordering::Relaxed) {
+            // SAFETY: reading the owned nonblocking fd into a live buffer.
+            let n =
+                unsafe { libc::read(rfd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                d_count.fetch_add(n as u64, Ordering::Relaxed);
+            } else {
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        drop(read_end);
+    });
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let before = BIG_ALLOCS.load(Ordering::Relaxed);
+        let uploads: Vec<_> = (0..conns)
+            .map(|_| {
+                let wire = std::sync::Arc::clone(&wire);
+                thread::spawn(move || {
+                    let mut s = TcpStream::connect(v4).expect("connect");
+                    s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+                    s.write_all(&wire).expect("write");
+                    let status = read_status(&mut s).expect("status");
+                    status == 200
+                })
+            })
+            .collect();
+        let ok = uploads
+            .into_iter()
+            .all(|u| u.join().expect("upload thread"));
+        let cost = BIG_ALLOCS.load(Ordering::Relaxed) - before;
+        stop.shutdown();
+        (cost, ok)
+    });
+
+    server.serve_forever().expect("serve_forever");
+    let (cost, ok) = client.join().expect("client thread");
+    // Every page the handler's writes reported must come out of the FIFO
+    // before the drain stops (the responses settled, so the writes did).
+    let total = written.load(Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while drained.load(Ordering::Relaxed) < total
+        && std::time::Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(5));
+    }
+    stop_drain.store(true, Ordering::Relaxed);
+    drain.join().expect("drain thread");
+    let s = stats.snapshot();
+    assert_eq!(s.recv_bufs_lent, 0, "leases not returned: {s:?}");
+    let got = drained.load(Ordering::Relaxed);
+    let _ = std::fs::remove_dir_all(&dir);
+    Some((
+        s.recv_shortage_parks,
+        cost,
+        got,
+        ok && total > 0 && got == total,
+    ))
+}
+
+/// Genuine pool exhaustion with `recv_shortage_retry` set parks the reads
+/// instead of falling back to owned buffers: the uploads stall against TCP
+/// until the FIFO drains, then complete intact - and the cost stays FLAT
+/// when the upload doubles, because a parked read allocates nothing while
+/// it waits and resumes against pool buffers when they come home. (An
+/// absolute zero is not the law here: the run's baseline - the pool
+/// growing to its registered bound, the fixture's own buffers - is a
+/// constant, and the feature's claim is the absence of per-window cost on
+/// top of it.) The parks counter is the proof each run actually entered
+/// exhaustion rather than dodging it.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn exhaustion_parks_reads_instead_of_allocating() {
+    let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    let retry = Some(Duration::from_millis(2));
+    let Some((parks1, cost1, got1, ok1)) =
+        exhaustion_put_cost(retry, 1536 * 1024)
+    else {
+        return; // io_uring unavailable here
+    };
+    let (parks2, cost2, got2, ok2) =
+        exhaustion_put_cost(retry, 3072 * 1024).expect("second run");
+    assert!(ok1 && ok2, "uploads failed or bytes lost ({got1}, {got2})");
+    assert!(
+        parks1 > 0 && parks2 > 0,
+        "the pool never exhausted: nothing was proven ({parks1}, {parks2})"
+    );
+    assert!(
+        cost2 <= cost1 + 2,
+        "parked backpressure allocated per window: {cost1} large \
+         allocations for 12 windows/conn, {cost2} for 24"
+    );
+}
+
+/// The configurable control: `None` keeps the old answer - fall back to
+/// owned buffers and keep every connection moving - so the same uploads
+/// complete without a single park.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn exhaustion_without_the_knob_completes_without_parking() {
+    let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((parks, _cost, got, ok)) = exhaustion_put_cost(None, 1536 * 1024)
+    else {
+        return; // io_uring unavailable here
+    };
+    assert!(ok, "uploads failed or bytes lost (drained {got})");
+    assert_eq!(parks, 0, "None must never park");
+}

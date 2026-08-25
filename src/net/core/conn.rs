@@ -86,6 +86,12 @@ pub(crate) enum Op {
     /// `dispatch` routes this tag to `unreachable!`), so the shared codec keeps
     /// one `Op`. Constructed by `from_u8` under every role, so no dead code.
     Connect = 20,
+    /// A backoff `TIMEOUT` for a recv parked on a genuinely exhausted buffer
+    /// pool (`recv_shortage_retry`): its completion re-pumps the connection,
+    /// which re-arms the read against whatever the pool has recovered.
+    /// Server-only (only a server registers recv pools; the client's
+    /// `dispatch` routes it to `unreachable!`). Not counted in `conn.ops`.
+    RecvRetry = 21,
 }
 
 impl Op {
@@ -112,6 +118,7 @@ impl Op {
             18 => Op::RecvClock,
             19 => Op::SpliceDeadline,
             20 => Op::Connect,
+            21 => Op::RecvRetry,
             _ => return None,
         })
     }
@@ -802,6 +809,11 @@ pub(crate) struct Connection<U> {
     // pair are queued by
     // the same task-work run, so the stash resolves within the same reap batch.
     pub recv_close_stash: Option<(bool, Op)>,
+    // A `RecvRetry` backoff timer is pending for this connection's parked
+    // read. Set at arm, cleared when the timer's CQE is consumed - the
+    // dedup that keeps a connection whose park is re-entered (another path
+    // pumped it meanwhile and hit the dry pool again) at one live timer.
+    pub recv_retry_armed: bool,
     // A push overflowed `max_send_backlog` while the connection was detached
     // (its worker owns the raw stream, so it cannot be torn down mid-detach):
     // evict with `SendBacklog` when the worker resumes it.
@@ -933,6 +945,7 @@ impl<U> Connection<U> {
             recv_clock_armed: false,
             recv_clock_fired: None,
             recv_close_stash: None,
+            recv_retry_armed: false,
             evict_on_resume: false,
             close_on_flush: None,
             #[cfg(feature = "net-client")]
@@ -2089,9 +2102,10 @@ mod tests {
                 | Op::SplicePoll
                 | Op::RecvClock
                 | Op::SpliceDeadline
-                | Op::Connect => {}
+                | Op::Connect
+                | Op::RecvRetry => {}
             }
-            21
+            22
         };
         // Every decodable op value: `from_u8` must invert the discriminant
         // (a renumbered enum with a stale table shows up here), and the

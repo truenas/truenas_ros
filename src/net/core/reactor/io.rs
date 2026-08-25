@@ -1192,7 +1192,9 @@ impl<U> Reactor<U> {
         self.sync_recv_buf_stats();
     }
 
-    /// Answer a recv that found the pool dry (`-ENOBUFS`).
+    /// Answer a recv that found the pool dry (`-ENOBUFS`). Returns whether
+    /// the caller should re-pump now; `false` means the read is parked on a
+    /// `RecvRetry` timer and the pump is that timer's to run.
     ///
     /// The kernel picks a provided buffer at completion, so a shortage
     /// cannot be seen at submit and this is the only place it is reported.
@@ -1200,18 +1202,57 @@ impl<U> Reactor<U> {
     /// quantity that actually bounds it - and bounds it at `pool_size`
     /// buffers, no worse than the per-connection buffer the pool replaced.
     ///
-    /// Progress does not depend on growth succeeding: a pool that will not
-    /// grow drops this connection back to owning its buffer, so the re-armed
-    /// read cannot come back `-ENOBUFS` a second time. Returns whether the
-    /// caller should re-arm.
+    /// Growth failing means the ring is at its registered bound with every
+    /// buffer lent - only leases held past their message can get there, so
+    /// it is sustained pressure, not sizing. `recv_shortage_retry` picks the
+    /// answer: park the read and retry on a timer (backpressure - the
+    /// unread socket fills and TCP slows the peer, while pool memory holds
+    /// at its bound), or drop the connection back to owning its buffer
+    /// (progress through the spike, paid in unpooled allocation). Either
+    /// way the read cannot come back `-ENOBUFS` unanswered: the owned
+    /// fallback cannot want a pool buffer at all, and a parked retry that
+    /// finds the pool still dry parks again.
+    ///
+    /// One live timer per connection (`recv_retry_armed`): a park
+    /// re-entered while the timer is pending - another path pumped the
+    /// connection into the still-dry pool - keeps the pending timer rather
+    /// than stacking a second.
     #[cfg(feature = "net-server")]
-    pub(crate) fn recv_buffer_shortage(&mut self, slot: u32) -> bool {
+    pub(crate) fn recv_buffer_shortage(
+        &mut self,
+        slot: u32,
+        generation: u32,
+    ) -> errno::Result<bool> {
         let grew = self.recv_bufs.as_mut().is_some_and(BufPool::grow);
-        if !grew {
-            self.table.conn_mut(slot).set_recv_owned();
+        if grew {
+            self.sync_recv_buf_stats();
+            return Ok(true);
         }
+        if self.recv_bufs.is_some() && self.cfg.recv_shortage_retry.is_some() {
+            // The pool guard is belt-and-braces: only a buffer-select recv
+            // can complete `-ENOBUFS`, and only a pooled server arms one.
+            // It keeps the contract literal - parking waits for POOL
+            // buffers to come home, so a shortage with no pool behind it
+            // (whatever produced it) takes the owned fallback below, which
+            // needs nothing returned to it.
+            self.sync_recv_buf_stats();
+            stat!(self, recv_shortage_parks);
+            let conn = self.table.conn_mut(slot);
+            if conn.recv_retry_armed {
+                return Ok(false);
+            }
+            conn.recv_retry_armed = true;
+            let ts = std::ptr::addr_of!(self.pads.recv_retry) as u64;
+            self.stage(pack(Op::RecvRetry, slot, generation), move |sqe| {
+                sqe.opcode = IORING_OP_TIMEOUT;
+                sqe.addr = ts;
+                sqe.len = 1; // exactly one timespec, per the kernel
+            })?;
+            return Ok(false);
+        }
+        self.table.conn_mut(slot).set_recv_owned();
         self.sync_recv_buf_stats();
-        true
+        Ok(true)
     }
 
     /// Hand back a pool buffer the next read has outgrown, so the read can
@@ -1368,11 +1409,12 @@ impl<U> Reactor<U> {
         // re-pump - the framer is pure over what is buffered, and nothing
         // was received, so it re-arms exactly this read.
         #[cfg(feature = "net-server")]
-        if res < 0
-            && Errno::from_raw(-res) == Errno::ENOBUFS
-            && self.recv_buffer_shortage(slot)
-        {
-            return Ok(RecvStep::Pump);
+        if res < 0 && Errno::from_raw(-res) == Errno::ENOBUFS {
+            return Ok(if self.recv_buffer_shortage(slot, generation)? {
+                RecvStep::Pump
+            } else {
+                RecvStep::Done
+            });
         }
         match self.table.conn_mut(slot).recv_result(res) {
             // EOF (half-close / keep-alive ended), truncation, cancel, error.

@@ -589,6 +589,15 @@ pub struct ServerStats {
     /// moves neither gauge, which is what the debug-build drain check
     /// against the kernel's consumer head exists to catch.
     pub recv_bufs_total: u32,
+    /// Reads parked on the [`recv_shortage_retry`] backoff because the
+    /// buffer pool was genuinely exhausted - at its registered bound with
+    /// every buffer lent. Counts parks, not connections: one connection
+    /// waiting through several backoff periods counts each retry that
+    /// found the pool still dry. Zero under any load the pool's growth
+    /// can answer; a nonzero value is the backpressure path engaging.
+    ///
+    /// [`recv_shortage_retry`]: super::ServerConfig::recv_shortage_retry
+    pub recv_shortage_parks: u64,
 }
 
 /// A `Clone + Send + Sync` handle for reading a running server's counters from
@@ -621,6 +630,7 @@ impl StatsHandle {
             bytes_in: s.bytes_in.load(Ordering::Relaxed),
             bytes_out: s.bytes_out.load(Ordering::Relaxed),
             recv_bufs_lent: s.recv_bufs_lent.load(Ordering::Relaxed) as u32,
+            recv_shortage_parks: s.recv_shortage_parks.load(Ordering::Relaxed),
             recv_bufs_total: s.recv_bufs_total.load(Ordering::Relaxed) as u32,
         }
     }

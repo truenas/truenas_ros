@@ -181,6 +181,9 @@ impl ClientConfig {
             request_timeout: self.response_timeout,
             send_timeout: self.send_timeout,
             tls_handshake_timeout: self.tls_handshake_timeout,
+            // Server-only: a client never registers a recv pool, so there
+            // is no shortage to park on.
+            recv_shortage_retry: None,
         }
     }
 }

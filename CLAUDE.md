@@ -170,10 +170,18 @@ Do not reopen these without a reason that is new.
   failed transfer, and treating it as a read error closes the connection
   mid-body (`a_burst_of_file_bodies_grows_the_ring_instead_of_shedding`
   pins the distinction). Growth doubles rather than steps, because the
-  shortage says the pool is under its working set. Progress does not depend
-  on growth succeeding - the recv path drops the connection back to owning
-  its buffer, the pump path re-issues the read with an owned one - so a
-  shortage can never come back twice.
+  shortage says the pool is under its working set. When growth CANNOT
+  succeed - the ring at its registered bound with every buffer lent, which
+  only leases held past their message can reach - the recv side's answer is
+  `recv_shortage_retry`: park the read and retry it on a standalone
+  `TIMEOUT` (the default; the unread socket fills and TCP slows the peer
+  while pool memory holds at its bound, `recv_shortage_parks` counts it),
+  or `None` to drop the connection back to owning its buffer and keep it
+  moving through the spike. One live timer per connection
+  (`recv_retry_armed`), and the retry re-pumps rather than re-arming
+  blindly, so a still-dry pool parks again and a torn-down slot is inert.
+  The pump path (file bodies) keeps the owned fallback unconditionally -
+  its shortage is the send side's to relieve, not the peer's.
 - **`post` writes a descriptor field by field and never `resv`.** Entry
   zero's `resv` is not reserved - it is the ring's published tail, and the
   kernel's only emptiness test is `tail == head`

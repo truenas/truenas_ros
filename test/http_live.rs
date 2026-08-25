@@ -3110,8 +3110,9 @@ fn a_streamed_chunked_put_pacing_below_the_clock_floor_completes() {
         HttpConfig::default(),
         1 << 20,
         move |_inc: Incoming<'_>| Some(sink.clone()),
-        |mut req: HttpRequest<'_>,
-         sink: &mut Arc<Mutex<Vec<u8>>>| match req.stage {
+        |mut req: HttpRequest<'_>, sink: &mut Arc<Mutex<Vec<u8>>>| match req
+            .stage
+        {
             Stage::Open => HttpVerdict::Continue,
             Stage::Window => {
                 sink.lock().unwrap().extend_from_slice(&req.body.take());

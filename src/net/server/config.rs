@@ -155,6 +155,24 @@ pub struct ServerConfig {
     /// provided-buffer rings degrades to owned buffers rather than failing
     /// to bind.
     pub recv_pool: bool,
+    /// How the recv side answers a read that found the buffer pool
+    /// **genuinely exhausted** - the ring at its registered bound with every
+    /// buffer lent, which growth cannot answer. `Some(backoff)` (the
+    /// default, 10 ms) parks the read and retries it on a kernel `TIMEOUT`
+    /// that period later: the socket is simply not read, its buffer fills,
+    /// and TCP pushes back on the peer until a buffer comes home - pool
+    /// memory stays at its bound. `None` falls back to reading into a
+    /// buffer the connection allocates and owns, which keeps every
+    /// connection moving through the spike at the cost of unpooled
+    /// allocation scaling with it.
+    ///
+    /// Ordinary shortage - the pool under its working set but under its
+    /// bound too - is not this: it grows the pool and re-arms immediately,
+    /// whichever way this is set. The bound is `pool_size` recv slots plus
+    /// `RECV_LEASE_DEPTH` leased windows per connection, so only leases
+    /// held past their message - a pipelined ingest handler floating
+    /// writes - can reach it.
+    pub recv_shortage_retry: Option<Duration>,
     /// `listen(2)` backlog.
     pub backlog: i32,
     /// For `AF_UNIX`, unlink a stale socket path before binding.
@@ -330,6 +348,7 @@ impl Default for ServerConfig {
             fs_body_pool: true,
             max_request_bytes: 1024 * 1024,
             recv_pool: true,
+            recv_shortage_retry: Some(Duration::from_millis(10)),
             backlog: 128,
             unlink_unix: true,
             idle_timeout: None,
@@ -490,6 +509,7 @@ impl ServerConfig {
             ("send_timeout", self.send_timeout),
             ("request_timeout", self.request_timeout),
             ("tls_handshake_timeout", self.tls_handshake_timeout),
+            ("recv_shortage_retry", self.recv_shortage_retry),
             ("keepalive", self.keepalive),
             ("tcp_user_timeout", self.tcp_user_timeout),
         ] {
@@ -516,6 +536,7 @@ impl ServerConfig {
             request_timeout: self.request_timeout,
             send_timeout: self.send_timeout,
             tls_handshake_timeout: self.tls_handshake_timeout,
+            recv_shortage_retry: self.recv_shortage_retry,
         }
     }
 }

@@ -789,6 +789,7 @@ where
                 .tls_handshake_timeout
                 .map(ts_of)
                 .unwrap_or_default(),
+            recv_retry: cfg.recv_shortage_retry.map(ts_of).unwrap_or_default(),
         });
 
         let (inject_tx, inject_rx) = mpsc::channel();
@@ -1146,6 +1147,9 @@ where
                 self.core.on_splice_deadline(slot, generation, cqe.res)?
             }
             // The client's outbound-connect op; a server never dials out.
+            // A parked read's pool-shortage backoff elapsed: re-pump the
+            // connection unless something else got there first.
+            Some(Op::RecvRetry) => self.on_recv_retry(slot, generation)?,
             Some(Op::Connect) => unreachable!("server never connects"),
             Some(Op::Cancel) | None => {}
         }
