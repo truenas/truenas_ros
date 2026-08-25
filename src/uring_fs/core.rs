@@ -20,14 +20,14 @@
 
 use super::offload_pool::{OffloadBounds, SharedPool};
 use super::{
-    Anchor, CONFINED_RESOLVE, File, FsOutcome, Leaf, Personality,
-    PrivilegedXattrs, ReplyTo, RwFlags, statx_at_flags,
+    Anchor, CONFINED_RESOLVE, CONFINEMENT_POLICY, File, FsOutcome, Leaf,
+    Personality, PrivilegedXattrs, ReplyTo, RwFlags, statx_at_flags,
 };
 use crate::errno::{Errno, retry_on_eintr};
 use crate::sync_fs::openat2::RawOpenHow;
 use crate::sync_fs::{
-    AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, Statfs, Statx,
-    StatxMask, StatxRaw, ZfsAttr,
+    AtFlags, Mode, OFlag, OpenHow, RenameFlags, Statfs, Statx, StatxMask,
+    StatxRaw, ZfsAttr,
 };
 use crate::uring::engine::Engine;
 use crate::uring::slots::SlotEntry;
@@ -1615,10 +1615,13 @@ impl<'a> FsConn<'a> {
 
     /// Open `path` relative to `anchor` as `who`; fire `on_done` with the new
     /// [`File`] ([`FsDone::file`]). `path` must be anchor-relative (a leading
-    /// `/` is refused); resolution defaults to `RESOLVE_BENEATH |
-    /// RESOLVE_NO_SYMLINKS` unless `how` chose its own. Only the request-handler
-    /// facade may open (a continuation's `open` is refused). An invalid argument
-    /// drops `on_done`, closing the connection.
+    /// `/` is refused); resolution defaults to the full [`CONFINED_RESOLVE`]
+    /// set unless `how` states a confinement policy of its own, on the same
+    /// rule the blocking [`FsHandle::open`](crate::uring_fs::FsHandle::open)
+    /// applies - a `resolve` carrying only hardening flags composes with the
+    /// default rather than replacing it. Only the request-handler facade may open (a
+    /// continuation's `open` is refused). An invalid argument drops `on_done`,
+    /// closing the connection.
     pub fn open<F>(
         &mut self,
         who: Personality,
@@ -1642,10 +1645,11 @@ impl<'a> FsConn<'a> {
             return;
         }
         let mut raw = how.to_raw();
-        if raw.resolve == 0 {
-            raw.resolve = ResolveFlag::RESOLVE_BENEATH
-                .union(ResolveFlag::RESOLVE_NO_SYMLINKS)
-                .bits();
+        // The same rule as `open_parts`, and it has to stay the same: this is
+        // the facade a request handler reaches with a path the peer chose, so
+        // it cannot be the laxer of the two.
+        if raw.resolve & CONFINEMENT_POLICY.bits() == 0 {
+            raw.resolve |= CONFINED_RESOLVE.bits();
         }
         self.fs.submit_open(
             self.eng,

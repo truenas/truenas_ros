@@ -526,26 +526,41 @@ fn fstatx_reports_open_file_metadata() {
     });
 }
 
+/// A `resolve` that only *hardens* must not also un-confine. `open` applies
+/// the full `CONFINED_RESOLVE` and lets a caller replace it, but only by
+/// naming a policy (`RESOLVE_BENEATH`, `RESOLVE_IN_ROOT`); a request for
+/// `RESOLVE_NO_MAGICLINKS` asks for *more* restriction and keeps the default
+/// underneath it. Keying that union on `resolve == 0` instead turns the
+/// hardening request into an escape hatch, which is what this pins.
 #[test]
-fn absolute_path_opts_out_of_confinement() {
+fn a_hardening_flag_does_not_opt_out_of_confinement() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("abs.txt"), b"abs").unwrap();
+        std::os::unix::fs::symlink("abs.txt", dir.join("link")).unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let abs = dir.join("abs.txt"); // an absolute path
 
-        // Under the default confinement, an absolute path is refused (EXDEV).
-        match h.open(me, &anchor, &abs, rdonly()) {
-            Err(Error::Errno(Errno::EXDEV)) => {}
-            other => {
-                panic!("expected EXDEV under RESOLVE_BENEATH, got {other:?}")
+        let hardened = rdonly().resolve(ResolveFlag::RESOLVE_NO_MAGICLINKS);
+        for (what, how) in [("default", rdonly()), ("hardened", hardened)] {
+            // An absolute path cannot be resolved from the filesystem root.
+            match h.open(me, &anchor, &abs, how) {
+                Err(Error::Errno(Errno::EXDEV)) => {}
+                other => panic!("{what}: absolute path opened: {other:?}"),
+            }
+            // Nor is a symlink followed, in-tree or not.
+            match h.open(me, &anchor, "link", how) {
+                Err(Error::Errno(Errno::ELOOP)) => {}
+                other => panic!("{what}: symlink followed: {other:?}"),
             }
         }
-        // An explicit `resolve` without RESOLVE_BENEATH opts out; the absolute
-        // path then resolves from the root (the dirfd is ignored).
-        let how = rdonly().resolve(ResolveFlag::RESOLVE_NO_MAGICLINKS);
+
+        // A *stated* policy still stands alone: `RESOLVE_BENEATH` without
+        // `RESOLVE_NO_SYMLINKS` is how a caller asks to follow in-tree
+        // symlinks, and it must keep meaning that.
+        let stated = rdonly().resolve(ResolveFlag::RESOLVE_BENEATH);
         let f = h
-            .open(me, &anchor, &abs, how)
-            .expect("absolute open, opted out");
+            .open(me, &anchor, "link", stated)
+            .expect("in-tree symlink");
         h.close(f).unwrap();
     });
 }
@@ -1413,27 +1428,45 @@ fn preadv2_pwritev2_flags_apply_or_fail_loudly() {
 }
 
 /// `open_confined` cannot be talked out of its confinement. `open` yields to a
-/// caller-supplied `resolve` (documented, and fine for a general opener); the
-/// confined form unions the guarantees in, so the same escape attempt that
-/// succeeds through `open` fails through `open_confined`.
+/// caller that *states* a policy (documented, and fine for a general opener);
+/// the confined form unions the guarantees in, so a `how` that buys in-tree
+/// symlinks through `open` buys nothing through `open_confined`.
 #[test]
 fn open_confined_cannot_be_weakened_by_the_caller() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::create_dir(dir.join("inner")).unwrap();
         std::fs::write(dir.join("outside"), b"secret").unwrap();
+        std::fs::write(dir.join("inner/target"), b"in-tree").unwrap();
         let inner = Anchor::open(dir.join("inner").as_path()).unwrap();
 
-        // A caller-chosen `resolve` that drops BENEATH: `open` honours it, so
-        // `..` walks out of the anchor. This is the documented escape hatch.
+        // A stated policy `open` honours: BENEATH without NO_SYMLINKS follows
+        // a link that stays inside the anchor.
+        let stated = OpenHow::new()
+            .flags(OFlag::O_RDONLY)
+            .resolve(ResolveFlag::RESOLVE_BENEATH);
+        std::os::unix::fs::symlink("target", dir.join("inner/in_tree"))
+            .unwrap();
+        let f = h
+            .open(me, &inner, "in_tree", stated)
+            .expect("plain open honours a stated policy");
+        h.close(f).unwrap();
+
+        // The same `how`, confined: NO_SYMLINKS is unioned back in.
+        let res = h.open_confined(me, &inner, "in_tree", stated);
+        assert!(
+            matches!(res, Err(Error::Errno(Errno::ELOOP))),
+            "confined open must not follow even an in-tree symlink, got {res:?}"
+        );
+
+        // Neither form walks out of the anchor.
         let permissive = OpenHow::new()
             .flags(OFlag::O_RDONLY)
             .resolve(ResolveFlag::RESOLVE_NO_MAGICLINKS);
+        let res = h.open(me, &inner, "../outside", permissive);
         assert!(
-            h.open(me, &inner, "../outside", permissive).is_ok(),
-            "plain open honours a caller's weaker policy"
+            matches!(res, Err(Error::Errno(Errno::EXDEV))),
+            "plain open must refuse a `..` escape, got {res:?}"
         );
-
-        // Same request, confined: refused by the kernel during resolution.
         let res = h.open_confined(me, &inner, "../outside", permissive);
         assert!(
             matches!(res, Err(Error::Errno(Errno::EXDEV | Errno::ELOOP))),
@@ -1598,16 +1631,28 @@ fn confined_open_refuses_to_cross_a_mount_point() {
 
         let how = OpenHow::new().flags(OFlag::O_PATH | OFlag::O_DIRECTORY);
 
-        // Without NO_XDEV the crossing is allowed - it is an ordinary open.
-        h.open(me, &root, name.as_str(), how)
-            .unwrap_or_else(|e| panic!("plain open of /{name}: {e}"));
+        // The default carries NO_XDEV, so an ordinary open stops too. This is
+        // the half a caller gets without asking: a share anchored on a parent
+        // dataset does not serve a child dataset's files through an object
+        // key that happens to name its mountpoint.
+        for (what, res) in [
+            ("open", h.open(me, &root, name.as_str(), how)),
+            (
+                "open_confined",
+                h.open_confined(me, &root, name.as_str(), how),
+            ),
+        ] {
+            assert!(
+                matches!(res, Err(Error::Errno(Errno::EXDEV))),
+                "{what}: crossing into /{name} must fail EXDEV, got {res:?}"
+            );
+        }
 
-        // With it, resolution stops at the mount boundary.
-        let res = h.open_confined(me, &root, name.as_str(), how);
-        assert!(
-            matches!(res, Err(Error::Errno(Errno::EXDEV))),
-            "crossing into /{name} must fail EXDEV, got {res:?}"
-        );
+        // A caller that states a policy gets exactly it, and NO_XDEV is not
+        // in `RESOLVE_BENEATH` - so the crossing is available, explicitly.
+        let stated = how.resolve(ResolveFlag::RESOLVE_BENEATH);
+        h.open(me, &root, name.as_str(), stated)
+            .unwrap_or_else(|e| panic!("stated-policy open of /{name}: {e}"));
     });
 }
 

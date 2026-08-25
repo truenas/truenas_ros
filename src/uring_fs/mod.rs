@@ -309,18 +309,33 @@ pub const CONFINED_RESOLVE: ResolveFlag = ResolveFlag::RESOLVE_BENEATH
     .union(ResolveFlag::RESOLVE_NO_SYMLINKS)
     .union(ResolveFlag::RESOLVE_NO_XDEV);
 
+/// The `resolve` flags that state *where* resolution may go, as against those
+/// that harden it where it already is.
+///
+/// The split is what keeps "I also want `RESOLVE_NO_MAGICLINKS`" from meaning
+/// "and no confinement". A caller naming one of these has made the confinement
+/// decision and is left with exactly it; a caller naming only hardening flags
+/// (`RESOLVE_NO_XDEV`, `RESOLVE_NO_SYMLINKS`, `RESOLVE_NO_MAGICLINKS`,
+/// `RESOLVE_CACHED`) has asked for *more* restriction and must not be given
+/// less, so [`CONFINED_RESOLVE`] is unioned in underneath it.
+const CONFINEMENT_POLICY: ResolveFlag =
+    ResolveFlag::RESOLVE_BENEATH.union(ResolveFlag::RESOLVE_IN_ROOT);
+
 /// Validate an open's `(path, how)` pair and produce the payloads an
 /// `OPENAT2` inject carries - shared by the blocking [`FsHandle::open`] and the
 /// async `rt` handle so both surfaces enforce identical rules.
 ///
 /// The path may be **multi-component** and is resolved by the kernel against
-/// the anchor dirfd. It is **confined to the anchor by default**
-/// (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`, applied when the caller set no
-/// `resolve` policy of its own). A caller that sets its own `resolve` - e.g.
-/// dropping `RESOLVE_BENEATH` - opts out of confinement and may then pass an
-/// **absolute** path, which the kernel resolves from the filesystem root
-/// (ignoring the dirfd), per `openat2(2)`. Opens return a real fd, so
-/// `O_CLOEXEC` is accepted.
+/// the anchor dirfd. It is **confined to the anchor** by the full
+/// [`CONFINED_RESOLVE`] set unless the caller names a [`CONFINEMENT_POLICY`]
+/// flag of its own, in which case that policy stands alone - `RESOLVE_BENEATH`
+/// by itself to allow in-tree symlinks, say. Hardening flags do not count as a
+/// policy and are unioned on top of the default, so adding one cannot subtract
+/// confinement. Opens return a real fd, so `O_CLOEXEC` is accepted.
+///
+/// There is therefore no flag combination that resolves an **absolute** path
+/// from the filesystem root: anchor on the directory that path names and open
+/// relative to it, which says the same thing where a reader can see it.
 pub(crate) fn open_parts<P: ?Sized + TnPath>(
     path: &P,
     how: OpenHow,
@@ -332,13 +347,13 @@ pub(crate) fn open_parts<P: ?Sized + TnPath>(
         ));
     }
     let mut raw = how.to_raw();
-    // Confine to the anchor by default: an unset `resolve` would let `..` or a
-    // symlink escape. A caller that sets its own `resolve` (e.g. to drop
-    // `RESOLVE_BENEATH` for an absolute path) opts out deliberately.
-    if raw.resolve == 0 {
-        raw.resolve = ResolveFlag::RESOLVE_BENEATH
-            .union(ResolveFlag::RESOLVE_NO_SYMLINKS)
-            .bits();
+    // Union, keyed on whether the caller stated a policy at all - never on
+    // `resolve == 0`. Testing the whole word makes a purely hardening flag an
+    // opt-out: `RESOLVE_NO_MAGICLINKS` alone would then drop `RESOLVE_BENEATH`,
+    // so a caller asking for less traversal would get less confinement and
+    // `../../etc/shadow` would resolve.
+    if raw.resolve & CONFINEMENT_POLICY.bits() == 0 {
+        raw.resolve |= CONFINED_RESOLVE.bits();
     }
     Ok((cpath, raw))
 }
@@ -1005,16 +1020,25 @@ impl FsHandle {
     /// Open failures (`ENOENT`, `EACCES` - the personality *working*) come
     /// back as `Errno` errors.
     ///
-    /// **Confined to `anchor` by default.** When `how` carries no `resolve`
-    /// policy, this applies `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`: a `..`
-    /// component or a symlink that would leave `anchor` is rejected
-    /// (`"../../etc/shadow"` cannot walk out of the share) and no symlink is
-    /// followed. A caller that sets its own `resolve` is trusted and left
-    /// untouched - pass e.g. just [`RESOLVE_BENEATH`] to allow in-tree
-    /// symlinks. The personality's DAC binds every access regardless; the
-    /// metadata ops are separately single-component-confined by [`Leaf`].
+    /// **Confined to `anchor` by default,** with the full
+    /// [`CONFINED_RESOLVE`] set: a `..` component or a symlink that would
+    /// leave `anchor` is rejected (`"../../etc/shadow"` cannot walk out of the
+    /// share), no symlink is followed, and resolution stops at a mount point
+    /// rather than crossing into a nested dataset or a `.zfs/snapshot`
+    /// automount.
+    ///
+    /// A caller may replace that policy, but only by *stating* one: naming
+    /// [`RESOLVE_BENEATH`] or [`RESOLVE_IN_ROOT`] gets exactly what it names -
+    /// `RESOLVE_BENEATH` alone to allow in-tree symlinks, say. A `resolve`
+    /// carrying only hardening flags is additive, so it composes with the
+    /// default instead of replacing it. Use
+    /// [`open_confined`](Self::open_confined) where confinement must not be
+    /// replaceable at all. The personality's DAC binds every access
+    /// regardless; the metadata ops are separately single-component-confined
+    /// by [`Leaf`].
     ///
     /// [`RESOLVE_BENEATH`]: crate::sync_fs::ResolveFlag::RESOLVE_BENEATH
+    /// [`RESOLVE_IN_ROOT`]: crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT
     pub fn open<P: ?Sized + TnPath>(
         &self,
         who: Personality,
@@ -1059,11 +1083,12 @@ impl FsHandle {
     /// weaken**.
     ///
     /// [`open`](Self::open) confines by default but yields to a caller that
-    /// supplies its own `resolve` - reasonable for a general-purpose opener,
-    /// and wrong when confinement is a security property of the surrounding
-    /// system rather than a convenience. This form unions the confinement
-    /// flags into whatever `how` asks for, so extra restrictions compose but
-    /// none of the three can be dropped.
+    /// states a confinement policy of its own (`RESOLVE_BENEATH` or
+    /// `RESOLVE_IN_ROOT`) - reasonable for a
+    /// general-purpose opener, and wrong when confinement is a security
+    /// property of the surrounding system rather than a convenience. This form
+    /// unions the confinement flags into whatever `how` asks for, so extra
+    /// restrictions compose but none of the three can be dropped.
     ///
     /// Use it wherever the path component comes from a remote peer. The three
     /// escapes it forecloses are `..` walking above `anchor`, a symlink
