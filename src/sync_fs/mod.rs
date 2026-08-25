@@ -1,8 +1,8 @@
 //! Blocking (synchronous) filesystem bindings - the `sync_fs` umbrella.
 //!
 //! The umbrella root is the base syscall layer (feature `sync-fs`): [`statx`],
-//! [`openat2`], [`mkdirat`], [`renameat2`], [`safe_open`], atomic writes, and
-//! the shared
+//! [`openat2`], [`mkdirat`], [`renameat2`], [`safe_open`], atomic writes,
+//! whole-directory name reads ([`dir`]), and the shared
 //! flag types ([`AtFlags`], [`OFlag`], [`Mode`]). Each sibling subsystem is a
 //! named submodule behind its own feature: [`xattr`], [`acl`] (NFS4/POSIX1E),
 //! [`fhandle`], [`iter`] (feature `fsiter`), and [`shutil`]. Mount topology
@@ -11,6 +11,8 @@
 
 #[cfg(feature = "sync-fs")]
 mod atomic;
+#[cfg(feature = "sync-fs")]
+pub mod dir;
 #[cfg(feature = "sync-fs")]
 mod mkdirat;
 #[cfg(feature = "sync-fs")]
