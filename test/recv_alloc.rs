@@ -669,19 +669,24 @@ fn a_multi_range_window_writes_every_range_from_the_claim() {
     );
 }
 
-/// The same guarantee at botocore's real chunk size.
+/// The same guarantee when a peer's HTTP chunks are larger than a window.
 ///
 /// A chunk of exactly one window is the single size at which every window
 /// carries its chunk header, so the connection always holds a recv claim
-/// and the cost of the no-claim arm is invisible - which is how a copy of
-/// seven windows in eight shipped. The default `aws s3 cp` frames 1 MiB
-/// aws-chunks (`httpchecksum.py`'s `_DEFAULT_CHUNK_SIZE`): eight windows
-/// per chunk, seven of them mid-chunk with the claim already leased to the
-/// previous window's write. Those must draw a fresh buffer from the ring,
-/// not be placed into an allocation `pwritev2_from` then copies.
+/// and the cost of the no-claim arm is invisible. Fixtures framed at that
+/// size therefore prove nothing about it - which is how a copy of seven
+/// windows in eight went unnoticed.
+///
+/// 1 MiB here is not botocore: botocore's HTTP chunks are 128 KiB (see
+/// `STREAM_WINDOW`), and its 1 MiB `_DEFAULT_CHUNK_SIZE` frames an inner
+/// aws-chunked payload this layer never frames. 1 MiB is chosen as a peer
+/// that chunks eight windows at a time, so seven in eight are mid-chunk
+/// with the claim already leased to the previous window's write. Those must
+/// draw a fresh buffer from the ring, not be placed into an allocation
+/// `pwritev2_from` then copies.
 #[cfg(feature = "uring-fs")]
 #[test]
-fn a_streamed_put_at_botocore_chunks_still_does_not_copy() {
+fn a_streamed_put_at_oversized_http_chunks_still_does_not_copy() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
     fn wire(p: &[u8]) -> Vec<u8> {
         chunked_put(p, 1024 * 1024)

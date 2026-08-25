@@ -1698,10 +1698,13 @@ impl<U> Reactor<U> {
                 // completion) - so placing there forfeits a zero-copy
                 // buffer to allocate a copied one. On a streamed upload the
                 // no-claim case is every mid-chunk window whose predecessor
-                // leased the claim to a write: at botocore's 1 MiB
-                // aws-chunks against a 128 KiB window that is seven windows
-                // in eight, each a placed allocation plus a full copy in
-                // `pwritev2_from`'s fallback. `frame_step` cannot see any
+                // leased the claim to a write, which needs a peer chunking
+                // larger than one window: at 1 MiB HTTP chunks against a
+                // 128 KiB window that is seven windows in eight, each a
+                // placed allocation plus a full copy in `pwritev2_from`'s
+                // fallback. Not the default client - botocore's HTTP chunks
+                // are one window (see `STREAM_WINDOW`), so every window
+                // carries a chunk header and holds a claim. `frame_step` cannot see any
                 // of this: it is deliberately state-free, and this is
                 // connection state.
                 //
