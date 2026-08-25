@@ -112,8 +112,24 @@ mod xattr {
             Ok(()) => {
                 let got = fgetxattr(file.as_fd(), name).unwrap();
                 assert_eq!(got, b"value");
+                // A small value must not carry the 4096-byte first-read
+                // buffer out with it.
+                assert_eq!(
+                    got.capacity(),
+                    got.len(),
+                    "the probe buffer was retained behind the value"
+                );
                 let names = flistxattr(file.as_fd()).unwrap();
                 assert!(names.iter().any(|n| n.as_bytes() == name.as_bytes()));
+                // A value past the first-read buffer (4096): the read
+                // answers ERANGE and the refetch must return it intact,
+                // not truncated to the initial buffer.
+                let big = vec![0xabu8; 6000];
+                if fsetxattr(file.as_fd(), name, &big, XattrFlags::empty())
+                    .is_ok()
+                {
+                    assert_eq!(fgetxattr(file.as_fd(), name).unwrap(), big);
+                }
             }
             // Some filesystems (e.g. certain tmpfs configs) reject user
             // xattrs. That is "not applicable" rather than a failure - but
@@ -731,7 +747,15 @@ mod fsiter {
             .find(|e| e.name() == "link")
             .expect("symlink not yielded");
         assert!(link.is_symlink());
-        assert_eq!(link.read_link().unwrap().as_os_str(), "target");
+        let target = link.read_link().unwrap();
+        assert_eq!(target.as_os_str(), "target");
+        // A short target must not carry the PATH_MAX probe buffer out
+        // with it.
+        assert_eq!(
+            target.as_os_str().len(),
+            target.into_os_string().into_encoded_bytes().capacity(),
+            "the readlink probe buffer was retained behind the target"
+        );
     }
 
     /// A small tree with globally-unique names (so a basename identifies an

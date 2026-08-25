@@ -111,6 +111,32 @@ where
         }
     }
 
+    /// A parked read's pool-shortage backoff elapsed (`Op::RecvRetry`).
+    /// Re-pump the connection - the framer is pure over what is buffered,
+    /// so this re-arms exactly the read that found the pool dry, and a
+    /// pool still dry parks it again. The 10 ms window between park and
+    /// retry admits arbitrary progress on the connection - a deferred
+    /// reply resolving, a splice arming, a flush-close, teardown - and
+    /// `pump_gate` is the single authority on every one of those states,
+    /// so beyond clearing the timer's dedup flag this adds no gating of
+    /// its own (a stale slot is refused before the flag is touched; a
+    /// stopping reactor stages nothing new). Not counted in `conn.ops`,
+    /// exactly like the other standalone timers.
+    pub(super) fn on_recv_retry(
+        &mut self,
+        slot: u32,
+        generation: u32,
+    ) -> errno::Result<()> {
+        if !self.core.table.slot_matches_cqe(slot, generation) {
+            return Ok(());
+        }
+        self.core.table.conn_mut(slot).recv_retry_armed = false;
+        if self.core.stopping() {
+            return Ok(());
+        }
+        self.pump(slot, generation)
+    }
+
     /// A body splice completed (`Op::SpliceRecv`). All the completion
     /// bookkeeping is core ([`Reactor::on_splice_recv_complete`]); a fully moved
     /// body pumps the next frame. The body never entered the buffer, so there is

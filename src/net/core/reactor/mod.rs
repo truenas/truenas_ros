@@ -56,6 +56,9 @@ pub(crate) struct KernelPads {
     /// Relative kTLS handshake timeout - meaningful iff
     /// `cfg.tls_handshake_timeout` is set (bounds the parked-handshake slot).
     pub(crate) tls_handshake: KernelTimespec,
+    /// Backoff before retrying a recv parked on an exhausted buffer pool --
+    /// meaningful iff `cfg.recv_shortage_retry` is set.
+    pub(crate) recv_retry: KernelTimespec,
 }
 
 /// The stream reactor: the shared [`Engine`] plus the connection table and

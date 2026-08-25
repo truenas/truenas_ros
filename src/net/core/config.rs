@@ -15,4 +15,5 @@ pub(crate) struct CoreConfig {
     pub(crate) request_timeout: Option<Duration>,
     pub(crate) send_timeout: Option<Duration>,
     pub(crate) tls_handshake_timeout: Option<Duration>,
+    pub(crate) recv_shortage_retry: Option<Duration>,
 }

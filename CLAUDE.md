@@ -170,10 +170,18 @@ Do not reopen these without a reason that is new.
   failed transfer, and treating it as a read error closes the connection
   mid-body (`a_burst_of_file_bodies_grows_the_ring_instead_of_shedding`
   pins the distinction). Growth doubles rather than steps, because the
-  shortage says the pool is under its working set. Progress does not depend
-  on growth succeeding - the recv path drops the connection back to owning
-  its buffer, the pump path re-issues the read with an owned one - so a
-  shortage can never come back twice.
+  shortage says the pool is under its working set. When growth CANNOT
+  succeed - the ring at its registered bound with every buffer lent, which
+  only leases held past their message can reach - the recv side's answer is
+  `recv_shortage_retry`: park the read and retry it on a standalone
+  `TIMEOUT` (the default; the unread socket fills and TCP slows the peer
+  while pool memory holds at its bound, `recv_shortage_parks` counts it),
+  or `None` to drop the connection back to owning its buffer and keep it
+  moving through the spike. One live timer per connection
+  (`recv_retry_armed`), and the retry re-pumps rather than re-arming
+  blindly, so a still-dry pool parks again and a torn-down slot is inert.
+  The pump path (file bodies) keeps the owned fallback unconditionally -
+  its shortage is the send side's to relieve, not the peer's.
 - **`post` writes a descriptor field by field and never `resv`.** Entry
   zero's `resv` is not reserved - it is the ring's published tail, and the
   kernel's only emptiness test is `tail == head`
@@ -265,12 +273,18 @@ Do not reopen these without a reason that is new.
   on delivery by allocating a buffer per body; against a held claim the
   second buffer is churn, and against no claim it forfeits the buffer the
   read gets free (the kernel picks at completion) to allocate one
-  `pwritev2_from` must then copy. The no-claim case is the default client:
-  botocore frames 1 MiB aws-chunks, so seven windows in eight are mid-chunk
-  with the claim leased to the previous window's write - measured at 14
-  large allocations and 896 KiB copied per MiB, 87.5% of payload.
+  `pwritev2_from` must then copy. The no-claim case arises whenever a peer's
+  HTTP chunks are larger than a window: every window after the first in a
+  chunk carries no chunk header, so the claim is already leased to the
+  previous window's write. Measured at 1 MiB HTTP chunks before this
+  suppression: 14 large allocations and 896 KiB copied per MiB, 87.5% of
+  payload. **This is not the default client.** botocore's HTTP chunks are
+  128 KiB - exactly one window - so a default upload carries a chunk header
+  on every window and never reaches the no-claim arm; its 1 MiB
+  `_DEFAULT_CHUNK_SIZE` frames an inner aws-chunked payload that this layer
+  decodes as body bytes rather than frames (see `STREAM_WINDOW`).
   `a_streamed_upload_does_not_allocate_per_window` and
-  `a_streamed_put_at_botocore_chunks_still_does_not_copy` pin the two
+  `a_streamed_put_at_oversized_http_chunks_still_does_not_copy` pin the two
   cases. `frame_step` cannot make this call - it is deliberately
   state-free - so `enact_frame_step` downgrades `place`. The trade is a
   copy for a handler that takes ownership of a body in that size range,

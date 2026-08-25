@@ -664,19 +664,34 @@ impl BufPool {
     /// Doubling rather than stepping: the shortage says the pool is under
     /// its working set, and a workload that opened many connections at once
     /// would otherwise need one `-ENOBUFS` round trip per buffer to get
-    /// there. Returns whether a buffer was actually added, since that - not
-    /// the target moving - is what lets the re-armed read find one.
+    /// there. Returns whether the re-armed read can find a buffer - one
+    /// this call added, or one already free.
+    ///
+    /// The free check comes first, and it is what keeps one burst from
+    /// growing the pool once per *completion* rather than once. A burst
+    /// queues several `-ENOBUFS` completions into one CQE batch, and every
+    /// one of them lands here; the first doubling answers them all, so the
+    /// rest arrive to find free buffers and a stale shortage. Doubling per
+    /// completion instead is 2^N for one batch - measured at the default
+    /// config: sixteen concurrent readers ran the pool from 8 buffers to
+    /// its 4096-entry ceiling, a gigabyte of resident buffers for a burst
+    /// that needed four megabytes, with `free == allocated` at every
+    /// doubling. The same check answers the ceiling honestly: a pool that
+    /// cannot grow but holds free buffers is not exhausted, and reporting
+    /// failure there would demote the connection to owned buffers for the
+    /// rest of its life (`set_recv_owned` is one-way) over a shortage that
+    /// no longer exists.
     ///
     /// The doubling is measured from whichever of target and allocated is
-    /// larger. A shortage means every allocated buffer is lent, and an idle
-    /// stretch may have lowered the target below that count while they were
-    /// out; doubling the *target* would then land at or under what is
-    /// already allocated, add nothing, and report failure - which demotes
-    /// the connection to owned buffers for the rest of its life
-    /// (`set_recv_owned` is one-way). Growth has to be measured against
-    /// what the pool holds.
+    /// larger. A real shortage means every allocated buffer is lent, and an
+    /// idle stretch may have lowered the target below that count while they
+    /// were out; doubling the *target* would then land at or under what is
+    /// already allocated and add nothing.
     pub(crate) fn grow(&mut self) -> bool {
         self.idle_rounds = 0;
+        if self.ring.free() > 0 {
+            return true;
+        }
         let allocated = self.ring.allocated();
         let base = self.ring.target().max(allocated);
         if base >= self.ring.entries() {
@@ -1079,22 +1094,72 @@ mod tests {
         };
         let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
         let start = p.allocated();
+        // Dry means dry: every buffer lent. A shortage with buffers free
+        // is stale - already answered by an earlier doubling - and grows
+        // nothing.
+        for b in 0..start {
+            assert!(p.take_lent(b).is_some(), "lend {b}");
+        }
         assert!(p.grow(), "room to grow");
         assert_eq!(p.allocated(), start * 2, "doubled");
     }
 
-    /// At the ceiling growth reports failure rather than silently doing
-    /// nothing, because that is the caller's signal to fall back to owning
-    /// a buffer instead of waiting for one that is not coming.
+    /// The ceiling is not exhaustion while anything is free.
+    ///
+    /// `grow()`'s answer is read as "will the re-armed read find a
+    /// buffer". At the ceiling with buffers free the answer is yes, and a
+    /// `false` there is answered with a demotion to owned buffers that
+    /// lasts the connection's life - over a shortage that no longer
+    /// exists. `false` is reserved for the pool that can neither grow nor
+    /// offer anything: every buffer lent, nowhere left to go.
     #[test]
-    fn a_pool_at_its_ceiling_refuses_to_grow() {
+    fn the_ceiling_is_not_exhaustion_while_anything_is_free() {
         let Some(r) = ring() else {
             return;
         };
         let mut p = BufPool::new(r.raw_fd(), 0, 64, 4).expect("registers");
-        while p.grow() {}
-        assert_eq!(p.allocated(), 4, "at the ceiling");
-        assert!(!p.grow(), "and says so");
+        assert_eq!(p.allocated(), 4, "born at the ceiling");
+        assert!(p.grow(), "free buffers at the ceiling answer a shortage");
+        assert_eq!(p.allocated(), 4, "without growing past it");
+        for b in 0..4 {
+            assert!(p.take_lent(b).is_some(), "lend {b}");
+        }
+        assert!(
+            !p.grow(),
+            "everything lent and nowhere to grow is exhaustion"
+        );
+        p.release(0);
+        assert!(p.grow(), "one freed buffer answers the next shortage");
+    }
+
+    /// One burst grows the pool once, not once per queued completion.
+    ///
+    /// A burst queues several `-ENOBUFS` completions into one CQE batch
+    /// and each lands in `grow()`. The first doubling answers them all;
+    /// without the free check the rest double a pool that already grew -
+    /// 2^N for one batch, measured at a gigabyte of resident buffers on
+    /// the default config for a burst that needed four megabytes.
+    #[test]
+    fn a_batch_of_shortages_doubles_once() {
+        let Some(r) = ring() else {
+            return;
+        };
+        let mut p = BufPool::new(r.raw_fd(), 0, 64, 4096).expect("registers");
+        let start = p.allocated();
+        for b in 0..start {
+            assert!(p.take_lent(b).is_some(), "lend {b}");
+        }
+        assert!(p.grow(), "a genuine shortage grows");
+        let after = p.allocated();
+        assert_eq!(after, start * 2, "one doubling");
+        for i in 0..16 {
+            assert!(p.grow(), "queued completion {i} finds the answer");
+        }
+        assert_eq!(
+            p.allocated(),
+            after,
+            "the rest of the batch rode the first doubling"
+        );
     }
 
     /// Shrinking waits for several consecutive idle rounds. A pool that

@@ -922,5 +922,8 @@ fn read_link_fd(fd: BorrowedFd<'_>) -> Result<PathBuf> {
         )
     })? as usize;
     buf.truncate(n);
+    // A target is typically tens of bytes; do not hand back the PATH_MAX
+    // probe behind it.
+    buf.shrink_to_fit();
     Ok(PathBuf::from(OsString::from_vec(buf)))
 }

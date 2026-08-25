@@ -255,9 +255,11 @@ impl Head<'_> {
     ///
     /// - `Transfer-Encoding` with `chunked` as the sole coding -> chunked; a
     ///   lone well-formed `Content-Length` sent alongside is **ignored** (TE
-    ///   wins - the receiver rule; verified by wire capture, default
-    ///   botocore-over-TLS sends exactly this pair, CL carrying the
-    ///   *decoded* length);
+    ///   wins - the receiver rule). botocore does NOT send this pair:
+    ///   `httpchecksum.py:486-489` deletes `Content-Length` when it sets
+    ///   `Transfer-Encoding: chunked`, putting the decoded length in
+    ///   `X-Amz-Decoded-Content-Length` instead. The tolerance is for other
+    ///   clients, not for boto;
     /// - codings before a final `chunked` (`gzip, chunked`) -> 501 (framing
     ///   is determinable, the coding is unimplemented);
     /// - `chunked` missing, repeated, or non-final -> 400 (body length
@@ -317,8 +319,9 @@ impl Head<'_> {
     /// and ignores the length. A front end that prefers the length instead
     /// would frame the same bytes with a different message boundary, and
     /// that difference is the CL.TE request smuggling primitive. The server
-    /// keeps the coding preference for client compatibility, since botocore
-    /// sends exactly this pair, and instead makes the exchange non
+    /// keeps the coding preference for client compatibility - not for
+    /// botocore, which deletes `Content-Length` rather than sending the
+    /// pair (`httpchecksum.py:486-489`) - and instead makes the exchange non
     /// pipelinable. The response glue forces the connection to close on a
     /// conflict, so no later request shares the connection with a smuggled
     /// prefix.
@@ -658,8 +661,9 @@ mod tests {
             body(b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"),
             Ok(BodyKind::Chunked)
         );
-        // TE + CL together: TE wins, CL ignored - the shape default
-        // botocore-over-TLS actually sends (captured 2026-08-07).
+        // TE + CL together: TE wins, CL ignored. NOT a botocore shape -
+        // it deletes Content-Length when it sets chunked
+        // (`httpchecksum.py:486-489`); this covers other clients.
         assert_eq!(
             body(b"PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n"),
             Ok(BodyKind::Chunked)

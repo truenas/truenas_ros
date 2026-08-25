@@ -154,6 +154,8 @@ where
                 .tls_handshake_timeout
                 .map(ts_of)
                 .unwrap_or_default(),
+            // Client-unused: only a server registers a recv pool.
+            recv_retry: KernelTimespec::default(),
         });
 
         let core = Reactor::from_parts(
@@ -307,6 +309,9 @@ where
         match op {
             // An outbound connect completed (`cqe.res == 0` up, `< 0` failed).
             Some(Op::Connect) => self.on_connect(slot, generation, cqe.res)?,
+            Some(Op::RecvRetry) => {
+                unreachable!("client never parks a recv on a pool")
+            }
             // A reply header/body recv completed.
             Some(op @ (Op::RecvHeader | Op::RecvBody)) => {
                 self.on_recv(slot, generation, cqe.res, op)?

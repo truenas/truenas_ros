@@ -155,6 +155,24 @@ pub struct ServerConfig {
     /// provided-buffer rings degrades to owned buffers rather than failing
     /// to bind.
     pub recv_pool: bool,
+    /// How the recv side answers a read that found the buffer pool
+    /// **genuinely exhausted** - the ring at its registered bound with every
+    /// buffer lent, which growth cannot answer. `Some(backoff)` (the
+    /// default, 10 ms) parks the read and retries it on a kernel `TIMEOUT`
+    /// that period later: the socket is simply not read, its buffer fills,
+    /// and TCP pushes back on the peer until a buffer comes home - pool
+    /// memory stays at its bound. `None` falls back to reading into a
+    /// buffer the connection allocates and owns, which keeps every
+    /// connection moving through the spike at the cost of unpooled
+    /// allocation scaling with it.
+    ///
+    /// Ordinary shortage - the pool under its working set but under its
+    /// bound too - is not this: it grows the pool and re-arms immediately,
+    /// whichever way this is set. The bound is `pool_size` recv slots plus
+    /// `RECV_LEASE_DEPTH` leased windows per connection, so only leases
+    /// held past their message - a pipelined ingest handler floating
+    /// writes - can reach it.
+    pub recv_shortage_retry: Option<Duration>,
     /// `listen(2)` backlog.
     pub backlog: i32,
     /// For `AF_UNIX`, unlink a stale socket path before binding.
@@ -189,11 +207,19 @@ pub struct ServerConfig {
     /// is reclaimed as usual.)
     ///
     /// Enforced by a kernel `LINK_TIMEOUT` on every in-progress recv, so it
-    /// costs no wakeups unless a request actually stalls. For an exact read - a
-    /// length-prefixed body or a `Need` header remainder - it bounds the whole
-    /// transfer; for a `More`/delimiter scan or a segmented kTLS body it bounds
-    /// inactivity between reads (a steadily progressing transfer resets it, a
-    /// stalled one is reclaimed). `None` (the default) never times a request out.
+    /// costs no wakeups unless a request actually stalls. The bound is
+    /// **progress per period**, uniformly: a `More`/delimiter scan re-arms on
+    /// each arrival, a segmented kTLS body on each record batch, and an exact
+    /// read - a length-prefixed body, a streamed window, a `Need` header
+    /// remainder - whose clock fires mid-transfer resumes from the bytes that
+    /// landed under a fresh clock. A period with zero progress closes the
+    /// connection; any progress buys exactly one more period. The corollary
+    /// is that this is an inactivity guard, not a rate floor: a transfer's
+    /// total time scales with how slowly the peer sends (a trickle of one
+    /// byte per period holds the slot indefinitely on every framing, exact
+    /// reads included), so a deployment that needs to bound total receipt
+    /// time must meter above this layer. `None` (the default) never times a
+    /// request out.
     ///
     /// A **spliced** body ([`Framing::SpliceBody`]) is clocked the same way:
     /// on plain TCP the clock rides the readiness poll between splice chunks;
@@ -322,6 +348,7 @@ impl Default for ServerConfig {
             fs_body_pool: true,
             max_request_bytes: 1024 * 1024,
             recv_pool: true,
+            recv_shortage_retry: Some(Duration::from_millis(10)),
             backlog: 128,
             unlink_unix: true,
             idle_timeout: None,
@@ -482,6 +509,7 @@ impl ServerConfig {
             ("send_timeout", self.send_timeout),
             ("request_timeout", self.request_timeout),
             ("tls_handshake_timeout", self.tls_handshake_timeout),
+            ("recv_shortage_retry", self.recv_shortage_retry),
             ("keepalive", self.keepalive),
             ("tcp_user_timeout", self.tcp_user_timeout),
         ] {
@@ -508,6 +536,7 @@ impl ServerConfig {
             request_timeout: self.request_timeout,
             send_timeout: self.send_timeout,
             tls_handshake_timeout: self.tls_handshake_timeout,
+            recv_shortage_retry: self.recv_shortage_retry,
         }
     }
 }

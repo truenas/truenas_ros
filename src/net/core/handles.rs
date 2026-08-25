@@ -128,6 +128,10 @@ pub(crate) struct StatsInner {
     pub(crate) recv_bufs_lent: AtomicU64,
     #[cfg(feature = "net-server")]
     pub(crate) recv_bufs_total: AtomicU64,
+    /// Reads parked on a `RecvRetry` backoff because the pool was at its
+    /// bound with every buffer lent (counts parks, not connections).
+    #[cfg(feature = "net-server")]
+    pub(crate) recv_shortage_parks: AtomicU64,
 }
 
 /// Bump a stats counter (single-writer loop thread; Relaxed is sufficient).

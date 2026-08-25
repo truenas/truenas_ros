@@ -498,7 +498,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Errno;
     use crate::net::client::{ClientConfig, ConnectOpts};
     use crate::net::core::protocol::ServerAddr;
     use crate::uring::sys::IoUringCqe;
@@ -518,9 +517,11 @@ mod tests {
         let framer: Framer = framer;
         match Client::new(ClientConfig::default(), framer) {
             Ok(c) => Some(c),
-            Err(crate::Error::Errno(
-                Errno::EPERM | Errno::ENOSYS | Errno::EACCES,
-            )) => None,
+            Err(crate::Error::Errno(e))
+                if crate::uring::setup_unavailable(e) =>
+            {
+                None
+            }
             Err(e) => panic!("client new: {e}"),
         }
     }
