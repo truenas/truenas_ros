@@ -62,21 +62,22 @@ pub(crate) fn xattr_retry_cap(size: usize, tries: u32) -> usize {
     }
 }
 
+/// First-read buffer: values at or under this cost ONE syscall, no size
+/// probe. The same policy as the async sibling's `DISCOVER_BUF`
+/// (`uring_fs/query_dir.rs`), and the same size; probing first costs a
+/// second syscall on every value to save an over-allocation on none - the
+/// probe's ~2x latency is pure loss at realistic value sizes.
+const INITIAL_BUF: usize = 4096;
+
 fn fgetxattr_cstr(raw: RawFd, name: &CStr) -> errno::Result<Vec<u8>> {
-    // A value that grows between the size probe and the read yields ERANGE;
-    // retry a bounded number of times, over-allocating on retry so a steadily
-    // growing value converges rather than spinning.
-    const SIZE_RETRIES: u32 = XATTR_SIZE_RETRIES;
+    // Read first, size only on ERANGE: the value outgrew the buffer (or
+    // grew between a probe and its read - the same race, handled the same
+    // way), so probe the current size and retry a bounded number of times,
+    // over-allocating on retry so a steadily growing value converges
+    // rather than spinning.
+    let mut cap = INITIAL_BUF;
     let mut tries = 0u32;
     loop {
-        // Probe the current size.
-        let size = retry_on_eintr(|| unsafe {
-            libc::fgetxattr(raw, name.as_ptr(), std::ptr::null_mut(), 0)
-        })? as usize;
-        if size > XATTR_SIZE_MAX {
-            return Err(Errno::E2BIG);
-        }
-        let cap = xattr_retry_cap(size, tries);
         let mut buf = vec![0u8; cap];
         let read = retry_on_eintr(|| unsafe {
             libc::fgetxattr(
@@ -93,9 +94,16 @@ fn fgetxattr_cstr(raw: RawFd, name: &CStr) -> errno::Result<Vec<u8>> {
             }
             Err(Errno::ERANGE) => {
                 tries += 1;
-                if tries >= SIZE_RETRIES {
+                if tries >= XATTR_SIZE_RETRIES {
                     return Err(Errno::ERANGE);
                 }
+                let size = retry_on_eintr(|| unsafe {
+                    libc::fgetxattr(raw, name.as_ptr(), std::ptr::null_mut(), 0)
+                })? as usize;
+                if size > XATTR_SIZE_MAX {
+                    return Err(Errno::E2BIG);
+                }
+                cap = xattr_retry_cap(size, tries);
             }
             Err(e) => return Err(e),
         }

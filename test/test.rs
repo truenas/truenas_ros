@@ -114,6 +114,15 @@ mod xattr {
                 assert_eq!(got, b"value");
                 let names = flistxattr(file.as_fd()).unwrap();
                 assert!(names.iter().any(|n| n.as_bytes() == name.as_bytes()));
+                // A value past the first-read buffer (4096): the read
+                // answers ERANGE and the refetch must return it intact,
+                // not truncated to the initial buffer.
+                let big = vec![0xabu8; 6000];
+                if fsetxattr(file.as_fd(), name, &big, XattrFlags::empty())
+                    .is_ok()
+                {
+                    assert_eq!(fgetxattr(file.as_fd(), name).unwrap(), big);
+                }
             }
             // Some filesystems (e.g. certain tmpfs configs) reject user
             // xattrs. That is "not applicable" rather than a failure - but
