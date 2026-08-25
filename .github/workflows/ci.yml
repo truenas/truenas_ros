@@ -76,26 +76,32 @@ jobs:
         echo "kernel=$(uname -r) uid=$(id -u) RLIMIT_MEMLOCK=$(ulimit -l) KiB"
 
     # The ZFS-backed and privileged tests skip automatically here (no datasets,
-    # unprivileged); the QEMU VM job exercises them for real. Three otherwise-
+    # unprivileged); the QEMU VM job exercises them for real. Two otherwise-
     # silent skips are turned into hard failures: the configparser differential
-    # tests (REQUIRE_PYTHON), the net server/client tests (REQUIRE_IO_URING,
-    # backed by the ring probe above that guarantees they can actually run),
-    # and the user-xattr fixtures (REQUIRE_XATTRS: the runner's scratch
-    # filesystems take `user.*` unprivileged, so a refusal means the flagship
-    # xattr paths would go green having tested nothing).
+    # tests (REQUIRE_PYTHON) and the net server/client tests (REQUIRE_IO_URING,
+    # backed by the ring probe above that guarantees they can actually run).
     #
-    # The kTLS data-path tests are deliberately NOT forced here: this runner's
-    # kernel has the tls ULP, but Ubuntu builds OpenSSL 3.0 without
-    # enable-ktls, so libssl can never install kTLS on a socket and the suites'
-    # loopback engagement probe skips those tests. The QEMU job (Trixie
-    # userspace, OpenSSL 3.2+ with ktls) sets TRUENAS_ROS_REQUIRE_KTLS=1 and
-    # runs them for real.
+    # Two families are deliberately NOT forced here, both because this runner
+    # cannot serve them and the QEMU job can:
+    #
+    # kTLS - this runner's kernel has the tls ULP, but Ubuntu builds OpenSSL
+    # 3.0 without enable-ktls, so libssl can never install kTLS on a socket and
+    # the suites' loopback engagement probe skips those tests.
+    #
+    # xattrs - the runner's scratch filesystem is ext4, which holds an xattr
+    # value in the inode's spare room or one filesystem block and answers
+    # ENOSPC above that (fs/ext4/xattr.c), so the large-value fixtures cannot
+    # run here whatever the crate does. The appliance runs on ZFS, which takes
+    # them without complaint, and that is where the gate belongs.
+    #
+    # The QEMU job (Trixie userspace, OpenSSL 3.2+ with ktls, real datasets)
+    # arms TRUENAS_ROS_REQUIRE_KTLS and TRUENAS_ROS_REQUIRE_XATTRS and runs
+    # both families for real.
     - name: test
       run: cargo test --all-features
       env:
         TRUENAS_ROS_REQUIRE_PYTHON: "1"
         TRUENAS_ROS_REQUIRE_IO_URING: "1"
-        TRUENAS_ROS_REQUIRE_XATTRS: "1"
         TRUENAS_ROS_REQUIRE_BTIME: "1"
 
     # The build that ships: `debug_assert` guards vanish here, so the release
@@ -106,7 +112,6 @@ jobs:
       env:
         TRUENAS_ROS_REQUIRE_PYTHON: "1"
         TRUENAS_ROS_REQUIRE_IO_URING: "1"
-        TRUENAS_ROS_REQUIRE_XATTRS: "1"
         TRUENAS_ROS_REQUIRE_BTIME: "1"
 
     # The concurrency models are gated on `#[cfg(loom)]`: loom substitutes std's
