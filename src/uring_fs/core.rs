@@ -3668,13 +3668,15 @@ mod routing_fuzz {
     }
 
     /// Build a real `Engine` or signal an environment skip (mirrors the
-    /// integration suites' io_uring guard).
+    /// integration suites' io_uring guard, gate included).
     fn engine_or_skip() -> Option<Engine> {
         match Engine::new(RING_ENTRIES, POOL) {
             Ok(e) => Some(e),
-            Err(crate::Error::Errno(
-                Errno::EPERM | Errno::ENOSYS | Errno::EACCES,
-            )) => None,
+            Err(crate::Error::Errno(e))
+                if crate::uring::setup_unavailable(e) =>
+            {
+                None
+            }
             Err(e) => panic!("Engine::new: {e}"),
         }
     }
