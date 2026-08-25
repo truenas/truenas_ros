@@ -43,14 +43,14 @@ use crate::errno::{self, Errno, retry_on_eintr};
 use crate::error::{Error, Result};
 use crate::fd::owned_from_raw;
 use crate::mount::{StatmountMask, statmount};
+use crate::sync_fs::dir::{Dir, DirEntry};
 use crate::sync_fs::{
     AtFlags, OFlag, OpenHow, ResolveFlag, Statx, StatxMask, openat2, statx,
 };
-use std::ffi::{CStr, OsStr, OsString};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
+use std::ffi::{OsStr, OsString};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::ptr::NonNull;
 
 /// Upper bound on directory-tree depth (bounds simultaneously-open dir fds).
 const MAX_DEPTH: usize = 2048;
@@ -901,74 +901,6 @@ fn restore_stack(
         stack.push(pushed);
     }
     Ok(())
-}
-
-/// One directory entry read from a [`Dir`].
-struct DirEntry {
-    d_type: u8,
-    d_ino: u64,
-    name: OsString,
-}
-
-/// A minimal RAII wrapper over a `DIR *` from `fdopendir`.
-struct Dir(NonNull<libc::DIR>);
-
-// SAFETY: a `Dir` owns its `DIR` exclusively and is never shared, so it may be
-// moved between threads. It is deliberately not `Sync`: concurrent `readdir`
-// on one stream is unsafe.
-unsafe impl Send for Dir {}
-
-impl Dir {
-    /// Take ownership of `fd` and open a directory stream on it.
-    fn from_fd(fd: OwnedFd) -> errno::Result<Dir> {
-        let raw = fd.into_raw_fd();
-        // SAFETY: `raw` is a fresh owned dir fd; fdopendir takes ownership.
-        let dirp = unsafe { libc::fdopendir(raw) };
-        match NonNull::new(dirp) {
-            Some(p) => Ok(Dir(p)),
-            None => {
-                let err = Errno::last();
-                // SAFETY: fdopendir failed, so it did not take ownership.
-                unsafe { libc::close(raw) };
-                Err(err)
-            }
-        }
-    }
-
-    fn fd(&self) -> RawFd {
-        // SAFETY: `self.0` is a live DIR stream.
-        unsafe { libc::dirfd(self.0.as_ptr()) }
-    }
-
-    fn next_entry(&mut self) -> errno::Result<Option<DirEntry>> {
-        // readdir signals end-of-directory and error both with NULL; clear
-        // errno first to tell them apart.
-        Errno::clear();
-        // SAFETY: `self.0` is a live DIR stream we own exclusively.
-        let ent = unsafe { libc::readdir(self.0.as_ptr()) };
-        if ent.is_null() {
-            return match Errno::last_raw() {
-                0 => Ok(None),
-                e => Err(Errno::from_raw(e)),
-            };
-        }
-        // SAFETY: `ent` points into the DIR buffer, valid until the next
-        // readdir/closedir; we copy the fields out immediately.
-        let ent = unsafe { &*ent };
-        let name = unsafe { CStr::from_ptr(ent.d_name.as_ptr()) };
-        Ok(Some(DirEntry {
-            d_type: ent.d_type,
-            d_ino: ent.d_ino,
-            name: OsStr::from_bytes(name.to_bytes()).to_os_string(),
-        }))
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        // SAFETY: `self.0` is a live DIR stream; closedir closes its fd.
-        unsafe { libc::closedir(self.0.as_ptr()) };
-    }
 }
 
 /// Classification of an entry `readdir` reported as `DT_UNKNOWN` - the case a
