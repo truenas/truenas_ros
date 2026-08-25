@@ -626,6 +626,12 @@ impl<U> Reactor<U> {
             return Ok(()); // a cancel completion - not a real expiry
         }
         if !self.table.slot_matches_cqe(slot, generation) {
+            // Left set, this flag disables the watchdog permanently, and it
+            // is the only clock that reaches a kTLS body splice. See
+            // `conn_at_cqe_mut`.
+            if let Some(conn) = self.table.conn_at_cqe_mut(slot, generation) {
+                conn.splice_deadline_armed = false;
+            }
             return Ok(()); // slot recycled / gone
         }
         enum Next {

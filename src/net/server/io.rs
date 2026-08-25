@@ -128,6 +128,15 @@ where
         generation: u32,
     ) -> errno::Result<()> {
         if !self.core.table.slot_matches_cqe(slot, generation) {
+            // Left set, this flag reads to `recv_buffer_shortage` as "a
+            // timer is pending", so every later shortage parks the read
+            // with nothing able to wake it and the connection holds its
+            // slot with no op in flight. See `conn_at_cqe_mut`.
+            if let Some(conn) =
+                self.core.table.conn_at_cqe_mut(slot, generation)
+            {
+                conn.recv_retry_armed = false;
+            }
             return Ok(());
         }
         self.core.table.conn_mut(slot).recv_retry_armed = false;

@@ -245,6 +245,34 @@ impl<U> ConnTable<U> {
         }
     }
 
+    /// The connection in `slot` at a completion's `generation`, serving or
+    /// parked across a detach.
+    ///
+    /// For a completion that must retire per-connection state whether or not
+    /// the connection is reachable for work right now - a standalone timer's
+    /// dedup flag, above all. [`ConnTable::begin_detach`] keeps the same
+    /// `Connection` and does **not** bump the generation, so a flag retired
+    /// only behind [`ConnTable::slot_matches_cqe`] is retired only sometimes:
+    /// left set, it stays set for the rest of that connection's life and
+    /// suppresses every later arm. What each flag then costs is at its own
+    /// site.
+    pub(crate) fn conn_at_cqe_mut(
+        &mut self,
+        slot: u32,
+        generation: u32,
+    ) -> Option<&mut Connection<U>> {
+        let e = self.slots.get_mut(slot as usize)?;
+        if e.generation as u32 != generation {
+            return None;
+        }
+        match &mut e.state {
+            SlotState::Serving(conn)
+            | SlotState::Detaching(conn)
+            | SlotState::Detached(conn) => Some(conn),
+            _ => None,
+        }
+    }
+
     /// As [`ConnTable::slot_matches`] but for a kernel completion, whose
     /// `user_data` carried only the low 32 bits of the generation. A completion
     /// never outlives its op's incarnation (the slot frees only at `ops == 0`),
@@ -626,6 +654,60 @@ mod tests {
         assert!(!t.slot_matches(0, 0)); // token minted for gen 0 is stale
         assert!(!t.free(0)); // freeing an empty slot counts nothing
         assert_eq!(t.generation(0), 2); // but still bumps
+    }
+
+    /// A detach keeps the same `Connection` at the same generation, so the
+    /// two "is this completion current" questions come apart there:
+    /// `slot_matches_cqe` answers "may this completion do work" and says no,
+    /// while the connection whose state the completion must retire is still
+    /// sitting in the slot.
+    ///
+    /// A standalone timer's dedup flag is the case that matters. Retiring it
+    /// only behind `slot_matches_cqe` retires it only sometimes, and the flag
+    /// then suppresses every future arm - `recv_retry_armed` leaves a parked
+    /// read with nothing to wake it, `splice_deadline_armed` disables the one
+    /// clock a kTLS body splice has.
+    #[test]
+    fn a_detached_slot_keeps_the_connection_a_completion_must_reach() {
+        let mut t: ConnTable<()> = ConnTable::new(1);
+        let conn = crate::net::core::conn::Connection::new(
+            ClientAddr::Unix { cred: None },
+            (),
+            1,
+        );
+        t.install(0, conn);
+        t.conn_mut(0).recv_retry_armed = true;
+        let cur_gen = t.generation(0) as u32;
+
+        for state in ["detaching", "detached"] {
+            if state == "detaching" {
+                t.begin_detach(0);
+            } else {
+                assert!(t.park_detached_in_place(0).is_some());
+            }
+            assert_eq!(
+                t.generation(0) as u32,
+                cur_gen,
+                "{state}: a detach must not bump the generation"
+            );
+            assert!(
+                !t.slot_matches_cqe(0, cur_gen),
+                "{state}: no work may be done against a detached slot"
+            );
+            assert!(
+                t.conn_at_cqe_mut(0, cur_gen).is_some(),
+                "{state}: but the connection whose flag is stale is right here"
+            );
+        }
+
+        // A recycled slot is a different connection, and its flags are not
+        // this completion's to touch.
+        assert!(t.reattach(0));
+        assert!(t.free(0));
+        assert!(
+            t.conn_at_cqe_mut(0, cur_gen).is_none(),
+            "a stale generation must reach nothing"
+        );
     }
 
     #[test]
