@@ -189,11 +189,19 @@ pub struct ServerConfig {
     /// is reclaimed as usual.)
     ///
     /// Enforced by a kernel `LINK_TIMEOUT` on every in-progress recv, so it
-    /// costs no wakeups unless a request actually stalls. For an exact read - a
-    /// length-prefixed body or a `Need` header remainder - it bounds the whole
-    /// transfer; for a `More`/delimiter scan or a segmented kTLS body it bounds
-    /// inactivity between reads (a steadily progressing transfer resets it, a
-    /// stalled one is reclaimed). `None` (the default) never times a request out.
+    /// costs no wakeups unless a request actually stalls. The bound is
+    /// **progress per period**, uniformly: a `More`/delimiter scan re-arms on
+    /// each arrival, a segmented kTLS body on each record batch, and an exact
+    /// read - a length-prefixed body, a streamed window, a `Need` header
+    /// remainder - whose clock fires mid-transfer resumes from the bytes that
+    /// landed under a fresh clock. A period with zero progress closes the
+    /// connection; any progress buys exactly one more period. The corollary
+    /// is that this is an inactivity guard, not a rate floor: a transfer's
+    /// total time scales with how slowly the peer sends (a trickle of one
+    /// byte per period holds the slot indefinitely on every framing, exact
+    /// reads included), so a deployment that needs to bound total receipt
+    /// time must meter above this layer. `None` (the default) never times a
+    /// request out.
     ///
     /// A **spliced** body ([`Framing::SpliceBody`]) is clocked the same way:
     /// on plain TCP the clock rides the readiness poll between splice chunks;

@@ -966,11 +966,123 @@ impl<U> Reactor<U> {
         CloseReason::TruncatedMessage
     }
 
+    /// Whether a short-positive exact read continues instead of closing:
+    /// its request clock fired (the peer was making progress, just not at
+    /// the armed read's pace within one period), on an active transfer (the
+    /// idle clock guards the keep-alive gap, not a transfer), on a reactor
+    /// that is not shutting down, over plain TCP (a kTLS short is `Again`
+    /// or a control record, classified before this is asked).
+    fn exact_partial_continues(
+        &self,
+        slot: u32,
+        fired: bool,
+        was_idle: bool,
+    ) -> bool {
+        fired
+            && !was_idle
+            && !self.draining
+            && !self.stopping()
+            && !self.table.conn(slot).is_ktls()
+    }
+
+    /// Re-arm a plain-TCP exact read whose request clock cancelled it with
+    /// partial progress (the cursor already advanced past what landed,
+    /// [`Connection::advance_exact_partial`]). io_uring accumulates a plain
+    /// `MSG_WAITALL` recv itself, so unlike kTLS a short completion here is
+    /// never healthy - this continuation exists only for the clock-cancelled
+    /// case. Closing there imposes a throughput floor of `recv_want /
+    /// request_timeout` on every exact read: a peer pacing a streamed
+    /// 128 KiB window slower than that dies mid-upload, with the window's
+    /// consumed bytes unrecoverable.
+    ///
+    /// Like the kTLS continuation it re-arms with a FRESH request clock, so
+    /// the clock bounds progress-per-period rather than the whole transfer:
+    /// a trickling slow-loris costs one timeout period per fired clock,
+    /// bounded by the armed read's length (for a header, by
+    /// `max_request_bytes`) - the same trade `resubmit_ktls_recv` documents.
+    /// A period with NO progress still closes (the zero-progress
+    /// `-ECANCELED` never reaches here), and an idle partial still closes.
+    ///
+    /// [`Connection::advance_exact_partial`]: crate::net::core::conn::Connection::advance_exact_partial
+    pub(crate) fn resubmit_exact_recv(
+        &mut self,
+        slot: u32,
+        generation: u32,
+        op: Op,
+    ) -> errno::Result<()> {
+        // Same guard as the kTLS continuation, for the same reason: the
+        // re-arm points `recv_ptr` past the advanced cursor with no fresh
+        // reserve, and what is on the other side of a miscount is the
+        // kernel writing past the allocation.
+        if !self.table.conn(slot).recv_armed_within() {
+            debug_assert!(
+                false,
+                "exact continuation would arm past the recv buffer"
+            );
+            return self.close_conn(
+                slot,
+                generation,
+                CloseReason::RecvError(errno::Errno::EIO),
+            );
+        }
+        let conn = self.table.conn_mut(slot);
+        conn.recving = true;
+        // An active mid-message transfer regardless of how the original
+        // read was armed (close reasons depend on this).
+        conn.recv_idle = false;
+        conn.ops += 1;
+        let want = conn.recv_want();
+        let addr = conn.recv_ptr();
+        // No buffer select: the partial bytes already landed in the storage
+        // the connection now holds (the claim the short completion adopted,
+        // its owned buffer, or a placed body), and the remainder must land
+        // right behind them.
+        let timeout_ts = self
+            .cfg
+            .request_timeout
+            .is_some()
+            .then_some(std::ptr::addr_of!(self.pads.request_timeout) as u64);
+        {
+            // Fresh clock pair for this recv (see `on_recv_clock`).
+            let conn = self.table.conn_mut(slot);
+            conn.recv_clock_armed = timeout_ts.is_some();
+            conn.recv_clock_fired = None;
+        }
+        match timeout_ts {
+            None => self.stage(pack(op, slot, generation), move |sqe| {
+                sqe.opcode = IORING_OP_RECV;
+                sqe.fd = slot as i32;
+                sqe.flags = IOSQE_FIXED_FILE;
+                sqe.addr = addr;
+                sqe.len = want as u32;
+                sqe.op_flags = libc::MSG_WAITALL as u32;
+            }),
+            Some(ts) => self.stage_linked(
+                pack(op, slot, generation),
+                move |sqe| {
+                    sqe.opcode = IORING_OP_RECV;
+                    sqe.fd = slot as i32;
+                    sqe.flags = IOSQE_FIXED_FILE | IOSQE_IO_LINK;
+                    sqe.addr = addr;
+                    sqe.len = want as u32;
+                    sqe.op_flags = libc::MSG_WAITALL as u32;
+                },
+                pack(Op::RecvClock, slot, generation),
+                move |sqe| {
+                    sqe.opcode = IORING_OP_LINK_TIMEOUT;
+                    sqe.fd = -1;
+                    sqe.addr = ts;
+                    sqe.len = 1; // exactly one timespec, per the kernel
+                },
+            ),
+        }
+    }
+
     /// A recv's linked idle/request clock reaped (`Op::RecvClock`): `-ETIME`
     /// when it fired (and cancelled its recv), `-ECANCELED` when the recv
     /// completed first. Not counted in `conn.ops` (exactly like the generic
     /// `LinkTimeout` CQEs this op split from). Resolves a parked
-    /// short-positive close (`recv_close_stash`) or records the outcome for a
+    /// short-positive recv (`recv_close_stash`) or records the outcome for a
     /// recv CQE later in this batch; on an already-closing (or recycled) slot
     /// it is inert.
     pub(crate) fn on_recv_clock(
@@ -983,7 +1095,7 @@ impl<U> Reactor<U> {
             return Ok(());
         }
         let fired = res == -libc::ETIME;
-        let was_idle = {
+        let (was_idle, op) = {
             let conn = self.table.conn_mut(slot);
             if conn.teardown_owns_slot() {
                 // Torn down by another path while the stash waited (the close
@@ -994,7 +1106,7 @@ impl<U> Reactor<U> {
                 return Ok(());
             }
             match conn.recv_close_stash.take() {
-                Some(was_idle) => was_idle,
+                Some(stash) => stash,
                 None => {
                     // No recv is parked on this clock. Record ONLY a genuine
                     // expiry, for a recv still in flight to read when it
@@ -1004,6 +1116,25 @@ impl<U> Reactor<U> {
                     // from a prior kTLS `Again` continuation whose recv won;
                     // recording its `false` would clobber the fresh recv's
                     // state and misclassify a real timeout as a truncation.
+                    //
+                    // A stale `-ETIME` cannot be told apart: a clock that
+                    // fires in the same instant its recv completes in full
+                    // posts `-ETIME` with nothing cancelled
+                    // (`io_link_timeout_fn` finds `timeout->head` NULL and
+                    // `io_req_task_link_timeout` completes `-ETIME`,
+                    // io_uring/timeout.c:340-343), and by the time it is
+                    // reaped the next recv - armed while ITS recv's CQE was
+                    // dispatched earlier in this same batch - owns these
+                    // fields. The pollution is bounded: it misreads only a
+                    // short-POSITIVE on that successor (an EOF partial
+                    // resumes once and re-completes empty into the same
+                    // truncation close; a real expiry records true twice),
+                    // never a zero-progress close, and the next arm resets
+                    // it. The fired clock's failed cancel can likewise
+                    // surface `ret` instead of `-ETIME` (`ret ?: -ETIME`,
+                    // timeout.c:337) and read as "recv won": that race
+                    // needs the recv already completing on its own, so the
+                    // truncation verdict it produces is the truth.
                     if fired {
                         conn.recv_clock_fired = Some(true);
                     }
@@ -1011,8 +1142,13 @@ impl<U> Reactor<U> {
                 }
             }
         };
-        // The parked short-positive recv resolves now. Partial progress -> it
-        // always closes (see the `on_recv` `res > 0` branch), never re-pumps.
+        // The parked short-positive recv resolves now, and never re-pumps
+        // (see the `on_recv` `res > 0` branch): a request-clock expiry on an
+        // active transfer resumes the read - the cursor advanced before the
+        // stash - and every other outcome closes.
+        if self.exact_partial_continues(slot, fired, was_idle) {
+            return self.resubmit_exact_recv(slot, generation, op);
+        }
         let reason = self.short_recv_reason(fired, was_idle);
         self.close_conn(slot, generation, reason)
     }
@@ -1241,11 +1377,13 @@ impl<U> Reactor<U> {
         match self.table.conn_mut(slot).recv_result(res) {
             // EOF (half-close / keep-alive ended), truncation, cancel, error.
             RecvOutcome::Failed => {
-                // A short-POSITIVE exact read always CLOSES (never re-enters
-                // the pump): the peer made partial progress, and those bytes
-                // sit unexposed in the recv buffer's spare capacity - a
-                // re-pump would re-frame from before them and desync the
-                // stream. Only its close REASON is deferred:
+                // A short-POSITIVE exact read never re-enters the pump: the
+                // peer made partial progress, and those bytes sit unexposed
+                // in the recv buffer's spare capacity - a re-pump would
+                // re-frame from before them and desync the stream. It either
+                // closes or (request clock fired on an active plain-TCP
+                // transfer) resumes the same read past them
+                // (`resubmit_exact_recv`). The verdict may be deferred:
                 //
                 // A kTLS control record can complete an exact read short (the
                 // kernel stops the RECVMSG at the record boundary): a peer's
@@ -1265,6 +1403,14 @@ impl<U> Reactor<U> {
                 // CQEs of a linked pair are queued by the same task-work
                 // run, so the stash resolves within this same reap batch.
                 if res > 0 {
+                    // Progress first, verdict second: advance the cursor past
+                    // the partial bytes unconditionally, because every path
+                    // out of here either closes (the cursor dies with the
+                    // connection) or continues the read from it - and the
+                    // stash path resolves without the count in hand.
+                    self.table
+                        .conn_mut(slot)
+                        .advance_exact_partial(res as usize);
                     let (armed, fired) = {
                         let c = self.table.conn(slot);
                         (c.recv_clock_armed, c.recv_clock_fired)
@@ -1274,10 +1420,14 @@ impl<U> Reactor<U> {
                         (true, Some(fired)) => fired,
                         (true, None) => {
                             self.table.conn_mut(slot).recv_close_stash =
-                                Some(was_idle);
+                                Some((was_idle, op));
                             return Ok(RecvStep::Done);
                         }
                     };
+                    if self.exact_partial_continues(slot, fired, was_idle) {
+                        self.resubmit_exact_recv(slot, generation, op)?;
+                        return Ok(RecvStep::Done);
+                    }
                     let reason = self.short_recv_reason(fired, was_idle);
                     self.close_conn(slot, generation, reason)?;
                     return Ok(RecvStep::Done);

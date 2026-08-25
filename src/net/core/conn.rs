@@ -796,10 +796,12 @@ pub(crate) struct Connection<U> {
     // (CQE order within a pair is not guaranteed): `Some(fired)`.
     pub recv_clock_fired: Option<bool>,
     // A short-positive recv completion parked until its clock CQE resolves
-    // its close reason: carries the recv's `was_idle`. While set, the pump
-    // must not re-arm the recv side. Both CQEs of a linked pair are queued by
+    // it: carries the recv's `was_idle` and its op, since a fired clock on
+    // an active transfer resumes the read rather than closing it. While
+    // set, the pump must not re-arm the recv side. Both CQEs of a linked
+    // pair are queued by
     // the same task-work run, so the stash resolves within the same reap batch.
-    pub recv_close_stash: Option<bool>,
+    pub recv_close_stash: Option<(bool, Op)>,
     // A push overflowed `max_send_backlog` while the connection was detached
     // (its worker owns the raw stream, so it cannot be torn down mid-detach):
     // evict with `SendBacklog` when the worker resumes it.
@@ -1328,6 +1330,18 @@ impl<U> Connection<U> {
     /// Bytes the armed (or continuing) recv still wants.
     pub(crate) fn recv_want(&self) -> usize {
         self.recv_want
+    }
+
+    /// Record partial progress on an exact read the request clock cut
+    /// short, so the continuation resumes where the kernel stopped - the
+    /// same bookkeeping a kTLS partial does in `recv_result`. The buffer
+    /// length is NOT advanced: the bytes sit in spare capacity until the
+    /// continuation completes, exactly as a kTLS continuation leaves them.
+    pub(crate) fn advance_exact_partial(&mut self, n: usize) {
+        debug_assert!(n <= self.recv_want, "progress past the armed want");
+        let n = n.min(self.recv_want);
+        self.recv_at += n;
+        self.recv_want -= n;
     }
 
     /// Does the currently-armed recv range `[recv_at, recv_at + recv_want)`

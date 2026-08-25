@@ -163,6 +163,38 @@ fn with_http_server<T: Send + 'static>(
     Some(join.join().expect("client thread").expect("client io"))
 }
 
+/// [`with_http_server`] with the server's tuning spelled out - for the
+/// tests whose subject IS a clock or a bound.
+fn with_http_server_cfg<T: Send + 'static>(
+    cfg: truenas_ros::net::server::ServerConfig,
+    client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
+) -> Option<T> {
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = protocol(
+        HttpConfig::default(),
+        |_inc: Incoming<'_>| Some(()),
+        echo_handler,
+    )
+    .expect("codec config is valid");
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return None,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let join = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        let r = client(v4);
+        stop.shutdown();
+        r
+    });
+    server.serve_forever().expect("serve_forever");
+    Some(join.join().expect("client thread").expect("client io"))
+}
+
 /// Read one response head off the stream, byte-by-byte to its CRLFCRLF (no
 /// over-read - the connection may carry more). Returns `(status, head
 /// text)`; any body is left unread (a HEAD answer has none to read).
@@ -2996,4 +3028,195 @@ fn a_deferred_stream_open_still_sends_the_interim() {
         server.serve_forever().expect("serve_forever");
         Some(join.join().expect("client thread").expect("client io"))
     }
+}
+
+/// A peer pacing an exact read below `want / request_timeout` used to die
+/// mid-transfer: the linked request clock cancelled the `MSG_WAITALL` recv
+/// with partial progress and the short-positive completion always closed.
+/// The clock-cancelled continuation (`resubmit_exact_recv`) resumes the
+/// read instead, so the clock bounds progress-per-period rather than
+/// imposing a throughput floor on the whole window.
+///
+/// 128 KiB `Content-Length` body written 16 KiB per ~150 ms against a
+/// 500 ms request clock: the transfer spans ~2 clock periods, every period
+/// sees progress, and the upload must complete and echo back intact.
+#[test]
+fn a_put_pacing_a_window_below_the_clock_floor_completes() {
+    use truenas_ros::net::server::ServerConfig;
+
+    let cfg = ServerConfig {
+        request_timeout: Some(Duration::from_millis(500)),
+        ..ServerConfig::default()
+    };
+    let Some(()) = with_http_server_cfg(cfg, |v4| {
+        let body: Vec<u8> = (0..128 * 1024).map(|i| (i % 249) as u8).collect();
+        // A loaded runner can stall the pacing loop past a whole clock
+        // period, which is a legitimate zero-progress close - retry those.
+        // The regression this pins is deterministic (the first mid-window
+        // expiry kills the upload), so every attempt fails under it.
+        let mut last = None;
+        for _ in 0..3 {
+            let r = (|| -> io::Result<Vec<u8>> {
+                let mut s = connect_tcp(v4)?;
+                write!(
+                    s,
+                    "PUT /echo HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )?;
+                for chunk in body.chunks(16 * 1024) {
+                    s.write_all(chunk)?;
+                    thread::sleep(Duration::from_millis(150));
+                }
+                let (status, _, echoed) = read_response(&mut s)?;
+                assert_eq!(status, 200);
+                Ok(echoed)
+            })();
+            match r {
+                Ok(echoed) => {
+                    assert_eq!(
+                        echoed, body,
+                        "echoed body differs from what was sent"
+                    );
+                    return Ok(());
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap())
+    }) else {
+        return; // io_uring unavailable here
+    };
+}
+
+/// The same pace through a STREAMED chunked upload - the default-client
+/// shape (botocore frames 128 KiB HTTP chunks and ts3 consumes them as
+/// stream windows). A plain accumulating handler dodges the floor by
+/// accident (chunked bodies arrive through non-exact `More` scans, each
+/// arrival re-arming a fresh clock); a streamed window is one exact
+/// `MSG_WAITALL` read under one clock, so this is where the chunked
+/// framing hit it.
+#[test]
+fn a_streamed_chunked_put_pacing_below_the_clock_floor_completes() {
+    use std::sync::{Arc, Mutex};
+    use truenas_ros::http::{HttpVerdict, Stage, protocol_streaming};
+    use truenas_ros::net::server::ServerConfig;
+
+    let body: Vec<u8> = (0..256 * 1024).map(|i| (i % 247) as u8).collect();
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let sink = got.clone();
+
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = protocol_streaming(
+        HttpConfig::default(),
+        1 << 20,
+        move |_inc: Incoming<'_>| Some(sink.clone()),
+        |mut req: HttpRequest<'_>,
+         sink: &mut Arc<Mutex<Vec<u8>>>| match req.stage {
+            Stage::Open => HttpVerdict::Continue,
+            Stage::Window => {
+                sink.lock().unwrap().extend_from_slice(&req.body.take());
+                HttpVerdict::Continue
+            }
+            Stage::End => HttpVerdict::Respond(HttpResponse::new(200)),
+            Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
+        },
+    )
+    .expect("codec config is valid");
+    let cfg = ServerConfig {
+        request_timeout: Some(Duration::from_millis(500)),
+        ..ServerConfig::default()
+    };
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let sent = body.clone();
+    let join = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        // Same retry policy as the Content-Length twin above: a loaded
+        // runner stalling a full period is a legitimate close, while the
+        // pinned regression fails every attempt.
+        let mut last = None;
+        for _ in 0..3 {
+            got.lock().unwrap().clear();
+            let r = (|| -> io::Result<()> {
+                let mut s = connect_tcp(v4)?;
+                write!(
+                    s,
+                    "PUT /up HTTP/1.1\r\nHost: t\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                    sent.len()
+                )?;
+                for chunk in sent.chunks(16 * 1024) {
+                    s.write_all(chunk)?;
+                    thread::sleep(Duration::from_millis(80));
+                }
+                s.write_all(b"\r\n0\r\n\r\n")?;
+                let (status, _, _) = read_response(&mut s)?;
+                assert_eq!(status, 200);
+                Ok(())
+            })();
+            match r {
+                Ok(()) => {
+                    let delivered = got.lock().unwrap();
+                    assert_eq!(
+                        *delivered, sent,
+                        "windows delivered differ from what was sent"
+                    );
+                    stop.shutdown();
+                    return Ok(());
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        stop.shutdown();
+        Err(last.unwrap())
+    });
+    server.serve_forever().expect("serve_forever");
+    join.join().expect("client thread").expect("client io");
+}
+
+/// The continuation must not have unseated the slow-loris guard: a transfer
+/// that makes NO progress for a full request-clock period still closes. The
+/// peer sends a quarter of the declared body and then stalls; the server
+/// must FIN within a few periods, never answer 200.
+#[test]
+fn a_stalled_transfer_still_dies_by_the_request_clock() {
+    use truenas_ros::net::server::ServerConfig;
+
+    let cfg = ServerConfig {
+        request_timeout: Some(Duration::from_millis(250)),
+        ..ServerConfig::default()
+    };
+    let Some(()) = with_http_server_cfg(cfg, |v4| {
+        let mut s = connect_tcp(v4)?;
+        write!(
+            s,
+            "PUT /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 131072\r\n\r\n"
+        )?;
+        s.write_all(&[7u8; 32 * 1024])?;
+        // Stall. The read outlasts several clock periods, so anything but
+        // the server closing the connection is a failure; a 200 here means
+        // a quarter of a body was delivered as whole.
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut b = [0u8; 512];
+        match s.read(&mut b) {
+            Ok(0) => Ok(()), // FIN: the clock reclaimed the slot
+            Ok(n) => panic!(
+                "server answered {} bytes to a stalled quarter-body: {:?}",
+                n,
+                String::from_utf8_lossy(&b[..n.min(64)])
+            ),
+            // ECONNRESET is a close with unread bytes on some paths.
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => Ok(()),
+            Err(e) => panic!("expected the server to close, got {e}"),
+        }
+    }) else {
+        return; // io_uring unavailable here
+    };
 }
