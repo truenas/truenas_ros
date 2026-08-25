@@ -10,7 +10,7 @@
 //! deliberately smaller — names out, nothing followed, nothing opened.
 
 use std::ffi::CStr;
-use std::os::fd::{AsFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::ptr::NonNull;
 
@@ -92,6 +92,8 @@ pub fn read_names(fd: impl AsFd) -> errno::Result<Vec<DirEntryName>> {
 /// One directory entry read from a [`Dir`].
 pub(crate) struct DirEntry {
     pub(crate) d_type: u8,
+    /// Consulted only by the traversal's resume seek.
+    #[cfg(feature = "fsiter")]
     pub(crate) d_ino: u64,
     pub(crate) name: std::ffi::OsString,
 }
@@ -121,7 +123,10 @@ impl Dir {
         }
     }
 
-    pub(crate) fn fd(&self) -> RawFd {
+    /// The stream's descriptor, which the traversal opens entries
+    /// relative to.
+    #[cfg(feature = "fsiter")]
+    pub(crate) fn fd(&self) -> std::os::fd::RawFd {
         // SAFETY: `self.0` is a live DIR stream.
         unsafe { libc::dirfd(self.0.as_ptr()) }
     }
@@ -150,6 +155,7 @@ impl Dir {
         let name = unsafe { CStr::from_ptr(ent.d_name.as_ptr()) };
         Ok(Some(DirEntry {
             d_type: ent.d_type,
+            #[cfg(feature = "fsiter")]
             d_ino: ent.d_ino,
             name: std::ffi::OsStr::from_bytes(name.to_bytes()).to_os_string(),
         }))
