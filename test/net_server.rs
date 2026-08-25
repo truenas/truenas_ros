@@ -8954,13 +8954,11 @@ fn fs_continuation_cannot_open_a_new_file() {
     }
 }
 
-/// `true` iff running as root - the broker can only impersonate another uid
-/// with `CAP_SETUID`.
 #[cfg(feature = "uring-fs")]
-fn is_root() -> bool {
-    // SAFETY: geteuid cannot fail.
-    unsafe { libc::geteuid() == 0 }
-}
+#[path = "support/privilege.rs"]
+mod privilege;
+#[cfg(feature = "uring-fs")]
+use privilege::{is_root, root_or_skip};
 
 /// The end-to-end proof that a server acts as *authenticated peers*: the
 /// personality genuinely gates namespace access, it is not a stamp. The
@@ -8985,7 +8983,7 @@ fn fs_broker_personality_gates_open() {
         Anchor, AsUser, CredBroker, Personality, RwFlags,
     };
 
-    if !is_root() {
+    if !root_or_skip("fs_broker_personality_gates_open") {
         return; // the broker cannot become another uid without CAP_SETUID
     }
     // A uid/gid that owns nothing here - its personality has only what "other"
@@ -9414,7 +9412,7 @@ fn fs_as_root_reads_trusted_xattr_across_privilege() {
     use truenas_ros::sync_fs::{OFlag, OpenHow};
     use truenas_ros::uring_fs::{Anchor, AsUser, CredBroker, Personality};
 
-    if !is_root() {
+    if !root_or_skip("fs_as_root_reads_trusted_xattr_across_privilege") {
         return;
     }
     const NOBODY_UID: u32 = 65_534;

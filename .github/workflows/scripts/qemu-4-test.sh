@@ -135,6 +135,24 @@ export TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY=1
 # broker test to RUN: unprivileged ci.yml can only skip it, so without this the
 # headline multi-ring feature is gated by a test that never executes.
 export TRUENAS_ROS_REQUIRE_CRED_BROKER=1
+# Root-only tests - broker impersonation, DAC_READ_SEARCH traversal, the
+# trusted.* namespace, capability-bounding-set sheds - return early when the
+# run is unprivileged, and libtest reports that as a pass. This job is the
+# only place they execute, so demand they execute: a skip here means the run
+# stopped being root and the privileged half of the suite tested nothing.
+export TRUENAS_ROS_REQUIRE_ROOT=1
+# `open_by_handle_at` needs CAP_DAC_READ_SEARCH (`may_decode_fh`,
+# fs/fhandle.c) and `name_to_handle_at` needs a filesystem that encodes
+# handles - ZFS registers `zpl_export_operations` with `.encode_fh`
+# (module/os/linux/zfs/zpl_export.c), and this job is root, so both hold.
+# One test in the whole tree drives that round trip; force it to run.
+export TRUENAS_ROS_REQUIRE_FHANDLE=1
+# STATX_CHANGE_COOKIE reaches userspace only on this fork: upstream strips
+# it in `cp_statx` and clears it from the request mask ("kernel-only for
+# now", fs/stat.c), and the TrueNAS patch exposes it under CONFIG_TRUENAS
+# for samba. This VM boots that kernel, so the cookie test must run rather
+# than skip - it is the only place in CI where it can.
+export TRUENAS_ROS_REQUIRE_CHANGE_COOKIE=1
 # The audit suite sends REAL records over NETLINK_AUDIT. It tolerates three
 # environments - no socket, a socket without CAP_AUDIT_WRITE, and the real
 # thing - and only the third tests anything. This VM is the only place that

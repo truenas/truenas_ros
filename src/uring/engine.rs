@@ -282,14 +282,17 @@ mod tests {
 
     /// Skip where io_uring is unavailable (sandbox/old kernel), like the fs
     /// suites. Nothing here submits, so no other failure mode is tolerated.
+    /// [`setup_unavailable`](crate::uring::setup_unavailable) owns which errno
+    /// counts as environmental and asserts on `TRUENAS_ROS_REQUIRE_IO_URING`;
+    /// a local copy of that list is how a skip stops being visible to CI.
     fn engine_or_skip() -> Option<Engine> {
         match Engine::new(RING_ENTRIES, POOL) {
             Ok(e) => Some(e),
-            Err(crate::Error::Errno(
-                errno::Errno::EPERM
-                | errno::Errno::ENOSYS
-                | errno::Errno::EACCES,
-            )) => None,
+            Err(crate::Error::Errno(e))
+                if crate::uring::setup_unavailable(e) =>
+            {
+                None
+            }
             Err(e) => panic!("Engine::new: {e}"),
         }
     }

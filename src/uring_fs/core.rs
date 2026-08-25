@@ -1587,6 +1587,7 @@ impl<'a> FsConn<'a> {
     /// End stage). The recv-buffer claim moves into the reborrow - the
     /// first dispatch is the one with the body - so a leased write still
     /// happens at most once per delivery.
+    #[cfg(feature = "http")]
     pub(crate) fn reborrow(&mut self) -> FsConn<'_> {
         FsConn {
             fs: &mut *self.fs,

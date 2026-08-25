@@ -13,6 +13,9 @@ mod close;
 mod io;
 mod wake;
 
+// The role layers are the only consumers, so a core-alone build has
+// none: gate the re-export or it is an unused import there.
+#[cfg(any(feature = "net-server", feature = "net-client"))]
 pub(crate) use io::{Enacted, Gate, RecvStep, SendStep, SpliceStep};
 #[cfg(feature = "net-server")]
 pub(crate) use io::{RECV_LEASE_DEPTH, recv_pool_buf_len};

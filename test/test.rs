@@ -323,7 +323,16 @@ mod mount {
         // mount is discarded when its fd drops. Skips when unprivileged.
         let fs = match fsopen("tmpfs", FsopenFlags::empty()) {
             Ok(fd) => fd,
-            Err(Errno::EPERM | Errno::ENOSYS | Errno::EACCES) => return,
+            Err(e @ (Errno::EPERM | Errno::ENOSYS | Errno::EACCES)) => {
+                // The only end-to-end drive of fsopen/fsconfig/fsmount in the
+                // tree; `coverage.rs` calls fsconfig but discards every
+                // result. A root run must not reach this arm.
+                assert!(
+                    std::env::var_os("TRUENAS_ROS_REQUIRE_ROOT").is_none(),
+                    "TRUENAS_ROS_REQUIRE_ROOT is set but fsopen(tmpfs): {e}"
+                );
+                return;
+            }
             Err(e) => panic!("fsopen(tmpfs): {e}"),
         };
         fsconfig(fs.as_fd(), FsConfig::Create).expect("fsconfig create");
@@ -504,6 +513,22 @@ mod fhandle {
     use truenas_ros::sync_fs::{AtFlags, OFlag, StatxMask, statx};
     use truenas_ros::{AT_FDCWD, Error};
 
+    /// Hold a file-handle refusal to `TRUENAS_ROS_REQUIRE_FHANDLE`.
+    ///
+    /// Two distinct causes end this test early - a filesystem that cannot
+    /// encode a handle, and a caller without `CAP_DAC_READ_SEARCH` for
+    /// `open_by_handle_at` (`may_decode_fh`, fs/fhandle.c) - and both leave
+    /// the reopen unasserted. This is the only test in the tree that calls
+    /// that syscall, so an ungated skip means the feature's end-to-end path
+    /// is covered nowhere.
+    #[track_caller]
+    fn refusal_is_allowed(what: &str, err: impl std::fmt::Display) {
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_FHANDLE").is_none(),
+            "TRUENAS_ROS_REQUIRE_FHANDLE is set but {what}: {err}"
+        );
+    }
+
     #[test]
     fn name_to_handle_roundtrip_and_reopen() {
         let dir = truenas_ros::tempdir().unwrap();
@@ -516,8 +541,11 @@ mod fhandle {
             FhFlags::AT_HANDLE_MNT_ID_UNIQUE,
         ) {
             Ok(h) => h,
-            // Filesystem cannot encode handles here; skip.
-            Err(Error::Errno(Errno::EOPNOTSUPP)) => return,
+            Err(Error::Errno(Errno::EOPNOTSUPP)) => {
+                // Filesystem cannot encode handles here; skip.
+                refusal_is_allowed("name_to_handle_at", Errno::EOPNOTSUPP);
+                return;
+            }
             Err(e) => panic!("name_to_handle_at: {e}"),
         };
 
@@ -551,8 +579,11 @@ mod fhandle {
             }
             // open_by_handle_at needs CAP_DAC_READ_SEARCH and is often blocked
             // by a container seccomp filter (ENOSYS); both are environmental.
-            Err(Error::Errno(Errno::EPERM | Errno::EACCES | Errno::ENOSYS)) => {
-            }
+            // This arm discards the only reopen assertion the tree has, so it
+            // answers to the gate rather than passing quietly.
+            Err(Error::Errno(
+                e @ (Errno::EPERM | Errno::EACCES | Errno::ENOSYS),
+            )) => refusal_is_allowed("open_by_handle_at", e),
             Err(e) => panic!("open_by_handle_at: {e}"),
         }
     }

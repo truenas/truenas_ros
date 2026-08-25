@@ -30,35 +30,29 @@ use truenas_ros::uring_fs::{
 };
 use truenas_ros::{Errno, Error};
 
-/// A ZFS dataset directory to work in, or `None` to skip.
+#[path = "support/privilege.rs"]
+mod privilege;
+#[path = "support/xattr.rs"]
+mod xattr_probe;
+#[path = "support/zfs_dir.rs"]
+mod zfs_dir;
+
+use privilege::{is_root, root_or_skip};
+use zfs_dir::zfs_dir_or_skip;
+
+/// Hold a ring-side `fsetxattr` refusal to the `TRUENAS_ROS_REQUIRE_XATTRS`
+/// gate, returning whether the set stuck.
 ///
-/// Resolved like `test/zfs.rs` does: the env vars the CI provisioning script
-/// exports, then the `/NFSV4ACL` / `/POSIXACL` convention. Any ZFS dataset
-/// serves - the attribute ioctls do not care about `acltype`.
-///
-/// `TRUENAS_ROS_REQUIRE_ZFS` turns the skip into a failure, so a runner that
-/// stopped provisioning a dataset goes red instead of reporting a green suite
-/// that exercised nothing.
-#[track_caller]
-fn zfs_dir_or_skip() -> Option<PathBuf> {
-    for var in ["TRUENAS_ROS_NFS4_DATASET", "TRUENAS_ROS_POSIX_DATASET"] {
-        if let Some(d) = std::env::var_os(var).map(PathBuf::from)
-            && d.is_dir()
-        {
-            return Some(d);
-        }
+/// The probes here set through the fs handle rather than `libc`, so the
+/// shared module's path helper cannot serve them - but what a refusal means
+/// is identical: every xattr assertion behind it is about to be skipped, and
+/// a runner whose scratch filesystem dropped xattr support has to fail where
+/// CI arms the gate rather than pass green having tested nothing.
+fn fd_xattr_ok<T>(what: &str, res: &Result<T, Error>) -> bool {
+    if let Err(e) = res {
+        xattr_probe::refusal_is_allowed(what, e);
     }
-    for fallback in ["/NFSV4ACL", "/POSIXACL"] {
-        let d = PathBuf::from(fallback);
-        if d.is_dir() {
-            return Some(d);
-        }
-    }
-    assert!(
-        std::env::var_os("TRUENAS_ROS_REQUIRE_ZFS").is_none(),
-        "TRUENAS_ROS_REQUIRE_ZFS is set but no ZFS dataset is present"
-    );
-    None
+    res.is_ok()
 }
 
 /// Single-buffer read, over the reactor's only read op.
@@ -1264,7 +1258,7 @@ fn privileged_xattr_prefixes_refuse_dangerous_namespaces() {
 /// below 6.13, where fd-based xattrs are unavailable.
 #[test]
 fn privileged_xattr_allowlist_elevates_only_listed_names() {
-    if !is_root() {
+    if !root_or_skip("privileged_xattr_allowlist_elevates_only_listed_names") {
         return;
     }
     pin_umask();
@@ -1798,12 +1792,6 @@ where
     });
 }
 
-/// Skip a root-only test when not running privileged.
-fn is_root() -> bool {
-    // SAFETY: geteuid cannot fail.
-    unsafe { libc::geteuid() == 0 }
-}
-
 // --- query_directory -------------------------------------------------------
 
 #[test]
@@ -1828,7 +1816,7 @@ fn query_directory_lists_and_enriches() {
             let f = h.open(me, &anchor, "a.txt", how).unwrap();
             let (res, _) = h.fsetxattr(me, &f, &etag, b"deadbeef".to_vec(), 0);
             h.close(f).unwrap();
-            res.is_ok()
+            fd_xattr_ok("fsetxattr(user.etag)", &res)
         };
 
         let opts = QueryOptions {
@@ -1886,7 +1874,7 @@ fn query_directory_discovers_user_xattrs() {
             let (res, _) =
                 h.fsetxattr(me, &f, &xattr_name(name), val.to_vec(), 0);
             h.close(f).unwrap();
-            res.is_ok()
+            fd_xattr_ok(&format!("fsetxattr({name})"), &res)
         };
         if !set("user.alpha", b"one") {
             return; // this kernel/fs refuses fd xattrs; nothing to discover
@@ -1952,7 +1940,7 @@ fn query_directory_discovers_non_utf8_name() {
             let f = h.open(me, &anchor, "a.txt", how).unwrap();
             let (res, _) = h.fsetxattr(me, &f, &name, b"present".to_vec(), 0);
             h.close(f).unwrap();
-            res.is_ok()
+            fd_xattr_ok("fsetxattr(user.<non-utf8>)", &res)
         };
         if !set_ok {
             return; // fd xattrs unsupported, or the fs rejects the name
@@ -2003,7 +1991,7 @@ fn query_directory_discovers_large_value() {
             let (res, _) =
                 h.fsetxattr(me, &f, &xattr_name("user.blob"), big.clone(), 0);
             h.close(f).unwrap();
-            res.is_ok()
+            fd_xattr_ok("fsetxattr(user.blob)", &res)
         };
         if !set_ok {
             return; // fd xattrs unsupported, or the fs rejects the value size
@@ -2055,7 +2043,7 @@ fn query_directory_explicit_large_value() {
             let f = h.open(me, &anchor, "big.bin", how).unwrap();
             let (res, _) = h.fsetxattr(me, &f, &name, big.clone(), 0);
             h.close(f).unwrap();
-            res.is_ok()
+            fd_xattr_ok("fsetxattr(user.blob)", &res)
         };
         if !set_ok {
             return; // fd xattrs unsupported, or the fs rejects the value size
@@ -2097,7 +2085,7 @@ fn query_directory_discovery_drops_unreadable_trusted() {
         EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
     };
 
-    if !is_root() {
+    if !root_or_skip("query_directory_discovery_drops_unreadable_trusted") {
         return; // broker impersonation and trusted.* both need privilege
     }
     const NOBODY_UID: u32 = 65_534;
@@ -2120,7 +2108,8 @@ fn query_directory_discovery_drops_unreadable_trusted() {
             h.close(f).unwrap();
             res
         };
-        if set(me, "user.pub", b"public").is_err() {
+        if !fd_xattr_ok("fsetxattr(user.pub)", &set(me, "user.pub", b"public"))
+        {
             return; // fd xattrs unsupported
         }
         set(me, "trusted.secret", b"classified").unwrap();
@@ -2184,7 +2173,7 @@ fn query_pool_discovers_xattrs() {
             let (res, _) =
                 h.fsetxattr(me, &f, &xattr_name("user.tag"), b"v".to_vec(), 0);
             h.close(f).unwrap();
-            res.is_ok()
+            fd_xattr_ok("fsetxattr(user.tag)", &res)
         };
         if !set_ok {
             return;
@@ -2221,7 +2210,7 @@ fn query_directory_enumeration_obeys_dac() {
     use truenas_ros::errno::Errno;
     use truenas_ros::uring_fs::{EnrichSpec, QueryOptions, query_directory};
 
-    if !is_root() {
+    if !root_or_skip("query_directory_enumeration_obeys_dac") {
         return; // the broker cannot become another uid without CAP_SETUID
     }
     const NOBODY_UID: u32 = 65_534;
@@ -2324,7 +2313,7 @@ fn fs_handle_query_xattrs_reads_user_namespace() {
                 h.fsetxattr(me, &f, &xattr_name(name), val.to_vec(), 0);
             res
         };
-        if set("user.a", b"1").is_err() {
+        if !fd_xattr_ok("fsetxattr(user.a)", &set("user.a", b"1")) {
             return; // this kernel/fs refuses fd xattrs
         }
         set("user.b", b"22").unwrap();
@@ -2359,7 +2348,7 @@ fn fs_handle_query_xattrs_drops_unreadable_trusted() {
     use std::collections::BTreeMap;
     use truenas_ros::uring_fs::XattrNamespaces;
 
-    if !is_root() {
+    if !root_or_skip("fs_handle_query_xattrs_drops_unreadable_trusted") {
         return; // broker impersonation and trusted.* both need privilege
     }
     const NOBODY_UID: u32 = 65_534;
@@ -2382,7 +2371,7 @@ fn fs_handle_query_xattrs_drops_unreadable_trusted() {
                 h.fsetxattr(me, &owner, &xattr_name(name), val.to_vec(), 0);
             res
         };
-        if set("user.pub", b"public").is_err() {
+        if !fd_xattr_ok("fsetxattr(user.pub)", &set("user.pub", b"public")) {
             return; // fd xattrs unsupported
         }
         set("trusted.secret", b"classified").unwrap();
@@ -2425,7 +2414,7 @@ fn fs_handle_query_xattrs_drops_unreadable_trusted() {
 /// `who`-attributed read (as an unprivileged identity) is denied.
 #[test]
 fn fs_handle_fgetxattr_as_root_reads_trusted() {
-    if !is_root() {
+    if !root_or_skip("fs_handle_fgetxattr_as_root_reads_trusted") {
         return; // broker impersonation and trusted.* both need privilege
     }
     const NOBODY_UID: u32 = 65_534;
@@ -2443,7 +2432,7 @@ fn fs_handle_fgetxattr_as_root_reads_trusted() {
         let f = h.open(me, &anchor, "f.txt", how).unwrap();
         let name = xattr_name("trusted.secret");
         let (set, _) = h.fsetxattr(me, &f, &name, b"classified".to_vec(), 0);
-        if set.is_err() {
+        if !fd_xattr_ok("fsetxattr(trusted.secret)", &set) {
             return; // fd xattrs unsupported
         }
 
@@ -2698,7 +2687,7 @@ fn group_list_beyond_the_cap_is_rejected_not_truncated() {
 
 #[test]
 fn impersonated_open_obeys_dac() {
-    if !is_root() {
+    if !root_or_skip("impersonated_open_obeys_dac") {
         return; // cross-uid impersonation needs CAP_SETUID
     }
     with_broker(|h, creds, me, dir| {
@@ -2748,7 +2737,7 @@ fn impersonated_open_obeys_dac() {
 
 #[test]
 fn impersonated_personality_holds_no_dac_override() {
-    if !is_root() {
+    if !root_or_skip("impersonated_personality_holds_no_dac_override") {
         return;
     }
     with_broker(|h, creds, _me, dir| {
@@ -2800,7 +2789,7 @@ fn impersonated_personality_holds_no_dac_override() {
 
 #[test]
 fn impersonated_create_is_owned_by_the_user() {
-    if !is_root() {
+    if !root_or_skip("impersonated_create_is_owned_by_the_user") {
         return;
     }
     with_broker(|h, creds, _me, dir| {
@@ -2840,7 +2829,7 @@ fn impersonated_create_is_owned_by_the_user() {
 
 #[test]
 fn impersonated_trusted_xattr_is_denied() {
-    if !is_root() {
+    if !root_or_skip("impersonated_trusted_xattr_is_denied") {
         return;
     }
     with_broker(|h, creds, me, dir| {
@@ -2883,7 +2872,7 @@ fn impersonated_trusted_xattr_is_denied() {
 
 #[test]
 fn broker_reverts_credentials_between_registrations() {
-    if !is_root() {
+    if !root_or_skip("broker_reverts_credentials_between_registrations") {
         return;
     }
     with_broker(|h, creds, _me, dir| {
@@ -3073,7 +3062,7 @@ fn large_ad_group_list_round_trips() {
     // retries), and an AD Kerberos PAC carries on the order of 1000 group
     // SIDs, so the wire format and the impersonation window must handle a
     // list of that size - not just the handful a POSIX user has.
-    if !is_root() {
+    if !root_or_skip("large_ad_group_list_round_trips") {
         return; // setgroups with a foreign list needs CAP_SETGID
     }
     with_broker(|h, creds, _me, dir| {
@@ -3302,13 +3291,25 @@ fn start_after_resumes_a_path_ordered_listing_without_gaps() {
 /// does **not** move when the file is merely read. A cookie that advanced on
 /// reads would invalidate every cache entry on every access.
 ///
-/// Skips where the filesystem does not supply one - the kernel reports that
-/// by leaving the bit out of the returned mask, which is why
-/// [`Statx::change_cookie`] is an `Option` rather than a bare `u64`.
+/// Skips where the kernel does not hand the cookie to userspace, which is a
+/// property of the *kernel*, not the filesystem: upstream strips the bit in
+/// `cp_statx` and clears it from the request mask ("kernel-only for now",
+/// fs/stat.c), while the TrueNAS fork exposes it under `CONFIG_TRUENAS`.
+/// Runs on a **ZFS dataset**, not the default `tempdir`. tmpfs carries
+/// `i_version` too (`SB_I_VERSION`, mm/shmem.c:5375), so a tempdir fixture
+/// would pass - but it would be pinning tmpfs's cookie, and the product only
+/// ships on ZFS. What has to hold is that *ZFS* moves the cookie on a write
+/// and holds it across a read.
+///
+/// Two gates, both armed in the QEMU job: `TRUENAS_ROS_REQUIRE_ZFS` for the
+/// dataset, and `TRUENAS_ROS_REQUIRE_CHANGE_COOKIE` for the kernel.
 #[test]
 fn change_cookie_moves_on_writes_and_not_on_reads() {
-    with_fs(test_cfg(), |h, me, dir, _stop| {
-        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+    let Some(ds) = zfs_dir_or_skip() else {
+        return;
+    };
+    with_fs(test_cfg(), |h, me, _dir, _stop| {
+        let anchor = Anchor::open(ds.as_path()).expect("anchor");
         let how = OpenHow::new()
             .flags(OFlag::O_RDWR | OFlag::O_CREAT)
             .mode(Mode::from_bits_truncate(0o600));
@@ -3321,12 +3322,12 @@ fn change_cookie_moves_on_writes_and_not_on_reads() {
         };
 
         let Some(first) = cookie(&f) else {
-            // No i_version on this filesystem - tmpfs, where `tempdir`
-            // lands by default, is one. Point `TMPDIR` at a ZFS
-            // dataset to actually exercise this.
-            eprintln!(
-                "skipping: no change cookie on the filesystem backing {}",
-                dir.display()
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_CHANGE_COOKIE").is_none(),
+                "TRUENAS_ROS_REQUIRE_CHANGE_COOKIE is set but the dataset \
+                 at {} reports none: this kernel is not exposing \
+                 STATX_CHANGE_COOKIE",
+                ds.display()
             );
             return;
         };
@@ -3366,7 +3367,9 @@ const CAP_NOBODY_GID: u32 = 65_534;
 /// have to change a test that says so.
 #[test]
 fn dac_read_search_traverses_a_directory_the_identity_cannot_search() {
-    if !is_root() {
+    if !root_or_skip(
+        "dac_read_search_traverses_a_directory_the_identity_cannot_search",
+    ) {
         return;
     }
     with_broker_caps(Caps::DAC_READ_SEARCH, |h, creds, _me, dir| {
@@ -3417,7 +3420,7 @@ fn dac_read_search_traverses_a_directory_the_identity_cannot_search() {
 /// even open - asymmetric enough to be worth pinning.
 #[test]
 fn dac_read_search_grants_o_rdonly_but_not_o_rdwr() {
-    if !is_root() {
+    if !root_or_skip("dac_read_search_grants_o_rdonly_but_not_o_rdwr") {
         return;
     }
     with_broker_caps(Caps::DAC_READ_SEARCH, |h, creds, _me, dir| {
@@ -3463,7 +3466,7 @@ fn dac_read_search_grants_o_rdonly_but_not_o_rdwr() {
 /// every file on the system.
 #[test]
 fn spawn_time_mask_is_a_ceiling_on_requested_caps() {
-    if !is_root() {
+    if !root_or_skip("spawn_time_mask_is_a_ceiling_on_requested_caps") {
         return;
     }
     with_broker(|_h, creds, _me, _dir| {
@@ -3492,7 +3495,7 @@ fn spawn_time_mask_is_a_ceiling_on_requested_caps() {
 /// either leaking a capability or withholding one, depending on the order.
 #[test]
 fn identity_cache_keys_on_the_capability_set() {
-    if !is_root() {
+    if !root_or_skip("identity_cache_keys_on_the_capability_set") {
         return;
     }
     with_broker_caps(Caps::DAC_READ_SEARCH, |_h, creds, _me, _dir| {
@@ -4035,7 +4038,7 @@ fn fremovexattr_refuses_attributes_outside_the_allowlist() {
 /// reactor cannot set the attribute this removes.
 #[test]
 fn fremovexattr_removes_allowlisted_attributes() {
-    if !is_root() {
+    if !root_or_skip("fremovexattr_removes_allowlisted_attributes") {
         return;
     }
     with_priv_xattr_fs(|h, me, dir| {
