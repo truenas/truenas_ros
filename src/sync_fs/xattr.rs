@@ -90,6 +90,15 @@ fn fgetxattr_cstr(raw: RawFd, name: &CStr) -> errno::Result<Vec<u8>> {
         match read {
             Ok(n) => {
                 buf.truncate(n as usize);
+                // Give the first-read buffer's surplus back when the value
+                // is small: `truncate` never shrinks capacity, and callers
+                // hold these values (a copied xattr set, a listing) far
+                // longer than the read. The shrink's memcpy is skipped when
+                // the value fills more than half the buffer, so it is only
+                // paid to reclaim at least its own size.
+                if buf.capacity() / 2 >= buf.len() {
+                    buf.shrink_to_fit();
+                }
                 return Ok(buf);
             }
             Err(Errno::ERANGE) => {
