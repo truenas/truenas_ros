@@ -1513,6 +1513,21 @@ fn revert() {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
+    /// Whether a root-only test may proceed. `false` means the caller
+    /// returns without asserting; `TRUENAS_ROS_REQUIRE_ROOT` turns that skip
+    /// into a failure where CI arms it (the QEMU job, the only place this
+    /// module's impersonation paths run at all).
+    fn root_or_skip(what: &str) -> bool {
+        if super::raw_geteuid() == 0 {
+            return true;
+        }
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_ROOT").is_none(),
+            "TRUENAS_ROS_REQUIRE_ROOT is set but this process is not root: \
+             {what}"
+        );
+        false
+    }
 
     /// A repeated gid must not buy the no-impersonation fast path.
     ///
@@ -1564,10 +1579,14 @@ mod tests {
     /// (Root-only: impersonation needs `CAP_SETUID`.)
     #[test]
     fn register_as_rejects_the_no_change_sentinel() {
-        if raw_geteuid() != 0 {
+        if !root_or_skip("register_as_rejects_the_no_change_sentinel") {
             return;
         }
-        let Ok(ring) = Ring::new(4) else { return };
+        let ring = match Ring::new(4) {
+            Ok(r) => r,
+            Err(e) if crate::uring::setup_unavailable(e) => return,
+            Err(e) => panic!("Ring::new: {e}"),
+        };
         let mut scratch = [0 as libc::gid_t; 8];
         let out = register_as(
             ring.raw_fd(),
@@ -1618,7 +1637,7 @@ mod tests {
         const CAP_SETGID: libc::c_long = 6;
         const CAP_SETUID: libc::c_long = 7;
         const PR_CAPBSET_READ: libc::c_long = 23;
-        if raw_geteuid() != 0 {
+        if !root_or_skip("drop_setid_caps_clears_the_bounding_set") {
             return;
         }
         // SAFETY: fork; the child only makes async-signal-safe syscalls and
@@ -1661,7 +1680,7 @@ mod tests {
     /// on. Root-only because it has to shed privilege to test the shed.
     #[test]
     fn drop_setid_caps_tolerates_an_unprivileged_caller() {
-        if raw_geteuid() != 0 {
+        if !root_or_skip("drop_setid_caps_tolerates_an_unprivileged_caller") {
             return;
         }
         // SAFETY: fork; the child only makes async-signal-safe syscalls and
@@ -1700,8 +1719,10 @@ mod tests {
     /// the reactors themselves.
     #[test]
     fn io_uring_fd_cannot_cross_scm_rights() {
-        let Ok(ring) = Ring::new(4) else {
-            return; // io_uring unavailable (sandbox/old kernel)
+        let ring = match Ring::new(4) {
+            Ok(r) => r,
+            Err(e) if crate::uring::setup_unavailable(e) => return,
+            Err(e) => panic!("Ring::new: {e}"),
         };
         let mut sv = [0 as RawFd; 2];
         // SAFETY: valid 2-element array.

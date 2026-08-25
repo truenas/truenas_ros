@@ -6,9 +6,11 @@
 // The `TRUENAS_ROS_REQUIRE_XATTRS` gate, shared with the live suites: a
 // filesystem that refuses xattrs must fail this suite loudly where CI arms
 // it, not skip the assertions behind the probe.
-#[cfg(feature = "xattr")]
 #[path = "support/xattr.rs"]
 mod xattr_probe;
+#[cfg(feature = "xattr")]
+#[path = "support/zfs_dir.rs"]
+mod zfs_dir;
 
 // ------------------------------------------------------------------ errno/error
 mod errno_error {
@@ -1097,7 +1099,16 @@ mod fhandle {
             FhFlags::AT_HANDLE_MNT_ID_UNIQUE,
         ) {
             Ok(h) => h,
-            Err(Error::Errno(Errno::EOPNOTSUPP)) => return,
+            Err(Error::Errno(Errno::EOPNOTSUPP)) => {
+                // The fs cannot encode handles; the codec assertions below
+                // are about to be skipped, so answer to the gate.
+                assert!(
+                    std::env::var_os("TRUENAS_ROS_REQUIRE_FHANDLE").is_none(),
+                    "TRUENAS_ROS_REQUIRE_FHANDLE is set but \
+                     name_to_handle_at: EOPNOTSUPP"
+                );
+                return;
+            }
             Err(e) => panic!("{e}"),
         };
         let hb =
@@ -1594,6 +1605,25 @@ mod shutil {
         copytree, copyuserspace,
     };
 
+    /// A source/destination pair on a **ZFS dataset**, or `None` to skip.
+    ///
+    /// For the clone path only: tmpfs serves `copy_file_range` as a plain
+    /// copy, so a tempdir fixture passes without ever reaching the block
+    /// clone (`zfs_clone_range`) that ships. The other copy helpers here are
+    /// filesystem-agnostic and keep the tempdir `pair`.
+    #[allow(clippy::type_complexity)]
+    fn zfs_pair(
+        src: &[u8],
+    ) -> Option<(std::path::PathBuf, std::fs::File, std::fs::File)> {
+        let ds = super::zfs_dir::zfs_dir_or_skip()?;
+        let s = ds.join("clone_src");
+        let d = ds.join("clone_dst");
+        std::fs::write(&s, src).unwrap();
+        let sf = std::fs::File::open(&s).unwrap();
+        let df = std::fs::File::create(&d).unwrap();
+        Some((ds, sf, df))
+    }
+
     fn pair(
         src: &[u8],
     ) -> (truenas_ros::TempDir, std::fs::File, std::fs::File) {
@@ -1633,28 +1663,37 @@ mod shutil {
         assert_eq!(copysendfile(s2.as_fd(), d2.as_fd()).unwrap(), 0);
     }
 
+    /// The clone half runs on a ZFS dataset, because that is the only place
+    /// it is the code under test: tmpfs serves `copy_file_range` as a plain
+    /// copy, so a tempdir fixture takes the `Ok` arm without ever reaching
+    /// `zfs_clone_range`. `EXDEV` stays tolerated - two files on different
+    /// filesystems genuinely cannot clone - but on a dataset an unsupported
+    /// answer is a regression, not an environment.
     #[test]
-    fn clonefile_and_copyfile() {
-        let (dir, s, d) = pair(b"clone me");
+    fn clonefile_clones_on_a_dataset() {
+        let Some((ds, s, d)) = zfs_pair(b"clone me") else {
+            return;
+        };
         match clonefile(s.as_fd(), d.as_fd()) {
             Ok(n) => {
                 assert_eq!(n, 8);
                 drop(d);
                 assert_eq!(
-                    std::fs::read(dir.path().join("d")).unwrap(),
+                    std::fs::read(ds.join("clone_dst")).unwrap(),
                     b"clone me"
                 );
             }
-            // copy_file_range may be unsupported here.
-            Err(
-                Errno::EXDEV
-                | Errno::ENOSYS
-                | Errno::EOPNOTSUPP
-                | Errno::EINVAL,
-            ) => {}
-            Err(e) => panic!("clonefile: {e}"),
+            Err(Errno::EXDEV) => {}
+            Err(e) => panic!("clonefile on a ZFS dataset: {e}"),
         }
-        // copyfile always lands the content (clone or fallback).
+        let _ = std::fs::remove_file(ds.join("clone_src"));
+        let _ = std::fs::remove_file(ds.join("clone_dst"));
+    }
+
+    /// `copyfile` lands the content whichever path it takes, so this half is
+    /// filesystem-agnostic and keeps the tempdir fixture.
+    #[test]
+    fn copyfile_lands_the_content() {
         let (dir2, s2, d2) = pair(b"copy me");
         copyfile(s2.as_fd(), d2.as_fd()).unwrap();
         drop(d2);

@@ -165,7 +165,8 @@ jobs:
     # Each feature alone proves the per-subsystem gates and dependency edges
     # (acl without shutil, idmap alone, …); `uring` alone proves the shared
     # engine builds severed from the net stack (the seam the async fs reactor
-    # relies on); each net role alone proves the role gates.
+    # relies on); each net role alone proves the role gates, and `net-core`
+    # alone proves the core they share builds with neither role present.
     #
     # Through clippy with `-D warnings`, not `cargo build`, because a warning
     # is only visible in the feature set that produces it: an item every other
@@ -177,10 +178,28 @@ jobs:
       run: |
         cargo clippy --no-default-features -- -D warnings
         for f in sync-fs xattr mount acl fhandle fsiter idmap shutil \
-                 configfile audit secrets signal uring net-server \
+                 configfile audit secrets signal uring net-core net-server \
                  net-client uring-fs http __fuzz; do
           echo "::group::clippy --features $f"
           cargo clippy --no-default-features --features "$f" -- -D warnings
+          echo "::endgroup::"
+        done
+        # Pairs. An `any(a, b)` gate needs no pair - a single-feature build
+        # already reaches each arm - so what wants one is an `all(a, b)`
+        # gate, or an item whose guard is keyed on one feature while its
+        # only caller sits behind another: in no other combination is the
+        # guard inactive and the caller absent at once. The crate has
+        # exactly one distinct `all(..)` feature pair today,
+        # `all(net-server, uring-fs)`, at ~70 sites (the file-body path),
+        # which is the first entry; `http,uring-fs` is the shape a consumer
+        # ships. The remaining two are forward guards on the axes where an
+        # `all(..)` would plausibly appear next. Add a pair here when a new
+        # `all(..)` predicate does. Clippy stops at check, so each is one
+        # compile, not a VM job.
+        for p in net-server,uring-fs net-client,uring-fs \
+                 net-server,net-client http,uring-fs; do
+          echo "::group::clippy --features $p"
+          cargo clippy --no-default-features --features "$p" -- -D warnings
           echo "::endgroup::"
         done
         cargo clippy --all-features -- -D warnings
