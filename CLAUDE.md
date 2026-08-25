@@ -405,6 +405,33 @@ Do not reopen these without a reason that is new.
   thresholds), and `a_known_length_body_streams_above_one_window` pins
   the full-window law.
 
+### The two receive clocks
+
+- **Two clocks, because neither can do the other's job.** `request_timeout` is
+  re-armed by every recv, so it answers "is this peer still there" and is
+  explicitly not a rate floor. Making it absolute instead would close a peer
+  transferring perfectly well, merely slowly; keeping only it leaves
+  `pool_size` **unauthenticated** peers holding every slot at one byte per
+  period, because a slot is taken at accept and accept is gated on a free one.
+  `validate` refuses `max_receipt_time <= request_timeout`, which would
+  pre-empt the inactivity bound and leave it configured but dead.
+- **The budget bounds one *message*, not one connection.** That is what makes
+  it compose with a streamed body - each window is its own message, so an
+  upload of any size is admitted while the floor stays `STREAM_WINDOW /
+  max_receipt_time`. A per-connection budget would cap upload size by wall
+  clock, the ceiling the streaming path exists to remove.
+- **Armed in `submit_recv` on the first non-idle read, retired in
+  `deliver_one`, never cancelled in between.** A `More` scan re-enters
+  `submit_recv` on every chunk, so a cancel-then-arm there rides the trickle
+  and reproduces `request_timeout` under a second name. An exact read cannot
+  show this - a length-prefixed body is one `submit_recv` whatever happens
+  afterwards - so the control for it has to be a chunk scan
+  (`a_chunk_scan_budget_is_not_restarted_by_progress`).
+- **Retiring at *delivery* is what keeps it a bound on receipt.** A
+  `Response::Defer` may run arbitrarily long, and a budget still armed would
+  clock the handler, then the next idle period, on a connection that has done
+  nothing wrong.
+
 ### The offload pool
 
 - **`WorkerPool::drop` waits `SHUTDOWN_DETACH_AFTER` *in total* and then

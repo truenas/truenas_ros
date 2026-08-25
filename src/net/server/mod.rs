@@ -333,7 +333,7 @@
 //!
 //! **Slow-loris coverage.** A peer that seizes a pool slot and then makes no
 //! progress ties it up; enough such peers exhaust `pool_size` and deny service.
-//! Three timeouts each bound one stall surface - a hardened deployment sets all
+//! Four timeouts each bound one stall surface - a hardened deployment sets all
 //! that apply:
 //! * `idle_timeout` - parked between requests with **nothing buffered** (the
 //!   connect-and-stay-silent variant); a kernel `LINK_TIMEOUT` on the idle recv.
@@ -344,6 +344,12 @@
 //!   splice chunks (plain TCP), or each record of a kTLS splice - which would
 //!   otherwise block an io-wq worker with no cancellable recv for any other
 //!   timeout to reach (see [`Framing::SpliceBody`]).
+//! * `max_receipt_time` - a request that **never stalls and never ends**,
+//!   which the two above cannot reach: both are re-armed by progress, so a
+//!   peer sending one byte per period satisfies them forever. This one runs
+//!   from a message's first byte to its delivery and is not restarted, so it
+//!   is the rate floor rather than a liveness check; a standalone `TIMEOUT`,
+//!   one per connection.
 //! * `tls_handshake_timeout` - a kTLS connection **parked across its handshake**
 //!   (no recv/send yet), which neither recv-linked timeout reaches; a standalone
 //!   `TIMEOUT` on the park.
@@ -351,6 +357,10 @@
 //! The recv-linked timeouts cost no wakeups until a stall and never interrupt a
 //! steadily progressing transfer. All default to `None`; set them especially
 //! when `pool_size` is tight and idle keep-alive would crowd out live traffic.
+//! Note what `idle_timeout` and `request_timeout` alone leave open: a slot is
+//! taken at **accept**, before authentication, so without `max_receipt_time`
+//! `pool_size` unauthenticated peers each trickling one byte per period hold
+//! every slot indefinitely and accept is gated behind them.
 //!
 //! `send_timeout` is the send-side counterpart: a `LINK_TIMEOUT` on each send
 //! that closes a connection whose reply stalls (a peer that stopped reading) --
@@ -785,6 +795,10 @@ where
             idle_timeout: cfg.idle_timeout.map(ts_of).unwrap_or_default(),
             send_timeout: cfg.send_timeout.map(ts_of).unwrap_or_default(),
             request_timeout: cfg.request_timeout.map(ts_of).unwrap_or_default(),
+            max_receipt_time: cfg
+                .max_receipt_time
+                .map(ts_of)
+                .unwrap_or_default(),
             tls_handshake: cfg
                 .tls_handshake_timeout
                 .map(ts_of)
@@ -1150,6 +1164,11 @@ where
             // A parked read's pool-shortage backoff elapsed: re-pump the
             // connection unless something else got there first.
             Some(Op::RecvRetry) => self.on_recv_retry(slot, generation)?,
+            // The total-receipt budget for the message in flight elapsed
+            // (or its retire-cancel completed).
+            Some(Op::ReceiptDeadline) => {
+                self.core.on_receipt_deadline(slot, generation, cqe.res)?
+            }
             Some(Op::Connect) => unreachable!("server never connects"),
             Some(Op::Cancel) | None => {}
         }

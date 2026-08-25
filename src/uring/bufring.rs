@@ -986,6 +986,46 @@ mod tests {
         assert_eq!(br.allocated(), allocated, "and allocated nothing");
     }
 
+    /// A release naming an id the ring has no slot for: a
+    /// userspace/kernel descriptor desync, refused before it can index
+    /// out of the table.
+    ///
+    /// The `debug_assert` fires first, so this reaches only the debug half
+    /// and only in a debug build.
+    /// `releasing_an_id_outside_the_ring_is_refused_without_asserts`
+    /// covers the `return` that ships beside it.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "buffer id outside the ring")]
+    fn releasing_an_id_outside_the_ring_is_refused() {
+        let Some(r) = ring() else {
+            panic!("buffer id outside the ring: skipped, no io_uring");
+        };
+        let mut br = BufRing::new(r.raw_fd(), 0, 4, 64, 4).expect("registers");
+        br.release(200);
+    }
+
+    /// The shipping half: with `debug_assertions` off the `let else` is the
+    /// whole guard, and what it must do is nothing at all - no loan
+    /// retired, since `lent` would otherwise be decremented for a buffer
+    /// nobody took and a wrapped count reads as a nearly empty pool.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn releasing_an_id_outside_the_ring_is_refused_without_asserts() {
+        let Some(r) = ring() else {
+            return;
+        };
+        let mut br = BufRing::new(r.raw_fd(), 0, 4, 64, 4).expect("registers");
+        br.lend(1);
+        let before = (br.free(), br.lent(), br.allocated());
+        br.release(200);
+        assert_eq!(
+            (br.free(), br.lent(), br.allocated()),
+            before,
+            "an out-of-range release moved nothing"
+        );
+    }
+
     /// The steady-state path allocates nothing.
     ///
     /// A buffer cycling lend -> release -> re-post keeps its storage: the

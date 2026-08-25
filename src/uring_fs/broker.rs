@@ -1474,13 +1474,23 @@ fn needs_impersonation(
     if n < 0 {
         return true;
     }
-    let cur = &scratch[..n as usize];
+    group_set_differs(&scratch[..n as usize], groups)
+}
+
+/// Is `groups` a different *set* from the broker's current `cur`?
+///
+/// `true` sends the request through the impersonation window, which is always
+/// sound; a wrong `false` serves it under the *broker's* credentials. Pure
+/// over its two arguments so the property can be driven from any host --
+/// `needs_impersonation` around it reads the live process, and one with fewer
+/// than two supplementary groups cannot forge a list to compare.
+fn group_set_differs(cur: &[u32], groups: &[u32]) -> bool {
     if cur.len() != groups.len() {
         return true;
     }
     // Equal length plus one-way containment is not set equality once a gid
     // repeats: a request for `[1, 1]` against a current `[1, 2]` satisfies
-    // both and takes the fast path, which registers the broker's *own*
+    // both and would take the fast path, registering the broker's *own*
     // credentials - group 2 included - under the caller's name. A repeat is
     // never something the fast path needs to serve, so it goes through the
     // window, where `setgroups` installs exactly what was asked for.
@@ -1536,36 +1546,77 @@ mod tests {
     /// caller whatever the broker holds. Equal length plus one-way
     /// containment satisfies `[1, 1]` against a current `[1, 2]` - same
     /// count, every requested gid present - while the sets differ by group
-    /// 2. Driven on the predicate, since reaching the real path needs a
-    /// forked broker with CAP_SETUID.
+    /// 2. Driven on `group_set_differs` rather than on
+    /// `needs_impersonation`, which reads the live process: a host with
+    /// fewer than two supplementary groups cannot forge a list at all, and
+    /// on the QEMU lane the suite runs as root, whose only group is root.
     #[test]
     fn a_repeated_gid_does_not_take_the_no_impersonation_path() {
-        let me = crate::uring_fs::broker::raw_geteuid();
-        let my_gid = crate::uring_fs::broker::raw_getegid();
-        let mut scratch = [0u32; 64];
-        // As many entries as the process has, all of them one gid it
-        // really holds - equal in count, and a subset by containment.
-        let n = unsafe {
-            libc::syscall(
-                libc::SYS_getgroups,
-                scratch.len() as libc::c_long,
-                scratch.as_mut_ptr(),
-            )
-        };
-        if n < 2 {
-            return; // needs at least two supplementary groups to forge
-        }
-        let real = &scratch[..n as usize].to_vec();
-        let forged: Vec<u32> = vec![real[0]; real.len()];
-        if forged == *real {
-            return; // this process's groups are already all equal
-        }
-        let mut scratch2 = [0u32; 64];
         assert!(
-            needs_impersonation(me, my_gid, &forged, &mut scratch2),
-            "a forged group list took the fast path: {forged:?} against \
-             {real:?}"
+            super::group_set_differs(&[1, 2], &[1, 1]),
+            "a repeat forged equality out of containment"
         );
+        assert!(super::group_set_differs(&[1, 1], &[1, 2]));
+        // Order is not identity.
+        assert!(!super::group_set_differs(&[1, 2, 3], &[3, 1, 2]));
+        assert!(!super::group_set_differs(&[], &[]));
+        // Neither containment direction alone is enough.
+        assert!(super::group_set_differs(&[1, 2], &[1, 3]));
+        assert!(super::group_set_differs(&[1], &[1, 2]));
+    }
+
+    /// The fast path is taken only on genuine set equality - swept, rather
+    /// than argued from the three clauses that implement it. Every sequence
+    /// pair over a 3-symbol alphabet up to length 3, checked against a
+    /// sorted-vector oracle that is deliberately not the shipped algorithm.
+    #[test]
+    fn the_group_fast_path_is_exactly_set_equality() {
+        fn seqs() -> Vec<Vec<u32>> {
+            let mut out = vec![vec![]];
+            for _ in 0..3 {
+                let mut next = Vec::new();
+                for s in &out {
+                    for g in 1..=3u32 {
+                        let mut t = s.clone();
+                        t.push(g);
+                        next.push(t);
+                    }
+                }
+                out.extend(next);
+            }
+            out
+        }
+        let all = seqs();
+        let mut fast = 0usize;
+        for cur in &all {
+            for want in &all {
+                // The oracle: multiset equality, which for the fast path to
+                // be sound must coincide with set equality - a repeat is
+                // exactly where the two part company.
+                let (mut a, mut b) = (cur.clone(), want.clone());
+                a.sort_unstable();
+                b.sort_unstable();
+                let same_multiset = a == b;
+                let differs = super::group_set_differs(cur, want);
+                if !differs {
+                    fast += 1;
+                    assert!(
+                        same_multiset,
+                        "fast path on unequal sets: {cur:?} vs {want:?}"
+                    );
+                }
+                // A repeat on either side must never be served fast, even
+                // when the multisets do match: `setgroups` is what installs
+                // the list the caller asked for.
+                let repeats = |l: &[u32]| {
+                    l.iter().enumerate().any(|(i, g)| l[..i].contains(g))
+                };
+                if repeats(cur) || repeats(want) {
+                    assert!(differs, "repeat took the fast path: {cur:?}");
+                }
+            }
+        }
+        assert!(fast > 0, "the sweep never reached the fast path");
     }
 
     use super::*;

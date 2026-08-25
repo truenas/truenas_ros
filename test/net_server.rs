@@ -3870,6 +3870,13 @@ fn server_config_bounds_are_rejected_at_construction() {
         ),
         (
             ServerConfig {
+                max_receipt_time: Some(zero),
+                ..ServerConfig::default()
+            },
+            "max_receipt_time must be non-zero",
+        ),
+        (
+            ServerConfig {
                 tls_handshake_timeout: Some(zero),
                 ..ServerConfig::default()
             },
@@ -6410,6 +6417,353 @@ fn tcp_request_timeout_partial_body_reports_request_timeout() {
         "a stalled-mid-body peer must read as RequestTimeout, \
          not TruncatedMessage"
     );
+}
+
+/// A receipt budget at or under the inactivity bound leaves the latter dead:
+/// the message is closed before a whole silent period can be observed, so
+/// `request_timeout` never fires and the pair reads as one knob with two
+/// names. Refused at validation, where the operator finds out, rather than
+/// tolerated into a configuration that means something else.
+#[test]
+fn a_receipt_budget_may_not_pre_empt_the_inactivity_bound() {
+    use truenas_ros::net::server::Listen;
+    let one = || {
+        vec![Listen::from(ServerAddr::Tcp(
+            "127.0.0.1:0".parse::<SocketAddrV4>().unwrap(),
+        ))]
+    };
+    let build = |cfg: ServerConfig| {
+        Server::with_config(one(), cfg, noop_protocol()).map(|_| ())
+    };
+    let request = Duration::from_secs(30);
+    for (what, receipt) in
+        [("under", Duration::from_secs(29)), ("equal", request)]
+    {
+        let cfg = ServerConfig {
+            request_timeout: Some(request),
+            max_receipt_time: Some(receipt),
+            ..ServerConfig::default()
+        };
+        match build(cfg) {
+            Err(Error::Validation(m)) => assert!(
+                m.contains("must exceed request_timeout"),
+                "{what}: wrong message {m:?}"
+            ),
+            other => panic!("{what} must be refused, got {:?}", other.is_ok()),
+        }
+    }
+    // One period longer is the smallest configuration that means what it
+    // says, and it is accepted. Either clock alone is fine too: the budget
+    // is the rate floor, the inactivity bound is the liveness check, and
+    // neither implies the other.
+    for (what, cfg) in [
+        (
+            "both",
+            ServerConfig {
+                request_timeout: Some(request),
+                max_receipt_time: Some(request + Duration::from_millis(1)),
+                ..ServerConfig::default()
+            },
+        ),
+        (
+            "budget alone",
+            ServerConfig {
+                max_receipt_time: Some(request),
+                ..ServerConfig::default()
+            },
+        ),
+        (
+            "inactivity alone",
+            ServerConfig {
+                request_timeout: Some(request),
+                ..ServerConfig::default()
+            },
+        ),
+    ] {
+        match build(cfg) {
+            Ok(()) => {}
+            Err(e) if should_skip(&e) => return,
+            Err(e) => panic!("{what} must be usable, got {e}"),
+        }
+    }
+}
+
+/// SECURITY (slow-loris, the case `request_timeout` cannot reach):
+/// `request_timeout` bounds progress per period, so a peer that sends one
+/// byte just inside every period re-arms it forever and holds its pool slot
+/// indefinitely. A slot is taken at accept, before authentication, and accept
+/// is gated on a free slot - so `pool_size` such peers deny service.
+/// `max_receipt_time` is the bound that cannot be restarted by progress: it
+/// runs from a message's first byte to its delivery.
+///
+/// The trickle here is deliberately faster than `request_timeout`, so the
+/// inactivity guard never fires and the close reason proves which clock did
+/// the reclaiming.
+#[test]
+fn max_receipt_time_reclaims_a_peer_trickling_under_the_floor() {
+    use std::sync::Mutex;
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let cfg = ServerConfig {
+        request_timeout: Some(Duration::from_millis(200)),
+        max_receipt_time: Some(Duration::from_millis(700)),
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config(
+        [addr],
+        cfg,
+        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
+    ) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    {
+        let reasons = Arc::clone(&reasons);
+        server.set_close_hook(move |_addr, reason, _state: &mut ()| {
+            reasons.lock().unwrap().push(reason);
+        });
+    }
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            // Declare 64 bytes, then feed them one at a time every 100 ms --
+            // half the request_timeout period, so that clock is re-armed on
+            // every byte and never fires. At this pace the message needs
+            // 6.4 s, nine times the receipt budget.
+            s.write_all(&64u32.to_be_bytes())?;
+            for _ in 0..64 {
+                if s.write_all(&[0xEE]).is_err() {
+                    break; // the server closed under us, which is the point
+                }
+                if s.flush().is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            expect_idle_close(&mut s)?;
+            Ok(())
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join").expect("client io");
+    assert_eq!(
+        reasons.lock().unwrap().as_slice(),
+        &[CloseReason::ReceiptTimeout],
+        "a peer under the rate floor must read as ReceiptTimeout - \
+         RequestTimeout would mean the inactivity guard caught it, and \
+         nothing at all would mean the budget never armed"
+    );
+}
+
+/// The budget is not restarted by progress - the property that separates it
+/// from `request_timeout`, driven on the framing that can tell them apart.
+///
+/// A length-prefixed body is a single exact read, so the arm happens once
+/// whatever the code does afterwards and a per-read re-arm is invisible. A
+/// `More`/delimiter scan re-enters `submit_recv` on every chunk, so a budget
+/// that is cancelled and re-armed there rides the trickle forever, exactly
+/// as the inactivity clock does. The gaps here are half `request_timeout`,
+/// so that clock is satisfied throughout and the close reason names which
+/// one fired.
+#[test]
+fn a_chunk_scan_budget_is_not_restarted_by_progress() {
+    use std::sync::Mutex;
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let cfg = ServerConfig {
+        request_timeout: Some(Duration::from_millis(200)),
+        max_receipt_time: Some(Duration::from_millis(700)),
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: lsp_header,
+        body: |_req: Request<'_, ()>| Response::Reply(b"ok".to_vec()),
+    };
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    {
+        let reasons = Arc::clone(&reasons);
+        server.set_close_hook(move |_addr, reason, _state: &mut ()| {
+            reasons.lock().unwrap().push(reason);
+        });
+    }
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            // A header that never terminates, one byte per 100 ms: every
+            // chunk read completes and re-arms, so `request_timeout` is
+            // satisfied on every one of them and never fires. Thirty bytes
+            // is 3 s of trickle against a 700 ms budget.
+            for _ in 0..30 {
+                if s.write_all(b"x").is_err() || s.flush().is_err() {
+                    break; // closed under us, which is the point
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            expect_idle_close(&mut s)?;
+            Ok(())
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join").expect("client io");
+    assert_eq!(
+        reasons.lock().unwrap().as_slice(),
+        &[CloseReason::ReceiptTimeout],
+        "a budget re-armed by each chunk never fires, and the scan runs on"
+    );
+}
+
+/// Exactly one budget per message, and the retire cancels the one there is.
+///
+/// A `More`/delimiter framer reads in chunks that complete on any byte, so a
+/// trickled header is many non-idle reads of one message - the shape that
+/// tells an idempotent arm from a per-read one. Arming per read stacks a
+/// timer each time, and they all carry the same `user_data`, so the retire's
+/// `ASYNC_CANCEL` reaps one and leaves the rest to fire later against a
+/// connection that has done nothing wrong. The header here completes well
+/// inside the budget, so a close of any kind is the bug.
+#[test]
+fn a_trickled_header_leaves_exactly_one_receipt_budget() {
+    let budget = Duration::from_millis(400);
+    let cfg = ServerConfig {
+        request_timeout: Some(Duration::from_millis(200)),
+        max_receipt_time: Some(budget),
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: lsp_header,
+        body: |_req: Request<'_, ()>| Response::Reply(b"ok".to_vec()),
+    };
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            // Eight chunk reads for one header, spread over 160 ms - well
+            // inside the budget, and none of the gaps near the inactivity
+            // bound either.
+            let head = b"Content-Length: 0\r\n\r\n";
+            for b in head {
+                s.write_all(&[*b])?;
+                s.flush()?;
+                thread::sleep(Duration::from_millis(160) / head.len() as u32);
+            }
+            let mut got = [0u8; 2];
+            s.read_exact(&mut got)?;
+            assert_eq!(&got, b"ok");
+
+            // Sit idle for several budgets. A timer left over from the
+            // trickle fires here and takes the slot with it.
+            thread::sleep(budget * 3);
+            s.write_all(head)?;
+            s.flush()?;
+            s.read_exact(&mut got)?;
+            assert_eq!(
+                &got, b"ok",
+                "a stale receipt budget reaped a healthy connection"
+            );
+            Ok(())
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join").expect("client io");
+}
+
+/// The budget is retired at delivery, so it bounds receipt and nothing else.
+///
+/// Two ways this could go wrong and both are silent: a budget that outlives
+/// its message would fire during handling or while the connection sits idle
+/// between requests, killing healthy keep-alive connections on a timer; and
+/// one that is re-armed rather than left running would degrade into the
+/// inactivity guard it exists beside. The sleeps here are several times the
+/// budget with the connection well-behaved throughout.
+#[test]
+fn max_receipt_time_does_not_clock_handling_or_an_idle_connection() {
+    let budget = Duration::from_millis(300);
+    let cfg = ServerConfig {
+        request_timeout: Some(Duration::from_millis(150)),
+        max_receipt_time: Some(budget),
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config(
+        [addr],
+        cfg,
+        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
+    ) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            for i in 0..3 {
+                send_framed(&mut s, b"ping")?;
+                assert_eq!(recv_framed(&mut s)?, b"ping", "round {i}");
+                // Idle for well over the budget between requests. A budget
+                // still armed from the last message reaps the slot here.
+                thread::sleep(budget * 3);
+            }
+            // And a message split across the budget in ONE go is fine so
+            // long as it lands inside it.
+            s.write_all(&4u32.to_be_bytes())?;
+            s.flush()?;
+            thread::sleep(budget / 3);
+            s.write_all(b"tail")?;
+            s.flush()?;
+            assert_eq!(recv_framed(&mut s)?, b"tail");
+            Ok(())
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join").expect("client io");
 }
 
 #[test]

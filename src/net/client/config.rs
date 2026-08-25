@@ -179,6 +179,10 @@ impl ClientConfig {
             max_in_flight_requests: self.max_in_flight,
             idle_timeout: self.idle_timeout,
             request_timeout: self.response_timeout,
+            // Server-only: a client's peer is the server it dialled, not an
+            // untrusted caller holding a pool slot, so there is no slot to
+            // defend.
+            max_receipt_time: None,
             send_timeout: self.send_timeout,
             tls_handshake_timeout: self.tls_handshake_timeout,
             // Server-only: a client never registers a recv pool, so there
