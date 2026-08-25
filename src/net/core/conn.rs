@@ -92,6 +92,11 @@ pub(crate) enum Op {
     /// Server-only (only a server registers recv pools; the client's
     /// `dispatch` routes it to `unreachable!`). Not counted in `conn.ops`.
     RecvRetry = 21,
+    /// A standalone `TIMEOUT` bounding the **total** receipt of one message
+    /// (`ServerConfig::max_receipt_time`): armed when a message's first byte
+    /// lands, cancelled when it is delivered. Server-only (the client's
+    /// `dispatch` routes it to `unreachable!`). Not counted in `conn.ops`.
+    ReceiptDeadline = 22,
 }
 
 impl Op {
@@ -119,6 +124,7 @@ impl Op {
             19 => Op::SpliceDeadline,
             20 => Op::Connect,
             21 => Op::RecvRetry,
+            22 => Op::ReceiptDeadline,
             _ => return None,
         })
     }
@@ -814,6 +820,11 @@ pub(crate) struct Connection<U> {
     // dedup that keeps a connection whose park is re-entered (another path
     // pumped it meanwhile and hit the dry pool again) at one live timer.
     pub recv_retry_armed: bool,
+    // A `ReceiptDeadline` timer is in flight for the message this connection
+    // is receiving. The dedup key for the arm: cleared by the cancel at
+    // delivery or by the expiry itself, and nowhere else.
+    #[cfg(feature = "net-server")]
+    pub receipt_deadline_armed: bool,
     // A push overflowed `max_send_backlog` while the connection was detached
     // (its worker owns the raw stream, so it cannot be torn down mid-detach):
     // evict with `SendBacklog` when the worker resumes it.
@@ -946,6 +957,8 @@ impl<U> Connection<U> {
             recv_clock_fired: None,
             recv_close_stash: None,
             recv_retry_armed: false,
+            #[cfg(feature = "net-server")]
+            receipt_deadline_armed: false,
             evict_on_resume: false,
             close_on_flush: None,
             #[cfg(feature = "net-client")]
@@ -2103,9 +2116,10 @@ mod tests {
                 | Op::RecvClock
                 | Op::SpliceDeadline
                 | Op::Connect
-                | Op::RecvRetry => {}
+                | Op::RecvRetry
+                | Op::ReceiptDeadline => {}
             }
-            22
+            23
         };
         // Every decodable op value: `from_u8` must invert the discriminant
         // (a renumbered enum with a stale table shows up here), and the

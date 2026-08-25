@@ -178,6 +178,12 @@ where
         // userdata (mutable). The Responder holds owned channel clones.
         // The token carries the FULL u64 generation - a worker may retain it
         // across recycles - whereas the kernel routing used the low 32 bits.
+        // Receipt is over the moment the message is handed to the handler,
+        // so the budget is retired here rather than when the next read is
+        // armed. Anything later would clock the *handling* too, and a
+        // request offloaded with `Response::Defer` may legitimately run for
+        // as long as it likes.
+        self.core.cancel_receipt_deadline(slot, generation)?;
         let gen64 = self.core.table.generation(slot);
         let (resp, req_id) = {
             let conn = self.core.table.conn_mut(slot);

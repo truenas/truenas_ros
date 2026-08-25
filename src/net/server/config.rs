@@ -232,6 +232,37 @@ pub struct ServerConfig {
     ///
     /// [`Framing::SpliceBody`]: super::Framing::SpliceBody
     pub request_timeout: Option<Duration>,
+    /// If set, close a connection that has not **finished receiving** the
+    /// message it started within this duration, reclaiming its pool slot.
+    ///
+    /// `request_timeout` bounds inactivity: any arriving byte buys another
+    /// period, so a peer trickling one byte per period holds its slot for as
+    /// long as it likes. That is the honest primitive for "is this peer still
+    /// there", and it is not a rate floor. This is the rate floor: the clock
+    /// starts when a message's first byte arrives and is cancelled when the
+    /// message is delivered, so it is never restarted by progress and a
+    /// receipt that takes longer than this is closed however busy the wire
+    /// was.
+    ///
+    /// It bounds one **message**, which is what makes it composable with a
+    /// streamed body: each window is its own message, so an upload of any
+    /// size is admitted while the floor it sets a peer stays
+    /// `STREAM_WINDOW / max_receipt_time`. A buffered request is bounded
+    /// whole, at `size / max_receipt_time`. Pick it from the slowest client
+    /// worth serving, not from the largest upload.
+    ///
+    /// Bounds only receipt, never handling: the clock is cancelled at
+    /// delivery, so a request offloaded via [`Response::Defer`] may run as
+    /// long as it likes. A standalone kernel `TIMEOUT`, one per connection,
+    /// so it costs no wakeups unless a message is actually in progress.
+    /// `None` (the default) never bounds total receipt.
+    ///
+    /// A slot is taken at **accept**, before any authentication, and accept
+    /// is gated on a free slot - so with this unset, `pool_size` peers each
+    /// sending one byte per `request_timeout` deny service to everyone else.
+    ///
+    /// [`Response::Defer`]: super::Response::Defer
+    pub max_receipt_time: Option<Duration>,
     /// Maximum requests in flight per connection before read-ahead pauses.
     /// `1` (the default) is strict sequential keep-alive: one request is fully
     /// answered before the next is read. `N > 1` **pipelines** - while a request
@@ -353,6 +384,7 @@ impl Default for ServerConfig {
             unlink_unix: true,
             idle_timeout: None,
             request_timeout: None,
+            max_receipt_time: None,
             max_in_flight_requests: 1,
             send_timeout: None,
             tls_handshake_timeout: None,
@@ -508,6 +540,7 @@ impl ServerConfig {
         for (name, d) in [
             ("send_timeout", self.send_timeout),
             ("request_timeout", self.request_timeout),
+            ("max_receipt_time", self.max_receipt_time),
             ("tls_handshake_timeout", self.tls_handshake_timeout),
             ("recv_shortage_retry", self.recv_shortage_retry),
             ("keepalive", self.keepalive),
@@ -518,6 +551,20 @@ impl ServerConfig {
                     "{name} must be non-zero"
                 )));
             }
+        }
+        // A receipt bound at or under the inactivity bound makes the latter
+        // dead: the message is closed before a period of silence can be
+        // observed, so `request_timeout` never fires and the two knobs read
+        // as one. Refused rather than tolerated, because the configuration
+        // then means something other than what it says.
+        if let (Some(receipt), Some(request)) =
+            (self.max_receipt_time, self.request_timeout)
+            && receipt <= request
+        {
+            return Err(Error::Validation(format!(
+                "max_receipt_time ({receipt:?}) must exceed request_timeout \
+                 ({request:?}), which it would otherwise pre-empt"
+            )));
         }
         Ok(())
     }
@@ -534,6 +581,7 @@ impl ServerConfig {
             max_in_flight_requests: self.max_in_flight_requests,
             idle_timeout: self.idle_timeout,
             request_timeout: self.request_timeout,
+            max_receipt_time: self.max_receipt_time,
             send_timeout: self.send_timeout,
             tls_handshake_timeout: self.tls_handshake_timeout,
             recv_shortage_retry: self.recv_shortage_retry,

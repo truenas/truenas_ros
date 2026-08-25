@@ -56,6 +56,9 @@ pub(crate) struct KernelPads {
     /// Relative request-receive timeout - meaningful iff `cfg.request_timeout`
     /// is set.
     pub(crate) request_timeout: KernelTimespec,
+    /// Relative total-receipt budget for one message - meaningful iff
+    /// `cfg.max_receipt_time` is set.
+    pub(crate) max_receipt_time: KernelTimespec,
     /// Relative kTLS handshake timeout - meaningful iff
     /// `cfg.tls_handshake_timeout` is set (bounds the parked-handshake slot).
     pub(crate) tls_handshake: KernelTimespec,

@@ -156,6 +156,9 @@ where
                 .unwrap_or_default(),
             // Client-unused: only a server registers a recv pool.
             recv_retry: KernelTimespec::default(),
+            // Client-unused: only a server defends a pool slot against the
+            // peer that took it.
+            max_receipt_time: KernelTimespec::default(),
         });
 
         let core = Reactor::from_parts(
@@ -311,6 +314,9 @@ where
             Some(Op::Connect) => self.on_connect(slot, generation, cqe.res)?,
             Some(Op::RecvRetry) => {
                 unreachable!("client never parks a recv on a pool")
+            }
+            Some(Op::ReceiptDeadline) => {
+                unreachable!("client never bounds total receipt")
             }
             // A reply header/body recv completed.
             Some(op @ (Op::RecvHeader | Op::RecvBody)) => {

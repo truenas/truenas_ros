@@ -170,6 +170,12 @@ pub enum CloseReason {
     /// an exact header remainder) but was not fully received in time - the
     /// slow-loris guard (see `ServerConfig::request_timeout`).
     RequestTimeout,
+    /// The `max_receipt_time` fired: a message began arriving and was still
+    /// arriving when its total-receipt budget ran out. Unlike
+    /// [`CloseReason::RequestTimeout`] this is not an inactivity verdict --
+    /// the peer may have been sending the whole time, just below the floor
+    /// the deployment set (see `ServerConfig::max_receipt_time`).
+    ReceiptTimeout,
     /// The `send_timeout` fired while a reply was stalled (peer not reading).
     SendTimeout,
     /// Closed by shutdown (graceful drain, or the connection quiesced during

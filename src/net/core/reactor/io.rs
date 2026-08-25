@@ -661,6 +661,110 @@ impl<U> Reactor<U> {
         }
     }
 
+    /// Arm the total-receipt budget for the message now arriving: a single
+    /// standalone `TIMEOUT` per connection, idempotent on
+    /// `receipt_deadline_armed`.
+    ///
+    /// **Never cancel before arming here.** A `More`/delimiter scan re-enters
+    /// `submit_recv` on every chunk, so a cancel-then-arm rides the trickle
+    /// and reproduces `request_timeout` under a second name
+    /// (`a_chunk_scan_budget_is_not_restarted_by_progress`). The early return
+    /// below is dedup only - one timer in flight rather than one per chunk
+    /// read; a stacked timer would not break the bound, since
+    /// `on_receipt_deadline` discards an expiry whose flag is already clear.
+    ///
+    /// Keyed `(slot, generation)`, so a recycled slot's expiry is inert.
+    /// No-op unless `max_receipt_time` is set.
+    #[cfg(feature = "net-server")]
+    fn arm_receipt_deadline(
+        &mut self,
+        slot: u32,
+        generation: u32,
+    ) -> errno::Result<()> {
+        if self.cfg.max_receipt_time.is_none() {
+            return Ok(());
+        }
+        {
+            let conn = self.table.conn_mut(slot);
+            if conn.receipt_deadline_armed {
+                return Ok(()); // one timer per message, not per read
+            }
+            conn.receipt_deadline_armed = true;
+        }
+        let ts = std::ptr::addr_of!(self.pads.max_receipt_time) as u64;
+        self.stage(pack(Op::ReceiptDeadline, slot, generation), move |sqe| {
+            sqe.opcode = IORING_OP_TIMEOUT;
+            sqe.addr = ts;
+            sqe.len = 1; // exactly one timespec, per the kernel
+        })
+    }
+
+    /// Retire the receipt budget: the message was delivered, or its
+    /// connection is closing. Clears the flag and cancels the in-flight
+    /// `TIMEOUT`; the cancelled timer completes `-ECANCELED`, which
+    /// `on_receipt_deadline` ignores.
+    ///
+    /// Called at **delivery**, which is what keeps this a bound on receipt
+    /// and not on handling: a request offloaded to a worker has already had
+    /// its clock retired by the time the handler runs.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn cancel_receipt_deadline(
+        &mut self,
+        slot: u32,
+        generation: u32,
+    ) -> errno::Result<()> {
+        let armed = match self.table.get_conn_mut(slot) {
+            Some(conn) if conn.receipt_deadline_armed => {
+                conn.receipt_deadline_armed = false;
+                true
+            }
+            _ => false,
+        };
+        if !armed {
+            return Ok(());
+        }
+        let target = pack(Op::ReceiptDeadline, slot, generation);
+        self.stage(pack(Op::Cancel, 0, 0), move |sqe| {
+            sqe.opcode = IORING_OP_ASYNC_CANCEL;
+            sqe.addr = target;
+        })
+    }
+
+    /// The receipt budget elapsed (`Op::ReceiptDeadline`). The message that
+    /// armed it is still arriving, so the peer is under the floor the
+    /// deployment set: close and reclaim the slot.
+    ///
+    /// A `-ECANCELED` is the retire path's own cancel and means the message
+    /// landed in time. A stale `-ETIME` - the timer expiring after its
+    /// cancel was staged - finds the flag already clear and does nothing.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn on_receipt_deadline(
+        &mut self,
+        slot: u32,
+        generation: u32,
+        res: i32,
+    ) -> errno::Result<()> {
+        if res != -libc::ETIME {
+            return Ok(()); // a cancel completion - not a real expiry
+        }
+        if !self.table.slot_matches_cqe(slot, generation) {
+            // Left set, this flag suppresses the budget for every later
+            // message on the connection. See `conn_at_cqe_mut`.
+            if let Some(conn) = self.table.conn_at_cqe_mut(slot, generation) {
+                conn.receipt_deadline_armed = false;
+            }
+            return Ok(());
+        }
+        {
+            let conn = self.table.conn_mut(slot);
+            if !conn.receipt_deadline_armed {
+                return Ok(()); // delivered already; this expiry lost the race
+            }
+            conn.receipt_deadline_armed = false;
+        }
+        self.close_conn(slot, generation, CloseReason::ReceiptTimeout)
+    }
+
     /// Arm a one-shot `POLL_ADD` for `POLLIN` on the connection's socket after a
     /// body splice returned `-EAGAIN` (the non-blocking pool socket was drained
     /// the moment the splice ran). Its completion (`on_splice_poll`) resubmits
@@ -778,12 +882,20 @@ impl<U> Reactor<U> {
         if !place_body {
             self.promote_recv_buffer(slot, want);
         }
-        let conn = self.table.conn_mut(slot);
         // The connection is idle - parked for the next request - when this is a
         // header read with nothing yet accumulated. Only such reads carry the
         // idle timeout; body and mid-header continuation reads are active
         // transfers.
-        let idle = op == Op::RecvHeader && conn.buffered() == 0;
+        let idle =
+            op == Op::RecvHeader && self.table.conn(slot).buffered() == 0;
+        // SECURITY: a message is under way, so its total-receipt budget
+        // runs from here - the one place that knows the read belongs to a
+        // message already begun.
+        #[cfg(feature = "net-server")]
+        if !idle {
+            self.arm_receipt_deadline(slot, generation)?;
+        }
+        let conn = self.table.conn_mut(slot);
         let want = if place_body {
             // Placement: the body reads into its own allocation; the exact
             // remainder is computed from what `arm_body_recv` carved.

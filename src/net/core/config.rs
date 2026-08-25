@@ -13,6 +13,7 @@ pub(crate) struct CoreConfig {
     pub(crate) max_in_flight_requests: usize,
     pub(crate) idle_timeout: Option<Duration>,
     pub(crate) request_timeout: Option<Duration>,
+    pub(crate) max_receipt_time: Option<Duration>,
     pub(crate) send_timeout: Option<Duration>,
     pub(crate) tls_handshake_timeout: Option<Duration>,
     pub(crate) recv_shortage_retry: Option<Duration>,
