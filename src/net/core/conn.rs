@@ -2378,6 +2378,122 @@ mod tests {
         );
     }
 
+    /// A consume that finds the lease flag set but the claim gone must not
+    /// dereference it. The flag and the claim are set and cleared together,
+    /// so this is declared unreachable - and the arm that ships is the one
+    /// no debug test can reach, because the assert fires first.
+    ///
+    /// `draining_a_lease_with_no_claim_fails_closed_without_asserts` covers
+    /// the release half.
+    #[cfg(all(debug_assertions, feature = "net-server", feature = "uring-fs"))]
+    #[test]
+    #[should_panic(expected = "leased with no claim")]
+    fn draining_a_lease_with_no_claim_fails_closed() {
+        let mut rb = RecvBuf::default();
+        rb.set_pooled();
+        rb.write_leased.set(true);
+        rb.set_filled(8);
+        rb.drain_front(4);
+    }
+
+    /// The shipping half: clear the flag and drain nothing.
+    ///
+    /// Falling through would take the `unsafe` copy below it with no claim
+    /// to bound it. Leaving the flag set is nearly as bad - every later
+    /// consume on the connection would re-enter this arm and never drain,
+    /// so the buffer would fill and the connection stall. Asserted on state,
+    /// which is what the release build actually has.
+    #[cfg(all(
+        not(debug_assertions),
+        feature = "net-server",
+        feature = "uring-fs"
+    ))]
+    #[test]
+    fn draining_a_lease_with_no_claim_fails_closed_without_asserts() {
+        let mut rb = RecvBuf::default();
+        rb.set_pooled();
+        rb.write_leased.set(true);
+        rb.set_filled(8);
+        rb.drain_front(4);
+        assert!(!rb.write_leased.get(), "the lease flag must be cleared");
+        assert_eq!(rb.len(), 8, "and nothing drained from a buffer it lacks");
+    }
+
+    /// `armed_within` is the predicate both continuation guards key on, and
+    /// what is on the other side of it is the kernel writing past the
+    /// allocation.
+    ///
+    /// The claim arm bounds on the buffer's `cap`, the owned arm on the
+    /// length `reserve_at` grew, and the sum is computed with `checked_add`
+    /// because a wrapped end compares as though it were in range.
+    #[test]
+    fn an_arm_reaching_past_its_buffer_is_outside_it() {
+        let mut owned = RecvBuf::default();
+        owned.reserve_at(0, 64);
+        assert!(owned.armed_within(0, 64), "the whole buffer is inside");
+        assert!(owned.armed_within(32, 32), "and so is an offset arm");
+        assert!(!owned.armed_within(32, 33), "one past the end is outside");
+        assert!(
+            !owned.armed_within(usize::MAX, 1),
+            "and a wrapping sum is outside, not back at the start"
+        );
+
+        let mut pooled = RecvBuf::default();
+        pooled.set_pooled();
+        let buf = Box::leak(vec![0u8; 64].into_boxed_slice());
+        pooled.install(RecvClaim {
+            bid: 7,
+            ptr: buf.as_mut_ptr(),
+            cap: 64,
+        });
+        assert!(pooled.armed_within(0, 64), "a claim bounds on its cap");
+        assert!(!pooled.armed_within(1, 64), "not on the storage behind it");
+    }
+
+    /// Why `resubmit_exact_recv`'s guard has no reachable arm: this is what
+    /// moves the cursor between the arm and the re-arm, and it moves
+    /// `recv_at` up by exactly what it takes off `recv_want`, so the end of
+    /// the armed range never moves. An arm that was inside its buffer is
+    /// still inside it, and losing that pairing is what would make the guard
+    /// bite.
+    #[test]
+    fn advancing_an_exact_partial_leaves_the_armed_end_where_it_was() {
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        c.recv_at = 100;
+        c.recv_want = 400;
+        let end = c.recv_at + c.recv_want;
+        for n in [0, 1, 137, 262] {
+            c.advance_exact_partial(n);
+            assert_eq!(c.recv_at + c.recv_want, end, "the armed end moved");
+        }
+        assert_eq!(c.recv_want, 0, "and the range is exhausted, not negative");
+    }
+
+    /// Progress past the armed want is a miscount, and in a release build
+    /// the clamp is the whole guard: without it `recv_want` wraps and the
+    /// re-arm asks the kernel for an address-space-sized range.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn advancing_past_the_armed_want_clamps_without_asserts() {
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        c.recv_at = 100;
+        c.recv_want = 400;
+        c.advance_exact_partial(4096);
+        assert_eq!(c.recv_want, 0, "a wrap would read as ~usize::MAX");
+        assert_eq!(c.recv_at, 500, "and the cursor stops at the armed end");
+    }
+
+    /// The debug half of the same guard, which is what surfaces the bug.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "progress past the armed want")]
+    fn advancing_past_the_armed_want_panics() {
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        c.recv_at = 100;
+        c.recv_want = 400;
+        c.advance_exact_partial(4096);
+    }
+
     /// A chunk can still be flushing when its tail retires. Its ring
     /// buffer has to come back anyway: conditioning the release on a tail
     /// being installed strands the buffer in the pool forever, where it can
