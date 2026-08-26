@@ -440,6 +440,29 @@ pub(crate) const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 /// Declared for the regression probe that pins the gate's behavior.
 pub(crate) const IORING_SETUP_SINGLE_ISSUER: u32 = 1 << 12;
 
+/// `io_uring_setup` flag: this process supplies the ring memory, at the
+/// addresses in `sq_off.user_addr` (the SQE array) and `cq_off.user_addr` (the
+/// combined SQ/CQ ring region), instead of the kernel allocating it
+/// (`io_allocate_scq_urings`, `io_uring/io_uring.c`).
+///
+/// Set only by [`RingFd::setup`](crate::uring::ring::RingFd::setup)'s `ENOMEM`
+/// retry, which documents why. Rejected before Linux 6.5.
+pub(crate) const IORING_SETUP_NO_MMAP: u32 = 1 << 14;
+
+/// `io_uring_setup` flag: do not allocate the SQ indirection array. Submission
+/// at ring position `t` then takes SQE slot `t & mask` directly in the kernel
+/// (`io_get_sqe`, `io_uring/io_uring.c`), which is the identity mapping this
+/// crate would otherwise write into that array itself.
+///
+/// Saves `sq_entries * 4` bytes of the ring region - 128 KiB at the 32768-entry
+/// maximum. Set unconditionally by
+/// [`RingFd::setup`](crate::uring::ring::RingFd::setup): the flag reached 6.10
+/// and this crate's floor is 6.18, assumed rather than probed.
+///
+/// With this set the kernel leaves `sq_off.array` at 0 (`io_uring.c:3920`), so
+/// nothing may derive an offset or extent from that field.
+pub(crate) const IORING_SETUP_NO_SQARRAY: u32 = 1 << 16;
+
 // `io_uring_probe_op.flags`: the opcode is supported by this kernel.
 pub(crate) const IO_URING_OP_SUPPORTED: u16 = 1 << 0;
 
