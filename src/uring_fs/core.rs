@@ -2892,13 +2892,19 @@ impl FsConn<'_> {
     /// this metadata-only by itself — `copy_file_range(2)` is clone-first —
     /// and falls back to a byte copy where it cannot.
     ///
-    /// **Offloaded, whole-range, one job.** The clone is not free of waiting
-    /// even when it is free of data movement, so none of it runs on the loop;
-    /// and the whole remaining range is offered in one call rather than in
-    /// chunks, because a chunk boundary is a second entry into
-    /// `zfs_clone_range`. See
-    /// [`copy_range`](super::query_dir::copy_range) for what that buys and
-    /// what it costs.
+    /// **Offloaded, whole-range, one job.** A clone is not free of waiting
+    /// even where it is free of data movement: with `zfs_bclone_wait_dirty`
+    /// on, a source that was written moments ago costs a transaction group
+    /// while it syncs. None of that may run on the loop, so all of it is
+    /// offloaded.
+    ///
+    /// The whole remaining range goes in one call rather than in chunks. A
+    /// chunk boundary is a second entry into `zfs_clone_range`, retaking
+    /// both rangelocks and every property and alignment check, and it
+    /// forfeits the clone besides — the destination's rangelock is promoted
+    /// to whole-file only on its first write, which is what grows the
+    /// blocksize to the source's. A short return is re-issued from where it
+    /// stopped.
     ///
     /// This is how an embedded handler assembles a large object from parts
     /// without leaving the loop;
