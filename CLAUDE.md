@@ -427,6 +427,14 @@ Do not reopen these without a reason that is new.
   show this - a length-prefixed body is one `submit_recv` whatever happens
   afterwards - so the control for it has to be a chunk scan
   (`a_chunk_scan_budget_is_not_restarted_by_progress`).
+- **Every standalone timer is cancelled in `close_conn`, and there are
+  three.** `RecvRetry`, `SpliceDeadline` and `ReceiptDeadline` are the whole
+  population of dedup-flagged, non-`ops`-counted ops: nothing else reaps
+  them, so one left armed holds `inflight` up until it expires. A stale
+  expiry is inert (`slot_matches_cqe`, then `conn_at_cqe_mut` to retire the
+  flag), so the cost is a delay rather than a fault - which is why no test
+  covers it and why a fourth timer of this shape has to be added to
+  `close_conn` by hand.
 - **A spliced body arms and retires it in `submit_splice_recv` /
   `on_splice_recv_complete`.** That path never enters `submit_recv`, so the
   arm site the buffered framings share cannot reach it, and the two clocks

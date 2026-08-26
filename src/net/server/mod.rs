@@ -941,7 +941,22 @@ where
             self.arm_accept(lidx)?;
         }
         let run = self.run_loop();
-        let drained = self.core.cancel_and_reap_all();
+        // fs ops ride this ring too, and this drain does not dispatch, so
+        // route their completions to the fs core as they are reaped: an
+        // `openat2` finishing here carries a real process fd in `cqe.res`
+        // that nothing else will ever own. The standalone fs host does the
+        // same (`uring_fs::host`'s `drain_or_leak`).
+        #[cfg(feature = "uring-fs")]
+        let drained = {
+            let fs = &mut self.fs;
+            self.core.cancel_and_reap_all(&mut |cqe| {
+                if let Some(fs) = fs.as_mut() {
+                    fs.on_drain_cqe(cqe);
+                }
+            })
+        };
+        #[cfg(not(feature = "uring-fs"))]
+        let drained = self.core.cancel_and_reap_all(&mut |_| {});
         run?;
         drained?;
         Ok(())
@@ -1343,6 +1358,16 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Drop
         // (early drop / panic unwind) ensure no op is in flight before the
         // buffers and ring are freed - and if that drain fails, leak the
         // buffers rather than free them under a still-live op.
+        #[cfg(feature = "uring-fs")]
+        let leaked = {
+            let fs = &mut self.fs;
+            self.core.drain_or_leak_routing(&mut |cqe| {
+                if let Some(fs) = fs.as_mut() {
+                    fs.on_drain_cqe(cqe);
+                }
+            })
+        };
+        #[cfg(not(feature = "uring-fs"))]
         let leaked = self.core.drain_or_leak();
         // fs ops share this ring; on a failed drain they may still be in
         // flight, so leak the fs op buffers alongside the connection buffers

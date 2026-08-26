@@ -727,6 +727,39 @@ impl<U> Reactor<U> {
         })
     }
 
+    /// Cancel a parked read's pool-shortage retry timer, for a connection
+    /// that is closing.
+    ///
+    /// The same reason the other two standalone timers are cancelled there:
+    /// it is not an `ops`-counted op, so nothing else reaps it, and an
+    /// uncancelled one keeps `inflight` up until it expires - delaying an
+    /// otherwise idle `serve_forever`'s exit. It is also the only one armed
+    /// by default (`recv_shortage_retry`), so it is the one most likely to
+    /// be pending at a close.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn cancel_recv_retry(
+        &mut self,
+        slot: u32,
+        generation: u32,
+    ) -> errno::Result<()> {
+        let armed = match self.table.get_conn_mut(slot) {
+            Some(conn) if conn.recv_retry_armed => {
+                conn.recv_retry_armed = false;
+                true
+            }
+            _ => false,
+        };
+        if !armed {
+            return Ok(());
+        }
+        let target = pack(Op::RecvRetry, slot, generation);
+        self.stage(pack(Op::Cancel, 0, 0), move |sqe| {
+            sqe.opcode = IORING_OP_ASYNC_CANCEL;
+            sqe.fd = -1;
+            sqe.addr = target;
+        })
+    }
+
     /// Retire the receipt budget: the message was delivered, or its
     /// connection is closing. Clears the flag and cancels the in-flight
     /// `TIMEOUT`; the cancelled timer completes `-ECANCELED`, which
