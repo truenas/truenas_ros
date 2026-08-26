@@ -30,6 +30,25 @@ use loom::sync::atomic::{AtomicU32, Ordering};
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// Acquire-load one of the ring's shared index words.
+///
+/// A function, and one spelling of the ordering, so the loom model drives
+/// *this* load rather than its own copy of the pairing. A model with its own
+/// copy checks the memory model rather than the code: it stays green with
+/// the shipping ordering weakened to `Relaxed`, which is the whole point of
+/// not having one (`bufring::publish_tail` says the same).
+#[inline]
+fn load_acquire(cell: &AtomicU32) -> u32 {
+    cell.load(Ordering::Acquire)
+}
+
+/// Release-store one of the ring's shared index words, publishing whatever
+/// the entry it names was filled with. See [`load_acquire`].
+#[inline]
+fn store_release(cell: &AtomicU32, v: u32) {
+    cell.store(v, Ordering::Release)
+}
+
 /// The kernel-shared SQ/CQ state: the four index words plus the SQE/CQE arrays.
 ///
 /// This is the single home of the acquire/release discipline. The user-side
@@ -146,48 +165,78 @@ impl SqCqRings {
         }
     }
 
+    // The four kernel-shared index words. A raw pointer into the mmap in a
+    // real ring, an owned atomic in a model - the `cfg` picks the *cell*,
+    // and nothing else, so the orderings below have one spelling each.
+    #[inline]
+    fn sq_khead(&self) -> &AtomicU32 {
+        #[cfg(not(loom))]
+        // SAFETY: points to the kernel-shared SQ head word, mapped for the
+        // ring's life.
+        unsafe {
+            &*self.sq_khead
+        }
+        #[cfg(loom)]
+        &self.sq_khead
+    }
+
+    #[inline]
+    fn sq_ktail(&self) -> &AtomicU32 {
+        #[cfg(not(loom))]
+        // SAFETY: as `sq_khead`, for the SQ tail word.
+        unsafe {
+            &*self.sq_ktail
+        }
+        #[cfg(loom)]
+        &self.sq_ktail
+    }
+
+    #[inline]
+    fn cq_khead(&self) -> &AtomicU32 {
+        #[cfg(not(loom))]
+        // SAFETY: as `sq_khead`, for the CQ head word.
+        unsafe {
+            &*self.cq_khead
+        }
+        #[cfg(loom)]
+        &self.cq_khead
+    }
+
+    #[inline]
+    fn cq_ktail(&self) -> &AtomicU32 {
+        #[cfg(not(loom))]
+        // SAFETY: as `sq_khead`, for the CQ tail word.
+        unsafe {
+            &*self.cq_ktail
+        }
+        #[cfg(loom)]
+        &self.cq_ktail
+    }
+
     // ---- user side (the real submit/reap discipline) -------------------
 
     /// Acquire-load the kernel-advanced SQ consumer head.
     #[inline]
     fn sq_head_acquire(&self) -> u32 {
-        #[cfg(not(loom))]
-        // SAFETY: `sq_khead` points to the kernel-shared SQ head word.
-        let v = unsafe { &*self.sq_khead }.load(Ordering::Acquire);
-        #[cfg(loom)]
-        let v = self.sq_khead.load(Ordering::Acquire);
-        v
+        load_acquire(self.sq_khead())
     }
 
     /// Release-store the producer SQ tail, publishing the SQEs filled below it.
     #[inline]
     fn publish_sq_tail(&self, tail: u32) {
-        #[cfg(not(loom))]
-        // SAFETY: `sq_ktail` points to the kernel-shared SQ tail word.
-        unsafe { &*self.sq_ktail }.store(tail, Ordering::Release);
-        #[cfg(loom)]
-        self.sq_ktail.store(tail, Ordering::Release);
+        store_release(self.sq_ktail(), tail);
     }
 
     /// Acquire-load the kernel-advanced CQ producer tail.
     #[inline]
     fn cq_tail_acquire(&self) -> u32 {
-        #[cfg(not(loom))]
-        // SAFETY: `cq_ktail` points to the kernel-shared CQ tail word.
-        let v = unsafe { &*self.cq_ktail }.load(Ordering::Acquire);
-        #[cfg(loom)]
-        let v = self.cq_ktail.load(Ordering::Acquire);
-        v
+        load_acquire(self.cq_ktail())
     }
 
     /// Release-store the consumer CQ head, freeing the slot for kernel reuse.
     #[inline]
     fn publish_cq_head(&self, head: u32) {
-        #[cfg(not(loom))]
-        // SAFETY: `cq_khead` points to the kernel-shared CQ head word.
-        unsafe { &*self.cq_khead }.store(head, Ordering::Release);
-        #[cfg(loom)]
-        self.cq_khead.store(head, Ordering::Release);
+        store_release(self.cq_khead(), head);
     }
 
     /// Reserve the SQE slot for producer position `sq_tail`, or `None` if the SQ

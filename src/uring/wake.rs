@@ -9,7 +9,7 @@ use crate::errno::Errno;
 use crate::fd::owned_from_raw;
 // `LoopShared`'s flags are loom-modelled (`loom_graceful_publication`), so the
 // atomics come from `crate::sync` - std's outside `--cfg loom`.
-use crate::sync::atomic::{AtomicBool, AtomicU64};
+use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(not(loom))]
 use std::ffi::c_void;
 #[cfg(not(loom))]
@@ -28,6 +28,49 @@ pub(crate) struct LoopShared {
     pub(crate) graceful: AtomicBool,
     pub(crate) grace_ms: AtomicU64,
     pub(crate) wake: WakeHandle,
+}
+
+impl LoopShared {
+    /// Request a hard stop.
+    ///
+    /// A function, and one spelling of the ordering, so a model drives *this*
+    /// store rather than its own copy of the pairing - a model with its own
+    /// copy checks the memory model rather than the code, and stays green
+    /// with the shipping ordering weakened (`bufring::publish_tail` states
+    /// the same rule).
+    #[inline]
+    pub(crate) fn request_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+
+    /// Whether a hard stop was requested. Paired with
+    /// [`request_stop`](Self::request_stop).
+    #[inline]
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
+    /// Request a graceful drain of `grace_ms`: the period first, then the
+    /// flag whose **Release** store is what makes it readable.
+    ///
+    /// `grace_ms` is a Relaxed payload published by this pair - message
+    /// passing, and the Release/Acquire is the only thing making it visible.
+    /// Weaken the store and a loop that sees `graceful` may still read
+    /// `grace_ms == 0`, arming a zero-length grace period and hard-killing
+    /// connections it promised to drain.
+    #[inline]
+    pub(crate) fn request_graceful(&self, grace_ms: u64) {
+        self.grace_ms.store(grace_ms, Ordering::Relaxed);
+        self.graceful.store(true, Ordering::Release);
+    }
+
+    /// The paired read: the grace period once a drain has been requested.
+    #[inline]
+    pub(crate) fn graceful_requested(&self) -> Option<u64> {
+        self.graceful
+            .load(Ordering::Acquire)
+            .then(|| self.grace_ms.load(Ordering::Relaxed))
+    }
 }
 
 /// The wake eventfd. Poking it adds 1 to the counter, completing the loop's
@@ -144,20 +187,21 @@ impl WakeHandle {
 // `grace_ms` is a **Relaxed** payload published by a **Release** store of
 // `graceful`, and read after an **Acquire** load of it:
 //
-//   writer (net/server/handles.rs:510-518)   loop (net/server/wake.rs:37, :88)
-//   grace_ms.store(ms, Relaxed)              if graceful.load(Acquire) {
-//   graceful.store(true, Release)                grace_ms.load(Relaxed)
-//   wake.poke()                              }
+//   writer (`ShutdownHandle::shutdown_graceful`)   loop (`Server::on_wake`)
+//   LoopShared::request_graceful(ms)              LoopShared::graceful_requested()
+//   wake.poke()
 //
 // That is message passing: the Release/Acquire pair is the only thing making
 // the Relaxed payload visible. Weaken the store to Relaxed and a loop that
 // sees `graceful` may still read `grace_ms == 0`, arming a zero-length grace
 // period and hard-killing connections it promised to drain.
+//
+// The model calls those two functions rather than re-spelling their stores,
+// which is what makes it a test of the code instead of a test of loom.
 #[cfg(loom)]
 mod loom_tests {
     use super::*;
     use crate::sync::Arc;
-    use crate::sync::atomic::Ordering;
 
     const GRACE_MS: u64 = 30_000;
 
@@ -180,23 +224,21 @@ mod loom_tests {
 
             let w = Arc::clone(&s);
             let drain = loom::thread::spawn(move || {
-                w.grace_ms.store(GRACE_MS, Ordering::Relaxed);
-                w.graceful.store(true, Ordering::Release);
+                w.request_graceful(GRACE_MS);
                 w.wake.poke();
             });
 
             let h = Arc::clone(&s);
             let hard = loom::thread::spawn(move || {
-                h.stop.store(true, Ordering::Release);
+                h.request_stop();
                 h.wake.poke();
             });
 
             // The loop's half. Reading `graceful` as set is a promise that the
             // period behind it is readable too.
-            if s.graceful.load(Ordering::Acquire) {
+            if let Some(ms) = s.graceful_requested() {
                 assert_eq!(
-                    s.grace_ms.load(Ordering::Relaxed),
-                    GRACE_MS,
+                    ms, GRACE_MS,
                     "graceful became visible before its grace period"
                 );
             }
@@ -205,9 +247,12 @@ mod loom_tests {
             hard.join().expect("hard writer");
 
             // Both requests landed; neither writer lost to the other.
-            assert!(s.graceful.load(Ordering::Acquire), "drain request lost");
-            assert!(s.stop.load(Ordering::Acquire), "hard stop lost");
-            assert_eq!(s.grace_ms.load(Ordering::Relaxed), GRACE_MS);
+            assert_eq!(
+                s.graceful_requested(),
+                Some(GRACE_MS),
+                "drain request lost"
+            );
+            assert!(s.stop_requested(), "hard stop lost");
         });
     }
 

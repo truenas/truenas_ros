@@ -298,6 +298,29 @@ struct Completed {
 /// staging; completion routing happens in [`FsCore::on_cqe`].
 /// A finished off-loop job awaiting on-loop delivery: `(token, boxed result)`.
 type PoolCompletion = (u64, Box<dyn Any + Send>);
+
+/// The offload worker's epilogue: record the outcome, then wake the loop.
+///
+/// The order is what makes the wake reliable - the queue is written under
+/// its lock *before* the poke, so a loop that wakes finds the completion
+/// there. The eventfd counts, and the loop re-arms its `READ`, so no poke is
+/// lost (the inject-path pattern).
+///
+/// A function so the loom models drive **this** epilogue rather than their
+/// own copy of it. A model with its own copy checks the memory model rather
+/// than the code: reorder the two lines in production and it stays green,
+/// which is the case it is for (`bufring::publish_tail` states the rule).
+pub(crate) fn finish_offload(
+    sink: &Mutex<VecDeque<PoolCompletion>>,
+    wake: &crate::uring::wake::WakeHandle,
+    token: u64,
+    outcome: Box<dyn Any + Send>,
+) {
+    sink.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back((token, outcome));
+    wake.poke();
+}
 /// A type-erased on-loop continuation: it downcasts the boxed job result back to
 /// the job's `R` and calls the caller's `on_done` with a fresh `FsConn`.
 type OffloadDeliver = Box<dyn FnOnce(Box<dyn Any + Send>, &mut FsConn<'_>)>;
@@ -2820,12 +2843,7 @@ impl FsConn<'_> {
             // Push and poke unconditionally: an unwind past either one would
             // leave `offload_reg` holding a continuation that never fires.
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-            sink.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push_back((token, Box::new(r)));
-            // Wake the loop to drain the completion (counting eventfd; the loop
-            // re-arms the READ, so no poke is lost - the inject-path pattern).
-            wake.wake.poke();
+            finish_offload(&sink, &wake.wake, token, Box::new(r));
         }));
     }
 
@@ -4625,11 +4643,7 @@ mod loom_tests {
             for token in 0..2u64 {
                 let (s, w) = (Arc::clone(&sink), Arc::clone(&wake));
                 workers.push(loom::thread::spawn(move || {
-                    s.lock().unwrap_or_else(|e| e.into_inner()).push_back((
-                        token,
-                        Box::new(token) as Box<dyn Any + Send>,
-                    ));
-                    w.poke();
+                    finish_offload(&s, &w, token, Box::new(token));
                 }));
             }
 
@@ -4684,10 +4698,7 @@ mod loom_tests {
 
             let (s, w) = (Arc::clone(&sink), Arc::clone(&wake));
             let worker = loom::thread::spawn(move || {
-                s.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push_back((token, Box::new(()) as Box<dyn Any + Send>));
-                w.poke();
+                finish_offload(&s, &w, token, Box::new(()));
             });
 
             let mut delivered = 0usize;

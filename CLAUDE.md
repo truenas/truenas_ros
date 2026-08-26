@@ -567,6 +567,19 @@ live in `loom_tests` modules beside the code, are named `loom_*` so one filter
 catches them, and compile only under `--cfg loom` - production builds are
 byte-identical, since `src/sync.rs` is a plain re-export of `std` otherwise.
 
+**A model must drive the code that ships, not a copy of its ordering.** Where
+the shipping form and the model's differ only in *which cell* is touched --
+`ring.rs`'s four index words are raw pointers into the mmap in production and
+owned atomics in a model - the `cfg` picks the cell and nothing else, and the
+ordering has exactly one spelling (`load_acquire`/`store_release`). Where the
+production writer lives in another module, the pairing moves to where both can
+reach it: `LoopShared::request_graceful`/`graceful_requested`, and
+`finish_offload` for the offload worker's push-then-poke epilogue. Each of the
+three used to be spelled twice, and weakening the *shipping* half left the
+model green - which is what `bufring.rs:105-108` says a model with its own
+copy is worth. The control for any new model is the same: weaken the
+production ordering and watch it fail.
+
 Three limits shape every model, and they are documented at `src/sync.rs`:
 
 - **No `OnceLock`.** Use the `OnceCell` shim's closure-taking `with`.
@@ -578,9 +591,18 @@ Three limits shape every model, and they are documented at `src/sync.rs`:
 
 `loom::MAX_THREADS` is 5 including main, so models are deliberately tiny, and
 `preemption_bound` keeps them to seconds rather than minutes. Every
-`#[cfg(test)]` module under `src/uring*/` must be `#[cfg(all(test,
-not(loom)))]`, or ordinary tests break the loom build on `thread::sleep` and
-friends.
+`#[cfg(test)]` module that builds a ring or drives real threads must be
+`#[cfg(all(test, not(loom)))]`, or ordinary tests break the loom build on
+`thread::sleep` and friends - `src/net/` as much as `src/uring*/`.
+
+Types shared with the engine come from `crate::sync`, never `std::sync`
+directly: `LoopShared` is handed out as a `crate::sync::Arc`, and a
+`std::sync::Arc` field holding it is a *distinct type* under `--cfg loom`.
+That mismatch kept `--cfg loom --features net-client` - and so
+`--all-features` - from compiling at all, which is why the lane used to run
+three feature subsets that avoided it. It is one `--all-features` invocation
+now, and it asserts the model **count**: a libtest filter that matches
+nothing exits 0, so a mistyped `--cfg` reads as a green lane.
 
 ## Fuzzing
 

@@ -497,7 +497,6 @@ use crate::uring::sys::*;
 use handles::Injected;
 use listen::listen_socket;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -1134,7 +1133,7 @@ where
             // stop - `serve_forever`'s drain cancels whatever remains.
             Some(Op::Deadline) => {
                 if self.core.draining && !self.core.stopping() {
-                    self.core.engine.shared.stop.store(true, Ordering::Release);
+                    self.core.engine.shared.request_stop();
                 }
             }
             // A peer-identity fetch - the slot's PendingPeer pad says which.
@@ -1365,14 +1364,14 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Drop
         #[cfg(feature = "uring-fs")]
         let leaked = {
             let fs = &mut self.fs;
-            self.core.drain_or_leak_routing(&mut |cqe| {
+            self.core.drain_or_leak(&mut |cqe| {
                 if let Some(fs) = fs.as_mut() {
                     fs.on_drain_cqe(cqe);
                 }
             })
         };
         #[cfg(not(feature = "uring-fs"))]
-        let leaked = self.core.drain_or_leak();
+        let leaked = self.core.drain_or_leak(&mut |_| {});
         // fs ops share this ring; on a failed drain they may still be in
         // flight, so leak the fs op buffers alongside the connection buffers
         // rather than free memory the kernel might yet write into.

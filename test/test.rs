@@ -1691,6 +1691,7 @@ mod shutil {
     // match the mode - under the default aclmode=discard it replaces it
     // outright - so restoring one bit would destroy the ACL the copy just
     // carried. Pinned here so the trade stays a decision.
+    #[cfg(feature = "acl")]
     #[test]
     fn an_acl_bearing_sticky_directory_arrives_without_the_sticky_bit() {
         use std::os::fd::AsFd;

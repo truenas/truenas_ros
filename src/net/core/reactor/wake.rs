@@ -5,13 +5,12 @@
 use super::Reactor;
 use crate::errno;
 use crate::net::core::conn::{Op, pack};
-use std::sync::atomic::Ordering;
 
 impl<U> Reactor<U> {
     /// If a graceful drain has fully quiesced (no live connections), stop.
     pub(crate) fn maybe_finish_drain(&mut self) {
         if self.draining && self.table.active() == 0 {
-            self.engine.shared.stop.store(true, Ordering::Release);
+            self.engine.shared.request_stop();
         }
     }
 

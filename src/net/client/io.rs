@@ -495,7 +495,9 @@ where
     }
 }
 
-#[cfg(test)]
+// `not(loom)`: this module builds a real ring and drives real threads,
+// neither of which a model run has. See `src/sync.rs`.
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::net::client::{ClientConfig, ConnectOpts};

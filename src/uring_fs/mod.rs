@@ -2257,8 +2257,7 @@ impl FsHandle {
     // caller gets back (buffers, lease), not an error-path allocation to shrink.
     #[allow(clippy::result_large_err)]
     pub(crate) fn send(&self, msg: FsInject) -> Result<(), FsInject> {
-        use crate::sync::atomic::Ordering;
-        if self.shared.stop.load(Ordering::Acquire) {
+        if self.shared.stop_requested() {
             return Err(msg);
         }
         if let Err(e) = self.tx.send(msg) {

@@ -275,14 +275,11 @@ impl<U> Reactor<U> {
     /// Returns `true` if the drain failed and the buffers were leaked - an
     /// embedding host with its own kernel-visible buffers on this ring (the
     /// server's fs op table) must then leak those too.
-    pub(crate) fn drain_or_leak(&mut self) -> bool {
-        self.drain_or_leak_routing(&mut |_| {})
-    }
-
-    /// [`drain_or_leak`](Self::drain_or_leak) for a host that shares this
-    /// ring: `other` is called with every reaped CQE, so the host can route
-    /// its own domain's completions (freeing what they carry) as they land.
-    pub(crate) fn drain_or_leak_routing(
+    /// `other` is called with every reaped CQE, so a host sharing this ring
+    /// (the server's fs op table) can route its own domain's completions --
+    /// freeing what they carry - as they land. A role with nothing else on
+    /// the ring passes a no-op.
+    pub(crate) fn drain_or_leak(
         &mut self,
         other: &mut dyn FnMut(&IoUringCqe),
     ) -> bool {
