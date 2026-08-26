@@ -6,6 +6,7 @@
 
 use super::Server;
 use super::handles::Injected;
+use super::io::Delivery;
 use crate::errno;
 use crate::net::core::conn::{Op, pack};
 use crate::net::core::handles::stat;
@@ -478,7 +479,11 @@ where
                         let conn = self.core.table.conn_mut(token.slot);
                         conn.outstanding = conn.outstanding.saturating_sub(1);
                     }
-                    self.deliver_one(token.slot, token.generation as u32)?;
+                    self.deliver_one(
+                        token.slot,
+                        token.generation as u32,
+                        Delivery::Redelivery,
+                    )?;
                     self.pump(token.slot, token.generation as u32)?;
                 }
                 Injected::Push { .. }

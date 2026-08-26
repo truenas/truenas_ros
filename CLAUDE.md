@@ -438,6 +438,13 @@ Do not reopen these without a reason that is new.
   (`arm_receipt_deadline` is idempotent on the flag).
   `the_receipt_budget_bounds_a_spliced_body_and_ends_with_it` drives both
   halves with `idle_timeout` unset, so neither can be masked.
+- **Only a *wire* delivery retires it** (`Delivery::FromWire`). A
+  redelivery's message was consumed and its budget retired at its first
+  delivery, so the budget armed when a worker's `redeliver` lands belongs to
+  a later message the read-ahead has begun - and retiring that one restarts
+  the bound. Where the next read is already in flight (an exact body read)
+  nothing re-arms it and the trickling peer is never reclaimed at all:
+  `a_redelivery_does_not_retire_the_next_message_budget`.
 - **Retiring at *delivery* is what keeps it a bound on receipt.** A
   `Response::Defer` may run arbitrarily long, and a budget still armed would
   clock the handler, then the next idle period, on a connection that has done
@@ -456,6 +463,21 @@ Do not reopen these without a reason that is new.
   is being *handled*, and handling is not clocked.
   `a_stalled_streamed_upload_is_reaped_mid_body` runs with `idle_timeout`
   unset so the misclassification has nothing to fall back on.
+
+### Delivering a message
+
+- **A redelivery owns neither the frame nor the budget.**
+  `Deferred::redeliver` re-enters `deliver_one` for a request the glue
+  retained, and its documented contract is an *empty* frame - the bytes went
+  at the first delivery. Above the default read-ahead cap the pump may have
+  framed the next pipelined request already, and delivering against that
+  frame slices a body out of a buffer holding only its header
+  (`Body::inline(&rest[..body_len])`, an out-of-range slice that panics the
+  reactor thread) and then lets `consume` eat that request's header. The
+  `Delivery` split is what keeps the two apart; the in-tree http codec never
+  reaches it, because `Phase::Parked` holds pipelined bytes unframed, so the
+  control has to be a framer that frames what is buffered
+  (`a_redelivery_does_not_take_the_read_ahead_frame`).
 
 ### The offload pool
 

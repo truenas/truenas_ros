@@ -18,6 +18,22 @@ use crate::net::core::reactor::{
     Enacted, Gate, RecvStep, SendStep, SpliceStep,
 };
 use crate::net::server::protocol::{DetachContext, Request, Response};
+
+/// Which delivery [`Server::deliver_one`] is running.
+///
+/// The two differ in what belongs to the message being delivered. A wire
+/// delivery owns the connection's current frame and the receipt budget armed
+/// for it; a redelivery owns neither - its bytes were consumed and its budget
+/// retired at its first delivery, and anything set on the connection now
+/// belongs to a *later* message the read-ahead has begun.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Delivery {
+    /// A message the framer just declared over what was read.
+    FromWire,
+    /// A worker's re-entry for a request the protocol glue retained
+    /// ([`super::Deferred::redeliver`]).
+    Redelivery,
+}
 use crate::sync::Arc;
 use crate::uring::sys::*;
 
@@ -58,7 +74,9 @@ where
             };
             match self.core.enact_frame_step(slot, generation, verdict)? {
                 Enacted::Done => return Ok(()),
-                Enacted::Deliver => self.deliver_one(slot, generation)?,
+                Enacted::Deliver => {
+                    self.deliver_one(slot, generation, Delivery::FromWire)?
+                }
             }
         }
     }
@@ -103,7 +121,7 @@ where
         }
         match self.core.on_recv_complete(slot, generation, res, op)? {
             RecvStep::Deliver => {
-                self.deliver_one(slot, generation)?;
+                self.deliver_one(slot, generation, Delivery::FromWire)?;
                 self.pump(slot, generation)
             }
             RecvStep::Pump => self.pump(slot, generation),
@@ -166,24 +184,49 @@ where
     /// Run the body handler for the current message, drop the request from the
     /// recv buffer, and act on the [`Response`]: queue a reply (and start
     /// sending), park for a deferred reply, or close. Also the re-entry point
-    /// for [`Deferred::redeliver`], where the current frame is empty and the
+    /// for [`Deferred::redeliver`] ([`Delivery::Redelivery`]), where the
     /// handler works from its own retained state.
     pub(super) fn deliver_one(
         &mut self,
         slot: u32,
         generation: u32,
+        which: Delivery,
     ) -> errno::Result<()> {
+        // A redelivery's message was consumed - and its budget retired - at
+        // its first delivery, so any budget armed now belongs to a *later*
+        // message still arriving on this connection. Retiring it here would
+        // restart the one bound progress is not supposed to restart. The
+        // wire-driven callers own that retirement, and only they.
+        //
+        // A redelivery's frame is likewise not its own: with a read-ahead cap
+        // above one the pump may already have framed the next request, and
+        // the handler must not be handed that message's extent (nor may
+        // `consume` below drop its header). Deliver against an empty frame --
+        // which is what `Deferred::redeliver` documents - and put the pending
+        // one back afterwards.
+        let saved = match which {
+            Delivery::FromWire => {
+                // Receipt is over the moment the message is handed to the
+                // handler, so the budget is retired here rather than when the
+                // next read is armed. Anything later would clock the
+                // *handling* too, and a request offloaded with
+                // `Response::Defer` may legitimately run for as long as it
+                // likes.
+                self.core.cancel_receipt_deadline(slot, generation)?;
+                None
+            }
+            Delivery::Redelivery => {
+                let conn = self.core.table.conn_mut(slot);
+                let frame = conn.frame();
+                conn.set_frame(0, 0);
+                Some(frame)
+            }
+        };
         // Borrow-split: `self.handlers`, `self.core.table`, and `self.mailbox` are
         // disjoint fields; within the connection, buf/addr (immutable) vs
         // userdata (mutable). The Responder holds owned channel clones.
         // The token carries the FULL u64 generation - a worker may retain it
         // across recycles - whereas the kernel routing used the low 32 bits.
-        // Receipt is over the moment the message is handed to the handler,
-        // so the budget is retired here rather than when the next read is
-        // armed. Anything later would clock the *handling* too, and a
-        // request offloaded with `Response::Defer` may legitimately run for
-        // as long as it likes.
-        self.core.cancel_receipt_deadline(slot, generation)?;
         let gen64 = self.core.table.generation(slot);
         let (resp, req_id) = {
             let conn = self.core.table.conn_mut(slot);
@@ -235,11 +278,18 @@ where
             )
         };
         // The handler has taken what it needs; drop the request from the recv
-        // buffer so the next request can be read into it.
+        // buffer so the next request can be read into it. (A redelivery's
+        // frame is empty, so this drains nothing - see `take_body_handoff`.)
         self.core.table.conn_mut(slot).consume();
         // Nothing buffered means nothing to hold a buffer for: give it back
         // so a connection waiting on its next request costs none.
         self.core.release_recv_buffer(slot);
+        // Hand the read-ahead frame back to the message it describes.
+        if let Some((header_len, body_len)) = saved
+            && let Some(conn) = self.core.table.get_conn_mut(slot)
+        {
+            conn.set_frame(header_len, body_len);
+        }
         stat!(self.core, requests);
         match resp {
             Response::Close => self.core.close_conn(
