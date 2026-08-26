@@ -316,11 +316,25 @@ impl Entry {
     /// handle (a special file may instead be a non-blocking one) usable with
     /// `statx` and [`Entry::read_link`]. Read file data only from an
     /// [`EntryType::File`] fd.
+    ///
+    /// A **directory** entry's descriptor shares its open file description
+    /// with this iterator, which duplicates it to descend. Reading the
+    /// directory stream through it - `getdents64`, or an `lseek` past what a
+    /// `DIR` has already buffered - moves the cursor the walk is still
+    /// reading, and the walk then yields a short listing with no error
+    /// anywhere in it. Reopen for a private cursor
+    /// (`openat(fd, ".", O_RDONLY | O_DIRECTORY)`, as `shutil`'s `reopen_dir`
+    /// does) rather than reading this one. `statx`, [`Entry::read_link`] and
+    /// reading a file entry's data are all unaffected.
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
 
     /// Consume the entry, taking ownership of its file descriptor.
+    ///
+    /// Owning the descriptor does not make its cursor private: a directory
+    /// entry's still shares the walk's open file description, with the
+    /// consequence [`Entry::fd`] describes.
     pub fn into_fd(self) -> OwnedFd {
         self.fd
     }

@@ -8,6 +8,26 @@
 //! same stream is [`iter`](crate::sync_fs::iter) (feature `fsiter`),
 //! which owns descent, resume and mount pinning; this module is
 //! deliberately smaller — names out, nothing followed, nothing opened.
+//!
+//! **The descriptor contract.** Everything here reads through a descriptor
+//! the caller supplies, and two properties travel with one.
+//!
+//! A `dup` - `F_DUPFD_CLOEXEC` included - shares the *open file
+//! description*, and a directory's read position lives there rather than in
+//! the descriptor. Two readers over dups of one description therefore
+//! consume each other's entries, and `readdir` reports nothing when they do:
+//! the loss is a short listing, not an error. **A shared description is
+//! single-reader.** That is not a lock this module can take, because the
+//! sharing is invisible from the descriptor number;
+//! [`iter::Entry::fd`](crate::sync_fs::iter::Entry::fd) states the same rule
+//! for the descriptor a walk hands out.
+//!
+//! Reopening would buy a private position, and would pay for it in
+//! authority: a fresh open is checked against the process that opens it,
+//! not against whoever obtained the descriptor it starts from - which in a
+//! process running as root is no check at all. So this module dups and
+//! spends the position rather than reopening and widening the right, and
+//! the position is the caller's to protect.
 
 use std::ffi::CStr;
 use std::os::fd::{AsFd, IntoRawFd, OwnedFd};
@@ -61,10 +81,14 @@ pub struct DirEntryName {
 
 /// Read every name in the directory open at `fd`, in filesystem order.
 ///
-/// One full drain per call, over a descriptor of its own: `openat2(fd,
-/// ".")` gives a fresh file description, so `fd` may be an `O_PATH`
-/// handle - which `fdopendir` refuses outright - and its position is left
-/// where it was found.
+/// One full drain per call: the stream is rewound first, so the result is
+/// the whole directory wherever the descriptor's offset sat. The stream
+/// runs on a `dup`, which shares the original's open file description, so
+/// **the caller's position is spent by the read** - a consuming read of the
+/// position, not a peek. A caller that is itself reading `fd`, or that has
+/// handed it to a traversal, reopens for a position of its own
+/// (`openat(fd, ".", O_RDONLY | O_DIRECTORY)`, as `shutil::reopen_dir`
+/// does) before calling here.
 ///
 /// **A `dup` cannot serve, and is not cheaper.** `fdopendir` rejects it
 /// for the same `O_PATH` reason, since a dup carries the original's
@@ -77,9 +101,29 @@ pub struct DirEntryName {
 /// with no error to say so. The dup also costs one syscall *more*: it
 /// needs a `rewinddir`, and the reopen does not.
 ///
-/// The reopen costs one right a dup does not need: search (`x`) permission
-/// on the directory, under the *calling* process's credentials. A caller
-/// holding a descriptor it can no longer traverse gets `EACCES`.
+/// **The dup is what keeps the read on the descriptor's own authority.** A
+/// dup carries the access `fd` was opened with and re-checks nothing, so
+/// what may be read here is what the opener was already entitled to read.
+/// A fresh open would instead be authorized against whoever calls this, and
+/// would need a right a dup does not - search (`x`) on the directory - so
+/// it would both widen and narrow the wrong way.
+///
+/// An `O_PATH` handle is a reference carrying no read, and `fdopendir`
+/// refuses one with `EBADF`. That refusal is the kernel's, not a check this
+/// module makes, and it is why the dup matters:
+/// `openat2` through an `O_PATH` descriptor *succeeds*, manufacturing the
+/// access it was deliberately opened without.
+/// [`Anchor`](crate::uring_fs::Anchor) is such a handle.
+///
+/// **Unbounded by construction.** One call, one `Vec`, every name: there is
+/// no limit, cursor or streaming variant, so a caller holds the whole
+/// directory at roughly 46-54 bytes and one allocation per entry. That is
+/// the shape a whole-drain wants and it is fine for a directory whose size
+/// the caller controls; a listing that a peer can grow belongs on
+/// [`uring_fs::query_dir`](crate::uring_fs::query_dir), which pages and
+/// enriches. No bounded twin is offered here rather than one being invented
+/// for a caller that does not exist - this function has none outside its own
+/// tests.
 ///
 /// Order is the filesystem's own (ZAP hash order on ZFS); a sorted view is
 /// the caller's sort. The result is a snapshot, not an atomic one: an entry
@@ -87,18 +131,12 @@ pub struct DirEntryName {
 /// missed or reported twice, which is `readdir`'s contract and not
 /// something this layer can close.
 pub fn read_names(fd: impl AsFd) -> errno::Result<Vec<DirEntryName>> {
-    let own = crate::sync_fs::openat2(
-        fd.as_fd(),
-        ".",
-        crate::sync_fs::OpenHow::new()
-            .flags(
-                crate::sync_fs::OFlag::O_RDONLY
-                    | crate::sync_fs::OFlag::O_DIRECTORY
-                    | crate::sync_fs::OFlag::O_CLOEXEC,
-            )
-            .resolve(crate::sync_fs::ResolveFlag::RESOLVE_NO_SYMLINKS),
-    )?;
-    let mut dir = Dir::from_fd(own)?;
+    let dup = fd
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|e| Errno::from_raw(e.raw_os_error().unwrap_or(libc::EIO)))?;
+    let mut dir = Dir::from_fd(dup)?;
+    dir.rewind();
     let mut names = Vec::new();
     while let Some(ent) = dir.next_entry()? {
         let bytes = ent.name.as_bytes();
@@ -153,6 +191,15 @@ impl Dir {
     pub(crate) fn fd(&self) -> std::os::fd::RawFd {
         // SAFETY: `self.0` is a live DIR stream.
         unsafe { libc::dirfd(self.0.as_ptr()) }
+    }
+
+    /// Reset the stream to the directory's start.
+    ///
+    /// Shared with whatever else holds this open file description, which is
+    /// the consuming half of [`read_names`]' contract.
+    fn rewind(&mut self) {
+        // SAFETY: `self.0` is a live DIR stream we own exclusively.
+        unsafe { libc::rewinddir(self.0.as_ptr()) };
     }
 
     pub(crate) fn next_entry(&mut self) -> errno::Result<Option<DirEntry>> {
@@ -337,69 +384,17 @@ mod tests {
         );
     }
 
-    /// A drain must not spend the position of a stream that shares the
-    /// caller's file description.
+    /// An `O_PATH` handle is refused, and the refusal is the kernel's.
     ///
-    /// This is the traversal shape: `iter::FsIter` descends by `dup`ping the
-    /// entry fd it just handed the caller and opening a `DIR` on the dup, so
-    /// the frame and `Entry::fd()` are one description. A drain that rewound
-    /// that description and walked it to EOF - which is what a `dup` plus
-    /// `rewinddir` does - left the walk at end-of-directory, and the walk
-    /// reported an empty subtree with no error. The frame is deliberately
-    /// unread here: glibc buffers a whole `getdents64` at the first
-    /// `readdir`, which would hide the moved offset on a small directory.
+    /// `O_PATH` is a reference carrying no read, and `fdopendir` answers one
+    /// with `EBADF`. Reading through a dup is what keeps that enforcement:
+    /// `openat2` through an `O_PATH` descriptor *succeeds*, manufacturing the
+    /// access it was opened without and checking it against this process
+    /// rather than whoever obtained the handle - which where this runs as
+    /// root is no check at all. [`Anchor::open`](crate::uring_fs::Anchor)
+    /// mints exactly this shape and takes `impl AsFd` to get here.
     #[test]
-    fn a_drain_leaves_a_walk_over_the_same_descriptor_intact() {
-        let tmp = crate::tempdir().expect("tempdir");
-        for i in 0..50 {
-            std::fs::write(tmp.path().join(format!("f{i:03}")), b"x")
-                .expect("file");
-        }
-        let dirf = std::fs::File::open(tmp.path()).expect("open dir");
-        let dup = dirf.as_fd().try_clone_to_owned().expect("dup");
-        let mut walk = Dir::from_fd(dup).expect("fdopendir");
-
-        assert_eq!(read_names(dirf.as_fd()).expect("drain").len(), 50);
-
-        let mut seen = 0usize;
-        while let Some(e) = walk.next_entry().expect("next_entry") {
-            let n = e.name.as_bytes();
-            if n != b"." && n != b".." {
-                seen += 1;
-            }
-        }
-        assert_eq!(
-            seen, 50,
-            "the drain consumed the walk's own position: it reopens rather \
-             than duplicating precisely so this cannot happen"
-        );
-    }
-
-    /// The caller's own offset is likewise untouched - the drain reads a
-    /// file description of its own.
-    #[test]
-    fn a_drain_leaves_the_descriptor_offset_where_it_found_it() {
-        use std::os::fd::AsRawFd;
-        let tmp = crate::tempdir().expect("tempdir");
-        for i in 0..8 {
-            std::fs::write(tmp.path().join(format!("n{i}")), b"").expect("f");
-        }
-        let dirf = std::fs::File::open(tmp.path()).expect("open dir");
-        // SAFETY: `dirf` is a live directory descriptor.
-        let before =
-            unsafe { libc::lseek(dirf.as_raw_fd(), 0, libc::SEEK_CUR) };
-        assert_eq!(read_names(dirf.as_fd()).expect("drain").len(), 8);
-        // SAFETY: same descriptor, still live.
-        let after = unsafe { libc::lseek(dirf.as_raw_fd(), 0, libc::SEEK_CUR) };
-        assert_eq!(before, after, "the drain spent the caller's position");
-    }
-
-    /// The consumer the module documents - "a descriptor its
-    /// credential-checked step already opened" - hands on an `O_PATH`
-    /// handle, which `fdopendir` refuses with `EBADF`. Reopening through it
-    /// is what makes that shape work.
-    #[test]
-    fn an_o_path_descriptor_is_readable() {
+    fn an_o_path_descriptor_is_refused() {
         use std::os::fd::{FromRawFd, OwnedFd};
         let tmp = crate::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("a"), b"").expect("file");
@@ -415,9 +410,71 @@ mod tests {
         assert!(raw >= 0, "open O_PATH: {}", Errno::last());
         // SAFETY: `raw` is a fresh owned descriptor.
         let anchor = unsafe { OwnedFd::from_raw_fd(raw) };
-        let got = read_names(anchor.as_fd()).expect("read_names on O_PATH");
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].name, b"a");
+        assert_eq!(
+            read_names(anchor.as_fd()).expect_err("O_PATH must be refused"),
+            Errno::EBADF,
+        );
+
+        // The same directory, opened for read, still drains - so the refusal
+        // is about the descriptor's access and not about the directory.
+        let ok = std::fs::File::open(tmp.path()).expect("open O_RDONLY");
+        assert_eq!(read_names(ok.as_fd()).expect("readable").len(), 1);
+    }
+
+    /// The drain spends the caller's position, and the reopen the docs
+    /// prescribe is what protects it.
+    ///
+    /// `read_names` rewinds a dup, and a dup shares the open file
+    /// description, so a walk holding that same description is left at
+    /// end-of-directory and reports an empty remainder with no error. That
+    /// is the contract: the alternative - reopening for a private position -
+    /// re-authorizes the read against whoever calls, and an `O_PATH` handle
+    /// reopens just fine. Callers that care reopen first, as
+    /// `shutil::reopen_dir` does.
+    ///
+    /// The frame is deliberately unread before the drain: glibc buffers a
+    /// whole `getdents64` at the first `readdir`, which would hide the moved
+    /// offset on a small directory.
+    #[test]
+    fn a_drain_spends_the_position_and_a_reopen_protects_it() {
+        let tmp = crate::tempdir().expect("tempdir");
+        for i in 0..50 {
+            std::fs::write(tmp.path().join(format!("f{i:03}")), b"x")
+                .expect("file");
+        }
+
+        // Sharing the description: the walk loses its remainder.
+        let dirf = std::fs::File::open(tmp.path()).expect("open dir");
+        let dup = dirf.as_fd().try_clone_to_owned().expect("dup");
+        let mut walk = Dir::from_fd(dup).expect("fdopendir");
+        assert_eq!(read_names(dirf.as_fd()).expect("drain").len(), 50);
+        let mut seen = 0usize;
+        while walk.next_entry().expect("walk").is_some() {
+            seen += 1;
+        }
+        assert!(
+            seen < 52,
+            "a shared description is single-reader: the drain spends it"
+        );
+
+        // A description of its own: untouched.
+        let dirf2 = std::fs::File::open(tmp.path()).expect("open dir");
+        let own = crate::sync_fs::openat2(
+            dirf2.as_fd(),
+            ".",
+            crate::sync_fs::OpenHow::new().flags(
+                crate::sync_fs::OFlag::O_RDONLY
+                    | crate::sync_fs::OFlag::O_DIRECTORY,
+            ),
+        )
+        .expect("reopen");
+        let mut walk2 = Dir::from_fd(own).expect("fdopendir");
+        assert_eq!(read_names(dirf2.as_fd()).expect("drain").len(), 50);
+        let mut seen2 = 0usize;
+        while walk2.next_entry().expect("walk").is_some() {
+            seen2 += 1;
+        }
+        assert_eq!(seen2, 52, "50 files plus . and .., all still there");
     }
 
     /// The `d_type` mapping, pinned over the raw constants because no
