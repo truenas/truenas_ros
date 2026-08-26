@@ -61,19 +61,21 @@ pub struct DirEntryName {
 
 /// Read every name in the directory open at `fd`, in filesystem order.
 ///
-/// One full drain per call, over a **reopened** descriptor: `openat2(fd,
-/// ".")` gives a fresh file description with its own offset, so the read
-/// starts at the directory's beginning and leaves `fd`'s position exactly
-/// where it was. `fd` may be an `O_PATH` handle - the kind a
-/// credential-checked step hands on - which `fdopendir` refuses outright.
+/// One full drain per call, over a descriptor of its own: `openat2(fd,
+/// ".")` gives a fresh file description, so `fd` may be an `O_PATH`
+/// handle - which `fdopendir` refuses outright - and its position is left
+/// where it was found.
 ///
-/// A `dup` would be cheaper and is wrong in both respects: a dup *shares*
-/// the original's file description, so rewinding it to read from the start
-/// rewinds the caller's stream, and the drain then leaves it at EOF. A
-/// traversal that calls this on a directory it is walking
+/// **A `dup` cannot serve, and is not cheaper.** `fdopendir` rejects it
+/// for the same `O_PATH` reason, since a dup carries the original's
+/// access mode; and it *shares* the original's file description, so
+/// rewinding it to read from the start rewinds the caller's stream and
+/// the drain then leaves that at EOF - which makes a traversal that calls
+/// this on a directory it is walking
 /// ([`iter::Entry::fd`](crate::sync_fs::iter::Entry::fd), whose frame
-/// descends on a dup of that same fd) sees the rest of that directory
-/// vanish, with no error to say so.
+/// descends on a dup of that same fd) lose the rest of that directory
+/// with no error to say so. The dup also costs one syscall *more*: it
+/// needs a `rewinddir`, and the reopen does not.
 ///
 /// The reopen costs one right a dup does not need: search (`x`) permission
 /// on the directory, under the *calling* process's credentials. A caller
