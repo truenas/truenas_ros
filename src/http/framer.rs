@@ -59,7 +59,16 @@ pub(crate) const CHUNK_WIRE_OVERHEAD: usize = 16 * 1024;
 pub struct HttpConfig {
     /// Maximum request-head size in bytes (request line + headers +
     /// terminator). Exceeding it answers `431 Request Header Fields Too
-    /// Large` and closes. Also bounds head re-parse cost on drip-fed input.
+    /// Large` and closes.
+    ///
+    /// It bounds each head re-parse, **not their total**. A head arriving in
+    /// pieces is re-tokenized in full on every arrival, so the work is
+    /// `segments * head_len` and only the second factor is capped here - a
+    /// peer choosing the segmentation chooses the first. Measured, the
+    /// rescan is about a third of the per-segment cost the connection pays
+    /// regardless (~1.5 us against ~6 us), so it is a tax on a scan rather
+    /// than a surface of its own; `max_head` is what keeps that tax from
+    /// growing without limit.
     pub max_head: usize,
     /// Maximum body size accepted for an inline-buffered body: the declared
     /// `Content-Length`, or for chunked requests the **decoded** entity size

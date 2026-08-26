@@ -160,12 +160,19 @@ pub mod fuzz {
     }
 
     /// Run the head tokenizer and semantic rules over `data`, returning the
-    /// head length, the expect-continue flag, and whether the body verdict was
-    /// `Ok` (the body enum itself stays crate-private); `Err` is the
-    /// die-with status.
-    pub fn head_facts(data: &[u8]) -> Result<Option<(usize, bool, bool)>, u16> {
+    /// head length, the expect-continue flag, whether the body verdict was
+    /// `Ok` (the body enum itself stays crate-private), and the **screened
+    /// request-target**; `Err` is the die-with status.
+    ///
+    /// The target is here so a fuzz target can assert on it. Without it the
+    /// request-target screen - the largest surface the codec grew - was
+    /// exercised by every input and observable by none, which is a target
+    /// that cannot fail.
+    pub fn head_facts(
+        data: &[u8],
+    ) -> Result<Option<(usize, bool, bool, &str)>, u16> {
         Ok(frame_facts(data)?
-            .map(|f| (f.len, f.expects_continue, f.body.is_ok())))
+            .map(|f| (f.len, f.expects_continue, f.body.is_ok(), f.target)))
     }
 
     /// Resumable chunk scan over a body region: `Ok(Some(extent))` once the

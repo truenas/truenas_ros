@@ -80,9 +80,13 @@ pub(crate) struct Head<'a> {
 /// builds (the framer would discard it unread).
 ///
 /// [`frame`]: super::framer::frame
-pub(crate) struct FrameFacts {
+pub(crate) struct FrameFacts<'a> {
     /// Bytes the head occupies, including the terminating CRLFCRLF.
     pub len: usize,
+    /// The screened request-target, reduced to origin form. Computed here
+    /// already; carried out so the screen can be asserted on rather than
+    /// only exercised - see `http::fuzz::head_facts`.
+    pub target: &'a str,
     /// The declared body framing, or the status the connection should die
     /// with. Kept as a `Result` so the framer sequences its own cap checks
     /// (431 before the body verdict) exactly as it would with a full parse.
@@ -241,10 +245,81 @@ fn view<'b>(h: &httparse::Header<'b>) -> HeaderView<'b> {
     }
 }
 
+/// Whether `value` is a well-formed `Host`: `uri-host [ ":" port ]`, RFC 3986
+/// sec. 3.2.2-3.2.3.
+///
+/// The point is what it excludes. `@`, SP, `/` and every control character
+/// are outside `reg-name`, so a `userinfo`, a path, or a header-splitting
+/// byte cannot ride into the routing key - and [`target_check`] compares an
+/// absolute-form authority against *this* value, so an unchecked `Host` is
+/// also how a malformed authority passes that comparison by matching itself.
+///
+/// `reg-name` admits the empty string, but an origin server cannot route a
+/// request that names no authority, and `target_check` documents an empty
+/// authority as falling out as a mismatch - true only if it never matches.
+fn host_is_valid(value: &[u8]) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    // A `:` inside an IP-literal belongs to the address, not to a port.
+    let (host, port) = match value.iter().rposition(|&b| b == b':') {
+        Some(i) if !value[i..].contains(&b']') => {
+            (&value[..i], Some(&value[i + 1..]))
+        }
+        _ => (value, None),
+    };
+    // `port = *DIGIT`; empty is legal (`host:`) and means the default.
+    if let Some(port) = port
+        && !port.iter().all(u8::is_ascii_digit)
+    {
+        return false;
+    }
+    if let Some(inner) =
+        host.strip_prefix(b"[").and_then(|h| h.strip_suffix(b"]"))
+    {
+        // `IP-literal = "[" ( IPv6address / IPvFuture ) "]"`. Bound the
+        // character set rather than re-implementing the address grammar: the
+        // job here is keeping a routing key free of delimiters, and a
+        // malformed address fails to resolve on its own.
+        return !inner.is_empty()
+            && inner.iter().all(|b| {
+                b.is_ascii_hexdigit() || matches!(b, b':' | b'.' | b'v' | b'V')
+            });
+    }
+    // `reg-name = *( unreserved / pct-encoded / sub-delims )`.
+    !host.is_empty()
+        && host.iter().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'%'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                )
+        })
+}
+
 /// RFC 9112 sec. 3.2: an HTTP/1.1 request without a `Host` field, or any request
 /// with more than one, MUST be answered 400. Enforced at tokenize time so a
 /// Host-less request never reaches routing code (virtual-hosted S3 derives
 /// the bucket from `Host`).
+///
+/// The value is validated here too, per RFC 9110 sec. 7.2 - a `Host` whose
+/// field value is not a valid `uri-host` is answered 400 rather than handed
+/// on. Counting the field lines and passing the bytes through unread left
+/// every malformed authority reaching bucket derivation.
 fn host_check<'h>(
     headers: impl Iterator<Item = HeaderView<'h>>,
     version: Version,
@@ -252,6 +327,7 @@ fn host_check<'h>(
     let mut hosts = headers.filter(|h| h.name.eq_ignore_ascii_case("host"));
     match (hosts.next(), version) {
         (Some(_), _) if hosts.next().is_some() => Err(400),
+        (Some(h), _) if !host_is_valid(h.value) => Err(400),
         (Some(h), _) => Ok(Some(h.value)),
         (None, Version::Http10) => Ok(None),
         (None, Version::Http11) => Err(400),
@@ -303,15 +379,16 @@ pub(crate) fn method_is_head(mut head: &[u8]) -> bool {
 /// Tokenize a (possibly incomplete) request head into just the
 /// [`FrameFacts`] the framer consumes - same rules as [`parse_head`], no
 /// header-index allocation.
-pub(crate) fn frame_facts(buf: &[u8]) -> Result<Option<FrameFacts>, u16> {
+pub(crate) fn frame_facts(buf: &[u8]) -> Result<Option<FrameFacts<'_>>, u16> {
     let mut slots = [httparse::EMPTY_HEADER; MAX_HEADERS];
     // The target's form is screened here too: the framer runs first, so a
     // shape this server does not serve must die before its body is sized.
-    let Some((req, len, version, _target)) = tokenize(buf, &mut slots)? else {
+    let Some((req, len, version, target)) = tokenize(buf, &mut slots)? else {
         return Ok(None);
     };
     Ok(Some(FrameFacts {
         len,
+        target,
         body: body_from(req.headers.iter().map(view), version),
         expects_continue: version == Version::Http11
             && has_token(
@@ -609,6 +686,54 @@ fn parse_content_length(v: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+
+    /// RFC 9110 sec. 7.2: a `Host` whose field value is not a valid
+    /// `uri-host` is a 400, on **every** request shape.
+    ///
+    /// Origin-form is the whole of real traffic and runs no authority
+    /// comparison, so hardening `target_check` alone would have left it open.
+    /// The value is what virtual-hosted S3 derives a bucket from, so `@`, SP
+    /// and `/` reaching it are a routing key carrying a userinfo or a path.
+    #[test]
+    fn a_malformed_host_is_refused_on_origin_form() {
+        let status = |buf: &[u8]| {
+            let mut headers = [HeaderView::EMPTY; MAX_HEADERS];
+            parse_head(buf, &mut headers).err()
+        };
+
+        for h in [
+            "",
+            "\t",
+            "u:p@evil.example",
+            "a b",
+            "bucket/evil",
+            "good:notaport",
+            "good:8080x",
+            "[not hex]",
+            "[]",
+        ] {
+            let req = format!("GET /k HTTP/1.1\r\nHost: {h}\r\n\r\n");
+            assert_eq!(status(req.as_bytes()), Some(400), "Host: {h:?}");
+        }
+
+        // And the shapes that must keep working.
+        for h in [
+            "good",
+            "good.example",
+            "good.example:8080",
+            "good.example:",
+            "under_score",
+            "xn--bcher-kva.example",
+            "192.0.2.1:443",
+            "[::1]",
+            "[::1]:8080",
+            "[v7.deadbeef]",
+            "pct%20encoded",
+        ] {
+            let req = format!("GET /k HTTP/1.1\r\nHost: {h}\r\n\r\n");
+            assert_eq!(status(req.as_bytes()), None, "Host: {h:?} must serve");
+        }
+    }
     use super::*;
 
     /// Parse a complete head and run `f` against it. The header array must
@@ -744,6 +869,19 @@ mod tests {
         for t in ["http://u@good/k", "http:///k", "http://good:8080/k"] {
             let req = format!("GET {t} HTTP/1.1\r\nHost: good\r\n\r\n");
             assert_eq!(status(req.as_bytes()), Some(400), "{t}");
+        }
+
+        // The same shapes matched by a Host that is equally malformed. The
+        // comparison alone does not catch these - it is `host_check`
+        // validating the field value that does, which is also what covers
+        // origin-form, where no comparison happens at all.
+        for h in ["u:p@evil.example", "", "bucket/evil", "good:notaport"] {
+            let req = format!("GET http://{h}/k HTTP/1.1\r\nHost: {h}\r\n\r\n");
+            assert_eq!(
+                status(req.as_bytes()),
+                Some(400),
+                "absolute-form {h:?} matching an equally malformed Host"
+            );
         }
 
         // Asterisk-form is a question about the server, and OPTIONS is the
