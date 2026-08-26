@@ -66,7 +66,8 @@ impl HeaderView<'_> {
 pub(crate) struct Head<'a> {
     /// Request method, verbatim (`httparse` guarantees a valid token).
     pub method: &'a str,
-    /// Request-target, verbatim.
+    /// Request-target in origin form, undecoded. Screened and, for
+    /// absolute-form, reduced by [`target_check`].
     pub target: &'a str,
     /// Protocol version.
     pub version: Version,
@@ -125,10 +126,11 @@ fn version_status(buf: &[u8]) -> u16 {
 /// caller applies. `Ok(None)` means "need more bytes"; `Err(status)` is the
 /// response status the connection should die with (400 malformed / Host
 /// rules, 431 too many headers, 505 unsupported version).
+#[allow(clippy::type_complexity)] // one parse's outputs, not an API
 fn tokenize<'s, 'b>(
     buf: &'b [u8],
     slots: &'s mut [httparse::Header<'b>; MAX_HEADERS],
-) -> Result<Option<(httparse::Request<'s, 'b>, usize, Version)>, u16> {
+) -> Result<Option<(httparse::Request<'s, 'b>, usize, Version, &'b str)>, u16> {
     let mut req = httparse::Request::new(&mut slots[..]);
     let len = match req.parse(buf) {
         Ok(httparse::Status::Complete(len)) => len,
@@ -144,8 +146,92 @@ fn tokenize<'s, 'b>(
         Some(1) => Version::Http11,
         _ => return Err(505),
     };
-    host_check(req.headers.iter().map(view), version)?;
-    Ok(Some((req, len, version)))
+    let host = host_check(req.headers.iter().map(view), version)?;
+    // Complete parses always carry method/path; treat absence as malformed
+    // rather than panicking on a tokenizer contract we don't control.
+    let (method, path) = match (req.method, req.path) {
+        (Some(m), Some(p)) => (m, p),
+        _ => return Err(400),
+    };
+    let target = target_check(method, path, host)?;
+    Ok(Some((req, len, version, target)))
+}
+
+/// RFC 9112 sec. 3.2: which request-target forms an **origin** server serves,
+/// and what the effective target is.
+///
+/// The codec refuses every other differential in this class with a rule of
+/// its own (duplicate Host, CL+TE, obs-fold, a space before a colon, a NUL in
+/// a value), and this one is the same shape. An absolute-form target carries
+/// its own authority, and sec. 3.2.1 says an origin server "MUST ignore the
+/// received Host header field (if any) and instead use the host information
+/// of the request-target". Left unchecked, two authorities arrive in one request and
+/// nothing reconciles them: a front end routing on one and this server on the
+/// other disagree about which bucket the request names.
+///
+/// Absolute-form is accepted, as sec. 3.2.2 requires, on the condition that
+/// its authority *equals* the `Host` field - which is how "use the target's
+/// authority" is honoured without a second routing key - and is then reduced
+/// to its path, so every handler sees one target shape. `userinfo` (which
+/// sec. 4.2.1 forbids a sender from generating) and an empty authority fall
+/// out of that comparison as mismatches.
+///
+/// Refused: authority-form, which belongs to `CONNECT` and a proxy; `*`
+/// outside `OPTIONS`; an absolute-form with no path to reduce to (`http://h?q`
+/// is legal and its origin-form equivalent is not a substring of it, so there
+/// is nothing to hand on); and any other shape, which is a client talking to
+/// something this is not.
+///
+/// `//host/path` starts with `/` and is ordinary origin-form - legal, and
+/// passed through. A consumer re-parsing a target as a URI reference must not
+/// read that as an authority.
+fn target_check<'b>(
+    method: &str,
+    target: &'b str,
+    host: Option<&[u8]>,
+) -> Result<&'b str, u16> {
+    if target.starts_with('/') {
+        return Ok(target); // origin-form: the shape this server serves
+    }
+    if target == "*" {
+        // Asterisk-form is a request about the server itself, and OPTIONS is
+        // the only method that asks one.
+        return if method == "OPTIONS" {
+            Ok(target)
+        } else {
+            Err(400)
+        };
+    }
+    let Some(rest) = strip_scheme(target) else {
+        // Authority-form (`host:port`) or nonsense. The former is CONNECT's
+        // alone; this is an origin server, not a proxy.
+        return Err(400);
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(end);
+    match host {
+        Some(h) if h.eq_ignore_ascii_case(authority.as_bytes()) => {}
+        _ => return Err(400),
+    }
+    match path.as_bytes().first() {
+        None => Ok("/"),
+        Some(b'/') => Ok(path),
+        _ => Err(400), // `?`/`#` with no path; see the doc above
+    }
+}
+
+/// Strip a `scheme "://"` prefix, returning what follows. `None` when the
+/// target does not start with one - `scheme = ALPHA *( ALPHA / DIGIT / "+" /
+/// "-" / "." )`, RFC 3986 sec. 3.1, so a bare `host:80` is not one.
+fn strip_scheme(target: &str) -> Option<&str> {
+    let bytes = target.as_bytes();
+    if !bytes.first().is_some_and(u8::is_ascii_alphabetic) {
+        return None;
+    }
+    let end = bytes.iter().position(|b| {
+        !(b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    })?;
+    target[end..].strip_prefix("://")
 }
 
 fn view<'b>(h: &httparse::Header<'b>) -> HeaderView<'b> {
@@ -162,11 +248,12 @@ fn view<'b>(h: &httparse::Header<'b>) -> HeaderView<'b> {
 fn host_check<'h>(
     headers: impl Iterator<Item = HeaderView<'h>>,
     version: Version,
-) -> Result<(), u16> {
+) -> Result<Option<&'h [u8]>, u16> {
     let mut hosts = headers.filter(|h| h.name.eq_ignore_ascii_case("host"));
     match (hosts.next(), version) {
         (Some(_), _) if hosts.next().is_some() => Err(400),
-        (Some(_), _) | (None, Version::Http10) => Ok(()),
+        (Some(h), _) => Ok(Some(h.value)),
+        (None, Version::Http10) => Ok(None),
         (None, Version::Http11) => Err(400),
     }
 }
@@ -183,7 +270,7 @@ pub(crate) fn parse_head<'a, 'buf>(
     headers: &'a mut [HeaderView<'buf>; MAX_HEADERS],
 ) -> Result<Option<Head<'a>>, u16> {
     let mut slots = [httparse::EMPTY_HEADER; MAX_HEADERS];
-    let Some((req, _len, version)) = tokenize(buf, &mut slots)? else {
+    let Some((req, _len, version, target)) = tokenize(buf, &mut slots)? else {
         return Ok(None);
     };
     let n = req.headers.len();
@@ -191,10 +278,9 @@ pub(crate) fn parse_head<'a, 'buf>(
         *dst = view(h);
     }
     Ok(Some(Head {
-        // Complete parses always carry method/path; treat absence as malformed
-        // rather than panicking on a tokenizer contract we don't control.
+        // `tokenize` proved both present and screened the target's form.
         method: req.method.ok_or(400u16)?,
-        target: req.path.ok_or(400u16)?,
+        target,
         version,
         headers: &headers[..n],
     }))
@@ -219,7 +305,9 @@ pub(crate) fn method_is_head(mut head: &[u8]) -> bool {
 /// header-index allocation.
 pub(crate) fn frame_facts(buf: &[u8]) -> Result<Option<FrameFacts>, u16> {
     let mut slots = [httparse::EMPTY_HEADER; MAX_HEADERS];
-    let Some((req, len, version)) = tokenize(buf, &mut slots)? else {
+    // The target's form is screened here too: the framer runs first, so a
+    // shape this server does not serve must die before its body is sized.
+    let Some((req, len, version, _target)) = tokenize(buf, &mut slots)? else {
         return Ok(None);
     };
     Ok(Some(FrameFacts {
@@ -603,6 +691,81 @@ mod tests {
             assert_eq!(h10.version, Version::Http10);
             assert!(!h10.keep_alive());
         });
+    }
+
+    /// Which request-target forms an origin server serves.
+    ///
+    /// The codec enforces Host presence and uniqueness because routing is
+    /// Host-based, and then took the target verbatim - so an absolute-form
+    /// request carried a *second* authority that nothing reconciled with the
+    /// first. A front end keyed on one and this server on the other disagree
+    /// about which bucket a request names, and an S3 layer deriving a key
+    /// from the target reads `http:` as its first path segment.
+    #[test]
+    fn request_target_forms() {
+        let status = |buf: &[u8]| {
+            let mut headers = [HeaderView::EMPTY; MAX_HEADERS];
+            parse_head(buf, &mut headers).err()
+        };
+
+        // Origin-form, in every shape a client sends it.
+        for t in ["/", "/b/k", "/b/k?list-type=2", "//evil.example/other"] {
+            let req = format!("GET {t} HTTP/1.1\r\nHost: good\r\n\r\n");
+            complete(req.as_bytes(), |h| {
+                assert_eq!(h.target, t, "origin-form is passed through");
+            });
+        }
+
+        // Absolute-form is accepted (RFC 9112 sec. 3.2.2 requires it) when
+        // its authority agrees with Host - which is how sec. 3.2.1's "use
+        // the host information of the request-target" is honoured without a
+        // second routing key - and is reduced to its path, so a handler sees
+        // one target shape whatever the client sent.
+        for (t, want) in [
+            ("http://good/b/k", "/b/k"),
+            ("https://GOOD/b/k?q=1", "/b/k?q=1"),
+            ("http://good", "/"),
+            ("http://good/", "/"),
+        ] {
+            let req = format!("GET {t} HTTP/1.1\r\nHost: good\r\n\r\n");
+            complete(req.as_bytes(), |h| {
+                assert_eq!(h.target, want, "{t} must reduce to its path");
+            });
+        }
+
+        // The differential itself: two authorities in one request.
+        assert_eq!(
+            status(b"GET http://evil/other HTTP/1.1\r\nHost: good\r\n\r\n"),
+            Some(400),
+            "an absolute-form authority that disagrees with Host must die"
+        );
+        // `userinfo` is forbidden to a sender (RFC 9110 sec. 4.2.1) and falls
+        // out of the same comparison, as does an empty authority.
+        for t in ["http://u@good/k", "http:///k", "http://good:8080/k"] {
+            let req = format!("GET {t} HTTP/1.1\r\nHost: good\r\n\r\n");
+            assert_eq!(status(req.as_bytes()), Some(400), "{t}");
+        }
+
+        // Asterisk-form is a question about the server, and OPTIONS is the
+        // only method that asks one.
+        complete(b"OPTIONS * HTTP/1.1\r\nHost: good\r\n\r\n", |h| {
+            assert_eq!(h.target, "*");
+        });
+        assert_eq!(status(b"GET * HTTP/1.1\r\nHost: good\r\n\r\n"), Some(400));
+
+        // Authority-form belongs to CONNECT and a proxy; this is neither.
+        for line in ["CONNECT evil:443 HTTP/1.1", "GET good:80 HTTP/1.1"] {
+            let req = format!("{line}\r\nHost: good\r\n\r\n");
+            assert_eq!(status(req.as_bytes()), Some(400), "{line}");
+        }
+
+        // The framer screens the same way, so a bad shape dies before its
+        // body is sized rather than after.
+        assert_eq!(
+            frame_facts(b"GET http://evil/k HTTP/1.1\r\nHost: good\r\n\r\n")
+                .err(),
+            Some(400)
+        );
     }
 
     #[test]
