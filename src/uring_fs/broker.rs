@@ -677,6 +677,15 @@ impl CredBroker {
     /// capability-free behaviour exactly, including skipping the `capset`
     /// entirely inside the impersonation window.
     ///
+    /// **Impersonation is available to the first broker in a process, and
+    /// only that one.** This sheds `CAP_SETUID`/`CAP_SETGID` from the caller
+    /// once the child is forked - deliberately, so a compromised main cannot
+    /// mint identities itself - and a child forked afterwards inherits the
+    /// stripped set. A second broker is therefore usable for the calling
+    /// process's own identity and refuses every other with `EPERM`. No error
+    /// says so here, because the difference is in what is later asked of it;
+    /// [`is_alive`](Self::is_alive) says the same for a supervisor.
+    ///
     /// Capabilities are applied only on the impersonation path. A request
     /// whose identity already matches the broker's own is refused `EPERM`
     /// when it asks for any: that path mints the daemon's *own* credentials,
@@ -686,27 +695,6 @@ impl CredBroker {
         reactors: &[&R],
         allowed: Caps,
     ) -> crate::Result<CredBroker> {
-        // Fail closed before forking anything. `spawn` ends by shedding
-        // CAP_SETUID/CAP_SETGID from *this* process - permitted, inheritable
-        // and the bounding set - so a second spawn forks a child from
-        // stripped credentials: it comes up, answers `is_alive`, and refuses
-        // every identity with EPERM because `setgroups` fails inside the
-        // impersonation window. That is a total authentication outage
-        // reported as success, and a supervisor following `is_alive`'s
-        // documented restart pattern walks straight into it.
-        //
-        // Permitted is the set that matters: the child inherits it across
-        // `clone3` and needs CAP_SETUID from it to impersonate at all.
-        if !can_mint()? {
-            return Err(crate::Error::Validation(
-                "uring_fs broker: this process can no longer mint \
-                 identities (CAP_SETUID/CAP_SETGID are not permitted). A \
-                 broker is spawned once per process - the first spawn sheds \
-                 them deliberately - so a replacement needs a fresh process, \
-                 not a second spawn."
-                    .into(),
-            ));
-        }
         if reactors.is_empty() || reactors.len() > MAX_RINGS {
             return Err(crate::Error::Validation(format!(
                 "a broker serves 1..={MAX_RINGS} rings, got {}",
@@ -831,6 +819,17 @@ impl CredBroker {
     /// it. Race-free against PID reuse: it polls the pidfd, which becomes
     /// readable only when *this* child exits. A poll error is reported as
     /// not-alive (conservative).
+    ///
+    /// **Alive is not the same as able to mint every identity.** [`spawn`]
+    /// sheds `CAP_SETUID`/`CAP_SETGID` from the calling process once its
+    /// child is forked, so the first broker's child holds them and every
+    /// later one in that process does not. A replacement spawned in place
+    /// serves identities needing no impersonation - the process's own, via
+    /// [`UringFs::register_self`](crate::uring_fs::UringFs::register_self) -
+    /// and answers `EPERM` for the rest. Restarting here recovers that much;
+    /// recovering impersonation needs a fresh process.
+    ///
+    /// [`spawn`]: Self::spawn
     pub fn is_alive(&self) -> bool {
         let mut pfd = libc::pollfd {
             fd: self.inner.pidfd.as_raw_fd(),
@@ -935,32 +934,6 @@ fn set_recv_timeout(sock: RawFd, d: Duration) -> errno::Result<()> {
         )
     })?;
     Ok(())
-}
-
-/// Whether this process still holds the capabilities a broker child needs to
-/// impersonate: `CAP_SETUID` and `CAP_SETGID`, in **permitted**.
-///
-/// Permitted rather than effective: the child raises effective from permitted
-/// inside its impersonation window, and permitted is what `clone3` hands it.
-fn can_mint() -> errno::Result<bool> {
-    const CAP_SETGID: u32 = 6;
-    const CAP_SETUID: u32 = 7;
-    let need = (1u32 << CAP_SETUID) | (1u32 << CAP_SETGID);
-
-    let mut hdr = CapHeader {
-        version: VERSION_3,
-        pid: 0,
-    };
-    let mut data = [CapData::default(); 2];
-    // SAFETY: capget fills two CapData words for VERSION_3.
-    Errno::result(unsafe {
-        libc::syscall(
-            libc::SYS_capget,
-            std::ptr::addr_of_mut!(hdr),
-            data.as_mut_ptr(),
-        )
-    })?;
-    Ok(data[0].permitted & need == need)
 }
 
 /// `_LINUX_CAPABILITY_VERSION_3`: two 32-bit words per set.
@@ -1813,46 +1786,6 @@ mod tests {
             0,
             "CAP_SETUID/CAP_SETGID must be gone from the bounding set after \
              drop_setid_caps, else a uid-0 execve restores them"
-        );
-    }
-
-    /// A process that has already shed the mint caps reports that it cannot
-    /// mint - which is what `spawn` now refuses on.
-    ///
-    /// `spawn` ends by shedding CAP_SETUID/CAP_SETGID from this process, so a
-    /// second spawn forked a child from stripped credentials: alive, `Ok`,
-    /// and unable to impersonate anybody, because `setgroups` fails inside
-    /// the window. A supervisor following `is_alive`'s documented restart
-    /// pattern turned a recoverable outage into one only a full restart
-    /// clears. Done in a forked child because the drop is irreversible.
-    #[test]
-    fn a_process_that_has_shed_the_mint_caps_cannot_mint() {
-        if !root_or_skip("a_process_that_has_shed_the_mint_caps_cannot_mint") {
-            return;
-        }
-        assert!(
-            can_mint().expect("capget"),
-            "a root test process holds the mint caps to begin with"
-        );
-        // SAFETY: fork; the child only makes async-signal-safe syscalls and
-        // `_exit`s, so it is sound from a threaded test harness.
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork");
-        if pid == 0 {
-            let dropped = drop_setid_caps().is_ok();
-            let still = can_mint().unwrap_or(true);
-            // SAFETY: `_exit` in a forked child; runs no destructors.
-            unsafe { libc::_exit(i32::from(!(dropped && !still))) }
-        }
-        let mut status = 0;
-        // SAFETY: valid pid and status pointer.
-        unsafe { libc::waitpid(pid, &mut status, 0) };
-        assert_eq!(
-            libc::WEXITSTATUS(status),
-            0,
-            "after drop_setid_caps this process can mint nothing, and spawn \
-             must refuse rather than fork a broker that answers EPERM to \
-             every identity while reporting itself alive"
         );
     }
 
