@@ -316,9 +316,17 @@ impl Drop for BrokerInner {
     fn drop(&mut self) {
         // Dropping the last `CredBroker`: no more requests will come, so kill
         // and reap the broker. `SIGKILL` via the pidfd is PID-reuse-safe and
-        // uncatchable, so a wedged broker cannot linger holding `CAP_SETUID`;
-        // the `waitpid` clears the zombie (`exit_signal == 0` means nothing
-        // auto-reaps it). `ECHILD` (already reaped, e.g. by a consumer's
+        // uncatchable, so a wedged broker cannot linger holding `CAP_SETUID`.
+        //
+        // `__WALL` is load-bearing. `clone3_fork(0, 0, ..)` gives the child
+        // `exit_signal == 0`, which makes it a "clone child" to
+        // `eligible_child` (`kernel/exit.c:1163`): with neither `__WALL` nor
+        // `__WCLONE`, `waitpid` answers `-1 ECHILD` immediately and the
+        // zombie stays for the host process's life. Nothing else reaps it
+        // either - that is the same `exit_signal == 0` at work, since no
+        // `SIGCHLD` is delivered to hang a handler off. `mount/idmap.rs`
+        // passes `SIGCHLD` and needs no flag; this is the other call site of
+        // the same helper. `ECHILD` (already reaped, e.g. by a consumer's
         // wildcard reaper) or any non-`EINTR` error ends the loop.
         // SAFETY: `pidfd_send_signal` on our owned pidfd; NULL siginfo / 0
         // flags per the man page.
@@ -333,7 +341,7 @@ impl Drop for BrokerInner {
         }
         // SAFETY: waitpid on our child pid; a NULL status pointer is allowed.
         let _ = retry_on_eintr(|| unsafe {
-            libc::waitpid(self.pid, std::ptr::null_mut(), 0)
+            libc::waitpid(self.pid, std::ptr::null_mut(), libc::__WALL)
         });
         // `pidfd` and `sock` (OwnedFd) close after this body.
     }

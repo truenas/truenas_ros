@@ -3221,3 +3221,209 @@ fn a_stalled_transfer_still_dies_by_the_request_clock() {
         return; // io_uring unavailable here
     };
 }
+
+/// A streamed body between windows is a message in progress, not an idle
+/// connection - so it carries `request_timeout` and arms `max_receipt_time`.
+///
+/// The reactor cannot tell the two apart on its own: a streaming codec
+/// consumes each window as its own message, so at a chunk boundary (and
+/// after the head has gone out as `Stage::Open`) the accumulate buffer is
+/// empty, which is exactly what "parked for the next request" looks like.
+/// `Framing::MoreInMessage` is the framer saying otherwise.
+///
+/// The negative control is the configuration: `idle_timeout` is deliberately
+/// unset here, so if the read is misclassified as idle it carries **no
+/// clock at all** and the peer holds its pool slot - taken at accept, before
+/// any authentication - forever. Reverting `known_step`/`stream_step`/
+/// `scan_step` to plain `More` hangs this test rather than failing it fast,
+/// which is the shape of the denial it guards.
+#[test]
+fn a_stalled_streamed_upload_is_reaped_mid_body() {
+    use std::sync::{Arc, Mutex};
+    use truenas_ros::http::{HttpConn, HttpVerdict, Stage, protocol_streaming};
+    use truenas_ros::net::CloseReason;
+    use truenas_ros::net::server::ServerConfig;
+
+    for (what, trailer) in [
+        // Stall the moment the head has been delivered: the framer is in
+        // `StreamOpen` -> `StreamBody` with nothing buffered.
+        ("after the head", None),
+        // Stall at a chunk boundary, the CRLF after the payload withheld so
+        // the buffer is empty there too.
+        ("after one full window", Some(128 * 1024usize)),
+    ] {
+        let reasons = Arc::new(Mutex::new(Vec::new()));
+        let cfg = ServerConfig {
+            request_timeout: Some(Duration::from_millis(300)),
+            max_receipt_time: Some(Duration::from_millis(900)),
+            idle_timeout: None, // the control: nothing else can reap this
+            ..ServerConfig::default()
+        };
+        let addr =
+            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let proto = protocol_streaming(
+            HttpConfig::default(),
+            1 << 30,
+            |_inc: Incoming<'_>| Some(()),
+            |req: HttpRequest<'_>, _s: &mut ()| match req.stage {
+                Stage::End => HttpVerdict::Respond(HttpResponse::new(200)),
+                Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
+                _ => HttpVerdict::Continue,
+            },
+        )
+        .expect("codec config is valid");
+        let mut server = match Server::with_config([addr], cfg, proto) {
+            Ok(s) => s,
+            Err(e) if should_skip(&e) => return,
+            Err(e) => panic!("bind: {e}"),
+        };
+        {
+            let reasons = Arc::clone(&reasons);
+            server.set_close_hook(move |_a, reason, _s: &mut HttpConn<()>| {
+                reasons.lock().unwrap().push(reason);
+            });
+        }
+        let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+            panic!("expected Tcp");
+        };
+        let stop = server.shutdown_handle();
+        let join = thread::spawn(move || {
+            let _stop = ShutdownOnDrop(stop.clone());
+            let r = (|| -> io::Result<()> {
+                let mut s = connect_tcp(v4)?;
+                s.write_all(
+                    b"PUT /o HTTP/1.1\r\nHost: t\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )?;
+                s.flush()?;
+                if let Some(n) = trailer {
+                    s.write_all(format!("{n:x}\r\n").as_bytes())?;
+                    s.write_all(&vec![b'A'; n])?;
+                    s.flush()?; // no closing CRLF: the buffer drains empty
+                }
+                // Now stall. Only the server closing ends this read.
+                s.set_read_timeout(Some(Duration::from_secs(8)))?;
+                let mut b = [0u8; 64];
+                match s.read(&mut b) {
+                    Ok(0) => Ok(()),
+                    Ok(n) => panic!(
+                        "answered {n} bytes to a stalled upload: {:?}",
+                        String::from_utf8_lossy(&b[..n.min(64)])
+                    ),
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                        Ok(())
+                    }
+                    Err(e) => panic!(
+                        "{what}: the server never reclaimed the slot: {e}"
+                    ),
+                }
+            })();
+            stop.shutdown();
+            r
+        });
+        server.serve_forever().expect("serve_forever");
+        join.join().expect("client thread").expect("client io");
+        let got = reasons.lock().unwrap().clone();
+        assert_eq!(
+            got.as_slice(),
+            &[CloseReason::RequestTimeout],
+            "{what}: a stalled streamed body must read as RequestTimeout - \
+             IdleTimeout would mean the read took the wrong clock, and \
+             nothing at all means it took none"
+        );
+    }
+}
+
+/// The receipt budget reaches a streamed window: a peer pacing one window
+/// slower than `max_receipt_time` is reclaimed even though it satisfies
+/// `request_timeout` throughout.
+///
+/// This is the property that separates the two clocks
+/// (`ServerConfig::max_receipt_time`), on the framing where the floor the
+/// config documents - one window over the budget - actually has to hold.
+///
+/// Not a control for `Framing::MoreInMessage`: the chunk-size line leaves
+/// bytes buffered, so this arm would find the budget armed either way. The
+/// stall above is the case that needs the framer's verdict.
+#[test]
+fn a_streamed_window_paced_under_the_floor_is_reclaimed() {
+    use std::sync::{Arc, Mutex};
+    use truenas_ros::http::{HttpConn, HttpVerdict, Stage, protocol_streaming};
+    use truenas_ros::net::CloseReason;
+    use truenas_ros::net::server::ServerConfig;
+
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let cfg = ServerConfig {
+        request_timeout: Some(Duration::from_millis(300)),
+        max_receipt_time: Some(Duration::from_millis(800)),
+        idle_timeout: None,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = protocol_streaming(
+        HttpConfig::default(),
+        1 << 30,
+        |_inc: Incoming<'_>| Some(()),
+        |req: HttpRequest<'_>, _s: &mut ()| match req.stage {
+            Stage::End => HttpVerdict::Respond(HttpResponse::new(200)),
+            Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
+            _ => HttpVerdict::Continue,
+        },
+    )
+    .expect("codec config is valid");
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    {
+        let reasons = Arc::clone(&reasons);
+        server.set_close_hook(move |_a, reason, _s: &mut HttpConn<()>| {
+            reasons.lock().unwrap().push(reason);
+        });
+    }
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let join = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            s.write_all(
+                b"PUT /o HTTP/1.1\r\nHost: t\r\n\
+                  Transfer-Encoding: chunked\r\n\r\n",
+            )?;
+            // A chunk far larger than one window, then one byte per 150 ms --
+            // half `request_timeout`, so that clock is satisfied throughout
+            // while the window needs hours.
+            s.write_all(b"40000\r\n")?;
+            s.flush()?;
+            for _ in 0..40 {
+                if s.write_all(b"A").is_err() || s.flush().is_err() {
+                    break; // the server closed under us, which is the point
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+            s.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut b = [0u8; 64];
+            match s.read(&mut b) {
+                Ok(0) => Ok(()),
+                Ok(n) => panic!("answered {n} bytes to a trickling window"),
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => Ok(()),
+                Err(e) => panic!("the server never reclaimed the slot: {e}"),
+            }
+        })();
+        stop.shutdown();
+        r
+    });
+    server.serve_forever().expect("serve_forever");
+    join.join().expect("client thread").expect("client io");
+    assert_eq!(
+        reasons.lock().unwrap().as_slice(),
+        &[CloseReason::ReceiptTimeout],
+        "a window paced under the floor must read as ReceiptTimeout - \
+         RequestTimeout would mean the inactivity guard caught it and the \
+         budget never armed"
+    );
+}

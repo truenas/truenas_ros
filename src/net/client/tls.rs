@@ -21,7 +21,12 @@ use crate::uring::sys::*;
 use crate::uring::wake::LoopShared;
 use std::os::fd::RawFd;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, mpsc};
+// `Arc` from `crate::sync`, matching `LoopShared`'s own: under `--cfg loom`
+// the engine hands out loom's, and `std`'s is a distinct type - which is
+// what kept `--cfg loom` + `net-client` (and so `--all-features`) from
+// compiling at all.
+use crate::sync::Arc;
+use std::sync::mpsc;
 
 /// The client kTLS handshake handler ([`Client::set_tls_handshake`]):
 /// `(furnished_fd, context, deferral)`, once per `tls` connect after its TCP

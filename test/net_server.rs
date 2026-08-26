@@ -11129,3 +11129,359 @@ fn an_exact_read_over_the_pool_buffer_takes_an_owned_one() {
         "the pool settles back to nothing lent: {s:?}"
     );
 }
+
+/// A redelivery must not be handed the *read-ahead* frame.
+///
+/// `Deferred::redeliver` documents that the handler runs again "with an
+/// empty frame (the original bytes were consumed at first delivery)".
+/// Nothing enforced it. Above the default read-ahead cap the pump can have
+/// framed the next pipelined request already - `set_frame(header_len,
+/// body_len)` recorded, its body still in flight - and the redelivery then
+/// built that message's `Body` out of a buffer holding only its header:
+/// `Body::inline(&rest[..body_len])` with `rest` empty, an out-of-range
+/// slice that panics the reactor thread and takes `serve_forever` with it.
+/// Bounds checks ship, so release panicked too.
+///
+/// Even short of the panic the state was wrong: `deliver_one`'s epilogue
+/// drains `frame_len().min(buffered)`, so a foreign frame ate the next
+/// request's header and desynced the stream.
+///
+/// The in-tree http codec never reaches this (`Phase::Parked` holds
+/// pipelined bytes unframed), so the control has to be a framer that does
+/// what `Protocol::header` allows: frame whatever is buffered.
+#[test]
+fn a_redelivery_does_not_take_the_read_ahead_frame() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let cfg = ServerConfig {
+        // Read-ahead is the precondition: at the default cap of one the pump
+        // stops while the first request is outstanding and never frames the
+        // second.
+        max_in_flight_requests: 2,
+        ..ServerConfig::default()
+    };
+    let seen = Arc::new(AtomicUsize::new(0));
+    let seen2 = Arc::clone(&seen);
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |req: Request<'_, ()>| {
+            let nth = seen2.fetch_add(1, Ordering::SeqCst);
+            match nth {
+                // The first request parks, and is answered off-thread by a
+                // redelivery long enough afterwards for the peer's second
+                // request head to have landed and been framed.
+                0 => {
+                    let (deferred, permit) = req.responder.defer();
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(150));
+                        deferred.redeliver();
+                    });
+                    Response::Defer(permit)
+                }
+                // The redelivery: an empty frame, whatever the pump has
+                // recorded for the request behind it.
+                1 => {
+                    assert!(
+                        req.body.is_empty(),
+                        "a redelivery must see an empty frame, got {} bytes",
+                        req.body.len()
+                    );
+                    Response::Reply(echo_frame(b"first"))
+                }
+                // The pipelined request, delivered from its own frame once
+                // its body arrives - intact, not short a header.
+                _ => Response::Reply(echo_frame(&req.body)),
+            }
+        },
+    };
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            send_framed(&mut s, b"A")?;
+            thread::sleep(Duration::from_millis(50));
+            // The second request's *header* only: the pump frames it and
+            // arms an exact read for a body that has not been sent.
+            s.write_all(&8u32.to_be_bytes())?;
+            s.flush()?;
+            thread::sleep(Duration::from_millis(250)); // the redelivery lands
+            s.write_all(b"BBBBBBBB")?;
+            s.flush()?;
+            assert_eq!(recv_framed(&mut s)?, b"first");
+            assert_eq!(recv_framed(&mut s)?, b"BBBBBBBB");
+            Ok(())
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join").expect("client io");
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        3,
+        "park, redelivery, pipelined"
+    );
+}
+
+/// A redelivery must not retire the receipt budget of the message behind it.
+///
+/// The budget belongs to whatever is *arriving*. A redelivered request was
+/// consumed - and its own budget retired - at its first delivery, so the
+/// only budget armed when a worker's `redeliver` lands belongs to a later
+/// message the read-ahead has begun. Cancelling it there restarts the one
+/// bound `max_receipt_time` exists to make un-restartable, and when the
+/// next read is already in flight (an exact body read) nothing re-arms it
+/// at all: the trickling peer is then never reclaimed.
+///
+/// The trickle is half `request_timeout`, so that clock is satisfied
+/// throughout and the close reason names which one fired.
+#[test]
+fn a_redelivery_does_not_retire_the_next_message_budget() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let cfg = ServerConfig {
+        request_timeout: Some(Duration::from_millis(300)),
+        max_receipt_time: Some(Duration::from_millis(900)),
+        max_in_flight_requests: 2,
+        ..ServerConfig::default()
+    };
+    let seen = Arc::new(AtomicUsize::new(0));
+    let seen2 = Arc::clone(&seen);
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |req: Request<'_, ()>| {
+            if seen2.fetch_add(1, Ordering::SeqCst) == 0 {
+                let (deferred, permit) = req.responder.defer();
+                thread::spawn(move || {
+                    // After the second request's budget is armed and its
+                    // exact body read is in flight.
+                    thread::sleep(Duration::from_millis(400));
+                    deferred.redeliver();
+                });
+                return Response::Defer(permit);
+            }
+            Response::Reply(echo_frame(b"ok"))
+        },
+    };
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    {
+        let reasons = Arc::clone(&reasons);
+        server.set_close_hook(move |_addr, reason, _state: &mut ()| {
+            reasons.lock().unwrap().push(reason);
+        });
+    }
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            send_framed(&mut s, b"A")?;
+            thread::sleep(Duration::from_millis(50));
+            s.write_all(&40u32.to_be_bytes())?;
+            s.flush()?;
+            for _ in 0..40 {
+                if s.write_all(b"B").is_err() || s.flush().is_err() {
+                    break; // closed under us, which is the point
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+            // The redelivery's own reply rides out while the second request
+            // is still trickling; drain to EOF rather than asserting the
+            // connection was silent.
+            s.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut sink = [0u8; 256];
+            loop {
+                match s.read(&mut sink) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                        break;
+                    }
+                    Err(e) => panic!("the server never closed: {e}"),
+                }
+            }
+            Ok(())
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join").expect("client io");
+    assert_eq!(
+        reasons.lock().unwrap().as_slice(),
+        &[CloseReason::ReceiptTimeout],
+        "the pipelined request's budget must survive the redelivery - \
+         nothing at all means the redelivery retired it and no later read \
+         re-armed one"
+    );
+}
+
+/// The receipt budget covers a spliced body, in both directions.
+///
+/// `arm_receipt_deadline` is reachable only from `submit_recv`, which a
+/// `Framing::SpliceBody` body never enters, so the one clock that progress
+/// cannot restart did not reach the splice path at all - the two that do
+/// (`request_timeout` on the readiness poll, the kTLS watchdog) are both
+/// inactivity bounds any arriving byte re-arms. And where a multi-read
+/// header had armed one, nothing retired it: there is no `deliver_one` on
+/// this path, so the budget outlived the message it belonged to and reaped
+/// a connection that had transferred its body on time.
+///
+/// Both halves on the plain-TCP splice, which is the same code as the kTLS
+/// one up to the blocking-vs-poll difference (see `submit_splice_recv`).
+#[test]
+fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
+    use std::sync::Mutex;
+    for (what, trickle) in [("a healthy body", false), ("a trickle", true)] {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe(2)` fills the two-element array with {read, write}.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let (pipe_rd, pipe_wr) = (fds[0], fds[1]);
+
+        let reasons = Arc::new(Mutex::new(Vec::new()));
+        let cfg = ServerConfig {
+            request_timeout: Some(Duration::from_millis(300)),
+            max_receipt_time: Some(Duration::from_millis(700)),
+            // Unset, so a connection that has finished its message and gone
+            // quiet has no other clock that could reap it: the healthy case
+            // fails loudly if the budget is still armed.
+            idle_timeout: None,
+            ..ServerConfig::default()
+        };
+        let addr =
+            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let proto = Protocol {
+            accept: |_: Incoming<'_>| Some(()),
+            header: splice_header(pipe_wr),
+            body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
+        };
+        let mut server = match Server::with_config([addr], cfg, proto) {
+            Ok(s) => s,
+            Err(e) if should_skip(&e) => {
+                // SAFETY: closing the test-owned pipe fds on the skip path.
+                unsafe {
+                    libc::close(pipe_rd);
+                    libc::close(pipe_wr);
+                }
+                return;
+            }
+            Err(e) => panic!("bind: {e}"),
+        };
+        {
+            let reasons = Arc::clone(&reasons);
+            server.set_close_hook(move |_addr, reason, _state: &mut ()| {
+                reasons.lock().unwrap().push(reason);
+            });
+        }
+        let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+            panic!("expected Tcp");
+        };
+        let stop = server.shutdown_handle();
+
+        // 64 bytes: well inside a pipe's capacity, so no reader is needed
+        // and nothing here can block on backpressure.
+        const BODY: usize = 64;
+        let client = thread::spawn(move || {
+            let _stop = ShutdownOnDrop(stop.clone());
+            let r = (|| -> io::Result<()> {
+                let mut s = connect_tcp(v4)?;
+                let mut hdr = vec![b'S'];
+                hdr.extend_from_slice(&(BODY as u32).to_be_bytes());
+                s.write_all(&hdr)?;
+                s.flush()?;
+                if trickle {
+                    // One byte per 150 ms - half `request_timeout`, so the
+                    // readiness poll is re-armed on every byte and never
+                    // fires, while the body needs 9.6 s against a 700 ms
+                    // budget.
+                    for _ in 0..BODY {
+                        if s.write_all(b"x").is_err() || s.flush().is_err() {
+                            break; // reaped under us, which is the point
+                        }
+                        thread::sleep(Duration::from_millis(150));
+                    }
+                } else {
+                    s.write_all(&[b'x'; BODY])?;
+                    s.flush()?;
+                    // The message is over. Stay quiet for longer than the
+                    // budget: a budget left armed reaps this connection.
+                    thread::sleep(Duration::from_millis(1200));
+                    // Still alive? Then the framing survived too.
+                    splice_frame(&mut s, b'C', b"ping")?;
+                    assert_eq!(recv_framed(&mut s)?, b"ping");
+                    return Ok(());
+                }
+                let mut sink = [0u8; 64];
+                s.set_read_timeout(Some(Duration::from_secs(5)))?;
+                match s.read(&mut sink) {
+                    Ok(0) => Ok(()),
+                    Ok(n) => panic!("answered {n} bytes to a trickled body"),
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                        Ok(())
+                    }
+                    Err(e) => panic!("the slot was never reclaimed: {e}"),
+                }
+            })();
+            stop.shutdown();
+            r
+        });
+
+        server.serve_forever().expect("serve_forever");
+        // SAFETY: the test owns both ends; the server never closes `pipe_wr`.
+        unsafe {
+            libc::close(pipe_wr);
+            libc::close(pipe_rd);
+        }
+        client.join().expect("thread join").expect("client io");
+        let got = reasons.lock().unwrap().clone();
+        if trickle {
+            assert_eq!(
+                got.as_slice(),
+                &[CloseReason::ReceiptTimeout],
+                "{what}: a spliced body under the floor must read as \
+                 ReceiptTimeout - nothing at all means the budget never \
+                 armed, since no other clock on this path is a total bound"
+            );
+        } else {
+            assert_eq!(
+                got.as_slice(),
+                &[CloseReason::PeerClosed],
+                "{what}: the budget must be retired when the body completes \
+                 - ReceiptTimeout here is a healthy connection reaped for \
+                 having finished on time"
+            );
+        }
+    }
+}

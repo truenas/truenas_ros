@@ -12,7 +12,7 @@ use crate::uring::wake::{LoopShared, WakeHandle};
 // `LoopShared` is loom-modelled (see `src/uring/wake.rs`), so the engine
 // builds it from `crate::sync` - std's outside `--cfg loom`.
 use crate::sync::Arc;
-use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU64};
 
 /// Longest chain [`Engine::stage_chain`] will stage. A cap rather than an
 /// open-ended count because every link is one more SQE that must be staged
@@ -245,7 +245,7 @@ impl Engine {
     }
 
     pub(crate) fn stopping(&self) -> bool {
-        self.shared.stop.load(Ordering::Acquire)
+        self.shared.stop_requested()
     }
 
     /// Rewind SQE staging and the in-flight count, so a staging-only test can

@@ -46,8 +46,18 @@ use super::response::{
 pub struct HttpRequest<'a> {
     /// Request method, verbatim (methods are case-sensitive tokens).
     pub method: &'a str,
-    /// Request-target, verbatim and undecoded (S3 keys percent-decode at the
-    /// S3 layer, where encoding is semantically load-bearing).
+    /// Request-target in **origin form** (`/path?query`), undecoded - S3 keys
+    /// percent-decode at the S3 layer, where encoding is semantically
+    /// load-bearing.
+    ///
+    /// One shape, whatever the client sent. Absolute-form is accepted (RFC
+    /// 9112 sec. 3.2.2 requires an origin server to) only when its authority
+    /// matches `Host`, and is reduced to its path here; asterisk-form
+    /// survives as `*`, and only for `OPTIONS`; every other form is answered
+    /// 400 before a handler runs. So this never carries a second authority
+    /// for a consumer to reconcile - but note that `//host/path` is ordinary
+    /// origin-form and reaches a handler verbatim, so a consumer re-parsing
+    /// this as a URI *reference* must not read that as an authority.
     pub target: &'a str,
     /// Protocol version (1.0 or 1.1; anything else died with 505).
     pub version: Version,

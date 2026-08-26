@@ -124,14 +124,30 @@ jobs:
     # which their doc comments call out as making them bounded rather than
     # exhaustive proofs. cfg(loom) is registered in Cargo.toml's [lints.rust].
     #
-    # Three invocations because the models span three feature sets: the SQ/CQ
-    # ring model needs only the shared engine, the pool/offload/inject ones need
-    # the fs reactor, and the parked-reply hand-off model needs the http glue.
+    # One invocation, at --all-features: it used to be three because
+    # `--cfg loom` + `net-client` did not compile (a `std::sync::Arc` where
+    # the engine hands out loom's), so the models had to be run in the
+    # feature subsets that avoided it - by accident, not by design.
+    #
+    # The count is asserted, not the exit code. A libtest filter that matches
+    # nothing exits 0, so a mistyped `--cfg looom`, a renamed `loom_` prefix
+    # or a deleted model would all read as a green lane. Bump MODELS when you
+    # add one.
     - name: loom (concurrency models)
       run: |
-        RUSTFLAGS="--cfg loom" cargo test --lib --features uring    loom_
-        RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
-        RUSTFLAGS="--cfg loom" cargo test --lib --features http     loom_
+        MODELS=18
+        out=$(RUSTFLAGS="--cfg loom" cargo test --lib --all-features loom_ 2>&1)
+        echo "$out"
+        n=$(printf '%s' "$out" |
+            sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | head -1)
+        if [ -z "$n" ]; then
+          echo "::error::loom lane produced no 'test result: ok. N passed'"
+          exit 1
+        fi
+        if [ "$n" -lt "$MODELS" ]; then
+          echo "::error::loom ran $n models, expected at least $MODELS"
+          exit 1
+        fi
 
     # The fuzz crate is self-rooted (its own workspace), so nothing above ever
     # compiles it — a target could bit-rot against an API change and no one
@@ -179,14 +195,21 @@ jobs:
     # `--all-features` clippy above can never see it. `-D warnings` after `--`
     # binds to this crate alone, so a warning in a dependency is not our build
     # failure.
+    #
+    # `--all-targets`, because the tests and examples are where a feature gate
+    # is most often missed and the only lane that built them was
+    # `--all-features` - so `cargo test` at DEFAULT features did not compile
+    # (an unregistered example reaching for `truenas_ros::http`) and nothing
+    # here said so. It costs one compile per entry, same as before.
     - name: feature-matrix (deny warnings)
       run: |
-        cargo clippy --no-default-features -- -D warnings
+        cargo clippy --no-default-features --all-targets -- -D warnings
         for f in sync-fs xattr mount acl fhandle fsiter idmap shutil \
                  configfile audit secrets signal uring net-core net-server \
                  net-client uring-fs http __fuzz; do
           echo "::group::clippy --features $f"
-          cargo clippy --no-default-features --features "$f" -- -D warnings
+          cargo clippy --no-default-features --features "$f" \
+            --all-targets -- -D warnings
           echo "::endgroup::"
         done
         # Pairs. An `any(a, b)` gate needs no pair - a single-feature build
@@ -204,7 +227,8 @@ jobs:
         for p in net-server,uring-fs net-client,uring-fs \
                  net-server,net-client http,uring-fs; do
           echo "::group::clippy --features $p"
-          cargo clippy --no-default-features --features "$p" -- -D warnings
+          cargo clippy --no-default-features --features "$p" \
+            --all-targets -- -D warnings
           echo "::endgroup::"
         done
         cargo clippy --all-features -- -D warnings

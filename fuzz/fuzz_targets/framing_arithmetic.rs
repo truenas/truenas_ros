@@ -19,9 +19,10 @@ fuzz_target!(|input: (u8, u64, u64, u64, u64, Option<u64>)| {
     let (sel, a, b, buffered, max_request_bytes, threshold) = input;
     // u64 == usize here (64-bit), so the full range — including the overflow
     // edges — is reachable.
-    let verdict = match sel % 5 {
+    let verdict = match sel % 6 {
         0 => Framing::Need(a as usize),
         1 => Framing::More,
+        4 => Framing::MoreInMessage,
         2 => Framing::Complete {
             header_len: a as usize,
             body_len: b as usize,
@@ -91,8 +92,17 @@ fuzz_target!(|input: (u8, u64, u64, u64, u64, Option<u64>)| {
                 );
             }
         }
-        FrameStep::ReadHeader { want, exact } => {
+        FrameStep::ReadHeader {
+            want,
+            exact,
+            in_message,
+        } => {
             assert!(want > 0, "ReadHeader: zero want");
+            // Only `MoreInMessage` sets it, and that verdict is never exact.
+            assert!(
+                !(exact && in_message),
+                "ReadHeader: an exact read cannot come from MoreInMessage"
+            );
             if exact {
                 // From Need(n): n > 0 and buffered + n <= cap.
                 let after = buffered

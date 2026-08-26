@@ -420,7 +420,7 @@ where
         // Ensure no op is in flight before the buffers and ring are freed; if
         // the drain fails, leak the buffers rather than free them under a
         // still-live op.
-        self.core.drain_or_leak();
+        self.core.drain_or_leak(&mut |_| {});
     }
 }
 

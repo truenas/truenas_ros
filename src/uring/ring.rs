@@ -30,6 +30,25 @@ use loom::sync::atomic::{AtomicU32, Ordering};
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// Acquire-load one of the ring's shared index words.
+///
+/// A function, and one spelling of the ordering, so the loom model drives
+/// *this* load rather than its own copy of the pairing. A model with its own
+/// copy checks the memory model rather than the code: it stays green with
+/// the shipping ordering weakened to `Relaxed`, which is the whole point of
+/// not having one (`bufring::publish_tail` says the same).
+#[inline]
+fn load_acquire(cell: &AtomicU32) -> u32 {
+    cell.load(Ordering::Acquire)
+}
+
+/// Release-store one of the ring's shared index words, publishing whatever
+/// the entry it names was filled with. See [`load_acquire`].
+#[inline]
+fn store_release(cell: &AtomicU32, v: u32) {
+    cell.store(v, Ordering::Release)
+}
+
 /// The kernel-shared SQ/CQ state: the four index words plus the SQE/CQE arrays.
 ///
 /// This is the single home of the acquire/release discipline. The user-side
@@ -146,48 +165,78 @@ impl SqCqRings {
         }
     }
 
+    // The four kernel-shared index words. A raw pointer into the mmap in a
+    // real ring, an owned atomic in a model - the `cfg` picks the *cell*,
+    // and nothing else, so the orderings below have one spelling each.
+    #[inline]
+    fn sq_khead(&self) -> &AtomicU32 {
+        #[cfg(not(loom))]
+        // SAFETY: points to the kernel-shared SQ head word, mapped for the
+        // ring's life.
+        unsafe {
+            &*self.sq_khead
+        }
+        #[cfg(loom)]
+        &self.sq_khead
+    }
+
+    #[inline]
+    fn sq_ktail(&self) -> &AtomicU32 {
+        #[cfg(not(loom))]
+        // SAFETY: as `sq_khead`, for the SQ tail word.
+        unsafe {
+            &*self.sq_ktail
+        }
+        #[cfg(loom)]
+        &self.sq_ktail
+    }
+
+    #[inline]
+    fn cq_khead(&self) -> &AtomicU32 {
+        #[cfg(not(loom))]
+        // SAFETY: as `sq_khead`, for the CQ head word.
+        unsafe {
+            &*self.cq_khead
+        }
+        #[cfg(loom)]
+        &self.cq_khead
+    }
+
+    #[inline]
+    fn cq_ktail(&self) -> &AtomicU32 {
+        #[cfg(not(loom))]
+        // SAFETY: as `sq_khead`, for the CQ tail word.
+        unsafe {
+            &*self.cq_ktail
+        }
+        #[cfg(loom)]
+        &self.cq_ktail
+    }
+
     // ---- user side (the real submit/reap discipline) -------------------
 
     /// Acquire-load the kernel-advanced SQ consumer head.
     #[inline]
     fn sq_head_acquire(&self) -> u32 {
-        #[cfg(not(loom))]
-        // SAFETY: `sq_khead` points to the kernel-shared SQ head word.
-        let v = unsafe { &*self.sq_khead }.load(Ordering::Acquire);
-        #[cfg(loom)]
-        let v = self.sq_khead.load(Ordering::Acquire);
-        v
+        load_acquire(self.sq_khead())
     }
 
     /// Release-store the producer SQ tail, publishing the SQEs filled below it.
     #[inline]
     fn publish_sq_tail(&self, tail: u32) {
-        #[cfg(not(loom))]
-        // SAFETY: `sq_ktail` points to the kernel-shared SQ tail word.
-        unsafe { &*self.sq_ktail }.store(tail, Ordering::Release);
-        #[cfg(loom)]
-        self.sq_ktail.store(tail, Ordering::Release);
+        store_release(self.sq_ktail(), tail);
     }
 
     /// Acquire-load the kernel-advanced CQ producer tail.
     #[inline]
     fn cq_tail_acquire(&self) -> u32 {
-        #[cfg(not(loom))]
-        // SAFETY: `cq_ktail` points to the kernel-shared CQ tail word.
-        let v = unsafe { &*self.cq_ktail }.load(Ordering::Acquire);
-        #[cfg(loom)]
-        let v = self.cq_ktail.load(Ordering::Acquire);
-        v
+        load_acquire(self.cq_ktail())
     }
 
     /// Release-store the consumer CQ head, freeing the slot for kernel reuse.
     #[inline]
     fn publish_cq_head(&self, head: u32) {
-        #[cfg(not(loom))]
-        // SAFETY: `cq_khead` points to the kernel-shared CQ head word.
-        unsafe { &*self.cq_khead }.store(head, Ordering::Release);
-        #[cfg(loom)]
-        self.cq_khead.store(head, Ordering::Release);
+        store_release(self.cq_khead(), head);
     }
 
     /// Reserve the SQE slot for producer position `sq_tail`, or `None` if the SQ
@@ -549,19 +598,49 @@ impl Ring {
         &mut self,
         min_complete: u32,
     ) -> errno::Result<()> {
+        // A SHORT submit skips the wait entirely. `io_uring_enter` runs
+        // `io_submit_sqes` and then
+        // `if (ret != to_submit) { mutex_unlock(..); goto out; }`
+        // (`io_uring/io_uring.c:3571-3574`), which jumps past the whole
+        // `IORING_ENTER_GETEVENTS` block - so it returns the count submitted
+        // having waited for nothing, and having flushed no CQ overflow
+        // backlog either. Both reap-to-zero loops built on this treat a
+        // return as "at least `min_complete` completions are available" and
+        // spin at 100% CPU when it is not. Submit to empty first, then enter
+        // once more purely to wait.
+        while self.to_submit > 0 {
+            match io_uring_enter(
+                self.raw_fd(),
+                self.to_submit,
+                min_complete,
+                IORING_ENTER_GETEVENTS,
+            ) {
+                // Nothing accepted and no error: the SQ is not draining, so
+                // spinning here would not help. Leave the rest staged.
+                Ok(0) => return Ok(()),
+                Ok(n) if n >= self.to_submit => {
+                    self.to_submit = 0;
+                    return Ok(()); // full submit: the wait above happened
+                }
+                Ok(n) => self.to_submit -= n,
+                // CQ overflow/backpressure: the SQEs stay staged. Returning
+                // lets the caller reap (which frees CQ space) and retry on
+                // the next tick.
+                Err(Errno::EBUSY | Errno::EAGAIN) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+        // Nothing staged (or the loop drained it short of a full submit):
+        // enter for the wait alone.
         match io_uring_enter(
             self.raw_fd(),
-            self.to_submit,
+            0,
             min_complete,
             IORING_ENTER_GETEVENTS,
         ) {
-            Ok(n) => self.to_submit -= n.min(self.to_submit),
-            // CQ overflow/backpressure: the SQEs stay staged. Returning lets the
-            // caller reap (which frees CQ space) and retry on the next tick.
-            Err(Errno::EBUSY | Errno::EAGAIN) => {}
-            Err(e) => return Err(e),
+            Ok(_) | Err(Errno::EBUSY | Errno::EAGAIN) => Ok(()),
+            Err(e) => Err(e),
         }
-        Ok(())
     }
 
     /// Read back a staged (not yet submitted) SQE, for tests that assert on the
@@ -740,6 +819,71 @@ mod tests {
             Ok(cqe.user_data)
         });
         assert_eq!(worker.join().unwrap().expect("ring io"), 0x5eed);
+    }
+
+    /// `submit_and_wait(n)` must return only once `n` completions are
+    /// there to reap - both when it submits and when it only waits.
+    ///
+    /// A SHORT submit skips the wait entirely: `io_uring_enter` runs
+    /// `io_submit_sqes` and then
+    /// `if (ret != to_submit) { mutex_unlock(..); goto out; }`
+    /// (`io_uring/io_uring.c:3571-3574`), jumping past the whole
+    /// `IORING_ENTER_GETEVENTS` block. Both reap-to-zero loops built on this
+    /// read a return as "the completions are available" and spin at 100% CPU
+    /// when they are not, so the wait has to be entered separately once the
+    /// SQ is empty.
+    #[test]
+    fn submit_and_wait_returns_with_what_it_waited_for() {
+        let Some(setup) = setup_or_skip(8) else {
+            return;
+        };
+        let mut ring = Ring::from_setup(setup).expect("map");
+        for i in 0..4u64 {
+            ring.push_sqe(|sqe| {
+                sqe.opcode = IORING_OP_NOP;
+                sqe.user_data = 0x100 + i;
+            })
+            .expect("stage");
+        }
+        ring.submit_and_wait(4).expect("submit_and_wait");
+        let mut got: Vec<u64> = (0..4)
+            .map(|k| {
+                ring.reap()
+                    .unwrap_or_else(|| {
+                        panic!("waited for 4, only {k} were available")
+                    })
+                    .user_data
+            })
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![0x100, 0x101, 0x102, 0x103]);
+
+        // The wait-only path: nothing staged, one op already submitted --
+        // and one that takes measurable time, since a NOP is reapable
+        // whether or not the enter waited for it.
+        let ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 60_000_000,
+        };
+        // The kernel copies the timespec at prep (`__io_timeout_prep` ->
+        // `get_timespec64`), so it need only be valid across `submit`.
+        let addr = std::ptr::addr_of!(ts) as u64;
+        ring.push_sqe(|sqe| {
+            sqe.opcode = IORING_OP_TIMEOUT;
+            sqe.addr = addr;
+            sqe.len = 1; // exactly one timespec, per the kernel
+            sqe.user_data = 0xbeef;
+        })
+        .expect("stage");
+        ring.submit().expect("submit"); // to_submit -> 0
+        ring.submit_and_wait(1)
+            .expect("wait with nothing to submit");
+        assert_eq!(
+            ring.reap()
+                .expect("the wait-only enter still waited")
+                .user_data,
+            0xbeef
+        );
     }
 }
 

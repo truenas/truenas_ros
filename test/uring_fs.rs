@@ -485,9 +485,10 @@ fn multi_component_and_beneath() {
             other => panic!("expected EXDEV, got {other:?}"),
         }
 
-        // The DEFAULT (no explicit resolve) now confines too: `open` applies
-        // RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS when `how` set no resolve, so a
-        // bare `rdonly()` rejects a `..` escape without the caller opting in.
+        // The DEFAULT (no explicit resolve) confines too: `open` applies the
+        // whole `CONFINED_RESOLVE` set - BENEATH | NO_SYMLINKS | NO_XDEV --
+        // when `how` states no policy, so a bare `rdonly()` rejects a `..`
+        // escape without the caller opting in.
         match h.open(me, &anchor, "../escape", rdonly()) {
             Err(Error::Errno(Errno::EXDEV)) => {}
             other => panic!("default open must confine `..`, got {other:?}"),
@@ -677,6 +678,51 @@ fn dropped_file_mid_op_completes_without_use_after_close() {
         assert_eq!(res.expect("parked read completes after data arrives"), 4);
         assert_eq!(&bufs[0], b"okay");
         writer.join().unwrap();
+    });
+}
+
+/// A creating open must not block on a name someone else planted.
+///
+/// `io_openat_force_async` puts every `O_CREAT`/`O_TRUNC` open on an io-wq
+/// worker, where the kernel does *not* add the `O_NONBLOCK` its inline path
+/// adds, so an `O_CREAT` that lands on a pre-existing FIFO sleeps in
+/// `wait_for_partner` until a writer appears. That pins a bounded io-wq
+/// worker and the calling thread - `into_outcome` waits with no deadline --
+/// so a handful of names in a shared multiprotocol tree stall every blocking
+/// fs op on the ring.
+///
+/// Both flags are driven: `O_CREAT|O_RDONLY` blocks for a writer,
+/// `O_TRUNC|O_WRONLY` for a reader. Non-blocking, the first opens and the
+/// second answers `ENXIO`; what is asserted is that each *returns*.
+#[test]
+fn a_creating_open_of_a_planted_fifo_does_not_block() {
+    use std::sync::mpsc;
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        mkfifo(&dir, "planted");
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        for (what, flags) in [
+            ("O_CREAT|O_RDONLY", OFlag::O_CREAT | OFlag::O_RDONLY),
+            ("O_TRUNC|O_WRONLY", OFlag::O_TRUNC | OFlag::O_WRONLY),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let h2 = h.clone();
+            let a2 = anchor.clone();
+            // Off-thread, because the failure mode is an indefinite block: a
+            // regression must fail this test rather than hang it.
+            thread::spawn(move || {
+                let how = OpenHow::new()
+                    .flags(flags)
+                    .mode(Mode::from_bits_truncate(0o600));
+                let _ = tx.send(h2.open(me, &a2, "planted", how).is_ok());
+            });
+            rx.recv_timeout(Duration::from_secs(3)).unwrap_or_else(|_| {
+                panic!(
+                    "{what} on a pre-existing FIFO never returned: the open \
+                     is blocked in fifo_open on an io-wq worker, and the \
+                     calling thread with it"
+                )
+            });
+        }
     });
 }
 
@@ -1486,6 +1532,30 @@ fn open_confined_cannot_be_weakened_by_the_caller() {
         // And an absolute path cannot bypass the anchor.
         let res = h.open_confined(me, &inner, "/etc/hostname", permissive);
         assert!(res.is_err(), "confined open must refuse an absolute path");
+
+        // `RESOLVE_IN_ROOT` is the one flag that cannot be unioned in: the
+        // kernel refuses `BENEATH|IN_ROOT` outright (`fs/open.c:1264`), so
+        // the union answered `EINVAL` for every path shape - a leaf, a
+        // nested path, `"."` - while the same call through `open` worked.
+        // Refused at the boundary, where the message can name the fix.
+        let in_root = OpenHow::new()
+            .flags(OFlag::O_RDONLY)
+            .resolve(ResolveFlag::RESOLVE_IN_ROOT);
+        for path in ["target", "./target", "."] {
+            let res = h.open_confined(me, &inner, path, in_root);
+            assert!(
+                matches!(res, Err(Error::Validation(_))),
+                "open_confined({path:?}) with RESOLVE_IN_ROOT must be \
+                 refused as a bad argument, not answered EINVAL by the \
+                 kernel: got {res:?}"
+            );
+            // The plain opener still serves it, which is what makes the
+            // refusal a routing decision rather than a lost capability.
+            let f = h
+                .open(me, &inner, path, in_root)
+                .unwrap_or_else(|e| panic!("open({path:?}) IN_ROOT: {e}"));
+            h.close(f).unwrap();
+        }
     });
 }
 
@@ -1648,11 +1718,31 @@ fn confined_open_refuses_to_cross_a_mount_point() {
             );
         }
 
-        // A caller that states a policy gets exactly it, and NO_XDEV is not
-        // in `RESOLVE_BENEATH` - so the crossing is available, explicitly.
-        let stated = how.resolve(ResolveFlag::RESOLVE_BENEATH);
-        h.open(me, &root, name.as_str(), stated)
-            .unwrap_or_else(|e| panic!("stated-policy open of /{name}: {e}"));
+        // Stating a policy replaces the policy, not the hardening that
+        // rides with it. `RESOLVE_BENEATH` is how a caller asks to follow
+        // in-tree symlinks; it must not also, silently, be how they ask to
+        // leave the filesystem - the kernel keeps the two questions apart
+        // (`__traverse_mounts` consults only `LOOKUP_NO_XDEV`), and so does
+        // this.
+        for stated in [
+            ResolveFlag::RESOLVE_BENEATH,
+            ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_SYMLINKS,
+            ResolveFlag::RESOLVE_IN_ROOT,
+        ] {
+            let res = h.open(me, &root, name.as_str(), how.resolve(stated));
+            assert!(
+                matches!(res, Err(Error::Errno(Errno::EXDEV))),
+                "{stated:?} must not buy a mount crossing, got {res:?}"
+            );
+        }
+
+        // The capability is not lost, only relocated to where a reader can
+        // see it: anchor on the nested mount and open relative to that.
+        let nested =
+            Anchor::open(format!("/{name}").as_str()).expect("anchor nested");
+        h.open(me, &nested, ".", how).unwrap_or_else(|e| {
+            panic!("open of /{name} as its own anchor: {e}")
+        });
     });
 }
 
@@ -1780,6 +1870,51 @@ fn metadata_ops_carry_the_personality() {
 /// `with_fs`, and run the loop on a scoped thread while the test thread
 /// drives registration (the reverse of the other tests, because `UringFs`
 /// is `!Send` but `CredBroker`/`CredHandle` are `Send`).
+/// Dropping the broker must leave no zombie behind.
+///
+/// `clone3_fork(0, 0, ..)` gives the child `exit_signal == 0`, which makes it
+/// a "clone child": `eligible_child` (`kernel/exit.c:1163`) tests
+/// `(p->exit_signal != SIGCHLD) ^ !!(wo->wo_flags & __WCLONE)`, so a plain
+/// `waitpid` answers `-1 ECHILD` at once and the task stays `Z` for the host
+/// process's life. Nothing else reaps it either - no `SIGCHLD` is delivered
+/// to hang a handler off - so this leaks one task per broker.
+#[test]
+fn dropping_the_broker_leaves_no_zombie() {
+    let afs = match UringFs::new(test_cfg()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("UringFs::new: {e}"),
+    };
+    let broker = match CredBroker::spawn(&[&afs]) {
+        Ok(b) => b,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("CredBroker::spawn: {e}"),
+    };
+    let pid = broker.pid();
+    assert!(broker.is_alive(), "the broker should be running");
+    drop(broker); // SIGKILL via the pidfd, then the reap
+
+    // A successful reap releases the task, so `/proc/<pid>` is gone the
+    // moment `Drop` returns. The poll is for the failing shape: a
+    // `waitpid` that answered ECHILD returns just as fast, and the child
+    // needs a moment to finish dying before it reads `Z`.
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    // Loops while `/proc/<pid>` still exists; a read error is the reap.
+    while let Ok(last) = std::fs::read_to_string(format!("/proc/{pid}/status"))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "broker pid {pid} outlived its drop ({}): the reap needs \
+             __WALL, since exit_signal == 0 makes plain waitpid answer \
+             ECHILD and nothing else collects the task",
+            last.lines()
+                .find(|l| l.starts_with("State:"))
+                .unwrap_or("no State line")
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn with_broker<F>(client: F)
 where
     F: FnOnce(&FsHandle, &CredHandle, Personality, &Path) + Send,

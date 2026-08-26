@@ -132,6 +132,7 @@ fn chunked_put(payload: &[u8], chunk: usize) -> Vec<u8> {
 }
 
 /// A `Content-Length` PUT: the head, then the raw payload.
+#[cfg(feature = "uring-fs")] // both call sites are gated on it
 fn cl_put(payload: &[u8]) -> Vec<u8> {
     let mut req = format!(
         "PUT /o HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n",

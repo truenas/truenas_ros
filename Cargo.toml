@@ -278,3 +278,9 @@ required-features = ["net-server", "net-client"]
 [[example]]
 name = "http_hello"
 required-features = ["http"]
+
+# Consumer-facing example: an http handler that parks on a worker
+# (`HttpVerdict::Defer`) and answers from it.
+[[example]]
+name = "http_offload"
+required-features = ["http"]

@@ -6,6 +6,7 @@
 
 use super::Server;
 use super::handles::Injected;
+use super::io::Delivery;
 use crate::errno;
 use crate::net::core::conn::{Op, pack};
 use crate::net::core::handles::stat;
@@ -14,7 +15,6 @@ use crate::net::core::table::SlotState;
 use crate::net::server::protocol::{Incoming, Request, Response};
 use crate::uring::sys::*;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::Ordering;
 
 // Wake-driven work can re-enter any stage - kTLS accept outcomes install
 // connections and deferred replies re-enter the pump - so this block carries
@@ -36,7 +36,7 @@ where
             self.drain_fs_offloads()?;
             self.drain_injections()?;
             self.drain_handshake_outcomes()?;
-            if self.core.engine.shared.graceful.load(Ordering::Acquire)
+            if self.core.engine.shared.graceful_requested().is_some()
                 && !self.core.draining
             {
                 self.begin_drain()?;
@@ -138,8 +138,8 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             .core
             .engine
             .shared
-            .grace_ms
-            .load(Ordering::Relaxed)
+            .graceful_requested()
+            .unwrap_or(0)
             .max(1);
         self.core.pads.deadline = KernelTimespec {
             tv_sec: (ms / 1000) as i64,
@@ -478,7 +478,11 @@ where
                         let conn = self.core.table.conn_mut(token.slot);
                         conn.outstanding = conn.outstanding.saturating_sub(1);
                     }
-                    self.deliver_one(token.slot, token.generation as u32)?;
+                    self.deliver_one(
+                        token.slot,
+                        token.generation as u32,
+                        Delivery::Redelivery,
+                    )?;
                     self.pump(token.slot, token.generation as u32)?;
                 }
                 Injected::Push { .. }

@@ -61,20 +61,44 @@ pub struct DirEntryName {
 
 /// Read every name in the directory open at `fd`, in filesystem order.
 ///
-/// One full drain per call: the stream is rewound first, so the result
-/// is the whole directory regardless of where the descriptor's offset
-/// sits. The stream runs on a dup, but a dup shares the original's file
-/// description, so the caller's offset is spent by the read — this is a
-/// consuming read of the position, not a peek. Order is the
-/// filesystem's own (ZAP hash order on ZFS); a sorted view is the
-/// caller's sort.
+/// One full drain per call, over a descriptor of its own: `openat2(fd,
+/// ".")` gives a fresh file description, so `fd` may be an `O_PATH`
+/// handle - which `fdopendir` refuses outright - and its position is left
+/// where it was found.
+///
+/// **A `dup` cannot serve, and is not cheaper.** `fdopendir` rejects it
+/// for the same `O_PATH` reason, since a dup carries the original's
+/// access mode; and it *shares* the original's file description, so
+/// rewinding it to read from the start rewinds the caller's stream and
+/// the drain then leaves that at EOF - which makes a traversal that calls
+/// this on a directory it is walking
+/// ([`iter::Entry::fd`](crate::sync_fs::iter::Entry::fd), whose frame
+/// descends on a dup of that same fd) lose the rest of that directory
+/// with no error to say so. The dup also costs one syscall *more*: it
+/// needs a `rewinddir`, and the reopen does not.
+///
+/// The reopen costs one right a dup does not need: search (`x`) permission
+/// on the directory, under the *calling* process's credentials. A caller
+/// holding a descriptor it can no longer traverse gets `EACCES`.
+///
+/// Order is the filesystem's own (ZAP hash order on ZFS); a sorted view is
+/// the caller's sort. The result is a snapshot, not an atomic one: an entry
+/// renamed while the drain runs moves relative to the cursor and can be
+/// missed or reported twice, which is `readdir`'s contract and not
+/// something this layer can close.
 pub fn read_names(fd: impl AsFd) -> errno::Result<Vec<DirEntryName>> {
-    let dup = fd
-        .as_fd()
-        .try_clone_to_owned()
-        .map_err(|e| Errno::from_raw(e.raw_os_error().unwrap_or(libc::EIO)))?;
-    let mut dir = Dir::from_fd(dup)?;
-    dir.rewind();
+    let own = crate::sync_fs::openat2(
+        fd.as_fd(),
+        ".",
+        crate::sync_fs::OpenHow::new()
+            .flags(
+                crate::sync_fs::OFlag::O_RDONLY
+                    | crate::sync_fs::OFlag::O_DIRECTORY
+                    | crate::sync_fs::OFlag::O_CLOEXEC,
+            )
+            .resolve(crate::sync_fs::ResolveFlag::RESOLVE_NO_SYMLINKS),
+    )?;
+    let mut dir = Dir::from_fd(own)?;
     let mut names = Vec::new();
     while let Some(ent) = dir.next_entry()? {
         let bytes = ent.name.as_bytes();
@@ -131,12 +155,6 @@ impl Dir {
         unsafe { libc::dirfd(self.0.as_ptr()) }
     }
 
-    /// Reset the stream to the directory's start.
-    fn rewind(&mut self) {
-        // SAFETY: `self.0` is a live DIR stream we own exclusively.
-        unsafe { libc::rewinddir(self.0.as_ptr()) };
-    }
-
     pub(crate) fn next_entry(&mut self) -> errno::Result<Option<DirEntry>> {
         // readdir signals end-of-directory and error both with NULL; clear
         // errno first to tell them apart.
@@ -150,13 +168,30 @@ impl Dir {
             };
         }
         // SAFETY: `ent` points into the DIR buffer, valid until the next
-        // readdir/closedir; we copy the fields out immediately.
-        let ent = unsafe { &*ent };
-        let name = unsafe { CStr::from_ptr(ent.d_name.as_ptr()) };
+        // readdir/closedir; every field is read through `addr_of!` and
+        // copied out immediately.
+        //
+        // A `&libc::dirent` must NOT be formed here. The reference would
+        // claim all 280 bytes of the struct - `d_name` is a `[c_char; 256]`
+        // - over a record only `d_reclen` bytes long: a short-named entry's
+        // record is 24-40 bytes, and the last record in a filled buffer ends
+        // where the buffer's valid data does. Measured on ZFS: over 5002
+        // entries the tightest record left 32 valid bytes. The same idiom,
+        // with the same reason, is at `uring_fs/core.rs` and
+        // `uring_fs/query_dir.rs`.
+        let (d_type, name) = unsafe {
+            (
+                std::ptr::addr_of!((*ent).d_type).read(),
+                CStr::from_ptr(
+                    std::ptr::addr_of!((*ent).d_name).cast::<libc::c_char>(),
+                ),
+            )
+        };
         Ok(Some(DirEntry {
-            d_type: ent.d_type,
+            d_type,
             #[cfg(feature = "fsiter")]
-            d_ino: ent.d_ino,
+            // SAFETY: as above; `d_ino` is inside every record's fixed head.
+            d_ino: unsafe { std::ptr::addr_of!((*ent).d_ino).read() },
             name: std::ffi::OsStr::from_bytes(name.to_bytes()).to_os_string(),
         }))
     }
@@ -243,6 +278,146 @@ mod tests {
         let second = read_names(dirf.as_fd()).expect("second");
         assert_eq!(first.len(), 2);
         assert_eq!(second.len(), 2);
+    }
+
+    /// The record `readdir` hands back is `d_reclen` bytes, which is far
+    /// less than `size_of::<libc::dirent>()` - the invariant that makes
+    /// `next_entry`'s `addr_of!` reads necessary rather than stylistic.
+    ///
+    /// Forming a `&libc::dirent` requires all 280 bytes to be
+    /// dereferenceable; a short-named entry's record is a tenth of that, and
+    /// the last record in a filled buffer ends exactly where the valid data
+    /// does. Driven over raw `getdents64` so the valid region is known
+    /// precisely; glibc's `readdir` hands out pointers into a buffer filled
+    /// the same way.
+    #[test]
+    fn a_directory_record_is_shorter_than_the_struct_that_describes_it() {
+        use std::os::fd::AsRawFd;
+        let tmp = crate::tempdir().expect("tempdir");
+        for i in 0..64 {
+            std::fs::write(tmp.path().join(format!("n{i:02}")), b"")
+                .expect("file");
+        }
+        let f = std::fs::File::open(tmp.path()).expect("open dir");
+        let mut buf = [0u8; 512];
+        // SAFETY: a live directory fd and a buffer of its own length.
+        let n = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                f.as_raw_fd(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(n > 0, "getdents64: {}", Errno::last());
+        let n = n as usize;
+        let (mut shortest, mut tightest) = (usize::MAX, usize::MAX);
+        let mut off = 0usize;
+        while off < n {
+            // SAFETY: `off` is inside the filled region and each record's
+            // fixed head is within it; `d_reclen` walks to the next.
+            let reclen = unsafe {
+                let ent = buf.as_ptr().add(off).cast::<libc::dirent64>();
+                std::ptr::addr_of!((*ent).d_reclen).read() as usize
+            };
+            assert!(reclen > 0 && off + reclen <= n, "malformed d_reclen");
+            shortest = shortest.min(reclen);
+            tightest = tightest.min(n - off);
+            off += reclen;
+        }
+        let claimed = std::mem::size_of::<libc::dirent>();
+        assert!(
+            shortest < claimed,
+            "shortest record {shortest} B, &libc::dirent claims {claimed} B"
+        );
+        assert!(
+            tightest < claimed,
+            "the last record leaves {tightest} valid bytes and a \
+             &libc::dirent formed there would claim {claimed}"
+        );
+    }
+
+    /// A drain must not spend the position of a stream that shares the
+    /// caller's file description.
+    ///
+    /// This is the traversal shape: `iter::FsIter` descends by `dup`ping the
+    /// entry fd it just handed the caller and opening a `DIR` on the dup, so
+    /// the frame and `Entry::fd()` are one description. A drain that rewound
+    /// that description and walked it to EOF - which is what a `dup` plus
+    /// `rewinddir` does - left the walk at end-of-directory, and the walk
+    /// reported an empty subtree with no error. The frame is deliberately
+    /// unread here: glibc buffers a whole `getdents64` at the first
+    /// `readdir`, which would hide the moved offset on a small directory.
+    #[test]
+    fn a_drain_leaves_a_walk_over_the_same_descriptor_intact() {
+        let tmp = crate::tempdir().expect("tempdir");
+        for i in 0..50 {
+            std::fs::write(tmp.path().join(format!("f{i:03}")), b"x")
+                .expect("file");
+        }
+        let dirf = std::fs::File::open(tmp.path()).expect("open dir");
+        let dup = dirf.as_fd().try_clone_to_owned().expect("dup");
+        let mut walk = Dir::from_fd(dup).expect("fdopendir");
+
+        assert_eq!(read_names(dirf.as_fd()).expect("drain").len(), 50);
+
+        let mut seen = 0usize;
+        while let Some(e) = walk.next_entry().expect("next_entry") {
+            let n = e.name.as_bytes();
+            if n != b"." && n != b".." {
+                seen += 1;
+            }
+        }
+        assert_eq!(
+            seen, 50,
+            "the drain consumed the walk's own position: it reopens rather \
+             than duplicating precisely so this cannot happen"
+        );
+    }
+
+    /// The caller's own offset is likewise untouched - the drain reads a
+    /// file description of its own.
+    #[test]
+    fn a_drain_leaves_the_descriptor_offset_where_it_found_it() {
+        use std::os::fd::AsRawFd;
+        let tmp = crate::tempdir().expect("tempdir");
+        for i in 0..8 {
+            std::fs::write(tmp.path().join(format!("n{i}")), b"").expect("f");
+        }
+        let dirf = std::fs::File::open(tmp.path()).expect("open dir");
+        // SAFETY: `dirf` is a live directory descriptor.
+        let before =
+            unsafe { libc::lseek(dirf.as_raw_fd(), 0, libc::SEEK_CUR) };
+        assert_eq!(read_names(dirf.as_fd()).expect("drain").len(), 8);
+        // SAFETY: same descriptor, still live.
+        let after = unsafe { libc::lseek(dirf.as_raw_fd(), 0, libc::SEEK_CUR) };
+        assert_eq!(before, after, "the drain spent the caller's position");
+    }
+
+    /// The consumer the module documents - "a descriptor its
+    /// credential-checked step already opened" - hands on an `O_PATH`
+    /// handle, which `fdopendir` refuses with `EBADF`. Reopening through it
+    /// is what makes that shape work.
+    #[test]
+    fn an_o_path_descriptor_is_readable() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let tmp = crate::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a"), b"").expect("file");
+        let c = std::ffi::CString::new(tmp.path().as_os_str().as_bytes())
+            .expect("path");
+        // SAFETY: a NUL-terminated path we own; O_PATH takes no rights.
+        let raw = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(raw >= 0, "open O_PATH: {}", Errno::last());
+        // SAFETY: `raw` is a fresh owned descriptor.
+        let anchor = unsafe { OwnedFd::from_raw_fd(raw) };
+        let got = read_names(anchor.as_fd()).expect("read_names on O_PATH");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, b"a");
     }
 
     /// The `d_type` mapping, pinned over the raw constants because no

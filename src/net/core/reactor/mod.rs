@@ -199,7 +199,10 @@ impl<U> Reactor<U> {
     /// close - so close it here, or a teardown racing an install leaks a real
     /// process fd (it survives the ring's own close; matters when the process
     /// outlives the owner).
-    pub(crate) fn cancel_and_reap_all(&mut self) -> errno::Result<()> {
+    pub(crate) fn cancel_and_reap_all(
+        &mut self,
+        other: &mut dyn FnMut(&IoUringCqe),
+    ) -> errno::Result<()> {
         self.engine
             .cancel_and_reap_all(pack(Op::Cancel, 0, 0), |cqe| {
                 let (op, _, _) = unpack(cqe.user_data);
@@ -211,6 +214,15 @@ impl<U> Reactor<U> {
                     // path.
                     unsafe { libc::close(cqe.res) };
                 }
+                // Anything not the reactor's own. A host sharing this ring
+                // (the server's fs op table) owns completions the reactor
+                // cannot classify, and this drain does not dispatch - so
+                // without routing them an `openat2` that completes here
+                // leaks a real process fd, which survives the ring's close
+                // and matters whenever the process outlives the server. The
+                // tag vocabularies are disjoint (`TAG_FS_DOMAIN`), so each
+                // side ignores the other's.
+                other(cqe);
             })
     }
 
@@ -263,8 +275,15 @@ impl<U> Reactor<U> {
     /// Returns `true` if the drain failed and the buffers were leaked - an
     /// embedding host with its own kernel-visible buffers on this ring (the
     /// server's fs op table) must then leak those too.
-    pub(crate) fn drain_or_leak(&mut self) -> bool {
-        if self.cancel_and_reap_all().is_err() {
+    /// `other` is called with every reaped CQE, so a host sharing this ring
+    /// (the server's fs op table) can route its own domain's completions --
+    /// freeing what they carry - as they land. A role with nothing else on
+    /// the ring passes a no-op.
+    pub(crate) fn drain_or_leak(
+        &mut self,
+        other: &mut dyn FnMut(&IoUringCqe),
+    ) -> bool {
+        if self.cancel_and_reap_all(other).is_err() {
             self.table.leak();
             // Registered recv buffers are kernel-visible on this same ring:
             // an op still in flight names one by index, so unmapping the

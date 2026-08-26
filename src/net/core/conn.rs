@@ -1159,6 +1159,13 @@ impl<U> Connection<U> {
         (&self.peer, &mut self.state)
     }
 
+    /// The current message's header/body split, for a caller that must put
+    /// it back - a redelivery, whose own frame is empty, delivering while a
+    /// read-ahead recv already carries the next message's extent.
+    pub(crate) fn frame(&self) -> (usize, usize) {
+        (self.header_len, self.body_len)
+    }
+
     /// Record the current message's header/body split (from a `Complete` verdict).
     pub(crate) fn set_frame(&mut self, header_len: usize, body_len: usize) {
         self.header_len = header_len;

@@ -59,9 +59,14 @@ impl<U> Reactor<U> {
         // would keep `inflight` up (delaying an idle `serve_forever`'s exit)
         // until it expired. A no-op when none is armed.
         self.cancel_splice_deadline(slot, generation)?;
-        // Same for the total-receipt budget, and for the same reason.
+        // Same for the total-receipt budget, and for the parked read's
+        // pool-shortage retry - the only one of the three armed by default,
+        // so the one most often pending here - and for the same reason.
         #[cfg(feature = "net-server")]
-        self.cancel_receipt_deadline(slot, generation)?;
+        {
+            self.cancel_receipt_deadline(slot, generation)?;
+            self.cancel_recv_retry(slot, generation)?;
+        }
         // The peer already sent its FIN (clean EOF) or is gone (reset/error),
         // so no SHUTDOWN is owed; every other reason is a server-initiated
         // close of a maybe-still-connected peer and must force the FIN.

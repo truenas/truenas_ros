@@ -72,8 +72,8 @@ pub(crate) struct DrainProbe {
 #[cfg(feature = "http")]
 impl DrainProbe {
     pub(crate) fn draining(&self) -> bool {
-        self.shared.graceful.load(Ordering::Acquire)
-            || self.shared.stop.load(Ordering::Acquire)
+        self.shared.graceful_requested().is_some()
+            || self.shared.stop_requested()
     }
 }
 
@@ -96,8 +96,8 @@ impl Responder {
     /// [`CloseReason::HandlerClosed`], not `ShuttingDown`, which is kept for
     /// connections the drain itself closes.
     pub fn draining(&self) -> bool {
-        self.shared.graceful.load(Ordering::Acquire)
-            || self.shared.stop.load(Ordering::Acquire)
+        self.shared.graceful_requested().is_some()
+            || self.shared.stop_requested()
     }
 
     /// A second responder for the same request, for the one dispatch step
@@ -172,7 +172,10 @@ impl std::fmt::Debug for Responder {
     }
 }
 
-#[cfg(test)]
+// The http glue's unit tests are the only consumer: `net-server` alone
+// builds these tests without them, and dead code is an error under the
+// feature matrix's `-D warnings`.
+#[cfg(all(test, feature = "http"))]
 impl Responder {
     /// A live responder backed by a throwaway channel and wake - for unit
     /// tests that drive protocol glue (the http `step`) without a reactor.
@@ -186,7 +189,7 @@ impl Responder {
     /// [`Responder::test_responder`] whose server is already draining.
     pub(crate) fn test_responder_draining() -> Responder {
         let r = Self::test_wired().0;
-        r.shared.graceful.store(true, Ordering::Release);
+        r.shared.request_graceful(0);
         r
     }
 
@@ -222,13 +225,13 @@ impl Responder {
 }
 
 /// The loop side of a [`Responder::test_responder_with_probe`] pair.
-#[cfg(all(test, loom))]
+#[cfg(all(test, loom, feature = "http"))]
 pub(crate) struct RedeliverProbe {
     rx: mpsc::Receiver<Injected>,
     shared: Arc<LoopShared>,
 }
 
-#[cfg(all(test, loom))]
+#[cfg(all(test, loom, feature = "http"))]
 impl RedeliverProbe {
     /// Consume the worker's outcome the way the loop does: block on the
     /// wake (the armed `READ`), then take the queued injection - asserting
@@ -721,7 +724,7 @@ impl ShutdownHandle {
     /// whose errors are meaningless by design (a full counter has already
     /// signalled; a closed fd means the server is gone).
     pub fn shutdown(&self) {
-        self.shared.stop.store(true, Ordering::Release);
+        self.shared.request_stop();
         self.shared.wake.poke();
     }
 
@@ -757,8 +760,7 @@ impl ShutdownHandle {
             return self.shutdown();
         }
         let ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
-        self.shared.grace_ms.store(ms, Ordering::Relaxed);
-        self.shared.graceful.store(true, Ordering::Release);
+        self.shared.request_graceful(ms);
         self.shared.wake.poke();
     }
 }

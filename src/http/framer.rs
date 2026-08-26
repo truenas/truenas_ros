@@ -668,7 +668,9 @@ fn known_step<U>(buf: &[u8], conn: &mut HttpConn<U>) -> Framing {
         return fail(&mut conn.phase, buf.len(), 500, false);
     }
     if buf.is_empty() {
-        return Framing::More;
+        // Between windows of a body already declared: nothing is buffered,
+        // and the request is still arriving.
+        return Framing::MoreInMessage;
     }
     // A full window per delivery, however little is buffered: the exact
     // read that completes it draws from the recv pool - the `More` above
@@ -709,7 +711,9 @@ fn stream_step<U>(buf: &[u8], conn: &mut HttpConn<U>) -> Framing {
         };
     }
     match chunked::step(buf, after_payload) {
-        chunked::Step::More => Framing::More,
+        // At a chunk boundary the buffer is empty and the body is still
+        // coming; `More` would put this read on the idle clock.
+        chunked::Step::More => Framing::MoreInMessage,
         chunked::Step::Bad(status) => {
             fail(&mut conn.phase, buf.len(), status, head_only)
         }
@@ -791,7 +795,10 @@ fn scan_step<U>(
             {
                 fail(&mut conn.phase, buf.len(), 400, head_only)
             } else {
-                Framing::More
+                // A chunk scan runs only inside a body. With the head
+                // consumed by the 100-continue dance the buffer can be empty
+                // here, which `More` would report as an idle park.
+                Framing::MoreInMessage
             }
         }
         Ok(Some(extent)) => {
@@ -1096,11 +1103,14 @@ mod tests {
         let mut raw = head.to_vec();
         raw.extend_from_slice(b"3\r\nfoo\r\n4\r\nbars\r\n0\r\n\r\n");
         for cut in 0..raw.len() {
-            assert_eq!(
-                frame(&raw[..cut], &mut c, &cfg()),
-                Framing::More,
-                "cut {cut}"
-            );
+            // Inside the head the connection is still parked for a request;
+            // from the terminator on, a body is arriving and the scan says so.
+            let want = if cut < head.len() {
+                Framing::More
+            } else {
+                Framing::MoreInMessage
+            };
+            assert_eq!(frame(&raw[..cut], &mut c, &cfg()), want, "cut {cut}");
         }
         assert_eq!(
             frame(&raw, &mut c, &cfg()),
@@ -1139,8 +1149,9 @@ mod tests {
         let wire = b"5\r\nhello\r\n0\r\n\r\n";
         assert_eq!(
             frame(&wire[..4], &mut c, &cfg()),
-            Framing::More,
-            "partial body resumes the dance into a scan"
+            Framing::MoreInMessage,
+            "partial body resumes the dance into a scan - and the dance \
+             consumed the head, so this scan can run on an empty buffer"
         );
         assert_eq!(
             frame(wire, &mut c, &cfg()),
@@ -1427,7 +1438,13 @@ mod tests {
             head: head.as_bytes().to_vec(),
             remaining: len as u64,
         };
-        assert_eq!(frame(&[], &mut c, &cfg()), Framing::More);
+        assert_eq!(
+            frame(&[], &mut c, &cfg()),
+            Framing::MoreInMessage,
+            "an empty buffer between windows is a message in progress, not \
+             an idle park - `More` here puts the read on `idle_timeout` and \
+             arms no receipt budget"
+        );
         let burst = vec![0u8; STREAM_WINDOW + 9];
         assert_eq!(
             frame(&burst, &mut c, &cfg()),

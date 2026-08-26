@@ -497,7 +497,6 @@ use crate::uring::sys::*;
 use handles::Injected;
 use listen::listen_socket;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -941,7 +940,22 @@ where
             self.arm_accept(lidx)?;
         }
         let run = self.run_loop();
-        let drained = self.core.cancel_and_reap_all();
+        // fs ops ride this ring too, and this drain does not dispatch, so
+        // route their completions to the fs core as they are reaped: an
+        // `openat2` finishing here carries a real process fd in `cqe.res`
+        // that nothing else will ever own. The standalone fs host does the
+        // same (`uring_fs::host`'s `drain_or_leak`).
+        #[cfg(feature = "uring-fs")]
+        let drained = {
+            let fs = &mut self.fs;
+            self.core.cancel_and_reap_all(&mut |cqe| {
+                if let Some(fs) = fs.as_mut() {
+                    fs.on_drain_cqe(cqe);
+                }
+            })
+        };
+        #[cfg(not(feature = "uring-fs"))]
+        let drained = self.core.cancel_and_reap_all(&mut |_| {});
         run?;
         drained?;
         Ok(())
@@ -952,9 +966,13 @@ where
             if self.core.engine.inflight == 0 {
                 break; // nothing outstanding; avoid blocking forever
             }
-            // submit_and_wait always enters with GETEVENTS, which also flushes
-            // any IORING_SQ_CQ_OVERFLOW backlog, so completions can't be
-            // stranded even under NODROP.
+            // `submit_and_wait` enters with GETEVENTS once the SQ is empty,
+            // which also flushes any IORING_SQ_CQ_OVERFLOW backlog, so
+            // completions can't be stranded even under NODROP. The "once the
+            // SQ is empty" is load-bearing: a short submit makes the kernel
+            // `goto out` past the whole GETEVENTS block
+            // (`io_uring/io_uring.c:3571-3574`), so an enter that both
+            // submits and waits does neither the wait nor the flush.
             self.core.engine.ring.submit_and_wait(1)?;
             while let Some(cqe) = self.core.engine.ring.reap() {
                 self.dispatch(cqe)?;
@@ -1115,7 +1133,7 @@ where
             // stop - `serve_forever`'s drain cancels whatever remains.
             Some(Op::Deadline) => {
                 if self.core.draining && !self.core.stopping() {
-                    self.core.engine.shared.stop.store(true, Ordering::Release);
+                    self.core.engine.shared.request_stop();
                 }
             }
             // A peer-identity fetch - the slot's PendingPeer pad says which.
@@ -1343,7 +1361,17 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Drop
         // (early drop / panic unwind) ensure no op is in flight before the
         // buffers and ring are freed - and if that drain fails, leak the
         // buffers rather than free them under a still-live op.
-        let leaked = self.core.drain_or_leak();
+        #[cfg(feature = "uring-fs")]
+        let leaked = {
+            let fs = &mut self.fs;
+            self.core.drain_or_leak(&mut |cqe| {
+                if let Some(fs) = fs.as_mut() {
+                    fs.on_drain_cqe(cqe);
+                }
+            })
+        };
+        #[cfg(not(feature = "uring-fs"))]
+        let leaked = self.core.drain_or_leak(&mut |_| {});
         // fs ops share this ring; on a failed drain they may still be in
         // flight, so leak the fs op buffers alongside the connection buffers
         // rather than free memory the kernel might yet write into.

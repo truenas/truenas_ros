@@ -62,7 +62,7 @@ fuzz_target!(|data: &[u8]| {
                         }
                         // A fixed-width prefix framer never scans for a
                         // delimiter, and never diverts a body to a splice fd.
-                        Framing::More => {
+                        Framing::More | Framing::MoreInMessage => {
                             panic!("length prefix framer returned More")
                         }
                         Framing::SpliceBody { .. } => {

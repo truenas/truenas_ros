@@ -321,6 +321,26 @@ pub const CONFINED_RESOLVE: ResolveFlag = ResolveFlag::RESOLVE_BENEATH
 const CONFINEMENT_POLICY: ResolveFlag =
     ResolveFlag::RESOLVE_BENEATH.union(ResolveFlag::RESOLVE_IN_ROOT);
 
+/// The part of [`CONFINED_RESOLVE`] a stated [`CONFINEMENT_POLICY`] does
+/// **not** replace.
+///
+/// `RESOLVE_NO_XDEV` answers a different question from `BENEATH`/`IN_ROOT`.
+/// Those bound where resolution may go *within a tree*; this bounds which
+/// *filesystem* it ends on, and the kernel keeps them just as separate --
+/// `__traverse_mounts` (`fs/namei.c:1485-1522`) refuses a crossing only
+/// under `LOOKUP_NO_XDEV`, and `LOOKUP_BENEATH` is consulted on the dotdot
+/// paths alone. So a caller naming `RESOLVE_BENEATH` to allow in-tree
+/// symlinks - the opt-out this module documents - was also, silently,
+/// opting into resolution walking off the anchor's filesystem: a nested
+/// dataset or a `.zfs/snapshot` automount served through a path the code
+/// calls confined, with its own permissions, quotas and snapshot policy.
+///
+/// A caller that genuinely means to serve a nested mount anchors on it and
+/// opens relative to that, which is the same answer this module gives for
+/// absolute paths and for the same reason: it says so where a reader can
+/// see it.
+const CONFINED_HARDENING: ResolveFlag = ResolveFlag::RESOLVE_NO_XDEV;
+
 /// Validate an open's `(path, how)` pair and produce the payloads an
 /// `OPENAT2` inject carries - shared by the blocking [`FsHandle::open`] and the
 /// async `rt` handle so both surfaces enforce identical rules.
@@ -328,14 +348,32 @@ const CONFINEMENT_POLICY: ResolveFlag =
 /// The path may be **multi-component** and is resolved by the kernel against
 /// the anchor dirfd. It is **confined to the anchor** by the full
 /// [`CONFINED_RESOLVE`] set unless the caller names a [`CONFINEMENT_POLICY`]
-/// flag of its own, in which case that policy stands alone - `RESOLVE_BENEATH`
-/// by itself to allow in-tree symlinks, say. Hardening flags do not count as a
-/// policy and are unioned on top of the default, so adding one cannot subtract
-/// confinement. Opens return a real fd, so `O_CLOEXEC` is accepted.
+/// flag of its own, in which case that policy stands in place of the default
+/// one - `RESOLVE_BENEATH` by itself to allow in-tree symlinks, say --
+/// alongside [`CONFINED_HARDENING`], which no policy replaces. Hardening flags
+/// do not count as a policy and are unioned on top of the default, so adding
+/// one cannot subtract confinement. Opens return a real fd, so `O_CLOEXEC` is
+/// accepted.
 ///
 /// There is therefore no flag combination that resolves an **absolute** path
 /// from the filesystem root: anchor on the directory that path names and open
 /// relative to it, which says the same thing where a reader can see it.
+/// Apply the confinement rule to a caller's `resolve` word: the whole
+/// [`CONFINED_RESOLVE`] bundle where no policy was stated, and
+/// [`CONFINED_HARDENING`] on top of one that was.
+///
+/// One function because there are two facades - the blocking
+/// [`open_parts`] and the request handler's
+/// [`FsConn::open`](core::FsConn::open) - and the second must never be the
+/// laxer of the two. Its own copy of this rule had already drifted once.
+pub(crate) fn confine_resolve(resolve: &mut u64) {
+    if *resolve & CONFINEMENT_POLICY.bits() == 0 {
+        *resolve |= CONFINED_RESOLVE.bits();
+    } else {
+        *resolve |= CONFINED_HARDENING.bits();
+    }
+}
+
 pub(crate) fn open_parts<P: ?Sized + TnPath>(
     path: &P,
     how: OpenHow,
@@ -352,8 +390,35 @@ pub(crate) fn open_parts<P: ?Sized + TnPath>(
     // opt-out: `RESOLVE_NO_MAGICLINKS` alone would then drop `RESOLVE_BENEATH`,
     // so a caller asking for less traversal would get less confinement and
     // `../../etc/shadow` would resolve.
-    if raw.resolve & CONFINEMENT_POLICY.bits() == 0 {
-        raw.resolve |= CONFINED_RESOLVE.bits();
+    confine_resolve(&mut raw.resolve);
+    // SECURITY: a creating open must not be able to block on a name someone
+    // else planted.
+    //
+    // `io_openat_force_async` (`io_uring/openclose.c:41-50`) puts every
+    // `O_CREAT`/`O_TRUNC`/`O_TMPFILE` open straight onto an io-wq worker,
+    // which means the `op.open_flag |= O_NONBLOCK` the inline path applies
+    // (`io_openat2:132-134`, guarded by `IO_URING_F_NONBLOCK` and carrying
+    // `WARN_ON_ONCE(io_openat_force_async(open))`) never runs. `fifo_open`
+    // then sleeps in `wait_for_partner` (`fs/pipe.c`) until a writer appears
+    // - forever, for a FIFO nobody is going to write to. That pins the io-wq
+    // worker *and* the calling thread, since `FsHandle::into_outcome` waits
+    // with no deadline, and the bounded worker pool is
+    // `min(sq_entries, 4 * nr_cpus)`: a few names in a shared multiprotocol
+    // tree stall every blocking fs op on the ring. Measured at >2.5 s and
+    // still climbing against 220 us with the flag.
+    //
+    // Only `O_CREAT` and `O_TRUNC` are covered, because they are the two
+    // that can resolve to a file that already exists and blocks; `O_TMPFILE`
+    // makes an unnamed inode and can land on nothing. The flag is not
+    // cleared from the returned descriptor, and does not need to be: it is
+    // inert on a regular file and a directory, which is everything a
+    // creating open legitimately reaches - `O_CREAT` makes regular files and
+    // nothing else, so a FIFO or a device under that name is already the
+    // confused deputy this is guarding against, and a non-blocking
+    // descriptor is the wanted answer there.
+    const CAN_BLOCK_ON_AN_EXISTING_FILE: i32 = libc::O_CREAT | libc::O_TRUNC;
+    if raw.flags & CAN_BLOCK_ON_AN_EXISTING_FILE as u64 != 0 {
+        raw.flags |= libc::O_NONBLOCK as u64;
     }
     Ok((cpath, raw))
 }
@@ -1028,10 +1093,14 @@ impl FsHandle {
     /// automount.
     ///
     /// A caller may replace that policy, but only by *stating* one: naming
-    /// [`RESOLVE_BENEATH`] or [`RESOLVE_IN_ROOT`] gets exactly what it names -
-    /// `RESOLVE_BENEATH` alone to allow in-tree symlinks, say. A `resolve`
-    /// carrying only hardening flags is additive, so it composes with the
-    /// default instead of replacing it. Use
+    /// [`RESOLVE_BENEATH`] or [`RESOLVE_IN_ROOT`] gets what it names -
+    /// `RESOLVE_BENEATH` alone to allow in-tree symlinks, say. What it does
+    /// **not** get is a way to leave the anchor's filesystem:
+    /// `RESOLVE_NO_XDEV` rides with every policy, because "may resolution
+    /// follow a symlink" and "may resolution end on another filesystem" are
+    /// separate questions and the kernel keeps them separate. Anchor on the
+    /// nested mount to serve it. A `resolve` carrying only hardening flags is
+    /// additive, so it composes with the default instead of replacing it. Use
     /// [`open_confined`](Self::open_confined) where confinement must not be
     /// replaceable at all. The personality's DAC binds every access
     /// regardless; the metadata ops are separately single-component-confined
@@ -1103,6 +1172,21 @@ impl FsHandle {
         how: OpenHow,
     ) -> crate::Result<File> {
         let (cpath, mut raw) = open_parts(path, how)?;
+        // `RESOLVE_IN_ROOT` is not a restriction that composes: the kernel
+        // refuses `BENEATH|IN_ROOT` outright (`fs/open.c:1264`), so unioning
+        // the bundle over a stated `IN_ROOT` made every path - a leaf, a
+        // nested path, `"."` - fail `EINVAL`, while the same call through
+        // `open` succeeded. Refuse it here, where the message can say what
+        // to do instead, rather than at the syscall where it cannot.
+        if raw.resolve & ResolveFlag::RESOLVE_IN_ROOT.bits() != 0 {
+            return Err(crate::Error::Validation(
+                "uring_fs open_confined: RESOLVE_IN_ROOT cannot compose \
+                 with the confinement bundle (openat2 refuses \
+                 BENEATH|IN_ROOT). Anchor on the root you mean, or use \
+                 `open` if you want IN_ROOT's clamping resolution."
+                    .into(),
+            ));
+        }
         // Union, never assign: a caller may add restrictions (RESOLVE_NO_
         // MAGICLINKS, say) but cannot subtract any of these three.
         raw.resolve |= CONFINED_RESOLVE.bits();
@@ -2173,8 +2257,7 @@ impl FsHandle {
     // caller gets back (buffers, lease), not an error-path allocation to shrink.
     #[allow(clippy::result_large_err)]
     pub(crate) fn send(&self, msg: FsInject) -> Result<(), FsInject> {
-        use crate::sync::atomic::Ordering;
-        if self.shared.stop.load(Ordering::Acquire) {
+        if self.shared.stop_requested() {
             return Err(msg);
         }
         if let Err(e) = self.tx.send(msg) {
