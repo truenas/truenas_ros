@@ -203,6 +203,10 @@ struct FsOpEntry {
     path2: Option<CString>,
     /// `OPENAT2` `open_how` pad - boxed for a stable address.
     how: Option<Box<RawOpenHow>>,
+    /// This `OPENAT2` carries an `O_NONBLOCK` the special-file guard added,
+    /// so the completion strips it back off the descriptor. False when the
+    /// caller asked for the flag itself - theirs to keep.
+    strip_nonblock: bool,
     /// `STATX` result pad - **the kernel writes it at completion**, so it
     /// must live until the CQE reaps.
     stat: Option<Box<StatxRaw>>,
@@ -253,6 +257,7 @@ impl FsOpEntry {
             path: None,
             path2: None,
             how: None,
+            strip_nonblock: false,
             stat: None,
             anchor: None,
             anchor2: None,
@@ -283,11 +288,45 @@ impl FsOpEntry {
     }
 }
 
+/// Take the special-file guard's `O_NONBLOCK` back off a freshly opened
+/// descriptor.
+///
+/// The flag exists to stop the *open* blocking on a planted FIFO or device;
+/// on the descriptor it leaves behind it is not inert. `io_file_get_flags`
+/// (`io_uring/io_uring.c:1793-1794`) reads it into `REQ_F_SUPPORT_NOWAIT` -
+/// the same bit `FMODE_NOWAIT` sets - so `__io_read` (`io_uring/rw.c:950-958`)
+/// takes the `IOCB_NOWAIT` branch instead of returning `-EAGAIN`, and the
+/// transfer runs in the submitting task rather than on an io-wq worker. That
+/// task is this reactor thread. The kernel strips the flag from the file it
+/// returns whenever it was the one that added it
+/// (`io_uring/openclose.c:161-162`); this is the same move for the same
+/// reason.
+///
+/// One `fcntl` on the reactor, ~400 ns and about 5% of the open it follows,
+/// spent to keep a whole read off this thread - a 32 MiB read of a warm ZFS
+/// file measured 22.7 ms inline against being punted. Run here because this
+/// is where the descriptor first becomes visible to anyone.
+///
+/// A failure is not worth failing the open over: the descriptor is valid
+/// either way, and what is lost is scheduling, not correctness.
+fn strip_guard_nonblock(fd: RawFd, flags: u64) {
+    // SAFETY: `fd` is the descriptor OPENAT2 just returned. `F_SETFL` honours
+    // only the settable subset (`O_APPEND`/`O_ASYNC`/`O_DIRECT`/`O_NOATIME`/
+    // `O_NONBLOCK`), so passing back what was asked for minus `O_NONBLOCK`
+    // keeps any of those the caller set and needs no `F_GETFL` first.
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFL, flags as i32 & !libc::O_NONBLOCK);
+    }
+}
+
 /// What a reaped op entry yields once its payloads are taken back out.
 struct Completed {
     waiter: Option<FsWaiter>,
     bufs: Vec<Vec<u8>>,
     stat: Option<Box<StatxRaw>>,
+    /// The open carried a guard `O_NONBLOCK`: the flags to restore without
+    /// it, or `None` when there is nothing to strip.
+    strip_nonblock: Option<u64>,
     #[cfg(feature = "net-server")]
     recv_lease: Option<std::sync::Arc<LeaseHold>>,
     #[cfg(feature = "net-server")]
@@ -477,6 +516,7 @@ impl FsCore {
 
     /// Stage an `OPENAT2` into a freshly reserved file slot. All failures are
     /// reported through `reply` (the loop never dies for a per-op reason).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn submit_open(
         &mut self,
         eng: &mut Engine,
@@ -484,6 +524,7 @@ impl FsCore {
         anchor: Anchor,
         path: CString,
         how: RawOpenHow,
+        guarded: bool,
         waiter: FsWaiter,
     ) {
         // A name-resolving op with personality 0 would run under the ring
@@ -506,6 +547,7 @@ impl FsCore {
         e.waiter = Some(waiter);
         e.path = Some(path);
         e.how = Some(Box::new(how));
+        e.strip_nonblock = guarded;
         let dirfd = anchor.raw_fd();
         let path_ptr = e.path.as_ref().expect("just set").as_ptr() as u64;
         let how_ptr =
@@ -1303,7 +1345,11 @@ impl FsCore {
         #[cfg(feature = "net-server")]
         let lease_want = completed.lease_want;
         let Completed {
-            waiter, bufs, stat, ..
+            waiter,
+            bufs,
+            stat,
+            strip_nonblock,
+            ..
         } = completed;
 
         // A successful OPENAT2 returns a real fd as its result; wrap it in an
@@ -1313,6 +1359,11 @@ impl FsCore {
         // an fd op) was already dropped by `take_op`'s `clear`, giving
         // close-last ordering by ownership.
         let file = if tag == TAG_OPEN && res >= 0 {
+            // Before anyone can see the descriptor, and so before any read of
+            // it could be issued.
+            if let Some(flags) = strip_nonblock {
+                strip_guard_nonblock(res, flags);
+            }
             // SAFETY: `res` is a fresh fd OPENAT2 just returned; nothing else
             // owns it.
             Some(Arc::new(unsafe { crate::fd::owned_from_raw(res) }))
@@ -1415,6 +1466,10 @@ impl FsCore {
         // path is what builds the `Arc` from the result). Wrap it here too, so
         // the waiter takes an owned file or its drop closes the descriptor
         // instead of leaking it.
+        // No `strip_guard_nonblock` here, unlike the live reap: the loop is
+        // dying, so no further read can be submitted on this ring, and the
+        // guard flag's only effect is on where a read of this descriptor
+        // would run.
         let file = if tag == TAG_OPEN && cqe.res >= 0 {
             // SAFETY: `res` is a fresh fd OPENAT2 just returned; nothing else
             // owns it.
@@ -1459,6 +1514,10 @@ impl FsCore {
             waiter: e.waiter.take(),
             bufs: std::mem::take(&mut e.bufs),
             stat: e.stat.take(),
+            strip_nonblock: e
+                .strip_nonblock
+                .then(|| e.how.as_ref().map(|h| h.flags))
+                .flatten(),
             #[cfg(feature = "net-server")]
             recv_lease: e.recv_lease.take(),
             #[cfg(feature = "net-server")]
@@ -1693,7 +1752,7 @@ impl<'a> FsConn<'a> {
         who: Personality,
         anchor: &Anchor,
         path: &CStr,
-        how: OpenHow,
+        how: impl Into<super::FsOpenHow>,
         on_done: F,
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
@@ -1710,18 +1769,22 @@ impl<'a> FsConn<'a> {
             // do not unify them.
             return;
         }
+        let (how, special) = how.into().into_parts();
         let mut raw = how.to_raw();
-        // The same rule as `open_parts`, through the same function: this is
-        // the facade a request handler reaches with a path the peer chose, so
-        // it cannot be the laxer of the two, and two copies of the rule had
-        // already drifted once.
+        // BOTH of `open_parts`' rules, through the same functions: this is the
+        // facade a request handler reaches with a path the peer chose, so it
+        // cannot be the laxer of the two. Sharing only one of them is how it
+        // becomes so - a creating open here parks on a planted FIFO that the
+        // client facade survives.
         super::confine_resolve(&mut raw.resolve);
+        let guarded = super::apply_special_file_guard(&mut raw, special);
         self.fs.submit_open(
             self.eng,
             who.0,
             anchor.clone(),
             path.to_owned(),
             raw,
+            guarded,
             embed(self.owner, on_done),
         );
     }
@@ -1868,12 +1931,17 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
+        // No special-file guard: every caller here opens `O_DIRECTORY`, and
+        // the kernel answers `ENOTDIR` on a FIFO or device before it ever
+        // reaches the file's own `open` method, so there is nothing to block
+        // on and nothing to strip afterwards.
         self.fs.submit_open(
             self.eng,
             who.0,
             anchor,
             path,
             how,
+            false,
             embed(self.owner, on_done),
         );
     }
@@ -4291,6 +4359,7 @@ mod routing_fuzz {
                     anchor.clone(),
                     CString::new("x").unwrap(),
                     OpenHow::new().to_raw(),
+                    false,
                     chan(&tx),
                 ),
                 1 | 2 if !core.op_free.is_empty() => {

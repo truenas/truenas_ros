@@ -374,53 +374,176 @@ pub(crate) fn confine_resolve(resolve: &mut u64) {
     }
 }
 
+/// Whether an open may be left able to block on a special file.
+///
+/// A path a peer chose can resolve to a FIFO or a device node, and opening
+/// one *blocks inside `open(2)` itself* - `fifo_open` sleeps in
+/// `wait_for_partner` (`fs/pipe.c`) until a writer appears, which for a FIFO
+/// nobody will write to is forever. There is no descriptor at that point, so
+/// no `fstatx` can screen it out after the fact; the only defences are to
+/// pass `O_NONBLOCK` or to never issue a read-open at all.
+///
+/// It is worse on the ring than off it. `io_openat_force_async`
+/// (`io_uring/openclose.c:42-50`) puts every `O_CREAT`/`O_TRUNC`/`O_TMPFILE`
+/// open straight onto an io-wq worker, where the `op.open_flag |= O_NONBLOCK`
+/// the inline path applies never runs, and `io_openat2`'s `LOOKUP_CACHED`
+/// sends a cold dentry or any symlink component down the same road. The
+/// bounded pool is `min(sq_entries, 4 * nr_cpus)`, so a handful of planted
+/// names pins every blocking fs op on the ring - and `FsHandle::into_outcome`
+/// waits with no deadline, so each pins a caller thread too.
+///
+/// # The flag is not inert on the descriptor it leaves behind
+///
+/// `O_NONBLOCK` on an open file is what `io_file_get_flags`
+/// (`io_uring/io_uring.c:1793-1794`) reads to set `REQ_F_SUPPORT_NOWAIT` -
+/// the same bit `FMODE_NOWAIT` sets - and `__io_read` (`io_uring/rw.c:950-958`)
+/// then takes the `IOCB_NOWAIT` branch instead of returning `-EAGAIN`. So the
+/// transfer runs in the *submitting task* rather than on an io-wq worker,
+/// which for every op here is the reactor thread. Measured on this crate's
+/// own rings, one 32 MiB read of a warm file:
+///
+/// ```text
+/// ZFS    plain       enter= 7.8 ms   CQE not ready   (punted to io-wq)
+/// ZFS    O_NONBLOCK  enter=22.7 ms   CQE ready       (ran inline)
+/// tmpfs  plain       enter= 0.1 ms   CQE not ready   (punted)
+/// tmpfs  O_NONBLOCK  enter=20.5 ms   CQE ready       (ran inline)
+/// ```
+///
+/// ZFS is the aggravating case rather than the cause: it references neither
+/// `IOCB_NOWAIT` nor `FMODE_NOWAIT` anywhere in its tree, so where tmpfs
+/// merely copies inline, ZFS blocks inline on a cache miss. The kernel strips
+/// the flag from the file it returns when *it* added it
+/// (`io_uring/openclose.c:161-162`, guarded on the application not having
+/// asked); [`SpecialFiles::Guard`] does the same, for the same reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpecialFiles {
+    /// Add `O_NONBLOCK` to the open so it cannot block, and strip it from the
+    /// descriptor once the open completes. The default, and the right choice
+    /// for any path a peer names or that another protocol can write.
+    ///
+    /// Costs one `fcntl(F_SETFL)` - ~400 ns here, about 5% of the open it
+    /// rides along with, once per descriptor - to keep a read of that
+    /// descriptor off the reactor thread.
+    Guard,
+    /// Leave the caller's flags exactly as given.
+    ///
+    /// For a tree the consumer owns outright, where no FIFO or device node
+    /// can appear because nothing else writes to it. Choosing this for a
+    /// multiprotocol share means one planted name hangs an io-wq worker and a
+    /// caller thread permanently, with no timeout anywhere to recover it.
+    Allow,
+}
+
+/// An [`OpenHow`] plus this crate's policy for it.
+///
+/// `OpenHow` is the kernel's `open_how` and nothing else; the policy is this
+/// crate's, applies only to opens issued on the ring, and so lives here. Every
+/// open entry point takes `impl Into<FsOpenHow>`, so passing a bare `OpenHow`
+/// keeps [`SpecialFiles::Guard`] - the safe default - and opting out is
+/// spelled at the call site that is taking the risk.
+///
+/// ```no_run
+/// # use truenas_ros::uring_fs::FsOpenHow;
+/// # use truenas_ros::sync_fs::{OpenHow, OFlag};
+/// # let how = OpenHow::new().flags(OFlag::O_RDONLY);
+/// // A tree nothing else can write to:
+/// let mine = FsOpenHow::from(how).allow_blocking_special_files();
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct FsOpenHow {
+    how: OpenHow,
+    special: SpecialFiles,
+}
+
+impl From<OpenHow> for FsOpenHow {
+    /// Takes [`SpecialFiles::Guard`].
+    fn from(how: OpenHow) -> FsOpenHow {
+        FsOpenHow {
+            how,
+            special: SpecialFiles::Guard,
+        }
+    }
+}
+
+impl FsOpenHow {
+    /// Select [`SpecialFiles::Allow`] - read its warning first.
+    pub fn allow_blocking_special_files(mut self) -> FsOpenHow {
+        self.special = SpecialFiles::Allow;
+        self
+    }
+
+    /// Select [`SpecialFiles::Guard`] explicitly (already the default).
+    pub fn guard_special_files(mut self) -> FsOpenHow {
+        self.special = SpecialFiles::Guard;
+        self
+    }
+
+    /// The kernel payload and the policy, for the submission paths.
+    pub(crate) fn into_parts(self) -> (OpenHow, SpecialFiles) {
+        (self.how, self.special)
+    }
+}
+
+/// Apply the special-file guard to `raw`, returning whether it was added here.
+///
+/// A caller that set `O_NONBLOCK` itself keeps it and gets `false`: the flag
+/// is theirs, and stripping it would be as surprising as leaving ours. This
+/// mirrors the kernel's own `nonblock_set` test at
+/// `io_uring/openclose.c:161-162`.
+///
+/// The flag goes on *every* guarded open, not only `O_CREAT`/`O_TRUNC`. Those
+/// two are merely the ones `io_openat_force_async` punts unconditionally;
+/// `io_openat2` applies `LOOKUP_CACHED` on the inline attempt only, and
+/// `legitimize_links` (`fs/namei.c:808-812`) fails while that is set, so a
+/// cold dentry or any symlink component also lands on a worker where the
+/// kernel's own fixup never runs. Narrowing the flag to the forced-async
+/// flags left those open, and since the descriptor is stripped afterwards
+/// there is nothing to be gained by narrowing it.
+pub(crate) fn apply_special_file_guard(
+    raw: &mut RawOpenHow,
+    special: SpecialFiles,
+) -> bool {
+    // `O_PATH` is excluded on both counts. It never invokes the file's own
+    // `open` method, so it cannot block on a FIFO and needs no guard; and
+    // `openat2` refuses `O_PATH` alongside anything outside
+    // `O_DIRECTORY|O_NOFOLLOW|O_PATH|O_CLOEXEC` (`fs/open.c:1298-1300`), so
+    // adding the flag would turn a working open into `EINVAL`.
+    if special == SpecialFiles::Allow
+        || raw.flags & libc::O_PATH as u64 != 0
+        || raw.flags & libc::O_NONBLOCK as u64 != 0
+    {
+        return false;
+    }
+    raw.flags |= libc::O_NONBLOCK as u64;
+    true
+}
+
+/// Split an open into the pieces a submission needs, applying both of this
+/// module's rules: resolve confinement and the special-file guard.
+///
+/// Returns whether the guard added `O_NONBLOCK`, so the completion can strip
+/// it back off the descriptor. **Both facades go through here** - the
+/// request-handler one in `core.rs` and the general-client one above - so
+/// neither can end up carrying a copy of half the rule.
 pub(crate) fn open_parts<P: ?Sized + TnPath>(
     path: &P,
-    how: OpenHow,
-) -> crate::Result<(CString, RawOpenHow)> {
+    how: FsOpenHow,
+) -> crate::Result<(CString, RawOpenHow, bool)> {
     let cpath: CString = path.with_tn_path(|c| c.to_owned())?;
     if cpath.as_bytes().is_empty() {
         return Err(crate::Error::Validation(
             "uring_fs open: empty path".into(),
         ));
     }
-    let mut raw = how.to_raw();
+    let mut raw = how.how.to_raw();
     // Union, keyed on whether the caller stated a policy at all - never on
     // `resolve == 0`. Testing the whole word makes a purely hardening flag an
     // opt-out: `RESOLVE_NO_MAGICLINKS` alone would then drop `RESOLVE_BENEATH`,
     // so a caller asking for less traversal would get less confinement and
     // `../../etc/shadow` would resolve.
     confine_resolve(&mut raw.resolve);
-    // SECURITY: a creating open must not be able to block on a name someone
-    // else planted.
-    //
-    // `io_openat_force_async` (`io_uring/openclose.c:41-50`) puts every
-    // `O_CREAT`/`O_TRUNC`/`O_TMPFILE` open straight onto an io-wq worker,
-    // which means the `op.open_flag |= O_NONBLOCK` the inline path applies
-    // (`io_openat2:132-134`, guarded by `IO_URING_F_NONBLOCK` and carrying
-    // `WARN_ON_ONCE(io_openat_force_async(open))`) never runs. `fifo_open`
-    // then sleeps in `wait_for_partner` (`fs/pipe.c`) until a writer appears
-    // - forever, for a FIFO nobody is going to write to. That pins the io-wq
-    // worker *and* the calling thread, since `FsHandle::into_outcome` waits
-    // with no deadline, and the bounded worker pool is
-    // `min(sq_entries, 4 * nr_cpus)`: a few names in a shared multiprotocol
-    // tree stall every blocking fs op on the ring. Measured at >2.5 s and
-    // still climbing against 220 us with the flag.
-    //
-    // Only `O_CREAT` and `O_TRUNC` are covered, because they are the two
-    // that can resolve to a file that already exists and blocks; `O_TMPFILE`
-    // makes an unnamed inode and can land on nothing. The flag is not
-    // cleared from the returned descriptor, and does not need to be: it is
-    // inert on a regular file and a directory, which is everything a
-    // creating open legitimately reaches - `O_CREAT` makes regular files and
-    // nothing else, so a FIFO or a device under that name is already the
-    // confused deputy this is guarding against, and a non-blocking
-    // descriptor is the wanted answer there.
-    const CAN_BLOCK_ON_AN_EXISTING_FILE: i32 = libc::O_CREAT | libc::O_TRUNC;
-    if raw.flags & CAN_BLOCK_ON_AN_EXISTING_FILE as u64 != 0 {
-        raw.flags |= libc::O_NONBLOCK as u64;
-    }
-    Ok((cpath, raw))
+    let guarded = apply_special_file_guard(&mut raw, how.special);
+    Ok((cpath, raw, guarded))
 }
 
 /// A registered io_uring personality: a kernel-held snapshot of one
@@ -896,6 +1019,9 @@ pub(crate) enum FsInject {
         anchor: Anchor,
         path: CString,
         how: RawOpenHow,
+        /// `open_parts` added `O_NONBLOCK` for the special-file guard, so the
+        /// completion strips it back off the descriptor.
+        guarded: bool,
         reply: ReplyTo,
     },
     Rw {
@@ -1113,10 +1239,10 @@ impl FsHandle {
         who: Personality,
         anchor: &Anchor,
         path: &P,
-        how: OpenHow,
+        how: impl Into<FsOpenHow>,
     ) -> crate::Result<File> {
-        let (cpath, raw) = open_parts(path, how)?;
-        self.open_raw(who, anchor, cpath, raw)
+        let (cpath, raw, guarded) = open_parts(path, how.into())?;
+        self.open_raw(who, anchor, cpath, raw, guarded)
     }
 
     /// Submit a prepared `OPENAT2`. Shared by [`open`](Self::open) and
@@ -1128,6 +1254,7 @@ impl FsHandle {
         anchor: &Anchor,
         cpath: CString,
         raw: RawOpenHow,
+        guarded: bool,
     ) -> crate::Result<File> {
         let (tx, rx) = mpsc::channel();
         let out = self.call(
@@ -1136,6 +1263,7 @@ impl FsHandle {
                 anchor: anchor.clone(),
                 path: cpath,
                 how: raw,
+                guarded,
                 reply: ReplyTo::Sync(tx),
             },
             &rx,
@@ -1169,9 +1297,9 @@ impl FsHandle {
         who: Personality,
         anchor: &Anchor,
         path: &P,
-        how: OpenHow,
+        how: impl Into<FsOpenHow>,
     ) -> crate::Result<File> {
-        let (cpath, mut raw) = open_parts(path, how)?;
+        let (cpath, mut raw, guarded) = open_parts(path, how.into())?;
         // `RESOLVE_IN_ROOT` is not a restriction that composes: the kernel
         // refuses `BENEATH|IN_ROOT` outright (`fs/open.c:1264`), so unioning
         // the bundle over a stated `IN_ROOT` made every path - a leaf, a
@@ -1190,7 +1318,7 @@ impl FsHandle {
         // Union, never assign: a caller may add restrictions (RESOLVE_NO_
         // MAGICLINKS, say) but cannot subtract any of these three.
         raw.resolve |= CONFINED_RESOLVE.bits();
-        self.open_raw(who, anchor, cpath, raw)
+        self.open_raw(who, anchor, cpath, raw, guarded)
     }
 
     /// Create every missing directory along `path` beneath `anchor`, returning
@@ -1404,6 +1532,41 @@ impl FsHandle {
         Ok(FsPending { rx })
     }
 
+    /// Start a `statx` of an **already-open** [`File`] without blocking
+    /// (`statx(fd, "", AT_EMPTY_PATH)`); collect it with
+    /// [`FsPending::wait_statx`]. The non-blocking twin of
+    /// [`fstatx`](Self::fstatx), and the fd-keyed counterpart of
+    /// [`start_statx`](Self::start_statx).
+    ///
+    /// Prefer this wherever a descriptor is already in hand: no path is
+    /// resolved, so the metadata is that descriptor's and cannot belong to
+    /// whatever the name resolved to a moment later. A listing that stats by
+    /// name *and* opens by name performs two independent lookups, and under
+    /// rename churn they can land on two different inodes - reporting one
+    /// file's size and mtime against another file's name.
+    pub fn start_fstatx(
+        &self,
+        who: Personality,
+        f: &File,
+        flags: AtFlags,
+        mask: StatxMask,
+    ) -> crate::Result<FsPending> {
+        let (tx, rx) = mpsc::channel();
+        self.send(FsInject::PathOp {
+            tag: core::TAG_STATX,
+            pers: who.0,
+            a1: Anchor::from_shared(f.fd.clone()),
+            n1: CString::default(),
+            a2: None,
+            n2: None,
+            flags: statx_at_flags(flags | AtFlags::AT_EMPTY_PATH),
+            len_arg: mask.bits(),
+            reply: ReplyTo::Sync(tx),
+        })
+        .map_err(|_| crate::Error::from(Errno::ECONNABORTED))?;
+        Ok(FsPending { rx })
+    }
+
     /// Start an `open` of `path` under `anchor` as `who` without blocking;
     /// collect the [`File`] with
     /// [`FsPending::wait_file`](FsPending::wait_file). The non-blocking twin of
@@ -1413,15 +1576,16 @@ impl FsHandle {
         who: Personality,
         anchor: &Anchor,
         path: &P,
-        how: OpenHow,
+        how: impl Into<FsOpenHow>,
     ) -> crate::Result<FsPending> {
-        let (cpath, raw) = open_parts(path, how)?;
+        let (cpath, raw, guarded) = open_parts(path, how.into())?;
         let (tx, rx) = mpsc::channel();
         self.send(FsInject::Open {
             pers: who.0,
             anchor: anchor.clone(),
             path: cpath,
             how: raw,
+            guarded,
             reply: ReplyTo::Sync(tx),
         })
         .map_err(|_| crate::Error::from(Errno::ECONNABORTED))?;
@@ -2475,7 +2639,8 @@ mod loom_tests {
             let (h, rx, shared) = handle();
             let (reply_tx, _reply_rx) = mpsc::channel();
 
-            shared.stop.store(true, Ordering::Release);
+            // The shipping spelling, so weakening it fails this model.
+            shared.request_stop();
             let refused = h
                 .send(FsInject::Fsync {
                     pers: 0,

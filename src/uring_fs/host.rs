@@ -21,7 +21,6 @@ use crate::uring::sys::{
 use crate::uring::user_data::{SLOT_MASK, TAG_FS_DOMAIN, pack_raw, unpack_raw};
 use crate::uring::wake::LoopShared;
 use std::fmt;
-use std::sync::atomic::Ordering;
 
 /// Sizing for an [`UringFs`], defaulted for a **server**: a request handler
 /// fans out many independent operations and collects their completions. Both
@@ -107,7 +106,10 @@ impl ShutdownHandle {
     /// Safe to call from any thread and more than once. Infallible: a flag
     /// store plus an eventfd poke.
     pub fn shutdown(&self) {
-        self.shared.stop.store(true, Ordering::Release);
+        // Through `request_stop`, not a hand-spelled store: one spelling of
+        // the ordering is what lets a model drive *this* code rather than
+        // its own copy of the pairing.
+        self.shared.request_stop();
         self.shared.wake.poke();
     }
 }
@@ -338,6 +340,7 @@ impl UringFs {
                     anchor,
                     path,
                     how,
+                    guarded,
                     reply,
                 } => self.fs.submit_open(
                     &mut self.eng,
@@ -345,6 +348,7 @@ impl UringFs {
                     anchor,
                     path,
                     how,
+                    guarded,
                     FsWaiter::Channel(reply),
                 ),
                 FsInject::Rw {
