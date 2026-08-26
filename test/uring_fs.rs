@@ -1870,6 +1870,51 @@ fn metadata_ops_carry_the_personality() {
 /// `with_fs`, and run the loop on a scoped thread while the test thread
 /// drives registration (the reverse of the other tests, because `UringFs`
 /// is `!Send` but `CredBroker`/`CredHandle` are `Send`).
+/// Dropping the broker must leave no zombie behind.
+///
+/// `clone3_fork(0, 0, ..)` gives the child `exit_signal == 0`, which makes it
+/// a "clone child": `eligible_child` (`kernel/exit.c:1163`) tests
+/// `(p->exit_signal != SIGCHLD) ^ !!(wo->wo_flags & __WCLONE)`, so a plain
+/// `waitpid` answers `-1 ECHILD` at once and the task stays `Z` for the host
+/// process's life. Nothing else reaps it either - no `SIGCHLD` is delivered
+/// to hang a handler off - so this leaks one task per broker.
+#[test]
+fn dropping_the_broker_leaves_no_zombie() {
+    let afs = match UringFs::new(test_cfg()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("UringFs::new: {e}"),
+    };
+    let broker = match CredBroker::spawn(&[&afs]) {
+        Ok(b) => b,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("CredBroker::spawn: {e}"),
+    };
+    let pid = broker.pid();
+    assert!(broker.is_alive(), "the broker should be running");
+    drop(broker); // SIGKILL via the pidfd, then the reap
+
+    // A successful reap releases the task, so `/proc/<pid>` is gone the
+    // moment `Drop` returns. The poll is for the failing shape: a
+    // `waitpid` that answered ECHILD returns just as fast, and the child
+    // needs a moment to finish dying before it reads `Z`.
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    // Loops while `/proc/<pid>` still exists; a read error is the reap.
+    while let Ok(last) = std::fs::read_to_string(format!("/proc/{pid}/status"))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "broker pid {pid} outlived its drop ({}): the reap needs \
+             __WALL, since exit_signal == 0 makes plain waitpid answer \
+             ECHILD and nothing else collects the task",
+            last.lines()
+                .find(|l| l.starts_with("State:"))
+                .unwrap_or("no State line")
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn with_broker<F>(client: F)
 where
     F: FnOnce(&FsHandle, &CredHandle, Personality, &Path) + Send,
