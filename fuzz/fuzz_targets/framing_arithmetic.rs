@@ -99,10 +99,23 @@ fuzz_target!(|input: (u8, u64, u64, u64, u64, Option<u64>)| {
             in_message,
         } => {
             assert!(want > 0, "ReadHeader: zero want");
-            // Only `MoreInMessage` sets it, and that verdict is never exact.
-            assert!(
-                !(exact && in_message),
-                "ReadHeader: an exact read cannot come from MoreInMessage"
+            // The two flags are independent, and each is a straight function
+            // of the verdict: `in_message` is the framer's own claim carried
+            // through untouched, and `exact` follows the verdict's shape. All
+            // four combinations are reachable - an exact read of a message
+            // already under way is `NeedInMessage`.
+            assert_eq!(
+                in_message,
+                matches!(
+                    verdict,
+                    Framing::MoreInMessage | Framing::NeedInMessage(_)
+                ),
+                "ReadHeader: in_message must carry the framer's verdict"
+            );
+            assert_eq!(
+                exact,
+                matches!(verdict, Framing::Need(_) | Framing::NeedInMessage(_)),
+                "ReadHeader: exact must follow the verdict's shape"
             );
             if exact {
                 // From Need(n): n > 0 and buffered + n <= cap.
