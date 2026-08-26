@@ -20,8 +20,8 @@
 
 use super::offload_pool::{OffloadBounds, SharedPool};
 use super::{
-    Anchor, CONFINED_RESOLVE, CONFINEMENT_POLICY, File, FsOutcome, Leaf,
-    Personality, PrivilegedXattrs, ReplyTo, RwFlags, statx_at_flags,
+    Anchor, CONFINED_RESOLVE, File, FsOutcome, Leaf, Personality,
+    PrivilegedXattrs, ReplyTo, RwFlags, statx_at_flags,
 };
 use crate::errno::{Errno, retry_on_eintr};
 use crate::sync_fs::openat2::RawOpenHow;
@@ -863,6 +863,39 @@ impl FsCore {
         );
     }
 
+    /// The opcode an fd-meta tag stages, or `None` for a tag with no arm.
+    ///
+    /// Separate from the operand match so the refusal happens **before** an
+    /// op slot is taken and an SQE is filled: `fill_sqe` zeroes the slot, so
+    /// a fall-through would submit `IORING_OP_NOP` (opcode 0) under the op's
+    /// own `user_data`, and a NOP completes `res = 0` - `Ok(0)` to the
+    /// waiter, for a write that never happened.
+    fn fd_meta_opcode(tag: u8) -> Option<u8> {
+        Some(match tag {
+            TAG_FTRUNCATE => IORING_OP_FTRUNCATE,
+            TAG_FALLOCATE => IORING_OP_FALLOCATE,
+            TAG_FADVISE => IORING_OP_FADVISE,
+            TAG_SPLICE => IORING_OP_SPLICE,
+            TAG_FGETXATTR => IORING_OP_FGETXATTR,
+            TAG_FSETXATTR => IORING_OP_FSETXATTR,
+            _ => return None,
+        })
+    }
+
+    /// The opcode a path-op tag stages, or `None` for a tag with no arm. See
+    /// [`fd_meta_opcode`](FsCore::fd_meta_opcode).
+    fn path_op_opcode(tag: u8) -> Option<u8> {
+        Some(match tag {
+            TAG_STATX => IORING_OP_STATX,
+            TAG_MKDIRAT => IORING_OP_MKDIRAT,
+            TAG_UNLINKAT => IORING_OP_UNLINKAT,
+            TAG_SYMLINKAT => IORING_OP_SYMLINKAT,
+            TAG_RENAMEAT => IORING_OP_RENAMEAT,
+            TAG_LINKAT => IORING_OP_LINKAT,
+            _ => return None,
+        })
+    }
+
     /// Stage an fd-meta op stamping `sqe.personality = personality_raw`
     /// **verbatim** (no `pers == 0` guard). Internal: the callers
     /// ([`FsCore::submit_fd_meta`], [`FsCore::submit_fgetxattr_as_root`]) own
@@ -881,6 +914,19 @@ impl FsCore {
         aux32: u32,
         waiter: FsWaiter,
     ) {
+        // Decide the opcode before a slot is taken. A tag with no arm in the
+        // match below would otherwise reach `fill_sqe`, which zeroes the SQE
+        // first (`uring/ring.rs`) - leaving `opcode` at 0, which is
+        // `IORING_OP_NOP` (first in the kernel's `enum io_uring_op`). The NOP
+        // is submitted carrying the op's real `user_data`, completes
+        // `res = 0`, and `map_res` hands the waiter `Ok(0)`: a `trusted.*`
+        // record write reported as done that never happened. The three
+        // path-op siblings refuse instead, and so does this now.
+        let Some(opcode) = Self::fd_meta_opcode(tag) else {
+            debug_assert!(false, "not an fd-meta tag {tag:#x}");
+            fail(waiter, Errno::EINVAL, vec![value]);
+            return;
+        };
         let Some(op_slot) = self.op_free.pop() else {
             fail(waiter, Errno::EBUSY, vec![value]);
             return;
@@ -906,19 +952,17 @@ impl FsCore {
         let staged = eng.stage(ud, |sqe| {
             sqe.fd = raw_fd;
             sqe.personality = personality_raw;
+            sqe.opcode = opcode;
             match tag {
                 TAG_FTRUNCATE => {
-                    sqe.opcode = IORING_OP_FTRUNCATE;
                     sqe.off_addr2 = off; // the new length
                 }
                 TAG_FALLOCATE => {
-                    sqe.opcode = IORING_OP_FALLOCATE;
                     sqe.off_addr2 = off; // offset
                     sqe.addr = len64; // length (kernel packing)
                     sqe.len = aux32; // mode
                 }
                 TAG_FADVISE => {
-                    sqe.opcode = IORING_OP_FADVISE;
                     sqe.off_addr2 = off; // offset
                     // Length rides in `addr`; the kernel consults `len` only
                     // when `addr` is 0, and 0 already means "to end of file".
@@ -926,7 +970,6 @@ impl FsCore {
                     sqe.op_flags = aux32; // POSIX_FADV_* advice
                 }
                 TAG_SPLICE => {
-                    sqe.opcode = IORING_OP_SPLICE;
                     // `sqe.fd` (set above) is the *output* - the file being
                     // written. The input rides in `splice_fd_in`, which
                     // overlays `file_index`; it is a plain descriptor, so
@@ -941,17 +984,16 @@ impl FsCore {
                     sqe.op_flags = SPLICE_F_MOVE;
                 }
                 TAG_FGETXATTR | TAG_FSETXATTR => {
-                    sqe.opcode = if tag == TAG_FGETXATTR {
-                        IORING_OP_FGETXATTR
-                    } else {
-                        IORING_OP_FSETXATTR
-                    };
                     sqe.addr = name_ptr;
                     sqe.off_addr2 = val_ptr;
                     sqe.len = val_len;
                     sqe.op_flags = aux32;
                 }
-                _ => debug_assert!(false, "not an fd-meta tag {tag:#x}"),
+                // Unreachable: `fd_meta_opcode` refused any other tag before
+                // a slot was taken. An arm added there and not here would
+                // submit a real op with zeroed operands, which is what this
+                // catches in a debug build.
+                _ => debug_assert!(false, "no operands for tag {tag:#x}"),
             }
         });
         if let Err(err) = staged {
@@ -988,6 +1030,14 @@ impl FsCore {
             fail(waiter, Errno::EINVAL, Vec::new());
             return;
         }
+        // See `stage_fd_meta`: an unhandled tag would leave the zeroed SQE's
+        // opcode at 0 - `IORING_OP_NOP` - and report `Ok(0)` for an op that
+        // never ran.
+        let Some(opcode) = Self::path_op_opcode(tag) else {
+            debug_assert!(false, "not a path-op tag {tag:#x}");
+            fail(waiter, Errno::EINVAL, Vec::new());
+            return;
+        };
         let Some(op_slot) = self.op_free.pop() else {
             fail(waiter, Errno::EBUSY, Vec::new());
             return;
@@ -1026,33 +1076,26 @@ impl FsCore {
             // `pers != 0` guaranteed at entry (fail-closed above).
             sqe.personality = pers;
             sqe.op_flags = flags;
+            sqe.opcode = opcode;
             match tag {
                 TAG_STATX => {
-                    sqe.opcode = IORING_OP_STATX;
                     sqe.len = len_arg; // STATX_* mask
                     sqe.off_addr2 = stat_ptr; // kernel writes at completion
                 }
                 TAG_MKDIRAT => {
-                    sqe.opcode = IORING_OP_MKDIRAT;
                     sqe.len = len_arg; // mode
                 }
-                TAG_UNLINKAT => {
-                    sqe.opcode = IORING_OP_UNLINKAT; // flags = AT_REMOVEDIR
-                }
+                TAG_UNLINKAT => {} // flags = AT_REMOVEDIR; nothing else
                 TAG_SYMLINKAT => {
-                    sqe.opcode = IORING_OP_SYMLINKAT;
                     sqe.off_addr2 = p2; // link path (addr = target)
                 }
                 TAG_RENAMEAT | TAG_LINKAT => {
-                    sqe.opcode = if tag == TAG_RENAMEAT {
-                        IORING_OP_RENAMEAT
-                    } else {
-                        IORING_OP_LINKAT
-                    };
                     sqe.off_addr2 = p2; // new path
                     sqe.len = dfd2 as u32; // new dirfd (kernel packing)
                 }
-                _ => debug_assert!(false, "not a path-op tag {tag:#x}"),
+                // Unreachable: `path_op_opcode` refused any other tag. See
+                // the twin arm in `stage_fd_meta`.
+                _ => debug_assert!(false, "no operands for tag {tag:#x}"),
             }
         });
         if let Err(err) = staged {
@@ -1645,12 +1688,11 @@ impl<'a> FsConn<'a> {
             return;
         }
         let mut raw = how.to_raw();
-        // The same rule as `open_parts`, and it has to stay the same: this is
+        // The same rule as `open_parts`, through the same function: this is
         // the facade a request handler reaches with a path the peer chose, so
-        // it cannot be the laxer of the two.
-        if raw.resolve & CONFINEMENT_POLICY.bits() == 0 {
-            raw.resolve |= CONFINED_RESOLVE.bits();
-        }
+        // it cannot be the laxer of the two, and two copies of the rule had
+        // already drifted once.
+        super::confine_resolve(&mut raw.resolve);
         self.fs.submit_open(
             self.eng,
             who.0,
@@ -1755,6 +1797,16 @@ impl<'a> FsConn<'a> {
         const TMPFILE_ONLY: i32 = libc::O_TMPFILE & !libc::O_DIRECTORY;
         let refused = (libc::O_CREAT | TMPFILE_ONLY) as u64;
         if raw.flags & refused != 0 {
+            return;
+        }
+        // And `RESOLVE_IN_ROOT`, for the same class of reason as the two
+        // above: the bundle unioned below carries `RESOLVE_BENEATH`, which
+        // the kernel refuses to pair with it (`fs/open.c:1264`), so every
+        // component of the walk would fail `EINVAL` - after the earlier ones
+        // had already been created.
+        if raw.resolve & crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT.bits()
+            != 0
+        {
             return;
         }
         raw.flags |= libc::O_DIRECTORY as u64;
@@ -3737,6 +3789,92 @@ mod routing_fuzz {
     fn complete(core: &mut FsCore, eng: &mut Engine, t: u8, s: u32, g: u32) {
         let res = if t == TAG_OPEN { synth_fd() } else { 16 };
         let _ = core.on_cqe(eng, t, s, g, res);
+    }
+
+    /// A tag with no arm must be refused before an SQE is filled.
+    ///
+    /// `fill_sqe` zeroes the slot, and opcode 0 is `IORING_OP_NOP` (first in
+    /// the kernel's `enum io_uring_op`). A fall-through therefore submitted a
+    /// NOP carrying the op's real `user_data`: it completes `res = 0`, and
+    /// `map_res` turns that into `Ok(0)` - an `FSETXATTR` of a `trusted.*`
+    /// record reported as done that never ran. The debug half is the
+    /// `debug_assert!(false)`; this is the half that ships.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn an_unknown_tag_is_refused_rather_than_staged_as_a_nop() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let before = snapshot(&core);
+
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        let (tx, rx) = mpsc::channel();
+        core.submit_fd_meta(
+            &mut eng,
+            0x7F, // no arm in either match
+            1,
+            file,
+            None,
+            vec![1, 2, 3],
+            0,
+            0,
+            0,
+            chan(&tx),
+        );
+        let out = rx.try_recv().expect("refusal is delivered, not dropped");
+        assert_eq!(out.res, Err(Errno::EINVAL));
+        assert_eq!(out.bufs, vec![vec![1u8, 2, 3]], "the value comes back");
+
+        let (tx2, rx2) = mpsc::channel();
+        core.submit_path_op(
+            &mut eng,
+            0x7E,
+            1,
+            Anchor::open("/").expect("anchor /"),
+            CString::new("x").unwrap(),
+            None,
+            None,
+            0,
+            0,
+            chan(&tx2),
+        );
+        assert_eq!(rx2.try_recv().expect("delivered").res, Err(Errno::EINVAL));
+
+        assert!(inflight(&core).is_empty(), "nothing was staged");
+        assert_eq!(snapshot(&core), before, "no op slot was consumed");
+    }
+
+    /// The debug half of the guard above: the same call trips the
+    /// `debug_assert!(false)` rather than reaching the refusal.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "not an fd-meta tag")]
+    fn an_unknown_tag_asserts_in_debug() {
+        let Some(mut eng) = engine_or_skip() else {
+            // A `should_panic` test cannot skip; panic with the expected
+            // message so an unavailable ring does not read as a regression.
+            panic!("not an fd-meta tag (io_uring unavailable: skipped)");
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        let (tx, _rx) = mpsc::channel();
+        core.submit_fd_meta(
+            &mut eng,
+            0x7F,
+            1,
+            file,
+            None,
+            Vec::new(),
+            0,
+            0,
+            0,
+            chan(&tx),
+        );
     }
 
     /// A short leased write must not look like success: its source is the

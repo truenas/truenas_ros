@@ -25,9 +25,13 @@ use super::Mode;
 ///
 /// To build a nested tree, alternate this with a confined walk -
 /// [`openat2`](super::openat2) under `RESOLVE_BENEATH |
-/// RESOLVE_NO_SYMLINKS` - so each component is created against a
-/// descriptor already proven to be inside the anchor. See
-/// `a_component_at_a_time_builds_a_tree`.
+/// RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV` - so each component is created
+/// against a descriptor already proven to be inside the anchor *and* on
+/// the anchor's own filesystem. `BENEATH` does not imply `NO_XDEV`: the
+/// kernel refuses a mount crossing only under `LOOKUP_NO_XDEV`
+/// (`__traverse_mounts`, `fs/namei.c:1485-1522`), so without it the walk
+/// steps into a nested dataset - or a `.zfs/snapshot` automount - and
+/// creates there. See `a_component_at_a_time_builds_a_tree`.
 ///
 /// Rejected: empty, `.`, `..`, and anything containing `/`.
 ///
