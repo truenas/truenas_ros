@@ -11352,6 +11352,143 @@ fn a_redelivery_does_not_retire_the_next_message_budget() {
 ///
 /// `arm_receipt_deadline` is reachable only from `submit_recv`, which a
 /// `Framing::SpliceBody` body never enters, so the one clock that progress
+/// A spliced body is bounded per window, not whole.
+///
+/// `max_receipt_time` is a rate floor: `ServerConfig` promises "each window
+/// is its own message, so an upload of any size is admitted", and tells the
+/// operator to pick it "from the slowest client worth serving, not from the
+/// largest upload". A buffered body earns that by construction - the framer
+/// splits anything above `STREAM_WINDOW` into windows, each its own message
+/// with its own budget. A spliced body is one message however large, so a
+/// budget armed once for the whole transfer made wall clock cap upload
+/// *size*.
+///
+/// Here: four windows, each moved in a quarter of the budget, but the whole
+/// body needing longer than one budget. Every gap is far inside both
+/// inactivity clocks, so nothing but a total bound can reap this - and a
+/// total bound is what this must not be.
+///
+/// The pipe is drained continuously; at 512 KiB the body is many times a
+/// pipe's capacity, so without a reader the splice would block on
+/// backpressure and the test would measure that instead.
+#[test]
+fn a_large_spliced_body_is_bounded_per_window_not_whole() {
+    use std::sync::Mutex;
+
+    const WINDOW: usize = 128 * 1024;
+    const WINDOWS: usize = 6;
+    const BODY: usize = WINDOW * WINDOWS;
+    /// Gap between windows: inside `request_timeout`, so the readiness poll
+    /// is re-armed on every one and can never be what reaps this.
+    const GAP: Duration = Duration::from_millis(150);
+
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `pipe(2)` fills the two-element array with {read, write}.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (pipe_rd, pipe_wr) = (fds[0], fds[1]);
+
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let cfg = ServerConfig {
+        // One window every 150 ms, so no window is remotely near the budget
+        // - but six of them take ~900 ms, and a budget armed once for the
+        // whole transfer fires at 500 ms, mid-body.
+        max_receipt_time: Some(Duration::from_millis(500)),
+        // Above the per-window gap, so the readiness poll is re-armed by
+        // every window and cannot be what reaps this. `ServerConfig` also
+        // requires the receipt budget to exceed it.
+        request_timeout: Some(Duration::from_millis(400)),
+        idle_timeout: None,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: splice_header(pipe_wr),
+        body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
+    };
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => {
+            // SAFETY: closing the test-owned pipe fds on the skip path.
+            unsafe {
+                libc::close(pipe_rd);
+                libc::close(pipe_wr);
+            }
+            return;
+        }
+        Err(e) => panic!("bind: {e}"),
+    };
+    {
+        let reasons = Arc::clone(&reasons);
+        server.set_close_hook(move |_addr, reason, _state: &mut ()| {
+            reasons.lock().unwrap().push(reason);
+        });
+    }
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    // Drain the pipe for the whole run, so the splice never blocks.
+    let draining = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let drain = {
+        let draining = Arc::clone(&draining);
+        thread::spawn(move || {
+            let mut sink = vec![0u8; 64 * 1024];
+            while draining.load(std::sync::atomic::Ordering::Relaxed) {
+                // SAFETY: `pipe_rd` is a live read end owned by this test.
+                let n = unsafe {
+                    libc::read(pipe_rd, sink.as_mut_ptr().cast(), sink.len())
+                };
+                if n <= 0 {
+                    break;
+                }
+            }
+        })
+    };
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            let mut hdr = vec![b'S'];
+            hdr.extend_from_slice(&(BODY as u32).to_be_bytes());
+            s.write_all(&hdr)?;
+            s.flush()?;
+            let chunk = vec![b'x'; WINDOW];
+            for _ in 0..WINDOWS {
+                s.write_all(&chunk)?;
+                s.flush()?;
+                thread::sleep(GAP);
+            }
+            // Alive? Then the transfer was never reaped, and the budget was
+            // retired with the message rather than left armed.
+            splice_frame(&mut s, b'C', b"ping")?;
+            assert_eq!(recv_framed(&mut s)?, b"ping");
+            Ok(())
+        })();
+        stop.shutdown();
+        r
+    });
+
+    server.serve_forever().expect("serve_forever");
+    draining.store(false, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: the test owns both ends; the server never closes `pipe_wr`.
+    unsafe {
+        libc::close(pipe_wr);
+        libc::close(pipe_rd);
+    }
+    let _ = drain.join();
+    client.join().expect("thread join").expect("client io");
+    assert_eq!(
+        reasons.lock().unwrap().clone().as_slice(),
+        &[CloseReason::PeerClosed],
+        "a body moving a window per quarter-budget is above the floor: \
+         ReceiptTimeout here means the budget bounded the transfer whole, \
+         so wall clock capped upload size"
+    );
+}
+
 /// cannot restart did not reach the splice path at all - the two that do
 /// (`request_timeout` on the readiness poll, the kTLS watchdog) are both
 /// inactivity bounds any arriving byte re-arms. And where a multi-read

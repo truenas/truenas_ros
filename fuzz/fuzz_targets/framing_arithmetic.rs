@@ -19,10 +19,11 @@ fuzz_target!(|input: (u8, u64, u64, u64, u64, Option<u64>)| {
     let (sel, a, b, buffered, max_request_bytes, threshold) = input;
     // u64 == usize here (64-bit), so the full range — including the overflow
     // edges — is reachable.
-    let verdict = match sel % 6 {
+    let verdict = match sel % 7 {
         0 => Framing::Need(a as usize),
         1 => Framing::More,
         4 => Framing::MoreInMessage,
+        5 => Framing::NeedInMessage(a as usize),
         2 => Framing::Complete {
             header_len: a as usize,
             body_len: b as usize,

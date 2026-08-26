@@ -17,6 +17,27 @@ use std::os::fd::RawFd;
 /// Bytes to request per chunked (`Framing::More`) recv.
 const RECV_CHUNK: usize = 4096;
 
+/// Bytes of a spliced body that buy one more receipt budget.
+///
+/// `max_receipt_time` is a rate floor, not a total: `ServerConfig` promises
+/// that "each window is its own message, so an upload of any size is
+/// admitted". A *buffered* body earns that by construction - the framer
+/// splits anything above `http::framer::STREAM_WINDOW` so each window is a
+/// separate message with its own budget. A spliced body is one message
+/// however large, so without a window here the budget bounded the whole
+/// transfer and wall clock capped upload *size*: an 8 MiB body at 10 MB/s
+/// was reaped after 7 MiB, with every gap far inside the inactivity clocks.
+///
+/// Renewing per window is not the same as restarting on progress. A peer
+/// must move a *whole* window to earn another budget, which is exactly the
+/// documented floor of `RECEIPT_WINDOW / max_receipt_time`; one that stalls,
+/// or drips below it, still fails to move a window in time and is closed.
+///
+/// Kept equal to `http::framer::STREAM_WINDOW` so both paths set the same
+/// floor, and stated as a constant here because the net core does not depend
+/// on `http` (see `RECV_BUF_BYTES`, which cites it the same way).
+const RECEIPT_WINDOW: usize = 128 * 1024;
+
 /// Point a staged recv at a provided-buffer group, if one was chosen.
 ///
 /// `buf_index` is the union field the kernel reads as `buf_group`; the SQE's
@@ -149,6 +170,36 @@ pub enum FrameStep {
     },
 }
 
+/// The shared body of [`Framing::Need`] and [`Framing::NeedInMessage`]: an
+/// exact read of `n`, with `in_message` the only difference between them.
+///
+/// `n` is framer-supplied - typically echoed straight off the wire - so the
+/// post-read total is capped exactly like a `Complete` frame, and one verdict
+/// cannot size a recv allocation past `max_request_bytes`.
+///
+/// Which clock the read carries is the framer's to state and cannot be
+/// inferred here: a `Need` from an empty buffer is the next message's first
+/// read for a length-prefix framer and a body continuation for one that
+/// consumed its head, and the two want opposite timeouts.
+fn need_step(
+    n: usize,
+    buffered: usize,
+    max_request_bytes: usize,
+    in_message: bool,
+) -> FrameStep {
+    if n == 0 {
+        return FrameStep::Close(CloseReason::Malformed);
+    }
+    match buffered.checked_add(n) {
+        Some(total) if total <= max_request_bytes => FrameStep::ReadHeader {
+            want: n,
+            exact: true,
+            in_message,
+        },
+        _ => FrameStep::Close(CloseReason::TooLarge),
+    }
+}
+
 /// The pump's per-verdict framing decision, factored out as a **pure** function
 /// so it can be exhaustively fuzzed (`fuzz/fuzz_targets/framing_arithmetic.rs`)
 /// independently of the io_uring loop: given a framer's [`Framing`] verdict, the
@@ -173,27 +224,11 @@ pub fn frame_step(
 ) -> FrameStep {
     match verdict {
         Framing::Invalid => FrameStep::Close(CloseReason::Malformed),
-        Framing::Need(n) => {
-            if n == 0 {
-                return FrameStep::Close(CloseReason::Malformed);
-            }
-            // `n` is framer-supplied (typically echoed straight off the wire):
-            // cap the post-read total exactly like a `Complete` frame, so one
-            // verdict can't size a recv allocation past `max_request_bytes`.
-            match buffered.checked_add(n) {
-                Some(total) if total <= max_request_bytes => {
-                    FrameStep::ReadHeader {
-                        want: n,
-                        exact: true,
-                        // A `Need` names a length, so the message it belongs
-                        // to is knowable from what is buffered: a mid-header
-                        // `Need` always has bytes accumulated, and one with an
-                        // empty buffer is the next message's first read.
-                        in_message: false,
-                    }
-                }
-                _ => FrameStep::Close(CloseReason::TooLarge),
-            }
+        Framing::Need(n) => need_step(n, buffered, max_request_bytes, false),
+        // Same read; the flag is the whole difference. See
+        // `Framing::NeedInMessage`.
+        Framing::NeedInMessage(n) => {
+            need_step(n, buffered, max_request_bytes, true)
         }
         Framing::More => FrameStep::ReadHeader {
             want: RECV_CHUNK,
@@ -567,7 +602,17 @@ impl<U> Reactor<U> {
         // extend the message's budget rather than restarting it, and a
         // header that already armed one keeps it.
         #[cfg(feature = "net-server")]
-        self.arm_receipt_deadline(slot, generation)?;
+        {
+            // Only when this call is the one that arms it: a short-splice
+            // resubmit must not move the mark, or no expiry could ever tell
+            // progress from a stall.
+            let fresh = !self.table.conn(slot).receipt_deadline_armed;
+            self.arm_receipt_deadline(slot, generation)?;
+            if fresh {
+                let conn = self.table.conn_mut(slot);
+                conn.receipt_window_mark = conn.splice_remaining;
+            }
+        }
         Ok(())
     }
 
@@ -816,12 +861,31 @@ impl<U> Reactor<U> {
             }
             return Ok(());
         }
-        {
+        let earned_another = {
             let conn = self.table.conn_mut(slot);
             if !conn.receipt_deadline_armed {
                 return Ok(()); // delivered already; this expiry lost the race
             }
             conn.receipt_deadline_armed = false;
+            // A spliced body is one message however large, so a budget that
+            // retired only at the end capped upload size by wall clock. Renew
+            // it for each whole window the peer actually moved - see
+            // `RECEIPT_WINDOW` for why that is the documented floor rather
+            // than a clock restarted by progress. A buffered message has no
+            // mark set and falls straight through to the close.
+            let moved = conn
+                .receipt_window_mark
+                .saturating_sub(conn.splice_remaining);
+            let splicing = conn.splicing || conn.splice_polling;
+            if splicing && moved >= RECEIPT_WINDOW {
+                conn.receipt_window_mark = conn.splice_remaining;
+                true
+            } else {
+                false
+            }
+        };
+        if earned_another {
+            return self.arm_receipt_deadline(slot, generation);
         }
         self.close_conn(slot, generation, CloseReason::ReceiptTimeout)
     }
@@ -2237,6 +2301,42 @@ mod tests {
                 exact: false,
                 in_message: true
             }
+        );
+        // An exact read from an empty buffer is ambiguous on its own: for a
+        // length-prefix framer it is the next message's first read, and for
+        // one that parsed a body length out of a head it has already consumed
+        // it is a continuation. Only the framer knows, so only the framer can
+        // say - and a `Need` that should have been `NeedInMessage` arms no
+        // receipt budget and takes the idle clock, which where
+        // `idle_timeout` is unset is no clock at all.
+        assert_eq!(
+            frame_step(Framing::Need(64), 0, MAX, None),
+            FrameStep::ReadHeader {
+                want: 64,
+                exact: true,
+                in_message: false
+            }
+        );
+        assert_eq!(
+            frame_step(Framing::NeedInMessage(64), 0, MAX, None),
+            FrameStep::ReadHeader {
+                want: 64,
+                exact: true,
+                in_message: true
+            }
+        );
+        // The twin inherits every guard, not just the flag.
+        assert_eq!(
+            frame_step(Framing::NeedInMessage(0), 0, MAX, None),
+            FrameStep::Close(CloseReason::Malformed)
+        );
+        assert_eq!(
+            frame_step(Framing::NeedInMessage(usize::MAX), 8, MAX, None),
+            FrameStep::Close(CloseReason::TooLarge)
+        );
+        assert_eq!(
+            frame_step(Framing::NeedInMessage(MAX), 1, MAX, None),
+            FrameStep::Close(CloseReason::TooLarge)
         );
         // Invalid closes.
         assert_eq!(

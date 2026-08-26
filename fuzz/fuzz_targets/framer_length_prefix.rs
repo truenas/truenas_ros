@@ -65,6 +65,17 @@ fuzz_target!(|data: &[u8]| {
                         Framing::More | Framing::MoreInMessage => {
                             panic!("length prefix framer returned More")
                         }
+                        // Nor the in-message twin of `Need`: the prefix is
+                        // read from an empty buffer, where this framer really
+                        // is idle, and mid-prefix it has bytes buffered -
+                        // which `frame_step` already reads as in-message
+                        // without being told.
+                        Framing::NeedInMessage(_) => {
+                            panic!(
+                                "length prefix framer returned \
+                                    NeedInMessage"
+                            )
+                        }
                         Framing::SpliceBody { .. } => {
                             panic!("length prefix framer returned SpliceBody")
                         }
