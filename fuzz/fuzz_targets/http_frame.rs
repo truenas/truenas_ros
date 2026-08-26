@@ -47,8 +47,9 @@ fuzz_target!(|data: &[u8]| {
                 data.len()
             );
         }
-        // Ran out of bytes mid-message.
-        Framing::More => {}
+        // Ran out of bytes: parked for the next message (`More`) or still
+        // receiving one already begun (`MoreInMessage`).
+        Framing::More | Framing::MoreInMessage => {}
         // The http framer never asks for exact counts, never splices, and
         // never returns Invalid — failures become Phase::Fail plus a
         // degenerate Complete so the glue can answer with a real status.

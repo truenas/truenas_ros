@@ -113,6 +113,10 @@ pub enum FrameStep {
         want: usize,
         /// `MSG_WAITALL` (exact count) vs a chunk read.
         exact: bool,
+        /// The framer says a message is already under way, so this read is an
+        /// active transfer even with nothing buffered
+        /// ([`Framing::MoreInMessage`]).
+        in_message: bool,
     },
     /// Read the message body: `want` more bytes (exact), recording the
     /// `header_len`/`body_len` split; `place` reads into an own allocation.
@@ -181,6 +185,11 @@ pub fn frame_step(
                     FrameStep::ReadHeader {
                         want: n,
                         exact: true,
+                        // A `Need` names a length, so the message it belongs
+                        // to is knowable from what is buffered: a mid-header
+                        // `Need` always has bytes accumulated, and one with an
+                        // empty buffer is the next message's first read.
+                        in_message: false,
                     }
                 }
                 _ => FrameStep::Close(CloseReason::TooLarge),
@@ -189,6 +198,14 @@ pub fn frame_step(
         Framing::More => FrameStep::ReadHeader {
             want: RECV_CHUNK,
             exact: false,
+            in_message: false,
+        },
+        // Same read; the flag is the whole difference. See
+        // `Framing::MoreInMessage`.
+        Framing::MoreInMessage => FrameStep::ReadHeader {
+            want: RECV_CHUNK,
+            exact: false,
+            in_message: true,
         },
         Framing::Complete {
             header_len,
@@ -540,6 +557,17 @@ impl<U> Reactor<U> {
         if ktls {
             self.arm_splice_deadline(slot, generation)?;
         }
+        // The total-receipt budget covers a spliced body like any other. It
+        // cannot arm itself here the way a buffered message does: the only
+        // arm site is `submit_recv`, and a spliced body never enters it, so
+        // without this the one clock that is not restarted by progress does
+        // not reach the framing that needs it most - both clocks above are
+        // inactivity bounds that any arriving byte re-arms. Idempotent on
+        // `receipt_deadline_armed`, so the resubmit and readiness-poll paths
+        // extend the message's budget rather than restarting it, and a
+        // header that already armed one keeps it.
+        #[cfg(feature = "net-server")]
+        self.arm_receipt_deadline(slot, generation)?;
         Ok(())
     }
 
@@ -815,6 +843,7 @@ impl<U> Reactor<U> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // one frame step unpacked, not an API
     pub(crate) fn submit_recv(
         &mut self,
         slot: u32,
@@ -823,6 +852,7 @@ impl<U> Reactor<U> {
         want: usize,
         exact: bool,
         place_body: bool,
+        in_message: bool,
     ) -> errno::Result<()> {
         // A connection with no buffer acquires one with the read itself:
         // `IOSQE_BUFFER_SELECT` has the kernel pick at completion, so an
@@ -883,11 +913,19 @@ impl<U> Reactor<U> {
             self.promote_recv_buffer(slot, want);
         }
         // The connection is idle - parked for the next request - when this is a
-        // header read with nothing yet accumulated. Only such reads carry the
-        // idle timeout; body and mid-header continuation reads are active
-        // transfers.
-        let idle =
-            op == Op::RecvHeader && self.table.conn(slot).buffered() == 0;
+        // header read with nothing yet accumulated *and the framer has not said
+        // otherwise*. Only such reads carry the idle timeout; body and
+        // mid-header continuation reads are active transfers.
+        //
+        // `buffered() == 0` alone cannot answer this. A streaming codec
+        // consumes each window as its own message, so between windows - and
+        // after a 100-continue dance has consumed the head - the buffer is
+        // empty while the request is very much in progress. `in_message`
+        // carries the framer's own verdict (`Framing::MoreInMessage`), which
+        // is the only place that distinction exists.
+        let idle = op == Op::RecvHeader
+            && !in_message
+            && self.table.conn(slot).buffered() == 0;
         // SECURITY: a message is under way, so its total-receipt budget
         // runs from here - the one place that knows the read belongs to a
         // message already begun.
@@ -1794,9 +1832,19 @@ impl<U> Reactor<U> {
             return Ok(SpliceStep::Done);
         }
         // Whole body spliced: retire the inactivity watchdog (kTLS only; a
-        // no-op otherwise), drop the header from the buffer (the body never
-        // entered it), and frame the next message.
+        // no-op otherwise) and the receipt budget, drop the header from the
+        // buffer (the body never entered it), and frame the next message.
+        //
+        // The budget MUST be retired here. There is no `deliver_one` on this
+        // path - the framer that returned `SpliceBody` was the per-frame
+        // consumer hook - so this is the only place the message ends, and a
+        // budget left armed reaps the connection mid-idle for having
+        // completed a transfer on time. Until it fired it also suppressed
+        // the budget of every later message, `arm_receipt_deadline` being
+        // idempotent on the flag.
         self.cancel_splice_deadline(slot, generation)?;
+        #[cfg(feature = "net-server")]
+        self.cancel_receipt_deadline(slot, generation)?;
         self.table.conn_mut(slot).consume();
         Ok(SpliceStep::Pump)
     }
@@ -1983,7 +2031,11 @@ impl<U> Reactor<U> {
                 self.close_conn(slot, generation, reason)?;
                 Ok(Enacted::Done)
             }
-            FrameStep::ReadHeader { want, exact } => {
+            FrameStep::ReadHeader {
+                want,
+                exact,
+                in_message,
+            } => {
                 self.submit_recv(
                     slot,
                     generation,
@@ -1991,6 +2043,7 @@ impl<U> Reactor<U> {
                     want,
                     exact,
                     false,
+                    in_message,
                 )?;
                 Ok(Enacted::Done)
             }
@@ -2043,6 +2096,8 @@ impl<U> Reactor<U> {
                     want,
                     true,
                     place,
+                    // A body read is an active transfer whatever is buffered.
+                    true,
                 )?;
                 Ok(Enacted::Done)
             }
@@ -2116,7 +2171,8 @@ mod tests {
             frame_step(Framing::Need(4), 0, MAX, None),
             FrameStep::ReadHeader {
                 want: 4,
-                exact: true
+                exact: true,
+                in_message: false
             }
         );
         // A need whose post-read total exceeds the cap closes TooLarge...
@@ -2134,7 +2190,19 @@ mod tests {
             frame_step(Framing::More, 7, MAX, None),
             FrameStep::ReadHeader {
                 want: RECV_CHUNK,
-                exact: false
+                exact: false,
+                in_message: false
+            }
+        );
+        // The same read, flagged as an active transfer. That flag is the
+        // whole of the difference, and `submit_recv` reads it to pick the
+        // clock and arm the receipt budget.
+        assert_eq!(
+            frame_step(Framing::MoreInMessage, 0, MAX, None),
+            FrameStep::ReadHeader {
+                want: RECV_CHUNK,
+                exact: false,
+                in_message: true
             }
         );
         // Invalid closes.

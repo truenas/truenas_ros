@@ -427,10 +427,35 @@ Do not reopen these without a reason that is new.
   show this - a length-prefixed body is one `submit_recv` whatever happens
   afterwards - so the control for it has to be a chunk scan
   (`a_chunk_scan_budget_is_not_restarted_by_progress`).
+- **A spliced body arms and retires it in `submit_splice_recv` /
+  `on_splice_recv_complete`.** That path never enters `submit_recv`, so the
+  arm site the buffered framings share cannot reach it, and the two clocks
+  that do reach it - `request_timeout` on the readiness poll, the kTLS
+  watchdog - are both inactivity bounds any arriving byte re-arms. There is
+  also no `deliver_one` there, so the whole-body tail is the only place the
+  message ends: a budget left armed reaps a connection for having finished
+  on time, and suppresses every later message's budget until it does
+  (`arm_receipt_deadline` is idempotent on the flag).
+  `the_receipt_budget_bounds_a_spliced_body_and_ends_with_it` drives both
+  halves with `idle_timeout` unset, so neither can be masked.
 - **Retiring at *delivery* is what keeps it a bound on receipt.** A
   `Response::Defer` may run arbitrarily long, and a budget still armed would
   clock the handler, then the next idle period, on a connection that has done
   nothing wrong.
+- **"Idle" is the framer's verdict, not `buffered() == 0`.** A streaming
+  codec consumes each window as its own message, so between windows - and
+  after the 100-continue dance has consumed the head - the buffer is empty
+  while the request is very much in progress, which is indistinguishable at
+  the reactor from a connection parked for its next request. Read off
+  `buffered()` alone, such a connection takes `idle_timeout` instead of
+  `request_timeout` and arms **no** receipt budget: with `idle_timeout`
+  unset it is never reaped at all, which is the exact denial both knobs
+  exist to close. `Framing::MoreInMessage` is the framer saying "a message
+  is under way"; `known_step`, `stream_step` and `scan_step` answer it, and
+  `Phase::Head` and `Phase::Parked` deliberately do not - a parked request
+  is being *handled*, and handling is not clocked.
+  `a_stalled_streamed_upload_is_reaped_mid_body` runs with `idle_timeout`
+  unset so the misclassification has nothing to fall back on.
 
 ### The offload pool
 

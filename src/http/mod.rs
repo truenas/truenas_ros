@@ -152,7 +152,7 @@ pub mod fuzz {
         let mut verdict = Framing::More;
         for end in 0..=data.len() {
             verdict = frame(&data[..end], &mut conn, &cfg);
-            if !matches!(verdict, Framing::More) {
+            if !matches!(verdict, Framing::More | Framing::MoreInMessage) {
                 break;
             }
         }

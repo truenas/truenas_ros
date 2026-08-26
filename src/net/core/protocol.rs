@@ -58,7 +58,35 @@ pub enum Framing {
     Need(usize),
     /// Read whatever the peer has sent (a chunk, no `MSG_WAITALL`), then
     /// re-check. Use when scanning for a delimiter of unknown position.
+    ///
+    /// Answering this with **nothing buffered** tells the server the
+    /// connection is parked for the *next* message: it carries
+    /// [`ServerConfig::idle_timeout`] and arms no receipt budget. A framer
+    /// mid-message with an empty buffer - a streamed body between windows,
+    /// a chunked body whose head was consumed by the 100-continue dance --
+    /// must answer [`MoreInMessage`](Framing::MoreInMessage) instead.
+    ///
+    /// [`ServerConfig::idle_timeout`]: crate::net::server::ServerConfig::idle_timeout
     More,
+    /// [`More`](Framing::More) for a message the peer has already begun.
+    ///
+    /// Identical in what it reads. The difference is which clock the read
+    /// carries: the server cannot tell a mid-message scan from an idle park
+    /// once the framer has consumed everything buffered, and only the framer
+    /// knows. This says "a message is under way", so the read takes
+    /// [`ServerConfig::request_timeout`] rather than
+    /// [`ServerConfig::idle_timeout`] and arms
+    /// [`ServerConfig::max_receipt_time`].
+    ///
+    /// **SECURITY: a framer that answers `More` here loses both bounds.** A
+    /// peer that sends a partial message and stops is then held by the idle
+    /// clock alone - by nothing at all where that is unset - with its pool
+    /// slot taken at accept, before any authentication.
+    ///
+    /// [`ServerConfig::idle_timeout`]: crate::net::server::ServerConfig::idle_timeout
+    /// [`ServerConfig::request_timeout`]: crate::net::server::ServerConfig::request_timeout
+    /// [`ServerConfig::max_receipt_time`]: crate::net::server::ServerConfig::max_receipt_time
+    MoreInMessage,
     /// The message is completely framed: its header is the first
     /// `header_len` accumulated bytes and its body is `body_len` bytes. The
     /// server reads any body bytes not already buffered, then delivers the

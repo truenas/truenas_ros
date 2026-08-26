@@ -11129,3 +11129,140 @@ fn an_exact_read_over_the_pool_buffer_takes_an_owned_one() {
         "the pool settles back to nothing lent: {s:?}"
     );
 }
+/// The receipt budget covers a spliced body, in both directions.
+///
+/// `arm_receipt_deadline` is reachable only from `submit_recv`, which a
+/// `Framing::SpliceBody` body never enters, so the one clock that progress
+/// cannot restart did not reach the splice path at all - the two that do
+/// (`request_timeout` on the readiness poll, the kTLS watchdog) are both
+/// inactivity bounds any arriving byte re-arms. And where a multi-read
+/// header had armed one, nothing retired it: there is no `deliver_one` on
+/// this path, so the budget outlived the message it belonged to and reaped
+/// a connection that had transferred its body on time.
+///
+/// Both halves on the plain-TCP splice, which is the same code as the kTLS
+/// one up to the blocking-vs-poll difference (see `submit_splice_recv`).
+#[test]
+fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
+    use std::sync::Mutex;
+    for (what, trickle) in [("a healthy body", false), ("a trickle", true)] {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe(2)` fills the two-element array with {read, write}.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let (pipe_rd, pipe_wr) = (fds[0], fds[1]);
+
+        let reasons = Arc::new(Mutex::new(Vec::new()));
+        let cfg = ServerConfig {
+            request_timeout: Some(Duration::from_millis(300)),
+            max_receipt_time: Some(Duration::from_millis(700)),
+            // Unset, so a connection that has finished its message and gone
+            // quiet has no other clock that could reap it: the healthy case
+            // fails loudly if the budget is still armed.
+            idle_timeout: None,
+            ..ServerConfig::default()
+        };
+        let addr =
+            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let proto = Protocol {
+            accept: |_: Incoming<'_>| Some(()),
+            header: splice_header(pipe_wr),
+            body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
+        };
+        let mut server = match Server::with_config([addr], cfg, proto) {
+            Ok(s) => s,
+            Err(e) if should_skip(&e) => {
+                // SAFETY: closing the test-owned pipe fds on the skip path.
+                unsafe {
+                    libc::close(pipe_rd);
+                    libc::close(pipe_wr);
+                }
+                return;
+            }
+            Err(e) => panic!("bind: {e}"),
+        };
+        {
+            let reasons = Arc::clone(&reasons);
+            server.set_close_hook(move |_addr, reason, _state: &mut ()| {
+                reasons.lock().unwrap().push(reason);
+            });
+        }
+        let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+            panic!("expected Tcp");
+        };
+        let stop = server.shutdown_handle();
+
+        // 64 bytes: well inside a pipe's capacity, so no reader is needed
+        // and nothing here can block on backpressure.
+        const BODY: usize = 64;
+        let client = thread::spawn(move || {
+            let _stop = ShutdownOnDrop(stop.clone());
+            let r = (|| -> io::Result<()> {
+                let mut s = connect_tcp(v4)?;
+                let mut hdr = vec![b'S'];
+                hdr.extend_from_slice(&(BODY as u32).to_be_bytes());
+                s.write_all(&hdr)?;
+                s.flush()?;
+                if trickle {
+                    // One byte per 150 ms - half `request_timeout`, so the
+                    // readiness poll is re-armed on every byte and never
+                    // fires, while the body needs 9.6 s against a 700 ms
+                    // budget.
+                    for _ in 0..BODY {
+                        if s.write_all(b"x").is_err() || s.flush().is_err() {
+                            break; // reaped under us, which is the point
+                        }
+                        thread::sleep(Duration::from_millis(150));
+                    }
+                } else {
+                    s.write_all(&[b'x'; BODY])?;
+                    s.flush()?;
+                    // The message is over. Stay quiet for longer than the
+                    // budget: a budget left armed reaps this connection.
+                    thread::sleep(Duration::from_millis(1200));
+                    // Still alive? Then the framing survived too.
+                    splice_frame(&mut s, b'C', b"ping")?;
+                    assert_eq!(recv_framed(&mut s)?, b"ping");
+                    return Ok(());
+                }
+                let mut sink = [0u8; 64];
+                s.set_read_timeout(Some(Duration::from_secs(5)))?;
+                match s.read(&mut sink) {
+                    Ok(0) => Ok(()),
+                    Ok(n) => panic!("answered {n} bytes to a trickled body"),
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                        Ok(())
+                    }
+                    Err(e) => panic!("the slot was never reclaimed: {e}"),
+                }
+            })();
+            stop.shutdown();
+            r
+        });
+
+        server.serve_forever().expect("serve_forever");
+        // SAFETY: the test owns both ends; the server never closes `pipe_wr`.
+        unsafe {
+            libc::close(pipe_wr);
+            libc::close(pipe_rd);
+        }
+        client.join().expect("thread join").expect("client io");
+        let got = reasons.lock().unwrap().clone();
+        if trickle {
+            assert_eq!(
+                got.as_slice(),
+                &[CloseReason::ReceiptTimeout],
+                "{what}: a spliced body under the floor must read as \
+                 ReceiptTimeout - nothing at all means the budget never \
+                 armed, since no other clock on this path is a total bound"
+            );
+        } else {
+            assert_eq!(
+                got.as_slice(),
+                &[CloseReason::PeerClosed],
+                "{what}: the budget must be retired when the body completes \
+                 - ReceiptTimeout here is a healthy connection reaped for \
+                 having finished on time"
+            );
+        }
+    }
+}
