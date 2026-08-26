@@ -1098,15 +1098,19 @@ impl QueryPool {
         QueryHandle { rx }
     }
 
-    /// Copy `len` bytes from `src[off_src..]` to `dst[off_dst..]`. First tries an
-    /// **inline block clone** (`FICLONERANGE`) on the caller's thread --
-    /// metadata-only on a reflink-capable filesystem (ZFS
-    /// `feature@block_cloning`: a block-pointer copy + BRT refcount, no data
-    /// I/O), so it moves nothing and returns a resolved [`CopyHandle`]. If the
-    /// clone is rejected (misaligned, unsupported, or cross-dataset), a real
-    /// byte copy is **offloaded to the pool** and the handle is pending;
-    /// `src`/`dst` clone into the job (`File` is `Send`) so their fds stay open.
-    /// Either way, [`CopyHandle::wait`] yields the bytes copied.
+    /// Copy `len` bytes from `src[off_src..]` to `dst[off_dst..]`, **always on
+    /// the pool**; `src`/`dst` clone into the job (`File` is `Send`) so their
+    /// fds stay open. [`CopyHandle::wait`] yields the bytes copied.
+    ///
+    /// **Nothing runs on the caller's thread**, including the clone. On ZFS a
+    /// block clone moves no data, which once argued for doing it inline, but
+    /// it still takes filesystem locks and - with `zfs_bclone_wait_dirty`,
+    /// which this fork defaults on - waits a transaction group for a source
+    /// that was just written. That is precisely the caller who clones what it
+    /// has only now finished writing, so the wait is the expected path and
+    /// not a corner: seconds of it, on the reactor, per copy. The whole range
+    /// goes in one job and the job re-issues on a short return, so the cost
+    /// of a large copy is one worker, not one worker per chunk.
     pub fn copy_file_range(
         &self,
         src: &File,
@@ -1115,28 +1119,10 @@ impl QueryPool {
         off_dst: u64,
         len: u64,
     ) -> CopyHandle {
-        // 1. Inline `FICLONERANGE`: on ZFS this is metadata-only (no data I/O),
-        //    so run it here, not on the pool - there is no io_uring op for it
-        //    (a direct `ioctl`). Caveat: a freshly written, still-dirty source
-        //    with `zfs_bclone_wait_dirty=1` can make this wait ~5s for a TXG
-        //    sync (`zfs_vnops.c`); an existing/synced source won't.
-        let fcr = FileCloneRange {
-            src_fd: src.as_raw_fd() as i64,
-            src_offset: off_src,
-            src_length: len,
-            dest_offset: off_dst,
-        };
-        // SAFETY: `dst`/`src` are live fds (held by the caller's `File`s); `&fcr`
-        // is a valid `file_clone_range` for the ioctl's duration.
-        let cloned =
-            unsafe { libc::ioctl(dst.as_raw_fd(), FICLONERANGE, &fcr) };
-        if cloned == 0 {
-            // Clone succeeded - no bytes moved; `len` now shares blocks.
-            return CopyHandle::Ready(Ok(len));
+        // Nothing to move, and nothing to wait for.
+        if len == 0 {
+            return CopyHandle::Ready(Ok(0));
         }
-        // 2. Clone rejected (misaligned `EINVAL`, `EOPNOTSUPP`, cross-dataset
-        //    `EXDEV`, dirty-no-wait `EAGAIN`, ...) -> offload a real byte copy
-        //    (clone-first `copy_file_range` with an `EXDEV` byte-copy fallback).
         let (out, rx) = mpsc::channel();
         let src = src.clone();
         let dst = dst.clone();
@@ -1197,20 +1183,21 @@ impl Iterator for QueryHandle {
     }
 }
 
-/// The result of a [`QueryPool::copy_file_range`]: `Ready` when the inline
-/// block clone succeeded (nothing offloaded), or `Pending` when a real byte
-/// copy was handed to the pool. [`wait`](Self::wait) yields the bytes copied.
+/// The result of a [`QueryPool::copy_file_range`]: `Ready` only when the
+/// request asked for nothing, else `Pending` on the job the pool is running.
+/// [`wait`](Self::wait) yields the bytes copied.
 #[derive(Debug)]
 pub enum CopyHandle {
-    /// The inline `FICLONERANGE` clone already finished with this result.
+    /// Answered without a job — a zero-length copy, which moves nothing and
+    /// waits for nothing.
     Ready(crate::Result<u64>),
-    /// A byte copy is running on the pool; its result arrives on this channel.
+    /// A copy is running on the pool; its result arrives on this channel.
     Pending(mpsc::Receiver<crate::Result<u64>>),
 }
 
 impl CopyHandle {
-    /// The bytes copied - instant for an inline clone, else blocking until the
-    /// offloaded copy finishes (`ECONNABORTED` if the pool was dropped first).
+    /// The bytes copied, blocking until the offloaded copy finishes
+    /// (`ECONNABORTED` if the pool was dropped first).
     pub fn wait(self) -> crate::Result<u64> {
         match self {
             CopyHandle::Ready(r) => r,
@@ -1221,60 +1208,52 @@ impl CopyHandle {
     }
 }
 
-/// `struct file_clone_range` (`linux/fs.h`) - the `FICLONERANGE` ioctl argument.
-#[repr(C)]
-struct FileCloneRange {
-    src_fd: i64,
-    src_offset: u64,
-    src_length: u64,
-    dest_offset: u64,
-}
-
-/// `FICLONERANGE` = `_IOW(0x94, 13, struct file_clone_range)` (a 32-byte arg):
-/// `(1 << 30) | (32 << 16) | (0x94 << 8) | 13`.
-const FICLONERANGE: libc::c_ulong = 0x4020_940D;
-
 /// Largest single kernel transfer, page-aligned.
+///
+/// A ceiling the kernel imposes on one `copy_file_range(2)`, not a chunk
+/// size this crate chose: the whole remaining range is offered on every
+/// call, and the loop below exists to re-issue what a short return left
+/// behind. Splitting a copy smaller than this would re-enter
+/// `zfs_clone_range` per piece — retaking both rangelocks and every
+/// property and alignment check — and would cost the clone outright, since
+/// the destination's rangelock is promoted to whole-file only while
+/// `z_size <= z_blksz` (`/CODE/zfs`, `module/os/linux/zfs/zfs_znode_os.c`),
+/// which is its first write and the one that grows the blocksize to the
+/// source's.
 const MAX_CHUNK: usize = 0x7FFF_FFFF & !0xFFF;
 
-/// Blocking ranged `copy_file_range`: block-clone `len` bytes from
-/// `src[off_src..]` to `dst[off_dst..]` on a reflink-capable filesystem (ZFS
-/// `feature@block_cloning` when recordsize-aligned), else the kernel copies
-/// in-kernel; across filesystems/pools `copy_file_range` returns `EXDEV`, so
-/// fall back to a positional read/write of the range. Returns bytes copied
-/// (short only at source EOF). Standalone here because `sync_fs::shutil` is a
-/// separate feature (unreachable under `uring-fs`) and its `clonefile` is
-/// whole-file only.
-/// Clone `len` bytes from `src[off_src..]` to `dst[off_dst..]`, preferring a
-/// metadata-only block clone and falling back to a real copy.
+/// Copy `len` bytes from `src[off_src..]` to `dst[off_dst..]`, letting the
+/// kernel clone them where it can. Returns bytes copied (short only at
+/// source EOF); across filesystems `copy_file_range` answers `EXDEV` and a
+/// positional read/write of the range stands in.
 ///
-/// **Blocking - for a pool thread, never the reactor.** `FICLONERANGE` is
-/// metadata-only on a reflink-capable filesystem, but it still takes
-/// filesystem locks and can wait on dirty data, so even the fast path must
-/// not run on the loop.
+/// **Blocking - for a pool thread, never the reactor.** Even a clone that
+/// moves no data takes filesystem locks and can wait on dirty data, so
+/// there is no fast path that may run on the loop.
+///
+/// **The clone is the kernel's, not an ioctl's.** `zpl_copy_file_range`
+/// tries `zfs_clone_range` first and falls back to a byte copy itself
+/// (`/CODE/zfs`, `module/os/linux/zfs/zpl_file.c`), so `copy_file_range(2)`
+/// is already clone-first and an explicit `FICLONERANGE` buys nothing. It
+/// costs: the ioctl refuses a range it can only partly clone rather than
+/// returning it short, and it refuses *after* `zfs_bclone_wait_dirty` has
+/// waited a transaction group for the source to sync - which this fork does
+/// by default (`zfs_vnops.c`, `int zfs_bclone_wait_dirty = 1`, and required
+/// by deployments that clone what they have just written). Trying the ioctl
+/// first therefore pays that wait, throws the answer away, and pays it again
+/// in the fallback.
 ///
 /// Needs no [`Personality`]: both endpoints are already-open [`File`]s, and
 /// the kernel authorizes the copy from *their* open modes - which were
 /// established under the identity that opened them - rather than from the
 /// calling thread's credentials.
-pub(crate) fn clone_or_copy_range(
+pub(crate) fn copy_range(
     src: &File,
     dst: &File,
     off_src: u64,
     off_dst: u64,
     len: u64,
 ) -> crate::Result<u64> {
-    let fcr = FileCloneRange {
-        src_fd: src.as_raw_fd() as i64,
-        src_offset: off_src,
-        src_length: len,
-        dest_offset: off_dst,
-    };
-    // SAFETY: both fds are live for the call; `&fcr` is a valid
-    // `file_clone_range` for the ioctl's duration.
-    if unsafe { libc::ioctl(dst.as_raw_fd(), FICLONERANGE, &fcr) } == 0 {
-        return Ok(len);
-    }
     copy_file_range_blocking(
         src.as_raw_fd(),
         dst.as_raw_fd(),
@@ -1537,5 +1516,109 @@ mod narrow_tests {
         assert!(right_size(vec![0u8; 16], 17).is_none());
         assert!(right_size(vec![0u8; 16], usize::MAX).is_none());
         assert_eq!(right_size(Vec::new(), 0).map(|v| v.len()), Some(0));
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod copy_range_tests {
+    use super::copy_range;
+    use crate::uring_fs::File;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::OwnedFd;
+    use std::sync::Arc;
+
+    fn handle(f: std::fs::File) -> File {
+        File::new(Arc::new(OwnedFd::from(f)))
+    }
+
+    /// The whole range in one call, and the count is the kernel's.
+    ///
+    /// **A request past the end must answer what moved, not what was
+    /// asked for.** The caller sizes its destination from a `statx` it
+    /// took earlier, so a source that has since shrunk is exactly the
+    /// case where a copy that reported success on trust would publish a
+    /// short object nothing re-checks. The clone ioctl this path used to
+    /// try first could not express that — it either moved the whole
+    /// range or refused — so the count it returned was the request, not
+    /// the transfer.
+    #[test]
+    fn a_copy_reports_what_moved_not_what_was_asked_for() {
+        let dir = crate::tempdir().expect("tempdir");
+        let body: Vec<u8> =
+            (0..40_000u32).flat_map(|i| i.to_le_bytes()).collect();
+
+        let src_path = dir.path().join("src.bin");
+        let mut src = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&src_path)
+            .expect("source");
+        src.write_all(&body).expect("fill the source");
+        src.sync_all().expect("sync");
+
+        let dst_path = dir.path().join("dst.bin");
+        let dst = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&dst_path)
+            .expect("destination");
+
+        // Offer far more than the source holds: one call, whole range.
+        let src_h = handle(src);
+        let dst_h = handle(dst);
+        let moved = copy_range(&src_h, &dst_h, 0, 0, body.len() as u64 * 4)
+            .expect("copy");
+        assert_eq!(
+            moved,
+            body.len() as u64,
+            "the count is what the source had, not what was requested"
+        );
+
+        let mut back = Vec::new();
+        let mut f = std::fs::File::open(&dst_path).expect("reopen");
+        f.seek(SeekFrom::Start(0)).expect("rewind");
+        f.read_to_end(&mut back).expect("read back");
+        assert_eq!(back, body, "byte for byte");
+    }
+
+    /// An offset pair the caller chose, so the range really is ranged.
+    #[test]
+    fn a_copy_honours_both_offsets() {
+        let dir = crate::tempdir().expect("tempdir");
+        let src_path = dir.path().join("src.bin");
+        let mut src = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&src_path)
+            .expect("source");
+        src.write_all(b"0123456789").expect("fill");
+        src.sync_all().expect("sync");
+
+        let dst_path = dir.path().join("dst.bin");
+        let mut dst = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&dst_path)
+            .expect("destination");
+        dst.write_all(b"..........").expect("prefill");
+        dst.sync_all().expect("sync");
+
+        let moved =
+            copy_range(&handle(src), &handle(dst), 2, 5, 3).expect("copy");
+        assert_eq!(moved, 3);
+
+        let back = std::fs::read(&dst_path).expect("read back");
+        assert_eq!(
+            &back, b".....234..",
+            "the window landed where it was aimed"
+        );
     }
 }

@@ -2887,15 +2887,23 @@ impl FsConn<'_> {
         );
     }
 
-    /// Copy `len` bytes from `src[off_src..]` to `dst[off_dst..]`, trying a
-    /// metadata-only block clone first (`FICLONERANGE` - on a pool with ZFS
-    /// block cloning this moves no data) and falling back to a real copy when
-    /// the clone is refused. Delivers the bytes copied.
+    /// Copy `len` bytes from `src[off_src..]` to `dst[off_dst..]`, delivering
+    /// the bytes copied. On a pool with ZFS block cloning the kernel makes
+    /// this metadata-only by itself — `copy_file_range(2)` is clone-first —
+    /// and falls back to a byte copy where it cannot.
+    ///
+    /// **Offloaded, whole-range, one job.** The clone is not free of waiting
+    /// even when it is free of data movement, so none of it runs on the loop;
+    /// and the whole remaining range is offered in one call rather than in
+    /// chunks, because a chunk boundary is a second entry into
+    /// `zfs_clone_range`. See
+    /// [`copy_range`](super::query_dir::copy_range) for what that buys and
+    /// what it costs.
     ///
     /// This is how an embedded handler assembles a large object from parts
     /// without leaving the loop;
     /// [`QueryPool::copy_file_range`](super::query_dir::QueryPool::copy_file_range)
-    /// is the off-loop twin.
+    /// is the twin for a caller that is not already on the loop.
     ///
     /// Takes no [`Personality`] because both endpoints are already-open
     /// [`File`]s and the kernel authorizes the copy from their open modes,
@@ -2913,9 +2921,7 @@ impl FsConn<'_> {
     {
         self.offload_result(
             move || {
-                super::query_dir::clone_or_copy_range(
-                    &src, &dst, off_src, off_dst, len,
-                )
+                super::query_dir::copy_range(&src, &dst, off_src, off_dst, len)
             },
             on_done,
         );
