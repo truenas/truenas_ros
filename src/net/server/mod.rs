@@ -967,9 +967,13 @@ where
             if self.core.engine.inflight == 0 {
                 break; // nothing outstanding; avoid blocking forever
             }
-            // submit_and_wait always enters with GETEVENTS, which also flushes
-            // any IORING_SQ_CQ_OVERFLOW backlog, so completions can't be
-            // stranded even under NODROP.
+            // `submit_and_wait` enters with GETEVENTS once the SQ is empty,
+            // which also flushes any IORING_SQ_CQ_OVERFLOW backlog, so
+            // completions can't be stranded even under NODROP. The "once the
+            // SQ is empty" is load-bearing: a short submit makes the kernel
+            // `goto out` past the whole GETEVENTS block
+            // (`io_uring/io_uring.c:3571-3574`), so an enter that both
+            // submits and waits does neither the wait nor the flush.
             self.core.engine.ring.submit_and_wait(1)?;
             while let Some(cqe) = self.core.engine.ring.reap() {
                 self.dispatch(cqe)?;
