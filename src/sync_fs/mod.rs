@@ -1,9 +1,10 @@
 //! Blocking (synchronous) filesystem bindings - the `sync_fs` umbrella.
 //!
 //! The umbrella root is the base syscall layer (feature `sync-fs`): [`statx`],
-//! [`openat2`], [`mkdirat`], [`renameat2`], [`safe_open`], atomic writes,
-//! whole-directory name reads ([`dir`]), and the shared
-//! flag types ([`AtFlags`], [`OFlag`], [`Mode`]). Each sibling subsystem is a
+//! [`openat2`], [`mkdirat`], [`unlinkat`], [`fchown`], [`renameat2`],
+//! [`safe_open`], atomic
+//! writes, whole-directory name reads ([`dir`]), and the shared flag types
+//! ([`AtFlags`], [`OFlag`], [`Mode`]). Each sibling subsystem is a
 //! named submodule behind its own feature: [`xattr`], [`acl`] (NFS4/POSIX1E),
 //! [`fhandle`], [`iter`] (feature `fsiter`), and [`shutil`]. Mount topology
 //! and idmapped-mount support live in [`crate::mount`]; the io_uring reactor
@@ -11,6 +12,8 @@
 
 #[cfg(feature = "sync-fs")]
 mod atomic;
+#[cfg(feature = "sync-fs")]
+mod chown;
 #[cfg(feature = "sync-fs")]
 pub mod dir;
 #[cfg(feature = "sync-fs")]
@@ -25,6 +28,8 @@ mod safe_open;
 mod statfs;
 #[cfg(feature = "sync-fs")]
 mod statx;
+#[cfg(feature = "sync-fs")]
+mod unlinkat;
 #[cfg(feature = "sync-fs")]
 mod zfsattr;
 
@@ -42,6 +47,8 @@ pub mod xattr;
 #[cfg(feature = "sync-fs")]
 pub use atomic::{AtomicWriteOptions, atomic_replace, atomic_write};
 #[cfg(feature = "sync-fs")]
+pub use chown::fchown;
+#[cfg(feature = "sync-fs")]
 pub use mkdirat::mkdirat;
 #[cfg(feature = "sync-fs")]
 pub use openat2::{OpenHow, ResolveFlag, openat2};
@@ -56,6 +63,8 @@ pub use statx::{
     Statx, StatxAttr, StatxMask, StatxRaw, StatxTimestamp, StatxTimestampRaw,
     makedev, statx,
 };
+#[cfg(feature = "sync-fs")]
+pub use unlinkat::unlinkat;
 #[cfg(feature = "sync-fs")]
 pub use zfsattr::{ZfsAttr, fget_zfs_attrs, fset_zfs_attrs};
 
