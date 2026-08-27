@@ -657,6 +657,86 @@ mod fsiter {
         assert!(it.next().is_none(), "and stay stopped");
     }
 
+    /// A directory `Entry::fd()` shares the walk's cursor, and the reopen
+    /// the docs prescribe is what gives a caller its own.
+    ///
+    /// The walk descends by duplicating the entry's descriptor, so the two
+    /// are one open file description. The fd is offered for `statx`,
+    /// `read_link` and file data, not for reading a directory stream, and
+    /// this test keeps the warning that says so honest. Reading it directly must
+    /// shorten the walk; reopening, as `shutil::reopen_dir` does, must not.
+    /// If the descent ever stops sharing, delete the warning and this half
+    /// with it.
+    #[test]
+    fn an_entry_fd_shares_the_walk_cursor_and_a_reopen_does_not() {
+        use std::os::fd::AsRawFd;
+
+        let dir = truenas_ros::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        for i in 0..50 {
+            std::fs::write(sub.join(format!("f{i}")), b"x").unwrap();
+        }
+
+        // `drain` reads the directory stream from the handed-out fd; `reopen`
+        // reads it from a fresh open file description over the same inode.
+        let count = |drain: bool, reopen: bool| {
+            let mut it = FsIterBuilder::new(dir.path(), fs_source(dir.path()))
+                .build()
+                .unwrap();
+            let mut n = 0;
+            for res in it.by_ref() {
+                let e = res.unwrap();
+                n += 1;
+                if !drain || !e.is_dir() {
+                    continue;
+                }
+                // SAFETY: a live directory fd; `.` names it.
+                let fd = if reopen {
+                    let r = unsafe {
+                        libc::openat(
+                            e.fd().as_raw_fd(),
+                            c".".as_ptr(),
+                            libc::O_RDONLY | libc::O_DIRECTORY,
+                        )
+                    };
+                    assert!(r >= 0, "reopen failed");
+                    r
+                } else {
+                    e.fd().as_raw_fd()
+                };
+                let mut buf = [0u8; 4096];
+                // SAFETY: a live directory fd and a buffer of `len`.
+                let got = unsafe {
+                    libc::syscall(
+                        libc::SYS_getdents64,
+                        fd,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                };
+                assert!(got > 0, "the directory reads: {got}");
+                if reopen {
+                    // SAFETY: our own fd, closed once.
+                    unsafe { libc::close(fd) };
+                }
+            }
+            n
+        };
+
+        let control = count(false, false);
+        assert_eq!(control, 51, "the subdirectory plus its fifty files");
+        assert!(
+            count(true, false) < control,
+            "reading the handed-out fd shares the walk's cursor, as documented"
+        );
+        assert_eq!(
+            count(true, true),
+            control,
+            "the documented reopen leaves the walk intact"
+        );
+    }
+
     fn names(dir: &std::path::Path) -> (BTreeSet<String>, u64, u64) {
         let mut it = FsIterBuilder::new(dir, fs_source(dir)).build().unwrap();
         let mut set = BTreeSet::new();
@@ -1539,6 +1619,108 @@ mod shutil {
             !outside.join("backup").exists(),
             "destination root was created outside the intended tree"
         );
+    }
+
+    /// A failed POSIX ACL write must leave the access half untouched.
+    ///
+    /// `PosixAcl::validate` bounds tag counts, canonical order, `rwx` bits
+    /// and id representability - never *size* - and nothing bounds entry
+    /// count, so an oversized list encodes happily and the kernel answers
+    /// `E2BIG`. The two xattr writes are not atomic, so one half can be left
+    /// behind, and it must never be the access ACL: that is what the kernel
+    /// consults on every open, so a get-modify-set widening access and
+    /// failing on the default would grant the wider rights while telling the
+    /// caller nothing changed.
+    #[cfg(feature = "acl")]
+    #[test]
+    fn a_failed_posix_acl_write_leaves_the_access_half_untouched() {
+        use std::os::fd::AsFd;
+        use truenas_ros::sync_fs::acl::{
+            PosixAce, PosixAcl, PosixPerm, PosixTag, fsetacl_posix,
+        };
+        use truenas_ros::sync_fs::xattr::fgetxattr;
+
+        let ace = |tag, perms, id, default| PosixAce {
+            tag,
+            perms,
+            id,
+            default,
+        };
+        let rx = PosixPerm::READ | PosixPerm::EXECUTE;
+        let access_of = |p| {
+            vec![
+                ace(PosixTag::UserObj, PosixPerm::all(), -1, false),
+                ace(PosixTag::User, p, 1234, false),
+                ace(PosixTag::GroupObj, p, -1, false),
+                ace(PosixTag::Mask, p, -1, false),
+                ace(PosixTag::Other, p, -1, false),
+            ]
+        };
+        let default_of = |p| {
+            vec![
+                ace(PosixTag::UserObj, PosixPerm::all(), -1, true),
+                ace(PosixTag::User, p, 1234, true),
+                ace(PosixTag::GroupObj, p, -1, true),
+                ace(PosixTag::Mask, p, -1, true),
+                ace(PosixTag::Other, p, -1, true),
+            ]
+        };
+        let get = |f: &std::fs::File, n| fgetxattr(f.as_fd(), n).ok();
+        let acc = "system.posix_acl_access";
+        let def = "system.posix_acl_default";
+
+        let tmp = truenas_ros::tempdir().unwrap();
+        let d = tmp.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        let f = std::fs::File::open(&d).unwrap();
+
+        // A narrow starting state: r-x access, r-x default.
+        let mut start = access_of(rx);
+        start.extend(default_of(rx));
+        let start = PosixAcl::from_aces(start);
+        let sb = start.access_bytes().unwrap();
+        let sd = start.default_bytes().unwrap();
+        if fsetacl_posix(f.as_fd(), &sb, sd.as_deref()).is_err() {
+            return; // no POSIX ACLs here (an NFSv4-ACL dataset, say)
+        }
+        let before_acc = get(&f, acc);
+        let before_def = get(&f, def);
+        assert!(before_acc.is_some(), "the starting ACL is stored");
+
+        // Widen access to rwx and attach an oversized default: the default
+        // write is the one that fails.
+        let mut aces = access_of(PosixPerm::all());
+        aces.extend(default_of(rx));
+        for i in 0..400_000i64 {
+            aces.push(ace(PosixTag::User, rx, 3000 + i, true));
+        }
+        let big_default = PosixAcl::from_aces(aces);
+        let ab = big_default.access_bytes().unwrap();
+        let db = big_default.default_bytes().unwrap();
+        assert!(
+            fsetacl_posix(f.as_fd(), &ab, db.as_deref()).is_err(),
+            "an oversized default must not be accepted"
+        );
+        assert_eq!(get(&f, acc), before_acc, "access widened despite the Err");
+        assert_eq!(get(&f, def), before_def, "and the default moved too");
+
+        // Now the other order: a valid default with an oversized access, so
+        // the default lands first and the access write is the one that
+        // fails. The default must be put back.
+        let mut aces = access_of(PosixPerm::all());
+        for i in 0..400_000i64 {
+            aces.push(ace(PosixTag::User, rx, 3000 + i, false));
+        }
+        aces.extend(default_of(PosixPerm::all()));
+        let big_access = PosixAcl::from_aces(aces);
+        let ab = big_access.access_bytes().unwrap();
+        let db = big_access.default_bytes().unwrap();
+        assert!(
+            fsetacl_posix(f.as_fd(), &ab, db.as_deref()).is_err(),
+            "an oversized access list must not be accepted"
+        );
+        assert_eq!(get(&f, acc), before_acc, "access must be untouched");
+        assert_eq!(get(&f, def), before_def, "the default must be restored");
     }
 
     // copytree does not chmod a file that carries an access ACL: the ACL is

@@ -771,6 +771,11 @@ pub(crate) struct Connection<U> {
     // (stall).
     pub splice_deadline_armed: bool,
     pub splice_watermark: usize,
+    /// `splice_remaining` when the current body opened, or when its last
+    /// receipt budget was renewed, so an expiry can tell a window's worth of
+    /// progress from a stall. Only the splice path sets it; a buffered
+    /// message is bounded whole and needs no mark. See `RECEIPT_WINDOW`.
+    pub receipt_window_mark: usize,
     // ---- send side ----
     // Outgoing PDUs (request replies and pushes) queued FIFO in production
     // order; the leading PDUs are (partially) in flight while `sending`.
@@ -941,6 +946,7 @@ impl<U> Connection<U> {
             splice_remaining: 0,
             splice_deadline_armed: false,
             splice_watermark: 0,
+            receipt_window_mark: 0,
             send_queue: VecDeque::new(),
             queued_bytes: 0,
             front_sent: 0,
@@ -1087,7 +1093,7 @@ impl<U> Connection<U> {
         &mut self,
         handoff_threshold: Option<usize>,
     ) -> (&[u8], Body<'_>, &ClientAddr, &mut U) {
-        let placed = self.body_buf.take();
+        let placed = self.take_placed_body();
         if placed.is_none()
             && let Some(buf) = self.take_body_handoff(handoff_threshold)
         {
@@ -1117,7 +1123,7 @@ impl<U> Connection<U> {
         &mut U,
         Option<crate::uring_fs::core::RecvWriteLease<'_>>,
     ) {
-        let placed = self.body_buf.take();
+        let placed = self.take_placed_body();
         if placed.is_none()
             && let Some(buf) = self.take_body_handoff(handoff_threshold)
         {
@@ -1130,6 +1136,27 @@ impl<U> Connection<U> {
             None => Body::inline(&rest[..self.body_len]),
         };
         (header, body, &self.peer, &mut self.state, lease)
+    }
+
+    /// The placed body, if it is this delivery's to hand over.
+    ///
+    /// `body_buf` is the destination of an in-flight `RECV` for as long as
+    /// `recv_into_body` is set: `recv_ptr` handed the kernel a pointer into
+    /// its spare capacity, under the contract stated there - *"Stable until
+    /// the CQE: neither `buf` nor `body_buf` is touched while `recving`."*
+    /// Moving it out gives the handler a Vec the kernel is still writing
+    /// into, and dropping that `Request` frees it under an armed op.
+    ///
+    /// A wire-driven delivery is unaffected, because `finish_body_recv`
+    /// clears the flag as it completes the body. What this stops is a
+    /// redelivery arriving while the pump has already armed the *next*
+    /// message's body: `deliver_one` zeroes that redelivery's frame for the
+    /// same reason, and an empty body is the matching answer.
+    fn take_placed_body(&mut self) -> Option<Vec<u8>> {
+        if self.recv_into_body {
+            return None;
+        }
+        self.body_buf.take()
     }
 
     /// The owned-buffer handoff predicate shared by both delivery forms.
@@ -2012,6 +2039,79 @@ mod tests {
         }
         c.consume();
         assert_eq!(c.buffered(), 0, "placed body never re-enters buf");
+    }
+
+    /// A redelivery must not be handed the buffer an in-flight `RECV` is
+    /// writing into.
+    ///
+    /// With a read-ahead cap above one the pump can frame and arm the *next*
+    /// message's body while a handler is parked on `Response::Defer`. The
+    /// redelivery that follows zeroes its own frame (`deliver_one`), and the
+    /// delivery must not `take` `body_buf` while it is an armed op's
+    /// destination: the handler would be handed a Vec freed the moment its
+    /// `Request` drops, with the kernel still writing into it.
+    #[test]
+    fn a_redelivery_does_not_steal_the_armed_body_buffer() {
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        let want = arm_a_body_recv(&mut c);
+        let armed = c.recv_ptr();
+
+        // The redelivery, as `deliver_one` stages it.
+        c.set_frame(0, 0);
+        {
+            let (header, body, _addr, _state) = c.deliver_parts(None);
+            assert!(header.is_empty(), "a redelivery carries no header");
+            assert_eq!(body.len(), 0, "nor the next message's body");
+        }
+        assert_eq!(
+            c.recv_ptr(),
+            armed,
+            "the armed recv still owns its destination"
+        );
+        assert_eq!(c.recv_want, want, "and still targets the same count");
+    }
+
+    /// The leased twin of
+    /// [`a_redelivery_does_not_steal_the_armed_body_buffer`]. Both delivery
+    /// forms open the same way, so a guard on one is a guard on neither.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    #[test]
+    fn a_leased_redelivery_does_not_steal_the_armed_body_buffer() {
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        arm_a_body_recv(&mut c);
+        let armed = c.recv_ptr();
+
+        c.set_frame(0, 0);
+        {
+            let (header, body, _addr, _state, _lease) =
+                c.deliver_parts_leased(Some(0));
+            assert!(header.is_empty(), "a redelivery carries no header");
+            assert_eq!(body.len(), 0, "nor the next message's body");
+        }
+        assert_eq!(
+            c.recv_ptr(),
+            armed,
+            "the armed recv still owns its destination"
+        );
+    }
+
+    /// Frame a 4-byte header plus 30 buffered body bytes and arm the rest of
+    /// a 100-byte body into `body_buf`, as the pump does for a pipelined
+    /// message. Returns the count the recv targets.
+    #[cfg(test)]
+    fn arm_a_body_recv(c: &mut Connection<()>) -> usize {
+        c.arm_recv(34, true);
+        {
+            // Play the kernel: the recv lands in reserved spare capacity.
+            let ptr = c.recv_ptr() as *mut u8;
+            // SAFETY: recv_ptr points at the 34 reserved-but-uninit bytes.
+            unsafe { std::ptr::write_bytes(ptr, 0, 34) };
+        }
+        assert_eq!(c.recv_result(34), RecvOutcome::Complete);
+        c.set_frame(4, 100);
+        let want = c.arm_body_recv();
+        assert_eq!(want, 70, "prefix of 30 already copied in");
+        want
     }
 
     #[test]

@@ -152,21 +152,63 @@ pub fn fsetacl_posix<Fd: AsFd>(
     write_posix(fd, access, default)
 }
 
-/// Write both halves of a POSIX ACL. Callers validate both lists first, so the
-/// kernel accepting the access xattr implies it accepts the default xattr too.
+/// Write both halves of a POSIX ACL, default half first.
+///
+/// **On any error the access ACL is unchanged.** That is the whole reason for
+/// the ordering. There is no transactional xattr write, so one of the two
+/// writes has to be the one that can be left behind, and it must not be the
+/// access half: that is what the kernel consults on every open, so a
+/// get-modify-set widening access and growing the default would otherwise
+/// leave the wider rights live while returning `Err` - the caller believing
+/// nothing changed, and the directory granting what the new access ACL names.
+///
+/// `validate` is not a defence here. It checks tag counts, canonical order,
+/// `rwx` bits and id representability, never *size*, and there is no bound on
+/// entry count - so a multi-megabyte default encodes happily and the kernel
+/// answers `E2BIG`. `ENOSPC` and `EDQUOT` reach the same place.
+///
+/// A default ACL grants nothing by itself; it is inherited by children created
+/// later. So when the access write is the one that fails, the default is put
+/// back. If that restore fails too its errno is what surfaces, and only then
+/// can the default half be left holding the new value.
 fn write_posix(
     fd: BorrowedFd<'_>,
     access: &[u8],
     default: Option<&[u8]>,
 ) -> Result<()> {
-    fsetxattr(fd, posix::POSIX_ACCESS_XATTR, access, XattrFlags::empty())?;
+    // Read before writing: once the write lands the old value is gone and
+    // the restore below has nothing to put back.
+    let prior = match fgetxattr(fd, posix::POSIX_DEFAULT_XATTR) {
+        Ok(bytes) => Some(bytes),
+        // Nothing there to preserve - a regular file answers this too - so
+        // restoring means removing. `EOPNOTSUPP` is the filesystem having no
+        // default ACL at all, which the write below reports for itself.
+        Err(Errno::ENODATA | Errno::EOPNOTSUPP) => None,
+        // Something is there and could not be read. Writing over it would
+        // destroy a value the restore could not put back, so touch neither
+        // half: an unreadable default is not a licence to replace it.
+        Err(e) => return Err(e.into()),
+    };
+
     match default {
         Some(d) => {
             fsetxattr(fd, posix::POSIX_DEFAULT_XATTR, d, XattrFlags::empty())?;
         }
         None => ignore_enodata(fremovexattr(fd, posix::POSIX_DEFAULT_XATTR))?,
     }
-    Ok(())
+
+    let Err(e) =
+        fsetxattr(fd, posix::POSIX_ACCESS_XATTR, access, XattrFlags::empty())
+    else {
+        return Ok(());
+    };
+    match &prior {
+        Some(p) => {
+            fsetxattr(fd, posix::POSIX_DEFAULT_XATTR, p, XattrFlags::empty())?
+        }
+        None => ignore_enodata(fremovexattr(fd, posix::POSIX_DEFAULT_XATTR))?,
+    }
+    Err(e.into())
 }
 
 fn fremoveacl(fd: BorrowedFd<'_>) -> Result<()> {

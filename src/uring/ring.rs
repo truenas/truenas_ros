@@ -311,12 +311,40 @@ impl SqCqRings {
     }
 }
 
+/// Ring memory this process allocated and handed to the kernel: the two
+/// anonymous mappings behind [`IORING_SETUP_NO_MMAP`].
+///
+/// Addresses, not pointers, so [`RingFd`] stays `Send`.
+///
+/// Owns both mappings until [`Ring::from_setup`] takes them over, so a
+/// `RingFd` dropped before it is ever mapped still unmaps them.
+struct RingMemory {
+    rings: usize,
+    rings_len: usize,
+    sqes: usize,
+    sqes_len: usize,
+}
+
+impl Drop for RingMemory {
+    fn drop(&mut self) {
+        // SAFETY: both came from `mmap_anon`, and this runs only while this
+        // value still owns them - `Ring::from_setup` forgets it when it takes
+        // them over, so neither region is unmapped twice.
+        unsafe {
+            libc::munmap(self.sqes as *mut libc::c_void, self.sqes_len);
+            libc::munmap(self.rings as *mut libc::c_void, self.rings_len);
+        }
+    }
+}
+
 /// A ring that exists but is not yet mapped: the `io_uring_setup(2)`
 /// descriptor plus the layout the kernel reported for it.
 ///
 /// The half of ring construction that may happen on a thread other than the
-/// one that will drive the ring. It holds no pointers, so it is `Send`; the
-/// mapped, single-thread half (`Ring`) is built from it on the owning thread.
+/// one that will drive the ring. It holds no pointers, so it is `Send` - the
+/// caller-allocated ring memory it may carry is held as an address for exactly
+/// that reason; the mapped, single-thread half (`Ring`) is built from it on the
+/// owning thread.
 /// The split exists for one caller: a process that runs several reactors on
 /// several threads but must fork its credential broker before any thread
 /// exists, with every ring fd already created for the child to inherit. Sound
@@ -329,16 +357,103 @@ impl SqCqRings {
 pub struct RingFd {
     fd: OwnedFd,
     params: IoUringParams,
+    /// The regions this process allocated and handed to the kernel, when the
+    /// `ENOMEM` retry in [`RingFd::setup`] was taken; `None` when the kernel
+    /// allocated them and [`Ring::from_setup`] maps them from the fd.
+    memory: Option<RingMemory>,
 }
 
 impl RingFd {
     /// `io_uring_setup(2)` for `entries` submission slots (rounded up to a
     /// power of two by the kernel). Fails with `ENOSYS`/`EPERM` where io_uring
     /// is unavailable (old kernel, seccomp, `kernel.io_uring_disabled`).
+    ///
+    /// Always sets [`IORING_SETUP_NO_SQARRAY`]: the flag reached 6.10, this
+    /// crate's floor is 6.18, and that floor is assumed rather than probed.
+    ///
+    /// On `ENOMEM`, retries once with the ring memory allocated here
+    /// ([`IORING_SETUP_NO_MMAP`]) before giving up: a fragmented host refuses
+    /// a large ring with memory to spare, because the kernel-allocated path
+    /// needs one physically contiguous high-order block per region
+    /// (`io_region_allocate_pages`, `io_uring/memmap.c`) and the scatter
+    /// fallback there does not fire wherever the cgroup-v2 memory controller
+    /// is on (`alloc_pages_bulk_node` refuses accounted allocations,
+    /// `mm/page_alloc.c:5079`). Pages this process already owns are pinned and
+    /// `vmap`'d instead, so the retry keeps the depth asked for.
+    ///
+    /// No help against `RLIMIT_MEMLOCK`, charged the same either way
+    /// (`io_create_region` -> `__io_account_mem`, skipped only under
+    /// `CAP_IPC_LOCK` - see [`Ring::reset_staging`]): surviving that ceiling
+    /// means asking for a smaller ring.
     pub(crate) fn setup(entries: u32) -> errno::Result<RingFd> {
-        let mut params = IoUringParams::default();
+        match Self::setup_kernel_memory(entries) {
+            // The retry's own errno is never the one reported. It can differ
+            // from `ENOMEM` only if this crate sized or aligned a region
+            // wrongly - `io_create_region` answers `EINVAL` for a misaligned
+            // `user_addr`/`size`, `io_pin_pages` `EFAULT` for a short one -
+            // and reporting either would describe a host merely out of
+            // contiguous memory as something it is not. `region_bytes` is
+            // pinned against the kernel's own layout by a test instead.
+            Err(Errno::ENOMEM) => {
+                Self::setup_with_own_memory(entries).map_err(|_| Errno::ENOMEM)
+            }
+            other => other,
+        }
+    }
+
+    /// `io_uring_setup(2)` with the kernel allocating the ring memory.
+    fn setup_kernel_memory(entries: u32) -> errno::Result<RingFd> {
+        let mut params = IoUringParams {
+            flags: IORING_SETUP_NO_SQARRAY,
+            ..IoUringParams::default()
+        };
         let fd = io_uring_setup(entries, &mut params)?;
-        Ok(RingFd { fd, params })
+        Ok(RingFd {
+            fd,
+            params,
+            memory: None,
+        })
+    }
+
+    /// [`RingFd::setup`]'s `ENOMEM` retry: map the two regions here and hand
+    /// the kernel their addresses.
+    ///
+    /// `RingMemory` is built before the syscall so its `Drop` covers the `?`,
+    /// including the `EINVAL` a kernel too old for the flag answers with.
+    fn setup_with_own_memory(entries: u32) -> errno::Result<RingFd> {
+        let (rings_len, sqes_len) = region_bytes(entries);
+        let rings = mmap_anon(rings_len)?;
+        let sqes = match mmap_anon(sqes_len) {
+            Ok(s) => s,
+            Err(e) => {
+                // SAFETY: `rings` came from `mmap_anon` just above and is
+                // unmapped once - nothing else owns it yet.
+                unsafe { libc::munmap(rings.cast(), rings_len) };
+                return Err(e);
+            }
+        };
+        let memory = RingMemory {
+            rings: rings as usize,
+            rings_len,
+            sqes: sqes as usize,
+            sqes_len,
+        };
+
+        let mut params = IoUringParams {
+            flags: IORING_SETUP_NO_SQARRAY | IORING_SETUP_NO_MMAP,
+            ..IoUringParams::default()
+        };
+        // The kernel sizes each region itself and pins that much from the
+        // address given, so these need only be page-aligned - `mmap` - and
+        // large enough, which `region_bytes` guarantees.
+        params.cq_off.user_addr = rings as u64;
+        params.sq_off.user_addr = sqes as u64;
+        let fd = io_uring_setup(entries, &mut params)?;
+        Ok(RingFd {
+            fd,
+            params,
+            memory: Some(memory),
+        })
     }
 
     /// The raw ring fd (for `io_uring_register`).
@@ -361,6 +476,90 @@ impl std::fmt::Debug for RingFd {
     }
 }
 
+/// The regions a [`Ring`] owns, with the lengths to `munmap` them by.
+///
+/// Named rather than positional because two fields alias whenever the CQ
+/// shares the SQ's mapping - `cq_ring` repeats `sq_ring` and `cq_ring_len` is
+/// then 0, which is what keeps `Ring`'s `Drop` from unmapping it twice. A
+/// swapped pair in a tuple would be exactly that double `munmap`.
+struct RingMaps {
+    sq_ring: *mut u8,
+    sq_ring_len: usize,
+    cq_ring: *mut u8,
+    /// 0 when `cq_ring` aliases `sq_ring`, so the region is unmapped once.
+    cq_ring_len: usize,
+    sqes: *mut IoUringSqe,
+    sqes_len: usize,
+}
+
+/// Take over the regions [`RingFd::setup`]'s retry mapped.
+///
+/// `IORING_SETUP_NO_MMAP` puts both rings in the single region the kernel took
+/// from `cq_off.user_addr` (`io_allocate_scq_urings`), so the CQ aliases it.
+/// Ownership moves to the `Ring`, whose `Drop` unmaps these - `RingMemory`'s
+/// must therefore not also run.
+fn adopt_own_memory(m: RingMemory) -> RingMaps {
+    let maps = RingMaps {
+        sq_ring: m.rings as *mut u8,
+        sq_ring_len: m.rings_len,
+        cq_ring: m.rings as *mut u8,
+        cq_ring_len: 0,
+        sqes: m.sqes as *mut IoUringSqe,
+        sqes_len: m.sqes_len,
+    };
+    std::mem::forget(m);
+    maps
+}
+
+/// `mmap` the regions the kernel allocated, from the ring fd.
+///
+/// The ring region's extent is the CQ's: with `NO_SQARRAY` dropping the index
+/// array, `rings_size` ends at the CQE array and `sq_off.array` is left at 0,
+/// so nothing may be derived from that field.
+fn map_from_fd(p: &IoUringParams, raw: RawFd) -> errno::Result<RingMaps> {
+    let ring_len = (p.cq_off.cqes as usize)
+        + (p.cq_entries as usize) * size_of::<IoUringCqe>();
+    let sqes_len = (p.sq_entries as usize) * size_of::<IoUringSqe>();
+
+    let sq_ring = mmap_region(ring_len, raw, IORING_OFF_SQ_RING)?;
+    let (cq_ring, cq_ring_len) = if p.features & IORING_FEAT_SINGLE_MMAP != 0 {
+        (sq_ring, 0usize)
+    } else {
+        match mmap_region(ring_len, raw, IORING_OFF_CQ_RING) {
+            Ok(q) => (q, ring_len),
+            Err(e) => {
+                // SAFETY: unmap the SQ region we just mapped.
+                unsafe { libc::munmap(sq_ring.cast(), ring_len) };
+                return Err(e);
+            }
+        }
+    };
+    // The SQES mapping base is page-aligned, so the IoUringSqe cast is sound
+    // despite the alignment-increasing lint.
+    #[allow(clippy::cast_ptr_alignment)]
+    let sqes = match mmap_region(sqes_len, raw, IORING_OFF_SQES) {
+        Ok(s) => s as *mut IoUringSqe,
+        Err(e) => {
+            // SAFETY: unmap the region(s) mapped above before returning.
+            unsafe {
+                if cq_ring_len != 0 {
+                    libc::munmap(cq_ring.cast(), cq_ring_len);
+                }
+                libc::munmap(sq_ring.cast(), ring_len);
+            }
+            return Err(e);
+        }
+    };
+    Ok(RingMaps {
+        sq_ring,
+        sq_ring_len: ring_len,
+        cq_ring,
+        cq_ring_len,
+        sqes,
+        sqes_len,
+    })
+}
+
 impl Ring {
     /// Create and map a ring sized for `entries` submission slots in one
     /// step, on this thread. Production goes through [`RingFd::setup`] and
@@ -375,73 +574,33 @@ impl Ring {
     /// ownership of it. Runs on the thread that will drive the ring; the
     /// descriptor itself may have been created on any thread of the process.
     pub(crate) fn from_setup(setup: RingFd) -> errno::Result<Ring> {
-        let RingFd { fd, params: p } = setup;
-        let raw = fd.as_raw_fd();
+        let RingFd {
+            fd,
+            params: p,
+            memory,
+        } = setup;
 
-        let single = p.features & IORING_FEAT_SINGLE_MMAP != 0;
-        let sq_ring_len = (p.sq_off.array as usize)
-            + (p.sq_entries as usize) * size_of::<u32>();
-        let cq_ring_len = (p.cq_off.cqes as usize)
-            + (p.cq_entries as usize) * size_of::<IoUringCqe>();
-        let sqes_len = (p.sq_entries as usize) * size_of::<IoUringSqe>();
+        debug_assert_eq!(
+            memory.is_some(),
+            p.flags & IORING_SETUP_NO_MMAP != 0,
+            "who owns the ring memory must match the flag it was made with"
+        );
 
-        // With SINGLE_MMAP the SQ and CQ share one mapping sized to the larger.
-        let sq_map_len = if single {
-            sq_ring_len.max(cq_ring_len)
-        } else {
-            sq_ring_len
+        let maps = match memory {
+            Some(m) => adopt_own_memory(m),
+            None => map_from_fd(&p, fd.as_raw_fd())?,
         };
 
-        let sq_ring = mmap_region(sq_map_len, raw, IORING_OFF_SQ_RING)?;
-        let (cq_ring, cq_own_len) = if single {
-            (sq_ring, 0usize)
-        } else {
-            match mmap_region(cq_ring_len, raw, IORING_OFF_CQ_RING) {
-                Ok(q) => (q, cq_ring_len),
-                Err(e) => {
-                    // SAFETY: unmap the SQ region we just mapped.
-                    unsafe { libc::munmap(sq_ring.cast(), sq_map_len) };
-                    return Err(e);
-                }
-            }
-        };
-        // The SQES mapping base is page-aligned, so the IoUringSqe cast is
-        // sound despite the alignment-increasing lint.
-        #[allow(clippy::cast_ptr_alignment)]
-        let sqes = match mmap_region(sqes_len, raw, IORING_OFF_SQES) {
-            Ok(s) => s as *mut IoUringSqe,
-            Err(e) => {
-                // SAFETY: unmap the region(s) mapped above before returning.
-                unsafe {
-                    if cq_own_len != 0 {
-                        libc::munmap(cq_ring.cast(), cq_own_len);
-                    }
-                    libc::munmap(sq_ring.cast(), sq_map_len);
-                }
-                return Err(e);
-            }
-        };
-
-        // The SQ indirection array is a fixed identity map: submission at ring
-        // position `t` always uses SQE slot `t & mask`, so we fill it once and
-        // never touch it again. (`SqCqRings` therefore never reads the array.)
-        // SAFETY: `array` is a kernel-provided offset to `sq_entries` u32 slots.
-        let sq_array = unsafe { field_ptr::<u32>(sq_ring, p.sq_off.array) };
-        for i in 0..p.sq_entries {
-            // SAFETY: i < sq_entries; sq_array has that many u32 slots.
-            unsafe { *sq_array.add(i as usize) = i };
-        }
-
-        let rings = SqCqRings::new(&p, sq_ring, cq_ring, sqes);
+        let rings = SqCqRings::new(&p, maps.sq_ring, maps.cq_ring, maps.sqes);
 
         Ok(Ring {
             fd,
-            sq_ring,
-            sq_ring_len: sq_map_len,
-            cq_ring,
-            cq_ring_len: cq_own_len,
-            sqes_map: sqes.cast::<u8>(),
-            sqes_len,
+            sq_ring: maps.sq_ring,
+            sq_ring_len: maps.sq_ring_len,
+            cq_ring: maps.cq_ring,
+            cq_ring_len: maps.cq_ring_len,
+            sqes_map: maps.sqes.cast::<u8>(),
+            sqes_len: maps.sqes_len,
             rings,
             sq_tail: 0,
             cq_head: 0,
@@ -742,6 +901,86 @@ impl std::fmt::Debug for Ring {
     }
 }
 
+/// Round up to a whole number of pages.
+fn page_align(n: usize) -> usize {
+    n.next_multiple_of(crate::uring::page_size())
+}
+
+/// Byte sizes of the two regions an `entries`-slot ring needs: the combined
+/// SQ/CQ ring region and the SQE array (`rings_size`, `io_uring/io_uring.c`).
+///
+/// Upper bounds, which is all that is needed - the kernel sizes each region
+/// itself and pins only that much from the address given, so over-sizing
+/// wastes a page and under-sizing fails the pin with `EFAULT`.
+///
+/// `sq_entries` is `roundup_pow_of_two(entries)` and `cq_entries` twice that
+/// (`io_uring_fill_params`); this crate sets no `CQSIZE`/`SQE128`/`CQE32`, so
+/// the entry sizes are the base ones, and `NO_SQARRAY` leaves the region with
+/// no index array at all (`rings_size`). `IO_RINGS_HEADER_MAX` covers
+/// `offsetof(struct io_rings, cqes)` for a 64- or 128-byte `L1_CACHE_BYTES`.
+fn region_bytes(entries: u32) -> (usize, usize) {
+    const IO_RINGS_HEADER_MAX: usize = 256;
+
+    // Widened before rounding: `next_power_of_two` cannot overflow a `usize`
+    // for any `u32`, so no input can panic here even though the only caller
+    // has already had this `entries` accepted by `io_uring_setup`.
+    let sq_entries = (entries.max(1) as usize).next_power_of_two();
+    let cq_entries = 2 * sq_entries;
+
+    let rings = IO_RINGS_HEADER_MAX + cq_entries * size_of::<IoUringCqe>();
+    let sqes = sq_entries * size_of::<IoUringSqe>();
+    (page_align(rings), page_align(sqes))
+}
+
+/// `mmap` one anonymous region to hand the kernel as ring memory.
+///
+/// `MAP_SHARED`, matching both the fd mapping this replaces and liburing's
+/// equivalent (`io_uring_alloc_huge`, `src/setup.c`). No `MAP_POPULATE`: the
+/// kernel faults every page in anyway when it pins them, and pre-faulting
+/// would touch megabytes that a memlock refusal - charged identically to both
+/// allocation paths - then throws away.
+///
+/// Deliberately no `MAP_HUGETLB`, though liburing asks for it: that needs a
+/// preallocated hugetlb pool and fails without one, which on a fragmented host
+/// is precisely when this path is reached. Order-0 pages make the retry work.
+///
+/// Kept separate from `mmap_region` rather than merged: the two differ in
+/// flags, fd, offset and in this one's `madvise` step with its own unwind, so
+/// a single helper would take a bool and four parameters to save six lines.
+///
+/// `MADV_DONTFORK` keeps the region out of forked children.
+/// `CredBroker::spawn` (`uring_fs/broker.rs`) forks holding the ring fds and
+/// needs only those; the kernel refuses `mmap` of a user-provided region
+/// through the fd (`io_region_validate_mmap`), so without this the inherited
+/// VMA would be the child's only route to ring memory - and an unasked-for
+/// one, already in its address space rather than a syscall away.
+fn mmap_anon(len: usize) -> errno::Result<*mut u8> {
+    // SAFETY: `addr = null` lets the kernel place it, `len` is non-zero and
+    // page-aligned, and an anonymous mapping takes no fd and no offset.
+    let p = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        return Err(Errno::last());
+    }
+    // SAFETY: `p`/`len` are the mapping just made.
+    if let Err(e) =
+        Errno::result(unsafe { libc::madvise(p, len, libc::MADV_DONTFORK) })
+    {
+        // SAFETY: same mapping, not yet owned by anything else.
+        unsafe { libc::munmap(p, len) };
+        return Err(e);
+    }
+    Ok(p.cast())
+}
+
 /// `mmap` one ring region. `PROT_READ|PROT_WRITE`, `MAP_SHARED|MAP_POPULATE`.
 fn mmap_region(len: usize, fd: RawFd, offset: i64) -> errno::Result<*mut u8> {
     // SAFETY: anonymous placement (`addr = null`), `len > 0`, `fd` a live ring
@@ -791,10 +1030,228 @@ mod tests {
     }
 
     /// The created-not-mapped half holds no pointers and may cross threads.
+    /// Still true once it carries caller-allocated ring memory, which is why
+    /// [`RingMemory`] holds addresses rather than pointers.
     #[test]
     fn ring_fd_is_send() {
         fn require_send<T: Send + Sync>(_: Option<&T>) {}
         require_send::<RingFd>(None);
+    }
+
+    /// The `ENOMEM` retry produces a working ring: the same NOP round trip,
+    /// but over memory this process mapped and the kernel pinned. Exercises
+    /// the `sq_off`/`cq_off` offsets against a base address the kernel did not
+    /// choose, and the hand-off of both mappings from `RingMemory` to `Ring`.
+    ///
+    /// At 4096 entries, not 8: `region_bytes(8)` is one page either way, so a
+    /// sizing error would be absorbed by page rounding and the test would
+    /// prove only that the two `user_addr` fields are not swapped.
+    ///
+    /// Driven directly rather than through the `ENOMEM` that selects it in
+    /// production: a test cannot fragment the host's memory on demand.
+    #[test]
+    fn caller_allocated_ring_round_trips() {
+        let setup = match RingFd::setup_with_own_memory(4096) {
+            Ok(r) => r,
+            Err(e) if crate::uring::setup_unavailable(e) => return,
+            Err(e) => panic!("setup_with_own_memory: {e}"),
+        };
+        assert!(setup.memory.is_some(), "the retry owns its ring memory");
+
+        let mut ring = Ring::from_setup(setup).expect("map");
+        ring.push_sqe(|sqe| {
+            sqe.opcode = IORING_OP_NOP;
+            sqe.user_data = 0xf00d;
+        })
+        .expect("stage");
+        ring.submit_and_wait(1).expect("submit_and_wait");
+        let cqe = ring.reap().expect("a completion after waiting for one");
+        assert_eq!(cqe.res, 0, "a NOP completes with 0");
+        assert_eq!(cqe.user_data, 0xf00d);
+    }
+
+    /// Every ring carries `NO_SQARRAY`, and the kernel answers it by leaving
+    /// `sq_off.array` unset.
+    ///
+    /// Both halves matter and neither is self-announcing: a ring built without
+    /// the flag still works, just 128 KiB larger at the maximum, and the
+    /// zeroed `sq_off.array` is what `region_bytes` and `map_from_fd` are
+    /// entitled to assume.
+    #[test]
+    fn setup_sets_no_sqarray() {
+        let Some(setup) = setup_or_skip(8) else {
+            return;
+        };
+        assert_ne!(
+            setup.params.flags & IORING_SETUP_NO_SQARRAY,
+            0,
+            "every ring is created with NO_SQARRAY"
+        );
+        assert_eq!(
+            setup.params.sq_off.array, 0,
+            "the kernel leaves sq_off.array unset under NO_SQARRAY"
+        );
+    }
+
+    /// Whether a mapping starting exactly at `addr` and spanning exactly `len`
+    /// is present.
+    ///
+    /// Exact extent rather than "is anything mapped here": `cargo test` runs
+    /// this lib's tests as threads of one process and several of them `mmap`,
+    /// so a range freed here can be handed straight to another thread.
+    /// Requiring both endpoints to match means a coincidental reuse would have
+    /// to reproduce the geometry exactly.
+    fn mapping_exists(addr: usize, len: usize) -> bool {
+        let want = format!("{addr:x}-{:x} ", addr + len);
+        std::fs::read_to_string("/proc/self/maps")
+            .expect("/proc/self/maps")
+            .lines()
+            .any(|line| line.starts_with(&want))
+    }
+
+    /// A caller-allocated ring dropped before it is ever mapped releases its
+    /// own memory. `RingMemory` owns both regions until `Ring::from_setup`
+    /// takes them over, and this is the path where that ownership is load
+    /// bearing: a ring created for a thread that then failed to start would
+    /// otherwise leak both regions for the life of the process.
+    ///
+    /// Retried rather than asserted once. `cargo test` runs this lib's tests
+    /// as threads of one process and several of them `mmap`, so a range freed
+    /// here can be handed straight to another thread and read as still-mapped
+    /// when the drop was perfectly correct. A leak is present on *every*
+    /// attempt; a collision is present on some, so one clean attempt is proof
+    /// and only an unbroken run of dirty ones is a failure.
+    #[test]
+    fn unmapped_caller_allocated_ring_releases_its_memory() {
+        const TRIES: usize = 8;
+        for attempt in 1..=TRIES {
+            let setup = match RingFd::setup_with_own_memory(8) {
+                Ok(r) => r,
+                Err(e) if crate::uring::setup_unavailable(e) => return,
+                Err(e) => panic!("setup_with_own_memory: {e}"),
+            };
+            let m = setup.memory.as_ref().expect("the retry owns its memory");
+            let (rings, rings_len) = (m.rings, m.rings_len);
+            let (sqes, sqes_len) = (m.sqes, m.sqes_len);
+            assert!(mapping_exists(rings, rings_len), "mapped before the drop");
+            assert!(mapping_exists(sqes, sqes_len), "mapped before the drop");
+
+            drop(setup);
+
+            if !mapping_exists(rings, rings_len)
+                && !mapping_exists(sqes, sqes_len)
+            {
+                return;
+            }
+            assert!(
+                attempt < TRIES,
+                "both regions still mapped after {TRIES} drops: a leak, not \
+                 a concurrent reuse of the address"
+            );
+        }
+    }
+
+    /// The retry's ring memory does not reach a forked child.
+    ///
+    /// `CredBroker::spawn` forks holding the ring fds and, by its own
+    /// contract, needing only those. The kernel refuses to hand a
+    /// user-provided region back through the fd (`io_region_validate_mmap`),
+    /// so `MADV_DONTFORK` in `mmap_anon` is the whole of that boundary: drop
+    /// it and the child gets ring memory already mapped, without asking.
+    #[test]
+    fn caller_allocated_ring_memory_is_not_inherited() {
+        let setup = match RingFd::setup_with_own_memory(8) {
+            Ok(r) => r,
+            Err(e) if crate::uring::setup_unavailable(e) => return,
+            Err(e) => panic!("setup_with_own_memory: {e}"),
+        };
+        let m = setup.memory.as_ref().expect("the retry owns its memory");
+        let (rings, rings_len) = (m.rings, m.rings_len);
+        assert!(mapping_exists(rings, rings_len), "mapped in the parent");
+
+        let mut fds = [0i32; 2];
+        // SAFETY: `fds` is a valid 2-element array for `pipe` to fill.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: the child issues three syscalls and `_exit`s - no
+        // allocation and no Rust destructor, so nothing can deadlock on a
+        // lock some other thread held at the moment of the fork.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // `msync` answers `ENOMEM` for a range that is not mapped. The
+            // child is single-threaded and has done nothing since the fork,
+            // so nothing can have reused the address.
+            let mapped = u8::from(
+                unsafe {
+                    libc::msync(
+                        rings as *mut libc::c_void,
+                        rings_len,
+                        libc::MS_ASYNC,
+                    )
+                } == 0,
+            );
+            unsafe {
+                libc::close(fds[0]);
+                libc::write(fds[1], std::ptr::addr_of!(mapped).cast(), 1);
+                libc::_exit(0)
+            };
+        }
+        let mut got = 1u8;
+        let mut st = 0;
+        let n = unsafe {
+            libc::close(fds[1]);
+            let n = libc::read(fds[0], std::ptr::addr_of_mut!(got).cast(), 1);
+            libc::close(fds[0]);
+            libc::waitpid(pid, &mut st, 0);
+            n
+        };
+        // Status first: a child that faulted never reported, and its silence
+        // would otherwise read as the mapping assertion passing.
+        assert!(
+            libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0,
+            "the child faulted: status {st}"
+        );
+        assert_eq!(n, 1, "the child reported nothing");
+        assert_eq!(got, 0, "ring memory reached the forked child");
+    }
+
+    /// `region_bytes` must never under-size either region. The kernel pins
+    /// what its own `rings_size()` asks for, and a mapping shorter than that
+    /// fails the pin with a bare `EFAULT` - which `RingFd::setup` reports as
+    /// the `ENOMEM` that sent it down this path, so an error here would be
+    /// invisible in production. This is the only thing that catches it.
+    #[test]
+    fn region_bytes_covers_the_kernel_layout() {
+        for entries in [1u32, 8, 512, 4096, 32768] {
+            // Through the caller-allocated path deliberately. The
+            // kernel-allocated one is what fails on a fragmented host, so
+            // asking it for 32768 entries here makes this test a second
+            // casualty of the very condition the retry exists to survive.
+            let setup = match RingFd::setup_with_own_memory(entries) {
+                Ok(r) => r,
+                Err(e) if crate::uring::setup_unavailable(e) => return,
+                Err(e) => panic!("setup_with_own_memory({entries}): {e}"),
+            };
+            let p = setup.params;
+            // Release the fd and its memlock charge before the next size:
+            // an io_uring context is freed asynchronously, and these are
+            // ~3.2 MiB each at the top of the range.
+            drop(setup);
+
+            let (rings_len, sqes_len) = region_bytes(entries);
+            let cq_end = (p.cq_off.cqes as usize)
+                + (p.cq_entries as usize) * size_of::<IoUringCqe>();
+            assert!(
+                rings_len >= page_align(cq_end),
+                "entries={entries}: ring region {rings_len} < {cq_end}"
+            );
+
+            let sqes_end = (p.sq_entries as usize) * size_of::<IoUringSqe>();
+            assert!(
+                sqes_len >= page_align(sqes_end),
+                "entries={entries}: SQE region {sqes_len} < {sqes_end}"
+            );
+        }
     }
 
     /// A ring created on one thread is mapped and driven on another, and the
@@ -922,6 +1379,9 @@ mod loom_tests {
         fn k_publish_cq_tail(&self, tail: u32) {
             self.cq_ktail.store(tail, Ordering::Release);
         }
+        fn k_cq_head_acquire(&self) -> u32 {
+            self.cq_khead.load(Ordering::Acquire)
+        }
     }
 
     // The mock kernel: consume every published SQE, and for each post one CQE
@@ -932,9 +1392,19 @@ mod loom_tests {
         let mut sq_head = 0u32; // kernel's private SQ consumer head
         let mut cq_tail = 0u32; // kernel's private CQ producer tail
         let mut produced = 0u32;
+        let cq_entries = k.cq_mask + 1;
         while produced < n {
             let sq_tail = k.k_sq_tail_acquire();
             while sq_head != sq_tail && produced < n {
+                // Wait for a CQE slot the user has finished with. This is the
+                // only reader of `cq_head`, and without it `publish_cq_head`
+                // has no counterparty at all: the model would write each CQE
+                // index once and never overwrite one, so weakening that
+                // Release could not be observed.
+                while cq_tail.wrapping_sub(k.k_cq_head_acquire()) >= cq_entries
+                {
+                    loom::thread::yield_now();
+                }
                 let ud = k.k_sqe_user_data((sq_head & k.sq_mask) as usize);
                 sq_head = sq_head.wrapping_add(1);
                 k.k_publish_sq_head(sq_head); // slot now reusable
@@ -958,10 +1428,17 @@ mod loom_tests {
     #[test]
     fn sq_cq_ordering_spsc() {
         loom::model(|| {
-            // Keep tiny - loom is exhaustive. Two ops over a 2-slot ring
-            // exercises publish/consume of distinct SQEs and CQEs.
+            // Keep tiny - loom is exhaustive - but **more ops than slots**.
+            // Two ops over a *two*-slot ring reuses nothing: `try_reserve`
+            // never finds the ring full, so `sq_head_acquire`'s Acquire has
+            // no reuse to order `fill_sqe` against, and the kernel never
+            // rewrites a CQE index, so `publish_cq_head`'s Release has no
+            // reader. Both could be weakened to Relaxed with the model still
+            // green. One slot forces a wrap on each side at the same op
+            // count, which is what makes them observable - and is cheaper
+            // than raising N, which loom explores exponentially.
             const N: u32 = 2;
-            let rings = Arc::new(SqCqRings::new_owned(2, 2));
+            let rings = Arc::new(SqCqRings::new_owned(1, 1));
 
             let k = rings.clone();
             let kernel = loom::thread::spawn(move || mock_kernel(&k, N));
@@ -970,16 +1447,24 @@ mod loom_tests {
             // reap N, asserting each user_data returns exactly once.
             let mut sq_tail = 0u32;
             let mut cq_head = 0u32;
-            for i in 0..N {
-                // 2-slot ring, N=2 => never full; reservation always succeeds.
-                let idx = rings.try_reserve(sq_tail).expect("slot free");
-                rings.fill_sqe(idx, |sqe| sqe.user_data = u64::from(i) + 1);
-                rings.advance(&mut sq_tail);
-            }
-
+            let mut sent = 0u32;
             let mut seen = 0u64;
             let mut count = 0u32;
             while count < N {
+                // Publish while there is room, then reap. Producing and
+                // consuming have to interleave now: with more ops than slots
+                // the ring really does fill, and the reservation that finds
+                // it full is the one whose slot the kernel is still reading.
+                while sent < N {
+                    let Some(idx) = rings.try_reserve(sq_tail) else {
+                        break;
+                    };
+                    rings.fill_sqe(idx, |sqe| {
+                        sqe.user_data = u64::from(sent) + 1
+                    });
+                    rings.advance(&mut sq_tail);
+                    sent += 1;
+                }
                 match rings.reap(&mut cq_head) {
                     Some(cqe) => {
                         let bit = 1u64 << (cqe.user_data - 1);

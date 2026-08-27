@@ -18,6 +18,27 @@
 //! for otherwise; see [`Order`] for what the ordered modes cost, and
 //! [`query_tree`](super::query_tree::query_tree) to walk a whole subtree in
 //! path order.
+//!
+//! # A listing is not a snapshot
+//!
+//! The name feed is `readdir`, and its contract admits an entry renamed
+//! during the sweep being missed or reported twice. Sorting afterwards
+//! cannot restore what the sweep never saw, so an ordered listing is as
+//! non-atomic as an unordered one - it is merely sorted.
+//!
+//! Paging with [`QueryOptions::start_after`] widens that window rather than
+//! closing it. Each continuation is its own sweep of a directory that has
+//! moved on since the last, so an entry renamed between pages can be absent
+//! from both or present in both under two names.
+//!
+//! Measured on ZFS under rename churn: a 4,000-entry directory lost an entry
+//! in 10 of 16 listings, and a 20,000-entry one yielded between 19,998 and
+//! 20,001 distinct names across 12 rounds. Create/unlink churn and
+//! `RENAME_EXCHANGE` were exact - it is specifically a rename that *changes
+//! the name* that can move an entry across the cursor.
+//!
+//! A caller that needs a point-in-time view needs a snapshot underneath it
+//! (`.zfs/snapshot`); no listing option can supply one.
 
 use super::offload_pool::{Job, SharedPool};
 use super::{Anchor, File, FsHandle, FsPending, Leaf, Personality};
@@ -146,6 +167,11 @@ pub struct QueryOptions {
     /// Ignored under [`Order::Readdir`], which has no order to be "after".
     /// Note this prunes *after* the directory has been read and sorted - it
     /// resumes a listing, it does not make resuming cheap.
+    ///
+    /// Resuming is also not a snapshot: each continuation re-reads a
+    /// directory that has moved on, so an entry renamed between pages can be
+    /// missed by both or reported by both under two names. See the module
+    /// docs - this is `readdir`'s contract, not something paging closes.
     pub start_after: Option<Vec<u8>>,
 }
 
@@ -431,11 +457,23 @@ impl QueryDir {
         let who = self.who;
         let spec = self.opts.spec;
 
+        // A descriptor is opened whenever anything below needs one. Where it
+        // is, the entry's metadata is taken from that descriptor rather than
+        // from a second resolution of the same name: two independent by-name
+        // lookups can land on two different inodes under rename churn, and
+        // pairing them reports one file's size, mtime and change cookie
+        // against another file's name. The fd-keyed `statx` is issued in the
+        // read phase below, where it overlaps the xattr reads, so this costs
+        // no op that the by-name form did not already cost.
+        let wants_fd = spec.intersects(
+            EnrichSpec::XATTR | EnrichSpec::ACL | EnrichSpec::XATTR_LIST,
+        );
+
         // Request statx and an fd for each entry, opened as `who`.
         let requested: Vec<Requested> = names
             .into_iter()
             .map(|(name, dtype)| {
-                let statx = if spec.contains(EnrichSpec::STATX) {
+                let statx = if spec.contains(EnrichSpec::STATX) && !wants_fd {
                     Leaf::new(name.as_bytes()).ok().and_then(|leaf| {
                         self.h
                             .start_statx(
@@ -450,11 +488,7 @@ impl QueryDir {
                 } else {
                     None
                 };
-                let open = if spec.intersects(
-                    EnrichSpec::XATTR
-                        | EnrichSpec::ACL
-                        | EnrichSpec::XATTR_LIST,
-                ) {
+                let open = if wants_fd {
                     let how = OpenHow::new().flags(
                         OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
                     );
@@ -471,10 +505,15 @@ impl QueryDir {
             })
             .collect();
 
-        // Collect each entry's statx and opened fd, dropping anything that
-        // crossed a mount point when the caller asked for one filesystem.
-        // Filtering here - before the xattr reads below - also means a nested
-        // dataset costs no further work.
+        // Collect each entry's opened fd and, where one was issued, its
+        // by-name statx, dropping anything that crossed a mount point when
+        // the caller asked for one filesystem.
+        //
+        // That drop needs metadata, so it runs here only for the entries that
+        // have some - the no-descriptor case - and is deferred to the assembly
+        // below for the rest. The trade is deliberate: a crossed entry pays
+        // for xattr reads it did not need, and every ordinary entry is spared
+        // a second `statx`. Crossing is the rare case; being listed is not.
         let cross_dev = |st: Option<&Statx>| match (self.dir_dev, st) {
             (Some(dev), Some(st)) => st.dev() != dev,
             // No device for the directory, or no statx for the entry: nothing
@@ -485,17 +524,16 @@ impl QueryDir {
             .into_iter()
             .filter_map(|p| {
                 let statx = p.statx.and_then(pending_statx);
-                if self.opts.same_device_only && cross_dev(statx.as_ref()) {
+                if statx.is_some()
+                    && self.opts.same_device_only
+                    && cross_dev(statx.as_ref())
+                {
                     return None;
                 }
-                let is_dir = statx
-                    .as_ref()
-                    .map(Statx::is_dir)
-                    .unwrap_or(p.dtype == libc::DT_DIR);
                 let file = p.open.and_then(pending_file);
                 Some(Opened {
                     name: p.name,
-                    is_dir,
+                    dtype: p.dtype,
                     statx,
                     file,
                 })
@@ -511,8 +549,25 @@ impl QueryDir {
                 let mut acl = None;
                 let mut discovered = Vec::new();
                 let mut incomplete = false;
+                let mut statx_pending = None;
                 match &p.file {
                     Some(f) => {
+                        if spec.contains(EnrichSpec::STATX) {
+                            // This entry's own descriptor, so no name is
+                            // resolved and the metadata cannot describe a
+                            // different inode. Issued here rather than with
+                            // the open so it pipelines with the xattr reads
+                            // below instead of costing a round trip.
+                            statx_pending = self
+                                .h
+                                .start_fstatx(
+                                    who,
+                                    f,
+                                    AtFlags::empty(),
+                                    self.opts.statx_mask,
+                                )
+                                .ok();
+                        }
                         if spec.contains(EnrichSpec::XATTR) {
                             for xn in &self.opts.xattr_names {
                                 let pend = self
@@ -585,10 +640,31 @@ impl QueryDir {
                     }
                     None => {}
                 }
+                // An entry whose open failed has no descriptor to stat, and
+                // so nothing for a by-name answer to be mispaired against:
+                // there it is both safe and the only answer available.
+                if statx_pending.is_none()
+                    && p.statx.is_none()
+                    && spec.contains(EnrichSpec::STATX)
+                {
+                    statx_pending =
+                        Leaf::new(p.name.as_bytes()).ok().and_then(|leaf| {
+                            self.h
+                                .start_statx(
+                                    who,
+                                    &self.dir,
+                                    leaf,
+                                    AtFlags::AT_SYMLINK_NOFOLLOW,
+                                    self.opts.statx_mask,
+                                )
+                                .ok()
+                        });
+                }
                 Reading {
                     name: p.name,
-                    is_dir: p.is_dir,
+                    dtype: p.dtype,
                     statx: p.statx,
+                    statx_pending,
                     file: p.file,
                     xattrs,
                     acl,
@@ -606,7 +682,21 @@ impl QueryDir {
         // own reference).
         reading
             .into_iter()
-            .map(|p| {
+            .filter_map(|p| {
+                // The descriptor's own answer where there is one; the by-name
+                // answer only where no descriptor was opened.
+                let statx = p.statx_pending.and_then(pending_statx).or(p.statx);
+                // Deferred from the collection above for every entry that
+                // carried no by-name answer to test there.
+                if self.opts.same_device_only && cross_dev(statx.as_ref()) {
+                    return None;
+                }
+                // A verdict from the metadata where there is any, and only
+                // then the readdir hint.
+                let is_dir = statx
+                    .as_ref()
+                    .map(Statx::is_dir)
+                    .unwrap_or(p.dtype == libc::DT_DIR);
                 let mut xattrs: Vec<(CString, Option<Vec<u8>>)> = p
                     .xattrs
                     .into_iter()
@@ -643,14 +733,14 @@ impl QueryDir {
                         xattrs.push((dn, Some(v)));
                     }
                 }
-                DirEntry {
+                Some(DirEntry {
                     name: p.name,
-                    is_dir: p.is_dir,
-                    statx: p.statx,
+                    is_dir,
+                    statx,
                     xattrs,
                     acl,
                     xattrs_incomplete: incomplete,
-                }
+                })
             })
             .collect()
     }
@@ -673,14 +763,20 @@ struct Requested {
 }
 struct Opened {
     name: OsString,
-    is_dir: bool,
+    dtype: u8,
+    /// The by-name answer, present only where no descriptor was opened.
     statx: Option<Statx>,
     file: Option<File>,
 }
 struct Reading {
     name: OsString,
-    is_dir: bool,
+    dtype: u8,
+    /// The by-name answer, present only where no descriptor was opened.
     statx: Option<Statx>,
+    /// A `statx` of the descriptor this entry actually holds, issued with the
+    /// xattr reads. Supersedes the by-name answer, which cannot be trusted to
+    /// describe the same inode the open resolved to.
+    statx_pending: Option<FsPending>,
     // Kept alive until any oversized discovered value has been refetched; each
     // in-flight op holds its own reference regardless.
     file: Option<File>,

@@ -24,9 +24,13 @@
 /// that.
 ///
 /// `EPERM`/`ENOSYS`/`EACCES` mean there is no io_uring here (an old kernel,
-/// seccomp, `kernel.io_uring_disabled`). `ENOMEM` is the memlock ceiling:
-/// every ring pins pages against `RLIMIT_MEMLOCK`, so a box running many
-/// test binaries at once exhausts it. **Everything else is a defect** -
+/// seccomp, `kernel.io_uring_disabled`). `ENOMEM` reaching a caller means
+/// *both* allocation paths in [`RingFd::setup`](ring::RingFd::setup) failed:
+/// either the `RLIMIT_MEMLOCK` ceiling, charged identically to both, or a
+/// host too fragmented even for the retry. Memlock is not always the cause,
+/// so raising `ulimit -l` is not always the answer - rings are refused at
+/// 32768 entries on a fragmented 6.18 box holding `CAP_IPC_LOCK`, where
+/// nothing is charged at all. **Everything else is a defect** -
 /// `EINVAL` above all, which is a rejected setup argument - and the caller
 /// must panic rather than skip every assertion behind it.
 ///
@@ -48,6 +52,16 @@ pub(crate) fn setup_unavailable(e: crate::errno::Errno) -> bool {
         );
     }
     environmental
+}
+
+/// The system page size, or 4096 if `sysconf` somehow refuses.
+///
+/// One definition for the `uring` modules: ring, SQE and buffer-ring regions
+/// are all sized in whole pages, and a wrong answer here is a short mapping.
+pub(crate) fn page_size() -> usize {
+    // SAFETY: `sysconf` with a valid name reads no memory and returns a long.
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if n > 0 { n as usize } else { 4096 }
 }
 
 #[cfg(feature = "net-server")]

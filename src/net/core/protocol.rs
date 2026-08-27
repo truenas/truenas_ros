@@ -53,9 +53,38 @@ pub struct PeerCred {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Framing {
     /// Read exactly `n` more bytes (one `MSG_WAITALL` recv), then re-check.
-    /// Use when the remaining length is known (a length prefix, or a body once
-    /// its length is parsed) - efficient, and never over-reads.
+    /// Use when the remaining length is known - efficient, and never
+    /// over-reads.
+    ///
+    /// Answering this with **nothing buffered** tells the server the
+    /// connection is parked for the *next* message: it carries
+    /// [`ServerConfig::idle_timeout`] and arms no receipt budget. A framer
+    /// mid-message with an empty buffer - a body whose length it parsed out
+    /// of a head it has already consumed - must answer
+    /// [`NeedInMessage`](Framing::NeedInMessage) instead.
+    ///
+    /// [`ServerConfig::idle_timeout`]: crate::net::server::ServerConfig::idle_timeout
     Need(usize),
+    /// [`Need`](Framing::Need) for a message the peer has already begun.
+    ///
+    /// Identical in what it reads. The difference is which clock the read
+    /// carries, exactly as [`MoreInMessage`](Framing::MoreInMessage) is to
+    /// [`More`](Framing::More): this says "a message is under way", so the
+    /// read takes [`ServerConfig::request_timeout`] rather than
+    /// [`ServerConfig::idle_timeout`] and arms
+    /// [`ServerConfig::max_receipt_time`].
+    ///
+    /// **SECURITY: a framer that answers `Need` here loses both bounds.** A
+    /// peer that sends a partial message and stops is then held by the idle
+    /// clock alone - by nothing at all where that is unset - with its pool
+    /// slot taken at accept, before any authentication. The exact shape is
+    /// easy to reach: a framer that reads a length prefix as its own message,
+    /// consumes it, and answers `Need(payload_len)` from an empty buffer.
+    ///
+    /// [`ServerConfig::idle_timeout`]: crate::net::server::ServerConfig::idle_timeout
+    /// [`ServerConfig::request_timeout`]: crate::net::server::ServerConfig::request_timeout
+    /// [`ServerConfig::max_receipt_time`]: crate::net::server::ServerConfig::max_receipt_time
+    NeedInMessage(usize),
     /// Read whatever the peer has sent (a chunk, no `MSG_WAITALL`), then
     /// re-check. Use when scanning for a delimiter of unknown position.
     ///

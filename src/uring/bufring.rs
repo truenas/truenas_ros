@@ -75,6 +75,7 @@
 //!   completion, which is the only place it can be answered.
 
 use crate::errno::{self, Errno};
+use crate::uring::page_size;
 use crate::uring::sys::*;
 use std::os::fd::RawFd;
 // The tail cell is `std`'s in production, reached through a raw pointer into
@@ -88,12 +89,6 @@ use loom::sync::atomic::{AtomicU16, Ordering};
 use std::sync::atomic::{AtomicU16, Ordering};
 
 /// The system page size; the granularity the ring must be aligned to.
-fn page_size() -> usize {
-    // SAFETY: `sysconf` with a valid name reads no memory and returns a long.
-    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if n > 0 { n as usize } else { 4096 }
-}
-
 /// Publish the producer tail.
 ///
 /// `Release` so the kernel cannot observe a tail that names a descriptor

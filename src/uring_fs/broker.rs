@@ -102,6 +102,7 @@ use crate::sync::{Arc, Mutex};
 use crate::uring::ring::RingFd;
 use std::ffi::c_void;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::time::Duration;
 
 use super::single_flight::SingleFlight;
 
@@ -676,6 +677,15 @@ impl CredBroker {
     /// capability-free behaviour exactly, including skipping the `capset`
     /// entirely inside the impersonation window.
     ///
+    /// **Impersonation is available to the first broker in a process, and
+    /// only that one.** This sheds `CAP_SETUID`/`CAP_SETGID` from the caller
+    /// once the child is forked - deliberately, so a compromised main cannot
+    /// mint identities itself - and a child forked afterwards inherits the
+    /// stripped set. A second broker is therefore usable for the calling
+    /// process's own identity and refuses every other with `EPERM`. No error
+    /// says so here, because the difference is in what is later asked of it;
+    /// [`is_alive`](Self::is_alive) says the same for a supervisor.
+    ///
     /// Capabilities are applied only on the impersonation path. A request
     /// whose identity already matches the broker's own is refused `EPERM`
     /// when it asks for any: that path mints the daemon's *own* credentials,
@@ -707,6 +717,10 @@ impl CredBroker {
         // SAFETY: fresh owned fds from socketpair.
         let parent_end = unsafe { crate::fd::owned_from_raw(sv[0]) };
         let child_end = unsafe { crate::fd::owned_from_raw(sv[1]) };
+
+        // The reply socket is the only thing standing between a stalled
+        // broker and every caller in the process; see `RECV_TIMEOUT`.
+        set_recv_timeout(parent_end.as_raw_fd(), RECV_TIMEOUT)?;
 
         // Fork the broker via `clone3`, not `fork()`, for three reasons --
         // one of them load-bearing for the privileged window:
@@ -805,6 +819,17 @@ impl CredBroker {
     /// it. Race-free against PID reuse: it polls the pidfd, which becomes
     /// readable only when *this* child exits. A poll error is reported as
     /// not-alive (conservative).
+    ///
+    /// **Alive is not the same as able to mint every identity.** [`spawn`]
+    /// sheds `CAP_SETUID`/`CAP_SETGID` from the calling process once its
+    /// child is forked, so the first broker's child holds them and every
+    /// later one in that process does not. A replacement spawned in place
+    /// serves identities needing no impersonation - the process's own, via
+    /// [`UringFs::register_self`](crate::uring_fs::UringFs::register_self) -
+    /// and answers `EPERM` for the rest. Restarting here recovers that much;
+    /// recovering impersonation needs a fresh process.
+    ///
+    /// [`spawn`]: Self::spawn
     pub fn is_alive(&self) -> bool {
         let mut pfd = libc::pollfd {
             fd: self.inner.pidfd.as_raw_fd(),
@@ -872,6 +897,43 @@ fn recv_reply(sock: RawFd) -> errno::Result<i64> {
         return Err(Errno::ECONNRESET);
     }
     Ok(i64::from_le_bytes(buf))
+}
+
+/// How long a broker round trip may take before the caller gives up.
+///
+/// Broker *death* already fails closed - the recv returns 0 and surfaces
+/// `ECONNRESET`. A **stall** did not: the socket mutex spans send and recv,
+/// so one wedged request blocked every other thread's register *and*
+/// unregister, and `IdEntry::drop` calls unregister - so any thread dropping
+/// the last `Lease`, the reactor thread included, wedged with it. There is no
+/// timeout anywhere else on this path and nothing consults `is_alive`.
+///
+/// A healthy round trip is a handful of syscalls in another process, so this
+/// is orders of magnitude above anything real: it exists to convert a
+/// permanent process-wide wedge into a per-call error, not to police
+/// latency. Reachable in-module - the child's `catch_unwind` allocates inside
+/// a fork-copied malloc arena and writes to an fd `tidy_child_fds` already
+/// closed - and from outside by a cgroup freeze, which `signal.rs` notes the
+/// broker deliberately ignores.
+const RECV_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound how long `recv` on `sock` may block.
+fn set_recv_timeout(sock: RawFd, d: Duration) -> errno::Result<()> {
+    let tv = libc::timeval {
+        tv_sec: d.as_secs() as libc::time_t,
+        tv_usec: d.subsec_micros() as libc::suseconds_t,
+    };
+    // SAFETY: `tv` is a live `timeval` of the length passed.
+    Errno::result(unsafe {
+        libc::setsockopt(
+            sock,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            std::ptr::addr_of!(tv).cast::<c_void>(),
+            size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    })?;
+    Ok(())
 }
 
 /// `_LINUX_CAPABILITY_VERSION_3`: two 32-bit words per set.

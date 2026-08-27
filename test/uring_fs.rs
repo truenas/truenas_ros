@@ -1974,6 +1974,156 @@ where
 
 // --- query_directory -------------------------------------------------------
 
+/// The special-file guard leaves nothing behind on the descriptor.
+///
+/// `O_NONBLOCK` stops the *open* parking on a planted FIFO, but on the file
+/// it returns it is not inert: `io_file_get_flags` reads it into
+/// `REQ_F_SUPPORT_NOWAIT`, so `__io_read` takes the `IOCB_NOWAIT` branch and
+/// the transfer runs in the submitting task - the reactor thread - instead of
+/// on an io-wq worker. Measured at 22.7 ms inline for a 32 MiB warm ZFS read
+/// against a punt. The kernel strips the flag from files it added it to
+/// (`io_uring/openclose.c:161-162`); so does this.
+#[test]
+fn an_open_leaves_no_guard_nonblock_on_the_descriptor() {
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::FsOpenHow;
+
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("f"), b"data").unwrap();
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let flags = |f: &truenas_ros::uring_fs::File| {
+            // SAFETY: a live descriptor; F_GETFL reads no memory through it.
+            unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) }
+        };
+
+        // Guarded (the default): the open cannot block, and the descriptor
+        // does not carry the flag that made it so.
+        let plain = OpenHow::new().flags(OFlag::O_RDONLY);
+        let f = h.open(me, &anchor, "f", plain).unwrap();
+        assert_eq!(
+            flags(&f) & libc::O_NONBLOCK,
+            0,
+            "the guard's O_NONBLOCK rode out on the descriptor"
+        );
+
+        // A caller asking for it keeps it - the flag is theirs, and the
+        // kernel makes the same distinction with `nonblock_set`.
+        let mine = OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_NONBLOCK);
+        let f = h.open(me, &anchor, "f", mine).unwrap();
+        assert_ne!(
+            flags(&f) & libc::O_NONBLOCK,
+            0,
+            "a caller's own O_NONBLOCK must not be stripped"
+        );
+
+        // And opting out leaves the flags exactly as given.
+        let allow = FsOpenHow::from(plain).allow_blocking_special_files();
+        let f = h.open(me, &anchor, "f", allow).unwrap();
+        assert_eq!(
+            flags(&f) & libc::O_NONBLOCK,
+            0,
+            "Allow adds nothing, so there is nothing to strip"
+        );
+    });
+}
+
+/// A creating open does not park on a planted writer-less FIFO.
+///
+/// `io_openat_force_async` (`io_uring/openclose.c:42-50`) puts every
+/// `O_CREAT`/`O_TRUNC`/`O_TMPFILE` open straight onto an io-wq worker, where
+/// the `op.open_flag |= O_NONBLOCK` the inline path applies never runs and
+/// `fifo_open` sleeps in `wait_for_partner` (`fs/pipe.c`) until a writer
+/// appears - forever, for a FIFO nobody will write to. The io-wq pool is
+/// `min(sq_entries, 4 * nr_cpus)`, so a handful of planted names pins every
+/// blocking fs op on the ring, and `into_outcome` waits with no deadline, so
+/// each pins a caller thread too.
+///
+/// Runs with a deadline on a worker thread: without the guard this does not
+/// fail, it hangs, and a hung test is a worse signal than a red one.
+#[test]
+fn a_creating_open_does_not_park_on_a_planted_fifo() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use truenas_ros::sync_fs::{Mode, OFlag, OpenHow};
+
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        let fifo = dir.join("planted");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+            .unwrap();
+        // SAFETY: a NUL-terminated path we own.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0, "mkfifo");
+
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // Exactly what an object create issues.
+                let how = OpenHow::new()
+                    .flags(OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC)
+                    .mode(Mode::from_bits_truncate(0o644));
+                let _ = tx.send(h.open(me, &anchor, "planted", how));
+            });
+            if rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                panic!(
+                    "a creating open parked on a writer-less FIFO: the \
+                     special-file guard is not reaching this path"
+                );
+            }
+        });
+    });
+}
+
+/// An entry whose descriptor could not be opened still reports metadata.
+///
+/// `enrich` takes an entry's `statx` from the descriptor it opened, so that
+/// the metadata cannot describe a different inode than the content. Where the
+/// open fails there is no descriptor to stat - and equally nothing for a
+/// by-name answer to be mispaired against - so the by-name lookup is both
+/// safe there and the only answer available. A symlink under `O_NOFOLLOW`
+/// is the deterministic way to reach that arm as root.
+#[test]
+fn an_unopenable_entry_still_reports_statx() {
+    use std::collections::BTreeMap;
+    use std::ffi::CString;
+    use truenas_ros::uring_fs::{
+        DirEntry, EnrichSpec, QueryOptions, query_directory,
+    };
+
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("real"), b"xx").unwrap();
+        std::os::unix::fs::symlink("real", dir.join("link")).unwrap();
+
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let opts = QueryOptions {
+            // Both, so a descriptor is opened and the fd-keyed statx is the
+            // one that normally answers.
+            spec: EnrichSpec::STATX | EnrichSpec::XATTR,
+            xattr_names: vec![CString::new("user.etag").unwrap()],
+            acl_name: CString::new("system.nfs4_acl_xdr").unwrap(),
+            xattr_ns: truenas_ros::uring_fs::XattrNamespaces::empty(),
+            clump: 8,
+            same_device_only: false,
+            ..Default::default()
+        };
+        let mut q = query_directory(&h, me, &anchor, opts).unwrap();
+        let mut all: BTreeMap<String, DirEntry> = BTreeMap::new();
+        while let Some(batch) = q.next() {
+            for e in batch.unwrap() {
+                all.insert(e.name.to_string_lossy().into_owned(), e);
+            }
+        }
+
+        assert_eq!(all.len(), 2, "the file and the symlink");
+        let link = all["link"].statx.as_ref().expect(
+            "a symlink cannot be opened O_NOFOLLOW, so its metadata has to \
+             come from the by-name fallback",
+        );
+        assert!(link.is_symlink(), "and it describes the symlink itself");
+        let real = all["real"].statx.as_ref().expect("opened, so fd-keyed");
+        assert_eq!(real.size(), 2);
+    });
+}
+
 #[test]
 fn query_directory_lists_and_enriches() {
     use std::collections::BTreeMap;
@@ -2745,7 +2895,10 @@ fn pool_copy_file_range_whole() {
             .wait()
         {
             Ok(n) => n,
-            Err(_) => return, // fs doesn't support the copy here - skip
+            // Not a skip: every filesystem these tests run on serves
+            // copy_file_range, so an error here is the copy path broken, and
+            // swallowing it is how a green suite covers nothing.
+            Err(e) => panic!("copy_file_range: {e}"),
         };
         assert_eq!(n, content.len() as u64);
         assert_eq!(std::fs::read(dir.join("dst")).unwrap(), content);
@@ -2773,7 +2926,7 @@ fn pool_copy_file_range_ranged_offload() {
         // a block-cloning fs: copy src[100..200] -> dst[50..150].
         let n = match pool.copy_file_range(&src, &dst, 100, 50, 100).wait() {
             Ok(n) => n,
-            Err(_) => return,
+            Err(e) => panic!("copy_file_range: {e}"),
         };
         assert_eq!(n, 100);
         let out = std::fs::read(dir.join("dst")).unwrap();
@@ -2781,6 +2934,136 @@ fn pool_copy_file_range_ranged_offload() {
         assert_eq!(out[49], 0xFF, "before the range: untouched");
         assert_eq!(out[150], 0xFF, "after the range: untouched");
     });
+}
+
+/// The `EXDEV` byte-copy fallback, entered where it actually runs.
+///
+/// `copy_file_range(2)` answers `EXDEV` when the endpoints are on different
+/// filesystems, and `copy_range_rw` is what carries the bytes then. Every
+/// other copy test puts both endpoints in one tempdir, where that answer
+/// never comes: with a `panic!` at the top of `copy_range_rw` the whole
+/// privileged lane stays green and the probe never fires. Here one endpoint
+/// is on the tempdir's filesystem and the other on a ZFS dataset.
+#[test]
+fn pool_copy_file_range_across_filesystems_takes_the_byte_copy() {
+    use truenas_ros::uring_fs::QueryPool;
+
+    let Some(ds) = zfs_dir_or_skip() else {
+        return;
+    };
+    let scratch = ds.join(format!("ros-xdev-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+
+    let content: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
+    let result = std::panic::catch_unwind({
+        let scratch = scratch.clone();
+        let content = content.clone();
+        move || {
+            with_fs(test_cfg(), |h, me, dir, _stop| {
+                // src on the tempdir's filesystem, dst on the dataset.
+                std::fs::write(dir.join("src"), &content).unwrap();
+                std::fs::write(scratch.join("dst"), b"").unwrap();
+                let a_src = Anchor::open(dir.as_path()).unwrap();
+                let a_dst = Anchor::open(scratch.as_path()).unwrap();
+                let src = h
+                    .open(
+                        me,
+                        &a_src,
+                        "src",
+                        OpenHow::new().flags(OFlag::O_RDONLY),
+                    )
+                    .unwrap();
+                let dst = h
+                    .open(
+                        me,
+                        &a_dst,
+                        "dst",
+                        OpenHow::new().flags(OFlag::O_RDWR),
+                    )
+                    .unwrap();
+                let pool = QueryPool::new(h);
+                let n = pool
+                    .copy_file_range(&src, &dst, 0, 0, content.len() as u64)
+                    .wait()
+                    .expect("the cross-filesystem copy must carry the bytes");
+                assert_eq!(n, content.len() as u64);
+                assert_eq!(
+                    std::fs::read(scratch.join("dst")).unwrap(),
+                    content,
+                    "the EXDEV fallback copied the wrong bytes"
+                );
+            });
+        }
+    });
+    let _ = std::fs::remove_dir_all(&scratch);
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
+/// The copy where the commit that added it actually runs: a ZFS dataset.
+///
+/// `test/support/zfs_dir.rs` states the reason - "`copy_file_range` is the
+/// clearest case - tmpfs serves it as a plain copy while ZFS serves it as a
+/// block clone (`zfs_clone_range`), which is the code that actually ships".
+/// Both tests the commit added run in `crate::tempdir()`, so they exercise
+/// the plain copy and assert nothing about the clone.
+#[test]
+fn pool_copy_file_range_on_a_dataset() {
+    use truenas_ros::uring_fs::QueryPool;
+
+    let Some(ds) = zfs_dir_or_skip() else {
+        return;
+    };
+    let scratch = ds.join(format!("ros-clone-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+
+    // Several blocks, whole-range and block-aligned: the shape that can
+    // clone. A range split below MAX_CHUNK forfeits it, which no other test
+    // in the tree would notice.
+    let content: Vec<u8> = (0..(1024u32 * 1024)).map(|i| i as u8).collect();
+    let result = std::panic::catch_unwind({
+        let scratch = scratch.clone();
+        let content = content.clone();
+        move || {
+            with_fs(test_cfg(), |h, me, _dir, _stop| {
+                std::fs::write(scratch.join("src"), &content).unwrap();
+                std::fs::write(scratch.join("dst"), b"").unwrap();
+                let anchor = Anchor::open(scratch.as_path()).unwrap();
+                let src = h
+                    .open(
+                        me,
+                        &anchor,
+                        "src",
+                        OpenHow::new().flags(OFlag::O_RDONLY),
+                    )
+                    .unwrap();
+                let dst = h
+                    .open(
+                        me,
+                        &anchor,
+                        "dst",
+                        OpenHow::new().flags(OFlag::O_RDWR),
+                    )
+                    .unwrap();
+                let pool = QueryPool::new(h);
+                let n = pool
+                    .copy_file_range(&src, &dst, 0, 0, content.len() as u64)
+                    .wait()
+                    .expect("the dataset copy must carry the bytes");
+                assert_eq!(n, content.len() as u64, "whole range in one call");
+                assert_eq!(
+                    std::fs::read(scratch.join("dst")).unwrap(),
+                    content,
+                    "the dataset copy produced the wrong bytes"
+                );
+            });
+        }
+    });
+    let _ = std::fs::remove_dir_all(&scratch);
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
 }
 
 /// A uid/gid pair that exists nowhere - no files, no group memberships --
