@@ -538,12 +538,19 @@ impl<U> Reactor<U> {
     /// automatic backpressure: the consumer's reader drains the pipe, TCP flow
     /// control pushes back on the sender, and the ring keeps serving other
     /// connections throughout.
+    ///
+    /// `first` says whether this call opens a body or continues one. Only the
+    /// caller knows: a short splice and a readiness poll both resubmit through
+    /// here with the remainder, and the connection flags read the same at every
+    /// entry (`splicing` is cleared on each completion). It sets the receipt
+    /// budget's window mark - see `RECEIPT_WINDOW`.
     pub(crate) fn submit_splice_recv(
         &mut self,
         slot: u32,
         generation: u32,
         fd: RawFd,
         len: usize,
+        first: bool,
     ) -> errno::Result<()> {
         let ktls = {
             let conn = self.table.conn_mut(slot);
@@ -603,16 +610,27 @@ impl<U> Reactor<U> {
         // header that already armed one keeps it.
         #[cfg(feature = "net-server")]
         {
-            // Only when this call is the one that arms it: a short-splice
-            // resubmit must not move the mark, or no expiry could ever tell
-            // progress from a stall.
-            let fresh = !self.table.conn(slot).receipt_deadline_armed;
-            self.arm_receipt_deadline(slot, generation)?;
-            if fresh {
+            // The mark is where this body started, so it is set once, when
+            // the body is opened. A short-splice resubmit must not move it,
+            // or no expiry could tell a window's progress from a stall.
+            //
+            // Not "when this call armed the budget": a framer whose header
+            // takes more than one read arms it in `submit_recv` (the second
+            // header read has bytes buffered, so it is not idle), leaving
+            // the mark at the previous message's - zero on the connection's
+            // first - and `moved` pinned at zero for the whole body. The
+            // renewal below can then never fire, which is the whole-transfer
+            // bound this window exists to remove.
+            if first {
                 let conn = self.table.conn_mut(slot);
                 conn.receipt_window_mark = conn.splice_remaining;
             }
+            self.arm_receipt_deadline(slot, generation)?;
         }
+        // The receipt budget is a server-role bound, and it is `first`'s only
+        // reader.
+        #[cfg(not(feature = "net-server"))]
+        let _ = first;
         Ok(())
     }
 
@@ -877,7 +895,7 @@ impl<U> Reactor<U> {
                 .receipt_window_mark
                 .saturating_sub(conn.splice_remaining);
             let splicing = conn.splicing || conn.splice_polling;
-            if false && splicing && moved >= RECEIPT_WINDOW {
+            if splicing && moved >= RECEIPT_WINDOW {
                 conn.receipt_window_mark = conn.splice_remaining;
                 true
             } else {
@@ -1845,7 +1863,7 @@ impl<U> Reactor<U> {
             let conn = self.table.conn(slot);
             (conn.splice_fd, conn.splice_remaining)
         };
-        self.submit_splice_recv(slot, generation, fd, remaining)
+        self.submit_splice_recv(slot, generation, fd, remaining, false)
     }
 
     /// The core of a body-splice completion (`Op::SpliceRecv`): the stat, the
@@ -1925,7 +1943,7 @@ impl<U> Reactor<U> {
                 let conn = self.table.conn(slot);
                 (conn.splice_fd, conn.splice_remaining)
             };
-            self.submit_splice_recv(slot, generation, fd, remaining)?;
+            self.submit_splice_recv(slot, generation, fd, remaining, false)?;
             return Ok(SpliceStep::Done);
         }
         // Whole body spliced: retire the inactivity watchdog (kTLS only; a
@@ -2243,7 +2261,7 @@ impl<U> Reactor<U> {
                 // fail-closed by the kernel (`-EINVAL`), which
                 // `on_splice_recv` maps to `TlsControl`.
                 self.table.conn_mut(slot).set_frame(header_len, body_len);
-                self.submit_splice_recv(slot, generation, fd, body_len)?;
+                self.submit_splice_recv(slot, generation, fd, body_len, true)?;
                 Ok(Enacted::Done)
             }
         }

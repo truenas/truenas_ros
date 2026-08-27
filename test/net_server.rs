@@ -11348,10 +11348,6 @@ fn a_redelivery_does_not_retire_the_next_message_budget() {
     );
 }
 
-/// The receipt budget covers a spliced body, in both directions.
-///
-/// `arm_receipt_deadline` is reachable only from `submit_recv`, which a
-/// `Framing::SpliceBody` body never enters, so the one clock that progress
 /// A spliced body is bounded per window, not whole.
 ///
 /// `max_receipt_time` is a rate floor: `ServerConfig` promises "each window
@@ -11363,12 +11359,21 @@ fn a_redelivery_does_not_retire_the_next_message_budget() {
 /// budget armed once for the whole transfer made wall clock cap upload
 /// *size*.
 ///
-/// Here: four windows, each moved in a quarter of the budget, but the whole
-/// body needing longer than one budget. Every gap is far inside both
+/// Here: six windows, each moved in under a third of the budget, but the
+/// whole body needing longer than one budget. Every gap is far inside both
 /// inactivity clocks, so nothing but a total bound can reap this - and a
 /// total bound is what this must not be.
 ///
-/// The pipe is drained continuously; at 512 KiB the body is many times a
+/// Run over both header shapes, because the renewal reads a mark that only
+/// the splice path sets. A header the framer reads in **two** exact steps
+/// arms the budget itself - the second read has bytes buffered, so
+/// `submit_recv` does not classify it idle - and a mark tied to whichever
+/// call armed the budget is then never set for the body at all: `moved`
+/// stays zero, no window is ever earned, and the transfer is bounded whole
+/// again. A one-read header hides that entirely, which is why it cannot be
+/// the only case here.
+///
+/// The pipe is drained continuously; at 768 KiB the body is many times a
 /// pipe's capacity, so without a reader the splice would block on
 /// backpressure and the test would measure that instead.
 #[test]
@@ -11382,118 +11387,159 @@ fn a_large_spliced_body_is_bounded_per_window_not_whole() {
     /// is re-armed on every one and can never be what reaps this.
     const GAP: Duration = Duration::from_millis(150);
 
-    let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: `pipe(2)` fills the two-element array with {read, write}.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
-    let (pipe_rd, pipe_wr) = (fds[0], fds[1]);
-
-    let reasons = Arc::new(Mutex::new(Vec::new()));
-    let cfg = ServerConfig {
-        // One window every 150 ms, so no window is remotely near the budget
-        // - but six of them take ~900 ms, and a budget armed once for the
-        // whole transfer fires at 500 ms, mid-body.
-        max_receipt_time: Some(Duration::from_millis(500)),
-        // Above the per-window gap, so the readiness poll is re-armed by
-        // every window and cannot be what reaps this. `ServerConfig` also
-        // requires the receipt budget to exceed it.
-        request_timeout: Some(Duration::from_millis(400)),
-        idle_timeout: None,
-        ..ServerConfig::default()
-    };
-    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let proto = Protocol {
-        accept: |_: Incoming<'_>| Some(()),
-        header: splice_header(pipe_wr),
-        body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
-    };
-    let mut server = match Server::with_config([addr], cfg, proto) {
-        Ok(s) => s,
-        Err(e) if should_skip(&e) => {
-            // SAFETY: closing the test-owned pipe fds on the skip path.
-            unsafe {
-                libc::close(pipe_rd);
-                libc::close(pipe_wr);
-            }
-            return;
-        }
-        Err(e) => panic!("bind: {e}"),
-    };
+    for (what, split_header) in
+        [("a one-read header", false), ("a two-read header", true)]
     {
-        let reasons = Arc::clone(&reasons);
-        server.set_close_hook(move |_addr, reason, _state: &mut ()| {
-            reasons.lock().unwrap().push(reason);
-        });
-    }
-    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
-        panic!("expected Tcp");
-    };
-    let stop = server.shutdown_handle();
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe(2)` fills the two-element array with {read, write}.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let (pipe_rd, pipe_wr) = (fds[0], fds[1]);
 
-    // Drain the pipe for the whole run, so the splice never blocks.
-    let draining = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let drain = {
-        let draining = Arc::clone(&draining);
-        thread::spawn(move || {
-            let mut sink = vec![0u8; 64 * 1024];
-            while draining.load(std::sync::atomic::Ordering::Relaxed) {
-                // SAFETY: `pipe_rd` is a live read end owned by this test.
-                let n = unsafe {
-                    libc::read(pipe_rd, sink.as_mut_ptr().cast(), sink.len())
-                };
-                if n <= 0 {
-                    break;
+        let reasons = Arc::new(Mutex::new(Vec::new()));
+        let cfg = ServerConfig {
+            // One window every 150 ms, so no window is remotely near the
+            // budget - but six of them take ~900 ms, and a budget armed once
+            // for the whole transfer fires at 500 ms, mid-body.
+            max_receipt_time: Some(Duration::from_millis(500)),
+            // Above the per-window gap, so the readiness poll is re-armed by
+            // every window and cannot be what reaps this. `ServerConfig` also
+            // requires the receipt budget to exceed it.
+            request_timeout: Some(Duration::from_millis(400)),
+            idle_timeout: None,
+            ..ServerConfig::default()
+        };
+        let addr =
+            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        // The same 5-byte `[tag][len BE]` header as `splice_header`, read in
+        // one exact step or two. Both are well-formed: `frame_step` requires
+        // a splice framer to read its header with exact `Framing::Need`, so
+        // that the whole header and nothing past it is buffered.
+        let header = move |buf: &[u8], _s: &mut ()| -> Framing {
+            if split_header && buf.is_empty() {
+                return Framing::Need(1); // the tag, then the length
+            }
+            if buf.len() < 5 {
+                return Framing::Need(5 - buf.len());
+            }
+            let len =
+                u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+            match buf[0] {
+                b'S' => Framing::SpliceBody {
+                    header_len: 5,
+                    body_len: len,
+                    fd: pipe_wr, // borrowed; the server never owns or closes it
+                },
+                b'C' => Framing::Complete {
+                    header_len: 5,
+                    body_len: len,
+                },
+                _ => Framing::Invalid,
+            }
+        };
+        let proto = Protocol {
+            accept: |_: Incoming<'_>| Some(()),
+            header,
+            body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
+        };
+        let mut server = match Server::with_config([addr], cfg, proto) {
+            Ok(s) => s,
+            Err(e) if should_skip(&e) => {
+                // SAFETY: closing the test-owned pipe fds on the skip path.
+                unsafe {
+                    libc::close(pipe_rd);
+                    libc::close(pipe_wr);
                 }
+                return;
             }
-        })
-    };
+            Err(e) => panic!("bind: {e}"),
+        };
+        {
+            let reasons = Arc::clone(&reasons);
+            server.set_close_hook(move |_addr, reason, _state: &mut ()| {
+                reasons.lock().unwrap().push(reason);
+            });
+        }
+        let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+            panic!("expected Tcp");
+        };
+        let stop = server.shutdown_handle();
 
-    let client = thread::spawn(move || {
-        let _stop = ShutdownOnDrop(stop.clone());
-        let r = (|| -> io::Result<()> {
-            let mut s = connect_tcp(v4)?;
-            let mut hdr = vec![b'S'];
-            hdr.extend_from_slice(&(BODY as u32).to_be_bytes());
-            s.write_all(&hdr)?;
-            s.flush()?;
-            let chunk = vec![b'x'; WINDOW];
-            for _ in 0..WINDOWS {
-                s.write_all(&chunk)?;
+        // Drain the pipe for the whole run, so the splice never blocks.
+        let draining = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let drain = {
+            let draining = Arc::clone(&draining);
+            thread::spawn(move || {
+                let mut sink = vec![0u8; 64 * 1024];
+                while draining.load(std::sync::atomic::Ordering::Relaxed) {
+                    // SAFETY: `pipe_rd` is a live read end owned by this test.
+                    let n = unsafe {
+                        libc::read(
+                            pipe_rd,
+                            sink.as_mut_ptr().cast(),
+                            sink.len(),
+                        )
+                    };
+                    if n <= 0 {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let client = thread::spawn(move || {
+            let _stop = ShutdownOnDrop(stop.clone());
+            let r = (|| -> io::Result<()> {
+                let mut s = connect_tcp(v4)?;
+                let mut hdr = vec![b'S'];
+                hdr.extend_from_slice(&(BODY as u32).to_be_bytes());
+                s.write_all(&hdr)?;
                 s.flush()?;
-                thread::sleep(GAP);
-            }
-            // Alive? Then the transfer was never reaped, and the budget was
-            // retired with the message rather than left armed.
-            splice_frame(&mut s, b'C', b"ping")?;
-            assert_eq!(recv_framed(&mut s)?, b"ping");
-            Ok(())
-        })();
-        stop.shutdown();
-        r
-    });
+                let chunk = vec![b'x'; WINDOW];
+                for _ in 0..WINDOWS {
+                    s.write_all(&chunk)?;
+                    s.flush()?;
+                    thread::sleep(GAP);
+                }
+                // Alive? Then the transfer was never reaped, and the budget
+                // was retired with the message rather than left armed.
+                splice_frame(&mut s, b'C', b"ping")?;
+                assert_eq!(recv_framed(&mut s)?, b"ping");
+                Ok(())
+            })();
+            stop.shutdown();
+            r
+        });
 
-    server.serve_forever().expect("serve_forever");
-    draining.store(false, std::sync::atomic::Ordering::Relaxed);
-    // SAFETY: the test owns both ends; the server never closes `pipe_wr`.
-    unsafe {
-        libc::close(pipe_wr);
-        libc::close(pipe_rd);
+        server.serve_forever().expect("serve_forever");
+        draining.store(false, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: the test owns both ends; the server never closes `pipe_wr`.
+        unsafe {
+            libc::close(pipe_wr);
+            libc::close(pipe_rd);
+        }
+        let _ = drain.join();
+        // The client completing its ping is half the proof: a connection
+        // reaped mid-transfer cannot answer one, so `client io` fails first.
+        let served = client.join().expect("thread join");
+        // The other half. Not an equality against `[PeerClosed]`: whether the
+        // peer-close is observed before `shutdown` tears the loop down is a
+        // race with no bearing on the budget, and it is lost in a release
+        // build.
+        let got = reasons.lock().unwrap().clone();
+        assert!(
+            !got.contains(&CloseReason::ReceiptTimeout),
+            "{what}: a body moving a window per third of a budget is above \
+             the floor: ReceiptTimeout means the budget bounded the transfer \
+             whole, so wall clock capped upload size (reasons: {got:?})"
+        );
+        served.unwrap_or_else(|e| panic!("{what}: client io: {e}"));
     }
-    let _ = drain.join();
-    // The client completing its ping is half the proof: a connection reaped
-    // mid-transfer cannot answer one, so `client io` fails first.
-    client.join().expect("thread join").expect("client io");
-    // The other half. Not an equality against `[PeerClosed]`: whether the
-    // peer-close is observed before `shutdown` tears the loop down is a race
-    // with no bearing on the budget, and it is lost in a release build.
-    let got = reasons.lock().unwrap().clone();
-    assert!(
-        !got.contains(&CloseReason::ReceiptTimeout),
-        "a body moving a window per quarter-budget is above the floor: \
-         ReceiptTimeout means the budget bounded the transfer whole, so \
-         wall clock capped upload size (reasons: {got:?})"
-    );
 }
 
+/// The receipt budget covers a spliced body, in both directions.
+///
+/// `arm_receipt_deadline` is reachable only from `submit_recv`, which a
+/// `Framing::SpliceBody` body never enters, so the one clock that progress
 /// cannot restart did not reach the splice path at all - the two that do
 /// (`request_timeout` on the readiness poll, the kTLS watchdog) are both
 /// inactivity bounds any arriving byte re-arms. And where a multi-read

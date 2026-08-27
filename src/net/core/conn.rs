@@ -771,10 +771,10 @@ pub(crate) struct Connection<U> {
     // (stall).
     pub splice_deadline_armed: bool,
     pub splice_watermark: usize,
-    /// `splice_remaining` when the receipt budget was last armed, so its
-    /// expiry can tell a window's worth of progress from a stall. Only the
-    /// splice path sets it; a buffered message is bounded whole and needs no
-    /// mark. See `RECEIPT_WINDOW`.
+    /// `splice_remaining` when the current body opened, or when its last
+    /// receipt budget was renewed, so an expiry can tell a window's worth of
+    /// progress from a stall. Only the splice path sets it; a buffered
+    /// message is bounded whole and needs no mark. See `RECEIPT_WINDOW`.
     pub receipt_window_mark: usize,
     // ---- send side ----
     // Outgoing PDUs (request replies and pushes) queued FIFO in production
