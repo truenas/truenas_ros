@@ -86,6 +86,12 @@ pub(crate) struct FrameFacts<'a> {
     /// The screened request-target, reduced to origin form. Computed here
     /// already; carried out so the screen can be asserted on rather than
     /// only exercised - see `http::fuzz::head_facts`.
+    ///
+    /// That seam is its only reader and is `__fuzz`-gated, so every shipping
+    /// build has a field nothing touches. Keep the field unconditional: the
+    /// struct's lifetime is borrowed through it alone, so gating it would
+    /// leave `'a` unconstrained and cost a `PhantomData` to say less.
+    #[cfg_attr(not(feature = "__fuzz"), allow(dead_code))]
     pub target: &'a str,
     /// The declared body framing, or the status the connection should die
     /// with. Kept as a `Result` so the framer sequences its own cap checks
