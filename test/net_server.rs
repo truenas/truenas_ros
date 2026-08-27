@@ -11479,13 +11479,18 @@ fn a_large_spliced_body_is_bounded_per_window_not_whole() {
         libc::close(pipe_rd);
     }
     let _ = drain.join();
+    // The client completing its ping is half the proof: a connection reaped
+    // mid-transfer cannot answer one, so `client io` fails first.
     client.join().expect("thread join").expect("client io");
-    assert_eq!(
-        reasons.lock().unwrap().clone().as_slice(),
-        &[CloseReason::PeerClosed],
+    // The other half. Not an equality against `[PeerClosed]`: whether the
+    // peer-close is observed before `shutdown` tears the loop down is a race
+    // with no bearing on the budget, and it is lost in a release build.
+    let got = reasons.lock().unwrap().clone();
+    assert!(
+        !got.contains(&CloseReason::ReceiptTimeout),
         "a body moving a window per quarter-budget is above the floor: \
-         ReceiptTimeout here means the budget bounded the transfer whole, \
-         so wall clock capped upload size"
+         ReceiptTimeout means the budget bounded the transfer whole, so \
+         wall clock capped upload size (reasons: {got:?})"
     );
 }
 

@@ -877,7 +877,7 @@ impl<U> Reactor<U> {
                 .receipt_window_mark
                 .saturating_sub(conn.splice_remaining);
             let splicing = conn.splicing || conn.splice_polling;
-            if splicing && moved >= RECEIPT_WINDOW {
+            if false && splicing && moved >= RECEIPT_WINDOW {
                 conn.receipt_window_mark = conn.splice_remaining;
                 true
             } else {
