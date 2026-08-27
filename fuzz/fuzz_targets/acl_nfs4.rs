@@ -18,7 +18,7 @@
 //! normalizing *differently on a second pass* would not be.
 
 use libfuzzer_sys::fuzz_target;
-use truenas_ros::sync_fs::acl::Nfs4Acl;
+use truenas_ros::sync_fs::acl::{Nfs4Acl, PosixAcl};
 
 /// XDR header: `acl_flags` + `naces`.
 const HDR_SZ: usize = 8;
@@ -76,4 +76,54 @@ fuzz_target!(|data: &[u8]| {
             "inherited ACL does not round-trip"
         );
     }
+
+    // The lossy POSIX1E translation runs a deny-propagating state machine
+    // over the same attacker-controlled ACEs, so it is driven from here too.
+    // It errors on an id POSIX cannot hold, which is a normal answer.
+    for is_dir in [false, true] {
+        let Ok(posix) = acl.to_posix_lossy(is_dir) else {
+            continue;
+        };
+        check_posix(&posix, is_dir);
+
+        // Anything we produced must convert back, and the pair must settle:
+        // the first pass can widen the group-class mask, because that mask is
+        // derived from the union of the NFS4 allow masks and `w` can be
+        // spelled by bits no single entry holds in full. The second pass
+        // recomputes it from entries that are already reduced, so from there
+        // on the two conversions have to be a fixed point.
+        let nfs4 = posix
+            .to_nfs4_lossy(is_dir)
+            .expect("a POSIX ACL we produced must convert back");
+        let again = nfs4
+            .to_posix_lossy(is_dir)
+            .expect("and that must convert forward again");
+        check_posix(&again, is_dir);
+        let settled = again
+            .to_nfs4_lossy(is_dir)
+            .expect("a settled POSIX ACL must convert back")
+            .to_posix_lossy(is_dir)
+            .expect("and forward again");
+        assert_eq!(settled, again, "the conversion pair does not settle");
+    }
 });
+
+/// A converted POSIX ACL must be one we could write: it is validated on the
+/// way out, so a shape the encoder refuses - or a default half on something
+/// that cannot carry one - is a read-but-cannot-write asymmetry.
+fn check_posix(acl: &PosixAcl, is_dir: bool) {
+    acl.access_bytes()
+        .expect("a converted POSIX ACL must be encodable");
+    let default = acl
+        .default_bytes()
+        .expect("a converted default ACL must be encodable");
+    assert_eq!(
+        default.is_some(),
+        acl.default.is_some(),
+        "the default half disagrees with its encoding"
+    );
+    assert!(
+        is_dir || acl.default.is_none(),
+        "only a directory can carry a default ACL"
+    );
+}
