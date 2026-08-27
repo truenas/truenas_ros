@@ -5,7 +5,13 @@
 //! (`system.posix_acl_*`) and returns the decoded [`Acl`]. [`fsetacl`] writes
 //! one back (or removes it). The wire formats and validation exactly mirror
 //! the `truenas_os` C extension.
+//!
+//! [`PosixAcl::to_nfs4_lossy`] and [`Nfs4Acl::to_posix_lossy`] translate
+//! between the two models for a caller that needs one shape whatever the
+//! filesystem hands back. Neither is a bijection, and each documents what it
+//! drops.
 
+mod lossy;
 mod nfs4;
 mod posix;
 
