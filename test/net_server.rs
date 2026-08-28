@@ -9474,6 +9474,172 @@ fn fs_broker_personality_gates_open() {
     );
 }
 
+/// `open_chain`'s whole point: a directory the caller could never
+/// traverse, opened as the daemon, with the file inside it still gated
+/// on the caller.
+///
+/// This is the property the split credential exists for. A `0700`
+/// daemon-owned tree grants nothing, so opening something under it as
+/// the daemon proves nothing about the caller — the last step has to
+/// name the caller for the kernel to decide their access to the file
+/// they actually asked for.
+///
+/// Three chains over the same tree say it three ways: the daemon
+/// reaches the file; the peer is refused at the file even though the
+/// directory above it opened; and the peer is refused at the directory
+/// when it is the one traversing. The second is the one that matters —
+/// a chain that leaked the daemon's credential into the last step would
+/// hand the peer a file it may not read.
+///
+/// Root-only (the broker needs `CAP_SETUID` to become the peer);
+/// skipped otherwise.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn fs_open_chain_gates_the_last_step_on_its_own_personality() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::OnceLock;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{
+        Anchor, AsUser, CredBroker, OpenStep, Personality, StepPath,
+    };
+
+    if !root_or_skip("fs_open_chain_gates_the_last_step") {
+        return; // the broker cannot become another uid without CAP_SETUID
+    }
+    const NOBODY_UID: u32 = 65_534;
+    const NOBODY_GID: u32 = 65_534;
+
+    let dir = truenas_ros::tempdir().unwrap();
+    // `private/` is the daemon-owned tree: 0700, so the peer cannot even
+    // traverse it. `obj` inside it is 0600, so the peer cannot read it
+    // either — two separate refusals, one per step.
+    let private = dir.path().join("private");
+    std::fs::create_dir(&private).unwrap();
+    let obj = private.join("obj");
+    std::fs::write(&obj, b"topsecret").unwrap();
+    for (path, mode) in [(&private, 0o700), (&obj, 0o600)] {
+        let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: valid path; chmod cannot corrupt memory.
+        assert_eq!(unsafe { libc::chmod(c.as_ptr(), mode) }, 0);
+    }
+
+    let cell: Arc<OnceLock<(Personality, Personality)>> =
+        Arc::new(OnceLock::new());
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+
+    let pc = Arc::clone(&cell);
+    let body = move |mut req: Request<'_, ()>| -> Response {
+        let cmd = req.body.take();
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let (root_pers, peer_pers) =
+            *pc.get().expect("personalities set before serving");
+        let anchor = anchor.clone();
+        // Who walks the directory, and who opens the file under it.
+        let (dir_who, leaf_who) = match cmd.as_slice() {
+            b"root-root" => (root_pers, root_pers),
+            b"root-peer" => (root_pers, peer_pers),
+            _ => (peer_pers, peer_pers),
+        };
+        fs.open_chain(
+            &anchor,
+            vec![
+                OpenStep {
+                    path: StepPath::Fixed(c"private".to_owned()),
+                    who: dir_who,
+                    how: OpenHow::new()
+                        .flags(OFlag::O_PATH | OFlag::O_DIRECTORY),
+                },
+                OpenStep {
+                    path: StepPath::Fixed(c"obj".to_owned()),
+                    who: leaf_who,
+                    how: OpenHow::new().flags(OFlag::O_RDONLY),
+                },
+            ],
+            move |done, fs| match done.file() {
+                Some(file) => {
+                    fs.close(file);
+                    deferred.reply(echo_frame(b"opened"));
+                }
+                None => deferred.reply(echo_frame(b"denied")),
+            },
+        );
+        Response::Defer(permit)
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let cfg = ServerConfig {
+        pool_size: 8,
+        fs_ops: 16,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    let root_pers = server.register_self().expect("register_self");
+    let broker = match CredBroker::spawn(&[&server]) {
+        Ok(b) => b,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("CredBroker::spawn: {e}"),
+    };
+    let creds = broker.handle(0).expect("broker handle");
+    let peer_pers = creds
+        .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
+        .expect("register peer");
+    cell.set((root_pers, peer_pers)).unwrap();
+
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<Vec<Vec<u8>>> {
+        let mut s = connect_tcp(v4)?;
+        let mut out = Vec::new();
+        for cmd in [b"root-root".as_slice(), b"root-peer", b"peer-peer"] {
+            send_framed(&mut s, cmd)?;
+            out.push(recv_framed(&mut s)?);
+        }
+        drop(s);
+        stop.shutdown();
+        Ok(out)
+    });
+    server.serve_forever().expect("serve_forever broker");
+    let got = client.join().unwrap().expect("client io");
+
+    assert_eq!(
+        got[0], b"opened",
+        "the daemon's own identity walks its 0700 tree and opens the file"
+    );
+    assert_eq!(
+        got[1], b"denied",
+        "the peer is refused at the file even though the daemon opened \
+         the directory above it - the last step's personality is what \
+         decides, and a chain that leaked the daemon's would hand over a \
+         file the peer may not read"
+    );
+    assert_eq!(
+        got[2], b"denied",
+        "the peer cannot traverse the 0700 directory either"
+    );
+}
+
 /// The multi-reactor shape: rings created on the main thread before the
 /// broker forks, servers built on worker threads after it, and the peer's
 /// personality minted on each ring before the thread that owns it has even
