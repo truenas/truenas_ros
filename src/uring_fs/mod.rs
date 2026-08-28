@@ -130,6 +130,14 @@
 //!   [`mkdir_path`](FsHandle::mkdir_path) creates a nested path the only sound
 //!   way - alternating confined walks with single-[`Leaf`] `mkdirat`s, because
 //!   `mkdirat` itself honours no resolve flags.
+//! - **Split-credential descent.** [`FsConn::open_chain`] opens a
+//!   sequence of paths, each relative to the one before it and each
+//!   under **its own personality** - so a file inside a tree only the
+//!   daemon may traverse is still resolved under the caller's
+//!   credential, and the kernel makes the access decision about the
+//!   file the caller actually named. Like `mkdir_path`, the walk lives
+//!   here because every step after the first is a continuation, where
+//!   [`open`](FsConn::open) is refused.
 //! - **Server-owned metadata.** [`PrivilegedXattrs`] lets declared
 //!   `trusted.*` attributes be written under the reactor's own credentials, so
 //!   a service can keep metadata that the user who owns the file can neither
@@ -210,7 +218,9 @@ pub(crate) mod core;
 // driving a standalone [`UringFs`] needs it exactly as much as an embedded
 // server does. Gating it on the server role made the whole on-loop surface
 // unreachable for anyone else.
-pub use core::{DirWalk, FsConn, FsDone, NameBatch};
+pub use core::{
+    DeriveName, DirWalk, FsConn, FsDone, NameBatch, OpenStep, StepPath,
+};
 
 pub mod query_dir;
 pub use query_dir::{

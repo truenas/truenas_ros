@@ -1908,6 +1908,68 @@ impl<'a> FsConn<'a> {
         });
     }
 
+    /// Open each step relative to the file the step before it opened,
+    /// and deliver the last.
+    ///
+    /// **Each step carries its own personality.** That is what this
+    /// exists for: reaching a file inside a tree the caller may not
+    /// traverse, while still having the kernel decide the caller's
+    /// access to the file itself. A directory opened under the daemon's
+    /// own personality grants nothing about what is inside it, so the
+    /// last step names the caller and the answer is the kernel's.
+    ///
+    /// Doing this from a consumer is not possible and deliberately so:
+    /// every step after the first is a continuation, where
+    /// [`open`](Self::open) is refused. Keeping the chain here is what
+    /// lets that refusal stand, exactly as it does for
+    /// [`mkdir_path`](Self::mkdir_path).
+    ///
+    /// Entry is `root`-gated for the same reason as both of those: the
+    /// final file reaches the consumer and would outlive a connection
+    /// that has already gone. Intermediates never leave the chain —
+    /// each is owned by the closure that opened it and closes with it.
+    ///
+    /// Every step is confined by [`CONFINED_RESOLVE`], unioned rather
+    /// than assigned, and every step but the last is forced
+    /// `O_DIRECTORY`. A step that creates is refused at entry, before
+    /// anything is submitted, so a bad argument cannot leave a
+    /// half-walked chain behind.
+    pub fn open_chain<F>(
+        &mut self,
+        anchor: &Anchor,
+        steps: Vec<OpenStep>,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        if !self.root {
+            return;
+        }
+        // Judged on shape before anything is submitted. A `Derived`
+        // step cannot be judged here — it has no path yet — so the walk
+        // judges it when it produces one, on the same rule.
+        if steps.is_empty() {
+            return;
+        }
+        if matches!(steps[0].path, StepPath::Derived(_)) {
+            // Nothing has been opened, so there is nothing to derive
+            // from.
+            return;
+        }
+        for step in &steps {
+            if let StepPath::Fixed(path) = &step.path
+                && crate::path::relative_defect(path.to_bytes()).is_some()
+            {
+                return;
+            }
+            if creation_refused(step.how.to_raw().flags) {
+                return;
+            }
+        }
+        let steps: VecDeque<OpenStep> = steps.into();
+        chain(self, anchor.clone(), steps, Box::new(on_done));
+    }
+
     /// Submit an open that is not the request handler's own.
     ///
     /// [`open`](Self::open) refuses a continuation because the file it
@@ -2710,11 +2772,136 @@ impl<'a> FsConn<'a> {
     }
 }
 
+/// Names a step's path from the directory the step before it opened.
+///
+/// Boxed rather than a generic parameter: the steps travel as one list,
+/// so they must all be the same type.
+pub type DeriveName = Box<dyn FnOnce(&Anchor) -> crate::Result<CString>>;
+
+/// What one step of an [`FsConn::open_chain`] resolves, and how it is
+/// named.
+///
+/// A step's path may hold several components: `openat2` honours the
+/// `RESOLVE_*` flags every step is confined by, so a whole subtree
+/// descent is one open rather than one per component. That is the
+/// difference from [`FsConn::mkdir_path`], whose `mkdirat` honours
+/// none and must therefore walk a component at a time.
+pub enum StepPath {
+    /// Known before the chain starts.
+    Fixed(CString),
+    /// Named from the directory the previous step opened.
+    ///
+    /// The one thing a consumer can compute that this module cannot: a
+    /// filehandle read back as the directory that stores state about
+    /// it. Runs on the reactor thread between two submissions, so it
+    /// must not block — a `name_to_handle_at` on a descriptor already
+    /// open is the intended shape, and a read of anything is not.
+    ///
+    /// Never valid as the first step: there is no previous file.
+    Derived(DeriveName),
+}
+
+impl std::fmt::Debug for StepPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixed(p) => f.debug_tuple("Fixed").field(p).finish(),
+            Self::Derived(_) => f.write_str("Derived(..)"),
+        }
+    }
+}
+
+/// One step of an [`FsConn::open_chain`].
+///
+/// **The credential is per step, which is the point.** A tree only the
+/// daemon may traverse is opened under its own personality, while a
+/// file inside it is still resolved under the caller's — so the
+/// kernel makes the access decision about the file the caller actually
+/// named, in a directory the caller could never have walked.
+#[derive(Debug)]
+pub struct OpenStep {
+    /// What this step names, relative to the file the previous step
+    /// opened (or to the chain's anchor, for the first).
+    pub path: StepPath,
+    /// The credential this step resolves under.
+    pub who: Personality,
+    /// This step's flags. Every step but the last is forced
+    /// `O_DIRECTORY`; the last is opened as asked.
+    pub how: OpenHow,
+}
+
 /// The callback a [`FsConn::mkdir_path`] walk carries between steps.
 ///
 /// Boxed: the walk is a loop written as recursion, so a generic parameter
 /// would be a type that contains itself.
 type WalkDone = Box<dyn FnOnce(FsDone, &mut FsConn<'_>)>;
+
+/// The creation flags no step of a chain may carry.
+///
+/// `O_CREAT` and `O_TMPFILE` both make an inode, and a chain that made
+/// one at an intermediate would leave it behind when a later step
+/// failed. `O_TMPFILE` is `__O_TMPFILE | O_DIRECTORY`, so testing for
+/// it has to mask the `O_DIRECTORY` half off — every directory open
+/// carries that bit and would otherwise look like one.
+fn creation_refused(flags: u64) -> bool {
+    const TMPFILE_ONLY: i32 = libc::O_TMPFILE & !libc::O_DIRECTORY;
+    flags & ((libc::O_CREAT | TMPFILE_ONLY) as u64) != 0
+}
+
+/// One step: name it, open it under its own personality, and recurse on
+/// what is left.
+///
+/// `cur` is the deepest file reached so far, and the last step's open is
+/// the answer.
+fn chain(
+    conn: &mut FsConn<'_>,
+    cur: Anchor,
+    mut steps: VecDeque<OpenStep>,
+    on_done: WalkDone,
+) {
+    let Some(step) = steps.pop_front() else {
+        // Entry validated a non-empty list. Answered rather than
+        // dropped: a dropped callback closes the connection.
+        return on_done(FsDone::failed(Errno::EINVAL), conn);
+    };
+    let last = steps.is_empty();
+    let mut raw = step.how.to_raw();
+    raw.resolve |= CONFINED_RESOLVE.bits();
+    // Only the answer is opened as the caller asked; everything above it
+    // is a directory this walks through.
+    if !last {
+        raw.flags |= libc::O_DIRECTORY as u64;
+    }
+    let who = step.who;
+    // A derived name is produced here, from the file the previous step
+    // opened, and screened on the same rule entry applied to the rest.
+    let path = match step.path {
+        StepPath::Fixed(path) => path,
+        StepPath::Derived(name) => match name(&cur) {
+            Ok(path)
+                if crate::path::relative_defect(path.to_bytes()).is_none() =>
+            {
+                path
+            }
+            Ok(_) => return on_done(FsDone::failed(Errno::EINVAL), conn),
+            Err(crate::Error::Errno(e)) => {
+                return on_done(FsDone::failed(e), conn);
+            }
+            Err(_) => return on_done(FsDone::failed(Errno::EINVAL), conn),
+        },
+    };
+    conn.open_component(who, cur, path, raw, move |res, conn| {
+        let Some(f) = res.file() else {
+            return on_done(res, conn);
+        };
+        if last {
+            return on_done(res, conn);
+        }
+        match Anchor::from_file(&f) {
+            Ok(next) => chain(conn, next, steps, on_done),
+            Err(_) => on_done(FsDone::failed(Errno::EBADF), conn),
+        }
+    });
+}
 
 /// One component: create it, open it, and recurse on what is left.
 ///
@@ -3366,6 +3553,219 @@ mod hybrid_tests {
         let r = f();
         std::panic::set_hook(prev);
         r
+    }
+
+    /// `a/b/leaf` under a fresh directory, for the chain tests.
+    fn nested() -> crate::TempDir {
+        let dir = crate::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("a/b")).expect("mkdir -p");
+        std::fs::write(dir.path().join("a/b/leaf"), b"bytes").expect("write");
+        dir
+    }
+
+    /// The whole point of the primitive: reach a file two directories
+    /// down, in steps, from one facade entry.
+    #[test]
+    fn a_chain_reaches_a_file_two_directories_down() {
+        let (mut eng, mut fs, me) = setup();
+        let dir = nested();
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let got: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
+        let g2 = got.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                c.open_chain(
+                    &at,
+                    vec![
+                        OpenStep {
+                            path: StepPath::Fixed(c"a/b".to_owned()),
+                            who: me,
+                            how: OpenHow::new()
+                                .flags(OFlag::O_PATH | OFlag::O_DIRECTORY),
+                        },
+                        OpenStep {
+                            path: StepPath::Fixed(c"leaf".to_owned()),
+                            who: me,
+                            how: OpenHow::new().flags(OFlag::O_RDONLY),
+                        },
+                    ],
+                    move |res, _c| {
+                        *g2.borrow_mut() = Some(res.file().is_some());
+                    },
+                );
+            },
+            || got.borrow().is_some(),
+        );
+        assert_eq!(*got.borrow(), Some(true), "the leaf must be delivered");
+    }
+
+    /// The step that cannot be written before the chain starts: a name
+    /// computed from the directory the previous step opened.
+    #[test]
+    fn a_derived_step_names_the_next_directory() {
+        let (mut eng, mut fs, me) = setup();
+        let dir = nested();
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let got: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
+        let g2 = got.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                c.open_chain(
+                    &at,
+                    vec![
+                        OpenStep {
+                            path: StepPath::Fixed(c"a".to_owned()),
+                            who: me,
+                            how: OpenHow::new()
+                                .flags(OFlag::O_PATH | OFlag::O_DIRECTORY),
+                        },
+                        OpenStep {
+                            // Derived from the open directory rather
+                            // than from anything the caller knew.
+                            path: StepPath::Derived(Box::new(|prev| {
+                                let st = crate::sync_fs::statx(
+                                    prev,
+                                    "",
+                                    AtFlags::AT_EMPTY_PATH,
+                                    StatxMask::INO,
+                                )?;
+                                assert!(st.ino() != 0, "a real directory");
+                                Ok(c"b/leaf".to_owned())
+                            })),
+                            who: me,
+                            how: OpenHow::new().flags(OFlag::O_RDONLY),
+                        },
+                    ],
+                    move |res, _c| {
+                        *g2.borrow_mut() = Some(res.file().is_some());
+                    },
+                );
+            },
+            || got.borrow().is_some(),
+        );
+        assert_eq!(*got.borrow(), Some(true), "the derived name must resolve");
+    }
+
+    /// Entry is `root`-gated like `open` and `mkdir_path`: the file the
+    /// last step produces reaches the consumer, and a continuation may
+    /// outlive the connection it would go to.
+    #[test]
+    fn a_chain_from_a_continuation_is_refused() {
+        let (mut eng, mut fs, me) = setup();
+        let dir = nested();
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let fired = Rc::new(RefCell::new(false));
+        let f2 = fired.clone();
+        {
+            // `root: false` is what a net-server continuation gets.
+            let mut c = FsConn::new(&mut fs, &mut eng, OWNER0, false);
+            c.open_chain(
+                &at,
+                vec![OpenStep {
+                    path: StepPath::Fixed(c"a".to_owned()),
+                    who: me,
+                    how: OpenHow::new().flags(OFlag::O_RDONLY),
+                }],
+                move |_res, _c| *f2.borrow_mut() = true,
+            );
+        }
+        // Drive the loop on separate work, so "never fired" is a fact
+        // about the gate rather than about a reactor that never ran:
+        // an open the gate let through would be reaped right here.
+        let marker = Rc::new(RefCell::new(false));
+        let m2 = marker.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| c.offload(|| 1u64, move |_, _| *m2.borrow_mut() = true),
+            || *marker.borrow(),
+        );
+        assert!(!*fired.borrow(), "a continuation may not open");
+    }
+
+    /// Every refusal is judged on shape at entry, before anything is
+    /// submitted, so a bad argument cannot leave a half-walked chain.
+    #[test]
+    fn a_chain_that_cannot_be_walked_is_refused_before_it_starts() {
+        let (mut eng, mut fs, me) = setup();
+        let dir = nested();
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let dirstep = |how: OpenHow| OpenStep {
+            path: StepPath::Fixed(c"a".to_owned()),
+            who: me,
+            how,
+        };
+        let plain = || OpenHow::new().flags(OFlag::O_RDONLY);
+        let cases: Vec<(&str, Vec<OpenStep>)> = vec![
+            ("no steps", Vec::new()),
+            (
+                // Nothing has been opened, so there is nothing to
+                // derive a name from.
+                "a first step that derives",
+                vec![OpenStep {
+                    path: StepPath::Derived(Box::new(|_| Ok(c"a".to_owned()))),
+                    who: me,
+                    how: plain(),
+                }],
+            ),
+            (
+                "an escaping component",
+                vec![
+                    dirstep(plain()),
+                    OpenStep {
+                        path: StepPath::Fixed(c"../escape".to_owned()),
+                        who: me,
+                        how: plain(),
+                    },
+                ],
+            ),
+            (
+                // A create at an intermediate would be left behind by a
+                // later step's failure.
+                "a creating step",
+                vec![
+                    dirstep(plain()),
+                    OpenStep {
+                        path: StepPath::Fixed(c"made".to_owned()),
+                        who: me,
+                        how: OpenHow::new()
+                            .flags(OFlag::O_RDONLY | OFlag::O_CREAT),
+                    },
+                ],
+            ),
+        ];
+        for (what, steps) in cases {
+            let fired = Rc::new(RefCell::new(false));
+            let f2 = fired.clone();
+            {
+                let mut c = FsConn::new(&mut fs, &mut eng, OWNER0, true);
+                c.open_chain(&at, steps, move |_res, _c| {
+                    *f2.borrow_mut() = true
+                });
+            }
+            // As in the gate's test: drive on separate work, so
+            // "never fired" says the entry refused rather than that
+            // nothing was ever reaped.
+            let marker = Rc::new(RefCell::new(false));
+            let m2 = marker.clone();
+            drive(
+                &mut eng,
+                &mut fs,
+                move |c| {
+                    c.offload(|| 1u64, move |_, _| *m2.borrow_mut() = true)
+                },
+                || *marker.borrow(),
+            );
+            assert!(!*fired.borrow(), "{what} must be refused at entry");
+        }
+        assert!(
+            !dir.path().join("a/made").exists(),
+            "a refused chain creates nothing"
+        );
     }
 
     #[test]
