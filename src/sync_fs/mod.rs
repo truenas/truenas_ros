@@ -17,6 +17,8 @@ mod chown;
 #[cfg(feature = "sync-fs")]
 pub mod dir;
 #[cfg(feature = "sync-fs")]
+mod linkat;
+#[cfg(feature = "sync-fs")]
 mod mkdirat;
 #[cfg(feature = "sync-fs")]
 pub(crate) mod openat2;
@@ -48,6 +50,8 @@ pub mod xattr;
 pub use atomic::{AtomicWriteOptions, atomic_replace, atomic_write};
 #[cfg(feature = "sync-fs")]
 pub use chown::fchown;
+#[cfg(feature = "sync-fs")]
+pub use linkat::linkat;
 #[cfg(feature = "sync-fs")]
 pub use mkdirat::mkdirat;
 #[cfg(feature = "sync-fs")]
