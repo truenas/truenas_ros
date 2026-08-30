@@ -1102,7 +1102,6 @@ where
                             fs,
                             &mut self.core.engine,
                             reaped,
-                            false,
                         );
                     }
                 }

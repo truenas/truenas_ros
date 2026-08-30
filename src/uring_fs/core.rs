@@ -1645,7 +1645,6 @@ pub struct FsConn<'a> {
     fs: &'a mut FsCore,
     eng: &'a mut Engine,
     owner: Owner,
-    root: bool,
     /// The delivering connection's recv-buffer claim, when the request's
     /// body still sits in one - what [`FsConn::pwritev2_from`] writes from
     /// without copying. `None` outside delivery (completion facades) and on
@@ -1693,13 +1692,11 @@ impl<'a> FsConn<'a> {
         fs: &'a mut FsCore,
         eng: &'a mut Engine,
         owner: Owner,
-        root: bool,
     ) -> FsConn<'a> {
         FsConn {
             fs,
             eng,
             owner,
-            root,
             #[cfg(feature = "net-server")]
             lease: None,
             #[cfg(feature = "net-server")]
@@ -1718,7 +1715,6 @@ impl<'a> FsConn<'a> {
             fs: &mut *self.fs,
             eng: &mut *self.eng,
             owner: self.owner,
-            root: self.root,
             #[cfg(feature = "net-server")]
             lease: self.lease.take(),
             #[cfg(feature = "net-server")]
@@ -1757,13 +1753,10 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        if !self.root {
-            return;
-        }
         let bytes = path.to_bytes();
         if bytes.is_empty() || bytes[0] == b'/' {
-            // Server facade: anchor-relative only (and `root`-gated above),
-            // deliberately stricter than the general-client `FsHandle::open`
+            // Server facade: anchor-relative only, deliberately stricter
+            // than the general-client `FsHandle::open`
             // (`open_parts`), which allows an absolute path when the caller
             // drops `RESOLVE_BENEATH`. The two validations differ on purpose;
             // do not unify them.
@@ -1823,18 +1816,14 @@ impl<'a> FsConn<'a> {
     /// intermediate components unconfined. The only sound construction
     /// alternates confined `openat2` walks with single-component
     /// `mkdirat`s, and each of those opens depends on the completion
-    /// before it. A consumer cannot write that loop: every step after
-    /// the first is a continuation, where [`open`](Self::open) is
-    /// refused. Keeping the walk here is what lets that refusal stand.
+    /// before it. Keeping the walk here is what makes each step's
+    /// confinement the walk's own rather than a consumer's to get
+    /// right, and what keeps a half-built tree from being reachable.
     ///
     /// `CONFINED_RESOLVE` is unioned in, not assigned: a caller may add
     /// restrictions and may drop none. Unlike a plain open, this one
     /// creates, and a create that escaped the anchor would leave a
     /// directory somewhere the caller never named.
-    ///
-    /// Entry is `root`-gated like [`open`](Self::open), and for its
-    /// reason: the directory this hands back would outlive a connection
-    /// that has already gone.
     pub fn mkdir_path<F>(
         &mut self,
         who: Personality,
@@ -1846,9 +1835,6 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        if !self.root {
-            return;
-        }
         let bytes = path.to_bytes();
         // Judged on shape before anything is submitted, so the probe below
         // cannot admit what the walk would refuse. See the doc above.
@@ -1918,16 +1904,11 @@ impl<'a> FsConn<'a> {
     /// own personality grants nothing about what is inside it, so the
     /// last step names the caller and the answer is the kernel's.
     ///
-    /// Doing this from a consumer is not possible and deliberately so:
-    /// every step after the first is a continuation, where
-    /// [`open`](Self::open) is refused. Keeping the chain here is what
-    /// lets that refusal stand, exactly as it does for
-    /// [`mkdir_path`](Self::mkdir_path).
-    ///
-    /// Entry is `root`-gated for the same reason as both of those: the
-    /// final file reaches the consumer and would outlive a connection
-    /// that has already gone. Intermediates never leave the chain —
-    /// each is owned by the closure that opened it and closes with it.
+    /// Kept here rather than written out by a consumer because the
+    /// per-step personality and confinement are the point: a caller
+    /// assembling the same walk by hand would have to get both right at
+    /// every step, and an intermediate opened under the wrong one
+    /// grants access the kernel was meant to decide.
     ///
     /// Every step is confined by [`CONFINED_RESOLVE`], unioned rather
     /// than assigned, and every step but the last is forced
@@ -1942,9 +1923,6 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        if !self.root {
-            return;
-        }
         // Judged on shape before anything is submitted. A `Derived`
         // step cannot be judged here — it has no path yet — so the walk
         // judges it when it produces one, on the same rule.
@@ -1970,15 +1948,7 @@ impl<'a> FsConn<'a> {
         chain(self, anchor.clone(), steps, Box::new(on_done));
     }
 
-    /// Submit an open that is not the request handler's own.
-    ///
-    /// [`open`](Self::open) refuses a continuation because the file it
-    /// produces has nowhere to go once the owning connection is gone
-    /// (`net/server/mod.rs`, the `root: false` facade). A walk's
-    /// intermediates never leave the walk - each is owned by the closure
-    /// that opened it and closes with the chain - so that leak cannot
-    /// arise here. The final open does reach the consumer, which is what
-    /// [`mkdir_path`](Self::mkdir_path) gates at entry instead.
+    /// One step of a walk, opened under its own personality.
     ///
     /// Stays private: every path this resolves is a single validated
     /// component of one the caller already named, confined, under the
@@ -3484,7 +3454,7 @@ mod hybrid_tests {
     ) {
         eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm_wake");
         {
-            let mut c = FsConn::new(fs, eng, OWNER0, true);
+            let mut c = FsConn::new(fs, eng, OWNER0);
             kickoff(&mut c);
         }
         let mut guard = 0u32;
@@ -3501,7 +3471,7 @@ mod hybrid_tests {
                 if tag == TAG_WAKE {
                     eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm");
                     for (o, deliver, any) in fs.take_pool_completions() {
-                        let mut c = FsConn::new(fs, eng, o, true);
+                        let mut c = FsConn::new(fs, eng, o);
                         deliver(any, &mut c);
                     }
                     continue;
@@ -3512,7 +3482,7 @@ mod hybrid_tests {
                 if let ReapedFs::Embedded(cb, d, o) =
                     fs.on_cqe(eng, tag, slot, g, cqe.res)
                 {
-                    let mut c = FsConn::new(fs, eng, o, true);
+                    let mut c = FsConn::new(fs, eng, o);
                     cb(d, &mut c);
                 }
             }
@@ -3650,41 +3620,50 @@ mod hybrid_tests {
         assert_eq!(*got.borrow(), Some(true), "the derived name must resolve");
     }
 
-    /// Entry is `root`-gated like `open` and `mkdir_path`: the file the
-    /// last step produces reaches the consumer, and a continuation may
-    /// outlive the connection it would go to.
+    /// A chain from a continuation opens, like one from the request
+    /// handler.
+    ///
+    /// It used to be refused, on the grounds that the file it produces
+    /// "would outlive the connection it would go to". It cannot: the
+    /// callback runs either way (`deliver_embedded` builds an `FsConn`
+    /// and calls it unconditionally), and it is handed the fd wrapped
+    /// in an `Arc<OwnedFd>` that closes on drop. Nothing was ever
+    /// orphaned, and the refusal silently dropped `on_done` — which
+    /// closes the connection — for consumers whose work legitimately
+    /// spans completions.
     #[test]
-    fn a_chain_from_a_continuation_is_refused() {
+    fn a_chain_from_a_continuation_opens() {
         let (mut eng, mut fs, me) = setup();
         let dir = nested();
         let at = Anchor::open(dir.path()).expect("anchor");
-        let fired = Rc::new(RefCell::new(false));
-        let f2 = fired.clone();
-        {
-            // `root: false` is what a net-server continuation gets.
-            let mut c = FsConn::new(&mut fs, &mut eng, OWNER0, false);
-            c.open_chain(
-                &at,
-                vec![OpenStep {
-                    path: StepPath::Fixed(c"a".to_owned()),
-                    who: me,
-                    how: OpenHow::new().flags(OFlag::O_RDONLY),
-                }],
-                move |_res, _c| *f2.borrow_mut() = true,
-            );
-        }
-        // Drive the loop on separate work, so "never fired" is a fact
-        // about the gate rather than about a reactor that never ran:
-        // an open the gate let through would be reaped right here.
-        let marker = Rc::new(RefCell::new(false));
-        let m2 = marker.clone();
+        let got = Rc::new(RefCell::new(None));
+        let g2 = got.clone();
         drive(
             &mut eng,
             &mut fs,
-            move |c| c.offload(|| 1u64, move |_, _| *m2.borrow_mut() = true),
-            || *marker.borrow(),
+            move |c| {
+                // One completion, then a chain from inside it: the
+                // shape the gate used to swallow.
+                c.offload(
+                    || 1u64,
+                    move |_, c| {
+                        c.open_chain(
+                            &at,
+                            vec![OpenStep {
+                                path: StepPath::Fixed(c"a".to_owned()),
+                                who: me,
+                                how: OpenHow::new().flags(OFlag::O_RDONLY),
+                            }],
+                            move |res, _c| {
+                                *g2.borrow_mut() = Some(res.file().is_some());
+                            },
+                        );
+                    },
+                );
+            },
+            || got.borrow().is_some(),
         );
-        assert!(!*fired.borrow(), "a continuation may not open");
+        assert_eq!(*got.borrow(), Some(true), "the chain resolved");
     }
 
     /// Every refusal is judged on shape at entry, before anything is
@@ -3742,7 +3721,7 @@ mod hybrid_tests {
             let fired = Rc::new(RefCell::new(false));
             let f2 = fired.clone();
             {
-                let mut c = FsConn::new(&mut fs, &mut eng, OWNER0, true);
+                let mut c = FsConn::new(&mut fs, &mut eng, OWNER0);
                 c.open_chain(&at, steps, move |_res, _c| {
                     *f2.borrow_mut() = true
                 });
@@ -4147,13 +4126,9 @@ fn deliver(
 /// owner-scoped [`FsConn`] (`root` per the host: the standalone reactor passes
 /// `true`, a net-server continuation `false`). Shared by the host and the net
 /// server so the wake-drain is written once.
-pub(crate) fn deliver_pool_completions(
-    fs: &mut FsCore,
-    eng: &mut Engine,
-    root: bool,
-) {
+pub(crate) fn deliver_pool_completions(fs: &mut FsCore, eng: &mut Engine) {
     for (owner, deliver, any) in fs.take_pool_completions() {
-        let mut conn = FsConn::new(fs, eng, owner, root);
+        let mut conn = FsConn::new(fs, eng, owner);
         deliver(any, &mut conn);
     }
 }
@@ -4168,11 +4143,10 @@ pub(crate) fn deliver_embedded(
     fs: &mut FsCore,
     eng: &mut Engine,
     reaped: ReapedFs,
-    root: bool,
 ) {
     match reaped {
         ReapedFs::Embedded(cb, done, owner) => {
-            let mut conn = FsConn::new(fs, eng, owner, root);
+            let mut conn = FsConn::new(fs, eng, owner);
             cb(done, &mut conn);
         }
         ReapedFs::Pump(..) => {

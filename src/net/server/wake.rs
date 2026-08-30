@@ -59,7 +59,6 @@ where
             crate::uring_fs::core::deliver_pool_completions(
                 fs,
                 &mut self.core.engine,
-                false,
             );
         }
         Ok(())
