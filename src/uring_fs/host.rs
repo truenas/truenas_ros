@@ -314,7 +314,7 @@ impl UringFs {
                 // Fire on-loop deliveries from finished off-loop pool jobs
                 // (`FsConn::offload` and the hybrid lister). Additive: the
                 // `FsHandle` path never touches the pool.
-                deliver_pool_completions(&mut self.fs, &mut self.eng, true);
+                deliver_pool_completions(&mut self.fs, &mut self.eng);
             }
             TAG_CANCEL => {}
             // Deliver a completion. An `FsHandle` op parks a channel waiter
@@ -326,7 +326,7 @@ impl UringFs {
             _ => {
                 let reaped =
                     self.fs.on_cqe(&mut self.eng, tag, slot, gen32, cqe.res);
-                deliver_embedded(&mut self.fs, &mut self.eng, reaped, true);
+                deliver_embedded(&mut self.fs, &mut self.eng, reaped);
             }
         }
         Ok(())

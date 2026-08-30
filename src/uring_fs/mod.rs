@@ -136,8 +136,8 @@
 //!   daemon may traverse is still resolved under the caller's
 //!   credential, and the kernel makes the access decision about the
 //!   file the caller actually named. Like `mkdir_path`, the walk lives
-//!   here because every step after the first is a continuation, where
-//!   [`open`](FsConn::open) is refused.
+//!   here so that each step's personality and confinement are the
+//!   walk's own rather than a consumer's to repeat correctly.
 //! - **Server-owned metadata.** [`PrivilegedXattrs`] lets declared
 //!   `trusted.*` attributes be written under the reactor's own credentials, so
 //!   a service can keep metadata that the user who owns the file can neither

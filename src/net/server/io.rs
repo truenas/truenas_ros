@@ -259,8 +259,6 @@ where
                     fc,
                     &mut self.core.engine,
                     Some((slot, gen64)),
-                    // Request-handler facade: `open` may mint a new file here.
-                    true,
                 )
                 .with_recv_lease(lease)
             });

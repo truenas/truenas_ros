@@ -9186,23 +9186,25 @@ fn fs_owned_files_swept_on_connection_close() {
     }
 }
 
-/// A completion callback's facade must **refuse** `open`. That refusal is what
-/// makes the owned-file sweep total: `close_conn` records a closing connection
-/// exactly once, so a file minted by a continuation - which can run after its
-/// connection was already swept - would hold its pool slot until server
-/// teardown, and a peer aborting mid-chain could leak descriptors for
-/// everyone.
+/// A continuation may open, and doing so reclaims its slot like any
+/// other op.
 ///
-/// The handler opens a file and, from the completion, tries to open a *second*
-/// one, carrying the request's `Deferred` into that attempt. The attempt is
-/// refused, dropping the callback and with it the `Deferred`, so the connection
-/// closes unanswered: the client must see EOF, never `chained`. Flip either
-/// `FsConn::new` call site to `root: true` and the reply appears instead.
-/// Looping well past the pool keeps the sweep honest at the same time - every
-/// connection leaves its first file open.
+/// This used to assert the opposite - that the facade refused - on the
+/// grounds that a file minted after `close_conn` had already swept the
+/// connection would hold its slot until server teardown. It does not.
+/// `close_owned_by` is gone; `cancel_owned_by` cancels in-flight *ops*
+/// so their parked fds are released, and the fds themselves close by
+/// `Arc`-drop whether or not anyone takes them. An `openat2` completes,
+/// so its entry is reaped either way.
+///
+/// The pool is deliberately smaller than the connection count, and each
+/// connection leaves its *first* file open while chaining a second from
+/// the completion. If a chained open leaked a slot, the later
+/// connections would find none and answer `open-err` - which is what
+/// makes this a measurement rather than a restatement.
 #[cfg(feature = "uring-fs")]
 #[test]
-fn fs_continuation_cannot_open_a_new_file() {
+fn fs_continuation_may_open_and_its_slot_comes_back() {
     use std::ffi::CString;
     use std::sync::OnceLock;
     use truenas_ros::sync_fs::{OFlag, OpenHow};
@@ -9237,12 +9239,11 @@ fn fs_continuation_cannot_open_a_new_file() {
                 deferred.reply(echo_frame(b"open-err"));
                 return;
             }
-            // Deliberate misuse: a continuation may not mint a new file. The
-            // facade refuses, which drops this closure - and the `Deferred` it
-            // carries - so the connection closes with no reply. (The file the
-            // chain already holds is left open on purpose; the sweep owns it.)
-            fs.open(who, &a2, &second, how, move |_d, _fs| {
-                deferred.reply(echo_frame(b"chained"));
+            // The first file stays open on purpose: this connection is
+            // holding a slot while it asks for another.
+            fs.open(who, &a2, &second, how, move |d, _fs| match d.file() {
+                Some(_) => deferred.reply(echo_frame(b"chained")),
+                None => deferred.reply(echo_frame(b"open-err")),
             });
         });
         Response::Defer(permit)
@@ -9287,24 +9288,14 @@ fn fs_continuation_cannot_open_a_new_file() {
     let replies = client.join().unwrap();
     assert_eq!(replies.len(), N);
     for (i, r) in replies.iter().enumerate() {
-        match r {
-            Ok(b) => panic!(
-                "connection {i}: a continuation minted a file, so nothing \
-                 would ever reclaim its slot (reply {:?})",
-                String::from_utf8_lossy(b)
-            ),
-            // A clean close, not a stall: the read must end at EOF/reset, not
-            // time out - a timeout would pass this test for the wrong reason.
-            Err(e) => assert!(
-                matches!(
-                    e.kind(),
-                    io::ErrorKind::UnexpectedEof
-                        | io::ErrorKind::ConnectionReset
-                ),
-                "connection {i}: the refused open must close the connection, \
-                 got {e:?}"
-            ),
-        }
+        let b = r.as_ref().unwrap_or_else(|e| {
+            panic!("connection {i}: the chained open must answer, got {e:?}")
+        });
+        assert_eq!(
+            b, b"chained",
+            "connection {i}: every connection past the pool must still find \
+             a slot, so nothing the chain opened was left holding one"
+        );
     }
 }
 
