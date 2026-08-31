@@ -198,6 +198,18 @@
 //! inline and receive completions as in-loop callbacks, interleaving fs and
 //! its own SQEs on one ring. Under the `net-server` feature the io_uring net
 //! server drives the core this way.
+//!
+//! # Awaiting instead of chaining
+//!
+//! Completion callbacks stay the primitive, and a second consumption
+//! style sits on them: [`FsConn::fut`] returns one submission's outcome
+//! as a future, and [`FsConn::spawn`] runs a `'static` future as an
+//! on-loop **task**, submitting through the [`TaskFs`] its body
+//! receives. A multi-step chain then reads as straight-line
+//! `async`/`await` instead of a hop per completion, with the same
+//! owner scoping, the same facade semantics per poll, and the ops
+//! themselves on the same ring path. The two styles mix freely within
+//! one request; see [`task`](self::TaskFs) for the contract.
 
 mod broker;
 // The mint-once-per-key protocol behind `IdentityCache`, kept separate so it
@@ -221,6 +233,11 @@ pub(crate) mod core;
 pub use core::{
     DeriveName, DirWalk, FsConn, FsDone, NameBatch, OpenStep, StepPath,
 };
+// The awaitable layer over the callback facade: op futures, offload
+// futures, and on-loop tasks. A consumer, not a second submission path -
+// every op it submits goes through `FsConn`'s methods above.
+pub(crate) mod task;
+pub use task::{FsFuture, JoinHandle, OffloadFuture, OnDone, TaskFs};
 
 pub mod query_dir;
 pub use query_dir::{
