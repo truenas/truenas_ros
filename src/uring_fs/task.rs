@@ -8,6 +8,11 @@
 //! wrapper re-shapes delivery only, and submission stays the eager,
 //! on-ring path the callback form uses.
 //!
+//! "Poll" in this module is always [`Future::poll`] - the state-machine
+//! step, `std`'s own vocabulary - never `poll(2)` or a readiness op. A
+//! task poll issues no syscall; the ops a poll submits do their kernel
+//! work through the ring like every other submission.
+//!
 //! - [`FsConn::fut`] wraps one submission. It hands the closure a boxed
 //!   callback ([`OnDone`]) to pass as any submit method's `on_done` and
 //!   returns the [`FsFuture`] that callback resolves.
