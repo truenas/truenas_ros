@@ -706,7 +706,6 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: u64) {
     let poll = poll_window(&entry.wake, || {
         with_current(&mut conn, || entry.fut.as_mut().poll(&mut cx))
     });
-    drop(conn);
     match poll {
         Poll::Ready(()) => fs.tasks.retire(idx),
         Poll::Pending => fs.tasks.put_back(idx, entry),
@@ -1075,7 +1074,6 @@ mod tests {
         let fut = conn.fut(|c, cb| {
             c.open(who, &anchor, c"/etc/hostname", creating(), cb)
         });
-        drop(conn);
 
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
@@ -1229,7 +1227,6 @@ mod tests {
         assert_eq!(polls.get(), 1, "one spawn poll before the stale wake");
         let mut conn = FsConn::new(&mut fs, &mut eng, None);
         conn.run_woken();
-        drop(conn);
         // The stale id was consumed without polling the slot's tenant.
         assert_eq!(polls.get(), 1, "tenant disturbed by a stale wake");
         assert!(fs.tasks.slots[0].entry.is_some(), "tenant evicted");
@@ -1307,7 +1304,6 @@ mod tests {
 
         let mut conn = FsConn::new(&mut fs, &mut eng, None);
         conn.run_woken();
-        drop(conn);
         assert_eq!(
             fs.tasks.free.len(),
             fs.tasks.slots.len(),
