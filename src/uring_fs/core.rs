@@ -389,6 +389,10 @@ pub(crate) struct FsCore {
     /// Attribute names whose `FSETXATTR` runs under ambient credentials rather
     /// than the request identity. Empty by default - see [`PrivilegedXattrs`].
     priv_xattrs: PrivilegedXattrs,
+    /// Spawned tasks and their run queue (the futures layer,
+    /// [`super::task`]); woken tasks are polled by the delivery
+    /// functions below.
+    pub(crate) tasks: super::task::Tasks,
 }
 
 impl FsCore {
@@ -406,6 +410,7 @@ impl FsCore {
             offload_reg: HashMap::new(),
             next_offload: 0,
             priv_xattrs: PrivilegedXattrs::default(),
+            tasks: super::task::Tasks::new(),
         }
     }
 
@@ -1702,6 +1707,13 @@ impl<'a> FsConn<'a> {
             #[cfg(feature = "net-server")]
             lease_hold: None,
         }
+    }
+
+    /// The facade's parts, reborrowed - what the task layer
+    /// ([`super::task`]) needs so a poll can hold its task entry out of
+    /// the table while the facade it hands the task borrows the tables.
+    pub(crate) fn split(&mut self) -> (&mut FsCore, &mut Engine, Owner) {
+        (&mut *self.fs, &mut *self.eng, self.owner)
     }
 
     /// A second facade over the same delivery, for a step that dispatches
@@ -4131,6 +4143,9 @@ pub(crate) fn deliver_pool_completions(fs: &mut FsCore, eng: &mut Engine) {
         let mut conn = FsConn::new(fs, eng, owner);
         deliver(any, &mut conn);
     }
+    // Tasks woken by these deliveries - or poked from off-loop, which
+    // lands on the same wake the pool uses - run in this dispatch.
+    super::task::drain(fs, eng);
 }
 
 /// Fire an embedded on-loop completion reaped by [`FsCore::on_cqe`] with a
@@ -4154,6 +4169,9 @@ pub(crate) fn deliver_embedded(
         }
         ReapedFs::None => {}
     }
+    // A completion that resolved an op future woke its task; polling
+    // here, after the callback fired, keeps tasks at callback latency.
+    super::task::drain(fs, eng);
 }
 
 /// Routing / close-last property fuzzer for the **plain-fd** core. There is no
