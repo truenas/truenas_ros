@@ -632,11 +632,12 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: u64) {
     let Some(mut entry) = fs.tasks.take_if(idx, generation) else {
         return;
     };
-    let wake = std::sync::Arc::clone(&entry.wake);
-    let waker = entry.waker.clone();
-    let mut cx = Context::from_waker(&waker);
     let mut conn = FsConn::new(fs, eng, entry.owner);
-    let poll = poll_window(&wake, || {
+    // Disjoint field borrows: the context reads the cached waker and
+    // the window reads the wake edge while the poll borrows the
+    // future - no waker clone (and no refcount traffic) per poll.
+    let mut cx = Context::from_waker(&entry.waker);
+    let poll = poll_window(&entry.wake, || {
         with_current(&mut conn, || entry.fut.as_mut().poll(&mut cx))
     });
     drop(conn);
