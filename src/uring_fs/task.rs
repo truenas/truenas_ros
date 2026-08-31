@@ -43,9 +43,12 @@
 //! - **Tasks are polled from the delivery points that fire callbacks**
 //!   (completion and offload delivery), plus [`FsConn::run_woken`] for
 //!   a callback that wakes a task by hand and wants it run before the
-//!   next completion. A waker used off-loop pushes under the run-queue
-//!   lock and then pokes the loop's wake eventfd - the offload pool's
-//!   push-then-poke protocol (`finish_offload`).
+//!   next completion. Each pass is bounded to what was queued when it
+//!   began - a wake landing mid-pass runs next pass, behind a poke of
+//!   the loop's wake eventfd - so a self-waking task cannot starve the
+//!   ring. A waker used off-loop pushes under the run-queue lock and
+//!   then pokes the same eventfd - the offload pool's push-then-poke
+//!   protocol (`finish_offload`).
 //! - **The task table and run queue are uncapped**, like the offload
 //!   registry: bound in-flight work upstream, at the request cap.
 
@@ -580,14 +583,6 @@ impl Tasks {
         }
     }
 
-    /// Whether a drain could have anything to do - one relaxed load,
-    /// cheap enough for every delivery to ask.
-    fn runnable_hint(&self) -> bool {
-        self.run
-            .as_ref()
-            .is_some_and(|r| r.ready.load(Ordering::Acquire) != 0)
-    }
-
     fn insert(
         &mut self,
         eng: &Engine,
@@ -651,19 +646,42 @@ impl Tasks {
     }
 }
 
-/// Poll every woken task, each with a fresh owner-scoped facade. Called
-/// by the delivery points after they fire callbacks, so a completion
-/// that woke a task runs it in the same dispatch, at callback latency.
+/// Poll woken tasks, each with a fresh owner-scoped facade, bounded to
+/// what was queued when the pass began. Called by the delivery points
+/// after they fire callbacks, so a completion that woke a task runs it
+/// in the same dispatch, at callback latency.
+///
+/// The entry bound is what keeps the ring serviced: a task that
+/// re-wakes itself - or a cascade every pass extends - lands behind it
+/// and waits for the next pass, so control returns to the host between
+/// passes and CQEs are reaped instead of starved. Work left behind the
+/// bound pokes the loop's wake eventfd; without that, a wake with
+/// nothing left in flight - a parent woken by its child's final poll -
+/// would wait on a completion that is never coming.
 pub(crate) fn drain(fs: &mut FsCore, eng: &mut Engine) {
-    if !fs.tasks.runnable_hint() {
+    let Some(mut budget) = fs
+        .tasks
+        .run
+        .as_ref()
+        .map(|r| r.ready.load(Ordering::Acquire))
+    else {
         return;
-    }
-    loop {
+    };
+    while budget > 0 {
         let Some(id) = fs.tasks.run.as_ref().and_then(|r| r.take_ready())
         else {
             return;
         };
+        budget -= 1;
         poll_one(fs, eng, id);
+    }
+    if let Some(run) = fs.tasks.run.as_ref()
+        && run.ready.load(Ordering::Acquire) != 0
+    {
+        // An on-loop poke: the pushes are this thread's and already
+        // made, the eventfd counts, and the hosts keep its READ armed
+        // - so the next wait completes at once and the leftover runs.
+        run.wake.wake.poke();
     }
 }
 
@@ -1290,6 +1308,45 @@ mod tests {
             fs.tasks.slots.len(),
             "the woken task did not run to completion"
         );
+    }
+
+    /// A drain pass covers exactly what was queued when it began: a
+    /// task that wakes itself on every poll runs once per pass and its
+    /// re-wake waits for the next, instead of the pass spinning on it
+    /// forever with the ring starved. The guard inside the future is
+    /// what a regression hits - an unbounded pass re-polls it past the
+    /// cap and fails by name rather than hanging the suite.
+    #[test]
+    fn a_self_waking_task_cannot_monopolise_a_drain_pass() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+
+        struct Spin {
+            polls: Rc<StdCell<u32>>,
+        }
+        impl Future for Spin {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                let n = self.polls.get() + 1;
+                self.polls.set(n);
+                assert!(n < 10, "an unbounded drain pass kept re-polling");
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        let polls = Rc::new(StdCell::new(0));
+        {
+            let polls = Rc::clone(&polls);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |_t| Spin { polls });
+        }
+        assert_eq!(polls.get(), 1, "the spawn poll");
+        drain(&mut fs, &mut eng);
+        assert_eq!(polls.get(), 2, "one poll per pass");
+        drain(&mut fs, &mut eng);
+        assert_eq!(polls.get(), 3, "one poll per pass, again");
     }
 
     /// A task awaits its child's output through the handle. The
