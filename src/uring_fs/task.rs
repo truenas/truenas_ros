@@ -18,7 +18,9 @@
 //!   continuation. The task body receives a [`TaskFs`], which is how
 //!   code inside the task submits: a task cannot hold the facade across
 //!   an `await`, so each poll runs with the delivering facade parked
-//!   where [`TaskFs`] can reach it, and nowhere else.
+//!   where [`TaskFs`] can reach it, and nowhere else. Spawning returns
+//!   a [`JoinHandle`] resolving with the task's output; dropping the
+//!   handle detaches rather than kills.
 //!
 //! # Contract
 //!
@@ -192,6 +194,28 @@ impl<T> Future for OffloadFuture<T> {
     }
 }
 
+/// A spawned task's output, as a future. Resolves `Some` with what the
+/// task returned; `None` if the task was dropped before finishing,
+/// which the reactor does only at teardown.
+///
+/// Dropping the handle detaches - the task runs to completion either
+/// way and its output is dropped unread. There is no kill through it.
+pub struct JoinHandle<T>(Rc<Slot<T>>);
+
+impl<T> std::fmt::Debug for JoinHandle<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinHandle").finish_non_exhaustive()
+    }
+}
+
+impl<T> Future for JoinHandle<T> {
+    type Output = Option<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        self.0.poll_take(cx)
+    }
+}
+
 // ---- the awaitable surface on the facade ----------------------------------
 
 impl FsConn<'_> {
@@ -248,15 +272,25 @@ impl FsConn<'_> {
     /// kill; a task whose connection died sees its ops fail and must
     /// wind down on that signal. Whatever outlives the loop is dropped
     /// with the reactor's tables at teardown.
-    pub fn spawn<F, Fut>(&mut self, body: F)
+    ///
+    /// The returned [`JoinHandle`] resolves with the task's output.
+    /// Dropping it detaches: the task runs to completion regardless
+    /// and its output is dropped unread - the shape a spawn used for
+    /// its effects wants, so the handle is not `#[must_use]`.
+    pub fn spawn<F, Fut, T>(&mut self, body: F) -> JoinHandle<T>
     where
         F: FnOnce(TaskFs) -> Fut,
-        Fut: Future<Output = ()> + 'static,
+        Fut: Future<Output = T> + 'static,
+        T: 'static,
     {
-        let fut = Box::pin(body(TaskFs::new()));
+        let slot = Slot::new();
+        let fire = Fire(Some(Rc::clone(&slot)));
+        let fut = body(TaskFs::new());
+        let task = Box::pin(async move { fire.fire(fut.await) });
         let (fs, eng, owner) = self.split();
-        let id = fs.tasks.insert(eng, owner, fut);
+        let id = fs.tasks.insert(eng, owner, task);
         poll_one(fs, eng, id);
+        JoinHandle(slot)
     }
 
     /// Poll every task woken since the last delivery. The delivery
@@ -373,14 +407,23 @@ impl TaskFs {
     }
 
     /// [`FsConn::spawn`] against the running poll's facade: the child
-    /// task shares this task's owner and is polled once inline.
-    pub fn spawn<F, Fut>(&self, body: F)
+    /// task shares this task's owner and is polled once inline. The
+    /// handle lets the spawning task await the child's output - two
+    /// children spawned back to back run their ops concurrently, and
+    /// awaiting both is a join.
+    pub fn spawn<F, Fut, T>(&self, body: F) -> JoinHandle<T>
     where
         F: FnOnce(TaskFs) -> Fut,
-        Fut: Future<Output = ()> + 'static,
+        Fut: Future<Output = T> + 'static,
+        T: 'static,
     {
-        let spawned = with_conn(|conn| conn.spawn(body)).is_some();
-        debug_assert!(spawned, "TaskFs::spawn outside a task poll");
+        match with_conn(|conn| conn.spawn(body)) {
+            Some(handle) => handle,
+            None => {
+                debug_assert!(false, "TaskFs::spawn outside a task poll");
+                JoinHandle(Slot::gone())
+            }
+        }
     }
 }
 
@@ -1246,6 +1289,88 @@ mod tests {
             fs.tasks.free.len(),
             fs.tasks.slots.len(),
             "the woken task did not run to completion"
+        );
+    }
+
+    /// A task awaits its child's output through the handle. The
+    /// parent's resume rides the leftover poke: the child's completion
+    /// wakes the parent after the pass's budget was taken, so without
+    /// the poke this join would stall with nothing left in flight.
+    #[test]
+    fn a_join_handle_resolves_with_the_tasks_output() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm wake");
+        let done = Rc::new(StdCell::new(false));
+
+        {
+            let done = Rc::clone(&done);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |t| async move {
+                let child = t.spawn(|t2| async move {
+                    t2.offload_fut(|| Ok(40 + 2)).await.expect("child offload")
+                });
+                assert_eq!(child.await, Some(42));
+                done.set(true);
+            });
+        }
+        drive(&mut fs, &mut eng, &done, "join of a child task");
+    }
+
+    /// Dropping the handle detaches: the task still runs to its end,
+    /// and only the output goes unread.
+    #[test]
+    fn a_dropped_join_handle_detaches() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm wake");
+        let done = Rc::new(StdCell::new(false));
+
+        {
+            let done = Rc::clone(&done);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            let handle = conn.spawn(move |t| async move {
+                t.offload_fut(|| Ok(())).await.expect("offload");
+                done.set(true);
+                "unread"
+            });
+            drop(handle);
+        }
+        drive(&mut fs, &mut eng, &done, "detached task");
+    }
+
+    /// A task dropped before finishing - which only teardown does -
+    /// resolves its join as `None` rather than leaving it pending.
+    #[test]
+    fn a_task_dropped_at_teardown_resolves_its_join_as_none() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+
+        /// Parks forever; only teardown ends it.
+        struct Forever;
+        impl Future for Forever {
+            type Output = u32;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<u32> {
+                Poll::Pending
+            }
+        }
+
+        let handle = {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(|_t| Forever)
+        };
+        drop(fs);
+
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut handle = std::pin::pin!(handle);
+        assert_eq!(
+            handle.as_mut().poll(&mut cx),
+            Poll::Ready(None),
+            "teardown must resolve the join, not strand it"
         );
     }
 }
