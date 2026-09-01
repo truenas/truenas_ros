@@ -308,7 +308,8 @@ pub enum JoinError {
     Dropped,
     /// This handle already yielded the task's output. A handle is not a
     /// broadcast: the poll that got the output took it, and the task
-    /// itself ran to completion - which is why this is not [`Dropped`],
+    /// itself ran to completion - which is why this is not
+    /// [`JoinError::Dropped`],
     /// whose answer is "look at why the work did not happen" and whose
     /// answer here is "fix the caller polling a resolved handle".
     Consumed,
@@ -689,8 +690,8 @@ fn with_conn<R>(
 /// borrow are already gone. A guard of the "submit on drop" shape
 /// therefore reaches this outside a poll by design, and teardown is the
 /// one place that is not misuse - the assert is suppressed there and
-/// the submission is refused like any other that cannot happen. See
-/// [`Tasks::drop`].
+/// the submission is refused like any other that cannot happen; the
+/// reasoning is on the task table's `Drop`, which is internal.
 ///
 /// **It carries the id of the task it was minted for**, and every
 /// method is refused unless that is the task being polled. The handle
