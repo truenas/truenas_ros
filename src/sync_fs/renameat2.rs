@@ -19,6 +19,21 @@ tn_bitflags! {
 /// Rename `old_path` (relative to `old_dirfd`) to `new_path` (relative to
 /// `new_dirfd`), applying `flags`.
 ///
+/// **Single components only, for [`unlinkat`](super::unlinkat)'s
+/// reason.** `renameat2` honours no `RESOLVE_*` flags either, so a
+/// multi-component path resolves every component but the last with
+/// symlinks followed, and one planted by whoever owns an intermediate
+/// directory moves the rename somewhere else - either end of it. Both
+/// names are screened with
+/// [`path::component_defect`](crate::path::component_defect); rejected
+/// are empty, `.`, `..`, and anything containing `/`.
+///
+/// That is the same rule [`mkdirat`](super::mkdirat),
+/// [`unlinkat`](super::unlinkat) and [`linkat`](super::linkat) apply,
+/// and this is the one that carries it into the atomic-replace path:
+/// `rename_into_place` and `shutil`'s copy both hand it a
+/// caller-supplied name.
+///
 /// See [`renameat2(2)`](https://man7.org/linux/man-pages/man2/renameat2.2.html).
 pub fn renameat2<P1, P2, Fd1, Fd2>(
     old_dirfd: Fd1,
@@ -37,6 +52,11 @@ where
     let new_raw = new_dirfd.as_fd().as_raw_fd();
     old_path.with_tn_path(|old_cstr| {
         new_path.with_tn_path(|new_cstr| {
+            if crate::path::component_defect(old_cstr.to_bytes()).is_some()
+                || crate::path::component_defect(new_cstr.to_bytes()).is_some()
+            {
+                return Err(errno::Errno::EINVAL);
+            }
             retry_on_eintr(|| unsafe {
                 libc::syscall(
                     libc::SYS_renameat2,

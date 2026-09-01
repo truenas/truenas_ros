@@ -2870,6 +2870,19 @@ impl<'a> FsConn<'a> {
     }
 
     /// Create a hard link at `new_leaf` in `new` for `old_leaf` in `old`.
+    ///
+    /// **A [`Leaf`] bounds the name, not what the name resolves to.**
+    /// `flags` reaches the kernel as given, and `AT_SYMLINK_FOLLOW`
+    /// there makes `old_leaf` resolve wherever it points - a
+    /// one-component symlink a peer planted inside `old` is a valid
+    /// leaf, so the new name lands inside `new` as a second name for an
+    /// inode outside it. The kernel offers no confinement for this:
+    /// `may_linkat` (`fs/namei.c`) decides *which* inode may be linked
+    /// and never where the link lands, so `fs.protected_hardlinks` does
+    /// not help either. Pass `AtFlags::empty()` unless the source tree
+    /// is one nothing else can write, or open the source under
+    /// `RESOLVE_NO_SYMLINKS` and publish it with
+    /// [`linkat_file`](Self::linkat_file).
     #[allow(clippy::too_many_arguments)]
     pub fn linkat<F>(
         &mut self,

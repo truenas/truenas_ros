@@ -323,29 +323,37 @@ mod fs {
 
     #[test]
     fn renameat2_plain_and_error_flags() {
+        use std::os::fd::AsFd;
         let dir = truenas_ros::tempdir().unwrap();
         let a = dir.path().join("a");
         let b = dir.path().join("b");
-        let c = dir.path().join("c");
         std::fs::write(&a, b"data").unwrap();
+        // Single components against a dirfd: the component screen.
+        let at = openat2(
+            AT_FDCWD,
+            dir.path(),
+            OpenHow::new().flags(OFlag::O_DIRECTORY | OFlag::O_CLOEXEC),
+        )
+        .expect("open the directory");
+        let at = at.as_fd();
 
-        renameat2(AT_FDCWD, &a, AT_FDCWD, &b, RenameFlags::empty()).unwrap();
+        renameat2(at, "a", at, "b", RenameFlags::empty()).unwrap();
         assert!(!a.exists());
         assert_eq!(std::fs::read(&b).unwrap(), b"data");
 
         // EXCHANGE with a missing partner -> ENOENT.
         assert_eq!(
-            renameat2(AT_FDCWD, &b, AT_FDCWD, &c, RenameFlags::RENAME_EXCHANGE)
+            renameat2(at, "b", at, "c", RenameFlags::RENAME_EXCHANGE)
                 .unwrap_err(),
             Errno::ENOENT
         );
         // NOREPLACE | EXCHANGE is contradictory -> EINVAL.
         assert_eq!(
             renameat2(
-                AT_FDCWD,
-                &b,
-                AT_FDCWD,
-                &c,
+                at,
+                "b",
+                at,
+                "c",
                 RenameFlags::RENAME_NOREPLACE | RenameFlags::RENAME_EXCHANGE,
             )
             .unwrap_err(),
