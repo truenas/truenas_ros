@@ -1024,9 +1024,9 @@ where
         }
         let owners: Vec<(u32, u64)> = std::mem::take(&mut self.core.fs_closed);
         if let Some(fs) = self.fs.as_mut() {
-            for owner in owners {
-                fs.cancel_owned_by(&mut self.core.engine, owner);
-            }
+            // One call, not one per owner: the scan walks the whole op
+            // table and the batch shares it.
+            fs.cancel_owned_by(&mut self.core.engine, owners);
         }
     }
 

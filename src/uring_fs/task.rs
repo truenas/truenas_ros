@@ -79,6 +79,11 @@
 //!   gone mid-chain - a task must tolerate too. A task ends by
 //!   returning; there is no external kill, so a task must terminate
 //!   when its ops start failing or the source feeding it closes.
+//!   **Neither of those reaches a task whose awaits are all
+//!   offloads**, because an offload is never cancelled and always
+//!   delivers, so that shape has to ask - with
+//!   [`TaskFs::owner_is_gone`]. A task that never winds down holds a
+//!   graceful drain open to its grace deadline.
 //! - **A task's facade carries no recv-buffer claim**, so
 //!   [`pwritev2_from`](FsConn::pwritev2_from) from inside a task
 //!   copies instead of writing the delivered buffer in place. The
@@ -524,8 +529,9 @@ impl FsConn<'_> {
     /// one run from completion delivery, each with a fresh facade for
     /// the same owner. A task ends by returning. There is no external
     /// kill; a task whose connection died sees its ops fail and must
-    /// wind down on that signal. Whatever outlives the loop is dropped
-    /// with the reactor's tables at teardown.
+    /// wind down on that signal - or, where its awaits cannot fail,
+    /// asks [`TaskFs::owner_is_gone`]. Whatever outlives the loop is
+    /// dropped with the reactor's tables at teardown.
     ///
     /// The returned [`JoinHandle`] resolves with the task's output.
     /// Dropping it detaches: the task runs to completion regardless
@@ -851,6 +857,23 @@ impl TaskFs {
                 OffloadFuture(no_facade(|| Err(Errno::EINVAL.into())))
             }
         }
+    }
+
+    /// [`FsConn::owner_is_gone`] against the running poll's facade -
+    /// the wind-down signal for a task whose awaits never fail.
+    ///
+    /// This module's contract says a task "must terminate when its ops
+    /// start failing or the source feeding it closes", and for a task
+    /// awaiting only offloads neither is ever true: an offload is never
+    /// cancelled and always delivers. Such a task keeps running for a
+    /// dead connection, stays counted in the live gauge, and holds a
+    /// graceful drain open until the grace period ends it. Poll this
+    /// between awaits and return.
+    ///
+    /// `true` outside a poll as well, since a handle that cannot reach
+    /// its facade has nothing left to do either.
+    pub fn owner_is_gone(&self) -> bool {
+        with_conn(self.task, |conn| conn.owner_is_gone()).unwrap_or(true)
     }
 
     /// [`FsConn::spawn`] against the running poll's facade: the child
@@ -2867,6 +2890,56 @@ mod tests {
         assert_eq!(fs.tasks.live.get(), 1, "the task is parked");
         // The teardown itself: no panic, in either profile.
         drop(fs);
+    }
+
+    /// A task awaiting only offloads learns its owner is gone, because
+    /// nothing else will tell it.
+    ///
+    /// The two signals this module names - "your ops start failing"
+    /// and "the source feeding you closes" - are both unreachable for
+    /// this shape: an offload is never cancelled and always delivers.
+    /// Left to run, it holds the live gauge up and a graceful drain
+    /// with it, so the reactor waits out its whole grace period on
+    /// work for a connection that hung up.
+    #[test]
+    fn an_offload_only_task_can_see_that_its_owner_is_gone() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm wake");
+        let owner = Some((3u32, 1u64));
+        let first = Rc::new(StdCell::new(false));
+        let saw_gone = Rc::new(StdCell::new(false));
+
+        {
+            let f = Rc::clone(&first);
+            let g = Rc::clone(&saw_gone);
+            let mut conn = FsConn::new(&mut fs, &mut eng, owner);
+            drop(conn.spawn(move |t| async move {
+                for _ in 0..64 {
+                    let _ = t.offload_fut(|| Ok::<_, crate::Error>(1u8)).await;
+                    f.set(true);
+                    // Every await answered `Ok`; the owner's state is
+                    // the only thing that ends this.
+                    if t.owner_is_gone() {
+                        g.set(true);
+                        return;
+                    }
+                }
+            }));
+        }
+
+        // Rounds with the owner live: the task keeps going.
+        drive(&mut fs, &mut eng, &first, "a first offload round");
+        assert_eq!(fs.tasks.live.get(), 1, "still running for a live owner");
+        assert!(!saw_gone.get(), "nothing has closed yet");
+
+        // The connection closes. The sweep cancels nothing here - the
+        // task holds no ring op - so the record it leaves is the whole
+        // signal.
+        fs.cancel_owned_by(&mut eng, vec![(3, 1)]);
+        drive(&mut fs, &mut eng, &saw_gone, "the wind-down");
+        assert_eq!(fs.tasks.live.get(), 0, "and wound down on it");
     }
 
     /// One task's destructor panicking at teardown does not take the

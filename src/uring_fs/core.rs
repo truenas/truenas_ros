@@ -420,6 +420,13 @@ pub(crate) struct FsCore {
     /// [`super::task`]); woken tasks are polled by the delivery
     /// functions below.
     pub(crate) tasks: super::task::Tasks,
+    /// The highest connection generation [`FsCore::cancel_owned_by`]
+    /// has swept, per connection slot - what
+    /// [`FsCore::owner_is_gone`] reads. One entry per slot and slots
+    /// are reused, so this is bounded by the host's connection table
+    /// and never by how many connections have come and gone. Empty for
+    /// a reactor with no owners (the standalone host).
+    closed_owners: HashMap<u32, u64>,
 }
 
 impl FsCore {
@@ -438,7 +445,24 @@ impl FsCore {
             next_offload: 0,
             priv_xattrs: PrivilegedXattrs::default(),
             tasks: super::task::Tasks::new(),
+            closed_owners: HashMap::new(),
         }
+    }
+
+    /// Whether `owner`'s connection has already been swept.
+    ///
+    /// Generations are per-slot and monotonic, so a sweep recorded at
+    /// or above this one's means this one is over: an entry for a later
+    /// tenant of the same slot answers `false` for the tenant that is
+    /// live, and `true` for every tenant before it.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    pub(crate) fn owner_is_gone(&self, owner: Owner) -> bool {
+        let Some((slot, generation)) = owner else {
+            return false;
+        };
+        self.closed_owners
+            .get(&slot)
+            .is_some_and(|&swept| swept >= generation)
     }
 
     /// A handle on this reactor's live-task count, for an embedding
@@ -753,6 +777,11 @@ impl FsCore {
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     pub(crate) fn has_free_op(&self) -> bool {
         !self.op_free.is_empty()
+    }
+
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn op_free_len_for_test(&self) -> usize {
+        self.op_free.len()
     }
 
     /// Stage a reactor-pump `READV`: one positional read of up to `want`
@@ -1359,41 +1388,78 @@ impl FsCore {
     /// continuation of a cancelled op runs after the sweep, with the same
     /// stamped owner, and whatever it submits then is not swept again -
     /// which is the same "an owner gone mid-chain" a continuation must
-    /// already tolerate. What bounds it is that such an op *completes*:
-    /// every submission path here either reaches the kernel and answers,
-    /// or is refused at submit. The one shape that could answer neither
-    /// was an unguarded open of a special file, and `chain` guards its
-    /// last step for exactly that reason. Adding a second sweep instead
-    /// would be unbounded - a continuation that resubmits on `ECANCELED`
-    /// keeps giving it something to find.
+    /// already tolerate, and deliberately still allowed: a handler
+    /// finishing an upload it already accepted has work to do that the
+    /// peer's disconnect does not undo. A second sweep is not the
+    /// answer either, and would be unbounded - a continuation that
+    /// resubmits on `ECANCELED` keeps giving it something to find, and
+    /// the sweep's own `ECANCELED` completions are what wake the
+    /// continuations that resubmit.
+    ///
+    /// So the bound is the continuation's, not this function's, and
+    /// [`FsCore::owner_is_gone`] - recorded here - is what makes it
+    /// reachable. Two shapes need it, because for them a post-sweep op
+    /// does *not* simply complete and stop:
+    ///
+    /// - An open with [`SpecialFiles::Allow`](super::SpecialFiles),
+    ///   whose own rustdoc says it "hangs an io-wq worker and a caller
+    ///   thread permanently, with no timeout anywhere to recover it".
+    ///   Cancelling reaches it while in flight; a fresh one afterwards
+    ///   has nothing left to reach it.
+    /// - A task awaiting only offloads, which are never cancelled and
+    ///   always deliver (see [`FsConn::offload`]) - so neither of the
+    ///   two signals [`super::task`] tells a task to wind down on ever
+    ///   arrives, and a re-arming one runs for a connection that is
+    ///   gone, counted in `tasks.live` and holding a graceful drain
+    ///   open with it.
+    ///
+    /// **Takes the whole batch of closes, because the scan is the
+    /// cost.** A close is recorded unconditionally - the host cannot
+    /// know whether a handler opened anything - so a connection that
+    /// served one cached GET still arrives here, and one scan per
+    /// owner walks the table `fs_ops + pool_size` entries deep, once
+    /// each, on the reactor thread. Sorted so the membership test is a
+    /// binary search: the batch is bounded by the connection table and
+    /// a linear test would make a mass disconnect quadratic. The
+    /// empty-table check ahead of it is what an idle server actually
+    /// hits.
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     pub(crate) fn cancel_owned_by(
         &mut self,
         eng: &mut Engine,
-        owner: (u32, u64),
+        mut owners: Vec<(u32, u64)>,
     ) {
+        // Recorded before the scan, so a continuation woken by one of
+        // the cancellations below already reads its owner as gone -
+        // and recorded whether or not there is anything to cancel,
+        // since that is what a task with no ring op reads.
+        for &(slot, generation) in &owners {
+            let swept = self.closed_owners.entry(slot).or_insert(generation);
+            *swept = (*swept).max(generation);
+        }
+        if self.op_free.len() == self.ops.len() {
+            return; // nothing in flight for anyone
+        }
+        owners.sort_unstable();
         // Collect targets first (the scan borrows `self.ops`), then stage.
-        let targets: Vec<u64> = self
-            .ops
-            .iter()
-            .enumerate()
-            .filter_map(|(i, entry)| {
-                let FsOpState::InFlight { tag } = entry.state.state else {
-                    return None;
-                };
-                match &entry.state.waiter {
-                    Some(FsWaiter::Embedded { owner: Some(o), .. })
-                        if *o == owner =>
-                    {
-                        Some(pack_raw(tag, i as u32, entry.generation as u32))
-                    }
-                    Some(FsWaiter::Pump { owner: o }) if *o == owner => {
-                        Some(pack_raw(tag, i as u32, entry.generation as u32))
-                    }
-                    _ => None,
-                }
-            })
-            .collect();
+        let targets: Vec<u64> =
+            self.ops
+                .iter()
+                .enumerate()
+                .filter_map(|(i, entry)| {
+                    let FsOpState::InFlight { tag } = entry.state.state else {
+                        return None;
+                    };
+                    let owner = match &entry.state.waiter {
+                        Some(FsWaiter::Embedded { owner: Some(o), .. }) => *o,
+                        Some(FsWaiter::Pump { owner: o }) => *o,
+                        _ => return None,
+                    };
+                    owners.binary_search(&owner).ok().map(|_| {
+                        pack_raw(tag, i as u32, entry.generation as u32)
+                    })
+                })
+                .collect();
         for ud in targets {
             self.submit_cancel(eng, ud);
         }
@@ -1956,6 +2022,30 @@ impl<'a> FsConn<'a> {
     /// the table while the facade it hands the task borrows the tables.
     pub(crate) fn split(&mut self) -> (&mut FsCore, &mut Engine, Owner) {
         (&mut *self.fs, &mut *self.eng, self.owner)
+    }
+
+    /// Whether the connection this facade acts for has already been
+    /// torn down.
+    ///
+    /// A continuation runs after its owner may be gone - the sweep is
+    /// once per close and a completion it cancelled is what schedules
+    /// the continuation - so "my ops are failing" is the signal
+    /// [`super::task`] tells a task to wind down on. Two shapes never
+    /// see it: an offload is never cancelled and always delivers, and
+    /// a timer armed *after* the sweep expires normally. A task built
+    /// from either would otherwise run for a dead connection
+    /// indefinitely, holding a graceful drain open with it.
+    ///
+    /// Submitting is still allowed here, and that is deliberate: a
+    /// handler finishing work it already accepted - the last write of
+    /// an upload, the rename that publishes it - is not undone by the
+    /// peer hanging up. This says the peer is gone; what is worth
+    /// finishing for it is the caller's judgement.
+    ///
+    /// Always `false` where the reactor has no owners (a standalone
+    /// [`UringFs`](super::UringFs), whose whole loop is the lifetime).
+    pub fn owner_is_gone(&self) -> bool {
+        self.fs.owner_is_gone(self.owner)
     }
 
     /// A second facade over the same delivery, for a step that dispatches
@@ -5459,6 +5549,129 @@ mod routing_fuzz {
         submit(&mut core, &mut eng).expect("freed slot serves the next");
     }
 
+    /// The sweep leaves a signal behind, because it cannot leave a
+    /// gate behind.
+    ///
+    /// It runs once per close and a continuation woken by one of its
+    /// own cancellations submits after it, so nothing stops a task
+    /// whose awaits cannot fail - an offload always delivers, a timer
+    /// armed afterwards expires normally - from running for a
+    /// connection that is gone. `owner_is_gone` is what such a task
+    /// asks, and it must answer for the swept tenant of a slot without
+    /// answering for the next one to take it.
+    #[test]
+    fn a_swept_owner_is_visible_to_what_runs_after_the_sweep() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(4, OffloadBounds::default());
+        let gone = (7u32, 3u64);
+
+        assert!(!core.owner_is_gone(Some(gone)), "nothing swept yet");
+        core.cancel_owned_by(&mut eng, vec![gone]);
+        assert!(core.owner_is_gone(Some(gone)), "the swept owner is gone");
+
+        // A slot is reused, and its next tenant is not the one swept.
+        assert!(
+            !core.owner_is_gone(Some((gone.0, gone.1 + 1))),
+            "a later tenant of the same slot is live"
+        );
+        // Every earlier tenant closed before this one did.
+        assert!(
+            core.owner_is_gone(Some((gone.0, gone.1 - 1))),
+            "a tenant before the swept one is gone too"
+        );
+        assert!(!core.owner_is_gone(Some((8, 3))), "another slot is its own");
+        assert!(
+            !core.owner_is_gone(None),
+            "a reactor with no owners has no connection to lose"
+        );
+
+        // And the facade a continuation is handed reads it.
+        let conn = FsConn::new(&mut core, &mut eng, Some(gone));
+        assert!(conn.owner_is_gone(), "the continuation facade answers");
+    }
+
+    /// One sweep reaches every closed owner's ops, and an idle table
+    /// costs nothing to sweep.
+    ///
+    /// A close is recorded whether or not the handler opened anything,
+    /// so on a busy server the batch is ordinary and the table is
+    /// `fs_ops + pool_size` deep - 28k+ entries at a real consumer's
+    /// configuration. Per-owner scanning walked all of it once per
+    /// close, on the reactor thread.
+    #[test]
+    fn one_sweep_covers_the_batch_and_an_idle_table_is_free() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let all_free = core.op_free_len_for_test();
+
+        // Nothing in flight: the sweep records and returns.
+        core.cancel_owned_by(&mut eng, vec![(1, 1), (2, 1), (3, 1)]);
+        assert!(core.owner_is_gone(Some((2, 1))), "recorded regardless");
+        assert_eq!(core.op_free_len_for_test(), all_free, "nothing taken");
+
+        // Four owners with a parked pipe read each: only a cancel can
+        // complete one, so what is left in flight names the batch.
+        let mut fds = [0i32; 2];
+        // SAFETY: `pipe(2)` fills {read, write}.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        // SAFETY: the fresh read end, owned here; the write end stays
+        // open so no read EOFs, and both close with the process.
+        let file =
+            File::new(Arc::new(unsafe { crate::fd::owned_from_raw(fds[0]) }));
+        let owners = [(10u32, 1u64), (11, 1), (12, 1), (13, 1)];
+        for o in owners {
+            core.submit_pump_read(
+                &mut eng,
+                &file,
+                PumpDest::Owned(Vec::with_capacity(8)),
+                8,
+                u64::MAX,
+                o,
+            )
+            .expect("submit");
+        }
+        assert_eq!(inflight(&core).len(), 4, "four parked reads");
+
+        // One call for three of them; the fourth is untouched.
+        core.cancel_owned_by(&mut eng, vec![(10, 1), (11, 1), (12, 1)]);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut reaped = Vec::new();
+        while reaped.len() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "one sweep did not reach the whole batch: {reaped:?}"
+            );
+            eng.ring.submit().expect("submit");
+            let Some(cqe) = eng.ring.reap() else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            };
+            let (tag, slot, g) = unpack_raw(cqe.user_data);
+            if let ReapedFs::Pump(_, owner) =
+                core.on_cqe(&mut eng, tag, slot, g, cqe.res)
+            {
+                reaped.push(owner);
+            }
+        }
+        reaped.sort_unstable();
+        assert_eq!(
+            reaped,
+            vec![(10, 1), (11, 1), (12, 1)],
+            "exactly the batch"
+        );
+        assert_eq!(inflight(&core).len(), 1, "the owner outside it stays");
+        assert!(
+            core.owner_is_gone(Some((11, 1)))
+                && !core.owner_is_gone(Some((13, 1))),
+            "and the record is exactly the batch too"
+        );
+    }
+
     #[test]
     fn cancel_owned_by_reaches_a_pump_read() {
         // Connection teardown's sweep cancels fs ops by owner; a pump read
@@ -5488,7 +5701,7 @@ mod routing_fuzz {
         )
         .expect("submit");
         assert_eq!(Arc::strong_count(&file.fd), 2, "op parks its clone");
-        core.cancel_owned_by(&mut eng, (5, 9));
+        core.cancel_owned_by(&mut eng, vec![(5, 9)]);
 
         // Reap until the read's own CQE routes (the cancel's is inert).
         //
