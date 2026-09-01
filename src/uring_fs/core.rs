@@ -31,13 +31,15 @@ use crate::sync_fs::{
 };
 use crate::uring::engine::Engine;
 use crate::uring::slots::SlotEntry;
+use crate::uring::sys::KernelTimespec;
 use crate::uring::sys::{
     IORING_FSYNC_DATASYNC, IORING_OP_ASYNC_CANCEL, IORING_OP_FADVISE,
     IORING_OP_FALLOCATE, IORING_OP_FGETXATTR, IORING_OP_FSETXATTR,
     IORING_OP_FSYNC, IORING_OP_FTRUNCATE, IORING_OP_LINKAT, IORING_OP_MKDIRAT,
     IORING_OP_OPENAT2, IORING_OP_READV, IORING_OP_RENAMEAT, IORING_OP_SPLICE,
-    IORING_OP_STATX, IORING_OP_SYMLINKAT, IORING_OP_UNLINKAT, IORING_OP_WRITEV,
-    IOSQE_BUFFER_SELECT, IoUringCqe, SPLICE_F_MOVE,
+    IORING_OP_STATX, IORING_OP_SYMLINKAT, IORING_OP_TIMEOUT,
+    IORING_OP_UNLINKAT, IORING_OP_WRITEV, IOSQE_BUFFER_SELECT, IoUringCqe,
+    SPLICE_F_MOVE,
 };
 use crate::uring::user_data::{pack_raw, unpack_raw};
 use std::any::Any;
@@ -99,6 +101,7 @@ pub(crate) const TAG_FGETXATTR: u8 = 0x8E;
 pub(crate) const TAG_FSETXATTR: u8 = 0x8F;
 pub(crate) const TAG_FADVISE: u8 = 0x90;
 pub(crate) const TAG_SPLICE: u8 = 0x91;
+pub(crate) const TAG_TIMEOUT: u8 = 0x92;
 /// The standalone host's wake tag (an embedded host reuses its own).
 pub(crate) const TAG_WAKE: u8 = 0x9D;
 /// Tags `ASYNC_CANCEL` ops (and the teardown drain); completions ignored.
@@ -226,6 +229,11 @@ struct FsOpEntry {
     /// `STATX` result pad - **the kernel writes it at completion**, so it
     /// must live until the CQE reaps.
     stat: Option<Box<StatxRaw>>,
+    /// `TIMEOUT` timespec pad. The kernel copies it at prep
+    /// (`__io_timeout_prep` -> `get_timespec64`), which happens inside the
+    /// enter that submits the SQE - boxed and parked here so the address
+    /// holds however many stages batch before that enter.
+    ts: Option<Box<KernelTimespec>>,
     /// Keeps a path op's dirfd alive (and its fd number un-reused) while
     /// the op is in flight.
     anchor: Option<Anchor>,
@@ -275,6 +283,7 @@ impl FsOpEntry {
             how: None,
             strip_nonblock: false,
             stat: None,
+            ts: None,
             anchor: None,
             anchor2: None,
             file: None,
@@ -292,6 +301,7 @@ impl FsOpEntry {
         self.path = None;
         self.path2 = None;
         self.how = None;
+        self.ts = None;
         self.anchor = None;
         self.anchor2 = None;
         self.file = None;
@@ -878,6 +888,47 @@ impl FsCore {
         }
     }
 
+    /// Stage a standalone relative timer: one `IORING_OP_TIMEOUT` whose
+    /// completion fires after `after`. Expiry is the op's success and is
+    /// delivered as `Ok(0)` - the kernel answers a pure timer (count 0)
+    /// with `-ETIME` (`io_timeout_fn`, `io_uring/timeout.c`), translated
+    /// at [`FsCore::on_cqe`] because that firing is the completion the
+    /// caller asked for. No fd, no personality: a timer touches nothing a
+    /// credential guards.
+    pub(crate) fn submit_timeout(
+        &mut self,
+        eng: &mut Engine,
+        after: std::time::Duration,
+        waiter: FsWaiter,
+    ) {
+        let Some(op_slot) = self.op_free.pop() else {
+            fail(waiter, Errno::EBUSY, Vec::new());
+            return;
+        };
+
+        let ts = Box::new(KernelTimespec {
+            tv_sec: i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: i64::from(after.subsec_nanos()),
+        });
+        let addr = std::ptr::addr_of!(*ts) as u64;
+        let entry = &mut self.ops[op_slot as usize];
+        let gen32 = entry.generation as u32;
+        let e = &mut entry.state;
+        e.state = FsOpState::InFlight { tag: TAG_TIMEOUT };
+        e.waiter = Some(waiter);
+        e.ts = Some(ts);
+
+        let ud = pack_raw(TAG_TIMEOUT, op_slot, gen32);
+        let staged = eng.stage(ud, |sqe| {
+            sqe.opcode = IORING_OP_TIMEOUT;
+            sqe.addr = addr;
+            sqe.len = 1; // exactly one timespec, per the kernel
+        });
+        if let Err(err) = staged {
+            self.fail_op(op_slot, err);
+        }
+    }
+
     /// Stage a metadata op that targets an **open file**: `FTRUNCATE`/
     /// `FALLOCATE` (no payload) and `FGETXATTR`/`FSETXATTR` (owned name +
     /// value). The file was permission-checked at open, and the fd is the
@@ -1400,8 +1451,13 @@ impl FsCore {
         } else {
             None
         };
-        #[cfg_attr(not(feature = "net-server"), allow(unused_mut))]
         let mut result = map_res(res);
+        // A timer's expiry is its success: a pure `IORING_OP_TIMEOUT`
+        // (count 0) completes `-ETIME` when it fires, and that firing is
+        // the completion the caller asked for.
+        if tag == TAG_TIMEOUT && result == Err(Errno::ETIME) {
+            result = Ok(0);
+        }
         // A short leased write is unrecoverable, so it must not look like
         // success: the source was the connection's receive buffer, and this
         // completion is what returns it to the pool - by the time a caller
@@ -2242,6 +2298,25 @@ impl<'a> FsConn<'a> {
             true,
             0,
             0,
+            embed(self.owner, self.fail_sink.take(), on_done),
+        );
+    }
+
+    /// Fire `on_done` after `after`: one relative, one-shot
+    /// `IORING_OP_TIMEOUT` on this ring, delivered as `Ok(0)` when it
+    /// expires. No fd and no personality ride it - a timer touches
+    /// nothing a credential guards - so this is the retry-tick and
+    /// deadline primitive: a caller that must try again later re-arms
+    /// here instead of sleeping an offload worker. A timer cancelled in
+    /// flight completes `ECANCELED`; an owner gone before expiry drops
+    /// the callback, like any continuation's.
+    pub fn timeout<F>(&mut self, after: std::time::Duration, on_done: F)
+    where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.fs.submit_timeout(
+            self.eng,
+            after,
             embed(self.owner, self.fail_sink.take(), on_done),
         );
     }

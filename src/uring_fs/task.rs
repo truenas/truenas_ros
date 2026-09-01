@@ -1392,6 +1392,63 @@ mod tests {
             .mode(Mode::from_bits_truncate(0o600))
     }
 
+    /// A timer completes on its own ring: relative, one-shot, expiry
+    /// delivered as success - and not before its duration has passed.
+    #[test]
+    fn a_timer_fires_after_its_duration() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        let done = Rc::new(StdCell::new(false));
+        let started = Instant::now();
+        {
+            let done = Rc::clone(&done);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.timeout(Duration::from_millis(50), move |d, _conn| {
+                assert!(
+                    d.result().is_ok(),
+                    "expiry is success, not ETIME: {:?}",
+                    d.result().err()
+                );
+                done.set(true);
+            });
+        }
+        drive(&mut fs, &mut eng, &done, "timer");
+        assert!(
+            started.elapsed() >= Duration::from_millis(45),
+            "fired early: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The timer composes with the future layer like any submission: a
+    /// task awaits its tick and resumes on the loop that armed it.
+    #[test]
+    fn a_task_awaits_a_timer() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        let done = Rc::new(StdCell::new(false));
+        let started = Instant::now();
+        {
+            let done = Rc::clone(&done);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |t| async move {
+                let fired = t
+                    .fut(|c, cb| c.timeout(Duration::from_millis(30), cb))
+                    .await;
+                assert!(fired.result().is_ok(), "{:?}", fired.result().err());
+                done.set(true);
+            });
+        }
+        drive(&mut fs, &mut eng, &done, "task timer");
+        assert!(
+            started.elapsed() >= Duration::from_millis(25),
+            "fired early: {:?}",
+            started.elapsed()
+        );
+    }
+
     /// The core claim: a whole write chain - open, write, fsync, stat,
     /// read back - as one straight-line task, every hop on the ring.
     #[test]
