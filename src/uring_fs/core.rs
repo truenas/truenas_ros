@@ -186,14 +186,37 @@ pub(crate) enum ReapedFs {
 /// Box a consumer callback as an owner-stamped embedded waiter - the one shape
 /// every [`FsConn`] submit method hands the core.
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
-fn embed<F>(owner: Owner, on_fail: Option<FailSink>, on_done: F) -> FsWaiter
+fn embed<F>(owner: Owner, armed: Armed, on_done: F) -> FsWaiter
 where
     F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
 {
     FsWaiter::Embedded {
         owner,
         cb: Box::new(on_done),
-        on_fail,
+        on_fail: armed.0,
+    }
+}
+
+/// One submission's share of the staged reason sink - and the proof
+/// that a submission took one.
+///
+/// **Only [`FsConn::arm_fail_sink`] makes one**, and that is the whole
+/// point of the type. [`FsConn::fut`] tells "the op is in flight and
+/// will report for itself" from "the facade refused the arguments and
+/// nothing ever will" by whether any submission armed the sink, so a
+/// submit method that reaches the core without arming makes `fut`
+/// answer a perfectly good op with a spurious `EINVAL`. Passing
+/// `embed` a bare `Option<FailSink>` let exactly that compile: a method
+/// written against the older signature took `self.fail_sink.take()`,
+/// which type-checks, submits, and arms nothing. This makes the same
+/// mistake a build failure.
+pub(crate) struct Armed(Option<FailSink>);
+
+#[cfg(test)]
+impl Armed {
+    /// A share for a test that submits with no facade to arm from.
+    fn none() -> Armed {
+        Armed(None)
     }
 }
 
@@ -1923,10 +1946,10 @@ impl<'a> FsConn<'a> {
 
     /// A clone of the staged sink for one submission, recording that a
     /// submission took it.
-    fn arm_fail_sink(&mut self) -> Option<FailSink> {
+    fn arm_fail_sink(&mut self) -> Armed {
         let sink = self.fail_sink.clone();
         self.fail_armed |= sink.is_some();
-        sink
+        Armed(sink)
     }
 
     /// The facade's parts, reborrowed - what the task layer
@@ -2457,10 +2480,11 @@ impl<'a> FsConn<'a> {
     where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
+        let sink = self.arm_fail_sink();
         self.fs.submit_timeout(
             self.eng,
             after,
-            embed(self.owner, self.fail_sink.take(), on_done),
+            embed(self.owner, sink, on_done),
         );
     }
 
@@ -4862,7 +4886,7 @@ mod routing_fuzz {
                 off,
                 0,
                 std::sync::Arc::clone(&hold),
-                embed(Some((0, 0)), None, |_d, _fs| {}),
+                embed(Some((0, 0)), Armed::none(), |_d, _fs| {}),
             );
             assert!(staged.is_ok(), "staged");
         }
