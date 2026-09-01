@@ -430,6 +430,15 @@ impl FsCore {
         }
     }
 
+    /// A handle on this reactor's live-task count, for an embedding
+    /// host whose graceful drain must wait for tasks as well as
+    /// connections. Unused by the standalone host, which stops when
+    /// nothing is in flight.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    pub(crate) fn task_gauge(&self) -> std::rc::Rc<std::cell::Cell<usize>> {
+        self.tasks.gauge()
+    }
+
     /// Install the ambient-credential xattr policy. Setup-time only: the hosts
     /// expose it through a `&mut self` setter, and their run loops also take
     /// `&mut self`, so it cannot change while operations are in flight.

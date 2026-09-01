@@ -762,6 +762,11 @@ struct TaskSlot {
 pub(crate) struct Tasks {
     slots: Vec<TaskSlot>,
     free: Vec<u32>,
+    /// Live tasks - inserted, not yet retired. Shared with an
+    /// embedding host so its drain can see work a connection table
+    /// cannot: a task can be pending with no connection and no op in
+    /// flight, which is invisible to a check that counts connections.
+    live: Rc<Cell<usize>>,
     /// Lazily built at the first spawn: the queue needs the engine's
     /// wake eventfd, which `FsCore::new` does not see.
     run: Option<Arc<RunShared>>,
@@ -772,6 +777,7 @@ impl Tasks {
         Tasks {
             slots: Vec::new(),
             free: Vec::new(),
+            live: Rc::new(Cell::new(0)),
             run: None,
         }
     }
@@ -815,6 +821,7 @@ impl Tasks {
             run: Arc::clone(run),
         });
         let waker = Waker::from(std::sync::Arc::clone(&wake));
+        self.live.set(self.live.get() + 1);
         self.slots[idx as usize].entry = Some(TaskEntry {
             fut,
             on_panic: Some(on_panic),
@@ -823,6 +830,12 @@ impl Tasks {
             waker,
         });
         id
+    }
+
+    /// A handle on the live-task count, for a host whose drain must
+    /// wait for tasks as well as connections.
+    pub(crate) fn gauge(&self) -> Rc<Cell<usize>> {
+        Rc::clone(&self.live)
     }
 
     /// Take the entry out for a poll; `None` for a stale id (the task
@@ -861,6 +874,7 @@ impl Tasks {
     }
 
     fn retire(&mut self, idx: u32) {
+        self.live.set(self.live.get().saturating_sub(1));
         let s = &mut self.slots[idx as usize];
         debug_assert!(s.entry.is_none(), "retiring a task still in its slot");
         s.generation = s.generation.wrapping_add(1);
@@ -1620,6 +1634,39 @@ mod tests {
     fn task_fs_outside_a_poll_debug_asserts() {
         let t = TaskFs::new();
         drop(t.fut(|_c, _cb| {}));
+    }
+
+    /// The live gauge an embedding host's drain reads: a spawned task
+    /// counts until it retires, so a drain that consults it cannot
+    /// stop the loop with task work outstanding. A task pending with
+    /// no op in flight is invisible to a connection count, which is
+    /// the case this exists for.
+    #[test]
+    fn the_task_gauge_tracks_live_tasks() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        let gauge = fs.task_gauge();
+        assert_eq!(gauge.get(), 0, "idle");
+
+        struct Park;
+        impl Future for Park {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            // Pending forever, with nothing in flight: exactly the
+            // shape a connection count cannot see.
+            conn.spawn(|_t| Park);
+            assert_eq!(gauge.get(), 1, "a parked task is live");
+            // And one that finishes immediately does not linger.
+            conn.spawn(|_t| async {});
+        }
+        assert_eq!(gauge.get(), 1, "the finished task retired");
     }
 
     /// A panicking task is contained: the caller that spawned it keeps

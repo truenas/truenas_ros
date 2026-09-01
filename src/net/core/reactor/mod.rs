@@ -94,6 +94,12 @@ pub(crate) struct Reactor<U> {
     /// accepting, stop starting requests, finish in-flight work under a
     /// Deadline timer that escalates to a hard stop.
     pub(crate) draining: bool,
+    /// Work a graceful drain must wait for beyond the connection
+    /// table - the fs reactor's live tasks, when one is embedded. A
+    /// task can be pending with no connection and no op in flight, so
+    /// counting connections alone would stop the loop with its work
+    /// unfinished. Zero for a server with no fs reactor.
+    pub(crate) pending_tasks: std::rc::Rc<std::cell::Cell<usize>>,
     /// Set by `reclaim_slot` whenever a pool slot is freed, drained by the
     /// role loop (`take_pool_freed`) to re-arm any listener parked on a full
     /// pool. A flag rather than a role-side call keeps slot reclamation core.
@@ -147,6 +153,7 @@ impl<U> Reactor<U> {
         pads: Box<KernelPads>,
     ) -> Reactor<U> {
         Reactor {
+            pending_tasks: std::rc::Rc::new(std::cell::Cell::new(0)),
             table: ConnTable::new(pool_size),
             cfg,
             stats: Arc::new(StatsInner::default()),
