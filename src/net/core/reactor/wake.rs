@@ -19,6 +19,17 @@ impl<U> Reactor<U> {
     ///
     /// A task that never finishes therefore holds a drain open; the
     /// grace period remains the backstop that ends it regardless.
+    ///
+    /// **Both terms need somewhere to be re-read.** Freeing a slot
+    /// (`reclaim_slot`) is edge-triggered on the connection term alone,
+    /// and once the table is empty no further slot is freed, so a drain
+    /// whose last blocker is a task would never re-run this and would
+    /// sit out its whole grace period before the `Deadline` hard-stopped
+    /// it - the outcome the grace period exists to avoid. The role loop
+    /// therefore re-reads it once per pass, where every completion that
+    /// can retire a task has already been dispatched. A pass costs a
+    /// branch; waking the loop to say so would cost a syscall for
+    /// nothing, since the pass is already running when the gauge falls.
     pub(crate) fn maybe_finish_drain(&mut self) {
         if self.draining
             && self.table.active() == 0

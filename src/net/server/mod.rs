@@ -995,6 +995,11 @@ where
             // completion for those connections has been routed).
             #[cfg(feature = "uring-fs")]
             self.sweep_closed_fs();
+            // A drain's quiescence, re-read where everything that can
+            // reach it has already run. `reclaim_slot` is edge-triggered
+            // on connections and cannot see a task retire; see
+            // `maybe_finish_drain`. Inert unless draining.
+            self.core.maybe_finish_drain();
         }
         Ok(())
     }
