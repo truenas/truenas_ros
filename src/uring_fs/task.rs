@@ -24,8 +24,15 @@
 //!   code inside the task submits: a task cannot hold the facade across
 //!   an `await`, so each poll runs with the delivering facade parked
 //!   where [`TaskFs`] can reach it, and nowhere else. Spawning returns
-//!   a [`JoinHandle`] resolving with the task's output; dropping the
-//!   handle detaches rather than kills.
+//!   a [`JoinHandle`] resolving with the task's output, or a
+//!   [`JoinError`]; dropping the handle detaches rather than kills.
+//! - **A panicking task is contained.** Its poll unwinds no further
+//!   than the executor: the payload reaches its [`JoinHandle`] as
+//!   [`JoinError::Panic`], the slot retires, and the reactor thread
+//!   keeps serving every other connection. This is the one place in
+//!   the crate that catches an unwind on the loop - a callback that
+//!   panics still takes the thread down - because a task is a
+//!   request's own work and a request's bug should cost the request.
 //!
 //! # Contract
 //!
@@ -38,13 +45,29 @@
 //!   `ECANCELED` rather than pending forever. That is the future form
 //!   of "dropping the continuation closes the connection": a refused
 //!   submission, or teardown, reaches the awaiting task as an error it
-//!   can act on.
+//!   can act on, **and it says which**: a refused submission resolves
+//!   with the errno the facade refused it for - `EBUSY` from a full
+//!   op table, which is the documented fan-out failure and is worth
+//!   retrying, or `EINVAL` from an argument the facade will never
+//!   accept, which is a caller bug. `ECANCELED` is left meaning
+//!   teardown alone. The callback form still drops `on_done` for all
+//!   three, which is its own contract; the futures layer stages a
+//!   reason sink beside the callback, and a sink runs no consumer
+//!   code, so nothing is delivered inline from a submit path.
 //! - **A task's facade is a continuation facade.** Each poll gets a
 //!   fresh owner-scoped [`FsConn`], the same one a completion callback
 //!   is handed, and everything a continuation must tolerate - an owner
 //!   gone mid-chain - a task must tolerate too. A task ends by
 //!   returning; there is no external kill, so a task must terminate
 //!   when its ops start failing or the source feeding it closes.
+//! - **A task's facade carries no recv-buffer claim**, so
+//!   [`pwritev2_from`](FsConn::pwritev2_from) from inside a task
+//!   copies instead of writing the delivered buffer in place. The
+//!   claim belongs to the delivery that is holding the body, and a
+//!   task outlives it. Submitting the write from the delivery's own
+//!   callback and handing the [`FsFuture`] to the task keeps the
+//!   zero-copy path; a task that wants the bytes must own them,
+//!   which its `'static` future requires in any case.
 //! - **Tasks are polled from the delivery points that fire callbacks**
 //!   (completion and offload delivery), plus [`FsConn::run_woken`] for
 //!   a callback that wakes a task by hand and wants it run before the
@@ -106,6 +129,20 @@ impl<V> Slot<V> {
     /// Fill with the outcome (`None` = the callback dropped unfired)
     /// and wake whoever parked.
     fn fill(&self, landed: Option<V>) {
+        {
+            // A real answer is final; `Gone` is not. The two arrive in
+            // either order - a refused submission drops its callback
+            // (which lands as `Gone`) and reports its errno through
+            // the waiter's sink - and the errno is the better answer
+            // whichever came first.
+            let cur = self.0.borrow();
+            let settled =
+                matches!(*cur, SlotState::Ready(_) | SlotState::Spent);
+            if settled || (matches!(*cur, SlotState::Gone) && landed.is_none())
+            {
+                return;
+            }
+        }
         let next = match landed {
             Some(v) => SlotState::Ready(v),
             None => SlotState::Gone,
@@ -202,13 +239,48 @@ impl<T> Future for OffloadFuture<T> {
     }
 }
 
-/// A spawned task's output, as a future. Resolves `Some` with what the
-/// task returned; `None` if the task was dropped before finishing,
-/// which the reactor does only at teardown.
+/// Why a task produced no output.
+#[derive(Debug)]
+pub enum JoinError {
+    /// The task panicked. The payload is what the poll unwound with,
+    /// as [`catch_unwind`](std::panic::catch_unwind) yields it.
+    ///
+    /// A panicking task is contained: its slot retires, the reactor
+    /// thread lives, and every other connection on that ring keeps
+    /// being served. Nothing else in this crate contains a panic - a
+    /// callback that unwinds still takes the loop down - so this is
+    /// deliberately the narrower promise: a task's own bug is a
+    /// request's problem, not the ring's.
+    Panic(Box<dyn std::any::Any + Send>),
+    /// The task never finished and never will: dropped at teardown
+    /// before completing, or a release-build [`TaskFs::spawn`] reached
+    /// outside a poll, whose body therefore never ran at all.
+    Dropped,
+}
+
+impl std::fmt::Display for JoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JoinError::Panic(_) => f.write_str("the task panicked"),
+            JoinError::Dropped => {
+                f.write_str("the task was dropped before it finished")
+            }
+        }
+    }
+}
+
+impl std::error::Error for JoinError {}
+
+/// A spawned task's output, as a future.
+///
+/// Resolves `Ok` with what the task returned, or [`JoinError`] when it
+/// produced nothing. Polling again after it has resolved answers
+/// [`JoinError::Dropped`]: the output is taken by the poll that got
+/// it, and a handle is not a broadcast.
 ///
 /// Dropping the handle detaches - the task runs to completion either
 /// way and its output is dropped unread. There is no kill through it.
-pub struct JoinHandle<T>(Rc<Slot<T>>);
+pub struct JoinHandle<T>(Rc<Slot<Result<T, JoinError>>>);
 
 impl<T> std::fmt::Debug for JoinHandle<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -217,10 +289,15 @@ impl<T> std::fmt::Debug for JoinHandle<T> {
 }
 
 impl<T> Future for JoinHandle<T> {
-    type Output = Option<T>;
+    type Output = Result<T, JoinError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        self.0.poll_take(cx)
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<T, JoinError>> {
+        self.0
+            .poll_take(cx)
+            .map(|v| v.unwrap_or(Err(JoinError::Dropped)))
     }
 }
 
@@ -249,7 +326,25 @@ impl FsConn<'_> {
     ) -> FsFuture {
         let slot = Slot::new();
         let fire = Fire(Some(Rc::clone(&slot)));
+        // Why an op never reached the ring, for the future to read:
+        // `EBUSY` from a full op table is worth retrying, `EINVAL`
+        // from a refused argument is a caller bug, and teardown is
+        // neither. The callback form cannot tell them apart - it
+        // drops `on_done` for all three - so the sink is what carries
+        // the distinction to a consumer that can act on it.
+        let reason = Rc::clone(&slot);
+        self.stage_fail_sink(Box::new(move |errno| {
+            reason.fill(Some(FsDone::failed(errno)));
+        }));
         submit(self, Box::new(move |done, _conn| fire.fire(done)));
+        // A sink still staged means `submit` returned without handing
+        // the op to the core at all: the facade's own argument checks
+        // refuse ahead of that (an absolute path, an empty link
+        // target), and they are the same class of defect the core
+        // reports as `EINVAL`.
+        if let Some(sink) = self.take_fail_sink() {
+            sink(Errno::EINVAL);
+        }
         FsFuture(slot)
     }
 
@@ -274,6 +369,11 @@ impl FsConn<'_> {
     /// this returns - so its first ops are on the ring when the caller
     /// resumes, exactly as an eager callback chain's would be.
     ///
+    /// `body` itself runs inside that first poll, so it may submit
+    /// through its [`TaskFs`] while assembling the future - the eager
+    /// pair this module's contract describes - and not only from
+    /// inside the returned future.
+    ///
     /// The task is owner-scoped like a continuation: polls after this
     /// one run from completion delivery, each with a fresh facade for
     /// the same owner. A task ends by returning. There is no external
@@ -287,16 +387,31 @@ impl FsConn<'_> {
     /// its effects wants, so the handle is not `#[must_use]`.
     pub fn spawn<F, Fut, T>(&mut self, body: F) -> JoinHandle<T>
     where
-        F: FnOnce(TaskFs) -> Fut,
+        F: FnOnce(TaskFs) -> Fut + 'static,
         Fut: Future<Output = T> + 'static,
         T: 'static,
     {
         let slot = Slot::new();
         let fire = Fire(Some(Rc::clone(&slot)));
-        let fut = body(TaskFs::new());
-        let task = Box::pin(async move { fire.fire(fut.await) });
+        // Type-erased so the entry, which cannot name `T`, can still
+        // answer this handle when its poll unwinds.
+        let panicked = {
+            let slot = Rc::clone(&slot);
+            Box::new(move |payload| {
+                slot.fill(Some(Err(JoinError::Panic(payload))));
+            })
+        };
+        // `body` runs *inside* the first poll, not here: it is handed
+        // a `TaskFs`, and a facade is parked only for the extent of a
+        // poll. Building the future out here would leave every op the
+        // caller submits while assembling it - the eager pair this
+        // contract advertises - with no facade to submit through.
+        let task = Box::pin(async move {
+            let fut = body(TaskFs::new());
+            fire.fire(Ok(fut.await));
+        });
         let (fs, eng, owner) = self.split();
-        let id = fs.tasks.insert(eng, owner, task);
+        let id = fs.tasks.insert(eng, owner, task, panicked);
         poll_one(fs, eng, id);
         JoinHandle(slot)
     }
@@ -320,15 +435,57 @@ std::thread_local! {
         const { Cell::new(None) };
 }
 
-/// Restore [`CURRENT`] on scope exit, a panic included: a panicking
+/// The cell a scoped pointer parks in.
+type ParkCell<T> = std::thread::LocalKey<Cell<Option<NonNull<T>>>>;
+
+/// Restore a park cell on scope exit, a panic included: a panicking
 /// task unwinds through the host loop, and the cell must not keep
 /// naming a facade that died with this frame.
-struct Restore(Option<NonNull<FsConn<'static>>>);
+struct Restore<T: 'static>(&'static ParkCell<T>, Option<NonNull<T>>);
 
-impl Drop for Restore {
+impl<T: 'static> Drop for Restore<T> {
     fn drop(&mut self) {
-        CURRENT.with(|c| c.set(self.0));
+        self.0.with(|c| c.set(self.1));
     }
+}
+
+/// Park `ptr` in `cell` for the dynamic extent of `f`.
+///
+/// Generic over the parked type so the protocol can be exercised
+/// without an io_uring ring: every test that reaches it through
+/// [`FsConn`] builds a real one, and Miri aborts on `io_uring_setup`
+/// rather than taking the skip path, which would leave the only
+/// `unsafe` in this module unvalidated by it.
+fn park_in<T: 'static, R>(
+    cell: &'static ParkCell<T>,
+    ptr: NonNull<T>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let _restore = Restore(cell, cell.with(|c| c.replace(Some(ptr))));
+    f()
+}
+
+/// Reach whatever `cell` holds, for the extent of `f`. `None` when
+/// nothing is parked.
+///
+/// **The pointer is taken for the call**, so a nested reach finds an
+/// empty cell rather than deriving a second live `&mut` to the same
+/// value, and the guard puts it back however `f` ends.
+fn reach_in<T: 'static, R>(
+    cell: &'static ParkCell<T>,
+    f: impl FnOnce(&mut T) -> R,
+) -> Option<R> {
+    cell.with(|c| {
+        let ptr = c.take()?;
+        let _restore = Restore(cell, Some(ptr));
+        // SAFETY: `ptr` was parked by `park_in` around a call that is
+        // still on this thread's stack, so the value it names outlives
+        // this borrow; the `take` above makes this the only live
+        // reference derived from it, and `f` is generic over the
+        // borrow's lifetime so the reference cannot escape.
+        let val = unsafe { &mut *ptr.as_ptr() };
+        Some(f(val))
+    })
 }
 
 /// Park `conn` in [`CURRENT`] for the duration of `f` (a task poll).
@@ -337,26 +494,16 @@ fn with_current<R>(conn: &mut FsConn<'_>, f: impl FnOnce() -> R) -> R {
     // back out strictly inside `f`'s dynamic extent, where `conn` is
     // still exclusively this frame's.
     let ptr = NonNull::from(conn).cast::<FsConn<'static>>();
-    let _restore = Restore(CURRENT.with(|c| c.replace(Some(ptr))));
-    f()
+    park_in(&CURRENT, ptr, f)
 }
 
 /// Reach the poll's parked facade. `None` outside a poll. The pointer
 /// is *taken* for the call - a nested reach sees an empty cell rather
 /// than a second `&mut` to the same facade.
 fn with_conn<R>(f: impl FnOnce(&mut FsConn<'_>) -> R) -> Option<R> {
-    CURRENT.with(|c| {
-        let ptr = c.take()?;
-        let _restore = Restore(Some(ptr));
-        // SAFETY: `ptr` was parked by `with_current` around the poll
-        // running right now on this thread; the facade it names is the
-        // executor's for that whole extent, and the `take` above makes
-        // this the only live reference derived from it. The `'static`
-        // in the cell is storage-only: `f` is generic over the
-        // facade's lifetime, so the reference cannot escape it.
-        let conn = unsafe { &mut *ptr.as_ptr() };
-        Some(f(conn))
-    })
+    // The `'static` in the cell is storage-only: `f` is generic over
+    // the facade's lifetime, so the reference cannot escape it.
+    reach_in(&CURRENT, f)
 }
 
 /// A task's handle to the facade of whichever poll is running it.
@@ -367,7 +514,16 @@ fn with_conn<R>(f: impl FnOnce(&mut FsConn<'_>) -> R) -> Option<R> {
 /// thread. Smuggling it elsewhere and calling it there debug-asserts,
 /// and in release resolves the op as `ECANCELED` / drops the spawn,
 /// the facade's shape for a submission that cannot happen.
-#[derive(Clone)]
+///
+/// **Deliberately not `Clone`.** It carries no task identity, so a
+/// copy kept past its poll - parked in connection state, say - and
+/// used during a *different* task's poll would find `CURRENT`
+/// populated, submit against that task's facade, and be stamped its
+/// owner: the wrong connection's teardown sweep would then cancel the
+/// op, and the right one would leave its descriptor parked. No assert
+/// can catch that, because from inside the cell it is indistinguishable
+/// from a legitimate submission. Without `Clone` the handle cannot
+/// outlive the body it was handed to.
 pub struct TaskFs {
     _on_loop: PhantomData<Rc<()>>,
 }
@@ -421,7 +577,7 @@ impl TaskFs {
     /// awaiting both is a join.
     pub fn spawn<F, Fut, T>(&self, body: F) -> JoinHandle<T>
     where
-        F: FnOnce(TaskFs) -> Fut,
+        F: FnOnce(TaskFs) -> Fut + 'static,
         Fut: Future<Output = T> + 'static,
         T: 'static,
     {
@@ -437,40 +593,57 @@ impl TaskFs {
 
 // ---- the task table and its run queue -------------------------------------
 
-/// Pack a task's slot index and generation into the id its waker carries.
-fn pack_task(idx: u32, generation: u32) -> u64 {
-    (u64::from(idx) << 32) | u64::from(generation)
-}
-
-fn unpack_task(id: u64) -> (u32, u32) {
-    ((id >> 32) as u32, id as u32)
+/// A task's slot and the incarnation of it this handle names.
+///
+/// Not packed into a `u64`: no task id ever reaches `user_data`, so
+/// nothing here is bounded by the 24-bit slot field the ring routing
+/// tokens use, and a full-width generation is what
+/// [`SlotEntry`](crate::uring::slots::SlotEntry) documents the reason
+/// for - a `Waker` is exactly the long-retained handle that must not
+/// alias a future incarnation after the counter wraps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct TaskId {
+    idx: u32,
+    generation: u64,
 }
 
 /// What a waker reaches: the run queue, its emptiness hint, and the
 /// loop's wake eventfd for an off-loop wake.
 pub(crate) struct RunShared {
     /// Woken task ids, in wake order.
-    queue: Mutex<VecDeque<u64>>,
+    queue: Mutex<VecDeque<TaskId>>,
     /// Queue-length hint, so the per-completion drain check is one
     /// relaxed load instead of a lock acquisition.
     ready: AtomicUsize,
+    /// Set for the extent of a [`drain`] pass. A wake landing inside a
+    /// pass is taken by that pass or by its trailing poke; a wake
+    /// landing outside one has nothing scheduled to collect it, so it
+    /// must poke for itself. Nested passes clear it early, which can
+    /// only cause a redundant poke - never a missed one - so the flag
+    /// needs no depth count.
+    draining: AtomicBool,
     /// The loop's shared flags and wake eventfd.
     wake: Arc<LoopShared>,
-    /// The loop thread, recorded at first spawn: a wake from it needs
-    /// no poke (a drain follows in the same dispatch), a wake from
-    /// anywhere else does.
+    /// The loop thread, recorded at first spawn.
     #[cfg(not(loom))]
     loop_thread: std::thread::ThreadId,
+    /// The model's stand-in for the thread check. A `cfg` hard-coding
+    /// this to `true` is what made the on-loop branch - where the
+    /// wake-outside-a-pass bug lived - unreachable from any model
+    /// while the module claimed its models carried the liveness
+    /// argument; keep it settable so both branches stay expressible.
+    #[cfg(loom)]
+    model_off_loop: bool,
 }
 
 impl RunShared {
     /// Whether the caller is off the loop thread. Under loom there is
-    /// no comparable thread identity, and the models exercise the
-    /// off-loop path - the one with an ordering to check.
+    /// no thread identity to read, so a model states which side it is
+    /// exercising; both are modelled.
     fn off_loop(&self) -> bool {
         #[cfg(loom)]
         {
-            true
+            self.model_off_loop
         }
         #[cfg(not(loom))]
         {
@@ -479,7 +652,7 @@ impl RunShared {
     }
 
     /// Pop the next woken task id, if any.
-    pub(crate) fn take_ready(&self) -> Option<u64> {
+    pub(crate) fn take_ready(&self) -> Option<TaskId> {
         let id = self
             .queue
             .lock()
@@ -495,7 +668,7 @@ impl RunShared {
 /// `crate::sync` like every cross-thread protocol here, so the loom
 /// models can drive [`wake_task`] itself.
 pub(crate) struct TaskWake {
-    id: u64,
+    id: TaskId,
     /// Wake-dedup edge: set by the wake that enqueues, cleared by
     /// [`poll_window`] just before the task runs.
     queued: AtomicBool,
@@ -513,8 +686,18 @@ impl std::task::Wake for TaskWake {
 }
 
 /// Wake one task: enqueue its id exactly once per wake edge, and poke
-/// the loop when woken from off it. Returns whether this call enqueued
-/// (a dedup-skipped wake returns `false`).
+/// the loop unless a drain pass is already running to collect it.
+/// Returns whether this call enqueued (a dedup-skipped wake returns
+/// `false`).
+///
+/// **The discriminant is whether a pass is running, not which thread
+/// the wake came from.** An on-loop wake outside a pass (the inline
+/// poll in [`FsConn::spawn`], or a callback waking a task by hand) is
+/// otherwise scheduled by nothing: the id sits in the queue while the
+/// loop parks on a ring that has no reason to complete, and the
+/// `queued` edge then latches, so every later wake - an off-loop one
+/// included - is deduped away and the task is unreachable for the
+/// life of the reactor.
 ///
 /// Push under the lock, then poke - `finish_offload`'s protocol, and
 /// the same one-direction ordering argument: poke first and the loop
@@ -536,7 +719,7 @@ pub(crate) fn wake_task(w: &TaskWake) -> bool {
         .unwrap_or_else(|e| e.into_inner())
         .push_back(w.id);
     w.run.ready.fetch_add(1, Ordering::Release);
-    if w.run.off_loop() {
+    if w.run.off_loop() || !w.run.draining.load(Ordering::Acquire) {
         w.run.wake.wake.poke();
     }
     true
@@ -553,8 +736,13 @@ pub(crate) fn poll_window<R>(w: &TaskWake, poll: impl FnOnce() -> R) -> R {
     poll()
 }
 
+/// Answers a task's [`JoinHandle`] when its poll unwinds; type-erased
+/// because the table cannot name a task's output type.
+type PanicSink = Box<dyn FnOnce(Box<dyn std::any::Any + Send>)>;
+
 struct TaskEntry {
     fut: Pin<Box<dyn Future<Output = ()>>>,
+    on_panic: Option<PanicSink>,
     owner: Owner,
     wake: std::sync::Arc<TaskWake>,
     waker: Waker,
@@ -563,7 +751,7 @@ struct TaskEntry {
 struct TaskSlot {
     /// Bumped at retire, so a stale waker's id misses and its wake is
     /// inert - the run queue may hold ids for tasks already gone.
-    generation: u32,
+    generation: u64,
     /// `None` while free *or* while the entry is out being polled; the
     /// free list is what distinguishes the two.
     entry: Option<TaskEntry>,
@@ -574,6 +762,11 @@ struct TaskSlot {
 pub(crate) struct Tasks {
     slots: Vec<TaskSlot>,
     free: Vec<u32>,
+    /// Live tasks - inserted, not yet retired. Shared with an
+    /// embedding host so its drain can see work a connection table
+    /// cannot: a task can be pending with no connection and no op in
+    /// flight, which is invisible to a check that counts connections.
+    live: Rc<Cell<usize>>,
     /// Lazily built at the first spawn: the queue needs the engine's
     /// wake eventfd, which `FsCore::new` does not see.
     run: Option<Arc<RunShared>>,
@@ -584,6 +777,7 @@ impl Tasks {
         Tasks {
             slots: Vec::new(),
             free: Vec::new(),
+            live: Rc::new(Cell::new(0)),
             run: None,
         }
     }
@@ -593,17 +787,21 @@ impl Tasks {
         eng: &Engine,
         owner: Owner,
         fut: Pin<Box<dyn Future<Output = ()>>>,
-    ) -> u64 {
+        on_panic: PanicSink,
+    ) -> TaskId {
         let run = self.run.get_or_insert_with(|| {
             Arc::new(RunShared {
                 queue: Mutex::new(VecDeque::new()),
                 ready: AtomicUsize::new(0),
+                draining: AtomicBool::new(false),
                 wake: Arc::clone(&eng.shared),
                 // The first spawn happens on the loop thread (spawns
                 // come through a facade, and facades exist only
                 // there), so this records the loop.
                 #[cfg(not(loom))]
                 loop_thread: std::thread::current().id(),
+                #[cfg(loom)]
+                model_off_loop: false,
             })
         });
         let idx = self.free.pop().unwrap_or_else(|| {
@@ -613,15 +811,20 @@ impl Tasks {
             });
             (self.slots.len() - 1) as u32
         });
-        let id = pack_task(idx, self.slots[idx as usize].generation);
+        let id = TaskId {
+            idx,
+            generation: self.slots[idx as usize].generation,
+        };
         let wake = std::sync::Arc::new(TaskWake {
             id,
             queued: AtomicBool::new(false),
             run: Arc::clone(run),
         });
         let waker = Waker::from(std::sync::Arc::clone(&wake));
+        self.live.set(self.live.get() + 1);
         self.slots[idx as usize].entry = Some(TaskEntry {
             fut,
+            on_panic: Some(on_panic),
             owner,
             wake,
             waker,
@@ -629,14 +832,41 @@ impl Tasks {
         id
     }
 
+    /// A handle on the live-task count, for a host whose drain must
+    /// wait for tasks as well as connections.
+    pub(crate) fn gauge(&self) -> Rc<Cell<usize>> {
+        Rc::clone(&self.live)
+    }
+
     /// Take the entry out for a poll; `None` for a stale id (the task
     /// retired and its slot moved on) or one already out.
-    fn take_if(&mut self, idx: u32, generation: u32) -> Option<TaskEntry> {
-        let s = self.slots.get_mut(idx as usize)?;
-        if s.generation != generation {
+    fn take_if(&mut self, id: TaskId) -> Option<TaskEntry> {
+        let s = self.slots.get_mut(id.idx as usize)?;
+        if s.generation != id.generation {
             return None;
         }
         s.entry.take()
+    }
+
+    /// Re-enqueue `id` when its slot is the live tenant but currently
+    /// out for a poll. A retired slot fails the generation test
+    /// (`retire` bumps it) and a free slot cannot match a minted id,
+    /// so this fires only for the mid-poll case.
+    fn requeue_if_busy(&self, id: TaskId) {
+        let busy = self.slots.get(id.idx as usize).is_some_and(|s| {
+            s.generation == id.generation && s.entry.is_none()
+        });
+        if !busy {
+            return;
+        }
+        let Some(run) = self.run.as_ref() else {
+            return;
+        };
+        run.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(id);
+        run.ready.fetch_add(1, Ordering::Release);
     }
 
     fn put_back(&mut self, idx: u32, entry: TaskEntry) {
@@ -644,10 +874,21 @@ impl Tasks {
     }
 
     fn retire(&mut self, idx: u32) {
+        self.live.set(self.live.get().saturating_sub(1));
         let s = &mut self.slots[idx as usize];
         debug_assert!(s.entry.is_none(), "retiring a task still in its slot");
         s.generation = s.generation.wrapping_add(1);
         self.free.push(idx);
+    }
+}
+
+/// Marks a drain pass live for [`wake_task`], and clears it however
+/// the pass ends.
+struct PassGuard(Arc<RunShared>);
+
+impl Drop for PassGuard {
+    fn drop(&mut self) {
+        self.0.draining.store(false, Ordering::Release);
     }
 }
 
@@ -664,14 +905,17 @@ impl Tasks {
 /// nothing left in flight - a parent woken by its child's final poll -
 /// would wait on a completion that is never coming.
 pub(crate) fn drain(fs: &mut FsCore, eng: &mut Engine) {
-    let Some(mut budget) = fs
-        .tasks
-        .run
-        .as_ref()
-        .map(|r| r.ready.load(Ordering::Acquire))
-    else {
+    let Some(run) = fs.tasks.run.as_ref().map(Arc::clone) else {
         return;
     };
+    let mut budget = run.ready.load(Ordering::Acquire);
+    if budget == 0 {
+        return;
+    }
+    run.draining.store(true, Ordering::Release);
+    // Cleared however the pass ends, an unwinding poll included: a
+    // flag left set would silence every later wake's poke.
+    let _pass = PassGuard(run);
     while budget > 0 {
         let Some(id) = fs.tasks.run.as_ref().and_then(|r| r.take_ready())
         else {
@@ -693,9 +937,16 @@ pub(crate) fn drain(fs: &mut FsCore, eng: &mut Engine) {
 /// Poll one task. The entry is held out of the table for the poll, so
 /// the facade the task submits through can borrow the tables freely;
 /// a task that completes retires its slot, one that pends goes back.
-fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: u64) {
-    let (idx, generation) = unpack_task(id);
-    let Some(mut entry) = fs.tasks.take_if(idx, generation) else {
+fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: TaskId) {
+    let idx = id.idx;
+    let Some(mut entry) = fs.tasks.take_if(id) else {
+        // A live generation with no entry is the slot's tenant out
+        // being polled - a re-entrant drain, which `run_woken` and the
+        // facade a submit closure receives both make reachable. That
+        // poll already cleared the dedup edge, so this id is the only
+        // record of the wake: put it back rather than consume it, or
+        // the task is never scheduled again.
+        fs.tasks.requeue_if_busy(id);
         return;
     };
     let mut conn = FsConn::new(fs, eng, entry.owner);
@@ -703,12 +954,30 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: u64) {
     // the window reads the wake edge while the poll borrows the
     // future - no waker clone (and no refcount traffic) per poll.
     let mut cx = Context::from_waker(&entry.waker);
-    let poll = poll_window(&entry.wake, || {
-        with_current(&mut conn, || entry.fut.as_mut().poll(&mut cx))
-    });
+    // The entry is out of the table for the poll, so an unwinding
+    // future would otherwise leave the slot neither occupied nor free
+    // - never reused, its generation never bumped, and `retire`'s own
+    // guard unable to see it.
+    let poll = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        poll_window(&entry.wake, || {
+            with_current(&mut conn, || entry.fut.as_mut().poll(&mut cx))
+        })
+    }));
     match poll {
-        Poll::Ready(()) => fs.tasks.retire(idx),
-        Poll::Pending => fs.tasks.put_back(idx, entry),
+        Ok(Poll::Ready(())) => fs.tasks.retire(idx),
+        Ok(Poll::Pending) => fs.tasks.put_back(idx, entry),
+        Err(payload) => {
+            // Contained: the handle learns what happened, the slot
+            // retires, and the ring keeps serving every other
+            // connection. The payload reaches the awaiter rather than
+            // the loop, so a task's own bug cannot take down requests
+            // that have nothing to do with it.
+            if let Some(sink) = entry.on_panic.take() {
+                sink(payload);
+            }
+            drop(entry);
+            fs.tasks.retire(idx);
+        }
     }
 }
 
@@ -735,10 +1004,12 @@ mod loom_tests {
         b.check(f);
     }
 
-    fn run_shared() -> Arc<RunShared> {
+    fn run_shared(off_loop: bool) -> Arc<RunShared> {
         Arc::new(RunShared {
             queue: Mutex::new(VecDeque::new()),
             ready: AtomicUsize::new(0),
+            draining: AtomicBool::new(false),
+            model_off_loop: off_loop,
             wake: Arc::new(LoopShared {
                 stop: AtomicBool::new(false),
                 graceful: AtomicBool::new(false),
@@ -756,9 +1027,16 @@ mod loom_tests {
     #[test]
     fn loom_a_task_wake_is_never_lost() {
         bounded_model(|| {
-            let run = run_shared();
+            // The **on-loop** branch: no pass is running, so the wake
+            // must poke for itself. Gate the poke on `off_loop()`
+            // alone and this model reports a deadlock - the loop
+            // parks on an eventfd nothing wrote.
+            let run = run_shared(false);
             let w = Arc::new(TaskWake {
-                id: pack_task(0, 0),
+                id: TaskId {
+                    idx: 0,
+                    generation: 0,
+                },
                 queued: AtomicBool::new(false),
                 run: Arc::clone(&run),
             });
@@ -789,6 +1067,151 @@ mod loom_tests {
         });
     }
 
+    /// An **off-loop** wake landing while a pass is running still
+    /// pokes: `wake_task`'s condition is `off_loop() || !draining`,
+    /// and the left arm is what covers a foreign thread whose wake
+    /// the running pass may already have passed by. Narrow the
+    /// condition to `!draining` alone and this model deadlocks - the
+    /// loop parks while the id sits in the queue.
+    ///
+    /// (The on-loop-inside-a-pass case is deliberately not modelled
+    /// here: on the loop thread the only wake source inside a pass is
+    /// a poll, which runs before the pass's leftover check, so it is
+    /// sequential and `a_self_waking_task_cannot_monopolise_a_drain_pass`
+    /// covers it. Modelling it as a second thread would assert an
+    /// interleaving the reactor cannot produce.)
+    #[test]
+    fn loom_an_off_loop_wake_during_a_pass_still_pokes() {
+        bounded_model(|| {
+            let run = run_shared(true);
+            let w = Arc::new(TaskWake {
+                id: TaskId {
+                    idx: 0,
+                    generation: 0,
+                },
+                queued: AtomicBool::new(false),
+                run: Arc::clone(&run),
+            });
+
+            // A pass is live for the whole race.
+            run.draining.store(true, Ordering::Release);
+            let t = {
+                let w = Arc::clone(&w);
+                loom::thread::spawn(move || wake_task(&w))
+            };
+
+            // The loop: park on the eventfd, then drain the queue.
+            let mut delivered = 0usize;
+            while delivered == 0 {
+                run.wake.wake.drain();
+                while let Some(_id) = run.take_ready() {
+                    poll_window(&w, || ());
+                    delivered += 1;
+                }
+            }
+            t.join().expect("waker thread");
+            assert_eq!(delivered, 1, "one wake, {delivered} deliveries");
+        });
+    }
+
+    /// Two threads racing one task's dedup edge: exactly one may
+    /// claim it, and the queue carries exactly one id for the edge
+    /// they raced over. The models above drive a single waker, so
+    /// `queued.swap`'s losing side is only ever taken by the loop's
+    /// own re-wake; two foreign wakers - a completion and an off-loop
+    /// hand-wake arriving together - is the shape that exercises it.
+    #[test]
+    fn loom_two_wakers_race_one_edge() {
+        bounded_model(|| {
+            let run = run_shared(true);
+            let w = Arc::new(TaskWake {
+                id: TaskId {
+                    idx: 0,
+                    generation: 0,
+                },
+                queued: AtomicBool::new(false),
+                run: Arc::clone(&run),
+            });
+
+            let hands: Vec<_> = (0..2)
+                .map(|_| {
+                    let w = Arc::clone(&w);
+                    loom::thread::spawn(move || wake_task(&w))
+                })
+                .collect();
+            let enqueued: usize = hands
+                .into_iter()
+                .map(|h| usize::from(h.join().expect("waker")))
+                .sum();
+            assert_eq!(enqueued, 1, "{enqueued} of 2 wakers claimed the edge");
+
+            run.wake.wake.drain();
+            let mut ids = 0usize;
+            while let Some(_id) = run.take_ready() {
+                poll_window(&w, || ());
+                ids += 1;
+            }
+            assert_eq!(ids, 1, "the queue held {ids} ids for one edge");
+        });
+    }
+
+    /// A pass that samples a budget of zero still leaves the id
+    /// reachable. `drain` reads `ready` once at entry and polls no
+    /// more than that, while `wake_task` pushes the id *before*
+    /// incrementing - so a pass can genuinely see zero with an id
+    /// already queued. That window is harmless because the increment
+    /// precedes the poke, so the loop the poke wakes reads a budget
+    /// that covers the id; the property worth holding is liveness,
+    /// not any instantaneous relation between counter and queue.
+    #[test]
+    fn loom_a_zero_budget_pass_still_delivers() {
+        bounded_model(|| {
+            let run = run_shared(true);
+            let w = Arc::new(TaskWake {
+                id: TaskId {
+                    idx: 0,
+                    generation: 0,
+                },
+                queued: AtomicBool::new(false),
+                run: Arc::clone(&run),
+            });
+
+            let t = {
+                let w = Arc::clone(&w);
+                loom::thread::spawn(move || wake_task(&w))
+            };
+
+            // `drain`'s shape: sample once, poll no more than that.
+            let mut polled = 0usize;
+            for _ in 0..run.ready.load(Ordering::Acquire) {
+                if run.take_ready().is_some() {
+                    poll_window(&w, || ());
+                    polled += 1;
+                }
+            }
+            if polled == 0 {
+                // Deliberately *before* the join: joining first would
+                // serialize the waker's whole epilogue and the
+                // ordering this guards would be unobservable. The loop
+                // parks on the poke, so what must hold is that the
+                // count is published before the poke that wakes a
+                // reader of it.
+                run.wake.wake.drain();
+                let budget = run.ready.load(Ordering::Acquire);
+                assert!(budget > 0, "a poke woke a pass with no budget");
+                let mut later = 0usize;
+                for _ in 0..budget {
+                    if run.take_ready().is_some() {
+                        poll_window(&w, || ());
+                        later += 1;
+                    }
+                }
+                assert_eq!(later, 1, "the id was not reachable after");
+            }
+            t.join().expect("waker thread");
+        });
+    }
+
     /// A wake landing around a poll window is never swallowed: if the
     /// waker's call was dedup-skipped, a poll of that task *starts*
     /// after it - which is all the waker contract asks. [`poll_window`]
@@ -798,9 +1221,12 @@ mod loom_tests {
     #[test]
     fn loom_a_wake_around_a_poll_window_is_covered() {
         bounded_model(|| {
-            let run = run_shared();
+            let run = run_shared(true);
             let w = Arc::new(TaskWake {
-                id: pack_task(0, 0),
+                id: TaskId {
+                    idx: 0,
+                    generation: 0,
+                },
                 queued: AtomicBool::new(false),
                 run: Arc::clone(&run),
             });
@@ -939,6 +1365,27 @@ mod tests {
         }
     }
 
+    /// Pending pokes on the wake eventfd, read without blocking. The
+    /// counter is consumed by the read, as the loop's armed READ does.
+    fn pending_pokes(run: &RunShared) -> u64 {
+        let mut buf: u64 = 0;
+        // SAFETY: an 8-byte read from the live eventfd into a `u64`;
+        // the fd is non-blocking, so an empty counter answers EAGAIN
+        // rather than parking the test.
+        let n = unsafe {
+            libc::read(
+                run.wake.wake.as_raw_fd(),
+                std::ptr::addr_of_mut!(buf).cast::<libc::c_void>(),
+                8,
+            )
+        };
+        if n == 8 { buf } else { 0 }
+    }
+
+    fn spec_dir() -> OpenHow {
+        OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY)
+    }
+
     fn creating() -> OpenHow {
         OpenHow::new()
             .flags(OFlag::O_CREAT | OFlag::O_RDWR)
@@ -1059,32 +1506,56 @@ mod tests {
         drive(&mut fs, &mut eng, &done, "overlapping opens");
     }
 
-    /// A submission the facade refuses (an absolute path) drops the
-    /// callback unfired; the future resolves `ECANCELED` with no CQE
-    /// ever arriving, instead of pending forever.
+    /// A refused submission resolves with the reason, not a blanket
+    /// `ECANCELED`: an argument the facade will never accept answers
+    /// `EINVAL`, and a full op table answers `EBUSY` - which a task
+    /// can retry. Both arrive with no CQE ever produced.
     #[test]
-    fn a_refused_submission_resolves_ecanceled() {
+    fn a_refusal_resolves_with_the_errno_it_was_refused_for() {
         let Some((mut eng, mut fs, who)) = rig() else {
             return;
         };
         let dir = crate::tempdir::tempdir().expect("tempdir");
         let anchor = Anchor::open(dir.path()).expect("anchor");
 
-        let mut conn = FsConn::new(&mut fs, &mut eng, None);
-        let fut = conn.fut(|c, cb| {
-            c.open(who, &anchor, c"/etc/hostname", creating(), cb)
-        });
-
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
-        let mut fut = std::pin::pin!(fut);
-        let Poll::Ready(done) = fut.as_mut().poll(&mut cx) else {
+
+        // An absolute path: refused by the facade, never submitted.
+        let mut conn = FsConn::new(&mut fs, &mut eng, None);
+        let bad = conn.fut(|c, cb| {
+            c.open(who, &anchor, c"/etc/hostname", creating(), cb)
+        });
+        let mut bad = std::pin::pin!(bad);
+        let Poll::Ready(done) = bad.as_mut().poll(&mut cx) else {
             panic!("a refused submission left its future pending");
         };
         assert!(
-            matches!(done.result(), Err(crate::Error::Errno(Errno::ECANCELED))),
-            "{:?}",
+            matches!(done.result(), Err(crate::Error::Errno(Errno::EINVAL))),
+            "want EINVAL, got {:?}",
             done.result()
+        );
+
+        // Fill the op table (8 slots), then one more: EBUSY.
+        let mut held = Vec::new();
+        for _ in 0..16 {
+            held.push(
+                conn.fut(|c, cb| c.open(who, &anchor, c".", spec_dir(), cb)),
+            );
+        }
+        let busy = held
+            .into_iter()
+            .filter_map(|f| {
+                let mut f = std::pin::pin!(f);
+                match f.as_mut().poll(&mut cx) {
+                    Poll::Ready(d) => Some(d.result()),
+                    Poll::Pending => None,
+                }
+            })
+            .find(|r| matches!(r, Err(crate::Error::Errno(Errno::EBUSY))));
+        assert!(
+            busy.is_some(),
+            "a full op table must answer EBUSY, not ECANCELED"
         );
     }
 
@@ -1214,7 +1685,10 @@ mod tests {
         // The parked task's waker id names (slot 0, generation 1).
         // Rebuild a *stale* waker for generation 0 and fire it.
         let stale = std::sync::Arc::new(TaskWake {
-            id: pack_task(0, 0),
+            id: TaskId {
+                idx: 0,
+                generation: 0,
+            },
             queued: AtomicBool::new(false),
             run: Arc::clone(fs.tasks.run.as_ref().expect("run queue")),
         });
@@ -1258,6 +1732,134 @@ mod tests {
     fn task_fs_outside_a_poll_debug_asserts() {
         let t = TaskFs::new();
         drop(t.fut(|_c, _cb| {}));
+    }
+
+    /// The live gauge an embedding host's drain reads: a spawned task
+    /// counts until it retires, so a drain that consults it cannot
+    /// stop the loop with task work outstanding. A task pending with
+    /// no op in flight is invisible to a connection count, which is
+    /// the case this exists for.
+    #[test]
+    fn the_task_gauge_tracks_live_tasks() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        let gauge = fs.task_gauge();
+        assert_eq!(gauge.get(), 0, "idle");
+
+        struct Park;
+        impl Future for Park {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            // Pending forever, with nothing in flight: exactly the
+            // shape a connection count cannot see.
+            conn.spawn(|_t| Park);
+            assert_eq!(gauge.get(), 1, "a parked task is live");
+            // And one that finishes immediately does not linger.
+            conn.spawn(|_t| async {});
+        }
+        assert_eq!(gauge.get(), 1, "the finished task retired");
+    }
+
+    /// A panicking task is contained: the caller that spawned it keeps
+    /// running, the slot retires, and the payload reaches the handle.
+    /// An unwind escaping here would take the reactor thread and every
+    /// connection on it.
+    #[test]
+    fn a_panicking_task_is_contained_and_reported() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+
+        struct Boom;
+        impl Future for Boom {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                panic!("task panic");
+            }
+        }
+
+        // The default hook would print this one; it is expected.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let handle = {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(|_t| Boom)
+        };
+        std::panic::set_hook(prev);
+
+        assert_eq!(
+            fs.tasks.free.len(),
+            fs.tasks.slots.len(),
+            "the panicking task stranded its slot"
+        );
+
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut handle = std::pin::pin!(handle);
+        let Poll::Ready(Err(JoinError::Panic(payload))) =
+            handle.as_mut().poll(&mut cx)
+        else {
+            panic!("the handle did not report the panic");
+        };
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"task panic"),
+            "the payload did not survive"
+        );
+    }
+
+    /// The other two misuse guards, release halves: reaching
+    /// `offload_fut` or `spawn` outside a poll cannot submit, so each
+    /// resolves rather than pends. `CLAUDE.md` wants a test per half
+    /// of a `debug_assert` + `if` pair; the debug halves are below.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn the_other_task_fs_guards_resolve_outside_a_poll() {
+        let t = TaskFs::new();
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let mut off =
+            std::pin::pin!(t.offload_fut(|| Ok::<_, crate::Error>(1)));
+        assert!(
+            matches!(
+                off.as_mut().poll(&mut cx),
+                Poll::Ready(Err(crate::Error::Errno(Errno::ECANCELED)))
+            ),
+            "offload_fut outside a poll must resolve, not pend"
+        );
+
+        let mut join = std::pin::pin!(t.spawn(|_t| async { 7u8 }));
+        assert!(
+            matches!(
+                join.as_mut().poll(&mut cx),
+                Poll::Ready(Err(JoinError::Dropped))
+            ),
+            "a spawn that never ran must resolve its join"
+        );
+    }
+
+    /// The debug halves of the same two guards.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "TaskFs::offload_fut outside a task poll")]
+    fn task_fs_offload_outside_a_poll_debug_asserts() {
+        drop(TaskFs::new().offload_fut(|| Ok::<_, crate::Error>(1)));
+    }
+
+    /// And `spawn`'s.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "TaskFs::spawn outside a task poll")]
+    fn task_fs_spawn_outside_a_poll_debug_asserts() {
+        drop(TaskFs::new().spawn(|_t| async {}));
     }
 
     /// `run_woken` drains a task woken by hand from a callback-side
@@ -1350,6 +1952,222 @@ mod tests {
         assert_eq!(polls.get(), 3, "one poll per pass, again");
     }
 
+    // ---- the scoped-pointer protocol, without a ring ----------------
+    //
+    // Every test that reaches `with_current`/`with_conn` through an
+    // `FsConn` builds a real io_uring, and Miri aborts on
+    // `io_uring_setup` rather than taking the skip path - so these
+    // drive the same `park_in`/`reach_in` with a plain type, which is
+    // what lets Miri validate the module's only `unsafe`.
+
+    std::thread_local! {
+        static PROBE: Cell<Option<NonNull<u32>>> = const { Cell::new(None) };
+    }
+
+    /// The parked value is reachable inside the extent and nowhere
+    /// else, and a reach hands out a usable `&mut`.
+    #[test]
+    fn a_parked_pointer_is_reachable_only_inside_its_extent() {
+        assert!(reach_in(&PROBE, |_: &mut u32| ()).is_none(), "before");
+        let mut v = 7u32;
+        park_in(&PROBE, NonNull::from(&mut v), || {
+            let doubled = reach_in(&PROBE, |p: &mut u32| {
+                *p *= 2;
+                *p
+            });
+            assert_eq!(doubled, Some(14));
+        });
+        assert!(reach_in(&PROBE, |_: &mut u32| ()).is_none(), "after");
+        assert_eq!(v, 14, "the reach wrote through to the parked value");
+    }
+
+    /// A reach nested inside a reach finds an empty cell: the pointer
+    /// is *taken* for the call, so no second live `&mut` to the same
+    /// value can be derived. This is the aliasing claim the module's
+    /// SAFETY comment rests on.
+    #[test]
+    fn a_nested_reach_cannot_alias_the_outer_borrow() {
+        let mut v = 1u32;
+        park_in(&PROBE, NonNull::from(&mut v), || {
+            let inner = reach_in(&PROBE, |outer: &mut u32| {
+                *outer += 1;
+                let nested = reach_in(&PROBE, |_: &mut u32| ());
+                // Still holding `outer` here: the nested reach must
+                // have found nothing.
+                *outer += 1;
+                nested
+            });
+            assert_eq!(inner, Some(None), "a nested reach aliased");
+        });
+        assert_eq!(v, 3);
+    }
+
+    /// Both halves restore the cell when their closure unwinds - a
+    /// panicking task unwinds through the host loop, and a cell left
+    /// naming a dead frame is a dangling pointer for the next poll.
+    #[test]
+    fn an_unwind_restores_the_cell() {
+        let mut v = 5u32;
+        let caught =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                park_in(&PROBE, NonNull::from(&mut v), || {
+                    reach_in(&PROBE, |_: &mut u32| panic!("boom"));
+                });
+            }));
+        assert!(caught.is_err(), "the panic must propagate");
+        assert!(
+            reach_in(&PROBE, |_: &mut u32| ()).is_none(),
+            "the cell still names a frame that is gone"
+        );
+    }
+
+    /// Parks nest: an inner park shadows the outer and the outer is
+    /// restored on the way out, so a task spawned from inside a poll
+    /// does not strand its parent's facade.
+    #[test]
+    fn parks_nest_and_restore_in_order() {
+        let (mut outer, mut inner) = (1u32, 2u32);
+        park_in(&PROBE, NonNull::from(&mut outer), || {
+            park_in(&PROBE, NonNull::from(&mut inner), || {
+                assert_eq!(reach_in(&PROBE, |p: &mut u32| *p), Some(2));
+            });
+            assert_eq!(reach_in(&PROBE, |p: &mut u32| *p), Some(1));
+        });
+    }
+
+    /// The eager idiom the contract advertises: ops submitted while
+    /// the body is being *assembled*, outside the async block, must
+    /// reach the ring like any other. They did not before - `body`
+    /// ran before any facade was parked, so each one resolved
+    /// `ECANCELED` for an op that was never submitted, which reads to
+    /// a task as "the connection went away".
+    #[test]
+    fn a_body_may_submit_while_it_is_being_assembled() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let anchor = Anchor::open(dir.path()).expect("anchor");
+        std::fs::write(dir.path().join("eager"), b"x").expect("seed");
+        let done = Rc::new(StdCell::new(false));
+
+        {
+            let done = Rc::clone(&done);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |t| {
+                // Submitted here, before the async block exists.
+                let opened = t.fut(|c, cb| {
+                    c.open(
+                        who,
+                        &anchor,
+                        c"eager",
+                        OpenHow::new().flags(OFlag::O_RDONLY),
+                        cb,
+                    )
+                });
+                async move {
+                    let res = opened.await;
+                    assert!(
+                        res.file().is_some(),
+                        "an op submitted while assembling the body did \
+                         not reach the ring: {:?}",
+                        res.result()
+                    );
+                    done.set(true);
+                }
+            });
+        }
+        drive(&mut fs, &mut eng, &done, "eager submit from the body");
+    }
+
+    /// A wake from an inline `spawn` poll - on the loop thread, with
+    /// no drain pass running to collect it - pokes the loop. Without
+    /// it the id sits queued while the host parks on a ring that has
+    /// no reason to complete, and `queued` then latches so even a
+    /// later off-loop wake is deduped away.
+    #[test]
+    fn an_on_loop_wake_outside_a_pass_pokes_the_loop() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+
+        struct WakeOnce {
+            polls: Rc<StdCell<u32>>,
+        }
+        impl Future for WakeOnce {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                self.polls.set(self.polls.get() + 1);
+                if self.polls.get() == 1 {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Poll::Ready(())
+            }
+        }
+
+        let polls = Rc::new(StdCell::new(0));
+        {
+            let polls = Rc::clone(&polls);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |_t| WakeOnce { polls });
+        }
+        let run = Arc::clone(fs.tasks.run.as_ref().expect("run queue"));
+        assert_eq!(run.ready.load(Ordering::Acquire), 1, "queued");
+        assert!(
+            pending_pokes(&run) > 0,
+            "nothing poked: the loop will park and never schedule it"
+        );
+    }
+
+    /// A re-entrant drain - `run_woken` from inside a poll - must not
+    /// consume the running task's own queued wake. The poll cleared
+    /// the dedup edge before running, so that id is the only record;
+    /// eat it and the task is never scheduled again.
+    #[test]
+    fn a_reentrant_drain_does_not_eat_the_running_tasks_wake() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+
+        struct WakeThenReenter {
+            polls: Rc<StdCell<u32>>,
+        }
+        impl Future for WakeThenReenter {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                self.polls.set(self.polls.get() + 1);
+                if self.polls.get() == 1 {
+                    cx.waker().wake_by_ref();
+                    // The documented hand-wake shape: re-enter the
+                    // executor from inside the poll.
+                    with_conn(|c| c.run_woken());
+                    return Poll::Pending;
+                }
+                Poll::Ready(())
+            }
+        }
+
+        let polls = Rc::new(StdCell::new(0));
+        {
+            let polls = Rc::clone(&polls);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |_t| WakeThenReenter { polls });
+        }
+        assert_eq!(polls.get(), 1, "the spawn poll");
+        FsConn::new(&mut fs, &mut eng, None).run_woken();
+        assert_eq!(
+            polls.get(),
+            2,
+            "the re-entrant drain consumed the task's own wake"
+        );
+        assert_eq!(
+            fs.tasks.free.len(),
+            fs.tasks.slots.len(),
+            "the task did not run to completion"
+        );
+    }
+
     /// A task awaits its child's output through the handle. The
     /// parent's resume rides the leftover poke: the child's completion
     /// wakes the parent after the pass's budget was taken, so without
@@ -1369,7 +2187,7 @@ mod tests {
                 let child = t.spawn(|t2| async move {
                     t2.offload_fut(|| Ok(40 + 2)).await.expect("child offload")
                 });
-                assert_eq!(child.await, Some(42));
+                assert_eq!(child.await.expect("child joined"), 42);
                 done.set(true);
             });
         }
@@ -1425,9 +2243,11 @@ mod tests {
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         let mut handle = std::pin::pin!(handle);
-        assert_eq!(
-            handle.as_mut().poll(&mut cx),
-            Poll::Ready(None),
+        assert!(
+            matches!(
+                handle.as_mut().poll(&mut cx),
+                Poll::Ready(Err(JoinError::Dropped))
+            ),
             "teardown must resolve the join, not strand it"
         );
     }

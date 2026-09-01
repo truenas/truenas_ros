@@ -829,6 +829,11 @@ where
         });
         let mut core =
             Reactor::from_parts(engine, cfg.pool_size, cfg.to_core(), pads);
+        // The drain waits on tasks too; see `maybe_finish_drain`.
+        #[cfg(feature = "uring-fs")]
+        if let Some(fs) = fs.as_ref() {
+            core.pending_tasks = fs.task_gauge();
+        }
         // One group to start: the pool grows under pressure, so sizing it
         // for a burst that may not come would just be memory held idle.
         //

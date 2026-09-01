@@ -237,7 +237,9 @@ pub use core::{
 // futures, and on-loop tasks. A consumer, not a second submission path -
 // every op it submits goes through `FsConn`'s methods above.
 pub(crate) mod task;
-pub use task::{FsFuture, JoinHandle, OffloadFuture, OnDone, TaskFs};
+pub use task::{
+    FsFuture, JoinError, JoinHandle, OffloadFuture, OnDone, TaskFs,
+};
 
 pub mod query_dir;
 pub use query_dir::{

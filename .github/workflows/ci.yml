@@ -135,7 +135,7 @@ jobs:
     # add one.
     - name: loom (concurrency models)
       run: |
-        MODELS=18
+        MODELS=23
         out=$(RUSTFLAGS="--cfg loom" cargo test --lib --all-features loom_ 2>&1)
         echo "$out"
         n=$(printf '%s' "$out" |

@@ -110,6 +110,18 @@ pub(crate) const TAG_CANCEL: u8 = 0x9E;
 /// which closes the connection - so a submission failure needs no error path.
 pub(crate) type EmbeddedCb = Box<dyn FnOnce(FsDone, &mut FsConn<'_>)>;
 
+/// Where an op that never reached the ring reports *why*.
+///
+/// A submission refusal and a teardown both drop the callback
+/// unfired, which is the callback contract; firing one inline from a
+/// submit path would deliver a completion during a submission, and
+/// nothing here does that. A sink is not a callback: it runs no
+/// consumer continuation and submits nothing, it only hands the errno
+/// to a waiting future, so the distinction the callback form cannot
+/// make (`EBUSY` retry, `EINVAL` caller bug, teardown stop) survives
+/// for the consumers that can act on it.
+pub(crate) type FailSink = Box<dyn FnOnce(Errno)>;
+
 /// An opaque per-op **owner** tag: the embedding host's connection identity
 /// `(slot, generation)`, threaded through so a chained callback runs under the
 /// same connection. The core never interprets it (files close by `Arc`-drop
@@ -125,6 +137,9 @@ pub(crate) enum FsWaiter {
     Embedded {
         owner: Owner,
         cb: EmbeddedCb,
+        /// Set only by the futures layer; `None` for a plain callback,
+        /// whose contract is that a drop closes the connection.
+        on_fail: Option<FailSink>,
     },
     /// A reactor-pump read (a `net` server streaming a file into a response
     /// body): no callback - [`FsCore::on_cqe`] hands the outcome back as
@@ -153,13 +168,14 @@ pub(crate) enum ReapedFs {
 /// Box a consumer callback as an owner-stamped embedded waiter - the one shape
 /// every [`FsConn`] submit method hands the core.
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
-fn embed<F>(owner: Owner, on_done: F) -> FsWaiter
+fn embed<F>(owner: Owner, on_fail: Option<FailSink>, on_done: F) -> FsWaiter
 where
     F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
 {
     FsWaiter::Embedded {
         owner,
         cb: Box::new(on_done),
+        on_fail,
     }
 }
 
@@ -412,6 +428,15 @@ impl FsCore {
             priv_xattrs: PrivilegedXattrs::default(),
             tasks: super::task::Tasks::new(),
         }
+    }
+
+    /// A handle on this reactor's live-task count, for an embedding
+    /// host whose graceful drain must wait for tasks as well as
+    /// connections. Unused by the standalone host, which stops when
+    /// nothing is in flight.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    pub(crate) fn task_gauge(&self) -> std::rc::Rc<std::cell::Cell<usize>> {
+        self.tasks.gauge()
     }
 
     /// Install the ambient-credential xattr policy. Setup-time only: the hosts
@@ -1401,7 +1426,7 @@ impl FsCore {
                 let _ = tx.send(FsOutcome::new(result, bufs, file, stat));
                 ReapedFs::None
             }
-            Some(FsWaiter::Embedded { owner, cb }) => ReapedFs::Embedded(
+            Some(FsWaiter::Embedded { owner, cb, .. }) => ReapedFs::Embedded(
                 cb,
                 FsDone {
                     result,
@@ -1645,6 +1670,15 @@ impl FsDone {
 /// ring only through this facade. A submission or argument-validation failure
 /// drops `on_done` (and the continuation it captured, closing the connection),
 /// so these methods return `()`.
+///
+/// **No method here may return data borrowed from `'a`.** The task layer
+/// parks a facade in a thread-local as `FsConn<'static>` and hands it back
+/// as `&mut FsConn<'_>` (`task::reach_in`); `&mut U` is
+/// invariant in `U`, so that closure can be instantiated at
+/// `&mut FsConn<'static>`. Nothing escapes today only because every method
+/// returns owned values or borrows of `&self` - add one
+/// `fn x(&self) -> &'a T` and a caller could extend a borrow of the ring's
+/// tables past the poll that parked them, with no diagnostic anywhere.
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 pub struct FsConn<'a> {
     fs: &'a mut FsCore,
@@ -1662,6 +1696,11 @@ pub struct FsConn<'a> {
     /// outstanding writes and nothing else.
     #[cfg(feature = "net-server")]
     lease_hold: Option<std::sync::Weak<LeaseHold>>,
+    /// Staged by [`FsConn::fut`] for the one submission it is about to
+    /// make, and taken by that submission's `embed`. `None` for every
+    /// callback caller, which is what keeps their drop-on-refusal
+    /// contract exactly as it was.
+    fail_sink: Option<FailSink>,
 }
 
 /// A view of the delivering connection's recv-pool claim, offered to the
@@ -1706,7 +1745,20 @@ impl<'a> FsConn<'a> {
             lease: None,
             #[cfg(feature = "net-server")]
             lease_hold: None,
+            fail_sink: None,
         }
+    }
+
+    /// Stage the reason-sink the next submission's `embed` will take.
+    /// Exactly one submission follows, inside [`FsConn::fut`].
+    pub(crate) fn stage_fail_sink(&mut self, sink: FailSink) {
+        self.fail_sink = Some(sink);
+    }
+
+    /// Take back a sink no submission consumed - the facade refused
+    /// the arguments before the op reached the core.
+    pub(crate) fn take_fail_sink(&mut self) -> Option<FailSink> {
+        self.fail_sink.take()
     }
 
     /// The facade's parts, reborrowed - what the task layer
@@ -1731,6 +1783,7 @@ impl<'a> FsConn<'a> {
             lease: self.lease.take(),
             #[cfg(feature = "net-server")]
             lease_hold: self.lease_hold.take(),
+            fail_sink: self.fail_sink.take(),
         }
     }
 
@@ -1790,7 +1843,7 @@ impl<'a> FsConn<'a> {
             path.to_owned(),
             raw,
             guarded,
-            embed(self.owner, on_done),
+            embed(self.owner, self.fail_sink.take(), on_done),
         );
     }
 
@@ -1986,7 +2039,7 @@ impl<'a> FsConn<'a> {
             path,
             how,
             false,
-            embed(self.owner, on_done),
+            embed(self.owner, self.fail_sink.take(), on_done),
         );
     }
 
@@ -2122,7 +2175,7 @@ impl<'a> FsConn<'a> {
                 None => Some(std::sync::Arc::new(LeaseHold(bid))),
             });
             if let (Some((_, taken)), Some(hold)) = (leased, hold) {
-                let w = embed(self.owner, on_done);
+                let w = embed(self.owner, self.fail_sink.take(), on_done);
                 match self.fs.submit_pwritev2_leased(
                     self.eng,
                     who.0,
@@ -2173,7 +2226,7 @@ impl<'a> FsConn<'a> {
             false,
             0,
             0,
-            embed(self.owner, on_done),
+            embed(self.owner, self.fail_sink.take(), on_done),
         );
     }
 
@@ -2189,7 +2242,7 @@ impl<'a> FsConn<'a> {
             true,
             0,
             0,
-            embed(self.owner, on_done),
+            embed(self.owner, self.fail_sink.take(), on_done),
         );
     }
 
@@ -2214,7 +2267,7 @@ impl<'a> FsConn<'a> {
             datasync,
             offset,
             length,
-            embed(self.owner, on_done),
+            embed(self.owner, self.fail_sink.take(), on_done),
         );
     }
 
@@ -2241,7 +2294,7 @@ impl<'a> FsConn<'a> {
             None,
             statx_at_flags(flags),
             mask.bits(),
-            embed(self.owner, on_done),
+            embed(self.owner, self.fail_sink.take(), on_done),
         );
     }
 
@@ -2266,7 +2319,7 @@ impl<'a> FsConn<'a> {
             None,
             statx_at_flags(flags | AtFlags::AT_EMPTY_PATH),
             mask.bits(),
-            embed(self.owner, on_done),
+            embed(self.owner, self.fail_sink.take(), on_done),
         );
     }
 
@@ -2331,7 +2384,7 @@ impl<'a> FsConn<'a> {
             f.fd,
             name.to_owned(),
             buf,
-            embed(self.owner, on_done),
+            embed(self.owner, self.fail_sink.take(), on_done),
         );
     }
 
@@ -2605,7 +2658,7 @@ impl<'a> FsConn<'a> {
             Some(leaf.to_cstring()),
             0,
             0,
-            embed(self.owner, on_done),
+            embed(self.owner, self.fail_sink.take(), on_done),
         );
     }
 
@@ -2657,7 +2710,7 @@ impl<'a> FsConn<'a> {
             f.fd,
             new.clone(),
             new_leaf.to_cstring(),
-            embed(self.owner, on_done),
+            embed(self.owner, self.fail_sink.take(), on_done),
         );
     }
 
@@ -2691,7 +2744,7 @@ impl<'a> FsConn<'a> {
             bufs,
             off,
             rw_flags.bits(),
-            embed(self.owner, on_done),
+            embed(self.owner, self.fail_sink.take(), on_done),
         );
     }
 
@@ -2720,7 +2773,7 @@ impl<'a> FsConn<'a> {
             off,
             len64,
             aux32,
-            embed(self.owner, on_done),
+            embed(self.owner, self.fail_sink.take(), on_done),
         );
     }
 
@@ -2749,7 +2802,7 @@ impl<'a> FsConn<'a> {
             n2,
             flags,
             len_arg,
-            embed(self.owner, on_done),
+            embed(self.owner, self.fail_sink.take(), on_done),
         );
     }
 }
@@ -3482,21 +3535,20 @@ mod hybrid_tests {
                 let (tag, slot, g) = unpack_raw(cqe.user_data);
                 if tag == TAG_WAKE {
                     eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm");
-                    for (o, deliver, any) in fs.take_pool_completions() {
-                        let mut c = FsConn::new(fs, eng, o);
-                        deliver(any, &mut c);
-                    }
+                    // The real delivery functions, not a copy of their
+                    // bodies: a copy silently misses whatever they
+                    // grow - it missed task draining entirely, so a
+                    // task spawned in a test here was polled once and
+                    // then waited on a loop that would never poll it
+                    // again, hanging instead of failing.
+                    deliver_pool_completions(fs, eng);
                     continue;
                 }
                 if tag == TAG_CANCEL || tag & TAG_FS_DOMAIN == 0 {
                     continue;
                 }
-                if let ReapedFs::Embedded(cb, d, o) =
-                    fs.on_cqe(eng, tag, slot, g, cqe.res)
-                {
-                    let mut c = FsConn::new(fs, eng, o);
-                    cb(d, &mut c);
-                }
+                let reaped = fs.on_cqe(eng, tag, slot, g, cqe.res);
+                deliver_embedded(fs, eng, reaped);
             }
         }
     }
@@ -4121,7 +4173,13 @@ fn deliver(
         // Submission failure / teardown of an embedded op: drop the callback
         // unfired - dropping the continuation it captured closes the
         // connection (see [`EmbeddedCb`]). Nothing else routes it.
-        Some(FsWaiter::Embedded { cb, .. }) => {
+        Some(FsWaiter::Embedded { cb, on_fail, .. }) => {
+            // The reason first, then the callback goes unfired as its
+            // contract says. The sink only fills a slot - no consumer
+            // code runs here, so this is not an inline delivery.
+            if let (Some(sink), Err(errno)) = (on_fail, res) {
+                sink(errno);
+            }
             drop(cb);
             drop((bufs, file, stat));
         }
@@ -4466,7 +4524,7 @@ mod routing_fuzz {
                 off,
                 0,
                 std::sync::Arc::clone(&hold),
-                embed(Some((0, 0)), |_d, _fs| {}),
+                embed(Some((0, 0)), None, |_d, _fs| {}),
             );
             assert!(staged.is_ok(), "staged");
         }
