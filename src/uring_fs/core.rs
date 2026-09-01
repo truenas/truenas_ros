@@ -113,17 +113,32 @@ pub(crate) const TAG_CANCEL: u8 = 0x9E;
 /// which closes the connection - so a submission failure needs no error path.
 pub(crate) type EmbeddedCb = Box<dyn FnOnce(FsDone, &mut FsConn<'_>)>;
 
-/// Where an op that never reached the ring reports *why*.
+/// Where an op that never reached the ring reports *why*, and hands
+/// back what it was given.
 ///
 /// A submission refusal and a teardown both drop the callback
 /// unfired, which is the callback contract; firing one inline from a
 /// submit path would deliver a completion during a submission, and
 /// nothing here does that. A sink is not a callback: it runs no
-/// consumer continuation and submits nothing, it only hands the errno
-/// to a waiting future, so the distinction the callback form cannot
-/// make (`EBUSY` retry, `EINVAL` caller bug, teardown stop) survives
-/// for the consumers that can act on it.
-pub(crate) type FailSink = Box<dyn FnOnce(Errno)>;
+/// consumer continuation and submits nothing, it only fills a slot, so
+/// the distinction the callback form cannot make (`EBUSY` retry,
+/// `EINVAL` caller bug, teardown stop) survives for the consumers that
+/// can act on it.
+///
+/// **It carries the payload too.** `EBUSY` from a full op table is the
+/// one refusal worth retrying, and a write whose buffers were dropped
+/// on the way out cannot be retried by anyone - the caller would have
+/// to keep a second copy of every payload against a failure the API
+/// tells it is transient. [`FsDone::into_bufs`] hands them back on this
+/// path exactly as it does on a completion.
+///
+/// **`Rc`, and cloned rather than taken.** A multi-step call ([`chain`],
+/// [`walk`]) submits from a fresh facade at every step after the first,
+/// so a sink one submission consumed would leave every later step
+/// reporting teardown for a refusal the caller is told to retry. The
+/// steps share one sink; the slot's "a real answer is final" precedence
+/// is what makes more than one filler safe.
+pub(crate) type FailSink = Rc<dyn Fn(Errno, Vec<Vec<u8>>)>;
 
 /// An opaque per-op **owner** tag: the embedding host's connection identity
 /// `(slot, generation)`, threaded through so a chained callback runs under the
@@ -171,22 +186,42 @@ pub(crate) enum ReapedFs {
 /// Box a consumer callback as an owner-stamped embedded waiter - the one shape
 /// every [`FsConn`] submit method hands the core.
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
-fn embed<F>(owner: Owner, on_fail: Option<FailSink>, on_done: F) -> FsWaiter
+fn embed<F>(owner: Owner, armed: Armed, on_done: F) -> FsWaiter
 where
     F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
 {
     FsWaiter::Embedded {
         owner,
         cb: Box::new(on_done),
-        on_fail,
+        on_fail: armed.0,
     }
 }
+
+/// One submission's share of the staged reason sink - and the proof
+/// that a submission took one.
+///
+/// **Only [`FsConn::arm_fail_sink`] makes one**, and that is the whole
+/// point of the type. [`FsConn::fut`] tells "the op is in flight and
+/// will report for itself" from "the facade refused the arguments and
+/// nothing ever will" by whether any submission armed the sink, so a
+/// submit method that reaches the core without arming makes `fut`
+/// answer a perfectly good op with a spurious `EINVAL`. Passing
+/// `embed` a bare `Option<FailSink>` let exactly that compile: a method
+/// written against the older signature took `self.fail_sink.take()`,
+/// which type-checks, submits, and arms nothing. This makes the same
+/// mistake a build failure.
+///
+/// The field is private rather than the type opaque, so a test in a
+/// descendant module can still build an unarmed one directly; a
+/// constructor for that would be dead code wherever the test using it
+/// is gated out.
+pub(crate) struct Armed(Option<FailSink>);
 
 /// Report an early submission failure - the SQE never staged (slot exhaustion,
 /// an unusable file) - handing the caller's payloads back exactly as a
 /// completion would (see [`deliver`]).
 fn fail(waiter: FsWaiter, err: Errno, bufs: Vec<Vec<u8>>) {
-    deliver(Some(waiter), Err(err), bufs, None, None);
+    deliver(Some(waiter), Err(err), bufs, None, None, true);
 }
 
 /// `fremovexattr(2)` on `f`. Blocking, because io_uring has no opcode for it:
@@ -1353,6 +1388,18 @@ impl FsCore {
     /// teardown). Cancelling - not force-dropping the entry - is required: the
     /// kernel op may still touch the fd or a buffer, so the entry must live
     /// until its (now-`ECANCELED`) CQE reaps it.
+    ///
+    /// **This runs once per close, and it is not a liveness gate.** A
+    /// continuation of a cancelled op runs after the sweep, with the same
+    /// stamped owner, and whatever it submits then is not swept again -
+    /// which is the same "an owner gone mid-chain" a continuation must
+    /// already tolerate. What bounds it is that such an op *completes*:
+    /// every submission path here either reaches the kernel and answers,
+    /// or is refused at submit. The one shape that could answer neither
+    /// was an unguarded open of a special file, and `chain` guards its
+    /// last step for exactly that reason. Adding a second sweep instead
+    /// would be unbounded - a continuation that resubmits on `ECANCELED`
+    /// keeps giving it something to find.
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     pub(crate) fn cancel_owned_by(
         &mut self,
@@ -1486,6 +1533,7 @@ impl FsCore {
                 cb,
                 FsDone {
                     result,
+                    refused: false,
                     bufs,
                     file: file.map(File::new),
                     stat,
@@ -1497,6 +1545,7 @@ impl FsCore {
             Some(FsWaiter::Pump { owner }) => ReapedFs::Pump(
                 FsDone {
                     result,
+                    refused: false,
                     bufs,
                     file: file.map(File::new),
                     stat,
@@ -1563,7 +1612,9 @@ impl FsCore {
         } else {
             None
         };
-        deliver(waiter, res, bufs, file, stat);
+        // Teardown, not a refusal: the loop is dying, so nothing here is
+        // worth retrying and `ECANCELED` is the honest answer.
+        deliver(waiter, res, bufs, file, stat, false);
     }
 
     /// Leak the op table without dropping it - used ONLY when a teardown
@@ -1628,7 +1679,7 @@ impl FsCore {
         e.clear();
         entry.generation += 1;
         self.op_free.push(op_slot);
-        deliver(waiter, Err(err), bufs, None, None);
+        deliver(waiter, Err(err), bufs, None, None, true);
     }
 }
 
@@ -1647,6 +1698,10 @@ pub(crate) enum PumpDest {
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 pub struct FsDone {
     result: Result<i32, Errno>,
+    /// Whether this outcome is the facade's or the core's refusal to
+    /// submit rather than something the kernel answered. See
+    /// [`FsDone::was_refused`].
+    refused: bool,
     bufs: Vec<Vec<u8>>,
     file: Option<File>,
     stat: Option<Box<StatxRaw>>,
@@ -1672,7 +1727,22 @@ impl FsDone {
     pub(crate) fn failed(err: Errno) -> FsDone {
         FsDone {
             result: Err(err),
+            refused: false,
             bufs: Vec::new(),
+            file: None,
+            stat: None,
+            #[cfg(feature = "net-server")]
+            recv_lease: None,
+        }
+    }
+
+    /// A submission the facade or the core refused, with the payload it
+    /// was handed back - see [`FailSink`] and [`FsDone::was_refused`].
+    pub(crate) fn refused_with(err: Errno, bufs: Vec<Vec<u8>>) -> FsDone {
+        FsDone {
+            result: Err(err),
+            refused: true,
+            bufs,
             file: None,
             stat: None,
             #[cfg(feature = "net-server")]
@@ -1711,6 +1781,24 @@ impl FsDone {
         self.bufs
     }
 
+    /// Whether this errno is **this crate's**, not the kernel's: the op
+    /// never reached the ring, because the facade refused the arguments
+    /// (`EINVAL`) or the op table was full (`EBUSY`).
+    ///
+    /// Read it before acting on an errno, because the two vocabularies
+    /// overlap and the actions do not. `EBUSY` here is the documented
+    /// fan-out failure, worth retrying with the payload
+    /// [`FsDone::into_bufs`] hands back; `EBUSY` from the kernel is
+    /// permanent for that path - `vfs_rmdir` answers it for a directory
+    /// that is a mountpoint (`is_local_mountpoint`, `fs/namei.c`), and a
+    /// nested dataset is exactly that under its parent, so a retry loop
+    /// that cannot tell the two apart spins forever on the thread that
+    /// serves every other connection. `ECANCELED` with this `false` is
+    /// teardown.
+    pub fn was_refused(&self) -> bool {
+        self.refused
+    }
+
     /// The `statx` metadata - present only for a successful `statx`.
     pub fn stat(&self) -> Option<Statx> {
         self.stat.as_deref().copied().map(Statx::from_raw)
@@ -1729,12 +1817,22 @@ impl FsDone {
 ///
 /// **No method here may return data borrowed from `'a`.** The task layer
 /// parks a facade in a thread-local as `FsConn<'static>` and hands it back
-/// as `&mut FsConn<'_>` (`task::reach_in`); `&mut U` is
-/// invariant in `U`, so that closure can be instantiated at
-/// `&mut FsConn<'static>`. Nothing escapes today only because every method
-/// returns owned values or borrows of `&self` - add one
-/// `fn x(&self) -> &'a T` and a caller could extend a borrow of the ring's
-/// tables past the poll that parked them, with no diagnostic anywhere.
+/// as `&mut FsConn<'_>`; `&mut U` is invariant in `U`, so a closure taking
+/// the facade can be instantiated at `&mut FsConn<'static>`.
+///
+/// What keeps that from leaking is **`task::with_conn`'s signature**:
+/// `impl FnOnce(&mut FsConn<'_>) -> R` desugars higher-ranked, so `R`
+/// cannot name the facade's lifetime whatever the cell holds. It is not
+/// `task::reach_in`, which is generic over a `'static` `T` and quantifies
+/// nothing - reached directly at `T = FsConn<'static>` it will hand out
+/// `&'static` borrows of a facade that died with its poll. A second
+/// wrapper beside `with_conn` has to reproduce that bound, or it is
+/// unsound from safe code.
+///
+/// The rule here is the belt to that brace, and today it holds only
+/// because every method returns owned values or borrows of `&self` - add
+/// one `fn x(&self) -> &'a T` and a caller could extend a borrow of the
+/// ring's tables past the poll that parked them.
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 pub struct FsConn<'a> {
     fs: &'a mut FsCore,
@@ -1752,12 +1850,22 @@ pub struct FsConn<'a> {
     /// outstanding writes and nothing else.
     #[cfg(feature = "net-server")]
     lease_hold: Option<std::sync::Weak<LeaseHold>>,
-    /// Staged by [`FsConn::fut`] for the one submission it is about to
-    /// make, and taken by that submission's `embed`. `None` for every
-    /// callback caller, which is what keeps their drop-on-refusal
-    /// contract exactly as it was.
+    /// Staged by [`FsConn::fut`] for the submissions that follow it, and
+    /// *cloned* by each one's `embed` rather than taken - see
+    /// [`FailSink`]. `None` for every callback caller, which is what
+    /// keeps their drop-on-refusal contract exactly as it was.
     fail_sink: Option<FailSink>,
+    /// Whether a submission has taken a clone of `fail_sink` since it
+    /// was staged. [`FsConn::fut`] reads it to tell "the op is in flight
+    /// and reports for itself" from "`submit` returned without handing
+    /// the op to the core at all".
+    fail_armed: bool,
 }
+
+/// What [`FsConn::stage_fail_sink`] displaced, to be handed back to
+/// [`FsConn::restore_fail_sink`]. A `fut` nested inside another's
+/// `submit` closure must not swallow the outer's sink.
+pub(crate) struct StagedSink(Option<FailSink>, bool);
 
 /// A view of the delivering connection's recv-pool claim, offered to the
 /// handler's fs facade for the duration of one delivery.
@@ -1802,19 +1910,43 @@ impl<'a> FsConn<'a> {
             #[cfg(feature = "net-server")]
             lease_hold: None,
             fail_sink: None,
+            fail_armed: false,
         }
     }
 
-    /// Stage the reason-sink the next submission's `embed` will take.
-    /// Exactly one submission follows, inside [`FsConn::fut`].
-    pub(crate) fn stage_fail_sink(&mut self, sink: FailSink) {
-        self.fail_sink = Some(sink);
+    /// Stage the reason-sink every submission inside one [`FsConn::fut`]
+    /// takes a clone of, answering with what was staged before so the
+    /// caller can put it back.
+    pub(crate) fn stage_fail_sink(&mut self, sink: FailSink) -> StagedSink {
+        StagedSink(
+            self.fail_sink.replace(sink),
+            std::mem::replace(&mut self.fail_armed, false),
+        )
     }
 
-    /// Take back a sink no submission consumed - the facade refused
-    /// the arguments before the op reached the core.
-    pub(crate) fn take_fail_sink(&mut self) -> Option<FailSink> {
-        self.fail_sink.take()
+    /// Put back what [`FsConn::stage_fail_sink`] displaced, answering
+    /// whether any submission armed the sink being retired. `false`
+    /// means the facade refused the arguments before the op reached the
+    /// core, so nothing will ever report for it.
+    pub(crate) fn restore_fail_sink(&mut self, prev: StagedSink) -> bool {
+        self.fail_sink = prev.0;
+        std::mem::replace(&mut self.fail_armed, prev.1)
+    }
+
+    /// Carry a multi-step call's sink onto the fresh facade a later step
+    /// submits from (see [`FailSink`]). `chain` and `walk` are the only
+    /// callers, because they are the only multi-step calls whose later
+    /// steps reach the core themselves.
+    fn carry_fail_sink(&mut self, sink: Option<FailSink>) {
+        self.fail_sink = sink;
+    }
+
+    /// A clone of the staged sink for one submission, recording that a
+    /// submission took it.
+    fn arm_fail_sink(&mut self) -> Armed {
+        let sink = self.fail_sink.clone();
+        self.fail_armed |= sink.is_some();
+        Armed(sink)
     }
 
     /// The facade's parts, reborrowed - what the task layer
@@ -1839,7 +1971,10 @@ impl<'a> FsConn<'a> {
             lease: self.lease.take(),
             #[cfg(feature = "net-server")]
             lease_hold: self.lease_hold.take(),
-            fail_sink: self.fail_sink.take(),
+            // Cloned, not taken: both halves of a two-step dispatch
+            // submit, and both should report.
+            fail_sink: self.fail_sink.clone(),
+            fail_armed: false,
         }
     }
 
@@ -1860,10 +1995,15 @@ impl<'a> FsConn<'a> {
     /// `/` is refused); resolution defaults to the full [`CONFINED_RESOLVE`]
     /// set unless `how` states a confinement policy of its own, on the same
     /// rule the blocking [`FsHandle::open`](crate::uring_fs::FsHandle::open)
-    /// applies - a `resolve` carrying only hardening flags composes with the
-    /// default rather than replacing it. Only the request-handler facade may open (a
-    /// continuation's `open` is refused). An invalid argument drops `on_done`,
-    /// closing the connection.
+    /// applies - a `resolve` carrying only hardening flags composes with
+    /// the default rather than replacing it. An invalid argument drops
+    /// `on_done`, closing the connection.
+    ///
+    /// Every facade may open, a continuation's included. What that costs
+    /// is the file: a continuation runs for an owner that may already be
+    /// gone, and nothing sweeps a descriptor opened after its
+    /// connection closed until the reactor's tables go, so a chain that
+    /// opens must reach a step that closes.
     pub fn open<F>(
         &mut self,
         who: Personality,
@@ -1892,6 +2032,7 @@ impl<'a> FsConn<'a> {
         // client facade survives.
         super::confine_resolve(&mut raw.resolve);
         let guarded = super::apply_special_file_guard(&mut raw, special);
+        let sink = self.arm_fail_sink();
         self.fs.submit_open(
             self.eng,
             who.0,
@@ -1899,7 +2040,7 @@ impl<'a> FsConn<'a> {
             path.to_owned(),
             raw,
             guarded,
-            embed(self.owner, self.fail_sink.take(), on_done),
+            embed(self.owner, sink, on_done),
         );
     }
 
@@ -2007,12 +2148,24 @@ impl<'a> FsConn<'a> {
 
         let (start, want) = (anchor.clone(), path.to_owned());
         let on_done: WalkDone = Box::new(on_done);
-        self.open_component(who, start.clone(), want, raw, move |res, conn| {
-            if res.file().is_some() {
-                return on_done(res, conn);
-            }
-            walk(conn, who, start, parts, mode, raw, on_done);
-        });
+        // Every step after the probe submits from a fresh facade, which
+        // carries no sink of its own; see [`FailSink`].
+        let sink = self.fail_sink.clone();
+        // Every step this makes forces `O_DIRECTORY`, the answer
+        // included, so no step can reach a FIFO's own `open`.
+        self.open_component(
+            who,
+            start.clone(),
+            want,
+            raw,
+            false,
+            move |res, conn| {
+                if res.file().is_some() {
+                    return on_done(res, conn);
+                }
+                walk(conn, who, start, parts, mode, raw, on_done, sink);
+            },
+        );
     }
 
     /// Open each step relative to the file the step before it opened,
@@ -2066,7 +2219,8 @@ impl<'a> FsConn<'a> {
             }
         }
         let steps: VecDeque<OpenStep> = steps.into();
-        chain(self, anchor.clone(), steps, Box::new(on_done));
+        let sink = self.fail_sink.clone();
+        chain(self, anchor.clone(), steps, Box::new(on_done), sink);
     }
 
     /// One step of a walk, opened under its own personality.
@@ -2074,28 +2228,33 @@ impl<'a> FsConn<'a> {
     /// Stays private: every path this resolves is a single validated
     /// component of one the caller already named, confined, under the
     /// caller's own personality.
+    /// `guarded` says whether the caller added the special-file guard to
+    /// `how`, so the completion knows to strip `O_NONBLOCK` back off the
+    /// descriptor. **The answer is not always a directory**: a step that
+    /// forces `O_DIRECTORY` needs no guard, because the kernel answers
+    /// `ENOTDIR` on a FIFO or device before reaching the file's own
+    /// `open` method, but `chain`'s last step is opened as the caller
+    /// asked and can name anything the anchor holds.
     fn open_component<F>(
         &mut self,
         who: Personality,
         anchor: Anchor,
         path: CString,
         how: RawOpenHow,
+        guarded: bool,
         on_done: F,
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        // No special-file guard: every caller here opens `O_DIRECTORY`, and
-        // the kernel answers `ENOTDIR` on a FIFO or device before it ever
-        // reaches the file's own `open` method, so there is nothing to block
-        // on and nothing to strip afterwards.
+        let sink = self.arm_fail_sink();
         self.fs.submit_open(
             self.eng,
             who.0,
             anchor,
             path,
             how,
-            false,
-            embed(self.owner, self.fail_sink.take(), on_done),
+            guarded,
+            embed(self.owner, sink, on_done),
         );
     }
 
@@ -2146,7 +2305,8 @@ impl<'a> FsConn<'a> {
     /// pool gets the buffer back when the last of them completes - zero
     /// copies, zero allocations, for as many in-bounds ranges as one
     /// delivery submits. Anything else - an unpooled connection, a placed
-    /// or owned body, a range outside the claim, a full op table - falls
+    /// or owned body, a range outside the claim, a full op table, or a
+    /// call from inside a task, whose facade carries no claim - falls
     /// back to `pwritev2` on a copy, so the call degrades instead of
     /// failing.
     ///
@@ -2231,7 +2391,8 @@ impl<'a> FsConn<'a> {
                 None => Some(std::sync::Arc::new(LeaseHold(bid))),
             });
             if let (Some((_, taken)), Some(hold)) = (leased, hold) {
-                let w = embed(self.owner, self.fail_sink.take(), on_done);
+                let sink = self.arm_fail_sink();
+                let w = embed(self.owner, sink, on_done);
                 match self.fs.submit_pwritev2_leased(
                     self.eng,
                     who.0,
@@ -2275,6 +2436,7 @@ impl<'a> FsConn<'a> {
     where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
+        let sink = self.arm_fail_sink();
         self.fs.submit_fsync(
             self.eng,
             who.0,
@@ -2282,7 +2444,7 @@ impl<'a> FsConn<'a> {
             false,
             0,
             0,
-            embed(self.owner, self.fail_sink.take(), on_done),
+            embed(self.owner, sink, on_done),
         );
     }
 
@@ -2291,6 +2453,7 @@ impl<'a> FsConn<'a> {
     where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
+        let sink = self.arm_fail_sink();
         self.fs.submit_fsync(
             self.eng,
             who.0,
@@ -2298,7 +2461,7 @@ impl<'a> FsConn<'a> {
             true,
             0,
             0,
-            embed(self.owner, self.fail_sink.take(), on_done),
+            embed(self.owner, sink, on_done),
         );
     }
 
@@ -2314,10 +2477,11 @@ impl<'a> FsConn<'a> {
     where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
+        let sink = self.arm_fail_sink();
         self.fs.submit_timeout(
             self.eng,
             after,
-            embed(self.owner, self.fail_sink.take(), on_done),
+            embed(self.owner, sink, on_done),
         );
     }
 
@@ -2335,6 +2499,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
+        let sink = self.arm_fail_sink();
         self.fs.submit_fsync(
             self.eng,
             who.0,
@@ -2342,7 +2507,7 @@ impl<'a> FsConn<'a> {
             datasync,
             offset,
             length,
-            embed(self.owner, self.fail_sink.take(), on_done),
+            embed(self.owner, sink, on_done),
         );
     }
 
@@ -2359,6 +2524,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
+        let sink = self.arm_fail_sink();
         self.fs.submit_path_op(
             self.eng,
             TAG_STATX,
@@ -2369,7 +2535,7 @@ impl<'a> FsConn<'a> {
             None,
             statx_at_flags(flags),
             mask.bits(),
-            embed(self.owner, self.fail_sink.take(), on_done),
+            embed(self.owner, sink, on_done),
         );
     }
 
@@ -2384,6 +2550,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
+        let sink = self.arm_fail_sink();
         self.fs.submit_path_op(
             self.eng,
             TAG_STATX,
@@ -2394,7 +2561,7 @@ impl<'a> FsConn<'a> {
             None,
             statx_at_flags(flags | AtFlags::AT_EMPTY_PATH),
             mask.bits(),
-            embed(self.owner, self.fail_sink.take(), on_done),
+            embed(self.owner, sink, on_done),
         );
     }
 
@@ -2454,12 +2621,13 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
+        let sink = self.arm_fail_sink();
         self.fs.submit_fgetxattr_as_root(
             self.eng,
             f.fd,
             name.to_owned(),
             buf,
-            embed(self.owner, self.fail_sink.take(), on_done),
+            embed(self.owner, sink, on_done),
         );
     }
 
@@ -2723,6 +2891,7 @@ impl<'a> FsConn<'a> {
         if target.to_bytes().is_empty() {
             return;
         }
+        let sink = self.arm_fail_sink();
         self.fs.submit_path_op(
             self.eng,
             TAG_SYMLINKAT,
@@ -2733,11 +2902,24 @@ impl<'a> FsConn<'a> {
             Some(leaf.to_cstring()),
             0,
             0,
-            embed(self.owner, self.fail_sink.take(), on_done),
+            embed(self.owner, sink, on_done),
         );
     }
 
     /// Create a hard link at `new_leaf` in `new` for `old_leaf` in `old`.
+    ///
+    /// **A [`Leaf`] bounds the name, not what the name resolves to.**
+    /// `flags` reaches the kernel as given, and `AT_SYMLINK_FOLLOW`
+    /// there makes `old_leaf` resolve wherever it points - a
+    /// one-component symlink a peer planted inside `old` is a valid
+    /// leaf, so the new name lands inside `new` as a second name for an
+    /// inode outside it. The kernel offers no confinement for this:
+    /// `may_linkat` (`fs/namei.c`) decides *which* inode may be linked
+    /// and never where the link lands, so `fs.protected_hardlinks` does
+    /// not help either. Pass `AtFlags::empty()` unless the source tree
+    /// is one nothing else can write, or open the source under
+    /// `RESOLVE_NO_SYMLINKS` and publish it with
+    /// [`linkat_file`](Self::linkat_file).
     #[allow(clippy::too_many_arguments)]
     pub fn linkat<F>(
         &mut self,
@@ -2779,13 +2961,14 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
+        let sink = self.arm_fail_sink();
         self.fs.submit_linkat_file(
             self.eng,
             who.0,
             f.fd,
             new.clone(),
             new_leaf.to_cstring(),
-            embed(self.owner, self.fail_sink.take(), on_done),
+            embed(self.owner, sink, on_done),
         );
     }
 
@@ -2811,6 +2994,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
+        let sink = self.arm_fail_sink();
         self.fs.submit_rw(
             self.eng,
             tag,
@@ -2819,7 +3003,7 @@ impl<'a> FsConn<'a> {
             bufs,
             off,
             rw_flags.bits(),
-            embed(self.owner, self.fail_sink.take(), on_done),
+            embed(self.owner, sink, on_done),
         );
     }
 
@@ -2838,6 +3022,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
+        let sink = self.arm_fail_sink();
         self.fs.submit_fd_meta(
             self.eng,
             tag,
@@ -2848,7 +3033,7 @@ impl<'a> FsConn<'a> {
             off,
             len64,
             aux32,
-            embed(self.owner, self.fail_sink.take(), on_done),
+            embed(self.owner, sink, on_done),
         );
     }
 
@@ -2867,6 +3052,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
+        let sink = self.arm_fail_sink();
         self.fs.submit_path_op(
             self.eng,
             tag,
@@ -2877,7 +3063,7 @@ impl<'a> FsConn<'a> {
             n2,
             flags,
             len_arg,
-            embed(self.owner, self.fail_sink.take(), on_done),
+            embed(self.owner, sink, on_done),
         );
     }
 }
@@ -2967,6 +3153,7 @@ fn chain(
     cur: Anchor,
     mut steps: VecDeque<OpenStep>,
     on_done: WalkDone,
+    sink: Option<FailSink>,
 ) {
     let Some(step) = steps.pop_front() else {
         // Entry validated a non-empty list. Answered rather than
@@ -2978,9 +3165,25 @@ fn chain(
     raw.resolve |= CONFINED_RESOLVE.bits();
     // Only the answer is opened as the caller asked; everything above it
     // is a directory this walks through.
-    if !last {
+    //
+    // Which is why the answer is guarded and the rest are not. An
+    // intermediate carries `O_DIRECTORY`, so the kernel answers `ENOTDIR`
+    // on a special file before reaching its own `open`; the answer
+    // carries whatever the caller asked for, and a FIFO named there with
+    // a forcing flag (`O_TRUNC`, which `io_openat_force_async` punts to
+    // io-wq where `io_openat2` never adds `O_NONBLOCK` -
+    // `io_uring/openclose.c`) parks a worker in `wait_for_partner`
+    // indefinitely and pins its op slot with it. There is no
+    // `SpecialFiles` opt-out here: a step names a path relative to a
+    // directory the caller may not own, which is the case the guard is
+    // for. A caller who means to open a FIFO uses `FsConn::open` with
+    // `SpecialFiles::Allow`.
+    let guarded = if last {
+        super::apply_special_file_guard(&mut raw, super::SpecialFiles::Guard)
+    } else {
         raw.flags |= libc::O_DIRECTORY as u64;
-    }
+        false
+    };
     let who = step.who;
     // A derived name is produced here, from the file the previous step
     // opened, and screened on the same rule entry applied to the rest.
@@ -2999,7 +3202,12 @@ fn chain(
             Err(_) => return on_done(FsDone::failed(Errno::EINVAL), conn),
         },
     };
-    conn.open_component(who, cur, path, raw, move |res, conn| {
+    // Carried onto every step's facade: the second and later steps
+    // submit from the fresh `FsConn` a completion is handed, which has
+    // no sink of its own, so without this a transient `EBUSY` mid-chain
+    // reaches the caller as teardown.
+    conn.carry_fail_sink(sink.clone());
+    conn.open_component(who, cur, path, raw, guarded, move |res, conn| {
         let Some(f) = res.file() else {
             return on_done(res, conn);
         };
@@ -3007,7 +3215,7 @@ fn chain(
             return on_done(res, conn);
         }
         match Anchor::from_file(&f) {
-            Ok(next) => chain(conn, next, steps, on_done),
+            Ok(next) => chain(conn, next, steps, on_done, sink),
             Err(_) => on_done(FsDone::failed(Errno::EBADF), conn),
         }
     });
@@ -3017,6 +3225,7 @@ fn chain(
 ///
 /// `cur` is the deepest directory reached so far, and the last component's
 /// open is the answer.
+#[allow(clippy::too_many_arguments)]
 fn walk(
     conn: &mut FsConn<'_>,
     who: Personality,
@@ -3025,6 +3234,7 @@ fn walk(
     mode: Mode,
     how: RawOpenHow,
     on_done: WalkDone,
+    sink: Option<FailSink>,
 ) {
     let Some(part) = parts.pop_front() else {
         // Entry validated a non-empty list. Answered rather than dropped:
@@ -3036,6 +3246,8 @@ fn walk(
         return on_done(FsDone::failed(Errno::EINVAL), conn);
     };
     let at = cur.clone();
+    // Carried onto every step's facade, for `chain`'s reason.
+    conn.carry_fail_sink(sink.clone());
     conn.mkdirat(who, &at, leaf, mode, move |res, conn| {
         match res.result() {
             // `mkdir -p`'s rule, and the outcome of losing a race with
@@ -3043,7 +3255,9 @@ fn walk(
             Ok(_) | Err(crate::Error::Errno(Errno::EEXIST)) => {}
             Err(_) => return on_done(res, conn),
         }
-        conn.open_component(who, cur, part, how, move |res, conn| {
+        conn.carry_fail_sink(sink.clone());
+        // `mkdir_path` forces `O_DIRECTORY` on every step; see `chain`.
+        conn.open_component(who, cur, part, how, false, move |res, conn| {
             let Some(f) = res.file() else {
                 return on_done(res, conn);
             };
@@ -3051,7 +3265,9 @@ fn walk(
                 return on_done(res, conn);
             }
             match Anchor::from_file(&f) {
-                Ok(next) => walk(conn, who, next, parts, mode, how, on_done),
+                Ok(next) => {
+                    walk(conn, who, next, parts, mode, how, on_done, sink)
+                }
                 Err(_) => on_done(FsDone::failed(Errno::EBADF), conn),
             }
         });
@@ -3177,8 +3393,8 @@ impl FsConn<'_> {
     /// - **An offload is never cancelled.** `cancel_owned_by` sweeps ring
     ///   ops only; the job always runs to completion and its delivery always
     ///   fires, possibly for an owner that is gone - a continuation must
-    ///   already tolerate that (its facade cannot `open`, and a deferred
-    ///   reply is generation-checked).
+    ///   already tolerate that (a deferred reply is generation-checked,
+    ///   and a file it opens is its own to close).
     /// - **The registry and pool queue are uncapped.** Bound in-flight jobs
     ///   upstream, at the request cap. A failed worker spawn runs the job
     ///   inline on the loop rather than lose it (`SharedPool`).
@@ -3391,8 +3607,7 @@ impl FsConn<'_> {
 
     /// Open `anchor` itself readable **under `who`** on the ring (the DAC /
     /// list-permission check), then `fdopendir` it off-loop; deliver the ready
-    /// [`DirWalk`] to `on_ready` on the reactor thread. Only the request-handler
-    /// facade may open (like [`FsConn::open`]).
+    /// [`DirWalk`] to `on_ready` on the reactor thread.
     pub fn open_dir<F>(
         &mut self,
         who: Personality,
@@ -3649,19 +3864,18 @@ mod hybrid_tests {
         dir
     }
 
-    /// Run `f` with panic printing silenced, serialized against every other
-    /// hook-swapping test: the hook is process-global and tests run as
-    /// threads in one binary, so two unserialized swaps can interleave and
-    /// strand the silent hook. Keep assertions outside `f` - a panic inside
-    /// it leaves the hook silenced for the rest of the run.
+    /// Run `f` with this thread's panic printing silenced, serialized
+    /// against every other hook-swapping test: installing a hook is
+    /// process-global and tests run as threads in one binary, so two
+    /// unserialized swaps can interleave and strand one of them. The
+    /// filter forwards other threads' panics, so a concurrent test's
+    /// real failure still names itself; a panic inside `f` restores the
+    /// hook on the way out.
     fn with_silent_panics<R>(f: impl FnOnce() -> R) -> R {
         static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _serialized = HOOK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let r = f();
-        std::panic::set_hook(prev);
-        r
+        let _quiet = crate::uring_fs::quiet_panics_on_this_thread();
+        f()
     }
 
     /// `a/b/leaf` under a fresh directory, for the chain tests.
@@ -3708,6 +3922,71 @@ mod hybrid_tests {
             || got.borrow().is_some(),
         );
         assert_eq!(*got.borrow(), Some(true), "the leaf must be delivered");
+    }
+
+    /// A chain's last step is opened as the caller asked, so unlike
+    /// every step above it, it can name a special file.
+    ///
+    /// `O_TRUNC` forces the open async (`io_openat_force_async`,
+    /// `io_uring/openclose.c`), and `io_openat2` adds `O_NONBLOCK` only
+    /// on the inline attempt (`IO_URING_F_NONBLOCK`), which a forced
+    /// io-wq worker does not have - the `WARN_ON_ONCE` beside it is the
+    /// kernel asserting the two are exclusive. So an unguarded step here
+    /// reaches `fifo_open`'s `wait_for_partner` (`fs/pipe.c`) and parks
+    /// a worker and its op slot until the owner's teardown sweep. The
+    /// guard is what makes it answer instead.
+    #[test]
+    fn a_chains_last_step_cannot_park_on_a_fifo() {
+        let (mut eng, mut fs, me) = setup();
+        let dir = crate::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("a")).expect("mkdir");
+        let fifo = dir.path().join("a/pipe");
+        let cpath =
+            CString::new(fifo.as_os_str().as_encoded_bytes()).expect("no NUL");
+        // SAFETY: a NUL-terminated path naming nothing yet, inside a
+        // directory this test made.
+        let made = unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let got: Rc<RefCell<Option<Option<Errno>>>> =
+            Rc::new(RefCell::new(None));
+        let g2 = got.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                c.open_chain(
+                    &at,
+                    vec![
+                        OpenStep {
+                            path: StepPath::Fixed(c"a".to_owned()),
+                            who: me,
+                            how: OpenHow::new()
+                                .flags(OFlag::O_PATH | OFlag::O_DIRECTORY),
+                        },
+                        OpenStep {
+                            path: StepPath::Fixed(c"pipe".to_owned()),
+                            who: me,
+                            how: OpenHow::new()
+                                .flags(OFlag::O_WRONLY | OFlag::O_TRUNC),
+                        },
+                    ],
+                    move |res, _c| {
+                        *g2.borrow_mut() = Some(match res.result() {
+                            Err(crate::Error::Errno(e)) => Some(e),
+                            _ => None,
+                        });
+                    },
+                );
+            },
+            || got.borrow().is_some(),
+        );
+        assert_eq!(
+            *got.borrow(),
+            Some(Some(Errno::ENXIO)),
+            "a FIFO with no reader must answer, not park a worker"
+        );
     }
 
     /// The step that cannot be written before the chain starts: a name
@@ -4240,6 +4519,7 @@ fn deliver(
     bufs: Vec<Vec<u8>>,
     file: Option<Arc<OwnedFd>>,
     stat: Option<Box<StatxRaw>>,
+    refused: bool,
 ) {
     match waiter {
         Some(FsWaiter::Channel(tx)) => {
@@ -4249,14 +4529,17 @@ fn deliver(
         // unfired - dropping the continuation it captured closes the
         // connection (see [`EmbeddedCb`]). Nothing else routes it.
         Some(FsWaiter::Embedded { cb, on_fail, .. }) => {
-            // The reason first, then the callback goes unfired as its
-            // contract says. The sink only fills a slot - no consumer
-            // code runs here, so this is not an inline delivery.
-            if let (Some(sink), Err(errno)) = (on_fail, res) {
-                sink(errno);
+            // A refusal reports its reason and hands the payload back; a
+            // teardown reports neither, which is what keeps `ECANCELED`
+            // meaning teardown alone. The callback goes unfired either
+            // way, as its contract says - the sink fills a slot and runs
+            // no consumer code, so this is not an inline delivery.
+            if let (true, Some(sink), Err(errno)) = (refused, &on_fail, res) {
+                sink(errno, bufs);
+            } else {
+                drop(bufs);
             }
-            drop(cb);
-            drop((bufs, file, stat));
+            drop((cb, on_fail, file, stat));
         }
         // A pump read has no callback to drop and nowhere to route from here:
         // on a teardown drain the owning connection is dying with the loop,
@@ -4268,17 +4551,18 @@ fn deliver(
 }
 
 /// Deliver every finished offload's continuation on-loop, each with a fresh
-/// owner-scoped [`FsConn`] (`root` per the host: the standalone reactor passes
-/// `true`, a net-server continuation `false`). Shared by the host and the net
-/// server so the wake-drain is written once.
+/// owner-scoped [`FsConn`]. Shared by the host and the net server so the
+/// wake-drain is written once.
 pub(crate) fn deliver_pool_completions(fs: &mut FsCore, eng: &mut Engine) {
-    for (owner, deliver, any) in fs.take_pool_completions() {
-        let mut conn = FsConn::new(fs, eng, owner);
-        deliver(any, &mut conn);
-    }
     // Tasks woken by these deliveries - or poked from off-loop, which
-    // lands on the same wake the pool uses - run in this dispatch.
-    super::task::drain(fs, eng);
+    // lands on the same wake the pool uses - run in this dispatch, and
+    // an on-loop wake inside it needs no poke to say so.
+    super::task::in_pass(fs, eng, |fs, eng| {
+        for (owner, deliver, any) in fs.take_pool_completions() {
+            let mut conn = FsConn::new(fs, eng, owner);
+            deliver(any, &mut conn);
+        }
+    });
 }
 
 /// Fire an embedded on-loop completion reaped by [`FsCore::on_cqe`] with a
@@ -4292,7 +4576,10 @@ pub(crate) fn deliver_embedded(
     eng: &mut Engine,
     reaped: ReapedFs,
 ) {
-    match reaped {
+    // A completion that resolves an op future wakes its task from
+    // inside the callback below; the drain that follows polls it, so
+    // the wake needs no poke to reach the loop. See `task::in_pass`.
+    super::task::in_pass(fs, eng, move |fs, eng| match reaped {
         ReapedFs::Embedded(cb, done, owner) => {
             let mut conn = FsConn::new(fs, eng, owner);
             cb(done, &mut conn);
@@ -4301,10 +4588,7 @@ pub(crate) fn deliver_embedded(
             unreachable!("pump reads are routed by the net server")
         }
         ReapedFs::None => {}
-    }
-    // A completion that resolved an op future woke its task; polling
-    // here, after the callback fired, keeps tasks at callback latency.
-    super::task::drain(fs, eng);
+    });
 }
 
 /// Routing / close-last property fuzzer for the **plain-fd** core. There is no
@@ -4599,7 +4883,8 @@ mod routing_fuzz {
                 off,
                 0,
                 std::sync::Arc::clone(&hold),
-                embed(Some((0, 0)), None, |_d, _fs| {}),
+                // No facade here to arm from; see `Armed`.
+                embed(Some((0, 0)), Armed(None), |_d, _fs| {}),
             );
             assert!(staged.is_ok(), "staged");
         }

@@ -995,6 +995,11 @@ where
             // completion for those connections has been routed).
             #[cfg(feature = "uring-fs")]
             self.sweep_closed_fs();
+            // A drain's quiescence, re-read where everything that can
+            // reach it has already run. `reclaim_slot` is edge-triggered
+            // on connections and cannot see a task retire; see
+            // `maybe_finish_drain`. Inert unless draining.
+            self.core.maybe_finish_drain();
         }
         Ok(())
     }
@@ -1086,8 +1091,9 @@ where
                     };
                     self.on_pump_read(owner, done, bid)?;
                 }
-                // Continuation facade `root: false`: no new `open` (the owning
-                // connection may be gone; its file would leak).
+                // A continuation facade, for an owner that may already be
+                // gone: a file it opens is its own to close, since
+                // nothing sweeps one opened after the connection did.
                 mut reaped => {
                     // A leased write's buffer comes back to the pool here,
                     // before the callback runs: the op is over whatever the

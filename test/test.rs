@@ -61,6 +61,10 @@ mod fs {
         assert_eq!(err, Errno::ELOOP);
     }
 
+    /// Names are single components against a dirfd, which is what the
+    /// component screen requires: `renameat2` honours no `RESOLVE_*`
+    /// flags, so a multi-component path would resolve every component
+    /// but the last with symlinks followed.
     #[test]
     fn renameat2_noreplace_and_exchange() {
         let dir = truenas_ros::tempdir().unwrap();
@@ -68,23 +72,30 @@ mod fs {
         let b = dir.path().join("b");
         std::fs::write(&a, b"aaa").unwrap();
         std::fs::write(&b, b"bbb").unwrap();
+        let at = openat2(
+            AT_FDCWD,
+            dir.path(),
+            OpenHow::new().flags(OFlag::O_DIRECTORY | OFlag::O_CLOEXEC),
+        )
+        .expect("open the directory");
+        let at = at.as_fd();
 
         // NOREPLACE must fail because `b` already exists.
-        let err = renameat2(
-            AT_FDCWD,
-            &a,
-            AT_FDCWD,
-            &b,
-            RenameFlags::RENAME_NOREPLACE,
-        )
-        .unwrap_err();
+        let err = renameat2(at, "a", at, "b", RenameFlags::RENAME_NOREPLACE)
+            .unwrap_err();
         assert_eq!(err, Errno::EEXIST);
 
         // EXCHANGE swaps the two files atomically.
-        renameat2(AT_FDCWD, &a, AT_FDCWD, &b, RenameFlags::RENAME_EXCHANGE)
+        renameat2(at, "a", at, "b", RenameFlags::RENAME_EXCHANGE)
             .expect("exchange failed");
         assert_eq!(std::fs::read(&a).unwrap(), b"bbb");
         assert_eq!(std::fs::read(&b).unwrap(), b"aaa");
+
+        // And a multi-component name is refused rather than resolved.
+        assert_eq!(
+            renameat2(at, "a", at, "sub/b", RenameFlags::empty()).unwrap_err(),
+            Errno::EINVAL
+        );
     }
 }
 

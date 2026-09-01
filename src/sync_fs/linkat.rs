@@ -23,13 +23,30 @@ use std::os::fd::{AsFd, AsRawFd};
 /// [`path::component_defect`](crate::path::component_defect); rejected
 /// are empty, `.`, `..`, and anything containing `/`.
 ///
+/// **The screen bounds the name, not what the name resolves to, and
+/// `AT_SYMLINK_FOLLOW` is where that matters.** A one-component symlink
+/// inside `old_dirfd` passes the screen and then resolves wherever it
+/// points, so the new name lands inside the anchor as a second name for
+/// an inode outside it. The kernel offers no confinement here at all -
+/// `may_linkat` (`fs/namei.c`) governs *which* inode you may link, by
+/// `safe_hardlink_source` or `inode_owner_or_capable`, and never where
+/// the link lands, so `fs.protected_hardlinks` does not help. A caller
+/// that needs the anchor to bound the result must not pass the flag, or
+/// must `openat2` the source under `RESOLVE_NO_SYMLINKS` first and link
+/// that with `AT_EMPTY_PATH`.
+///
 /// `flags` takes `AT_SYMLINK_FOLLOW` to link a symlink's target rather
-/// than the symlink, and `AT_EMPTY_PATH` to link the descriptor itself
-/// — which requires `old_path` to be empty and, in the kernel,
-/// `CAP_DAC_READ_SEARCH`. The empty name is the one spelling the
-/// component screen would otherwise refuse, so that flag lifts the
-/// screen for `old_path` and only for it: the *new* name is always a
-/// name.
+/// than the symlink, and `AT_EMPTY_PATH` to link the descriptor itself,
+/// which requires `old_path` to be empty. The kernel's own test for
+/// that flag is a **disjunction** (`fs/namei.c`, under
+/// `LOOKUP_LINKAT_EMPTY`): it answers `ENOENT` only when the
+/// descriptor's open-time credentials differ from the caller's *and*
+/// the caller lacks `CAP_DAC_READ_SEARCH`. A process linking a
+/// descriptor it opened itself therefore needs no capability at all;
+/// `do_linkat`'s own comment spells the pair out. The empty name is the
+/// one spelling the component screen would otherwise refuse, so that
+/// flag lifts the screen for `old_path` and only for it: the *new* name
+/// is always a name.
 ///
 /// `EEXIST` where `new_path` is taken, and it is the caller's to
 /// interpret: `linkat` cannot replace a name, and this invents no

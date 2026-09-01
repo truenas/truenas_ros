@@ -203,7 +203,9 @@
 //!
 //! Completion callbacks stay the primitive, and a second consumption
 //! style sits on them: [`FsConn::fut`] returns one submission's outcome
-//! as a future, and [`FsConn::spawn`] runs a `'static` future as an
+//! as a future - [`FsConn::result_fut`] for the offload-shaped methods,
+//! whose callback carries a [`crate::Result`] rather than an
+//! [`FsDone`] - and [`FsConn::spawn`] runs a `'static` future as an
 //! on-loop **task**, submitting through the [`TaskFs`] its body
 //! receives. A multi-step chain then reads as straight-line
 //! `async`/`await` instead of a hop per completion, with the same
@@ -238,8 +240,50 @@ pub use core::{
 // every op it submits goes through `FsConn`'s methods above.
 pub(crate) mod task;
 pub use task::{
-    FsFuture, JoinError, JoinHandle, OffloadFuture, OnDone, TaskFs,
+    FsFuture, JoinError, JoinHandle, OffloadFuture, OnDone, OnResult, TaskFs,
 };
+
+/// Silence the panic hook for **this thread only**, restoring it when
+/// the guard drops.
+///
+/// `set_hook` is process-wide and `cargo test` runs a binary's tests as
+/// threads in one process, so a hook that swallows everything hides a
+/// concurrent test's genuine panic message for the window it is
+/// installed - turning a legible failure elsewhere into a bare "test
+/// failed". This one forwards every other thread's panic to the hook it
+/// replaced.
+#[cfg(test)]
+pub(crate) fn quiet_panics_on_this_thread() -> QuietPanics {
+    let prev = std::sync::Arc::new(std::panic::take_hook());
+    let forward = std::sync::Arc::clone(&prev);
+    let mine = std::thread::current().id();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() != mine {
+            forward(info);
+        }
+    }));
+    QuietPanics(prev)
+}
+
+/// The hook `set_hook` takes and `take_hook` returns.
+#[cfg(test)]
+type PanicHook =
+    Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+/// The guard [`quiet_panics_on_this_thread`] returns.
+#[cfg(test)]
+pub(crate) struct QuietPanics(std::sync::Arc<PanicHook>);
+
+#[cfg(test)]
+impl Drop for QuietPanics {
+    fn drop(&mut self) {
+        // Reinstalled as a thin wrapper over the hook that was there
+        // before, which is behaviourally the same and needs no
+        // unwrapping of the shared handle the filter still holds.
+        let prev = std::sync::Arc::clone(&self.0);
+        std::panic::set_hook(Box::new(move |info| prev(info)));
+    }
+}
 
 pub mod query_dir;
 pub use query_dir::{

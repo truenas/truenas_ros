@@ -7907,6 +7907,78 @@ fn server_builds_with_fs_pool() {
     assert_eq!(client.join().unwrap().expect("client io"), b"req-0");
 }
 
+/// A graceful drain waits for a task, and stops as soon as it retires.
+///
+/// The wait is deliberate - a task outlives the connection that spawned
+/// it - but the quiescence test has to be re-read somewhere the gauge
+/// falling can reach, or the drain sits out its whole grace period and
+/// leaves through the `Deadline` hard stop instead. The grace here is
+/// long and the task is short, so the two outcomes are seconds apart.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn a_graceful_drain_ends_when_its_last_task_retires() {
+    let cfg = ServerConfig {
+        pool_size: 4,
+        fs_ops: 8,
+        ..ServerConfig::default()
+    };
+    let body = move |mut req: Request<'_, ()>| -> Response {
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        // Pending with no connection and no ring op: the shape a
+        // connection count cannot see. It outlives the reply below and
+        // the close that follows it.
+        drop(fs.spawn(|t| async move {
+            let _ = t
+                .offload_fut(|| {
+                    thread::sleep(Duration::from_millis(300));
+                    Ok(())
+                })
+                .await;
+        }));
+        Response::Reply(echo_frame(b"spawned"))
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    const GRACE: Duration = Duration::from_secs(5);
+    let client = thread::spawn(move || -> io::Result<()> {
+        let mut c = connect_tcp(v4)?;
+        send_framed(&mut c, b"go")?;
+        assert_eq!(recv_framed(&mut c)?, b"spawned");
+        // The task is still pending; the table empties behind it.
+        drop(c);
+        stop.shutdown_graceful(GRACE);
+        Ok(())
+    });
+    let began = Instant::now();
+    server.serve_forever().expect("serve_forever");
+    let took = began.elapsed();
+    client.join().expect("client thread").expect("client io");
+    assert!(
+        took < GRACE / 2,
+        "the drain ran to its grace deadline ({took:?}) rather than \
+         stopping when the task retired"
+    );
+}
+
 /// The M4 headline: a static-file server. Each request names a file; the body
 /// handler opens it on the server's own ring under a per-connection
 /// [`Personality`], reads it, and replies with its contents - all inline on the
