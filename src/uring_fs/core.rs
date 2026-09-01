@@ -2188,7 +2188,9 @@ impl<'a> FsConn<'a> {
     ///
     /// Every step is confined by [`CONFINED_RESOLVE`], unioned rather
     /// than assigned, and every step but the last is forced
-    /// `O_DIRECTORY`. A step that creates is refused at entry, before
+    /// `O_DIRECTORY`. A step that creates, or that states
+    /// `RESOLVE_IN_ROOT` - which the kernel refuses to pair with the
+    /// `RESOLVE_BENEATH` unioned here - is refused at entry, before
     /// anything is submitted, so a bad argument cannot leave a
     /// half-walked chain behind.
     pub fn open_chain<F>(
@@ -2217,6 +2219,24 @@ impl<'a> FsConn<'a> {
                 return;
             }
             if creation_refused(step.how.to_raw().flags) {
+                return;
+            }
+            // `chain` unions `CONFINED_RESOLVE` onto every step, and
+            // `RESOLVE_BENEATH` is in it: "Scoping flags are mutually
+            // exclusive" (`build_open_flags`, `fs/open.c:1263-1265`), so
+            // a caller's `RESOLVE_IN_ROOT` makes every step `EINVAL` -
+            // and with `was_refused` false, which tells the caller the
+            // *kernel* objected to their path when this crate added the
+            // bit that made it object. Screened here rather than fixed
+            // up in `chain`, on `mkdir_path`'s rule: routing through
+            // `confine_resolve` instead would union only
+            // `CONFINED_HARDENING` once a policy bit is set, silently
+            // dropping the `RESOLVE_NO_SYMLINKS` a multi-personality
+            // chain needs more rather than less.
+            if step.how.to_raw().resolve
+                & crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT.bits()
+                != 0
+            {
                 return;
             }
         }
@@ -4136,6 +4156,22 @@ mod hybrid_tests {
                         who: me,
                         how: plain(),
                     },
+                ],
+            ),
+            (
+                // `chain` unions RESOLVE_BENEATH, and the kernel
+                // refuses the pair ("Scoping flags are mutually
+                // exclusive", `fs/open.c:1263-1265`) - so every step
+                // would answer EINVAL, blaming the kernel for a bit
+                // this crate added.
+                "a step scoped to a root",
+                vec![
+                    dirstep(
+                        plain().resolve(
+                            crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT,
+                        ),
+                    ),
+                    dirstep(plain()),
                 ],
             ),
             (

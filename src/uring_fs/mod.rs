@@ -581,8 +581,22 @@ pub(crate) fn apply_special_file_guard(
     // `openat2` refuses `O_PATH` alongside anything outside
     // `O_DIRECTORY|O_NOFOLLOW|O_PATH|O_CLOEXEC` (`fs/open.c:1298-1300`), so
     // adding the flag would turn a working open into `EINVAL`.
+    //
+    // `O_DIRECTORY` is excluded because the kernel answers before the file's
+    // `open` can block: `build_open_flags` raises `LOOKUP_DIRECTORY`
+    // (`fs/open.c:1337`) and `do_open` tests it - `if ((nd->flags &
+    // LOOKUP_DIRECTORY) && !d_can_lookup(...)) return -ENOTDIR;`,
+    // `fs/namei.c:4003-4004` - *above* the `vfs_open` at `:4020`. Nothing
+    // creates its way past that either: `O_DIRECTORY | O_CREAT` is refused
+    // outright at `fs/open.c:1283`. The flag is not free - the descriptor is
+    // stripped afterwards, which is one blocking `fcntl` on the reactor
+    // thread per open - and this crate's own `open_dir` walk pays it on
+    // every directory it opens. `chain` and `mkdir_path` already skipped the
+    // guard on the steps they force `O_DIRECTORY` onto, citing this same
+    // ordering; this is the rule they were stating.
     if special == SpecialFiles::Allow
         || raw.flags & libc::O_PATH as u64 != 0
+        || raw.flags & libc::O_DIRECTORY as u64 != 0
         || raw.flags & libc::O_NONBLOCK as u64 != 0
     {
         return false;
@@ -2531,6 +2545,52 @@ impl FsHandle {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+
+    /// The guard is added where a special file could block, and
+    /// nowhere else - because it is not free.
+    ///
+    /// The descriptor is stripped afterwards, which is one blocking
+    /// `fcntl` on the reactor thread per open; `open_dir`'s walk opens
+    /// a directory per request, and a directory cannot reach the
+    /// blocking `open` the flag exists to defeat. The exemption is a
+    /// kernel ordering, cited on the function.
+    #[test]
+    fn the_special_file_guard_skips_what_cannot_block() {
+        let guard = |flags: i32| {
+            let mut raw = OpenHow::new()
+                .flags(OFlag::from_bits_retain(flags))
+                .to_raw();
+            let added = apply_special_file_guard(&mut raw, SpecialFiles::Guard);
+            (added, raw.flags & libc::O_NONBLOCK as u64 != 0)
+        };
+
+        assert_eq!(
+            guard(libc::O_RDONLY),
+            (true, true),
+            "an ordinary open can name a FIFO and must be guarded"
+        );
+        assert_eq!(
+            guard(libc::O_RDONLY | libc::O_DIRECTORY),
+            (false, false),
+            "O_DIRECTORY answers ENOTDIR before the file's own open"
+        );
+        assert_eq!(
+            guard(libc::O_RDONLY | libc::O_PATH),
+            (false, false),
+            "O_PATH never invokes the file's open"
+        );
+        assert_eq!(
+            guard(libc::O_RDONLY | libc::O_NONBLOCK),
+            (false, true),
+            "a caller's own O_NONBLOCK is theirs, and stays"
+        );
+
+        let mut raw = OpenHow::new().flags(OFlag::O_RDONLY).to_raw();
+        assert!(
+            !apply_special_file_guard(&mut raw, SpecialFiles::Allow),
+            "the opt-out is the one place a blocking open is asked for"
+        );
+    }
 
     /// The liveness half of the inject-vs-shutdown race: a caller that got an
     /// `Ok` from [`FsHandle::send`] and is parked in [`FsHandle::call`] on its
