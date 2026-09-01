@@ -274,6 +274,11 @@ impl FsConn<'_> {
     /// this returns - so its first ops are on the ring when the caller
     /// resumes, exactly as an eager callback chain's would be.
     ///
+    /// `body` itself runs inside that first poll, so it may submit
+    /// through its [`TaskFs`] while assembling the future - the eager
+    /// pair this module's contract describes - and not only from
+    /// inside the returned future.
+    ///
     /// The task is owner-scoped like a continuation: polls after this
     /// one run from completion delivery, each with a fresh facade for
     /// the same owner. A task ends by returning. There is no external
@@ -287,14 +292,21 @@ impl FsConn<'_> {
     /// its effects wants, so the handle is not `#[must_use]`.
     pub fn spawn<F, Fut, T>(&mut self, body: F) -> JoinHandle<T>
     where
-        F: FnOnce(TaskFs) -> Fut,
+        F: FnOnce(TaskFs) -> Fut + 'static,
         Fut: Future<Output = T> + 'static,
         T: 'static,
     {
         let slot = Slot::new();
         let fire = Fire(Some(Rc::clone(&slot)));
-        let fut = body(TaskFs::new());
-        let task = Box::pin(async move { fire.fire(fut.await) });
+        // `body` runs *inside* the first poll, not here: it is handed
+        // a `TaskFs`, and a facade is parked only for the extent of a
+        // poll. Building the future out here would leave every op the
+        // caller submits while assembling it - the eager pair this
+        // contract advertises - with no facade to submit through.
+        let task = Box::pin(async move {
+            let fut = body(TaskFs::new());
+            fire.fire(fut.await);
+        });
         let (fs, eng, owner) = self.split();
         let id = fs.tasks.insert(eng, owner, task);
         poll_one(fs, eng, id);
@@ -421,7 +433,7 @@ impl TaskFs {
     /// awaiting both is a join.
     pub fn spawn<F, Fut, T>(&self, body: F) -> JoinHandle<T>
     where
-        F: FnOnce(TaskFs) -> Fut,
+        F: FnOnce(TaskFs) -> Fut + 'static,
         Fut: Future<Output = T> + 'static,
         T: 'static,
     {
@@ -454,23 +466,35 @@ pub(crate) struct RunShared {
     /// Queue-length hint, so the per-completion drain check is one
     /// relaxed load instead of a lock acquisition.
     ready: AtomicUsize,
+    /// Set for the extent of a [`drain`] pass. A wake landing inside a
+    /// pass is taken by that pass or by its trailing poke; a wake
+    /// landing outside one has nothing scheduled to collect it, so it
+    /// must poke for itself. Nested passes clear it early, which can
+    /// only cause a redundant poke - never a missed one - so the flag
+    /// needs no depth count.
+    draining: AtomicBool,
     /// The loop's shared flags and wake eventfd.
     wake: Arc<LoopShared>,
-    /// The loop thread, recorded at first spawn: a wake from it needs
-    /// no poke (a drain follows in the same dispatch), a wake from
-    /// anywhere else does.
+    /// The loop thread, recorded at first spawn.
     #[cfg(not(loom))]
     loop_thread: std::thread::ThreadId,
+    /// The model's stand-in for the thread check. A `cfg` hard-coding
+    /// this to `true` is what made the on-loop branch - where the
+    /// wake-outside-a-pass bug lived - unreachable from any model
+    /// while the module claimed its models carried the liveness
+    /// argument; keep it settable so both branches stay expressible.
+    #[cfg(loom)]
+    model_off_loop: bool,
 }
 
 impl RunShared {
     /// Whether the caller is off the loop thread. Under loom there is
-    /// no comparable thread identity, and the models exercise the
-    /// off-loop path - the one with an ordering to check.
+    /// no thread identity to read, so a model states which side it is
+    /// exercising; both are modelled.
     fn off_loop(&self) -> bool {
         #[cfg(loom)]
         {
-            true
+            self.model_off_loop
         }
         #[cfg(not(loom))]
         {
@@ -513,8 +537,18 @@ impl std::task::Wake for TaskWake {
 }
 
 /// Wake one task: enqueue its id exactly once per wake edge, and poke
-/// the loop when woken from off it. Returns whether this call enqueued
-/// (a dedup-skipped wake returns `false`).
+/// the loop unless a drain pass is already running to collect it.
+/// Returns whether this call enqueued (a dedup-skipped wake returns
+/// `false`).
+///
+/// **The discriminant is whether a pass is running, not which thread
+/// the wake came from.** An on-loop wake outside a pass (the inline
+/// poll in [`FsConn::spawn`], or a callback waking a task by hand) is
+/// otherwise scheduled by nothing: the id sits in the queue while the
+/// loop parks on a ring that has no reason to complete, and the
+/// `queued` edge then latches, so every later wake - an off-loop one
+/// included - is deduped away and the task is unreachable for the
+/// life of the reactor.
 ///
 /// Push under the lock, then poke - `finish_offload`'s protocol, and
 /// the same one-direction ordering argument: poke first and the loop
@@ -536,7 +570,7 @@ pub(crate) fn wake_task(w: &TaskWake) -> bool {
         .unwrap_or_else(|e| e.into_inner())
         .push_back(w.id);
     w.run.ready.fetch_add(1, Ordering::Release);
-    if w.run.off_loop() {
+    if w.run.off_loop() || !w.run.draining.load(Ordering::Acquire) {
         w.run.wake.wake.poke();
     }
     true
@@ -598,12 +632,15 @@ impl Tasks {
             Arc::new(RunShared {
                 queue: Mutex::new(VecDeque::new()),
                 ready: AtomicUsize::new(0),
+                draining: AtomicBool::new(false),
                 wake: Arc::clone(&eng.shared),
                 // The first spawn happens on the loop thread (spawns
                 // come through a facade, and facades exist only
                 // there), so this records the loop.
                 #[cfg(not(loom))]
                 loop_thread: std::thread::current().id(),
+                #[cfg(loom)]
+                model_off_loop: false,
             })
         });
         let idx = self.free.pop().unwrap_or_else(|| {
@@ -639,6 +676,28 @@ impl Tasks {
         s.entry.take()
     }
 
+    /// Re-enqueue `id` when its slot is the live tenant but currently
+    /// out for a poll. A retired slot fails the generation test
+    /// (`retire` bumps it) and a free slot cannot match a minted id,
+    /// so this fires only for the mid-poll case.
+    fn requeue_if_busy(&self, id: u64, idx: u32, generation: u32) {
+        let busy = self
+            .slots
+            .get(idx as usize)
+            .is_some_and(|s| s.generation == generation && s.entry.is_none());
+        if !busy {
+            return;
+        }
+        let Some(run) = self.run.as_ref() else {
+            return;
+        };
+        run.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(id);
+        run.ready.fetch_add(1, Ordering::Release);
+    }
+
     fn put_back(&mut self, idx: u32, entry: TaskEntry) {
         self.slots[idx as usize].entry = Some(entry);
     }
@@ -648,6 +707,16 @@ impl Tasks {
         debug_assert!(s.entry.is_none(), "retiring a task still in its slot");
         s.generation = s.generation.wrapping_add(1);
         self.free.push(idx);
+    }
+}
+
+/// Marks a drain pass live for [`wake_task`], and clears it however
+/// the pass ends.
+struct PassGuard(Arc<RunShared>);
+
+impl Drop for PassGuard {
+    fn drop(&mut self) {
+        self.0.draining.store(false, Ordering::Release);
     }
 }
 
@@ -664,14 +733,17 @@ impl Tasks {
 /// nothing left in flight - a parent woken by its child's final poll -
 /// would wait on a completion that is never coming.
 pub(crate) fn drain(fs: &mut FsCore, eng: &mut Engine) {
-    let Some(mut budget) = fs
-        .tasks
-        .run
-        .as_ref()
-        .map(|r| r.ready.load(Ordering::Acquire))
-    else {
+    let Some(run) = fs.tasks.run.as_ref().map(Arc::clone) else {
         return;
     };
+    let mut budget = run.ready.load(Ordering::Acquire);
+    if budget == 0 {
+        return;
+    }
+    run.draining.store(true, Ordering::Release);
+    // Cleared however the pass ends, an unwinding poll included: a
+    // flag left set would silence every later wake's poke.
+    let _pass = PassGuard(run);
     while budget > 0 {
         let Some(id) = fs.tasks.run.as_ref().and_then(|r| r.take_ready())
         else {
@@ -696,6 +768,13 @@ pub(crate) fn drain(fs: &mut FsCore, eng: &mut Engine) {
 fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: u64) {
     let (idx, generation) = unpack_task(id);
     let Some(mut entry) = fs.tasks.take_if(idx, generation) else {
+        // A live generation with no entry is the slot's tenant out
+        // being polled - a re-entrant drain, which `run_woken` and the
+        // facade a submit closure receives both make reachable. That
+        // poll already cleared the dedup edge, so this id is the only
+        // record of the wake: put it back rather than consume it, or
+        // the task is never scheduled again.
+        fs.tasks.requeue_if_busy(id, idx, generation);
         return;
     };
     let mut conn = FsConn::new(fs, eng, entry.owner);
@@ -735,10 +814,12 @@ mod loom_tests {
         b.check(f);
     }
 
-    fn run_shared() -> Arc<RunShared> {
+    fn run_shared(off_loop: bool) -> Arc<RunShared> {
         Arc::new(RunShared {
             queue: Mutex::new(VecDeque::new()),
             ready: AtomicUsize::new(0),
+            draining: AtomicBool::new(false),
+            model_off_loop: off_loop,
             wake: Arc::new(LoopShared {
                 stop: AtomicBool::new(false),
                 graceful: AtomicBool::new(false),
@@ -756,7 +837,11 @@ mod loom_tests {
     #[test]
     fn loom_a_task_wake_is_never_lost() {
         bounded_model(|| {
-            let run = run_shared();
+            // The **on-loop** branch: no pass is running, so the wake
+            // must poke for itself. Gate the poke on `off_loop()`
+            // alone and this model reports a deadlock - the loop
+            // parks on an eventfd nothing wrote.
+            let run = run_shared(false);
             let w = Arc::new(TaskWake {
                 id: pack_task(0, 0),
                 queued: AtomicBool::new(false),
@@ -789,6 +874,50 @@ mod loom_tests {
         });
     }
 
+    /// An **off-loop** wake landing while a pass is running still
+    /// pokes: `wake_task`'s condition is `off_loop() || !draining`,
+    /// and the left arm is what covers a foreign thread whose wake
+    /// the running pass may already have passed by. Narrow the
+    /// condition to `!draining` alone and this model deadlocks - the
+    /// loop parks while the id sits in the queue.
+    ///
+    /// (The on-loop-inside-a-pass case is deliberately not modelled
+    /// here: on the loop thread the only wake source inside a pass is
+    /// a poll, which runs before the pass's leftover check, so it is
+    /// sequential and `a_self_waking_task_cannot_monopolise_a_drain_pass`
+    /// covers it. Modelling it as a second thread would assert an
+    /// interleaving the reactor cannot produce.)
+    #[test]
+    fn loom_an_off_loop_wake_during_a_pass_still_pokes() {
+        bounded_model(|| {
+            let run = run_shared(true);
+            let w = Arc::new(TaskWake {
+                id: pack_task(0, 0),
+                queued: AtomicBool::new(false),
+                run: Arc::clone(&run),
+            });
+
+            // A pass is live for the whole race.
+            run.draining.store(true, Ordering::Release);
+            let t = {
+                let w = Arc::clone(&w);
+                loom::thread::spawn(move || wake_task(&w))
+            };
+
+            // The loop: park on the eventfd, then drain the queue.
+            let mut delivered = 0usize;
+            while delivered == 0 {
+                run.wake.wake.drain();
+                while let Some(_id) = run.take_ready() {
+                    poll_window(&w, || ());
+                    delivered += 1;
+                }
+            }
+            t.join().expect("waker thread");
+            assert_eq!(delivered, 1, "one wake, {delivered} deliveries");
+        });
+    }
+
     /// A wake landing around a poll window is never swallowed: if the
     /// waker's call was dedup-skipped, a poll of that task *starts*
     /// after it - which is all the waker contract asks. [`poll_window`]
@@ -798,7 +927,7 @@ mod loom_tests {
     #[test]
     fn loom_a_wake_around_a_poll_window_is_covered() {
         bounded_model(|| {
-            let run = run_shared();
+            let run = run_shared(true);
             let w = Arc::new(TaskWake {
                 id: pack_task(0, 0),
                 queued: AtomicBool::new(false),
@@ -937,6 +1066,23 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
+    }
+
+    /// Pending pokes on the wake eventfd, read without blocking. The
+    /// counter is consumed by the read, as the loop's armed READ does.
+    fn pending_pokes(run: &RunShared) -> u64 {
+        let mut buf: u64 = 0;
+        // SAFETY: an 8-byte read from the live eventfd into a `u64`;
+        // the fd is non-blocking, so an empty counter answers EAGAIN
+        // rather than parking the test.
+        let n = unsafe {
+            libc::read(
+                run.wake.wake.as_raw_fd(),
+                std::ptr::addr_of_mut!(buf).cast::<libc::c_void>(),
+                8,
+            )
+        };
+        if n == 8 { buf } else { 0 }
     }
 
     fn creating() -> OpenHow {
@@ -1348,6 +1494,139 @@ mod tests {
         assert_eq!(polls.get(), 2, "one poll per pass");
         drain(&mut fs, &mut eng);
         assert_eq!(polls.get(), 3, "one poll per pass, again");
+    }
+
+    /// The eager idiom the contract advertises: ops submitted while
+    /// the body is being *assembled*, outside the async block, must
+    /// reach the ring like any other. They did not before - `body`
+    /// ran before any facade was parked, so each one resolved
+    /// `ECANCELED` for an op that was never submitted, which reads to
+    /// a task as "the connection went away".
+    #[test]
+    fn a_body_may_submit_while_it_is_being_assembled() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let anchor = Anchor::open(dir.path()).expect("anchor");
+        std::fs::write(dir.path().join("eager"), b"x").expect("seed");
+        let done = Rc::new(StdCell::new(false));
+
+        {
+            let done = Rc::clone(&done);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |t| {
+                // Submitted here, before the async block exists.
+                let opened = t.fut(|c, cb| {
+                    c.open(
+                        who,
+                        &anchor,
+                        c"eager",
+                        OpenHow::new().flags(OFlag::O_RDONLY),
+                        cb,
+                    )
+                });
+                async move {
+                    let res = opened.await;
+                    assert!(
+                        res.file().is_some(),
+                        "an op submitted while assembling the body did \
+                         not reach the ring: {:?}",
+                        res.result()
+                    );
+                    done.set(true);
+                }
+            });
+        }
+        drive(&mut fs, &mut eng, &done, "eager submit from the body");
+    }
+
+    /// A wake from an inline `spawn` poll - on the loop thread, with
+    /// no drain pass running to collect it - pokes the loop. Without
+    /// it the id sits queued while the host parks on a ring that has
+    /// no reason to complete, and `queued` then latches so even a
+    /// later off-loop wake is deduped away.
+    #[test]
+    fn an_on_loop_wake_outside_a_pass_pokes_the_loop() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+
+        struct WakeOnce {
+            polls: Rc<StdCell<u32>>,
+        }
+        impl Future for WakeOnce {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                self.polls.set(self.polls.get() + 1);
+                if self.polls.get() == 1 {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Poll::Ready(())
+            }
+        }
+
+        let polls = Rc::new(StdCell::new(0));
+        {
+            let polls = Rc::clone(&polls);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |_t| WakeOnce { polls });
+        }
+        let run = Arc::clone(fs.tasks.run.as_ref().expect("run queue"));
+        assert_eq!(run.ready.load(Ordering::Acquire), 1, "queued");
+        assert!(
+            pending_pokes(&run) > 0,
+            "nothing poked: the loop will park and never schedule it"
+        );
+    }
+
+    /// A re-entrant drain - `run_woken` from inside a poll - must not
+    /// consume the running task's own queued wake. The poll cleared
+    /// the dedup edge before running, so that id is the only record;
+    /// eat it and the task is never scheduled again.
+    #[test]
+    fn a_reentrant_drain_does_not_eat_the_running_tasks_wake() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+
+        struct WakeThenReenter {
+            polls: Rc<StdCell<u32>>,
+        }
+        impl Future for WakeThenReenter {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                self.polls.set(self.polls.get() + 1);
+                if self.polls.get() == 1 {
+                    cx.waker().wake_by_ref();
+                    // The documented hand-wake shape: re-enter the
+                    // executor from inside the poll.
+                    with_conn(|c| c.run_woken());
+                    return Poll::Pending;
+                }
+                Poll::Ready(())
+            }
+        }
+
+        let polls = Rc::new(StdCell::new(0));
+        {
+            let polls = Rc::clone(&polls);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |_t| WakeThenReenter { polls });
+        }
+        assert_eq!(polls.get(), 1, "the spawn poll");
+        FsConn::new(&mut fs, &mut eng, None).run_woken();
+        assert_eq!(
+            polls.get(),
+            2,
+            "the re-entrant drain consumed the task's own wake"
+        );
+        assert_eq!(
+            fs.tasks.free.len(),
+            fs.tasks.slots.len(),
+            "the task did not run to completion"
+        );
     }
 
     /// A task awaits its child's output through the handle. The
