@@ -24,8 +24,15 @@
 //!   code inside the task submits: a task cannot hold the facade across
 //!   an `await`, so each poll runs with the delivering facade parked
 //!   where [`TaskFs`] can reach it, and nowhere else. Spawning returns
-//!   a [`JoinHandle`] resolving with the task's output; dropping the
-//!   handle detaches rather than kills.
+//!   a [`JoinHandle`] resolving with the task's output, or a
+//!   [`JoinError`]; dropping the handle detaches rather than kills.
+//! - **A panicking task is contained.** Its poll unwinds no further
+//!   than the executor: the payload reaches its [`JoinHandle`] as
+//!   [`JoinError::Panic`], the slot retires, and the reactor thread
+//!   keeps serving every other connection. This is the one place in
+//!   the crate that catches an unwind on the loop - a callback that
+//!   panics still takes the thread down - because a task is a
+//!   request's own work and a request's bug should cost the request.
 //!
 //! # Contract
 //!
@@ -38,15 +45,15 @@
 //!   `ECANCELED` rather than pending forever. That is the future form
 //!   of "dropping the continuation closes the connection": a refused
 //!   submission, or teardown, reaches the awaiting task as an error it
-//!   can act on. **It does not say which**, and the three causes want
-//!   different answers: op-table exhaustion is the documented
-//!   fan-out failure and is worth retrying, an argument the facade
-//!   refuses (an absolute path, an empty link target) is a caller
-//!   bug, and teardown means stop. The callback form cannot tell them
-//!   apart either - it drops `on_done` for all three - so a
-//!   discriminant has to come from the facade, not from here. Until
-//!   it does, a task that treats `ECANCELED` as fatal gives up work a
-//!   retry would have completed.
+//!   can act on, **and it says which**: a refused submission resolves
+//!   with the errno the facade refused it for - `EBUSY` from a full
+//!   op table, which is the documented fan-out failure and is worth
+//!   retrying, or `EINVAL` from an argument the facade will never
+//!   accept, which is a caller bug. `ECANCELED` is left meaning
+//!   teardown alone. The callback form still drops `on_done` for all
+//!   three, which is its own contract; the futures layer stages a
+//!   reason sink beside the callback, and a sink runs no consumer
+//!   code, so nothing is delivered inline from a submit path.
 //! - **A task's facade is a continuation facade.** Each poll gets a
 //!   fresh owner-scoped [`FsConn`], the same one a completion callback
 //!   is handed, and everything a continuation must tolerate - an owner
@@ -122,6 +129,20 @@ impl<V> Slot<V> {
     /// Fill with the outcome (`None` = the callback dropped unfired)
     /// and wake whoever parked.
     fn fill(&self, landed: Option<V>) {
+        {
+            // A real answer is final; `Gone` is not. The two arrive in
+            // either order - a refused submission drops its callback
+            // (which lands as `Gone`) and reports its errno through
+            // the waiter's sink - and the errno is the better answer
+            // whichever came first.
+            let cur = self.0.borrow();
+            let settled =
+                matches!(*cur, SlotState::Ready(_) | SlotState::Spent);
+            if settled || (matches!(*cur, SlotState::Gone) && landed.is_none())
+            {
+                return;
+            }
+        }
         let next = match landed {
             Some(v) => SlotState::Ready(v),
             None => SlotState::Gone,
@@ -218,21 +239,48 @@ impl<T> Future for OffloadFuture<T> {
     }
 }
 
-/// A spawned task's output, as a future. Resolves `Some` with what the
-/// task returned.
+/// Why a task produced no output.
+#[derive(Debug)]
+pub enum JoinError {
+    /// The task panicked. The payload is what the poll unwound with,
+    /// as [`catch_unwind`](std::panic::catch_unwind) yields it.
+    ///
+    /// A panicking task is contained: its slot retires, the reactor
+    /// thread lives, and every other connection on that ring keeps
+    /// being served. Nothing else in this crate contains a panic - a
+    /// callback that unwinds still takes the loop down - so this is
+    /// deliberately the narrower promise: a task's own bug is a
+    /// request's problem, not the ring's.
+    Panic(Box<dyn std::any::Any + Send>),
+    /// The task never finished and never will: dropped at teardown
+    /// before completing, or a release-build [`TaskFs::spawn`] reached
+    /// outside a poll, whose body therefore never ran at all.
+    Dropped,
+}
+
+impl std::fmt::Display for JoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JoinError::Panic(_) => f.write_str("the task panicked"),
+            JoinError::Dropped => {
+                f.write_str("the task was dropped before it finished")
+            }
+        }
+    }
+}
+
+impl std::error::Error for JoinError {}
+
+/// A spawned task's output, as a future.
 ///
-/// **`None` is not one outcome.** It answers: the task was dropped
-/// before finishing (the reactor does that only at teardown); the
-/// handle was already polled to `Ready` once; the task panicked (the
-/// unwind takes the reactor thread with it, so a live awaiter sees
-/// this only across a caught unwind); or, in a release build, the
-/// spawn never ran because [`TaskFs::spawn`] was reached outside a
-/// poll. A caller branching on `None` to stop retrying is right about
-/// the first and wrong about the last, where nothing has run at all.
+/// Resolves `Ok` with what the task returned, or [`JoinError`] when it
+/// produced nothing. Polling again after it has resolved answers
+/// [`JoinError::Dropped`]: the output is taken by the poll that got
+/// it, and a handle is not a broadcast.
 ///
 /// Dropping the handle detaches - the task runs to completion either
 /// way and its output is dropped unread. There is no kill through it.
-pub struct JoinHandle<T>(Rc<Slot<T>>);
+pub struct JoinHandle<T>(Rc<Slot<Result<T, JoinError>>>);
 
 impl<T> std::fmt::Debug for JoinHandle<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -241,10 +289,15 @@ impl<T> std::fmt::Debug for JoinHandle<T> {
 }
 
 impl<T> Future for JoinHandle<T> {
-    type Output = Option<T>;
+    type Output = Result<T, JoinError>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        self.0.poll_take(cx)
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<T, JoinError>> {
+        self.0
+            .poll_take(cx)
+            .map(|v| v.unwrap_or(Err(JoinError::Dropped)))
     }
 }
 
@@ -273,7 +326,25 @@ impl FsConn<'_> {
     ) -> FsFuture {
         let slot = Slot::new();
         let fire = Fire(Some(Rc::clone(&slot)));
+        // Why an op never reached the ring, for the future to read:
+        // `EBUSY` from a full op table is worth retrying, `EINVAL`
+        // from a refused argument is a caller bug, and teardown is
+        // neither. The callback form cannot tell them apart - it
+        // drops `on_done` for all three - so the sink is what carries
+        // the distinction to a consumer that can act on it.
+        let reason = Rc::clone(&slot);
+        self.stage_fail_sink(Box::new(move |errno| {
+            reason.fill(Some(FsDone::failed(errno)));
+        }));
         submit(self, Box::new(move |done, _conn| fire.fire(done)));
+        // A sink still staged means `submit` returned without handing
+        // the op to the core at all: the facade's own argument checks
+        // refuse ahead of that (an absolute path, an empty link
+        // target), and they are the same class of defect the core
+        // reports as `EINVAL`.
+        if let Some(sink) = self.take_fail_sink() {
+            sink(Errno::EINVAL);
+        }
         FsFuture(slot)
     }
 
@@ -322,6 +393,14 @@ impl FsConn<'_> {
     {
         let slot = Slot::new();
         let fire = Fire(Some(Rc::clone(&slot)));
+        // Type-erased so the entry, which cannot name `T`, can still
+        // answer this handle when its poll unwinds.
+        let panicked = {
+            let slot = Rc::clone(&slot);
+            Box::new(move |payload| {
+                slot.fill(Some(Err(JoinError::Panic(payload))));
+            })
+        };
         // `body` runs *inside* the first poll, not here: it is handed
         // a `TaskFs`, and a facade is parked only for the extent of a
         // poll. Building the future out here would leave every op the
@@ -329,10 +408,10 @@ impl FsConn<'_> {
         // contract advertises - with no facade to submit through.
         let task = Box::pin(async move {
             let fut = body(TaskFs::new());
-            fire.fire(fut.await);
+            fire.fire(Ok(fut.await));
         });
         let (fs, eng, owner) = self.split();
-        let id = fs.tasks.insert(eng, owner, task);
+        let id = fs.tasks.insert(eng, owner, task, panicked);
         poll_one(fs, eng, id);
         JoinHandle(slot)
     }
@@ -657,8 +736,13 @@ pub(crate) fn poll_window<R>(w: &TaskWake, poll: impl FnOnce() -> R) -> R {
     poll()
 }
 
+/// Answers a task's [`JoinHandle`] when its poll unwinds; type-erased
+/// because the table cannot name a task's output type.
+type PanicSink = Box<dyn FnOnce(Box<dyn std::any::Any + Send>)>;
+
 struct TaskEntry {
     fut: Pin<Box<dyn Future<Output = ()>>>,
+    on_panic: Option<PanicSink>,
     owner: Owner,
     wake: std::sync::Arc<TaskWake>,
     waker: Waker,
@@ -697,6 +781,7 @@ impl Tasks {
         eng: &Engine,
         owner: Owner,
         fut: Pin<Box<dyn Future<Output = ()>>>,
+        on_panic: PanicSink,
     ) -> TaskId {
         let run = self.run.get_or_insert_with(|| {
             Arc::new(RunShared {
@@ -732,6 +817,7 @@ impl Tasks {
         let waker = Waker::from(std::sync::Arc::clone(&wake));
         self.slots[idx as usize].entry = Some(TaskEntry {
             fut,
+            on_panic: Some(on_panic),
             owner,
             wake,
             waker,
@@ -855,12 +941,9 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: TaskId) {
     // future - no waker clone (and no refcount traffic) per poll.
     let mut cx = Context::from_waker(&entry.waker);
     // The entry is out of the table for the poll, so an unwinding
-    // future would drop it here and leave the slot neither occupied
-    // nor free - never reused, its generation never bumped, and
-    // `retire`'s own guard unable to see it. Catch the unwind to
-    // retire the slot, then resume: containing a panicking task is a
-    // policy this crate does not have, and the hosts have no
-    // `catch_unwind` either.
+    // future would otherwise leave the slot neither occupied nor free
+    // - never reused, its generation never bumped, and `retire`'s own
+    // guard unable to see it.
     let poll = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         poll_window(&entry.wake, || {
             with_current(&mut conn, || entry.fut.as_mut().poll(&mut cx))
@@ -870,9 +953,16 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: TaskId) {
         Ok(Poll::Ready(())) => fs.tasks.retire(idx),
         Ok(Poll::Pending) => fs.tasks.put_back(idx, entry),
         Err(payload) => {
+            // Contained: the handle learns what happened, the slot
+            // retires, and the ring keeps serving every other
+            // connection. The payload reaches the awaiter rather than
+            // the loop, so a task's own bug cannot take down requests
+            // that have nothing to do with it.
+            if let Some(sink) = entry.on_panic.take() {
+                sink(payload);
+            }
             drop(entry);
             fs.tasks.retire(idx);
-            std::panic::resume_unwind(payload);
         }
     }
 }
@@ -1180,6 +1270,10 @@ mod tests {
         if n == 8 { buf } else { 0 }
     }
 
+    fn spec_dir() -> OpenHow {
+        OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY)
+    }
+
     fn creating() -> OpenHow {
         OpenHow::new()
             .flags(OFlag::O_CREAT | OFlag::O_RDWR)
@@ -1300,32 +1394,56 @@ mod tests {
         drive(&mut fs, &mut eng, &done, "overlapping opens");
     }
 
-    /// A submission the facade refuses (an absolute path) drops the
-    /// callback unfired; the future resolves `ECANCELED` with no CQE
-    /// ever arriving, instead of pending forever.
+    /// A refused submission resolves with the reason, not a blanket
+    /// `ECANCELED`: an argument the facade will never accept answers
+    /// `EINVAL`, and a full op table answers `EBUSY` - which a task
+    /// can retry. Both arrive with no CQE ever produced.
     #[test]
-    fn a_refused_submission_resolves_ecanceled() {
+    fn a_refusal_resolves_with_the_errno_it_was_refused_for() {
         let Some((mut eng, mut fs, who)) = rig() else {
             return;
         };
         let dir = crate::tempdir::tempdir().expect("tempdir");
         let anchor = Anchor::open(dir.path()).expect("anchor");
 
-        let mut conn = FsConn::new(&mut fs, &mut eng, None);
-        let fut = conn.fut(|c, cb| {
-            c.open(who, &anchor, c"/etc/hostname", creating(), cb)
-        });
-
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
-        let mut fut = std::pin::pin!(fut);
-        let Poll::Ready(done) = fut.as_mut().poll(&mut cx) else {
+
+        // An absolute path: refused by the facade, never submitted.
+        let mut conn = FsConn::new(&mut fs, &mut eng, None);
+        let bad = conn.fut(|c, cb| {
+            c.open(who, &anchor, c"/etc/hostname", creating(), cb)
+        });
+        let mut bad = std::pin::pin!(bad);
+        let Poll::Ready(done) = bad.as_mut().poll(&mut cx) else {
             panic!("a refused submission left its future pending");
         };
         assert!(
-            matches!(done.result(), Err(crate::Error::Errno(Errno::ECANCELED))),
-            "{:?}",
+            matches!(done.result(), Err(crate::Error::Errno(Errno::EINVAL))),
+            "want EINVAL, got {:?}",
             done.result()
+        );
+
+        // Fill the op table (8 slots), then one more: EBUSY.
+        let mut held = Vec::new();
+        for _ in 0..16 {
+            held.push(
+                conn.fut(|c, cb| c.open(who, &anchor, c".", spec_dir(), cb)),
+            );
+        }
+        let busy = held
+            .into_iter()
+            .filter_map(|f| {
+                let mut f = std::pin::pin!(f);
+                match f.as_mut().poll(&mut cx) {
+                    Poll::Ready(d) => Some(d.result()),
+                    Poll::Pending => None,
+                }
+            })
+            .find(|r| matches!(r, Err(crate::Error::Errno(Errno::EBUSY))));
+        assert!(
+            busy.is_some(),
+            "a full op table must answer EBUSY, not ECANCELED"
         );
     }
 
@@ -1504,14 +1622,12 @@ mod tests {
         drop(t.fut(|_c, _cb| {}));
     }
 
-    /// A panicking poll must leave the table consistent. The entry is
-    /// out of the slot for the poll, so an unwind that skipped
-    /// `retire` would leave it neither occupied nor free: never
-    /// reused, generation never bumped, and `retire`'s own guard
-    /// unable to see it. The panic still propagates - containing one
-    /// is a policy this crate does not have.
+    /// A panicking task is contained: the caller that spawned it keeps
+    /// running, the slot retires, and the payload reaches the handle.
+    /// An unwind escaping here would take the reactor thread and every
+    /// connection on it.
     #[test]
-    fn a_panicking_task_still_retires_its_slot() {
+    fn a_panicking_task_is_contained_and_reported() {
         let Some((mut eng, mut fs, _who)) = rig() else {
             return;
         };
@@ -1524,16 +1640,33 @@ mod tests {
             }
         }
 
-        let caught =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut conn = FsConn::new(&mut fs, &mut eng, None);
-                conn.spawn(|_t| Boom);
-            }));
-        assert!(caught.is_err(), "the panic must still propagate");
+        // The default hook would print this one; it is expected.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let handle = {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(|_t| Boom)
+        };
+        std::panic::set_hook(prev);
+
         assert_eq!(
             fs.tasks.free.len(),
             fs.tasks.slots.len(),
             "the panicking task stranded its slot"
+        );
+
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut handle = std::pin::pin!(handle);
+        let Poll::Ready(Err(JoinError::Panic(payload))) =
+            handle.as_mut().poll(&mut cx)
+        else {
+            panic!("the handle did not report the panic");
+        };
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"task panic"),
+            "the payload did not survive"
         );
     }
 
@@ -1559,9 +1692,11 @@ mod tests {
         );
 
         let mut join = std::pin::pin!(t.spawn(|_t| async { 7u8 }));
-        assert_eq!(
-            join.as_mut().poll(&mut cx),
-            Poll::Ready(None),
+        assert!(
+            matches!(
+                join.as_mut().poll(&mut cx),
+                Poll::Ready(Err(JoinError::Dropped))
+            ),
             "a spawn that never ran must resolve its join"
         );
     }
@@ -1907,7 +2042,7 @@ mod tests {
                 let child = t.spawn(|t2| async move {
                     t2.offload_fut(|| Ok(40 + 2)).await.expect("child offload")
                 });
-                assert_eq!(child.await, Some(42));
+                assert_eq!(child.await.expect("child joined"), 42);
                 done.set(true);
             });
         }
@@ -1963,9 +2098,11 @@ mod tests {
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         let mut handle = std::pin::pin!(handle);
-        assert_eq!(
-            handle.as_mut().poll(&mut cx),
-            Poll::Ready(None),
+        assert!(
+            matches!(
+                handle.as_mut().poll(&mut cx),
+                Poll::Ready(Err(JoinError::Dropped))
+            ),
             "teardown must resolve the join, not strand it"
         );
     }
