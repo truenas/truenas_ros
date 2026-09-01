@@ -205,6 +205,14 @@ impl<V> Drop for Fire<V> {
 /// argument refusal turns into on this path.
 pub type OnDone = Box<dyn FnOnce(FsDone, &mut FsConn<'_>)>;
 
+/// The boxed callback [`FsConn::result_fut`] hands its closure - pass it
+/// as the `on_done` of any facade method whose outcome is a
+/// [`crate::Result`] rather than an [`FsDone`] (the offload-backed
+/// metadata tails, and the two directory-walk steps). Dropping it
+/// unfired resolves the future as `ECANCELED`, exactly as [`OnDone`]
+/// does.
+pub type OnResult<T> = Box<dyn FnOnce(crate::Result<T>, &mut FsConn<'_>)>;
+
 /// One submitted op's completion, as a future. Resolves to the same
 /// [`FsDone`] the callback form receives; a callback dropped unfired
 /// resolves as a failed `ECANCELED` outcome instead of pending forever.
@@ -376,6 +384,41 @@ impl FsConn<'_> {
         let slot = Slot::new();
         let fire = Fire(Some(Rc::clone(&slot)));
         self.offload_result(job, move |r, _conn| fire.fire(r));
+        OffloadFuture(slot)
+    }
+
+    /// Submit one op through `submit` and return its outcome as a
+    /// future - [`fut`](Self::fut) for the nine facade methods whose
+    /// callback carries a [`crate::Result`] instead of an [`FsDone`]:
+    /// both `fstatfs` forms, `flistxattr`, `fremovexattr`, the ZFS
+    /// attribute pair, `copy_file_range`, and the `open_dir`/`next_batch`
+    /// walk. Without it a handler cannot be written wholly as a task, and
+    /// the three that are hand-rollable through
+    /// [`offload_fut`](Self::offload_fut) lose real guarantees on the
+    /// way: `fremovexattr`'s allowlist and `open_dir`'s per-request
+    /// `open` are reactor state a pool job cannot see.
+    ///
+    /// ```ignore
+    /// let st = conn.result_fut(|c, cb| c.fstatfs(file.clone(), cb)).await?;
+    /// ```
+    ///
+    /// Submission is eager on the same terms as [`fut`](Self::fut). **No
+    /// reason sink is staged**, so a refusal on this shape resolves
+    /// `ECANCELED` rather than naming itself. Eight of the nine deliver
+    /// through the offload pool, where a refusal has no errno to carry
+    /// and `ECANCELED` is already
+    /// [`offload_fut`](Self::offload_fut)'s answer; `open_dir` is the
+    /// exception - its first step is a ring `open`, so a full op table
+    /// reaches this future as teardown would. Await the `open` yourself
+    /// with [`fut`](Self::fut) if that distinction matters.
+    pub fn result_fut<T, S>(&mut self, submit: S) -> OffloadFuture<T>
+    where
+        S: FnOnce(&mut FsConn<'_>, OnResult<T>),
+        T: 'static,
+    {
+        let slot = Slot::new();
+        let fire = Fire(Some(Rc::clone(&slot)));
+        submit(self, Box::new(move |r, _conn| fire.fire(r)));
         OffloadFuture(slot)
     }
 
@@ -580,6 +623,21 @@ impl TaskFs {
             Some(f) => f,
             None => {
                 debug_assert!(false, "TaskFs::offload_fut outside a task poll");
+                OffloadFuture(Slot::gone())
+            }
+        }
+    }
+
+    /// [`FsConn::result_fut`] against the running poll's facade.
+    pub fn result_fut<T, S>(&self, submit: S) -> OffloadFuture<T>
+    where
+        S: FnOnce(&mut FsConn<'_>, OnResult<T>),
+        T: 'static,
+    {
+        match with_conn(|conn| conn.result_fut(submit)) {
+            Some(f) => f,
+            None => {
+                debug_assert!(false, "TaskFs::result_fut outside a task poll");
                 OffloadFuture(Slot::gone())
             }
         }
@@ -1301,6 +1359,7 @@ mod tests {
     };
     use crate::uring_fs::{
         Anchor, Leaf, OffloadBounds, OpenStep, Personality, RwFlags, StepPath,
+        ZfsAttr,
     };
     use std::cell::Cell as StdCell;
     use std::cell::RefCell as StdRefCell;
@@ -1632,6 +1691,140 @@ mod tests {
             busy.is_some(),
             "a full op table must answer EBUSY, not ECANCELED"
         );
+    }
+
+    /// ZFS's `f_type` magic - `statfs(2)`, and `Statfs::fs_type`'s own
+    /// doc.
+    const ZFS_SUPER_MAGIC: i64 = 0x2fc1_2fc1;
+
+    /// The offload-shaped half of the facade, awaited from one task: the
+    /// capacity tail, the xattr list, the ZFS attribute ioctl,
+    /// server-side copy, and the `open_dir`/`next_batch` walk whose
+    /// first step is itself a ring op.
+    ///
+    /// This is also the module's only test whose result depends on which
+    /// filesystem it runs on, and it needs no fixture to be: it reads
+    /// `f_type` through the same `fstatfs` it is exercising, then
+    /// requires the attribute ioctl to answer `Ok` on ZFS and `ENOTTY`
+    /// anywhere else. Point `TMPDIR` at a dataset and it takes the ZFS
+    /// arm; leave it on tmpfs and it takes the other. Both arms are
+    /// assertions, so neither silently degrades into a skip.
+    ///
+    /// Outcomes are collected and asserted after the drive rather than
+    /// inside the body: an `assert!` in a task body is contained into
+    /// its `JoinHandle`, so it would surface as this test's deadline
+    /// expiring with the message lost.
+    #[test]
+    fn a_task_awaits_the_offload_shaped_ops_and_sees_the_filesystem() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm wake");
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let anchor = Anchor::open(dir.path()).expect("anchor");
+        let done = Rc::new(StdCell::new(false));
+
+        type Seen = (
+            Option<i64>,                    // fstatfs f_type
+            Option<usize>,                  // flistxattr count
+            Option<crate::Result<ZfsAttr>>, // the ioctl, either way
+            Option<crate::Result<u64>>,     // copy_file_range
+            Option<usize>,                  // next_batch names
+        );
+        let seen: Rc<StdRefCell<Seen>> =
+            Rc::new(StdRefCell::new(Default::default()));
+
+        {
+            let (done, seen) = (Rc::clone(&done), Rc::clone(&seen));
+            let anchor2 = anchor.clone();
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |t| async move {
+                let src = t
+                    .fut(|c, cb| {
+                        c.open(who, &anchor2, c"src.bin", creating(), cb)
+                    })
+                    .await
+                    .file()
+                    .expect("open src");
+                let wrote = t
+                    .fut(|c, cb| {
+                        c.pwritev2(
+                            who,
+                            src.clone(),
+                            vec![b"payload".to_vec()],
+                            0,
+                            RwFlags::empty(),
+                            cb,
+                        )
+                    })
+                    .await;
+                assert_eq!(wrote.result().expect("write"), 7);
+
+                let st = t
+                    .result_fut(|c, cb| c.fstatfs(src.clone(), cb))
+                    .await
+                    .expect("fstatfs");
+                seen.borrow_mut().0 = Some(st.fs_type());
+
+                let names = t
+                    .result_fut(|c, cb| c.flistxattr(src.clone(), cb))
+                    .await
+                    .expect("flistxattr");
+                seen.borrow_mut().1 = Some(names.len());
+
+                seen.borrow_mut().2 = Some(
+                    t.result_fut(|c, cb| c.fget_zfs_attrs(src.clone(), cb))
+                        .await,
+                );
+
+                let dst = t
+                    .fut(|c, cb| {
+                        c.open(who, &anchor2, c"dst.bin", creating(), cb)
+                    })
+                    .await
+                    .file()
+                    .expect("open dst");
+                seen.borrow_mut().3 = Some(
+                    t.result_fut(|c, cb| {
+                        c.copy_file_range(src.clone(), dst, 0, 0, 7, cb)
+                    })
+                    .await,
+                );
+
+                let walk = t
+                    .result_fut(|c, cb| c.open_dir(who, &anchor2, cb))
+                    .await
+                    .expect("open_dir");
+                let batch = t
+                    .result_fut(|c, cb| c.next_batch(&walk, cb))
+                    .await
+                    .expect("next_batch");
+                seen.borrow_mut().4 = Some(batch.names.len());
+
+                done.set(true);
+            });
+        }
+        drive(&mut fs, &mut eng, &done, "offload-shaped ops");
+
+        let (f_type, xattrs, zfs, copied, entries) =
+            std::mem::take(&mut *seen.borrow_mut());
+        let f_type = f_type.expect("fstatfs answered");
+        assert_eq!(xattrs, Some(0), "a fresh file carries no xattrs");
+        assert_eq!(copied.expect("copy answered").expect("copy"), 7);
+        assert_eq!(entries, Some(2), "src.bin and dst.bin");
+
+        let zfs = zfs.expect("the ioctl answered");
+        if f_type == ZFS_SUPER_MAGIC {
+            zfs.expect("a ZFS dataset must answer the attribute ioctl");
+        } else {
+            match zfs {
+                Err(crate::Error::Errno(Errno::ENOTTY)) => {}
+                other => panic!(
+                    "f_type {f_type:#x} is not ZFS, so the attribute ioctl \
+                     must answer ENOTTY, not {other:?}"
+                ),
+            }
+        }
     }
 
     /// A refusal hands the payload back, because the retry it advises

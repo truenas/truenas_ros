@@ -203,7 +203,9 @@
 //!
 //! Completion callbacks stay the primitive, and a second consumption
 //! style sits on them: [`FsConn::fut`] returns one submission's outcome
-//! as a future, and [`FsConn::spawn`] runs a `'static` future as an
+//! as a future - [`FsConn::result_fut`] for the offload-shaped methods,
+//! whose callback carries a [`crate::Result`] rather than an
+//! [`FsDone`] - and [`FsConn::spawn`] runs a `'static` future as an
 //! on-loop **task**, submitting through the [`TaskFs`] its body
 //! receives. A multi-step chain then reads as straight-line
 //! `async`/`await` instead of a hop per completion, with the same
@@ -238,7 +240,7 @@ pub use core::{
 // every op it submits goes through `FsConn`'s methods above.
 pub(crate) mod task;
 pub use task::{
-    FsFuture, JoinError, JoinHandle, OffloadFuture, OnDone, TaskFs,
+    FsFuture, JoinError, JoinHandle, OffloadFuture, OnDone, OnResult, TaskFs,
 };
 
 pub mod query_dir;
