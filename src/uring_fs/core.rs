@@ -3815,19 +3815,18 @@ mod hybrid_tests {
         dir
     }
 
-    /// Run `f` with panic printing silenced, serialized against every other
-    /// hook-swapping test: the hook is process-global and tests run as
-    /// threads in one binary, so two unserialized swaps can interleave and
-    /// strand the silent hook. Keep assertions outside `f` - a panic inside
-    /// it leaves the hook silenced for the rest of the run.
+    /// Run `f` with this thread's panic printing silenced, serialized
+    /// against every other hook-swapping test: installing a hook is
+    /// process-global and tests run as threads in one binary, so two
+    /// unserialized swaps can interleave and strand one of them. The
+    /// filter forwards other threads' panics, so a concurrent test's
+    /// real failure still names itself; a panic inside `f` restores the
+    /// hook on the way out.
     fn with_silent_panics<R>(f: impl FnOnce() -> R) -> R {
         static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _serialized = HOOK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let r = f();
-        std::panic::set_hook(prev);
-        r
+        let _quiet = crate::uring_fs::quiet_panics_on_this_thread();
+        f()
     }
 
     /// `a/b/leaf` under a fresh directory, for the chain tests.

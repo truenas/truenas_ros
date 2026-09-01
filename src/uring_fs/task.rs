@@ -34,6 +34,15 @@
 //!   panics still takes the thread down - because a task is a
 //!   request's own work and a request's bug should cost the request.
 //!
+//!   Containment covers **the disposal of what the poll produced**, not
+//!   only the poll. A detached task's output is dropped by the
+//!   executor, because the handle is gone and nothing else holds the
+//!   slot, and that drop runs inside the same guard; outside it an
+//!   output whose `Drop` unwinds would take the delivery path, which is
+//!   the reactor thread. An output handed to a live [`JoinHandle`] is
+//!   disposed of by whoever polls or drops that handle, in their frame,
+//!   like any other value.
+//!
 //! # Contract
 //!
 //! - **Submission is eager.** The op is in flight when [`FsConn::fut`]
@@ -166,17 +175,30 @@ impl<V> Slot<V> {
         }
     }
 
-    fn poll_take(&self, cx: &mut Context<'_>) -> Poll<Option<V>> {
+    fn poll_take(&self, cx: &mut Context<'_>) -> Poll<Took<V>> {
         let mut s = self.0.borrow_mut();
         match std::mem::replace(&mut *s, SlotState::Spent) {
-            SlotState::Ready(v) => Poll::Ready(Some(v)),
-            SlotState::Gone | SlotState::Spent => Poll::Ready(None),
+            SlotState::Ready(v) => Poll::Ready(Took::Value(v)),
+            SlotState::Gone => Poll::Ready(Took::Gone),
+            SlotState::Spent => Poll::Ready(Took::Spent),
             SlotState::Pending(_) => {
                 *s = SlotState::Pending(Some(cx.waker().clone()));
                 Poll::Pending
             }
         }
     }
+}
+
+/// What a poll took out of a slot. Three outcomes, because the two
+/// empty ones need different answers: nothing ever landed, against an
+/// earlier poll having taken what did.
+enum Took<V> {
+    Value(V),
+    /// The filler was dropped unfired - a refused submission with no
+    /// reason to report, or teardown.
+    Gone,
+    /// A previous poll took the outcome. A slot is not a broadcast.
+    Spent,
 }
 
 /// The filling half of a slot: firing consumes it; dropping it unfired
@@ -227,10 +249,16 @@ impl std::fmt::Debug for FsFuture {
 impl Future for FsFuture {
     type Output = FsDone;
 
+    /// A second poll answers `ECANCELED` too, with
+    /// [`FsDone::was_refused`] false: the outcome went to the poll that
+    /// got it, and there is nothing left to hand over. Distinguishing
+    /// that from teardown would cost a variant nobody can act on -
+    /// polling a resolved future again is a caller bug either way.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<FsDone> {
-        self.0
-            .poll_take(cx)
-            .map(|v| v.unwrap_or_else(|| FsDone::failed(Errno::ECANCELED)))
+        self.0.poll_take(cx).map(|took| match took {
+            Took::Value(done) => done,
+            Took::Gone | Took::Spent => FsDone::failed(Errno::ECANCELED),
+        })
     }
 }
 
@@ -247,13 +275,15 @@ impl<T> std::fmt::Debug for OffloadFuture<T> {
 impl<T> Future for OffloadFuture<T> {
     type Output = crate::Result<T>;
 
+    /// A second poll answers `ECANCELED` too; see [`FsFuture::poll`].
     fn poll(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<crate::Result<T>> {
-        self.0
-            .poll_take(cx)
-            .map(|v| v.unwrap_or_else(|| Err(Errno::ECANCELED.into())))
+        self.0.poll_take(cx).map(|took| match took {
+            Took::Value(r) => r,
+            Took::Gone | Took::Spent => Err(Errno::ECANCELED.into()),
+        })
     }
 }
 
@@ -270,10 +300,18 @@ pub enum JoinError {
     /// deliberately the narrower promise: a task's own bug is a
     /// request's problem, not the ring's.
     Panic(Box<dyn std::any::Any + Send>),
-    /// The task never finished and never will: dropped at teardown
-    /// before completing, or a release-build [`TaskFs::spawn`] reached
-    /// outside a poll, whose body therefore never ran at all.
+    /// The task produced no output and never will: dropped at teardown
+    /// before completing, or a release-build [`TaskFs::spawn`] called
+    /// out of turn, whose body therefore never ran at all. Both are
+    /// "this work did not happen"; neither is worth retrying through
+    /// this handle, which has no task behind it either way.
     Dropped,
+    /// This handle already yielded the task's output. A handle is not a
+    /// broadcast: the poll that got the output took it, and the task
+    /// itself ran to completion - which is why this is not [`Dropped`],
+    /// whose answer is "look at why the work did not happen" and whose
+    /// answer here is "fix the caller polling a resolved handle".
+    Consumed,
 }
 
 impl std::fmt::Display for JoinError {
@@ -281,7 +319,10 @@ impl std::fmt::Display for JoinError {
         match self {
             JoinError::Panic(_) => f.write_str("the task panicked"),
             JoinError::Dropped => {
-                f.write_str("the task was dropped before it finished")
+                f.write_str("the task produced no output and never will")
+            }
+            JoinError::Consumed => {
+                f.write_str("this join handle was already consumed")
             }
         }
     }
@@ -293,11 +334,17 @@ impl std::error::Error for JoinError {}
 ///
 /// Resolves `Ok` with what the task returned, or [`JoinError`] when it
 /// produced nothing. Polling again after it has resolved answers
-/// [`JoinError::Dropped`]: the output is taken by the poll that got
-/// it, and a handle is not a broadcast.
+/// [`JoinError::Consumed`]: the output went to the poll that got it,
+/// and a handle is not a broadcast.
 ///
 /// Dropping the handle detaches - the task runs to completion either
 /// way and its output is dropped unread. There is no kill through it.
+///
+/// **A detached task's panic has no programmatic recipient.** It is
+/// still contained and the slot still retires, but
+/// [`JoinError::Panic`] lands in a slot nobody reads, so the default
+/// panic hook printing it is the only report. Keep the handle for work
+/// whose failure has to be acted on.
 pub struct JoinHandle<T>(Rc<Slot<Result<T, JoinError>>>);
 
 impl<T> std::fmt::Debug for JoinHandle<T> {
@@ -313,9 +360,11 @@ impl<T> Future for JoinHandle<T> {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<T, JoinError>> {
-        self.0
-            .poll_take(cx)
-            .map(|v| v.unwrap_or(Err(JoinError::Dropped)))
+        self.0.poll_take(cx).map(|took| match took {
+            Took::Value(out) => out,
+            Took::Gone => Err(JoinError::Dropped),
+            Took::Spent => Err(JoinError::Consumed),
+        })
     }
 }
 
@@ -491,6 +540,47 @@ std::thread_local! {
     /// for [`TaskFs`] to reach. `None` outside a poll.
     static CURRENT: Cell<Option<NonNull<FsConn<'static>>>> =
         const { Cell::new(None) };
+
+    /// Which task that poll is running. Set and cleared with
+    /// [`CURRENT`], by [`with_current`] alone.
+    ///
+    /// A [`TaskFs`] carries the id it was minted under and is refused
+    /// against any other, so a handle that left its body cannot submit
+    /// during a different task's poll. Without it the facade is reached
+    /// by whoever is running, and an op written in one task's terms is
+    /// stamped another's owner - the wrong connection's teardown sweep
+    /// cancels it, the right one leaves its descriptor parked, and
+    /// nothing anywhere says so.
+    static CURRENT_TASK: Cell<Option<TaskId>> = const { Cell::new(None) };
+
+    /// Set while a [`Tasks`] table is dropping the futures still parked
+    /// in it, so a destructor that reaches [`TaskFs`] is answered rather
+    /// than asserted at. See [`Tasks::drop`].
+    static TEARDOWN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Restore [`CURRENT_TASK`] on scope exit, a panic included - the pair
+/// of [`Restore`] for the id that travels with the parked facade.
+struct RestoreTask(Option<TaskId>);
+
+impl Drop for RestoreTask {
+    fn drop(&mut self) {
+        CURRENT_TASK.with(|c| c.set(self.0));
+    }
+}
+
+/// The same, for [`TEARDOWN`].
+struct RestoreTeardown(bool);
+
+impl Drop for RestoreTeardown {
+    fn drop(&mut self) {
+        TEARDOWN.with(|c| c.set(self.0));
+    }
+}
+
+/// Whether a [`Tasks`] table is dropping its pending futures right now.
+fn tearing_down() -> bool {
+    TEARDOWN.with(|c| c.get())
 }
 
 /// The cell a scoped pointer parks in.
@@ -546,19 +636,33 @@ fn reach_in<T: 'static, R>(
     })
 }
 
-/// Park `conn` in [`CURRENT`] for the duration of `f` (a task poll).
-fn with_current<R>(conn: &mut FsConn<'_>, f: impl FnOnce() -> R) -> R {
+/// Park `conn`, and the id of the task it is being polled for, for the
+/// duration of `f`.
+fn with_current<R>(
+    conn: &mut FsConn<'_>,
+    task: TaskId,
+    f: impl FnOnce() -> R,
+) -> R {
     // The lifetime is erased for storage only: the pointer is taken
     // back out strictly inside `f`'s dynamic extent, where `conn` is
     // still exclusively this frame's.
     let ptr = NonNull::from(conn).cast::<FsConn<'static>>();
+    let _task = RestoreTask(CURRENT_TASK.with(|c| c.replace(Some(task))));
     park_in(&CURRENT, ptr, f)
 }
 
-/// Reach the poll's parked facade. `None` outside a poll. The pointer
-/// is *taken* for the call - a nested reach sees an empty cell rather
-/// than a second `&mut` to the same facade.
-fn with_conn<R>(f: impl FnOnce(&mut FsConn<'_>) -> R) -> Option<R> {
+/// Reach the poll's parked facade **on behalf of `who`**. `None`
+/// outside a poll, and `None` when the running poll is some other
+/// task's - a handle that left its body. The pointer is *taken* for the
+/// call, so a nested reach sees an empty cell rather than a second
+/// `&mut` to the same facade.
+fn with_conn<R>(
+    who: Option<TaskId>,
+    f: impl FnOnce(&mut FsConn<'_>) -> R,
+) -> Option<R> {
+    if who.is_none() || CURRENT_TASK.with(|c| c.get()) != who {
+        return None;
+    }
     // The `'static` in the cell is storage-only: `f` is generic over
     // the facade's lifetime, so the reference cannot escape it.
     reach_in(&CURRENT, f)
@@ -567,22 +671,39 @@ fn with_conn<R>(f: impl FnOnce(&mut FsConn<'_>) -> R) -> Option<R> {
 /// A task's handle to the facade of whichever poll is running it.
 ///
 /// Handed to the task body by [`FsConn::spawn`]; methods work only
-/// while the task is being polled (which is the only time the task's
-/// code runs). It is not `Send`: a task and its ops belong to the loop
-/// thread. Smuggling it elsewhere and calling it there debug-asserts,
+/// while that task is being polled. It is not `Send`: a task and its
+/// ops belong to the loop thread. Calling one out of turn debug-asserts,
 /// and in release resolves the op as `ECANCELED` / drops the spawn,
 /// the facade's shape for a submission that cannot happen.
 ///
-/// **Deliberately not `Clone`.** It carries no task identity, so a
-/// copy kept past its poll - parked in connection state, say - and
-/// used during a *different* task's poll would find `CURRENT`
-/// populated, submit against that task's facade, and be stamped its
-/// owner: the wrong connection's teardown sweep would then cancel the
-/// op, and the right one would leave its descriptor parked. No assert
-/// can catch that, because from inside the cell it is indistinguishable
-/// from a legitimate submission. Without `Clone` the handle cannot
-/// outlive the body it was handed to.
+/// A poll is not the only time a task's code runs: **destructors do
+/// too**, including at teardown, where the tables the facade would
+/// borrow are already gone. A guard of the "submit on drop" shape
+/// therefore reaches this outside a poll by design, and teardown is the
+/// one place that is not misuse - the assert is suppressed there and
+/// the submission is refused like any other that cannot happen. See
+/// [`Tasks::drop`].
+///
+/// **It carries the id of the task it was minted for**, and every
+/// method is refused unless that is the task being polled. The handle
+/// is `'static` and `!Send`, so removing `Clone` does not keep it
+/// inside its body: a body can *move* it into any `'static` non-`Send`
+/// place on the loop thread - connection state, a `thread_local!` - and
+/// something else can pick it up there. Used during a different task's
+/// poll it would otherwise find `CURRENT` populated, submit against
+/// that task's facade and be stamped its owner, so the wrong
+/// connection's teardown sweep would cancel the op and the right one
+/// would leave its descriptor parked, with no diagnostic anywhere. The
+/// id is what makes that case indistinguishable from reaching outside a
+/// poll, which is a refusal this already had a shape for.
+///
+/// Not `Clone` all the same: nothing needs a second handle, and the
+/// narrower surface is one less thing for the id check to be the only
+/// guard on.
 pub struct TaskFs {
+    /// `None` is unreachable - a body is built inside its own first
+    /// poll - and fails every method closed if it ever is not.
+    task: Option<TaskId>,
     _on_loop: PhantomData<Rc<()>>,
 }
 
@@ -595,6 +716,7 @@ impl std::fmt::Debug for TaskFs {
 impl TaskFs {
     fn new() -> TaskFs {
         TaskFs {
+            task: CURRENT_TASK.with(|c| c.get()),
             _on_loop: PhantomData,
         }
     }
@@ -604,10 +726,13 @@ impl TaskFs {
         &self,
         submit: impl FnOnce(&mut FsConn<'_>, OnDone),
     ) -> FsFuture {
-        match with_conn(|conn| conn.fut(submit)) {
+        match with_conn(self.task, |conn| conn.fut(submit)) {
             Some(f) => f,
             None => {
-                debug_assert!(false, "TaskFs::fut outside a task poll");
+                debug_assert!(
+                    tearing_down(),
+                    "TaskFs::fut outside a task poll"
+                );
                 FsFuture(Slot::gone())
             }
         }
@@ -619,10 +744,13 @@ impl TaskFs {
         J: FnOnce() -> crate::Result<T> + Send + 'static,
         T: Send + 'static,
     {
-        match with_conn(|conn| conn.offload_fut(job)) {
+        match with_conn(self.task, |conn| conn.offload_fut(job)) {
             Some(f) => f,
             None => {
-                debug_assert!(false, "TaskFs::offload_fut outside a task poll");
+                debug_assert!(
+                    tearing_down(),
+                    "TaskFs::offload_fut outside a task poll"
+                );
                 OffloadFuture(Slot::gone())
             }
         }
@@ -634,10 +762,13 @@ impl TaskFs {
         S: FnOnce(&mut FsConn<'_>, OnResult<T>),
         T: 'static,
     {
-        match with_conn(|conn| conn.result_fut(submit)) {
+        match with_conn(self.task, |conn| conn.result_fut(submit)) {
             Some(f) => f,
             None => {
-                debug_assert!(false, "TaskFs::result_fut outside a task poll");
+                debug_assert!(
+                    tearing_down(),
+                    "TaskFs::result_fut outside a task poll"
+                );
                 OffloadFuture(Slot::gone())
             }
         }
@@ -654,10 +785,13 @@ impl TaskFs {
         Fut: Future<Output = T> + 'static,
         T: 'static,
     {
-        match with_conn(|conn| conn.spawn(body)) {
+        match with_conn(self.task, |conn| conn.spawn(body)) {
             Some(handle) => handle,
             None => {
-                debug_assert!(false, "TaskFs::spawn outside a task poll");
+                debug_assert!(
+                    tearing_down(),
+                    "TaskFs::spawn outside a task poll"
+                );
                 JoinHandle(Slot::gone())
             }
         }
@@ -843,6 +977,31 @@ pub(crate) struct Tasks {
     /// Lazily built at the first spawn: the queue needs the engine's
     /// wake eventfd, which `FsCore::new` does not see.
     run: Option<Arc<RunShared>>,
+}
+
+impl Drop for Tasks {
+    /// Drop the still-pending futures inside a [`TEARDOWN`] mark.
+    ///
+    /// A task pending when the reactor's tables go has its destructors
+    /// run with no poll on the stack, so a guard that submits on drop
+    /// reaches [`TaskFs`] and finds nothing parked. Asserting is right
+    /// for a handle used out of turn and wrong here: this is the
+    /// documented "whatever outlives the loop is dropped with the
+    /// reactor's tables", and in a debug build the assert is a *second*
+    /// panic - which, when the teardown is itself an unwind, aborts the
+    /// process and replaces the diagnosis of the first panic with a bare
+    /// SIGABRT. Both profiles run in the gate.
+    ///
+    /// Parking a facade for the drop instead is not available: `tasks`
+    /// is the last field of `FsCore` and nothing above it has a `Drop`,
+    /// so `ops` and `offload_reg` are already destroyed by the time this
+    /// runs and the facade would name a dead op table.
+    fn drop(&mut self) {
+        let _restore = RestoreTeardown(TEARDOWN.with(|c| c.replace(true)));
+        // Explicit, because the field's own drop glue runs *after* this
+        // returns - by then the mark is cleared.
+        self.slots.clear();
+    }
 }
 
 impl Tasks {
@@ -1069,9 +1228,21 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: TaskId) {
     // - never reused, its generation never bumped, and `retire`'s own
     // guard unable to see it.
     let poll = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        poll_window(&entry.wake, || {
-            with_current(&mut conn, || entry.fut.as_mut().poll(&mut cx))
-        })
+        let done = poll_window(&entry.wake, || {
+            with_current(&mut conn, id, || entry.fut.as_mut().poll(&mut cx))
+        });
+        // A finished task has just put its output in the slot, and the
+        // panic sink below is the executor's share of that slot. With
+        // the handle detached - which the contract blesses - it is the
+        // *last* share, so releasing it runs the output's destructor.
+        // Release it here, under the guard: outside, that destructor
+        // runs on the delivery path with nothing to catch it, and an
+        // output whose `Drop` panics takes the reactor thread and every
+        // connection on it down.
+        if done.is_ready() {
+            drop(entry.on_panic.take());
+        }
+        done
     }));
     match poll {
         Ok(Poll::Ready(())) => fs.tasks.retire(idx),
@@ -1082,9 +1253,19 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: TaskId) {
             // connection. The payload reaches the awaiter rather than
             // the loop, so a task's own bug cannot take down requests
             // that have nothing to do with it.
-            if let Some(sink) = entry.on_panic.take() {
-                sink(payload);
-            }
+            //
+            // Guarded for the reason above: filling a detached handle's
+            // slot is what releases the last share of it, so the
+            // payload's own disposal must not unwind the delivery path
+            // either. A sink already taken above is a `Ready` poll whose
+            // output panicked on the way out - contained, and with the
+            // handle gone there is nobody left to report it to.
+            let _ =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Some(sink) = entry.on_panic.take() {
+                        sink(payload);
+                    }
+                }));
             drop(entry);
             fs.tasks.retire(idx);
         }
@@ -2176,6 +2357,62 @@ mod tests {
         drive(&mut fs, &mut eng, &done, "offload future");
     }
 
+    /// A detached task's output is dropped by the executor, on the
+    /// delivery path. Its destructor must therefore unwind no further
+    /// than the poll guard, or one request's output takes the reactor
+    /// thread and every connection on it down.
+    #[test]
+    fn a_detached_tasks_output_drops_inside_the_guard() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm wake");
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let anchor = Anchor::open(dir.path()).expect("anchor");
+
+        struct Boom;
+        impl Drop for Boom {
+            fn drop(&mut self) {
+                panic!("a task output's drop glue");
+            }
+        }
+
+        {
+            let anchor2 = anchor.clone();
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            // Detached, and pending: the handle is gone before the poll
+            // that finishes the task, so the executor holds the last
+            // share of the slot the output lands in.
+            drop(conn.spawn(move |t| async move {
+                let _ = t
+                    .fut(|c, cb| {
+                        c.open(who, &anchor2, c"boom.bin", creating(), cb)
+                    })
+                    .await;
+                Boom
+            }));
+        }
+
+        let _quiet = crate::uring_fs::quiet_panics_on_this_thread();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut turns = 0;
+        while fs.tasks.live.get() != 0 {
+            assert!(Instant::now() < deadline, "the task never finished");
+            let escaped =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    turn(&mut fs, &mut eng)
+                }));
+            let Ok(reaped) = escaped else {
+                panic!("a drop-glue panic escaped onto the delivery path");
+            };
+            turns += 1;
+            if reaped == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(turns > 0, "the drive never ran a turn");
+    }
+
     /// A task spawned from inside a task runs, and slots recycle once
     /// tasks retire - the second spawn reuses the first one's slot.
     #[test]
@@ -2288,6 +2525,179 @@ mod tests {
         ));
     }
 
+    /// The three ways a join yields no output need three answers. A
+    /// handle polled twice conflated with a task torn down before it
+    /// finished sends a reader looking for work that did not happen,
+    /// when what happened is that the work finished and this caller
+    /// asked twice.
+    #[test]
+    fn a_second_join_poll_is_not_a_task_that_never_finished() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let handle = {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(|_t| async { 7u32 })
+        };
+        let mut handle = std::pin::pin!(handle);
+        assert!(matches!(handle.as_mut().poll(&mut cx), Poll::Ready(Ok(7))));
+        let Poll::Ready(Err(e)) = handle.as_mut().poll(&mut cx) else {
+            panic!("a spent handle must resolve, not pend");
+        };
+        assert!(
+            matches!(e, JoinError::Consumed),
+            "a spent handle must not read as a task that never ran: {e}"
+        );
+
+        // And the genuine no-output case still reads as one.
+        struct Park;
+        impl Future for Park {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+        let parked = {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(|_t| Park)
+        };
+        drop(fs); // teardown: the task never finishes
+        let mut parked = std::pin::pin!(parked);
+        let Poll::Ready(Err(e)) = parked.as_mut().poll(&mut cx) else {
+            panic!("a torn-down task must resolve its handle");
+        };
+        assert!(matches!(e, JoinError::Dropped), "want Dropped, got {e}");
+    }
+
+    /// A task still pending at teardown has its future dropped with no
+    /// poll on the stack. A guard of the "submit on drop" shape reaches
+    /// `TaskFs` there, and that is not misuse - it is the documented
+    /// "whatever outlives the loop is dropped with the reactor's
+    /// tables". In a debug build an assert there is a second panic, and
+    /// a teardown that is itself an unwind then aborts, replacing the
+    /// first panic's diagnosis with a bare SIGABRT.
+    ///
+    /// One test for both profiles: the release build never asserted, so
+    /// what it pins is that the shape stays a silent no-op.
+    #[test]
+    fn a_task_dropped_at_teardown_may_reach_its_facade() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+
+        struct SubmitOnDrop(TaskFs);
+        impl Drop for SubmitOnDrop {
+            fn drop(&mut self) {
+                // Refused, because there is no poll - but refused
+                // quietly, because this is teardown.
+                drop(self.0.fut(|_c, _cb| {}));
+            }
+        }
+        struct Park(#[allow(dead_code)] SubmitOnDrop);
+        impl Future for Park {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            drop(conn.spawn(|t| Park(SubmitOnDrop(t))));
+        }
+        assert_eq!(fs.tasks.live.get(), 1, "the task is parked");
+        // The teardown itself: no panic, in either profile.
+        drop(fs);
+    }
+
+    /// A `TaskFs` that left its body cannot submit under whatever task
+    /// happens to be running.
+    ///
+    /// Removing `Clone` does not keep it inside its body - the handle is
+    /// `'static` and `!Send`, so a body can *move* it into any
+    /// `'static` non-`Send` place on the loop thread and something else
+    /// can pick it up there. Identity is what refuses it: without the
+    /// check the op is submitted against the running task's facade and
+    /// stamped its owner, so the wrong connection's teardown sweep
+    /// cancels it and the right one leaves its descriptor parked.
+    ///
+    /// The debug half; `_without_asserts` is the release sibling, and
+    /// the gate runs both profiles.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_smuggled_task_handle_is_refused() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        let smuggled: Rc<StdRefCell<Option<TaskFs>>> =
+            Rc::new(StdRefCell::new(None));
+
+        let outcome = {
+            let stash = Rc::clone(&smuggled);
+            let take = Rc::clone(&smuggled);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            // A: hands its own handle out and ends.
+            drop(conn.spawn(move |t| async move {
+                *stash.borrow_mut() = Some(t);
+            }));
+            // B: picks it up and submits through it during *its* poll.
+            let _quiet = crate::uring_fs::quiet_panics_on_this_thread();
+            conn.spawn(move |_t| async move {
+                let other = take.borrow_mut().take().expect("A ran first");
+                drop(other.fut(|_c, _cb| {}));
+            })
+        };
+
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut outcome = std::pin::pin!(outcome);
+        let Poll::Ready(Err(JoinError::Panic(_))) =
+            outcome.as_mut().poll(&mut cx)
+        else {
+            panic!("a smuggled handle submitted under the wrong task");
+        };
+    }
+
+    /// The release half: no assert to catch it, so the state is what
+    /// has to say so - the submission never happens and the future
+    /// resolves as one that cannot.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn a_smuggled_task_handle_is_refused_without_asserts() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        let smuggled: Rc<StdRefCell<Option<TaskFs>>> =
+            Rc::new(StdRefCell::new(None));
+        let seen: Rc<StdCell<Option<Errno>>> = Rc::new(StdCell::new(None));
+
+        {
+            let stash = Rc::clone(&smuggled);
+            let take = Rc::clone(&smuggled);
+            let out = Rc::clone(&seen);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            drop(conn.spawn(move |t| async move {
+                *stash.borrow_mut() = Some(t);
+            }));
+            drop(conn.spawn(move |_t| async move {
+                let other = take.borrow_mut().take().expect("A ran first");
+                let done = other.fut(|_c, _cb| {}).await;
+                out.set(match done.result() {
+                    Err(crate::Error::Errno(e)) => Some(e),
+                    _ => None,
+                });
+            }));
+        }
+        assert_eq!(
+            seen.get(),
+            Some(Errno::ECANCELED),
+            "a smuggled handle must submit nothing"
+        );
+    }
+
     /// The debug half: reaching `TaskFs` outside a poll asserts.
     #[cfg(debug_assertions)]
     #[test]
@@ -2348,14 +2758,14 @@ mod tests {
             }
         }
 
-        // The default hook would print this one; it is expected.
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
+        // The default hook would print this one; it is expected. Scoped
+        // to this thread, so a concurrent test's real panic still
+        // reaches the terminal.
         let handle = {
+            let _quiet = crate::uring_fs::quiet_panics_on_this_thread();
             let mut conn = FsConn::new(&mut fs, &mut eng, None);
             conn.spawn(|_t| Boom)
         };
-        std::panic::set_hook(prev);
 
         assert_eq!(
             fs.tasks.free.len(),
@@ -2757,8 +3167,10 @@ mod tests {
                 if self.polls.get() == 1 {
                     cx.waker().wake_by_ref();
                     // The documented hand-wake shape: re-enter the
-                    // executor from inside the poll.
-                    with_conn(|c| c.run_woken());
+                    // executor from inside the poll, through the id of
+                    // whichever task that is.
+                    let me = CURRENT_TASK.with(|c| c.get());
+                    with_conn(me, |c| c.run_woken());
                     return Poll::Pending;
                 }
                 Poll::Ready(())
