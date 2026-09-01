@@ -904,9 +904,9 @@ pub(crate) struct RunShared {
     /// Set for the extent of a [`drain`] pass. A wake landing inside a
     /// pass is taken by that pass or by its trailing poke; a wake
     /// landing outside one has nothing scheduled to collect it, so it
-    /// must poke for itself. Nested passes clear it early, which can
-    /// only cause a redundant poke - never a missed one - so the flag
-    /// needs no depth count.
+    /// must poke for itself. Written only through
+    /// [`RunShared::begin_pass`] and [`PassGuard`], so the models and
+    /// the loop share one spelling of the ordering.
     draining: AtomicBool,
     /// The loop's shared flags and wake eventfd.
     wake: Arc<LoopShared>,
@@ -926,6 +926,19 @@ impl RunShared {
     /// Whether the caller is off the loop thread. Under loom there is
     /// no thread identity to read, so a model states which side it is
     /// exercising; both are modelled.
+    /// Mark a drain pass live, answering what was there before so
+    /// [`PassGuard`] can put it back.
+    ///
+    /// A nested pass - a callback calling
+    /// [`run_woken`](FsConn::run_woken) from inside a delivery - must
+    /// not un-mark the outer one when it ends: the outer pass's
+    /// remaining deliveries would then poke the loop for work the
+    /// outer pass is already about to do. Restoring rather than
+    /// clearing is one word here and removes the depth question.
+    fn begin_pass(&self) -> bool {
+        self.draining.swap(true, Ordering::AcqRel)
+    }
+
     fn off_loop(&self) -> bool {
         #[cfg(loom)]
         {
@@ -1018,8 +1031,25 @@ pub(crate) fn wake_task(w: &TaskWake) -> bool {
 /// the loom model bites on; the pairing lives here, once, so the model
 /// drives the shipping order rather than a copy of it.
 ///
+/// **A swap, not a store, because this is the acquire half of the
+/// dedup edge.** A wake that finds the flag already set
+/// ([`wake_task`]'s early return) touches nothing else: it does not
+/// take the run-queue lock, so the lock is not there to carry what the
+/// waker published before waking, and the covering poll is this one. A
+/// plain store cannot read the release that skipping waker performed,
+/// so it establishes no happens-before and the poll may run against
+/// stale data. tokio writes its state back unchanged on exactly this
+/// path for exactly this reason (`runtime/task/state.rs`,
+/// "to pair with the Acquire in `transition_to_running`").
+///
+/// In-tree no waker leaves the loop thread - every [`Slot`] is a
+/// `RefCell` behind an `Rc` and the only production `wake()` is inside
+/// [`Slot::fill`] - so this pairs nothing today. It is the public
+/// [`Waker`] surface that makes it reachable: an off-loop lock-free
+/// waker is what a consumer may legitimately build, and its readiness
+/// would otherwise be invisible to the poll that is meant to cover it.
 pub(crate) fn poll_window<R>(w: &TaskWake, poll: impl FnOnce() -> R) -> R {
-    w.queued.store(false, Ordering::Release);
+    w.queued.swap(false, Ordering::AcqRel);
     poll()
 }
 
@@ -1225,13 +1255,16 @@ impl Tasks {
     }
 }
 
-/// Marks a drain pass live for [`wake_task`], and clears it however
-/// the pass ends.
-struct PassGuard(Arc<RunShared>);
+/// Puts the drain-pass mark back however the pass ends, an unwinding
+/// poll included: a flag left set would silence every later wake's
+/// poke, and a flag cleared by a *nested* pass would put the outer
+/// pass's remaining deliveries back to poking. See
+/// [`RunShared::begin_pass`].
+struct PassGuard(Arc<RunShared>, bool);
 
 impl Drop for PassGuard {
     fn drop(&mut self) {
-        self.0.draining.store(false, Ordering::Release);
+        self.0.draining.store(self.1, Ordering::Release);
     }
 }
 
@@ -1253,21 +1286,21 @@ impl Drop for PassGuard {
 /// none of that, and an awaited op should not either.
 ///
 /// A nested [`drain`] - a callback calling
-/// [`run_woken`](FsConn::run_woken) - clears the flag when it returns,
-/// which costs the redundant poke back for the rest of this pass and
-/// never a wake.
+/// [`run_woken`](FsConn::run_woken) - restores the mark rather than
+/// clearing it, so the rest of this pass keeps it.
 pub(crate) fn in_pass(
     fs: &mut FsCore,
     eng: &mut Engine,
     deliver: impl FnOnce(&mut FsCore, &mut Engine),
 ) {
-    let pass = fs.tasks.run.as_ref().map(Arc::clone);
-    if let Some(run) = &pass {
-        run.draining.store(true, Ordering::Release);
-    }
     // `None` where the reactor has never spawned a task, and there no
     // task wake can arrive.
-    let _pass = pass.map(PassGuard);
+    let _pass = fs
+        .tasks
+        .run
+        .as_ref()
+        .map(Arc::clone)
+        .map(|run| PassGuard(Arc::clone(&run), run.begin_pass()));
     deliver(fs, eng);
     drain(fs, eng);
 }
@@ -1292,10 +1325,7 @@ pub(crate) fn drain(fs: &mut FsCore, eng: &mut Engine) {
     if budget == 0 {
         return;
     }
-    run.draining.store(true, Ordering::Release);
-    // Cleared however the pass ends, an unwinding poll included: a
-    // flag left set would silence every later wake's poke.
-    let _pass = PassGuard(run);
+    let _pass = PassGuard(Arc::clone(&run), run.begin_pass());
     while budget > 0 {
         let Some(id) = fs.tasks.run.as_ref().and_then(|r| r.take_ready())
         else {
@@ -1399,7 +1429,15 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: TaskId) {
 // re-enqueued - never swallowed (`poll_window` clearing the dedup edge
 // *before* the poll). The models drive the shipping functions; a copy
 // of their ordering would stay green with the shipping half weakened.
-
+//
+// A third claim carries its *visibility*, and needs a different kind
+// of model. Liveness models assert delivery counts, and a count is
+// invariant under `Relaxed` - weaken every ordering here and they all
+// stay green, because nothing crosses the edge they model.
+// `loom_a_deduped_wake_publishes_what_it_wrote` carries a payload
+// across it and goes red on either half, which is the control
+// `CLAUDE.md` asks for. Add an ordering site here and it needs a model
+// of that second kind, or it is unchecked however many models pass.
 #[cfg(loom)]
 mod loom_tests {
     use super::*;
@@ -1501,8 +1539,9 @@ mod loom_tests {
                 run: Arc::clone(&run),
             });
 
-            // A pass is live for the whole race.
-            run.draining.store(true, Ordering::Release);
+            // A pass is live for the whole race, marked the way the
+            // loop marks it.
+            run.begin_pass();
             let t = {
                 let w = Arc::clone(&w);
                 loom::thread::spawn(move || wake_task(&w))
@@ -1677,6 +1716,77 @@ mod loom_tests {
                     "a dedup-skipped wake was never followed by a poll"
                 );
             }
+        });
+    }
+
+    /// The covering poll sees what the wake published, on the path
+    /// where nothing else carries it.
+    ///
+    /// Every model above asserts a **count** - a wake is delivered, and
+    /// exactly once - and a count is invariant under `Relaxed`: weaken
+    /// every ordering in this module and they all stay green, because
+    /// no payload crosses the edge they model. This one carries one.
+    ///
+    /// The enqueueing wake needs no help: it pushes under
+    /// `RunShared::queue` and the pop takes the same lock, so the lock
+    /// is the happens-before. The **skipping** wake takes no lock -
+    /// [`wake_task`] returns straight off the swap - so the only edge
+    /// available is `queued` itself, and it exists only because
+    /// [`poll_window`] acquires there. Weaken either half to `Relaxed`
+    /// and this goes red; that is the control `CLAUDE.md` asks for, and
+    /// it is why the swap is not a store.
+    ///
+    /// The main thread latches the edge first, so the spawned wake is
+    /// the deduped one whenever loom schedules it before the window -
+    /// and where loom schedules it after, the flag is clear, the wake
+    /// enqueues, and the trailing drain polls it under the lock. Either
+    /// way the *last* poll is the covering one.
+    #[test]
+    fn loom_a_deduped_wake_publishes_what_it_wrote() {
+        bounded_model(|| {
+            let run = run_shared(true);
+            let w = Arc::new(TaskWake {
+                id: TaskId {
+                    idx: 0,
+                    generation: 0,
+                },
+                queued: AtomicBool::new(false),
+                run: Arc::clone(&run),
+            });
+            // What an off-loop waker publishes before waking: a plain
+            // cell with no ordering of its own, which is the shape a
+            // lock-free waker's readiness has.
+            let payload = Arc::new(AtomicUsize::new(0));
+
+            // Latch the edge, so the racing wake below has one to skip.
+            wake_task(&w);
+
+            let t = {
+                let w = Arc::clone(&w);
+                let p = Arc::clone(&payload);
+                loom::thread::spawn(move || {
+                    p.store(1, Ordering::Relaxed);
+                    wake_task(&w);
+                })
+            };
+
+            let mut last = 0usize;
+            let mut polls = 0usize;
+            while let Some(_id) = run.take_ready() {
+                last = poll_window(&w, || payload.load(Ordering::Relaxed));
+                polls += 1;
+            }
+            t.join().expect("waker thread");
+            // Whatever the racing wake enqueued, if anything.
+            while let Some(_id) = run.take_ready() {
+                last = poll_window(&w, || payload.load(Ordering::Relaxed));
+                polls += 1;
+            }
+            assert!(polls >= 1, "the latched wake was never polled");
+            assert_eq!(
+                last, 1,
+                "the poll covering the wake did not see what it published"
+            );
         });
     }
 }
