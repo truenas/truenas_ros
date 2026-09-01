@@ -1077,11 +1077,41 @@ impl Drop for Tasks {
     /// so `ops` and `offload_reg` are already destroyed by the time this
     /// runs and the facade would name a dead op table.
     ///
+    /// **Dropped one task at a time, each contained.** A destructor
+    /// here runs with no poll on the stack, so nothing else would catch
+    /// it: one task's unwinding guard would escape this `Drop` impl and
+    /// take every task after it, and when the teardown is itself an
+    /// unwind - the case the mark above exists for - a panic escaping a
+    /// `Drop` aborts and replaces the first panic's diagnosis with a
+    /// bare SIGABRT. That is the harm this whole function is about, so
+    /// suppressing only the assert it raised would be answering the
+    /// symptom. The payload goes to that task's own join handle, the
+    /// route [`poll_one`] already uses for a panicking poll.
     fn drop(&mut self) {
         let _restore = RestoreTeardown(TEARDOWN.with(|c| c.replace(true)));
         // Explicit, because the field's own drop glue runs *after* this
         // returns - by then the mark is cleared.
-        self.slots.clear();
+        for slot in &mut self.slots {
+            let Some(mut entry) = slot.entry.take() else {
+                continue;
+            };
+            // Held back so the sink survives its own entry's unwind,
+            // and dropped unfired otherwise - the future's `Fire` has
+            // already answered the handle by then.
+            let sink = entry.on_panic.take();
+            let unwound =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop(entry)
+                }));
+            if let (Err(payload), Some(sink)) = (unwound, sink) {
+                // Guarded on the same rule as `poll_one`'s: filling a
+                // detached handle's slot releases the last share of it,
+                // so the payload's own disposal must not unwind either.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || sink(payload),
+                ));
+            }
+        }
     }
 }
 
@@ -1341,13 +1371,18 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: TaskId) {
             // either. A sink already taken above is a `Ready` poll whose
             // output panicked on the way out - contained, and with the
             // handle gone there is nobody left to report it to.
+            // The future's own destructors are inside the guard too:
+            // an unwinding poll leaves the future half-dropped, and a
+            // guard in it that panics on the way out has nothing else
+            // catching it on the delivery path.
             let _ =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    if let Some(sink) = entry.on_panic.take() {
+                    let sink = entry.on_panic.take();
+                    drop(entry);
+                    if let Some(sink) = sink {
                         sink(payload);
                     }
                 }));
-            drop(entry);
             fs.tasks.retire(idx);
         }
     }
@@ -2722,6 +2757,74 @@ mod tests {
         assert_eq!(fs.tasks.live.get(), 1, "the task is parked");
         // The teardown itself: no panic, in either profile.
         drop(fs);
+    }
+
+    /// One task's destructor panicking at teardown does not take the
+    /// tasks queued behind it.
+    ///
+    /// The mark above suppresses the assert a submit-on-drop guard
+    /// raises; it does nothing for a destructor that panics for its own
+    /// reasons, and that panic escapes a `Drop` impl - which aborts
+    /// outright when the teardown is itself an unwind. The evidence has
+    /// to be a *second* task: contained means the sweep carries on, so
+    /// what it drops is what says so.
+    #[test]
+    fn a_teardown_panic_does_not_take_the_tasks_behind_it() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+
+        struct PanicOnDrop;
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("a task destructor");
+            }
+        }
+        struct Note(Rc<StdCell<bool>>);
+        impl Drop for Note {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        struct Park<T>(#[allow(dead_code)] T);
+        impl<T> Future for Park<T> {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+
+        let reached = Rc::new(StdCell::new(false));
+        let join = {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            let h = conn.spawn(|_t| Park(PanicOnDrop));
+            let note = Rc::clone(&reached);
+            drop(conn.spawn(move |_t| Park(Note(note))));
+            h
+        };
+        assert_eq!(fs.tasks.live.get(), 2, "both tasks are parked");
+
+        let _quiet = crate::uring_fs::quiet_panics_on_this_thread();
+        drop(fs);
+        assert!(
+            reached.get(),
+            "a panicking destructor took the task behind it"
+        );
+
+        // And the payload reached the handle rather than the process.
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut join = std::pin::pin!(join);
+        let Poll::Ready(Err(JoinError::Panic(payload))) =
+            join.as_mut().poll(&mut cx)
+        else {
+            panic!("the panicking task's handle did not learn why");
+        };
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"a task destructor"),
+            "the payload did not survive"
+        );
     }
 
     /// A `TaskFs` that left its body cannot submit under whatever task
