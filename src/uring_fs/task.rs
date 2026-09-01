@@ -38,13 +38,29 @@
 //!   `ECANCELED` rather than pending forever. That is the future form
 //!   of "dropping the continuation closes the connection": a refused
 //!   submission, or teardown, reaches the awaiting task as an error it
-//!   can act on.
+//!   can act on. **It does not say which**, and the three causes want
+//!   different answers: op-table exhaustion is the documented
+//!   fan-out failure and is worth retrying, an argument the facade
+//!   refuses (an absolute path, an empty link target) is a caller
+//!   bug, and teardown means stop. The callback form cannot tell them
+//!   apart either - it drops `on_done` for all three - so a
+//!   discriminant has to come from the facade, not from here. Until
+//!   it does, a task that treats `ECANCELED` as fatal gives up work a
+//!   retry would have completed.
 //! - **A task's facade is a continuation facade.** Each poll gets a
 //!   fresh owner-scoped [`FsConn`], the same one a completion callback
 //!   is handed, and everything a continuation must tolerate - an owner
 //!   gone mid-chain - a task must tolerate too. A task ends by
 //!   returning; there is no external kill, so a task must terminate
 //!   when its ops start failing or the source feeding it closes.
+//! - **A task's facade carries no recv-buffer claim**, so
+//!   [`pwritev2_from`](FsConn::pwritev2_from) from inside a task
+//!   copies instead of writing the delivered buffer in place. The
+//!   claim belongs to the delivery that is holding the body, and a
+//!   task outlives it. Submitting the write from the delivery's own
+//!   callback and handing the [`FsFuture`] to the task keeps the
+//!   zero-copy path; a task that wants the bytes must own them,
+//!   which its `'static` future requires in any case.
 //! - **Tasks are polled from the delivery points that fire callbacks**
 //!   (completion and offload delivery), plus [`FsConn::run_woken`] for
 //!   a callback that wakes a task by hand and wants it run before the
@@ -203,8 +219,16 @@ impl<T> Future for OffloadFuture<T> {
 }
 
 /// A spawned task's output, as a future. Resolves `Some` with what the
-/// task returned; `None` if the task was dropped before finishing,
-/// which the reactor does only at teardown.
+/// task returned.
+///
+/// **`None` is not one outcome.** It answers: the task was dropped
+/// before finishing (the reactor does that only at teardown); the
+/// handle was already polled to `Ready` once; the task panicked (the
+/// unwind takes the reactor thread with it, so a live awaiter sees
+/// this only across a caught unwind); or, in a release build, the
+/// spawn never ran because [`TaskFs::spawn`] was reached outside a
+/// poll. A caller branching on `None` to stop retrying is right about
+/// the first and wrong about the last, where nothing has run at all.
 ///
 /// Dropping the handle detaches - the task runs to completion either
 /// way and its output is dropped unread. There is no kill through it.
@@ -332,15 +356,57 @@ std::thread_local! {
         const { Cell::new(None) };
 }
 
-/// Restore [`CURRENT`] on scope exit, a panic included: a panicking
+/// The cell a scoped pointer parks in.
+type ParkCell<T> = std::thread::LocalKey<Cell<Option<NonNull<T>>>>;
+
+/// Restore a park cell on scope exit, a panic included: a panicking
 /// task unwinds through the host loop, and the cell must not keep
 /// naming a facade that died with this frame.
-struct Restore(Option<NonNull<FsConn<'static>>>);
+struct Restore<T: 'static>(&'static ParkCell<T>, Option<NonNull<T>>);
 
-impl Drop for Restore {
+impl<T: 'static> Drop for Restore<T> {
     fn drop(&mut self) {
-        CURRENT.with(|c| c.set(self.0));
+        self.0.with(|c| c.set(self.1));
     }
+}
+
+/// Park `ptr` in `cell` for the dynamic extent of `f`.
+///
+/// Generic over the parked type so the protocol can be exercised
+/// without an io_uring ring: every test that reaches it through
+/// [`FsConn`] builds a real one, and Miri aborts on `io_uring_setup`
+/// rather than taking the skip path, which would leave the only
+/// `unsafe` in this module unvalidated by it.
+fn park_in<T: 'static, R>(
+    cell: &'static ParkCell<T>,
+    ptr: NonNull<T>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let _restore = Restore(cell, cell.with(|c| c.replace(Some(ptr))));
+    f()
+}
+
+/// Reach whatever `cell` holds, for the extent of `f`. `None` when
+/// nothing is parked.
+///
+/// **The pointer is taken for the call**, so a nested reach finds an
+/// empty cell rather than deriving a second live `&mut` to the same
+/// value, and the guard puts it back however `f` ends.
+fn reach_in<T: 'static, R>(
+    cell: &'static ParkCell<T>,
+    f: impl FnOnce(&mut T) -> R,
+) -> Option<R> {
+    cell.with(|c| {
+        let ptr = c.take()?;
+        let _restore = Restore(cell, Some(ptr));
+        // SAFETY: `ptr` was parked by `park_in` around a call that is
+        // still on this thread's stack, so the value it names outlives
+        // this borrow; the `take` above makes this the only live
+        // reference derived from it, and `f` is generic over the
+        // borrow's lifetime so the reference cannot escape.
+        let val = unsafe { &mut *ptr.as_ptr() };
+        Some(f(val))
+    })
 }
 
 /// Park `conn` in [`CURRENT`] for the duration of `f` (a task poll).
@@ -349,26 +415,16 @@ fn with_current<R>(conn: &mut FsConn<'_>, f: impl FnOnce() -> R) -> R {
     // back out strictly inside `f`'s dynamic extent, where `conn` is
     // still exclusively this frame's.
     let ptr = NonNull::from(conn).cast::<FsConn<'static>>();
-    let _restore = Restore(CURRENT.with(|c| c.replace(Some(ptr))));
-    f()
+    park_in(&CURRENT, ptr, f)
 }
 
 /// Reach the poll's parked facade. `None` outside a poll. The pointer
 /// is *taken* for the call - a nested reach sees an empty cell rather
 /// than a second `&mut` to the same facade.
 fn with_conn<R>(f: impl FnOnce(&mut FsConn<'_>) -> R) -> Option<R> {
-    CURRENT.with(|c| {
-        let ptr = c.take()?;
-        let _restore = Restore(Some(ptr));
-        // SAFETY: `ptr` was parked by `with_current` around the poll
-        // running right now on this thread; the facade it names is the
-        // executor's for that whole extent, and the `take` above makes
-        // this the only live reference derived from it. The `'static`
-        // in the cell is storage-only: `f` is generic over the
-        // facade's lifetime, so the reference cannot escape it.
-        let conn = unsafe { &mut *ptr.as_ptr() };
-        Some(f(conn))
-    })
+    // The `'static` in the cell is storage-only: `f` is generic over
+    // the facade's lifetime, so the reference cannot escape it.
+    reach_in(&CURRENT, f)
 }
 
 /// A task's handle to the facade of whichever poll is running it.
@@ -379,7 +435,16 @@ fn with_conn<R>(f: impl FnOnce(&mut FsConn<'_>) -> R) -> Option<R> {
 /// thread. Smuggling it elsewhere and calling it there debug-asserts,
 /// and in release resolves the op as `ECANCELED` / drops the spawn,
 /// the facade's shape for a submission that cannot happen.
-#[derive(Clone)]
+///
+/// **Deliberately not `Clone`.** It carries no task identity, so a
+/// copy kept past its poll - parked in connection state, say - and
+/// used during a *different* task's poll would find `CURRENT`
+/// populated, submit against that task's facade, and be stamped its
+/// owner: the wrong connection's teardown sweep would then cancel the
+/// op, and the right one would leave its descriptor parked. No assert
+/// can catch that, because from inside the cell it is indistinguishable
+/// from a legitimate submission. Without `Clone` the handle cannot
+/// outlive the body it was handed to.
 pub struct TaskFs {
     _on_loop: PhantomData<Rc<()>>,
 }
@@ -449,20 +514,25 @@ impl TaskFs {
 
 // ---- the task table and its run queue -------------------------------------
 
-/// Pack a task's slot index and generation into the id its waker carries.
-fn pack_task(idx: u32, generation: u32) -> u64 {
-    (u64::from(idx) << 32) | u64::from(generation)
-}
-
-fn unpack_task(id: u64) -> (u32, u32) {
-    ((id >> 32) as u32, id as u32)
+/// A task's slot and the incarnation of it this handle names.
+///
+/// Not packed into a `u64`: no task id ever reaches `user_data`, so
+/// nothing here is bounded by the 24-bit slot field the ring routing
+/// tokens use, and a full-width generation is what
+/// [`SlotEntry`](crate::uring::slots::SlotEntry) documents the reason
+/// for - a `Waker` is exactly the long-retained handle that must not
+/// alias a future incarnation after the counter wraps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct TaskId {
+    idx: u32,
+    generation: u64,
 }
 
 /// What a waker reaches: the run queue, its emptiness hint, and the
 /// loop's wake eventfd for an off-loop wake.
 pub(crate) struct RunShared {
     /// Woken task ids, in wake order.
-    queue: Mutex<VecDeque<u64>>,
+    queue: Mutex<VecDeque<TaskId>>,
     /// Queue-length hint, so the per-completion drain check is one
     /// relaxed load instead of a lock acquisition.
     ready: AtomicUsize,
@@ -503,7 +573,7 @@ impl RunShared {
     }
 
     /// Pop the next woken task id, if any.
-    pub(crate) fn take_ready(&self) -> Option<u64> {
+    pub(crate) fn take_ready(&self) -> Option<TaskId> {
         let id = self
             .queue
             .lock()
@@ -519,7 +589,7 @@ impl RunShared {
 /// `crate::sync` like every cross-thread protocol here, so the loom
 /// models can drive [`wake_task`] itself.
 pub(crate) struct TaskWake {
-    id: u64,
+    id: TaskId,
     /// Wake-dedup edge: set by the wake that enqueues, cleared by
     /// [`poll_window`] just before the task runs.
     queued: AtomicBool,
@@ -597,7 +667,7 @@ struct TaskEntry {
 struct TaskSlot {
     /// Bumped at retire, so a stale waker's id misses and its wake is
     /// inert - the run queue may hold ids for tasks already gone.
-    generation: u32,
+    generation: u64,
     /// `None` while free *or* while the entry is out being polled; the
     /// free list is what distinguishes the two.
     entry: Option<TaskEntry>,
@@ -627,7 +697,7 @@ impl Tasks {
         eng: &Engine,
         owner: Owner,
         fut: Pin<Box<dyn Future<Output = ()>>>,
-    ) -> u64 {
+    ) -> TaskId {
         let run = self.run.get_or_insert_with(|| {
             Arc::new(RunShared {
                 queue: Mutex::new(VecDeque::new()),
@@ -650,7 +720,10 @@ impl Tasks {
             });
             (self.slots.len() - 1) as u32
         });
-        let id = pack_task(idx, self.slots[idx as usize].generation);
+        let id = TaskId {
+            idx,
+            generation: self.slots[idx as usize].generation,
+        };
         let wake = std::sync::Arc::new(TaskWake {
             id,
             queued: AtomicBool::new(false),
@@ -668,9 +741,9 @@ impl Tasks {
 
     /// Take the entry out for a poll; `None` for a stale id (the task
     /// retired and its slot moved on) or one already out.
-    fn take_if(&mut self, idx: u32, generation: u32) -> Option<TaskEntry> {
-        let s = self.slots.get_mut(idx as usize)?;
-        if s.generation != generation {
+    fn take_if(&mut self, id: TaskId) -> Option<TaskEntry> {
+        let s = self.slots.get_mut(id.idx as usize)?;
+        if s.generation != id.generation {
             return None;
         }
         s.entry.take()
@@ -680,11 +753,10 @@ impl Tasks {
     /// out for a poll. A retired slot fails the generation test
     /// (`retire` bumps it) and a free slot cannot match a minted id,
     /// so this fires only for the mid-poll case.
-    fn requeue_if_busy(&self, id: u64, idx: u32, generation: u32) {
-        let busy = self
-            .slots
-            .get(idx as usize)
-            .is_some_and(|s| s.generation == generation && s.entry.is_none());
+    fn requeue_if_busy(&self, id: TaskId) {
+        let busy = self.slots.get(id.idx as usize).is_some_and(|s| {
+            s.generation == id.generation && s.entry.is_none()
+        });
         if !busy {
             return;
         }
@@ -765,16 +837,16 @@ pub(crate) fn drain(fs: &mut FsCore, eng: &mut Engine) {
 /// Poll one task. The entry is held out of the table for the poll, so
 /// the facade the task submits through can borrow the tables freely;
 /// a task that completes retires its slot, one that pends goes back.
-fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: u64) {
-    let (idx, generation) = unpack_task(id);
-    let Some(mut entry) = fs.tasks.take_if(idx, generation) else {
+fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: TaskId) {
+    let idx = id.idx;
+    let Some(mut entry) = fs.tasks.take_if(id) else {
         // A live generation with no entry is the slot's tenant out
         // being polled - a re-entrant drain, which `run_woken` and the
         // facade a submit closure receives both make reachable. That
         // poll already cleared the dedup edge, so this id is the only
         // record of the wake: put it back rather than consume it, or
         // the task is never scheduled again.
-        fs.tasks.requeue_if_busy(id, idx, generation);
+        fs.tasks.requeue_if_busy(id);
         return;
     };
     let mut conn = FsConn::new(fs, eng, entry.owner);
@@ -782,12 +854,26 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: u64) {
     // the window reads the wake edge while the poll borrows the
     // future - no waker clone (and no refcount traffic) per poll.
     let mut cx = Context::from_waker(&entry.waker);
-    let poll = poll_window(&entry.wake, || {
-        with_current(&mut conn, || entry.fut.as_mut().poll(&mut cx))
-    });
+    // The entry is out of the table for the poll, so an unwinding
+    // future would drop it here and leave the slot neither occupied
+    // nor free - never reused, its generation never bumped, and
+    // `retire`'s own guard unable to see it. Catch the unwind to
+    // retire the slot, then resume: containing a panicking task is a
+    // policy this crate does not have, and the hosts have no
+    // `catch_unwind` either.
+    let poll = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        poll_window(&entry.wake, || {
+            with_current(&mut conn, || entry.fut.as_mut().poll(&mut cx))
+        })
+    }));
     match poll {
-        Poll::Ready(()) => fs.tasks.retire(idx),
-        Poll::Pending => fs.tasks.put_back(idx, entry),
+        Ok(Poll::Ready(())) => fs.tasks.retire(idx),
+        Ok(Poll::Pending) => fs.tasks.put_back(idx, entry),
+        Err(payload) => {
+            drop(entry);
+            fs.tasks.retire(idx);
+            std::panic::resume_unwind(payload);
+        }
     }
 }
 
@@ -843,7 +929,10 @@ mod loom_tests {
             // parks on an eventfd nothing wrote.
             let run = run_shared(false);
             let w = Arc::new(TaskWake {
-                id: pack_task(0, 0),
+                id: TaskId {
+                    idx: 0,
+                    generation: 0,
+                },
                 queued: AtomicBool::new(false),
                 run: Arc::clone(&run),
             });
@@ -892,7 +981,10 @@ mod loom_tests {
         bounded_model(|| {
             let run = run_shared(true);
             let w = Arc::new(TaskWake {
-                id: pack_task(0, 0),
+                id: TaskId {
+                    idx: 0,
+                    generation: 0,
+                },
                 queued: AtomicBool::new(false),
                 run: Arc::clone(&run),
             });
@@ -929,7 +1021,10 @@ mod loom_tests {
         bounded_model(|| {
             let run = run_shared(true);
             let w = Arc::new(TaskWake {
-                id: pack_task(0, 0),
+                id: TaskId {
+                    idx: 0,
+                    generation: 0,
+                },
                 queued: AtomicBool::new(false),
                 run: Arc::clone(&run),
             });
@@ -1360,7 +1455,10 @@ mod tests {
         // The parked task's waker id names (slot 0, generation 1).
         // Rebuild a *stale* waker for generation 0 and fire it.
         let stale = std::sync::Arc::new(TaskWake {
-            id: pack_task(0, 0),
+            id: TaskId {
+                idx: 0,
+                generation: 0,
+            },
             queued: AtomicBool::new(false),
             run: Arc::clone(fs.tasks.run.as_ref().expect("run queue")),
         });
@@ -1404,6 +1502,84 @@ mod tests {
     fn task_fs_outside_a_poll_debug_asserts() {
         let t = TaskFs::new();
         drop(t.fut(|_c, _cb| {}));
+    }
+
+    /// A panicking poll must leave the table consistent. The entry is
+    /// out of the slot for the poll, so an unwind that skipped
+    /// `retire` would leave it neither occupied nor free: never
+    /// reused, generation never bumped, and `retire`'s own guard
+    /// unable to see it. The panic still propagates - containing one
+    /// is a policy this crate does not have.
+    #[test]
+    fn a_panicking_task_still_retires_its_slot() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+
+        struct Boom;
+        impl Future for Boom {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                panic!("task panic");
+            }
+        }
+
+        let caught =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut conn = FsConn::new(&mut fs, &mut eng, None);
+                conn.spawn(|_t| Boom);
+            }));
+        assert!(caught.is_err(), "the panic must still propagate");
+        assert_eq!(
+            fs.tasks.free.len(),
+            fs.tasks.slots.len(),
+            "the panicking task stranded its slot"
+        );
+    }
+
+    /// The other two misuse guards, release halves: reaching
+    /// `offload_fut` or `spawn` outside a poll cannot submit, so each
+    /// resolves rather than pends. `CLAUDE.md` wants a test per half
+    /// of a `debug_assert` + `if` pair; the debug halves are below.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn the_other_task_fs_guards_resolve_outside_a_poll() {
+        let t = TaskFs::new();
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let mut off =
+            std::pin::pin!(t.offload_fut(|| Ok::<_, crate::Error>(1)));
+        assert!(
+            matches!(
+                off.as_mut().poll(&mut cx),
+                Poll::Ready(Err(crate::Error::Errno(Errno::ECANCELED)))
+            ),
+            "offload_fut outside a poll must resolve, not pend"
+        );
+
+        let mut join = std::pin::pin!(t.spawn(|_t| async { 7u8 }));
+        assert_eq!(
+            join.as_mut().poll(&mut cx),
+            Poll::Ready(None),
+            "a spawn that never ran must resolve its join"
+        );
+    }
+
+    /// The debug halves of the same two guards.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "TaskFs::offload_fut outside a task poll")]
+    fn task_fs_offload_outside_a_poll_debug_asserts() {
+        drop(TaskFs::new().offload_fut(|| Ok::<_, crate::Error>(1)));
+    }
+
+    /// And `spawn`'s.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "TaskFs::spawn outside a task poll")]
+    fn task_fs_spawn_outside_a_poll_debug_asserts() {
+        drop(TaskFs::new().spawn(|_t| async {}));
     }
 
     /// `run_woken` drains a task woken by hand from a callback-side
@@ -1494,6 +1670,89 @@ mod tests {
         assert_eq!(polls.get(), 2, "one poll per pass");
         drain(&mut fs, &mut eng);
         assert_eq!(polls.get(), 3, "one poll per pass, again");
+    }
+
+    // ---- the scoped-pointer protocol, without a ring ----------------
+    //
+    // Every test that reaches `with_current`/`with_conn` through an
+    // `FsConn` builds a real io_uring, and Miri aborts on
+    // `io_uring_setup` rather than taking the skip path - so these
+    // drive the same `park_in`/`reach_in` with a plain type, which is
+    // what lets Miri validate the module's only `unsafe`.
+
+    std::thread_local! {
+        static PROBE: Cell<Option<NonNull<u32>>> = const { Cell::new(None) };
+    }
+
+    /// The parked value is reachable inside the extent and nowhere
+    /// else, and a reach hands out a usable `&mut`.
+    #[test]
+    fn a_parked_pointer_is_reachable_only_inside_its_extent() {
+        assert!(reach_in(&PROBE, |_: &mut u32| ()).is_none(), "before");
+        let mut v = 7u32;
+        park_in(&PROBE, NonNull::from(&mut v), || {
+            let doubled = reach_in(&PROBE, |p: &mut u32| {
+                *p *= 2;
+                *p
+            });
+            assert_eq!(doubled, Some(14));
+        });
+        assert!(reach_in(&PROBE, |_: &mut u32| ()).is_none(), "after");
+        assert_eq!(v, 14, "the reach wrote through to the parked value");
+    }
+
+    /// A reach nested inside a reach finds an empty cell: the pointer
+    /// is *taken* for the call, so no second live `&mut` to the same
+    /// value can be derived. This is the aliasing claim the module's
+    /// SAFETY comment rests on.
+    #[test]
+    fn a_nested_reach_cannot_alias_the_outer_borrow() {
+        let mut v = 1u32;
+        park_in(&PROBE, NonNull::from(&mut v), || {
+            let inner = reach_in(&PROBE, |outer: &mut u32| {
+                *outer += 1;
+                let nested = reach_in(&PROBE, |_: &mut u32| ());
+                // Still holding `outer` here: the nested reach must
+                // have found nothing.
+                *outer += 1;
+                nested
+            });
+            assert_eq!(inner, Some(None), "a nested reach aliased");
+        });
+        assert_eq!(v, 3);
+    }
+
+    /// Both halves restore the cell when their closure unwinds - a
+    /// panicking task unwinds through the host loop, and a cell left
+    /// naming a dead frame is a dangling pointer for the next poll.
+    #[test]
+    fn an_unwind_restores_the_cell() {
+        let mut v = 5u32;
+        let caught =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                park_in(&PROBE, NonNull::from(&mut v), || {
+                    reach_in(&PROBE, |_: &mut u32| panic!("boom"));
+                });
+            }));
+        assert!(caught.is_err(), "the panic must propagate");
+        assert!(
+            reach_in(&PROBE, |_: &mut u32| ()).is_none(),
+            "the cell still names a frame that is gone"
+        );
+    }
+
+    /// Parks nest: an inner park shadows the outer and the outer is
+    /// restored on the way out, so a task spawned from inside a poll
+    /// does not strand its parent's facade.
+    #[test]
+    fn parks_nest_and_restore_in_order() {
+        let (mut outer, mut inner) = (1u32, 2u32);
+        park_in(&PROBE, NonNull::from(&mut outer), || {
+            park_in(&PROBE, NonNull::from(&mut inner), || {
+                assert_eq!(reach_in(&PROBE, |p: &mut u32| *p), Some(2));
+            });
+            assert_eq!(reach_in(&PROBE, |p: &mut u32| *p), Some(1));
+        });
     }
 
     /// The eager idiom the contract advertises: ops submitted while

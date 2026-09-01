@@ -1645,6 +1645,15 @@ impl FsDone {
 /// ring only through this facade. A submission or argument-validation failure
 /// drops `on_done` (and the continuation it captured, closing the connection),
 /// so these methods return `()`.
+///
+/// **No method here may return data borrowed from `'a`.** The task layer
+/// parks a facade in a thread-local as `FsConn<'static>` and hands it back
+/// as `&mut FsConn<'_>` (`task::reach_in`); `&mut U` is
+/// invariant in `U`, so that closure can be instantiated at
+/// `&mut FsConn<'static>`. Nothing escapes today only because every method
+/// returns owned values or borrows of `&self` - add one
+/// `fn x(&self) -> &'a T` and a caller could extend a borrow of the ring's
+/// tables past the poll that parked them, with no diagnostic anywhere.
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 pub struct FsConn<'a> {
     fs: &'a mut FsCore,
@@ -3482,21 +3491,20 @@ mod hybrid_tests {
                 let (tag, slot, g) = unpack_raw(cqe.user_data);
                 if tag == TAG_WAKE {
                     eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm");
-                    for (o, deliver, any) in fs.take_pool_completions() {
-                        let mut c = FsConn::new(fs, eng, o);
-                        deliver(any, &mut c);
-                    }
+                    // The real delivery functions, not a copy of their
+                    // bodies: a copy silently misses whatever they
+                    // grow - it missed task draining entirely, so a
+                    // task spawned in a test here was polled once and
+                    // then waited on a loop that would never poll it
+                    // again, hanging instead of failing.
+                    deliver_pool_completions(fs, eng);
                     continue;
                 }
                 if tag == TAG_CANCEL || tag & TAG_FS_DOMAIN == 0 {
                     continue;
                 }
-                if let ReapedFs::Embedded(cb, d, o) =
-                    fs.on_cqe(eng, tag, slot, g, cqe.res)
-                {
-                    let mut c = FsConn::new(fs, eng, o);
-                    cb(d, &mut c);
-                }
+                let reaped = fs.on_cqe(eng, tag, slot, g, cqe.res);
+                deliver_embedded(fs, eng, reaped);
             }
         }
     }
