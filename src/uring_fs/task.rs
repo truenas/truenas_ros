@@ -139,10 +139,16 @@ impl<V> Slot<V> {
         Rc::new(Slot(RefCell::new(SlotState::Pending(None))))
     }
 
-    /// A slot born resolved-as-gone, for a submission that never
-    /// happened ([`TaskFs`] reached outside a poll).
+    /// A slot born resolved-as-gone: teardown took the submission, and
+    /// there is nothing to say about it beyond that.
     fn gone() -> Rc<Slot<V>> {
         Rc::new(Slot(RefCell::new(SlotState::Gone)))
+    }
+
+    /// A slot born already holding `v`, for an answer settled before
+    /// any op could exist - see [`no_facade`].
+    fn ready(v: V) -> Rc<Slot<V>> {
+        Rc::new(Slot(RefCell::new(SlotState::Ready(v))))
     }
 
     /// Fill with the outcome (`None` = the callback dropped unfired)
@@ -376,11 +382,12 @@ impl FsConn<'_> {
     /// future. `submit` receives this facade and the boxed callback to
     /// pass as the op's `on_done`:
     ///
-    /// ```ignore
-    /// let done = conn
-    ///     .fut(|c, done| c.fsync(who, file.clone(), done))
-    ///     .await;
-    /// done.result()?;
+    /// ```no_run
+    /// # use truenas_ros::uring_fs::{File, Personality, TaskFs};
+    /// # async fn body(t: TaskFs, who: Personality, file: File) {
+    /// let done = t.fut(|c, done| c.fsync(who, file.clone(), done)).await;
+    /// let _ = done.result();
+    /// # }
     /// ```
     ///
     /// Submission happens inside this call - the op is in flight when
@@ -388,6 +395,13 @@ impl FsConn<'_> {
     /// futures created back to back overlap on the ring. A `submit`
     /// that drops `on_done` without passing it anywhere resolves the
     /// future as `ECANCELED`.
+    ///
+    /// **`submit` submits exactly one op.** The reason sink staged here
+    /// lives on the facade, so *any* submission the closure makes arms
+    /// it and a refusal of the wrong one fills this slot - reporting an
+    /// errno for an op that is still in flight, whose real completion
+    /// then lands in a settled slot and is discarded. Submit the extra
+    /// op before or after the call, not inside it.
     pub fn fut(
         &mut self,
         submit: impl FnOnce(&mut FsConn<'_>, OnDone),
@@ -448,19 +462,38 @@ impl FsConn<'_> {
     /// way: `fremovexattr`'s allowlist and `open_dir`'s per-request
     /// `open` are reactor state a pool job cannot see.
     ///
-    /// ```ignore
-    /// let st = conn.result_fut(|c, cb| c.fstatfs(file.clone(), cb)).await?;
+    /// ```no_run
+    /// # use truenas_ros::uring_fs::{File, TaskFs};
+    /// # async fn body(t: TaskFs, file: File) -> truenas_ros::Result<()> {
+    /// let st = t.result_fut(|c, cb| c.fstatfs(file.clone(), cb)).await?;
+    /// # let _ = st;
+    /// # Ok(())
+    /// # }
     /// ```
     ///
-    /// Submission is eager on the same terms as [`fut`](Self::fut). **No
-    /// reason sink is staged**, so a refusal on this shape resolves
-    /// `ECANCELED` rather than naming itself. Eight of the nine deliver
-    /// through the offload pool, where a refusal has no errno to carry
-    /// and `ECANCELED` is already
-    /// [`offload_fut`](Self::offload_fut)'s answer; `open_dir` is the
-    /// exception - its first step is a ring `open`, so a full op table
-    /// reaches this future as teardown would. Await the `open` yourself
-    /// with [`fut`](Self::fut) if that distinction matters.
+    /// The one-op rule on [`fut`](Self::fut)'s `submit` applies here
+    /// too, and for the same reason.
+    ///
+    /// Submission is eager on the same terms as [`fut`](Self::fut), and
+    /// it stages a reason sink for the same reason - `open_dir`'s first
+    /// step is a ring `open`, so a full op table refuses this shape too
+    /// and would otherwise reach the future as `ECANCELED`, which
+    /// [`FsFuture`] reserves for teardown.
+    ///
+    /// **Staging is what keeps the sink from being ambient.** The sink
+    /// lives on the facade, because a multi-step call's later steps
+    /// submit from a fresh one; so a submission made inside *another*
+    /// future's `submit` closure arms whatever is staged, and without a
+    /// frame of its own this call would fill the enclosing future's
+    /// slot with its own refusal while the enclosing op was still in
+    /// flight. It does not copy [`fut`](Self::fut)'s "nothing armed, so
+    /// nothing will ever answer" rule: eight of the nine methods here
+    /// never reach the op table at all, so on this shape an unarmed
+    /// sink is the ordinary case rather than a refused argument.
+    ///
+    /// Eight of the nine deliver through the offload pool, where a
+    /// refusal has no errno to carry and the future resolves
+    /// `ECANCELED` as [`offload_fut`](Self::offload_fut) does.
     pub fn result_fut<T, S>(&mut self, submit: S) -> OffloadFuture<T>
     where
         S: FnOnce(&mut FsConn<'_>, OnResult<T>),
@@ -468,7 +501,12 @@ impl FsConn<'_> {
     {
         let slot = Slot::new();
         let fire = Fire(Some(Rc::clone(&slot)));
+        let reason = Rc::clone(&slot);
+        let outer = self.stage_fail_sink(Rc::new(move |errno, _bufs| {
+            reason.fill(Some(Err(errno.into())));
+        }));
         submit(self, Box::new(move |r, _conn| fire.fire(r)));
+        self.restore_fail_sink(outer);
         OffloadFuture(slot)
     }
 
@@ -722,6 +760,25 @@ impl std::fmt::Debug for TaskFs {
     }
 }
 
+/// The slot a [`TaskFs`] call answers with when it cannot reach a
+/// facade, which happens for two unrelated reasons.
+///
+/// Teardown is [`Slot::gone`]: it polls as `ECANCELED` with
+/// [`FsDone::was_refused`] false, which is this module's one meaning for
+/// "the reactor is going away" and the signal a consumer winds down on.
+/// The other reason is this handle being used out of turn - moved into
+/// `'static` state and submitted through from somewhere else - and
+/// reporting *that* as teardown tells a release build to shut a healthy
+/// server down over a caller's bug. `refused` names the caller instead,
+/// on the same rule as every other submission the crate itself refuses.
+fn no_facade<V>(refused: impl FnOnce() -> V) -> Rc<Slot<V>> {
+    if tearing_down() {
+        Slot::gone()
+    } else {
+        Slot::ready(refused())
+    }
+}
+
 impl TaskFs {
     fn new() -> TaskFs {
         TaskFs {
@@ -731,6 +788,10 @@ impl TaskFs {
     }
 
     /// [`FsConn::fut`] against the running poll's facade.
+    ///
+    /// Using this handle outside its own task's poll submits nothing
+    /// and resolves `EINVAL` with [`FsDone::was_refused`] true - see
+    /// [`no_facade`]; the same misuse at teardown resolves `ECANCELED`.
     pub fn fut(
         &self,
         submit: impl FnOnce(&mut FsConn<'_>, OnDone),
@@ -742,12 +803,18 @@ impl TaskFs {
                     tearing_down(),
                     "TaskFs::fut with no facade: outside its task's poll, or nested inside a call already holding it"
                 );
-                FsFuture(Slot::gone())
+                FsFuture(no_facade(|| {
+                    FsDone::refused_with(Errno::EINVAL, Vec::new())
+                }))
             }
         }
     }
 
     /// [`FsConn::offload_fut`] against the running poll's facade.
+    ///
+    /// Misuse resolves `EINVAL` and teardown `ECANCELED`, as
+    /// [`fut`](Self::fut) does - the errno is the whole distinction
+    /// here, since a [`crate::Result`] carries no provenance bit.
     pub fn offload_fut<T, J>(&self, job: J) -> OffloadFuture<T>
     where
         J: FnOnce() -> crate::Result<T> + Send + 'static,
@@ -760,12 +827,15 @@ impl TaskFs {
                     tearing_down(),
                     "TaskFs::offload_fut with no facade: outside its task's poll, or nested inside a call already holding it"
                 );
-                OffloadFuture(Slot::gone())
+                OffloadFuture(no_facade(|| Err(Errno::EINVAL.into())))
             }
         }
     }
 
     /// [`FsConn::result_fut`] against the running poll's facade.
+    ///
+    /// Misuse resolves `EINVAL` and teardown `ECANCELED`; see
+    /// [`offload_fut`](Self::offload_fut).
     pub fn result_fut<T, S>(&self, submit: S) -> OffloadFuture<T>
     where
         S: FnOnce(&mut FsConn<'_>, OnResult<T>),
@@ -778,7 +848,7 @@ impl TaskFs {
                     tearing_down(),
                     "TaskFs::result_fut with no facade: outside its task's poll, or nested inside a call already holding it"
                 );
-                OffloadFuture(Slot::gone())
+                OffloadFuture(no_facade(|| Err(Errno::EINVAL.into())))
             }
         }
     }
@@ -947,6 +1017,7 @@ pub(crate) fn wake_task(w: &TaskWake) -> bool {
 /// it was announcing. Clearing after the poll is the lost-wakeup bug
 /// the loom model bites on; the pairing lives here, once, so the model
 /// drives the shipping order rather than a copy of it.
+///
 pub(crate) fn poll_window<R>(w: &TaskWake, poll: impl FnOnce() -> R) -> R {
     w.queued.store(false, Ordering::Release);
     poll()
@@ -1005,6 +1076,7 @@ impl Drop for Tasks {
     /// is the last field of `FsCore` and nothing above it has a `Drop`,
     /// so `ops` and `offload_reg` are already destroyed by the time this
     /// runs and the facade would name a dead op table.
+    ///
     fn drop(&mut self) {
         let _restore = RestoreTeardown(TEARDOWN.with(|c| c.replace(true)));
         // Explicit, because the field's own drop glue runs *after* this
@@ -1292,6 +1364,7 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: TaskId) {
 // re-enqueued - never swallowed (`poll_window` clearing the dedup edge
 // *before* the poll). The models drive the shipping functions; a copy
 // of their ordering would stay green with the shipping half weakened.
+
 #[cfg(loom)]
 mod loom_tests {
     use super::*;
@@ -2537,10 +2610,16 @@ mod tests {
     }
 
     /// `TaskFs` reached outside a poll refuses. Debug builds assert;
-    /// this is the release half - the op resolves `ECANCELED`.
+    /// this is the release half, where the errno is the whole report.
+    ///
+    /// It must not be `ECANCELED`: that is this module's one meaning
+    /// for "the reactor is going away", and a release consumer reading
+    /// it winds a healthy server down over a caller's bug. Teardown
+    /// still answers it - `a_task_dropped_at_teardown_may_reach_its_facade`
+    /// is that side.
     #[cfg(not(debug_assertions))]
     #[test]
-    fn task_fs_outside_a_poll_resolves_ecanceled() {
+    fn task_fs_outside_a_poll_is_refused_rather_than_torn_down() {
         let t = TaskFs::new();
         let fut = t.fut(|_c, _cb| unreachable!("no facade to submit on"));
         let waker = Waker::noop();
@@ -2549,10 +2628,12 @@ mod tests {
         let Poll::Ready(done) = fut.as_mut().poll(&mut cx) else {
             panic!("an unsubmittable op left its future pending");
         };
-        assert!(matches!(
-            done.result(),
-            Err(crate::Error::Errno(Errno::ECANCELED))
-        ));
+        assert!(done.was_refused(), "the crate refused this, not the kernel");
+        assert!(
+            matches!(done.result(), Err(crate::Error::Errno(Errno::EINVAL))),
+            "a misused handle must not answer ECANCELED: {:?}",
+            done.result()
+        );
     }
 
     /// The three ways a join yields no output need three answers. A
@@ -2723,8 +2804,9 @@ mod tests {
         }
         assert_eq!(
             seen.get(),
-            Some(Errno::ECANCELED),
-            "a smuggled handle must submit nothing"
+            Some(Errno::EINVAL),
+            "a smuggled handle must submit nothing, and say so as a \
+             refusal rather than as the reactor going away"
         );
     }
 
@@ -2818,10 +2900,20 @@ mod tests {
         );
     }
 
-    /// The other two misuse guards, release halves: reaching
-    /// `offload_fut` or `spawn` outside a poll cannot submit, so each
-    /// resolves rather than pends. `CLAUDE.md` wants a test per half
-    /// of a `debug_assert` + `if` pair; the debug halves are below.
+    /// The other three misuse guards, release halves: reaching
+    /// `offload_fut`, `result_fut` or `spawn` outside a poll cannot
+    /// submit, so each resolves rather than pends. `CLAUDE.md` wants a
+    /// test per half of a `debug_assert` + `if` pair; the debug halves
+    /// are below. Left untested, the `if` is free to resolve as
+    /// anything - a slot that never resolves at all included, which
+    /// hangs the task holding `tasks.live` up and a graceful drain
+    /// open with it.
+    ///
+    /// `EINVAL` rather than `ECANCELED` for the two futures, on
+    /// `task_fs_outside_a_poll_is_refused_rather_than_torn_down`'s
+    /// reasoning. `spawn` keeps `Dropped`, which its own doc already
+    /// covers both ways: the body never ran, and there is no third
+    /// meaning for that answer to collide with.
     #[cfg(not(debug_assertions))]
     #[test]
     fn the_other_task_fs_guards_resolve_outside_a_poll() {
@@ -2834,9 +2926,18 @@ mod tests {
         assert!(
             matches!(
                 off.as_mut().poll(&mut cx),
-                Poll::Ready(Err(crate::Error::Errno(Errno::ECANCELED)))
+                Poll::Ready(Err(crate::Error::Errno(Errno::EINVAL)))
             ),
-            "offload_fut outside a poll must resolve, not pend"
+            "offload_fut outside a poll must resolve as a refusal"
+        );
+
+        let mut res = std::pin::pin!(t.result_fut(|_c, _cb: OnResult<u32>| {}));
+        assert!(
+            matches!(
+                res.as_mut().poll(&mut cx),
+                Poll::Ready(Err(crate::Error::Errno(Errno::EINVAL)))
+            ),
+            "result_fut outside a poll must resolve as a refusal"
         );
 
         let mut join = std::pin::pin!(t.spawn(|_t| async { 7u8 }));
@@ -2849,12 +2950,20 @@ mod tests {
         );
     }
 
-    /// The debug halves of the same two guards.
+    /// The debug halves of the same three guards.
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "TaskFs::offload_fut with no facade")]
     fn task_fs_offload_outside_a_poll_debug_asserts() {
         drop(TaskFs::new().offload_fut(|| Ok::<_, crate::Error>(1)));
+    }
+
+    /// And `result_fut`'s.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "TaskFs::result_fut with no facade")]
+    fn task_fs_result_fut_outside_a_poll_debug_asserts() {
+        drop(TaskFs::new().result_fut(|_c, _cb: OnResult<u32>| {}));
     }
 
     /// And `spawn`'s.

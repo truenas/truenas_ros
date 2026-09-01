@@ -183,40 +183,6 @@ pub(crate) enum ReapedFs {
     Pump(FsDone, (u32, u64)),
 }
 
-/// Box a consumer callback as an owner-stamped embedded waiter - the one shape
-/// every [`FsConn`] submit method hands the core.
-#[cfg_attr(not(feature = "net-server"), allow(dead_code))]
-fn embed<F>(owner: Owner, armed: Armed, on_done: F) -> FsWaiter
-where
-    F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
-{
-    FsWaiter::Embedded {
-        owner,
-        cb: Box::new(on_done),
-        on_fail: armed.0,
-    }
-}
-
-/// One submission's share of the staged reason sink - and the proof
-/// that a submission took one.
-///
-/// **Only [`FsConn::arm_fail_sink`] makes one**, and that is the whole
-/// point of the type. [`FsConn::fut`] tells "the op is in flight and
-/// will report for itself" from "the facade refused the arguments and
-/// nothing ever will" by whether any submission armed the sink, so a
-/// submit method that reaches the core without arming makes `fut`
-/// answer a perfectly good op with a spurious `EINVAL`. Passing
-/// `embed` a bare `Option<FailSink>` let exactly that compile: a method
-/// written against the older signature took `self.fail_sink.take()`,
-/// which type-checks, submits, and arms nothing. This makes the same
-/// mistake a build failure.
-///
-/// The field is private rather than the type opaque, so a test in a
-/// descendant module can still build an unarmed one directly; a
-/// constructor for that would be dead code wherever the test using it
-/// is gated out.
-pub(crate) struct Armed(Option<FailSink>);
-
 /// Report an early submission failure - the SQE never staged (slot exhaustion,
 /// an unusable file) - handing the caller's payloads back exactly as a
 /// completion would (see [`deliver`]).
@@ -1722,8 +1688,11 @@ impl std::fmt::Debug for FsDone {
 
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 impl FsDone {
-    /// A completion no op produced - what a multi-step call answers
-    /// with when it refuses between steps.
+    /// A completion no op produced, with **no** claim about who
+    /// produced the errno: the kernel's own verdict forwarded from
+    /// somewhere else, or an outcome whose provenance is not this
+    /// crate's to assert. [`FsDone::refused`] is the arm for a screen
+    /// of this crate's own.
     pub(crate) fn failed(err: Errno) -> FsDone {
         FsDone {
             result: Err(err),
@@ -1734,6 +1703,20 @@ impl FsDone {
             #[cfg(feature = "net-server")]
             recv_lease: None,
         }
+    }
+
+    /// A step this crate's own screen refused, carrying no payload -
+    /// what a multi-step call answers with when it refuses *between*
+    /// steps.
+    ///
+    /// Provenance has to be the same at both ends of a chain or it says
+    /// nothing: the very screen that gives `EINVAL` with
+    /// [`was_refused`](FsDone::was_refused) true at `open_chain`'s entry
+    /// gives it again on a derived name three steps in, and answering
+    /// the second with `failed` makes the same refusal read as
+    /// `ECANCELED`-class teardown to the awaiting task.
+    pub(crate) fn refused(err: Errno) -> FsDone {
+        FsDone::refused_with(err, Vec::new())
     }
 
     /// A submission the facade or the core refused, with the payload it
@@ -1941,12 +1924,31 @@ impl<'a> FsConn<'a> {
         self.fail_sink = sink;
     }
 
-    /// A clone of the staged sink for one submission, recording that a
-    /// submission took it.
-    fn arm_fail_sink(&mut self) -> Armed {
-        let sink = self.fail_sink.clone();
-        self.fail_armed |= sink.is_some();
-        Armed(sink)
+    /// Box `on_done` as this connection's owner-stamped embedded waiter,
+    /// taking a share of the staged reason sink on the way - **the one
+    /// shape every submit method here hands the core.**
+    ///
+    /// Arming and boxing are one step because they were two, and the
+    /// second was skippable. [`FsConn::fut`] tells "the op is in flight
+    /// and will report for itself" from "the facade refused the
+    /// arguments and nothing ever will" by whether any submission armed
+    /// the sink, so a submit method that reaches the core without arming
+    /// makes `fut` answer a perfectly good op with a spurious `EINVAL` -
+    /// which is what the ring timer shipped with. There is no longer a
+    /// waiter to build without passing through here, and nothing to pass
+    /// in place of the share.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    fn waiter<F>(&mut self, on_done: F) -> FsWaiter
+    where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        let on_fail = self.fail_sink.clone();
+        self.fail_armed |= on_fail.is_some();
+        FsWaiter::Embedded {
+            owner: self.owner,
+            cb: Box::new(on_done),
+            on_fail,
+        }
     }
 
     /// The facade's parts, reborrowed - what the task layer
@@ -2032,7 +2034,7 @@ impl<'a> FsConn<'a> {
         // client facade survives.
         super::confine_resolve(&mut raw.resolve);
         let guarded = super::apply_special_file_guard(&mut raw, special);
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_open(
             self.eng,
             who.0,
@@ -2040,7 +2042,7 @@ impl<'a> FsConn<'a> {
             path.to_owned(),
             raw,
             guarded,
-            embed(self.owner, sink, on_done),
+            w,
         );
     }
 
@@ -2246,16 +2248,9 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
-        self.fs.submit_open(
-            self.eng,
-            who.0,
-            anchor,
-            path,
-            how,
-            guarded,
-            embed(self.owner, sink, on_done),
-        );
+        let w = self.waiter(on_done);
+        self.fs
+            .submit_open(self.eng, who.0, anchor, path, how, guarded, w);
     }
 
     /// Scattered positional read with per-operation flags (`preadv2(2)`).
@@ -2391,8 +2386,8 @@ impl<'a> FsConn<'a> {
                 None => Some(std::sync::Arc::new(LeaseHold(bid))),
             });
             if let (Some((_, taken)), Some(hold)) = (leased, hold) {
-                let sink = self.arm_fail_sink();
-                let w = embed(self.owner, sink, on_done);
+                let w = self.waiter(on_done);
+                let w = w;
                 match self.fs.submit_pwritev2_leased(
                     self.eng,
                     who.0,
@@ -2436,16 +2431,8 @@ impl<'a> FsConn<'a> {
     where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
-        self.fs.submit_fsync(
-            self.eng,
-            who.0,
-            f.fd,
-            false,
-            0,
-            0,
-            embed(self.owner, sink, on_done),
-        );
+        let w = self.waiter(on_done);
+        self.fs.submit_fsync(self.eng, who.0, f.fd, false, 0, 0, w);
     }
 
     /// Flush `f`'s data and essential metadata (`fdatasync`) as `who`.
@@ -2453,16 +2440,8 @@ impl<'a> FsConn<'a> {
     where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
-        self.fs.submit_fsync(
-            self.eng,
-            who.0,
-            f.fd,
-            true,
-            0,
-            0,
-            embed(self.owner, sink, on_done),
-        );
+        let w = self.waiter(on_done);
+        self.fs.submit_fsync(self.eng, who.0, f.fd, true, 0, 0, w);
     }
 
     /// Fire `on_done` after `after`: one relative, one-shot
@@ -2477,12 +2456,8 @@ impl<'a> FsConn<'a> {
     where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
-        self.fs.submit_timeout(
-            self.eng,
-            after,
-            embed(self.owner, sink, on_done),
-        );
+        let w = self.waiter(on_done);
+        self.fs.submit_timeout(self.eng, after, w);
     }
 
     /// Flush the byte range `[offset, offset + length)` of `f` as `who`
@@ -2499,16 +2474,9 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
-        self.fs.submit_fsync(
-            self.eng,
-            who.0,
-            f.fd,
-            datasync,
-            offset,
-            length,
-            embed(self.owner, sink, on_done),
-        );
+        let w = self.waiter(on_done);
+        self.fs
+            .submit_fsync(self.eng, who.0, f.fd, datasync, offset, length, w);
     }
 
     /// Stat the entry `leaf` inside `anchor` as `who` (no terminal-symlink
@@ -2524,7 +2492,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_path_op(
             self.eng,
             TAG_STATX,
@@ -2535,7 +2503,7 @@ impl<'a> FsConn<'a> {
             None,
             statx_at_flags(flags),
             mask.bits(),
-            embed(self.owner, sink, on_done),
+            w,
         );
     }
 
@@ -2550,7 +2518,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_path_op(
             self.eng,
             TAG_STATX,
@@ -2561,7 +2529,7 @@ impl<'a> FsConn<'a> {
             None,
             statx_at_flags(flags | AtFlags::AT_EMPTY_PATH),
             mask.bits(),
-            embed(self.owner, sink, on_done),
+            w,
         );
     }
 
@@ -2621,13 +2589,13 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_fgetxattr_as_root(
             self.eng,
             f.fd,
             name.to_owned(),
             buf,
-            embed(self.owner, sink, on_done),
+            w,
         );
     }
 
@@ -2891,7 +2859,7 @@ impl<'a> FsConn<'a> {
         if target.to_bytes().is_empty() {
             return;
         }
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_path_op(
             self.eng,
             TAG_SYMLINKAT,
@@ -2902,7 +2870,7 @@ impl<'a> FsConn<'a> {
             Some(leaf.to_cstring()),
             0,
             0,
-            embed(self.owner, sink, on_done),
+            w,
         );
     }
 
@@ -2961,14 +2929,14 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_linkat_file(
             self.eng,
             who.0,
             f.fd,
             new.clone(),
             new_leaf.to_cstring(),
-            embed(self.owner, sink, on_done),
+            w,
         );
     }
 
@@ -2994,7 +2962,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_rw(
             self.eng,
             tag,
@@ -3003,7 +2971,7 @@ impl<'a> FsConn<'a> {
             bufs,
             off,
             rw_flags.bits(),
-            embed(self.owner, sink, on_done),
+            w,
         );
     }
 
@@ -3022,18 +2990,9 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_fd_meta(
-            self.eng,
-            tag,
-            who.0,
-            f.fd,
-            name,
-            value,
-            off,
-            len64,
-            aux32,
-            embed(self.owner, sink, on_done),
+            self.eng, tag, who.0, f.fd, name, value, off, len64, aux32, w,
         );
     }
 
@@ -3052,7 +3011,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_path_op(
             self.eng,
             tag,
@@ -3063,7 +3022,7 @@ impl<'a> FsConn<'a> {
             n2,
             flags,
             len_arg,
-            embed(self.owner, sink, on_done),
+            w,
         );
     }
 }
@@ -3158,7 +3117,7 @@ fn chain(
     let Some(step) = steps.pop_front() else {
         // Entry validated a non-empty list. Answered rather than
         // dropped: a dropped callback closes the connection.
-        return on_done(FsDone::failed(Errno::EINVAL), conn);
+        return on_done(FsDone::refused(Errno::EINVAL), conn);
     };
     let last = steps.is_empty();
     let mut raw = step.how.to_raw();
@@ -3195,11 +3154,14 @@ fn chain(
             {
                 path
             }
-            Ok(_) => return on_done(FsDone::failed(Errno::EINVAL), conn),
+            Ok(_) => return on_done(FsDone::refused(Errno::EINVAL), conn),
+            // Forwarded, not refused: the errno is the caller's own
+            // closure's, and marking it would have this crate claim a
+            // verdict it did not reach.
             Err(crate::Error::Errno(e)) => {
                 return on_done(FsDone::failed(e), conn);
             }
-            Err(_) => return on_done(FsDone::failed(Errno::EINVAL), conn),
+            Err(_) => return on_done(FsDone::refused(Errno::EINVAL), conn),
         },
     };
     // Carried onto every step's facade: the second and later steps
@@ -3216,7 +3178,7 @@ fn chain(
         }
         match Anchor::from_file(&f) {
             Ok(next) => chain(conn, next, steps, on_done, sink),
-            Err(_) => on_done(FsDone::failed(Errno::EBADF), conn),
+            Err(_) => on_done(FsDone::refused(Errno::EBADF), conn),
         }
     });
 }
@@ -3239,11 +3201,11 @@ fn walk(
     let Some(part) = parts.pop_front() else {
         // Entry validated a non-empty list. Answered rather than dropped:
         // a dropped callback closes the connection.
-        return on_done(FsDone::failed(Errno::EINVAL), conn);
+        return on_done(FsDone::refused(Errno::EINVAL), conn);
     };
     let bytes = part.clone().into_bytes();
     let Ok(leaf) = Leaf::new(&bytes) else {
-        return on_done(FsDone::failed(Errno::EINVAL), conn);
+        return on_done(FsDone::refused(Errno::EINVAL), conn);
     };
     let at = cur.clone();
     // Carried onto every step's facade, for `chain`'s reason.
@@ -3268,7 +3230,7 @@ fn walk(
                 Ok(next) => {
                     walk(conn, who, next, parts, mode, how, on_done, sink)
                 }
-                Err(_) => on_done(FsDone::failed(Errno::EBADF), conn),
+                Err(_) => on_done(FsDone::refused(Errno::EBADF), conn),
             }
         });
     });
@@ -4084,6 +4046,62 @@ mod hybrid_tests {
         assert_eq!(*got.borrow(), Some(true), "the chain resolved");
     }
 
+    /// A screen that fires mid-chain refuses the way the same screen
+    /// refuses at entry.
+    ///
+    /// `..` in a component is refused at `open_chain`'s entry - where
+    /// nothing is submitted, nothing arms the sink, and `FsConn::fut`
+    /// synthesises the marked `EINVAL`
+    /// (`a_refused_errno_is_marked_as_this_crates_own`) - and again on
+    /// a name the caller's `DeriveName` produces after a step has
+    /// opened. The second is a real completion answered by `chain`, so
+    /// it has to carry the mark itself; without it the same defect
+    /// reads as this crate's verdict at entry and as the kernel's three
+    /// steps in, and an awaiting task takes the second for teardown.
+    #[test]
+    fn a_mid_chain_screen_refuses_the_way_the_entry_screen_does() {
+        let (mut eng, mut fs, me) = setup();
+        let dir = nested();
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let mid: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
+        let m2 = mid.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                c.open_chain(
+                    &at,
+                    vec![
+                        OpenStep {
+                            path: StepPath::Fixed(c"a".to_owned()),
+                            who: me,
+                            how: OpenHow::new()
+                                .flags(OFlag::O_PATH | OFlag::O_DIRECTORY),
+                        },
+                        OpenStep {
+                            path: StepPath::Derived(Box::new(|_| {
+                                Ok(c"../escape".to_owned())
+                            })),
+                            who: me,
+                            how: OpenHow::new().flags(OFlag::O_RDONLY),
+                        },
+                    ],
+                    move |res, _c| *m2.borrow_mut() = Some(res),
+                );
+            },
+            || mid.borrow().is_some(),
+        );
+        let mid = mid.borrow_mut().take().expect("the chain answered");
+        assert!(
+            matches!(mid.result(), Err(crate::Error::Errno(Errno::EINVAL))),
+            "the mid-chain screen refuses the same defect"
+        );
+        assert!(
+            mid.was_refused(),
+            "a mid-chain refusal must not read as the kernel's verdict"
+        );
+    }
+
     /// Every refusal is judged on shape at entry, before anything is
     /// submitted, so a bad argument cannot leave a half-walked chain.
     #[test]
@@ -4522,6 +4540,14 @@ fn deliver(
     refused: bool,
 ) {
     match waiter {
+        // A refusal is *not* marked on the way out here, and the
+        // asymmetry with the arm below is deliberate rather than
+        // missed. The blocking path's public signatures return
+        // `crate::Result`, so there is nowhere to put the bit without
+        // redesigning them; `FsHandle::path_op` carries the rule a
+        // caller needs instead, and names the facade path that does
+        // report provenance. Surface it here the day a channel
+        // consumer can act on it.
         Some(FsWaiter::Channel(tx)) => {
             let _ = tx.send(FsOutcome::new(res, bufs, file, stat));
         }
@@ -4883,8 +4909,13 @@ mod routing_fuzz {
                 off,
                 0,
                 std::sync::Arc::clone(&hold),
-                // No facade here to arm from; see `Armed`.
-                embed(Some((0, 0)), Armed(None), |_d, _fs| {}),
+                // No facade here, so no sink to arm from; every
+                // shipping submission goes through `FsConn::waiter`.
+                FsWaiter::Embedded {
+                    owner: Some((0, 0)),
+                    cb: Box::new(|_d, _fs| {}),
+                    on_fail: None,
+                },
             );
             assert!(staged.is_ok(), "staged");
         }

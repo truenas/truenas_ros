@@ -2456,6 +2456,19 @@ impl FsHandle {
 
     /// A directory-entry op in the common `(anchor, leaf)` [+ destination]
     /// shape.
+    ///
+    /// **`EBUSY` from here has two producers and this path cannot tell
+    /// them apart.** The reactor answers it when the op table is full,
+    /// which is transient and worth retrying; the kernel answers it
+    /// from `is_local_mountpoint` in `vfs_rmdir` (`fs/namei.c:4588`),
+    /// `vfs_unlink` (`:4715`) and `vfs_rename` (`:5243`), which is
+    /// permanent for that path - and on TrueNAS a nested dataset is a
+    /// local mountpoint under its parent, so a blocking caller that
+    /// retries on `EBUSY` alone spins on one. The bit that separates
+    /// them is carried ([`FsOutcome::was_refused`]) but not surfaced by
+    /// these signatures; the [`FsConn`] facade's
+    /// [`FsDone::was_refused`](core::FsDone::was_refused) is where it
+    /// is readable, so bound the retries here or use that path.
     #[allow(clippy::too_many_arguments)]
     fn path_op(
         &self,
