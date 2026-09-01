@@ -210,15 +210,12 @@ where
 /// written against the older signature took `self.fail_sink.take()`,
 /// which type-checks, submits, and arms nothing. This makes the same
 /// mistake a build failure.
+///
+/// The field is private rather than the type opaque, so a test in a
+/// descendant module can still build an unarmed one directly; a
+/// constructor for that would be dead code wherever the test using it
+/// is gated out.
 pub(crate) struct Armed(Option<FailSink>);
-
-#[cfg(test)]
-impl Armed {
-    /// A share for a test that submits with no facade to arm from.
-    fn none() -> Armed {
-        Armed(None)
-    }
-}
 
 /// Report an early submission failure - the SQE never staged (slot exhaustion,
 /// an unusable file) - handing the caller's payloads back exactly as a
@@ -4886,7 +4883,8 @@ mod routing_fuzz {
                 off,
                 0,
                 std::sync::Arc::clone(&hold),
-                embed(Some((0, 0)), Armed::none(), |_d, _fs| {}),
+                // No facade here to arm from; see `Armed`.
+                embed(Some((0, 0)), Armed(None), |_d, _fs| {}),
             );
             assert!(staged.is_ok(), "staged");
         }
