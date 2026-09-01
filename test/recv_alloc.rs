@@ -279,7 +279,8 @@ fn download_cost(warmup: usize, measured: usize) -> Option<usize> {
     const CHUNK: usize = 64 * 1024;
     const SIZE: usize = 4 * CHUNK; // four chunk reads per body
 
-    let dir = std::env::temp_dir().join(format!("ros-dl-{warmup}-{measured}"));
+    let dir = std::env::temp_dir()
+        .join(format!("ros-dl-{warmup}-{measured}-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("obj");
     std::fs::write(&path, vec![0x41u8; SIZE]).expect("write fixture");
@@ -441,8 +442,11 @@ fn put_to_file_cost_ranged(
     use truenas_ros::http::HttpStreamDeferred;
     use truenas_ros::uring_fs::{Personality, RwFlags};
 
-    let dir = std::env::temp_dir()
-        .join(format!("ros-put-{mib}-{:x}", wire_of as usize));
+    let dir = std::env::temp_dir().join(format!(
+        "ros-put-{mib}-{:x}-{}",
+        wire_of as usize,
+        std::process::id()
+    ));
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("obj");
     let _ = std::fs::remove_file(&path);
@@ -847,7 +851,15 @@ fn pipelined_put_cost(
     use truenas_ros::http::HttpDeferred;
     use truenas_ros::uring_fs::{File, Personality, RwFlags};
 
-    let dir = std::env::temp_dir().join(format!("ros-pipe-{mib}-{conns}-{k}"));
+    // The pid is what keeps this reentrant. `MEASURING` serializes the
+    // measuring tests *within* a process, and nothing serializes two
+    // processes - so two `recv_alloc` binaries running at once (a
+    // background suite and a foreground rerun, most often) shared this
+    // directory, and the `remove_dir_all` below deleted the other's
+    // objects mid-upload. It surfaced as `read back` failing at the
+    // verify, which reads exactly like a lost write.
+    let dir = std::env::temp_dir()
+        .join(format!("ros-pipe-{mib}-{conns}-{k}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mkdir");
     for i in 0..conns {

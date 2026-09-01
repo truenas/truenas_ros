@@ -796,8 +796,9 @@ impl TaskFs {
     /// [`FsConn::fut`] against the running poll's facade.
     ///
     /// Using this handle outside its own task's poll submits nothing
-    /// and resolves `EINVAL` with [`FsDone::was_refused`] true - see
-    /// [`no_facade`]; the same misuse at teardown resolves `ECANCELED`.
+    /// and resolves `EINVAL` with [`FsDone::was_refused`] true; the
+    /// same misuse at teardown resolves `ECANCELED` instead, which is
+    /// this module's one meaning for "the reactor is going away".
     pub fn fut(
         &self,
         submit: impl FnOnce(&mut FsConn<'_>, OnDone),

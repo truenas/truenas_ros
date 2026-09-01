@@ -2045,9 +2045,9 @@ impl<'a> FsConn<'a> {
     ///
     /// A continuation runs after its owner may be gone - the sweep is
     /// once per close and a completion it cancelled is what schedules
-    /// the continuation - so "my ops are failing" is the signal
-    /// [`super::task`] tells a task to wind down on. Two shapes never
-    /// see it: an offload is never cancelled and always delivers, and
+    /// the continuation - so "my ops are failing" is the signal a task
+    /// is told to wind down on. Two shapes never see it: an offload is
+    /// never cancelled and always delivers, and
     /// a timer armed *after* the sweep expires normally. A task built
     /// from either would otherwise run for a dead connection
     /// indefinitely, holding a graceful drain open with it.
@@ -3977,16 +3977,10 @@ mod hybrid_tests {
         dir
     }
 
-    /// Run `f` with this thread's panic printing silenced, serialized
-    /// against every other hook-swapping test: installing a hook is
-    /// process-global and tests run as threads in one binary, so two
-    /// unserialized swaps can interleave and strand one of them. The
-    /// filter forwards other threads' panics, so a concurrent test's
-    /// real failure still names itself; a panic inside `f` restores the
-    /// hook on the way out.
+    /// Run `f` with this thread's panic printing silenced. The guard
+    /// carries its own serialization now (see
+    /// `quiet_panics_on_this_thread`), so this is only the shorthand.
     fn with_silent_panics<R>(f: impl FnOnce() -> R) -> R {
-        static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _serialized = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let _quiet = crate::uring_fs::quiet_panics_on_this_thread();
         f()
     }

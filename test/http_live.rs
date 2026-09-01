@@ -1302,15 +1302,19 @@ fn http_handler_reads_a_file_through_one_batched_job() {
     };
 }
 
-/// `HttpDeferred::redrive` pins the second-open contract: continuation and
-/// offload-delivery facades cannot `open`, so a handler whose next open
-/// depends on an earlier result parks its progress in `U` and redrives -
-/// and the redelivery's fresh facade must be open-capable, or the second
-/// pass's continuation is dropped and the connection closes instead of
-/// answering.
+/// `HttpDeferred::redrive` hands a handler a fresh request-handler
+/// facade, with the request state it parked in `U`.
+///
+/// Every facade can `open` - the gate that once stopped a continuation
+/// from opening is gone, and `fs_continuation_may_open_and_its_slot_comes_back`
+/// pins that directly. What survives is the redelivery contract: a
+/// handler whose next step depends on an earlier result parks its
+/// progress, redrives from wherever the earlier result landed, and must
+/// get a facade back at all - a redelivery that dropped its
+/// continuation would close the connection instead of answering.
 #[cfg(feature = "uring-fs")]
 #[test]
-fn http_redrive_hands_back_an_open_capable_facade() {
+fn http_redrive_returns_a_facade_with_the_parked_state() {
     use std::sync::{Arc, OnceLock};
     use truenas_ros::http::HttpVerdict;
     use truenas_ros::sync_fs::{OFlag, OpenHow};
@@ -1333,8 +1337,8 @@ fn http_redrive_hands_back_an_open_capable_facade() {
             );
         };
         if !*redriven {
-            // First pass: park, and redrive from an offload delivery - the
-            // seam whose facade is deliberately not open-capable.
+            // First pass: park, and redrive from an offload delivery -
+            // the seam furthest from the request handler.
             *redriven = true;
             let (deferred, permit) = req.defer();
             fs.offload_result(|| Ok(()), move |_res, _fs| deferred.redrive());
@@ -1733,9 +1737,11 @@ fn http_file_body_waits_for_an_op_slot() {
         let (deferred, permit) = req.defer();
         let who = *pc.get().expect("personality set before serving");
         let armed = armed_tx.clone();
-        // Both opens are issued HERE: a continuation's facade cannot open
-        // (`root: false`), so the second handle cannot be fetched from the
-        // first's callback. Whichever completes second does the work.
+        // Both opens are issued HERE so they overlap on the ring, which
+        // is what this test is about: whichever completes second does
+        // the work. (Not a restriction - a continuation's facade opens
+        // like any other; see
+        // `fs_continuation_may_open_and_its_slot_comes_back`.)
         type Held = (
             Option<truenas_ros::uring_fs::File>,
             Option<truenas_ros::uring_fs::File>,
