@@ -925,15 +925,19 @@ impl FsCore {
     /// at [`FsCore::on_cqe`] because that firing is the completion the
     /// caller asked for. No fd, no personality: a timer touches nothing a
     /// credential guards.
+    ///
+    /// Answers the armed timer's routing token, for
+    /// [`FsCore::submit_cancel`]; `None` when the table refused it, and
+    /// then the waiter has already been failed.
     pub(crate) fn submit_timeout(
         &mut self,
         eng: &mut Engine,
         after: std::time::Duration,
         waiter: FsWaiter,
-    ) {
+    ) -> Option<u64> {
         let Some(op_slot) = self.op_free.pop() else {
             fail(waiter, Errno::EBUSY, Vec::new());
-            return;
+            return None;
         };
 
         let ts = Box::new(KernelTimespec {
@@ -956,7 +960,9 @@ impl FsCore {
         });
         if let Err(err) = staged {
             self.fail_op(op_slot, err);
+            return None;
         }
+        Some(ud)
     }
 
     /// Stage a metadata op that targets an **open file**: `FTRUNCATE`/
@@ -1366,7 +1372,6 @@ impl FsCore {
     /// -- nothing routes its completion - but goes through `eng.stage` so the
     /// engine's in-flight accounting stays correct. Best-effort: a stage failure
     /// (ring full) is dropped; server teardown still reaps the op.
-    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     fn submit_cancel(&self, eng: &mut Engine, target_ud: u64) {
         let ud = pack_raw(TAG_CANCEL, 0, 0);
         let _ = eng.stage(ud, |sqe| {
@@ -1751,6 +1756,17 @@ impl std::fmt::Debug for FsDone {
             .finish_non_exhaustive()
     }
 }
+
+/// A timer armed by [`FsConn::timeout`], for
+/// [`FsConn::cancel_timeout`].
+///
+/// Names one arming, not the slot: it carries the op-table generation
+/// the arm was made under, so a `Timer` kept past its own expiry
+/// cancels nothing when the slot has been reissued. Copy, because
+/// retracting is idempotent and a caller that holds two deadlines
+/// should not have to track which one it has already spent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timer(u64);
 
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 impl FsDone {
@@ -2559,15 +2575,40 @@ impl<'a> FsConn<'a> {
     /// expires. No fd and no personality ride it - a timer touches
     /// nothing a credential guards - so this is the retry-tick and
     /// deadline primitive: a caller that must try again later re-arms
-    /// here instead of sleeping an offload worker. A timer cancelled in
-    /// flight completes `ECANCELED`; an owner gone before expiry drops
-    /// the callback, like any continuation's.
-    pub fn timeout<F>(&mut self, after: std::time::Duration, on_done: F)
+    /// here instead of sleeping an offload worker. An owner gone before
+    /// expiry drops the callback, like any continuation's.
+    ///
+    /// **A timer holds its op slot for its whole wall-clock duration**,
+    /// which no other op on this facade does - a read holds one until
+    /// the I/O completes, and the table is sized on that. So a deadline
+    /// armed for 30 s and reached in 3 ms costs the other 29.997 s of
+    /// the handler budget unless it is retracted, which is what the
+    /// returned [`Timer`] is for. `None` means the table refused the
+    /// arm; `on_done` has already been answered `EBUSY`.
+    pub fn timeout<F>(
+        &mut self,
+        after: std::time::Duration,
+        on_done: F,
+    ) -> Option<Timer>
     where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
         let w = self.waiter(on_done);
-        self.fs.submit_timeout(self.eng, after, w);
+        self.fs.submit_timeout(self.eng, after, w).map(Timer)
+    }
+
+    /// Retract a timer armed by [`timeout`](Self::timeout), freeing its
+    /// op slot ahead of its expiry.
+    ///
+    /// The timer completes `ECANCELED` and `on_done` fires with it, so
+    /// a caller still gets exactly one answer per arm - which is why
+    /// this is the retraction rather than a way to make one vanish.
+    /// Best-effort and idempotent: a [`Timer`] that has already fired
+    /// names a generation the slot no longer carries, so the kernel
+    /// finds nothing and the cancel is inert. Nothing is reported
+    /// either way; the answer arrives at `on_done`.
+    pub fn cancel_timeout(&mut self, timer: Timer) {
+        self.fs.submit_cancel(self.eng, timer.0);
     }
 
     /// Flush the byte range `[offset, offset + length)` of `f` as `who`

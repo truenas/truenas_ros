@@ -1966,6 +1966,77 @@ mod tests {
         );
     }
 
+    /// A deadline reached early gives its op slot back, instead of
+    /// holding it for the wall-clock time it was armed for.
+    ///
+    /// Every other op on this facade holds a slot until an I/O
+    /// completes, and the table is sized on that. A timer holds one for
+    /// its whole duration, so a handler arming a 30 s deadline and
+    /// finishing in milliseconds spends the rest of it out of the
+    /// handler budget - which is what makes the retraction load-bearing
+    /// rather than a convenience. The kernel's half is `io_try_cancel`
+    /// falling through to `io_timeout_cancel` (`io_uring/cancel.c`),
+    /// which `submit_cancel` reaches because it leaves
+    /// `IORING_ASYNC_CANCEL_FD` clear.
+    #[test]
+    fn a_cancelled_timer_gives_its_slot_back_before_it_expires() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        // One slot, so holding it is observable.
+        let mut fs = FsCore::new(1, OffloadBounds::default());
+        let done = Rc::new(StdCell::new(false));
+        let started = Instant::now();
+
+        let timer = {
+            let done = Rc::clone(&done);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            // An hour, so nothing here can pass by expiring.
+            conn.timeout(Duration::from_secs(3600), move |d, _conn| {
+                assert!(
+                    matches!(
+                        d.result(),
+                        Err(crate::Error::Errno(Errno::ECANCELED))
+                    ),
+                    "a retracted timer answers ECANCELED: {:?}",
+                    d.result()
+                );
+                done.set(true);
+            })
+            .expect("the table armed it")
+        };
+        assert!(!fs.has_free_op(), "the armed timer holds the only slot");
+
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.cancel_timeout(timer);
+        }
+        drive(&mut fs, &mut eng, &done, "the retraction");
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "it waited out the arm rather than being retracted"
+        );
+        assert!(
+            fs.has_free_op(),
+            "the slot came back with the ECANCELED completion"
+        );
+
+        // A `Timer` outliving its own op retracts nothing: the slot is
+        // reissued under a new generation, so the token names no op.
+        let fired = Rc::new(StdCell::new(false));
+        {
+            let fired = Rc::clone(&fired);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.timeout(Duration::from_millis(30), move |d, _conn| {
+                assert!(d.result().is_ok(), "the reissued timer expires");
+                fired.set(true);
+            })
+            .expect("the freed slot serves the next arm");
+            conn.cancel_timeout(timer); // the spent one
+        }
+        drive(&mut fs, &mut eng, &fired, "a stale retraction is inert");
+    }
+
     /// The timer composes with the future layer like any submission: a
     /// task awaits its tick and resumes on the loop that armed it.
     #[test]
@@ -1980,7 +2051,9 @@ mod tests {
             let mut conn = FsConn::new(&mut fs, &mut eng, None);
             conn.spawn(move |t| async move {
                 let fired = t
-                    .fut(|c, cb| c.timeout(Duration::from_millis(30), cb))
+                    .fut(|c, cb| {
+                        c.timeout(Duration::from_millis(30), cb);
+                    })
                     .await;
                 assert!(fired.result().is_ok(), "{:?}", fired.result().err());
                 done.set(true);
