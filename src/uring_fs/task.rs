@@ -965,10 +965,47 @@ impl Drop for PassGuard {
     }
 }
 
+/// Run one delivery point's callbacks inside a drain pass, then poll
+/// the tasks they woke.
+///
+/// **The mark and the drain are one call because they are one
+/// invariant.** The flag is what tells [`wake_task`] the loop is already
+/// about to poll, so a delivery point that marked a pass and then did
+/// not drain would swallow the wake outright. A guard the caller has to
+/// pair by hand is how that gets broken by the next delivery point
+/// somebody adds.
+///
+/// Marking *before* the callbacks is the whole point: a completion that
+/// resolves an op future wakes its task from inside the callback, one
+/// statement before the drain that polls it, so the eventfd write, the
+/// CQE it produces and the re-arm SQE that follows are all spent
+/// announcing work this call is already doing. The callback form pays
+/// none of that, and an awaited op should not either.
+///
+/// A nested [`drain`] - a callback calling
+/// [`run_woken`](FsConn::run_woken) - clears the flag when it returns,
+/// which costs the redundant poke back for the rest of this pass and
+/// never a wake.
+pub(crate) fn in_pass(
+    fs: &mut FsCore,
+    eng: &mut Engine,
+    deliver: impl FnOnce(&mut FsCore, &mut Engine),
+) {
+    let pass = fs.tasks.run.as_ref().map(Arc::clone);
+    if let Some(run) = &pass {
+        run.draining.store(true, Ordering::Release);
+    }
+    // `None` where the reactor has never spawned a task, and there no
+    // task wake can arrive.
+    let _pass = pass.map(PassGuard);
+    deliver(fs, eng);
+    drain(fs, eng);
+}
+
 /// Poll woken tasks, each with a fresh owner-scoped facade, bounded to
-/// what was queued when the pass began. Called by the delivery points
-/// after they fire callbacks, so a completion that woke a task runs it
-/// in the same dispatch, at callback latency.
+/// what was queued when the pass began. Called by [`in_pass`] once its
+/// delivery point has fired its callbacks, so a completion that woke a
+/// task runs it in the same dispatch, at callback latency.
 ///
 /// The entry bound is what keeps the ring serviced: a task that
 /// re-wakes itself - or a cascade every pass extends - lands behind it
@@ -2643,6 +2680,60 @@ mod tests {
         assert!(
             pending_pokes(&run) > 0,
             "nothing poked: the loop will park and never schedule it"
+        );
+    }
+
+    /// The converse, and the one that costs: a completion that resolves
+    /// an op future wakes its task one statement before the drain that
+    /// polls it, so the wake must not spend an eventfd write, the CQE
+    /// it produces and the re-arm SQE that follows announcing work the
+    /// same dispatch is already doing. The callback form pays none of
+    /// that.
+    #[test]
+    fn a_completion_that_resolves_a_future_does_not_poke_the_loop() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        // The wake `READ` is deliberately not armed: it would consume
+        // the eventfd counter this test is counting. Nothing here needs
+        // it - every op is a ring op, delivered by `deliver_embedded`.
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let anchor = Anchor::open(dir.path()).expect("anchor");
+        let done = Rc::new(StdCell::new(false));
+
+        const OPS: usize = 8;
+        {
+            let done = Rc::clone(&done);
+            let anchor2 = anchor.clone();
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |t| async move {
+                for _ in 0..OPS {
+                    t.fut(|c, cb| c.open(who, &anchor2, c".", spec_dir(), cb))
+                        .await
+                        .file()
+                        .expect("open");
+                }
+                done.set(true);
+            });
+        }
+        let run = Arc::clone(fs.tasks.run.as_ref().expect("run queue"));
+        // The spawn's own inline poll is outside a pass, so it pokes;
+        // clear that one and count only what the completions cost.
+        let _spawn_poke = pending_pokes(&run);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut pokes = 0;
+        while !done.get() {
+            assert!(Instant::now() < deadline, "the task never finished");
+            if turn(&mut fs, &mut eng) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            pokes += pending_pokes(&run);
+        }
+        assert_eq!(
+            pokes, 0,
+            "{OPS} awaited ops cost {pokes} eventfd pokes for tasks the \
+             same dispatch was about to poll"
         );
     }
 

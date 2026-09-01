@@ -4507,13 +4507,15 @@ fn deliver(
 /// `true`, a net-server continuation `false`). Shared by the host and the net
 /// server so the wake-drain is written once.
 pub(crate) fn deliver_pool_completions(fs: &mut FsCore, eng: &mut Engine) {
-    for (owner, deliver, any) in fs.take_pool_completions() {
-        let mut conn = FsConn::new(fs, eng, owner);
-        deliver(any, &mut conn);
-    }
     // Tasks woken by these deliveries - or poked from off-loop, which
-    // lands on the same wake the pool uses - run in this dispatch.
-    super::task::drain(fs, eng);
+    // lands on the same wake the pool uses - run in this dispatch, and
+    // an on-loop wake inside it needs no poke to say so.
+    super::task::in_pass(fs, eng, |fs, eng| {
+        for (owner, deliver, any) in fs.take_pool_completions() {
+            let mut conn = FsConn::new(fs, eng, owner);
+            deliver(any, &mut conn);
+        }
+    });
 }
 
 /// Fire an embedded on-loop completion reaped by [`FsCore::on_cqe`] with a
@@ -4527,7 +4529,10 @@ pub(crate) fn deliver_embedded(
     eng: &mut Engine,
     reaped: ReapedFs,
 ) {
-    match reaped {
+    // A completion that resolves an op future wakes its task from
+    // inside the callback below; the drain that follows polls it, so
+    // the wake needs no poke to reach the loop. See `task::in_pass`.
+    super::task::in_pass(fs, eng, move |fs, eng| match reaped {
         ReapedFs::Embedded(cb, done, owner) => {
             let mut conn = FsConn::new(fs, eng, owner);
             cb(done, &mut conn);
@@ -4536,10 +4541,7 @@ pub(crate) fn deliver_embedded(
             unreachable!("pump reads are routed by the net server")
         }
         ReapedFs::None => {}
-    }
-    // A completion that resolved an op future woke its task; polling
-    // here, after the callback fired, keeps tasks at callback latency.
-    super::task::drain(fs, eng);
+    });
 }
 
 /// Routing / close-last property fuzzer for the **plain-fd** core. There is no
