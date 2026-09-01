@@ -1091,8 +1091,9 @@ where
                     };
                     self.on_pump_read(owner, done, bid)?;
                 }
-                // Continuation facade `root: false`: no new `open` (the owning
-                // connection may be gone; its file would leak).
+                // A continuation facade, for an owner that may already be
+                // gone: a file it opens is its own to close, since
+                // nothing sweeps one opened after the connection did.
                 mut reaped => {
                     // A leased write's buffer comes back to the pool here,
                     // before the callback runs: the op is over whatever the

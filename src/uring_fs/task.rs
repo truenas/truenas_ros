@@ -619,6 +619,14 @@ fn park_in<T: 'static, R>(
 /// **The pointer is taken for the call**, so a nested reach finds an
 /// empty cell rather than deriving a second live `&mut` to the same
 /// value, and the guard puts it back however `f` ends.
+///
+/// **`T` must not carry a lifetime, and this does not check it.** The
+/// bound is `T: 'static`, which `FsConn<'static>` satisfies, so `f` here
+/// may be instantiated at a single concrete lifetime and can return a
+/// borrow that outlives the value. [`with_conn`] is what makes the
+/// facade safe, by taking `impl FnOnce(&mut FsConn<'_>) -> R` - which
+/// desugars higher-ranked - and every reach of [`CURRENT`] goes through
+/// it. Reaching the cell directly is a use-after-free from safe code.
 fn reach_in<T: 'static, R>(
     cell: &'static ParkCell<T>,
     f: impl FnOnce(&mut T) -> R,
@@ -731,7 +739,7 @@ impl TaskFs {
             None => {
                 debug_assert!(
                     tearing_down(),
-                    "TaskFs::fut outside a task poll"
+                    "TaskFs::fut with no facade: outside its task's poll, or nested inside a call already holding it"
                 );
                 FsFuture(Slot::gone())
             }
@@ -749,7 +757,7 @@ impl TaskFs {
             None => {
                 debug_assert!(
                     tearing_down(),
-                    "TaskFs::offload_fut outside a task poll"
+                    "TaskFs::offload_fut with no facade: outside its task's poll, or nested inside a call already holding it"
                 );
                 OffloadFuture(Slot::gone())
             }
@@ -767,7 +775,7 @@ impl TaskFs {
             None => {
                 debug_assert!(
                     tearing_down(),
-                    "TaskFs::result_fut outside a task poll"
+                    "TaskFs::result_fut with no facade: outside its task's poll, or nested inside a call already holding it"
                 );
                 OffloadFuture(Slot::gone())
             }
@@ -790,7 +798,7 @@ impl TaskFs {
             None => {
                 debug_assert!(
                     tearing_down(),
-                    "TaskFs::spawn outside a task poll"
+                    "TaskFs::spawn with no facade: outside its task's poll, or nested inside a call already holding it"
                 );
                 JoinHandle(Slot::gone())
             }
@@ -2413,8 +2421,13 @@ mod tests {
         assert!(turns > 0, "the drive never ran a turn");
     }
 
-    /// A task spawned from inside a task runs, and slots recycle once
-    /// tasks retire - the second spawn reuses the first one's slot.
+    /// A task spawned from inside a task runs, and a slot a retired
+    /// task left is reused rather than grown past.
+    ///
+    /// Both halves are asserted. Parent and child coexist, so the table
+    /// grows to two while they run; the assertion that everything
+    /// retired would hold on its own even if `insert` never popped
+    /// `free`, so the spawn afterwards is what pins recycling.
     #[test]
     fn tasks_nest_and_slots_recycle() {
         let Some((mut eng, mut fs, _who)) = rig() else {
@@ -2445,7 +2458,23 @@ mod tests {
             });
         }
         drive(&mut fs, &mut eng, &done, "nested tasks");
-        assert_eq!(fs.tasks.free.len(), fs.tasks.slots.len());
+        assert_eq!(
+            fs.tasks.free.len(),
+            fs.tasks.slots.len(),
+            "a retired task left its slot occupied"
+        );
+        let grown = fs.tasks.slots.len();
+        assert_eq!(grown, 2, "parent and child coexist");
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            drop(conn.spawn(|_t| async {}));
+        }
+        assert_eq!(
+            fs.tasks.slots.len(),
+            grown,
+            "a spawn after two retirements grew the table instead of \
+             reusing a free slot"
+        );
     }
 
     /// A stale waker - its task retired, the slot's generation moved
@@ -2701,7 +2730,7 @@ mod tests {
     /// The debug half: reaching `TaskFs` outside a poll asserts.
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "outside a task poll")]
+    #[should_panic(expected = "TaskFs::fut with no facade")]
     fn task_fs_outside_a_poll_debug_asserts() {
         let t = TaskFs::new();
         drop(t.fut(|_c, _cb| {}));
@@ -2822,7 +2851,7 @@ mod tests {
     /// The debug halves of the same two guards.
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "TaskFs::offload_fut outside a task poll")]
+    #[should_panic(expected = "TaskFs::offload_fut with no facade")]
     fn task_fs_offload_outside_a_poll_debug_asserts() {
         drop(TaskFs::new().offload_fut(|| Ok::<_, crate::Error>(1)));
     }
@@ -2830,7 +2859,7 @@ mod tests {
     /// And `spawn`'s.
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "TaskFs::spawn outside a task poll")]
+    #[should_panic(expected = "TaskFs::spawn with no facade")]
     fn task_fs_spawn_outside_a_poll_debug_asserts() {
         drop(TaskFs::new().spawn(|_t| async {}));
     }

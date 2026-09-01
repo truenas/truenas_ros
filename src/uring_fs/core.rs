@@ -1797,12 +1797,22 @@ impl FsDone {
 ///
 /// **No method here may return data borrowed from `'a`.** The task layer
 /// parks a facade in a thread-local as `FsConn<'static>` and hands it back
-/// as `&mut FsConn<'_>` (`task::reach_in`); `&mut U` is
-/// invariant in `U`, so that closure can be instantiated at
-/// `&mut FsConn<'static>`. Nothing escapes today only because every method
-/// returns owned values or borrows of `&self` - add one
-/// `fn x(&self) -> &'a T` and a caller could extend a borrow of the ring's
-/// tables past the poll that parked them, with no diagnostic anywhere.
+/// as `&mut FsConn<'_>`; `&mut U` is invariant in `U`, so a closure taking
+/// the facade can be instantiated at `&mut FsConn<'static>`.
+///
+/// What keeps that from leaking is **`task::with_conn`'s signature**:
+/// `impl FnOnce(&mut FsConn<'_>) -> R` desugars higher-ranked, so `R`
+/// cannot name the facade's lifetime whatever the cell holds. It is not
+/// `task::reach_in`, which is generic over a `'static` `T` and quantifies
+/// nothing - reached directly at `T = FsConn<'static>` it will hand out
+/// `&'static` borrows of a facade that died with its poll. A second
+/// wrapper beside `with_conn` has to reproduce that bound, or it is
+/// unsound from safe code.
+///
+/// The rule here is the belt to that brace, and today it holds only
+/// because every method returns owned values or borrows of `&self` - add
+/// one `fn x(&self) -> &'a T` and a caller could extend a borrow of the
+/// ring's tables past the poll that parked them.
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 pub struct FsConn<'a> {
     fs: &'a mut FsCore,
@@ -1965,10 +1975,15 @@ impl<'a> FsConn<'a> {
     /// `/` is refused); resolution defaults to the full [`CONFINED_RESOLVE`]
     /// set unless `how` states a confinement policy of its own, on the same
     /// rule the blocking [`FsHandle::open`](crate::uring_fs::FsHandle::open)
-    /// applies - a `resolve` carrying only hardening flags composes with the
-    /// default rather than replacing it. Only the request-handler facade may open (a
-    /// continuation's `open` is refused). An invalid argument drops `on_done`,
-    /// closing the connection.
+    /// applies - a `resolve` carrying only hardening flags composes with
+    /// the default rather than replacing it. An invalid argument drops
+    /// `on_done`, closing the connection.
+    ///
+    /// Every facade may open, a continuation's included. What that costs
+    /// is the file: a continuation runs for an owner that may already be
+    /// gone, and nothing sweeps a descriptor opened after its
+    /// connection closed until the reactor's tables go, so a chain that
+    /// opens must reach a step that closes.
     pub fn open<F>(
         &mut self,
         who: Personality,
@@ -2270,7 +2285,8 @@ impl<'a> FsConn<'a> {
     /// pool gets the buffer back when the last of them completes - zero
     /// copies, zero allocations, for as many in-bounds ranges as one
     /// delivery submits. Anything else - an unpooled connection, a placed
-    /// or owned body, a range outside the claim, a full op table - falls
+    /// or owned body, a range outside the claim, a full op table, or a
+    /// call from inside a task, whose facade carries no claim - falls
     /// back to `pwritev2` on a copy, so the call degrades instead of
     /// failing.
     ///
@@ -3356,8 +3372,8 @@ impl FsConn<'_> {
     /// - **An offload is never cancelled.** `cancel_owned_by` sweeps ring
     ///   ops only; the job always runs to completion and its delivery always
     ///   fires, possibly for an owner that is gone - a continuation must
-    ///   already tolerate that (its facade cannot `open`, and a deferred
-    ///   reply is generation-checked).
+    ///   already tolerate that (a deferred reply is generation-checked,
+    ///   and a file it opens is its own to close).
     /// - **The registry and pool queue are uncapped.** Bound in-flight jobs
     ///   upstream, at the request cap. A failed worker spawn runs the job
     ///   inline on the loop rather than lose it (`SharedPool`).
@@ -3570,8 +3586,7 @@ impl FsConn<'_> {
 
     /// Open `anchor` itself readable **under `who`** on the ring (the DAC /
     /// list-permission check), then `fdopendir` it off-loop; deliver the ready
-    /// [`DirWalk`] to `on_ready` on the reactor thread. Only the request-handler
-    /// facade may open (like [`FsConn::open`]).
+    /// [`DirWalk`] to `on_ready` on the reactor thread.
     pub fn open_dir<F>(
         &mut self,
         who: Personality,
@@ -4515,9 +4530,8 @@ fn deliver(
 }
 
 /// Deliver every finished offload's continuation on-loop, each with a fresh
-/// owner-scoped [`FsConn`] (`root` per the host: the standalone reactor passes
-/// `true`, a net-server continuation `false`). Shared by the host and the net
-/// server so the wake-drain is written once.
+/// owner-scoped [`FsConn`]. Shared by the host and the net server so the
+/// wake-drain is written once.
 pub(crate) fn deliver_pool_completions(fs: &mut FsCore, eng: &mut Engine) {
     // Tasks woken by these deliveries - or poked from off-loop, which
     // lands on the same wake the pool uses - run in this dispatch, and

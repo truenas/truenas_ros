@@ -49,10 +49,13 @@ where
     /// Deliver the results of finished fs offload jobs ([`FsConn::offload`] and
     /// the hybrid directory lister) that workers pushed onto the fs completion
     /// queue and signalled by poking this wake. Each fires with a fresh
-    /// owner-scoped `FsConn` whose facade cannot `open`, so a continuation for
-    /// a possibly-gone connection cannot mint a new file. Without this drain the
-    /// server would never resolve an offloaded request and would leak the walk's
-    /// `DIR*`; the standalone host drains the same way from its own wake.
+    /// owner-scoped `FsConn` for an owner that may already be gone, so a
+    /// file one of them opens is its own to close. Without this drain the
+    /// server would never resolve an offloaded request and would leak the
+    /// walk's `DIR*`; the standalone host drains the same way from its own
+    /// wake. It is also where the fs reactor's woken tasks are polled
+    /// (`deliver_pool_completions` ends in `task::in_pass`'s drain), so
+    /// skipping it strands those too.
     #[cfg(feature = "uring-fs")]
     fn drain_fs_offloads(&mut self) -> errno::Result<()> {
         if let Some(fs) = self.fs.as_mut() {

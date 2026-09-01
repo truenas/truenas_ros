@@ -1299,14 +1299,14 @@ where
 ///   [`HttpDeferred`] in the op's continuation, and return
 ///   [`HttpVerdict::Defer`]; the continuation, or a later offload delivery,
 ///   resolves it via [`HttpDeferred::reply`].
-/// - **A continuation cannot `open`.**
-///   [`open`](crate::uring_fs::FsConn::open) works only on the facade
-///   handed to the handler itself; on the one a continuation or offload
-///   delivery receives it is refused (the owning connection may be gone,
-///   and a file opened for it would leak). A handler whose second `open`
-///   depends on a first op's result parks its progress in the connection
-///   state `U` and calls [`HttpDeferred::redrive`]: redelivery re-enters
-///   the handler with a fresh, open-capable facade.
+/// - **A continuation may `open`, and owns what it opens.**
+///   [`open`](crate::uring_fs::FsConn::open) works on every facade,
+///   including the one a continuation or offload delivery receives. That
+///   facade runs for an owner that may already be gone, and nothing
+///   sweeps a descriptor opened after its connection closed, so a chain
+///   that opens must reach a step that closes. A handler that would
+///   rather re-enter with a fresh delivery can still park its progress
+///   in the connection state `U` and call [`HttpDeferred::redrive`].
 /// - **Offload jobs are never cancelled**
 ///   ([`FsConn::offload`](crate::uring_fs::FsConn::offload)): a delivery
 ///   may fire for a request that is gone, and a resolved [`HttpDeferred`]
