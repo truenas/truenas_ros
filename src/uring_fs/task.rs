@@ -45,15 +45,25 @@
 //!   `ECANCELED` rather than pending forever. That is the future form
 //!   of "dropping the continuation closes the connection": a refused
 //!   submission, or teardown, reaches the awaiting task as an error it
-//!   can act on, **and it says which**: a refused submission resolves
-//!   with the errno the facade refused it for - `EBUSY` from a full
-//!   op table, which is the documented fan-out failure and is worth
-//!   retrying, or `EINVAL` from an argument the facade will never
-//!   accept, which is a caller bug. `ECANCELED` is left meaning
-//!   teardown alone. The callback form still drops `on_done` for all
-//!   three, which is its own contract; the futures layer stages a
-//!   reason sink beside the callback, and a sink runs no consumer
-//!   code, so nothing is delivered inline from a submit path.
+//!   can act on, **and it says which**. The callback form still drops
+//!   `on_done` for all of them, which is its own contract; the futures
+//!   layer stages a reason sink beside the callback, and a sink runs no
+//!   consumer code, so nothing is delivered inline from a submit path.
+//!   Three things make the distinction usable:
+//!   - [`FsDone::was_refused`] says the errno is **this crate's**, not
+//!     the kernel's. Read it first: `EBUSY` from a full op table is
+//!     worth retrying and `EBUSY` from the kernel is permanent for that
+//!     path, and nothing about the errno alone separates them.
+//!   - The refusal **hands the payload back** ([`FsDone::into_bufs`]),
+//!     so the retry it advises is possible without keeping a second
+//!     copy of every write.
+//!   - The sink is **shared across a multi-step call's steps**
+//!     ([`FsConn::open_chain`], [`FsConn::mkdir_path`]), which submit
+//!     from a fresh facade after the first, so a mid-chain refusal
+//!     keeps its errno instead of arriving as teardown.
+//!
+//!   `ECANCELED` with `was_refused()` false is left meaning teardown
+//!   alone.
 //! - **A task's facade is a continuation facade.** Each poll gets a
 //!   fresh owner-scoped [`FsConn`], the same one a completion callback
 //!   is handed, and everything a continuation must tolerate - an owner
@@ -327,23 +337,28 @@ impl FsConn<'_> {
         let slot = Slot::new();
         let fire = Fire(Some(Rc::clone(&slot)));
         // Why an op never reached the ring, for the future to read:
-        // `EBUSY` from a full op table is worth retrying, `EINVAL`
-        // from a refused argument is a caller bug, and teardown is
-        // neither. The callback form cannot tell them apart - it
-        // drops `on_done` for all three - so the sink is what carries
-        // the distinction to a consumer that can act on it.
+        // `EBUSY` from a full op table is worth retrying with the
+        // payload the sink hands back, `EINVAL` from a refused argument
+        // is a caller bug, and teardown is neither. The callback form
+        // cannot tell them apart - it drops `on_done` for all three -
+        // so the sink is what carries the distinction, and
+        // `FsDone::was_refused` is what separates it from the kernel's
+        // own `EBUSY`.
         let reason = Rc::clone(&slot);
-        self.stage_fail_sink(Box::new(move |errno| {
-            reason.fill(Some(FsDone::failed(errno)));
+        // Saved and put back, because `submit` may itself contain a
+        // `fut`: assigning over the outer sink would leave the outer op
+        // reporting teardown for its own refusal.
+        let outer = self.stage_fail_sink(Rc::new(move |errno, bufs| {
+            reason.fill(Some(FsDone::refused_with(errno, bufs)));
         }));
         submit(self, Box::new(move |done, _conn| fire.fire(done)));
-        // A sink still staged means `submit` returned without handing
-        // the op to the core at all: the facade's own argument checks
-        // refuse ahead of that (an absolute path, an empty link
-        // target), and they are the same class of defect the core
-        // reports as `EINVAL`.
-        if let Some(sink) = self.take_fail_sink() {
-            sink(Errno::EINVAL);
+        // No submission armed the sink: `submit` returned without
+        // handing the op to the core at all, which is what the facade's
+        // own argument checks do (an absolute path, an empty link
+        // target) - the same class of defect the core reports as
+        // `EINVAL`.
+        if !self.restore_fail_sink(outer) {
+            slot.fill(Some(FsDone::refused_with(Errno::EINVAL, Vec::new())));
         }
         FsFuture(slot)
     }
@@ -1284,8 +1299,11 @@ mod tests {
     use crate::uring_fs::core::{
         TAG_CANCEL, TAG_WAKE, deliver_embedded, deliver_pool_completions,
     };
-    use crate::uring_fs::{Anchor, OffloadBounds, Personality, RwFlags};
+    use crate::uring_fs::{
+        Anchor, Leaf, OffloadBounds, OpenStep, Personality, RwFlags, StepPath,
+    };
     use std::cell::Cell as StdCell;
+    use std::cell::RefCell as StdRefCell;
     use std::time::{Duration, Instant};
 
     const RING_ENTRIES: u32 = 64;
@@ -1614,6 +1632,264 @@ mod tests {
             busy.is_some(),
             "a full op table must answer EBUSY, not ECANCELED"
         );
+    }
+
+    /// A refusal hands the payload back, because the retry it advises
+    /// is impossible without it: the buffers a write was given are
+    /// dropped on the way out of `deliver`, and nothing tells a caller
+    /// to keep a second copy.
+    #[test]
+    fn a_refusal_hands_back_the_payload_it_advises_retrying() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let anchor = Anchor::open(dir.path()).expect("anchor");
+        let done = Rc::new(StdCell::new(false));
+        /// Whether the refusal was marked as this crate's, and the
+        /// payload it handed back.
+        type Refused = Option<(bool, Vec<Vec<u8>>)>;
+        let seen: Rc<StdRefCell<Refused>> = Rc::new(StdRefCell::new(None));
+
+        {
+            let (done, seen) = (Rc::clone(&done), Rc::clone(&seen));
+            let anchor2 = anchor.clone();
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |t| async move {
+                let file = t
+                    .fut(|c, cb| {
+                        c.open(who, &anchor2, c"payload.bin", creating(), cb)
+                    })
+                    .await
+                    .file()
+                    .expect("open");
+                // Fill the op table, then write through it.
+                let mut held = Vec::new();
+                for _ in 0..POOL {
+                    held.push(t.fut(|c, cb| {
+                        c.open(who, &anchor2, c".", spec_dir(), cb)
+                    }));
+                }
+                let refused = t
+                    .fut(|c, cb| {
+                        c.pwritev2(
+                            who,
+                            file,
+                            vec![b"the body a retry needs".to_vec()],
+                            0,
+                            RwFlags::empty(),
+                            cb,
+                        )
+                    })
+                    .await;
+                assert!(
+                    matches!(
+                        refused.result(),
+                        Err(crate::Error::Errno(Errno::EBUSY))
+                    ),
+                    "a full op table must answer EBUSY"
+                );
+                *seen.borrow_mut() =
+                    Some((refused.was_refused(), refused.into_bufs()));
+                drop(held);
+                done.set(true);
+            });
+        }
+        drive(&mut fs, &mut eng, &done, "refused payload");
+
+        let (refused, bufs) = std::mem::take(&mut *seen.borrow_mut())
+            .expect("the write answered");
+        assert!(refused, "a full op table is this crate's refusal");
+        assert_eq!(
+            bufs,
+            vec![b"the body a retry needs".to_vec()],
+            "a refusal that keeps the payload cannot be retried"
+        );
+    }
+
+    /// The errno alone cannot say who answered. `EBUSY` from a full op
+    /// table is worth retrying; `EBUSY` from the kernel - a directory
+    /// that is a mountpoint, which every nested dataset is - is
+    /// permanent, so a task that cannot tell them apart spins forever.
+    #[test]
+    fn a_refused_errno_is_marked_as_this_crates_own() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let anchor = Anchor::open(dir.path()).expect("anchor");
+        let done = Rc::new(StdCell::new(false));
+        let seen: Rc<StdRefCell<Vec<(Errno, bool)>>> =
+            Rc::new(StdRefCell::new(Vec::new()));
+
+        {
+            let (done, seen) = (Rc::clone(&done), Rc::clone(&seen));
+            let anchor2 = anchor.clone();
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |t| async move {
+                // The kernel's: nothing of that name.
+                let miss = t
+                    .fut(|c, cb| {
+                        c.statx(
+                            who,
+                            &anchor2,
+                            Leaf::new(b"absent").expect("leaf"),
+                            AtFlags::empty(),
+                            StatxMask::INO,
+                            cb,
+                        )
+                    })
+                    .await;
+                let Err(crate::Error::Errno(e)) = miss.result() else {
+                    panic!("a missing name must fail");
+                };
+                seen.borrow_mut().push((e, miss.was_refused()));
+
+                // This crate's: an absolute path the facade will not take.
+                let bad = t
+                    .fut(|c, cb| {
+                        c.open(who, &anchor2, c"/etc/hostname", creating(), cb)
+                    })
+                    .await;
+                let Err(crate::Error::Errno(e)) = bad.result() else {
+                    panic!("an absolute path must be refused");
+                };
+                seen.borrow_mut().push((e, bad.was_refused()));
+                done.set(true);
+            });
+        }
+        drive(&mut fs, &mut eng, &done, "refusal provenance");
+
+        let seen = std::mem::take(&mut *seen.borrow_mut());
+        assert_eq!(
+            seen,
+            vec![(Errno::ENOENT, false), (Errno::EINVAL, true)],
+            "the kernel's errno must not read as a refusal, nor the reverse"
+        );
+    }
+
+    /// A chain submits every step after the first from the fresh facade
+    /// its predecessor's completion was handed. A sink that one
+    /// submission consumed would leave every later step reporting
+    /// teardown for a refusal the caller is told to retry.
+    #[test]
+    fn a_chain_step_past_the_first_still_names_its_refusal() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("sub")).expect("mkdir sub");
+        std::fs::write(dir.path().join("sub/leaf"), b"x").expect("leaf");
+        let anchor = Anchor::open(dir.path()).expect("anchor");
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let chained = {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.fut(|c, cb| {
+                c.open_chain(
+                    &anchor,
+                    vec![
+                        OpenStep {
+                            path: StepPath::Fixed(c"sub".to_owned()),
+                            who,
+                            how: spec_dir(),
+                        },
+                        OpenStep {
+                            path: StepPath::Fixed(c"leaf".to_owned()),
+                            who,
+                            how: OpenHow::new().flags(OFlag::O_RDONLY),
+                        },
+                    ],
+                    cb,
+                )
+            })
+        };
+        let mut chained = std::pin::pin!(chained);
+
+        // Take every free slot in the window `on_cqe` opens and
+        // `deliver_embedded` closes - which is exactly where the net
+        // server's `redrive_parked_tail` takes one - so step two meets a
+        // full table.
+        let mut stolen = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let done = loop {
+            assert!(Instant::now() < deadline, "the chain never answered");
+            if let Poll::Ready(d) = chained.as_mut().poll(&mut cx) {
+                break d;
+            }
+            eng.ring.submit().expect("submit");
+            let Some(cqe) = eng.ring.reap() else {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            };
+            if cqe.flags & IORING_CQE_F_MORE == 0 {
+                eng.inflight = eng.inflight.saturating_sub(1);
+            }
+            let (tag, slot, gen32) = unpack_raw(cqe.user_data);
+            if tag & TAG_FS_DOMAIN == 0 || tag == TAG_CANCEL {
+                continue;
+            }
+            let reaped = fs.on_cqe(&mut eng, tag, slot, gen32, cqe.res);
+            if !stolen {
+                stolen = true;
+                let mut thief = FsConn::new(&mut fs, &mut eng, None);
+                for _ in 0..POOL {
+                    thief.open(who, &anchor, c".", spec_dir(), |_, _| {});
+                }
+            }
+            deliver_embedded(&mut fs, &mut eng, reaped);
+        };
+
+        assert!(
+            matches!(done.result(), Err(crate::Error::Errno(Errno::EBUSY))),
+            "step two's refusal must keep its errno, got {:?}",
+            done.result()
+        );
+        assert!(done.was_refused(), "and must read as this crate's own");
+    }
+
+    /// A `fut` inside another `fut`'s submit closure stages a sink of
+    /// its own. Assigning over the outer's would leave the outer op
+    /// reporting teardown for its own refusal.
+    #[test]
+    fn a_nested_fut_does_not_swallow_the_outer_ones_reason() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let anchor = Anchor::open(dir.path()).expect("anchor");
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut conn = FsConn::new(&mut fs, &mut eng, None);
+
+        // Leave exactly one free slot: the nested `fut` takes it, so the
+        // outer's own submission is the one refused.
+        let mut held = Vec::new();
+        for _ in 0..POOL - 1 {
+            held.push(
+                conn.fut(|c, cb| c.open(who, &anchor, c".", spec_dir(), cb)),
+            );
+        }
+        let mut inner = None;
+        let outer = conn.fut(|c, cb| {
+            inner =
+                Some(c.fut(|c2, cb2| {
+                    c2.open(who, &anchor, c".", spec_dir(), cb2)
+                }));
+            c.open(who, &anchor, c".", spec_dir(), cb);
+        });
+        let mut outer = std::pin::pin!(outer);
+        let Poll::Ready(done) = outer.as_mut().poll(&mut cx) else {
+            panic!("the outer submission left its future pending");
+        };
+        assert!(
+            matches!(done.result(), Err(crate::Error::Errno(Errno::EBUSY))),
+            "want the outer's own EBUSY, got {:?}",
+            done.result()
+        );
+        assert!(done.was_refused());
+        drop((inner, held));
     }
 
     /// Dropping a pending future abandons the result; the completion
