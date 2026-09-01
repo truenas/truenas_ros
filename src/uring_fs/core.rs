@@ -1368,6 +1368,18 @@ impl FsCore {
     /// teardown). Cancelling - not force-dropping the entry - is required: the
     /// kernel op may still touch the fd or a buffer, so the entry must live
     /// until its (now-`ECANCELED`) CQE reaps it.
+    ///
+    /// **This runs once per close, and it is not a liveness gate.** A
+    /// continuation of a cancelled op runs after the sweep, with the same
+    /// stamped owner, and whatever it submits then is not swept again -
+    /// which is the same "an owner gone mid-chain" a continuation must
+    /// already tolerate. What bounds it is that such an op *completes*:
+    /// every submission path here either reaches the kernel and answers,
+    /// or is refused at submit. The one shape that could answer neither
+    /// was an unguarded open of a special file, and `chain` guards its
+    /// last step for exactly that reason. Adding a second sweep instead
+    /// would be unbounded - a continuation that resubmits on `ECANCELED`
+    /// keeps giving it something to find.
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     pub(crate) fn cancel_owned_by(
         &mut self,
@@ -2104,12 +2116,21 @@ impl<'a> FsConn<'a> {
         // Every step after the probe submits from a fresh facade, which
         // carries no sink of its own; see [`FailSink`].
         let sink = self.fail_sink.clone();
-        self.open_component(who, start.clone(), want, raw, move |res, conn| {
-            if res.file().is_some() {
-                return on_done(res, conn);
-            }
-            walk(conn, who, start, parts, mode, raw, on_done, sink);
-        });
+        // Every step this makes forces `O_DIRECTORY`, the answer
+        // included, so no step can reach a FIFO's own `open`.
+        self.open_component(
+            who,
+            start.clone(),
+            want,
+            raw,
+            false,
+            move |res, conn| {
+                if res.file().is_some() {
+                    return on_done(res, conn);
+                }
+                walk(conn, who, start, parts, mode, raw, on_done, sink);
+            },
+        );
     }
 
     /// Open each step relative to the file the step before it opened,
@@ -2172,20 +2193,24 @@ impl<'a> FsConn<'a> {
     /// Stays private: every path this resolves is a single validated
     /// component of one the caller already named, confined, under the
     /// caller's own personality.
+    /// `guarded` says whether the caller added the special-file guard to
+    /// `how`, so the completion knows to strip `O_NONBLOCK` back off the
+    /// descriptor. **The answer is not always a directory**: a step that
+    /// forces `O_DIRECTORY` needs no guard, because the kernel answers
+    /// `ENOTDIR` on a FIFO or device before reaching the file's own
+    /// `open` method, but `chain`'s last step is opened as the caller
+    /// asked and can name anything the anchor holds.
     fn open_component<F>(
         &mut self,
         who: Personality,
         anchor: Anchor,
         path: CString,
         how: RawOpenHow,
+        guarded: bool,
         on_done: F,
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        // No special-file guard: every caller here opens `O_DIRECTORY`, and
-        // the kernel answers `ENOTDIR` on a FIFO or device before it ever
-        // reaches the file's own `open` method, so there is nothing to block
-        // on and nothing to strip afterwards.
         let sink = self.arm_fail_sink();
         self.fs.submit_open(
             self.eng,
@@ -2193,7 +2218,7 @@ impl<'a> FsConn<'a> {
             anchor,
             path,
             how,
-            false,
+            guarded,
             embed(self.owner, sink, on_done),
         );
     }
@@ -3090,9 +3115,25 @@ fn chain(
     raw.resolve |= CONFINED_RESOLVE.bits();
     // Only the answer is opened as the caller asked; everything above it
     // is a directory this walks through.
-    if !last {
+    //
+    // Which is why the answer is guarded and the rest are not. An
+    // intermediate carries `O_DIRECTORY`, so the kernel answers `ENOTDIR`
+    // on a special file before reaching its own `open`; the answer
+    // carries whatever the caller asked for, and a FIFO named there with
+    // a forcing flag (`O_TRUNC`, which `io_openat_force_async` punts to
+    // io-wq where `io_openat2` never adds `O_NONBLOCK` -
+    // `io_uring/openclose.c`) parks a worker in `wait_for_partner`
+    // indefinitely and pins its op slot with it. There is no
+    // `SpecialFiles` opt-out here: a step names a path relative to a
+    // directory the caller may not own, which is the case the guard is
+    // for. A caller who means to open a FIFO uses `FsConn::open` with
+    // `SpecialFiles::Allow`.
+    let guarded = if last {
+        super::apply_special_file_guard(&mut raw, super::SpecialFiles::Guard)
+    } else {
         raw.flags |= libc::O_DIRECTORY as u64;
-    }
+        false
+    };
     let who = step.who;
     // A derived name is produced here, from the file the previous step
     // opened, and screened on the same rule entry applied to the rest.
@@ -3116,7 +3157,7 @@ fn chain(
     // no sink of its own, so without this a transient `EBUSY` mid-chain
     // reaches the caller as teardown.
     conn.carry_fail_sink(sink.clone());
-    conn.open_component(who, cur, path, raw, move |res, conn| {
+    conn.open_component(who, cur, path, raw, guarded, move |res, conn| {
         let Some(f) = res.file() else {
             return on_done(res, conn);
         };
@@ -3165,7 +3206,8 @@ fn walk(
             Err(_) => return on_done(res, conn),
         }
         conn.carry_fail_sink(sink.clone());
-        conn.open_component(who, cur, part, how, move |res, conn| {
+        // `mkdir_path` forces `O_DIRECTORY` on every step; see `chain`.
+        conn.open_component(who, cur, part, how, false, move |res, conn| {
             let Some(f) = res.file() else {
                 return on_done(res, conn);
             };
@@ -3832,6 +3874,71 @@ mod hybrid_tests {
             || got.borrow().is_some(),
         );
         assert_eq!(*got.borrow(), Some(true), "the leaf must be delivered");
+    }
+
+    /// A chain's last step is opened as the caller asked, so unlike
+    /// every step above it, it can name a special file.
+    ///
+    /// `O_TRUNC` forces the open async (`io_openat_force_async`,
+    /// `io_uring/openclose.c`), and `io_openat2` adds `O_NONBLOCK` only
+    /// on the inline attempt (`IO_URING_F_NONBLOCK`), which a forced
+    /// io-wq worker does not have - the `WARN_ON_ONCE` beside it is the
+    /// kernel asserting the two are exclusive. So an unguarded step here
+    /// reaches `fifo_open`'s `wait_for_partner` (`fs/pipe.c`) and parks
+    /// a worker and its op slot until the owner's teardown sweep. The
+    /// guard is what makes it answer instead.
+    #[test]
+    fn a_chains_last_step_cannot_park_on_a_fifo() {
+        let (mut eng, mut fs, me) = setup();
+        let dir = crate::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("a")).expect("mkdir");
+        let fifo = dir.path().join("a/pipe");
+        let cpath =
+            CString::new(fifo.as_os_str().as_encoded_bytes()).expect("no NUL");
+        // SAFETY: a NUL-terminated path naming nothing yet, inside a
+        // directory this test made.
+        let made = unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let got: Rc<RefCell<Option<Option<Errno>>>> =
+            Rc::new(RefCell::new(None));
+        let g2 = got.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                c.open_chain(
+                    &at,
+                    vec![
+                        OpenStep {
+                            path: StepPath::Fixed(c"a".to_owned()),
+                            who: me,
+                            how: OpenHow::new()
+                                .flags(OFlag::O_PATH | OFlag::O_DIRECTORY),
+                        },
+                        OpenStep {
+                            path: StepPath::Fixed(c"pipe".to_owned()),
+                            who: me,
+                            how: OpenHow::new()
+                                .flags(OFlag::O_WRONLY | OFlag::O_TRUNC),
+                        },
+                    ],
+                    move |res, _c| {
+                        *g2.borrow_mut() = Some(match res.result() {
+                            Err(crate::Error::Errno(e)) => Some(e),
+                            _ => None,
+                        });
+                    },
+                );
+            },
+            || got.borrow().is_some(),
+        );
+        assert_eq!(
+            *got.borrow(),
+            Some(Some(Errno::ENXIO)),
+            "a FIFO with no reader must answer, not park a worker"
+        );
     }
 
     /// The step that cannot be written before the chain starts: a name
