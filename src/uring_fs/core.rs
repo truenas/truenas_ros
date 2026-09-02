@@ -1263,7 +1263,10 @@ impl FsCore {
     /// `ECANCELED` with no refusal mark - exactly what the same timer
     /// would have answered had it been in flight when the sweep ran -
     /// so a continuation keyed on that vocabulary winds down the same
-    /// way in both orderings.
+    /// way in both orderings. Delivered by the *drop*, not the sink:
+    /// [`deliver`] fires a sink only for marked refusals, so it is the
+    /// dropped callback's `Fire` that resolves an awaited frame as
+    /// `Gone`, which reads back as exactly that unmarked `ECANCELED`.
     pub(crate) fn submit_timeout(
         &mut self,
         eng: &mut Engine,
@@ -2460,11 +2463,18 @@ impl FsDone {
 ///
 /// **Re-entrancy:** callbacks run inside dispatch - never block, and drive the
 /// ring only through this facade. An argument a screen here refuses answers
-/// `on_done` with a marked `EINVAL` **before the method returns**; a
-/// submission failure past the screens (a full op table) drops `on_done`
-/// (and the continuation it captured, closing the connection) unless the
-/// futures layer has staged its reason sink. These methods return `()`
-/// either way.
+/// `on_done` with a marked `EINVAL` **before the method returns**. A
+/// refusal past the screens is the core declining to *host* the op -
+/// a full op table, an `Allow` open's two-slot charge with one slot
+/// left, the per-owner wall-clock cap, a swept owner arming a hold, a
+/// staging failure - and every one of them drops `on_done` (and the
+/// continuation it captured, closing the connection) unless the
+/// futures layer has staged its reason sink, which answers each with
+/// its vocabulary: the capacity refusals as a marked errno through
+/// the sink, the swept owner's as the unmarked `ECANCELED` the sweep
+/// would have dealt the op in flight (resolved by the dropped
+/// callback itself - see [`FsConn::timeout`]). These methods return
+/// `()` either way.
 ///
 /// **No method here may return data borrowed from `'a`.** The task layer
 /// parks a facade in a thread-local as `FsConn<'static>` and hands it back
@@ -3239,17 +3249,22 @@ impl<'a> FsConn<'a> {
     /// the handler budget unless it is retracted, which is what the
     /// returned [`Timer`] is for.
     ///
-    /// `None` means the arm was refused - a full table, a staging
-    /// failure, or a connection the teardown sweep has already passed,
-    /// which may finish I/O but not park time on the table. The refusal
-    /// reaches `on_done`'s frame the way every refused submission does:
-    /// through the staged reason sink where one is armed (an awaited
-    /// [`fut`](FsConn::fut) reads the errno and
-    /// [`FsDone::was_refused`]), and otherwise by dropping the callback
-    /// unfired, which for a request-handler continuation closes the
-    /// connection. Nothing is delivered *to* a plain `on_done` on
-    /// refusal - it never ran, and the `None` is the caller's copy of
-    /// that fact.
+    /// `None` means the arm was refused - a full table, the per-owner
+    /// cap, a staging failure, or a connection the teardown sweep has
+    /// already passed, which may finish I/O but not park time on the
+    /// table. How the refusal reaches `on_done`'s frame depends on
+    /// which. The capacity refusals report through the staged reason
+    /// sink where one is armed - an awaited [`fut`](FsConn::fut) reads
+    /// the errno and [`FsDone::was_refused`] - while the swept owner's
+    /// resolves an awaited frame as *unmarked* `ECANCELED` through the
+    /// dropped callback itself (`deliver` fires a sink only for
+    /// marked refusals; the drop is the delivery): the sweep's own
+    /// vocabulary, on purpose, so a continuation keyed on it winds
+    /// down the same way in both orderings. With no frame staged,
+    /// every refusal drops the callback unfired, which for a
+    /// request-handler continuation closes the connection. Nothing is
+    /// delivered *to* a plain `on_done` on refusal - it never ran, and
+    /// the `None` is the caller's copy of that fact.
     pub fn timeout<F>(
         &mut self,
         after: std::time::Duration,
