@@ -2064,6 +2064,29 @@ impl<'a> FsConn<'a> {
         self.fs.owner_is_gone(self.owner)
     }
 
+    /// Whether the loop this facade runs on has been asked to drain
+    /// gracefully.
+    ///
+    /// The other half of [`owner_is_gone`](Self::owner_is_gone): that
+    /// one says *your connection* closed, this one says *the server*
+    /// is going away - a task whose connection is perfectly healthy
+    /// can still be the last thing holding a drain open, and this is
+    /// the signal it winds down on. Readable only between awaits, like
+    /// its sibling, so it narrows the drain for looping work (a
+    /// re-arming tick, a batch loop) and deliberately not for a single
+    /// long await - an offload is never cancelled, and its delivery is
+    /// the next chance to look.
+    ///
+    /// **Never `true` on a standalone [`UringFs`](super::UringFs)
+    /// host today** - nothing there requests a graceful drain; its
+    /// [`ShutdownHandle`](super::ShutdownHandle) stops the loop
+    /// outright - so a consumer on that host must not wait for this.
+    /// The contract is "a `true` means wind down", not "a drain will
+    /// announce itself".
+    pub fn draining(&self) -> bool {
+        self.eng.shared.graceful_requested().is_some()
+    }
+
     /// A second facade over the same delivery, for a step that dispatches
     /// twice (the window exhausting a known-length stream also carries the
     /// End stage). The recv-buffer claim moves into the reborrow - the
@@ -4679,6 +4702,22 @@ mod hybrid_tests {
 }
 
 fn map_res(res: i32) -> Result<i32, Errno> {
+    // The kernel-internal restart codes, which io_uring folds to
+    // `-EINTR` for reads and writes (`io_fixup_restart_res`,
+    // `io_uring/rw.c` - "Just fail this IO with EINTR") but posts
+    // verbatim for opens and splices, where the fixup is not applied.
+    // A cancelled `SpecialFiles::Allow` open blocked in `fifo_open`
+    // surfaces `-ERESTARTSYS` this way; unmapped it decodes as
+    // `UnknownErrno`, and one teardown sweep then yields two different
+    // errnos depending on where each op was parked. Folded here, once,
+    // so every fs op behaves as the kernel's own rw path does. The
+    // stream domain's splice does the same by hand
+    // (`net/core/reactor/io.rs`).
+    // Exactly the four the kernel names - 515 between them is
+    // `ENOIOCTLCMD`, not a restart code.
+    if matches!(res, -512 | -513 | -514 | -516) {
+        return Err(Errno::EINTR);
+    }
     if res < 0 {
         Err(Errno::from_raw(-res))
     } else {
@@ -5582,6 +5621,21 @@ mod routing_fuzz {
             ReapedFs::Pump(..)
         ));
         submit(&mut core, &mut eng).expect("freed slot serves the next");
+    }
+
+    /// The kernel-internal restart codes decode as `EINTR`, the way
+    /// io_uring's own rw path folds them (`io_fixup_restart_res`,
+    /// `io_uring/rw.c`), and the codes between and around them stay
+    /// themselves.
+    #[test]
+    fn restart_codes_fold_to_eintr_like_the_kernels_rw_path() {
+        for res in [-512, -513, -514, -516] {
+            assert_eq!(map_res(res), Err(Errno::EINTR), "res {res}");
+        }
+        // 515 is ENOIOCTLCMD, not a restart code; a range would eat it.
+        assert_eq!(map_res(-515), Err(Errno::from_raw(515)));
+        assert_eq!(map_res(-libc::ECANCELED), Err(Errno::ECANCELED));
+        assert_eq!(map_res(7), Ok(7));
     }
 
     /// The sweep leaves a signal behind, because it cannot leave a

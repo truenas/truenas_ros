@@ -81,9 +81,10 @@
 //!   when its ops start failing or the source feeding it closes.
 //!   **Neither of those reaches a task whose awaits are all
 //!   offloads**, because an offload is never cancelled and always
-//!   delivers, so that shape has to ask - with
-//!   [`TaskFs::owner_is_gone`]. A task that never winds down holds a
-//!   graceful drain open to its grace deadline.
+//!   delivers, so that shape has to ask - [`TaskFs::owner_is_gone`]
+//!   for "your connection closed", [`TaskFs::draining`] for "the
+//!   server is going away", polled between awaits. A task that never
+//!   winds down holds a graceful drain open to its grace deadline.
 //! - **A task's facade carries no recv-buffer claim**, so
 //!   [`pwritev2_from`](FsConn::pwritev2_from) from inside a task
 //!   copies instead of writing the delivered buffer in place. The
@@ -871,10 +872,52 @@ impl TaskFs {
     /// graceful drain open until the grace period ends it. Poll this
     /// between awaits and return.
     ///
-    /// `true` outside a poll as well, since a handle that cannot reach
-    /// its facade has nothing left to do either.
+    /// Reached with no facade - outside this task's poll, or nested
+    /// inside a call already holding it - this cannot read the owner's
+    /// state and **must not guess "gone"**: the documented reaction to
+    /// `true` is to wind down, so a wrong `true` makes a task abandon
+    /// work for a live connection. The nested reach is the one a
+    /// helper that both submits and checks takes -
+    /// `t.fut(|c, cb| { if t.owner_is_gone() { .. } .. })` - and the
+    /// facade is parked out of the cell for exactly the extent of that
+    /// closure. Both misuses take the siblings' shape: a debug assert,
+    /// and in release the teardown state, which is the only thing
+    /// knowable from here.
     pub fn owner_is_gone(&self) -> bool {
-        with_conn(self.task, |conn| conn.owner_is_gone()).unwrap_or(true)
+        match with_conn(self.task, |conn| conn.owner_is_gone()) {
+            Some(gone) => gone,
+            None => {
+                debug_assert!(
+                    tearing_down(),
+                    "TaskFs::owner_is_gone with no facade: outside its task's poll, or nested inside a call already holding it"
+                );
+                tearing_down()
+            }
+        }
+    }
+
+    /// [`FsConn::draining`] against the running poll's facade - the
+    /// server-side half of the wind-down pair. Poll it between awaits
+    /// with [`owner_is_gone`](Self::owner_is_gone): that one ends a
+    /// task whose connection died, this one ends a task holding a
+    /// graceful drain open from a connection that is fine. Never
+    /// `true` on a standalone host; see [`FsConn::draining`].
+    ///
+    /// With no facade - outside the poll, or nested - the answer is
+    /// the teardown state, on
+    /// [`owner_is_gone`](Self::owner_is_gone)'s reasoning: a wrong
+    /// `true` makes a task abandon work, so nothing is guessed.
+    pub fn draining(&self) -> bool {
+        match with_conn(self.task, |conn| conn.draining()) {
+            Some(draining) => draining,
+            None => {
+                debug_assert!(
+                    tearing_down(),
+                    "TaskFs::draining with no facade: outside its task's poll, or nested inside a call already holding it"
+                );
+                tearing_down()
+            }
+        }
     }
 
     /// [`FsConn::spawn`] against the running poll's facade: the child
@@ -2964,6 +3007,106 @@ mod tests {
         assert_eq!(fs.tasks.live.get(), 1, "the task is parked");
         // The teardown itself: no panic, in either profile.
         drop(fs);
+    }
+
+    /// A nested `owner_is_gone` must not call a live owner dead.
+    ///
+    /// Inside a `fut`'s submit closure the facade is parked out of the
+    /// thread-local for the extent of the call, so the nested reach
+    /// cannot read the owner's state - and answering `true` there
+    /// makes the natural helper shape, a closure that both checks and
+    /// submits, abandon work for a connection that is alive. Release
+    /// half; the misuse asserts in debug like every sibling, so the
+    /// whole test is `cfg`'d the same way.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn a_nested_owner_check_does_not_call_a_live_owner_gone() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        let owner = Some((4u32, 1u64));
+        let seen: Rc<StdCell<Option<(bool, bool)>>> =
+            Rc::new(StdCell::new(None));
+        {
+            let out = Rc::clone(&seen);
+            let mut conn = FsConn::new(&mut fs, &mut eng, owner);
+            drop(conn.spawn(move |t| async move {
+                let plain = t.owner_is_gone();
+                let nested = Rc::new(StdCell::new(false));
+                let n2 = Rc::clone(&nested);
+                let t2 = &t;
+                drop(t.fut(move |_c, _cb| {
+                    n2.set(t2.owner_is_gone());
+                }));
+                out.set(Some((plain, nested.get())));
+            }));
+        }
+        let (plain, nested) = seen.get().expect("the task ran");
+        assert!(!plain, "the owner is live");
+        assert!(
+            !nested,
+            "a nested reach reported a live owner as gone - the check \
+             inside a submit closure winds a healthy handler down"
+        );
+    }
+
+    /// A re-arming task winds down when the server drains, on the
+    /// signal alone.
+    ///
+    /// Every await here succeeds and the owner stays live, so neither
+    /// of the other wind-down signals ever fires - without
+    /// [`TaskFs::draining`] this shape holds a graceful drain open to
+    /// its grace deadline, which is the case the net drain test can
+    /// only bound from above. The task is given a generous iteration
+    /// budget precisely so the signal, not the budget, is what ends
+    /// it: the negative control (the getter hardwired `false`) runs
+    /// the budget out and fails the count below.
+    #[test]
+    fn a_rearming_task_winds_down_when_the_server_drains() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm wake");
+        let rounds = Rc::new(StdCell::new(0usize));
+        let ended = Rc::new(StdCell::new(false));
+        {
+            let (n, e) = (Rc::clone(&rounds), Rc::clone(&ended));
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((9, 1)));
+            drop(conn.spawn(move |t| async move {
+                for _ in 0..64 {
+                    let _ = t.offload_fut(|| Ok::<_, crate::Error>(1u8)).await;
+                    n.set(n.get() + 1);
+                    if t.draining() {
+                        e.set(true);
+                        return;
+                    }
+                }
+            }));
+        }
+
+        // A few live rounds first: the signal is off and the task runs.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while rounds.get() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "a couple of live rounds never finished"
+            );
+            if turn(&mut fs, &mut eng) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(!ended.get(), "nothing has asked for a drain yet");
+
+        // The drain request, as the net server's shutdown_graceful
+        // makes it. The task's next between-awaits check ends it.
+        eng.shared.request_graceful(5_000);
+        drive(&mut fs, &mut eng, &ended, "the wind-down");
+        assert!(
+            rounds.get() < 64,
+            "the task ran its whole budget: the drain signal never \
+             reached it"
+        );
+        assert_eq!(fs.tasks.live.get(), 0, "and it retired");
     }
 
     /// A task awaiting only offloads learns its owner is gone, because
