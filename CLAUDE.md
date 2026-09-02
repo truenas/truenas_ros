@@ -97,14 +97,19 @@ Do not reopen these without a reason that is new.
   `FileTail::reading` gates body reads to one per connection and connections
   never exceed `pool_size`, so at least `fs_ops` slots always remain -
   pigeonhole, not arithmetic. The other direction is what parking handles.
-  Timers get the same *shape* of bound for a different reason: a timer is
-  the one op that holds its slot for wall-clock time rather than until an
-  I/O completes, so `FsCore::set_timer_cap` bounds them per owner at
-  `max_in_flight_requests` - the consumer discipline is one retry tick per
-  in-flight request, and a smaller constant would couple this crate to the
-  pipelining knob of another. The table is **not** resized for it: timers
-  spend the handler budget their owner already has, capped so no one
-  tenant can park it all.
+  Wall-clock holds get the same *shape* of bound for a different reason:
+  a timer holds its slot for wall-clock time rather than until an I/O
+  completes - and an `Allow` open holds two slots the same way, charged
+  as one count - so `FsCore::set_timer_cap` bounds them per owner at
+  `max_in_flight_requests`. The consumer discipline is one retry tick
+  per *connection*, walking every claimant parked on it (its
+  `guard.rs`; one tick per waiter measured ~11 refusals over a 300-key
+  DeleteObjects), and a smaller constant would couple this crate to the
+  pipelining knob of another. A retraction returns the cap headroom on
+  the spot - the slot follows at the CQE - so retract-then-rearm inside
+  one delivery holds at any cap. The table is **not** resized for it:
+  holds spend the handler budget their owner already has, capped so no
+  one tenant can park it all.
 - **The `fs_ops + pool_size <= MAX_POOL` bound is about field *width*.** An
   op-slot index is packed into the 24-bit `user_data` slot field
   (`user_data::SLOT_MASK`); `TAG_FS_DOMAIN` keeping the two tag vocabularies
@@ -791,11 +796,15 @@ intra-doc links, so a public item pointing at a private one, or a link
 that does not resolve, is otherwise invisible until CI.
 
 CI carries one lane the local gate does not: the dedicated `miri.yml`
-workflow, on every PR. It validates the task executor's memory model -
-the one instrument on x86 that catches a re-weakening of the wake
-protocol's dedup edge without trusting our own loom model. It needs the
-nightly toolchain and no local run; the workflow's comments say what it
-covers and why the module filter and both count assertions are
-load-bearing.
+workflow, on every PR. It interprets everything Miri can reach - both
+aliasing models - and above all the task executor's memory model: the
+one instrument on x86 that catches a re-weakening of the wake
+protocol's dedup edge without trusting our own loom model (each
+memory-model edge's rustdoc names which instrument owns it). It needs
+the nightly toolchain and no local run; the workflow's comments say
+what it covers, why every exclusion carries its measured abort reason,
+and why the exact-count assertions are load-bearing - adding a
+Miri-eligible test means bumping `MIRI_TESTS`, on the loom lane's
+`MODELS` discipline.
 
 Report failures with their output. A skipped step is a skipped step; say so.
