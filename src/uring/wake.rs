@@ -58,6 +58,14 @@ impl LoopShared {
     /// Weaken the store and a loop that sees `graceful` may still read
     /// `grace_ms == 0`, arming a zero-length grace period and hard-killing
     /// connections it promised to drain.
+    ///
+    /// **The loom lane owns this edge** (`loom_graceful_publication`):
+    /// this module's concurrency tests compile only under `--cfg loom`,
+    /// so Miri interprets nothing that crosses it and every Miri arm
+    /// stays green with the store weakened - measured, against loom
+    /// going red in seconds. The mirror-image edge is the wake dedup's
+    /// (`task::poll_window`), which only Miri catches; retire either
+    /// lane and its edge goes unwatched.
     #[inline]
     pub(crate) fn request_graceful(&self, grace_ms: u64) {
         self.grace_ms.store(grace_ms, Ordering::Relaxed);

@@ -1142,6 +1142,15 @@ pub(crate) fn wake_task(w: &TaskWake) -> bool {
 /// [`Waker`] surface that makes it reachable: an off-loop lock-free
 /// waker is what a consumer may legitimately build, and its readiness
 /// would otherwise be invisible to the poll that is meant to cover it.
+///
+/// **The Miri lane owns this edge**
+/// (`miri_a_deduped_wake_publishes_what_it_wrote`, seeded): the old
+/// `store(false, Release)` spelling survived 200k native rounds - x86's
+/// TSO hides it - and the loom model's exploration is documented as
+/// unable to vouch for it, while Miri kills it within a handful of
+/// seeds. The mirror-image edge is the graceful-drain publication
+/// (`uring::wake::LoopShared::request_graceful`), which only loom
+/// catches; retire either lane and its edge goes unwatched.
 pub(crate) fn poll_window<R>(w: &TaskWake, poll: impl FnOnce() -> R) -> R {
     w.queued.swap(false, Ordering::AcqRel);
     poll()
