@@ -10405,9 +10405,13 @@ fn fs_conn_mkdir_path_builds_a_tree_and_answers_a_real_directory() {
 /// `a/..` names, so the answer is the same either way: refused, before
 /// anything is submitted.
 ///
-/// An invalid argument drops `on_done`, which closes the connection, as
-/// `open` documents - so the assertion is that the peer sees EOF and no
-/// reply, and that nothing was created on the way.
+/// An invalid argument answers `on_done` before `mkdir_path` returns,
+/// with `EINVAL` and the refusal mark - so the handler replies to the
+/// peer instead of the connection being shed over a caller bug, and the
+/// callback runs inline while the handler is still on its way to
+/// `Response::Defer`. That ordering is the other thing this pins: a
+/// `Deferred::reply` made before the `Defer(permit)` verdict is
+/// processed rides the injection queue and lands once the park exists.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_conn_mkdir_path_refuses_a_path_it_cannot_rebuild() {
@@ -10437,10 +10441,17 @@ fn fs_conn_mkdir_path_refuses_a_path_it_cannot_rebuild() {
         let anchor = anchor.clone();
         let how = OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY);
         let mode = Mode::from_bits_truncate(0o755);
-        fs.mkdir_path(who, &anchor, c"a/../b", mode, how, move |_d, _fs| {
-            // Never reached: the refusal drops this callback, and dropping
-            // the `Deferred` it holds is what closes the connection.
-            deferred.reply(echo_frame(b"unreachable"));
+        fs.mkdir_path(who, &anchor, c"a/../b", mode, how, move |d, _fs| {
+            // Fired inline, before `mkdir_path` returned: the screen
+            // answers rather than dropping, and the reply below is
+            // injected ahead of the `Defer` verdict being processed.
+            let verdict = match d.result() {
+                Err(truenas_ros::Error::Errno(e)) if d.was_refused() => {
+                    format!("refused:{e:?}")
+                }
+                other => format!("wrong:{other:?}"),
+            };
+            deferred.reply(echo_frame(verdict.as_bytes()));
         });
         Response::Defer(permit)
     };
@@ -10484,9 +10495,10 @@ fn fs_conn_mkdir_path_refuses_a_path_it_cannot_rebuild() {
         .serve_forever()
         .expect("serve_forever mkdir_path refusal");
     let got = client.join().unwrap().expect("client io");
-    assert!(
-        got.is_err(),
-        "the refusal closes the connection; the peer must not get a reply"
+    assert_eq!(
+        got.expect("the handler answered instead of shedding the peer"),
+        b"refused:EINVAL".to_vec(),
+        "the callback saw the marked refusal"
     );
     assert!(
         !dir.path().join("b").exists() && !dir.path().join("a/b").exists(),
@@ -10507,6 +10519,9 @@ fn fs_conn_mkdir_path_refuses_a_path_it_cannot_rebuild() {
 /// `O_TMPFILE` is the case that hides: it is `__O_TMPFILE | O_DIRECTORY`,
 /// so forcing `O_DIRECTORY` does not exclude it and a naive
 /// `flags & O_TMPFILE` test matches every plain directory open.
+///
+/// Both refusals answer the callback inline with a marked `EINVAL`;
+/// the handler replies, and the peer keeps its connection.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_conn_mkdir_path_refuses_a_how_that_would_answer_with_a_file() {
@@ -10546,9 +10561,16 @@ fn fs_conn_mkdir_path_refuses_a_how_that_would_answer_with_a_file() {
             .flags(flags)
             .mode(Mode::from_bits_truncate(0o644));
         let mode = Mode::from_bits_truncate(0o755);
-        fs.mkdir_path(who, &anchor, c"a/b/c", mode, how, move |_d, _fs| {
-            // Never reached: the refusal drops this, closing the connection.
-            deferred.reply(echo_frame(b"unreachable"));
+        fs.mkdir_path(who, &anchor, c"a/b/c", mode, how, move |d, _fs| {
+            // Fired inline with the marked refusal; see the sibling
+            // test for the ordering this rides on.
+            let ok = matches!(
+                d.result(),
+                Err(truenas_ros::Error::Errno(
+                    truenas_ros::errno::Errno::EINVAL
+                ))
+            ) && d.was_refused();
+            deferred.reply(echo_frame(if ok { b"refused" } else { b"wrong" }));
         });
         Response::Defer(permit)
     };
@@ -10585,7 +10607,7 @@ fn fs_conn_mkdir_path_refuses_a_how_that_would_answer_with_a_file() {
                 let mut s = connect_tcp(v4)?;
                 s.set_read_timeout(Some(Duration::from_secs(5)))?;
                 send_framed(&mut s, b"go")?;
-                *slot = recv_framed(&mut s).is_err();
+                *slot = recv_framed(&mut s)? == b"refused";
             }
             Ok(got)
         })();
@@ -10595,11 +10617,12 @@ fn fs_conn_mkdir_path_refuses_a_how_that_would_answer_with_a_file() {
     server
         .serve_forever()
         .expect("serve_forever mkdir_path how");
-    let closed = client.join().unwrap().expect("client io");
+    let answered = client.join().unwrap().expect("client io");
     assert_eq!(
-        closed,
+        answered,
         [true, true],
-        "both O_CREAT and O_TMPFILE must be refused, closing the connection"
+        "both O_CREAT and O_TMPFILE must be refused, with the refusal \
+         answered to the handler rather than the connection shed"
     );
     let leaf = dir.path().join("a/b/c");
     assert!(

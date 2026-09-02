@@ -2040,9 +2040,12 @@ impl FsDone {
 /// completion fires the `on_done` callback **inline on the loop thread**.
 ///
 /// **Re-entrancy:** callbacks run inside dispatch - never block, and drive the
-/// ring only through this facade. A submission or argument-validation failure
-/// drops `on_done` (and the continuation it captured, closing the connection),
-/// so these methods return `()`.
+/// ring only through this facade. An argument a screen here refuses answers
+/// `on_done` with a marked `EINVAL` **before the method returns**; a
+/// submission failure past the screens (a full op table) drops `on_done`
+/// (and the continuation it captured, closing the connection) unless a
+/// reason sink is staged (the futures layer's [`FailSink`]). These methods
+/// return `()` either way.
 ///
 /// **No method here may return data borrowed from `'a`.** The task layer
 /// parks a facade in a thread-local as `FsConn<'static>` and hands it back
@@ -2291,8 +2294,12 @@ impl<'a> FsConn<'a> {
     /// set unless `how` states a confinement policy of its own, on the same
     /// rule the blocking [`FsHandle::open`](crate::uring_fs::FsHandle::open)
     /// applies - a `resolve` carrying only hardening flags composes with
-    /// the default rather than replacing it. An invalid argument drops
-    /// `on_done`, closing the connection.
+    /// the default rather than replacing it. An invalid argument answers
+    /// `on_done` **before this returns** with `EINVAL` and
+    /// [`FsDone::was_refused`] true - the same verdict the mid-walk
+    /// screens give, so provenance does not depend on where the screen
+    /// fired. It is not silently dropped: a dropped continuation closes
+    /// the connection, which turns a caller bug into a shed peer.
     ///
     /// Every facade may open, a continuation's included. What that costs
     /// is the file: a continuation runs for an owner that may already be
@@ -2316,7 +2323,7 @@ impl<'a> FsConn<'a> {
             // (`open_parts`), which allows an absolute path when the caller
             // drops `RESOLVE_BENEATH`. The two validations differ on purpose;
             // do not unify them.
-            return;
+            return on_done(FsDone::refused(Errno::EINVAL), self);
         }
         let (how, special) = how.into().into_parts();
         let mut raw = how.to_raw();
@@ -2356,8 +2363,9 @@ impl<'a> FsConn<'a> {
     /// `EEXIST` is success at every component, so two callers building
     /// one tree both finish.
     ///
-    /// An invalid argument drops `on_done`, closing the connection, as
-    /// [`open`](Self::open) does. `path` must name its components plainly
+    /// An invalid argument answers `on_done` before this returns with a
+    /// marked `EINVAL`, as [`open`](Self::open) does. `path` must name
+    /// its components plainly
     /// -- relative, no `.`, no `..`, no empty component - which is
     /// [`path::relative_defect`](crate::path::relative_defect). `..` is
     /// refused rather than resolved even though `openat2` would resolve it
@@ -2396,7 +2404,7 @@ impl<'a> FsConn<'a> {
         // Judged on shape before anything is submitted, so the probe below
         // cannot admit what the walk would refuse. See the doc above.
         if crate::path::relative_defect(bytes).is_some() {
-            return;
+            return on_done(FsDone::refused(Errno::EINVAL), self);
         }
         // Owned, because each component outlives the completion that
         // consumes it. Every one is a `Leaf` by the check above.
@@ -2426,7 +2434,7 @@ impl<'a> FsConn<'a> {
         const TMPFILE_ONLY: i32 = libc::O_TMPFILE & !libc::O_DIRECTORY;
         let refused = (libc::O_CREAT | TMPFILE_ONLY) as u64;
         if raw.flags & refused != 0 {
-            return;
+            return on_done(FsDone::refused(Errno::EINVAL), self);
         }
         // And `RESOLVE_IN_ROOT`, for the same class of reason as the two
         // above: the bundle unioned below carries `RESOLVE_BENEATH`, which
@@ -2436,7 +2444,7 @@ impl<'a> FsConn<'a> {
         if raw.resolve & crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT.bits()
             != 0
         {
-            return;
+            return on_done(FsDone::refused(Errno::EINVAL), self);
         }
         raw.flags |= libc::O_DIRECTORY as u64;
         raw.resolve |= CONFINED_RESOLVE.bits();
@@ -2485,7 +2493,10 @@ impl<'a> FsConn<'a> {
     /// `RESOLVE_IN_ROOT` - which the kernel refuses to pair with the
     /// `RESOLVE_BENEATH` unioned here - is refused at entry, before
     /// anything is submitted, so a bad argument cannot leave a
-    /// half-walked chain behind.
+    /// half-walked chain behind. The refusal answers `on_done` with a
+    /// marked `EINVAL` before this returns, exactly as the same screen
+    /// answers mid-walk on a derived name - one verdict per defect,
+    /// wherever it fires.
     pub fn open_chain<F>(
         &mut self,
         anchor: &Anchor,
@@ -2498,21 +2509,21 @@ impl<'a> FsConn<'a> {
         // step cannot be judged here — it has no path yet — so the walk
         // judges it when it produces one, on the same rule.
         if steps.is_empty() {
-            return;
+            return on_done(FsDone::refused(Errno::EINVAL), self);
         }
         if matches!(steps[0].path, StepPath::Derived(_)) {
             // Nothing has been opened, so there is nothing to derive
             // from.
-            return;
+            return on_done(FsDone::refused(Errno::EINVAL), self);
         }
         for step in &steps {
             if let StepPath::Fixed(path) = &step.path
                 && crate::path::relative_defect(path.to_bytes()).is_some()
             {
-                return;
+                return on_done(FsDone::refused(Errno::EINVAL), self);
             }
             if creation_refused(step.how.to_raw().flags) {
-                return;
+                return on_done(FsDone::refused(Errno::EINVAL), self);
             }
             // `chain` unions `CONFINED_RESOLVE` onto every step, and
             // `RESOLVE_BENEATH` is in it: "Scoping flags are mutually
@@ -2530,7 +2541,7 @@ impl<'a> FsConn<'a> {
                 & crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT.bits()
                 != 0
             {
-                return;
+                return on_done(FsDone::refused(Errno::EINVAL), self);
             }
         }
         let steps: VecDeque<OpenStep> = steps.into();
@@ -3222,7 +3233,7 @@ impl<'a> FsConn<'a> {
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
         if target.to_bytes().is_empty() {
-            return;
+            return on_done(FsDone::refused(Errno::EINVAL), self);
         }
         let w = self.waiter(on_done);
         self.fs.submit_path_op(
@@ -4461,8 +4472,101 @@ mod hybrid_tests {
         );
     }
 
+    /// The other entry screens answer the same way `open_chain`'s do:
+    /// inline, `EINVAL`, marked as this crate's. One test per method
+    /// with a screen, so a new screen added to any of them without an
+    /// answer shows up as an unfired callback here.
+    #[test]
+    fn every_entry_screen_answers_instead_of_dropping() {
+        let (mut eng, mut fs, me) = setup();
+        let dir = nested();
+        let at = Anchor::open(dir.path()).expect("anchor");
+
+        let refused = |what: &str, got: Rc<RefCell<Option<FsDone>>>| {
+            let done = got
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| panic!("{what}: the refusal was dropped"));
+            assert!(
+                matches!(
+                    done.result(),
+                    Err(crate::Error::Errno(Errno::EINVAL))
+                ) && done.was_refused(),
+                "{what}: {:?} refused={}",
+                done.result(),
+                done.was_refused()
+            );
+        };
+
+        let mut c = FsConn::new(&mut fs, &mut eng, OWNER0);
+        for (what, path) in [
+            ("an absolute open", c"/etc/hostname"),
+            ("an empty open", c""),
+        ] {
+            let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
+            let g2 = got.clone();
+            c.open(
+                me,
+                &at,
+                path,
+                OpenHow::new().flags(OFlag::O_RDONLY),
+                move |res, _c| *g2.borrow_mut() = Some(res),
+            );
+            refused(what, got);
+        }
+
+        for (what, path, how) in [
+            (
+                "a mkdir_path with ..",
+                c"a/../b",
+                OpenHow::new().flags(OFlag::O_RDONLY),
+            ),
+            (
+                "a creating mkdir_path",
+                c"a/b",
+                OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_CREAT),
+            ),
+            (
+                "a root-scoped mkdir_path",
+                c"a/b",
+                OpenHow::new()
+                    .flags(OFlag::O_RDONLY)
+                    .resolve(crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT),
+            ),
+        ] {
+            let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
+            let g2 = got.clone();
+            c.mkdir_path(
+                me,
+                &at,
+                path,
+                Mode::from_bits_truncate(0o755),
+                how,
+                move |res, _c| *g2.borrow_mut() = Some(res),
+            );
+            refused(what, got);
+        }
+
+        let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
+        let g2 = got.clone();
+        c.symlinkat(
+            me,
+            c"",
+            &at,
+            Leaf::new("l").expect("leaf"),
+            move |res, _c| *g2.borrow_mut() = Some(res),
+        );
+        refused("an empty symlink target", got);
+        assert!(!dir.path().join("l").exists(), "nothing was created");
+    }
+
     /// Every refusal is judged on shape at entry, before anything is
-    /// submitted, so a bad argument cannot leave a half-walked chain.
+    /// submitted, so a bad argument cannot leave a half-walked chain -
+    /// and each answers `on_done` with the marked `EINVAL` before
+    /// `open_chain` returns, rather than dropping it. A dropped
+    /// callback closes the connection, which turns a caller bug into a
+    /// shed peer; and the awaited form aside, a plain-callback caller
+    /// had no way to hear the refusal at all.
     #[test]
     fn a_chain_that_cannot_be_walked_is_refused_before_it_starts() {
         let (mut eng, mut fs, me) = setup();
@@ -4529,28 +4633,31 @@ mod hybrid_tests {
             ),
         ];
         for (what, steps) in cases {
-            let fired = Rc::new(RefCell::new(false));
+            let fired: Rc<RefCell<Option<FsDone>>> =
+                Rc::new(RefCell::new(None));
             let f2 = fired.clone();
             {
                 let mut c = FsConn::new(&mut fs, &mut eng, OWNER0);
-                c.open_chain(&at, steps, move |_res, _c| {
-                    *f2.borrow_mut() = true
+                c.open_chain(&at, steps, move |res, _c| {
+                    *f2.borrow_mut() = Some(res);
                 });
             }
-            // As in the gate's test: drive on separate work, so
-            // "never fired" says the entry refused rather than that
-            // nothing was ever reaped.
-            let marker = Rc::new(RefCell::new(false));
-            let m2 = marker.clone();
-            drive(
-                &mut eng,
-                &mut fs,
-                move |c| {
-                    c.offload(|| 1u64, move |_, _| *m2.borrow_mut() = true)
-                },
-                || *marker.borrow(),
+            // Inline: the refusal is answered before `open_chain`
+            // returned, with nothing driven - which is also what pins
+            // that nothing was submitted.
+            let done = fired
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| panic!("{what}: the refusal was dropped"));
+            assert!(
+                matches!(
+                    done.result(),
+                    Err(crate::Error::Errno(Errno::EINVAL))
+                ),
+                "{what}: wrong errno {:?}",
+                done.result()
             );
-            assert!(!*fired.borrow(), "{what} must be refused at entry");
+            assert!(done.was_refused(), "{what}: the crate's own verdict");
         }
         assert!(
             !dir.path().join("a/made").exists(),
