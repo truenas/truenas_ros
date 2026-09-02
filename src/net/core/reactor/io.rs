@@ -265,9 +265,11 @@ pub fn frame_step(
                     body_len,
                 }
             } else {
-                // Large bodies are *placed*: read into their own allocation
-                // (zero-copy `Body::take`). Requires the header to be fully
-                // buffered (always true for `Need` framers).
+                // Large bodies are *placed*: read into storage of
+                // their own, claimed from the ring's body pool where the
+                // role has one (zero-copy `Body::take`). Requires the
+                // header to be fully buffered (always true for `Need`
+                // framers).
                 let place = buffered >= header_len
                     && matches!(body_placement_threshold, Some(t) if body_len >= t);
                 FrameStep::ReadBody {
@@ -1048,11 +1050,20 @@ impl<U> Reactor<U> {
         if !idle {
             self.arm_receipt_deadline(slot, generation)?;
         }
+        // Reused storage for a placed body, claimed before the table
+        // borrow: the pool cleared it, so only capacity carries over. The
+        // client role has no pool and places into fresh storage as before.
+        #[cfg(feature = "net-server")]
+        let reuse = place_body
+            .then(|| self.body_pool.as_ref().map(|p| p.borrow_mut().claim(0)))
+            .flatten();
+        #[cfg(not(feature = "net-server"))]
+        let reuse = None;
         let conn = self.table.conn_mut(slot);
         let want = if place_body {
             // Placement: the body reads into its own allocation; the exact
             // remainder is computed from what `arm_body_recv` carved.
-            conn.arm_body_recv()
+            conn.arm_body_recv(reuse)
         } else {
             let granted = conn.arm_recv(want, exact);
             if granted < want && exact {
@@ -1531,7 +1542,12 @@ impl<U> Reactor<U> {
     #[cfg(feature = "net-server")]
     pub(crate) fn promote_recv_buffer(&mut self, slot: u32, want: usize) {
         let at = self.table.conn(slot).buffered();
-        let Some(claim) = self.table.conn_mut(slot).promote_recv_buf(at, want)
+        // Lazy: only a promote that actually fires claims reused storage,
+        // because a claim is a demand signal the pool sizes itself by.
+        let pool = self.body_pool.as_ref();
+        let seed = || pool.map(|p| p.borrow_mut().claim(0));
+        let Some(claim) =
+            self.table.conn_mut(slot).promote_recv_buf(at, want, seed)
         else {
             return;
         };
@@ -1577,7 +1593,13 @@ impl<U> Reactor<U> {
     /// and this is where that happens.
     #[cfg(feature = "net-server")]
     pub(crate) fn release_recv_buffer(&mut self, slot: u32) {
-        let Some(claim) = self.table.conn_mut(slot).release_recv_buf() else {
+        let (claim, surplus) = self.table.conn_mut(slot).release_recv_buf();
+        // Promoted storage comes home with the message that outgrew the
+        // pool buffer; the next promotion anywhere on the ring reuses it.
+        if let (Some(v), Some(pool)) = (surplus, self.body_pool.as_ref()) {
+            pool.borrow_mut().give(v);
+        }
+        let Some(claim) = claim else {
             return;
         };
         if let Some(pool) = self.recv_bufs.as_mut() {
@@ -2168,13 +2190,15 @@ impl<U> Reactor<U> {
                 body_len,
                 place,
             } => {
-                // Placement buys a move on delivery by allocating a buffer
-                // per body. The pool makes that a bad trade twice over: a
-                // held claim big enough for the body means a second buffer
-                // is pure churn, and a connection with *no* claim gets one
-                // free with the read itself (the kernel picks at
-                // completion) - so placing there forfeits a zero-copy
-                // buffer to allocate a copied one. On a streamed upload the
+                // Placement buys a move on delivery by directing the
+                // body into storage of its own (pool-claimed and reused,
+                // but still a buffer beside the recv rings). The rings
+                // make that a bad trade twice over: a held claim big
+                // enough for the body means a second buffer is pure
+                // churn, and a connection with *no* claim gets one free
+                // with the read itself (the kernel picks at completion)
+                // - so placing there forfeits a zero-copy buffer to
+                // claim a copied one. On a streamed upload the
                 // no-claim case is every mid-chunk window whose predecessor
                 // leased the claim to a write, which needs a peer chunking
                 // larger than one window: at 1 MiB HTTP chunks against a

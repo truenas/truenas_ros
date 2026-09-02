@@ -94,7 +94,8 @@
 //! # Large bodies (placement)
 //!
 //! A message body at or over `ServerConfig::body_placement_threshold`
-//! (default 64 KiB; `None` disables) is read **into its own allocation**
+//! (default 64 KiB; `None` disables) is read **into storage of its own**,
+//! claimed from the ring's body pool and returned there for reuse,
 //! rather than the connection's accumulate buffer - the transport-level
 //! equivalent of Samba's probe-then-carve read path: one recv for the frame
 //! header, one recv landing the payload in its final resting place. The
@@ -462,6 +463,7 @@ mod listen;
 mod protocol;
 mod wake;
 
+pub use crate::net::core::bodypool::BodyRecycler;
 pub use crate::net::core::handles::AcceptDeferral;
 pub use crate::net::core::protocol::{
     Body, ClientAddr, CloseReason, Endian, Framing, PeerCred, PrefixWidth,
@@ -505,6 +507,23 @@ const MAX_RING_ENTRIES: u32 = 32768;
 /// Backoff before re-arming a listener's accept after a transient error
 /// (resource pressure) - throttles the retry so it can't spin at 100% CPU.
 const ACCEPT_RETRY_MS: u64 = 20;
+
+/// The maintenance tick: how often a ring observes its buffer pools.
+/// Pressure needs no timer - it rides `-ENOBUFS` completions and misses --
+/// but quiet has nothing to ride, so without this a ring that went from
+/// busy to silent held its burst-peak buffers until traffic resumed. Five
+/// seconds against `SHRINK_AFTER = 4` means roughly twenty seconds of
+/// confirmed silence before the first give-back - hysteresis, not
+/// twitchiness.
+const MAINTAIN_TICK_SECS: u64 = 5;
+
+/// The most bytes one ring's body pool may retain for reuse. A hard
+/// ceiling over the demand-licensed target, so a storm of maximal
+/// bodies bounds at this figure per ring and quiet decays it from
+/// there - flexible growth underneath, never a runaway. Live (claimed)
+/// bodies are bounded separately, by what the endpoint admits per
+/// connection times the connections actually mid-body.
+const BODY_POOL_BUDGET: usize = 64 * 1024 * 1024;
 
 /// The kTLS handshake handler ([`Server::set_tls_handshake`]):
 /// `(furnished_fd, incoming, deferral)`, once per connection on a kTLS
@@ -806,6 +825,7 @@ where
                 .map(ts_of)
                 .unwrap_or_default(),
             recv_retry: cfg.recv_shortage_retry.map(ts_of).unwrap_or_default(),
+            maintain: ts_of(Duration::from_secs(MAINTAIN_TICK_SECS)),
         });
 
         let (inject_tx, inject_rx) = mpsc::channel();
@@ -863,6 +883,14 @@ where
         // reserved for a kernel that refuses the registration outright (or
         // an allocation failure under real memory pressure). Descriptors
         // are 16 bytes; the buffers behind them are allocated on demand.
+        // The body pool needs no kernel registration - it is plain
+        // userspace storage for placed and promoted bodies - so unlike the
+        // rings below it cannot fail to construct. Bounded in bytes, not
+        // buffers: retained capacity is what costs, and a count would let
+        // a few maximal bodies retain what a thousand small ones should.
+        core.body_pool = Some(std::rc::Rc::new(std::cell::RefCell::new(
+            crate::net::core::bodypool::BodyPool::new(BODY_POOL_BUDGET),
+        )));
         if cfg.recv_pool {
             // One buffer per connection: no more messages can be arriving
             // at once than there are connections.
@@ -956,6 +984,7 @@ where
             ));
         }
         self.core.arm_wake()?;
+        self.submit_maintain()?;
         for lidx in 0..self.listeners.len() as u32 {
             self.arm_accept(lidx)?;
         }
@@ -1186,6 +1215,23 @@ where
                     self.arm_accept(slot)?;
                 }
             }
+            // The maintenance tick: the one observation quiet pools get.
+            // Pressure rides completions; silence rides this.
+            Some(Op::Maintain) => {
+                if let Some(p) = self.core.recv_bufs.as_mut() {
+                    p.rebalance();
+                }
+                #[cfg(feature = "uring-fs")]
+                if let Some(p) = self.core.body_bufs.as_mut() {
+                    p.rebalance();
+                }
+                if let Some(p) = self.core.body_pool.as_ref() {
+                    p.borrow_mut().rebalance();
+                }
+                if !self.core.stopping() {
+                    self.submit_maintain()?;
+                }
+            }
             // A parked kTLS handshake's timeout fired (or was cancelled on
             // resolve): shed the slot if it is still parked.
             Some(Op::HandshakeTimeout) => {
@@ -1225,6 +1271,18 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     /// `:0` TCP ports come back resolved).
     pub fn local_addrs(&self) -> Vec<ServerAddr> {
         self.listeners.iter().map(|l| l.addr.clone()).collect()
+    }
+
+    /// The consumer's end of the body-storage loop: recycle a delivered
+    /// body's `Vec` so the next placed or promoted body on this ring
+    /// reuses it instead of allocating. `!Send` by construction - it
+    /// belongs to this ring's thread, like the server itself once
+    /// serving.
+    pub fn body_recycler(&self) -> Option<BodyRecycler> {
+        self.core
+            .body_pool
+            .as_ref()
+            .map(|p| crate::net::core::bodypool::BodyRecycler::new(p.clone()))
     }
 
     /// A `Send + Sync` handle that stops [`Server::serve_forever`] from another
