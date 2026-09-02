@@ -630,7 +630,10 @@ pub fn setup_ring(
 /// handler's own budget (`fs_ops`) plus one slot per connection for the
 /// reply path's body reads. A file tail keeps at most one read in flight,
 /// so `pool_size` bounds them exactly and a full pool of streaming bodies
-/// cannot exhaust the table out from under handler ops.
+/// cannot exhaust the table out from under handler ops. (An
+/// `SpecialFiles::Allow` open spends two handler-budget slots - its own
+/// and its guard timer's - until it answers; that is the caller's budget,
+/// like any other handler op.)
 #[cfg(feature = "uring-fs")]
 fn fs_op_slots(cfg: &ServerConfig) -> u32 {
     if cfg.fs_ops > 0 {

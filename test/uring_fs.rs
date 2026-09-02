@@ -2017,7 +2017,8 @@ fn an_open_leaves_no_guard_nonblock_on_the_descriptor() {
         );
 
         // And opting out leaves the flags exactly as given.
-        let allow = FsOpenHow::from(plain).allow_blocking_special_files();
+        let allow = FsOpenHow::from(plain)
+            .allow_blocking_special_files(std::time::Duration::from_secs(5));
         let f = h.open(me, &anchor, "f", allow).unwrap();
         assert_eq!(
             flags(&f) & libc::O_NONBLOCK,
@@ -2070,6 +2071,140 @@ fn a_creating_open_does_not_park_on_a_planted_fifo() {
                 );
             }
         });
+    });
+}
+
+/// An `Allow` open that blocks is bounded by its own deadline, and the
+/// worker it parked comes back.
+///
+/// The shape the mandatory deadline exists for: `O_WRONLY|O_CREAT` on a
+/// planted writer-less FIFO is forced onto an io-wq worker
+/// (`io_openat_force_async`) where `fifo_open` sleeps in
+/// `wait_for_partner` - with `Allow` and no deadline, forever, and the
+/// pool is one bounded set shared by every blocking fs op on the ring.
+/// The `LINK_TIMEOUT` staged as the open's link tail has the kernel
+/// cancel it when the deadline fires; the cancellation reaches the
+/// sleep as a signal, so the errno is `ECANCELED` or - where the open
+/// was already parked and returns `-ERESTARTSYS`, folded by `map_res`
+/// the way the kernel's own rw path folds it - `EINTR`. Either way the
+/// worker is freed, which the guarded open afterwards proves: it needs
+/// an io-wq worker of its own and completes.
+#[test]
+fn an_allow_open_is_bounded_by_its_deadline() {
+    use std::time::{Duration, Instant};
+    use truenas_ros::errno::Errno;
+    use truenas_ros::sync_fs::{Mode, OFlag, OpenHow};
+    use truenas_ros::uring_fs::FsOpenHow;
+
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        let fifo = dir.join("planted");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+            .unwrap();
+        // SAFETY: a NUL-terminated path we own.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0, "mkfifo");
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+
+        let how = OpenHow::new()
+            .flags(OFlag::O_WRONLY | OFlag::O_CREAT)
+            .mode(Mode::from_bits_truncate(0o644));
+        let allow = FsOpenHow::from(how)
+            .allow_blocking_special_files(Duration::from_millis(300));
+        let began = Instant::now();
+        let got = h.open(me, &anchor, "planted", allow);
+        let took = began.elapsed();
+        let errno = match got {
+            Err(truenas_ros::Error::Errno(e)) => e,
+            other => panic!("a blocked Allow open must fail: {other:?}"),
+        };
+        assert!(
+            matches!(errno, Errno::ECANCELED | Errno::EINTR),
+            "the deadline's cancellation, not some other failure: {errno}"
+        );
+        assert!(
+            took >= Duration::from_millis(250),
+            "failed in {took:?}: something other than the deadline ended it"
+        );
+        assert!(
+            took < Duration::from_secs(5),
+            "took {took:?}: the deadline did not bound the park"
+        );
+
+        // The worker came back: a guarded creating open needs one too.
+        let plain = OpenHow::new()
+            .flags(OFlag::O_WRONLY | OFlag::O_CREAT)
+            .mode(Mode::from_bits_truncate(0o644));
+        h.open(me, &anchor, "after", plain)
+            .expect("the parked worker was never freed");
+    });
+}
+
+/// An `Allow` open that completes retracts its guard, giving both
+/// slots back long before the hour-long deadline.
+///
+/// On a two-slot table, so the leak is the difference: an `Allow` open
+/// charges its own slot and its guard's, and a guard left armed after
+/// the open answered holds one of the two for the deadline's full
+/// length - the next `Allow` open, which needs both, then never fits.
+/// The retraction's slot returns with its own CQE, so the second open
+/// is retried briefly rather than demanded instantly.
+#[test]
+fn an_allow_open_that_completes_disarms_its_deadline() {
+    use std::time::{Duration, Instant};
+    use truenas_ros::sync_fs::{Mode, OFlag, OpenHow};
+    use truenas_ros::uring_fs::FsOpenHow;
+
+    let mut cfg = test_cfg();
+    cfg.ops = 2;
+    with_fs(cfg, |h, me, dir, _stop| {
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let how = OpenHow::new()
+            .flags(OFlag::O_RDWR | OFlag::O_CREAT)
+            .mode(Mode::from_bits_truncate(0o600));
+        let allow = FsOpenHow::from(how)
+            .allow_blocking_special_files(Duration::from_secs(3600));
+        let f = h
+            .open(me, &anchor, "quick", allow)
+            .expect("a regular file answers long before its deadline");
+        drop(f);
+
+        // Both slots come back once the guard's retraction lands.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match h.open(me, &anchor, "again", allow) {
+                Ok(_) => break,
+                Err(truenas_ros::Error::Errno(
+                    truenas_ros::errno::Errno::EBUSY,
+                )) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!(
+                    "the guard's slot never came back after the open \
+                     answered: {e}"
+                ),
+            }
+        }
+    });
+}
+
+/// A zero `Allow` deadline is refused at entry: it would cancel the
+/// open it exists to guard, so it is a shape defect like any other.
+#[test]
+fn a_zero_allow_deadline_is_refused() {
+    use std::time::Duration;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::FsOpenHow;
+
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let allow = FsOpenHow::from(OpenHow::new().flags(OFlag::O_RDONLY))
+            .allow_blocking_special_files(Duration::ZERO);
+        assert!(
+            matches!(
+                h.open(me, &anchor, "x", allow),
+                Err(truenas_ros::Error::Validation(_))
+            ),
+            "a zero deadline must be refused before anything submits"
+        );
     });
 }
 

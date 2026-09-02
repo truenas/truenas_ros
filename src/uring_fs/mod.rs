@@ -548,13 +548,30 @@ pub enum SpecialFiles {
     /// rides along with, once per descriptor - to keep a read of that
     /// descriptor off the reactor thread.
     Guard,
-    /// Leave the caller's flags exactly as given.
+    /// Leave the caller's flags exactly as given, bounded by `deadline`:
+    /// a guard timer rides the open (an `ASYNC_CANCEL` staged at expiry -
+    /// deliberately not a kernel `LINK_TIMEOUT`, which arms only after
+    /// the issue it would bound returns and so cannot cover a
+    /// force-async open at all; see `core::TAG_OPEN_DEADLINE`), so one
+    /// that blocks - `fifo_open` parked in `wait_for_partner` - fails
+    /// when the deadline fires instead of parking its worker for good.
+    /// An `Allow` open charges **two op slots** until it answers: its
+    /// own and its guard's.
     ///
     /// For a tree the consumer owns outright, where no FIFO or device node
-    /// can appear because nothing else writes to it. Choosing this for a
-    /// multiprotocol share means one planted name hangs an io-wq worker and a
-    /// caller thread permanently, with no timeout anywhere to recover it.
-    Allow,
+    /// *should* appear because nothing else writes to it. The deadline is
+    /// mandatory because the blast radius of being wrong is not the
+    /// caller's alone: io-wq is one bounded pool
+    /// (`min(sq_entries, 4 * nr_cpus)`), so a handful of planted names
+    /// pins **every** blocking fs op on the ring - other connections'
+    /// guarded creating opens included - not just the open that opted in.
+    /// A deadline open that trips answers `ECANCELED` (or `EINTR`, where
+    /// the cancellation caught the open mid-sleep) and the worker comes
+    /// back; without one, recovery was connection teardown or never.
+    Allow {
+        /// How long the open may block before the kernel cancels it.
+        deadline: std::time::Duration,
+    },
 }
 
 /// An [`OpenHow`] plus this crate's policy for it.
@@ -569,8 +586,9 @@ pub enum SpecialFiles {
 /// # use truenas_ros::uring_fs::FsOpenHow;
 /// # use truenas_ros::sync_fs::{OpenHow, OFlag};
 /// # let how = OpenHow::new().flags(OFlag::O_RDONLY);
-/// // A tree nothing else can write to:
-/// let mine = FsOpenHow::from(how).allow_blocking_special_files();
+/// // A tree nothing else can write to - bounded anyway:
+/// let mine = FsOpenHow::from(how)
+///     .allow_blocking_special_files(std::time::Duration::from_secs(5));
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct FsOpenHow {
@@ -590,8 +608,11 @@ impl From<OpenHow> for FsOpenHow {
 
 impl FsOpenHow {
     /// Select [`SpecialFiles::Allow`] - read its warning first.
-    pub fn allow_blocking_special_files(mut self) -> FsOpenHow {
-        self.special = SpecialFiles::Allow;
+    pub fn allow_blocking_special_files(
+        mut self,
+        deadline: std::time::Duration,
+    ) -> FsOpenHow {
+        self.special = SpecialFiles::Allow { deadline };
         self
     }
 
@@ -648,7 +669,7 @@ pub(crate) fn apply_special_file_guard(
     // every directory it opens. `chain` and `mkdir_path` already skipped the
     // guard on the steps they force `O_DIRECTORY` onto, citing this same
     // ordering; this is the rule they were stating.
-    if special == SpecialFiles::Allow
+    if matches!(special, SpecialFiles::Allow { .. })
         || raw.flags & libc::O_PATH as u64 != 0
         || raw.flags & libc::O_DIRECTORY as u64 != 0
         || raw.flags & libc::O_NONBLOCK as u64 != 0
@@ -669,13 +690,29 @@ pub(crate) fn apply_special_file_guard(
 pub(crate) fn open_parts<P: ?Sized + TnPath>(
     path: &P,
     how: FsOpenHow,
-) -> crate::Result<(CString, RawOpenHow, bool)> {
+) -> crate::Result<(CString, RawOpenHow, bool, Option<std::time::Duration>)> {
     let cpath: CString = path.with_tn_path(|c| c.to_owned())?;
     if cpath.as_bytes().is_empty() {
         return Err(crate::Error::Validation(
             "uring_fs open: empty path".into(),
         ));
     }
+    let deadline = match how.special {
+        SpecialFiles::Allow { deadline } => {
+            // A zero deadline races the open's own completion for no
+            // reason a caller can want; refuse it the way every other
+            // shape defect is refused, before anything is submitted.
+            if deadline.is_zero() {
+                return Err(crate::Error::Validation(
+                    "uring_fs open: a zero Allow deadline cancels the \
+                     open it guards"
+                        .into(),
+                ));
+            }
+            Some(deadline)
+        }
+        SpecialFiles::Guard => None,
+    };
     let mut raw = how.how.to_raw();
     // Union, keyed on whether the caller stated a policy at all - never on
     // `resolve == 0`. Testing the whole word makes a purely hardening flag an
@@ -684,7 +721,7 @@ pub(crate) fn open_parts<P: ?Sized + TnPath>(
     // `../../etc/shadow` would resolve.
     confine_resolve(&mut raw.resolve);
     let guarded = apply_special_file_guard(&mut raw, how.special);
-    Ok((cpath, raw, guarded))
+    Ok((cpath, raw, guarded, deadline))
 }
 
 /// A registered io_uring personality: a kernel-held snapshot of one
@@ -1177,6 +1214,10 @@ pub(crate) enum FsInject {
         /// `open_parts` added `O_NONBLOCK` for the special-file guard, so the
         /// completion strips it back off the descriptor.
         guarded: bool,
+        /// An [`SpecialFiles::Allow`] open's bound, staged as the
+        /// `LINK_TIMEOUT` riding the open. `None` for a guarded open,
+        /// which cannot block.
+        deadline: Option<std::time::Duration>,
         reply: ReplyTo,
     },
     Rw {
@@ -1396,8 +1437,8 @@ impl FsHandle {
         path: &P,
         how: impl Into<FsOpenHow>,
     ) -> crate::Result<File> {
-        let (cpath, raw, guarded) = open_parts(path, how.into())?;
-        self.open_raw(who, anchor, cpath, raw, guarded)
+        let (cpath, raw, guarded, deadline) = open_parts(path, how.into())?;
+        self.open_raw(who, anchor, cpath, raw, guarded, deadline)
     }
 
     /// Submit a prepared `OPENAT2`. Shared by [`open`](Self::open) and
@@ -1410,6 +1451,7 @@ impl FsHandle {
         cpath: CString,
         raw: RawOpenHow,
         guarded: bool,
+        deadline: Option<std::time::Duration>,
     ) -> crate::Result<File> {
         let (tx, rx) = mpsc::channel();
         let out = self.call(
@@ -1419,6 +1461,7 @@ impl FsHandle {
                 path: cpath,
                 how: raw,
                 guarded,
+                deadline,
                 reply: ReplyTo::Sync(tx),
             },
             &rx,
@@ -1454,7 +1497,7 @@ impl FsHandle {
         path: &P,
         how: impl Into<FsOpenHow>,
     ) -> crate::Result<File> {
-        let (cpath, mut raw, guarded) = open_parts(path, how.into())?;
+        let (cpath, mut raw, guarded, deadline) = open_parts(path, how.into())?;
         // See `scoping_conflict`: unioning the bundle over a stated
         // `IN_ROOT` made every path - a leaf, a nested path, `"."` -
         // fail `EINVAL`, while the same call through `open` succeeded.
@@ -1472,7 +1515,7 @@ impl FsHandle {
         // Union, never assign: a caller may add restrictions (RESOLVE_NO_
         // MAGICLINKS, say) but cannot subtract any of these three.
         raw.resolve |= CONFINED_RESOLVE.bits();
-        self.open_raw(who, anchor, cpath, raw, guarded)
+        self.open_raw(who, anchor, cpath, raw, guarded, deadline)
     }
 
     /// Create every missing directory along `path` beneath `anchor`, returning
@@ -1732,7 +1775,7 @@ impl FsHandle {
         path: &P,
         how: impl Into<FsOpenHow>,
     ) -> crate::Result<FsPending> {
-        let (cpath, raw, guarded) = open_parts(path, how.into())?;
+        let (cpath, raw, guarded, deadline) = open_parts(path, how.into())?;
         let (tx, rx) = mpsc::channel();
         self.send(FsInject::Open {
             pers: who.0,
@@ -1740,6 +1783,7 @@ impl FsHandle {
             path: cpath,
             how: raw,
             guarded,
+            deadline,
             reply: ReplyTo::Sync(tx),
         })
         .map_err(|_| crate::Error::from(Errno::ECONNABORTED))?;
@@ -2719,7 +2763,12 @@ mod tests {
 
         let mut raw = OpenHow::new().flags(OFlag::O_RDONLY).to_raw();
         assert!(
-            !apply_special_file_guard(&mut raw, SpecialFiles::Allow),
+            !apply_special_file_guard(
+                &mut raw,
+                SpecialFiles::Allow {
+                    deadline: std::time::Duration::from_secs(1),
+                },
+            ),
             "the opt-out is the one place a blocking open is asked for"
         );
     }
