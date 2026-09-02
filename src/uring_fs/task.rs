@@ -114,7 +114,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-use super::core::{FsConn, FsCore, FsDone, Owner};
+use super::core::{FsConn, FsCore, FsDone, Owner, SinkInner};
 use crate::errno::Errno;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
@@ -411,12 +411,16 @@ impl FsConn<'_> {
     /// that drops `on_done` without passing it anywhere resolves the
     /// future as `ECANCELED`.
     ///
-    /// **`submit` submits exactly one op.** The reason sink staged here
-    /// lives on the facade, so *any* submission the closure makes arms
-    /// it and a refusal of the wrong one fills this slot - reporting an
-    /// errno for an op that is still in flight, whose real completion
-    /// then lands in a settled slot and is discarded. Submit the extra
-    /// op before or after the call, not inside it.
+    /// **`submit` submits exactly one op.** The reason sink staged
+    /// here answers for a single submission, and the *first* one the
+    /// closure makes takes it; a later submission in the same frame
+    /// arms nothing, so its refusal follows the plain-callback
+    /// contract - dropped unfired, which for a request handler closes
+    /// the connection - instead of filling a slot that belongs to the
+    /// first op. If this future's own `on_done` rode that later
+    /// submission and it was refused, the future resolves `ECANCELED`
+    /// unmarked, the dropped-callback verdict. Submit the extra op
+    /// before or after the call, not inside it.
     pub fn fut(
         &mut self,
         submit: impl FnOnce(&mut FsConn<'_>, OnDone),
@@ -435,9 +439,11 @@ impl FsConn<'_> {
         // Saved and put back, because `submit` may itself contain a
         // `fut`: assigning over the outer sink would leave the outer op
         // reporting teardown for its own refusal.
-        let outer = self.stage_fail_sink(Rc::new(move |errno, bufs| {
-            reason.fill(Some(FsDone::refused_with(errno, bufs)));
-        }));
+        let outer = self.stage_fail_sink(Rc::new(SinkInner::new(
+            move |errno, bufs| {
+                reason.fill(Some(FsDone::refused_with(errno, bufs)));
+            },
+        )));
         submit(self, Box::new(move |done, _conn| fire.fire(done)));
         // No submission armed the sink: `submit` returned without
         // handing the op to the core at all, which is what the facade's
@@ -517,9 +523,11 @@ impl FsConn<'_> {
         let slot = Slot::new();
         let fire = Fire(Some(Rc::clone(&slot)));
         let reason = Rc::clone(&slot);
-        let outer = self.stage_fail_sink(Rc::new(move |errno, _bufs| {
-            reason.fill(Some(Err(errno.into())));
-        }));
+        let outer = self.stage_fail_sink(Rc::new(SinkInner::new(
+            move |errno, _bufs| {
+                reason.fill(Some(Err(errno.into())));
+            },
+        )));
         submit(self, Box::new(move |r, _conn| fire.fire(r)));
         self.restore_fail_sink(outer);
         OffloadFuture(slot)

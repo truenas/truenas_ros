@@ -157,7 +157,33 @@ pub(crate) type EmbeddedCb = Box<dyn FnOnce(FsDone, &mut FsConn<'_>)>;
 /// reporting teardown for a refusal the caller is told to retry. The
 /// steps share one sink; the slot's "a real answer is final" precedence
 /// is what makes more than one filler safe.
-pub(crate) type FailSink = Rc<dyn Fn(Errno, Vec<Vec<u8>>)>;
+///
+/// The frame's arm flag rides the same allocation ([`SinkInner`]), so
+/// staging a frame costs one `Rc`, not two.
+pub(crate) type FailSink = Rc<SinkInner>;
+
+/// A staged reason sink and the frame flag that meters arms of it -
+/// one allocation, because both exist per [`FsConn::fut`] frame and
+/// the flag alone was measured at 3.5x the cost of the `Arc` clone the
+/// completion path gave up in the same series.
+pub(crate) struct SinkInner<F: ?Sized = dyn Fn(Errno, Vec<Vec<u8>>)> {
+    /// Whether a submission in the watching frame has taken the share:
+    /// set by the first [`armed::arm`] under [`FsConn::fut`]'s frame,
+    /// read back by [`FsConn::restore_fail_sink`]. Shared with every
+    /// clone of the sink `Rc`, which is what lets an arm made through
+    /// a [`FsConn::reborrow`] reach the frame that is watching.
+    armed: Cell<bool>,
+    fill: F,
+}
+
+impl<F: Fn(Errno, Vec<Vec<u8>>)> SinkInner<F> {
+    pub(crate) fn new(fill: F) -> SinkInner<F> {
+        SinkInner {
+            armed: Cell::new(false),
+            fill,
+        }
+    }
+}
 
 /// An opaque per-op **owner** tag: the embedding host's connection identity
 /// `(slot, generation)`, threaded through so a chained callback runs under the
@@ -224,28 +250,31 @@ mod armed {
         }
     }
 
-    /// Clone the staged sink and record the arm on the current frame.
+    /// Clone the staged sink and record the arm on the watching frame.
     ///
-    /// **One frame, one submission.** Every clone taken inside one
-    /// [`FsConn::fut`] frame captures that future's own slot, so
-    /// whichever of two ops is refused first fills it and the other
-    /// op's real completion is silently discarded - with its `File`,
-    /// closing a descriptor under the caller. The debug assert names
-    /// the second submission at the point it arms; it cannot
-    /// false-positive on `chain`/`walk`, whose later steps run on a
-    /// fresh facade that carries the sink but no frame.
+    /// **One frame, one submission** - [`FsConn::fut`]'s stated
+    /// contract - and the *first* arm inside a frame is the one that
+    /// takes the share. Every clone captures that future's own slot,
+    /// so a second submission's refusal would fill a slot belonging to
+    /// the first op, discarding the first's real completion - with its
+    /// `File`, closing a descriptor under the caller - and reporting
+    /// the loser's errno for an op still in flight. A later arm in the
+    /// same frame therefore gets an *empty* share: its refusal follows
+    /// the plain-callback contract (dropped unfired) and the frame
+    /// answers for exactly the submission that armed it, in both
+    /// build profiles - a panic here would run inside dispatch, on
+    /// consumer input, on a path with no containment. Cannot misfire
+    /// on `chain`/`walk`, whose later steps run on a fresh facade that
+    /// carries the sink but watches no frame, so their shares stay
+    /// armed and a mid-chain refusal keeps its errno.
     pub(super) fn arm(conn: &mut FsConn<'_>) -> Armed {
-        let sink = conn.fail_sink.clone();
-        if sink.is_some()
-            && let Some(frame) = &conn.fail_armed
+        if conn.frame_watching
+            && let Some(sink) = &conn.fail_sink
+            && sink.armed.replace(true)
         {
-            debug_assert!(
-                !frame.get(),
-                "a second submission inside one future's frame: its refusal would fill a slot belonging to the other op"
-            );
-            frame.set(true);
+            return Armed(None);
         }
-        Armed(sink)
+        Armed(conn.fail_sink.clone())
     }
 
     /// A share that never arms, for driving the core without a facade.
@@ -2441,23 +2470,27 @@ pub struct FsConn<'a> {
     /// [`FailSink`]. `None` for every callback caller, which is what
     /// keeps their drop-on-refusal contract exactly as it was.
     fail_sink: Option<FailSink>,
-    /// The current frame's arm counter: whether a submission has taken
-    /// a clone of `fail_sink` since it was staged. [`FsConn::fut`] reads
-    /// it to tell "the op is in flight and reports for itself" from
-    /// "`submit` returned without handing the op to the core at all".
-    /// Shared (`Rc`) rather than a plain bool because a two-step
-    /// dispatch submits through [`FsConn::reborrow`], and an arm made
-    /// through the reborrow must reach the frame that is watching -
-    /// a copied flag left the outer `fut` synthesising a spurious
-    /// `EINVAL` for an op in flight. `None` outside any frame, so a
-    /// facade minted per completion costs no allocation.
-    fail_armed: Option<Rc<Cell<bool>>>,
+    /// Whether a [`FsConn::fut`] frame is watching this facade's
+    /// submissions. The arm flag itself - whether a submission has
+    /// taken a clone of `fail_sink` since it was staged, which `fut`
+    /// reads to tell "the op is in flight and reports for itself" from
+    /// "`submit` returned without handing the op to the core at all" -
+    /// rides the staged sink's own allocation ([`SinkInner`]), shared
+    /// by every clone of it: a two-step dispatch submits through
+    /// [`FsConn::reborrow`], and an arm made through the reborrow must
+    /// reach the frame that is watching - a copied flag left the outer
+    /// `fut` synthesising a spurious `EINVAL` for an op in flight.
+    /// This bool is what stays per-facade: a `chain`/`walk` step's
+    /// fresh facade carries the sink but watches no frame, so its arms
+    /// take shares without spending the one-per-frame budget.
+    frame_watching: bool,
 }
 
 /// What [`FsConn::stage_fail_sink`] displaced, to be handed back to
-/// [`FsConn::restore_fail_sink`]. A `fut` nested inside another's
-/// `submit` closure must not swallow the outer's sink - or its frame.
-pub(crate) struct StagedSink(Option<FailSink>, Option<Rc<Cell<bool>>>);
+/// [`FsConn::restore_fail_sink`]: the sink staged before, and whether
+/// a frame was watching then. A `fut` nested inside another's `submit`
+/// closure must not swallow the outer's sink - or its frame.
+pub(crate) struct StagedSink(Option<FailSink>, bool);
 
 /// A view of the delivering connection's recv-pool claim, offered to the
 /// handler's fs facade for the duration of one delivery.
@@ -2523,30 +2556,33 @@ impl<'a> FsConn<'a> {
             #[cfg(feature = "net-server")]
             lease_hold: None,
             fail_sink: None,
-            fail_armed: None,
+            frame_watching: false,
         }
     }
 
-    /// Stage the reason-sink every submission inside one [`FsConn::fut`]
-    /// takes a clone of - and the frame cell those submissions arm -
-    /// answering with what was staged before so the caller can put it
-    /// back.
+    /// Stage the reason-sink whose share the frame's one submission
+    /// takes ([`armed::arm`]) and mark the frame watching, answering
+    /// with what was staged before so the caller can put it back. The
+    /// frame's arm flag rides the sink's own allocation, so a frame
+    /// costs no second `Rc`.
     pub(crate) fn stage_fail_sink(&mut self, sink: FailSink) -> StagedSink {
         StagedSink(
             self.fail_sink.replace(sink),
-            self.fail_armed.replace(Rc::new(Cell::new(false))),
+            std::mem::replace(&mut self.frame_watching, true),
         )
     }
 
     /// Put back what [`FsConn::stage_fail_sink`] displaced, answering
     /// whether any submission armed the sink being retired. `false`
     /// means the facade refused the arguments before the op reached the
-    /// core, so nothing will ever report for it. Read off the shared
-    /// cell, so an arm made through a [`FsConn::reborrow`] counts.
+    /// core, so nothing will ever report for it. Read off the retiring
+    /// sink's own shared flag, so an arm made through a
+    /// [`FsConn::reborrow`] counts.
     pub(crate) fn restore_fail_sink(&mut self, prev: StagedSink) -> bool {
-        self.fail_sink = prev.0;
-        std::mem::replace(&mut self.fail_armed, prev.1)
-            .is_some_and(|frame| frame.get())
+        let armed = std::mem::replace(&mut self.fail_sink, prev.0)
+            .is_some_and(|s| s.armed.get());
+        self.frame_watching = prev.1;
+        armed
     }
 
     /// Carry a multi-step call's sink onto the fresh facade a later step
@@ -2649,11 +2685,12 @@ impl<'a> FsConn<'a> {
             #[cfg(feature = "net-server")]
             lease_hold: self.lease_hold.take(),
             // Cloned, not taken: both halves of a two-step dispatch
-            // submit, and both should report. The frame cell is shared,
-            // not reset - an arm made through the reborrow belongs to
-            // whatever frame is watching the outer facade.
+            // submit, and both should report. The frame's arm flag
+            // rides the shared sink `Rc`, not a copied field - an arm
+            // made through the reborrow belongs to whatever frame is
+            // watching the outer facade.
             fail_sink: self.fail_sink.clone(),
-            fail_armed: self.fail_armed.clone(),
+            frame_watching: self.frame_watching,
         }
     }
 
@@ -4912,35 +4949,21 @@ mod hybrid_tests {
         assert!(dir.path().join("made").exists(), "and it really ran");
     }
 
-    /// The debug half of the one-frame-one-submission rule: the second
-    /// arm inside one `fut` frame asserts at the point it arms, naming
-    /// the defect while both ops are still in scope.
-    #[cfg(all(feature = "net-server", debug_assertions))]
+    /// The one-frame-one-submission rule, enforced by attribution
+    /// rather than by a panic: the first submission in a frame owns
+    /// the frame's slot, and a second one's refusal cannot fill it.
+    /// The one-slot table makes the second open's refusal *real* -
+    /// the case where both arms sharing the slot discarded the first
+    /// op's completion, `File` and all, and reported the loser's
+    /// `EBUSY` for an op still in flight. Both profiles now answer the
+    /// same way, so this test carries no `debug_assertions` gate.
     #[test]
-    #[should_panic(expected = "a second submission inside one future's frame")]
-    fn a_second_submission_in_one_frame_debug_asserts() {
-        let (mut eng, mut fs, me) = setup();
-        let dir = crate::tempdir().expect("tempdir");
-        let at = Anchor::open(dir.path()).expect("anchor");
-        let mut c = FsConn::new(&mut fs, &mut eng, OWNER0);
-        let _quiet = crate::uring_fs::quiet_panics_on_this_thread();
-        drop(c.fut(|c, cb| {
-            let how = OpenHow::new().flags(OFlag::O_RDONLY);
-            c.open(me, &at, c"a", how, |_d, _c| {});
-            c.open(me, &at, c"a", how, cb);
-        }));
-    }
-
-    /// The release half has no `if` to test - both submissions arm and
-    /// the first refusal wins the slot, which `fut`'s rustdoc states as
-    /// the caller obligation - so what release pins is that the frame
-    /// mechanism itself stays: one submission in the frame reports
-    /// normally. (`a_reborrowed_submission_arms_the_outer_frame` is the
-    /// state assertion for the sharing half.)
-    #[cfg(all(feature = "net-server", not(debug_assertions)))]
-    #[test]
-    fn a_second_submission_in_one_frame_still_answers_the_first() {
-        let (mut eng, mut fs, me) = setup();
+    fn a_second_submissions_refusal_cannot_answer_for_the_first() {
+        let mut eng = Engine::new(256, 128).expect("engine");
+        let mut fs = FsCore::new(1, OffloadBounds::default());
+        let me = Personality(
+            register_personality(eng.ring.raw_fd()).expect("personality"),
+        );
         let dir = nested();
         let at = Anchor::open(dir.path()).expect("anchor");
         let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
@@ -4953,8 +4976,13 @@ mod hybrid_tests {
                     let done = t
                         .fut(|c, cb| {
                             let how = OpenHow::new().flags(OFlag::O_RDONLY);
-                            c.open(me, &at, c"a", how, |_d, _c| {});
+                            // Takes the one op slot and arms the frame.
                             c.open(me, &at, c"a", how, cb);
+                            // Refused `EBUSY` on the empty table; its
+                            // share is empty, so the refusal follows
+                            // the callback contract instead of filling
+                            // the frame's slot.
+                            c.open(me, &at, c"a", how, |_d, _c| {});
                         })
                         .await;
                     *g2.borrow_mut() = Some(done);
@@ -4965,8 +4993,65 @@ mod hybrid_tests {
         let done = got.borrow_mut().take().expect("resolved");
         assert!(
             done.file().is_some(),
-            "the awaited op still answers: {:?}",
-            done.result()
+            "the armed op must answer with its own completion: {:?} \
+             refused={}",
+            done.result(),
+            done.was_refused()
+        );
+    }
+
+    /// The other ordering of the same violation: when the frame's own
+    /// `on_done` rides the *second* submission and that one is
+    /// refused, the future resolves with the dropped-callback verdict
+    /// (unmarked `ECANCELED`) rather than hanging or stealing the
+    /// first op's answer. `fut`'s rustdoc states both halves.
+    #[test]
+    fn a_refused_second_submission_answers_for_itself() {
+        let mut eng = Engine::new(256, 128).expect("engine");
+        let mut fs = FsCore::new(1, OffloadBounds::default());
+        let me = Personality(
+            register_personality(eng.ring.raw_fd()).expect("personality"),
+        );
+        let dir = nested();
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
+        let opened: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
+        let g2 = got.clone();
+        let o2 = opened.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                drop(c.spawn(move |t| async move {
+                    let done = t
+                        .fut(|c, cb| {
+                            let how = OpenHow::new().flags(OFlag::O_RDONLY);
+                            // Takes the slot and the frame's share.
+                            c.open(me, &at, c"a", how, move |d, _c| {
+                                *o2.borrow_mut() = Some(d.file().is_some());
+                            });
+                            // Refused; dropping `cb` resolves the
+                            // future as `Fire::drop` documents.
+                            c.open(me, &at, c"a", how, cb);
+                        })
+                        .await;
+                    *g2.borrow_mut() = Some(done);
+                }));
+            },
+            || got.borrow().is_some() && opened.borrow().is_some(),
+        );
+        let done = got.borrow_mut().take().expect("resolved");
+        assert!(
+            matches!(done.result(), Err(crate::Error::Errno(Errno::ECANCELED)))
+                && !done.was_refused(),
+            "the dropped-callback verdict: {:?} refused={}",
+            done.result(),
+            done.was_refused()
+        );
+        assert_eq!(
+            opened.borrow_mut().take(),
+            Some(true),
+            "and the first submission still answers its own callback"
         );
     }
 
@@ -5577,7 +5662,7 @@ fn deliver(
             // no consumer code, so this is not an inline delivery.
             let on_fail = on_fail.take();
             if let (true, Some(sink), Err(errno)) = (refused, &on_fail, res) {
-                sink(errno, bufs);
+                (sink.fill)(errno, bufs);
             } else {
                 drop(bufs);
             }
