@@ -2314,6 +2314,212 @@ mod tests {
         );
     }
 
+    /// An `Allow` open is a wall-clock hold like a timer - two slots
+    /// parked until its deadline or its answer - so it spends the same
+    /// per-owner budget: at the cap it is refused with the marked
+    /// `EBUSY` a timer arm gets, and the tenant beside it still opens.
+    #[test]
+    fn an_allow_open_spends_the_owners_timer_budget() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        fs.set_timer_cap(1);
+        let dir = crate::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("plain"), b"x").expect("write");
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let hour = Duration::from_secs(3600);
+
+        // The owner's one hold: an hour timer.
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            assert!(conn.timeout(hour, |_d, _c| {}).is_some(), "first arm");
+        }
+        // Its `Allow` open is refused before either slot is popped,
+        // with the errno and the mark an over-cap timer arm carries.
+        let seen: Rc<StdCell<Option<(bool, bool)>>> =
+            Rc::new(StdCell::new(None));
+        let free_before = fs.op_free_len_for_test();
+        {
+            let out = Rc::clone(&seen);
+            let at = at.clone();
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            drop(conn.spawn(move |t| async move {
+                let d = t
+                    .fut(|c, cb| {
+                        c.open(
+                            who,
+                            &at,
+                            c"plain",
+                            crate::uring_fs::FsOpenHow::from(
+                                OpenHow::new().flags(OFlag::O_RDONLY),
+                            )
+                            .allow_blocking_special_files(hour),
+                            cb,
+                        );
+                    })
+                    .await;
+                out.set(Some((
+                    matches!(
+                        d.result(),
+                        Err(crate::Error::Errno(Errno::EBUSY))
+                    ),
+                    d.was_refused(),
+                )));
+            }));
+        }
+        assert_eq!(
+            seen.get(),
+            Some((true, true)),
+            "refused as this crate's own EBUSY, not silently"
+        );
+        assert_eq!(
+            fs.op_free_len_for_test(),
+            free_before,
+            "a refused pair holds nothing"
+        );
+
+        // The neighbour's budget is its own.
+        let ok = Rc::new(StdCell::new(false));
+        {
+            let out = Rc::clone(&ok);
+            let at = at.clone();
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((2, 1)));
+            drop(conn.spawn(move |t| async move {
+                let d = t
+                    .fut(|c, cb| {
+                        c.open(
+                            who,
+                            &at,
+                            c"plain",
+                            crate::uring_fs::FsOpenHow::from(
+                                OpenHow::new().flags(OFlag::O_RDONLY),
+                            )
+                            .allow_blocking_special_files(hour),
+                            cb,
+                        );
+                    })
+                    .await;
+                out.set(d.result().is_ok());
+            }));
+        }
+        drive(&mut fs, &mut eng, &ok, "the neighbour's Allow open");
+    }
+
+    /// The pair's charge is taken when the guard stages and returned
+    /// when the open answers, so an in-flight `Allow` open blocks the
+    /// owner's next arm and its completion frees it - the same
+    /// lifecycle a timer's count follows.
+    #[test]
+    fn an_allow_opens_charge_returns_when_it_answers() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        fs.set_timer_cap(1);
+        let dir = crate::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("plain"), b"x").expect("write");
+        let at = Anchor::open(dir.path()).expect("anchor");
+
+        let done = Rc::new(StdCell::new(false));
+        {
+            let out = Rc::clone(&done);
+            let at = at.clone();
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            drop(conn.spawn(move |t| async move {
+                let d = t
+                    .fut(|c, cb| {
+                        c.open(
+                            who,
+                            &at,
+                            c"plain",
+                            crate::uring_fs::FsOpenHow::from(
+                                OpenHow::new().flags(OFlag::O_RDONLY),
+                            )
+                            .allow_blocking_special_files(Duration::from_secs(
+                                3600,
+                            )),
+                            cb,
+                        );
+                    })
+                    .await;
+                assert!(d.result().is_ok(), "{:?}", d.result());
+                out.set(true);
+            }));
+        }
+        // Charged while in flight: the owner's next arm is refused.
+        assert_eq!(fs.armed_timers_for_test(&(1, 1)), 1, "the pair charged");
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            assert!(
+                conn.timeout(Duration::from_secs(3600), |_d, _c| {})
+                    .is_none(),
+                "the hold spends the same budget a timer would"
+            );
+        }
+        drive(&mut fs, &mut eng, &done, "allow open");
+        assert_eq!(
+            fs.armed_timers_for_test(&(1, 1)),
+            0,
+            "the answer returned the charge"
+        );
+    }
+
+    /// A connection the sweep has passed may not park an `Allow` pair
+    /// on the table, for the reason its timers are refused: two slots
+    /// held for wall-clock time, with nothing left to retract them.
+    /// Same verdict, same delivery.
+    #[test]
+    fn a_swept_owner_cannot_park_an_allow_open() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        let dir = crate::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("plain"), b"x").expect("write");
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let seen: Rc<StdCell<Option<(bool, bool)>>> =
+            Rc::new(StdCell::new(None));
+
+        fs.cancel_owned_by(&mut eng, vec![(6, 1)]);
+        {
+            let out = Rc::clone(&seen);
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((6, 1)));
+            drop(conn.spawn(move |t| async move {
+                let d = t
+                    .fut(|c, cb| {
+                        c.open(
+                            who,
+                            &at,
+                            c"plain",
+                            crate::uring_fs::FsOpenHow::from(
+                                OpenHow::new().flags(OFlag::O_RDONLY),
+                            )
+                            .allow_blocking_special_files(Duration::from_secs(
+                                3600,
+                            )),
+                            cb,
+                        );
+                    })
+                    .await;
+                out.set(Some((
+                    matches!(
+                        d.result(),
+                        Err(crate::Error::Errno(Errno::ECANCELED))
+                    ),
+                    d.was_refused(),
+                )));
+            }));
+        }
+        let (ecanceled, refused) = seen.get().expect("answered at once");
+        assert!(ecanceled, "the sweep's verdict, not a strand");
+        assert!(
+            !refused,
+            "unmarked, exactly as an in-flight timer the sweep reached"
+        );
+        assert!(
+            fs.has_free_op(),
+            "no slot pair may be held for a dead connection"
+        );
+    }
+
     /// The timer composes with the future layer like any submission: a
     /// task awaits its tick and resumes on the loop that armed it.
     #[test]

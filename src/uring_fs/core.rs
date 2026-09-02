@@ -538,20 +538,25 @@ pub(crate) struct FsCore {
     /// and never by how many connections have come and gone. Empty for
     /// a reactor with no owners (the standalone host).
     closed_owners: HashMap<u32, u64>,
-    /// Armed timers per owner, and the per-owner ceiling the host set
-    /// ([`FsCore::set_timer_cap`]). A timer is the one op that holds
-    /// its slot for wall-clock time rather than until an I/O
-    /// completes, so without a bound one connection could park the
-    /// whole shared handler budget for its arms' full duration -
-    /// measured at every slot of a consumer-sized table in 19 ms.
+    /// Armed wall-clock holds per owner, and the per-owner ceiling the
+    /// host set ([`FsCore::set_timer_cap`]). A timer holds its op slot
+    /// for wall-clock time rather than until an I/O completes - and an
+    /// `Allow` open holds two slots the same way, its own and its
+    /// guard's, until the deadline or the open ends the pair - so
+    /// without a bound one connection could park the whole shared
+    /// handler budget for its arms' full duration - measured at every
+    /// slot of a consumer-sized table in 19 ms. An `Allow` pair
+    /// charges one count (so a count bounds at most two slots),
+    /// taken when its guard stages and returned when the open answers.
     /// The ceiling is the host's `max_in_flight_requests`: the real
-    /// consumer's discipline is one timer per in-flight request (a
-    /// retry tick per parked claimant), so one connection needs N
-    /// concurrent timers exactly when N pipelined requests contend at
-    /// once, and a smaller constant would couple this crate to the
-    /// pipelining knob of another. `None` is uncapped - the standalone
-    /// host has one caller and no tenants to protect from each other -
-    /// and owner-less arms are never counted.
+    /// consumer's discipline is one retry tick per connection, walking
+    /// every claimant parked on it (its `guard.rs`), so one connection
+    /// needs N concurrent holds exactly when N pipelined requests
+    /// carry deadlines at once, and a smaller constant would couple
+    /// this crate to the pipelining knob of another. `None` is
+    /// uncapped - the standalone host has one caller and no tenants to
+    /// protect from each other - and owner-less arms are never
+    /// counted.
     armed_timers: HashMap<(u32, u64), u32>,
     timer_cap: Option<u32>,
     /// Spawned tasks and their run queue (the futures layer,
@@ -754,6 +759,35 @@ impl FsCore {
             fail(waiter, Errno::EINVAL, Vec::new());
             return;
         }
+        // An `Allow` open is a wall-clock hold like a timer - two slots
+        // parked until the deadline or the open ends the pair - so it
+        // answers to both timer tenancy rules (`armed_timers`,
+        // `submit_timeout`): a swept owner may not park time on the
+        // table (same verdict, same delivery - the sweep's own
+        // `ECANCELED`, unmarked), and an owner at its cap is refused
+        // with the marked `EBUSY` a full table answers. A guarded open
+        // cannot block and passes both.
+        if deadline.is_some()
+            && let FsWaiter::Embedded { owner: Some(o), .. } = &waiter
+        {
+            if self.owner_is_gone(Some(*o)) {
+                deliver(
+                    Some(waiter),
+                    Err(Errno::ECANCELED),
+                    Vec::new(),
+                    None,
+                    None,
+                    false,
+                );
+                return;
+            }
+            if let Some(cap) = self.timer_cap
+                && self.armed_timers.get(o).copied().unwrap_or(0) >= cap
+            {
+                fail(waiter, Errno::EBUSY, Vec::new());
+                return;
+            }
+        }
         // An `Allow` open charges two slots - its own and its guard
         // timer's, both held until it answers - so the refusal happens
         // here, before either pop, and the guard's pop below cannot
@@ -767,6 +801,12 @@ impl FsCore {
             return;
         };
 
+        // The owner an `Allow` pair's wall-clock charge is metered to,
+        // read before the waiter parks on the entry.
+        let timer_owner = match &waiter {
+            FsWaiter::Embedded { owner: Some(o), .. } => Some(*o),
+            _ => None,
+        };
         let entry = &mut self.ops[op_slot as usize];
         let open_gen = entry.generation;
         let gen32 = entry.generation as u32;
@@ -836,6 +876,14 @@ impl FsCore {
                         guard_slot,
                         self.ops[guard_slot as usize].generation,
                     ));
+                    // The pair's wall-clock charge, counted like a
+                    // timer's arm: taken only once the guard is real,
+                    // returned when the open answers (`take_op`, keyed
+                    // on `guard` being set - a stage-failed guard never
+                    // reaches here and never charges).
+                    if let Some(o) = timer_owner {
+                        *self.armed_timers.entry(o).or_insert(0) += 1;
+                    }
                 }
                 Err(_) => {
                     // The open is in flight and its bound cannot be:
@@ -2066,21 +2114,36 @@ impl FsCore {
             _ => return None,
         }
         let e = &mut entry.state;
-        // A timer's completion - expiry, retraction, or the teardown
-        // drain - returns its owner's headroom. Decremented here and
+        // A wall-clock hold's completion returns its owner's headroom:
+        // a timer's - expiry, retraction, or the teardown drain - and
+        // an `Allow` open's, whose pair charged one count when its
+        // guard staged (`guard` still set is the receipt; a
+        // stage-failed guard never charged). Decremented here and
         // incremented only after a successful stage, so the two are
         // paired on the entry's own lifecycle whoever staged the
         // cancel.
-        if tag == TAG_TIMEOUT
-            && let Some(FsWaiter::Embedded { owner: Some(o), .. }) = &e.waiter
-        {
-            if let Some(n) = self.armed_timers.get_mut(o) {
+        let charged = match (tag, &e.waiter) {
+            (TAG_TIMEOUT, Some(FsWaiter::Embedded { owner: Some(o), .. })) => {
+                Some(*o)
+            }
+            (TAG_OPEN, Some(FsWaiter::Embedded { owner: Some(o), .. }))
+                if e.guard.is_some() =>
+            {
+                Some(*o)
+            }
+            _ => None,
+        };
+        if let Some(o) = charged {
+            if let Some(n) = self.armed_timers.get_mut(&o) {
                 *n -= 1;
                 if *n == 0 {
-                    self.armed_timers.remove(o);
+                    self.armed_timers.remove(&o);
                 }
             } else {
-                debug_assert!(false, "a timer completed with no armed count");
+                debug_assert!(
+                    false,
+                    "a wall-clock hold completed with no armed count"
+                );
             }
         }
         let done = Completed {

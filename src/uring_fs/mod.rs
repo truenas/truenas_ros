@@ -557,7 +557,10 @@ pub enum SpecialFiles {
     /// that blocks - `fifo_open` parked in `wait_for_partner` - fails
     /// when the deadline fires instead of parking its worker for good.
     /// An `Allow` open charges **two op slots** until it answers: its
-    /// own and its guard's.
+    /// own and its guard's - so one can be refused `EBUSY` with a slot
+    /// still free - and the pair is a wall-clock hold, metered against
+    /// the owner's timer cap and refused for a swept owner exactly as
+    /// a timer arm is (`core::FsCore::armed_timers`).
     ///
     /// For a tree the consumer owns outright, where no FIFO or device node
     /// *should* appear because nothing else writes to it. The deadline is
