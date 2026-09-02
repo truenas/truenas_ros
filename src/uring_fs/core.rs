@@ -183,40 +183,6 @@ pub(crate) enum ReapedFs {
     Pump(FsDone, (u32, u64)),
 }
 
-/// Box a consumer callback as an owner-stamped embedded waiter - the one shape
-/// every [`FsConn`] submit method hands the core.
-#[cfg_attr(not(feature = "net-server"), allow(dead_code))]
-fn embed<F>(owner: Owner, armed: Armed, on_done: F) -> FsWaiter
-where
-    F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
-{
-    FsWaiter::Embedded {
-        owner,
-        cb: Box::new(on_done),
-        on_fail: armed.0,
-    }
-}
-
-/// One submission's share of the staged reason sink - and the proof
-/// that a submission took one.
-///
-/// **Only [`FsConn::arm_fail_sink`] makes one**, and that is the whole
-/// point of the type. [`FsConn::fut`] tells "the op is in flight and
-/// will report for itself" from "the facade refused the arguments and
-/// nothing ever will" by whether any submission armed the sink, so a
-/// submit method that reaches the core without arming makes `fut`
-/// answer a perfectly good op with a spurious `EINVAL`. Passing
-/// `embed` a bare `Option<FailSink>` let exactly that compile: a method
-/// written against the older signature took `self.fail_sink.take()`,
-/// which type-checks, submits, and arms nothing. This makes the same
-/// mistake a build failure.
-///
-/// The field is private rather than the type opaque, so a test in a
-/// descendant module can still build an unarmed one directly; a
-/// constructor for that would be dead code wherever the test using it
-/// is gated out.
-pub(crate) struct Armed(Option<FailSink>);
-
 /// Report an early submission failure - the SQE never staged (slot exhaustion,
 /// an unusable file) - handing the caller's payloads back exactly as a
 /// completion would (see [`deliver`]).
@@ -454,6 +420,13 @@ pub(crate) struct FsCore {
     /// [`super::task`]); woken tasks are polled by the delivery
     /// functions below.
     pub(crate) tasks: super::task::Tasks,
+    /// The highest connection generation [`FsCore::cancel_owned_by`]
+    /// has swept, per connection slot - what
+    /// [`FsCore::owner_is_gone`] reads. One entry per slot and slots
+    /// are reused, so this is bounded by the host's connection table
+    /// and never by how many connections have come and gone. Empty for
+    /// a reactor with no owners (the standalone host).
+    closed_owners: HashMap<u32, u64>,
 }
 
 impl FsCore {
@@ -472,7 +445,24 @@ impl FsCore {
             next_offload: 0,
             priv_xattrs: PrivilegedXattrs::default(),
             tasks: super::task::Tasks::new(),
+            closed_owners: HashMap::new(),
         }
+    }
+
+    /// Whether `owner`'s connection has already been swept.
+    ///
+    /// Generations are per-slot and monotonic, so a sweep recorded at
+    /// or above this one's means this one is over: an entry for a later
+    /// tenant of the same slot answers `false` for the tenant that is
+    /// live, and `true` for every tenant before it.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    pub(crate) fn owner_is_gone(&self, owner: Owner) -> bool {
+        let Some((slot, generation)) = owner else {
+            return false;
+        };
+        self.closed_owners
+            .get(&slot)
+            .is_some_and(|&swept| swept >= generation)
     }
 
     /// A handle on this reactor's live-task count, for an embedding
@@ -789,6 +779,11 @@ impl FsCore {
         !self.op_free.is_empty()
     }
 
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn op_free_len_for_test(&self) -> usize {
+        self.op_free.len()
+    }
+
     /// Stage a reactor-pump `READV`: one positional read of up to `want`
     /// bytes at `off` into `buf`'s spare capacity, completing back through
     /// [`ReapedFs::Pump`] rather than a callback - the submission path for
@@ -930,15 +925,19 @@ impl FsCore {
     /// at [`FsCore::on_cqe`] because that firing is the completion the
     /// caller asked for. No fd, no personality: a timer touches nothing a
     /// credential guards.
+    ///
+    /// Answers the armed timer's routing token, for
+    /// [`FsCore::submit_cancel`]; `None` when the table refused it, and
+    /// then the waiter has already been failed.
     pub(crate) fn submit_timeout(
         &mut self,
         eng: &mut Engine,
         after: std::time::Duration,
         waiter: FsWaiter,
-    ) {
+    ) -> Option<u64> {
         let Some(op_slot) = self.op_free.pop() else {
             fail(waiter, Errno::EBUSY, Vec::new());
-            return;
+            return None;
         };
 
         let ts = Box::new(KernelTimespec {
@@ -961,7 +960,9 @@ impl FsCore {
         });
         if let Err(err) = staged {
             self.fail_op(op_slot, err);
+            return None;
         }
+        Some(ud)
     }
 
     /// Stage a metadata op that targets an **open file**: `FTRUNCATE`/
@@ -1371,7 +1372,6 @@ impl FsCore {
     /// -- nothing routes its completion - but goes through `eng.stage` so the
     /// engine's in-flight accounting stays correct. Best-effort: a stage failure
     /// (ring full) is dropped; server teardown still reaps the op.
-    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     fn submit_cancel(&self, eng: &mut Engine, target_ud: u64) {
         let ud = pack_raw(TAG_CANCEL, 0, 0);
         let _ = eng.stage(ud, |sqe| {
@@ -1393,41 +1393,78 @@ impl FsCore {
     /// continuation of a cancelled op runs after the sweep, with the same
     /// stamped owner, and whatever it submits then is not swept again -
     /// which is the same "an owner gone mid-chain" a continuation must
-    /// already tolerate. What bounds it is that such an op *completes*:
-    /// every submission path here either reaches the kernel and answers,
-    /// or is refused at submit. The one shape that could answer neither
-    /// was an unguarded open of a special file, and `chain` guards its
-    /// last step for exactly that reason. Adding a second sweep instead
-    /// would be unbounded - a continuation that resubmits on `ECANCELED`
-    /// keeps giving it something to find.
+    /// already tolerate, and deliberately still allowed: a handler
+    /// finishing an upload it already accepted has work to do that the
+    /// peer's disconnect does not undo. A second sweep is not the
+    /// answer either, and would be unbounded - a continuation that
+    /// resubmits on `ECANCELED` keeps giving it something to find, and
+    /// the sweep's own `ECANCELED` completions are what wake the
+    /// continuations that resubmit.
+    ///
+    /// So the bound is the continuation's, not this function's, and
+    /// [`FsCore::owner_is_gone`] - recorded here - is what makes it
+    /// reachable. Two shapes need it, because for them a post-sweep op
+    /// does *not* simply complete and stop:
+    ///
+    /// - An open with [`SpecialFiles::Allow`](super::SpecialFiles),
+    ///   whose own rustdoc says it "hangs an io-wq worker and a caller
+    ///   thread permanently, with no timeout anywhere to recover it".
+    ///   Cancelling reaches it while in flight; a fresh one afterwards
+    ///   has nothing left to reach it.
+    /// - A task awaiting only offloads, which are never cancelled and
+    ///   always deliver (see [`FsConn::offload`]) - so neither of the
+    ///   two signals [`super::task`] tells a task to wind down on ever
+    ///   arrives, and a re-arming one runs for a connection that is
+    ///   gone, counted in `tasks.live` and holding a graceful drain
+    ///   open with it.
+    ///
+    /// **Takes the whole batch of closes, because the scan is the
+    /// cost.** A close is recorded unconditionally - the host cannot
+    /// know whether a handler opened anything - so a connection that
+    /// served one cached GET still arrives here, and one scan per
+    /// owner walks the table `fs_ops + pool_size` entries deep, once
+    /// each, on the reactor thread. Sorted so the membership test is a
+    /// binary search: the batch is bounded by the connection table and
+    /// a linear test would make a mass disconnect quadratic. The
+    /// empty-table check ahead of it is what an idle server actually
+    /// hits.
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     pub(crate) fn cancel_owned_by(
         &mut self,
         eng: &mut Engine,
-        owner: (u32, u64),
+        mut owners: Vec<(u32, u64)>,
     ) {
+        // Recorded before the scan, so a continuation woken by one of
+        // the cancellations below already reads its owner as gone -
+        // and recorded whether or not there is anything to cancel,
+        // since that is what a task with no ring op reads.
+        for &(slot, generation) in &owners {
+            let swept = self.closed_owners.entry(slot).or_insert(generation);
+            *swept = (*swept).max(generation);
+        }
+        if self.op_free.len() == self.ops.len() {
+            return; // nothing in flight for anyone
+        }
+        owners.sort_unstable();
         // Collect targets first (the scan borrows `self.ops`), then stage.
-        let targets: Vec<u64> = self
-            .ops
-            .iter()
-            .enumerate()
-            .filter_map(|(i, entry)| {
-                let FsOpState::InFlight { tag } = entry.state.state else {
-                    return None;
-                };
-                match &entry.state.waiter {
-                    Some(FsWaiter::Embedded { owner: Some(o), .. })
-                        if *o == owner =>
-                    {
-                        Some(pack_raw(tag, i as u32, entry.generation as u32))
-                    }
-                    Some(FsWaiter::Pump { owner: o }) if *o == owner => {
-                        Some(pack_raw(tag, i as u32, entry.generation as u32))
-                    }
-                    _ => None,
-                }
-            })
-            .collect();
+        let targets: Vec<u64> =
+            self.ops
+                .iter()
+                .enumerate()
+                .filter_map(|(i, entry)| {
+                    let FsOpState::InFlight { tag } = entry.state.state else {
+                        return None;
+                    };
+                    let owner = match &entry.state.waiter {
+                        Some(FsWaiter::Embedded { owner: Some(o), .. }) => *o,
+                        Some(FsWaiter::Pump { owner: o }) => *o,
+                        _ => return None,
+                    };
+                    owners.binary_search(&owner).ok().map(|_| {
+                        pack_raw(tag, i as u32, entry.generation as u32)
+                    })
+                })
+                .collect();
         for ud in targets {
             self.submit_cancel(eng, ud);
         }
@@ -1720,10 +1757,24 @@ impl std::fmt::Debug for FsDone {
     }
 }
 
+/// A timer armed by [`FsConn::timeout`], for
+/// [`FsConn::cancel_timeout`].
+///
+/// Names one arming, not the slot: it carries the op-table generation
+/// the arm was made under, so a `Timer` kept past its own expiry
+/// cancels nothing when the slot has been reissued. Copy, because
+/// retracting is idempotent and a caller that holds two deadlines
+/// should not have to track which one it has already spent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timer(u64);
+
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 impl FsDone {
-    /// A completion no op produced - what a multi-step call answers
-    /// with when it refuses between steps.
+    /// A completion no op produced, with **no** claim about who
+    /// produced the errno: the kernel's own verdict forwarded from
+    /// somewhere else, or an outcome whose provenance is not this
+    /// crate's to assert. [`FsDone::refused`] is the arm for a screen
+    /// of this crate's own.
     pub(crate) fn failed(err: Errno) -> FsDone {
         FsDone {
             result: Err(err),
@@ -1734,6 +1785,20 @@ impl FsDone {
             #[cfg(feature = "net-server")]
             recv_lease: None,
         }
+    }
+
+    /// A step this crate's own screen refused, carrying no payload -
+    /// what a multi-step call answers with when it refuses *between*
+    /// steps.
+    ///
+    /// Provenance has to be the same at both ends of a chain or it says
+    /// nothing: the very screen that gives `EINVAL` with
+    /// [`was_refused`](FsDone::was_refused) true at `open_chain`'s entry
+    /// gives it again on a derived name three steps in, and answering
+    /// the second with `failed` makes the same refusal read as
+    /// `ECANCELED`-class teardown to the awaiting task.
+    pub(crate) fn refused(err: Errno) -> FsDone {
+        FsDone::refused_with(err, Vec::new())
     }
 
     /// A submission the facade or the core refused, with the payload it
@@ -1941,12 +2006,31 @@ impl<'a> FsConn<'a> {
         self.fail_sink = sink;
     }
 
-    /// A clone of the staged sink for one submission, recording that a
-    /// submission took it.
-    fn arm_fail_sink(&mut self) -> Armed {
-        let sink = self.fail_sink.clone();
-        self.fail_armed |= sink.is_some();
-        Armed(sink)
+    /// Box `on_done` as this connection's owner-stamped embedded waiter,
+    /// taking a share of the staged reason sink on the way - **the one
+    /// shape every submit method here hands the core.**
+    ///
+    /// Arming and boxing are one step because they were two, and the
+    /// second was skippable. [`FsConn::fut`] tells "the op is in flight
+    /// and will report for itself" from "the facade refused the
+    /// arguments and nothing ever will" by whether any submission armed
+    /// the sink, so a submit method that reaches the core without arming
+    /// makes `fut` answer a perfectly good op with a spurious `EINVAL` -
+    /// which is what the ring timer shipped with. There is no longer a
+    /// waiter to build without passing through here, and nothing to pass
+    /// in place of the share.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    fn waiter<F>(&mut self, on_done: F) -> FsWaiter
+    where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        let on_fail = self.fail_sink.clone();
+        self.fail_armed |= on_fail.is_some();
+        FsWaiter::Embedded {
+            owner: self.owner,
+            cb: Box::new(on_done),
+            on_fail,
+        }
     }
 
     /// The facade's parts, reborrowed - what the task layer
@@ -1954,6 +2038,30 @@ impl<'a> FsConn<'a> {
     /// the table while the facade it hands the task borrows the tables.
     pub(crate) fn split(&mut self) -> (&mut FsCore, &mut Engine, Owner) {
         (&mut *self.fs, &mut *self.eng, self.owner)
+    }
+
+    /// Whether the connection this facade acts for has already been
+    /// torn down.
+    ///
+    /// A continuation runs after its owner may be gone - the sweep is
+    /// once per close and a completion it cancelled is what schedules
+    /// the continuation - so "my ops are failing" is the signal a task
+    /// is told to wind down on. Two shapes never see it: an offload is
+    /// never cancelled and always delivers, and
+    /// a timer armed *after* the sweep expires normally. A task built
+    /// from either would otherwise run for a dead connection
+    /// indefinitely, holding a graceful drain open with it.
+    ///
+    /// Submitting is still allowed here, and that is deliberate: a
+    /// handler finishing work it already accepted - the last write of
+    /// an upload, the rename that publishes it - is not undone by the
+    /// peer hanging up. This says the peer is gone; what is worth
+    /// finishing for it is the caller's judgement.
+    ///
+    /// Always `false` where the reactor has no owners (a standalone
+    /// [`UringFs`](super::UringFs), whose whole loop is the lifetime).
+    pub fn owner_is_gone(&self) -> bool {
+        self.fs.owner_is_gone(self.owner)
     }
 
     /// A second facade over the same delivery, for a step that dispatches
@@ -2032,7 +2140,7 @@ impl<'a> FsConn<'a> {
         // client facade survives.
         super::confine_resolve(&mut raw.resolve);
         let guarded = super::apply_special_file_guard(&mut raw, special);
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_open(
             self.eng,
             who.0,
@@ -2040,7 +2148,7 @@ impl<'a> FsConn<'a> {
             path.to_owned(),
             raw,
             guarded,
-            embed(self.owner, sink, on_done),
+            w,
         );
     }
 
@@ -2186,7 +2294,9 @@ impl<'a> FsConn<'a> {
     ///
     /// Every step is confined by [`CONFINED_RESOLVE`], unioned rather
     /// than assigned, and every step but the last is forced
-    /// `O_DIRECTORY`. A step that creates is refused at entry, before
+    /// `O_DIRECTORY`. A step that creates, or that states
+    /// `RESOLVE_IN_ROOT` - which the kernel refuses to pair with the
+    /// `RESOLVE_BENEATH` unioned here - is refused at entry, before
     /// anything is submitted, so a bad argument cannot leave a
     /// half-walked chain behind.
     pub fn open_chain<F>(
@@ -2215,6 +2325,24 @@ impl<'a> FsConn<'a> {
                 return;
             }
             if creation_refused(step.how.to_raw().flags) {
+                return;
+            }
+            // `chain` unions `CONFINED_RESOLVE` onto every step, and
+            // `RESOLVE_BENEATH` is in it: "Scoping flags are mutually
+            // exclusive" (`build_open_flags`, `fs/open.c:1263-1265`), so
+            // a caller's `RESOLVE_IN_ROOT` makes every step `EINVAL` -
+            // and with `was_refused` false, which tells the caller the
+            // *kernel* objected to their path when this crate added the
+            // bit that made it object. Screened here rather than fixed
+            // up in `chain`, on `mkdir_path`'s rule: routing through
+            // `confine_resolve` instead would union only
+            // `CONFINED_HARDENING` once a policy bit is set, silently
+            // dropping the `RESOLVE_NO_SYMLINKS` a multi-personality
+            // chain needs more rather than less.
+            if step.how.to_raw().resolve
+                & crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT.bits()
+                != 0
+            {
                 return;
             }
         }
@@ -2246,16 +2374,9 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
-        self.fs.submit_open(
-            self.eng,
-            who.0,
-            anchor,
-            path,
-            how,
-            guarded,
-            embed(self.owner, sink, on_done),
-        );
+        let w = self.waiter(on_done);
+        self.fs
+            .submit_open(self.eng, who.0, anchor, path, how, guarded, w);
     }
 
     /// Scattered positional read with per-operation flags (`preadv2(2)`).
@@ -2391,8 +2512,8 @@ impl<'a> FsConn<'a> {
                 None => Some(std::sync::Arc::new(LeaseHold(bid))),
             });
             if let (Some((_, taken)), Some(hold)) = (leased, hold) {
-                let sink = self.arm_fail_sink();
-                let w = embed(self.owner, sink, on_done);
+                let w = self.waiter(on_done);
+                let w = w;
                 match self.fs.submit_pwritev2_leased(
                     self.eng,
                     who.0,
@@ -2436,16 +2557,8 @@ impl<'a> FsConn<'a> {
     where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
-        self.fs.submit_fsync(
-            self.eng,
-            who.0,
-            f.fd,
-            false,
-            0,
-            0,
-            embed(self.owner, sink, on_done),
-        );
+        let w = self.waiter(on_done);
+        self.fs.submit_fsync(self.eng, who.0, f.fd, false, 0, 0, w);
     }
 
     /// Flush `f`'s data and essential metadata (`fdatasync`) as `who`.
@@ -2453,16 +2566,8 @@ impl<'a> FsConn<'a> {
     where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
-        self.fs.submit_fsync(
-            self.eng,
-            who.0,
-            f.fd,
-            true,
-            0,
-            0,
-            embed(self.owner, sink, on_done),
-        );
+        let w = self.waiter(on_done);
+        self.fs.submit_fsync(self.eng, who.0, f.fd, true, 0, 0, w);
     }
 
     /// Fire `on_done` after `after`: one relative, one-shot
@@ -2470,19 +2575,40 @@ impl<'a> FsConn<'a> {
     /// expires. No fd and no personality ride it - a timer touches
     /// nothing a credential guards - so this is the retry-tick and
     /// deadline primitive: a caller that must try again later re-arms
-    /// here instead of sleeping an offload worker. A timer cancelled in
-    /// flight completes `ECANCELED`; an owner gone before expiry drops
-    /// the callback, like any continuation's.
-    pub fn timeout<F>(&mut self, after: std::time::Duration, on_done: F)
+    /// here instead of sleeping an offload worker. An owner gone before
+    /// expiry drops the callback, like any continuation's.
+    ///
+    /// **A timer holds its op slot for its whole wall-clock duration**,
+    /// which no other op on this facade does - a read holds one until
+    /// the I/O completes, and the table is sized on that. So a deadline
+    /// armed for 30 s and reached in 3 ms costs the other 29.997 s of
+    /// the handler budget unless it is retracted, which is what the
+    /// returned [`Timer`] is for. `None` means the table refused the
+    /// arm; `on_done` has already been answered `EBUSY`.
+    pub fn timeout<F>(
+        &mut self,
+        after: std::time::Duration,
+        on_done: F,
+    ) -> Option<Timer>
     where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
-        self.fs.submit_timeout(
-            self.eng,
-            after,
-            embed(self.owner, sink, on_done),
-        );
+        let w = self.waiter(on_done);
+        self.fs.submit_timeout(self.eng, after, w).map(Timer)
+    }
+
+    /// Retract a timer armed by [`timeout`](Self::timeout), freeing its
+    /// op slot ahead of its expiry.
+    ///
+    /// The timer completes `ECANCELED` and `on_done` fires with it, so
+    /// a caller still gets exactly one answer per arm - which is why
+    /// this is the retraction rather than a way to make one vanish.
+    /// Best-effort and idempotent: a [`Timer`] that has already fired
+    /// names a generation the slot no longer carries, so the kernel
+    /// finds nothing and the cancel is inert. Nothing is reported
+    /// either way; the answer arrives at `on_done`.
+    pub fn cancel_timeout(&mut self, timer: Timer) {
+        self.fs.submit_cancel(self.eng, timer.0);
     }
 
     /// Flush the byte range `[offset, offset + length)` of `f` as `who`
@@ -2499,16 +2625,9 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
-        self.fs.submit_fsync(
-            self.eng,
-            who.0,
-            f.fd,
-            datasync,
-            offset,
-            length,
-            embed(self.owner, sink, on_done),
-        );
+        let w = self.waiter(on_done);
+        self.fs
+            .submit_fsync(self.eng, who.0, f.fd, datasync, offset, length, w);
     }
 
     /// Stat the entry `leaf` inside `anchor` as `who` (no terminal-symlink
@@ -2524,7 +2643,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_path_op(
             self.eng,
             TAG_STATX,
@@ -2535,7 +2654,7 @@ impl<'a> FsConn<'a> {
             None,
             statx_at_flags(flags),
             mask.bits(),
-            embed(self.owner, sink, on_done),
+            w,
         );
     }
 
@@ -2550,7 +2669,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_path_op(
             self.eng,
             TAG_STATX,
@@ -2561,7 +2680,7 @@ impl<'a> FsConn<'a> {
             None,
             statx_at_flags(flags | AtFlags::AT_EMPTY_PATH),
             mask.bits(),
-            embed(self.owner, sink, on_done),
+            w,
         );
     }
 
@@ -2621,13 +2740,13 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_fgetxattr_as_root(
             self.eng,
             f.fd,
             name.to_owned(),
             buf,
-            embed(self.owner, sink, on_done),
+            w,
         );
     }
 
@@ -2891,7 +3010,7 @@ impl<'a> FsConn<'a> {
         if target.to_bytes().is_empty() {
             return;
         }
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_path_op(
             self.eng,
             TAG_SYMLINKAT,
@@ -2902,7 +3021,7 @@ impl<'a> FsConn<'a> {
             Some(leaf.to_cstring()),
             0,
             0,
-            embed(self.owner, sink, on_done),
+            w,
         );
     }
 
@@ -2961,14 +3080,14 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_linkat_file(
             self.eng,
             who.0,
             f.fd,
             new.clone(),
             new_leaf.to_cstring(),
-            embed(self.owner, sink, on_done),
+            w,
         );
     }
 
@@ -2994,7 +3113,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_rw(
             self.eng,
             tag,
@@ -3003,7 +3122,7 @@ impl<'a> FsConn<'a> {
             bufs,
             off,
             rw_flags.bits(),
-            embed(self.owner, sink, on_done),
+            w,
         );
     }
 
@@ -3022,18 +3141,9 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_fd_meta(
-            self.eng,
-            tag,
-            who.0,
-            f.fd,
-            name,
-            value,
-            off,
-            len64,
-            aux32,
-            embed(self.owner, sink, on_done),
+            self.eng, tag, who.0, f.fd, name, value, off, len64, aux32, w,
         );
     }
 
@@ -3052,7 +3162,7 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let sink = self.arm_fail_sink();
+        let w = self.waiter(on_done);
         self.fs.submit_path_op(
             self.eng,
             tag,
@@ -3063,7 +3173,7 @@ impl<'a> FsConn<'a> {
             n2,
             flags,
             len_arg,
-            embed(self.owner, sink, on_done),
+            w,
         );
     }
 }
@@ -3158,7 +3268,7 @@ fn chain(
     let Some(step) = steps.pop_front() else {
         // Entry validated a non-empty list. Answered rather than
         // dropped: a dropped callback closes the connection.
-        return on_done(FsDone::failed(Errno::EINVAL), conn);
+        return on_done(FsDone::refused(Errno::EINVAL), conn);
     };
     let last = steps.is_empty();
     let mut raw = step.how.to_raw();
@@ -3195,11 +3305,14 @@ fn chain(
             {
                 path
             }
-            Ok(_) => return on_done(FsDone::failed(Errno::EINVAL), conn),
+            Ok(_) => return on_done(FsDone::refused(Errno::EINVAL), conn),
+            // Forwarded, not refused: the errno is the caller's own
+            // closure's, and marking it would have this crate claim a
+            // verdict it did not reach.
             Err(crate::Error::Errno(e)) => {
                 return on_done(FsDone::failed(e), conn);
             }
-            Err(_) => return on_done(FsDone::failed(Errno::EINVAL), conn),
+            Err(_) => return on_done(FsDone::refused(Errno::EINVAL), conn),
         },
     };
     // Carried onto every step's facade: the second and later steps
@@ -3216,7 +3329,7 @@ fn chain(
         }
         match Anchor::from_file(&f) {
             Ok(next) => chain(conn, next, steps, on_done, sink),
-            Err(_) => on_done(FsDone::failed(Errno::EBADF), conn),
+            Err(_) => on_done(FsDone::refused(Errno::EBADF), conn),
         }
     });
 }
@@ -3239,11 +3352,11 @@ fn walk(
     let Some(part) = parts.pop_front() else {
         // Entry validated a non-empty list. Answered rather than dropped:
         // a dropped callback closes the connection.
-        return on_done(FsDone::failed(Errno::EINVAL), conn);
+        return on_done(FsDone::refused(Errno::EINVAL), conn);
     };
     let bytes = part.clone().into_bytes();
     let Ok(leaf) = Leaf::new(&bytes) else {
-        return on_done(FsDone::failed(Errno::EINVAL), conn);
+        return on_done(FsDone::refused(Errno::EINVAL), conn);
     };
     let at = cur.clone();
     // Carried onto every step's facade, for `chain`'s reason.
@@ -3268,7 +3381,7 @@ fn walk(
                 Ok(next) => {
                     walk(conn, who, next, parts, mode, how, on_done, sink)
                 }
-                Err(_) => on_done(FsDone::failed(Errno::EBADF), conn),
+                Err(_) => on_done(FsDone::refused(Errno::EBADF), conn),
             }
         });
     });
@@ -3864,16 +3977,10 @@ mod hybrid_tests {
         dir
     }
 
-    /// Run `f` with this thread's panic printing silenced, serialized
-    /// against every other hook-swapping test: installing a hook is
-    /// process-global and tests run as threads in one binary, so two
-    /// unserialized swaps can interleave and strand one of them. The
-    /// filter forwards other threads' panics, so a concurrent test's
-    /// real failure still names itself; a panic inside `f` restores the
-    /// hook on the way out.
+    /// Run `f` with this thread's panic printing silenced. The guard
+    /// carries its own serialization now (see
+    /// `quiet_panics_on_this_thread`), so this is only the shorthand.
     fn with_silent_panics<R>(f: impl FnOnce() -> R) -> R {
-        static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _serialized = HOOK.lock().unwrap_or_else(|e| e.into_inner());
         let _quiet = crate::uring_fs::quiet_panics_on_this_thread();
         f()
     }
@@ -4084,6 +4191,62 @@ mod hybrid_tests {
         assert_eq!(*got.borrow(), Some(true), "the chain resolved");
     }
 
+    /// A screen that fires mid-chain refuses the way the same screen
+    /// refuses at entry.
+    ///
+    /// `..` in a component is refused at `open_chain`'s entry - where
+    /// nothing is submitted, nothing arms the sink, and `FsConn::fut`
+    /// synthesises the marked `EINVAL`
+    /// (`a_refused_errno_is_marked_as_this_crates_own`) - and again on
+    /// a name the caller's `DeriveName` produces after a step has
+    /// opened. The second is a real completion answered by `chain`, so
+    /// it has to carry the mark itself; without it the same defect
+    /// reads as this crate's verdict at entry and as the kernel's three
+    /// steps in, and an awaiting task takes the second for teardown.
+    #[test]
+    fn a_mid_chain_screen_refuses_the_way_the_entry_screen_does() {
+        let (mut eng, mut fs, me) = setup();
+        let dir = nested();
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let mid: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
+        let m2 = mid.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                c.open_chain(
+                    &at,
+                    vec![
+                        OpenStep {
+                            path: StepPath::Fixed(c"a".to_owned()),
+                            who: me,
+                            how: OpenHow::new()
+                                .flags(OFlag::O_PATH | OFlag::O_DIRECTORY),
+                        },
+                        OpenStep {
+                            path: StepPath::Derived(Box::new(|_| {
+                                Ok(c"../escape".to_owned())
+                            })),
+                            who: me,
+                            how: OpenHow::new().flags(OFlag::O_RDONLY),
+                        },
+                    ],
+                    move |res, _c| *m2.borrow_mut() = Some(res),
+                );
+            },
+            || mid.borrow().is_some(),
+        );
+        let mid = mid.borrow_mut().take().expect("the chain answered");
+        assert!(
+            matches!(mid.result(), Err(crate::Error::Errno(Errno::EINVAL))),
+            "the mid-chain screen refuses the same defect"
+        );
+        assert!(
+            mid.was_refused(),
+            "a mid-chain refusal must not read as the kernel's verdict"
+        );
+    }
+
     /// Every refusal is judged on shape at entry, before anything is
     /// submitted, so a bad argument cannot leave a half-walked chain.
     #[test]
@@ -4118,6 +4281,22 @@ mod hybrid_tests {
                         who: me,
                         how: plain(),
                     },
+                ],
+            ),
+            (
+                // `chain` unions RESOLVE_BENEATH, and the kernel
+                // refuses the pair ("Scoping flags are mutually
+                // exclusive", `fs/open.c:1263-1265`) - so every step
+                // would answer EINVAL, blaming the kernel for a bit
+                // this crate added.
+                "a step scoped to a root",
+                vec![
+                    dirstep(
+                        plain().resolve(
+                            crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT,
+                        ),
+                    ),
+                    dirstep(plain()),
                 ],
             ),
             (
@@ -4522,6 +4701,14 @@ fn deliver(
     refused: bool,
 ) {
     match waiter {
+        // A refusal is *not* marked on the way out here, and the
+        // asymmetry with the arm below is deliberate rather than
+        // missed. The blocking path's public signatures return
+        // `crate::Result`, so there is nowhere to put the bit without
+        // redesigning them; `FsHandle::path_op` carries the rule a
+        // caller needs instead, and names the facade path that does
+        // report provenance. Surface it here the day a channel
+        // consumer can act on it.
         Some(FsWaiter::Channel(tx)) => {
             let _ = tx.send(FsOutcome::new(res, bufs, file, stat));
         }
@@ -4883,8 +5070,13 @@ mod routing_fuzz {
                 off,
                 0,
                 std::sync::Arc::clone(&hold),
-                // No facade here to arm from; see `Armed`.
-                embed(Some((0, 0)), Armed(None), |_d, _fs| {}),
+                // No facade here, so no sink to arm from; every
+                // shipping submission goes through `FsConn::waiter`.
+                FsWaiter::Embedded {
+                    owner: Some((0, 0)),
+                    cb: Box::new(|_d, _fs| {}),
+                    on_fail: None,
+                },
             );
             assert!(staged.is_ok(), "staged");
         }
@@ -5392,6 +5584,129 @@ mod routing_fuzz {
         submit(&mut core, &mut eng).expect("freed slot serves the next");
     }
 
+    /// The sweep leaves a signal behind, because it cannot leave a
+    /// gate behind.
+    ///
+    /// It runs once per close and a continuation woken by one of its
+    /// own cancellations submits after it, so nothing stops a task
+    /// whose awaits cannot fail - an offload always delivers, a timer
+    /// armed afterwards expires normally - from running for a
+    /// connection that is gone. `owner_is_gone` is what such a task
+    /// asks, and it must answer for the swept tenant of a slot without
+    /// answering for the next one to take it.
+    #[test]
+    fn a_swept_owner_is_visible_to_what_runs_after_the_sweep() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(4, OffloadBounds::default());
+        let gone = (7u32, 3u64);
+
+        assert!(!core.owner_is_gone(Some(gone)), "nothing swept yet");
+        core.cancel_owned_by(&mut eng, vec![gone]);
+        assert!(core.owner_is_gone(Some(gone)), "the swept owner is gone");
+
+        // A slot is reused, and its next tenant is not the one swept.
+        assert!(
+            !core.owner_is_gone(Some((gone.0, gone.1 + 1))),
+            "a later tenant of the same slot is live"
+        );
+        // Every earlier tenant closed before this one did.
+        assert!(
+            core.owner_is_gone(Some((gone.0, gone.1 - 1))),
+            "a tenant before the swept one is gone too"
+        );
+        assert!(!core.owner_is_gone(Some((8, 3))), "another slot is its own");
+        assert!(
+            !core.owner_is_gone(None),
+            "a reactor with no owners has no connection to lose"
+        );
+
+        // And the facade a continuation is handed reads it.
+        let conn = FsConn::new(&mut core, &mut eng, Some(gone));
+        assert!(conn.owner_is_gone(), "the continuation facade answers");
+    }
+
+    /// One sweep reaches every closed owner's ops, and an idle table
+    /// costs nothing to sweep.
+    ///
+    /// A close is recorded whether or not the handler opened anything,
+    /// so on a busy server the batch is ordinary and the table is
+    /// `fs_ops + pool_size` deep - 28k+ entries at a real consumer's
+    /// configuration. Per-owner scanning walked all of it once per
+    /// close, on the reactor thread.
+    #[test]
+    fn one_sweep_covers_the_batch_and_an_idle_table_is_free() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let all_free = core.op_free_len_for_test();
+
+        // Nothing in flight: the sweep records and returns.
+        core.cancel_owned_by(&mut eng, vec![(1, 1), (2, 1), (3, 1)]);
+        assert!(core.owner_is_gone(Some((2, 1))), "recorded regardless");
+        assert_eq!(core.op_free_len_for_test(), all_free, "nothing taken");
+
+        // Four owners with a parked pipe read each: only a cancel can
+        // complete one, so what is left in flight names the batch.
+        let mut fds = [0i32; 2];
+        // SAFETY: `pipe(2)` fills {read, write}.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        // SAFETY: the fresh read end, owned here; the write end stays
+        // open so no read EOFs, and both close with the process.
+        let file =
+            File::new(Arc::new(unsafe { crate::fd::owned_from_raw(fds[0]) }));
+        let owners = [(10u32, 1u64), (11, 1), (12, 1), (13, 1)];
+        for o in owners {
+            core.submit_pump_read(
+                &mut eng,
+                &file,
+                PumpDest::Owned(Vec::with_capacity(8)),
+                8,
+                u64::MAX,
+                o,
+            )
+            .expect("submit");
+        }
+        assert_eq!(inflight(&core).len(), 4, "four parked reads");
+
+        // One call for three of them; the fourth is untouched.
+        core.cancel_owned_by(&mut eng, vec![(10, 1), (11, 1), (12, 1)]);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut reaped = Vec::new();
+        while reaped.len() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "one sweep did not reach the whole batch: {reaped:?}"
+            );
+            eng.ring.submit().expect("submit");
+            let Some(cqe) = eng.ring.reap() else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            };
+            let (tag, slot, g) = unpack_raw(cqe.user_data);
+            if let ReapedFs::Pump(_, owner) =
+                core.on_cqe(&mut eng, tag, slot, g, cqe.res)
+            {
+                reaped.push(owner);
+            }
+        }
+        reaped.sort_unstable();
+        assert_eq!(
+            reaped,
+            vec![(10, 1), (11, 1), (12, 1)],
+            "exactly the batch"
+        );
+        assert_eq!(inflight(&core).len(), 1, "the owner outside it stays");
+        assert!(
+            core.owner_is_gone(Some((11, 1)))
+                && !core.owner_is_gone(Some((13, 1))),
+            "and the record is exactly the batch too"
+        );
+    }
+
     #[test]
     fn cancel_owned_by_reaches_a_pump_read() {
         // Connection teardown's sweep cancels fs ops by owner; a pump read
@@ -5421,7 +5736,7 @@ mod routing_fuzz {
         )
         .expect("submit");
         assert_eq!(Arc::strong_count(&file.fd), 2, "op parks its clone");
-        core.cancel_owned_by(&mut eng, (5, 9));
+        core.cancel_owned_by(&mut eng, vec![(5, 9)]);
 
         // Reap until the read's own CQE routes (the cancel's is inert).
         //

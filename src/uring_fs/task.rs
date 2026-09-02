@@ -79,6 +79,11 @@
 //!   gone mid-chain - a task must tolerate too. A task ends by
 //!   returning; there is no external kill, so a task must terminate
 //!   when its ops start failing or the source feeding it closes.
+//!   **Neither of those reaches a task whose awaits are all
+//!   offloads**, because an offload is never cancelled and always
+//!   delivers, so that shape has to ask - with
+//!   [`TaskFs::owner_is_gone`]. A task that never winds down holds a
+//!   graceful drain open to its grace deadline.
 //! - **A task's facade carries no recv-buffer claim**, so
 //!   [`pwritev2_from`](FsConn::pwritev2_from) from inside a task
 //!   copies instead of writing the delivered buffer in place. The
@@ -139,10 +144,16 @@ impl<V> Slot<V> {
         Rc::new(Slot(RefCell::new(SlotState::Pending(None))))
     }
 
-    /// A slot born resolved-as-gone, for a submission that never
-    /// happened ([`TaskFs`] reached outside a poll).
+    /// A slot born resolved-as-gone: teardown took the submission, and
+    /// there is nothing to say about it beyond that.
     fn gone() -> Rc<Slot<V>> {
         Rc::new(Slot(RefCell::new(SlotState::Gone)))
+    }
+
+    /// A slot born already holding `v`, for an answer settled before
+    /// any op could exist - see [`no_facade`].
+    fn ready(v: V) -> Rc<Slot<V>> {
+        Rc::new(Slot(RefCell::new(SlotState::Ready(v))))
     }
 
     /// Fill with the outcome (`None` = the callback dropped unfired)
@@ -376,11 +387,12 @@ impl FsConn<'_> {
     /// future. `submit` receives this facade and the boxed callback to
     /// pass as the op's `on_done`:
     ///
-    /// ```ignore
-    /// let done = conn
-    ///     .fut(|c, done| c.fsync(who, file.clone(), done))
-    ///     .await;
-    /// done.result()?;
+    /// ```no_run
+    /// # use truenas_ros::uring_fs::{File, Personality, TaskFs};
+    /// # async fn body(t: TaskFs, who: Personality, file: File) {
+    /// let done = t.fut(|c, done| c.fsync(who, file.clone(), done)).await;
+    /// let _ = done.result();
+    /// # }
     /// ```
     ///
     /// Submission happens inside this call - the op is in flight when
@@ -388,6 +400,13 @@ impl FsConn<'_> {
     /// futures created back to back overlap on the ring. A `submit`
     /// that drops `on_done` without passing it anywhere resolves the
     /// future as `ECANCELED`.
+    ///
+    /// **`submit` submits exactly one op.** The reason sink staged here
+    /// lives on the facade, so *any* submission the closure makes arms
+    /// it and a refusal of the wrong one fills this slot - reporting an
+    /// errno for an op that is still in flight, whose real completion
+    /// then lands in a settled slot and is discarded. Submit the extra
+    /// op before or after the call, not inside it.
     pub fn fut(
         &mut self,
         submit: impl FnOnce(&mut FsConn<'_>, OnDone),
@@ -448,19 +467,38 @@ impl FsConn<'_> {
     /// way: `fremovexattr`'s allowlist and `open_dir`'s per-request
     /// `open` are reactor state a pool job cannot see.
     ///
-    /// ```ignore
-    /// let st = conn.result_fut(|c, cb| c.fstatfs(file.clone(), cb)).await?;
+    /// ```no_run
+    /// # use truenas_ros::uring_fs::{File, TaskFs};
+    /// # async fn body(t: TaskFs, file: File) -> truenas_ros::Result<()> {
+    /// let st = t.result_fut(|c, cb| c.fstatfs(file.clone(), cb)).await?;
+    /// # let _ = st;
+    /// # Ok(())
+    /// # }
     /// ```
     ///
-    /// Submission is eager on the same terms as [`fut`](Self::fut). **No
-    /// reason sink is staged**, so a refusal on this shape resolves
-    /// `ECANCELED` rather than naming itself. Eight of the nine deliver
-    /// through the offload pool, where a refusal has no errno to carry
-    /// and `ECANCELED` is already
-    /// [`offload_fut`](Self::offload_fut)'s answer; `open_dir` is the
-    /// exception - its first step is a ring `open`, so a full op table
-    /// reaches this future as teardown would. Await the `open` yourself
-    /// with [`fut`](Self::fut) if that distinction matters.
+    /// The one-op rule on [`fut`](Self::fut)'s `submit` applies here
+    /// too, and for the same reason.
+    ///
+    /// Submission is eager on the same terms as [`fut`](Self::fut), and
+    /// it stages a reason sink for the same reason - `open_dir`'s first
+    /// step is a ring `open`, so a full op table refuses this shape too
+    /// and would otherwise reach the future as `ECANCELED`, which
+    /// [`FsFuture`] reserves for teardown.
+    ///
+    /// **Staging is what keeps the sink from being ambient.** The sink
+    /// lives on the facade, because a multi-step call's later steps
+    /// submit from a fresh one; so a submission made inside *another*
+    /// future's `submit` closure arms whatever is staged, and without a
+    /// frame of its own this call would fill the enclosing future's
+    /// slot with its own refusal while the enclosing op was still in
+    /// flight. It does not copy [`fut`](Self::fut)'s "nothing armed, so
+    /// nothing will ever answer" rule: eight of the nine methods here
+    /// never reach the op table at all, so on this shape an unarmed
+    /// sink is the ordinary case rather than a refused argument.
+    ///
+    /// Eight of the nine deliver through the offload pool, where a
+    /// refusal has no errno to carry and the future resolves
+    /// `ECANCELED` as [`offload_fut`](Self::offload_fut) does.
     pub fn result_fut<T, S>(&mut self, submit: S) -> OffloadFuture<T>
     where
         S: FnOnce(&mut FsConn<'_>, OnResult<T>),
@@ -468,7 +506,12 @@ impl FsConn<'_> {
     {
         let slot = Slot::new();
         let fire = Fire(Some(Rc::clone(&slot)));
+        let reason = Rc::clone(&slot);
+        let outer = self.stage_fail_sink(Rc::new(move |errno, _bufs| {
+            reason.fill(Some(Err(errno.into())));
+        }));
         submit(self, Box::new(move |r, _conn| fire.fire(r)));
+        self.restore_fail_sink(outer);
         OffloadFuture(slot)
     }
 
@@ -486,8 +529,9 @@ impl FsConn<'_> {
     /// one run from completion delivery, each with a fresh facade for
     /// the same owner. A task ends by returning. There is no external
     /// kill; a task whose connection died sees its ops fail and must
-    /// wind down on that signal. Whatever outlives the loop is dropped
-    /// with the reactor's tables at teardown.
+    /// wind down on that signal - or, where its awaits cannot fail,
+    /// asks [`TaskFs::owner_is_gone`]. Whatever outlives the loop is
+    /// dropped with the reactor's tables at teardown.
     ///
     /// The returned [`JoinHandle`] resolves with the task's output.
     /// Dropping it detaches: the task runs to completion regardless
@@ -722,6 +766,25 @@ impl std::fmt::Debug for TaskFs {
     }
 }
 
+/// The slot a [`TaskFs`] call answers with when it cannot reach a
+/// facade, which happens for two unrelated reasons.
+///
+/// Teardown is [`Slot::gone`]: it polls as `ECANCELED` with
+/// [`FsDone::was_refused`] false, which is this module's one meaning for
+/// "the reactor is going away" and the signal a consumer winds down on.
+/// The other reason is this handle being used out of turn - moved into
+/// `'static` state and submitted through from somewhere else - and
+/// reporting *that* as teardown tells a release build to shut a healthy
+/// server down over a caller's bug. `refused` names the caller instead,
+/// on the same rule as every other submission the crate itself refuses.
+fn no_facade<V>(refused: impl FnOnce() -> V) -> Rc<Slot<V>> {
+    if tearing_down() {
+        Slot::gone()
+    } else {
+        Slot::ready(refused())
+    }
+}
+
 impl TaskFs {
     fn new() -> TaskFs {
         TaskFs {
@@ -731,6 +794,11 @@ impl TaskFs {
     }
 
     /// [`FsConn::fut`] against the running poll's facade.
+    ///
+    /// Using this handle outside its own task's poll submits nothing
+    /// and resolves `EINVAL` with [`FsDone::was_refused`] true; the
+    /// same misuse at teardown resolves `ECANCELED` instead, which is
+    /// this module's one meaning for "the reactor is going away".
     pub fn fut(
         &self,
         submit: impl FnOnce(&mut FsConn<'_>, OnDone),
@@ -742,12 +810,18 @@ impl TaskFs {
                     tearing_down(),
                     "TaskFs::fut with no facade: outside its task's poll, or nested inside a call already holding it"
                 );
-                FsFuture(Slot::gone())
+                FsFuture(no_facade(|| {
+                    FsDone::refused_with(Errno::EINVAL, Vec::new())
+                }))
             }
         }
     }
 
     /// [`FsConn::offload_fut`] against the running poll's facade.
+    ///
+    /// Misuse resolves `EINVAL` and teardown `ECANCELED`, as
+    /// [`fut`](Self::fut) does - the errno is the whole distinction
+    /// here, since a [`crate::Result`] carries no provenance bit.
     pub fn offload_fut<T, J>(&self, job: J) -> OffloadFuture<T>
     where
         J: FnOnce() -> crate::Result<T> + Send + 'static,
@@ -760,12 +834,15 @@ impl TaskFs {
                     tearing_down(),
                     "TaskFs::offload_fut with no facade: outside its task's poll, or nested inside a call already holding it"
                 );
-                OffloadFuture(Slot::gone())
+                OffloadFuture(no_facade(|| Err(Errno::EINVAL.into())))
             }
         }
     }
 
     /// [`FsConn::result_fut`] against the running poll's facade.
+    ///
+    /// Misuse resolves `EINVAL` and teardown `ECANCELED`; see
+    /// [`offload_fut`](Self::offload_fut).
     pub fn result_fut<T, S>(&self, submit: S) -> OffloadFuture<T>
     where
         S: FnOnce(&mut FsConn<'_>, OnResult<T>),
@@ -778,9 +855,26 @@ impl TaskFs {
                     tearing_down(),
                     "TaskFs::result_fut with no facade: outside its task's poll, or nested inside a call already holding it"
                 );
-                OffloadFuture(Slot::gone())
+                OffloadFuture(no_facade(|| Err(Errno::EINVAL.into())))
             }
         }
+    }
+
+    /// [`FsConn::owner_is_gone`] against the running poll's facade -
+    /// the wind-down signal for a task whose awaits never fail.
+    ///
+    /// This module's contract says a task "must terminate when its ops
+    /// start failing or the source feeding it closes", and for a task
+    /// awaiting only offloads neither is ever true: an offload is never
+    /// cancelled and always delivers. Such a task keeps running for a
+    /// dead connection, stays counted in the live gauge, and holds a
+    /// graceful drain open until the grace period ends it. Poll this
+    /// between awaits and return.
+    ///
+    /// `true` outside a poll as well, since a handle that cannot reach
+    /// its facade has nothing left to do either.
+    pub fn owner_is_gone(&self) -> bool {
+        with_conn(self.task, |conn| conn.owner_is_gone()).unwrap_or(true)
     }
 
     /// [`FsConn::spawn`] against the running poll's facade: the child
@@ -834,9 +928,9 @@ pub(crate) struct RunShared {
     /// Set for the extent of a [`drain`] pass. A wake landing inside a
     /// pass is taken by that pass or by its trailing poke; a wake
     /// landing outside one has nothing scheduled to collect it, so it
-    /// must poke for itself. Nested passes clear it early, which can
-    /// only cause a redundant poke - never a missed one - so the flag
-    /// needs no depth count.
+    /// must poke for itself. Written only through
+    /// [`RunShared::begin_pass`] and [`PassGuard`], so the models and
+    /// the loop share one spelling of the ordering.
     draining: AtomicBool,
     /// The loop's shared flags and wake eventfd.
     wake: Arc<LoopShared>,
@@ -856,6 +950,19 @@ impl RunShared {
     /// Whether the caller is off the loop thread. Under loom there is
     /// no thread identity to read, so a model states which side it is
     /// exercising; both are modelled.
+    /// Mark a drain pass live, answering what was there before so
+    /// [`PassGuard`] can put it back.
+    ///
+    /// A nested pass - a callback calling
+    /// [`run_woken`](FsConn::run_woken) from inside a delivery - must
+    /// not un-mark the outer one when it ends: the outer pass's
+    /// remaining deliveries would then poke the loop for work the
+    /// outer pass is already about to do. Restoring rather than
+    /// clearing is one word here and removes the depth question.
+    fn begin_pass(&self) -> bool {
+        self.draining.swap(true, Ordering::AcqRel)
+    }
+
     fn off_loop(&self) -> bool {
         #[cfg(loom)]
         {
@@ -947,8 +1054,26 @@ pub(crate) fn wake_task(w: &TaskWake) -> bool {
 /// it was announcing. Clearing after the poll is the lost-wakeup bug
 /// the loom model bites on; the pairing lives here, once, so the model
 /// drives the shipping order rather than a copy of it.
+///
+/// **A swap, not a store, because this is the acquire half of the
+/// dedup edge.** A wake that finds the flag already set
+/// ([`wake_task`]'s early return) touches nothing else: it does not
+/// take the run-queue lock, so the lock is not there to carry what the
+/// waker published before waking, and the covering poll is this one. A
+/// plain store cannot read the release that skipping waker performed,
+/// so it establishes no happens-before and the poll may run against
+/// stale data. tokio writes its state back unchanged on exactly this
+/// path for exactly this reason (`runtime/task/state.rs`,
+/// "to pair with the Acquire in `transition_to_running`").
+///
+/// In-tree no waker leaves the loop thread - every [`Slot`] is a
+/// `RefCell` behind an `Rc` and the only production `wake()` is inside
+/// [`Slot::fill`] - so this pairs nothing today. It is the public
+/// [`Waker`] surface that makes it reachable: an off-loop lock-free
+/// waker is what a consumer may legitimately build, and its readiness
+/// would otherwise be invisible to the poll that is meant to cover it.
 pub(crate) fn poll_window<R>(w: &TaskWake, poll: impl FnOnce() -> R) -> R {
-    w.queued.store(false, Ordering::Release);
+    w.queued.swap(false, Ordering::AcqRel);
     poll()
 }
 
@@ -1005,11 +1130,42 @@ impl Drop for Tasks {
     /// is the last field of `FsCore` and nothing above it has a `Drop`,
     /// so `ops` and `offload_reg` are already destroyed by the time this
     /// runs and the facade would name a dead op table.
+    ///
+    /// **Dropped one task at a time, each contained.** A destructor
+    /// here runs with no poll on the stack, so nothing else would catch
+    /// it: one task's unwinding guard would escape this `Drop` impl and
+    /// take every task after it, and when the teardown is itself an
+    /// unwind - the case the mark above exists for - a panic escaping a
+    /// `Drop` aborts and replaces the first panic's diagnosis with a
+    /// bare SIGABRT. That is the harm this whole function is about, so
+    /// suppressing only the assert it raised would be answering the
+    /// symptom. The payload goes to that task's own join handle, the
+    /// route [`poll_one`] already uses for a panicking poll.
     fn drop(&mut self) {
         let _restore = RestoreTeardown(TEARDOWN.with(|c| c.replace(true)));
         // Explicit, because the field's own drop glue runs *after* this
         // returns - by then the mark is cleared.
-        self.slots.clear();
+        for slot in &mut self.slots {
+            let Some(mut entry) = slot.entry.take() else {
+                continue;
+            };
+            // Held back so the sink survives its own entry's unwind,
+            // and dropped unfired otherwise - the future's `Fire` has
+            // already answered the handle by then.
+            let sink = entry.on_panic.take();
+            let unwound =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop(entry)
+                }));
+            if let (Err(payload), Some(sink)) = (unwound, sink) {
+                // Guarded on the same rule as `poll_one`'s: filling a
+                // detached handle's slot releases the last share of it,
+                // so the payload's own disposal must not unwind either.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || sink(payload),
+                ));
+            }
+        }
     }
 }
 
@@ -1123,13 +1279,16 @@ impl Tasks {
     }
 }
 
-/// Marks a drain pass live for [`wake_task`], and clears it however
-/// the pass ends.
-struct PassGuard(Arc<RunShared>);
+/// Puts the drain-pass mark back however the pass ends, an unwinding
+/// poll included: a flag left set would silence every later wake's
+/// poke, and a flag cleared by a *nested* pass would put the outer
+/// pass's remaining deliveries back to poking. See
+/// [`RunShared::begin_pass`].
+struct PassGuard(Arc<RunShared>, bool);
 
 impl Drop for PassGuard {
     fn drop(&mut self) {
-        self.0.draining.store(false, Ordering::Release);
+        self.0.draining.store(self.1, Ordering::Release);
     }
 }
 
@@ -1151,21 +1310,21 @@ impl Drop for PassGuard {
 /// none of that, and an awaited op should not either.
 ///
 /// A nested [`drain`] - a callback calling
-/// [`run_woken`](FsConn::run_woken) - clears the flag when it returns,
-/// which costs the redundant poke back for the rest of this pass and
-/// never a wake.
+/// [`run_woken`](FsConn::run_woken) - restores the mark rather than
+/// clearing it, so the rest of this pass keeps it.
 pub(crate) fn in_pass(
     fs: &mut FsCore,
     eng: &mut Engine,
     deliver: impl FnOnce(&mut FsCore, &mut Engine),
 ) {
-    let pass = fs.tasks.run.as_ref().map(Arc::clone);
-    if let Some(run) = &pass {
-        run.draining.store(true, Ordering::Release);
-    }
     // `None` where the reactor has never spawned a task, and there no
     // task wake can arrive.
-    let _pass = pass.map(PassGuard);
+    let _pass = fs
+        .tasks
+        .run
+        .as_ref()
+        .map(Arc::clone)
+        .map(|run| PassGuard(Arc::clone(&run), run.begin_pass()));
     deliver(fs, eng);
     drain(fs, eng);
 }
@@ -1190,10 +1349,7 @@ pub(crate) fn drain(fs: &mut FsCore, eng: &mut Engine) {
     if budget == 0 {
         return;
     }
-    run.draining.store(true, Ordering::Release);
-    // Cleared however the pass ends, an unwinding poll included: a
-    // flag left set would silence every later wake's poke.
-    let _pass = PassGuard(run);
+    let _pass = PassGuard(Arc::clone(&run), run.begin_pass());
     while budget > 0 {
         let Some(id) = fs.tasks.run.as_ref().and_then(|r| r.take_ready())
         else {
@@ -1269,13 +1425,18 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: TaskId) {
             // either. A sink already taken above is a `Ready` poll whose
             // output panicked on the way out - contained, and with the
             // handle gone there is nobody left to report it to.
+            // The future's own destructors are inside the guard too:
+            // an unwinding poll leaves the future half-dropped, and a
+            // guard in it that panics on the way out has nothing else
+            // catching it on the delivery path.
             let _ =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    if let Some(sink) = entry.on_panic.take() {
+                    let sink = entry.on_panic.take();
+                    drop(entry);
+                    if let Some(sink) = sink {
                         sink(payload);
                     }
                 }));
-            drop(entry);
             fs.tasks.retire(idx);
         }
     }
@@ -1292,6 +1453,15 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: TaskId) {
 // re-enqueued - never swallowed (`poll_window` clearing the dedup edge
 // *before* the poll). The models drive the shipping functions; a copy
 // of their ordering would stay green with the shipping half weakened.
+//
+// A third claim carries its *visibility*, and needs a different kind
+// of model. Liveness models assert delivery counts, and a count is
+// invariant under `Relaxed` - weaken every ordering here and they all
+// stay green, because nothing crosses the edge they model.
+// `loom_a_deduped_wake_publishes_what_it_wrote` carries a payload
+// across it and goes red on either half, which is the control
+// `CLAUDE.md` asks for. Add an ordering site here and it needs a model
+// of that second kind, or it is unchecked however many models pass.
 #[cfg(loom)]
 mod loom_tests {
     use super::*;
@@ -1393,8 +1563,9 @@ mod loom_tests {
                 run: Arc::clone(&run),
             });
 
-            // A pass is live for the whole race.
-            run.draining.store(true, Ordering::Release);
+            // A pass is live for the whole race, marked the way the
+            // loop marks it.
+            run.begin_pass();
             let t = {
                 let w = Arc::clone(&w);
                 loom::thread::spawn(move || wake_task(&w))
@@ -1571,6 +1742,77 @@ mod loom_tests {
             }
         });
     }
+
+    /// The covering poll sees what the wake published, on the path
+    /// where nothing else carries it.
+    ///
+    /// Every model above asserts a **count** - a wake is delivered, and
+    /// exactly once - and a count is invariant under `Relaxed`: weaken
+    /// every ordering in this module and they all stay green, because
+    /// no payload crosses the edge they model. This one carries one.
+    ///
+    /// The enqueueing wake needs no help: it pushes under
+    /// `RunShared::queue` and the pop takes the same lock, so the lock
+    /// is the happens-before. The **skipping** wake takes no lock -
+    /// [`wake_task`] returns straight off the swap - so the only edge
+    /// available is `queued` itself, and it exists only because
+    /// [`poll_window`] acquires there. Weaken either half to `Relaxed`
+    /// and this goes red; that is the control `CLAUDE.md` asks for, and
+    /// it is why the swap is not a store.
+    ///
+    /// The main thread latches the edge first, so the spawned wake is
+    /// the deduped one whenever loom schedules it before the window -
+    /// and where loom schedules it after, the flag is clear, the wake
+    /// enqueues, and the trailing drain polls it under the lock. Either
+    /// way the *last* poll is the covering one.
+    #[test]
+    fn loom_a_deduped_wake_publishes_what_it_wrote() {
+        bounded_model(|| {
+            let run = run_shared(true);
+            let w = Arc::new(TaskWake {
+                id: TaskId {
+                    idx: 0,
+                    generation: 0,
+                },
+                queued: AtomicBool::new(false),
+                run: Arc::clone(&run),
+            });
+            // What an off-loop waker publishes before waking: a plain
+            // cell with no ordering of its own, which is the shape a
+            // lock-free waker's readiness has.
+            let payload = Arc::new(AtomicUsize::new(0));
+
+            // Latch the edge, so the racing wake below has one to skip.
+            wake_task(&w);
+
+            let t = {
+                let w = Arc::clone(&w);
+                let p = Arc::clone(&payload);
+                loom::thread::spawn(move || {
+                    p.store(1, Ordering::Relaxed);
+                    wake_task(&w);
+                })
+            };
+
+            let mut last = 0usize;
+            let mut polls = 0usize;
+            while let Some(_id) = run.take_ready() {
+                last = poll_window(&w, || payload.load(Ordering::Relaxed));
+                polls += 1;
+            }
+            t.join().expect("waker thread");
+            // Whatever the racing wake enqueued, if anything.
+            while let Some(_id) = run.take_ready() {
+                last = poll_window(&w, || payload.load(Ordering::Relaxed));
+                polls += 1;
+            }
+            assert!(polls >= 1, "the latched wake was never polled");
+            assert_eq!(
+                last, 1,
+                "the poll covering the wake did not see what it published"
+            );
+        });
+    }
 }
 
 // ---- tests ----------------------------------------------------------------
@@ -1725,6 +1967,77 @@ mod tests {
         );
     }
 
+    /// A deadline reached early gives its op slot back, instead of
+    /// holding it for the wall-clock time it was armed for.
+    ///
+    /// Every other op on this facade holds a slot until an I/O
+    /// completes, and the table is sized on that. A timer holds one for
+    /// its whole duration, so a handler arming a 30 s deadline and
+    /// finishing in milliseconds spends the rest of it out of the
+    /// handler budget - which is what makes the retraction load-bearing
+    /// rather than a convenience. The kernel's half is `io_try_cancel`
+    /// falling through to `io_timeout_cancel` (`io_uring/cancel.c`),
+    /// which `submit_cancel` reaches because it leaves
+    /// `IORING_ASYNC_CANCEL_FD` clear.
+    #[test]
+    fn a_cancelled_timer_gives_its_slot_back_before_it_expires() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        // One slot, so holding it is observable.
+        let mut fs = FsCore::new(1, OffloadBounds::default());
+        let done = Rc::new(StdCell::new(false));
+        let started = Instant::now();
+
+        let timer = {
+            let done = Rc::clone(&done);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            // An hour, so nothing here can pass by expiring.
+            conn.timeout(Duration::from_secs(3600), move |d, _conn| {
+                assert!(
+                    matches!(
+                        d.result(),
+                        Err(crate::Error::Errno(Errno::ECANCELED))
+                    ),
+                    "a retracted timer answers ECANCELED: {:?}",
+                    d.result()
+                );
+                done.set(true);
+            })
+            .expect("the table armed it")
+        };
+        assert!(!fs.has_free_op(), "the armed timer holds the only slot");
+
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.cancel_timeout(timer);
+        }
+        drive(&mut fs, &mut eng, &done, "the retraction");
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "it waited out the arm rather than being retracted"
+        );
+        assert!(
+            fs.has_free_op(),
+            "the slot came back with the ECANCELED completion"
+        );
+
+        // A `Timer` outliving its own op retracts nothing: the slot is
+        // reissued under a new generation, so the token names no op.
+        let fired = Rc::new(StdCell::new(false));
+        {
+            let fired = Rc::clone(&fired);
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.timeout(Duration::from_millis(30), move |d, _conn| {
+                assert!(d.result().is_ok(), "the reissued timer expires");
+                fired.set(true);
+            })
+            .expect("the freed slot serves the next arm");
+            conn.cancel_timeout(timer); // the spent one
+        }
+        drive(&mut fs, &mut eng, &fired, "a stale retraction is inert");
+    }
+
     /// The timer composes with the future layer like any submission: a
     /// task awaits its tick and resumes on the loop that armed it.
     #[test]
@@ -1739,7 +2052,9 @@ mod tests {
             let mut conn = FsConn::new(&mut fs, &mut eng, None);
             conn.spawn(move |t| async move {
                 let fired = t
-                    .fut(|c, cb| c.timeout(Duration::from_millis(30), cb))
+                    .fut(|c, cb| {
+                        c.timeout(Duration::from_millis(30), cb);
+                    })
                     .await;
                 assert!(fired.result().is_ok(), "{:?}", fired.result().err());
                 done.set(true);
@@ -2537,10 +2852,16 @@ mod tests {
     }
 
     /// `TaskFs` reached outside a poll refuses. Debug builds assert;
-    /// this is the release half - the op resolves `ECANCELED`.
+    /// this is the release half, where the errno is the whole report.
+    ///
+    /// It must not be `ECANCELED`: that is this module's one meaning
+    /// for "the reactor is going away", and a release consumer reading
+    /// it winds a healthy server down over a caller's bug. Teardown
+    /// still answers it - `a_task_dropped_at_teardown_may_reach_its_facade`
+    /// is that side.
     #[cfg(not(debug_assertions))]
     #[test]
-    fn task_fs_outside_a_poll_resolves_ecanceled() {
+    fn task_fs_outside_a_poll_is_refused_rather_than_torn_down() {
         let t = TaskFs::new();
         let fut = t.fut(|_c, _cb| unreachable!("no facade to submit on"));
         let waker = Waker::noop();
@@ -2549,10 +2870,12 @@ mod tests {
         let Poll::Ready(done) = fut.as_mut().poll(&mut cx) else {
             panic!("an unsubmittable op left its future pending");
         };
-        assert!(matches!(
-            done.result(),
-            Err(crate::Error::Errno(Errno::ECANCELED))
-        ));
+        assert!(done.was_refused(), "the crate refused this, not the kernel");
+        assert!(
+            matches!(done.result(), Err(crate::Error::Errno(Errno::EINVAL))),
+            "a misused handle must not answer ECANCELED: {:?}",
+            done.result()
+        );
     }
 
     /// The three ways a join yields no output need three answers. A
@@ -2643,6 +2966,124 @@ mod tests {
         drop(fs);
     }
 
+    /// A task awaiting only offloads learns its owner is gone, because
+    /// nothing else will tell it.
+    ///
+    /// The two signals this module names - "your ops start failing"
+    /// and "the source feeding you closes" - are both unreachable for
+    /// this shape: an offload is never cancelled and always delivers.
+    /// Left to run, it holds the live gauge up and a graceful drain
+    /// with it, so the reactor waits out its whole grace period on
+    /// work for a connection that hung up.
+    #[test]
+    fn an_offload_only_task_can_see_that_its_owner_is_gone() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm wake");
+        let owner = Some((3u32, 1u64));
+        let first = Rc::new(StdCell::new(false));
+        let saw_gone = Rc::new(StdCell::new(false));
+
+        {
+            let f = Rc::clone(&first);
+            let g = Rc::clone(&saw_gone);
+            let mut conn = FsConn::new(&mut fs, &mut eng, owner);
+            drop(conn.spawn(move |t| async move {
+                for _ in 0..64 {
+                    let _ = t.offload_fut(|| Ok::<_, crate::Error>(1u8)).await;
+                    f.set(true);
+                    // Every await answered `Ok`; the owner's state is
+                    // the only thing that ends this.
+                    if t.owner_is_gone() {
+                        g.set(true);
+                        return;
+                    }
+                }
+            }));
+        }
+
+        // Rounds with the owner live: the task keeps going.
+        drive(&mut fs, &mut eng, &first, "a first offload round");
+        assert_eq!(fs.tasks.live.get(), 1, "still running for a live owner");
+        assert!(!saw_gone.get(), "nothing has closed yet");
+
+        // The connection closes. The sweep cancels nothing here - the
+        // task holds no ring op - so the record it leaves is the whole
+        // signal.
+        fs.cancel_owned_by(&mut eng, vec![(3, 1)]);
+        drive(&mut fs, &mut eng, &saw_gone, "the wind-down");
+        assert_eq!(fs.tasks.live.get(), 0, "and wound down on it");
+    }
+
+    /// One task's destructor panicking at teardown does not take the
+    /// tasks queued behind it.
+    ///
+    /// The mark above suppresses the assert a submit-on-drop guard
+    /// raises; it does nothing for a destructor that panics for its own
+    /// reasons, and that panic escapes a `Drop` impl - which aborts
+    /// outright when the teardown is itself an unwind. The evidence has
+    /// to be a *second* task: contained means the sweep carries on, so
+    /// what it drops is what says so.
+    #[test]
+    fn a_teardown_panic_does_not_take_the_tasks_behind_it() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+
+        struct PanicOnDrop;
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("a task destructor");
+            }
+        }
+        struct Note(Rc<StdCell<bool>>);
+        impl Drop for Note {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        struct Park<T>(#[allow(dead_code)] T);
+        impl<T> Future for Park<T> {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+
+        let reached = Rc::new(StdCell::new(false));
+        let join = {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            let h = conn.spawn(|_t| Park(PanicOnDrop));
+            let note = Rc::clone(&reached);
+            drop(conn.spawn(move |_t| Park(Note(note))));
+            h
+        };
+        assert_eq!(fs.tasks.live.get(), 2, "both tasks are parked");
+
+        let _quiet = crate::uring_fs::quiet_panics_on_this_thread();
+        drop(fs);
+        assert!(
+            reached.get(),
+            "a panicking destructor took the task behind it"
+        );
+
+        // And the payload reached the handle rather than the process.
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut join = std::pin::pin!(join);
+        let Poll::Ready(Err(JoinError::Panic(payload))) =
+            join.as_mut().poll(&mut cx)
+        else {
+            panic!("the panicking task's handle did not learn why");
+        };
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"a task destructor"),
+            "the payload did not survive"
+        );
+    }
+
     /// A `TaskFs` that left its body cannot submit under whatever task
     /// happens to be running.
     ///
@@ -2723,8 +3164,9 @@ mod tests {
         }
         assert_eq!(
             seen.get(),
-            Some(Errno::ECANCELED),
-            "a smuggled handle must submit nothing"
+            Some(Errno::EINVAL),
+            "a smuggled handle must submit nothing, and say so as a \
+             refusal rather than as the reactor going away"
         );
     }
 
@@ -2818,10 +3260,20 @@ mod tests {
         );
     }
 
-    /// The other two misuse guards, release halves: reaching
-    /// `offload_fut` or `spawn` outside a poll cannot submit, so each
-    /// resolves rather than pends. `CLAUDE.md` wants a test per half
-    /// of a `debug_assert` + `if` pair; the debug halves are below.
+    /// The other three misuse guards, release halves: reaching
+    /// `offload_fut`, `result_fut` or `spawn` outside a poll cannot
+    /// submit, so each resolves rather than pends. `CLAUDE.md` wants a
+    /// test per half of a `debug_assert` + `if` pair; the debug halves
+    /// are below. Left untested, the `if` is free to resolve as
+    /// anything - a slot that never resolves at all included, which
+    /// hangs the task holding `tasks.live` up and a graceful drain
+    /// open with it.
+    ///
+    /// `EINVAL` rather than `ECANCELED` for the two futures, on
+    /// `task_fs_outside_a_poll_is_refused_rather_than_torn_down`'s
+    /// reasoning. `spawn` keeps `Dropped`, which its own doc already
+    /// covers both ways: the body never ran, and there is no third
+    /// meaning for that answer to collide with.
     #[cfg(not(debug_assertions))]
     #[test]
     fn the_other_task_fs_guards_resolve_outside_a_poll() {
@@ -2834,9 +3286,18 @@ mod tests {
         assert!(
             matches!(
                 off.as_mut().poll(&mut cx),
-                Poll::Ready(Err(crate::Error::Errno(Errno::ECANCELED)))
+                Poll::Ready(Err(crate::Error::Errno(Errno::EINVAL)))
             ),
-            "offload_fut outside a poll must resolve, not pend"
+            "offload_fut outside a poll must resolve as a refusal"
+        );
+
+        let mut res = std::pin::pin!(t.result_fut(|_c, _cb: OnResult<u32>| {}));
+        assert!(
+            matches!(
+                res.as_mut().poll(&mut cx),
+                Poll::Ready(Err(crate::Error::Errno(Errno::EINVAL)))
+            ),
+            "result_fut outside a poll must resolve as a refusal"
         );
 
         let mut join = std::pin::pin!(t.spawn(|_t| async { 7u8 }));
@@ -2849,12 +3310,20 @@ mod tests {
         );
     }
 
-    /// The debug halves of the same two guards.
+    /// The debug halves of the same three guards.
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "TaskFs::offload_fut with no facade")]
     fn task_fs_offload_outside_a_poll_debug_asserts() {
         drop(TaskFs::new().offload_fut(|| Ok::<_, crate::Error>(1)));
+    }
+
+    /// And `result_fut`'s.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "TaskFs::result_fut with no facade")]
+    fn task_fs_result_fut_outside_a_poll_debug_asserts() {
+        drop(TaskFs::new().result_fut(|_c, _cb: OnResult<u32>| {}));
     }
 
     /// And `spawn`'s.

@@ -12,9 +12,12 @@ request-head tokenizer) is argued for in `Cargo.toml`. Dev-only crates in a
 separate, self-rooted workspace (`fuzz/`) do not count against this and do
 not have to hold the MSRV.
 
-Every feature must build alone. `cargo build --no-default-features --features
-<one>` is part of the gate, because the per-subsystem gates and dependency
-edges only stay honest if something checks them.
+Every feature must build alone, and the gate checks it with **clippy over
+`--all-targets`**, not a plain `build`: dead code behind a feature only
+becomes dead once the tests are compiled, so `--all-features` and a
+per-feature `build` both pass over it. The per-subsystem gates and
+dependency edges only stay honest if something checks them; see the loop
+under *The gate*.
 
 Internals a fuzz target needs are exposed through a `#[cfg(feature =
 "__fuzz")] pub mod fuzz` seam next to the code, never by widening real
@@ -743,12 +746,30 @@ Before reporting anything done:
 cargo fmt --all --check
 cargo fmt --all --check --manifest-path fuzz/Cargo.toml   # its own workspace
 cargo clippy --all-features --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 cargo test --all-features --no-fail-fast
 cargo test --release --all-features --no-fail-fast   # the guards that ship
 RUSTFLAGS="--cfg loom" cargo test --lib --features uring    loom_
 RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
 RUSTFLAGS="--cfg loom" cargo test --lib --features http     loom_
 (cd fuzz && cargo +nightly fuzz build)
+
+# Every feature alone. Keep the list in step with `ci.yml`'s
+# feature-matrix job, which is the authority and also runs the pairs.
+for f in sync-fs xattr mount acl fhandle fsiter idmap shutil \
+         configfile audit secrets signal uring net-core net-server \
+         net-client uring-fs http __fuzz; do
+  cargo clippy --no-default-features --features "$f" \
+    --all-targets -- -D warnings || break
+done
 ```
+
+The last two steps are here because a defect got through without each,
+and the commit that fixed it named the gap without closing it. A
+per-feature clippy over `--all-targets` is what catches code that only
+becomes dead with one feature off - `--all-features` and a per-feature
+`build` both pass over it. `cargo doc` is the only step that resolves
+intra-doc links, so a public item pointing at a private one, or a link
+that does not resolve, is otherwise invisible until CI.
 
 Report failures with their output. A skipped step is a skipped step; say so.

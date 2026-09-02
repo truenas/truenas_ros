@@ -7914,6 +7914,14 @@ fn server_builds_with_fs_pool() {
 /// falling can reach, or the drain sits out its whole grace period and
 /// leaves through the `Deadline` hard stop instead. The grace here is
 /// long and the task is short, so the two outcomes are seconds apart.
+///
+/// **Bounded on both sides, because both failures are silent.** The
+/// upper bound catches a drain that hangs to its deadline. The lower
+/// one catches the opposite and worse mutation - a drain that stops
+/// ignoring tasks altogether, dropping their work on the floor - which
+/// on a `SIGTERM` with a long grace looks exactly like a clean
+/// shutdown. Without it, discarding the task gauge entirely leaves this
+/// test green.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_graceful_drain_ends_when_its_last_task_retires() {
@@ -7976,6 +7984,11 @@ fn a_graceful_drain_ends_when_its_last_task_retires() {
         took < GRACE / 2,
         "the drain ran to its grace deadline ({took:?}) rather than \
          stopping when the task retired"
+    );
+    assert!(
+        took >= Duration::from_millis(250),
+        "the drain stopped in {took:?}, inside the task's own 300 ms - so \
+         it did not wait for the task at all and dropped its work"
     );
 }
 
@@ -10290,9 +10303,9 @@ fn fs_fd_reclaimed_on_connection_close_midchain() {
 /// `FsConn::mkdir_path` builds a missing tree on-loop and hands back the
 /// deepest directory as a real descriptor.
 ///
-/// Two requests, because the call is gated to the request-handler facade: the
-/// first walks a tree that does not exist, the second takes the fast path over
-/// the tree the first made. The reply is the `fsync` of the returned handle,
+/// Two requests, because the two paths through it differ: the first walks
+/// a tree that does not exist, the second takes the fast path over the
+/// tree the first made. The reply is the `fsync` of the returned handle,
 /// which an `O_PATH` directory would answer `EBADF`.
 #[cfg(feature = "uring-fs")]
 #[test]

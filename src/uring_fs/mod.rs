@@ -233,7 +233,7 @@ pub(crate) mod core;
 // server does. Gating it on the server role made the whole on-loop surface
 // unreachable for anyone else.
 pub use core::{
-    DeriveName, DirWalk, FsConn, FsDone, NameBatch, OpenStep, StepPath,
+    DeriveName, DirWalk, FsConn, FsDone, NameBatch, OpenStep, StepPath, Timer,
 };
 // The awaitable layer over the callback facade: op futures, offload
 // futures, and on-loop tasks. A consumer, not a second submission path -
@@ -243,45 +243,76 @@ pub use task::{
     FsFuture, JoinError, JoinHandle, OffloadFuture, OnDone, OnResult, TaskFs,
 };
 
-/// Silence the panic hook for **this thread only**, restoring it when
-/// the guard drops.
+/// Silence the panic hook for **this thread only**, until the guard
+/// drops.
 ///
 /// `set_hook` is process-wide and `cargo test` runs a binary's tests as
 /// threads in one process, so a hook that swallows everything hides a
 /// concurrent test's genuine panic message for the window it is
 /// installed - turning a legible failure elsewhere into a bare "test
-/// failed". This one forwards every other thread's panic to the hook it
-/// replaced.
+/// failed".
+///
+/// **The filter is installed once and never taken back, because
+/// `set_hook` is a slot rather than a stack.** A guard that installed
+/// over the current hook and restored it on drop cannot compose: thread
+/// B installs over A's, A's guard drops and restores the *default*,
+/// discarding B's filter while B is still running, and B's later drop
+/// reinstates A's stale one for the rest of the process. Serializing
+/// the callers instead - which one caller here did and three did not -
+/// makes them wait on each other for no reason. One hook consulting a
+/// set of quiet threads has neither problem, and quieting is nested and
+/// counted so a guard inside a guard un-quiets nothing.
 #[cfg(test)]
 pub(crate) fn quiet_panics_on_this_thread() -> QuietPanics {
-    let prev = std::sync::Arc::new(std::panic::take_hook());
-    let forward = std::sync::Arc::clone(&prev);
-    let mine = std::thread::current().id();
-    std::panic::set_hook(Box::new(move |info| {
-        if std::thread::current().id() != mine {
-            forward(info);
-        }
-    }));
-    QuietPanics(prev)
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !quiet_threads()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&std::thread::current().id())
+            {
+                prev(info);
+            }
+        }));
+    });
+    *quiet_threads()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(std::thread::current().id())
+        .or_insert(0) += 1;
+    QuietPanics(())
 }
 
-/// The hook `set_hook` takes and `take_hook` returns.
+/// Threads currently quieted, and how many guards deep each is.
 #[cfg(test)]
-type PanicHook =
-    Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+fn quiet_threads() -> &'static std::sync::Mutex<
+    std::collections::HashMap<std::thread::ThreadId, u32>,
+> {
+    static QUIET: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, u32>>,
+    > = std::sync::OnceLock::new();
+    QUIET.get_or_init(Default::default)
+}
 
 /// The guard [`quiet_panics_on_this_thread`] returns.
 #[cfg(test)]
-pub(crate) struct QuietPanics(std::sync::Arc<PanicHook>);
+pub(crate) struct QuietPanics(());
 
 #[cfg(test)]
 impl Drop for QuietPanics {
     fn drop(&mut self) {
-        // Reinstalled as a thin wrapper over the hook that was there
-        // before, which is behaviourally the same and needs no
-        // unwrapping of the shared handle the filter still holds.
-        let prev = std::sync::Arc::clone(&self.0);
-        std::panic::set_hook(Box::new(move |info| prev(info)));
+        let mut quiet =
+            quiet_threads().lock().unwrap_or_else(|e| e.into_inner());
+        if let std::collections::hash_map::Entry::Occupied(mut e) =
+            quiet.entry(std::thread::current().id())
+        {
+            *e.get_mut() -= 1;
+            if *e.get() == 0 {
+                e.remove();
+            }
+        }
     }
 }
 
@@ -581,8 +612,22 @@ pub(crate) fn apply_special_file_guard(
     // `openat2` refuses `O_PATH` alongside anything outside
     // `O_DIRECTORY|O_NOFOLLOW|O_PATH|O_CLOEXEC` (`fs/open.c:1298-1300`), so
     // adding the flag would turn a working open into `EINVAL`.
+    //
+    // `O_DIRECTORY` is excluded because the kernel answers before the file's
+    // `open` can block: `build_open_flags` raises `LOOKUP_DIRECTORY`
+    // (`fs/open.c:1337`) and `do_open` tests it - `if ((nd->flags &
+    // LOOKUP_DIRECTORY) && !d_can_lookup(...)) return -ENOTDIR;`,
+    // `fs/namei.c:4003-4004` - *above* the `vfs_open` at `:4020`. Nothing
+    // creates its way past that either: `O_DIRECTORY | O_CREAT` is refused
+    // outright at `fs/open.c:1283`. The flag is not free - the descriptor is
+    // stripped afterwards, which is one blocking `fcntl` on the reactor
+    // thread per open - and this crate's own `open_dir` walk pays it on
+    // every directory it opens. `chain` and `mkdir_path` already skipped the
+    // guard on the steps they force `O_DIRECTORY` onto, citing this same
+    // ordering; this is the rule they were stating.
     if special == SpecialFiles::Allow
         || raw.flags & libc::O_PATH as u64 != 0
+        || raw.flags & libc::O_DIRECTORY as u64 != 0
         || raw.flags & libc::O_NONBLOCK as u64 != 0
     {
         return false;
@@ -868,6 +913,18 @@ pub enum Advice {
 /// (Multi-component resolution exists in exactly one place --
 /// [`FsHandle::open`] - where `RESOLVE_BENEATH` lets the *kernel* enforce
 /// containment.)
+///
+/// **One exception, and it is not this type's to close: `AT_SYMLINK_FOLLOW`
+/// on a link.** A single-component symlink passes `Leaf::new` and then
+/// resolves to wherever it points, so `linkat` with that flag reaches
+/// outside the anchor on a name a peer planted inside it. Nothing in the
+/// kernel bounds where the link lands: `may_linkat` (`fs/namei.c:1271`)
+/// tests `safe_hardlink_source(idmap, inode) ||
+/// inode_owner_or_capable(idmap, inode)` on the **source** inode, and only
+/// when `sysctl_protected_hardlinks` is set. See
+/// [`FsConn::linkat`](crate::uring_fs::FsConn::linkat) for the worked
+/// case; every other name op here takes the leaf literally, so the
+/// confinement holds.
 ///
 /// Rejected: empty, `.`, `..`, anything containing `/` or an interior NUL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2456,6 +2513,19 @@ impl FsHandle {
 
     /// A directory-entry op in the common `(anchor, leaf)` [+ destination]
     /// shape.
+    ///
+    /// **`EBUSY` from here has two producers and this path cannot tell
+    /// them apart.** The reactor answers it when the op table is full,
+    /// which is transient and worth retrying; the kernel answers it
+    /// from `is_local_mountpoint` in `vfs_rmdir` (`fs/namei.c:4588`),
+    /// `vfs_unlink` (`:4715`) and `vfs_rename` (`:5243`), which is
+    /// permanent for that path - and on TrueNAS a nested dataset is a
+    /// local mountpoint under its parent, so a blocking caller that
+    /// retries on `EBUSY` alone spins on one. The bit that separates
+    /// them is carried ([`FsOutcome::was_refused`]) but not surfaced by
+    /// these signatures; the [`FsConn`] facade's
+    /// [`FsDone::was_refused`](core::FsDone::was_refused) is where it
+    /// is readable, so bound the retries here or use that path.
     #[allow(clippy::too_many_arguments)]
     fn path_op(
         &self,
@@ -2518,6 +2588,115 @@ impl FsHandle {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+
+    /// One thread's guard dropping leaves another's alone, and a
+    /// nested guard un-quiets nothing when it ends.
+    ///
+    /// `set_hook` is one slot, not a stack, and `cargo test` runs a
+    /// binary's tests as threads - so a guard that installs over the
+    /// current hook and restores it on drop cannot compose. Thread B
+    /// installs over A's; A's guard drops and restores the *default*,
+    /// discarding B's filter while B is still running; B's later drop
+    /// reinstates A's stale filter for the rest of the process. The
+    /// hook here is installed once and reads a set instead, so the
+    /// property to hold is the set's.
+    ///
+    /// Asserted on the set rather than on stderr because the
+    /// alternative is not stable: a test that installs a counting hook
+    /// to watch it either sits *over* the filter, where quieting is
+    /// vacuous, or replaces the filter permanently for every test that
+    /// runs afterwards.
+    #[test]
+    fn quieting_composes_across_threads_and_nests() {
+        fn quiet(id: std::thread::ThreadId) -> bool {
+            quiet_threads()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&id)
+        }
+        let me = std::thread::current().id();
+        let both = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let gone = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let outer = quiet_panics_on_this_thread();
+        assert!(quiet(me), "this thread is quiet");
+
+        let (b, g) =
+            (std::sync::Arc::clone(&both), std::sync::Arc::clone(&gone));
+        let other = std::thread::spawn(move || {
+            let id = std::thread::current().id();
+            let mine = quiet_panics_on_this_thread();
+            b.wait(); // both guards alive
+            g.wait(); // the other thread has dropped its outer guard
+            assert!(quiet(id), "another thread's drop un-quieted this one");
+            drop(mine);
+            assert!(!quiet(id), "its own drop must un-quiet it");
+            id
+        });
+
+        both.wait();
+        drop(outer);
+        assert!(!quiet(me), "this thread's own drop un-quiets it");
+        gone.wait();
+        let other_id = other.join().expect("the other thread");
+        assert!(!quiet(other_id), "and nothing is left behind");
+
+        // Nesting: the inner guard ending does not un-quiet the outer.
+        let outer = quiet_panics_on_this_thread();
+        {
+            let _inner = quiet_panics_on_this_thread();
+            assert!(quiet(me), "quiet, twice over");
+        }
+        assert!(quiet(me), "a nested guard ending un-quieted the outer one");
+        drop(outer);
+        assert!(!quiet(me), "the last one out turns the lights on");
+    }
+
+    /// The guard is added where a special file could block, and
+    /// nowhere else - because it is not free.
+    ///
+    /// The descriptor is stripped afterwards, which is one blocking
+    /// `fcntl` on the reactor thread per open; `open_dir`'s walk opens
+    /// a directory per request, and a directory cannot reach the
+    /// blocking `open` the flag exists to defeat. The exemption is a
+    /// kernel ordering, cited on the function.
+    #[test]
+    fn the_special_file_guard_skips_what_cannot_block() {
+        let guard = |flags: i32| {
+            let mut raw = OpenHow::new()
+                .flags(OFlag::from_bits_retain(flags))
+                .to_raw();
+            let added = apply_special_file_guard(&mut raw, SpecialFiles::Guard);
+            (added, raw.flags & libc::O_NONBLOCK as u64 != 0)
+        };
+
+        assert_eq!(
+            guard(libc::O_RDONLY),
+            (true, true),
+            "an ordinary open can name a FIFO and must be guarded"
+        );
+        assert_eq!(
+            guard(libc::O_RDONLY | libc::O_DIRECTORY),
+            (false, false),
+            "O_DIRECTORY answers ENOTDIR before the file's own open"
+        );
+        assert_eq!(
+            guard(libc::O_RDONLY | libc::O_PATH),
+            (false, false),
+            "O_PATH never invokes the file's open"
+        );
+        assert_eq!(
+            guard(libc::O_RDONLY | libc::O_NONBLOCK),
+            (false, true),
+            "a caller's own O_NONBLOCK is theirs, and stays"
+        );
+
+        let mut raw = OpenHow::new().flags(OFlag::O_RDONLY).to_raw();
+        assert!(
+            !apply_special_file_guard(&mut raw, SpecialFiles::Allow),
+            "the opt-out is the one place a blocking open is asked for"
+        );
+    }
 
     /// The liveness half of the inject-vs-shutdown race: a caller that got an
     /// `Ok` from [`FsHandle::send`] and is parked in [`FsHandle::call`] on its
