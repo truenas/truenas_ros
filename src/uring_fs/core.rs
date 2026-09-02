@@ -231,7 +231,9 @@ mod armed {
     }
 
     /// A share that never arms, for driving the core without a facade.
-    #[cfg(all(test, not(loom)))]
+    /// Gated exactly as its one caller (the leased-write reap test) is,
+    /// so no feature subset sees a producer with nothing producing.
+    #[cfg(all(test, not(loom), feature = "net-server"))]
     pub(super) fn unarmed() -> Armed {
         Armed(None)
     }
@@ -491,10 +493,6 @@ pub(crate) struct FsCore {
     /// Attribute names whose `FSETXATTR` runs under ambient credentials rather
     /// than the request identity. Empty by default - see [`PrivilegedXattrs`].
     priv_xattrs: PrivilegedXattrs,
-    /// Spawned tasks and their run queue (the futures layer,
-    /// [`super::task`]); woken tasks are polled by the delivery
-    /// functions below.
-    pub(crate) tasks: super::task::Tasks,
     /// This reactor's identity, minted at construction, so a [`Timer`]
     /// can be verified against the table that issued it - two reactors
     /// on one thread both start their tables at slot 0, generation 0,
@@ -523,6 +521,13 @@ pub(crate) struct FsCore {
     /// and owner-less arms are never counted.
     armed_timers: HashMap<(u32, u64), u32>,
     timer_cap: Option<u32>,
+    /// Spawned tasks and their run queue (the futures layer,
+    /// [`super::task`]); woken tasks are polled by the delivery
+    /// functions below. **Last field on purpose**: fields drop in
+    /// declaration order, so `Tasks::drop` - which runs pending task
+    /// destructors - is the final thing to go, with everything above
+    /// already destroyed; its own doc leans on exactly that.
+    pub(crate) tasks: super::task::Tasks,
 }
 
 impl FsCore {
@@ -1096,6 +1101,12 @@ impl FsCore {
             return None;
         };
 
+        // Saturating, like every Duration-to-timespec conversion in the
+        // crate: `get_timespec64` copies the struct verbatim and
+        // `timespec64_valid` only refuses a negative or over-range
+        // `tv_nsec` (`io_uring/timeout.c` via `__io_timeout_prep`), so
+        // a clamped i64::MAX is "effectively forever" rather than an
+        // error.
         let ts = Box::new(KernelTimespec {
             tv_sec: i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
             tv_nsec: i64::from(after.subsec_nanos()),
@@ -1988,7 +1999,7 @@ impl std::fmt::Debug for FsDone {
 ///
 /// Names one arming, not the slot: it carries the reactor's identity
 /// and the **full-width** op-table generation the arm was made under,
-/// on the rule [`SlotEntry`](crate::uring::slots::SlotEntry) states -
+/// on the rule the ring's slot entries state (`uring::slots`) -
 /// a caller-retained handle must never alias a future incarnation of
 /// its slot, and the truncated 32-bit routing token is only safe
 /// because a completion cannot outlive its op, which a `Timer` held
@@ -2119,9 +2130,9 @@ impl FsDone {
 /// ring only through this facade. An argument a screen here refuses answers
 /// `on_done` with a marked `EINVAL` **before the method returns**; a
 /// submission failure past the screens (a full op table) drops `on_done`
-/// (and the continuation it captured, closing the connection) unless a
-/// reason sink is staged (the futures layer's [`FailSink`]). These methods
-/// return `()` either way.
+/// (and the continuation it captured, closing the connection) unless the
+/// futures layer has staged its reason sink. These methods return `()`
+/// either way.
 ///
 /// **No method here may return data borrowed from `'a`.** The task layer
 /// parks a facade in a thread-local as `FsConn<'static>` and hands it back
@@ -2137,10 +2148,14 @@ impl FsDone {
 /// wrapper beside `with_conn` has to reproduce that bound, or it is
 /// unsound from safe code.
 ///
-/// The rule here is the belt to that brace, and today it holds only
-/// because every method returns owned values or borrows of `&self` - add
-/// one `fn x(&self) -> &'a T` and a caller could extend a borrow of the
-/// ring's tables past the poll that parked them.
+/// The rule here is the belt to that brace, and it is `reach_in`'s
+/// path it guards, not `with_conn`'s: through `with_conn` the binder
+/// already stops a caller naming the lifetime, so a `fn x(&self) ->
+/// &'a T` added here is unexploitable there - but reached at
+/// `T = FsConn<'static>` it hands out `&'static` borrows of the ring's
+/// tables from safe code, and nothing in `reach_in`'s signature is
+/// positioned to object. Keep methods returning owned values or
+/// borrows of `&self`.
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 pub struct FsConn<'a> {
     fs: &'a mut FsCore,
@@ -2518,14 +2533,11 @@ impl<'a> FsConn<'a> {
         if raw.flags & refused != 0 {
             return on_done(FsDone::refused(Errno::EINVAL), self);
         }
-        // And `RESOLVE_IN_ROOT`, for the same class of reason as the two
-        // above: the bundle unioned below carries `RESOLVE_BENEATH`, which
-        // the kernel refuses to pair with it (`fs/open.c:1264`), so every
-        // component of the walk would fail `EINVAL` - after the earlier ones
-        // had already been created.
-        if raw.resolve & crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT.bits()
-            != 0
-        {
+        // And a scoping conflict, for the same class of reason as the
+        // two above: the walk would fail `EINVAL` at every component -
+        // after the earlier ones had already been created. The rule and
+        // its citation live on `scoping_conflict`.
+        if super::scoping_conflict(raw.resolve) {
             return on_done(FsDone::refused(Errno::EINVAL), self);
         }
         raw.flags |= libc::O_DIRECTORY as u64;
@@ -2607,22 +2619,11 @@ impl<'a> FsConn<'a> {
             if creation_refused(step.how.to_raw().flags) {
                 return on_done(FsDone::refused(Errno::EINVAL), self);
             }
-            // `chain` unions `CONFINED_RESOLVE` onto every step, and
-            // `RESOLVE_BENEATH` is in it: "Scoping flags are mutually
-            // exclusive" (`build_open_flags`, `fs/open.c:1263-1265`), so
-            // a caller's `RESOLVE_IN_ROOT` makes every step `EINVAL` -
-            // and with `was_refused` false, which tells the caller the
-            // *kernel* objected to their path when this crate added the
-            // bit that made it object. Screened here rather than fixed
-            // up in `chain`, on `mkdir_path`'s rule: routing through
-            // `confine_resolve` instead would union only
-            // `CONFINED_HARDENING` once a policy bit is set, silently
-            // dropping the `RESOLVE_NO_SYMLINKS` a multi-personality
-            // chain needs more rather than less.
-            if step.how.to_raw().resolve
-                & crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT.bits()
-                != 0
-            {
+            // A scoping conflict would otherwise make every step
+            // `EINVAL` with the kernel blamed for a bit this crate
+            // added; the rule and its citation live on
+            // `scoping_conflict`.
+            if super::scoping_conflict(step.how.to_raw().resolve) {
                 return on_done(FsDone::refused(Errno::EINVAL), self);
             }
         }
@@ -2793,7 +2794,6 @@ impl<'a> FsConn<'a> {
             });
             if let (Some((_, taken)), Some(hold)) = (leased, hold) {
                 let w = self.waiter(on_done);
-                let w = w;
                 match self.fs.submit_pwritev2_leased(
                     self.eng,
                     who.0,

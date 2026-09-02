@@ -541,9 +541,8 @@ fn cstr(s: &str) -> CString {
 }
 
 fn main() {
-    let base =
-        std::env::temp_dir().join(format!("fs_cb_demo_{}", std::process::id()));
-    std::fs::create_dir_all(&base).unwrap();
+    let tmp = truenas_ros::tempdir().expect("tempdir");
+    let base = tmp.path().to_owned();
     let dir = open_dir(&base);
 
     let mut rt = Reactor::default();
@@ -601,7 +600,6 @@ fn main() {
     unsafe {
         libc::close(dir);
     }
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 fn open_dir(p: &std::path::Path) -> RawFd {

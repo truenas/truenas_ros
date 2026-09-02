@@ -282,7 +282,7 @@ pub(crate) fn quiet_panics_on_this_thread() -> QuietPanics {
         .unwrap_or_else(|e| e.into_inner())
         .entry(std::thread::current().id())
         .or_insert(0) += 1;
-    QuietPanics(())
+    QuietPanics(std::marker::PhantomData)
 }
 
 /// Threads currently quieted, and how many guards deep each is.
@@ -296,9 +296,13 @@ fn quiet_threads() -> &'static std::sync::Mutex<
     QUIET.get_or_init(Default::default)
 }
 
-/// The guard [`quiet_panics_on_this_thread`] returns.
+/// The guard [`quiet_panics_on_this_thread`] returns. Thread-affine
+/// (`!Send`), because its `Drop` decrements the **dropping** thread's
+/// entry: carried across a spawn it would un-quiet the wrong thread -
+/// or no thread, leaving the originating one quiet for the rest of the
+/// process.
 #[cfg(test)]
-pub(crate) struct QuietPanics(());
+pub(crate) struct QuietPanics(std::marker::PhantomData<std::rc::Rc<()>>);
 
 #[cfg(test)]
 impl Drop for QuietPanics {
@@ -478,6 +482,21 @@ pub(crate) fn confine_resolve(resolve: &mut u64) {
     }
 }
 
+/// Whether `resolve` states `RESOLVE_IN_ROOT`, which cannot compose with
+/// the `RESOLVE_BENEATH` a confined walk unions in: "Scoping flags are
+/// mutually exclusive" (`build_open_flags`, `fs/open.c:1263-1265`), so
+/// every step of such a walk would answer `EINVAL` - after the earlier
+/// ones had already run, for a walk that creates. The rule is stated
+/// here once because three callers screen it - `open_confined`,
+/// `FsConn::mkdir_path` and `FsConn::open_chain`, the three sites that
+/// union the bundle unconditionally - and each used to restate it.
+/// Screening, not routing through [`confine_resolve`]: that would union
+/// only [`CONFINED_HARDENING`] once a policy bit is set, silently
+/// dropping the `RESOLVE_NO_SYMLINKS` a confined walk needs most.
+pub(crate) fn scoping_conflict(resolve: u64) -> bool {
+    resolve & crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT.bits() != 0
+}
+
 /// Whether an open may be left able to block on a special file.
 ///
 /// A path a peer chose can resolve to a FIFO or a device node, and opening
@@ -619,7 +638,11 @@ pub(crate) fn apply_special_file_guard(
     // LOOKUP_DIRECTORY) && !d_can_lookup(...)) return -ENOTDIR;`,
     // `fs/namei.c:4003-4004` - *above* the `vfs_open` at `:4020`. Nothing
     // creates its way past that either: `O_DIRECTORY | O_CREAT` is refused
-    // outright at `fs/open.c:1283`. The flag is not free - the descriptor is
+    // outright at `fs/open.c:1283`. An `O_TMPFILE` open rides this
+    // exemption too (`__O_TMPFILE | O_DIRECTORY`), and is safe for its own
+    // reason, not this ordering - `path_openat` routes it to `do_tmpfile`
+    // (`fs/namei.c:4173`), which creates an unnamed `S_IFREG` inode
+    // (`fs/open.c:1271` forces the mode), so it cannot name a FIFO at all. The flag is not free - the descriptor is
     // stripped afterwards, which is one blocking `fcntl` on the reactor
     // thread per open - and this crate's own `open_dir` walk pays it on
     // every directory it opens. `chain` and `mkdir_path` already skipped the
@@ -914,17 +937,19 @@ pub enum Advice {
 /// [`FsHandle::open`] - where `RESOLVE_BENEATH` lets the *kernel* enforce
 /// containment.)
 ///
-/// **One exception, and it is not this type's to close: `AT_SYMLINK_FOLLOW`
-/// on a link.** A single-component symlink passes `Leaf::new` and then
-/// resolves to wherever it points, so `linkat` with that flag reaches
-/// outside the anchor on a name a peer planted inside it. Nothing in the
-/// kernel bounds where the link lands: `may_linkat` (`fs/namei.c:1271`)
-/// tests `safe_hardlink_source(idmap, inode) ||
-/// inode_owner_or_capable(idmap, inode)` on the **source** inode, and only
-/// when `sysctl_protected_hardlinks` is set. See
+/// **One exception, and it is not this type's to close:
+/// `AT_SYMLINK_FOLLOW`.** A single-component symlink passes `Leaf::new`,
+/// and any op whose `AtFlags` accept that flag then resolves to wherever
+/// it points - outside the anchor, on a name a peer planted inside it.
+/// That is every entry point taking a `Leaf` *and* `AtFlags`: both
+/// `linkat`s (where the link lands outside; nothing in the kernel bounds
+/// it - `may_linkat`, `fs/namei.c:1271`, tests the **source** inode, and
+/// only when `sysctl_protected_hardlinks` is set) and both `statx`
+/// shapes plus [`FsHandle::start_statx`] (where the stat reads the
+/// target's inode, size, mode and times outside the anchor). See
 /// [`FsConn::linkat`](crate::uring_fs::FsConn::linkat) for the worked
-/// case; every other name op here takes the leaf literally, so the
-/// confinement holds.
+/// case. The ops that take a `Leaf` and **no** `AtFlags` use the name
+/// literally, and there the confinement holds unconditionally.
 ///
 /// Rejected: empty, `.`, `..`, anything containing `/` or an interior NUL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1430,13 +1455,12 @@ impl FsHandle {
         how: impl Into<FsOpenHow>,
     ) -> crate::Result<File> {
         let (cpath, mut raw, guarded) = open_parts(path, how.into())?;
-        // `RESOLVE_IN_ROOT` is not a restriction that composes: the kernel
-        // refuses `BENEATH|IN_ROOT` outright (`fs/open.c:1264`), so unioning
-        // the bundle over a stated `IN_ROOT` made every path - a leaf, a
-        // nested path, `"."` - fail `EINVAL`, while the same call through
-        // `open` succeeded. Refuse it here, where the message can say what
-        // to do instead, rather than at the syscall where it cannot.
-        if raw.resolve & ResolveFlag::RESOLVE_IN_ROOT.bits() != 0 {
+        // See `scoping_conflict`: unioning the bundle over a stated
+        // `IN_ROOT` made every path - a leaf, a nested path, `"."` -
+        // fail `EINVAL`, while the same call through `open` succeeded.
+        // Refused here, where the message can say what to do instead,
+        // rather than at the syscall where it cannot.
+        if scoping_conflict(raw.resolve) {
             return Err(crate::Error::Validation(
                 "uring_fs open_confined: RESOLVE_IN_ROOT cannot compose \
                  with the confinement bundle (openat2 refuses \
@@ -2521,11 +2545,13 @@ impl FsHandle {
     /// `vfs_unlink` (`:4715`) and `vfs_rename` (`:5243`), which is
     /// permanent for that path - and on TrueNAS a nested dataset is a
     /// local mountpoint under its parent, so a blocking caller that
-    /// retries on `EBUSY` alone spins on one. The bit that separates
-    /// them is carried ([`FsOutcome::was_refused`]) but not surfaced by
-    /// these signatures; the [`FsConn`] facade's
-    /// [`FsDone::was_refused`](core::FsDone::was_refused) is where it
-    /// is readable, so bound the retries here or use that path.
+    /// retries on `EBUSY` alone spins on one. These signatures return
+    /// `crate::Result`, which has nowhere to carry the bit that
+    /// separates them; on the [`FsConn`] facade the same distinction is
+    /// readable as [`FsDone::was_refused`](core::FsDone::was_refused)
+    /// (the `FsDone`-carrying callbacks and [`FsConn::fut`] - not the
+    /// `crate::Result` shapes of `offload_fut`/`result_fut`, which drop
+    /// it too). Bound the retries here, or use that path.
     #[allow(clippy::too_many_arguments)]
     fn path_op(
         &self,

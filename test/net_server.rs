@@ -8351,9 +8351,10 @@ fn fs_conn_fstatfs_agrees_from_file_and_anchor() {
         let who = *pc.get().expect("personality set before serving");
         let anchor = anchor.clone();
         let how = OpenHow::new().flags(OFlag::O_RDONLY);
-        // `open` first: a continuation resumed from an offload gets an
-        // `FsConn` that cannot open (net/server/wake.rs), so the ring op has
-        // to lead and the offloads chain behind it.
+        // `open` first, then the offloads chain behind it - the chain
+        // is what this test is about. (Every facade can open, an
+        // offload-delivery continuation's included; the gate that once
+        // said otherwise is gone.)
         fs.open(who, &anchor.clone(), c"f.txt", how, move |done, fs| {
             let Some(file) = done.file() else {
                 return deferred.reply(echo_frame(

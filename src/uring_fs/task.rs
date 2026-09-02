@@ -307,10 +307,19 @@ pub enum JoinError {
     ///
     /// A panicking task is contained: its slot retires, the reactor
     /// thread lives, and every other connection on that ring keeps
-    /// being served. Nothing else in this crate contains a panic - a
-    /// callback that unwinds still takes the loop down - so this is
-    /// deliberately the narrower promise: a task's own bug is a
-    /// request's problem, not the ring's.
+    /// being served - **unless the panicking future also holds a
+    /// destructor that panics.** The poll's unwind drops the future's
+    /// state, so a `Drop` that panics there is a panic during an
+    /// unwind, which aborts by language rule before any guard in this
+    /// crate can run; no placement of `catch_unwind` closes it. Keep
+    /// panic-on-drop guards out of task state. (Teardown is different:
+    /// there the entries drop with no unwind in progress, and one
+    /// destructor's panic is contained per slot.)
+    ///
+    /// Elsewhere in this crate a panic is not contained - a callback
+    /// that unwinds still takes the loop down - so this is deliberately
+    /// the narrower promise: a task's own bug is a request's problem,
+    /// not the ring's.
     Panic(Box<dyn std::any::Any + Send>),
     /// The task produced no output and never will: dropped at teardown
     /// before completing, or a release-build [`TaskFs::spawn`] called
@@ -1481,10 +1490,14 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: TaskId) {
             // either. A sink already taken above is a `Ready` poll whose
             // output panicked on the way out - contained, and with the
             // handle gone there is nobody left to report it to.
-            // The future's own destructors are inside the guard too:
-            // an unwinding poll leaves the future half-dropped, and a
-            // guard in it that panics on the way out has nothing else
-            // catching it on the delivery path.
+            // The future's own destructors run inside the guard too,
+            // but do not read that as containment: the poll is already
+            // unwinding, so a destructor that panics here is a panic
+            // during an unwind and aborts before this arm runs at all
+            // (see [`JoinError::Panic`]). What the guard covers is the
+            // destructor of a future dropped *by this arm* whose panic
+            // is its first - contained, so it cannot take the delivery
+            // path down.
             let _ =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let sink = entry.on_panic.take();

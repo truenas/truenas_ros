@@ -279,9 +279,8 @@ fn download_cost(warmup: usize, measured: usize) -> Option<usize> {
     const CHUNK: usize = 64 * 1024;
     const SIZE: usize = 4 * CHUNK; // four chunk reads per body
 
-    let dir = std::env::temp_dir()
-        .join(format!("ros-dl-{warmup}-{measured}-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
+    let tmp = truenas_ros::tempdir().expect("tempdir");
+    let dir = tmp.path().to_owned();
     let path = dir.join("obj");
     std::fs::write(&path, vec![0x41u8; SIZE]).expect("write fixture");
 
@@ -378,7 +377,6 @@ fn download_cost(warmup: usize, measured: usize) -> Option<usize> {
 
     server.serve_forever().expect("serve_forever");
     let cost = client.join().expect("client thread");
-    let _ = std::fs::remove_dir_all(&dir);
     let _ = stats.snapshot();
     Some(cost)
 }
@@ -442,14 +440,9 @@ fn put_to_file_cost_ranged(
     use truenas_ros::http::HttpStreamDeferred;
     use truenas_ros::uring_fs::{Personality, RwFlags};
 
-    let dir = std::env::temp_dir().join(format!(
-        "ros-put-{mib}-{:x}-{}",
-        wire_of as usize,
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&dir);
+    let tmp = truenas_ros::tempdir().expect("tempdir");
+    let dir = tmp.path().to_owned();
     let path = dir.join("obj");
-    let _ = std::fs::remove_file(&path);
     std::fs::write(&path, b"").expect("create");
 
     // One pre-opened destination, cloned per request (the open path is not
@@ -608,7 +601,6 @@ fn put_to_file_cost_ranged(
     );
     let written = std::fs::read(&path).expect("read back");
     let matches = written == payload;
-    let _ = std::fs::remove_dir_all(&dir);
     Some((cost, cost_med, matches))
 }
 
@@ -851,17 +843,17 @@ fn pipelined_put_cost(
     use truenas_ros::http::HttpDeferred;
     use truenas_ros::uring_fs::{File, Personality, RwFlags};
 
-    // The pid is what keeps this reentrant. `MEASURING` serializes the
-    // measuring tests *within* a process, and nothing serializes two
-    // processes - so two `recv_alloc` binaries running at once (a
-    // background suite and a foreground rerun, most often) shared this
-    // directory, and the `remove_dir_all` below deleted the other's
-    // objects mid-upload. It surfaced as `read back` failing at the
-    // verify, which reads exactly like a lost write.
-    let dir = std::env::temp_dir()
-        .join(format!("ros-pipe-{mib}-{conns}-{k}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
+    // `truenas_ros::tempdir()` (mkdtemp) rather than a parameter-named
+    // directory, and the drop guard rather than a trailing
+    // `remove_dir_all`, for two measured reasons: parameter-named
+    // fixtures were shared by two `recv_alloc` binaries running at
+    // once - `MEASURING` serializes only within a process - and the
+    // pre-clean deleted the other's objects mid-upload, reading as a
+    // lost write at the verify; and a hand-rolled teardown sits behind
+    // every assert, so one failing run left its RAM-backed fixtures on
+    // tmpfs. The guard cleans up on the unwind too.
+    let tmp = truenas_ros::tempdir().expect("tempdir");
+    let dir = tmp.path().to_owned();
     for i in 0..conns {
         std::fs::write(dir.join(format!("obj{i}")), b"").expect("create");
     }
@@ -1081,7 +1073,6 @@ fn pipelined_put_cost(
         std::fs::read(dir.join(format!("obj{i}"))).expect("read back") == want
     });
     let peak = peak_seen.load(Ordering::Relaxed);
-    let _ = std::fs::remove_dir_all(&dir);
     Some((cost, ok, peak))
 }
 
@@ -1141,13 +1132,8 @@ fn exhaustion_put_cost(
     use truenas_ros::http::HttpDeferred;
     use truenas_ros::uring_fs::{File, Personality, RwFlags};
 
-    let dir = std::env::temp_dir().join(format!(
-        "ros-exh-{}-{per_conn}-{}",
-        retry.map_or(0, |d| d.as_millis()),
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
+    let tmp = truenas_ros::tempdir().expect("tempdir");
+    let dir = tmp.path().to_owned();
     let fifo = dir.join("sink");
     let cpath =
         std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
@@ -1421,7 +1407,6 @@ fn exhaustion_put_cost(
     let s = stats.snapshot();
     assert_eq!(s.recv_bufs_lent, 0, "leases not returned: {s:?}");
     let got = drained.load(Ordering::Relaxed);
-    let _ = std::fs::remove_dir_all(&dir);
     Some((
         s.recv_shortage_parks,
         cost,
