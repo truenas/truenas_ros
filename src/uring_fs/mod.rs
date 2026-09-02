@@ -233,7 +233,8 @@ pub(crate) mod core;
 // server does. Gating it on the server role made the whole on-loop surface
 // unreachable for anyone else.
 pub use core::{
-    DeriveName, DirWalk, FsConn, FsDone, NameBatch, OpenStep, StepPath, Timer,
+    ConnToken, DeriveName, DirWalk, FsConn, FsDone, NameBatch, OpenStep,
+    StepPath, Timer,
 };
 // The awaitable layer over the callback facade: op futures, offload
 // futures, and on-loop tasks. A consumer, not a second submission path -

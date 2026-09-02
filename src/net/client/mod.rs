@@ -141,9 +141,11 @@ where
         let ts_of = connect::ts_of; // shared duration -> timespec clamp
         let pads = Box::new(KernelPads {
             deadline: KernelTimespec::default(),
-            // Client-unused (only a server arms accept retries). The connect
-            // timeout is per-connect, stored in each `PendingConnect`.
+            // Client-unused (only a server arms accept retries and the
+            // maintenance tick). The connect timeout is per-connect,
+            // stored in each `PendingConnect`.
             accept_retry: KernelTimespec::default(),
+            maintain: KernelTimespec::default(),
             idle_timeout: config.idle_timeout.map(ts_of).unwrap_or_default(),
             send_timeout: config.send_timeout.map(ts_of).unwrap_or_default(),
             request_timeout: config
@@ -379,7 +381,8 @@ where
                 | Op::AcceptRetry
                 | Op::Cred
                 | Op::Peername
-                | Op::DetachInstall,
+                | Op::DetachInstall
+                | Op::Maintain,
             ) => unreachable!("client never issues {op:?}"),
         }
         Ok(())

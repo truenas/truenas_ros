@@ -7,6 +7,8 @@
 //! unused. The `not(net-server)` allow below relaxes dead-code exactly for the
 //! server-support surface when the server role is absent; `net-server` and
 //! `full` builds stay strict, so genuinely dead core code is still caught.
+#[cfg(feature = "net-server")]
+pub(crate) mod bodypool;
 pub(crate) mod config;
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 pub(crate) mod conn;
@@ -22,6 +24,8 @@ pub(crate) mod sock;
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 pub(crate) mod table;
 
+#[cfg(feature = "net-server")]
+pub use bodypool::BodyRecycler;
 pub use protocol::{
     Body, ClientAddr, CloseReason, Endian, Framing, PeerCred, PrefixWidth,
     SendBuf, ServerAddr, length_prefix_header,

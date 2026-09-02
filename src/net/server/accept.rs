@@ -517,6 +517,17 @@ where
 // Arming the listener (and its retry backoff) runs no handler code --
 // bounds-free, so the teardown path can re-arm a parked accept.
 impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
+    /// Arm the periodic maintenance `TIMEOUT`; its completion rebalances
+    /// the buffer pools and re-arms itself until shutdown.
+    pub(super) fn submit_maintain(&mut self) -> errno::Result<()> {
+        let ts = std::ptr::addr_of!(self.core.pads.maintain) as u64;
+        self.core.stage(pack(Op::Maintain, 0, 0), move |sqe| {
+            sqe.opcode = IORING_OP_TIMEOUT;
+            sqe.addr = ts;
+            sqe.len = 1; // exactly one timespec, per the kernel
+        })
+    }
+
     /// Arm a short backoff `TIMEOUT`; its completion re-arms `lidx`'s accept.
     fn submit_accept_retry(&mut self, lidx: u32) -> errno::Result<()> {
         let ts = std::ptr::addr_of!(self.core.pads.accept_retry) as u64;

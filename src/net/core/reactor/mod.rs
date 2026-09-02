@@ -65,6 +65,10 @@ pub(crate) struct KernelPads {
     /// Backoff before retrying a recv parked on an exhausted buffer pool --
     /// meaningful iff `cfg.recv_shortage_retry` is set.
     pub(crate) recv_retry: KernelTimespec,
+    /// The periodic maintenance tick (`MAINTAIN_TICK`) - the observation
+    /// quiet pools get, since pressure rides completions and silence has
+    /// none.
+    pub(crate) maintain: KernelTimespec,
 }
 
 /// The stream reactor: the shared [`Engine`] plus the connection table and
@@ -130,6 +134,15 @@ pub(crate) struct Reactor<U> {
     /// this pool's storage.
     #[cfg(feature = "net-server")]
     pub(crate) recv_bufs: Option<BufPool>,
+    /// Ring-owned storage for placed and promoted request bodies - the
+    /// recv-side sibling of the chunk ring's rule that buffers belong to
+    /// the ring, not a connection. `Rc`, because the consumer's
+    /// [`BodyRecycler`](crate::net::core::bodypool::BodyRecycler) closes
+    /// the loop from outside the reactor borrow.
+    #[cfg(feature = "net-server")]
+    pub(crate) body_pool: Option<
+        std::rc::Rc<std::cell::RefCell<crate::net::core::bodypool::BodyPool>>,
+    >,
     /// Buffers a file-sourced response body is read into, on their own
     /// group. Ring-global: every connection on this reactor draws from it,
     /// so the memory tracks bodies in flight rather than the connection
@@ -167,6 +180,8 @@ impl<U> Reactor<U> {
             has_fs_pool: false,
             #[cfg(feature = "net-server")]
             recv_bufs: None,
+            #[cfg(feature = "net-server")]
+            body_pool: None,
             #[cfg(all(feature = "net-server", feature = "uring-fs"))]
             body_bufs: None,
             engine,

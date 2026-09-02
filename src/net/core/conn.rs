@@ -97,6 +97,11 @@ pub(crate) enum Op {
     /// lands, cancelled when it is delivered. Server-only (the client's
     /// `dispatch` routes it to `unreachable!`). Not counted in `conn.ops`.
     ReceiptDeadline = 22,
+    /// The ring's periodic maintenance `TIMEOUT` (server-only): its
+    /// completion rebalances the buffer pools - the one observation quiet
+    /// rings get, since pressure rides completions and silence has none --
+    /// and re-arms itself.
+    Maintain = 23,
 }
 
 impl Op {
@@ -125,6 +130,7 @@ impl Op {
             20 => Op::Connect,
             21 => Op::RecvRetry,
             22 => Op::ReceiptDeadline,
+            23 => Op::Maintain,
             _ => return None,
         })
     }
@@ -275,23 +281,24 @@ impl RecvBuf {
     /// Give the buffer up, for the caller to hand back to the pool. Only
     /// once nothing is buffered: the bytes live in it.
     ///
-    /// Also drops any storage a promote left behind, so one oversized
-    /// message does not leave the connection carrying its buffer for the
-    /// rest of its life - which is the retention the pool exists to end.
-    pub(crate) fn release(&mut self) -> Option<RecvClaim> {
+    /// Also surrenders any storage a promote left behind - handed up
+    /// for the ring's body pool to retain or free under its byte
+    /// budget - so one oversized message does not leave the connection
+    /// carrying its buffer for the rest of its life, which is the
+    /// retention the pools exist to end.
+    pub(crate) fn release(&mut self) -> (Option<RecvClaim>, Option<Vec<u8>>) {
         if self.filled > 0 {
-            return None;
+            return (None, None);
         }
         #[cfg(all(feature = "net-server", feature = "uring-fs"))]
         if self.write_leased.get() {
             // A write op owns the buffer; it will be released through the
             // completion's lease, never through the connection.
-            return None;
+            return (None, None);
         }
-        if self.pooled && !self.owned.is_empty() {
-            self.owned = Vec::new();
-        }
-        self.claim.take()
+        let surplus = (self.pooled && !self.owned.is_empty())
+            .then(|| std::mem::take(&mut self.owned));
+        (self.claim.take(), surplus)
     }
 
     /// Whether the buffer in hand covers a whole message of `total` bytes.
@@ -325,6 +332,7 @@ impl RecvBuf {
         &mut self,
         at: usize,
         want: usize,
+        seed: impl FnOnce() -> Option<Vec<u8>>,
     ) -> Option<RecvClaim> {
         // Unreachable while a leased write holds the claim - no recv is
         // armed between the write's submit and the delivery's consume - and
@@ -338,6 +346,14 @@ impl RecvBuf {
         let c = self.claim?;
         if at.saturating_add(want) <= c.cap {
             return None;
+        }
+        // Reused storage from the ring's body pool where one waits.
+        // Deferred to here so the calls that promote nothing claim
+        // nothing - a claim is a demand signal, and a false one grows
+        // the pool.
+        if let Some(s) = seed() {
+            debug_assert!(s.is_empty(), "a reused body kept bytes");
+            self.owned = s;
         }
         self.owned.clear();
         self.owned.reserve(at.saturating_add(want));
@@ -1219,7 +1235,9 @@ impl<U> Connection<U> {
 
     /// Hand the recv buffer back once nothing is buffered, so the next read
     /// acquires afresh and an idle connection holds none.
-    pub(crate) fn release_recv_buf(&mut self) -> Option<RecvClaim> {
+    pub(crate) fn release_recv_buf(
+        &mut self,
+    ) -> (Option<RecvClaim>, Option<Vec<u8>>) {
         self.recv_buf.release()
     }
 
@@ -1239,8 +1257,9 @@ impl<U> Connection<U> {
         &mut self,
         at: usize,
         want: usize,
+        seed: impl FnOnce() -> Option<Vec<u8>>,
     ) -> Option<RecvClaim> {
-        self.recv_buf.promote_for(at, want)
+        self.recv_buf.promote_for(at, want, seed)
     }
 
     /// Surrender the pool buffer unconditionally, for teardown.
@@ -1301,9 +1320,13 @@ impl<U> Connection<U> {
     ///
     /// Caller guarantees the header is fully buffered and the body is not
     /// (`header_len <= buf.len() < header_len + body_len`).
-    pub(crate) fn arm_body_recv(&mut self) -> usize {
+    pub(crate) fn arm_body_recv(&mut self, reuse: Option<Vec<u8>>) -> usize {
         let prefix = self.recv_buf.len() - self.header_len;
-        let mut body = Vec::with_capacity(self.body_len);
+        // Reused storage from the ring's body pool where one waits; the
+        // pool cleared it before reissue, so only capacity carries over.
+        let mut body = reuse.unwrap_or_default();
+        debug_assert!(body.is_empty(), "a reused body kept bytes");
+        body.reserve(self.body_len);
         body.extend_from_slice(&self.recv_buf[self.header_len..]);
         self.recv_buf.truncate(self.header_len);
         self.recv_at = prefix;
@@ -2018,7 +2041,7 @@ mod tests {
         }
         assert_eq!(c.recv_result(34), RecvOutcome::Complete);
         c.set_frame(4, 100);
-        let want = c.arm_body_recv();
+        let want = c.arm_body_recv(None);
         assert_eq!(want, 70, "prefix of 30 already copied in");
         assert_eq!(c.buffered(), 4, "buf truncated back to the header");
         // Play the kernel: fill the armed spare capacity, then complete.
@@ -2109,7 +2132,7 @@ mod tests {
         }
         assert_eq!(c.recv_result(34), RecvOutcome::Complete);
         c.set_frame(4, 100);
-        let want = c.arm_body_recv();
+        let want = c.arm_body_recv(None);
         assert_eq!(want, 70, "prefix of 30 already copied in");
         want
     }
@@ -2224,9 +2247,10 @@ mod tests {
                 | Op::SpliceDeadline
                 | Op::Connect
                 | Op::RecvRetry
-                | Op::ReceiptDeadline => {}
+                | Op::ReceiptDeadline
+                | Op::Maintain => {}
             }
-            23
+            24
         };
         // Every decodable op value: `from_u8` must invert the discriminant
         // (a renumbered enum with a stale table shows up here), and the
@@ -2411,7 +2435,7 @@ mod tests {
             cap: 64,
         });
         rb.write_lease(64).expect("a claim leases").taken.set(true);
-        assert!(rb.release().is_none(), "release while leased");
+        assert!(rb.release().0.is_none(), "release while leased");
         assert!(rb.forfeit().is_none(), "forfeit while leased");
         // Forfeit dropped the claim without surrendering the bid: the op's
         // completion is the one release left, which is the point.
@@ -2463,7 +2487,7 @@ mod tests {
             cap: 64,
         });
         rb.write_lease(64).expect("a claim leases").taken.set(true);
-        let _ = rb.promote_for(0, 1 << 20);
+        let _ = rb.promote_for(0, 1 << 20, || None);
     }
 
     /// The shipping half of the same guard: `None`, and the claim left
@@ -2489,7 +2513,7 @@ mod tests {
         });
         rb.write_lease(64).expect("a claim leases").taken.set(true);
         assert!(
-            rb.promote_for(0, 1 << 20).is_none(),
+            rb.promote_for(0, 1 << 20, || None).is_none(),
             "promote under a lease must not surrender the claim"
         );
         assert_eq!(
