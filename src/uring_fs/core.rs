@@ -1229,8 +1229,9 @@ impl FsCore {
             }
             // The per-owner ceiling (see `armed_timers`). `EBUSY` with
             // the refusal mark, like a full table: the caller holds a
-            // deadline already, and its completion is when arming again
-            // makes sense.
+            // deadline already, and its completion - or its retraction,
+            // which returns the headroom on the spot - is when arming
+            // again makes sense.
             if let Some(cap) = self.timer_cap
                 && self.armed_timers.get(o).copied().unwrap_or(0) >= cap
             {
@@ -1303,7 +1304,36 @@ impl FsCore {
         {
             return;
         }
+        if entry.state.retracted {
+            // Already retracted - `Timer` is `Copy` and retraction is
+            // idempotent - and the headroom below went back the first
+            // time, so a second pass must return nothing twice.
+            return;
+        }
         entry.state.retracted = true;
+        // The owner's cap headroom returns at the retraction, not at
+        // the CQE it hastens: the natural pattern this call invites -
+        // retract one deadline and arm its replacement inside the same
+        // delivery - would otherwise be refused at the cap for the
+        // width of a reap, which is not observable from inside the
+        // callback that retracted. The slot itself still frees at the
+        // timer's CQE, so an owner mid-swap briefly holds up to twice
+        // its cap in slots; `take_op` skips a retracted entry's
+        // decrement, keeping the pair exact.
+        let o = match &entry.state.waiter {
+            Some(FsWaiter::Embedded { owner: Some(o), .. }) => Some(*o),
+            _ => None,
+        };
+        if let Some(o) = o {
+            if let Some(n) = self.armed_timers.get_mut(&o) {
+                *n -= 1;
+                if *n == 0 {
+                    self.armed_timers.remove(&o);
+                }
+            } else {
+                debug_assert!(false, "a retraction with no armed count");
+            }
+        }
         self.submit_cancel(eng, pack_raw(TAG_TIMEOUT, slot, generation as u32));
     }
 
@@ -2123,7 +2153,13 @@ impl FsCore {
         // paired on the entry's own lifecycle whoever staged the
         // cancel.
         let charged = match (tag, &e.waiter) {
-            (TAG_TIMEOUT, Some(FsWaiter::Embedded { owner: Some(o), .. })) => {
+            // A retracted timer returned its headroom at the
+            // retraction itself (`retract_timeout`); only the
+            // unretracted endings - expiry, the teardown drain, the
+            // sweep's cancel - return it here.
+            (TAG_TIMEOUT, Some(FsWaiter::Embedded { owner: Some(o), .. }))
+                if !e.retracted =>
+            {
                 Some(*o)
             }
             (TAG_OPEN, Some(FsWaiter::Embedded { owner: Some(o), .. }))
@@ -3157,8 +3193,15 @@ impl<'a> FsConn<'a> {
             })
     }
 
-    /// Retract a timer armed by [`timeout`](Self::timeout), freeing its
-    /// op slot ahead of its expiry.
+    /// Retract a timer armed by [`timeout`](Self::timeout), ending its
+    /// wall-clock hold ahead of its expiry.
+    ///
+    /// What comes back when: the owner's **cap headroom returns
+    /// here**, synchronously, so retracting one deadline and arming
+    /// its replacement inside the same delivery holds at any cap; the
+    /// **op slot follows at the retracted timer's CQE**, which the
+    /// staged cancel hastens but this call cannot wait for - an owner
+    /// mid-swap briefly holds up to twice its cap in slots.
     ///
     /// The timer completes `ECANCELED` **with
     /// [`FsDone::was_refused`] true** and `on_done` fires with it, so a
@@ -3168,8 +3211,9 @@ impl<'a> FsConn<'a> {
     /// healthy retraction must not read as that. Best-effort and
     /// idempotent: the token is verified against the table before
     /// anything is staged, so a [`Timer`] that already fired - or one
-    /// minted by a different reactor - retracts nothing. Nothing is
-    /// reported here either way; the answer arrives at `on_done`.
+    /// minted by a different reactor, or retracted once already -
+    /// retracts nothing. Nothing is reported here either way; the
+    /// answer arrives at `on_done`.
     pub fn cancel_timeout(&mut self, timer: Timer) {
         self.fs.retract_timeout(
             self.eng,

@@ -2242,28 +2242,73 @@ mod tests {
             "another owner's first arm is its own"
         );
 
-        // A completion - here a retraction - returns the headroom. The
-        // count comes back with the timer's own CQE, not with the
-        // cancel being staged, so the reap has to land before the
-        // headroom is real - drive until the count moves.
+        // A retraction returns the headroom on the spot - before any
+        // CQE - so the natural retract-then-rearm inside one delivery
+        // holds at the cap. (The slot itself still comes back at the
+        // retracted timer's CQE.)
         {
             let mut conn = FsConn::new(&mut fs, &mut eng, None);
             conn.cancel_timeout(a1.expect("armed above"));
         }
+        assert_eq!(
+            fs.armed_timers_for_test(&(1, 1)),
+            1,
+            "the retraction must return the headroom synchronously"
+        );
+        assert!(
+            arm(&mut fs, &mut eng, (1, 1)).is_some(),
+            "so the replacement deadline arms in the same delivery"
+        );
+        // And the retracted timer's own CQE must not return it twice:
+        // drive until its slot frees, then the count still covers the
+        // two live arms.
+        let free_before_cqe = fs.op_free_len_for_test();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while fs.armed_timers_for_test(&(1, 1)) != 1 {
+        while fs.op_free_len_for_test() != free_before_cqe + 1 {
             assert!(
                 Instant::now() < deadline,
-                "the retraction never returned the headroom"
+                "the retracted timer's CQE never landed"
             );
             if turn(&mut fs, &mut eng) == 0 {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        assert!(
-            arm(&mut fs, &mut eng, (1, 1)).is_some(),
-            "the completion must return the owner's headroom"
+        assert_eq!(
+            fs.armed_timers_for_test(&(1, 1)),
+            2,
+            "a retraction's headroom must not come back a second time"
         );
+    }
+
+    /// Retraction is idempotent in the headroom too: a `Timer` is
+    /// `Copy`, so a caller can retract one arm twice, and the second
+    /// pass must return nothing - a double return would spend another
+    /// live timer's count.
+    #[test]
+    fn a_double_retraction_returns_the_headroom_once() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        fs.set_timer_cap(2);
+        let hour = Duration::from_secs(3600);
+        let (t1, t2) = {
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            let t1 = conn.timeout(hour, |_d, _c| {}).expect("first arm");
+            let t2 = conn.timeout(hour, |_d, _c| {}).expect("second arm");
+            (t1, t2)
+        };
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.cancel_timeout(t1);
+            conn.cancel_timeout(t1);
+        }
+        assert_eq!(
+            fs.armed_timers_for_test(&(1, 1)),
+            1,
+            "one retraction, one return - t2's count must survive"
+        );
+        let mut conn = FsConn::new(&mut fs, &mut eng, None);
+        conn.cancel_timeout(t2);
     }
 
     /// A connection the sweep has passed may not park time on the
