@@ -972,8 +972,18 @@ pub(crate) struct RunShared {
     /// pass is taken by that pass or by its trailing poke; a wake
     /// landing outside one has nothing scheduled to collect it, so it
     /// must poke for itself. Written only through
-    /// [`RunShared::begin_pass`] and [`PassGuard`], so the models and
-    /// the loop share one spelling of the ordering.
+    /// [`RunShared::begin_pass`] and [`PassGuard`].
+    ///
+    /// **Every access is the loop thread's, so all three are spelled
+    /// `Relaxed` and no ordering is claimed.** The census: both writers
+    /// run only inside the loop's delivery passes, and the single read
+    /// ([`wake_task`]) sits behind `off_loop() ||`, whose short-circuit
+    /// is exactly what keeps an off-loop waker from ever reaching it.
+    /// The module's rule stands - an ordering site needs a model that
+    /// carries a payload across it or it is unchecked - and the way
+    /// this site satisfies it is by claiming none; a change that lets
+    /// another thread read this flag must bring the ordering *and* the
+    /// model with it.
     draining: AtomicBool,
     /// The loop's shared flags and wake eventfd.
     wake: Arc<LoopShared>,
@@ -990,9 +1000,6 @@ pub(crate) struct RunShared {
 }
 
 impl RunShared {
-    /// Whether the caller is off the loop thread. Under loom there is
-    /// no thread identity to read, so a model states which side it is
-    /// exercising; both are modelled.
     /// Mark a drain pass live, answering what was there before so
     /// [`PassGuard`] can put it back.
     ///
@@ -1003,9 +1010,12 @@ impl RunShared {
     /// outer pass is already about to do. Restoring rather than
     /// clearing is one word here and removes the depth question.
     fn begin_pass(&self) -> bool {
-        self.draining.swap(true, Ordering::AcqRel)
+        self.draining.swap(true, Ordering::Relaxed)
     }
 
+    /// Whether the caller is off the loop thread. Under loom there is
+    /// no thread identity to read, so a model states which side it is
+    /// exercising; both are modelled.
     fn off_loop(&self) -> bool {
         #[cfg(loom)]
         {
@@ -1085,7 +1095,7 @@ pub(crate) fn wake_task(w: &TaskWake) -> bool {
         .unwrap_or_else(|e| e.into_inner())
         .push_back(w.id);
     w.run.ready.fetch_add(1, Ordering::Release);
-    if w.run.off_loop() || !w.run.draining.load(Ordering::Acquire) {
+    if w.run.off_loop() || !w.run.draining.load(Ordering::Relaxed) {
         w.run.wake.wake.poke();
     }
     true
@@ -1331,7 +1341,7 @@ struct PassGuard(Arc<RunShared>, bool);
 
 impl Drop for PassGuard {
     fn drop(&mut self) {
-        self.0.draining.store(self.1, Ordering::Release);
+        self.0.draining.store(self.1, Ordering::Relaxed);
     }
 }
 
@@ -1361,13 +1371,15 @@ pub(crate) fn in_pass(
     deliver: impl FnOnce(&mut FsCore, &mut Engine),
 ) {
     // `None` where the reactor has never spawned a task, and there no
-    // task wake can arrive.
-    let _pass = fs
-        .tasks
-        .run
-        .as_ref()
-        .map(Arc::clone)
-        .map(|run| PassGuard(Arc::clone(&run), run.begin_pass()));
+    // task wake can arrive. One clone, not a clone per guard: this
+    // runs once per CQE in both hosts, and the `Arc` is genuinely
+    // cross-thread, so a redundant refcount pair here is two locked
+    // RMWs on the delivery hot path - the same cost the poll loop
+    // avoids by caching its waker.
+    let _pass = fs.tasks.run.as_ref().map(Arc::clone).map(|run| {
+        let prev = run.begin_pass();
+        PassGuard(run, prev)
+    });
     deliver(fs, eng);
     drain(fs, eng);
 }
@@ -1392,7 +1404,8 @@ pub(crate) fn drain(fs: &mut FsCore, eng: &mut Engine) {
     if budget == 0 {
         return;
     }
-    let _pass = PassGuard(Arc::clone(&run), run.begin_pass());
+    let prev = run.begin_pass();
+    let _pass = PassGuard(run, prev);
     while budget > 0 {
         let Some(id) = fs.tasks.run.as_ref().and_then(|r| r.take_ready())
         else {
@@ -3930,6 +3943,87 @@ mod tests {
         assert!(
             pending_pokes(&run) > 0,
             "nothing poked: the loop will park and never schedule it"
+        );
+    }
+
+    /// A nested drain ending does not un-mark the outer pass.
+    ///
+    /// `PassGuard` restores the value it displaced rather than storing
+    /// `false`; get that wrong and a callback that calls
+    /// [`FsConn::run_woken`] mid-delivery clears the mark for the rest
+    /// of the outer pass, so every later on-loop wake in it pokes the
+    /// eventfd for work the pass's own trailing drain is already about
+    /// to do. The nested-restore property had no in-tree detector -
+    /// reinstating the clear left the whole suite green - which is what
+    /// this exists to be. The nested drain is fed a woken task of its
+    /// own, because a drain with nothing queued returns before its
+    /// guard exists.
+    #[test]
+    fn a_nested_drain_keeps_the_outer_pass_marked() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+
+        // A task that parks once and hands its waker out.
+        struct Park {
+            waker_out: Rc<RefCell<Option<Waker>>>,
+            polled: Rc<StdCell<u32>>,
+        }
+        impl Future for Park {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                self.polled.set(self.polled.get() + 1);
+                if self.polled.get() == 1 {
+                    *self.waker_out.borrow_mut() = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+                Poll::Ready(())
+            }
+        }
+
+        let park = || {
+            (
+                Rc::new(RefCell::new(None::<Waker>)),
+                Rc::new(StdCell::new(0u32)),
+            )
+        };
+        let (waker_a, polled_a) = park();
+        let (waker_b, polled_b) = park();
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            for (w, p) in [(&waker_a, &polled_a), (&waker_b, &polled_b)] {
+                let (w, p) = (Rc::clone(w), Rc::clone(p));
+                drop(conn.spawn(move |_t| Park {
+                    waker_out: w,
+                    polled: p,
+                }));
+            }
+        }
+        let run = Arc::clone(fs.tasks.run.as_ref().expect("run queue"));
+        let waker_a = waker_a.borrow_mut().take().expect("A parked");
+        let waker_b = waker_b.borrow_mut().take().expect("B parked");
+
+        // A is woken outside any pass - that poke is legitimate and is
+        // drained off the counter before the measurement starts.
+        waker_a.wake();
+        let _ = pending_pokes(&run);
+
+        in_pass(&mut fs, &mut eng, |fs, eng| {
+            // The nested pass has A queued, so it really runs: marks,
+            // polls A, and its guard restores on the way out.
+            drain(fs, eng);
+            // An on-loop wake after it ended, still inside the outer
+            // pass: collected by the outer pass's trailing drain, so a
+            // poke here is a wasted syscall.
+            waker_b.wake_by_ref();
+        });
+        assert_eq!(polled_a.get(), 2, "the nested drain ran A");
+        assert_eq!(polled_b.get(), 2, "the outer pass's drain ran B");
+        assert_eq!(
+            pending_pokes(&run),
+            0,
+            "a wake inside the outer pass poked: the nested drain \
+             un-marked it"
         );
     }
 

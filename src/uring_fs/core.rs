@@ -1631,29 +1631,39 @@ impl FsCore {
             let swept = self.closed_owners.entry(slot).or_insert(generation);
             *swept = (*swept).max(generation);
         }
-        if self.op_free.len() == self.ops.len() {
+        // Bounded by the in-flight count, not the table: a slot is in
+        // `op_free` iff free (all three push sites clear the entry and
+        // bump the generation first), so the difference is exactly how
+        // many in-flight entries the scan can meet, and it stops once
+        // it has seen them all. The empty-table early-out above is what
+        // an idle server hits; this is what a *loaded* one does - at
+        // least one op in flight plus a trickle of closes is a steady
+        // state, and without the bound every close in it paid the full
+        // `fs_ops + pool_size` walk on the reactor thread.
+        let mut in_flight = self.ops.len() - self.op_free.len();
+        if in_flight == 0 {
             return; // nothing in flight for anyone
         }
         owners.sort_unstable();
         // Collect targets first (the scan borrows `self.ops`), then stage.
-        let targets: Vec<u64> =
-            self.ops
-                .iter()
-                .enumerate()
-                .filter_map(|(i, entry)| {
-                    let FsOpState::InFlight { tag } = entry.state.state else {
-                        return None;
-                    };
-                    let owner = match &entry.state.waiter {
-                        Some(FsWaiter::Embedded { owner: Some(o), .. }) => *o,
-                        Some(FsWaiter::Pump { owner: o }) => *o,
-                        _ => return None,
-                    };
-                    owners.binary_search(&owner).ok().map(|_| {
-                        pack_raw(tag, i as u32, entry.generation as u32)
-                    })
-                })
-                .collect();
+        let mut targets: Vec<u64> = Vec::new();
+        for (i, entry) in self.ops.iter().enumerate() {
+            if in_flight == 0 {
+                break;
+            }
+            let FsOpState::InFlight { tag } = entry.state.state else {
+                continue;
+            };
+            in_flight -= 1;
+            let owner = match &entry.state.waiter {
+                Some(FsWaiter::Embedded { owner: Some(o), .. }) => *o,
+                Some(FsWaiter::Pump { owner: o }) => *o,
+                _ => continue,
+            };
+            if owners.binary_search(&owner).is_ok() {
+                targets.push(pack_raw(tag, i as u32, entry.generation as u32));
+            }
+        }
         for ud in targets {
             self.submit_cancel(eng, ud);
         }
@@ -6207,8 +6217,14 @@ mod routing_fuzz {
         }
         assert_eq!(inflight(&core).len(), 4, "four parked reads");
 
-        // One call for three of them; the fourth is untouched.
-        core.cancel_owned_by(&mut eng, vec![(10, 1), (11, 1), (12, 1)]);
+        // One call for three of them; the fourth is untouched. The
+        // batch arrives DESCENDING, because production `fs_closed` is
+        // pushed in close order and is not sorted: the membership test
+        // is a binary search, so an already-sorted batch here would
+        // pass with the sort deleted while production silently missed
+        // owners - their ops never cancelled, their fds parked until
+        // teardown.
+        core.cancel_owned_by(&mut eng, vec![(12, 1), (11, 1), (10, 1)]);
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut reaped = Vec::new();
