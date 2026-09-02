@@ -130,12 +130,23 @@ jobs:
     # feature subsets that avoided it - by accident, not by design.
     #
     # The count is asserted, not the exit code. A libtest filter that matches
-    # nothing exits 0, so a mistyped `--cfg looom`, a renamed `loom_` prefix
-    # or a deleted model would all read as a green lane. Bump MODELS when you
-    # add one.
+    # nothing exits 0, so a mistyped `--cfg looom` would read as a green lane.
+    #
+    # The filter selects by PATH, and every model lives in a module named
+    # `loom_tests`, so the module segment is what matches: renaming a model's
+    # `loom_` prefix does not change the count, and a test in one of those
+    # modules that is not a model is counted too (`sq_cq_ordering_spsc` is
+    # one, which is why this is 24 and not the 23 `fn loom_*` in the tree).
+    # The count is a tripwire on the total, not a census of models.
+    #
+    # Exact, not a lower bound: `-lt` against a constant one below the true
+    # count is the one failure this assertion exists to prevent. At
+    # MODELS=23 against 24 running, silencing any single model left the lane
+    # green - measured, `#[ignore]` on one gave `23 passed; 1 ignored`, and
+    # `23 -lt 23` is false. Bump MODELS when you add one; that is the point.
     - name: loom (concurrency models)
       run: |
-        MODELS=23
+        MODELS=24
         out=$(RUSTFLAGS="--cfg loom" cargo test --lib --all-features loom_ 2>&1)
         echo "$out"
         n=$(printf '%s' "$out" |
@@ -144,8 +155,8 @@ jobs:
           echo "::error::loom lane produced no 'test result: ok. N passed'"
           exit 1
         fi
-        if [ "$n" -lt "$MODELS" ]; then
-          echo "::error::loom ran $n models, expected at least $MODELS"
+        if [ "$n" -ne "$MODELS" ]; then
+          echo "::error::loom ran $n models, expected exactly $MODELS"
           exit 1
         fi
 

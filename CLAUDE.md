@@ -754,17 +754,27 @@ RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
 RUSTFLAGS="--cfg loom" cargo test --lib --features http     loom_
 (cd fuzz && cargo +nightly fuzz build)
 
+# No feature at all: the only step that proves the crate compiles with
+# every gate off. `ci.yml` runs it as its own matrix cell.
+cargo clippy --no-default-features --all-targets -- -D warnings
+
 # Every feature alone. Keep the list in step with `ci.yml`'s
 # feature-matrix job, which is the authority and also runs the pairs.
+#
+# `|| exit 1` rather than `|| break`: `break` succeeds, so a loop that
+# breaks on a failure still reports success, and a bare loop reports its
+# *last* iteration - so a feature that fails in the middle of the list
+# is lost either way unless the shell is running `set -e`. Only `exit`
+# leaves the gate.
 for f in sync-fs xattr mount acl fhandle fsiter idmap shutil \
          configfile audit secrets signal uring net-core net-server \
          net-client uring-fs http __fuzz; do
   cargo clippy --no-default-features --features "$f" \
-    --all-targets -- -D warnings || break
+    --all-targets -- -D warnings || exit 1
 done
 ```
 
-The last two steps are here because a defect got through without each,
+The last three steps are here because a defect got through without each,
 and the commit that fixed it named the gap without closing it. A
 per-feature clippy over `--all-targets` is what catches code that only
 becomes dead with one feature off - `--all-features` and a per-feature
