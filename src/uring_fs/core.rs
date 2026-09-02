@@ -2367,7 +2367,28 @@ impl std::fmt::Debug for FsConn<'_> {
 }
 
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+/// An opaque identity for the connection a facade serves - stable
+/// across every facade of one connection's deliveries and
+/// continuations, distinct across connections, across reincarnations
+/// of a slot, and across reactors. A key for consumers that multiplex
+/// per-connection state - one shared retry tick, a dedup map - sized
+/// to the same tenancy the per-owner caps meter. It carries no
+/// capability and names nothing retractable.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ConnToken {
+    core: u64,
+    owner: Owner,
+}
+
 impl<'a> FsConn<'a> {
+    /// The identity of the connection this facade acts for.
+    pub fn conn_token(&self) -> ConnToken {
+        ConnToken {
+            core: self.fs.core_id,
+            owner: self.owner,
+        }
+    }
+
     pub(crate) fn new(
         fs: &'a mut FsCore,
         eng: &'a mut Engine,
