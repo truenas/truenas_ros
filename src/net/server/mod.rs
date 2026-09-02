@@ -630,7 +630,10 @@ pub fn setup_ring(
 /// handler's own budget (`fs_ops`) plus one slot per connection for the
 /// reply path's body reads. A file tail keeps at most one read in flight,
 /// so `pool_size` bounds them exactly and a full pool of streaming bodies
-/// cannot exhaust the table out from under handler ops.
+/// cannot exhaust the table out from under handler ops. (An
+/// `SpecialFiles::Allow` open spends two handler-budget slots - its own
+/// and its guard timer's - until it answers; that is the caller's budget,
+/// like any other handler op.)
 #[cfg(feature = "uring-fs")]
 fn fs_op_slots(cfg: &ServerConfig) -> u32 {
     if cfg.fs_ops > 0 {
@@ -826,6 +829,18 @@ where
                     ceiling: cfg.fs_offload_ceiling,
                 },
             )
+        });
+        #[cfg(feature = "uring-fs")]
+        let fs = fs.map(|mut fs| {
+            // One timer per in-flight request: a parked retry tick per
+            // request is the consumer discipline, so a connection needs
+            // more concurrent timers only when more requests are in
+            // flight on it - deriving the cap from the same knob keeps
+            // the two from drifting apart. See `FsCore::armed_timers`.
+            fs.set_timer_cap(
+                u32::try_from(cfg.max_in_flight_requests).unwrap_or(u32::MAX),
+            );
+            fs
         });
         let mut core =
             Reactor::from_parts(engine, cfg.pool_size, cfg.to_core(), pads);

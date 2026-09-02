@@ -1,0 +1,89 @@
+name: Miri
+
+# The task executor's memory model, validated on every PR - the half loom
+# cannot vouch for, since a loom green proves nothing (documented
+# under-exploration) and x86's TSO hides weak-memory defects from every
+# native run: the dedup edge's old `store(false, Release)` spelling was
+# green over 200k native rounds and dies within a handful of Miri seeds.
+#
+# Miri is an interpreter, not a kernel: no syscall ever reaches one,
+# `engine_or_skip` returns None under `cfg(miri)` before touching
+# `io_uring_setup` (an unsupported foreign call would abort, not error),
+# and the ring-dependent tests skip themselves exactly as on a ring-less
+# host. What runs is the pure-executor slice - the wake protocol, the
+# slots, `reach_in` (the module's only `unsafe`) - plus the dedicated
+# weak-memory probe. Nothing here needs the QEMU lane, and nothing the
+# QEMU lane proves is visible from here.
+#
+# Its own workflow rather than a step in `ci.yml`: it needs the nightly
+# toolchain the main job deliberately avoids outside the fuzz build, it
+# runs in parallel instead of lengthening the one `check` job, and a
+# Miri red names itself in the PR's checks.
+
+on:
+  pull_request:
+  push:
+    branches: [ main, master ]
+
+concurrency:
+  group: miri-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  RUST_BACKTRACE: "1"
+
+jobs:
+  miri:
+    name: miri (task executor, weak memory)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    # Its own key: miri builds a sysroot and compiles into `target/miri`,
+    # and sharing the main job's cache would have the two evicting each
+    # other's artifacts.
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target/miri
+        key: miri-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
+
+    - name: Install Rust toolchain
+      run: rustup toolchain install nightly --profile minimal --component miri
+
+    # The module filter is mandatory: unfiltered, the first non-ring
+    # foreign call (`sigaction` in clone3) aborts the whole binary before
+    # anything interesting runs.
+    #
+    # The counts are asserted on the two SINGLE runs, on the loom lane's
+    # lesson (a libtest filter matching nothing exits 0, so a renamed
+    # module or test would otherwise read as a green lane). The
+    # many-seeds run asserts nothing about its output on purpose: the
+    # seeds run as parallel interpreters and their libtest lines
+    # interleave, so no line-shaped assertion is reliable there - its
+    # exit code is the assertion, and the single probe run above it is
+    # what pins that the filter still names a real test.
+    - name: miri
+      run: |
+        out=$(cargo +nightly miri test --lib --no-default-features \
+          --features uring-fs uring_fs::task:: 2>&1)
+        echo "$out"
+        n=$(printf '%s' "$out" |
+            sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | head -1)
+        if [ -z "$n" ] || [ "$n" -lt 10 ]; then
+          echo "::error::miri task lane ran ${n:-no} tests"
+          exit 1
+        fi
+        probe=uring_fs::task::tests::miri_a_deduped_wake_publishes_what_it_wrote
+        out=$(cargo +nightly miri test --lib --no-default-features \
+          --features uring-fs -- --exact "$probe" 2>&1)
+        echo "$out"
+        if ! printf '%s' "$out" | grep -q '^test result: ok\. 1 passed'; then
+          echo "::error::the weak-memory probe did not run or did not pass"
+          exit 1
+        fi
+        MIRIFLAGS="-Zmiri-many-seeds=0..16" cargo +nightly miri test --lib \
+          --no-default-features --features uring-fs -- --exact "$probe"

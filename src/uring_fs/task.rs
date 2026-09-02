@@ -81,9 +81,10 @@
 //!   when its ops start failing or the source feeding it closes.
 //!   **Neither of those reaches a task whose awaits are all
 //!   offloads**, because an offload is never cancelled and always
-//!   delivers, so that shape has to ask - with
-//!   [`TaskFs::owner_is_gone`]. A task that never winds down holds a
-//!   graceful drain open to its grace deadline.
+//!   delivers, so that shape has to ask - [`TaskFs::owner_is_gone`]
+//!   for "your connection closed", [`TaskFs::draining`] for "the
+//!   server is going away", polled between awaits. A task that never
+//!   winds down holds a graceful drain open to its grace deadline.
 //! - **A task's facade carries no recv-buffer claim**, so
 //!   [`pwritev2_from`](FsConn::pwritev2_from) from inside a task
 //!   copies instead of writing the delivered buffer in place. The
@@ -306,10 +307,19 @@ pub enum JoinError {
     ///
     /// A panicking task is contained: its slot retires, the reactor
     /// thread lives, and every other connection on that ring keeps
-    /// being served. Nothing else in this crate contains a panic - a
-    /// callback that unwinds still takes the loop down - so this is
-    /// deliberately the narrower promise: a task's own bug is a
-    /// request's problem, not the ring's.
+    /// being served - **unless the panicking future also holds a
+    /// destructor that panics.** The poll's unwind drops the future's
+    /// state, so a `Drop` that panics there is a panic during an
+    /// unwind, which aborts by language rule before any guard in this
+    /// crate can run; no placement of `catch_unwind` closes it. Keep
+    /// panic-on-drop guards out of task state. (Teardown is different:
+    /// there the entries drop with no unwind in progress, and one
+    /// destructor's panic is contained per slot.)
+    ///
+    /// Elsewhere in this crate a panic is not contained - a callback
+    /// that unwinds still takes the loop down - so this is deliberately
+    /// the narrower promise: a task's own bug is a request's problem,
+    /// not the ring's.
     Panic(Box<dyn std::any::Any + Send>),
     /// The task produced no output and never will: dropped at teardown
     /// before completing, or a release-build [`TaskFs::spawn`] called
@@ -871,10 +881,52 @@ impl TaskFs {
     /// graceful drain open until the grace period ends it. Poll this
     /// between awaits and return.
     ///
-    /// `true` outside a poll as well, since a handle that cannot reach
-    /// its facade has nothing left to do either.
+    /// Reached with no facade - outside this task's poll, or nested
+    /// inside a call already holding it - this cannot read the owner's
+    /// state and **must not guess "gone"**: the documented reaction to
+    /// `true` is to wind down, so a wrong `true` makes a task abandon
+    /// work for a live connection. The nested reach is the one a
+    /// helper that both submits and checks takes -
+    /// `t.fut(|c, cb| { if t.owner_is_gone() { .. } .. })` - and the
+    /// facade is parked out of the cell for exactly the extent of that
+    /// closure. Both misuses take the siblings' shape: a debug assert,
+    /// and in release the teardown state, which is the only thing
+    /// knowable from here.
     pub fn owner_is_gone(&self) -> bool {
-        with_conn(self.task, |conn| conn.owner_is_gone()).unwrap_or(true)
+        match with_conn(self.task, |conn| conn.owner_is_gone()) {
+            Some(gone) => gone,
+            None => {
+                debug_assert!(
+                    tearing_down(),
+                    "TaskFs::owner_is_gone with no facade: outside its task's poll, or nested inside a call already holding it"
+                );
+                tearing_down()
+            }
+        }
+    }
+
+    /// [`FsConn::draining`] against the running poll's facade - the
+    /// server-side half of the wind-down pair. Poll it between awaits
+    /// with [`owner_is_gone`](Self::owner_is_gone): that one ends a
+    /// task whose connection died, this one ends a task holding a
+    /// graceful drain open from a connection that is fine. Never
+    /// `true` on a standalone host; see [`FsConn::draining`].
+    ///
+    /// With no facade - outside the poll, or nested - the answer is
+    /// the teardown state, on
+    /// [`owner_is_gone`](Self::owner_is_gone)'s reasoning: a wrong
+    /// `true` makes a task abandon work, so nothing is guessed.
+    pub fn draining(&self) -> bool {
+        match with_conn(self.task, |conn| conn.draining()) {
+            Some(draining) => draining,
+            None => {
+                debug_assert!(
+                    tearing_down(),
+                    "TaskFs::draining with no facade: outside its task's poll, or nested inside a call already holding it"
+                );
+                tearing_down()
+            }
+        }
     }
 
     /// [`FsConn::spawn`] against the running poll's facade: the child
@@ -929,8 +981,18 @@ pub(crate) struct RunShared {
     /// pass is taken by that pass or by its trailing poke; a wake
     /// landing outside one has nothing scheduled to collect it, so it
     /// must poke for itself. Written only through
-    /// [`RunShared::begin_pass`] and [`PassGuard`], so the models and
-    /// the loop share one spelling of the ordering.
+    /// [`RunShared::begin_pass`] and [`PassGuard`].
+    ///
+    /// **Every access is the loop thread's, so all three are spelled
+    /// `Relaxed` and no ordering is claimed.** The census: both writers
+    /// run only inside the loop's delivery passes, and the single read
+    /// ([`wake_task`]) sits behind `off_loop() ||`, whose short-circuit
+    /// is exactly what keeps an off-loop waker from ever reaching it.
+    /// The module's rule stands - an ordering site needs a model that
+    /// carries a payload across it or it is unchecked - and the way
+    /// this site satisfies it is by claiming none; a change that lets
+    /// another thread read this flag must bring the ordering *and* the
+    /// model with it.
     draining: AtomicBool,
     /// The loop's shared flags and wake eventfd.
     wake: Arc<LoopShared>,
@@ -947,9 +1009,6 @@ pub(crate) struct RunShared {
 }
 
 impl RunShared {
-    /// Whether the caller is off the loop thread. Under loom there is
-    /// no thread identity to read, so a model states which side it is
-    /// exercising; both are modelled.
     /// Mark a drain pass live, answering what was there before so
     /// [`PassGuard`] can put it back.
     ///
@@ -960,9 +1019,12 @@ impl RunShared {
     /// outer pass is already about to do. Restoring rather than
     /// clearing is one word here and removes the depth question.
     fn begin_pass(&self) -> bool {
-        self.draining.swap(true, Ordering::AcqRel)
+        self.draining.swap(true, Ordering::Relaxed)
     }
 
+    /// Whether the caller is off the loop thread. Under loom there is
+    /// no thread identity to read, so a model states which side it is
+    /// exercising; both are modelled.
     fn off_loop(&self) -> bool {
         #[cfg(loom)]
         {
@@ -1042,7 +1104,7 @@ pub(crate) fn wake_task(w: &TaskWake) -> bool {
         .unwrap_or_else(|e| e.into_inner())
         .push_back(w.id);
     w.run.ready.fetch_add(1, Ordering::Release);
-    if w.run.off_loop() || !w.run.draining.load(Ordering::Acquire) {
+    if w.run.off_loop() || !w.run.draining.load(Ordering::Relaxed) {
         w.run.wake.wake.poke();
     }
     true
@@ -1288,7 +1350,7 @@ struct PassGuard(Arc<RunShared>, bool);
 
 impl Drop for PassGuard {
     fn drop(&mut self) {
-        self.0.draining.store(self.1, Ordering::Release);
+        self.0.draining.store(self.1, Ordering::Relaxed);
     }
 }
 
@@ -1318,13 +1380,15 @@ pub(crate) fn in_pass(
     deliver: impl FnOnce(&mut FsCore, &mut Engine),
 ) {
     // `None` where the reactor has never spawned a task, and there no
-    // task wake can arrive.
-    let _pass = fs
-        .tasks
-        .run
-        .as_ref()
-        .map(Arc::clone)
-        .map(|run| PassGuard(Arc::clone(&run), run.begin_pass()));
+    // task wake can arrive. One clone, not a clone per guard: this
+    // runs once per CQE in both hosts, and the `Arc` is genuinely
+    // cross-thread, so a redundant refcount pair here is two locked
+    // RMWs on the delivery hot path - the same cost the poll loop
+    // avoids by caching its waker.
+    let _pass = fs.tasks.run.as_ref().map(Arc::clone).map(|run| {
+        let prev = run.begin_pass();
+        PassGuard(run, prev)
+    });
     deliver(fs, eng);
     drain(fs, eng);
 }
@@ -1349,7 +1413,8 @@ pub(crate) fn drain(fs: &mut FsCore, eng: &mut Engine) {
     if budget == 0 {
         return;
     }
-    let _pass = PassGuard(Arc::clone(&run), run.begin_pass());
+    let prev = run.begin_pass();
+    let _pass = PassGuard(run, prev);
     while budget > 0 {
         let Some(id) = fs.tasks.run.as_ref().and_then(|r| r.take_ready())
         else {
@@ -1425,10 +1490,14 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: TaskId) {
             // either. A sink already taken above is a `Ready` poll whose
             // output panicked on the way out - contained, and with the
             // handle gone there is nobody left to report it to.
-            // The future's own destructors are inside the guard too:
-            // an unwinding poll leaves the future half-dropped, and a
-            // guard in it that panics on the way out has nothing else
-            // catching it on the delivery path.
+            // The future's own destructors run inside the guard too,
+            // but do not read that as containment: the poll is already
+            // unwinding, so a destructor that panics here is a panic
+            // during an unwind and aborts before this arm runs at all
+            // (see [`JoinError::Panic`]). What the guard covers is the
+            // destructor of a future dropped *by this arm* whose panic
+            // is its first - contained, so it cannot take the delivery
+            // path down.
             let _ =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let sink = entry.on_panic.take();
@@ -1840,6 +1909,15 @@ mod tests {
     /// Build a real `Engine` or signal an environment skip (mirrors the
     /// integration suites' io_uring guard, gate included).
     fn engine_or_skip() -> Option<Engine> {
+        // Under Miri there is no ring to set up - `io_uring_setup` is an
+        // unsupported foreign call that aborts the interpreter, not an
+        // errno the arm below could catch - so the skip decision has to
+        // come first. The ring-dependent tests then skip themselves
+        // exactly as they do on a ring-less host, and the Miri lane
+        // (ci.yml `miri`) runs what is left: the pure-executor paths.
+        if cfg!(miri) {
+            return None;
+        }
         match Engine::new(RING_ENTRIES, POOL) {
             Ok(e) => Some(e),
             Err(crate::Error::Errno(e))
@@ -2002,6 +2080,14 @@ mod tests {
                     "a retracted timer answers ECANCELED: {:?}",
                     d.result()
                 );
+                // Marked: ECANCELED *unmarked* is the teardown verdict
+                // a task winds down on, and a healthy retraction the
+                // caller asked for must not read as the reactor going
+                // away.
+                assert!(
+                    d.was_refused(),
+                    "a retraction must not wear the teardown verdict"
+                );
                 done.set(true);
             })
             .expect("the table armed it")
@@ -2036,6 +2122,196 @@ mod tests {
             conn.cancel_timeout(timer); // the spent one
         }
         drive(&mut fs, &mut eng, &fired, "a stale retraction is inert");
+    }
+
+    /// A `Timer` is scoped to the reactor that minted it: another
+    /// reactor on the same thread starts its table at the same slot
+    /// and generation, so without the identity check a retraction
+    /// with a foreign token cancels whoever holds that slot here.
+    #[test]
+    fn a_foreign_reactors_timer_token_retracts_nothing() {
+        let Some(mut eng_a) = engine_or_skip() else {
+            return;
+        };
+        let Some(mut eng_b) = engine_or_skip() else {
+            return;
+        };
+        let mut fs_a = FsCore::new(1, OffloadBounds::default());
+        let mut fs_b = FsCore::new(1, OffloadBounds::default());
+
+        // A's first timer and B's first timer: same slot, same
+        // generation, different reactors.
+        let fired_a = Rc::new(StdCell::new(false));
+        let token_a = {
+            let fired = Rc::clone(&fired_a);
+            let mut conn = FsConn::new(&mut fs_a, &mut eng_a, None);
+            conn.timeout(Duration::from_millis(40), move |d, _c| {
+                assert!(d.result().is_ok(), "A's timer expires normally");
+                fired.set(true);
+            })
+            .expect("A arms")
+        };
+        let fired_b = Rc::new(StdCell::new(false));
+        {
+            let fired = Rc::clone(&fired_b);
+            let mut conn = FsConn::new(&mut fs_b, &mut eng_b, None);
+            conn.timeout(Duration::from_millis(40), move |d, _c| {
+                assert!(
+                    d.result().is_ok(),
+                    "B's timer must expire - A's token cancelled it: {:?}",
+                    d.result()
+                );
+                fired.set(true);
+            })
+            .expect("B arms");
+        }
+
+        // A's token handed to B's facade: inert, not a cancel of B's
+        // timer.
+        {
+            let mut conn = FsConn::new(&mut fs_b, &mut eng_b, None);
+            conn.cancel_timeout(token_a);
+        }
+        drive(&mut fs_b, &mut eng_b, &fired_b, "B's expiry");
+        // And A's own timer still answers - untouched by the misuse.
+        drive(&mut fs_a, &mut eng_a, &fired_a, "A's expiry");
+    }
+
+    /// One connection's timers are bounded at the host's cap, and a
+    /// completion returns the headroom.
+    ///
+    /// The cap is per owner, so the tenant beside a timer-hungry
+    /// connection still arms - the two-sided starvation this exists to
+    /// prevent had a full table refusing a *different* connection's
+    /// first submission. The N+1th arm answers `EBUSY` with the
+    /// refusal mark, exactly like a full table: the caller holds a
+    /// deadline already, and its completion is when arming again makes
+    /// sense - which the retraction half below proves by reclaiming
+    /// the headroom early.
+    #[test]
+    fn a_connections_timers_are_capped_and_a_completion_frees_one() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        fs.set_timer_cap(2);
+        let hour = Duration::from_secs(3600);
+        let arm = |fs: &mut FsCore, eng: &mut Engine, owner: (u32, u64)| {
+            let mut conn = FsConn::new(fs, eng, Some(owner));
+            conn.timeout(hour, |_d, _c| {})
+        };
+
+        let a1 = arm(&mut fs, &mut eng, (1, 1));
+        let a2 = arm(&mut fs, &mut eng, (1, 1));
+        assert!(a1.is_some() && a2.is_some(), "up to the cap arms");
+        assert!(
+            arm(&mut fs, &mut eng, (1, 1)).is_none(),
+            "the third arm is refused"
+        );
+        // And the awaited form reads the refusal with its provenance -
+        // the plain callback above is dropped by contract, so the sink
+        // is where the errno lives.
+        let seen3: Rc<StdCell<Option<(bool, bool)>>> =
+            Rc::new(StdCell::new(None));
+        {
+            let out = Rc::clone(&seen3);
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            drop(conn.spawn(move |t| async move {
+                let d = t
+                    .fut(|c, cb| {
+                        c.timeout(hour, cb);
+                    })
+                    .await;
+                out.set(Some((
+                    matches!(
+                        d.result(),
+                        Err(crate::Error::Errno(Errno::EBUSY))
+                    ),
+                    d.was_refused(),
+                )));
+            }));
+        }
+        assert_eq!(
+            seen3.get(),
+            Some((true, true)),
+            "refused as this crate's own EBUSY, not silently"
+        );
+
+        // The tenant beside it is untouched by the neighbour's cap.
+        assert!(
+            arm(&mut fs, &mut eng, (2, 1)).is_some(),
+            "another owner's first arm is its own"
+        );
+
+        // A completion - here a retraction - returns the headroom. The
+        // count comes back with the timer's own CQE, not with the
+        // cancel being staged, so the reap has to land before the
+        // headroom is real - drive until the count moves.
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.cancel_timeout(a1.expect("armed above"));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fs.armed_timers_for_test(&(1, 1)) != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the retraction never returned the headroom"
+            );
+            if turn(&mut fs, &mut eng) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(
+            arm(&mut fs, &mut eng, (1, 1)).is_some(),
+            "the completion must return the owner's headroom"
+        );
+    }
+
+    /// A connection the sweep has passed may not park time on the
+    /// table. Its I/O is still welcome - finishing accepted work is
+    /// the sweep's own contract - but a timer holds a slot for
+    /// wall-clock duration, and a re-arming tick for a dead owner
+    /// strands one per arm with the only `Timer` holder the dead
+    /// handler itself. The answer is the sweep's own verdict, so the
+    /// continuation winds down the same way in either ordering.
+    #[test]
+    fn a_swept_owner_cannot_arm_a_timer() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm wake");
+        let owner = Some((6u32, 1u64));
+        let seen: Rc<StdCell<Option<(bool, bool)>>> =
+            Rc::new(StdCell::new(None));
+
+        fs.cancel_owned_by(&mut eng, vec![(6, 1)]);
+        {
+            let out = Rc::clone(&seen);
+            let mut conn = FsConn::new(&mut fs, &mut eng, owner);
+            drop(conn.spawn(move |t| async move {
+                let d = t
+                    .fut(|c, cb| {
+                        c.timeout(Duration::from_secs(3600), cb);
+                    })
+                    .await;
+                out.set(Some((
+                    matches!(
+                        d.result(),
+                        Err(crate::Error::Errno(Errno::ECANCELED))
+                    ),
+                    d.was_refused(),
+                )));
+            }));
+        }
+        let (ecanceled, refused) = seen.get().expect("answered at once");
+        assert!(ecanceled, "the sweep's verdict, not a strand");
+        assert!(
+            !refused,
+            "unmarked, exactly as an in-flight timer the sweep reached"
+        );
+        assert!(
+            fs.has_free_op(),
+            "no slot may be held for a dead connection's hour"
+        );
     }
 
     /// The timer composes with the future layer like any submission: a
@@ -2966,6 +3242,106 @@ mod tests {
         drop(fs);
     }
 
+    /// A nested `owner_is_gone` must not call a live owner dead.
+    ///
+    /// Inside a `fut`'s submit closure the facade is parked out of the
+    /// thread-local for the extent of the call, so the nested reach
+    /// cannot read the owner's state - and answering `true` there
+    /// makes the natural helper shape, a closure that both checks and
+    /// submits, abandon work for a connection that is alive. Release
+    /// half; the misuse asserts in debug like every sibling, so the
+    /// whole test is `cfg`'d the same way.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn a_nested_owner_check_does_not_call_a_live_owner_gone() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        let owner = Some((4u32, 1u64));
+        let seen: Rc<StdCell<Option<(bool, bool)>>> =
+            Rc::new(StdCell::new(None));
+        {
+            let out = Rc::clone(&seen);
+            let mut conn = FsConn::new(&mut fs, &mut eng, owner);
+            drop(conn.spawn(move |t| async move {
+                let plain = t.owner_is_gone();
+                let nested = Rc::new(StdCell::new(false));
+                let n2 = Rc::clone(&nested);
+                let t2 = &t;
+                drop(t.fut(move |_c, _cb| {
+                    n2.set(t2.owner_is_gone());
+                }));
+                out.set(Some((plain, nested.get())));
+            }));
+        }
+        let (plain, nested) = seen.get().expect("the task ran");
+        assert!(!plain, "the owner is live");
+        assert!(
+            !nested,
+            "a nested reach reported a live owner as gone - the check \
+             inside a submit closure winds a healthy handler down"
+        );
+    }
+
+    /// A re-arming task winds down when the server drains, on the
+    /// signal alone.
+    ///
+    /// Every await here succeeds and the owner stays live, so neither
+    /// of the other wind-down signals ever fires - without
+    /// [`TaskFs::draining`] this shape holds a graceful drain open to
+    /// its grace deadline, which is the case the net drain test can
+    /// only bound from above. The task is given a generous iteration
+    /// budget precisely so the signal, not the budget, is what ends
+    /// it: the negative control (the getter hardwired `false`) runs
+    /// the budget out and fails the count below.
+    #[test]
+    fn a_rearming_task_winds_down_when_the_server_drains() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm wake");
+        let rounds = Rc::new(StdCell::new(0usize));
+        let ended = Rc::new(StdCell::new(false));
+        {
+            let (n, e) = (Rc::clone(&rounds), Rc::clone(&ended));
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((9, 1)));
+            drop(conn.spawn(move |t| async move {
+                for _ in 0..64 {
+                    let _ = t.offload_fut(|| Ok::<_, crate::Error>(1u8)).await;
+                    n.set(n.get() + 1);
+                    if t.draining() {
+                        e.set(true);
+                        return;
+                    }
+                }
+            }));
+        }
+
+        // A few live rounds first: the signal is off and the task runs.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while rounds.get() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "a couple of live rounds never finished"
+            );
+            if turn(&mut fs, &mut eng) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(!ended.get(), "nothing has asked for a drain yet");
+
+        // The drain request, as the net server's shutdown_graceful
+        // makes it. The task's next between-awaits check ends it.
+        eng.shared.request_graceful(5_000);
+        drive(&mut fs, &mut eng, &ended, "the wind-down");
+        assert!(
+            rounds.get() < 64,
+            "the task ran its whole budget: the drain signal never \
+             reached it"
+        );
+        assert_eq!(fs.tasks.live.get(), 0, "and it retired");
+    }
+
     /// A task awaiting only offloads learns its owner is gone, because
     /// nothing else will tell it.
     ///
@@ -3589,6 +3965,175 @@ mod tests {
         assert!(
             pending_pokes(&run) > 0,
             "nothing poked: the loop will park and never schedule it"
+        );
+    }
+
+    /// The dedup edge publishes what a deduped waker wrote - the
+    /// property [`loom_a_deduped_wake_publishes_what_it_wrote`] models,
+    /// spelled for **Miri**, which is the only instrument on x86 that
+    /// can see it outside our own model. The hardware never shows the
+    /// stale read (TSO), loom greens prove nothing (under-exploration
+    /// is its documented unsoundness), so re-weakening `poll_window`'s
+    /// swap back to a plain store leaves everything but that one model
+    /// green - and this test, under `-Zmiri-many-seeds`, where the
+    /// weak-memory emulation supplies the stale value. Natively it
+    /// passes vacuously and costs nothing.
+    ///
+    /// **The payload must be an atomic read with `Relaxed`, and the
+    /// assertion a value, not a race.** The tempting probe - a
+    /// non-atomic payload, expecting Miri to report the missing
+    /// happens-before as a data race - is UB on the *correct* code: a
+    /// poll already in flight reads concurrently with the racing
+    /// waker's pre-wake write, which no edge orders (the coverage
+    /// contract is about polls that start *after* the wake), and
+    /// Miri's vector clocks flag the pair even when they are seconds
+    /// apart. Measured: four false races at 64 seeds with the shipped
+    /// spelling. The atomic form has no UB anywhere; the weakened edge
+    /// shows up as this assertion instead.
+    #[test]
+    fn miri_a_deduped_wake_publishes_what_it_wrote() {
+        let run = Arc::new(RunShared {
+            queue: Mutex::new(VecDeque::new()),
+            ready: AtomicUsize::new(0),
+            draining: AtomicBool::new(false),
+            wake: Arc::new(crate::uring::wake::LoopShared {
+                stop: std::sync::atomic::AtomicBool::new(false),
+                graceful: std::sync::atomic::AtomicBool::new(false),
+                grace_ms: std::sync::atomic::AtomicU64::new(0),
+                wake: crate::uring::wake::WakeHandle::new().expect("eventfd"),
+            }),
+            loop_thread: std::thread::current().id(),
+        });
+        // Iterated, because one seed is one schedule: the stale-read
+        // window needs the racing thread to skip between the latch and
+        // the poll, and a single race per execution leaves whole seed
+        // ranges never opening it. Miri's scheduler keeps drawing from
+        // the seed across iterations, so each round is a fresh
+        // interleaving - measured, this is the difference between the
+        // weakened edge surviving 16 seeds and dying inside the first.
+        for round in 0..16u64 {
+            let w = Arc::new(TaskWake {
+                id: TaskId {
+                    idx: 0,
+                    generation: 0,
+                },
+                queued: AtomicBool::new(false),
+                run: Arc::clone(&run),
+            });
+            let payload = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let want = round + 1;
+
+            // Latch the edge, so the racing wake below is the deduped
+            // one whenever the scheduler runs it before the window;
+            // where it runs after, the wake enqueues and the post-join
+            // drain covers it through the queue lock instead. Either
+            // way the last poll is the covering one - the same case
+            // split as the loom model.
+            wake_task(&w);
+            let t = {
+                let (w, p) = (Arc::clone(&w), Arc::clone(&payload));
+                std::thread::spawn(move || {
+                    p.store(want, std::sync::atomic::Ordering::Relaxed);
+                    wake_task(&w);
+                })
+            };
+            let mut last = 0u64;
+            while let Some(_id) = run.take_ready() {
+                last = poll_window(&w, || {
+                    payload.load(std::sync::atomic::Ordering::Relaxed)
+                });
+            }
+            t.join().expect("waker thread");
+            while let Some(_id) = run.take_ready() {
+                last = poll_window(&w, || {
+                    payload.load(std::sync::atomic::Ordering::Relaxed)
+                });
+            }
+            assert_eq!(
+                last, want,
+                "the poll covering the wake did not see what it published"
+            );
+        }
+    }
+
+    /// A nested drain ending does not un-mark the outer pass.
+    ///
+    /// `PassGuard` restores the value it displaced rather than storing
+    /// `false`; get that wrong and a callback that calls
+    /// [`FsConn::run_woken`] mid-delivery clears the mark for the rest
+    /// of the outer pass, so every later on-loop wake in it pokes the
+    /// eventfd for work the pass's own trailing drain is already about
+    /// to do. The nested-restore property had no in-tree detector -
+    /// reinstating the clear left the whole suite green - which is what
+    /// this exists to be. The nested drain is fed a woken task of its
+    /// own, because a drain with nothing queued returns before its
+    /// guard exists.
+    #[test]
+    fn a_nested_drain_keeps_the_outer_pass_marked() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+
+        // A task that parks once and hands its waker out.
+        struct Park {
+            waker_out: Rc<RefCell<Option<Waker>>>,
+            polled: Rc<StdCell<u32>>,
+        }
+        impl Future for Park {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                self.polled.set(self.polled.get() + 1);
+                if self.polled.get() == 1 {
+                    *self.waker_out.borrow_mut() = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+                Poll::Ready(())
+            }
+        }
+
+        let park = || {
+            (
+                Rc::new(RefCell::new(None::<Waker>)),
+                Rc::new(StdCell::new(0u32)),
+            )
+        };
+        let (waker_a, polled_a) = park();
+        let (waker_b, polled_b) = park();
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            for (w, p) in [(&waker_a, &polled_a), (&waker_b, &polled_b)] {
+                let (w, p) = (Rc::clone(w), Rc::clone(p));
+                drop(conn.spawn(move |_t| Park {
+                    waker_out: w,
+                    polled: p,
+                }));
+            }
+        }
+        let run = Arc::clone(fs.tasks.run.as_ref().expect("run queue"));
+        let waker_a = waker_a.borrow_mut().take().expect("A parked");
+        let waker_b = waker_b.borrow_mut().take().expect("B parked");
+
+        // A is woken outside any pass - that poke is legitimate and is
+        // drained off the counter before the measurement starts.
+        waker_a.wake();
+        let _ = pending_pokes(&run);
+
+        in_pass(&mut fs, &mut eng, |fs, eng| {
+            // The nested pass has A queued, so it really runs: marks,
+            // polls A, and its guard restores on the way out.
+            drain(fs, eng);
+            // An on-loop wake after it ended, still inside the outer
+            // pass: collected by the outer pass's trailing drain, so a
+            // poke here is a wasted syscall.
+            waker_b.wake_by_ref();
+        });
+        assert_eq!(polled_a.get(), 2, "the nested drain ran A");
+        assert_eq!(polled_b.get(), 2, "the outer pass's drain ran B");
+        assert_eq!(
+            pending_pokes(&run),
+            0,
+            "a wake inside the outer pass poked: the nested drain \
+             un-marked it"
         );
     }
 

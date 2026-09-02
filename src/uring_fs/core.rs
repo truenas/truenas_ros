@@ -43,6 +43,7 @@ use crate::uring::sys::{
 };
 use crate::uring::user_data::{pack_raw, unpack_raw};
 use std::any::Any;
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
@@ -102,6 +103,24 @@ pub(crate) const TAG_FSETXATTR: u8 = 0x8F;
 pub(crate) const TAG_FADVISE: u8 = 0x90;
 pub(crate) const TAG_SPLICE: u8 = 0x91;
 pub(crate) const TAG_TIMEOUT: u8 = 0x92;
+/// The guard timer riding an `Allow` open (`super::SpecialFiles`): an
+/// ordinary `IORING_OP_TIMEOUT` in its own op slot whose expiry stages
+/// an `ASYNC_CANCEL` for the open, and which the open's own completion
+/// retracts. **Not** a kernel `LINK_TIMEOUT`, which cannot do this
+/// job: `io_queue_linked_timeout` runs only after `def->issue` returns
+/// (`io_uring/io_uring.c:1850-1866`), and a force-async open's one and
+/// only issue is the blocking one on io-wq (`io_queue_sqe_fallback` ->
+/// `io_queue_iowq`, no inline attempt) - so a linked deadline on
+/// exactly the shape this exists for is armed only after the block
+/// ends. Measured: an hour-long park under a 300 ms linked deadline.
+/// `ASYNC_CANCEL` reaches the parked worker as a signal
+/// (`io_wq_worker_cancel` -> `__set_notify_signal`;
+/// `wait_for_partner` sleeps interruptibly), which is the proven path.
+///
+/// Routed by its own arm in [`FsCore::on_cqe`]: no consumer callback
+/// and no owner - the open's waiter carries both - so the entry's only
+/// cargo is the timespec and the open's routing token.
+pub(crate) const TAG_OPEN_DEADLINE: u8 = 0x93;
 /// The standalone host's wake tag (an embedded host reuses its own).
 pub(crate) const TAG_WAKE: u8 = 0x9D;
 /// Tags `ASYNC_CANCEL` ops (and the teardown drain); completions ignored.
@@ -155,9 +174,11 @@ pub(crate) enum FsWaiter {
     Embedded {
         owner: Owner,
         cb: EmbeddedCb,
-        /// Set only by the futures layer; `None` for a plain callback,
-        /// whose contract is that a drop closes the connection.
-        on_fail: Option<FailSink>,
+        /// The reason-sink share [`armed::arm`] took - holding `None`
+        /// for a plain callback, whose contract is that a drop closes
+        /// the connection. The wrapper is what makes hand-building
+        /// this variant a build failure; see [`armed`].
+        on_fail: armed::Armed,
     },
     /// A reactor-pump read (a `net` server streaming a file into a response
     /// body): no callback - [`FsCore::on_cqe`] hands the outcome back as
@@ -169,6 +190,71 @@ pub(crate) enum FsWaiter {
     Pump {
         owner: (u32, u64),
     },
+}
+
+/// The one producer of an [`FsWaiter::Embedded`]'s reason-sink share.
+///
+/// [`FsConn::fut`] tells "the op is in flight and will report for
+/// itself" from "the facade refused the arguments and nothing ever
+/// will" by whether any submission armed the staged sink, so a waiter
+/// built without arming makes `fut` answer a good op with a spurious
+/// `EINVAL` - the defect the ring timer shipped with. Folding arming
+/// into [`FsConn::waiter`] closed the front door, but `FsWaiter` is
+/// crate-visible and its variant fields were plain, so any of the
+/// fifteen submit methods could still hand-build the waiter - and the
+/// compiler's own suggested fix to the naive attempt produced exactly
+/// that spelling, copied from a test 2,500 lines below.
+///
+/// Hence a module: [`Armed`]'s field is private to it, so building one
+/// outside answers `E0603` and the one hop past *that* diagnostic is
+/// an edit to this guard, not to the call site. [`arm`] is the sole
+/// producer and does the whole dance - the clone, the double-arm
+/// check, the frame accounting - so there is no partial spelling left
+/// to reach for.
+mod armed {
+    use super::{FailSink, FsConn};
+
+    /// One submission's share of the staged reason sink.
+    pub(crate) struct Armed(Option<FailSink>);
+
+    impl Armed {
+        /// Surrender the share for delivery ([`super::deliver`]).
+        pub(super) fn take(self) -> Option<FailSink> {
+            self.0
+        }
+    }
+
+    /// Clone the staged sink and record the arm on the current frame.
+    ///
+    /// **One frame, one submission.** Every clone taken inside one
+    /// [`FsConn::fut`] frame captures that future's own slot, so
+    /// whichever of two ops is refused first fills it and the other
+    /// op's real completion is silently discarded - with its `File`,
+    /// closing a descriptor under the caller. The debug assert names
+    /// the second submission at the point it arms; it cannot
+    /// false-positive on `chain`/`walk`, whose later steps run on a
+    /// fresh facade that carries the sink but no frame.
+    pub(super) fn arm(conn: &mut FsConn<'_>) -> Armed {
+        let sink = conn.fail_sink.clone();
+        if sink.is_some()
+            && let Some(frame) = &conn.fail_armed
+        {
+            debug_assert!(
+                !frame.get(),
+                "a second submission inside one future's frame: its refusal would fill a slot belonging to the other op"
+            );
+            frame.set(true);
+        }
+        Armed(sink)
+    }
+
+    /// A share that never arms, for driving the core without a facade.
+    /// Gated exactly as its one caller (the leased-write reap test) is,
+    /// so no feature subset sees a producer with nothing producing.
+    #[cfg(all(test, not(loom), feature = "net-server"))]
+    pub(super) fn unarmed() -> Armed {
+        Armed(None)
+    }
 }
 
 /// A routed fs-domain CQE, from [`FsCore::on_cqe`]: nothing left to do (a
@@ -235,6 +321,17 @@ struct FsOpEntry {
     /// enter that submits the SQE - boxed and parked here so the address
     /// holds however many stages batch before that enter.
     ts: Option<Box<KernelTimespec>>,
+    /// This timer's `ECANCELED` was asked for ([`FsConn::cancel_timeout`]),
+    /// so the completion reports a marked retraction rather than the
+    /// teardown verdict - `ECANCELED` with [`FsDone::was_refused`] false
+    /// stays meaning teardown alone.
+    retracted: bool,
+    /// On a [`TAG_OPEN_DEADLINE`] entry: the routing token of the
+    /// `Allow` open this guard cancels if it fires.
+    cancels: Option<u64>,
+    /// On a [`TAG_OPEN`] entry: the guard timer's slot and full
+    /// generation, retracted when the open answers first.
+    guard: Option<(u32, u64)>,
     /// Keeps a path op's dirfd alive (and its fd number un-reused) while
     /// the op is in flight.
     anchor: Option<Anchor>,
@@ -285,6 +382,9 @@ impl FsOpEntry {
             strip_nonblock: false,
             stat: None,
             ts: None,
+            retracted: false,
+            cancels: None,
+            guard: None,
             anchor: None,
             anchor2: None,
             file: None,
@@ -303,6 +403,9 @@ impl FsOpEntry {
         self.path2 = None;
         self.how = None;
         self.ts = None;
+        self.retracted = false;
+        self.cancels = None;
+        self.guard = None;
         self.anchor = None;
         self.anchor2 = None;
         self.file = None;
@@ -351,6 +454,11 @@ struct Completed {
     waiter: Option<FsWaiter>,
     bufs: Vec<Vec<u8>>,
     stat: Option<Box<StatxRaw>>,
+    /// The op's `ECANCELED` was a retraction the caller asked for.
+    retracted: bool,
+    /// An `Allow` open's guard timer, to retract now that the open has
+    /// answered for itself.
+    guard: Option<(u32, u64)>,
     /// The open carried a guard `O_NONBLOCK`: the flags to restore without
     /// it, or `None` when there is nothing to strip.
     strip_nonblock: Option<u64>,
@@ -416,10 +524,11 @@ pub(crate) struct FsCore {
     /// Attribute names whose `FSETXATTR` runs under ambient credentials rather
     /// than the request identity. Empty by default - see [`PrivilegedXattrs`].
     priv_xattrs: PrivilegedXattrs,
-    /// Spawned tasks and their run queue (the futures layer,
-    /// [`super::task`]); woken tasks are polled by the delivery
-    /// functions below.
-    pub(crate) tasks: super::task::Tasks,
+    /// This reactor's identity, minted at construction, so a [`Timer`]
+    /// can be verified against the table that issued it - two reactors
+    /// on one thread both start their tables at slot 0, generation 0,
+    /// so slot + generation alone alias across them.
+    core_id: u64,
     /// The highest connection generation [`FsCore::cancel_owned_by`]
     /// has swept, per connection slot - what
     /// [`FsCore::owner_is_gone`] reads. One entry per slot and slots
@@ -427,6 +536,29 @@ pub(crate) struct FsCore {
     /// and never by how many connections have come and gone. Empty for
     /// a reactor with no owners (the standalone host).
     closed_owners: HashMap<u32, u64>,
+    /// Armed timers per owner, and the per-owner ceiling the host set
+    /// ([`FsCore::set_timer_cap`]). A timer is the one op that holds
+    /// its slot for wall-clock time rather than until an I/O
+    /// completes, so without a bound one connection could park the
+    /// whole shared handler budget for its arms' full duration -
+    /// measured at every slot of a consumer-sized table in 19 ms.
+    /// The ceiling is the host's `max_in_flight_requests`: the real
+    /// consumer's discipline is one timer per in-flight request (a
+    /// retry tick per parked claimant), so one connection needs N
+    /// concurrent timers exactly when N pipelined requests contend at
+    /// once, and a smaller constant would couple this crate to the
+    /// pipelining knob of another. `None` is uncapped - the standalone
+    /// host has one caller and no tenants to protect from each other -
+    /// and owner-less arms are never counted.
+    armed_timers: HashMap<(u32, u64), u32>,
+    timer_cap: Option<u32>,
+    /// Spawned tasks and their run queue (the futures layer,
+    /// [`super::task`]); woken tasks are polled by the delivery
+    /// functions below. **Last field on purpose**: fields drop in
+    /// declaration order, so `Tasks::drop` - which runs pending task
+    /// destructors - is the final thing to go, with everything above
+    /// already destroyed; its own doc leans on exactly that.
+    pub(crate) tasks: super::task::Tasks,
 }
 
 impl FsCore {
@@ -445,8 +577,27 @@ impl FsCore {
             next_offload: 0,
             priv_xattrs: PrivilegedXattrs::default(),
             tasks: super::task::Tasks::new(),
+            core_id: {
+                // Plain std atomic: an id fetch is not a cross-thread
+                // protocol, and loom need not model it.
+                static NEXT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             closed_owners: HashMap::new(),
+            armed_timers: HashMap::new(),
+            timer_cap: None,
         }
+    }
+
+    /// Bound armed timers per owner (see the field). Setup-time only,
+    /// on [`FsCore::set_privileged_xattrs`]'s rule: the hosts expose
+    /// it through a `&mut self` setter and their run loops also take
+    /// `&mut self`, so it cannot change while operations are in
+    /// flight.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    pub(crate) fn set_timer_cap(&mut self, per_owner: u32) {
+        self.timer_cap = Some(per_owner);
     }
 
     /// Whether `owner`'s connection has already been swept.
@@ -590,6 +741,7 @@ impl FsCore {
         path: CString,
         how: RawOpenHow,
         guarded: bool,
+        deadline: Option<std::time::Duration>,
         waiter: FsWaiter,
     ) {
         // A name-resolving op with personality 0 would run under the ring
@@ -598,6 +750,14 @@ impl FsCore {
         // this only catches an internal misuse; fail closed regardless.
         if pers == 0 {
             fail(waiter, Errno::EINVAL, Vec::new());
+            return;
+        }
+        // An `Allow` open charges two slots - its own and its guard
+        // timer's, both held until it answers - so the refusal happens
+        // here, before either pop, and the guard's pop below cannot
+        // fail.
+        if deadline.is_some() && self.op_free.len() < 2 {
+            fail(waiter, Errno::EBUSY, Vec::new());
             return;
         }
         let Some(op_slot) = self.op_free.pop() else {
@@ -633,6 +793,57 @@ impl FsCore {
         });
         if let Err(e) = staged {
             self.fail_op(op_slot, e);
+            return;
+        }
+        // An `Allow` open's bound: an ordinary timer in its own slot
+        // whose expiry stages the `ASYNC_CANCEL` that frees a worker
+        // parked inside `open(2)` itself (`fifo_open` in
+        // `wait_for_partner`; the cancel reaches it as a signal), and
+        // which the open's completion retracts. See
+        // [`TAG_OPEN_DEADLINE`] for why this is not a kernel
+        // `LINK_TIMEOUT`: one cannot bound a force-async op at all.
+        // Guarded opens cannot block, so they never pay the second
+        // slot; the two-slot charge was checked before the open's own
+        // pop, so this cannot fail for want of a slot.
+        if let Some(after) = deadline {
+            let guard_slot =
+                self.op_free.pop().expect("reserved before the open's pop");
+            let ts = Box::new(KernelTimespec {
+                tv_sec: i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
+                tv_nsec: i64::from(after.subsec_nanos()),
+            });
+            let ts_ptr = std::ptr::addr_of!(*ts) as u64;
+            let gentry = &mut self.ops[guard_slot as usize];
+            let ggen32 = gentry.generation as u32;
+            let ge = &mut gentry.state;
+            ge.state = FsOpState::InFlight {
+                tag: TAG_OPEN_DEADLINE,
+            };
+            ge.ts = Some(ts);
+            ge.cancels = Some(ud);
+            let gud = pack_raw(TAG_OPEN_DEADLINE, guard_slot, ggen32);
+            let staged = eng.stage(gud, |sqe| {
+                sqe.opcode = IORING_OP_TIMEOUT;
+                sqe.addr = ts_ptr;
+                sqe.len = 1; // exactly one timespec, per the kernel
+            });
+            match staged {
+                Ok(()) => {
+                    self.ops[op_slot as usize].state.guard = Some((
+                        guard_slot,
+                        self.ops[guard_slot as usize].generation,
+                    ));
+                }
+                Err(_) => {
+                    // The open is in flight and its bound cannot be:
+                    // cancel the open rather than let it run unbounded
+                    // - it completes `ECANCELED` like any refused work
+                    // - and free the guard's slot (its waiter is
+                    // `None`, so the fail delivers to nobody).
+                    self.fail_op(guard_slot, Errno::ECANCELED);
+                    self.submit_cancel(eng, ud);
+                }
+            }
         }
     }
 
@@ -784,6 +995,11 @@ impl FsCore {
         self.op_free.len()
     }
 
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn armed_timers_for_test(&self, owner: &(u32, u64)) -> u32 {
+        self.armed_timers.get(owner).copied().unwrap_or(0)
+    }
+
     /// Stage a reactor-pump `READV`: one positional read of up to `want`
     /// bytes at `off` into `buf`'s spare capacity, completing back through
     /// [`ReapedFs::Pump`] rather than a callback - the submission path for
@@ -926,20 +1142,62 @@ impl FsCore {
     /// caller asked for. No fd, no personality: a timer touches nothing a
     /// credential guards.
     ///
-    /// Answers the armed timer's routing token, for
-    /// [`FsCore::submit_cancel`]; `None` when the table refused it, and
-    /// then the waiter has already been failed.
+    /// Answers the armed timer's slot and full-width generation, for
+    /// [`FsConn::cancel_timeout`]'s [`Timer`]; `None` when the arm was
+    /// refused, and then the waiter has already been answered.
+    ///
+    /// **A swept owner may not park time on the table.** Post-sweep
+    /// submissions are deliberately allowed - a handler finishing an
+    /// upload it accepted has work the disconnect does not undo - but a
+    /// timer is a *wait*, not progress, and it is the one op that holds
+    /// its slot for wall-clock duration: a re-arming retry tick whose
+    /// connection died otherwise strands a slot per arm for the arm's
+    /// full length, with the only holder of the [`Timer`] the dead
+    /// handler itself. The refusal is the sweep's own verdict,
+    /// `ECANCELED` with no refusal mark - exactly what the same timer
+    /// would have answered had it been in flight when the sweep ran -
+    /// so a continuation keyed on that vocabulary winds down the same
+    /// way in both orderings.
     pub(crate) fn submit_timeout(
         &mut self,
         eng: &mut Engine,
         after: std::time::Duration,
         waiter: FsWaiter,
-    ) -> Option<u64> {
+    ) -> Option<(u32, u64)> {
+        if let FsWaiter::Embedded { owner: Some(o), .. } = &waiter {
+            if self.owner_is_gone(Some(*o)) {
+                deliver(
+                    Some(waiter),
+                    Err(Errno::ECANCELED),
+                    Vec::new(),
+                    None,
+                    None,
+                    false,
+                );
+                return None;
+            }
+            // The per-owner ceiling (see `armed_timers`). `EBUSY` with
+            // the refusal mark, like a full table: the caller holds a
+            // deadline already, and its completion is when arming again
+            // makes sense.
+            if let Some(cap) = self.timer_cap
+                && self.armed_timers.get(o).copied().unwrap_or(0) >= cap
+            {
+                fail(waiter, Errno::EBUSY, Vec::new());
+                return None;
+            }
+        }
         let Some(op_slot) = self.op_free.pop() else {
             fail(waiter, Errno::EBUSY, Vec::new());
             return None;
         };
 
+        // Saturating, like every Duration-to-timespec conversion in the
+        // crate: `get_timespec64` copies the struct verbatim and
+        // `timespec64_valid` only refuses a negative or over-range
+        // `tv_nsec` (`io_uring/timeout.c` via `__io_timeout_prep`), so
+        // a clamped i64::MAX is "effectively forever" rather than an
+        // error.
         let ts = Box::new(KernelTimespec {
             tv_sec: i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
             tv_nsec: i64::from(after.subsec_nanos()),
@@ -962,7 +1220,40 @@ impl FsCore {
             self.fail_op(op_slot, err);
             return None;
         }
-        Some(ud)
+        // Counted only once the arm is real - the refusals above never
+        // increment, so nothing decrements for them either.
+        if let Some(FsWaiter::Embedded { owner: Some(o), .. }) =
+            &self.ops[op_slot as usize].state.waiter
+        {
+            *self.armed_timers.entry(*o).or_insert(0) += 1;
+        }
+        Some((op_slot, self.ops[op_slot as usize].generation))
+    }
+
+    /// Verify `Timer`'s three fields against this table and, when they
+    /// still name a live timer, mark the entry retracted and stage the
+    /// `ASYNC_CANCEL`. Anything else - a foreign reactor's token, a
+    /// slot reissued since, an op that is not a timer - is inert.
+    pub(crate) fn retract_timeout(
+        &mut self,
+        eng: &mut Engine,
+        core: u64,
+        slot: u32,
+        generation: u64,
+    ) {
+        if core != self.core_id {
+            return;
+        }
+        let Some(entry) = self.ops.get_mut(slot as usize) else {
+            return;
+        };
+        if entry.generation != generation
+            || entry.state.state != (FsOpState::InFlight { tag: TAG_TIMEOUT })
+        {
+            return;
+        }
+        entry.state.retracted = true;
+        self.submit_cancel(eng, pack_raw(TAG_TIMEOUT, slot, generation as u32));
     }
 
     /// Stage a metadata op that targets an **open file**: `FTRUNCATE`/
@@ -1442,29 +1733,39 @@ impl FsCore {
             let swept = self.closed_owners.entry(slot).or_insert(generation);
             *swept = (*swept).max(generation);
         }
-        if self.op_free.len() == self.ops.len() {
+        // Bounded by the in-flight count, not the table: a slot is in
+        // `op_free` iff free (all three push sites clear the entry and
+        // bump the generation first), so the difference is exactly how
+        // many in-flight entries the scan can meet, and it stops once
+        // it has seen them all. The empty-table early-out above is what
+        // an idle server hits; this is what a *loaded* one does - at
+        // least one op in flight plus a trickle of closes is a steady
+        // state, and without the bound every close in it paid the full
+        // `fs_ops + pool_size` walk on the reactor thread.
+        let mut in_flight = self.ops.len() - self.op_free.len();
+        if in_flight == 0 {
             return; // nothing in flight for anyone
         }
         owners.sort_unstable();
         // Collect targets first (the scan borrows `self.ops`), then stage.
-        let targets: Vec<u64> =
-            self.ops
-                .iter()
-                .enumerate()
-                .filter_map(|(i, entry)| {
-                    let FsOpState::InFlight { tag } = entry.state.state else {
-                        return None;
-                    };
-                    let owner = match &entry.state.waiter {
-                        Some(FsWaiter::Embedded { owner: Some(o), .. }) => *o,
-                        Some(FsWaiter::Pump { owner: o }) => *o,
-                        _ => return None,
-                    };
-                    owners.binary_search(&owner).ok().map(|_| {
-                        pack_raw(tag, i as u32, entry.generation as u32)
-                    })
-                })
-                .collect();
+        let mut targets: Vec<u64> = Vec::new();
+        for (i, entry) in self.ops.iter().enumerate() {
+            if in_flight == 0 {
+                break;
+            }
+            let FsOpState::InFlight { tag } = entry.state.state else {
+                continue;
+            };
+            in_flight -= 1;
+            let owner = match &entry.state.waiter {
+                Some(FsWaiter::Embedded { owner: Some(o), .. }) => *o,
+                Some(FsWaiter::Pump { owner: o }) => *o,
+                _ => continue,
+            };
+            if owners.binary_search(&owner).is_ok() {
+                targets.push(pack_raw(tag, i as u32, entry.generation as u32));
+            }
+        }
         for ud in targets {
             self.submit_cancel(eng, ud);
         }
@@ -1481,7 +1782,7 @@ impl FsCore {
     /// for the host to route itself.
     pub(crate) fn on_cqe(
         &mut self,
-        _eng: &mut Engine,
+        eng: &mut Engine,
         tag: u8,
         op_slot: u32,
         gen32: u32,
@@ -1489,6 +1790,37 @@ impl FsCore {
     ) -> ReapedFs {
         if tag == TAG_CANCEL {
             // An ASYNC_CANCEL's own completion; nothing to route.
+            return ReapedFs::None;
+        }
+        if tag == TAG_OPEN_DEADLINE {
+            // An `Allow` open's guard: fired (`-ETIME`), retracted by
+            // the open completing first (`-ECANCELED`), or swept. Its
+            // slot frees here; only a genuine firing stages the cancel
+            // - a retracted or stale guard must not cancel whoever
+            // holds the open's slot now, which the token's generation
+            // already prevents.
+            let Some(entry) = self.ops.get_mut(op_slot as usize) else {
+                return ReapedFs::None;
+            };
+            if entry.generation as u32 != gen32
+                || entry.state.state
+                    != (FsOpState::InFlight {
+                        tag: TAG_OPEN_DEADLINE,
+                    })
+            {
+                return ReapedFs::None;
+            }
+            let cancels = entry.state.cancels.take();
+            let retracted = entry.state.retracted;
+            entry.state.clear();
+            entry.generation += 1;
+            self.op_free.push(op_slot);
+            if !retracted
+                && res == -libc::ETIME
+                && let Some(open_ud) = cancels
+            {
+                self.submit_cancel(eng, open_ud);
+            }
             return ReapedFs::None;
         }
         #[cfg_attr(not(feature = "net-server"), allow(unused_mut))]
@@ -1514,8 +1846,29 @@ impl FsCore {
             bufs,
             stat,
             strip_nonblock,
+            retracted,
+            guard,
             ..
         } = completed;
+        // The open answered, so its guard timer's hour is over: mark
+        // and cancel it, on `retract_timeout`'s exact rule - the mark
+        // keeps its `ECANCELED` from staging a cancel of a slot the
+        // open no longer holds, and the generation check makes a stale
+        // pair inert.
+        if let Some((gslot, ggen)) = guard
+            && let Some(gentry) = self.ops.get_mut(gslot as usize)
+            && gentry.generation == ggen
+            && gentry.state.state
+                == (FsOpState::InFlight {
+                    tag: TAG_OPEN_DEADLINE,
+                })
+        {
+            gentry.state.retracted = true;
+            self.submit_cancel(
+                eng,
+                pack_raw(TAG_OPEN_DEADLINE, gslot, ggen as u32),
+            );
+        }
 
         // A successful OPENAT2 returns a real fd as its result; wrap it in an
         // `Arc<OwnedFd>`. If nobody takes it (a gone channel receiver, or a
@@ -1542,6 +1895,14 @@ impl FsCore {
         if tag == TAG_TIMEOUT && result == Err(Errno::ETIME) {
             result = Ok(0);
         }
+        // A retraction the caller staged is not the reactor going away:
+        // `ECANCELED` with `was_refused` false stays meaning teardown
+        // alone (the vocabulary a task winds down on), so the answer a
+        // `cancel_timeout` asked for carries the mark. Gated on the
+        // errno as well as the flag - if the timer expired before the
+        // cancel reached it, the expiry is the answer and it is not a
+        // retraction.
+        let refused = retracted && result == Err(Errno::ECANCELED);
         // A short leased write is unrecoverable, so it must not look like
         // success: the source was the connection's receive buffer, and this
         // completion is what returns it to the pool - by the time a caller
@@ -1570,7 +1931,7 @@ impl FsCore {
                 cb,
                 FsDone {
                     result,
-                    refused: false,
+                    refused,
                     bufs,
                     file: file.map(File::new),
                     stat,
@@ -1582,7 +1943,7 @@ impl FsCore {
             Some(FsWaiter::Pump { owner }) => ReapedFs::Pump(
                 FsDone {
                     result,
-                    refused: false,
+                    refused,
                     bufs,
                     file: file.map(File::new),
                     stat,
@@ -1684,10 +2045,29 @@ impl FsCore {
             _ => return None,
         }
         let e = &mut entry.state;
+        // A timer's completion - expiry, retraction, or the teardown
+        // drain - returns its owner's headroom. Decremented here and
+        // incremented only after a successful stage, so the two are
+        // paired on the entry's own lifecycle whoever staged the
+        // cancel.
+        if tag == TAG_TIMEOUT
+            && let Some(FsWaiter::Embedded { owner: Some(o), .. }) = &e.waiter
+        {
+            if let Some(n) = self.armed_timers.get_mut(o) {
+                *n -= 1;
+                if *n == 0 {
+                    self.armed_timers.remove(o);
+                }
+            } else {
+                debug_assert!(false, "a timer completed with no armed count");
+            }
+        }
         let done = Completed {
             waiter: e.waiter.take(),
             bufs: std::mem::take(&mut e.bufs),
             stat: e.stat.take(),
+            retracted: e.retracted,
+            guard: e.guard.take(),
             strip_nonblock: e
                 .strip_nonblock
                 .then(|| e.how.as_ref().map(|h| h.flags))
@@ -1760,13 +2140,27 @@ impl std::fmt::Debug for FsDone {
 /// A timer armed by [`FsConn::timeout`], for
 /// [`FsConn::cancel_timeout`].
 ///
-/// Names one arming, not the slot: it carries the op-table generation
-/// the arm was made under, so a `Timer` kept past its own expiry
-/// cancels nothing when the slot has been reissued. Copy, because
+/// Names one arming, not the slot: it carries the reactor's identity
+/// and the **full-width** op-table generation the arm was made under,
+/// on the rule the ring's slot entries state (`uring::slots`) -
+/// a caller-retained handle must never alias a future incarnation of
+/// its slot, and the truncated 32-bit routing token is only safe
+/// because a completion cannot outlive its op, which a `Timer` held
+/// past expiry does by design. The retraction verifies all three
+/// fields against the table before staging anything, so a stale
+/// token, or one minted by a different reactor on this thread, is
+/// inert rather than a cancel of whoever holds the slot now. Copy, because
 /// retracting is idempotent and a caller that holds two deadlines
-/// should not have to track which one it has already spent.
+/// should not have to track which one it has already spent; not
+/// `Send`, because it names loop-thread state and crossing threads
+/// with it could only ever reach the wrong ring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Timer(u64);
+pub struct Timer {
+    core: u64,
+    slot: u32,
+    generation: u64,
+    _on_loop: std::marker::PhantomData<std::rc::Rc<()>>,
+}
 
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 impl FsDone {
@@ -1876,9 +2270,12 @@ impl FsDone {
 /// completion fires the `on_done` callback **inline on the loop thread**.
 ///
 /// **Re-entrancy:** callbacks run inside dispatch - never block, and drive the
-/// ring only through this facade. A submission or argument-validation failure
-/// drops `on_done` (and the continuation it captured, closing the connection),
-/// so these methods return `()`.
+/// ring only through this facade. An argument a screen here refuses answers
+/// `on_done` with a marked `EINVAL` **before the method returns**; a
+/// submission failure past the screens (a full op table) drops `on_done`
+/// (and the continuation it captured, closing the connection) unless the
+/// futures layer has staged its reason sink. These methods return `()`
+/// either way.
 ///
 /// **No method here may return data borrowed from `'a`.** The task layer
 /// parks a facade in a thread-local as `FsConn<'static>` and hands it back
@@ -1894,10 +2291,14 @@ impl FsDone {
 /// wrapper beside `with_conn` has to reproduce that bound, or it is
 /// unsound from safe code.
 ///
-/// The rule here is the belt to that brace, and today it holds only
-/// because every method returns owned values or borrows of `&self` - add
-/// one `fn x(&self) -> &'a T` and a caller could extend a borrow of the
-/// ring's tables past the poll that parked them.
+/// The rule here is the belt to that brace, and it is `reach_in`'s
+/// path it guards, not `with_conn`'s: through `with_conn` the binder
+/// already stops a caller naming the lifetime, so a `fn x(&self) ->
+/// &'a T` added here is unexploitable there - but reached at
+/// `T = FsConn<'static>` it hands out `&'static` borrows of the ring's
+/// tables from safe code, and nothing in `reach_in`'s signature is
+/// positioned to object. Keep methods returning owned values or
+/// borrows of `&self`.
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 pub struct FsConn<'a> {
     fs: &'a mut FsCore,
@@ -1920,17 +2321,23 @@ pub struct FsConn<'a> {
     /// [`FailSink`]. `None` for every callback caller, which is what
     /// keeps their drop-on-refusal contract exactly as it was.
     fail_sink: Option<FailSink>,
-    /// Whether a submission has taken a clone of `fail_sink` since it
-    /// was staged. [`FsConn::fut`] reads it to tell "the op is in flight
-    /// and reports for itself" from "`submit` returned without handing
-    /// the op to the core at all".
-    fail_armed: bool,
+    /// The current frame's arm counter: whether a submission has taken
+    /// a clone of `fail_sink` since it was staged. [`FsConn::fut`] reads
+    /// it to tell "the op is in flight and reports for itself" from
+    /// "`submit` returned without handing the op to the core at all".
+    /// Shared (`Rc`) rather than a plain bool because a two-step
+    /// dispatch submits through [`FsConn::reborrow`], and an arm made
+    /// through the reborrow must reach the frame that is watching -
+    /// a copied flag left the outer `fut` synthesising a spurious
+    /// `EINVAL` for an op in flight. `None` outside any frame, so a
+    /// facade minted per completion costs no allocation.
+    fail_armed: Option<Rc<Cell<bool>>>,
 }
 
 /// What [`FsConn::stage_fail_sink`] displaced, to be handed back to
 /// [`FsConn::restore_fail_sink`]. A `fut` nested inside another's
-/// `submit` closure must not swallow the outer's sink.
-pub(crate) struct StagedSink(Option<FailSink>, bool);
+/// `submit` closure must not swallow the outer's sink - or its frame.
+pub(crate) struct StagedSink(Option<FailSink>, Option<Rc<Cell<bool>>>);
 
 /// A view of the delivering connection's recv-pool claim, offered to the
 /// handler's fs facade for the duration of one delivery.
@@ -1975,27 +2382,30 @@ impl<'a> FsConn<'a> {
             #[cfg(feature = "net-server")]
             lease_hold: None,
             fail_sink: None,
-            fail_armed: false,
+            fail_armed: None,
         }
     }
 
     /// Stage the reason-sink every submission inside one [`FsConn::fut`]
-    /// takes a clone of, answering with what was staged before so the
-    /// caller can put it back.
+    /// takes a clone of - and the frame cell those submissions arm -
+    /// answering with what was staged before so the caller can put it
+    /// back.
     pub(crate) fn stage_fail_sink(&mut self, sink: FailSink) -> StagedSink {
         StagedSink(
             self.fail_sink.replace(sink),
-            std::mem::replace(&mut self.fail_armed, false),
+            self.fail_armed.replace(Rc::new(Cell::new(false))),
         )
     }
 
     /// Put back what [`FsConn::stage_fail_sink`] displaced, answering
     /// whether any submission armed the sink being retired. `false`
     /// means the facade refused the arguments before the op reached the
-    /// core, so nothing will ever report for it.
+    /// core, so nothing will ever report for it. Read off the shared
+    /// cell, so an arm made through a [`FsConn::reborrow`] counts.
     pub(crate) fn restore_fail_sink(&mut self, prev: StagedSink) -> bool {
         self.fail_sink = prev.0;
         std::mem::replace(&mut self.fail_armed, prev.1)
+            .is_some_and(|frame| frame.get())
     }
 
     /// Carry a multi-step call's sink onto the fresh facade a later step
@@ -2011,21 +2421,16 @@ impl<'a> FsConn<'a> {
     /// shape every submit method here hands the core.**
     ///
     /// Arming and boxing are one step because they were two, and the
-    /// second was skippable. [`FsConn::fut`] tells "the op is in flight
-    /// and will report for itself" from "the facade refused the
-    /// arguments and nothing ever will" by whether any submission armed
-    /// the sink, so a submit method that reaches the core without arming
-    /// makes `fut` answer a perfectly good op with a spurious `EINVAL` -
-    /// which is what the ring timer shipped with. There is no longer a
-    /// waiter to build without passing through here, and nothing to pass
-    /// in place of the share.
+    /// second was skippable; the share itself is only constructible in
+    /// [`armed`], so a hand-built waiter that skips arming is a build
+    /// failure rather than a spurious `EINVAL` - the defect the ring
+    /// timer shipped with.
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     fn waiter<F>(&mut self, on_done: F) -> FsWaiter
     where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let on_fail = self.fail_sink.clone();
-        self.fail_armed |= on_fail.is_some();
+        let on_fail = armed::arm(self);
         FsWaiter::Embedded {
             owner: self.owner,
             cb: Box::new(on_done),
@@ -2064,6 +2469,29 @@ impl<'a> FsConn<'a> {
         self.fs.owner_is_gone(self.owner)
     }
 
+    /// Whether the loop this facade runs on has been asked to drain
+    /// gracefully.
+    ///
+    /// The other half of [`owner_is_gone`](Self::owner_is_gone): that
+    /// one says *your connection* closed, this one says *the server*
+    /// is going away - a task whose connection is perfectly healthy
+    /// can still be the last thing holding a drain open, and this is
+    /// the signal it winds down on. Readable only between awaits, like
+    /// its sibling, so it narrows the drain for looping work (a
+    /// re-arming tick, a batch loop) and deliberately not for a single
+    /// long await - an offload is never cancelled, and its delivery is
+    /// the next chance to look.
+    ///
+    /// **Never `true` on a standalone [`UringFs`](super::UringFs)
+    /// host today** - nothing there requests a graceful drain; its
+    /// [`ShutdownHandle`](super::ShutdownHandle) stops the loop
+    /// outright - so a consumer on that host must not wait for this.
+    /// The contract is "a `true` means wind down", not "a drain will
+    /// announce itself".
+    pub fn draining(&self) -> bool {
+        self.eng.shared.graceful_requested().is_some()
+    }
+
     /// A second facade over the same delivery, for a step that dispatches
     /// twice (the window exhausting a known-length stream also carries the
     /// End stage). The recv-buffer claim moves into the reborrow - the
@@ -2080,9 +2508,11 @@ impl<'a> FsConn<'a> {
             #[cfg(feature = "net-server")]
             lease_hold: self.lease_hold.take(),
             // Cloned, not taken: both halves of a two-step dispatch
-            // submit, and both should report.
+            // submit, and both should report. The frame cell is shared,
+            // not reset - an arm made through the reborrow belongs to
+            // whatever frame is watching the outer facade.
             fail_sink: self.fail_sink.clone(),
-            fail_armed: false,
+            fail_armed: self.fail_armed.clone(),
         }
     }
 
@@ -2104,8 +2534,12 @@ impl<'a> FsConn<'a> {
     /// set unless `how` states a confinement policy of its own, on the same
     /// rule the blocking [`FsHandle::open`](crate::uring_fs::FsHandle::open)
     /// applies - a `resolve` carrying only hardening flags composes with
-    /// the default rather than replacing it. An invalid argument drops
-    /// `on_done`, closing the connection.
+    /// the default rather than replacing it. An invalid argument answers
+    /// `on_done` **before this returns** with `EINVAL` and
+    /// [`FsDone::was_refused`] true - the same verdict the mid-walk
+    /// screens give, so provenance does not depend on where the screen
+    /// fired. It is not silently dropped: a dropped continuation closes
+    /// the connection, which turns a caller bug into a shed peer.
     ///
     /// Every facade may open, a continuation's included. What that costs
     /// is the file: a continuation runs for an owner that may already be
@@ -2129,9 +2563,21 @@ impl<'a> FsConn<'a> {
             // (`open_parts`), which allows an absolute path when the caller
             // drops `RESOLVE_BENEATH`. The two validations differ on purpose;
             // do not unify them.
-            return;
+            return on_done(FsDone::refused(Errno::EINVAL), self);
         }
         let (how, special) = how.into().into_parts();
+        // An `Allow` open's mandatory bound; a zero deadline cancels the
+        // open it guards, so it is refused on the entry-screen contract
+        // like every other shape defect.
+        let deadline = match special {
+            super::SpecialFiles::Allow { deadline } => {
+                if deadline.is_zero() {
+                    return on_done(FsDone::refused(Errno::EINVAL), self);
+                }
+                Some(deadline)
+            }
+            super::SpecialFiles::Guard => None,
+        };
         let mut raw = how.to_raw();
         // BOTH of `open_parts`' rules, through the same functions: this is the
         // facade a request handler reaches with a path the peer chose, so it
@@ -2148,6 +2594,7 @@ impl<'a> FsConn<'a> {
             path.to_owned(),
             raw,
             guarded,
+            deadline,
             w,
         );
     }
@@ -2169,8 +2616,9 @@ impl<'a> FsConn<'a> {
     /// `EEXIST` is success at every component, so two callers building
     /// one tree both finish.
     ///
-    /// An invalid argument drops `on_done`, closing the connection, as
-    /// [`open`](Self::open) does. `path` must name its components plainly
+    /// An invalid argument answers `on_done` before this returns with a
+    /// marked `EINVAL`, as [`open`](Self::open) does. `path` must name
+    /// its components plainly
     /// -- relative, no `.`, no `..`, no empty component - which is
     /// [`path::relative_defect`](crate::path::relative_defect). `..` is
     /// refused rather than resolved even though `openat2` would resolve it
@@ -2209,7 +2657,7 @@ impl<'a> FsConn<'a> {
         // Judged on shape before anything is submitted, so the probe below
         // cannot admit what the walk would refuse. See the doc above.
         if crate::path::relative_defect(bytes).is_some() {
-            return;
+            return on_done(FsDone::refused(Errno::EINVAL), self);
         }
         // Owned, because each component outlives the completion that
         // consumes it. Every one is a `Leaf` by the check above.
@@ -2239,17 +2687,14 @@ impl<'a> FsConn<'a> {
         const TMPFILE_ONLY: i32 = libc::O_TMPFILE & !libc::O_DIRECTORY;
         let refused = (libc::O_CREAT | TMPFILE_ONLY) as u64;
         if raw.flags & refused != 0 {
-            return;
+            return on_done(FsDone::refused(Errno::EINVAL), self);
         }
-        // And `RESOLVE_IN_ROOT`, for the same class of reason as the two
-        // above: the bundle unioned below carries `RESOLVE_BENEATH`, which
-        // the kernel refuses to pair with it (`fs/open.c:1264`), so every
-        // component of the walk would fail `EINVAL` - after the earlier ones
-        // had already been created.
-        if raw.resolve & crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT.bits()
-            != 0
-        {
-            return;
+        // And a scoping conflict, for the same class of reason as the
+        // two above: the walk would fail `EINVAL` at every component -
+        // after the earlier ones had already been created. The rule and
+        // its citation live on `scoping_conflict`.
+        if super::scoping_conflict(raw.resolve) {
+            return on_done(FsDone::refused(Errno::EINVAL), self);
         }
         raw.flags |= libc::O_DIRECTORY as u64;
         raw.resolve |= CONFINED_RESOLVE.bits();
@@ -2298,7 +2743,10 @@ impl<'a> FsConn<'a> {
     /// `RESOLVE_IN_ROOT` - which the kernel refuses to pair with the
     /// `RESOLVE_BENEATH` unioned here - is refused at entry, before
     /// anything is submitted, so a bad argument cannot leave a
-    /// half-walked chain behind.
+    /// half-walked chain behind. The refusal answers `on_done` with a
+    /// marked `EINVAL` before this returns, exactly as the same screen
+    /// answers mid-walk on a derived name - one verdict per defect,
+    /// wherever it fires.
     pub fn open_chain<F>(
         &mut self,
         anchor: &Anchor,
@@ -2311,39 +2759,28 @@ impl<'a> FsConn<'a> {
         // step cannot be judged here — it has no path yet — so the walk
         // judges it when it produces one, on the same rule.
         if steps.is_empty() {
-            return;
+            return on_done(FsDone::refused(Errno::EINVAL), self);
         }
         if matches!(steps[0].path, StepPath::Derived(_)) {
             // Nothing has been opened, so there is nothing to derive
             // from.
-            return;
+            return on_done(FsDone::refused(Errno::EINVAL), self);
         }
         for step in &steps {
             if let StepPath::Fixed(path) = &step.path
                 && crate::path::relative_defect(path.to_bytes()).is_some()
             {
-                return;
+                return on_done(FsDone::refused(Errno::EINVAL), self);
             }
             if creation_refused(step.how.to_raw().flags) {
-                return;
+                return on_done(FsDone::refused(Errno::EINVAL), self);
             }
-            // `chain` unions `CONFINED_RESOLVE` onto every step, and
-            // `RESOLVE_BENEATH` is in it: "Scoping flags are mutually
-            // exclusive" (`build_open_flags`, `fs/open.c:1263-1265`), so
-            // a caller's `RESOLVE_IN_ROOT` makes every step `EINVAL` -
-            // and with `was_refused` false, which tells the caller the
-            // *kernel* objected to their path when this crate added the
-            // bit that made it object. Screened here rather than fixed
-            // up in `chain`, on `mkdir_path`'s rule: routing through
-            // `confine_resolve` instead would union only
-            // `CONFINED_HARDENING` once a policy bit is set, silently
-            // dropping the `RESOLVE_NO_SYMLINKS` a multi-personality
-            // chain needs more rather than less.
-            if step.how.to_raw().resolve
-                & crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT.bits()
-                != 0
-            {
-                return;
+            // A scoping conflict would otherwise make every step
+            // `EINVAL` with the kernel blamed for a bit this crate
+            // added; the rule and its citation live on
+            // `scoping_conflict`.
+            if super::scoping_conflict(step.how.to_raw().resolve) {
+                return on_done(FsDone::refused(Errno::EINVAL), self);
             }
         }
         let steps: VecDeque<OpenStep> = steps.into();
@@ -2376,7 +2813,7 @@ impl<'a> FsConn<'a> {
     {
         let w = self.waiter(on_done);
         self.fs
-            .submit_open(self.eng, who.0, anchor, path, how, guarded, w);
+            .submit_open(self.eng, who.0, anchor, path, how, guarded, None, w);
     }
 
     /// Scattered positional read with per-operation flags (`preadv2(2)`).
@@ -2513,7 +2950,6 @@ impl<'a> FsConn<'a> {
             });
             if let (Some((_, taken)), Some(hold)) = (leased, hold) {
                 let w = self.waiter(on_done);
-                let w = w;
                 match self.fs.submit_pwritev2_leased(
                     self.eng,
                     who.0,
@@ -2583,8 +3019,19 @@ impl<'a> FsConn<'a> {
     /// the I/O completes, and the table is sized on that. So a deadline
     /// armed for 30 s and reached in 3 ms costs the other 29.997 s of
     /// the handler budget unless it is retracted, which is what the
-    /// returned [`Timer`] is for. `None` means the table refused the
-    /// arm; `on_done` has already been answered `EBUSY`.
+    /// returned [`Timer`] is for.
+    ///
+    /// `None` means the arm was refused - a full table, a staging
+    /// failure, or a connection the teardown sweep has already passed,
+    /// which may finish I/O but not park time on the table. The refusal
+    /// reaches `on_done`'s frame the way every refused submission does:
+    /// through the staged reason sink where one is armed (an awaited
+    /// [`fut`](FsConn::fut) reads the errno and
+    /// [`FsDone::was_refused`]), and otherwise by dropping the callback
+    /// unfired, which for a request-handler continuation closes the
+    /// connection. Nothing is delivered *to* a plain `on_done` on
+    /// refusal - it never ran, and the `None` is the caller's copy of
+    /// that fact.
     pub fn timeout<F>(
         &mut self,
         after: std::time::Duration,
@@ -2594,21 +3041,37 @@ impl<'a> FsConn<'a> {
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
         let w = self.waiter(on_done);
-        self.fs.submit_timeout(self.eng, after, w).map(Timer)
+        let core = self.fs.core_id;
+        self.fs
+            .submit_timeout(self.eng, after, w)
+            .map(|(slot, generation)| Timer {
+                core,
+                slot,
+                generation,
+                _on_loop: std::marker::PhantomData,
+            })
     }
 
     /// Retract a timer armed by [`timeout`](Self::timeout), freeing its
     /// op slot ahead of its expiry.
     ///
-    /// The timer completes `ECANCELED` and `on_done` fires with it, so
-    /// a caller still gets exactly one answer per arm - which is why
-    /// this is the retraction rather than a way to make one vanish.
-    /// Best-effort and idempotent: a [`Timer`] that has already fired
-    /// names a generation the slot no longer carries, so the kernel
-    /// finds nothing and the cancel is inert. Nothing is reported
-    /// either way; the answer arrives at `on_done`.
+    /// The timer completes `ECANCELED` **with
+    /// [`FsDone::was_refused`] true** and `on_done` fires with it, so a
+    /// caller still gets exactly one answer per arm and the answer says
+    /// what it was - `ECANCELED` unmarked stays meaning the reactor is
+    /// going away, which is the verdict a task winds down on, and a
+    /// healthy retraction must not read as that. Best-effort and
+    /// idempotent: the token is verified against the table before
+    /// anything is staged, so a [`Timer`] that already fired - or one
+    /// minted by a different reactor - retracts nothing. Nothing is
+    /// reported here either way; the answer arrives at `on_done`.
     pub fn cancel_timeout(&mut self, timer: Timer) {
-        self.fs.submit_cancel(self.eng, timer.0);
+        self.fs.retract_timeout(
+            self.eng,
+            timer.core,
+            timer.slot,
+            timer.generation,
+        );
     }
 
     /// Flush the byte range `[offset, offset + length)` of `f` as `who`
@@ -3008,7 +3471,7 @@ impl<'a> FsConn<'a> {
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
         if target.to_bytes().is_empty() {
-            return;
+            return on_done(FsDone::refused(Errno::EINVAL), self);
         }
         let w = self.waiter(on_done);
         self.fs.submit_path_op(
@@ -4247,8 +4710,212 @@ mod hybrid_tests {
         );
     }
 
+    /// An op submitted through a reborrowed facade still reports to
+    /// the frame that is watching.
+    ///
+    /// `reborrow` clones the sink - both halves of a two-step dispatch
+    /// submit, and both should report - and used to reset the arm
+    /// counter to a fresh copy, so a `fut` whose closure reborrowed saw
+    /// nothing armed, synthesised a spurious `EINVAL` for an op in
+    /// flight, and the real completion landed in the settled slot: for
+    /// a creating open, a file made on disk whose descriptor was
+    /// dropped under the caller. The counter is shared now.
+    #[cfg(feature = "http")]
+    #[test]
+    fn a_reborrowed_submission_arms_the_outer_frame() {
+        let (mut eng, mut fs, me) = setup();
+        let dir = crate::tempdir().expect("tempdir");
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
+        let g2 = got.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                drop(c.spawn(move |t| async move {
+                    let done = t
+                        .fut(|c, cb| {
+                            let mut r = c.reborrow();
+                            r.open(
+                                me,
+                                &at,
+                                c"made",
+                                OpenHow::new()
+                                    .flags(OFlag::O_RDWR | OFlag::O_CREAT)
+                                    .mode(Mode::from_bits_truncate(0o600)),
+                                cb,
+                            );
+                        })
+                        .await;
+                    *g2.borrow_mut() = Some(done);
+                }));
+            },
+            || got.borrow().is_some(),
+        );
+        let done = got.borrow_mut().take().expect("resolved");
+        assert!(
+            done.file().is_some(),
+            "the open through the reborrow must reach this future: {:?} \
+             (was_refused={})",
+            done.result(),
+            done.was_refused()
+        );
+        assert!(dir.path().join("made").exists(), "and it really ran");
+    }
+
+    /// The debug half of the one-frame-one-submission rule: the second
+    /// arm inside one `fut` frame asserts at the point it arms, naming
+    /// the defect while both ops are still in scope.
+    #[cfg(all(feature = "net-server", debug_assertions))]
+    #[test]
+    #[should_panic(expected = "a second submission inside one future's frame")]
+    fn a_second_submission_in_one_frame_debug_asserts() {
+        let (mut eng, mut fs, me) = setup();
+        let dir = crate::tempdir().expect("tempdir");
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let mut c = FsConn::new(&mut fs, &mut eng, OWNER0);
+        let _quiet = crate::uring_fs::quiet_panics_on_this_thread();
+        drop(c.fut(|c, cb| {
+            let how = OpenHow::new().flags(OFlag::O_RDONLY);
+            c.open(me, &at, c"a", how, |_d, _c| {});
+            c.open(me, &at, c"a", how, cb);
+        }));
+    }
+
+    /// The release half has no `if` to test - both submissions arm and
+    /// the first refusal wins the slot, which `fut`'s rustdoc states as
+    /// the caller obligation - so what release pins is that the frame
+    /// mechanism itself stays: one submission in the frame reports
+    /// normally. (`a_reborrowed_submission_arms_the_outer_frame` is the
+    /// state assertion for the sharing half.)
+    #[cfg(all(feature = "net-server", not(debug_assertions)))]
+    #[test]
+    fn a_second_submission_in_one_frame_still_answers_the_first() {
+        let (mut eng, mut fs, me) = setup();
+        let dir = nested();
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
+        let g2 = got.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                drop(c.spawn(move |t| async move {
+                    let done = t
+                        .fut(|c, cb| {
+                            let how = OpenHow::new().flags(OFlag::O_RDONLY);
+                            c.open(me, &at, c"a", how, |_d, _c| {});
+                            c.open(me, &at, c"a", how, cb);
+                        })
+                        .await;
+                    *g2.borrow_mut() = Some(done);
+                }));
+            },
+            || got.borrow().is_some(),
+        );
+        let done = got.borrow_mut().take().expect("resolved");
+        assert!(
+            done.file().is_some(),
+            "the awaited op still answers: {:?}",
+            done.result()
+        );
+    }
+
+    /// The other entry screens answer the same way `open_chain`'s do:
+    /// inline, `EINVAL`, marked as this crate's. One test per method
+    /// with a screen, so a new screen added to any of them without an
+    /// answer shows up as an unfired callback here.
+    #[test]
+    fn every_entry_screen_answers_instead_of_dropping() {
+        let (mut eng, mut fs, me) = setup();
+        let dir = nested();
+        let at = Anchor::open(dir.path()).expect("anchor");
+
+        let refused = |what: &str, got: Rc<RefCell<Option<FsDone>>>| {
+            let done = got
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| panic!("{what}: the refusal was dropped"));
+            assert!(
+                matches!(
+                    done.result(),
+                    Err(crate::Error::Errno(Errno::EINVAL))
+                ) && done.was_refused(),
+                "{what}: {:?} refused={}",
+                done.result(),
+                done.was_refused()
+            );
+        };
+
+        let mut c = FsConn::new(&mut fs, &mut eng, OWNER0);
+        for (what, path) in [
+            ("an absolute open", c"/etc/hostname"),
+            ("an empty open", c""),
+        ] {
+            let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
+            let g2 = got.clone();
+            c.open(
+                me,
+                &at,
+                path,
+                OpenHow::new().flags(OFlag::O_RDONLY),
+                move |res, _c| *g2.borrow_mut() = Some(res),
+            );
+            refused(what, got);
+        }
+
+        for (what, path, how) in [
+            (
+                "a mkdir_path with ..",
+                c"a/../b",
+                OpenHow::new().flags(OFlag::O_RDONLY),
+            ),
+            (
+                "a creating mkdir_path",
+                c"a/b",
+                OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_CREAT),
+            ),
+            (
+                "a root-scoped mkdir_path",
+                c"a/b",
+                OpenHow::new()
+                    .flags(OFlag::O_RDONLY)
+                    .resolve(crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT),
+            ),
+        ] {
+            let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
+            let g2 = got.clone();
+            c.mkdir_path(
+                me,
+                &at,
+                path,
+                Mode::from_bits_truncate(0o755),
+                how,
+                move |res, _c| *g2.borrow_mut() = Some(res),
+            );
+            refused(what, got);
+        }
+
+        let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
+        let g2 = got.clone();
+        c.symlinkat(
+            me,
+            c"",
+            &at,
+            Leaf::new("l").expect("leaf"),
+            move |res, _c| *g2.borrow_mut() = Some(res),
+        );
+        refused("an empty symlink target", got);
+        assert!(!dir.path().join("l").exists(), "nothing was created");
+    }
+
     /// Every refusal is judged on shape at entry, before anything is
-    /// submitted, so a bad argument cannot leave a half-walked chain.
+    /// submitted, so a bad argument cannot leave a half-walked chain -
+    /// and each answers `on_done` with the marked `EINVAL` before
+    /// `open_chain` returns, rather than dropping it. A dropped
+    /// callback closes the connection, which turns a caller bug into a
+    /// shed peer; and the awaited form aside, a plain-callback caller
+    /// had no way to hear the refusal at all.
     #[test]
     fn a_chain_that_cannot_be_walked_is_refused_before_it_starts() {
         let (mut eng, mut fs, me) = setup();
@@ -4315,28 +4982,31 @@ mod hybrid_tests {
             ),
         ];
         for (what, steps) in cases {
-            let fired = Rc::new(RefCell::new(false));
+            let fired: Rc<RefCell<Option<FsDone>>> =
+                Rc::new(RefCell::new(None));
             let f2 = fired.clone();
             {
                 let mut c = FsConn::new(&mut fs, &mut eng, OWNER0);
-                c.open_chain(&at, steps, move |_res, _c| {
-                    *f2.borrow_mut() = true
+                c.open_chain(&at, steps, move |res, _c| {
+                    *f2.borrow_mut() = Some(res);
                 });
             }
-            // As in the gate's test: drive on separate work, so
-            // "never fired" says the entry refused rather than that
-            // nothing was ever reaped.
-            let marker = Rc::new(RefCell::new(false));
-            let m2 = marker.clone();
-            drive(
-                &mut eng,
-                &mut fs,
-                move |c| {
-                    c.offload(|| 1u64, move |_, _| *m2.borrow_mut() = true)
-                },
-                || *marker.borrow(),
+            // Inline: the refusal is answered before `open_chain`
+            // returned, with nothing driven - which is also what pins
+            // that nothing was submitted.
+            let done = fired
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| panic!("{what}: the refusal was dropped"));
+            assert!(
+                matches!(
+                    done.result(),
+                    Err(crate::Error::Errno(Errno::EINVAL))
+                ),
+                "{what}: wrong errno {:?}",
+                done.result()
             );
-            assert!(!*fired.borrow(), "{what} must be refused at entry");
+            assert!(done.was_refused(), "{what}: the crate's own verdict");
         }
         assert!(
             !dir.path().join("a/made").exists(),
@@ -4679,6 +5349,22 @@ mod hybrid_tests {
 }
 
 fn map_res(res: i32) -> Result<i32, Errno> {
+    // The kernel-internal restart codes, which io_uring folds to
+    // `-EINTR` for reads and writes (`io_fixup_restart_res`,
+    // `io_uring/rw.c` - "Just fail this IO with EINTR") but posts
+    // verbatim for opens and splices, where the fixup is not applied.
+    // A cancelled `SpecialFiles::Allow` open blocked in `fifo_open`
+    // surfaces `-ERESTARTSYS` this way; unmapped it decodes as
+    // `UnknownErrno`, and one teardown sweep then yields two different
+    // errnos depending on where each op was parked. Folded here, once,
+    // so every fs op behaves as the kernel's own rw path does. The
+    // stream domain's splice does the same by hand
+    // (`net/core/reactor/io.rs`).
+    // Exactly the four the kernel names - 515 between them is
+    // `ENOIOCTLCMD`, not a restart code.
+    if matches!(res, -512 | -513 | -514 | -516) {
+        return Err(Errno::EINTR);
+    }
     if res < 0 {
         Err(Errno::from_raw(-res))
     } else {
@@ -4721,6 +5407,7 @@ fn deliver(
             // meaning teardown alone. The callback goes unfired either
             // way, as its contract says - the sink fills a slot and runs
             // no consumer code, so this is not an inline delivery.
+            let on_fail = on_fail.take();
             if let (true, Some(sink), Err(errno)) = (refused, &on_fail, res) {
                 sink(errno, bufs);
             } else {
@@ -4821,6 +5508,15 @@ mod routing_fuzz {
     /// Build a real `Engine` or signal an environment skip (mirrors the
     /// integration suites' io_uring guard, gate included).
     fn engine_or_skip() -> Option<Engine> {
+        // Under Miri there is no ring to set up - `io_uring_setup` is an
+        // unsupported foreign call that aborts the interpreter, not an
+        // errno the arm below could catch - so the skip decision has to
+        // come first. The ring-dependent tests then skip themselves
+        // exactly as they do on a ring-less host, and the Miri lane
+        // (ci.yml `miri`) runs what is left: the pure-executor paths.
+        if cfg!(miri) {
+            return None;
+        }
         match Engine::new(RING_ENTRIES, POOL) {
             Ok(e) => Some(e),
             Err(crate::Error::Errno(e))
@@ -5075,7 +5771,7 @@ mod routing_fuzz {
                 FsWaiter::Embedded {
                     owner: Some((0, 0)),
                     cb: Box::new(|_d, _fs| {}),
-                    on_fail: None,
+                    on_fail: armed::unarmed(),
                 },
             );
             assert!(staged.is_ok(), "staged");
@@ -5362,6 +6058,7 @@ mod routing_fuzz {
                     CString::new("x").unwrap(),
                     OpenHow::new().to_raw(),
                     false,
+                    None,
                     chan(&tx),
                 ),
                 1 | 2 if !core.op_free.is_empty() => {
@@ -5584,6 +6281,21 @@ mod routing_fuzz {
         submit(&mut core, &mut eng).expect("freed slot serves the next");
     }
 
+    /// The kernel-internal restart codes decode as `EINTR`, the way
+    /// io_uring's own rw path folds them (`io_fixup_restart_res`,
+    /// `io_uring/rw.c`), and the codes between and around them stay
+    /// themselves.
+    #[test]
+    fn restart_codes_fold_to_eintr_like_the_kernels_rw_path() {
+        for res in [-512, -513, -514, -516] {
+            assert_eq!(map_res(res), Err(Errno::EINTR), "res {res}");
+        }
+        // 515 is ENOIOCTLCMD, not a restart code; a range would eat it.
+        assert_eq!(map_res(-515), Err(Errno::from_raw(515)));
+        assert_eq!(map_res(-libc::ECANCELED), Err(Errno::ECANCELED));
+        assert_eq!(map_res(7), Ok(7));
+    }
+
     /// The sweep leaves a signal behind, because it cannot leave a
     /// gate behind.
     ///
@@ -5671,8 +6383,14 @@ mod routing_fuzz {
         }
         assert_eq!(inflight(&core).len(), 4, "four parked reads");
 
-        // One call for three of them; the fourth is untouched.
-        core.cancel_owned_by(&mut eng, vec![(10, 1), (11, 1), (12, 1)]);
+        // One call for three of them; the fourth is untouched. The
+        // batch arrives DESCENDING, because production `fs_closed` is
+        // pushed in close order and is not sorted: the membership test
+        // is a binary search, so an already-sorted batch here would
+        // pass with the sort deleted while production silently missed
+        // owners - their ops never cancelled, their fds parked until
+        // teardown.
+        core.cancel_owned_by(&mut eng, vec![(12, 1), (11, 1), (10, 1)]);
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut reaped = Vec::new();
@@ -5705,6 +6423,83 @@ mod routing_fuzz {
                 && !core.owner_is_gone(Some((13, 1))),
             "and the record is exactly the batch too"
         );
+    }
+
+    /// The teardown sweep reaching an `Allow` open retracts its guard
+    /// with it: the open completes through the sweep's cancel, its
+    /// completion marks and cancels the guard, and both slots return -
+    /// no hour-long residue for a connection that is gone.
+    #[test]
+    fn the_sweep_reaches_an_allow_open_and_its_guard_follows() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(2, OffloadBounds::default());
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let fifo = dir.path().join("pipe");
+        let cpath =
+            CString::new(fifo.as_os_str().as_encoded_bytes()).expect("no NUL");
+        // SAFETY: a NUL-terminated path this test owns.
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0, "mkfifo");
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let me = crate::uring::sys::register_personality(eng.ring.raw_fd())
+            .expect("personality");
+
+        // The forced-async blocking shape, behind an hour's guard.
+        let mut raw = OpenHow::new()
+            .flags(OFlag::O_WRONLY | OFlag::O_CREAT)
+            .mode(crate::sync_fs::Mode::from_bits_truncate(0o600))
+            .to_raw();
+        crate::uring_fs::confine_resolve(&mut raw.resolve);
+        core.submit_open(
+            &mut eng,
+            me,
+            at.clone(),
+            c"pipe".to_owned(),
+            raw,
+            false,
+            Some(std::time::Duration::from_secs(3600)),
+            FsWaiter::Pump { owner: (5, 9) },
+        );
+        assert!(
+            !core.has_free_op(),
+            "the open and its guard hold both slots"
+        );
+
+        core.cancel_owned_by(&mut eng, vec![(5, 9)]);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut open_done = false;
+        while !(open_done && core.op_free_len_for_test() == 2) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "open_done={open_done} free={}: the sweep stranded the \
+                 pair for its hour",
+                core.op_free_len_for_test()
+            );
+            eng.ring.submit().expect("submit");
+            let Some(cqe) = eng.ring.reap() else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            };
+            let (tag, slot, g) = unpack_raw(cqe.user_data);
+            if let ReapedFs::Pump(done, owner) =
+                core.on_cqe(&mut eng, tag, slot, g, cqe.res)
+            {
+                assert_eq!(owner, (5, 9));
+                assert!(
+                    matches!(
+                        done.result(),
+                        Err(crate::Error::Errno(
+                            Errno::ECANCELED | Errno::EINTR
+                        ))
+                    ),
+                    "the sweep's verdict: {:?}",
+                    done.result()
+                );
+                open_done = true;
+            }
+        }
     }
 
     #[test]

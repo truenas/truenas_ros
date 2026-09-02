@@ -97,6 +97,14 @@ Do not reopen these without a reason that is new.
   `FileTail::reading` gates body reads to one per connection and connections
   never exceed `pool_size`, so at least `fs_ops` slots always remain -
   pigeonhole, not arithmetic. The other direction is what parking handles.
+  Timers get the same *shape* of bound for a different reason: a timer is
+  the one op that holds its slot for wall-clock time rather than until an
+  I/O completes, so `FsCore::set_timer_cap` bounds them per owner at
+  `max_in_flight_requests` - the consumer discipline is one retry tick per
+  in-flight request, and a smaller constant would couple this crate to the
+  pipelining knob of another. The table is **not** resized for it: timers
+  spend the handler budget their owner already has, capped so no one
+  tenant can park it all.
 - **The `fs_ops + pool_size <= MAX_POOL` bound is about field *width*.** An
   op-slot index is packed into the 24-bit `user_data` slot field
   (`user_data::SLOT_MASK`); `TAG_FS_DOMAIN` keeping the two tag vocabularies
@@ -754,22 +762,40 @@ RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
 RUSTFLAGS="--cfg loom" cargo test --lib --features http     loom_
 (cd fuzz && cargo +nightly fuzz build)
 
+# No feature at all: the only step that proves the crate compiles with
+# every gate off. `ci.yml` runs it as its own matrix cell.
+cargo clippy --no-default-features --all-targets -- -D warnings
+
 # Every feature alone. Keep the list in step with `ci.yml`'s
 # feature-matrix job, which is the authority and also runs the pairs.
+#
+# `|| exit 1` rather than `|| break`: `break` succeeds, so a loop that
+# breaks on a failure still reports success, and a bare loop reports its
+# *last* iteration - so a feature that fails in the middle of the list
+# is lost either way unless the shell is running `set -e`. Only `exit`
+# leaves the gate.
 for f in sync-fs xattr mount acl fhandle fsiter idmap shutil \
          configfile audit secrets signal uring net-core net-server \
          net-client uring-fs http __fuzz; do
   cargo clippy --no-default-features --features "$f" \
-    --all-targets -- -D warnings || break
+    --all-targets -- -D warnings || exit 1
 done
 ```
 
-The last two steps are here because a defect got through without each,
+The last three steps are here because a defect got through without each,
 and the commit that fixed it named the gap without closing it. A
 per-feature clippy over `--all-targets` is what catches code that only
 becomes dead with one feature off - `--all-features` and a per-feature
 `build` both pass over it. `cargo doc` is the only step that resolves
 intra-doc links, so a public item pointing at a private one, or a link
 that does not resolve, is otherwise invisible until CI.
+
+CI carries one lane the local gate does not: the dedicated `miri.yml`
+workflow, on every PR. It validates the task executor's memory model -
+the one instrument on x86 that catches a re-weakening of the wake
+protocol's dedup edge without trusting our own loom model. It needs the
+nightly toolchain and no local run; the workflow's comments say what it
+covers and why the module filter and both count assertions are
+load-bearing.
 
 Report failures with their output. A skipped step is a skipped step; say so.

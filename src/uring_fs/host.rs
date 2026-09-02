@@ -341,6 +341,7 @@ impl UringFs {
                     path,
                     how,
                     guarded,
+                    deadline,
                     reply,
                 } => self.fs.submit_open(
                     &mut self.eng,
@@ -349,6 +350,7 @@ impl UringFs {
                     path,
                     how,
                     guarded,
+                    deadline,
                     FsWaiter::Channel(reply),
                 ),
                 FsInject::Rw {
