@@ -1053,9 +1053,18 @@ impl<U> Reactor<U> {
         // Reused storage for a placed body, claimed before the table
         // borrow: the pool cleared it, so only capacity carries over. The
         // client role has no pool and places into fresh storage as before.
+        // Claimed at the body's real size - the frame declared it - so a
+        // miss records the bytes actually needed, and held, so the
+        // licence survives however many maintenance ticks a slow-link
+        // receipt spans.
         #[cfg(feature = "net-server")]
         let reuse = place_body
-            .then(|| self.body_pool.as_ref().map(|p| p.borrow_mut().claim(0)))
+            .then(|| {
+                let need = self.table.conn(slot).frame().1;
+                self.body_pool
+                    .as_ref()
+                    .map(|p| p.borrow_mut().claim_held(need))
+            })
             .flatten();
         #[cfg(not(feature = "net-server"))]
         let reuse = None;
@@ -1544,8 +1553,11 @@ impl<U> Reactor<U> {
         let at = self.table.conn(slot).buffered();
         // Lazy: only a promote that actually fires claims reused storage,
         // because a claim is a demand signal the pool sizes itself by.
+        // Sized at what the promoted read needs, and held, so the
+        // licence rides the storage rather than one observation window.
         let pool = self.body_pool.as_ref();
-        let seed = || pool.map(|p| p.borrow_mut().claim(0));
+        let seed =
+            || pool.map(|p| p.borrow_mut().claim_held(at.saturating_add(want)));
         let Some(claim) =
             self.table.conn_mut(slot).promote_recv_buf(at, want, seed)
         else {
@@ -1593,11 +1605,22 @@ impl<U> Reactor<U> {
     /// and this is where that happens.
     #[cfg(feature = "net-server")]
     pub(crate) fn release_recv_buffer(&mut self, slot: u32) {
+        let delivered = self.table.conn_mut(slot).take_delivered_licence();
         let (claim, surplus) = self.table.conn_mut(slot).release_recv_buf();
-        // Promoted storage comes home with the message that outgrew the
-        // pool buffer; the next promotion anywhere on the ring reuses it.
-        if let (Some(v), Some(pool)) = (surplus, self.body_pool.as_ref()) {
-            pool.borrow_mut().give(v);
+        if let Some(pool) = self.body_pool.as_ref() {
+            let mut pool = pool.borrow_mut();
+            // A placed body just left custody with the handler; its held
+            // licence joins the windowed pot, so the consumer's recycle
+            // window opens at delivery rather than expiring mid-receipt.
+            if delivered > 0 {
+                pool.receipt_done(delivered);
+            }
+            // Promoted storage comes home with the message that outgrew
+            // the pool buffer - licence attached - and the next
+            // promotion anywhere on the ring reuses it.
+            if let Some((v, licence)) = surplus {
+                pool.give_held(v, licence);
+            }
         }
         let Some(claim) = claim else {
             return;
