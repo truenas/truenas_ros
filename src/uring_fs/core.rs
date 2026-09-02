@@ -235,6 +235,11 @@ struct FsOpEntry {
     /// enter that submits the SQE - boxed and parked here so the address
     /// holds however many stages batch before that enter.
     ts: Option<Box<KernelTimespec>>,
+    /// This timer's `ECANCELED` was asked for ([`FsConn::cancel_timeout`]),
+    /// so the completion reports a marked retraction rather than the
+    /// teardown verdict - `ECANCELED` with [`FsDone::was_refused`] false
+    /// stays meaning teardown alone.
+    retracted: bool,
     /// Keeps a path op's dirfd alive (and its fd number un-reused) while
     /// the op is in flight.
     anchor: Option<Anchor>,
@@ -285,6 +290,7 @@ impl FsOpEntry {
             strip_nonblock: false,
             stat: None,
             ts: None,
+            retracted: false,
             anchor: None,
             anchor2: None,
             file: None,
@@ -303,6 +309,7 @@ impl FsOpEntry {
         self.path2 = None;
         self.how = None;
         self.ts = None;
+        self.retracted = false;
         self.anchor = None;
         self.anchor2 = None;
         self.file = None;
@@ -351,6 +358,8 @@ struct Completed {
     waiter: Option<FsWaiter>,
     bufs: Vec<Vec<u8>>,
     stat: Option<Box<StatxRaw>>,
+    /// The op's `ECANCELED` was a retraction the caller asked for.
+    retracted: bool,
     /// The open carried a guard `O_NONBLOCK`: the flags to restore without
     /// it, or `None` when there is nothing to strip.
     strip_nonblock: Option<u64>,
@@ -420,6 +429,11 @@ pub(crate) struct FsCore {
     /// [`super::task`]); woken tasks are polled by the delivery
     /// functions below.
     pub(crate) tasks: super::task::Tasks,
+    /// This reactor's identity, minted at construction, so a [`Timer`]
+    /// can be verified against the table that issued it - two reactors
+    /// on one thread both start their tables at slot 0, generation 0,
+    /// so slot + generation alone alias across them.
+    core_id: u64,
     /// The highest connection generation [`FsCore::cancel_owned_by`]
     /// has swept, per connection slot - what
     /// [`FsCore::owner_is_gone`] reads. One entry per slot and slots
@@ -427,6 +441,22 @@ pub(crate) struct FsCore {
     /// and never by how many connections have come and gone. Empty for
     /// a reactor with no owners (the standalone host).
     closed_owners: HashMap<u32, u64>,
+    /// Armed timers per owner, and the per-owner ceiling the host set
+    /// ([`FsCore::set_timer_cap`]). A timer is the one op that holds
+    /// its slot for wall-clock time rather than until an I/O
+    /// completes, so without a bound one connection could park the
+    /// whole shared handler budget for its arms' full duration -
+    /// measured at every slot of a consumer-sized table in 19 ms.
+    /// The ceiling is the host's `max_in_flight_requests`: the real
+    /// consumer's discipline is one timer per in-flight request (a
+    /// retry tick per parked claimant), so one connection needs N
+    /// concurrent timers exactly when N pipelined requests contend at
+    /// once, and a smaller constant would couple this crate to the
+    /// pipelining knob of another. `None` is uncapped - the standalone
+    /// host has one caller and no tenants to protect from each other -
+    /// and owner-less arms are never counted.
+    armed_timers: HashMap<(u32, u64), u32>,
+    timer_cap: Option<u32>,
 }
 
 impl FsCore {
@@ -445,8 +475,27 @@ impl FsCore {
             next_offload: 0,
             priv_xattrs: PrivilegedXattrs::default(),
             tasks: super::task::Tasks::new(),
+            core_id: {
+                // Plain std atomic: an id fetch is not a cross-thread
+                // protocol, and loom need not model it.
+                static NEXT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             closed_owners: HashMap::new(),
+            armed_timers: HashMap::new(),
+            timer_cap: None,
         }
+    }
+
+    /// Bound armed timers per owner (see the field). Setup-time only,
+    /// on [`FsCore::set_privileged_xattrs`]'s rule: the hosts expose
+    /// it through a `&mut self` setter and their run loops also take
+    /// `&mut self`, so it cannot change while operations are in
+    /// flight.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    pub(crate) fn set_timer_cap(&mut self, per_owner: u32) {
+        self.timer_cap = Some(per_owner);
     }
 
     /// Whether `owner`'s connection has already been swept.
@@ -784,6 +833,11 @@ impl FsCore {
         self.op_free.len()
     }
 
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn armed_timers_for_test(&self, owner: &(u32, u64)) -> u32 {
+        self.armed_timers.get(owner).copied().unwrap_or(0)
+    }
+
     /// Stage a reactor-pump `READV`: one positional read of up to `want`
     /// bytes at `off` into `buf`'s spare capacity, completing back through
     /// [`ReapedFs::Pump`] rather than a callback - the submission path for
@@ -926,15 +980,51 @@ impl FsCore {
     /// caller asked for. No fd, no personality: a timer touches nothing a
     /// credential guards.
     ///
-    /// Answers the armed timer's routing token, for
-    /// [`FsCore::submit_cancel`]; `None` when the table refused it, and
-    /// then the waiter has already been failed.
+    /// Answers the armed timer's slot and full-width generation, for
+    /// [`FsConn::cancel_timeout`]'s [`Timer`]; `None` when the arm was
+    /// refused, and then the waiter has already been answered.
+    ///
+    /// **A swept owner may not park time on the table.** Post-sweep
+    /// submissions are deliberately allowed - a handler finishing an
+    /// upload it accepted has work the disconnect does not undo - but a
+    /// timer is a *wait*, not progress, and it is the one op that holds
+    /// its slot for wall-clock duration: a re-arming retry tick whose
+    /// connection died otherwise strands a slot per arm for the arm's
+    /// full length, with the only holder of the [`Timer`] the dead
+    /// handler itself. The refusal is the sweep's own verdict,
+    /// `ECANCELED` with no refusal mark - exactly what the same timer
+    /// would have answered had it been in flight when the sweep ran -
+    /// so a continuation keyed on that vocabulary winds down the same
+    /// way in both orderings.
     pub(crate) fn submit_timeout(
         &mut self,
         eng: &mut Engine,
         after: std::time::Duration,
         waiter: FsWaiter,
-    ) -> Option<u64> {
+    ) -> Option<(u32, u64)> {
+        if let FsWaiter::Embedded { owner: Some(o), .. } = &waiter {
+            if self.owner_is_gone(Some(*o)) {
+                deliver(
+                    Some(waiter),
+                    Err(Errno::ECANCELED),
+                    Vec::new(),
+                    None,
+                    None,
+                    false,
+                );
+                return None;
+            }
+            // The per-owner ceiling (see `armed_timers`). `EBUSY` with
+            // the refusal mark, like a full table: the caller holds a
+            // deadline already, and its completion is when arming again
+            // makes sense.
+            if let Some(cap) = self.timer_cap
+                && self.armed_timers.get(o).copied().unwrap_or(0) >= cap
+            {
+                fail(waiter, Errno::EBUSY, Vec::new());
+                return None;
+            }
+        }
         let Some(op_slot) = self.op_free.pop() else {
             fail(waiter, Errno::EBUSY, Vec::new());
             return None;
@@ -962,7 +1052,40 @@ impl FsCore {
             self.fail_op(op_slot, err);
             return None;
         }
-        Some(ud)
+        // Counted only once the arm is real - the refusals above never
+        // increment, so nothing decrements for them either.
+        if let Some(FsWaiter::Embedded { owner: Some(o), .. }) =
+            &self.ops[op_slot as usize].state.waiter
+        {
+            *self.armed_timers.entry(*o).or_insert(0) += 1;
+        }
+        Some((op_slot, self.ops[op_slot as usize].generation))
+    }
+
+    /// Verify `Timer`'s three fields against this table and, when they
+    /// still name a live timer, mark the entry retracted and stage the
+    /// `ASYNC_CANCEL`. Anything else - a foreign reactor's token, a
+    /// slot reissued since, an op that is not a timer - is inert.
+    pub(crate) fn retract_timeout(
+        &mut self,
+        eng: &mut Engine,
+        core: u64,
+        slot: u32,
+        generation: u64,
+    ) {
+        if core != self.core_id {
+            return;
+        }
+        let Some(entry) = self.ops.get_mut(slot as usize) else {
+            return;
+        };
+        if entry.generation != generation
+            || entry.state.state != (FsOpState::InFlight { tag: TAG_TIMEOUT })
+        {
+            return;
+        }
+        entry.state.retracted = true;
+        self.submit_cancel(eng, pack_raw(TAG_TIMEOUT, slot, generation as u32));
     }
 
     /// Stage a metadata op that targets an **open file**: `FTRUNCATE`/
@@ -1514,6 +1637,7 @@ impl FsCore {
             bufs,
             stat,
             strip_nonblock,
+            retracted,
             ..
         } = completed;
 
@@ -1542,6 +1666,14 @@ impl FsCore {
         if tag == TAG_TIMEOUT && result == Err(Errno::ETIME) {
             result = Ok(0);
         }
+        // A retraction the caller staged is not the reactor going away:
+        // `ECANCELED` with `was_refused` false stays meaning teardown
+        // alone (the vocabulary a task winds down on), so the answer a
+        // `cancel_timeout` asked for carries the mark. Gated on the
+        // errno as well as the flag - if the timer expired before the
+        // cancel reached it, the expiry is the answer and it is not a
+        // retraction.
+        let refused = retracted && result == Err(Errno::ECANCELED);
         // A short leased write is unrecoverable, so it must not look like
         // success: the source was the connection's receive buffer, and this
         // completion is what returns it to the pool - by the time a caller
@@ -1570,7 +1702,7 @@ impl FsCore {
                 cb,
                 FsDone {
                     result,
-                    refused: false,
+                    refused,
                     bufs,
                     file: file.map(File::new),
                     stat,
@@ -1582,7 +1714,7 @@ impl FsCore {
             Some(FsWaiter::Pump { owner }) => ReapedFs::Pump(
                 FsDone {
                     result,
-                    refused: false,
+                    refused,
                     bufs,
                     file: file.map(File::new),
                     stat,
@@ -1684,10 +1816,28 @@ impl FsCore {
             _ => return None,
         }
         let e = &mut entry.state;
+        // A timer's completion - expiry, retraction, or the teardown
+        // drain - returns its owner's headroom. Decremented here and
+        // incremented only after a successful stage, so the two are
+        // paired on the entry's own lifecycle whoever staged the
+        // cancel.
+        if tag == TAG_TIMEOUT
+            && let Some(FsWaiter::Embedded { owner: Some(o), .. }) = &e.waiter
+        {
+            if let Some(n) = self.armed_timers.get_mut(o) {
+                *n -= 1;
+                if *n == 0 {
+                    self.armed_timers.remove(o);
+                }
+            } else {
+                debug_assert!(false, "a timer completed with no armed count");
+            }
+        }
         let done = Completed {
             waiter: e.waiter.take(),
             bufs: std::mem::take(&mut e.bufs),
             stat: e.stat.take(),
+            retracted: e.retracted,
             strip_nonblock: e
                 .strip_nonblock
                 .then(|| e.how.as_ref().map(|h| h.flags))
@@ -1760,13 +1910,27 @@ impl std::fmt::Debug for FsDone {
 /// A timer armed by [`FsConn::timeout`], for
 /// [`FsConn::cancel_timeout`].
 ///
-/// Names one arming, not the slot: it carries the op-table generation
-/// the arm was made under, so a `Timer` kept past its own expiry
-/// cancels nothing when the slot has been reissued. Copy, because
+/// Names one arming, not the slot: it carries the reactor's identity
+/// and the **full-width** op-table generation the arm was made under,
+/// on the rule [`SlotEntry`](crate::uring::slots::SlotEntry) states -
+/// a caller-retained handle must never alias a future incarnation of
+/// its slot, and the truncated 32-bit routing token is only safe
+/// because a completion cannot outlive its op, which a `Timer` held
+/// past expiry does by design. The retraction verifies all three
+/// fields against the table before staging anything, so a stale
+/// token, or one minted by a different reactor on this thread, is
+/// inert rather than a cancel of whoever holds the slot now. Copy, because
 /// retracting is idempotent and a caller that holds two deadlines
-/// should not have to track which one it has already spent.
+/// should not have to track which one it has already spent; not
+/// `Send`, because it names loop-thread state and crossing threads
+/// with it could only ever reach the wrong ring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Timer(u64);
+pub struct Timer {
+    core: u64,
+    slot: u32,
+    generation: u64,
+    _on_loop: std::marker::PhantomData<std::rc::Rc<()>>,
+}
 
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 impl FsDone {
@@ -2606,8 +2770,19 @@ impl<'a> FsConn<'a> {
     /// the I/O completes, and the table is sized on that. So a deadline
     /// armed for 30 s and reached in 3 ms costs the other 29.997 s of
     /// the handler budget unless it is retracted, which is what the
-    /// returned [`Timer`] is for. `None` means the table refused the
-    /// arm; `on_done` has already been answered `EBUSY`.
+    /// returned [`Timer`] is for.
+    ///
+    /// `None` means the arm was refused - a full table, a staging
+    /// failure, or a connection the teardown sweep has already passed,
+    /// which may finish I/O but not park time on the table. The refusal
+    /// reaches `on_done`'s frame the way every refused submission does:
+    /// through the staged reason sink where one is armed (an awaited
+    /// [`fut`](FsConn::fut) reads the errno and
+    /// [`FsDone::was_refused`]), and otherwise by dropping the callback
+    /// unfired, which for a request-handler continuation closes the
+    /// connection. Nothing is delivered *to* a plain `on_done` on
+    /// refusal - it never ran, and the `None` is the caller's copy of
+    /// that fact.
     pub fn timeout<F>(
         &mut self,
         after: std::time::Duration,
@@ -2617,21 +2792,37 @@ impl<'a> FsConn<'a> {
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
         let w = self.waiter(on_done);
-        self.fs.submit_timeout(self.eng, after, w).map(Timer)
+        let core = self.fs.core_id;
+        self.fs
+            .submit_timeout(self.eng, after, w)
+            .map(|(slot, generation)| Timer {
+                core,
+                slot,
+                generation,
+                _on_loop: std::marker::PhantomData,
+            })
     }
 
     /// Retract a timer armed by [`timeout`](Self::timeout), freeing its
     /// op slot ahead of its expiry.
     ///
-    /// The timer completes `ECANCELED` and `on_done` fires with it, so
-    /// a caller still gets exactly one answer per arm - which is why
-    /// this is the retraction rather than a way to make one vanish.
-    /// Best-effort and idempotent: a [`Timer`] that has already fired
-    /// names a generation the slot no longer carries, so the kernel
-    /// finds nothing and the cancel is inert. Nothing is reported
-    /// either way; the answer arrives at `on_done`.
+    /// The timer completes `ECANCELED` **with
+    /// [`FsDone::was_refused`] true** and `on_done` fires with it, so a
+    /// caller still gets exactly one answer per arm and the answer says
+    /// what it was - `ECANCELED` unmarked stays meaning the reactor is
+    /// going away, which is the verdict a task winds down on, and a
+    /// healthy retraction must not read as that. Best-effort and
+    /// idempotent: the token is verified against the table before
+    /// anything is staged, so a [`Timer`] that already fired - or one
+    /// minted by a different reactor - retracts nothing. Nothing is
+    /// reported here either way; the answer arrives at `on_done`.
     pub fn cancel_timeout(&mut self, timer: Timer) {
-        self.fs.submit_cancel(self.eng, timer.0);
+        self.fs.retract_timeout(
+            self.eng,
+            timer.core,
+            timer.slot,
+            timer.generation,
+        );
     }
 
     /// Flush the byte range `[offset, offset + length)` of `f` as `who`

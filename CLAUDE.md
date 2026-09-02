@@ -97,6 +97,14 @@ Do not reopen these without a reason that is new.
   `FileTail::reading` gates body reads to one per connection and connections
   never exceed `pool_size`, so at least `fs_ops` slots always remain -
   pigeonhole, not arithmetic. The other direction is what parking handles.
+  Timers get the same *shape* of bound for a different reason: a timer is
+  the one op that holds its slot for wall-clock time rather than until an
+  I/O completes, so `FsCore::set_timer_cap` bounds them per owner at
+  `max_in_flight_requests` - the consumer discipline is one retry tick per
+  in-flight request, and a smaller constant would couple this crate to the
+  pipelining knob of another. The table is **not** resized for it: timers
+  spend the handler budget their owner already has, capped so no one
+  tenant can park it all.
 - **The `fs_ops + pool_size <= MAX_POOL` bound is about field *width*.** An
   op-slot index is packed into the 24-bit `user_data` slot field
   (`user_data::SLOT_MASK`); `TAG_FS_DOMAIN` keeping the two tag vocabularies

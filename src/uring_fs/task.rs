@@ -2045,6 +2045,14 @@ mod tests {
                     "a retracted timer answers ECANCELED: {:?}",
                     d.result()
                 );
+                // Marked: ECANCELED *unmarked* is the teardown verdict
+                // a task winds down on, and a healthy retraction the
+                // caller asked for must not read as the reactor going
+                // away.
+                assert!(
+                    d.was_refused(),
+                    "a retraction must not wear the teardown verdict"
+                );
                 done.set(true);
             })
             .expect("the table armed it")
@@ -2079,6 +2087,196 @@ mod tests {
             conn.cancel_timeout(timer); // the spent one
         }
         drive(&mut fs, &mut eng, &fired, "a stale retraction is inert");
+    }
+
+    /// A `Timer` is scoped to the reactor that minted it: another
+    /// reactor on the same thread starts its table at the same slot
+    /// and generation, so without the identity check a retraction
+    /// with a foreign token cancels whoever holds that slot here.
+    #[test]
+    fn a_foreign_reactors_timer_token_retracts_nothing() {
+        let Some(mut eng_a) = engine_or_skip() else {
+            return;
+        };
+        let Some(mut eng_b) = engine_or_skip() else {
+            return;
+        };
+        let mut fs_a = FsCore::new(1, OffloadBounds::default());
+        let mut fs_b = FsCore::new(1, OffloadBounds::default());
+
+        // A's first timer and B's first timer: same slot, same
+        // generation, different reactors.
+        let fired_a = Rc::new(StdCell::new(false));
+        let token_a = {
+            let fired = Rc::clone(&fired_a);
+            let mut conn = FsConn::new(&mut fs_a, &mut eng_a, None);
+            conn.timeout(Duration::from_millis(40), move |d, _c| {
+                assert!(d.result().is_ok(), "A's timer expires normally");
+                fired.set(true);
+            })
+            .expect("A arms")
+        };
+        let fired_b = Rc::new(StdCell::new(false));
+        {
+            let fired = Rc::clone(&fired_b);
+            let mut conn = FsConn::new(&mut fs_b, &mut eng_b, None);
+            conn.timeout(Duration::from_millis(40), move |d, _c| {
+                assert!(
+                    d.result().is_ok(),
+                    "B's timer must expire - A's token cancelled it: {:?}",
+                    d.result()
+                );
+                fired.set(true);
+            })
+            .expect("B arms");
+        }
+
+        // A's token handed to B's facade: inert, not a cancel of B's
+        // timer.
+        {
+            let mut conn = FsConn::new(&mut fs_b, &mut eng_b, None);
+            conn.cancel_timeout(token_a);
+        }
+        drive(&mut fs_b, &mut eng_b, &fired_b, "B's expiry");
+        // And A's own timer still answers - untouched by the misuse.
+        drive(&mut fs_a, &mut eng_a, &fired_a, "A's expiry");
+    }
+
+    /// One connection's timers are bounded at the host's cap, and a
+    /// completion returns the headroom.
+    ///
+    /// The cap is per owner, so the tenant beside a timer-hungry
+    /// connection still arms - the two-sided starvation this exists to
+    /// prevent had a full table refusing a *different* connection's
+    /// first submission. The N+1th arm answers `EBUSY` with the
+    /// refusal mark, exactly like a full table: the caller holds a
+    /// deadline already, and its completion is when arming again makes
+    /// sense - which the retraction half below proves by reclaiming
+    /// the headroom early.
+    #[test]
+    fn a_connections_timers_are_capped_and_a_completion_frees_one() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        fs.set_timer_cap(2);
+        let hour = Duration::from_secs(3600);
+        let arm = |fs: &mut FsCore, eng: &mut Engine, owner: (u32, u64)| {
+            let mut conn = FsConn::new(fs, eng, Some(owner));
+            conn.timeout(hour, |_d, _c| {})
+        };
+
+        let a1 = arm(&mut fs, &mut eng, (1, 1));
+        let a2 = arm(&mut fs, &mut eng, (1, 1));
+        assert!(a1.is_some() && a2.is_some(), "up to the cap arms");
+        assert!(
+            arm(&mut fs, &mut eng, (1, 1)).is_none(),
+            "the third arm is refused"
+        );
+        // And the awaited form reads the refusal with its provenance -
+        // the plain callback above is dropped by contract, so the sink
+        // is where the errno lives.
+        let seen3: Rc<StdCell<Option<(bool, bool)>>> =
+            Rc::new(StdCell::new(None));
+        {
+            let out = Rc::clone(&seen3);
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            drop(conn.spawn(move |t| async move {
+                let d = t
+                    .fut(|c, cb| {
+                        c.timeout(hour, cb);
+                    })
+                    .await;
+                out.set(Some((
+                    matches!(
+                        d.result(),
+                        Err(crate::Error::Errno(Errno::EBUSY))
+                    ),
+                    d.was_refused(),
+                )));
+            }));
+        }
+        assert_eq!(
+            seen3.get(),
+            Some((true, true)),
+            "refused as this crate's own EBUSY, not silently"
+        );
+
+        // The tenant beside it is untouched by the neighbour's cap.
+        assert!(
+            arm(&mut fs, &mut eng, (2, 1)).is_some(),
+            "another owner's first arm is its own"
+        );
+
+        // A completion - here a retraction - returns the headroom. The
+        // count comes back with the timer's own CQE, not with the
+        // cancel being staged, so the reap has to land before the
+        // headroom is real - drive until the count moves.
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.cancel_timeout(a1.expect("armed above"));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fs.armed_timers_for_test(&(1, 1)) != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "the retraction never returned the headroom"
+            );
+            if turn(&mut fs, &mut eng) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(
+            arm(&mut fs, &mut eng, (1, 1)).is_some(),
+            "the completion must return the owner's headroom"
+        );
+    }
+
+    /// A connection the sweep has passed may not park time on the
+    /// table. Its I/O is still welcome - finishing accepted work is
+    /// the sweep's own contract - but a timer holds a slot for
+    /// wall-clock duration, and a re-arming tick for a dead owner
+    /// strands one per arm with the only `Timer` holder the dead
+    /// handler itself. The answer is the sweep's own verdict, so the
+    /// continuation winds down the same way in either ordering.
+    #[test]
+    fn a_swept_owner_cannot_arm_a_timer() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm wake");
+        let owner = Some((6u32, 1u64));
+        let seen: Rc<StdCell<Option<(bool, bool)>>> =
+            Rc::new(StdCell::new(None));
+
+        fs.cancel_owned_by(&mut eng, vec![(6, 1)]);
+        {
+            let out = Rc::clone(&seen);
+            let mut conn = FsConn::new(&mut fs, &mut eng, owner);
+            drop(conn.spawn(move |t| async move {
+                let d = t
+                    .fut(|c, cb| {
+                        c.timeout(Duration::from_secs(3600), cb);
+                    })
+                    .await;
+                out.set(Some((
+                    matches!(
+                        d.result(),
+                        Err(crate::Error::Errno(Errno::ECANCELED))
+                    ),
+                    d.was_refused(),
+                )));
+            }));
+        }
+        let (ecanceled, refused) = seen.get().expect("answered at once");
+        assert!(ecanceled, "the sweep's verdict, not a strand");
+        assert!(
+            !refused,
+            "unmarked, exactly as an in-flight timer the sweep reached"
+        );
+        assert!(
+            fs.has_free_op(),
+            "no slot may be held for a dead connection's hour"
+        );
     }
 
     /// The timer composes with the future layer like any submission: a
