@@ -1440,11 +1440,21 @@ impl<U> Connection<U> {
         // truncates the accumulate buffer to the header - so asking
         // `recv_buf` about it inspects unrelated storage, and answers
         // "outside" for every body larger than its own head.
+        //
+        // Bounded by `body_len`, not `body.capacity()`: the two were
+        // equal when every body was freshly allocated, but a pooled
+        // buffer carries whatever capacity its largest tenant left -
+        // 16x the body at the defaults - and the spare bytes past
+        // `body_len` are a previous message's, from any connection on
+        // the ring. `recv_at + recv_want == body_len` is the invariant
+        // every partial path preserves, so this is the exact bound the
+        // cursor is supposed to satisfy (and `capacity >= body_len` by
+        // `arm_body_recv`'s reserve, so it is the tighter of the two).
         match &self.body_buf {
-            Some(body) if self.recv_into_body => self
+            Some(_) if self.recv_into_body => self
                 .recv_at
                 .checked_add(self.recv_want)
-                .is_some_and(|end| end <= body.capacity()),
+                .is_some_and(|end| end <= self.body_len),
             _ => self.recv_buf.armed_within(self.recv_at, self.recv_want),
         }
     }
@@ -2062,6 +2072,32 @@ mod tests {
         }
         c.consume();
         assert_eq!(c.buffered(), 0, "placed body never re-enters buf");
+    }
+
+    /// The kTLS continuation's every-build guard bounds the placed-body
+    /// cursor by the *body*, not by its buffer. The two were equal when
+    /// every body was freshly allocated; a pooled buffer carries
+    /// whatever capacity its largest tenant left, and the spare bytes
+    /// past `body_len` are a previous message's - so a cursor walked
+    /// past the body while still inside the allocation must be refused.
+    #[test]
+    fn a_placed_cursor_is_bounded_by_the_body_not_its_buffer() {
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        c.set_frame(0, 100);
+        // Reused pool storage, sized by a larger tenant.
+        let want = c.arm_body_recv(Vec::with_capacity(1024).into());
+        assert_eq!(want, 100);
+        assert!(c.recv_armed_within(), "the armed read is in bounds");
+        // Partial progress up to the body's edge stays in bounds.
+        c.advance_exact_partial(60);
+        assert!(c.recv_armed_within(), "a mid-body continuation is fine");
+        // A cursor past the body but not the buffer is exactly the
+        // range whose bytes belong to someone else's message.
+        c.recv_want = 100;
+        assert!(
+            !c.recv_armed_within(),
+            "the guard must bound by body_len, not capacity"
+        );
     }
 
     /// A redelivery must not be handed the buffer an in-flight `RECV` is
