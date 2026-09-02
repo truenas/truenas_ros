@@ -790,4 +790,12 @@ becomes dead with one feature off - `--all-features` and a per-feature
 intra-doc links, so a public item pointing at a private one, or a link
 that does not resolve, is otherwise invisible until CI.
 
+CI carries one lane the local gate does not: the dedicated `miri.yml`
+workflow, on every PR. It validates the task executor's memory model -
+the one instrument on x86 that catches a re-weakening of the wake
+protocol's dedup edge without trusting our own loom model. It needs the
+nightly toolchain and no local run; the workflow's comments say what it
+covers and why the module filter and both count assertions are
+load-bearing.
+
 Report failures with their output. A skipped step is a skipped step; say so.

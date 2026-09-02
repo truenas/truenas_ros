@@ -1909,6 +1909,15 @@ mod tests {
     /// Build a real `Engine` or signal an environment skip (mirrors the
     /// integration suites' io_uring guard, gate included).
     fn engine_or_skip() -> Option<Engine> {
+        // Under Miri there is no ring to set up - `io_uring_setup` is an
+        // unsupported foreign call that aborts the interpreter, not an
+        // errno the arm below could catch - so the skip decision has to
+        // come first. The ring-dependent tests then skip themselves
+        // exactly as they do on a ring-less host, and the Miri lane
+        // (ci.yml `miri`) runs what is left: the pure-executor paths.
+        if cfg!(miri) {
+            return None;
+        }
         match Engine::new(RING_ENTRIES, POOL) {
             Ok(e) => Some(e),
             Err(crate::Error::Errno(e))
@@ -3957,6 +3966,94 @@ mod tests {
             pending_pokes(&run) > 0,
             "nothing poked: the loop will park and never schedule it"
         );
+    }
+
+    /// The dedup edge publishes what a deduped waker wrote - the
+    /// property [`loom_a_deduped_wake_publishes_what_it_wrote`] models,
+    /// spelled for **Miri**, which is the only instrument on x86 that
+    /// can see it outside our own model. The hardware never shows the
+    /// stale read (TSO), loom greens prove nothing (under-exploration
+    /// is its documented unsoundness), so re-weakening `poll_window`'s
+    /// swap back to a plain store leaves everything but that one model
+    /// green - and this test, under `-Zmiri-many-seeds`, where the
+    /// weak-memory emulation supplies the stale value. Natively it
+    /// passes vacuously and costs nothing.
+    ///
+    /// **The payload must be an atomic read with `Relaxed`, and the
+    /// assertion a value, not a race.** The tempting probe - a
+    /// non-atomic payload, expecting Miri to report the missing
+    /// happens-before as a data race - is UB on the *correct* code: a
+    /// poll already in flight reads concurrently with the racing
+    /// waker's pre-wake write, which no edge orders (the coverage
+    /// contract is about polls that start *after* the wake), and
+    /// Miri's vector clocks flag the pair even when they are seconds
+    /// apart. Measured: four false races at 64 seeds with the shipped
+    /// spelling. The atomic form has no UB anywhere; the weakened edge
+    /// shows up as this assertion instead.
+    #[test]
+    fn miri_a_deduped_wake_publishes_what_it_wrote() {
+        let run = Arc::new(RunShared {
+            queue: Mutex::new(VecDeque::new()),
+            ready: AtomicUsize::new(0),
+            draining: AtomicBool::new(false),
+            wake: Arc::new(crate::uring::wake::LoopShared {
+                stop: std::sync::atomic::AtomicBool::new(false),
+                graceful: std::sync::atomic::AtomicBool::new(false),
+                grace_ms: std::sync::atomic::AtomicU64::new(0),
+                wake: crate::uring::wake::WakeHandle::new().expect("eventfd"),
+            }),
+            loop_thread: std::thread::current().id(),
+        });
+        // Iterated, because one seed is one schedule: the stale-read
+        // window needs the racing thread to skip between the latch and
+        // the poll, and a single race per execution leaves whole seed
+        // ranges never opening it. Miri's scheduler keeps drawing from
+        // the seed across iterations, so each round is a fresh
+        // interleaving - measured, this is the difference between the
+        // weakened edge surviving 16 seeds and dying inside the first.
+        for round in 0..16u64 {
+            let w = Arc::new(TaskWake {
+                id: TaskId {
+                    idx: 0,
+                    generation: 0,
+                },
+                queued: AtomicBool::new(false),
+                run: Arc::clone(&run),
+            });
+            let payload = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let want = round + 1;
+
+            // Latch the edge, so the racing wake below is the deduped
+            // one whenever the scheduler runs it before the window;
+            // where it runs after, the wake enqueues and the post-join
+            // drain covers it through the queue lock instead. Either
+            // way the last poll is the covering one - the same case
+            // split as the loom model.
+            wake_task(&w);
+            let t = {
+                let (w, p) = (Arc::clone(&w), Arc::clone(&payload));
+                std::thread::spawn(move || {
+                    p.store(want, std::sync::atomic::Ordering::Relaxed);
+                    wake_task(&w);
+                })
+            };
+            let mut last = 0u64;
+            while let Some(_id) = run.take_ready() {
+                last = poll_window(&w, || {
+                    payload.load(std::sync::atomic::Ordering::Relaxed)
+                });
+            }
+            t.join().expect("waker thread");
+            while let Some(_id) = run.take_ready() {
+                last = poll_window(&w, || {
+                    payload.load(std::sync::atomic::Ordering::Relaxed)
+                });
+            }
+            assert_eq!(
+                last, want,
+                "the poll covering the wake did not see what it published"
+            );
+        }
     }
 
     /// A nested drain ending does not un-mark the outer pass.
