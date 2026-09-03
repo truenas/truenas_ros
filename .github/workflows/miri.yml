@@ -89,11 +89,15 @@ env:
   #
   # The cost is that adding a Miri-eligible test reddens this lane until
   # the number is bumped - deliberate, and the same trade the loom lane's
-  # MODELS makes. (81 measured at dc95690; 85 covers the four Allow/
-  # retraction tenancy tests added since.) If that friction is unwanted, `-lt` pinned at the TRUE
+  # MODELS makes. (81 measured at dc95690; 85 covered the four Allow/
+  # retraction tenancy tests added since; 86 added the mid-swap slot
+  # bound; 87 the slot Refused transition table, pure Rc/RefCell state
+  # that genuinely executes here; 91 adds the four ring-gated
+  # refusal-delivery tests.) If that friction is unwanted,
+  # `-lt` pinned at the TRUE
   # count still catches deletion, which is the failure mode; what it must
   # not be again is a floor far below what runs.
-  MIRI_TESTS: "85"
+  MIRI_TESTS: "91"
 
   # The `http` band, run as its own step under its own feature set.
   MIRI_HTTP_TESTS: "32"
@@ -139,40 +143,16 @@ jobs:
       env:
         MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check
       run: |
-        out=$(cargo +nightly miri test --lib --no-default-features \
-          --features uring-fs -- $MIRI_SKIP 2>&1)
-        echo "$out"
-        n=$(printf '%s' "$out" |
-            sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | head -1)
-        if [ -z "$n" ] || [ "$n" -ne "$MIRI_TESTS" ]; then
-          echo "::error::miri ran ${n:-no} tests, expected exactly $MIRI_TESTS"
-          # A bare integer does not say WHAT changed, which is the one
-          # real weakness of a counted gate: name the roster so the log
-          # shows which test vanished instead of needing a local repro.
-          echo "--- tests the filter selected ---"
-          printf '%s' "$out" | sed -n 's/^test \(.*\) \.\.\. .*/\1/p' | sort
-          exit 1
-        fi
-
+        .github/workflows/scripts/counted-cargo-test.sh "$MIRI_TESTS" "miri stacked borrows" -- \
+          cargo +nightly miri test --lib --no-default-features \
+          --features uring-fs -- $MIRI_SKIP
     - name: miri (tree borrows)
       env:
         MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-strict-provenance
       run: |
-        out=$(cargo +nightly miri test --lib --no-default-features \
-          --features uring-fs -- $MIRI_SKIP 2>&1)
-        echo "$out"
-        n=$(printf '%s' "$out" |
-            sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | head -1)
-        if [ -z "$n" ] || [ "$n" -ne "$MIRI_TESTS" ]; then
-          echo "::error::miri tree-borrows ran ${n:-no} tests, expected exactly $MIRI_TESTS"
-          # A bare integer does not say WHAT changed, which is the one
-          # real weakness of a counted gate: name the roster so the log
-          # shows which test vanished instead of needing a local repro.
-          echo "--- tests the filter selected ---"
-          printf '%s' "$out" | sed -n 's/^test \(.*\) \.\.\. .*/\1/p' | sort
-          exit 1
-        fi
-
+        .github/workflows/scripts/counted-cargo-test.sh "$MIRI_TESTS" "miri tree borrows" -- \
+          cargo +nightly miri test --lib --no-default-features \
+          --features uring-fs -- $MIRI_SKIP
     # A second feature set, because the filter above cannot reach it: the
     # `http` band's protocol tests are pure parsing - 0 ring-guard uses in
     # the file, so all 32 genuinely execute rather than skipping - and
@@ -187,17 +167,9 @@ jobs:
       env:
         MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-strict-provenance
       run: |
-        out=$(cargo +nightly miri test --lib --no-default-features \
-          --features http http::protocol:: 2>&1)
-        echo "$out"
-        n=$(printf '%s' "$out" |
-            sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | head -1)
-        if [ -z "$n" ] || [ "$n" -ne "$MIRI_HTTP_TESTS" ]; then
-          echo "::error::miri http ran ${n:-no} tests, expected exactly $MIRI_HTTP_TESTS"
-          printf '%s' "$out" | sed -n 's/^test \(.*\) \.\.\. .*/\1/p' | sort
-          exit 1
-        fi
-
+        .github/workflows/scripts/counted-cargo-test.sh "$MIRI_HTTP_TESTS" "miri http band" -- \
+          cargo +nightly miri test --lib --no-default-features \
+          --features http http::protocol::
     # The seed sweep, over the WHOLE task module rather than one probe.
     # Seeding one test explores that test's interleavings; seeding the
     # module explores every wake-protocol test's, and the defect this lane
@@ -234,15 +206,10 @@ jobs:
       env:
         MIRIFLAGS: -Zmiri-strict-provenance
       run: |
-        probe=uring_fs::task::tests::miri_a_deduped_wake_publishes_what_it_wrote
-        out=$(cargo +nightly miri test --lib --no-default-features \
-          --features uring-fs -- --exact "$probe" 2>&1)
-        echo "$out"
-        if ! printf '%s' "$out" | grep -q '^test result: ok\. 1 passed'; then
-          echo "::error::the weak-memory probe did not run or did not pass"
-          exit 1
-        fi
-
+        .github/workflows/scripts/counted-cargo-test.sh 1 "miri weak-memory probe" -- \
+          cargo +nightly miri test --lib --no-default-features \
+          --features uring-fs -- --exact \
+          uring_fs::task::tests::miri_a_deduped_wake_publishes_what_it_wrote
     - name: miri (the weak-memory probe, deeply seeded)
       env:
         MIRIFLAGS: -Zmiri-many-seeds=0..64 -Zmiri-strict-provenance

@@ -820,11 +820,6 @@ pub(crate) struct Connection<U> {
     /// slower than the pool's maintenance tick keeps what it is owed.
     #[cfg(feature = "net-server")]
     body_licence: usize,
-    /// Held licences whose bodies left custody this delivery
-    /// (`take_placed_body`), awaiting the post-consume hand-off to the
-    /// pool's windowed pot (`release_recv_buffer`).
-    #[cfg(feature = "net-server")]
-    delivered_licence: usize,
     // ---- spliced body ----
     // A framed body spliced straight from the socket to a consumer fd
     // (`Framing::SpliceBody`) instead of read into a buffer - zero-copy. The fd
@@ -1016,8 +1011,6 @@ impl<U> Connection<U> {
             body_buf: None,
             #[cfg(feature = "net-server")]
             body_licence: 0,
-            #[cfg(feature = "net-server")]
-            delivered_licence: 0,
             recv_into_body: false,
             splicing: false,
             splice_polling: false,
@@ -1148,8 +1141,11 @@ impl<U> Connection<U> {
         (&self.recv_buf[..self.header_len], self.body_len)
     }
 
-    /// `(header, body, peer, state)` for a complete message, borrow-split for
-    /// the body handler call. A placed body is moved out of `body_buf`; an
+    /// `(header, body, peer, state, licence)` for a complete message,
+    /// borrow-split for the body handler call; the last element is the
+    /// placed body's held pool licence (0 otherwise), for the delivery
+    /// to pot before the handler runs. A placed body is moved out of
+    /// `body_buf`; an
     /// inline body borrows `buf` - except a **body-only** message (an http
     /// 100-continue dance body, delivered with `header_len == 0`) whose
     /// extent is exactly the buffered bytes: at or over `handoff_threshold`,
@@ -1171,19 +1167,19 @@ impl<U> Connection<U> {
     pub(crate) fn deliver_parts(
         &mut self,
         handoff_threshold: Option<usize>,
-    ) -> (&[u8], Body<'_>, &ClientAddr, &mut U) {
+    ) -> (&[u8], Body<'_>, &ClientAddr, &mut U, usize) {
         let placed = self.take_placed_body();
         if placed.is_none()
             && let Some(buf) = self.take_body_handoff(handoff_threshold)
         {
-            return (&[], Body::placed(buf), &self.peer, &mut self.state);
+            return (&[], Body::placed(buf), &self.peer, &mut self.state, 0);
         }
         let (header, rest) = self.recv_buf.split_at(self.header_len);
-        let body = match placed {
-            Some(bytes) => Body::placed(bytes),
-            None => Body::inline(&rest[..self.body_len]),
+        let (body, licence) = match placed {
+            Some((bytes, licence)) => (Body::placed(bytes), licence),
+            None => (Body::inline(&rest[..self.body_len]), 0),
         };
-        (header, body, &self.peer, &mut self.state)
+        (header, body, &self.peer, &mut self.state, licence)
     }
 
     /// As [`deliver_parts`](Self::deliver_parts), plus the recv claim as a
@@ -1201,20 +1197,28 @@ impl<U> Connection<U> {
         &ClientAddr,
         &mut U,
         Option<crate::uring_fs::core::RecvWriteLease<'_>>,
+        usize,
     ) {
         let placed = self.take_placed_body();
         if placed.is_none()
             && let Some(buf) = self.take_body_handoff(handoff_threshold)
         {
-            return (&[], Body::placed(buf), &self.peer, &mut self.state, None);
+            return (
+                &[],
+                Body::placed(buf),
+                &self.peer,
+                &mut self.state,
+                None,
+                0,
+            );
         }
         let lease = self.recv_buf.write_lease(self.header_len + self.body_len);
         let (header, rest) = self.recv_buf.split_at(self.header_len);
-        let body = match placed {
-            Some(bytes) => Body::placed(bytes),
-            None => Body::inline(&rest[..self.body_len]),
+        let (body, licence) = match placed {
+            Some((bytes, licence)) => (Body::placed(bytes), licence),
+            None => (Body::inline(&rest[..self.body_len]), 0),
         };
-        (header, body, &self.peer, &mut self.state, lease)
+        (header, body, &self.peer, &mut self.state, lease, licence)
     }
 
     /// The placed body, if it is this delivery's to hand over.
@@ -1231,29 +1235,21 @@ impl<U> Connection<U> {
     /// redelivery arriving while the pump has already armed the *next*
     /// message's body: `deliver_one` zeroes that redelivery's frame for the
     /// same reason, and an empty body is the matching answer.
-    fn take_placed_body(&mut self) -> Option<Vec<u8>> {
+    fn take_placed_body(&mut self) -> Option<(Vec<u8>, usize)> {
         if self.recv_into_body {
             return None;
         }
-        let body = self.body_buf.take();
+        let body = self.body_buf.take()?;
         // The body leaves custody with the handler; its held licence
-        // moves to the delivered pot, handed to the pool after consume
-        // (`release_recv_buffer`) so the consumer's recycle window
-        // opens at delivery, not at the arm.
+        // rides out beside it, for the delivery to pot **before** the
+        // handler runs. A recycle inside the handler must find the
+        // licence spendable - potted afterwards, the pool freed
+        // exactly the storage the recycle seam exists to keep.
         #[cfg(feature = "net-server")]
-        if body.is_some() {
-            self.delivered_licence = self
-                .delivered_licence
-                .saturating_add(std::mem::take(&mut self.body_licence));
-        }
-        body
-    }
-
-    /// Held licences whose bodies were delivered by this delivery,
-    /// taken for the pool's windowed pot.
-    #[cfg(feature = "net-server")]
-    pub(crate) fn take_delivered_licence(&mut self) -> usize {
-        std::mem::take(&mut self.delivered_licence)
+        let licence = std::mem::take(&mut self.body_licence);
+        #[cfg(not(feature = "net-server"))]
+        let licence = 0;
+        Some((body, licence))
     }
 
     /// Teardown's take of everything the ring's body pool can reuse:
@@ -2173,7 +2169,7 @@ mod tests {
         unsafe { std::ptr::write_bytes(ptr, 0xCD, want) };
         assert_eq!(c.recv_result(want as i32), RecvOutcome::Complete);
         {
-            let (header, mut body, _addr, _state) = c.deliver_parts(None);
+            let (header, mut body, _addr, _state, _lic) = c.deliver_parts(None);
             assert_eq!(header.len(), 4);
             assert_eq!(body.len(), 100);
             assert!(body[..30].iter().all(|&b| b == 0), "copied prefix");
@@ -2213,13 +2209,13 @@ mod tests {
         );
     }
 
-    /// A delivered placed body's held licence leaves custody with it,
-    /// staged for the pool's windowed pot (taken once by
-    /// `release_recv_buffer`) rather than dying on the connection or
-    /// leaking onto the next message's claim.
+    /// A delivered placed body's held licence leaves custody *with*
+    /// it - handed to the delivery for potting before the handler
+    /// runs - rather than dying on the connection or leaking onto the
+    /// next message's claim.
     #[cfg(feature = "net-server")]
     #[test]
-    fn a_delivered_bodys_licence_is_staged_for_the_pot() {
+    fn a_delivered_bodys_licence_rides_out_with_the_body() {
         let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
         c.set_frame(0, 100);
         let want = c.arm_body_recv(Some((Vec::with_capacity(100), 100)));
@@ -2228,15 +2224,14 @@ mod tests {
         unsafe { std::ptr::write_bytes(ptr, 0xCD, want) };
         assert_eq!(c.recv_result(want as i32), RecvOutcome::Complete);
         {
-            let (_h, body, _addr, _state) = c.deliver_parts(None);
+            let (_h, body, _addr, _state, licence) = c.deliver_parts(None);
             assert_eq!(body.len(), 100, "the placed body delivered");
+            assert_eq!(licence, 100, "the licence rode out with the body");
         }
-        assert_eq!(
-            c.take_delivered_licence(),
-            100,
-            "the licence rode out with the body"
-        );
-        assert_eq!(c.take_delivered_licence(), 0, "and is taken exactly once");
+        c.set_frame(0, 0);
+        let (_h, body, _addr, _state, licence) = c.deliver_parts(None);
+        assert_eq!(body.len(), 0, "the body was taken once");
+        assert_eq!(licence, 0, "and the licence with it");
     }
 
     /// Teardown hands a dying connection's body storage home with the
@@ -2276,7 +2271,7 @@ mod tests {
         // The redelivery, as `deliver_one` stages it.
         c.set_frame(0, 0);
         {
-            let (header, body, _addr, _state) = c.deliver_parts(None);
+            let (header, body, _addr, _state, _lic) = c.deliver_parts(None);
             assert!(header.is_empty(), "a redelivery carries no header");
             assert_eq!(body.len(), 0, "nor the next message's body");
         }
@@ -2300,7 +2295,7 @@ mod tests {
 
         c.set_frame(0, 0);
         {
-            let (header, body, _addr, _state, _lease) =
+            let (header, body, _addr, _state, _lease, _lic) =
                 c.deliver_parts_leased(Some(0));
             assert!(header.is_empty(), "a redelivery carries no header");
             assert_eq!(body.len(), 0, "nor the next message's body");
@@ -2346,7 +2341,8 @@ mod tests {
         c.set_frame(0, 100);
         let p0 = c.recv_buf.as_ptr() as usize;
         {
-            let (header, mut body, _addr, _state) = c.deliver_parts(Some(64));
+            let (header, mut body, _addr, _state, _lic) =
+                c.deliver_parts(Some(64));
             assert!(header.is_empty());
             assert_eq!(body.len(), 100);
             let owned = body.take();
@@ -2365,7 +2361,7 @@ mod tests {
         c.set_frame(0, 10);
         let p_small = c.recv_buf.as_ptr() as usize;
         {
-            let (_h, mut body, _addr, _state) = c.deliver_parts(Some(64));
+            let (_h, mut body, _addr, _state, _lic) = c.deliver_parts(Some(64));
             assert_eq!(body.len(), 10);
             let copied = body.take();
             assert_ne!(
@@ -2386,7 +2382,7 @@ mod tests {
         assert_eq!(c.recv_result(120), RecvOutcome::Complete);
         c.set_frame(0, 100);
         {
-            let (_h, body, _addr, _state) = c.deliver_parts(Some(64));
+            let (_h, body, _addr, _state, _lic) = c.deliver_parts(Some(64));
             assert_eq!(body.len(), 100);
         }
         c.consume();

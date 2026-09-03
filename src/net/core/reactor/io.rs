@@ -1605,21 +1605,15 @@ impl<U> Reactor<U> {
     /// and this is where that happens.
     #[cfg(feature = "net-server")]
     pub(crate) fn release_recv_buffer(&mut self, slot: u32) {
-        let delivered = self.table.conn_mut(slot).take_delivered_licence();
         let (claim, surplus) = self.table.conn_mut(slot).release_recv_buf();
         if let Some(pool) = self.body_pool.as_ref() {
-            let mut pool = pool.borrow_mut();
-            // A placed body just left custody with the handler; its held
-            // licence joins the windowed pot, so the consumer's recycle
-            // window opens at delivery rather than expiring mid-receipt.
-            if delivered > 0 {
-                pool.receipt_done(delivered);
-            }
+            // A delivered placed body's licence is potted by the
+            // delivery itself, before its handler runs (`deliver_one`).
             // Promoted storage comes home with the message that outgrew
             // the pool buffer - licence attached - and the next
             // promotion anywhere on the ring reuses it.
             if let Some((v, licence)) = surplus {
-                pool.give_held(v, licence);
+                pool.borrow_mut().give_held(v, licence);
             }
         }
         let Some(claim) = claim else {

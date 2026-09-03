@@ -107,9 +107,28 @@ Do not reopen these without a reason that is new.
   DeleteObjects), and a smaller constant would couple this crate to the
   pipelining knob of another. A retraction returns the cap headroom on
   the spot - the slot follows at the CQE - so retract-then-rearm inside
-  one delivery holds at any cap. The table is **not** resized for it:
+  one delivery holds at any cap; the retiring slots are themselves
+  counted (`WallClock`), and the arm refuses when armed + retiring
+  reaches twice the cap, because with the headroom back early that
+  sum is the only thing standing between a swap loop and the whole
+  table. The table is **not** resized for it:
   holds spend the handler budget their owner already has, capped so no
   one tenant can park it all.
+- **A host refusal is delivered, not dropped.** The class - a full op
+  table, an `Allow` pair's two-slot charge, the wall-clock cap, a
+  swept owner, a staging failure - is decided at eighteen submit
+  screens and used to be delivered at none: every one dropped the
+  embedded callback, which closed the connection with no verdict
+  anywhere. It is one queue now (`FsCore::refuse`), drained where
+  finished offloads deliver - a refusal is structurally an offload
+  that resolved at submit time, and the re-entrancy that forbids
+  firing inside `submit_*` is what the push-then-poke wake protocol
+  already answers. Vocabularies survive: capacity refusals arrive
+  marked with the payload handed back, the swept owner's as the
+  unmarked `ECANCELED` the sweep would have dealt in flight. One
+  drain pass delivers only what was queued when it began, so a
+  callback that re-arms into another refusal pays a wake round trip
+  per attempt instead of spinning the ring from inside one pass.
 - **The `fs_ops + pool_size <= MAX_POOL` bound is about field *width*.** An
   op-slot index is packed into the 24-bit `user_data` slot field
   (`user_data::SLOT_MASK`); `TAG_FS_DOMAIN` keeping the two tag vocabularies
@@ -762,9 +781,15 @@ cargo clippy --all-features --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 cargo test --all-features --no-fail-fast
 cargo test --release --all-features --no-fail-fast   # the guards that ship
-RUSTFLAGS="--cfg loom" cargo test --lib --features uring    loom_
-RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
-RUSTFLAGS="--cfg loom" cargo test --lib --features http     loom_
+
+# Loom, in CI's exact spelling: ONE --all-features invocation, count
+# asserted. A libtest filter that matches nothing exits 0, so a
+# mistyped --cfg reads as a green lane; the count (ci.yml's MODELS -
+# keep the two in step) is the tripwire. The old three-subset form
+# asserted nothing and measured 3/22/5 models against the lane's 24.
+.github/workflows/scripts/counted-cargo-test.sh 24 loom -- \
+  env RUSTFLAGS="--cfg loom" cargo test --lib --all-features loom_
+
 (cd fuzz && cargo +nightly fuzz build)
 
 # No feature at all: the only step that proves the crate compiles with
