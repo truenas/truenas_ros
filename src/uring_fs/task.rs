@@ -114,7 +114,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-use super::core::{FsConn, FsCore, FsDone, Owner};
+use super::core::{FsConn, FsCore, FsDone, Owner, SinkInner};
 use crate::errno::Errno;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
@@ -411,12 +411,16 @@ impl FsConn<'_> {
     /// that drops `on_done` without passing it anywhere resolves the
     /// future as `ECANCELED`.
     ///
-    /// **`submit` submits exactly one op.** The reason sink staged here
-    /// lives on the facade, so *any* submission the closure makes arms
-    /// it and a refusal of the wrong one fills this slot - reporting an
-    /// errno for an op that is still in flight, whose real completion
-    /// then lands in a settled slot and is discarded. Submit the extra
-    /// op before or after the call, not inside it.
+    /// **`submit` submits exactly one op.** The reason sink staged
+    /// here answers for a single submission, and the *first* one the
+    /// closure makes takes it; a later submission in the same frame
+    /// arms nothing, so its refusal follows the plain-callback
+    /// contract - dropped unfired, which for a request handler closes
+    /// the connection - instead of filling a slot that belongs to the
+    /// first op. If this future's own `on_done` rode that later
+    /// submission and it was refused, the future resolves `ECANCELED`
+    /// unmarked, the dropped-callback verdict. Submit the extra op
+    /// before or after the call, not inside it.
     pub fn fut(
         &mut self,
         submit: impl FnOnce(&mut FsConn<'_>, OnDone),
@@ -435,9 +439,11 @@ impl FsConn<'_> {
         // Saved and put back, because `submit` may itself contain a
         // `fut`: assigning over the outer sink would leave the outer op
         // reporting teardown for its own refusal.
-        let outer = self.stage_fail_sink(Rc::new(move |errno, bufs| {
-            reason.fill(Some(FsDone::refused_with(errno, bufs)));
-        }));
+        let outer = self.stage_fail_sink(Rc::new(SinkInner::new(
+            move |errno, bufs| {
+                reason.fill(Some(FsDone::refused_with(errno, bufs)));
+            },
+        )));
         submit(self, Box::new(move |done, _conn| fire.fire(done)));
         // No submission armed the sink: `submit` returned without
         // handing the op to the core at all, which is what the facade's
@@ -517,9 +523,11 @@ impl FsConn<'_> {
         let slot = Slot::new();
         let fire = Fire(Some(Rc::clone(&slot)));
         let reason = Rc::clone(&slot);
-        let outer = self.stage_fail_sink(Rc::new(move |errno, _bufs| {
-            reason.fill(Some(Err(errno.into())));
-        }));
+        let outer = self.stage_fail_sink(Rc::new(SinkInner::new(
+            move |errno, _bufs| {
+                reason.fill(Some(Err(errno.into())));
+            },
+        )));
         submit(self, Box::new(move |r, _conn| fire.fire(r)));
         self.restore_fail_sink(outer);
         OffloadFuture(slot)
@@ -1134,6 +1142,15 @@ pub(crate) fn wake_task(w: &TaskWake) -> bool {
 /// [`Waker`] surface that makes it reachable: an off-loop lock-free
 /// waker is what a consumer may legitimately build, and its readiness
 /// would otherwise be invisible to the poll that is meant to cover it.
+///
+/// **The Miri lane owns this edge**
+/// (`miri_a_deduped_wake_publishes_what_it_wrote`, seeded): the old
+/// `store(false, Release)` spelling survived 200k native rounds - x86's
+/// TSO hides it - and the loom model's exploration is documented as
+/// unable to vouch for it, while Miri kills it within a handful of
+/// seeds. The mirror-image edge is the graceful-drain publication
+/// (`uring::wake::LoopShared::request_graceful`), which only loom
+/// catches; retire either lane and its edge goes unwatched.
 pub(crate) fn poll_window<R>(w: &TaskWake, poll: impl FnOnce() -> R) -> R {
     w.queued.swap(false, Ordering::AcqRel);
     poll()
@@ -2242,28 +2259,73 @@ mod tests {
             "another owner's first arm is its own"
         );
 
-        // A completion - here a retraction - returns the headroom. The
-        // count comes back with the timer's own CQE, not with the
-        // cancel being staged, so the reap has to land before the
-        // headroom is real - drive until the count moves.
+        // A retraction returns the headroom on the spot - before any
+        // CQE - so the natural retract-then-rearm inside one delivery
+        // holds at the cap. (The slot itself still comes back at the
+        // retracted timer's CQE.)
         {
             let mut conn = FsConn::new(&mut fs, &mut eng, None);
             conn.cancel_timeout(a1.expect("armed above"));
         }
+        assert_eq!(
+            fs.armed_timers_for_test(&(1, 1)),
+            1,
+            "the retraction must return the headroom synchronously"
+        );
+        assert!(
+            arm(&mut fs, &mut eng, (1, 1)).is_some(),
+            "so the replacement deadline arms in the same delivery"
+        );
+        // And the retracted timer's own CQE must not return it twice:
+        // drive until its slot frees, then the count still covers the
+        // two live arms.
+        let free_before_cqe = fs.op_free_len_for_test();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while fs.armed_timers_for_test(&(1, 1)) != 1 {
+        while fs.op_free_len_for_test() != free_before_cqe + 1 {
             assert!(
                 Instant::now() < deadline,
-                "the retraction never returned the headroom"
+                "the retracted timer's CQE never landed"
             );
             if turn(&mut fs, &mut eng) == 0 {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        assert!(
-            arm(&mut fs, &mut eng, (1, 1)).is_some(),
-            "the completion must return the owner's headroom"
+        assert_eq!(
+            fs.armed_timers_for_test(&(1, 1)),
+            2,
+            "a retraction's headroom must not come back a second time"
         );
+    }
+
+    /// Retraction is idempotent in the headroom too: a `Timer` is
+    /// `Copy`, so a caller can retract one arm twice, and the second
+    /// pass must return nothing - a double return would spend another
+    /// live timer's count.
+    #[test]
+    fn a_double_retraction_returns_the_headroom_once() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        fs.set_timer_cap(2);
+        let hour = Duration::from_secs(3600);
+        let (t1, t2) = {
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            let t1 = conn.timeout(hour, |_d, _c| {}).expect("first arm");
+            let t2 = conn.timeout(hour, |_d, _c| {}).expect("second arm");
+            (t1, t2)
+        };
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.cancel_timeout(t1);
+            conn.cancel_timeout(t1);
+        }
+        assert_eq!(
+            fs.armed_timers_for_test(&(1, 1)),
+            1,
+            "one retraction, one return - t2's count must survive"
+        );
+        let mut conn = FsConn::new(&mut fs, &mut eng, None);
+        conn.cancel_timeout(t2);
     }
 
     /// A connection the sweep has passed may not park time on the
@@ -2311,6 +2373,212 @@ mod tests {
         assert!(
             fs.has_free_op(),
             "no slot may be held for a dead connection's hour"
+        );
+    }
+
+    /// An `Allow` open is a wall-clock hold like a timer - two slots
+    /// parked until its deadline or its answer - so it spends the same
+    /// per-owner budget: at the cap it is refused with the marked
+    /// `EBUSY` a timer arm gets, and the tenant beside it still opens.
+    #[test]
+    fn an_allow_open_spends_the_owners_timer_budget() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        fs.set_timer_cap(1);
+        let dir = crate::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("plain"), b"x").expect("write");
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let hour = Duration::from_secs(3600);
+
+        // The owner's one hold: an hour timer.
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            assert!(conn.timeout(hour, |_d, _c| {}).is_some(), "first arm");
+        }
+        // Its `Allow` open is refused before either slot is popped,
+        // with the errno and the mark an over-cap timer arm carries.
+        let seen: Rc<StdCell<Option<(bool, bool)>>> =
+            Rc::new(StdCell::new(None));
+        let free_before = fs.op_free_len_for_test();
+        {
+            let out = Rc::clone(&seen);
+            let at = at.clone();
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            drop(conn.spawn(move |t| async move {
+                let d = t
+                    .fut(|c, cb| {
+                        c.open(
+                            who,
+                            &at,
+                            c"plain",
+                            crate::uring_fs::FsOpenHow::from(
+                                OpenHow::new().flags(OFlag::O_RDONLY),
+                            )
+                            .allow_blocking_special_files(hour),
+                            cb,
+                        );
+                    })
+                    .await;
+                out.set(Some((
+                    matches!(
+                        d.result(),
+                        Err(crate::Error::Errno(Errno::EBUSY))
+                    ),
+                    d.was_refused(),
+                )));
+            }));
+        }
+        assert_eq!(
+            seen.get(),
+            Some((true, true)),
+            "refused as this crate's own EBUSY, not silently"
+        );
+        assert_eq!(
+            fs.op_free_len_for_test(),
+            free_before,
+            "a refused pair holds nothing"
+        );
+
+        // The neighbour's budget is its own.
+        let ok = Rc::new(StdCell::new(false));
+        {
+            let out = Rc::clone(&ok);
+            let at = at.clone();
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((2, 1)));
+            drop(conn.spawn(move |t| async move {
+                let d = t
+                    .fut(|c, cb| {
+                        c.open(
+                            who,
+                            &at,
+                            c"plain",
+                            crate::uring_fs::FsOpenHow::from(
+                                OpenHow::new().flags(OFlag::O_RDONLY),
+                            )
+                            .allow_blocking_special_files(hour),
+                            cb,
+                        );
+                    })
+                    .await;
+                out.set(d.result().is_ok());
+            }));
+        }
+        drive(&mut fs, &mut eng, &ok, "the neighbour's Allow open");
+    }
+
+    /// The pair's charge is taken when the guard stages and returned
+    /// when the open answers, so an in-flight `Allow` open blocks the
+    /// owner's next arm and its completion frees it - the same
+    /// lifecycle a timer's count follows.
+    #[test]
+    fn an_allow_opens_charge_returns_when_it_answers() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        fs.set_timer_cap(1);
+        let dir = crate::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("plain"), b"x").expect("write");
+        let at = Anchor::open(dir.path()).expect("anchor");
+
+        let done = Rc::new(StdCell::new(false));
+        {
+            let out = Rc::clone(&done);
+            let at = at.clone();
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            drop(conn.spawn(move |t| async move {
+                let d = t
+                    .fut(|c, cb| {
+                        c.open(
+                            who,
+                            &at,
+                            c"plain",
+                            crate::uring_fs::FsOpenHow::from(
+                                OpenHow::new().flags(OFlag::O_RDONLY),
+                            )
+                            .allow_blocking_special_files(Duration::from_secs(
+                                3600,
+                            )),
+                            cb,
+                        );
+                    })
+                    .await;
+                assert!(d.result().is_ok(), "{:?}", d.result());
+                out.set(true);
+            }));
+        }
+        // Charged while in flight: the owner's next arm is refused.
+        assert_eq!(fs.armed_timers_for_test(&(1, 1)), 1, "the pair charged");
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            assert!(
+                conn.timeout(Duration::from_secs(3600), |_d, _c| {})
+                    .is_none(),
+                "the hold spends the same budget a timer would"
+            );
+        }
+        drive(&mut fs, &mut eng, &done, "allow open");
+        assert_eq!(
+            fs.armed_timers_for_test(&(1, 1)),
+            0,
+            "the answer returned the charge"
+        );
+    }
+
+    /// A connection the sweep has passed may not park an `Allow` pair
+    /// on the table, for the reason its timers are refused: two slots
+    /// held for wall-clock time, with nothing left to retract them.
+    /// Same verdict, same delivery.
+    #[test]
+    fn a_swept_owner_cannot_park_an_allow_open() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        let dir = crate::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("plain"), b"x").expect("write");
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let seen: Rc<StdCell<Option<(bool, bool)>>> =
+            Rc::new(StdCell::new(None));
+
+        fs.cancel_owned_by(&mut eng, vec![(6, 1)]);
+        {
+            let out = Rc::clone(&seen);
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((6, 1)));
+            drop(conn.spawn(move |t| async move {
+                let d = t
+                    .fut(|c, cb| {
+                        c.open(
+                            who,
+                            &at,
+                            c"plain",
+                            crate::uring_fs::FsOpenHow::from(
+                                OpenHow::new().flags(OFlag::O_RDONLY),
+                            )
+                            .allow_blocking_special_files(Duration::from_secs(
+                                3600,
+                            )),
+                            cb,
+                        );
+                    })
+                    .await;
+                out.set(Some((
+                    matches!(
+                        d.result(),
+                        Err(crate::Error::Errno(Errno::ECANCELED))
+                    ),
+                    d.was_refused(),
+                )));
+            }));
+        }
+        let (ecanceled, refused) = seen.get().expect("answered at once");
+        assert!(ecanceled, "the sweep's verdict, not a strand");
+        assert!(
+            !refused,
+            "unmarked, exactly as an in-flight timer the sweep reached"
+        );
+        assert!(
+            fs.has_free_op(),
+            "no slot pair may be held for a dead connection"
         );
     }
 

@@ -557,7 +557,10 @@ pub enum SpecialFiles {
     /// that blocks - `fifo_open` parked in `wait_for_partner` - fails
     /// when the deadline fires instead of parking its worker for good.
     /// An `Allow` open charges **two op slots** until it answers: its
-    /// own and its guard's.
+    /// own and its guard's - so one can be refused `EBUSY` with a slot
+    /// still free - and the pair is a wall-clock hold, metered against
+    /// the owner's timer cap and refused for a swept owner exactly as
+    /// a timer arm is (`core::FsCore::armed_timers`).
     ///
     /// For a tree the consumer owns outright, where no FIFO or device node
     /// *should* appear because nothing else writes to it. The deadline is
@@ -1215,9 +1218,11 @@ pub(crate) enum FsInject {
         /// `open_parts` added `O_NONBLOCK` for the special-file guard, so the
         /// completion strips it back off the descriptor.
         guarded: bool,
-        /// An [`SpecialFiles::Allow`] open's bound, staged as the
-        /// `LINK_TIMEOUT` riding the open. `None` for a guarded open,
-        /// which cannot block.
+        /// An [`SpecialFiles::Allow`] open's bound: a guard timer in
+        /// its own op slot whose expiry cancels the open
+        /// ([`core::TAG_OPEN_DEADLINE`]) - **not** a kernel
+        /// `LINK_TIMEOUT`, which cannot bound a force-async open at
+        /// all. `None` for a guarded open, which cannot block.
         deadline: Option<std::time::Duration>,
         reply: ReplyTo,
     },

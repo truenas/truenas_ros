@@ -260,6 +260,23 @@ impl<U> Reactor<U> {
             pool.release(claim.bid);
             self.sync_recv_buf_stats();
         }
+        // The dying connection's placed and promoted body storage goes
+        // home too - with the held licences their claims recorded - for
+        // the pool to retain or free under its byte law. Dropped on the
+        // floor instead, every abandoned large upload took one warm
+        // buffer out of the loop, for the cost of a Content-Length
+        // header and a disconnect, no authentication required.
+        #[cfg(feature = "net-server")]
+        if let Some(pool) = self.body_pool.as_ref() {
+            let (placed, owned) = self.table.forfeit_body_storage(slot);
+            let mut pool = pool.borrow_mut();
+            if let Some((v, licence)) = placed {
+                pool.give_held(v, licence);
+            }
+            if let Some((v, licence)) = owned {
+                pool.give_held(v, licence);
+            }
+        }
         // Segments still queued name ring buffers; the connection is about
         // to go away and they are owed back.
         #[cfg(all(feature = "net-server", feature = "uring-fs"))]

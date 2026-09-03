@@ -2082,13 +2082,16 @@ fn a_creating_open_does_not_park_on_a_planted_fifo() {
 /// (`io_openat_force_async`) where `fifo_open` sleeps in
 /// `wait_for_partner` - with `Allow` and no deadline, forever, and the
 /// pool is one bounded set shared by every blocking fs op on the ring.
-/// The `LINK_TIMEOUT` staged as the open's link tail has the kernel
-/// cancel it when the deadline fires; the cancellation reaches the
-/// sleep as a signal, so the errno is `ECANCELED` or - where the open
-/// was already parked and returns `-ERESTARTSYS`, folded by `map_res`
-/// the way the kernel's own rw path folds it - `EINTR`. Either way the
-/// worker is freed, which the guarded open afterwards proves: it needs
-/// an io-wq worker of its own and completes.
+/// The deadline is a guard timer in its own op slot whose expiry
+/// stages an `ASYNC_CANCEL` for the open (`core::TAG_OPEN_DEADLINE` -
+/// **not** a kernel `LINK_TIMEOUT`, which arms only after the blocking
+/// issue returns and so cannot bound this shape); the cancellation
+/// reaches the sleep as a signal, so the errno is `ECANCELED` or --
+/// where the open was already parked and returns `-ERESTARTSYS`,
+/// folded by `map_res` the way the kernel's own rw path folds it --
+/// `EINTR`. Either way the worker is freed, which the guarded open
+/// afterwards proves: it needs an io-wq worker of its own and
+/// completes.
 #[test]
 fn an_allow_open_is_bounded_by_its_deadline() {
     use std::time::{Duration, Instant};

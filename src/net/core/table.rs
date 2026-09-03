@@ -555,6 +555,28 @@ impl<U> ConnTable<U> {
         conn.forfeit_recv_buf()
     }
 
+    /// Teardown's take of the slot's placed and promoted body storage,
+    /// each with the held body-pool licence its claim recorded, so the
+    /// caller can hand them home before the connection goes away.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn forfeit_body_storage(
+        &mut self,
+        slot: u32,
+    ) -> (
+        Option<super::conn::HeldStorage>,
+        Option<super::conn::HeldStorage>,
+    ) {
+        let Some(e) = self.slots.get_mut(slot as usize) else {
+            return (None, None);
+        };
+        match &mut e.state {
+            SlotState::Serving(conn)
+            | SlotState::Detaching(conn)
+            | SlotState::Detached(conn) => conn.forfeit_body_storage(),
+            _ => (None, None),
+        }
+    }
+
     /// Ring buffer ids still queued on this slot's connection, taken.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) fn drain_pooled_send_bids(&mut self, slot: u32) -> Vec<u16> {

@@ -181,6 +181,13 @@ pub(crate) struct RecvClaim {
     pub(crate) cap: usize,
 }
 
+/// Storage going home to the ring's body pool with the held licence
+/// its claim recorded ([`BodyPool::claim_held`]).
+///
+/// [`BodyPool::claim_held`]: super::bodypool::BodyPool::claim_held
+#[cfg(feature = "net-server")]
+pub(crate) type HeldStorage = (Vec<u8>, usize);
+
 /// The bytes a connection has accumulated for the message it is framing.
 ///
 /// A seam, not an abstraction for its own sake: this used to be a bare
@@ -213,6 +220,12 @@ pub(crate) struct RecvBuf {
     /// kernel writes into space reserved past the tail and the count only
     /// becomes known at completion.
     filled: usize,
+    /// The held body-pool licence a promote's missed claim recorded
+    /// ([`BodyPool::claim_held`](super::bodypool::BodyPool::claim_held)),
+    /// carried until `owned` goes home so a receipt spanning
+    /// maintenance ticks keeps what it is owed.
+    #[cfg(feature = "net-server")]
+    owned_licence: usize,
 }
 
 impl RecvBuf {
@@ -281,12 +294,14 @@ impl RecvBuf {
     /// Give the buffer up, for the caller to hand back to the pool. Only
     /// once nothing is buffered: the bytes live in it.
     ///
-    /// Also surrenders any storage a promote left behind - handed up
-    /// for the ring's body pool to retain or free under its byte
-    /// budget - so one oversized message does not leave the connection
-    /// carrying its buffer for the rest of its life, which is the
-    /// retention the pools exist to end.
-    pub(crate) fn release(&mut self) -> (Option<RecvClaim>, Option<Vec<u8>>) {
+    /// Also surrenders any storage a promote left behind - with the
+    /// held licence its claim recorded, for the ring's body pool to
+    /// retain or free under its byte budget - so one oversized message
+    /// does not leave the connection carrying its buffer for the rest
+    /// of its life, which is the retention the pools exist to end.
+    pub(crate) fn release(
+        &mut self,
+    ) -> (Option<RecvClaim>, Option<(Vec<u8>, usize)>) {
         if self.filled > 0 {
             return (None, None);
         }
@@ -296,9 +311,33 @@ impl RecvBuf {
             // completion's lease, never through the connection.
             return (None, None);
         }
-        let surplus = (self.pooled && !self.owned.is_empty())
-            .then(|| std::mem::take(&mut self.owned));
+        let surplus = (self.pooled && !self.owned.is_empty()).then(|| {
+            let owned = std::mem::take(&mut self.owned);
+            (owned, self.take_owned_licence())
+        });
         (self.claim.take(), surplus)
+    }
+
+    /// The held licence riding `owned`, taken - 0 where no pool exists.
+    fn take_owned_licence(&mut self) -> usize {
+        #[cfg(feature = "net-server")]
+        {
+            std::mem::take(&mut self.owned_licence)
+        }
+        #[cfg(not(feature = "net-server"))]
+        {
+            0
+        }
+    }
+
+    /// Teardown's take of the promoted/owned storage, licence included:
+    /// the connection is going away, and storage dropped on the floor
+    /// is one warm buffer out of the pool's loop per close.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn forfeit_owned(&mut self) -> Option<(Vec<u8>, usize)> {
+        let licence = std::mem::take(&mut self.owned_licence);
+        (self.owned.capacity() > 0)
+            .then(|| (std::mem::take(&mut self.owned), licence))
     }
 
     /// Whether the buffer in hand covers a whole message of `total` bytes.
@@ -332,7 +371,7 @@ impl RecvBuf {
         &mut self,
         at: usize,
         want: usize,
-        seed: impl FnOnce() -> Option<Vec<u8>>,
+        seed: impl FnOnce() -> Option<(Vec<u8>, usize)>,
     ) -> Option<RecvClaim> {
         // Unreachable while a leased write holds the claim - no recv is
         // armed between the write's submit and the delivery's consume - and
@@ -350,13 +389,23 @@ impl RecvBuf {
         // Reused storage from the ring's body pool where one waits.
         // Deferred to here so the calls that promote nothing claim
         // nothing - a claim is a demand signal, and a false one grows
-        // the pool.
-        if let Some(s) = seed() {
+        // the pool. A missed claim's licence rides the storage
+        // (`owned_licence`) until it goes home.
+        #[cfg_attr(not(feature = "net-server"), allow(unused_variables))]
+        if let Some((s, licence)) = seed() {
             debug_assert!(s.is_empty(), "a reused body kept bytes");
             self.owned = s;
+            #[cfg(feature = "net-server")]
+            {
+                self.owned_licence = licence;
+            }
         }
         self.owned.clear();
-        self.owned.reserve(at.saturating_add(want));
+        // Exact: the seed's capacity already covers a served fit, and a
+        // pooled Vec grown amortized ends up at twice its old capacity
+        // - an 8 MiB allocation for a 5 MiB body, the spare 3 MiB
+        // never written and charged in full to the byte budget.
+        self.owned.reserve_exact(at.saturating_add(want));
         // SAFETY: `filled <= cap` by construction, and the pool outlives
         // this connection - see `RecvClaim`.
         self.owned.extend_from_slice(unsafe {
@@ -766,6 +815,16 @@ pub(crate) struct Connection<U> {
     // the exact-count CQE proves it is initialized.
     body_buf: Option<Vec<u8>>,
     recv_into_body: bool, // the in-flight recv targets `body_buf`, not `buf`
+    /// The held body-pool licence `body_buf`'s missed claim recorded,
+    /// riding the storage until it leaves custody - so a body arriving
+    /// slower than the pool's maintenance tick keeps what it is owed.
+    #[cfg(feature = "net-server")]
+    body_licence: usize,
+    /// Held licences whose bodies left custody this delivery
+    /// (`take_placed_body`), awaiting the post-consume hand-off to the
+    /// pool's windowed pot (`release_recv_buffer`).
+    #[cfg(feature = "net-server")]
+    delivered_licence: usize,
     // ---- spliced body ----
     // A framed body spliced straight from the socket to a consumer fd
     // (`Framing::SpliceBody`) instead of read into a buffer - zero-copy. The fd
@@ -955,6 +1014,10 @@ impl<U> Connection<U> {
             recv_exact: true,
             transport: Transport::Plain,
             body_buf: None,
+            #[cfg(feature = "net-server")]
+            body_licence: 0,
+            #[cfg(feature = "net-server")]
+            delivered_licence: 0,
             recv_into_body: false,
             splicing: false,
             splice_polling: false,
@@ -1172,7 +1235,41 @@ impl<U> Connection<U> {
         if self.recv_into_body {
             return None;
         }
-        self.body_buf.take()
+        let body = self.body_buf.take();
+        // The body leaves custody with the handler; its held licence
+        // moves to the delivered pot, handed to the pool after consume
+        // (`release_recv_buffer`) so the consumer's recycle window
+        // opens at delivery, not at the arm.
+        #[cfg(feature = "net-server")]
+        if body.is_some() {
+            self.delivered_licence = self
+                .delivered_licence
+                .saturating_add(std::mem::take(&mut self.body_licence));
+        }
+        body
+    }
+
+    /// Held licences whose bodies were delivered by this delivery,
+    /// taken for the pool's windowed pot.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn take_delivered_licence(&mut self) -> usize {
+        std::mem::take(&mut self.delivered_licence)
+    }
+
+    /// Teardown's take of everything the ring's body pool can reuse:
+    /// the placed body's storage and the promoted/owned accumulate
+    /// storage, each with the held licence its claim recorded. The
+    /// connection is going away, so the bytes have no reader left and
+    /// the pool clears before reissue.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn forfeit_body_storage(
+        &mut self,
+    ) -> (Option<HeldStorage>, Option<HeldStorage>) {
+        let placed = self
+            .body_buf
+            .take()
+            .map(|v| (v, std::mem::take(&mut self.body_licence)));
+        (placed, self.recv_buf.forfeit_owned())
     }
 
     /// The owned-buffer handoff predicate shared by both delivery forms.
@@ -1237,7 +1334,7 @@ impl<U> Connection<U> {
     /// acquires afresh and an idle connection holds none.
     pub(crate) fn release_recv_buf(
         &mut self,
-    ) -> (Option<RecvClaim>, Option<Vec<u8>>) {
+    ) -> (Option<RecvClaim>, Option<(Vec<u8>, usize)>) {
         self.recv_buf.release()
     }
 
@@ -1257,7 +1354,7 @@ impl<U> Connection<U> {
         &mut self,
         at: usize,
         want: usize,
-        seed: impl FnOnce() -> Option<Vec<u8>>,
+        seed: impl FnOnce() -> Option<(Vec<u8>, usize)>,
     ) -> Option<RecvClaim> {
         self.recv_buf.promote_for(at, want, seed)
     }
@@ -1320,13 +1417,29 @@ impl<U> Connection<U> {
     ///
     /// Caller guarantees the header is fully buffered and the body is not
     /// (`header_len <= buf.len() < header_len + body_len`).
-    pub(crate) fn arm_body_recv(&mut self, reuse: Option<Vec<u8>>) -> usize {
+    pub(crate) fn arm_body_recv(
+        &mut self,
+        reuse: Option<(Vec<u8>, usize)>,
+    ) -> usize {
         let prefix = self.recv_buf.len() - self.header_len;
         // Reused storage from the ring's body pool where one waits; the
-        // pool cleared it before reissue, so only capacity carries over.
-        let mut body = reuse.unwrap_or_default();
+        // pool cleared it before reissue, so only capacity carries
+        // over. The licence beside it is a missed claim's held share
+        // (`BodyPool::claim_held`), parked on the connection until the
+        // body leaves custody so a receipt spanning maintenance ticks
+        // keeps it.
+        #[cfg_attr(not(feature = "net-server"), allow(unused_variables))]
+        let (mut body, licence) = reuse.unwrap_or_default();
+        #[cfg(feature = "net-server")]
+        {
+            self.body_licence = licence;
+        }
         debug_assert!(body.is_empty(), "a reused body kept bytes");
-        body.reserve(self.body_len);
+        // Exact: a pooled Vec grown amortized lands at twice its old
+        // capacity - an 8 MiB allocation for a 5 MiB body, the spare
+        // never written and charged in full to the byte budget - where
+        // the fresh-allocation path was always exact.
+        body.reserve_exact(self.body_len);
         body.extend_from_slice(&self.recv_buf[self.header_len..]);
         self.recv_buf.truncate(self.header_len);
         self.recv_at = prefix;
@@ -1440,11 +1553,21 @@ impl<U> Connection<U> {
         // truncates the accumulate buffer to the header - so asking
         // `recv_buf` about it inspects unrelated storage, and answers
         // "outside" for every body larger than its own head.
+        //
+        // Bounded by `body_len`, not `body.capacity()`: the two were
+        // equal when every body was freshly allocated, but a pooled
+        // buffer carries whatever capacity its largest tenant left -
+        // 16x the body at the defaults - and the spare bytes past
+        // `body_len` are a previous message's, from any connection on
+        // the ring. `recv_at + recv_want == body_len` is the invariant
+        // every partial path preserves, so this is the exact bound the
+        // cursor is supposed to satisfy (and `capacity >= body_len` by
+        // `arm_body_recv`'s reserve, so it is the tighter of the two).
         match &self.body_buf {
-            Some(body) if self.recv_into_body => self
+            Some(_) if self.recv_into_body => self
                 .recv_at
                 .checked_add(self.recv_want)
-                .is_some_and(|end| end <= body.capacity()),
+                .is_some_and(|end| end <= self.body_len),
             _ => self.recv_buf.armed_within(self.recv_at, self.recv_want),
         }
     }
@@ -2062,6 +2185,77 @@ mod tests {
         }
         c.consume();
         assert_eq!(c.buffered(), 0, "placed body never re-enters buf");
+    }
+
+    /// The kTLS continuation's every-build guard bounds the placed-body
+    /// cursor by the *body*, not by its buffer. The two were equal when
+    /// every body was freshly allocated; a pooled buffer carries
+    /// whatever capacity its largest tenant left, and the spare bytes
+    /// past `body_len` are a previous message's - so a cursor walked
+    /// past the body while still inside the allocation must be refused.
+    #[test]
+    fn a_placed_cursor_is_bounded_by_the_body_not_its_buffer() {
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        c.set_frame(0, 100);
+        // Reused pool storage, sized by a larger tenant.
+        let want = c.arm_body_recv(Some((Vec::with_capacity(1024), 0)));
+        assert_eq!(want, 100);
+        assert!(c.recv_armed_within(), "the armed read is in bounds");
+        // Partial progress up to the body's edge stays in bounds.
+        c.advance_exact_partial(60);
+        assert!(c.recv_armed_within(), "a mid-body continuation is fine");
+        // A cursor past the body but not the buffer is exactly the
+        // range whose bytes belong to someone else's message.
+        c.recv_want = 100;
+        assert!(
+            !c.recv_armed_within(),
+            "the guard must bound by body_len, not capacity"
+        );
+    }
+
+    /// A delivered placed body's held licence leaves custody with it,
+    /// staged for the pool's windowed pot (taken once by
+    /// `release_recv_buffer`) rather than dying on the connection or
+    /// leaking onto the next message's claim.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_delivered_bodys_licence_is_staged_for_the_pot() {
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        c.set_frame(0, 100);
+        let want = c.arm_body_recv(Some((Vec::with_capacity(100), 100)));
+        let ptr = c.recv_ptr() as *mut u8;
+        // SAFETY: recv_ptr points at `want` reserved-but-uninit bytes.
+        unsafe { std::ptr::write_bytes(ptr, 0xCD, want) };
+        assert_eq!(c.recv_result(want as i32), RecvOutcome::Complete);
+        {
+            let (_h, body, _addr, _state) = c.deliver_parts(None);
+            assert_eq!(body.len(), 100, "the placed body delivered");
+        }
+        assert_eq!(
+            c.take_delivered_licence(),
+            100,
+            "the licence rode out with the body"
+        );
+        assert_eq!(c.take_delivered_licence(), 0, "and is taken exactly once");
+    }
+
+    /// Teardown hands a dying connection's body storage home with the
+    /// held licences its claims recorded - an abandoned mid-receive
+    /// upload must not take a warm buffer out of the pool's loop.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn teardown_forfeits_body_storage_with_its_licence() {
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        c.set_frame(0, 100);
+        // Armed and mid-receive: the peer disconnects here.
+        let _want = c.arm_body_recv(Some((Vec::with_capacity(100), 100)));
+        let (placed, owned) = c.forfeit_body_storage();
+        let (v, licence) = placed.expect("the placed storage comes home");
+        assert!(v.capacity() >= 100);
+        assert_eq!(licence, 100, "with the licence its claim recorded");
+        assert!(owned.is_none(), "nothing was promoted");
+        let (placed, _) = c.forfeit_body_storage();
+        assert!(placed.is_none(), "forfeit is take-once");
     }
 
     /// A redelivery must not be handed the buffer an in-flight `RECV` is

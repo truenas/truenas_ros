@@ -31,12 +31,30 @@
 //! keeps that capacity for as long as it is retained. So the law is in
 //! bytes:
 //!
-//! - **Retention is licensed by demand.** A claim that finds the list
-//!   empty allocates (the caller's body must exist regardless) and
-//!   records a miss. When storage comes home, each outstanding miss
-//!   licenses raising the retention target to cover it — so the target
-//!   grows toward the storm's real working set, measured in the bytes
-//!   the storm actually used, never ahead of it.
+//! - **Retention is licensed by demand, measured in bytes.** A claim
+//!   that finds nothing fitting allocates (the caller's body must exist
+//!   regardless) and records the *size* it needed — a sizeless count
+//!   let `claim(0)` + `give(64 MiB)` license retaining sixty-four
+//!   megabytes nobody asked for. When storage comes home, outstanding
+//!   missed bytes license raising the retention target toward it — so
+//!   the target grows toward the storm's real working set and never
+//!   ahead of it.
+//! - **A licence lives as long as its claim is in flight.** The
+//!   reactor's claims ([`BodyPool::claim_held`]) resolve
+//!   deterministically — the storage is given back, or the body leaves
+//!   custody at delivery ([`BodyPool::receipt_done`]) — so their
+//!   licences ride the claim itself and survive however many
+//!   maintenance ticks a slow receipt spans; a licence that expired
+//!   with the tick made the pool inert for exactly the slow-link
+//!   uploads it exists for. Only the *windowed* pot expires: consumer
+//!   claims ([`BodyRecycler`]) and delivered bodies awaiting an
+//!   optional recycle, where nothing guarantees the storage ever
+//!   returns.
+//! - **A body is served from storage near its size.** The free list is
+//!   taken best-fit, and a buffer more than a few times the ask is left
+//!   for the body it was sized by — serving every small body from the
+//!   high-water buffer is the "whole maximal buffers for storms of
+//!   small ones" this module's own header rejects.
 //! - **A hard budget caps the target.** Whatever demand claims, retained
 //!   bytes never exceed the budget the pool was built with; storage over
 //!   it is freed on the spot, and a single body larger than the budget
@@ -69,10 +87,23 @@ use std::rc::Rc;
 /// allocating and freeing across a workload that merely pauses.
 const SHRINK_AFTER: u8 = 4;
 
+/// How many times the ask a served buffer may exceed, floored at
+/// [`OVERSIZE_FLOOR`]: past it the claim is treated as unmet and
+/// allocates right-sized, diversifying the inventory instead of
+/// carrying every small body in the high-water allocation — measured
+/// at 8x resident over-provision (384 KiB bodies in a 3 MiB buffer)
+/// and 16x possible at the shipped defaults.
+const OVERSIZE_SERVE: usize = 4;
+
+/// Below this, over-provision is noise: refusing a 256 KiB buffer to a
+/// 4 KiB ask would shed warm reuse to save kilobytes.
+const OVERSIZE_FLOOR: usize = 64 * 1024;
+
 /// Ring-owned storage for bodies read outside a pool buffer.
 pub(crate) struct BodyPool {
-    /// Cleared, capacity-bearing Vecs awaiting reuse. LIFO, so a storm of
-    /// same-shaped bodies keeps cycling its warmest allocation.
+    /// Cleared, capacity-bearing Vecs awaiting reuse. Taken best-fit,
+    /// so a storm of same-shaped bodies keeps cycling the allocation
+    /// its own size warmed.
     free: Vec<Vec<u8>>,
     /// Total capacity retained in `free`, in bytes — the figure every
     /// bound below is about.
@@ -83,13 +114,15 @@ pub(crate) struct BodyPool {
     /// The hard ceiling on `target`, set at construction: whatever a
     /// storm proves, retained storage never passes this.
     budget: usize,
-    /// Claims that found the list empty since the last rebalance. Each
-    /// licenses one retention-grow when storage comes home; reset every
-    /// observation, so a storm long gone cannot license a later one. A
-    /// counter rather than an outstanding ledger because a delivered
-    /// body may never come back (the consumer owns it), and a ledger
-    /// that cannot be decremented reliably reads as permanent load.
-    misses: usize,
+    /// Bytes of demand that found nothing fitting, recorded by
+    /// consumer claims at the claim and by reactor claims when their
+    /// body leaves custody ([`BodyPool::receipt_done`]). Licenses
+    /// target growth as storage comes home; reset every observation
+    /// window, so a storm long gone cannot license a later one — the
+    /// storage on this pot's clock is consumer-held, and nothing
+    /// guarantees it ever returns. Capped at `budget`, which is the
+    /// most it could ever license anyway.
+    missed_bytes: usize,
     /// Claims since the last rebalance — the quiet detector.
     hot: usize,
     /// Consecutive rebalances that observed no claim.
@@ -103,46 +136,92 @@ impl BodyPool {
             retained: 0,
             target: 0,
             budget,
-            misses: 0,
+            missed_bytes: 0,
             hot: 0,
             idle_rounds: 0,
         }
     }
 
-    /// Storage for a body of at least `min_cap` bytes: a reused Vec where
-    /// one waits, a fresh allocation — and a recorded miss — where none
-    /// does. The returned Vec is empty; its capacity covers `min_cap`.
+    /// The best-fitting free Vec for `min_cap`, if serving it is not an
+    /// over-provision ([`OVERSIZE_SERVE`]); its capacity leaves
+    /// `retained` with it.
+    fn take_fit(&mut self, min_cap: usize) -> Option<Vec<u8>> {
+        let mut best: Option<(usize, usize)> = None;
+        for (i, v) in self.free.iter().enumerate() {
+            let cap = v.capacity();
+            if cap >= min_cap && best.is_none_or(|(_, c)| cap < c) {
+                best = Some((i, cap));
+            }
+        }
+        let (i, cap) = best?;
+        if cap > min_cap.saturating_mul(OVERSIZE_SERVE).max(OVERSIZE_FLOOR) {
+            return None;
+        }
+        self.retained = self.retained.saturating_sub(cap);
+        Some(self.free.swap_remove(i))
+    }
+
+    /// Storage for a body of at least `min_cap` bytes, consumer form: a
+    /// fitting reused Vec where one waits, a fresh allocation — and
+    /// `min_cap` recorded on the windowed pot — where none does. The
+    /// returned Vec is empty; its capacity covers `min_cap`.
     pub(crate) fn claim(&mut self, min_cap: usize) -> Vec<u8> {
+        let (v, licence) = self.claim_held(min_cap);
+        self.missed_bytes =
+            self.missed_bytes.saturating_add(licence).min(self.budget);
+        v
+    }
+
+    /// [`claim`](BodyPool::claim) for a claimant whose storage resolves
+    /// deterministically — the reactor's placed and promoted bodies.
+    /// The miss, if any, comes back as a *held licence* the caller
+    /// carries beside the storage and returns through
+    /// [`give_held`](BodyPool::give_held) or
+    /// [`receipt_done`](BodyPool::receipt_done); held licences do not
+    /// expire with the observation window, so a receipt spanning
+    /// maintenance ticks still licenses what it used.
+    pub(crate) fn claim_held(&mut self, min_cap: usize) -> (Vec<u8>, usize) {
         self.hot = self.hot.saturating_add(1);
-        match self.free.pop() {
+        match self.take_fit(min_cap) {
             Some(mut v) => {
                 debug_assert!(v.is_empty(), "a pooled body kept bytes");
-                self.retained = self.retained.saturating_sub(v.capacity());
-                v.reserve(min_cap);
-                v
+                v.reserve_exact(min_cap);
+                (v, 0)
             }
-            None => {
-                self.misses = self.misses.saturating_add(1);
-                Vec::with_capacity(min_cap)
-            }
+            None => (Vec::with_capacity(min_cap), min_cap),
         }
     }
 
-    /// Hand storage home. Cleared here so a claim never sees stale bytes.
-    /// Retained only within the byte target — which an outstanding miss
-    /// may first raise to cover it, up to the budget — and freed on the
-    /// spot otherwise.
-    pub(crate) fn give(&mut self, mut v: Vec<u8>) {
+    /// A held claim's body left reactor custody (delivered to the
+    /// handler): its licence moves to the windowed pot, where the
+    /// consumer's optional recycle can still spend it before the
+    /// window closes.
+    pub(crate) fn receipt_done(&mut self, licence: usize) {
+        self.missed_bytes =
+            self.missed_bytes.saturating_add(licence).min(self.budget);
+    }
+
+    /// Hand storage home with the held licence its claim recorded (0
+    /// for a pool-served claim). Cleared here so a claim never sees
+    /// stale bytes; retained only within the byte target — which
+    /// outstanding missed bytes may first raise toward it, up to the
+    /// budget — and freed on the spot otherwise.
+    pub(crate) fn give_held(&mut self, mut v: Vec<u8>, licence: usize) {
+        self.missed_bytes =
+            self.missed_bytes.saturating_add(licence).min(self.budget);
         let cap = v.capacity();
         if cap == 0 {
             return;
         }
         let held = self.retained.saturating_add(cap);
-        if held > self.target && self.misses > 0 && held <= self.budget {
-            // Demand proved a body of this size was needed while the
-            // list was dry; retaining it is what a working set means.
-            self.misses -= 1;
-            self.target = held;
+        if held > self.target && self.missed_bytes > 0 && held <= self.budget {
+            // Demand proved bytes of this order were needed while
+            // nothing fitting waited; retaining toward it is what a
+            // working set means — and no further than the missed
+            // bytes, so one giant give cannot ride a small licence.
+            let grant = (held - self.target).min(self.missed_bytes);
+            self.target += grant;
+            self.missed_bytes -= grant;
         }
         if held > self.target {
             return; // freed here — over target, or over budget outright
@@ -152,12 +231,20 @@ impl BodyPool {
         self.free.push(v);
     }
 
+    /// Hand storage home, consumer form: no held licence, so retention
+    /// rides whatever the windowed pot holds.
+    pub(crate) fn give(&mut self, v: Vec<u8>) {
+        self.give_held(v, 0);
+    }
+
     /// The timer's observation: quiet long enough halves the target and
     /// frees the surplus now — no traffic is needed to hand anything
-    /// back. Demand licenses do not survive the observation window, so a
-    /// storm long gone cannot inflate the pool a later one holds.
+    /// back. The windowed pot does not survive the observation — a
+    /// storm long gone cannot inflate the pool a later one holds — but
+    /// held licences do: they ride the reactor claims that recorded
+    /// them, whose resolution is deterministic.
     pub(crate) fn rebalance(&mut self) {
-        self.misses = 0;
+        self.missed_bytes = 0;
         if self.hot > 0 {
             self.hot = 0;
             self.idle_rounds = 0;
@@ -316,6 +403,91 @@ mod tests {
         p.give(v);
         p.rebalance();
         assert!(p.retained() >= MIB, "a claim resets the quiet count");
+    }
+
+    /// A held licence rides its claim, not the observation window: a
+    /// body that takes longer than a maintenance tick to arrive still
+    /// licenses retaining its storage when it comes home - the
+    /// windowed form went inert for exactly the slow-link uploads the
+    /// pool exists for, measured at three fresh allocations for three
+    /// 7-second bodies with `target` never leaving zero.
+    #[test]
+    fn a_held_licence_survives_the_observation_window() {
+        let mut p = BodyPool::new(64 * MIB);
+        let (v, licence) = p.claim_held(MIB);
+        assert_eq!(licence, MIB, "a dry pool records the bytes needed");
+        p.rebalance(); // a tick passes mid-receipt
+        p.rebalance(); // and another
+        p.give_held(v, licence);
+        assert_eq!(p.retained(), MIB, "the slow body still licenses itself");
+        let (w, licence) = p.claim_held(MIB);
+        assert_eq!(licence, 0, "and the next receipt is a pool hit");
+        p.give_held(w, 0);
+    }
+
+    /// A delivered body's licence moves to the windowed pot at
+    /// delivery, so the consumer's recycle window opens then - not at
+    /// the arm, however long the receipt took.
+    #[test]
+    fn a_delivered_body_recycles_on_the_deliverys_clock() {
+        let mut p = BodyPool::new(64 * MIB);
+        let (v, licence) = p.claim_held(MIB);
+        p.rebalance(); // the receipt spans a tick
+        p.receipt_done(licence); // delivery: the body leaves custody
+        drop(v); // the handler owns it now; it comes back via recycle
+        let mut recycled = Vec::new();
+        recycled.reserve_exact(MIB);
+        p.give(recycled);
+        assert_eq!(p.retained(), MIB, "recycled within the delivery window");
+    }
+
+    /// The licence is sized in bytes, so a sizeless claim licenses
+    /// nothing and a giant give cannot ride a small one: `claim(0)` +
+    /// `give(64 MiB)` used to set a 64 MiB target off a zero-byte miss.
+    #[test]
+    fn a_licence_is_bytes_not_a_count() {
+        let mut p = BodyPool::new(64 * MIB);
+        drop(p.claim(0));
+        let mut giant = Vec::new();
+        giant.reserve_exact(8 * MIB);
+        p.give(giant);
+        assert_eq!(p.retained(), 0, "a zero-byte miss licenses nothing");
+        assert_eq!(p.target(), 0);
+        // A small miss cannot license a giant either: the grant stops
+        // at the missed bytes.
+        drop(p.claim(64 * 1024));
+        let mut giant = Vec::new();
+        giant.reserve_exact(8 * MIB);
+        p.give(giant);
+        assert_eq!(p.retained(), 0, "the giant is freed, not retained");
+        assert!(p.target() <= 64 * 1024, "the target grew by the miss alone");
+    }
+
+    /// A body is served from storage near its size: the high-water
+    /// buffer stays for bodies of its own order, and a much smaller
+    /// claim allocates right-sized instead of faulting 8x its need -
+    /// the "whole maximal buffers for storms of small ones" the module
+    /// header rejects.
+    #[test]
+    fn a_small_body_is_not_served_from_the_high_water_buffer() {
+        let mut p = BodyPool::new(64 * MIB);
+        let (big, licence) = p.claim_held(3 * MIB);
+        p.give_held(big, licence);
+        assert_eq!(p.retained(), 3 * MIB, "the big body's storage waits");
+        let (small, licence) = p.claim_held(300 * 1024);
+        assert!(
+            small.capacity() < MIB,
+            "a 300 KiB body must not carry a 3 MiB allocation: {}",
+            small.capacity()
+        );
+        assert_eq!(licence, 300 * 1024, "unmet at its own size, licensed");
+        assert_eq!(p.retained(), 3 * MIB, "the big buffer stayed for its own");
+        // Near its size, the big buffer does serve.
+        let (served, licence) = p.claim_held(MIB);
+        assert_eq!(served.capacity(), 3 * MIB, "a 1 MiB ask takes the 3 MiB");
+        assert_eq!(licence, 0);
+        p.give_held(served, 0);
+        p.give_held(small, 300 * 1024);
     }
 
     /// A miss does not license retention across observation windows: a
