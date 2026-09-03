@@ -1215,9 +1215,11 @@ pub(crate) enum FsInject {
         /// `open_parts` added `O_NONBLOCK` for the special-file guard, so the
         /// completion strips it back off the descriptor.
         guarded: bool,
-        /// An [`SpecialFiles::Allow`] open's bound, staged as the
-        /// `LINK_TIMEOUT` riding the open. `None` for a guarded open,
-        /// which cannot block.
+        /// An [`SpecialFiles::Allow`] open's bound: a guard timer in
+        /// its own op slot whose expiry cancels the open
+        /// ([`core::TAG_OPEN_DEADLINE`]) - **not** a kernel
+        /// `LINK_TIMEOUT`, which cannot bound a force-async open at
+        /// all. `None` for a guarded open, which cannot block.
         deadline: Option<std::time::Duration>,
         reply: ReplyTo,
     },

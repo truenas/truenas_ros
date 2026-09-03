@@ -321,14 +321,16 @@ struct FsOpEntry {
     /// enter that submits the SQE - boxed and parked here so the address
     /// holds however many stages batch before that enter.
     ts: Option<Box<KernelTimespec>>,
-    /// This timer's `ECANCELED` was asked for ([`FsConn::cancel_timeout`]),
-    /// so the completion reports a marked retraction rather than the
-    /// teardown verdict - `ECANCELED` with [`FsDone::was_refused`] false
-    /// stays meaning teardown alone.
+    /// This op's `ECANCELED` was asked for - a timer's by
+    /// [`FsConn::cancel_timeout`], an `Allow` open's by its own tripped
+    /// deadline - so the completion reports a marked cancellation rather
+    /// than the teardown verdict - `ECANCELED` with
+    /// [`FsDone::was_refused`] false stays meaning teardown alone.
     retracted: bool,
-    /// On a [`TAG_OPEN_DEADLINE`] entry: the routing token of the
-    /// `Allow` open this guard cancels if it fires.
-    cancels: Option<u64>,
+    /// On a [`TAG_OPEN_DEADLINE`] entry: the slot and full generation of
+    /// the `Allow` open this guard cancels if it fires - full-width like
+    /// [`FsOpEntry::guard`], so a reissued slot is inert.
+    cancels: Option<(u32, u64)>,
     /// On a [`TAG_OPEN`] entry: the guard timer's slot and full
     /// generation, retracted when the open answers first.
     guard: Option<(u32, u64)>,
@@ -766,6 +768,7 @@ impl FsCore {
         };
 
         let entry = &mut self.ops[op_slot as usize];
+        let open_gen = entry.generation;
         let gen32 = entry.generation as u32;
         let e = &mut entry.state;
         e.state = FsOpState::InFlight { tag: TAG_OPEN };
@@ -820,7 +823,7 @@ impl FsCore {
                 tag: TAG_OPEN_DEADLINE,
             };
             ge.ts = Some(ts);
-            ge.cancels = Some(ud);
+            ge.cancels = Some((op_slot, open_gen));
             let gud = pack_raw(TAG_OPEN_DEADLINE, guard_slot, ggen32);
             let staged = eng.stage(gud, |sqe| {
                 sqe.opcode = IORING_OP_TIMEOUT;
@@ -1817,9 +1820,22 @@ impl FsCore {
             self.op_free.push(op_slot);
             if !retracted
                 && res == -libc::ETIME
-                && let Some(open_ud) = cancels
+                && let Some((oslot, ogen)) = cancels
+                && let Some(oentry) = self.ops.get_mut(oslot as usize)
+                && oentry.generation == ogen
+                && oentry.state.state == (FsOpState::InFlight { tag: TAG_OPEN })
             {
-                self.submit_cancel(eng, open_ud);
+                // The mirror of the arm below: mark, then cancel. The
+                // mark is what makes the open's `ECANCELED` carry the
+                // deadline's verdict (`was_refused` true, like a
+                // retracted timer's) instead of the unmarked form
+                // reserved for teardown - which a task winds a live
+                // connection down on (`task.rs`). The verification is
+                // `retract_timeout`'s: an open that already answered -
+                // its slot freed or reissued - is left alone, and the
+                // cancel is skipped with it.
+                oentry.state.retracted = true;
+                self.submit_cancel(eng, pack_raw(TAG_OPEN, oslot, ogen as u32));
             }
             return ReapedFs::None;
         }
@@ -1895,13 +1911,18 @@ impl FsCore {
         if tag == TAG_TIMEOUT && result == Err(Errno::ETIME) {
             result = Ok(0);
         }
-        // A retraction the caller staged is not the reactor going away:
-        // `ECANCELED` with `was_refused` false stays meaning teardown
-        // alone (the vocabulary a task winds down on), so the answer a
-        // `cancel_timeout` asked for carries the mark. Gated on the
-        // errno as well as the flag - if the timer expired before the
-        // cancel reached it, the expiry is the answer and it is not a
-        // retraction.
+        // A cancellation that was asked for is not the reactor going
+        // away: `ECANCELED` with `was_refused` false stays meaning
+        // teardown alone (the vocabulary a task winds down on), so the
+        // answer a `cancel_timeout` staged - or an `Allow` open's own
+        // tripped deadline - carries the mark. Gated on the errno as
+        // well as the flag: if the op answered before the cancel
+        // reached it, that answer stands and is not a cancellation. A
+        // deadline that catches the open's worker mid-sleep can also
+        // surface as `EINTR` (the cancel arrives as a signal, and
+        // `map_res` folds `-ERESTARTSYS` the way the kernel's rw path
+        // does) - a kernel verdict, left unmarked; only the `ECANCELED`
+        // spelling ever collided with teardown's.
         let refused = retracted && result == Err(Errno::ECANCELED);
         // A short leased write is unrecoverable, so it must not look like
         // success: the source was the connection's receive buffer, and this
@@ -4885,6 +4906,25 @@ mod hybrid_tests {
             refused(what, got);
         }
 
+        // `open`'s second screen, on a path the first admits: a
+        // zero-length `Allow` deadline would cancel the open it
+        // guards. The screens are driven separately because the first
+        // returns before the second can run - which is how this one
+        // shipped uncovered.
+        let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
+        let g2 = got.clone();
+        c.open(
+            me,
+            &at,
+            c"a",
+            crate::uring_fs::FsOpenHow::from(
+                OpenHow::new().flags(OFlag::O_RDONLY),
+            )
+            .allow_blocking_special_files(std::time::Duration::ZERO),
+            move |res, _c| *g2.borrow_mut() = Some(res),
+        );
+        refused("a zero Allow deadline", got);
+
         for (what, path, how) in [
             (
                 "a mkdir_path with ..",
@@ -6518,6 +6558,143 @@ mod routing_fuzz {
                     "the sweep's verdict: {:?}",
                     done.result()
                 );
+                open_done = true;
+            }
+        }
+    }
+
+    /// A deadline-tripped `Allow` open answers in its own vocabulary,
+    /// never teardown's: the guard's expiry marks the open before
+    /// staging its cancel, so the `ECANCELED` arrives with
+    /// `was_refused` true - unmarked `ECANCELED` is what a task winds a
+    /// whole live connection down on, and one bad filename must not
+    /// read as the reactor going away. Driven with synthesized CQEs
+    /// (the routing idiom above) because the live trip has two honest
+    /// spellings - which one the kernel answers depends on where the
+    /// cancel's signal catches the parked worker - and only this arm's
+    /// ordering is the property under test.
+    #[test]
+    fn a_tripped_allow_deadline_answers_marked_not_as_teardown() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(2, OffloadBounds::default());
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let raw = OpenHow::new().flags(OFlag::O_WRONLY).to_raw();
+        // A fresh table's LIFO free list hands out slot 0 (the open)
+        // then slot 1 (the guard), both at generation 0. The SQEs stage
+        // into a ring far larger than two entries and are never
+        // submitted; the CQEs below are synthesized.
+        core.submit_open(
+            &mut eng,
+            77,
+            at.clone(),
+            c"planted".to_owned(),
+            raw,
+            false,
+            Some(std::time::Duration::from_secs(3600)),
+            FsWaiter::Pump { owner: (5, 9) },
+        );
+        assert!(
+            !core.has_free_op(),
+            "the open and its guard hold both slots"
+        );
+
+        // The guard fires: its arm must mark the open it cancels.
+        let reaped =
+            core.on_cqe(&mut eng, TAG_OPEN_DEADLINE, 1, 0, -libc::ETIME);
+        assert!(matches!(reaped, ReapedFs::None), "the guard routes nowhere");
+        // The cancel lands: the open completes `ECANCELED`, marked.
+        match core.on_cqe(&mut eng, TAG_OPEN, 0, 0, -libc::ECANCELED) {
+            ReapedFs::Pump(done, owner) => {
+                assert_eq!(owner, (5, 9));
+                assert!(
+                    matches!(
+                        done.result(),
+                        Err(crate::Error::Errno(Errno::ECANCELED))
+                    ) && done.was_refused(),
+                    "a tripped deadline answered teardown's verdict: \
+                     {:?} refused={}",
+                    done.result(),
+                    done.was_refused()
+                );
+            }
+            _ => panic!("the open's completion was not routed"),
+        }
+        assert_eq!(core.op_free_len_for_test(), 2, "both slots returned");
+    }
+
+    /// The live half of the trip: a planted FIFO with no writer parks
+    /// the open on an io-wq worker, and the deadline is the only way it
+    /// ends. Which spelling comes back depends on where the cancel's
+    /// signal catches the worker - `ECANCELED` marked, or `EINTR` - so
+    /// what this pins is that both slots recover and that the teardown
+    /// spelling (`ECANCELED` unmarked) never appears; the deterministic
+    /// ordering above owns the mark itself.
+    #[test]
+    fn a_tripped_allow_deadline_recovers_both_slots() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(2, OffloadBounds::default());
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let fifo = dir.path().join("pipe");
+        let cpath =
+            CString::new(fifo.as_os_str().as_encoded_bytes()).expect("no NUL");
+        // SAFETY: a NUL-terminated path this test owns.
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0, "mkfifo");
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let me = crate::uring::sys::register_personality(eng.ring.raw_fd())
+            .expect("personality");
+
+        let mut raw = OpenHow::new()
+            .flags(OFlag::O_WRONLY | OFlag::O_CREAT)
+            .mode(crate::sync_fs::Mode::from_bits_truncate(0o600))
+            .to_raw();
+        crate::uring_fs::confine_resolve(&mut raw.resolve);
+        core.submit_open(
+            &mut eng,
+            me,
+            at.clone(),
+            c"pipe".to_owned(),
+            raw,
+            false,
+            Some(std::time::Duration::from_millis(50)),
+            FsWaiter::Pump { owner: (5, 9) },
+        );
+
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut open_done = false;
+        while !(open_done && core.op_free_len_for_test() == 2) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "open_done={open_done} free={}: the deadline never \
+                 recovered the pair",
+                core.op_free_len_for_test()
+            );
+            eng.ring.submit().expect("submit");
+            let Some(cqe) = eng.ring.reap() else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            };
+            let (tag, slot, g) = unpack_raw(cqe.user_data);
+            if let ReapedFs::Pump(done, owner) =
+                core.on_cqe(&mut eng, tag, slot, g, cqe.res)
+            {
+                assert_eq!(owner, (5, 9));
+                match done.result() {
+                    Err(crate::Error::Errno(Errno::ECANCELED)) => {
+                        assert!(
+                            done.was_refused(),
+                            "a tripped deadline answered the unmarked \
+                             `ECANCELED` reserved for teardown"
+                        );
+                    }
+                    Err(crate::Error::Errno(Errno::EINTR)) => {}
+                    other => panic!("the open ended some other way: {other:?}"),
+                }
                 open_done = true;
             }
         }
