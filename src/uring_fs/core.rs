@@ -966,12 +966,18 @@ impl FsCore {
                 }
                 Err(_) => {
                     // The open is in flight and its bound cannot be:
-                    // cancel the open rather than let it run unbounded
-                    // - it completes `ECANCELED` like any refused work
-                    // - and free the guard's slot (its waiter is
-                    // `None`, so the fail delivers to nobody).
+                    // cancel the open rather than let it run
+                    // unbounded, marked (`retract_op`) as the
+                    // asked-for cancellation it is, so its
+                    // `ECANCELED` arrives in the deadline vocabulary
+                    // (`was_refused` true, the tripped guard's own
+                    // spelling) rather than teardown's - a task winds
+                    // a live connection down on the unmarked form,
+                    // and one failed guard stage is not the reactor
+                    // going away. The guard's slot frees (its waiter
+                    // is `None`, so the fail delivers to nobody).
                     self.fail_op(guard_slot, Errno::ECANCELED);
-                    self.submit_cancel(eng, ud);
+                    self.retract_op(eng, TAG_OPEN, op_slot, open_gen);
                 }
             }
         }
@@ -1371,10 +1377,47 @@ impl FsCore {
         Some((op_slot, self.ops[op_slot as usize].generation))
     }
 
+    /// Verify `(tag, slot, generation)` still names the in-flight op
+    /// it was minted against and, if so, mark it retracted and stage
+    /// its `ASYNC_CANCEL` - the one spelling of asked-for
+    /// cancellation, shared by a timer's retraction, an `Allow`
+    /// guard's firing, an answered open retiring its guard, and the
+    /// guard-stage failure that cancels its open. The mark is what
+    /// routes the coming `ECANCELED` away from teardown's vocabulary
+    /// ([`FsDone::was_refused`]), and it is checked before it is set,
+    /// so a second ask neither re-marks nor re-stages - whatever
+    /// accounting hangs off the first ask cannot fire twice. `false`
+    /// for a stale generation, a reissued slot, a tag mismatch, or an
+    /// already-marked entry, all of which must stay inert.
+    fn retract_op(
+        &mut self,
+        eng: &mut Engine,
+        tag: u8,
+        op_slot: u32,
+        generation: u64,
+    ) -> bool {
+        let Some(entry) = self.ops.get_mut(op_slot as usize) else {
+            return false;
+        };
+        if entry.generation != generation
+            || entry.state.state != (FsOpState::InFlight { tag })
+        {
+            return false;
+        }
+        if entry.state.retracted {
+            return false;
+        }
+        entry.state.retracted = true;
+        self.submit_cancel(eng, pack_raw(tag, op_slot, generation as u32));
+        true
+    }
+
     /// Verify `Timer`'s three fields against this table and, when they
     /// still name a live timer, mark the entry retracted and stage the
-    /// `ASYNC_CANCEL`. Anything else - a foreign reactor's token, a
-    /// slot reissued since, an op that is not a timer - is inert.
+    /// `ASYNC_CANCEL` ([`FsCore::retract_op`]). Anything else - a
+    /// foreign reactor's token, a slot reissued since, an op that is
+    /// not a timer, a timer retracted once already (the headroom went
+    /// back the first time; `Timer` is `Copy`) - is inert.
     pub(crate) fn retract_timeout(
         &mut self,
         eng: &mut Engine,
@@ -1385,21 +1428,9 @@ impl FsCore {
         if core != self.core_id {
             return;
         }
-        let Some(entry) = self.ops.get_mut(slot as usize) else {
-            return;
-        };
-        if entry.generation != generation
-            || entry.state.state != (FsOpState::InFlight { tag: TAG_TIMEOUT })
-        {
+        if !self.retract_op(eng, TAG_TIMEOUT, slot, generation) {
             return;
         }
-        if entry.state.retracted {
-            // Already retracted - `Timer` is `Copy` and retraction is
-            // idempotent - and the headroom below went back the first
-            // time, so a second pass must return nothing twice.
-            return;
-        }
-        entry.state.retracted = true;
         // The owner's cap headroom returns at the retraction, not at
         // the CQE it hastens: the natural pattern this call invites -
         // retract one deadline and arm its replacement inside the same
@@ -1410,7 +1441,7 @@ impl FsCore {
         // an owner mid-swap holds up to twice its cap in slots and the
         // arm screen refuses at that bound ([`WallClock`]), while
         // `take_op` retires exactly the half its CQE ends.
-        let o = match &entry.state.waiter {
+        let o = match &self.ops[slot as usize].state.waiter {
             Some(FsWaiter::Embedded { owner: Some(o), .. }) => Some(*o),
             _ => None,
         };
@@ -1422,7 +1453,6 @@ impl FsCore {
                 debug_assert!(false, "a retraction with no armed count");
             }
         }
-        self.submit_cancel(eng, pack_raw(TAG_TIMEOUT, slot, generation as u32));
     }
 
     /// Stage a metadata op that targets an **open file**: `FTRUNCATE`/
@@ -2001,21 +2031,16 @@ impl FsCore {
             if !retracted
                 && res == -libc::ETIME
                 && let Some((oslot, ogen)) = cancels
-                && let Some(oentry) = self.ops.get_mut(oslot as usize)
-                && oentry.generation == ogen
-                && oentry.state.state == (FsOpState::InFlight { tag: TAG_OPEN })
             {
-                // The mirror of the arm below: mark, then cancel. The
-                // mark is what makes the open's `ECANCELED` carry the
-                // deadline's verdict (`was_refused` true, like a
-                // retracted timer's) instead of the unmarked form
-                // reserved for teardown - which a task winds a live
-                // connection down on (`task.rs`). The verification is
-                // `retract_timeout`'s: an open that already answered -
-                // its slot freed or reissued - is left alone, and the
-                // cancel is skipped with it.
-                oentry.state.retracted = true;
-                self.submit_cancel(eng, pack_raw(TAG_OPEN, oslot, ogen as u32));
+                // Mark, then cancel (`retract_op`). The mark is what
+                // makes the open's `ECANCELED` carry the deadline's
+                // verdict (`was_refused` true, like a retracted
+                // timer's) instead of the unmarked form reserved for
+                // teardown - which a task winds a live connection
+                // down on (`task.rs`). An open that already answered
+                // - its slot freed or reissued - is left alone, and
+                // the cancel is skipped with it.
+                self.retract_op(eng, TAG_OPEN, oslot, ogen);
             }
             return ReapedFs::None;
         }
@@ -2047,23 +2072,12 @@ impl FsCore {
             ..
         } = completed;
         // The open answered, so its guard timer's hour is over: mark
-        // and cancel it, on `retract_timeout`'s exact rule - the mark
-        // keeps its `ECANCELED` from staging a cancel of a slot the
-        // open no longer holds, and the generation check makes a stale
-        // pair inert.
-        if let Some((gslot, ggen)) = guard
-            && let Some(gentry) = self.ops.get_mut(gslot as usize)
-            && gentry.generation == ggen
-            && gentry.state.state
-                == (FsOpState::InFlight {
-                    tag: TAG_OPEN_DEADLINE,
-                })
-        {
-            gentry.state.retracted = true;
-            self.submit_cancel(
-                eng,
-                pack_raw(TAG_OPEN_DEADLINE, gslot, ggen as u32),
-            );
+        // and cancel it (`retract_op`) - the mark keeps its
+        // `ECANCELED` from staging a cancel of a slot the open no
+        // longer holds, and the generation check makes a stale pair
+        // inert.
+        if let Some((gslot, ggen)) = guard {
+            self.retract_op(eng, TAG_OPEN_DEADLINE, gslot, ggen);
         }
 
         // A successful OPENAT2 returns a real fd as its result; wrap it in an
