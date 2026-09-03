@@ -107,7 +107,11 @@ Do not reopen these without a reason that is new.
   DeleteObjects), and a smaller constant would couple this crate to the
   pipelining knob of another. A retraction returns the cap headroom on
   the spot - the slot follows at the CQE - so retract-then-rearm inside
-  one delivery holds at any cap. The table is **not** resized for it:
+  one delivery holds at any cap; the retiring slots are themselves
+  counted (`WallClock`), and the arm refuses when armed + retiring
+  reaches twice the cap, because with the headroom back early that
+  sum is the only thing standing between a swap loop and the whole
+  table. The table is **not** resized for it:
   holds spend the handler budget their owner already has, capped so no
   one tenant can park it all.
 - **The `fs_ops + pool_size <= MAX_POOL` bound is about field *width*.** An

@@ -2297,6 +2297,68 @@ mod tests {
         );
     }
 
+    /// The retraction's early headroom is a cap trade, not a cap
+    /// escape: each swap frees a *count* while its slot rides to a
+    /// CQE no delivery inside the same dispatch will reap, so the arm
+    /// screen also refuses at `armed + retiring` reaching twice the
+    /// cap - the documented mid-swap slot ceiling. Asserted on the
+    /// *slots*, because the shipped tests asserted the count alone
+    /// and a retract-rearm loop at cap 1 walked a 64-slot table to
+    /// zero free with the count never leaving zero.
+    #[test]
+    fn a_mid_swap_owner_is_bounded_at_twice_its_cap_in_slots() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        fs.set_timer_cap(1);
+        let hour = Duration::from_secs(3600);
+        let owner = (1u32, 1u64);
+        let free_at_start = fs.op_free_len_for_test();
+        let mut arms = 0u32;
+        let mut refused_at = None;
+        for i in 0..8 {
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some(owner));
+            match conn.timeout(hour, |_d, _c| {}) {
+                Some(t) => {
+                    arms += 1;
+                    conn.cancel_timeout(t);
+                }
+                None => {
+                    refused_at = Some(i);
+                    break;
+                }
+            }
+        }
+        assert_eq!(arms, 2, "one full swap holds; the next arm is refused");
+        assert_eq!(refused_at, Some(2), "refused at twice the cap");
+        assert_eq!(
+            free_at_start - fs.op_free_len_for_test(),
+            2,
+            "a mid-swap owner holds at most twice its cap in slots"
+        );
+        assert_eq!(fs.armed_timers_for_test(&owner), 0);
+        assert_eq!(fs.retiring_timers_for_test(&owner), 2);
+        // The parked slots return at their CQEs, and the bound lifts
+        // with them.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fs.op_free_len_for_test() != free_at_start {
+            assert!(
+                Instant::now() < deadline,
+                "a retracted timer's slot never came home"
+            );
+            if turn(&mut fs, &mut eng) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(fs.retiring_timers_for_test(&owner), 0);
+        let mut conn = FsConn::new(&mut fs, &mut eng, Some(owner));
+        let t = conn.timeout(hour, |_d, _c| {});
+        assert!(t.is_some(), "the bound lifts when the slots come home");
+        if let Some(t) = t {
+            conn.cancel_timeout(t);
+        }
+    }
+
     /// Retraction is idempotent in the headroom too: a `Timer` is
     /// `Copy`, so a caller can retract one arm twice, and the second
     /// pass must return nothing - a double return would spend another

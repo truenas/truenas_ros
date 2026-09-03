@@ -541,6 +541,24 @@ struct OffloadEntry {
     deliver: OffloadDeliver,
 }
 
+/// One owner's wall-clock tenancy. `armed` is what the cap meters -
+/// each count returned at its hold's ending, or early at a timer's
+/// retraction. `retiring` counts retracted timers whose slots are
+/// still parked awaiting their CQE: the retraction hands the cap
+/// headroom back on the spot so retract-then-rearm holds inside one
+/// delivery, but the slot rides to a CQE no delivery reaps, so the
+/// arm screens also refuse at `armed + retiring` reaching twice the
+/// cap - the documented mid-swap slot ceiling. Without that clause
+/// the early headroom unmade the cap entirely: a retract-rearm loop
+/// inside one delivery parked the whole table with `armed` never
+/// leaving zero (cap 1 on a 64-slot table measured 64 arms, zero
+/// refusals, zero free slots).
+#[derive(Clone, Copy, Default)]
+struct WallClock {
+    armed: u32,
+    retiring: u32,
+}
+
 pub(crate) struct FsCore {
     ops: Vec<SlotEntry<FsOpEntry>>,
     op_free: Vec<u32>,
@@ -578,7 +596,7 @@ pub(crate) struct FsCore {
     /// and never by how many connections have come and gone. Empty for
     /// a reactor with no owners (the standalone host).
     closed_owners: HashMap<u32, u64>,
-    /// Armed wall-clock holds per owner, and the per-owner ceiling the
+    /// Wall-clock holds per owner, and the per-owner ceiling the
     /// host set ([`FsCore::set_timer_cap`]). A timer holds its op slot
     /// for wall-clock time rather than until an I/O completes - and an
     /// `Allow` open holds two slots the same way, its own and its
@@ -597,7 +615,7 @@ pub(crate) struct FsCore {
     /// uncapped - the standalone host has one caller and no tenants to
     /// protect from each other - and owner-less arms are never
     /// counted.
-    armed_timers: HashMap<(u32, u64), u32>,
+    armed_timers: HashMap<(u32, u64), WallClock>,
     timer_cap: Option<u32>,
     /// Spawned tasks and their run queue (the futures layer,
     /// [`super::task`]); woken tasks are polled by the delivery
@@ -662,6 +680,44 @@ impl FsCore {
         self.closed_owners
             .get(&slot)
             .is_some_and(|&swept| swept >= generation)
+    }
+
+    /// Screen a wall-clock hold - a timer, or an `Allow` open's pair -
+    /// before any slot is popped for it: a swept owner may not park
+    /// time on the table (the sweep's own `ECANCELED`, unmarked, so a
+    /// continuation keyed on that vocabulary winds down the same way
+    /// in both orderings), and an owner at its cap - or mid-swap at
+    /// twice its cap in slots ([`WallClock`]) - is refused with the
+    /// marked `EBUSY` a full table answers. `Some` is the verdict to
+    /// deliver, `(errno, marked)`.
+    ///
+    /// The `Embedded`-with-owner pattern is the screen's boundary as
+    /// well as its key: an off-loop `FsWaiter::Channel` hold (a public
+    /// [`FsHandle::open`](super::FsHandle::open) carrying a deadline)
+    /// names no owner to meter, so it passes unscreened and its two
+    /// slots go uncounted by any cap. That tenancy is bounded by its
+    /// own shape instead - a `ReplyTo::Sync` reply pins one blocked
+    /// caller thread per outstanding off-loop hold - and metering it
+    /// would need an owner axis off-loop callers do not have.
+    fn refuse_wall_clock_hold(
+        &self,
+        waiter: &FsWaiter,
+    ) -> Option<(Errno, bool)> {
+        let FsWaiter::Embedded { owner: Some(o), .. } = waiter else {
+            return None;
+        };
+        if self.owner_is_gone(Some(*o)) {
+            return Some((Errno::ECANCELED, false));
+        }
+        if let Some(cap) = self.timer_cap {
+            let t = self.armed_timers.get(o).copied().unwrap_or_default();
+            if t.armed >= cap
+                || t.armed.saturating_add(t.retiring) >= cap.saturating_mul(2)
+            {
+                return Some((Errno::EBUSY, true));
+            }
+        }
+        None
     }
 
     /// A handle on this reactor's live-task count, for an embedding
@@ -802,32 +858,14 @@ impl FsCore {
         }
         // An `Allow` open is a wall-clock hold like a timer - two slots
         // parked until the deadline or the open ends the pair - so it
-        // answers to both timer tenancy rules (`armed_timers`,
-        // `submit_timeout`): a swept owner may not park time on the
-        // table (same verdict, same delivery - the sweep's own
-        // `ECANCELED`, unmarked), and an owner at its cap is refused
-        // with the marked `EBUSY` a full table answers. A guarded open
-        // cannot block and passes both.
+        // answers to the timer tenancy screen (`refuse_wall_clock_hold`,
+        // shared with `submit_timeout`). A guarded open cannot block
+        // and passes unscreened.
         if deadline.is_some()
-            && let FsWaiter::Embedded { owner: Some(o), .. } = &waiter
+            && let Some((err, marked)) = self.refuse_wall_clock_hold(&waiter)
         {
-            if self.owner_is_gone(Some(*o)) {
-                deliver(
-                    Some(waiter),
-                    Err(Errno::ECANCELED),
-                    Vec::new(),
-                    None,
-                    None,
-                    false,
-                );
-                return;
-            }
-            if let Some(cap) = self.timer_cap
-                && self.armed_timers.get(o).copied().unwrap_or(0) >= cap
-            {
-                fail(waiter, Errno::EBUSY, Vec::new());
-                return;
-            }
+            deliver(Some(waiter), Err(err), Vec::new(), None, None, marked);
+            return;
         }
         // An `Allow` open charges two slots - its own and its guard
         // timer's, both held until it answers - so the refusal happens
@@ -923,7 +961,7 @@ impl FsCore {
                     // on `guard` being set - a stage-failed guard never
                     // reaches here and never charges).
                     if let Some(o) = timer_owner {
-                        *self.armed_timers.entry(o).or_insert(0) += 1;
+                        self.armed_timers.entry(o).or_default().armed += 1;
                     }
                 }
                 Err(_) => {
@@ -1103,7 +1141,20 @@ impl FsCore {
 
     #[cfg(all(test, not(loom)))]
     pub(crate) fn armed_timers_for_test(&self, owner: &(u32, u64)) -> u32 {
-        self.armed_timers.get(owner).copied().unwrap_or(0)
+        self.armed_timers
+            .get(owner)
+            .copied()
+            .unwrap_or_default()
+            .armed
+    }
+
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn retiring_timers_for_test(&self, owner: &(u32, u64)) -> u32 {
+        self.armed_timers
+            .get(owner)
+            .copied()
+            .unwrap_or_default()
+            .retiring
     }
 
     /// Stage a reactor-pump `READV`: one positional read of up to `want`
@@ -1273,29 +1324,9 @@ impl FsCore {
         after: std::time::Duration,
         waiter: FsWaiter,
     ) -> Option<(u32, u64)> {
-        if let FsWaiter::Embedded { owner: Some(o), .. } = &waiter {
-            if self.owner_is_gone(Some(*o)) {
-                deliver(
-                    Some(waiter),
-                    Err(Errno::ECANCELED),
-                    Vec::new(),
-                    None,
-                    None,
-                    false,
-                );
-                return None;
-            }
-            // The per-owner ceiling (see `armed_timers`). `EBUSY` with
-            // the refusal mark, like a full table: the caller holds a
-            // deadline already, and its completion - or its retraction,
-            // which returns the headroom on the spot - is when arming
-            // again makes sense.
-            if let Some(cap) = self.timer_cap
-                && self.armed_timers.get(o).copied().unwrap_or(0) >= cap
-            {
-                fail(waiter, Errno::EBUSY, Vec::new());
-                return None;
-            }
+        if let Some((err, marked)) = self.refuse_wall_clock_hold(&waiter) {
+            deliver(Some(waiter), Err(err), Vec::new(), None, None, marked);
+            return None;
         }
         let Some(op_slot) = self.pop_op() else {
             fail(waiter, Errno::EBUSY, Vec::new());
@@ -1335,7 +1366,7 @@ impl FsCore {
         if let Some(FsWaiter::Embedded { owner: Some(o), .. }) =
             &self.ops[op_slot as usize].state.waiter
         {
-            *self.armed_timers.entry(*o).or_insert(0) += 1;
+            self.armed_timers.entry(*o).or_default().armed += 1;
         }
         Some((op_slot, self.ops[op_slot as usize].generation))
     }
@@ -1375,19 +1406,18 @@ impl FsCore {
         // delivery - would otherwise be refused at the cap for the
         // width of a reap, which is not observable from inside the
         // callback that retracted. The slot itself still frees at the
-        // timer's CQE, so an owner mid-swap briefly holds up to twice
-        // its cap in slots; `take_op` skips a retracted entry's
-        // decrement, keeping the pair exact.
+        // timer's CQE, so the count moves from `armed` to `retiring`:
+        // an owner mid-swap holds up to twice its cap in slots and the
+        // arm screen refuses at that bound ([`WallClock`]), while
+        // `take_op` retires exactly the half its CQE ends.
         let o = match &entry.state.waiter {
             Some(FsWaiter::Embedded { owner: Some(o), .. }) => Some(*o),
             _ => None,
         };
         if let Some(o) = o {
-            if let Some(n) = self.armed_timers.get_mut(&o) {
-                *n -= 1;
-                if *n == 0 {
-                    self.armed_timers.remove(&o);
-                }
+            if let Some(t) = self.armed_timers.get_mut(&o) {
+                t.armed -= 1;
+                t.retiring += 1;
             } else {
                 debug_assert!(false, "a retraction with no armed count");
             }
@@ -2216,7 +2246,7 @@ impl FsCore {
             _ => return None,
         }
         let e = &mut entry.state;
-        // A wall-clock hold's completion returns its owner's headroom:
+        // A wall-clock hold's completion returns its owner's tenancy:
         // a timer's - expiry, retraction, or the teardown drain - and
         // an `Allow` open's, whose pair charged one count when its
         // guard staged (`guard` still set is the receipt; a
@@ -2225,26 +2255,29 @@ impl FsCore {
         // paired on the entry's own lifecycle whoever staged the
         // cancel.
         let charged = match (tag, &e.waiter) {
-            // A retracted timer returned its headroom at the
-            // retraction itself (`retract_timeout`); only the
+            // A retracted timer returned its cap headroom at the
+            // retraction itself (`retract_timeout`), which parked the
+            // count on `retiring` until this CQE frees the slot; the
             // unretracted endings - expiry, the teardown drain, the
-            // sweep's cancel - return it here.
-            (TAG_TIMEOUT, Some(FsWaiter::Embedded { owner: Some(o), .. }))
-                if !e.retracted =>
-            {
-                Some(*o)
+            // sweep's cancel - return the armed half here instead.
+            (TAG_TIMEOUT, Some(FsWaiter::Embedded { owner: Some(o), .. })) => {
+                Some((*o, e.retracted))
             }
             (TAG_OPEN, Some(FsWaiter::Embedded { owner: Some(o), .. }))
                 if e.guard.is_some() =>
             {
-                Some(*o)
+                Some((*o, false))
             }
             _ => None,
         };
-        if let Some(o) = charged {
-            if let Some(n) = self.armed_timers.get_mut(&o) {
-                *n -= 1;
-                if *n == 0 {
+        if let Some((o, retired)) = charged {
+            if let Some(t) = self.armed_timers.get_mut(&o) {
+                if retired {
+                    t.retiring -= 1;
+                } else {
+                    t.armed -= 1;
+                }
+                if t.armed == 0 && t.retiring == 0 {
                     self.armed_timers.remove(&o);
                 }
             } else {
@@ -3292,8 +3325,12 @@ impl<'a> FsConn<'a> {
     /// here**, synchronously, so retracting one deadline and arming
     /// its replacement inside the same delivery holds at any cap; the
     /// **op slot follows at the retracted timer's CQE**, which the
-    /// staged cancel hastens but this call cannot wait for - an owner
-    /// mid-swap briefly holds up to twice its cap in slots.
+    /// staged cancel hastens but this call cannot wait for. An owner
+    /// mid-swap therefore holds up to twice its cap in slots - and no
+    /// further: the arm screen refuses at that bound, so a
+    /// retract-rearm loop inside one delivery is refused once its
+    /// retiring slots reach the cap again, instead of walking the
+    /// whole table with the armed count never leaving zero.
     ///
     /// The timer completes `ECANCELED` **with
     /// [`FsDone::was_refused`] true** and `on_done` fires with it, so a
