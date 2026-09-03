@@ -1554,6 +1554,31 @@ fn buffered_cost(messages: usize) -> Option<usize> {
     Some(client.join().expect("client thread"))
 }
 
+/// The first recycle already licenses reuse: the licence is potted
+/// before the handler runs, so message 2 serves from message 1's
+/// recycled storage. Potted after the handler instead, message 1's
+/// recycle found an empty pot and freed, and message 2 allocated
+/// afresh - the pool bootstrapped one message late in the fast case,
+/// and never at all for bodies spaced past a maintenance window,
+/// where the zeroed pot ate the licence between messages every time.
+#[test]
+fn the_first_recycle_licenses_the_second_message() {
+    let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(one) = buffered_cost(1) else {
+        return; // io_uring unavailable
+    };
+    let Some(two) = buffered_cost(2) else {
+        return;
+    };
+    assert!(
+        two <= one,
+        "the second message must reuse the first one's storage: 1 message \
+         cost {one} large allocations, 2 cost {two}. The extra allocation \
+         is a recycle whose licence was potted one step behind the give it \
+         existed to cover."
+    );
+}
+
 /// A recycled buffered body must not cost an allocation per message.
 ///
 /// The first body is a miss and allocates; every later one on the

@@ -230,10 +230,13 @@ impl BodyPool {
         }
     }
 
-    /// A held claim's body left reactor custody (delivered to the
-    /// handler): its licence moves to the windowed pot, where the
-    /// consumer's optional recycle can still spend it before the
-    /// window closes.
+    /// A held claim's body is leaving reactor custody (delivered to
+    /// the handler): its licence moves to the windowed pot, where the
+    /// consumer's optional recycle can spend it before the window
+    /// closes. Called **before** the handler runs, because the common
+    /// recycle is synchronous, inside the handler - a licence potted
+    /// after it landed one step behind the give it existed to cover,
+    /// and the placed-body path never retained anything.
     pub(crate) fn receipt_done(&mut self, licence: usize) {
         self.missed_bytes =
             self.missed_bytes.saturating_add(licence).min(self.budget);
