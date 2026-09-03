@@ -254,19 +254,26 @@ mod armed {
     ///
     /// **One frame, one submission** - [`FsConn::fut`]'s stated
     /// contract - and the *first* arm inside a frame is the one that
-    /// takes the share. Every clone captures that future's own slot,
-    /// so a second submission's refusal would fill a slot belonging to
-    /// the first op, discarding the first's real completion - with its
-    /// `File`, closing a descriptor under the caller - and reporting
-    /// the loser's errno for an op still in flight. A later arm in the
-    /// same frame therefore gets an *empty* share: its refusal follows
-    /// the plain-callback contract (dropped unfired) and the frame
-    /// answers for exactly the submission that armed it, in both
-    /// build profiles - a panic here would run inside dispatch, on
-    /// consumer input, on a path with no containment. Cannot misfire
-    /// on `chain`/`walk`, whose later steps run on a fresh facade that
-    /// carries the sink but watches no frame, so their shares stay
-    /// armed and a mid-chain refusal keeps its errno.
+    /// takes the share; a later arm in the same frame gets an *empty*
+    /// one, so its refusal follows the plain-callback contract
+    /// (dropped unfired) rather than spending the frame's one report
+    /// on a submission the caller did not await - in both build
+    /// profiles, because a panic here would run inside dispatch, on
+    /// consumer input, on a path with no containment. `chain`/`walk`
+    /// steps run on a fresh facade that carries the sink but watches
+    /// no frame, so their shares stay real and a mid-chain refusal
+    /// keeps its errno.
+    ///
+    /// The dedup meters *reporting*, not correctness: shares multiply
+    /// across chain steps and reborrows, so which submission answers
+    /// the frame cannot be decided here. That is the slot's own rule:
+    /// a share's refusal parks provisionally, and the submission
+    /// carrying the frame's callback owns the outcome
+    /// (`SlotState::Refused`, `task.rs`). The slot rule is what keeps
+    /// any share's refusal, deduped or not, from discarding a real
+    /// completion still in flight - the shape that closed a fresh
+    /// descriptor under a caller told a marked `EBUSY` for a create
+    /// that ran.
     pub(super) fn arm(conn: &mut FsConn<'_>) -> Armed {
         if conn.frame_watching
             && let Some(sink) = &conn.fail_sink
@@ -2489,12 +2496,13 @@ impl FsDone {
 /// left, the per-owner wall-clock cap, a swept owner arming a hold, a
 /// staging failure - and every one of them drops `on_done` (and the
 /// continuation it captured, closing the connection) unless the
-/// futures layer has staged its reason sink, which answers each with
-/// its vocabulary: the capacity refusals as a marked errno through
-/// the sink, the swept owner's as the unmarked `ECANCELED` the sweep
-/// would have dealt the op in flight (resolved by the dropped
-/// callback itself - see [`FsConn::timeout`]). These methods return
-/// `()` either way.
+/// submission *armed* a share of the futures layer's staged reason
+/// sink (`armed::arm` - staging alone is not enough), which answers
+/// each with its vocabulary: the capacity refusals as a marked errno
+/// through the sink, the swept owner's as the unmarked `ECANCELED`
+/// the sweep would have dealt the op in flight (resolved by the
+/// dropped callback itself - see [`FsConn::timeout`]). These methods
+/// return `()` either way.
 ///
 /// **No method here may return data borrowed from `'a`.** The task layer
 /// parks a facade in a thread-local as `FsConn<'static>` and hands it back
@@ -5077,6 +5085,82 @@ mod hybrid_tests {
             done.result(),
             done.was_refused()
         );
+    }
+
+    /// The third ordering of the same violation, and the one the
+    /// other two cannot see: the *first* submission takes the frame's
+    /// arm and is refused **without consuming a slot** (the per-owner
+    /// cap - reachable at the consumer's stated cap-1 configuration),
+    /// while the second, carrying the frame's own `on_done`, submits
+    /// fine and completes with a real fd. The refusal's share must
+    /// not answer for the op the caller actually awaited: parked
+    /// provisionally (`SlotState::Refused`), it is superseded by the
+    /// real completion - where settling the slot outright reported a
+    /// marked `EBUSY` for a create that ran and dropped the real
+    /// `FsDone` into the settled slot, closing the fresh descriptor
+    /// under the caller (a retry of that "retryable" `EBUSY` then
+    /// answers `EEXIST` for a create it was told never happened).
+    #[test]
+    fn a_refused_first_arm_cannot_answer_for_the_callbacks_own_op() {
+        let mut eng = Engine::new(256, 128).expect("engine");
+        let mut fs = FsCore::new(2, OffloadBounds::default());
+        let me = Personality(
+            register_personality(eng.ring.raw_fd()).expect("personality"),
+        );
+        fs.set_timer_cap(1);
+        let dir = crate::tempdir().expect("tempdir");
+        let at = Anchor::open(dir.path()).expect("anchor");
+        // Spend the owner's one wall-clock count outside the frame.
+        {
+            let mut c = FsConn::new(&mut fs, &mut eng, OWNER0);
+            let held =
+                c.timeout(std::time::Duration::from_secs(3600), |_d, _c| {});
+            assert!(held.is_some(), "the budget-spending arm itself");
+        }
+        let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
+        let g2 = got.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                drop(c.spawn(move |t| async move {
+                    let done = t
+                        .fut(|c, cb| {
+                            // Takes the frame's arm; refused at the
+                            // cap, consuming no slot.
+                            let _ = c.timeout(
+                                std::time::Duration::from_secs(3600),
+                                |_d, _c| {},
+                            );
+                            // Carries the frame's callback; succeeds.
+                            c.open(
+                                me,
+                                &at,
+                                c"made",
+                                OpenHow::new()
+                                    .flags(OFlag::O_RDWR | OFlag::O_CREAT)
+                                    .mode(Mode::from_bits_truncate(0o600)),
+                                cb,
+                            );
+                        })
+                        .await;
+                    *g2.borrow_mut() = Some(done);
+                }));
+            },
+            || got.borrow().is_some(),
+        );
+        let done = got.borrow_mut().take().expect("resolved");
+        assert!(
+            done.file().is_some(),
+            "the awaited op must answer its own frame: {:?} refused={}",
+            done.result(),
+            done.was_refused()
+        );
+        let f = done.file().expect("checked above");
+        // SAFETY: querying flags on an fd this test still owns.
+        let live = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFD) } >= 0;
+        assert!(live, "and its descriptor must still be open");
+        assert!(dir.path().join("made").exists(), "the create really ran");
     }
 
     /// The other ordering of the same violation: when the frame's own

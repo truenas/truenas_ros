@@ -128,6 +128,17 @@ use crate::uring::wake::LoopShared;
 enum SlotState<V> {
     /// Unfired; the waker parked by the most recent poll, if any.
     Pending(Option<Waker>),
+    /// A staged reason sink's refusal, parked provisionally. The
+    /// submission carrying the frame's callback owns the slot, so a
+    /// sink's verdict waits for the callback route to settle it:
+    /// [`Fire::fire`] with a real outcome supersedes it, and the
+    /// callback dropping unfired adopts it. Settling `Ready` straight
+    /// from the sink let a refusal whose arm rode a *different*
+    /// submission answer for an op still in flight - the real
+    /// completion then landed in a settled slot and was dropped,
+    /// `File` and all, closing a fresh descriptor under a caller told
+    /// a marked `EBUSY` for a create that ran.
+    Refused(V, Option<Waker>),
     /// Fired; the next poll takes it.
     Ready(V),
     /// The callback was dropped unfired (a refused submission, or
@@ -157,33 +168,75 @@ impl<V> Slot<V> {
         Rc::new(Slot(RefCell::new(SlotState::Ready(v))))
     }
 
-    /// Fill with the outcome (`None` = the callback dropped unfired)
-    /// and wake whoever parked.
+    /// Fill through the callback route (`None` = the callback dropped
+    /// unfired) and wake whoever parked.
     fn fill(&self, landed: Option<V>) {
-        {
-            // A real answer is final; `Gone` is not. The two arrive in
-            // either order - a refused submission drops its callback
-            // (which lands as `Gone`) and reports its errno through
-            // the waiter's sink - and the errno is the better answer
-            // whichever came first.
-            let cur = self.0.borrow();
-            let settled =
-                matches!(*cur, SlotState::Ready(_) | SlotState::Spent);
-            if settled || (matches!(*cur, SlotState::Gone) && landed.is_none())
-            {
-                return;
-            }
-        }
-        let next = match landed {
-            Some(v) => SlotState::Ready(v),
-            None => SlotState::Gone,
-        };
         // The borrow ends before the wake: the waker re-enters the
         // executor's queue, never this slot, but keeping the borrow
         // narrow costs nothing and removes the question.
-        let prev = std::mem::replace(&mut *self.0.borrow_mut(), next);
-        if let SlotState::Pending(Some(w)) = prev {
+        let woken = {
+            let mut s = self.0.borrow_mut();
+            let (next, waker) =
+                match (std::mem::replace(&mut *s, SlotState::Spent), landed) {
+                    // A real answer is final, and a taken slot stays
+                    // taken.
+                    (cur @ (SlotState::Ready(_) | SlotState::Spent), _) => {
+                        *s = cur;
+                        return;
+                    }
+                    // `Gone` is not final: a refused submission drops
+                    // its callback (which lands as `Gone`) and reports
+                    // its errno through the waiter's sink, in either
+                    // order, and the errno is the better answer.
+                    (SlotState::Gone, Some(v)) => (SlotState::Ready(v), None),
+                    (SlotState::Gone, None) => {
+                        *s = SlotState::Gone;
+                        return;
+                    }
+                    // The callback route settles a parked refusal: a
+                    // real completion supersedes it - the op the
+                    // caller awaited answers for itself - and the
+                    // callback dropping unfired adopts it.
+                    (SlotState::Refused(_, w), Some(v)) => {
+                        (SlotState::Ready(v), w)
+                    }
+                    (SlotState::Refused(r, w), None) => {
+                        (SlotState::Ready(r), w)
+                    }
+                    (SlotState::Pending(w), Some(v)) => {
+                        (SlotState::Ready(v), w)
+                    }
+                    (SlotState::Pending(w), None) => (SlotState::Gone, w),
+                };
+            *s = next;
+            waker
+        };
+        if let Some(w) = woken {
             w.wake();
+        }
+    }
+
+    /// Park a staged reason sink's refusal. Provisional on purpose:
+    /// the submission carrying the frame's callback owns the slot
+    /// ([`SlotState::Refused`]), so the reason resolves the future
+    /// only once that callback drops unfired, and a real completion
+    /// still in flight supersedes it. The first refusal wins over
+    /// later ones; a slot already `Gone` takes the reason at once,
+    /// the callback route having already ended.
+    fn fill_refused(&self, v: V) {
+        let mut s = self.0.borrow_mut();
+        match &*s {
+            SlotState::Pending(_) => {
+                let SlotState::Pending(w) =
+                    std::mem::replace(&mut *s, SlotState::Spent)
+                else {
+                    unreachable!("matched Pending above");
+                };
+                *s = SlotState::Refused(v, w);
+            }
+            SlotState::Gone => *s = SlotState::Ready(v),
+            SlotState::Refused(..) | SlotState::Ready(_) | SlotState::Spent => {
+            }
         }
     }
 
@@ -195,6 +248,10 @@ impl<V> Slot<V> {
             SlotState::Spent => Poll::Ready(Took::Spent),
             SlotState::Pending(_) => {
                 *s = SlotState::Pending(Some(cx.waker().clone()));
+                Poll::Pending
+            }
+            SlotState::Refused(v, _) => {
+                *s = SlotState::Refused(v, Some(cx.waker().clone()));
                 Poll::Pending
             }
         }
@@ -413,14 +470,19 @@ impl FsConn<'_> {
     ///
     /// **`submit` submits exactly one op.** The reason sink staged
     /// here answers for a single submission, and the *first* one the
-    /// closure makes takes it; a later submission in the same frame
-    /// arms nothing, so its refusal follows the plain-callback
+    /// closure makes takes its share; a later submission in the same
+    /// frame arms nothing, so its refusal follows the plain-callback
     /// contract - dropped unfired, which for a request handler closes
-    /// the connection - instead of filling a slot that belongs to the
-    /// first op. If this future's own `on_done` rode that later
-    /// submission and it was refused, the future resolves `ECANCELED`
-    /// unmarked, the dropped-callback verdict. Submit the extra op
-    /// before or after the call, not inside it.
+    /// the connection. And whichever submission a refusal reaches the
+    /// sink from, the submission carrying this future's own `on_done`
+    /// owns the slot: the sink's verdict is parked provisionally
+    /// (`SlotState::Refused`), a real completion supersedes it, and
+    /// it resolves the future only once `on_done` drops unfired - so
+    /// a refused arm can never answer for an op still in flight. If
+    /// `on_done` rode a later submission that was refused with an
+    /// empty share, the future resolves `ECANCELED` unmarked, the
+    /// dropped-callback verdict. Submit the extra op before or after
+    /// the call, not inside it.
     pub fn fut(
         &mut self,
         submit: impl FnOnce(&mut FsConn<'_>, OnDone),
@@ -441,7 +503,7 @@ impl FsConn<'_> {
         // reporting teardown for its own refusal.
         let outer = self.stage_fail_sink(Rc::new(SinkInner::new(
             move |errno, bufs| {
-                reason.fill(Some(FsDone::refused_with(errno, bufs)));
+                reason.fill_refused(FsDone::refused_with(errno, bufs));
             },
         )));
         submit(self, Box::new(move |done, _conn| fire.fire(done)));
@@ -525,7 +587,7 @@ impl FsConn<'_> {
         let reason = Rc::clone(&slot);
         let outer = self.stage_fail_sink(Rc::new(SinkInner::new(
             move |errno, _bufs| {
-                reason.fill(Some(Err(errno.into())));
+                reason.fill_refused(Err(errno.into()));
             },
         )));
         submit(self, Box::new(move |r, _conn| fire.fire(r)));
@@ -2357,6 +2419,53 @@ mod tests {
         if let Some(t) = t {
             conn.cancel_timeout(t);
         }
+    }
+
+    /// The `Refused` state's whole transition table, on the slot
+    /// alone: a parked refusal is settled only by the callback route -
+    /// a real answer supersedes it, the callback dropping unfired
+    /// adopts it, a second refusal cannot replace it, and a refusal
+    /// reaching a slot whose callback already dropped resolves at
+    /// once. Pure `Rc`/`RefCell` state with no ring behind it, so this
+    /// one also genuinely executes under Miri, which is the instrument
+    /// for the aliasing on the waker and `RefCell` paths here.
+    #[test]
+    fn a_parked_refusal_is_settled_only_by_the_callback_route() {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        // A real answer supersedes the parked reason.
+        let s: Rc<Slot<u32>> = Slot::new();
+        s.fill_refused(7);
+        assert!(matches!(s.poll_take(&mut cx), Poll::Pending));
+        Fire(Some(Rc::clone(&s))).fire(42);
+        assert!(matches!(s.poll_take(&mut cx), Poll::Ready(Took::Value(42))));
+
+        // The callback dropping unfired adopts it.
+        let s: Rc<Slot<u32>> = Slot::new();
+        s.fill_refused(7);
+        drop(Fire(Some(Rc::clone(&s))));
+        assert!(matches!(s.poll_take(&mut cx), Poll::Ready(Took::Value(7))));
+
+        // The first refusal wins over a later one.
+        let s: Rc<Slot<u32>> = Slot::new();
+        s.fill_refused(7);
+        s.fill_refused(9);
+        drop(Fire(Some(Rc::clone(&s))));
+        assert!(matches!(s.poll_take(&mut cx), Poll::Ready(Took::Value(7))));
+
+        // A refusal after the callback route already ended resolves
+        // at once - there is nothing left to wait for.
+        let s: Rc<Slot<u32>> = Slot::new();
+        drop(Fire(Some(Rc::clone(&s))));
+        s.fill_refused(7);
+        assert!(matches!(s.poll_take(&mut cx), Poll::Ready(Took::Value(7))));
+
+        // And a settled slot is final: a refusal cannot rewrite it.
+        let s: Rc<Slot<u32>> = Slot::new();
+        Fire(Some(Rc::clone(&s))).fire(42);
+        s.fill_refused(7);
+        assert!(matches!(s.poll_take(&mut cx), Poll::Ready(Took::Value(42))));
     }
 
     /// Retraction is idempotent in the headroom too: a `Timer` is
