@@ -762,9 +762,15 @@ cargo clippy --all-features --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 cargo test --all-features --no-fail-fast
 cargo test --release --all-features --no-fail-fast   # the guards that ship
-RUSTFLAGS="--cfg loom" cargo test --lib --features uring    loom_
-RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
-RUSTFLAGS="--cfg loom" cargo test --lib --features http     loom_
+
+# Loom, in CI's exact spelling: ONE --all-features invocation, count
+# asserted. A libtest filter that matches nothing exits 0, so a
+# mistyped --cfg reads as a green lane; the count (ci.yml's MODELS -
+# keep the two in step) is the tripwire. The old three-subset form
+# asserted nothing and measured 3/22/5 models against the lane's 24.
+.github/workflows/scripts/counted-cargo-test.sh 24 loom -- \
+  env RUSTFLAGS="--cfg loom" cargo test --lib --all-features loom_
+
 (cd fuzz && cargo +nightly fuzz build)
 
 # No feature at all: the only step that proves the crate compiles with

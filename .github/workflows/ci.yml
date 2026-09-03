@@ -145,21 +145,12 @@ jobs:
     # green - measured, `#[ignore]` on one gave `23 passed; 1 ignored`, and
     # `23 -lt 23` is false. Bump MODELS when you add one; that is the point.
     - name: loom (concurrency models)
+      env:
+        MODELS: "24"
       run: |
-        MODELS=24
-        out=$(RUSTFLAGS="--cfg loom" cargo test --lib --all-features loom_ 2>&1)
-        echo "$out"
-        n=$(printf '%s' "$out" |
-            sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | head -1)
-        if [ -z "$n" ]; then
-          echo "::error::loom lane produced no 'test result: ok. N passed'"
-          exit 1
-        fi
-        if [ "$n" -ne "$MODELS" ]; then
-          echo "::error::loom ran $n models, expected exactly $MODELS"
-          exit 1
-        fi
-
+        .github/workflows/scripts/counted-cargo-test.sh "$MODELS" "loom" -- \
+          env RUSTFLAGS="--cfg loom" \
+          cargo test --lib --all-features loom_
     # The fuzz crate is self-rooted (its own workspace), so nothing above ever
     # compiles it — a target could bit-rot against an API change and no one
     # would know until someone ran a campaign by hand. Building every target is
