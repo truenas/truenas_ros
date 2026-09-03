@@ -91,12 +91,13 @@ env:
   # the number is bumped - deliberate, and the same trade the loom lane's
   # MODELS makes. (81 measured at dc95690; 85 covered the four Allow/
   # retraction tenancy tests added since; 86 added the mid-swap slot
-  # bound; 87 adds the slot Refused transition table, pure Rc/RefCell
-  # state that genuinely executes here.) If that friction is unwanted,
+  # bound; 87 the slot Refused transition table, pure Rc/RefCell state
+  # that genuinely executes here; 91 adds the four ring-gated
+  # refusal-delivery tests.) If that friction is unwanted,
   # `-lt` pinned at the TRUE
   # count still catches deletion, which is the failure mode; what it must
   # not be again is a floor far below what runs.
-  MIRI_TESTS: "87"
+  MIRI_TESTS: "91"
 
   # The `http` band, run as its own step under its own feature set.
   MIRI_HTTP_TESTS: "32"

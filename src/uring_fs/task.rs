@@ -471,18 +471,17 @@ impl FsConn<'_> {
     /// **`submit` submits exactly one op.** The reason sink staged
     /// here answers for a single submission, and the *first* one the
     /// closure makes takes its share; a later submission in the same
-    /// frame arms nothing, so its refusal follows the plain-callback
-    /// contract - dropped unfired, which for a request handler closes
-    /// the connection. And whichever submission a refusal reaches the
-    /// sink from, the submission carrying this future's own `on_done`
-    /// owns the slot: the sink's verdict is parked provisionally
-    /// (`SlotState::Refused`), a real completion supersedes it, and
-    /// it resolves the future only once `on_done` drops unfired - so
-    /// a refused arm can never answer for an op still in flight. If
-    /// `on_done` rode a later submission that was refused with an
-    /// empty share, the future resolves `ECANCELED` unmarked, the
-    /// dropped-callback verdict. Submit the extra op before or after
-    /// the call, not inside it.
+    /// frame arms nothing. And whichever submission a refusal reaches
+    /// the sink from, the submission carrying this future's own
+    /// `on_done` owns the slot: the sink's verdict is parked
+    /// provisionally (`SlotState::Refused`), a real completion
+    /// supersedes it, and the refusal's own delivery - every host
+    /// refusal fires its callback with its verdict at the wake drain
+    /// (`FsCore::refuse`) - settles it with the same marked errno. So
+    /// a refused arm can never answer for an op still in flight, and
+    /// whichever submission carried `on_done`, the future resolves
+    /// with that submission's own outcome. Submit the extra op before
+    /// or after the call, not inside it.
     pub fn fut(
         &mut self,
         submit: impl FnOnce(&mut FsConn<'_>, OnDone),
@@ -2011,11 +2010,16 @@ mod tests {
     /// A ring, its fs tables, and a personality for the tests' own
     /// credentials - or a skip where rings cannot be created.
     fn rig() -> Option<(Engine, FsCore, Personality)> {
-        let eng = engine_or_skip()?;
+        let mut eng = engine_or_skip()?;
         let who = Personality(
             register_personality(eng.ring.raw_fd())
                 .expect("register_personality"),
         );
+        // Armed here because refusals deliver on the wake drain now:
+        // a test that only ever refused used to need no ring traffic
+        // at all, and with no armed wake the poke would never surface
+        // as the TAG_WAKE completion `turn` drains on.
+        eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm wake");
         Some((eng, FsCore::new(8, OffloadBounds::default()), who))
     }
 
@@ -2107,14 +2111,16 @@ mod tests {
         {
             let done = Rc::clone(&done);
             let mut conn = FsConn::new(&mut fs, &mut eng, None);
-            conn.timeout(Duration::from_millis(50), move |d, _conn| {
-                assert!(
-                    d.result().is_ok(),
-                    "expiry is success, not ETIME: {:?}",
-                    d.result().err()
-                );
-                done.set(true);
-            });
+            let armed =
+                conn.timeout(Duration::from_millis(50), move |d, _conn| {
+                    assert!(
+                        d.result().is_ok(),
+                        "expiry is success, not ETIME: {:?}",
+                        d.result().err()
+                    );
+                    done.set(true);
+                });
+            assert!(armed.is_some(), "an uncapped arm cannot be refused");
         }
         drive(&mut fs, &mut eng, &done, "timer");
         assert!(
@@ -2286,9 +2292,8 @@ mod tests {
             arm(&mut fs, &mut eng, (1, 1)).is_none(),
             "the third arm is refused"
         );
-        // And the awaited form reads the refusal with its provenance -
-        // the plain callback above is dropped by contract, so the sink
-        // is where the errno lives.
+        // And the awaited form reads the refusal with its provenance,
+        // delivered at the wake drain the queued callback rides.
         let seen3: Rc<StdCell<Option<(bool, bool)>>> =
             Rc::new(StdCell::new(None));
         {
@@ -2297,7 +2302,8 @@ mod tests {
             drop(conn.spawn(move |t| async move {
                 let d = t
                     .fut(|c, cb| {
-                        c.timeout(hour, cb);
+                        // The frame's sink carries any refusal.
+                        let _ = c.timeout(hour, cb);
                     })
                     .await;
                 out.set(Some((
@@ -2308,6 +2314,13 @@ mod tests {
                     d.was_refused(),
                 )));
             }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen3.get().is_none() {
+            assert!(Instant::now() < deadline, "the refusal never delivered");
+            if turn(&mut fs, &mut eng) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         assert_eq!(
             seen3.get(),
@@ -2421,6 +2434,200 @@ mod tests {
         }
     }
 
+    /// A host refusal delivers the plain callback with its verdict at
+    /// the wake drain: the marked `EBUSY` a full budget answers, with
+    /// `None` still returned synchronously as "no timer to retract".
+    /// The refusal class used to be decided at every submit screen and
+    /// delivered nowhere - a plain-callback caller got nothing but its
+    /// continuation dropped, which for a request handler closed the
+    /// connection.
+    #[test]
+    fn a_host_refusal_delivers_a_plain_callback_with_its_verdict() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        fs.set_timer_cap(1);
+        let hour = Duration::from_secs(3600);
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            assert!(conn.timeout(hour, |_d, _c| {}).is_some(), "cap spender");
+        }
+        let seen: Rc<StdCell<Option<(bool, bool)>>> =
+            Rc::new(StdCell::new(None));
+        {
+            let out = Rc::clone(&seen);
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            let refused = conn.timeout(hour, move |d, _c| {
+                out.set(Some((
+                    matches!(
+                        d.result(),
+                        Err(crate::Error::Errno(Errno::EBUSY))
+                    ),
+                    d.was_refused(),
+                )));
+            });
+            assert!(refused.is_none(), "no timer exists to retract");
+            assert!(seen.get().is_none(), "not inline: submit holds the core");
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen.get().is_none() {
+            assert!(Instant::now() < deadline, "the verdict never delivered");
+            if turn(&mut fs, &mut eng) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(
+            seen.get(),
+            Some((true, true)),
+            "the callback fires with the marked EBUSY, not a drop"
+        );
+    }
+
+    /// The swept owner's refusal delivers the same callback with
+    /// teardown's own vocabulary - `ECANCELED`, unmarked - so a
+    /// continuation keyed on it winds down exactly as it would had the
+    /// sweep caught the op in flight.
+    #[test]
+    fn a_swept_refusal_delivers_teardowns_vocabulary() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        fs.cancel_owned_by(&mut eng, vec![(6, 1)]);
+        let seen: Rc<StdCell<Option<(bool, bool)>>> =
+            Rc::new(StdCell::new(None));
+        {
+            let out = Rc::clone(&seen);
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((6, 1)));
+            let refused =
+                conn.timeout(Duration::from_secs(3600), move |d, _c| {
+                    out.set(Some((
+                        matches!(
+                            d.result(),
+                            Err(crate::Error::Errno(Errno::ECANCELED))
+                        ),
+                        d.was_refused(),
+                    )));
+                });
+            assert!(refused.is_none(), "a swept owner cannot park time");
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen.get().is_none() {
+            assert!(Instant::now() < deadline, "the verdict never delivered");
+            if turn(&mut fs, &mut eng) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(
+            seen.get(),
+            Some((true, false)),
+            "unmarked ECANCELED: the sweep's verdict, delivered"
+        );
+    }
+
+    /// A refusal requeued from inside its own delivery waits for the
+    /// next drain pass: one call to the drain delivers exactly what
+    /// was queued when it began, FIFO, so a callback that re-arms and
+    /// is refused again cannot spin the ring from inside one pass -
+    /// each attempt costs a wake round trip.
+    #[test]
+    fn a_refusal_requeued_mid_drain_delivers_on_the_next_pass() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        fs.set_timer_cap(1);
+        let hour = Duration::from_secs(3600);
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            assert!(conn.timeout(hour, |_d, _c| {}).is_some(), "cap spender");
+        }
+        let log: Rc<StdRefCell<Vec<&'static str>>> =
+            Rc::new(StdRefCell::new(Vec::new()));
+        {
+            let (l1, l2) = (Rc::clone(&log), Rc::clone(&log));
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            let requeued = Rc::clone(&log);
+            assert!(
+                conn.timeout(hour, move |_d, c| {
+                    l1.borrow_mut().push("a");
+                    // Still at cap: this re-arm queues mid-drain.
+                    let _ = c.timeout(hour, move |_d, _c| {
+                        requeued.borrow_mut().push("a2");
+                    });
+                })
+                .is_none()
+            );
+            assert!(
+                conn.timeout(hour, move |_d, _c| {
+                    l2.borrow_mut().push("b");
+                })
+                .is_none()
+            );
+        }
+        // One pass: the two pre-queued refusals deliver, in order; the
+        // mid-drain requeue does not.
+        deliver_pool_completions(&mut fs, &mut eng);
+        assert_eq!(*log.borrow(), vec!["a", "b"], "bounded to the pass");
+        deliver_pool_completions(&mut fs, &mut eng);
+        assert_eq!(*log.borrow(), vec!["a", "b", "a2"], "next pass takes it");
+    }
+
+    /// The drain's trailing re-poke is load-bearing for exactly one
+    /// shape: a callback that re-arms while a *sibling* refusal is
+    /// still queued. The push's own poke is elided then (the queue was
+    /// not empty), and the pass's wake is already consumed, so without
+    /// the re-poke the requeued refusal strands until some unrelated
+    /// wake happens by. Driven through the wake alone - no direct
+    /// drain calls - so eliding the re-poke fails this test instead of
+    /// passing it.
+    #[test]
+    fn a_requeued_refusal_is_not_stranded_behind_its_siblings() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        fs.set_timer_cap(1);
+        let hour = Duration::from_secs(3600);
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            assert!(conn.timeout(hour, |_d, _c| {}).is_some(), "cap spender");
+        }
+        let log: Rc<StdRefCell<Vec<&'static str>>> =
+            Rc::new(StdRefCell::new(Vec::new()));
+        {
+            let (l1, l2) = (Rc::clone(&log), Rc::clone(&log));
+            let requeued = Rc::clone(&log);
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            assert!(
+                conn.timeout(hour, move |_d, c| {
+                    l1.borrow_mut().push("a");
+                    // "b" is still queued here, so this push's poke is
+                    // elided; only the drain's re-poke carries it.
+                    let _ = c.timeout(hour, move |_d, _c| {
+                        requeued.borrow_mut().push("a2");
+                    });
+                })
+                .is_none()
+            );
+            assert!(
+                conn.timeout(hour, move |_d, _c| {
+                    l2.borrow_mut().push("b");
+                })
+                .is_none()
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while log.borrow().len() < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "the requeued refusal stranded: {:?}",
+                log.borrow()
+            );
+            if turn(&mut fs, &mut eng) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert_eq!(*log.borrow(), vec!["a", "b", "a2"]);
+    }
+
     /// The `Refused` state's whole transition table, on the slot
     /// alone: a parked refusal is settled only by the callback route -
     /// a real answer supersedes it, the callback dropping unfired
@@ -2511,7 +2718,6 @@ mod tests {
         let Some((mut eng, mut fs, _who)) = rig() else {
             return;
         };
-        eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm wake");
         let owner = Some((6u32, 1u64));
         let seen: Rc<StdCell<Option<(bool, bool)>>> =
             Rc::new(StdCell::new(None));
@@ -2523,7 +2729,8 @@ mod tests {
             drop(conn.spawn(move |t| async move {
                 let d = t
                     .fut(|c, cb| {
-                        c.timeout(Duration::from_secs(3600), cb);
+                        // The frame's sink carries any refusal.
+                        let _ = c.timeout(Duration::from_secs(3600), cb);
                     })
                     .await;
                 out.set(Some((
@@ -2535,7 +2742,14 @@ mod tests {
                 )));
             }));
         }
-        let (ecanceled, refused) = seen.get().expect("answered at once");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen.get().is_none() {
+            assert!(Instant::now() < deadline, "the verdict never delivered");
+            if turn(&mut fs, &mut eng) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let (ecanceled, refused) = seen.get().expect("driven to delivery");
         assert!(ecanceled, "the sweep's verdict, not a strand");
         assert!(
             !refused,
@@ -2599,6 +2813,13 @@ mod tests {
                     d.was_refused(),
                 )));
             }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen.get().is_none() {
+            assert!(Instant::now() < deadline, "the refusal never delivered");
+            if turn(&mut fs, &mut eng) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
         assert_eq!(
             seen.get(),
@@ -2741,7 +2962,14 @@ mod tests {
                 )));
             }));
         }
-        let (ecanceled, refused) = seen.get().expect("answered at once");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen.get().is_none() {
+            assert!(Instant::now() < deadline, "the verdict never delivered");
+            if turn(&mut fs, &mut eng) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let (ecanceled, refused) = seen.get().expect("driven to delivery");
         assert!(ecanceled, "the sweep's verdict, not a strand");
         assert!(
             !refused,
@@ -2768,7 +2996,8 @@ mod tests {
             conn.spawn(move |t| async move {
                 let fired = t
                     .fut(|c, cb| {
-                        c.timeout(Duration::from_millis(30), cb);
+                        // The frame's sink carries any refusal.
+                        let _ = c.timeout(Duration::from_millis(30), cb);
                     })
                     .await;
                 assert!(fired.result().is_ok(), "{:?}", fired.result().err());
@@ -2927,27 +3156,37 @@ mod tests {
             done.result()
         );
 
-        // Fill the op table (8 slots), then one more: EBUSY.
+        // Fill the op table (8 slots), then more: each surplus is
+        // EBUSY, delivered at the wake drain its queued callback rides.
         let mut held = Vec::new();
         for _ in 0..16 {
             held.push(
                 conn.fut(|c, cb| c.open(who, &anchor, c".", spec_dir(), cb)),
             );
         }
-        let busy = held
-            .into_iter()
-            .filter_map(|f| {
-                let mut f = std::pin::pin!(f);
-                match f.as_mut().poll(&mut cx) {
-                    Poll::Ready(d) => Some(d.result()),
-                    Poll::Pending => None,
+        let mut busy = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !busy {
+            assert!(
+                Instant::now() < deadline,
+                "a full op table must answer EBUSY, not ECANCELED"
+            );
+            held.retain_mut(|f| match Pin::new(&mut *f).poll(&mut cx) {
+                Poll::Ready(d) => {
+                    if matches!(
+                        d.result(),
+                        Err(crate::Error::Errno(Errno::EBUSY))
+                    ) {
+                        busy = true;
+                    }
+                    false
                 }
-            })
-            .find(|r| matches!(r, Err(crate::Error::Errno(Errno::EBUSY))));
-        assert!(
-            busy.is_some(),
-            "a full op table must answer EBUSY, not ECANCELED"
-        );
+                Poll::Pending => true,
+            });
+            if !busy && turn(&mut fs, &mut eng) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 
     /// ZFS's `f_type` magic - `statfs(2)`, and `Statfs::fs_type`'s own
@@ -3280,6 +3519,12 @@ mod tests {
             if tag & TAG_FS_DOMAIN == 0 || tag == TAG_CANCEL {
                 continue;
             }
+            if tag == TAG_WAKE {
+                // Step two's refusal rides the wake drain now.
+                eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("re-arm");
+                deliver_pool_completions(&mut fs, &mut eng);
+                continue;
+            }
             let reaped = fs.on_cqe(&mut eng, tag, slot, gen32, cqe.res);
             if !stolen {
                 stolen = true;
@@ -3330,8 +3575,18 @@ mod tests {
             c.open(who, &anchor, c".", spec_dir(), cb);
         });
         let mut outer = std::pin::pin!(outer);
-        let Poll::Ready(done) = outer.as_mut().poll(&mut cx) else {
-            panic!("the outer submission left its future pending");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let done = loop {
+            if let Poll::Ready(d) = outer.as_mut().poll(&mut cx) {
+                break d;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the outer's refusal never delivered"
+            );
+            if turn(&mut fs, &mut eng) == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         };
         assert!(
             matches!(done.result(), Err(crate::Error::Errno(Errno::EBUSY))),

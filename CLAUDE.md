@@ -114,6 +114,21 @@ Do not reopen these without a reason that is new.
   table. The table is **not** resized for it:
   holds spend the handler budget their owner already has, capped so no
   one tenant can park it all.
+- **A host refusal is delivered, not dropped.** The class - a full op
+  table, an `Allow` pair's two-slot charge, the wall-clock cap, a
+  swept owner, a staging failure - is decided at eighteen submit
+  screens and used to be delivered at none: every one dropped the
+  embedded callback, which closed the connection with no verdict
+  anywhere. It is one queue now (`FsCore::refuse`), drained where
+  finished offloads deliver - a refusal is structurally an offload
+  that resolved at submit time, and the re-entrancy that forbids
+  firing inside `submit_*` is what the push-then-poke wake protocol
+  already answers. Vocabularies survive: capacity refusals arrive
+  marked with the payload handed back, the swept owner's as the
+  unmarked `ECANCELED` the sweep would have dealt in flight. One
+  drain pass delivers only what was queued when it began, so a
+  callback that re-arms into another refusal pays a wake round trip
+  per attempt instead of spinning the ring from inside one pass.
 - **The `fs_ops + pool_size <= MAX_POOL` bound is about field *width*.** An
   op-slot index is packed into the 24-bit `user_data` slot field
   (`user_data::SLOT_MASK`); `TAG_FS_DOMAIN` keeping the two tag vocabularies

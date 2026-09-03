@@ -126,10 +126,15 @@ pub(crate) const TAG_WAKE: u8 = 0x9D;
 /// Tags `ASYNC_CANCEL` ops (and the teardown drain); completions ignored.
 pub(crate) const TAG_CANCEL: u8 = 0x9E;
 
-/// A completed embedded op's callback, fired **inline on the loop thread** by
-/// the embedding host (a `net` server) with the outcome and a fresh [`FsConn`]
-/// for chaining. Dropping it without firing drops its captured continuation --
-/// which closes the connection - so a submission failure needs no error path.
+/// A completed embedded op's callback, fired **on the loop thread** by
+/// the embedding host (a `net` server) with the outcome and a fresh
+/// [`FsConn`] for chaining - inline at the completion's dispatch, or at
+/// the wake drain for a host refusal ([`FsCore::refuse`]), which fires
+/// it with the refusal's verdict and payload instead of dropping it.
+/// Dropping it without firing is the teardown drain's shape alone now:
+/// the captured continuation drops with it, which closes the
+/// connection - the right end for a loop that is dying, and no longer
+/// the answer a live submission failure gives.
 pub(crate) type EmbeddedCb = Box<dyn FnOnce(FsDone, &mut FsConn<'_>)>;
 
 /// Where an op that never reached the ring reports *why*, and hands
@@ -303,13 +308,6 @@ pub(crate) enum ReapedFs {
     Embedded(EmbeddedCb, FsDone, Owner),
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     Pump(FsDone, (u32, u64)),
-}
-
-/// Report an early submission failure - the SQE never staged (slot exhaustion,
-/// an unusable file) - handing the caller's payloads back exactly as a
-/// completion would (see [`deliver`]).
-fn fail(waiter: FsWaiter, err: Errno, bufs: Vec<Vec<u8>>) {
-    deliver(Some(waiter), Err(err), bufs, None, None, true);
 }
 
 /// `fremovexattr(2)` on `f`. Blocking, because io_uring has no opcode for it:
@@ -613,6 +611,34 @@ pub(crate) struct FsCore {
     /// counted.
     armed_timers: HashMap<(u32, u64), WallClock>,
     timer_cap: Option<u32>,
+    /// Host refusals awaiting delivery: embedded ops the ring never
+    /// hosted - a full table, an `Allow` pair's two-slot charge, the
+    /// wall-clock cap, a swept owner, a staging failure - resolved at
+    /// submit time and fired at the wake drain
+    /// ([`deliver_pool_completions`]), each with its payload and its
+    /// verdict. The refusal is decided inside `submit_*`, which holds
+    /// `&mut self` on the fs tables, so the callback cannot fire
+    /// there; structurally it is an offload that resolved at submit,
+    /// and it rides the same push-then-poke protocol to the same
+    /// drain. Dropping the callback instead was the old contract, and
+    /// it delivered nothing to a plain-callback caller but a closed
+    /// connection - the class was decided at every submit screen and
+    /// delivered nowhere.
+    ///
+    /// Uncapped, like the task run queue and the offload registry:
+    /// bound in-flight work upstream, at the request cap - a pass's
+    /// queue depth is what one dispatch's consumer code submitted.
+    /// And loop-thread state only, no instrument beyond the borrow
+    /// checker: `FsCore` is `!Send` (the `Rc`s in `tasks` see to it),
+    /// so push and drain cannot race. The one cross-thread-shaped
+    /// edge - the self-poke that guarantees a drain - rests on pokes
+    /// accumulating in the eventfd counter (`eventfd_write`,
+    /// `fs/eventfd.c`: `ctx->count += ucnt`, so a poke made while the
+    /// READ is unarmed completes the next arm immediately), which
+    /// `loom_wake_pokes_accumulate` models and
+    /// `loom_offload_wakeup_loses_nothing` exercises against a racing
+    /// drain.
+    refusals: VecDeque<(Owner, EmbeddedCb, FsDone)>,
     /// Spawned tasks and their run queue (the futures layer,
     /// [`super::task`]); woken tasks are polled by the delivery
     /// functions below. **Last field on purpose**: fields drop in
@@ -648,6 +674,7 @@ impl FsCore {
             closed_owners: HashMap::new(),
             armed_timers: HashMap::new(),
             timer_cap: None,
+            refusals: VecDeque::new(),
         }
     }
 
@@ -848,7 +875,7 @@ impl FsCore {
         // never grant implicitly. `Personality` cannot be 0 by construction, so
         // this only catches an internal misuse; fail closed regardless.
         if pers == 0 {
-            fail(waiter, Errno::EINVAL, Vec::new());
+            self.refuse(eng, waiter, Errno::EINVAL, true, Vec::new());
             return;
         }
         // An `Allow` open is a wall-clock hold like a timer - two slots
@@ -859,7 +886,7 @@ impl FsCore {
         if deadline.is_some()
             && let Some((err, marked)) = self.refuse_wall_clock_hold(&waiter)
         {
-            deliver(Some(waiter), Err(err), Vec::new(), None, None, marked);
+            self.refuse(eng, waiter, err, marked, Vec::new());
             return;
         }
         // An `Allow` open charges two slots - its own and its guard
@@ -867,11 +894,11 @@ impl FsCore {
         // here, before either pop, and the guard's pop below cannot
         // fail.
         if deadline.is_some() && self.op_free.len() < 2 {
-            fail(waiter, Errno::EBUSY, Vec::new());
+            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new());
             return;
         }
         let Some(op_slot) = self.pop_op() else {
-            fail(waiter, Errno::EBUSY, Vec::new());
+            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new());
             return;
         };
 
@@ -909,7 +936,7 @@ impl FsCore {
             sqe.personality = pers;
         });
         if let Err(e) = staged {
-            self.fail_op(op_slot, e);
+            self.fail_op(eng, op_slot, e);
             return;
         }
         // An `Allow` open's bound: an ordinary timer in its own slot
@@ -971,7 +998,7 @@ impl FsCore {
                     // and one failed guard stage is not the reactor
                     // going away. The guard's slot frees (its waiter
                     // is `None`, so the fail delivers to nobody).
-                    self.fail_op(guard_slot, Errno::ECANCELED);
+                    self.fail_op(eng, guard_slot, Errno::ECANCELED);
                     self.retract_op(eng, TAG_OPEN, op_slot, open_gen);
                 }
             }
@@ -999,7 +1026,7 @@ impl FsCore {
         waiter: FsWaiter,
     ) {
         let Some(op_slot) = self.pop_op() else {
-            fail(waiter, Errno::EBUSY, bufs);
+            self.refuse(eng, waiter, Errno::EBUSY, true, bufs);
             return;
         };
 
@@ -1042,7 +1069,7 @@ impl FsCore {
             sqe.personality = pers;
         });
         if let Err(err) = staged {
-            self.fail_op(op_slot, err);
+            self.fail_op(eng, op_slot, err);
         }
     }
 
@@ -1231,7 +1258,7 @@ impl FsCore {
             }
         });
         if let Err(err) = staged {
-            self.fail_op(op_slot, err);
+            self.fail_op(eng, op_slot, err);
             return Err(err);
         }
         Ok(())
@@ -1253,7 +1280,7 @@ impl FsCore {
         waiter: FsWaiter,
     ) {
         let Some(op_slot) = self.pop_op() else {
-            fail(waiter, Errno::EBUSY, Vec::new());
+            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new());
             return;
         };
 
@@ -1279,7 +1306,7 @@ impl FsCore {
             sqe.personality = pers;
         });
         if let Err(err) = staged {
-            self.fail_op(op_slot, err);
+            self.fail_op(eng, op_slot, err);
         }
     }
 
@@ -1317,11 +1344,11 @@ impl FsCore {
         waiter: FsWaiter,
     ) -> Option<(u32, u64)> {
         if let Some((err, marked)) = self.refuse_wall_clock_hold(&waiter) {
-            deliver(Some(waiter), Err(err), Vec::new(), None, None, marked);
+            self.refuse(eng, waiter, err, marked, Vec::new());
             return None;
         }
         let Some(op_slot) = self.pop_op() else {
-            fail(waiter, Errno::EBUSY, Vec::new());
+            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new());
             return None;
         };
 
@@ -1350,7 +1377,7 @@ impl FsCore {
             sqe.len = 1; // exactly one timespec, per the kernel
         });
         if let Err(err) = staged {
-            self.fail_op(op_slot, err);
+            self.fail_op(eng, op_slot, err);
             return None;
         }
         // Counted only once the arm is real - the refusals above never
@@ -1477,7 +1504,7 @@ impl FsCore {
         waiter: FsWaiter,
     ) {
         if pers == 0 {
-            fail(waiter, Errno::EINVAL, vec![value]);
+            self.refuse(eng, waiter, Errno::EINVAL, true, vec![value]);
             return;
         }
         // An allowlisted attribute is metadata the *server* owns, which the
@@ -1582,11 +1609,11 @@ impl FsCore {
         // path-op siblings refuse instead, and so does this now.
         let Some(opcode) = Self::fd_meta_opcode(tag) else {
             debug_assert!(false, "not an fd-meta tag {tag:#x}");
-            fail(waiter, Errno::EINVAL, vec![value]);
+            self.refuse(eng, waiter, Errno::EINVAL, true, vec![value]);
             return;
         };
         let Some(op_slot) = self.pop_op() else {
-            fail(waiter, Errno::EBUSY, vec![value]);
+            self.refuse(eng, waiter, Errno::EBUSY, true, vec![value]);
             return;
         };
 
@@ -1655,7 +1682,7 @@ impl FsCore {
             }
         });
         if let Err(err) = staged {
-            self.fail_op(op_slot, err);
+            self.fail_op(eng, op_slot, err);
         }
     }
 
@@ -1685,7 +1712,7 @@ impl FsCore {
         // See `submit_open`: personality 0 = ambient root on a name-resolving
         // op. Fail closed.
         if pers == 0 {
-            fail(waiter, Errno::EINVAL, Vec::new());
+            self.refuse(eng, waiter, Errno::EINVAL, true, Vec::new());
             return;
         }
         // See `stage_fd_meta`: an unhandled tag would leave the zeroed SQE's
@@ -1693,11 +1720,11 @@ impl FsCore {
         // never ran.
         let Some(opcode) = Self::path_op_opcode(tag) else {
             debug_assert!(false, "not a path-op tag {tag:#x}");
-            fail(waiter, Errno::EINVAL, Vec::new());
+            self.refuse(eng, waiter, Errno::EINVAL, true, Vec::new());
             return;
         };
         let Some(op_slot) = self.pop_op() else {
-            fail(waiter, Errno::EBUSY, Vec::new());
+            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new());
             return;
         };
 
@@ -1757,7 +1784,7 @@ impl FsCore {
             }
         });
         if let Err(err) = staged {
-            self.fail_op(op_slot, err);
+            self.fail_op(eng, op_slot, err);
         }
     }
 
@@ -1799,11 +1826,11 @@ impl FsCore {
         // Like every name-resolving op: personality 0 would resolve `n2` and
         // create the link as ambient root. Fail closed.
         if pers == 0 {
-            fail(waiter, Errno::EINVAL, Vec::new());
+            self.refuse(eng, waiter, Errno::EINVAL, true, Vec::new());
             return;
         }
         let Some(op_slot) = self.pop_op() else {
-            fail(waiter, Errno::EBUSY, Vec::new());
+            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new());
             return;
         };
 
@@ -1835,7 +1862,7 @@ impl FsCore {
             sqe.personality = pers;
         });
         if let Err(err) = staged {
-            self.fail_op(op_slot, err);
+            self.fail_op(eng, op_slot, err);
         }
     }
 
@@ -2207,7 +2234,7 @@ impl FsCore {
         };
         // Teardown, not a refusal: the loop is dying, so nothing here is
         // worth retrying and `ECANCELED` is the honest answer.
-        deliver(waiter, res, bufs, file, stat, false);
+        deliver(waiter, res, bufs, file, stat);
     }
 
     /// Leak the op table without dropping it - used ONLY when a teardown
@@ -2302,11 +2329,91 @@ impl FsCore {
         Some(done)
     }
 
+    /// Refuse to host an op: resolve `waiter` with the verdict now and
+    /// deliver it at the next wake drain. A channel waiter is answered
+    /// in place (a send runs no consumer code, so there is no
+    /// re-entrancy to defer around); an embedded callback is **queued
+    /// with its `FsDone`** - payload included, so a refused write
+    /// hands its buffers back through the same callback a completion
+    /// would - because the refusal is decided inside a `submit_*`
+    /// holding `&mut self` on the fs tables, where consumer code
+    /// cannot run. The push pokes the loop's wake, so the queue drains
+    /// on the same `TAG_WAKE` pass that delivers finished offloads
+    /// ([`deliver_pool_completions`]); a refusal is structurally an
+    /// offload that resolved at submit time.
+    ///
+    /// A *marked* refusal also fires the staged reason-sink share
+    /// synchronously (reason only - the payload rides the queue),
+    /// which is what an awaited frame reads before its callback route
+    /// settles (`armed::arm`, `SlotState::Refused`). An unmarked one
+    /// (the swept owner's) fires no sink on purpose: the delivered
+    /// `ECANCELED` with [`FsDone::was_refused`] false is the teardown
+    /// vocabulary a task winds down on, in both orderings. A pump
+    /// waiter has no callback and its submit site reports
+    /// synchronously; it drops here as before.
+    fn refuse(
+        &mut self,
+        eng: &mut Engine,
+        waiter: FsWaiter,
+        err: Errno,
+        marked: bool,
+        bufs: Vec<Vec<u8>>,
+    ) {
+        match waiter {
+            FsWaiter::Embedded { owner, cb, on_fail } => {
+                let on_fail = on_fail.take();
+                if marked && let Some(sink) = &on_fail {
+                    (sink.fill)(err, Vec::new());
+                }
+                if self.refusals.is_empty() {
+                    eng.shared.wake.poke();
+                }
+                self.refusals.push_back((
+                    owner,
+                    cb,
+                    FsDone {
+                        result: Err(err),
+                        refused: marked,
+                        bufs,
+                        file: None,
+                        stat: None,
+                        #[cfg(feature = "net-server")]
+                        recv_lease: None,
+                    },
+                ));
+            }
+            other => deliver(Some(other), Err(err), bufs, None, None),
+        }
+    }
+
+    /// One queued refusal, taken for delivery; the drain owns the
+    /// bound (what was queued when its pass began).
+    pub(crate) fn take_refusal(
+        &mut self,
+    ) -> Option<(Owner, EmbeddedCb, FsDone)> {
+        self.refusals.pop_front()
+    }
+
+    /// How many refusals the current drain pass should deliver, and a
+    /// re-poke when a pass leaves any behind - a callback that
+    /// resubmits and is refused again queues mid-drain, and the poke
+    /// that started the pass is already consumed.
+    pub(crate) fn refusals_queued(&self) -> usize {
+        self.refusals.len()
+    }
+
+    pub(crate) fn repoke_if_refusals_left(&self, eng: &Engine) {
+        if !self.refusals.is_empty() {
+            eng.shared.wake.poke();
+        }
+    }
+
     /// Fail a just-reserved op entry before its SQE ever reached the kernel:
-    /// report and free (buffers go back to the caller, as on completion). A
-    /// stage failure never fires an embedded callback - `let _ =` drops it,
-    /// closing the connection via its captured `Deferred`.
-    fn fail_op(&mut self, op_slot: u32, err: Errno) {
+    /// report and free (buffers go back to the caller, as on completion),
+    /// on [`FsCore::refuse`]'s delivery - the one shape every host
+    /// refusal takes. An entry with no waiter (an `Allow` guard) frees
+    /// silently; there is nobody to answer.
+    fn fail_op(&mut self, eng: &mut Engine, op_slot: u32, err: Errno) {
         let entry = &mut self.ops[op_slot as usize];
         let e = &mut entry.state;
         let waiter = e.waiter.take();
@@ -2315,7 +2422,10 @@ impl FsCore {
         e.clear();
         entry.generation += 1;
         self.op_free.push(op_slot);
-        deliver(waiter, Err(err), bufs, None, None, true);
+        match waiter {
+            Some(w) => self.refuse(eng, w, err, true, bufs),
+            None => drop(bufs),
+        }
     }
 }
 
@@ -2494,15 +2604,19 @@ impl FsDone {
 /// refusal past the screens is the core declining to *host* the op -
 /// a full op table, an `Allow` open's two-slot charge with one slot
 /// left, the per-owner wall-clock cap, a swept owner arming a hold, a
-/// staging failure - and every one of them drops `on_done` (and the
-/// continuation it captured, closing the connection) unless the
-/// submission *armed* a share of the futures layer's staged reason
-/// sink (`armed::arm` - staging alone is not enough), which answers
-/// each with its vocabulary: the capacity refusals as a marked errno
-/// through the sink, the swept owner's as the unmarked `ECANCELED`
-/// the sweep would have dealt the op in flight (resolved by the
-/// dropped callback itself - see [`FsConn::timeout`]). These methods
-/// return `()` either way.
+/// staging failure - and every one of them **delivers** `on_done`
+/// with its verdict and payload at the next wake drain
+/// (`FsCore::refuse`): the capacity refusals as a marked errno
+/// ([`FsDone::was_refused`], with [`FsDone::into_bufs`] handing the
+/// payload back for the retry the mark advises), the swept owner's as
+/// the unmarked `ECANCELED` the sweep would have dealt the op in
+/// flight - teardown's vocabulary, so a continuation keyed on it
+/// winds down the same way in both orderings. An awaited frame
+/// additionally reads a marked refusal's reason synchronously through
+/// its armed sink share (`armed::arm`), which the delivered callback
+/// then settles. These methods return `()` either way; only the
+/// timing distinguishes a screen's answer (inline) from the core's
+/// (one drain later).
 ///
 /// **No method here may return data borrowed from `'a`.** The task layer
 /// parks a facade in a thread-local as `FsConn<'static>` and hands it back
@@ -3280,19 +3394,21 @@ impl<'a> FsConn<'a> {
     /// `None` means the arm was refused - a full table, the per-owner
     /// cap, a staging failure, or a connection the teardown sweep has
     /// already passed, which may finish I/O but not park time on the
-    /// table. How the refusal reaches `on_done`'s frame depends on
-    /// which. The capacity refusals report through the staged reason
-    /// sink where one is armed - an awaited [`fut`](FsConn::fut) reads
-    /// the errno and [`FsDone::was_refused`] - while the swept owner's
-    /// resolves an awaited frame as *unmarked* `ECANCELED` through the
-    /// dropped callback itself (`deliver` fires a sink only for
-    /// marked refusals; the drop is the delivery): the sweep's own
-    /// vocabulary, on purpose, so a continuation keyed on it winds
-    /// down the same way in both orderings. With no frame staged,
-    /// every refusal drops the callback unfired, which for a
-    /// request-handler continuation closes the connection. Nothing is
-    /// delivered *to* a plain `on_done` on refusal - it never ran, and
-    /// the `None` is the caller's copy of that fact.
+    /// table - and no timer exists to retract. The refusal still
+    /// reaches `on_done`, delivered at the next wake drain
+    /// (`FsCore::refuse`) with the verdict on its face: the
+    /// capacity refusals as the marked `EBUSY` a full table answers
+    /// ([`FsDone::was_refused`] true - the arm is worth retrying once
+    /// a hold ends), the swept owner's as *unmarked* `ECANCELED` -
+    /// the sweep's own vocabulary, on purpose, so a continuation
+    /// keyed on it winds down the same way in both orderings. An
+    /// awaited [`fut`](FsConn::fut) additionally reads a marked
+    /// reason synchronously through its armed sink share, before the
+    /// delivered callback settles the frame with the same verdict.
+    #[must_use = "None means no timer exists to retract - the arm was \
+                  refused and `on_done` will deliver the verdict at \
+                  the next drain; a discarded Some forfeits the \
+                  retraction and rides the full wall-clock hold"]
     pub fn timeout<F>(
         &mut self,
         after: std::time::Duration,
@@ -5165,9 +5281,13 @@ mod hybrid_tests {
 
     /// The other ordering of the same violation: when the frame's own
     /// `on_done` rides the *second* submission and that one is
-    /// refused, the future resolves with the dropped-callback verdict
-    /// (unmarked `ECANCELED`) rather than hanging or stealing the
-    /// first op's answer. `fut`'s rustdoc states both halves.
+    /// refused, the future resolves with that submission's own marked
+    /// verdict - the queued refusal fires the callback with its
+    /// `EBUSY` ([`FsCore::refuse`]) - rather than hanging or stealing
+    /// the first op's answer. Before refusals delivered, the dropped
+    /// callback resolved this as unmarked `ECANCELED`, teardown's
+    /// vocabulary, for a connection that was fine. `fut`'s rustdoc
+    /// states both halves.
     #[test]
     fn a_refused_second_submission_answers_for_itself() {
         let mut eng = Engine::new(256, 128).expect("engine");
@@ -5193,8 +5313,9 @@ mod hybrid_tests {
                             c.open(me, &at, c"a", how, move |d, _c| {
                                 *o2.borrow_mut() = Some(d.file().is_some());
                             });
-                            // Refused; dropping `cb` resolves the
-                            // future as `Fire::drop` documents.
+                            // Refused; the queued callback resolves
+                            // the future with the refusal's own
+                            // marked verdict at the wake drain.
                             c.open(me, &at, c"a", how, cb);
                         })
                         .await;
@@ -5205,9 +5326,9 @@ mod hybrid_tests {
         );
         let done = got.borrow_mut().take().expect("resolved");
         assert!(
-            matches!(done.result(), Err(crate::Error::Errno(Errno::ECANCELED)))
-                && !done.was_refused(),
-            "the dropped-callback verdict: {:?} refused={}",
+            matches!(done.result(), Err(crate::Error::Errno(Errno::EBUSY)))
+                && done.was_refused(),
+            "the refused submission's own verdict: {:?} refused={}",
             done.result(),
             done.was_refused()
         );
@@ -5800,11 +5921,10 @@ fn deliver(
     bufs: Vec<Vec<u8>>,
     file: Option<Arc<OwnedFd>>,
     stat: Option<Box<StatxRaw>>,
-    refused: bool,
 ) {
     match waiter {
         // A refusal is *not* marked on the way out here, and the
-        // asymmetry with the arm below is deliberate rather than
+        // asymmetry with the embedded path is deliberate rather than
         // missed. The blocking path's public signatures return
         // `crate::Result`, so there is nowhere to put the bit without
         // redesigning them; `FsHandle::path_op` carries the rule a
@@ -5814,26 +5934,18 @@ fn deliver(
         Some(FsWaiter::Channel(tx)) => {
             let _ = tx.send(FsOutcome::new(res, bufs, file, stat));
         }
-        // Submission failure / teardown of an embedded op: drop the callback
-        // unfired - dropping the continuation it captured closes the
-        // connection (see [`EmbeddedCb`]). Nothing else routes it.
+        // The teardown drain only, now that a live host refusal queues
+        // for delivery (`FsCore::refuse`): the loop is dying, nothing
+        // will drain a queue, and dropping the callback unfired is the
+        // one shape left - which resolves an awaited frame as its
+        // `Fire` drops, `ECANCELED` unmarked, teardown's own
+        // vocabulary.
         Some(FsWaiter::Embedded { cb, on_fail, .. }) => {
-            // A refusal reports its reason and hands the payload back; a
-            // teardown reports neither, which is what keeps `ECANCELED`
-            // meaning teardown alone. The callback goes unfired either
-            // way, as its contract says - the sink fills a slot and runs
-            // no consumer code, so this is not an inline delivery.
-            let on_fail = on_fail.take();
-            if let (true, Some(sink), Err(errno)) = (refused, &on_fail, res) {
-                (sink.fill)(errno, bufs);
-            } else {
-                drop(bufs);
-            }
-            drop((cb, on_fail, file, stat));
+            drop((cb, on_fail, bufs, file, stat));
         }
         // A pump read has no callback to drop and nowhere to route from here:
         // on a teardown drain the owning connection is dying with the loop,
-        // and on a staging failure (`fail_op`) `submit_pump_read` reports the
+        // and on a refusal (`FsCore::refuse`) `submit_pump_read` reports the
         // error to its caller synchronously. The payloads just drop.
         Some(FsWaiter::Pump { .. }) => drop((bufs, file, stat)),
         None => {}
@@ -5852,6 +5964,21 @@ pub(crate) fn deliver_pool_completions(fs: &mut FsCore, eng: &mut Engine) {
             let mut conn = FsConn::new(fs, eng, owner);
             deliver(any, &mut conn);
         }
+        // Host refusals resolved at submit time deliver on the same
+        // pass, with the same fresh owner-scoped facade a completion
+        // gets. Bounded to what was queued when the pass began: a
+        // callback that resubmits and is refused again queues behind
+        // the re-poke below and delivers next pass, so a retry loop
+        // pays a wake round-trip per attempt instead of starving the
+        // ring from inside one drain.
+        for _ in 0..fs.refusals_queued() {
+            let Some((owner, cb, done)) = fs.take_refusal() else {
+                break;
+            };
+            let mut conn = FsConn::new(fs, eng, owner);
+            cb(done, &mut conn);
+        }
+        fs.repoke_if_refusals_left(eng);
     });
 }
 
