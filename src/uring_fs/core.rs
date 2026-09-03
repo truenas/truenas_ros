@@ -562,17 +562,6 @@ struct WallClock {
 pub(crate) struct FsCore {
     ops: Vec<SlotEntry<FsOpEntry>>,
     op_free: Vec<u32>,
-    /// One past the highest slot index that may hold an in-flight op:
-    /// raised by every pop ([`FsCore::pop_op`]), tightened by each
-    /// sweep to the highest entry it actually saw, and reset by the
-    /// empty-table early-out. Exists because `op_free` is a LIFO
-    /// seeded high-to-low: after a deep burst the surviving ops sit
-    /// scattered high, so a scan from index 0 that stops on the
-    /// in-flight *count* still walks to the highest survivor -
-    /// measured at 20,969 of 29,184 entries for one live op. The
-    /// count bounds how many entries the sweep must see; this bounds
-    /// where it has to look.
-    scan_high: u32,
     /// This reactor's one blocking-work pool (shared with off-loop
     /// [`QueryPool`](super::query_dir::QueryPool)s), spawned on first use.
     pool: Arc<SharedPool>,
@@ -636,7 +625,6 @@ impl FsCore {
                 })
                 .collect(),
             op_free: (0..op_slots).rev().collect(),
-            scan_high: 0,
             pool: SharedPool::new(offload),
             completions: Arc::new(Mutex::new(VecDeque::new())),
             offload_reg: HashMap::new(),
@@ -1117,13 +1105,9 @@ impl FsCore {
         }
     }
 
-    /// Pop a free op slot - the one way any submit path takes one -
-    /// keeping `scan_high` an upper bound on where in-flight entries
-    /// can sit.
+    /// Pop a free op slot - the one way any submit path takes one.
     fn pop_op(&mut self) -> Option<u32> {
-        let slot = self.op_free.pop()?;
-        self.scan_high = self.scan_high.max(slot + 1);
-        Some(slot)
+        self.op_free.pop()
     }
 
     /// Whether the op table has a slot left. The reply path consults this
@@ -1138,11 +1122,6 @@ impl FsCore {
     #[cfg(all(test, not(loom)))]
     pub(crate) fn op_free_len_for_test(&self) -> usize {
         self.op_free.len()
-    }
-
-    #[cfg(all(test, not(loom)))]
-    pub(crate) fn scan_high_for_test(&self) -> u32 {
-        self.scan_high
     }
 
     #[cfg(all(test, not(loom)))]
@@ -1932,34 +1911,30 @@ impl FsCore {
             let swept = self.closed_owners.entry(slot).or_insert(generation);
             *swept = (*swept).max(generation);
         }
-        // Bounded by the in-flight count *and* by position. A slot is
-        // in `op_free` iff free (all three push sites clear the entry
-        // and bump the generation first), so the difference is exactly
-        // how many in-flight entries the scan can meet, and it stops
-        // once it has seen them all - but the count alone is a
-        // termination condition, not a bound on where they sit:
-        // `op_free` is a LIFO seeded high-to-low, so after a deep
-        // burst the survivors are scattered high and a scan from 0
-        // still walked to the highest of them (20,969 of 29,184
-        // entries for one live op, recovering 8-20% of the unbounded
-        // cost). `scan_high` is the position bound: every pop raises
-        // it, and each scan pays down to the truth once and tightens
-        // it to what it saw. The empty-table early-out above is what
-        // an idle server hits; this is what a *loaded* one does - at
-        // least one op in flight plus a trickle of closes is a steady
-        // state, and without the bounds every close in it paid the
-        // full `fs_ops + pool_size` walk on the reactor thread.
+        // Bounded by the in-flight count: a slot is in `op_free` iff
+        // free (all three push sites clear the entry and bump the
+        // generation first), so the difference is exactly how many
+        // in-flight entries the scan can meet, and it stops once it
+        // has seen them all. That break already lands at one past the
+        // highest in-flight index, so the count is a position bound
+        // too - a further position term cannot improve on it (a
+        // `scan_high` water mark was measured within one entry of
+        // this bound in every reachable state, and 1,950 entries
+        // looser after a drained burst, because LIFO reuse keeps
+        // re-raising it). What would escape the highest-index term is
+        // *membership* - iterating an occupied-slot list or bitmap
+        // instead of scanning toward a count - at a cost on every
+        // submit/complete for a saving on the close path; the sweep
+        // stays a scan until that trade is worth it. The empty-table
+        // early-out above is what an idle server hits.
         let mut in_flight = self.ops.len() - self.op_free.len();
         if in_flight == 0 {
-            self.scan_high = 0; // nothing in flight for anyone
-            return;
+            return; // nothing in flight for anyone
         }
         owners.sort_unstable();
         // Collect targets first (the scan borrows `self.ops`), then stage.
         let mut targets: Vec<u64> = Vec::new();
-        let limit = (self.scan_high as usize).min(self.ops.len());
-        let mut high_seen = 0usize;
-        for (i, entry) in self.ops[..limit].iter().enumerate() {
+        for (i, entry) in self.ops.iter().enumerate() {
             if in_flight == 0 {
                 break;
             }
@@ -1967,7 +1942,6 @@ impl FsCore {
                 continue;
             };
             in_flight -= 1;
-            high_seen = i + 1;
             let owner = match &entry.state.waiter {
                 Some(FsWaiter::Embedded { owner: Some(o), .. }) => *o,
                 Some(FsWaiter::Pump { owner: o }) => *o,
@@ -1977,8 +1951,7 @@ impl FsCore {
                 targets.push(pack_raw(tag, i as u32, entry.generation as u32));
             }
         }
-        debug_assert_eq!(in_flight, 0, "an in-flight op sits above scan_high");
-        self.scan_high = high_seen as u32;
+        debug_assert_eq!(in_flight, 0, "in_flight over-counts the table");
         for ud in targets {
             self.submit_cancel(eng, ud);
         }
@@ -6859,50 +6832,6 @@ mod routing_fuzz {
                 open_done = true;
             }
         }
-    }
-
-    /// The sweep's scan is bounded by where in-flight ops can sit, not
-    /// by the table: a burst that filled the table and drained leaves
-    /// its survivors at high indices, the first sweep pays down to the
-    /// truth once and tightens the bound, and an empty table resets
-    /// it. Driven with synthesized CQEs; the only kernel involvement
-    /// is the never-flushed staging ring.
-    #[test]
-    fn the_sweep_scan_tightens_to_the_highest_live_slot() {
-        let Some(mut eng) = engine_or_skip() else {
-            return;
-        };
-        let mut core = FsCore::new(64, OffloadBounds::default());
-        let hour = std::time::Duration::from_secs(3600);
-        // Fill the table: the LIFO free list hands out 0..64 in order.
-        for i in 0..64u32 {
-            core.submit_timeout(
-                &mut eng,
-                hour,
-                FsWaiter::Pump { owner: (i, 1) },
-            );
-        }
-        assert!(!core.has_free_op(), "the burst fills the table");
-        assert_eq!(core.scan_high_for_test(), 64, "pops raised the bound");
-        // The burst drains, one survivor high in the table.
-        for slot in (0..64u32).filter(|&s| s != 60) {
-            core.on_cqe(&mut eng, TAG_TIMEOUT, slot, 0, -libc::ETIME);
-        }
-        // A sweep for an absent owner pays the walk once and tightens.
-        core.cancel_owned_by(&mut eng, vec![(999, 1)]);
-        assert_eq!(
-            core.scan_high_for_test(),
-            61,
-            "the scan tightened to one past the survivor"
-        );
-        // The survivor ends; an empty table resets the bound outright.
-        core.on_cqe(&mut eng, TAG_TIMEOUT, 60, 0, -libc::ETIME);
-        core.cancel_owned_by(&mut eng, vec![(999, 1)]);
-        assert_eq!(core.scan_high_for_test(), 0, "an idle table scans nothing");
-        // And the next pop raises it again - the slot freed last is
-        // reissued first.
-        core.submit_timeout(&mut eng, hour, FsWaiter::Pump { owner: (7, 1) });
-        assert_eq!(core.scan_high_for_test(), 61, "a pop re-raises the bound");
     }
 
     /// A deadline-tripped `Allow` open answers in its own vocabulary,
