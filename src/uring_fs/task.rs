@@ -1568,21 +1568,23 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: TaskId) {
             // either. A sink already taken above is a `Ready` poll whose
             // output panicked on the way out - contained, and with the
             // handle gone there is nobody left to report it to.
-            // The future's own destructors run inside the guard too,
-            // but do not read that as containment: the poll is already
-            // unwinding, so a destructor that panics here is a panic
-            // during an unwind and aborts before this arm runs at all
-            // (see [`JoinError::Panic`]). What the guard covers is the
-            // destructor of a future dropped *by this arm* whose panic
-            // is its first - contained, so it cannot take the delivery
-            // path down.
+            // Two guards, delivery first, which is the order
+            // `Tasks::drop` uses. The future's destructors run under
+            // their own: a destructor whose panic is its first is
+            // contained rather than aborting, so sharing one guard with
+            // the delivery would let it swallow `sink(payload)` and
+            // resolve the handle `Dropped` for work that ran and
+            // panicked.
+            let sink = entry.on_panic.take();
             let _ =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let sink = entry.on_panic.take();
-                    drop(entry);
                     if let Some(sink) = sink {
                         sink(payload);
                     }
+                }));
+            let _ =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop(entry);
                 }));
             fs.tasks.retire(idx);
         }
@@ -1609,7 +1611,7 @@ fn poll_one(fs: &mut FsCore, eng: &mut Engine, id: TaskId) {
 // across it and goes red on either half, which is the control
 // `CLAUDE.md` asks for. Add an ordering site here and it needs a model
 // of that second kind, or it is unchecked however many models pass.
-#[cfg(loom)]
+#[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
     use crate::sync::atomic::{AtomicU64, AtomicUsize};

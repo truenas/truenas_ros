@@ -2912,7 +2912,7 @@ mod tests {
 // This model drives the real `send`. What it cannot drive is the reactor's
 // teardown, which lives in `host.rs` around real io_uring work - so the loop
 // side is a stand-in that performs the same two steps in the same order.
-#[cfg(loom)]
+#[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
     use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};

@@ -54,10 +54,11 @@ use std::fmt;
 /// common 8 MiB limit; measured, the 22nd concurrent default-sized ring fails
 /// `ENOMEM`.
 ///
-/// `ops` is ordinary heap - about 180 bytes per slot, so the default costs
-/// ~5.8 MiB of RSS, allocated once at construction - and is not accounted
-/// against any limit. That asymmetry is why the two defaults differ by 8x:
-/// raising concurrency is cheap, raising the batch size is not.
+/// `ops` is ordinary heap - 272 bytes per slot, 280 under `net-server`
+/// (pinned by `core::op_entry_size`), so the default costs ~8.5 MiB of RSS,
+/// allocated once at construction - and is not accounted against any limit.
+/// That asymmetry is why the two defaults differ by 8x: raising concurrency
+/// is cheap, raising the batch size is not.
 ///
 /// One reactor sits well inside 8 MiB. Several (a `reuse_port` reactor per
 /// core), or a consumer that also registers buffers, must raise the limit
@@ -486,6 +487,9 @@ impl UringFs {
     }
 
     fn drain_teardown(&mut self) -> crate::Result<()> {
+        // Before the reap, while the ring is still whole: see
+        // `drain_stop_window`.
+        crate::uring_fs::core::drain_stop_window(&mut self.fs, &mut self.eng);
         let drained = self.drain_or_leak();
         while let Ok(msg) = self.inject_rx.try_recv() {
             let (reply, bufs) = match msg {
@@ -584,6 +588,64 @@ mod tests {
                 Err(crate::Error::Validation(_))
             ),
             "a submission ring below the floor is refused"
+        );
+    }
+
+    /// A refusal queued in the stop window is delivered by the teardown,
+    /// not dropped with its callback.
+    ///
+    /// `run_loop` exits on `stopping()` and its `TAG_WAKE` arm never
+    /// re-arms the wake `READ` once it has, so the poke behind a refusal
+    /// queued in that window can no longer become a `TAG_WAKE` completion -
+    /// and the teardown reap (`cancel_and_reap_all`) touches ring ops only,
+    /// never `fs.refusals`. Left there, the callback dies unfired with the
+    /// payload it was handing back.
+    ///
+    /// The pass is bounded to what was already queued, and the continuation
+    /// below is the documented edge of that: what a callback asks for
+    /// during teardown is going nowhere anyway.
+    #[test]
+    fn teardown_delivers_a_refusal_queued_in_the_stop_window() {
+        use crate::uring_fs::core::FsConn;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut host = match UringFs::new(FsConfig::default()) {
+            Ok(h) => h,
+            Err(crate::Error::Errno(e)) if skip_unavailable(e) => return,
+            Err(e) => panic!("UringFs::new: {e}"),
+        };
+        host.fs.set_timer_cap(1);
+        let hour = std::time::Duration::from_secs(3600);
+        {
+            let mut conn =
+                FsConn::new(&mut host.fs, &mut host.eng, Some((1, 1)));
+            assert!(conn.timeout(hour, |_d, _c| {}).is_some(), "cap spender");
+        }
+        let log: Rc<RefCell<Vec<&'static str>>> =
+            Rc::new(RefCell::new(Vec::new()));
+        {
+            let l = Rc::clone(&log);
+            let requeued = Rc::clone(&log);
+            let mut conn =
+                FsConn::new(&mut host.fs, &mut host.eng, Some((1, 1)));
+            assert!(
+                conn.timeout(hour, move |_d, c| {
+                    l.borrow_mut().push("a");
+                    // Still at cap: this re-arm queues mid-drain.
+                    let _ = c.timeout(hour, move |_d, _c| {
+                        requeued.borrow_mut().push("a2");
+                    });
+                })
+                .is_none(),
+                "refused at the cap"
+            );
+        }
+        host.drain_teardown().expect("teardown");
+        assert_eq!(
+            *log.borrow(),
+            vec!["a"],
+            "a refusal queued before the stop died with its callback"
         );
     }
 
