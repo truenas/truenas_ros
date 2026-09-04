@@ -111,7 +111,13 @@ Do not reopen these without a reason that is new.
   counted (`WallClock`), and the arm refuses when armed + retiring
   reaches twice the cap, because with the headroom back early that
   sum is the only thing standing between a swap loop and the whole
-  table. The table is **not** resized for it:
+  table. **Two classes park on `retiring`, and the sum bounds neither
+  unless both do**: a retracted timer, and an `Allow` pair whose open
+  answered while its guard slot was still parked - one count for two
+  slots means the count cannot go home with the first of them. A
+  screen implementing that arithmetic over one of the two classes
+  reads as correct and is not, which is why the census matters more
+  than the formula. The table is **not** resized for it:
   holds spend the handler budget their owner already has, capped so no
   one tenant can park it all.
 - **A host refusal is delivered, not dropped.** The class - a full op

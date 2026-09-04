@@ -368,6 +368,16 @@ struct FsOpEntry {
     /// On a [`TAG_OPEN`] entry: the guard timer's slot and full
     /// generation, retracted when the open answers first.
     guard: Option<(u32, u64)>,
+    /// On a [`TAG_OPEN_DEADLINE`] entry whose open already answered: the
+    /// owner whose [`WallClock::retiring`] count this slot is holding
+    /// open. The pair charges one count for two slots, so the count
+    /// cannot go home at the open's CQE - the guard slot is still
+    /// parked, exactly as a retracted timer's is, and is metered the
+    /// same way until its own CQE frees it. Set by [`FsCore::take_op`]
+    /// at the moment it parks the count, never at the arm: the reverse
+    /// ordering (the guard fires first) frees this slot while the open
+    /// still holds its `armed` charge, and there is nothing to park.
+    wall_clock: Option<(u32, u64)>,
     /// Keeps a path op's dirfd alive (and its fd number un-reused) while
     /// the op is in flight.
     anchor: Option<Anchor>,
@@ -421,6 +431,7 @@ impl FsOpEntry {
             retracted: false,
             cancels: None,
             guard: None,
+            wall_clock: None,
             anchor: None,
             anchor2: None,
             file: None,
@@ -442,6 +453,7 @@ impl FsOpEntry {
         self.retracted = false;
         self.cancels = None;
         self.guard = None;
+        self.wall_clock = None;
         self.anchor = None;
         self.anchor2 = None;
         self.file = None;
@@ -548,16 +560,25 @@ struct OffloadEntry {
 
 /// One owner's wall-clock tenancy. `armed` is what the cap meters -
 /// each count returned at its hold's ending, or early at a timer's
-/// retraction. `retiring` counts retracted timers whose slots are
-/// still parked awaiting their CQE: the retraction hands the cap
-/// headroom back on the spot so retract-then-rearm holds inside one
-/// delivery, but the slot rides to a CQE no delivery reaps, so the
-/// arm screens also refuse at `armed + retiring` reaching twice the
-/// cap - the documented mid-swap slot ceiling. Without that clause
-/// the early headroom unmade the cap entirely: a retract-rearm loop
-/// inside one delivery parked the whole table with `armed` never
-/// leaving zero (cap 1 on a 64-slot table measured 64 arms, zero
-/// refusals, zero free slots).
+/// retraction. `retiring` counts a hold whose count has gone back to
+/// the cap while a slot it charged for is still parked awaiting its
+/// CQE, and there are two of those:
+///
+/// - a **retracted timer**, whose retraction hands the cap headroom
+///   back on the spot so retract-then-rearm holds inside one delivery,
+///   while the slot rides to a CQE no delivery reaps;
+/// - an **`Allow` pair whose open answered first**, which charged one
+///   count for two slots, so the guard slot outlives the CQE that
+///   would otherwise return the whole charge.
+///
+/// So the arm screens also refuse at `armed + retiring` reaching twice
+/// the cap - the documented mid-swap slot ceiling - and both classes
+/// have to reach `retiring`, or the sum bounds one of them and the
+/// other walks the table one unreaped slot at a time. Without the
+/// clause at all the early headroom unmade the cap entirely: a
+/// retract-rearm loop inside one delivery parked the whole table with
+/// `armed` never leaving zero (cap 1 on a 64-slot table measured 64
+/// arms, zero refusals, zero free slots).
 #[derive(Clone, Copy, Default)]
 struct WallClock {
     armed: u32,
@@ -598,8 +619,10 @@ pub(crate) struct FsCore {
     /// without a bound one connection could park the whole shared
     /// handler budget for its arms' full duration - measured at every
     /// slot of a consumer-sized table in 19 ms. An `Allow` pair
-    /// charges one count (so a count bounds at most two slots),
-    /// taken when its guard stages and returned when the open answers.
+    /// charges one count (so a count bounds at most two slots), taken
+    /// when its guard stages and returned by whichever of its two
+    /// slots frees last - parked on `retiring` in between, exactly as
+    /// a retracted timer's is ([`WallClock`]).
     /// The ceiling is the host's `max_in_flight_requests`: the real
     /// consumer's discipline is one retry tick per connection, walking
     /// every claimant parked on it (its `guard.rs`), so one connection
@@ -978,18 +1001,21 @@ impl FsCore {
                         self.ops[guard_slot as usize].generation,
                     ));
                     // The pair's wall-clock charge, counted like a
-                    // timer's arm: taken only once the guard is real,
-                    // returned when the open answers (`take_op`, keyed
-                    // on `guard` being set - a stage-failed guard never
-                    // reaches here and never charges).
+                    // timer's arm: taken only once the guard is real
+                    // (a stage-failed guard never reaches here and
+                    // never charges), and returned by whichever of the
+                    // two slots frees last - `take_op` moves it to
+                    // `retiring` when the open answers with the guard
+                    // still parked, exactly as a retracted timer's
+                    // count parks for the width of its reap.
                     if let Some(o) = timer_owner {
                         self.armed_timers.entry(o).or_default().armed += 1;
                     }
                 }
                 Err(_) => {
                     // The open is in flight and its bound cannot be:
-                    // cancel the open rather than let it run
-                    // unbounded, marked (`retract_op`) as the
+                    // ask for the open to be cancelled rather than let
+                    // it run unbounded, marked (`retract_op`) as the
                     // asked-for cancellation it is, so its
                     // `ECANCELED` arrives in the deadline vocabulary
                     // (`was_refused` true, the tripped guard's own
@@ -2032,9 +2058,15 @@ impl FsCore {
             }
             let cancels = entry.state.cancels.take();
             let retracted = entry.state.retracted;
+            let parked = entry.state.wall_clock.take();
             entry.state.clear();
             entry.generation += 1;
             self.op_free.push(op_slot);
+            // The pair's charge, parked here by `take_op` when the open
+            // answered first: the slot is free now, so it goes home.
+            if let Some(o) = parked {
+                self.release_retiring(o);
+            }
             if !retracted
                 && res == -libc::ETIME
                 && let Some((oslot, ogen)) = cancels
@@ -2250,6 +2282,25 @@ impl FsCore {
 
     // ---- internals -----------------------------------------------------
 
+    /// Return a wall-clock count parked on `retiring` - an `Allow`
+    /// pair's, once the guard slot it was parked on has freed. The
+    /// timer half is inline in [`FsCore::take_op`], where the same CQE
+    /// decides which of the two buckets it came out of.
+    fn release_retiring(&mut self, owner: (u32, u64)) {
+        let Some(t) = self.armed_timers.get_mut(&owner) else {
+            debug_assert!(false, "a parked wall-clock hold with no count");
+            return;
+        };
+        debug_assert!(t.retiring > 0, "a parked hold returned twice");
+        // Saturating rather than wrapping: an unmatched return is a
+        // stuck cap in release, not a `u32::MAX` that refuses the
+        // owner's every arm for the life of the reactor.
+        t.retiring = t.retiring.saturating_sub(1);
+        if t.armed == 0 && t.retiring == 0 {
+            self.armed_timers.remove(&owner);
+        }
+    }
+
     /// Take a completed op entry out: returns its waiter and payloads and
     /// frees the slot (generation bumped) - the freed-before-fire rule.
     fn take_op(
@@ -2258,7 +2309,7 @@ impl FsCore {
         op_slot: u32,
         gen32: u32,
     ) -> Option<Completed> {
-        let entry = self.ops.get_mut(op_slot as usize)?;
+        let entry = self.ops.get(op_slot as usize)?;
         if entry.generation as u32 != gen32 {
             return None;
         }
@@ -2266,6 +2317,27 @@ impl FsCore {
             FsOpState::InFlight { tag: t } if t == tag => {}
             _ => return None,
         }
+        // An `Allow` open whose guard slot is still in flight: the pair
+        // charged one count for two slots, so the charge outlives this
+        // CQE and has to park rather than go home (see `park` below).
+        // Checked against the guard entry itself, because `guard` stays
+        // set on an open whose guard fired *first* - in that ordering
+        // the guard's slot is already free (and possibly reissued) and
+        // there is nothing left to meter.
+        let live_guard = if tag == TAG_OPEN {
+            entry.state.guard.filter(|&(gslot, ggen)| {
+                self.ops.get(gslot as usize).is_some_and(|g| {
+                    g.generation == ggen
+                        && g.state.state
+                            == (FsOpState::InFlight {
+                                tag: TAG_OPEN_DEADLINE,
+                            })
+                })
+            })
+        } else {
+            None
+        };
+        let entry = &mut self.ops[op_slot as usize];
         let e = &mut entry.state;
         // A wall-clock hold's completion returns its owner's tenancy:
         // a timer's - expiry, retraction, or the teardown drain - and
@@ -2291,12 +2363,43 @@ impl FsCore {
             }
             _ => None,
         };
+        // An `Allow` open that answers first
+        // leaves its guard slot parked until that slot's own CQE, so
+        // returning the whole charge here would leave a held slot
+        // metered by nothing and let the arm screen wave through a
+        // fresh pair per unreaped guard - the cap counting arms while
+        // the table pays in slots. The count moves to `retiring`, the
+        // same bucket a retracted timer parks on for the same window,
+        // and the guard carries the owner that owes it.
+        let park_on_guard = match charged {
+            Some((o, _)) => live_guard.map(|g| (o, g)),
+            None => None,
+        };
+        // The other direction: a guard slot reaped without passing
+        // `on_cqe`'s `TAG_OPEN_DEADLINE` arm - the teardown drain
+        // routes every tag through here - still owes whatever its own
+        // open parked on it. Read under the tag, so an ordinary
+        // completion does not touch the field at all.
+        let owed_here = if tag == TAG_OPEN_DEADLINE {
+            e.wall_clock.take()
+        } else {
+            None
+        };
+        // Set only where the count actually moved, so the receipt on
+        // the guard slot and the count on `retiring` are written by the
+        // same branch: a park recorded against a charge that was not
+        // there would have the guard's CQE return a count nobody took.
+        let mut parked = false;
         if let Some((o, retired)) = charged {
             if let Some(t) = self.armed_timers.get_mut(&o) {
                 if retired {
                     t.retiring -= 1;
                 } else {
                     t.armed -= 1;
+                }
+                if park_on_guard.is_some() {
+                    t.retiring += 1;
+                    parked = true;
                 }
                 if t.armed == 0 && t.retiring == 0 {
                     self.armed_timers.remove(&o);
@@ -2326,6 +2429,16 @@ impl FsCore {
         e.clear();
         entry.generation += 1;
         self.op_free.push(op_slot);
+        // Hand the guard the owner whose count now sits on `retiring`,
+        // for its own CQE to return (`on_cqe`'s [`TAG_OPEN_DEADLINE`]
+        // arm). Written after this entry's borrow ends, so the two
+        // slots are touched one at a time.
+        if parked && let Some((o, (gslot, _))) = park_on_guard {
+            self.ops[gslot as usize].state.wall_clock = Some(o);
+        }
+        if let Some(o) = owed_here {
+            self.release_retiring(o);
+        }
         Some(done)
     }
 
