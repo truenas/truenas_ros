@@ -138,7 +138,19 @@ pub fn validate_acl(target: AclTarget<'_>, acl: &Acl) -> Result<()> {
 }
 
 /// Low-level: validate and write raw NFS4 XDR bytes to `system.nfs4_acl_xdr`.
+///
+/// An **empty** `data` is refused `EINVAL`. It does not write an ACL that
+/// grants nobody anything, which is what a caller that filtered an ACL down
+/// to nothing would mean by it: the kernel leaves `kvalue` NULL for a
+/// zero-length `setxattr` (`setxattr_copy`, `fs/xattr.c:655-669`), and ZFS
+/// reads `(NULL, 0)` as the strip signal (`__zpl_xattr_nfs41acl_set` ->
+/// `zfs_stripacl`, `module/os/linux/zfs/zpl_xattr.c`). So the object would
+/// silently revert to mode-only permissions - the opposite of denying
+/// everyone. Removal has its own spelling, [`fsetacl`] with `None`.
 pub fn fsetacl_nfs4<Fd: AsFd>(fd: Fd, data: &[u8]) -> Result<()> {
+    if data.is_empty() {
+        return Err(Errno::EINVAL.into());
+    }
     let fd = fd.as_fd();
     Nfs4Acl::from_xattr(data)?.validate(target_is_dir(AclTarget::Fd(fd))?)?;
     fsetxattr(fd, nfs4::NFS4_ACL_XATTR, data, XattrFlags::empty())?;
@@ -147,11 +159,19 @@ pub fn fsetacl_nfs4<Fd: AsFd>(fd: Fd, data: &[u8]) -> Result<()> {
 
 /// Low-level: validate and write raw POSIX ACL xattr bytes. A `None` default
 /// removes the default ACL xattr.
+///
+/// An **empty** `access` is refused `EINVAL`, for the reason
+/// [`fsetacl_nfs4`] gives: a zero-length `setxattr` reaches the filesystem
+/// as `(NULL, 0)` and removes the ACL rather than writing an empty one.
+/// Removal has its own spelling, [`fsetacl`] with `None`.
 pub fn fsetacl_posix<Fd: AsFd>(
     fd: Fd,
     access: &[u8],
     default: Option<&[u8]>,
 ) -> Result<()> {
+    if access.is_empty() {
+        return Err(Errno::EINVAL.into());
+    }
     let fd = fd.as_fd();
     PosixAcl::from_xattr(access, default)?
         .validate(target_is_dir(AclTarget::Fd(fd))?)?;

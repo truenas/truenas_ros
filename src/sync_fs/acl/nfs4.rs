@@ -369,6 +369,22 @@ impl Nfs4Acl {
                         .into(),
                 ));
             }
+            // AUDIT and ALARM are NFSv4.1 types this crate can represent and
+            // ZFS will not store: `nfsace4i_to_acep`
+            // (`module/os/linux/zfs/zpl_xattr.c`) answers `-EINVAL` for any
+            // type but ALLOW and DENY. Refused here so the failure names
+            // itself instead of arriving as a bare `EINVAL` from `setxattr`
+            // with nothing to attribute it to. Only the write path: the
+            // decoder keeps accepting them, so an ACL read from a
+            // filesystem that does store them still round-trips through
+            // this type.
+            if matches!(a.ace_type, Nfs4AceType::Audit | Nfs4AceType::Alarm) {
+                return Err(Error::Validation(format!(
+                    "{:?} entries cannot be stored: ZFS implements only \
+                     ALLOW and DENY and refuses the rest with EINVAL",
+                    a.ace_type
+                )));
+            }
             // Refusing beats accepting a write that reads back as 0x00.
             if a.ace_flags.intersects(Nfs4Flag::UNREPRESENTABLE) {
                 return Err(Error::Validation(
@@ -441,11 +457,34 @@ fn bucket_key(a: &Nfs4Ace) -> u8 {
     inherited * 2 + is_allow
 }
 
+/// Whether a child of this type inherits an ACE carrying `flags` - a port of
+/// ZFS's `zfs_ace_can_use` (`module/os/linux/zfs/zfs_acl.c`), which is the
+/// arithmetic this predicts and therefore the only definition that counts:
+///
+/// ```text
+/// if (S_ISDIR(obj_mode) && (iflags & ACE_DIRECTORY_INHERIT_ACE))
+///         return (1);
+/// else if (iflags & ACE_FILE_INHERIT_ACE)
+///         return (!(S_ISDIR(obj_mode) &&
+///             (iflags & ACE_NO_PROPAGATE_INHERIT_ACE)));
+/// return (0);
+/// ```
+///
+/// The `NO_PROPAGATE_INHERIT` term is load-bearing for exactly one input: a
+/// child **directory** whose parent ACE carries `FILE_INHERIT` without
+/// `DIRECTORY_INHERIT`. ZFS does not pass that one down - the ACE was meant
+/// for files, and the flag says "not to grandchildren" - and a predicate
+/// that answers on the two inheritable bits alone reports a grant the
+/// filesystem will not create. `validate` admits the combination (it refuses
+/// `NO_PROPAGATE_INHERIT` only with *no* inheritable flag set), so it is
+/// reachable. For a child file the two forms agree on every input.
 fn ace_is_inheritable(flags: Nfs4Flag, is_dir: bool) -> bool {
-    if is_dir {
-        flags.intersects(Nfs4Flag::INHERITABLE)
+    if is_dir && flags.contains(Nfs4Flag::DIRECTORY_INHERIT) {
+        true
+    } else if flags.contains(Nfs4Flag::FILE_INHERIT) {
+        !(is_dir && flags.contains(Nfs4Flag::NO_PROPAGATE_INHERIT))
     } else {
-        flags.contains(Nfs4Flag::FILE_INHERIT)
+        false
     }
 }
 
@@ -485,6 +524,102 @@ mod tests {
                 who_id,
             }],
         }
+    }
+
+    /// AUDIT and ALARM are representable here and unstorable there.
+    ///
+    /// `nfsace4i_to_acep` (`module/os/linux/zfs/zpl_xattr.c`) answers
+    /// `-EINVAL` for any ACE type but ALLOW and DENY, so writing one
+    /// reached the kernel and came back as a bare `EINVAL` from `setxattr`
+    /// with nothing naming the cause. The decoder still accepts them - only
+    /// the write path refuses - so an ACL read from elsewhere round-trips.
+    #[test]
+    fn validate_rejects_ace_types_zfs_will_not_store() {
+        for t in [Nfs4AceType::Audit, Nfs4AceType::Alarm] {
+            let mut acl = named_user(1000);
+            acl.aces[0].ace_type = t;
+            let e = acl.validate(false).expect_err("{t:?} must be refused");
+            assert!(
+                matches!(&e, Error::Validation(m) if m.contains("ALLOW")),
+                "the refusal must name why: {e}"
+            );
+        }
+        // The two ZFS does implement are untouched.
+        for t in [Nfs4AceType::Allow, Nfs4AceType::Deny] {
+            let mut acl = named_user(1000);
+            acl.aces[0].ace_type = t;
+            acl.validate(false).expect("ALLOW/DENY still validate");
+        }
+        // And decoding one is still fine - the refusal is the write path's.
+        let mut acl = named_user(1000);
+        acl.aces[0].ace_type = Nfs4AceType::Audit;
+        let bytes = acl.to_xattr().expect("encodes");
+        assert_eq!(
+            Nfs4Acl::from_xattr(&bytes).expect("decodes").aces[0].ace_type,
+            Nfs4AceType::Audit
+        );
+    }
+
+    /// `ace_is_inheritable` is a prediction of `zfs_ace_can_use`, so the
+    /// whole truth table is the property - a row that disagrees is an ACL
+    /// this crate says a child will have and the filesystem will not give
+    /// it.
+    ///
+    /// The row that used to disagree is a child **directory** whose parent
+    /// ACE carries `FILE_INHERIT` without `DIRECTORY_INHERIT` and with
+    /// `NO_PROPAGATE_INHERIT`: the ACE was meant for files and the flag
+    /// says "not to grandchildren", so ZFS does not pass it down.
+    #[test]
+    fn inheritance_matches_zfs_ace_can_use() {
+        use Nfs4Flag as F;
+        // The reference, transcribed from `zfs_ace_can_use`
+        // (`module/os/linux/zfs/zfs_acl.c`).
+        fn zfs(flags: Nfs4Flag, is_dir: bool) -> bool {
+            if is_dir && flags.contains(F::DIRECTORY_INHERIT) {
+                true
+            } else if flags.contains(F::FILE_INHERIT) {
+                !(is_dir && flags.contains(F::NO_PROPAGATE_INHERIT))
+            } else {
+                false
+            }
+        }
+        // Every combination of the four inheritance bits, both child types.
+        for bits in 0u32..16 {
+            let flags = F::from_bits_truncate(bits) & F::INHERIT_MASK;
+            for is_dir in [false, true] {
+                assert_eq!(
+                    ace_is_inheritable(flags, is_dir),
+                    zfs(flags, is_dir),
+                    "flags {flags:?} is_dir={is_dir}"
+                );
+            }
+        }
+        // And the row itself, spelled out, so a rewrite that keeps the
+        // loop green by changing both sides still has to face it.
+        let nope = F::FILE_INHERIT | F::NO_PROPAGATE_INHERIT;
+        assert!(
+            !ace_is_inheritable(nope, true),
+            "a FILE_INHERIT|NO_PROPAGATE ACE is not passed to a child dir"
+        );
+        assert!(
+            ace_is_inheritable(nope, false),
+            "but a child file still gets it"
+        );
+
+        // Reached through the public entry point, on an ACL `validate`
+        // admits - which is what makes the row reachable at all.
+        let mut acl = named_user(1000);
+        acl.acl_flags = Nfs4AclFlag::ACL_IS_DIR;
+        acl.aces[0].ace_flags = nope;
+        acl.validate(true).expect("validate admits this shape");
+        assert!(
+            acl.generate_inherited_acl(true).is_err(),
+            "predicted an inheritance ZFS does not perform"
+        );
+        assert!(
+            acl.generate_inherited_acl(false).is_ok(),
+            "a child file does inherit it"
+        );
     }
 
     /// ZFS masks SUCCESSFUL_ACCESS/FAILED_ACCESS out of the ACE flags it
