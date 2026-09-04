@@ -132,12 +132,12 @@ enum SlotState<V> {
     /// submission carrying the frame's callback owns the slot, so a
     /// sink's verdict waits for the callback route to settle it:
     /// [`Fire::fire`] with a real outcome supersedes it, and the
-    /// callback dropping unfired adopts it. Settling `Ready` straight
-    /// from the sink let a refusal whose arm rode a *different*
-    /// submission answer for an op still in flight - the real
-    /// completion then landed in a settled slot and was dropped,
-    /// `File` and all, closing a fresh descriptor under a caller told
-    /// a marked `EBUSY` for a create that ran.
+    /// callback dropping unfired adopts it. Do not settle `Ready`
+    /// straight from the sink: a refusal whose arm rode a *different*
+    /// submission would then answer for an op still in flight, and the
+    /// real completion lands in a settled slot and is dropped, `File`
+    /// and all - closing a fresh descriptor under a caller told a
+    /// marked `EBUSY` for a create that ran.
     Refused(V, Option<Waker>),
     /// Fired; the next poll takes it.
     Ready(V),
@@ -2015,10 +2015,10 @@ mod tests {
             register_personality(eng.ring.raw_fd())
                 .expect("register_personality"),
         );
-        // Armed here because refusals deliver on the wake drain now:
-        // a test that only ever refused used to need no ring traffic
-        // at all, and with no armed wake the poke would never surface
-        // as the TAG_WAKE completion `turn` drains on.
+        // Armed because refusals deliver on the wake drain: without
+        // an armed wake the poke never surfaces as the TAG_WAKE
+        // completion `turn` drains on, so a test that only ever
+        // refuses would wait for a delivery nothing can make.
         eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm wake");
         Some((eng, FsCore::new(8, OffloadBounds::default()), who))
     }
@@ -2437,10 +2437,9 @@ mod tests {
     /// A host refusal delivers the plain callback with its verdict at
     /// the wake drain: the marked `EBUSY` a full budget answers, with
     /// `None` still returned synchronously as "no timer to retract".
-    /// The refusal class used to be decided at every submit screen and
-    /// delivered nowhere - a plain-callback caller got nothing but its
-    /// continuation dropped, which for a request handler closed the
-    /// connection.
+    /// The synchronous `None` is not the report - a plain-callback
+    /// caller has no channel but the callback, and a dropped
+    /// continuation is a closed connection for a request handler.
     #[test]
     fn a_host_refusal_delivers_a_plain_callback_with_its_verdict() {
         let Some((mut eng, mut fs, _who)) = rig() else {

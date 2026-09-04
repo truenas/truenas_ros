@@ -140,21 +140,22 @@ pub(crate) type EmbeddedCb = Box<dyn FnOnce(FsDone, &mut FsConn<'_>)>;
 /// Where an op that never reached the ring reports *why*, and hands
 /// back what it was given.
 ///
-/// A submission refusal and a teardown both drop the callback
-/// unfired, which is the callback contract; firing one inline from a
-/// submit path would deliver a completion during a submission, and
-/// nothing here does that. A sink is not a callback: it runs no
-/// consumer continuation and submits nothing, it only fills a slot, so
-/// the distinction the callback form cannot make (`EBUSY` retry,
-/// `EINVAL` caller bug, teardown stop) survives for the consumers that
-/// can act on it.
+/// A sink is not a callback: it runs no consumer continuation and
+/// submits nothing, it only fills a slot. That is what lets it fire
+/// from inside a `submit_*` holding `&mut self` on the fs tables,
+/// where firing a callback would deliver a completion during a
+/// submission - so the distinction the callback form cannot make
+/// (`EBUSY` retry, `EINVAL` caller bug, teardown stop) reaches an
+/// awaited frame at the moment the refusal is decided, rather than
+/// waiting on the drain that delivers the callback.
 ///
-/// **It carries the payload too.** `EBUSY` from a full op table is the
-/// one refusal worth retrying, and a write whose buffers were dropped
-/// on the way out cannot be retried by anyone - the caller would have
-/// to keep a second copy of every payload against a failure the API
-/// tells it is transient. [`FsDone::into_bufs`] hands them back on this
-/// path exactly as it does on a completion.
+/// **The reason only; the payload rides the callback.** A marked
+/// refusal is queued whole ([`FsCore::refuse`]) - errno and buffers -
+/// and its delivery supersedes the parked reason, so the sink is
+/// filled with an empty payload and [`FsDone::into_bufs`] hands the
+/// real one back off the callback route. The one ending that resolves
+/// from the reason alone is a callback dropped unfired, which is
+/// teardown, where the payload is going nowhere either way.
 ///
 /// **`Rc`, and cloned rather than taken.** A multi-step call ([`chain`],
 /// [`walk`]) submits from a fresh facade at every step after the first,
@@ -643,10 +644,10 @@ pub(crate) struct FsCore {
     /// `&mut self` on the fs tables, so the callback cannot fire
     /// there; structurally it is an offload that resolved at submit,
     /// and it rides the same push-then-poke protocol to the same
-    /// drain. Dropping the callback instead was the old contract, and
-    /// it delivered nothing to a plain-callback caller but a closed
-    /// connection - the class was decided at every submit screen and
-    /// delivered nowhere.
+    /// drain. Queueing is what makes the class deliverable at all: a
+    /// screen that drops the callback instead hands a plain-callback
+    /// caller nothing but a closed connection, for a verdict decided
+    /// at eighteen submit screens and reported at none.
     ///
     /// Uncapped, like the task run queue and the offload registry:
     /// bound in-flight work upstream, at the request cap - a pass's
@@ -737,13 +738,22 @@ impl FsCore {
     /// deliver, `(errno, marked)`.
     ///
     /// The `Embedded`-with-owner pattern is the screen's boundary as
-    /// well as its key: an off-loop `FsWaiter::Channel` hold (a public
-    /// [`FsHandle::open`](super::FsHandle::open) carrying a deadline)
-    /// names no owner to meter, so it passes unscreened and its two
-    /// slots go uncounted by any cap. That tenancy is bounded by its
-    /// own shape instead - a `ReplyTo::Sync` reply pins one blocked
-    /// caller thread per outstanding off-loop hold - and metering it
-    /// would need an owner axis off-loop callers do not have.
+    /// well as its key: a hold that names no owner passes unscreened
+    /// and its two slots go uncounted by any cap. Two shapes reach
+    /// that - an off-loop `FsWaiter::Channel` hold (a public
+    /// [`FsHandle::open`](super::FsHandle::open) carrying a deadline),
+    /// and an `Embedded` hold submitted with `owner: None`.
+    ///
+    /// **Nothing meters them, and the only backstop is the table.**
+    /// [`FsHandle`](super::FsHandle) is `Clone`, so the number of
+    /// concurrent off-loop holds is the number of caller threads, and
+    /// the pair's own `op_free.len() < 2` check is what refuses them -
+    /// as `EBUSY`, to whoever asks next, including every owner that
+    /// *is* metered. The thread a `ReplyTo::Sync` reply blocks is not
+    /// a second bound either: it unblocks when the *open* answers,
+    /// while the guard slot is still parked to its own CQE. Metering
+    /// this needs an owner axis off-loop callers do not have, which is
+    /// why the exemption stands rather than being called a bound.
     fn refuse_wall_clock_hold(
         &self,
         waiter: &FsWaiter,
@@ -1230,7 +1240,7 @@ impl FsCore {
     /// caller (`EBUSY` on a full op table, or the staging error): there is no
     /// callback whose drop could report it, and a silently dropped pump read
     /// would strand its connection mid-body with nothing left to re-drive it.
-    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    ///
     /// `dest` is either a buffer this side supplies, or a group id to let
     /// the kernel pick one from a registered ring at completion.
     ///
@@ -1240,6 +1250,7 @@ impl FsCore {
     /// answers `-EINVAL` above one (`io_uring/rw.c`) - which this submit
     /// already satisfies. The kernel reads the iovec for its *length* and
     /// supplies the address itself, so `iov_base` is not dereferenced.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     pub(crate) fn submit_pump_read(
         &mut self,
         eng: &mut Engine,
@@ -1370,10 +1381,10 @@ impl FsCore {
     /// `ECANCELED` with no refusal mark - exactly what the same timer
     /// would have answered had it been in flight when the sweep ran -
     /// so a continuation keyed on that vocabulary winds down the same
-    /// way in both orderings. Delivered by the *drop*, not the sink:
-    /// [`deliver`] fires a sink only for marked refusals, so it is the
-    /// dropped callback's `Fire` that resolves an awaited frame as
-    /// `Gone`, which reads back as exactly that unmarked `ECANCELED`.
+    /// way in both orderings. Delivered by the callback, not the sink:
+    /// [`FsCore::refuse`] fires a sink only for *marked* refusals, so
+    /// an awaited frame reads this one off the queued callback's own
+    /// `FsDone`: `ECANCELED` with [`FsDone::was_refused`] false.
     pub(crate) fn submit_timeout(
         &mut self,
         eng: &mut Engine,
@@ -5484,11 +5495,10 @@ mod hybrid_tests {
     /// `on_done` rides the *second* submission and that one is
     /// refused, the future resolves with that submission's own marked
     /// verdict - the queued refusal fires the callback with its
-    /// `EBUSY` ([`FsCore::refuse`]) - rather than hanging or stealing
-    /// the first op's answer. Before refusals delivered, the dropped
-    /// callback resolved this as unmarked `ECANCELED`, teardown's
-    /// vocabulary, for a connection that was fine. `fut`'s rustdoc
-    /// states both halves.
+    /// `EBUSY` ([`FsCore::refuse`]) - rather than hanging, stealing
+    /// the first op's answer, or reading back as the unmarked
+    /// `ECANCELED` a task winds a live connection down on. `fut`'s
+    /// rustdoc states both halves.
     #[test]
     fn a_refused_second_submission_answers_for_itself() {
         let mut eng = Engine::new(256, 128).expect("engine");

@@ -558,9 +558,14 @@ pub enum SpecialFiles {
     /// when the deadline fires instead of parking its worker for good.
     /// An `Allow` open charges **two op slots** until it answers: its
     /// own and its guard's - so one can be refused `EBUSY` with a slot
-    /// still free - and the pair is a wall-clock hold, metered against
-    /// the owner's timer cap and refused for a swept owner exactly as
-    /// a timer arm is (`core::FsCore::armed_timers`).
+    /// still free. Submitted by an embedding host against a connection
+    /// it names, the pair is a wall-clock hold, metered against that
+    /// owner's timer cap and refused for a swept owner exactly as a
+    /// timer arm is (`core::FsCore::armed_timers`). Off the loop, over
+    /// an [`FsHandle`], there is no owner to meter it against: the
+    /// pair is bounded by the op table alone, so a caller that keeps
+    /// many handle threads in deadline opens at once can crowd out
+    /// metered work (`core::FsCore::refuse_wall_clock_hold`).
     ///
     /// For a tree the consumer owns outright, where no FIFO or device node
     /// *should* appear because nothing else writes to it. The deadline is
