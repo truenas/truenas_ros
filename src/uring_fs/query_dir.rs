@@ -139,6 +139,21 @@ pub struct QueryOptions {
     ///
     /// Requires [`EnrichSpec::STATX`] (the device number comes from `statx`);
     /// without it the option cannot be honoured and is ignored.
+    ///
+    /// **It fails open, and one of the three ways it can is not a
+    /// configuration choice.** The filter compares two device numbers and
+    /// keeps the entry whenever either is missing: with `STATX` unset (the
+    /// line above), with no device for the directory itself, and - the one
+    /// a caller does not opt into - when a *per-entry* `statx` fails while
+    /// `STATX` was requested. Each entry's `statx` is a ring op, and a full
+    /// op table answers a marked `EBUSY`, so under exactly the pressure
+    /// that makes a listing large a child dataset or a `.zfs/snapshot`
+    /// automount can appear as an ordinary entry in a listing whose caller
+    /// asked for one filesystem. [`DirEntry`] has no equivalent of
+    /// [`DirEntry::xattrs_incomplete`] here, so a caller cannot re-check
+    /// or refuse either. [`TreeOptions`](super::query_tree::TreeOptions)
+    /// surfaces this verbatim, so a subtree walk inherits it at every
+    /// level.
     pub same_device_only: bool,
     /// The `statx` mask requested for each entry when [`EnrichSpec::STATX`] is
     /// set. Defaults to [`StatxMask::BASIC_STATS`]; widen it to ask for fields
@@ -273,6 +288,16 @@ pub struct QueryDir {
     /// the first [`QueryDir::next`] and drained a `clump` at a time after.
     /// `None` until that first call; `Some(empty)` once exhausted.
     sorted: Option<VecDeque<(OsString, u8)>>,
+    /// A batch answered `Err`, so the listing is over.
+    ///
+    /// **Continuing past one would be the data loss the error exists to
+    /// report.** A clump's names are already off the `readdir` stream by the
+    /// time it can fail, and that stream has no rewind: calling
+    /// [`next`](QueryDir::next) again would resume at the *following* clump
+    /// and hand the caller the rest of the directory with a hole in it,
+    /// which reads as a complete listing. `FsIter` carries the same flag for
+    /// the same reason.
+    fatal: bool,
 }
 
 impl fmt::Debug for QueryDir {
@@ -298,11 +323,18 @@ impl QueryDir {
     // yields fallible batches the caller drives.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<crate::Result<Vec<DirEntry>>> {
-        match self.next_names() {
-            Ok(names) if names.is_empty() => None,
-            Ok(names) => Some(Ok(self.enrich(names))),
-            Err(e) => Some(Err(e)),
+        if self.fatal {
+            return None;
         }
+        let out = match self.next_names() {
+            Ok(names) if names.is_empty() => return None,
+            Ok(names) => self.enrich(names),
+            Err(e) => Err(e),
+        };
+        if out.is_err() {
+            self.fatal = true;
+        }
+        Some(out)
     }
 
     /// The next `clump` names to enrich. Streams straight off `readdir` under
@@ -453,9 +485,18 @@ impl QueryDir {
     /// discovery lists candidate names with `flistxattr` on the caller's own
     /// thread, then reads their values under `who` and keeps only the readable
     /// ones.
-    fn enrich(&self, names: Vec<(OsString, u8)>) -> Vec<DirEntry> {
+    fn enrich(
+        &self,
+        names: Vec<(OsString, u8)>,
+    ) -> crate::Result<Vec<DirEntry>> {
         let who = self.who;
         let spec = self.opts.spec;
+        // With the confinement asked for, an entry whose device cannot be
+        // determined is answered for rather than yielded
+        // ([`unknown_device_verdict`]). The refusal is collected here
+        // because the judgement sits inside an iterator pipeline.
+        let confined = self.opts.same_device_only;
+        let mut refused: Option<Errno> = None;
 
         // A descriptor is opened whenever anything below needs one. Where it
         // is, the entry's metadata is taken from that descriptor rather than
@@ -523,11 +564,11 @@ impl QueryDir {
         let opened: Vec<Opened> = requested
             .into_iter()
             .filter_map(|p| {
-                let statx = p.statx.and_then(pending_statx);
-                if statx.is_some()
-                    && self.opts.same_device_only
-                    && cross_dev(statx.as_ref())
-                {
+                // Only the early drop here; the verdict on an entry with no
+                // device is the assembly's, which is the one place that has
+                // seen every attempt to get one.
+                let (statx, statx_err) = split_statx(p.statx);
+                if statx.is_some() && confined && cross_dev(statx.as_ref()) {
                     return None;
                 }
                 let file = p.open.and_then(pending_file);
@@ -535,6 +576,7 @@ impl QueryDir {
                     name: p.name,
                     dtype: p.dtype,
                     statx,
+                    statx_err,
                     file,
                 })
             })
@@ -664,6 +706,7 @@ impl QueryDir {
                     name: p.name,
                     dtype: p.dtype,
                     statx: p.statx,
+                    statx_err: p.statx_err,
                     statx_pending,
                     file: p.file,
                     xattrs,
@@ -680,16 +723,32 @@ impl QueryDir {
         // discovered attribute `who` cannot read is dropped. The fd is held
         // until any refetch finishes, then dropped (each in-flight op keeps its
         // own reference).
-        reading
+        let entries: Vec<DirEntry> = reading
             .into_iter()
             .filter_map(|p| {
                 // The descriptor's own answer where there is one; the by-name
                 // answer only where no descriptor was opened.
-                let statx = p.statx_pending.and_then(pending_statx).or(p.statx);
-                // Deferred from the collection above for every entry that
-                // carried no by-name answer to test there.
-                if self.opts.same_device_only && cross_dev(statx.as_ref()) {
-                    return None;
+                let (fd_statx, fd_err) = split_statx(p.statx_pending);
+                let statx = fd_statx.or(p.statx);
+                let statx_err = fd_err.or(p.statx_err);
+                // **The one place an entry's device is judged**, because it
+                // is the only one that has seen every attempt to get it: the
+                // by-name `statx`, the descriptor's own, and the by-name
+                // retry when no descriptor opened. Judging at the collection
+                // phase instead reads "no metadata yet" as a failure for
+                // every entry whose device was always going to come from a
+                // descriptor - which is every entry, whenever the caller
+                // asked for xattrs, an ACL or a name list.
+                if confined && spec.contains(EnrichSpec::STATX) {
+                    if statx.is_none() {
+                        if let Some(e) = unknown_device_verdict(statx_err) {
+                            refused = refused.or(Some(e));
+                        }
+                        return None;
+                    }
+                    if cross_dev(statx.as_ref()) {
+                        return None;
+                    }
                 }
                 // A verdict from the metadata where there is any, and only
                 // then the readdir hint.
@@ -742,7 +801,16 @@ impl QueryDir {
                     xattrs_incomplete: incomplete,
                 })
             })
-            .collect()
+            .collect();
+        // After the pipelines, not inside them: the ops of a clump are all
+        // in flight, and abandoning the collection early would leave their
+        // completions - and the descriptors they carry - to be reaped by
+        // nobody. Every entry is awaited either way; only the verdict
+        // changes.
+        match refused {
+            Some(e) => Err(e.into()),
+            None => Ok(entries),
+        }
     }
 }
 
@@ -766,6 +834,10 @@ struct Opened {
     dtype: u8,
     /// The by-name answer, present only where no descriptor was opened.
     statx: Option<Statx>,
+    /// Why that answer is absent, where one was attempted. `None` both when
+    /// it succeeded and when none was issued - the assembly tells those
+    /// apart by whether it ends up with metadata.
+    statx_err: Option<Errno>,
     file: Option<File>,
 }
 struct Reading {
@@ -773,6 +845,8 @@ struct Reading {
     dtype: u8,
     /// The by-name answer, present only where no descriptor was opened.
     statx: Option<Statx>,
+    /// Why that answer is absent, where one was attempted.
+    statx_err: Option<Errno>,
     /// A `statx` of the descriptor this entry actually holds, issued with the
     /// xattr reads. Supersedes the by-name answer, which cannot be trusted to
     /// describe the same inode the open resolved to.
@@ -793,6 +867,58 @@ fn pending_statx(p: FsPending) -> Option<Statx> {
     let out = p.into_outcome().ok()?;
     out.res.ok()?;
     out.stat.map(|raw| Statx::from_raw(*raw))
+}
+
+/// Await an entry's `statx`, keeping the errno apart from the metadata.
+///
+/// `(None, None)` means no `statx` was issued for this entry at all - which
+/// is ordinary: the by-name one is skipped whenever a descriptor is opened,
+/// because the descriptor's own answer supersedes it.
+fn split_statx(p: Option<FsPending>) -> (Option<Statx>, Option<Errno>) {
+    let Some(p) = p else {
+        return (None, None);
+    };
+    let out = match p.into_outcome() {
+        Ok(out) => out,
+        Err(_) => return (None, Some(Errno::ECONNABORTED)),
+    };
+    match out.res {
+        Ok(_) => (out.stat.map(|raw| Statx::from_raw(*raw)), None),
+        Err(e) => (None, Some(e)),
+    }
+}
+
+/// What a confined listing does with an entry whose device it could not
+/// read: drop this one, or fail the batch.
+///
+/// **`same_device_only` is a confinement, and the filter behind it keeps an
+/// entry whose device is unknown.** It exists to drop what lives on another
+/// filesystem - on ZFS a child dataset or a `.zfs/snapshot` automount - so a
+/// listing that silently includes one it could not check is exactly what the
+/// caller asked not to get. With the option set, an unresolved `statx` is
+/// therefore answered for.
+///
+/// The split is `query_tree`'s `is_subtree_skip`, deliberately: skip only
+/// what has nothing left to list, surface everything else, because a partial
+/// listing that reads as complete is data loss for whatever is built on it.
+///
+/// * `EACCES`/`EPERM` - this identity may not see it, which is the
+///   per-identity behaviour the rest of this module already has (an xattr
+///   `who` cannot read is dropped, not reported).
+/// * `ENOENT` - the entry went away between `readdir` and the `statx`. A
+///   walk over a live tree hits this routinely.
+/// * Anything else - the marked `EBUSY` of a full op table above all, which
+///   is reached under exactly the pressure that makes a listing large - is
+///   the filter failing, and the caller is told. `EBUSY` there is the
+///   documented retryable refusal.
+/// * No errno at all: nothing was issued where something should have been.
+///   Not "nothing to list", so it surfaces too.
+fn unknown_device_verdict(err: Option<Errno>) -> Option<Errno> {
+    match err {
+        Some(Errno::EACCES | Errno::EPERM | Errno::ENOENT) => None,
+        Some(e) => Some(e),
+        None => Some(Errno::ECONNABORTED),
+    }
 }
 
 /// Await an `open` twin: the opened [`File`] on success, else `None`.
@@ -1129,6 +1255,7 @@ pub fn query_directory(
             ..opts
         },
         sorted: None,
+        fatal: false,
     })
 }
 
@@ -1438,6 +1565,80 @@ fn copy_range_rw(
         remaining -= r as u64;
     }
     Ok(total)
+}
+
+#[cfg(all(test, not(loom)))]
+mod confinement_tests {
+    use super::{split_statx, unknown_device_verdict};
+    use crate::errno::Errno;
+    use crate::uring_fs::{FsOutcome, FsPending};
+
+    fn split(res: Result<i32, Errno>) -> Option<Errno> {
+        split_statx(Some(FsPending::resolved(FsOutcome::new(
+            res,
+            Vec::new(),
+            None,
+            None,
+        ))))
+        .1
+    }
+
+    /// `same_device_only` is a confinement, and the filter behind it keeps
+    /// an entry whose device it could not read. So with the option set, an
+    /// unresolved `statx` has to be answered for.
+    ///
+    /// The split is `query_tree`'s `is_subtree_skip`, deliberately: skip
+    /// only what has nothing left to list, surface everything else, because
+    /// a partial listing that reads as complete is data loss for whatever
+    /// is built on it.
+    #[test]
+    fn an_unreadable_device_is_answered_for_the_way_query_tree_would() {
+        // Nothing left to list: the entry alone goes, which is the
+        // per-identity behaviour the rest of this module already has.
+        for e in [Errno::EACCES, Errno::EPERM, Errno::ENOENT] {
+            assert_eq!(
+                unknown_device_verdict(Some(e)),
+                None,
+                "{e} should drop the entry, not fail the listing"
+            );
+        }
+
+        // The filter failing: surfaced, with its own errno. `EBUSY` is the
+        // marked refusal of a full op table - reached under exactly the
+        // pressure that makes a listing large - and is the documented
+        // retryable one.
+        for e in [Errno::EBUSY, Errno::EIO, Errno::ENOTDIR] {
+            assert_eq!(
+                unknown_device_verdict(Some(e)),
+                Some(e),
+                "{e} should fail the listing rather than admit an entry \
+                 whose filesystem is unknown"
+            );
+        }
+
+        // No errno at all where a device was owed: not "nothing to list".
+        assert_eq!(
+            unknown_device_verdict(None),
+            Some(Errno::ECONNABORTED),
+            "an entry that produced no answer and no reason must surface"
+        );
+    }
+
+    /// The errno has to survive the await, or every verdict above is taken
+    /// on `None` and the listing fails for reasons it should have skipped.
+    #[test]
+    fn splitting_a_statx_keeps_the_errno_apart_from_the_metadata() {
+        for e in [Errno::EACCES, Errno::EBUSY, Errno::ENOENT] {
+            assert_eq!(split(Err(e)), Some(e));
+        }
+        // A success carries no errno - and no pad on this outcome, which is
+        // what makes the "no metadata, no reason" arm above reachable at
+        // all.
+        assert_eq!(split(Ok(0)), None);
+        // And an entry for which none was issued reports neither.
+        let (st, err) = split_statx(None);
+        assert!(st.is_none() && err.is_none());
+    }
 }
 
 #[cfg(all(test, not(loom)))]

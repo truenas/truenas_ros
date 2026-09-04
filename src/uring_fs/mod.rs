@@ -1349,6 +1349,15 @@ impl FsPending {
         self.rx.recv().map_err(|_| Errno::ECONNABORTED.into())
     }
 
+    /// A pending already resolved to `outcome`, for tests that need to drive
+    /// an awaiter's verdict without a ring behind it.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn resolved(outcome: FsOutcome) -> FsPending {
+        let (tx, rx) = mpsc::channel();
+        tx.send(outcome).expect("the receiver is right here");
+        FsPending { rx }
+    }
+
     /// Block until a [`start_open`](FsHandle::start_open) completes and take
     /// its [`File`].
     ///
