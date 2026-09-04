@@ -76,10 +76,18 @@
 //!   would shield another class's dead high-water buffers forever. A
 //!   free entry that serves nothing for [`SHRINK_AFTER`] hot
 //!   observations is evicted at the rebalance, licence and all, so
-//!   resident memory tracks the *live* working set within a few
-//!   windows of a workload shift. Quiet windows never age entries —
-//!   the halving path owns that regime — so a workload that merely
-//!   pauses keeps its warm pool.
+//!   *retained capacity* tracks the live working set within a few
+//!   windows of a workload shift. Capacity, not resident pages: the
+//!   two are named apart throughout this module because they are
+//!   taken by different instruments (see [`OVERSIZE_SERVE`]), and
+//!   dropping a `Vec` returns pages only as far as the allocator
+//!   unmaps them — glibc raises `M_MMAP_THRESHOLD` to the size of
+//!   each mmapped block it frees, so a pool cycling multi-MiB bodies
+//!   migrates to arena allocations whose `free()` trims nothing.
+//!   Retained capacity is the figure this pool moves and the upper
+//!   bound resident can fall to; it is not a measurement of resident.
+//!   Quiet windows never age entries — the halving path owns that
+//!   regime — so a workload that merely pauses keeps its warm pool.
 //!
 //! # The loop is advisory on the consumer side
 //!
@@ -186,10 +194,17 @@ impl BodyPool {
     /// `retained` with it. The one place a serve is counted as heat.
     fn take_fit(&mut self, min_cap: usize) -> Option<Vec<u8>> {
         // `free` is sorted by capacity, so the first entry covering the
-        // ask is the best fit and finding it is a binary search — the
+        // ask is the best fit and *finding* it is a binary search — the
         // linear best-fit walk cost ~500 ns per claim once a storm had
         // diversified the list into hundreds of entries, against 7 ns
-        // for the LIFO pop it replaced.
+        // for the LIFO pop it replaced. Taking it is still O(n): the
+        // `remove` below memmoves, as `give_held`'s `insert` does, so
+        // the pair is a win above ~100 entries and costs +18 to +27 ns
+        // per body below it (n=8: 7.4→25.7 ns; n=32: 17.8→26.5;
+        // n=1024: 459→318). Bucketing `free` by `capacity().ilog2()`
+        // would be O(1) both ways with best-fit-near-size and
+        // per-entry ageing intact; it is not worth the shape yet at
+        // those absolutes.
         let i = self.free.partition_point(|(v, _)| v.capacity() < min_cap);
         let cap = self.free.get(i)?.0.capacity();
         if cap > min_cap.saturating_mul(OVERSIZE_SERVE).max(OVERSIZE_FLOOR) {
@@ -293,6 +308,33 @@ impl BodyPool {
     /// storm long gone cannot inflate the pool a later one holds — but
     /// held licences do: they ride the reactor claims that recorded
     /// them, whose resolution is deterministic.
+    ///
+    /// **Its cost scales with the entry count, and the entry count is
+    /// bounded in bytes, not in entries** (deliberately — see the
+    /// pool's construction in `net::server`). The ceiling is `budget /
+    /// smallest retained capacity`, so an [`OVERSIZE_FLOOR`]-sized
+    /// inventory reaches ~1024 entries at the default budget and one
+    /// of 4 KiB bodies — [`BodyRecycler::claim`] is public and takes
+    /// any `min_cap` — reaches 16x that.
+    ///
+    /// The walk itself is cheap; the eviction is a `free()` per entry
+    /// it drops, inline on the reactor thread. Measured here, release,
+    /// best of seven, 64 MiB of budget spread over `n` touched entries,
+    /// non-evicting against whole-inventory-evicting:
+    ///
+    /// | n | entry | quiet walk | evicting |
+    /// |---|---|---|---|
+    /// | 21 | 3.0 MiB | 0.1 µs | 2.7 µs |
+    /// | 1024 | 64 KiB | 4.1 µs | 219 µs |
+    /// | 4096 | 16 KiB | 16.2 µs | 845 µs |
+    /// | 16384 | 4 KiB | 65.8 µs | 3.2 ms |
+    ///
+    /// Big entries are mmap-backed and unmap in one call each, which is
+    /// why the *largest* inventory by bytes is the cheapest to evict
+    /// and a diversified small-body one is not. Once per 5 s tick, and
+    /// it is deallocation the pool owes either way — but at the top of
+    /// that table it is a reactor stall, which is the cost of leaving
+    /// the entry count unbounded.
     pub(crate) fn rebalance(&mut self) {
         self.missed_bytes = 0;
         if self.served > 0 {
@@ -595,10 +637,10 @@ mod tests {
     /// Under load, each retained buffer earns its keep: one that
     /// serves nothing for SHRINK_AFTER hot observations is evicted -
     /// with its licence, so the target follows - while the entries
-    /// traffic actually cycles stay warm. Whole-pool heat used to
-    /// shield exactly the stranded high-water buffer a shifted
-    /// workload left behind; whole-pool quiet still takes the halving
-    /// path, so a pause is not an eviction.
+    /// traffic actually cycles stay warm. Per entry, because
+    /// whole-pool heat shields exactly the stranded high-water buffer
+    /// a shifted workload leaves behind; whole-pool quiet still takes
+    /// the halving path, so a pause is not an eviction.
     #[test]
     fn a_buffer_that_stops_serving_ages_out_under_load() {
         let mut p = BodyPool::new(64 * MIB);
