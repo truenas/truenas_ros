@@ -140,7 +140,13 @@ impl<U> ConnTable<U> {
         self.slots.len()
     }
 
-    /// Connections currently `Serving`.
+    /// Connections holding a `Connection`: `Serving`, plus `Detaching` and
+    /// `Detached`.
+    ///
+    /// The wider meaning is load-bearing and easy to "correct" away: the
+    /// graceful drain's completion test reads this, and a detached socket is
+    /// still a worker's to finish with. Narrow it to `Serving` and the drain
+    /// tears the ring down under one.
     pub(crate) fn active(&self) -> u32 {
         self.active
     }

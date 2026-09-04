@@ -253,15 +253,26 @@ impl RecvBuf {
     }
 
     /// Whether an armed recv must acquire a buffer - pool-backed, none
-    /// held, and nothing accumulated. The submit answers this by setting
-    /// `IOSQE_BUFFER_SELECT`.
+    /// held, and no destination of its own. The submit answers this by
+    /// setting `IOSQE_BUFFER_SELECT`.
     ///
-    /// The `filled` term is what distinguishes a connection waiting to
-    /// acquire from one that has [`promoted`](RecvBuf::promote_for) off a
-    /// buffer mid-message: both are pooled and hold no claim, but the second
-    /// is accumulating into `owned` and a fresh claim would orphan it.
+    /// The last two terms distinguish a connection waiting to acquire from
+    /// one that has [`promoted`](RecvBuf::promote_for) off a buffer: both
+    /// are pooled and hold no claim, but the second has storage of its own
+    /// and a fresh claim would orphan it. **`filled` alone cannot say so.**
+    /// A promote fires with nothing accumulated whenever the previous
+    /// message was consumed without releasing the claim - a spliced body -
+    /// and `submit_recv` decides the select *before* it promotes, so
+    /// answering `true` behind one grants a length `reserve_at` never
+    /// allocates and `write_ptr` then hands the kernel a null destination
+    /// on an SQE carrying no buffer select. The storage itself is the mark
+    /// that survives: `promote_for` sizes it, and `release`, `take_owned`
+    /// and `forfeit_owned` are the three sites that take it back to empty.
     pub(crate) fn needs_buffer(&self) -> bool {
-        self.pooled && self.claim.is_none() && self.filled == 0
+        self.pooled
+            && self.claim.is_none()
+            && self.filled == 0
+            && self.owned.is_empty()
     }
 
     /// Adopt the buffer a completion selected.
@@ -417,6 +428,19 @@ impl RecvBuf {
         self.owned.extend_from_slice(unsafe {
             std::slice::from_raw_parts(c.ptr, self.filled)
         });
+        // Size the destination here rather than leave it to the `resize`
+        // `reserve_at` performs a beat later; it is the same call, and
+        // doing it here is what makes non-empty storage the mark
+        // [`RecvBuf::needs_buffer`] reads. A promote that copies nothing -
+        // the read past a spliced body's consume, which keeps the claim -
+        // would otherwise leave `owned` empty and that predicate true.
+        // Only ever grows, and the assert is the reason: `at` is the
+        // caller's idea of what is buffered and the copy above uses
+        // `filled`, so a caller that disagreed with itself would resize
+        // *below* the bytes just copied. The one production caller reads
+        // `at` straight off `buffered()`, which is `filled`.
+        debug_assert_eq!(at, self.filled, "a promote at the wrong offset");
+        self.owned.resize(at.saturating_add(want), 0);
         self.claim = None;
         Some(c)
     }
@@ -856,6 +880,16 @@ pub(crate) struct Connection<U> {
     // expiry re-arms if it dropped (progress) or cancels the splice if unchanged
     // (stall).
     pub splice_deadline_armed: bool,
+    /// Watchdogs retired but not yet reaped. A retire clears the flag and
+    /// only *stages* the cancel, so the old timer's `-ETIME` can already be
+    /// posted while the successor is armed inside the same dispatch - and
+    /// `user_data` carries the *slot's* generation, not the timer's, so the
+    /// two are bit-identical. The flag is a boolean identity for a
+    /// population that is not always one; this is the count that tells them
+    /// apart. Each retired timer owes exactly one completion, and they come
+    /// back in order: the successor is armed later with the same duration,
+    /// so it cannot expire first.
+    pub splice_deadline_owed: u32,
     pub splice_watermark: usize,
     /// `splice_remaining` when the current body opened, or when its last
     /// receipt budget was renewed, so an expiry can tell a window's worth of
@@ -916,6 +950,10 @@ pub(crate) struct Connection<U> {
     // delivery or by the expiry itself, and nowhere else.
     #[cfg(feature = "net-server")]
     pub receipt_deadline_armed: bool,
+    /// Budgets retired but not yet reaped - see
+    /// [`Connection::splice_deadline_owed`], which this mirrors exactly.
+    #[cfg(feature = "net-server")]
+    pub receipt_deadline_owed: u32,
     // A push overflowed `max_send_backlog` while the connection was detached
     // (its worker owns the raw stream, so it cannot be torn down mid-detach):
     // evict with `SendBacklog` when the worker resumes it.
@@ -1033,6 +1071,7 @@ impl<U> Connection<U> {
             splice_fd: -1,
             splice_remaining: 0,
             splice_deadline_armed: false,
+            splice_deadline_owed: 0,
             splice_watermark: 0,
             receipt_window_mark: 0,
             send_queue: VecDeque::new(),
@@ -1053,6 +1092,8 @@ impl<U> Connection<U> {
             recv_retry_armed: false,
             #[cfg(feature = "net-server")]
             receipt_deadline_armed: false,
+            #[cfg(feature = "net-server")]
+            receipt_deadline_owed: 0,
             evict_on_resume: false,
             close_on_flush: None,
             #[cfg(feature = "net-client")]
@@ -1920,12 +1961,24 @@ impl<U> Connection<U> {
         // Whatever close a discarded body carried is subsumed by the
         // `close_on_flush` that brought us here.
         self.deferred_close = false;
+        let mut bytes = 0usize;
         for item in std::mem::take(&mut self.next_file_pending) {
             match item {
+                // A deferred body has queued no bytes yet - a file tail is
+                // queued a chunk at a time, and this one never started.
                 PendingItem::File(_) => charged += 1,
                 // A reply retires on its final segment, so only that one
-                // carries a charge; `Push` segments carry none.
+                // carries a charge; `Push` segments carry none. The bytes
+                // are `enqueue`'s, which counts them into `queued_bytes`
+                // before the diversion holds the item back, so they go home
+                // here for the same reason the `outstanding` charges do -
+                // nothing will flush to credit them, and `queued_bytes` is
+                // what the send-backlog check reads. (Never a pooled
+                // buffer: `enqueue_file_chunk` is the only pooled queuer
+                // and it bypasses the diversion, so there is no id owed
+                // back with them.)
                 PendingItem::Pdu(pdu) => {
+                    bytes += pdu.bytes.len();
                     if matches!(pdu.kind, SendKind::ReplyLast) {
                         charged += 1;
                     }
@@ -1933,6 +1986,7 @@ impl<U> Connection<U> {
             }
         }
         self.outstanding = self.outstanding.saturating_sub(charged);
+        self.queued_bytes = self.queued_bytes.saturating_sub(bytes);
     }
 
     /// Whether any PDU is queued (or being sent).
@@ -2559,6 +2613,51 @@ mod tests {
         assert!(!c.has_pending_send());
     }
 
+    /// Dropping a stranded body returns the followers' bytes as well as
+    /// their `outstanding` charges.
+    ///
+    /// `enqueue` counts a diverted PDU into `queued_bytes` before the
+    /// diversion holds it back - deliberately, so the send-backlog check
+    /// sees it - and nothing will flush to credit it once the flush-close
+    /// discards it. Left behind, `queued_bytes` reports bytes the
+    /// connection is not holding, which is the same class of leak the
+    /// `outstanding` charges beside it are returned by hand to avoid.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    #[test]
+    fn dropping_a_stranded_body_returns_the_followers_bytes() {
+        let dev_null = || {
+            let fd: std::os::fd::OwnedFd =
+                std::fs::File::open("/dev/null").expect("open").into();
+            crate::uring_fs::File::new(crate::sync::Arc::new(fd))
+        };
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        c.install_file_tail(dev_null(), 0, 20);
+        // A push arrives mid-tail (released when the tail retires), then a
+        // second `ReplyFile`, then another push behind *that* - which is
+        // what stays held once the tail hands on.
+        c.enqueue_push(vec![b'p'; 7]);
+        c.defer_file_reply(PendingFile {
+            head: Vec::new(),
+            file: dev_null(),
+            offset: 0,
+            len: 40,
+            close: false,
+        });
+        c.enqueue_push(vec![b'q'; 5]);
+        assert_eq!(c.queued_bytes(), 12, "diverted, and still counted");
+
+        c.finish_file_tail();
+        assert_eq!(c.queued_bytes(), 12, "the first push is on the queue");
+
+        // Flush-closing: the deferred body and everything behind it go.
+        c.drop_queued_file_reply();
+        assert_eq!(
+            c.queued_bytes(),
+            7,
+            "the dropped follower's bytes were never returned"
+        );
+    }
+
     /// A short read continues from the offset it REACHED. The declared length
     /// is a promise about the body's size, not about how many bytes any one
     /// read returns, so the tail's cursor tracks the count actually delivered.
@@ -2776,6 +2875,57 @@ mod tests {
         rb.drain_front(4);
         assert!(!rb.write_leased.get(), "the lease flag must be cleared");
         assert_eq!(rb.len(), 8, "and nothing drained from a buffer it lacks");
+    }
+
+    /// A promote that copies nothing still has to leave the connection
+    /// reading into the storage it just installed.
+    ///
+    /// `submit_recv` decides the buffer select first, off a claim still
+    /// held, so the SQE goes out with no `IOSQE_BUFFER_SELECT`; the
+    /// promote then hands that claim back. If `needs_buffer` answers
+    /// `true` behind it, `reserve_at` grants the whole read without
+    /// allocating - past the `granted < want && exact` refusal, which is
+    /// documented as unreachable for exactly this reason - and
+    /// `write_ptr` hands the kernel address 0 with `MSG_WAITALL` and
+    /// nothing to select. `access_ok(NULL, n)` passes on x86_64, so the
+    /// copy faults and the connection dies `RecvError(EFAULT)` with
+    /// nothing in either profile to say why.
+    ///
+    /// Reachable past a spliced body: `on_splice_recv_complete` consumes
+    /// the header without releasing the claim, so the next exact read
+    /// larger than one pool buffer promotes with nothing accumulated.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_promote_that_copies_nothing_still_has_a_destination() {
+        let mut rb = RecvBuf::default();
+        rb.set_pooled();
+        let buf = Box::leak(vec![0u8; 64].into_boxed_slice());
+        rb.install(RecvClaim {
+            bid: 5,
+            ptr: buf.as_mut_ptr(),
+            cap: 64,
+        });
+        // A spliced body's consume: the claim stays, nothing is in it.
+        assert_eq!(rb.len(), 0, "the header was consumed");
+        assert!(
+            !rb.needs_buffer(),
+            "a held claim needs no buffer - the select decision the \
+             submit takes before it promotes"
+        );
+
+        let want = 4096;
+        let claim = rb
+            .promote_for(0, want, || None)
+            .expect("the read outgrows the claim");
+        assert_eq!(claim.bid, 5, "the buffer goes back to the pool");
+        assert!(
+            !rb.needs_buffer(),
+            "the promoted storage is this read's destination, and the \
+             SQE has already been decided to carry no buffer select"
+        );
+        assert_eq!(rb.reserve_at(0, want), want, "the whole read is granted");
+        assert!(!rb.write_ptr(0).is_null(), "and it has somewhere to land");
+        assert!(rb.armed_within(0, want), "inside what the promote sized");
     }
 
     /// A licence outlives the `pooled` flag that let it be taken, so the
