@@ -39,16 +39,16 @@
 //! [`Cookie::truncate`]-ing to that `depth` and rebuilding.
 
 use crate::AT_FDCWD;
-use crate::errno::{self, Errno, retry_on_eintr};
+use crate::errno::{Errno, retry_on_eintr};
 use crate::error::{Error, Result};
-use crate::fd::owned_from_raw;
+use crate::fd::dup_cloexec;
 use crate::mount::{StatmountMask, statmount};
 use crate::sync_fs::dir::{Dir, DirEntry};
 use crate::sync_fs::{
     AtFlags, OFlag, OpenHow, ResolveFlag, Statx, StatxMask, openat2, statx,
 };
 use std::ffi::{OsStr, OsString};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -430,6 +430,39 @@ impl FsIter {
     /// Open and (if a directory) descend into a single directory entry.
     /// Returns `Ok(None)` for entries that are silently pruned.
     fn process(&mut self, dirent: &DirEntry) -> Result<Option<Entry>> {
+        // SECURITY: a `readdir` name is data, and the only screen above
+        // this is `is_dot` - an equality test against exactly `.` and
+        // `..`, which `../outside`, `a/b` and `a/../..` all pass.
+        // Nothing in `ITER_RESOLVE` refuses a `..` *component*:
+        // `RESOLVE_NO_SYMLINKS` governs symlinks
+        // (`fs/namei.c:1944`), and `follow_dotdot` refuses only under
+        // `LOOKUP_BENEATH` (`:2107-2108`), which is not set, while
+        // `RESOLVE_NO_XDEV` stays satisfied for as long as the escape
+        // stays on this filesystem. So `openat2` resolves the name, the
+        // entry is statx'd and btime-filtered as if it belonged, and a
+        // directory is pushed as a frame at `parent.join(name)` - the
+        // walk continues outside its root, and `Entry::name` hands the
+        // same bytes to a consumer whose own `*at` calls honour no
+        // RESOLVE flag. That is why `mkdirat`, `unlinkat`, `renameat2`
+        // and `linkat` all screen with this rule.
+        //
+        // `RESOLVE_BENEATH` is deliberately *not* the fix. Its refusal
+        // is `EXDEV`, which the mount-crossing arm below answers by
+        // re-opening with `RESOLVE_NO_SYMLINKS` alone - so it would
+        // route the escape through the one arm that drops the
+        // confinement, and a single component cannot escape a dirfd
+        // anyway once this screen is in front of it.
+        //
+        // Refused, not skipped: a listing that silently drops entries
+        // reads as complete, which is data loss for the recursive
+        // copy or delete built on it - the line `is_subtree_skip`
+        // settles for `query_tree`. The trigger is an untrustworthy
+        // `readdir` (FUSE, a corrupt directory, a foreign image),
+        // which this walk's mount-source check does not cover: it pins
+        // the dataset name, not the filesystem's honesty.
+        if crate::path::component_defect(dirent.name.as_bytes()).is_some() {
+            return Err(Errno::EINVAL.into());
+        }
         let is_dir_hint = dirent.d_type == libc::DT_DIR;
         let mut is_lnk = dirent.d_type == libc::DT_LNK;
         // A FIFO/socket/device that `readdir` already identified: open it
@@ -843,14 +876,6 @@ fn btime_skips(st: &Statx, cutoff: i64) -> Option<bool> {
     Some(st.btime().sec > cutoff)
 }
 
-fn dup_cloexec(fd: BorrowedFd<'_>) -> errno::Result<OwnedFd> {
-    let raw = retry_on_eintr(|| unsafe {
-        libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0)
-    })?;
-    // SAFETY: `fcntl(F_DUPFD_CLOEXEC)` returned a fresh owned fd.
-    Ok(unsafe { owned_from_raw(raw as RawFd) })
-}
-
 /// Descend `stack` (initially just the root frame) along a resume `cookie`,
 /// re-opening and inode-validating each saved directory level so iteration
 /// continues inside the deepest one. Intermediate directories are consumed from
@@ -877,7 +902,18 @@ fn restore_stack(
                     });
                 }
             };
-            if is_dot(&dirent.name) || dirent.d_ino != want {
+            // A name that is not a single component can never be the
+            // saved child - `process` refuses one, so the walk never
+            // descended into it - and it must not be opened here
+            // either, for the reason stated there. Skipped rather than
+            // refused: this loop is searching for one inode, not
+            // listing, and every entry it passes over is consumed
+            // either way.
+            if is_dot(&dirent.name)
+                || crate::path::component_defect(dirent.name.as_bytes())
+                    .is_some()
+                || dirent.d_ino != want
+            {
                 continue;
             }
             // The inode matches; confirm it is really the saved directory (not
@@ -1015,6 +1051,57 @@ mod tests {
             d_ino: 0,
             name: OsString::from(name),
         })
+    }
+
+    /// **SECURITY.** A `readdir` name is data the filesystem supplies,
+    /// and the walk's only screen above `process` is `is_dot` - an
+    /// equality test against exactly `.` and `..`.
+    ///
+    /// The kernel premise is asserted first, because the screen is
+    /// worth exactly what it prevents: `ITER_RESOLVE` does not refuse a
+    /// `..` component, so `openat2` resolves `../outside` from the
+    /// walk's own anchor and the entry would be statx'd, filtered and
+    /// - as a directory - descended into, all outside the root.
+    #[test]
+    fn a_readdir_name_that_is_not_one_component_is_refused() {
+        let dir = crate::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(dir.path().join("outside"), b"secret").unwrap();
+
+        // The premise. Not a property under test - a fact about the
+        // flags, and the reason a name cannot be handed to `openat2`
+        // unscreened.
+        let anchor = openat2(
+            AT_FDCWD,
+            &root,
+            how(DIR_OFLAGS, ResolveFlag::RESOLVE_NO_SYMLINKS),
+        )
+        .unwrap();
+        assert!(
+            openat2(
+                anchor.as_fd(),
+                OsStr::new("../outside"),
+                how(OFlag::O_RDONLY | OFlag::O_NOFOLLOW, ITER_RESOLVE),
+            )
+            .is_ok(),
+            "NO_XDEV|NO_SYMLINKS is not a confinement against `..`"
+        );
+
+        let mut it =
+            FsIterBuilder::new(&root, fs_source(&root)).build().unwrap();
+        for name in ["../outside", "sub/../../outside", "sub/x", ""] {
+            assert!(
+                matches!(
+                    process_unknown(&mut it, name),
+                    Err(Error::Errno(Errno::EINVAL))
+                ),
+                "{name:?} reached openat2"
+            );
+        }
+        // And an ordinary name is untouched.
+        assert!(process_unknown(&mut it, "sub").unwrap().is_some());
     }
 
     #[test]
