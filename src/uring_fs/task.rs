@@ -3143,6 +3143,75 @@ mod tests {
         assert!(again.is_some(), "the owner's budget came back whole");
     }
 
+    /// A retraction's verdict is the caller's ask, not the race. The
+    /// kernel delists a timeout before posting `-ETIME`
+    /// (`io_timeout_fn`, `io_uring/timeout.c:254-276`), so a cancel
+    /// staged after the fire reaches nothing and the expiry stands -
+    /// and `submit_cancel` is best-effort, so it may never have been
+    /// staged at all. Reported as `Ok(0)` that reads as "the deadline
+    /// arrived" and runs the consumer's timeout handler for work it
+    /// had already finished. Driven with the `-ETIME` CQE demonstrably
+    /// in hand before the retraction, so the raced ordering is the one
+    /// under test rather than one the scheduler might supply.
+    #[test]
+    fn a_retracted_timer_that_already_expired_is_not_an_expiry() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+        let seen: Rc<StdCell<Option<(bool, bool)>>> =
+            Rc::new(StdCell::new(None));
+        let out = Rc::clone(&seen);
+        let t = {
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            conn.timeout(Duration::from_millis(1), move |d, _c| {
+                out.set(Some((
+                    matches!(
+                        d.result(),
+                        Err(crate::Error::Errno(Errno::ECANCELED))
+                    ),
+                    d.was_refused(),
+                )));
+            })
+        }
+        .expect("armed");
+        eng.ring.submit().expect("submit");
+
+        // Reap the expiry without routing it: the entry stays in
+        // flight, so the retraction below is the ordinary one a caller
+        // makes - and the answer it will be given is already posted.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let expiry = loop {
+            assert!(Instant::now() < deadline, "the timer never expired");
+            if let Some(cqe) = eng.ring.reap() {
+                break cqe;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        eng.inflight = eng.inflight.saturating_sub(1);
+        assert_eq!(expiry.res, -libc::ETIME, "expected the expiry");
+
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, Some((1, 1)));
+            conn.cancel_timeout(t);
+        }
+        let (tag, slot, gen32) = unpack_raw(expiry.user_data);
+        let reaped = fs.on_cqe(&mut eng, tag, slot, gen32, expiry.res);
+        deliver_embedded(&mut fs, &mut eng, reaped);
+
+        assert_eq!(
+            seen.get(),
+            Some((true, true)),
+            "a retracted timer answers as the cancellation it asked \
+             for, never as an expiry"
+        );
+        assert_eq!(
+            fs.armed_timers_for_test(&(1, 1)),
+            0,
+            "and the cap accounting still balances"
+        );
+        assert_eq!(fs.retiring_timers_for_test(&(1, 1)), 0);
+    }
+
     /// A connection the sweep has passed may not park an `Allow` pair
     /// on the table, for the reason its timers are refused: two slots
     /// held for wall-clock time, with nothing left to retract them.

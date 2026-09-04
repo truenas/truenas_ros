@@ -1024,6 +1024,17 @@ impl FsCore {
                     // and one failed guard stage is not the reactor
                     // going away. The guard's slot frees (its waiter
                     // is `None`, so the fail delivers to nobody).
+                    //
+                    // The ask is all this arm can promise. It is
+                    // reached *because* a stage just failed, and the
+                    // cancel goes to the same ring
+                    // ([`FsCore::submit_cancel`] is best-effort), so
+                    // where the failure is the SQ being full against a
+                    // CQ that has stopped draining, the open really
+                    // does run to its own ending with an io-wq worker
+                    // parked in it. Teardown is the recovery for that;
+                    // nothing here can stage its way out of a ring
+                    // that will not take a submission.
                     self.fail_op(eng, guard_slot, Errno::ECANCELED);
                     self.retract_op(eng, TAG_OPEN, op_slot, open_gen);
                 }
@@ -1428,6 +1439,14 @@ impl FsCore {
     /// accounting hangs off the first ask cannot fire twice. `false`
     /// for a stale generation, a reissued slot, a tag mismatch, or an
     /// already-marked entry, all of which must stay inert.
+    ///
+    /// **`true` reports the mark, not the staging.** The cancel is
+    /// best-effort ([`FsCore::submit_cancel`]) and can lose its race
+    /// even when it stages, so the op's own ending is what the callers
+    /// see: `on_cqe` reads the mark, not the errno the kernel chose, to
+    /// decide whether a completion answers an ask (a retracted timer's
+    /// `-ETIME` reads as the marked cancellation it asked for). Nothing
+    /// may take `true` to mean an `ASYNC_CANCEL` reached the kernel.
     fn retract_op(
         &mut self,
         eng: &mut Engine,
@@ -1899,8 +1918,18 @@ impl FsCore {
     /// cancelled op completes with `ECANCELED` and its CQE runs `take_op` like
     /// any other, dropping the parked `Arc` (close-last). Takes no op-table slot
     /// -- nothing routes its completion - but goes through `eng.stage` so the
-    /// engine's in-flight accounting stays correct. Best-effort: a stage failure
-    /// (ring full) is dropped; server teardown still reaps the op.
+    /// engine's in-flight accounting stays correct.
+    ///
+    /// **Best-effort, and nothing may hang off it having reached the
+    /// kernel.** `push_sqe` answers `EBUSY` when a full SQ meets a
+    /// `submit` that accepted nothing - a CQ-overflow backpressure
+    /// return is `Ok` with the SQEs still staged (`Ring::submit`) - so
+    /// a healthy ring under load reaches this, not only a failing
+    /// `io_uring_enter`. A cancel that never staged leaves the op
+    /// running to its own ending, which the teardown drain reaps.
+    /// [`FsCore::retract_op`]'s mark is what the callers' verdicts are
+    /// built on for exactly that reason: the mark records the ask, and
+    /// the ask is answerable whether or not the hastening arrived.
     fn submit_cancel(&self, eng: &mut Engine, target_ud: u64) {
         let ud = pack_raw(TAG_CANCEL, 0, 0);
         let _ = eng.stage(ud, |sqe| {
@@ -2141,8 +2170,27 @@ impl FsCore {
         // A timer's expiry is its success: a pure `IORING_OP_TIMEOUT`
         // (count 0) completes `-ETIME` when it fires, and that firing is
         // the completion the caller asked for.
+        //
+        // Unless the caller retracted it, in which case the deadline is
+        // gone whatever the kernel did with the cancel, and `Ok(0)` -
+        // this crate's spelling for "the deadline arrived" - would run
+        // a timeout handler for work the caller already finished. The
+        // retraction cannot make the cancel win: `io_timeout_fn`
+        // delists the timeout before posting `-ETIME`
+        // (`io_uring/timeout.c:254-276`), so an `ASYNC_CANCEL` that
+        // arrives after the fire finds nothing (`io_timeout_extract`,
+        // `:278-303`) and the `-ETIME` stands - and `submit_cancel` is
+        // best-effort besides, so the cancel may never have been staged
+        // at all. The mark is the caller's ask, and it is what decides
+        // the verdict; the errno then reads as the marked cancellation
+        // `refused` computes below, exactly as a cancel that won would
+        // have delivered.
         if tag == TAG_TIMEOUT && result == Err(Errno::ETIME) {
-            result = Ok(0);
+            result = if retracted {
+                Err(Errno::ECANCELED)
+            } else {
+                Ok(0)
+            };
         }
         // A cancellation that was asked for is not the reactor going
         // away: `ECANCELED` with `was_refused` false stays meaning
@@ -3561,12 +3609,23 @@ impl<'a> FsConn<'a> {
     /// caller still gets exactly one answer per arm and the answer says
     /// what it was - `ECANCELED` unmarked stays meaning the reactor is
     /// going away, which is the verdict a task winds down on, and a
-    /// healthy retraction must not read as that. Best-effort and
-    /// idempotent: the token is verified against the table before
-    /// anything is staged, so a [`Timer`] that already fired - or one
-    /// minted by a different reactor, or retracted once already -
-    /// retracts nothing. Nothing is reported here either way; the
-    /// answer arrives at `on_done`.
+    /// healthy retraction must not read as that. **That verdict does
+    /// not depend on the cancel winning.** The kernel delists a
+    /// timeout before posting `-ETIME` (`io_timeout_fn`,
+    /// `io_uring/timeout.c:254-276`), so a retraction that arrives
+    /// after the fire cancels nothing and the expiry stands - and the
+    /// cancel is best-effort besides. The mark is the caller's ask, and
+    /// `on_cqe` reads the mark: a retracted timer's `-ETIME` is
+    /// delivered as the marked cancellation, never as `Ok(0)`, which
+    /// is this crate's "the deadline arrived" and would run a timeout
+    /// handler for work the caller had already finished.
+    ///
+    /// Idempotent: the token is verified against the table before
+    /// anything is staged, so a [`Timer`] whose op has already
+    /// *answered* - its slot freed, or reissued since - or one minted
+    /// by a different reactor, or retracted once already, retracts
+    /// nothing. Nothing is reported here either way; the answer
+    /// arrives at `on_done`.
     pub fn cancel_timeout(&mut self, timer: Timer) {
         self.fs.retract_timeout(
             self.eng,
