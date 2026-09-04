@@ -2001,7 +2001,7 @@ impl FsCore {
             *swept = (*swept).max(generation);
         }
         // Bounded by the in-flight count: a slot is in `op_free` iff
-        // free (all three push sites clear the entry and bump the
+        // free (all four push sites clear the entry and bump the
         // generation first), so the difference is exactly how many
         // in-flight entries the scan can meet, and it stops once it
         // has seen them all. That break already lands at one past the
@@ -2017,6 +2017,32 @@ impl FsCore {
         // stays a scan until that trade is worth it. The empty-table
         // early-out above is what an idle server hits.
         let mut in_flight = self.ops.len() - self.op_free.len();
+        // The premise, checked in the direction that hurts, and only
+        // that one. The walk below stops once it has decremented this
+        // to zero, so a count that is too *high* is caught by the walk
+        // itself - it runs out of entries and the post-walk assert
+        // fires - while one that is too low (a slot pushed to
+        // `op_free` twice) breaks the walk early and silently leaves
+        // live ops uncancelled, in both profiles. Only the derived
+        // figure against the table's own census sees that direction.
+        //
+        // `>=`, not equality: a slot popped for an op whose state is
+        // not set yet counts as in flight here and not in the census,
+        // and that window is legitimate - unobservable from this
+        // function's one production caller, which runs from the
+        // reactor's top-level loop, but not something to assert away.
+        debug_assert!(
+            in_flight
+                >= self
+                    .ops
+                    .iter()
+                    .filter(|e| matches!(
+                        e.state.state,
+                        FsOpState::InFlight { .. }
+                    ))
+                    .count(),
+            "the free list holds a slot the op table still has in flight"
+        );
         if in_flight == 0 {
             return; // nothing in flight for anyone
         }
@@ -2040,7 +2066,10 @@ impl FsCore {
                 targets.push(pack_raw(tag, i as u32, entry.generation as u32));
             }
         }
-        debug_assert_eq!(in_flight, 0, "in_flight over-counts the table");
+        debug_assert_eq!(
+            in_flight, 0,
+            "the walk ended with in-flight entries unvisited"
+        );
         for ud in targets {
             self.submit_cancel(eng, ud);
         }
