@@ -257,6 +257,104 @@ pub fn block(set: SigSet) -> Result<Blocked> {
     Ok(Blocked { set })
 }
 
+/// [`block`], and then confirm the whole process is covered.
+///
+/// `block` can only report on the thread it ran on. That is the *contract* -
+/// block before any other thread exists, and every later thread inherits the
+/// mask - but nothing enforces it, so a process that spawns first and blocks
+/// second gets `Ok` and still dies on `SIGTERM`, taking the default action on
+/// a thread that was already running. This is the same call with the
+/// contract checked: every other thread in the process must already have the
+/// set blocked.
+///
+/// **The check is why this is a second function rather than a stricter
+/// `block`.** A test harness is multi-threaded by the time any test runs -
+/// `cargo test` runs a binary's tests as threads - so refusing there would
+/// fail suites that are doing nothing wrong, this crate's own included. A
+/// daemon calls this one; a test calls [`block`].
+///
+/// Reads `/proc/self/task/*/status`, so it needs `/proc` mounted, and
+/// refuses when it is not: an `Ok` from this function is supposed to mean
+/// the process is covered, and it cannot mean that unverified. A thread that
+/// exits mid-scan is skipped - it can no longer take a default action - and
+/// one created mid-scan inherited the mask this call has already set, so it
+/// is covered by construction.
+///
+/// Errors [`Errno::EBUSY`] when a thread is found without the set, and
+/// [`Errno::ENOSYS`] when the check itself could not run - `/proc` absent, or
+/// a `status` this code cannot parse. Both are reported **after** blocking on
+/// this thread: the mask is set either way, and only the report differs, so a
+/// caller that decides to carry on is no worse off than one that called
+/// [`block`].
+pub fn block_strict(set: SigSet) -> Result<Blocked> {
+    let blocked = block(set)?;
+    let me = gettid();
+    let dir =
+        std::fs::read_dir("/proc/self/task").map_err(|_| Errno::ENOSYS)?;
+    for entry in dir {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(tid) = name.to_str().and_then(|t| t.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if tid == me {
+            continue;
+        }
+        // Gone between the listing and the read: it can take no action.
+        let Ok(status) = std::fs::read_to_string(
+            std::path::Path::new("/proc/self/task")
+                .join(&name)
+                .join("status"),
+        ) else {
+            continue;
+        };
+        let Some(mask) = sig_blk(&status) else {
+            return Err(Errno::ENOSYS);
+        };
+        if !mask_covers(&set, mask) {
+            return Err(Errno::EBUSY);
+        }
+    }
+    Ok(blocked)
+}
+
+/// This thread's kernel tid, which is what names its `/proc/self/task` entry.
+/// `std::thread::ThreadId` is not it.
+fn gettid() -> i32 {
+    // SAFETY: `gettid` takes no arguments, reads no memory and cannot fail.
+    unsafe { libc::syscall(libc::SYS_gettid) as i32 }
+}
+
+/// Whether a thread whose blocked-signal mask is `mask` has every signal in
+/// `set` blocked. Bit `n-1` of the mask is signal `n`.
+///
+/// Asks the set itself rather than walking [`SigSet::ALL`]: that list is the
+/// `Signal` enum's, and a signal outside it would be waved through by a
+/// covering test built from it. Nothing can put one there today - `add` and
+/// `of` both take a `Signal` - but the check that decides whether a process
+/// is covered should not be the one that has to be revisited when the enum
+/// grows.
+fn mask_covers(set: &SigSet, mask: u64) -> bool {
+    (1..=64).all(|n| {
+        // SAFETY: a valid set; `sigismember` answers 0/1 for a signal in
+        // range and -1 for one that is not, all of which read as "absent".
+        let member = unsafe { libc::sigismember(&set.0, n) == 1 };
+        !member || mask & (1u64 << (n - 1)) != 0
+    })
+}
+
+/// The `SigBlk:` mask out of a `/proc/<pid>/task/<tid>/status`, or `None` if
+/// the field is absent or unparseable - which is a `/proc` this code does not
+/// understand, not a thread that is covered.
+fn sig_blk(status: &str) -> Option<u64> {
+    let field = status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigBlk:"))?
+        .trim();
+    u64::from_str_radix(field, 16).ok()
+}
+
 /// A set of signals blocked on this thread (and on every thread created
 /// after [`block`] ran), and the ways to receive one of them.
 ///
@@ -513,6 +611,78 @@ mod tests {
         assert_eq!(rc, 0, "pthread_sigmask");
         // SAFETY: a zero return means the call filled `out`.
         SigSet(unsafe { out.assume_init() })
+    }
+
+    /// The `SigBlk:` parse, against the shape `/proc` really writes and
+    /// against shapes it does not.
+    ///
+    /// A `/proc` this code cannot read is not a process that is covered, so
+    /// an unparseable field has to answer `None` and be refused by the
+    /// caller - the field is 16 hex digits with a leading tab, and the
+    /// mask's bit `n-1` is signal `n`.
+    #[test]
+    fn sig_blk_reads_the_field_the_kernel_writes() {
+        let status = "Name:\tfoo\nTgid:\t1\nSigBlk:\t0000000000004002\n\
+                      SigIgn:\t0000000000001000\n";
+        let mask = sig_blk(status).expect("the field is there");
+        // 0x4002 = bits 1 and 14 -> signals 2 (INT) and 15 (TERM).
+        assert_ne!(mask & (1 << (Signal::Int.as_raw() - 1)), 0);
+        assert_ne!(mask & (1 << (Signal::Term.as_raw() - 1)), 0);
+        assert_eq!(mask & (1 << (Signal::Hup.as_raw() - 1)), 0);
+        // Absent, and unparseable: both are "cannot tell", never "clear".
+        assert!(sig_blk("Name:\tfoo\n").is_none());
+        assert!(sig_blk("SigBlk:\tnot-a-mask\n").is_none());
+    }
+
+    /// `block_strict` refuses a process whose other threads do not have the
+    /// set blocked, which is the whole of what `block` cannot report.
+    ///
+    /// **The refusal is what a test binary can observe; the acceptance is
+    /// not.** `cargo test` runs a binary's tests as threads, and its main
+    /// thread never blocks anything, so this process is permanently
+    /// uncovered - which is precisely why this is a second function rather
+    /// than a stricter `block`. Getting a covered process would mean
+    /// forking, and the scan allocates (`read_dir`, `read_to_string`),
+    /// which is the malloc-arena deadlock a fork from a multi-threaded
+    /// harness invites and this repo forbids elsewhere. The acceptance side
+    /// is covered by `mask_covers` instead, which is the decision the loop
+    /// is built out of.
+    #[test]
+    fn block_strict_refuses_an_uncovered_process() {
+        assert!(
+            matches!(
+                block_strict(SigSet::of([Signal::Usr1])),
+                Err(Errno::EBUSY)
+            ),
+            "a process with threads that predate the block was not reported"
+        );
+        // And the plain form answers `Ok` on the same process. That is the
+        // defect the strict form exists for, and the reason `block` cannot
+        // simply be made strict.
+        block(SigSet::of([Signal::Usr1])).expect("block is unchanged");
+    }
+
+    /// The decision `block_strict`'s loop is built out of, both ways.
+    ///
+    /// Bit `n-1` of the mask is signal `n`, and *every* signal in the set
+    /// has to be present: a thread with half of them blocked still takes
+    /// the default action on the other half.
+    #[test]
+    fn mask_covers_needs_every_signal_in_the_set() {
+        let bit = |s: Signal| 1u64 << (s.as_raw() - 1);
+        let want = SigSet::of([Signal::Term, Signal::Int]);
+
+        assert!(mask_covers(&want, bit(Signal::Term) | bit(Signal::Int)));
+        // Supersets are fine.
+        assert!(mask_covers(&want, u64::MAX));
+        // Half is not.
+        assert!(!mask_covers(&want, bit(Signal::Term)));
+        assert!(!mask_covers(&want, bit(Signal::Int)));
+        assert!(!mask_covers(&want, 0));
+        // A different signal entirely does not stand in for either.
+        assert!(!mask_covers(&want, bit(Signal::Hup) | bit(Signal::Usr1)));
+        // An empty set is covered by anything, including nothing.
+        assert!(mask_covers(&SigSet::empty(), 0));
     }
 
     /// A signal raised at this thread after blocking is dequeued by `wait`

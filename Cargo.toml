@@ -28,9 +28,13 @@ httparse = { version = "1.10", optional = true }
 # src/uring/wake.rs, and the offload pool / completion sink / inject / identity
 # models in src/uring_fs. Pulled ONLY under `--cfg loom`, so normal builds keep
 # the libc+bitflags charter untouched — see src/sync.rs for the std/loom shim.
-#   Run: RUSTFLAGS="--cfg loom" cargo test --lib --features uring    loom_
-#        RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
-#        RUSTFLAGS="--cfg loom" cargo test --lib --features http     loom_
+#   Run: .github/workflows/scripts/counted-cargo-test.sh 24 loom -- \
+#          env RUSTFLAGS="--cfg loom" cargo test --lib --all-features loom_
+#
+# One invocation, and the count is the point: a libtest filter that matches
+# nothing exits 0, so a mistyped `--cfg` reads as a green lane. The three
+# feature-subset spelling this replaced selected 3 of the 24 models in its
+# first line and asserted nothing about any of them.
 [target.'cfg(loom)'.dependencies]
 loom = { version = "0.7" }
 

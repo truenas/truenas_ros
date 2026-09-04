@@ -47,12 +47,21 @@
 //! **The screen is applied per call site, not by the path conversion.** No
 //! `TnPath::with_tn_path` implementation calls either function - that trait
 //! converts a path to a `CStr` and screens nothing - so going through it
-//! says nothing about whether a path was judged. The callers that do judge
-//! name it explicitly: `FsIterBuilder::build`, `FsConn::mkdir_path`,
-//! `FsHandle::mkdir_path` and `mkdirat`. Anything else - `renameat2`,
-//! `statx`, `name_to_handle_at` among them - takes the caller's bytes as
-//! given, and its confinement is whatever `RESOLVE_*` flags and anchor it
-//! was handed, not this module.
+//! says nothing about whether a path was judged.
+//!
+//! Two rules of thumb, and neither is a substitute for grepping the two
+//! function names. A call that takes a **single component** against an
+//! anchor screens with [`component_defect`], because no `RESOLVE_*` flag
+//! confines a name the caller assembled: `mkdirat`, `unlinkat`,
+//! `renameat2` (both names), `linkat` (both names), and `FsIter::process`
+//! on every name `readdir` hands it. A call that takes a **relative
+//! multi-component path** it will rebuild one component at a time screens
+//! with [`relative_defect`]: `FsIterBuilder::relative_path`, and the fs
+//! reactor's `mkdir_path`/`walk` entry points.
+//!
+//! Everything else - `statx`, `name_to_handle_at`, the plain `openat2`
+//! wrappers - takes the caller's bytes as given, and its confinement is
+//! whatever `RESOLVE_*` flags and anchor it was handed, not this module.
 //!
 //! The owned components a directory *walk* carries are a different matter:
 //! those outlive the completion that consumes them and have to be owned.

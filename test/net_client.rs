@@ -1146,8 +1146,16 @@ where
     F: FnMut(&[u8], &mut U) -> Framing,
 {
     let ctx = Arc::new(ktls_client_ctx());
-    let mut client =
-        Client::new(ClientConfig::default(), framer).map_err(to_io)?;
+    // A kTLS body splice is refused without a response clock
+    // (`CloseReason::SpliceUnbounded`): it blocks an io-wq worker awaiting
+    // the next TLS record, where no linked timeout reaches it, so the
+    // standalone watchdog this maps to is its only bound. Generous - none of
+    // these tests stall.
+    let cfg = ClientConfig {
+        response_timeout: Some(Duration::from_secs(10)),
+        ..ClientConfig::default()
+    };
+    let mut client = Client::new(cfg, framer).map_err(to_io)?;
     client.set_tls_handshake(move |fd, _c, deferral| {
         let ctx = Arc::clone(&ctx);
         thread::spawn(move || match ktls_client_handshake(fd, &ctx) {

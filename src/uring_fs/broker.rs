@@ -302,10 +302,23 @@ impl AsUser {
     }
 }
 
+/// The parent's end of the broker socket, with the mark that says a reply
+/// is owed on it and nobody is going to claim it.
+///
+/// The two travel under one lock because the mark is only meaningful to
+/// whoever is about to use the socket: a reply carries nothing naming the
+/// request it answers, so a thread that finds the mark set must not send.
+struct BrokerSock {
+    fd: OwnedFd,
+    /// Set when a request was delivered and its reply was not received.
+    /// See [`round_trip`].
+    desynced: bool,
+}
+
 struct BrokerInner {
     /// Serialized: one request at a time (registration is a rare,
     /// session-setup operation - see the fs-reactor design sec. 16.4).
-    sock: Mutex<OwnedFd>,
+    sock: Mutex<BrokerSock>,
     pid: libc::pid_t,
     /// The broker's pidfd (from `clone3(CLONE_PIDFD)`): race-free death
     /// detection ([`CredBroker::is_alive`]), signalling, and reaping.
@@ -720,7 +733,13 @@ impl CredBroker {
 
         // The reply socket is the only thing standing between a stalled
         // broker and every caller in the process; see `RECV_TIMEOUT`.
-        set_recv_timeout(parent_end.as_raw_fd(), RECV_TIMEOUT)?;
+        set_timeout(parent_end.as_raw_fd(), libc::SO_RCVTIMEO, RECV_TIMEOUT)?;
+        // And the same bound on the way out. A child that has stopped
+        // reading fills the sndbuf, and a blocking `send` then waits
+        // forever holding the socket mutex - wedging every register and
+        // unregister in the process, `IdEntry::drop` on the reactor thread
+        // included, which is the wedge the recv bound exists to prevent.
+        set_timeout(parent_end.as_raw_fd(), libc::SO_SNDTIMEO, RECV_TIMEOUT)?;
 
         // Fork the broker via `clone3`, not `fork()`, for three reasons --
         // one of them load-bearing for the privileged window:
@@ -783,7 +802,10 @@ impl CredBroker {
         drop_setid_caps()?;
         Ok(CredBroker {
             inner: Arc::new(BrokerInner {
-                sock: Mutex::new(parent_end),
+                sock: Mutex::new(BrokerSock {
+                    fd: parent_end,
+                    desynced: false,
+                }),
                 pid,
                 pidfd,
                 rings: ring_fds.len(),
@@ -861,27 +883,72 @@ impl CredBroker {
             req[at..at + 4].copy_from_slice(&g.to_le_bytes());
         }
 
-        let sock = self.inner.sock.lock().map_err(|_| Errno::EIO)?;
-        let n = retry_on_eintr(|| {
-            // SAFETY: `req[..len]` is a valid initialized buffer.
-            unsafe {
-                libc::send(
-                    sock.as_raw_fd(),
-                    req.as_ptr().cast::<c_void>(),
-                    len,
-                    libc::MSG_NOSIGNAL,
-                )
-            }
-        })?;
-        if n as usize != len {
-            return Err(Errno::EIO.into());
-        }
-        let reply = recv_reply(sock.as_raw_fd())?;
+        let mut sock = self.inner.sock.lock().map_err(|_| Errno::EIO)?;
+        let reply = round_trip(&mut sock, &req)?;
         if reply < 0 {
             return Err(Errno::from_raw(-reply as i32).into());
         }
         Ok(reply)
     }
+}
+
+/// One request/reply exchange, and the whole of the socket's state machine.
+///
+/// **SECURITY: a reply names no request.** The wire is eight bytes with no
+/// sequence number, so a recv that gives up leaves the broker's answer
+/// queued and the *next* caller receives it: caller A registers uid 1000
+/// and times out while the broker replies id 7, caller B registers uid 2000
+/// and the broker mints id 8, and B is handed 7. `CredHandle::register`
+/// does only a `u16::try_from`, so `IdentityCache` then caches personality
+/// 7 under B's key and every op for uid 2000 carries uid 1000's credential
+/// snapshot, supplementary groups included - and every later reply stays
+/// shifted. The one length check cannot see it: `SOCK_SEQPACKET` always
+/// delivers the full eight bytes.
+///
+/// There is no resynchronising without that sequence number, so the socket
+/// fails closed instead: any recv failure once the request is on the wire
+/// marks it, and every later request answers `EPROTO` rather than a reply
+/// it cannot attribute. A supervisor has [`CredBroker::is_alive`] and
+/// [`CredBroker::pid`] to act on that; a mis-attributed credential it
+/// would never see. `RECV_TIMEOUT`'s own doc names the reachable trigger:
+/// an external cgroup freeze, which thaws and then replies.
+///
+/// A failed *send* does not mark: `unix_dgram_sendmsg` takes its `-EAGAIN`
+/// arm before `skb_queue_tail` (`net/unix/af_unix.c`), so a send that gave
+/// up delivered nothing and nothing is owed back.
+///
+/// Neither does `ECONNRESET`. That is the one recv failure that **consumed
+/// the queue**: `recv_reply` reports it for a reply that is not eight bytes,
+/// which is either EOF - the child has gone, so nothing is coming - or a
+/// datagram it read and discarded. Either way the socket is left in step,
+/// and marking would trade broker death's own documented vocabulary (see
+/// [`RECV_TIMEOUT`]) for an `EPROTO` that says less.
+fn round_trip(sock: &mut BrokerSock, req: &[u8]) -> errno::Result<i64> {
+    if sock.desynced {
+        return Err(Errno::EPROTO);
+    }
+    let n = retry_on_eintr(|| {
+        // SAFETY: `req` is a valid initialized buffer of `req.len()`.
+        unsafe {
+            libc::send(
+                sock.fd.as_raw_fd(),
+                req.as_ptr().cast::<c_void>(),
+                req.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        }
+    })?;
+    if n as usize != req.len() {
+        return Err(Errno::EIO);
+    }
+    // Delivered. From here a reply is owed on this socket, and anything
+    // but taking it - bar the one ending that proves none is coming -
+    // leaves that reply for whoever sends next.
+    recv_reply(sock.fd.as_raw_fd()).inspect_err(|e| {
+        if *e != Errno::ECONNRESET {
+            sock.desynced = true;
+        }
+    })
 }
 
 fn recv_reply(sock: RawFd) -> errno::Result<i64> {
@@ -915,10 +982,21 @@ fn recv_reply(sock: RawFd) -> errno::Result<i64> {
 /// a fork-copied malloc arena and writes to an fd `tidy_child_fds` already
 /// closed - and from outside by a cgroup freeze, which `signal.rs` notes the
 /// broker deliberately ignores.
+///
+/// Bounds the send too, since a child that has stopped reading wedges the
+/// mutex there instead. Giving up is not free either way - the reply it
+/// leaves behind cannot be attributed, so the socket is spent
+/// ([`round_trip`]) - which is why the value is a ceiling on the
+/// pathological rather than a latency budget.
 const RECV_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bound how long `recv` on `sock` may block.
-fn set_recv_timeout(sock: RawFd, d: Duration) -> errno::Result<()> {
+/// Bound how long `recv` or `send` on `sock` may block (`opt` is
+/// `SO_RCVTIMEO` or `SO_SNDTIMEO`; both take a `timeval`).
+fn set_timeout(
+    sock: RawFd,
+    opt: libc::c_int,
+    d: Duration,
+) -> errno::Result<()> {
     let tv = libc::timeval {
         tv_sec: d.as_secs() as libc::time_t,
         tv_usec: d.subsec_micros() as libc::suseconds_t,
@@ -928,7 +1006,7 @@ fn set_recv_timeout(sock: RawFd, d: Duration) -> errno::Result<()> {
         libc::setsockopt(
             sock,
             libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
+            opt,
             std::ptr::addr_of!(tv).cast::<c_void>(),
             size_of::<libc::timeval>() as libc::socklen_t,
         )
@@ -1826,6 +1904,99 @@ mod tests {
             0,
             "an unprivileged drop_setid_caps must succeed: spawn treats a \
              failure as fatal, and a non-root reactor has nothing to regain"
+        );
+    }
+
+    /// **SECURITY.** A recv that gives up leaves the broker's reply on
+    /// the socket, and the wire carries nothing naming the request it
+    /// answers - so without the mark the *next* caller receives it and
+    /// `register` hands one identity another's personality.
+    ///
+    /// Both halves are here, because the mark is only worth what the
+    /// hazard is: the refusal, and then the same socket with the mark
+    /// cleared by hand, which really does answer the previous caller's
+    /// id.
+    #[test]
+    fn a_timed_out_request_refuses_the_next_caller_not_its_reply() {
+        let mut sv = [0 as RawFd; 2];
+        // SAFETY: valid 2-element array.
+        Errno::result(unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                sv.as_mut_ptr(),
+            )
+        })
+        .expect("socketpair");
+        // SAFETY: fresh fds from socketpair.
+        let (parent, child) = unsafe {
+            (
+                crate::fd::owned_from_raw(sv[0]),
+                crate::fd::owned_from_raw(sv[1]),
+            )
+        };
+        set_timeout(
+            parent.as_raw_fd(),
+            libc::SO_RCVTIMEO,
+            Duration::from_millis(50),
+        )
+        .expect("SO_RCVTIMEO");
+        let mut sock = BrokerSock {
+            fd: parent,
+            desynced: false,
+        };
+
+        // A broker that does not answer in time - a cgroup freeze, say,
+        // which `RECV_TIMEOUT` names.
+        let req = [0u8; HDR_LEN];
+        let e = round_trip(&mut sock, &req).expect_err("the recv must give up");
+        assert_eq!(e, Errno::EAGAIN, "SO_RCVTIMEO expiry");
+        assert!(sock.desynced, "a reply is owed on this socket");
+
+        // It thaws and replies. The request was delivered, so this is a
+        // real reply - for a caller that has gone.
+        reply(child.as_raw_fd(), 7).expect("the broker answers late");
+
+        let e = round_trip(&mut sock, &req).expect_err("desynced must refuse");
+        assert_eq!(
+            e,
+            Errno::EPROTO,
+            "a reply that cannot be attributed is not an answer"
+        );
+
+        // The control: what the refusal is standing in front of.
+        sock.desynced = false;
+        assert_eq!(
+            round_trip(&mut sock, &req).expect("the queued reply"),
+            7,
+            "the socket really does hand the previous caller's id over"
+        );
+
+        // The one recv failure that consumed the queue is not a desync
+        // and keeps its own errno. Driven with a reply the broker could
+        // never send - a short datagram - because that reaches
+        // `recv_reply`'s length check with the peer still open, where a
+        // closed peer would fail at the send instead.
+        let short = [0u8; 4];
+        // SAFETY: a valid 4-byte source on the child end.
+        Errno::result(unsafe {
+            libc::send(
+                child.as_raw_fd(),
+                short.as_ptr().cast::<c_void>(),
+                short.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        })
+        .expect("short reply");
+        assert_eq!(
+            round_trip(&mut sock, &req).expect_err("not eight bytes"),
+            Errno::ECONNRESET,
+            "broker death must keep its own vocabulary"
+        );
+        assert!(
+            !sock.desynced,
+            "a recv that consumed the queue leaves nothing stale"
         );
     }
 

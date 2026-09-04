@@ -72,7 +72,7 @@ env:
   # Most of `uring_fs::task` is ring-dependent and returns vacuously
   # under `cfg(miri)`. Measured by cross-referencing the filter's own
   # `--list` against the ring guards (`rig`, `engine_or_skip`):
-  # lane-wide 94 matched, 55 vacuous, 39 executing; `uring_fs::task`
+  # lane-wide 95 matched, 55 vacuous, 40 executing; `uring_fs::task`
   # alone is 59 matched, 49 vacuous, 10 executing. So the shipped floor
   # of 10 was cleared by the vacuous skips ALONE: every meaningful test
   # could stop running and the lane would still pass. That is the
@@ -87,7 +87,8 @@ env:
   # It is also most of the value of widening the filter. Seven of the nine
   # modules added here have ZERO ring-guard uses - query_tree,
   # single_flight, offload_pool, user_data, sys, path::shape, errno - so
-  # they genuinely execute, taking real coverage from ~9 tests to 39.
+  # they genuinely execute, taking real coverage from ~9 tests to the
+  # executing count above.
   # `uring::engine`'s 6 are guard-gated and will skip; they are counted
   # for the tripwire, not claimed as coverage.
   #
@@ -102,15 +103,20 @@ env:
   # bound; 87 the slot Refused transition table, pure Rc/RefCell state
   # that genuinely executes here; 91 adds the four ring-gated
   # refusal-delivery tests; 94 the `Allow` pair's tenancy in both
-  # orderings and the retracted-timer verdict.) If that friction is
-  # unwanted,
-  # `-lt` pinned at the TRUE count still catches deletion, which is the
-  # failure mode; what it must not be again is a floor far below what
-  # runs.
-  MIRI_TESTS: "94"
+  # orderings and the retracted-timer verdict; 95 the single-flight
+  # invalidate-during-mint control, which is plain map state behind
+  # no guard and so the first bump since 87 to move the executing
+  # count as well as the matched one.) If that friction is unwanted,
+  # `-lt` pinned at the TRUE count still catches deletion, which is
+  # the failure mode; what it must not be again is a floor far below
+  # what runs.
+  MIRI_TESTS: "95"
 
   # The `http` band, run as its own step under its own feature set.
-  MIRI_HTTP_TESTS: "32"
+  # Exact for the same reason, and bumped by the same rule: 32 at the
+  # step's measurement, 33 with the streaming-protocol connection
+  # bound added beside the codec.
+  MIRI_HTTP_TESTS: "33"
 
 jobs:
   miri:
@@ -165,10 +171,10 @@ jobs:
           --features uring-fs -- $MIRI_SKIP
     # A second feature set, because the filter above cannot reach it: the
     # `http` band's protocol tests are pure parsing - 0 ring-guard uses in
-    # the file, so all 32 genuinely execute rather than skipping - and
-    # they need `-Zmiri-disable-isolation` for `clock_gettime`, not for
-    # anything about the ring. Measured: 32 passed in 9s, and still 32
-    # under tree borrows and strict provenance.
+    # the file, so all of them genuinely execute rather than skipping
+    # - and they need `-Zmiri-disable-isolation` for `clock_gettime`,
+    # not for anything about the ring. Measured at 32: 32 passed in
+    # 9s, and still 32 under tree borrows and strict provenance.
     #
     # The flag is confined to THIS step on purpose. The steps above stay
     # isolated so their weak-memory work is not sharing a host clock or

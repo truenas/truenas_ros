@@ -446,6 +446,17 @@ impl FsOpEntry {
     /// Release every payload and mark the entry free (the caller bumps the
     /// generation and returns the slot to the free-list).
     fn clear(&mut self) {
+        // Everything, including the four a caller is expected to have taken
+        // first (`take_op` does, and so does `fail_op`). Left out, the
+        // residue is inert only by coincidence of which tags read which
+        // field - a stale `strip_nonblock` is read against the *next*
+        // tenant's `how`, and reads as `None` only because `how` is cleared
+        // here - and the coincidence is not something the next op added to
+        // this table should have to re-establish.
+        self.waiter = None;
+        self.bufs = Vec::new();
+        self.stat = None;
+        self.strip_nonblock = false;
         self.iov.clear();
         self.path = None;
         self.path2 = None;
@@ -584,6 +595,64 @@ struct OffloadEntry {
 struct WallClock {
     armed: u32,
     retiring: u32,
+}
+
+/// Every move of the pair, in one place.
+///
+/// The three call sites used to spell their own arithmetic and disagreed
+/// about the failure: `release_retiring` saturated, on the stated grounds
+/// that "an unmatched return is a stuck cap in release, not a `u32::MAX`
+/// that refuses the owner's every arm for the life of the reactor", while
+/// `take_op` and the retraction wrapped. Break the pairing and the release
+/// build wraps `armed` to `u32::MAX`, `refuse_wall_clock_hold` then reads
+/// `armed >= cap` and answers a marked `EBUSY` to every later timer arm
+/// and every `Allow` open by that owner - forever, with the map entry never
+/// reclaimed because `is_empty` can never be true again.
+///
+/// The `debug_assert`s live here rather than at the call sites for the
+/// same reason: the ones there fired only on a *missing* map entry, so a
+/// count already at zero had no detector in either profile.
+impl WallClock {
+    /// A hold armed.
+    fn arm(&mut self) {
+        self.armed = self.armed.saturating_add(1);
+    }
+
+    /// A hold's slot answered. `retired` picks the half its count sits on:
+    /// a retraction moved it to `retiring` already.
+    fn ended(&mut self, retired: bool) {
+        let c = if retired {
+            &mut self.retiring
+        } else {
+            &mut self.armed
+        };
+        debug_assert!(*c > 0, "a wall-clock hold ended with nothing counted");
+        *c = c.saturating_sub(1);
+    }
+
+    /// A retraction: the cap headroom goes back now, the slot at the CQE.
+    fn retract(&mut self) {
+        debug_assert!(self.armed > 0, "a retraction with nothing armed");
+        self.armed = self.armed.saturating_sub(1);
+        self.retiring = self.retiring.saturating_add(1);
+    }
+
+    /// An `Allow` pair's one count parked on the slot that has not freed
+    /// yet - it cannot go home with the first of the two.
+    fn park(&mut self) {
+        self.retiring = self.retiring.saturating_add(1);
+    }
+
+    /// A parked count going home, its slot now free.
+    fn release_park(&mut self) {
+        debug_assert!(self.retiring > 0, "a parked hold returned twice");
+        self.retiring = self.retiring.saturating_sub(1);
+    }
+
+    /// Nothing left to account for this owner.
+    fn is_empty(&self) -> bool {
+        self.armed == 0 && self.retiring == 0
+    }
 }
 
 pub(crate) struct FsCore {
@@ -1019,7 +1088,7 @@ impl FsCore {
                     // still parked, exactly as a retracted timer's
                     // count parks for the width of its reap.
                     if let Some(o) = timer_owner {
-                        self.armed_timers.entry(o).or_default().armed += 1;
+                        self.armed_timers.entry(o).or_default().arm();
                     }
                 }
                 Err(_) => {
@@ -1433,7 +1502,7 @@ impl FsCore {
         if let Some(FsWaiter::Embedded { owner: Some(o), .. }) =
             &self.ops[op_slot as usize].state.waiter
         {
-            self.armed_timers.entry(*o).or_default().armed += 1;
+            self.armed_timers.entry(*o).or_default().arm();
         }
         Some((op_slot, self.ops[op_slot as usize].generation))
     }
@@ -1516,8 +1585,7 @@ impl FsCore {
         };
         if let Some(o) = o {
             if let Some(t) = self.armed_timers.get_mut(&o) {
-                t.armed -= 1;
-                t.retiring += 1;
+                t.retract();
             } else {
                 debug_assert!(false, "a retraction with no armed count");
             }
@@ -2137,7 +2205,7 @@ impl FsCore {
                 self.release_retiring(o);
             }
             if !retracted
-                && res == -libc::ETIME
+                && res != -libc::ECANCELED
                 && let Some((oslot, ogen)) = cancels
             {
                 // Mark, then cancel (`retract_op`). The mark is what
@@ -2148,6 +2216,25 @@ impl FsCore {
                 // down on (`task.rs`). An open that already answered
                 // - its slot freed or reissued - is left alone, and
                 // the cancel is skipped with it.
+                //
+                // The screen is the *cancellation*, not the firing.
+                // A guard that ends any other way has stopped
+                // bounding an open that is still running, and the
+                // reachable one is not `-ETIME`: the SQE is accepted
+                // by `push_sqe` - charge taken, cancel target
+                // recorded - while `__io_timeout_prep` runs later
+                // inside `io_uring_enter` and can still answer
+                // `-ENOMEM` (`io_uring/timeout.c:554-556`), with
+                // `io_submit_fail_init` posting a CQE under the
+                // guard's own tag. Left uncancelled, an `Allow` open
+                // parks in `fifo_open`'s `wait_for_partner` on a
+                // peer-planted FIFO for as long as the peer likes,
+                // holding an io-wq worker, its op slot and its
+                // owner's wall-clock charge. An unmarked `ECANCELED`
+                // is the one ending that must NOT cancel here: it is
+                // a sweep (`cancel_owned_by`) or teardown, which
+                // stages the open's own cancel and needs its
+                // `ECANCELED` to stay in teardown's vocabulary.
                 self.retract_op(eng, TAG_OPEN, oslot, ogen);
             }
             return ReapedFs::None;
@@ -2379,12 +2466,8 @@ impl FsCore {
             debug_assert!(false, "a parked wall-clock hold with no count");
             return;
         };
-        debug_assert!(t.retiring > 0, "a parked hold returned twice");
-        // Saturating rather than wrapping: an unmatched return is a
-        // stuck cap in release, not a `u32::MAX` that refuses the
-        // owner's every arm for the life of the reactor.
-        t.retiring = t.retiring.saturating_sub(1);
-        if t.armed == 0 && t.retiring == 0 {
+        t.release_park();
+        if t.is_empty() {
             self.armed_timers.remove(&owner);
         }
     }
@@ -2480,16 +2563,12 @@ impl FsCore {
         let mut parked = false;
         if let Some((o, retired)) = charged {
             if let Some(t) = self.armed_timers.get_mut(&o) {
-                if retired {
-                    t.retiring -= 1;
-                } else {
-                    t.armed -= 1;
-                }
+                t.ended(retired);
                 if park_on_guard.is_some() {
-                    t.retiring += 1;
+                    t.park();
                     parked = true;
                 }
-                if t.armed == 0 && t.retiring == 0 {
+                if t.is_empty() {
                     self.armed_timers.remove(&o);
                 }
             } else {
@@ -2619,7 +2698,6 @@ impl FsCore {
         let e = &mut entry.state;
         let waiter = e.waiter.take();
         let bufs = std::mem::take(&mut e.bufs);
-        e.stat = None;
         e.clear();
         entry.generation += 1;
         self.op_free.push(op_slot);
@@ -2789,7 +2867,13 @@ impl FsDone {
     }
 
     /// The `statx` metadata - present only for a successful `statx`.
+    ///
+    /// The pad is allocated before submission and zeroed, and the kernel
+    /// returns from `do_statx` before it writes any of it, so a failed op
+    /// leaves a pad that would read as size 0, mode 0 and a 1970 mtime.
+    /// Gated on the result for the same reason [`FsDone::file`] is.
     pub fn stat(&self) -> Option<Statx> {
+        self.result.ok()?;
         self.stat.as_deref().copied().map(Statx::from_raw)
     }
 }
@@ -6193,6 +6277,34 @@ pub(crate) fn deliver_pool_completions(fs: &mut FsCore, eng: &mut Engine) {
     });
 }
 
+/// Deliver what the stop window left queued, once the loop has stopped.
+///
+/// `run_loop` exits on `stopping()` and the teardown reap reaches ring ops
+/// only, so a refusal queued in the window before the stop - and an offload
+/// whose worker finished after it - is delivered by nothing: the callback
+/// dies unfired with the payload it was handing back, which for a refused
+/// write is its buffers. An offload is not a ring op at all, so
+/// `cancel_and_reap_all` cannot reach it however long it runs, and
+/// [`FsConn::offload`]'s promise that "the job always runs to completion and
+/// its delivery always fires" is the thing being kept here.
+///
+/// **Called before the teardown reap, not after**: a callback firing here
+/// may submit, and the ring is still whole, so whatever it stages is
+/// cancelled and reaped like any other in-flight op instead of being staged
+/// into a ring already torn down.
+///
+/// **One pass, which is the whole guarantee.** The pass is already bounded
+/// to what was queued when it began ([`deliver_pool_completions`]), so a
+/// callback that resubmits, is refused again and queues behind it is *not*
+/// covered - deliberately. Running to quiescence instead would let a
+/// consumer's retry loop hold teardown open for as long as it liked, and
+/// what a callback asks for during teardown is going nowhere anyway: its op
+/// would be cancelled with the rest, and a plain callback dropped unfired
+/// already means the connection closes.
+pub(crate) fn drain_stop_window(fs: &mut FsCore, eng: &mut Engine) {
+    deliver_pool_completions(fs, eng);
+}
+
 /// Fire an embedded on-loop completion reaped by [`FsCore::on_cqe`] with a
 /// fresh owner-scoped [`FsConn`]; a no-op when `on_cqe` returned
 /// [`ReapedFs::None`] (a channel op already delivered, or an inert stale
@@ -6227,6 +6339,108 @@ pub(crate) fn deliver_embedded(
 /// once (never early - a parked clone outlives a dropped caller - never leaked),
 /// and stale/wrong-tag/recycled completions are inert. `ROUTING_FUZZ_SEEDS=N`
 /// overrides the seed count.
+#[cfg(all(test, not(loom)))]
+mod op_entry_size {
+    use super::{FsOpEntry, SlotEntry};
+
+    /// The op table's per-slot cost, which [`FsConfig`]'s rustdoc quotes to
+    /// work out the default's resident cost against the ring's locked-memory
+    /// one.
+    ///
+    /// It was quoted at ~180 bytes and measures 272 (280 under
+    /// `net-server`), so every worked total there understated by about
+    /// 1.5x: the default 32768-slot table is 8.5 MiB, not the 5.8 MiB the
+    /// doc arrived at. Pinned loosely, because the point is that the figure
+    /// is re-derived when the entry grows, not that it never may.
+    ///
+    /// [`FsConfig`]: crate::uring_fs::FsConfig
+    #[test]
+    fn the_op_slot_is_the_size_the_config_docs_quote() {
+        let n = size_of::<SlotEntry<FsOpEntry>>();
+        assert!(
+            (256..=288).contains(&n),
+            "an op slot is {n} bytes; `FsConfig`'s rustdoc quotes 272 (280 \
+             with `net-server`) - re-derive the default's resident cost there"
+        );
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod wall_clock_tests {
+    use super::WallClock;
+
+    /// The count that a broken pairing would run past zero, in the build
+    /// that catches it.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a wall-clock hold ended with nothing counted")]
+    fn a_hold_that_ends_twice_is_caught() {
+        let mut w = WallClock::default();
+        w.arm();
+        w.ended(false);
+        w.ended(false);
+    }
+
+    /// And in the build that ships, where the assert is not compiled: the
+    /// count saturates at zero rather than wrapping to `u32::MAX`.
+    ///
+    /// That is the whole point of the shared impl. `refuse_wall_clock_hold`
+    /// reads `armed >= cap`, so a wrapped `armed` answers a marked `EBUSY`
+    /// to every later timer arm and every `Allow` open by that owner for
+    /// the life of the reactor - and `is_empty` can never be true again, so
+    /// the map entry is never reclaimed either. Saturating leaves a stuck
+    /// cap of one hold instead of a permanent refusal.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn a_hold_that_ends_twice_saturates_rather_than_wrapping() {
+        let mut w = WallClock::default();
+        w.arm();
+        w.ended(false);
+        w.ended(false);
+        assert_eq!(w.armed, 0, "the count wrapped");
+        assert!(w.is_empty(), "the owner's entry can still be reclaimed");
+
+        let mut w = WallClock::default();
+        w.park();
+        w.release_park();
+        w.release_park();
+        assert_eq!(w.retiring, 0, "the parked count wrapped");
+        assert!(w.is_empty());
+
+        let mut w = WallClock::default();
+        w.retract();
+        assert_eq!(
+            (w.armed, w.retiring),
+            (0, 1),
+            "a retraction with none armed"
+        );
+    }
+
+    /// The pairing itself, in both profiles: a retraction moves the count
+    /// rather than returning it, and the CQE that follows ends the half it
+    /// moved to.
+    #[test]
+    fn a_retraction_moves_the_count_and_the_cqe_ends_it() {
+        let mut w = WallClock::default();
+        w.arm();
+        w.retract();
+        assert_eq!((w.armed, w.retiring), (0, 1));
+        assert!(!w.is_empty(), "the slot has not freed yet");
+        w.ended(true);
+        assert!(w.is_empty());
+
+        // An `Allow` pair: one count, two slots, so it parks on whichever
+        // frees first and goes home with the second.
+        let mut w = WallClock::default();
+        w.arm();
+        w.ended(false);
+        w.park();
+        assert!(!w.is_empty(), "one count cannot go home with one of two");
+        w.release_park();
+        assert!(w.is_empty());
+    }
+}
+
 #[cfg(all(test, not(loom)))]
 mod routing_fuzz {
     use super::*;
@@ -7318,6 +7532,102 @@ mod routing_fuzz {
         assert_eq!(core.op_free_len_for_test(), 2, "both slots returned");
     }
 
+    /// A guard that ends without firing has still stopped bounding its
+    /// open, and the reachable ending is a prep failure: `push_sqe`
+    /// accepts the SQE - charge taken, cancel target recorded - while
+    /// `__io_timeout_prep` runs later inside `io_uring_enter` and can
+    /// answer `-ENOMEM` (`io_uring/timeout.c:554-556`), with
+    /// `io_submit_fail_init` posting a CQE under the guard's own tag.
+    /// Screened on `-ETIME` the token was discarded and nothing ever
+    /// cancelled the open, so an `Allow` open parked in `fifo_open`
+    /// held an io-wq worker, its op slot and its owner's charge for as
+    /// long as the peer liked.
+    #[test]
+    fn a_guard_that_never_armed_still_cancels_its_open() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(2, OffloadBounds::default());
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let raw = OpenHow::new().flags(OFlag::O_WRONLY).to_raw();
+        core.submit_open(
+            &mut eng,
+            77,
+            at.clone(),
+            c"planted".to_owned(),
+            raw,
+            false,
+            Some(std::time::Duration::from_secs(3600)),
+            FsWaiter::Pump { owner: (5, 9) },
+        );
+        assert!(!core.has_free_op(), "the open and its guard hold both");
+
+        // The guard's prep failed: it never armed, so nothing else will
+        // ever end the open.
+        let reaped =
+            core.on_cqe(&mut eng, TAG_OPEN_DEADLINE, 1, 0, -libc::ENOMEM);
+        assert!(matches!(reaped, ReapedFs::None), "the guard routes nowhere");
+        match core.on_cqe(&mut eng, TAG_OPEN, 0, 0, -libc::ECANCELED) {
+            ReapedFs::Pump(done, owner) => {
+                assert_eq!(owner, (5, 9));
+                assert!(
+                    done.was_refused(),
+                    "an open whose bound never armed ran on unmarked: \
+                     {:?} refused={}",
+                    done.result(),
+                    done.was_refused()
+                );
+            }
+            _ => panic!("the open was never cancelled"),
+        }
+        assert_eq!(core.op_free_len_for_test(), 2, "both slots returned");
+    }
+
+    /// The other half of the same screen: an *unmarked* `ECANCELED` on
+    /// the guard is a sweep or teardown, which stages the open's own
+    /// cancel and needs its `ECANCELED` to stay in teardown's
+    /// vocabulary. Marking there would tell a task that its connection
+    /// had one op refused, where what happened is that the connection
+    /// went away.
+    #[test]
+    fn a_swept_guard_leaves_its_open_in_teardown_s_vocabulary() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(2, OffloadBounds::default());
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let at = Anchor::open(dir.path()).expect("anchor");
+        let raw = OpenHow::new().flags(OFlag::O_WRONLY).to_raw();
+        core.submit_open(
+            &mut eng,
+            77,
+            at.clone(),
+            c"planted".to_owned(),
+            raw,
+            false,
+            Some(std::time::Duration::from_secs(3600)),
+            FsWaiter::Pump { owner: (5, 9) },
+        );
+        // The sweep stages a cancel for both, marking neither.
+        core.cancel_owned_by(&mut eng, vec![(5, 9)]);
+        let reaped =
+            core.on_cqe(&mut eng, TAG_OPEN_DEADLINE, 1, 0, -libc::ECANCELED);
+        assert!(matches!(reaped, ReapedFs::None), "the guard routes nowhere");
+        match core.on_cqe(&mut eng, TAG_OPEN, 0, 0, -libc::ECANCELED) {
+            ReapedFs::Pump(done, owner) => {
+                assert_eq!(owner, (5, 9));
+                assert!(
+                    !done.was_refused(),
+                    "a swept open answered as a refusal: {:?}",
+                    done.result()
+                );
+            }
+            _ => panic!("the open's completion was not routed"),
+        }
+        assert_eq!(core.op_free_len_for_test(), 2, "both slots returned");
+    }
+
     /// The live half of the trip: a planted FIFO with no writer parks
     /// the open on an io-wq worker, and the deadline is the only way it
     /// ends. Which spelling comes back depends on where the cancel's
@@ -7506,7 +7816,7 @@ mod pool_identity_tests {
 //
 // The eventfd is the `cfg(loom)` counter in `crate::uring::wake`, so what this
 // proves is conditional on a real eventfd accumulating pokes the same way.
-#[cfg(loom)]
+#[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
     use crate::uring::wake::WakeHandle;

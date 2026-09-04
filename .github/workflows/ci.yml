@@ -97,8 +97,12 @@ jobs:
     # The QEMU job (Trixie userspace, OpenSSL 3.2+ with ktls, real datasets)
     # arms TRUENAS_ROS_REQUIRE_KTLS and TRUENAS_ROS_REQUIRE_XATTRS and runs
     # both families for real.
+    # `--no-fail-fast`, so one target's failure does not hide every later
+    # target's. Without it cargo stops at the first failing binary and the
+    # log names one failure where there may be several - which is exactly
+    # the information a red lane is for.
     - name: test
-      run: cargo test --all-features
+      run: cargo test --all-features --no-fail-fast
       env:
         TRUENAS_ROS_REQUIRE_PYTHON: "1"
         TRUENAS_ROS_REQUIRE_IO_URING: "1"
@@ -108,7 +112,7 @@ jobs:
     # lane is what covers each guard's graceful `if` half (the `should_panic`
     # tests cover the assert half and are `#[cfg(debug_assertions)]`).
     - name: test (release)
-      run: cargo test --release --all-features
+      run: cargo test --release --all-features --no-fail-fast
       env:
         TRUENAS_ROS_REQUIRE_PYTHON: "1"
         TRUENAS_ROS_REQUIRE_IO_URING: "1"
@@ -133,11 +137,12 @@ jobs:
     # nothing exits 0, so a mistyped `--cfg looom` would read as a green lane.
     #
     # The filter selects by PATH, and every model lives in a module named
-    # `loom_tests`, so the module segment is what matches: renaming a model's
-    # `loom_` prefix does not change the count, and a test in one of those
-    # modules that is not a model is counted too (`sq_cq_ordering_spsc` is
-    # one, which is why this is 24 and not the 23 `fn loom_*` in the tree).
-    # The count is a tripwire on the total, not a census of models.
+    # `loom_tests`, so the module segment is what matches and a model's own
+    # `loom_` prefix does not change the count. Keep the prefix anyway:
+    # `CLAUDE.md` states it, and it is what makes the name alone say whether
+    # a `loom_tests` entry is a model. The count is a tripwire on the total,
+    # not a census - moving a model to a plain `tests` module drops it out
+    # of the filter and reddens the lane, which is the intended reaction.
     #
     # Exact, not a lower bound: `-lt` against a constant one below the true
     # count is the one failure this assertion exists to prevent. At
@@ -171,6 +176,18 @@ jobs:
         command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
         cd fuzz
         cargo +nightly fuzz build
+        # The census. `cargo fuzz list` reads the `[[bin]]` table, so a
+        # target added under `fuzz_targets/` and never registered there is
+        # built by nothing, smoked by nothing and fmt-checked by nothing -
+        # it just sits in the tree looking covered. Compare the two lists.
+        # shellcheck disable=SC2012
+        ls fuzz_targets/*.rs | xargs -n1 basename | sed 's/\.rs$//' \
+          | sort > /tmp/fuzz-on-disk
+        cargo +nightly fuzz list | sort > /tmp/fuzz-registered
+        if ! diff -u /tmp/fuzz-on-disk /tmp/fuzz-registered; then
+          echo "::error::fuzz target census mismatch (- on disk, + registered)"
+          exit 1
+        fi
         for t in $(cargo +nightly fuzz list); do
           # Targets share a dictionary where they share a wire format.
           dict=dicts/$t.dict

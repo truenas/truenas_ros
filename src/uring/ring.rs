@@ -387,16 +387,18 @@ impl RingFd {
     /// means asking for a smaller ring.
     pub(crate) fn setup(entries: u32) -> errno::Result<RingFd> {
         match Self::setup_kernel_memory(entries) {
-            // The retry's own errno is never the one reported. It can differ
-            // from `ENOMEM` only if this crate sized or aligned a region
-            // wrongly - `io_create_region` answers `EINVAL` for a misaligned
-            // `user_addr`/`size`, `io_pin_pages` `EFAULT` for a short one -
-            // and reporting either would describe a host merely out of
-            // contiguous memory as something it is not. `region_bytes` is
-            // pinned against the kernel's own layout by a test instead.
-            Err(Errno::ENOMEM) => {
-                Self::setup_with_own_memory(entries).map_err(|_| Errno::ENOMEM)
-            }
+            // The retry reports its own errno. It is not always a memory
+            // one: `io_uring_setup` allocates its descriptor after the ring
+            // regions, so a process at its `NOFILE` limit answers `EMFILE`;
+            // `kernel.io_uring_disabled` is a live sysctl, so a flip between
+            // the two attempts answers `EPERM`; and a kernel that rejects
+            // `IORING_SETUP_NO_MMAP` answers `EINVAL`. Test helpers treat
+            // `ENOMEM` as this environment rather than a defect
+            // (`super::setup_unavailable`), so reporting one of those as
+            // `ENOMEM` would skip the assertions behind it instead of
+            // failing. `region_bytes` is pinned against the kernel's own
+            // layout by a test.
+            Err(Errno::ENOMEM) => Self::setup_with_own_memory(entries),
             other => other,
         }
     }
@@ -1357,7 +1359,7 @@ mod tests {
 // C11 memory model; because the entry arrays are `loom` `UnsafeCell`s, any
 // SQE/CQE access not ordered by the Acquire/Release pairing is reported as a
 // data race (weaken a `Release` to `Relaxed` and the test fails).
-#[cfg(loom)]
+#[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
     use loom::sync::Arc;
@@ -1426,7 +1428,7 @@ mod loom_tests {
     }
 
     #[test]
-    fn sq_cq_ordering_spsc() {
+    fn loom_sq_cq_ordering_spsc() {
         loom::model(|| {
             // Keep tiny - loom is exhaustive - but **more ops than slots**.
             // Two ops over a *two*-slot ring reuses nothing: `try_reserve`

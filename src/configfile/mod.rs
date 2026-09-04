@@ -380,14 +380,19 @@ impl ConfigFile {
     /// an ordinary read.
     #[cfg(feature = "secrets")]
     pub fn read_secret_path(&mut self, path: &Path) -> Result<()> {
+        let source = path.display().to_string();
+        // Staged first, and the two settings below only once it has
+        // succeeded: both are one-way, so setting them ahead of a fallible
+        // read permanently downgrades an already-populated interpolating
+        // configuration to raw on a secret this call never got to read.
+        let staged = stage_secret_image(path)?;
         self.scrub = true;
         // Read secrets verbatim. Interpolation would route a value through
         // `before_get`, whose growing accumulator orphans partial-plaintext
         // copies in freed heap the scrub-on-drop never reaches; the module
         // doc already names raw the secrets configuration.
         self.interp = Interp::None;
-        let source = path.display().to_string();
-        match stage_secret_image(path)? {
+        match staged {
             None => parse::read(self, &source, ""),
             Some((mut mem, content)) => {
                 let slice = mem.as_mut_slice();
@@ -640,7 +645,14 @@ impl ConfigFile {
         &self,
         section: &str,
     ) -> Result<Option<Vec<(String, String)>>> {
-        if !self.sections.contains(section) {
+        // `DEFAULT` is not in `sections`, and asking for its pairs is not
+        // asking for a section that does not exist: `configparser.items`
+        // raises `NoSectionError` only `if section != self.default_section`,
+        // so there it answers the defaults. `has_option` and `raw_lookup`
+        // already carry the same special case. `options` deliberately does
+        // not - CPython's raises there, and the two are documented to
+        // disagree.
+        if !self.sections.contains(section) && section != DEFAULT_SECTION {
             return Ok(None);
         }
         let view = self.merged_view(section);
@@ -1250,6 +1262,75 @@ mod tests {
             Some("postgres://%(user)s@h"),
             "a secret value must be read verbatim, not interpolated"
         );
+    }
+
+    /// `items("DEFAULT")` answers the defaults, as `configparser` does.
+    ///
+    /// `sections()` excludes `DEFAULT` in both, so keying the "no such
+    /// section" refusal on it alone made this one shape answer `None`
+    /// where CPython answers the pairs: its `items` raises
+    /// `NoSectionError` only `if section != self.default_section`.
+    /// `has_option` and `raw_lookup` already carry the same special case;
+    /// `options` deliberately does not, because CPython's raises there.
+    #[test]
+    fn items_answers_the_default_section() {
+        let mut cfg = ConfigFile::raw();
+        cfg.read_str("[DEFAULT]\na = 1\nb = 2\n[s]\nb = 3\nc = 4\n")
+            .unwrap();
+        assert_eq!(
+            cfg.items("DEFAULT").unwrap(),
+            Some(vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string()),
+            ])
+        );
+        // A section that really is absent still answers `None`, and
+        // `options` keeps CPython's answer for `DEFAULT`.
+        assert_eq!(cfg.items("nope").unwrap(), None);
+        assert_eq!(cfg.options("DEFAULT"), None);
+        // And the ordinary section is unchanged: defaults first, then the
+        // section's own additions, with its overrides in place.
+        assert_eq!(
+            cfg.items("s").unwrap(),
+            Some(vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "3".to_string()),
+                ("c".to_string(), "4".to_string()),
+            ])
+        );
+    }
+
+    /// A secret read that fails leaves the configuration as it found it.
+    ///
+    /// `scrub` and `interp` are both one-way, so setting them ahead of the
+    /// staging read permanently downgraded an already-populated
+    /// interpolating configuration to raw over a secret that was never
+    /// read. Driven with an absent path, which is the same failure a
+    /// permission denial or a non-regular file takes; a host without
+    /// `memfd_secret` reaches it one call earlier and asserts the same
+    /// thing.
+    #[cfg(feature = "secrets")]
+    #[test]
+    fn a_refused_secret_read_does_not_downgrade_the_configuration() {
+        let mut cfg = ConfigFile::new();
+        cfg.read_str("[DEFAULT]\nbase = /srv\n[p]\ndir = %(base)s/data\n")
+            .unwrap();
+        assert_eq!(
+            cfg.get("p", "dir").unwrap().as_deref(),
+            Some("/srv/data"),
+            "interpolating before the refused read"
+        );
+
+        let dir = crate::tempdir().unwrap();
+        cfg.read_secret_path(&dir.path().join("nope.ini"))
+            .expect_err("an absent secret must fail");
+
+        assert_eq!(
+            cfg.get("p", "dir").unwrap().as_deref(),
+            Some("/srv/data"),
+            "a refused secret read downgraded the configuration to raw"
+        );
+        assert!(!cfg.scrub, "and marked it scrubbed");
     }
 
     /// The staged image really is `memfd_secret` memory: its VMA carries

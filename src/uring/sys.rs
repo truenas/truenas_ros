@@ -405,6 +405,8 @@ pub(crate) struct IoUringBufReg {
     pub(crate) min_left: u32,
     pub(crate) resv: [u32; 5],
 }
+#[cfg(feature = "net-server")]
+const _: () = assert!(core::mem::size_of::<IoUringBufReg>() == 40);
 
 /// One entry of a provided-buffer ring.
 ///
@@ -421,6 +423,11 @@ pub(crate) struct IoUringBuf {
     /// Reserved - except on entry zero, where this is the ring's `tail`.
     pub(crate) resv: u16,
 }
+// Load-bearing twice over: this fixes the descriptor stride the kernel
+// walks, and it is what makes entry zero's `resv` overlay the published
+// tail (`BufRing::post`).
+#[cfg(feature = "net-server")]
+const _: () = assert!(core::mem::size_of::<IoUringBuf>() == 16);
 
 /// SQE flag: take this op's buffer from the group named in `sqe.buf_group`
 /// instead of `sqe.addr`.
@@ -476,6 +483,7 @@ pub(crate) struct IoUringProbeOp {
     pub flags: u16,
     pub resv2: u32,
 }
+const _: () = assert!(core::mem::size_of::<IoUringProbeOp>() == 8);
 
 /// `struct io_uring_probe` header (16 bytes), followed by `nr_args`
 /// [`IoUringProbeOp`] entries. `last_op` is the highest opcode the kernel
@@ -488,6 +496,7 @@ pub(crate) struct IoUringProbeHeader {
     pub resv: u16,
     pub resv2: [u32; 3],
 }
+const _: () = assert!(core::mem::size_of::<IoUringProbeHeader>() == 16);
 
 // -------------------------------------------------------------------------
 // Syscall wrappers (modeled on src/namespace.rs / src/mount/open_tree.rs)

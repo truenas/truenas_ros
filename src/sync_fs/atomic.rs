@@ -54,7 +54,13 @@ impl Default for AtomicWriteOptions {
 /// `RESOLVE_NO_SYMLINKS`.
 ///
 /// `write_fn` receives the temporary [`File`] directly, so it can use the full
-/// [`std::io`] API (or anything built on it).
+/// [`std::io`] API (or anything built on it). It is handed a file that is
+/// still owner-private and at neither the requested mode nor the requested
+/// owner: both land afterwards, because a write to a regular file makes the
+/// kernel drop `S_ISUID`/`S_ISGID` and a chown before the write would open
+/// the staged bytes to the target uid. One consequence for a `write_fn` with
+/// side effects: an ownership or mode that cannot be applied is now
+/// discovered **after** it has run, not before.
 pub fn atomic_write<F>(
     target: &Path,
     opts: AtomicWriteOptions,
@@ -111,19 +117,35 @@ where
     let uid = opts.uid.or_else(|| inherit.map(|s| s.uid()));
     let gid = opts.gid.or_else(|| inherit.map(|s| s.gid()));
 
-    // Create the temp file, set its owner/mode, then hand it to the caller.
-    let (tmp_name, mut file) = create_temp(dir, name, opts.mode)?;
-    if let Err(e) = set_owner_and_mode(&file, uid, gid, opts.mode) {
+    // The data lands first, and the owner and mode only once it has.
+    //
+    // An unprivileged write to a regular file makes the kernel drop its
+    // setuid/setgid bits (`file_remove_privs_flags`, `fs/inode.c`, through
+    // `setattr_should_drop_suidgid`, `fs/attr.c:63-78`), so a mode applied
+    // to the staging file *before* `write_fn` publishes a file that has
+    // silently lost them - `mode: 0o4755` arriving as `0o755` with an `Ok`
+    // return. Invisible to a privileged writer, which keeps them under
+    // `CAP_FSETID`, so this order is what makes the option mean the same
+    // thing for both. `copy_into` states the same rule for `copytree`.
+    //
+    // The same ordering closes the other half: chowning the staging file to
+    // the target uid while it is still empty hands that uid a window on the
+    // bytes as they are written. `create_temp` stages owner-private for as
+    // long as that window lasts.
+    let (tmp_name, mut file) = create_temp(dir, name)?;
+    let staged = write_fn(&mut file)
+        .and_then(|()| file.flush())
+        .map_err(|e| Error::from(Errno::try_from(e).unwrap_or(Errno::EIO)))
+        .and_then(|()| set_owner_and_mode(&file, uid, gid, opts.mode))
+        .and_then(|()| {
+            file.sync_all().map_err(|e| {
+                Error::from(Errno::try_from(e).unwrap_or(Errno::EIO))
+            })
+        });
+    drop(file);
+    if let Err(e) = staged {
         let _ = unlinkat(dir, &tmp_name);
         return Err(e);
-    }
-    let written = write_fn(&mut file)
-        .and_then(|()| file.flush())
-        .and_then(|()| file.sync_all());
-    drop(file);
-    if let Err(e) = written {
-        let _ = unlinkat(dir, &tmp_name);
-        return Err(Errno::try_from(e).unwrap_or(Errno::EIO).into());
     }
 
     // Move into place.
@@ -202,7 +224,6 @@ pub fn atomic_replace(
 fn create_temp(
     dir: BorrowedFd<'_>,
     target_name: &OsStr,
-    mode: u32,
 ) -> Result<(OsString, File)> {
     let mut rand = [0u8; 16];
     // getrandom fully fills any request of <= 256 bytes (flags 0), so on success
@@ -230,7 +251,10 @@ fn create_temp(
                 | OFlag::O_NOFOLLOW
                 | OFlag::O_CLOEXEC,
         )
-        .mode(Mode::from_bits_truncate(mode as libc::mode_t))
+        // Owner-private while the caller writes: the real mode - and the
+        // real owner - land afterwards, so nothing else can read the file
+        // through the staging name while it is being filled.
+        .mode(Mode::from_bits_truncate(0o600))
         .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS);
     let fd = openat2(dir, name.as_os_str(), how)?;
     Ok((name, File::from(fd)))
@@ -287,6 +311,48 @@ mod tests {
             fsync_dir(read_end.as_fd()),
             Err(Error::Errno(Errno::EINVAL))
         ));
+    }
+
+    /// The mode lands **after** the data, so a setuid/setgid bit survives to
+    /// the published file.
+    ///
+    /// An unprivileged write to a regular file makes the kernel drop those
+    /// bits (`file_remove_privs_flags`, `fs/inode.c`, via
+    /// `setattr_should_drop_suidgid`, `fs/attr.c:63-78`), so a mode applied
+    /// to the staging file before `write_fn` publishes `0o755` for a
+    /// requested `0o4755` and returns `Ok`. The effect is **invisible to a
+    /// privileged writer**, which keeps the bits under `CAP_FSETID` - so
+    /// what is asserted here is the order itself, which a test can see
+    /// whatever it is running as: the staging file the caller is handed is
+    /// still owner-private, and the mode only appears afterwards.
+    #[test]
+    fn the_mode_lands_after_the_data_not_before_it() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::tempdir().unwrap();
+        let target = dir.path().join("cfg");
+
+        let seen = std::cell::Cell::new(0u32);
+        atomic_write(
+            &target,
+            AtomicWriteOptions {
+                mode: 0o4755,
+                ..Default::default()
+            },
+            |f| {
+                seen.set(f.metadata()?.mode() & 0o7777);
+                f.write_all(b"payload")
+            },
+        )
+        .expect("write");
+
+        assert_eq!(
+            seen.get(),
+            0o600,
+            "the caller wrote into a file already at its final mode"
+        );
+        let st = std::fs::metadata(&target).unwrap();
+        assert_eq!(st.mode() & 0o7777, 0o4755, "the published mode");
+        assert_eq!(std::fs::read(&target).unwrap(), b"payload");
     }
 
     // A planted symlink must not be followed for the write nor adopted for the

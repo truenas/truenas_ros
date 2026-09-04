@@ -746,6 +746,13 @@ fn a_known_length_put_streams_without_copying() {
 fn pipelined_known_length_streams_do_not_desync() {
     use std::sync::atomic::AtomicUsize;
 
+    // Allocates ~20 buffers over `BIG` through a live server. The counter
+    // is process-global and this binary's tests run as parallel threads,
+    // so without the turn those land inside another test's measurement
+    // window - reddening a correct suite, or raising a differential's
+    // baseline arm enough to admit the regression it exists to catch.
+    let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+
     let opens = std::sync::Arc::new(AtomicUsize::new(0));
     let ends = std::sync::Arc::new(AtomicUsize::new(0));
     let (o, e) = (std::sync::Arc::clone(&opens), std::sync::Arc::clone(&ends));

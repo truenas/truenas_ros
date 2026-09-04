@@ -241,7 +241,23 @@ pub fn copytree_reporting(
     // makes the 0o700 hold above true of an existing root too. Where an ACL
     // governs the mode (ZFS aclmode=restricted) the chmod is rejected; there
     // the ACL is authoritative for visibility, so proceed rather than refuse.
+    //
+    // A group-or-other bit is also how a *borrowed* root is recognised: one
+    // this copy created is 0o700 at most, since umask can only narrow it. A
+    // borrowed root's mode has to go back if the copy does not finish, and
+    // only the success path restores one - `finish_dir` stamps the source
+    // root's mode from the root frame, reached only after the walk
+    // completes, so every `?` on the way out left a directory this copy did
+    // not create at 0o700 with the original recorded nowhere for the caller
+    // to put back either. On a share or system-dataset migration that locks
+    // every non-owner identity out of the destination, and the returned
+    // error names no permission change.
+    let mut borrowed = None;
     if dst_self_st.mode() & 0o077 != 0 {
+        borrowed = Some((
+            crate::fd::dup_cloexec(dst_root.as_fd())?,
+            (dst_self_st.mode() & 0o7777) as libc::mode_t,
+        ));
         ok_if_acl_governed(fchmod_fd(dst_root.as_fd(), 0o700))?;
     }
 
@@ -257,7 +273,7 @@ pub fn copytree_reporting(
         .unwrap_or_else(|| src.to_string_lossy().into_owned());
 
     // Primary filesystem.
-    copy_one_mount(
+    let mut outcome = copy_one_mount(
         src_root.as_fd(),
         src,
         fs_name,
@@ -268,11 +284,11 @@ pub fn copytree_reporting(
         progress,
         &mut stats,
         &mut counter,
-    )?;
+    );
 
     // Child mounts, as a post-pass.
-    if config.traverse {
-        traverse_child_mounts(
+    if outcome.is_ok() && config.traverse {
+        outcome = traverse_child_mounts(
             src,
             dst,
             &dst_self_st,
@@ -281,7 +297,16 @@ pub fn copytree_reporting(
             progress,
             &mut stats,
             &mut counter,
-        )?;
+        );
+    }
+    if let Err(e) = outcome {
+        // Best-effort, and it must not displace the error that got here:
+        // the caller is being told the copy failed, and a failure to put
+        // the mode back is not the thing to report instead of that.
+        if let Some((fd, mode)) = borrowed {
+            let _ = ok_if_acl_governed(fchmod_fd(fd.as_fd(), mode));
+        }
+        return Err(e);
     }
 
     progress(&CopyTreeProgress {
@@ -556,17 +581,15 @@ fn make_file(
     let Some(tmp) = tmp_name else {
         return res;
     };
-    // One step from the temporary name to the destination name, so a reader
-    // sees either the entry that was there or the finished copy, never a
-    // partial one.
-    let res = res.and_then(|n| {
-        renameat2(parent, tmp.as_os_str(), parent, name, RenameFlags::empty())?;
-        Ok(n)
-    });
-    if res.is_err() {
-        let _ = unlink_at(parent, &tmp);
-    }
-    res
+    let n = match res {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = unlink_at(parent, &tmp);
+            return Err(e);
+        }
+    };
+    rename_over(parent, tmp.as_os_str(), name)?;
+    Ok(n)
 }
 
 /// Copy `src`'s data then metadata into the destination file just created at
@@ -599,6 +622,14 @@ fn create_temp(
     dir: BorrowedFd<'_>,
     how: OpenHow,
 ) -> Result<(OsString, OwnedFd)> {
+    let name = temp_name()?;
+    let fd = openat2(dir, name.as_os_str(), how)?;
+    Ok((name, fd))
+}
+
+/// A fresh staging name, for the three creators that replace a taken
+/// destination by building beside it and renaming over.
+fn temp_name() -> Result<OsString> {
     let mut rand = [0u8; 16];
     // getrandom fully fills any request of <= 256 bytes (flags 0), so on success
     // the whole buffer is populated; only the error case needs handling.
@@ -611,11 +642,28 @@ fn create_temp(
         name.push(char::from(HEX[(b >> 4) as usize]));
         name.push(char::from(HEX[(b & 0x0f) as usize]));
     }
-    let name = OsString::from(name);
-    let fd = openat2(dir, name.as_os_str(), how)?;
-    Ok((name, fd))
+    Ok(OsString::from(name))
 }
 
+/// Move `tmp` onto `name` in `dir`, unlinking the staging entry if the
+/// rename fails. One step, so a reader sees either the entry that was
+/// there or the finished copy, never a partial one.
+fn rename_over(dir: BorrowedFd<'_>, tmp: &OsStr, name: &OsStr) -> Result<()> {
+    let res = renameat2(dir, tmp, dir, name, RenameFlags::empty());
+    if res.is_err() {
+        let _ = unlink_at(dir, tmp);
+    }
+    res.map_err(Into::into)
+}
+
+/// Recreate a symbolic link at `name`, pointing where `src` points.
+///
+/// With `exist_ok` a taken name is **replaced**, the way [`make_file`]
+/// replaces one: keeping whatever is there leaves a destination whose entry
+/// types and link targets diverge from the source while `copytree` returns
+/// `Ok` and counts the link in its stats. An incremental or re-run copy is
+/// exactly where that shows up, and a name pre-created as a regular file
+/// would survive a symlink source verbatim.
 fn make_symlink(
     parent: BorrowedFd<'_>,
     name: &OsStr,
@@ -623,7 +671,24 @@ fn make_symlink(
     config: &CopyTreeConfig,
 ) -> Result<()> {
     let target = read_link_fd(src)?;
-    let res = target.as_os_str().with_tn_path(|t| {
+    match symlink_at(parent, name, target.as_os_str()) {
+        Ok(()) => Ok(()),
+        Err(Errno::EEXIST) if config.exist_ok => {
+            let tmp = temp_name()?;
+            symlink_at(parent, tmp.as_os_str(), target.as_os_str())?;
+            rename_over(parent, tmp.as_os_str(), name)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `symlinkat`, with the errno surfaced so the caller can act on `EEXIST`.
+fn symlink_at(
+    parent: BorrowedFd<'_>,
+    name: &OsStr,
+    target: &OsStr,
+) -> std::result::Result<(), Errno> {
+    let res = target.with_tn_path(|t| {
         name.with_tn_path(|n| {
             retry_on_eintr(|| unsafe {
                 libc::symlinkat(t.as_ptr(), parent.as_raw_fd(), n.as_ptr())
@@ -632,9 +697,7 @@ fn make_symlink(
     })?;
     match res {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(Errno::EEXIST)) if config.exist_ok => Ok(()),
-        Ok(Err(e)) => Err(e.into()),
-        Err(e) => Err(e.into()),
+        Ok(Err(e)) | Err(e) => Err(e),
     }
 }
 
@@ -668,12 +731,47 @@ fn make_special(
     src_st: &Statx,
     config: &CopyTreeConfig,
 ) -> Result<()> {
-    // `mknodat`'s mode is umask-masked, so the exact permission bits are
-    // restored below; `rdev` is 0 for FIFOs/sockets and the device number for
-    // block/character devices. The `S_IFMT` bits in `mode` select the type.
-    // setid is masked at creation - `vfs_mknod` passes it through, and it must
-    // not land before the node's ownership is settled.
     let mode = src_st.mode() as libc::mode_t;
+    // With `exist_ok` a taken name is **replaced**, the way `make_file`
+    // replaces one: the node is built beside it and renamed over. Keeping
+    // whatever is there leaves a destination whose entry types diverge from
+    // the source - a name pre-created as a regular file survives a FIFO
+    // source verbatim - while `copytree` returns `Ok` and counts the
+    // special in its stats. Every exit from here on has to take the
+    // staging entry with it, which is what the two-step tail below is.
+    let staged = match mknod_at(parent, name, mode, src_st) {
+        Ok(()) => None,
+        Err(Errno::EEXIST) if config.exist_ok => {
+            let tmp = temp_name()?;
+            mknod_at(parent, tmp.as_os_str(), mode, src_st)?;
+            Some(tmp)
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let at: &OsStr = staged.as_deref().unwrap_or(name);
+    let outcome = make_special_meta(parent, at, name, src_st, config);
+    match (staged, outcome) {
+        (None, r) => r,
+        (Some(tmp), Ok(())) => rename_over(parent, tmp.as_os_str(), name),
+        (Some(tmp), Err(e)) => {
+            let _ = unlink_at(parent, tmp.as_os_str());
+            Err(e)
+        }
+    }
+}
+
+/// `mknodat` for `src_st`'s type, with the errno surfaced so the caller can
+/// act on `EEXIST`. setid is masked at creation - `vfs_mknod` passes it
+/// through, and it must not land before the node's ownership is settled.
+fn mknod_at(
+    parent: BorrowedFd<'_>,
+    name: &OsStr,
+    mode: libc::mode_t,
+    src_st: &Statx,
+) -> std::result::Result<(), Errno> {
+    // `mknodat`'s mode is umask-masked, so the exact permission bits are
+    // restored by the caller; `rdev` is 0 for FIFOs/sockets and the device
+    // number for block/character devices. The `S_IFMT` bits select the type.
     let res = name.with_tn_path(|n| {
         retry_on_eintr(|| unsafe {
             libc::mknodat(
@@ -684,12 +782,20 @@ fn make_special(
             )
         })
     })?;
-    match res {
-        Ok(_) => {}
-        Err(Errno::EEXIST) if config.exist_ok => return Ok(()),
-        Err(e) => return Err(e.into()),
-    }
+    res.map(drop)
+}
 
+/// Validate the node just created at `at` and set its ownership, mode and
+/// timestamps. `name` is the destination the node is destined for, and is
+/// only used to name it in an error.
+fn make_special_meta(
+    parent: BorrowedFd<'_>,
+    at: &OsStr,
+    name: &OsStr,
+    src_st: &Statx,
+    config: &CopyTreeConfig,
+) -> Result<()> {
+    let mode = src_st.mode() as libc::mode_t;
     // Pin the new node and set every attribute below through this handle, so
     // the name resolves exactly once and cannot be redirected between the
     // mknod and these calls. `O_PATH` because a FIFO or device must not be
@@ -697,7 +803,7 @@ fn make_special(
     // method), and it is all the `AT_EMPTY_PATH` calls need.
     let node = openat2(
         parent,
-        name,
+        at,
         OpenHow::new()
             .flags(OFlag::O_PATH | OFlag::O_NOFOLLOW)
             .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
@@ -771,17 +877,39 @@ fn make_special(
     Ok(())
 }
 
+/// The names to consider copying off `fd`, or an empty list where the copy
+/// flags ask for none.
+///
+/// Routed through [`guard`] like every other metadata step, because listing
+/// the names is one: `raise_error: false` is the mode a migration uses to
+/// salvage a tree, and this was the one metadata call that propagated
+/// regardless. `flistxattr` really does fail on a well-formed file - the
+/// kernel clamps its buffer to `XATTR_LIST_MAX` (65536, `limits.h:17`, and
+/// not raised by the patch that lifts xattr *values* to 2 MiB) and rewrites
+/// the resulting `ERANGE` to `E2BIG` (`listxattr`, `fs/xattr.c:989-993`),
+/// while ZFS with `xattr=sa` accepts far more name bytes than that. Two of
+/// the three callers are directory-frame initialisers, so one directory
+/// with a large name list killed the copy of everything beneath it.
+///
+/// The degraded entry still gets its mode, owner and timestamps:
+/// `copy_permissions` takes its `fchmod` branch when no ACL name is in the
+/// list.
 fn list_xattrs(
     fd: BorrowedFd<'_>,
     config: &CopyTreeConfig,
 ) -> Result<Vec<CString>> {
-    if config
+    if !config
         .flags
         .intersects(CopyFlags::PERMISSIONS | CopyFlags::XATTRS)
     {
-        Ok(flistxattr(fd)?)
-    } else {
-        Ok(Vec::new())
+        return Ok(Vec::new());
+    }
+    match flistxattr(fd) {
+        Ok(names) => Ok(names),
+        Err(e) => {
+            guard(config, Err(e.into()))?;
+            Ok(Vec::new())
+        }
     }
 }
 
@@ -926,4 +1054,65 @@ fn read_link_fd(fd: BorrowedFd<'_>) -> Result<PathBuf> {
     // probe behind it.
     buf.shrink_to_fit();
     Ok(PathBuf::from(OsString::from_vec(buf)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Listing an entry's xattr names is a metadata step and honours
+    /// `raise_error` like every other one.
+    ///
+    /// It was the one that did not: a source whose name list the kernel
+    /// refuses failed the whole copy in **both** modes, and two of the three
+    /// call sites are directory-frame initialisers, so one such directory
+    /// killed the copy of everything beneath it. `E2BIG` is reachable on a
+    /// well-formed file (`listxattr`, `fs/xattr.c:989-993`, clamping at
+    /// `XATTR_LIST_MAX`); driven here through an `O_PATH` handle, which the
+    /// whole `f*xattr` family refuses with `EBADF`, because that needs no
+    /// filesystem willing to hold 64 KiB of names.
+    #[test]
+    fn listing_xattr_names_honours_raise_error() {
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("f"), b"x").expect("write");
+        let fd = openat2(
+            AT_FDCWD,
+            &dir.path().join("f"),
+            OpenHow::new().flags(OFlag::O_PATH | OFlag::O_NOFOLLOW),
+        )
+        .expect("O_PATH open");
+
+        let raising = CopyTreeConfig {
+            raise_error: true,
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                list_xattrs(fd.as_fd(), &raising),
+                Err(Error::Errno(Errno::EBADF))
+            ),
+            "a refused name list must surface where the caller asked for it"
+        );
+
+        let salvaging = CopyTreeConfig {
+            raise_error: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            list_xattrs(fd.as_fd(), &salvaging).expect("degrades"),
+            Vec::<CString>::new(),
+            "the mode a migration uses to salvage a tree must not fail here"
+        );
+
+        // And with neither flag asked for, the call is never made at all.
+        let bare = CopyTreeConfig {
+            flags: CopyFlags::TIMESTAMPS,
+            raise_error: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            list_xattrs(fd.as_fd(), &bare).expect("no names"),
+            Vec::<CString>::new()
+        );
+    }
 }

@@ -671,9 +671,12 @@ impl<U> Reactor<U> {
     }
 
     /// Cancel the kTLS-splice watchdog once its body finishes (or its
-    /// connection closes): clears the flag and issues an `ASYNC_CANCEL` for
-    /// the in-flight `TIMEOUT`. The cancelled timer completes `-ECANCELED`,
-    /// which `on_splice_deadline` ignores (it acts only on `-ETIME`).
+    /// connection closes): clears the flag, counts the completion the timer
+    /// still owes ([`Connection::splice_deadline_owed`]) and issues an
+    /// `ASYNC_CANCEL` for the in-flight `TIMEOUT`. Either ending - the
+    /// cancel's `-ECANCELED` or an expiry that beat it - is consumed
+    /// against that count, because the successor watchdog is armed one
+    /// dispatch later under identical `user_data`.
     pub(crate) fn cancel_splice_deadline(
         &mut self,
         slot: u32,
@@ -682,6 +685,10 @@ impl<U> Reactor<U> {
         let armed = match self.table.get_conn_mut(slot) {
             Some(conn) if conn.splice_deadline_armed => {
                 conn.splice_deadline_armed = false;
+                // Owed whether or not the cancel below stages, and
+                // whether or not it wins: the timer is in flight, so a
+                // completion is coming either way.
+                conn.splice_deadline_owed += 1;
                 true
             }
             _ => false,
@@ -715,6 +722,25 @@ impl<U> Reactor<U> {
         generation: u32,
         res: i32,
     ) -> errno::Result<()> {
+        // A retired watchdog still owes one completion, and the retire
+        // only staged its cancel - `run_loop` submits at the top of the
+        // next iteration, after this reap loop drains. So the old
+        // timer's `-ETIME` can already be posted when its body finishes
+        // "just inside" the period, while the successor is armed one
+        // dispatch later inside the same batch
+        // (`on_splice_recv_complete` -> pump -> `submit_splice_recv`).
+        // Read off the flag alone that expiry takes the live path and
+        // reaches `Next::Cancel` - `splice_watermark` equals
+        // `splice_remaining` at every arm - so it cancels the
+        // *successor's* splice, which completes `-ECANCELED` and is
+        // classified `RequestTimeout`: a healthy transfer killed at its
+        // first record, with the watchdog now disarmed.
+        if let Some(conn) = self.table.conn_at_cqe_mut(slot, generation)
+            && conn.splice_deadline_owed > 0
+        {
+            conn.splice_deadline_owed -= 1;
+            return Ok(());
+        }
         if res != -libc::ETIME {
             return Ok(()); // a cancel completion - not a real expiry
         }
@@ -764,9 +790,13 @@ impl<U> Reactor<U> {
     /// (`a_chunk_scan_budget_is_not_restarted_by_progress`). The early return
     /// below is dedup only - one timer in flight rather than one per chunk
     /// read; a stacked timer would not break the bound, since
-    /// `on_receipt_deadline` discards an expiry whose flag is already clear.
+    /// `on_receipt_deadline` charges an expiry it did not arm to the
+    /// retired count instead.
     ///
     /// Keyed `(slot, generation)`, so a recycled slot's expiry is inert.
+    /// That is the slot's generation, not the timer's, so it does **not**
+    /// tell one budget from its successor - `receipt_deadline_owed` is
+    /// what does.
     /// No-op unless `max_receipt_time` is set.
     #[cfg(feature = "net-server")]
     fn arm_receipt_deadline(
@@ -842,6 +872,9 @@ impl<U> Reactor<U> {
         let armed = match self.table.get_conn_mut(slot) {
             Some(conn) if conn.receipt_deadline_armed => {
                 conn.receipt_deadline_armed = false;
+                // See `splice_deadline_owed`: the completion is owed
+                // whatever the cancel below does.
+                conn.receipt_deadline_owed += 1;
                 true
             }
             _ => false,
@@ -862,7 +895,10 @@ impl<U> Reactor<U> {
     ///
     /// A `-ECANCELED` is the retire path's own cancel and means the message
     /// landed in time. A stale `-ETIME` - the timer expiring after its
-    /// cancel was staged - finds the flag already clear and does nothing.
+    /// cancel was staged - is consumed against
+    /// [`Connection::receipt_deadline_owed`], not against the flag: the
+    /// successor can be armed before the stale expiry is reaped, and the
+    /// two carry identical `user_data`.
     #[cfg(feature = "net-server")]
     pub(crate) fn on_receipt_deadline(
         &mut self,
@@ -870,6 +906,19 @@ impl<U> Reactor<U> {
         generation: u32,
         res: i32,
     ) -> errno::Result<()> {
+        // The retired budget's own completion - see
+        // `Connection::receipt_deadline_owed`. `deliver_one` retires and
+        // `pump -> submit_recv -> arm_receipt_deadline` re-arms inside
+        // one dispatch, and the retire is where the old deadline sits,
+        // so a peer that finished just inside its budget posts an
+        // `-ETIME` that the successor's flag would answer with
+        // `ReceiptTimeout` on a connection that did nothing wrong.
+        if let Some(conn) = self.table.conn_at_cqe_mut(slot, generation)
+            && conn.receipt_deadline_owed > 0
+        {
+            conn.receipt_deadline_owed -= 1;
+            return Ok(());
+        }
         if res != -libc::ETIME {
             return Ok(()); // a cancel completion - not a real expiry
         }
@@ -1180,6 +1229,44 @@ impl<U> Reactor<U> {
         conn.ops += 1;
         let single = conn.send_single();
         let ktls = conn.is_ktls();
+        // SECURITY: over kTLS, a positive send completion is NOT delivery,
+        // and this reactor cannot make it one.
+        //
+        // `tls_sw_sendmsg` accepts bytes into records that may still sit in
+        // the layer's own `tx_list`. The teardown's `SHUTDOWN(SHUT_RDWR)`
+        // is not a TLS operation - the ULP overrides `close` and `sendmsg`,
+        // never `shutdown` (`net/tls/tls_main.c:949-976`) - so it sets
+        // `SEND_SHUTDOWN`, and the `CLOSE` behind it finds every remaining
+        // record unsendable: `tls_sw_release_resources_tx`
+        // (`net/tls/tls_sw.c:2602`) does try `tls_tx_records` first, but
+        // `tcp_sendmsg_locked` refuses a shut-down socket, so the loop below
+        // it frees them. The peer reads a clean FIN and this server counts a
+        // reply. Measured at one whole 16384-byte record.
+        //
+        // **The obvious remedy is closed, and it is worth saying which.**
+        // What decides it is whether the `sendmsg` carries `MSG_DONTWAIT`:
+        // `tls_tx_records(sk, -1)` at close replays each record's own
+        // `rec->tx_flags`, so a record queued blocking would be pushed
+        // blocking. io_uring adds `MSG_DONTWAIT` whenever it issues with
+        // `IO_URING_F_NONBLOCK` (`io_uring/net.c:566-567`, `:664-665`), and
+        // `IOSQE_ASYNC` does **not** take that away for a socket:
+        // `io_wq_submit_work` puts the flag straight back for any pollable
+        // opcode on a pollable file (`io_uring/io_uring.c:1982-1988`), and
+        // `SEND`/`SENDMSG` are both `.pollout = 1`. Measured on this kernel:
+        // a forced-async `SEND` of 4 MiB into a 4 KiB sndbuf with the peer
+        // not reading returns a short count of 8064 in 5 ms rather than
+        // blocking. On `-EAGAIN` the same loop arms poll and returns, so the
+        // blocking retry two lines further down is unreachable for a socket
+        // as well. There is no SQE flag that yields a blocking `sendmsg`
+        // here.
+        //
+        // What is left is a policy call the reactor cannot make for the
+        // deployment: drop the `SHUT_RDWR` for kTLS so the close at least
+        // attempts the flush (partial - the records still carry
+        // `MSG_DONTWAIT`, so it pushes only what the sndbuf takes at that
+        // instant, and `close` on a socket with unread receive data sends
+        // RST rather than FIN), or delay the teardown after the last send
+        // by a grace period, which is a duration nothing here can derive.
         let msg = conn.send_msg_ptr();
         // A one-PDU gather takes the plain `SEND` opcode (ptr/len in the SQE,
         // no msghdr import); `SENDMSG` is reserved for real multi-PDU gathers.
@@ -1544,6 +1631,34 @@ impl<U> Reactor<U> {
         self.table.conn_mut(slot).set_recv_owned();
         self.sync_recv_buf_stats();
         Ok(true)
+    }
+
+    /// Whether a connection other than `slot` is currently splicing a body
+    /// to `fd` - the destination-sharing refusal
+    /// ([`CloseReason::SpliceFdInUse`]).
+    ///
+    /// `splice_fd` is only meaningful while one of the two in-flight marks
+    /// is set: it keeps its last value after a body finishes, and a
+    /// connection that has never spliced holds `-1`.
+    ///
+    /// Every state that owns a `Connection`, not just `Serving`. A body in
+    /// flight is what makes the destination unsafe to share, and the cost of
+    /// missing one is two bodies interleaved on the same pipe - so the scan
+    /// is deliberately wider than the states that can reach it today.
+    pub(crate) fn splice_fd_in_use(&self, slot: u32, fd: RawFd) -> bool {
+        use crate::net::core::table::SlotState;
+        self.table.iter().any(|(i, e)| {
+            if i == slot {
+                return false;
+            }
+            let (SlotState::Serving(c)
+            | SlotState::Detaching(c)
+            | SlotState::Detached(c)) = &e.state
+            else {
+                return false;
+            };
+            (c.splicing || c.splice_polling) && c.splice_fd == fd
+        })
     }
 
     /// Hand back a pool buffer the next read has outgrown, so the read can
@@ -2292,6 +2407,51 @@ impl<U> Reactor<U> {
                     )?;
                     return Ok(Enacted::Done);
                 }
+                // SECURITY: one destination, one body. A splice moves at
+                // most what the transport hands over in one call - over
+                // kTLS, one TLS record - and `on_splice_recv_complete`
+                // resubmits the remainder as a *fresh* op. Between the two,
+                // another connection's splice can take the pipe's mutex and
+                // write its own bytes, so two bodies sharing a destination
+                // interleave. The head-of-line stall a shared pipe also
+                // causes is the same configuration seen from the other end.
+                //
+                // A scan, not a set: this runs once per body (the resubmits
+                // go straight to `submit_splice_recv`), it is bounded by
+                // `pool_size`, and it carries no lifecycle of its own - a
+                // set would need unwinding on every teardown path, which is
+                // exactly where a leak would hide.
+                if self.splice_fd_in_use(slot, fd) {
+                    self.close_conn(
+                        slot,
+                        generation,
+                        CloseReason::SpliceFdInUse,
+                    )?;
+                    return Ok(Enacted::Done);
+                }
+                // SECURITY: a kTLS body splice has exactly one bound - the
+                // standalone watchdog keyed on `request_timeout`, because
+                // it blocks on an io-wq worker awaiting the next record
+                // where no linked timeout can reach it (see
+                // `submit_splice_recv`). Unset, a peer that handshakes,
+                // declares a large body and goes silent holds its slot, an
+                // io-wq worker and this pipe's mutex for as long as it
+                // likes. Refuse rather than serve it unbounded: the remedy
+                // is one configuration line (`request_timeout`, or its
+                // client spelling `response_timeout` - both project onto
+                // this field), and an unbounded stall is not something an
+                // operator can find. Plain TCP is unaffected - its
+                // readiness-poll path is already clocked.
+                if self.table.conn(slot).is_ktls()
+                    && self.cfg.request_timeout.is_none()
+                {
+                    self.close_conn(
+                        slot,
+                        generation,
+                        CloseReason::SpliceUnbounded,
+                    )?;
+                    return Ok(Enacted::Done);
+                }
                 // Transport-agnostic: the kernel routes the splice through
                 // the socket's `splice_read`. Plain sockets move raw bytes;
                 // kTLS routes to `tls_sw_splice_read` (both software and
@@ -2309,9 +2469,155 @@ impl<U> Reactor<U> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+    #[cfg(feature = "net-server")]
+    use crate::net::ClientAddr;
+    #[cfg(feature = "net-server")]
+    use crate::net::core::config::CoreConfig;
+    #[cfg(feature = "net-server")]
+    use crate::net::core::conn::Connection;
+    #[cfg(feature = "net-server")]
+    use crate::net::core::reactor::KernelPads;
+    #[cfg(feature = "net-server")]
+    use crate::uring::sys::KernelTimespec;
+    #[cfg(feature = "net-server")]
+    use std::time::Duration;
+
+    /// A reactor over a small real ring, with one connection installed at
+    /// slot 0 generation 0. `None` where io_uring is unavailable.
+    ///
+    /// Nothing is ever submitted: the SQEs the timer arms stage into a ring
+    /// far larger than the handful used, and the completions below are
+    /// synthesized - which is the only way to fix the interleaving the
+    /// property is about.
+    #[cfg(feature = "net-server")]
+    fn reactor_with_one_conn(
+        max_receipt_time: Option<Duration>,
+        request_timeout: Option<Duration>,
+    ) -> Option<Reactor<()>> {
+        let engine = match crate::uring::engine::Engine::new(64, 8) {
+            Ok(e) => e,
+            Err(crate::Error::Errno(e))
+                if crate::uring::setup_unavailable(e) =>
+            {
+                return None;
+            }
+            Err(e) => panic!("engine: {e}"),
+        };
+        let cfg = CoreConfig {
+            max_request_bytes: MAX,
+            body_placement_threshold: None,
+            max_send_coalesce: 1,
+            max_send_backlog: 8,
+            max_in_flight_requests: 4,
+            idle_timeout: None,
+            request_timeout,
+            max_receipt_time,
+            send_timeout: None,
+            tls_handshake_timeout: None,
+            recv_shortage_retry: None,
+        };
+        let pads = Box::new(KernelPads {
+            deadline: KernelTimespec::default(),
+            accept_retry: KernelTimespec::default(),
+            idle_timeout: KernelTimespec::default(),
+            send_timeout: KernelTimespec::default(),
+            request_timeout: KernelTimespec::default(),
+            max_receipt_time: KernelTimespec::default(),
+            tls_handshake: KernelTimespec::default(),
+            recv_retry: KernelTimespec::default(),
+            maintain: KernelTimespec::default(),
+        });
+        let mut r: Reactor<()> = Reactor::from_parts(engine, 4, cfg, pads);
+        let peer = ClientAddr::Inet(
+            "127.0.0.1:1".parse::<std::net::SocketAddr>().unwrap(),
+        );
+        r.table.install(0, Connection::new(peer, (), 1));
+        Some(r)
+    }
+
+    /// A budget retired and replaced inside one dispatch: the predecessor's
+    /// expiry must not be charged to the successor.
+    ///
+    /// `deliver_one` retires (clearing the flag and *staging* a cancel that
+    /// `run_loop` submits only at the top of the next iteration) and
+    /// `pump -> submit_recv -> arm_receipt_deadline` re-arms, all before
+    /// the reap loop reaches the old timer's `-ETIME` - which is posted at
+    /// exactly the deadline the retire sat on, i.e. whenever a peer
+    /// finishes just inside its budget. `user_data` carries the slot's
+    /// generation, not the timer's, so the two expiries are bit-identical
+    /// and the flag alone cannot tell them apart.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_retired_receipt_budget_is_not_charged_to_its_successor() {
+        let Some(mut r) =
+            reactor_with_one_conn(Some(Duration::from_secs(30)), None)
+        else {
+            return;
+        };
+        r.arm_receipt_deadline(0, 0).expect("arm");
+        r.cancel_receipt_deadline(0, 0).expect("retire");
+        r.arm_receipt_deadline(0, 0)
+            .expect("the successor's budget");
+        assert!(r.table.conn(0).receipt_deadline_armed, "armed again");
+
+        // The retired timer's expiry, reaped after the re-arm.
+        r.on_receipt_deadline(0, 0, -libc::ETIME)
+            .expect("stale expiry");
+        assert!(
+            r.table.slot_matches_cqe(0, 0),
+            "a peer that finished inside its budget was closed"
+        );
+        assert!(
+            r.table.conn(0).receipt_deadline_armed,
+            "the successor's budget was spent by its predecessor"
+        );
+
+        // And the successor's own expiry still bites: the flag it armed
+        // is spent, and the connection is winding down.
+        r.on_receipt_deadline(0, 0, -libc::ETIME)
+            .expect("live expiry");
+        assert!(
+            !r.table.conn(0).receipt_deadline_armed && r.table.conn(0).closing,
+            "the live budget stopped reclaiming a stalled peer"
+        );
+    }
+
+    /// The same interleaving on the kTLS splice watchdog, where it is worse:
+    /// `splice_watermark` equals `splice_remaining` at every arm, so a stale
+    /// expiry reaching the live path takes `Next::Cancel` and cancels the
+    /// *successor's* splice - a healthy multi-GB transfer killed at its
+    /// first record, and the watchdog disarmed behind it.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_retired_splice_watchdog_does_not_cancel_the_next_body() {
+        let Some(mut r) =
+            reactor_with_one_conn(None, Some(Duration::from_secs(30)))
+        else {
+            return;
+        };
+        {
+            let conn = r.table.conn_mut(0);
+            conn.splicing = true;
+            conn.splice_remaining = 1 << 20;
+        }
+        r.arm_splice_deadline(0, 0).expect("arm");
+        r.cancel_splice_deadline(0, 0).expect("body done");
+        // The next body on the same connection.
+        r.table.conn_mut(0).splice_remaining = 1 << 20;
+        r.arm_splice_deadline(0, 0)
+            .expect("the successor's watchdog");
+        assert!(r.table.conn(0).splice_deadline_armed, "armed again");
+
+        r.on_splice_deadline(0, 0, -libc::ETIME)
+            .expect("stale expiry");
+        assert!(
+            r.table.conn(0).splice_deadline_armed,
+            "the successor's watchdog was disarmed by its predecessor"
+        );
+    }
 
     const MAX: usize = 1024 * 1024;
 

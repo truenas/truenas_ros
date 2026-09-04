@@ -785,7 +785,7 @@ mod pool_tests {
 // is 5 including the main thread. `cooldown` is zero throughout because
 // `claim_spawn_slot` reads an `Instant`, which loom does not model - so growth
 // is always permitted here rather than throttled.
-#[cfg(loom)]
+#[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
 
@@ -831,9 +831,18 @@ mod loom_tests {
         })
     }
 
-    /// Every submitted job runs exactly once, and `Drop` does not return until
-    /// the queue is empty and every worker has exited - the guarantee that lets
-    /// a job borrow reactor state.
+    /// Every submitted job runs exactly once, and `Drop` waits for the queue
+    /// to empty and every worker to exit.
+    ///
+    /// **That wait is not a guarantee, and nothing rests on it being one.**
+    /// `Drop` has three exits that return with work outstanding: a drop
+    /// running on one of this pool's own workers, and the two
+    /// `SHUTDOWN_DETACH_AFTER` breaks. Detaching is sound because `Job` is
+    /// `Box<dyn FnOnce() + Send>` and therefore `'static` - no job holds a
+    /// borrow of what the dropper frees - which is what `Drop`'s own comment
+    /// says. This model cannot reach any of the three either: loom
+    /// delegates `wait_timeout` to `wait` and hardcodes `timed_out() ==
+    /// false` (`src/sync.rs`), so what it checks is the quiescent path.
     #[test]
     fn loom_pool_lifecycle() {
         loom::model(|| {

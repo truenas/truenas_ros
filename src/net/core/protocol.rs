@@ -273,7 +273,46 @@ pub enum CloseReason {
     /// from "no socket data", which would spin the readiness poll at full
     /// CPU. A blocking pipe blocks the splice on an io-wq worker instead:
     /// that is the transfer's designed backpressure.
+    ///
+    /// Over kTLS the block is not only "the pipe is full" - see the
+    /// `net::server` module docs: the destination pipe's mutex is held
+    /// across a wait for the next TLS record, so one silent peer stalls
+    /// every other body spliced to the same fd. Give each connection its
+    /// own pipe there.
     SpliceBadFd,
+    /// A framer named a [`Framing::SpliceBody`] destination that another
+    /// connection is already splicing to. **Sharing one pipe across
+    /// connections corrupts bodies, not just latency.**
+    ///
+    /// A splice moves at most what the transport hands over in one call -
+    /// over kTLS, one TLS record - and the reactor resubmits the remainder
+    /// as a fresh op. Between those two, another connection's splice can
+    /// take the pipe's mutex and write its own bytes, so two bodies sharing
+    /// a destination **interleave**. The head-of-line stall a shared pipe
+    /// also causes (see [`CloseReason::SpliceBadFd`]) is the same
+    /// configuration, noticed from the other end.
+    ///
+    /// Give each connection its own pipe. This is a consumer bug, not peer
+    /// behaviour - a captured-fd closure is the shape that invites it.
+    SpliceFdInUse,
+    /// A kTLS [`Framing::SpliceBody`] on a role with no request clock -
+    /// `ServerConfig::request_timeout`, or its client spelling
+    /// `ClientConfig::response_timeout`.
+    ///
+    /// That clock is the *only* bound a kTLS body splice has. It blocks on
+    /// an io-wq worker awaiting the next TLS record, which no linked
+    /// timeout can reach (the kernel arms one only after the head op's
+    /// `issue()` returns, and a blocking splice's does not return until it
+    /// completes), so the standalone watchdog keyed on `request_timeout` is
+    /// what cancels a stalled one. Unset, a peer that handshakes, declares
+    /// a large body and goes silent holds its slot, an io-wq worker and its
+    /// destination pipe's mutex for as long as it likes.
+    ///
+    /// Refused rather than served unbounded: the remedy is one
+    /// configuration line, and a silent unbounded stall is not something an
+    /// operator can find. Plain-TCP splices are unaffected - their
+    /// readiness-poll path is already clocked.
+    SpliceUnbounded,
 }
 
 /// The current message's body, as handed to the `body` handler.

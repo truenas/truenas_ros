@@ -177,10 +177,12 @@ impl Statmount {
     /// When both [`StatmountMask::MNT_OPTS`] and [`StatmountMask::SB_BASIC`]
     /// were requested, a `ro,`/`rw,` prefix (derived from
     /// [`SbFlags::RDONLY`]) is prepended, since `statmount` otherwise omits it.
+    ///
+    /// The prefix is keyed on `SB_BASIC` alone. A filesystem whose
+    /// superblock emits no options at all - procfs, sysfs, tracefs, nsfs -
+    /// makes the kernel return without raising `MNT_OPTS`, so keying on that
+    /// bit would drop the read-only status of every such mount.
     pub fn mount_opts(&self) -> Option<String> {
-        if !self.mask.contains(StatmountMask::MNT_OPTS) {
-            return None;
-        }
         let opts = self.mnt_opts_raw.as_deref().unwrap_or("");
         if self.mask.contains(StatmountMask::SB_BASIC) {
             let ro = self
@@ -507,8 +509,19 @@ mod tests {
         sm2.mnt_opts_raw = Some(String::new());
         assert_eq!(sm2.mount_opts(), None);
 
-        // No MNT_OPTS bit at all -> None.
+        // No MNT_OPTS bit and no SB_BASIC -> nothing to report.
         assert_eq!(base(StatmountMask::MNT_BASIC).mount_opts(), None);
+
+        // SB_BASIC without MNT_OPTS -> still the prefix. This is the shape a
+        // real reply takes for a filesystem whose superblock emits no options
+        // at all (procfs, sysfs, tracefs, nsfs): the kernel returns without
+        // raising MNT_OPTS, so keying the prefix on that bit would drop the
+        // read-only status of every such mount.
+        let mut sm3 = base(StatmountMask::SB_BASIC);
+        sm3.sb_flags = Some(SbFlags::empty());
+        assert_eq!(sm3.mount_opts().as_deref(), Some("rw"));
+        sm3.sb_flags = Some(SbFlags::RDONLY);
+        assert_eq!(sm3.mount_opts().as_deref(), Some("ro"));
     }
 
     /// A string-array count is declared by the reply, not derived from it, so

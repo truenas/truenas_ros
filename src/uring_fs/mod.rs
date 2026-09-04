@@ -1349,6 +1349,15 @@ impl FsPending {
         self.rx.recv().map_err(|_| Errno::ECONNABORTED.into())
     }
 
+    /// A pending already resolved to `outcome`, for tests that need to drive
+    /// an awaiter's verdict without a ring behind it.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn resolved(outcome: FsOutcome) -> FsPending {
+        let (tx, rx) = mpsc::channel();
+        tx.send(outcome).expect("the receiver is right here");
+        FsPending { rx }
+    }
+
     /// Block until a [`start_open`](FsHandle::start_open) completes and take
     /// its [`File`].
     ///
@@ -2912,7 +2921,7 @@ mod tests {
 // This model drives the real `send`. What it cannot drive is the reactor's
 // teardown, which lives in `host.rs` around real io_uring work - so the loop
 // side is a stand-in that performs the same two steps in the same order.
-#[cfg(loom)]
+#[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
     use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};

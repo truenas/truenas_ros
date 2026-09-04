@@ -107,14 +107,24 @@ impl<K: Clone + Eq + Hash, V: Clone> SingleFlight<K, V> {
                 }
             };
             // Cannot fail: the gate is held and the re-check found it empty.
+            // Publishing here is the whole of it - callers reach the value
+            // through the `Arc` the map already holds, so there is nothing
+            // to write back.
+            //
+            // **Do not re-install the slot afterwards.** It looks like a
+            // harmless re-affirmation and it is not: the map lock is
+            // released across `mint`, so an `invalidate` or `clear` landing
+            // in that window has removed this key, and an
+            // `entry(..).or_insert_with(..)` there puts the just-minted slot
+            // straight back. Snapshots never expire on their own
+            // ([`IdentityCache`](super::IdentityCache)), so revocation is
+            // the only mechanism there is and nothing retries it - the stale
+            // value would then be served for the life of the process. The
+            // reachable shape is ordinary: a directory-services change fires
+            // `invalidate_all` while acquires for new identities are in
+            // flight. A slot the map still holds needs no write, and one it
+            // no longer holds must not be given back.
             slot.cell.set(value.clone());
-            // Confirmed above to be the map's slot, and the gate we hold keeps
-            // eviction-on-failure of it out, so this re-affirms rather than
-            // races a replacement. `or_insert_with` so a newer slot still wins
-            // if an `invalidate` replaced it during the mint.
-            if let Ok(mut live) = self.live.lock() {
-                live.entry(key.clone()).or_insert_with(|| slot.clone());
-            }
             return Ok(value);
         }
     }
@@ -236,6 +246,48 @@ mod tests {
         );
     }
 
+    /// An `invalidate` that lands while a mint is running must survive it.
+    ///
+    /// The map lock is released across `mint` - deliberately, so a hit on
+    /// one key does not block a mint on another - which puts every
+    /// revocation racing every in-flight acquire for that key. Driven from
+    /// inside the mint rather than from a second thread: the window is the
+    /// released map lock, so a reentrant call reaches it exactly, and
+    /// deterministically, where a timing test would only sometimes.
+    ///
+    /// The harm is `IdentityCache`'s: snapshots are frozen and nothing
+    /// expires on its own, so `invalidate`/`invalidate_all` is the only
+    /// revocation there is and nothing retries it. Undone once, the stale
+    /// credential is served for the life of the process.
+    #[test]
+    fn an_invalidate_during_a_mint_is_not_undone() {
+        let s = sf();
+        // The whole-map form is the reachable one: a directory-services
+        // change clears everything while acquires are in flight.
+        assert_eq!(
+            s.get_or_try_init(&1, || {
+                s.clear();
+                Ok(10)
+            })
+            .unwrap(),
+            10
+        );
+        assert_eq!(s.len(), 0, "a clear during the mint was undone");
+        // And the single-key form.
+        assert_eq!(
+            s.get_or_try_init(&2, || {
+                s.invalidate(&2);
+                Ok(20)
+            })
+            .unwrap(),
+            20
+        );
+        assert_eq!(s.len(), 0, "an invalidate during the mint was undone");
+        // The value still reaches the caller that minted it, and the next
+        // caller mints again rather than reading a revoked one.
+        assert_eq!(s.get_or_try_init(&2, || Ok(21)).unwrap(), 21);
+    }
+
     #[test]
     fn invalidate_forces_the_next_mint() {
         let s = sf();
@@ -248,7 +300,7 @@ mod tests {
     }
 }
 
-#[cfg(loom)]
+#[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
     use crate::sync::thread;
