@@ -178,7 +178,11 @@ if [ -n "$kver" ] && [ "$(printf '%s\n6.18.16\n' "$kver" | sort -V | head -n1)" 
 else
   echo "kernel ${kver:-unknown} < 6.18.16: unix_peercred pending (kernel predates the fix)"
 fi
-cargo test --all-features 2>&1 | tee /home/debian/test-output.txt
+# `--no-fail-fast`: this lane is the only one that runs the privileged and
+# ZFS-backed families, and a run that stops at the first failing target
+# reports one failure where there may be several - across a VM round trip
+# that costs minutes to repeat.
+cargo test --all-features --no-fail-fast 2>&1 | tee /home/debian/test-output.txt
 TEST_EXIT_CODE=${PIPESTATUS[0]}
 
 echo ""
