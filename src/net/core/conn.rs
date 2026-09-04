@@ -336,7 +336,13 @@ impl RecvBuf {
     #[cfg(feature = "net-server")]
     pub(crate) fn forfeit_owned(&mut self) -> Option<(Vec<u8>, usize)> {
         let licence = std::mem::take(&mut self.owned_licence);
-        (self.owned.capacity() > 0)
+        // A licence with no storage under it still has to be handed
+        // over: `give_held` pots it before it looks at the capacity, so
+        // an empty `Vec` carries it home, and taking it here without
+        // returning it is the one way it is lost outright rather than
+        // held. `promote_for` writes the licence and the capacity
+        // separately, so the pair really can come apart.
+        (self.owned.capacity() > 0 || licence > 0)
             .then(|| (std::mem::take(&mut self.owned), licence))
     }
 
@@ -552,22 +558,32 @@ impl RecvBuf {
         self.filled = self.filled.min(n);
     }
 
-    /// The whole buffer, moved out, leaving this empty - the delivery
-    /// handoff that gives a body-only message's storage to the handler
-    /// rather than copying it.
+    /// The whole buffer, moved out with the held licence riding it -
+    /// the delivery handoff that gives a body-only message's storage to
+    /// the handler rather than copying it.
     ///
     /// This is the one operation a pool-backed buffer will not be able to
     /// serve, since that memory belongs to the ring: it will answer `None`
     /// and the body will be delivered borrowed, with a handler that wants to
     /// own it paying the copy `Body::take` already documents.
-    pub(crate) fn take_owned(&mut self) -> Option<Vec<u8>> {
+    ///
+    /// **The licence goes with the storage**, as it does on the other two
+    /// paths that move `owned` out (`release`, `forfeit_owned`) - here to
+    /// the delivery, which pots it exactly as a placed body's is
+    /// ([`BodyPool::receipt_done`](super::bodypool::BodyPool::receipt_done)):
+    /// the storage has left reactor custody either way. Storage promoted
+    /// off a pool buffer can reach here, because `set_owned` clears
+    /// `pooled` one-way and `promote_for` does not: a licence dropped on
+    /// the floor here is demand the pool met and never counted, and it
+    /// stops growing for a working set it is already serving.
+    pub(crate) fn take_owned(&mut self) -> Option<(Vec<u8>, usize)> {
         if self.claim.is_some() || self.pooled {
             return None;
         }
         let mut v = std::mem::take(&mut self.owned);
         v.truncate(self.filled);
         self.filled = 0;
-        Some(v)
+        Some((v, self.take_owned_licence()))
     }
 }
 
@@ -1170,9 +1186,16 @@ impl<U> Connection<U> {
     ) -> (&[u8], Body<'_>, &ClientAddr, &mut U, usize) {
         let placed = self.take_placed_body();
         if placed.is_none()
-            && let Some(buf) = self.take_body_handoff(handoff_threshold)
+            && let Some((buf, licence)) =
+                self.take_body_handoff(handoff_threshold)
         {
-            return (&[], Body::placed(buf), &self.peer, &mut self.state, 0);
+            return (
+                &[],
+                Body::placed(buf),
+                &self.peer,
+                &mut self.state,
+                licence,
+            );
         }
         let (header, rest) = self.recv_buf.split_at(self.header_len);
         let (body, licence) = match placed {
@@ -1201,7 +1224,8 @@ impl<U> Connection<U> {
     ) {
         let placed = self.take_placed_body();
         if placed.is_none()
-            && let Some(buf) = self.take_body_handoff(handoff_threshold)
+            && let Some((buf, licence)) =
+                self.take_body_handoff(handoff_threshold)
         {
             return (
                 &[],
@@ -1209,7 +1233,7 @@ impl<U> Connection<U> {
                 &self.peer,
                 &mut self.state,
                 None,
-                0,
+                licence,
             );
         }
         let lease = self.recv_buf.write_lease(self.header_len + self.body_len);
@@ -1279,7 +1303,7 @@ impl<U> Connection<U> {
     fn take_body_handoff(
         &mut self,
         handoff_threshold: Option<usize>,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<(Vec<u8>, usize)> {
         if self.header_len == 0
             && self.body_len > 0
             && self.recv_buf.len() == self.body_len
@@ -2752,6 +2776,71 @@ mod tests {
         rb.drain_front(4);
         assert!(!rb.write_leased.get(), "the lease flag must be cleared");
         assert_eq!(rb.len(), 8, "and nothing drained from a buffer it lacks");
+    }
+
+    /// A licence outlives the `pooled` flag that let it be taken, so the
+    /// three sites that move `owned` out all have to carry it.
+    ///
+    /// `promote_for` writes `owned_licence` and clears `claim`; it does
+    /// **not** clear `pooled`, which is what makes `take_owned`
+    /// unreachable from a promote alone. `set_owned` clears `pooled`, is
+    /// one-way, and is reached by an ordinary oversized exact read or a
+    /// pool that will not grow - so the two compose, and `take_owned`
+    /// hands the storage to the handler with the licence still on the
+    /// connection unless it takes it. A dropped licence is demand the
+    /// pool met and never counted: it stops growing for a working set it
+    /// is already serving, silently, since nothing else reads the field.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn every_path_that_moves_owned_out_carries_its_licence() {
+        // Promote off a pool buffer: the seed's licence lands on the
+        // connection and rides `owned` from here on.
+        let seed = |rb: &mut RecvBuf| {
+            rb.set_pooled();
+            let buf = Box::leak(vec![b'x'; 64].into_boxed_slice());
+            rb.install(RecvClaim {
+                bid: 1,
+                ptr: buf.as_mut_ptr(),
+                cap: 64,
+            });
+            rb.set_filled(8);
+            rb.promote_for(8, 1 << 20, || Some((Vec::new(), 4096)))
+                .expect("a promote past the claim's cap");
+            assert_eq!(rb.owned_licence, 4096, "the seed's licence is held");
+        };
+
+        // The delivery handoff, once the pool has given up on this
+        // connection (`set_owned`) - the composition the promote alone
+        // cannot reach.
+        let mut handed = RecvBuf::default();
+        seed(&mut handed);
+        handed.set_owned();
+        let (v, licence) = handed.take_owned().expect("owned and unpooled");
+        assert_eq!(licence, 4096, "the handoff dropped the licence");
+        assert_eq!(handed.owned_licence, 0, "and left none behind");
+        assert_eq!(v.len(), 8, "with the accumulated bytes");
+
+        // Teardown, with the storage already handed off: a licence with
+        // no capacity under it must still be surrendered, because
+        // `give_held` pots it before it looks at the capacity and this
+        // is the last chance to.
+        let mut bare = RecvBuf::default();
+        seed(&mut bare);
+        bare.owned = Vec::new();
+        let (_, licence) = bare.forfeit_owned().expect("a licence with no Vec");
+        assert_eq!(licence, 4096, "teardown dropped the licence");
+
+        // And the ordinary release, for the denominator - which the
+        // delivery reaches once the message it accumulated is consumed.
+        let mut released = RecvBuf::default();
+        seed(&mut released);
+        released.truncate(0);
+        let (_, surplus) = released.release();
+        assert_eq!(
+            surplus.expect("promoted storage comes home").1,
+            4096,
+            "release dropped the licence"
+        );
     }
 
     /// `armed_within` is the predicate both continuation guards key on, and

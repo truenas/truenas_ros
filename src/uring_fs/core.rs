@@ -140,21 +140,22 @@ pub(crate) type EmbeddedCb = Box<dyn FnOnce(FsDone, &mut FsConn<'_>)>;
 /// Where an op that never reached the ring reports *why*, and hands
 /// back what it was given.
 ///
-/// A submission refusal and a teardown both drop the callback
-/// unfired, which is the callback contract; firing one inline from a
-/// submit path would deliver a completion during a submission, and
-/// nothing here does that. A sink is not a callback: it runs no
-/// consumer continuation and submits nothing, it only fills a slot, so
-/// the distinction the callback form cannot make (`EBUSY` retry,
-/// `EINVAL` caller bug, teardown stop) survives for the consumers that
-/// can act on it.
+/// A sink is not a callback: it runs no consumer continuation and
+/// submits nothing, it only fills a slot. That is what lets it fire
+/// from inside a `submit_*` holding `&mut self` on the fs tables,
+/// where firing a callback would deliver a completion during a
+/// submission - so the distinction the callback form cannot make
+/// (`EBUSY` retry, `EINVAL` caller bug, teardown stop) reaches an
+/// awaited frame at the moment the refusal is decided, rather than
+/// waiting on the drain that delivers the callback.
 ///
-/// **It carries the payload too.** `EBUSY` from a full op table is the
-/// one refusal worth retrying, and a write whose buffers were dropped
-/// on the way out cannot be retried by anyone - the caller would have
-/// to keep a second copy of every payload against a failure the API
-/// tells it is transient. [`FsDone::into_bufs`] hands them back on this
-/// path exactly as it does on a completion.
+/// **The reason only; the payload rides the callback.** A marked
+/// refusal is queued whole ([`FsCore::refuse`]) - errno and buffers -
+/// and its delivery supersedes the parked reason, so the sink is
+/// filled with an empty payload and [`FsDone::into_bufs`] hands the
+/// real one back off the callback route. The one ending that resolves
+/// from the reason alone is a callback dropped unfired, which is
+/// teardown, where the payload is going nowhere either way.
 ///
 /// **`Rc`, and cloned rather than taken.** A multi-step call ([`chain`],
 /// [`walk`]) submits from a fresh facade at every step after the first,
@@ -368,6 +369,16 @@ struct FsOpEntry {
     /// On a [`TAG_OPEN`] entry: the guard timer's slot and full
     /// generation, retracted when the open answers first.
     guard: Option<(u32, u64)>,
+    /// On a [`TAG_OPEN_DEADLINE`] entry whose open already answered: the
+    /// owner whose [`WallClock::retiring`] count this slot is holding
+    /// open. The pair charges one count for two slots, so the count
+    /// cannot go home at the open's CQE - the guard slot is still
+    /// parked, exactly as a retracted timer's is, and is metered the
+    /// same way until its own CQE frees it. Set by [`FsCore::take_op`]
+    /// at the moment it parks the count, never at the arm: the reverse
+    /// ordering (the guard fires first) frees this slot while the open
+    /// still holds its `armed` charge, and there is nothing to park.
+    wall_clock: Option<(u32, u64)>,
     /// Keeps a path op's dirfd alive (and its fd number un-reused) while
     /// the op is in flight.
     anchor: Option<Anchor>,
@@ -421,6 +432,7 @@ impl FsOpEntry {
             retracted: false,
             cancels: None,
             guard: None,
+            wall_clock: None,
             anchor: None,
             anchor2: None,
             file: None,
@@ -442,6 +454,7 @@ impl FsOpEntry {
         self.retracted = false;
         self.cancels = None;
         self.guard = None;
+        self.wall_clock = None;
         self.anchor = None;
         self.anchor2 = None;
         self.file = None;
@@ -548,16 +561,25 @@ struct OffloadEntry {
 
 /// One owner's wall-clock tenancy. `armed` is what the cap meters -
 /// each count returned at its hold's ending, or early at a timer's
-/// retraction. `retiring` counts retracted timers whose slots are
-/// still parked awaiting their CQE: the retraction hands the cap
-/// headroom back on the spot so retract-then-rearm holds inside one
-/// delivery, but the slot rides to a CQE no delivery reaps, so the
-/// arm screens also refuse at `armed + retiring` reaching twice the
-/// cap - the documented mid-swap slot ceiling. Without that clause
-/// the early headroom unmade the cap entirely: a retract-rearm loop
-/// inside one delivery parked the whole table with `armed` never
-/// leaving zero (cap 1 on a 64-slot table measured 64 arms, zero
-/// refusals, zero free slots).
+/// retraction. `retiring` counts a hold whose count has gone back to
+/// the cap while a slot it charged for is still parked awaiting its
+/// CQE, and there are two of those:
+///
+/// - a **retracted timer**, whose retraction hands the cap headroom
+///   back on the spot so retract-then-rearm holds inside one delivery,
+///   while the slot rides to a CQE no delivery reaps;
+/// - an **`Allow` pair whose open answered first**, which charged one
+///   count for two slots, so the guard slot outlives the CQE that
+///   would otherwise return the whole charge.
+///
+/// So the arm screens also refuse at `armed + retiring` reaching twice
+/// the cap - the documented mid-swap slot ceiling - and both classes
+/// have to reach `retiring`, or the sum bounds one of them and the
+/// other walks the table one unreaped slot at a time. Without the
+/// clause at all the early headroom unmade the cap entirely: a
+/// retract-rearm loop inside one delivery parked the whole table with
+/// `armed` never leaving zero (cap 1 on a 64-slot table measured 64
+/// arms, zero refusals, zero free slots).
 #[derive(Clone, Copy, Default)]
 struct WallClock {
     armed: u32,
@@ -598,8 +620,10 @@ pub(crate) struct FsCore {
     /// without a bound one connection could park the whole shared
     /// handler budget for its arms' full duration - measured at every
     /// slot of a consumer-sized table in 19 ms. An `Allow` pair
-    /// charges one count (so a count bounds at most two slots),
-    /// taken when its guard stages and returned when the open answers.
+    /// charges one count (so a count bounds at most two slots), taken
+    /// when its guard stages and returned by whichever of its two
+    /// slots frees last - parked on `retiring` in between, exactly as
+    /// a retracted timer's is ([`WallClock`]).
     /// The ceiling is the host's `max_in_flight_requests`: the real
     /// consumer's discipline is one retry tick per connection, walking
     /// every claimant parked on it (its `guard.rs`), so one connection
@@ -620,10 +644,10 @@ pub(crate) struct FsCore {
     /// `&mut self` on the fs tables, so the callback cannot fire
     /// there; structurally it is an offload that resolved at submit,
     /// and it rides the same push-then-poke protocol to the same
-    /// drain. Dropping the callback instead was the old contract, and
-    /// it delivered nothing to a plain-callback caller but a closed
-    /// connection - the class was decided at every submit screen and
-    /// delivered nowhere.
+    /// drain. Queueing is what makes the class deliverable at all: a
+    /// screen that drops the callback instead hands a plain-callback
+    /// caller nothing but a closed connection, for a verdict decided
+    /// at eighteen submit screens and reported at none.
     ///
     /// Uncapped, like the task run queue and the offload registry:
     /// bound in-flight work upstream, at the request cap - a pass's
@@ -714,13 +738,22 @@ impl FsCore {
     /// deliver, `(errno, marked)`.
     ///
     /// The `Embedded`-with-owner pattern is the screen's boundary as
-    /// well as its key: an off-loop `FsWaiter::Channel` hold (a public
-    /// [`FsHandle::open`](super::FsHandle::open) carrying a deadline)
-    /// names no owner to meter, so it passes unscreened and its two
-    /// slots go uncounted by any cap. That tenancy is bounded by its
-    /// own shape instead - a `ReplyTo::Sync` reply pins one blocked
-    /// caller thread per outstanding off-loop hold - and metering it
-    /// would need an owner axis off-loop callers do not have.
+    /// well as its key: a hold that names no owner passes unscreened
+    /// and its two slots go uncounted by any cap. Two shapes reach
+    /// that - an off-loop `FsWaiter::Channel` hold (a public
+    /// [`FsHandle::open`](super::FsHandle::open) carrying a deadline),
+    /// and an `Embedded` hold submitted with `owner: None`.
+    ///
+    /// **Nothing meters them, and the only backstop is the table.**
+    /// [`FsHandle`](super::FsHandle) is `Clone`, so the number of
+    /// concurrent off-loop holds is the number of caller threads, and
+    /// the pair's own `op_free.len() < 2` check is what refuses them -
+    /// as `EBUSY`, to whoever asks next, including every owner that
+    /// *is* metered. The thread a `ReplyTo::Sync` reply blocks is not
+    /// a second bound either: it unblocks when the *open* answers,
+    /// while the guard slot is still parked to its own CQE. Metering
+    /// this needs an owner axis off-loop callers do not have, which is
+    /// why the exemption stands rather than being called a bound.
     fn refuse_wall_clock_hold(
         &self,
         waiter: &FsWaiter,
@@ -978,18 +1011,21 @@ impl FsCore {
                         self.ops[guard_slot as usize].generation,
                     ));
                     // The pair's wall-clock charge, counted like a
-                    // timer's arm: taken only once the guard is real,
-                    // returned when the open answers (`take_op`, keyed
-                    // on `guard` being set - a stage-failed guard never
-                    // reaches here and never charges).
+                    // timer's arm: taken only once the guard is real
+                    // (a stage-failed guard never reaches here and
+                    // never charges), and returned by whichever of the
+                    // two slots frees last - `take_op` moves it to
+                    // `retiring` when the open answers with the guard
+                    // still parked, exactly as a retracted timer's
+                    // count parks for the width of its reap.
                     if let Some(o) = timer_owner {
                         self.armed_timers.entry(o).or_default().armed += 1;
                     }
                 }
                 Err(_) => {
                     // The open is in flight and its bound cannot be:
-                    // cancel the open rather than let it run
-                    // unbounded, marked (`retract_op`) as the
+                    // ask for the open to be cancelled rather than let
+                    // it run unbounded, marked (`retract_op`) as the
                     // asked-for cancellation it is, so its
                     // `ECANCELED` arrives in the deadline vocabulary
                     // (`was_refused` true, the tripped guard's own
@@ -998,6 +1034,17 @@ impl FsCore {
                     // and one failed guard stage is not the reactor
                     // going away. The guard's slot frees (its waiter
                     // is `None`, so the fail delivers to nobody).
+                    //
+                    // The ask is all this arm can promise. It is
+                    // reached *because* a stage just failed, and the
+                    // cancel goes to the same ring
+                    // ([`FsCore::submit_cancel`] is best-effort), so
+                    // where the failure is the SQ being full against a
+                    // CQ that has stopped draining, the open really
+                    // does run to its own ending with an io-wq worker
+                    // parked in it. Teardown is the recovery for that;
+                    // nothing here can stage its way out of a ring
+                    // that will not take a submission.
                     self.fail_op(eng, guard_slot, Errno::ECANCELED);
                     self.retract_op(eng, TAG_OPEN, op_slot, open_gen);
                 }
@@ -1193,7 +1240,7 @@ impl FsCore {
     /// caller (`EBUSY` on a full op table, or the staging error): there is no
     /// callback whose drop could report it, and a silently dropped pump read
     /// would strand its connection mid-body with nothing left to re-drive it.
-    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    ///
     /// `dest` is either a buffer this side supplies, or a group id to let
     /// the kernel pick one from a registered ring at completion.
     ///
@@ -1203,6 +1250,7 @@ impl FsCore {
     /// answers `-EINVAL` above one (`io_uring/rw.c`) - which this submit
     /// already satisfies. The kernel reads the iovec for its *length* and
     /// supplies the address itself, so `iov_base` is not dereferenced.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     pub(crate) fn submit_pump_read(
         &mut self,
         eng: &mut Engine,
@@ -1333,10 +1381,10 @@ impl FsCore {
     /// `ECANCELED` with no refusal mark - exactly what the same timer
     /// would have answered had it been in flight when the sweep ran -
     /// so a continuation keyed on that vocabulary winds down the same
-    /// way in both orderings. Delivered by the *drop*, not the sink:
-    /// [`deliver`] fires a sink only for marked refusals, so it is the
-    /// dropped callback's `Fire` that resolves an awaited frame as
-    /// `Gone`, which reads back as exactly that unmarked `ECANCELED`.
+    /// way in both orderings. Delivered by the callback, not the sink:
+    /// [`FsCore::refuse`] fires a sink only for *marked* refusals, so
+    /// an awaited frame reads this one off the queued callback's own
+    /// `FsDone`: `ECANCELED` with [`FsDone::was_refused`] false.
     pub(crate) fn submit_timeout(
         &mut self,
         eng: &mut Engine,
@@ -1402,6 +1450,14 @@ impl FsCore {
     /// accounting hangs off the first ask cannot fire twice. `false`
     /// for a stale generation, a reissued slot, a tag mismatch, or an
     /// already-marked entry, all of which must stay inert.
+    ///
+    /// **`true` reports the mark, not the staging.** The cancel is
+    /// best-effort ([`FsCore::submit_cancel`]) and can lose its race
+    /// even when it stages, so the op's own ending is what the callers
+    /// see: `on_cqe` reads the mark, not the errno the kernel chose, to
+    /// decide whether a completion answers an ask (a retracted timer's
+    /// `-ETIME` reads as the marked cancellation it asked for). Nothing
+    /// may take `true` to mean an `ASYNC_CANCEL` reached the kernel.
     fn retract_op(
         &mut self,
         eng: &mut Engine,
@@ -1873,8 +1929,18 @@ impl FsCore {
     /// cancelled op completes with `ECANCELED` and its CQE runs `take_op` like
     /// any other, dropping the parked `Arc` (close-last). Takes no op-table slot
     /// -- nothing routes its completion - but goes through `eng.stage` so the
-    /// engine's in-flight accounting stays correct. Best-effort: a stage failure
-    /// (ring full) is dropped; server teardown still reaps the op.
+    /// engine's in-flight accounting stays correct.
+    ///
+    /// **Best-effort, and nothing may hang off it having reached the
+    /// kernel.** `push_sqe` answers `EBUSY` when a full SQ meets a
+    /// `submit` that accepted nothing - a CQ-overflow backpressure
+    /// return is `Ok` with the SQEs still staged (`Ring::submit`) - so
+    /// a healthy ring under load reaches this, not only a failing
+    /// `io_uring_enter`. A cancel that never staged leaves the op
+    /// running to its own ending, which the teardown drain reaps.
+    /// [`FsCore::retract_op`]'s mark is what the callers' verdicts are
+    /// built on for exactly that reason: the mark records the ask, and
+    /// the ask is answerable whether or not the hastening arrived.
     fn submit_cancel(&self, eng: &mut Engine, target_ud: u64) {
         let ud = pack_raw(TAG_CANCEL, 0, 0);
         let _ = eng.stage(ud, |sqe| {
@@ -1946,7 +2012,7 @@ impl FsCore {
             *swept = (*swept).max(generation);
         }
         // Bounded by the in-flight count: a slot is in `op_free` iff
-        // free (all three push sites clear the entry and bump the
+        // free (all four push sites clear the entry and bump the
         // generation first), so the difference is exactly how many
         // in-flight entries the scan can meet, and it stops once it
         // has seen them all. That break already lands at one past the
@@ -1962,6 +2028,32 @@ impl FsCore {
         // stays a scan until that trade is worth it. The empty-table
         // early-out above is what an idle server hits.
         let mut in_flight = self.ops.len() - self.op_free.len();
+        // The premise, checked in the direction that hurts, and only
+        // that one. The walk below stops once it has decremented this
+        // to zero, so a count that is too *high* is caught by the walk
+        // itself - it runs out of entries and the post-walk assert
+        // fires - while one that is too low (a slot pushed to
+        // `op_free` twice) breaks the walk early and silently leaves
+        // live ops uncancelled, in both profiles. Only the derived
+        // figure against the table's own census sees that direction.
+        //
+        // `>=`, not equality: a slot popped for an op whose state is
+        // not set yet counts as in flight here and not in the census,
+        // and that window is legitimate - unobservable from this
+        // function's one production caller, which runs from the
+        // reactor's top-level loop, but not something to assert away.
+        debug_assert!(
+            in_flight
+                >= self
+                    .ops
+                    .iter()
+                    .filter(|e| matches!(
+                        e.state.state,
+                        FsOpState::InFlight { .. }
+                    ))
+                    .count(),
+            "the free list holds a slot the op table still has in flight"
+        );
         if in_flight == 0 {
             return; // nothing in flight for anyone
         }
@@ -1985,7 +2077,10 @@ impl FsCore {
                 targets.push(pack_raw(tag, i as u32, entry.generation as u32));
             }
         }
-        debug_assert_eq!(in_flight, 0, "in_flight over-counts the table");
+        debug_assert_eq!(
+            in_flight, 0,
+            "the walk ended with in-flight entries unvisited"
+        );
         for ud in targets {
             self.submit_cancel(eng, ud);
         }
@@ -2032,9 +2127,15 @@ impl FsCore {
             }
             let cancels = entry.state.cancels.take();
             let retracted = entry.state.retracted;
+            let parked = entry.state.wall_clock.take();
             entry.state.clear();
             entry.generation += 1;
             self.op_free.push(op_slot);
+            // The pair's charge, parked here by `take_op` when the open
+            // answered first: the slot is free now, so it goes home.
+            if let Some(o) = parked {
+                self.release_retiring(o);
+            }
             if !retracted
                 && res == -libc::ETIME
                 && let Some((oslot, ogen)) = cancels
@@ -2109,8 +2210,27 @@ impl FsCore {
         // A timer's expiry is its success: a pure `IORING_OP_TIMEOUT`
         // (count 0) completes `-ETIME` when it fires, and that firing is
         // the completion the caller asked for.
+        //
+        // Unless the caller retracted it, in which case the deadline is
+        // gone whatever the kernel did with the cancel, and `Ok(0)` -
+        // this crate's spelling for "the deadline arrived" - would run
+        // a timeout handler for work the caller already finished. The
+        // retraction cannot make the cancel win: `io_timeout_fn`
+        // delists the timeout before posting `-ETIME`
+        // (`io_uring/timeout.c:254-276`), so an `ASYNC_CANCEL` that
+        // arrives after the fire finds nothing (`io_timeout_extract`,
+        // `:278-303`) and the `-ETIME` stands - and `submit_cancel` is
+        // best-effort besides, so the cancel may never have been staged
+        // at all. The mark is the caller's ask, and it is what decides
+        // the verdict; the errno then reads as the marked cancellation
+        // `refused` computes below, exactly as a cancel that won would
+        // have delivered.
         if tag == TAG_TIMEOUT && result == Err(Errno::ETIME) {
-            result = Ok(0);
+            result = if retracted {
+                Err(Errno::ECANCELED)
+            } else {
+                Ok(0)
+            };
         }
         // A cancellation that was asked for is not the reactor going
         // away: `ECANCELED` with `was_refused` false stays meaning
@@ -2250,6 +2370,25 @@ impl FsCore {
 
     // ---- internals -----------------------------------------------------
 
+    /// Return a wall-clock count parked on `retiring` - an `Allow`
+    /// pair's, once the guard slot it was parked on has freed. The
+    /// timer half is inline in [`FsCore::take_op`], where the same CQE
+    /// decides which of the two buckets it came out of.
+    fn release_retiring(&mut self, owner: (u32, u64)) {
+        let Some(t) = self.armed_timers.get_mut(&owner) else {
+            debug_assert!(false, "a parked wall-clock hold with no count");
+            return;
+        };
+        debug_assert!(t.retiring > 0, "a parked hold returned twice");
+        // Saturating rather than wrapping: an unmatched return is a
+        // stuck cap in release, not a `u32::MAX` that refuses the
+        // owner's every arm for the life of the reactor.
+        t.retiring = t.retiring.saturating_sub(1);
+        if t.armed == 0 && t.retiring == 0 {
+            self.armed_timers.remove(&owner);
+        }
+    }
+
     /// Take a completed op entry out: returns its waiter and payloads and
     /// frees the slot (generation bumped) - the freed-before-fire rule.
     fn take_op(
@@ -2258,7 +2397,7 @@ impl FsCore {
         op_slot: u32,
         gen32: u32,
     ) -> Option<Completed> {
-        let entry = self.ops.get_mut(op_slot as usize)?;
+        let entry = self.ops.get(op_slot as usize)?;
         if entry.generation as u32 != gen32 {
             return None;
         }
@@ -2266,6 +2405,27 @@ impl FsCore {
             FsOpState::InFlight { tag: t } if t == tag => {}
             _ => return None,
         }
+        // An `Allow` open whose guard slot is still in flight: the pair
+        // charged one count for two slots, so the charge outlives this
+        // CQE and has to park rather than go home (see `park` below).
+        // Checked against the guard entry itself, because `guard` stays
+        // set on an open whose guard fired *first* - in that ordering
+        // the guard's slot is already free (and possibly reissued) and
+        // there is nothing left to meter.
+        let live_guard = if tag == TAG_OPEN {
+            entry.state.guard.filter(|&(gslot, ggen)| {
+                self.ops.get(gslot as usize).is_some_and(|g| {
+                    g.generation == ggen
+                        && g.state.state
+                            == (FsOpState::InFlight {
+                                tag: TAG_OPEN_DEADLINE,
+                            })
+                })
+            })
+        } else {
+            None
+        };
+        let entry = &mut self.ops[op_slot as usize];
         let e = &mut entry.state;
         // A wall-clock hold's completion returns its owner's tenancy:
         // a timer's - expiry, retraction, or the teardown drain - and
@@ -2291,12 +2451,43 @@ impl FsCore {
             }
             _ => None,
         };
+        // An `Allow` open that answers first
+        // leaves its guard slot parked until that slot's own CQE, so
+        // returning the whole charge here would leave a held slot
+        // metered by nothing and let the arm screen wave through a
+        // fresh pair per unreaped guard - the cap counting arms while
+        // the table pays in slots. The count moves to `retiring`, the
+        // same bucket a retracted timer parks on for the same window,
+        // and the guard carries the owner that owes it.
+        let park_on_guard = match charged {
+            Some((o, _)) => live_guard.map(|g| (o, g)),
+            None => None,
+        };
+        // The other direction: a guard slot reaped without passing
+        // `on_cqe`'s `TAG_OPEN_DEADLINE` arm - the teardown drain
+        // routes every tag through here - still owes whatever its own
+        // open parked on it. Read under the tag, so an ordinary
+        // completion does not touch the field at all.
+        let owed_here = if tag == TAG_OPEN_DEADLINE {
+            e.wall_clock.take()
+        } else {
+            None
+        };
+        // Set only where the count actually moved, so the receipt on
+        // the guard slot and the count on `retiring` are written by the
+        // same branch: a park recorded against a charge that was not
+        // there would have the guard's CQE return a count nobody took.
+        let mut parked = false;
         if let Some((o, retired)) = charged {
             if let Some(t) = self.armed_timers.get_mut(&o) {
                 if retired {
                     t.retiring -= 1;
                 } else {
                     t.armed -= 1;
+                }
+                if park_on_guard.is_some() {
+                    t.retiring += 1;
+                    parked = true;
                 }
                 if t.armed == 0 && t.retiring == 0 {
                     self.armed_timers.remove(&o);
@@ -2326,6 +2517,16 @@ impl FsCore {
         e.clear();
         entry.generation += 1;
         self.op_free.push(op_slot);
+        // Hand the guard the owner whose count now sits on `retiring`,
+        // for its own CQE to return (`on_cqe`'s [`TAG_OPEN_DEADLINE`]
+        // arm). Written after this entry's borrow ends, so the two
+        // slots are touched one at a time.
+        if parked && let Some((o, (gslot, _))) = park_on_guard {
+            self.ops[gslot as usize].state.wall_clock = Some(o);
+        }
+        if let Some(o) = owed_here {
+            self.release_retiring(o);
+        }
         Some(done)
     }
 
@@ -3448,12 +3649,23 @@ impl<'a> FsConn<'a> {
     /// caller still gets exactly one answer per arm and the answer says
     /// what it was - `ECANCELED` unmarked stays meaning the reactor is
     /// going away, which is the verdict a task winds down on, and a
-    /// healthy retraction must not read as that. Best-effort and
-    /// idempotent: the token is verified against the table before
-    /// anything is staged, so a [`Timer`] that already fired - or one
-    /// minted by a different reactor, or retracted once already -
-    /// retracts nothing. Nothing is reported here either way; the
-    /// answer arrives at `on_done`.
+    /// healthy retraction must not read as that. **That verdict does
+    /// not depend on the cancel winning.** The kernel delists a
+    /// timeout before posting `-ETIME` (`io_timeout_fn`,
+    /// `io_uring/timeout.c:254-276`), so a retraction that arrives
+    /// after the fire cancels nothing and the expiry stands - and the
+    /// cancel is best-effort besides. The mark is the caller's ask, and
+    /// `on_cqe` reads the mark: a retracted timer's `-ETIME` is
+    /// delivered as the marked cancellation, never as `Ok(0)`, which
+    /// is this crate's "the deadline arrived" and would run a timeout
+    /// handler for work the caller had already finished.
+    ///
+    /// Idempotent: the token is verified against the table before
+    /// anything is staged, so a [`Timer`] whose op has already
+    /// *answered* - its slot freed, or reissued since - or one minted
+    /// by a different reactor, or retracted once already, retracts
+    /// nothing. Nothing is reported here either way; the answer
+    /// arrives at `on_done`.
     pub fn cancel_timeout(&mut self, timer: Timer) {
         self.fs.retract_timeout(
             self.eng,
@@ -5283,11 +5495,10 @@ mod hybrid_tests {
     /// `on_done` rides the *second* submission and that one is
     /// refused, the future resolves with that submission's own marked
     /// verdict - the queued refusal fires the callback with its
-    /// `EBUSY` ([`FsCore::refuse`]) - rather than hanging or stealing
-    /// the first op's answer. Before refusals delivered, the dropped
-    /// callback resolved this as unmarked `ECANCELED`, teardown's
-    /// vocabulary, for a connection that was fine. `fut`'s rustdoc
-    /// states both halves.
+    /// `EBUSY` ([`FsCore::refuse`]) - rather than hanging, stealing
+    /// the first op's answer, or reading back as the unmarked
+    /// `ECANCELED` a task winds a live connection down on. `fut`'s
+    /// rustdoc states both halves.
     #[test]
     fn a_refused_second_submission_answers_for_itself() {
         let mut eng = Engine::new(256, 128).expect("engine");

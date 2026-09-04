@@ -70,16 +70,24 @@ env:
   #
   # Read this as a count of tests MATCHED, not of tests that did work.
   # Most of `uring_fs::task` is ring-dependent and returns vacuously
-  # under `cfg(miri)` - 43 ring-guard call sites among its 64 test fns,
-  # and an independent count put 37 of the 46 matched as vacuous, leaving
-  # 9 that execute. So the shipped floor of 10 was cleared by the vacuous
-  # skips ALONE: every meaningful test could stop running and the lane
-  # would still pass. That is the sharper reason this must be exact.
+  # under `cfg(miri)`. Measured by cross-referencing the filter's own
+  # `--list` against the ring guards (`rig`, `engine_or_skip`):
+  # lane-wide 94 matched, 55 vacuous, 39 executing; `uring_fs::task`
+  # alone is 59 matched, 49 vacuous, 10 executing. So the shipped floor
+  # of 10 was cleared by the vacuous skips ALONE: every meaningful test
+  # could stop running and the lane would still pass. That is the
+  # sharper reason this must be exact.
+  #
+  # And a bump is not coverage. The seven tests that took MIRI_TESTS
+  # from 87 to 94 all enter through `rig()`, so they added 0 to the
+  # executing count; the fraction moves only when a test that does not
+  # need a ring is added. Re-measure with the two counts above rather
+  # than inferring one from the other.
   #
   # It is also most of the value of widening the filter. Seven of the nine
   # modules added here have ZERO ring-guard uses - query_tree,
   # single_flight, offload_pool, user_data, sys, path::shape, errno - so
-  # they genuinely execute, taking real coverage from ~9 tests to ~38.
+  # they genuinely execute, taking real coverage from ~9 tests to 39.
   # `uring::engine`'s 6 are guard-gated and will skip; they are counted
   # for the tripwire, not claimed as coverage.
   #
@@ -93,11 +101,13 @@ env:
   # retraction tenancy tests added since; 86 added the mid-swap slot
   # bound; 87 the slot Refused transition table, pure Rc/RefCell state
   # that genuinely executes here; 91 adds the four ring-gated
-  # refusal-delivery tests.) If that friction is unwanted,
-  # `-lt` pinned at the TRUE
-  # count still catches deletion, which is the failure mode; what it must
-  # not be again is a floor far below what runs.
-  MIRI_TESTS: "91"
+  # refusal-delivery tests; 94 the `Allow` pair's tenancy in both
+  # orderings and the retracted-timer verdict.) If that friction is
+  # unwanted,
+  # `-lt` pinned at the TRUE count still catches deletion, which is the
+  # failure mode; what it must not be again is a floor far below what
+  # runs.
+  MIRI_TESTS: "94"
 
   # The `http` band, run as its own step under its own feature set.
   MIRI_HTTP_TESTS: "32"

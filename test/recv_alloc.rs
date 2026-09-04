@@ -1570,12 +1570,14 @@ fn the_first_recycle_licenses_the_second_message() {
     let Some(two) = buffered_cost(2) else {
         return;
     };
-    assert!(
-        two <= one,
-        "the second message must reuse the first one's storage: 1 message \
-         cost {one} large allocations, 2 cost {two}. The extra allocation \
-         is a recycle whose licence was potted one step behind the give it \
-         existed to cover."
+    assert_eq!(
+        two, one,
+        "the second message must reuse the first one's storage and cost \
+         nothing extra: 1 message cost {one} large allocations, 2 cost \
+         {two}. Above, the recycle's licence is reaching the pot one step \
+         behind the give it exists to cover; below, run 1's own setup has \
+         started costing more than run 2's and the comparison no longer \
+         measures the pool."
     );
 }
 

@@ -111,7 +111,13 @@ Do not reopen these without a reason that is new.
   counted (`WallClock`), and the arm refuses when armed + retiring
   reaches twice the cap, because with the headroom back early that
   sum is the only thing standing between a swap loop and the whole
-  table. The table is **not** resized for it:
+  table. **Two classes park on `retiring`, and the sum bounds neither
+  unless both do**: a retracted timer, and an `Allow` pair whose open
+  answered while its guard slot was still parked - one count for two
+  slots means the count cannot go home with the first of them. A
+  screen implementing that arithmetic over one of the two classes
+  reads as correct and is not, which is why the census matters more
+  than the formula. The table is **not** resized for it:
   holds spend the handler budget their owner already has, capped so no
   one tenant can park it all.
 - **A host refusal is delivered, not dropped.** The class - a full op
@@ -129,6 +135,12 @@ Do not reopen these without a reason that is new.
   drain pass delivers only what was queued when it began, so a
   callback that re-arms into another refusal pays a wake round trip
   per attempt instead of spinning the ring from inside one pass.
+  **The drain is unconditional in both hosts**, because it is the
+  queue's only consumer and the teardown reap does not touch it: a
+  refusal queued in the window before a `stop()` otherwise dies
+  unfired with the callback and the payload it was handing back.
+  `Server::on_wake` gates the re-arm and the injection drains, never
+  `drain_fs_offloads`, which is the shape `uring_fs::host` already had.
 - **The `fs_ops + pool_size <= MAX_POOL` bound is about field *width*.** An
   op-slot index is packed into the 24-bit `user_data` slot field
   (`user_data::SLOT_MASK`); `TAG_FS_DOMAIN` keeping the two tag vocabularies
