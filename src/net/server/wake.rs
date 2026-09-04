@@ -29,11 +29,20 @@ where
         // The READ already drained the eventfd counter into `pads.wake_buf`. A
         // poke means a shutdown request and/or replies handed back by offloaded
         // workers; deliver those, then re-arm (unless we're shutting down).
+        //
+        // Fire finished fs offloads first, so a continuation that answers its
+        // request via a `Deferred` has that reply drained in this pass - and
+        // unconditionally, as the standalone host does (`uring_fs::host`'s
+        // `TAG_WAKE` arm gates only the re-arm). This drain is the only route
+        // a queued host refusal has (`FsCore::refuse`), and `serve_forever`'s
+        // teardown routes reaped CQEs to `on_drain_cqe` without touching the
+        // refusal queue - so one gated out here dies unfired, taking the
+        // callback and the payload it was handing back with it. It runs no
+        // I/O of its own; whatever a continuation submits from it is reaped
+        // by the teardown drain like any other in-flight op.
+        #[cfg(feature = "uring-fs")]
+        self.drain_fs_offloads()?;
         if !self.core.stopping() {
-            // Fire finished fs offloads first, so a continuation that answers
-            // its request via a `Deferred` has that reply drained in this pass.
-            #[cfg(feature = "uring-fs")]
-            self.drain_fs_offloads()?;
             self.drain_injections()?;
             self.drain_handshake_outcomes()?;
             if self.core.engine.shared.graceful_requested().is_some()

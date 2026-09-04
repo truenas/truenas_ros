@@ -135,6 +135,12 @@ Do not reopen these without a reason that is new.
   drain pass delivers only what was queued when it began, so a
   callback that re-arms into another refusal pays a wake round trip
   per attempt instead of spinning the ring from inside one pass.
+  **The drain is unconditional in both hosts**, because it is the
+  queue's only consumer and the teardown reap does not touch it: a
+  refusal queued in the window before a `stop()` otherwise dies
+  unfired with the callback and the payload it was handing back.
+  `Server::on_wake` gates the re-arm and the injection drains, never
+  `drain_fs_offloads`, which is the shape `uring_fs::host` already had.
 - **The `fs_ops + pool_size <= MAX_POOL` bound is about field *width*.** An
   op-slot index is packed into the 24-bit `user_data` slot field
   (`user_data::SLOT_MASK`); `TAG_FS_DOMAIN` keeping the two tag vocabularies
