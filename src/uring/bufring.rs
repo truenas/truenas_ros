@@ -180,8 +180,17 @@ impl BufRing {
         buf_len: usize,
         initial: u16,
     ) -> errno::Result<BufRing> {
-        let entries = entries.max(1).next_power_of_two();
-        if entries == 0 || buf_len == 0 {
+        // `checked_`, because the plain form panics in debug and wraps to
+        // zero in release for anything above 32768 - so the `entries == 0`
+        // guard below could only ever fire in one of the two profiles, and
+        // the build that ships is the one where a wrapped count reaches the
+        // kernel. The kernel's own ceiling is 32768 entries
+        // (`io_uring/kbuf.c:633-637`); this refuses what it would.
+        let entries = match entries.max(1).checked_next_power_of_two() {
+            Some(e) => e,
+            None => return Err(Errno::EINVAL),
+        };
+        if buf_len == 0 {
             return Err(Errno::EINVAL);
         }
         let ring_bytes = usize::from(entries) * size_of::<IoUringBuf>();
@@ -201,6 +210,20 @@ impl BufRing {
         };
         if ptr == libc::MAP_FAILED {
             return Err(Errno::last());
+        }
+        // `MADV_DONTFORK`, as the SQ/CQ mapping sets on the same grounds
+        // (`ring::mmap_anon`): `CredBroker::spawn` forks holding the ring
+        // fds, and a `MAP_PRIVATE` region is otherwise copy-on-write into
+        // the child - handing it a route to descriptors naming this
+        // process's recv buffers that it never asked for and does not use.
+        // SAFETY: `ptr`/`mapped` are the mapping just made.
+        if let Err(e) = Errno::result(unsafe {
+            libc::madvise(ptr, mapped, libc::MADV_DONTFORK)
+        }) {
+            // SAFETY: same mapping, not yet owned by anything else and not
+            // yet registered, so the kernel holds no pin on it.
+            unsafe { libc::munmap(ptr, mapped) };
+            return Err(e);
         }
         let reg = IoUringBufReg {
             ring_addr: ptr as u64,
@@ -784,6 +807,89 @@ mod tests {
         drop(br); // unregisters; a leak would fail the next registration
         let again = BufRing::new(r.raw_fd(), 0, 4, 64, 4);
         assert!(again.is_ok(), "the id was freed: {again:?}");
+    }
+
+    /// The descriptor ring does not reach a forked child.
+    ///
+    /// `CredBroker::spawn` forks holding the ring fds and, by its own
+    /// contract, needing only those. This mapping is `MAP_PRIVATE`, so
+    /// without `MADV_DONTFORK` a fork copies it in - handing the child
+    /// descriptors naming this process's recv buffers that it never asked
+    /// for. The sibling SQ/CQ mapping is pinned the same way and by the
+    /// same test (`ring::caller_allocated_ring_memory_is_not_inherited`).
+    #[test]
+    fn the_descriptor_ring_is_not_inherited() {
+        let Some(r) = ring() else {
+            return;
+        };
+        let br = BufRing::new(r.raw_fd(), 0, 4, 64, 4).expect("registers");
+        let (addr, len) = (br.ring.cast::<libc::c_void>(), br.mapped);
+
+        let mut fds = [0i32; 2];
+        // SAFETY: `fds` is a valid 2-element array for `pipe` to fill.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: the child issues three syscalls and `_exit`s - no
+        // allocation and no Rust destructor, so nothing can deadlock on a
+        // lock some other thread held at the moment of the fork.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // `msync` answers `ENOMEM` for a range that is not mapped.
+            let mapped = u8::from(
+                unsafe { libc::msync(addr, len, libc::MS_ASYNC) } == 0,
+            );
+            unsafe {
+                libc::close(fds[0]);
+                libc::write(fds[1], std::ptr::addr_of!(mapped).cast(), 1);
+                libc::_exit(0)
+            };
+        }
+        let mut got = 1u8;
+        let mut st = 0;
+        let n = unsafe {
+            libc::close(fds[1]);
+            let n = libc::read(fds[0], std::ptr::addr_of_mut!(got).cast(), 1);
+            libc::close(fds[0]);
+            libc::waitpid(pid, &mut st, 0);
+            n
+        };
+        // Status first: a child that faulted never reported, and its
+        // silence would otherwise read as the assertion passing.
+        assert!(
+            libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0,
+            "the child faulted: status {st}"
+        );
+        assert_eq!(n, 1, "the child reported nothing");
+        assert_eq!(got, 0, "the descriptor ring reached the forked child");
+    }
+
+    /// An entry count no `u16` power of two can describe is refused, in
+    /// **both** profiles.
+    ///
+    /// `u16::next_power_of_two` panics in debug above 32768 and wraps to
+    /// zero in release, so the plain form put the panic in front of the
+    /// `entries == 0` guard in one profile and let a wrapped count through
+    /// to the kernel in the other - the profile that ships. The refusal
+    /// precedes the mmap and the registration, so it needs no ring.
+    #[test]
+    fn an_entry_count_no_power_of_two_can_describe_is_refused() {
+        for n in [32769u16, 65535] {
+            assert!(
+                matches!(BufRing::new(-1, 0, n, 64, 0), Err(Errno::EINVAL)),
+                "{n} entries was not refused"
+            );
+        }
+        // And the last count that does fit is still accepted, so the bound
+        // is the field's and not a taste one.
+        let Some(r) = ring() else {
+            return;
+        };
+        assert_eq!(
+            BufRing::new(r.raw_fd(), 0, 32768, 64, 0)
+                .expect("32768 entries fit a u16")
+                .entries(),
+            32768
+        );
     }
 
     /// The kernel demands a power of two and rejects anything else, so the

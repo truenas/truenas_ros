@@ -206,7 +206,7 @@ impl WakeHandle {
 //
 // The model calls those two functions rather than re-spelling their stores,
 // which is what makes it a test of the code instead of a test of loom.
-#[cfg(loom)]
+#[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
     use crate::sync::Arc;
