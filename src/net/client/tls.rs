@@ -240,23 +240,33 @@ where
         // The deferral's own alias of the socket, for ready()'s key
         // readback. Fail closed like the staging arm above: a connection
         // whose keys can never be confirmed must not be servable.
-        let Some(sock) = crate::fd::dup_cloexec(fd) else {
-            // SAFETY: `fd` is the furnished fd we never delivered to a worker.
-            unsafe { libc::close(fd) };
-            self.parked_handshakes -= 1;
-            // Every connect resolves to exactly one of `Connected` or
-            // `ConnectFailed` - that is what `await_connect` blocks on - so
-            // tearing the slot down without emitting one leaves the caller
-            // waiting for an event that will never arrive.
-            self.events.push_back(Event::ConnectFailed {
-                conn: ConnId::new(slot, gen64),
-                err: Errno::ECONNABORTED,
-            });
-            if let Some(p) = self.core.table.take_tls_connecting(slot) {
-                self.core.table.park_tls(slot, Box::new(p.peer));
-                let _ = self.core.submit_teardown(slot, generation, true);
+        // SAFETY: `fd` is the furnished fd, live for this call.
+        let sock = match crate::fd::dup_cloexec(unsafe {
+            std::os::fd::BorrowedFd::borrow_raw(fd)
+        }) {
+            Ok(s) => s,
+            Err(err) => {
+                // SAFETY: `fd` is the furnished fd, never delivered to
+                // a worker.
+                unsafe { libc::close(fd) };
+                self.parked_handshakes -= 1;
+                // Every connect resolves to exactly one of `Connected` or
+                // `ConnectFailed` - that is what `await_connect` blocks on - so
+                // tearing the slot down without emitting one leaves the caller
+                // waiting for an event that will never arrive. The errno is the
+                // dup's own: this fails when the process is out of descriptors,
+                // and reporting `ECONNABORTED` for that told the consumer the
+                // peer had gone.
+                self.events.push_back(Event::ConnectFailed {
+                    conn: ConnId::new(slot, gen64),
+                    err,
+                });
+                if let Some(p) = self.core.table.take_tls_connecting(slot) {
+                    self.core.table.park_tls(slot, Box::new(p.peer));
+                    let _ = self.core.submit_teardown(slot, generation, true);
+                }
+                return Ok(());
             }
-            return Ok(());
         };
         let deferral = ConnectDeferral {
             slot,

@@ -116,6 +116,28 @@
 //! (bodies splice decrypted); see [`Framing::SpliceBody`] for the framer
 //! contract and timeout interaction.
 //!
+//! **Over kTLS that sentence describes only the plain-TCP case, and a
+//! shared destination pipe is not safe.** `splice_file_to_pipe` takes the
+//! destination pipe's mutex and holds it across `do_splice_read`
+//! (`fs/splice.c:1289-1294`), which over kTLS dispatches
+//! `tls_sw_splice_read` (`net/tls/tls_main.c:890`, `:895`). That waits for
+//! the next TLS record - `tls_rx_rec_wait`, and the submit deliberately
+//! leaves `SPLICE_F_NONBLOCK` unset - so the block is not "the pipe is
+//! full" but "the peer has sent nothing", with an empty pipe and an idle
+//! reader. One peer that handshakes, declares a large body and goes silent
+//! therefore holds that pipe's mutex and every other body spliced to the
+//! same fd serialises behind it. Measured: one, two and four kTLS stallers
+//! each stop an unrelated healthy reply, while the plain-TCP control
+//! survives twenty-four.
+//!
+//! `request_timeout` bounds it (the kTLS splice watchdog,
+//! `arm_splice_deadline`) and is `None` by default, so the default
+//! configuration blocks for as long as the peer likes; even set, one
+//! stalled peer imposes its full period on every other body through that
+//! pipe. **A framer that hands out one pipe per connection is unaffected**;
+//! a captured-fd closure sharing one is the shape to avoid until this has
+//! a fix that does not change the wire timing.
+//!
 //! The egress mirror is a **reply body sourced from a file**
 //! ([`Response::ReplyFile`]; HTTP handlers reach it as
 //! `HttpResponse::file_body`): the reactor reads the declared range on its
@@ -304,7 +326,11 @@
 //!   [`ShutdownHandle::shutdown`] (an eventfd poke). The `signal` feature
 //!   packages exactly that - `signal::block` on the main thread before any
 //!   thread exists, then `Blocked::wait` or a `SignalFd` on the one thread
-//!   that receives - and still installs no handler anywhere.
+//!   that receives - and still installs no handler anywhere. `block` can
+//!   only report on the thread it ran on, so a daemon that wants the
+//!   ordering *checked* rather than assumed calls `signal::block_strict`,
+//!   which refuses when any other thread is already running without the
+//!   set.
 //!
 //! # Safety model
 //!
@@ -479,12 +505,42 @@ pub use protocol::{
     DetachContext, Incoming, Protocol, Request, Response, length_prefixed,
 };
 
-/// The pure framing decision, re-exported only under the `__fuzz` feature for
-/// `fuzz/fuzz_targets/framing_arithmetic.rs`. Not part of the stable API. It
-/// lives in `net::core` now (the engine that enacts it is core); re-exported
-/// here to keep the `net::server` fuzz path stable.
+/// Adopt a registered buffer ring, counting the one refusal an operator can
+/// act on.
+///
+/// `EINVAL`/`ENOSYS` is a kernel with no provided-buffer rings and the
+/// owned-buffer fallback is its designed answer, so it is not counted -
+/// conflating the two is what left a `RLIMIT_MEMLOCK` refusal invisible.
+/// See `ServerStats::buf_rings_refused_memlock`.
+#[cfg(feature = "net-server")]
+fn count_memlock_refusal(
+    stats: &crate::net::core::handles::StatsInner,
+    r: errno::Result<crate::uring::bufring::BufPool>,
+) -> Option<crate::uring::bufring::BufPool> {
+    match r {
+        Ok(p) => Some(p),
+        Err(crate::errno::Errno::ENOMEM) => {
+            stats
+                .buf_rings_refused_memlock
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+/// The internals `fuzz/fuzz_targets/framing_arithmetic.rs` drives, behind the
+/// `#[cfg(feature = "__fuzz")] pub mod fuzz` seam every other target uses
+/// (`mount::statmount`, `audit`, `uring_fs`). Never part of the stable API;
+/// `__fuzz` is outside both `default` and `full`.
+///
+/// The decision itself lives in `net::core` - the engine that enacts it is
+/// core - and is re-exported here so the target's path stays with the role
+/// whose framer contract it fuzzes.
 #[cfg(feature = "__fuzz")]
-pub use crate::net::core::reactor::{FrameStep, frame_step};
+pub mod fuzz {
+    pub use crate::net::core::reactor::{FrameStep, frame_step};
+}
 
 use crate::errno::{self};
 use crate::error::Error;
@@ -877,6 +933,24 @@ where
         // receive buffers, which is the same fallback a pool that runs dry
         // takes. Failing construction would turn a memory optimisation into
         // a bind error.
+        //
+        // **The two refusals are not the same event, and only one of them
+        // is environmental.** `EINVAL`/`ENOSYS` is a kernel with no
+        // provided-buffer rings: the fallback is the designed answer and
+        // there is nothing to report. `ENOMEM` is `RLIMIT_MEMLOCK` refusing
+        // the ring's region - registration is charged page by page,
+        // `io_register_pbuf_ring` -> `io_create_region` ->
+        // `__io_account_mem` (`io_uring/rsrc.c:39-57`), the same path the
+        // SQ/CQ is charged on, where the failure IS reported - and it
+        // leaves a band of limit values, one region wide, in which this
+        // returns `Ok` with every read degraded to the per-read malloc the
+        // ring exists to remove. `__io_account_mem` charges a per-uid
+        // counter, so an unrelated process of the same user can put a
+        // previously healthy server in that band on its next restart. It is
+        // counted rather than made fatal, so an operator has something to
+        // read (`ServerStats::buf_rings_refused_memlock`); whether it
+        // should refuse the bind instead is a deployment's call, not this
+        // constructor's.
         // Both rings are registered at their physical bound - a descriptor
         // slot per unit of the most concurrent demand possible - so growth
         // never hits an artificial ceiling and the malloc fallback is
@@ -894,7 +968,7 @@ where
         if cfg.recv_pool {
             // One buffer per connection: no more messages can be arriving
             // at once than there are connections.
-            core.recv_bufs = crate::uring::bufring::BufPool::new(
+            let r = crate::uring::bufring::BufPool::new(
                 core.engine.ring.raw_fd(),
                 crate::uring::bufring::BGID_RECV,
                 crate::net::core::reactor::recv_pool_buf_len(
@@ -908,8 +982,8 @@ where
                         crate::net::core::reactor::RECV_LEASE_DEPTH + 1,
                     ),
                 ),
-            )
-            .ok();
+            );
+            core.recv_bufs = count_memlock_refusal(&core.stats, r);
         }
         // The file-body ring: its own group, because a group's buffers are
         // interchangeable and a file chunk is not sized like a request.
@@ -917,7 +991,7 @@ where
         // is the most that can be in flight at once.
         #[cfg(feature = "uring-fs")]
         if cfg.fs_ops > 0 && cfg.fs_body_pool {
-            core.body_bufs = crate::uring::bufring::BufPool::new(
+            let r = crate::uring::bufring::BufPool::new(
                 core.engine.ring.raw_fd(),
                 crate::uring::bufring::BGID_FILE_BODY,
                 cfg.fs_body_chunk,
@@ -926,8 +1000,8 @@ where
                         crate::net::core::conn::FILE_TAIL_BUFS,
                     )),
                 ),
-            )
-            .ok();
+            );
+            core.body_bufs = count_memlock_refusal(&core.stats, r);
         }
         // Only a server with an fs pool sweeps closed connections; tell the
         // shared reactor so `close_conn` records into `fs_closed` here and not
@@ -989,6 +1063,13 @@ where
             self.arm_accept(lidx)?;
         }
         let run = self.run_loop();
+        // Deliver what the stop window left queued before the reap, while
+        // the ring is still whole - the same gap the standalone host closes
+        // (`uring_fs::core::drain_stop_window`).
+        #[cfg(feature = "uring-fs")]
+        if let Some(fs) = self.fs.as_mut() {
+            crate::uring_fs::core::drain_stop_window(fs, &mut self.core.engine);
+        }
         // fs ops ride this ring too, and this drain does not dispatch, so
         // route their completions to the fs core as they are reaped: an
         // `openat2` finishing here carries a real process fd in `cqe.res`

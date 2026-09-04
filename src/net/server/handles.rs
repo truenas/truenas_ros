@@ -601,6 +601,32 @@ pub struct ServerStats {
     ///
     /// [`recv_shortage_retry`]: super::ServerConfig::recv_shortage_retry
     pub recv_shortage_parks: u64,
+    /// Provided-buffer rings this server asked for and did not get because
+    /// `RLIMIT_MEMLOCK` refused their region.
+    ///
+    /// **Nonzero means permanently degraded, not absent.** Registering a
+    /// ring is charged page by page against that limit
+    /// (`io_register_pbuf_ring` -> `io_create_region` -> `__io_account_mem`,
+    /// `io_uring/rsrc.c:39-57`) - the same path the SQ/CQ is charged on,
+    /// where the failure *is* reported. Refused here, every read falls back
+    /// to the per-read allocation the ring exists to remove (measured at
+    /// 1.22 -> 2.23 allocations per 128 KiB streamed window) while the
+    /// server answers 200 and every other counter looks healthy. The remedy
+    /// is the operator's: raise the limit (`LimitMEMLOCK=` in the unit, or
+    /// `setrlimit` before [`Server::bind`](super::Server::bind)).
+    ///
+    /// It is not decided by this server's own configuration.
+    /// `__io_account_mem` charges `user->locked_vm`, a **per-uid** counter,
+    /// so an unrelated process of the same user can push a previously
+    /// healthy server into the refusing band on its next restart.
+    ///
+    /// A kernel with no provided-buffer rings at all answers
+    /// `EINVAL`/`ENOSYS` and is **not** counted here: falling back silently
+    /// is right for that, and conflating the two is what left this
+    /// invisible. Distinguishing it from a pool that was never asked for
+    /// takes this counter, because
+    /// [`recv_bufs_total`](ServerStats::recv_bufs_total) reads 0 either way.
+    pub buf_rings_refused_memlock: u64,
 }
 
 /// A `Clone + Send + Sync` handle for reading a running server's counters from
@@ -635,6 +661,9 @@ impl StatsHandle {
             recv_bufs_lent: s.recv_bufs_lent.load(Ordering::Relaxed) as u32,
             recv_shortage_parks: s.recv_shortage_parks.load(Ordering::Relaxed),
             recv_bufs_total: s.recv_bufs_total.load(Ordering::Relaxed) as u32,
+            buf_rings_refused_memlock: s
+                .buf_rings_refused_memlock
+                .load(Ordering::Relaxed),
         }
     }
 }

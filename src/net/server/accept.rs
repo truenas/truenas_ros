@@ -190,11 +190,31 @@ where
         // The deferral's own alias of the socket, for ready()'s key
         // readback. Fail closed like the peer fetch above: a connection
         // whose keys can never be confirmed must not be servable.
-        let Some(sock) = crate::fd::dup_cloexec(fd) else {
-            // SAFETY: close the freshly furnished fd we will not deliver.
-            unsafe { libc::close(fd) };
-            stat!(self.core, shed);
-            return self.core.submit_teardown(slot, generation, true);
+        // SAFETY: `fd` is the freshly installed fd, live for this call.
+        let sock = match crate::fd::dup_cloexec(unsafe {
+            std::os::fd::BorrowedFd::borrow_raw(fd)
+        }) {
+            Ok(s) => s,
+            Err(_) => {
+                // SAFETY: close the freshly furnished fd we will not
+                // deliver.
+                unsafe { libc::close(fd) };
+                stat!(self.core, shed);
+                // Unlike every arm above, the slot is already parked here
+                // *and* its handshake timeout is already armed. Retire
+                // both, the way the resolve path does: left armed, that
+                // timeout fires later, finds the slot still parked and
+                // issues a SECOND teardown for the same slot and
+                // generation - against `close.rs`'s rule that the
+                // index-freeing CLOSE is a connection's last ring op.
+                // Taking the park is what makes a surviving expiry inert
+                // (`on_handshake_timeout` finds nothing parked), so the
+                // cancel is belt-and-braces and must not displace the
+                // teardown - the sibling arm above sheds the same way.
+                let _ = self.core.table.take_tls_parked(slot);
+                let _ = self.cancel_handshake_timeout(slot, generation);
+                return self.core.submit_teardown(slot, generation, true);
+            }
         };
         let deferral = AcceptDeferral {
             slot,
