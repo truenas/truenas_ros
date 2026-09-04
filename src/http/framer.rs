@@ -350,6 +350,17 @@ impl<U> HttpConn<U> {
     /// Public for the one admission that wrapper cannot cover: a kTLS
     /// listener's handshake worker, where the accept handler does not run
     /// and `AcceptDeferral::ready` takes the connection state directly.
+    ///
+    /// **On a kTLS listener served by a streaming protocol, this is the
+    /// wrong constructor and nothing will say so.** The streaming decision
+    /// lives in the builder's accept closure, which `ready()` replaces, so
+    /// a handshake worker handing back `HttpConn::new` gets a connection
+    /// whose bodies buffer - and whose effective ceiling is
+    /// `max_request_bytes`, not the `max_body_bytes` the protocol was built
+    /// with. A limit that holds on one transport and not the other is worse
+    /// than no limit, because a deployment sets it, tests it over plain
+    /// HTTP and ships it. Use [`HttpConn::new_streaming`] with the same cap
+    /// there.
     pub fn new(state: U) -> Self {
         Self {
             phase: Phase::Head,
@@ -361,7 +372,9 @@ impl<U> HttpConn<U> {
     /// A connection whose bodies stream - chunked a chunk at a time,
     /// known-length a window at a time above one window - bounded at
     /// `max_body_bytes`. The streaming builder's accept wrapper mints
-    /// these; see [`HttpConn::new`] for why the constructor is public.
+    /// these; see [`HttpConn::new`] for why the constructor is public, and
+    /// for why a kTLS handshake worker must call **this** one, with the cap
+    /// the protocol was built with, rather than [`HttpConn::new`].
     pub fn new_streaming(state: U, max_body_bytes: u64) -> Self {
         Self {
             phase: Phase::Head,

@@ -1248,6 +1248,28 @@ where
             })
         },
         header: move |buf: &[u8], conn: &mut HttpConn<U>| {
+            // The accept wrapper above is not the only admission. A kTLS
+            // listener is admitted by `AcceptDeferral::ready`, which takes
+            // the connection state directly and never runs it
+            // (`net/server/accept.rs`: `install_conn` has exactly two
+            // callers, and only the plain-TCP one goes through the accept
+            // handler). A worker that hands back `HttpConn::new` there
+            // would otherwise get a connection with no cap at all - and
+            // `stream_cap` is not merely the streaming switch, it *is* the
+            // body limit, so the ceiling would silently become
+            // `HttpConfig::max_body` instead of the `max_body_bytes` this
+            // protocol was built with. A limit that holds on one transport
+            // and not the other is worse than no limit: a deployment sets
+            // it, tests it over plain HTTP and ships it.
+            //
+            // Adopting it here rather than at admission covers every route
+            // in, present and future. Safe at this point by construction -
+            // `HttpConn::new` leaves `Phase::Head`, so no body is ever in
+            // progress the first time this runs - and `is_none` leaves a
+            // connection minted `new_streaming` with its own cap.
+            if conn.stream_cap.is_none() {
+                conn.stream_cap = stream_cap;
+            }
             frame(buf, conn, &cfg)
         },
         body: move |req: Request<'_, HttpConn<U>>| {
@@ -1428,6 +1450,14 @@ where
 ///   must consume it as it arrives.
 ///
 /// Errors when `cfg` fails [`HttpConfig::validate`].
+///
+/// **A kTLS listener needs the cap passed by hand.** The streaming
+/// decision is made in this function's accept closure, and a kTLS
+/// connection is admitted by `AcceptDeferral::ready` instead - the
+/// accept handler never runs for one. A handshake worker that hands
+/// back [`HttpConn::new`] therefore gets a buffering connection whose
+/// effective ceiling is `max_request_bytes`; use
+/// [`HttpConn::new_streaming`] with `max_body_bytes` there.
 #[allow(clippy::type_complexity)]
 pub fn protocol_streaming<U, A, H>(
     cfg: HttpConfig,
@@ -1461,6 +1491,14 @@ where
 /// server already drives.
 ///
 /// Errors when `cfg` fails [`HttpConfig::validate`].
+///
+/// **A kTLS listener needs the cap passed by hand.** The streaming
+/// decision is made in this function's accept closure, and a kTLS
+/// connection is admitted by `AcceptDeferral::ready` instead - the
+/// accept handler never runs for one. A handshake worker that hands
+/// back [`HttpConn::new`] therefore gets a buffering connection whose
+/// effective ceiling is `max_request_bytes`; use
+/// [`HttpConn::new_streaming`] with `max_body_bytes` there.
 #[cfg(feature = "uring-fs")]
 #[allow(clippy::type_complexity)]
 pub fn protocol_streaming_fs<U, A, H>(
@@ -1522,7 +1560,87 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::framer::{Phase, STREAM_WINDOW};
     use crate::net::Framing;
+
+    /// A streaming protocol streams - and bounds - a connection its accept
+    /// wrapper never minted.
+    ///
+    /// A kTLS listener is admitted by `AcceptDeferral::ready`, which takes
+    /// the connection state directly and never runs the accept handler, so
+    /// a handshake worker can hand back `HttpConn::new`. `stream_cap` is
+    /// not merely the streaming switch - it *is* the body limit and it
+    /// lifts `HttpConfig::max_body` - so without this the endpoint's
+    /// declared `max_body_bytes` would not apply on the TLS transport at
+    /// all, and the effective ceiling would be `max_body` instead. A limit
+    /// that holds on one transport and not the other is worse than no
+    /// limit.
+    #[test]
+    fn a_streaming_protocol_bounds_a_connection_it_did_not_mint() {
+        let cfg = HttpConfig {
+            max_head: 1024,
+            max_body: 8 * 1024 * 1024,
+        };
+        const CAP: u64 = 256 * 1024;
+        assert!(
+            CAP as usize > STREAM_WINDOW && (CAP as usize) < cfg.max_body,
+            "the cap has to sit between the window and `max_body` for \
+             either assertion below to mean anything"
+        );
+        let mut proto = protocol_streaming(
+            cfg,
+            CAP,
+            |_i: Incoming<'_>| Some(()),
+            |_r: HttpRequest<'_>, _s: &mut ()| HttpVerdict::Continue,
+        )
+        .expect("build");
+
+        // A body over one window streams, on a connection minted the way a
+        // kTLS handshake worker mints one.
+        let mut conn = HttpConn::new(());
+        let head = format!(
+            "PUT /k HTTP/1.1\r\nHost: h\r\nContent-Length: {}\r\n\r\n",
+            STREAM_WINDOW + 1
+        );
+        assert_eq!(
+            (proto.header)(head.as_bytes(), &mut conn),
+            Framing::Complete {
+                header_len: head.len(),
+                body_len: 0
+            }
+        );
+        assert!(
+            matches!(conn.phase, Phase::StreamOpen { .. }),
+            "buffered a body the protocol was built to stream: {:?}",
+            conn.phase
+        );
+
+        // And the cap is the cap, not `max_body`.
+        let mut conn = HttpConn::new(());
+        let head = format!(
+            "PUT /k HTTP/1.1\r\nHost: h\r\nContent-Length: {}\r\n\r\n",
+            CAP + 1
+        );
+        let _ = (proto.header)(head.as_bytes(), &mut conn);
+        assert!(
+            matches!(conn.phase, Phase::Fail { status: 413, .. }),
+            "a body over `max_body_bytes` was admitted against \
+             `HttpConfig::max_body` instead: {:?}",
+            conn.phase
+        );
+
+        // A connection the wrapper *did* mint keeps its own cap - this must
+        // adopt, never overwrite.
+        let mut conn = HttpConn::new_streaming((), 1024);
+        let head =
+            b"PUT /k HTTP/1.1\r\nHost: h\r\nContent-Length: 2048\r\n\r\n";
+        let _ = (proto.header)(head, &mut conn);
+        assert!(
+            matches!(conn.phase, Phase::Fail { status: 413, .. }),
+            "the protocol's cap overwrote the connection's own: {:?}",
+            conn.phase
+        );
+    }
 
     /// [`step`] with a throwaway date cache and responder - the tests assert
     /// nothing about `Date` freshness (pinned in `date.rs`) or the injection
