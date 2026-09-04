@@ -247,18 +247,24 @@ fn zfs_snapshot_is_detected() {
     let _ = std::fs::read_dir(&snap_path).map(|d| d.count());
     let sm = statmount_path(&snap_path);
     let _ = zfs(&["destroy", "-r", &snap]);
-    if let Ok(sm) = sm {
-        // Snapshot detection needs `sb_source`, which requires a new-enough
-        // kernel *and* ZFS wiring it up for the snapshot mount. Where it is
-        // unavailable, detection is gracefully disabled (exactly as
-        // `truenas_pyos` documents), so only assert when it was reported.
-        if sm.sb_source.is_some() {
-            assert!(
-                is_zfs_snapshot(&sm),
-                "snapshot not detected: sb_source={:?} mnt_point={:?}",
-                sm.sb_source,
-                sm.mnt_point
-            );
-        }
+    // Both degradations are announced. Held inside two silent `if`s, this
+    // test returned green whether it had asserted anything or not, so
+    // `REQUIRE_ZFS` could not see the fixture go missing under it - which
+    // is the whole job of the gate.
+    let Ok(sm) = sm else {
+        return skip("statmount of the snapshot mount failed");
+    };
+    // Snapshot detection needs `sb_source`, which requires a new-enough
+    // kernel *and* ZFS wiring it up for the snapshot mount. Where it is
+    // unavailable, detection is gracefully disabled (exactly as
+    // `truenas_pyos` documents), so only assert when it was reported.
+    if sm.sb_source.is_none() {
+        return skip("the snapshot mount reported no sb_source");
     }
+    assert!(
+        is_zfs_snapshot(&sm),
+        "snapshot not detected: sb_source={:?} mnt_point={:?}",
+        sm.sb_source,
+        sm.mnt_point
+    );
 }

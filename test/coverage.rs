@@ -598,15 +598,31 @@ mod mount {
 
     #[test]
     fn privileged_wrappers_are_callable() {
-        // These need CAP_SYS_ADMIN; unprivileged they return an error. We only
-        // drive the wrapper + errno mapping, so the outcome is not asserted.
-        let _ = open_tree(AT_FDCWD, "/", OpenTreeFlags::OPEN_TREE_CLONE);
-        let _ = move_mount(
-            AT_FDCWD,
-            "/proc/self/ns/mnt",
-            AT_FDCWD,
-            "/tmp",
-            MoveMountFlags::empty(),
+        // Each wrapper builds its argument struct and issues its syscall;
+        // what is under test is that path, not the kernel's answer.
+        //
+        // **Every target is a name that cannot exist.** This test runs as
+        // root in the QEMU lane, where the earlier form asked the kernel to
+        // remount `/` read-only and to `move_mount` onto `/tmp` - stopped
+        // only incidentally, by the `MOUNT_ATTR_IDMAP` on a directory fd
+        // and by the source not being a mount point. Neither is a
+        // guarantee, and an edit that removed the idmap would take the
+        // runner's root filesystem read-only. Against an absent path the
+        // syscall can only fail, so the outcome is assertable too.
+        let dir = truenas_ros::tempdir().unwrap();
+        let gone = dir.path().join("no-such-mount");
+        assert!(
+            open_tree(AT_FDCWD, &gone, OpenTreeFlags::OPEN_TREE_CLONE).is_err()
+        );
+        assert!(
+            move_mount(
+                AT_FDCWD,
+                &gone,
+                AT_FDCWD,
+                &gone,
+                MoveMountFlags::empty()
+            )
+            .is_err()
         );
         let anchor = std::fs::File::open("/").unwrap();
         let attr = MountSetattr::new()
@@ -615,7 +631,9 @@ mod mount {
             .atime(Atime::Noatime)
             .propagation(MntPropagation::MS_SLAVE)
             .idmap(anchor.as_fd());
-        let _ = mount_setattr(AT_FDCWD, "/", AtFlags::empty(), &attr);
+        assert!(
+            mount_setattr(AT_FDCWD, &gone, AtFlags::empty(), &attr).is_err()
+        );
     }
 
     #[test]
@@ -981,6 +999,7 @@ mod acl {
 
     #[test]
     fn low_level_fsetacl_paths() {
+        use truenas_ros::errno::Errno;
         use truenas_ros::sync_fs::acl::{fsetacl_nfs4, fsetacl_posix};
         let dir = truenas_ros::tempdir().unwrap();
         let d = std::fs::File::open(dir.path()).unwrap();
@@ -1012,6 +1031,23 @@ mod acl {
         .to_xattr()
         .unwrap();
         let _ = fsetacl_nfs4(d.as_fd(), &nfs4);
+        assert!(!nfs4.is_empty(), "an empty ACL still serialises to bytes");
+
+        // An *empty* slice is refused, on both raw paths, before it can
+        // reach the filesystem. The kernel leaves `kvalue` NULL for a
+        // zero-length `setxattr` (`setxattr_copy`, `fs/xattr.c:655-669`)
+        // and ZFS reads `(NULL, 0)` as the strip signal, so writing one
+        // would silently revert the object to mode-only permissions - the
+        // opposite of the "deny everyone" a caller that filtered an ACL
+        // down to nothing means by it. Removal is `fsetacl(fd, None)`.
+        assert!(matches!(
+            fsetacl_nfs4(d.as_fd(), &[]),
+            Err(truenas_ros::Error::Errno(Errno::EINVAL))
+        ));
+        assert!(matches!(
+            fsetacl_posix(d.as_fd(), &[], None),
+            Err(truenas_ros::Error::Errno(Errno::EINVAL))
+        ));
     }
 }
 
@@ -1797,6 +1833,104 @@ mod shutil {
                 .is_err()
             );
         }
+    }
+
+    /// A re-run or incremental copy must leave the destination looking like
+    /// the source, whatever was at the name first.
+    ///
+    /// `make_file` replaced a collision with `exist_ok`; `make_symlink` and
+    /// `make_special` kept it, so a destination could carry a different
+    /// symlink target - or an entry of a different *type* entirely - while
+    /// `copytree` returned `Ok` with stats claiming it had copied one.
+    #[test]
+    fn copytree_replaces_a_taken_symlink_or_special() {
+        let tmp = truenas_ros::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("real"), b"NEW").unwrap();
+        std::os::unix::fs::symlink("real", src.join("link")).unwrap();
+        mkfifo(&src.join("pipe"));
+
+        // A destination that already has all three names taken, two of them
+        // by the wrong kind of object.
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(dst.join("other"), b"OLD").unwrap();
+        std::os::unix::fs::symlink("other", dst.join("link")).unwrap();
+        std::fs::write(dst.join("pipe"), b"PLANTED").unwrap();
+
+        let stats = copytree(&src, &dst, &CopyTreeConfig::default()).unwrap();
+        assert_eq!(stats.symlinks, 1);
+        assert_eq!(stats.specials, 1);
+        assert_eq!(
+            std::fs::read_link(dst.join("link")).unwrap(),
+            std::path::Path::new("real"),
+            "the destination kept a link pointing somewhere else"
+        );
+        assert_eq!(std::fs::read(dst.join("link")).unwrap(), b"NEW");
+        let m = std::fs::symlink_metadata(dst.join("pipe")).unwrap();
+        assert!(
+            std::os::unix::fs::FileTypeExt::is_fifo(&m.file_type()),
+            "a regular file survived a FIFO source, mode {:o}",
+            m.permissions().mode()
+        );
+    }
+
+    /// A copy that fails must leave a *borrowed* destination root at the
+    /// mode it found.
+    ///
+    /// copytree narrows a pre-existing root to 0o700 for the duration, so
+    /// group and other cannot reach files while they are being written -
+    /// but only the success path restored a mode, and the original was
+    /// recorded nowhere, so the caller could not put it back either. On a
+    /// share or system-dataset migration that locks every non-owner
+    /// identity out of the destination, and the error names no permission
+    /// change.
+    #[test]
+    fn a_failed_copytree_puts_a_borrowed_root_s_mode_back() {
+        let tmp = truenas_ros::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/f"), b"x").unwrap();
+
+        // A destination this copy did not create, and is only borrowing.
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        // A regular file where the source has a directory: `make_dir`
+        // swallows the `EEXIST` under `exist_ok` and the `O_DIRECTORY`
+        // open behind it answers `ENOTDIR`, which is a copy that fails
+        // after the root has been narrowed.
+        std::fs::write(dst.join("sub"), b"in the way").unwrap();
+
+        let err = copytree(&src, &dst, &CopyTreeConfig::default())
+            .expect_err("the copy must fail");
+        assert!(
+            matches!(err, truenas_ros::Error::Errno(Errno::ENOTDIR)),
+            "unexpected failure: {err:?}"
+        );
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().permissions().mode() & 0o7777,
+            0o755,
+            "a borrowed destination root was left narrowed"
+        );
+
+        // The control: a copy that succeeds ends at the source root's mode,
+        // which is what `finish_dir` stamps.
+        std::fs::remove_file(dst.join("sub")).unwrap();
+        copytree(&src, &dst, &CopyTreeConfig::default()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dst).unwrap().permissions().mode() & 0o7777,
+            std::fs::metadata(&src).unwrap().permissions().mode() & 0o7777,
+        );
+    }
+
+    fn mkfifo(p: &std::path::Path) {
+        let c =
+            std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path this test owns.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
     }
 
     #[test]

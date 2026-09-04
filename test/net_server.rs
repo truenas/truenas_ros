@@ -376,6 +376,7 @@ fn tcp_many_concurrent() {
     let stop = server.shutdown_handle();
 
     let coordinator = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let clients: Vec<_> = (0..N)
             .map(|i| thread::spawn(move || one_shot(v4, i)))
             .collect();
@@ -1674,7 +1675,7 @@ fn tls_listener_without_a_handshake_handler_is_rejected() {
     };
     let mut server = match Server::bind([Listen::tls(addr)], proto) {
         Ok(s) => s,
-        Err(e) if should_skip(&e) => return,
+        Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
         // A kernel without FIXED_FD_INSTALL rejects the listener earlier, with
         // its own validation message - environmental, not the case under test.
         Err(Error::Validation(m)) if m.contains("FIXED_FD_INSTALL") => return,
@@ -2562,6 +2563,121 @@ fn tcp_graceful_drain_lets_healthy_splice_finish() {
     rd.read_to_end(&mut got).expect("pipe read");
     assert_eq!(got.len(), BODY, "drain truncated a healthy splice");
     assert_eq!(got, payload, "spliced body corrupted");
+}
+
+/// SECURITY: one destination pipe, one body. Two connections splicing to
+/// the same fd do not merely queue behind each other - they **interleave**.
+/// A splice moves at most what the transport hands over in one call, and
+/// the remainder is resubmitted as a fresh op, so another connection's
+/// splice can take the pipe's mutex in between and write its own bytes.
+/// The second body is refused rather than served corrupt.
+///
+/// A captured-fd framer closure is the shape that invites this, which is
+/// exactly what `splice_header` is - so this test is the framer every other
+/// splice test here uses, driven by two connections instead of one.
+#[test]
+fn tcp_splice_body_refuses_a_destination_already_in_use() {
+    use std::sync::Mutex;
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `pipe(2)` fills {read, write}.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (pipe_rd, pipe_wr) = (fds[0], fds[1]);
+
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: splice_header(pipe_wr),
+        body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
+    };
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => {
+            // SAFETY: closing the test-owned pipe fds on the skip path.
+            unsafe {
+                libc::close(pipe_rd);
+                libc::close(pipe_wr);
+            }
+            return;
+        }
+        Err(e) => panic!("bind: {e}"),
+    };
+    {
+        let seen = Arc::clone(&reasons);
+        server.set_close_hook(move |_peer, why, _state| {
+            seen.lock().unwrap().push(why);
+        });
+    }
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        (|| -> io::Result<()> {
+            // The first connection opens a body far larger than the pipe and
+            // never finishes it, so its splice stays in flight.
+            // `pipe_rd` is this thread's for the duration; the outer scope
+            // closes both ends once it has joined.
+            let mut first = connect_tcp(v4)?;
+            let mut hdr = vec![b'S'];
+            hdr.extend_from_slice(&(8u32 * 1024 * 1024).to_be_bytes());
+            first.write_all(&hdr)?;
+            first.write_all(&[b'a'; 4096])?;
+            first.flush()?;
+            // Wait for the splice by *observing* it, not by sleeping: the
+            // bytes reaching the pipe are the proof that the first body is
+            // in flight, and it stays in flight because only 4096 of the
+            // declared 8 MiB were sent.
+            let mut drained = 0usize;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while drained < 4096 && Instant::now() < deadline {
+                let mut sink = [0u8; 4096];
+                // SAFETY: reading into a local buffer of its own length.
+                let n = unsafe {
+                    libc::read(
+                        pipe_rd,
+                        sink.as_mut_ptr().cast(),
+                        (4096 - drained) as libc::size_t,
+                    )
+                };
+                if n > 0 {
+                    drained += n as usize;
+                }
+            }
+            assert_eq!(drained, 4096, "the first body never reached the pipe");
+
+            // The second names the same fd: refused, not queued.
+            let mut second = connect_tcp(v4)?;
+            second.write_all(&hdr)?;
+            second.flush()?;
+            let mut one = [0u8; 1];
+            match second.read(&mut one) {
+                Ok(0) | Err(_) => {}
+                Ok(n) => panic!("unexpected {n} byte(s) on a refused body"),
+            }
+            Ok(())
+        })()
+        .expect("client io");
+        stop.shutdown();
+    });
+
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("client join");
+    assert!(
+        reasons
+            .lock()
+            .unwrap()
+            .contains(&CloseReason::SpliceFdInUse),
+        "a shared splice destination must be refused, got {:?}",
+        reasons.lock().unwrap()
+    );
+    // SAFETY: closing the test-owned pipe fds.
+    unsafe {
+        libc::close(pipe_rd);
+        libc::close(pipe_wr);
+    }
 }
 
 #[test]
@@ -4876,6 +4992,7 @@ fn tcp_peername_is_per_connection() {
     let stop = server.shutdown_handle();
 
     let driver = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let clients: Vec<_> = (0..N)
             .map(|_| {
                 thread::spawn(move || -> io::Result<()> {
@@ -7154,6 +7271,7 @@ fn a_shutdown_amid_arrivals_tears_down_quietly() {
     let stats = server.stats_handle();
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         // One full round trip first, so the fixture is known to have been
         // accepted and served before anything races - the shutdown below
         // is deliberately concurrent and would otherwise be free to win
@@ -7468,6 +7586,111 @@ fn ktls_close_notify_reports_tls_control() {
     );
 }
 
+/// SECURITY: a kTLS body splice with no `request_timeout` is refused.
+///
+/// That clock is the **only** bound one has. `tls_sw_splice_read` blocks an
+/// io-wq worker awaiting the next TLS record, which no linked timeout can
+/// reach - the kernel arms one only after the head op's `issue()` returns,
+/// and a blocking splice's does not return until it completes - so the
+/// standalone watchdog keyed on `request_timeout` is the whole mechanism.
+/// Unset, a peer that handshakes, declares a large body and goes silent
+/// holds its slot, an io-wq worker and its destination pipe's mutex
+/// indefinitely, immune to every other timeout.
+///
+/// Plain TCP is deliberately not refused: its `-EAGAIN` readiness-poll path
+/// is already clocked. The second half of this test is that denominator.
+#[test]
+fn ktls_splice_body_without_a_clock_is_refused() {
+    use std::sync::Mutex;
+    if ktls_openssl_unsupported() {
+        return;
+    }
+    let (cert, key) = self_signed();
+    let acceptor = Arc::new(ktls_acceptor(&cert, &key));
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `pipe(2)` fills {read, write}.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (pipe_rd, pipe_wr) = (fds[0], fds[1]);
+    let close_pipe = move || {
+        // SAFETY: closing the test-owned pipe fds.
+        unsafe {
+            libc::close(pipe_rd);
+            libc::close(pipe_wr);
+        }
+    };
+
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: splice_header(pipe_wr),
+        body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
+    };
+    // No `request_timeout`, which is the default.
+    let mut server = match Server::bind(
+        [truenas_ros::net::server::Listen::tls(addr)],
+        proto,
+    ) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) || ktls_unsupported(&e) => {
+            close_pipe();
+            return;
+        }
+        Err(e) => panic!("bind: {e}"),
+    };
+    {
+        let seen = Arc::clone(&reasons);
+        server.set_close_hook(move |_peer, why, _state: &mut ()| {
+            seen.lock().unwrap().push(why);
+        });
+    }
+    {
+        let acceptor = Arc::clone(&acceptor);
+        server.set_tls_handshake(move |fd, _inc, deferral| {
+            let acceptor = Arc::clone(&acceptor);
+            thread::spawn(move || match ktls_server_handshake(fd, &acceptor) {
+                Ok(()) => deferral.ready(()),
+                Err(_) => deferral.reject(),
+            });
+        });
+    }
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        (|| -> io::Result<()> {
+            let mut s = tls_connect(v4)?;
+            let mut hdr = vec![b'S'];
+            hdr.extend_from_slice(&(1024u32 * 1024).to_be_bytes());
+            s.write_all(&hdr)?;
+            s.flush()?;
+            let mut one = [0u8; 1];
+            match s.read(&mut one) {
+                Ok(0) | Err(_) => {}
+                Ok(n) => panic!("unexpected {n} byte(s) on a refused body"),
+            }
+            Ok(())
+        })()
+        .expect("client io");
+        stop.shutdown();
+    });
+
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("client join");
+    assert!(
+        reasons
+            .lock()
+            .unwrap()
+            .contains(&CloseReason::SpliceUnbounded),
+        "an unbounded kTLS splice must be refused, got {:?}",
+        reasons.lock().unwrap()
+    );
+    close_pipe();
+}
+
 #[test]
 fn tcp_splice_body_over_ktls() {
     // A body splices zero-copy off a SOFTWARE kTLS socket, in the clear: the
@@ -7499,8 +7722,17 @@ fn tcp_splice_body_over_ktls() {
         header: splice_header(pipe_wr),
         body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
     };
-    let mut server = match Server::bind(
+    // `request_timeout` is not optional for a kTLS splice: it is the only
+    // clock that reaches one, so a server without it refuses the body
+    // (`CloseReason::SpliceUnbounded`). Generous here - nothing in this test
+    // stalls, and the sibling stall tests are where the value matters.
+    let cfg = ServerConfig {
+        request_timeout: Some(Duration::from_secs(10)),
+        ..ServerConfig::default()
+    };
+    let mut server = match Server::with_config(
         [truenas_ros::net::server::Listen::tls(addr)],
+        cfg,
         proto,
     ) {
         Ok(s) => s,
@@ -7899,6 +8131,7 @@ fn server_builds_with_fs_pool() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let r = one_shot(v4, 0);
         stop.shutdown();
         r
@@ -8088,6 +8321,7 @@ fn fs_static_file_server_open_read_reply() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<(Vec<u8>, Vec<u8>)> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let mut s = connect_tcp(v4)?;
         // Two files on ONE keep-alive connection: proves per-request open/close.
         send_framed(&mut s, b"hello.txt")?;
@@ -8188,6 +8422,7 @@ fn fs_dir_listing_replies_through_the_wake_drain() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let mut s = connect_tcp(v4)?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
         send_framed(&mut s, b"list")?;
@@ -8298,6 +8533,7 @@ fn fs_conn_flistxattr_lists_file_xattrs() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let mut s = connect_tcp(v4)?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
         send_framed(&mut s, b"list")?;
@@ -8423,6 +8659,7 @@ fn fs_conn_fstatfs_agrees_from_file_and_anchor() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let mut s = connect_tcp(v4)?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
         send_framed(&mut s, b"statfs")?;
@@ -8570,6 +8807,7 @@ fn fs_conn_zfs_attrs_round_trip_through_the_pool() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let mut s = connect_tcp(v4)?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
         send_framed(&mut s, b"attrs")?;
@@ -8692,6 +8930,7 @@ fn fs_conn_offload_result_batches_statx_and_xattrs_in_one_job() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let mut s = connect_tcp(v4)?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
         send_framed(&mut s, b"head")?;
@@ -8854,6 +9093,7 @@ fn server_privileged_xattr_policy_reaches_the_embedded_reactor() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let mut s = connect_tcp(v4)?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
         send_framed(&mut s, b"go")?;
@@ -8977,6 +9217,7 @@ fn fs_file_carries_personality_and_as_root() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let mut s = connect_tcp(v4)?;
         send_framed(&mut s, b"go")?;
         let r = recv_framed(&mut s)?;
@@ -9131,6 +9372,7 @@ fn fs_metadata_ops_rename_truncate_xattr() {
     // (optional getxattr reply, optional truncate reply, rename reply).
     type MetaReplies = io::Result<(Option<Vec<u8>>, Option<Vec<u8>>, Vec<u8>)>;
     let client = thread::spawn(move || -> MetaReplies {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let mut s = connect_tcp(v4)?;
         // getxattr and truncate read/modify orig.txt; rename moves it last.
         let xattr = if do_xattr {
@@ -9248,6 +9490,7 @@ fn fs_owned_files_swept_on_connection_close() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<Vec<Vec<u8>>> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         // Sequential connections, each opening one (never-closed) file, then
         // closing - the sweep must reclaim its slot before the pool exhausts.
         let mut replies = Vec::with_capacity(N);
@@ -9361,6 +9604,7 @@ fn fs_continuation_may_open_and_its_slot_comes_back() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> Vec<io::Result<Vec<u8>>> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let mut out = Vec::with_capacity(N);
         for _ in 0..N {
             let mut s = connect_tcp(v4).expect("connect");
@@ -9529,6 +9773,7 @@ fn fs_broker_personality_gates_open() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<(Vec<u8>, Vec<u8>)> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let mut s = connect_tcp(v4)?;
         send_framed(&mut s, b"as-peer")?;
         let peer = recv_framed(&mut s)?;
@@ -9687,6 +9932,7 @@ fn fs_open_chain_gates_the_last_step_on_its_own_personality() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<Vec<Vec<u8>>> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let mut s = connect_tcp(v4)?;
         let mut out = Vec::new();
         for cmd in [b"root-root".as_slice(), b"root-peer", b"peer-peer"] {
@@ -10146,6 +10392,7 @@ fn fs_as_root_reads_trusted_xattr_across_privilege() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let mut s = connect_tcp(v4)?;
         send_framed(&mut s, b"go")?;
         let r = recv_framed(&mut s)?;
@@ -10268,6 +10515,7 @@ fn fs_fd_reclaimed_on_connection_close_midchain() {
     let stop = server.shutdown_handle();
     let oc2 = Arc::clone(&opened);
     let client = thread::spawn(move || -> io::Result<bool> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let mut s = connect_tcp(v4)?;
         send_framed(&mut s, b"go")?;
         let _ = recv_framed(&mut s)?; // "opened": fd recorded, read in flight
@@ -10372,6 +10620,7 @@ fn fs_conn_mkdir_path_builds_a_tree_and_answers_a_real_directory() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<(Vec<u8>, Vec<u8>)> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         // Shut down on every exit: one that skipped it would strand
         // `serve_forever` and hang rather than fail.
         let out = (|| {
@@ -10483,6 +10732,7 @@ fn fs_conn_mkdir_path_refuses_a_path_it_cannot_rebuild() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<io::Result<Vec<u8>>> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let out = (|| {
             let mut s = connect_tcp(v4)?;
             s.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -10602,6 +10852,7 @@ fn fs_conn_mkdir_path_refuses_a_how_that_would_answer_with_a_file() {
     };
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<[bool; 2]> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let out = (|| {
             let mut got = [false; 2];
             for slot in got.iter_mut() {
@@ -10640,6 +10891,15 @@ fn fs_conn_mkdir_path_refuses_a_how_that_would_answer_with_a_file() {
 /// test has to say out loud that it got a pool. Without this they all pass
 /// against the fallback and prove nothing about the ring.
 fn assert_pool_registered(s: &truenas_ros::net::server::ServerStats) {
+    // Named separately, because the two reasons for `recv_bufs_total == 0`
+    // want different actions from whoever reads the failure: a kernel with
+    // no provided-buffer rings is environmental, and `RLIMIT_MEMLOCK`
+    // refusing their region is `ulimit -l` on this host - which the
+    // per-uid accounting makes reachable from an unrelated process.
+    assert_eq!(
+        s.buf_rings_refused_memlock, 0,
+        "RLIMIT_MEMLOCK refused a buffer ring - raise `ulimit -l`: {s:?}"
+    );
     assert!(
         s.recv_bufs_total > 0,
         "no recv buffer ring registered - this test exercised the \
@@ -10682,6 +10942,7 @@ fn a_pooled_server_echoes_what_an_owned_one_does() {
     let stop = server.shutdown_handle();
 
     let coordinator = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let clients: Vec<_> = (0..N)
             .map(|_i| {
                 thread::spawn(move || {

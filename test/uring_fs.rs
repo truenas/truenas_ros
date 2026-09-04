@@ -1772,6 +1772,47 @@ fn abandoned_tmpfile_leaves_nothing_behind() {
     });
 }
 
+/// The confinement composes with every enrichment, not only the one that
+/// takes the by-name `statx` path.
+///
+/// Asking for xattrs, an ACL or a name list opens a descriptor, and the
+/// device then comes from a `statx` of *that* - issued in the read phase,
+/// with no by-name answer at the collection phase at all. A confinement
+/// that reads "no metadata here" as a failure at the earlier phase would
+/// refuse every such listing outright.
+#[test]
+fn confinement_composes_with_the_descriptor_enrichments() {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("a"), b"x").expect("write");
+        std::fs::create_dir(dir.join("d")).expect("mkdir");
+        let anchor = Anchor::open(&dir).expect("anchor");
+        for spec in [
+            EnrichSpec::STATX | EnrichSpec::XATTR,
+            EnrichSpec::STATX | EnrichSpec::XATTR_LIST,
+            EnrichSpec::STATX,
+        ] {
+            let opts = QueryOptions {
+                spec,
+                clump: 64,
+                same_device_only: true,
+                xattr_names: vec![xattr_name("user.nope")],
+                ..Default::default()
+            };
+            let mut q = query_directory(&h, me, &anchor, opts).expect("list");
+            let mut names = Vec::new();
+            while let Some(batch) = q.next() {
+                for e in batch
+                    .unwrap_or_else(|e| panic!("{spec:?} listing refused: {e}"))
+                {
+                    names.push(e.name.to_string_lossy().into_owned());
+                }
+            }
+            names.sort();
+            assert_eq!(names, ["a", "d"], "{spec:?}");
+        }
+    });
+}
+
 /// `readdir` honours no `RESOLVE_*` flags, so the listing side needs its own
 /// mount check - otherwise a nested dataset lists as though it were part of
 /// the tree. Uses a real mount boundary; self-skips without one.
