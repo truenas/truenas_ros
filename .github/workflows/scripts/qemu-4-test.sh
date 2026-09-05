@@ -11,8 +11,16 @@ echo "Running cargo tests..."
 # Load VM info
 source /tmp/vm-info.sh
 
-# Run tests in VM as root (ZFS pool creation + privileged syscalls need it)
-ssh debian@$VM_IP 'sudo bash -s' <<'REMOTE_SCRIPT'
+# Run tests in VM as root (ZFS pool creation + privileged syscalls need it).
+#
+# `|| TEST_RESULT=$?` rather than reading `$?` after the heredoc: `set -e` is
+# on, so a failing ssh - which is every red run - terminates this script at
+# the ssh itself. The assignment, both `scp`s and the failure report below
+# never run, so a red run ships no test output and `qemu-6-summary.sh` reports
+# `Status: UNKNOWN`. Copying the log matters most exactly then, which is also
+# why the run above passes `--no-fail-fast`.
+TEST_RESULT=0
+ssh debian@$VM_IP 'sudo bash -s' <<'REMOTE_SCRIPT' || TEST_RESULT=$?
 set -eu
 
 echo "=========================================="
@@ -122,6 +130,17 @@ export TRUENAS_ROS_REQUIRE_ZFS=1
 # fixture must also stick. Force the xattr fixtures to RUN; a refusal means
 # the fixture landed somewhere degraded and must turn CI red.
 export TRUENAS_ROS_REQUIRE_XATTRS=1
+# A POSIX ACL is a different question from an xattr: `system.posix_acl_access`
+# is refused EOPNOTSUPP off a dataset whose acltype is not posixacl
+# (`zpl_xattr_acl_set_access`, module/os/linux/zfs/zpl_xattr.c) by a filesystem
+# that takes user.* xattrs perfectly well, so it gets its own gate rather than
+# riding the one above. The ACL fixtures build their scratch tree under
+# `std::env::temp_dir()`, and nothing here sets TMPDIR: that is this VM's /tmp,
+# which takes POSIX ACLs on either backing Debian gives it (tmpfs with
+# CONFIG_TMPFS_POSIX_ACL, or the root ext4). If that ever stops being true the
+# fixtures belong on the /POSIXACL dataset `setup-test-zfs.sh` already mounts,
+# not on a skip nobody sees.
+export TRUENAS_ROS_REQUIRE_POSIX_ACL=1
 # `setup-test-zfs.sh` mounted /POSIXACL and /NFSV4ACL, so this VM has a REAL
 # mount boundary for the RESOLVE_NO_XDEV tests to cross. That is what this
 # demands: every Linux host has /proc, /sys, /dev and /run as top-level mounts,
@@ -199,8 +218,6 @@ echo "=========================================="
 
 exit $TEST_EXIT_CODE
 REMOTE_SCRIPT
-
-TEST_RESULT=$?
 
 scp debian@$VM_IP:~/test-output.txt /tmp/ || true
 scp debian@$VM_IP:~/test-exitcode.txt /tmp/ || true

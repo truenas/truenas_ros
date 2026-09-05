@@ -106,17 +106,21 @@ env:
   # orderings and the retracted-timer verdict; 95 the single-flight
   # invalidate-during-mint control, which is plain map state behind
   # no guard and so the first bump since 87 to move the executing
-  # count as well as the matched one.) If that friction is unwanted,
+  # count as well as the matched one; 96 the run-queue count's
+  # nested-pass regression, ring-gated and so counted rather than
+  # claimed.) If that friction is unwanted,
   # `-lt` pinned at the TRUE count still catches deletion, which is
   # the failure mode; what it must not be again is a floor far below
   # what runs.
-  MIRI_TESTS: "95"
+  MIRI_TESTS: "96"
 
   # The `http` band, run as its own step under its own feature set.
   # Exact for the same reason, and bumped by the same rule: 32 at the
   # step's measurement, 33 with the streaming-protocol connection
-  # bound added beside the codec.
-  MIRI_HTTP_TESTS: "33"
+  # bound added beside the codec, 35 with the two stage-contract tests
+  # (a streaming connection's `Whole` deliveries, and an `End` park
+  # redriven as itself) - both pure dispatch, so both execute here.
+  MIRI_HTTP_TESTS: "35"
 
 jobs:
   miri:

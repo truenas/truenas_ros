@@ -59,6 +59,17 @@ jobs:
     - name: clippy
       run: cargo clippy --all-features --all-targets -- -D warnings
 
+    # Again in release, because the step above cannot see release-only code:
+    # `cargo clippy` builds with `debug_assertions` on, so every
+    # `cfg(not(debug_assertions))` arm - the graceful-`if` half of each
+    # `debug_assert` guard, which is why the release test lane below exists -
+    # is never compiled by it and so never linted. `cargo test --release`
+    # compiles those arms but denies no warnings, so nothing gates them.
+    # Measured: a `deref_addrof` planted in one leaves every `-D warnings`
+    # step above at 0 errors and turns this one red.
+    - name: clippy (release)
+      run: cargo clippy --release --all-features --all-targets -- -D warnings
+
     # The net (io_uring) tests skip themselves when a ring can't be created. We
     # do NOT want that to pass silently as green, so force them to run below —
     # but first fail fast and legibly if this runner has io_uring restricted,
@@ -151,7 +162,7 @@ jobs:
     # `23 -lt 23` is false. Bump MODELS when you add one; that is the point.
     - name: loom (concurrency models)
       env:
-        MODELS: "24"
+        MODELS: "25"
       run: |
         .github/workflows/scripts/counted-cargo-test.sh "$MODELS" "loom" -- \
           env RUSTFLAGS="--cfg loom" \
@@ -253,6 +264,27 @@ jobs:
         cargo clippy --all-features -- -D warnings
         # A real build (clippy stops at check) of the shape everything ships.
         cargo build --all-features
+
+    # The MSRV is a promise `Cargo.toml` makes to consumers and nothing
+    # here checked it: every other step runs on `stable`, `miri.yml` on
+    # nightly, and there is no `rust-toolchain` file - so an API stabilised
+    # after the declared version compiles green here and breaks only in a
+    # downstream consumer pinned to what this crate says it supports.
+    #
+    # The version is read from `Cargo.toml` rather than repeated, so a bump
+    # there moves this lane with it and cannot leave the two disagreeing.
+    # An absent declaration is an error, not a skip: a step that quietly
+    # checks nothing is the failure the loom and Miri counts exist to stop.
+    - name: MSRV (the toolchain Cargo.toml declares)
+      run: |
+        msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+        if [ -z "$msrv" ]; then
+          echo "::error::Cargo.toml declares no rust-version to check"
+          exit 1
+        fi
+        echo "MSRV declared as $msrv"
+        rustup toolchain install "$msrv" --profile minimal
+        cargo "+$msrv" check --all-features --all-targets
 
     # `--no-deps` keeps RUSTDOCFLAGS off the dependencies, so `-D warnings`
     # here is this crate's own doc build: a link to an item the reader cannot
