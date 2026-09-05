@@ -41,8 +41,41 @@ tn_bitflags! {
     /// `AV_QUARANTINED`, `AV_MODIFIED`) are ZFS-internal and deliberately
     /// absent.
     pub struct ZfsAttr: u64 {
-        /// File may not be written to. Presented to SMB clients as the
-        /// READONLY DOS attribute; toggling does not affect existing opens.
+        /// File may not be written to - **on an `acltype=nfsv4` dataset,
+        /// for a caller whose permission check reaches ZFS**. Presented
+        /// to SMB clients as the READONLY DOS attribute, and deliberately
+        /// fchmod-shaped: toggling does not affect existing opens or
+        /// mappings (`zfs_write` exempts it by name, pointing at the
+        /// fchmod(0444) analogy in `zfs_zaccess_common`, `zfs_acl.c`).
+        ///
+        /// Unlike `IMMUTABLE` above, no VFS `i_flags` bit exists for
+        /// this, so the deny lives in the access check alone - and
+        /// `zpl_permission` (`zpl_xattr.c`) forwards a plain
+        /// read/write/exec check to ZFS only when the dataset is
+        /// `acltype=nfsv4` *and* the file's ACL is non-trivial. Anywhere
+        /// else - posixacl, `acltype=off`, or a mode-shaped ACL - the
+        /// check falls back to `generic_permission`, which reads the
+        /// mode and nothing else: **the flag sets successfully and
+        /// blocks no write.** The platform contract is therefore nfsv4
+        /// with non-trivial ACLs on the files; inherited ACEs satisfy
+        /// it, and every create flavor takes its ACL from the directory
+        /// it is born in (one shared `zfs_acl_ids_create(dzp, ..)`).
+        /// `acltype` *defaults* to nfsv4 on this platform
+        /// (`zfs_prop.c`), so the failure mode is a dataset someone
+        /// switched, not one never configured - and a
+        /// `system.nfs4_acl_xdr` getxattr probes it, answering
+        /// `EOPNOTSUPP` anywhere the deny would not hold.
+        ///
+        /// A latch, not a lock: a privileged caller passes (the
+        /// `secpolicy_vnode_access2` fallback in `zfs_zaccess`), the
+        /// owner can clear it through this ioctl, and an SMB client
+        /// with write access can clear the DOS attribute - while NFS
+        /// has no surface to clear it at all. The one unconditional
+        /// refusal is a new shared-writable mmap (`zfs_map`,
+        /// `zfs_vnops_os.c`), denied on every dataset flavor with no
+        /// privilege fallback. Invisible to `statx` and `lsattr`, so a
+        /// refused write presents as a bare `EPERM` on a file whose
+        /// mode looks writable.
         READONLY = 0x0000_0001_0000_0000;
         /// HIDDEN DOS attribute - hides the file from SMB clients.
         HIDDEN = 0x0000_0002_0000_0000;
