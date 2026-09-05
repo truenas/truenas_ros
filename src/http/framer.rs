@@ -33,7 +33,7 @@ use crate::net::Framing;
 #[cfg(doc)]
 use crate::net::server::{Response, ServerConfig};
 
-use super::chunked::{self, ChunkScan};
+use super::chunked::{self, CHUNK_LINE_MAX, ChunkScan, TRAILER_LINE_MAX};
 use super::head::{BodyKind, frame_facts, method_is_head};
 
 /// Fixed wire-overhead allowance for chunk framing on top of
@@ -89,12 +89,14 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     /// 16 KiB heads; bodies fill the rest of the reactor's default 1 MiB
     /// message cap ([`ServerConfig::max_request_bytes`]) after the head and
-    /// chunk-framing allowances (16 KiB each), so the default codec on the
-    /// default server has no dead band between the limits.
+    /// chunk-framing allowances (16 KiB each) and the scanner's in-flight
+    /// line, so the default codec on the default server has no dead band
+    /// between the limits ([`HttpConfig::min_request_bytes`] is where the
+    /// terms come from).
     fn default() -> Self {
         Self {
             max_head: 16 * 1024,
-            max_body: 1024 * 1024 - 2 * 16 * 1024,
+            max_body: 1024 * 1024 - 2 * 16 * 1024 - (TRAILER_LINE_MAX + 1),
         }
     }
 }
@@ -125,16 +127,41 @@ impl HttpConfig {
     }
 
     /// The smallest [`ServerConfig::max_request_bytes`] under which every
-    /// message this codec admits reaches the framer intact:
-    /// `max_head + max_body + CHUNK_WIRE_OVERHEAD` (the last term because a
-    /// chunked body's wire form may legitimately exceed its decoded size).
-    /// A reactor cap below this leaves a dead band - requests the codec
-    /// would accept (or answer 413/431) that the reactor instead kills with
-    /// a raw close and no HTTP response.
+    /// message this codec admits reaches the framer intact. A reactor cap
+    /// below this leaves a dead band - requests the codec would accept (or
+    /// answer 413/431) that the reactor instead kills with a raw close and
+    /// no HTTP response.
+    ///
+    /// Three terms and a floor, because the reactor measures the **buffer**
+    /// while these caps measure something narrower:
+    ///
+    /// * `max_head + max_body + CHUNK_WIRE_OVERHEAD` - a buffered message's
+    ///   wire extent, the third term because a chunked body's wire form may
+    ///   legitimately exceed its decoded size.
+    /// * the chunk scanner's in-flight line. `ChunkScan` advances only
+    ///   over whole CRLF-delimited lines and both chunk caps are measured
+    ///   on the *scanned* extent, so a peer that pauses mid-line leaves up
+    ///   to `TRAILER_LINE_MAX + 1` bytes buffered and uncounted - one short
+    ///   of the length at which `find_crlf` gives up. A trailer line is the
+    ///   longer of the two lines the scanner reads.
+    /// * a floor of one head and one streamed window with its chunk
+    ///   framing, since `max_body` bounds only the bodies a delivery
+    ///   buffers and a streaming endpoint may set it far below a window.
+    ///   The pump's gate runs before the head is delivered, so both can sit
+    ///   in the buffer at once, and the window's own `Framing::Complete` is
+    ///   checked against this cap as well.
     pub fn min_request_bytes(&self) -> usize {
         self.max_head
             .saturating_add(self.max_body)
             .saturating_add(CHUNK_WIRE_OVERHEAD)
+            .saturating_add(TRAILER_LINE_MAX + 1)
+            .max(
+                self.max_head
+                    .saturating_add(STREAM_WINDOW)
+                    // The CRLF closing the previous payload, then the size
+                    // line and its own CRLF - `chunked::step`'s `framing`.
+                    .saturating_add(CHUNK_LINE_MAX + 4),
+            )
     }
 }
 
@@ -304,14 +331,14 @@ pub(crate) enum StreamedBody {
     Known(u64),
 }
 
-/// A park taken mid-body: the phase to restore, and which stage the
-/// retained delivery belongs to so a redrive re-presents it as itself.
+/// A park taken mid-body: the phase to restore once the park resolves.
+/// Which stage the retained delivery belongs to lives on the park itself
+/// (`ParkedRequest::stage`), because an `End` park has no resume phase to
+/// read it off.
 #[derive(Debug)]
 pub(crate) struct StreamPark {
     /// The phase the connection returns to once the park resolves.
     pub(crate) next: Phase,
-    /// The stage the retained delivery was made at.
-    pub(crate) stage: super::protocol::Stage,
     /// A withheld `100 Continue` the resume owes before any body byte can
     /// arrive. Only an `Open` park can carry one: the client is holding
     /// its body back for exactly this line, so a resume that answers with
@@ -874,6 +901,113 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+    }
+
+    /// While the framer is still asking for bytes, everything buffered is
+    /// inside the bound it publishes.
+    ///
+    /// The reactor closes `TooLarge` on the **buffer**; the chunk caps are
+    /// measured on the **scanned** extent, and the scanner advances only
+    /// over whole CRLF-delimited lines. A peer that pauses mid-trailer-line
+    /// therefore parks a line's worth of bytes the caps never see.
+    ///
+    /// The fixture asserts its own reach first: without exceeding
+    /// `max_head + max_body + CHUNK_WIRE_OVERHEAD` it would hold against
+    /// the three-term bound and prove nothing.
+    #[test]
+    fn a_paused_trailer_line_is_inside_the_published_bound() {
+        let cfg = HttpConfig {
+            max_head: 16 * 1024,
+            max_body: 128 * 1024,
+        };
+        // A head padded to exactly `max_head`.
+        let mut head = b"PUT /u HTTP/1.1\r\nHost: h\r\n\
+                         Transfer-Encoding: chunked\r\nX-Pad: "
+            .to_vec();
+        let tail = b"\r\n\r\n";
+        head.resize(cfg.max_head - tail.len(), b'a');
+        head.extend_from_slice(tail);
+        assert_eq!(head.len(), cfg.max_head);
+
+        // 48-byte payloads, six bytes of framing each: the wire extent
+        // lands just under `max_body + CHUNK_WIRE_OVERHEAD` with the
+        // decoded size just under `max_body`.
+        let mut wire = head.clone();
+        for _ in 0..2730 {
+            wire.extend_from_slice(b"30\r\n");
+            wire.extend_from_slice(&[b'x'; 48]);
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n");
+        // The most a trailer line can hold unscanned: one byte short of the
+        // length at which `find_crlf` answers `TooLong`.
+        wire.extend_from_slice(&vec![b'v'; TRAILER_LINE_MAX + 1]);
+
+        let mut c = conn();
+        assert_eq!(
+            frame(&wire, &mut c, &cfg),
+            Framing::MoreInMessage,
+            "the codec is still asking for bytes at {} buffered",
+            wire.len()
+        );
+        assert!(
+            wire.len() > cfg.max_head + cfg.max_body + CHUNK_WIRE_OVERHEAD,
+            "fixture at {} does not reach past the three-term bound, so it \
+             cannot show the in-flight line is budgeted",
+            wire.len()
+        );
+        assert!(
+            wire.len() <= cfg.min_request_bytes(),
+            "buffered {} past the published minimum {}: the reactor closes \
+             TooLarge here, with no HTTP response",
+            wire.len(),
+            cfg.min_request_bytes()
+        );
+    }
+
+    /// A streamed window is a message this codec declares and `max_body`
+    /// does not bound, so the published minimum admits one whatever
+    /// `max_body` is set to.
+    #[test]
+    fn the_published_bound_admits_one_streamed_window() {
+        let cfg = HttpConfig {
+            max_head: 1024,
+            max_body: 4 * 1024,
+        };
+        let head = b"PUT /u HTTP/1.1\r\nHost: h\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n";
+        let mut c = HttpConn::new_streaming((), 1 << 30);
+        assert!(matches!(
+            frame(head, &mut c, &cfg),
+            Framing::Complete { .. }
+        ));
+        // The glue accepts the open and advances, as the protocol does.
+        c.phase = Phase::StreamBody {
+            head: head.to_vec(),
+            chunk_left: 0,
+            after_payload: false,
+            decoded: 0,
+        };
+
+        let mut wire = format!("{:x}\r\n", STREAM_WINDOW).into_bytes();
+        wire.extend_from_slice(&vec![b'x'; STREAM_WINDOW]);
+        wire.extend_from_slice(b"\r\n");
+        let Framing::Complete {
+            header_len,
+            body_len,
+        } = frame(&wire, &mut c, &cfg)
+        else {
+            panic!("a streamed window frames as one message");
+        };
+        assert_eq!(body_len, STREAM_WINDOW);
+        assert!(
+            header_len + body_len <= cfg.min_request_bytes(),
+            "a window this codec declares ({} + {}) is past the minimum it \
+             publishes ({}): `frame_step` closes TooLarge on it",
+            header_len,
+            body_len,
+            cfg.min_request_bytes()
         );
     }
 

@@ -247,7 +247,12 @@ mod xattr {
             )
         };
         if rc != 0 {
-            // tmpfs and some configs reject `user.` xattrs; not applicable.
+            // Every assertion below is about to be skipped, so a scratch
+            // filesystem that drops `user.*` answers to the gate.
+            super::xattr_probe::refusal_is_allowed(
+                "fsetxattr(a non-UTF-8 user name)",
+                std::io::Error::last_os_error(),
+            );
             return;
         }
         let names = flistxattr(file.as_fd()).unwrap();
@@ -1265,6 +1270,61 @@ mod shutil {
     /// copies its own output back into itself, which terminates only at the
     /// walk's depth limit or when the filesystem fills - after writing an
     /// exponentially duplicated tree. `copytree` advertises the skip; this
+    /// A destination root the copy did not create gets its mode back.
+    ///
+    /// The root is held at 0o700 for the duration so group and other never
+    /// see a half-written tree, and the real mode is meant to be applied at
+    /// the end - but the only thing that applies one is
+    /// `copy_permissions`, under `CopyFlags::PERMISSIONS`. Without that
+    /// flag a copy that succeeds leaves a borrowed destination owner-only,
+    /// which on a share or system-dataset migration locks every other
+    /// identity out and reports success.
+    #[test]
+    fn a_borrowed_destination_root_keeps_its_mode() {
+        use truenas_ros::sync_fs::shutil::CopyFlags;
+        let tmp = truenas_ros::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("f"), b"x").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        for (what, flags, want) in [
+            // Nothing re-stamps the mode, so the restore is the only thing
+            // standing between the caller and a 0o700 destination.
+            (
+                "no PERMISSIONS",
+                CopyFlags::OWNER | CopyFlags::TIMESTAMPS,
+                0o775,
+            ),
+            // The control: with the flag, the source root's mode lands, as
+            // that flag says it should.
+            ("all flags", CopyFlags::all(), 0o755),
+        ] {
+            let dst = tmp.path().join(format!("dst-{}", want));
+            std::fs::create_dir(&dst).unwrap();
+            std::fs::set_permissions(
+                &dst,
+                std::fs::Permissions::from_mode(0o775),
+            )
+            .unwrap();
+
+            let config = CopyTreeConfig {
+                flags,
+                ..Default::default()
+            };
+            copytree(&src, &dst, &config)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let mode = std::fs::metadata(&dst).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o7777,
+                want,
+                "{what}: destination left {:o}",
+                mode & 0o7777
+            );
+        }
+    }
+
     /// is what holds it.
     #[test]
     fn a_destination_inside_the_source_is_not_copied_into_itself() {
@@ -1691,7 +1751,13 @@ mod shutil {
         let start = PosixAcl::from_aces(start);
         let sb = start.access_bytes().unwrap();
         let sd = start.default_bytes().unwrap();
-        if fsetacl_posix(f.as_fd(), &sb, sd.as_deref()).is_err() {
+        if let Err(e) = fsetacl_posix(f.as_fd(), &sb, sd.as_deref()) {
+            // Every assertion below is skipped, so the refusal answers to
+            // the gate rather than passing green having tested nothing.
+            super::xattr_probe::posix_acl_refusal_is_allowed(
+                "fsetacl_posix",
+                e,
+            );
             return; // no POSIX ACLs here (an NFSv4-ACL dataset, say)
         }
         let before_acc = get(&f, acc);
@@ -1775,8 +1841,13 @@ mod shutil {
         )
         .unwrap();
         let f = std::fs::File::open(src.join("helper")).unwrap();
-        if fsetacl_posix(f.as_fd(), &acl.access_bytes().unwrap(), None).is_err()
+        if let Err(e) =
+            fsetacl_posix(f.as_fd(), &acl.access_bytes().unwrap(), None)
         {
+            super::xattr_probe::posix_acl_refusal_is_allowed(
+                "fsetacl_posix",
+                e,
+            );
             return; // no POSIX ACLs here (an NFSv4-ACL dataset, say)
         }
         let src_acl = fgetxattr(f.as_fd(), "system.posix_acl_access").unwrap();
@@ -1856,7 +1927,11 @@ mod shutil {
 
         for dir in [src.clone(), src.join("nested")] {
             let d = std::fs::File::open(&dir).unwrap();
-            if fsetacl_posix(d.as_fd(), &access, Some(&default)).is_err() {
+            if let Err(e) = fsetacl_posix(d.as_fd(), &access, Some(&default)) {
+                super::xattr_probe::posix_acl_refusal_is_allowed(
+                    "fsetacl_posix",
+                    e,
+                );
                 return; // no POSIX ACLs here (an NFSv4-ACL dataset, say)
             }
         }
@@ -1921,8 +1996,13 @@ mod shutil {
         )
         .unwrap();
         let d = std::fs::File::open(src.join("shared")).unwrap();
-        if fsetacl_posix(d.as_fd(), &acl.access_bytes().unwrap(), None).is_err()
+        if let Err(e) =
+            fsetacl_posix(d.as_fd(), &acl.access_bytes().unwrap(), None)
         {
+            super::xattr_probe::posix_acl_refusal_is_allowed(
+                "fsetacl_posix",
+                e,
+            );
             return; // no POSIX ACLs here (an NFSv4-ACL dataset, say)
         }
         let src_acl = fgetxattr(d.as_fd(), "system.posix_acl_access").unwrap();

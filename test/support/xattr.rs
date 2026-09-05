@@ -28,6 +28,24 @@ pub fn refusal_is_allowed(what: &str, err: impl std::fmt::Display) {
     );
 }
 
+/// The same, for a **POSIX ACL** refusal, which is a different question
+/// from the one above: a POSIX ACL is the `system.posix_acl_access` xattr,
+/// and a dataset whose `acltype` is not `posixacl` refuses it `EOPNOTSUPP`
+/// (`zpl_xattr_acl_set_access`, `module/os/linux/zfs/zpl_xattr.c`) while
+/// taking `user.*` xattrs perfectly well. Gating one on the other would
+/// redden a lane for a filesystem doing exactly what it says.
+///
+/// `TRUENAS_ROS_REQUIRE_POSIX_ACL` is therefore its own gate. Arming it
+/// takes knowing where the fixture lands - the QEMU lane's `/POSIXACL`
+/// dataset is the one place in CI that is guaranteed to answer.
+#[allow(dead_code)]
+pub fn posix_acl_refusal_is_allowed(what: &str, err: impl std::fmt::Display) {
+    assert!(
+        std::env::var_os("TRUENAS_ROS_REQUIRE_POSIX_ACL").is_none(),
+        "TRUENAS_ROS_REQUIRE_POSIX_ACL is set but {what} failed: {err}"
+    );
+}
+
 /// Set an xattr with `libc::setxattr`, returning whether it stuck. The
 /// fixtures probe `user.*` names, and the privileged-policy fixture a
 /// root-set `trusted.*` one. `false` means the caller skips its xattr

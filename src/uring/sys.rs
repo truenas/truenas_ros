@@ -197,6 +197,20 @@ pub(crate) const IORING_OP_TIMEOUT: u8 = 11;
 pub(crate) const IORING_OP_ACCEPT: u8 = 13;
 pub(crate) const IORING_OP_ASYNC_CANCEL: u8 = 14;
 pub(crate) const IORING_OP_LINK_TIMEOUT: u8 = 15;
+
+/// Fill the trailing `IORING_OP_LINK_TIMEOUT` that bounds the `IOSQE_IO_LINK`
+/// head staged in front of it. `ts` addresses exactly one [`KernelTimespec`],
+/// which is what `len` declares and the only count the kernel accepts
+/// (`io_link_timeout_prep`).
+///
+/// Every linked op in this crate pairs with this one SQE, so the shape lives
+/// here rather than being spelled out at each staging site.
+pub(crate) fn fill_link_timeout(sqe: &mut IoUringSqe, ts: u64) {
+    sqe.opcode = IORING_OP_LINK_TIMEOUT;
+    sqe.fd = -1;
+    sqe.addr = ts;
+    sqe.len = 1;
+}
 /// Connect an outbound stream socket (client). `sqe.fd` is the (fixed) socket,
 /// `sqe.addr`@16 the target sockaddr, `sqe.addr2`@8 (`off_addr2`) its length;
 /// `len`/`op_flags`/`buf_index`/`file_index` must be 0 (`io_connect_prep` rejects

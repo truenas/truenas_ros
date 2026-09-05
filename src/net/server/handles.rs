@@ -538,8 +538,18 @@ pub struct ServerStats {
     pub accepted: u64,
     /// Connections rejected by the accept handler (`None`).
     pub rejected: u64,
-    /// Connections shed: pool full, out of range, arriving during shutdown, or
-    /// a failed credential fetch.
+    /// Connections shed: pool full, out of range, arriving during shutdown,
+    /// a failed credential fetch, or - on a kTLS listener - the process
+    /// being out of file descriptors.
+    ///
+    /// That last one is worth stating because nothing else reports it. A
+    /// parked kTLS handshake holds two *process* descriptors (the furnished
+    /// fd, plus the deferral's own dup of it) where a plain-TCP pool
+    /// descriptor holds none, so `RLIMIT_NOFILE` bounds how many handshakes
+    /// can be in flight at once independently of `pool_size` - and both the
+    /// install (`FIXED_FD_INSTALL` charges the fd table:
+    /// `io_install_fixed_fd` -> `receive_fd` -> `get_unused_fd_flags`) and
+    /// the dup answer `EMFILE` by shedding, with the errno going nowhere.
     pub shed: u64,
     /// Transient accept errors (resource pressure) that triggered a backoff
     /// re-arm instead of terminating the server.

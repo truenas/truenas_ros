@@ -3241,8 +3241,21 @@ fn tcp_reuse_port_and_options() {
     };
 
     // Second bind to the SAME port must succeed with reuse_port...
-    let second = Server::with_config([ServerAddr::Tcp(v4)], cfg, proto());
-    assert!(second.is_ok(), "reuse_port second bind: {second:?}");
+    //
+    // `with_config` is a ring setup as well as a bind, and a second ring
+    // needs physically contiguous high-order pages: on the platform this
+    // crate targets, where ARC holds most of RAM, that is exactly the
+    // allocation that fails `ENOMEM`. That is the environmental skip
+    // `should_skip` already answers for the first server above - and
+    // `TRUENAS_ROS_REQUIRE_IO_URING`, which both CI lanes arm, turns it
+    // red where it must not happen. The message names the call, because
+    // `bind(2)` is not what refused.
+    let second = match Server::with_config([ServerAddr::Tcp(v4)], cfg, proto())
+    {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("reuse_port second Server::with_config: {e}"),
+    };
     // ...and is dropped before any client connects, so the kernel cannot have
     // routed our test connection into its (never-served) backlog.
     drop(second);
@@ -5770,7 +5783,19 @@ fn tcp_multicore_two_rings() {
     let w1 = thread::spawn(move || {
         worker(addr, tx);
     });
-    let (_, stop1) = rx.recv().expect("worker 1").expect("second bind");
+    // As above: the second `with_config` sets up a second ring, and a box
+    // whose free memory is fragmented refuses that with `ENOMEM` long
+    // before it refuses a bind.
+    let (_, stop1) = match rx.recv().expect("worker 1") {
+        Ok(v) => v,
+        Err(e) if should_skip(&e) => {
+            stop0.shutdown();
+            w0.join().unwrap();
+            w1.join().unwrap();
+            return;
+        }
+        Err(e) => panic!("second Server::with_config: {e}"),
+    };
 
     // Fresh connection per round-trip so accepts spread across both rings.
     for i in 0..16 {
@@ -12190,12 +12215,22 @@ fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
                  armed, since no other clock on this path is a total bound"
             );
         } else {
-            assert_eq!(
-                got.as_slice(),
-                &[CloseReason::PeerClosed],
+            // The healthy connection ends twice over: the client's FIN goes
+            // out when its closure returns, and its `shutdown` request
+            // follows immediately. Which the loop reaches first is a race
+            // with no bearing on the budget - and the teardown winning
+            // before the hook runs leaves nothing recorded at all - so this
+            // names the benign endings rather than one of them. What may
+            // not appear is the budget: this connection finished on time.
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [] | [CloseReason::PeerClosed]
+                        | [CloseReason::ShuttingDown]
+                ),
                 "{what}: the budget must be retired when the body completes \
                  - ReceiptTimeout here is a healthy connection reaped for \
-                 having finished on time"
+                 having finished on time (reasons: {got:?})"
             );
         }
     }

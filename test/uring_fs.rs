@@ -1686,6 +1686,35 @@ fn mount_crossings() -> Vec<String> {
     found
 }
 
+/// A crossing this identity can **search**, which is more than
+/// [`mount_crossings`] promises: it filters on device and nothing else, and
+/// the relocation half below opens the chosen mount as its own anchor. A
+/// top-level dataset can be root-only - TrueNAS ships `/audit`, `/conf` and
+/// `/root` at 0700, and they sort first - so an unprivileged run picked one
+/// and died `EACCES` on a fixture question rather than on the confinement
+/// under test.
+///
+/// `metadata("/<name>/.")` is exactly that question: resolving `.` inside
+/// the directory needs the search bit the test is about to need.
+fn traversable_crossing() -> Option<String> {
+    let all = mount_crossings();
+    let pick = all
+        .iter()
+        .find(|n| std::fs::metadata(format!("/{n}/.")).is_ok())
+        .cloned();
+    assert!(
+        pick.is_some()
+            || all.is_empty()
+            || std::env::var_os("TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY").is_none(),
+        "TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY is set but none of {all:?} is \
+         searchable by uid {}: the confinement test needs a crossing it can \
+         open as its own anchor, not merely one that exists",
+        // SAFETY: `getuid` takes no arguments and cannot fail.
+        unsafe { libc::getuid() }
+    );
+    pick
+}
+
 /// `RESOLVE_NO_XDEV` is what makes "this tree is one filesystem" a rule the
 /// kernel enforces rather than a convention: a walk that would step onto
 /// another mount fails instead of quietly serving files from it. Uses a real
@@ -1695,7 +1724,7 @@ fn mount_crossings() -> Vec<String> {
 fn confined_open_refuses_to_cross_a_mount_point() {
     with_fs(test_cfg(), |h, me, _dir, _stop| {
         let root = Anchor::open("/").expect("anchor /");
-        let Some(name) = mount_crossings().into_iter().next() else {
+        let Some(name) = traversable_crossing() else {
             return; // single-filesystem host: nothing to cross
         };
 

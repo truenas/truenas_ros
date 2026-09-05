@@ -362,7 +362,13 @@ mod loom_tests {
     /// fill. Checked from the far side: once both callers are done, a third
     /// lookup is a hit.
     ///
-    /// Negative control: delete the re-install in `get_or_try_init`.
+    /// Negative control: delete the slot-identity re-check under the gate,
+    /// which reddens this and `loom_a_failed_mint_cannot_double_mint`. (Not
+    /// the re-install after a successful mint - `get_or_try_init`
+    /// deliberately does not write the slot back, and the reasoning is at
+    /// the publish. The guard on the *eviction* is watched by
+    /// `loom_a_failed_mint_evicts_only_its_own_slot`, which is the only
+    /// model that changes a slot's identity under a mint.)
     #[test]
     fn loom_a_failed_mint_does_not_orphan_a_successful_one() {
         bounded_model(|| {
@@ -404,6 +410,47 @@ mod loom_tests {
     /// minted at most once, and one live value remains.
     ///
     /// Negative control: delete the slot-identity re-check under the gate.
+    /// A failing mint evicts **its own** slot and no other.
+    ///
+    /// The map lock is released across `mint`, so an `invalidate` landing
+    /// in that window has already replaced the slot the failure is about to
+    /// drop - and dropping the replacement discards a value that was
+    /// minted successfully, with nothing to retry it. Snapshots never
+    /// expire on their own, so a directory-services change firing
+    /// `invalidate` while an acquire is in flight is the reachable shape.
+    ///
+    /// Negative control: drop the `Arc::ptr_eq` from the eviction. The
+    /// other three models stay green through that, which is why this one
+    /// exists - it is the only one that moves a slot's identity while a
+    /// mint is running.
+    #[test]
+    fn loom_a_failed_mint_evicts_only_its_own_slot() {
+        bounded_model(|| {
+            let s: Arc<SingleFlight<u32, u32>> = Arc::new(SingleFlight::new());
+
+            let s1 = s.clone();
+            let t1 = thread::spawn(move || {
+                let _ = s1.get_or_try_init(&1, || Err(Errno::EIO.into()));
+            });
+
+            // Replace the slot the failing mint is holding, then fill the
+            // replacement.
+            s.invalidate(&1);
+            let got = s.get_or_try_init(&1, || Ok(42)).unwrap();
+            assert_eq!(got, 42);
+
+            t1.join().unwrap();
+
+            // From the far side: the value is still cached, so the eviction
+            // took the failed mint's slot rather than this one.
+            let again = s.get_or_try_init(&1, || Ok(99)).unwrap();
+            assert_eq!(
+                again, 42,
+                "a failed mint evicted a slot that was not its own"
+            );
+        });
+    }
+
     #[test]
     fn loom_a_failed_mint_cannot_double_mint() {
         bounded_model(|| {

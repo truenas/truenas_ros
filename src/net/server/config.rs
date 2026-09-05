@@ -14,11 +14,11 @@ use std::time::Duration;
 /// The largest usable pool slot (the `user_data` codec reserves 24 bits).
 const MAX_POOL: u32 = 0x00ff_ffff;
 
-/// Ceiling on the fs offload pool's own thread count. Not a kernel limit - a
-/// sanity bound, since every one of these is a real OS thread spawned by one
-/// reactor for work that has no io_uring opcode.
+/// Ceiling on the fs offload pool's own thread count - the pool's own
+/// constant, shared with the standalone host, which screens the same bound
+/// in `UringFs::check`.
 #[cfg(feature = "uring-fs")]
-const MAX_OFFLOAD_THREADS: usize = 1024;
+use crate::uring_fs::offload_pool::MAX_OFFLOAD_THREADS;
 /// Bounds for `fs_body_chunk`: below 4 KiB a multi-GB body is all per-op
 /// overhead; above 16 MiB two buffers per streaming connection stop being
 /// "bounded" in any useful sense (and a read result must fit an i32).

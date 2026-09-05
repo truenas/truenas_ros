@@ -244,12 +244,7 @@ where
                     sqe.flags |= IOSQE_IO_LINK;
                 },
                 pack(Op::LinkTimeout, slot, generation),
-                move |sqe| {
-                    sqe.opcode = IORING_OP_LINK_TIMEOUT;
-                    sqe.fd = -1;
-                    sqe.addr = ts_ptr;
-                    sqe.len = 1; // exactly one timespec, per the kernel
-                },
+                move |sqe| fill_link_timeout(sqe, ts_ptr),
             )
         } else {
             self.core.stage(connect_ud, fill)

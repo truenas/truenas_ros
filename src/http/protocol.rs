@@ -93,7 +93,8 @@ pub struct HttpRequest<'a> {
     pub peer: &'a ClientAddr,
     /// Where this delivery sits in the body. [`Stage::Whole`] for every
     /// non-streaming builder; a streaming connection walks
-    /// `Open` -> `Window`* -> `End`.
+    /// `Open` -> `Window`* -> `End` for a body it streams and still
+    /// delivers `Whole` for the rest (see [`Stage`]).
     pub stage: Stage,
     /// The reply ticket, consumed by [`HttpRequest::defer`].
     responder: Responder,
@@ -112,12 +113,14 @@ impl<'a> HttpRequest<'a> {
             raw_head,
             trailers,
             responder,
+            stage,
             ..
         } = self;
         let (deferred, permit) = responder.defer();
         let answer = Arc::new(Mutex::new(None));
         let req = Box::new(ParkedRequest {
             head: raw_head.to_vec(),
+            stage,
             body: body.take(),
             trailers: trailers
                 .iter()
@@ -158,12 +161,14 @@ impl<'a> HttpRequest<'a> {
             raw_head,
             responder,
             body,
+            stage,
             ..
         } = self;
         let (deferred, permit) = responder.defer();
         let answer = Arc::new(Mutex::new(None));
         let req = Box::new(ParkedRequest {
             head: raw_head.to_vec(),
+            stage,
             body: Vec::new(),
             trailers: Vec::new(),
             answer: Arc::clone(&answer),
@@ -200,6 +205,11 @@ pub(crate) struct ParkedRequest {
     /// The head block verbatim (`raw_head`), re-parsed at completion so no
     /// negotiated fact is copied aside where it could drift.
     head: Vec<u8>,
+    /// The stage this delivery was made at, so a redrive re-presents it as
+    /// itself. The resume phase cannot answer for it: an `End` park carries
+    /// no resume state at all (`settle(conn, d, None)` on both End arms),
+    /// which is indistinguishable there from a park taken at `Whole`.
+    stage: Stage,
     /// The body, taken owned at [`HttpRequest::defer`] (zero-copy when the
     /// reactor placed it).
     body: Vec<u8>,
@@ -234,10 +244,18 @@ impl std::fmt::Debug for ParkedRequest {
 /// Where a delivery sits in a body.
 ///
 /// Every non-streaming builder delivers [`Stage::Whole`] and nothing else --
-/// the whole body, once, as those builders document. A streaming connection
-/// never delivers `Whole`: it opens with [`Stage::Open`] before a body byte
-/// exists, hands each chunk over as [`Stage::Window`], and closes with
-/// [`Stage::End`] once the terminal chunk and its trailers have landed.
+/// the whole body, once, as those builders document.
+///
+/// A streaming connection opens with [`Stage::Open`] before a body byte
+/// exists, hands each window over as [`Stage::Window`], and closes with
+/// [`Stage::End`] - **for the bodies it streams**. It delivers `Whole` for
+/// everything else it carries: a bodyless request, and a `Content-Length`
+/// body at or under one window, both of which take the buffered path
+/// because a whole delivery there is already one pooled read. So a
+/// streaming handler has to answer a `Whole` delivery the way a
+/// non-streaming one would; [`HttpVerdict::Continue`] is refused at `Whole`
+/// and at `End` alike, and refusing it closes the connection with no HTTP
+/// response.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Stage {
     /// The whole body arrived at once.
@@ -850,18 +868,6 @@ where
             if responder.draining() {
                 return farewell(503, method_is_head(&head), dates);
             }
-            let next = match body {
-                super::framer::StreamedBody::Chunked => Phase::StreamBody {
-                    head: head.clone(),
-                    chunk_left: 0,
-                    after_payload: false,
-                    decoded: 0,
-                },
-                super::framer::StreamedBody::Known(len) => Phase::StreamKnown {
-                    head: head.clone(),
-                    remaining: len,
-                },
-            };
             let d = dispatch(
                 &head,
                 Body::inline(&[]),
@@ -874,6 +880,21 @@ where
                 handler,
                 Stage::Open,
             );
+            // Built after the dispatch, which only borrows the head, so the
+            // head moves into the phase it opens instead of being copied
+            // alongside a borrow that is already finished with it.
+            let next = match body {
+                super::framer::StreamedBody::Chunked => Phase::StreamBody {
+                    head,
+                    chunk_left: 0,
+                    after_payload: false,
+                    decoded: 0,
+                },
+                super::framer::StreamedBody::Known(len) => Phase::StreamKnown {
+                    head,
+                    remaining: len,
+                },
+            };
             match d {
                 Dispatched::Continue => {
                     conn.phase = next;
@@ -895,7 +916,6 @@ where
                     d,
                     Some(super::framer::StreamPark {
                         next,
-                        stage: Stage::Open,
                         // The interim was withheld pending this very
                         // decision; the resume owes it, or the client
                         // never sends the body it is parked deciding on.
@@ -932,16 +952,6 @@ where
                 }
             };
             let left = owed.saturating_sub(delivered);
-            let next = Phase::StreamBody {
-                head: head.clone(),
-                chunk_left: left,
-                // Only a fully delivered chunk owes the CRLF that closes
-                // it; a split one is still mid-payload.
-                after_payload: left == 0,
-                // Counted here, once per delivery, because the framer
-                // re-runs for the same window while its bytes arrive.
-                decoded: decoded.saturating_add(delivered),
-            };
             let d = dispatch(
                 &head,
                 body,
@@ -954,6 +964,20 @@ where
                 handler,
                 Stage::Window,
             );
+            // After the dispatch, which only borrows the head: this arm runs
+            // once per window for the life of the upload, so a clone here is
+            // a head copy per 128 KiB. Its known-length twin below already
+            // moves.
+            let next = Phase::StreamBody {
+                head,
+                chunk_left: left,
+                // Only a fully delivered chunk owes the CRLF that closes
+                // it; a split one is still mid-payload.
+                after_payload: left == 0,
+                // Counted here, once per delivery, because the framer
+                // re-runs for the same window while its bytes arrive.
+                decoded: decoded.saturating_add(delivered),
+            };
             match d {
                 Dispatched::Continue => {
                     conn.phase = next;
@@ -965,7 +989,6 @@ where
                     d,
                     Some(super::framer::StreamPark {
                         next,
-                        stage: Stage::Window,
                         // Mid-body: any interim went out when the open was
                         // answered.
                         expect_interim: false,
@@ -1036,7 +1059,6 @@ where
                                 remaining: left,
                             }
                         },
-                        stage: Stage::Window,
                         // Mid-body: any interim went out when the open was
                         // answered.
                         expect_interim: false,
@@ -1076,6 +1098,7 @@ where
         Phase::Parked { req, resume } => {
             let ParkedRequest {
                 head,
+                stage,
                 body: parked,
                 trailers,
                 answer,
@@ -1148,8 +1171,6 @@ where
                         .iter()
                         .map(|(n, v)| HeaderView { name: n, value: v })
                         .collect();
-                    let stage =
-                        resume.as_ref().map_or(Stage::Whole, |r| r.stage);
                     // The handles are split because a redriven window that
                     // exhausted a known length owes an End dispatch as well
                     // (below), exactly as the inline path does.
@@ -2213,6 +2234,61 @@ mod tests {
         );
     }
 
+    /// A streaming connection delivers [`Stage::Whole`] too, and both
+    /// shapes that reach it are ordinary: a bodyless request, and a
+    /// `Content-Length` body at or under one window - each takes the
+    /// buffered path because a whole delivery there is already one pooled
+    /// read.
+    ///
+    /// This is the contract a handler is written against. Read as
+    /// "a streaming connection never delivers `Whole`", such a handler
+    /// answers [`HttpVerdict::Continue`] for a stage it was told cannot
+    /// occur and the connection closes with no HTTP response
+    /// (`continuing_past_a_delivery_that_owes_a_reply_closes`).
+    #[test]
+    fn a_streaming_connection_still_delivers_whole() {
+        let cap = 4 * STREAM_WINDOW as u64;
+        for (what, head, body) in [
+            (
+                "a bodyless request",
+                b"GET /k HTTP/1.1\r\nHost: h\r\n\r\n".to_vec(),
+                Vec::new(),
+            ),
+            (
+                "a sub-window body",
+                b"PUT /k HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\n\r\n"
+                    .to_vec(),
+                b"abcd".to_vec(),
+            ),
+        ] {
+            let mut conn = HttpConn::new_streaming((), cap);
+            let mut wire = head.clone();
+            wire.extend_from_slice(&body);
+            assert!(
+                matches!(
+                    frame(&wire, &mut conn, &cfg()),
+                    Framing::Complete { body_len, .. } if body_len == body.len()
+                ),
+                "{what}: not a buffered delivery"
+            );
+            let mut seen = None;
+            let _ = drive_verdict(
+                &head,
+                Body::inline(&body),
+                &peer(),
+                &mut conn,
+                &mut |req: HttpRequest<'_>, _: &mut ()| {
+                    seen = Some(req.stage);
+                    HttpVerdict::Respond(HttpResponse::new(200))
+                },
+            );
+            assert!(
+                matches!(seen, Some(Stage::Whole)),
+                "{what} on a streaming connection presented as {seen:?}"
+            );
+        }
+    }
+
     /// While draining, the dance's first message is refused with a close
     /// instead of being invited to send a body the drain will not read.
     #[test]
@@ -2870,6 +2946,85 @@ mod tests {
         assert_eq!(conn.state, 2);
     }
 
+    /// A park taken at [`Stage::End`] is redriven as `End`.
+    ///
+    /// An `End` park carries no resume state - `settle(conn, d, None)` is
+    /// what both End arms file - so the stage cannot be read back off the
+    /// resume phase, and a handler that finalises an upload at `End` would
+    /// be handed its terminal delivery as if the whole body had arrived in
+    /// one piece.
+    #[test]
+    fn a_park_at_end_is_redriven_as_end() {
+        let head = b"PUT /up HTTP/1.1\r\nHost: h\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n";
+        let mut conn = HttpConn::new_streaming(Vec::<Stage>::new(), 1 << 20);
+        let p = peer();
+        let parked: RefCell<Option<HttpDeferred>> = RefCell::new(None);
+        let park_once = std::cell::Cell::new(false);
+        let mut handler = |req: HttpRequest<'_>, seen: &mut Vec<Stage>| {
+            seen.push(req.stage);
+            match req.stage {
+                Stage::End if !park_once.replace(true) => {
+                    let (deferred, permit) = req.defer();
+                    parked.borrow_mut().replace(deferred);
+                    HttpVerdict::Defer(permit)
+                }
+                Stage::End => HttpVerdict::Respond(HttpResponse::new(200)),
+                _ => HttpVerdict::Continue,
+            }
+        };
+
+        // Open, one window, then the terminal chunk - which parks.
+        let _ = frame(head, &mut conn, &cfg());
+        let _ =
+            drive_verdict(head, Body::inline(b""), &p, &mut conn, &mut handler);
+        let win = b"3\r\nabc\r\n";
+        let f = frame(win, &mut conn, &cfg());
+        let Framing::Complete {
+            header_len,
+            body_len,
+        } = f
+        else {
+            panic!("window: {f:?}")
+        };
+        let _ = drive_verdict(
+            &win[..header_len],
+            Body::inline(&win[header_len..header_len + body_len]),
+            &p,
+            &mut conn,
+            &mut handler,
+        );
+        // The window consumed its payload but not the CRLF that closes it.
+        let last = b"\r\n0\r\n\r\n";
+        let f = frame(last, &mut conn, &cfg());
+        let Framing::Complete { header_len, .. } = f else {
+            panic!("terminal: {f:?}")
+        };
+        let resp = drive_verdict(
+            &last[..header_len],
+            Body::inline(b""),
+            &p,
+            &mut conn,
+            &mut handler,
+        );
+        assert!(matches!(resp, Response::Defer(_)), "got {resp:?}");
+        assert_eq!(
+            conn.state,
+            vec![Stage::Open, Stage::Window, Stage::End],
+            "the inline walk"
+        );
+
+        parked.borrow_mut().take().expect("parked").redrive();
+        let done = complete_parked(&mut conn, &mut handler);
+        assert!(text(&done).starts_with("HTTP/1.1 200 OK\r\n"), "{done:?}");
+        assert_eq!(
+            conn.state.last(),
+            Some(&Stage::End),
+            "the redrive re-presented an End park as {:?}",
+            conn.state.last()
+        );
+    }
+
     /// While a request is parked the framer holds pipelined bytes unframed,
     /// so a later request cannot be answered around the parked one.
     #[test]
@@ -2879,6 +3034,7 @@ mod tests {
             resume: None,
             req: Box::new(ParkedRequest {
                 head: b"GET / HTTP/1.1\r\nHost: h\r\n\r\n".to_vec(),
+                stage: Stage::Whole,
                 body: Vec::new(),
                 trailers: Vec::new(),
                 answer: Arc::new(Mutex::new(None)),

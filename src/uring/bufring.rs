@@ -190,7 +190,15 @@ impl BufRing {
             Some(e) => e,
             None => return Err(Errno::EINVAL),
         };
-        if buf_len == 0 {
+        // A descriptor's `len` is a `u32` (`io_uring_buf`), so a length
+        // that does not fit one cannot be published: `buf_len as u32`
+        // truncates, and any nonzero multiple of 2^32 truncates to exactly
+        // the zero this guard refuses. The kernel clamps a selecting read
+        // down to the descriptor it picked (`io_ring_buffer_select`,
+        // `io_uring/kbuf.c`), so every read would then complete `res = 0`,
+        // which the recv path reads as a peer FIN. Refuse it here, where
+        // the caller still learns.
+        if buf_len == 0 || buf_len > u32::MAX as usize {
             return Err(Errno::EINVAL);
         }
         let ring_bytes = usize::from(entries) * size_of::<IoUringBuf>();
@@ -320,7 +328,12 @@ impl BufRing {
         unsafe {
             let d = self.ring.add(slot);
             (&raw mut (*d).addr).write(addr as u64);
-            (&raw mut (*d).len).write(self.buf_len as u32);
+            // `new` refuses a `buf_len` past `u32::MAX`, so this is
+            // lossless; saturating rather than casting means a broken
+            // invariant understates a buffer's tail instead of publishing
+            // the zero length that reads as a peer FIN.
+            (&raw mut (*d).len)
+                .write(self.buf_len.min(u32::MAX as usize) as u32);
             (&raw mut (*d).bid).write(bid);
         }
         self.tail = self.tail.wrapping_add(1);
@@ -807,6 +820,29 @@ mod tests {
         drop(br); // unregisters; a leak would fail the next registration
         let again = BufRing::new(r.raw_fd(), 0, 4, 64, 4);
         assert!(again.is_ok(), "the id was freed: {again:?}");
+    }
+
+    /// A buffer length the descriptor cannot carry is refused at
+    /// registration.
+    ///
+    /// `io_uring_buf::len` is a `u32`. A cast would truncate, and every
+    /// nonzero multiple of 2^32 truncates to the zero length the same guard
+    /// refuses outright - after which the kernel clamps each selecting read
+    /// to zero and the recv path reads that as the peer hanging up.
+    #[test]
+    fn a_buffer_longer_than_the_descriptor_field_is_refused() {
+        let Some(r) = ring() else {
+            return;
+        };
+        for len in [0, u32::MAX as usize + 1, 1usize << 33] {
+            assert!(
+                matches!(
+                    BufRing::new(r.raw_fd(), 0, 4, len, 0),
+                    Err(Errno::EINVAL)
+                ),
+                "registered a {len}-byte buffer the descriptor cannot name"
+            );
+        }
     }
 
     /// The descriptor ring does not reach a forked child.

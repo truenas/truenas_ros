@@ -364,7 +364,7 @@ impl QueryDir {
                 all.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()))
             }
             Order::ByPathBytes => {
-                self.resolve_unknown_dtypes(&mut all);
+                self.resolve_unknown_dtypes(&mut all)?;
                 all.sort_by(|a, b| {
                     cmp_path_bytes(
                         a.0.as_bytes(),
@@ -398,38 +398,57 @@ impl QueryDir {
 
     /// Give every `DT_UNKNOWN` entry a real `d_type` with a scatter-gathered
     /// `statx`, so [`Order::ByPathBytes`] never has to guess whether a name
-    /// carries a trailing separator. An entry whose `statx` fails keeps
-    /// `DT_UNKNOWN` and sorts as a non-directory - the same answer guessing
-    /// would have given, but only where the kernel could tell us nothing.
-    fn resolve_unknown_dtypes(&self, all: &mut [(OsString, u8)]) {
-        let pending: Vec<(usize, FsPending)> = all
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, d))| *d == libc::DT_UNKNOWN)
-            .filter_map(|(i, (name, _))| {
-                let leaf = Leaf::new(name.as_bytes()).ok()?;
-                let p = self
-                    .h
-                    .start_statx(
-                        self.who,
-                        &self.dir,
-                        leaf,
-                        AtFlags::AT_SYMLINK_NOFOLLOW,
-                        StatxMask::TYPE,
-                    )
-                    .ok()?;
-                Some((i, p))
-            })
-            .collect();
+    /// carries a trailing separator.
+    ///
+    /// This is where the whole listing's directory-ness is decided
+    /// ([`entry_is_dir`]), so an entry left `DT_UNKNOWN` here is one the
+    /// listing goes on to call a file, emit with a file's key, and - through
+    /// [`DirEntry::is_dir`] - never descend into. Only the answers that mean
+    /// *there is nothing there to list* may be swallowed into that, which is
+    /// [`unresolved_statx_verdict`]'s split: an entry this identity cannot
+    /// stat cannot be entered either, and one that has gone is gone. Every
+    /// other refusal - the marked `EBUSY` of a full op table above all,
+    /// reached under exactly the pressure that makes a listing large - fails
+    /// the batch, because sorting on a guess produces a page that reads as
+    /// complete and is not.
+    fn resolve_unknown_dtypes(
+        &self,
+        all: &mut [(OsString, u8)],
+    ) -> crate::Result<()> {
+        let mut pending: Vec<(usize, FsPending)> = Vec::new();
+        for (i, (name, d)) in all.iter().enumerate() {
+            if *d != libc::DT_UNKNOWN {
+                continue;
+            }
+            // A name that cannot be a leaf cannot be statted or descended
+            // into either, so it stays what `readdir` called it.
+            let Ok(leaf) = Leaf::new(name.as_bytes()) else {
+                continue;
+            };
+            pending.push((
+                i,
+                self.h.start_statx(
+                    self.who,
+                    &self.dir,
+                    leaf,
+                    AtFlags::AT_SYMLINK_NOFOLLOW,
+                    StatxMask::TYPE,
+                )?,
+            ));
+        }
         for (i, p) in pending {
-            if let Some(st) = pending_statx(p) {
+            let (st, err) = split_statx(Some(p));
+            if let Some(st) = st {
                 all[i].1 = if st.is_dir() {
                     libc::DT_DIR
                 } else {
                     libc::DT_REG
                 };
+            } else if let Some(e) = unresolved_statx_verdict(err) {
+                return Err(e.into());
             }
         }
+        Ok(())
     }
 
     /// Read up to `limit` kept entry names (with their `d_type`), skipping
@@ -493,7 +512,7 @@ impl QueryDir {
         let spec = self.opts.spec;
         // With the confinement asked for, an entry whose device cannot be
         // determined is answered for rather than yielded
-        // ([`unknown_device_verdict`]). The refusal is collected here
+        // ([`unresolved_statx_verdict`]). The refusal is collected here
         // because the judgement sits inside an iterator pipeline.
         let confined = self.opts.same_device_only;
         let mut refused: Option<Errno> = None;
@@ -741,7 +760,7 @@ impl QueryDir {
                 // asked for xattrs, an ACL or a name list.
                 if confined && spec.contains(EnrichSpec::STATX) {
                     if statx.is_none() {
-                        if let Some(e) = unknown_device_verdict(statx_err) {
+                        if let Some(e) = unresolved_statx_verdict(statx_err) {
                             refused = refused.or(Some(e));
                         }
                         return None;
@@ -750,12 +769,11 @@ impl QueryDir {
                         return None;
                     }
                 }
-                // A verdict from the metadata where there is any, and only
-                // then the readdir hint.
-                let is_dir = statx
-                    .as_ref()
-                    .map(Statx::is_dir)
-                    .unwrap_or(p.dtype == libc::DT_DIR);
+                let is_dir = entry_is_dir(
+                    self.opts.order,
+                    p.dtype,
+                    statx.as_ref().map(Statx::is_dir),
+                );
                 let mut xattrs: Vec<(CString, Option<Vec<u8>>)> = p
                     .xattrs
                     .into_iter()
@@ -862,13 +880,6 @@ struct Reading {
     incomplete: bool,
 }
 
-/// Await a `statx` twin: `Some(Statx)` on success, else `None`.
-fn pending_statx(p: FsPending) -> Option<Statx> {
-    let out = p.into_outcome().ok()?;
-    out.res.ok()?;
-    out.stat.map(|raw| Statx::from_raw(*raw))
-}
-
 /// Await an entry's `statx`, keeping the errno apart from the metadata.
 ///
 /// `(None, None)` means no `statx` was issued for this entry at all - which
@@ -888,8 +899,37 @@ fn split_statx(p: Option<FsPending>) -> (Option<Statx>, Option<Errno>) {
     }
 }
 
-/// What a confined listing does with an entry whose device it could not
-/// read: drop this one, or fail the batch.
+/// One entry's directory-ness, which is one answer and not two.
+///
+/// Under [`Order::ByPathBytes`] it is the answer the **sort** committed to,
+/// which is the `d_type` [`QueryDir::resolve_unknown_dtypes`] settled before
+/// the comparator ran - not the enrichment `statx`, which is a later and
+/// separate observation of the same name. The two can disagree (the entry
+/// was replaced between them), and taking the later one emits the entry at a
+/// position its own key does not sort to: [`DirEntry::is_dir`] is what a
+/// caller appends the trailing separator from, so the next page resumes at a
+/// key that steps over siblings this page never emitted. Losing entries out
+/// of a listing that reads as complete is the failure
+/// `query_tree::is_subtree_skip` exists to prevent, and it is where a
+/// contradiction surfaces instead: a descent into something that is no
+/// longer a directory answers `ENOTDIR`, which that predicate deliberately
+/// does not swallow.
+///
+/// The unordered modes synthesize no key, so nothing there is committed to
+/// and the metadata is simply the better answer.
+fn entry_is_dir(order: Order, dtype: u8, statx_says_dir: Option<bool>) -> bool {
+    match order {
+        Order::ByPathBytes => dtype == libc::DT_DIR,
+        _ => statx_says_dir.unwrap_or(dtype == libc::DT_DIR),
+    }
+}
+
+/// What a listing does with an entry whose `statx` did not answer: swallow
+/// this one, or fail the batch. `None` is "nothing there to list".
+///
+/// Two callers ask it. [`QueryDir::resolve_unknown_dtypes`] asks before the
+/// sort, where an unanswered `statx` decides an entry is not a directory;
+/// the confined filter below asks after it.
 ///
 /// **`same_device_only` is a confinement, and the filter behind it keeps an
 /// entry whose device is unknown.** It exists to drop what lives on another
@@ -913,7 +953,7 @@ fn split_statx(p: Option<FsPending>) -> (Option<Statx>, Option<Errno>) {
 ///   documented retryable refusal.
 /// * No errno at all: nothing was issued where something should have been.
 ///   Not "nothing to list", so it surfaces too.
-fn unknown_device_verdict(err: Option<Errno>) -> Option<Errno> {
+fn unresolved_statx_verdict(err: Option<Errno>) -> Option<Errno> {
     match err {
         Some(Errno::EACCES | Errno::EPERM | Errno::ENOENT) => None,
         Some(e) => Some(e),
@@ -1569,9 +1609,41 @@ fn copy_range_rw(
 
 #[cfg(all(test, not(loom)))]
 mod confinement_tests {
-    use super::{split_statx, unknown_device_verdict};
+    use super::{Order, entry_is_dir, split_statx, unresolved_statx_verdict};
     use crate::errno::Errno;
     use crate::uring_fs::{FsOutcome, FsPending};
+
+    /// An ordered listing emits the directory-ness it sorted by.
+    ///
+    /// `cmp_path_bytes` gives a directory the trailing separator its
+    /// children will carry, and a caller resumes from the key built out of
+    /// `DirEntry::is_dir` - so an entry ordered as one thing and reported as
+    /// the other resumes at a key that steps over siblings never emitted. A
+    /// disagreement is ordinary: the two observations are a `readdir` sweep
+    /// and a later per-entry `statx`, with the entry free to be replaced in
+    /// between.
+    #[test]
+    fn an_ordered_listing_reports_the_directory_ness_it_sorted_by() {
+        // Sorted as a file, `statx` says directory: the key is already
+        // spent, so the listing keeps its word.
+        assert!(
+            !entry_is_dir(Order::ByPathBytes, libc::DT_REG, Some(true)),
+            "an entry sorted at `a` reported as `a/`: the resume key skips \
+             every sibling between them"
+        );
+        // And the other way, which the descent answers for with ENOTDIR.
+        assert!(entry_is_dir(Order::ByPathBytes, libc::DT_DIR, Some(false)));
+        // No metadata at all: the hint, in every mode.
+        for order in [Order::ByPathBytes, Order::ByName, Order::Readdir] {
+            assert!(entry_is_dir(order, libc::DT_DIR, None));
+            assert!(!entry_is_dir(order, libc::DT_REG, None));
+        }
+        // The unordered modes synthesize no key, so the metadata wins.
+        for order in [Order::ByName, Order::Readdir] {
+            assert!(entry_is_dir(order, libc::DT_REG, Some(true)));
+            assert!(!entry_is_dir(order, libc::DT_DIR, Some(false)));
+        }
+    }
 
     fn split(res: Result<i32, Errno>) -> Option<Errno> {
         split_statx(Some(FsPending::resolved(FsOutcome::new(
@@ -1597,7 +1669,7 @@ mod confinement_tests {
         // per-identity behaviour the rest of this module already has.
         for e in [Errno::EACCES, Errno::EPERM, Errno::ENOENT] {
             assert_eq!(
-                unknown_device_verdict(Some(e)),
+                unresolved_statx_verdict(Some(e)),
                 None,
                 "{e} should drop the entry, not fail the listing"
             );
@@ -1609,7 +1681,7 @@ mod confinement_tests {
         // retryable one.
         for e in [Errno::EBUSY, Errno::EIO, Errno::ENOTDIR] {
             assert_eq!(
-                unknown_device_verdict(Some(e)),
+                unresolved_statx_verdict(Some(e)),
                 Some(e),
                 "{e} should fail the listing rather than admit an entry \
                  whose filesystem is unknown"
@@ -1618,7 +1690,7 @@ mod confinement_tests {
 
         // No errno at all where a device was owed: not "nothing to list".
         assert_eq!(
-            unknown_device_verdict(None),
+            unresolved_statx_verdict(None),
             Some(Errno::ECONNABORTED),
             "an entry that produced no answer and no reason must surface"
         );

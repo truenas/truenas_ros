@@ -719,7 +719,12 @@ fn tcp_splice_body() {
     let payload: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
     let expected = payload.clone();
 
-    // Reader thread: drain exactly BODY bytes off the pipe read end.
+    // Reader thread: drain the pipe until BODY bytes arrive or the write
+    // end closes. The EOF arm is what an io_uring *skip* looks like from
+    // here: `with_server` returns without ever running the client body, so
+    // nothing is spliced, and a reader that only ever stops at BODY blocks
+    // for the life of the run - a hang with no test named. The main thread
+    // closes the write end before joining, which is the EOF.
     let reader = thread::spawn(move || {
         let mut got = vec![0u8; BODY];
         let mut off = 0;
@@ -732,12 +737,15 @@ fn tcp_splice_body() {
                     (BODY - off) as libc::size_t,
                 )
             };
-            assert!(n > 0, "pipe read returned {n}");
+            if n == 0 {
+                break; // write end closed: nothing more is coming
+            }
+            assert!(n > 0, "pipe read: {}", std::io::Error::last_os_error());
             off += n as usize;
         }
         // SAFETY: done with the read end.
         unsafe { libc::close(pipe_rd) };
-        assert_eq!(got, expected, "spliced body mismatch");
+        (off, got)
     });
 
     with_server(echo, move |v4| {
@@ -773,9 +781,16 @@ fn tcp_splice_body() {
         client.close_now(conn);
         Ok(())
     });
-    reader.join().expect("reader join");
+    // Before the join, not after: this close is the reader's EOF.
     // SAFETY: closing the test-owned write end (the client only borrowed it).
     unsafe { libc::close(pipe_wr) };
+    let (off, got) = reader.join().expect("reader join");
+    // On an io_uring skip the client body never ran and nothing was
+    // spliced; only assert the transfer on a real run.
+    if off > 0 {
+        assert_eq!(off, BODY, "splice moved {off} of {BODY} body bytes");
+        assert_eq!(got, expected, "spliced body mismatch");
+    }
 }
 
 #[test]
@@ -921,7 +936,10 @@ fn ktls_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> Acceptor {
 /// socket and refuses the connection unless the readback shows it engaged
 /// both directions - then close the furnished fd (the pool descriptor keeps
 /// the kTLS socket).
-fn ktls_server_handshake(fd: RawFd, acceptor: &Acceptor) -> Result<(), String> {
+fn ktls_server_handshake(
+    fd: RawFd,
+    acceptor: &Acceptor,
+) -> Result<(), KtlsProbe> {
     // This worker owns the furnished fd: EVERY return path must close it (the
     // set_tls_handshake contract), or each failed handshake leaks a process fd.
     struct FdCloser(RawFd);
@@ -945,7 +963,50 @@ fn ktls_server_handshake(fd: RawFd, acceptor: &Acceptor) -> Result<(), String> {
     acceptor
         .accept(borrowed)
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(KtlsProbe::from)
+}
+
+/// Why a probe handshake did not engage kTLS, which is two answers and not
+/// one.
+///
+/// [`KtlsProbe::NotEngaged`] is this **host's** verdict - libssl built
+/// without `enable-ktls`, OpenSSL's TLS 1.3 RX gap, no `tls` module - and
+/// the data-path tests skip on it. [`KtlsProbe::Broken`] is the probe's own
+/// failure, descriptor exhaustion above all, which CI and the nightly VM
+/// reach at a soft `NOFILE` of 1024. Folded into one channel the decision
+/// site cannot tell them apart even in principle: unarmed it skips silently
+/// on a suite that tested nothing, and armed it asserts "OpenSSL cannot
+/// engage kTLS: dup", sending a maintainer to the wrong subsystem.
+///
+/// `test/support/ktls.rs` gets this split from
+/// `truenas_ktls::Error::NotEngaged` for free. The client half here has no
+/// such type - `SSL_connect` and the `SOL_TLS` readback are two different
+/// questions asked of one `unsafe` block - so it is spelled out.
+#[derive(Debug)]
+enum KtlsProbe {
+    /// This host cannot engage kTLS.
+    NotEngaged(String),
+    /// The probe itself failed; nothing about kTLS was measured.
+    Broken(String),
+}
+
+impl From<truenas_ktls::Error> for KtlsProbe {
+    fn from(e: truenas_ktls::Error) -> KtlsProbe {
+        match e {
+            truenas_ktls::Error::NotEngaged { .. } => {
+                KtlsProbe::NotEngaged(e.to_string())
+            }
+            other => KtlsProbe::Broken(other.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for KtlsProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KtlsProbe::NotEngaged(m) | KtlsProbe::Broken(m) => f.write_str(m),
+        }
+    }
 }
 
 /// A kTLS-enabled OpenSSL client context: `SSL_OP_ENABLE_KTLS` + no cert
@@ -962,7 +1023,7 @@ fn ktls_client_ctx() -> SslContext {
 /// kTLS on the socket), confirm kTLS engaged both directions, then close the
 /// furnished fd. The mirror of `ktls_server_handshake`, `SSL_connect` for
 /// `SSL_accept` - exactly what a `Client::set_tls_handshake` worker does.
-fn ktls_client_handshake(fd: RawFd, ctx: &SslContext) -> Result<(), String> {
+fn ktls_client_handshake(fd: RawFd, ctx: &SslContext) -> Result<(), KtlsProbe> {
     struct FdCloser(RawFd);
     impl Drop for FdCloser {
         fn drop(&mut self) {
@@ -977,22 +1038,26 @@ fn ktls_client_handshake(fd: RawFd, ctx: &SslContext) -> Result<(), String> {
         let fl = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, fl & !libc::O_NONBLOCK);
     }
-    let mut ssl = Ssl::new(ctx).map_err(|e| e.to_string())?;
+    let mut ssl =
+        Ssl::new(ctx).map_err(|e| KtlsProbe::Broken(e.to_string()))?;
     ssl.set_connect_state();
     // SAFETY: a BIO_NOCLOSE socket BIO over `fd`; SSL owns the BIO (freed on
     // drop), and `fd` outlives `ssl` here.
     let rc = unsafe {
         let bio = openssl_sys::BIO_new_socket(fd, BIO_NOCLOSE);
         if bio.is_null() {
-            return Err("BIO_new_socket".into());
+            return Err(KtlsProbe::Broken("BIO_new_socket".into()));
         }
         openssl_sys::SSL_set_bio(ssl.as_ptr(), bio, bio);
         openssl_sys::SSL_connect(ssl.as_ptr())
     };
     if rc != 1 {
-        return Err(format!("SSL_connect returned {rc}"));
+        // The handshake completes even where engagement cannot - the
+        // fallback is userspace records - so a failure here is the probe's,
+        // not this host's kTLS answer.
+        return Err(KtlsProbe::Broken(format!("SSL_connect returned {rc}")));
     }
-    confirm_ktls(fd)?;
+    confirm_ktls(fd).map_err(KtlsProbe::NotEngaged)?;
     drop(ssl); // BIO_NOCLOSE -> fd not closed; kTLS stays on the socket
     Ok(()) // _fd_owner closes the furnished fd
 }
@@ -1028,41 +1093,38 @@ fn confirm_ktls(fd: RawFd) -> Result<(), String> {
 /// data-path tests would fail rather than skip. Probe once with a loopback
 /// handshake - the same acceptor, client context, and confirmation the tests
 /// use - so those tests can skip when this host's OpenSSL cannot engage kTLS.
-fn ktls_engages() -> &'static Result<(), String> {
-    static PROBE: std::sync::OnceLock<Result<(), String>> =
+fn ktls_engages() -> &'static Result<(), KtlsProbe> {
+    static PROBE: std::sync::OnceLock<Result<(), KtlsProbe>> =
         std::sync::OnceLock::new();
     PROBE.get_or_init(|| {
+        // The probe's own scaffolding panics at source rather than
+        // returning: a loopback socket it cannot get is not a kTLS verdict,
+        // and `KtlsProbe` exists so nothing downstream has to guess which
+        // it was reading (`test/support/ktls.rs` panics here too).
         let (cert, key) = self_signed();
         let acceptor = ktls_acceptor(&cert, &key);
-        let listener =
-            TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-        let addr = listener.local_addr().map_err(|e| e.to_string())?;
-        let server = thread::spawn(move || -> Result<(), String> {
-            let (stream, _) = listener.accept().map_err(|e| e.to_string())?;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        let addr = listener.local_addr().expect("probe local_addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("probe accept");
             // The handshake helpers own (and close) the fd they are given;
             // hand each a dup and let the `TcpStream`s keep the sockets.
             // SAFETY: dup of a live fd.
             let fd = unsafe { libc::dup(stream.as_raw_fd()) };
-            if fd < 0 {
-                return Err("dup".into());
-            }
+            assert!(fd >= 0, "probe dup");
             ktls_server_handshake(fd, &acceptor)
         });
-        let stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
+        let stream = TcpStream::connect(addr).expect("probe connect");
         // SAFETY: dup of a live fd (see above).
         let fd = unsafe { libc::dup(stream.as_raw_fd()) };
-        if fd < 0 {
-            return Err("dup".into());
-        }
+        assert!(fd >= 0, "probe dup");
         let client = ktls_client_handshake(fd, &ktls_client_ctx());
         if client.is_err() {
             drop(stream); // EOF unblocks a server still mid-handshake
             let _ = server.join();
             return client;
         }
-        let served = server
-            .join()
-            .map_err(|_| "probe server panicked".to_string())?;
+        let served = server.join().expect("probe server thread");
         drop(stream); // keep the socket open until the server side confirmed
         served
     })
@@ -1074,7 +1136,7 @@ fn ktls_engages() -> &'static Result<(), String> {
 fn ktls_openssl_unsupported() -> bool {
     match ktls_engages() {
         Ok(()) => false,
-        Err(e) => {
+        Err(KtlsProbe::NotEngaged(e)) => {
             assert!(
                 std::env::var_os("TRUENAS_ROS_REQUIRE_KTLS").is_none(),
                 "TRUENAS_ROS_REQUIRE_KTLS set but {} cannot engage kTLS: {e}",
@@ -1085,6 +1147,11 @@ fn ktls_openssl_unsupported() -> bool {
                 openssl::version::version(),
             );
             true
+        }
+        // Not a verdict about this host's kTLS, so neither skipping nor
+        // blaming OpenSSL for it is honest.
+        Err(KtlsProbe::Broken(e)) => {
+            panic!("kTLS probe failed before it could measure engagement: {e}")
         }
     }
 }
@@ -1402,18 +1469,14 @@ fn ktls_splice_body() {
     let payload: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
     let expected = payload.clone();
 
+    // Drains until BODY arrives or the write end closes - the same reader as
+    // `tcp_splice_body`, and the EOF arm is how a kTLS *skip* (the client
+    // body never runs, nothing is spliced) ends instead of blocking. The
+    // main thread's close below is that EOF; nothing here waits on a clock.
     let reader = thread::spawn(move || {
-        // Non-blocking + deadline-bounded so a kTLS *skip* (the client body never
-        // runs, nothing is ever spliced) returns instead of blocking forever.
-        // SAFETY: make the read end non-blocking so the deadline loop works.
-        unsafe {
-            let fl = libc::fcntl(pipe_rd, libc::F_GETFL);
-            libc::fcntl(pipe_rd, libc::F_SETFL, fl | libc::O_NONBLOCK);
-        }
         let mut got = vec![0u8; BODY];
         let mut off = 0;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while off < BODY && Instant::now() < deadline {
+        while off < BODY {
             // SAFETY: read into `got[off..]`, within bounds.
             let n = unsafe {
                 libc::read(
@@ -1422,11 +1485,11 @@ fn ktls_splice_body() {
                     (BODY - off) as libc::size_t,
                 )
             };
-            if n > 0 {
-                off += n as usize;
-            } else {
-                thread::sleep(Duration::from_millis(5));
+            if n == 0 {
+                break; // write end closed: nothing more is coming
             }
+            assert!(n > 0, "pipe read: {}", std::io::Error::last_os_error());
+            off += n as usize;
         }
         // SAFETY: done with the read end.
         unsafe { libc::close(pipe_rd) };
@@ -1464,6 +1527,9 @@ fn ktls_splice_body() {
         Ok(())
     });
 
+    // Before the join, not after: this close is the reader's EOF.
+    // SAFETY: closing the test-owned write end (read end closed by the reader).
+    unsafe { libc::close(pipe_wr) };
     let (off, got) = reader.join().expect("reader join");
     // On a kTLS skip the client body never ran, so nothing was spliced; only
     // assert the transfer on a real run (off > 0 means the splice happened).
@@ -1471,6 +1537,4 @@ fn ktls_splice_body() {
         assert_eq!(off, BODY, "kTLS splice moved {off} of {BODY} body bytes");
         assert_eq!(got, expected, "kTLS spliced body content mismatch");
     }
-    // SAFETY: closing the test-owned write end (read end closed by the reader).
-    unsafe { libc::close(pipe_wr) };
 }

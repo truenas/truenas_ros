@@ -989,11 +989,18 @@ mod acl {
             p_ace(PosixTag::GroupObj, -1, false),
             p_ace(PosixTag::Other, -1, false),
         ]));
-        // An Err here just means the filesystem doesn't support POSIX ACL
-        // writes; skip in that case.
-        if let Ok(()) = fsetacl(f.as_fd(), Some(&acl)) {
-            let _ = fgetacl(f.as_fd()).unwrap(); // read back
-            fsetacl(f.as_fd(), None).unwrap(); // remove
+        // A POSIX ACL is the `system.posix_acl_access` xattr, refused
+        // `EOPNOTSUPP` off a dataset whose `acltype` is not `posixacl`
+        // (`zpl_xattr_acl_set_access`, module/os/linux/zfs/zpl_xattr.c), so
+        // the refusal answers to the gate rather than skipping in silence.
+        match fsetacl(f.as_fd(), Some(&acl)) {
+            Ok(()) => {
+                let _ = fgetacl(f.as_fd()).unwrap(); // read back
+                fsetacl(f.as_fd(), None).unwrap(); // remove
+            }
+            Err(e) => {
+                crate::xattr_probe::posix_acl_refusal_is_allowed("fsetacl", e)
+            }
         }
     }
 

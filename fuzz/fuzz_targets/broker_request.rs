@@ -82,6 +82,20 @@ fuzz_target!(|data: &[u8]| {
         "accepted caps {:?} outside the ceiling {allowed:?}",
         decoded.caps
     );
+    // An unknown bit must be refused, not masked off - a caller would
+    // otherwise get a personality weaker than it asked for and discover it
+    // as an `EACCES` far from here. The `contains` above cannot see that
+    // happen: it is true by construction on the accept path
+    // (`decode_request` ends in `Some(c) if allowed.contains(c)`), so it
+    // holds under `from_bits_truncate` just as well. Re-derive the wire
+    // word and require the decode to have been lossless.
+    let caps_bits = u32::from_le_bytes([req[12], req[13], req[14], req[15]]);
+    assert_eq!(
+        Caps::from_bits(caps_bits),
+        Some(decoded.caps),
+        "accepted a caps word {caps_bits:#x} that is not exactly {:?}",
+        decoded.caps
+    );
 
     // Deciding is a pure function of the inputs.
     assert_eq!(
@@ -108,7 +122,11 @@ fuzz_target!(|data: &[u8]| {
             "group {i} was not copied verbatim"
         );
     }
-    // A short destination must truncate, never overrun.
+    // A short destination must truncate, never overrun - so the count goes
+    // in unclamped. `MAX_GROUPS` is 4096, so an accepted request really can
+    // declare more groups than this buffer holds; clamping here would
+    // exercise no truncation at all, and an `out[i]` rewrite of
+    // `decode_groups` would go unnoticed.
     let mut small = [0u32; 4];
-    decode_groups(&req, decoded.ngroups.min(small.len()), &mut small);
+    decode_groups(&req, decoded.ngroups, &mut small);
 });

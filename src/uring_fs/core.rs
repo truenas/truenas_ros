@@ -584,13 +584,24 @@ struct OffloadEntry {
 ///   would otherwise return the whole charge.
 ///
 /// So the arm screens also refuse at `armed + retiring` reaching twice
-/// the cap - the documented mid-swap slot ceiling - and both classes
-/// have to reach `retiring`, or the sum bounds one of them and the
-/// other walks the table one unreaped slot at a time. Without the
-/// clause at all the early headroom unmade the cap entirely: a
-/// retract-rearm loop inside one delivery parked the whole table with
-/// `armed` never leaving zero (cap 1 on a 64-slot table measured 64
-/// arms, zero refusals, zero free slots).
+/// the cap, and both classes have to reach `retiring`, or the sum
+/// bounds one of them and the other walks the table one unreaped slot
+/// at a time. Without the clause at all the early headroom unmade the
+/// cap entirely: a retract-rearm loop inside one delivery parked the
+/// whole table with `armed` never leaving zero (cap 1 on a 64-slot
+/// table measured 64 arms, zero refusals, zero free slots).
+///
+/// **Both screens are counts, and a count is not a slot.** A timer's
+/// is one slot, an `Allow` pair's armed count is two, and a `retiring`
+/// count is one whichever class parked it - so the mid-swap ceiling is
+/// `2 x cap` slots for an owner arming timers and up to `3 x cap` for
+/// one arming pairs (`cap` pairs armed at two slots each, plus `cap`
+/// guard slots parked on `retiring`). That is the number the table is
+/// sized against; stating the ceiling in slots and enforcing it in
+/// counts is what the two disagree about, and converting here would
+/// have to charge each class its own weight rather than assume the
+/// heavier one, which over-refuses the timers this cap was written
+/// for.
 #[derive(Clone, Copy, Default)]
 struct WallClock {
     armed: u32,
@@ -802,8 +813,9 @@ impl FsCore {
     /// time on the table (the sweep's own `ECANCELED`, unmarked, so a
     /// continuation keyed on that vocabulary winds down the same way
     /// in both orderings), and an owner at its cap - or mid-swap at
-    /// twice its cap in slots ([`WallClock`]) - is refused with the
-    /// marked `EBUSY` a full table answers. `Some` is the verdict to
+    /// twice its cap in *counts*, which is two to three times that in
+    /// slots depending on the class ([`WallClock`]) - is refused with
+    /// the marked `EBUSY` a full table answers. `Some` is the verdict to
     /// deliver, `(errno, marked)`.
     ///
     /// The `Embedded`-with-owner pattern is the screen's boundary as
@@ -1146,22 +1158,24 @@ impl FsCore {
             return;
         };
 
-        let iov: Vec<libc::iovec> = bufs
-            .iter_mut()
-            .map(|b| libc::iovec {
-                iov_base: b.as_mut_ptr().cast(),
-                iov_len: b.len(),
-            })
-            .collect();
-
         let raw_fd = file.as_raw_fd();
         let entry = &mut self.ops[op_slot as usize];
         let gen32 = entry.generation as u32;
         let e = &mut entry.state;
         e.state = FsOpState::InFlight { tag };
         e.waiter = Some(waiter);
+        // Into the slot's own storage: `FsOpEntry::clear` empties this
+        // vector without releasing it, so the block a previous tenant grew
+        // is the one this op fills - assigning a fresh `Vec` here dropped
+        // that capacity and allocated once per op instead. Built before
+        // `bufs` moves below, which is fine: the heap block each iovec
+        // names does not move with the vector that owns it.
+        e.iov.clear();
+        e.iov.extend(bufs.iter_mut().map(|b| libc::iovec {
+            iov_base: b.as_mut_ptr().cast(),
+            iov_len: b.len(),
+        }));
         e.bufs = bufs;
-        e.iov = iov;
         // Park the fd here so it stays open until the CQE even if the caller
         // drops its `File` mid-op (close-last by ownership).
         e.file = Some(file);
@@ -1221,10 +1235,12 @@ impl FsCore {
         let entry = &mut self.ops[op_slot as usize];
         let gen32 = entry.generation as u32;
         entry.state.state = FsOpState::InFlight { tag: TAG_WRITEV };
-        entry.state.iov = vec![libc::iovec {
+        // The slot's own storage, as in `submit_rw`.
+        entry.state.iov.clear();
+        entry.state.iov.push(libc::iovec {
             iov_base: src as *mut libc::c_void,
             iov_len: len,
-        }];
+        });
         entry.state.file = Some(file);
         entry.state.recv_lease = Some(hold);
         entry.state.lease_want = len as u32;
@@ -1339,25 +1355,26 @@ impl FsCore {
         let Some(op_slot) = self.pop_op() else {
             return Err(Errno::EBUSY);
         };
-        // The iovec targets the Vec's spare capacity; computed before the
-        // move below, and the heap block's address survives the move. Under
-        // buffer select only its length is read.
-        let iov = vec![libc::iovec {
-            iov_base: buf.as_mut_ptr().cast(),
-            iov_len: want,
-        }];
         let raw_fd = file.as_raw_fd();
         let entry = &mut self.ops[op_slot as usize];
         let gen32 = entry.generation as u32;
         let e = &mut entry.state;
         e.state = FsOpState::InFlight { tag: TAG_READV };
         e.waiter = Some(FsWaiter::Pump { owner });
+        // The iovec targets the Vec's spare capacity; computed before the
+        // move below, and the heap block's address survives the move. Under
+        // buffer select only its length is read. The slot's own storage, as
+        // in `submit_rw`.
+        e.iov.clear();
+        e.iov.push(libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: want,
+        });
         e.bufs = if bgid.is_some() {
             Vec::new()
         } else {
             vec![buf]
         };
-        e.iov = iov;
         // Park the fd so it stays open until the CQE even if the connection
         // drops its `File` mid-op (close-last by ownership).
         e.file = Some(Arc::clone(&file.fd));
@@ -2097,19 +2114,22 @@ impl FsCore {
         // early-out above is what an idle server hits.
         let mut in_flight = self.ops.len() - self.op_free.len();
         // The premise, checked in the direction that hurts, and only
-        // that one. The walk below stops once it has decremented this
-        // to zero, so a count that is too *high* is caught by the walk
-        // itself - it runs out of entries and the post-walk assert
-        // fires - while one that is too low (a slot pushed to
-        // `op_free` twice) breaks the walk early and silently leaves
-        // live ops uncancelled, in both profiles. Only the derived
-        // figure against the table's own census sees that direction.
+        // that one: a count too *low* (a slot pushed to `op_free`
+        // twice) breaks the walk early and silently leaves live ops
+        // uncancelled, in both profiles, and only the derived figure
+        // against the table's own census sees that.
         //
         // `>=`, not equality: a slot popped for an op whose state is
         // not set yet counts as in flight here and not in the census,
         // and that window is legitimate - unobservable from this
         // function's one production caller, which runs from the
         // reactor's top-level loop, but not something to assert away.
+        // Which is also why the walk below ends with no assertion on
+        // what is left of the count: a remainder is exactly that
+        // window, every in-flight entry having been visited, and a
+        // detector that fires on a state its own premise documents as
+        // legitimate reports the wrong thing twice - once by firing,
+        // and once by reading as though it were watching something.
         debug_assert!(
             in_flight
                 >= self
@@ -2145,10 +2165,6 @@ impl FsCore {
                 targets.push(pack_raw(tag, i as u32, entry.generation as u32));
             }
         }
-        debug_assert_eq!(
-            in_flight, 0,
-            "the walk ended with in-flight entries unvisited"
-        );
         for ud in targets {
             self.submit_cancel(eng, ud);
         }

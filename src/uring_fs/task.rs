@@ -1106,13 +1106,21 @@ impl RunShared {
     }
 
     /// Pop the next woken task id, if any.
+    ///
+    /// The count is **published from under the lock**, never adjusted by a
+    /// delta. A delta is only as good as the pairing, and the pairing is
+    /// broken by design at both ends: [`wake_task`] pushes under this lock
+    /// and adds after releasing it, so an off-loop waker leaves the queue
+    /// longer than the count for a window, and a nested pass can spend
+    /// count an outer pass's budget was sampled from. The subtraction that
+    /// finds nothing left wraps to `usize::MAX`, which [`drain`] samples as
+    /// the entry bound that returns this thread to the ring. Storing the
+    /// length the lock holder can see cannot wrap and cannot contradict a
+    /// push it already observed.
     pub(crate) fn take_ready(&self) -> Option<TaskId> {
-        let id = self
-            .queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop_front()?;
-        self.ready.fetch_sub(1, Ordering::AcqRel);
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let id = q.pop_front()?;
+        self.ready.store(q.len(), Ordering::Release);
         Some(id)
     }
 }
@@ -1167,12 +1175,13 @@ pub(crate) fn wake_task(w: &TaskWake) -> bool {
     if w.queued.swap(true, Ordering::AcqRel) {
         return false;
     }
-    w.run
-        .queue
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push_back(w.id);
-    w.run.ready.fetch_add(1, Ordering::Release);
+    {
+        let mut q = w.run.queue.lock().unwrap_or_else(|e| e.into_inner());
+        q.push_back(w.id);
+        // Published from under the lock, so the count can never disagree
+        // with a push the lock holder has already made - see `take_ready`.
+        w.run.ready.store(q.len(), Ordering::Release);
+    }
     if w.run.off_loop() || !w.run.draining.load(Ordering::Relaxed) {
         w.run.wake.wake.poke();
     }
@@ -1399,11 +1408,9 @@ impl Tasks {
         let Some(run) = self.run.as_ref() else {
             return;
         };
-        run.queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back(id);
-        run.ready.fetch_add(1, Ordering::Release);
+        let mut q = run.queue.lock().unwrap_or_else(|e| e.into_inner());
+        q.push_back(id);
+        run.ready.store(q.len(), Ordering::Release);
     }
 
     fn put_back(&mut self, idx: u32, entry: TaskEntry) {
@@ -3008,7 +3015,7 @@ mod tests {
         };
         assert!(
             after.is_none(),
-            "an owner already holding twice its cap in slots must be \
+            "an owner already holding twice its cap in counts must be \
              refused, whichever class parked them"
         );
         assert_eq!(
@@ -5312,6 +5319,86 @@ mod tests {
                 Poll::Ready(Err(JoinError::Dropped))
             ),
             "teardown must resolve the join, not strand it"
+        );
+    }
+
+    /// The run-queue count may not disagree with the queue it counts.
+    ///
+    /// `wake_task` pushes under the queue lock and adjusts the count after
+    /// releasing it, so an off-loop waker caught between the two leaves the
+    /// queue one longer than the count. A nested pass - a callback calling
+    /// [`FsConn::run_woken`] from inside a delivery - then spends count the
+    /// outer pass's budget was sampled from, and the outer pass pops the
+    /// unaccounted id with a decrement that has nothing left to take.
+    ///
+    /// It wraps, and [`drain`] samples exactly that as the per-pass entry
+    /// bound: that bound is what returns this thread to `submit_and_wait`,
+    /// so at `usize::MAX` a task that re-wakes itself keeps one pass
+    /// running and every connection on the ring stops being served.
+    #[test]
+    fn a_nested_pass_cannot_run_the_ready_count_below_zero() {
+        let Some((mut eng, mut fs, _who)) = rig() else {
+            return;
+        };
+
+        /// Re-enters the executor from inside its own poll - the
+        /// documented hand-wake shape.
+        struct Reenter;
+        impl Future for Reenter {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                let me = CURRENT_TASK.with(|c| c.get());
+                with_conn(me, |c| c.run_woken());
+                Poll::Pending
+            }
+        }
+        struct Pend;
+        impl Future for Pend {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+
+        {
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            let _reenter = conn.spawn(|_t| Reenter);
+            let _pend = conn.spawn(|_t| Pend);
+        }
+        let run = Arc::clone(fs.tasks.run.as_ref().expect("run queue"));
+        let (a, b) = (
+            TaskId {
+                idx: 0,
+                generation: 0,
+            },
+            TaskId {
+                idx: 1,
+                generation: 0,
+            },
+        );
+
+        // Two wakes fully accounted - what an on-loop `wake_task` leaves.
+        for id in [a, b] {
+            run.queue.lock().unwrap().push_back(id);
+            run.ready.fetch_add(1, Ordering::Release);
+        }
+        // And a third from off the loop thread, caught inside `wake_task`'s
+        // window: pushed under the lock, its count not landed yet.
+        run.queue.lock().unwrap().push_back(a);
+        assert_eq!(run.ready.load(Ordering::Acquire), 2, "setup");
+        assert_eq!(run.queue.lock().unwrap().len(), 3, "setup");
+
+        // Budget 2: pop a, which re-enters and lets a nested pass spend the
+        // count for b; the outer pass still has budget for the third pop.
+        drain(&mut fs, &mut eng);
+
+        let left = run.queue.lock().unwrap().len();
+        assert_eq!(
+            run.ready.load(Ordering::Acquire),
+            left,
+            "the count disagrees with the queue it counts; a later pass \
+             samples this as the entry bound that returns the thread to \
+             the ring"
         );
     }
 }

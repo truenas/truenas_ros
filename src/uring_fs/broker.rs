@@ -800,7 +800,7 @@ impl CredBroker {
         // mint caps - an unsafe state. The `?` surfaces it; `spawn` failure is
         // fatal (see the doc), so the caller aborts rather than serves.
         drop_setid_caps()?;
-        Ok(CredBroker {
+        let broker = CredBroker {
             inner: Arc::new(BrokerInner {
                 sock: Mutex::new(BrokerSock {
                     fd: parent_end,
@@ -810,7 +810,23 @@ impl CredBroker {
                 pidfd,
                 rings: ring_fds.len(),
             }),
-        })
+        };
+        // Take the child's ready datagram before handing back a handle. A
+        // child that died renumbering its descriptors otherwise reaches the
+        // caller as a live `CredBroker` whose first `register` answers
+        // `ECONNRESET` - with the mint capabilities already shed, so no
+        // second broker can impersonate and the process cannot recover
+        // without restarting. Failing here is what the contract above says
+        // it is, and dropping `broker` kills and reaps the child.
+        //
+        // Bounded by the same `SO_RCVTIMEO` every other reply on this socket
+        // carries, so a child wedged before its first send costs one
+        // `RECV_TIMEOUT` rather than the process.
+        {
+            let sock = broker.inner.sock.lock().map_err(|_| Errno::EIO)?;
+            recv_reply(sock.fd.as_raw_fd())?;
+        }
+        Ok(broker)
     }
 
     /// The handle for ring `index` - the position of that [`UringFs`] in
@@ -1163,6 +1179,18 @@ fn broker_main(
     scratch: Vec<libc::gid_t>,
 ) -> ! {
     let nrings = tidy_child_fds(sock, ring_fds);
+    // Say the layout took, before anything can be asked of it. `dup2_or_die`
+    // exits for a reason the parent cannot see - a scratch target at or above
+    // `RLIMIT_NOFILE` answers `EBADF` (`ksys_dup3`, `/CODE/linux`
+    // `fs/file.c:1411-1412`), which a process holding descriptors near its
+    // soft limit at spawn time reaches - and `spawn`, whose failure is
+    // documented as fatal, must not report a completed security setup for a
+    // child that is already gone. Eight bytes on the same socket every reply
+    // rides, consumed by `spawn` before it hands back a handle.
+    if reply(SOCK_FD, 0).is_err() {
+        // SAFETY: `_exit` in the forked child; no destructors, no flush.
+        unsafe { libc::_exit(4) }
+    }
     // A panic inside request handling must not unwind past `_exit` and run the
     // parent's `Drop` handlers / flush its buffers on the shared copy-on-write
     // image. Contain it here and exit non-zero; under `panic = "abort"` the
@@ -1685,6 +1713,60 @@ mod tests {
              {what}"
         );
         false
+    }
+
+    /// Both halves of the ready handshake `spawn` consults before it hands
+    /// back a handle.
+    ///
+    /// A child that dies renumbering its descriptors never sends its ready
+    /// datagram, and its socket end closes with it - so the parent's read
+    /// is a short one, which is the `ECONNRESET` broker death has always
+    /// spelled. A live child's eight bytes read back as a reply.
+    ///
+    /// The other half of the protocol - that `spawn` consumes exactly this
+    /// datagram, so the first `register` is not answered by it - is what
+    /// every brokered test in `test/uring_fs.rs` would fail on.
+    #[test]
+    fn a_child_that_dies_before_its_ready_datagram_reads_as_broker_death() {
+        use std::os::fd::AsRawFd;
+
+        fn pair() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+            let mut sv = [0 as libc::c_int; 2];
+            // SAFETY: `sv` is a valid 2-element array for socketpair.
+            let rc = unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    sv.as_mut_ptr(),
+                )
+            };
+            assert_eq!(rc, 0, "socketpair: {}", super::Errno::last());
+            // SAFETY: fresh owned fds from socketpair.
+            unsafe {
+                (
+                    crate::fd::owned_from_raw(sv[0]),
+                    crate::fd::owned_from_raw(sv[1]),
+                )
+            }
+        }
+
+        let (parent, child) = pair();
+        super::reply(child.as_raw_fd(), 0).expect("the child says it is up");
+        assert_eq!(
+            super::recv_reply(parent.as_raw_fd()),
+            Ok(0),
+            "a ready child hands the parent its datagram"
+        );
+
+        let (parent, child) = pair();
+        drop(child); // the child exited in `tidy_child_fds`
+        assert_eq!(
+            super::recv_reply(parent.as_raw_fd()),
+            Err(super::Errno::ECONNRESET),
+            "a dead child must reach `spawn` as broker death, not as a \
+             handle whose mint capabilities are already gone"
+        );
     }
 
     /// A repeated gid must not buy the no-impersonation fast path.

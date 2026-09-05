@@ -558,10 +558,10 @@ Do not reopen these without a reason that is new.
 
 - **`SingleFlight`'s `get_or_try_init` fails closed on a poisoned map because
   of *where* the first acquisition sits, not because its poison handling is
-  uniform.** It is not uniform: of the four map acquisitions in that function,
-  `:67` and `:90` use `map_err(|_| Errno::EIO)?` while `:101` and `:115` use
-  `if let Ok(mut live)`, which swallows poison - and `invalidate`, `clear` and
-  `len` swallow it too. What makes the whole thing safe is that `:67` is the
+  uniform.** It is not uniform: of the three map acquisitions in that
+  function, `:67` and `:90` use `map_err(|_| Errno::EIO)?` while `:101` - the
+  failed mint's eviction - uses `if let Ok(mut live)`, which swallows poison,
+  and `invalidate`, `clear` and `len` swallow it too. What makes the whole thing safe is that `:67` is the
   **first** acquisition and precedes the cache-hit fast path at `:73`, so a
   poisoned `live` fails every `acquire` before a stale identity can be served.
   That is an ordering property. **Hoisting the fast path above the `:67` lock
@@ -790,6 +790,10 @@ Before reporting anything done:
 cargo fmt --all --check
 cargo fmt --all --check --manifest-path fuzz/Cargo.toml   # its own workspace
 cargo clippy --all-features --all-targets -- -D warnings
+# And again in release: clippy builds with `debug_assertions` on, so the
+# `cfg(not(debug_assertions))` half of every `debug_assert` guard is not
+# compiled by the line above and never linted.
+cargo clippy --release --all-features --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 cargo test --all-features --no-fail-fast
 cargo test --release --all-features --no-fail-fast   # the guards that ship
@@ -798,11 +802,18 @@ cargo test --release --all-features --no-fail-fast   # the guards that ship
 # asserted. A libtest filter that matches nothing exits 0, so a
 # mistyped --cfg reads as a green lane; the count (ci.yml's MODELS -
 # keep the two in step) is the tripwire. The old three-subset form
-# asserted nothing and measured 3/22/5 models against the lane's 24.
-.github/workflows/scripts/counted-cargo-test.sh 24 loom -- \
+# asserted nothing and measured 3/22/5 models against a lane that ran
+# every one of them.
+.github/workflows/scripts/counted-cargo-test.sh 25 loom -- \
   env RUSTFLAGS="--cfg loom" cargo test --lib --all-features loom_
 
 (cd fuzz && cargo +nightly fuzz build)
+
+# The MSRV `Cargo.toml` declares, which every other step here misses:
+# they all run on the default toolchain. `ci.yml` reads the version out
+# of the manifest so the two cannot drift.
+cargo "+$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" \
+  check --all-features --all-targets
 
 # No feature at all: the only step that proves the crate compiles with
 # every gate off. `ci.yml` runs it as its own matrix cell.
