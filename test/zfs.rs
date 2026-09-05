@@ -432,6 +432,21 @@ fn a_readonly_flag_is_fchmod_shaped_for_the_descriptor_holding_it() {
     // SAFETY: unmapping the mapping created above.
     unsafe { libc::munmap(private, 4) };
 
+    // A trusted.* xattr still lands: `xattr_permission`'s trusted branch
+    // is `CAP_SYS_ADMIN` alone, with no inode write check (`fs/xattr.c`),
+    // and the flag's own deny is `WRITE_MASK_DATA` through `zfs_zaccess`,
+    // which a trusted write never consults. The S3 front re-stamps a
+    // superseded predecessor's index record while that predecessor is
+    // READONLY, so this is load-bearing, not a curiosity.
+    {
+        use truenas_ros::sync_fs::xattr::{XattrFlags, fsetxattr};
+        fsetxattr(f.as_fd(), "trusted.rostest_ro", b"v", XattrFlags::empty())
+            .expect(
+                "trusted.* must survive READONLY - the restamp depends \
+                     on it",
+            );
+    }
+
     // Deletion needs no clearing: READONLY guards data, not names. This is
     // why DeleteObject carries no unlatch step.
     std::fs::remove_file(&path)
