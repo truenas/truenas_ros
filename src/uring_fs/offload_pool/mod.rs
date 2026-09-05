@@ -49,6 +49,14 @@ impl Default for OffloadBounds {
 /// on the worker's own thread, never sent.
 pub(crate) type Job = Box<dyn FnOnce() + Send>;
 
+/// Ceiling on the pool's own thread count. Not a kernel limit - a sanity
+/// bound, since every one of these is a real OS thread, spawned by one
+/// reactor and on the reactor thread, for work that has no io_uring opcode.
+///
+/// Lives here rather than in a host's config so **both** hosts screen against
+/// the same number: `net`'s `ServerConfig::validate` and `UringFs::check`.
+pub(crate) const MAX_OFFLOAD_THREADS: usize = 1024;
+
 /// Growth is rate-limited to at most one new worker per this interval, so a
 /// burst of microsecond-fast jobs that momentarily saturates the pool does not
 /// spawn a thread per job; sustained blocking work still grows to the ceiling.

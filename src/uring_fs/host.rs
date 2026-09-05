@@ -7,6 +7,7 @@ use super::core::{
     FsCore, FsWaiter, TAG_CANCEL, TAG_WAKE, deliver_embedded,
     deliver_pool_completions,
 };
+use super::offload_pool::MAX_OFFLOAD_THREADS;
 use super::{
     FsHandle, FsInject, FsOutcome, OffloadBounds, Personality, PrivilegedXattrs,
 };
@@ -77,8 +78,10 @@ pub struct FsConfig {
     pub entries: u32,
     /// Op-table slots - the maximum number of concurrently in-flight
     /// operations, and the ceiling a fan-out actually hits: submitting past
-    /// it fails `EBUSY` however deep the ring is. Plain heap at ~180 bytes a
-    /// slot, so this is the cheap axis to raise.
+    /// it fails `EBUSY` however deep the ring is. Plain heap at 272 bytes a
+    /// slot, 280 under `net-server` (pinned by `core::op_entry_size`), so
+    /// this is the cheap axis to raise - and see the type docs, which work
+    /// the default's resident cost out of the same figure.
     pub ops: u32,
     /// Sizing for the blocking-offload pool that backs `FsConn::offload` and
     /// the hybrid lister. Per ring; see [`OffloadBounds`].
@@ -200,6 +203,22 @@ impl UringFs {
             return Err(crate::Error::Validation(
                 "FsConfig::entries must be at least 4".into(),
             ));
+        }
+        // Both offload bounds are real OS threads, and `floor` spawns
+        // eagerly on the reactor thread at first use (`WorkerPool::new`
+        // loops over it), so an absurd value is a thread storm inside one
+        // `offload` call rather than a bad number in a struct. `net`'s
+        // `ServerConfig::validate` screens its own pair against this same
+        // constant; this is the standalone host's half of it. The pool's
+        // documented normalisation - `floor` at least 1, `ceiling` raised
+        // to `floor` - is not second-guessed here: an inverted pair is
+        // legal and says what it means.
+        let widest = cfg.offload.floor.max(cfg.offload.ceiling);
+        if widest > MAX_OFFLOAD_THREADS {
+            return Err(crate::Error::Validation(format!(
+                "FsConfig::offload asks for {widest} worker threads; the \
+                 pool is bounded at {MAX_OFFLOAD_THREADS}"
+            )));
         }
         Ok(())
     }
@@ -589,6 +608,43 @@ mod tests {
             ),
             "a submission ring below the floor is refused"
         );
+    }
+
+    /// The offload bounds are OS threads spawned on the reactor thread at
+    /// first use, so they are screened at construction like every other
+    /// sizing knob - the rule `net`'s `ServerConfig::validate` already held
+    /// for the same pair, against the same constant.
+    ///
+    /// Never submits anything: the pool is lazy, so the screen is what is
+    /// under test and no thread is spawned either way.
+    #[test]
+    fn offload_bounds_past_the_thread_cap_are_refused() {
+        for (floor, ceiling) in [
+            (MAX_OFFLOAD_THREADS + 1, MAX_OFFLOAD_THREADS + 1),
+            // The floor is the eager half, so it is screened on its own.
+            (usize::MAX, 1),
+            (1, usize::MAX),
+        ] {
+            let storm = FsConfig {
+                offload: crate::uring_fs::OffloadBounds {
+                    floor,
+                    ceiling,
+                    ..crate::uring_fs::OffloadBounds::default()
+                },
+                entries: 8,
+                ops: 8,
+                ..FsConfig::default()
+            };
+            match UringFs::new(storm) {
+                Err(crate::Error::Validation(_)) => {}
+                Err(crate::Error::Errno(e)) if skip_unavailable(e) => {}
+                Err(e) => panic!("UringFs::new({floor}..={ceiling}): {e}"),
+                Ok(_fs) => panic!(
+                    "accepted {floor}..={ceiling} worker threads; the first \
+                     offload spawns them on the reactor thread"
+                ),
+            }
+        }
     }
 
     /// A refusal queued in the stop window is delivered by the teardown,
