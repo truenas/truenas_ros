@@ -79,13 +79,16 @@
 //! own default message cap (raise them in step; see
 //! [`HttpConfig::min_request_bytes`]).
 //!
-//! A body can instead be **streamed** ([`protocol_streaming`]), where none
-//! of those caps apply: the body is never held, so the bound is the one the
-//! builder supplies - measured as each chunk is declared for chunked, and
-//! against the declared length for `Content-Length`. A known-length body at
-//! or under one window still arrives whole (one pool-buffered delivery is
-//! already its cheapest form); above that it streams exactly as chunked
-//! does.
+//! A body can instead be **streamed** ([`protocol_streaming`]), where
+//! [`HttpConfig::max_body`] no longer bounds the bodies it streams: one of
+//! those is never held, so the bound is the one the builder supplies --
+//! measured as each chunk is declared for chunked, and against the declared
+//! length for `Content-Length`. A known-length body at or under one window
+//! still arrives whole (one pool-buffered delivery is already its cheapest
+//! form); above that it streams exactly as chunked does. That whole delivery
+//! *is* buffered, so `max_body` still governs it - a `max_body` below one
+//! window refuses bodies well inside the streaming cap, and the two are set
+//! in step.
 //!
 //! Chunked is not optional for an S3 front: verified by wire capture
 //! (boto3 1.37.9, 2026-08-07), the default modern SDK PUTs over TLS with
