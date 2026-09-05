@@ -244,14 +244,16 @@ pub fn copytree_reporting(
     //
     // A group-or-other bit is also how a *borrowed* root is recognised: one
     // this copy created is 0o700 at most, since umask can only narrow it. A
-    // borrowed root's mode has to go back if the copy does not finish, and
-    // only the success path restores one - `finish_dir` stamps the source
-    // root's mode from the root frame, reached only after the walk
-    // completes, so every `?` on the way out left a directory this copy did
-    // not create at 0o700 with the original recorded nowhere for the caller
-    // to put back either. On a share or system-dataset migration that locks
-    // every non-owner identity out of the destination, and the returned
-    // error names no permission change.
+    // borrowed root's mode has to go back, and the walk itself puts one
+    // back on exactly one condition: `finish_dir` -> `copy_metadata` ->
+    // `copy_permissions` stamps the *source* root's mode, under
+    // `CopyFlags::PERMISSIONS` and from the root frame, which is reached
+    // only after the walk completes. So both a `?` on the way out and a
+    // clean finish without that flag leave a directory this copy did not
+    // create at 0o700 - locking every non-owner identity out of a share or
+    // system-dataset migration, with the original recorded nowhere for the
+    // caller to put back and nothing in the result saying so. Both are
+    // restored below.
     let mut borrowed = None;
     if dst_self_st.mode() & 0o077 != 0 {
         borrowed = Some((
@@ -307,6 +309,16 @@ pub fn copytree_reporting(
             let _ = ok_if_acl_governed(fchmod_fd(fd.as_fd(), mode));
         }
         return Err(e);
+    }
+    // The copy finished. Put the borrowed root's mode back unless the walk
+    // has already stamped one over it, and surface a failure to: unlike the
+    // error path above there is nothing else to report, and a caller told
+    // its copy succeeded would otherwise never learn the destination is
+    // still owner-only.
+    if let Some((fd, mode)) = borrowed
+        && !config.flags.contains(CopyFlags::PERMISSIONS)
+    {
+        ok_if_acl_governed(fchmod_fd(fd.as_fd(), mode))?;
     }
 
     progress(&CopyTreeProgress {
