@@ -194,9 +194,23 @@ where
             // frees it (dropping the pending `U`). The connect established
             // (TCP up), so force the FIN out.
             let gen64 = self.core.table.generation(slot);
+            // The errno the kernel gave, on the same grounds as the dup
+            // below: `FIXED_FD_INSTALL` is the one op on this path that
+            // charges the *process* fd table (`io_install_fixed_fd` ->
+            // `receive_fd` -> `get_unused_fd_flags`, fs/file.c:1367),
+            // where the registered-slot accept that produced the socket
+            // charges nothing - so `EMFILE` arrives here and nowhere
+            // else, and answering `ECONNABORTED` for it told the consumer
+            // the peer had gone. A teardown cancellation is not a
+            // descriptor failure and keeps the answer it always gave.
+            let err = if res == -libc::ECANCELED {
+                Errno::ECONNABORTED
+            } else {
+                Errno::from_raw(-res)
+            };
             self.events.push_back(Event::ConnectFailed {
                 conn: ConnId::new(slot, gen64),
-                err: Errno::ECONNABORTED,
+                err,
             });
             return self.core.submit_teardown(slot, generation, true);
         }
