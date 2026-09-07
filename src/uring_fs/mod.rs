@@ -188,8 +188,18 @@
 //! not to traverse every directory above it, opt in with [`Caps`] - allowed
 //! by a ceiling fixed at [`CredBroker::spawn_with_caps`], before the
 //! privilege drop, so nothing that happens to the reactor afterwards can
-//! widen it. Read [`Caps::DAC_READ_SEARCH`] first: it is a whole-filesystem
-//! read grant, not a traverse-only one, and Linux offers nothing narrower.
+//! widen it.
+//!
+//! Read the entry for whichever bit you are reaching for before reaching for
+//! it; none of them is narrow. [`Caps::DAC_READ_SEARCH`] is a
+//! whole-filesystem *read* grant, not a traverse-only one, and Linux offers
+//! nothing narrower on that axis. [`Caps::DAC_OVERRIDE`] adds write, and on
+//! ZFS the `chmod` and ACL rewrite with it. [`Caps::FOWNER`] adds
+//! delete-past-a-denial. Either can change ownership where the ACL is
+//! non-trivial. The last two are defensible only where every path op is
+//! confined
+//! (`RESOLVE_BENEATH`), because they bound what may be done *within* a tree
+//! and say nothing about *which* tree.
 //!
 //! # Embedding in another host
 //!
