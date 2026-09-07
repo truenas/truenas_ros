@@ -8,7 +8,12 @@
 //! fixtures). When no such dataset is present the test **skips**, so the suite
 //! stays green in an unprivileged sandbox and only does real work in CI (see
 //! `.github/workflows/scripts/setup-test-zfs.sh`).
-#![cfg(all(target_os = "linux", feature = "acl"))]
+#![cfg(all(
+    target_os = "linux",
+    feature = "acl",
+    feature = "xattr",
+    feature = "sync-fs"
+))]
 
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
