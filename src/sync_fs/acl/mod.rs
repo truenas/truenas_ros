@@ -143,8 +143,7 @@ pub fn validate_acl(target: AclTarget<'_>, acl: &Acl) -> Result<()> {
 /// grants nobody anything, which is what a caller that filtered an ACL down
 /// to nothing would mean by it: the kernel leaves `kvalue` NULL for a
 /// zero-length `setxattr` (`setxattr_copy`, `fs/xattr.c:655-669`), and ZFS
-/// reads `(NULL, 0)` as the strip signal (`__zpl_xattr_nfs41acl_set` ->
-/// `zfs_stripacl`, `module/os/linux/zfs/zpl_xattr.c`). So the object would
+/// reads `(NULL, 0)` as the signal to strip the ACL. So the object would
 /// silently revert to mode-only permissions - the opposite of denying
 /// everyone. Removal has its own spelling, [`fsetacl`] with `None`.
 pub fn fsetacl_nfs4<Fd: AsFd>(fd: Fd, data: &[u8]) -> Result<()> {

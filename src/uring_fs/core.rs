@@ -2354,9 +2354,8 @@ impl FsCore {
         // saw `Ok(n)` the unwritten bytes could hold another connection's
         // request, so a retry from them writes someone else's data and a
         // shrug stores a truncated object. ZFS makes the case real: a
-        // partial write returns its count with no error, by design
-        // (`zfs_write`, `module/zfs/zfs_vnops.c:1085-1094` - "it's at least
-        // a partial write, so it's successful"). The copy path stays
+        // partial write returns its count with no error, by design. The
+        // copy path stays
         // retryable (`FsDone::into_bufs` hands the source back), which is
         // the one honest asymmetry between the two.
         #[cfg(feature = "net-server")]
@@ -3548,9 +3547,8 @@ impl<'a> FsConn<'a> {
     /// surfaced as `Err(EIO)` rather than as an `Ok(n)` inviting one.
     ///
     /// The `EIO` carries no cause because none is knowable at this
-    /// completion: ZFS discards the breaking errno once
-    /// any progress was made (`zfs_write`, `module/zfs/zfs_vnops.c:1085-1094`
-    /// returns the partial count with no error), and io_uring folds a
+    /// completion: ZFS discards the breaking errno once any progress was
+    /// made, returning the partial count with no error, and io_uring folds a
     /// post-progress errno into the positive count the same way
     /// (`io_fixup_rw_res`, `io_uring/rw.c:563-574`) - so mapping the short
     /// write to `ENOSPC` or `EDQUOT` would be a guess. A consumer that must
@@ -6656,8 +6654,7 @@ mod routing_fuzz {
     /// the time any caller could react, so `Ok(n)` would invite a retry
     /// from bytes that may hold another connection's request - and a
     /// caller that shrugged would store a truncated object. ZFS returns
-    /// partial writes as successes by design (`zfs_write`,
-    /// `module/zfs/zfs_vnops.c:1085-1094`), so the case is real, and the
+    /// partial writes as successes by design, so the case is real, and the
     /// reap is the one place that still knows both the asked-for and the
     /// written count.
     #[cfg(feature = "net-server")]
