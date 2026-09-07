@@ -198,28 +198,17 @@ tn_bitflags! {
         ///   same file still fails `EACCES`. Surprising, and load-bearing.
         /// - **Never** grants execute, any write, or a way past a read-only
         ///   mount, an immutable flag, or LSM policy.
-        /// - **On ZFS with NFSv4 ACLs it overrides an explicit DENY entry**,
-        ///   at two independent layers. `zpl_permission` short-circuits on
-        ///   the capability *before the ACL is read at all*
-        ///   (`module/os/linux/zfs/zpl_xattr.c`, "Skip reading ACL if
-        ///   requested permissions are fully satisfied by capabilities"), and
-        ///   the slower `zfs_zaccess` path reaches
-        ///   `secpolicy_vnode_access2` (`module/os/linux/zfs/policy.c`),
-        ///   which reimplements the same directory/file rules as the VFS. An
-        ///   NFSv4 `deny` ACE is not a boundary against this capability.
-        /// - **It does not grant delete.** An explicit `ACE_DELETE` /
-        ///   `ACE_DELETE_CHILD` denial bottoms out in
-        ///   `secpolicy_vnode_remove`, which wants `CAP_FOWNER`
-        ///   (`module/os/linux/zfs/zfs_acl.c`). Nor does it defeat the
-        ///   dataset-level refusals - read-only, `ZFS_IMMUTABLE`,
-        ///   `ZFS_NOUNLINK`, quarantine - which clear `check_privs` and so
-        ///   never reach a capability check at all.
-        /// - **Namespace caveat.** ZFS's fast path uses a bare `capable()`
-        ///   (init user namespace), where the VFS uses
-        ///   `capable_wrt_inode_uidgid` (the inode's namespace, plus a
-        ///   uid/gid mapping check re-run per path component). The two agree
-        ///   for a reactor in the initial namespace, which is the only
-        ///   supported configuration today; they would diverge under an
+        /// - **On ZFS with NFSv4 ACLs it overrides an explicit DENY
+        ///   entry.** A `deny` ACE is not a boundary against this
+        ///   capability.
+        /// - **It does not grant delete**, and it does not defeat a
+        ///   read-only dataset, `ZFS_IMMUTABLE`, `ZFS_NOUNLINK` or
+        ///   quarantine, which are refused before any capability is
+        ///   consulted.
+        /// - **Namespace caveat.** ZFS tests the capability in the initial
+        ///   user namespace where the VFS tests it against the inode's. The
+        ///   two agree for a reactor in the initial namespace, which is the
+        ///   only supported configuration today; they would diverge under an
         ///   idmapped mount (see [`crate::mount::idmap`]).
         /// - It also satisfies the `linkat(AT_EMPTY_PATH)` check
         ///   (`fs/namei.c:2632`), so a personality holding it can publish an
@@ -241,13 +230,13 @@ tn_bitflags! {
         /// filesystem's, decides an operation. On ZFS with NFSv4 ACLs it
         /// grants a directory unconditionally - create, unlink and rename
         /// succeed past an explicit DENY ACE - and a regular file read,
-        /// write, and execute wherever the mode carries any execute bit,
-        /// deciding before the ACL is read (`zpl_permission`,
-        /// `module/os/linux/zfs/zpl_xattr.c:1546-1557`). It also answers the
-        /// NFSv4 `chmod`/`chown` retry (`fs/attr.c:188-196`, `:229-236`), so
-        /// it rewrites a mode or ACL it does not own and, where the ACL is
-        /// non-trivial, changes the owner - see [`Caps::FOWNER`] on why an
-        /// ownership change is the one that lasts.
+        /// write, and execute wherever the mode carries any execute bit -
+        /// deciding before the ACL is read at all. It also answers the NFSv4
+        /// `chmod`/`chown` retry the VFS makes when its own owner test fails
+        /// (`fs/attr.c:188-196`, `:229-236`), so it rewrites a mode or ACL it
+        /// does not own and, where the ACL is non-trivial, changes the owner
+        /// - see [`Caps::FOWNER`] on why an ownership change is the one that
+        /// lasts.
         ///
         /// It does not defeat a DENY `ACE_DELETE` (that is
         /// [`Caps::FOWNER`]), nor a read-only dataset, `ZFS_IMMUTABLE`,
@@ -273,14 +262,12 @@ tn_bitflags! {
         /// Granted alongside [`Caps::DAC_OVERRIDE`] to a service that must
         /// complete an operation the filesystem's owner checks would refuse.
         /// It grants `chmod` and ACL rewrite, and on a file whose NFSv4 ACL
-        /// is non-trivial it grants `chown` - note that ZFS asks for this
-        /// bit there, not `CAP_CHOWN` (`secpolicy_vnode_chown`,
-        /// `module/os/linux/zfs/policy.c:205`).
+        /// is non-trivial it grants `chown` - note that it is this bit ZFS
+        /// asks for there, not `CAP_CHOWN`.
         ///
         /// What it adds over [`Caps::DAC_OVERRIDE`], which reaches `chmod`
         /// and `chown` by its own route, is **delete past an explicit DENY
-        /// `ACE_DELETE`**: that bottoms out in `secpolicy_vnode_remove`
-        /// (`policy.c:222-225`), which nothing else in this type satisfies.
+        /// `ACE_DELETE`**, which nothing else in this type satisfies.
         /// It does not defeat a read-only dataset, `ZFS_IMMUTABLE`,
         /// `ZFS_NOUNLINK` or quarantine, and it does not widen
         /// [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs), which is

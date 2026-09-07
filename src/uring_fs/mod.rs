@@ -949,11 +949,10 @@ impl PrivilegedXattrs {
 
 /// Cache advice for [`FsHandle::fadvise`] - the `POSIX_FADV_*` values.
 ///
-/// On ZFS these are not page-cache-only hints: `zpl_fadvise`
-/// (`module/os/linux/zfs/zpl_file.c`) maps [`WillNeed`](Self::WillNeed) to a
-/// `dmu_prefetch` into the ARC and [`DontNeed`](Self::DontNeed) to a
-/// `dmu_evict_range` out of it, on top of the generic page-cache handling. So
-/// this is the API that reaches the cache that actually matters here.
+/// On ZFS these are not page-cache-only hints: [`WillNeed`](Self::WillNeed)
+/// prefetches into the ARC and [`DontNeed`](Self::DontNeed) evicts from it,
+/// on top of the generic page-cache handling. So this is the API that
+/// reaches the cache that actually matters here.
 ///
 /// It has no `preadv2`/`pwritev2` equivalent. [`RwFlags::RWF_DONTCACHE`] would
 /// cover the drop half more cheaply - no second syscall, no window where the

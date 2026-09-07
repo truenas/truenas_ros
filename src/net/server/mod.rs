@@ -149,9 +149,8 @@
 //! (a second hop, and a pipe per in-flight response), and over kTLS - the
 //! appliance default - encryption copies the plaintext into record buffers
 //! regardless, so the bounded-buffer copy is the mechanism's whole cost.
-//! On ZFS every one of these reads is punted to an io-wq worker
-//! (`zpl_file.c` sets neither `FMODE_NOWAIT` nor `FMODE_BUF_RASYNC`), which
-//! is why the per-connection pipeline depth is fixed at two and the chunk
+//! On ZFS every one of these reads is punted to an io-wq worker, which is
+//! why the per-connection pipeline depth is fixed at two and the chunk
 //! *size* is the knob; it is the count of connections mid-body that
 //! multiplies the load on that bounded worker class, and `pool_size` bounds
 //! it.

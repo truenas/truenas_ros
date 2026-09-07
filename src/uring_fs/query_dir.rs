@@ -104,8 +104,8 @@ bitflags! {
         /// `system.nfs4_acl_xdr`).
         ///
         /// On an `acltype=nfsv4` dataset ZFS lists `system.nfs4_acl_xdr` only
-        /// when the ACL is **not** trivial (`zpl_xattr_list`), and almost every
-        /// object carries a trivial one - so discovery alone is not a reliable
+        /// when the ACL is **not** trivial, and almost every object carries
+        /// a trivial one - so discovery alone is not a reliable
         /// way to pick ACLs up. Ask for [`EnrichSpec::ACL`] instead, which
         /// fetches [`QueryOptions::acl_name`] directly.
         const SYSTEM = 0b1000;
@@ -1476,13 +1476,9 @@ impl CopyHandle {
 /// A ceiling the kernel imposes on one `copy_file_range(2)`, not a chunk
 /// size this crate chose: the whole remaining range is offered on every
 /// call, and the loop below exists to re-issue what a short return left
-/// behind. Splitting a copy smaller than this would re-enter
-/// `zfs_clone_range` per piece — retaking both rangelocks and every
-/// property and alignment check — and would cost the clone outright, since
-/// the destination's rangelock is promoted to whole-file only while
-/// `z_size <= z_blksz` (`/CODE/zfs`, `module/os/linux/zfs/zfs_znode_os.c`),
-/// which is its first write and the one that grows the blocksize to the
-/// source's.
+/// behind. Splitting a copy smaller than this costs the clone outright on
+/// ZFS, which can only take the whole-file lock a clone needs while the
+/// destination is still empty - that is, on the first write.
 const MAX_CHUNK: usize = 0x7FFF_FFFF & !0xFFF;
 
 /// Copy `len` bytes from `src[off_src..]` to `dst[off_dst..]`, letting the
@@ -1494,17 +1490,13 @@ const MAX_CHUNK: usize = 0x7FFF_FFFF & !0xFFF;
 /// moves no data takes filesystem locks and can wait on dirty data, so
 /// there is no fast path that may run on the loop.
 ///
-/// **The clone is the kernel's, not an ioctl's.** `zpl_copy_file_range`
-/// tries `zfs_clone_range` first and falls back to a byte copy itself
-/// (`/CODE/zfs`, `module/os/linux/zfs/zpl_file.c`), so `copy_file_range(2)`
-/// is already clone-first and an explicit `FICLONERANGE` buys nothing. It
-/// costs: the ioctl refuses a range it can only partly clone rather than
-/// returning it short, and it refuses *after* `zfs_bclone_wait_dirty` has
-/// waited a transaction group for the source to sync - which this fork does
-/// by default (`zfs_vnops.c`, `int zfs_bclone_wait_dirty = 1`, and required
-/// by deployments that clone what they have just written). Trying the ioctl
-/// first therefore pays that wait, throws the answer away, and pays it again
-/// in the fallback.
+/// **The clone is the kernel's, not an ioctl's.** On ZFS
+/// `copy_file_range(2)` already tries a clone and falls back to a byte copy
+/// itself, so an explicit `FICLONERANGE` buys nothing and costs: the ioctl
+/// refuses a range it can only partly clone rather than returning it short,
+/// and it refuses only after waiting a transaction group for the source to
+/// sync. Trying it first pays that wait, throws the answer away, and pays it
+/// again in the fallback.
 ///
 /// Needs no [`Personality`]: both endpoints are already-open [`File`]s, and
 /// the kernel authorizes the copy from *their* open modes - which were
