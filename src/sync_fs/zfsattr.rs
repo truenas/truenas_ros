@@ -70,9 +70,10 @@ tn_bitflags! {
         /// attribute - while NFS has no surface to clear it at all. The
         /// one unconditional refusal is a new shared-writable mmap,
         /// denied on every dataset flavor with no privilege fallback.
-        /// Invisible to `statx` and `lsattr`, so a
-        /// refused write presents as a bare `EPERM` on a file whose
-        /// mode looks writable.
+        /// Invisible to `statx` and `lsattr`, so a refused write presents
+        /// as a bare `EACCES` on a file whose mode looks writable - the
+        /// fallback re-decides the errno, and `EPERM` is what `IMMUTABLE`
+        /// answers, refused by the VFS before ZFS is consulted.
         READONLY = 0x0000_0001_0000_0000;
         /// HIDDEN DOS attribute - hides the file from SMB clients.
         HIDDEN = 0x0000_0002_0000_0000;

@@ -546,20 +546,19 @@ fn a_readonly_inode_gains_and_loses_names_freely() {
 
 /// Where the flag actually denies, and where it documentedly does not.
 ///
-/// The deny lives in `zfs_zaccess_common`, and `zpl_permission` forwards an
-/// ordinary open-for-write there only on an `acltype=nfsv4` dataset whose
-/// file carries a **non-trivial** ACL - everything else short-circuits to
-/// `generic_permission`, which reads the mode (`zpl_xattr.c`, the
-/// `GENERIC_MASK` bail). That scope is the platform contract the S3 front
-/// documents ("NFSv4 required"), and this test is the contract in
-/// executable form: the nfsv4 half proves the deny where it is promised,
-/// and the posix half proves the gap where it is documented.
+/// An ordinary open-for-write is asked of ZFS at all only on an
+/// `acltype=nfsv4` dataset whose file carries a **non-trivial** ACL;
+/// everything else is answered from the mode alone. That scope is the
+/// platform contract the S3 front documents ("NFSv4 required"), and this
+/// test is the contract in executable form: the nfsv4 half proves the deny
+/// where it is promised, and the posix half proves the gap where it is
+/// documented.
 ///
 /// **A red on either half is the platform moving, not this test rotting.**
 /// If the posix half's open starts failing, or the root open below starts
-/// failing, the fork has grown enforcement (the `zpl_permission` hardening
-/// the design note names) - update `ZfsAttr::READONLY`'s rustdoc and the
-/// S3 front's requirement documentation to match, then the assertions.
+/// failing, the fork has grown enforcement - update `ZfsAttr::READONLY`'s
+/// rustdoc and the S3 front's requirement documentation to match, then the
+/// assertions.
 #[test]
 fn readonly_denies_a_fresh_writer_exactly_where_documented() {
     // --- the enforced half: acltype=nfsv4, non-trivial ACL ---------------
@@ -578,9 +577,9 @@ fn readonly_denies_a_fresh_writer_exactly_where_documented() {
     };
 
     // Grant `nobody` write through the ACL - a named-user ACE, which also
-    // forces the ACL non-trivial, which is what routes the next open past
-    // the `GENERIC_MASK` bail and into `zfs_zaccess` at all. Asserted, not
-    // hoped: `trivial()` is the same verdict the kernel short-circuits on.
+    // forces the ACL non-trivial, which is what gets the next open asked of
+    // ZFS at all. Asserted, not hoped: `trivial()` is the same verdict the
+    // kernel short-circuits on.
     let mut aces = acl.aces.clone();
     aces.push(Nfs4Ace::new(
         Nfs4AceType::Allow,
@@ -609,16 +608,19 @@ fn readonly_denies_a_fresh_writer_exactly_where_documented() {
 
     add_zfs_attrs(&f, ZfsAttr::READONLY);
 
+    // EACCES, not EPERM: the flag's own refusal is internal, and the
+    // privilege fallback that runs after it re-decides the errno - denying
+    // an unprivileged caller as EACCES. `IMMUTABLE` is the one that answers
+    // EPERM, because the VFS refuses it before ZFS is consulted at all.
     assert_eq!(
         open_for_write_as_nobody(&path),
-        Err(libc::EPERM),
+        Err(libc::EACCES),
         "READONLY must deny a fresh unprivileged writer on the enforced \
-         path, and as EPERM - the zfs_zaccess_common verdict - not EACCES"
+         path"
     );
 
-    // Root passes: the privilege fallback (`secpolicy_vnode_access2`) runs
-    // after the flag's EPERM. Pinned so a fork hardening announces itself
-    // here rather than in a fleet's backup scripts.
+    // Root passes on that same fallback. Pinned so a fork hardening
+    // announces itself here rather than in a fleet's backup scripts.
     std::fs::OpenOptions::new()
         .write(true)
         .open(&path)
@@ -635,9 +637,9 @@ fn readonly_denies_a_fresh_writer_exactly_where_documented() {
         let _ = std::fs::remove_file(&ppath);
         return skip("the POSIX dataset path does not answer ZFS ioctls");
     }
-    // World-writable by mode, then flagged. On a posixacl dataset
-    // `zpl_permission` never consults ZFS for a plain MAY_WRITE, so the
-    // flag holds no one - the gap "NFSv4 required" exists to document.
+    // World-writable by mode, then flagged. On a posixacl dataset a plain
+    // write check never reaches ZFS, so the flag holds no one - the gap
+    // "NFSv4 required" exists to document.
     let mut perms = std::fs::metadata(&ppath).expect("stat").permissions();
     use std::os::unix::fs::PermissionsExt;
     perms.set_mode(0o666);
