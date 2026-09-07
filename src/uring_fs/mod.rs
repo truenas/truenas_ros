@@ -188,18 +188,8 @@
 //! not to traverse every directory above it, opt in with [`Caps`] - allowed
 //! by a ceiling fixed at [`CredBroker::spawn_with_caps`], before the
 //! privilege drop, so nothing that happens to the reactor afterwards can
-//! widen it.
-//!
-//! Read the entry for whichever bit you are reaching for before reaching for
-//! it; none of them is narrow. [`Caps::DAC_READ_SEARCH`] is a
-//! whole-filesystem *read* grant, not a traverse-only one, and Linux offers
-//! nothing narrower on that axis. [`Caps::DAC_OVERRIDE`] adds write, and on
-//! ZFS the `chmod` and ACL rewrite with it. [`Caps::FOWNER`] adds
-//! delete-past-a-denial. Either can change ownership where the ACL is
-//! non-trivial. The last two are defensible only where every path op is
-//! confined
-//! (`RESOLVE_BENEATH`), because they bound what may be done *within* a tree
-//! and say nothing about *which* tree.
+//! widen it. Read [`Caps::DAC_READ_SEARCH`] first: it is a whole-filesystem
+//! read grant, not a traverse-only one, and Linux offers nothing narrower.
 //!
 //! # Embedding in another host
 //!
@@ -949,10 +939,11 @@ impl PrivilegedXattrs {
 
 /// Cache advice for [`FsHandle::fadvise`] - the `POSIX_FADV_*` values.
 ///
-/// On ZFS these are not page-cache-only hints: [`WillNeed`](Self::WillNeed)
-/// prefetches into the ARC and [`DontNeed`](Self::DontNeed) evicts from it,
-/// on top of the generic page-cache handling. So this is the API that
-/// reaches the cache that actually matters here.
+/// On ZFS these are not page-cache-only hints: `zpl_fadvise`
+/// (`module/os/linux/zfs/zpl_file.c`) maps [`WillNeed`](Self::WillNeed) to a
+/// `dmu_prefetch` into the ARC and [`DontNeed`](Self::DontNeed) to a
+/// `dmu_evict_range` out of it, on top of the generic page-cache handling. So
+/// this is the API that reaches the cache that actually matters here.
 ///
 /// It has no `preadv2`/`pwritev2` equivalent. [`RwFlags::RWF_DONTCACHE`] would
 /// cover the drop half more cheaply - no second syscall, no window where the

@@ -863,8 +863,9 @@ fn is_dot(name: &OsStr) -> bool {
 /// `STATX_BTIME` clear and `stx_btime` zero, so a bare compare reads every
 /// file as born at the epoch, keeps all of them, and looks exactly like a
 /// cutoff nothing happened to exceed. The caller cannot tell the two apart,
-/// which is why this reports the third case rather than guessing. ZFS
-/// always reports a birth time, so on a dataset `None` never happens.
+/// which is why this reports the third case rather than guessing. ZFS fills
+/// the field unconditionally (`zpl_getattr_impl`, `zpl_inode.c:502`), so on a
+/// dataset `None` never happens.
 fn btime_skips(st: &Statx, cutoff: i64) -> Option<bool> {
     if cutoff == 0 {
         return Some(false);

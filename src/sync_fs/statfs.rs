@@ -17,8 +17,9 @@ use std::os::fd::{AsFd, AsRawFd};
 /// Filesystem statistics for the mount a descriptor lives on.
 ///
 /// Block counts are in units of [`block_size`](Self::block_size), which on ZFS
-/// is the dataset's `recordsize` - **not** a fixed 4096. Take the unit from
-/// this struct rather than assuming one, or the byte figures are wrong by
+/// is the dataset's `recordsize` (`zfsvfs->z_max_blksz`, `zfs_statvfs` in
+/// `module/os/linux/zfs/zfs_vfsops.c`) - **not** a fixed 4096. Take the unit
+/// from this struct rather than assuming one, or the byte figures are wrong by
 /// whatever factor the dataset was tuned to.
 #[derive(Clone, Copy, Debug)]
 pub struct Statfs(libc::statfs);
@@ -43,9 +44,9 @@ impl Statfs {
     ///
     /// On ext4-style filesystems this is smaller than
     /// [`free_blocks`](Self::free_blocks) by the root reservation. **ZFS keeps
-    /// no reservation and sets the two equal**, so code that infers a
-    /// reserve from the difference concludes there is none rather than
-    /// misreporting.
+    /// no reservation and sets the two equal** (`f_bavail = f_bfree`,
+    /// `zfs_vfsops.c`), so code that infers a reserve from the difference
+    /// concludes there is none rather than misreporting.
     pub fn available_blocks(&self) -> u64 {
         self.0.f_bavail
     }
@@ -94,15 +95,19 @@ impl Statfs {
     ///
     /// The halves are `u32` because that is how they are produced: ZFS packs
     /// the objset guid's low 32 bits into `val[0]` and high 32 bits into
-    /// `val[1]`, both written as `uint32_t`, making the one-id recombination
+    /// `val[1]`, both written as `uint32_t` (`zfs_statvfs`,
+    /// `module/os/linux/zfs/zfs_vfsops.c`), making the one-id recombination
     /// `(u64::from(id[1]) << 32) | u64::from(id[0])`. Handing out the
     /// kernel's signed `int` instead would sign-extend a high-bit `val[0]`
     /// across the whole upper word of that expression, so any two
     /// filesystems sharing a low half would collide.
     ///
-    /// The id names the mount for its lifetime, no longer: ZFS reassigns it
-    /// when a dataset opens into an in-core collision, so an export/import
-    /// can change it. State that must recognise a dataset
+    /// The id names the mount for its lifetime, no longer: ZFS derives it
+    /// from `ds_fsid_guid`, "a 56-bit ID that can change to avoid
+    /// collisions" (`include/sys/dsl_dataset.h`), reassigned when a dataset
+    /// opens into an in-core collision (`unique_insert` in
+    /// `dsl_dataset_hold_obj`, `module/zfs/dsl_dataset.c`) - so an
+    /// export/import can change it. State that must recognise a dataset
     /// across mounts should key on the dataset's own guid instead.
     pub fn fsid(&self) -> [u32; 2] {
         const _: () = assert!(

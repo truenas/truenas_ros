@@ -166,22 +166,23 @@ tn_bitflags! {
     /// **The bit values are the kernel's own capability numbers**, so a mask
     /// is exactly the low word of `cap_effective` that the broker installs.
     ///
-    /// # Why these three, and not the rest
+    /// # Why only `DAC_READ_SEARCH`
     ///
     /// As with [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs), the
     /// refusals are the point:
     ///
-    /// - `CAP_CHOWN` changes ownership on any inode of any type on any
-    ///   filesystem. [`Caps::FOWNER`] reaches ownership only through ZFS's
-    ///   NFSv4 path, and only where the ACL is non-trivial.
+    /// - `CAP_DAC_OVERRIDE` bypasses write and execute checks too, so a
+    ///   personality carrying it could create, unlink, and rename anywhere --
+    ///   there is no filesystem state a caller could not reach.
+    /// - `CAP_FOWNER` bypasses the owner check for `chmod`/`chown`/`utimes`
+    ///   and for setting attributes on files the identity does not own.
+    ///   Server-owned metadata already has a narrower answer in
+    ///   `PrivilegedXattrs`.
+    /// - `CAP_CHOWN` would let a caller give away or claim file ownership.
     /// - `CAP_SYS_ADMIN` needs no explanation.
     ///
-    /// The two write-side bits are defensible only where the caller confines
-    /// every path op: they bound what may be done *within* a tree and say
-    /// nothing about *which* tree.
-    ///
-    /// Add one only with the same treatment these get: the precise kernel
-    /// semantics, verified against the source, written down.
+    /// Add one only with the same treatment this one gets: the precise
+    /// kernel semantics, verified against the source, written down.
     pub struct Caps: u32 {
         /// `CAP_DAC_READ_SEARCH` - **read the whole filesystem**.
         ///
@@ -198,17 +199,28 @@ tn_bitflags! {
         ///   same file still fails `EACCES`. Surprising, and load-bearing.
         /// - **Never** grants execute, any write, or a way past a read-only
         ///   mount, an immutable flag, or LSM policy.
-        /// - **On ZFS with NFSv4 ACLs it overrides an explicit DENY
-        ///   entry.** A `deny` ACE is not a boundary against this
-        ///   capability.
-        /// - **It does not grant delete**, and it does not defeat a
-        ///   read-only dataset, `ZFS_IMMUTABLE`, `ZFS_NOUNLINK` or
-        ///   quarantine, which are refused before any capability is
-        ///   consulted.
-        /// - **Namespace caveat.** ZFS tests the capability in the initial
-        ///   user namespace where the VFS tests it against the inode's. The
-        ///   two agree for a reactor in the initial namespace, which is the
-        ///   only supported configuration today; they would diverge under an
+        /// - **On ZFS with NFSv4 ACLs it overrides an explicit DENY entry**,
+        ///   at two independent layers. `zpl_permission` short-circuits on
+        ///   the capability *before the ACL is read at all*
+        ///   (`module/os/linux/zfs/zpl_xattr.c`, "Skip reading ACL if
+        ///   requested permissions are fully satisfied by capabilities"), and
+        ///   the slower `zfs_zaccess` path reaches
+        ///   `secpolicy_vnode_access2` (`module/os/linux/zfs/policy.c`),
+        ///   which reimplements the same directory/file rules as the VFS. An
+        ///   NFSv4 `deny` ACE is not a boundary against this capability.
+        /// - **It does not grant delete.** An explicit `ACE_DELETE` /
+        ///   `ACE_DELETE_CHILD` denial bottoms out in
+        ///   `secpolicy_vnode_remove`, which wants `CAP_FOWNER`
+        ///   (`module/os/linux/zfs/zfs_acl.c`). Nor does it defeat the
+        ///   dataset-level refusals - read-only, `ZFS_IMMUTABLE`,
+        ///   `ZFS_NOUNLINK`, quarantine - which clear `check_privs` and so
+        ///   never reach a capability check at all.
+        /// - **Namespace caveat.** ZFS's fast path uses a bare `capable()`
+        ///   (init user namespace), where the VFS uses
+        ///   `capable_wrt_inode_uidgid` (the inode's namespace, plus a
+        ///   uid/gid mapping check re-run per path component). The two agree
+        ///   for a reactor in the initial namespace, which is the only
+        ///   supported configuration today; they would diverge under an
         ///   idmapped mount (see [`crate::mount::idmap`]).
         /// - It also satisfies the `linkat(AT_EMPTY_PATH)` check
         ///   (`fs/namei.c:2632`), so a personality holding it can publish an
@@ -222,71 +234,6 @@ tn_bitflags! {
         /// read.
         /// (`CAP_DAC_READ_SEARCH` is capability number 2, hence bit 2.)
         DAC_READ_SEARCH = 0x0000_0004;
-
-        /// `CAP_DAC_OVERRIDE` - **read and write the whole filesystem**,
-        /// within whatever the caller's path resolution confines it to.
-        ///
-        /// For a service whose own authorization layer, not the
-        /// filesystem's, decides an operation. On ZFS with NFSv4 ACLs it
-        /// grants a directory unconditionally - create, unlink and rename
-        /// succeed past an explicit DENY ACE - and a regular file read,
-        /// write, and execute wherever the mode carries any execute bit -
-        /// deciding before the ACL is read at all. It also answers the NFSv4
-        /// `chmod`/`chown` retry the VFS makes when its own owner test fails
-        /// (`fs/attr.c:188-196`, `:229-236`), so it rewrites a mode or ACL it
-        /// does not own and, where the ACL is non-trivial, changes the owner
-        /// - see [`Caps::FOWNER`] on why an ownership change is the one that
-        /// lasts.
-        ///
-        /// It does not defeat a DENY `ACE_DELETE` (that is
-        /// [`Caps::FOWNER`]), nor a read-only dataset, `ZFS_IMMUTABLE`,
-        /// `ZFS_NOUNLINK` or quarantine, which are refused before any
-        /// capability is consulted.
-        ///
-        /// # This bit requires confinement, and the requirement is structural
-        ///
-        /// Unconfined, a personality holding this could create, unlink and
-        /// rename anywhere the reactor can name. `RESOLVE_BENEATH` is what
-        /// bounds it, and it is capability-independent - `LOOKUP_BENEATH` is
-        /// an unconditional `-EXDEV` (`fs/namei.c:1045`, `:2108`) with no
-        /// `capable()` in that path. A consumer that resolves every
-        /// user-supplied name from a per-tenant anchor bounds this bit to
-        /// that subtree; one that does not, does not bound it at all.
-        ///
-        /// (`CAP_DAC_OVERRIDE` is capability number 1, hence bit 1.)
-        DAC_OVERRIDE = 0x0000_0002;
-
-        /// `CAP_FOWNER` - **act as the owner of every file**, within
-        /// whatever the caller's path resolution confines it to.
-        ///
-        /// Granted alongside [`Caps::DAC_OVERRIDE`] to a service that must
-        /// complete an operation the filesystem's owner checks would refuse.
-        /// It grants `chmod` and ACL rewrite, and on a file whose NFSv4 ACL
-        /// is non-trivial it grants `chown` - note that it is this bit ZFS
-        /// asks for there, not `CAP_CHOWN`.
-        ///
-        /// What it adds over [`Caps::DAC_OVERRIDE`], which reaches `chmod`
-        /// and `chown` by its own route, is **delete past an explicit DENY
-        /// `ACE_DELETE`**, which nothing else in this type satisfies.
-        /// It does not defeat a read-only dataset, `ZFS_IMMUTABLE`,
-        /// `ZFS_NOUNLINK` or quarantine, and it does not widen
-        /// [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs), which is
-        /// an allowlist checked before the syscall rather than a DAC
-        /// decision.
-        ///
-        /// # An ownership change outlives the request that made it
-        ///
-        /// Written data can be written again; who the filesystem says owns
-        /// it cannot be undone by the next request. A tenant whose own layer
-        /// is authoritative today can leave ownership state behind that
-        /// becomes authoritative if the same tree is later served under a
-        /// policy where the filesystem decides. Grant it only where that
-        /// later reading is impossible or acceptable - and note that
-        /// declining this bit alone does not close it, because
-        /// [`Caps::DAC_OVERRIDE`] reaches the same state.
-        ///
-        /// (`CAP_FOWNER` is capability number 3, hence bit 3.)
-        FOWNER = 0x0000_0008;
     }
 }
 
@@ -735,12 +682,9 @@ impl CredBroker {
     /// property. Main can already ask the broker to mint any non-root
     /// identity (see the module boundary note), so a per-request capability
     /// with no spawn-time bound would let a compromised main hand itself
-    /// whatever [`Caps`] defines - up to `CAP_DAC_OVERRIDE | CAP_FOWNER`,
-    /// which between them read, write, `chmod`, `chown` and delete anything
-    /// the reactor can name. A ceiling chosen before the fork cannot be
-    /// widened by anything that happens to main afterwards, which is why
-    /// this argument should be the smallest set the deployment needs and
-    /// not the whole of [`Caps`].
+    /// `CAP_DAC_READ_SEARCH` - read access to every file on the system. A
+    /// ceiling chosen before the fork cannot be widened by anything that
+    /// happens to main afterwards.
     ///
     /// `Caps::empty()` - what [`spawn`](Self::spawn) passes - reproduces the
     /// capability-free behaviour exactly, including skipping the `capset`

@@ -8,8 +8,8 @@ pub(crate) const NFS4_ACL_XATTR: &str = "system.nfs4_acl_xdr";
 const HDR_SZ: usize = 8;
 const ACE_SZ: usize = 20;
 // The `iflag` bit that marks a special principal (`OWNER@`/`GROUP@`/
-// `EVERYONE@`). ZFS tests this bit alone and ignores the rest of the word,
-// so the decoder must too.
+// `EVERYONE@`). ZFS tests this bit alone and ignores the rest of the word
+// (`ACEI4_SPECIAL_WHO`, zpl_xattr.c), so the decoder must too.
 const ACEI4_SPECIAL_WHO: u32 = 1;
 
 tn_enum! {
@@ -108,9 +108,9 @@ impl Nfs4Flag {
     /// The two "inheritable to a child" bits.
     const INHERITABLE: Nfs4Flag =
         Nfs4Flag::FILE_INHERIT.union(Nfs4Flag::DIRECTORY_INHERIT);
-    /// The audit/alarm qualifiers ZFS cannot represent: it masks these two
-    /// out of the on-disk ACE flags on both encode and decode, so a set bit
-    /// is silently lost on write.
+    /// The audit/alarm qualifiers ZFS cannot represent: it masks the on-disk
+    /// ACE flags with `NFS41_FLAGS` on both encode and decode (`zpl_xattr.c`),
+    /// which excludes these two, so a set bit is silently lost on write.
     const UNREPRESENTABLE: Nfs4Flag =
         Nfs4Flag::SUCCESSFUL_ACCESS.union(Nfs4Flag::FAILED_ACCESS);
 }
@@ -198,7 +198,8 @@ fn be32(b: &[u8], i: usize) -> u32 {
 }
 
 /// The wire `who` word for a `Named` ACE. The field is 32 bits wide and ZFS
-/// stores it verbatim as a `uid_t`, so every `u32` is a valid named id. A `who_id` outside `0..=u32::MAX` cannot
+/// stores it verbatim as a `uid_t` (`nfsace4i_to_acep`, `zpl_xattr.c`), so
+/// every `u32` is a valid named id. A `who_id` outside `0..=u32::MAX` cannot
 /// be represented and is rejected; a `Named` ACE never carries a negative id,
 /// since the decoder maps special principals to `-1`.
 fn named_who(who_id: i64) -> Result<u32> {
@@ -368,9 +369,10 @@ impl Nfs4Acl {
                         .into(),
                 ));
             }
-            // AUDIT and ALARM are NFSv4.1 types this crate can represent
-            // and ZFS will not store: it answers `-EINVAL` for any type but
-            // ALLOW and DENY. Refused here so the failure names
+            // AUDIT and ALARM are NFSv4.1 types this crate can represent and
+            // ZFS will not store: `nfsace4i_to_acep`
+            // (`module/os/linux/zfs/zpl_xattr.c`) answers `-EINVAL` for any
+            // type but ALLOW and DENY. Refused here so the failure names
             // itself instead of arriving as a bare `EINVAL` from `setxattr`
             // with nothing to attribute it to. Only the write path: the
             // decoder keeps accepting them, so an ACL read from a
@@ -456,8 +458,8 @@ fn bucket_key(a: &Nfs4Ace) -> u8 {
 }
 
 /// Whether a child of this type inherits an ACE carrying `flags` - a port of
-/// ZFS's own inheritance arithmetic, which is what this predicts and
-/// therefore the only definition that counts:
+/// ZFS's `zfs_ace_can_use` (`module/os/linux/zfs/zfs_acl.c`), which is the
+/// arithmetic this predicts and therefore the only definition that counts:
 ///
 /// ```text
 /// if (S_ISDIR(obj_mode) && (iflags & ACE_DIRECTORY_INHERIT_ACE))
@@ -526,8 +528,8 @@ mod tests {
 
     /// AUDIT and ALARM are representable here and unstorable there.
     ///
-    /// ZFS answers `-EINVAL` for any ACE type but ALLOW and DENY, so
-    /// writing one
+    /// `nfsace4i_to_acep` (`module/os/linux/zfs/zpl_xattr.c`) answers
+    /// `-EINVAL` for any ACE type but ALLOW and DENY, so writing one
     /// reached the kernel and came back as a bare `EINVAL` from `setxattr`
     /// with nothing naming the cause. The decoder still accepts them - only
     /// the write path refuses - so an ACL read from elsewhere round-trips.
@@ -570,7 +572,8 @@ mod tests {
     #[test]
     fn inheritance_matches_zfs_ace_can_use() {
         use Nfs4Flag as F;
-        // The reference, transcribed from ZFS's own predicate.
+        // The reference, transcribed from `zfs_ace_can_use`
+        // (`module/os/linux/zfs/zfs_acl.c`).
         fn zfs(flags: Nfs4Flag, is_dir: bool) -> bool {
             if is_dir && flags.contains(F::DIRECTORY_INHERIT) {
                 true

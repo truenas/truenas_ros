@@ -41,7 +41,8 @@
 //!   at depth 2 what the source stopped at depth 1.
 //! * **AUDIT and ALARM ACEs are skipped rather than refused.** nfsd rejects
 //!   the whole ACL; they settle no access and POSIX1E has no auditing, so
-//!   dropping them cannot widen the result. ZFS will not store one anyway.
+//!   dropping them cannot widen the result. ZFS will not store one anyway
+//!   (`nfsace4i_to_acep`, `module/os/linux/zfs/zpl_xattr.c`).
 //! * **An `INHERIT_ONLY` ACE with neither inherit bit governs nothing.**
 //!   nfsd tests `flag & (FILE_INHERIT|DIRECTORY_INHERIT)`, finds neither and
 //!   feeds the ACE to the *effective* ACL - granting rights the ACE says do

@@ -106,8 +106,8 @@ pub struct ServerConfig {
     /// only when every connection is mid-body at once. A connection has at
     /// most two chunks out - one landing while the previous one sends -
     /// and that count is fixed, not configurable: on ZFS every ring
-    /// read is punted to an io-wq worker, so a deeper pipeline would only
-    /// deepen that bounded
+    /// read is punted to an io-wq worker (`zpl_file.c` sets no
+    /// `FMODE_NOWAIT`), so a deeper pipeline would only deepen that bounded
     /// worker class's queue, and it is the count of connections mid-body,
     /// not the per-connection depth, that multiplies the load.
     #[cfg(feature = "uring-fs")]

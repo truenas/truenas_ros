@@ -110,22 +110,10 @@ let broker = CredBroker::spawn_with_caps(&[&afs], Caps::DAC_READ_SEARCH)?;
 let who = creds.register(&AsUser::new(1000, 1000).caps(Caps::DAC_READ_SEARCH))?;
 ```
 
-The allowlist will mint three capabilities, and each is broad. Pass the
-smallest set the deployment needs - the argument is a ceiling, not a default.
-
-- `Caps::DAC_READ_SEARCH` grants traverse and read over the whole filesystem,
-  and on ZFS it overrides an explicit NFSv4 ACL deny. It grants no write, no
-  execute, and no delete.
-- `Caps::DAC_OVERRIDE` adds write, and on ZFS with NFSv4 ACLs it also
-  rewrites a mode or ACL the identity does not own.
-- `Caps::FOWNER` adds delete past an explicit `ACE_DELETE` denial, which
-  `DAC_OVERRIDE` cannot reach. Both can change ownership where the ACL is
-  non-trivial, and an ownership change outlives the request that made it.
-
-The last two are defensible only where the caller confines every path op
-(`RESOLVE_BENEATH` from a per-tenant anchor): they bound what may be done
-*within* a tree and cannot change *which* tree. Read each bit's docs before
-reaching for it.
+`Caps::DAC_READ_SEARCH` is the only capability the allowlist will mint, and it
+is broad: it grants traverse and read over the whole filesystem, and on ZFS it
+overrides an explicit NFSv4 ACL deny. It does not grant any write, execute, or
+delete. Read its docs before reaching for it.
 
 ### Listing and walking
 
