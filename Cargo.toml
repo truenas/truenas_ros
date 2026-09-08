@@ -23,6 +23,26 @@ bitflags = "2.6"
 # with it; the `ws` codec tokenizes the `101` upgrade response. The rest
 # of each codec — framing, keep-alive, serialization, hardening — is ours.
 httparse = { version = "1.10", optional = true }
+# The second charter exception, and a heavier one than httparse: it links
+# libcrypto. The `ws` codec needs SHA-1 and base64 for RFC 6455's handshake
+# accept digest (§1.3), and we do not ship hand-rolled crypto for it -
+# `openssl::sha::sha1` + `openssl::base64` are the vetted implementations.
+# Already the kTLS tests' dev-dependency (below), so it adds no build
+# requirement libssl-dev was not already imposing; `dep:openssl` is only
+# pulled by `ws`, so a build without that feature keeps the libc+bitflags
+# footprint. (The digest is a protocol tag, not a secret - RFC 6455 §1.3
+# says so - so the choice is about not rolling our own, not about strength.)
+#
+# FIPS caveat (revisit): the accept digest is SHA-1, which RFC 6455
+# mandates and which is non-security here. A hardened OpenSSL that
+# disallows SHA-1 through its FIPS provider could refuse this and break
+# the handshake - the same corner Python's hashlib needs
+# `usedforsecurity=False` for. `openssl::sha::sha1` uses the low-level
+# call and usually sidesteps the provider, but that is build-dependent.
+# If a FIPS deployment trips on it, the fix is to compute this one digest
+# with a FIPS-agnostic pure-Rust sha1 (it is math, not a secret) rather
+# than through libcrypto - see `ws::accept_for`.
+openssl = { version = "0.10", optional = true }
 
 # loom (a concurrency permutation checker) backs the `loom_tests` modules: the
 # SQ/CQ ordering model in src/uring/ring.rs, the graceful-drain publication in
@@ -115,7 +135,7 @@ http = ["net-server", "dep:httparse"]
 # the role-agnostic `net-core` (the framer is direction-neutral); a
 # consumer pairs it with `net-client` to actually dial. Checked against
 # libwebsockets (`/CODE/libwebsockets`) rather than the RFC prose alone.
-ws = ["net-core", "dep:httparse"]
+ws = ["net-core", "dep:httparse", "dep:openssl"]
 # The io_uring filesystem reactor: files opened into a fixed-descriptor
 # pool, every op stamped with a registered personality (kernel-enforced
 # per-op identity), anchored path resolution. Off by default and absent from
