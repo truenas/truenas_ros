@@ -31,10 +31,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use truenas_ros::net::client::{
-    Client, ClientConfig, ConnId, ConnectOpts, Event, RequestId,
+    Client, ClientConfig, ConnId, ConnectOpts, Event, RequestId, setup_ring,
 };
 use truenas_ros::net::server::{
-    Endian, Listen, PrefixWidth, Server, ServerAddr, ShutdownHandle,
+    Endian, Incoming, Listen, PrefixWidth, Protocol, PushHandle, Request,
+    Response, Server, ServerAddr, ShutdownHandle, length_prefix_header,
     length_prefixed,
 };
 use truenas_ros::net::{ClientAddr, CloseReason, Framing};
@@ -146,14 +147,14 @@ where
         .expect("client body");
 }
 
-/// Connect to `v4` (blocking), run a request round-trip for each message
+/// Connect to `addr` (blocking), run a request round-trip for each message
 /// (keep-alive on one connection), gracefully close, and return the reply
 /// bodies.
-fn echo_client(v4: SocketAddrV4, msgs: &[&[u8]]) -> io::Result<Vec<Vec<u8>>> {
+fn echo_client(addr: ServerAddr, msgs: &[&[u8]]) -> io::Result<Vec<Vec<u8>>> {
     let mut client =
         Client::new(ClientConfig::default(), client_framer()).map_err(to_io)?;
     // Blocking connect: it returns a serving connection ready for requests.
-    let conn = client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
+    let conn = client.connect(addr, ConnectOpts::default())?;
     assert!(
         client.is_open(conn),
         "connection is open after a blocking connect"
@@ -194,7 +195,7 @@ fn run_echo(msgs: Vec<Vec<u8>>) {
     let want = msgs.clone();
     with_server(echo, move |v4| {
         let refs: Vec<&[u8]> = msgs.iter().map(Vec::as_slice).collect();
-        let got = echo_client(v4, &refs)?;
+        let got = echo_client(ServerAddr::Tcp(v4), &refs)?;
         assert_eq!(got, want);
         Ok(())
     });
@@ -1537,4 +1538,329 @@ fn ktls_splice_body() {
         assert_eq!(off, BODY, "kTLS splice moved {off} of {BODY} body bytes");
         assert_eq!(got, expected, "kTLS spliced body content mismatch");
     }
+}
+
+/// `unix_peercred` needs io_uring socket commands on `AF_UNIX` (Linux >=
+/// 6.18.16); on older kernels `with_config`'s startup probe fails with a
+/// validation error. Environmental, like `should_skip` - but force the test
+/// on known-good hosts with `TRUENAS_ROS_REQUIRE_PEERCRED`.
+#[cfg(feature = "uring-fs")]
+fn peercred_unsupported(e: &Error) -> bool {
+    let unsupported = matches!(e, Error::Validation(m) if m.contains("unix_peercred requires"));
+    if unsupported {
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_PEERCRED").is_none(),
+            "TRUENAS_ROS_REQUIRE_PEERCRED set but kernel lacks AF_UNIX \
+             socket commands: {e}"
+        );
+    }
+    unsupported
+}
+
+/// The first client-side AF_UNIX coverage: dial a unix `net::server` by
+/// path, run keep-alive echo round-trips, close gracefully. The dial path
+/// (the `sockaddr_un` build, `IORING_OP_CONNECT` on the fixed file) is
+/// otherwise exercised only over TCP.
+#[test]
+fn unix_echo_roundtrip() {
+    let dir = truenas_ros::tempdir().unwrap();
+    let path = dir.path().join("echo.sock");
+    let mut server = match Server::bind(
+        [ServerAddr::Unix(path.clone())],
+        length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
+    ) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let stop = server.shutdown_handle();
+    let handle = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let r = echo_client(
+            ServerAddr::Unix(path),
+            &[b"alpha".as_slice(), b"beta", b"gamma"],
+        );
+        stop.shutdown();
+        r
+    });
+    server.serve_forever().expect("serve_forever");
+    let got = handle.join().expect("client thread join").expect("client");
+    let want: Vec<Vec<u8>> = [b"alpha".as_slice(), b"beta", b"gamma"]
+        .map(<[u8]>::to_vec)
+        .into();
+    assert_eq!(got, want);
+}
+
+/// Unsolicited pushes arrive on a connection with nothing awaiting: after
+/// its one "sub" round-trip the subscriber connection has zero requests in
+/// flight, so every pushed frame needs a reply recv the client re-armed on
+/// its own. That is the read-gate liveness a JSON-RPC-style consumer leans
+/// on (`expect_server_push` sessions park for notifications); if the core
+/// ever starts charging client deliveries against the in-flight gate, this
+/// stops receiving and fails on the pump timeout instead of shipping.
+#[test]
+fn push_without_requests() {
+    use std::sync::Mutex;
+    const PUSHES: usize = 5;
+    let sub_handle: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: {
+            let sub_handle = Arc::clone(&sub_handle);
+            move |req: Request<'_, ()>| {
+                let Request {
+                    body, responder, ..
+                } = req;
+                if &body[..] == b"sub" {
+                    *sub_handle.lock().unwrap() = Some(responder.push_handle());
+                    Response::Reply(frame(b"subscribed"))
+                } else if let Some(msg) = body.strip_prefix(b"pub:") {
+                    if let Some(h) = sub_handle.lock().unwrap().as_ref() {
+                        h.push(frame(msg));
+                    }
+                    Response::Reply(frame(b"published"))
+                } else {
+                    Response::Reply(frame(&body))
+                }
+            }
+        },
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::bind([addr], proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let handle = thread::spawn(move || -> io::Result<()> {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let cfg = ClientConfig {
+            expect_server_push: true,
+            ..ClientConfig::default()
+        };
+        let mut client = Client::new(cfg, client_framer()).map_err(to_io)?;
+        let sub =
+            client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
+        assert_eq!(client.request(sub, frame(b"sub"))?.to_vec(), b"subscribed");
+
+        // From here the subscriber has nothing in flight; the publisher
+        // triggers pushes toward it from a second connection.
+        let publisher =
+            client.connect(ServerAddr::Tcp(v4), ConnectOpts::default())?;
+        for i in 0..PUSHES {
+            let m = format!("pub:{i}");
+            assert_eq!(
+                client.request(publisher, frame(m.as_bytes()))?.to_vec(),
+                b"published"
+            );
+        }
+
+        let mut got = Vec::new();
+        while got.len() < PUSHES {
+            match client.next_event_timeout(Duration::from_secs(5))? {
+                Some(Event::Reply { conn, id, body, .. }) => {
+                    assert_eq!(conn, sub, "pushes land on the subscriber");
+                    assert_eq!(id, RequestId::UNSOLICITED);
+                    got.push(body.to_vec());
+                }
+                Some(other) => {
+                    return Err(io::Error::other(format!(
+                        "unexpected event while collecting pushes: {other:?}"
+                    )));
+                }
+                None => {
+                    return Err(io::Error::other(
+                        "pump ran dry before every push arrived",
+                    ));
+                }
+            }
+        }
+        for (i, body) in got.iter().enumerate() {
+            assert_eq!(body, format!("{i}").as_bytes(), "push order");
+        }
+        client.close(publisher);
+        client.close(sub);
+        stop.shutdown();
+        Ok(())
+    });
+    server.serve_forever().expect("serve_forever");
+    handle
+        .join()
+        .expect("client thread join")
+        .expect("client body");
+}
+
+/// `with_ring` refuses a ring sized for a smaller configuration instead of
+/// running a submission queue that forces mid-batch flushes (which would
+/// split linked op+timeout pairs).
+#[test]
+fn with_ring_refuses_shallow_ring() {
+    let small = ClientConfig {
+        pool_size: 1,
+        ..ClientConfig::default()
+    };
+    let ring = match setup_ring(&small) {
+        Ok(r) => r,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("setup_ring: {e}"),
+    };
+    match Client::with_ring(ClientConfig::default(), client_framer(), ring) {
+        Err(Error::Validation(msg)) => assert!(
+            msg.contains("submission entries"),
+            "the refusal names the ring depth: {msg}"
+        ),
+        Ok(_) => panic!("a shallow ring must be refused"),
+        Err(e) => panic!("expected a validation refusal, got {e}"),
+    }
+}
+
+/// End to end: a broker-minted personality stamped on the client's unix
+/// CONNECT is what the server's `SO_PEERCRED` reports - the minted euid/egid
+/// with this process's pid - while an unstamped dial on the same client
+/// reports the ambient identity. The ambient arm is the negative control
+/// that keeps the minted one honest: drop the `.personality(..)` and the two
+/// connections become indistinguishable.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn unix_personality_peercred() {
+    use truenas_ros::net::server::{PeerCred, ServerConfig};
+    use truenas_ros::uring_fs::{AsUser, CredBroker};
+
+    const NOBODY_UID: u32 = 65_534;
+    const NOBODY_GID: u32 = 65_534;
+
+    // SAFETY: geteuid reads a register-held credential; trivially safe.
+    if unsafe { libc::geteuid() } != 0 {
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_CRED_BROKER").is_none(),
+            "TRUENAS_ROS_REQUIRE_CRED_BROKER is set but this process is not \
+             root: the broker cannot become another uid without CAP_SETUID"
+        );
+        return;
+    }
+
+    let dir = truenas_ros::tempdir().unwrap();
+    let path = dir.path().join("pers.sock");
+
+    // The client ring first, on this thread: the broker inherits the fd at
+    // its fork and registers the peer identity on it before the client maps
+    // it (`Client::with_ring` below, on the client thread).
+    let ccfg = ClientConfig {
+        pool_size: 4,
+        ..ClientConfig::default()
+    };
+    let ring = match setup_ring(&ccfg) {
+        Ok(r) => r,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("setup_ring: {e}"),
+    };
+    let broker = match CredBroker::spawn(&[&ring]) {
+        Ok(b) => b,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("CredBroker::spawn: {e}"),
+    };
+    let who = broker
+        .handle(0)
+        .expect("broker handle")
+        .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
+        .expect("register nobody on the client ring");
+
+    // A unix server fetching each peer's SO_PEERCRED at accept and echoing
+    // it from the body handler (the `unix_peercred_auth` shape).
+    let scfg = ServerConfig {
+        unix_peercred: true,
+        ..ServerConfig::default()
+    };
+    let proto = Protocol {
+        accept: |inc: Incoming<'_>| match inc.peer {
+            ClientAddr::Unix { cred: Some(c) } => Some(*c),
+            _ => None,
+        },
+        header: length_prefix_header::<PeerCred>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: |req: Request<'_, PeerCred>| {
+            let Request { state: cred, .. } = req;
+            Response::Reply(frame(
+                format!("{}:{}:{}", cred.pid, cred.uid, cred.gid).as_bytes(),
+            ))
+        },
+    };
+    let mut server = match Server::with_config(
+        [ServerAddr::Unix(path.clone())],
+        scfg,
+        proto,
+    ) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) || peercred_unsupported(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let stop = server.shutdown_handle();
+
+    // The minted identity must be able to *reach* the socket: connect(2)
+    // checks MAY_WRITE on the socket inode and search on every ancestor
+    // under the personality's credentials (unix_find_bsd ->
+    // path_permission), and the tempdir is 0700 root. Open both up the way
+    // a real local-API daemon does its own socket (middlewared: 0666).
+    for (p, mode) in [(dir.path(), 0o755), (path.as_path(), 0o666)] {
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes())
+            .expect("no interior NUL in a tempdir path");
+        // SAFETY: valid NUL-terminated path; chmod reads it and touches no
+        // other memory.
+        assert_eq!(unsafe { libc::chmod(c.as_ptr(), mode) }, 0, "chmod {p:?}");
+    }
+
+    let handle = thread::spawn(move || -> io::Result<()> {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let mut client =
+            Client::with_ring(ccfg, client_framer(), ring).map_err(to_io)?;
+        // SAFETY: getpid/geteuid/getegid are trivially safe.
+        let (me, euid, egid) =
+            unsafe { (libc::getpid(), libc::geteuid(), libc::getegid()) };
+
+        // The minted identity on the dial: the peer sees nobody/nobody, and
+        // the pid stays this process's (io-wq workers share the tgid; the
+        // personality overrides credentials, never the task).
+        let minted = client.connect(
+            ServerAddr::Unix(path.clone()),
+            ConnectOpts::default().personality(who),
+        )?;
+        let seen = client.request(minted, frame(b"who am i"))?.to_vec();
+        assert_eq!(
+            String::from_utf8(seen).expect("utf8"),
+            format!("{me}:{NOBODY_UID}:{NOBODY_GID}"),
+            "SO_PEERCRED must report the minted identity under this pid"
+        );
+
+        // The ambient control on the same client: an unstamped dial is the
+        // daemon itself.
+        let ambient =
+            client.connect(ServerAddr::Unix(path), ConnectOpts::default())?;
+        let seen = client.request(ambient, frame(b"who am i"))?.to_vec();
+        assert_eq!(
+            String::from_utf8(seen).expect("utf8"),
+            format!("{me}:{euid}:{egid}"),
+            "an unstamped dial must report the ambient identity"
+        );
+
+        client.close(minted);
+        client.close(ambient);
+        stop.shutdown();
+        Ok(())
+    });
+    server.serve_forever().expect("serve_forever");
+    handle
+        .join()
+        .expect("client thread join")
+        .expect("client body");
 }

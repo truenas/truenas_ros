@@ -4,6 +4,7 @@
 
 use crate::errno::Errno;
 use crate::net::core::protocol::{Body, CloseReason};
+use crate::uring::personality::Personality;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -131,6 +132,27 @@ pub struct ConnectOpts {
     /// `IORING_OP_FIXED_FD_INSTALL` (Linux >= 6.8) + the TLS ULP; a `tls`
     /// connect without them fails cleanly. `false` (the default) is plain TCP.
     pub tls: bool,
+    /// Run the `IORING_OP_CONNECT` under this registered personality: the
+    /// kernel resolves the id at SQE init and wraps the whole connect -
+    /// io-wq punts included - in that identity's credentials. For an
+    /// `AF_UNIX` dial that identity is what the connect leaves behind: the
+    /// accepting side's `SO_PEERCRED` reports the personality's euid/egid
+    /// (the pid stays this process's), and the socket file's `MAY_WRITE`
+    /// permission check runs under it too. Only the connect is stamped -
+    /// peer credentials and path DAC are captured at `connect(2)` time, and
+    /// send/recv on a connected stream check neither - so later I/O runs
+    /// unstamped by design.
+    ///
+    /// `None` (the default) connects under the loop thread's ambient
+    /// credentials, exactly as before.
+    ///
+    /// **The id must come from the ring this client runs on** (a client
+    /// built with [`with_ring`](super::Client::with_ring) on a ring the
+    /// credential broker inherited, or another registration on that same
+    /// ring). An id from a different ring silently names whatever *this*
+    /// ring registered under that number - see the [`Personality`] type
+    /// docs for why that cannot be caught here.
+    pub personality: Option<Personality>,
 }
 
 impl ConnectOpts {
@@ -138,6 +160,13 @@ impl ConnectOpts {
     /// Requires [`Client::set_tls_handshake`](super::Client::set_tls_handshake).
     pub fn tls(mut self) -> ConnectOpts {
         self.tls = true;
+        self
+    }
+
+    /// Dial under a registered personality (see
+    /// [`personality`](ConnectOpts::personality)).
+    pub fn personality(mut self, who: Personality) -> ConnectOpts {
+        self.personality = Some(who);
         self
     }
 }

@@ -23,6 +23,13 @@ pub use config::ClientConfig;
 pub use event::{ConnId, ConnectOpts, Event, RequestId};
 pub use tls::{ConnectDeferral, TlsConnectContext};
 
+// The two types the multi-ring/broker recipe needs by name: the ring created
+// ahead of the client (`setup_ring` -> `CredBroker::spawn` -> `with_ring`)
+// and the identity a broker registration on it yields.
+pub use crate::uring::personality::Personality;
+pub use crate::uring::ring::RingFd;
+
+use crate::error::Error;
 use crate::net::core::conn::{Op, unpack};
 use crate::net::core::probe::probe_ktls;
 use crate::net::core::protocol::{CloseReason, Framing};
@@ -37,6 +44,43 @@ use tls::{HandshakeResult, TlsConnectFn};
 
 /// Kernel cap on SQ ring entries.
 const MAX_RING_ENTRIES: u32 = 32768;
+
+/// Submission-queue depth for a client under `config`.
+fn ring_entries(config: &ClientConfig) -> u32 {
+    // Peak SQEs a connection holds at once: a recv, a concurrent send (only
+    // when pipelining), each timed op's linked timeout, plus the connect
+    // pair. Size the ring so a full pool's peak never forces a mid-batch
+    // flush (which would split a linked op+timeout pair).
+    let per_conn = (if config.max_in_flight > 1 { 2 } else { 1 })
+        + u32::from(
+            config.idle_timeout.is_some() || config.response_timeout.is_some(),
+        )
+        + u32::from(config.send_timeout.is_some())
+        + u32::from(config.connect_timeout.is_some())
+        + u32::from(config.tls_handshake_timeout.is_some());
+    config
+        .pool_size
+        .saturating_mul(per_conn)
+        .saturating_add(2)
+        .next_power_of_two()
+        .min(MAX_RING_ENTRIES)
+}
+
+/// Create the ring a client under `config` will run on, without building the
+/// client.
+///
+/// For a process that dials as *minted identities*: the credential broker
+/// must inherit every ring fd at its fork and the fork must precede every
+/// thread, while a [`Client`] can only be built on the thread that runs it.
+/// So create the ring here, on the main thread, spawn the broker over the
+/// [`RingFd`] (alongside any server/fs rings), then build the client on its
+/// own thread with [`Client::with_ring`] and dial with
+/// [`ConnectOpts::personality`]. A client that only ever connects as the
+/// daemon itself needs none of this; [`Client::new`] creates its own ring.
+pub fn setup_ring(config: &ClientConfig) -> crate::Result<RingFd> {
+    config.validate()?;
+    Ok(RingFd::setup(ring_entries(config))?)
+}
 
 /// A single-threaded io_uring stream client.
 ///
@@ -110,32 +154,44 @@ where
     /// that as an environment skip.
     pub fn new(config: ClientConfig, framer: F) -> crate::Result<Self> {
         config.validate()?;
+        Self::build(config, framer, RingFd::setup(ring_entries(&config))?)
+    }
 
-        // Peak SQEs a connection holds at once: a recv, a concurrent send (only
-        // when pipelining), each timed op's linked timeout, plus the connect
-        // pair. Size the ring so a full pool's peak never forces a mid-batch
-        // flush (which would split a linked op+timeout pair).
-        let per_conn = (if config.max_in_flight > 1 { 2 } else { 1 })
-            + u32::from(
-                config.idle_timeout.is_some()
-                    || config.response_timeout.is_some(),
-            )
-            + u32::from(config.send_timeout.is_some())
-            + u32::from(config.connect_timeout.is_some())
-            + u32::from(config.tls_handshake_timeout.is_some());
-        let entries = config
-            .pool_size
-            .saturating_mul(per_conn)
-            .saturating_add(2)
-            .next_power_of_two()
-            .min(MAX_RING_ENTRIES);
+    /// As [`Client::new`], on a ring from [`setup_ring`].
+    ///
+    /// `config` must be the one the ring was set up for. The ring is sized
+    /// from it, and one too shallow for this configuration is refused with
+    /// [`Error::Validation`] rather than run with a queue that forces
+    /// mid-batch flushes.
+    pub fn with_ring(
+        config: ClientConfig,
+        framer: F,
+        ring: RingFd,
+    ) -> crate::Result<Self> {
+        config.validate()?;
+        let need = ring_entries(&config);
+        if ring.sq_entries() < need {
+            return Err(Error::Validation(format!(
+                "ring has {} submission entries, this configuration needs \
+                 {need}",
+                ring.sq_entries()
+            )));
+        }
+        Self::build(config, framer, ring)
+    }
+
+    fn build(
+        config: ClientConfig,
+        framer: F,
+        ring: RingFd,
+    ) -> crate::Result<Self> {
         // The shared engine: ring + pool + wake + the `FIXED_FD_INSTALL`
         // probe (Linux >= 6.8 - furnishes the real fd behind a kTLS
         // handshake). The TLS ULP is what makes kTLS work at all; probe it
         // once and keep the flag (a runtime decision, like the server's
         // detach) - a `tls` connect on a kernel missing either fails cleanly,
         // while a plain-TCP client is unaffected.
-        let engine = Engine::new(entries, config.pool_size)?;
+        let engine = Engine::on_ring(ring, config.pool_size)?;
         let ktls_supported = probe_ktls().is_ok();
 
         let ts_of = connect::ts_of; // shared duration -> timespec clamp
