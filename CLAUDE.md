@@ -7,11 +7,15 @@ merits rather than rediscovered.
 ## The crate's charter
 
 `libc` + `bitflags`, MSRV 1.97.1. A new runtime dependency is a design
-decision, not a convenience - the one exception (`httparse`, the HTTP head
-tokenizer, used by the `http` request codec and the `ws` `101`-response
-codec) is argued for in `Cargo.toml`. Dev-only crates in a separate,
-self-rooted workspace (`fuzz/`, and the shipping `truenas_api_client/`) do
-not count against this and do not have to hold the MSRV.
+decision, not a convenience - two optional exceptions, each argued for in
+`Cargo.toml` and each pulled only by the feature that needs it:
+`httparse` (the HTTP head tokenizer, used by the `http` request codec and
+the `ws` `101` head) and `openssl` (SHA-1 + base64 for the `ws`
+handshake's RFC 6455 §1.3 accept digest - vetted rather than hand-rolled;
+the heavier one, since it links libcrypto, but off unless `ws` is on).
+Dev-only crates in a separate, self-rooted workspace (`fuzz/`, and the
+shipping `truenas_api_client/`) do not count against this and do not have
+to hold the MSRV.
 
 Every feature must build alone, and the gate checks it with **clippy over
 `--all-targets`**, not a plain `build`: dead code behind a feature only

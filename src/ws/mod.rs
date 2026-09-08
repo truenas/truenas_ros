@@ -67,9 +67,6 @@
 //! peer close code is echoed verbatim rather than sanitised to `1002`
 //! (the connection closes immediately either way).
 
-mod base64;
-mod sha1;
-
 use crate::net::Framing;
 
 /// Continuation of a fragmented message (RFC 6455 §5.4).
@@ -442,11 +439,16 @@ pub fn upgrade_request(endpoint: &str, key: &str) -> Vec<u8> {
 /// too: a peer answering an upgrade (a test's scripted server, or a future
 /// `ws` server role) computes it the same way libwebsockets does at
 /// `server-ws.c:687`.
+///
+/// The SHA-1 is openssl's. It is RFC 6455-mandated and non-security (a
+/// handshake tag, not a secret), so if a FIPS-hardened OpenSSL ever
+/// refuses SHA-1 and breaks this, the fix is a FIPS-agnostic pure-Rust
+/// sha1 here rather than libcrypto - see the `openssl` dep in `Cargo.toml`.
 pub fn accept_for(key: &str) -> String {
     let mut seed = Vec::with_capacity(key.len() + ACCEPT_GUID.len());
     seed.extend_from_slice(key.as_bytes());
     seed.extend_from_slice(ACCEPT_GUID);
-    base64::encode(&sha1::sha1(&seed))
+    openssl::base64::encode_block(&openssl::sha::sha1(&seed))
 }
 
 /// Why a WebSocket upgrade was refused.
@@ -629,7 +631,7 @@ pub fn upgrade_response(key: &str) -> Vec<u8> {
 pub fn ws_key() -> String {
     let mut raw = [0u8; 16];
     getrandom_exact(&mut raw);
-    base64::encode(&raw)
+    openssl::base64::encode_block(&raw)
 }
 
 /// A fresh 4-byte frame mask (§5.3 wants it unpredictable per frame).
