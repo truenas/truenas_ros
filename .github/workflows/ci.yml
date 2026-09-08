@@ -236,7 +236,7 @@ jobs:
         cargo clippy --no-default-features --all-targets -- -D warnings
         for f in sync-fs xattr mount acl fhandle fsiter idmap shutil \
                  configfile audit secrets signal uring net-core net-server \
-                 net-client uring-fs http __fuzz; do
+                 net-client uring-fs http ws __fuzz; do
           echo "::group::clippy --features $f"
           cargo clippy --no-default-features --features "$f" \
             --all-targets -- -D warnings
@@ -255,7 +255,7 @@ jobs:
         # `all(..)` predicate does. Clippy stops at check, so each is one
         # compile, not a VM job.
         for p in net-server,uring-fs net-client,uring-fs \
-                 net-server,net-client http,uring-fs; do
+                 net-server,net-client http,uring-fs ws,net-client; do
           echo "::group::clippy --features $p"
           cargo clippy --no-default-features --features "$p" \
             --all-targets -- -D warnings
@@ -291,5 +291,82 @@ jobs:
     # reach, a redundant target, broken markup.
     - name: docs (deny warnings)
       run: cargo doc --all-features --no-deps
+      env:
+        RUSTDOCFLAGS: "-D warnings"
+
+  # The api-client satellite is a self-rooted workspace (it brings serde,
+  # which the parent's libc+bitflags charter forbids), so nothing in the job
+  # above compiles it - the same blind spot the fuzz build step exists to
+  # close, but for a crate that ships. Everything runs against its own
+  # manifest; the io_uring probe mirrors the parent job's because the
+  # integration tests drive the real net client. `truenas_jsonrpc` is a git
+  # dependency on the sibling utils repo (the ktls dev-dep's shape), so
+  # cargo fetches it - no extra checkout.
+  api-client:
+    name: api-client (fmt + clippy + test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: truenas_api_client
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      run: |
+        rustup toolchain install stable --profile minimal
+        rustup component add clippy rustfmt
+        rustup default stable
+
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          truenas_api_client/target
+        key: cargo-api-client-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
+
+    - name: rustfmt
+      run: cargo fmt --all --check
+
+    - name: clippy
+      run: cargo clippy --all-targets -- -D warnings
+
+    # Release too, for the same reason as the parent job: clippy builds with
+    # debug_assertions on, so `cfg(not(debug_assertions))` arms are invisible
+    # to the line above.
+    - name: clippy (release)
+      run: cargo clippy --release --all-targets -- -D warnings
+
+    - name: Verify io_uring is available
+      run: |
+        disabled=$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0)
+        if [ "$disabled" != "0" ]; then
+          echo "::error::io_uring restricted on this runner (io_uring_disabled=$disabled)"
+          exit 1
+        fi
+
+    - name: test
+      run: cargo test --no-fail-fast
+      env:
+        TRUENAS_ROS_REQUIRE_IO_URING: "1"
+
+    - name: test (release)
+      run: cargo test --release --no-fail-fast
+      env:
+        TRUENAS_ROS_REQUIRE_IO_URING: "1"
+
+    - name: MSRV (the toolchain Cargo.toml declares)
+      run: |
+        msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+        if [ -z "$msrv" ]; then
+          echo "::error::Cargo.toml declares no rust-version to check"
+          exit 1
+        fi
+        rustup toolchain install "$msrv" --profile minimal
+        cargo "+$msrv" check --all-targets
+
+    - name: docs (deny warnings)
+      run: cargo doc --no-deps
       env:
         RUSTDOCFLAGS: "-D warnings"

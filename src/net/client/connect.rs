@@ -13,6 +13,7 @@ use crate::net::core::conn::{Connection, Op, pack};
 use crate::net::core::protocol::{ClientAddr, Framing, ServerAddr};
 use crate::net::core::sock::{build_sockaddr, set_opt};
 use crate::net::core::table::PendingConnect;
+use crate::uring::personality::Personality;
 use crate::uring::sys::*;
 use std::collections::VecDeque;
 use std::io;
@@ -226,15 +227,23 @@ where
             .connecting_addr(slot)
             .expect("slot just reserved as Connecting");
         let connect_ud = pack(Op::Connect, slot, generation);
+        // 0 = no credential override (the kernel never allocates id 0), so
+        // an opts without a personality dials under ambient credentials.
+        let pers = opts.personality.map_or(0, Personality::id);
         let fill = move |sqe: &mut IoUringSqe| {
             sqe.opcode = IORING_OP_CONNECT;
             // Fixed (pool) descriptor at `slot`; addr@16, addr len@8. The
             // kernel rejects a non-zero len/op_flags/buf_index/file_index, so
-            // leave them zeroed (the SQE arrives zeroed).
+            // leave them zeroed (the SQE arrives zeroed). `personality` is
+            // not in that list: it is resolved opcode-agnostically at SQE
+            // init and applied around issue (`io_init_req`,
+            // `__io_issue_sqe`), which is what runs the connect - and the
+            // peercred capture inside it - as the minted identity.
             sqe.fd = slot as i32;
             sqe.flags = IOSQE_FIXED_FILE;
             sqe.addr = addr_ptr;
             sqe.off_addr2 = u64::from(addr_len);
+            sqe.personality = pers;
         };
         let staged = if effective_timeout.is_some() {
             self.core.stage_linked(

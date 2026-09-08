@@ -67,6 +67,7 @@ pub(crate) fn page_size() -> usize {
 #[cfg(feature = "net-server")]
 pub(crate) mod bufring;
 pub(crate) mod engine;
+pub(crate) mod personality;
 pub(crate) mod probe;
 pub(crate) mod ring;
 pub(crate) mod slots;

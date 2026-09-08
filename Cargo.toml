@@ -18,9 +18,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [dependencies]
 libc = { version = "0.2.155", features = ["extra_traits"] }
 bitflags = "2.6"
-# HTTP/1.1 request-head tokenizer for the `http` codec: sans-io, zero-dep,
-# no runtime opinions (the same parser hyper uses internally). The rest of
-# the codec — framing, keep-alive, serialization, hardening — is ours.
+# HTTP head tokenizer: sans-io, zero-dep, no runtime opinions (the same
+# parser hyper uses internally). The `http` codec tokenizes request heads
+# with it; the `ws` codec tokenizes the `101` upgrade response. The rest
+# of each codec — framing, keep-alive, serialization, hardening — is ours.
 httparse = { version = "1.10", optional = true }
 
 # loom (a concurrency permutation checker) backs the `loom_tests` modules: the
@@ -106,6 +107,15 @@ net-client = ["net-core"]
 # Head tokenizing is `httparse`; framing, 100-continue, keep-alive,
 # serialization, and smuggling hardening are implemented here.
 http = ["net-server", "dep:httparse"]
+# RFC 6455 client-side WebSocket codec over the `net` protocol seam
+# (`src/ws`): the client-direction analogue of `http`. A `Framing` framer
+# (the 101 head, then frames), the frame parse/encode with client masking,
+# and the handshake helpers (SHA-1/base64 accept digest, upgrade request,
+# 101 validation). Head tokenizing is `httparse`, like `http`. Needs only
+# the role-agnostic `net-core` (the framer is direction-neutral); a
+# consumer pairs it with `net-client` to actually dial. Checked against
+# libwebsockets (`/CODE/libwebsockets`) rather than the RFC prose alone.
+ws = ["net-core", "dep:httparse"]
 # The io_uring filesystem reactor: files opened into a fixed-descriptor
 # pool, every op stamped with a registered personality (kernel-enforced
 # per-op identity), anchored path resolution. Off by default and absent from
@@ -148,6 +158,7 @@ full = [
     "net-server",
     "net-client",
     "http",
+    "ws",
     "secrets",
 ]
 

@@ -1,0 +1,38 @@
+# truenas_api_client — a non-blocking client for TrueNAS middlewared's
+# JSON-RPC 2.0-over-WebSocket API on its AF_UNIX socket, built on the parent
+# crate's `net-client` role. Sessions dial under io_uring personalities, so
+# middlewared's SO_PEERCRED auto-auth sees a minted identity, not the daemon.
+#
+# A self-rooted workspace (the `fuzz/` shape, but shipping): the parent
+# crate's charter is libc + bitflags (+ httparse), and this satellite brings
+# serde — it must never join that dependency graph.
+[package]
+name = "truenas_api_client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "MIT"
+description = "Non-blocking TrueNAS middlewared API client over io_uring"
+publish = false
+
+[dependencies]
+truenas_ros = { path = "..", features = ["net-client", "uring-fs", "ws"] }
+# The sans-io JSON-RPC 2.0 codec, from the satellite utils repo (the same
+# git-dependency shape truenas_ros's ktls dev-dep uses, and for the same
+# reason: it brings serde, which cannot enter the parent's dep graph).
+# Branch-tracked with no committed lockfile, so a fresh resolve follows
+# the sibling's master.
+truenas_jsonrpc = { git = "https://github.com/truenas/truenas_ros_utils", branch = "master" }
+serde = { version = "1", default-features = false, features = [
+    "std",
+    "derive",
+] }
+serde_json = { version = "1", features = ["raw_value"] }
+
+[dev-dependencies]
+# The mock middlewared's integration tests classify an io_uring setup
+# errno for the environment-skip discipline; no runtime code links libc.
+libc = "0.2.155"
+
+[workspace]
+members = ["."]
