@@ -132,7 +132,20 @@ use super::single_flight::SingleFlight;
 pub const MAX_GROUPS: usize = 4096;
 
 /// How many rings one broker will serve.
-pub const MAX_RINGS: usize = 8;
+///
+/// A policy bound rather than a structural one: the ring index is a `u8`
+/// in the request header and ring `i` is the child's `RING_FD_BASE + i`,
+/// so nothing in the transport or the fd layout gives way before 255.
+/// What the bound is for is catching a caller that hands the broker a
+/// slice it did not mean to, at the one moment that cannot be retried -
+/// the fork happens once, before any thread exists.
+///
+/// It has to clear a reactor per server thread **plus** any ring that
+/// serves no listener: a sidecar that dials another daemon under a
+/// personality needs one of its own, because a personality id is valid
+/// only on the ring it was minted against. Sized so a deployment need
+/// not trade one against the other.
+pub const MAX_RINGS: usize = 16;
 
 /// The child's IPC socket, after `tidy_child_fds` normalizes descriptors.
 const SOCK_FD: RawFd = 3;
