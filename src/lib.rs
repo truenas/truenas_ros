@@ -104,3 +104,6 @@ pub mod net;
 
 #[cfg(feature = "http")]
 pub mod http;
+
+#[cfg(feature = "ws")]
+pub mod ws;
