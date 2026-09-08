@@ -7,10 +7,11 @@ merits rather than rediscovered.
 ## The crate's charter
 
 `libc` + `bitflags`, MSRV 1.97.1. A new runtime dependency is a design
-decision, not a convenience - the one exception (`httparse`, for the HTTP
-request-head tokenizer) is argued for in `Cargo.toml`. Dev-only crates in a
-separate, self-rooted workspace (`fuzz/`) do not count against this and do
-not have to hold the MSRV.
+decision, not a convenience - the one exception (`httparse`, the HTTP head
+tokenizer, used by the `http` request codec and the `ws` `101`-response
+codec) is argued for in `Cargo.toml`. Dev-only crates in a separate,
+self-rooted workspace (`fuzz/`, and the shipping `truenas_api_client/`) do
+not count against this and do not have to hold the MSRV.
 
 Every feature must build alone, and the gate checks it with **clippy over
 `--all-targets`**, not a plain `build`: dead code behind a feature only
@@ -28,7 +29,9 @@ visibility. `__fuzz` is outside `default` and `full`. See
 
 - `src/sync_fs/` blocking syscalls; `src/uring/` the shared io_uring engine;
   `src/uring_fs/` the async fs reactor and credential broker; `src/net/` the
-  reactor and server/client roles; `src/http/` the HTTP/1.1 codec on top.
+  reactor and server/client roles; `src/http/` the HTTP/1.1 codec on top;
+  `src/ws/` the RFC 6455 client WebSocket codec (the outbound analogue of
+  `http`; checked against `/CODE/libwebsockets`).
 - Reference trees, cited rather than recalled: **`/CODE/linux`** (the
   `truenas/linux` fork) and **`/CODE/zfs`** (the `truenas/zfs` fork). See
   *Validating against the platform* below for which revision of each is the
@@ -789,6 +792,7 @@ Before reporting anything done:
 ```sh
 cargo fmt --all --check
 cargo fmt --all --check --manifest-path fuzz/Cargo.toml   # its own workspace
+cargo fmt --all --check --manifest-path truenas_api_client/Cargo.toml  # ditto
 cargo clippy --all-features --all-targets -- -D warnings
 # And again in release: clippy builds with `debug_assertions` on, so the
 # `cfg(not(debug_assertions))` half of every `debug_assert` guard is not
@@ -829,10 +833,25 @@ cargo clippy --no-default-features --all-targets -- -D warnings
 # leaves the gate.
 for f in sync-fs xattr mount acl fhandle fsiter idmap shutil \
          configfile audit secrets signal uring net-core net-server \
-         net-client uring-fs http __fuzz; do
+         net-client uring-fs http ws __fuzz; do
   cargo clippy --no-default-features --features "$f" \
     --all-targets -- -D warnings || exit 1
 done
+
+# The api-client satellite (truenas_api_client/) is a self-rooted workspace
+# like fuzz/, so nothing above compiles it - but unlike fuzz/ it ships, so
+# it gets the full discipline against its own manifest (ci.yml's
+# `api-client` job is the authority). It depends on `truenas_jsonrpc` via a
+# git dependency on the sibling `truenas_ros_utils` repo (the ktls dev-dep's
+# shape), so cargo fetches it and no sibling checkout is needed.
+(cd truenas_api_client \
+  && cargo clippy --all-targets -- -D warnings \
+  && cargo clippy --release --all-targets -- -D warnings \
+  && cargo test --no-fail-fast \
+  && cargo test --release --no-fail-fast \
+  && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps \
+  && cargo "+$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" \
+       check --all-targets)
 ```
 
 The last three steps are here because a defect got through without each,
