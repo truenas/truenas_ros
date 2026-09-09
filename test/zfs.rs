@@ -29,6 +29,9 @@ use truenas_ros::sync_fs::{
     fset_zfs_attrs, linkat, openat2, renameat2,
 };
 
+#[path = "support/zfs_dir.rs"]
+mod zfs_dir;
+
 /// Skip the calling test. `TRUENAS_ROS_REQUIRE_ZFS` turns the skip into a
 /// failure, so a fixture that stopped being provisioned cannot report a green
 /// suite that tested nothing.
@@ -41,11 +44,18 @@ fn skip(why: &str) {
 }
 
 /// Resolve an ACL-typed dataset directory, or `None` to skip the test.
+///
+/// Checked with `statfs`, not `is_dir`: `zfs create -o mountpoint=/POSIXACL`
+/// leaves that directory behind on the root filesystem, so a dataset that
+/// stopped being mounted - one of the two degradations
+/// `qemu-4-test.sh`'s `TRUENAS_ROS_REQUIRE_ZFS` exists to catch - hands an
+/// `is_dir` gate a plain ext4/tmpfs directory whose POSIX ACLs answer
+/// perfectly well. `test/support/zfs_dir.rs` states the same reason.
 fn dataset(env_var: &str, fallback: &str) -> Option<PathBuf> {
     let dir = std::env::var_os(env_var)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(fallback));
-    dir.is_dir().then_some(dir)
+    (zfs_dir::is_zfs(&dir) == Some(true)).then_some(dir)
 }
 
 fn nfs4_dir() -> Option<PathBuf> {
@@ -312,9 +322,29 @@ fn open_for_write_as_nobody(path: &Path) -> Result<(), i32> {
         // setresuid to a non-zero uid clears the effective capability set,
         // so the child cannot ride CAP_DAC_OVERRIDE through the check.
         unsafe {
-            libc::syscall(libc::SYS_setgroups, 0usize, std::ptr::null::<u32>());
-            libc::syscall(libc::SYS_setresgid, 65534, 65534, 65534);
-            libc::syscall(libc::SYS_setresuid, 65534, 65534, 65534);
+            // Fail CLOSED, the discipline `register_as` states: each of
+            // these can fail after its permission check (`set_user` ->
+            // EAGAIN on the target uid's RLIMIT_NPROC, `prepare_creds` ->
+            // ENOMEM, an LSM veto in `security_task_fix_setuid`;
+            // `__sys_setresuid`, kernel/sys.c), and a child that stayed
+            // root opens every file below and exits 0. The posix-half
+            // assertion downstream expects a *successful* open, so an
+            // unchecked drop would pin nothing there for good; the nfs4
+            // half would redden and read as the platform growing
+            // enforcement, which is what its rustdoc tells the reader to
+            // relax the READONLY docs over. 255 is outside errno.
+            let dropped = libc::syscall(
+                libc::SYS_setgroups,
+                0usize,
+                std::ptr::null::<u32>(),
+            ) == 0
+                && libc::syscall(libc::SYS_setresgid, 65534, 65534, 65534) == 0
+                && libc::syscall(libc::SYS_setresuid, 65534, 65534, 65534) == 0
+                && libc::geteuid() == 65534
+                && libc::getegid() == 65534;
+            if !dropped {
+                libc::_exit(255);
+            }
             let fd = libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
             libc::_exit(if fd >= 0 {
                 0
@@ -332,6 +362,11 @@ fn open_for_write_as_nobody(path: &Path) -> Result<(), i32> {
     assert!(libc::WIFEXITED(status), "probe child did not exit");
     match libc::WEXITSTATUS(status) {
         0 => Ok(()),
+        255 => panic!(
+            "the probe child could not drop to nobody - every verdict below \
+             would be root's, and the one that expects a successful open \
+             would pass having tested nothing"
+        ),
         e => Err(e),
     }
 }

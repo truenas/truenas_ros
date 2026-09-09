@@ -803,6 +803,16 @@ cargo clippy --all-features --all-targets -- -D warnings
 # compiled by the line above and never linted.
 cargo clippy --release --all-features --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+
+# Arm what this box can satisfy. *Tests* above says a skip has to be
+# loud or gated, and a gate nothing arms is neither: these three are
+# exactly what `ci.yml` arms on an unprivileged runner, so a local pass
+# and a CI pass mean the same thing. The other twelve need root, ZFS,
+# audit or a real kernel, and `qemu-4-test.sh` arms them where they can
+# be satisfied - arming them here would turn every dev run red for the
+# environment rather than for the code.
+export TRUENAS_ROS_REQUIRE_IO_URING=1 TRUENAS_ROS_REQUIRE_PYTHON=1 \
+       TRUENAS_ROS_REQUIRE_BTIME=1
 cargo test --all-features --no-fail-fast
 cargo test --release --all-features --no-fail-fast   # the guards that ship
 
@@ -848,6 +858,8 @@ done
 # `api-client` job is the authority). It depends on `truenas_jsonrpc` via a
 # git dependency on the sibling `truenas_ros_utils` repo (the ktls dev-dep's
 # shape), so cargo fetches it and no sibling checkout is needed.
+# `qemu-4-test.sh` runs it too, and is the only lane where its brokered
+# identity paths execute at all.
 (cd truenas_api_client \
   && cargo clippy --all-targets -- -D warnings \
   && cargo clippy --release --all-targets -- -D warnings \

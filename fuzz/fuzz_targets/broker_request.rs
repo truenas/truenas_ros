@@ -37,17 +37,38 @@ const HDR_LEN: usize = 16;
 fuzz_target!(|data: &[u8]| {
     // A broker is spawned with a real ring count and a real ceiling, so model
     // both rather than letting the fuzzer invent impossible ones. The ceiling
-    // is drawn from the selector rather than independently: with a random
+    // is drawn from a selector byte rather than independently: with a random
     // ceiling the `caps ⊆ allowed` check would almost always reject, and the
     // accept path — the one that mints a personality — would go untested.
-    let Some((&sel, req)) = data.split_first() else {
+    //
+    // Two selector bytes, because the ring count and the ceiling are
+    // independent axes and one byte cannot carry both:
+    //
+    // * `nrings` takes a **whole** byte. A nibble cannot express a ceiling
+    //   above 15, so `usize::from(sel >> 4) % (MAX_RINGS + 1)` was the
+    //   identity once `MAX_RINGS` reached sixteen, and the maximum ring
+    //   count — with it the widest `ring < nrings` accept this target
+    //   exists to explore — was unreachable. A whole byte tracks the
+    //   constant to 255, which is where the `u8` ring index really binds.
+    // * `1 +`, because `spawn_with_caps` refuses an empty slice, so a
+    //   broker serving no rings is not a state worth modelling.
+    // * a **second** byte for the ceiling. Drawing both from one byte
+    //   couples them: `1 + sel % 16` makes `nrings`' parity the exact
+    //   inverse of the `sel & 1` ceiling branch, so `nrings == MAX_RINGS`
+    //   would pair only with the restrictive ceiling that mostly rejects —
+    //   and the accept path is precisely what needs it. Independent bytes
+    //   reach the full cross product at every ceiling.
+    let Some((&sel, rest)) = data.split_first() else {
         return;
     };
-    let nrings = usize::from(sel >> 4) % (MAX_RINGS + 1);
-    let allowed = if sel & 1 == 0 {
+    let Some((&cap_sel, req)) = rest.split_first() else {
+        return;
+    };
+    let nrings = 1 + usize::from(sel) % MAX_RINGS;
+    let allowed = if cap_sel & 1 == 0 {
         Caps::all()
     } else {
-        Caps::from_bits_truncate(u32::from(sel >> 1))
+        Caps::from_bits_truncate(u32::from(cap_sel >> 1))
     };
 
     let decoded = match decode_request(req, nrings, allowed) {

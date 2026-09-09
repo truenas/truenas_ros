@@ -21,11 +21,28 @@ use truenas_ros::ws::{
     OP_PONG, OP_TEXT,
 };
 
-/// Concurrent calls this session keeps in flight before queueing locally.
-/// middlewared's per-connection semaphore is soft 10 / hard 20; staying
-/// under the soft limit means the server never delays us and the hard
-/// `-32000` refusal is unreachable from a single well-behaved session.
-const CALL_BUDGET: usize = 8;
+/// Concurrent calls this session keeps in flight; further calls queue
+/// behind the answers.
+///
+/// A mirror of middlewared's own per-connection semaphore, which is soft
+/// 10 / hard 20 (`SoftHardSemaphore(10, 20)`,
+/// `middlewared/api/base/server/ws_handler/rpc.py`, over
+/// `middlewared/utils/lock.py`): under the soft limit the server never
+/// delays us, and the hard `-32000` refusal is out of reach of the calls
+/// one session has outstanding at once.
+///
+/// The ceiling sits under the soft limit rather than at it because with
+/// `legacy_jobs` off a job method holds its server-side slot for the
+/// whole job - `method.call` awaits `result.wait()` *inside* the
+/// semaphore - so concurrency there is scarce and long-held.
+///
+/// It bounds *outstanding* calls, not calls in front of the server:
+/// a timed-out call's slot comes back at `expire` while the server
+/// may still be running it, so repeated timeouts can put more work there
+/// than this number. That is deliberate - the alternative is a session
+/// that accepts calls and sends none - and `-32000` is retryable, which
+/// [`ApiError::TooManyConcurrentCalls`] says.
+pub const CALL_BUDGET: usize = 8;
 
 /// What one pending entry is for, which decides how its answer surfaces.
 pub(crate) enum Kind {
@@ -50,6 +67,10 @@ pub(crate) enum Kind {
 
 /// One outstanding call.
 pub(crate) struct Pending {
+    /// Whether this call's frame actually reached the wire. A call still
+    /// in `backlog` has spent no budget, so timing it out must not credit
+    /// a slot it never took.
+    sent: bool,
     pub(crate) call: CallId,
     pub(crate) kind: Kind,
     /// When the call times out locally ([`ApiError::Timeout`]); the entry
@@ -118,7 +139,14 @@ pub(crate) enum Act {
 }
 
 /// A decoded `collection_update` event.
-#[derive(Clone, Debug, Deserialize)]
+///
+/// [`Debug`] reports the payload members by size, not content: a
+/// `core.get_jobs` update carries the job's own result in `fields`, so
+/// `{:?}` on the event is the same disclosure [`OwnedResult`]'s `Debug`
+/// avoids.
+///
+/// [`OwnedResult`]: crate::OwnedResult
+#[derive(Clone, Deserialize)]
 pub struct CollectionUpdate {
     /// What happened: `added`, `changed`, or `removed`.
     pub msg: String,
@@ -133,6 +161,19 @@ pub struct CollectionUpdate {
     /// Anything else the emitter attached.
     #[serde(default)]
     pub extra: Option<Value>,
+}
+
+impl std::fmt::Debug for CollectionUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::Opaque;
+        f.debug_struct("CollectionUpdate")
+            .field("msg", &self.msg)
+            .field("collection", &self.collection)
+            .field("id", &Opaque(self.id.as_ref()))
+            .field("fields", &Opaque(self.fields.as_ref()))
+            .field("extra", &Opaque(self.extra.as_ref()))
+            .finish()
+    }
 }
 
 /// The `notify_unsubscribed` payload.
@@ -182,6 +223,8 @@ pub(crate) struct Session {
     /// Refuse outbound messages beyond this (middlewared kills the
     /// connection on oversize instead of failing the call).
     max_outbound: usize,
+    /// Bound on `backlog` (`ApiConfig::max_queued_calls`).
+    max_queued: usize,
     /// Whether session setup skips `core.set_options` (legacy job ids).
     legacy_jobs: bool,
     /// The peer-close report, captured when the close frame arrives so
@@ -195,6 +238,7 @@ impl Session {
         legacy_jobs: bool,
         max_outbound: usize,
         max_inbound: usize,
+        max_queued: usize,
     ) -> Session {
         Session {
             phase: Phase::AwaitingHead,
@@ -207,13 +251,21 @@ impl Session {
             backlog: VecDeque::new(),
             max_inbound,
             max_outbound,
+            max_queued,
             legacy_jobs,
             close_reason: None,
         }
     }
 
     /// The upgrade request to send once the transport connects.
-    pub(crate) fn upgrade(&self, endpoint: &str) -> Vec<u8> {
+    ///
+    /// Fails on an endpoint `ws::validate_request_target` refuses;
+    /// `ApiClient::connect_start` screens the same value before it dials,
+    /// so reaching this is a caller that went around it.
+    pub(crate) fn upgrade(
+        &self,
+        endpoint: &str,
+    ) -> Result<Vec<u8>, HandshakeError> {
         ws::upgrade_request(endpoint, &self.key)
     }
 
@@ -250,7 +302,8 @@ impl Session {
 
     /// Build and account one call. `params` must already be a JSON Array
     /// (the caller validated the first byte). Returns the send when the
-    /// budget allows, queues otherwise.
+    /// budget allows, queues otherwise - and refuses rather than queueing
+    /// once the backlog is at [`Session::max_queued`].
     pub(crate) fn submit(
         &mut self,
         call: CallId,
@@ -263,24 +316,40 @@ impl Session {
             .caller
             .request(method, Some(params))
             .map_err(|e| ApiError::Build(e.to_string()))?;
-        if frame.len() > self.max_outbound {
+        // Per method, as middlewared applies it: the whitelisted upload
+        // methods are exempt from the ordinary cap and nothing else is.
+        let cap = crate::config::outbound_cap(self.max_outbound, method);
+        if frame.len() > cap {
             // The id is minted but never sent; a gap in the sequence is
             // harmless (ids are correlation keys, nothing more).
             return Err(ApiError::TooLarge {
                 len: frame.len(),
-                cap: self.max_outbound,
+                cap,
+            });
+        }
+        let sending = self.budget > 0;
+        // A backlog with no bound turns a caller that ignores backpressure
+        // into unbounded memory: every queued call holds its encoded
+        // frame, up to `max_outbound` each. Refuse the submission instead,
+        // in the vocabulary `queue_bulk` already uses for the same
+        // question. The refusal is before `pending.insert`, so a refused
+        // call leaves no tombstone to be answered.
+        if !sending && self.backlog.len() >= self.max_queued {
+            return Err(ApiError::QueueFull {
+                cap: self.max_queued,
             });
         }
         self.pending.insert(
             id.clone(),
             Pending {
+                sent: sending,
                 call,
                 kind,
                 deadline,
                 abandoned: false,
             },
         );
-        if self.budget > 0 {
+        if sending {
             self.budget -= 1;
             Ok(vec![Act::Send(ws::encode_frame(
                 OP_TEXT,
@@ -317,6 +386,15 @@ impl Session {
                 if self.frag.is_some() {
                     return vec![Act::Fault(
                         "new data frame inside a fragmented message",
+                    )];
+                }
+                // The cap has to bind here, not only where the pieces are
+                // joined: a first fragment is held until a continuation
+                // arrives, and a peer that never sends one holds whatever
+                // it declared for as long as the connection lives.
+                if payload.len() > self.max_inbound {
+                    return vec![Act::Fault(
+                        "fragmented message exceeds the inbound cap",
                     )];
                 }
                 self.frag = Some(payload);
@@ -356,16 +434,23 @@ impl Session {
     /// A close frame from the peer: echo it (once), remember why, and let
     /// the driver run the transport close.
     fn on_close_frame(&mut self, payload: &[u8]) -> Vec<Act> {
-        let reason = if payload.len() >= 2 {
-            let code = u16::from_be_bytes([payload[0], payload[1]]);
-            let text = String::from_utf8_lossy(&payload[2..]);
-            if text.is_empty() {
-                format!("peer closed ({code})")
-            } else {
-                format!("peer closed ({code}: {text})")
+        // §5.5.1 makes /reason/ UTF-8 and its first two bytes a code, so a
+        // lossy decode would report a reason the peer never sent and a
+        // one-byte body would report no code at all rather than a
+        // malformed frame. Say which it was instead.
+        let reason = match payload.len() {
+            0 => "peer closed".to_owned(),
+            1 => "peer closed (malformed close body)".to_owned(),
+            _ => {
+                let code = u16::from_be_bytes([payload[0], payload[1]]);
+                match std::str::from_utf8(&payload[2..]) {
+                    Ok("") => format!("peer closed ({code})"),
+                    Ok(text) => format!("peer closed ({code}: {text})"),
+                    Err(_) => {
+                        format!("peer closed ({code}: invalid UTF-8 reason)")
+                    }
+                }
             }
-        } else {
-            "peer closed".to_owned()
         };
         if matches!(self.phase, Phase::Closing) {
             // Our close is out already; this is the peer's echo, and the
@@ -373,15 +458,23 @@ impl Session {
             return Vec::new();
         }
         self.phase = Phase::Closing;
-        self.close_reason = Some(reason.clone());
-        // §5.5.1: echo the status code back.
-        let echo = if payload.len() >= 2 {
-            &payload[..2]
-        } else {
-            &[][..]
+        self.close_reason = Some(reason);
+        // No continuation can arrive now, so an open reassembly is dead
+        // weight - up to `max_inbound` of it - held until the driver gets
+        // round to dropping the session.
+        self.frag = None;
+
+        // §5.5.1 echoes the status code back, bounded by §7.4.1: 1004,
+        // 1005, 1006, 1015 and the unassigned ranges MUST NOT be set by an
+        // endpoint, so an unsendable peer code is answered 1002 rather than
+        // reflected - a peer that checks would fail the connection over our
+        // echo and turn a graceful close into an abnormal one.
+        let echo = match ws::close_echo_code(payload) {
+            Some(code) => code.to_be_bytes().to_vec(),
+            None => Vec::new(),
         };
         vec![
-            Act::Send(ws::encode_frame(OP_CLOSE, echo, ws::mask_key())),
+            Act::Send(ws::encode_frame(OP_CLOSE, &echo, ws::mask_key())),
             Act::PeerClosing,
         ]
     }
@@ -477,8 +570,27 @@ impl Session {
         let Some(p) = self.pending.remove(reply.id()) else {
             return vec![Act::Fault("response to no outstanding call")];
         };
-        // The server slot is free again either way; refill and drain.
-        self.budget += 1;
+        // An answer naming a call that never reached the wire is not a
+        // Response: JSON-RPC 2.0 §5 requires a Response's id to be the id
+        // of a Request the peer received, and this one was never sent. It
+        // is still sitting in `backlog`, so crediting a slot it never
+        // spent would put it on the wire with no `pending` entry - its
+        // real answer would then fault the session, after a fabricated
+        // result had already been handed to the caller.
+        if !p.sent {
+            return vec![Act::Fault("answer for a call never sent")];
+        }
+        // Refill - unless `expire` already credited this slot when it told
+        // the caller the call was finished (see `expire`), which would
+        // otherwise count one answer twice.
+        if !p.abandoned {
+            self.budget += 1;
+            debug_assert!(
+                self.budget <= CALL_BUDGET,
+                "budget {} exceeded CALL_BUDGET {CALL_BUDGET}",
+                self.budget
+            );
+        }
         let mut acts = self.drain_backlog();
         if p.abandoned {
             // Timed out locally; the late answer is dropped by design.
@@ -490,7 +602,26 @@ impl Session {
         };
         match p.kind {
             Kind::SetOptions => match outcome {
-                Ok(_) => acts.push(Act::Ready),
+                // The server echoes the options it put in force, and the
+                // echo is the authority - not the request. Asking for
+                // modern job answering and being given legacy answering
+                // silently would make every job call's result the job's
+                // integer id where the caller expects the job's result.
+                Ok(raw) => match legacy_jobs_in_force(&raw) {
+                    Some(false) => acts.push(Act::Ready),
+                    Some(true) => {
+                        acts.push(Act::SetupFailed(ApiError::Protocol(
+                            "core.set_options answered legacy_jobs: true \
+                             after this session asked for modern job \
+                             answering",
+                        )))
+                    }
+                    None => acts.push(Act::SetupFailed(ApiError::Protocol(
+                        "core.set_options did not report legacy_jobs, so \
+                         this API version cannot honour it and the \
+                         session would decode job ids as results",
+                    ))),
+                },
                 Err(e) => acts.push(Act::SetupFailed(e)),
             },
             Kind::User => acts.push(Act::CallDone {
@@ -547,7 +678,16 @@ impl Session {
                 self.pending.remove(&id);
                 continue;
             }
+            // A queued frame whose `pending` entry has gone is not
+            // sendable: nothing would correlate its answer. Drop it rather
+            // than emitting a call the session cannot account for.
+            if !self.pending.contains_key(&id) {
+                continue;
+            }
             self.budget -= 1;
+            if let Some(p) = self.pending.get_mut(&id) {
+                p.sent = true;
+            }
             acts.push(Act::Send(ws::encode_frame(
                 OP_TEXT,
                 &frame,
@@ -562,8 +702,9 @@ impl Session {
         self.subs.get(&sub).and_then(|e| e.ident.as_deref())
     }
 
-    /// This session's outbound message cap, for sizing a `core.bulk`
-    /// flush chunk.
+    /// This session's *ordinary* outbound cap, for sizing a `core.bulk`
+    /// flush chunk. `core.bulk` is not one of the methods middlewared
+    /// exempts, so the ordinary cap is the one that binds it.
     pub(crate) fn max_outbound(&self) -> usize {
         self.max_outbound
     }
@@ -581,11 +722,24 @@ impl Session {
     /// stay as tombstones (their answers are still owed by the server and
     /// must be recognized when they land); a tombstone still in the
     /// backlog is dropped at drain instead.
+    ///
+    /// Abandoning a call also returns its concurrency slot: the caller has
+    /// just been handed [`ApiError::Timeout`] and is free to issue another
+    /// call, so holding the slot until an answer that may never come would
+    /// let [`CALL_BUDGET`] timeouts take the session to zero budget - after
+    /// which every call is accepted, queued, and never sent. The tombstone
+    /// keeps correlation working when a late answer does land, and the
+    /// reply path skips the refill for an abandoned entry so the slot is
+    /// credited exactly once.
     pub(crate) fn expire(&mut self, now: Instant) -> Vec<Act> {
         let mut acts = Vec::new();
+        let mut freed = 0;
         for p in self.pending.values_mut() {
             if !p.abandoned && p.deadline.is_some_and(|d| d <= now) {
                 p.abandoned = true;
+                if p.sent {
+                    freed += 1;
+                }
                 // The setup call has no caller-visible id; its timeout
                 // surfaces through the blocking connect's own deadline.
                 if !matches!(p.kind, Kind::SetOptions) {
@@ -596,11 +750,19 @@ impl Session {
                 }
             }
         }
+        self.budget += freed;
+        debug_assert!(
+            self.budget <= CALL_BUDGET,
+            "budget {} exceeded CALL_BUDGET {CALL_BUDGET}",
+            self.budget
+        );
+        acts.extend(self.drain_backlog());
         acts
     }
 
     /// Every live call, failed at once - the session is going away.
     pub(crate) fn fail_all(&mut self, why: &str) -> Vec<Act> {
+        self.frag = None;
         let mut acts = Vec::new();
         for (_, p) in self.pending.drain() {
             if !p.abandoned && !matches!(p.kind, Kind::SetOptions) {
@@ -617,13 +779,41 @@ impl Session {
     }
 }
 
+/// What `core.set_options` reports it put in force, or `None` if it
+/// reports nothing.
+///
+/// middlewared echoes the applied options and the reference Python client
+/// reads `legacy_jobs` back out of that echo rather than trusting its own
+/// request (`truenas_api_client/__init__.py`, the `_set_options_call`
+/// arm).
+///
+/// **`None` is a refusal, not a shrug.** Every API version that honours
+/// the option answers with a required object -
+/// `CoreSetOptionsResult { result: CoreOptions }`, and `CoreOptions`
+/// declares `legacy_jobs` (`middlewared/api/v26_0_0/core.py`). A version
+/// that does not honour it is exactly the one that answers nothing:
+/// `api/v25_04_1/core.py` accepts only `py_exceptions` and drops the rest
+/// (`extra="ignore"`), and `CoreSetOptionsResult.to_previous` in
+/// `api/v25_10_0/core.py` rewrites the echo to `null` on the way down.
+/// Its `App.legacy_jobs` then stays at its default of `true`. So a silent
+/// echo means legacy answering is in force, and the session must not
+/// proceed believing otherwise. [`validate_endpoint`] refuses those API
+/// versions up front; this is the check that does not depend on the
+/// endpoint being read correctly.
+fn legacy_jobs_in_force(raw: &RawValue) -> Option<bool> {
+    serde_json::from_str::<serde_json::Value>(raw.get())
+        .ok()?
+        .get("legacy_jobs")?
+        .as_bool()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use truenas_ros::ws::FrameHead;
 
     fn session() -> Session {
-        let mut s = Session::new("test-key".into(), false, 65_536, 1024);
+        let mut s = Session::new("test-key".into(), false, 65_536, 1024, 256);
         // on_frame does not gate on phase, but a realistic session is Open.
         s.phase = Phase::Open;
         s
@@ -754,7 +944,7 @@ mod tests {
     /// single frame; this bounds the whole message).
     #[test]
     fn an_oversized_reassembly_faults() {
-        let mut s = Session::new("k".into(), false, 65_536, 8);
+        let mut s = Session::new("k".into(), false, 65_536, 8, 256);
         s.phase = Phase::Open;
         assert!(
             s.on_frame(head(false, OP_TEXT, 6), vec![b'x'; 6])
@@ -807,5 +997,342 @@ mod tests {
             "the close code is captured: {:?}",
             s.close_reason
         );
+    }
+
+    /// middlewared grants the extended cap per *method*, after parsing -
+    /// `parse_message` returns early for a whitelisted one and applies
+    /// the ordinary cap to everything else - so a single per-session
+    /// number cannot mirror it. An upload gets the extended cap without
+    /// the session's other calls getting it too.
+    #[test]
+    fn the_extended_cap_applies_to_the_upload_methods_only() {
+        use serde_json::value::RawValue;
+        let mut s = Session::new("k".into(), false, 65_536, 1024, 256);
+        s.phase = Phase::Open;
+        // A params array comfortably over the ordinary 64 KiB cap and
+        // under the extended 2 MiB one.
+        let big = format!("[\"{}\"]", "x".repeat(100_000));
+        let args = RawValue::from_string(big).unwrap();
+        let mut n = 0;
+        let mut go = |s: &mut Session, method: &str| {
+            n += 1;
+            s.submit(crate::CallId(n), Kind::User, method, &args, None)
+        };
+        for method in crate::MSG_SIZE_EXTENDED_METHODS {
+            assert!(
+                matches!(go(&mut s, method).as_deref(), Ok([Act::Send(_)])),
+                "{method} must be allowed the extended cap"
+            );
+        }
+        match go(&mut s, "pool.dataset.create") {
+            Err(ApiError::TooLarge { cap, .. }) => {
+                assert_eq!(cap, crate::MIDDLEWARE_MSG_CAP)
+            }
+            other => panic!("an ordinary method must be refused: {other:?}"),
+        }
+        // The exemption is a larger cap, not the absence of one:
+        // `parse_message` refuses above it before it reads the method
+        // at all.
+        let huge =
+            format!("[\"{}\"]", "x".repeat(crate::MIDDLEWARE_MSG_CAP_EXTENDED));
+        let huge = RawValue::from_string(huge).unwrap();
+        match s.submit(
+            crate::CallId(99),
+            Kind::User,
+            "filesystem.file_receive",
+            &huge,
+            None,
+        ) {
+            Err(ApiError::TooLarge { cap, .. }) => {
+                assert_eq!(cap, crate::MIDDLEWARE_MSG_CAP_EXTENDED)
+            }
+            other => panic!("the extended cap still bounds: {other:?}"),
+        }
+    }
+
+    /// A first fragment is held until a continuation arrives, so it is
+    /// bounded where it is stored, not only where the pieces are joined -
+    /// otherwise a peer opens a fragmented message, sends nothing more,
+    /// and holds whatever it declared for the connection's life. Closing
+    /// releases it: no continuation can arrive after that.
+    #[test]
+    fn an_open_reassembly_is_bounded_and_released_at_close() {
+        let mut s = Session::new("k".into(), false, 65_536, 64, 256);
+        s.phase = Phase::Open;
+        // Over the cap in the very first fragment.
+        match s
+            .on_frame(head(false, OP_TEXT, 256), vec![b'a'; 256])
+            .as_slice()
+        {
+            [Act::Fault(why)] => {
+                assert_eq!(*why, "fragmented message exceeds the inbound cap")
+            }
+            other => {
+                panic!("an over-cap first fragment must fault: {other:?}")
+            }
+        }
+        assert!(s.frag.is_none(), "a refused fragment is not stored");
+
+        // Under the cap: held, then released when the peer closes.
+        let mut s = Session::new("k".into(), false, 65_536, 64, 256);
+        s.phase = Phase::Open;
+        assert!(
+            s.on_frame(head(false, OP_TEXT, 32), vec![b'a'; 32])
+                .is_empty()
+        );
+        assert!(s.frag.is_some(), "the control: it really is held");
+        let _ =
+            s.on_frame(head(true, OP_CLOSE, 2), 1000u16.to_be_bytes().to_vec());
+        assert!(s.frag.is_none(), "closing releases the reassembly");
+    }
+
+    /// Past the concurrency budget calls queue; past the queue's own
+    /// bound they are refused, in `queue_bulk`'s vocabulary. Without the
+    /// bound a caller that ignores the queueing holds one encoded frame
+    /// per call, up to `max_outbound` each, with nothing to stop it.
+    #[test]
+    fn a_full_backlog_refuses_rather_than_growing() {
+        use serde_json::value::RawValue;
+        const QUEUED: usize = 4;
+        let mut s = Session::new("k".into(), false, 65_536, 1024, QUEUED);
+        s.phase = Phase::Open;
+        let args = RawValue::from_string("[]".to_owned()).unwrap();
+        let put = |s: &mut Session, i: usize| {
+            s.submit(
+                crate::CallId(i as u64),
+                Kind::User,
+                "core.ping",
+                &args,
+                None,
+            )
+        };
+        // The budget's worth go to the wire.
+        for i in 0..CALL_BUDGET {
+            let acts = put(&mut s, i).expect("under budget");
+            assert!(
+                matches!(acts.as_slice(), [Act::Send(_)]),
+                "call {i} should have gone out"
+            );
+        }
+        // The queue's worth are accepted and held.
+        for i in 0..QUEUED {
+            let acts = put(&mut s, CALL_BUDGET + i).expect("queues");
+            assert!(acts.is_empty(), "a queued call sends nothing");
+        }
+        assert_eq!(s.backlog.len(), QUEUED);
+        // One more is refused, and leaves nothing behind: no tombstone
+        // for an answer to find, and no growth.
+        let pending_before = s.pending.len();
+        match put(&mut s, 999) {
+            Err(ApiError::QueueFull { cap }) => assert_eq!(cap, QUEUED),
+            other => panic!("expected QueueFull, got {other:?}"),
+        }
+        assert_eq!(s.backlog.len(), QUEUED, "a refusal does not queue");
+        assert_eq!(
+            s.pending.len(),
+            pending_before,
+            "a refusal leaves no tombstone"
+        );
+    }
+
+    /// A locally timed-out call returns its concurrency slot at `expire`,
+    /// keeps its tombstone so a late answer is still recognised, and that
+    /// late answer credits nothing a second time.
+    ///
+    /// Before the fix this covers, `expire` left every slot spent, so
+    /// `CALL_BUDGET` unanswered timeouts pinned `budget` at 0 for the life
+    /// of the session: later calls went to `backlog`, `drain_backlog` never
+    /// ran (its guard is `while self.budget > 0`), and the session accepted
+    /// calls and sent none with nothing surfaced to the caller.
+    #[test]
+    fn a_timed_out_call_frees_its_slot_and_a_late_answer_credits_once() {
+        use serde_json::value::RawValue;
+        let mut s = session();
+        let args = RawValue::from_string("[]".to_owned()).unwrap();
+        let past = Instant::now();
+
+        // Fill the budget, every call already past its deadline. Keep the
+        // ids so one can be answered late.
+        let mut ids = Vec::new();
+        for i in 0..CALL_BUDGET {
+            let acts = s
+                .submit(
+                    crate::CallId(100 + i as u64),
+                    Kind::User,
+                    "core.ping",
+                    &args,
+                    Some(past),
+                )
+                .expect("submits under budget");
+            let [Act::Send(frame)] = acts.as_slice() else {
+                panic!("call {i} should have gone to the wire: {acts:?}")
+            };
+            let (_op, payload) = unmask(frame);
+            let v: serde_json::Value =
+                serde_json::from_slice(&payload).expect("a JSON request");
+            ids.push(v.get("id").cloned().expect("a request carries an id"));
+        }
+        assert_eq!(s.budget, 0, "every slot is spent while the calls live");
+
+        // The clock crosses every deadline.
+        let later = past + std::time::Duration::from_secs(1);
+        let acts = s.expire(later);
+        assert_eq!(
+            acts.len(),
+            CALL_BUDGET,
+            "every abandoned call surfaces its Timeout"
+        );
+        assert_eq!(
+            s.pending.len(),
+            CALL_BUDGET,
+            "tombstones stay, so a late answer is still recognised"
+        );
+        assert_eq!(
+            s.budget, CALL_BUDGET,
+            "the caller was told they finished, so the slots come back"
+        );
+
+        // So an ordinary call reaches the wire instead of the backlog.
+        let acts = s
+            .submit(crate::CallId(999), Kind::User, "core.ping", &args, None)
+            .expect("submits");
+        assert!(
+            matches!(acts.as_slice(), [Act::Send(_)]),
+            "the freed budget admits it: {acts:?}"
+        );
+        assert!(s.backlog.is_empty(), "nothing was queued");
+        assert_eq!(s.budget, CALL_BUDGET - 1);
+
+        // A late answer to an abandoned call must not credit a slot twice.
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": ids[0],
+            "result": null,
+        })
+        .to_string();
+        let len = body.len();
+        let acts = s.on_frame(head(true, OP_TEXT, len), body.into_bytes());
+        assert!(
+            acts.is_empty(),
+            "a late answer to an abandoned call surfaces nothing: {acts:?}"
+        );
+        assert_eq!(
+            s.budget,
+            CALL_BUDGET - 1,
+            "expire already credited that slot; the answer must not again"
+        );
+    }
+
+    /// A peer that answers an id it was never sent must be refused, not
+    /// believed. `submit` inserts into `pending` for the backlogged branch
+    /// too, so before the fix this covers, such an answer refunded a slot
+    /// the call never spent, handed the caller a fabricated `CallDone`,
+    /// let `drain_backlog` put the call on the wire with no `pending`
+    /// entry, and then faulted the whole session when the genuine answer
+    /// arrived - failing every other in-flight call with it.
+    #[test]
+    fn an_answer_for_a_never_sent_call_is_refused() {
+        use serde_json::value::RawValue;
+        let mut s = session();
+        let args = RawValue::from_string("[]".to_owned()).unwrap();
+
+        // Fill the budget, then one more so it is queued rather than sent.
+        for i in 0..CALL_BUDGET {
+            let acts = s
+                .submit(
+                    crate::CallId(100 + i as u64),
+                    Kind::User,
+                    "core.ping",
+                    &args,
+                    None,
+                )
+                .expect("submits under budget");
+            assert!(matches!(acts.as_slice(), [Act::Send(_)]), "call {i}");
+        }
+        let acts = s
+            .submit(crate::CallId(999), Kind::User, "core.ping", &args, None)
+            .expect("submits");
+        assert!(acts.is_empty(), "the ninth call is queued, not sent");
+        assert_eq!(s.backlog.len(), 1);
+        let queued_id = s.backlog.front().expect("a queued frame").0.clone();
+        let budget_before = s.budget;
+
+        // The peer answers the id it has not been sent.
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": queued_id,
+            "result": "early",
+        })
+        .to_string();
+        let len = body.len();
+        let acts = s.on_frame(head(true, OP_TEXT, len), body.into_bytes());
+
+        assert!(
+            matches!(acts.as_slice(), [Act::Fault(_)]),
+            "an answer for a call never sent is a protocol fault: {acts:?}"
+        );
+        assert_eq!(
+            s.budget, budget_before,
+            "no slot is credited for a call that never spent one"
+        );
+    }
+
+    /// §7.4.1: 1005 is a reserved value an endpoint MUST NOT set as a
+    /// status code, so the echo answers 1002 while the report still names
+    /// what the peer actually sent. Same for a malformed one-byte body and
+    /// a reason that is not UTF-8 (§5.5.1, §8.1).
+    #[test]
+    fn a_close_code_no_endpoint_may_send_is_not_echoed_back() {
+        for code in [1004u16, 1005, 1006, 1015, 0, 2999] {
+            let mut s = session();
+            let acts = s
+                .on_frame(head(true, OP_CLOSE, 2), code.to_be_bytes().to_vec());
+            match acts.first() {
+                Some(Act::Send(frame)) => {
+                    let (op, payload) = unmask(frame);
+                    assert_eq!(op, OP_CLOSE);
+                    assert_eq!(
+                        payload,
+                        1002u16.to_be_bytes().to_vec(),
+                        "peer sent {code}; the echo must be 1002"
+                    );
+                }
+                other => panic!("expected a close echo, got {other:?}"),
+            }
+            assert!(
+                s.close_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains(&code.to_string())),
+                "the report still names {code}: {:?}",
+                s.close_reason
+            );
+        }
+        // A one-byte body is not a code (§5.5.1).
+        let mut s = session();
+        let acts = s.on_frame(head(true, OP_CLOSE, 1), vec![0x03]);
+        match acts.first() {
+            Some(Act::Send(frame)) => {
+                assert_eq!(unmask(frame).1, 1002u16.to_be_bytes().to_vec());
+            }
+            other => panic!("expected a close echo, got {other:?}"),
+        }
+        assert!(
+            s.close_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("malformed")),
+            "a one-byte body is reported as malformed: {:?}",
+            s.close_reason
+        );
+        // A non-UTF-8 reason is answered 1007, not echoed as 1000.
+        let mut s = session();
+        let mut body = 1000u16.to_be_bytes().to_vec();
+        body.extend_from_slice(&[0xFF, 0xFE, 0x80]);
+        let acts = s.on_frame(head(true, OP_CLOSE, body.len()), body);
+        match acts.first() {
+            Some(Act::Send(frame)) => {
+                assert_eq!(unmask(frame).1, 1007u16.to_be_bytes().to_vec());
+            }
+            other => panic!("expected a close echo, got {other:?}"),
+        }
     }
 }

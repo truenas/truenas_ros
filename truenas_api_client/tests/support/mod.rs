@@ -68,7 +68,18 @@ impl Wire {
             json!([{ "legacy_jobs": false }]),
             "session setup asks for modern job answering"
         );
-        self.respond_ok(&id, json!(null));
+        // The shape middlewared answers with: the options it put in
+        // force, all three of them (`core.set_options` in
+        // `middlewared/service/core_service.py`, against
+        // `CoreSetOptionsResult { result: CoreOptions }`).
+        self.respond_ok(
+            &id,
+            json!({
+                "legacy_jobs": false,
+                "private_methods": false,
+                "py_exceptions": false,
+            }),
+        );
     }
 
     /// Answer the upgrade request with an arbitrary non-101 head.

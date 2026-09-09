@@ -120,14 +120,32 @@ fn is_http_version(tok: &[u8]) -> bool {
 /// Answering 505 for the latter tells the client to retry at a lower HTTP
 /// version it never named, so read the version token off the request line
 /// and answer 505 only when it is a well-formed `HTTP/<DIGIT>.<DIGIT>`.
+///
+/// "Read the version token off the request line" means the **third** field
+/// of `request-line = method SP request-target SP HTTP-version` (RFC 9112
+/// sec. 3), not the tail after the last space. A malformed line whose last
+/// space-delimited token happens to be a well-formed version - `GET /a b
+/// HTTP/1.1`, a space inside the target - is byte soup, and taking the tail
+/// answered it 505: the outcome this function exists to prevent.
+///
+/// Leading empty lines are skipped for the same reason
+/// [`method_is_head`] skips them: `httparse` does (RFC 9112 sec. 2.2
+/// robustness), so scanning from byte 0 reads an empty line as the request
+/// line and answers 400 for a real `\r\nGET / HTTP/2.0`.
 fn version_status(buf: &[u8]) -> u16 {
+    let mut buf = buf;
+    while let [b'\r', b'\n', rest @ ..] | [b'\n', rest @ ..] = buf {
+        buf = rest;
+    }
     let line_end = buf
         .iter()
         .position(|&b| b == b'\r' || b == b'\n')
         .unwrap_or(buf.len());
-    let line = &buf[..line_end];
-    match line.iter().rposition(|&b| b == b' ') {
-        Some(sp) if is_http_version(&line[sp + 1..]) => 505,
+    let mut fields = buf[..line_end].split(|&b| b == b' ');
+    match (fields.next(), fields.next(), fields.next(), fields.next()) {
+        (Some(_), Some(_), Some(version), None) if is_http_version(version) => {
+            505
+        }
         _ => 400,
     }
 }

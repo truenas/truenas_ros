@@ -57,7 +57,7 @@ pub fn zfs_dir_or_skip() -> Option<std::path::PathBuf> {
 /// Whether `path` is on ZFS. `None` when it does not exist or cannot be
 /// stat'd, which is the "no fixture" case rather than the "wrong one".
 #[allow(dead_code)] // see `zfs_dir_or_skip`
-fn is_zfs(path: &std::path::Path) -> Option<bool> {
+pub fn is_zfs(path: &std::path::Path) -> Option<bool> {
     use std::os::unix::ffi::OsStrExt;
     // `zfs_super_magic` (`include/os/linux/zfs/sys/zfs_vfsops_os.h`).
     const ZFS_SUPER_MAGIC: i64 = 0x2fc12fc1;

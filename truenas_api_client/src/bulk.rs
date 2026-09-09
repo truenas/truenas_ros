@@ -8,8 +8,11 @@
 //! per tick, and `core.bulk` runs the items server-side under the calling
 //! session's own credentials.
 //!
-//! This module is the sans-io storage and the chunk builder; the tick
-//! clock, the flush, and the per-item result fan-out live in the driver.
+//! This module is the sans-io storage and the chunk builder for **one
+//! session**: `core.bulk` runs its items under the calling session's own
+//! credentials, so the driver holds one of these per session and flushes
+//! each on the session it belongs to. The tick clock, the flush, and the
+//! per-item result fan-out live in the driver.
 
 use crate::error::ApiError;
 use crate::{__json, BulkTicket};
@@ -66,6 +69,11 @@ impl BulkQueue {
     /// Whether anything is queued.
     pub(crate) fn is_empty(&self) -> bool {
         self.total == 0
+    }
+
+    /// How many items are queued.
+    pub(crate) fn len(&self) -> usize {
+        self.total
     }
 
     /// The methods that currently have queued items, in flush order.

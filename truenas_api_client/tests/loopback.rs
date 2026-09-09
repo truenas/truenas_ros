@@ -194,7 +194,11 @@ fn client_or_skip(path: &std::path::Path) -> Option<ApiClient> {
 fn client_and_server_round_trip() {
     let uuid = "11111111-2222-3333-4444-555555555555";
     let (path, _dir, handle) = serve(move |method, params| match method {
-        "core.set_options" => ok(json!(null)),
+        "core.set_options" => ok(json!({
+            "legacy_jobs": false,
+            "private_methods": false,
+            "py_exceptions": false,
+        })),
         "core.ping" => ok(json!("pong")),
         "core.subscribe" => Answer {
             result: Ok(json!(uuid)),
