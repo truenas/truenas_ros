@@ -155,6 +155,7 @@ uring-fs = ["uring", "sync-fs", "xattr"]
 __fuzz = [
     "net-server",
     "http",
+    "ws",
     "acl",
     "configfile",
     "fhandle",

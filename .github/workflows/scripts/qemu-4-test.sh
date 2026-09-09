@@ -204,6 +204,23 @@ fi
 cargo test --all-features --no-fail-fast 2>&1 | tee /home/debian/test-output.txt
 TEST_EXIT_CODE=${PIPESTATUS[0]}
 
+# The api-client satellite is a self-rooted workspace, so the line above
+# does not compile it - and it is the crate whose whole subject is minting
+# identities through the credential broker, which needs the root this lane
+# alone has. ci.yml's `api-client` job runs it unprivileged; this is the
+# only place its brokered paths can execute at all. Appended rather than
+# folded in, so a failure here is distinguishable from the parent's.
+echo ""
+echo "=========================================="
+echo "Running the api-client satellite"
+echo "=========================================="
+cargo test --manifest-path truenas_api_client/Cargo.toml --no-fail-fast \
+  2>&1 | tee -a /home/debian/test-output.txt
+CLIENT_EXIT_CODE=${PIPESTATUS[0]}
+if [ "$TEST_EXIT_CODE" -eq 0 ]; then
+  TEST_EXIT_CODE=$CLIENT_EXIT_CODE
+fi
+
 echo ""
 echo "=========================================="
 echo "Tearing down ZFS test datasets"
