@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use support::{Mock, Wire, serve, serve_one};
 use truenas_api_client::{
-    ApiClient, ApiConfig, ApiError, ApiEvent, HandshakeError, SessionOpts,
-    params,
+    ApiClient, ApiConfig, ApiError, ApiEvent, CALL_BUDGET, HandshakeError,
+    MIN_API_VERSION, SessionOpts, params, validate_endpoint,
 };
 
 /// The scenario-default config against `mock`'s socket.
@@ -661,6 +661,309 @@ fn call_start_is_non_blocking() {
     mock.join();
 }
 
+/// A timed-out call returns its concurrency slot. `CALL_BUDGET` calls the
+/// server never answers, all timed out locally, must not leave the session
+/// unable to send anything further: the caller has just been handed
+/// `Timeout` for each and is entitled to issue more.
+///
+/// Under the defect this covers, the call after the timeouts is accepted
+/// (`call_start` answers `Ok`) but never reaches the wire, so the mock's
+/// `expect_call("after.timeouts")` reads the close frame instead and
+/// panics - a failure, not a hang.
+#[test]
+fn a_timed_out_call_returns_its_budget_slot() {
+    let mock = serve_one(|mut w: Wire| {
+        w.accept_session("/api/current");
+        // Fill the budget and answer none of it.
+        for _ in 0..CALL_BUDGET {
+            let _ = w.expect_call("core.ping");
+        }
+        // The freed slot must let this one out.
+        let (id, _) = w.expect_call("after.timeouts");
+        w.respond_ok(&id, json!("sent-after-timeouts"));
+        w.expect_close();
+    });
+    let cfg = ApiConfig {
+        call_timeout: Some(Duration::from_millis(200)),
+        ..config(&mock)
+    };
+    let Some(mut api) = client_or_skip_cfg(cfg) else {
+        return;
+    };
+    let sid = api.connect(SessionOpts::default()).expect("connect");
+
+    for _ in 0..CALL_BUDGET {
+        api.call_start(sid, "core.ping", &params!()).expect("start");
+    }
+    let mut timeouts = 0;
+    while timeouts < CALL_BUDGET {
+        match api.pump(Some(Duration::from_secs(10))).expect("pump") {
+            Some(ApiEvent::CallDone {
+                result: Err(ApiError::Timeout),
+                ..
+            }) => {
+                timeouts += 1;
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    assert_eq!(timeouts, CALL_BUDGET, "every filled call timed out");
+
+    let after = api
+        .call_start(sid, "after.timeouts", &params!())
+        .expect("a call after the timeouts");
+    loop {
+        match api.pump(Some(Duration::from_secs(10))).expect("pump") {
+            Some(ApiEvent::CallDone { call, result }) if call == after => {
+                let got: String =
+                    result.expect("answered").decode().expect("a string");
+                assert_eq!(got, "sent-after-timeouts");
+                break;
+            }
+            Some(_) => {}
+            None => {
+                panic!("the call after the timeouts never reached the wire")
+            }
+        }
+    }
+    shutdown(&mut api, sid);
+    mock.join();
+}
+
+/// `core.set_options`' answer is the authority on what is in force, not the
+/// request. A server that answers `legacy_jobs: true` after this session
+/// asked for modern answering must fail setup, because every job call's
+/// result would then be the job's integer id where the caller expects the
+/// job's result — a silently wrong value, not an error.
+///
+/// The reference Python client reads the same echo
+/// (`truenas/api_client`, the `_set_options_call` arm) rather than trusting
+/// its own request.
+#[test]
+fn a_set_options_echo_contradicting_the_request_fails_setup() {
+    let mock = serve_one(|mut w: Wire| {
+        w.accept_upgrade("/api/current");
+        let (id, params) = w.expect_call("core.set_options");
+        assert_eq!(params, json!([{ "legacy_jobs": false }]));
+        // The server did not honour it.
+        w.respond_ok(&id, json!({ "legacy_jobs": true }));
+    });
+    let Some(mut api) = client_or_skip(&mock) else {
+        return;
+    };
+    match api.connect(SessionOpts::default()) {
+        Err(ApiError::Protocol(what)) => {
+            assert!(
+                what.contains("legacy_jobs"),
+                "the refusal names the option: {what}"
+            );
+        }
+        other => panic!("expected a Protocol refusal, got {other:?}"),
+    }
+}
+
+/// A silent echo is a refusal too, and for a sharper reason than a
+/// contradicting one: every API version that honours `legacy_jobs`
+/// answers with a required object, so the only versions that answer
+/// nothing are the ones that dropped the option and left
+/// `App.legacy_jobs` at `true`. Proceeding there decodes every job's
+/// integer id as the caller's result.
+#[test]
+fn a_set_options_echo_without_the_member_fails_setup() {
+    for echo in [json!(null), json!({ "py_exceptions": false })] {
+        let mock = serve_one(move |mut w: Wire| {
+            w.accept_upgrade("/api/current");
+            let (id, _) = w.expect_call("core.set_options");
+            w.respond_ok(&id, echo.clone());
+        });
+        let Some(mut api) = client_or_skip(&mock) else {
+            return;
+        };
+        match api.connect(SessionOpts::default()) {
+            Err(ApiError::Protocol(what)) => assert!(
+                what.contains("legacy_jobs"),
+                "the refusal names the option: {what}"
+            ),
+            other => panic!("expected a Protocol refusal, got {other:?}"),
+        }
+    }
+}
+
+/// The positive control for both refusals above: the echo middlewared
+/// actually sends opens the session and serves a call.
+#[test]
+fn the_echo_middlewared_sends_opens_the_session() {
+    let mock = serve_one(|mut w: Wire| {
+        w.accept_session("/api/current");
+        let (id, _) = w.expect_call("core.ping");
+        w.respond_ok(&id, json!("pong"));
+        w.expect_close();
+    });
+    let Some(mut api) = client_or_skip(&mock) else {
+        return;
+    };
+    let sid = api.connect(SessionOpts::default()).expect("the real echo");
+    let pong: String = api.call(sid, "core.ping", &params!()).expect("ping");
+    assert_eq!(pong, "pong");
+    shutdown(&mut api, sid);
+    mock.join();
+}
+
+/// A `{:?}` on an event is how a consumer's log gets written, and a
+/// method's result is whatever it asked middlewared for. Report the size,
+/// not the content - the line middlewared itself draws between the caller
+/// and the audit record (`api/base/handler/remove_secrets.py`).
+#[test]
+fn debug_on_an_event_does_not_print_the_server_result() {
+    const SECRET: &str = "s3cr3t-token-do-not-log";
+    let mock = serve_one(|mut w: Wire| {
+        w.accept_session("/api/current");
+        let (id, _) = w.expect_call("auth.generate_token");
+        w.respond_ok(&id, json!({ "token": SECRET }));
+        w.send_notification(
+            "collection_update",
+            json!({
+                "msg": "changed",
+                "collection": "core.get_jobs",
+                "id": 1,
+                "fields": { "result": SECRET },
+            }),
+        );
+        w.expect_close();
+    });
+    let Some(mut api) = client_or_skip(&mock) else {
+        return;
+    };
+    let sid = api.connect(SessionOpts::default()).expect("connect");
+    let call = api
+        .call_start(sid, "auth.generate_token", &params!())
+        .expect("send");
+    let mut seen_call = false;
+    let mut seen_update = false;
+    while !(seen_call && seen_update) {
+        let Some(ev) = api.pump(Some(Duration::from_secs(10))).expect("pump")
+        else {
+            panic!("timed out waiting for both events")
+        };
+        let printed = format!("{ev:?}");
+        assert!(
+            !printed.contains(SECRET),
+            "Debug leaked the payload: {printed}"
+        );
+        match &ev {
+            ApiEvent::CallDone { call: c, result } => {
+                assert_eq!(*c, call);
+                // The caller's own side still gets the whole thing.
+                assert!(
+                    result.as_ref().expect("ok").get().contains(SECRET),
+                    "the value itself must survive"
+                );
+                seen_call = true;
+            }
+            ApiEvent::CollectionUpdate { update, .. } => {
+                assert!(
+                    update
+                        .fields
+                        .as_ref()
+                        .expect("fields")
+                        .to_string()
+                        .contains(SECRET),
+                    "the value itself must survive"
+                );
+                seen_update = true;
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    shutdown(&mut api, sid);
+    mock.join();
+}
+
+/// `Instant + Duration` panics on overflow and the durations here are
+/// the caller's: `Duration::MAX` is an ordinary way to spell "wait as
+/// long as it takes", and a library must not abort the process over it.
+/// An unrepresentable deadline is no deadline, which is what `None`
+/// already means on every one of these paths.
+#[test]
+fn an_unrepresentable_timeout_is_no_timeout() {
+    let mock = serve_one(|mut w: Wire| {
+        w.accept_session("/api/current");
+        let (id, _) = w.expect_call("core.ping");
+        w.respond_ok(&id, json!("pong"));
+        w.expect_close();
+    });
+    let cfg = ApiConfig {
+        connect_timeout: Some(Duration::MAX),
+        call_timeout: Some(Duration::MAX),
+        ..config(&mock)
+    };
+    let Some(mut api) = client_or_skip_cfg(cfg) else {
+        return;
+    };
+    let sid = api.connect(SessionOpts::default()).expect("connect");
+    // And on `pump`'s own argument: an answer is on its way, so an
+    // unrepresentable bound waits for it instead of aborting.
+    let call = api.call_start(sid, "core.ping", &params!()).expect("send");
+    match api.pump(Some(Duration::MAX)).expect("pump") {
+        Some(ApiEvent::CallDone { call: c, result }) => {
+            assert_eq!(c, call);
+            assert_eq!(result.expect("ok").get(), "\"pong\"");
+        }
+        other => panic!("expected the ping's answer, got {other:?}"),
+    }
+    shutdown(&mut api, sid);
+    mock.join();
+}
+
+/// The endpoint reaches the wire inside the request line and decides
+/// which API version answers, so both refusals happen before the dial -
+/// no half-open session, no socket.
+#[test]
+fn a_refused_endpoint_never_dials() {
+    // Nothing is ever accepted here: a refusal that dialled would show
+    // up as the script blocking on accept, which `join` would surface.
+    let mock = serve(Vec::new());
+    let Some(_probe) = client_or_skip(&mock) else {
+        return;
+    };
+    let with = |ep: &str| ApiConfig {
+        endpoint: ep.to_owned(),
+        ..config(&mock)
+    };
+    for ep in [
+        "/api/current\r\nX-Injected: 1",
+        "/api/current HTTP/1.1\r\n\r\nGET /admin",
+        "/api/cur rent",
+        "api/current",
+        "",
+    ] {
+        let mut api = ApiClient::new(with(ep)).expect("client");
+        match api.connect_start(SessionOpts::default()) {
+            Err(ApiError::Handshake(HandshakeError::BadTarget { .. })) => {}
+            other => panic!("{ep:?} must be refused, got {other:?}"),
+        }
+    }
+    for (ep, want) in [
+        ("/api/v25.04.1", (25u32, 4u32, 1u32)),
+        ("/api/v24.10", (24, 10, 0)),
+    ] {
+        let mut api = ApiClient::new(with(ep)).expect("client");
+        match api.connect_start(SessionOpts::default()) {
+            Err(ApiError::UnsupportedApiVersion { pinned, minimum }) => {
+                assert_eq!(pinned, want);
+                assert_eq!(minimum, MIN_API_VERSION);
+            }
+            other => panic!("{ep:?} must be refused, got {other:?}"),
+        }
+    }
+    // What must still pass: `current`, the floor, and a later pin.
+    for ep in ["/api/current", "/api/v26.0.0", "/api/v27.0.0", "/ws"] {
+        assert!(validate_endpoint(ep).is_ok(), "{ep} must be accepted");
+    }
+    mock.join();
+}
+
 // --- The deferred core.bulk queue --------------------------------------
 
 /// A flush sends one core.bulk per method carrying every queued item's
@@ -716,6 +1019,61 @@ fn bulk_flush_groups_by_method() {
     assert_eq!(done[&t2], 20);
     assert_eq!(done[&t3], -1); // "true" is not an i64
     shutdown(&mut api, sid);
+    mock.join();
+}
+
+/// Each queued item flushes on the session it was queued against.
+/// core.bulk runs its items under the calling session's credentials, so a
+/// second `queue_bulk` naming a different session must not re-aim the
+/// items already queued for the first.
+#[test]
+fn bulk_flushes_each_item_on_its_own_session() {
+    let scripts: Vec<Box<dyn FnOnce(Wire) + Send>> = vec![
+        Box::new(|mut w: Wire| {
+            w.accept_session("/api/current");
+            let (id, params) = w.expect_call("core.bulk");
+            assert_eq!(params, json!(["s1.method", [["one"]]]));
+            w.respond_ok(&id, json!([{ "result": 1, "error": null }]));
+            w.expect_close();
+        }),
+        Box::new(|mut w: Wire| {
+            w.accept_session("/api/current");
+            let (id, params) = w.expect_call("core.bulk");
+            assert_eq!(params, json!(["s2.method", [["two"]]]));
+            w.respond_ok(&id, json!([{ "result": 2, "error": null }]));
+            w.expect_close();
+        }),
+    ];
+    let mock = serve(scripts);
+    let Some(mut api) = client_or_skip(&mock) else {
+        return;
+    };
+    let s1 = api.connect(SessionOpts::default()).expect("s1");
+    let s2 = api.connect(SessionOpts::default()).expect("s2");
+    let t1 = api
+        .queue_bulk(s1, "s1.method", &params!("one"))
+        .expect("q1");
+    let t2 = api
+        .queue_bulk(s2, "s2.method", &params!("two"))
+        .expect("q2");
+    api.flush_bulk();
+
+    let mut done: std::collections::HashMap<_, i64> =
+        std::collections::HashMap::new();
+    while done.len() < 2 {
+        match api.pump(Some(Duration::from_secs(10))).expect("pump") {
+            Some(ApiEvent::BulkFlushed { .. }) => {}
+            Some(ApiEvent::BulkItemDone { ticket, result }) => {
+                let v: Value = result.expect("item ok").decode().expect("i64");
+                done.insert(ticket, v.as_i64().expect("i64"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    assert_eq!(done[&t1], 1);
+    assert_eq!(done[&t2], 2);
+    shutdown(&mut api, s1);
+    shutdown(&mut api, s2);
     mock.join();
 }
 

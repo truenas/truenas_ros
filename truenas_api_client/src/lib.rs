@@ -43,14 +43,15 @@ mod server;
 mod session;
 
 pub use config::{
-    ApiConfig, MIDDLEWARE_MSG_CAP, MIDDLEWARE_MSG_CAP_EXTENDED, SessionOpts,
+    ApiConfig, MIDDLEWARE_MSG_CAP, MIDDLEWARE_MSG_CAP_EXTENDED,
+    MIN_API_VERSION, MSG_SIZE_EXTENDED_METHODS, SessionOpts, validate_endpoint,
 };
 pub use error::{
-    ApiError, CALL_ERROR, CallError, ExtraError, TOO_MANY_CONCURRENT_CALLS,
-    Trace,
+    ApiError, CALL_ERROR, CallError, ExtraError, INVALID_PARAMS,
+    TOO_MANY_CONCURRENT_CALLS, Trace,
 };
 pub use server::{JsonRpcServer, ServerAct, ServerStep};
-pub use session::CollectionUpdate;
+pub use session::{CALL_BUDGET, CollectionUpdate};
 // The WebSocket codec is the parent crate's `ws` module; the middlewared
 // specifics (JSON-RPC, sessions, the bulk queue) are what live here. A
 // consumer that wants the handshake-refusal reason, or a mock answering a
@@ -73,6 +74,7 @@ use serde_json::Value;
 use serde_json::value::RawValue;
 use session::{Act, Kind, Phase, Session};
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::time::{Duration, Instant};
 use truenas_ros::net::client::{Client, ConnId, ConnectOpts, Event};
 use truenas_ros::net::{Framing, ServerAddr};
@@ -112,8 +114,22 @@ pub struct BulkTicket(u64);
 
 /// An owned, still-encoded JSON-RPC `result`: decode it into the type the
 /// method returns, or keep it raw.
-#[derive(Debug)]
+///
+/// [`Debug`] reports its size and not its content. A method's result is
+/// whatever the caller asked middlewared for - `auth.*` tokens, a
+/// `datastore.query` row, a key - and `{:?}` on an event is how it would
+/// reach a log file. middlewared draws the same line: results go to the
+/// caller intact and through `remove_secrets` on the way to the audit
+/// record (`api/base/handler/remove_secrets.py`, used by
+/// `handler/dump_params.py`). [`OwnedResult::get`] and
+/// [`OwnedResult::decode`] are the caller's side of it.
 pub struct OwnedResult(Box<RawValue>);
+
+impl fmt::Debug for OwnedResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "OwnedResult(<{} bytes>)", self.0.get().len())
+    }
+}
 
 impl OwnedResult {
     /// Decode into `R`.
@@ -128,8 +144,13 @@ impl OwnedResult {
 }
 
 /// What [`ApiClient::pump`] surfaces.
+///
+/// Its [`Debug`] is written out rather than derived, and the `match` in
+/// it is exhaustive on purpose: every variant that carries server data
+/// has to decide whether `{:?}` prints it, and a new one will not
+/// compile until someone does. See [`OwnedResult`] for the line being
+/// drawn.
 #[non_exhaustive]
-#[derive(Debug)]
 pub enum ApiEvent {
     /// The session finished its handshake and setup; calls flow.
     SessionReady(SessionId),
@@ -217,12 +238,111 @@ pub enum ApiEvent {
     },
 }
 
+impl fmt::Debug for ApiEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SessionReady(s) => {
+                f.debug_tuple("SessionReady").field(s).finish()
+            }
+            Self::SessionFailed { session, error } => f
+                .debug_struct("SessionFailed")
+                .field("session", session)
+                .field("error", error)
+                .finish(),
+            Self::CallDone { call, result } => f
+                .debug_struct("CallDone")
+                .field("call", call)
+                .field("result", result)
+                .finish(),
+            Self::SubscriptionReady { call, sub } => f
+                .debug_struct("SubscriptionReady")
+                .field("call", call)
+                .field("sub", sub)
+                .finish(),
+            Self::Unsubscribed { call, sub } => f
+                .debug_struct("Unsubscribed")
+                .field("call", call)
+                .field("sub", sub)
+                .finish(),
+            Self::CollectionUpdate { session, update } => f
+                .debug_struct("CollectionUpdate")
+                .field("session", session)
+                .field("update", update)
+                .finish(),
+            // An error payload, not a result: it exists to be reported.
+            Self::SubscriptionEnded {
+                session,
+                collection,
+                error,
+            } => f
+                .debug_struct("SubscriptionEnded")
+                .field("session", session)
+                .field("collection", collection)
+                .field("error", error)
+                .finish(),
+            // A notification this client does not model, so its params
+            // are unread server data - the same question a result asks.
+            Self::Notification {
+                session,
+                method,
+                params,
+            } => f
+                .debug_struct("Notification")
+                .field("session", session)
+                .field("method", method)
+                .field("params", &Opaque(params.as_ref()))
+                .finish(),
+            Self::BulkItemDone { ticket, result } => f
+                .debug_struct("BulkItemDone")
+                .field("ticket", ticket)
+                .field("result", result)
+                .finish(),
+            Self::BulkFlushed { method, items } => f
+                .debug_struct("BulkFlushed")
+                .field("method", method)
+                .field("items", items)
+                .finish(),
+            Self::SessionClosed { session, reason } => f
+                .debug_struct("SessionClosed")
+                .field("session", session)
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
+/// A `Value` reported by size rather than content, for the same reason
+/// [`OwnedResult`]'s [`Debug`] is.
+pub(crate) struct Opaque<'a>(pub(crate) Option<&'a Value>);
+
+impl fmt::Debug for Opaque<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            None => f.write_str("None"),
+            Some(v) => write!(f, "<{} bytes>", v.to_string().len()),
+        }
+    }
+}
+
 /// The reply framer type driving the underlying client.
 type Framer = fn(&[u8], &mut WsState) -> Framing;
 
 /// The non-blocking middlewared client: one io_uring ring, any number of
 /// sessions, caller-pumped. `!Send` like the client it embeds - one ring,
 /// one thread.
+/// `now + d`, or `None` when there is no bound - which is what `None`
+/// already means everywhere this feeds, and what an unrepresentable one
+/// has to mean.
+///
+/// `Instant + Duration` panics on overflow, and the durations here are
+/// caller-supplied: `ApiConfig::call_timeout` and `connect_timeout` are
+/// plain `Option<Duration>` fields, and `pump`'s argument is whatever the
+/// caller passes - `Duration::MAX` being an ordinary way to spell "wait
+/// as long as it takes". A library must not abort the process over that.
+fn deadline_in(d: Option<Duration>) -> Option<Instant> {
+    Instant::now().checked_add(d?)
+}
+
 pub struct ApiClient {
     client: Client<WsState, Framer>,
     cfg: ApiConfig,
@@ -231,11 +351,12 @@ pub struct ApiClient {
     out: VecDeque<ApiEvent>,
     next_call: u64,
     next_sub: u64,
-    /// The deferred, tick-batched submission queue.
-    bulk: BulkQueue,
-    /// The session the deferred queue flushes on (the last one
-    /// `queue_bulk` named). One nominated session, per the API contract.
-    bulk_session: Option<SessionId>,
+    /// The deferred, tick-batched submission queues: one per session,
+    /// because `core.bulk` executes its items under the calling session's
+    /// credentials, so an item's session is part of what it *is*. Held in
+    /// first-queued order so a flush is deterministic; the count is
+    /// bounded by `max_sessions`, which makes the linear lookup free.
+    bulk: Vec<(ConnId, BulkQueue)>,
     /// core.bulk calls in flight, each mapped to what it carries, so the
     /// batch's array result fans back out to per-item events.
     bulk_carriers: HashMap<CallId, (String, Vec<BulkTicket>)>,
@@ -282,8 +403,7 @@ impl ApiClient {
             out: VecDeque::new(),
             next_call: 1,
             next_sub: 1,
-            bulk: BulkQueue::default(),
-            bulk_session: None,
+            bulk: Vec::new(),
             bulk_carriers: HashMap::new(),
             next_ticket: 1,
             last_tick: None,
@@ -299,6 +419,10 @@ impl ApiClient {
         &mut self,
         opts: SessionOpts,
     ) -> Result<SessionId, ApiError> {
+        // Before the dial: the endpoint is spliced into the request line
+        // and decides which API version answers, so both refusals belong
+        // here rather than at a half-open connection.
+        crate::config::validate_endpoint(&self.cfg.endpoint)?;
         let mut copts = ConnectOpts::default();
         if let Some(who) = opts.personality {
             copts = copts.personality(who);
@@ -317,6 +441,7 @@ impl ApiClient {
                 opts.legacy_jobs,
                 opts.max_outbound_bytes,
                 self.cfg.max_message_bytes,
+                self.cfg.max_queued_calls,
             ),
         );
         Ok(SessionId(conn))
@@ -331,7 +456,7 @@ impl ApiClient {
         opts: SessionOpts,
     ) -> Result<SessionId, ApiError> {
         let sid = self.connect_start(opts)?;
-        let deadline = self.cfg.connect_timeout.map(|d| Instant::now() + d);
+        let deadline = deadline_in(self.cfg.connect_timeout);
         let got = self.wait_for(deadline, |ev| {
             matches!(ev, ApiEvent::SessionReady(s) if *s == sid)
                 || matches!(
@@ -363,7 +488,7 @@ impl ApiClient {
     ) -> Result<CallId, ApiError> {
         let raw = array_params(params)?;
         let call = self.mint_call();
-        let deadline = self.cfg.call_timeout.map(|d| Instant::now() + d);
+        let deadline = deadline_in(self.cfg.call_timeout);
         let acts = {
             let sess = self.session_mut(session)?;
             if !matches!(sess.phase, Phase::Open) {
@@ -389,7 +514,7 @@ impl ApiClient {
         let call = self.mint_call();
         let sub = SubscriptionId(self.next_sub);
         self.next_sub += 1;
-        let deadline = self.cfg.call_timeout.map(|d| Instant::now() + d);
+        let deadline = deadline_in(self.cfg.call_timeout);
         let acts = {
             let sess = self.session_mut(session)?;
             if !matches!(sess.phase, Phase::Open) {
@@ -420,7 +545,7 @@ impl ApiClient {
         sub: SubscriptionId,
     ) -> Result<CallId, ApiError> {
         let call = self.mint_call();
-        let deadline = self.cfg.call_timeout.map(|d| Instant::now() + d);
+        let deadline = deadline_in(self.cfg.call_timeout);
         let acts = {
             let sess = self.session_mut(session)?;
             let Some(ident) = sess.sub_ident(sub) else {
@@ -450,9 +575,15 @@ impl ApiClient {
     /// Array shape a direct call takes; [`params!`] builds one). Use this
     /// for background work whose latency does not matter and whose volume
     /// would otherwise flood middlewared - a per-item request becomes a
-    /// per-method-per-tick one. `core.bulk` runs the items under
-    /// `session`'s own credentials, so nominate a session (typically the
-    /// root one) whose identity may make every queued call.
+    /// per-method-per-tick one.
+    ///
+    /// `core.bulk` runs the items under `session`'s own credentials, so
+    /// each item is queued *against* the session named here and flushes on
+    /// that session and no other - queueing against a second session opens
+    /// a second queue rather than re-aiming the first. Whichever session
+    /// an item names must be one whose identity may make that call.
+    /// [`ApiConfig::max_queued_bulk_items`] bounds the client's queues
+    /// together, not each one.
     pub fn queue_bulk<P: Serialize + ?Sized>(
         &mut self,
         session: SessionId,
@@ -465,17 +596,26 @@ impl ApiClient {
             return Err(ApiError::UnknownSession);
         }
         let raw = array_params(args)?;
+        // The cap is client-wide, so charge it against every session's
+        // queue rather than letting each hold `max_queued_bulk_items`.
+        let cap = self.cfg.max_queued_bulk_items;
+        let queued: usize = self.bulk.iter().map(|(_, q)| q.len()).sum();
+        if queued >= cap {
+            return Err(ApiError::QueueFull { cap });
+        }
         let ticket = BulkTicket(self.next_ticket);
         self.next_ticket += 1;
-        self.bulk.enqueue(
-            ticket,
-            method,
-            raw,
-            self.cfg.max_queued_bulk_items,
-        )?;
-        // Remember which session carries the queue: the flush needs it,
-        // and one queue serves one nominated session.
-        self.bulk_session = Some(session);
+        let queue = match self.bulk.iter_mut().find(|(id, _)| *id == session.0)
+        {
+            Some((_, q)) => q,
+            None => {
+                self.bulk.push((session.0, BulkQueue::default()));
+                &mut self.bulk.last_mut().expect("just pushed").1
+            }
+        };
+        // The cap was charged client-wide just above, so the per-queue
+        // bound is not the one that governs here.
+        queue.enqueue(ticket, method, raw, usize::MAX)?;
         Ok(ticket)
     }
 
@@ -506,7 +646,7 @@ impl ApiClient {
         &mut self,
         timeout: Option<Duration>,
     ) -> Result<Option<ApiEvent>, ApiError> {
-        let until = timeout.map(|d| Instant::now() + d);
+        let until = deadline_in(timeout);
         loop {
             if let Some(ev) = self.out.pop_front() {
                 // A core.bulk carrier's answer is not a user CallDone: fan
@@ -544,7 +684,7 @@ impl ApiClient {
                 .values()
                 .filter_map(Session::next_deadline)
                 .min();
-            let next_tick = (!self.bulk.is_empty()).then(|| {
+            let next_tick = self.bulk_pending().then(|| {
                 self.last_tick.map_or(now, |last| last + self.cfg.bulk_tick)
             });
             let base_wait = match (until, next_deadline) {
@@ -841,14 +981,23 @@ impl ApiClient {
     }
 
     /// Fire expired call deadlines across every session.
+    ///
+    /// `pump` calls this on every iteration that has no event ready, so it
+    /// runs far more often than any deadline actually fires. Collecting
+    /// straight into `(conn, acts)` pairs - rather than every session's
+    /// `ConnId` up front, the borrow-checker workaround `apply`'s `&mut
+    /// self` would otherwise force - means the common case (nothing due)
+    /// touches the allocator not at all: an untouched `Vec` never
+    /// allocates.
     fn expire(&mut self, now: Instant) {
-        let conns: Vec<ConnId> = self.sessions.keys().copied().collect();
-        for conn in conns {
-            let acts = self
-                .sessions
-                .get_mut(&conn)
-                .map(|s| s.expire(now))
-                .unwrap_or_default();
+        let mut due: Vec<(ConnId, Vec<Act>)> = Vec::new();
+        for (&conn, sess) in self.sessions.iter_mut() {
+            let acts = sess.expire(now);
+            if !acts.is_empty() {
+                due.push((conn, acts));
+            }
+        }
+        for (conn, acts) in due {
             self.apply(conn, acts);
         }
     }
@@ -858,68 +1007,88 @@ impl ApiClient {
     /// tickets here rather than wedging the queue.
     fn flush_bulk_now(&mut self) {
         self.last_tick = Some(Instant::now());
-        if self.bulk.is_empty() {
-            return;
-        }
-        let Some(session) = self.bulk_session else {
-            return;
-        };
-        // A dead nominated session drops the queue with a clear failure
-        // rather than silently holding items no flush can ever send.
-        let Some(cap) = self.sessions.get(&session.0).map(|s| s.max_outbound())
-        else {
-            self.drain_bulk_to_closed("bulk session is gone");
-            return;
-        };
-
-        for method in self.bulk.methods() {
-            loop {
-                let mut oversized = Vec::new();
-                let chunk = self.bulk.take_chunk(&method, cap, &mut oversized);
-                for (ticket, len) in oversized {
-                    self.out.push_back(ApiEvent::BulkItemDone {
-                        ticket,
-                        result: Err(ApiError::TooLarge { len, cap }),
+        // Each session's queue flushes on that session: `core.bulk` runs
+        // its items under the calling session's credentials, so sending
+        // one session's items on another would execute them as the wrong
+        // principal.
+        for conn in self.bulk.iter().map(|(id, _)| *id).collect::<Vec<_>>() {
+            // A dead session drops its own queue with a clear failure
+            // rather than silently holding items no flush can ever send.
+            let Some(cap) = self.sessions.get(&conn).map(|s| s.max_outbound())
+            else {
+                self.drain_bulk_to_closed(conn, "bulk session is gone");
+                continue;
+            };
+            let session = SessionId(conn);
+            for method in self.bulk_methods(conn) {
+                loop {
+                    let mut oversized = Vec::new();
+                    let chunk = self.bulk_queue(conn).and_then(|q| {
+                        q.take_chunk(&method, cap, &mut oversized)
                     });
-                }
-                let Some(chunk) = chunk else { break };
-                let n = chunk.tickets.len();
-                // chunk.params is the whole `core.bulk` argument array
-                // already: `[method, [[args]...]]`. core.bulk is a job, so
-                // with legacy_jobs off its answer is the per-item array
-                // when the batch finishes.
-                match self.call_start(session, "core.bulk", &chunk.params) {
-                    Ok(call) => {
-                        self.bulk_carriers
-                            .insert(call, (method.clone(), chunk.tickets));
-                        self.out.push_back(ApiEvent::BulkFlushed {
-                            method: method.clone(),
-                            items: n,
+                    for (ticket, len) in oversized {
+                        self.out.push_back(ApiEvent::BulkItemDone {
+                            ticket,
+                            result: Err(ApiError::TooLarge { len, cap }),
                         });
                     }
-                    Err(e) => {
-                        // The flush call itself could not be submitted;
-                        // fail this chunk's tickets and stop the method.
-                        let reason = e.to_string();
-                        for ticket in chunk.tickets {
-                            self.out.push_back(ApiEvent::BulkItemDone {
-                                ticket,
-                                result: Err(ApiError::Closed {
-                                    reason: reason.clone(),
-                                }),
+                    let Some(chunk) = chunk else { break };
+                    let n = chunk.tickets.len();
+                    // chunk.params is the whole `core.bulk` argument array
+                    // already: `[method, [[args]...]]`. core.bulk is a job,
+                    // so with legacy_jobs off its answer is the per-item
+                    // array when the batch finishes.
+                    match self.call_start(session, "core.bulk", &chunk.params) {
+                        Ok(call) => {
+                            self.bulk_carriers
+                                .insert(call, (method.clone(), chunk.tickets));
+                            self.out.push_back(ApiEvent::BulkFlushed {
+                                method: method.clone(),
+                                items: n,
                             });
                         }
-                        break;
+                        Err(e) => {
+                            // The flush call itself could not be submitted;
+                            // fail this chunk's tickets and stop the method.
+                            let reason = e.to_string();
+                            for ticket in chunk.tickets {
+                                self.out.push_back(ApiEvent::BulkItemDone {
+                                    ticket,
+                                    result: Err(ApiError::Closed {
+                                        reason: reason.clone(),
+                                    }),
+                                });
+                            }
+                            break;
+                        }
                     }
                 }
             }
         }
+        self.bulk.retain(|(_, q)| !q.is_empty());
+    }
+
+    /// `conn`'s deferred queue, if it has one.
+    fn bulk_queue(&mut self, conn: ConnId) -> Option<&mut BulkQueue> {
+        self.bulk
+            .iter_mut()
+            .find(|(id, _)| *id == conn)
+            .map(|(_, q)| q)
+    }
+
+    /// The methods `conn` has queued, in flush order.
+    fn bulk_methods(&self, conn: ConnId) -> Vec<String> {
+        self.bulk
+            .iter()
+            .find(|(id, _)| *id == conn)
+            .map(|(_, q)| q.methods())
+            .unwrap_or_default()
     }
 
     /// Whether the tick has elapsed since the last flush (or nothing has
     /// flushed yet and items are waiting).
     fn bulk_tick_due(&self, now: Instant) -> bool {
-        if self.bulk.is_empty() {
+        if !self.bulk_pending() {
             return false;
         }
         match self.last_tick {
@@ -928,12 +1097,19 @@ impl ApiClient {
         }
     }
 
-    /// Fail every queued item (the nominated session died before a flush).
-    fn drain_bulk_to_closed(&mut self, why: &str) {
+    /// Whether any session has deferred items waiting.
+    fn bulk_pending(&self) -> bool {
+        self.bulk.iter().any(|(_, q)| !q.is_empty())
+    }
+
+    /// Fail every item `conn` has queued (its session died before a
+    /// flush).
+    fn drain_bulk_to_closed(&mut self, conn: ConnId, why: &str) {
         let mut oversized = Vec::new();
-        for method in self.bulk.methods() {
-            while let Some(chunk) =
-                self.bulk.take_chunk(&method, usize::MAX, &mut oversized)
+        for method in self.bulk_methods(conn) {
+            while let Some(chunk) = self
+                .bulk_queue(conn)
+                .and_then(|q| q.take_chunk(&method, usize::MAX, &mut oversized))
             {
                 for ticket in chunk.tickets {
                     self.out.push_back(ApiEvent::BulkItemDone {
