@@ -213,7 +213,14 @@ impl Session {
     }
 
     /// The upgrade request to send once the transport connects.
-    pub(crate) fn upgrade(&self, endpoint: &str) -> Vec<u8> {
+    ///
+    /// Fails on an endpoint `ws::validate_request_target` refuses;
+    /// `ApiClient::connect_start` screens the same value before it dials,
+    /// so reaching this is a caller that went around it.
+    pub(crate) fn upgrade(
+        &self,
+        endpoint: &str,
+    ) -> Result<Vec<u8>, HandshakeError> {
         ws::upgrade_request(endpoint, &self.key)
     }
 

@@ -676,8 +676,10 @@ impl ApiClient {
                 let Some(sess) = self.sessions.get(&conn) else {
                     return;
                 };
-                let up = sess.upgrade(&self.cfg.endpoint);
-                self.send_or_fault(conn, up);
+                match sess.upgrade(&self.cfg.endpoint) {
+                    Ok(up) => self.send_or_fault(conn, up),
+                    Err(e) => self.apply(conn, vec![Act::Failed(e)]),
+                }
             }
             Event::ConnectFailed { conn, err } => {
                 if self.sessions.remove(&conn).is_some() {

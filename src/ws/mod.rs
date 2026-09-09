@@ -86,6 +86,12 @@ pub const OP_PONG: u8 = 0xA;
 /// `client-ws.c:217`, `server-ws.c:687`).
 const ACCEPT_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+/// §7.4.1's 1002: the connection is ending because of a protocol error.
+pub const CLOSE_PROTOCOL_ERROR: u16 = 1002;
+/// §7.4.1's 1007: data inside a message was inconsistent with the message
+/// type - non-UTF-8 where §5.6/§5.5.1 require UTF-8.
+pub const CLOSE_INVALID_PAYLOAD: u16 = 1007;
+
 /// Bound on the HTTP response head. A 101 is a few hundred bytes; anything
 /// that reaches this without a blank line is not a WebSocket handshake.
 const MAX_HEAD: usize = 16 * 1024;
@@ -240,9 +246,18 @@ fn parse_head(buf: &[u8], require_mask: bool) -> HeadVerdict {
 }
 
 /// Recover a masked client frame's payload in place, using the 4-byte key
-/// at the tail of its `header` (as [`server_frame_head`] framed it). A no-op
-/// on an unmasked header (fewer than 4 bytes of key is a caller error, so
-/// this asserts the header is a masked one).
+/// at the tail of its `header` - the header [`server_frame_head`] framed,
+/// and only that.
+///
+/// **This is not a no-op on an unmasked header, and cannot be made one.**
+/// The mask bit lives in the header's second byte, but a masked header is
+/// 6, 8 or 14 bytes and an unmasked one 2, 4 or 10 (RFC 6455 §5.2), so
+/// the last four bytes of an unmasked 4- or 10-byte header are its own
+/// length field - XORing a payload with those silently corrupts it, and a
+/// 2-byte unmasked header trips the length assert below, which is a plain
+/// `assert!` and so fires in release too. Server-to-client frames are
+/// never masked (§5.3), which is why [`frame_head`]'s output must not be
+/// passed here.
 pub fn unmask(header: &[u8], payload: &mut [u8]) {
     assert!(
         header.len() >= 4,
@@ -251,6 +266,60 @@ pub fn unmask(header: &[u8], payload: &mut [u8]) {
     let key = &header[header.len() - 4..];
     for (i, b) in payload.iter_mut().enumerate() {
         *b ^= key[i % 4];
+    }
+}
+
+/// Whether `code` may be *sent* as a Close frame status code (RFC 6455
+/// §7.4.1, §7.4.2). The sendable defined codes are 1000-1003 and 1007-1011,
+/// plus 3000-4999 for libraries, frameworks and private agreement. 1004,
+/// 1005, 1006 and 1015 are reserved values §7.4.1 says an endpoint MUST NOT
+/// set, and the rest carries no meaning to send: 0-999 is "not used", and
+/// 1012-1014, 1016-2999 and 5000+ are undefined by this revision.
+///
+/// A code arriving from a peer is a different question - a receiver reports
+/// whatever it was told. This bounds only what goes back out, which is why
+/// [`close_echo_code`] and not this is what the close discipline calls.
+pub fn is_sendable_close_code(code: u16) -> bool {
+    // 1000-1011 are §7.4.1's own definitions, less the three it forbids an
+    // endpoint to send (1004 undefined, 1005 and 1006 reserved-not-on-wire).
+    // 1012-1014 (Service Restart, Try Again Later, Bad Gateway) appear
+    // nowhere in RFC 6455 - they are later IANA registrations, which §7.4.2
+    // provides for ("reserved for definition by this protocol, its future
+    // revisions, and extensions specified in a permanent and readily
+    // available public specification"), so they are sendable and echoable.
+    // 1015 stays out: §7.4.1 forbids setting it. 3000-3999 are registered
+    // library/framework codes and 4000-4999 private, both sendable.
+    matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
+}
+
+/// The status code to answer a peer's close frame with, given its whole
+/// close body: §5.5.1 has the endpoint echo the code it received, and
+/// §7.4.1 bounds which codes it may put on the wire, so this is the echo
+/// with that bound applied.
+///
+/// - No body: `None` - answer with no body either.
+/// - A one-byte body: [`CLOSE_PROTOCOL_ERROR`]. §5.5.1 - "If there is a
+///   body, the first two bytes of the body MUST be a 2-byte unsigned
+///   integer" - so one byte is a malformed frame, not a code.
+/// - A code [`is_sendable_close_code`] refuses: [`CLOSE_PROTOCOL_ERROR`],
+///   because reflecting it would be this endpoint setting it.
+/// - A reason that is not valid UTF-8: [`CLOSE_INVALID_PAYLOAD`] (§5.5.1
+///   makes /reason/ UTF-8; §8.1 makes an invalid stream fatal).
+/// - Otherwise the peer's own code.
+pub fn close_echo_code(payload: &[u8]) -> Option<u16> {
+    match payload.len() {
+        0 => None,
+        1 => Some(CLOSE_PROTOCOL_ERROR),
+        _ => {
+            let code = u16::from_be_bytes([payload[0], payload[1]]);
+            if !is_sendable_close_code(code) {
+                Some(CLOSE_PROTOCOL_ERROR)
+            } else if std::str::from_utf8(&payload[2..]).is_err() {
+                Some(CLOSE_INVALID_PAYLOAD)
+            } else {
+                Some(code)
+            }
+        }
     }
 }
 
@@ -411,14 +480,66 @@ fn encode(opcode: u8, payload: &[u8], mask: Option<[u8; 4]>) -> Vec<u8> {
     out
 }
 
+/// Bound on an endpoint. A request-target this long is not a mistake
+/// anyone makes by hand, and the request line has to fit a head the peer
+/// will read.
+const MAX_TARGET: usize = 2048;
+
+/// Whether `endpoint` may be spliced into a request line: non-empty, no
+/// longer than 2048 bytes, beginning with `/`, and every byte a visible
+/// ASCII character.
+///
+/// RFC 9112 §3 makes `request-line = method SP request-target SP
+/// HTTP-version CRLF`, so a target carrying CR, LF or a space does not
+/// produce a longer request line - it produces *more lines*. A `\r\n`
+/// closes the request line and everything after it is read as a header
+/// field, or as a second request; that is request splitting, and the
+/// endpoint is the one field of this handshake a deployment supplies.
+/// Rejecting every byte outside `0x21..=0x7E` also covers NUL, DEL, the
+/// C0 controls and anything non-ASCII, none of which belong in an
+/// origin-form target either (RFC 9110 §4.1 keeps a target to US-ASCII,
+/// percent-encoding the rest).
+///
+/// This is a bound on shape, not a URI parser: a target that clears it
+/// can still be a path middlewared does not serve, which the server
+/// answers for itself.
+pub fn validate_request_target(endpoint: &str) -> Result<(), HandshakeError> {
+    let bad = |value: &str| {
+        Err(HandshakeError::BadTarget {
+            value: value.escape_default().to_string(),
+        })
+    };
+    if endpoint.is_empty() || endpoint.len() > MAX_TARGET {
+        return bad(endpoint);
+    }
+    if !endpoint.starts_with('/') {
+        return bad(endpoint);
+    }
+    if !endpoint.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+        return bad(endpoint);
+    }
+    Ok(())
+}
+
 /// The upgrade request for `endpoint` (e.g. `/api/current`), carrying
 /// `key` as `Sec-WebSocket-Key`.
+///
+/// `endpoint` goes into the request line verbatim, so it is screened by
+/// [`validate_request_target`] first and this refuses rather than
+/// splicing - the screen is the whole defence against request splitting
+/// through a configured endpoint, and a caller that could skip it would
+/// be the hole. `key` is minted by [`ws_key`] and is base64 by
+/// construction.
 ///
 /// `Host: localhost` is what the reference Python client sends over the
 /// unix socket (it dials the path itself and hands its WebSocket layer a
 /// dummy `ws://localhost/...` URL), so it is the value every middlewared
 /// deployment has been accepting since the JSON-RPC API shipped.
-pub fn upgrade_request(endpoint: &str, key: &str) -> Vec<u8> {
+pub fn upgrade_request(
+    endpoint: &str,
+    key: &str,
+) -> Result<Vec<u8>, HandshakeError> {
+    validate_request_target(endpoint)?;
     let mut out = Vec::with_capacity(160 + endpoint.len());
     out.extend_from_slice(b"GET ");
     out.extend_from_slice(endpoint.as_bytes());
@@ -427,7 +548,7 @@ pub fn upgrade_request(endpoint: &str, key: &str) -> Vec<u8> {
     out.extend_from_slice(b"Sec-WebSocket-Key: ");
     out.extend_from_slice(key.as_bytes());
     out.extend_from_slice(b"\r\nSec-WebSocket-Version: 13\r\n\r\n");
-    out
+    Ok(out)
 }
 
 /// The `Sec-WebSocket-Accept` value that proves the peer parsed `key`:
@@ -480,6 +601,22 @@ pub enum HandshakeError {
     MissingKey,
     /// (Server side) `Sec-WebSocket-Version` was not `13`.
     BadVersion,
+    /// The `101` selected an extension or subprotocol this client never
+    /// offered - RFC 6455 §4.1 items 5 and 6 make either one fatal, and
+    /// [`upgrade_request`] offers neither, so any value at all is
+    /// unrequested. `header` names which one.
+    Unrequested {
+        /// `Sec-WebSocket-Extensions` or `Sec-WebSocket-Protocol`.
+        header: &'static str,
+        /// What the server put there, for the diagnosis.
+        value: String,
+    },
+    /// The endpoint is not a request-target that can go in a request line
+    /// (see [`validate_request_target`]).
+    BadTarget {
+        /// The offending endpoint, escaped, for the diagnosis.
+        value: String,
+    },
 }
 
 impl std::fmt::Display for HandshakeError {
@@ -502,6 +639,12 @@ impl std::fmt::Display for HandshakeError {
                 f.write_str("request carried no Sec-WebSocket-Key")
             }
             Self::BadVersion => f.write_str("Sec-WebSocket-Version was not 13"),
+            Self::Unrequested { header, value } => {
+                write!(f, "server selected {header}: {value}, never offered")
+            }
+            Self::BadTarget { value } => {
+                write!(f, "endpoint is not a usable request-target: {value}")
+            }
         }
     }
 }
@@ -514,6 +657,18 @@ impl std::error::Error for HandshakeError {}
 /// `Upgrade`/`Connection` carry the websocket tokens (case-insensitively),
 /// and `Sec-WebSocket-Accept` is byte-exactly [`accept_for`]`(key)` (base64
 /// is case-sensitive, so only surrounding whitespace is trimmed).
+///
+/// Two rules bound what else the head may carry. §4.1 items 5 and 6 make a
+/// server-selected extension or subprotocol fatal when the client did not
+/// offer it, and [`upgrade_request`] offers neither, so a non-empty
+/// `Sec-WebSocket-Extensions` or `Sec-WebSocket-Protocol` is always
+/// [`HandshakeError::Unrequested`]. That matters here beyond conformance:
+/// [`frame_head`] refuses every RSV bit, so an extension accepted at the
+/// handshake would surface as an unexplained `Framing::Invalid` on the
+/// peer's first extended frame instead of a named handshake failure.
+/// §11.3.3 makes `Sec-WebSocket-Accept` appear at most once, and a
+/// last-wins scan would let a right value excuse a wrong one behind it, so
+/// a second occurrence is [`HandshakeError::BadAccept`].
 ///
 /// `head` is the whole response head through its terminating blank line -
 /// what the framer's handshake phase cuts and delivers.
@@ -537,7 +692,7 @@ pub fn validate_101(head: &[u8], key: &str) -> Result<(), HandshakeError> {
     }
     let mut upgraded = false;
     let mut connection = false;
-    let mut accept_ok = false;
+    let mut accept_ok: Option<bool> = None;
     for h in resp.headers.iter() {
         if h.name.eq_ignore_ascii_case("upgrade") {
             upgraded = std::str::from_utf8(h.value)
@@ -548,17 +703,47 @@ pub fn validate_101(head: &[u8], key: &str) -> Result<(), HandshakeError> {
                     .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
             });
         } else if h.name.eq_ignore_ascii_case("sec-websocket-accept") {
-            accept_ok = std::str::from_utf8(h.value)
-                .is_ok_and(|v| v.trim() == accept_for(key));
+            // §11.3.3: at most once. A second one is refused rather than
+            // overwriting the first's verdict.
+            if accept_ok.is_some() {
+                return Err(HandshakeError::BadAccept);
+            }
+            accept_ok = Some(
+                std::str::from_utf8(h.value)
+                    .is_ok_and(|v| v.trim() == accept_for(key)),
+            );
+        } else if let Some(header) = unrequested_negotiation(h.name) {
+            // §4.1 items 5 and 6. An empty value selects nothing, so only a
+            // populated one is a selection.
+            let value = String::from_utf8_lossy(h.value).trim().to_owned();
+            if !value.is_empty() {
+                return Err(HandshakeError::Unrequested { header, value });
+            }
         }
     }
     if !upgraded || !connection {
         return Err(HandshakeError::NotUpgraded);
     }
-    if !accept_ok {
+    if accept_ok != Some(true) {
         return Err(HandshakeError::BadAccept);
     }
     Ok(())
+}
+
+/// The canonical name of a negotiation header this client never offers, or
+/// `None` for anything else. [`upgrade_request`] sends no
+/// `Sec-WebSocket-Extensions` and no `Sec-WebSocket-Protocol`, so a server
+/// naming either has selected something that was not on offer (RFC 6455
+/// §4.1 items 5 and 6, and §9's "A server MUST NOT respond with any
+/// extension not requested by the client").
+fn unrequested_negotiation(name: &str) -> Option<&'static str> {
+    if name.eq_ignore_ascii_case("sec-websocket-extensions") {
+        Some("Sec-WebSocket-Extensions")
+    } else if name.eq_ignore_ascii_case("sec-websocket-protocol") {
+        Some("Sec-WebSocket-Protocol")
+    } else {
+        None
+    }
 }
 
 /// Validate a client's `GET` upgrade request and return its
@@ -1007,7 +1192,7 @@ mod tests {
     /// route has been accepting from the reference client.
     #[test]
     fn upgrade_request_is_byte_exact() {
-        let req = upgrade_request("/api/current", "AAAA");
+        let req = upgrade_request("/api/current", "AAAA").unwrap();
         assert_eq!(
             std::str::from_utf8(&req).unwrap(),
             "GET /api/current HTTP/1.1\r\n\
@@ -1169,5 +1354,160 @@ mod tests {
                 .collect();
             assert_eq!(got, payload, "payload unmasks to the original");
         }
+    }
+
+    /// An endpoint reaches the wire inside `request-line = method SP
+    /// request-target SP HTTP-version CRLF` (RFC 9112 §3), so a target
+    /// carrying CR, LF or a space does not lengthen that line - it ends
+    /// it, and what follows is read as a header field or a second
+    /// request. The screen is what keeps a configured endpoint from
+    /// forging either.
+    #[test]
+    fn a_request_target_that_would_split_the_request_is_refused() {
+        for good in [
+            "/",
+            "/api/current",
+            "/api/v26.0.0",
+            "/api/current?x=1&y=%20",
+            "/a/b/c#frag",
+        ] {
+            assert!(
+                validate_request_target(good).is_ok(),
+                "{good:?} must be accepted"
+            );
+            assert!(upgrade_request(good, "AAAA").is_ok());
+        }
+        for bad in [
+            "",                              // no target at all
+            "api/current",                   // not origin-form
+            "/api/cur rent",                 // ends the target
+            "/api/current\r\nX-Injected: 1", // forges a header
+            "/a HTTP/1.1\r\n\r\nGET /admin", // forges a request
+            "/api/\ncurrent",                // bare LF
+            "/api/\u{0}current",             // NUL
+            "/api/\u{7f}current",            // DEL
+            "/api/café",                     // non-ASCII
+            &format!("/{}", "a".repeat(MAX_TARGET)),
+        ] {
+            assert!(
+                matches!(
+                    validate_request_target(bad),
+                    Err(HandshakeError::BadTarget { .. })
+                ),
+                "{bad:?} must be refused"
+            );
+            assert!(
+                upgrade_request(bad, "AAAA").is_err(),
+                "{bad:?} must not reach a request line"
+            );
+        }
+        // The screen is the whole defence, so pin what it defends: one
+        // request line, five headers, and the blank line that ends the
+        // head - seven CRLFs and no more.
+        let req = upgrade_request("/api/current", "AAAA").unwrap();
+        assert!(req.starts_with(b"GET /api/current HTTP/1.1\r\n"));
+        assert_eq!(
+            req.windows(2).filter(|w| w == b"\r\n").count(),
+            7,
+            "the head is a request line, five headers and a blank line"
+        );
+    }
+
+    /// §4.1 items 5 and 6: this client offers no extension and no
+    /// subprotocol, so a `101` selecting either is fatal - and it must be,
+    /// because `frame_head` refuses the RSV bits a negotiated extension
+    /// would then set. §11.3.3: `Sec-WebSocket-Accept` at most once, so a
+    /// right value behind a wrong one does not excuse it.
+    #[test]
+    fn validate_101_refuses_unoffered_negotiation_and_duplicate_accepts() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let head = |extra: &str| {
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\n{extra}Sec-WebSocket-Accept: {}\r\n\r\n",
+                accept_for(key)
+            )
+        };
+        assert!(
+            validate_101(head("").as_bytes(), key).is_ok(),
+            "the control"
+        );
+        for extra in [
+            "Sec-WebSocket-Extensions: permessage-deflate\r\n",
+            "sec-websocket-extensions: x-webkit-deflate-frame\r\n",
+            "Sec-WebSocket-Protocol: chat\r\n",
+        ] {
+            assert!(
+                matches!(
+                    validate_101(head(extra).as_bytes(), key),
+                    Err(HandshakeError::Unrequested { .. })
+                ),
+                "must refuse {extra:?}"
+            );
+        }
+        // An empty value selects nothing and is not a refusal.
+        assert!(
+            validate_101(head("Sec-WebSocket-Protocol: \r\n").as_bytes(), key)
+                .is_ok(),
+            "an empty selection is no selection"
+        );
+        // §11.3.3, both orders - a duplicate is refused either way.
+        let dup = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Accept: \
+             bm90LXRoZS1kaWdlc3Q=\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+            accept_for(key)
+        );
+        assert!(
+            matches!(
+                validate_101(dup.as_bytes(), key),
+                Err(HandshakeError::BadAccept)
+            ),
+            "a wrong accept is not excused by a right one behind it"
+        );
+        let dup_rev = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\
+             Sec-WebSocket-Accept: bm90LXRoZS1kaWdlc3Q=\r\n\r\n",
+            accept_for(key)
+        );
+        assert!(matches!(
+            validate_101(dup_rev.as_bytes(), key),
+            Err(HandshakeError::BadAccept)
+        ));
+    }
+
+    /// §7.4.1's send bound, and the echo it produces. The reserved values
+    /// an endpoint MUST NOT set never reach the wire; a sendable code is
+    /// passed through unchanged.
+    #[test]
+    fn close_echo_refuses_the_codes_no_endpoint_may_send() {
+        for code in [1000u16, 1001, 1002, 1003, 1007, 1011, 3000, 4999] {
+            assert!(is_sendable_close_code(code), "{code} is sendable");
+            assert_eq!(
+                close_echo_code(&code.to_be_bytes()),
+                Some(code),
+                "{code} echoes unchanged"
+            );
+        }
+        // §7.4.1's reserved values, and the ranges with no assigned meaning.
+        for code in [0u16, 999, 1004, 1005, 1006, 1015, 1016, 2999, 5000] {
+            assert!(!is_sendable_close_code(code), "{code} is not sendable");
+            assert_eq!(
+                close_echo_code(&code.to_be_bytes()),
+                Some(CLOSE_PROTOCOL_ERROR),
+                "{code} is answered 1002, not reflected"
+            );
+        }
+        // No body stays no body; a one-byte body is a malformed frame.
+        assert_eq!(close_echo_code(&[]), None);
+        assert_eq!(close_echo_code(&[0x03]), Some(CLOSE_PROTOCOL_ERROR));
+        // §5.5.1/§8.1: the reason must be UTF-8.
+        let mut bad = 1000u16.to_be_bytes().to_vec();
+        bad.extend_from_slice(&[0xFF, 0xFE]);
+        assert_eq!(close_echo_code(&bad), Some(CLOSE_INVALID_PAYLOAD));
+        let mut good = 1000u16.to_be_bytes().to_vec();
+        good.extend_from_slice(b"bye");
+        assert_eq!(close_echo_code(&good), Some(1000));
     }
 }
