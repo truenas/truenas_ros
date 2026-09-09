@@ -389,7 +389,11 @@ struct BrokerInner {
     /// The broker's pidfd (from `clone3(CLONE_PIDFD)`): race-free death
     /// detection ([`CredBroker::is_alive`]), signalling, and reaping.
     pidfd: OwnedFd,
-    rings: usize,
+    /// The ring descriptors this broker was spawned over, in the order
+    /// the child renumbered them (ring `i` is the child's
+    /// `RING_FD_BASE + i`). Kept so a handle can be asked for by *ring*
+    /// rather than by position - see [`CredBroker::handle_for`].
+    ring_fds: Vec<RawFd>,
 }
 
 impl Drop for BrokerInner {
@@ -439,7 +443,7 @@ impl std::fmt::Debug for CredBroker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CredBroker")
             .field("pid", &self.inner.pid)
-            .field("rings", &self.inner.rings)
+            .field("rings", &self.inner.ring_fds.len())
             .finish_non_exhaustive()
     }
 }
@@ -453,6 +457,13 @@ pub struct CredHandle {
 }
 
 impl CredHandle {
+    /// Which ring this handle mints on - its position in the slice
+    /// [`CredBroker::spawn`] was given. A [`Personality`] minted here is
+    /// meaningful on that ring and no other.
+    pub fn ring(&self) -> u8 {
+        self.ring
+    }
+
     /// Mint a [`Personality`] for `who` - the broker impersonates that
     /// identity just long enough to snapshot it.
     ///
@@ -491,9 +502,20 @@ impl CredHandle {
             )));
         }
         let id = self.broker.request(OP_REGISTER, self.ring, who)?;
+        // Through `Personality::from_raw`, not `Personality` directly:
+        // this is the one `Personality` built from data that crossed a
+        // process boundary, and `from_raw`'s `!= 0` refusal exists for
+        // exactly it. `sqe.personality == 0` means *no credential
+        // override*, so an op stamped with it runs under the reactor
+        // thread's ambient credentials - the root daemon - instead of the
+        // identity that was asked for. The kernel never allocates id 0
+        // (`XA_FLAGS_ALLOC1`), so a reply of 0 is malformed and refusing
+        // it is what keeps "personality 0 is unreachable from this API"
+        // true rather than merely intended.
         u16::try_from(id)
-            .map(Personality)
-            .map_err(|_| Errno::EINVAL.into())
+            .ok()
+            .and_then(Personality::from_raw)
+            .ok_or_else(|| Errno::EINVAL.into())
     }
 
     /// Retire a personality, freeing its kernel-held credential and its id.
@@ -800,6 +822,41 @@ impl CredBroker {
         let parent_end = unsafe { crate::fd::owned_from_raw(sv[0]) };
         let child_end = unsafe { crate::fd::owned_from_raw(sv[1]) };
 
+        // The child renumbers its descriptors through a scratch range above
+        // the highest fd it inherits (`tidy_child_fds`), so the layout needs
+        // `n + 1` descriptors of headroom over that high-water mark - a
+        // requirement that grows with the slice, and therefore with
+        // `MAX_RINGS`. `dup3` refuses a target at or above `RLIMIT_NOFILE`
+        // with `EBADF` (`ksys_dup3`, `/CODE/linux` `fs/file.c:1411-1412`)
+        // and `dup2_or_die` then `_exit`s the child - after the fork, so the
+        // parent learns of it only at `recv_reply`, with `CAP_SETUID`
+        // already shed and impersonation unrecoverable without a fresh
+        // process (see `is_alive`). Check the headroom here instead, while
+        // the caller still holds its capabilities and can retry with fewer
+        // rings: a `Validation` error costs it nothing, a dead child costs
+        // it the process.
+        let max_src = ring_fds
+            .iter()
+            .copied()
+            .fold(child_end.as_raw_fd(), |a, b| a.max(b));
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` over a stack `rlimit` this thread owns.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+            let top = child_fd_high_water(max_src, ring_fds.len());
+            if u64::from(top.unsigned_abs()) >= lim.rlim_cur {
+                return Err(crate::Error::Validation(format!(
+                    "not enough descriptor headroom to renumber {} ring(s): \
+                     the child would need descriptors up to {top}, but \
+                     RLIMIT_NOFILE is {}",
+                    ring_fds.len(),
+                    lim.rlim_cur
+                )));
+            }
+        }
+
         // The reply socket is the only thing standing between a stalled
         // broker and every caller in the process; see `RECV_TIMEOUT`.
         set_timeout(parent_end.as_raw_fd(), libc::SO_RCVTIMEO, RECV_TIMEOUT)?;
@@ -877,7 +934,7 @@ impl CredBroker {
                 }),
                 pid,
                 pidfd,
-                rings: ring_fds.len(),
+                ring_fds,
             }),
         };
         // Take the child's ready datagram before handing back a handle. A
@@ -898,13 +955,53 @@ impl CredBroker {
         Ok(broker)
     }
 
+    /// The handle for the ring `reactor` runs on.
+    ///
+    /// Prefer this to [`handle`](Self::handle). A [`Personality`] is
+    /// meaningful only on the ring that minted it - the kernel's id space
+    /// is per-ring and starts at 1 for each, so crossing two rings hits
+    /// rather than misses and runs the operation under another identity
+    /// (see [`Personality`]'s own type docs). Pairing the handle to the
+    /// ring here is what keeps a caller from having to carry that pairing
+    /// itself, in a second list beside the first.
+    ///
+    /// A reactor this broker was not spawned over is a `Validation`
+    /// error. The match is on the ring descriptor, so a reactor from the
+    /// spawn slice that has since been *dropped* can have its number
+    /// reused by an unrelated ring; keeping the spawn slice alive for the
+    /// broker's life is the existing contract and remains one.
+    pub fn handle_for<R: BrokerReactor + ?Sized>(
+        &self,
+        reactor: &R,
+    ) -> crate::Result<CredHandle> {
+        let fd = reactor.broker_ring_fd();
+        let index = self
+            .inner
+            .ring_fds
+            .iter()
+            .position(|&r| r == fd)
+            .ok_or_else(|| {
+                crate::Error::Validation(
+                    "that reactor's ring is not one this broker serves"
+                        .to_owned(),
+                )
+            })?;
+        self.handle(index as u8)
+    }
+
     /// The handle for ring `index` - the position of that [`UringFs`] in
     /// the slice passed to [`CredBroker::spawn`].
+    ///
+    /// Positional, so the caller carries the pairing between a ring and
+    /// its index in a second list beside the first, and a personality
+    /// minted through the wrong index runs its operations as another
+    /// ring's identity without failing. [`handle_for`](Self::handle_for)
+    /// takes the reactor instead and cannot be given the wrong one.
     pub fn handle(&self, index: u8) -> crate::Result<CredHandle> {
-        if usize::from(index) >= self.inner.rings {
+        if usize::from(index) >= self.inner.ring_fds.len() {
             return Err(crate::Error::Validation(format!(
                 "ring index {index} out of range (broker serves {})",
-                self.inner.rings
+                self.inner.ring_fds.len()
             )));
         }
         Ok(CredHandle {
@@ -1492,6 +1589,19 @@ fn tidy_child_fds(sock: RawFd, ring_fds: &[RawFd]) -> usize {
     n
 }
 
+/// The highest descriptor number [`tidy_child_fds`] will name for a child
+/// inheriting `n` rings whose highest inherited descriptor is `max_src`.
+///
+/// Split out so it can be checked before the fork: `dup3` refuses a target
+/// at or above `RLIMIT_NOFILE` (`ksys_dup3`, `/CODE/linux`
+/// `fs/file.c:1411-1412`), and in the child that refusal is a `_exit`, not
+/// an error the parent can act on. The value grows with `n`, so it is what
+/// makes [`MAX_RINGS`] cost descriptors rather than nothing.
+fn child_fd_high_water(max_src: RawFd, n: usize) -> RawFd {
+    let scratch_base = max_src.max(RING_FD_BASE + n as RawFd) + 1;
+    scratch_base + n as RawFd
+}
+
 /// `dup2(from, to)` retrying `EINTR`, aborting the (forked) child on any
 /// other failure - a wrong descriptor layout must never go on to serve
 /// requests.
@@ -1782,6 +1892,50 @@ mod tests {
              {what}"
         );
         false
+    }
+
+    /// The pre-fork headroom check must be exactly the range
+    /// `tidy_child_fds` renumbers through, and must scale with the ring
+    /// count - otherwise raising `MAX_RINGS` moves a `dup3` `EBADF` into
+    /// the window after `CAP_SETUID` is shed, where no caller can act on
+    /// it.
+    #[test]
+    fn the_child_fd_high_water_scales_with_the_ring_count() {
+        // Low `max_src`: the target range itself is the floor.
+        assert_eq!(child_fd_high_water(3, 1), RING_FD_BASE + 1 + 1 + 1);
+        // High `max_src`: scratch sits above it, one slot per ring plus the
+        // socket's own copy.
+        assert_eq!(child_fd_high_water(900, 8), 900 + 1 + 8);
+        assert_eq!(child_fd_high_water(900, 16), 900 + 1 + 16);
+        // Doubling MAX_RINGS costs exactly MAX_RINGS more descriptors.
+        assert_eq!(
+            child_fd_high_water(900, MAX_RINGS)
+                - child_fd_high_water(900, MAX_RINGS / 2),
+            (MAX_RINGS / 2) as RawFd
+        );
+    }
+
+    /// `spawn` refuses before the fork when the layout cannot fit under
+    /// `RLIMIT_NOFILE`, rather than forking a child that `_exit`s inside
+    /// `tidy_child_fds`. Driven through the arithmetic rather than by
+    /// lowering the process limit, which every other test in this binary
+    /// shares.
+    #[test]
+    fn a_layout_that_cannot_fit_is_refused_not_forked() {
+        let soft: u64 = 64;
+        // A daemon holding descriptors just under its soft limit.
+        let top = child_fd_high_water(60, MAX_RINGS);
+        assert!(
+            u64::from(top.unsigned_abs()) >= soft,
+            "16 rings over fd 60 must not fit under a soft limit of {soft}"
+        );
+        // The same daemon with one ring does fit, so the refusal is about
+        // the slice and a caller can retry.
+        let one = child_fd_high_water(60, 1);
+        assert!(
+            u64::from(one.unsigned_abs()) < soft,
+            "one ring over fd 60 must fit under {soft}"
+        );
     }
 
     /// Both halves of the ready handshake `spawn` consults before it hands

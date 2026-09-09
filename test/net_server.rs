@@ -10141,11 +10141,24 @@ fn fs_broker_serves_rings_mapped_on_worker_threads() {
             Err(e) => panic!("setup_ring: {e}"),
         }
     }
+    // One more ring, deliberately *not* handed to the broker: the
+    // pairing check has to refuse a reactor this broker does not serve,
+    // or it is not a pairing check.
+    let outsider = match setup_ring([addr.clone()], &cfg) {
+        Ok(r) => r,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("setup_ring: {e}"),
+    };
     let broker = match CredBroker::spawn(&rings.iter().collect::<Vec<_>>()) {
         Ok(b) => b,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("CredBroker::spawn: {e}"),
     };
+    assert!(
+        broker.handle_for(&outsider).is_err(),
+        "a ring this broker does not serve must not get a handle"
+    );
+    drop(outsider);
 
     // Each worker mints the peer on its still-unmapped ring, maps it, builds
     // the server around it, and reports its address and stop handle before
@@ -10153,7 +10166,15 @@ fn fs_broker_serves_rings_mapped_on_worker_threads() {
     let (tx, rx) = mpsc::channel::<(usize, SocketAddrV4, ShutdownHandle)>();
     let mut workers = Vec::new();
     for (i, ring) in rings.into_iter().enumerate() {
-        let creds = broker.handle(i as u8).expect("broker handle");
+        // By ring, not by position: a personality is meaningful only on
+        // the ring that minted it, and `i` here is a second list beside
+        // the first. The positional form must agree with it.
+        let creds = broker.handle_for(&ring).expect("broker handle");
+        assert_eq!(
+            creds.ring(),
+            broker.handle(i as u8).expect("broker handle").ring(),
+            "handle_for and handle must name the same ring"
+        );
         let anchor = anchor.clone();
         let addr = addr.clone();
         let tx = tx.clone();
