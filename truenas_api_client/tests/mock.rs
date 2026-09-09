@@ -370,6 +370,11 @@ fn ping_flood_never_wedges() {
 
 /// An oversized outbound message is refused before the wire - middlewared
 /// would close the whole connection - and the session keeps serving.
+///
+/// The method has to be one middlewared does *not* exempt: it grants the
+/// extended cap per method, after parsing, so 70 KiB under
+/// `filesystem.file_receive` is a message the server accepts and this
+/// client must not refuse.
 #[test]
 fn oversize_outbound_refused() {
     let mock = serve_one(|mut w: Wire| {
@@ -383,7 +388,7 @@ fn oversize_outbound_refused() {
     };
     let sid = api.connect(SessionOpts::default()).expect("connect");
     let big = "y".repeat(70 * 1024);
-    match api.call_start(sid, "filesystem.file_receive", &params!(big)) {
+    match api.call_start(sid, "pool.dataset.create", &params!(big)) {
         Err(ApiError::TooLarge { len, cap }) => {
             assert!(len > cap);
             assert_eq!(cap, truenas_api_client::MIDDLEWARE_MSG_CAP);

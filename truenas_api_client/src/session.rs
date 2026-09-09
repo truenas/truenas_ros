@@ -1030,6 +1030,24 @@ mod tests {
             }
             other => panic!("an ordinary method must be refused: {other:?}"),
         }
+        // The exemption is a larger cap, not the absence of one:
+        // `parse_message` refuses above it before it reads the method
+        // at all.
+        let huge =
+            format!("[\"{}\"]", "x".repeat(crate::MIDDLEWARE_MSG_CAP_EXTENDED));
+        let huge = RawValue::from_string(huge).unwrap();
+        match s.submit(
+            crate::CallId(99),
+            Kind::User,
+            "filesystem.file_receive",
+            &huge,
+            None,
+        ) {
+            Err(ApiError::TooLarge { cap, .. }) => {
+                assert_eq!(cap, crate::MIDDLEWARE_MSG_CAP_EXTENDED)
+            }
+            other => panic!("the extended cap still bounds: {other:?}"),
+        }
     }
 
     /// A first fragment is held until a continuation arrives, so it is
