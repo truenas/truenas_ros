@@ -753,6 +753,12 @@ pub fn validate_101(head: &[u8], key: &str) -> Result<(), HandshakeError> {
     let mut upgraded: Option<bool> = None;
     let mut connection = false;
     let mut accept_ok: Option<bool> = None;
+    // §11.3.2 and §11.3.4 word these two the same way: each MAY appear
+    // multiple times in a *request* and "MUST NOT appear more than once in
+    // an HTTP response". They are the two negotiation slots, so they are
+    // tracked as two flags rather than a set.
+    let mut extensions_seen = false;
+    let mut protocol_seen = false;
     for h in resp.headers.iter() {
         if h.name.eq_ignore_ascii_case("upgrade") {
             // Equality, and at most once: two lines cannot combine into a
@@ -780,6 +786,19 @@ pub fn validate_101(head: &[u8], key: &str) -> Result<(), HandshakeError> {
                     .is_ok_and(|v| v.trim() == accept_for(key)),
             );
         } else if let Some(header) = unrequested_negotiation(h.name) {
+            // At most once in a response (§11.3.2, §11.3.4), checked
+            // before the value is read: a single *empty* line selects
+            // nothing and is tolerated, so without this a server could
+            // send two of them and neither would be refused - the one
+            // repeat rule in the handshake with no arm here.
+            let seen = if header == "Sec-WebSocket-Extensions" {
+                &mut extensions_seen
+            } else {
+                &mut protocol_seen
+            };
+            if std::mem::replace(seen, true) {
+                return Err(HandshakeError::DuplicateHeader { header });
+            }
             // §4.1 items 5 and 6. An empty value selects nothing, so only a
             // populated one is a selection.
             let value = String::from_utf8_lossy(h.value).trim().to_owned();
@@ -1535,6 +1554,38 @@ mod tests {
                 })
             ),
             "two nonces must not resolve to one of them"
+        );
+        // --- the two negotiation slots, which §11.3.2 and §11.3.4 also
+        // --- cap at one per response. An *empty* one selects nothing and
+        // --- is tolerated, so the repeat is the only thing to catch.
+        for header in ["Sec-WebSocket-Extensions", "Sec-WebSocket-Protocol"] {
+            let twice = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\n{header}: \r\n{header}: \r\n\
+                 Sec-WebSocket-Accept: {}\r\n\r\n",
+                accept_for(key)
+            );
+            assert!(
+                matches!(
+                    validate_101(twice.as_bytes(), key),
+                    Err(HandshakeError::DuplicateHeader { header: h }) if h == header
+                ),
+                "a repeated {header} must be refused in a response"
+            );
+        }
+
+        // The request direction needs the `Upgrade` duplicate rule too -
+        // the response-direction case above does not exercise this
+        // validator.
+        let two_upgrades = "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\
+             Upgrade: h2c\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: abc\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        assert!(
+            matches!(
+                validate_upgrade_request(two_upgrades.as_bytes()),
+                Err(HandshakeError::DuplicateHeader { header: "Upgrade" })
+            ),
+            "a repeated Upgrade must be refused in a request too"
         );
         let two_versions = "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\
              Connection: Upgrade\r\nSec-WebSocket-Key: abc\r\n\
