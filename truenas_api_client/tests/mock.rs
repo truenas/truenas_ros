@@ -15,7 +15,7 @@ use std::time::Duration;
 use support::{Mock, Wire, serve, serve_one};
 use truenas_api_client::{
     ApiClient, ApiConfig, ApiError, ApiEvent, CALL_BUDGET, HandshakeError,
-    MIN_API_VERSION, SessionOpts, params, validate_endpoint,
+    MAX_CALL_RETRIES, MIN_API_VERSION, SessionOpts, params, validate_endpoint,
 };
 
 /// The scenario-default config against `mock`'s socket.
@@ -137,6 +137,11 @@ fn bad_accept_fails_connect() {
 
 /// middlewared's -32001 payload decodes into the typed CallError, and a
 /// -32000 is its own retryable variant.
+///
+/// A `-32000` is reissued rather than reported, so the caller only hears
+/// about it once the reissues are spent - which is what the repeated
+/// refusals below are: the same call arriving again, under its own id,
+/// after each backoff.
 #[test]
 fn call_error_envelope() {
     let mock = serve_one(|mut w: Wire| {
@@ -159,8 +164,12 @@ fn call_error_envelope() {
                 "extra": [["pool_create.name", "Invalid name", 22]]
             })),
         );
-        let (id, _) = w.expect_call("pool.create");
-        w.respond_err(&id, -32000, "Too many concurrent calls", None);
+        // Refuse every reissue, then one more: the last is the one the
+        // caller is told about.
+        for _ in 0..=MAX_CALL_RETRIES {
+            let (id, _) = w.expect_call("pool.create");
+            w.respond_err(&id, -32000, "Too many concurrent calls", None);
+        }
     });
     let Some(mut api) = client_or_skip(&mock) else {
         return;
@@ -680,16 +689,31 @@ fn a_timed_out_call_returns_its_budget_slot() {
     let mock = serve_one(|mut w: Wire| {
         w.accept_session("/api/current");
         // Fill the budget and answer none of it.
-        for _ in 0..CALL_BUDGET {
-            let _ = w.expect_call("core.ping");
-        }
-        // The freed slot must let this one out.
+        let ids: Vec<_> = (0..CALL_BUDGET)
+            .map(|_| w.expect_call("core.ping").0)
+            .collect();
+        // A call issued after every one of those timed out must NOT
+        // reach the wire: this server is still holding all eight, and
+        // being told nothing by the client giving up.
+        // Long enough to cover the client's submission (which follows
+        // the 250 ms timeouts) and short enough that the answer below
+        // still beats that submission's own deadline.
+        let quiet =
+            w.count_client_text_frames_until_quiet(Duration::from_millis(350));
+        assert_eq!(
+            quiet, 0,
+            "the client sent more while the server held every slot"
+        );
+        // Answering one is what frees a slot - and the tombstone for that
+        // long-abandoned call must still correlate, or this answer faults
+        // the session instead of releasing the queue.
+        w.respond_ok(&ids[0], json!(null));
         let (id, _) = w.expect_call("after.timeouts");
-        w.respond_ok(&id, json!("sent-after-timeouts"));
+        w.respond_ok(&id, json!("sent-after-a-slot-came-back"));
         w.expect_close();
     });
     let cfg = ApiConfig {
-        call_timeout: Some(Duration::from_millis(200)),
+        call_timeout: Some(Duration::from_millis(250)),
         ..config(&mock)
     };
     let Some(mut api) = client_or_skip_cfg(cfg) else {
@@ -723,7 +747,7 @@ fn a_timed_out_call_returns_its_budget_slot() {
             Some(ApiEvent::CallDone { call, result }) if call == after => {
                 let got: String =
                     result.expect("answered").decode().expect("a string");
-                assert_eq!(got, "sent-after-timeouts");
+                assert_eq!(got, "sent-after-a-slot-came-back");
                 break;
             }
             Some(_) => {}
@@ -977,6 +1001,50 @@ fn a_setup_failure_fails_the_calls_it_already_accepted() {
     mock.join();
 }
 
+/// The deferred queue is bounded in bytes as well as in items. The count
+/// is a pipelining depth; each item carries its own encoded params and
+/// nothing bounds those at enqueue, so a count alone leaves the queue's
+/// memory at the item cap times whatever the caller queues.
+#[test]
+fn the_deferred_queue_is_bounded_in_bytes_too() {
+    let mock = serve_one(|mut w: Wire| {
+        w.accept_session("/api/current");
+        w.expect_close();
+    });
+    let cfg = ApiConfig {
+        // Room for many items, but only a little memory.
+        max_queued_bulk_items: 10_000,
+        max_queued_bulk_bytes: 64 * 1024,
+        ..config(&mock)
+    };
+    let Some(mut api) = client_or_skip_cfg(cfg) else {
+        return;
+    };
+    let sid = api.connect(SessionOpts::default()).expect("connect");
+    let big = "x".repeat(8 * 1024);
+    let mut queued = 0;
+    loop {
+        match api.queue_bulk(sid, "pool.snapshot", &params!(big.clone())) {
+            Ok(_) => queued += 1,
+            Err(ApiError::QueueFull { queue, cap }) => {
+                assert_eq!(cap, 64 * 1024, "the byte cap is what refused");
+                assert!(queue.contains("bytes"), "and it says so: {queue}");
+                break;
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(
+            queued < 100,
+            "the byte cap must bite long before the item cap of 10,000"
+        );
+    }
+    api.close(sid);
+    while api.is_open(sid) {
+        let _ = api.pump(Some(Duration::from_millis(50)));
+    }
+    mock.join();
+}
+
 /// A blocking wait sets aside every event that is not the one it wants,
 /// and a subscribed session lets the *peer* decide how many of those
 /// there are. Bound it: past the cap the wait fails rather than
@@ -1006,7 +1074,13 @@ fn a_blocking_wait_will_not_buffer_without_bound() {
     };
     let sid = api.connect(SessionOpts::default()).expect("connect");
     match api.call::<_, String>(sid, "core.ping", &params!()) {
-        Err(ApiError::QueueFull { cap }) => assert_eq!(cap, 8),
+        Err(ApiError::QueueFull { queue, cap }) => {
+            assert_eq!(cap, 8);
+            assert!(
+                queue.contains("blocking wait"),
+                "the message names the queue that filled: {queue}"
+            );
+        }
         other => panic!("expected the wait to be bounded, got {other:?}"),
     }
     // What was set aside is still deliverable - the bound refuses the
@@ -1022,6 +1096,119 @@ fn a_blocking_wait_will_not_buffer_without_bound() {
     while api.is_open(sid) {
         let _ = api.pump(Some(Duration::from_millis(50)));
     }
+    mock.join();
+}
+
+/// A wait refused by `max_waiting_events` must not be refused again on the
+/// events the refusal itself put back.
+///
+/// `wait_for` restores its set-aside to the front of `self.out`, and `pump`
+/// drains `self.out` before it touches the transport. Counting a restored
+/// event made the refusal self-sustaining: every later `call` tripped the
+/// cap on the previous one's stash without doing any I/O, so a healthy
+/// server answering every request could not get an answer through, and the
+/// frames those calls had just handed the transport were never flushed.
+#[test]
+fn a_refused_wait_does_not_refuse_the_calls_that_follow_it() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const FLOOD: usize = 64;
+    const ISSUED: usize = 20;
+    let seen = Arc::new(AtomicUsize::new(0));
+    let seen_w = seen.clone();
+    let mock = serve_one(move |mut w: Wire| {
+        w.accept_session("/api/current");
+        // The first call reaches the wire before the flood.
+        let (_id, _) = w.expect_call("core.ping");
+        for i in 0..FLOOD {
+            w.send_notification(
+                "collection_update",
+                json!({ "msg": "changed", "collection": "c", "id": i }),
+            );
+        }
+        // Answer nothing; count every further call that arrives.
+        let n =
+            w.count_client_text_frames_until_quiet(Duration::from_millis(900));
+        seen_w.store(n + 1, Ordering::SeqCst);
+    });
+    let cfg = ApiConfig {
+        max_waiting_events: 4,
+        call_timeout: Some(Duration::from_millis(80)),
+        ..config(&mock)
+    };
+    let Some(mut api) = client_or_skip_cfg(cfg) else {
+        return;
+    };
+    let sid = api.connect(SessionOpts::default()).expect("connect");
+    for _ in 0..ISSUED {
+        let _ = api.call::<_, String>(sid, "core.ping", &params!());
+    }
+    // Let the concurrency budget recycle so the backlog drains: the point
+    // is that the calls reach the wire at all, not how fast.
+    for _ in 0..60 {
+        let _ = api.pump(Some(Duration::from_millis(20)));
+    }
+    mock.join();
+    let n = seen.load(Ordering::SeqCst);
+    // With the refusal counting its own restored stash, exactly ONE of the
+    // twenty ever reached the wire - the wait short-circuited before any
+    // I/O, so even the frames already handed to the transport were never
+    // flushed.
+    //
+    // The number that should reach it is the concurrency budget, and no
+    // more: this mock answers nothing, and a call the server has not
+    // answered is one it is still running, so its slot does not come back
+    // when the client times out. What the wedge did is bound this by the
+    // *wait* rather than by the budget.
+    assert_eq!(
+        n, CALL_BUDGET,
+        "the concurrency budget is what bounds how many of the {ISSUED} \
+         reach the wire, not a refused wait"
+    );
+}
+
+/// The same, from the caller's side: a healthy server that buries one
+/// answer under a flood must still be able to answer the calls that come
+/// after, without the caller dropping to `pump`.
+#[test]
+fn a_flood_does_not_make_call_permanently_unusable() {
+    const FLOOD: usize = 64;
+    let mock = serve_one(|mut w: Wire| {
+        w.accept_session("/api/current");
+        let (id, _) = w.expect_call("core.ping");
+        for i in 0..FLOOD {
+            w.send_notification(
+                "collection_update",
+                json!({ "msg": "changed", "collection": "c", "id": i }),
+            );
+        }
+        w.respond_ok(&id, json!("pong"));
+        for _ in 0..11 {
+            let (id, _) = w.expect_call("core.ping");
+            w.respond_ok(&id, json!("pong"));
+        }
+        w.expect_close();
+    });
+    let cfg = ApiConfig {
+        max_waiting_events: 8,
+        ..config(&mock)
+    };
+    let Some(mut api) = client_or_skip_cfg(cfg) else {
+        return;
+    };
+    let sid = api.connect(SessionOpts::default()).expect("connect");
+    let mut oks = 0;
+    for _ in 0..12 {
+        if api.call::<_, String>(sid, "core.ping", &params!()).is_ok() {
+            oks += 1;
+        }
+    }
+    assert!(
+        oks >= 2,
+        "a healthy server answering every ping must not leave call() \
+         permanently refused: {oks} of 12 succeeded"
+    );
+    shutdown(&mut api, sid);
     mock.join();
 }
 
@@ -1359,7 +1546,10 @@ fn bulk_queue_full_refuses() {
     let sid = api.connect(SessionOpts::default()).expect("connect");
     api.queue_bulk(sid, "m", &params!(1)).expect("first fits");
     match api.queue_bulk(sid, "m", &params!(2)) {
-        Err(ApiError::QueueFull { cap }) => assert_eq!(cap, 1),
+        Err(ApiError::QueueFull { queue, cap }) => {
+            assert_eq!(cap, 1);
+            assert!(queue.contains("bulk"), "names the bulk queue: {queue}");
+        }
         other => panic!("expected QueueFull, got {other:?}"),
     }
     api.flush_bulk();
@@ -1406,5 +1596,126 @@ fn bulk_tick_flushes_automatically() {
     }
     assert_eq!(got, Some(7));
     shutdown(&mut api, sid);
+    mock.join();
+}
+
+/// RFC 6455 §5.5.1 on the wire, not just in the session: nothing with a data
+/// opcode may follow this client's own Close frame. `unsubscribe_start` was
+/// the one public call with no `Phase::Open` guard - its two siblings have
+/// one - and it reaches `Act::Send` through `submit`, so the backlog's own
+/// phase gate never sees it.
+#[test]
+fn no_data_frame_follows_our_own_close() {
+    let mock = serve_one(|mut w: Wire| {
+        w.accept_session("/api/current");
+        let (id, _) = w.expect_call("core.subscribe");
+        w.respond_ok(&id, json!("ident-1"));
+        let mut after_close = Vec::new();
+        let mut closed = false;
+        while let Some((opcode, _fin, _payload)) = w.read_frame_or_eof() {
+            if closed {
+                after_close.push(opcode);
+            }
+            if opcode == 0x8 {
+                closed = true;
+            }
+        }
+        assert!(closed, "the client sent a close frame");
+        assert!(
+            !after_close.contains(&0x1) && !after_close.contains(&0x2),
+            "a data frame followed our own Close: {after_close:?}"
+        );
+    });
+    let Some(mut api) = client_or_skip_cfg(config(&mock)) else {
+        return;
+    };
+    let sid = api.connect(SessionOpts::default()).expect("connect");
+    let _call = api.subscribe_start(sid, "reporting.realtime").expect("sub");
+    let sub = loop {
+        match api.pump(Some(Duration::from_secs(10))).expect("pump") {
+            Some(ApiEvent::SubscriptionReady { sub, .. }) => break sub,
+            Some(_) => {}
+            None => panic!("no subscription"),
+        }
+    };
+    api.close(sid);
+    assert!(
+        matches!(
+            api.unsubscribe_start(sid, sub),
+            Err(ApiError::Closed { .. })
+        ),
+        "unsubscribing a closing session must be refused, not sent"
+    );
+    let mut guard = 0;
+    while api.is_open(sid) && guard < 200 {
+        guard += 1;
+        if api
+            .pump(Some(Duration::from_millis(50)))
+            .expect("pump")
+            .is_none()
+        {
+            break;
+        }
+    }
+    mock.join();
+}
+
+/// The backlog half of the same rule, end to end: a call still queued when
+/// the Close goes out must not be drained onto the wire by a deadline
+/// sweep. `Session::expire` ends in `drain_backlog`, and `pump` runs it
+/// before it reaps any completion, so this is not a race.
+#[test]
+fn an_expiry_sweep_after_our_close_sends_nothing() {
+    let mock = serve_one(|mut w: Wire| {
+        w.accept_session("/api/current");
+        for _ in 0..CALL_BUDGET {
+            let _ = w.expect_call("core.ping");
+        }
+        let mut after_close = Vec::new();
+        let mut closed = false;
+        while let Some((opcode, _fin, _payload)) = w.read_frame_or_eof() {
+            if closed {
+                after_close.push(opcode);
+            }
+            if opcode == 0x8 {
+                closed = true;
+            }
+        }
+        assert!(closed, "the client sent a close frame");
+        assert!(
+            !after_close.contains(&0x1),
+            "a queued call was drained onto the wire after our own Close: \
+             {after_close:?}"
+        );
+    });
+    let cfg = ApiConfig {
+        call_timeout: Some(Duration::from_millis(200)),
+        ..config(&mock)
+    };
+    let Some(mut api) = client_or_skip_cfg(cfg) else {
+        return;
+    };
+    let sid = api.connect(SessionOpts::default()).expect("connect");
+    for _ in 0..CALL_BUDGET {
+        api.call_start(sid, "core.ping", &params!()).expect("start");
+    }
+    // Submitted later, so its own deadline is still ahead when the eight
+    // sent calls have passed theirs and freed the budget it waits on.
+    std::thread::sleep(Duration::from_millis(150));
+    api.call_start(sid, "queued.call", &params!())
+        .expect("queued");
+    std::thread::sleep(Duration::from_millis(80));
+    api.close(sid);
+    let mut guard = 0;
+    while api.is_open(sid) && guard < 200 {
+        guard += 1;
+        if api
+            .pump(Some(Duration::from_millis(50)))
+            .expect("pump")
+            .is_none()
+        {
+            break;
+        }
+    }
     mock.join();
 }

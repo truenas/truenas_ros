@@ -51,7 +51,7 @@ pub use error::{
     TOO_MANY_CONCURRENT_CALLS, Trace,
 };
 pub use server::{JsonRpcServer, ServerAct, ServerStep};
-pub use session::{CALL_BUDGET, CollectionUpdate};
+pub use session::{CALL_BUDGET, CollectionUpdate, MAX_CALL_RETRIES};
 // The WebSocket codec is the parent crate's `ws` module; the middlewared
 // specifics (JSON-RPC, sessions, the bulk queue) are what live here. A
 // consumer that wants the handshake-refusal reason, or a mock answering a
@@ -566,6 +566,18 @@ impl ApiClient {
         let deadline = deadline_in(self.cfg.call_timeout);
         let acts = {
             let sess = self.session_mut(session)?;
+            // The guard `call_start` and `subscribe_start` carry, and the
+            // route the backlog gate cannot reach: this call reaches
+            // `Act::Send` through `submit`, not `drain_backlog`, so
+            // without it one public call after `close()` puts a data frame
+            // on the wire behind the session's own Close frame - which
+            // RFC 6455 §5.5.1 forbids ("The application MUST NOT send any
+            // more data frames after sending a Close frame").
+            if !matches!(sess.phase, Phase::Open) {
+                return Err(ApiError::Closed {
+                    reason: "session is not open".into(),
+                });
+            }
             let Some(ident) = sess.sub_ident(sub) else {
                 return Err(ApiError::UnknownSession);
             };
@@ -619,7 +631,23 @@ impl ApiClient {
         let cap = self.cfg.max_queued_bulk_items;
         let queued: usize = self.bulk.iter().map(|(_, q)| q.len()).sum();
         if queued >= cap {
-            return Err(ApiError::QueueFull { cap });
+            return Err(ApiError::QueueFull {
+                queue: "the deferred bulk queue, in items",
+                cap,
+            });
+        }
+        // The count is a depth; this is the memory. An item carries its
+        // own encoded params and nothing bounds those at enqueue, so
+        // without this the queue's ceiling is the item cap times whatever
+        // the caller queues.
+        let bytes_cap = self.cfg.max_queued_bulk_bytes;
+        let queued_bytes: usize =
+            self.bulk.iter().map(|(_, q)| q.bytes()).sum();
+        if queued_bytes.saturating_add(raw.get().len()) > bytes_cap {
+            return Err(ApiError::QueueFull {
+                queue: "the deferred bulk queue, in bytes",
+                cap: bytes_cap,
+            });
         }
         let ticket = BulkTicket(self.next_ticket);
         self.next_ticket += 1;
@@ -782,6 +810,19 @@ impl ApiClient {
         mut pred: impl FnMut(&ApiEvent) -> bool,
     ) -> Result<ApiEvent, ApiError> {
         let mut skipped: VecDeque<ApiEvent> = VecDeque::new();
+        // Events already queued when this wait began are not buffered by
+        // it: `wait_for` restores its set-aside to the front of `self.out`
+        // on the way out, and `pump` drains `self.out` before it touches
+        // the transport, so moving one from `self.out` into `skipped`
+        // frees no memory and allocates none. Counting them made the
+        // refusal self-sustaining - the wait tripped the cap on the
+        // previous wait's own restored stash, without pumping any I/O, so
+        // once the client held `max_waiting_events` events every later
+        // `call`/`connect` was refused and the frames they had just
+        // handed the transport were never flushed. Only what arrives
+        // during this wait is new memory, so only that is counted.
+        let mut carried = self.out.len();
+        let mut buffered = 0usize;
         let out = loop {
             let remaining = match deadline {
                 Some(d) => {
@@ -796,6 +837,12 @@ impl ApiClient {
             match self.pump(remaining) {
                 Err(e) => break Err(e),
                 Ok(Some(ev)) if pred(&ev) => break Ok(ev),
+                Ok(Some(ev)) if carried > 0 => {
+                    // Already queued before the wait began: set it aside
+                    // without charging it. See `carried` above.
+                    carried -= 1;
+                    skipped.push_back(ev);
+                }
                 Ok(Some(ev)) => {
                     // The one queue the peer fills. A subscribed session
                     // pushes `collection_update`s for as long as the call
@@ -803,12 +850,14 @@ impl ApiClient {
                     // rate, so an unbounded set-aside is the peer's memory
                     // budget rather than ours. Fail the wait instead;
                     // `pump` is the unbuffered path and stays available.
-                    if skipped.len() >= self.cfg.max_waiting_events {
+                    if buffered >= self.cfg.max_waiting_events {
                         skipped.push_back(ev);
                         break Err(ApiError::QueueFull {
+                            queue: "events set aside by a blocking wait",
                             cap: self.cfg.max_waiting_events,
                         });
                     }
+                    buffered += 1;
                     skipped.push_back(ev);
                 }
                 Ok(None) => {

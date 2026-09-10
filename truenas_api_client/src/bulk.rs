@@ -35,6 +35,8 @@ pub(crate) struct BulkQueue {
     /// method. `BTreeMap` for a deterministic flush order.
     by_method: BTreeMap<String, VecDeque<Item>>,
     total: usize,
+    /// Encoded-params bytes currently held; see [`BulkQueue::bytes`].
+    bytes: usize,
 }
 
 /// One flush chunk: the `core.bulk` JSON-RPC params it should be sent
@@ -56,19 +58,35 @@ impl BulkQueue {
         max_items: usize,
     ) -> Result<(), ApiError> {
         if self.total >= max_items {
-            return Err(ApiError::QueueFull { cap: max_items });
+            return Err(ApiError::QueueFull {
+                queue: "the deferred bulk queue, in items",
+                cap: max_items,
+            });
         }
+        let len = args.get().len();
         self.by_method
             .entry(method.to_owned())
             .or_default()
             .push_back(Item { ticket, args });
         self.total += 1;
+        self.bytes += len;
         Ok(())
     }
 
     /// Whether anything is queued.
     pub(crate) fn is_empty(&self) -> bool {
         self.total == 0
+    }
+
+    /// How many bytes of encoded params are queued.
+    ///
+    /// Kept rather than summed, for the reason the call backlog keeps
+    /// its own: `queue_bulk` asks before every enqueue and this queue is
+    /// ten thousand items deep by default, so a traversal here makes
+    /// filling it quadratic - measured at 30 ms for a thousand items and
+    /// 320 ms for four thousand before this was a counter.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
     }
 
     /// How many items are queued.
@@ -118,6 +136,7 @@ impl BulkQueue {
             if base_len + item_len > budget && tickets.is_empty() {
                 let item = queue.pop_front().expect("front just checked");
                 self.total -= 1;
+                self.bytes = self.bytes.saturating_sub(item_len);
                 oversized.push((item.ticket, item_len));
                 continue;
             }
@@ -128,6 +147,7 @@ impl BulkQueue {
             }
             let item = queue.pop_front().expect("front just checked");
             self.total -= 1;
+            self.bytes = self.bytes.saturating_sub(item_len);
             if !tickets.is_empty() {
                 body.push(',');
             }
@@ -239,6 +259,52 @@ mod tests {
     }
 
     /// The queue refuses past its cap.
+    /// The byte counter tracks the queue exactly, in and out. It is a
+    /// counter and not a traversal because `queue_bulk` asks before
+    /// every enqueue: summing made filling the default 10,000-item
+    /// queue quadratic.
+    #[test]
+    fn the_byte_counter_matches_the_queue() {
+        let mut q = BulkQueue::default();
+        let walk = |q: &BulkQueue| -> usize {
+            q.by_method
+                .values()
+                .flat_map(|d| d.iter())
+                .map(|i| i.args.get().len())
+                .sum()
+        };
+        assert_eq!(q.bytes(), 0);
+        for i in 0..6u64 {
+            let args = RawValue::from_string(format!(
+                "[\"{}\"]",
+                "x".repeat(if i == 5 { 400 } else { 20 })
+            ))
+            .unwrap();
+            q.enqueue(BulkTicket(i), "m", args, usize::MAX).unwrap();
+            assert_eq!(q.bytes(), walk(&q), "after enqueue {i}");
+        }
+        // Drain in chunks small enough to force several passes, and one
+        // oversized item out through the other removal site.
+        // `take_chunk` reserves 128 bytes of envelope margin, so the
+        // usable budget is `max_frame - 128`. 160 leaves 32: room for one
+        // small item per chunk, so the ordinary removal runs several
+        // times, while the 400-byte item cannot fit even alone and takes
+        // the oversized removal. Both decrement the counter.
+        let mut oversized = Vec::new();
+        let mut passes = 0;
+        while q.take_chunk("m", 160, &mut oversized).is_some() {
+            passes += 1;
+            assert_eq!(q.bytes(), walk(&q), "after a chunk");
+        }
+        assert_eq!(q.bytes(), walk(&q), "after the last chunk");
+        assert!(passes >= 2, "the ordinary removal must run: {passes}");
+        assert!(
+            !oversized.is_empty(),
+            "and the oversized removal must run too"
+        );
+        assert_eq!(q.bytes(), 0, "a drained queue charges nothing");
+    }
+
     #[test]
     fn enqueue_refuses_at_the_cap() {
         let mut q = BulkQueue::default();
@@ -256,7 +322,10 @@ mod tests {
                 RawValue::from_string("[2]".into()).unwrap(),
                 1
             ),
-            Err(ApiError::QueueFull { cap: 1 })
+            Err(ApiError::QueueFull {
+                queue: "the deferred bulk queue, in items",
+                cap: 1,
+            })
         ));
     }
 }

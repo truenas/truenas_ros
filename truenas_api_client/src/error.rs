@@ -172,7 +172,12 @@ pub enum ApiError {
     /// ([`ApiConfig::max_queued_calls`](crate::ApiConfig::max_queued_calls)).
     /// Retry once earlier work drains.
     QueueFull {
-        /// The configured item cap.
+        /// Which bound was reached, in the units it counts - four
+        /// different queues raise this and an operator reading the
+        /// message needs to know which. See the producers in
+        /// `bulk.rs`, `session.rs` and `lib.rs`.
+        queue: &'static str,
+        /// The configured bound, in `queue`'s units.
         cap: usize,
     },
     /// [`ApiConfig::endpoint`](crate::ApiConfig::endpoint) pins an API
@@ -214,8 +219,8 @@ impl fmt::Display for ApiError {
                  (middlewared closes the connection on oversize)"
             ),
             Self::Timeout => f.write_str("call timed out"),
-            Self::QueueFull { cap } => {
-                write!(f, "deferred bulk queue is full ({cap} items)")
+            Self::QueueFull { queue, cap } => {
+                write!(f, "{queue} is at its bound of {cap}")
             }
             Self::Closed { reason } => write!(f, "session closed: {reason}"),
             Self::Io(e) => write!(f, "transport: {e}"),
@@ -320,6 +325,38 @@ mod tests {
     /// middlewared's validation failure: -32602 with the full TrueNAS
     /// payload, including the per-attribute `extra` list. It decodes like
     /// -32001 rather than being handed back as an opaque blob.
+    /// `format_truenas_error` always emits the member -
+    /// `"extra": extra` with `extra` defaulting to `None`
+    /// (`api/base/server/ws_handler/rpc.py`) - so the common `-32001`
+    /// carries `"extra": null`. Without the null filter `extra_raw`
+    /// would be `Some(Value::Null)` and a caller testing `is_some()`
+    /// would act on a payload that is not there.
+    #[test]
+    fn a_null_extra_is_absent_not_present() {
+        let e = ErrorObject::new(CALL_ERROR, "Method call error").with_data(
+            serde_json::json!({
+                "error": 1,
+                "errname": "EPERM",
+                "reason": "Not authorized",
+                "trace": null,
+                "extra": null,
+            }),
+        );
+        match from_rpc_error(&e) {
+            ApiError::Call(err) => {
+                assert_eq!(err.errname.as_deref(), Some("EPERM"));
+                assert!(err.extra.is_none());
+                assert!(
+                    err.extra_raw.is_none(),
+                    "a null member is absent, not a payload: {:?}",
+                    err.extra_raw
+                );
+                assert!(err.trace.is_none(), "so is a null trace");
+            }
+            other => panic!("expected Call, got {other:?}"),
+        }
+    }
+
     /// `-32001`'s `extra` is whatever the raiser passed
     /// `CallError(..., extra=...)`, and every middlewared raiser passes a
     /// dict - the delete-with-dependents report, the open-files list.
