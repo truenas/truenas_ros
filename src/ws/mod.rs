@@ -270,11 +270,13 @@ pub fn unmask(header: &[u8], payload: &mut [u8]) {
 }
 
 /// Whether `code` may be *sent* as a Close frame status code (RFC 6455
-/// §7.4.1, §7.4.2). The sendable defined codes are 1000-1003 and 1007-1011,
-/// plus 3000-4999 for libraries, frameworks and private agreement. 1004,
-/// 1005, 1006 and 1015 are reserved values §7.4.1 says an endpoint MUST NOT
-/// set, and the rest carries no meaning to send: 0-999 is "not used", and
-/// 1012-1014, 1016-2999 and 5000+ are undefined by this revision.
+/// §7.4.1, §7.4.2). The sendable defined codes are 1000-1003 and
+/// 1007-1014, plus 3000-4999 for libraries, frameworks and private
+/// agreement. 1004, 1005, 1006 and 1015 are reserved values §7.4.1 says an
+/// endpoint MUST NOT set, and the rest carries no meaning to send: 0-999 is
+/// "not used", and 1016-2999 and 5000+ are undefined by this revision.
+/// 1012-1014 are absent from RFC 6455 itself but registered with IANA
+/// since, which §7.4.2 provides for - see the body comment.
 ///
 /// A code arriving from a peer is a different question - a receiver reports
 /// whatever it was told. This bounds only what goes back out, which is why
@@ -289,6 +291,19 @@ pub fn is_sendable_close_code(code: u16) -> bool {
     // available public specification"), so they are sendable and echoable.
     // 1015 stays out: §7.4.1 forbids setting it. 3000-3999 are registered
     // library/framework codes and 4000-4999 private, both sendable.
+    //
+    // **This diverges from libwebsockets**, which the module is otherwise
+    // checked against: `ops-ws.c`'s peer-close arm rewrites 1012, 1013 and
+    // 1014 to 1002 along with the codes §7.4.1 really forbids. Two other
+    // implementations take the range this does, and one of them is the
+    // server this crate talks to: aiohttp's `ALLOWED_CLOSE_CODES` is built
+    // from a `WSCloseCode` enum that includes all three
+    // (`aiohttp/_websocket/models.py`), and Python `websockets` lists them
+    // in `EXTERNAL_CLOSE_CODES` (`websockets/frames.py`) with the same
+    // `3000..=4999` tail. Rewriting a peer's 1013 "try again later" to
+    // 1002 would answer a graceful retry request with a protocol-error
+    // accusation, and middlewared's own stack would have accepted the
+    // 1013. The narrow set is the older reading; this is the registry's.
     matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 
@@ -611,6 +626,13 @@ pub enum HandshakeError {
         /// What the server put there, for the diagnosis.
         value: String,
     },
+    /// A header the handshake allows at most once appeared twice. Not
+    /// `MissingKey`/`BadVersion`/`BadAccept`: the field is present, and
+    /// twice is a different failure from absent or wrong.
+    DuplicateHeader {
+        /// Which one, canonically spelled.
+        header: &'static str,
+    },
     /// The endpoint is not a request-target that can go in a request line
     /// (see [`validate_request_target`]).
     BadTarget {
@@ -642,6 +664,9 @@ impl std::fmt::Display for HandshakeError {
             Self::Unrequested { header, value } => {
                 write!(f, "server selected {header}: {value}, never offered")
             }
+            Self::DuplicateHeader { header } => {
+                write!(f, "{header} appeared more than once")
+            }
             Self::BadTarget { value } => {
                 write!(f, "endpoint is not a usable request-target: {value}")
             }
@@ -650,6 +675,41 @@ impl std::fmt::Display for HandshakeError {
 }
 
 impl std::error::Error for HandshakeError {}
+
+/// Whether a list-valued header field carries `token`, case-insensitively.
+///
+/// **Only `Connection` gets this.** RFC 6455 §4.1 words its two upgrade
+/// checks differently and means it: the `Connection` field "doesn't
+/// contain a token that is an ASCII case-insensitive match for the value
+/// `Upgrade`" - a token search - while `Upgrade` is failed when it
+/// "contains a value that is not an ASCII case-insensitive match for the
+/// value `websocket`", which is an equality test on the whole field.
+/// Two references draw the same line. libwebsockets' client tokenizes
+/// `Connection` with `LWS_TOKENIZE_F_COMMA_SEP_LIST` and runs a plain
+/// `strcmp(p, "websocket")` over `Upgrade` (`lib/roles/ws/client-ws.c`);
+/// Python `websockets` flattens every `Connection` field line and asks
+/// `any(== "upgrade")`, then requires `len(upgrade) == 1 and upgrade[0]
+/// == "websocket"` (`websockets/server.py`). Handing `Upgrade` a token
+/// search would accept `Upgrade: h2c, websocket`, which both refuse.
+///
+/// `websocket-client` - the library the canonical TrueNAS Python client
+/// is built on - is the outlier: it treats both as token lists
+/// (`_handshake.py`'s `_HEADERS_TO_CHECK`) and would accept that. It is
+/// also the least strict of the three, and RFC 6455 §4.1's own wording
+/// is the equality one, so the strict reading wins here.
+///
+/// A sender may still split `Connection` across field lines of the same
+/// name; RFC 9110 §5.3 says combining them does not change the meaning,
+/// so `|=`-ing this over every matching line is the combined search.
+///
+/// A non-UTF-8 value carries no token rather than poisoning the scan: it
+/// cannot equal one, and the verdict is decided by whether the tokens
+/// that matter were found at all.
+fn has_token(value: &[u8], token: &str) -> bool {
+    std::str::from_utf8(value).is_ok_and(|v| {
+        v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token))
+    })
+}
 
 /// Validate a server's `101` upgrade response against the `key` this
 /// connection sent (RFC 6455 §4.2.2 / §4.1, the checks libwebsockets'
@@ -690,23 +750,30 @@ pub fn validate_101(head: &[u8], key: &str) -> Result<(), HandshakeError> {
             reason: resp.reason.unwrap_or("").to_owned(),
         });
     }
-    let mut upgraded = false;
+    let mut upgraded: Option<bool> = None;
     let mut connection = false;
     let mut accept_ok: Option<bool> = None;
     for h in resp.headers.iter() {
         if h.name.eq_ignore_ascii_case("upgrade") {
-            upgraded = std::str::from_utf8(h.value)
-                .is_ok_and(|v| v.trim().eq_ignore_ascii_case("websocket"));
+            // Equality, and at most once: two lines cannot combine into a
+            // value equal to `websocket`, so a second is a refusal rather
+            // than a merge.
+            if upgraded.is_some() {
+                return Err(HandshakeError::DuplicateHeader {
+                    header: "Upgrade",
+                });
+            }
+            upgraded = Some(
+                std::str::from_utf8(h.value)
+                    .is_ok_and(|v| v.trim().eq_ignore_ascii_case("websocket")),
+            );
         } else if h.name.eq_ignore_ascii_case("connection") {
-            connection = std::str::from_utf8(h.value).is_ok_and(|v| {
-                v.split(',')
-                    .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
-            });
+            connection |= has_token(h.value, "upgrade");
         } else if h.name.eq_ignore_ascii_case("sec-websocket-accept") {
-            // §11.3.3: at most once. A second one is refused rather than
-            // overwriting the first's verdict.
             if accept_ok.is_some() {
-                return Err(HandshakeError::BadAccept);
+                return Err(HandshakeError::DuplicateHeader {
+                    header: "Sec-WebSocket-Accept",
+                });
             }
             accept_ok = Some(
                 std::str::from_utf8(h.value)
@@ -721,7 +788,7 @@ pub fn validate_101(head: &[u8], key: &str) -> Result<(), HandshakeError> {
             }
         }
     }
-    if !upgraded || !connection {
+    if upgraded != Some(true) || !connection {
         return Err(HandshakeError::NotUpgraded);
     }
     if accept_ok != Some(true) {
@@ -766,29 +833,56 @@ pub fn validate_upgrade_request(head: &[u8]) -> Result<String, HandshakeError> {
     if req.method != Some("GET") {
         return Err(HandshakeError::NotUpgradeRequest);
     }
-    let mut upgraded = false;
+    let mut upgraded: Option<bool> = None;
     let mut connection = false;
-    let mut version_ok = false;
+    let mut version: Option<bool> = None;
     let mut key: Option<String> = None;
     for h in req.headers.iter() {
         if h.name.eq_ignore_ascii_case("upgrade") {
-            upgraded = std::str::from_utf8(h.value)
-                .is_ok_and(|v| v.trim().eq_ignore_ascii_case("websocket"));
+            if upgraded.is_some() {
+                return Err(HandshakeError::DuplicateHeader {
+                    header: "Upgrade",
+                });
+            }
+            upgraded = Some(
+                std::str::from_utf8(h.value)
+                    .is_ok_and(|v| v.trim().eq_ignore_ascii_case("websocket")),
+            );
         } else if h.name.eq_ignore_ascii_case("connection") {
-            connection = std::str::from_utf8(h.value).is_ok_and(|v| {
-                v.split(',')
-                    .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
-            });
+            connection |= has_token(h.value, "upgrade");
         } else if h.name.eq_ignore_ascii_case("sec-websocket-version") {
-            version_ok =
-                std::str::from_utf8(h.value).is_ok_and(|v| v.trim() == "13");
+            // A singleton, and refused rather than overwritten for the
+            // same reason as the key below: a second line would decide a
+            // verdict the first line already gave.
+            if version.is_some() {
+                return Err(HandshakeError::DuplicateHeader {
+                    header: "Sec-WebSocket-Version",
+                });
+            }
+            version = Some(
+                std::str::from_utf8(h.value).is_ok_and(|v| v.trim() == "13"),
+            );
         } else if h.name.eq_ignore_ascii_case("sec-websocket-key") {
-            key = std::str::from_utf8(h.value)
-                .ok()
-                .map(|v| v.trim().to_owned());
+            // The nonce is what the `101` proves possession of, so a
+            // repeated one is not a merge question - it is two different
+            // claims about which value the peer chose. Taking the last
+            // makes this endpoint compute `accept_for` over a nonce the
+            // client need never have sent, which is the whole thing the
+            // digest exists to rule out. Refuse instead of picking.
+            if key.is_some() {
+                return Err(HandshakeError::DuplicateHeader {
+                    header: "Sec-WebSocket-Key",
+                });
+            }
+            key = Some(
+                std::str::from_utf8(h.value)
+                    .map(|v| v.trim().to_owned())
+                    .unwrap_or_default(),
+            );
         }
     }
-    if !upgraded || !connection {
+    let version_ok = version.unwrap_or(false);
+    if upgraded != Some(true) || !connection {
         return Err(HandshakeError::NotUpgradeRequest);
     }
     if !version_ok {
@@ -1356,6 +1450,106 @@ mod tests {
         }
     }
 
+    /// The two rules a repeated header field gets, and which one each
+    /// slot takes.
+    ///
+    /// `Upgrade` and `Connection` are comma-separated lists, so splitting
+    /// one across field lines means what the joined list means (RFC 9110
+    /// §5.3) and a validator must look in all of them. The nonce and the
+    /// version are single claims: a second line is not more of the same
+    /// value, it is a different answer, and taking the last would let a
+    /// peer choose which of two nonces this endpoint proves.
+    #[test]
+    fn a_repeated_header_is_combined_or_refused_by_what_it_is() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        // --- lists: split across lines, and in either order ---
+        for split in [
+            "Connection: keep-alive\r\nConnection: Upgrade\r\n",
+            "Connection: Upgrade\r\nConnection: keep-alive\r\n",
+            "Connection: keep-alive, Upgrade\r\n",
+        ] {
+            let head = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                 {split}Sec-WebSocket-Accept: {}\r\n\r\n",
+                accept_for(key)
+            );
+            assert!(
+                validate_101(head.as_bytes(), key).is_ok(),
+                "a combinable Connection must be read across lines: {split:?}"
+            );
+        }
+        // `Upgrade` is NOT a token search. RFC 6455 sec. 4.1 fails a 101
+        // whose Upgrade "contains a value that is not an ASCII
+        // case-insensitive match for the value websocket", and
+        // libwebsockets' client is a plain `strcmp` (client-ws.c). A
+        // token search here would accept this; both refuse it.
+        let head = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c, websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+            accept_for(key)
+        );
+        assert!(
+            matches!(
+                validate_101(head.as_bytes(), key),
+                Err(HandshakeError::NotUpgraded)
+            ),
+            "Upgrade must equal websocket, not merely contain it"
+        );
+        // ...and a second Upgrade line is a duplicate, not a merge.
+        let twice = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+             Upgrade: h2c\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {}\r\n\r\n",
+            accept_for(key)
+        );
+        assert!(matches!(
+            validate_101(twice.as_bytes(), key),
+            Err(HandshakeError::DuplicateHeader { header: "Upgrade" })
+        ));
+
+        // --- the request direction, same rule ---
+        let req = |extra: &str| {
+            format!(
+                "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\
+                 {extra}Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+        };
+        let combined = req("Connection: keep-alive\r\nConnection: Upgrade\r\n\
+                            Sec-WebSocket-Key: abc\r\n");
+        assert_eq!(
+            validate_upgrade_request(combined.as_bytes())
+                .ok()
+                .as_deref(),
+            Some("abc"),
+        );
+
+        // --- singletons: a second line is refused, not preferred ---
+        let two_keys =
+            req("Connection: Upgrade\r\nSec-WebSocket-Key: attacker\r\n\
+             Sec-WebSocket-Key: victim\r\n");
+        assert!(
+            matches!(
+                validate_upgrade_request(two_keys.as_bytes()),
+                Err(HandshakeError::DuplicateHeader {
+                    header: "Sec-WebSocket-Key"
+                })
+            ),
+            "two nonces must not resolve to one of them"
+        );
+        let two_versions = "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Key: abc\r\n\
+             Sec-WebSocket-Version: 8\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        assert!(
+            matches!(
+                validate_upgrade_request(two_versions.as_bytes()),
+                Err(HandshakeError::DuplicateHeader {
+                    header: "Sec-WebSocket-Version"
+                })
+            ),
+            "a second version line must not excuse the first"
+        );
+    }
+
     /// An endpoint reaches the wire inside `request-line = method SP
     /// request-target SP HTTP-version CRLF` (RFC 9112 §3), so a target
     /// carrying CR, LF or a space does not lengthen that line - it ends
@@ -1461,7 +1655,9 @@ mod tests {
         assert!(
             matches!(
                 validate_101(dup.as_bytes(), key),
-                Err(HandshakeError::BadAccept)
+                Err(HandshakeError::DuplicateHeader {
+                    header: "Sec-WebSocket-Accept"
+                })
             ),
             "a wrong accept is not excused by a right one behind it"
         );
@@ -1473,7 +1669,9 @@ mod tests {
         );
         assert!(matches!(
             validate_101(dup_rev.as_bytes(), key),
-            Err(HandshakeError::BadAccept)
+            Err(HandshakeError::DuplicateHeader {
+                header: "Sec-WebSocket-Accept"
+            })
         ));
     }
 
@@ -1482,7 +1680,13 @@ mod tests {
     /// passed through unchanged.
     #[test]
     fn close_echo_refuses_the_codes_no_endpoint_may_send() {
-        for code in [1000u16, 1001, 1002, 1003, 1007, 1011, 3000, 4999] {
+        // 1012, 1013 and 1014 are the IANA registrations §7.4.2 provides
+        // for and are the reason this bound is not the RFC's own 1007-1011:
+        // without them here, narrowing the range back to `1007..=1011`
+        // passes every test in both workspaces.
+        for code in [
+            1000u16, 1001, 1002, 1003, 1007, 1011, 1012, 1013, 1014, 3000, 4999,
+        ] {
             assert!(is_sendable_close_code(code), "{code} is sendable");
             assert_eq!(
                 close_echo_code(&code.to_be_bytes()),
