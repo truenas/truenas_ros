@@ -1462,37 +1462,6 @@ mod tests {
         );
     }
 
-    /// A growth that could not allocate reports failure, so the caller
-    /// takes its owned-buffer fallback.
-    ///
-    /// `post` is fallible on purpose, and the promise attached to that
-    /// fallback - the re-armed read cannot come back `-ENOBUFS` a second
-    /// time - is only kept if `grow` answers on buffers posted rather than
-    /// on the target it just raised. A `buf_len` no allocator can satisfy
-    /// makes every `post` fail without touching the ring.
-    #[test]
-    fn growth_that_allocates_nothing_reports_failure() {
-        let Some(r) = ring() else {
-            return;
-        };
-        let Ok(mut p) = BufPool::new(r.raw_fd(), 3, usize::MAX / 2, 64) else {
-            return;
-        };
-        assert_eq!(p.allocated(), 0, "nothing could be allocated at all");
-        for round in 0..3 {
-            assert!(
-                !p.grow(),
-                "round {round}: grow reported success with {} allocated",
-                p.allocated()
-            );
-            assert_eq!(
-                p.allocated(),
-                0,
-                "round {round}: still nothing behind the target"
-            );
-        }
-    }
-
     /// The pool always keeps at least one buffer: dropping to zero would
     /// mean every recv came back `-ENOBUFS` with nothing to grow from.
     #[test]

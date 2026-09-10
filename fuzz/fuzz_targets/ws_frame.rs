@@ -110,11 +110,34 @@ fuzz_target!(|data: &[u8]| {
         loop {
             // Drip-feed the current message: every prefix, so a resumable
             // ask is exercised at each byte boundary.
+            //
+            // A resumable ask is any of the FOUR - `Need`, `NeedInMessage`,
+            // `More`, `MoreInMessage` - not the two the handshake phase
+            // happens to use. The frame phase asks with `Need`/`NeedInMessage`
+            // (`ws::frame_step` answers `Need(2)` for an empty buffer), so a
+            // predicate naming only `More`/`MoreInMessage` reads the frame
+            // phase's very first ask as a terminal verdict, the `let else`
+            // below finds it is not a `Complete`, and the outer loop breaks
+            // at `end == 0` having consumed nothing. That is why the frame
+            // phase still ran no frames after the loop was rewritten to
+            // consume them: `frame_step` was entered, but only ever through
+            // its empty-buffer early return, so its `parse` was never called
+            // at all.
+            //
+            // Measured: a `panic!` on `frame_step`'s `Framing::Complete` arm
+            // survived 400 000 runs with the two-variant predicate and
+            // crashes on the seeded corpus with this one.
             let mut verdict = None;
             for end in 0..=buf.len() {
                 let v = framer(&buf[..end], &mut st);
                 check_framing(v);
-                if !matches!(v, Framing::More | Framing::MoreInMessage) {
+                if !matches!(
+                    v,
+                    Framing::More
+                        | Framing::MoreInMessage
+                        | Framing::Need(_)
+                        | Framing::NeedInMessage(_)
+                ) {
                     verdict = Some((v, end));
                     break;
                 }
