@@ -227,6 +227,18 @@ pub enum ApiEvent {
         /// How many items the batch carried.
         items: usize,
     },
+    /// The server reported an error naming no call of ours: a Response
+    /// with `id: null`, which JSON-RPC 2.0 §5 reserves for an error the
+    /// server could not attribute. middlewared sends one when a message
+    /// of ours does not parse, or when its own notification fails to
+    /// serialise, and keeps the connection serving - so this is a report,
+    /// not a teardown, and every call in flight is unaffected.
+    ServerError {
+        /// The session it arrived on.
+        session: SessionId,
+        /// What the server said.
+        error: ApiError,
+    },
     /// The session is gone (peer close, protocol fault, transport close,
     /// or a local [`close`](ApiClient::close)); every call still pending
     /// on it has already surfaced as a failed [`ApiEvent::CallDone`].
@@ -301,6 +313,11 @@ impl fmt::Debug for ApiEvent {
                 .debug_struct("BulkFlushed")
                 .field("method", method)
                 .field("items", items)
+                .finish(),
+            Self::ServerError { session, error } => f
+                .debug_struct("ServerError")
+                .field("session", session)
+                .field("error", error)
                 .finish(),
             Self::SessionClosed { session, reason } => f
                 .debug_struct("SessionClosed")
@@ -442,6 +459,7 @@ impl ApiClient {
                 opts.max_outbound_bytes,
                 self.cfg.max_message_bytes,
                 self.cfg.max_queued_calls,
+                self.cfg.max_queued_bytes,
             ),
         );
         Ok(SessionId(conn))
@@ -684,9 +702,19 @@ impl ApiClient {
                 .values()
                 .filter_map(Session::next_deadline)
                 .min();
-            let next_tick = self.bulk_pending().then(|| {
-                self.last_tick.map_or(now, |last| last + self.cfg.bulk_tick)
-            });
+            // `checked_add` for the same reason the five deadline sites
+            // use it: `bulk_tick` is a caller-supplied `Duration` on a
+            // plain public field, and `Instant + Duration` panics on
+            // overflow. An unrepresentable tick means "not yet", which
+            // `None` already means to the wait computation below.
+            let next_tick = self
+                .bulk_pending()
+                .then(|| {
+                    self.last_tick.map_or(Some(now), |last| {
+                        last.checked_add(self.cfg.bulk_tick)
+                    })
+                })
+                .flatten();
             let base_wait = match (until, next_deadline) {
                 (Some(u), Some(d)) => Some(u.min(d)),
                 (Some(u), None) => Some(u),
@@ -768,7 +796,21 @@ impl ApiClient {
             match self.pump(remaining) {
                 Err(e) => break Err(e),
                 Ok(Some(ev)) if pred(&ev) => break Ok(ev),
-                Ok(Some(ev)) => skipped.push_back(ev),
+                Ok(Some(ev)) => {
+                    // The one queue the peer fills. A subscribed session
+                    // pushes `collection_update`s for as long as the call
+                    // takes, and nothing else here grows with the peer's
+                    // rate, so an unbounded set-aside is the peer's memory
+                    // budget rather than ours. Fail the wait instead;
+                    // `pump` is the unbuffered path and stays available.
+                    if skipped.len() >= self.cfg.max_waiting_events {
+                        skipped.push_back(ev);
+                        break Err(ApiError::QueueFull {
+                            cap: self.cfg.max_waiting_events,
+                        });
+                    }
+                    skipped.push_back(ev);
+                }
                 Ok(None) => {
                     break Err(if deadline.is_some() {
                         ApiError::Timeout
@@ -897,16 +939,16 @@ impl ApiClient {
             Act::Send(_) => unreachable!("apply() routes sends"),
             Act::Ready => self.out.push_back(ApiEvent::SessionReady(session)),
             Act::Failed(e) => {
-                self.client.close_now(conn);
-                self.sessions.remove(&conn);
+                let why = e.to_string();
+                self.fail_session(conn, &why);
                 self.out.push_back(ApiEvent::SessionFailed {
                     session,
                     error: ApiError::Handshake(e),
                 });
             }
             Act::SetupFailed(e) => {
-                self.client.close_now(conn);
-                self.sessions.remove(&conn);
+                let why = e.to_string();
+                self.fail_session(conn, &why);
                 self.out
                     .push_back(ApiEvent::SessionFailed { session, error: e });
             }
@@ -946,6 +988,9 @@ impl ApiClient {
                 // it and FIN. The Closed event finishes the story.
                 self.client.close(conn);
             }
+            Act::ServerError(error) => {
+                self.out.push_back(ApiEvent::ServerError { session, error });
+            }
             Act::Fault(what) => {
                 self.client.close_now(conn);
                 if let Some(mut sess) = self.sessions.remove(&conn) {
@@ -959,6 +1004,30 @@ impl ApiClient {
                     });
                 }
             }
+        }
+    }
+
+    /// Drop `conn` and fail everything it had accepted.
+    ///
+    /// Every route that removes a session has to come through here. The
+    /// session owns the only record of the calls in flight on it
+    /// (`Session::pending`), so removing it without draining that record
+    /// strands each one: the caller was handed a `CallId` and no
+    /// `CallDone` will ever answer it, and `ApiClient::call` - which
+    /// waits on exactly that event - blocks for as long as
+    /// `call_timeout` allows, which is for ever by default.
+    ///
+    /// `SessionFailed` does not substitute. A caller waiting on a
+    /// specific call is not watching for it, and `wait_for`'s predicate
+    /// is per-event: the session-level report is stashed as a skipped
+    /// event, not delivered as the call's answer.
+    fn fail_session(&mut self, conn: ConnId, why: &str) {
+        self.client.close_now(conn);
+        let Some(mut sess) = self.sessions.remove(&conn) else {
+            return;
+        };
+        for act in sess.fail_all(why) {
+            self.surface(conn, act);
         }
     }
 
@@ -1214,6 +1283,7 @@ fn bulk_item_error(err: &Value) -> CallError {
         reason: Some(reason),
         trace: None,
         extra: None,
+        extra_raw: None,
     }
 }
 

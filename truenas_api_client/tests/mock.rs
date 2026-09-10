@@ -921,6 +921,110 @@ fn an_unrepresentable_timeout_is_no_timeout() {
     mock.join();
 }
 
+/// A session that dies during setup must fail the calls it already
+/// accepted. `call_start` admits a call as soon as the `101` lands - the
+/// phase is `Open` from there, and `core.set_options` is still
+/// outstanding - so a refusal at setup arrives with caller work already
+/// in flight. Dropping the session without draining `pending` leaves
+/// `ApiClient::call` waiting on a `CallDone` that can never come, and
+/// `call_timeout` is `None` by default.
+#[test]
+fn a_setup_failure_fails_the_calls_it_already_accepted() {
+    let mock = serve_one(|mut w: Wire| {
+        w.accept_upgrade("/api/current");
+        let (id, _) = w.expect_call("core.set_options");
+        // Hold the answer until the client has issued a user call.
+        let (_uid, _) = w.expect_call("core.ping");
+        w.respond_err(&id, -32000, "no options for you", None);
+    });
+    let Some(mut api) = client_or_skip(&mock) else {
+        return;
+    };
+    let sid = api.connect_start(SessionOpts::default()).expect("dial");
+    // Pump until the handshake is through and the session takes calls.
+    let mut call = None;
+    for _ in 0..50 {
+        let _ = api.pump(Some(Duration::from_millis(20)));
+        if let Ok(c) = api.call_start(sid, "core.ping", &params!()) {
+            call = Some(c);
+            break;
+        }
+    }
+    let call = call.expect("the session accepted a call before setup failed");
+
+    // The setup refusal must answer that call, not strand it. Both
+    // events are owed: the call's, and the session's.
+    let mut done = None;
+    let mut failed = false;
+    for _ in 0..50 {
+        match api.pump(Some(Duration::from_millis(100))) {
+            Ok(Some(ApiEvent::CallDone { call: c, result })) if c == call => {
+                done = Some(result)
+            }
+            Ok(Some(ApiEvent::SessionFailed { .. })) => failed = true,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        if done.is_some() && failed {
+            break;
+        }
+    }
+    assert!(failed, "the session's own failure still surfaces");
+    match done {
+        Some(Err(ApiError::Closed { .. })) => {}
+        other => panic!("the accepted call must be failed, got {other:?}"),
+    }
+    mock.join();
+}
+
+/// A blocking wait sets aside every event that is not the one it wants,
+/// and a subscribed session lets the *peer* decide how many of those
+/// there are. Bound it: past the cap the wait fails rather than
+/// buffering, and the events set aside are still there for `pump`.
+#[test]
+fn a_blocking_wait_will_not_buffer_without_bound() {
+    const FLOOD: usize = 64;
+    let mock = serve_one(|mut w: Wire| {
+        w.accept_session("/api/current");
+        let (id, _) = w.expect_call("core.ping");
+        // Answer only after burying it under notifications.
+        for i in 0..FLOOD {
+            w.send_notification(
+                "collection_update",
+                json!({ "msg": "changed", "collection": "c", "id": i }),
+            );
+        }
+        w.respond_ok(&id, json!("pong"));
+        w.expect_close();
+    });
+    let cfg = ApiConfig {
+        max_waiting_events: 8,
+        ..config(&mock)
+    };
+    let Some(mut api) = client_or_skip_cfg(cfg) else {
+        return;
+    };
+    let sid = api.connect(SessionOpts::default()).expect("connect");
+    match api.call::<_, String>(sid, "core.ping", &params!()) {
+        Err(ApiError::QueueFull { cap }) => assert_eq!(cap, 8),
+        other => panic!("expected the wait to be bounded, got {other:?}"),
+    }
+    // What was set aside is still deliverable - the bound refuses the
+    // wait, it does not drop the peer's events.
+    let mut seen = 0;
+    while let Ok(Some(ev)) = api.pump(Some(Duration::from_millis(50))) {
+        if matches!(ev, ApiEvent::CollectionUpdate { .. }) {
+            seen += 1;
+        }
+    }
+    assert!(seen > 0, "the buffered events survive the refusal");
+    api.close(sid);
+    while api.is_open(sid) {
+        let _ = api.pump(Some(Duration::from_millis(50)));
+    }
+    mock.join();
+}
+
 /// The endpoint reaches the wire inside the request line and decides
 /// which API version answers, so both refusals happen before the dial -
 /// no half-open session, no socket.

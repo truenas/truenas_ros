@@ -238,6 +238,17 @@ impl JsonRpcServer {
     }
 
     fn on_close_frame(&mut self, payload: &[u8]) -> Vec<ServerAct> {
+        // Nothing goes back out once this side has closed: §5.5.1 has an
+        // endpoint consider the connection closed after both sending and
+        // receiving a Close, so a second Close of ours would be a frame
+        // after the handshake finished. This guard sits above the length
+        // check because a *malformed* re-close is still a re-close - with
+        // the two in the other order a one-byte second body put another
+        // Close frame on a connection already closing, while a two-byte
+        // one was correctly silent.
+        if matches!(self.phase, Phase::Closing) {
+            return Vec::new();
+        }
         // §5.5.1: "If there is a body, the first two bytes of the body
         // MUST be a 2-byte unsigned integer ... representing a status
         // code". One byte is neither a status code nor an absent body, so
@@ -253,9 +264,6 @@ impl JsonRpcServer {
                 ServerAct::Fault("close body shorter than a status code"),
             ];
         }
-        if matches!(self.phase, Phase::Closing) {
-            return Vec::new();
-        }
         let code = (payload.len() >= 2)
             .then(|| u16::from_be_bytes([payload[0], payload[1]]));
         self.phase = Phase::Closing;
@@ -267,17 +275,21 @@ impl JsonRpcServer {
         // received", but §7.4.1 forbids ever *setting* 1005/1006/1015 and
         // §7.4.2 leaves 0-999 unused and above 4999 undefined - so a code
         // this endpoint may not send is answered with 1002 rather than
-        // mirrored back onto the wire.
-        let echo = match code {
-            Some(code) if ws::is_sendable_close_code(code) => code,
-            Some(_) => CLOSE_PROTOCOL_ERROR,
-            None => CLOSE_NORMAL,
+        // mirrored back onto the wire. `close_echo_code` is the whole
+        // discipline, and it also catches the case an open-coded
+        // `is_sendable_close_code` test misses: §5.5.1 makes /reason/ UTF-8
+        // and §8.1 makes an invalid stream fatal, so a reason that is not
+        // UTF-8 is answered 1007 rather than echoed. `None` means the
+        // peer sent no body, and the helper documents it as "answer with
+        // no body either" - which is what the client role does, so this
+        // role does it too rather than inventing a 1000 the peer never
+        // sent.
+        let echo = match ws::close_echo_code(payload) {
+            Some(code) => code.to_be_bytes().to_vec(),
+            None => Vec::new(),
         };
         vec![
-            ServerAct::Send(ws::encode_server_frame(
-                OP_CLOSE,
-                &echo.to_be_bytes(),
-            )),
+            ServerAct::Send(ws::encode_server_frame(OP_CLOSE, &echo)),
             ServerAct::PeerClosing,
         ]
     }
@@ -301,10 +313,30 @@ impl JsonRpcServer {
             Incoming::Single(Call::Invalid { id, error, .. }) => {
                 vec![ServerAct::Send(error_frame(id, error))]
             }
-            // middlewared rejects batches; mirror it by refusing the
-            // connection rather than answering a batch it would never send.
-            Incoming::Batch(_) => vec![ServerAct::Fault("batch not supported")],
+            // middlewared refuses batches, but it does not close over
+            // one: `parse_message` raises `ValueError('Batch messages are
+            // not supported at this time')`
+            // (`middlewared/utils/limits.py`) and the handler answers
+            // `-32700` and `continue`s
+            // (`api/base/server/ws_handler/rpc.py`). Mirroring it means
+            // answering, not faulting - a client that sends a batch by
+            // mistake gets an error and keeps its other calls.
+            Incoming::Batch(_) => {
+                vec![ServerAct::Send(error_frame(Id::Null, batch_refusal()))]
+            }
+            // An empty array reaches `Incoming::Invalid` rather than
+            // `Batch`, and middlewared does not make that distinction:
+            // `parse_message` raises on `isinstance(message, list)`
+            // before it looks inside, so `[]` and `[{...}]` get the same
+            // `-32700`. Route it to the same answer.
             Incoming::Invalid { error, .. } => {
+                let body = text.trim_ascii_start();
+                if body.first() == Some(&b'[') {
+                    return vec![ServerAct::Send(error_frame(
+                        Id::Null,
+                        batch_refusal(),
+                    ))];
+                }
                 vec![ServerAct::Send(error_frame(Id::Null, error))]
             }
         }
@@ -363,6 +395,16 @@ const CLOSE_NORMAL: u16 = 1000;
 /// RFC 6455 §7.4.1's 1002, "terminating the connection due to a protocol
 /// error".
 const CLOSE_PROTOCOL_ERROR: u16 = 1002;
+
+/// middlewared's own answer to a batch, verbatim: `parse_message` raises
+/// `ValueError('Batch messages are not supported at this time')` and the
+/// handler turns a `ValueError` into `INVALID_JSON` (`-32700`) against a
+/// `None` id, then `continue`s (`middlewared/utils/limits.py`,
+/// `api/base/server/ws_handler/rpc.py`).
+fn batch_refusal() -> ErrorObject {
+    ErrorObject::parse_error()
+        .with_reason("Batch messages are not supported at this time")
+}
 
 /// One error-response frame (unmasked server text frame).
 fn error_frame(id: Id, error: ErrorObject) -> Vec<u8> {
@@ -576,6 +618,54 @@ mod tests {
         ));
     }
 
+    /// middlewared treats every JSON array alike: `parse_message` sees a
+    /// list and raises before it looks inside. So `[]` and `[{...}]` must
+    /// get the same answer here, and it must be an answer rather than a
+    /// teardown.
+    #[test]
+    fn a_batch_is_answered_the_way_middlewared_answers_one() {
+        for body in [&b"[]"[..], br#"[{"jsonrpc":"2.0","method":"m","id":1}]"#]
+        {
+            let mut s = open_server();
+            match s
+                .on_frame(head(true, OP_TEXT, body.len()), body.to_vec())
+                .as_slice()
+            {
+                [ServerAct::Send(f)] => {
+                    let (op, payload) = decode(f);
+                    assert_eq!(op, OP_TEXT);
+                    let v: serde_json::Value =
+                        serde_json::from_slice(&payload).expect("JSON");
+                    assert_eq!(
+                        v["error"]["code"], -32700,
+                        "{body:?} must answer -32700 like middlewared"
+                    );
+                    assert!(v["id"].is_null());
+                }
+                other => panic!("{body:?} must be answered: {other:?}"),
+            }
+        }
+    }
+
+    /// `close_echo_code` documents `None` as "answer with no body
+    /// either", and both roles must mean the same thing by it: a peer
+    /// that sent no code gets no code back, not a 1000 it never sent.
+    #[test]
+    fn an_empty_close_body_is_answered_with_an_empty_body() {
+        let mut s = open_server();
+        match s.on_frame(head(true, OP_CLOSE, 0), Vec::new()).as_slice() {
+            [ServerAct::Send(f), ServerAct::PeerClosing] => {
+                let (op, payload) = decode(f);
+                assert_eq!(op, OP_CLOSE);
+                assert!(
+                    payload.is_empty(),
+                    "an absent code is echoed absent, got {payload:?}"
+                );
+            }
+            other => panic!("expected a close echo: {other:?}"),
+        }
+    }
+
     /// A close body must carry a whole status code (§5.5.1), and a code
     /// this endpoint may not send is never echoed back (§7.4.1/§7.4.2).
     #[test]
@@ -623,17 +713,66 @@ mod tests {
             );
         }
 
-        // An empty body is legal and answered with 1000.
+        // An empty body is legal, and answered empty - see
+        // `an_empty_close_body_is_answered_with_an_empty_body`, which
+        // owns that case and says why both roles must agree on it.
+    }
+
+    /// The mirror of the client role's
+    /// `a_close_code_no_endpoint_may_send_is_not_echoed_back`: §5.5.1 makes
+    /// /reason/ UTF-8 and §8.1 makes an invalid stream fatal, so a close
+    /// body whose reason is not UTF-8 is answered 1007, not echoed.
+    #[test]
+    fn cr5_a_non_utf8_close_reason_is_answered_1007() {
         let mut s = open_server();
-        match s.on_frame(head(true, OP_CLOSE, 0), Vec::new()).as_slice() {
-            [ServerAct::Send(f), ServerAct::PeerClosing] => {
+        let mut body = 1000u16.to_be_bytes().to_vec();
+        body.extend_from_slice(&[0xFF, 0xFE, 0x80]);
+        match s
+            .on_frame(head(true, OP_CLOSE, body.len()), body)
+            .as_slice()
+        {
+            [ServerAct::Send(f), ..] => {
+                let (op, p) = decode(f);
+                assert_eq!(op, OP_CLOSE);
                 assert_eq!(
-                    decode(f),
-                    (OP_CLOSE, 1000u16.to_be_bytes().to_vec())
-                )
+                    u16::from_be_bytes([p[0], p[1]]),
+                    1007,
+                    "a non-UTF-8 reason must be answered 1007"
+                );
             }
-            other => panic!("{other:?}"),
+            other => panic!("expected a close echo, got {other:?}"),
         }
+    }
+
+    /// §5.5.1: once a Close has been both sent and received the
+    /// connection is closed, so no second Close goes out - including for a
+    /// re-close whose body is malformed, which the length check used to
+    /// answer ahead of the closing guard.
+    #[test]
+    fn cr5_a_malformed_re_close_stays_silent() {
+        let mut s = open_server();
+        // First close: normal, 2-byte body. Session goes to Closing.
+        let acts = s.on_frame(head(true, OP_CLOSE, 2), vec![0x03, 0xE8]);
+        assert!(matches!(acts.as_slice(), [ServerAct::Send(_), _]));
+        // A SECOND close with a 2-byte body is correctly silent.
+        let quiet = s.on_frame(head(true, OP_CLOSE, 2), vec![0x03, 0xE8]);
+        assert!(quiet.is_empty(), "2-byte re-close is silent: {quiet:?}");
+        // A second close with a ONE-byte body is not: the length check sits
+        // above the Phase::Closing guard, so it emits a second Close frame.
+        let again = s.on_frame(head(true, OP_CLOSE, 1), vec![0x03]);
+        assert!(
+            again.is_empty(),
+            "a re-close must not put a second Close frame on the wire: \
+             {again:?}"
+        );
+        // And the one-byte body is still a fault on a *first* close.
+        let mut fresh = open_server();
+        assert!(matches!(
+            fresh
+                .on_frame(head(true, OP_CLOSE, 1), vec![0x03])
+                .as_slice(),
+            [ServerAct::Send(_), ServerAct::Fault(_)]
+        ));
     }
 
     /// Nothing is answered once a Close has been sent or received: no pong

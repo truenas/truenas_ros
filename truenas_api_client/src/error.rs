@@ -73,7 +73,23 @@ pub struct CallError {
     /// The server-side traceback, when the server chose to send one.
     pub trace: Option<Trace>,
     /// Validation failures as `(attribute, message, errno)` triples.
+    ///
+    /// Populated only when `data.extra` really is that list, which is the
+    /// `-32602` shape: `send_truenas_validation_error` passes
+    /// `ValidationErrors`, whose `__iter__` yields
+    /// `(attribute, errmsg, errno)`. On `-32001` the member is whatever
+    /// the raiser handed `CallError(..., extra=...)`, and every raiser in
+    /// middlewared hands it a **dict** - `{'dependencies': [...]}` from
+    /// `crud_service.py`'s delete-with-dependents, the open-files report
+    /// from `pool_/dataset_processes.py`. Those arrive in
+    /// [`CallError::extra_raw`] instead of being dropped.
     pub extra: Option<Vec<ExtraError>>,
+    /// `data.extra` exactly as the server sent it, whatever its shape.
+    ///
+    /// Always carries the member when there is one, so nothing the server
+    /// put there is lost to a type that did not fit it. [`CallError::extra`]
+    /// is this decoded, for the one shape that has a type.
+    pub extra_raw: Option<Value>,
 }
 
 impl fmt::Display for CallError {
@@ -287,6 +303,11 @@ fn call_error(e: &truenas_jsonrpc::ErrorObject) -> CallError {
         reason: member(data, "reason"),
         trace: member(data, "trace"),
         extra: member(data, "extra"),
+        extra_raw: data
+            .and_then(Value::as_object)
+            .and_then(|m| m.get("extra"))
+            .filter(|v| !v.is_null())
+            .cloned(),
     }
 }
 
@@ -299,6 +320,55 @@ mod tests {
     /// middlewared's validation failure: -32602 with the full TrueNAS
     /// payload, including the per-attribute `extra` list. It decodes like
     /// -32001 rather than being handed back as an opaque blob.
+    /// `-32001`'s `extra` is whatever the raiser passed
+    /// `CallError(..., extra=...)`, and every middlewared raiser passes a
+    /// dict - the delete-with-dependents report, the open-files list.
+    /// The typed field cannot hold one; the raw field must not lose it.
+    #[test]
+    fn a_dict_extra_survives_as_raw() {
+        let e = ErrorObject::new(CALL_ERROR, "Method call error").with_data(
+            serde_json::json!({
+                "error": 16,
+                "errname": "EBUSY",
+                "reason": "Device busy",
+                "extra": { "dependencies": ["share/smb/1"] },
+            }),
+        );
+        match from_rpc_error(&e) {
+            ApiError::Call(err) => {
+                // The members around it still decode.
+                assert_eq!(err.errname.as_deref(), Some("EBUSY"));
+                assert_eq!(err.reason.as_deref(), Some("Device busy"));
+                // The dict does not fit the typed shape...
+                assert!(err.extra.is_none());
+                // ...and is therefore the thing that must not be dropped.
+                let raw = err.extra_raw.expect("the dict reaches the caller");
+                assert_eq!(raw["dependencies"][0], "share/smb/1");
+            }
+            other => panic!("expected Call, got {other:?}"),
+        }
+    }
+
+    /// The `-32602` shape still decodes into the typed field, and the raw
+    /// one carries it too - one member, two views.
+    #[test]
+    fn a_list_extra_decodes_and_is_also_raw() {
+        let e = ErrorObject::new(INVALID_PARAMS, "Invalid params").with_data(
+            serde_json::json!({
+                "extra": [["pool_create.name", "Invalid", 22]],
+            }),
+        );
+        match from_rpc_error(&e) {
+            ApiError::InvalidParams(err) => {
+                let typed = err.extra.expect("the triple decodes");
+                assert_eq!(typed[0].0, "pool_create.name");
+                assert_eq!(typed[0].2, 22);
+                assert!(err.extra_raw.is_some(), "raw carries it too");
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_validation_error_decodes_its_payload() {
         let e = ErrorObject::new(INVALID_PARAMS, "Invalid params").with_data(
