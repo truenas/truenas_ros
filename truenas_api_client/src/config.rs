@@ -91,10 +91,27 @@ pub struct ApiConfig {
     /// Batching this way keeps background work from overloading
     /// middlewared with a request per item.
     pub bulk_tick: Duration,
-    /// Cap on items held in the deferred queue at once. `queue_bulk`
-    /// refuses past it ([`ApiError::QueueFull`](crate::ApiError::QueueFull))
-    /// rather than growing without bound while middlewared is unreachable.
+    /// Cap on items held in the deferred queue at once, across every
+    /// session. `queue_bulk` refuses past it
+    /// ([`ApiError::QueueFull`](crate::ApiError::QueueFull)).
+    ///
+    /// This is a count, and a count does not bound memory: each item
+    /// holds its own encoded params, and nothing bounds those at
+    /// enqueue: an item too large to flush is still accepted and fails
+    /// later, when the chunk builder finds it.
+    /// [`ApiConfig::max_queued_bulk_bytes`] is the bound that does the
+    /// memory, in the units it is about.
     pub max_queued_bulk_items: usize,
+    /// Cap on the bytes the deferred queue holds at once, across every
+    /// session. Charged against the encoded params, and refused with
+    /// [`ApiError::QueueFull`](crate::ApiError::QueueFull) like the item
+    /// count, whichever trips first.
+    ///
+    /// The queue exists to hold work while middlewared is unreachable,
+    /// which is exactly the condition under which it grows and nothing
+    /// drains it - so it is the queue that most needs a bound stated in
+    /// memory rather than in items.
+    pub max_queued_bulk_bytes: usize,
     /// Cap on calls one session holds queued behind its concurrency
     /// budget ([`CALL_BUDGET`](crate::CALL_BUDGET)). A submission past it
     /// is refused with [`ApiError::QueueFull`](crate::ApiError::QueueFull)
@@ -146,6 +163,7 @@ impl Default for ApiConfig {
             call_timeout: None,
             bulk_tick: Duration::from_secs(10),
             max_queued_bulk_items: 10_000,
+            max_queued_bulk_bytes: 64 * 1024 * 1024,
             max_queued_calls: 256,
             max_queued_bytes: 16 * 1024 * 1024,
             max_waiting_events: 4096,

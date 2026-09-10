@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
 use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use truenas_jsonrpc::{Answer, Call, Caller, Id, Incoming, Outcome};
 use truenas_ros::ws::{
     self, FrameHead, HandshakeError, OP_BINARY, OP_CLOSE, OP_CONT, OP_PING,
@@ -36,12 +36,18 @@ use truenas_ros::ws::{
 /// whole job - `method.call` awaits `result.wait()` *inside* the
 /// semaphore - so concurrency there is scarce and long-held.
 ///
-/// It bounds *outstanding* calls, not calls in front of the server:
-/// a timed-out call's slot comes back at `expire` while the server
-/// may still be running it, so repeated timeouts can put more work there
-/// than this number. That is deliberate - the alternative is a session
-/// that accepts calls and sends none - and `-32000` is retryable, which
-/// [`ApiError::TooManyConcurrentCalls`] says.
+/// It counts what the *server* is holding, not what this client still
+/// cares about, and those differ: a slot is spent when the request goes
+/// out and returned only by its answer. Timing a call out, or failing it
+/// on an unattributable error, tells the caller it is over and tells
+/// middlewared nothing - the method is still running inside the
+/// semaphore. Crediting the slot there would let repeated timeouts put
+/// more work in front of the server than this number, which is the only
+/// way a session that obeys this ceiling can reach `-32000` at all.
+/// Calls that arrive while the slots are out queue in `backlog` and go
+/// when an answer frees one; `submit` refuses with
+/// [`ApiError::QueueFull`] once that queue hits its own bound, so the
+/// pushback is visible rather than silent.
 pub const CALL_BUDGET: usize = 8;
 
 /// What one pending entry is for, which decides how its answer surfaces.
@@ -78,6 +84,18 @@ pub(crate) struct Pending {
     /// dropped.
     pub(crate) deadline: Option<Instant>,
     pub(crate) abandoned: bool,
+    /// The encoded request, kept so a `-32000` can be reissued without
+    /// troubling the caller: middlewared raises at its hard limit before
+    /// the call is entered, so the method provably did not run.
+    ///
+    /// `None` for calls at the extended cap (the exempt upload methods,
+    /// 32x the ordinary one) and for session setup. Retention is bounded
+    /// by [`CALL_BUDGET`] frames at the *ordinary* cap; letting a 2 MiB
+    /// upload in would multiply that by 32 for the calls least likely to
+    /// want a silent reissue.
+    retry_frame: Option<Vec<u8>>,
+    /// Reissues so far, against [`MAX_CALL_RETRIES`].
+    retries: u32,
 }
 
 /// Where the session is in its life.
@@ -238,7 +256,43 @@ pub(crate) struct Session {
     /// The peer-close report, captured when the close frame arrives so
     /// the transport-level close can name it.
     pub(crate) close_reason: Option<String>,
+    /// A `-32000` arrived and the backoff has not been given a clock yet.
+    /// `on_answer` has no `Instant` (this half of the client is sans-io),
+    /// so the refusal is recorded here and `expire` - which the driver
+    /// calls with `now` on every pump iteration - turns it into
+    /// `backoff_until`.
+    backoff_armed: bool,
+    /// While set, `drain_backlog` sends nothing. Cleared by `expire` once
+    /// the instant passes; published through `next_deadline` so the pump
+    /// wakes for it.
+    backoff_until: Option<Instant>,
+    /// Consecutive `-32000` refusals, the exponent for [`BACKOFF_BASE`].
+    /// Reset by any answer that is not a refusal.
+    backoff_step: u32,
 }
+
+/// Reissues of one call after a `-32000` before its caller is told.
+///
+/// A refusal at the peer's hard concurrency limit is raised before the
+/// method is entered, so nothing ran and reissuing cannot double the
+/// call. This is how many times that is done silently. The
+/// caller's own `call_timeout` is the real bound - `expire` abandons the
+/// call whatever this says - so this exists to stop an unbounded reissue
+/// loop on a session with no call deadline set.
+pub const MAX_CALL_RETRIES: u32 = 4;
+
+/// First pause after a `-32000`, doubled per consecutive refusal up to
+/// [`BACKOFF_CAP`].
+const BACKOFF_BASE: Duration = Duration::from_millis(100);
+
+/// Ceiling for the pause. What has to drain before the peer has room is
+/// other work - this client is not the only one against the limit - and a
+/// job method holds its slot for the whole job (`method.call` awaits
+/// `result.wait()` *inside* the semaphore,
+/// `api/base/server/ws_handler/rpc.py`), so the wait is seconds rather
+/// than milliseconds. Past this, waiting longer only delays noticing
+/// that the peer has recovered.
+const BACKOFF_CAP: Duration = Duration::from_secs(5);
 
 impl Session {
     pub(crate) fn new(
@@ -263,6 +317,9 @@ impl Session {
             max_queued,
             max_queued_bytes,
             queued_bytes: 0,
+            backoff_armed: false,
+            backoff_until: None,
+            backoff_step: 0,
             legacy_jobs,
             close_reason: None,
         }
@@ -338,7 +395,12 @@ impl Session {
                 cap,
             });
         }
-        let sending = self.budget > 0;
+        // A running backoff holds new calls too, not only the ones
+        // already queued. `-32000` frees a slot as it arrives - it is an
+        // answer - so a caller submitting on the next line would find
+        // `budget > 0` and go straight out into the same refusal,
+        // stepping around `drain_backlog`'s gate entirely.
+        let sending = self.budget > 0 && !self.backing_off();
         // A backlog with no bound turns a caller that ignores backpressure
         // into unbounded memory: every queued call holds its encoded
         // frame, up to `max_outbound` each. Refuse the submission instead,
@@ -353,6 +415,7 @@ impl Session {
             // the worst case at the wrong number by that factor.
             if self.backlog.len() >= self.max_queued {
                 return Err(ApiError::QueueFull {
+                    queue: "this session's call backlog, in calls",
                     cap: self.max_queued,
                 });
             }
@@ -360,10 +423,14 @@ impl Session {
                 > self.max_queued_bytes
             {
                 return Err(ApiError::QueueFull {
+                    queue: "this session's call backlog, in bytes",
                     cap: self.max_queued_bytes,
                 });
             }
         }
+        let retry_frame = (matches!(kind, Kind::User)
+            && frame.len() <= self.max_outbound)
+            .then(|| frame.clone());
         self.pending.insert(
             id.clone(),
             Pending {
@@ -372,6 +439,8 @@ impl Session {
                 kind,
                 deadline,
                 abandoned: false,
+                retry_frame,
+                retries: 0,
             },
         );
         if sending {
@@ -614,12 +683,27 @@ impl Session {
         // healthy call in flight for a message the server already moved
         // past. Surface it and carry on.
         if matches!(reply.id(), Id::Null) {
-            return vec![Act::ServerError(match reply.outcome() {
+            let report = match reply.outcome() {
                 Outcome::Failure(e) => from_rpc_error(e),
                 Outcome::Result(_) => ApiError::Protocol(
                     "a result Response with a null id names no call",
                 ),
-            })];
+            };
+            // §5 gives `null` one meaning: the server could not work out
+            // which request the error belongs to. So it belongs to none of
+            // ours in particular and to any of them in general - and the
+            // one that provoked it will never be answered, because the
+            // answer it would have had is this one. Leaving them pending
+            // strands each caller and keeps their budget slots: `expire`
+            // only abandons an entry with a deadline, `call_timeout` is
+            // `None` by default, so nothing would ever return them and
+            // `CALL_BUDGET` of these would wedge a healthy session.
+            let mut acts = vec![Act::ServerError(report)];
+            acts.extend(self.fail_outstanding(
+                "the server reported an error it could not attribute to a \
+                 request; every call in flight was failed with it",
+            ));
+            return acts;
         }
         let Some(p) = self.pending.remove(reply.id()) else {
             return vec![Act::Fault("response to no outstanding call")];
@@ -634,16 +718,60 @@ impl Session {
         if !p.sent {
             return vec![Act::Fault("answer for a call never sent")];
         }
-        // Refill - unless `expire` already credited this slot when it told
-        // the caller the call was finished (see `expire`), which would
-        // otherwise count one answer twice.
-        if !p.abandoned {
-            self.budget += 1;
-            debug_assert!(
-                self.budget <= CALL_BUDGET,
-                "budget {} exceeded CALL_BUDGET {CALL_BUDGET}",
-                self.budget
-            );
+        // The answer is the only thing that says the server has let this
+        // call go, so it is the only thing that returns its slot -
+        // abandoned or not. A caller giving up does not free the server.
+        self.budget += 1;
+        debug_assert!(
+            self.budget <= CALL_BUDGET,
+            "budget {} exceeded CALL_BUDGET {CALL_BUDGET}",
+            self.budget
+        );
+        // A `-32000` says the peer is at its hard concurrency limit
+        // (`SoftHardSemaphore(10, 20)`, `api/base/server/ws_handler
+        // /rpc.py`). Arm the backoff *before* draining, or this answer's
+        // freed slot immediately sends a queued call into the same
+        // refusal. Abandoned or not: the refusal describes the server,
+        // not the call.
+        let refused = matches!(
+            reply.outcome(),
+            Outcome::Failure(e)
+                if e.code() == crate::error::TOO_MANY_CONCURRENT_CALLS
+        );
+        if refused {
+            self.backoff_armed = true;
+            self.backoff_step = self.backoff_step.saturating_add(1);
+            // The limit is the server's, and this client is not the only
+            // one against it, so the call was refused for load it did not
+            // create and its caller has nothing to fix. Reissue it after
+            // the pause instead of reporting it - `__aenter__` raises
+            // above `hardlimit` before `counter += 1` and before
+            // `method.call` (`middlewared/utils/lock.py`), so the method
+            // did not run and a reissue cannot double it.
+            if !p.abandoned
+                && p.retries < MAX_CALL_RETRIES
+                && let Some(frame) = p.retry_frame.clone()
+            {
+                self.queued_bytes =
+                    self.queued_bytes.saturating_add(frame.len());
+                self.backlog.push_front((reply.id().clone(), frame));
+                self.pending.insert(
+                    reply.id().clone(),
+                    Pending {
+                        sent: false,
+                        retries: p.retries + 1,
+                        ..p
+                    },
+                );
+                // No `drain_backlog`: the backoff is armed, so it would
+                // send nothing, and the entry is back in `pending` for
+                // `expire` to release when the pause ends.
+                return Vec::new();
+            }
+        } else {
+            // Any answer that is not a refusal means the peer has room
+            // again, so the next refusal starts from the base delay.
+            self.backoff_step = 0;
         }
         let mut acts = self.drain_backlog();
         if p.abandoned {
@@ -721,6 +849,26 @@ impl Session {
     /// Send whatever the refilled budget admits.
     fn drain_backlog(&mut self) -> Vec<Act> {
         let mut acts = Vec::new();
+        // §5.5.1: "MUST NOT send any more data frames after sending a
+        // Close frame". A queued call is a data frame, and the answer that
+        // frees a budget slot can arrive after our Close has gone out -
+        // the peer's own close, echoed here, or a local `close()` - so
+        // without this the next `on_answer` puts a fresh `core.*` request
+        // on a connection this endpoint already considers closed. The
+        // server role refuses the whole class one level up
+        // (`OP_TEXT | OP_CONT if closing`, `server.rs`); the client keeps
+        // reading, because an answer that has already arrived is worth
+        // delivering, and refuses only the sending. `fail_all` clears the
+        // backlog and fails those calls when the transport close lands.
+        if matches!(self.phase, Phase::Closing) {
+            return acts;
+        }
+        // Backing off from a `-32000`. The queued calls are exactly the
+        // ones that would walk into the same wall, and the server clears
+        // its own backlog by finishing work, not by being asked again.
+        if self.backing_off() {
+            return acts;
+        }
         while self.budget > 0 {
             let Some((id, frame)) = self.backlog.pop_front() else {
                 break;
@@ -752,6 +900,14 @@ impl Session {
         acts
     }
 
+    /// Whether a `-32000` backoff is holding this session's sends. True
+    /// from the moment the refusal is parsed (`backoff_armed`) until
+    /// `expire` retires the instant it was given, so there is no window
+    /// between the two in which a send slips out.
+    fn backing_off(&self) -> bool {
+        self.backoff_armed || self.backoff_until.is_some()
+    }
+
     /// The server-issued ident for `sub`, once subscribed.
     pub(crate) fn sub_ident(&self, sub: SubscriptionId) -> Option<&str> {
         self.subs.get(&sub).and_then(|e| e.ident.as_deref())
@@ -765,11 +921,14 @@ impl Session {
     }
 
     /// The earliest live call deadline, for the pump's wait computation.
+    /// A running backoff is one of them: nothing else would wake the pump
+    /// to release the calls it is holding.
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         self.pending
             .values()
             .filter(|p| !p.abandoned)
             .filter_map(|p| p.deadline)
+            .chain(self.backoff_until)
             .min()
     }
 
@@ -778,23 +937,19 @@ impl Session {
     /// must be recognized when they land); a tombstone still in the
     /// backlog is dropped at drain instead.
     ///
-    /// Abandoning a call also returns its concurrency slot: the caller has
-    /// just been handed [`ApiError::Timeout`] and is free to issue another
-    /// call, so holding the slot until an answer that may never come would
-    /// let [`CALL_BUDGET`] timeouts take the session to zero budget - after
-    /// which every call is accepted, queued, and never sent. The tombstone
-    /// keeps correlation working when a late answer does land, and the
-    /// reply path skips the refill for an abandoned entry so the slot is
-    /// credited exactly once.
+    /// Abandoning a call does **not** return its concurrency slot. The
+    /// caller has been handed [`ApiError::Timeout`] and is free to issue
+    /// another call, but middlewared was told nothing and is still running
+    /// the method inside its semaphore; crediting the slot here would put
+    /// more work in front of the server than [`CALL_BUDGET`] and walk into
+    /// the `-32000` that ceiling exists to stay clear of. The slot comes
+    /// back where every slot does, in `on_answer`, when the answer this
+    /// tombstone is waiting for lands.
     pub(crate) fn expire(&mut self, now: Instant) -> Vec<Act> {
         let mut acts = Vec::new();
-        let mut freed = 0;
         for p in self.pending.values_mut() {
             if !p.abandoned && p.deadline.is_some_and(|d| d <= now) {
                 p.abandoned = true;
-                if p.sent {
-                    freed += 1;
-                }
                 // The setup call has no caller-visible id; its timeout
                 // surfaces through the blocking connect's own deadline.
                 if !matches!(p.kind, Kind::SetOptions) {
@@ -805,17 +960,80 @@ impl Session {
                 }
             }
         }
-        self.budget += freed;
-        debug_assert!(
-            self.budget <= CALL_BUDGET,
-            "budget {} exceeded CALL_BUDGET {CALL_BUDGET}",
-            self.budget
-        );
+        // The backoff's clock. `on_answer` armed it without one; give it
+        // an instant here, and retire it once that instant has passed so
+        // the drain below can run.
+        if self.backoff_armed {
+            let step = self.backoff_step.saturating_sub(1).min(16);
+            let full =
+                BACKOFF_BASE.saturating_mul(1u32 << step).min(BACKOFF_CAP);
+            // Equal jitter: half the window, plus a random part of the
+            // rest. The limit is shared, so every client against it is
+            // refused at the same moment and a fixed delay would march
+            // them back in step - the thundering herd re-forming on each
+            // retry. Entropy from `getrandom(2)`, the source the frame
+            // masks already use, rather than a new dependency.
+            let r = u32::from_be_bytes(ws::mask_key());
+            let half = full / 2;
+            let delay = half
+                + half.mul_f64(f64::from(r) / f64::from(u32::MAX)).min(half);
+            // `checked_add` for the reason every other deadline site uses
+            // it: `Instant + Duration` panics on overflow.
+            self.backoff_until = now.checked_add(delay);
+            self.backoff_armed = false;
+        } else if self.backoff_until.is_some_and(|t| t <= now) {
+            self.backoff_until = None;
+        }
         acts.extend(self.drain_backlog());
         acts
     }
 
     /// Every live call, failed at once - the session is going away.
+    /// Fail every call this session has accepted, and keep serving.
+    ///
+    /// The teardown twin below drains `pending` outright, because a
+    /// session being dropped will never see another answer. This one is
+    /// called on a session that survives, so **a sent call keeps its
+    /// entry and its slot**: telling the caller the call is over says
+    /// nothing to the server, which is still running it and still owes an
+    /// answer. Dropping the entry makes that answer match nothing and
+    /// fault the session with "response to no outstanding call" - the
+    /// exact teardown this is here to avoid. Marking it abandoned is what
+    /// `expire` does for the same reason, and the slot comes back where
+    /// every other slot does, in `on_answer`.
+    ///
+    /// `Kind::SetOptions` is not failed at all: it has no caller-visible
+    /// id to report against. A setup that never completes is what
+    /// `connect_timeout` is for.
+    pub(crate) fn fail_outstanding(&mut self, why: &'static str) -> Vec<Act> {
+        let mut acts = Vec::new();
+        self.pending.retain(|_, p| {
+            if p.sent {
+                if !p.abandoned && !matches!(p.kind, Kind::SetOptions) {
+                    acts.push(Act::CallDone {
+                        call: p.call,
+                        result: Err(ApiError::Protocol(why)),
+                    });
+                    p.abandoned = true;
+                }
+                return true;
+            }
+            // Never reached the wire, so nothing is owed for it and it
+            // holds no slot. Its frame is in the backlog being cleared
+            // just below.
+            if !p.abandoned && !matches!(p.kind, Kind::SetOptions) {
+                acts.push(Act::CallDone {
+                    call: p.call,
+                    result: Err(ApiError::Protocol(why)),
+                });
+            }
+            false
+        });
+        self.backlog.clear();
+        self.queued_bytes = 0;
+        acts
+    }
+
     pub(crate) fn fail_all(&mut self, why: &str) -> Vec<Act> {
         self.frag = None;
         let mut acts = Vec::new();
@@ -1148,7 +1366,7 @@ mod tests {
         loop {
             match put(&mut s) {
                 Ok(_) => queued += 1,
-                Err(ApiError::QueueFull { cap }) => {
+                Err(ApiError::QueueFull { cap, .. }) => {
                     assert_eq!(cap, 200_000, "the byte cap is what refused");
                     break;
                 }
@@ -1194,6 +1412,128 @@ mod tests {
         assert!(!matches!(s.phase, Phase::Closing), "the session stays open");
     }
 
+    /// An `id: null` Response names no call of ours, and under 2.0 that
+    /// has exactly one meaning: the server could not work out which
+    /// request the error belongs to. The call that provoked it will
+    /// therefore never be answered - so it, and every other call in
+    /// flight, is failed to its caller.
+    ///
+    /// The tombstones stay. The server was told nothing by our giving up
+    /// and is still running those calls, so their answers are still
+    /// coming: dropping the entries makes each one fault the session with
+    /// "response to no outstanding call", which is the teardown this
+    /// tolerance exists to prevent. The slots come back with the answers.
+    #[test]
+    fn a_null_id_error_fails_the_calls_in_flight_but_keeps_their_tombstones() {
+        use serde_json::value::RawValue;
+        let mut s = session();
+        let args = RawValue::from_string("[]".to_owned()).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..3u64 {
+            let acts = s
+                .submit(crate::CallId(i), Kind::User, "core.ping", &args, None)
+                .expect("submits");
+            let [Act::Send(frame)] = acts.as_slice() else {
+                panic!("call {i} should have gone out: {acts:?}")
+            };
+            let (_op, payload) = unmask(frame);
+            let v: serde_json::Value =
+                serde_json::from_slice(&payload).expect("a JSON request");
+            ids.push(v.get("id").cloned().expect("a request carries an id"));
+        }
+        assert_eq!(s.budget, CALL_BUDGET - 3);
+
+        let body = r#"{"jsonrpc":"2.0","error":{"code":-32700,
+                       "message":"Parse error"},"id":null}"#;
+        let acts = s.on_frame(
+            head(true, OP_TEXT, body.len()),
+            body.as_bytes().to_vec(),
+        );
+        let done = acts
+            .iter()
+            .filter(|a| matches!(a, Act::CallDone { .. }))
+            .count();
+        assert!(
+            matches!(acts.first(), Some(Act::ServerError(_))),
+            "the server's report still surfaces: {acts:?}"
+        );
+        assert_eq!(done, 3, "every call in flight is answered: {acts:?}");
+        assert_eq!(
+            s.pending.len(),
+            3,
+            "the server still owes three answers; the tombstones wait"
+        );
+        assert_eq!(s.budget, CALL_BUDGET - 3, "and still holds their slots");
+        assert!(
+            !matches!(s.phase, Phase::Closing),
+            "the session keeps serving"
+        );
+
+        // The answers land. Each is recognised and dropped, and each
+        // returns its slot. A fault here is the defect.
+        for (n, id) in ids.iter().enumerate() {
+            let body =
+                serde_json::json!({"jsonrpc":"2.0","id":id,"result":null})
+                    .to_string();
+            let len = body.len();
+            let acts = s.on_frame(head(true, OP_TEXT, len), body.into_bytes());
+            assert!(
+                acts.is_empty(),
+                "late answer {n} must be dropped, not faulted: {acts:?}"
+            );
+            assert_eq!(s.budget, CALL_BUDGET - 2 + n);
+        }
+        assert!(s.pending.is_empty(), "every tombstone retired");
+        assert!(
+            !matches!(s.phase, Phase::Closing),
+            "and the session is still serving"
+        );
+    }
+
+    /// A session still in setup keeps its `core.set_options` tombstone
+    /// through the same report. Dropping it would leave the setup answer
+    /// matching no entry, and the session would then fault itself with
+    /// "response to no outstanding call" - a diagnosis of the wrong
+    /// thing. Its budget slot stays spent with it.
+    #[test]
+    fn a_null_id_error_does_not_strand_a_session_still_in_setup() {
+        let mut s =
+            Session::new("k".into(), false, 65_536, 65_536, 256, 1 << 20);
+        // The setup call, exactly as `on_head` issues it once the 101
+        // validates: `core.set_options` under `Kind::SetOptions`.
+        let params = serde_json::value::RawValue::from_string(
+            r#"[{"legacy_jobs":false}]"#.to_owned(),
+        )
+        .unwrap();
+        s.phase = Phase::Open;
+        s.submit(
+            crate::CallId(0),
+            Kind::SetOptions,
+            "core.set_options",
+            &params,
+            None,
+        )
+        .expect("the setup call goes out");
+        assert_eq!(s.pending.len(), 1, "the setup call is outstanding");
+
+        let body = r#"{"jsonrpc":"2.0","error":{"code":-32700,
+                       "message":"Parse error"},"id":null}"#;
+        let _ = s.on_frame(
+            head(true, OP_TEXT, body.len()),
+            body.as_bytes().to_vec(),
+        );
+        assert_eq!(
+            s.pending.len(),
+            1,
+            "the setup tombstone survives, or its answer faults the session"
+        );
+        assert_eq!(
+            s.budget,
+            CALL_BUDGET - 1,
+            "and the slot it holds is not handed back twice"
+        );
+    }
+
     /// The inbound cap covers an unfragmented message, not only a
     /// reassembled one.
     #[test]
@@ -1210,6 +1550,123 @@ mod tests {
             }
             other => panic!("an over-cap message must fault: {other:?}"),
         }
+    }
+
+    /// §5.5.1: no data frame goes out after our Close.
+    ///
+    /// The backlog is the one place a data frame can be born from an
+    /// *inbound* event: an answer frees a concurrency slot, `on_answer`
+    /// drains the queue, and each drained call is a fresh request frame.
+    /// Nothing gated that on the phase, so a Response arriving between our
+    /// Close and the transport teardown put a new `core.ping` on the wire.
+    #[test]
+    fn no_data_frame_goes_out_after_our_close() {
+        use serde_json::value::RawValue;
+        let mut s = session();
+        let args = RawValue::from_string("[]".to_owned()).unwrap();
+        for i in 0..CALL_BUDGET {
+            let _ = s
+                .submit(
+                    crate::CallId(100 + i as u64),
+                    Kind::User,
+                    "core.ping",
+                    &args,
+                    None,
+                )
+                .expect("under budget");
+        }
+        let _ = s
+            .submit(crate::CallId(999), Kind::User, "core.ping", &args, None)
+            .expect("queues");
+        assert_eq!(s.backlog.len(), 1, "one call is queued");
+
+        // The peer closes; we echo and go to Closing.
+        let close = s.on_frame(head(true, OP_CLOSE, 2), vec![0x03, 0xE8]);
+        assert!(matches!(close.as_slice(), [Act::Send(_), Act::PeerClosing]));
+        assert!(matches!(s.phase, Phase::Closing));
+
+        // Now one of the outstanding answers lands.
+        let answered = s
+            .pending
+            .iter()
+            .find(|(_, p)| p.sent)
+            .map(|(k, _)| k.clone())
+            .expect("a sent call");
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": answered, "result": "pong",
+        })
+        .to_string();
+        let len = body.len();
+        let acts = s.on_frame(head(true, OP_TEXT, len), body.into_bytes());
+        let sent: Vec<u8> = acts
+            .iter()
+            .filter_map(|a| match a {
+                Act::Send(b) => Some(b[0] & 0x0F),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            sent.is_empty(),
+            "no frame may follow our Close; sent opcodes {sent:?}"
+        );
+        // The answer itself is still delivered - only the sending stops.
+        assert!(
+            acts.iter().any(|a| matches!(a, Act::CallDone { .. })),
+            "the answer that already arrived is still surfaced: {acts:?}"
+        );
+        assert_eq!(s.backlog.len(), 1, "the queued call stays queued");
+    }
+
+    /// The reachable half of the same rule: `expire` drains the backlog
+    /// too, and `pump` runs it before it reaps a single completion.
+    ///
+    /// So with `call_timeout` set and more than `CALL_BUDGET` calls in
+    /// flight, one `close()` + one `pump()` was enough to put a queued
+    /// request on the wire after the Close - and the caller was told that
+    /// same call had failed `Closed`, while its frame was already gone.
+    #[test]
+    fn expire_does_not_drain_the_backlog_after_our_close() {
+        use serde_json::value::RawValue;
+        use std::time::Duration;
+        let mut s = session();
+        let args = RawValue::from_string("[]".to_owned()).unwrap();
+        let t0 = Instant::now();
+        // Budget spent, every one of them due to time out...
+        for i in 0..CALL_BUDGET {
+            let _ = s
+                .submit(
+                    crate::CallId(100 + i as u64),
+                    Kind::User,
+                    "core.ping",
+                    &args,
+                    Some(t0),
+                )
+                .expect("under budget");
+        }
+        // ...and one queued call that is NOT due, so expiry frees slots
+        // for it rather than dropping it.
+        let _ = s
+            .submit(crate::CallId(999), Kind::User, "core.ping", &args, None)
+            .expect("queues");
+        assert_eq!(s.backlog.len(), 1);
+
+        let close = s.on_frame(head(true, OP_CLOSE, 2), vec![0x03, 0xE8]);
+        assert!(matches!(close.as_slice(), [Act::Send(_), Act::PeerClosing]));
+
+        let acts = s.expire(t0 + Duration::from_secs(1));
+        let sent: Vec<u8> = acts
+            .iter()
+            .filter_map(|a| match a {
+                Act::Send(b) => Some(b[0] & 0x0F),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            sent.is_empty(),
+            "expire must not put a frame on a closing connection; sent \
+             opcodes {sent:?}"
+        );
+        assert_eq!(s.backlog.len(), 1, "the queued call stays queued");
     }
 
     /// A first fragment is held until a continuation arrives, so it is
@@ -1289,7 +1746,9 @@ mod tests {
         // for an answer to find, and no growth.
         let pending_before = s.pending.len();
         match put(&mut s, 999) {
-            Err(ApiError::QueueFull { cap }) => assert_eq!(cap, QUEUED),
+            Err(ApiError::QueueFull { cap, .. }) => {
+                assert_eq!(cap, QUEUED)
+            }
             other => panic!("expected QueueFull, got {other:?}"),
         }
         assert_eq!(s.backlog.len(), QUEUED, "a refusal does not queue");
@@ -1353,22 +1812,21 @@ mod tests {
             "tombstones stay, so a late answer is still recognised"
         );
         assert_eq!(
-            s.budget, CALL_BUDGET,
-            "the caller was told they finished, so the slots come back"
+            s.budget, 0,
+            "the caller gave up; the server did not, so it still holds \
+             every slot"
         );
 
-        // So an ordinary call reaches the wire instead of the backlog.
+        // So a further call is queued, not sent: the peer's concurrency
+        // limit is counted by the peer, and it has not answered anything.
         let acts = s
             .submit(crate::CallId(999), Kind::User, "core.ping", &args, None)
             .expect("submits");
-        assert!(
-            matches!(acts.as_slice(), [Act::Send(_)]),
-            "the freed budget admits it: {acts:?}"
-        );
-        assert!(s.backlog.is_empty(), "nothing was queued");
-        assert_eq!(s.budget, CALL_BUDGET - 1);
+        assert!(acts.is_empty(), "queued behind the server's own work");
+        assert_eq!(s.backlog.len(), 1);
 
-        // A late answer to an abandoned call must not credit a slot twice.
+        // The answer is what frees the server, so it is what frees the
+        // slot - and it releases the queued call.
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": ids[0],
@@ -1378,13 +1836,258 @@ mod tests {
         let len = body.len();
         let acts = s.on_frame(head(true, OP_TEXT, len), body.into_bytes());
         assert!(
-            acts.is_empty(),
-            "a late answer to an abandoned call surfaces nothing: {acts:?}"
+            matches!(acts.as_slice(), [Act::Send(_)]),
+            "the late answer's slot goes to the queued call: {acts:?}"
         );
+        assert_eq!(s.budget, 0, "which spends it again immediately");
+        assert!(s.backlog.is_empty(), "the backlog drained");
         assert_eq!(
-            s.budget,
-            CALL_BUDGET - 1,
-            "expire already credited that slot; the answer must not again"
+            s.pending.len(),
+            CALL_BUDGET,
+            "one tombstone retired, one live call added"
+        );
+    }
+
+    /// Read a request frame's `id` out of a `Send`.
+    fn sent_id(acts: &[Act]) -> serde_json::Value {
+        let [Act::Send(frame)] = acts else {
+            panic!("expected exactly one Send: {acts:?}")
+        };
+        let (_op, payload) = unmask(frame);
+        let v: serde_json::Value =
+            serde_json::from_slice(&payload).expect("a JSON request");
+        v.get("id").cloned().expect("a request carries an id")
+    }
+
+    /// Build a `-32000` answer for `id`.
+    fn refusal(id: &serde_json::Value) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": crate::error::TOO_MANY_CONCURRENT_CALLS,
+                "message": "Maximum number of concurrent calls (20) has \
+                            exceeded",
+            },
+        })
+        .to_string()
+    }
+
+    /// A `-32000` is the shared limit saying "not now", not a verdict on
+    /// the call: middlewared raises it before entering the method
+    /// (`SoftHardSemaphore.__aenter__` is above `hardlimit` before
+    /// `counter += 1` and before `method.call`), so nothing ran. The call
+    /// is reissued after a pause rather than reported, and while that
+    /// pause runs nothing else goes out either - not the queued calls,
+    /// and not a call submitted meanwhile on the slot the refusal itself
+    /// just returned.
+    #[test]
+    fn a_concurrency_refusal_is_reissued_after_a_pause() {
+        use serde_json::value::RawValue;
+        let mut s = session();
+        let args = RawValue::from_string("[]".to_owned()).unwrap();
+
+        let mut ids = Vec::new();
+        for i in 0..CALL_BUDGET {
+            let acts = s
+                .submit(
+                    crate::CallId(100 + i as u64),
+                    Kind::User,
+                    "core.ping",
+                    &args,
+                    None,
+                )
+                .expect("submits under budget");
+            ids.push(sent_id(&acts));
+        }
+        s.submit(crate::CallId(999), Kind::User, "core.ping", &args, None)
+            .expect("submits");
+        assert_eq!(s.backlog.len(), 1, "queued behind the budget");
+
+        // The refusal lands.
+        let body = refusal(&ids[0]);
+        let len = body.len();
+        let acts = s.on_frame(head(true, OP_TEXT, len), body.into_bytes());
+        assert!(
+            acts.is_empty(),
+            "nothing is reported and nothing goes out: {acts:?}"
+        );
+        assert_eq!(s.backlog.len(), 2, "the refused call is requeued");
+        let front: serde_json::Value = serde_json::from_slice(
+            &s.backlog.front().expect("a queued frame").1,
+        )
+        .expect("a JSON request");
+        assert_eq!(
+            front.get("id"),
+            Some(&ids[0]),
+            "and requeued at the front, ahead of what was already waiting"
+        );
+
+        // A call submitted during the pause queues too: the refusal
+        // returned a slot, so `submit` would otherwise find budget and go
+        // straight out around the drain's gate.
+        let acts = s
+            .submit(crate::CallId(1000), Kind::User, "core.ping", &args, None)
+            .expect("submits");
+        assert!(acts.is_empty(), "a fresh call queues too: {acts:?}");
+        assert_eq!(s.backlog.len(), 3);
+
+        // `expire` gives the pause a clock and publishes it.
+        let t0 = Instant::now();
+        assert!(s.expire(t0).is_empty(), "still paused");
+        let until = s.next_deadline().expect("the pause is a pump deadline");
+        assert!(until > t0 && until <= t0 + BACKOFF_CAP, "bounded");
+        assert!(
+            s.expire(until - Duration::from_millis(1)).is_empty(),
+            "the pause holds"
+        );
+        assert_eq!(s.backlog.len(), 3, "all three still held");
+
+        // One answer came back, so one slot did: the reissue goes, and
+        // the rest wait for further answers.
+        let acts = s.expire(until);
+        assert_eq!(
+            sent_id(&acts),
+            ids[0],
+            "the reissued call is the one that goes"
+        );
+        assert_eq!(s.backlog.len(), 2, "held by the budget, not the pause");
+        assert_eq!(
+            s.next_deadline(),
+            None,
+            "and the pause is no longer a deadline"
+        );
+    }
+
+    /// A call refused past [`MAX_CALL_RETRIES`] reaches its caller. The
+    /// reissue is a courtesy against a busy peer, not an unbounded loop -
+    /// a session with no `call_timeout` has nothing else to end it.
+    #[test]
+    fn a_call_refused_past_its_retry_bound_reaches_its_caller() {
+        use serde_json::value::RawValue;
+        let mut s = session();
+        let args = RawValue::from_string("[]".to_owned()).unwrap();
+
+        let acts = s
+            .submit(crate::CallId(1), Kind::User, "core.ping", &args, None)
+            .expect("submits");
+        let mut id = sent_id(&acts);
+
+        for attempt in 0..MAX_CALL_RETRIES {
+            let body = refusal(&id);
+            let len = body.len();
+            let acts = s.on_frame(head(true, OP_TEXT, len), body.into_bytes());
+            assert!(
+                acts.is_empty(),
+                "reissue {attempt} must not report: {acts:?}"
+            );
+            // Clear the pause; the reissue goes out with the same id.
+            let t0 = Instant::now();
+            s.expire(t0);
+            let until = s.next_deadline().expect("a pause");
+            let acts = s.expire(until);
+            assert_eq!(sent_id(&acts), id, "reissued under its own id");
+            id = sent_id(&acts);
+        }
+
+        // One more refusal, and the caller hears about it.
+        let body = refusal(&id);
+        let len = body.len();
+        let acts = s.on_frame(head(true, OP_TEXT, len), body.into_bytes());
+        assert!(
+            matches!(
+                acts.as_slice(),
+                [Act::CallDone {
+                    result: Err(ApiError::TooManyConcurrentCalls { .. }),
+                    ..
+                }]
+            ),
+            "the bound is reached and the refusal surfaces: {acts:?}"
+        );
+        assert!(s.backlog.is_empty(), "and it is not requeued again");
+    }
+
+    /// Consecutive refusals lengthen the pause, and an answer that is not
+    /// a refusal resets it - without that, a session that hit the limit
+    /// once carries the longest delay for the rest of its life.
+    ///
+    /// Each pause is jittered, so the assertion is on the window rather
+    /// than on an exact figure: equal jitter puts it in
+    /// `[full/2, full]` for that step's `full`.
+    #[test]
+    fn the_backoff_grows_and_an_ordinary_answer_resets_it() {
+        use serde_json::value::RawValue;
+        let mut s = session();
+        let args = RawValue::from_string("[]".to_owned()).unwrap();
+
+        // Answer one call and return the pause that answer produced.
+        let answer = |s: &mut Session, n: u64, refused: bool| -> Duration {
+            let acts = s
+                .submit(crate::CallId(n), Kind::User, "core.ping", &args, None)
+                .expect("submits");
+            let id = sent_id(&acts);
+            let body = if refused {
+                refusal(&id)
+            } else {
+                serde_json::json!({"jsonrpc":"2.0","id":id,"result":null})
+                    .to_string()
+            };
+            let len = body.len();
+            s.on_frame(head(true, OP_TEXT, len), body.into_bytes());
+            let t0 = Instant::now();
+            s.expire(t0);
+            let d = s.next_deadline().map_or(Duration::ZERO, |t| t - t0);
+            // Clear whatever pause was set, so the next measurement is
+            // not taken through this one.
+            s.expire(t0 + d);
+            d
+        };
+        // The window `full` for the nth consecutive refusal.
+        let window = |n: u32| -> Duration {
+            BACKOFF_BASE.saturating_mul(1 << n).min(BACKOFF_CAP)
+        };
+        let in_window = |d: Duration, n: u32| {
+            let full = window(n);
+            assert!(
+                d >= full / 2 && d <= full,
+                "refusal {} paused {d:?}, outside [{:?}, {full:?}]",
+                n + 1,
+                full / 2
+            );
+        };
+
+        in_window(answer(&mut s, 1, true), 0);
+        in_window(answer(&mut s, 2, true), 1);
+        in_window(answer(&mut s, 3, true), 2);
+
+        // A good answer resets the exponent.
+        assert_eq!(answer(&mut s, 4, false), Duration::ZERO, "no pause");
+        in_window(answer(&mut s, 5, true), 0);
+
+        // And the pause is actually jittered, not merely inside the
+        // window a fixed delay would also satisfy. Every client against
+        // this shared limit is refused at the same moment; identical
+        // delays march them back in step, which is the herd re-forming.
+        // A fresh session per sample: a reissued call this test never
+        // answers would hold its slot and starve the next submission.
+        let first_pause = |n: u64| -> Duration {
+            let mut s = session();
+            let args = RawValue::from_string("[]".to_owned()).unwrap();
+            let acts = s
+                .submit(crate::CallId(n), Kind::User, "core.ping", &args, None)
+                .expect("submits");
+            let body = refusal(&sent_id(&acts));
+            let len = body.len();
+            s.on_frame(head(true, OP_TEXT, len), body.into_bytes());
+            let t0 = Instant::now();
+            s.expire(t0);
+            s.next_deadline().map_or(Duration::ZERO, |t| t - t0)
+        };
+        let seen: Vec<Duration> = (0..8u64).map(first_pause).collect();
+        assert!(
+            seen.iter().any(|d| *d != seen[0]),
+            "eight first-step pauses were all {:?}: no jitter",
+            seen[0]
         );
     }
 

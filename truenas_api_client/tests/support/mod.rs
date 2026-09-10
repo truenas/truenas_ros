@@ -177,6 +177,51 @@ impl Wire {
         }
     }
 
+    /// Count client TEXT frames until the socket goes quiet for `quiet`.
+    ///
+    /// The discriminator a "did the call reach the wire?" scenario needs:
+    /// a call that was accepted but never flushed is invisible to
+    /// `expect_call`, which would simply block.
+    pub fn count_client_text_frames_until_quiet(
+        &mut self,
+        quiet: std::time::Duration,
+    ) -> usize {
+        self.stream.set_read_timeout(Some(quiet)).expect("timeout");
+        let mut n = 0usize;
+        loop {
+            let mut h = [0u8; 2];
+            if self.stream.read_exact(&mut h).is_err() {
+                break;
+            }
+            let opcode = h[0] & 0x0F;
+            let len = match h[1] & 0x7F {
+                126 => {
+                    let mut e = [0u8; 2];
+                    if self.stream.read_exact(&mut e).is_err() {
+                        break;
+                    }
+                    usize::from(u16::from_be_bytes(e))
+                }
+                127 => {
+                    let mut e = [0u8; 8];
+                    if self.stream.read_exact(&mut e).is_err() {
+                        break;
+                    }
+                    u64::from_be_bytes(e) as usize
+                }
+                v => usize::from(v),
+            };
+            let mut rest = vec![0u8; len + 4]; // mask + payload
+            if self.stream.read_exact(&mut rest).is_err() {
+                break;
+            }
+            if opcode == 0x1 {
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Read the next text message and require it to be a call of
     /// `method`; hand back `(id, params)`.
     pub fn expect_call(&mut self, method: &str) -> (Value, Value) {
@@ -293,6 +338,38 @@ impl Wire {
         let mut payload = code.to_be_bytes().to_vec();
         payload.extend_from_slice(reason.as_bytes());
         self.send_frame(0x8, true, &payload);
+    }
+
+    /// [`read_frame`](Self::read_frame), but `None` at EOF instead of a
+    /// panic - for a script that reads to the end of the connection.
+    pub fn read_frame_or_eof(&mut self) -> Option<(u8, bool, Vec<u8>)> {
+        let mut h = [0u8; 2];
+        if self.stream.read_exact(&mut h).is_err() {
+            return None;
+        }
+        let fin = h[0] & 0x80 != 0;
+        let opcode = h[0] & 0x0F;
+        assert!(
+            h[1] & 0x80 != 0,
+            "INVARIANT: client frames must be masked (opcode {opcode:#x})"
+        );
+        let len = match h[1] & 0x7F {
+            126 => {
+                let ext = self.read_exact(2);
+                usize::from(u16::from_be_bytes([ext[0], ext[1]]))
+            }
+            127 => {
+                let ext = self.read_exact(8);
+                u64::from_be_bytes(ext.try_into().unwrap()) as usize
+            }
+            n => usize::from(n),
+        };
+        let mask = self.read_exact(4);
+        let mut payload = self.read_exact(len);
+        for (i, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[i % 4];
+        }
+        Some((opcode, fin, payload))
     }
 
     /// Read the client's close echo (or its initiated close).

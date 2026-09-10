@@ -368,6 +368,10 @@ mod mount {
 }
 
 #[cfg(feature = "acl")]
+#[path = "support/zfs_dir.rs"]
+mod zfs_dir;
+
+#[cfg(feature = "acl")]
 mod acl {
     use std::os::fd::AsFd;
     use truenas_ros::sync_fs::acl::{
@@ -494,10 +498,24 @@ mod acl {
     /// nothing". Create the fixture instead of hoping for it, and route
     /// the absent-dataset exit through `require_zfs` so the promise is
     /// true.
-    fn live_acl_file(dir: &str) -> Option<(std::path::PathBuf, std::fs::File)> {
-        let dir = std::path::Path::new(dir);
-        if !dir.is_dir() {
-            require_zfs(&format!("{} is absent", dir.display()));
+    fn live_acl_file(
+        env_var: &str,
+        fallback: &str,
+    ) -> Option<(std::path::PathBuf, std::fs::File)> {
+        // Resolved the way every other ZFS fixture in the tree resolves:
+        // the provisioning script's env var first, then the convention
+        // path, and gated on `statfs` rather than on the directory
+        // existing. `is_dir` was the gate `test/zfs.rs` was moved off in
+        // the same commit that wrote this one - it says yes to a
+        // leftover mountpoint on the root filesystem and to tmpfs, which
+        // serves POSIX ACLs perfectly well, so the POSIX half would pass
+        // green having tested the filesystem this suite exists to avoid.
+        let dir = std::env::var_os(env_var)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(fallback));
+        let dir = dir.as_path();
+        if super::zfs_dir::is_zfs(dir) != Some(true) {
+            require_zfs(&format!("{} is not a ZFS dataset", dir.display()));
             return None;
         }
         let path = dir.join(format!("rostest_acl_{}", std::process::id()));
@@ -515,7 +533,9 @@ mod acl {
 
     #[test]
     fn fgetacl_live_nfs4_roundtrips() {
-        let Some((path, f)) = live_acl_file("/NFSV4ACL") else {
+        let Some((path, f)) =
+            live_acl_file("TRUENAS_ROS_NFS4_DATASET", "/NFSV4ACL")
+        else {
             return;
         };
         let got = fgetacl(f.as_fd());
@@ -537,7 +557,9 @@ mod acl {
 
     #[test]
     fn fgetacl_live_posix_roundtrips() {
-        let Some((path, f)) = live_acl_file("/POSIXACL") else {
+        let Some((path, f)) =
+            live_acl_file("TRUENAS_ROS_POSIX_DATASET", "/POSIXACL")
+        else {
             return;
         };
         let got = fgetacl(f.as_fd());
@@ -557,12 +579,19 @@ mod acl {
                     id: 4_200,
                     default: false,
                 });
-                access.push(PosixAce {
-                    tag: PosixTag::Mask,
-                    perms: PosixPerm::READ | PosixPerm::WRITE,
-                    id: -1,
-                    default: false,
-                });
+                // Only when there is not one already: a file inheriting
+                // a default ACL from its parent arrives with a MASK, and
+                // a second one is not a valid POSIX1E ACL - `fsetacl`
+                // refuses it and the `expect` below panics. CI never saw
+                // it because `setup-test-zfs.sh` sets no default ACL.
+                if !access.iter().any(|a| a.tag == PosixTag::Mask) {
+                    access.push(PosixAce {
+                        tag: PosixTag::Mask,
+                        perms: PosixPerm::READ | PosixPerm::WRITE,
+                        id: -1,
+                        default: false,
+                    });
+                }
                 let want = PosixAcl::from_aces(access);
                 fsetacl(f.as_fd(), Some(&Acl::Posix(want)))
                     .expect("set a real ACL");

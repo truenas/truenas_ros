@@ -866,6 +866,16 @@ fn open_metadata_close_workflow() {
         assert_eq!(n.expect("fgetxattr"), 3);
         assert_eq!(&val[..3], b"\x01\x02\x03");
 
+        // ...and a *generous* read buffer is not an oversized value. The
+        // bound above belongs to the write path: `FsConn::fgetxattr`'s
+        // contract is that a buffer SHORTER than the value fails ERANGE,
+        // and the sync twin (`sync_fs::xattr::fgetxattr`) takes no buffer
+        // at all and never refuses on its size.
+        let (n, val) =
+            h.fgetxattr(me, &f, &name, vec![0u8; 2 * XATTR_SIZE_MAX]);
+        assert_eq!(n.expect("a generous read buffer still reads the value"), 3);
+        assert_eq!(&val[..3], b"\x01\x02\x03");
+
         // Allocation control, by fd.
         h.fallocate(me, &f, 0, 4096, 4096).expect("fallocate");
         assert_eq!(std::fs::metadata(dir.join("doc.bin")).unwrap().len(), 8192);

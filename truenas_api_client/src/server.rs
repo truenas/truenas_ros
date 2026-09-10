@@ -322,22 +322,35 @@ impl JsonRpcServer {
             // answering, not faulting - a client that sends a batch by
             // mistake gets an error and keeps its other calls.
             Incoming::Batch(_) => {
-                vec![ServerAct::Send(error_frame(Id::Null, batch_refusal()))]
+                vec![ServerAct::Send(error_frame(
+                    Id::Null,
+                    not_an_object(text),
+                ))]
             }
-            // An empty array reaches `Incoming::Invalid` rather than
-            // `Batch`, and middlewared does not make that distinction:
-            // `parse_message` raises on `isinstance(message, list)`
-            // before it looks inside, so `[]` and `[{...}]` get the same
-            // `-32700`. Route it to the same answer.
+            // middlewared splits these two by *shape*, not by content,
+            // and one step earlier than this codec does. `parse_message`
+            // runs before any JSON-RPC validation: it raises for
+            // unparseable bytes, for a list, and for anything else
+            // without `.get` - and every one of those becomes
+            // `-32700` against a null id, after which the handler
+            // `continue`s (`middlewared/utils/limits.py`,
+            // `api/base/server/ws_handler/rpc.py`). Only a top-level
+            // *object* survives to `validate_message`, whose failures are
+            // `-32600` against the id it could recover.
+            //
+            // So the rule is the top-level shape: an object may be
+            // `-32600`, and everything else - a bare string, a number,
+            // `null`, an array empty or not, or bytes that are not JSON
+            // at all - is `-32700`.
             Incoming::Invalid { error, .. } => {
-                let body = text.trim_ascii_start();
-                if body.first() == Some(&b'[') {
-                    return vec![ServerAct::Send(error_frame(
+                if text.trim_ascii_start().first() == Some(&b'{') {
+                    vec![ServerAct::Send(error_frame(Id::Null, error))]
+                } else {
+                    vec![ServerAct::Send(error_frame(
                         Id::Null,
-                        batch_refusal(),
-                    ))];
+                        not_an_object(text),
+                    ))]
                 }
-                vec![ServerAct::Send(error_frame(Id::Null, error))]
             }
         }
     }
@@ -396,14 +409,29 @@ const CLOSE_NORMAL: u16 = 1000;
 /// error".
 const CLOSE_PROTOCOL_ERROR: u16 = 1002;
 
-/// middlewared's own answer to a batch, verbatim: `parse_message` raises
-/// `ValueError('Batch messages are not supported at this time')` and the
-/// handler turns a `ValueError` into `INVALID_JSON` (`-32700`) against a
-/// `None` id, then `continue`s (`middlewared/utils/limits.py`,
-/// `api/base/server/ws_handler/rpc.py`).
-fn batch_refusal() -> ErrorObject {
-    ErrorObject::parse_error()
-        .with_reason("Batch messages are not supported at this time")
+/// middlewared's answer to anything that is not a top-level JSON object:
+/// `parse_message` raises before any JSON-RPC validation and the handler
+/// turns the `ValueError` into `INVALID_JSON` (`-32700`) against a `None`
+/// id, then keeps serving (`middlewared/utils/limits.py`,
+/// `api/base/server/ws_handler/rpc.py`). Its own text for the list case
+/// is kept, since a batch is the shape a client is most likely to send
+/// on purpose.
+fn not_an_object(text: &[u8]) -> ErrorObject {
+    let e = ErrorObject::parse_error();
+    if text.trim_ascii_start().first() == Some(&b'[') {
+        return e.with_reason("Batch messages are not supported at this time");
+    }
+    // Well-formed JSON that is simply not an object - a bare string, a
+    // number, `true`, `null`. middlewared reaches these through the same
+    // `except Exception` and says something different, so this does too:
+    // telling a client that sent `"hello"` that batches are unsupported
+    // diagnoses the wrong thing.
+    if serde_json::from_slice::<serde_json::Value>(text).is_ok() {
+        return e.with_reason("Invalid Message Format");
+    }
+    // Not JSON at all. middlewared forwards the decoder's own message
+    // here; ours is the code's standard text rather than an invented one.
+    e
 }
 
 /// One error-response frame (unmasked server text frame).
@@ -618,32 +646,71 @@ mod tests {
         ));
     }
 
-    /// middlewared treats every JSON array alike: `parse_message` sees a
-    /// list and raises before it looks inside. So `[]` and `[{...}]` must
-    /// get the same answer here, and it must be an answer rather than a
-    /// teardown.
+    /// middlewared splits `-32700` from `-32600` by the top-level shape
+    /// and one step earlier than this codec does: only an object reaches
+    /// `validate_message`, and everything else fails in `parse_message`.
     #[test]
-    fn a_batch_is_answered_the_way_middlewared_answers_one() {
-        for body in [&b"[]"[..], br#"[{"jsonrpc":"2.0","method":"m","id":1}]"#]
-        {
+    fn only_a_top_level_object_can_be_invalid_request() {
+        // -32700: not an object, however well-formed the JSON is.
+        for body in [
+            &b"[]"[..],
+            br#"[{"jsonrpc":"2.0","method":"m","id":1}]"#,
+            br#""just a string""#,
+            b"42",
+            b"null",
+            b"not json at all",
+        ] {
             let mut s = open_server();
             match s
                 .on_frame(head(true, OP_TEXT, body.len()), body.to_vec())
                 .as_slice()
             {
                 [ServerAct::Send(f)] => {
-                    let (op, payload) = decode(f);
-                    assert_eq!(op, OP_TEXT);
                     let v: serde_json::Value =
-                        serde_json::from_slice(&payload).expect("JSON");
+                        serde_json::from_slice(&decode(f).1).expect("JSON");
                     assert_eq!(
                         v["error"]["code"], -32700,
-                        "{body:?} must answer -32700 like middlewared"
+                        "{body:?} is not an object, so middlewared answers \
+                         -32700"
                     );
                     assert!(v["id"].is_null());
+                    // ...and says which of the three it was, as
+                    // middlewared does: the batch text belongs to a list,
+                    // well-formed JSON that is not an object gets
+                    // "Invalid Message Format", and bytes that are not
+                    // JSON at all get no invented reason.
+                    let reason = v["error"]["data"].as_str();
+                    let want = if body.trim_ascii_start().first() == Some(&b'[')
+                    {
+                        Some("Batch messages are not supported at this time")
+                    } else if serde_json::from_slice::<serde_json::Value>(body)
+                        .is_ok()
+                    {
+                        Some("Invalid Message Format")
+                    } else {
+                        None
+                    };
+                    assert_eq!(reason, want, "{body:?} got the wrong reason");
                 }
                 other => panic!("{body:?} must be answered: {other:?}"),
             }
+        }
+        // -32600: an object, but not a valid request.
+        let mut s = open_server();
+        let body = br#"{"jsonrpc":"2.0","id":1}"#;
+        match s
+            .on_frame(head(true, OP_TEXT, body.len()), body.to_vec())
+            .as_slice()
+        {
+            [ServerAct::Send(f)] => {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&decode(f).1).expect("JSON");
+                assert_eq!(
+                    v["error"]["code"], -32600,
+                    "an object reaches request validation"
+                );
+            }
+            other => panic!("must be answered: {other:?}"),
         }
     }
 
