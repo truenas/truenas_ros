@@ -1753,19 +1753,37 @@ impl FsCore {
             self.refuse(eng, waiter, Errno::EINVAL, true, vec![value]);
             return;
         };
-        // The value's length reaches the SQE as a `u32` (`val_len` below),
-        // so an oversized one does not fail - it *truncates*: at 1 << 32 it
-        // becomes a length of zero, the kernel stores an empty attribute,
-        // the op completes `res = 0`, and `map_res` hands the waiter
-        // `Ok(())` for a write that did not happen. That is the same
-        // reported-but-not-done failure the opcode screen above refuses,
-        // arriving by the length instead of the opcode.
+        // The length reaches the SQE as a `u32` (`val_len` below), so an
+        // oversized one does not fail - it *truncates*: at 1 << 32 it
+        // becomes a length of zero. That is the same reported-but-not-done
+        // failure the opcode screen above refuses, arriving by the length
+        // instead of the opcode. Both xattr tags need a bound, but not the
+        // same one, because `value` is not the same thing to each.
         //
-        // The bound is the sync twin's, so one operation has one contract
-        // across both implementations: `sync_fs::xattr::fsetxattr` refuses
-        // above `XATTR_SIZE_MAX` before any syscall, and the uring get path
-        // already uses the same constant (`query_dir.rs`).
-        if value.len() > crate::sync_fs::xattr::XATTR_SIZE_MAX {
+        // FSETXATTR: `value` IS the attribute. The bound is the sync twin's,
+        // so one operation has one contract across both implementations -
+        // `sync_fs::xattr::fsetxattr` refuses above `XATTR_SIZE_MAX` before
+        // any syscall. Truncating here would store an empty attribute and
+        // complete `res = 0`, handing the waiter `Ok(())` for a write that
+        // did not happen.
+        //
+        // FGETXATTR: `value` is the caller's OUTPUT buffer, and a generous
+        // one is legal - `FsConn::fgetxattr`'s rustdoc promises only that a
+        // buffer SHORTER than the value fails `ERANGE`, and the sync twin
+        // takes no buffer at all and never refuses on its size. So
+        // `XATTR_SIZE_MAX` is the wrong bound here; the only length this
+        // path cannot represent is one past `u32::MAX`, which truncates to
+        // zero and is the kernel's size-only form: `res` comes back as the
+        // attribute's size with nothing written, and the waiter is told it
+        // read a value it did not.
+        let unrepresentable = match tag {
+            TAG_FSETXATTR => {
+                value.len() > crate::sync_fs::xattr::XATTR_SIZE_MAX
+            }
+            TAG_FGETXATTR => value.len() > u32::MAX as usize,
+            _ => false,
+        };
+        if unrepresentable {
             self.refuse(eng, waiter, Errno::E2BIG, true, vec![value]);
             return;
         }
