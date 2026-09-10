@@ -844,6 +844,28 @@ fn open_metadata_close_workflow() {
             h.fsetxattr(me, &f, &name, b"zz".to_vec(), libc::XATTR_CREATE);
         assert!(matches!(res, Err(Error::Errno(Errno::EEXIST))));
 
+        // Oversized is E2BIG on this path too - the sync twin's contract
+        // (`sync_fs::xattr::fsetxattr`, `test/coverage.rs
+        // oversize_short_circuits_to_e2big`).
+        //
+        // This is a contract test, not a control: measured on this
+        // filesystem the kernel answers E2BIG here anyway, so removing
+        // the crate's bound does not change the result. What the bound
+        // catches is the `as u32` truncation, which needs a value of
+        // 1 << 32 to reach and is not testable at that size.
+        use truenas_ros::sync_fs::xattr::XATTR_SIZE_MAX;
+        let big = vec![0u8; XATTR_SIZE_MAX + 1];
+        let (res, back) = h.fsetxattr(me, &f, &name, big, 0);
+        assert!(
+            matches!(res, Err(Error::Errno(Errno::E2BIG))),
+            "an oversized value must be refused, got {res:?}"
+        );
+        assert_eq!(back.len(), XATTR_SIZE_MAX + 1, "the buffer comes back");
+        // ...and the refusal left the stored value alone.
+        let (n, val) = h.fgetxattr(me, &f, &name, vec![0u8; 64]);
+        assert_eq!(n.expect("fgetxattr"), 3);
+        assert_eq!(&val[..3], b"\x01\x02\x03");
+
         // Allocation control, by fd.
         h.fallocate(me, &f, 0, 4096, 4096).expect("fallocate");
         assert_eq!(std::fs::metadata(dir.join("doc.bin")).unwrap().len(), 8192);
