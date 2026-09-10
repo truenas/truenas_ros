@@ -372,7 +372,7 @@ mod acl {
     use std::os::fd::AsFd;
     use truenas_ros::sync_fs::acl::{
         Acl, Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag, Nfs4Flag, Nfs4Perm,
-        Nfs4Who, PosixAcl, PosixPerm, PosixTag, fgetacl,
+        Nfs4Who, PosixAce, PosixAcl, PosixPerm, PosixTag, fgetacl, fsetacl,
     };
     use truenas_ros::sync_fs::xattr::fgetxattr;
 
@@ -483,38 +483,100 @@ mod acl {
         assert!(acl.aces[2].ace_flags.contains(Nfs4Flag::INHERITED));
     }
 
+    /// A scratch file on `dir`, or `None` when the dataset is not there.
+    ///
+    /// These two tests used to open a `raw_bytes` file at the dataset
+    /// root that nothing in the tree ever created, behind an ungated
+    /// `Err(_) => return`. So both returned before their assertion in
+    /// every lane - including the QEMU one, where `qemu-4-test.sh` arms
+    /// `TRUENAS_ROS_REQUIRE_ZFS=1` naming these very checks and promising
+    /// that a skip "must turn CI red rather than pass green having tested
+    /// nothing". Create the fixture instead of hoping for it, and route
+    /// the absent-dataset exit through `require_zfs` so the promise is
+    /// true.
+    fn live_acl_file(dir: &str) -> Option<(std::path::PathBuf, std::fs::File)> {
+        let dir = std::path::Path::new(dir);
+        if !dir.is_dir() {
+            require_zfs(&format!("{} is absent", dir.display()));
+            return None;
+        }
+        let path = dir.join(format!("rostest_acl_{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        match std::fs::write(&path, b"acl round trip") {
+            Ok(()) => {}
+            Err(e) => {
+                require_zfs(&format!("{} is not writable: {e}", dir.display()));
+                return None;
+            }
+        }
+        let f = std::fs::File::open(&path).expect("reopen the scratch file");
+        Some((path, f))
+    }
+
     #[test]
     fn fgetacl_live_nfs4_roundtrips() {
-        let f = match std::fs::File::open("/NFSV4ACL/raw_bytes") {
-            Ok(f) => f,
-            Err(_) => return, // fixture absent; skip
+        let Some((path, f)) = live_acl_file("/NFSV4ACL") else {
+            return;
         };
-        match fgetacl(f.as_fd()) {
+        let got = fgetacl(f.as_fd());
+        let _ = std::fs::remove_file(&path);
+        match got {
             Ok(Acl::Nfs4(acl)) => {
                 let raw = fgetxattr(f.as_fd(), "system.nfs4_acl_xdr").unwrap();
                 assert_eq!(acl.to_xattr().unwrap(), raw);
             }
-            // The fixture path exists but is not on an NFSv4-ACL dataset.
+            // The path exists but is not on an NFSv4-ACL dataset.
             Ok(Acl::Posix(_)) => require_zfs("/NFSV4ACL is not NFSv4-ACL"),
-            Err(_) => {} // filesystem may not support NFS4 ACLs here
+            // Not an NFS4-ACL filesystem at all. Swallowed only where the
+            // fixture is not required; under REQUIRE_ZFS it is a failure
+            // like any other, since the dataset was provisioned to serve
+            // exactly this.
+            Err(e) => require_zfs(&format!("/NFSV4ACL fgetacl failed: {e}")),
         }
     }
 
     #[test]
     fn fgetacl_live_posix_roundtrips() {
-        let f = match std::fs::File::open("/POSIXACL/raw_bytes") {
-            Ok(f) => f,
-            Err(_) => return,
+        let Some((path, f)) = live_acl_file("/POSIXACL") else {
+            return;
         };
-        match fgetacl(f.as_fd()) {
+        let got = fgetacl(f.as_fd());
+        let _ = std::fs::remove_file(&path);
+        match got {
             Ok(Acl::Posix(acl)) => {
+                // A file with only mode bits has no stored
+                // `system.posix_acl_access`: the trivial ACL is
+                // synthesised, and reading the xattr answers `ENODATA`.
+                // Give it a real one - a named user, which also forces
+                // the MASK entry - so the round trip compares the codec
+                // against bytes the kernel actually stored.
+                let mut access = acl.access.clone();
+                access.push(PosixAce {
+                    tag: PosixTag::User,
+                    perms: PosixPerm::READ | PosixPerm::WRITE,
+                    id: 4_200,
+                    default: false,
+                });
+                access.push(PosixAce {
+                    tag: PosixTag::Mask,
+                    perms: PosixPerm::READ | PosixPerm::WRITE,
+                    id: -1,
+                    default: false,
+                });
+                let want = PosixAcl::from_aces(access);
+                fsetacl(f.as_fd(), Some(&Acl::Posix(want)))
+                    .expect("set a real ACL");
+
+                let Ok(Acl::Posix(stored)) = fgetacl(f.as_fd()) else {
+                    panic!("the ACL just written did not read back as POSIX")
+                };
                 let raw =
                     fgetxattr(f.as_fd(), "system.posix_acl_access").unwrap();
-                assert_eq!(acl.access_bytes().unwrap(), raw);
+                assert_eq!(stored.access_bytes().unwrap(), raw);
             }
-            // The fixture path exists but is not on a POSIX-ACL dataset.
+            // The path exists but is not on a POSIX-ACL dataset.
             Ok(Acl::Nfs4(_)) => require_zfs("/POSIXACL is not POSIX-ACL"),
-            Err(_) => {}
+            Err(e) => require_zfs(&format!("/POSIXACL fgetacl failed: {e}")),
         }
     }
 }

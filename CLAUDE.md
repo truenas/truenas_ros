@@ -809,8 +809,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
 # exactly what `ci.yml` arms on an unprivileged runner, so a local pass
 # and a CI pass mean the same thing. The other twelve need root, ZFS,
 # audit or a real kernel, and `qemu-4-test.sh` arms them where they can
-# be satisfied - arming them here would turn every dev run red for the
-# environment rather than for the code.
+# be satisfied.
+#
+# `REQUIRE_IO_URING` is the one that can redden for the environment, and
+# knowingly: the client suite classes ring-setup `ENOMEM` as
+# environmental and skips on it (`truenas_api_client/tests/mock.rs`),
+# and arming the variable turns that skip into a failure. That is the
+# trade - the alternative is a green run that tested no io_uring at all
+# - so read an isolated `ENOMEM` failure as the box, not the code, and
+# re-run before believing it. Under fleet load it has been seen to fail
+# tens of tests in one run and none in the next.
 export TRUENAS_ROS_REQUIRE_IO_URING=1 TRUENAS_ROS_REQUIRE_PYTHON=1 \
        TRUENAS_ROS_REQUIRE_BTIME=1
 cargo test --all-features --no-fail-fast
@@ -858,8 +866,11 @@ done
 # `api-client` job is the authority). It depends on `truenas_jsonrpc` via a
 # git dependency on the sibling `truenas_ros_utils` repo (the ktls dev-dep's
 # shape), so cargo fetches it and no sibling checkout is needed.
-# `qemu-4-test.sh` runs it too, and is the only lane where its brokered
-# identity paths execute at all.
+# `qemu-4-test.sh` runs it too. That lane has the root the broker needs,
+# so it is the only one where the crate's brokered identity paths *could*
+# execute - but no test in the satellite reaches one today
+# (`grep -rn 'CredBroker\|AsUser' truenas_api_client/tests/` is empty), so
+# running it there buys the privileged half of nothing until one does.
 (cd truenas_api_client \
   && cargo clippy --all-targets -- -D warnings \
   && cargo clippy --release --all-targets -- -D warnings \

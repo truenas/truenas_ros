@@ -136,6 +136,9 @@ pub(crate) enum Act {
     /// The peer violated the protocol; close immediately and fail
     /// everything outstanding.
     Fault(&'static str),
+    /// The server reported an error against no call of ours - a
+    /// `id: null` Response. Diagnostic: the session stays up.
+    ServerError(ApiError),
 }
 
 /// A decoded `collection_update` event.
@@ -223,8 +226,13 @@ pub(crate) struct Session {
     /// Refuse outbound messages beyond this (middlewared kills the
     /// connection on oversize instead of failing the call).
     max_outbound: usize,
-    /// Bound on `backlog` (`ApiConfig::max_queued_calls`).
+    /// Bound on `backlog`'s length (`ApiConfig::max_queued_calls`).
     max_queued: usize,
+    /// Bound on `backlog`'s bytes (`ApiConfig::max_queued_bytes`).
+    max_queued_bytes: usize,
+    /// Bytes currently held in `backlog`, kept rather than summed: a
+    /// submission is on the hot path and the queue can be hundreds deep.
+    queued_bytes: usize,
     /// Whether session setup skips `core.set_options` (legacy job ids).
     legacy_jobs: bool,
     /// The peer-close report, captured when the close frame arrives so
@@ -239,6 +247,7 @@ impl Session {
         max_outbound: usize,
         max_inbound: usize,
         max_queued: usize,
+        max_queued_bytes: usize,
     ) -> Session {
         Session {
             phase: Phase::AwaitingHead,
@@ -252,6 +261,8 @@ impl Session {
             max_inbound,
             max_outbound,
             max_queued,
+            max_queued_bytes,
+            queued_bytes: 0,
             legacy_jobs,
             close_reason: None,
         }
@@ -334,10 +345,24 @@ impl Session {
         // in the vocabulary `queue_bulk` already uses for the same
         // question. The refusal is before `pending.insert`, so a refused
         // call leaves no tombstone to be answered.
-        if !sending && self.backlog.len() >= self.max_queued {
-            return Err(ApiError::QueueFull {
-                cap: self.max_queued,
-            });
+        if !sending {
+            // Two caps, and the first one tripped refuses. The count is a
+            // pipelining depth; the bytes are what actually bound memory,
+            // because a frame's ceiling is per method and the upload
+            // methods are 32x the ordinary one - so a count alone leaves
+            // the worst case at the wrong number by that factor.
+            if self.backlog.len() >= self.max_queued {
+                return Err(ApiError::QueueFull {
+                    cap: self.max_queued,
+                });
+            }
+            if self.queued_bytes.saturating_add(frame.len())
+                > self.max_queued_bytes
+            {
+                return Err(ApiError::QueueFull {
+                    cap: self.max_queued_bytes,
+                });
+            }
         }
         self.pending.insert(
             id.clone(),
@@ -357,6 +382,7 @@ impl Session {
                 ws::mask_key(),
             ))])
         } else {
+            self.queued_bytes += frame.len();
             self.backlog.push_back((id, frame));
             Ok(Vec::new())
         }
@@ -405,6 +431,17 @@ impl Session {
                     return vec![Act::Fault(
                         "new data frame inside a fragmented message",
                     )];
+                }
+                // The cap covers an unfragmented message too, not only a
+                // reassembled one. The transport bounds this today -
+                // `ApiConfig::max_message_bytes` feeds both
+                // `max_reply_bytes` and `max_inbound`, so the reactor
+                // closes first - but the session is sans-io and states
+                // its own bound; a driver that framed these bytes some
+                // other way would otherwise hand `on_message` whatever
+                // the peer declared.
+                if payload.len() > self.max_inbound {
+                    return vec![Act::Fault("message exceeds the inbound cap")];
                 }
                 self.on_message(&payload)
             }
@@ -567,6 +604,23 @@ impl Session {
                 return vec![Act::Fault("unparseable response")];
             }
         };
+        // JSON-RPC 2.0 §5: a Response carries `id: null` when the server
+        // could not recover an id from what it was answering - a parse
+        // error, or its own message failing to serialise. middlewared
+        // sends exactly that and keeps serving
+        // (`app.send_error(None, ...)` then `continue`,
+        // `api/base/server/ws_handler/rpc.py`), so it names no call of
+        // ours and tearing the session down over it would fail every
+        // healthy call in flight for a message the server already moved
+        // past. Surface it and carry on.
+        if matches!(reply.id(), Id::Null) {
+            return vec![Act::ServerError(match reply.outcome() {
+                Outcome::Failure(e) => from_rpc_error(e),
+                Outcome::Result(_) => ApiError::Protocol(
+                    "a result Response with a null id names no call",
+                ),
+            })];
+        }
         let Some(p) = self.pending.remove(reply.id()) else {
             return vec![Act::Fault("response to no outstanding call")];
         };
@@ -671,6 +725,7 @@ impl Session {
             let Some((id, frame)) = self.backlog.pop_front() else {
                 break;
             };
+            self.queued_bytes = self.queued_bytes.saturating_sub(frame.len());
             // A queued call that timed out before it ever reached the
             // wire: drop it here, and free its tombstone - no answer can
             // exist for a call that was never sent.
@@ -775,6 +830,7 @@ impl Session {
             }
         }
         self.backlog.clear();
+        self.queued_bytes = 0;
         acts
     }
 }
@@ -813,7 +869,14 @@ mod tests {
     use truenas_ros::ws::FrameHead;
 
     fn session() -> Session {
-        let mut s = Session::new("test-key".into(), false, 65_536, 1024, 256);
+        let mut s = Session::new(
+            "test-key".into(),
+            false,
+            65_536,
+            1024,
+            256,
+            16 * 1024 * 1024,
+        );
         // on_frame does not gate on phase, but a realistic session is Open.
         s.phase = Phase::Open;
         s
@@ -944,7 +1007,8 @@ mod tests {
     /// single frame; this bounds the whole message).
     #[test]
     fn an_oversized_reassembly_faults() {
-        let mut s = Session::new("k".into(), false, 65_536, 8, 256);
+        let mut s =
+            Session::new("k".into(), false, 65_536, 8, 256, 16 * 1024 * 1024);
         s.phase = Phase::Open;
         assert!(
             s.on_frame(head(false, OP_TEXT, 6), vec![b'x'; 6])
@@ -1007,7 +1071,14 @@ mod tests {
     #[test]
     fn the_extended_cap_applies_to_the_upload_methods_only() {
         use serde_json::value::RawValue;
-        let mut s = Session::new("k".into(), false, 65_536, 1024, 256);
+        let mut s = Session::new(
+            "k".into(),
+            false,
+            65_536,
+            1024,
+            256,
+            16 * 1024 * 1024,
+        );
         s.phase = Phase::Open;
         // A params array comfortably over the ordinary 64 KiB cap and
         // under the extended 2 MiB one.
@@ -1050,6 +1121,97 @@ mod tests {
         }
     }
 
+    /// The backlog has two caps and refuses on whichever trips first.
+    /// The count is a pipelining depth; the bytes are what bound memory,
+    /// because a frame's ceiling is per method and the upload methods
+    /// carry 32x the ordinary one - so a count alone leaves the worst
+    /// case at the wrong number by that factor.
+    #[test]
+    fn a_full_backlog_is_refused_by_bytes_as_well_as_by_count() {
+        use serde_json::value::RawValue;
+        // Room for many frames, but only a little memory.
+        let mut s =
+            Session::new("k".into(), false, 2_097_152, 1024, 1024, 200_000);
+        s.phase = Phase::Open;
+        let big = format!("[\"{}\"]", "x".repeat(60_000));
+        let args = RawValue::from_string(big).unwrap();
+        let mut n = 0;
+        let mut put = |s: &mut Session| {
+            n += 1;
+            s.submit(crate::CallId(n), Kind::User, "core.ping", &args, None)
+        };
+        // Spend the budget on the wire, then fill the queue by bytes.
+        for _ in 0..CALL_BUDGET {
+            put(&mut s).expect("under budget");
+        }
+        let mut queued = 0;
+        loop {
+            match put(&mut s) {
+                Ok(_) => queued += 1,
+                Err(ApiError::QueueFull { cap }) => {
+                    assert_eq!(cap, 200_000, "the byte cap is what refused");
+                    break;
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+            assert!(queued < 50, "the byte cap must bite long before 1024");
+        }
+        assert!(
+            s.queued_bytes <= 200_000,
+            "the queue stays inside its byte bound: {}",
+            s.queued_bytes
+        );
+        // Draining gives the bytes back.
+        s.budget = CALL_BUDGET;
+        let _ = s.drain_backlog();
+        assert_eq!(s.queued_bytes, 0, "a drained queue charges nothing");
+    }
+
+    /// JSON-RPC 2.0 §5 reserves `id: null` for an error the server could
+    /// not attribute to a request - a parse failure, or its own message
+    /// failing to serialise. middlewared answers exactly that and keeps
+    /// the connection serving, so treating it as "a response to no
+    /// outstanding call" would fail every healthy call in flight over a
+    /// message the server has already moved past.
+    #[test]
+    fn a_null_id_error_reports_without_killing_the_session() {
+        let mut s = session();
+        let body = r#"{"jsonrpc":"2.0","error":{"code":-32700,
+                       "message":"Parse error"},"id":null}"#;
+        let acts = s.on_frame(
+            head(true, OP_TEXT, body.len()),
+            body.as_bytes().to_vec(),
+        );
+        match acts.as_slice() {
+            [Act::ServerError(e)] => {
+                assert!(
+                    format!("{e}").contains("Parse error"),
+                    "the server's report reaches the caller: {e}"
+                );
+            }
+            other => panic!("expected a report, not a teardown: {other:?}"),
+        }
+        assert!(!matches!(s.phase, Phase::Closing), "the session stays open");
+    }
+
+    /// The inbound cap covers an unfragmented message, not only a
+    /// reassembled one.
+    #[test]
+    fn the_inbound_cap_covers_an_unfragmented_message() {
+        let mut s =
+            Session::new("k".into(), false, 65_536, 64, 256, 16 * 1024 * 1024);
+        s.phase = Phase::Open;
+        match s
+            .on_frame(head(true, OP_TEXT, 256), vec![b'a'; 256])
+            .as_slice()
+        {
+            [Act::Fault(why)] => {
+                assert_eq!(*why, "message exceeds the inbound cap")
+            }
+            other => panic!("an over-cap message must fault: {other:?}"),
+        }
+    }
+
     /// A first fragment is held until a continuation arrives, so it is
     /// bounded where it is stored, not only where the pieces are joined -
     /// otherwise a peer opens a fragmented message, sends nothing more,
@@ -1057,7 +1219,8 @@ mod tests {
     /// releases it: no continuation can arrive after that.
     #[test]
     fn an_open_reassembly_is_bounded_and_released_at_close() {
-        let mut s = Session::new("k".into(), false, 65_536, 64, 256);
+        let mut s =
+            Session::new("k".into(), false, 65_536, 64, 256, 16 * 1024 * 1024);
         s.phase = Phase::Open;
         // Over the cap in the very first fragment.
         match s
@@ -1074,7 +1237,8 @@ mod tests {
         assert!(s.frag.is_none(), "a refused fragment is not stored");
 
         // Under the cap: held, then released when the peer closes.
-        let mut s = Session::new("k".into(), false, 65_536, 64, 256);
+        let mut s =
+            Session::new("k".into(), false, 65_536, 64, 256, 16 * 1024 * 1024);
         s.phase = Phase::Open;
         assert!(
             s.on_frame(head(false, OP_TEXT, 32), vec![b'a'; 32])
@@ -1094,7 +1258,8 @@ mod tests {
     fn a_full_backlog_refuses_rather_than_growing() {
         use serde_json::value::RawValue;
         const QUEUED: usize = 4;
-        let mut s = Session::new("k".into(), false, 65_536, 1024, QUEUED);
+        let mut s =
+            Session::new("k".into(), false, 65_536, 1024, QUEUED, usize::MAX);
         s.phase = Phase::Open;
         let args = RawValue::from_string("[]".to_owned()).unwrap();
         let put = |s: &mut Session, i: usize| {

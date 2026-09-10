@@ -66,6 +66,16 @@ impl Conn {
                 HeadVerdict::Invalid(_) => return None,
             }
         };
+        // The declared length is the peer's, so it is checked against
+        // the session's bound before it sizes an allocation. That bound
+        // is what `JsonRpcServer::max_message_bytes` exists to hand a
+        // driver: the payload is read before `on_frame` ever sees it, so
+        // a driver that trusts `payload_len` aborts on a header alone -
+        // 64 bits of declared length and nothing between it and
+        // `vec![0u8; n]`.
+        if h.payload_len > self.server.max_message_bytes() {
+            return None;
+        }
         let mut payload = vec![0u8; h.payload_len];
         self.stream.read_exact(&mut payload).ok()?;
         ws::unmask(&hdr, &mut payload);

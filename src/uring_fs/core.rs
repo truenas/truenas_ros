@@ -1753,6 +1753,22 @@ impl FsCore {
             self.refuse(eng, waiter, Errno::EINVAL, true, vec![value]);
             return;
         };
+        // The value's length reaches the SQE as a `u32` (`val_len` below),
+        // so an oversized one does not fail - it *truncates*: at 1 << 32 it
+        // becomes a length of zero, the kernel stores an empty attribute,
+        // the op completes `res = 0`, and `map_res` hands the waiter
+        // `Ok(())` for a write that did not happen. That is the same
+        // reported-but-not-done failure the opcode screen above refuses,
+        // arriving by the length instead of the opcode.
+        //
+        // The bound is the sync twin's, so one operation has one contract
+        // across both implementations: `sync_fs::xattr::fsetxattr` refuses
+        // above `XATTR_SIZE_MAX` before any syscall, and the uring get path
+        // already uses the same constant (`query_dir.rs`).
+        if value.len() > crate::sync_fs::xattr::XATTR_SIZE_MAX {
+            self.refuse(eng, waiter, Errno::E2BIG, true, vec![value]);
+            return;
+        }
         let Some(op_slot) = self.pop_op() else {
             self.refuse(eng, waiter, Errno::EBUSY, true, vec![value]);
             return;

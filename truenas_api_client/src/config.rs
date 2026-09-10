@@ -100,13 +100,39 @@ pub struct ApiConfig {
     /// is refused with [`ApiError::QueueFull`](crate::ApiError::QueueFull)
     /// rather than accepted into a queue with no bound.
     ///
-    /// The queue holds encoded frames, so the memory it can reach is this
-    /// times [`SessionOpts::max_outbound_bytes`] - 16 MiB per session at
-    /// the defaults. It is the depth a caller may pipeline *beyond* what
-    /// middlewared will run at once, so a few hundred is already far more
-    /// outstanding work than the server's own semaphore admits; the point
-    /// of the number is that there is one.
+    /// This is the pipelining *depth* a caller may run beyond what
+    /// middlewared will take at once, so a few hundred is already far
+    /// more outstanding work than the server's own semaphore admits.
+    ///
+    /// It does not bound memory on its own, which is why
+    /// [`ApiConfig::max_queued_bytes`] exists beside it: the queue holds
+    /// encoded frames, and a frame's ceiling is per *method* - the two
+    /// upload methods get [`MIDDLEWARE_MSG_CAP_EXTENDED`] - so a count
+    /// alone leaves the worst case at this times 2 MiB.
     pub max_queued_calls: usize,
+    /// Cap on the bytes one session holds queued behind its concurrency
+    /// budget. A submission that would push the backlog past this is
+    /// refused with [`ApiError::QueueFull`](crate::ApiError::QueueFull),
+    /// whichever of the two caps it trips first.
+    ///
+    /// This is the one that bounds memory, and it is stated in the units
+    /// it bounds. The queue holds whole encoded frames, so without it the
+    /// reachable worst case is [`ApiConfig::max_queued_calls`] frames at
+    /// the largest per-method ceiling rather than at the ordinary one.
+    pub max_queued_bytes: usize,
+    /// Cap on the events a *blocking* helper ([`ApiClient::call`](crate::ApiClient::call),
+    /// [`ApiClient::connect`](crate::ApiClient::connect)) may set aside while it waits for the one
+    /// it wants. Past it the wait fails with
+    /// [`ApiError::QueueFull`](crate::ApiError::QueueFull) rather than
+    /// buffering without limit.
+    ///
+    /// This is the only queue the *peer* fills: a subscribed session
+    /// receiving `collection_update` events fills it at whatever rate
+    /// middlewared emits them, for as long as the call takes. The
+    /// non-blocking [`ApiClient::pump`](crate::ApiClient::pump) never buffers - it hands each
+    /// event straight back - so a consumer that wants no bound here uses
+    /// the model rather than the convenience.
+    pub max_waiting_events: usize,
 }
 
 impl Default for ApiConfig {
@@ -121,6 +147,8 @@ impl Default for ApiConfig {
             bulk_tick: Duration::from_secs(10),
             max_queued_bulk_items: 10_000,
             max_queued_calls: 256,
+            max_queued_bytes: 16 * 1024 * 1024,
+            max_waiting_events: 4096,
         }
     }
 }

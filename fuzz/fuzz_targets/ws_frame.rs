@@ -91,18 +91,52 @@ fuzz_target!(|data: &[u8]| {
         check_verdict(server_frame_head(d), d, true);
     }
 
-    // Both framers, drip-fed through the handshake phase into frames.
+    // Both framers, drip-fed through the handshake phase and then *past*
+    // it into frames.
+    //
+    // The break has to consume, not stop. A framer answers `More` only
+    // while the handshake head is still arriving; the verdict that ends
+    // that phase is a `Complete` naming the head's extent, and stopping
+    // there is stopping exactly at the point the frame phase begins - so
+    // the loop that was meant to reach `frame_step` never did. Consume
+    // each `Complete` and carry on from the remainder, which is what a
+    // driver does.
     for framer in [
         ws::ws_frame as fn(&[u8], &mut WsState) -> Framing,
         ws::ws_server_frame as fn(&[u8], &mut WsState) -> Framing,
     ] {
         let mut st = WsState::default();
-        for end in 0..=data.len() {
-            let v = framer(&data[..end], &mut st);
-            check_framing(v);
-            if !matches!(v, Framing::More | Framing::MoreInMessage) {
+        let mut buf: &[u8] = data;
+        loop {
+            // Drip-feed the current message: every prefix, so a resumable
+            // ask is exercised at each byte boundary.
+            let mut verdict = None;
+            for end in 0..=buf.len() {
+                let v = framer(&buf[..end], &mut st);
+                check_framing(v);
+                if !matches!(v, Framing::More | Framing::MoreInMessage) {
+                    verdict = Some((v, end));
+                    break;
+                }
+            }
+            // Ran out of bytes without a verdict, or the framer refused.
+            let Some((
+                Framing::Complete {
+                    header_len,
+                    body_len,
+                },
+                _,
+            )) = verdict
+            else {
+                break;
+            };
+            let Some(total) = header_len.checked_add(body_len) else {
+                break;
+            };
+            if total == 0 || total > buf.len() {
                 break;
             }
+            buf = &buf[total..];
         }
     }
 
