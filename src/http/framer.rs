@@ -365,7 +365,7 @@ pub struct HttpConn<U> {
     /// reading - to protect. Refusing to guess forces the decision to the
     /// call site that knows the protocol above (an S3 front bounds a part
     /// at 5 GiB).
-    pub(crate) stream_cap: Option<u64>,
+    pub(crate) stream_cap: Option<std::num::NonZeroU64>,
     /// The consumer's per-connection state, as returned by their accept
     /// handler.
     pub state: U,
@@ -402,7 +402,20 @@ impl<U> HttpConn<U> {
     /// these; see [`HttpConn::new`] for why the constructor is public, and
     /// for why a kTLS handshake worker must call **this** one, with the cap
     /// the protocol was built with, rather than [`HttpConn::new`].
-    pub fn new_streaming(state: U, max_body_bytes: u64) -> Self {
+    ///
+    /// `NonZeroU64` rather than a checked `u64`, because the check has one
+    /// place it can be forgotten and this removes it. The cap IS the body
+    /// limit on a connection that streams, so a zero answers 413 to every
+    /// body-bearing request while a bodyless GET is served normally - an
+    /// endpoint that reads healthy and admits no payload. The builder
+    /// refuses a zero of its own, but it cannot screen this constructor:
+    /// the adoption site fills `stream_cap` only when it is `None`, so a
+    /// connection minted here with its own cap keeps it, and that is
+    /// exactly the route this method exists for.
+    pub fn new_streaming(
+        state: U,
+        max_body_bytes: std::num::NonZeroU64,
+    ) -> Self {
         Self {
             phase: Phase::Head,
             stream_cap: Some(max_body_bytes),
@@ -581,7 +594,7 @@ pub(crate) fn frame<U>(
                             // regardless of size.
                             if conn
                                 .stream_cap
-                                .is_some_and(|cap| body_len as u64 > cap)
+                                .is_some_and(|cap| body_len as u64 > cap.get())
                             {
                                 return fail(
                                     &mut conn.phase,
@@ -777,7 +790,7 @@ fn stream_step<U>(buf: &[u8], conn: &mut HttpConn<U>) -> Framing {
             // declared, not after buffering one - a streamed body is never
             // buffered whole, so there is no "after" to check at.
             let total = (decoded as u64).saturating_add(payload as u64);
-            let over = conn.stream_cap.is_some_and(|cap| total > cap);
+            let over = conn.stream_cap.is_some_and(|cap| total > cap.get());
             if over {
                 return fail(&mut conn.phase, buf.len(), 413, head_only);
             }
@@ -880,6 +893,13 @@ fn scan_step<U>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The streaming cap as `new_streaming` takes it. Every literal here is
+    /// non-zero by inspection; a zero is the configuration the builders
+    /// refuse and the type no longer represents.
+    fn nz(n: u64) -> std::num::NonZeroU64 {
+        std::num::NonZeroU64::new(n).expect("a non-zero literal cap")
+    }
 
     fn conn() -> HttpConn<()> {
         HttpConn::new(())
@@ -1023,7 +1043,7 @@ mod tests {
         };
         let head = b"PUT /u HTTP/1.1\r\nHost: h\r\n\
                      Transfer-Encoding: chunked\r\n\r\n";
-        let mut c = HttpConn::new_streaming((), 1 << 30);
+        let mut c = HttpConn::new_streaming((), nz(1 << 30));
         assert!(matches!(
             frame(head, &mut c, &cfg),
             Framing::Complete { .. }
@@ -1417,7 +1437,7 @@ mod tests {
         let over = 100 * 1024;
         assert!(over < STREAM_WINDOW, "the point is a sub-window body");
 
-        let mut c = HttpConn::new_streaming((), 1024);
+        let mut c = HttpConn::new_streaming((), nz(1024));
         let head = format!(
             "PUT /k HTTP/1.1\r\nHost: h\r\nContent-Length: {over}\r\n\r\n"
         );
@@ -1435,7 +1455,7 @@ mod tests {
         );
 
         // And the legitimate case still frames: at the cap, not over it.
-        let mut c = HttpConn::new_streaming((), 1024);
+        let mut c = HttpConn::new_streaming((), nz(1024));
         let head =
             b"PUT /k HTTP/1.1\r\nHost: h\r\nContent-Length: 1024\r\n\r\n";
         let _ = frame(head, &mut c, &cfg);
@@ -1610,7 +1630,7 @@ mod tests {
     /// chunk, which is what keeps the reactor's buffer off the body's size.
     #[test]
     fn a_known_length_body_streams_above_one_window() {
-        let mut c = HttpConn::new_streaming((), 1 << 30);
+        let mut c = HttpConn::new_streaming((), nz(1 << 30));
         let len = STREAM_WINDOW * 2 + 5;
         let head = format!(
             "PUT /o HTTP/1.1\r\nHost: t\r\nContent-Length: {len}\r\n\r\n"
@@ -1693,7 +1713,7 @@ mod tests {
     /// read already, so nothing streams; one byte past it does.
     #[test]
     fn the_known_stream_threshold_is_one_window() {
-        let mut c = HttpConn::new_streaming((), 1 << 30);
+        let mut c = HttpConn::new_streaming((), nz(1 << 30));
         let head = format!(
             "PUT /o HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n",
             STREAM_WINDOW
@@ -1725,7 +1745,7 @@ mod tests {
     /// `max_body` no longer bounds what streams.
     #[test]
     fn a_known_stream_is_bounded_by_the_stream_cap() {
-        let mut c = HttpConn::new_streaming((), 1 << 20);
+        let mut c = HttpConn::new_streaming((), nz(1 << 20));
         let head = format!(
             "PUT /o HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n",
             (1 << 20) + 1
@@ -1734,7 +1754,7 @@ mod tests {
         assert!(matches!(c.phase, Phase::Fail { status: 413, .. }));
 
         // Between max_body and the cap: streams rather than 413s.
-        let mut c = HttpConn::new_streaming((), 1 << 30);
+        let mut c = HttpConn::new_streaming((), nz(1 << 30));
         let over_max_body = cfg().max_body + 1;
         let head = format!(
             "PUT /o HTTP/1.1\r\nHost: t\r\nContent-Length: \
@@ -1752,7 +1772,7 @@ mod tests {
     /// never the buffered dance.
     #[test]
     fn an_expecting_known_stream_opens_instead_of_dancing() {
-        let mut c = HttpConn::new_streaming((), 1 << 30);
+        let mut c = HttpConn::new_streaming((), nz(1 << 30));
         let head = format!(
             "PUT /o HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\n\
              Content-Length: {}\r\n\r\n",
@@ -1777,7 +1797,7 @@ mod tests {
 
     #[test]
     fn a_streamed_body_is_declared_one_chunk_at_a_time() {
-        let mut c = HttpConn::new_streaming((), 1 << 20);
+        let mut c = HttpConn::new_streaming((), nz(1 << 20));
         let head = b"PUT /o HTTP/1.1\r\nHost: t\r\n\
                      Transfer-Encoding: chunked\r\n\r\n";
         // The head, alone.
@@ -1849,7 +1869,7 @@ mod tests {
     #[test]
     fn a_streamed_chunk_is_declared_the_same_way_on_every_re_entry() {
         let body = b"20000\r\n";
-        let mut c = HttpConn::new_streaming((), 1 << 20);
+        let mut c = HttpConn::new_streaming((), nz(1 << 20));
         c.phase = Phase::StreamBody {
             head: b"PUT / HTTP/1.1\r\nHost: t\r\n\r\n".to_vec(),
             chunk_left: 0,
@@ -1888,7 +1908,7 @@ mod tests {
     /// at. The bound is the builder's, not `max_body`.
     #[test]
     fn a_streamed_body_is_capped_as_it_is_declared() {
-        let mut c = HttpConn::new_streaming((), 6);
+        let mut c = HttpConn::new_streaming((), nz(6));
         c.phase = Phase::StreamBody {
             head: b"PUT / HTTP/1.1\r\nHost: t\r\n\r\n".to_vec(),
             chunk_left: 0,
