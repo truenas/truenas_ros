@@ -94,23 +94,28 @@ fuzz_target!(|data: &[u8]| {
     );
 
     // Inheritance needs a default ACL to draw from; erroring is a normal
-    // answer. What it returns must satisfy the same contract.
+    // answer. What it returns must satisfy the same contract - at every
+    // create mode, since the mode is intersected into the result
+    // (`posix_acl_create_masq`) and a narrowed entry still has to encode.
     for is_dir in [false, true] {
-        let Ok(child) = acl.generate_inherited_acl(is_dir) else {
-            continue;
-        };
-        let cenc = child
-            .access_bytes()
-            .expect("an inherited ACL must be re-encodable");
-        let cdef = child
-            .default_bytes()
-            .expect("an inherited ACL must be re-encodable");
-        let redecoded = PosixAcl::from_xattr(&cenc, cdef.as_deref())
-            .expect("inherited ACL must re-decode");
-        assert_eq!(
-            (&redecoded.access, &redecoded.default),
-            (&child.access, &child.default),
-            "inherited ACL does not round-trip"
-        );
+        for mode in [0o000u32, 0o600, 0o700, 0o644, 0o755, 0o777] {
+            let Ok((child, _mode)) = acl.generate_inherited_acl(is_dir, mode)
+            else {
+                continue;
+            };
+            let cenc = child
+                .access_bytes()
+                .expect("an inherited ACL must be re-encodable");
+            let cdef = child
+                .default_bytes()
+                .expect("an inherited ACL must be re-encodable");
+            let redecoded = PosixAcl::from_xattr(&cenc, cdef.as_deref())
+                .expect("inherited ACL must re-decode");
+            assert_eq!(
+                (&redecoded.access, &redecoded.default),
+                (&child.access, &child.default),
+                "inherited ACL does not round-trip"
+            );
+        }
     }
 });

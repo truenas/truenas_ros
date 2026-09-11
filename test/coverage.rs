@@ -941,8 +941,20 @@ mod acl {
         assert_eq!(round.access.len(), 3);
         assert_eq!(round.default.as_ref().unwrap().len(), 3);
         // Inheriting keeps a default for a dir, drops it for a file.
-        assert!(acl.generate_inherited_acl(true).unwrap().default.is_some());
-        assert!(acl.generate_inherited_acl(false).unwrap().default.is_none());
+        assert!(
+            acl.generate_inherited_acl(true, 0o755)
+                .unwrap()
+                .0
+                .default
+                .is_some()
+        );
+        assert!(
+            acl.generate_inherited_acl(false, 0o755)
+                .unwrap()
+                .0
+                .default
+                .is_none()
+        );
     }
 
     #[test]

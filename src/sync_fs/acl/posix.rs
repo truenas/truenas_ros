@@ -53,6 +53,74 @@ tn_bitflags! {
     }
 }
 
+/// The kernel's `posix_acl_create_masq` (`fs/posix_acl.c`), transcribed.
+///
+/// It intersects a freshly-inherited access ACL with the create mode and
+/// narrows the mode by what survives, returning the narrowed mode. Both
+/// directions matter: the ACL is what the child ends up with, and the mode
+/// is what `getattr` reports.
+///
+/// ```text
+/// case ACL_USER_OBJ:
+///         pa->e_perm &= (mode >> 6) | ~S_IRWXO;
+///         mode &= (pa->e_perm << 6) | ~S_IRWXU;
+/// case ACL_USER: case ACL_GROUP:  not_equiv = 1;
+/// case ACL_GROUP_OBJ:             group_obj = pa;
+/// case ACL_OTHER:
+///         pa->e_perm &= mode | ~S_IRWXO;
+///         mode &= pa->e_perm | ~S_IRWXO;
+/// case ACL_MASK:                  mask_obj = pa; not_equiv = 1;
+/// ...
+/// if (mask_obj) {
+///         mask_obj->e_perm &= (mode >> 3) | ~S_IRWXO;
+///         mode &= (mask_obj->e_perm << 3) | ~S_IRWXG;
+/// } else {
+///         group_obj->e_perm &= (mode >> 3) | ~S_IRWXO;
+///         mode &= (group_obj->e_perm << 3) | ~S_IRWXG;
+/// }
+/// ```
+///
+/// `~S_IRWXO` is the identity on a three-bit permission field, so each
+/// `&= x | ~S_IRWXO` is `&= x & 7` here. The `MASK`/`GROUP_OBJ` step runs
+/// *after* the loop and reads the mode the loop already narrowed, which is
+/// why it cannot be folded into it.
+///
+/// `ACL_MASK` and `ACL_GROUP_OBJ` are an either/or in the C and so here: a
+/// `Mask` entry supersedes `GroupObj` for the group class. An ACL with
+/// neither is malformed - the C answers `-EIO` - and so is one this crate
+/// would refuse in [`validate`](PosixAcl::validate).
+fn create_masq(access: &mut [PosixAce], mode: u32) -> Result<u32> {
+    const RWX: u16 = 0o7;
+    let mut m = mode;
+    let mut group_obj: Option<usize> = None;
+    let mut mask_obj: Option<usize> = None;
+    for (i, a) in access.iter_mut().enumerate() {
+        match a.tag {
+            PosixTag::UserObj => {
+                a.perms &=
+                    PosixPerm::from_bits_truncate(((m >> 6) as u16) & RWX);
+                m &= ((a.perms.bits() as u32) << 6) | !0o700;
+            }
+            PosixTag::Other => {
+                a.perms &= PosixPerm::from_bits_truncate((m as u16) & RWX);
+                m &= u32::from(a.perms.bits()) | !0o007;
+            }
+            PosixTag::GroupObj => group_obj = Some(i),
+            PosixTag::Mask => mask_obj = Some(i),
+            // The C answers `-EIO` for any other tag; this enum has none,
+            // so there is no arm to write rather than one left off.
+            PosixTag::User | PosixTag::Group => {}
+        }
+    }
+    let group_class = mask_obj.or(group_obj).ok_or_else(|| {
+        Error::Validation("ACL has neither a MASK nor a GROUP_OBJ entry".into())
+    })?;
+    let a = &mut access[group_class];
+    a.perms &= PosixPerm::from_bits_truncate(((m >> 3) as u16) & RWX);
+    m &= (u32::from(a.perms.bits()) << 3) | !0o070;
+    Ok((mode & !0o777) | (m & 0o777))
+}
+
 /// A single POSIX1E ACL entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PosixAce {
@@ -218,8 +286,50 @@ impl PosixAcl {
     }
 
     /// Produce the ACL a new child object inherits from this directory's
-    /// default ACL. Errors if this ACL is trivial or has no default ACL.
-    pub fn generate_inherited_acl(&self, is_dir: bool) -> Result<Self> {
+    /// default ACL, and the mode it is created with.
+    ///
+    /// Errors if this ACL is trivial or has no default ACL.
+    ///
+    /// `mode` is the **requested** creation mode, unmasked. A raw mode word
+    /// rather than `sync_fs::Mode`, because this module compiles under the
+    /// `acl` feature alone and that type is `sync-fs`'s. The umask is
+    /// deliberately not applied: `posix_acl_create`
+    /// (`fs/posix_acl.c`) applies `current_umask()` only on the branch where
+    /// the parent has **no** default ACL, and takes this one instead when it
+    /// has - the intersection below does the narrowing in its place.
+    ///
+    /// # The mode is not a formality
+    ///
+    /// The default ACL is not copied down verbatim.
+    /// `posix_acl_create_masq` intersects it with the create mode, and the
+    /// intersection runs both ways: the entries are narrowed by the mode and
+    /// the mode is narrowed by what survives. Predicting without it says
+    /// group and other have access they do not have. Measured against the
+    /// kernel, parent default `rwx` on all four entries:
+    ///
+    /// ```text
+    /// verbatim copy (what this used to answer):
+    ///     USER_OBJ:7 GROUP_OBJ:7 MASK:7 OTHER:7
+    /// kernel, child dir created 0o700:
+    ///     USER_OBJ:7 GROUP_OBJ:7 MASK:0 OTHER:0
+    /// kernel, child file created 0o600:
+    ///     USER_OBJ:6 GROUP_OBJ:7 MASK:0 OTHER:0
+    /// ```
+    ///
+    /// # When the child gets no access ACL at all
+    ///
+    /// `posix_acl_create` releases the masq'd ACL when it comes out
+    /// *equivalent to the mode* - no `User`, `Group` or `Mask` entry - and
+    /// stores only the mode. The returned ACL is still the right answer
+    /// about effective permissions there, since that is what equivalence
+    /// means, but it is not what `getxattr` would find:
+    /// [`equivalent_to_mode`](PosixAcl::equivalent_to_mode) is the same
+    /// question this makes the kernel ask.
+    pub fn generate_inherited_acl(
+        &self,
+        is_dir: bool,
+        mode: u32,
+    ) -> Result<(Self, u32)> {
         if self.access.is_empty() && self.default.is_none() {
             return Err(Error::Validation(
                 "cannot generate inherited ACL from trivial ACL".into(),
@@ -230,13 +340,14 @@ impl PosixAcl {
                 "cannot generate inherited ACL: no default ACL".into(),
             )
         })?;
-        let access = default
+        let mut access: Vec<PosixAce> = default
             .iter()
             .map(|a| PosixAce {
                 default: false,
                 ..a.clone()
             })
             .collect();
+        let new_mode = create_masq(&mut access, mode)?;
         let new_default = is_dir.then(|| {
             default
                 .iter()
@@ -246,10 +357,26 @@ impl PosixAcl {
                 })
                 .collect()
         });
-        Ok(PosixAcl {
-            access,
-            default: new_default,
-            synthesized: false,
+        Ok((
+            PosixAcl {
+                access,
+                default: new_default,
+                synthesized: false,
+            },
+            new_mode,
+        ))
+    }
+
+    /// Whether this ACL's access entries say no more than the mode bits do -
+    /// no `User`, `Group` or `Mask` entry.
+    ///
+    /// The kernel's `not_equiv` (`posix_acl_create_masq`, `fs/posix_acl.c`),
+    /// and it decides whether a created child carries an access ACL at all:
+    /// `posix_acl_create` releases the ACL and keeps only the mode when this
+    /// is true.
+    pub fn equivalent_to_mode(&self) -> bool {
+        !self.access.iter().any(|a| {
+            matches!(a.tag, PosixTag::User | PosixTag::Group | PosixTag::Mask)
         })
     }
 
@@ -537,11 +664,137 @@ mod tests {
         assert!(synthesize_from_mode(0o600).trivial());
     }
 
+    /// The prediction is the kernel's, so the kernel is the oracle.
+    ///
+    /// A parent directory carrying a default ACL, a child created under it,
+    /// and the crate's answer compared against what `getxattr` finds - not
+    /// against a transcription of the arithmetic, which would pass on a
+    /// transcription that is wrong in both places.
+    ///
+    /// Copied verbatim, as this did before, a default of `rwx` on all four
+    /// entries predicts `MASK:rwx OTHER:rwx` for a child made `0o700`,
+    /// where the kernel gives `MASK:--- OTHER:---`: group and other told
+    /// they have full access when they have none.
+    ///
+    /// Skips where the filesystem has no POSIX ACLs; held to
+    /// `TRUENAS_ROS_REQUIRE_POSIX_ACL` where CI arms it, because a silent
+    /// skip here is a test that asserts nothing about the one thing it is
+    /// for.
+    #[test]
+    fn the_inherited_acl_matches_what_the_kernel_creates() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = crate::tempdir().expect("tempdir");
+        let parent = dir.path().join("p");
+        std::fs::create_dir(&parent).expect("parent");
+        let cpath = |p: &std::path::Path| {
+            std::ffi::CString::new(p.as_os_str().as_bytes()).expect("path")
+        };
+
+        // Parent default ACL: owner/group/mask/other all rwx, plus a named
+        // user so the result is not mode-equivalent and the kernel really
+        // stores an access ACL on the child.
+        let entries = [
+            (PosixTag::UserObj, -1i64),
+            (PosixTag::User, 1000),
+            (PosixTag::GroupObj, -1),
+            (PosixTag::Mask, -1),
+            (PosixTag::Other, -1),
+        ];
+        let default: Vec<PosixAce> = entries
+            .iter()
+            .map(|&(tag, id)| PosixAce {
+                tag,
+                perms: PosixPerm::all(),
+                id,
+                default: true,
+            })
+            .collect();
+        let blob = encode_aces(&default).expect("encode");
+        let cp = cpath(&parent);
+        // SAFETY: valid NUL-terminated path and a sized buffer.
+        let rc = unsafe {
+            libc::setxattr(
+                cp.as_ptr(),
+                c"system.posix_acl_default".as_ptr(),
+                blob.as_ptr().cast(),
+                blob.len(),
+                0,
+            )
+        };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_POSIX_ACL").is_none(),
+                "TRUENAS_ROS_REQUIRE_POSIX_ACL is set but the fixture \
+                 filesystem refuses a default ACL: {e}"
+            );
+            return;
+        }
+
+        let parent_acl = PosixAcl::from_xattr(&[], Some(&blob))
+            .expect("the default reads back");
+
+        for (name, mode, is_dir) in
+            [("cd", 0o700u32, true), ("cf", 0o600, false)]
+        {
+            let child = parent.join(name);
+            // The umask must not narrow this: `posix_acl_create` applies it
+            // only on the branch where the parent has NO default ACL.
+            let old = unsafe { libc::umask(0) };
+            if is_dir {
+                std::fs::create_dir(&child).expect("child dir");
+                std::fs::set_permissions(
+                    &child,
+                    std::os::unix::fs::PermissionsExt::from_mode(mode),
+                )
+                .expect("child mode");
+            } else {
+                let cc = cpath(&child);
+                // SAFETY: valid path; O_CREAT with an explicit mode.
+                let fd = unsafe {
+                    libc::open(
+                        cc.as_ptr(),
+                        libc::O_CREAT | libc::O_RDWR,
+                        mode as libc::c_uint,
+                    )
+                };
+                assert!(fd >= 0, "child file");
+                // SAFETY: a descriptor this call just opened.
+                unsafe { libc::close(fd) };
+            }
+            unsafe { libc::umask(old) };
+
+            let mut buf = [0u8; 512];
+            let cc = cpath(&child);
+            // SAFETY: valid path and a sized destination.
+            let n = unsafe {
+                libc::getxattr(
+                    cc.as_ptr(),
+                    c"system.posix_acl_access".as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                )
+            };
+            assert!(n > 0, "the kernel stored no access ACL on {name}");
+            let actual = PosixAcl::from_xattr(&buf[..n as usize], None)
+                .expect("the kernel's ACL decodes");
+
+            let (predicted, _mode) = parent_acl
+                .generate_inherited_acl(is_dir, mode)
+                .expect("a default ACL is present");
+            assert_eq!(
+                predicted.access, actual.access,
+                "{name}: predicted vs the kernel's own"
+            );
+        }
+    }
+
     #[test]
     fn generate_inherited_needs_a_default_acl() {
         assert!(
             synthesize_from_mode(0o755)
-                .generate_inherited_acl(true)
+                .generate_inherited_acl(true, 0o755)
                 .is_err()
         );
     }

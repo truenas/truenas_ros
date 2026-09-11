@@ -500,6 +500,20 @@ fn ace_is_inheritable(flags: Nfs4Flag, is_dir: bool) -> bool {
     }
 }
 
+/// `aclinherit` is deliberately not a parameter, and the reason is the
+/// product's rather than the library's: TrueNAS sets `aclinherit=passthrough`
+/// on every NFSv4 dataset it creates, and passthrough is the one value under
+/// which `zfs_acl_inherit` leaves the access mask alone. Its other arms all
+/// alter what the child gets - `discard` inherits nothing, `noallow` drops
+/// ALLOW ACEs, `passthrough-x` strips `ACE_EXECUTE` from a non-directory,
+/// `restricted` clears `RESTRICTED_CLEAR` (`ACE_WRITE_ACL|ACE_WRITE_OWNER`) -
+/// so a predictor that ignored the property would be wrong under any of
+/// them. It is right under the one the product uses, and taking the
+/// property as an argument would pessimize the library for configurations
+/// that do not occur. A dataset built by hand with `zfs create` takes ZFS's
+/// own default of `restricted` and reads `SOURCE=default`, which looks
+/// stock and is not what the product produces.
+///
 /// Rewrite an ACE's flags for a newly-created child - the second half of
 /// ZFS's inheritance arithmetic, which is what this predicts and therefore
 /// the only definition that counts (`zfs_acl_inherit`,
