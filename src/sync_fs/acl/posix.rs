@@ -683,110 +683,160 @@ mod tests {
     #[test]
     fn the_inherited_acl_matches_what_the_kernel_creates() {
         use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
 
         let dir = crate::tempdir().expect("tempdir");
-        let parent = dir.path().join("p");
-        std::fs::create_dir(&parent).expect("parent");
         let cpath = |p: &std::path::Path| {
             std::ffi::CString::new(p.as_os_str().as_bytes()).expect("path")
         };
 
-        // Parent default ACL: owner/group/mask/other all rwx, plus a named
-        // user so the result is not mode-equivalent and the kernel really
-        // stores an access ACL on the child.
-        let entries = [
-            (PosixTag::UserObj, -1i64),
-            (PosixTag::User, 1000),
-            (PosixTag::GroupObj, -1),
-            (PosixTag::Mask, -1),
-            (PosixTag::Other, -1),
-        ];
-        let default: Vec<PosixAce> = entries
-            .iter()
-            .map(|&(tag, id)| PosixAce {
-                tag,
-                perms: PosixPerm::all(),
-                id,
-                default: true,
-            })
-            .collect();
-        let blob = encode_aces(&default).expect("encode");
-        let cp = cpath(&parent);
-        // SAFETY: valid NUL-terminated path and a sized buffer.
-        let rc = unsafe {
-            libc::setxattr(
-                cp.as_ptr(),
-                c"system.posix_acl_default".as_ptr(),
-                blob.as_ptr().cast(),
-                blob.len(),
-                0,
-            )
-        };
-        if rc != 0 {
-            let e = std::io::Error::last_os_error();
-            assert!(
-                std::env::var_os("TRUENAS_ROS_REQUIRE_POSIX_ACL").is_none(),
-                "TRUENAS_ROS_REQUIRE_POSIX_ACL is set but the fixture \
-                 filesystem refuses a default ACL: {e}"
-            );
-            return;
-        }
-
-        let parent_acl = PosixAcl::from_xattr(&[], Some(&blob))
-            .expect("the default reads back");
-
-        for (name, mode, is_dir) in
-            [("cd", 0o700u32, true), ("cf", 0o600, false)]
-        {
-            let child = parent.join(name);
-            // The umask must not narrow this: `posix_acl_create` applies it
-            // only on the branch where the parent has NO default ACL.
-            let old = unsafe { libc::umask(0) };
-            if is_dir {
-                std::fs::create_dir(&child).expect("child dir");
-                std::fs::set_permissions(
-                    &child,
-                    std::os::unix::fs::PermissionsExt::from_mode(mode),
-                )
-                .expect("child mode");
-            } else {
-                let cc = cpath(&child);
-                // SAFETY: valid path; O_CREAT with an explicit mode.
-                let fd = unsafe {
-                    libc::open(
-                        cc.as_ptr(),
-                        libc::O_CREAT | libc::O_RDWR,
-                        mode as libc::c_uint,
-                    )
-                };
-                assert!(fd >= 0, "child file");
-                // SAFETY: a descriptor this call just opened.
-                unsafe { libc::close(fd) };
-            }
-            unsafe { libc::umask(old) };
-
-            let mut buf = [0u8; 512];
-            let cc = cpath(&child);
-            // SAFETY: valid path and a sized destination.
-            let n = unsafe {
-                libc::getxattr(
-                    cc.as_ptr(),
-                    c"system.posix_acl_access".as_ptr(),
-                    buf.as_mut_ptr().cast(),
-                    buf.len(),
+        // Two parent default ACLs, because one of them cannot fail.
+        //
+        // `rwx` everywhere is *wider* than either create mode below, so the
+        // mode survives the intersection unchanged and the predicted mode is
+        // the requested mode - an assertion that reads as checking the
+        // arithmetic and restates its input. `r-x` on `USER_OBJ` is
+        // narrower, and there the mode comes back `0o500`/`0o400`: that row
+        // is what makes the mode assertion an assertion.
+        //
+        // A named user in both, so the result is not mode-equivalent and the
+        // kernel really stores an access ACL on the child.
+        for (shape, owner) in [
+            ("wide", PosixPerm::all()),
+            ("narrow", PosixPerm::READ | PosixPerm::EXECUTE),
+        ] {
+            let parent = dir.path().join(format!("p_{shape}"));
+            std::fs::create_dir(&parent).expect("parent");
+            let entries = [
+                (PosixTag::UserObj, -1i64),
+                (PosixTag::User, 1000),
+                (PosixTag::GroupObj, -1),
+                (PosixTag::Mask, -1),
+                (PosixTag::Other, -1),
+            ];
+            let default: Vec<PosixAce> = entries
+                .iter()
+                .map(|&(tag, id)| PosixAce {
+                    tag,
+                    perms: if tag == PosixTag::UserObj {
+                        owner
+                    } else {
+                        PosixPerm::all()
+                    },
+                    id,
+                    default: true,
+                })
+                .collect();
+            let blob = encode_aces(&default).expect("encode");
+            let cp = cpath(&parent);
+            // SAFETY: valid NUL-terminated path and a sized buffer.
+            let rc = unsafe {
+                libc::setxattr(
+                    cp.as_ptr(),
+                    c"system.posix_acl_default".as_ptr(),
+                    blob.as_ptr().cast(),
+                    blob.len(),
+                    0,
                 )
             };
-            assert!(n > 0, "the kernel stored no access ACL on {name}");
-            let actual = PosixAcl::from_xattr(&buf[..n as usize], None)
-                .expect("the kernel's ACL decodes");
+            if rc != 0 {
+                let e = std::io::Error::last_os_error();
+                assert!(
+                    std::env::var_os("TRUENAS_ROS_REQUIRE_POSIX_ACL").is_none(),
+                    "TRUENAS_ROS_REQUIRE_POSIX_ACL is set but the fixture \
+                 filesystem refuses a default ACL: {e}"
+                );
+                return;
+            }
 
-            let (predicted, _mode) = parent_acl
-                .generate_inherited_acl(is_dir, mode)
-                .expect("a default ACL is present");
-            assert_eq!(
-                predicted.access, actual.access,
-                "{name}: predicted vs the kernel's own"
-            );
+            let parent_acl = PosixAcl::from_xattr(&[], Some(&blob))
+                .expect("the default reads back");
+
+            for (name, mode, is_dir) in
+                [("cd", 0o700u32, true), ("cf", 0o600, false)]
+            {
+                let child = parent.join(name);
+                // The umask must not narrow this: `posix_acl_create` applies it
+                // only on the branch where the parent has NO default ACL.
+                let old = unsafe { libc::umask(0) };
+                if is_dir {
+                    // `mkdir` WITH the mode, not `create_dir` then `chmod`. A
+                    // chmod is not a second spelling of the create: it sets
+                    // `USER_OBJ`/`MASK`/`OTHER` from the mode it is given
+                    // (`posix_acl_chmod`), so it overwrites both halves of what
+                    // inheritance produced and this compares the prediction
+                    // against the chmod's arithmetic instead of the kernel's
+                    // `posix_acl_create`. Measured on a `posixacl` dataset, with
+                    // the narrow default above and a `0o700` child: `mkdir`
+                    // gives `mode 0500, user::r-x`, create-then-chmod gives
+                    // `mode 0700, user::rwx`. The two agree only for a default
+                    // wider than the mode, which is the one shape this used to
+                    // build.
+                    let cc = cpath(&child);
+                    // SAFETY: valid NUL-terminated path and an explicit mode.
+                    let rc = unsafe {
+                        libc::mkdir(cc.as_ptr(), mode as libc::mode_t)
+                    };
+                    assert_eq!(
+                        rc,
+                        0,
+                        "child dir: {}",
+                        std::io::Error::last_os_error()
+                    );
+                } else {
+                    let cc = cpath(&child);
+                    // SAFETY: valid path; O_CREAT with an explicit mode.
+                    let fd = unsafe {
+                        libc::open(
+                            cc.as_ptr(),
+                            libc::O_CREAT | libc::O_RDWR,
+                            mode as libc::c_uint,
+                        )
+                    };
+                    assert!(fd >= 0, "child file");
+                    // SAFETY: a descriptor this call just opened.
+                    unsafe { libc::close(fd) };
+                }
+                unsafe { libc::umask(old) };
+
+                let mut buf = [0u8; 512];
+                let cc = cpath(&child);
+                // SAFETY: valid path and a sized destination.
+                let n = unsafe {
+                    libc::getxattr(
+                        cc.as_ptr(),
+                        c"system.posix_acl_access".as_ptr(),
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                    )
+                };
+                assert!(n > 0, "the kernel stored no access ACL on {name}");
+                let actual = PosixAcl::from_xattr(&buf[..n as usize], None)
+                    .expect("the kernel's ACL decodes");
+
+                let (predicted, predicted_mode) = parent_acl
+                    .generate_inherited_acl(is_dir, mode)
+                    .expect("a default ACL is present");
+                assert_eq!(
+                    predicted.access, actual.access,
+                    "{shape}/{name}: predicted vs the kernel's own"
+                );
+                // The other half of the same intersection, and the one `getattr`
+                // reports: `posix_acl_create_masq` narrows the entries by the
+                // mode AND the mode by what survives. Checking only the entries
+                // leaves the second return value of `generate_inherited_acl`
+                // with no oracle at all.
+                let actual_mode = std::fs::symlink_metadata(&child)
+                    .expect("stat the child")
+                    .permissions()
+                    .mode()
+                    & 0o7777;
+                assert_eq!(
+                    predicted_mode & 0o7777,
+                    actual_mode,
+                    "{shape}/{name}: predicted create mode vs the kernel's own"
+                );
+            }
         }
     }
 
