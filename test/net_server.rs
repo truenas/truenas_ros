@@ -12239,3 +12239,136 @@ fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
         }
     }
 }
+/// A reply the handler declared final keeps the pump gate shut even when a
+/// body is still streaming ahead of it.
+///
+/// `Connection::has_deferred_close` is that gate ("both mean no further
+/// request may be admitted"), and `Response::ReplyFile { close: true }`
+/// arriving while another body streams is what sets it. But
+/// `take_queued_file_reply` cleared the flag for whichever deferred body
+/// came off the queue next, on the grounds that installing it arms
+/// `close_on_flush` from its own `close` - true only when THAT body is the
+/// one that carried the close. With the close on a later deferred body the
+/// gate reopened for the whole read-ahead window, and every request the
+/// handler then answered was discarded unsent by `drop_queued_file_reply`
+/// when the final body retired.
+///
+/// The control is the parameter: with the close on the active tail, or on
+/// the first deferred body, the gate holds and the handler stops on time.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn a_deferred_close_keeps_the_gate_shut_for_a_later_body() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, FsConfig, UringFs};
+
+    const CHUNK: usize = 16 * 1024;
+    const SIZE: usize = 8 * CHUNK;
+    const REQS: usize = 5;
+
+    let dir = truenas_ros::tempdir().unwrap();
+    std::fs::write(dir.path().join("obj"), vec![0x42u8; SIZE])
+        .expect("fixture");
+
+    // `close_at` is the 0-based request whose `ReplyFile` is declared
+    // final: 0 is the active tail, 1 the first deferred body, 2 the second.
+    // The handler must run exactly `close_at + 1` times in every case.
+    for close_at in [0usize, 1, 2] {
+        let mut afs = match UringFs::new(FsConfig::default()) {
+            Ok(f) => f,
+            Err(e) if should_skip(&e) => return,
+            Err(e) => panic!("UringFs::new: {e}"),
+        };
+        let who = afs.register_self().expect("register_self");
+        let handle = afs.handle();
+        let stop_fs = afs.shutdown_handle();
+        let anchor = Anchor::open(dir.path()).expect("anchor");
+        let (ftx, frx) = mpsc::channel();
+        thread::scope(|sc| {
+            sc.spawn(move || {
+                let r = handle.open(
+                    who,
+                    &anchor,
+                    c"obj",
+                    OpenHow::new().flags(OFlag::O_RDONLY),
+                );
+                let _ = ftx.send(r);
+                stop_fs.shutdown();
+            });
+            afs.run().expect("fs host run");
+        });
+        let file = frx.recv().expect("open outcome").expect("open");
+
+        let cfg = ServerConfig {
+            pool_size: 4,
+            fs_ops: 8,
+            fs_body_chunk: CHUNK,
+            // Read-ahead is the precondition: at the default cap of one the
+            // pump never frames a second request, so no body is ever
+            // deferred behind another.
+            max_in_flight_requests: 8,
+            ..ServerConfig::default()
+        };
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen2 = Arc::clone(&seen);
+        let proto = Protocol {
+            accept: |_: Incoming<'_>| Some(()),
+            header: length_prefix_header::<()>(
+                PrefixWidth::U32,
+                Endian::Big,
+                false,
+            ),
+            body: move |_req: Request<'_, ()>| {
+                let nth = seen2.fetch_add(1, Ordering::SeqCst);
+                Response::ReplyFile {
+                    head: Vec::new(),
+                    file: file.clone(),
+                    offset: 0,
+                    len: SIZE as u64,
+                    close: nth == close_at,
+                }
+            },
+        };
+        let addr =
+            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let mut server = match Server::with_config([addr], cfg, proto) {
+            Ok(s) => s,
+            Err(e) if should_skip(&e) => return,
+            Err(e) => panic!("bind: {e}"),
+        };
+        let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+            panic!("expected Tcp");
+        };
+        let stop = server.shutdown_handle();
+        let client = thread::spawn(move || -> io::Result<usize> {
+            let _stop = ShutdownOnDrop(stop.clone());
+            let mut s = connect_tcp(v4)?;
+            // Every request in one write, so all of them are in the socket
+            // buffer before the first body starts streaming.
+            let mut wire = Vec::new();
+            for _ in 0..REQS {
+                wire.extend_from_slice(&1u32.to_be_bytes());
+                wire.push(b'g');
+            }
+            s.write_all(&wire)?;
+            s.flush()?;
+            let mut got = Vec::new();
+            let n = s.read_to_end(&mut got)?;
+            stop.shutdown();
+            Ok(n)
+        });
+        server.serve_forever().expect("serve_forever");
+        let bytes = client.join().expect("join").expect("client");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            close_at + 1,
+            "close_at={close_at}: requests admitted past the final reply"
+        );
+        assert_eq!(
+            bytes,
+            (close_at + 1) * SIZE,
+            "close_at={close_at}: bodies on the wire"
+        );
+    }
+}
