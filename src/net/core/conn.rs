@@ -1972,10 +1972,21 @@ impl<U> Connection<U> {
     /// path, which is the only place a read can be issued.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) fn take_queued_file_reply(&mut self) -> Option<PendingFile> {
-        // Installing it arms `close_on_flush` from its own `close`, which
-        // takes the gate over from here.
-        self.deferred_close = false;
-        self.next_file.take()
+        let next = self.next_file.take();
+        // Installing this one arms `close_on_flush` from ITS own `close`,
+        // which takes the gate over from here - but the flag summarises
+        // every deferred body, not just this one. A close carried by a body
+        // still queued BEHIND it has nothing else holding the gate, so
+        // recompute from the followers rather than clearing outright.
+        // Cleared, the gate opens for as many further requests as the
+        // read-ahead cap allows, and every one the handler then answers is
+        // discarded unsent by `drop_queued_file_reply` when the final body
+        // retires - the admission `has_deferred_close` exists to refuse.
+        self.deferred_close = self
+            .next_file_pending
+            .iter()
+            .any(|item| matches!(item, PendingItem::File(f) if f.close));
+        next
     }
 
     /// Drop a deferred file body **and everything queued behind it** - the

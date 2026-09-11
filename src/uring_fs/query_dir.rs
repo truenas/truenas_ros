@@ -1081,12 +1081,32 @@ fn pending_file(p: FsPending) -> (Option<File>, Option<Errno>) {
 ///
 /// The same split `pending_discovered` makes for a value read, applied to
 /// the open that precedes it: an object this identity may not open
-/// (`EACCES`/`EPERM`), one that went away between `readdir` and the open
-/// (`ENOENT`), and one that **cannot be opened at all** are definite
-/// answers, not incompletenesses. The last is the easy one to miss and the
-/// only unconditional one: the open is `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`, so
-/// every symbolic link answers `ELOOP` and every socket `ENXIO`, on every
-/// listing, for a directory containing nothing unusual.
+/// (`EACCES`/`EPERM` - the same drop
+/// [`DirEntry::xattrs_incomplete`] promises never to flag) and one that went
+/// away between `readdir` and the open (`ENOENT`, so there are no values) are
+/// definite answers, not incompletenesses.
+///
+/// **`ELOOP` joins them only because a symlink cannot hold the values.** The
+/// open is `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`, so every symbolic link answers
+/// `ELOOP` on every listing, and flagging one would make the flag permanent
+/// for a directory containing nothing unusual. That is affordable only
+/// because the kernel refuses an access ACL on a symlink outright
+/// (`vfs_get_acl`, `fs/posix_acl.c`: `if (S_ISLNK(inode->i_mode))
+/// return ERR_PTR(-EOPNOTSUPP)`) and
+/// refuses `user.*` on anything but a regular file or directory
+/// (`xattr(7)`), so "absent" is the true answer there.
+///
+/// **`ENXIO` is not in that position and must not sit beside it.** It is
+/// what a unix socket answers, and a socket - like a FIFO or a device node -
+/// carries extended attributes and POSIX ACLs exactly as a regular file
+/// does. The errno says the object cannot be opened, nothing at all about
+/// its values, so an entry that answers it has values the listing was asked
+/// for and did not read. Classed definite, `DirEntry::acl` reports `None`
+/// (its rustdoc: "requested and **present**") and every requested
+/// `xattr_names` slot reports `None`, with nothing flagged - which is the
+/// trivial-versus-unread confusion the ACL arm in `next_batch` exists to
+/// refuse. `ENOTDIR` cannot arise here (a single-component open with no
+/// `O_DIRECTORY`) and says nothing about values either.
 ///
 /// Everything else - the marked `EBUSY` of a full op table above all, and
 /// `None`, meaning no op slot was free to issue the open with - is the read
@@ -1094,14 +1114,7 @@ fn pending_file(p: FsPending) -> (Option<File>, Option<Errno>) {
 fn open_failure_is_incompleteness(err: Option<Errno>) -> bool {
     !matches!(
         err,
-        Some(
-            Errno::EACCES
-                | Errno::EPERM
-                | Errno::ENOENT
-                | Errno::ELOOP
-                | Errno::ENXIO
-                | Errno::ENOTDIR
-        )
+        Some(Errno::EACCES | Errno::EPERM | Errno::ENOENT | Errno::ELOOP)
     )
 }
 
@@ -1241,10 +1254,16 @@ fn pending_discovered(p: FsPending) -> DiscRead {
         },
         // Both spellings of "your buffer was too small"
         // ([`is_short_buffer`]), so the classification does not depend on
-        // how large the probe buffer that reached it happens to be. Both
-        // are 64 KiB or under today, so only `ERANGE` can arrive; keeping
-        // the pair together is what stops a raised probe buffer from
-        // silently turning growth into a drop.
+        // how large the probe buffer that reached it happens to be - and
+        // both DO arrive here today. `do_getxattr` rewrites the
+        // filesystem's `-ERANGE` to `-E2BIG` when the caller's buffer is
+        // **at or above** `XATTR_SIZE_MAX` (65536), and the ACL probe below
+        // is exactly 65536, so an ACL larger than it answers `E2BIG` while
+        // the 4096-byte value probes answer `ERANGE`. Measured on ZFS
+        // against a 204800-byte value: buffer 4096 and 65535 -> `ERANGE`,
+        // 65536 and 65537 -> `E2BIG`, 204800 -> `Ok(204800)`. Keeping the
+        // pair together is what stops either probe buffer from silently
+        // turning growth into a drop.
         Err(e) if is_short_buffer(e) => DiscRead::Grow,
         // A definite answer of "no value here", which is never an
         // incompleteness: the attribute is not set (`ENODATA`), this
@@ -1777,7 +1796,8 @@ mod confinement_tests {
     use crate::errno::Errno;
     use crate::uring_fs::{FsOutcome, FsPending};
 
-    /// An entry that cannot be opened at all is answered, not lost.
+    /// An entry that cannot be opened at all is answered, not lost - but
+    /// only where the entry could not have held the values either.
     ///
     /// The listing opens each entry `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` to
     /// read its values through, and two ordinary entry types can never
@@ -1786,33 +1806,30 @@ mod confinement_tests {
     /// listing's own flags on this tree: sym -> ELOOP, sock -> ENXIO,
     /// while fifo, regular and directory all open.
     ///
-    /// Treated as incompletenesses they flag
-    /// [`DirEntry::xattrs_incomplete`] on a listing that lost nothing, for
-    /// a directory containing nothing unusual, and a consumer that
-    /// re-queries on the flag re-queries for ever - re-opening a symlink
-    /// can never succeed. `ENXIO` is the easy half to miss: a definite set
-    /// of `EACCES|EPERM|ENOENT|ELOOP` alone reads as complete and leaves
-    /// every socket entry flagged.
+    /// The two do **not** get the same verdict, and the errno is not what
+    /// separates them - what the object can hold is. Treated as an
+    /// incompleteness, `ELOOP` flags [`DirEntry::xattrs_incomplete`] on a
+    /// listing that lost nothing and a consumer that re-queries on the flag
+    /// re-queries for ever; that is affordable because a symlink can hold
+    /// neither an access ACL nor a `user.*` attribute, so "absent" is true
+    /// of it. A socket holds both, so its `ENXIO` leaves values genuinely
+    /// unread and belongs on the reported side beside `EBUSY`, or the
+    /// listing answers "this object has no ACL" for one that has one.
     ///
     /// The reported side is what the flag is for, and `None` is in it:
     /// no op slot was free to issue the open with, so the entry's values
     /// really are unread.
     #[test]
     fn an_unopenable_entry_is_answered_not_lost() {
-        for e in [
-            Errno::EACCES,
-            Errno::EPERM,
-            Errno::ENOENT,
-            Errno::ELOOP,
-            Errno::ENXIO,
-            Errno::ENOTDIR,
-        ] {
+        for e in [Errno::EACCES, Errno::EPERM, Errno::ENOENT, Errno::ELOOP] {
             assert!(
                 !open_failure_is_incompleteness(Some(e)),
                 "{e} is a definite answer about this entry"
             );
         }
         for e in [
+            Errno::ENXIO,
+            Errno::ENOTDIR,
             Errno::EBUSY,
             Errno::ECANCELED,
             Errno::ECONNABORTED,

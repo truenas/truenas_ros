@@ -483,8 +483,11 @@ impl Head<'_> {
     /// - non-digit / overflowing `Content-Length` -> 400;
     /// - neither header -> `Known(0)` (no body).
     ///
-    /// At runtime the framer reads this via [`FrameFacts`]; the method
-    /// remains as the tests' oracle asserting the two paths agree.
+    /// At runtime the framer reads this via [`FrameFacts`]. Both call
+    /// [`body_from`] over the same header views, so this is the same
+    /// expression rather than a second reading: `frame_facts_agrees_with_
+    /// parse_head` states each case's verdict outright and this method is
+    /// only the cross-check that the two callers still see the same views.
     #[cfg(test)]
     pub fn body(&self) -> Result<BodyKind, u16> {
         body_from(self.views(), self.version)
@@ -498,8 +501,11 @@ impl Head<'_> {
     /// a list-typed field, so the token is honored wherever it appears --
     /// any field line, any list position.
     ///
-    /// At runtime the framer reads this via [`FrameFacts`]; the method
-    /// remains as the tests' oracle asserting the two paths agree.
+    /// At runtime the framer reads this via [`FrameFacts`]. Only the
+    /// version guard is written twice; the token search is the same
+    /// [`has_token`] call on both sides, so - like [`body`](Self::body) -
+    /// the verdict this is checked against is the one stated in
+    /// `frame_facts_agrees_with_parse_head`, not this method's answer.
     #[cfg(test)]
     pub fn expects_continue(&self) -> bool {
         self.version == Version::Http11
@@ -1295,6 +1301,19 @@ mod tests {
             b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
             b"PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\n",
             b"PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n",
+            // The other two axes the open-coded read owns. Field names and
+            // list tokens are both matched case-insensitively (RFC 9110
+            // sec. 5.3, sec. 5.1), and `close` decides wherever it appears
+            // in the combined list - including alongside `keep-alive` on
+            // 1.1, where the version default would otherwise carry. Without
+            // these the fence passes a reader that compares either one
+            // exactly, or splits the list on the wrong delimiter.
+            b"GET / HTTP/1.1\r\nHost: h\r\nConnection: CLOSE\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: h\r\nconnection: Close\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: h\r\nConnection: keep-alive, close\r\n\r\n",
+            b"GET / HTTP/1.0\r\nConnection: KEEP-ALIVE\r\n\r\n",
+            b"GET / HTTP/1.0\r\nCONNECTION: Keep-Alive\r\n\r\n",
+            b"PUT / HTTP/1.1\r\nHost: h\r\ncontent-length: 5\r\ntransfer-encoding: chunked\r\n\r\n",
         ];
         for c in cases {
             complete(c, |h| {
@@ -1368,19 +1387,69 @@ mod tests {
 
     #[test]
     fn frame_facts_agrees_with_parse_head() {
-        let reqs: &[&[u8]] = &[
-            b"GET / HTTP/1.1\r\nHost: h\r\n\r\n",
-            b"PUT /k HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\n",
-            b"PUT /k HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n",
-            b"PUT /k HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n",
-            b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
+        // Each case carries what the framing rules say it means, written
+        // out here. Asserting the two readers against *each other* alone
+        // cannot fail: `frame_facts` and `Head::body` both evaluate
+        // `body_from` over the same header views, so the comparison is one
+        // expression against itself and any defect in `body_from` moves
+        // both sides together. The stated expectation is what gives this
+        // test a verdict of its own; the cross-check then says the two
+        // callers still read the same views.
+        type Case = (&'static [u8], Result<BodyKind, u16>, bool);
+        let reqs: &[Case] = &[
+            (b"GET / HTTP/1.1\r\nHost: h\r\n\r\n", Ok(BodyKind::Known(0)), false),
+            (
+                b"PUT /k HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\n",
+                Ok(BodyKind::Known(5)),
+                false,
+            ),
+            (
+                b"PUT /k HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n",
+                Ok(BodyKind::Known(3)),
+                true,
+            ),
+            (
+                b"PUT /k HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n",
+                Ok(BodyKind::Known(3)),
+                false,
+            ),
+            (
+                b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
+                Ok(BodyKind::Chunked),
+                false,
+            ),
+            // The three verdicts the rules produce that no case above
+            // reaches: TE wins over a lone well-formed CL, a repeated CL is
+            // the smuggling class, and a coding before `chunked` is framing
+            // this codec can place but not decode.
+            (
+                b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
+                Ok(BodyKind::Chunked),
+                false,
+            ),
+            (
+                b"PUT /k HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n",
+                Err(400),
+                false,
+            ),
+            (
+                b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+                Err(501),
+                false,
+            ),
         ];
-        for req in reqs {
+        for (req, body, expects) in reqs {
             complete(req, |head| {
                 let facts =
                     frame_facts(req).expect("parse ok").expect("complete");
-                assert_eq!(facts.body, head.body());
-                assert_eq!(facts.expects_continue, head.expects_continue());
+                assert_eq!(facts.body, *body, "{req:?}");
+                assert_eq!(facts.expects_continue, *expects, "{req:?}");
+                assert_eq!(facts.body, head.body(), "{req:?}");
+                assert_eq!(
+                    facts.expects_continue,
+                    head.expects_continue(),
+                    "{req:?}"
+                );
             });
         }
         // Error and partial verdicts agree too.

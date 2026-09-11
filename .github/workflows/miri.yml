@@ -35,11 +35,9 @@ env:
   # Measured at dc95690, one module at a time, with each abort reason
   # recorded rather than inferred:
   #   uring_fs::core, uring_fs::host  - syscall 425 (io_uring_setup)
-  #   uring_fs::broker                - syscall 53 (socketpair), at
-  #                                     `broker.rs`'s
-  #                                     `socketpair(AF_UNIX, SEQPACKET)`,
-  #                                     which the module's own diagram
-  #                                     names as its first step
+  #   uring_fs::broker                - TWO walls, and neither is well
+  #                                     described by a syscall number;
+  #                                     see the note below
   #   uring::ring                     - mmap with flags other than
   #                                     MAP_PRIVATE|MAP_ANONYMOUS
   #   uring_fs::query_dir::
@@ -58,12 +56,32 @@ env:
   # actually calls it: 96 -> 110 tests, 0 failed, no abort, under both
   # aliasing models.
   #
-  # The broker's reason was recorded as syscall 107, which is `geteuid`
-  # (`arch/x86/entry/syscalls/syscall_64.tbl` in the truenas/linux fork)
-  # - a call Miri supports, so it can never have been the wall. That is
-  # not cosmetic: a wrong reason sends the next person narrowing at the
-  # wrong place, which is how the `query_dir::` skip came to be a whole
-  # module too wide.
+  # The broker's reason was recorded as syscall 107 and "corrected" here
+  # to 53 on the reasoning that 107 is `geteuid`, which Miri supports.
+  # That correction was wrong, and its own lesson caught it: 107 was
+  # right. Miri implements the `geteuid()` *function*, not the
+  # `syscall()` dispatch for it, and `broker.rs`'s `raw_geteuid` calls
+  # the raw form on purpose - "no glibc state in the loop, by
+  # construction". Measured:
+  #
+  #   error: unsupported operation: syscall: unsupported syscall number 107
+  #     --> src/uring_fs/broker.rs
+  #      |  unsafe { libc::syscall(libc::SYS_geteuid) as u32 }
+  #
+  # And 53 is not a syscall wall either: Miri implements `socketpair`
+  # and refuses the TYPE - "socketpair: type 0x5 is unsupported, only
+  # SOCK_STREAM, SOCK_CLOEXEC and SOCK_NONBLOCK are allowed" - which is
+  # the SEQPACKET the module's own diagram names as its first step.
+  #
+  # So the module has two walls, on different tests, and a syscall
+  # number describes neither. It is also wider than both:
+  # `the_group_fast_path_is_exactly_set_equality` interprets clean under
+  # Miri today. Narrowing it needs a per-test skip list, which is a
+  # maintenance trade rather than a correction, so it is not made here.
+  #
+  # The rule this was meant to serve still holds, and now has a second
+  # instance behind it: a wrong reason sends the next person narrowing
+  # at the wrong place. Measure the wall, do not infer it from a name.
   #
   # `-Zmiri-disable-isolation` does NOT recover the `mkdtemp` group:
   # `mkdtemp` is unimplemented in Miri, not merely isolated - measured, 0
@@ -132,12 +150,13 @@ env:
   # nested-pass regression, ring-gated and so counted rather than
   # claimed; 110 is not a new test at all - it is the `query_dir::`
   # skip narrowed to its actual reason, which admits 14 that were
-  # being skipped for a `mkdtemp` they never call.) If that friction
-  # is unwanted,
+  # being skipped for a `mkdtemp` they never call; 111 adds the
+  # sequential stop-screen test, pure channel state that genuinely
+  # executes here.) If that friction is unwanted,
   # `-lt` pinned at the TRUE count still catches deletion, which is
   # the failure mode; what it must not be again is a floor far below
   # what runs.
-  MIRI_TESTS: "110"
+  MIRI_TESTS: "111"
 
   # The `http` band, run as its own step under its own feature set.
   # Exact for the same reason, and bumped by the same rule: 32 at the

@@ -3261,10 +3261,23 @@ fn tcp_reuse_port_and_options() {
     drop(second);
 
     // Without the flag the same bind fails with EADDRINUSE.
+    //
+    // `Server::bind` is `with_config` with the default config
+    // (`net/server/mod.rs`), so it sets a ring up exactly as the two calls
+    // above do - and answers the same environmental `ENOMEM` for the same
+    // reason. Screened through `should_skip` before the errno is judged,
+    // or that skip becomes `expected EADDRINUSE, got ENOMEM`: a hard
+    // failure naming the wrong syscall, on the one call in this test that
+    // was left unguarded.
     let dup = Server::bind(
         [ServerAddr::Tcp(v4)],
         length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
     );
+    if let Err(e) = &dup
+        && should_skip(e)
+    {
+        return;
+    }
     assert!(
         matches!(dup, Err(Error::Errno(Errno::EADDRINUSE))),
         "expected EADDRINUSE, got {dup:?}"
@@ -7608,6 +7621,134 @@ fn ktls_close_notify_reports_tls_control() {
     assert!(
         !got.contains(&CloseReason::TruncatedMessage),
         "clean TLS close misread as truncation: {got:?}"
+    );
+}
+
+/// A peer's TLS 1.3 KeyUpdate closes the connection as `TlsControl`, and the
+/// request behind it is not answered.
+///
+/// `CloseReason::TlsControl` names this case outright - "a post-handshake
+/// handshake message, TLS 1.3 KeyUpdate, or alert ... renegotiation/rekey are
+/// out of scope" - but only the alert half had a test
+/// (`ktls_close_notify_reports_tls_control`). The two halves reach the same
+/// reason down different paths: an alert completes the parked idle read SHORT
+/// (`on_recv_complete`'s `res > 0 && ktls_control_record` arm), while a
+/// KeyUpdate arrives mid-conversation with a request queued behind it.
+///
+/// Measured, not assumed: this kernel does NOT absorb an RX KeyUpdate on the
+/// server's behalf, so the record does reach the reactor. Pinning that here
+/// means a kernel or policy change that starts handling rekey - or that
+/// reclassifies the record - goes red rather than silently altering what a
+/// long-lived peer sees.
+#[test]
+fn ktls_peer_key_update_closes_as_tls_control() {
+    use foreign_types::ForeignTypeRef;
+    use std::sync::Mutex;
+    // Not bound by the `openssl` crate (nor by `openssl-sys`), so declare the
+    // two libssl entry points this needs.
+    unsafe extern "C" {
+        fn SSL_key_update(
+            ssl: *mut openssl_sys::SSL,
+            updatetype: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
+        fn SSL_do_handshake(ssl: *mut openssl_sys::SSL) -> std::os::raw::c_int;
+    }
+    const SSL_KEY_UPDATE_NOT_REQUESTED: std::os::raw::c_int = 0;
+
+    if ktls_openssl_unsupported() {
+        return;
+    }
+    let (cert, key) = self_signed();
+    let acceptor = Arc::new(ktls_acceptor(&cert, &key));
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = length_prefixed(
+        PrefixWidth::U32,
+        Endian::Big,
+        false,
+        |_h: &[u8], body: &[u8], _p: &ClientAddr| Some(echo_frame(body)),
+    );
+    let mut server = match Server::bind(
+        [truenas_ros::net::server::Listen::tls(addr)],
+        proto,
+    ) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    {
+        let acceptor = Arc::clone(&acceptor);
+        server.set_tls_handshake(move |fd, _inc, deferral| {
+            let acceptor = Arc::clone(&acceptor);
+            thread::spawn(move || match ktls_server_handshake(fd, &acceptor) {
+                Ok(()) => deferral.ready(()),
+                Err(_) => deferral.reject(),
+            });
+        });
+    }
+    {
+        let reasons = Arc::clone(&reasons);
+        server.set_close_hook(move |_addr, reason, _state: &mut ()| {
+            reasons.lock().unwrap().push(reason);
+        });
+    }
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let answered = Arc::new(Mutex::new(None::<bool>));
+    let answered2 = Arc::clone(&answered);
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let mut s = tls_connect(v4).expect("tls connect");
+        assert_eq!(
+            s.ssl().version_str(),
+            "TLSv1.3",
+            "KeyUpdate is a TLS 1.3 message"
+        );
+        // The control: the connection serves normally before the rekey, so a
+        // failure after it is the rekey and not the fixture.
+        send_framed(&mut s, b"before-rekey").expect("send 1");
+        assert_eq!(recv_framed(&mut s).expect("recv 1"), b"before-rekey");
+
+        // Post-handshake KeyUpdate, flushed immediately.
+        assert_eq!(
+            unsafe {
+                SSL_key_update(s.ssl().as_ptr(), SSL_KEY_UPDATE_NOT_REQUESTED)
+            },
+            1,
+            "SSL_key_update"
+        );
+        assert_eq!(
+            unsafe { SSL_do_handshake(s.ssl().as_ptr()) },
+            1,
+            "flush the KeyUpdate"
+        );
+
+        // The request behind it rides the new keys. The server has already
+        // closed on the control record, so it is never answered.
+        let _ = send_framed(&mut s, b"after-rekey");
+        *answered2.lock().unwrap() = Some(recv_framed(&mut s).is_ok());
+        thread::sleep(Duration::from_millis(150));
+        stop.shutdown();
+    });
+
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join");
+    let got = reasons.lock().unwrap().clone();
+    assert!(
+        got.contains(&CloseReason::TlsControl),
+        "a peer KeyUpdate must report TlsControl, got {got:?}"
+    );
+    assert!(
+        !got.contains(&CloseReason::TruncatedMessage),
+        "a rekey misread as truncation: {got:?}"
+    );
+    assert_eq!(
+        *answered.lock().unwrap(),
+        Some(false),
+        "the request behind a KeyUpdate is not answered"
     );
 }
 
@@ -12235,6 +12376,166 @@ fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
                 "{what}: the budget must be retired when the body completes \
                  - ReceiptTimeout here is a healthy connection reaped for \
                  having finished on time (reasons: {got:?})"
+            );
+        }
+    }
+}
+
+/// A reply the handler declared final keeps the pump gate shut even when a
+/// body is still streaming ahead of it.
+///
+/// `Connection::has_deferred_close` is that gate ("both mean no further
+/// request may be admitted"), and `Response::ReplyFile { close: true }`
+/// arriving while another body streams is what sets it. But
+/// `take_queued_file_reply` cleared the flag for whichever deferred body
+/// came off the queue next, on the grounds that installing it arms
+/// `close_on_flush` from its own `close` - true only when THAT body is the
+/// one that carried the close. With the close on a later deferred body the
+/// gate reopened for the whole read-ahead window, and every request the
+/// handler then answered was discarded unsent by `drop_queued_file_reply`
+/// when the final body retired.
+///
+/// The control is the parameter: with the close on the active tail, or on
+/// the first deferred body, the gate holds and the handler stops on time.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn a_deferred_close_keeps_the_gate_shut_for_a_later_body() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, FsConfig, UringFs};
+
+    const CHUNK: usize = 16 * 1024;
+    const SIZE: usize = 8 * CHUNK;
+    const REQS: usize = 5;
+
+    let dir = truenas_ros::tempdir().unwrap();
+    std::fs::write(dir.path().join("obj"), vec![0x42u8; SIZE])
+        .expect("fixture");
+
+    // `close_at` is the 0-based request whose `ReplyFile` is declared
+    // final: 0 is the active tail, 1 the first deferred body, 2 the second.
+    // The handler must run exactly `close_at + 1` times in every case.
+    for close_at in [0usize, 1, 2] {
+        let mut afs = match UringFs::new(FsConfig::default()) {
+            Ok(f) => f,
+            Err(e) if should_skip(&e) => return,
+            Err(e) => panic!("UringFs::new: {e}"),
+        };
+        let who = afs.register_self().expect("register_self");
+        let handle = afs.handle();
+        let stop_fs = afs.shutdown_handle();
+        let anchor = Anchor::open(dir.path()).expect("anchor");
+        let (ftx, frx) = mpsc::channel();
+        thread::scope(|sc| {
+            sc.spawn(move || {
+                let r = handle.open(
+                    who,
+                    &anchor,
+                    c"obj",
+                    OpenHow::new().flags(OFlag::O_RDONLY),
+                );
+                let _ = ftx.send(r);
+                stop_fs.shutdown();
+            });
+            afs.run().expect("fs host run");
+        });
+        let file = frx.recv().expect("open outcome").expect("open");
+
+        let cfg = ServerConfig {
+            pool_size: 4,
+            fs_ops: 8,
+            fs_body_chunk: CHUNK,
+            // Read-ahead is the precondition: at the default cap of one the
+            // pump never frames a second request, so no body is ever
+            // deferred behind another.
+            max_in_flight_requests: 8,
+            ..ServerConfig::default()
+        };
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen2 = Arc::clone(&seen);
+        let proto = Protocol {
+            accept: |_: Incoming<'_>| Some(()),
+            header: length_prefix_header::<()>(
+                PrefixWidth::U32,
+                Endian::Big,
+                false,
+            ),
+            body: move |_req: Request<'_, ()>| {
+                let nth = seen2.fetch_add(1, Ordering::SeqCst);
+                Response::ReplyFile {
+                    head: Vec::new(),
+                    file: file.clone(),
+                    offset: 0,
+                    len: SIZE as u64,
+                    close: nth == close_at,
+                }
+            },
+        };
+        let addr =
+            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let mut server = match Server::with_config([addr], cfg, proto) {
+            Ok(s) => s,
+            Err(e) if should_skip(&e) => return,
+            Err(e) => panic!("bind: {e}"),
+        };
+        let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+            panic!("expected Tcp");
+        };
+        let stop = server.shutdown_handle();
+        let client = thread::spawn(move || -> io::Result<(usize, bool)> {
+            let _stop = ShutdownOnDrop(stop.clone());
+            let mut s = connect_tcp(v4)?;
+            // Every request in one write, so all of them are in the socket
+            // buffer before the first body starts streaming.
+            let mut wire = Vec::new();
+            for _ in 0..REQS {
+                wire.extend_from_slice(&1u32.to_be_bytes());
+                wire.push(b'g');
+            }
+            s.write_all(&wire)?;
+            s.flush()?;
+            let mut got = Vec::new();
+            // The gate shuts before the refused requests are read off the
+            // socket, so they are still in the receive queue when the
+            // connection closes - and the kernel answers a close with
+            // unread data by sending RST rather than FIN (`tcp_close`,
+            // net/ipv4/tcp.c:3165-3170, `TCP_ABORT_ON_CLOSE`). Whether any
+            // are left is a timing question rather than a property of the
+            // code under test: a host whose pump framed every pipelined
+            // request before the gate shut closes cleanly, one that did
+            // not gets the reset. Both endings are healthy here.
+            //
+            // The reset is not free - it aborts the connection instead of
+            // draining it, so bytes the server had queued but not yet
+            // delivered are lost and the peer sees a truncated stream,
+            // measured here at exactly one chunk short. So the byte count
+            // is only checked exactly on the clean ending; `seen`, which
+            // the server counts, is the claim this test makes and holds
+            // either way.
+            let clean = match s.read_to_end(&mut got) {
+                Ok(_) => true,
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => false,
+                Err(e) => return Err(e),
+            };
+            stop.shutdown();
+            Ok((got.len(), clean))
+        });
+        server.serve_forever().expect("serve_forever");
+        let (bytes, clean) = client.join().expect("join").expect("client");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            close_at + 1,
+            "close_at={close_at}: requests admitted past the final reply"
+        );
+        let want = (close_at + 1) * SIZE;
+        if clean {
+            assert_eq!(bytes, want, "close_at={close_at}: bodies on the wire");
+        } else {
+            assert!(
+                bytes <= want,
+                "close_at={close_at}: {bytes} bytes on the wire, past the \
+                 {want} the gate allows"
             );
         }
     }

@@ -2644,25 +2644,31 @@ fn query_directory_explicit_large_value() {
     });
 }
 
-/// A listing that lost nothing must not report itself short because some of
-/// its entries have no openable descriptor.
+/// A listing that lost nothing must not report itself short - and one that
+/// did must.
 ///
 /// The listing opens each entry `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` to read its
 /// values through, and two ordinary entry types can never satisfy that: a
 /// symbolic link answers `ELOOP` because of `O_NOFOLLOW`, and a socket
-/// answers `ENXIO`. Classing every failed open as an incompleteness flags
-/// `xattrs_incomplete` on a complete listing of a directory containing
-/// nothing unusual - and a consumer that re-queries on the flag re-queries
-/// for ever, because re-opening a symlink can never succeed.
+/// answers `ENXIO`. They do not get the same verdict, because the errno is
+/// not what decides it - what the object can hold is.
 ///
-/// Both types are here on purpose: a definite set of
-/// `EACCES|EPERM|ENOENT|ELOOP` passes the symlink and still flags the
-/// socket, so a test with only a symlink in it reads as green against that
-/// half-fix.
+/// A symlink can hold neither an access ACL (`vfs_get_acl` refuses one
+/// outright) nor a `user.*` attribute (`xattr(7)`), so "absent" is the true
+/// answer about it and flagging one would make `xattrs_incomplete`
+/// permanent for a directory containing nothing unusual - a consumer that
+/// re-queries on the flag would re-query for ever.
+///
+/// A socket holds both, exactly as a regular file does, so its `ENXIO`
+/// leaves values the caller asked for genuinely unread. Reported as absent
+/// with the flag clear, a permissions layer mirroring ACLs out of a listing
+/// records "this object has no ACL" for one that has one, which is the
+/// trivial-versus-unread confusion the ACL arm in `next_batch` exists to
+/// refuse.
 ///
 /// The regular file is the live control - it opens, its value is read, and
-/// it is reported complete - so a blanket "nothing is ever flagged" would
-/// not pass either.
+/// it is reported complete - so a blanket "everything is flagged" would not
+/// pass either.
 #[test]
 fn query_directory_does_not_flag_an_entry_it_cannot_open() {
     use truenas_ros::uring_fs::{
@@ -2712,9 +2718,12 @@ fn query_directory_does_not_flag_an_entry_it_cannot_open() {
             "the listing must yield every entry it was given"
         );
         for (n, incomplete, _) in &seen {
-            assert!(
-                !incomplete,
-                "{n}: a listing that lost nothing reported itself short"
+            // The socket is the one entry whose values were asked for and
+            // not read; every other row lost nothing.
+            let expected = n == "sock";
+            assert_eq!(
+                *incomplete, expected,
+                "{n}: xattrs_incomplete should be {expected}"
             );
         }
         if set_ok {
@@ -5007,5 +5016,113 @@ fn a_subtree_removed_under_the_walk_is_skipped_quietly() {
             "a vanished subtree must not fail the walk"
         );
         assert!(t.next().is_none(), "the walk ends after the last sibling");
+    });
+}
+
+/// An entry the listing cannot open must not report its ACL as *absent*.
+///
+/// A unix socket answers `ENXIO` to `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` and
+/// carries a POSIX access ACL exactly as a regular file does, so the ACL
+/// the caller asked for was not read. With that classed as a definite
+/// answer, `DirEntry::acl` is `None` - its rustdoc's spelling of "not
+/// present" - and `xattrs_incomplete` is clear, so a permissions layer
+/// mirroring ACLs out of a listing records "no ACL" for an object that has
+/// one.
+///
+/// A symbolic link is the opposite control and must STAY unflagged: the
+/// kernel refuses an access ACL on one outright (`vfs_get_acl`), so
+/// "absent" is true of it, and flagging it would make the flag permanent
+/// for an ordinary directory.
+#[test]
+fn query_directory_does_not_call_an_unread_acl_absent() {
+    use std::collections::BTreeMap;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStringExt;
+    use truenas_ros::uring_fs::{
+        DirEntry, EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
+    };
+
+    // system.posix_acl_access: u32 version, then 8-byte (tag, perm, id).
+    // A named user, so the ACL is not equivalent to the mode and the
+    // filesystem really stores one.
+    let acl: Vec<u8> = {
+        let mut v = Vec::new();
+        v.extend_from_slice(&2u32.to_le_bytes());
+        for (tag, perm, id) in [
+            (0x01u16, 0o6u16, 0xFFFF_FFFFu32),
+            (0x02, 0o4, 1000),
+            (0x04, 0o4, 0xFFFF_FFFF),
+            (0x10, 0o6, 0xFFFF_FFFF),
+            (0x20, 0o0, 0xFFFF_FFFF),
+        ] {
+            v.extend_from_slice(&tag.to_le_bytes());
+            v.extend_from_slice(&perm.to_le_bytes());
+            v.extend_from_slice(&id.to_le_bytes());
+        }
+        v
+    };
+    let aclname = CString::new("system.posix_acl_access").expect("name");
+
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("f"), b"x").expect("regular file");
+        let _sock = std::os::unix::net::UnixListener::bind(dir.join("s"))
+            .expect("unix socket");
+        std::os::unix::fs::symlink("f", dir.join("l")).expect("symlink");
+
+        for name in ["f", "s"] {
+            let p = CString::new(dir.join(name).into_os_string().into_vec())
+                .expect("path");
+            // SAFETY: valid NUL-terminated path/name and a sized buffer.
+            let rc = unsafe {
+                libc::setxattr(
+                    p.as_ptr(),
+                    aclname.as_ptr(),
+                    acl.as_ptr().cast(),
+                    acl.len(),
+                    0,
+                )
+            };
+            if rc != 0 {
+                // Not a POSIX-ACL filesystem for this node type.
+                let e = std::io::Error::last_os_error();
+                assert!(
+                    std::env::var_os("TRUENAS_ROS_REQUIRE_POSIX_ACL").is_none(),
+                    "TRUENAS_ROS_REQUIRE_POSIX_ACL is set but the fixture \
+                     filesystem refuses an access ACL on {name}: {e}"
+                );
+                return;
+            }
+        }
+
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let opts = QueryOptions {
+            spec: EnrichSpec::ACL,
+            acl_name: aclname.clone(),
+            xattr_ns: XattrNamespaces::empty(),
+            ..Default::default()
+        };
+        let mut q = query_directory(&h, me, &anchor, opts).expect("list");
+        let mut all: BTreeMap<String, DirEntry> = BTreeMap::new();
+        while let Some(batch) = q.next() {
+            for e in batch.expect("batch") {
+                all.insert(e.name.to_string_lossy().into_owned(), e);
+            }
+        }
+
+        assert_eq!(
+            all["f"].acl.as_deref(),
+            Some(&acl[..]),
+            "the control opens, so its ACL is read"
+        );
+        assert!(!all["f"].xattrs_incomplete, "the control lost nothing");
+        assert!(
+            all["s"].acl.is_none() && all["s"].xattrs_incomplete,
+            "an ACL that could not be read is unread, not absent"
+        );
+        assert!(
+            !all["l"].xattrs_incomplete,
+            "a symlink cannot hold an access ACL, so absent is the true \
+             answer and the flag must stay clear"
+        );
     });
 }

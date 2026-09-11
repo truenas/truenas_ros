@@ -826,11 +826,13 @@ cargo test --release --all-features --no-fail-fast   # the guards that ship
 
 # Loom, in CI's exact spelling: ONE --all-features invocation, count
 # asserted. A libtest filter that matches nothing exits 0, so a
-# mistyped --cfg reads as a green lane; the count (ci.yml's MODELS -
-# keep the two in step) is the tripwire. The old three-subset form
-# asserted nothing and measured 3/22/5 models against a lane that ran
-# every one of them.
-.github/workflows/scripts/counted-cargo-test.sh 25 loom -- \
+# mistyped --cfg reads as a green lane; the count is the tripwire. It
+# is read out of ci.yml rather than repeated here, so there is exactly
+# one copy of the number and this block runs as pasted. The old
+# three-subset form asserted nothing and measured 3/22/5 models
+# against a lane that ran every one of them.
+MODELS=$(sed -n 's/^ *MODELS: "\([0-9]*\)"$/\1/p' .github/workflows/ci.yml)
+.github/workflows/scripts/counted-cargo-test.sh "$MODELS" loom -- \
   env RUSTFLAGS="--cfg loom" cargo test --lib --all-features loom_
 
 (cd fuzz && cargo +nightly fuzz build)

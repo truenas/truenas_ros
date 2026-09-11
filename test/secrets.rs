@@ -101,6 +101,27 @@ fn a_forked_child_cannot_read_the_key() {
 
     let pid = fork_now();
     if pid == 0 {
+        // The fault below is the pass condition, so the child is going to
+        // be killed by a signal that dumps core. With the ordinary
+        // `core_pattern` of `core` and `core_uses_pid` set, that writes a
+        // `core.<pid>` the size of the child's address space into
+        // whatever directory `cargo test` was run from - measured at
+        // 6.9 MiB per run, left behind in the source tree. Refuse the
+        // dump rather than produce and ignore it. Lowering `RLIMIT_CORE`
+        // needs no privilege, changes no signal (the child still dies
+        // `SIGSEGV`, which is what the parent asserts), and is a bare
+        // syscall, so it is safe in the post-fork child alongside the
+        // `_exit` below.
+        // SAFETY: a valid rlimit for a limit any process may lower.
+        unsafe {
+            libc::setrlimit(
+                libc::RLIMIT_CORE,
+                &libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                },
+            )
+        };
         // SAFETY: deliberately reading an address this process should not
         // have. Faulting is the pass condition; the parent checks the signal.
         let first = unsafe { std::ptr::read_volatile(addr as *const u8) };

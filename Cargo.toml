@@ -49,8 +49,15 @@ openssl = { version = "0.10", optional = true }
 # src/uring/wake.rs, and the offload pool / completion sink / inject / identity
 # models in src/uring_fs. Pulled ONLY under `--cfg loom`, so normal builds keep
 # the libc+bitflags charter untouched — see src/sync.rs for the std/loom shim.
-#   Run: .github/workflows/scripts/counted-cargo-test.sh "$MODELS" loom -- \
+#   Run: MODELS=$(sed -n 's/^ *MODELS: "\([0-9]*\)"$/\1/p' \
+#                    .github/workflows/ci.yml)
+#        .github/workflows/scripts/counted-cargo-test.sh "$MODELS" loom -- \
 #          env RUSTFLAGS="--cfg loom" cargo test --lib --all-features loom_
+#
+# `$MODELS` is a workflow `env:`, so a command that merely NAMES it does not
+# run outside the workflow: `counted-cargo-test.sh "" ...` exits 2 at
+# `${1:?}`. Read it out of `ci.yml` here instead - one copy of the number,
+# and the line a reader pastes is the line that works.
 #
 # One invocation, and the count is the point: a libtest filter that matches
 # nothing exits 0, so a mistyped `--cfg` reads as a green lane. The
