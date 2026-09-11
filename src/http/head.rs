@@ -494,8 +494,14 @@ impl Head<'_> {
     /// as the tests' oracle asserting the one-pass read agrees.
     #[cfg(test)]
     pub fn keep_alive(&self) -> bool {
+        // `close` decides on both versions: RFC 9112 sec. 9.6 makes it a
+        // receiver obligation regardless of the version default, so a 1.0
+        // request carrying both tokens closes rather than persisting.
+        if has_token(self.views(), "connection", b"close") {
+            return false;
+        }
         match self.version {
-            Version::Http11 => !has_token(self.views(), "connection", b"close"),
+            Version::Http11 => true,
             Version::Http10 => {
                 has_token(self.views(), "connection", b"keep-alive")
             }
@@ -564,10 +570,20 @@ impl Head<'_> {
                 has_te = true;
             }
         }
-        let keep_alive = match self.version {
-            Version::Http11 => !conn_close,
-            Version::Http10 => conn_keep,
-        };
+        // `close` wins on both versions. RFC 9112 sec. 9.6 states it as a
+        // receiver obligation ("a server that receives a close connection
+        // option MUST initiate closure after it sends the final response"),
+        // not as the 1.1 default's negation - so an HTTP/1.0 request
+        // carrying `keep-alive` *and* `close` must close. Reading only
+        // `keep-alive` on 1.0 answered that request `Connection: keep-alive`
+        // and went on serving the socket, which is the two ends disagreeing
+        // about connection reuse - the shape a chain in front desynchronizes
+        // on.
+        let keep_alive = !conn_close
+            && match self.version {
+                Version::Http11 => true,
+                Version::Http10 => conn_keep,
+            };
         (keep_alive, has_cl && has_te)
     }
 }
@@ -1208,6 +1224,9 @@ mod tests {
             b"GET / HTTP/1.0\r\n\r\n",
             b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
             b"GET / HTTP/1.0\r\nConnection: close\r\n\r\n",
+            b"GET / HTTP/1.0\r\nConnection: keep-alive, close\r\n\r\n",
+            b"GET / HTTP/1.0\r\nConnection: close, keep-alive\r\n\r\n",
+            b"GET / HTTP/1.0\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n",
             b"PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
             b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
             b"PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\n",
@@ -1244,6 +1263,34 @@ mod tests {
             b"PUT / HTTP/1.1\r\nHost: h\r\nExpect: ext\r\nExpect: 100-continue\r\nContent-Length: 1\r\n\r\n",
             |second| assert!(second.expects_continue()),
         );
+    }
+
+    /// `Connection: close` closes on **both** versions (RFC 9112 sec. 9.6),
+    /// so a 1.0 request that carries `keep-alive` alongside it does not
+    /// persist. Kept next to the 1.1 twin: the two versions differing on the
+    /// same field value is the bug this pins.
+    #[test]
+    fn close_beats_keep_alive_on_http10_too() {
+        for raw in [
+            &b"GET / HTTP/1.0\r\nConnection: keep-alive, close\r\n\r\n"[..],
+            &b"GET / HTTP/1.0\r\nConnection: close, keep-alive\r\n\r\n"[..],
+            &b"GET / HTTP/1.0\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n"[..],
+        ] {
+            complete(raw, |h| {
+                assert!(!h.keep_alive(), "{raw:?}");
+                assert!(!h.response_disposition().0, "{raw:?}");
+            });
+        }
+        // The 1.1 twin, as the control: it already closed on this input, and
+        // the two must not disagree.
+        complete(
+            b"GET / HTTP/1.1\r\nHost: h\r\nConnection: keep-alive, close\r\n\r\n",
+            |h| assert!(!h.keep_alive()),
+        );
+        // And plain `keep-alive` on 1.0 still persists.
+        complete(b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", |h| {
+            assert!(h.keep_alive())
+        });
     }
 
     #[test]
