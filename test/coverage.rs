@@ -248,9 +248,62 @@ mod fs {
         assert!(st.blksize() > 0);
         assert_eq!(st.mtime().sec, md.mtime());
         assert_eq!(makedev(st.dev_major(), st.dev_minor()), st.dev());
-        // Exercise the remaining accessors / timestamp conversions.
-        let _ = (st.blocks(), st.subvol(), st.mask(), st.attributes());
-        let _ = (st.attributes_mask(), st.raw(), st.btime());
+        // The remaining field accessors, against an oracle rather than
+        // discarded. Each is one raw read off the buffer the kernel
+        // filled, so the failure they have to catch is a field named
+        // wrongly, and driving them under `let _ =` cannot see it:
+        // swapping the bodies of `blocks` and `subvol` and pointing
+        // `attributes_mask` at `stx_attributes` left every target in this
+        // suite green, because nothing anywhere compared their values to
+        // anything. `blocks`, `subvol` and `attributes_mask` are read
+        // here and nowhere else in the tree.
+        //
+        // `st_blocks` is the same 512-byte count `stx_blocks` carries.
+        {
+            use std::os::linux::fs::MetadataExt as _;
+            assert_eq!(st.blocks(), md.st_blocks(), "stx_blocks");
+        }
+        // The fields this test read values out of must be reported filled.
+        // Not `BASIC_STATS`: `ATIME` is in that set and ZFS does not
+        // return it here (measured), so demanding the whole set reddens
+        // for a filesystem answering correctly.
+        assert!(
+            st.mask()
+                .contains(StatxMask::INO | StatxMask::SIZE | StatxMask::BLOCKS),
+            "the kernel did not report the fields this test read: {:?}",
+            st.mask()
+        );
+        // `attributes_mask` is what the filesystem SUPPORTS, a different
+        // word from `attributes`. The VFS sets the automount/mount-root
+        // bits in it for every stat, so it is never empty - while
+        // `attributes` on an ordinary file is zero (measured: attrs 0x0,
+        // mask IMMUTABLE|APPEND|NODUMP|AUTOMOUNT|MOUNT_ROOT|DAX on ZFS).
+        // An `attributes_mask` reading the attributes word is therefore
+        // empty here, which is what this catches.
+        let attrs = st.attributes();
+        let supported = st.attributes_mask();
+        assert!(
+            !supported.is_empty(),
+            "attributes_mask is empty: the attributes word was read instead"
+        );
+        assert_eq!(
+            attrs & supported,
+            attrs,
+            "attributes carries bits the filesystem does not support"
+        );
+        // `SUBVOL` was not requested, so the kernel leaves it zero; the
+        // file has bytes, so its block count does not. That asymmetry is
+        // what distinguishes the two fields without pinning a value.
+        assert!(st.blocks() > 0, "a 7-byte file occupies blocks");
+        assert_eq!(st.subvol(), 0, "SUBVOL was not requested");
+        // `raw` is the buffer the accessors read, not a copy of it.
+        assert_eq!(st.raw().stx_ino, st.ino(), "raw() is not the read buffer");
+        assert_eq!(
+            st.btime().sec,
+            st.raw().stx_btime.tv_sec,
+            "btime() is not stx_btime"
+        );
+        // Timestamp conversions, still driven for their arithmetic.
         let _ = (st.atime().as_secs_f64(), st.ctime().as_nanos());
         assert!(st.mtime().to_system_time().is_some());
     }
@@ -638,29 +691,57 @@ mod mount {
 
     #[test]
     fn fsconfig_variants_reach_the_syscall() {
-        // fsopen needs CAP_SYS_ADMIN; drive fsconfig against a plain fd instead
-        // -- each command fails at the syscall but every match arm is exercised.
+        use truenas_ros::errno::Errno;
+        // fsopen needs CAP_SYS_ADMIN; drive fsconfig against a plain fd
+        // instead -- every match arm is exercised and each one must reach
+        // the syscall, which refuses a descriptor that is not a filesystem
+        // context with `EINVAL` (measured on 6.18.42-production+truenas:
+        // all seven commands answer EINVAL against an `O_DIRECTORY` fd on
+        // `/`).
+        //
+        // The errno is the assertion and not a decoration. `Create` is the
+        // only variant `test/test.rs`'s end-to-end
+        // `fsopen_fsconfig_fsmount_detached_tmpfs` drives, and that test
+        // is root-only; discarding these results left the other six arms
+        // with no assertion anywhere in the tree, so each could stop
+        // issuing its syscall and answer `Ok(())` with every target green.
+        // A short-circuit answers `Ok`, which is what this refuses.
         let f = std::fs::File::open("/").unwrap();
         let fd = f.as_fd();
-        let _ = fsconfig(fd, FsConfig::Flag { key: "ro" });
-        let _ = fsconfig(
-            fd,
-            FsConfig::String {
-                key: "src",
-                value: "x",
-            },
-        );
-        let _ = fsconfig(
-            fd,
-            FsConfig::Binary {
-                key: "k",
-                value: b"v",
-            },
-        );
-        let _ = fsconfig(fd, FsConfig::Fd { key: "fd", fd });
-        let _ = fsconfig(fd, FsConfig::Create);
-        let _ = fsconfig(fd, FsConfig::Reconfigure);
-        let _ = fsconfig(fd, FsConfig::CreateExcl);
+        for (what, got) in [
+            ("Flag", fsconfig(fd, FsConfig::Flag { key: "ro" })),
+            (
+                "String",
+                fsconfig(
+                    fd,
+                    FsConfig::String {
+                        key: "src",
+                        value: "x",
+                    },
+                ),
+            ),
+            (
+                "Binary",
+                fsconfig(
+                    fd,
+                    FsConfig::Binary {
+                        key: "k",
+                        value: b"v",
+                    },
+                ),
+            ),
+            ("Fd", fsconfig(fd, FsConfig::Fd { key: "fd", fd })),
+            ("Create", fsconfig(fd, FsConfig::Create)),
+            ("Reconfigure", fsconfig(fd, FsConfig::Reconfigure)),
+            ("CreateExcl", fsconfig(fd, FsConfig::CreateExcl)),
+        ] {
+            assert_eq!(
+                got,
+                Err(Errno::EINVAL),
+                "fsconfig({what}) on a non-context fd must be refused by \
+                 the kernel, not answered locally"
+            );
+        }
     }
 }
 

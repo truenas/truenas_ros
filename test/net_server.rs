@@ -3261,10 +3261,23 @@ fn tcp_reuse_port_and_options() {
     drop(second);
 
     // Without the flag the same bind fails with EADDRINUSE.
+    //
+    // `Server::bind` is `with_config` with the default config
+    // (`net/server/mod.rs`), so it sets a ring up exactly as the two calls
+    // above do - and answers the same environmental `ENOMEM` for the same
+    // reason. Screened through `should_skip` before the errno is judged,
+    // or that skip becomes `expected EADDRINUSE, got ENOMEM`: a hard
+    // failure naming the wrong syscall, on the one call in this test that
+    // was left unguarded.
     let dup = Server::bind(
         [ServerAddr::Tcp(v4)],
         length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
     );
+    if let Err(e) = &dup
+        && should_skip(e)
+    {
+        return;
+    }
     assert!(
         matches!(dup, Err(Error::Errno(Errno::EADDRINUSE))),
         "expected EADDRINUSE, got {dup:?}"
@@ -7608,6 +7621,134 @@ fn ktls_close_notify_reports_tls_control() {
     assert!(
         !got.contains(&CloseReason::TruncatedMessage),
         "clean TLS close misread as truncation: {got:?}"
+    );
+}
+
+/// A peer's TLS 1.3 KeyUpdate closes the connection as `TlsControl`, and the
+/// request behind it is not answered.
+///
+/// `CloseReason::TlsControl` names this case outright - "a post-handshake
+/// handshake message, TLS 1.3 KeyUpdate, or alert ... renegotiation/rekey are
+/// out of scope" - but only the alert half had a test
+/// (`ktls_close_notify_reports_tls_control`). The two halves reach the same
+/// reason down different paths: an alert completes the parked idle read SHORT
+/// (`on_recv_complete`'s `res > 0 && ktls_control_record` arm), while a
+/// KeyUpdate arrives mid-conversation with a request queued behind it.
+///
+/// Measured, not assumed: this kernel does NOT absorb an RX KeyUpdate on the
+/// server's behalf, so the record does reach the reactor. Pinning that here
+/// means a kernel or policy change that starts handling rekey - or that
+/// reclassifies the record - goes red rather than silently altering what a
+/// long-lived peer sees.
+#[test]
+fn ktls_peer_key_update_closes_as_tls_control() {
+    use foreign_types::ForeignTypeRef;
+    use std::sync::Mutex;
+    // Not bound by the `openssl` crate (nor by `openssl-sys`), so declare the
+    // two libssl entry points this needs.
+    unsafe extern "C" {
+        fn SSL_key_update(
+            ssl: *mut openssl_sys::SSL,
+            updatetype: std::os::raw::c_int,
+        ) -> std::os::raw::c_int;
+        fn SSL_do_handshake(ssl: *mut openssl_sys::SSL) -> std::os::raw::c_int;
+    }
+    const SSL_KEY_UPDATE_NOT_REQUESTED: std::os::raw::c_int = 0;
+
+    if ktls_openssl_unsupported() {
+        return;
+    }
+    let (cert, key) = self_signed();
+    let acceptor = Arc::new(ktls_acceptor(&cert, &key));
+    let reasons = Arc::new(Mutex::new(Vec::new()));
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let proto = length_prefixed(
+        PrefixWidth::U32,
+        Endian::Big,
+        false,
+        |_h: &[u8], body: &[u8], _p: &ClientAddr| Some(echo_frame(body)),
+    );
+    let mut server = match Server::bind(
+        [truenas_ros::net::server::Listen::tls(addr)],
+        proto,
+    ) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    {
+        let acceptor = Arc::clone(&acceptor);
+        server.set_tls_handshake(move |fd, _inc, deferral| {
+            let acceptor = Arc::clone(&acceptor);
+            thread::spawn(move || match ktls_server_handshake(fd, &acceptor) {
+                Ok(()) => deferral.ready(()),
+                Err(_) => deferral.reject(),
+            });
+        });
+    }
+    {
+        let reasons = Arc::clone(&reasons);
+        server.set_close_hook(move |_addr, reason, _state: &mut ()| {
+            reasons.lock().unwrap().push(reason);
+        });
+    }
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let answered = Arc::new(Mutex::new(None::<bool>));
+    let answered2 = Arc::clone(&answered);
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let mut s = tls_connect(v4).expect("tls connect");
+        assert_eq!(
+            s.ssl().version_str(),
+            "TLSv1.3",
+            "KeyUpdate is a TLS 1.3 message"
+        );
+        // The control: the connection serves normally before the rekey, so a
+        // failure after it is the rekey and not the fixture.
+        send_framed(&mut s, b"before-rekey").expect("send 1");
+        assert_eq!(recv_framed(&mut s).expect("recv 1"), b"before-rekey");
+
+        // Post-handshake KeyUpdate, flushed immediately.
+        assert_eq!(
+            unsafe {
+                SSL_key_update(s.ssl().as_ptr(), SSL_KEY_UPDATE_NOT_REQUESTED)
+            },
+            1,
+            "SSL_key_update"
+        );
+        assert_eq!(
+            unsafe { SSL_do_handshake(s.ssl().as_ptr()) },
+            1,
+            "flush the KeyUpdate"
+        );
+
+        // The request behind it rides the new keys. The server has already
+        // closed on the control record, so it is never answered.
+        let _ = send_framed(&mut s, b"after-rekey");
+        *answered2.lock().unwrap() = Some(recv_framed(&mut s).is_ok());
+        thread::sleep(Duration::from_millis(150));
+        stop.shutdown();
+    });
+
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join");
+    let got = reasons.lock().unwrap().clone();
+    assert!(
+        got.contains(&CloseReason::TlsControl),
+        "a peer KeyUpdate must report TlsControl, got {got:?}"
+    );
+    assert!(
+        !got.contains(&CloseReason::TruncatedMessage),
+        "a rekey misread as truncation: {got:?}"
+    );
+    assert_eq!(
+        *answered.lock().unwrap(),
+        Some(false),
+        "the request behind a KeyUpdate is not answered"
     );
 }
 
@@ -12239,6 +12380,7 @@ fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
         }
     }
 }
+
 /// A reply the handler declared final keeps the pump gate shut even when a
 /// body is still streaming ahead of it.
 ///
