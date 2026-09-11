@@ -40,7 +40,6 @@ use crate::sync_fs::{
 use crate::sync_fs::{Mode, StatxMask};
 use std::ffi::{CString, OsStr, OsString};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 // Fixed inode of the ZFS `.zfs` ctldir at a dataset root; used to avoid
@@ -462,7 +461,10 @@ fn copy_one_mount(
                 stats.bytes += n;
             }
             EntryType::Symlink => {
-                make_symlink(parent_dst, entry.name(), entry.fd(), config)?;
+                // `Entry::read_link` is the walk's own reader over the same
+                // `O_PATH` handle - there is no second one here.
+                let target = entry.read_link()?;
+                make_symlink(parent_dst, entry.name(), &target, &st, config)?;
                 stats.symlinks += 1;
             }
             EntryType::Special => {
@@ -719,7 +721,7 @@ fn rename_over(dir: BorrowedFd<'_>, tmp: &OsStr, name: &OsStr) -> Result<()> {
     res.map_err(Into::into)
 }
 
-/// Recreate a symbolic link at `name`, pointing where `src` points.
+/// Recreate a symbolic link at `name`, pointing at `target`.
 ///
 /// With `exist_ok` a taken name is **replaced**, the way [`make_file`]
 /// replaces one: keeping whatever is there leaves a destination whose entry
@@ -727,22 +729,144 @@ fn rename_over(dir: BorrowedFd<'_>, tmp: &OsStr, name: &OsStr) -> Result<()> {
 /// `Ok` and counts the link in its stats. An incremental or re-run copy is
 /// exactly where that shows up, and a name pre-created as a regular file
 /// would survive a symlink source verbatim.
+///
+/// # Ownership and timestamps
+///
+/// A link is the fourth creator, and it carries [`CopyFlags::OWNER`] and
+/// [`CopyFlags::TIMESTAMPS`] like the other three. **Neither is decoration
+/// on a link**: its own uid is what `fs.protected_symlinks`
+/// (`may_follow_link`, `fs/namei.c`) compares against the follower's, and
+/// what a sticky directory's delete rule reads, so a destination whose links
+/// all belong to whoever ran the copy denies and permits differently from
+/// the source it claims to be a copy of. Both are set through an `O_PATH`
+/// pin, which is the only way to name a link without following it - hence
+/// `fchownat`/`utimensat` with `AT_EMPTY_PATH` rather than
+/// [`copy_metadata`]'s `fchown` and [`apply_timestamps`]' `futimens`, both
+/// of which answer `EBADF` on such a handle.
+///
+/// [`CopyFlags::PERMISSIONS`] is not carried, and there is nothing to carry:
+/// a symbolic link's mode is `0o777` on Linux whatever is asked for, and
+/// `fchmodat2` refuses one (measured on ZFS: `EOPNOTSUPP` through an
+/// `O_PATH` handle with `AT_EMPTY_PATH`). [`CopyFlags::XATTRS`] is skipped
+/// for [`make_special`]'s reason - the `f*xattr` family refuses an `O_PATH`
+/// descriptor - and the VFS refuses `user.*` on a link anyway
+/// (`xattr_permission`, `fs/xattr.c`).
 fn make_symlink(
     parent: BorrowedFd<'_>,
     name: &OsStr,
-    src: BorrowedFd<'_>,
+    target: &Path,
+    src_st: &Statx,
     config: &CopyTreeConfig,
 ) -> Result<()> {
-    let target = read_link_fd(src)?;
-    match symlink_at(parent, name, target.as_os_str()) {
-        Ok(()) => Ok(()),
+    let staged = match symlink_at(parent, name, target.as_os_str()) {
+        Ok(()) => None,
         Err(Errno::EEXIST) if config.exist_ok => {
             let tmp = temp_name()?;
             symlink_at(parent, tmp.as_os_str(), target.as_os_str())?;
-            rename_over(parent, tmp.as_os_str(), name)
+            Some(tmp)
         }
-        Err(e) => Err(e.into()),
+        Err(e) => return Err(e.into()),
+    };
+    // Stamp at whatever name the link is under, then move it: a reader sees
+    // the finished link or the entry that was there, never one carrying the
+    // copying identity. `make_special` has the same two-step tail, and every
+    // exit from here on has to take the staging entry with it.
+    let at: &OsStr = staged.as_deref().unwrap_or(name);
+    let outcome = make_symlink_meta(parent, at, name, src_st, config);
+    match (staged, outcome) {
+        (None, r) => r,
+        (Some(tmp), Ok(())) => rename_over(parent, tmp.as_os_str(), name),
+        (Some(tmp), Err(e)) => {
+            let _ = unlink_at(parent, tmp.as_os_str());
+            Err(e)
+        }
     }
+}
+
+/// Set the new link's ownership and timestamps. `name` is the destination
+/// the link is destined for, and is only used to name it in an error.
+fn make_symlink_meta(
+    parent: BorrowedFd<'_>,
+    at: &OsStr,
+    name: &OsStr,
+    src_st: &Statx,
+    config: &CopyTreeConfig,
+) -> Result<()> {
+    if !config
+        .flags
+        .intersects(CopyFlags::OWNER | CopyFlags::TIMESTAMPS)
+    {
+        return Ok(());
+    }
+    // Pin the link and set both attributes through this handle, so the name
+    // resolves exactly once and cannot be redirected between the `symlinkat`
+    // and these calls - `make_special_meta`'s reason, and `O_PATH` is what
+    // opens a symlink without following it.
+    let node = openat2(
+        parent,
+        at,
+        OpenHow::new()
+            .flags(OFlag::O_PATH | OFlag::O_NOFOLLOW)
+            .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
+    )?;
+    let node_st = statx(node.as_fd(), "", AtFlags::AT_EMPTY_PATH, META_MASK)?;
+    if !node_st.is_symlink() || node_st.nlink() != 1 {
+        return Err(Error::Validation(format!(
+            "destination symbolic link {name:?} changed during the copy"
+        )));
+    }
+    // Ownership failures always propagate (matching `copy_metadata`).
+    if config.flags.contains(CopyFlags::OWNER) {
+        retry_on_eintr(|| unsafe {
+            libc::fchownat(
+                node.as_raw_fd(),
+                c"".as_ptr(),
+                src_st.uid(),
+                src_st.gid(),
+                libc::AT_EMPTY_PATH,
+            )
+        })?;
+    }
+    utimes_at(node.as_fd(), src_st, config)
+}
+
+/// Apply `src_st`'s atime/mtime to a node pinned by an `O_PATH` handle.
+///
+/// `utimensat` with `AT_EMPTY_PATH` rather than [`apply_timestamps`]'
+/// `futimens`, which an `O_PATH` descriptor answers `EBADF` (`fdget` masks
+/// `FMODE_PATH`). The two creators with no data descriptor to stamp through
+/// - a special node and a symbolic link - share this one.
+fn utimes_at(
+    node: BorrowedFd<'_>,
+    src_st: &Statx,
+    config: &CopyTreeConfig,
+) -> Result<()> {
+    if !config.flags.contains(CopyFlags::TIMESTAMPS) {
+        return Ok(());
+    }
+    let a = src_st.atime();
+    let m = src_st.mtime();
+    let times = [
+        libc::timespec {
+            tv_sec: a.sec,
+            tv_nsec: a.nsec as i64,
+        },
+        libc::timespec {
+            tv_sec: m.sec,
+            tv_nsec: m.nsec as i64,
+        },
+    ];
+    let r = retry_on_eintr(|| unsafe {
+        libc::utimensat(
+            node.as_raw_fd(),
+            c"".as_ptr(),
+            times.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    })
+    .map(drop)
+    .map_err(Error::from);
+    guard(config, r)
 }
 
 /// `symlinkat`, with the errno surfaced so the caller can act on `EEXIST`.
@@ -932,32 +1056,7 @@ fn make_special_meta(
         let r = ok_if_acl_governed(fchmod_fd(node.as_fd(), perm));
         guard(config, r)?;
     }
-    if config.flags.contains(CopyFlags::TIMESTAMPS) {
-        let a = src_st.atime();
-        let m = src_st.mtime();
-        let times = [
-            libc::timespec {
-                tv_sec: a.sec,
-                tv_nsec: a.nsec as i64,
-            },
-            libc::timespec {
-                tv_sec: m.sec,
-                tv_nsec: m.nsec as i64,
-            },
-        ];
-        let r = retry_on_eintr(|| unsafe {
-            libc::utimensat(
-                node.as_raw_fd(),
-                c"".as_ptr(),
-                times.as_ptr(),
-                libc::AT_EMPTY_PATH,
-            )
-        })
-        .map(drop)
-        .map_err(Error::from);
-        guard(config, r)?;
-    }
-    Ok(())
+    utimes_at(node.as_fd(), src_st, config)
 }
 
 /// The names to consider copying off `fd`, or an empty list where the copy
@@ -1236,23 +1335,6 @@ fn unlink_at(dirfd: BorrowedFd<'_>, name: &OsStr) -> Result<()> {
     Ok(())
 }
 
-fn read_link_fd(fd: BorrowedFd<'_>) -> Result<PathBuf> {
-    let mut buf = vec![0u8; libc::PATH_MAX as usize];
-    let n = retry_on_eintr(|| unsafe {
-        libc::readlinkat(
-            fd.as_raw_fd(),
-            c"".as_ptr(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-        )
-    })? as usize;
-    buf.truncate(n);
-    // A target is typically tens of bytes; do not hand back the PATH_MAX
-    // probe behind it.
-    buf.shrink_to_fit();
-    Ok(PathBuf::from(OsString::from_vec(buf)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1327,6 +1409,107 @@ mod tests {
             copy_metadata(sf.as_fd(), df.as_fd(), &absent, &st, &strict)
                 .is_err(),
             "raise_error must still propagate it"
+        );
+    }
+
+    /// A symbolic link is the fourth creator and carries the metadata flags
+    /// the other three do.
+    ///
+    /// Nothing touched a created link, so `CopyFlags::TIMESTAMPS` and
+    /// `CopyFlags::OWNER` were both silently dropped for one while
+    /// `copytree` answered `Ok` and counted it in `stats.symlinks`. The
+    /// timestamp is the half an unprivileged run can see; ownership needs a
+    /// uid to give the link away to, so it belongs to the QEMU lane
+    /// (measured there: a source link at uid 1234 arrived at uid 0).
+    ///
+    /// The regular file beside it is the control - it always carried the
+    /// stamp - and the source time is far enough in the past that a link
+    /// left at the copy's own clock cannot pass.
+    #[test]
+    fn a_symlink_carries_the_metadata_flags() {
+        fn set_link_time(p: &std::path::Path, sec: i64) {
+            let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes())
+                .expect("a path with no interior NUL");
+            let t = [
+                libc::timespec {
+                    tv_sec: sec,
+                    tv_nsec: 0,
+                },
+                libc::timespec {
+                    tv_sec: sec,
+                    tv_nsec: 0,
+                },
+            ];
+            // SAFETY: a valid NUL-terminated path and a two-timespec array.
+            let r = unsafe {
+                libc::utimensat(
+                    libc::AT_FDCWD,
+                    c.as_ptr(),
+                    t.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            assert_eq!(r, 0, "utimensat: {}", std::io::Error::last_os_error());
+        }
+        fn link_mtime(p: &std::path::Path) -> i64 {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::symlink_metadata(p).expect("lstat").mtime()
+        }
+
+        const OLD: i64 = 978_307_200; // 2001-01-01T00:00:00Z
+        let d = crate::tempdir().expect("tempdir");
+        let src = d.path().join("src");
+        std::fs::create_dir(&src).expect("src");
+        std::fs::write(src.join("target"), b"x").expect("target");
+        std::fs::write(src.join("plain"), b"x").expect("plain");
+        std::os::unix::fs::symlink("target", src.join("link"))
+            .expect("symlink");
+        set_link_time(&src.join("link"), OLD);
+        set_link_time(&src.join("plain"), OLD);
+
+        let dst = d.path().join("dst");
+        copytree(
+            &src,
+            &dst,
+            &CopyTreeConfig {
+                flags: CopyFlags::all(),
+                ..Default::default()
+            },
+        )
+        .expect("copytree");
+
+        assert_eq!(
+            std::fs::read_link(dst.join("link")).expect("read_link"),
+            std::path::Path::new("target"),
+            "the target still travels verbatim"
+        );
+        assert_eq!(
+            link_mtime(&dst.join("plain")),
+            OLD,
+            "the control: a regular file carries the stamp"
+        );
+        assert_eq!(
+            link_mtime(&dst.join("link")),
+            OLD,
+            "a link was left at the copy's own clock"
+        );
+
+        // And with the flag off it is not stamped, so the row above is the
+        // flag doing the work rather than a link inheriting a time.
+        let bare = d.path().join("bare");
+        copytree(
+            &src,
+            &bare,
+            &CopyTreeConfig {
+                flags: CopyFlags::all() - CopyFlags::TIMESTAMPS,
+                ..Default::default()
+            },
+        )
+        .expect("copytree");
+        assert_ne!(
+            link_mtime(&bare.join("link")),
+            OLD,
+            "TIMESTAMPS off must leave the link at the create time"
         );
     }
 
