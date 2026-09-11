@@ -2827,6 +2827,63 @@ mod tests {
         );
     }
 
+    /// A stop already visible to the caller refuses the inject, and refuses
+    /// it without queueing.
+    ///
+    /// This is the *sequential* half of the shutdown screen, and it is not a
+    /// concurrency property at all: with the flag already set,
+    /// [`FsHandle::send`]'s answer is straight-line behaviour of one thread.
+    /// `loom_inject_after_stop_is_refused` races the stop on its own thread
+    /// and asserts only that `send`'s answer and the queue AGREE - which
+    /// stays true with the `stop_requested()` arm of `send` deleted, because
+    /// both halves of that equality are produced by the same path on the same
+    /// thread. Measured at bfc51e2: with that arm removed every one of the 25
+    /// loom models stays green, and the only thing in the tree that notices is
+    /// `teardown_with_inflight_op` in `test/uring_fs.rs`, which DEADLOCKS
+    /// rather than failing. A model cannot hold this property; this can.
+    #[test]
+    fn a_visible_stop_refuses_a_send_without_queueing() {
+        let (tx, rx) = mpsc::channel();
+        let shared = Arc::new(crate::uring::wake::LoopShared {
+            stop: std::sync::atomic::AtomicBool::new(false),
+            graceful: std::sync::atomic::AtomicBool::new(false),
+            grace_ms: std::sync::atomic::AtomicU64::new(0),
+            wake: crate::uring::wake::WakeHandle::new().expect("eventfd"),
+        });
+        // The shipping spelling, so weakening the screen fails this.
+        shared.request_stop();
+        let h = FsHandle {
+            tx,
+            shared,
+            pool: offload_pool::SharedPool::new(OffloadBounds {
+                floor: 1,
+                ceiling: 1,
+            }),
+        };
+
+        // SAFETY: dup(2) returns a fresh owned descriptor or -1; stderr is
+        // always open in a test process.
+        let raw = unsafe { libc::dup(2) };
+        assert!(raw >= 0, "dup(2) failed");
+        // SAFETY: fresh owned fd from dup().
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(raw) });
+
+        let (reply_tx, _reply_rx) = mpsc::channel();
+        let refused = h
+            .send(FsInject::Fsync {
+                pers: 0,
+                file,
+                datasync: false,
+                offset: 0,
+                length: 0,
+                reply: ReplyTo::Sync(reply_tx),
+            })
+            .is_err();
+
+        assert!(refused, "send accepted an inject after stop was set");
+        assert!(rx.try_recv().is_err(), "a refused inject was queued anyway");
+    }
+
     /// The elevation decision is a pure prefix match, so it is testable on any
     /// kernel - unlike the privileged write itself, which needs 6.13 plus root
     /// and therefore only runs in the QEMU job.
