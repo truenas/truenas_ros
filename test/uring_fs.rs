@@ -2644,6 +2644,91 @@ fn query_directory_explicit_large_value() {
     });
 }
 
+/// A listing that lost nothing must not report itself short because some of
+/// its entries have no openable descriptor.
+///
+/// The listing opens each entry `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` to read its
+/// values through, and two ordinary entry types can never satisfy that: a
+/// symbolic link answers `ELOOP` because of `O_NOFOLLOW`, and a socket
+/// answers `ENXIO`. Classing every failed open as an incompleteness flags
+/// `xattrs_incomplete` on a complete listing of a directory containing
+/// nothing unusual - and a consumer that re-queries on the flag re-queries
+/// for ever, because re-opening a symlink can never succeed.
+///
+/// Both types are here on purpose: a definite set of
+/// `EACCES|EPERM|ENOENT|ELOOP` passes the symlink and still flags the
+/// socket, so a test with only a symlink in it reads as green against that
+/// half-fix.
+///
+/// The regular file is the live control - it opens, its value is read, and
+/// it is reported complete - so a blanket "nothing is ever flagged" would
+/// not pass either.
+#[test]
+fn query_directory_does_not_flag_an_entry_it_cannot_open() {
+    use truenas_ros::uring_fs::{
+        EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
+    };
+
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("plain.bin"), b"x").unwrap();
+        std::os::unix::fs::symlink("plain.bin", dir.join("link")).unwrap();
+        let sock = std::os::unix::net::UnixListener::bind(dir.join("sock"))
+            .expect("bind a unix socket in the listing");
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let name = xattr_name("user.probe");
+
+        // The control's value, set through the crate's own op.
+        let set_ok = {
+            let how = OpenHow::new().flags(OFlag::O_RDWR);
+            let f = h.open(me, &anchor, "plain.bin", how).unwrap();
+            let (res, _) = h.fsetxattr(me, &f, &name, b"v".to_vec(), 0);
+            h.close(f).unwrap();
+            fd_xattr_ok("fsetxattr(user.probe)", &res)
+        };
+
+        let opts = QueryOptions {
+            spec: EnrichSpec::XATTR,
+            xattr_names: vec![name.clone()],
+            xattr_ns: XattrNamespaces::empty(),
+            ..Default::default()
+        };
+        let mut q = query_directory(&h, me, &anchor, opts).unwrap();
+        let mut seen: Vec<(String, bool, Option<Vec<u8>>)> = Vec::new();
+        while let Some(batch) = q.next() {
+            for e in batch.unwrap() {
+                seen.push((
+                    e.name.to_string_lossy().into_owned(),
+                    e.xattrs_incomplete,
+                    e.xattrs.first().and_then(|(_, v)| v.clone()),
+                ));
+            }
+        }
+        seen.sort();
+        let names: Vec<&str> = seen.iter().map(|(n, ..)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            ["link", "plain.bin", "sock", "sub"],
+            "the listing must yield every entry it was given"
+        );
+        for (n, incomplete, _) in &seen {
+            assert!(
+                !incomplete,
+                "{n}: a listing that lost nothing reported itself short"
+            );
+        }
+        if set_ok {
+            let plain = seen.iter().find(|(n, ..)| n == "plain.bin").unwrap();
+            assert_eq!(
+                plain.2.as_deref(),
+                Some(b"v".as_slice()),
+                "the control entry's value was not read"
+            );
+        }
+        drop(sock);
+    });
+}
+
 /// An ACL the filesystem does not implement is **absent**, not a listing that
 /// could not be completed.
 ///
