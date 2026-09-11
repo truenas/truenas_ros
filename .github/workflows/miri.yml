@@ -35,13 +35,35 @@ env:
   # Measured at dc95690, one module at a time, with each abort reason
   # recorded rather than inferred:
   #   uring_fs::core, uring_fs::host  - syscall 425 (io_uring_setup)
-  #   uring_fs::broker                - syscall 107
+  #   uring_fs::broker                - syscall 53 (socketpair), at
+  #                                     `broker.rs`'s
+  #                                     `socketpair(AF_UNIX, SEQPACKET)`,
+  #                                     which the module's own diagram
+  #                                     names as its first step
   #   uring::ring                     - mmap with flags other than
   #                                     MAP_PRIVATE|MAP_ANONYMOUS
-  #   uring_fs::query_dir, sync_fs::,
+  #   uring_fs::query_dir::
+  #   copy_range_tests, sync_fs::,
   #   tempdir::                       - foreign fn `mkdtemp`, which is the
   #                                     crate's own `tempdir()` helper
   #   clone3::                        - foreign fn `sigaction`
+  #
+  # **A skip is exactly as wide as its reason.** Two of these were not.
+  #
+  # `query_dir::` took the whole module for a `mkdtemp` only
+  # `copy_range_tests::` performs - the other three test modules there
+  # (`confinement_tests`, `order_tests`, `narrow_tests`) are pure and
+  # miri-eligible, and one of them is the classifier the listing's
+  # incompleteness rules are pinned by. Narrowed to the module that
+  # actually calls it: 96 -> 110 tests, 0 failed, no abort, under both
+  # aliasing models.
+  #
+  # The broker's reason was recorded as syscall 107, which is `geteuid`
+  # (`arch/x86/entry/syscalls/syscall_64.tbl` in the truenas/linux fork)
+  # - a call Miri supports, so it can never have been the wall. That is
+  # not cosmetic: a wrong reason sends the next person narrowing at the
+  # wrong place, which is how the `query_dir::` skip came to be a whole
+  # module too wide.
   #
   # `-Zmiri-disable-isolation` does NOT recover the `mkdtemp` group:
   # `mkdtemp` is unimplemented in Miri, not merely isolated - measured, 0
@@ -57,7 +79,7 @@ env:
     --skip uring_fs::core::
     --skip uring_fs::host::
     --skip uring_fs::broker::
-    --skip uring_fs::query_dir::
+    --skip uring_fs::query_dir::copy_range_tests::
     --skip uring::ring::
     --skip sync_fs::
     --skip tempdir::
@@ -108,11 +130,14 @@ env:
   # no guard and so the first bump since 87 to move the executing
   # count as well as the matched one; 96 the run-queue count's
   # nested-pass regression, ring-gated and so counted rather than
-  # claimed.) If that friction is unwanted,
+  # claimed; 110 is not a new test at all - it is the `query_dir::`
+  # skip narrowed to its actual reason, which admits 14 that were
+  # being skipped for a `mkdtemp` they never call.) If that friction
+  # is unwanted,
   # `-lt` pinned at the TRUE count still catches deletion, which is
   # the failure mode; what it must not be again is a floor far below
   # what runs.
-  MIRI_TESTS: "96"
+  MIRI_TESTS: "110"
 
   # The `http` band, run as its own step under its own feature set.
   # Exact for the same reason, and bumped by the same rule: 32 at the

@@ -1789,8 +1789,13 @@ mod shutil {
             .open(dir.path().join("s"))
             .unwrap();
         let d = std::fs::File::create(dir.path().join("d")).unwrap();
-        if fsetxattr(s.as_fd(), "user.keep", b"v", XattrFlags::empty()).is_err()
+        if let Err(e) =
+            fsetxattr(s.as_fd(), "user.keep", b"v", XattrFlags::empty())
         {
+            // Every assertion below is behind this probe, so the refusal is
+            // held to the same gate as its sibling in `xattr::` rather than
+            // returning silently.
+            super::xattr_probe::refusal_is_allowed("fsetxattr(user.keep)", e);
             return; // user xattrs unsupported here
         }
         // A system/ACL name in the list must be skipped without error.
