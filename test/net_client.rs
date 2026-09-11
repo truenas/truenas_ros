@@ -749,7 +749,15 @@ fn tcp_splice_body() {
         (off, got)
     });
 
+    // Set as the client body's first act, so the assertions below can tell
+    // "io_uring is unavailable, `with_server` never ran the body" from "the
+    // body ran and moved nothing". `off > 0` cannot tell them apart: a splice
+    // aimed at the wrong sink completes, reports `Event::Splice` with the
+    // DECLARED body_len, and leaves this pipe empty.
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ran_in = Arc::clone(&ran);
     with_server(echo, move |v4| {
+        ran_in.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut client = Client::new(ClientConfig::default(), splice_framer())
             .map_err(to_io)?;
         // The sink fd rides in `U`; the framer reads it from there.
@@ -787,8 +795,9 @@ fn tcp_splice_body() {
     unsafe { libc::close(pipe_wr) };
     let (off, got) = reader.join().expect("reader join");
     // On an io_uring skip the client body never ran and nothing was
-    // spliced; only assert the transfer on a real run.
-    if off > 0 {
+    // spliced; on a real run the transfer is the whole point, so assert it
+    // unconditionally.
+    if ran.load(std::sync::atomic::Ordering::SeqCst) {
         assert_eq!(off, BODY, "splice moved {off} of {BODY} body bytes");
         assert_eq!(got, expected, "spliced body mismatch");
     }
@@ -1499,7 +1508,10 @@ fn ktls_splice_body() {
 
     // Skip is decided at the server bind inside `with_ktls_server`; on a skip the
     // client body never runs, so drain the reader (it will time out) below.
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ran_in = Arc::clone(&ran);
     with_ktls_server(move |v4| {
+        ran_in.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut client = ktls_client(splice_framer())?;
         let conn = client.connect_with_state(
             ServerAddr::Tcp(v4),
@@ -1532,9 +1544,11 @@ fn ktls_splice_body() {
     // SAFETY: closing the test-owned write end (read end closed by the reader).
     unsafe { libc::close(pipe_wr) };
     let (off, got) = reader.join().expect("reader join");
-    // On a kTLS skip the client body never ran, so nothing was spliced; only
-    // assert the transfer on a real run (off > 0 means the splice happened).
-    if off > 0 {
+    // On a kTLS skip the client body never ran, so nothing was spliced; on a
+    // real run the transfer is the whole point, so assert it unconditionally.
+    // (`off > 0` does NOT mean the splice happened: one aimed at the wrong
+    // sink completes and reports the declared length with this pipe empty.)
+    if ran.load(std::sync::atomic::Ordering::SeqCst) {
         assert_eq!(off, BODY, "kTLS splice moved {off} of {BODY} body bytes");
         assert_eq!(got, expected, "kTLS spliced body content mismatch");
     }
