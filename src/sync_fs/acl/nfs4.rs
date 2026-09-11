@@ -680,8 +680,7 @@ mod tests {
             if !is_dir || f.contains(F::NO_PROPAGATE_INHERIT) {
                 return (newflags - all_inherit) | F::INHERITED;
             }
-            if f.intersects(F::INHERITABLE)
-                && !f.contains(F::DIRECTORY_INHERIT)
+            if f.intersects(F::INHERITABLE) && !f.contains(F::DIRECTORY_INHERIT)
             {
                 newflags |= F::INHERIT_ONLY;
             } else {

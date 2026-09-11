@@ -44,7 +44,8 @@ use super::offload_pool::{Job, SharedPool};
 use super::{Anchor, File, FsHandle, FsPending, Leaf, Personality};
 use crate::errno::{Errno, retry_on_eintr};
 use crate::sync_fs::xattr::{
-    XATTR_SIZE_MAX, XATTR_SIZE_RETRIES, flistxattr, xattr_retry_cap,
+    XATTR_SIZE_MAX, XATTR_SIZE_RETRIES, flistxattr, is_short_buffer,
+    xattr_retry_cap,
 };
 use crate::sync_fs::{AtFlags, OFlag, OpenHow, Statx, StatxMask};
 use bitflags::bitflags;
@@ -1110,8 +1111,8 @@ fn pending_discovered(p: FsPending) -> DiscRead {
 
 /// Refetch an attribute whose value outgrew its initial buffer: probe the size
 /// and read at that size under `who`, bounded to [`XATTR_SIZE_MAX`]. A value
-/// growing between probe and read yields `ERANGE` (rewritten to `E2BIG` once the
-/// buffer reaches the cap, `fs/xattr.c`), so retry a bounded number of times,
+/// growing between probe and read reports a short buffer, in either of the two
+/// spellings [`is_short_buffer`] names, so retry a bounded number of times,
 /// over-allocating on retry so a steadily growing value converges. `None` if it
 /// became unreadable or exceeds the cap. Mirrors the sync `fgetxattr` retry.
 fn refetch_grow(
@@ -1131,7 +1132,7 @@ fn refetch_grow(
         let (n, buf) = h.fgetxattr(who, f, name, vec![0u8; cap]);
         match n {
             Ok(n) => return narrow(buf, n),
-            Err(crate::Error::Errno(Errno::ERANGE | Errno::E2BIG)) => {
+            Err(crate::Error::Errno(e)) if is_short_buffer(e) => {
                 tries += 1;
                 if tries >= XATTR_SIZE_RETRIES {
                     return None;
