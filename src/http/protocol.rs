@@ -1257,6 +1257,18 @@ where
     H: FnMut(HttpRequest<'_>, &mut U, FsSlot<'_>) -> HttpVerdict,
 {
     cfg.validate()?;
+    // The streaming cap IS the body limit on a streaming connection
+    // (`stream_cap` bounds every body, buffered or not), so a zero there is
+    // the same "admits nothing" configuration `HttpConfig::validate` exists
+    // to refuse: every request carrying a byte of body would be answered 413.
+    // `HttpConfig::validate` cannot see it - the cap is a builder argument,
+    // not a config field - so it is checked here, where both streaming
+    // constructors pass through.
+    if stream_cap == Some(0) {
+        return Err(crate::Error::Validation(
+            "http streaming max_body_bytes must be non-zero".into(),
+        ));
+    }
     // One date cache per protocol instance - instances are per reactor and
     // handlers run on the reactor thread, so the `Date` value renders once
     // a second instead of once a response, with no synchronization.
@@ -1771,6 +1783,43 @@ mod tests {
             conn,
             handler,
         )
+    }
+
+    /// A streaming endpoint whose cap is zero admits no body at all, which
+    /// is the same refusal `HttpConfig::validate` makes for a zero
+    /// `max_head`/`max_body` - and `HttpConfig::validate` cannot see this
+    /// one, because the cap is a builder argument rather than a config field.
+    #[test]
+    fn a_streaming_protocol_rejects_a_zero_body_cap() {
+        assert!(
+            protocol_streaming(
+                cfg(),
+                0,
+                |_: Incoming<'_>| Some(()),
+                |_: HttpRequest<'_>, _: &mut ()| HttpVerdict::Continue,
+            )
+            .is_err(),
+            "a zero streaming cap 413s every body-bearing request"
+        );
+        // The control: a real cap still builds.
+        assert!(
+            protocol_streaming(
+                cfg(),
+                1 << 20,
+                |_: Incoming<'_>| Some(()),
+                |_: HttpRequest<'_>, _: &mut ()| HttpVerdict::Continue,
+            )
+            .is_ok()
+        );
+        // And the non-streaming builders are untouched (`stream_cap: None`).
+        assert!(
+            protocol(
+                cfg(),
+                |_: Incoming<'_>| Some(()),
+                |_: HttpRequest<'_>, _: &mut ()| HttpResponse::new(200),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

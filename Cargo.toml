@@ -278,6 +278,19 @@ path = "test/recv_alloc.rs"
 name = "uring_fs"
 path = "test/uring_fs.rs"
 
+# The layer-0 callback design probe. Registered like its siblings even
+# though it needs no feature: autodiscovery would build it anyway, and that
+# is the trap - an unregistered example has no `required-features` line, so
+# it is compiled by EVERY lane including `--no-default-features`, and the
+# first library call it grows breaks each of them at once. (That already
+# happened once: see the `--all-targets` note on the feature-matrix step in
+# `.github/workflows/ci.yml`.) Its only library use today is
+# `truenas_ros::tempdir()`, which no feature gates; everything else it
+# touches is `std` and `libc`. If it ever reaches into `uring_fs`, this is
+# where `required-features = ["uring-fs"]` goes.
+[[example]]
+name = "fs_callback_layer0"
+
 # Consumer-facing example: the `net::server` handlers (esp. `accept`) as
 # standalone functions. Built only when the `net-server` feature is on.
 [[example]]

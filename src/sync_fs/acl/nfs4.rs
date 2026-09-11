@@ -328,6 +328,20 @@ impl Nfs4Acl {
     /// Produce the ACL a new child object would inherit from this one.
     ///
     /// Errors if no ACE is inheritable for the given child type.
+    ///
+    /// **A correct prediction is not always a writable ACL.** This answers
+    /// what ZFS would create, and ZFS creates ACLs the write path refuses:
+    /// a parent ACE carrying `NO_PROPAGATE_INHERIT` yields a child ACE with
+    /// every inheritance bit stripped, so a child *directory* whose parent
+    /// had no other inheritable ACE gets an ACL with nothing inheritable in
+    /// it - which the structural check [`fsetacl`] runs rejects, exactly as
+    /// it rejects the trivial directory ACL ZFS synthesises from the mode
+    /// bits. A get-parent, predict, set-child caller sees the refusal
+    /// rather than a silently over-propagating grant, which is the safer of
+    /// the two answers and not an obvious one; do not reconcile it by
+    /// widening what this predicts.
+    ///
+    /// [`fsetacl`]: crate::sync_fs::acl::fsetacl
     pub fn generate_inherited_acl(&self, is_dir: bool) -> Result<Self> {
         let aces: Vec<Nfs4Ace> = self
             .aces
@@ -486,7 +500,39 @@ fn ace_is_inheritable(flags: Nfs4Flag, is_dir: bool) -> bool {
     }
 }
 
-/// Rewrite an ACE's flags for a newly-created child (port of the C logic).
+/// Rewrite an ACE's flags for a newly-created child - the second half of
+/// ZFS's inheritance arithmetic, which is what this predicts and therefore
+/// the only definition that counts (`zfs_acl_inherit`,
+/// `module/os/linux/zfs/zfs_acl.c`):
+///
+/// ```text
+/// zfs_set_ace(aclp, acep, access_mask, type, who, iflags|ACE_INHERITED_ACE);
+/// newflags = aclp->z_ops->ace_flags_get(acep);
+///
+/// if (!isdir || (iflags & ACE_NO_PROPAGATE_INHERIT_ACE)) {
+///         newflags &= ~ALL_INHERIT;
+///         ace_flags_set(acep, newflags|ACE_INHERITED_ACE);
+///         continue;
+/// }
+/// if ((iflags & (ACE_FILE_INHERIT_ACE|ACE_DIRECTORY_INHERIT_ACE)) ==
+///     ACE_FILE_INHERIT_ACE)
+///         newflags |= ACE_INHERIT_ONLY_ACE;
+/// else
+///         newflags &= ~ACE_INHERIT_ONLY_ACE;
+/// ace_flags_set(acep, newflags|ACE_INHERITED_ACE);
+/// ```
+///
+/// `ALL_INHERIT` is all four inheritance bits plus `INHERITED`
+/// (`zfs_acl.c:86`), so the first branch leaves a child ACE that is not
+/// inheritable any further - which is the whole meaning of
+/// `NO_PROPAGATE_INHERIT`. Both of the non-propagating cases - a child file,
+/// and a child directory whose parent ACE says stop - take it, which is why
+/// they are one arm here rather than two.
+///
+/// The `(iflags & (FILE|DIRECTORY)) == FILE` test reduces to "no
+/// `DIRECTORY_INHERIT`" for anything that reaches this function, since
+/// [`ace_is_inheritable`] admits a child directory only when one of the two
+/// bits is set.
 fn inherited_flags(f: Nfs4Flag, is_dir: bool) -> Nfs4Flag {
     use Nfs4Flag as F;
     if is_dir && !f.contains(F::NO_PROPAGATE_INHERIT) {
@@ -494,12 +540,6 @@ fn inherited_flags(f: Nfs4Flag, is_dir: bool) -> Nfs4Flag {
             (f - F::INHERIT_ONLY) | F::INHERITED
         } else {
             (f | F::INHERIT_ONLY) | F::INHERITED
-        }
-    } else if is_dir {
-        if f.contains(F::INHERIT_ONLY) && f.contains(F::FILE_INHERIT) {
-            (f - F::INHERIT_ONLY) | F::INHERITED
-        } else {
-            (f - F::INHERIT_MASK) | F::INHERITED
         }
     } else {
         (f - F::INHERIT_MASK) | F::INHERITED
@@ -617,6 +657,114 @@ mod tests {
             acl.generate_inherited_acl(false).is_ok(),
             "a child file does inherit it"
         );
+    }
+
+    /// The *flags* half of the same prediction, which the sweep above does
+    /// not reach: it compares `ace_is_inheritable` only, so an ACE that ZFS
+    /// and this crate agree a child receives can still arrive carrying
+    /// different flags.
+    ///
+    /// The row that disagreed is a child **directory** whose parent ACE
+    /// carries `NO_PROPAGATE_INHERIT` alongside `INHERIT_ONLY` and
+    /// `FILE_INHERIT`: ZFS strips every inheritance bit, and keeping them
+    /// hands the grandchildren a grant the parent ACE said to stop at one
+    /// level - and `validate` admits the result, so it is writable.
+    #[test]
+    fn inherited_flags_match_zfs_acl_inherit() {
+        use Nfs4Flag as F;
+        // ALL_INHERIT, transcribed from zfs_acl.c:86.
+        let all_inherit = F::INHERIT_MASK | F::INHERITED;
+        // The flag rewrite in zfs_acl_inherit(), transcribed.
+        let zfs = |f: F, is_dir: bool| -> F {
+            let mut newflags = f | F::INHERITED;
+            if !is_dir || f.contains(F::NO_PROPAGATE_INHERIT) {
+                return (newflags - all_inherit) | F::INHERITED;
+            }
+            if f.intersects(F::INHERITABLE) && !f.contains(F::DIRECTORY_INHERIT)
+            {
+                newflags |= F::INHERIT_ONLY;
+            } else {
+                newflags -= F::INHERIT_ONLY;
+            }
+            newflags | F::INHERITED
+        };
+        let mut reached = 0;
+        for bits in 0u32..16 {
+            let f = F::from_bits_truncate(bits) & F::INHERIT_MASK;
+            for is_dir in [false, true] {
+                if !ace_is_inheritable(f, is_dir) {
+                    continue;
+                }
+                reached += 1;
+                assert_eq!(
+                    inherited_flags(f, is_dir),
+                    zfs(f, is_dir),
+                    "flags {f:?} is_dir={is_dir}"
+                );
+            }
+        }
+        assert_eq!(reached, 18, "every inheriting row has to be compared");
+
+        // The row itself, through the public entry point, spelled out so a
+        // rewrite that keeps both sides in step still has to face it.
+        let stop = F::FILE_INHERIT
+            | F::DIRECTORY_INHERIT
+            | F::NO_PROPAGATE_INHERIT
+            | F::INHERIT_ONLY;
+        let mut acl = named_user(1000);
+        acl.acl_flags = Nfs4AclFlag::ACL_IS_DIR;
+        acl.aces[0].ace_flags = stop;
+        acl.validate(true).expect("validate admits this shape");
+        let child = acl
+            .generate_inherited_acl(true)
+            .expect("a child directory does inherit it");
+        assert_eq!(
+            child.aces[0].ace_flags,
+            F::INHERITED,
+            "NO_PROPAGATE_INHERIT means the child ACE inherits no further"
+        );
+    }
+
+    /// The prediction is ZFS's, and `validate` is stricter than ZFS, so the
+    /// two can disagree - pinned here so the disagreement is a decision
+    /// rather than a surprise.
+    ///
+    /// A parent ACE flagged `FILE|DIRECTORY|NO_PROPAGATE|INHERIT_ONLY` hands
+    /// a child directory an ACE with every inheritance bit gone, which is
+    /// what `zfs_acl_inherit` does and what the filesystem then stores.
+    /// `validate(true)` refuses that ACL for having nothing inheritable in
+    /// it - the same rule that refuses the trivial directory ACL ZFS
+    /// synthesises. So a caller that predicts and writes gets a named
+    /// refusal where it used to get `Ok` and an ACE the grandchildren
+    /// inherit.
+    ///
+    /// The child *file* form is unaffected and still writes.
+    #[test]
+    fn a_no_propagate_prediction_is_correct_and_unwritable() {
+        use Nfs4Flag as F;
+        let stop = F::FILE_INHERIT
+            | F::DIRECTORY_INHERIT
+            | F::NO_PROPAGATE_INHERIT
+            | F::INHERIT_ONLY;
+        let mut acl = named_user(1000);
+        acl.acl_flags = Nfs4AclFlag::ACL_IS_DIR;
+        acl.aces[0].ace_flags = stop;
+
+        let child = acl.generate_inherited_acl(true).expect("inherits");
+        assert_eq!(child.aces[0].ace_flags, F::INHERITED, "ZFS's answer");
+        let e = child
+            .validate(true)
+            .expect_err("an ACL with nothing inheritable is refused");
+        assert!(
+            matches!(&e, Error::Validation(m) if m.contains("FILE_INHERIT")),
+            "the refusal has to name the rule: {e}"
+        );
+
+        // A child file takes the same stripped flags and validates, so the
+        // refusal above is the directory rule and not the strip.
+        let child = acl.generate_inherited_acl(false).expect("inherits");
+        assert_eq!(child.aces[0].ace_flags, F::INHERITED);
+        child.validate(false).expect("a child file ACL is writable");
     }
 
     /// ZFS masks SUCCESSFUL_ACCESS/FAILED_ACCESS out of the ACE flags it

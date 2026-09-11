@@ -14,7 +14,11 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: true
+  # As in `ci.yml` and `miri.yml`: a PR supersedes itself, a push to master
+  # must not. This lane is the only one that runs the privileged and
+  # ZFS-backed families, so a merged commit whose QEMU run was cancelled has
+  # no coverage of them at all.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Bump IMAGE_VERSION to bust the cached Debian cloud image (e.g. when it has
 # drifted). The TrueNAS kernel and OpenZFS debs are downloaded fresh from their

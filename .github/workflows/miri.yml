@@ -119,8 +119,18 @@ env:
   # step's measurement, 33 with the streaming-protocol connection
   # bound added beside the codec, 35 with the two stage-contract tests
   # (a streaming connection's `Whole` deliveries, and an `End` park
-  # redriven as itself) - both pure dispatch, so both execute here.
-  MIRI_HTTP_TESTS: "35"
+  # redriven as itself) - both pure dispatch, so both execute here; 36
+  # with the streaming builder's zero-cap refusal, likewise pure
+  # construction.
+  #
+  # The filter is `http::protocol::`, not `http::`, so most of the codec
+  # is outside this number: tests added under `http::chunked`,
+  # `http::response`, `http::framer` or `http::head` do not move it and
+  # are not covered by it. Four landed beside that zero-cap one and the
+  # count went up by one - if a band over the whole codec is wanted, it
+  # is a new step with its own measured count, not a wider filter on
+  # this one.
+  MIRI_HTTP_TESTS: "36"
 
 jobs:
   miri:

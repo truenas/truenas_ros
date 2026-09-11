@@ -1393,9 +1393,40 @@ impl<U> Connection<U> {
 
     /// Hand the recv buffer back once nothing is buffered, so the next read
     /// acquires afresh and an idle connection holds none.
+    ///
+    /// **Refused while a recv is in flight**, exactly as
+    /// [`Connection::take_placed_body`] is and for the same reason:
+    /// [`recv_ptr`](Connection::recv_ptr) handed the kernel a raw pointer
+    /// into whichever storage this holds - a pool buffer's `claim.ptr` when
+    /// one is claimed, `owned`'s allocation when a promote left one - under
+    /// the contract stated there, *"Stable until the CQE: neither `buf` nor
+    /// `body_buf` is touched while `recving`"*. Releasing a claim reposts
+    /// its descriptor for the kernel to hand to some other connection's
+    /// read - or frees the buffer outright, since `BufRing::release` is
+    /// where a shrinking pool gives storage up - while this connection's
+    /// recv still writes into it.
+    ///
+    /// [`RecvBuf::release`]'s `filled > 0` is not that check. Both partial
+    /// paths advance `recv_at` and deliberately leave `filled` alone
+    /// (`recv_result`'s kTLS arm, and
+    /// [`advance_exact_partial`](Connection::advance_exact_partial) for a
+    /// plain-TCP read its request clock cut short), and a spliced body
+    /// consumes its header without releasing the claim - so across those
+    /// whole windows the connection holds a claim, has a recv armed into it,
+    /// and reports `filled == 0`.
+    ///
+    /// A wire-driven delivery cannot reach this state: `on_recv_complete`
+    /// clears `recving` before it can answer `RecvStep::Deliver`, and
+    /// `pump_gate` stops on the flag. What this stops is the redelivery
+    /// route, which reaches `deliver_one` from `drain_injections` directly
+    /// and past neither. The buffer is not stranded: the completing recv
+    /// re-enters the pump, and the next delivery releases it.
     pub(crate) fn release_recv_buf(
         &mut self,
     ) -> (Option<RecvClaim>, Option<(Vec<u8>, usize)>) {
+        if self.recving {
+            return (None, None);
+        }
         self.recv_buf.release()
     }
 
@@ -2875,6 +2906,63 @@ mod tests {
         rb.drain_front(4);
         assert!(!rb.write_leased.get(), "the lease flag must be cleared");
         assert_eq!(rb.len(), 8, "and nothing drained from a buffer it lacks");
+    }
+
+    /// A delivery must not hand a lent pool buffer back while a recv is
+    /// still writing into it.
+    ///
+    /// `deliver_one` ends every delivery with `consume()` then
+    /// `release_recv_buffer(slot)`, unconditionally, and a *redelivery*
+    /// reaches it from `drain_injections` rather than through `pump_gate` --
+    /// so the `!recving` test the wire path relies on is not in the way.
+    /// A redelivery's frame is zeroed, so its `consume` drains nothing and
+    /// `filled` stays where the armed read left it.
+    ///
+    /// `filled == 0` under an armed read is not exotic: a spliced body
+    /// consumes its header without releasing the claim, and both partial
+    /// paths (`recv_result`'s kTLS arm, `advance_exact_partial`) advance
+    /// `recv_at` and leave `filled` alone by design. Released there, the
+    /// descriptor is reposted for the kernel to hand to another
+    /// connection (or the buffer freed, if the pool is shrinking) with
+    /// this connection's DMA still aimed at it.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_delivery_does_not_release_a_buffer_under_an_armed_recv() {
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        c.set_recv_pooled();
+        let buf = Box::leak(vec![0u8; 64].into_boxed_slice());
+        c.install_recv_buf(RecvClaim {
+            bid: 7,
+            ptr: buf.as_mut_ptr(),
+            cap: 64,
+        });
+        // The state a spliced body's consume leaves: claim held, nothing
+        // in it. The pump then arms the next read into that same buffer.
+        assert_eq!(c.buffered(), 0);
+        assert_eq!(c.arm_recv(32, false), 32);
+        c.recving = true;
+        let ptr_armed = c.recv_ptr();
+        assert_eq!(
+            ptr_armed,
+            buf.as_mut_ptr() as u64,
+            "the kernel was handed the claim's own storage"
+        );
+
+        let (claim, surplus) = c.release_recv_buf();
+        assert!(
+            claim.is_none() && surplus.is_none(),
+            "the buffer went back to the pool under a live recv"
+        );
+
+        // The control: once the recv completes it is released as before,
+        // so the guard is a `recving` rule and not a blanket refusal.
+        c.recving = false;
+        let (claim, _) = c.release_recv_buf();
+        assert_eq!(
+            claim.map(|c| c.bid),
+            Some(7),
+            "a quiet connection still gives its buffer up"
+        );
     }
 
     /// A promote that copies nothing still has to leave the connection

@@ -62,6 +62,35 @@ pub(crate) fn xattr_retry_cap(size: usize, tries: u32) -> usize {
     }
 }
 
+/// Whether an `fgetxattr` errno means "your buffer was too small", which
+/// the kernel spells two ways.
+///
+/// `do_getxattr` (`fs/xattr.c:852-857`) ends by rewriting the filesystem's
+/// `-ERANGE` to `-E2BIG` whenever the *caller's* buffer is at or above the
+/// kernel's own `XATTR_SIZE_MAX`:
+///
+/// ```text
+/// } else if (error == -ERANGE && ctx->size >= XATTR_SIZE_MAX) {
+///         error = -E2BIG;
+/// ```
+///
+/// That constant is 65536 (`uapi/linux/limits.h:16`) and the rewrite carries
+/// no `IS_LARGE_XATTR` guard, even though the size clamp directly above it
+/// does - so on a filesystem whose values may legitimately reach
+/// `XATTR_LARGE_SIZE_MAX` (2 MiB, `limits.h:18`, which is what
+/// [`XATTR_SIZE_MAX`] here follows) a retry buffer big enough for a large
+/// value is exactly the buffer whose short read is reported as `E2BIG`.
+/// Measured on a ZFS dataset against a 204800-byte value: buffer 4096 and
+/// 65535 answer `ERANGE`, 65536 and 65537 answer `E2BIG`, 204800 answers
+/// `Ok(204800)`.
+///
+/// Both retry loops screen the *probed* length against [`XATTR_SIZE_MAX`],
+/// so a value genuinely past the cap is still refused `E2BIG` - by the
+/// probe, not by this.
+pub(crate) fn is_short_buffer(e: Errno) -> bool {
+    matches!(e, Errno::ERANGE | Errno::E2BIG)
+}
+
 /// First-read buffer: values at or under this cost ONE syscall, no size
 /// probe. The same policy as the async sibling's `DISCOVER_BUF`
 /// (`uring_fs/query_dir.rs`), and the same size; probing first costs a
@@ -101,7 +130,7 @@ fn fgetxattr_cstr(raw: RawFd, name: &CStr) -> errno::Result<Vec<u8>> {
                 }
                 return Ok(buf);
             }
-            Err(Errno::ERANGE) => {
+            Err(e) if is_short_buffer(e) => {
                 tries += 1;
                 if tries >= XATTR_SIZE_RETRIES {
                     return Err(Errno::ERANGE);
@@ -174,6 +203,14 @@ pub fn flistxattr<Fd: AsFd>(fd: Fd) -> errno::Result<Vec<CString>> {
         });
         match res {
             Ok(n) => break n as usize,
+            // `ERANGE` alone, unlike the value reads' [`is_short_buffer`]:
+            // `listxattr` (`fs/xattr.c:988-991`) runs the same
+            // `ERANGE -> E2BIG` rewrite, but against `XATTR_LIST_MAX`, and
+            // that constant really is 64 KiB on both sides
+            // (`uapi/linux/limits.h:17`). So the rewrite fires exactly when
+            // this loop has already grown to its ceiling and is about to
+            // answer `E2BIG` itself - both routes end at the same errno,
+            // and there is nothing to widen.
             Err(Errno::ERANGE) => {
                 if buf.len() >= XATTR_LIST_MAX {
                     return Err(Errno::E2BIG);
@@ -190,4 +227,36 @@ pub fn flistxattr<Fd: AsFd>(fd: Fd) -> errno::Result<Vec<CString>> {
         .filter(|s| !s.is_empty())
         .filter_map(|s| CString::new(s).ok())
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The retry loops enter on "the buffer was too small" and on nothing
+    /// else, and the kernel spells that two ways - see [`is_short_buffer`].
+    ///
+    /// The membership matters in both directions. Drop `E2BIG` and a value
+    /// past ~43 KiB that grows under the reader hands the caller `E2BIG`,
+    /// which this module's own rustdoc defines as "exceeds
+    /// [`XATTR_SIZE_MAX`]" - so a 400 KiB attribute reads as oversized and
+    /// is dropped. Widen it to every errno and an absent attribute
+    /// (`ENODATA`) or an unreadable one (`EACCES`) costs a size probe and
+    /// three more reads before failing anyway.
+    #[test]
+    fn a_short_buffer_is_the_only_retry_signal() {
+        for e in [Errno::ERANGE, Errno::E2BIG] {
+            assert!(is_short_buffer(e), "{e} must re-probe and retry");
+        }
+        for e in [
+            Errno::ENODATA,
+            Errno::EACCES,
+            Errno::EPERM,
+            Errno::EOPNOTSUPP,
+            Errno::EINTR,
+            Errno::EIO,
+        ] {
+            assert!(!is_short_buffer(e), "{e} is not a sizing failure");
+        }
+    }
 }

@@ -707,7 +707,13 @@ pub(crate) fn frame<U>(
 fn known_step<U>(buf: &[u8], conn: &mut HttpConn<U>) -> Framing {
     let Phase::StreamKnown { remaining, .. } = &conn.phase else {
         // Caller invariant; nothing about the request is knowable here.
-        return fail(&mut conn.phase, 0, 500, false);
+        // `buf.len()`, not 0, for the same reason every other degrade arm
+        // passes it: `fail` promises to deliver what is buffered so the glue
+        // runs once more and sends the 500 farewell, and a `Complete { 0, 0 }`
+        // is not a message the reactor will deliver - `frame_step` answers a
+        // zero-length one with `CloseReason::Malformed`, a raw close with no
+        // HTTP response at all. The phase would be set and never read.
+        return fail(&mut conn.phase, buf.len(), 500, false);
     };
     let remaining = *remaining;
     if remaining == 0 {
@@ -881,6 +887,46 @@ mod tests {
 
     fn cfg() -> HttpConfig {
         HttpConfig::default()
+    }
+
+    /// Every degrade arm must deliver a message the reactor will actually
+    /// hand back, or the 500 farewell it just armed never goes out.
+    /// `frame_step` closes a zero-length `Complete` as `Malformed` - a raw
+    /// close with no HTTP response - so an arm that answers `Complete { 0, 0 }`
+    /// has silently swapped the promised farewell for a slam.
+    #[test]
+    fn a_degrade_arm_delivers_something_to_farewell_with() {
+        let cfg = cfg();
+        let buf = b"some bytes already in the buffer";
+        // Each of the four helpers reached with the wrong phase installed.
+        let mut c = conn();
+        c.phase = Phase::Head;
+        assert_ne!(
+            known_step(buf, &mut c),
+            Framing::Complete {
+                header_len: 0,
+                body_len: 0
+            },
+            "known_step's degrade arm answers an undeliverable message"
+        );
+        let mut c = conn();
+        c.phase = Phase::Head;
+        assert_ne!(
+            stream_step(buf, &mut c),
+            Framing::Complete {
+                header_len: 0,
+                body_len: 0
+            }
+        );
+        let mut c = conn();
+        c.phase = Phase::Head;
+        assert_ne!(
+            scan_step(buf, &mut c, &cfg),
+            Framing::Complete {
+                header_len: 0,
+                body_len: 0
+            }
+        );
     }
 
     #[test]

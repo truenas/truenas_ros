@@ -162,11 +162,27 @@ fn split_trailer(line: &[u8]) -> Option<(&[u8], &[u8])> {
 /// and trailers into letting a trailer rewrite framing or auth after the
 /// body - so a well-formed line bearing one is consumed and dropped, never
 /// surfaced.
-const FORBIDDEN_TRAILERS: [&str; 5] = [
+///
+/// **Three of the six clauses sec. 6.5.1 names, and the doc on
+/// [`HttpRequest::trailers`](crate::http::HttpRequest::trailers) says which
+/// three.** The request modifiers, the response control data and the
+/// payload-processing fields ride through: a consumer that merges the two
+/// sections still sees an `If-Match` or a `Content-Type` arriving after the
+/// body. That is an incomplete list rather than a broken promise, and
+/// widening it changes what consumers are handed - but *credentials* is a
+/// clause this claims outright, so every field in it belongs here.
+const FORBIDDEN_TRAILERS: [&str; 6] = [
+    // Message framing.
     "transfer-encoding",
     "content-length",
+    // Routing.
     "host",
+    // Credentials. RFC 9110 sec. 6.5.1 names the authentication fields as a
+    // clause, not as a list of one: a proxy credential arriving after the
+    // body is the same rewrite as an origin one, and SigV4 signs the head
+    // block rather than this section.
     "authorization",
+    "proxy-authorization",
     "cookie",
 ];
 
@@ -603,6 +619,7 @@ mod tests {
             Transfer-Encoding: chunked\r\n\
             HOST: evil\r\n\
             Authorization: Basic abc\r\n\
+            Proxy-Authorization: Basic def\r\n\
             Cookie: sid=1\r\n\
             x-amz-checksum-crc32: ok==\r\n\r\n";
         let (entity, trailers) = decode(wire).expect("decodes");

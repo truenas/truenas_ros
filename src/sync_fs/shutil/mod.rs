@@ -223,7 +223,16 @@ pub fn copytree_reporting(
     // so group/other are never granted access to the files being written before
     // the copy completes. Owner keeps write, so children stay creatable even
     // when the source root is not owner-writable.
-    mkdir_at(dst_parent_fd.as_fd(), dst_name, 0o700, config.exist_ok)?;
+    //
+    // Without `CopyFlags::PERMISSIONS` there is no later mode to apply, so
+    // the hold has nothing to be released into and the umask's answer is
+    // the final one from the start - see [`creation_mode`].
+    let created = mkdir_at(
+        dst_parent_fd.as_fd(),
+        dst_name,
+        creation_mode(config, true),
+        config.exist_ok,
+    )?;
     let dst_root = openat2(
         dst_parent_fd.as_fd(),
         dst_name,
@@ -235,31 +244,53 @@ pub fn copytree_reporting(
     // -- applied to the primary pass and every traversed child mount.
     let dst_self_st =
         statx(dst_root.as_fd(), "", AtFlags::AT_EMPTY_PATH, META_MASK)?;
-    // `mkdir_at` sets the mode only for a root it creates; with `exist_ok` it
-    // swallows EEXIST, so a pre-existing root keeps whatever mode it had.
-    // Narrow it when that mode grants group or other access, which is what
-    // makes the 0o700 hold above true of an existing root too. Where an ACL
-    // governs the mode (ZFS aclmode=restricted) the chmod is rejected; there
-    // the ACL is authoritative for visibility, so proceed rather than refuse.
+    // The root's mode can grant group or other two ways, and they are not
+    // the same question.
     //
-    // A group-or-other bit is also how a *borrowed* root is recognised: one
-    // this copy created is 0o700 at most, since umask can only narrow it. A
-    // borrowed root's mode has to go back, and the walk itself puts one
-    // back on exactly one condition: `finish_dir` -> `copy_metadata` ->
-    // `copy_permissions` stamps the *source* root's mode, under
-    // `CopyFlags::PERMISSIONS` and from the root frame, which is reached
-    // only after the walk completes. So both a `?` on the way out and a
-    // clean finish without that flag leave a directory this copy did not
-    // create at 0o700 - locking every non-owner identity out of a share or
-    // system-dataset migration, with the original recorded nowhere for the
-    // caller to put back and nothing in the result saying so. Both are
-    // restored below.
+    // With `exist_ok` a pre-existing root keeps whatever mode it had - a
+    // **borrowed** root, which `mkdir_at` now reports directly rather than
+    // having it inferred. And a root this copy *created* can come back
+    // broader than the mode it asked for: with an inheritable ACE on the
+    // destination's parent, `zfs_acl_ids_create` hands the new directory
+    // the inherited ACL and then recomputes its mode from it -
+    // `zfs_mode_compute` (`module/os/linux/zfs/zfs_acl.c`) keeps only
+    // `S_IFMT|S_ISUID|S_ISGID|S_ISVTX` of what was asked for and rebuilds
+    // every rwx bit out of the ACEs. Under `aclmode=restricted` the
+    // requested mode is not consulted at all: `zfs_acl_inherit` clears
+    // `need_chmod` whenever anything was inherited, so `zfs_acl_chmod`
+    // never folds it in.
+    //
+    // **Narrowing is for the duration, so it is only correct where a later
+    // mode is coming to release it into.** Two things can be that mode:
+    // `copy_permissions` stamping the source root's, under
+    // `CopyFlags::PERMISSIONS` and from the root frame when the walk
+    // completes; or the borrowed root's own, put back below. With neither -
+    // a created root and no `PERMISSIONS` - a narrowing would be the final
+    // mode, which is the whole defect [`creation_mode`] exists to close.
+    //
+    // Where an ACL governs the mode (ZFS `aclmode=restricted`) the chmod is
+    // rejected `EPERM`; there the ACL is authoritative for visibility, so
+    // proceed rather than refuse.
+    //
+    // Only a borrowed root's mode has to go back, and nothing else puts it
+    // there: a `?` on the way out, and a clean finish without `PERMISSIONS`,
+    // would both leave a directory this copy did not create at 0o700 --
+    // locking every non-owner identity out of a share or system-dataset
+    // migration, with the original recorded nowhere for the caller to put
+    // back and nothing in the result saying so. Both are restored below.
     let mut borrowed = None;
-    if dst_self_st.mode() & 0o077 != 0 {
+    let grants_others = dst_self_st.mode() & 0o077 != 0;
+    if grants_others && !created {
         borrowed = Some((
             crate::fd::dup_cloexec(dst_root.as_fd())?,
             (dst_self_st.mode() & 0o7777) as libc::mode_t,
         ));
+    }
+    if narrows_the_root(
+        grants_others,
+        created,
+        config.flags.contains(CopyFlags::PERMISSIONS),
+    ) {
         ok_if_acl_governed(fchmod_fd(dst_root.as_fd(), 0o700))?;
     }
 
@@ -550,8 +581,10 @@ fn make_dir(
     config: &CopyTreeConfig,
 ) -> Result<OwnedFd> {
     // Created owner-only (0o700), as the destination root is; the source's
-    // mode is applied by `finish_dir` on ascent, once the contents have landed.
-    mkdir_at(parent, name, 0o700, config.exist_ok)?;
+    // mode is applied by `finish_dir` on ascent, once the contents have
+    // landed - or, with no source mode coming, at the umask's answer
+    // outright. [`creation_mode`] has the whole rule.
+    mkdir_at(parent, name, creation_mode(config, true), config.exist_ok)?;
     Ok(openat2(
         parent,
         name,
@@ -573,12 +606,14 @@ fn make_file(
     // created rather than one already at the name. With `exist_ok` an existing
     // entry is replaced by filling a fresh inode under a temporary name and
     // renaming it into place below, not opened and truncated.
-    // Created owner-private (0o600) until copy_permissions sets the real mode.
+    // Created owner-private (0o600) until copy_permissions sets the real
+    // mode - or, with no real mode coming, at the umask's answer outright.
+    // [`creation_mode`] has the whole rule.
     let how = OpenHow::new()
         .flags(
             OFlag::O_RDWR | OFlag::O_NOFOLLOW | OFlag::O_CREAT | OFlag::O_EXCL,
         )
-        .mode(Mode::from_bits_truncate(0o600))
+        .mode(Mode::from_bits_truncate(creation_mode(config, false)))
         .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS);
     let (dfd, tmp_name) = match openat2(parent, name, how) {
         Ok(fd) => (fd, None),
@@ -641,20 +676,13 @@ fn create_temp(
 
 /// A fresh staging name, for the three creators that replace a taken
 /// destination by building beside it and renaming over.
+///
+/// One generator, shared with `atomic_write`'s, which had the same job and
+/// not the same length rule: the `NAME_MAX` reasoning [`create_temp`] states
+/// travels with the name now instead of being restated beside one of the two
+/// call sites.
 fn temp_name() -> Result<OsString> {
-    let mut rand = [0u8; 16];
-    // getrandom fully fills any request of <= 256 bytes (flags 0), so on success
-    // the whole buffer is populated; only the error case needs handling.
-    retry_on_eintr(|| unsafe {
-        libc::getrandom(rand.as_mut_ptr().cast(), rand.len(), 0)
-    })?;
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut name = String::from(".copytree.tmp.");
-    for b in rand {
-        name.push(char::from(HEX[(b >> 4) as usize]));
-        name.push(char::from(HEX[(b & 0x0f) as usize]));
-    }
-    Ok(OsString::from(name))
+    crate::sync_fs::atomic::staging_name(".copytree.tmp.")
 }
 
 /// Move `tmp` onto `name` in `dir`, unlinking the staging entry if the
@@ -995,21 +1023,113 @@ fn guard(config: &CopyTreeConfig, r: Result<()>) -> Result<()> {
     }
 }
 
+/// `true` when this call created the directory, `false` when `exist_ok`
+/// adopted one already at the name. The distinction is what tells a root
+/// this copy owns from one it borrowed, which decides whether its mode is
+/// this copy's to set or someone else's to have back.
 fn mkdir_at(
     dirfd: BorrowedFd<'_>,
     name: &OsStr,
     mode: libc::mode_t,
     exist_ok: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let res = name.with_tn_path(|c| {
         retry_on_eintr(|| unsafe {
             libc::mkdirat(dirfd.as_raw_fd(), c.as_ptr(), mode)
         })
     })?;
     match res {
-        Ok(_) => Ok(()),
-        Err(Errno::EEXIST) if exist_ok => Ok(()),
+        Ok(_) => Ok(true),
+        Err(Errno::EEXIST) if exist_ok => Ok(false),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Whether the destination root is narrowed to `0o700` for the duration of
+/// the copy.
+///
+/// Narrowing is a **hold**, so it is only correct where a later mode is
+/// coming to release it into, and there are exactly two:
+///
+/// * `CopyFlags::PERMISSIONS`, under which `copy_permissions` stamps the
+///   source root's mode from the root frame once the walk completes;
+/// * a *borrowed* root's own mode, put back by `copytree` on both exits.
+///
+/// With neither - a root this copy created, and no `PERMISSIONS` - the
+/// narrowing would be the final mode, which is the defect
+/// [`creation_mode`] exists to close. `grants_others` is the only thing
+/// worth narrowing.
+///
+/// **A created root can need this too, which is not obvious**, and getting
+/// it wrong is not visible on any filesystem that lacks NFSv4 ACLs. A
+/// created root's mode is normally at most what was asked for, since the
+/// umask can only narrow - but with an inheritable ACE on the
+/// destination's parent, ZFS hands the new directory the inherited ACL and
+/// then recomputes its mode from it: `zfs_mode_compute`
+/// (`module/os/linux/zfs/zfs_acl.c`) keeps only
+/// `S_IFMT|S_ISUID|S_ISGID|S_ISVTX` of the requested mode and rebuilds
+/// every rwx bit out of the ACEs, so `0o700` can come back `0o770`. Under
+/// `aclmode=restricted` the requested mode is not consulted at all --
+/// `zfs_acl_inherit` clears `need_chmod` whenever anything was inherited,
+/// so `zfs_acl_chmod` never folds it in.
+///
+/// POSIX ACLs cannot reach this: default-ACL inheritance intersects with
+/// the requested mode rather than replacing it (measured on a `posixacl`
+/// dataset: a `0o777` default ACL still yields `0o700` for a `mkdir(0o700)`).
+/// So the live case belongs to the QEMU lane's `acltype=nfsv4` dataset, and
+/// what is pinned here is the decision.
+fn narrows_the_root(
+    grants_others: bool,
+    created: bool,
+    permissions: bool,
+) -> bool {
+    grants_others && (!created || permissions)
+}
+
+/// The mode a destination object is created with.
+///
+/// `0o700`/`0o600` is a **hold**: the source's mode is broader and lands
+/// later ([`finish_dir`] on ascent for a directory, [`copy_metadata`] for a
+/// file), so group and other are not granted access to bytes still being
+/// written. It only means anything when a later mode is coming.
+///
+/// Without [`CopyFlags::PERMISSIONS`] none is, and nothing released the
+/// hold: `copy_metadata`'s `copy_permissions` call is gated on that flag,
+/// so a `copytree` asking for `XATTRS | OWNER | TIMESTAMPS` produced
+/// `0o700` directories and `0o600` files throughout and returned `Ok`,
+/// with no non-owner identity able to enter the destination and nothing in
+/// the result saying so.
+///
+/// So the permissive form is the *creation* mode there, not a mode stamped
+/// afterwards: whatever a plain `mkdir` or `open` would have produced is
+/// the only reading of "do not copy permissions" that leaves a usable
+/// tree, and handing the same mode to the same syscall is how you get it.
+///
+/// What that resolves to is the **filesystem's** business, not this
+/// function's. On an ordinary one it is the caller's umask, which is the
+/// caller's standing statement about who may read what it creates. On ZFS
+/// with an inheritable ACE on the parent it is the inherited ACL:
+/// `zfs_acl_ids_create` recomputes the new object's mode from the ACL
+/// (`zfs_mode_compute` keeps only `S_IFMT|S_ISUID|S_ISGID|S_ISVTX` of what
+/// was asked for), and under `aclmode=restricted` the requested mode is not
+/// consulted at all - `zfs_acl_inherit` clears `need_chmod` whenever
+/// anything was inherited. Either way the answer is the one the object
+/// would have been created with, which is the point.
+///
+/// Stamping it afterwards instead would put an `fchmod` on every created
+/// object, and on ZFS a chmod is never just a mode change:
+/// `zfs_acl_chmod_setattr` (`module/os/linux/zfs/zfs_acl.c`) rewrites the
+/// ACL to agree with the new mode, and under the default `aclmode=discard`
+/// replaces it outright - destroying whatever the destination parent
+/// passed down to it. Under `aclmode=restricted` it would not even do
+/// that: the chmod is refused `EPERM`, so the hold would never be
+/// released and the tree would stay owner-only anyway.
+fn creation_mode(config: &CopyTreeConfig, is_dir: bool) -> libc::mode_t {
+    match (config.flags.contains(CopyFlags::PERMISSIONS), is_dir) {
+        (true, true) => 0o700,
+        (true, false) => 0o600,
+        (false, true) => 0o777,
+        (false, false) => 0o666,
     }
 }
 
@@ -1071,6 +1191,190 @@ fn read_link_fd(fd: BorrowedFd<'_>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `copytree` without `CopyFlags::PERMISSIONS` must leave a usable
+    /// tree, not an owner-only one.
+    ///
+    /// Every destination object is created under a temporary hold -
+    /// `0o700` for a directory, `0o600` for a file - because the source's
+    /// mode is broader and lands later, so group and other are not granted
+    /// access to bytes still being written. Without the flag nothing ever
+    /// landed: `copy_metadata` gates `copy_permissions` on it, so the hold
+    /// was final and a copy asking for `XATTRS | OWNER | TIMESTAMPS`
+    /// produced `dst=0700 dst/sub=0700 dst/sub/f=0600` over a `0755` tree
+    /// of `0644` files - and returned `Ok`.
+    ///
+    /// The property is "whatever a plain `mkdir` or `open` would have
+    /// produced", so the oracle is a reference tree built with exactly
+    /// those calls, in the same parent and at the same depth, rather than
+    /// a constant or a umask arithmetic. That is what makes it hold on a
+    /// filesystem where the answer is *not* the umask: on ZFS with an
+    /// inheritable ACE on the parent, `zfs_mode_compute` rebuilds a created
+    /// object's rwx bits out of the inherited ACL and discards the
+    /// requested ones, and under `aclmode=restricted` the requested mode is
+    /// not consulted at all.
+    ///
+    /// The `PERMISSIONS` arm is the control: it must still carry the
+    /// source's modes, which a creation-mode change could otherwise mask
+    /// away.
+    #[test]
+    fn copytree_without_permissions_matches_a_plain_create() {
+        let d = crate::tempdir().expect("tempdir");
+        let src = d.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).expect("src tree");
+        std::fs::write(src.join("sub/f"), b"x").expect("src file");
+        for (p, m) in [
+            (src.clone(), 0o755u32),
+            (src.join("sub"), 0o750),
+            (src.join("sub/f"), 0o644),
+        ] {
+            std::fs::set_permissions(
+                &p,
+                std::os::unix::fs::PermissionsExt::from_mode(m),
+            )
+            .expect("source mode");
+        }
+        let mode = |p: std::path::PathBuf| -> u32 {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(p).expect("stat").permissions().mode() & 0o7777
+        };
+
+        // The oracle: the same shape, built the ordinary way.
+        let r = d.path().join("ref");
+        std::fs::create_dir(&r).expect("ref root");
+        std::fs::create_dir(r.join("sub")).expect("ref subdir");
+        std::fs::File::create(r.join("sub/f")).expect("ref file");
+
+        let dst = d.path().join("plain");
+        copytree(
+            &src,
+            &dst,
+            &CopyTreeConfig {
+                flags: CopyFlags::all() - CopyFlags::PERMISSIONS,
+                ..Default::default()
+            },
+        )
+        .expect("copytree");
+        assert_eq!(mode(dst.clone()), mode(r.clone()), "destination root");
+        assert_eq!(mode(dst.join("sub")), mode(r.join("sub")), "subdirectory");
+        assert_eq!(mode(dst.join("sub/f")), mode(r.join("sub/f")), "file");
+        // And the oracle is not itself owner-only, or every row above would
+        // pass on the very state this exists to refuse.
+        assert_ne!(
+            mode(r.join("sub/f")) & 0o077,
+            0,
+            "the runner's umask leaves nothing for this test to see"
+        );
+
+        // The control: with the flag the source's modes still arrive, and
+        // a chmod is not umask-masked, so they arrive exactly.
+        let dst = d.path().join("perms");
+        copytree(
+            &src,
+            &dst,
+            &CopyTreeConfig {
+                flags: CopyFlags::all(),
+                ..Default::default()
+            },
+        )
+        .expect("copytree");
+        assert_eq!(mode(dst.clone()), 0o755, "the source root's mode");
+        assert_eq!(mode(dst.join("sub")), 0o750, "the source subdir's mode");
+        assert_eq!(mode(dst.join("sub/f")), 0o644, "the source file's mode");
+    }
+
+    /// The destination root is narrowed for the duration only where a
+    /// later mode is coming to release it into, and every row says which
+    /// mode that is.
+    ///
+    /// The row that is easy to lose is `(created, PERMISSIONS)`. A created
+    /// root looks like it cannot need narrowing - the umask only ever
+    /// narrows what `mkdir` was asked for - so a guard written as "narrow a
+    /// root we did not create" reads as complete and is not: with an
+    /// inheritable ACE on the destination's parent, `zfs_mode_compute`
+    /// rebuilds a created directory's rwx bits out of the inherited ACL and
+    /// discards the requested ones, so `0o700` comes back `0o770`. Miss the
+    /// row and the hold is gone for exactly the trees that carry ACLs,
+    /// invisibly on every filesystem this suite can reach.
+    ///
+    /// The complement is the defect that started this: narrowing a created
+    /// root with no `PERMISSIONS` makes `0o700` its *final* mode, because
+    /// nothing would ever put a broader one there.
+    #[test]
+    fn the_root_is_narrowed_only_where_a_later_mode_is_coming() {
+        // (grants_others, created, permissions) -> narrowed, and why.
+        for (grants, created, perms, want, why) in [
+            (
+                true,
+                true,
+                true,
+                true,
+                "copy_permissions stamps the source's",
+            ),
+            (true, true, false, false, "nothing would ever release it"),
+            (
+                true,
+                false,
+                true,
+                true,
+                "copy_permissions stamps the source's",
+            ),
+            (true, false, false, true, "the borrowed mode goes back"),
+            // Nothing to narrow: owner-only already.
+            (false, true, true, false, "owner-only already"),
+            (false, true, false, false, "owner-only already"),
+            (false, false, true, false, "owner-only already"),
+            (false, false, false, false, "owner-only already"),
+        ] {
+            assert_eq!(
+                narrows_the_root(grants, created, perms),
+                want,
+                "grants_others={grants} created={created} \
+                 permissions={perms}: {why}"
+            );
+        }
+    }
+
+    /// A root the copy *borrowed* is still narrowed for the duration and
+    /// handed back exactly as it was, which is a different rule from the
+    /// one above: there a later mode really is coming - the caller's own.
+    ///
+    /// `mkdir_at` reporting whether it created the directory is what keeps
+    /// the two apart. Inferred from the mode instead (`& 0o077 != 0`), a
+    /// root this copy just created at the umask default reads as borrowed
+    /// on any umask that leaves a group or other bit.
+    #[test]
+    fn a_borrowed_root_is_handed_back_as_it_was() {
+        let d = crate::tempdir().expect("tempdir");
+        let src = d.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).expect("src tree");
+        std::fs::write(src.join("sub/f"), b"x").expect("src file");
+        let dst = d.path().join("borrowed");
+        std::fs::create_dir(&dst).expect("dst root");
+        std::fs::set_permissions(
+            &dst,
+            std::os::unix::fs::PermissionsExt::from_mode(0o775),
+        )
+        .expect("dst mode");
+
+        copytree(
+            &src,
+            &dst,
+            &CopyTreeConfig {
+                flags: CopyFlags::all() - CopyFlags::PERMISSIONS,
+                exist_ok: true,
+                ..Default::default()
+            },
+        )
+        .expect("copytree");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&dst).expect("stat").permissions().mode()
+                & 0o7777,
+            0o775,
+            "a borrowed root goes back exactly as it was"
+        );
+    }
 
     /// Listing an entry's xattr names is a metadata step and honours
     /// `raise_error` like every other one.

@@ -102,6 +102,18 @@ pub(crate) struct Pending {
 pub(crate) enum Phase {
     /// The upgrade request is out; the HTTP response head is inbound.
     AwaitingHead,
+    /// The `101` is in and `core.set_options` is on the wire, unanswered.
+    ///
+    /// Frames flow - the setup call is one - but no *caller's* call may
+    /// join them, which is what makes [`Phase::Open`] mean "ready" to
+    /// the three public guards that read it. Until the echo lands the
+    /// peer's `App.legacy_jobs` is still at its default of `true`
+    /// (`api/base/server/app.py`), so a job method called here answers
+    /// with the job's integer id rather than the job's result
+    /// (`api/base/server/method.py`, the `if app.legacy_jobs` arm) -
+    /// exactly the silent substitution [`legacy_jobs_in_force`] refuses
+    /// the session over.
+    Setup,
     /// Serving: calls flow, notifications arrive.
     Open,
     /// A close frame has been sent (ours or the echo of the peer's); the
@@ -344,10 +356,13 @@ impl Session {
         match ws::validate_101(head, &self.key) {
             Err(e) => vec![Act::Failed(e)],
             Ok(()) => {
-                self.phase = Phase::Open;
                 if self.legacy_jobs {
+                    // Nothing to negotiate: legacy answering is what the
+                    // peer already does, so this session is ready here.
+                    self.phase = Phase::Open;
                     return vec![Act::Ready];
                 }
+                self.phase = Phase::Setup;
                 // The reference client's session setup: answers arrive
                 // when jobs finish, not as bare job ids.
                 let params = serde_json::value::to_raw_value(&[
@@ -790,7 +805,14 @@ impl Session {
                 // silently would make every job call's result the job's
                 // integer id where the caller expects the job's result.
                 Ok(raw) => match legacy_jobs_in_force(&raw) {
-                    Some(false) => acts.push(Act::Ready),
+                    Some(false) => {
+                        // The echo is in force, so this is the moment the
+                        // session may take a caller's call: `Phase::Open`
+                        // is what the public guards read, and it means
+                        // ready, not merely upgraded.
+                        self.phase = Phase::Open;
+                        acts.push(Act::Ready);
+                    }
                     Some(true) => {
                         acts.push(Act::SetupFailed(ApiError::Protocol(
                             "core.set_options answered legacy_jobs: true \

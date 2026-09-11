@@ -945,59 +945,131 @@ fn an_unrepresentable_timeout_is_no_timeout() {
     mock.join();
 }
 
-/// A session that dies during setup must fail the calls it already
-/// accepted. `call_start` admits a call as soon as the `101` lands - the
-/// phase is `Open` from there, and `core.set_options` is still
-/// outstanding - so a refusal at setup arrives with caller work already
-/// in flight. Dropping the session without draining `pending` leaves
-/// `ApiClient::call` waiting on a `CallDone` that can never come, and
-/// `call_timeout` is `None` by default.
+/// Every route that removes a session drains `pending` first, so a call
+/// the session accepted is answered rather than stranded.
+///
+/// This is the surviving half of what `Phase::Setup` made
+/// unconstructible. `call_start` now refuses until the setup echo lands,
+/// so no caller call can be in flight when `Act::SetupFailed` or
+/// `Act::Failed` fires - but the property those two routes were given
+/// `fail_session` for is about *every* removal route, and `Act::Fault`
+/// reaches a session that is fully open with real work outstanding.
+///
+/// Strand it and `ApiClient::call` waits on a `CallDone` that can never
+/// come, for as long as `call_timeout` allows - which is for ever by
+/// default. `SessionClosed` does not substitute: `wait_for`'s predicate
+/// is per-event, so a session-level report is stashed as a skipped event
+/// rather than delivered as the call's answer.
 #[test]
-fn a_setup_failure_fails_the_calls_it_already_accepted() {
+fn a_faulted_session_answers_the_call_it_accepted() {
+    let mock = serve_one(|mut w: Wire| {
+        w.accept_session("/api/current");
+        let (_id, _) = w.expect_call("slow.method");
+        // An answer naming a call that was never made: JSON-RPC has no
+        // reading of it, so the session faults with the real call still
+        // outstanding.
+        w.respond_ok(&json!(999_999), json!(null));
+        let _ = w.read_frame_or_eof();
+    });
+    let Some(mut api) = client_or_skip(&mock) else {
+        return;
+    };
+    let sid = api.connect(SessionOpts::default()).expect("connect");
+    let call = api
+        .call_start(sid, "slow.method", &params!())
+        .expect("an open session takes the call");
+
+    let mut answered = None;
+    let mut closed = false;
+    for _ in 0..50 {
+        match api.pump(Some(Duration::from_millis(200))) {
+            Ok(Some(ApiEvent::CallDone { call: c, result })) if c == call => {
+                answered = Some(result)
+            }
+            Ok(Some(ApiEvent::SessionClosed { session, reason })) => {
+                assert_eq!(session, sid);
+                assert!(
+                    reason.contains("protocol violation"),
+                    "the fault names itself: {reason}"
+                );
+                closed = true;
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        if answered.is_some() && closed {
+            break;
+        }
+    }
+    assert!(closed, "the session's own failure still surfaces");
+    match answered {
+        Some(Err(ApiError::Closed { .. })) => {}
+        other => panic!("the accepted call must be failed, got {other:?}"),
+    }
+    assert!(!api.is_open(sid));
+    // Dropped before the join: the fault's `close_now` is what gives the
+    // script its EOF, and the script is blocked in `read_frame_or_eof`
+    // waiting for it.
+    drop(api);
+    mock.join();
+}
+
+/// No caller's call joins a session whose setup has not answered, and a
+/// setup that then fails still reports itself.
+///
+/// `connect_start` promises calls before ready are refused, and the
+/// window this closes is the one where they were not: `Phase::Open` used
+/// to be set at the `101`, with `core.set_options` still outstanding. In
+/// that window the peer's `App.legacy_jobs` is at its default of `true`
+/// (`api/base/server/app.py`), so a job method answers with the job's
+/// integer id rather than the job's result
+/// (`api/base/server/method.py`) - the silent substitution
+/// `legacy_jobs_in_force` fails the whole session over when the echo
+/// says it.
+#[test]
+fn no_call_is_accepted_before_setup_answers() {
     let mock = serve_one(|mut w: Wire| {
         w.accept_upgrade("/api/current");
         let (id, _) = w.expect_call("core.set_options");
-        // Hold the answer until the client has issued a user call.
-        let (_uid, _) = w.expect_call("core.ping");
+        // Nothing else may reach the wire before this answer; the
+        // client-side assertion below is what proves it, and the
+        // params-Array/mask invariants would catch a stray frame here.
+        std::thread::sleep(Duration::from_millis(150));
         w.respond_err(&id, -32000, "no options for you", None);
     });
     let Some(mut api) = client_or_skip(&mock) else {
         return;
     };
     let sid = api.connect_start(SessionOpts::default()).expect("dial");
-    // Pump until the handshake is through and the session takes calls.
-    let mut call = None;
-    for _ in 0..50 {
-        let _ = api.pump(Some(Duration::from_millis(20)));
-        if let Ok(c) = api.call_start(sid, "core.ping", &params!()) {
-            call = Some(c);
-            break;
-        }
-    }
-    let call = call.expect("the session accepted a call before setup failed");
 
-    // The setup refusal must answer that call, not strand it. Both
-    // events are owed: the call's, and the session's.
-    let mut done = None;
+    // Every attempt across the whole setup phase is refused, and the
+    // refusal is the one `connect_start` documents.
     let mut failed = false;
+    let mut attempts = 0;
     for _ in 0..50 {
-        match api.pump(Some(Duration::from_millis(100))) {
-            Ok(Some(ApiEvent::CallDone { call: c, result })) if c == call => {
-                done = Some(result)
+        match api.call_start(sid, "core.ping", &params!()) {
+            Ok(c) => panic!("a call was accepted before ready: {c:?}"),
+            Err(ApiError::Closed { .. }) => attempts += 1,
+            // Once the setup failure lands the session is gone, which is
+            // the other legitimate refusal.
+            Err(ApiError::UnknownSession) => {}
+            Err(e) => panic!("unexpected refusal: {e}"),
+        }
+        match api.pump(Some(Duration::from_millis(20))) {
+            Ok(Some(ApiEvent::SessionFailed { session, .. })) => {
+                assert_eq!(session, sid);
+                failed = true;
+                break;
             }
-            Ok(Some(ApiEvent::SessionFailed { .. })) => failed = true,
+            Ok(Some(ApiEvent::SessionReady(_))) => {
+                panic!("the setup was refused; it cannot be ready")
+            }
             Ok(_) => {}
             Err(_) => break,
         }
-        if done.is_some() && failed {
-            break;
-        }
     }
-    assert!(failed, "the session's own failure still surfaces");
-    match done {
-        Some(Err(ApiError::Closed { .. })) => {}
-        other => panic!("the accepted call must be failed, got {other:?}"),
-    }
+    assert!(failed, "the session's own failure surfaces");
+    assert!(attempts > 0, "the refusal path was actually exercised");
     mock.join();
 }
 
@@ -1314,6 +1386,76 @@ fn bulk_flush_groups_by_method() {
     assert_eq!(done[&t1], 10);
     assert_eq!(done[&t2], 20);
     assert_eq!(done[&t3], -1); // "true" is not an i64
+    shutdown(&mut api, sid);
+    mock.join();
+}
+
+/// A session still dialing is not a dead one.
+///
+/// `queue_bulk` admits an item against any session the client knows, and
+/// the tick clock starts due (`last_tick` is `None`), so the first `pump`
+/// after a `connect_start` reaches the flush loop while the session is
+/// still in `AwaitingHead`. The flush could not send anything there --
+/// `call_start` refuses a session that is not `Open` - but `take_chunk`
+/// had already removed the items, so every one of them was failed
+/// `ApiError::Closed` against a session that was about to be healthy.
+///
+/// The mock holds the upgrade back so the window is wide enough to pump
+/// through; the assertion is that no ticket answers before the session is
+/// ready, and that the item then flushes and succeeds.
+#[test]
+fn bulk_items_survive_a_dialing_session() {
+    let mock = serve_one(|mut w: Wire| {
+        // Wide enough for the client to pump several times while the
+        // session sits in `AwaitingHead`.
+        std::thread::sleep(Duration::from_millis(200));
+        w.accept_session("/api/current");
+        let (id, params) = w.expect_call("core.bulk");
+        assert_eq!(params, json!(["m.method", [[1]]]));
+        w.respond_ok(&id, json!([{ "result": 7, "error": null }]));
+    });
+    let Some(mut api) = client_or_skip(&mock) else {
+        return;
+    };
+    let sid = api.connect_start(SessionOpts::default()).expect("dial");
+    let ticket = api.queue_bulk(sid, "m.method", &params!(1)).expect("queue");
+
+    // Pump the whole dialing window. Nothing may answer the ticket here.
+    let mut ready = false;
+    for _ in 0..100 {
+        match api.pump(Some(Duration::from_millis(20))).expect("pump") {
+            Some(ApiEvent::BulkItemDone { ticket: t, result }) => {
+                panic!("ticket {t:?} answered while dialing: {result:?}")
+            }
+            Some(ApiEvent::SessionReady(s)) => {
+                assert_eq!(s, sid);
+                ready = true;
+                break;
+            }
+            Some(other) => panic!("unexpected event: {other:?}"),
+            None => {}
+        }
+    }
+    assert!(ready, "the session never came up");
+
+    // And the item the queue held is still there to send. (The default
+    // `bulk_tick` is 10s, so force the flush rather than wait it out.)
+    api.flush_bulk();
+    let mut got = None;
+    while got.is_none() {
+        match api.pump(Some(Duration::from_secs(10))).expect("pump") {
+            Some(ApiEvent::BulkItemDone { ticket: t, result }) => {
+                assert_eq!(t, ticket);
+                got = Some(result.expect("the held item flushed and ran"));
+            }
+            Some(ApiEvent::BulkFlushed { items, .. }) => {
+                assert_eq!(items, 1, "the item was still queued")
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    let v: Value = got.expect("answered").decode().expect("json");
+    assert_eq!(v.as_i64(), Some(7));
     shutdown(&mut api, sid);
     mock.join();
 }

@@ -7,7 +7,11 @@ on:
 
 concurrency:
   group: ci-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: true
+  # PRs supersede themselves; a push to master must not, or a merged commit
+  # can end up with no CI result at all - it would sit on master having been
+  # verified only in its pre-merge form, and a later bisect has nothing to
+  # read. `miri.yml` makes the same distinction for the same reason.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Some failures only ever reproduce on the runner, and a bare `panicked at
 # file:line` with no frames is not enough to chase one from a log.
@@ -55,6 +59,34 @@ jobs:
       run: |
         cargo fmt --all --check
         cargo fmt --all --check --manifest-path fuzz/Cargo.toml
+
+    # The `[[test]]` census, the suites' twin of the fuzz-target one below.
+    # The suites live in `test/`, not `tests/`, so Cargo autodiscovers none
+    # of them: a file added there and never registered in the `[[test]]`
+    # table is built by nothing, run by nothing, linted by nothing and
+    # fmt-checked by nothing - it just sits in the tree looking covered,
+    # which is the whole shape the fuzz census exists to refuse.
+    #
+    # Measured: an unregistered `test/*.rs` carrying a `panic!`, a
+    # `deref_addrof` and deliberate misformatting left `cargo test
+    # --all-features`, `cargo clippy --all-targets -- -D warnings` and
+    # `cargo fmt --all --check` all at exit 0. Registering the same file
+    # unchanged turns the fmt check red and clippy red at once.
+    #
+    # `path = "test/..."` is the key, not `name`: the name is free, the
+    # path is what says the file on disk is the file cargo builds.
+    - name: test-target census
+      run: |
+        # shellcheck disable=SC2012
+        ls test/*.rs | sort > /tmp/tests-on-disk
+        sed -n 's/^path = "\(test\/[^"]*\.rs\)"$/\1/p' Cargo.toml \
+          | sort > /tmp/tests-registered
+        if ! diff -u /tmp/tests-on-disk /tmp/tests-registered; then
+          echo "::error::test target census mismatch" \
+               "(- on disk, + registered in [[test]])"
+          exit 1
+        fi
+        echo "test targets: $(wc -l < /tmp/tests-on-disk) on disk, all registered"
 
     - name: clippy
       run: cargo clippy --all-features --all-targets -- -D warnings

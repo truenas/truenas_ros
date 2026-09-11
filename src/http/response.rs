@@ -179,9 +179,25 @@ impl HttpResponse {
     /// status outside `100..=999` would serialize as a head no client can
     /// parse, so it is replaced with `500` here rather than desynchronizing
     /// the connection at the wire.
+    ///
+    /// A **1xx is replaced with `500` for the same reason**, one layer up.
+    /// This type is the codec's *final* response for a message, and RFC 9110
+    /// sec. 15.2 makes 1xx interim: a client that receives one keeps waiting
+    /// for the final response, while the codec has already answered the
+    /// message and re-armed for the next request. The exchange then hangs
+    /// until a timeout, or - on a pipelined connection - the peer pairs
+    /// every later response with the wrong request. `101` is worse still:
+    /// the peer is told the connection is no longer HTTP/1.1 while this
+    /// codec goes on framing HTTP/1.1 requests on it.
+    ///
+    /// The one interim this codec sends, the `Expect: 100-continue` line, is
+    /// written as raw bytes by the framing glue and never travels through
+    /// this type, so nothing legitimate is refused here. A handler that
+    /// wants a protocol switch needs a protocol that models one
+    /// ([`ws`](crate::ws)), not a status code.
     pub fn new(status: u16) -> Self {
         Self {
-            status: if (100..=999).contains(&status) {
+            status: if (200..=999).contains(&status) {
                 status
             } else {
                 500
@@ -659,12 +675,34 @@ mod tests {
         assert!(s.ends_with("\r\n\r\nhello"), "{s}");
     }
 
+    /// An interim status is not a final response, so it never reaches the
+    /// wire as one: `HttpResponse::new` normalizes 1xx to 500. Pinned
+    /// because the failure is silent on this side - the response
+    /// serializes and the connection keeps serving - and shows up only as
+    /// a hung client.
+    #[test]
+    fn an_interim_status_cannot_be_a_final_response() {
+        for interim in [100u16, 101, 102, 103, 199] {
+            assert_eq!(
+                HttpResponse::new(interim).status(),
+                500,
+                "{interim} was accepted as a final status"
+            );
+        }
+        // The control: the neighbouring statuses are untouched, so the
+        // check above is a 1xx rule and not a blanket rewrite.
+        for ok in [200u16, 204, 304, 400, 413, 431, 500, 505, 999] {
+            assert_eq!(HttpResponse::new(ok).status(), ok);
+        }
+    }
+
     #[test]
     fn head_declaration_does_not_revive_a_bodyless_status() {
-        // 1xx/204/304 carry no Content-Length at all, and a HEAD asking for
-        // one changes nothing - S3 answers a conditional HeadObject with a
-        // bare 304.
-        for status in [100, 204, 304] {
+        // 204/304 (and 1xx, which cannot get here - see
+        // `an_interim_status_cannot_be_a_final_response`) carry no
+        // Content-Length at all, and a HEAD asking for one changes nothing --
+        // S3 answers a conditional HeadObject with a bare 304.
+        for status in [204, 304] {
             let resp = HttpResponse::new(status).head_content_length(4096);
             let out = serialize(&resp, true, &date(), ConnHeader::None);
             let s = text(&out);
@@ -718,7 +756,10 @@ mod tests {
         for bad in [0, 99, 1000, u16::MAX] {
             assert_eq!(HttpResponse::new(bad).status(), 500, "{bad}");
         }
-        assert_eq!(HttpResponse::new(100).status(), 100);
+        // 1xx fits the grammar but is not a *final* response, and is
+        // normalized too - `an_interim_status_cannot_be_a_final_response`.
+        assert_eq!(HttpResponse::new(100).status(), 500);
+        assert_eq!(HttpResponse::new(200).status(), 200);
         assert_eq!(HttpResponse::new(999).status(), 999);
     }
 
@@ -781,8 +822,12 @@ mod tests {
     #[test]
     fn bodyless_statuses_carry_no_content() {
         // 1xx/204/304 MUST NOT carry content; a handler-set body is elided
-        // and no Content-Length is emitted at all.
-        for status in [100, 204, 304] {
+        // and no Content-Length is emitted at all. A 1xx cannot reach the
+        // serializer as a final response (`HttpResponse::new` normalizes it
+        // to 500 - `an_interim_status_cannot_be_a_final_response`), so the
+        // predicate's 1xx arm is asserted directly rather than dropped.
+        assert!(status_is_bodyless(100) && status_is_bodyless(199));
+        for status in [204, 304] {
             let resp = HttpResponse::new(status).body("diagnostic");
             let out = serialize(&resp, false, &date(), ConnHeader::None);
             let s = text(&out);
@@ -909,7 +954,7 @@ mod file_body_tests {
 
     #[test]
     fn bodyless_statuses_drop_the_handle_and_the_length() {
-        for status in [100, 204, 304] {
+        for status in [204, 304] {
             let (file, held) = probe_file();
             let resp = HttpResponse::new(status).file_body(file, 0, 4096);
             let Serialized::HeadOnly(head) =

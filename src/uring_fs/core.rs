@@ -989,7 +989,7 @@ impl FsCore {
         // never grant implicitly. `Personality` cannot be 0 by construction, so
         // this only catches an internal misuse; fail closed regardless.
         if pers == 0 {
-            self.refuse(eng, waiter, Errno::EINVAL, true, Vec::new());
+            self.refuse(eng, waiter, Errno::EINVAL, true, Vec::new(), None);
             return;
         }
         // An `Allow` open is a wall-clock hold like a timer - two slots
@@ -1000,7 +1000,7 @@ impl FsCore {
         if deadline.is_some()
             && let Some((err, marked)) = self.refuse_wall_clock_hold(&waiter)
         {
-            self.refuse(eng, waiter, err, marked, Vec::new());
+            self.refuse(eng, waiter, err, marked, Vec::new(), None);
             return;
         }
         // An `Allow` open charges two slots - its own and its guard
@@ -1008,11 +1008,11 @@ impl FsCore {
         // here, before either pop, and the guard's pop below cannot
         // fail.
         if deadline.is_some() && self.op_free.len() < 2 {
-            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new());
+            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new(), None);
             return;
         }
         let Some(op_slot) = self.pop_op() else {
-            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new());
+            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new(), None);
             return;
         };
 
@@ -1154,7 +1154,7 @@ impl FsCore {
         waiter: FsWaiter,
     ) {
         let Some(op_slot) = self.pop_op() else {
-            self.refuse(eng, waiter, Errno::EBUSY, true, bufs);
+            self.refuse(eng, waiter, Errno::EBUSY, true, bufs, Some(file));
             return;
         };
 
@@ -1349,9 +1349,28 @@ impl FsCore {
             PumpDest::Owned(b) => (b, None),
             PumpDest::Group(g) => (Vec::new(), Some(g)),
         };
-        debug_assert!(
-            bgid.is_some() || (buf.is_empty() && buf.capacity() >= want)
-        );
+        // The kernel writes `want` bytes into `buf`'s spare capacity, so a
+        // buffer that cannot hold them is an out-of-bounds heap write, not a
+        // short read - and it happens later, on an io-wq worker, far from
+        // here. Screened in BOTH profiles: every other kernel-visible length
+        // in this file is structural (an iovec is built from its buffer's
+        // own `len()`), and this one is the caller's to get right. Refused
+        // rather than only asserted, on `stage_fd_meta`'s rule - this
+        // function already answers `EBUSY` for a full table, so its caller
+        // has an error path either way. Buffer select is exempt: there the
+        // kernel reads the iovec for its length and supplies the address
+        // itself (`io_iov_buffer_select_prep`, `io_uring/rw.c`), so
+        // `iov_base` is never dereferenced.
+        if bgid.is_none() && (!buf.is_empty() || buf.capacity() < want) {
+            debug_assert!(
+                false,
+                "a pump read of {want} bytes into a buffer holding {} with \
+                 capacity {}",
+                buf.len(),
+                buf.capacity()
+            );
+            return Err(Errno::EINVAL);
+        }
         let Some(op_slot) = self.pop_op() else {
             return Err(Errno::EBUSY);
         };
@@ -1414,7 +1433,14 @@ impl FsCore {
         waiter: FsWaiter,
     ) {
         let Some(op_slot) = self.pop_op() else {
-            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new());
+            self.refuse(
+                eng,
+                waiter,
+                Errno::EBUSY,
+                true,
+                Vec::new(),
+                Some(file),
+            );
             return;
         };
 
@@ -1478,11 +1504,11 @@ impl FsCore {
         waiter: FsWaiter,
     ) -> Option<(u32, u64)> {
         if let Some((err, marked)) = self.refuse_wall_clock_hold(&waiter) {
-            self.refuse(eng, waiter, err, marked, Vec::new());
+            self.refuse(eng, waiter, err, marked, Vec::new(), None);
             return None;
         }
         let Some(op_slot) = self.pop_op() else {
-            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new());
+            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new(), None);
             return None;
         };
 
@@ -1645,7 +1671,14 @@ impl FsCore {
         waiter: FsWaiter,
     ) {
         if pers == 0 {
-            self.refuse(eng, waiter, Errno::EINVAL, true, vec![value]);
+            self.refuse(
+                eng,
+                waiter,
+                Errno::EINVAL,
+                true,
+                vec![value],
+                Some(file),
+            );
             return;
         }
         // An allowlisted attribute is metadata the *server* owns, which the
@@ -1750,7 +1783,14 @@ impl FsCore {
         // path-op siblings refuse instead, and so does this now.
         let Some(opcode) = Self::fd_meta_opcode(tag) else {
             debug_assert!(false, "not an fd-meta tag {tag:#x}");
-            self.refuse(eng, waiter, Errno::EINVAL, true, vec![value]);
+            self.refuse(
+                eng,
+                waiter,
+                Errno::EINVAL,
+                true,
+                vec![value],
+                Some(file),
+            );
             return;
         };
         // The length reaches the SQE as a `u32` (`val_len` below), so an
@@ -1784,11 +1824,25 @@ impl FsCore {
             _ => false,
         };
         if unrepresentable {
-            self.refuse(eng, waiter, Errno::E2BIG, true, vec![value]);
+            self.refuse(
+                eng,
+                waiter,
+                Errno::E2BIG,
+                true,
+                vec![value],
+                Some(file),
+            );
             return;
         }
         let Some(op_slot) = self.pop_op() else {
-            self.refuse(eng, waiter, Errno::EBUSY, true, vec![value]);
+            self.refuse(
+                eng,
+                waiter,
+                Errno::EBUSY,
+                true,
+                vec![value],
+                Some(file),
+            );
             return;
         };
 
@@ -1887,7 +1941,7 @@ impl FsCore {
         // See `submit_open`: personality 0 = ambient root on a name-resolving
         // op. Fail closed.
         if pers == 0 {
-            self.refuse(eng, waiter, Errno::EINVAL, true, Vec::new());
+            self.refuse(eng, waiter, Errno::EINVAL, true, Vec::new(), None);
             return;
         }
         // See `stage_fd_meta`: an unhandled tag would leave the zeroed SQE's
@@ -1895,11 +1949,11 @@ impl FsCore {
         // never ran.
         let Some(opcode) = Self::path_op_opcode(tag) else {
             debug_assert!(false, "not a path-op tag {tag:#x}");
-            self.refuse(eng, waiter, Errno::EINVAL, true, Vec::new());
+            self.refuse(eng, waiter, Errno::EINVAL, true, Vec::new(), None);
             return;
         };
         let Some(op_slot) = self.pop_op() else {
-            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new());
+            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new(), None);
             return;
         };
 
@@ -2001,11 +2055,25 @@ impl FsCore {
         // Like every name-resolving op: personality 0 would resolve `n2` and
         // create the link as ambient root. Fail closed.
         if pers == 0 {
-            self.refuse(eng, waiter, Errno::EINVAL, true, Vec::new());
+            self.refuse(
+                eng,
+                waiter,
+                Errno::EINVAL,
+                true,
+                Vec::new(),
+                Some(file),
+            );
             return;
         }
         let Some(op_slot) = self.pop_op() else {
-            self.refuse(eng, waiter, Errno::EBUSY, true, Vec::new());
+            self.refuse(
+                eng,
+                waiter,
+                Errno::EBUSY,
+                true,
+                Vec::new(),
+                Some(file),
+            );
             return;
         };
 
@@ -2687,6 +2755,7 @@ impl FsCore {
         err: Errno,
         marked: bool,
         bufs: Vec<Vec<u8>>,
+        file: Option<Arc<OwnedFd>>,
     ) {
         match waiter {
             FsWaiter::Embedded { owner, cb, on_fail } => {
@@ -2704,14 +2773,14 @@ impl FsCore {
                         result: Err(err),
                         refused: marked,
                         bufs,
-                        file: None,
+                        file: file.map(File::new),
                         stat: None,
                         #[cfg(feature = "net-server")]
                         recv_lease: None,
                     },
                 ));
             }
-            other => deliver(Some(other), Err(err), bufs, None, None),
+            other => deliver(Some(other), Err(err), bufs, file, None),
         }
     }
 
@@ -2747,12 +2816,18 @@ impl FsCore {
         let e = &mut entry.state;
         let waiter = e.waiter.take();
         let bufs = std::mem::take(&mut e.bufs);
+        // Taken out before `clear`, for the same reason the buffers are:
+        // the caller surrendered its `File` to this submission, so
+        // dropping the parked `Arc` here closes the descriptor of a
+        // caller being told a *marked* errno - the one `FsDone::was_refused`
+        // documents as worth retrying. A retry needs the file.
+        let file = e.file.take();
         e.clear();
         entry.generation += 1;
         self.op_free.push(op_slot);
         match waiter {
-            Some(w) => self.refuse(eng, w, err, true, bufs),
-            None => drop(bufs),
+            Some(w) => self.refuse(eng, w, err, true, bufs, file),
+            None => drop((bufs, file)),
         }
     }
 }
@@ -2887,7 +2962,17 @@ impl FsDone {
         self.result
     }
 
-    /// The freshly opened file - present only for a successful `open`.
+    /// The file this outcome carries: a successful `open`'s new one, or -
+    /// on a refusal ([`was_refused`](FsDone::was_refused)) of an op that
+    /// targets an open file - the very handle the refused submission was
+    /// given back, so the retry the mark advises can actually be made.
+    ///
+    /// The facade's fd-ops take `File` **by value**, so a caller that hands
+    /// in its last handle has surrendered it. Dropping it on a capacity
+    /// refusal closed the descriptor under a caller told `EBUSY` with
+    /// [`into_bufs`](FsDone::into_bufs) handing the payload back for a
+    /// retry that had nothing left to write to. Nothing here reports an
+    /// *opened* file for a refusal: a refusal never reached the ring.
     pub fn file(&self) -> Option<File> {
         self.file.clone()
     }
@@ -6916,6 +7001,118 @@ mod routing_fuzz {
         assert_eq!(rc, -1, "the drained open's fd was closed, not leaked");
     }
 
+    /// A refused fd-op hands the caller's `File` back with the payload.
+    ///
+    /// The facade's fd-ops take `File` by value, so a caller that submits
+    /// its last handle has surrendered it. The refusal used to drop the
+    /// parked `Arc`, which **closed the descriptor** under a caller told a
+    /// *marked* `EBUSY` - the errno `FsDone::was_refused` documents as
+    /// "worth retrying with the payload `into_bufs` hands back". The
+    /// payload came back and the file it was to be written to did not.
+    ///
+    /// Control first: with a slot free the same submission parks the fd and
+    /// it stays open, so the weak-ref instrument is shown reading "alive"
+    /// before it is trusted to read "closed".
+    ///
+    /// This drives the *submit-time* refusals - the `pop_op` arms and the
+    /// screens above them, which is where the documented `EBUSY` fan-out
+    /// failure lives. `fail_op`'s arm (a slot already taken and the SQE
+    /// then refused) carries the same one-line return and no test:
+    /// `push_sqe` flushes and retries on a full SQ, so a staging failure
+    /// needs a kernel-side refusal this suite cannot provoke.
+    #[test]
+    fn a_refused_fd_op_hands_the_callers_file_back() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+
+        // --- live control: a slot IS free, so the fd survives ---------
+        let mut core = FsCore::new(2, OffloadBounds::default());
+        let arc = Arc::new(unsafe { crate::fd::owned_from_raw(synth_fd()) });
+        let weak_ok = Arc::downgrade(&arc);
+        let (tx, _rx) = mpsc::channel::<FsOutcome>();
+        core.submit_fd_meta(
+            &mut eng,
+            TAG_FTRUNCATE,
+            1,
+            arc, // the caller's LAST reference moves in
+            None,
+            Vec::new(),
+            0,
+            0,
+            0,
+            chan(&tx),
+        );
+        assert!(
+            weak_ok.upgrade().is_some(),
+            "CONTROL: an accepted fd-op parks the fd; it must stay open"
+        );
+
+        // --- the case: the table is full, so the op is refused --------
+        let mut core = FsCore::new(1, OffloadBounds::default());
+        // Take the one slot.
+        let hog = Arc::new(unsafe { crate::fd::owned_from_raw(synth_fd()) });
+        core.submit_fd_meta(
+            &mut eng,
+            TAG_FTRUNCATE,
+            1,
+            hog,
+            None,
+            Vec::new(),
+            0,
+            0,
+            0,
+            chan(&tx),
+        );
+        assert!(!core.has_free_op(), "the table is full");
+
+        let arc = Arc::new(unsafe { crate::fd::owned_from_raw(synth_fd()) });
+        let raw_before = arc.as_raw_fd();
+        let weak = Arc::downgrade(&arc);
+        let payload = vec![1u8, 2, 3];
+        let (tx2, rx2) = mpsc::channel::<FsOutcome>();
+        core.submit_fd_meta(
+            &mut eng,
+            TAG_FSETXATTR,
+            1,
+            arc, // the caller's LAST reference moves in
+            Some(c"user.x".to_owned()),
+            payload,
+            0,
+            0,
+            0,
+            chan(&tx2),
+        );
+        let out = rx2.try_recv().expect("the refusal is delivered in place");
+        assert_eq!(out.res, Err(Errno::EBUSY), "the marked fan-out refusal");
+        assert_eq!(
+            out.bufs,
+            vec![vec![1u8, 2, 3]],
+            "the PAYLOAD is handed back for the advised retry"
+        );
+        assert!(
+            weak.upgrade().is_some(),
+            "the refusal dropped the caller's last File reference"
+        );
+        assert_eq!(
+            out.file.as_ref().map(|f| f.as_raw_fd()),
+            Some(raw_before),
+            "the refusal must hand the caller's own file back"
+        );
+        // And the descriptor is still open, so the advised retry can run.
+        // SAFETY: `fcntl(F_GETFD)` probes a descriptor number, reads nothing.
+        let rc = unsafe { libc::fcntl(raw_before, libc::F_GETFD) };
+        assert_ne!(
+            rc, -1,
+            "the refused op closed the caller's descriptor: retry impossible"
+        );
+        drop(out);
+        assert!(
+            weak.upgrade().is_none(),
+            "and it closes normally once the outcome is dropped"
+        );
+    }
+
     #[test]
     fn close_last_parked_vs_caller() {
         let Some(mut eng) = engine_or_skip() else {
@@ -7294,6 +7491,107 @@ mod routing_fuzz {
             ReapedFs::Pump(..)
         ));
         submit(&mut core, &mut eng).expect("freed slot serves the next");
+    }
+
+    /// A pump read whose buffer cannot hold `want` is refused, not staged.
+    ///
+    /// The iovec points at the `Vec`'s spare capacity and carries `want` as
+    /// its length, so an oversized `want` is an out-of-bounds heap write
+    /// performed by the kernel on an io-wq worker - the corruption surfaces
+    /// nowhere near the call. The debug half is the `debug_assert!(false)`;
+    /// this is the half that ships, on
+    /// `an_unknown_tag_is_refused_rather_than_staged_as_a_nop`'s pattern.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn a_pump_read_past_its_buffer_is_refused_not_staged() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(4, OffloadBounds::default());
+        let dir = crate::tempdir().expect("tempdir");
+        let p = dir.path().join("f");
+        std::fs::write(&p, b"abcd").unwrap();
+        let fd: std::os::fd::OwnedFd = std::fs::File::open(&p).unwrap().into();
+        let file = File::new(Arc::new(fd));
+
+        // The control: `want == capacity` is exactly what the reply path
+        // submits, and it must still be accepted - and take a slot.
+        let free = core.op_free_len_for_test();
+        core.submit_pump_read(
+            &mut eng,
+            &file,
+            PumpDest::Owned(Vec::with_capacity(8)),
+            8,
+            0,
+            (0, 1),
+        )
+        .expect("want == capacity is the ordinary case");
+        assert_eq!(core.op_free_len_for_test(), free - 1, "it took a slot");
+
+        // One byte past the allocation.
+        let free = core.op_free_len_for_test();
+        assert_eq!(
+            core.submit_pump_read(
+                &mut eng,
+                &file,
+                PumpDest::Owned(Vec::with_capacity(8)),
+                9,
+                0,
+                (0, 1),
+            ),
+            Err(Errno::EINVAL),
+            "a read past the buffer must be refused"
+        );
+        assert_eq!(
+            core.op_free_len_for_test(),
+            free,
+            "the refusal must not consume an op slot"
+        );
+
+        // The other half of the precondition: the host sets the length from
+        // the CQE count, so a buffer that already has one would be written
+        // past its own contents.
+        let mut used = Vec::with_capacity(64);
+        used.push(1u8);
+        assert_eq!(
+            core.submit_pump_read(
+                &mut eng,
+                &file,
+                PumpDest::Owned(used),
+                8,
+                0,
+                (0, 1),
+            ),
+            Err(Errno::EINVAL),
+            "a non-empty destination must be refused"
+        );
+    }
+
+    /// The debug half of the guard above: the same call trips the
+    /// `debug_assert!(false)` rather than reaching the refusal.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a pump read of 9 bytes")]
+    fn a_pump_read_past_its_buffer_asserts_in_debug() {
+        let Some(mut eng) = engine_or_skip() else {
+            // A `should_panic` test cannot skip; panic with the expected
+            // message so an unavailable ring does not read as a regression.
+            panic!("a pump read of 9 bytes (io_uring unavailable: skipped)");
+        };
+        let mut core = FsCore::new(4, OffloadBounds::default());
+        let dir = crate::tempdir().expect("tempdir");
+        let p = dir.path().join("f");
+        std::fs::write(&p, b"abcd").unwrap();
+        let fd: std::os::fd::OwnedFd = std::fs::File::open(&p).unwrap().into();
+        let file = File::new(Arc::new(fd));
+        let _ = core.submit_pump_read(
+            &mut eng,
+            &file,
+            PumpDest::Owned(Vec::with_capacity(8)),
+            9,
+            0,
+            (0, 1),
+        );
     }
 
     /// The kernel-internal restart codes decode as `EINTR`, the way
