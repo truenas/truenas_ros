@@ -525,6 +525,12 @@ fn respond(
     }
 }
 
+/// The one interim this codec sends (RFC 9110 sec. 10.1.1), as wire bytes.
+/// `Response::Reply` sends them verbatim - the interim never travels through
+/// [`HttpResponse`], which replaces a 1xx with 500. Four arms release it and
+/// they must release the same bytes, so there is one copy of them.
+const CONTINUE_LINE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+
 /// The farewell for a connection the framer failed: a real status line, then
 /// flush-close. Tiny text body so a captured trace is self-explanatory --
 /// elided when the dying request was a HEAD (`head_only`), whose responses
@@ -726,6 +732,19 @@ where
             Dispatched::Continue => Response::Close,
         }
     }
+    /// Release, or withhold, the interim a streamed open owed. Three arms
+    /// reach this - the inline open, the deferred resume, and the redrive -
+    /// and an arm that answered `Vec::new()` where the others answered the
+    /// interim would leave an expecting client waiting on its own timeout
+    /// for a body the stream is already open for.
+    fn interim(expect: bool) -> Response {
+        Response::Reply(if expect {
+            CONTINUE_LINE.to_vec()
+        } else {
+            Vec::new()
+        })
+    }
+
     match std::mem::replace(&mut conn.phase, Phase::Head) {
         // The framer's farewell: everything buffered was delivered as a
         // degenerate message; answer and flush-close. The HEAD flag rides
@@ -747,7 +766,7 @@ where
                 return farewell(503, method_is_head(&head), dates);
             }
             conn.phase = Phase::ExpectBody { head, body };
-            Response::Reply(b"HTTP/1.1 100 Continue\r\n\r\n".to_vec())
+            Response::Reply(CONTINUE_LINE.to_vec())
         }
         // Dance message 2: the body alone, paired with the stash. (A
         // chunked dance never lands here - the framer morphs ExpectBody
@@ -898,13 +917,7 @@ where
             match d {
                 Dispatched::Continue => {
                     conn.phase = next;
-                    if expect {
-                        Response::Reply(
-                            b"HTTP/1.1 100 Continue\r\n\r\n".to_vec(),
-                        )
-                    } else {
-                        Response::Reply(Vec::new())
-                    }
+                    interim(expect)
                 }
                 // Refused, or parked to decide off-thread. A refusal is
                 // final: the body it declined is still coming and nothing
@@ -1136,11 +1149,7 @@ where
                         // interim, or the expecting client holds its body
                         // back until its own timeout and the stream this
                         // resume opened never starts.
-                        Response::Reply(if r.expect_interim {
-                            b"HTTP/1.1 100 Continue\r\n\r\n".to_vec()
-                        } else {
-                            Vec::new()
-                        })
+                        interim(r.expect_interim)
                     }
                     None => Response::Close,
                 },
@@ -1220,11 +1229,7 @@ where
                         }
                         (Dispatched::Continue, Some(r)) => {
                             conn.phase = r.next;
-                            Response::Reply(if r.expect_interim {
-                                b"HTTP/1.1 100 Continue\r\n\r\n".to_vec()
-                            } else {
-                                Vec::new()
-                            })
+                            interim(r.expect_interim)
                         }
                         (d, resume) => settle(conn, d, resume.map(|r| *r)),
                     }
