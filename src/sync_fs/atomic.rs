@@ -132,7 +132,7 @@ where
     // the target uid while it is still empty hands that uid a window on the
     // bytes as they are written. `create_temp` stages owner-private for as
     // long as that window lasts.
-    let (tmp_name, mut file) = create_temp(dir, name)?;
+    let (tmp_name, mut file) = create_temp(dir)?;
     let staged = write_fn(&mut file)
         .and_then(|()| file.flush())
         .map_err(|e| Error::from(Errno::try_from(e).unwrap_or(Errno::EIO)))
@@ -216,15 +216,24 @@ pub fn atomic_replace(
     atomic_write(target, opts, |f| f.write_all(data))
 }
 
-/// Create a uniquely-named temporary file beside `target_name` in `dir`.
+/// A staging name, for the creators that replace a taken destination by
+/// building beside it and renaming over. `prefix` names the writer, so a
+/// leftover says which one left it.
 ///
 /// The suffix is 128 random bits from `getrandom(2)`, so a single
 /// `O_CREAT | O_EXCL` open is collision-free in practice - no retry loop and no
 /// shared counter. A collision (never expected) simply surfaces as `EEXIST`.
-fn create_temp(
-    dir: BorrowedFd<'_>,
-    target_name: &OsStr,
-) -> Result<(OsString, File)> {
+///
+/// **The length is fixed rather than derived from the destination name.** A
+/// name built as `. + target + .tmp. + 32 hex` is 38 bytes longer than the
+/// target it stands in for, so a target already within 38 bytes of the
+/// filesystem's `NAME_MAX` - 218 bytes on a stock ZFS dataset - cannot be
+/// staged at all: the `openat2` below answers `ENAMETOOLONG` for a name the
+/// caller was entitled to write. `NAME_MAX` is a filesystem property (ZFS
+/// raises it to 1023 with the `longname` feature), so there is no constant to
+/// clamp against; carrying none of the target's bytes is what removes the
+/// dependency.
+pub(crate) fn staging_name(prefix: &str) -> Result<OsString> {
     let mut rand = [0u8; 16];
     // getrandom fully fills any request of <= 256 bytes (flags 0), so on success
     // the whole buffer is populated; only the error case needs handling.
@@ -232,16 +241,19 @@ fn create_temp(
         libc::getrandom(rand.as_mut_ptr().cast(), rand.len(), 0)
     })?;
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut suffix = String::with_capacity(rand.len() * 2);
+    let mut name = String::with_capacity(prefix.len() + rand.len() * 2);
+    name.push_str(prefix);
     for b in rand {
-        suffix.push(char::from(HEX[(b >> 4) as usize]));
-        suffix.push(char::from(HEX[(b & 0x0f) as usize]));
+        name.push(char::from(HEX[(b >> 4) as usize]));
+        name.push(char::from(HEX[(b & 0x0f) as usize]));
     }
+    Ok(OsString::from(name))
+}
 
-    let mut name = OsString::from(".");
-    name.push(target_name);
-    name.push(".tmp.");
-    name.push(suffix);
+/// Create a uniquely-named temporary file in `dir`, with the same `how` the
+/// destination it will be renamed over is created with.
+fn create_temp(dir: BorrowedFd<'_>) -> Result<(OsString, File)> {
+    let name = staging_name(".tnatomic.tmp.")?;
 
     let how = OpenHow::new()
         .flags(
@@ -353,6 +365,30 @@ mod tests {
         let st = std::fs::metadata(&target).unwrap();
         assert_eq!(st.mode() & 0o7777, 0o4755, "the published mode");
         assert_eq!(std::fs::read(&target).unwrap(), b"payload");
+    }
+
+    /// A target name the filesystem accepts must be writable, whatever its
+    /// length: the staging name stands in for it and carries none of its
+    /// bytes, so it cannot push the create past `NAME_MAX`.
+    ///
+    /// Derived from the target - `. + target + .tmp. + 32 hex` - the staging
+    /// name was 38 bytes longer, and every target of 218 bytes or more on a
+    /// stock ZFS or ext4 dataset answered `ENAMETOOLONG` with nothing
+    /// written.
+    #[test]
+    fn a_long_target_name_is_still_writable() {
+        let dir = crate::tempdir().unwrap();
+        for n in [8usize, 217, 218, 250] {
+            let name = "x".repeat(n);
+            let target = dir.path().join(&name);
+            // The control: the filesystem takes the name at all.
+            std::fs::write(&target, b"probe").expect("the name is writable");
+            std::fs::remove_file(&target).unwrap();
+
+            atomic_replace(&target, b"payload", AtomicWriteOptions::default())
+                .unwrap_or_else(|e| panic!("{n}-byte target name: {e}"));
+            assert_eq!(std::fs::read(&target).unwrap(), b"payload");
+        }
     }
 
     // A planted symlink must not be followed for the write nor adopted for the

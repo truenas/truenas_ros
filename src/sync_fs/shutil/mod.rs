@@ -641,20 +641,13 @@ fn create_temp(
 
 /// A fresh staging name, for the three creators that replace a taken
 /// destination by building beside it and renaming over.
+///
+/// One generator, shared with `atomic_write`'s, which had the same job and
+/// not the same length rule: the `NAME_MAX` reasoning [`create_temp`] states
+/// travels with the name now instead of being restated beside one of the two
+/// call sites.
 fn temp_name() -> Result<OsString> {
-    let mut rand = [0u8; 16];
-    // getrandom fully fills any request of <= 256 bytes (flags 0), so on success
-    // the whole buffer is populated; only the error case needs handling.
-    retry_on_eintr(|| unsafe {
-        libc::getrandom(rand.as_mut_ptr().cast(), rand.len(), 0)
-    })?;
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut name = String::from(".copytree.tmp.");
-    for b in rand {
-        name.push(char::from(HEX[(b >> 4) as usize]));
-        name.push(char::from(HEX[(b & 0x0f) as usize]));
-    }
-    Ok(OsString::from(name))
+    crate::sync_fs::atomic::staging_name(".copytree.tmp.")
 }
 
 /// Move `tmp` onto `name` in `dir`, unlinking the staging entry if the
