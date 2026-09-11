@@ -941,8 +941,20 @@ mod acl {
         assert_eq!(round.access.len(), 3);
         assert_eq!(round.default.as_ref().unwrap().len(), 3);
         // Inheriting keeps a default for a dir, drops it for a file.
-        assert!(acl.generate_inherited_acl(true).unwrap().default.is_some());
-        assert!(acl.generate_inherited_acl(false).unwrap().default.is_none());
+        assert!(
+            acl.generate_inherited_acl(true, 0o755)
+                .unwrap()
+                .0
+                .default
+                .is_some()
+        );
+        assert!(
+            acl.generate_inherited_acl(false, 0o755)
+                .unwrap()
+                .0
+                .default
+                .is_none()
+        );
     }
 
     #[test]
@@ -1789,8 +1801,13 @@ mod shutil {
             .open(dir.path().join("s"))
             .unwrap();
         let d = std::fs::File::create(dir.path().join("d")).unwrap();
-        if fsetxattr(s.as_fd(), "user.keep", b"v", XattrFlags::empty()).is_err()
+        if let Err(e) =
+            fsetxattr(s.as_fd(), "user.keep", b"v", XattrFlags::empty())
         {
+            // Every assertion below is behind this probe, so the refusal is
+            // held to the same gate as its sibling in `xattr::` rather than
+            // returning silently.
+            super::xattr_probe::refusal_is_allowed("fsetxattr(user.keep)", e);
             return; // user xattrs unsupported here
         }
         // A system/ACL name in the list must be skipped without error.

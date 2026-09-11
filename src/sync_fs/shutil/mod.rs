@@ -306,7 +306,7 @@ pub fn copytree_reporting(
         .unwrap_or_else(|| src.to_string_lossy().into_owned());
 
     // Primary filesystem.
-    let mut outcome = copy_one_mount(
+    let outcome = copy_one_mount(
         src_root.as_fd(),
         src,
         fs_name,
@@ -318,6 +318,13 @@ pub fn copytree_reporting(
         &mut stats,
         &mut counter,
     );
+
+    // The primary pass's answer is the destination ROOT's - whether the walk
+    // stamped a mode over the hold. A child mount's pass answers for its own
+    // root and says nothing about this one, so it is not allowed to
+    // overwrite it.
+    let root_stamped = outcome.as_ref().copied().unwrap_or(false);
+    let mut outcome = outcome.map(drop);
 
     // Child mounts, as a post-pass.
     if outcome.is_ok() && config.traverse {
@@ -346,8 +353,17 @@ pub fn copytree_reporting(
     // error path above there is nothing else to report, and a caller told
     // its copy succeeded would otherwise never learn the destination is
     // still owner-only.
+    //
+    // "Has already stamped one" is the walk's own answer, not
+    // `CopyFlags::PERMISSIONS`. The flag says a stamp was *asked for*;
+    // `copy_metadata` wraps `copy_permissions` in `guard`, which swallows
+    // its failure when `raise_error` is false, so the flag being set is no
+    // evidence a mode landed. An `acltype=nfsv4` source copied onto an
+    // `acltype=posix` destination fails `fsetxattr(system.nfs4_acl_xdr)`
+    // EOPNOTSUPP on the root frame every time - not a race - and that left
+    // a borrowed root at the 0o700 hold with `copytree` returning `Ok`.
     if let Some((fd, mode)) = borrowed
-        && !config.flags.contains(CopyFlags::PERMISSIONS)
+        && !root_stamped
     {
         ok_if_acl_governed(fchmod_fd(fd.as_fd(), mode))?;
     }
@@ -375,7 +391,7 @@ fn copy_one_mount(
     progress: &mut dyn FnMut(&CopyTreeProgress),
     stats: &mut CopyTreeStats,
     counter: &mut u64,
-) -> Result<()> {
+) -> Result<bool> {
     // fsiter never yields the start directory, so the root gets a frame of its
     // own, popped after the walk - children are then created while the root is
     // still writable and its timestamps are not bumped by those writes.
@@ -460,11 +476,13 @@ fn copy_one_mount(
     }
 
     // Stamp the directories still open, deepest first, ending with the mount
-    // root now that every child exists.
+    // root now that every child exists - so the LAST answer is the root's,
+    // which is the one the borrowed-root restore needs.
+    let mut root_stamped = false;
     while let Some(frame) = frames.pop() {
-        finish_dir(frame, config)?;
+        root_stamped = finish_dir(frame, config)?;
     }
-    Ok(())
+    Ok(root_stamped)
 }
 
 /// One level of the destination-side directory stack. The destination directory
@@ -482,15 +500,20 @@ struct DirFrame {
 /// Apply a finished destination directory's metadata: permissions, xattrs and
 /// owner, then timestamps last (a chmod or a chown would otherwise bump ctime,
 /// and the children already written bumped mtime).
-fn finish_dir(frame: DirFrame, config: &CopyTreeConfig) -> Result<()> {
-    copy_metadata(
+///
+/// Returns whether this directory's mode was stamped from the source - see
+/// [`copy_metadata`]. Only the mount root's answer is read, by
+/// `copytree_reporting`'s borrowed-root restore.
+fn finish_dir(frame: DirFrame, config: &CopyTreeConfig) -> Result<bool> {
+    let stamped = copy_metadata(
         frame.src.as_fd(),
         frame.dst.as_fd(),
         &frame.xattrs,
         &frame.src_st,
         config,
     )?;
-    apply_timestamps(frame.dst.as_fd(), &frame.src_st, config)
+    apply_timestamps(frame.dst.as_fd(), &frame.src_st, config)?;
+    Ok(stamped)
 }
 
 /// Reopen a directory the walk owns, giving the caller an fd that outlives the
@@ -772,6 +795,26 @@ fn make_special(
     config: &CopyTreeConfig,
 ) -> Result<()> {
     let mode = src_st.mode() as libc::mode_t;
+    // The mode to *create* with follows [`creation_mode`]'s rule, which the
+    // commit that introduced it applied to `make_dir` and `make_file` and
+    // not to this third creator. Passing `src_st.mode()` regardless of the
+    // flag carried the source's permission bits onto a FIFO, socket or
+    // device node while a regular file beside it took the permissive form:
+    // the same flag, the same source mode, two answers, and a source node
+    // at `0o600` produced a destination node no non-owner can open.
+    //
+    // The `S_IFMT` bits are the node's *type* rather than a permission, so
+    // they ride through both arms - `mknodat` selects on them.
+    //
+    // Under `PERMISSIONS` the source's mode is what this creates with, not
+    // a hold: `make_special_meta` below stamps the real mode from this same
+    // `src_st`, and that stamp is `guard`ed, so a hold here would be one
+    // more narrowing that a swallowed failure could make permanent.
+    let create_mode = if config.flags.contains(CopyFlags::PERMISSIONS) {
+        mode
+    } else {
+        (mode & libc::S_IFMT) | creation_mode(config, false)
+    };
     // With `exist_ok` a taken name is **replaced**, the way `make_file`
     // replaces one: the node is built beside it and renamed over. Keeping
     // whatever is there leaves a destination whose entry types diverge from
@@ -779,11 +822,11 @@ fn make_special(
     // source verbatim - while `copytree` returns `Ok` and counts the
     // special in its stats. Every exit from here on has to take the
     // staging entry with it, which is what the two-step tail below is.
-    let staged = match mknod_at(parent, name, mode, src_st) {
+    let staged = match mknod_at(parent, name, create_mode, src_st) {
         Ok(()) => None,
         Err(Errno::EEXIST) if config.exist_ok => {
             let tmp = temp_name()?;
-            mknod_at(parent, tmp.as_os_str(), mode, src_st)?;
+            mknod_at(parent, tmp.as_os_str(), create_mode, src_st)?;
             Some(tmp)
         }
         Err(e) => return Err(e.into()),
@@ -953,13 +996,20 @@ fn list_xattrs(
     }
 }
 
+/// `Ok(true)` when the destination's own permissions were set from the
+/// source. That is the question the borrowed destination root's restore
+/// turns on: `guard` swallows a `copy_permissions` failure when
+/// `raise_error` is false, and nothing downstream could tell that from a
+/// success. `false` with the flag off too - nothing was owed there, and the
+/// restore is what supplies the mode instead.
 fn copy_metadata(
     src: BorrowedFd<'_>,
     dst: BorrowedFd<'_>,
     xattrs: &[CString],
     src_st: &Statx,
     config: &CopyTreeConfig,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut stamped = false;
     let mode = src_st.mode() as u32;
     // Ownership is applied first: chowning a non-directory makes the kernel
     // clear its setuid/setgid bits and any `security.capability`, so the mode
@@ -971,7 +1021,9 @@ fn copy_metadata(
         })?;
     }
     if config.flags.contains(CopyFlags::PERMISSIONS) {
-        guard(config, copy_permissions(src, dst, xattrs, mode))?;
+        let r = copy_permissions(src, dst, xattrs, mode);
+        stamped = r.is_ok();
+        guard(config, r)?;
     }
     if config.flags.contains(CopyFlags::XATTRS) {
         guard(config, copy_xattrs(src, dst, xattrs))?;
@@ -984,7 +1036,7 @@ fn copy_metadata(
     {
         guard(config, copy_setid(dst, xattrs, mode))?;
     }
-    Ok(())
+    Ok(stamped)
 }
 
 fn apply_timestamps(
@@ -1106,15 +1158,28 @@ fn narrows_the_root(
 /// tree, and handing the same mode to the same syscall is how you get it.
 ///
 /// What that resolves to is the **filesystem's** business, not this
-/// function's. On an ordinary one it is the caller's umask, which is the
-/// caller's standing statement about who may read what it creates. On ZFS
-/// with an inheritable ACE on the parent it is the inherited ACL:
-/// `zfs_acl_ids_create` recomputes the new object's mode from the ACL
-/// (`zfs_mode_compute` keeps only `S_IFMT|S_ISUID|S_ISGID|S_ISVTX` of what
-/// was asked for), and under `aclmode=restricted` the requested mode is not
-/// consulted at all - `zfs_acl_inherit` clears `need_chmod` whenever
-/// anything was inherited. Either way the answer is the one the object
-/// would have been created with, which is the point.
+/// function's, and "the umask" is only one of the three answers.
+///
+/// * No ACL inheritance: the caller's umask, the caller's standing
+///   statement about who may read what it creates. `mode_strip_umask`
+///   (`include/linux/namei.h`) applies it in the VFS - but *only* when
+///   `!IS_POSIXACL(dir)`; where the filesystem does POSIX ACLs the VFS
+///   defers, so this is not the universal case it reads as.
+/// * POSIX ACLs with a default ACL on the parent: `posix_acl_create`
+///   (`fs/posix_acl.c`) applies the umask on its no-default-ACL branch and
+///   otherwise lets `posix_acl_create_masq` narrow the mode by the
+///   inherited entries instead. ZFS reaches the same helper directly -
+///   `zpl_init_acl` calls `__posix_acl_create`
+///   (`module/os/linux/zfs/zpl_xattr.c`).
+/// * NFSv4 ACLs with an inheritable ACE on the parent: the inherited ACL,
+///   full stop. `zfs_acl_ids_create` recomputes the mode from it
+///   (`zfs_mode_compute` keeps only `S_IFMT|S_ISUID|S_ISGID|S_ISVTX` of
+///   what was asked for), and under `aclmode=restricted` the requested
+///   mode is not consulted at all - `zfs_acl_inherit` clears `need_chmod`
+///   whenever anything was inherited.
+///
+/// In all three the answer is the one the object would have been created
+/// with, which is the point; none of them is this function's to compute.
 ///
 /// Stamping it afterwards instead would put an `fchmod` on every created
 /// object, and on ZFS a chmod is never just a mode change:
@@ -1192,6 +1257,88 @@ fn read_link_fd(fd: BorrowedFd<'_>) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// A swallowed `copy_permissions` failure must not read as a stamp.
+    ///
+    /// `copy_metadata` wraps it in `guard`, which returns `Ok(())` when
+    /// `raise_error` is false - so the flag being set is no evidence a mode
+    /// landed, and `copytree`'s borrowed-root restore used to read the flag.
+    /// It left a root this copy did not create at the `0o700` hold with
+    /// `copytree` answering `Ok`.
+    ///
+    /// The live trigger is an `acltype=nfsv4` source copied onto an
+    /// `acltype=posix` destination: `system.nfs4_acl_xdr` is in
+    /// `ACCESS_ACL_XATTRS`, so `copy_permissions` `fsetxattr`s it and the
+    /// destination answers EOPNOTSUPP, every time. That needs two dataset
+    /// types and is a QEMU-lane fixture. The failure is provoked here
+    /// through the same door instead - `copy_metadata` takes the attribute
+    /// list as a parameter, so a name the source does not have makes its
+    /// `fgetxattr` answer ENODATA - which exercises the contract that
+    /// changed rather than the one filesystem pairing that reaches it.
+    ///
+    /// **What this does not reach is `copytree`'s use of the answer.**
+    /// `list_xattrs` reads the source's real attributes, so the failure
+    /// cannot be provoked through the public entry point without two
+    /// filesystems that disagree about an ACL namespace - and with
+    /// `PERMISSIONS` off the two formulations (`!root_stamped` and
+    /// `!PERMISSIONS`) agree, so no test here can tell them apart. The
+    /// wiring is covered by reading, not by this.
+    #[test]
+    fn a_swallowed_permissions_failure_is_not_a_stamp() {
+        let d = crate::tempdir().expect("tempdir");
+        let src = d.path().join("s");
+        let dst = d.path().join("d");
+        std::fs::create_dir(&src).expect("src");
+        std::fs::create_dir(&dst).expect("dst");
+        let sf = std::fs::File::open(&src).expect("open src");
+        let df = std::fs::File::open(&dst).expect("open dst");
+        let st = statx(sf.as_fd(), "", AtFlags::AT_EMPTY_PATH, META_MASK)
+            .expect("statx");
+        let cfg = CopyTreeConfig {
+            flags: CopyFlags::PERMISSIONS,
+            raise_error: false,
+            ..Default::default()
+        };
+
+        // The control: nothing named, so `copy_permissions` takes its
+        // `fchmod` branch and succeeds.
+        assert!(
+            copy_metadata(sf.as_fd(), df.as_fd(), &[], &st, &cfg)
+                .expect("guard swallows nothing here"),
+            "a successful copy_permissions is a stamp"
+        );
+
+        // The case: an attribute the source does not have. `fgetxattr`
+        // answers ENODATA, `copy_permissions` returns Err, `guard` swallows
+        // it - and the answer must be "no mode landed".
+        let absent = vec![c"system.posix_acl_default".to_owned()];
+        assert!(
+            !copy_metadata(sf.as_fd(), df.as_fd(), &absent, &st, &cfg)
+                .expect("raise_error is false, so the copy continues"),
+            "a swallowed failure reported itself as a stamp"
+        );
+
+        // And with `raise_error` the same call is an error rather than a
+        // quiet `false`, so the two dispositions stay distinguishable.
+        let strict = CopyTreeConfig {
+            raise_error: true,
+            ..cfg
+        };
+        assert!(
+            copy_metadata(sf.as_fd(), df.as_fd(), &absent, &st, &strict)
+                .is_err(),
+            "raise_error must still propagate it"
+        );
+    }
+
+    /// `mkfifo`, for the special-node rows: `std::fs` has no maker for one.
+    fn mkfifo_at(path: &std::path::Path, mode: libc::mode_t) {
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .expect("a path with no interior NUL");
+        // SAFETY: a valid NUL-terminated path and a mode; creates a name.
+        let r = unsafe { libc::mkfifo(c.as_ptr(), mode) };
+        assert_eq!(r, 0, "mkfifo: {}", std::io::Error::last_os_error());
+    }
+
     /// `copytree` without `CopyFlags::PERMISSIONS` must leave a usable
     /// tree, not an owner-only one.
     ///
@@ -1223,10 +1370,12 @@ mod tests {
         let src = d.path().join("src");
         std::fs::create_dir_all(src.join("sub")).expect("src tree");
         std::fs::write(src.join("sub/f"), b"x").expect("src file");
+        mkfifo_at(&src.join("sub/p"), 0o600);
         for (p, m) in [
             (src.clone(), 0o755u32),
             (src.join("sub"), 0o750),
             (src.join("sub/f"), 0o644),
+            (src.join("sub/p"), 0o600),
         ] {
             std::fs::set_permissions(
                 &p,
@@ -1239,11 +1388,14 @@ mod tests {
             std::fs::metadata(p).expect("stat").permissions().mode() & 0o7777
         };
 
-        // The oracle: the same shape, built the ordinary way.
+        // The oracle: the same shape, built the ordinary way. A special
+        // node is the third creator, and `mkfifo(0o666)` is what one
+        // built outside this copy looks like.
         let r = d.path().join("ref");
         std::fs::create_dir(&r).expect("ref root");
         std::fs::create_dir(r.join("sub")).expect("ref subdir");
         std::fs::File::create(r.join("sub/f")).expect("ref file");
+        mkfifo_at(&r.join("sub/p"), 0o666);
 
         let dst = d.path().join("plain");
         copytree(
@@ -1258,6 +1410,11 @@ mod tests {
         assert_eq!(mode(dst.clone()), mode(r.clone()), "destination root");
         assert_eq!(mode(dst.join("sub")), mode(r.join("sub")), "subdirectory");
         assert_eq!(mode(dst.join("sub/f")), mode(r.join("sub/f")), "file");
+        assert_eq!(
+            mode(dst.join("sub/p")),
+            mode(r.join("sub/p")),
+            "a special node is the third creator and takes the same rule"
+        );
         // And the oracle is not itself owner-only, or every row above would
         // pass on the very state this exists to refuse.
         assert_ne!(
@@ -1281,6 +1438,7 @@ mod tests {
         assert_eq!(mode(dst.clone()), 0o755, "the source root's mode");
         assert_eq!(mode(dst.join("sub")), 0o750, "the source subdir's mode");
         assert_eq!(mode(dst.join("sub/f")), 0o644, "the source file's mode");
+        assert_eq!(mode(dst.join("sub/p")), 0o600, "the source fifo's mode");
     }
 
     /// The destination root is narrowed for the duration only where a

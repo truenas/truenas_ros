@@ -1531,15 +1531,20 @@ mod shutil {
             .write(true)
             .open(src.join("bin"))
             .unwrap();
-        if setxattr(&f, c"security.capability", &CAP_SETUID_EP) != 0 {
-            return; // needs CAP_SETFCAP, or the fs has no security namespace
-        }
+        // The gated probe runs FIRST. A filesystem with no xattrs at all
+        // refuses both names, and the capability skip below is unconditional -
+        // so in the other order an xattr-less scratch filesystem returned here
+        // silently with `TRUENAS_ROS_REQUIRE_XATTRS` armed, which is exactly
+        // what the trailing `user.marker` assertion says must not happen.
         if setxattr(&f, c"user.marker", b"v") != 0 {
             super::xattr_probe::refusal_is_allowed(
                 "setxattr(user.marker)",
                 std::io::Error::last_os_error(),
             );
             return;
+        }
+        if setxattr(&f, c"security.capability", &CAP_SETUID_EP) != 0 {
+            return; // needs CAP_SETFCAP, or the fs has no security namespace
         }
         drop(f);
 

@@ -132,22 +132,39 @@ fn is_http_version(tok: &[u8]) -> bool {
 /// [`method_is_head`] skips them: `httparse` does (RFC 9112 sec. 2.2
 /// robustness), so scanning from byte 0 reads an empty line as the request
 /// line and answers 400 for a real `\r\nGET / HTTP/2.0`.
-fn version_status(buf: &[u8]) -> u16 {
+///
+/// `None` means **the request line has not terminated yet**, so there is no
+/// version token to read and no verdict to give. `httparse` reaches
+/// `Error::Version` before the field is whole: `parse_version` takes eight
+/// bytes at once when it has them and otherwise compares what it does have
+/// against the literal `HTTP/1.` a byte at a time, answering the error at the
+/// first mismatch (`httparse-1.10.1/src/lib.rs:782-788`). `HTTP/2` is refused
+/// at six bytes, two short of a token this would accept, and reading those
+/// six as the whole field answers 400 for a version that is well formed once
+/// the rest arrives - while the same request answers 505 when its line lands
+/// in one segment. Deciding on an unterminated line makes the status a
+/// function of TCP segmentation; the caller waits instead, bounded by
+/// [`HttpConfig::max_head`](super::HttpConfig::max_head) like every other
+/// partial head.
+fn version_status(buf: &[u8]) -> Option<u16> {
     let mut buf = buf;
     while let [b'\r', b'\n', rest @ ..] | [b'\n', rest @ ..] = buf {
         buf = rest;
     }
-    let line_end = buf
-        .iter()
-        .position(|&b| b == b'\r' || b == b'\n')
-        .unwrap_or(buf.len());
+    // `Error::Version` is only reachable once `method SP target SP` has been
+    // consumed, so the first CR/LF from here is the request line's end.
+    let line_end = buf.iter().position(|&b| b == b'\r' || b == b'\n')?;
     let mut fields = buf[..line_end].split(|&b| b == b' ');
-    match (fields.next(), fields.next(), fields.next(), fields.next()) {
-        (Some(_), Some(_), Some(version), None) if is_http_version(version) => {
-            505
-        }
-        _ => 400,
-    }
+    Some(
+        match (fields.next(), fields.next(), fields.next(), fields.next()) {
+            (Some(_), Some(_), Some(version), None)
+                if is_http_version(version) =>
+            {
+                505
+            }
+            _ => 400,
+        },
+    )
 }
 
 /// Shared tokenize step: `httparse` plus the version and Host checks every
@@ -165,8 +182,13 @@ fn tokenize<'s, 'b>(
         Ok(httparse::Status::Partial) => return Ok(None),
         Err(httparse::Error::TooManyHeaders) => return Err(431),
         // `httparse` reports both a real unsupported version and a malformed
-        // request line as `Error::Version`; separate them (505 vs 400).
-        Err(httparse::Error::Version) => return Err(version_status(buf)),
+        // request line as `Error::Version`; separate them (505 vs 400) - and
+        // only once the request line is whole, since the tokenizer raises the
+        // error before it is (see `version_status`).
+        Err(httparse::Error::Version) => match version_status(buf) {
+            Some(status) => return Err(status),
+            None => return Ok(None),
+        },
         Err(_) => return Err(400),
     };
     let version = match req.version {
@@ -964,6 +986,48 @@ mod tests {
             buf.extend_from_slice(b"\r\nHost: h\r\n\r\n");
             assert_eq!(status(&buf), Some(505), "{v:?}");
         }
+    }
+
+    /// The version verdict is a property of the request, not of how the
+    /// socket cut it. `httparse` answers `Error::Version` before the field
+    /// is whole (`parse_version` compares against the literal `HTTP/1.` a
+    /// byte at a time below eight, `httparse-1.10.1/src/lib.rs:782-788`), so
+    /// `HTTP/2.0` is refused at `HTTP/2` - and reading that as the version
+    /// answered the same request 400 when its request line arrived split and
+    /// 505 when it arrived whole.
+    #[test]
+    fn the_version_verdict_does_not_depend_on_segmentation() {
+        for v in [&b"HTTP/2.0"[..], b"HTTP/0.9", b"HTTP/9.9"] {
+            let mut buf = b"GET / ".to_vec();
+            buf.extend_from_slice(v);
+            buf.extend_from_slice(b"\r\nHost: h\r\n\r\n");
+            // Every prefix answers either "need more" or 505 - never 400.
+            for end in 1..=buf.len() {
+                match frame_facts(&buf[..end]) {
+                    Ok(None) => {}
+                    Err(505) => {}
+                    other => panic!(
+                        "{v:?} at {end} bytes: {:?}",
+                        other.map(|o| o.map(|f| f.len))
+                    ),
+                }
+            }
+            // And the whole request still dies 505, not "need more".
+            assert_eq!(frame_facts(&buf).err(), Some(505), "{v:?}");
+        }
+        // The control: byte soup where a version belongs is still 400 at
+        // every prefix that decides at all.
+        let soup = b"GET / XYZZY\r\nHost: h\r\n\r\n";
+        for end in 1..=soup.len() {
+            match frame_facts(&soup[..end]) {
+                Ok(None) | Err(400) => {}
+                other => panic!(
+                    "soup at {end} bytes: {:?}",
+                    other.map(|o| o.map(|f| f.len))
+                ),
+            }
+        }
+        assert_eq!(frame_facts(soup).err(), Some(400));
     }
 
     #[test]

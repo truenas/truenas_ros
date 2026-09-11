@@ -288,6 +288,17 @@ impl RecvBuf {
         &self,
         extent: usize,
     ) -> Option<crate::uring_fs::core::RecvWriteLease<'_>> {
+        // A zero extent is a *redelivery*: `deliver_one` zeroes the frame
+        // because the message's bytes were consumed at its first delivery,
+        // so there is nothing here for a write to borrow. Minted anyway,
+        // the lease still names the claim, and `pwritev2_from`'s bounds
+        // test admits a zero-length range at the base - which a
+        // redelivery's empty `Body` is - so a write with no bytes takes
+        // the claim a read-ahead recv is armed into. The same case
+        // `take_body_handoff` excludes with its `body_len > 0`.
+        if extent == 0 {
+            return None;
+        }
         let c = self.claim.as_ref()?;
         Some(crate::uring_fs::core::RecvWriteLease {
             ptr: c.ptr,
@@ -3182,5 +3193,67 @@ mod tests {
         assert_eq!(c.chunk_out, 0, "the share came back");
         assert_eq!(p.freed, 1, "and the buffer id rode out to the pool");
         assert_eq!(p.freed_bids[0], 7, "the one the segment held");
+    }
+
+    /// A redelivery owns no bytes, so it must not be handed a write lease.
+    ///
+    /// `deliver_one` zeroes a redelivery's frame - the message's bytes went
+    /// at its first delivery - so `deliver_parts_leased` asked
+    /// `write_lease(0)`, which still minted a lease naming the claim with
+    /// `cap == 0`. `pwritev2_from`'s containment gate is
+    /// `at >= base && at + len <= base + cap`, and a redelivery's `Body` is
+    /// an EMPTY slice at the claim base (`RecvBuf::deref` is
+    /// `from_raw_parts(c.ptr, 0)`), so
+    /// a zero-length write passed it: `taken` was set, the op recorded
+    /// `LeaseHold(bid)`, and `consume`'s leased arm surrendered the claim
+    /// to it - while the pump's read-ahead recv was armed into that same
+    /// buffer. The op's completion then releases the id to the pool under
+    /// a live DMA, which is the hazard
+    /// `a_delivery_does_not_release_a_buffer_under_an_armed_recv` closes on
+    /// the other door.
+    ///
+    /// `take_body_handoff` already excludes the same zero-frame case, for
+    /// the same reason, with its `body_len > 0`.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    #[test]
+    fn a_redelivery_is_not_handed_a_write_lease() {
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
+        c.set_recv_pooled();
+        let buf = Box::leak(vec![0u8; 64].into_boxed_slice());
+        let base = buf.as_mut_ptr();
+        c.install_recv_buf(RecvClaim {
+            bid: 7,
+            ptr: base,
+            cap: 64,
+        });
+
+        // A claim held, nothing in it, the next read armed into it.
+        assert_eq!(c.arm_recv(32, false), 32);
+        c.recving = true;
+        assert_eq!(c.recv_ptr(), base as u64, "the kernel has the claim");
+
+        // `deliver_one(Redelivery)` zeroes the frame before delivering.
+        c.set_frame(0, 0);
+        {
+            let (header, body, _peer, _state, lease, _lic) =
+                c.deliver_parts_leased(Some(0));
+            assert!(header.is_empty() && body.is_empty());
+            assert!(
+                lease.is_none(),
+                "a zeroed frame has no bytes to lease the claim for"
+            );
+        }
+        c.consume();
+        assert!(
+            c.recv_buf.claim.is_some(),
+            "the claim stays where the armed recv is writing"
+        );
+
+        // The control: a real wire frame over the same buffer still leases.
+        c.recv_buf.set_filled(8);
+        c.set_frame(4, 4);
+        let (_h, _b, _p, _s, lease, _l) = c.deliver_parts_leased(Some(0));
+        let lease = lease.expect("a wire delivery still gets its lease");
+        assert_eq!((lease.bid, lease.cap), (7, 8), "bounded to the message");
     }
 }

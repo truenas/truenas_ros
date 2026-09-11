@@ -591,13 +591,17 @@ impl QueryDir {
                 if statx.is_some() && confined && cross_dev(statx.as_ref()) {
                     return None;
                 }
-                let file = p.open.and_then(pending_file);
+                let (file, open_err) = match p.open.map(pending_file) {
+                    Some((f, e)) => (f, e),
+                    None => (None, None),
+                };
                 Some(Opened {
                     name: p.name,
                     dtype: p.dtype,
                     statx,
                     statx_err,
                     file,
+                    open_err,
                 })
             })
             .collect();
@@ -709,7 +713,9 @@ impl QueryDir {
                 // that could not be opened is not an entry with no
                 // extended attributes, which is the distinction
                 // [`DirEntry::xattrs_incomplete`] exists to carry.
-                incomplete |= wants_fd && p.file.is_none();
+                incomplete |= wants_fd
+                    && p.file.is_none()
+                    && open_failure_is_incompleteness(p.open_err);
                 // An entry whose open failed has no descriptor to stat, and
                 // so nothing for a by-name answer to be mispaired against:
                 // there it is both safe and the only answer available.
@@ -787,6 +793,14 @@ impl QueryDir {
                 // value this entry was asked for now says whether it was
                 // lost, and the ACL is one of them.
                 let mut incomplete = p.incomplete;
+                // Whether a descriptor was opened at all. A missing pending
+                // means "no op slot was free" only when there *was* a
+                // descriptor to read through; with none, the verdict was
+                // already taken above (`open_failure_is_incompleteness`), and
+                // re-taking it here reports every symlink and every socket -
+                // neither of which this open can ever resolve - as a listing
+                // that could not be completed.
+                let had_fd = p.file.is_some();
                 let mut xattrs: Vec<(CString, Option<Vec<u8>>)> = p
                     .xattrs
                     .into_iter()
@@ -807,8 +821,14 @@ impl QueryDir {
                             // No op slot, so the read never happened: the
                             // slot keeps its name with a `None` value, and
                             // the entry says the listing is short.
-                            Some(DiscRead::Lost) | None => {
+                            Some(DiscRead::Lost) => {
                                 incomplete = true;
+                                None
+                            }
+                            // ... but only where a descriptor existed to
+                            // read through; see `had_fd`.
+                            None => {
+                                incomplete |= had_fd;
                                 None
                             }
                             Some(DiscRead::Drop) => None,
@@ -848,7 +868,18 @@ impl QueryDir {
                     // Absent - on an `acltype=nfsv4` dataset the ordinary
                     // case, since ZFS keeps no `system.nfs4_acl_xdr` for a
                     // trivial ACL - or one this identity may not read.
-                    Some(DiscRead::Drop) | None => None,
+                    Some(DiscRead::Drop) => None,
+                    // No pending where one was asked for and a descriptor
+                    // existed to ask through: the ACL read could not be
+                    // *submitted* (a full op table), which is the same
+                    // unread value `DiscRead::Lost` reports for one that
+                    // was. Without the two conditions this arm also covers
+                    // "no ACL requested" and "no descriptor", neither of
+                    // which is an incompleteness.
+                    None => {
+                        incomplete |= had_fd && spec.contains(EnrichSpec::ACL);
+                        None
+                    }
                 };
                 for (dn, pend) in p.discovered {
                     let val = match pend.map(pending_discovered) {
@@ -921,6 +952,9 @@ struct Opened {
     /// apart by whether it ends up with metadata.
     statx_err: Option<Errno>,
     file: Option<File>,
+    /// Why there is no descriptor, where one was attempted. `None` both when
+    /// the open succeeded and when none was issued.
+    open_err: Option<Errno>,
 }
 struct Reading {
     name: OsString,
@@ -1025,11 +1059,50 @@ fn unresolved_statx_verdict(err: Option<Errno>) -> Option<Errno> {
     }
 }
 
-/// Await an `open` twin: the opened [`File`] on success, else `None`.
-fn pending_file(p: FsPending) -> Option<File> {
-    let out = p.into_outcome().ok()?;
-    out.res.ok()?;
-    out.file.map(File::new)
+/// Await an `open` twin: the opened [`File`] on success, else the errno that
+/// says why there is none - the open's twin of `statx_err`, and the input to
+/// [`open_failure_is_incompleteness`].
+fn pending_file(p: FsPending) -> (Option<File>, Option<Errno>) {
+    let Ok(out) = p.into_outcome() else {
+        return (None, Some(Errno::ECONNABORTED));
+    };
+    match out.res {
+        Ok(_) => match out.file.map(File::new) {
+            Some(f) => (Some(f), None),
+            None => (None, Some(Errno::EIO)),
+        },
+        Err(e) => (None, Some(e)),
+    }
+}
+
+/// Whether a failed entry `open` leaves this entry's values genuinely
+/// *unread* - which is what [`DirEntry::xattrs_incomplete`] reports - rather
+/// than definitely answered.
+///
+/// The same split `pending_discovered` makes for a value read, applied to
+/// the open that precedes it: an object this identity may not open
+/// (`EACCES`/`EPERM`), one that went away between `readdir` and the open
+/// (`ENOENT`), and one that **cannot be opened at all** are definite
+/// answers, not incompletenesses. The last is the easy one to miss and the
+/// only unconditional one: the open is `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`, so
+/// every symbolic link answers `ELOOP` and every socket `ENXIO`, on every
+/// listing, for a directory containing nothing unusual.
+///
+/// Everything else - the marked `EBUSY` of a full op table above all, and
+/// `None`, meaning no op slot was free to issue the open with - is the read
+/// failing, and is reported.
+fn open_failure_is_incompleteness(err: Option<Errno>) -> bool {
+    !matches!(
+        err,
+        Some(
+            Errno::EACCES
+                | Errno::EPERM
+                | Errno::ENOENT
+                | Errno::ELOOP
+                | Errno::ENXIO
+                | Errno::ENOTDIR
+        )
+    )
 }
 
 /// Initial buffer for a discovered attribute's value read; larger values are
@@ -1698,11 +1771,65 @@ fn copy_range_rw(
 #[cfg(all(test, not(loom)))]
 mod confinement_tests {
     use super::{
-        DiscRead, Order, entry_is_dir, pending_discovered, split_statx,
-        unresolved_statx_verdict,
+        DiscRead, Order, entry_is_dir, open_failure_is_incompleteness,
+        pending_discovered, split_statx, unresolved_statx_verdict,
     };
     use crate::errno::Errno;
     use crate::uring_fs::{FsOutcome, FsPending};
+
+    /// An entry that cannot be opened at all is answered, not lost.
+    ///
+    /// The listing opens each entry `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` to
+    /// read its values through, and two ordinary entry types can never
+    /// satisfy that: a symbolic link answers `ELOOP` because of
+    /// `O_NOFOLLOW`, and a socket answers `ENXIO`. Measured with the
+    /// listing's own flags on this tree: sym -> ELOOP, sock -> ENXIO,
+    /// while fifo, regular and directory all open.
+    ///
+    /// Treated as incompletenesses they flag
+    /// [`DirEntry::xattrs_incomplete`] on a listing that lost nothing, for
+    /// a directory containing nothing unusual, and a consumer that
+    /// re-queries on the flag re-queries for ever - re-opening a symlink
+    /// can never succeed. `ENXIO` is the easy half to miss: a definite set
+    /// of `EACCES|EPERM|ENOENT|ELOOP` alone reads as complete and leaves
+    /// every socket entry flagged.
+    ///
+    /// The reported side is what the flag is for, and `None` is in it:
+    /// no op slot was free to issue the open with, so the entry's values
+    /// really are unread.
+    #[test]
+    fn an_unopenable_entry_is_answered_not_lost() {
+        for e in [
+            Errno::EACCES,
+            Errno::EPERM,
+            Errno::ENOENT,
+            Errno::ELOOP,
+            Errno::ENXIO,
+            Errno::ENOTDIR,
+        ] {
+            assert!(
+                !open_failure_is_incompleteness(Some(e)),
+                "{e} is a definite answer about this entry"
+            );
+        }
+        for e in [
+            Errno::EBUSY,
+            Errno::ECANCELED,
+            Errno::ECONNABORTED,
+            Errno::EIO,
+            Errno::EMFILE,
+            Errno::ENOMEM,
+        ] {
+            assert!(
+                open_failure_is_incompleteness(Some(e)),
+                "{e} left this entry's values unread"
+            );
+        }
+        assert!(
+            open_failure_is_incompleteness(None),
+            "no op slot to issue the open with is a failed read"
+        );
+    }
 
     /// An attribute read that did not happen is not an attribute that is
     /// not there.

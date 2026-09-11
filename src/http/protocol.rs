@@ -1242,7 +1242,7 @@ where
 #[allow(clippy::type_complexity)]
 fn build<U, A, H>(
     cfg: HttpConfig,
-    stream_cap: Option<u64>,
+    stream_cap: Option<std::num::NonZeroU64>,
     mut accept: A,
     mut handler: H,
 ) -> crate::Result<
@@ -1257,18 +1257,6 @@ where
     H: FnMut(HttpRequest<'_>, &mut U, FsSlot<'_>) -> HttpVerdict,
 {
     cfg.validate()?;
-    // The streaming cap IS the body limit on a streaming connection
-    // (`stream_cap` bounds every body, buffered or not), so a zero there is
-    // the same "admits nothing" configuration `HttpConfig::validate` exists
-    // to refuse: every request carrying a byte of body would be answered 413.
-    // `HttpConfig::validate` cannot see it - the cap is a builder argument,
-    // not a config field - so it is checked here, where both streaming
-    // constructors pass through.
-    if stream_cap == Some(0) {
-        return Err(crate::Error::Validation(
-            "http streaming max_body_bytes must be non-zero".into(),
-        ));
-    }
     // One date cache per protocol instance - instances are per reactor and
     // handlers run on the reactor thread, so the `Date` value renders once
     // a second instead of once a response, with no synchronization.
@@ -1447,6 +1435,30 @@ where
     )
 }
 
+/// The streaming cap as the type the connection state holds.
+///
+/// The cap IS the body limit on a streaming connection - `stream_cap`
+/// bounds every body, buffered or not - so a zero is the same "admits
+/// nothing" configuration [`HttpConfig::validate`] exists to refuse: every
+/// request carrying a byte of body would be answered 413 while a bodyless
+/// GET was served normally, an endpoint that reads healthy and admits no
+/// payload. `HttpConfig::validate` cannot see it, because the cap is a
+/// builder argument rather than a config field.
+///
+/// The builders take a plain `u64` and refuse zero here, so a
+/// misconfiguration is a named `Validation` rather than a type error at the
+/// call site. Past this point it is `NonZeroU64` and there is nothing left
+/// to check - which is the half that matters, since
+/// [`HttpConn::new_streaming`](super::HttpConn::new_streaming) is public and
+/// reaches the same state without passing through any builder.
+fn stream_cap(max_body_bytes: u64) -> crate::Result<std::num::NonZeroU64> {
+    std::num::NonZeroU64::new(max_body_bytes).ok_or_else(|| {
+        crate::Error::Validation(
+            "http streaming max_body_bytes must be non-zero".into(),
+        )
+    })
+}
+
 /// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint that **streams**
 /// request bodies rather than buffering them.
 ///
@@ -1510,7 +1522,7 @@ where
 {
     build(
         cfg,
-        Some(max_body_bytes),
+        Some(stream_cap(max_body_bytes)?),
         accept,
         move |req: HttpRequest<'_>, state: &mut U, _fs: FsSlot<'_>| {
             handler(req, state)
@@ -1554,7 +1566,7 @@ where
         Option<crate::uring_fs::FsConn<'_>>,
     ) -> HttpVerdict,
 {
-    build(cfg, Some(max_body_bytes), accept, handler)
+    build(cfg, Some(stream_cap(max_body_bytes)?), accept, handler)
 }
 
 /// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint.
@@ -1595,6 +1607,13 @@ mod tests {
     use super::*;
     use crate::http::framer::{Phase, STREAM_WINDOW};
     use crate::net::Framing;
+
+    /// The streaming cap as `new_streaming` takes it. Every literal here is
+    /// non-zero by inspection; a zero is the configuration the builders
+    /// refuse and the type no longer represents.
+    fn nz(n: u64) -> std::num::NonZeroU64 {
+        std::num::NonZeroU64::new(n).expect("a non-zero literal cap")
+    }
 
     /// A streaming protocol streams - and bounds - a connection its accept
     /// wrapper never minted.
@@ -1664,7 +1683,7 @@ mod tests {
 
         // A connection the wrapper *did* mint keeps its own cap - this must
         // adopt, never overwrite.
-        let mut conn = HttpConn::new_streaming((), 1024);
+        let mut conn = HttpConn::new_streaming((), nz(1024));
         let head =
             b"PUT /k HTTP/1.1\r\nHost: h\r\nContent-Length: 2048\r\n\r\n";
         let _ = (proto.header)(head, &mut conn);
@@ -1791,6 +1810,14 @@ mod tests {
     /// one, because the cap is a builder argument rather than a config field.
     #[test]
     fn a_streaming_protocol_rejects_a_zero_body_cap() {
+        // The builder's half. The constructor's half is not a test: it is
+        // `NonZeroU64` in `HttpConn::new_streaming`'s signature, so a zero
+        // cap is unrepresentable rather than refused. That matters because
+        // the adoption site fills `stream_cap` only when it is `None` - a
+        // connection minted with its own cap keeps it, and a kTLS handshake
+        // worker mints exactly that way
+        // (`a_streaming_protocol_bounds_a_connection_it_did_not_mint`), so
+        // a check here could never have covered it.
         assert!(
             protocol_streaming(
                 cfg(),
@@ -2145,7 +2172,7 @@ mod tests {
         let head = b"PUT /up HTTP/1.1\r\nHost: h\r\n\
                      Expect: 100-continue\r\n\
                      Transfer-Encoding: chunked\r\n\r\n";
-        let mut conn = HttpConn::new_streaming((), 1 << 20);
+        let mut conn = HttpConn::new_streaming((), nz(1 << 20));
         let p = peer();
         assert_eq!(
             frame(head, &mut conn, &cfg()),
@@ -2193,7 +2220,7 @@ mod tests {
         let head = b"PUT /up HTTP/1.1\r\nHost: h\r\n\
                      Expect: 100-continue\r\n\
                      Transfer-Encoding: chunked\r\n\r\n";
-        let mut conn = HttpConn::new_streaming((), 1 << 20);
+        let mut conn = HttpConn::new_streaming((), nz(1 << 20));
         let p = peer();
         let _ = frame(head, &mut conn, &cfg());
         let resp = drive_verdict(
@@ -2226,7 +2253,7 @@ mod tests {
         let head = b"PUT /up HTTP/1.1\r\nHost: h\r\n\
                      Expect: 100-continue\r\n\
                      Transfer-Encoding: chunked\r\n\r\n";
-        let mut conn = HttpConn::new_streaming((), 1 << 20);
+        let mut conn = HttpConn::new_streaming((), nz(1 << 20));
         let p = peer();
         let _ = frame(head, &mut conn, &cfg());
         let resp = step(
@@ -2310,7 +2337,7 @@ mod tests {
                 b"abcd".to_vec(),
             ),
         ] {
-            let mut conn = HttpConn::new_streaming((), cap);
+            let mut conn = HttpConn::new_streaming((), nz(cap));
             let mut wire = head.clone();
             wire.extend_from_slice(&body);
             assert!(
@@ -3006,7 +3033,8 @@ mod tests {
     fn a_park_at_end_is_redriven_as_end() {
         let head = b"PUT /up HTTP/1.1\r\nHost: h\r\n\
                      Transfer-Encoding: chunked\r\n\r\n";
-        let mut conn = HttpConn::new_streaming(Vec::<Stage>::new(), 1 << 20);
+        let mut conn =
+            HttpConn::new_streaming(Vec::<Stage>::new(), nz(1 << 20));
         let p = peer();
         let parked: RefCell<Option<HttpDeferred>> = RefCell::new(None);
         let park_once = std::cell::Cell::new(false);

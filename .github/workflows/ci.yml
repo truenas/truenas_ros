@@ -88,6 +88,62 @@ jobs:
         fi
         echo "test targets: $(wc -l < /tmp/tests-on-disk) on disk, all registered"
 
+        # The same census for the shared modules the suites pull in with
+        # `#[path]`. They are not cargo targets, so nothing above reaches
+        # them: a file added here and referenced by no suite is built by
+        # nothing, run by nothing, linted by nothing and fmt-checked by
+        # nothing - exactly the state the step above exists to refuse, one
+        # directory down, and four of the fifteen files in `test/` live
+        # there.
+        #
+        # Measured on 0ad4af5: `test/support/orphan.rs` carrying a
+        # `panic!`, a `deref_addrof` and deliberate misformatting left the
+        # census at exit 0, `cargo fmt --all --check` at exit 0, and
+        # `cargo metadata`'s target list naming it zero times - so
+        # `clippy --all-targets` never compiles it either. The same file
+        # one directory up reddens the census above, and the same
+        # misformatting in a *referenced* support file reddens fmt, so
+        # both instruments are shown reading positive before either is
+        # trusted reading negative.
+        # shellcheck disable=SC2012
+        ls test/support/*.rs | sort > /tmp/support-on-disk
+        sed -n 's/.*#\[path = "\(support\/[^"]*\.rs\)"\].*/test\/\1/p' \
+          test/*.rs | sort -u > /tmp/support-referenced
+        if ! diff -u /tmp/support-on-disk /tmp/support-referenced; then
+          echo "::error::test support census mismatch" \
+               "(- on disk, + pulled in by a registered suite)"
+          exit 1
+        fi
+        echo "test support modules:" \
+             "$(wc -l < /tmp/support-on-disk) on disk, all referenced"
+
+    # The `[[example]]` census, the same shape for the other hand-registered
+    # target table - and the one where the consequence of an omission is
+    # loudest. Autodiscovery DOES build an unregistered example, and that is
+    # the trap: with no entry there is no `required-features` line, so it
+    # compiles in EVERY lane including `--no-default-features`, and the
+    # first gated library call it grows breaks every feature-matrix entry at
+    # once. `examples/fs_callback_layer0.rs` did exactly that, which is why
+    # its entry exists.
+    #
+    # `name` is the key here, not `path` as the two censuses above use: an
+    # example's path is the default `examples/<name>.rs`, and the name is
+    # what `required-features` hangs off.
+    - name: example-target census
+      run: |
+        # shellcheck disable=SC2012
+        ls examples/*.rs | sed 's|^examples/||; s|\.rs$||' | sort \
+          > /tmp/examples-on-disk
+        sed -n '/^\[\[example\]\]/,/^$/p' Cargo.toml \
+          | sed -n 's/^name = "\([^"]*\)"$/\1/p' | sort \
+          > /tmp/examples-registered
+        if ! diff -u /tmp/examples-on-disk /tmp/examples-registered; then
+          echo "::error::example target census mismatch" \
+               "(- on disk, + registered in [[example]])"
+          exit 1
+        fi
+        echo "examples: $(wc -l < /tmp/examples-on-disk) on disk, all registered"
+
     - name: clippy
       run: cargo clippy --all-features --all-targets -- -D warnings
 
@@ -219,11 +275,26 @@ jobs:
         command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
         cd fuzz
         cargo +nightly fuzz build
-        # The census. `cargo fuzz list` reads the `[[bin]]` table, so a
-        # target added under `fuzz_targets/` and never registered there is
-        # built by nothing, smoked by nothing and fmt-checked by nothing -
-        # it just sits in the tree looking covered. Compare the two lists.
+        # The census, over PATHS first. `path = "fuzz_targets/..."` is what
+        # says the file on disk is the file cargo builds; the name is free.
+        # A `[[bin]]` whose path names another file leaves its own
+        # `fuzz_targets/*.rs` built by nothing, smoked by nothing and
+        # fmt-checked by nothing - measured, with a deliberate syntax error
+        # in the orphaned file: `cargo fuzz build` and `cargo fmt --check`
+        # both stayed at exit 0. This is the `[[test]]` census's rule, and
+        # it is here for the same reason.
         # shellcheck disable=SC2012
+        ls fuzz_targets/*.rs | sort > /tmp/fuzz-paths-on-disk
+        sed -n 's|^path = "\(fuzz_targets/[^"]*\.rs\)"$|\1|p' Cargo.toml \
+          | sort > /tmp/fuzz-paths-registered
+        if ! diff -u /tmp/fuzz-paths-on-disk /tmp/fuzz-paths-registered; then
+          echo "::error::fuzz target path census mismatch" \
+               "(- on disk, + registered in [[bin]])"
+          exit 1
+        fi
+        # And over NAMES, which the smoke loop below keys its dictionary and
+        # corpus lookups on: a target renamed away from its file's basename
+        # silently loses both.
         ls fuzz_targets/*.rs | xargs -n1 basename | sed 's/\.rs$//' \
           | sort > /tmp/fuzz-on-disk
         cargo +nightly fuzz list | sort > /tmp/fuzz-registered

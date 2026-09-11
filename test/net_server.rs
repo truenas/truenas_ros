@@ -8467,7 +8467,6 @@ fn fs_dir_listing_replies_through_the_wake_drain() {
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_conn_flistxattr_lists_file_xattrs() {
-    use std::ffi::CString;
     use std::sync::OnceLock;
     use std::time::Duration;
     use truenas_ros::sync_fs::{OFlag, OpenHow};
@@ -8477,24 +8476,15 @@ fn fs_conn_flistxattr_lists_file_xattrs() {
     let fp = dir.path().join("f.txt");
     std::fs::write(&fp, b"x").unwrap();
     // Seed two user xattrs with a plain syscall (independent of fd-xattr
-    // support, which only gates the ring read/write ops).
-    let cpath = CString::new(fp.to_string_lossy().as_bytes().to_vec()).unwrap();
-    for (name, val) in [("user.a", b"1".as_slice()), ("user.b", b"22")] {
-        let cname = CString::new(name).unwrap();
-        // SAFETY: `cpath`/`cname` are valid NUL-terminated C strings; `val` is a
-        // valid buffer of `val.len()` bytes for the syscall's duration.
-        let rc = unsafe {
-            libc::setxattr(
-                cpath.as_ptr(),
-                cname.as_ptr(),
-                val.as_ptr().cast(),
-                val.len(),
-                0,
-            )
-        };
-        if rc != 0 {
-            return; // this fs refuses user xattrs
-        }
+    // support, which only gates the ring read/write ops). Through
+    // `set_user_xattr`, which holds the refusal to
+    // `TRUENAS_ROS_REQUIRE_XATTRS`: every assertion below is behind this
+    // probe, so a hand-rolled `libc::setxattr` with a silent `return`
+    // reports ok having tested nothing on a filesystem without xattrs.
+    if !set_user_xattr(&fp, b"user.a", b"1")
+        || !set_user_xattr(&fp, b"user.b", b"22")
+    {
+        return; // this fs refuses user xattrs
     }
 
     let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
@@ -10324,19 +10314,12 @@ fn fs_as_root_reads_trusted_xattr_across_privilege() {
     // SAFETY: valid path; chmod cannot corrupt memory.
     assert_eq!(unsafe { libc::chmod(cpath.as_ptr(), 0o644) }, 0);
     // Seed a `trusted.*` attribute (root/CAP_SYS_ADMIN only); skip if the fs
-    // refuses it.
-    let tname = CString::new("trusted.tr_test").unwrap();
-    // SAFETY: valid path/name and a 3-byte value.
-    let seeded = unsafe {
-        libc::setxattr(
-            cpath.as_ptr(),
-            tname.as_ptr(),
-            b"cap".as_ptr().cast(),
-            3,
-            0,
-        )
-    };
-    if seeded != 0 {
+    // refuses it. Through `set_user_xattr`, as the privileged-xattr fixture
+    // above already is: the one assertion this test makes sits at its end,
+    // so a hand-rolled `libc::setxattr` with a silent `return` reports ok
+    // having tested nothing - with `TRUENAS_ROS_REQUIRE_XATTRS` armed, which
+    // `qemu-4-test.sh` arms naming this very probe.
+    if !set_user_xattr(&f, b"trusted.tr_test", b"cap") {
         return; // filesystem refuses trusted.* here
     }
 

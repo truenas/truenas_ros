@@ -1821,12 +1821,33 @@ impl FsHandle {
 
     /// Read extended attribute `name` from the open file into `buf`.
     ///
-    /// Returns the attribute's size and the buffer. A `buf` shorter than the
-    /// value fails `ERANGE`; passing an empty `buf` queries the size without
-    /// reading (the kernel's `size == 0` convention). Note this is a **real
-    /// per-operation credential check**, not just attribution: `user.*`
-    /// requires read permission on the inode at call time, and an
-    /// unprivileged `trusted.*` read reports `ENODATA` rather than `EPERM`.
+    /// Returns the attribute's size and the buffer. Passing an empty `buf`
+    /// queries the size without reading (the kernel's `size == 0`
+    /// convention). Note this is a **real per-operation credential check**,
+    /// not just attribution: `user.*` requires read permission on the inode
+    /// at call time, and an unprivileged `trusted.*` read reports `ENODATA`
+    /// rather than `EPERM`.
+    ///
+    /// # A short buffer is reported two ways
+    ///
+    /// A `buf` shorter than the value fails **`ERANGE` or `E2BIG`**, and
+    /// which one arrives is decided by the buffer rather than by the value.
+    /// `do_getxattr` (`fs/xattr.c`) ends by rewriting the filesystem's
+    /// `-ERANGE` to `-E2BIG` whenever the caller's buffer is at or above the
+    /// kernel's own `XATTR_SIZE_MAX` (65536, `uapi/linux/limits.h`), and
+    /// that rewrite carries no `IS_LARGE_XATTR` guard even though the size
+    /// clamp directly above it does. On a filesystem whose values may reach
+    /// `XATTR_LARGE_SIZE_MAX` (2 MiB) a retry buffer big enough for a large
+    /// value is therefore exactly the buffer whose short read reports
+    /// `E2BIG`. Measured on ZFS against a 204800-byte value: 4096 and 65535
+    /// answer `ERANGE`, 65536 and 65537 answer `E2BIG`, 204800 answers
+    /// `Ok(204800)`.
+    ///
+    /// So a grow-and-retry loop must enter on **both**. Written to `ERANGE`
+    /// alone it converges for small values and drops any value past ~43 KiB
+    /// as oversized, because its first 1.5x retry lands at or over 65536.
+    /// `E2BIG` on its own does not mean "too big for this filesystem"; that
+    /// is what the size-only form answers.
     pub fn fgetxattr(
         &self,
         who: Personality,
@@ -2938,9 +2959,29 @@ mod loom_tests {
             let (h, rx, shared) = handle();
             let (reply_tx, _reply_rx) = mpsc::channel();
 
-            // The shipping spelling, so weakening it fails this model.
-            shared.request_stop();
-            let refused = h
+            // The stop runs on its OWN thread, which is what makes this a
+            // model at all: with the store and the send in program order
+            // there is exactly one interleaving to explore, so loom runs
+            // the body once and nothing about when the flag becomes
+            // visible is under test. Two threads is the race the module
+            // header describes - the loop decides to stop while a caller
+            // is inside `send`.
+            //
+            // Measured: the in-line form explores 1 execution; this one
+            // explores 6 and reaches both answers (4 accepted, 2 refused),
+            // so both arms of the assertion below are exercised.
+            //
+            // What it checks is that `send`'s answer and the queue AGREE,
+            // not the flag's Release/Acquire pairing: weakening both sides
+            // to `Relaxed` leaves this model - and every other in the lane
+            // - green, because the agreement holds whatever order the flag
+            // becomes visible in. That ordering has no model; do not read
+            // this one as its detector.
+            let stopper = {
+                let shared = Arc::clone(&shared);
+                loom::thread::spawn(move || shared.request_stop())
+            };
+            let accepted = h
                 .send(FsInject::Fsync {
                     pers: 0,
                     file: scratch_fd(),
@@ -2949,12 +2990,18 @@ mod loom_tests {
                     length: 0,
                     reply: ReplyTo::Sync(reply_tx),
                 })
-                .is_err();
+                .is_ok();
+            stopper.join().unwrap();
 
-            assert!(refused, "send accepted an inject after stop was set");
-            assert!(
-                rx.try_recv().is_err(),
-                "a refused inject was queued anyway"
+            // Either answer is legal - the stop may land before or after
+            // the screen. What is not legal is the two disagreeing: an
+            // accepted inject that never reached the queue is the caller
+            // parked for ever, and a refused one that did is a payload
+            // handed back while the loop still owns it.
+            assert_eq!(
+                accepted,
+                rx.try_recv().is_ok(),
+                "send's answer and the queue disagree"
             );
         });
     }
