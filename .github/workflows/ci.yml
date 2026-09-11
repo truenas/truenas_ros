@@ -105,9 +105,24 @@ jobs:
         # misformatting in a *referenced* support file reddens fmt, so
         # both instruments are shown reading positive before either is
         # trusted reading negative.
+        #
+        # The reference scan is anchored at the START of the line, modulo
+        # indentation: unanchored, it counts an attribute inside a COMMENT,
+        # which is exactly the state that makes a support file an orphan -
+        # a `#[path]` commented out while its module is temporarily
+        # disabled. Measured at bfc51e2 with the unanchored form:
+        # `test/support/orphan.rs` holding a `deref_addrof` and deliberate
+        # misformatting, plus `// temporarily disabled: #[path =
+        # "support/orphan.rs"] mod orphan;` in `test/test.rs`, left this
+        # census at "5 on disk, all referenced", exit 0, `cargo fmt --all
+        # --check` at exit 0 and `clippy --all-features --all-targets -- -D
+        # warnings` at exit 0. The same misformatting in a REFERENCED
+        # support file turns fmt red, so the instrument is shown reading
+        # positive before it is trusted reading negative. An indented
+        # `#[path]` - one inside a `mod { }` block - still counts.
         # shellcheck disable=SC2012
         ls test/support/*.rs | sort > /tmp/support-on-disk
-        sed -n 's/.*#\[path = "\(support\/[^"]*\.rs\)"\].*/test\/\1/p' \
+        sed -n 's|^[[:space:]]*#\[path = "\(support/[^"]*\.rs\)"\].*|test/\1|p' \
           test/*.rs | sort -u > /tmp/support-referenced
         if ! diff -u /tmp/support-on-disk /tmp/support-referenced; then
           echo "::error::test support census mismatch" \
@@ -131,8 +146,23 @@ jobs:
     # what `required-features` hangs off.
     - name: example-target census
       run: |
+        # Cargo autodiscovers an example TWO ways - `examples/<name>.rs` and
+        # `examples/<name>/main.rs` - so a census over the first glob alone
+        # leaves the directory-shaped half of the trap open. Measured at
+        # bfc51e2: `examples/orphan_dir/main.rs` calling a `net-core`-gated
+        # item left this step at "examples: 8 on disk, all registered", exit
+        # 0, while `cargo metadata` listed it as an example with
+        # `required-features: None` and the feature matrix's first line
+        # (`clippy --no-default-features --all-targets`) failed to compile
+        # it - the exact breakage the paragraph above describes. A directory
+        # with no `main.rs` is not a target and must stay green, so the
+        # second glob names `main.rs` rather than the directory.
+        # `|| true`: this block is the pipeline's subshell and inherits
+        # `-e`, so an unmatched glob would abort it before the second `ls`.
         # shellcheck disable=SC2012
-        ls examples/*.rs | sed 's|^examples/||; s|\.rs$||' | sort \
+        { ls examples/*.rs 2>/dev/null || true
+          ls examples/*/main.rs 2>/dev/null || true
+        } | sed 's|^examples/||; s|/main\.rs$||; s|\.rs$||' | sort \
           > /tmp/examples-on-disk
         sed -n '/^\[\[example\]\]/,/^$/p' Cargo.toml \
           | sed -n 's/^name = "\([^"]*\)"$/\1/p' | sort \
@@ -431,6 +461,40 @@ jobs:
 
     - name: rustfmt
       run: cargo fmt --all --check
+
+    # The `test/support` census of the parent job, for the one crate that
+    # census cannot see: this workspace is self-rooted, so nothing there
+    # compiles it. `tests/*.rs` IS autodiscovered here and needs no census;
+    # `tests/support/*.rs` is reached by plain `mod` resolution out of
+    # `tests/support/mod.rs`, so a file added beside it and named by nothing
+    # is built by nothing, linted by nothing and fmt-checked by nothing -
+    # the same state, one crate over. Measured at bfc51e2:
+    # `tests/support/orphan.rs` holding text that is not Rust at all left
+    # `cargo fmt --all --check` at exit 0 and `cargo metadata`'s target list
+    # naming it zero times, so `clippy --all-targets` never compiles it
+    # either; the same misformatting in the REFERENCED `tests/support/mod.rs`
+    # turns fmt red, so the instrument is shown reading positive before it is
+    # trusted reading negative.
+    - name: test support census
+      run: |
+        if ! grep -qE '^[[:space:]]*(pub )?mod support;' tests/*.rs; then
+          echo "::error::no suite declares \`mod support;\`, so" \
+               "tests/support/ is reached by nothing"
+          exit 1
+        fi
+        # shellcheck disable=SC2012
+        ls tests/support/*.rs | sort > /tmp/ac-support-on-disk
+        { echo tests/support/mod.rs
+          sed -n 's|^[[:space:]]*\(pub \)\?mod \([a-z0-9_]*\);.*|tests/support/\2.rs|p' \
+            tests/support/mod.rs
+        } | sort -u > /tmp/ac-support-referenced
+        if ! diff -u /tmp/ac-support-on-disk /tmp/ac-support-referenced; then
+          echo "::error::api-client test support census mismatch" \
+               "(- on disk, + reached from tests/support/mod.rs)"
+          exit 1
+        fi
+        echo "api-client test support modules:" \
+             "$(wc -l < /tmp/ac-support-on-disk) on disk, all referenced"
 
     - name: clippy
       run: cargo clippy --all-targets -- -D warnings
