@@ -1132,11 +1132,24 @@ impl ApiClient {
         for conn in self.bulk.iter().map(|(id, _)| *id).collect::<Vec<_>>() {
             // A dead session drops its own queue with a clear failure
             // rather than silently holding items no flush can ever send.
-            let Some(cap) = self.sessions.get(&conn).map(|s| s.max_outbound())
-            else {
+            let Some(sess) = self.sessions.get(&conn) else {
                 self.drain_bulk_to_closed(conn, "bulk session is gone");
                 continue;
             };
+            // A session still dialing is not a dead one. `queue_bulk`
+            // admits an item against any session this client knows, and
+            // the tick clock starts due (`last_tick` is `None`), so the
+            // first `pump` after a `connect_start` reaches this loop
+            // while the session is still in `AwaitingHead`. Failing the
+            // items there hands the caller `Closed` for a session that
+            // is about to be healthy - and takes the items with it,
+            // because `take_chunk` has already removed them. Hold them
+            // for a later tick instead; the only thing that may drop a
+            // queue is the session being *gone*.
+            if !matches!(sess.phase, Phase::Open) {
+                continue;
+            }
+            let cap = sess.max_outbound();
             let session = SessionId(conn);
             for method in self.bulk_methods(conn) {
                 loop {
