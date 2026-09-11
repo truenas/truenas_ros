@@ -702,6 +702,14 @@ impl QueryDir {
                     }
                     None => {}
                 }
+                // No descriptor where one was wanted: every value this
+                // entry was asked for is unread, and none of the reads
+                // above ran to say so. The open is a ring op, so a full
+                // op table answers a marked `EBUSY` here - and an entry
+                // that could not be opened is not an entry with no
+                // extended attributes, which is the distinction
+                // [`DirEntry::xattrs_incomplete`] exists to carry.
+                incomplete |= wants_fd && p.file.is_none();
                 // An entry whose open failed has no descriptor to stat, and
                 // so nothing for a by-name answer to be mispaired against:
                 // there it is both safe and the only answer available.
@@ -775,6 +783,10 @@ impl QueryDir {
                     p.dtype,
                     statx.as_ref().map(Statx::is_dir),
                 );
+                // Declared before the reads that report into it: every
+                // value this entry was asked for now says whether it was
+                // lost, and the ACL is one of them.
+                let mut incomplete = p.incomplete;
                 let mut xattrs: Vec<(CString, Option<Vec<u8>>)> = p
                     .xattrs
                     .into_iter()
@@ -782,17 +794,62 @@ impl QueryDir {
                         let val = match pend.map(pending_discovered) {
                             Some(DiscRead::Got(v)) => Some(v),
                             Some(DiscRead::Grow) => {
-                                p.file.as_ref().and_then(|f| {
+                                // `ERANGE` proved the value readable and
+                                // oversized, so losing it now is a failed
+                                // read, not a denial - the discovered
+                                // twin below says the same.
+                                let v = p.file.as_ref().and_then(|f| {
                                     refetch_grow(&self.h, who, f, &xn)
-                                })
+                                });
+                                incomplete |= v.is_none();
+                                v
                             }
-                            Some(DiscRead::Drop) | None => None,
+                            // No op slot, so the read never happened: the
+                            // slot keeps its name with a `None` value, and
+                            // the entry says the listing is short.
+                            Some(DiscRead::Lost) | None => {
+                                incomplete = true;
+                                None
+                            }
+                            Some(DiscRead::Drop) => None,
                         };
                         (xn, val)
                     })
                     .collect();
-                let acl = p.acl.and_then(pending_bytes);
-                let mut incomplete = p.incomplete;
+                // The ACL reads like every other value, which it did not
+                // before: `pending_bytes` mapped *every* error to `None`,
+                // so a marked `EBUSY` from a full op table, a torn-down
+                // loop and a value past the probe were all reported as the
+                // attribute being **absent**, with nothing flagged. A
+                // trivial ACL and an unread one are not the same answer to
+                // a permissions layer mirroring ACLs out of a listing.
+                //
+                // The growth arm is reachable only for an `acl_name`
+                // pointing at something larger than the 64 KiB probe. It
+                // cannot be `system.nfs4_acl_xdr` on ZFS: `zpl_xattr.c`
+                // refuses `naces > NFS41ACL_MAX_ACES` (1024) at set time
+                // and `ACES_TO_XDRSIZE` is `8 + n*20`, so the largest
+                // storable value is 20488 bytes. It is here because the
+                // slot takes a caller-supplied name, not because that
+                // one overflows.
+                let acl = match p.acl.map(pending_discovered) {
+                    Some(DiscRead::Got(v)) => Some(v),
+                    Some(DiscRead::Grow) => {
+                        let v = p.file.as_ref().and_then(|f| {
+                            refetch_grow(&self.h, who, f, &self.opts.acl_name)
+                        });
+                        incomplete |= v.is_none();
+                        v
+                    }
+                    Some(DiscRead::Lost) => {
+                        incomplete = true;
+                        None
+                    }
+                    // Absent - on an `acltype=nfsv4` dataset the ordinary
+                    // case, since ZFS keeps no `system.nfs4_acl_xdr` for a
+                    // trivial ACL - or one this identity may not read.
+                    Some(DiscRead::Drop) | None => None,
+                };
                 for (dn, pend) in p.discovered {
                     let val = match pend.map(pending_discovered) {
                         Some(DiscRead::Got(v)) => Some(v),
@@ -805,7 +862,13 @@ impl QueryDir {
                             incomplete |= v.is_none();
                             v
                         }
-                        Some(DiscRead::Drop) | None => None,
+                        // As above: nothing was read, so the name is not
+                        // reportable as absent.
+                        Some(DiscRead::Lost) | None => {
+                            incomplete = true;
+                            None
+                        }
+                        Some(DiscRead::Drop) => None,
                     };
                     if let Some(v) = val {
                         xattrs.push((dn, Some(v)));
@@ -969,15 +1032,6 @@ fn pending_file(p: FsPending) -> Option<File> {
     out.file.map(File::new)
 }
 
-/// Await an `fgetxattr` twin: the attribute value (truncated to its size), else
-/// `None` (absent / error / gone loop).
-fn pending_bytes(p: FsPending) -> Option<Vec<u8>> {
-    let out = p.into_outcome().ok()?;
-    let n = usize::try_from(out.res.ok()?).ok()?;
-    let buf = out.bufs.into_iter().next()?;
-    right_size(buf, n)
-}
-
 /// Initial buffer for a discovered attribute's value read; larger values are
 /// refetched at their true size (see [`refetch_grow`]).
 const DISCOVER_BUF: usize = 4096;
@@ -1039,8 +1093,16 @@ enum DiscRead {
     Got(Vec<u8>),
     /// Value outgrew the initial buffer (`ERANGE`); refetch at its true size.
     Grow,
-    /// Absent, or `who` lacks the privilege to read it, or the loop is gone.
+    /// Absent (`ENODATA`), or `who` lacks the privilege to read it
+    /// (`EACCES`/`EPERM`). A deliberate drop, never an incompleteness --
+    /// see [`DirEntry::xattrs_incomplete`].
     Drop,
+    /// The read itself failed: the marked `EBUSY` of a full op table, a
+    /// torn-down loop, or a count the buffer cannot account for. The
+    /// attribute may well be there and readable, so this is the case
+    /// [`DirEntry::xattrs_incomplete`] exists to report - it is not
+    /// "absent".
+    Lost,
 }
 
 /// Narrow an owned buffer to the `n` bytes the kernel filled, keeping the
@@ -1092,7 +1154,7 @@ fn right_size(mut buf: Vec<u8>, n: usize) -> Option<Vec<u8>> {
 /// Classify a discovered attribute's `fgetxattr` outcome (see [`DiscRead`]).
 fn pending_discovered(p: FsPending) -> DiscRead {
     let Some(out) = p.into_outcome().ok() else {
-        return DiscRead::Drop;
+        return DiscRead::Lost;
     };
     match out.res {
         Ok(n) => match out
@@ -1102,10 +1164,40 @@ fn pending_discovered(p: FsPending) -> DiscRead {
             .and_then(|b| right_size(b, usize::try_from(n).ok()?))
         {
             Some(v) => DiscRead::Got(v),
-            None => DiscRead::Drop,
+            None => DiscRead::Lost,
         },
-        Err(Errno::ERANGE) => DiscRead::Grow,
-        Err(_) => DiscRead::Drop,
+        // Both spellings of "your buffer was too small"
+        // ([`is_short_buffer`]), so the classification does not depend on
+        // how large the probe buffer that reached it happens to be. Both
+        // are 64 KiB or under today, so only `ERANGE` can arrive; keeping
+        // the pair together is what stops a raised probe buffer from
+        // silently turning growth into a drop.
+        Err(e) if is_short_buffer(e) => DiscRead::Grow,
+        // A definite answer of "no value here", which is never an
+        // incompleteness: the attribute is not set (`ENODATA`), this
+        // identity may not read it (`EACCES`/`EPERM` -
+        // `unresolved_statx_verdict`'s split, minus `ENOENT`, which names a
+        // path where these take a descriptor), or the filesystem does not
+        // implement that attribute at all.
+        //
+        // **`EOPNOTSUPP` belongs here and it is the easy one to miss.** It
+        // is what an `acltype=posixacl` dataset answers for
+        // `system.nfs4_acl_xdr` (`zpl_xattr_acl_get_access` and its NFSv4
+        // twin, `module/os/linux/zfs/zpl_xattr.c`), and
+        // [`QueryOptions::acl_name`] is a name the *caller* supplies - so a
+        // permissions layer that asks for the NFSv4 ACL while listing a
+        // POSIX dataset gets that errno for every single entry. Classed as
+        // a failed read it would flag [`DirEntry::xattrs_incomplete`] on a
+        // listing that is complete, on every entry, for a filesystem doing
+        // exactly what it says.
+        //
+        // Everything else is the read failing - the marked `EBUSY` of a
+        // full op table above all, reached under exactly the pressure that
+        // makes a listing large - and is reported.
+        Err(
+            Errno::ENODATA | Errno::EACCES | Errno::EPERM | Errno::EOPNOTSUPP,
+        ) => DiscRead::Drop,
+        Err(_) => DiscRead::Lost,
     }
 }
 
@@ -1186,7 +1278,10 @@ pub(crate) fn scan_xattrs(
         let val = match p.map(pending_discovered) {
             Some(DiscRead::Got(v)) => Some(v),
             Some(DiscRead::Grow) => refetch_grow(h, who, f, &n),
-            Some(DiscRead::Drop) | None => None,
+            // This signature has nowhere to carry "and one was lost" the
+            // way [`DirEntry::xattrs_incomplete`] does, so a refused read
+            // is still dropped here. Widening it is a separate change.
+            Some(DiscRead::Drop | DiscRead::Lost) | None => None,
         };
         if let Some(v) = val {
             out.push((n, v));
@@ -1602,9 +1697,102 @@ fn copy_range_rw(
 
 #[cfg(all(test, not(loom)))]
 mod confinement_tests {
-    use super::{Order, entry_is_dir, split_statx, unresolved_statx_verdict};
+    use super::{
+        DiscRead, Order, entry_is_dir, pending_discovered, split_statx,
+        unresolved_statx_verdict,
+    };
     use crate::errno::Errno;
     use crate::uring_fs::{FsOutcome, FsPending};
+
+    /// An attribute read that did not happen is not an attribute that is
+    /// not there.
+    ///
+    /// [`DirEntry::xattrs_incomplete`] exists to separate the two, and its
+    /// own doc names the causes: "the `flistxattr` itself failed ..., an op
+    /// slot was unavailable, or a value known to be readable could not be
+    /// refetched". Everything downstream of this classification keys off it
+    /// -- the explicit names, the discovered names, and the ACL - so the
+    /// split lives here, once, and is pinned here.
+    ///
+    /// The two deliberate drops are `unresolved_statx_verdict`'s, minus
+    /// `ENOENT` (which names a *path*, and these reads take a descriptor)
+    /// plus `ENODATA` (the attribute genuinely is not there). Getting the
+    /// membership wrong in either direction is a real defect: a marked
+    /// `EBUSY` classed as `Drop` reports a full op table as "this file has
+    /// no ACL", and an `EACCES` classed as `Lost` flags every listing under
+    /// an identity that cannot read `trusted.*`.
+    #[test]
+    fn a_refused_value_read_is_not_an_absent_attribute() {
+        fn classify(res: Result<i32, Errno>, buf: Vec<u8>) -> DiscRead {
+            pending_discovered(FsPending::resolved(FsOutcome::new(
+                res,
+                vec![buf],
+                None,
+                None,
+            )))
+        }
+
+        assert!(
+            matches!(classify(Ok(3), vec![1, 2, 3, 0, 0]), DiscRead::Got(v) if v == [1, 2, 3]),
+            "a short value in a probe buffer is the value"
+        );
+        assert!(
+            matches!(classify(Err(Errno::ERANGE), vec![0; 4]), DiscRead::Grow),
+            "ERANGE is the refetch signal, not a loss"
+        );
+        // `E2BIG` is the same signal for a large caller buffer:
+        // `do_getxattr` (`fs/xattr.c:852-857`) rewrites the filesystem's
+        // `-ERANGE` to it once the buffer reaches the kernel's
+        // `XATTR_SIZE_MAX`. Unreachable from here today - both probe
+        // buffers are 64 KiB or under - and pinned anyway, because the
+        // fixed sizes are the only reason it is, and `refetch_grow`,
+        // whose buffers do pass 64 KiB, needs the same answer.
+        assert!(
+            matches!(classify(Err(Errno::E2BIG), vec![0; 4]), DiscRead::Grow),
+            "E2BIG is ERANGE for a buffer at or above XATTR_SIZE_MAX"
+        );
+
+        // Deliberate drops: a definite "no value here". Never an
+        // incompleteness.
+        //
+        // `EOPNOTSUPP` is the one that costs if it is missed. An
+        // `acltype=posixacl` dataset answers it for `system.nfs4_acl_xdr`,
+        // and `acl_name` is the caller's to choose, so classing it as a
+        // failed read flags every entry of a complete listing whenever a
+        // permissions layer asks for the NFSv4 ACL on a POSIX dataset.
+        for e in [
+            Errno::ENODATA,
+            Errno::EACCES,
+            Errno::EPERM,
+            Errno::EOPNOTSUPP,
+        ] {
+            assert!(
+                matches!(classify(Err(e), vec![0; 4]), DiscRead::Drop),
+                "{e} is a definite answer, not a failed read"
+            );
+        }
+
+        // The read failing. `EBUSY` is the marked refusal of a full op
+        // table - reached under exactly the pressure that makes a listing
+        // large - and `ECONNABORTED` is a loop torn down mid-flight.
+        for e in [
+            Errno::EBUSY,
+            Errno::EIO,
+            Errno::ECANCELED,
+            Errno::ECONNABORTED,
+        ] {
+            assert!(
+                matches!(classify(Err(e), vec![0; 4]), DiscRead::Lost),
+                "{e} left the value unread, which is not 'absent'"
+            );
+        }
+
+        // A count the buffer cannot account for is not a value either.
+        assert!(
+            matches!(classify(Ok(9), vec![0; 4]), DiscRead::Lost),
+            "a count past the buffer is a failed read"
+        );
+    }
 
     /// An ordered listing emits the directory-ness it sorted by.
     ///

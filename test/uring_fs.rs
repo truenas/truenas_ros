@@ -2644,6 +2644,82 @@ fn query_directory_explicit_large_value() {
     });
 }
 
+/// An ACL the filesystem does not implement is **absent**, not a listing that
+/// could not be completed.
+///
+/// [`QueryOptions::acl_name`] is the caller's to choose, and a permissions
+/// layer that asks for `system.nfs4_acl_xdr` while listing an
+/// `acltype=posixacl` dataset gets `EOPNOTSUPP` for every entry - measured:
+/// tmpfs and a posixacl ZFS dataset both answer it. Classed as a failed read
+/// that raises `xattrs_incomplete` on every entry of a complete listing, for a
+/// filesystem doing exactly what it says, and a consumer that reads the flag
+/// re-queries or refuses for ever.
+///
+/// The first half is the live control. A `None` ACL proves nothing on its own -
+/// the slot reads `None` when `EnrichSpec::ACL` was never requested, when the
+/// entry could not be opened, and when the read was refused - so the same
+/// listing machinery is first shown fetching an `acl_name` that *is* readable.
+#[test]
+fn query_directory_reports_an_unimplemented_acl_as_absent() {
+    use truenas_ros::uring_fs::{
+        EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
+    };
+
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("obj.bin"), b"x").unwrap();
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let readable = xattr_name("user.pretend_acl");
+        let value = b"an acl blob".to_vec();
+
+        let set_ok = {
+            let how = OpenHow::new().flags(OFlag::O_RDWR);
+            let f = h.open(me, &anchor, "obj.bin", how).unwrap();
+            let (res, _) = h.fsetxattr(me, &f, &readable, value.clone(), 0);
+            h.close(f).unwrap();
+            fd_xattr_ok("fsetxattr(user.pretend_acl)", &res)
+        };
+
+        let list = |acl_name: CString| {
+            let opts = QueryOptions {
+                spec: EnrichSpec::ACL,
+                acl_name,
+                xattr_ns: XattrNamespaces::empty(),
+                ..Default::default()
+            };
+            let mut q = query_directory(&h, me, &anchor, opts).unwrap();
+            let mut seen = None;
+            while let Some(batch) = q.next() {
+                for e in batch.unwrap() {
+                    if e.name.as_bytes() == b"obj.bin" {
+                        seen = Some((e.acl.clone(), e.xattrs_incomplete));
+                    }
+                }
+            }
+            seen.expect("the listing never yielded the file it was given")
+        };
+
+        // The control: the ACL slot really does fetch.
+        if set_ok {
+            let (acl, incomplete) = list(readable);
+            assert_eq!(
+                acl.as_deref(),
+                Some(value.as_slice()),
+                "the ACL slot did not fetch a readable attribute"
+            );
+            assert!(!incomplete, "a value that was read is not incomplete");
+        }
+
+        // The case: a name this filesystem has no handler for.
+        let (acl, incomplete) = list(xattr_name("system.nfs4_acl_xdr"));
+        assert!(acl.is_none(), "there is no NFSv4 ACL here to report");
+        assert!(
+            !incomplete,
+            "an attribute the filesystem does not implement is absent, \
+             not a listing that could not be completed"
+        );
+    });
+}
+
 /// Discovery runs each value read under the caller: an unprivileged identity
 /// sees the world-readable `user.*` attribute but never the `trusted.*` one,
 /// while a privileged identity does. The candidate-listing `flistxattr` runs at
