@@ -1821,12 +1821,33 @@ impl FsHandle {
 
     /// Read extended attribute `name` from the open file into `buf`.
     ///
-    /// Returns the attribute's size and the buffer. A `buf` shorter than the
-    /// value fails `ERANGE`; passing an empty `buf` queries the size without
-    /// reading (the kernel's `size == 0` convention). Note this is a **real
-    /// per-operation credential check**, not just attribution: `user.*`
-    /// requires read permission on the inode at call time, and an
-    /// unprivileged `trusted.*` read reports `ENODATA` rather than `EPERM`.
+    /// Returns the attribute's size and the buffer. Passing an empty `buf`
+    /// queries the size without reading (the kernel's `size == 0`
+    /// convention). Note this is a **real per-operation credential check**,
+    /// not just attribution: `user.*` requires read permission on the inode
+    /// at call time, and an unprivileged `trusted.*` read reports `ENODATA`
+    /// rather than `EPERM`.
+    ///
+    /// # A short buffer is reported two ways
+    ///
+    /// A `buf` shorter than the value fails **`ERANGE` or `E2BIG`**, and
+    /// which one arrives is decided by the buffer rather than by the value.
+    /// `do_getxattr` (`fs/xattr.c`) ends by rewriting the filesystem's
+    /// `-ERANGE` to `-E2BIG` whenever the caller's buffer is at or above the
+    /// kernel's own `XATTR_SIZE_MAX` (65536, `uapi/linux/limits.h`), and
+    /// that rewrite carries no `IS_LARGE_XATTR` guard even though the size
+    /// clamp directly above it does. On a filesystem whose values may reach
+    /// `XATTR_LARGE_SIZE_MAX` (2 MiB) a retry buffer big enough for a large
+    /// value is therefore exactly the buffer whose short read reports
+    /// `E2BIG`. Measured on ZFS against a 204800-byte value: 4096 and 65535
+    /// answer `ERANGE`, 65536 and 65537 answer `E2BIG`, 204800 answers
+    /// `Ok(204800)`.
+    ///
+    /// So a grow-and-retry loop must enter on **both**. Written to `ERANGE`
+    /// alone it converges for small values and drops any value past ~43 KiB
+    /// as oversized, because its first 1.5x retry lands at or over 65536.
+    /// `E2BIG` on its own does not mean "too big for this filesystem"; that
+    /// is what the size-only form answers.
     pub fn fgetxattr(
         &self,
         who: Personality,

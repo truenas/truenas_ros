@@ -99,9 +99,11 @@ pub(crate) fn is_short_buffer(e: Errno) -> bool {
 const INITIAL_BUF: usize = 4096;
 
 fn fgetxattr_cstr(raw: RawFd, name: &CStr) -> errno::Result<Vec<u8>> {
-    // Read first, size only on ERANGE: the value outgrew the buffer (or
-    // grew between a probe and its read - the same race, handled the same
-    // way), so probe the current size and retry a bounded number of times,
+    // Read first, size only on a short buffer ([`is_short_buffer`], which
+    // is `ERANGE` or `E2BIG` - the kernel spells it two ways and the
+    // buffer decides which): the value outgrew the buffer (or grew between
+    // a probe and its read - the same race, handled the same way), so
+    // probe the current size and retry a bounded number of times,
     // over-allocating on retry so a steadily growing value converges
     // rather than spinning.
     let mut cap = INITIAL_BUF;

@@ -1808,9 +1808,13 @@ impl FsCore {
         // did not happen.
         //
         // FGETXATTR: `value` is the caller's OUTPUT buffer, and a generous
-        // one is legal - `FsConn::fgetxattr`'s rustdoc promises only that a
-        // buffer SHORTER than the value fails `ERANGE`, and the sync twin
-        // takes no buffer at all and never refuses on its size. So
+        // one is legal - the contract on `FsHandle::fgetxattr` says only
+        // that a buffer shorter than the value fails, never that a longer
+        // one is refused, and the sync twin takes no buffer at all and
+        // never refuses on its size. (It says shorter fails `ERANGE` *or*
+        // `E2BIG`: above 64 KiB the kernel rewrites the one to the other,
+        // so neither errno is available here to mean "your buffer is
+        // unreasonable".) So
         // `XATTR_SIZE_MAX` is the wrong bound here; the only length this
         // path cannot represent is one past `u32::MAX`, which truncates to
         // zero and is the kernel's size-only form: `res` comes back as the
