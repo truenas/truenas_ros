@@ -2959,9 +2959,29 @@ mod loom_tests {
             let (h, rx, shared) = handle();
             let (reply_tx, _reply_rx) = mpsc::channel();
 
-            // The shipping spelling, so weakening it fails this model.
-            shared.request_stop();
-            let refused = h
+            // The stop runs on its OWN thread, which is what makes this a
+            // model at all: with the store and the send in program order
+            // there is exactly one interleaving to explore, so loom runs
+            // the body once and nothing about when the flag becomes
+            // visible is under test. Two threads is the race the module
+            // header describes - the loop decides to stop while a caller
+            // is inside `send`.
+            //
+            // Measured: the in-line form explores 1 execution; this one
+            // explores 6 and reaches both answers (4 accepted, 2 refused),
+            // so both arms of the assertion below are exercised.
+            //
+            // What it checks is that `send`'s answer and the queue AGREE,
+            // not the flag's Release/Acquire pairing: weakening both sides
+            // to `Relaxed` leaves this model - and every other in the lane
+            // - green, because the agreement holds whatever order the flag
+            // becomes visible in. That ordering has no model; do not read
+            // this one as its detector.
+            let stopper = {
+                let shared = Arc::clone(&shared);
+                loom::thread::spawn(move || shared.request_stop())
+            };
+            let accepted = h
                 .send(FsInject::Fsync {
                     pers: 0,
                     file: scratch_fd(),
@@ -2970,12 +2990,18 @@ mod loom_tests {
                     length: 0,
                     reply: ReplyTo::Sync(reply_tx),
                 })
-                .is_err();
+                .is_ok();
+            stopper.join().unwrap();
 
-            assert!(refused, "send accepted an inject after stop was set");
-            assert!(
-                rx.try_recv().is_err(),
-                "a refused inject was queued anyway"
+            // Either answer is legal - the stop may land before or after
+            // the screen. What is not legal is the two disagreeing: an
+            // accepted inject that never reached the queue is the caller
+            // parked for ever, and a refused one that did is a payload
+            // handed back while the loop still owns it.
+            assert_eq!(
+                accepted,
+                rx.try_recv().is_ok(),
+                "send's answer and the queue disagree"
             );
         });
     }
