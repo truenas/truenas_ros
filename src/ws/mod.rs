@@ -55,10 +55,18 @@
 //! - **A non-minimal length is refused** (a 16-bit form under 126, a
 //!   64-bit form at or under `0xFFFF`). RFC 6455 §5.2 requires the sender
 //!   use the minimal form; lws-client does not check on receive.
-//! - **UTF-8 is not validated here.** A text frame is JSON, and the
-//!   session's `serde_json` decode rejects non-UTF-8, so an invalid frame
-//!   still closes the connection - lws-client validates UTF-8 only when
-//!   the context opts in (`client-parser-ws.c:228-231`).
+//! - **UTF-8 is not validated here.** A text frame is JSON, and a
+//!   `serde_json` decode rejects non-UTF-8, so the codec does not need to
+//!   look - lws-client validates UTF-8 only when the context opts in
+//!   (`client-parser-ws.c:228-231`). **That is about detection, not about
+//!   the verdict**, and the two are not the same: RFC 6455 §8.1 requires
+//!   *failing the connection* on invalid UTF-8, while bad JSON is an
+//!   application error a role may answer and serve past. Each consumer
+//!   therefore owns its own screen - `Session::on_message` faults on any
+//!   non-JSON text, and `JsonRpcServer::on_message` checks the encoding
+//!   explicitly because it answers `-32700` and keeps serving otherwise.
+//!   A role that leaves this to `serde_json` alone will answer an
+//!   invalid-UTF-8 frame instead of failing on it.
 //!
 //! Two behaviours are consciously *not* enforced, because the framer is a
 //! per-frame cutter and the peer is well-behaved: the receipt clock is not

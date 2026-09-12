@@ -17,13 +17,32 @@ use truenas_ros::net::client::{ClientConfig, Personality};
 /// middlewared's `core.on_connect` hook authenticates the peer by
 /// `SO_PEERCRED` *before* the first message is parsed
 /// (`check_permission`, `middlewared/plugins/auth.py`), so a session that
-/// is going to authenticate already has. One that is not - a uid PAM or
-/// privilege composition refuses - answers `ENOTAUTHENTICATED` to every
-/// call it can make anyway, so defaulting to 8192 would buy a tidier
-/// failure on a session that is already useless and cost every ordinary
-/// session the 8 KiB to 64 KiB range the server accepts. Set
-/// [`SessionOpts::max_outbound_bytes`] to 8192 for a session expected to
-/// stay unauthenticated.
+/// is going to authenticate normally already has by the time it sends
+/// anything. Lowering the default unconditionally would cost every
+/// ordinary session the 8 KiB to 64 KiB range the server accepts.
+///
+/// **That hook can decline without saying so.** `check_permission` returns
+/// leaving the session unauthenticated when the peer's uid has no passwd
+/// entry, and again when PAM refuses it - the second logs server-side and
+/// tells the client nothing either way. So "connected over the unix socket"
+/// is not the same as "authenticated", and a caller cannot infer its own
+/// cap from the transport.
+///
+/// **Do not read that as "an unauthenticated session is useless".** It is
+/// not: the `auth.login*` family has to be callable before authentication
+/// or nothing could ever authenticate, and middlewared exempts a set of
+/// methods from the requirement - `core.ping` among them, which the r126
+/// review measured answering `"pong"` on a session middlewared itself
+/// calls Anonymous. Such a session is *mid-login*, not dead, and the 8192
+/// cap binds every byte it sends.
+///
+/// So the exposure is real and the mitigation is
+/// [`SessionOpts::max_outbound_bytes`] set to 8192 for a session expected
+/// to stay unauthenticated. That now binds everything, including the two
+/// [`MSG_SIZE_EXTENDED_METHODS`] - the exemption used to override it, and
+/// is now gated on holding the ordinary cap. Above the server's real limit
+/// middlewared does not fail the call, it closes the connection, taking
+/// every other call in flight with it.
 pub const MIDDLEWARE_MSG_CAP: usize = 65_536;
 
 /// middlewared's extended cap, honored only for the whitelisted
@@ -50,7 +69,19 @@ pub const MSG_SIZE_EXTENDED_METHODS: [&str; 2] =
 /// is either too small for the upload or too large for every other call
 /// on the same session - so the cap is chosen per call here too.
 pub(crate) fn outbound_cap(ordinary: usize, method: &str) -> usize {
-    if MSG_SIZE_EXTENDED_METHODS.contains(&method) {
+    // The exemption only exists *above* the ordinary cap, and a session
+    // whose ordinary cap is below it has been deliberately constrained -
+    // the mitigation this file prescribes for one expected to stay
+    // unauthenticated. Granting 2 MiB there would discard that setting for
+    // exactly the two methods, and the server would not honour it anyway:
+    // `parse_message` refuses an unauthenticated message above 8192
+    // (`limits.py`, the `not authenticated` gate) *before* `ejson.loads`,
+    // before it reads `method`, and before the whitelist is consulted - so
+    // the frame is closed on, not answered, taking every other call in
+    // flight with it.
+    if ordinary >= MIDDLEWARE_MSG_CAP
+        && MSG_SIZE_EXTENDED_METHODS.contains(&method)
+    {
         MIDDLEWARE_MSG_CAP_EXTENDED
     } else {
         ordinary
@@ -315,5 +346,52 @@ impl SessionOpts {
     pub fn legacy_jobs(mut self) -> SessionOpts {
         self.legacy_jobs = true;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MIDDLEWARE_MSG_CAP, MIDDLEWARE_MSG_CAP_EXTENDED,
+        MSG_SIZE_EXTENDED_METHODS, outbound_cap,
+    };
+
+    /// The extended cap is an exemption from the ordinary one, so it may
+    /// only ever raise a session that has the ordinary one.
+    ///
+    /// Lowering `max_outbound_bytes` to 8192 is the mitigation this module
+    /// prescribes for a session expected to stay unauthenticated. Applied
+    /// regardless of that setting, the exemption discards it for exactly
+    /// the two whitelisted methods - and the server will not honour it
+    /// either: `parse_message` refuses an unauthenticated message above
+    /// 8192 before it parses the body or reads `method`, so the frame is
+    /// closed on rather than answered, taking every other call on the
+    /// session with it.
+    #[test]
+    fn the_extended_cap_cannot_raise_a_lowered_session() {
+        for m in MSG_SIZE_EXTENDED_METHODS {
+            // The control: an ordinary session still gets the exemption.
+            assert_eq!(
+                outbound_cap(MIDDLEWARE_MSG_CAP, m),
+                MIDDLEWARE_MSG_CAP_EXTENDED,
+                "{m}: an ordinary session must keep the exemption"
+            );
+            // ...and a session lowered below the ordinary cap does not.
+            assert_eq!(
+                outbound_cap(8192, m),
+                8192,
+                "{m}: the exemption overrode a deliberately lowered cap"
+            );
+            // A cap raised above the ordinary one keeps it too.
+            assert_eq!(
+                outbound_cap(MIDDLEWARE_MSG_CAP * 2, m),
+                MIDDLEWARE_MSG_CAP_EXTENDED,
+                "{m}: above the ordinary cap the exemption still applies"
+            );
+        }
+        // Every other method is the caller's cap, whatever it is.
+        for cap in [8192, MIDDLEWARE_MSG_CAP, MIDDLEWARE_MSG_CAP_EXTENDED] {
+            assert_eq!(outbound_cap(cap, "core.ping"), cap);
+        }
     }
 }

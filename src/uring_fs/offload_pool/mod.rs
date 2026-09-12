@@ -214,7 +214,7 @@ impl PoolShared {
     /// granted the retiring worker is never the last, so a model could not
     /// tell a pool that correctly refuses to retire its final worker from one
     /// that does not.
-    #[cfg(loom)]
+    #[cfg(all(test, loom))]
     fn retire_idle_workers(&self, n: usize) {
         self.retire_next_idle.store(n, Ordering::Relaxed);
         self.cv.notify_all();
@@ -223,7 +223,7 @@ impl PoolShared {
     /// Model-only: let the next `n` `Drop`s detach instead of waiting the
     /// workers out. Standing in for a clock loom does not have - see
     /// [`shutdown_expired`].
-    #[cfg(loom)]
+    #[cfg(all(test, loom))]
     fn detach_next_drop(&self, n: usize) {
         self.detach_next_drop.store(n, Ordering::Relaxed);
     }
@@ -808,9 +808,9 @@ mod loom_tests {
     ///
     /// Three threads parking and signalling on one mutex/condvar is past the
     /// point where full exploration terminates in useful time. A preemption
-    /// bound keeps every interleaving with at most `N` forced context switches
-    /// - the region where essentially all real concurrency bugs live - and
-    /// drops the deeper ones. **These are bounded proofs, not exhaustive
+    /// bound keeps every interleaving with at most `N` forced context
+    /// switches (the region where essentially all real concurrency bugs
+    /// live) and drops the deeper ones. **These are bounded proofs, not exhaustive
     /// ones**, unlike the ring's SPSC model, which is small enough to explore
     /// in full. Each was checked against a deliberately broken variant to
     /// confirm the bound still catches the bug it is there to catch.

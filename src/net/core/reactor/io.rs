@@ -1804,6 +1804,26 @@ impl<U> Reactor<U> {
         if self.table.conn(slot).close_on_flush.is_some() {
             return Ok(RecvStep::Done);
         }
+        // Same answer for a peer that half-closed while a reply was owed:
+        // this completion does not re-pump. A FIN re-completes a re-armed
+        // recv immediately, so answering `Pump` here - what the idle clock
+        // does - spins the loop instead of waiting, measured at 465ms of
+        // CPU against 62ms over the same 800ms of owed work.
+        //
+        // Note this is **not** the full retirement `close_on_flush` gets:
+        // `pump_gate` stops for that flag and does not consult this one, so
+        // a later send completion can still re-arm a read, which the FIN
+        // completes again and this arm parks again. That costs a syscall
+        // per send while the flag is set - bounded by send activity, not a
+        // spin, which is what the CPU measurement shows - and the
+        // re-completion is also what closes a connection whose owed work
+        // finished without putting any bytes on the wire, since `on_send`
+        // never fires there. Adding the flag to `pump_gate` would make the
+        // retirement real and remove that churn; it would also remove that
+        // second closing path, so do the accounting before changing it.
+        if self.table.conn(slot).peer_closed.is_some() {
+            return Ok(RecvStep::Done);
+        }
         // Not a transfer outcome: the read never started, because the pool
         // had no buffer to select. Grow (or fall back to owning one) and
         // re-pump - the framer is pure over what is buffered, and nothing
@@ -1954,6 +1974,48 @@ impl<U> Reactor<U> {
                 };
                 if owes_work {
                     return Ok(RecvStep::Pump);
+                }
+            }
+            // A peer that half-closed after its request is being polite,
+            // not gone: `shutdown(SHUT_WR)` completes the parked read-ahead
+            // recv with `res == 0`, which is `PeerClosed` rather than
+            // `IdleTimeout`, so the guard above never saw it and the
+            // connection was torn down with the reply still owed. `closing`
+            // then makes `kick_send` swallow the queued reply,
+            // `drain_injections` drop the worker outcome and `on_pump_read`
+            // drop every file-body chunk - a correctly framed GET answering
+            // zero bytes. Only reachable above a read-ahead of one, which is
+            // the default, so nothing in tree meets it yet.
+            //
+            // It cannot re-pump like the clock does (a FIN re-completes at
+            // once and the loop spins) and it cannot arm `close_on_flush`
+            // (that makes `teardown_owns_slot()` true, and the outcome is
+            // dropped anyway). So the recv side retires here and the send
+            // side closes when nothing is owed.
+            //
+            // **`PeerClosed` only, and do not widen this.**
+            // `recv_close_reason` answers it for `res == 0` on an *idle*
+            // recv - the read-ahead parked between requests, which is where
+            // a peer that finished asking and half-closed lands. The same
+            // `res == 0` on a non-idle recv is `TruncatedMessage`: the peer
+            // went away mid-message, that request can never complete, and
+            // holding the connection open for it would wait on bytes that
+            // are not coming.
+            //
+            // Note also what is *not* in `owes_work` here:
+            // `served_since_idle_arm`, which the clock above needs. That
+            // asks "has this connection served anything since the timer was
+            // armed", which is a question about the idle measurement, not
+            // about whether a response is owed now.
+            if matches!(reason, CloseReason::PeerClosed) {
+                let c = self.table.conn_mut(slot);
+                let owes_work = c.outstanding > 0
+                    || c.sending
+                    || c.has_pending_send()
+                    || c.tail_active();
+                if owes_work {
+                    c.peer_closed = Some(reason);
+                    return Ok(RecvStep::Done);
                 }
             }
         }
@@ -2164,12 +2226,20 @@ impl<U> Reactor<U> {
             // `tail_active`: a streaming body's queue can read dry between
             // chunks (the next read still in flight) - the flush-close waits
             // for the tail's last chunk, or it would truncate the farewell.
-            if conn.close_on_flush.is_some()
-                && !conn.sending
+            let dry = !conn.sending
                 && !conn.has_pending_send()
-                && !conn.tail_active()
-            {
+                && !conn.tail_active();
+            if conn.close_on_flush.is_some() && dry {
                 conn.close_on_flush.take()
+            } else if conn.peer_closed.is_some() && dry && conn.outstanding == 0
+            {
+                // The half-closed peer's reply has reached the wire and
+                // nothing else is owed, so the connection can go. The
+                // `outstanding` test is what a flush-close does not need:
+                // that one is a farewell and nothing follows it, while this
+                // connection was still answering, and a pipelined request
+                // admitted before the FIN may still be in a handler.
+                conn.peer_closed.take()
             } else {
                 None
             }

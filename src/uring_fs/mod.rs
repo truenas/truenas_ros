@@ -273,7 +273,7 @@ pub use task::{
 /// makes them wait on each other for no reason. One hook consulting a
 /// set of quiet threads has neither problem, and quieting is nested and
 /// counted so a guard inside a guard un-quiets nothing.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 pub(crate) fn quiet_panics_on_this_thread() -> QuietPanics {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
@@ -297,7 +297,7 @@ pub(crate) fn quiet_panics_on_this_thread() -> QuietPanics {
 }
 
 /// Threads currently quieted, and how many guards deep each is.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 fn quiet_threads() -> &'static std::sync::Mutex<
     std::collections::HashMap<std::thread::ThreadId, u32>,
 > {
@@ -312,10 +312,10 @@ fn quiet_threads() -> &'static std::sync::Mutex<
 /// entry: carried across a spawn it would un-quiet the wrong thread -
 /// or no thread, leaving the originating one quiet for the rest of the
 /// process.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 pub(crate) struct QuietPanics(std::marker::PhantomData<std::rc::Rc<()>>);
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 impl Drop for QuietPanics {
     fn drop(&mut self) {
         let mut quiet =
@@ -2049,10 +2049,11 @@ impl FsHandle {
 
     /// Set the open file's length (`ftruncate`).
     ///
-    /// Requires `IORING_OP_FTRUNCATE` (Linux >= 6.9) - the one op above this
-    /// crate's other io_uring floors. Where the kernel lacks it,
-    /// [`UringFs::new`] leaves it disabled and this returns `EOPNOTSUPP`
-    /// without touching the ring.
+    /// Uses `IORING_OP_FTRUNCATE`, which needs Linux >= 6.9 - later than the
+    /// other io_uring ops this crate submits, and still below its 6.18 floor,
+    /// so it is always present and **nothing probes or gates it**. On a
+    /// kernel that lacked it the submission would answer the bare `-EINVAL`
+    /// io_uring returns for any unknown opcode.
     pub fn ftruncate(
         &self,
         who: Personality,
@@ -2954,7 +2955,7 @@ mod tests {
 #[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
-    use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use crate::sync::atomic::{AtomicBool, AtomicU64};
     use crate::uring::wake::{LoopShared, WakeHandle};
 
     fn bounded_model(f: impl Fn() + Sync + Send + 'static) {
@@ -2994,10 +2995,6 @@ mod loom_tests {
         (h, rx, shared)
     }
 
-    /// An `Ok` from `send` is honoured: the message is on the queue, so the
-    /// loop's final drain finds it. An `Err` hands the message back intact so
-    /// the caller can recover the buffers it moved in. Neither outcome may
-    /// leave a message accepted-but-undrainable.
     // The liveness property this file's shutdown race really turns on - an
     // accepted inject whose receiver is dropped disconnects the caller's reply
     // channel, so `call` returns `ECONNABORTED` instead of parking - is **not
@@ -3008,6 +3005,11 @@ mod loom_tests {
     // covered by a real-threads test instead:
     // `shutdown_disconnects_a_queued_injects_reply`.
 
+    /// An `Ok` from `send` is honoured: the message is on the queue, so the
+    /// loop's final drain finds it. An `Err` hands the message back intact so
+    /// the caller can recover the buffers it moved in. Neither outcome may
+    /// leave a message accepted-but-undrainable.
+    ///
     /// Once `stop` is visible to the caller, `send` refuses and gives the
     /// message back rather than queueing onto a loop that will never drain.
     #[test]

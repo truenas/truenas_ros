@@ -1472,7 +1472,13 @@ pub fn decode_groups(req: &[u8], ngroups: usize, out: &mut [u32]) {
 /// The three scratch buffers are allocated by the **parent** before the fork
 /// and moved in here: a raw `clone3` bypasses glibc's atfork malloc mitigation,
 /// so allocating in the child could deadlock on an arena lock a concurrent
-/// thread held at fork time. The loop is then truly allocation-free.
+/// thread held at fork time.
+///
+/// The loop is then allocation-free, and so is leaving it: the buffers are
+/// `mem::forget`ed rather than dropped, because owning them by value means
+/// the frame's drop glue is three `free()` calls - the same arena lock, from
+/// the same child. The guarantee has to cover the return, not just the
+/// steady state.
 fn broker_loop(
     nrings: usize,
     allowed: Caps,
@@ -1530,6 +1536,18 @@ fn broker_loop(
             break;
         }
     }
+    // The loop is allocation-free, but *returning* was not: these three are
+    // owned here, so the frame's drop glue is three `free()` calls - on the
+    // same arena lock the raw `clone3` may have caught held, which is the
+    // deadlock this whole design avoids. `free` is not `malloc`, but it takes
+    // that lock just the same.
+    //
+    // Leaking is free: `broker_main` `_exit`s on the next line, so the
+    // kernel reclaims the child's whole address space regardless, and
+    // nothing in this process ever reads the buffers again.
+    std::mem::forget(req);
+    std::mem::forget(groups);
+    std::mem::forget(scratch);
     // Returns to `broker_main`, which `_exit`s (0 on this clean shutdown).
 }
 

@@ -62,6 +62,36 @@ Do not reopen these without a reason that is new.
   and under the default `aclmode=discard` it replaces it outright
   (`zfs_acl_chmod_setattr`, `zfs_acl.c`). The reasoning is at
   `copy_permissions`.
+- **Metadata calls are fd-based, and `O_PATH` is an error, not a case to work
+  around.** `fchmod`, `fchown`, `futimens` and the `f*xattr` family take a
+  real descriptor: the descriptor *is* the object, so no name is resolved
+  twice and none can be swapped under the call. An `O_PATH` handle is not an
+  open file and carries none of this - `fchmod(2)`, `fsetxattr(2)` and
+  `setxattrat(2)`'s empty-path form all answer it `EBADF`, measured on this
+  kernel for a regular file, a FIFO and a socket alike.
+  **Two workarounds are forbidden**, and both have been tried here and
+  reverted: `fchmodat2(2)` with `AT_EMPTY_PATH` on an `O_PATH` pin, and
+  `setxattr("/proc/self/fd/N", ...)`. They are worse than the gap they close,
+  because they carry only the *mode*: an ACL or an xattr on the same handle
+  still cannot travel, so the copy looks faithful, reports `Ok`, and has
+  silently dropped the access control. `fchmod_fd` screens for `O_PATH` and
+  fails with a message naming the cause, so a caller that pins with `O_PATH`
+  finds out at once instead of shipping a half-copy.
+  **Know the line**: `fchownat` and `utimensat` with `AT_EMPTY_PATH` *are*
+  supported on an `O_PATH` handle - measured - and are the only way to touch
+  a symlink, which cannot be opened any other way (`O_RDONLY|O_NOFOLLOW` is
+  `ELOOP`) and has neither a mode nor xattrs to lose. Those are not the hack,
+  and `make_symlink_meta` is correct as written. The rule is about using an
+  empty-path or `/proc` form to *get around a call that refused the handle*,
+  which is only ever chmod and the xattr family.
+  The consequence is owned rather than hidden: `copytree` opens a FIFO
+  `O_RDONLY|O_NONBLOCK` (which does not wait for a writer) and carries its
+  full metadata, and **refuses a socket or a device node outright** when any
+  metadata flag is set - a socket answers `ENXIO` to every open and a device
+  node's open would run its driver. `a_socket_is_refused_rather_than_moded_
+  through_a_path` pins both halves. If you are about to reach for an
+  empty-path or `/proc` form to make one of these "work", this is the entry
+  that says not to.
 - **`query_tree` skips only what has nothing left to list** - `EACCES`,
   `EPERM`, `ENOENT`. Everything else, `ENOTDIR` included, surfaces as
   `Some(Err)`, because a partial listing that reads as complete is data loss
@@ -834,6 +864,13 @@ cargo test --release --all-features --no-fail-fast   # the guards that ship
 MODELS=$(sed -n 's/^ *MODELS: "\([0-9]*\)"$/\1/p' .github/workflows/ci.yml)
 .github/workflows/scripts/counted-cargo-test.sh "$MODELS" loom -- \
   env RUSTFLAGS="--cfg loom" cargo test --lib --all-features loom_
+
+# And lint that configuration, which nothing else does: `loom` is a `cfg`
+# rather than a feature, so no clippy step above compiles it, and the line
+# above replaces RUSTFLAGS wholesale - dropping the `-D warnings` the other
+# lanes carry there. `--all-targets` because the models live in
+# `#[cfg(all(test, loom))]` modules a bare `--lib` never builds.
+RUSTFLAGS="--cfg loom" cargo clippy --all-targets --all-features -- -D warnings
 
 (cd fuzz && cargo +nightly fuzz build)
 

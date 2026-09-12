@@ -12540,3 +12540,85 @@ fn a_deferred_close_keeps_the_gate_shut_for_a_later_body() {
         }
     }
 }
+
+/// A peer that half-closes after its request still gets its response.
+///
+/// `shutdown(SHUT_WR)` is politeness, not departure: the client has said it
+/// will send nothing more and is waiting to read. It completes the parked
+/// read-ahead recv with `res == 0`, which is `CloseReason::PeerClosed` - and
+/// the "does this connection still owe work?" guard was applied to
+/// `IdleTimeout` alone, so the connection was torn down with the reply owed.
+/// `closing` then makes `kick_send` swallow the queued reply,
+/// `drain_injections` drop the worker outcome and `on_pump_read` drop every
+/// file-body chunk: a correctly framed request answered with zero bytes.
+///
+/// `cap` is the control and the trigger in one. At the default read-ahead of
+/// one nothing arms a second recv while a reply is owed, so the FIN is not
+/// seen until after - which is why nothing in tree meets this and why the
+/// first iteration passes on the unfixed code. Above one it is met at once.
+/// The handler defers for the same reason: an inline reply has already been
+/// sent by the time the FIN lands.
+#[test]
+fn a_peer_half_close_does_not_reap_a_connection_that_owes_a_reply() {
+    use std::io::{Read, Write};
+    for cap in [1usize, 4] {
+        let addr =
+            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let cfg = ServerConfig {
+            max_in_flight_requests: cap,
+            ..Default::default()
+        };
+        // The reply must still be OWED when the FIN lands, so the handler
+        // defers: an inline echo has already answered by then.
+        let proto = Protocol {
+            accept: |_: Incoming<'_>| Some(()),
+            header: length_prefix_header::<()>(
+                PrefixWidth::U32,
+                Endian::Big,
+                false,
+            ),
+            body: |req: Request<'_, ()>| {
+                let Request {
+                    body, responder, ..
+                } = req;
+                let input = body.to_vec();
+                let (deferred, permit) = responder.defer();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(20));
+                    deferred.reply(echo_frame(&input));
+                });
+                Response::Defer(permit)
+            },
+        };
+        let mut server = match Server::with_config([addr], cfg, proto) {
+            Ok(s) => s,
+            Err(e) if should_skip(&e) => return,
+            Err(e) => panic!("bind: {e}"),
+        };
+        let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+            panic!("expected Tcp");
+        };
+        let stop = server.shutdown_handle();
+        let client = thread::spawn(move || -> std::io::Result<usize> {
+            let _stop = ShutdownOnDrop(stop.clone());
+            let mut s = connect_tcp(v4)?;
+            let body = b"hello";
+            let mut wire = (body.len() as u32).to_be_bytes().to_vec();
+            wire.extend_from_slice(body);
+            s.write_all(&wire)?;
+            s.flush()?;
+            // The politeness: nothing more is coming from this side.
+            s.shutdown(std::net::Shutdown::Write)?;
+            let mut got = Vec::new();
+            let n = s.read_to_end(&mut got).unwrap_or(got.len());
+            stop.shutdown();
+            Ok(n)
+        });
+        server.serve_forever().expect("serve_forever");
+        let n = client.join().expect("join").expect("client");
+        assert_eq!(
+            n, 9,
+            "cap={cap}: a half-closed peer got {n} bytes of a 9-byte reply"
+        );
+    }
+}

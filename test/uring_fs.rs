@@ -2718,12 +2718,17 @@ fn query_directory_does_not_flag_an_entry_it_cannot_open() {
             "the listing must yield every entry it was given"
         );
         for (n, incomplete, _) in &seen {
-            // The socket is the one entry whose values were asked for and
-            // not read; every other row lost nothing.
-            let expected = n == "sock";
-            assert_eq!(
-                *incomplete, expected,
-                "{n}: xattrs_incomplete should be {expected}"
+            // Nothing here lost a value. The only name asked for is
+            // `user.probe`, and `user.*` lives only on regular files and
+            // directories (`xattr_permission`, `fs/xattr.c`), so for the
+            // symlink and the socket - neither of which can be opened by
+            // this listing - "absent" is the true answer rather than an
+            // unread one. Flagging them makes the flag permanent: both
+            // answer the same errno on every call, so a consumer that
+            // re-queries on it re-queries for ever.
+            assert!(
+                !incomplete,
+                "{n}: flagged incomplete for a `user.*` name it cannot hold"
             );
         }
         if set_ok {
@@ -2734,6 +2739,105 @@ fn query_directory_does_not_flag_an_entry_it_cannot_open() {
                 "the control entry's value was not read"
             );
         }
+        drop(sock);
+    });
+}
+
+/// The narrowing is two-sided: an entry that could not be opened is flagged
+/// when the request named something its type *does* hold.
+///
+/// The companion above pins the other half - a socket asked only for
+/// `user.*`, which it cannot hold, is not flagged. Here the same socket, in
+/// the same unopenable state, is asked for its access ACL, which it holds
+/// and which this listing did not read. Without both, a fix for either half
+/// reads as correct: suppressing the flag for every socket passes the first
+/// test and loses a real value silently, which is the error the `ENXIO`
+/// classification was changed to remove in the first place.
+///
+/// The ACL is put on the socket through the raw syscall because the listing
+/// itself cannot open one, and `fsetxattr` needs a descriptor.
+#[test]
+fn query_directory_flags_a_socket_whose_acl_it_could_not_read() {
+    use truenas_ros::uring_fs::{
+        EnrichSpec, QueryOptions, XattrNamespaces, query_directory,
+    };
+
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("plain.bin"), b"x").unwrap();
+        let sock = std::os::unix::net::UnixListener::bind(dir.join("sock"))
+            .expect("bind a unix socket in the listing");
+
+        // A named user makes it a real ACL rather than one equivalent to
+        // the mode, so the value genuinely exists on the socket. Written out
+        // rather than built through `sync_fs::acl`, which is a different
+        // feature - this test compiles under `uring-fs` alone.
+        // version 2, then USER_OBJ / USER:1000 / GROUP_OBJ / MASK / OTHER.
+        let mut blob = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [
+            (0x01u16, 0o7u16, !0u32),
+            (0x02, 0o4, 1000),
+            (0x04, 0o7, !0),
+            (0x10, 0o7, !0),
+            (0x20, 0o5, !0),
+        ] {
+            blob.extend_from_slice(&tag.to_le_bytes());
+            blob.extend_from_slice(&perm.to_le_bytes());
+            blob.extend_from_slice(&id.to_le_bytes());
+        }
+        use std::os::unix::ffi::OsStrExt as _;
+        let sock_path = dir.join("sock");
+        let cp =
+            std::ffi::CString::new(sock_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path and a sized buffer.
+        let rc = unsafe {
+            libc::setxattr(
+                cp.as_ptr(),
+                c"system.posix_acl_access".as_ptr(),
+                blob.as_ptr().cast(),
+                blob.len(),
+                0,
+            )
+        };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_POSIX_ACL").is_none(),
+                "TRUENAS_ROS_REQUIRE_POSIX_ACL is set but a socket here \
+                 will not hold a POSIX ACL: {e}"
+            );
+            return;
+        }
+
+        let opts = QueryOptions {
+            spec: EnrichSpec::ACL,
+            acl_name: c"system.posix_acl_access".to_owned(),
+            xattr_ns: XattrNamespaces::empty(),
+            ..Default::default()
+        };
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let mut q = query_directory(&h, me, &anchor, opts).unwrap();
+        let mut seen: Vec<(String, bool, bool)> = Vec::new();
+        while let Some(batch) = q.next() {
+            for e in batch.unwrap() {
+                seen.push((
+                    e.name.to_string_lossy().into_owned(),
+                    e.xattrs_incomplete,
+                    e.acl.is_some(),
+                ));
+            }
+        }
+        seen.sort();
+        let sock_row = seen.iter().find(|(n, ..)| n == "sock").expect("sock");
+        assert!(
+            sock_row.1 && !sock_row.2,
+            "a socket holding an ACL this listing could not open must be \
+             reported as unread, not as having none: {sock_row:?}"
+        );
+        let plain = seen.iter().find(|(n, ..)| n == "plain.bin").expect("f");
+        assert!(
+            !plain.1,
+            "the control opened fine and lost nothing: {plain:?}"
+        );
         drop(sock);
     });
 }

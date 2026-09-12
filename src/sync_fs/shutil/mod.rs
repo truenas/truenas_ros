@@ -24,7 +24,7 @@ pub use copy::{
     copysendfile, copyuserspace,
 };
 
-use copy::SETID_BITS;
+use copy::{SETID_BITS, release_creation_hold};
 
 use crate::AT_FDCWD;
 use crate::errno::{Errno, retry_on_eintr};
@@ -166,6 +166,19 @@ fn select_copy_fn(op: CopyTreeOp) -> CopyFn {
 /// copied, as a post-pass, into the correspondingly-named destination directory
 /// -- which **must already exist** (it is opened, not created, so the data lands
 /// on the intended destination mount rather than its parent).
+///
+/// # Hardlinks are not preserved
+///
+/// Each name in the source becomes its own inode in the destination, so N
+/// links to one file cost N copies of its data and `stats.files` counts each
+/// name. Nothing detects the sharing: `st_nlink` is read only to refuse a
+/// multiply-linked *destination*, never consulted on the source.
+///
+/// This is a divergence from the Python `shutil` this module tracks, and it is
+/// stated rather than fixed because preserving links means carrying an
+/// inode-to-first-path map for the whole walk - memory proportional to the
+/// tree, and a behaviour change for every existing caller. If you are copying
+/// a hardlink farm, that cost is yours to plan for.
 ///
 /// For progress reporting, use [`copytree_reporting`].
 pub fn copytree(
@@ -934,11 +947,19 @@ fn make_special(
     // a hold: `make_special_meta` below stamps the real mode from this same
     // `src_st`, and that stamp is `guard`ed, so a hold here would be one
     // more narrowing that a swallowed failure could make permanent.
-    let create_mode = if config.flags.contains(CopyFlags::PERMISSIONS) {
-        mode
-    } else {
-        (mode & libc::S_IFMT) | creation_mode(config, false)
-    };
+    // Always created at the hold, never at the source's mode - the same
+    // pattern `make_file` and `make_dir` use, and here it is load-bearing
+    // rather than tidy. `make_special_meta` opens this node `O_RDONLY` to
+    // carry metadata through a real descriptor, and a source FIFO with no
+    // owner-read bit (`0o200`, `0o000`) would then answer its own copy
+    // `EACCES` for an unprivileged caller - measured. `O_PATH`, which this
+    // used to pin with, needs no read permission, so creating at the
+    // source's mode was free before and is not now.
+    //
+    // Under `PERMISSIONS` the real mode lands in `make_special_meta`'s
+    // `fchmod`, which the umask made necessary anyway; without it the node
+    // keeps the hold, exactly as before.
+    let create_mode = (mode & libc::S_IFMT) | creation_mode(config, false);
     // With `exist_ok` a taken name is **replaced**, the way `make_file`
     // replaces one: the node is built beside it and renamed over. Keeping
     // whatever is there leaves a destination whose entry types diverge from
@@ -992,9 +1013,57 @@ fn mknod_at(
     res.map(drop)
 }
 
-/// Validate the node just created at `at` and set its ownership, mode and
-/// timestamps. `name` is the destination the node is destined for, and is
-/// only used to name it in an error.
+/// Carry the source's ownership, mode and timestamps onto the new node,
+/// through a **real descriptor** on it.
+///
+/// A FIFO is opened `O_RDONLY|O_NONBLOCK`, which completes immediately with
+/// no writer - the non-blocking read-open is exactly the case `open(2)`
+/// documents as not waiting - and `fchmod`, `fchown` and `futimens` all work
+/// on the result.
+///
+/// **The type is established through an `O_PATH` handle first**, because a
+/// real read-open runs the file's `open` method and `O_PATH` does not. Only
+/// then is the node opened for real, and the two handles are required to be
+/// the same `(dev, ino)`. Without that order, something planted at the
+/// destination name would be opened before anything knew what it was; with
+/// it, a swap between the two opens is refused instead. That second check is
+/// defensive and has no test: driving it needs a swap landing inside a
+/// two-syscall window, and the destination directory is held at `0o700` for
+/// the copy precisely so nothing else can create entries there.
+///
+/// **The access ACL is still not carried, for any special type**, and that
+/// is a real gap in [`CopyFlags::PERMISSIONS`] - "copy ACL xattrs, *or*
+/// `fchmod` when no ACL is present" - not a thing this function forgot. The
+/// destination FIFO has a real descriptor and could take one; the *source*
+/// does not. The walk pins source specials `O_PATH`, and that cannot read an
+/// xattr at all - `fgetxattr` and `getxattrat` with `AT_EMPTY_PATH` both
+/// answer it `EBADF`, measured.
+///
+/// Reopening the source FIFO for real is not a way out, and the cost is
+/// worse than a perturbation. Measured: a process blocked in
+/// `open(O_WRONLY)` on that FIFO is **released** by our read-open, and once
+/// we close - having read the ACL - its next `write` answers `EPIPE`, which
+/// under the default disposition kills it. A read-only copy would be
+/// terminating live processes on the tree it is reading. Reading by name
+/// instead re-resolves it, which is the hole this function exists to close.
+/// So a
+/// source `u:1000:r--` does not travel onto any special node;
+/// `a_special_file_takes_the_mode_and_not_the_acl` pins it so the limit is
+/// visible rather than discovered.
+///
+/// **A socket or a device node is refused instead.** Neither can be given a
+/// real descriptor: a socket answers `ENXIO` to every `open(2)`, and opening
+/// a device runs the driver's `open` method, which a file copy must not do.
+/// The workarounds that make the call *appear* to work - `fchmodat2(2)`'s
+/// empty-path form on an `O_PATH` pin, or `/proc/self/fd/N` - are not used
+/// here: an `O_PATH` handle cannot carry an ACL or an xattr at all
+/// (`fsetxattr` and `setxattrat` with `AT_EMPTY_PATH` both answer it
+/// `EBADF`, measured), so they carry the mode while the access control
+/// silently does not travel, and the copy reports `Ok`. Refusing says the
+/// same thing out loud, at the one node it applies to.
+///
+/// With none of the three flags set there is nothing to carry, so nothing is
+/// opened and every type is copied.
 fn make_special_meta(
     parent: BorrowedFd<'_>,
     at: &OsStr,
@@ -1002,27 +1071,70 @@ fn make_special_meta(
     src_st: &Statx,
     config: &CopyTreeConfig,
 ) -> Result<()> {
-    let mode = src_st.mode() as libc::mode_t;
-    // Pin the new node and set every attribute below through this handle, so
-    // the name resolves exactly once and cannot be redirected between the
-    // mknod and these calls. `O_PATH` because a FIFO or device must not be
-    // opened for I/O (that would block on a peer, or run the device's `open`
-    // method), and it is all the `AT_EMPTY_PATH` calls need.
-    let node = openat2(
+    let ifmt = libc::S_IFMT as u16;
+    // Verify the node FIRST, and for every type, whatever the flags say.
+    // `make_special`'s staging path renames this name into place afterwards,
+    // so a node swapped under the copy is one the rename would publish -
+    // metadata or no metadata. `O_PATH` never invokes the file's `open`
+    // method and a real read-open does, so the look comes before any real
+    // open: if something other than our node is at this name - a device
+    // node, which needs `CAP_MKNOD` to plant but is not impossible -
+    // opening it first would run that driver.
+    let peek = openat2(
         parent,
         at,
         OpenHow::new()
             .flags(OFlag::O_PATH | OFlag::O_NOFOLLOW)
             .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
     )?;
-    // Confirm the handle is on the node `mknodat` created - same type and
-    // device number, and a single link - so a different object at the name is
-    // not the one adjusted below.
+    let peek_st = statx(peek.as_fd(), "", AtFlags::AT_EMPTY_PATH, META_MASK)?;
+    let changed = |st: &Statx| {
+        st.mode() & ifmt != src_st.mode() & ifmt
+            || st.rdev() != src_st.rdev()
+            || st.nlink() != 1
+    };
+    if changed(&peek_st) {
+        return Err(Error::Validation(format!(
+            "destination special file {name:?} changed during the copy"
+        )));
+    }
+    if !config.flags.intersects(
+        CopyFlags::OWNER | CopyFlags::PERMISSIONS | CopyFlags::TIMESTAMPS,
+    ) {
+        // Verified, and nothing to carry onto it.
+        return Ok(());
+    }
+    let kind = src_st.mode() & ifmt;
+    if kind != libc::S_IFIFO as u16 {
+        let what = match u32::from(kind) {
+            libc::S_IFSOCK => "socket",
+            libc::S_IFCHR => "character device",
+            libc::S_IFBLK => "block device",
+            _ => "special file",
+        };
+        return Err(Error::Validation(format!(
+            "{what} {name:?}: metadata was requested, and this type cannot \
+             be given a real descriptor to carry it through - a socket \
+             refuses every open and a device node's open runs its driver. \
+             Clear CopyFlags::OWNER, PERMISSIONS and TIMESTAMPS to copy it \
+             as a bare node."
+        )));
+    }
+    // A read-open of a FIFO with `O_NONBLOCK` does not wait for a writer.
+    let node = openat2(
+        parent,
+        at,
+        OpenHow::new()
+            .flags(OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW)
+            .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
+    )?;
+    // ...and confirm the real handle landed on the very inode just
+    // inspected, so a swap between the two opens cannot slip a different
+    // object into the calls below.
     let node_st = statx(node.as_fd(), "", AtFlags::AT_EMPTY_PATH, META_MASK)?;
-    let ifmt = libc::S_IFMT as u16;
-    if node_st.mode() & ifmt != src_st.mode() & ifmt
-        || node_st.rdev() != src_st.rdev()
-        || node_st.nlink() != 1
+    if changed(&node_st)
+        || node_st.dev() != peek_st.dev()
+        || node_st.ino() != peek_st.ino()
     {
         return Err(Error::Validation(format!(
             "destination special file {name:?} changed during the copy"
@@ -1034,13 +1146,7 @@ fn make_special_meta(
     // failures always propagate (matching `copy_metadata`).
     if config.flags.contains(CopyFlags::OWNER) {
         retry_on_eintr(|| unsafe {
-            libc::fchownat(
-                node.as_raw_fd(),
-                c"".as_ptr(),
-                src_st.uid(),
-                src_st.gid(),
-                libc::AT_EMPTY_PATH,
-            )
+            libc::fchown(node.as_raw_fd(), src_st.uid(), src_st.gid())
         })?;
     }
     if config.flags.contains(CopyFlags::PERMISSIONS) {
@@ -1048,6 +1154,7 @@ fn make_special_meta(
         // Where an ACL governs the node's mode (ZFS aclmode=restricted) the
         // chmod is rejected; the ACL is authoritative, so treat it as applied
         // rather than aborting the whole copy over one node.
+        let mode = src_st.mode() as libc::mode_t;
         let perm = if config.flags.contains(CopyFlags::OWNER) {
             mode & 0o7777
         } else {
@@ -1122,6 +1229,24 @@ fn copy_metadata(
     if config.flags.contains(CopyFlags::PERMISSIONS) {
         let r = copy_permissions(src, dst, xattrs, mode);
         stamped = r.is_ok();
+        if !stamped {
+            // `creation_mode` made this object at a `0o700`/`0o600` hold on
+            // the promise that the source's mode lands here, and the call
+            // above is the only thing that delivers it. Release the hold
+            // rather than leave it as the final mode.
+            //
+            // **Before `guard`, deliberately.** After it this never runs
+            // under `raise_error: true`, and that is the caller taking the
+            // `Err` and keeping the partially-copied tree - the one that
+            // most needs a tree it can enter. The error still propagates
+            // below; only the mode lands first.
+            //
+            // A failure to release is swallowed: `r` is already an error on
+            // its way to `guard`, which is the verdict the caller asked for,
+            // and replacing it with this one would report the repair's
+            // failure in place of the cause.
+            stamped = release_creation_hold(dst, mode).unwrap_or(false);
+        }
         guard(config, r)?;
     }
     if config.flags.contains(CopyFlags::XATTRS) {
@@ -1297,22 +1422,41 @@ fn creation_mode(config: &CopyTreeConfig, is_dir: bool) -> libc::mode_t {
     }
 }
 
-/// Set `mode` on the file `fd` refers to, where `fd` may be an `O_PATH` handle.
-/// `fchmod(2)` rejects those (`fdget` masks `FMODE_PATH`), so this goes through
-/// `fchmodat2(2)`'s empty-path form, which resolves the handle's own path and
-/// never re-resolves a name. `fchmodat2` is a raw syscall because `libc`
-/// exposes no wrapper for it.
+/// Set `mode` on the open file `fd` refers to, through `fchmod(2)`.
+///
+/// **`fd` must be a real descriptor, never `O_PATH`.** Every metadata call in
+/// this module is fd-based on purpose: the descriptor *is* the object, so no
+/// name is resolved twice and there is no window for one to be swapped. An
+/// `O_PATH` handle is not an open file - `fchmod(2)`, `fsetxattr(2)` and
+/// `setxattrat(2)`'s empty-path form all answer it `EBADF`, measured - so
+/// code that pins with `O_PATH` cannot carry metadata and must not pretend
+/// to.
+///
+/// Handed one, this fails immediately and says so, rather than routing
+/// around it. The two known workarounds are both refused here:
+/// `fchmodat2(2)`'s empty-path form, and `/proc/self/fd/N`. They make the
+/// call appear to work while leaving the caller holding a handle that cannot
+/// carry an ACL or an xattr at all, so the mode travels and the access
+/// control silently does not. If you need metadata on an object, open it for
+/// real; if it cannot be opened for real, that is the thing to report.
 fn fchmod_fd(fd: BorrowedFd<'_>, mode: libc::mode_t) -> Result<()> {
-    retry_on_eintr(|| unsafe {
-        libc::syscall(
-            libc::SYS_fchmodat2,
-            fd.as_raw_fd(),
-            c"".as_ptr(),
-            mode as libc::c_uint,
-            libc::AT_EMPTY_PATH,
-        )
-    })?;
+    if is_o_path(fd)? {
+        return Err(Error::Validation(
+            "copytree metadata needs a real descriptor, not an O_PATH handle \
+             - O_PATH cannot carry a mode, an ACL or an xattr"
+                .into(),
+        ));
+    }
+    retry_on_eintr(|| unsafe { libc::fchmod(fd.as_raw_fd(), mode) })?;
     Ok(())
+}
+
+/// Whether `fd` is an `O_PATH` handle, which carries no file metadata.
+fn is_o_path(fd: BorrowedFd<'_>) -> Result<bool> {
+    let fl = retry_on_eintr(|| unsafe {
+        libc::fcntl(fd.as_raw_fd(), libc::F_GETFL)
+    })?;
+    Ok(fl & libc::O_PATH != 0)
 }
 
 /// Treat a chmod rejected because an ACL governs the object's mode as done.
@@ -1339,40 +1483,102 @@ fn unlink_at(dirfd: BorrowedFd<'_>, name: &OsStr) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// A swallowed `copy_permissions` failure must not read as a stamp.
+    /// An `O_PATH` handle is refused by name, before any syscall that would
+    /// appear to work.
     ///
-    /// `copy_metadata` wraps it in `guard`, which returns `Ok(())` when
-    /// `raise_error` is false - so the flag being set is no evidence a mode
-    /// landed, and `copytree`'s borrowed-root restore used to read the flag.
-    /// It left a root this copy did not create at the `0o700` hold with
-    /// `copytree` answering `Ok`.
+    /// `O_PATH` carries no file metadata: `fchmod(2)`, `fsetxattr(2)` and
+    /// `setxattrat(2)`'s empty-path form all answer it `EBADF`. Two forms
+    /// *do* reach the inode - `fchmodat2(2)` with `AT_EMPTY_PATH`, and
+    /// `setxattr("/proc/self/fd/N", ..)` - and both have been used here and
+    /// removed, because they carry only the mode: an ACL on the same handle
+    /// still cannot travel, so the copy looks faithful and has silently
+    /// dropped the access control. The screen is what makes a caller that
+    /// pins with `O_PATH` find out at once.
     ///
-    /// The live trigger is an `acltype=nfsv4` source copied onto an
-    /// `acltype=posix` destination: `system.nfs4_acl_xdr` is in
-    /// `ACCESS_ACL_XATTRS`, so `copy_permissions` `fsetxattr`s it and the
-    /// destination answers EOPNOTSUPP, every time. That needs two dataset
-    /// types and is a QEMU-lane fixture. The failure is provoked here
-    /// through the same door instead - `copy_metadata` takes the attribute
-    /// list as a parameter, so a name the source does not have makes its
-    /// `fgetxattr` answer ENODATA - which exercises the contract that
-    /// changed rather than the one filesystem pairing that reaches it.
+    /// The real descriptor on the same file is the control: without it a
+    /// screen that refused everything would pass this too.
+    #[test]
+    fn an_o_path_handle_cannot_carry_a_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = crate::tempdir().expect("tempdir");
+        let p = d.path().join("f");
+        std::fs::write(&p, b"x").expect("fixture");
+
+        let real = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&p)
+            .expect("open");
+        fchmod_fd(real.as_fd(), 0o640).expect("a real descriptor works");
+
+        let path_fd = openat2(
+            AT_FDCWD,
+            p.as_os_str(),
+            OpenHow::new().flags(OFlag::O_PATH | OFlag::O_NOFOLLOW),
+        )
+        .expect("O_PATH open");
+        assert!(is_o_path(path_fd.as_fd()).expect("F_GETFL"));
+        let err = fchmod_fd(path_fd.as_fd(), 0o600)
+            .expect_err("an O_PATH handle must be refused, not worked around");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("O_PATH") && msg.contains("real descriptor"),
+            "the refusal must say what is wrong: {msg}"
+        );
+        // And it did not take effect by some other route.
+        let m = std::fs::metadata(&p).expect("stat").permissions().mode();
+        assert_eq!(
+            m & 0o777,
+            0o640,
+            "the refused call changed the mode anyway"
+        );
+    }
+
+    /// A swallowed `copy_permissions` failure releases the creation hold -
+    /// or declines, and then reports no stamp.
+    ///
+    /// `creation_mode` makes every object at a `0o700`/`0o600` hold on the
+    /// promise that the source's mode lands afterwards, `copy_permissions`
+    /// is the only thing that delivers it, and `copy_metadata` wraps that in
+    /// `guard` - which answers `Ok(())` when `raise_error` is false, the
+    /// mode `copytree`'s own docs name for salvaging a tree. So a swallowed
+    /// failure left the **hold** as the final mode for the whole tree, with
+    /// `copytree` answering `Ok` and plausible stats.
+    ///
+    /// The live trigger is an ACL-namespace mismatch - an `acltype=nfsv4`
+    /// source onto an `acltype=posix` destination, or either onto
+    /// `acltype=off` - which fails `fsetxattr` EOPNOTSUPP for every object,
+    /// every time. That needs two dataset types and is a QEMU-lane fixture.
+    /// The failure is provoked through the same door here: `copy_metadata`
+    /// takes the attribute list as a parameter, so a name the source does
+    /// not have makes its `fgetxattr` answer ENODATA.
+    ///
+    /// Both halves matter and they pull opposite ways. Where the
+    /// destination carries no ACL the hold comes off and that **is** a
+    /// stamp, so a borrowed root keeps it - which is what `PERMISSIONS`
+    /// means when `copy_permissions` succeeds. Where the destination carries
+    /// one, the ACL is already the permissions and an `fchmod` would rewrite
+    /// it (`aclmode=discard` replaces it outright), so the release declines
+    /// and reports no stamp. A fix that always stamps, or never does, passes
+    /// one half and fails the other.
     ///
     /// **What this does not reach is `copytree`'s use of the answer.**
     /// `list_xattrs` reads the source's real attributes, so the failure
     /// cannot be provoked through the public entry point without two
-    /// filesystems that disagree about an ACL namespace - and with
-    /// `PERMISSIONS` off the two formulations (`!root_stamped` and
-    /// `!PERMISSIONS`) agree, so no test here can tell them apart. The
-    /// wiring is covered by reading, not by this.
+    /// filesystems that disagree about an ACL namespace. That wiring is
+    /// covered by reading, not by this.
     #[test]
-    fn a_swallowed_permissions_failure_is_not_a_stamp() {
+    fn a_swallowed_permissions_failure_releases_the_hold() {
+        use std::os::unix::fs::PermissionsExt;
         let d = crate::tempdir().expect("tempdir");
         let src = d.path().join("s");
         let dst = d.path().join("d");
         std::fs::create_dir(&src).expect("src");
         std::fs::create_dir(&dst).expect("dst");
+        // The source mode the fallback must land, distinct from the hold.
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755))
+            .expect("src mode");
         let sf = std::fs::File::open(&src).expect("open src");
-        let df = std::fs::File::open(&dst).expect("open dst");
         let st = statx(sf.as_fd(), "", AtFlags::AT_EMPTY_PATH, META_MASK)
             .expect("statx");
         let cfg = CopyTreeConfig {
@@ -1380,27 +1586,60 @@ mod tests {
             raise_error: false,
             ..Default::default()
         };
+        // An attribute the source does not have: `fgetxattr` answers
+        // ENODATA and `guard` swallows the failure.
+        let absent = vec![c"system.posix_acl_default".to_owned()];
 
         // The control: nothing named, so `copy_permissions` takes its
         // `fchmod` branch and succeeds.
+        let df = std::fs::File::open(&dst).expect("open dst");
         assert!(
             copy_metadata(sf.as_fd(), df.as_fd(), &[], &st, &cfg)
                 .expect("guard swallows nothing here"),
             "a successful copy_permissions is a stamp"
         );
 
-        // The case: an attribute the source does not have. `fgetxattr`
-        // answers ENODATA, `copy_permissions` returns Err, `guard` swallows
-        // it - and the answer must be "no mode landed".
-        let absent = vec![c"system.posix_acl_default".to_owned()];
+        // Half one: no ACL on the destination, so the hold is released and
+        // the source's mode lands. Start it back at the hold to prove it.
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o700))
+            .expect("hold");
         assert!(
-            !copy_metadata(sf.as_fd(), df.as_fd(), &absent, &st, &cfg)
+            copy_metadata(sf.as_fd(), df.as_fd(), &absent, &st, &cfg)
                 .expect("raise_error is false, so the copy continues"),
-            "a swallowed failure reported itself as a stamp"
+            "the hold was released, which is a stamp"
+        );
+        assert_eq!(
+            std::fs::metadata(&dst).expect("stat").permissions().mode() & 0o777,
+            0o755,
+            "the destination is still at the creation hold"
         );
 
+        // Half two: an ACL on the destination, so the release declines
+        // rather than rewriting it, and reports no stamp.
+        let acl = dst_with_acl(&d);
+        if let Some(af) = acl {
+            let ast = statx(af.as_fd(), "", AtFlags::AT_EMPTY_PATH, META_MASK)
+                .expect("statx");
+            let before = ast.mode() & 0o7777;
+            assert!(
+                !copy_metadata(sf.as_fd(), af.as_fd(), &absent, &st, &cfg)
+                    .expect("raise_error is false"),
+                "an ACL-governed destination must not report a stamp"
+            );
+            let after =
+                statx(af.as_fd(), "", AtFlags::AT_EMPTY_PATH, META_MASK)
+                    .expect("statx")
+                    .mode()
+                    & 0o7777;
+            assert_eq!(
+                before, after,
+                "the release rewrote a mode an ACL governs"
+            );
+        }
+
         // And with `raise_error` the same call is an error rather than a
-        // quiet `false`, so the two dispositions stay distinguishable.
+        // quiet answer, so the two dispositions stay distinguishable - the
+        // release running *before* `guard` must not swallow the cause.
         let strict = CopyTreeConfig {
             raise_error: true,
             ..cfg
@@ -1410,6 +1649,48 @@ mod tests {
                 .is_err(),
             "raise_error must still propagate it"
         );
+    }
+
+    /// A directory carrying an access ACL, or `None` where this filesystem
+    /// will not hold one. Loud under `TRUENAS_ROS_REQUIRE_POSIX_ACL`.
+    #[cfg(test)]
+    fn dst_with_acl(d: &crate::TempDir) -> Option<std::fs::File> {
+        let p = d.path().join("acl_dst");
+        std::fs::create_dir(&p).expect("acl dst");
+        let f = std::fs::File::open(&p).expect("open acl dst");
+        // version 2, then USER_OBJ / USER:1000 / GROUP_OBJ / MASK / OTHER.
+        let mut blob = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [
+            (0x01u16, 0o7u16, !0u32),
+            (0x02, 0o4, 1000),
+            (0x04, 0o7, !0),
+            (0x10, 0o7, !0),
+            (0x20, 0o5, !0),
+        ] {
+            blob.extend_from_slice(&tag.to_le_bytes());
+            blob.extend_from_slice(&perm.to_le_bytes());
+            blob.extend_from_slice(&id.to_le_bytes());
+        }
+        // SAFETY: a live descriptor, a NUL-terminated name and a sized buffer.
+        let rc = unsafe {
+            libc::fsetxattr(
+                f.as_raw_fd(),
+                c"system.posix_acl_access".as_ptr(),
+                blob.as_ptr().cast(),
+                blob.len(),
+                0,
+            )
+        };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_POSIX_ACL").is_none(),
+                "TRUENAS_ROS_REQUIRE_POSIX_ACL is set but a directory here \
+                 will not hold a POSIX ACL: {e}"
+            );
+            return None;
+        }
+        Some(f)
     }
 
     /// A symbolic link is the fourth creator and carries the metadata flags

@@ -715,7 +715,10 @@ impl QueryDir {
                 // [`DirEntry::xattrs_incomplete`] exists to carry.
                 incomplete |= wants_fd
                     && p.file.is_none()
-                    && open_failure_is_incompleteness(p.open_err);
+                    && open_failure_is_incompleteness(p.open_err)
+                    && asked_for_what_this_type_can_hold(
+                        spec, &self.opts, p.dtype,
+                    );
                 // An entry whose open failed has no descriptor to stat, and
                 // so nothing for a by-name answer to be mispaired against:
                 // there it is both safe and the only answer available.
@@ -1073,6 +1076,67 @@ fn pending_file(p: FsPending) -> (Option<File>, Option<Errno>) {
         },
         Err(e) => (None, Some(e)),
     }
+}
+
+/// Whether this request asked for anything an entry of this `d_type` could
+/// actually hold.
+///
+/// [`open_failure_is_incompleteness`] answers whether the errno left the
+/// values *unread*; it cannot answer whether there were any. A socket
+/// answers `ENXIO` to the listing's `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` open on
+/// every call, so a flag raised from the errno alone is permanent and a
+/// consumer that re-queries on it re-queries for ever - the very shape the
+/// `ELOOP` carve-out exists to prevent, moved from symlinks onto sockets.
+/// What separates a lost value from an absent one is whether the type could
+/// hold what the request named:
+///
+/// - `user.*` lives only on regular files and directories
+///   (`xattr_permission`, `fs/xattr.c`: `!S_ISREG && !S_ISDIR` answers
+///   `-ENODATA` to a read, `-EPERM` to a write), so a socket asked only for
+///   `user.*` names lost nothing and "absent" is the true answer.
+/// - an access ACL is refused on a symlink outright (`vfs_get_acl`,
+///   `fs/posix_acl.c`) and held by every other type - a socket's reads back
+///   at its full length - so a socket asked for one *does* have a value this
+///   listing did not read.
+/// - `trusted.*` and `security.*` carry no type rule at all
+///   (`xattr_permission` returns 0 for `security.*`/`system.*` and gates
+///   `trusted.*` on `CAP_SYS_ADMIN` alone), so any type could hold them.
+///
+/// This only ever *narrows* the flag: it is `&&`-ed with the errno verdict,
+/// so the settled reading of `EACCES`/`EPERM`/`ENOENT`/`ELOOP` still stands
+/// and a symlink is still never flagged. `DT_UNKNOWN` answers `true` -
+/// with no type there is nothing to rule out, and over-reporting is the
+/// safe direction.
+fn asked_for_what_this_type_can_hold(
+    spec: EnrichSpec,
+    opts: &QueryOptions,
+    dtype: u8,
+) -> bool {
+    // Regular files and directories hold every namespace, so nothing a
+    // request can name is ruled out for them.
+    if matches!(dtype, libc::DT_REG | libc::DT_DIR | libc::DT_UNKNOWN) {
+        return true;
+    }
+    // Only a symlink cannot hold an access ACL.
+    if spec.contains(EnrichSpec::ACL) && dtype != libc::DT_LNK {
+        return true;
+    }
+    // A named read is ruled out only where every name is `user.*`.
+    if spec.contains(EnrichSpec::XATTR)
+        && opts
+            .xattr_names
+            .iter()
+            .any(|n| !n.to_bytes().starts_with(b"user."))
+    {
+        return true;
+    }
+    // Discovery is ruled out only where `user.` is the whole request.
+    if spec.contains(EnrichSpec::XATTR_LIST)
+        && !(opts.xattr_ns - XattrNamespaces::USER).is_empty()
+    {
+        return true;
+    }
+    false
 }
 
 /// Whether a failed entry `open` leaves this entry's values genuinely
@@ -1789,9 +1853,13 @@ fn copy_range_rw(
 
 #[cfg(all(test, not(loom)))]
 mod confinement_tests {
+    use std::ffi::CString;
+
     use super::{
-        DiscRead, Order, entry_is_dir, open_failure_is_incompleteness,
-        pending_discovered, split_statx, unresolved_statx_verdict,
+        DiscRead, EnrichSpec, Order, QueryOptions, XattrNamespaces,
+        asked_for_what_this_type_can_hold, entry_is_dir,
+        open_failure_is_incompleteness, pending_discovered, split_statx,
+        unresolved_statx_verdict,
     };
     use crate::errno::Errno;
     use crate::uring_fs::{FsOutcome, FsPending};
@@ -1819,6 +1887,78 @@ mod confinement_tests {
     /// The reported side is what the flag is for, and `None` is in it:
     /// no op slot was free to issue the open with, so the entry's values
     /// really are unread.
+    /// The type half of the same verdict: the errno says the values were
+    /// not read, this says whether there were any to read.
+    ///
+    /// Both must hold, so this can only ever *narrow* the flag. The matrix
+    /// is the point - a socket asked for `user.*` lost nothing and a socket
+    /// asked for its ACL lost a real value, and a fix that answers only one
+    /// of those reads as correct.
+    #[test]
+    fn only_a_request_the_type_could_answer_is_an_incompleteness() {
+        let opts = |spec, names: &[&str], ns| QueryOptions {
+            spec,
+            xattr_names: names
+                .iter()
+                .map(|n| CString::new(*n).unwrap())
+                .collect(),
+            xattr_ns: ns,
+            ..Default::default()
+        };
+        let user =
+            opts(EnrichSpec::XATTR, &["user.probe"], XattrNamespaces::empty());
+        let trusted = opts(
+            EnrichSpec::XATTR,
+            &["trusted.probe"],
+            XattrNamespaces::empty(),
+        );
+        let acl = opts(EnrichSpec::ACL, &[], XattrNamespaces::empty());
+        let disc_user =
+            opts(EnrichSpec::XATTR_LIST, &[], XattrNamespaces::USER);
+        let disc_both = opts(
+            EnrichSpec::XATTR_LIST,
+            &[],
+            XattrNamespaces::USER | XattrNamespaces::TRUSTED,
+        );
+
+        // A socket holds an ACL and `trusted.*`, and cannot hold `user.*`
+        // (`xattr_permission`, `fs/xattr.c`).
+        for (o, want, why) in [
+            (&user, false, "user.* cannot live on a socket"),
+            (&trusted, true, "trusted.* has no type rule"),
+            (&acl, true, "a socket's ACL reads back at full length"),
+            (&disc_user, false, "user.-only discovery finds nothing"),
+            (&disc_both, true, "trusted.* is in the requested set"),
+        ] {
+            assert_eq!(
+                asked_for_what_this_type_can_hold(o.spec, o, libc::DT_SOCK),
+                want,
+                "DT_SOCK: {why}"
+            );
+        }
+        // A symlink holds neither, but `ELOOP` is what actually decides it.
+        assert!(!asked_for_what_this_type_can_hold(
+            acl.spec,
+            &acl,
+            libc::DT_LNK
+        ));
+        // A regular file, a directory and an unknown type rule out nothing.
+        for dt in [libc::DT_REG, libc::DT_DIR, libc::DT_UNKNOWN] {
+            assert!(
+                asked_for_what_this_type_can_hold(user.spec, &user, dt),
+                "dtype {dt} must rule nothing out"
+            );
+        }
+        // Nothing asked for is never an incompleteness.
+        let nothing =
+            opts(EnrichSpec::STATX, &["user.probe"], XattrNamespaces::USER);
+        assert!(!asked_for_what_this_type_can_hold(
+            nothing.spec,
+            &nothing,
+            libc::DT_SOCK
+        ));
+    }
+
     #[test]
     fn an_unopenable_entry_is_answered_not_lost() {
         for e in [Errno::EACCES, Errno::EPERM, Errno::ENOENT, Errno::ELOOP] {
