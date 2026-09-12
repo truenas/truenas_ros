@@ -2049,10 +2049,11 @@ impl FsHandle {
 
     /// Set the open file's length (`ftruncate`).
     ///
-    /// Requires `IORING_OP_FTRUNCATE` (Linux >= 6.9) - the one op above this
-    /// crate's other io_uring floors. Where the kernel lacks it,
-    /// [`UringFs::new`] leaves it disabled and this returns `EOPNOTSUPP`
-    /// without touching the ring.
+    /// Uses `IORING_OP_FTRUNCATE`, which needs Linux >= 6.9 - later than the
+    /// other io_uring ops this crate submits, and still below its 6.18 floor,
+    /// so it is always present and **nothing probes or gates it**. On a
+    /// kernel that lacked it the submission would answer the bare `-EINVAL`
+    /// io_uring returns for any unknown opcode.
     pub fn ftruncate(
         &self,
         who: Personality,

@@ -311,8 +311,10 @@ pub(crate) const IORING_OP_FSETXATTR: u8 = 41;
 /// the attribute's size.
 pub(crate) const IORING_OP_FGETXATTR: u8 = 43;
 /// Truncate an fd (**`sqe.off` = the new length**; every other operand
-/// must be zero). Linux >= 6.9 - the one op above this crate's other
-/// io_uring floors, so it is probed individually.
+/// must be zero). Linux >= 6.9 - later than the other io_uring ops here, and
+/// still below the crate's 6.18 kernel floor, so it is always present. It is
+/// **not** probed: `probe_op_supported` is called for `OPENAT2` and
+/// `FIXED_FD_INSTALL` only.
 pub(crate) const IORING_OP_FTRUNCATE: u8 = 55;
 
 /// `sqe.fsync_flags` (the `op_flags` overlay) for `FSYNC`: `fdatasync`
