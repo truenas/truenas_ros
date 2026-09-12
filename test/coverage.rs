@@ -229,6 +229,33 @@ mod fs {
         let dir = truenas_ros::tempdir().unwrap();
         let path = dir.path().join("f");
         std::fs::write(&path, b"1234567").unwrap();
+        // Give atime, mtime and ctime three distinct values first. A file
+        // written a moment ago carries all three at the same instant, so a
+        // swap between the accessors would be invisible - this test read
+        // `atime()` and `ctime()` only for their arithmetic, and
+        // `atime() -> stx_ctime` survived the whole suite. `utimensat` sets
+        // the first two; ctime follows as "now", because changing them is
+        // itself a status change.
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let c =
+                std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            let times = [
+                libc::timespec {
+                    tv_sec: 1_000_000,
+                    tv_nsec: 111,
+                },
+                libc::timespec {
+                    tv_sec: 2_000_000,
+                    tv_nsec: 222,
+                },
+            ];
+            // SAFETY: a valid NUL-terminated path and a two-element array.
+            let rc = unsafe {
+                libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0)
+            };
+            assert_eq!(rc, 0, "utimensat: {}", std::io::Error::last_os_error());
+        }
         let md = std::fs::metadata(&path).unwrap();
 
         let st = statx(
@@ -303,7 +330,22 @@ mod fs {
             st.raw().stx_btime.tv_sec,
             "btime() is not stx_btime"
         );
-        // Timestamp conversions, still driven for their arithmetic.
+        // Each timestamp against std's own `stat`, and against the value
+        // set above - the cross-check alone would pass a swap that moved
+        // both readers together.
+        assert_eq!(st.atime().sec, md.atime(), "stx_atime vs std");
+        assert_eq!(st.ctime().sec, md.ctime(), "stx_ctime vs std");
+        assert_eq!(st.atime().sec, 1_000_000, "atime() is not stx_atime");
+        assert_eq!(st.atime().nsec, 111, "atime() lost its nanoseconds");
+        assert_eq!(st.mtime().sec, 2_000_000, "mtime() is not stx_mtime");
+        assert_eq!(st.mtime().nsec, 222, "mtime() lost its nanoseconds");
+        assert!(
+            st.ctime().sec > 2_000_000,
+            "ctime() is not stx_ctime: the status change is `now`, later \
+             than either time set above, but it reads {}",
+            st.ctime().sec
+        );
+        // Conversions, still driven for their arithmetic.
         let _ = (st.atime().as_secs_f64(), st.ctime().as_nanos());
         assert!(st.mtime().to_system_time().is_some());
     }

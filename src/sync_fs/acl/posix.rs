@@ -800,6 +800,7 @@ mod tests {
                 unsafe { libc::umask(old) };
 
                 let mut buf = [0u8; 512];
+                let mut buf2 = [0u8; 512];
                 let cc = cpath(&child);
                 // SAFETY: valid path and a sized destination.
                 let n = unsafe {
@@ -814,12 +815,61 @@ mod tests {
                 let actual = PosixAcl::from_xattr(&buf[..n as usize], None)
                     .expect("the kernel's ACL decodes");
 
+                // A directory also inherits the parent's *default* ACL
+                // verbatim, and reading only the access half left that
+                // unchecked: building the child's default from the
+                // mode-masked access entries instead of the parent's
+                // default survived every suite, and every grandchild would
+                // have inherited the wrong one.
+                let dn = unsafe {
+                    libc::getxattr(
+                        cc.as_ptr(),
+                        c"system.posix_acl_default".as_ptr(),
+                        buf2.as_mut_ptr().cast(),
+                        buf2.len(),
+                    )
+                };
+                let actual_default = if is_dir {
+                    assert!(
+                        dn > 0,
+                        "{shape}: the kernel stored no default ACL on a \
+                         directory under a parent that has one"
+                    );
+                    Some(
+                        PosixAcl::from_xattr(&buf2[..dn as usize], None)
+                            .expect("the kernel's default ACL decodes")
+                            .access,
+                    )
+                } else {
+                    assert!(
+                        dn < 0,
+                        "{shape}: a non-directory must not carry a default \
+                         ACL, but the kernel stored {dn} bytes"
+                    );
+                    None
+                };
+
                 let (predicted, predicted_mode) = parent_acl
                     .generate_inherited_acl(is_dir, mode)
                     .expect("a default ACL is present");
                 assert_eq!(
                     predicted.access, actual.access,
                     "{shape}/{name}: predicted vs the kernel's own"
+                );
+                // `default` carries `default: true` on every entry, which is
+                // the flag, not the content; compare what the kernel stored.
+                let predicted_default: Option<Vec<PosixAce>> =
+                    predicted.default.as_ref().map(|d| {
+                        d.iter()
+                            .map(|a| PosixAce {
+                                default: false,
+                                ..a.clone()
+                            })
+                            .collect()
+                    });
+                assert_eq!(
+                    predicted_default, actual_default,
+                    "{shape}/{name}: predicted default ACL vs the kernel's"
                 );
                 // The other half of the same intersection, and the one `getattr`
                 // reports: `posix_acl_create_masq` narrows the entries by the
