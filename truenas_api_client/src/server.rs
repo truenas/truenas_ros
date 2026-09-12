@@ -267,6 +267,9 @@ impl JsonRpcServer {
         let code = (payload.len() >= 2)
             .then(|| u16::from_be_bytes([payload[0], payload[1]]));
         self.phase = Phase::Closing;
+        // As in `close`: the message stream ends here, so an unfinished
+        // reassembly is released rather than held to the session's own end.
+        self.frag = None;
         self.close_reason = Some(match code {
             Some(code) => format!("client closed ({code})"),
             None => "client closed".to_owned(),
@@ -295,6 +298,29 @@ impl JsonRpcServer {
     }
 
     fn on_message(&mut self, text: &[u8]) -> Vec<ServerAct> {
+        // RFC 6455 §8.1: a text frame whose payload is not valid UTF-8
+        // fails the connection. This is not the same fault as bad JSON -
+        // that is a JSON-RPC error, answered `-32700` with the session
+        // still serving, which is what middlewared does and what the arms
+        // below implement. Only the encoding violation is a *WebSocket*
+        // one, and it is the codec's to catch: `ws` declines UTF-8
+        // validation on the grounds that `serde_json` rejects non-UTF-8
+        // anyway, which is true of *detecting* it and says nothing about
+        // what each role then does. The client role reaches `Act::Fault`
+        // and closes; this role answered and kept serving, so a peer could
+        // stream arbitrarily many invalid-UTF-8 frames on a connection
+        // that should have been failed at the first.
+        if std::str::from_utf8(text).is_err() {
+            self.phase = Phase::Closing;
+            self.frag = None;
+            return vec![
+                ServerAct::Send(ws::encode_server_frame(
+                    OP_CLOSE,
+                    &CLOSE_INVALID_PAYLOAD.to_be_bytes(),
+                )),
+                ServerAct::Fault("text frame is not valid UTF-8"),
+            ];
+        }
         match truenas_jsonrpc::parse(text) {
             Incoming::Single(Call::Valid(req)) => {
                 let method = req.method().to_owned();
@@ -390,8 +416,23 @@ impl JsonRpcServer {
     /// After this the session answers no more requests - §5.5.1 forbids a
     /// data frame after a Close - so an inbound message is dropped rather
     /// than surfaced, and a Ping goes unanswered (§5.5.2).
+    ///
+    /// **Returns empty when this session has already closed**, because
+    /// §5.5.1 forbids sending anything after a Close and that includes a
+    /// second Close. The peer's own Close puts the session here too, and it
+    /// has already been echoed, so a caller that then closes locally would
+    /// otherwise put two Close frames on the wire. `Session::start_close`
+    /// guards from the same signature; this is the same rule for the role
+    /// whose version of it is public. Write nothing when the answer is
+    /// empty.
     pub fn close(&mut self) -> Vec<u8> {
+        if matches!(self.phase, Phase::Closing) {
+            return Vec::new();
+        }
         self.phase = Phase::Closing;
+        // Nothing will be reassembled onto this session again; §5.5.1 ends
+        // the message stream here, so an open fragment is dead weight.
+        self.frag = None;
         ws::encode_server_frame(OP_CLOSE, &CLOSE_NORMAL.to_be_bytes())
     }
 
@@ -408,6 +449,10 @@ const CLOSE_NORMAL: u16 = 1000;
 /// RFC 6455 §7.4.1's 1002, "terminating the connection due to a protocol
 /// error".
 const CLOSE_PROTOCOL_ERROR: u16 = 1002;
+
+/// RFC 6455 §7.4.1's 1007, "data within a message that was not consistent
+/// with the type of the message" - a text frame that is not valid UTF-8.
+const CLOSE_INVALID_PAYLOAD: u16 = 1007;
 
 /// middlewared's answer to anything that is not a top-level JSON object:
 /// `parse_message` raises before any JSON-RPC validation and the handler
@@ -730,6 +775,127 @@ mod tests {
                 );
             }
             other => panic!("expected a close echo: {other:?}"),
+        }
+    }
+
+    /// A text frame that is not valid UTF-8 fails the connection
+    /// (RFC 6455 §8.1), rather than being answered and served past.
+    ///
+    /// This is a narrower rule than "bad input closes": JSON that is valid
+    /// UTF-8 but not a JSON-RPC message is answered `-32700` with the
+    /// session still open, because that is a JSON-RPC error and what
+    /// middlewared does. Only the encoding violation is a WebSocket
+    /// protocol one. The two controls below are what separate them - the
+    /// codec declines UTF-8 validation on the grounds that `serde_json`
+    /// rejects non-UTF-8 anyway, which is true of detecting it and says
+    /// nothing about what the role then does, and this role answered and
+    /// kept serving where the client role faults.
+    #[test]
+    fn invalid_utf8_in_a_text_frame_fails_the_connection() {
+        // 0xFF is not a valid UTF-8 byte anywhere.
+        let mut s = open_server();
+        let bad = vec![b'{', 0xFF, b'}'];
+        let acts = s.on_frame(head(true, OP_TEXT, bad.len()), bad);
+        match acts.as_slice() {
+            [ServerAct::Send(f), ServerAct::Fault(why)] => {
+                assert_eq!(
+                    decode(f),
+                    (OP_CLOSE, 1007u16.to_be_bytes().to_vec()),
+                    "the close must carry 1007"
+                );
+                assert!(why.contains("UTF-8"), "the fault must say why: {why}");
+            }
+            other => {
+                panic!("invalid UTF-8 must fail the connection: {other:?}")
+            }
+        }
+        assert!(s.is_closing(), "the session must be closing");
+
+        // Control: valid UTF-8 that is not JSON is answered, not failed -
+        // a JSON-RPC error keeps the session serving.
+        let mut ok = open_server();
+        let acts = ok.on_frame(head(true, OP_TEXT, 5), b"hello".to_vec());
+        assert!(
+            matches!(acts.as_slice(), [ServerAct::Send(_)]),
+            "valid UTF-8 that is not JSON is answered, not failed: {acts:?}"
+        );
+        assert!(!ok.is_closing(), "...and the session keeps serving");
+
+        // Control: a well-formed call still works, so the screen is not
+        // rejecting everything.
+        let mut good = open_server();
+        let call = br#"{"jsonrpc":"2.0","id":1,"method":"core.ping"}"#;
+        let acts =
+            good.on_frame(head(true, OP_TEXT, call.len()), call.to_vec());
+        assert!(
+            acts.iter().any(|a| matches!(a, ServerAct::Request { .. })),
+            "a valid call must still surface: {acts:?}"
+        );
+    }
+
+    /// Only one Close ever goes out, whoever started it.
+    ///
+    /// §5.5.1 forbids sending anything after a Close, and that includes a
+    /// second Close. The peer's Close already puts this session in
+    /// `Closing` and has been echoed, so a caller that then closes locally
+    /// would put two on the wire. `Session::start_close` guards from the
+    /// same signature and is `pub(crate)`; this one is `pub`, so it is the
+    /// one a consumer can trip.
+    ///
+    /// The two controls are what make this more than "close returns empty":
+    /// a lone local close must still emit, and a *second* peer Close must
+    /// not be echoed either.
+    #[test]
+    fn only_one_close_frame_goes_out() {
+        // The peer closed first; the echo is that one Close.
+        let mut s = open_server();
+        let acts = s.on_frame(head(true, OP_CLOSE, 2), vec![0x03, 0xE8]);
+        let echoed = acts
+            .iter()
+            .filter(|a| matches!(a, ServerAct::Send(_)))
+            .count();
+        assert_eq!(echoed, 1, "the peer's close is echoed once");
+        assert!(s.is_closing());
+        assert!(
+            s.close().is_empty(),
+            "a local close after the peer's put a second Close on the wire"
+        );
+
+        // Control: with no peer close, the local one must still be sent.
+        let mut lone = open_server();
+        let f = lone.close();
+        assert!(!f.is_empty(), "a lone local close must emit");
+        assert_eq!(decode(&f).0, OP_CLOSE);
+        assert!(lone.close().is_empty(), "...and only once");
+
+        // Control: a second *peer* Close is not echoed either.
+        let mut twice = open_server();
+        let _ = twice.on_frame(head(true, OP_CLOSE, 2), vec![0x03, 0xE8]);
+        let again = twice.on_frame(head(true, OP_CLOSE, 2), vec![0x03, 0xE8]);
+        assert!(
+            !again.iter().any(|a| matches!(a, ServerAct::Send(_))),
+            "a re-close must stay silent: {again:?}"
+        );
+    }
+
+    /// A close releases the reassembly buffer instead of holding it to the
+    /// session's own end. `Session` does this; this role did not.
+    #[test]
+    fn a_close_releases_an_open_reassembly() {
+        for close_locally in [true, false] {
+            let mut s = open_server();
+            // Open a fragmented message and leave it open.
+            let _ = s.on_frame(head(false, OP_TEXT, 3), b"{\"a".to_vec());
+            assert!(s.frag.is_some(), "the fixture did not open a fragment");
+            if close_locally {
+                let _ = s.close();
+            } else {
+                let _ = s.on_frame(head(true, OP_CLOSE, 2), vec![0x03, 0xE8]);
+            }
+            assert!(
+                s.frag.is_none(),
+                "close_locally={close_locally}: the reassembly was held"
+            );
         }
     }
 
