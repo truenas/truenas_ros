@@ -219,6 +219,53 @@ pub fn copy_permissions(
     Ok(())
 }
 
+/// Put a plain mode on a destination whose ACL copy failed, so the creation
+/// hold is not the mode it keeps. Answers whether one was applied.
+///
+/// `creation_mode` makes every object at `0o700`/`0o600` on the promise that
+/// the source's mode lands afterwards, and [`copy_permissions`] is the only
+/// thing that delivers it. `copy_metadata` wraps that in `guard`, which
+/// answers `Ok(())` when `raise_error` is false - the mode `copytree`'s own
+/// documentation names for salvaging a tree - so a swallowed failure left the
+/// **hold** as the final mode for every object, with `copytree` answering
+/// `Ok` and plausible stats. Not a race: an `acltype=nfsv4` source onto an
+/// `acltype=posix` destination, or either onto `acltype=off`, fails
+/// `fsetxattr` `EOPNOTSUPP` for every object in the tree.
+///
+/// **Declines when the destination already carries an access ACL.** There the
+/// ACL *is* the permissions and a `chmod` would rewrite it to match the mode -
+/// under ZFS's default `aclmode=discard`, replace it outright
+/// (`zfs_acl_chmod_setattr`, `module/os/linux/zfs/zfs_acl.c`). A destination
+/// holding one is not sitting at the hold, so there is nothing to release.
+///
+/// setid is withheld exactly as [`copy_permissions`] withholds it;
+/// [`copy_setid`] applies it afterwards when ownership was preserved.
+pub(super) fn release_creation_hold(
+    dst: BorrowedFd<'_>,
+    mode: u32,
+) -> Result<bool> {
+    for name in ACCESS_ACL_XATTRS {
+        match fgetxattr(dst, name) {
+            Ok(_) => return Ok(false),
+            // No ACL of that flavour, or a filesystem that keeps none -
+            // which is the case this exists for.
+            Err(Errno::ENODATA | Errno::EOPNOTSUPP) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    super::ok_if_acl_governed(
+        retry_on_eintr(|| unsafe {
+            libc::fchmod(
+                dst.as_raw_fd(),
+                mode as libc::mode_t & 0o7777 & !SETID_BITS,
+            )
+        })
+        .map(drop)
+        .map_err(Into::into),
+    )?;
+    Ok(true)
+}
+
 /// Apply the `S_ISUID`/`S_ISGID` bits of `mode` that [`copy_permissions`]
 /// withholds.
 ///

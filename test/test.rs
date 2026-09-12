@@ -1718,6 +1718,58 @@ mod shutil {
         );
     }
 
+    /// A FIFO whose own mode denies reading is still copied.
+    ///
+    /// `make_special_meta` carries metadata through a real descriptor, so it
+    /// opens the new node `O_RDONLY|O_NONBLOCK`. If that node were created
+    /// at the *source's* mode, a write-only FIFO - `0o200`, `0o000`,
+    /// `0o222` - would answer its own copy `EACCES` and fail the whole
+    /// tree. The `O_PATH` pin this replaced needed no read permission, so
+    /// creating at the source mode used to be free. It is created at the
+    /// creation hold instead and the real mode lands in the `fchmod`
+    /// afterwards, which the umask made necessary anyway.
+    ///
+    /// **This test cannot fail as root**, which is the environment CLAUDE.md
+    /// warns about: DAC denies root nothing, so the `EACCES` is unreachable
+    /// here and the assertions below merely pass. It bites on the
+    /// unprivileged CI runner, which is precisely where the regression
+    /// lived - every other FIFO fixture in this suite uses a readable mode,
+    /// so nothing else would ever have met it.
+    #[test]
+    fn a_write_only_fifo_is_still_copied() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = truenas_ros::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        let c = std::ffi::CString::new(
+            src.join("wo").as_os_str().as_bytes().to_vec(),
+        )
+        .unwrap();
+        // 0o200: writable by the owner, readable by nobody at all.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o200) }, 0);
+        // mkfifo is umask-masked; force the exact bits.
+        std::fs::set_permissions(
+            src.join("wo"),
+            std::fs::Permissions::from_mode(0o200),
+        )
+        .unwrap();
+
+        let dst = tmp.path().join("dst");
+        let stats = copytree(&src, &dst, &CopyTreeConfig::default())
+            .expect("a write-only FIFO must not fail its own copy");
+        assert_eq!(stats.specials, 1);
+        assert_eq!(
+            std::fs::symlink_metadata(dst.join("wo"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o200,
+            "the source's mode must still travel, hold or no hold"
+        );
+    }
+
     /// A special node takes the source's mode and **not** its access ACL.
     ///
     /// This pins a limitation, not a feature. The destination FIFO has a
