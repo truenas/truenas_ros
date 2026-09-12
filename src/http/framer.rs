@@ -852,7 +852,31 @@ fn scan_step<U>(
     let header_len = *head_len;
     let body = buf.get(header_len..).unwrap_or(&[]);
     match chunked::scan(body, scan) {
-        Err(status) => fail(&mut conn.phase, buf.len(), status, head_only),
+        Err(status) => {
+            // The caps describe what the scan has taken in, not which arm
+            // it left through. `scan` keeps `decoded` and `consumed` across
+            // arrivals and updates them as it walks, so an over-cap body
+            // reaches the same numbers whether the malformation is met in
+            // this arrival or a later one - only the arm differs. Checked
+            // here with the same precedence as the other two, or the same
+            // bytes answer 413 when the peer's write ends on a chunk
+            // boundary and `status` when the whole body lands at once,
+            // which is TCP segmentation deciding an HTTP status. 413 is the
+            // more useful of the two: it tells a client not to retry the
+            // body, and one that trimmed and retried would be answered 413
+            // the second time anyway.
+            let decoded = scan.decoded;
+            let consumed = scan.consumed;
+            if decoded > cfg.max_body {
+                fail(&mut conn.phase, buf.len(), 413, head_only)
+            } else if consumed
+                > cfg.max_body.saturating_add(CHUNK_WIRE_OVERHEAD)
+            {
+                fail(&mut conn.phase, buf.len(), 400, head_only)
+            } else {
+                fail(&mut conn.phase, buf.len(), status, head_only)
+            }
+        }
         Ok(None) => {
             let decoded = scan.decoded;
             let consumed = scan.consumed;
@@ -1511,6 +1535,79 @@ mod tests {
         }
         frame(&raw, &mut c, &small);
         assert!(matches!(c.phase, Phase::Fail { status: 400, .. }));
+    }
+
+    /// A body that is both over the cap **and** malformed answers the same
+    /// status whichever way the peer's writes fell.
+    ///
+    /// `scan` reports progress (`Ok(None)`) when an arrival ends on a chunk
+    /// boundary and an error when it meets the malformation, and it keeps
+    /// `decoded`/`consumed` across arrivals either way - so the two
+    /// segmentations reach the same numbers and only the arm differs. With
+    /// the caps checked in the progress arms alone, the identical bytes
+    /// answered 413 split on a boundary and 400 delivered whole. That is
+    /// TCP segmentation choosing an HTTP status, and the two say different
+    /// things to a client: 413 means do not retry this body, 400 means it
+    /// was malformed.
+    ///
+    /// The control is the second half: a malformed body that is *not* over
+    /// the cap must still answer the framing error, so this is a precedence
+    /// rule and not "413 for everything".
+    #[test]
+    fn a_chunked_verdict_does_not_depend_on_segmentation() {
+        let small = HttpConfig {
+            max_head: 1024,
+            max_body: 64,
+        };
+        let head =
+            b"PUT /k HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
+        // 16 bytes per chunk, well past max_body, then a size line no radix
+        // accepts - over-cap and malformed in one body.
+        let mut raw = head.to_vec();
+        let boundary = raw.len() + 10 * b"10\r\n0123456789abcdef\r\n".len();
+        for _ in 0..10 {
+            raw.extend_from_slice(b"10\r\n0123456789abcdef\r\n");
+        }
+        raw.extend_from_slice(b"zz\r\n");
+
+        // Whole body in one arrival: the scan meets the malformation.
+        let mut whole = conn();
+        frame(&raw, &mut whole, &small);
+        let Phase::Fail {
+            status: at_once, ..
+        } = whole.phase
+        else {
+            panic!("expected a failure for the whole body");
+        };
+
+        // Split on a chunk boundary: the scan reports progress first.
+        let mut split = conn();
+        frame(&raw[..boundary], &mut split, &small);
+        frame(&raw, &mut split, &small);
+        let Phase::Fail {
+            status: segmented, ..
+        } = split.phase
+        else {
+            panic!("expected a failure for the segmented body");
+        };
+
+        assert_eq!(
+            at_once, segmented,
+            "the same bytes answered {at_once} whole and {segmented} split - \
+             segmentation decided the status"
+        );
+        assert_eq!(at_once, 413, "over the cap is the stronger verdict");
+
+        // The control: malformed but within the cap keeps the framing error.
+        let mut ok_size = conn();
+        let mut short = head.to_vec();
+        short.extend_from_slice(b"4\r\nabcd\r\n");
+        short.extend_from_slice(b"zz\r\n");
+        frame(&short, &mut ok_size, &small);
+        assert!(
+            matches!(ok_size.phase, Phase::Fail { status: 400, .. }),
+            "a malformed body inside the cap is still 400"
+        );
     }
 
     #[test]
