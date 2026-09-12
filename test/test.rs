@@ -1582,6 +1582,191 @@ mod shutil {
         );
     }
 
+    /// A special node takes the source's mode and **not** its access ACL.
+    ///
+    /// This pins a limitation, not a feature. The destination FIFO has a
+    /// real descriptor and could take an ACL; the source does not. The walk
+    /// pins source specials `O_PATH`, which cannot read an xattr, and
+    /// reopening the source FIFO for real would release any writer blocked
+    /// in `open(O_WRONLY)` on it - a copy must not perturb the tree it
+    /// reads. Reading it by name re-resolves it, which is the hole the pin
+    /// exists to close.
+    ///
+    /// So `CopyFlags::PERMISSIONS` - "copy ACL xattrs, *or* `fchmod` when no
+    /// ACL is present" - runs only its second half here. The regular file is
+    /// the control: it carries the same ACL through the same copy, so this
+    /// is the special-file path and not a broken fixture.
+    #[test]
+    fn a_special_file_takes_the_mode_and_not_the_acl() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = truenas_ros::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("reg"), b"data").unwrap();
+        let cpath = |p: &std::path::Path| {
+            std::ffi::CString::new(p.as_os_str().as_encoded_bytes().to_vec())
+                .unwrap()
+        };
+        let fifo = cpath(&src.join("fifo"));
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o640) }, 0);
+
+        // version 2, then USER_OBJ / USER:1000 / GROUP_OBJ / MASK / OTHER.
+        let mut blob = 2u32.to_le_bytes().to_vec();
+        // Resolves to mode 0o666, which a 0o022 umask strips down to 0o644
+        // at `mknodat` - so the destination only reaches it if the mode is
+        // applied through the descriptor afterwards.
+        for (tag, perm, id) in [
+            (0x01u16, 0o6u16, !0u32),
+            (0x02, 0o4, 1000),
+            (0x04, 0o6, !0),
+            (0x10, 0o6, !0),
+            (0x20, 0o6, !0),
+        ] {
+            blob.extend_from_slice(&tag.to_le_bytes());
+            blob.extend_from_slice(&perm.to_le_bytes());
+            blob.extend_from_slice(&id.to_le_bytes());
+        }
+        let acl = c"system.posix_acl_access";
+        for n in ["reg", "fifo"] {
+            let c = cpath(&src.join(n));
+            let rc = unsafe {
+                libc::setxattr(
+                    c.as_ptr(),
+                    acl.as_ptr(),
+                    blob.as_ptr().cast(),
+                    blob.len(),
+                    0,
+                )
+            };
+            if rc != 0 {
+                let e = std::io::Error::last_os_error();
+                assert!(
+                    std::env::var_os("TRUENAS_ROS_REQUIRE_POSIX_ACL").is_none(),
+                    "TRUENAS_ROS_REQUIRE_POSIX_ACL is set but {n} here will \
+                     not hold a POSIX ACL: {e}"
+                );
+                return;
+            }
+        }
+        let src_mode = std::fs::symlink_metadata(src.join("fifo"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(src_mode, 0o666, "the fixture's own mode");
+
+        let dst = tmp.path().join("dst");
+        copytree(&src, &dst, &CopyTreeConfig::default()).unwrap();
+
+        let has_acl = |p: &std::path::Path| -> bool {
+            let c = cpath(p);
+            let n = unsafe {
+                libc::getxattr(
+                    c.as_ptr(),
+                    acl.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            n >= 0
+        };
+        assert!(
+            has_acl(&dst.join("reg")),
+            "the control: a regular file carries its ACL"
+        );
+        assert!(
+            !has_acl(&dst.join("fifo")),
+            "a special node carrying an ACL means this limitation is gone - \
+             update the docs on `make_special_meta` and delete this test"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(dst.join("fifo"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            src_mode,
+            "the mode is the half that does travel, exactly"
+        );
+    }
+
+    /// Metadata is carried through a real descriptor or not at all.
+    ///
+    /// A FIFO can be opened `O_RDONLY|O_NONBLOCK` without waiting for a
+    /// writer, so it takes the full metadata set. A socket refuses every
+    /// `open(2)` with `ENXIO` and a device node's open runs its driver, so
+    /// neither can be given one - and `copytree` says so instead of reaching
+    /// for `fchmodat2`'s empty-path form on an `O_PATH` pin or
+    /// `/proc/self/fd/N`. Those make the mode appear to travel while an ACL
+    /// or xattr on the same handle cannot travel at all (`fsetxattr` and
+    /// `setxattrat` with `AT_EMPTY_PATH` both answer an `O_PATH` descriptor
+    /// `EBADF`), so the copy would report `Ok` having dropped the access
+    /// control.
+    ///
+    /// With the three metadata flags cleared there is nothing to carry, so
+    /// the same socket copies as a bare node.
+    #[test]
+    fn a_socket_is_refused_rather_than_moded_through_a_path() {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        use truenas_ros::sync_fs::shutil::CopyFlags;
+        let tmp = truenas_ros::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        let _sock =
+            std::os::unix::net::UnixListener::bind(src.join("sock")).unwrap();
+        std::fs::set_permissions(
+            src.join("sock"),
+            std::fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+
+        let dst = tmp.path().join("dst");
+        let err = copytree(&src, &dst, &CopyTreeConfig::default())
+            .expect_err("a socket cannot carry metadata, so this must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("socket") && msg.contains("real descriptor"),
+            "the refusal must name the type and why: {msg}"
+        );
+
+        // Cleared flags: nothing to carry, so the node copies.
+        let bare = tmp.path().join("bare");
+        let cfg = CopyTreeConfig {
+            flags: CopyFlags::empty(),
+            ..Default::default()
+        };
+        copytree(&src, &bare, &cfg).expect("a bare socket still copies");
+        assert!(
+            std::fs::symlink_metadata(bare.join("sock"))
+                .unwrap()
+                .file_type()
+                .is_socket(),
+            "the node itself is still recreated by type"
+        );
+
+        // The control: a FIFO in the same position takes the whole set,
+        // so this is the socket and not a broken fixture.
+        let fsrc = tmp.path().join("fsrc");
+        std::fs::create_dir(&fsrc).unwrap();
+        let c = std::ffi::CString::new(
+            fsrc.join("fifo").into_os_string().into_encoded_bytes(),
+        )
+        .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o640) }, 0);
+        let fdst = tmp.path().join("fdst");
+        copytree(&fsrc, &fdst, &CopyTreeConfig::default())
+            .expect("a FIFO carries its metadata through a real descriptor");
+        assert_eq!(
+            std::fs::symlink_metadata(fdst.join("fifo"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640,
+            "the FIFO's exact mode must survive the umask"
+        );
+    }
+
     // A writer-less FIFO in the source must be recreated by type, not read as a
     // regular file (which would block the copy forever).
     #[test]
