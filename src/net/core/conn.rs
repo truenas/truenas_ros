@@ -979,6 +979,21 @@ pub(crate) struct Connection<U> {
     // farewell. On a detached connection it is only marked; the close lands at
     // resume (like `evict_on_resume`).
     pub close_on_flush: Option<CloseReason>,
+    // The peer half-closed (`shutdown(SHUT_WR)`, or a plain close) while this
+    // connection still owed a response. Distinct from `close_on_flush` on
+    // purpose, and it must stay distinct:
+    //
+    //   - it retires the recv side the same way, because a FIN re-completes a
+    //     re-armed recv instantly and re-pumping one spins the loop at 100%
+    //     CPU rather than waiting for anything;
+    //   - but it does **not** mean a teardown owns the slot. The reply is
+    //     still coming, and `teardown_owns_slot()` is what makes a worker
+    //     outcome, a redelivery or a push get dropped - so arming
+    //     `close_on_flush` here would swap "closed with the reply unsent" for
+    //     "closed with the reply never produced".
+    //
+    // The close lands from the send path once nothing is owed.
+    pub peer_closed: Option<CloseReason>,
     // The reason this connection began closing, stashed by `close_conn` so the
     // client can report it in `Event::Closed` when the slot is reclaimed. The
     // server reports closes through its close hook and never reads this, so the
@@ -1107,6 +1122,7 @@ impl<U> Connection<U> {
             receipt_deadline_owed: 0,
             evict_on_resume: false,
             close_on_flush: None,
+            peer_closed: None,
             #[cfg(feature = "net-client")]
             close_reason: None,
             sending: false,
