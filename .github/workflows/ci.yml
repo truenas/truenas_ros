@@ -278,6 +278,19 @@ jobs:
     # MODELS=23 against 24 running, silencing any single model left the lane
     # green - measured, `#[ignore]` on one gave `23 passed; 1 ignored`, and
     # `23 -lt 23` is false. Bump MODELS when you add one; that is the point.
+    # Nothing else lints this configuration. `loom` is a `cfg`, not a feature,
+    # so no clippy step above ever compiles it — and the step below replaces
+    # RUSTFLAGS wholesale, which drops the `-D warnings` the other lanes carry
+    # in it. A planted unused binding inside a loom-only module passed the
+    # entire documented gate at exit 0 while this lane printed the warning and
+    # exited 0 anyway; the same binding in `src/secrets.rs` reddened at once.
+    # So lint it here, over `--all-targets` like every other clippy step,
+    # because the models live in `#[cfg(all(test, loom))]` modules that a bare
+    # `--lib` does not compile.
+    - name: clippy (loom cfg)
+      run: |
+        RUSTFLAGS="--cfg loom" cargo clippy --all-targets --all-features \
+          -- -D warnings
     - name: loom (concurrency models)
       env:
         MODELS: "25"

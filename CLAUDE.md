@@ -865,6 +865,13 @@ MODELS=$(sed -n 's/^ *MODELS: "\([0-9]*\)"$/\1/p' .github/workflows/ci.yml)
 .github/workflows/scripts/counted-cargo-test.sh "$MODELS" loom -- \
   env RUSTFLAGS="--cfg loom" cargo test --lib --all-features loom_
 
+# And lint that configuration, which nothing else does: `loom` is a `cfg`
+# rather than a feature, so no clippy step above compiles it, and the line
+# above replaces RUSTFLAGS wholesale - dropping the `-D warnings` the other
+# lanes carry there. `--all-targets` because the models live in
+# `#[cfg(all(test, loom))]` modules a bare `--lib` never builds.
+RUSTFLAGS="--cfg loom" cargo clippy --all-targets --all-features -- -D warnings
+
 (cd fuzz && cargo +nightly fuzz build)
 
 # The MSRV `Cargo.toml` declares, which every other step here misses:

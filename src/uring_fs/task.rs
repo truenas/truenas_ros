@@ -1470,7 +1470,7 @@ pub(crate) fn in_pass(
     // cross-thread, so a redundant refcount pair here is two locked
     // RMWs on the delivery hot path - the same cost the poll loop
     // avoids by caching its waker.
-    let _pass = fs.tasks.run.as_ref().map(Arc::clone).map(|run| {
+    let _pass = fs.tasks.run.clone().map(|run| {
         let prev = run.begin_pass();
         PassGuard(run, prev)
     });
@@ -1491,7 +1491,7 @@ pub(crate) fn in_pass(
 /// nothing left in flight - a parent woken by its child's final poll -
 /// would wait on a completion that is never coming.
 pub(crate) fn drain(fs: &mut FsCore, eng: &mut Engine) {
-    let Some(run) = fs.tasks.run.as_ref().map(Arc::clone) else {
+    let Some(run) = fs.tasks.run.clone() else {
         return;
     };
     let mut budget = run.ready.load(Ordering::Acquire);
