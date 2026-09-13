@@ -86,12 +86,20 @@ Do not reopen these without a reason that is new.
   which is only ever chmod and the xattr family.
   The consequence is owned rather than hidden: `copytree` opens a FIFO
   `O_RDONLY|O_NONBLOCK` (which does not wait for a writer) and carries its
-  full metadata, and **refuses a socket or a device node outright** when any
-  metadata flag is set - a socket answers `ENXIO` to every open and a device
-  node's open would run its driver. `a_socket_is_refused_rather_than_moded_
-  through_a_path` pins both halves. If you are about to reach for an
-  empty-path or `/proc` form to make one of these "work", this is the entry
-  that says not to.
+  full metadata, and **refuses the mode of a socket or a device node** - a
+  socket answers `ENXIO` to every open and a device node's open would run
+  its driver, so neither can be given the descriptor `fchmod` needs.
+  `a_socket_is_refused_rather_than_moded_through_a_path` pins both halves.
+  **Only the mode.** Owner and timestamps ride the `AT_EMPTY_PATH` pair on
+  the `O_PATH` peek, the same two calls `make_symlink_meta` uses, so a
+  caller asking for those without `PERMISSIONS` is served rather than
+  refused (`a_socket_carries_everything_but_its_mode`). The refusal is a
+  metadata-copy failure like any other, so it goes through `guard`: under
+  `raise_error: false` the copy continues and the node keeps the creation
+  hold, because releasing that hold needs the same `fchmod`
+  (`a_refused_special_type_is_swallowed_when_errors_are_not_raised`). If you
+  are about to reach for an empty-path or `/proc` form to make the *mode*
+  work, this is the entry that says not to.
 - **`query_tree` skips only what has nothing left to list** - `EACCES`,
   `EPERM`, `ENOENT`. Everything else, `ENOTDIR` included, surfaces as
   `Some(Err)`, because a partial listing that reads as complete is data loss

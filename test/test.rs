@@ -1729,12 +1729,14 @@ mod shutil {
     /// creation hold instead and the real mode lands in the `fchmod`
     /// afterwards, which the umask made necessary anyway.
     ///
-    /// **This test cannot fail as root**, which is the environment CLAUDE.md
-    /// warns about: DAC denies root nothing, so the `EACCES` is unreachable
-    /// here and the assertions below merely pass. It bites on the
-    /// unprivileged CI runner, which is precisely where the regression
-    /// lived - every other FIFO fixture in this suite uses a readable mode,
-    /// so nothing else would ever have met it.
+    /// DAC denies root nothing, so as root the `EACCES` is unreachable and
+    /// every assertion below merely passes - measured: with the creation
+    /// mode reverted to the source's, this test still reported `ok`. The
+    /// copy therefore runs with `CAP_DAC_OVERRIDE` and
+    /// `CAP_DAC_READ_SEARCH` dropped from this thread, which makes the same
+    /// mutation fail. `DacDropped::take` is a no-op for a non-root caller,
+    /// so the unprivileged runner - where the regression lived, every other
+    /// FIFO fixture here using a readable mode - is unchanged.
     #[test]
     fn a_write_only_fifo_is_still_copied() {
         use std::os::unix::ffi::OsStrExt;
@@ -1756,8 +1758,11 @@ mod shutil {
         .unwrap();
 
         let dst = tmp.path().join("dst");
-        let stats = copytree(&src, &dst, &CopyTreeConfig::default())
-            .expect("a write-only FIFO must not fail its own copy");
+        let stats = {
+            let _dac = DacDropped::take();
+            copytree(&src, &dst, &CopyTreeConfig::default())
+                .expect("a write-only FIFO must not fail its own copy")
+        };
         assert_eq!(stats.specials, 1);
         assert_eq!(
             std::fs::symlink_metadata(dst.join("wo"))
@@ -1878,7 +1883,7 @@ mod shutil {
         );
     }
 
-    /// Metadata is carried through a real descriptor or not at all.
+    /// The **mode** is carried through a real descriptor or not at all.
     ///
     /// A FIFO can be opened `O_RDONLY|O_NONBLOCK` without waiting for a
     /// writer, so it takes the full metadata set. A socket refuses every
@@ -1890,6 +1895,9 @@ mod shutil {
     /// `setxattrat` with `AT_EMPTY_PATH` both answer an `O_PATH` descriptor
     /// `EBADF`), so the copy would report `Ok` having dropped the access
     /// control.
+    ///
+    /// Owner and timestamps are not part of that limit and do travel;
+    /// `a_socket_carries_everything_but_its_mode` is the other half.
     ///
     /// With the three metadata flags cleared there is nothing to carry, so
     /// the same socket copies as a bare node.
@@ -1952,6 +1960,390 @@ mod shutil {
                 & 0o777,
             0o640,
             "the FIFO's exact mode must survive the umask"
+        );
+    }
+
+    /// A socket gives up its mode and nothing else.
+    ///
+    /// Only `fchmod` is impossible on a socket or a device node: it needs a
+    /// real descriptor and neither type can be given one. `fchownat` and
+    /// `utimensat` with `AT_EMPTY_PATH` are supported on the `O_PATH` peek,
+    /// measured, and type-agnostic in the kernel (`chown_common`,
+    /// `fs/open.c:754`, tests the inode's type only to kill setid;
+    /// `do_utimes_path`, `fs/utimes.c:86`, accepts the flag outright). So
+    /// refusing `OWNER` and `TIMESTAMPS` alongside the mode gave up three
+    /// attributes to report one, and killed outright a copy that asked only
+    /// for the two that work.
+    ///
+    /// The mode assertion needs no knowledge of the umask: a regular file
+    /// beside the socket is created at the same `creation_mode` permissive
+    /// form, so the two are compared to each other rather than to a
+    /// constant.
+    ///
+    /// The owner half only *distinguishes* as root, which is where the
+    /// source can be given an identity the copying process does not have;
+    /// the timestamp half bites everywhere, and both stamps are far enough
+    /// from "now" that they cannot arrive by accident.
+    #[test]
+    fn a_socket_carries_everything_but_its_mode() {
+        use std::os::unix::fs::MetadataExt;
+        use truenas_ros::sync_fs::shutil::CopyFlags;
+        const ATIME: i64 = 1_000_000_000;
+        const MTIME: i64 = 1_234_567_890;
+
+        let tmp = truenas_ros::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        let _sock =
+            std::os::unix::net::UnixListener::bind(src.join("sock")).unwrap();
+        // The control for the creation mode: same source mode, a type that
+        // takes the whole metadata set.
+        std::fs::write(src.join("reg"), b"x").unwrap();
+        for n in ["sock", "reg"] {
+            std::fs::set_permissions(
+                src.join(n),
+                std::fs::Permissions::from_mode(0o707),
+            )
+            .unwrap();
+        }
+
+        // Stamp the source by NAME: a socket cannot be opened to be stamped
+        // through a descriptor, which is the whole reason this case exists.
+        let c = std::ffi::CString::new(
+            src.join("sock").into_os_string().into_encoded_bytes(),
+        )
+        .unwrap();
+        // SAFETY: a valid path and a two-element timespec array.
+        let uid = unsafe { libc::geteuid() };
+        let want_uid = if uid == 0 { 65534 } else { uid };
+        assert_eq!(
+            unsafe {
+                libc::fchownat(
+                    libc::AT_FDCWD,
+                    c.as_ptr(),
+                    want_uid,
+                    u32::MAX,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            },
+            0,
+            "could not give the source socket its own owner"
+        );
+        let times = [
+            libc::timespec {
+                tv_sec: ATIME,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: MTIME,
+                tv_nsec: 0,
+            },
+        ];
+        assert_eq!(
+            unsafe {
+                libc::utimensat(
+                    libc::AT_FDCWD,
+                    c.as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            },
+            0,
+            "could not stamp the source socket"
+        );
+
+        // Nothing this asks for is impossible, so nothing is refused.
+        let dst = tmp.path().join("dst");
+        let cfg = CopyTreeConfig {
+            flags: CopyFlags::OWNER | CopyFlags::TIMESTAMPS,
+            ..Default::default()
+        };
+        let stats = copytree(&src, &dst, &cfg)
+            .expect("owner and timestamps need no real descriptor");
+        assert_eq!(stats.specials, 1);
+        let md = std::fs::symlink_metadata(dst.join("sock")).unwrap();
+        assert_eq!(md.uid(), want_uid, "the source's owner must travel");
+        assert_eq!(md.atime(), ATIME, "the source's atime must travel");
+        assert_eq!(md.mtime(), MTIME, "the source's mtime must travel");
+        let reg_mode = std::fs::metadata(dst.join("reg"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            md.permissions().mode() & 0o777,
+            reg_mode,
+            "with PERMISSIONS clear the socket takes the same creation mode \
+             as the file beside it"
+        );
+        assert_ne!(
+            md.permissions().mode() & 0o777,
+            0o707,
+            "and the source's mode is not what travels"
+        );
+
+        // The default flags ask for the mode too, which is the one thing
+        // that cannot travel: the copy fails and says so - and the two that
+        // can travel have landed on the node that is there.
+        let strict = tmp.path().join("strict");
+        let err = copytree(&src, &strict, &CopyTreeConfig::default())
+            .expect_err("a socket's mode cannot travel");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("socket")
+                && msg.contains("real descriptor")
+                && msg.contains("mode"),
+            "the refusal must name the type and the one attribute it is \
+             about: {msg}"
+        );
+        let md = std::fs::symlink_metadata(strict.join("sock")).unwrap();
+        assert_eq!(md.uid(), want_uid, "the owner travelled before the mode");
+        assert_eq!(md.mtime(), MTIME, "so did the timestamps");
+
+        // PERMISSIONS alone asks for the one thing that cannot travel, and
+        // for nothing else: the refusal fires, and neither of the two calls
+        // above runs. Each is gated on its own flag, and the message says
+        // "where asked for" rather than claiming a carry that never
+        // happened.
+        let only = tmp.path().join("only");
+        let cfg = CopyTreeConfig {
+            flags: CopyFlags::PERMISSIONS,
+            ..Default::default()
+        };
+        copytree(&src, &only, &cfg)
+            .expect_err("PERMISSIONS is the flag that cannot be served");
+        let md = std::fs::symlink_metadata(only.join("sock")).unwrap();
+        // Against the *copier's* identity, not against `want_uid`: the two
+        // are the same uid unless this is running as root, and an
+        // inequality would then fail the unprivileged runner for being
+        // unprivileged. This says the same thing where it can distinguish
+        // and nothing false where it cannot.
+        assert_eq!(
+            md.uid(),
+            uid,
+            "OWNER was not asked for, so the node keeps the copier's \
+             identity"
+        );
+        assert_ne!(
+            md.mtime(),
+            MTIME,
+            "TIMESTAMPS was not asked for, so no stamp may have run"
+        );
+    }
+
+    /// The special-type refusal is a metadata-copy failure, so
+    /// `raise_error: false` swallows it like every other one.
+    ///
+    /// It fires only *because* metadata was requested - the node itself is
+    /// created and verified before the flags are even consulted - and
+    /// `CopyTreeConfig::raise_error` documents that class as "ignored, and
+    /// the copy continues" when false. Returned past `guard`, one unix
+    /// socket anywhere in a source tree failed the whole copy in **both**
+    /// dispositions and left a partial destination behind: an ssh-agent
+    /// socket in a home directory is enough.
+    ///
+    /// Swallowed, the node is the bare special the refusal's own message
+    /// tells the caller to ask for - and it keeps the creation hold, since
+    /// releasing that needs the very `fchmod` a socket cannot be given.
+    #[test]
+    fn a_refused_special_type_is_swallowed_when_errors_are_not_raised() {
+        use std::os::unix::fs::FileTypeExt;
+        let tmp = truenas_ros::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        let _sock =
+            std::os::unix::net::UnixListener::bind(src.join("sock")).unwrap();
+        std::fs::write(src.join("reg"), b"payload").unwrap();
+
+        // The control: the default `raise_error: true` still refuses, with
+        // the message unchanged.
+        let strict = tmp.path().join("strict");
+        let err = copytree(&src, &strict, &CopyTreeConfig::default())
+            .expect_err("raise_error: true still refuses");
+        assert!(
+            err.to_string().contains("socket"),
+            "the refusal must still name the type: {err}"
+        );
+
+        let dst = tmp.path().join("dst");
+        let cfg = CopyTreeConfig {
+            raise_error: false,
+            ..Default::default()
+        };
+        let stats = copytree(&src, &dst, &cfg)
+            .expect("raise_error: false must not fail the copy over a socket");
+        assert_eq!(stats.specials, 1, "the socket is counted");
+        assert_eq!(stats.files, 1, "and the file beside it is copied");
+        assert!(
+            std::fs::symlink_metadata(dst.join("sock"))
+                .unwrap()
+                .file_type()
+                .is_socket(),
+            "the node is recreated by type"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("reg")).unwrap(),
+            b"payload",
+            "the walk continued past the socket"
+        );
+    }
+
+    /// Drop `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH` from **this thread's**
+    /// effective set for as long as the guard lives.
+    ///
+    /// Running as root, DAC denies nothing, so an `EACCES` path cannot be
+    /// provoked at all. Capabilities are per-*thread* credentials and
+    /// `capset` with `pid: 0` addresses the calling thread, so this is
+    /// local to the test - no fork, and nothing else in the binary sees it.
+    /// Only *effective* is narrowed, so permitted still holds what the
+    /// restore raises back.
+    struct DacDropped(Option<[u32; 2]>);
+
+    impl DacDropped {
+        const CAP_DAC_OVERRIDE: u32 = 1;
+        const CAP_DAC_READ_SEARCH: u32 = 2;
+
+        /// `None` when the caller is not root - there is nothing to drop and
+        /// the kernel is already denying, which is the state under test.
+        fn take() -> Self {
+            // SAFETY: reads the calling thread's uid.
+            if unsafe { libc::geteuid() } != 0 {
+                return DacDropped(None);
+            }
+            let mut data = Self::caps();
+            let saved = [data[0], data[1]];
+            data[0] &= !((1 << Self::CAP_DAC_OVERRIDE)
+                | (1 << Self::CAP_DAC_READ_SEARCH));
+            Self::set_effective(data);
+            DacDropped(Some(saved))
+        }
+
+        /// The effective words of the calling thread, low then high.
+        fn caps() -> [u32; 2] {
+            let mut hdr = [0x2008_0522u32, 0]; // VERSION_3, pid 0
+            let mut data = [0u32; 6]; // two {effective, permitted, inheritable}
+            // SAFETY: capget fills two three-word blocks for VERSION_3.
+            let r = unsafe {
+                libc::syscall(
+                    libc::SYS_capget,
+                    hdr.as_mut_ptr(),
+                    data.as_mut_ptr(),
+                )
+            };
+            assert_eq!(r, 0, "capget");
+            [data[0], data[3]]
+        }
+
+        fn set_effective(eff: [u32; 2]) {
+            let mut hdr = [0x2008_0522u32, 0];
+            let mut data = [0u32; 6];
+            // SAFETY: as above.
+            let r = unsafe {
+                libc::syscall(
+                    libc::SYS_capget,
+                    hdr.as_mut_ptr(),
+                    data.as_mut_ptr(),
+                )
+            };
+            assert_eq!(r, 0, "capget");
+            data[0] = eff[0];
+            data[3] = eff[1];
+            // SAFETY: capset reads the same layout back.
+            let r = unsafe {
+                libc::syscall(libc::SYS_capset, hdr.as_mut_ptr(), data.as_ptr())
+            };
+            assert_eq!(r, 0, "capset");
+        }
+    }
+
+    impl Drop for DacDropped {
+        fn drop(&mut self) {
+            if let Some(saved) = self.0 {
+                Self::set_effective(saved);
+            }
+        }
+    }
+
+    /// A destination node the copy cannot open is refused **by name**.
+    ///
+    /// `creation_mode`'s hold is only a *request*. Where the destination
+    /// parent carries an inheritable ACL the umask never applies and the new
+    /// node's mode is narrowed through the inherited entries instead
+    /// (`zpl_init_acl` -> `__posix_acl_create`,
+    /// `module/os/linux/zfs/zpl_xattr.c`; `posix_acl_create`,
+    /// `fs/posix_acl.c`), so a parent whose entries withhold owner-read
+    /// produces a node this very copy cannot open for the real descriptor
+    /// its metadata needs. The `O_PATH` pin this replaced needed no read
+    /// permission, so the whole state is new - and it reached the caller as
+    /// a bare `EACCES` naming nothing at all.
+    ///
+    /// The fixture is a destination root carrying `default:user::-w-`,
+    /// written as the raw `system.posix_acl_default` blob because the
+    /// narrowing is what is under test and `setfacl` is not a dependency. A
+    /// filesystem that refuses the xattr fails the test rather than skipping
+    /// it: every temp filesystem this runs on does POSIX ACLs, and a silent
+    /// pass here would be a pass having tested nothing.
+    #[test]
+    fn a_destination_node_without_owner_read_names_what_narrowed_it() {
+        use std::os::unix::fs::PermissionsExt;
+        use truenas_ros::sync_fs::xattr::{XattrFlags, fsetxattr};
+        let tmp = truenas_ros::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        let fifo = src.join("fifo");
+        let c = std::ffi::CString::new(
+            fifo.clone().into_os_string().into_encoded_bytes(),
+        )
+        .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+
+        // `system.posix_acl_default`: version 2, then {u16 tag, u16 perm,
+        // u32 id} per entry. user:: write-only, group:: and other:: none --
+        // the minimal complete set, and the owner entry is the one
+        // `posix_acl_create_masq` intersects the requested mode against.
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, perm) in [(0x01u16, 2u16), (0x04, 0), (0x20, 0)] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&perm.to_le_bytes());
+            acl.extend_from_slice(&u32::MAX.to_le_bytes());
+        }
+        // On the destination ROOT, so only what the copy creates *inside* it
+        // is narrowed: put it a level up and the destination directory
+        // itself lands at 0o200 and the copy cannot even enter it.
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir(&dst).unwrap();
+        let dfd = std::fs::File::open(&dst).unwrap();
+        fsetxattr(
+            std::os::fd::AsFd::as_fd(&dfd),
+            c"system.posix_acl_default",
+            &acl,
+            XattrFlags::empty(),
+        )
+        .expect("the temp filesystem must support POSIX default ACLs");
+
+        let err = {
+            let _dac = DacDropped::take();
+            copytree(&src, &dst, &CopyTreeConfig::default())
+                .expect_err("the new node has no owner-read to open it with")
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("without owner-read")
+                && msg.contains("inherited")
+                && msg.contains("0o200"),
+            "the refusal must name the mode it measured and what set it: \
+             {msg}"
+        );
+        // The premise, in case a filesystem ever stops narrowing: the node
+        // really was created below the hold this copy asked for.
+        assert_eq!(
+            std::fs::symlink_metadata(dst.join("fifo"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o200,
+            "the inherited entries, not the copy, chose this mode"
         );
     }
 
