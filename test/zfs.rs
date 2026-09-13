@@ -882,6 +882,24 @@ fn a_trivial_nfsv4_destination_releases_the_creation_hold() {
         .expect("fsetacl posix");
     drop(f);
 
+    // Read the source's mode AFTER the ACL, not before: an access ACL
+    // carrying a MASK republishes the file's group bits as that mask
+    // (`posix_acl_update_mode`, `fs/posix_acl.c`), so the `0o644` this file
+    // was created at is `0o664` by now - owner `rw` from `user_obj`, group
+    // `rw` from the mask, other `r`. The hold release stamps `src_st.mode()`,
+    // so the source is the oracle and a literal here is a guess that ages.
+    let src_mode = std::fs::metadata(src.join("f"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    let hold = 0o600;
+    assert_ne!(
+        src_mode, hold,
+        "the source landed on the creation hold itself, so the assertion \
+         below could not tell a release from a failure to release"
+    );
+
     let cfg = CopyTreeConfig {
         raise_error: false,
         ..Default::default()
@@ -893,10 +911,14 @@ fn a_trivial_nfsv4_destination_releases_the_creation_hold() {
     let _ = std::fs::remove_dir_all(&dst);
     let stats = copied.expect("the salvage mode must not fail the copy");
     assert_eq!(stats.files, 1);
+    let got = mode.expect("the file must exist");
+    assert_ne!(
+        got, hold,
+        "the destination kept the {hold:#o} creation hold: the ACL copy \
+         failed EOPNOTSUPP and the release declined on a trivial ACL"
+    );
     assert_eq!(
-        mode.expect("the file must exist"),
-        0o644,
-        "the destination kept the 0o600 creation hold: the ACL copy failed \
-         EOPNOTSUPP and the release declined on a trivial ACL"
+        got, src_mode,
+        "the hold was released but not to the source's mode"
     );
 }
