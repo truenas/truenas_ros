@@ -1337,11 +1337,25 @@ fn copy_metadata(
             // above is the only thing that delivers it. Release the hold
             // rather than leave it as the final mode.
             //
-            // **Before `guard`, deliberately.** After it this never runs
-            // under `raise_error: true`, and that is the caller taking the
-            // `Err` and keeping the partially-copied tree - the one that
-            // most needs a tree it can enter. The error still propagates
-            // below; only the mode lands first.
+            // **Before `guard`, deliberately**, so the mode lands in either
+            // disposition. The case this exists for is `raise_error: false`,
+            // where `guard` answers `Ok(())` and `copytree` returns success
+            // with plausible stats over a tree that is owner-only root to
+            // leaf.
+            //
+            // **This object, and nothing above it.** `finish_dir` stamps a
+            // directory on *ascent*, so a `raise_error: true` walk that
+            // stops here drops every ancestor frame unstamped and they keep
+            // the `0o700` hold; an ownership failure propagates from the
+            // `fchown` above without reaching this line at all. Deliberate,
+            // not missed: an aborted copy's destination is not a finished
+            // artifact. The caller owns every object in it and can enter it
+            // - an unprivileged `fchown` to another uid is `EPERM`, so it
+            // never happened, and a privileged one is root's - while
+            // widening an incomplete tree to the source's modes would
+            // publish a partial result to identities that should not be
+            // reading it yet. A retry under the default `exist_ok` re-stamps
+            // the whole tree.
             //
             // A failure to release is swallowed: `r` is already an error on
             // its way to `guard`, which is the verdict the caller asked for,

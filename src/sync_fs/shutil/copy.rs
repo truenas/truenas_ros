@@ -219,6 +219,38 @@ pub fn copy_permissions(
     Ok(())
 }
 
+/// Whether a `system.nfs4_acl_xdr` blob carries nothing but the mode.
+///
+/// The blob's first big-endian word is `vsa_aclflags` - `zfsacl_to_nfsacl41i`
+/// writes it ahead of the ACE count (`module/os/linux/zfs/zpl_xattr.c`) - and
+/// `zfs_getacl` ORs `ACL_IS_TRIVIAL` into it from `z_pflags`
+/// (`zfs_acl.c:2063`; the bit is `0x10000`,
+/// `include/os/linux/spl/sys/acl.h:87`). `__zpl_xattr_nfs41acl_get` asks for
+/// it by requesting `VSA_ACE_ACLFLAGS`, so the bit is in every blob it
+/// returns. `Nfs4AclFlag::ACL_IS_TRIVIAL` is the same bit under this crate's
+/// own name, and `truenas_os`'s `NFS4ACL.trivial` reads the same word.
+///
+/// **Asked of the blob, and not of `listxattr`, on purpose.** `zpl_xattr_list`
+/// withholds the name for a trivial ACL and would answer this too - but
+/// io_uring has `FGETXATTR`/`GETXATTR`/`FSETXATTR`/`SETXATTR` and **no**
+/// listxattr op at all (`include/uapi/linux/io_uring.h`), so a predicate built
+/// on listing cannot follow this code to the async side. The flags word rides
+/// in bytes the caller has already fetched, which costs nothing and ports.
+///
+/// A blob too short to hold that word is unreadable rather than trivial, and
+/// an unreadable ACL is one a `chmod` must not be let near.
+fn nfs4_acl_is_trivial(blob: &[u8]) -> bool {
+    // `include/os/linux/spl/sys/acl.h:87`. A ZFS extension rather than an
+    // RFC 8881 flag, which is why it sits above `ACL_FLAGS_ALL` instead of
+    // among the three standard bits.
+    const ACL_IS_TRIVIAL: u32 = 0x0001_0000;
+    let Some(word) = blob.get(..4) else {
+        return false;
+    };
+    let flags = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+    flags & ACL_IS_TRIVIAL != 0
+}
+
 /// Put a plain mode on a destination whose ACL copy failed, so the creation
 /// hold is not the mode it keeps. Answers whether one was applied.
 ///
@@ -238,20 +270,41 @@ pub fn copy_permissions(
 /// (`zfs_acl_chmod_setattr`, `module/os/linux/zfs/zfs_acl.c`). A destination
 /// holding one is not sitting at the hold, so there is nothing to release.
 ///
+/// **The two names are asked different questions, because they answer
+/// differently.** A POSIX access ACL exists as a stored xattr only when there
+/// is a real one, so its presence is the answer. `system.nfs4_acl_xdr` is
+/// synthesised: `__zpl_xattr_nfs41acl_get` (`module/os/linux/zfs/zpl_xattr.c`)
+/// refuses only a non-NFSv4 dataset and an empty ACL, so **every** object on
+/// an `acltype=nfsv4` dataset answers it - a trivial ACL included, since that
+/// is still three ACEs. Presence therefore said "ACL" for every object on that
+/// row and the hold was never released there at all, which is the row a share
+/// migration lands on. [`nfs4_acl_is_trivial`] asks the blob instead.
+///
+/// `EOPNOTSUPP` means the filesystem keeps no xattrs, so there is no ACL to
+/// damage and the mode lands.
+///
+/// **Scope is the object whose [`copy_permissions`] failed.** Ancestors are
+/// stamped by `finish_dir` on ascent, so a walk that stops keeps their holds;
+/// the call site says why an aborted copy is left closed rather than widened.
+///
 /// setid is withheld exactly as [`copy_permissions`] withholds it;
 /// [`copy_setid`] applies it afterwards when ownership was preserved.
 pub(super) fn release_creation_hold(
     dst: BorrowedFd<'_>,
     mode: u32,
 ) -> Result<bool> {
-    for name in ACCESS_ACL_XATTRS {
-        match fgetxattr(dst, name) {
-            Ok(_) => return Ok(false),
-            // No ACL of that flavour, or a filesystem that keeps none -
-            // which is the case this exists for.
-            Err(Errno::ENODATA | Errno::EOPNOTSUPP) => {}
-            Err(e) => return Err(e.into()),
-        }
+    match fgetxattr(dst, POSIX_ACCESS) {
+        Ok(_) => return Ok(false),
+        // No ACL of that flavour, or a filesystem that keeps none - which is
+        // the case this exists for.
+        Err(Errno::ENODATA | Errno::EOPNOTSUPP) => {}
+        Err(e) => return Err(e.into()),
+    }
+    match fgetxattr(dst, NFS4_ACL) {
+        Ok(blob) if !nfs4_acl_is_trivial(&blob) => return Ok(false),
+        Ok(_) => {}
+        Err(Errno::ENODATA | Errno::EOPNOTSUPP) => {}
+        Err(e) => return Err(e.into()),
     }
     super::ok_if_acl_governed(
         retry_on_eintr(|| unsafe {
@@ -330,4 +383,39 @@ pub fn copy_xattrs(
         fsetxattr(dst, name.as_c_str(), &buf, XattrFlags::empty())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The trivial bit is read out of the blob, at the right offset, in the
+    /// right byte order - the whole of what `release_creation_hold` decides
+    /// an `acltype=nfsv4` destination on.
+    ///
+    /// A pure function so this runs everywhere, including the unprivileged
+    /// runner: the live half needs an NFSv4 dataset and only the QEMU lane
+    /// has one, which is exactly how the defect this replaced survived.
+    #[test]
+    fn the_nfs4_trivial_bit_is_read_from_the_blob() {
+        // XDR: [aclflags, ace_count, ...aces]. ZFS writes both big-endian.
+        let blob = |flags: u32, naces: u32| {
+            let mut v = flags.to_be_bytes().to_vec();
+            v.extend_from_slice(&naces.to_be_bytes());
+            v
+        };
+        // A trivial ACL is still three ACEs, which is why counting them - or
+        // asking whether the xattr exists - cannot answer this.
+        assert!(nfs4_acl_is_trivial(&blob(0x0001_0000, 3)));
+        // ACL_IS_DIR beside it, as a directory's blob carries.
+        assert!(nfs4_acl_is_trivial(&blob(0x0003_0000, 3)));
+        // A real ACL: same shape, same ACE count, bit clear.
+        assert!(!nfs4_acl_is_trivial(&blob(0x0002_0000, 3)));
+        assert!(!nfs4_acl_is_trivial(&blob(0, 3)));
+        // Little-endian would read 0x0000_0100 here and answer the opposite.
+        assert!(!nfs4_acl_is_trivial(&0x0001_0000u32.to_le_bytes()));
+        // Too short to hold the word: unreadable, so not trivial.
+        assert!(!nfs4_acl_is_trivial(&[]));
+        assert!(!nfs4_acl_is_trivial(&[0, 1, 0]));
+    }
 }
