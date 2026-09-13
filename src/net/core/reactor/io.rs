@@ -1810,17 +1810,12 @@ impl<U> Reactor<U> {
         // does - spins the loop instead of waiting, measured at 465ms of
         // CPU against 62ms over the same 800ms of owed work.
         //
-        // Note this is **not** the full retirement `close_on_flush` gets:
-        // `pump_gate` stops for that flag and does not consult this one, so
-        // a later send completion can still re-arm a read, which the FIN
-        // completes again and this arm parks again. That costs a syscall
-        // per send while the flag is set - bounded by send activity, not a
-        // spin, which is what the CPU measurement shows - and the
-        // re-completion is also what closes a connection whose owed work
-        // finished without putting any bytes on the wire, since `on_send`
-        // never fires there. Adding the flag to `pump_gate` would make the
-        // retirement real and remove that churn; it would also remove that
-        // second closing path, so do the accounting before changing it.
+        // `pump_gate` retires the recv side on this flag as well, so
+        // nothing re-arms a read while it is set and this arm is a
+        // backstop rather than the steady state. It stays because what
+        // losing it costs is the spin above; it is not a closing path.
+        // The close belongs to `pump_gate` when the owed work ends with
+        // nothing on the wire, and to `on_send_complete` when bytes flush.
         if self.table.conn(slot).peer_closed.is_some() {
             return Ok(RecvStep::Done);
         }
@@ -2309,6 +2304,31 @@ impl<U> Reactor<U> {
             {
                 self.close_conn(slot, generation, CloseReason::ShuttingDown)?;
                 return Ok(Gate::Stop);
+            }
+            return Ok(Gate::Stop);
+        }
+        // A peer that half-closed while work was owed (`peer_closed`). The
+        // flag is only set on an *idle* read-ahead recv over an empty
+        // buffer, so nothing is pending and nothing more can arrive: the
+        // recv side is retired here, the way `close_on_flush` retires it,
+        // without making a teardown own the slot (which would drop the
+        // reply that is still coming).
+        //
+        // This is also the only place such a connection can close when its
+        // owed work ends with **nothing on the wire** - a one-way
+        // `Injected::Done`, a `Redeliver` answering empty, an inline empty
+        // `Response::Reply`. Those retire `outstanding` and queue no PDU,
+        // so `on_send_complete` - which owns the case where bytes flush --
+        // never runs, and the slot and the fd would be held until the
+        // server exits.
+        if let Some(reason) = conn.peer_closed {
+            let dry = conn.outstanding == 0
+                && !conn.sending
+                && !conn.has_pending_send()
+                && !conn.tail_active();
+            if dry {
+                self.table.conn_mut(slot).peer_closed = None;
+                self.close_conn(slot, generation, reason)?;
             }
             return Ok(Gate::Stop);
         }

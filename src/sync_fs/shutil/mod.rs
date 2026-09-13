@@ -909,22 +909,27 @@ fn symlink_at(
 ///
 /// # Ownership, mode and timestamps only
 ///
-/// Extended attributes and ACLs are not carried onto a special node, and
-/// routing this through [`copy_xattrs`] would not carry them either. The node
-/// is pinned with `O_PATH` for the reason above, and the whole `f*xattr`
-/// family refuses an `O_PATH` descriptor with `EBADF`: for an empty path
-/// `path_setxattrat` resolves the fd through `fdget` (`fs/xattr.c:757`), which
-/// masks out `FMODE_PATH`. `setxattrat` with `AT_EMPTY_PATH` is the same call
-/// -- `getname_maybe_null` returns NULL for an empty name (`fs/namei.c:233`),
-/// landing on that branch. `fchmodat2` is not subject to this, which is why
-/// the mode below can be set through the handle and the xattrs cannot.
+/// Extended attributes and ACLs do not travel onto a special node, and
+/// routing this through [`copy_xattrs`] would not carry them either. The
+/// obstacle is the **source**: the walk pins source specials `O_PATH`, and
+/// the whole `f*xattr` family refuses such a descriptor with `EBADF`. For an
+/// empty path `path_setxattrat` resolves the fd through `fdget`
+/// (`fs/xattr.c:757`), which masks out `FMODE_PATH`; `setxattrat` with
+/// `AT_EMPTY_PATH` lands on that same branch, since `getname_maybe_null`
+/// returns NULL for an empty name (`fs/namei.c:233`).
 ///
-/// What is left is re-resolving the name (which reopens the redirect window
-/// the pin exists to close) or `/proc/self/fd/N`. Neither is worth it for what
-/// is missed: the VFS already refuses `user.*` on anything that is not a
-/// regular file or a directory (`xattr_permission`, `fs/xattr.c:154`), and
-/// [`copy_xattrs`] skips `system.` and `security.` by charter, so the gap is
-/// `trusted.*` plus any ACL the source node carries.
+/// Neither `/proc/self/fd/N` nor re-resolving the name is used to get round
+/// that. The `/proc` form carries the mode while the access control silently
+/// does not, and re-resolving reopens the redirect window the fd-based rule
+/// exists to close - [`make_special_meta`] measures what reopening a live
+/// FIFO costs its writers. What is missed is small either way: the VFS
+/// already refuses `user.*` on anything that is not a regular file or a
+/// directory (`xattr_permission`, `fs/xattr.c:154`), and [`copy_xattrs`]
+/// skips `system.` and `security.` by charter, so the gap is `trusted.*`
+/// plus any ACL the source node carries.
+///
+/// The destination's side of this - a real descriptor, and the types that
+/// cannot be given one - is on [`make_special_meta`].
 fn make_special(
     parent: BorrowedFd<'_>,
     name: &OsStr,
@@ -943,22 +948,20 @@ fn make_special(
     // The `S_IFMT` bits are the node's *type* rather than a permission, so
     // they ride through both arms - `mknodat` selects on them.
     //
-    // Under `PERMISSIONS` the source's mode is what this creates with, not
-    // a hold: `make_special_meta` below stamps the real mode from this same
-    // `src_st`, and that stamp is `guard`ed, so a hold here would be one
-    // more narrowing that a swallowed failure could make permanent.
     // Always created at the hold, never at the source's mode - the same
     // pattern `make_file` and `make_dir` use, and here it is load-bearing
     // rather than tidy. `make_special_meta` opens this node `O_RDONLY` to
     // carry metadata through a real descriptor, and a source FIFO with no
     // owner-read bit (`0o200`, `0o000`) would then answer its own copy
-    // `EACCES` for an unprivileged caller - measured. `O_PATH`, which this
-    // used to pin with, needs no read permission, so creating at the
-    // source's mode was free before and is not now.
+    // `EACCES` for an unprivileged caller - measured. Note the hold is only
+    // a *request*: where the destination parent carries an inheritable ACL
+    // the filesystem computes the mode from that instead, which
+    // `make_special_meta`'s open reports by name when it lands below
+    // owner-read.
     //
     // Under `PERMISSIONS` the real mode lands in `make_special_meta`'s
     // `fchmod`, which the umask made necessary anyway; without it the node
-    // keeps the hold, exactly as before.
+    // keeps the hold.
     let create_mode = (mode & libc::S_IFMT) | creation_mode(config, false);
     // With `exist_ok` a taken name is **replaced**, the way `make_file`
     // replaces one: the node is built beside it and renamed over. Keeping
@@ -978,6 +981,13 @@ fn make_special(
     };
     let at: &OsStr = staged.as_deref().unwrap_or(name);
     let outcome = make_special_meta(parent, at, name, src_st, config);
+    // The two arms differ on purpose. A staged entry is scratch under a
+    // random name that nothing will ever look for, so a failure takes it
+    // with it. A node created at the *destination* name is not scratch: it
+    // is part of the partially-copied tree the caller keeps along with the
+    // `Err`, exactly as `make_file` leaves a partially written file and
+    // `make_symlink` leaves its link. Unlinking it here would make specials
+    // the only creator that erases its own evidence.
     match (staged, outcome) {
         (None, r) => r,
         (Some(tmp), Ok(())) => rename_over(parent, tmp.as_os_str(), name),
@@ -1051,16 +1061,26 @@ fn mknod_at(
 /// `a_special_file_takes_the_mode_and_not_the_acl` pins it so the limit is
 /// visible rather than discovered.
 ///
-/// **A socket or a device node is refused instead.** Neither can be given a
-/// real descriptor: a socket answers `ENXIO` to every `open(2)`, and opening
-/// a device runs the driver's `open` method, which a file copy must not do.
-/// The workarounds that make the call *appear* to work - `fchmodat2(2)`'s
+/// **A socket or a device node gives up its mode, and only its mode.**
+/// Neither can be given a real descriptor - a socket answers `ENXIO` to
+/// every `open(2)`, and opening a device runs the driver's `open` method,
+/// which a file copy must not do - so `fchmod`, which needs one, is refused.
+/// The workarounds that make *that* call appear to work - `fchmodat2(2)`'s
 /// empty-path form on an `O_PATH` pin, or `/proc/self/fd/N` - are not used
 /// here: an `O_PATH` handle cannot carry an ACL or an xattr at all
 /// (`fsetxattr` and `setxattrat` with `AT_EMPTY_PATH` both answer it
 /// `EBADF`, measured), so they carry the mode while the access control
-/// silently does not travel, and the copy reports `Ok`. Refusing says the
-/// same thing out loud, at the one node it applies to.
+/// silently does not travel, and the copy reports `Ok`.
+///
+/// Ownership and timestamps are a different question and are **carried**,
+/// through `fchownat` and `utimensat` with `AT_EMPTY_PATH` on the peek - the
+/// forms the kernel supports on an `O_PATH` handle, which
+/// [`make_symlink_meta`] already uses for the same reason. Refusing those
+/// too would give up three attributes to report one.
+///
+/// The mode's refusal is a metadata-copy failure like any other, so it goes
+/// through [`guard`]: under `raise_error: false` the copy continues and the
+/// node keeps the creation hold.
 ///
 /// With none of the three flags set there is nothing to carry, so nothing is
 /// opened and every type is copied.
@@ -1106,28 +1126,110 @@ fn make_special_meta(
     }
     let kind = src_st.mode() & ifmt;
     if kind != libc::S_IFIFO as u16 {
+        // Only the **mode** is impossible on this type. `fchownat` and
+        // `utimensat` with `AT_EMPTY_PATH` are supported on an `O_PATH`
+        // handle - measured here on a socket and a FIFO, and type-agnostic
+        // in the kernel: `chown_common` (`fs/open.c:754`) tests the inode's
+        // type only to kill setid on a non-directory, and `do_utimes_path`
+        // accepts the flag outright (`fs/utimes.c:86`). They are the same
+        // two calls `make_symlink_meta` makes on a symlink, which cannot be
+        // opened any other way either. The rule they sit under is about
+        // using an empty-path form to get round a call that *refused* the
+        // handle, which is only ever chmod and the xattr family - and the
+        // chmod is exactly what is refused below rather than routed around.
+        //
+        // The peek is the only handle here, so there is no second open and
+        // no window for a swap: `changed(&peek_st)` above already verified
+        // what these calls are about to touch.
+        //
+        // `copy_metadata`'s ordering: ownership first (a chown bumps ctime
+        // and clears setid), timestamps last, and the one failure that can
+        // be swallowed after both - so what can travel does, in either
+        // disposition, and the error reports only what did not.
+        if config.flags.contains(CopyFlags::OWNER) {
+            // Ownership failures always propagate (matching `copy_metadata`).
+            retry_on_eintr(|| unsafe {
+                libc::fchownat(
+                    peek.as_raw_fd(),
+                    c"".as_ptr(),
+                    src_st.uid(),
+                    src_st.gid(),
+                    libc::AT_EMPTY_PATH,
+                )
+            })?;
+        }
+        utimes_at(peek.as_fd(), src_st, config)?;
+        if !config.flags.contains(CopyFlags::PERMISSIONS) {
+            return Ok(());
+        }
         let what = match u32::from(kind) {
             libc::S_IFSOCK => "socket",
             libc::S_IFCHR => "character device",
             libc::S_IFBLK => "block device",
             _ => "special file",
         };
-        return Err(Error::Validation(format!(
-            "{what} {name:?}: metadata was requested, and this type cannot \
-             be given a real descriptor to carry it through - a socket \
-             refuses every open and a device node's open runs its driver. \
-             Clear CopyFlags::OWNER, PERMISSIONS and TIMESTAMPS to copy it \
-             as a bare node."
-        )));
+        // Through `guard`, because this is a metadata-copy failure and
+        // nothing else: it fires only *because* the mode was requested, and
+        // the node is already created and already verified above. That is
+        // the class `CopyTreeConfig::raise_error` documents as "ignored, and
+        // the copy continues" when false - the mode a migration uses to
+        // salvage a tree - and returning past it made one unix socket
+        // anywhere in the source fail the whole copy in both dispositions.
+        //
+        // Swallowed, the node keeps the creation hold: releasing that needs
+        // the `fchmod` this very refusal says the node cannot be given.
+        return guard(
+            config,
+            Err(Error::Validation(format!(
+                "{what} {name:?}: its mode cannot travel - this type cannot \
+                 be given the real descriptor `fchmod` needs, because a \
+                 socket refuses every open and a device node's open would \
+                 run its driver. Only the mode is refused; owner and \
+                 timestamps, where asked for, were carried. Clear \
+                 CopyFlags::PERMISSIONS to copy it without its mode, which \
+                 creates it at the permissive form `creation_mode` \
+                 documents rather than at the source's."
+            ))),
+        );
     }
     // A read-open of a FIFO with `O_NONBLOCK` does not wait for a writer.
+    //
+    // `EACCES` here is the copy's own doing and must not reach a caller as a
+    // bare errno. [`creation_mode`]'s hold is a *request*: what a new node is
+    // created with is the filesystem's to decide. Where the destination
+    // parent carries an inheritable ACL the umask never applies and the mode
+    // is narrowed through the inherited entries instead - `zpl_init_acl`
+    // takes that branch into `__posix_acl_create`
+    // (`module/os/linux/zfs/zpl_xattr.c`), as the VFS does in
+    // `posix_acl_create` (`fs/posix_acl.c`), and `zfs_acl_ids_create`
+    // recomputes it outright for NFSv4 - so a parent whose inherited entries
+    // withhold owner-read produces a node this very copy cannot open. The
+    // umask reaches the same state by the other route, which is why the
+    // refusal reports the mode the peek measured rather than naming a cause
+    // it cannot tell apart.
     let node = openat2(
         parent,
         at,
         OpenHow::new()
             .flags(OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW)
             .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
-    )?;
+    )
+    .map_err(|e| match e {
+        Errno::EACCES => Error::Validation(format!(
+            "destination special file {name:?} was created at mode {:#o}, \
+             without owner-read, so this copy cannot open it for the real \
+             descriptor its metadata needs. A new node's mode belongs to \
+             the filesystem: the destination parent's inherited (default) \
+             ACL, or the umask, narrowed the {:#o} this copy asked for. \
+             Grant read to the copying identity in the destination \
+             parent's inherited entries, or clear CopyFlags::OWNER, \
+             PERMISSIONS and TIMESTAMPS to copy this node without \
+             metadata.",
+            peek_st.mode() & 0o7777,
+            creation_mode(config, false)
+        )),
+        other => Error::from(other),
+    })?;
     // ...and confirm the real handle landed on the very inode just
     // inspected, so a swap between the two opens cannot slip a different
     // object into the calls below.
@@ -1235,11 +1337,25 @@ fn copy_metadata(
             // above is the only thing that delivers it. Release the hold
             // rather than leave it as the final mode.
             //
-            // **Before `guard`, deliberately.** After it this never runs
-            // under `raise_error: true`, and that is the caller taking the
-            // `Err` and keeping the partially-copied tree - the one that
-            // most needs a tree it can enter. The error still propagates
-            // below; only the mode lands first.
+            // **Before `guard`, deliberately**, so the mode lands in either
+            // disposition. The case this exists for is `raise_error: false`,
+            // where `guard` answers `Ok(())` and `copytree` returns success
+            // with plausible stats over a tree that is owner-only root to
+            // leaf.
+            //
+            // **This object, and nothing above it.** `finish_dir` stamps a
+            // directory on *ascent*, so a `raise_error: true` walk that
+            // stops here drops every ancestor frame unstamped and they keep
+            // the `0o700` hold; an ownership failure propagates from the
+            // `fchown` above without reaching this line at all. Deliberate,
+            // not missed: an aborted copy's destination is not a finished
+            // artifact. The caller owns every object in it and can enter it
+            // - an unprivileged `fchown` to another uid is `EPERM`, so it
+            // never happened, and a privileged one is root's - while
+            // widening an incomplete tree to the source's modes would
+            // publish a partial result to identities that should not be
+            // reading it yet. A retry under the default `exist_ok` re-stamps
+            // the whole tree.
             //
             // A failure to release is swallowed: `r` is already an error on
             // its way to `guard`, which is the verdict the caller asked for,

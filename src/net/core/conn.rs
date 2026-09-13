@@ -992,7 +992,12 @@ pub(crate) struct Connection<U> {
     //     `close_on_flush` here would swap "closed with the reply unsent" for
     //     "closed with the reply never produced".
     //
-    // The close lands from the send path once nothing is owed.
+    // The close lands from the send path once nothing is owed - and from
+    // `pump_gate` when the owed work ends without putting any bytes on the
+    // wire (a one-way `Injected::Done`, a `Redeliver` answering empty, an
+    // inline empty `Response::Reply`), because no send completes there.
+    // Both arms are needed: leaving only the send path holds the slot and
+    // the fd for the life of the server on the one-way case.
     pub peer_closed: Option<CloseReason>,
     // The reason this connection began closing, stashed by `close_conn` so the
     // client can report it in `Event::Closed` when the slot is reclaimed. The

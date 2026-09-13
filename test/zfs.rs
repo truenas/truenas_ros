@@ -761,3 +761,164 @@ fn immutable_locks_the_version_row_until_cleared() {
     std::fs::remove_file(&path)
         .expect("unlink after the clear, with READONLY still set");
 }
+
+/// The creation hold is released on an `acltype=nfsv4` destination whose own
+/// ACL is trivial - and the `getxattr`/`listxattr` disagreement that made it
+/// not be.
+///
+/// `release_creation_hold` declines when the destination already carries an
+/// access ACL, because there the ACL *is* the permissions and a `chmod` would
+/// rewrite it. Asked as "does the xattr exist", that is answered "yes" by
+/// **every** object on an nfsv4 dataset: `__zpl_xattr_nfs41acl_get`
+/// (`module/os/linux/zfs/zpl_xattr.c`) synthesises the blob and refuses only a
+/// non-NFSv4 dataset and an empty ACL, and a trivial ACL is still three ACEs.
+/// So the hold was never released anywhere on this row, which is the row a
+/// share migration lands on.
+///
+/// The answer is in the blob: its first big-endian word is `vsa_aclflags`,
+/// into which `zfs_getacl` ORs `ACL_IS_TRIVIAL` (`zfs_acl.c:2063`). That is
+/// what this pins, because it is what the fix reads - and it is a `getxattr`,
+/// which io_uring has, where `listxattr` (which would also answer) has no
+/// io_uring op at all.
+///
+/// The failing direction is a POSIX-ACL source onto an nfsv4 destination:
+/// `copy_permissions` copies `system.posix_acl_access`, the destination
+/// answers `EOPNOTSUPP` for every object, and `raise_error: false` - the mode
+/// `copytree` documents for salvaging a tree - swallows it. The hold release
+/// is then the only thing between the caller and an owner-only tree.
+///
+/// The first half pins the platform behaviour, so a ZFS that stops publishing
+/// the flag reddens here rather than silently making the second half vacuous.
+/// `the_nfs4_trivial_bit_is_read_from_the_blob` pins the decoder itself, and
+/// runs everywhere.
+#[cfg(feature = "shutil")]
+#[test]
+fn a_trivial_nfsv4_destination_releases_the_creation_hold() {
+    use std::os::unix::fs::PermissionsExt;
+    use truenas_ros::sync_fs::shutil::{CopyTreeConfig, copytree};
+    let (Some(psrc), Some(ndst)) = (posix_dir(), nfs4_dir()) else {
+        return skip("need both a POSIX-ACL and an NFSv4-ACL dataset");
+    };
+
+    // The premise: a fresh nfsv4 object answers the `get`, and the blob it
+    // answers with says it is trivial.
+    let (probe_path, probe) = scratch_file(&ndst, "hold_probe");
+    match fgetacl(probe.as_fd()) {
+        Ok(Acl::Nfs4(a)) if a.trivial() => {}
+        Ok(Acl::Nfs4(_)) => {
+            let _ = std::fs::remove_file(&probe_path);
+            return skip(
+                "the NFSv4 dataset hands new files a non-trivial ACL, so \
+                 declining is correct there and this pins nothing",
+            );
+        }
+        _ => {
+            let _ = std::fs::remove_file(&probe_path);
+            return skip(
+                "the NFSv4 dataset path is not an NFSv4-ACL filesystem",
+            );
+        }
+    }
+    let got = fgetxattr(probe.as_fd(), "system.nfs4_acl_xdr");
+    let _ = std::fs::remove_file(&probe_path);
+    let blob = got.expect("a trivial ACL must still answer the get");
+    assert!(
+        blob.len() >= 4,
+        "the blob must carry its flags word: {} bytes",
+        blob.len()
+    );
+    let flags = u32::from_be_bytes([blob[0], blob[1], blob[2], blob[3]]);
+    assert_ne!(
+        flags & 0x0001_0000,
+        0,
+        "ACL_IS_TRIVIAL must be set for a fresh object's ACL, or the fix \
+         reads a bit ZFS no longer publishes: acl_flags {flags:#x}"
+    );
+
+    let tag = std::process::id();
+    let src = psrc.join(format!("rostest_hold_src_{tag}"));
+    let dst = ndst.join(format!("rostest_hold_dst_{tag}"));
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dst);
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("f"), b"payload").unwrap();
+    std::fs::set_permissions(
+        src.join("f"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+
+    // A NON-trivial POSIX access ACL on the source file, so
+    // `copy_permissions` takes its xattr branch - the one an nfsv4
+    // destination refuses.
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(src.join("f"))
+        .unwrap();
+    let base = match fgetacl(f.as_fd()) {
+        Ok(Acl::Posix(a)) => a,
+        _ => {
+            let _ = std::fs::remove_dir_all(&src);
+            return skip(
+                "the POSIX dataset path is not a POSIX-ACL filesystem",
+            );
+        }
+    };
+    let mut aces = base.access.clone();
+    aces.push(PosixAce {
+        tag: PosixTag::User,
+        perms: PosixPerm::READ,
+        id: 4_200,
+        default: false,
+    });
+    aces.push(PosixAce {
+        tag: PosixTag::Mask,
+        perms: PosixPerm::READ | PosixPerm::WRITE,
+        id: -1,
+        default: false,
+    });
+    fsetacl(f.as_fd(), Some(&Acl::Posix(PosixAcl::from_aces(aces))))
+        .expect("fsetacl posix");
+    drop(f);
+
+    // Read the source's mode AFTER the ACL, not before: an access ACL
+    // carrying a MASK republishes the file's group bits as that mask
+    // (`posix_acl_update_mode`, `fs/posix_acl.c`), so the `0o644` this file
+    // was created at is `0o664` by now - owner `rw` from `user_obj`, group
+    // `rw` from the mask, other `r`. The hold release stamps `src_st.mode()`,
+    // so the source is the oracle and a literal here is a guess that ages.
+    let src_mode = std::fs::metadata(src.join("f"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    let hold = 0o600;
+    assert_ne!(
+        src_mode, hold,
+        "the source landed on the creation hold itself, so the assertion \
+         below could not tell a release from a failure to release"
+    );
+
+    let cfg = CopyTreeConfig {
+        raise_error: false,
+        ..Default::default()
+    };
+    let copied = copytree(&src, &dst, &cfg);
+    let mode = std::fs::metadata(dst.join("f"))
+        .map(|m| m.permissions().mode() & 0o777);
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(&dst);
+    let stats = copied.expect("the salvage mode must not fail the copy");
+    assert_eq!(stats.files, 1);
+    let got = mode.expect("the file must exist");
+    assert_ne!(
+        got, hold,
+        "the destination kept the {hold:#o} creation hold: the ACL copy \
+         failed EOPNOTSUPP and the release declined on a trivial ACL"
+    );
+    assert_eq!(
+        got, src_mode,
+        "the hold was released but not to the source's mode"
+    );
+}

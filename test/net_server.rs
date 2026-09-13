@@ -12622,3 +12622,84 @@ fn a_peer_half_close_does_not_reap_a_connection_that_owes_a_reply() {
         );
     }
 }
+
+/// A half-closed peer whose owed work completes with **nothing to send** must
+/// still have its connection closed.
+///
+/// `peer_closed` retires the recv side and leaves the close to the send path.
+/// A one-way request - `Deferred::reply(Vec::new())`, the `Injected::Done`
+/// arm - retires `outstanding` and queues no PDU, so no send ever completes
+/// and that path never runs. The pump then re-arms a read, the FIN
+/// re-completes it at once, and the `peer_closed` arm in `on_recv_complete`
+/// returned without closing: the pool slot and the fd were held for the life
+/// of the server, on a peer that had already said goodbye.
+///
+/// `cap` is the trigger, as in
+/// `a_peer_half_close_does_not_reap_a_connection_that_owes_a_reply`: at the
+/// default read-ahead of one nothing arms a second recv while the request is
+/// in flight, so the FIN is not seen until after and the connection closes
+/// the ordinary way.
+#[test]
+fn a_half_closed_peer_closes_when_its_one_way_request_finishes() {
+    use std::io::{Read, Write};
+    for cap in [1usize, 4] {
+        let addr =
+            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let cfg = ServerConfig {
+            max_in_flight_requests: cap,
+            ..Default::default()
+        };
+        let proto = Protocol {
+            accept: |_: Incoming<'_>| Some(()),
+            header: length_prefix_header::<()>(
+                PrefixWidth::U32,
+                Endian::Big,
+                false,
+            ),
+            body: |req: Request<'_, ()>| {
+                let Request { responder, .. } = req;
+                let (deferred, permit) = responder.defer();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(20));
+                    // One-way: the request completes with no PDU at all.
+                    deferred.reply(Vec::new());
+                });
+                Response::Defer(permit)
+            },
+        };
+        let mut server = match Server::with_config([addr], cfg, proto) {
+            Ok(s) => s,
+            Err(e) if should_skip(&e) => return,
+            Err(e) => panic!("bind: {e}"),
+        };
+        let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+            panic!("expected Tcp");
+        };
+        let stop = server.shutdown_handle();
+        let client = thread::spawn(move || -> std::io::Result<bool> {
+            let _stop = ShutdownOnDrop(stop.clone());
+            let mut s = connect_tcp(v4)?;
+            s.set_read_timeout(Some(Duration::from_secs(3)))?;
+            let body = b"hello";
+            let mut wire = (body.len() as u32).to_be_bytes().to_vec();
+            wire.extend_from_slice(body);
+            s.write_all(&wire)?;
+            s.flush()?;
+            s.shutdown(std::net::Shutdown::Write)?;
+            // The server owes a one-way reply; once it has answered it,
+            // nothing can arrive on this connection ever again, so the
+            // server must close. EOF is that close; a timeout is the leak.
+            let mut buf = [0u8; 1];
+            let eof = matches!(s.read(&mut buf), Ok(0));
+            stop.shutdown();
+            Ok(eof)
+        });
+        server.serve_forever().expect("serve_forever");
+        let eof = client.join().expect("join").expect("client");
+        assert!(
+            eof,
+            "cap={cap}: the connection was never closed after the one-way \
+             request completed"
+        );
+    }
+}
