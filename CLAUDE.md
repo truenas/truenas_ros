@@ -6,7 +6,7 @@ merits rather than rediscovered.
 
 ## The crate's charter
 
-`libc` + `bitflags`, MSRV 1.97.1. A new runtime dependency is a design
+`libc` + `bitflags`, MSRV 1.98.1. A new runtime dependency is a design
 decision, not a convenience - two optional exceptions, each argued for in
 `Cargo.toml` and each pulled only by the feature that needs it:
 `httparse` (the HTTP head tokenizer, used by the `http` request codec and

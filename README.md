@@ -183,7 +183,7 @@ cfg.write_path("/etc/app.conf".as_ref(), opts)?;
   than degrading: a server configured for `unix_peercred` refuses to start
   below 6.18.16 (the `AF_UNIX` cmd fix), `UringFs::new` probes `OPENAT2`, and
   `SecretMem::available` reports whether `memfd_secret` is compiled in.
-- Rust 1.97.1 or newer
+- Rust 1.98.1 or newer
 
 ## Testing
 
