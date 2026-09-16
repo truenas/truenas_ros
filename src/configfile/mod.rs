@@ -1333,10 +1333,11 @@ mod tests {
         assert!(!cfg.scrub, "and marked it scrubbed");
     }
 
-    /// The staged image really is `memfd_secret` memory: its VMA carries
-    /// secretmem's locked/undumpable/no-fork flags, which an ordinary
-    /// heap buffer's does not. Catches the staging being swapped for a
-    /// plain allocation, which parse results alone cannot see.
+    /// The staged image really is `memfd_secret` memory: its VMA is the
+    /// `/secretmem` pseudo-file and carries secretmem's undumpable and
+    /// no-fork flags, which an ordinary heap buffer's does not. Catches
+    /// the staging being swapped for a plain allocation, which parse
+    /// results alone cannot see.
     #[cfg(feature = "secrets")]
     #[test]
     fn read_secret_path_stages_off_heap() {
@@ -1353,14 +1354,18 @@ mod tests {
         let (mem, content) = stage_secret_image(&path).unwrap().unwrap();
         // Normalized in place, in the region.
         assert_eq!(&mem.as_slice()[..content], b"[user]\nkey = sw0rdf1sh\n");
-        let flags =
-            crate::secrets::vm_flags_of(mem.as_slice().as_ptr() as usize)
-                .expect("no smaps entry for the staged image");
-        for want in ["lo", "dd", "dc"] {
+        let vma = crate::secrets::vma_of(mem.as_slice().as_ptr() as usize)
+            .expect("no smaps entry for the staged image");
+        assert!(
+            vma.name.starts_with("/secretmem"),
+            "staging is not secretmem-backed: {:?}",
+            vma.name
+        );
+        for want in ["dd", "dc"] {
             assert!(
-                flags.split_whitespace().any(|f| f == want),
-                "staging is not secretmem-backed: missing {want:?} in \
-                 {flags:?}"
+                vma.flags.split_whitespace().any(|f| f == want),
+                "staging is missing {want:?} in {:?}",
+                vma.flags
             );
         }
     }

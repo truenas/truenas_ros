@@ -112,9 +112,9 @@ export TRUENAS_ROS_REQUIRE_IO_URING=1
 export TRUENAS_ROS_REQUIRE_KTLS=1
 # memfd_secret (CONFIG_SECRETMEM, default-on) backs the `secrets` module's
 # protected memory. `secretmem_init` mounts the backing fs only when
-# `secretmem_enable && can_set_direct_map()` (mm/secretmem.c:280), and on
+# `secretmem_enable && can_set_direct_map()` (mm/secretmem.c:377), and on
 # x86_64 the second is unconditionally true, so the appliance kernel always
-# has it: force the secrets tests to RUN, including the VM_LOCKED/VM_DONTDUMP
+# has it: force the secrets tests to RUN, including the VM_DONTDUMP
 # assertion. A skip means secretmem regressed or was disabled off and must
 # turn CI red.
 export TRUENAS_ROS_REQUIRE_SECRETMEM=1

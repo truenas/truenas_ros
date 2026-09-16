@@ -1,9 +1,16 @@
 //! `memfd_secret(2)`-backed protected memory for long-lived in-process
 //! secrets: the pages are removed from the kernel direct map, kept off swap,
 //! and excluded from core dumps (on TrueNAS, from a support bundle).
-//! `secretmem_mmap_prepare` stamps the VMA `VM_LOCKED | VM_DONTDUMP` itself
-//! (`mm/secretmem.c:131`) - no separate `mlock`/`madvise` - and charges it
-//! against `RLIMIT_MEMLOCK` (`:128`).
+//! `secretmem_mmap_prepare` stamps the VMA `VM_DONTDUMP` itself
+//! (`mm/secretmem.c:207`) - no separate `madvise` - and the pages stay off
+//! swap because the inode's mapping is unevictable
+//! (`mapping_set_unevictable`, `:303`), not because the VMA is locked:
+//! secretmem sets no `VM_LOCKED`. `RLIMIT_MEMLOCK` is charged page by page
+//! at first touch, to the `locked_vm` of the user who created the file
+//! (`:65-72`, `:275`), with no `CAP_IPC_LOCK` bypass; a fault over the
+//! limit is `SIGBUS` (`:136-138`). That is stable 853043cb1294 (mainline
+//! 97d34aa65c29), shipped from 6.18.52. Earlier 6.18 kernels stamp
+//! `VM_LOCKED` too and check the limit at `mmap`.
 //!
 //! This is memory-access hardening, not at-rest encryption: a usable secret is
 //! plaintext in the region while the process runs; what it removes are the
@@ -78,7 +85,15 @@ unsafe impl Sync for SecretMem {}
 
 impl SecretMem {
     /// A `len`-byte region, zero-filled. [`Errno::ENOSYS`] if secretmem is
-    /// unavailable; `EAGAIN`/`ENOMEM` if it would exceed `RLIMIT_MEMLOCK`.
+    /// unavailable.
+    ///
+    /// `RLIMIT_MEMLOCK` is not checked here. Each page is charged when it
+    /// is first touched (`secretmem_account_folio` in `secretmem_fault`,
+    /// `mm/secretmem.c:136`), and a fault over the limit is `SIGBUS`, not
+    /// an error this call can return. The counter is per user across every
+    /// secretmem file that user created, root included, and the limit is
+    /// the faulting task's. A 6.18 kernel before .52 checks the limit at
+    /// `mmap` instead, so there this call returns `EAGAIN`.
     pub fn with_capacity(len: usize) -> Result<SecretMem> {
         let page = page_size();
         let mapped = len
@@ -87,7 +102,7 @@ impl SecretMem {
             .ok_or(Errno::EINVAL)?;
         let fd = memfd_secret()?;
         // Size the file to the whole mapping: `secretmem_fault` SIGBUSes a
-        // fault at or past `i_size` (`mm/secretmem.c:61`), and a zero-length
+        // fault at or past `i_size` (`mm/secretmem.c:122`), and a zero-length
         // request is one page here by the `max(1)` above.
         // SAFETY: `fd` is our live memfd; `mapped` fits an `off_t`.
         let t =
@@ -112,7 +127,7 @@ impl SecretMem {
         }
         // Keep the region out of forked children. secretmem mandates
         // `MAP_SHARED` (`secretmem_mmap_prepare` rejects a private mapping,
-        // `mm/secretmem.c:125`), so `VM_DONTCOPY` is the only thing standing
+        // `mm/secretmem.c:204`), so `VM_DONTCOPY` is the only thing standing
         // between a child and the same folios.
         // SAFETY: our own mapping, exactly `mapped` bytes, still live.
         if unsafe { libc::madvise(p, mapped, libc::MADV_DONTFORK) } < 0 {
@@ -135,12 +150,11 @@ impl SecretMem {
     /// fail closed; `false` means no `CONFIG_SECRETMEM`, it was disabled, the
     /// arch gate is unmet, or seccomp blocks the syscall.
     ///
-    /// Support, not headroom. `RLIMIT_MEMLOCK` is charged when the region is
-    /// mapped, not when the syscall is made (`mlock_future_ok` from
-    /// `secretmem_mmap_prepare`, `mm/secretmem.c:128`, and bypassed entirely
-    /// under `CAP_IPC_LOCK`, `mm/mmap.c:233`), so a `true` here does not
-    /// promise the next [`with_capacity`](Self::with_capacity) fits the
-    /// limit - that surfaces as `EAGAIN` from the allocation itself.
+    /// Support, not headroom. `RLIMIT_MEMLOCK` is charged page by page at
+    /// first touch, not when the syscall is made (`secretmem_account_folio`,
+    /// `mm/secretmem.c:136`), so a `true` here does not promise the next
+    /// [`with_capacity`](Self::with_capacity) fits the limit - that is a
+    /// `SIGBUS` on the first write, as documented there.
     pub fn available() -> bool {
         match memfd_secret() {
             Ok(_) => true,
@@ -198,7 +212,7 @@ impl std::fmt::Debug for SecretMem {
 impl Drop for SecretMem {
     fn drop(&mut self) {
         // Unmap only: `secretmem_free_folio` zeroes the folio on last free
-        // (`folio_zero_segment`, `mm/secretmem.c:153-157`), so the bytes do
+        // (`folio_zero_segment`, `mm/secretmem.c:229-233`), so the bytes do
         // not outlive the mapping.
         // SAFETY: our live mapping, released exactly once.
         unsafe { libc::munmap(self.ptr.cast(), self.mapped) };
@@ -246,23 +260,45 @@ impl std::fmt::Debug for Secret {
 
 pub use crate::scrub::scrub;
 
-/// `VmFlags:` for whichever `/proc/self/smaps` region contains `addr` --
+/// The `/proc/self/smaps` entry for the mapping that contains `addr` --
 /// how a test proves what backs a mapping. Crate-visible so the
-/// `configfile` staging test can hold a region and check the same flags.
+/// `configfile` staging test can hold a region and check the same entry.
 #[cfg(test)]
-pub(crate) fn vm_flags_of(addr: usize) -> Option<String> {
+pub(crate) struct Vma {
+    /// The pathname field. A secretmem region shows `/secretmem (deleted)`,
+    /// the pseudo-file `secretmem_file_create` allocates
+    /// (`alloc_file_pseudo(.., "secretmem", ..)`, `mm/secretmem.c:295`); an
+    /// anonymous mapping shows nothing and the heap shows `[heap]`.
+    pub(crate) name: String,
+    /// The `VmFlags:` line, space-separated mnemonics.
+    pub(crate) flags: String,
+}
+
+#[cfg(test)]
+pub(crate) fn vma_of(addr: usize) -> Option<Vma> {
     let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
-    let mut in_region = false;
+    let mut name: Option<String> = None;
     for line in smaps.lines() {
         if let Some(range) = line.split(' ').next()
             && let Some((lo, hi)) = range.split_once('-')
             && let (Ok(lo), Ok(hi)) =
                 (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
         {
-            in_region = addr >= lo && addr < hi;
+            // Header line: range, perms, offset, dev, inode, then the name.
+            name = (addr >= lo && addr < hi).then(|| {
+                line.split_whitespace()
+                    .skip(5)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
         }
-        if in_region && let Some(f) = line.strip_prefix("VmFlags:") {
-            return Some(f.trim().to_string());
+        if let Some(name) = &name
+            && let Some(f) = line.strip_prefix("VmFlags:")
+        {
+            return Some(Vma {
+                name: name.clone(),
+                flags: f.trim().to_string(),
+            });
         }
     }
     None
@@ -343,26 +379,52 @@ mod tests {
         assert_eq!(format!("{:?}", Some(&s)), "Some(Secret(..))");
     }
 
-    /// The three flags the region is for: `lo` (`VM_LOCKED`, off swap) and
-    /// `dd` (`VM_DONTDUMP`, out of core dumps) from `secretmem_mmap_prepare`,
-    /// and `dc` (`VM_DONTCOPY`) from the fork barrier.
+    /// The region is the `/secretmem` pseudo-file and carries the two VMA
+    /// flags it is for: `dd` (`VM_DONTDUMP`, out of core dumps) from
+    /// `secretmem_mmap_prepare` and `dc` (`VM_DONTCOPY`) from the fork
+    /// barrier. Off-swap is not a VMA flag - it is the inode's unevictable
+    /// mapping (`mapping_set_unevictable`, `mm/secretmem.c:303`) - so `lo`
+    /// is not asked for, and a 6.18 kernel before .52 that still sets it
+    /// passes too. An ordinary allocation is the negative control.
     ///
     /// Nothing else here would notice a kernel that kept `memfd_secret`
     /// working and stopped setting them.
     #[test]
-    fn the_mapping_is_locked_and_undumpable() {
+    fn the_region_is_secretmem_undumpable_and_not_forked() {
         if !secretmem_or_skip() {
             return;
         }
         let mem = SecretMem::with_capacity(64).expect("secret region");
-        let flags = vm_flags_of(mem.as_slice().as_ptr() as usize)
+        let vma = vma_of(mem.as_slice().as_ptr() as usize)
             .expect("no smaps entry for the region");
-        for want in ["lo", "dd", "dc"] {
+        assert!(
+            vma.name.starts_with("/secretmem"),
+            "region is not secretmem-backed: {:?}",
+            vma.name
+        );
+        for want in ["dd", "dc"] {
             assert!(
-                flags.split_whitespace().any(|f| f == want),
-                "secretmem VMA is missing {want:?}: {flags:?}"
+                vma.flags.split_whitespace().any(|f| f == want),
+                "secretmem VMA is missing {want:?}: {:?}",
+                vma.flags
             );
         }
+        let heap = Box::new([0u8; 64]);
+        let plain = vma_of(heap.as_ptr() as usize)
+            .expect("no smaps entry for the heap buffer");
+        assert!(
+            !plain.name.starts_with("/secretmem"),
+            "heap buffer reads as secretmem: {:?}",
+            plain.name
+        );
+        assert!(
+            !plain
+                .flags
+                .split_whitespace()
+                .any(|f| f == "dd" || f == "dc"),
+            "heap buffer carries secretmem's flags: {:?}",
+            plain.flags
+        );
     }
 
     /// A forked child reaches neither the mapping nor the parent's bytes,
@@ -383,7 +445,7 @@ mod tests {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
-            let mapped = u8::from(vm_flags_of(addr).is_some());
+            let mapped = u8::from(vma_of(addr).is_some());
             // SAFETY: the child's own copy, dropped exactly once - the
             // teardown a forked worker runs.
             unsafe { std::ptr::drop_in_place(&mut mem) };
