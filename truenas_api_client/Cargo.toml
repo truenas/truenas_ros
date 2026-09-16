@@ -10,7 +10,7 @@
 name = "truenas_api_client"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.97.1"
+rust-version = "1.98.1"
 license = "MIT"
 description = "Non-blocking TrueNAS middlewared API client over io_uring"
 publish = false

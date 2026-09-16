@@ -4,7 +4,7 @@
 # cursor codecs, the audit record encoder, the path checks, and the credential
 # broker's request header. A separate, unpublished dev-only crate (like the
 # kTLS test deps): it does NOT touch the library's libc+bitflags charter or its
-# 1.97 MSRV. Run with a nightly toolchain:
+# 1.98 MSRV. Run with a nightly toolchain:
 #   cargo +nightly fuzz run framer_length_prefix
 #   cargo +nightly fuzz run tree_cursor -- -dict=dicts/tree_cursor.dict
 # No corpus is checked in; regressions live in the library's own tests. See
