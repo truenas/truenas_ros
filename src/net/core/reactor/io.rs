@@ -84,16 +84,21 @@ const RECV_POOL_BUF: usize = 256 * 1024;
 /// cap is not the thing that pushes its own connection over the wall.
 ///
 /// One would cover arrivals alone - no more messages can be arriving at
-/// once than there are connections - but a leased write
-/// (`FsConn::pwritev2_from`) holds its buffer past the message's consume,
-/// until the write's CQE. A pipelined ingest handler (submit the window,
-/// return `Continue`, brake with `defer_stream` at its depth) therefore
-/// holds up to its write depth plus the one arriving, and the registration
-/// is the wall growth stops at: past it a connection degrades to owned
-/// buffers *permanently*, which reintroduces the per-window allocation and
-/// copy under exactly the load the ring exists for. Four covers a write
-/// depth sized to the bandwidth-delay product of ARC-latency writes at
-/// 128 KiB windows (~2-5), and a descriptor slot is 16 bytes, so the
+/// once than there are connections - but a claim outlives its message:
+/// a leased write (`FsConn::pwritev2_from`) holds its buffer until the
+/// write's CQE, a leased job (`offload_from`, `offload_leased`) until its
+/// completion is taken, a `LeasedWindow` until the handler spends or
+/// drops it. A pipelined ingest handler (submit the window, return
+/// `Continue`, brake with `defer_stream` at its depth) therefore holds as
+/// many buffers as it has claims outstanding, plus the one arriving, and
+/// the registration is the wall growth stops at: past it a connection
+/// degrades to owned buffers *permanently*, which reintroduces the
+/// per-window allocation and copy under exactly the load the ring exists
+/// for. The count is what the wall meters - how a handler divides it
+/// between writes in flight, jobs reading and windows held is its own
+/// choice, and the buffers' size does not enter. Four is a pipeline a
+/// few windows deep, which covers the bandwidth-delay product of
+/// ARC-latency writes, and a descriptor slot is 16 bytes, so the
 /// headroom costs nothing - backing buffers remain demand-allocated.
 ///
 /// This is SPDK's backpressure shape, checked rather than recalled: the

@@ -293,7 +293,7 @@ jobs:
           -- -D warnings
     - name: loom (concurrency models)
       env:
-        MODELS: "25"
+        MODELS: "27"
       run: |
         .github/workflows/scripts/counted-cargo-test.sh "$MODELS" "loom" -- \
           env RUSTFLAGS="--cfg loom" \

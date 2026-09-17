@@ -72,6 +72,22 @@ where
                 fs,
                 &mut self.core.engine,
             );
+            // A job that digested a leased recv buffer (`offload_from`)
+            // released its share when its completion was taken above,
+            // and a share dropped anywhere else - a `LeasedWindow` a
+            // handler let go, on any thread - queued its buffer id and
+            // poked this wake; both come back to the pool here, the one
+            // place that can reach it - as a leased write's does from
+            // the fs dispatch in `on_cqe`.
+            let released = fs.take_pool_releases();
+            if !released.is_empty() {
+                if let Some(pool) = self.core.recv_bufs.as_mut() {
+                    for bid in released {
+                        pool.release(bid);
+                    }
+                }
+                self.core.sync_recv_buf_stats();
+            }
         }
         Ok(())
     }

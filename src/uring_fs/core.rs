@@ -403,12 +403,167 @@ struct FsOpEntry {
 }
 
 /// One delivery's claim on a recv-pool buffer, shared by every leased
-/// write reading from it. Plain `std::sync` deliberately: nothing
-/// synchronizes *through* it - the refcount is the whole protocol - and
-/// loom neither models this path nor supplies `Weak`.
+/// write, every leased job and every [`LeasedWindow`] reading from it.
+///
+/// The buffer goes back to the pool when the last share goes. A reaped
+/// write and a taken job completion take the id out on the reactor
+/// ([`into_bid`](Self::into_bid), which disarms the drop); a share
+/// dropped anywhere else - a window a handler held past its delivery
+/// and let go, on whatever thread - returns it through the fs core's
+/// returns queue and pokes the loop, the road a finished job's result
+/// takes ([`publish`]). That road is loom-modelled
+/// (`loom_dropped_share_returns_after_its_read`); the refcount is not,
+/// which is why the share is a `std::sync::Arc`: the facade keeps a
+/// `Weak` to it and the reactor paths race their `Arc::into_inner`
+/// against a drop elsewhere, and loom supplies neither.
 #[cfg(feature = "net-server")]
-#[derive(Debug)]
-pub(crate) struct LeaseHold(pub(crate) u16);
+pub(crate) struct LeaseHold {
+    bid: u16,
+    /// `None` once the id was taken out explicitly, and on the test
+    /// holds minted with no core behind them.
+    returns: Option<LeaseReturns>,
+}
+
+/// Where a share dropped off the explicit release paths sends its buffer
+/// id: the core's queue and the loop's wake.
+///
+/// The wake is a strong `Arc` - loom's `Arc` has no `Weak` - so a share
+/// a handler keeps alive keeps the loop's eventfd open with it: a
+/// descriptor and a few words, for as long as the window lives. Every
+/// drop pokes; a handler returning a backlog on the loop thread pays a
+/// syscall per window, which at the depths a lease budget allows is
+/// noise beside the buffer it frees.
+#[cfg(feature = "net-server")]
+#[derive(Clone)]
+pub(crate) struct LeaseReturns {
+    queue: Arc<Mutex<VecDeque<u16>>>,
+    wake: Arc<crate::uring::wake::LoopShared>,
+}
+
+#[cfg(feature = "net-server")]
+impl std::fmt::Debug for LeaseHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeaseHold").field("bid", &self.bid).finish()
+    }
+}
+
+#[cfg(feature = "net-server")]
+impl LeaseHold {
+    fn new(bid: u16, returns: LeaseReturns) -> LeaseHold {
+        LeaseHold {
+            bid,
+            returns: Some(returns),
+        }
+    }
+
+    /// A hold with no core to return to: for the tests that drive the
+    /// release paths by hand.
+    #[cfg(test)]
+    fn detached(bid: u16) -> LeaseHold {
+        LeaseHold { bid, returns: None }
+    }
+
+    /// The buffer id, taken out by the last share's holder on the reactor:
+    /// the caller returns it to the pool itself, so the drop does not.
+    fn into_bid(mut self) -> u16 {
+        self.returns = None;
+        self.bid
+    }
+}
+
+#[cfg(feature = "net-server")]
+impl Drop for LeaseHold {
+    fn drop(&mut self) {
+        if let Some(returns) = self.returns.take() {
+            publish(&returns.queue, &returns.wake.wake, self.bid);
+        }
+    }
+}
+
+/// A pool job's view of a leased recv buffer ([`FsConn::offload_from`]):
+/// the raw extent, because a `&[u8]` cannot cross to a worker thread with
+/// the facade's lifetime on it.
+///
+/// Valid to read for as long as a [`LeaseHold`] share for the buffer
+/// exists, and one does for the job's whole run: the share is registered
+/// with the job's continuation before the job is submitted and dropped
+/// only when the finished job's completion is taken on the reactor. The
+/// pool re-issues a buffer only after its last share is gone, and nothing
+/// writes a delivered buffer before then, so the bytes are both alive and
+/// immutable while any thread holds this.
+#[cfg(feature = "net-server")]
+#[derive(Clone, Copy)]
+struct LeasedBytes {
+    ptr: *const u8,
+    len: usize,
+}
+
+// SAFETY: the pointer is a plain address into a buffer that stays mapped,
+// unmoved and unwritten for the lifetime of the `LeaseHold` share taken
+// beside this value (see the type's documentation); the worker only reads
+// through it, so moving the address to another thread races with nothing.
+#[cfg(feature = "net-server")]
+unsafe impl Send for LeasedBytes {}
+
+#[cfg(feature = "net-server")]
+impl LeasedBytes {
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr` and `len` came from a live `&[u8]` into a leased
+        // buffer, and the share held beside this value keeps that buffer
+        // alive and unwritten until after the job using this view returns.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+/// A window of the delivering connection's receive buffer, held past the
+/// delivery ([`FsConn::lease_window`]): the bytes and a share of the
+/// buffer's claim, so the pool re-issues the buffer only once this is
+/// gone. What a handler that digests its windows in order keeps while
+/// an earlier window's job still runs, and spends on
+/// [`FsConn::offload_leased`] from that job's completion - no copy at
+/// either end.
+///
+/// Dropping one unspent returns its share like any other: the buffer
+/// goes back to the pool when the last share of its claim is gone,
+/// wherever that happens.
+///
+/// **The budget.** A connection's recv ring registers
+/// `RECV_LEASE_DEPTH` (4) buffer slots past the one arriving, and every
+/// buffer a handler keeps a claim on counts against them, whatever its
+/// size: the buffers its leased writes are still reading, the ones its
+/// jobs are reading, and the ones it holds like this. Past the
+/// registration a connection degrades to owned buffers *permanently*: a
+/// copy per window from then on, visible only as an allocation count. A
+/// handler therefore keeps its claims outstanding, all kinds together,
+/// within `RECV_LEASE_DEPTH`.
+#[cfg(feature = "net-server")]
+pub struct LeasedWindow {
+    view: LeasedBytes,
+    hold: std::sync::Arc<LeaseHold>,
+}
+
+#[cfg(feature = "net-server")]
+impl LeasedWindow {
+    /// The window's length in bytes.
+    pub fn len(&self) -> usize {
+        self.view.len
+    }
+
+    /// Whether the window holds no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.view.len == 0
+    }
+}
+
+#[cfg(feature = "net-server")]
+impl std::fmt::Debug for LeasedWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeasedWindow")
+            .field("len", &self.view.len)
+            .field("hold", &self.hold)
+            .finish()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum FsOpState {
@@ -550,9 +705,24 @@ pub(crate) fn finish_offload(
     token: u64,
     outcome: Box<dyn Any + Send>,
 ) {
+    publish(sink, wake, (token, outcome));
+}
+
+/// Hand `item` to the loop: push it under the queue's mutex, then poke.
+/// The one spelling of that order, for a finished job's result
+/// ([`finish_offload`]) and a dropped share's buffer id
+/// ([`LeaseHold`]) alike: the push is what makes the loop's drain
+/// observe everything the pusher did before it, and a poke that came
+/// first could be drained ahead of the push and leave the item to wait
+/// for the next.
+pub(crate) fn publish<T>(
+    sink: &Mutex<VecDeque<T>>,
+    wake: &crate::uring::wake::WakeHandle,
+    item: T,
+) {
     sink.lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push_back((token, outcome));
+        .push_back(item);
     wake.poke();
 }
 /// A type-erased on-loop continuation: it downcasts the boxed job result back to
@@ -568,6 +738,14 @@ type PoolDelivery = (Owner, OffloadDeliver, Box<dyn Any + Send>);
 struct OffloadEntry {
     owner: Owner,
     deliver: OffloadDeliver,
+    /// The job's share of the delivering connection's recv-buffer claim
+    /// ([`FsConn::offload_from`]), held *here* and not by the job: this
+    /// share never leaves the reactor, which drops it from
+    /// [`FsCore::take_pool_completions`] once the job has returned - the
+    /// bytes the job read stay put for its whole run. `None` for every
+    /// other offload.
+    #[cfg(feature = "net-server")]
+    lease: Option<std::sync::Arc<LeaseHold>>,
 }
 
 /// One owner's wall-clock tenancy. `armed` is what the cap meters -
@@ -677,6 +855,17 @@ pub(crate) struct FsCore {
     /// Reactor-side continuations for in-flight offloads, keyed by token.
     offload_reg: HashMap<u64, OffloadEntry>,
     next_offload: u64,
+    /// Recv-pool buffer ids whose last share a finished
+    /// [`FsConn::offload_from`] job dropped, owed to the net server's
+    /// pool ([`FsCore::take_pool_releases`]); the fs core cannot reach
+    /// the pool itself.
+    #[cfg(feature = "net-server")]
+    pool_releases: Vec<u16>,
+    /// Buffer ids returned by shares dropped off the explicit release
+    /// paths ([`LeaseHold`]), from any thread; drained with
+    /// `pool_releases`.
+    #[cfg(feature = "net-server")]
+    lease_returns: Arc<Mutex<VecDeque<u16>>>,
     /// Attribute names whose `FSETXATTR` runs under ambient credentials rather
     /// than the request identity. Empty by default - see [`PrivilegedXattrs`].
     priv_xattrs: PrivilegedXattrs,
@@ -766,6 +955,10 @@ impl FsCore {
             completions: Arc::new(Mutex::new(VecDeque::new())),
             offload_reg: HashMap::new(),
             next_offload: 0,
+            #[cfg(feature = "net-server")]
+            pool_releases: Vec::new(),
+            #[cfg(feature = "net-server")]
+            lease_returns: Arc::new(Mutex::new(VecDeque::new())),
             priv_xattrs: PrivilegedXattrs::default(),
             tasks: super::task::Tasks::new(),
             core_id: {
@@ -882,8 +1075,32 @@ impl FsCore {
     ) -> u64 {
         let token = self.next_offload;
         self.next_offload = self.next_offload.wrapping_add(1);
-        self.offload_reg
-            .insert(token, OffloadEntry { owner, deliver });
+        self.offload_reg.insert(
+            token,
+            OffloadEntry {
+                owner,
+                deliver,
+                #[cfg(feature = "net-server")]
+                lease: None,
+            },
+        );
+        token
+    }
+
+    /// [`register_offload`](Self::register_offload) for a job that reads a
+    /// leased recv buffer: `hold` is the job's share of the claim, kept
+    /// with the continuation and dropped when the completion is taken.
+    #[cfg(feature = "net-server")]
+    fn register_leased_offload(
+        &mut self,
+        owner: Owner,
+        deliver: OffloadDeliver,
+        hold: std::sync::Arc<LeaseHold>,
+    ) -> u64 {
+        let token = self.register_offload(owner, deliver);
+        if let Some(e) = self.offload_reg.get_mut(&token) {
+            e.lease = Some(hold);
+        }
         token
     }
 
@@ -962,10 +1179,52 @@ impl FsCore {
         let mut out = Vec::with_capacity(drained.len());
         for (token, any) in drained {
             if let Some(e) = self.offload_reg.remove(&token) {
+                // The job is over - its result is in hand - so its share
+                // of the recv claim ends here, on the reactor. The buffer
+                // surfaces only from the last share, as a leased write's
+                // completion surfaces it (`on_cqe`); sibling writes of the
+                // same delivery may still be reading it.
+                #[cfg(feature = "net-server")]
+                if let Some(bid) = e
+                    .lease
+                    .and_then(std::sync::Arc::into_inner)
+                    .map(LeaseHold::into_bid)
+                {
+                    self.pool_releases.push(bid);
+                }
                 out.push((e.owner, e.deliver, any));
             }
         }
         out
+    }
+
+    /// The recv-pool buffers finished offload jobs, and shares dropped
+    /// elsewhere, have released since the last call, for the net server to
+    /// hand back to its pool. Empty on a host with no pool.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn take_pool_releases(&mut self) -> Vec<u16> {
+        let mut out = std::mem::take(&mut self.pool_releases);
+        out.extend(
+            self.lease_returns
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain(..),
+        );
+        out
+    }
+
+    /// The return road for a share minted against this core: the
+    /// queue [`take_pool_releases`](Self::take_pool_releases) drains, and
+    /// the loop's wake.
+    #[cfg(feature = "net-server")]
+    fn lease_returns(
+        &self,
+        wake: &Arc<crate::uring::wake::LoopShared>,
+    ) -> LeaseReturns {
+        LeaseReturns {
+            queue: Arc::clone(&self.lease_returns),
+            wake: Arc::clone(wake),
+        }
     }
 
     // ---- submission (from drained injects) -----------------------------
@@ -2376,7 +2635,7 @@ impl FsCore {
             .recv_lease
             .take()
             .and_then(std::sync::Arc::into_inner)
-            .map(|h| h.0);
+            .map(LeaseHold::into_bid);
         #[cfg(feature = "net-server")]
         let lease_want = completed.lease_want;
         let Completed {
@@ -3321,6 +3580,41 @@ impl<'a> FsConn<'a> {
         self
     }
 
+    /// The delivering connection's claim on the buffer `src` lies in, as a
+    /// share to hand an op or a job: the hold is minted on the first taker
+    /// and cloned for the rest, so the buffer goes back to the pool when
+    /// the last of them completes. The facade keeps only a `Weak` - a
+    /// strong clone here would withhold the release until the facade
+    /// dropped, for no one's benefit. An upgrade can only fail if every
+    /// holder already completed and released the buffer, which cannot
+    /// happen while this delivery is still running its handler - but if
+    /// it ever did, leasing again would read a buffer the pool may have
+    /// re-issued, so `None` sends the caller to its copy path instead.
+    #[cfg(feature = "net-server")]
+    fn claim_share(
+        &self,
+        src: &[u8],
+    ) -> Option<(&'a Cell<bool>, std::sync::Arc<LeaseHold>)> {
+        let l = self.lease.as_ref()?;
+        let base = l.ptr as usize;
+        let at = src.as_ptr() as usize;
+        let fits = at >= base
+            && at
+                .checked_add(src.len())
+                .is_some_and(|end| end <= base + l.cap);
+        if !fits {
+            return None;
+        }
+        let hold = match &self.lease_hold {
+            Some(w) => w.upgrade()?,
+            None => std::sync::Arc::new(LeaseHold::new(
+                l.bid,
+                self.fs.lease_returns(&self.eng.shared),
+            )),
+        };
+        Some((l.taken, hold))
+    }
+
     /// Open `path` relative to `anchor` as `who`; fire `on_done` with the new
     /// [`File`] ([`FsDone::file`]). `path` must be anchor-relative (a leading
     /// `/` is refused); resolution defaults to the full [`CONFINED_RESOLVE`]
@@ -3738,7 +4032,10 @@ impl<'a> FsConn<'a> {
             // copy path instead.
             let hold = leased.and_then(|(bid, _)| match &self.lease_hold {
                 Some(w) => w.upgrade(),
-                None => Some(std::sync::Arc::new(LeaseHold(bid))),
+                None => Some(std::sync::Arc::new(LeaseHold::new(
+                    bid,
+                    self.fs.lease_returns(&self.eng.shared),
+                ))),
             });
             if let (Some((_, taken)), Some(hold)) = (leased, hold) {
                 let w = self.waiter(on_done);
@@ -4822,6 +5119,115 @@ impl FsConn<'_> {
             // Push and poke unconditionally: an unwind past either one would
             // leave `offload_reg` holding a continuation that never fires.
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            finish_offload(&sink, &wake.wake, token, Box::new(r));
+        }));
+    }
+
+    /// Run `job` over `src` on the pool - [`pwritev2_from`]'s twin for
+    /// CPU work: where `src` lies inside the delivering connection's
+    /// recv-buffer claim, the job reads that buffer in place and no copy
+    /// is made; anywhere else (an unpooled connection, a placed body, a
+    /// range past the claim, a completion facade) the bytes are copied
+    /// and the job runs over the copy. Either way `on_done` gets the
+    /// job's [`crate::Result`] on the loop, a panicked job mapped to
+    /// `EIO` exactly as [`offload_result`](Self::offload_result) maps it.
+    ///
+    /// The job holds a share of the same claim a leased write holds, so
+    /// a window can be written with [`pwritev2_from`] *and* digested here
+    /// from one buffer: the buffer returns to the pool when the last of
+    /// its writes and jobs is over, and neither waits for the other. The
+    /// share is kept by the reactor, not by the job, and is dropped when
+    /// the job's completion is taken - after the job has returned - so
+    /// the bytes it reads stay put for its whole run and the release
+    /// happens where the pool lives. A streaming handler therefore need
+    /// not park for the digest any more than for the write: submit both
+    /// and return `Continue`, and brake on the count in flight as
+    /// [`pwritev2_from`]'s pipelined-ingest note says.
+    ///
+    /// The job contract is [`offload`](Self::offload)'s - ambient
+    /// credentials, never cancelled, ordinary thread stack. What it adds:
+    /// the job must treat `src` as immutable, which it is - nothing writes
+    /// a delivered buffer before its release.
+    ///
+    /// [`pwritev2_from`]: Self::pwritev2_from
+    pub fn offload_from<T, J, F>(&mut self, src: &[u8], job: J, on_done: F)
+    where
+        J: FnOnce(&[u8]) -> crate::Result<T> + Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(crate::Result<T>, &mut FsConn<'_>) + 'static,
+    {
+        #[cfg(feature = "net-server")]
+        if let Some(window) = self.lease_window(src) {
+            self.offload_leased(window, job, on_done);
+            return;
+        }
+        let owned = src.to_vec();
+        self.offload_result(move || job(&owned), on_done);
+    }
+
+    /// Hold `src`'s receive buffer past this delivery: a share of the
+    /// buffer's claim, spent later on [`offload_leased`](Self::offload_leased)
+    /// from any facade - a completion's included - or returned by the
+    /// drop. `None` where `src` is not in a pooled receive buffer this
+    /// delivery claimed (a completion facade, an unpooled connection, a
+    /// body the codec moved to owned storage): the caller copies.
+    ///
+    /// The bytes are valid and immutable for as long as the window lives:
+    /// the share keeps the pool from re-issuing the buffer, and nothing
+    /// writes a delivered buffer before its release.
+    #[cfg(feature = "net-server")]
+    pub fn lease_window(&mut self, src: &[u8]) -> Option<LeasedWindow> {
+        let (taken, hold) = self.claim_share(src)?;
+        taken.set(true);
+        self.lease_hold = Some(std::sync::Arc::downgrade(&hold));
+        Some(LeasedWindow {
+            view: LeasedBytes {
+                ptr: src.as_ptr(),
+                len: src.len(),
+            },
+            hold,
+        })
+    }
+
+    /// Run `job` over a leased window on the pool, from any facade; the
+    /// window's share is dropped when the finished job's completion is
+    /// taken on the loop, so the pool re-issues the buffer only after the
+    /// job has returned. `on_done` fires on the loop with the job's
+    /// result, as [`offload_result`](Self::offload_result)'s does.
+    #[cfg(feature = "net-server")]
+    pub fn offload_leased<T, J, F>(
+        &mut self,
+        window: LeasedWindow,
+        job: J,
+        on_done: F,
+    ) where
+        J: FnOnce(&[u8]) -> crate::Result<T> + Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(crate::Result<T>, &mut FsConn<'_>) + 'static,
+    {
+        let LeasedWindow { view, hold } = window;
+        // SAFETY-relevant invariants, stated once: `view` points into a
+        // recv-pool buffer a delivery claimed; the share registered below
+        // keeps the pool from re-issuing it until `take_pool_completions`
+        // drops the share, which happens after the job has returned; and
+        // no writer touches a delivered buffer before its release. So the
+        // view is valid and immutable for the job's whole run, on whatever
+        // thread the pool runs it. The raw parts, not the slice, cross to
+        // the worker - a `&[u8]` borrows the facade's lifetime and could
+        // not.
+        let deliver: OffloadDeliver = Box::new(move |any, conn| {
+            if let Ok(r) = any.downcast::<thread::Result<crate::Result<T>>>() {
+                on_done((*r).unwrap_or_else(|_| Err(Errno::EIO.into())), conn);
+            }
+        });
+        let token = self.fs.register_leased_offload(self.owner, deliver, hold);
+        let sink = self.fs.completion_sink();
+        let wake = Arc::clone(&self.eng.shared);
+        self.fs.submit_offload(Box::new(move || {
+            let r =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    job(view.as_slice())
+                }));
             finish_offload(&sink, &wake.wake, token, Box::new(r));
         }));
     }
@@ -6032,6 +6438,91 @@ mod hybrid_tests {
         );
     }
 
+    /// A share dropped off the explicit release paths returns its buffer
+    /// through the core's queue and pokes the loop; one taken out by
+    /// `into_bid` - a reaped write's, a taken completion's - does not
+    /// return it a second time.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_dropped_share_returns_its_buffer_once() {
+        let (eng, mut fs, _me) = setup();
+        let returns = fs.lease_returns(&eng.shared);
+        let dropped = std::sync::Arc::new(LeaseHold::new(3, returns.clone()));
+        let taken = std::sync::Arc::new(LeaseHold::new(4, returns));
+        let sibling = std::sync::Arc::clone(&dropped);
+        drop(dropped);
+        assert!(
+            fs.take_pool_releases().is_empty(),
+            "a share returned while a sibling still held the buffer"
+        );
+        drop(sibling);
+        assert_eq!(fs.take_pool_releases(), [3], "the last share returns");
+        assert_eq!(
+            std::sync::Arc::into_inner(taken).map(LeaseHold::into_bid),
+            Some(4)
+        );
+        assert!(
+            fs.take_pool_releases().is_empty(),
+            "a share taken out explicitly returned again from its drop"
+        );
+    }
+
+    /// A facade with no recv claim - every completion facade, every
+    /// unpooled connection - sends `offload_from` down its copy path: the
+    /// job sees the caller's bytes, verbatim, and the result comes back
+    /// through the ordinary `Result` seam with a panic mapped to `EIO`.
+    /// The leased path is the net server's to prove
+    /// (`test/recv_alloc.rs`), since only a delivery can hold a claim.
+    #[test]
+    fn offload_from_copies_where_nothing_is_leased() {
+        type Seen = Rc<RefCell<Option<crate::Result<(usize, u64)>>>>;
+        let (mut eng, mut fs, _me) = setup();
+        let seen: Seen = Rc::new(RefCell::new(None));
+        let bad: Rc<RefCell<Option<crate::Result<u64>>>> =
+            Rc::new(RefCell::new(None));
+        let (s2, b2) = (seen.clone(), bad.clone());
+        let bytes: Vec<u8> = (0..=255u8).cycle().take(3 * 1024 + 7).collect();
+        let want: u64 = bytes.iter().map(|&b| u64::from(b)).sum();
+        with_silent_panics(|| {
+            drive(
+                &mut eng,
+                &mut fs,
+                move |c| {
+                    c.offload_from(
+                        &bytes,
+                        |view| {
+                            Ok((
+                                view.len(),
+                                view.iter().map(|&b| u64::from(b)).sum(),
+                            ))
+                        },
+                        move |r, _c| *s2.borrow_mut() = Some(r),
+                    );
+                    c.offload_from(
+                        &[1u8, 2, 3],
+                        |_view| -> crate::Result<u64> { panic!("job blew up") },
+                        move |r, _c| *b2.borrow_mut() = Some(r),
+                    );
+                },
+                || seen.borrow().is_some() && bad.borrow().is_some(),
+            );
+        });
+        assert!(
+            matches!(*seen.borrow(), Some(Ok((n, sum))) if n == 3 * 1024 + 7 && sum == want),
+            "the job reads the caller's bytes: {:?}",
+            seen.borrow()
+        );
+        assert!(
+            matches!(*bad.borrow(), Some(Err(crate::Error::Errno(Errno::EIO)))),
+            "a panicked job is exactly EIO: {:?}",
+            bad.borrow()
+        );
+        assert!(
+            fs.offload_reg.is_empty(),
+            "no continuation may be stranded in the registry"
+        );
+    }
+
     /// `offload_result` maps a panicked job to exactly `EIO` - the documented
     /// contract - while an `Ok` job in the same drive passes its value
     /// through untouched, and neither strands its registry entry.
@@ -6391,6 +6882,10 @@ pub(crate) fn deliver_pool_completions(fs: &mut FsCore, eng: &mut Engine) {
     // Tasks woken by these deliveries - or poked from off-loop, which
     // lands on the same wake the pool uses - run in this dispatch, and
     // an on-loop wake inside it needs no poke to say so.
+    //
+    // A recv buffer a finished `offload_from` job released is *not*
+    // handed back here: the pool is the net server's, so the wake handler
+    // that called this takes `FsCore::take_pool_releases` afterwards.
     super::task::in_pass(fs, eng, |fs, eng| {
         for (owner, deliver, any) in fs.take_pool_completions() {
             let mut conn = FsConn::new(fs, eng, owner);
@@ -6802,7 +7297,7 @@ mod routing_fuzz {
             buf.len(),
             0,
             0,
-            std::sync::Arc::new(LeaseHold(9)),
+            std::sync::Arc::new(LeaseHold::detached(9)),
             chan(&tx),
         );
         assert!(staged.is_ok(), "staged");
@@ -6827,7 +7322,7 @@ mod routing_fuzz {
             buf.len(),
             0,
             0,
-            std::sync::Arc::new(LeaseHold(9)),
+            std::sync::Arc::new(LeaseHold::detached(9)),
             chan(&tx),
         );
         assert!(staged.is_ok(), "staged");
@@ -6857,7 +7352,7 @@ mod routing_fuzz {
         let fd = synth_fd();
         // SAFETY: `synth_fd` just opened it; nothing else owns it.
         let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
-        let hold = std::sync::Arc::new(LeaseHold(9));
+        let hold = std::sync::Arc::new(LeaseHold::detached(9));
 
         for off in [0u64, 4096] {
             let staged = core.submit_pwritev2_leased(
@@ -6945,7 +7440,7 @@ mod routing_fuzz {
             buf.len(),
             0,
             0,
-            std::sync::Arc::new(LeaseHold(9)),
+            std::sync::Arc::new(LeaseHold::detached(9)),
             chan(&tx),
         );
         assert!(staged.is_ok(), "staged");
@@ -8266,6 +8761,123 @@ mod loom_tests {
             assert!(
                 fs.take_pool_completions().is_empty(),
                 "the continuation fired twice for one completion"
+            );
+        });
+    }
+
+    /// A recv buffer standing in for the pool's: the job reads it on a
+    /// worker, the pool overwrites it when it is re-issued. loom refuses
+    /// any interleaving where the two overlap, which is the whole claim
+    /// [`FsConn::offload_from`] makes about the bytes a job reads.
+    #[cfg(feature = "net-server")]
+    struct Buffer(loom::cell::UnsafeCell<u8>);
+    // SAFETY: the model's point is that loom checks every access for
+    // overlap; the cell is shared only to let it.
+    #[cfg(feature = "net-server")]
+    unsafe impl Sync for Buffer {}
+
+    /// A leased buffer is re-issued only after the job that read it has
+    /// finished with it. The worker reads the bytes and then finishes its
+    /// offload - read, push, poke, as `offload_from`'s wrapper orders
+    /// them; the reactor drains, takes the job's share, and only then
+    /// sees the buffer id come back, at which point the pool may write
+    /// the buffer again. The push under the sink's mutex is what orders
+    /// the read before the write; without it the reactor could release
+    /// a buffer a worker is still reading.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn loom_leased_offload_releases_after_the_job_read() {
+        bounded_model(|| {
+            let mut fs = FsCore::new(4, OffloadBounds::default());
+            let buffer = Arc::new(Buffer(loom::cell::UnsafeCell::new(0xa5)));
+            // The job's share is the registry's alone: a leased write of
+            // the same delivery would hold another, and its CQE would
+            // have dropped it on the reactor - the model is the job's
+            // ordering, which is the new one.
+            let hold = std::sync::Arc::new(LeaseHold::detached(7));
+            let token = fs.register_leased_offload(
+                None,
+                Box::new(|_any, _conn| {
+                    unreachable!("not invoked in the model")
+                }),
+                hold,
+            );
+            let sink = fs.completion_sink();
+            let wake = Arc::new(
+                WakeHandle::new().expect("the model's wake never fails"),
+            );
+
+            let (s, w, b) =
+                (Arc::clone(&sink), Arc::clone(&wake), Arc::clone(&buffer));
+            let worker = loom::thread::spawn(move || {
+                // The job: read the leased bytes, then finish.
+                let seen = b.0.with(|p| unsafe { *p });
+                finish_offload(&s, &w, token, Box::new(seen));
+            });
+
+            let mut released = Vec::new();
+            while released.is_empty() {
+                wake.drain();
+                let _ = fs.take_pool_completions();
+                released = fs.take_pool_releases();
+            }
+            assert_eq!(released, [7], "the job's share frees its buffer");
+            // The pool re-issues the buffer: the write a still-running
+            // job's read must never overlap.
+            buffer.0.with_mut(|p| unsafe { *p = 0 });
+            worker.join().expect("worker");
+
+            assert!(
+                fs.take_pool_releases().is_empty(),
+                "a buffer was released twice"
+            );
+        });
+    }
+
+    /// A share dropped off the explicit release paths - a
+    /// [`LeasedWindow`] a handler let go, here on a worker thread after
+    /// reading the bytes - returns its buffer through the core's queue, and
+    /// the pool re-issues the buffer only after that read. The push under
+    /// the queue's mutex in `LeaseHold`'s drop is what orders the read
+    /// before the write, exactly as a finished job's push does.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn loom_dropped_share_returns_after_its_read() {
+        bounded_model(|| {
+            let fs = FsCore::new(4, OffloadBounds::default());
+            let buffer = Arc::new(Buffer(loom::cell::UnsafeCell::new(0xa5)));
+            let wake = Arc::new(crate::uring::wake::LoopShared {
+                stop: crate::sync::atomic::AtomicBool::new(false),
+                graceful: crate::sync::atomic::AtomicBool::new(false),
+                grace_ms: crate::sync::atomic::AtomicU64::new(0),
+                wake: WakeHandle::new().expect("the model's wake never fails"),
+            });
+            let hold =
+                std::sync::Arc::new(LeaseHold::new(7, fs.lease_returns(&wake)));
+            let mut fs = fs;
+
+            let b = Arc::clone(&buffer);
+            let worker = loom::thread::spawn(move || {
+                // The holder: read the leased bytes, then let the share go.
+                let seen = b.0.with(|p| unsafe { *p });
+                drop(hold);
+                seen
+            });
+
+            let mut released = Vec::new();
+            while released.is_empty() {
+                wake.wake.drain();
+                released = fs.take_pool_releases();
+            }
+            assert_eq!(released, [7], "the dropped share frees its buffer");
+            // The pool re-issues the buffer: the write must never overlap
+            // the holder's read.
+            buffer.0.with_mut(|p| unsafe { *p = 0 });
+            assert_eq!(worker.join().expect("worker"), 0xa5);
+
+            assert!(
+                fs.take_pool_releases().is_empty(),
+                "a buffer was released twice"
             );
         });
     }
