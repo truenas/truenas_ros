@@ -460,14 +460,20 @@ Do not reopen these without a reason that is new.
   a plain `defer` (an End park retains no resume state, so `resume()` there
   closes by design) answered from the last completion.
 - **`RECV_LEASE_DEPTH` (4) is why the recv ring registers past one slot per
-  connection.** A leased write holds its buffer beyond its message's
-  consume, so a pipelined connection holds up to its depth plus the one
-  arriving. The registration is the wall growth stops at, and past it a
-  connection degrades to owned buffers *permanently* - measured at ~2 large
+  connection.** A claim outlives its message - a leased write until its
+  CQE, a leased job (`offload_from`/`offload_leased`) until its completion
+  is taken, a `LeasedWindow` until the handler spends or drops it - so a
+  pipelined connection holds as many buffers as it has claims outstanding
+  plus the one arriving, whatever the buffers' size and however the
+  handler divides the count among writes, jobs and held windows. The
+  registration is the wall growth stops at, and past it a connection
+  degrades to owned buffers *permanently* - measured at ~2 large
   allocations per window (the owned growth plus the write's copy fallback)
   against zero inside the wall, which is
-  `a_pipelined_put_overlaps_writes_with_arrivals`'s negative control.
-  Descriptor slots are 16 bytes, so the headroom is free.
+  `a_pipelined_put_overlaps_writes_with_arrivals`'s negative control;
+  `a_held_window_is_digested_from_the_previous_jobs_completion` keeps a
+  job and held windows inside the same wall. Descriptor slots are 16
+  bytes, so the headroom is free.
 - **A `Content-Length` body streams only above one window, and its End
   stage rides the delivery that exhausts the length.** At or under
   `STREAM_WINDOW` a whole delivery is one pool-buffered read already, so

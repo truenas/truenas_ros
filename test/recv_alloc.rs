@@ -436,20 +436,150 @@ fn put_to_file_cost_ranged(
     wire_of: fn(&[u8]) -> Vec<u8>,
     split: bool,
 ) -> Option<(usize, usize, bool)> {
-    use std::sync::OnceLock;
     use truenas_ros::http::HttpStreamDeferred;
-    use truenas_ros::uring_fs::{Personality, RwFlags};
+    use truenas_ros::uring_fs::RwFlags;
+
+    let landed = streamed_put(mib, wire_of, |file, pc| {
+        truenas_ros::http::protocol_streaming_fs(
+            HttpConfig::default(),
+            1 << 30,
+            |_i: Incoming<'_>| Some(0u64),
+            move |req: HttpRequest<'_>, off: &mut u64, fs| match req.stage {
+                Stage::Open => {
+                    *off = 0;
+                    HttpVerdict::Continue
+                }
+                Stage::Window => {
+                    let Some(mut fs) = fs else {
+                        return HttpVerdict::Respond(HttpResponse::new(500));
+                    };
+                    let who = *pc.get().expect("personality set");
+                    let at = *off;
+                    *off += req.body.len() as u64;
+                    let (d, permit, body) = req.defer_stream();
+                    let d: HttpStreamDeferred = d;
+                    let half = if split && body.len() >= 2 {
+                        body.len() / 2
+                    } else {
+                        body.len()
+                    };
+                    let ranges: Vec<(usize, usize)> = if half == body.len() {
+                        vec![(0, body.len())]
+                    } else {
+                        vec![(0, half), (half, body.len())]
+                    };
+                    let d = std::rc::Rc::new(std::cell::RefCell::new(Some(d)));
+                    let left =
+                        std::rc::Rc::new(std::cell::Cell::new(ranges.len()));
+                    let failed = std::rc::Rc::new(std::cell::Cell::new(false));
+                    for (start, end) in ranges {
+                        let (d, left, failed) = (
+                            std::rc::Rc::clone(&d),
+                            std::rc::Rc::clone(&left),
+                            std::rc::Rc::clone(&failed),
+                        );
+                        fs.pwritev2_from(
+                            who,
+                            file.clone(),
+                            &body[start..end],
+                            at + start as u64,
+                            RwFlags::empty(),
+                            move |done, _fs| {
+                                if done.result().is_err() {
+                                    failed.set(true);
+                                }
+                                left.set(left.get() - 1);
+                                if left.get() == 0 {
+                                    let d = d
+                                        .borrow_mut()
+                                        .take()
+                                        .expect("one taker");
+                                    if failed.get() {
+                                        d.fail(HttpResponse::new(500));
+                                    } else {
+                                        d.resume();
+                                    }
+                                }
+                            },
+                        );
+                    }
+                    HttpVerdict::Defer(permit)
+                }
+                Stage::End => HttpVerdict::Respond(
+                    HttpResponse::new(200).header("x-bytes", off.to_string()),
+                ),
+                Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
+            },
+        )
+        .expect("codec config")
+    })?;
+    Some((landed.cost, landed.cost_med, landed.matches))
+}
+
+/// What one streamed PUT through [`streamed_put`] cost and delivered.
+#[cfg(feature = "uring-fs")]
+struct Landed {
+    /// Allocations at or above [`BIG`] during the upload.
+    cost: usize,
+    /// Allocations at or above [`MED`] during the upload.
+    cost_med: usize,
+    /// The destination holds exactly the payload.
+    matches: bool,
+    /// The bytes that were uploaded, for a digest to be checked against.
+    payload: Vec<u8>,
+    /// The response head, for whatever the handler put on it.
+    head: String,
+}
+
+#[cfg(feature = "uring-fs")]
+impl Landed {
+    /// A response header's value, where the handler set it.
+    fn header(&self, name: &str) -> Option<&str> {
+        self.head.lines().find_map(|l| {
+            l.strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix(": "))
+                .map(str::trim)
+        })
+    }
+}
+
+/// One streamed PUT of `mib` MiB of varied bytes, framed by `wire_of`,
+/// into a server running the protocol `proto_of` builds over a
+/// pre-opened destination and the reactor's own personality (set once the
+/// server exists, before the first connection). The upload's large
+/// allocations are counted, every receive buffer is checked back home,
+/// and the destination is read back. `None` where this box has no
+/// io_uring.
+///
+/// The destination is opened through a throwaway [`UringFs`] host, not
+/// the server's own reactor: the open path is not what any caller
+/// measures, and the file is cloned into every request from here.
+#[cfg(feature = "uring-fs")]
+fn streamed_put<U, A, H, B>(
+    mib: usize,
+    wire_of: impl FnOnce(&[u8]) -> Vec<u8>,
+    proto_of: impl FnOnce(
+        truenas_ros::uring_fs::File,
+        std::sync::Arc<std::sync::OnceLock<truenas_ros::uring_fs::Personality>>,
+    ) -> truenas_ros::net::server::Protocol<A, H, B>,
+) -> Option<Landed>
+where
+    A: FnMut(Incoming<'_>) -> Option<U>,
+    H: FnMut(&[u8], &mut U) -> truenas_ros::net::Framing,
+    B: FnMut(
+        truenas_ros::net::server::Request<'_, U>,
+    ) -> truenas_ros::net::server::Response,
+{
+    use std::sync::OnceLock;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, FsConfig, Personality, UringFs};
 
     let tmp = truenas_ros::tempdir().expect("tempdir");
     let dir = tmp.path().to_owned();
     let path = dir.join("obj");
     std::fs::write(&path, b"").expect("create");
 
-    // One pre-opened destination, cloned per request (the open path is not
-    // what this measures).
     let file = {
-        use truenas_ros::sync_fs::{OFlag, OpenHow};
-        use truenas_ros::uring_fs::{Anchor, FsConfig, UringFs};
         let mut afs = match UringFs::new(FsConfig::default()) {
             Ok(f) => f,
             Err(e) if should_skip(&e) => return None,
@@ -478,76 +608,7 @@ fn put_to_file_cost_ranged(
 
     let pers: std::sync::Arc<OnceLock<Personality>> =
         std::sync::Arc::new(OnceLock::new());
-    let pc = std::sync::Arc::clone(&pers);
-    let proto = truenas_ros::http::protocol_streaming_fs(
-        HttpConfig::default(),
-        1 << 30,
-        |_i: Incoming<'_>| Some(0u64),
-        move |req: HttpRequest<'_>, off: &mut u64, fs| match req.stage {
-            Stage::Open => {
-                *off = 0;
-                HttpVerdict::Continue
-            }
-            Stage::Window => {
-                let Some(mut fs) = fs else {
-                    return HttpVerdict::Respond(HttpResponse::new(500));
-                };
-                let who = *pc.get().expect("personality set");
-                let at = *off;
-                *off += req.body.len() as u64;
-                let (d, permit, body) = req.defer_stream();
-                let d: HttpStreamDeferred = d;
-                let half = if split && body.len() >= 2 {
-                    body.len() / 2
-                } else {
-                    body.len()
-                };
-                let ranges: Vec<(usize, usize)> = if half == body.len() {
-                    vec![(0, body.len())]
-                } else {
-                    vec![(0, half), (half, body.len())]
-                };
-                let d = std::rc::Rc::new(std::cell::RefCell::new(Some(d)));
-                let left = std::rc::Rc::new(std::cell::Cell::new(ranges.len()));
-                let failed = std::rc::Rc::new(std::cell::Cell::new(false));
-                for (start, end) in ranges {
-                    let (d, left, failed) = (
-                        std::rc::Rc::clone(&d),
-                        std::rc::Rc::clone(&left),
-                        std::rc::Rc::clone(&failed),
-                    );
-                    fs.pwritev2_from(
-                        who,
-                        file.clone(),
-                        &body[start..end],
-                        at + start as u64,
-                        RwFlags::empty(),
-                        move |done, _fs| {
-                            if done.result().is_err() {
-                                failed.set(true);
-                            }
-                            left.set(left.get() - 1);
-                            if left.get() == 0 {
-                                let d =
-                                    d.borrow_mut().take().expect("one taker");
-                                if failed.get() {
-                                    d.fail(HttpResponse::new(500));
-                                } else {
-                                    d.resume();
-                                }
-                            }
-                        },
-                    );
-                }
-                HttpVerdict::Defer(permit)
-            }
-            Stage::End => HttpVerdict::Respond(
-                HttpResponse::new(200).header("x-bytes", off.to_string()),
-            ),
-            Stage::Whole => HttpVerdict::Respond(HttpResponse::new(500)),
-        },
-    )
-    .expect("codec config");
+    let proto = proto_of(file, std::sync::Arc::clone(&pers));
 
     let cfg = ServerConfig {
         pool_size: 8,
@@ -569,7 +630,10 @@ fn put_to_file_cost_ranged(
     let stats = server.stats_handle();
     let stop = server.shutdown_handle();
 
-    let payload = vec![0x9du8; mib * 1024 * 1024];
+    // Varied bytes, so a window digested out of order or over a recycled
+    // buffer shows up; a constant fill would hash the same either way.
+    let payload: Vec<u8> =
+        (0..mib * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     let wire = wire_of(&payload);
 
     let client = thread::spawn(move || {
@@ -579,17 +643,17 @@ fn put_to_file_cost_ranged(
         let before = BIG_ALLOCS.load(Ordering::Relaxed);
         let before_med = MED_ALLOCS.load(Ordering::Relaxed);
         s.write_all(&wire).expect("write");
-        let status = read_status(&mut s).expect("status");
-        assert_eq!(status, 200, "upload refused");
+        let (status, head) = read_response_head(&mut s).expect("head");
+        assert_eq!(status, 200, "upload refused: {head}");
         let cost = BIG_ALLOCS.load(Ordering::Relaxed) - before;
         let cost_med = MED_ALLOCS.load(Ordering::Relaxed) - before_med;
         drop(s);
         stop.shutdown();
-        (cost, cost_med)
+        (cost, cost_med, head)
     });
 
     server.serve_forever().expect("serve_forever");
-    let (cost, cost_med) = client.join().expect("client thread");
+    let (cost, cost_med, head) = client.join().expect("client thread");
     let s = stats.snapshot();
     assert!(
         s.recv_bufs_total > 0,
@@ -600,8 +664,440 @@ fn put_to_file_cost_ranged(
         "a leased buffer was never returned: {s:?}"
     );
     let written = std::fs::read(&path).expect("read back");
-    let matches = written == payload;
-    Some((cost, cost_med, matches))
+    Some(Landed {
+        cost,
+        cost_med,
+        matches: written == payload,
+        payload,
+        head,
+    })
+}
+
+/// The digest the two digesting handlers compute: order-sensitive, so a
+/// window hashed over the wrong bytes or a recycled buffer shows up.
+#[cfg(feature = "uring-fs")]
+fn fold(acc: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(acc, |h, &b| {
+        h.wrapping_mul(0x0000_0100_0000_01b3) ^ u64::from(b)
+    })
+}
+
+#[cfg(feature = "uring-fs")]
+const FOLD_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// [`put_to_file_cost`] with every window also *digested* on the pool from
+/// the same leased buffer (`offload_from`): the write and the job share
+/// the window's claim, the stream resumes when both have landed, and
+/// `End` answers the running digest. Returns the allocation costs, whether
+/// the file matched, and whether the digest the handler accumulated is
+/// the payload's.
+#[cfg(feature = "uring-fs")]
+fn put_digest_cost(mib: usize) -> Option<(usize, usize, bool, bool)> {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use truenas_ros::http::HttpStreamDeferred;
+    use truenas_ros::uring_fs::RwFlags;
+
+    /// One connection's upload: the payload offset and the digest so
+    /// far. Each window parks until its job is back, so the next window
+    /// starts from the digest its predecessor's completion stored.
+    struct Digesting {
+        off: u64,
+        acc: u64,
+    }
+
+    let landed = streamed_put(
+        mib,
+        |p| chunked_put(p, 128 * 1024),
+        |file, pc| {
+            truenas_ros::http::protocol_streaming_fs(
+                HttpConfig::default(),
+                1 << 30,
+                |_i: Incoming<'_>| {
+                    Some(Rc::new(RefCell::new(Digesting {
+                        off: 0,
+                        acc: FOLD_SEED,
+                    })))
+                },
+                move |req: HttpRequest<'_>,
+                      st: &mut Rc<RefCell<Digesting>>,
+                      fs| {
+                    match req.stage {
+                        Stage::Open => HttpVerdict::Continue,
+                        Stage::Window => {
+                            let Some(mut fs) = fs else {
+                                return HttpVerdict::Respond(
+                                    HttpResponse::new(500),
+                                );
+                            };
+                            let who = *pc.get().expect("personality set");
+                            let (at, acc) = {
+                                let mut p = st.borrow_mut();
+                                let at = p.off;
+                                p.off += req.body.len() as u64;
+                                (at, p.acc)
+                            };
+                            let (d, permit, body) = req.defer_stream();
+                            let d: HttpStreamDeferred = d;
+                            let d = Rc::new(RefCell::new(Some(d)));
+                            // Two landings per window: the write's CQE and
+                            // the job's delivery. The last one resumes the
+                            // stream.
+                            let left = Rc::new(Cell::new(2u8));
+                            let failed = Rc::new(Cell::new(false));
+                            let finish = {
+                                let (d, left, failed) = (
+                                    Rc::clone(&d),
+                                    Rc::clone(&left),
+                                    Rc::clone(&failed),
+                                );
+                                move |ok: bool| {
+                                    if !ok {
+                                        failed.set(true);
+                                    }
+                                    left.set(left.get() - 1);
+                                    if left.get() == 0 {
+                                        let d = d
+                                            .borrow_mut()
+                                            .take()
+                                            .expect("one taker");
+                                        if failed.get() {
+                                            d.fail(HttpResponse::new(500));
+                                        } else {
+                                            d.resume();
+                                        }
+                                    }
+                                }
+                            };
+                            let f1 = finish.clone();
+                            fs.pwritev2_from(
+                                who,
+                                file.clone(),
+                                &body,
+                                at,
+                                RwFlags::empty(),
+                                move |done, _fs| f1(done.result().is_ok()),
+                            );
+                            let st = Rc::clone(st);
+                            fs.offload_from(
+                                &body,
+                                move |view| Ok(fold(acc, view)),
+                                move |r, _fs| match r {
+                                    Ok(h) => {
+                                        // Stored before the resume, so the
+                                        // next window and `End` both read it.
+                                        st.borrow_mut().acc = h;
+                                        finish(true);
+                                    }
+                                    Err(_) => finish(false),
+                                },
+                            );
+                            HttpVerdict::Defer(permit)
+                        }
+                        Stage::End => {
+                            let p = st.borrow();
+                            HttpVerdict::Respond(
+                                HttpResponse::new(200)
+                                    .header("x-bytes", p.off.to_string())
+                                    .header(
+                                        "x-digest",
+                                        format!("{:016x}", p.acc),
+                                    ),
+                            )
+                        }
+                        Stage::Whole => {
+                            HttpVerdict::Respond(HttpResponse::new(500))
+                        }
+                    }
+                },
+            )
+            .expect("codec config")
+        },
+    )?;
+    let want = format!("{:016x}", fold(FOLD_SEED, &landed.payload));
+    let digested = landed.header("x-digest") == Some(want.as_str());
+    Some((landed.cost, landed.cost_med, landed.matches, digested))
+}
+
+/// [`put_digest_cost`] with the digest *pipelined*: a window is never
+/// parked on its own job. Each window is written and leased
+/// (`lease_window`); the lease is spent on the pool at once when no job is
+/// running, else it waits in a backlog and the running job's completion
+/// spends it - `offload_leased` from a completion facade. The stream
+/// brakes only past two waiting windows, and `End` answers from the
+/// completion that drains the last of them. Returns what
+/// [`put_digest_cost`] does.
+#[cfg(feature = "uring-fs")]
+fn put_pipelined_digest_cost(mib: usize) -> Option<(usize, usize, bool, bool)> {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+    use truenas_ros::http::{HttpDeferred, HttpStreamDeferred};
+    use truenas_ros::uring_fs::{FsConn, LeasedWindow, RwFlags};
+
+    /// A window waiting for the digest: leased where the delivery could
+    /// lease it, copied where it could not (never, on this path - the
+    /// flat allocation count is what proves it).
+    enum Window {
+        Leased(LeasedWindow),
+        Owned(Vec<u8>),
+    }
+
+    /// One connection's upload.
+    struct Pipe {
+        off: u64,
+        acc: u64,
+        /// A digest job is out.
+        busy: bool,
+        backlog: VecDeque<Window>,
+        writes: u32,
+        write_failed: bool,
+        parked: Option<HttpStreamDeferred>,
+        end: Option<HttpDeferred>,
+    }
+
+    const BACKLOG: usize = 2;
+
+    impl Pipe {
+        fn settled(&self) -> bool {
+            !self.busy && self.backlog.is_empty() && self.writes == 0
+        }
+        fn answer(&mut self) {
+            if self.settled()
+                && let Some(end) = self.end.take()
+            {
+                end.reply(if self.write_failed {
+                    HttpResponse::new(500)
+                } else {
+                    HttpResponse::new(200)
+                        .header("x-bytes", self.off.to_string())
+                        .header("x-digest", format!("{:016x}", self.acc))
+                });
+            }
+        }
+        fn unbrake(&mut self) {
+            if self.backlog.len() < BACKLOG
+                && let Some(p) = self.parked.take()
+            {
+                p.resume();
+            }
+        }
+    }
+
+    /// Spend one window on the pool; its completion spends the next.
+    fn submit(conn: &mut FsConn<'_>, st: Rc<RefCell<Pipe>>, w: Window) {
+        let acc = st.borrow().acc;
+        let done = {
+            let st = Rc::clone(&st);
+            move |r: truenas_ros::Result<u64>, conn: &mut FsConn<'_>| {
+                let next = {
+                    let mut p = st.borrow_mut();
+                    match r {
+                        Ok(h) => p.acc = h,
+                        Err(_) => p.write_failed = true,
+                    }
+                    let next = p.backlog.pop_front();
+                    if next.is_none() {
+                        p.busy = false;
+                    }
+                    p.unbrake();
+                    next
+                };
+                match next {
+                    Some(w) => submit(conn, st, w),
+                    None => st.borrow_mut().answer(),
+                }
+            }
+        };
+        match w {
+            Window::Leased(w) => {
+                conn.offload_leased(w, move |view| Ok(fold(acc, view)), done)
+            }
+            Window::Owned(bytes) => {
+                conn.offload_result(move || Ok(fold(acc, &bytes)), done)
+            }
+        }
+    }
+
+    let landed = streamed_put(
+        mib,
+        |p| chunked_put(p, 128 * 1024),
+        |file, pc| {
+            truenas_ros::http::protocol_streaming_fs(
+                HttpConfig::default(),
+                1 << 30,
+                |_i: Incoming<'_>| {
+                    Some(Rc::new(RefCell::new(Pipe {
+                        off: 0,
+                        acc: FOLD_SEED,
+                        busy: false,
+                        backlog: VecDeque::new(),
+                        writes: 0,
+                        write_failed: false,
+                        parked: None,
+                        end: None,
+                    })))
+                },
+                move |req: HttpRequest<'_>, st: &mut Rc<RefCell<Pipe>>, fs| {
+                    match req.stage {
+                        Stage::Open => HttpVerdict::Continue,
+                        Stage::Window => {
+                            let Some(mut fs) = fs else {
+                                return HttpVerdict::Respond(
+                                    HttpResponse::new(500),
+                                );
+                            };
+                            let who = *pc.get().expect("personality set");
+                            let at = {
+                                let mut p = st.borrow_mut();
+                                let at = p.off;
+                                p.off += req.body.len() as u64;
+                                p.writes += 1;
+                                at
+                            };
+                            let wst = Rc::clone(st);
+                            fs.pwritev2_from(
+                                who,
+                                file.clone(),
+                                &req.body,
+                                at,
+                                RwFlags::empty(),
+                                move |done, _fs| {
+                                    let mut p = wst.borrow_mut();
+                                    if done.result().is_err() {
+                                        p.write_failed = true;
+                                    }
+                                    p.writes -= 1;
+                                    p.answer();
+                                },
+                            );
+                            let window = match fs.lease_window(&req.body) {
+                                Some(w) => Window::Leased(w),
+                                None => Window::Owned(req.body.to_vec()),
+                            };
+                            let busy = std::mem::replace(
+                                &mut st.borrow_mut().busy,
+                                true,
+                            );
+                            if busy {
+                                st.borrow_mut().backlog.push_back(window);
+                            } else {
+                                submit(&mut fs, Rc::clone(st), window);
+                            }
+                            if st.borrow().backlog.len() >= BACKLOG {
+                                let (d, permit, _body) = req.defer_stream();
+                                st.borrow_mut().parked = Some(d);
+                                HttpVerdict::Defer(permit)
+                            } else {
+                                HttpVerdict::Continue
+                            }
+                        }
+                        Stage::End => {
+                            let (d, permit) = req.defer();
+                            let mut p = st.borrow_mut();
+                            p.end = Some(d);
+                            p.answer();
+                            HttpVerdict::Defer(permit)
+                        }
+                        Stage::Whole => {
+                            HttpVerdict::Respond(HttpResponse::new(500))
+                        }
+                    }
+                },
+            )
+            .expect("codec config")
+        },
+    )?;
+    let want = format!("{:016x}", fold(FOLD_SEED, &landed.payload));
+    let digested = landed.header("x-digest") == Some(want.as_str());
+    Some((landed.cost, landed.cost_med, landed.matches, digested))
+}
+
+/// A window held past its delivery and spent from an earlier job's
+/// completion costs no copy and returns its lease.
+///
+/// The pipelined shape: the stream flows while the digest runs behind
+/// it, windows waiting their turn as leases rather than copies, every
+/// one spent by `offload_leased` from a completion facade that holds no
+/// lease of its own. Flat allocation count, every buffer back, and the
+/// digest is the payload's - so the windows were read in order and none
+/// was recycled under a waiting job.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn a_held_window_is_digested_from_the_previous_jobs_completion() {
+    let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((small, _, ok_small, digest_small)) = put_pipelined_digest_cost(4)
+    else {
+        return; // io_uring unavailable
+    };
+    let Some((large, _, ok_large, digest_large)) =
+        put_pipelined_digest_cost(16)
+    else {
+        return;
+    };
+    assert!(ok_small && ok_large, "file bytes differ from the upload");
+    assert!(
+        digest_small && digest_large,
+        "the pipelined jobs digested other bytes than the payload's"
+    );
+    assert!(
+        large <= small + 8,
+        "pipelined digesting cost scales with payload: 4 MiB cost {small} \
+         large allocations, 16 MiB cost {large}. A held window that fell \
+         to a copy looks exactly like this."
+    );
+}
+
+/// Read one response head; the status and the raw header block.
+#[cfg(feature = "uring-fs")]
+fn read_response_head(s: &mut TcpStream) -> io::Result<(u16, String)> {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        if s.read(&mut byte)? == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "head"));
+        }
+        buf.push(byte[0]);
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    Ok((status, text))
+}
+
+/// A window digested on the pool from the receive buffer it arrived in
+/// costs no copy and returns its lease.
+///
+/// `offload_from` shares the write's claim: the write and the job read
+/// the same buffer, the buffer returns when the last of them is over, and
+/// neither falls to the copy path - so the allocation count is flat in
+/// the payload, every lease comes back, and the digest is the payload's.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn a_leased_window_is_digested_in_place() {
+    let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((small, _, ok_small, digest_small)) = put_digest_cost(4) else {
+        return; // io_uring unavailable
+    };
+    let Some((large, _, ok_large, digest_large)) = put_digest_cost(16) else {
+        return;
+    };
+    assert!(ok_small && ok_large, "file bytes differ from the upload");
+    assert!(
+        digest_small && digest_large,
+        "the pool job digested other bytes than the payload's"
+    );
+    // 4 MiB is 32 windows, 16 MiB is 128: a per-window copy shows up as
+    // ~96 between them.
+    assert!(
+        large <= small + 8,
+        "digesting cost scales with payload: 4 MiB cost {small} large \
+         allocations, 16 MiB cost {large}. A copy fallback looks exactly \
+         like this."
+    );
 }
 
 /// Writing a streamed PUT to a file must neither corrupt it nor allocate

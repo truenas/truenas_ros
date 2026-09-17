@@ -246,6 +246,10 @@ pub use core::{
     ConnToken, DeriveName, DirWalk, FsConn, FsDone, NameBatch, OpenStep,
     StepPath, Timer,
 };
+// The one on-loop type that is the server's alone: a window of a pooled
+// receive buffer, which only the net server has.
+#[cfg(feature = "net-server")]
+pub use core::LeasedWindow;
 // The awaitable layer over the callback facade: op futures, offload
 // futures, and on-loop tasks. A consumer, not a second submission path -
 // every op it submits goes through `FsConn`'s methods above.
