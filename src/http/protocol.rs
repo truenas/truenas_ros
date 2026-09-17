@@ -26,7 +26,8 @@ use super::chunked;
 use super::date::DateCache;
 use super::framer::{HttpConfig, HttpConn, Phase, frame};
 use super::head::{
-    Head, HeaderView, MAX_HEADERS, Version, method_is_head, parse_head,
+    Head, HeadIndex, HeaderView, MAX_HEADERS, Version, head_view,
+    method_is_head,
 };
 use super::response::{
     ConnHeader, HttpResponse, Serialized, serialize, serialize_reply,
@@ -202,8 +203,8 @@ impl std::fmt::Debug for HttpRequest<'_> {
 /// [`HttpDeferred::reply`] fills. Fully owned - the connection buffer it was
 /// parsed from is recycled while the request is parked.
 pub(crate) struct ParkedRequest {
-    /// The head block verbatim (`raw_head`), re-parsed at completion so no
-    /// negotiated fact is copied aside where it could drift.
+    /// The head block verbatim (`raw_head`), viewed again at completion so
+    /// no negotiated fact is copied aside where it could drift.
     head: Vec<u8>,
     /// The stage this delivery was made at, so a redrive re-presents it as
     /// itself. The resume phase cannot answer for it: an `End` park carries
@@ -581,16 +582,19 @@ enum Dispatched {
     },
 }
 
-/// Re-parse a head the framer already accepted into the caller's array, or
-/// the `500` farewell a re-parse divergence (a codec bug) is answered with.
-/// Shared by the inline dispatch and the parked completion so the header-count
-/// cap and the farewell shape cannot drift between them.
-fn reparse_or_farewell<'a, 'buf>(
+/// View a head the framer already accepted through the caller's array, or
+/// the `500` farewell a head that no longer reads (a codec bug) is answered
+/// with. The view comes from the connection's [`HeadIndex`], so the head is
+/// not tokenized a second time. Shared by the inline dispatch and the parked
+/// completion so the header-count cap and the farewell shape cannot drift
+/// between them.
+fn head_or_farewell<'a, 'buf>(
     head_bytes: &'buf [u8],
+    index: &HeadIndex,
     headers: &'a mut [HeaderView<'buf>; MAX_HEADERS],
     dates: &mut DateCache,
 ) -> std::result::Result<Head<'a>, Response> {
-    match parse_head(head_bytes, headers) {
+    match head_view(index, head_bytes, headers) {
         Err(_) | Ok(None) => {
             Err(farewell(500, method_is_head(head_bytes), dates))
         }
@@ -598,7 +602,7 @@ fn reparse_or_farewell<'a, 'buf>(
     }
 }
 
-/// Parse a delivered head and run the consumer's handler against it - the
+/// View a delivered head and run the consumer's handler against it - the
 /// shared tail of the normal path, the 100-continue dance, and a parked
 /// request's redelivery, so all three hand handlers an identical request
 /// view by construction.
@@ -607,6 +611,7 @@ fn reparse_or_farewell<'a, 'buf>(
 #[allow(clippy::too_many_arguments)]
 fn dispatch<U, H>(
     head_bytes: &[u8],
+    index: &HeadIndex,
     body: Body<'_>,
     trailers: &[HeaderView<'_>],
     peer: &ClientAddr,
@@ -622,7 +627,7 @@ where
 {
     let mut headers: [HeaderView<'_>; MAX_HEADERS] =
         [HeaderView::EMPTY; MAX_HEADERS];
-    let h = match reparse_or_farewell(head_bytes, &mut headers, dates) {
+    let h = match head_or_farewell(head_bytes, index, &mut headers, dates) {
         Ok(h) => h,
         Err(resp) => return Dispatched::Done(resp),
     };
@@ -676,6 +681,7 @@ where
 /// elision, and the smuggling forced-close cannot fork between the two.
 fn respond_parked(
     head_bytes: &[u8],
+    index: &HeadIndex,
     resp: HttpResponse,
     dates: &mut DateCache,
     draining: bool,
@@ -683,7 +689,7 @@ fn respond_parked(
 ) -> Response {
     let mut headers: [HeaderView<'_>; MAX_HEADERS] =
         [HeaderView::EMPTY; MAX_HEADERS];
-    match reparse_or_farewell(head_bytes, &mut headers, dates) {
+    match head_or_farewell(head_bytes, index, &mut headers, dates) {
         Ok(h) => respond(&h, resp, dates, draining, abandons_body),
         Err(farewell) => farewell,
     }
@@ -774,6 +780,7 @@ where
         Phase::ExpectBody { head: stash, .. } => {
             let d = dispatch(
                 &stash,
+                &conn.index,
                 body,
                 &[],
                 peer,
@@ -806,6 +813,7 @@ where
                         Ok(trailers) => {
                             let d = dispatch(
                                 head_bytes,
+                                &conn.index,
                                 Body::owned_range(wire, c.start, c.len),
                                 &trailers,
                                 peer,
@@ -833,6 +841,7 @@ where
                     };
                     let d = dispatch(
                         head_bytes,
+                        &conn.index,
                         entity,
                         &trailers,
                         peer,
@@ -859,6 +868,7 @@ where
         Phase::Head => {
             let d = dispatch(
                 header,
+                &conn.index,
                 body,
                 &[],
                 peer,
@@ -889,6 +899,7 @@ where
             }
             let d = dispatch(
                 &head,
+                &conn.index,
                 Body::inline(&[]),
                 &[],
                 peer,
@@ -967,6 +978,7 @@ where
             let left = owed.saturating_sub(delivered);
             let d = dispatch(
                 &head,
+                &conn.index,
                 body,
                 &[],
                 peer,
@@ -1020,6 +1032,7 @@ where
             let mut fs = fs;
             let d = dispatch(
                 &head,
+                &conn.index,
                 body,
                 &[],
                 peer,
@@ -1034,6 +1047,7 @@ where
                 Dispatched::Continue if left == 0 => {
                     let d = dispatch(
                         &head,
+                        &conn.index,
                         Body::inline(&[]),
                         &[],
                         peer,
@@ -1096,6 +1110,7 @@ where
                 .unwrap_or_default();
             let d = dispatch(
                 &head,
+                &conn.index,
                 Body::inline(&[]),
                 &trailers,
                 peer,
@@ -1131,6 +1146,7 @@ where
                     Some(r) if matches!(r.next, Phase::StreamDone { .. }) => {
                         let d = dispatch(
                             &head,
+                            &conn.index,
                             Body::inline(&[]),
                             &[],
                             peer,
@@ -1157,6 +1173,7 @@ where
                     let resp = *resp;
                     let out = respond_parked(
                         &head,
+                        &conn.index,
                         resp,
                         dates,
                         responder.draining(),
@@ -1186,6 +1203,7 @@ where
                     let mut fs = fs;
                     let d = dispatch(
                         &head,
+                        &conn.index,
                         Body::placed(parked),
                         &views,
                         peer,
@@ -1215,6 +1233,7 @@ where
                         {
                             let d = dispatch(
                                 &head,
+                                &conn.index,
                                 Body::inline(&[]),
                                 &[],
                                 peer,
@@ -3105,6 +3124,115 @@ mod tests {
             "the redrive re-presented an End park as {:?}",
             conn.state.last()
         );
+    }
+
+    /// The framer tokenizes a head and every dispatch after it views that
+    /// head through the recorded index. A streamed upload dispatches its head
+    /// at the open, at each window, at the end and again when a park is
+    /// redriven, and none of those may tokenize it again.
+    ///
+    /// The second half is the fallback. A head that no index describes is
+    /// tokenized at dispatch and served all the same.
+    #[test]
+    fn a_head_is_tokenized_once_however_often_it_is_dispatched() {
+        use super::super::head::REPARSED;
+
+        let head = b"PUT /up HTTP/1.1\r\nHost: h\r\nX-Tag: one\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n";
+        let mut conn =
+            HttpConn::new_streaming(Vec::<Stage>::new(), nz(1 << 20));
+        let p = peer();
+        let parked: RefCell<Option<HttpDeferred>> = RefCell::new(None);
+        let park_once = std::cell::Cell::new(false);
+        let mut handler = |req: HttpRequest<'_>, seen: &mut Vec<Stage>| {
+            assert_eq!(req.method, "PUT");
+            assert_eq!(req.target, "/up");
+            let tag = req.headers.iter().find(|h| h.name == "X-Tag");
+            assert_eq!(tag.map(|h| h.value), Some(&b"one"[..]));
+            seen.push(req.stage);
+            match req.stage {
+                Stage::End if !park_once.replace(true) => {
+                    let (deferred, permit) = req.defer();
+                    parked.borrow_mut().replace(deferred);
+                    HttpVerdict::Defer(permit)
+                }
+                Stage::End => HttpVerdict::Respond(HttpResponse::new(200)),
+                _ => HttpVerdict::Continue,
+            }
+        };
+        let before = REPARSED.get();
+
+        let _ = frame(head, &mut conn, &cfg());
+        let _ =
+            drive_verdict(head, Body::inline(b""), &p, &mut conn, &mut handler);
+        let win = b"3\r\nabc\r\n";
+        let f = frame(win, &mut conn, &cfg());
+        let Framing::Complete {
+            header_len,
+            body_len,
+        } = f
+        else {
+            panic!("window: {f:?}")
+        };
+        let _ = drive_verdict(
+            &win[..header_len],
+            Body::inline(&win[header_len..header_len + body_len]),
+            &p,
+            &mut conn,
+            &mut handler,
+        );
+        let last = b"\r\n0\r\n\r\n";
+        let f = frame(last, &mut conn, &cfg());
+        let Framing::Complete { header_len, .. } = f else {
+            panic!("terminal: {f:?}")
+        };
+        let resp = drive_verdict(
+            &last[..header_len],
+            Body::inline(b""),
+            &p,
+            &mut conn,
+            &mut handler,
+        );
+        assert!(matches!(resp, Response::Defer(_)), "got {resp:?}");
+        parked.borrow_mut().take().expect("parked").redrive();
+        let done = complete_parked(&mut conn, &mut handler);
+        assert!(text(&done).starts_with("HTTP/1.1 200 OK\r\n"), "{done:?}");
+        assert_eq!(
+            conn.state,
+            vec![Stage::Open, Stage::Window, Stage::End, Stage::End]
+        );
+
+        // The next request on the connection replaces the index.
+        let next = b"GET /after HTTP/1.1\r\nHost: h\r\n\r\n";
+        let mut saw = None;
+        let resp = roundtrip(next, &mut conn, &mut |req, _| {
+            saw = Some(req.target.to_owned());
+            HttpResponse::new(204)
+        });
+        assert!(is_keep(&resp));
+        assert_eq!(saw.as_deref(), Some("/after"));
+        assert_eq!(
+            REPARSED.get(),
+            before,
+            "a head the framer indexed was tokenized again at dispatch"
+        );
+
+        // A connection the framer never ran on has no index to view through.
+        let mut bare = HttpConn::new(());
+        let mut saw = None;
+        let resp = drive(
+            next,
+            Body::inline(b""),
+            &p,
+            &mut bare,
+            &mut |req: HttpRequest<'_>, _: &mut ()| {
+                saw = Some(req.target.to_owned());
+                HttpResponse::new(204)
+            },
+        );
+        assert!(is_keep(&resp));
+        assert_eq!(saw.as_deref(), Some("/after"));
+        assert_eq!(REPARSED.get(), before + 1, "the fallback did not run");
     }
 
     /// While a request is parked the framer holds pipelined bytes unframed,

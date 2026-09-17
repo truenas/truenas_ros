@@ -1,12 +1,13 @@
 //! Request-head analysis: `httparse` tokenizing plus the semantic checks the
 //! tokenizer deliberately leaves to the server - body length, smuggling
 //! rules, Host enforcement, keep-alive, `Expect`. Pure functions over byte
-//! slices. The framer (to place message boundaries) calls [`frame_facts`] and
-//! the glue (to build the [`HttpRequest`](super::HttpRequest) view) calls
-//! [`parse_head`]; both run the same tokenizer and the same semantic rules
-//! over the same header views, so the two can never disagree about what a
-//! head means - [`frame_facts`] merely skips building the header index the
-//! framer would throw away.
+//! slices. The framer (to place message boundaries) calls
+//! [`frame_facts_indexed`], which tokenizes the head once and records where
+//! its parts sit in a [`HeadIndex`]. The glue (to build the
+//! [`HttpRequest`](super::HttpRequest) view) calls [`head_view`], which
+//! rebuilds the view from that index instead of tokenizing again, so the two
+//! can never disagree about what a head means. [`parse_head`] is the full
+//! tokenize behind [`head_view`] for a head no index describes.
 
 /// Header-count cap handed to `httparse`. Sized for S3: AWS caps user
 /// metadata at 2 KiB total, but short keys can spread that budget across
@@ -60,7 +61,7 @@ impl HeaderView<'_> {
 /// A completely tokenized request head. Method and target borrow the
 /// connection buffer; the header index borrows a fixed array the caller owns
 /// (so tokenizing a head allocates nothing). (Its length is not carried: the
-/// glue always parses exactly the head bytes the framer declared, so the span
+/// glue always views exactly the head bytes the framer declared, so the span
 /// is the input itself.)
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Head<'a> {
@@ -76,8 +77,7 @@ pub(crate) struct Head<'a> {
 }
 
 /// The facts framing needs from a complete head - everything [`frame`]
-/// consumes, computed without allocating the header index [`parse_head`]
-/// builds (the framer would discard it unread).
+/// consumes.
 ///
 /// [`frame`]: super::framer::frame
 pub(crate) struct FrameFacts<'a> {
@@ -101,6 +101,174 @@ pub(crate) struct FrameFacts<'a> {
     /// the `100-continue` expectation (RFC 9110 sec. 10.1.1 forbids interim
     /// responses to HTTP/1.0 clients, which would parse one as final).
     pub expects_continue: bool,
+}
+
+/// Where one part of a head sits, as an offset from the front of the head.
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    at: u32,
+    len: u32,
+}
+
+impl Span {
+    /// Where `part` sits in `buf`, or `None` when it is not a slice of `buf`
+    /// or does not fit the width.
+    fn of(buf: &[u8], part: &[u8]) -> Option<Span> {
+        // An empty part has no bytes to find, and the tokenizer does not
+        // promise that an empty value points into the buffer.
+        if part.is_empty() {
+            return Some(Span { at: 0, len: 0 });
+        }
+        Some(Span {
+            at: u32::try_from(buf.subslice_range(part)?.start).ok()?,
+            len: u32::try_from(part.len()).ok()?,
+        })
+    }
+
+    fn bytes(self, head: &[u8]) -> Option<&[u8]> {
+        head.get(self.at as usize..)?.get(..self.len as usize)
+    }
+
+    fn text(self, head: &[u8]) -> Option<&str> {
+        std::str::from_utf8(self.bytes(head)?).ok()
+    }
+}
+
+/// Where the parts of one tokenized head sit, so the glue can rebuild the
+/// [`Head`] view without tokenizing the same bytes again. That saves one
+/// tokenize per request, and one per window of a streamed body, because
+/// every window is dispatched with its head.
+///
+/// The parts are kept as offsets because the head bytes move between
+/// framing and delivery. The recv buffer is copied to owned storage when a
+/// body outgrows it, and the 100-continue dance, the stream phases and a
+/// park each copy the head aside. The bytes are the same every time, so an
+/// offset from the front still finds its part where a pointer would not.
+///
+/// The index describes the last head that tokenized complete. No other head
+/// is tokenized before that request's last dispatch, because only the
+/// framer's `Head` phase tokenizes, and a request in the dance, mid-stream
+/// or parked keeps the connection in another phase. The length check in
+/// [`head_view`] is a tripwire behind that reasoning, not a substitute for
+/// it, so a new framer phase that tokenizes has to keep it true.
+#[derive(Debug, Default)]
+pub(crate) struct HeadIndex {
+    /// The head described, or `None` when none is.
+    head: Option<IndexedHead>,
+    /// Name and value of each header in wire order. The storage is reused
+    /// from one head to the next, so a connection allocates it once.
+    headers: Vec<(Span, Span)>,
+    /// Set when a head is recorded and cleared by the first view of it,
+    /// which debug builds compare with a tokenize of the bytes in hand. The
+    /// check runs once per head and not once per view, because a streamed
+    /// body views its head for every window and a tokenize on each one slows
+    /// dispatch enough to change what the timing tests measure. An atomic
+    /// and not a `Cell`, so that the type is `Sync` in both builds.
+    #[cfg(debug_assertions)]
+    unchecked: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Debug)]
+struct IndexedHead {
+    /// Length of the head the offsets were taken from.
+    len: usize,
+    method: Span,
+    /// `None` is the `/` that [`target_check`] gives an absolute-form
+    /// target with no path. That one is a literal, not a slice of the head.
+    target: Option<Span>,
+    version: Version,
+}
+
+impl HeadIndex {
+    /// Where the tokenizer found each part of the head at the front of
+    /// `buf`. `None` when a part cannot be placed, which leaves the index
+    /// describing nothing, and [`head_view`] then tokenizes instead.
+    fn place(
+        &mut self,
+        buf: &[u8],
+        len: usize,
+        req: &httparse::Request<'_, '_>,
+        version: Version,
+        target: &str,
+    ) -> Option<IndexedHead> {
+        self.headers.clear();
+        for h in req.headers.iter() {
+            self.headers.push((
+                Span::of(buf, h.name.as_bytes())?,
+                Span::of(buf, h.value)?,
+            ));
+        }
+        let target = match Span::of(buf, target.as_bytes()) {
+            Some(span) => Some(span),
+            None if target == "/" => None,
+            None => return None,
+        };
+        let method = Span::of(buf, req.method?.as_bytes())?;
+        #[cfg(debug_assertions)]
+        {
+            *self.unchecked.get_mut() = true;
+        }
+        Some(IndexedHead {
+            len,
+            method,
+            target,
+            version,
+        })
+    }
+
+    /// The head described, when `head` is that head by length.
+    fn described(&self, head: &[u8]) -> Option<&IndexedHead> {
+        self.head.as_ref().filter(|at| at.len == head.len())
+    }
+
+    /// The view of `head` rebuilt from the offsets, written through
+    /// `headers`. `None` when the index does not describe `head`.
+    pub(crate) fn view<'a, 'buf>(
+        &self,
+        head: &'buf [u8],
+        headers: &'a mut [HeaderView<'buf>; MAX_HEADERS],
+    ) -> Option<Head<'a>> {
+        let at = self.described(head)?;
+        let filled = headers.get_mut(..self.headers.len())?;
+        for (dst, (name, value)) in filled.iter_mut().zip(&self.headers) {
+            *dst = HeaderView {
+                name: name.text(head)?,
+                value: value.bytes(head)?,
+            };
+        }
+        let view = Head {
+            method: at.method.text(head)?,
+            target: match at.target {
+                Some(span) => span.text(head)?,
+                None => "/",
+            },
+            version: at.version,
+            headers: filled,
+        };
+        #[cfg(debug_assertions)]
+        if self
+            .unchecked
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            assert!(
+                tokenizes_to(head, &view),
+                "the head index disagrees with a parse of the same bytes"
+            );
+        }
+        Some(view)
+    }
+}
+
+/// Whether a tokenize of `head` gives `view`. Out of line so that its header
+/// arrays take stack only while it runs, and not in every frame of
+/// [`HeadIndex::view`].
+#[cfg(debug_assertions)]
+#[inline(never)]
+fn tokenizes_to(head: &[u8], view: &Head<'_>) -> bool {
+    matches!(
+        parse_head(head, &mut [HeaderView::EMPTY; MAX_HEADERS]),
+        Ok(Some(ref parsed)) if parsed == view
+    )
 }
 
 /// Whether `tok` is an `HTTP-version` (RFC 9110 sec. 2.5): the uppercase name
@@ -408,6 +576,35 @@ pub(crate) fn parse_head<'a, 'buf>(
     }))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Heads [`head_view`] tokenized on this thread because no index
+    /// described them.
+    pub(crate) static REPARSED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The [`Head`] view of `head`, rebuilt from `index` when it describes these
+/// bytes and tokenized by [`parse_head`] when it does not. Same verdicts as
+/// [`parse_head`]. A head the index describes but cannot rebuild is a codec
+/// bug and comes back `Ok(None)`, which the glue answers as one.
+///
+/// The tokenize is called from here and not from inside the view, so that
+/// path stays as shallow as a bare [`parse_head`]. It runs on a loom
+/// coroutine, whose whole stack is 32 KiB.
+pub(crate) fn head_view<'a, 'buf>(
+    index: &HeadIndex,
+    head: &'buf [u8],
+    headers: &'a mut [HeaderView<'buf>; MAX_HEADERS],
+) -> Result<Option<Head<'a>>, u16> {
+    if index.described(head).is_some() {
+        return Ok(index.view(head, headers));
+    }
+    #[cfg(test)]
+    REPARSED.with(|n| n.set(n.get() + 1));
+    parse_head(head, headers)
+}
+
 /// Whether raw head bytes name the `HEAD` method. `httparse` skips empty
 /// lines before the request line (RFC 9112 sec. 2.2 robustness), so this must
 /// skip them too: judging the method from byte 0 would call `\r\nHEAD ...`
@@ -422,16 +619,29 @@ pub(crate) fn method_is_head(mut head: &[u8]) -> bool {
     head.starts_with(b"HEAD ")
 }
 
-/// Tokenize a (possibly incomplete) request head into just the
-/// [`FrameFacts`] the framer consumes - same rules as [`parse_head`], no
-/// header-index allocation.
+/// [`frame_facts_indexed`] for a caller with no dispatch to follow. Those
+/// are the framer's 431 recheck on a connection that is already dying, the
+/// tests and the fuzz seam.
 pub(crate) fn frame_facts(buf: &[u8]) -> Result<Option<FrameFacts<'_>>, u16> {
+    frame_facts_indexed(buf, &mut HeadIndex::default())
+}
+
+/// Tokenize a (possibly incomplete) request head into the [`FrameFacts`]
+/// the framer consumes - same rules as [`parse_head`] - and record where
+/// its parts sit in `index` for [`head_view`]. Any verdict but a complete
+/// head leaves `index` describing nothing.
+pub(crate) fn frame_facts_indexed<'b>(
+    buf: &'b [u8],
+    index: &mut HeadIndex,
+) -> Result<Option<FrameFacts<'b>>, u16> {
+    index.head = None;
     let mut slots = [httparse::EMPTY_HEADER; MAX_HEADERS];
     // The target's form is screened here too: the framer runs first, so a
     // shape this server does not serve must die before its body is sized.
     let Some((req, len, version, target)) = tokenize(buf, &mut slots)? else {
         return Ok(None);
     };
+    index.head = index.place(buf, len, &req, version, target);
     Ok(Some(FrameFacts {
         len,
         target,
@@ -1455,5 +1665,69 @@ mod tests {
         // Error and partial verdicts agree too.
         assert_eq!(frame_facts(b"GET / HTTP/1.1\r\n\r\n").err(), Some(400));
         assert!(frame_facts(b"GET / HTT").expect("partial ok").is_none());
+    }
+
+    /// The view rebuilt from the index is the view a tokenize gives, over
+    /// the shapes where an offset could go wrong. Those are a target reduced
+    /// from absolute-form (a slice of the target, or a literal that is not
+    /// in the head at all), an empty value, empty lines ahead of the request
+    /// line, no headers, and body bytes behind the head.
+    #[test]
+    fn the_index_rebuilds_the_view_a_tokenize_gives() {
+        let cases: &[&[u8]] = &[
+            b"GET / HTTP/1.1\r\nHost: h\r\n\r\n",
+            b"GET /k?a=b HTTP/1.1\r\nHost: h\r\nX-Empty:\r\nX-A: 1\r\n\r\n",
+            b"GET http://h/k HTTP/1.1\r\nHost: h\r\n\r\n",
+            b"GET http://h HTTP/1.1\r\nHost: h\r\n\r\n",
+            b"OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n",
+            b"\r\n\r\nHEAD /k HTTP/1.1\r\nhost:  h  \r\n\r\n",
+            b"GET / HTTP/1.0\r\n\r\n",
+            b"PUT /k HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello",
+        ];
+        for buf in cases {
+            let mut index = HeadIndex::default();
+            let len = frame_facts_indexed(buf, &mut index)
+                .expect("parse ok")
+                .expect("complete")
+                .len;
+            let head = &buf[..len];
+            let mut viewed = [HeaderView::EMPTY; MAX_HEADERS];
+            let mut parsed = [HeaderView::EMPTY; MAX_HEADERS];
+            let view = index.view(head, &mut viewed);
+            assert!(view.is_some(), "no index for {buf:?}");
+            assert_eq!(
+                view,
+                parse_head(head, &mut parsed).expect("parse ok"),
+                "{buf:?}"
+            );
+        }
+    }
+
+    /// An index serves only the head it was taken from. Bytes of another
+    /// length are tokenized instead, and a tokenize that does not end in a
+    /// complete head leaves nothing behind to view through.
+    #[test]
+    fn an_index_describes_only_the_head_it_was_taken_from() {
+        let a = b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n";
+        let b = b"GET /other HTTP/1.1\r\nHost: h\r\n\r\n";
+        let mut index = HeadIndex::default();
+        frame_facts_indexed(a, &mut index).expect("parse ok");
+        let mut headers = [HeaderView::EMPTY; MAX_HEADERS];
+        assert!(index.view(a, &mut headers).is_some());
+        assert!(index.view(b, &mut headers).is_none());
+
+        // The fallback serves the bytes in hand, not the head indexed.
+        let before = REPARSED.get();
+        let head = head_view(&index, b, &mut headers)
+            .expect("parse ok")
+            .expect("complete");
+        assert_eq!(head.target, "/other");
+        assert_eq!(REPARSED.get(), before + 1);
+
+        for undone in [&b"GET /a HTT"[..], &b"GET /a HTTP/1.1\r\n\r\n"[..]] {
+            frame_facts_indexed(a, &mut index).expect("parse ok");
+            let _ = frame_facts_indexed(undone, &mut index);
+            assert!(index.view(a, &mut headers).is_none(), "{undone:?}");
+        }
     }
 }

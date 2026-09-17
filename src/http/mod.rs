@@ -133,17 +133,21 @@ pub use response::{HttpResponse, IntoBytes};
 /// Never part of the stable API.
 ///
 /// The targets under `fuzz/fuzz_targets/`: `http_frame` driving
-/// [`fuzz::drive_frame`], `http_head` driving [`fuzz::head_facts`], and
-/// `http_chunked` driving [`fuzz::chunk_scan`] then [`fuzz::chunk_decode`],
-/// each asserting the codec's delivery-safety and agreement invariants --
-/// seeded under `fuzz/corpus/` with the golden botocore shapes.
+/// [`fuzz::drive_frame`], `http_head` driving [`fuzz::head_facts`] and
+/// [`fuzz::index_agrees`], and `http_chunked` driving
+/// [`fuzz::chunk_scan`] then [`fuzz::chunk_decode`], each asserting the
+/// codec's delivery-safety and agreement invariants -- seeded under
+/// `fuzz/corpus/` with the golden botocore shapes.
 #[cfg(feature = "__fuzz")]
 pub mod fuzz {
     use std::borrow::Cow;
 
     use super::chunked::{self, ChunkScan};
     use super::framer::{HttpConfig, HttpConn, frame};
-    use super::head::{HeaderView, frame_facts};
+    use super::head::{
+        HeadIndex, HeaderView, MAX_HEADERS, frame_facts, frame_facts_indexed,
+        parse_head,
+    };
     use crate::net::Framing;
 
     /// Drive the framing state machine over `data`, feeding progressively
@@ -176,6 +180,22 @@ pub mod fuzz {
     ) -> Result<Option<(usize, bool, bool, &str)>, u16> {
         Ok(frame_facts(data)?
             .map(|f| (f.len, f.expects_continue, f.body.is_ok(), f.target)))
+    }
+
+    /// Whether the index the framer records for `data` describes the
+    /// complete head at its front and rebuilds the same view a tokenize of
+    /// that head gives, which is what dispatch relies on. `None` when `data`
+    /// holds no complete head.
+    pub fn index_agrees(data: &[u8]) -> Option<bool> {
+        let mut index = HeadIndex::default();
+        let len = frame_facts_indexed(data, &mut index).ok()??.len;
+        let head = &data[..len];
+        let mut viewed = [HeaderView::EMPTY; MAX_HEADERS];
+        let mut parsed = [HeaderView::EMPTY; MAX_HEADERS];
+        Some(
+            index.view(head, &mut viewed)
+                == parse_head(head, &mut parsed).ok().flatten(),
+        )
     }
 
     /// Resumable chunk scan over a body region: `Ok(Some(extent))` once the

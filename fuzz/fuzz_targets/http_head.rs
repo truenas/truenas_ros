@@ -8,10 +8,12 @@
 //! head dies with one of the codec's promised statuses; and — the production
 //! shape — the facts computed on the full buffer are reproduced exactly when
 //! the declared head bytes are re-parsed alone, because that is what the
-//! glue's dispatch does with the framer's `header_len`.
+//! glue's dispatch does with the framer's `header_len` when no index
+//! describes the head. When one does, dispatch rebuilds the view from the
+//! index instead, so that view must equal a tokenize of the same bytes.
 
 use libfuzzer_sys::fuzz_target;
-use truenas_ros::http::fuzz::head_facts;
+use truenas_ros::http::fuzz::{head_facts, index_agrees};
 
 fuzz_target!(|data: &[u8]| {
     match head_facts(data) {
@@ -48,6 +50,14 @@ fuzz_target!(|data: &[u8]| {
                     panic!("declared head no longer parses: {other:?}")
                 }
             }
+            // The glue views the head through the index the framer recorded.
+            // Every complete head must be described by its index, and the
+            // view must be the one a tokenize gives.
+            assert_eq!(
+                index_agrees(data),
+                Some(true),
+                "the head index and a parse of the head diverged"
+            );
         }
         // Need more bytes.
         Ok(None) => {}
