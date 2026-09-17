@@ -168,7 +168,7 @@ env:
   # (a streaming connection's `Whole` deliveries, and an `End` park
   # redriven as itself) - both pure dispatch, so both execute here; 36
   # with the streaming builder's zero-cap refusal, likewise pure
-  # construction.
+  # construction. The head index test makes it 37, pure dispatch again.
   #
   # The filter is `http::protocol::`, not `http::`, so most of the codec
   # is outside this number: tests added under `http::chunked`,
@@ -177,7 +177,7 @@ env:
   # count went up by one - if a band over the whole codec is wanted, it
   # is a new step with its own measured count, not a wider filter on
   # this one.
-  MIRI_HTTP_TESTS: "36"
+  MIRI_HTTP_TESTS: "37"
 
 jobs:
   miri:

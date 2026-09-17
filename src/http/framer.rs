@@ -34,7 +34,9 @@ use crate::net::Framing;
 use crate::net::server::{Response, ServerConfig};
 
 use super::chunked::{self, CHUNK_LINE_MAX, ChunkScan, TRAILER_LINE_MAX};
-use super::head::{BodyKind, frame_facts, method_is_head};
+use super::head::{
+    BodyKind, HeadIndex, frame_facts, frame_facts_indexed, method_is_head,
+};
 
 /// Fixed wire-overhead allowance for chunk framing on top of
 /// [`HttpConfig::max_body`]: a chunked message whose **wire** extent exceeds
@@ -366,6 +368,9 @@ pub struct HttpConn<U> {
     /// call site that knows the protocol above (an S3 front bounds a part
     /// at 5 GiB).
     pub(crate) stream_cap: Option<std::num::NonZeroU64>,
+    /// Where the parts of the last complete head sit, recorded by [`frame`]
+    /// so that dispatch does not tokenize the head a second time.
+    pub(crate) index: HeadIndex,
     /// The consumer's per-connection state, as returned by their accept
     /// handler.
     pub state: U,
@@ -392,6 +397,7 @@ impl<U> HttpConn<U> {
         Self {
             phase: Phase::Head,
             stream_cap: None,
+            index: HeadIndex::default(),
             state,
         }
     }
@@ -419,6 +425,7 @@ impl<U> HttpConn<U> {
         Self {
             phase: Phase::Head,
             stream_cap: Some(max_body_bytes),
+            index: HeadIndex::default(),
             state,
         }
     }
@@ -535,7 +542,7 @@ pub(crate) fn frame<U>(
             // method prefix is sound to read here - unlike at delivery,
             // where the dance may have consumed the head already.
             let head_only = method_is_head(buf);
-            match frame_facts(buf) {
+            match frame_facts_indexed(buf, &mut conn.index) {
                 Err(status) => {
                     // The parse-time screens (malformed, Host, version) run
                     // before the head-size cap can, because the cap needs
