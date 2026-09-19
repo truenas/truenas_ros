@@ -78,6 +78,7 @@ use crate::errno::{self, Errno};
 use crate::uring::page_size;
 use crate::uring::sys::*;
 use std::os::fd::RawFd;
+use std::time::{Duration, Instant};
 // The tail cell is `std`'s in production, reached through a raw pointer into
 // the mapping; under loom it is loom's, owned by value and carrying the model
 // state - the same split `uring::ring` makes, and for the same reason: the
@@ -107,12 +108,14 @@ fn publish_tail(cell: &AtomicU16, tail: u16) {
 
 /// Where one buffer id stands.
 ///
-/// There is no `Free` - allocated but neither posted nor lent - because
-/// nothing keeps a buffer in that state: a released buffer is either posted
-/// straight back or dropped, decided in one place.
+/// This is the id's standing with the kernel, not whether storage sits
+/// behind it: an `Absent` id may keep the buffer a shrink left it, so
+/// the next growth posts it without touching the allocator. What counts
+/// as allocated is what the ring holds or has lent; kept storage is
+/// neither, and [`BufRing::trim`] is where it goes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Slot {
-    /// No buffer allocated for this id.
+    /// Not in the ring and not lent, with or without storage behind it.
     Absent,
     /// Posted to the ring; the kernel may pick it at any time.
     Posted,
@@ -127,8 +130,10 @@ pub(crate) struct BufRing {
     ring: *mut IoUringBuf,
     /// Mapped length, for `munmap`.
     mapped: usize,
-    /// Storage per id, `None` where no buffer is allocated. Indexed by
-    /// buffer id, so it is `entries` long for the ring's whole life.
+    /// Storage per id, `None` where the id holds none. Indexed by buffer
+    /// id, so it is `entries` long for the ring's whole life. An `Absent`
+    /// id can hold storage: a shrink stops posting a buffer, it does not
+    /// free it.
     bufs: Vec<Option<Box<[u8]>>>,
     /// What each id is doing, parallel to `bufs`.
     slots: Vec<Slot>,
@@ -146,6 +151,10 @@ pub(crate) struct BufRing {
     absent: Vec<u16>,
     posted: u16,
     lent: u16,
+    /// The most lent at once since the last [`take_peak`](Self::take_peak).
+    /// What the sizing policy observes: a count read at an instant is zero
+    /// between two requests on a serial reactor, whatever the load.
+    peak: u16,
     /// Producer index. The kernel owns the consumer side and never writes
     /// this.
     tail: u16,
@@ -267,6 +276,7 @@ impl BufRing {
             target: 0,
             posted: 0,
             lent: 0,
+            peak: 0,
             tail: 0,
             ring_fd,
             #[cfg(test)]
@@ -421,6 +431,24 @@ impl BufRing {
         *slot = Slot::Lent;
         self.posted -= 1;
         self.lent += 1;
+        self.peak = self.peak.max(self.lent);
+    }
+
+    /// The most lent at once since the previous call, which is what the
+    /// sizing policy reads instead of the count at an instant.
+    pub(crate) fn take_peak(&mut self) -> u16 {
+        std::mem::replace(&mut self.peak, self.lent)
+    }
+
+    /// Give up the storage behind every id that is neither posted nor
+    /// lent. Safe at any time: the kernel can name only a posted id, and
+    /// a consumer only a lent one.
+    pub(crate) fn trim(&mut self) {
+        for (buf, slot) in self.bufs.iter_mut().zip(&self.slots) {
+            if *slot == Slot::Absent {
+                *buf = None;
+            }
+        }
     }
 
     /// Verify the kernel's pick and record the loan in one step: `bid` must
@@ -445,16 +473,17 @@ impl BufRing {
         Some(ptr)
     }
 
-    /// Hand `bid` back: re-post it, or drop it if the pool has shrunk past
-    /// what it needs.
+    /// Hand `bid` back: re-post it, or keep it out of the ring if the pool
+    /// has shrunk past what it needs.
     ///
     /// Owed exactly when a completion carried `IORING_CQE_F_BUFFER`; an op
     /// that never selected one - `-ENOBUFS` above all - must not call this,
     /// or the same id is posted twice and two ops write the same bytes.
     ///
-    /// **This is the only place a buffer is freed**, and it runs when the
-    /// kernel has already handed the buffer back, so there is no window in
-    /// which freed storage is still reachable from a descriptor.
+    /// **Nothing is freed here.** A surplus buffer keeps its storage and
+    /// stops being posted, so the next growth reaches for it before the
+    /// allocator; [`trim`](Self::trim) is where storage goes, and the
+    /// policy calls that only once the pool has stayed quiet.
     pub(crate) fn release(&mut self, bid: u16) {
         let i = usize::from(bid);
         let Some(slot) = self.slots.get_mut(i) else {
@@ -468,10 +497,9 @@ impl BufRing {
         *slot = Slot::Absent;
         self.lent -= 1;
         if self.allocated() >= self.target {
-            // THE FREE SITE, and the only one before `Drop`: the target
-            // fell while this buffer was out, so it is surplus and goes
-            // back to the allocator rather than to the ring.
-            self.bufs[i] = None;
+            // The target fell while this buffer was out, so it is surplus:
+            // it leaves the ring and keeps its storage. Pushed last so a
+            // growth takes it before an id that would need allocating.
             self.absent.push(bid);
             return;
         }
@@ -591,12 +619,20 @@ pub(crate) const BGID_FILE_BODY: u16 = 1;
 /// Buffers the pool starts with, before demand has said anything.
 const POOL_INITIAL: u16 = 8;
 
-/// Consecutive idle observations before the pool gives a buffer up. Growth
-/// is immediate and shrinking is not, because a pool that shrinks on the
+/// Consecutive idle rounds before the pool gives a buffer up. Growth is
+/// immediate and shrinking is not, because a pool that shrinks on the
 /// first quiet moment spends its life allocating and freeing across a
 /// workload that merely pauses - the same hysteresis hyper applies to its
 /// read sizes (`src/proto/h1/io.rs`), for the same reason.
 const SHRINK_AFTER: u8 = 4;
+
+/// The least time between two idle rounds. Observations arrive at every
+/// arm site, and one batch of completions re-arms several connections
+/// within microseconds, so rounds counted per call would let a single
+/// batch shrink a pool that is fully busy. A round is a second at least;
+/// on a silent pool the maintenance tick, five seconds apart, is what
+/// paces them.
+const IDLE_ROUND: Duration = Duration::from_secs(1);
 
 /// Sizing policy over one [`BufRing`].
 ///
@@ -608,8 +644,12 @@ const SHRINK_AFTER: u8 = 4;
 /// completion.
 pub(crate) struct BufPool {
     ring: BufRing,
-    /// Consecutive observations with nothing lent.
+    /// Consecutive idle rounds, each at least [`IDLE_ROUND`] after the
+    /// observation before it.
     idle_rounds: u8,
+    /// When the last observation that counted was made: a loan seen, or an
+    /// idle round taken.
+    marked: Instant,
 }
 
 impl BufPool {
@@ -636,6 +676,7 @@ impl BufPool {
                 POOL_INITIAL.min(entries.max(1)),
             )?,
             idle_rounds: 0,
+            marked: Instant::now(),
         })
     }
 
@@ -737,35 +778,54 @@ impl BufPool {
     ///
     /// **This lowers the target; the buffers follow as they cycle.** A
     /// posted descriptor cannot be retracted - the kernel owns that entry
-    /// until it picks it - so surplus storage is given up in
-    /// [`release`](BufRing::release), as each buffer comes back. A pool that
-    /// goes from busy to *quieter* therefore returns its surplus promptly,
-    /// and one that goes from busy to *silent* holds it until traffic
-    /// resumes, since nothing is cycling to hand anything back.
+    /// until it picks it - so surplus leaves the ring in
+    /// [`release`](BufRing::release), as each buffer comes back, and keeps
+    /// its storage there. The storage goes at the *next* shrink, through
+    /// [`trim`](BufRing::trim): a pool that was quiet long enough to
+    /// shrink twice has shown the surplus is not coming back, and a pool
+    /// that shrank once and then grew again posts what it kept without
+    /// reaching the allocator.
     ///
     /// That residue is bounded by the ring's ceiling and is no worse than
     /// what it replaces: a per-connection buffer that grew once stayed grown
     /// for the connection's life, and there were `pool_size` of them.
     ///
-    /// The sample is taken at the arm sites, where the arming connection
-    /// itself holds no claim by definition - so a single serial connection
-    /// reads zero loans every time and walks the target down to one, which
-    /// for that workload is the right size; any second active connection
-    /// resets the count. The cost lands on the first burst after a quiet
-    /// stretch, one honest `-ENOBUFS` round trip per doubling back up.
-    /// Sampling a high-water mark since the last call instead would never
-    /// read zero on any serving workload, and a pool that can never see
-    /// idle never shrinks - so the sample stays instantaneous.
+    /// **The observation is the peak since the last one, never the count
+    /// at an instant, and idle rounds are paced by time, never by call.**
+    /// The arm sites call this between two requests, when the arming
+    /// connection holds no claim by definition, and on a serial reactor
+    /// nothing else does either - so an instantaneous count reads zero
+    /// there under any load. The peak since the previous call reads the
+    /// arming connection's own loan at most arm sites; the exception is a
+    /// batch of completions that re-arms several connections back to
+    /// back, where no loan falls between two calls, and that is why a
+    /// quiet call counts as a round only once [`IDLE_ROUND`] has passed
+    /// since the last observation that counted. A pool therefore shrinks
+    /// only after `SHRINK_AFTER` rounds with no loan at all, which on a
+    /// silent pool the maintenance tick paces, and it holds its working
+    /// set for as long as it is working.
     pub(crate) fn rebalance(&mut self) {
-        if self.ring.lent() > 0 {
+        self.rebalance_at(Instant::now());
+    }
+
+    /// [`rebalance`](Self::rebalance) with the clock passed in, which is
+    /// what lets a test walk through idle rounds without waiting them out.
+    pub(crate) fn rebalance_at(&mut self, now: Instant) {
+        if self.ring.take_peak() > 0 {
             self.idle_rounds = 0;
+            self.marked = now;
             return;
         }
+        if now.saturating_duration_since(self.marked) < IDLE_ROUND {
+            return;
+        }
+        self.marked = now;
         self.idle_rounds = self.idle_rounds.saturating_add(1);
         if self.idle_rounds < SHRINK_AFTER {
             return;
         }
         self.idle_rounds = 0;
+        self.ring.trim();
         let want = (self.ring.target() / 2).max(1);
         if want < self.ring.target() {
             self.ring.set_target(want);
@@ -791,6 +851,21 @@ impl std::fmt::Debug for BufPool {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+
+    /// `rounds` quiet observations, each a full idle round after the last.
+    fn quiet(p: &mut BufPool, t: &mut Instant, rounds: u8) {
+        for _ in 0..rounds {
+            *t += IDLE_ROUND;
+            p.rebalance_at(*t);
+        }
+    }
+
+    /// The ids the ring currently holds posted.
+    fn posted_ids(p: &BufPool) -> Vec<u16> {
+        (0..p.ring.entries())
+            .filter(|&b| p.ring.slots[usize::from(b)] == Slot::Posted)
+            .collect()
+    }
     use crate::uring::ring::RingFd;
 
     /// A ring the kernel accepted, or `None` where io_uring is unavailable
@@ -1189,11 +1264,12 @@ mod tests {
         assert_eq!(br.allocated(), 4, "and the pool is unchanged");
     }
 
-    /// The mirror: over target, the release *does* give the storage up.
-    /// Together with the test above this pins exactly when the allocator is
-    /// reached.
+    /// The mirror: over target, the release leaves the ring and keeps its
+    /// storage, so a later growth reaches for it before the allocator.
+    /// Together with the test above this pins exactly when the allocator
+    /// is reached.
     #[test]
-    fn a_release_over_target_gives_the_storage_up() {
+    fn a_release_over_target_keeps_the_storage_unposted() {
         let Some(r) = ring() else {
             return;
         };
@@ -1202,7 +1278,16 @@ mod tests {
         assert!(br.bufs[2].is_some());
         br.set_target(1);
         br.release(2);
-        assert!(br.bufs[2].is_none(), "surplus storage freed, not re-posted");
+        assert!(br.bufs[2].is_some(), "surplus storage kept");
+        assert_eq!(br.slots[2], Slot::Absent, "and out of the ring");
+        assert_eq!(br.allocated(), 3, "not counted as held");
+        let allocs = br.allocs;
+        br.set_target(4);
+        assert_eq!(br.slots[2], Slot::Posted, "growth posts it again");
+        assert_eq!(br.allocs, allocs, "without reaching the allocator");
+        br.set_target(1);
+        br.trim();
+        assert!(br.bufs[2].is_some(), "a posted id is never trimmed");
     }
 
     /// Shrinking cannot take a buffer away from an op that holds it. The
@@ -1224,9 +1309,14 @@ mod tests {
             "a lent buffer is still there to be written into"
         );
         assert_eq!(br.lent(), 1);
-        // Only on release does it go, because only then is the kernel done.
+        // Only on release does it leave, because only then is the kernel
+        // done - and it leaves the ring, not the allocator.
         br.release(3);
-        assert!(br.addr_of(3).is_none(), "freed once handed back");
+        assert_eq!(br.lent(), 0);
+        assert_eq!(br.slots[3], Slot::Absent, "out of the ring once back");
+        assert_eq!(br.addr_of(3), Some(held), "storage kept for a regrowth");
+        br.trim();
+        assert!(br.addr_of(3).is_none(), "and gone only when trimmed");
     }
 
     /// Over-target buffers are given up as they come back, one release at a
@@ -1352,12 +1442,34 @@ mod tests {
         p.grow();
         let grown = p.target();
         assert!(grown > 1);
+        let mut t = Instant::now();
         for round in 0..SHRINK_AFTER - 1 {
-            p.rebalance();
+            quiet(&mut p, &mut t, 1);
             assert_eq!(p.target(), grown, "still aiming high at round {round}");
         }
-        p.rebalance();
+        quiet(&mut p, &mut t, 1);
         assert!(p.target() < grown, "lowered after the quiet spell");
+    }
+
+    /// Observations that arrive within one round count as one: a batch of
+    /// completions re-arms several connections back to back, and four
+    /// such arms are not four quiet spells.
+    #[test]
+    fn a_burst_of_observations_within_a_round_counts_once() {
+        let Some(r) = ring() else {
+            return;
+        };
+        let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
+        p.grow();
+        p.grow();
+        let grown = p.target();
+        let mut t = Instant::now() + IDLE_ROUND;
+        for _ in 0..SHRINK_AFTER * 4 {
+            p.rebalance_at(t);
+        }
+        assert_eq!(p.target(), grown, "one round, however often it asked");
+        quiet(&mut p, &mut t, SHRINK_AFTER);
+        assert!(p.target() < grown, "paced rounds still shrink it");
     }
 
     /// Lowering the target does not free anything by itself - a posted
@@ -1374,9 +1486,7 @@ mod tests {
         p.grow();
         p.grow();
         let grown = p.allocated();
-        for _ in 0..SHRINK_AFTER {
-            p.rebalance();
-        }
+        quiet(&mut p, &mut Instant::now(), SHRINK_AFTER);
         assert!(p.target() < grown, "aiming lower");
         assert_eq!(p.allocated(), grown, "but still holding it all");
         // One cycle per buffer is what hands the surplus back.
@@ -1386,6 +1496,89 @@ mod tests {
         }
         assert_eq!(p.allocated(), p.target(), "settled where it was aiming");
         assert!(p.allocated() < grown, "and that is fewer than before");
+    }
+
+    /// A pool that shrinks and then grows again posts what it kept: the
+    /// allocator is reached once per buffer for the pool's whole life
+    /// unless a second quiet spell trims the surplus first.
+    #[test]
+    fn a_shrink_and_a_regrowth_reach_the_allocator_not_once() {
+        let Some(r) = ring() else {
+            return;
+        };
+        let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
+        p.grow();
+        p.grow();
+        let grown = p.allocated();
+        let allocs = p.ring.allocs;
+        quiet(&mut p, &mut Instant::now(), SHRINK_AFTER);
+        for bid in 0..grown {
+            assert!(p.take_lent(bid).is_some(), "a posted id lends");
+            p.release(bid);
+        }
+        assert!(p.allocated() < grown, "the surplus left the ring");
+        let kept = p.ring.bufs.iter().filter(|b| b.is_some()).count();
+        assert_eq!(kept, usize::from(grown), "and kept its storage");
+        // Every one of them lent: the shortage that grows the pool back.
+        for bid in posted_ids(&p) {
+            assert!(p.take_lent(bid).is_some(), "a posted id lends");
+        }
+        assert!(p.grow(), "a dry ring grows");
+        assert_eq!(p.allocated(), grown, "back to where it was");
+        assert_eq!(p.ring.allocs, allocs, "with nothing newly allocated");
+    }
+
+    /// Storage a shrink left behind goes at the next shrink, not before:
+    /// two quiet spells in a row are what say the surplus is not wanted.
+    #[test]
+    fn a_second_quiet_spell_trims_what_the_first_kept() {
+        let Some(r) = ring() else {
+            return;
+        };
+        let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
+        p.grow();
+        p.grow();
+        let grown = p.allocated();
+        let mut t = Instant::now();
+        quiet(&mut p, &mut t, SHRINK_AFTER);
+        for bid in 0..grown {
+            assert!(p.take_lent(bid).is_some(), "a posted id lends");
+            p.release(bid);
+        }
+        let held =
+            |p: &BufPool| p.ring.bufs.iter().filter(|b| b.is_some()).count();
+        assert_eq!(held(&p), usize::from(grown), "kept through the first");
+        // The cycle's loans are activity, seen by the next observation.
+        quiet(&mut p, &mut t, 1);
+        quiet(&mut p, &mut t, SHRINK_AFTER - 1);
+        assert_eq!(held(&p), usize::from(grown), "and until the second lands");
+        quiet(&mut p, &mut t, 1);
+        assert_eq!(
+            held(&p),
+            usize::from(p.allocated()),
+            "then only what the ring holds is backed"
+        );
+    }
+
+    /// The observation is the peak since the last one: a loan taken and
+    /// returned between two observations still counts as activity, which
+    /// is what the arm sites see on every request.
+    #[test]
+    fn a_loan_returned_before_the_observation_still_counts() {
+        let Some(r) = ring() else {
+            return;
+        };
+        let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
+        p.grow();
+        let grown = p.target();
+        let mut t = Instant::now();
+        for _ in 0..SHRINK_AFTER * 3 {
+            assert!(p.take_lent(0).is_some(), "a posted id lends");
+            p.release(0);
+            t += IDLE_ROUND;
+            p.rebalance_at(t);
+        }
+        assert_eq!(p.target(), grown, "never lowered between requests");
     }
 
     /// Activity resets the count, so a pool that is busy every so often
@@ -1398,13 +1591,13 @@ mod tests {
         let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
         p.grow();
         let grown = p.target();
+        let mut t = Instant::now();
         for _ in 0..SHRINK_AFTER * 3 {
-            for _ in 0..SHRINK_AFTER - 1 {
-                p.rebalance();
-            }
+            quiet(&mut p, &mut t, SHRINK_AFTER - 1);
             // One buffer in use is enough to count as busy.
             assert!(p.take_lent(0).is_some(), "a posted id lends");
-            p.rebalance();
+            t += IDLE_ROUND;
+            p.rebalance_at(t);
             p.release(0);
         }
         assert_eq!(p.target(), grown, "never lowered while it was working");
@@ -1431,9 +1624,7 @@ mod tests {
         // Idle it down first: the target falls, and the surplus is given
         // up only in `release`, so nothing posted cycles and the pool goes
         // on holding what it had.
-        for _ in 0..SHRINK_AFTER {
-            p.rebalance();
-        }
+        quiet(&mut p, &mut Instant::now(), SHRINK_AFTER);
         let allocated = p.allocated();
         assert!(
             p.target() < allocated,
@@ -1470,9 +1661,7 @@ mod tests {
             return;
         };
         let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
-        for _ in 0..SHRINK_AFTER * 8 {
-            p.rebalance();
-        }
+        quiet(&mut p, &mut Instant::now(), SHRINK_AFTER * 8);
         assert!(p.target() >= 1, "never aims at nothing");
         assert!(p.free() >= 1, "and what it keeps is available");
     }
