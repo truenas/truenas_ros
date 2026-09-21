@@ -9,7 +9,6 @@ use crate::errno::{self, Errno};
 use crate::net::core::conn::{Op, RecvOutcome, pack};
 use crate::net::core::handles::stat;
 use crate::net::core::protocol::{CloseReason, Framing};
-#[cfg(feature = "net-server")]
 use crate::uring::sys::*;
 use std::os::fd::RawFd;
 
