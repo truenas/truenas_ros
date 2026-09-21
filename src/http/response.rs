@@ -10,7 +10,12 @@
 //! values with any byte outside RFC 9110's field-value grammar are dropped
 //! too, so handler-echoed input can never split a response, and statuses
 //! that don't fit the three-digit
-//! status-line grammar are replaced with 500.
+//! status-line grammar are replaced with 500. The screen runs once per
+//! field: [`HttpResponse::header`] applies it as the field is added, and
+//! a consumer that builds its fields ahead of the response applies it
+//! through [`ScreenedHeader::new`], which is the only way to make the
+//! value [`HttpResponse::header_screened`] stores unscreened — so there
+//! is no path onto the wire that the rule has not seen.
 
 use std::borrow::Cow;
 
@@ -118,10 +123,53 @@ impl IntoBytes for Cow<'static, [u8]> {
         self
     }
 }
+impl IntoBytes for Cow<'static, str> {
+    fn into_bytes(self) -> Cow<'static, [u8]> {
+        match self {
+            Cow::Borrowed(s) => Cow::Borrowed(s.as_bytes()),
+            Cow::Owned(s) => Cow::Owned(s.into()),
+        }
+    }
+}
 
 /// A response header pair: name and undecoded value, both `Cow<'static, _>`
 /// so a response built from literals borrows rather than allocates.
 pub(crate) type Header = (Cow<'static, str>, Cow<'static, [u8]>);
+
+/// A response field that passed the codec's screen ([`header_pair_ok`])
+/// when it was built, so [`HttpResponse::header_screened`] stores it
+/// without screening it again. [`ScreenedHeader::new`] is the only
+/// constructor: a value of this type is the proof, and a consumer that
+/// keeps its fields in this type keeps that proof with them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenedHeader {
+    name: Cow<'static, str>,
+    value: Cow<'static, [u8]>,
+}
+
+impl ScreenedHeader {
+    /// Screen `name: value`; `None` is a pair the codec would not carry.
+    /// A `&'static str` name and a static value are stored as borrows.
+    #[inline]
+    pub fn new(
+        name: impl Into<Cow<'static, str>>,
+        value: impl IntoBytes,
+    ) -> Option<Self> {
+        let name = name.into();
+        let value = value.into_bytes();
+        header_pair_ok(&name, &value).then_some(ScreenedHeader { name, value })
+    }
+
+    /// The field name, as given.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The field value, undecoded.
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+}
 
 /// Inline capacity for [`Headers`]. Every response this codec emits carries
 /// well under this many fields, so the common case never touches the heap.
@@ -226,10 +274,17 @@ impl HttpResponse {
     ) -> Self {
         let name = name.into();
         let value = value.into_bytes();
-        if is_token(&name) && !has_field_break(&value) && !is_codec_owned(&name)
-        {
+        if header_pair_ok(&name, &value) {
             self.headers.push((name, value));
         }
+        self
+    }
+
+    /// Store a field the screen already admitted — a [`ScreenedHeader`]
+    /// is only ever the product of [`header_pair_ok`] — without walking
+    /// its name and value a second time.
+    pub fn header_screened(mut self, field: ScreenedHeader) -> Self {
+        self.headers.push((field.name, field.value));
         self
     }
 
@@ -329,6 +384,19 @@ impl HttpResponse {
     pub fn status(&self) -> u16 {
         self.status
     }
+}
+
+/// Whether the codec carries `name: value` as a response field: `name` is
+/// a non-empty RFC 9110 token that the codec does not write itself, and
+/// `value` has no byte that would end the field line early (CR, LF, NUL,
+/// the other C0 controls, or DEL). The one rule [`HttpResponse::header`]
+/// screens with and [`ScreenedHeader::new`] proves, exported so a
+/// caller's own boundary can apply the codec's rule rather than a copy
+/// that can drift from it. Inlined because that boundary is in another
+/// crate and runs once per field of every response.
+#[inline]
+pub fn header_pair_ok(name: &str, value: &[u8]) -> bool {
+    is_token(name) && !is_codec_owned(name) && !has_field_break(value)
 }
 
 /// Headers the serializer emits itself; consumer copies are dropped.
@@ -435,13 +503,16 @@ fn write_head(
     date: &[u8],
     conn: ConnHeader,
 ) {
-    use std::io::Write;
-
+    // Bytes pushed directly rather than `write!`: the formatter's
+    // per-call setup and padding path cost more than the status line
+    // and the numbers themselves, once per response on the reactor
+    // thread.
     let bodyless = status_is_bodyless(resp.status);
-    // Vec<u8> Write is infallible; unwraps here cannot fire.
-    write!(out, "HTTP/1.1 {} {}\r\n", resp.status, reason(resp.status))
-        .unwrap();
-    out.extend_from_slice(b"Date: ");
+    out.extend_from_slice(b"HTTP/1.1 ");
+    push_decimal(out, u64::from(resp.status));
+    out.push(b' ');
+    out.extend_from_slice(reason(resp.status).as_bytes());
+    out.extend_from_slice(b"\r\nDate: ");
     out.extend_from_slice(date);
     out.extend_from_slice(b"\r\n");
     if !bodyless {
@@ -453,7 +524,9 @@ fn write_head(
             Some(len) if head_only => len,
             _ => resp.body.declared_len(),
         };
-        write!(out, "Content-Length: {declared}\r\n").unwrap();
+        out.extend_from_slice(b"Content-Length: ");
+        push_decimal(out, declared);
+        out.extend_from_slice(b"\r\n");
     }
     match conn {
         ConnHeader::None => {}
@@ -463,11 +536,27 @@ fn write_head(
         ConnHeader::Close => out.extend_from_slice(b"Connection: close\r\n"),
     }
     for (name, value) in resp.headers.iter() {
-        write!(out, "{name}: ").unwrap();
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
         out.extend_from_slice(value);
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"\r\n");
+}
+
+/// Append `n` in decimal.
+fn push_decimal(out: &mut Vec<u8>, mut n: u64) {
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[i..]);
 }
 
 /// A serialized response, ready to hand the reactor as a reply.
@@ -610,6 +699,80 @@ mod tests {
              x-amz-request-id: abc123\r\n\
              \r\n\
              hello"
+        );
+    }
+
+    /// A field screened ahead of its response reaches the wire exactly
+    /// as one screened at `header` does, and the screen it passed is the
+    /// same one: what `header` drops, `ScreenedHeader::new` refuses.
+    #[test]
+    fn a_screened_field_is_carried_and_an_unscreenable_one_is_refused() {
+        let screened = ScreenedHeader::new("x-amz-request-id", "abc123")
+            .expect("a token name and a clean value");
+        assert_eq!(screened.name(), "x-amz-request-id");
+        assert_eq!(screened.value(), b"abc123");
+        let via_screen = HttpResponse::new(200)
+            .header_screened(screened)
+            .body("hello");
+        let via_header = HttpResponse::new(200)
+            .header("x-amz-request-id", "abc123")
+            .body("hello");
+        assert_eq!(
+            serialize(&via_screen, false, &date(), ConnHeader::None),
+            serialize(&via_header, false, &date(), ConnHeader::None)
+        );
+        for (name, value) in [
+            ("content-length", "0"),
+            ("Transfer-Encoding", "chunked"),
+            ("x y", "1"),
+            ("", "1"),
+            ("x-amz-meta-bad", "a\r\nx-injected: 1"),
+            ("x-amz-meta-nul", "a\0b"),
+        ] {
+            assert!(
+                ScreenedHeader::new(name, value).is_none(),
+                "{name:?}: {value:?}"
+            );
+            assert!(!header_pair_ok(name, value.as_bytes()), "{name:?}");
+        }
+        // Static inputs stay borrows; the value keeps HTAB and obs-text.
+        let kept = ScreenedHeader::new(Cow::Borrowed("x"), "a\tb\u{e9}")
+            .expect("field content");
+        assert!(matches!(kept.name, Cow::Borrowed(_)));
+        assert_eq!(kept.value(), "a\tb\u{e9}".as_bytes());
+    }
+
+    /// The hand-rolled decimal matches `std` at every edge the head
+    /// renders: the smallest and largest lengths, a length that fills the
+    /// digit buffer, and a three-digit status.
+    #[test]
+    fn push_decimal_matches_std_at_the_edges() {
+        for n in [
+            0u64,
+            1,
+            9,
+            10,
+            99,
+            100,
+            4096,
+            u64::from(u32::MAX),
+            10_000_000_000_000_000_000,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            let mut out = Vec::new();
+            push_decimal(&mut out, n);
+            assert_eq!(text(&out), n.to_string(), "{n}");
+        }
+        let resp = HttpResponse::new(999).body("");
+        let out = serialize(&resp, true, &date(), ConnHeader::None);
+        assert!(text(&out).starts_with("HTTP/1.1 999 "), "{}", text(&out));
+        let resp = HttpResponse::new(200).head_content_length(u64::MAX);
+        let out = serialize(&resp, true, &date(), ConnHeader::None);
+        assert!(
+            text(&out).contains("Content-Length: 18446744073709551615\r\n"),
+            "{}",
+            text(&out)
         );
     }
 
