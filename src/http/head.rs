@@ -9,6 +9,8 @@
 //! can never disagree about what a head means. [`parse_head`] is the full
 //! tokenize behind [`head_view`] for a head no index describes.
 
+use std::mem::MaybeUninit;
+
 /// Header-count cap handed to `httparse`. Sized for S3: AWS caps user
 /// metadata at 2 KiB total, but short keys can spread that budget across
 /// ~130 `x-amz-meta-*` fields, on top of the auth/content/standard fields a
@@ -339,13 +341,18 @@ fn version_status(buf: &[u8]) -> Option<u16> {
 /// caller applies. `Ok(None)` means "need more bytes"; `Err(status)` is the
 /// response status the connection should die with (400 malformed / Host
 /// rules, 431 too many headers, 505 unsupported version).
+///
+/// `slots` is uninitialized on purpose: httparse writes only the slots it
+/// fills, and `req.headers` is that prefix. Initializing all
+/// `MAX_HEADERS` first is a 5 KiB stack fill per head, on the reactor
+/// thread, for slots a typical head never reaches.
 #[allow(clippy::type_complexity)] // one parse's outputs, not an API
 fn tokenize<'s, 'b>(
     buf: &'b [u8],
-    slots: &'s mut [httparse::Header<'b>; MAX_HEADERS],
+    slots: &'s mut [MaybeUninit<httparse::Header<'b>>; MAX_HEADERS],
 ) -> Result<Option<(httparse::Request<'s, 'b>, usize, Version, &'b str)>, u16> {
-    let mut req = httparse::Request::new(&mut slots[..]);
-    let len = match req.parse(buf) {
+    let mut req = httparse::Request::new(&mut []);
+    let len = match req.parse_with_uninit_headers(buf, &mut slots[..]) {
         Ok(httparse::Status::Complete(len)) => len,
         Ok(httparse::Status::Partial) => return Ok(None),
         Err(httparse::Error::TooManyHeaders) => return Err(431),
@@ -559,7 +566,7 @@ pub(crate) fn parse_head<'a, 'buf>(
     buf: &'buf [u8],
     headers: &'a mut [HeaderView<'buf>; MAX_HEADERS],
 ) -> Result<Option<Head<'a>>, u16> {
-    let mut slots = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut slots = [const { MaybeUninit::uninit() }; MAX_HEADERS];
     let Some((req, _len, version, target)) = tokenize(buf, &mut slots)? else {
         return Ok(None);
     };
@@ -635,7 +642,7 @@ pub(crate) fn frame_facts_indexed<'b>(
     index: &mut HeadIndex,
 ) -> Result<Option<FrameFacts<'b>>, u16> {
     index.head = None;
-    let mut slots = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut slots = [const { MaybeUninit::uninit() }; MAX_HEADERS];
     // The target's form is screened here too: the framer runs first, so a
     // shape this server does not serve must die before its body is sized.
     let Some((req, len, version, target)) = tokenize(buf, &mut slots)? else {

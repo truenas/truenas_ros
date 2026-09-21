@@ -65,10 +65,12 @@
 //!   botocore requests have), `Host` enforcement (missing on HTTP/1.1, or
 //!   duplicated -> 400), head-size cap (431), body cap (413), chunk-line and
 //!   trailer caps (400/431), version check (505). On the write side, the
-//!   response-splitting guards: non-token header names and values with a
-//!   byte outside RFC 9110's field-value grammar are dropped, out-of-range
-//!   statuses become 500, and bodyless
-//!   statuses (1xx/204/304) never carry content.
+//!   response-splitting guards: non-token header names, names the codec
+//!   writes itself, and values with a byte outside RFC 9110's field-value
+//!   grammar are dropped — at [`HttpResponse::header`], or at
+//!   [`ScreenedHeader::new`] for a field built ahead of its response —
+//!   out-of-range statuses become 500, and bodyless statuses
+//!   (1xx/204/304) never carry content.
 //!
 //! # Scope (v1)
 //!
@@ -126,7 +128,7 @@ pub use protocol::{
 };
 #[cfg(feature = "uring-fs")]
 pub use protocol::{protocol_fs, protocol_streaming_fs};
-pub use response::{HttpResponse, IntoBytes};
+pub use response::{HttpResponse, IntoBytes, ScreenedHeader, header_pair_ok};
 
 /// Pure codec entry points exposed to the fuzz crate (`fuzz/`) under `__fuzz`
 /// only - the `http` analogue of the net stack's `frame_step` re-export.
