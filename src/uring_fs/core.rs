@@ -847,6 +847,9 @@ impl WallClock {
 pub(crate) struct FsCore {
     ops: Vec<SlotEntry<FsOpEntry>>,
     op_free: Vec<u32>,
+    /// Reply-path pump reads in flight that select from a provided-buffer
+    /// ring: what the body pool's `grow` subtracts from its free count.
+    pump_selecting: u32,
     /// This reactor's one blocking-work pool (shared with off-loop
     /// [`QueryPool`](super::query_dir::QueryPool)s), spawned on first use.
     pool: Arc<SharedPool>,
@@ -951,6 +954,7 @@ impl FsCore {
                 })
                 .collect(),
             op_free: (0..op_slots).rev().collect(),
+            pump_selecting: 0,
             pool: SharedPool::new(offload),
             completions: Arc::new(Mutex::new(VecDeque::new())),
             offload_reg: HashMap::new(),
@@ -1544,6 +1548,12 @@ impl FsCore {
         !self.op_free.is_empty()
     }
 
+    /// Selecting pump reads in flight, for the body pool's `grow`.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    pub(crate) fn pump_selecting(&self) -> u32 {
+        self.pump_selecting
+    }
+
     #[cfg(all(test, not(loom)))]
     pub(crate) fn op_free_len_for_test(&self) -> usize {
         self.op_free.len()
@@ -1672,6 +1682,9 @@ impl FsCore {
         if let Err(err) = staged {
             self.fail_op(eng, op_slot, err);
             return Err(err);
+        }
+        if bgid.is_some() {
+            self.pump_selecting += 1;
         }
         Ok(())
     }
@@ -2731,6 +2744,11 @@ impl FsCore {
             result = Err(Errno::EIO);
         }
 
+        // A selecting pump read (no owned buffer) is done with the ring,
+        // whatever it answered - `-ENOBUFS` and `-ECANCELED` included.
+        if matches!(waiter, Some(FsWaiter::Pump { .. })) && bufs.is_empty() {
+            self.pump_selecting = self.pump_selecting.saturating_sub(1);
+        }
         match waiter {
             Some(FsWaiter::Channel(tx)) => {
                 let _ = tx.send(FsOutcome::new(result, bufs, file, stat));

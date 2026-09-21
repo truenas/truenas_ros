@@ -759,9 +759,14 @@ impl BufPool {
     /// idle stretch may have lowered the target below that count while they
     /// were out; doubling the *target* would then land at or under what is
     /// already allocated and add nothing.
-    pub(crate) fn grow(&mut self) -> bool {
+    pub(crate) fn grow(&mut self, armed: u32) -> bool {
         self.idle_rounds = 0;
-        if self.ring.free() > 0 {
+        // `free` records a pick only at its completion. A selecting read
+        // punted to io-wq holds its buffer for the whole wait before that,
+        // so `armed` (such reads in flight) is subtracted first: a free
+        // count no larger than it is a shortage the kernel can see and
+        // this side cannot.
+        if u32::from(self.ring.free()) > armed {
             return true;
         }
         let allocated = self.ring.allocated();
@@ -895,6 +900,30 @@ mod tests {
         drop(br); // unregisters; a leak would fail the next registration
         let again = BufRing::new(r.raw_fd(), 0, 4, 64, 4);
         assert!(again.is_ok(), "the id was freed: {again:?}");
+    }
+
+    /// The shortage the free count cannot see: every free buffer is
+    /// already spoken for by a selecting read still in flight. `grow`
+    /// used to answer that with "free buffers, nothing to do", and the
+    /// re-armed read met the same empty ring - a spin, not a wait.
+    #[test]
+    fn a_shortage_masked_by_armed_reads_still_grows() {
+        let Some(r) = ring() else {
+            return;
+        };
+        let mut p = BufPool::new(r.raw_fd(), 1, 64, 64).expect("registers");
+        assert_eq!(p.allocated(), POOL_INITIAL);
+        assert!(p.grow(0), "nothing armed: the free buffers answer it");
+        assert_eq!(p.allocated(), POOL_INITIAL, "and nothing is added");
+        assert!(
+            p.grow(u32::from(POOL_INITIAL)),
+            "every free buffer is armed"
+        );
+        assert_eq!(
+            p.allocated(),
+            POOL_INITIAL * 2,
+            "so it is real, and doubles"
+        );
     }
 
     /// A buffer length the descriptor cannot carry is refused at
@@ -1367,7 +1396,7 @@ mod tests {
         for b in 0..start {
             assert!(p.take_lent(b).is_some(), "lend {b}");
         }
-        assert!(p.grow(), "room to grow");
+        assert!(p.grow(0), "room to grow");
         assert_eq!(p.allocated(), start * 2, "doubled");
     }
 
@@ -1386,17 +1415,17 @@ mod tests {
         };
         let mut p = BufPool::new(r.raw_fd(), 0, 64, 4).expect("registers");
         assert_eq!(p.allocated(), 4, "born at the ceiling");
-        assert!(p.grow(), "free buffers at the ceiling answer a shortage");
+        assert!(p.grow(0), "free buffers at the ceiling answer a shortage");
         assert_eq!(p.allocated(), 4, "without growing past it");
         for b in 0..4 {
             assert!(p.take_lent(b).is_some(), "lend {b}");
         }
         assert!(
-            !p.grow(),
+            !p.grow(0),
             "everything lent and nowhere to grow is exhaustion"
         );
         p.release(0);
-        assert!(p.grow(), "one freed buffer answers the next shortage");
+        assert!(p.grow(0), "one freed buffer answers the next shortage");
     }
 
     /// One burst grows the pool once, not once per queued completion.
@@ -1416,11 +1445,11 @@ mod tests {
         for b in 0..start {
             assert!(p.take_lent(b).is_some(), "lend {b}");
         }
-        assert!(p.grow(), "a genuine shortage grows");
+        assert!(p.grow(0), "a genuine shortage grows");
         let after = p.allocated();
         assert_eq!(after, start * 2, "one doubling");
         for i in 0..16 {
-            assert!(p.grow(), "queued completion {i} finds the answer");
+            assert!(p.grow(0), "queued completion {i} finds the answer");
         }
         assert_eq!(
             p.allocated(),
@@ -1438,8 +1467,8 @@ mod tests {
             return;
         };
         let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
-        p.grow();
-        p.grow();
+        p.grow(0);
+        p.grow(0);
         let grown = p.target();
         assert!(grown > 1);
         let mut t = Instant::now();
@@ -1460,8 +1489,8 @@ mod tests {
             return;
         };
         let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
-        p.grow();
-        p.grow();
+        p.grow(0);
+        p.grow(0);
         let grown = p.target();
         let mut t = Instant::now() + IDLE_ROUND;
         for _ in 0..SHRINK_AFTER * 4 {
@@ -1483,8 +1512,8 @@ mod tests {
             return;
         };
         let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
-        p.grow();
-        p.grow();
+        p.grow(0);
+        p.grow(0);
         let grown = p.allocated();
         quiet(&mut p, &mut Instant::now(), SHRINK_AFTER);
         assert!(p.target() < grown, "aiming lower");
@@ -1507,8 +1536,8 @@ mod tests {
             return;
         };
         let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
-        p.grow();
-        p.grow();
+        p.grow(0);
+        p.grow(0);
         let grown = p.allocated();
         let allocs = p.ring.allocs;
         quiet(&mut p, &mut Instant::now(), SHRINK_AFTER);
@@ -1523,7 +1552,7 @@ mod tests {
         for bid in posted_ids(&p) {
             assert!(p.take_lent(bid).is_some(), "a posted id lends");
         }
-        assert!(p.grow(), "a dry ring grows");
+        assert!(p.grow(0), "a dry ring grows");
         assert_eq!(p.allocated(), grown, "back to where it was");
         assert_eq!(p.ring.allocs, allocs, "with nothing newly allocated");
     }
@@ -1536,8 +1565,8 @@ mod tests {
             return;
         };
         let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
-        p.grow();
-        p.grow();
+        p.grow(0);
+        p.grow(0);
         let grown = p.allocated();
         let mut t = Instant::now();
         quiet(&mut p, &mut t, SHRINK_AFTER);
@@ -1569,7 +1598,7 @@ mod tests {
             return;
         };
         let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
-        p.grow();
+        p.grow(0);
         let grown = p.target();
         let mut t = Instant::now();
         for _ in 0..SHRINK_AFTER * 3 {
@@ -1589,7 +1618,7 @@ mod tests {
             return;
         };
         let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
-        p.grow();
+        p.grow(0);
         let grown = p.target();
         let mut t = Instant::now();
         for _ in 0..SHRINK_AFTER * 3 {
@@ -1643,7 +1672,7 @@ mod tests {
         );
 
         assert!(
-            p.grow(),
+            p.grow(0),
             "a dry ring holding {allocated} buffers reported no growth"
         );
         assert!(
