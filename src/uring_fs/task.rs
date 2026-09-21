@@ -1983,8 +1983,8 @@ mod tests {
         TAG_CANCEL, TAG_WAKE, deliver_embedded, deliver_pool_completions,
     };
     use crate::uring_fs::{
-        Anchor, Leaf, OffloadBounds, OpenStep, Personality, RwFlags, StepPath,
-        ZfsAttr,
+        AlignedBuf, Anchor, Leaf, OffloadBounds, OpenStep, Personality,
+        RwFlags, StepPath, ZfsAttr,
     };
     use std::cell::Cell as StdCell;
     use std::cell::RefCell as StdRefCell;
@@ -3313,6 +3313,106 @@ mod tests {
             "fired early: {:?}",
             started.elapsed()
         );
+    }
+
+    /// A pinned write reads from the caller's own storage - an
+    /// `AlignedBuf` here, page-aligned as a direct write needs - and the
+    /// pin comes back to the caller (through its `Drop`) before the
+    /// completion runs: what the file holds is the buffer's filled
+    /// prefix, and by the time the callback sees the result the storage
+    /// is already free to reuse.
+    #[test]
+    fn a_pinned_write_lands_the_buffer_and_releases_it_first() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let anchor = Anchor::open(dir.path()).expect("anchor");
+        let payload: Vec<u8> =
+            (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let done = Rc::new(StdCell::new(false));
+        // Where the pin goes when the op drops it: `Some` once released.
+        let home: Rc<StdCell<Option<AlignedBuf>>> = Rc::new(StdCell::new(None));
+
+        struct Pin {
+            buf: Option<AlignedBuf>,
+            home: Rc<StdCell<Option<AlignedBuf>>>,
+        }
+        impl AsRef<[u8]> for Pin {
+            fn as_ref(&self) -> &[u8] {
+                self.buf.as_ref().map_or(&[], AsRef::as_ref)
+            }
+        }
+        impl Drop for Pin {
+            fn drop(&mut self) {
+                self.home.set(self.buf.take());
+            }
+        }
+
+        {
+            let (done, payload, home) =
+                (Rc::clone(&done), payload.clone(), Rc::clone(&home));
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |t| async move {
+                let opened = t
+                    .fut(|c, cb| {
+                        c.open(who, &anchor, c"pinned.bin", creating(), cb)
+                    })
+                    .await;
+                let file = opened.file().expect("open");
+                let mut buf = AlignedBuf::new(1 << 20).expect("allocates");
+                assert_eq!(buf.fill(&payload), payload.len(), "fits");
+                let pin = Pin {
+                    buf: Some(buf),
+                    home: Rc::clone(&home),
+                };
+                let wrote = t
+                    .fut(|c, cb| {
+                        c.pwritev2_pinned(
+                            who,
+                            file.clone(),
+                            pin,
+                            0,
+                            RwFlags::empty(),
+                            cb,
+                        )
+                    })
+                    .await;
+                assert_eq!(
+                    wrote.result().expect("write") as usize,
+                    payload.len(),
+                    "the filled prefix, not the capacity"
+                );
+                let released = home.take();
+                let released = released
+                    .expect("the pin was dropped before the completion ran");
+                assert_eq!(
+                    released.len(),
+                    payload.len(),
+                    "and came home intact"
+                );
+                let read = t
+                    .fut(|c, cb| {
+                        c.preadv2(
+                            who,
+                            file.clone(),
+                            vec![vec![0u8; payload.len() + 1]],
+                            0,
+                            RwFlags::empty(),
+                            cb,
+                        )
+                    })
+                    .await;
+                assert_eq!(
+                    read.result().expect("read") as usize,
+                    payload.len(),
+                    "nothing past the prefix reached the file"
+                );
+                assert_eq!(&read.into_bufs()[0][..payload.len()], &payload[..]);
+                done.set(true);
+            });
+        }
+        drive(&mut fs, &mut eng, &done, "pinned write");
     }
 
     /// The core claim: a whole write chain - open, write, fsync, stat,

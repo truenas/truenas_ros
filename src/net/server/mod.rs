@@ -489,11 +489,14 @@ mod protocol;
 mod wake;
 
 pub use crate::net::core::bodypool::BodyRecycler;
+// The page-aligned storage `BodyRecycler::claim_aligned` hands out; a
+// consumer needs the type to hold it, whether or not it has `uring-fs`.
 pub use crate::net::core::handles::AcceptDeferral;
 pub use crate::net::core::protocol::{
     Body, ClientAddr, CloseReason, Endian, Framing, PeerCred, PrefixWidth,
     SendBuf, ServerAddr, length_prefix_header,
 };
+pub use crate::uring::aligned::AlignedBuf;
 pub use crate::uring::ring::RingFd;
 pub use config::{Listen, ServerConfig};
 pub use handles::{

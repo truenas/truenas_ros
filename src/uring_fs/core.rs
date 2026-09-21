@@ -400,7 +400,17 @@ struct FsOpEntry {
     /// be told apart from a full one at reap time.
     #[cfg(feature = "net-server")]
     lease_want: u32,
+    /// What a pinned write ([`FsConn::pwritev2_pinned`]) is issued from:
+    /// the caller's own storage, owned here for exactly as long as the
+    /// kernel may read it - until the CQE is reaped - and dropped just
+    /// before the waiter runs, so its drop is the caller's signal that
+    /// the bytes are free to reuse.
+    pin: Option<Pin>,
 }
+
+/// The storage a pinned write is issued from, owned by the op for as
+/// long as the kernel may read it ([`FsConn::pwritev2_pinned`]).
+type Pin = Box<dyn AsRef<[u8]>>;
 
 /// One delivery's claim on a recv-pool buffer, shared by every leased
 /// write, every leased job and every [`LeasedWindow`] reading from it.
@@ -595,6 +605,7 @@ impl FsOpEntry {
             recv_lease: None,
             #[cfg(feature = "net-server")]
             lease_want: 0,
+            pin: None,
         }
     }
 
@@ -629,6 +640,7 @@ impl FsOpEntry {
             self.recv_lease = None;
             self.lease_want = 0;
         }
+        self.pin = None;
         self.state = FsOpState::Free;
     }
 }
@@ -1530,6 +1542,69 @@ impl FsCore {
                 entry.generation += 1;
                 self.op_free.push(op_slot);
                 Err(waiter)
+            }
+        }
+    }
+
+    /// `WRITEV` from storage the caller owns, `pin`, which the op keeps
+    /// alive - and which must not change - until its CQE: the iovec
+    /// points into `pin`'s bytes, and `pin` is dropped before the waiter
+    /// runs. A refused submit (no op slot, or the ring would not take the
+    /// SQE) hands both back, so the caller's fallback still owns its
+    /// callback and its buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit_pwritev2_pinned(
+        &mut self,
+        eng: &mut Engine,
+        pers: u16,
+        file: Arc<OwnedFd>,
+        pin: Pin,
+        off: u64,
+        rw_flags: u32,
+        waiter: FsWaiter,
+    ) -> Result<(), (FsWaiter, Pin)> {
+        let Some(op_slot) = self.pop_op() else {
+            return Err((waiter, pin));
+        };
+        let raw_fd = file.as_raw_fd();
+        let entry = &mut self.ops[op_slot as usize];
+        let gen32 = entry.generation as u32;
+        entry.state.state = FsOpState::InFlight { tag: TAG_WRITEV };
+        // The bytes live behind the box, which the entry now owns; the
+        // box's contents do not move when the box does, so the pointer
+        // taken here stays good for as long as the entry holds it.
+        let src: &[u8] = (*pin).as_ref();
+        entry.state.iov.clear();
+        entry.state.iov.push(libc::iovec {
+            iov_base: src.as_ptr() as *mut libc::c_void,
+            iov_len: src.len(),
+        });
+        entry.state.file = Some(file);
+        entry.state.pin = Some(pin);
+        let iov_ptr = entry.state.iov.as_ptr() as u64;
+        let ud = pack_raw(TAG_WRITEV, op_slot, gen32);
+        let staged = eng.stage(ud, |sqe| {
+            sqe.opcode = IORING_OP_WRITEV;
+            sqe.fd = raw_fd;
+            sqe.addr = iov_ptr;
+            sqe.len = 1;
+            sqe.off_addr2 = off;
+            sqe.op_flags = rw_flags;
+            sqe.personality = pers;
+        });
+        match staged {
+            Ok(()) => {
+                entry.state.waiter = Some(waiter);
+                Ok(())
+            }
+            Err(_) => {
+                // Never in flight: unwind the entry and hand everything
+                // back, as the leased submit does.
+                let pin = entry.state.pin.take().expect("set above");
+                entry.state.clear();
+                entry.generation += 1;
+                self.op_free.push(op_slot);
+                Err((waiter, pin))
             }
         }
     }
@@ -4093,6 +4168,78 @@ impl<'a> FsConn<'a> {
             }
         }
         self.pwritev2(who, f, vec![src.to_vec()], off, flags, on_done);
+    }
+
+    /// Write `pin`'s bytes to `f` at `off` from storage the caller owns,
+    /// without copying: the op takes `pin`, holds it until its CQE is
+    /// reaped, and drops it just before `on_done` runs. So the drop is
+    /// the caller's signal that the bytes are free to reuse, and a
+    /// `Drop` on the pin is where a staging buffer goes back to whoever
+    /// hands them out.
+    ///
+    /// This is the copy-free path for a body the caller has already
+    /// assembled in storage of its own - an [`AlignedBuf`] holding one
+    /// record for a direct write, say - where [`pwritev2_from`] cannot
+    /// help (it leases the receive buffer, and only that) and
+    /// [`pwritev2`] would take a `Vec` it has no way to align.
+    /// Short-write semantics are [`pwritev2`]'s: `Ok(n)` with `n` short
+    /// is the caller's to judge.
+    ///
+    /// A full op table, or a ring that will not take the SQE, falls back
+    /// to [`pwritev2`] on a copy, dropping `pin` at once - the call
+    /// degrades instead of failing, exactly as [`pwritev2_from`] does.
+    ///
+    /// Where the write runs is the descriptor's business, as for every
+    /// op here: a file this facade opened carries no `O_NONBLOCK` (the
+    /// special-file guard adds it for the open and strips it after),
+    /// so io_uring punts the write to io-wq. A caller that states
+    /// `O_NONBLOCK` on a ring open turns that off, and on an `O_DIRECT`
+    /// file the write then runs inline on the ring's thread for its
+    /// whole disk round trip - `open_read_ring`'s defect, on the write
+    /// side.
+    ///
+    /// [`AlignedBuf`]: super::AlignedBuf
+    /// [`pwritev2_from`]: FsConn::pwritev2_from
+    /// [`pwritev2`]: FsConn::pwritev2
+    pub fn pwritev2_pinned<P, F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        pin: P,
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        P: AsRef<[u8]> + 'static,
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        let pin: Pin = Box::new(pin);
+        let w = self.waiter(on_done);
+        match self.fs.submit_pwritev2_pinned(
+            self.eng,
+            who.0,
+            Arc::clone(&f.fd),
+            pin,
+            off,
+            flags.bits(),
+            w,
+        ) {
+            Ok(()) => {}
+            Err((w, pin)) => {
+                let copy = (*pin).as_ref().to_vec();
+                drop(pin);
+                self.fs.submit_rw(
+                    self.eng,
+                    TAG_WRITEV,
+                    who.0,
+                    f.fd,
+                    vec![copy],
+                    off,
+                    flags.bits(),
+                    w,
+                );
+            }
+        }
     }
 
     /// Flush `f`'s data and metadata (`fsync`) as `who`.
@@ -6997,19 +7144,21 @@ mod op_entry_size {
     /// work out the default's resident cost against the ring's locked-memory
     /// one.
     ///
-    /// It was quoted at ~180 bytes and measures 272 (280 under
+    /// It was quoted at ~180 bytes and measured 272 (280 under
     /// `net-server`), so every worked total there understated by about
     /// 1.5x: the default 32768-slot table is 8.5 MiB, not the 5.8 MiB the
-    /// doc arrived at. Pinned loosely, because the point is that the figure
-    /// is re-derived when the entry grows, not that it never may.
+    /// doc arrived at. The pinned write's `pin` - a fat pointer - then
+    /// took it to 288 (296), ~9 MiB. Pinned loosely, because the point is
+    /// that the figure is re-derived when the entry grows, not that it
+    /// never may.
     ///
     /// [`FsConfig`]: crate::uring_fs::FsConfig
     #[test]
     fn the_op_slot_is_the_size_the_config_docs_quote() {
         let n = size_of::<SlotEntry<FsOpEntry>>();
         assert!(
-            (256..=288).contains(&n),
-            "an op slot is {n} bytes; `FsConfig`'s rustdoc quotes 272 (280 \
+            (272..=304).contains(&n),
+            "an op slot is {n} bytes; `FsConfig`'s rustdoc quotes 288 (296 \
              with `net-server`) - re-derive the default's resident cost there"
         );
     }

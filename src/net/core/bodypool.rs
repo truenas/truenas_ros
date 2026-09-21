@@ -99,8 +99,108 @@
 //! correctness one, and nothing breaks when an error path drops a body on
 //! the floor.
 
+//!
+//! # Two inventories, one law
+//!
+//! A direct write needs storage a `Vec` cannot be: page-aligned, so
+//! the kernel can DMA from it ([`AlignedBuf`]). The pool retains those
+//! beside its `Vec`s, in a second free list, under the same bytes:
+//! one `retained`, one `target`, one `budget`, one windowed pot of
+//! missed bytes, one heat, one shrink. A claim names the kind it
+//! needs and is served from that kind alone - a body's `Vec` and a
+//! record's staging are not interchangeable - but a byte retained is
+//! a byte retained whichever list holds it, and the quiet halving and
+//! the under-load ageing walk both.
+
 use std::cell::RefCell;
 use std::rc::Rc;
+
+use crate::uring::aligned::AlignedBuf;
+
+/// What the pool retains, by capacity: a `Vec` for a body read outside
+/// a pool buffer, or a page-aligned buffer for a record staged for a
+/// direct write. Two kinds, one accounting.
+trait Retained {
+    fn capacity(&self) -> usize;
+    /// Empty it, keeping the allocation, so a claim never sees stale
+    /// bytes.
+    fn clear(&mut self);
+}
+
+impl Retained for Vec<u8> {
+    fn capacity(&self) -> usize {
+        Vec::capacity(self)
+    }
+    fn clear(&mut self) {
+        Vec::clear(self);
+    }
+}
+
+impl Retained for AlignedBuf {
+    fn capacity(&self) -> usize {
+        AlignedBuf::capacity(self)
+    }
+    fn clear(&mut self) {
+        AlignedBuf::clear(self);
+    }
+}
+
+/// The best-fitting free entry for `min_cap` in one sorted inventory,
+/// if serving it is not an over-provision ([`OVERSIZE_SERVE`]); its
+/// capacity leaves `retained` with it, and the serve is counted as
+/// heat. The one place a serve is counted.
+fn take_fit_from<T: Retained>(
+    free: &mut Vec<(T, u8)>,
+    retained: &mut usize,
+    served: &mut usize,
+    min_cap: usize,
+) -> Option<T> {
+    // `free` is sorted by capacity, so the first entry covering the
+    // ask is the best fit and *finding* it is a binary search — the
+    // linear best-fit walk cost ~500 ns per claim once a storm had
+    // diversified the list into hundreds of entries, against 7 ns
+    // for the LIFO pop it replaced. Taking it is still O(n): the
+    // `remove` below memmoves, as the sorted insert does, so the
+    // pair is a win above ~100 entries and costs +18 to +27 ns per
+    // body below it (n=8: 7.4→25.7 ns; n=32: 17.8→26.5; n=1024:
+    // 459→318). Bucketing by `capacity().ilog2()` would be O(1) both
+    // ways with best-fit-near-size and per-entry ageing intact; it is
+    // not worth the shape yet at those absolutes.
+    let i = free.partition_point(|(v, _)| v.capacity() < min_cap);
+    let cap = free.get(i)?.0.capacity();
+    if cap > min_cap.saturating_mul(OVERSIZE_SERVE).max(OVERSIZE_FLOOR) {
+        return None;
+    }
+    *retained = retained.saturating_sub(cap);
+    *served = served.saturating_add(1);
+    Some(free.remove(i).0)
+}
+
+/// Sorted insert into one inventory, keeping the binary-search
+/// best-fit true and the shrink's pop pointed at the largest entry.
+/// Age zero: a give is this buffer's demand proving itself.
+fn keep_in<T: Retained>(free: &mut Vec<(T, u8)>, mut v: T) {
+    v.clear();
+    let cap = v.capacity();
+    let at = free.partition_point(|(w, _)| w.capacity() <= cap);
+    free.insert(at, (v, 0));
+}
+
+/// Age one inventory by a hot observation, evicting what served
+/// nothing for [`SHRINK_AFTER`] of them; the bytes evicted.
+fn age<T: Retained>(free: &mut Vec<(T, u8)>) -> usize {
+    let mut evicted = 0usize;
+    free.retain_mut(|(v, age)| {
+        *age = age.saturating_add(1);
+        if *age < SHRINK_AFTER {
+            true
+        } else {
+            evicted += v.capacity();
+            false
+        }
+    });
+    evicted
+}
 
 /// Consecutive quiet observations before the pool gives storage up —
 /// [`BufPool`](crate::uring::bufring)'s constant, for the same reason: a
@@ -147,8 +247,13 @@ pub(crate) struct BodyPool {
     /// quiet never ages entries, because the halving path owns that
     /// regime and a workload that merely pauses keeps its warm pool.
     free: Vec<(Vec<u8>, u8)>,
-    /// Total capacity retained in `free`, in bytes — the figure every
-    /// bound below is about.
+    /// The page-aligned inventory, kept exactly as `free` is — sorted,
+    /// aged, best-fit — for the records a direct write is staged in.
+    /// Its own list because a claim's kind is not negotiable, not
+    /// because its bytes are counted apart: they are not.
+    aligned: Vec<(AlignedBuf, u8)>,
+    /// Total capacity retained in `free` and `aligned`, in bytes — the
+    /// figure every bound below is about.
     retained: usize,
     /// The most bytes `free` may retain right now. Raised by licensed
     /// demand, halved by quiet, never above `budget`.
@@ -180,6 +285,7 @@ impl BodyPool {
     pub(crate) fn new(budget: usize) -> BodyPool {
         BodyPool {
             free: Vec::new(),
+            aligned: Vec::new(),
             retained: 0,
             target: 0,
             budget,
@@ -189,30 +295,14 @@ impl BodyPool {
         }
     }
 
-    /// The best-fitting free Vec for `min_cap`, if serving it is not an
-    /// over-provision ([`OVERSIZE_SERVE`]); its capacity leaves
-    /// `retained` with it. The one place a serve is counted as heat.
+    /// The best-fitting free Vec for `min_cap` ([`take_fit_from`]).
     fn take_fit(&mut self, min_cap: usize) -> Option<Vec<u8>> {
-        // `free` is sorted by capacity, so the first entry covering the
-        // ask is the best fit and *finding* it is a binary search — the
-        // linear best-fit walk cost ~500 ns per claim once a storm had
-        // diversified the list into hundreds of entries, against 7 ns
-        // for the LIFO pop it replaced. Taking it is still O(n): the
-        // `remove` below memmoves, as `give_held`'s `insert` does, so
-        // the pair is a win above ~100 entries and costs +18 to +27 ns
-        // per body below it (n=8: 7.4→25.7 ns; n=32: 17.8→26.5;
-        // n=1024: 459→318). Bucketing `free` by `capacity().ilog2()`
-        // would be O(1) both ways with best-fit-near-size and
-        // per-entry ageing intact; it is not worth the shape yet at
-        // those absolutes.
-        let i = self.free.partition_point(|(v, _)| v.capacity() < min_cap);
-        let cap = self.free.get(i)?.0.capacity();
-        if cap > min_cap.saturating_mul(OVERSIZE_SERVE).max(OVERSIZE_FLOOR) {
-            return None;
-        }
-        self.retained = self.retained.saturating_sub(cap);
-        self.served = self.served.saturating_add(1);
-        Some(self.free.remove(i).0)
+        take_fit_from(
+            &mut self.free,
+            &mut self.retained,
+            &mut self.served,
+            min_cap,
+        )
     }
 
     /// Storage for a body of at least `min_cap` bytes, consumer form: a
@@ -257,17 +347,16 @@ impl BodyPool {
             self.missed_bytes.saturating_add(licence).min(self.budget);
     }
 
-    /// Hand storage home with the held licence its claim recorded (0
-    /// for a pool-served claim). Cleared here so a claim never sees
-    /// stale bytes; retained only within the byte target — which
-    /// outstanding missed bytes may first raise toward it, up to the
-    /// budget — and freed on the spot otherwise.
-    pub(crate) fn give_held(&mut self, mut v: Vec<u8>, licence: usize) {
+    /// Whether `cap` bytes coming home may be retained, and the
+    /// accounting if so: within the byte target — which outstanding
+    /// missed bytes may first raise toward it, up to the budget — it
+    /// is retained and counted; otherwise the caller frees it on the
+    /// spot. The one admission rule, for both inventories.
+    fn admit(&mut self, cap: usize, licence: usize) -> bool {
         self.missed_bytes =
             self.missed_bytes.saturating_add(licence).min(self.budget);
-        let cap = v.capacity();
         if cap == 0 {
-            return;
+            return false;
         }
         let held = self.retained.saturating_add(cap);
         if held > self.target {
@@ -282,24 +371,67 @@ impl BodyPool {
             // unlicensed give rode demand that was never granted it.
             let grant = (held - self.target).min(self.missed_bytes);
             if held > self.budget || self.target + grant < held {
-                return; // freed; nothing is spent on freed storage
+                return false; // freed; nothing is spent on freed storage
             }
             self.target += grant;
             self.missed_bytes -= grant;
         }
-        v.clear();
         self.retained = held;
-        // Sorted insert, keeping the binary-search best-fit true and
-        // the shrink's pop pointed at the largest entry. Age zero: a
-        // give is this buffer's demand proving itself.
-        let at = self.free.partition_point(|(w, _)| w.capacity() <= cap);
-        self.free.insert(at, (v, 0));
+        true
+    }
+
+    /// Hand storage home with the held licence its claim recorded (0
+    /// for a pool-served claim). Cleared here so a claim never sees
+    /// stale bytes; retained only within the byte target — which
+    /// outstanding missed bytes may first raise toward it, up to the
+    /// budget — and freed on the spot otherwise.
+    pub(crate) fn give_held(&mut self, v: Vec<u8>, licence: usize) {
+        if self.admit(v.capacity(), licence) {
+            keep_in(&mut self.free, v);
+        }
     }
 
     /// Hand storage home, consumer form: no held licence, so retention
     /// rides whatever the windowed pot holds.
     pub(crate) fn give(&mut self, v: Vec<u8>) {
         self.give_held(v, 0);
+    }
+
+    /// Page-aligned storage of at least `min_cap` bytes, consumer form
+    /// ([`claim`](BodyPool::claim) for the aligned inventory): a
+    /// fitting reused buffer where one waits, a fresh page-rounded
+    /// allocation — and its size recorded on the windowed pot — where
+    /// none does. `None` only when the allocator refuses: a consumer
+    /// under memory pressure should hold fewer records, not abort.
+    /// The returned buffer is empty.
+    pub(crate) fn claim_aligned(
+        &mut self,
+        min_cap: usize,
+    ) -> Option<AlignedBuf> {
+        if let Some(buf) = take_fit_from(
+            &mut self.aligned,
+            &mut self.retained,
+            &mut self.served,
+            min_cap,
+        ) {
+            debug_assert!(buf.is_empty(), "a pooled record kept bytes");
+            return Some(buf);
+        }
+        let buf = AlignedBuf::new(min_cap)?;
+        self.missed_bytes = self
+            .missed_bytes
+            .saturating_add(buf.capacity())
+            .min(self.budget);
+        Some(buf)
+    }
+
+    /// Hand page-aligned storage home ([`give`](BodyPool::give) for the
+    /// aligned inventory): cleared, and retained only within the byte
+    /// target the two inventories share.
+    pub(crate) fn give_aligned(&mut self, buf: AlignedBuf) {
+        if self.admit(buf.capacity(), 0) {
+            keep_in(&mut self.aligned, buf);
+        }
     }
 
     /// The timer's observation: quiet long enough halves the target and
@@ -349,16 +481,7 @@ impl BodyPool {
             // down, so a later unlicensed give cannot ride demand
             // that left with the buffer. The loan gap is untouched:
             // claimed-out capacity sits in neither figure.
-            let mut evicted = 0usize;
-            self.free.retain_mut(|(v, age)| {
-                *age = age.saturating_add(1);
-                if *age < SHRINK_AFTER {
-                    true
-                } else {
-                    evicted += v.capacity();
-                    false
-                }
-            });
+            let evicted = age(&mut self.free) + age(&mut self.aligned);
             self.retained = self.retained.saturating_sub(evicted);
             self.target = self.target.saturating_sub(evicted);
             return;
@@ -370,15 +493,22 @@ impl BodyPool {
         self.idle_rounds = 0;
         self.target /= 2;
         while self.retained > self.target {
-            // The list is sorted, so this frees the largest entry
-            // first — the high-water buffer a shifted workload
-            // stranded is the first thing a shrink reclaims.
-            let Some((v, _)) = self.free.pop() else {
+            // Both lists are sorted, so this frees the largest entry
+            // of either first — the high-water buffer a shifted
+            // workload stranded is the first thing a shrink reclaims.
+            let vec_cap = self.free.last().map_or(0, |(v, _)| v.capacity());
+            let aligned_cap =
+                self.aligned.last().map_or(0, |(b, _)| b.capacity());
+            let cap = if vec_cap == 0 && aligned_cap == 0 {
                 debug_assert!(false, "retained bytes with no free entry");
                 self.retained = 0;
                 break;
+            } else if aligned_cap > vec_cap {
+                self.aligned.pop().map_or(0, |(b, _)| b.capacity())
+            } else {
+                self.free.pop().map_or(0, |(v, _)| v.capacity())
             };
-            self.retained = self.retained.saturating_sub(v.capacity());
+            self.retained = self.retained.saturating_sub(cap);
         }
     }
 
@@ -424,6 +554,21 @@ impl BodyRecycler {
     /// placement path does, instead of minting its own per message.
     pub fn claim(&self, min_cap: usize) -> Vec<u8> {
         self.pool.borrow_mut().claim(min_cap)
+    }
+
+    /// Draw page-aligned storage of at least `min_cap` bytes — the
+    /// record a direct write is staged in — from the pool's aligned
+    /// inventory: a reused buffer where one waits, a fresh allocation
+    /// otherwise, `None` only when the allocator refuses. Retention is
+    /// under the same byte budget as [`claim`](BodyRecycler::claim)'s.
+    pub fn claim_aligned(&self, min_cap: usize) -> Option<AlignedBuf> {
+        self.pool.borrow_mut().claim_aligned(min_cap)
+    }
+
+    /// Return a record's staging for reuse. Its bytes are dead the
+    /// moment this is called; the pool clears them before reissue.
+    pub fn recycle_aligned(&self, buf: AlignedBuf) {
+        self.pool.borrow_mut().give_aligned(buf);
     }
 }
 
@@ -733,5 +878,101 @@ mod tests {
             p.rebalance();
         }
         assert_eq!(p.target(), 0, "quiet walks an abandoned target down");
+    }
+    /// The aligned inventory cycles a record's staging exactly as the
+    /// `Vec` inventory cycles a body: one allocation, reused.
+    #[test]
+    fn an_aligned_claim_cycles_its_storage() {
+        let mut p = BodyPool::new(64 * MIB);
+        let mut a = p.claim_aligned(MIB).expect("allocates");
+        let ptr = a.as_ref().as_ptr() as usize;
+        assert_eq!(a.fill(&[7u8; 4096]), 4096);
+        p.give_aligned(a);
+        assert_eq!(p.retained(), MIB);
+        let b = p.claim_aligned(MIB).expect("serves");
+        assert_eq!(b.as_ref().as_ptr() as usize, ptr, "the warm buffer cycles");
+        assert!(b.is_empty(), "cleared before reissue");
+        assert_eq!(p.retained(), 0, "claimed storage is out, not retained");
+    }
+
+    /// One byte budget: a record retained is a body not retained, and
+    /// the budget caps the two together.
+    #[test]
+    fn aligned_and_vec_bytes_share_one_budget() {
+        let mut p = BodyPool::new(2 * MIB);
+        let a = p.claim_aligned(MIB).expect("allocates");
+        let v = p.claim(MIB);
+        p.give_aligned(a);
+        p.give(v);
+        assert_eq!(p.retained(), 2 * MIB, "both licensed, both kept");
+        let extra = p.claim_aligned(MIB).expect("allocates");
+        p.give_aligned(extra);
+        assert_eq!(p.retained(), 2 * MIB, "a third is over the budget: freed");
+        let mut extra = Vec::new();
+        extra.reserve_exact(MIB);
+        p.give(extra);
+        assert_eq!(p.retained(), 2 * MIB, "whichever kind");
+    }
+
+    /// A claim's kind is not negotiable: a waiting `Vec` never serves an
+    /// aligned ask, nor a waiting record a body's.
+    #[test]
+    fn the_kinds_never_serve_each_other() {
+        let mut p = BodyPool::new(64 * MIB);
+        let v = p.claim(MIB);
+        p.give(v);
+        assert_eq!(p.retained(), MIB);
+        let a = p.claim_aligned(MIB).expect("allocates rather than serves");
+        assert_eq!(p.retained(), MIB, "the Vec stayed put");
+        p.give_aligned(a);
+        assert_eq!(p.retained(), 2 * MIB, "and the record's miss licensed it");
+        let b = p.claim(MIB);
+        assert_eq!(p.retained(), MIB, "the Vec served; the record stayed put");
+        p.give(b);
+    }
+
+    /// Quiet halves the shared target and frees the largest entry of
+    /// either inventory first.
+    #[test]
+    fn quiet_frees_the_largest_entry_of_either_inventory() {
+        let mut p = BodyPool::new(64 * MIB);
+        let a = p.claim_aligned(2 * MIB).expect("allocates");
+        let v = p.claim(MIB);
+        p.give_aligned(a);
+        p.give(v);
+        assert_eq!(p.retained(), 3 * MIB);
+        for _ in 0..SHRINK_AFTER {
+            p.rebalance();
+        }
+        assert_eq!(p.target(), 3 * MIB / 2, "quiet halves the byte target");
+        assert_eq!(
+            p.retained(),
+            MIB,
+            "the 2 MiB record went first, the Vec stays"
+        );
+        assert!(
+            p.claim_aligned(2 * MIB).is_some(),
+            "an aligned ask allocates again"
+        );
+    }
+
+    /// Under load an aligned entry earns its keep like any other: one
+    /// the workload stops asking for is evicted, licence and all.
+    #[test]
+    fn an_aligned_entry_ages_out_under_load() {
+        let mut p = BodyPool::new(64 * MIB);
+        let a = p.claim_aligned(MIB).expect("allocates");
+        let small = p.claim_held(300 * 1024);
+        p.give_aligned(a);
+        p.give_held(small.0, small.1);
+        assert_eq!(p.retained(), MIB + 300 * 1024);
+        for _ in 0..SHRINK_AFTER {
+            let (v, licence) = p.claim_held(300 * 1024);
+            assert_eq!(licence, 0, "the body class serves itself");
+            p.give_held(v, 0);
+            p.rebalance();
+        }
+        assert_eq!(p.retained(), 300 * 1024, "the unserved record ages out");
+        assert_eq!(p.target(), 300 * 1024, "its licence died with it");
     }
 }

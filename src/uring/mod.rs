@@ -65,6 +65,10 @@ pub(crate) fn page_size() -> usize {
 }
 
 #[cfg(feature = "net-server")]
+// The page-aligned owned buffer a direct write is issued from; shared by
+// `uring_fs` (the write) and `net::core::bodypool` (the retention), so it
+// lives beside the ring rather than under either.
+pub(crate) mod aligned;
 pub(crate) mod bufring;
 pub(crate) mod engine;
 pub(crate) mod personality;
