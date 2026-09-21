@@ -738,13 +738,6 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         owned: bool,
     ) -> errno::Result<()> {
         let chunk = self.cfg.fs_body_chunk;
-        // The pool's shrink cadence: pressure is answered where the kernel
-        // reports it (`-ENOBUFS` in `on_pump_read`), but quiet has no
-        // completion to ride, so it is observed here, where every body read
-        // begins.
-        if let Some(p) = self.core.body_bufs.as_mut() {
-            p.rebalance();
-        }
         {
             let Some(conn) = self.core.table.get_conn_mut(slot) else {
                 return Ok(()); // closed or parked under a stale call
@@ -758,6 +751,14 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             if tail.reading || tail.unread == 0 {
                 return Ok(()); // busy, or the last chunk is already queued
             }
+        }
+        // The pool's shrink cadence: pressure is answered where the kernel
+        // reports it (`-ENOBUFS` in `on_pump_read`), but quiet has no
+        // completion to ride, so it is observed here, where every body read
+        // begins. After the early returns: a call that drives nothing reads
+        // no clock.
+        if let Some(p) = self.core.body_bufs.as_mut() {
+            p.rebalance();
         }
         let gen64 = self.core.table.generation(slot);
         // Before a buffer is committed to it: a submit that fails on a full
@@ -914,8 +915,10 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             // failure - re-issues the read with an owned buffer, so
             // progress never waits on the pool.
             Err(errno::Errno::ENOBUFS) => {
+                let armed =
+                    self.fs.as_ref().map_or(0, |fs| fs.pump_selecting());
                 let grew =
-                    self.core.body_bufs.as_mut().is_some_and(|p| p.grow());
+                    self.core.body_bufs.as_mut().is_some_and(|p| p.grow(armed));
                 self.core.sync_recv_buf_stats();
                 self.core.table.conn_mut(slot).tail_release_chunk();
                 return self.drive_file_tail(slot, generation, !grew);

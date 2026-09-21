@@ -10,7 +10,6 @@ use crate::net::core::conn::{Op, RecvOutcome, pack};
 use crate::net::core::handles::stat;
 use crate::net::core::protocol::{CloseReason, Framing};
 #[cfg(feature = "net-server")]
-use crate::uring::bufring::BufPool;
 use crate::uring::sys::*;
 use std::os::fd::RawFd;
 
@@ -1581,7 +1580,9 @@ impl<U> Reactor<U> {
         slot: u32,
         generation: u32,
     ) -> errno::Result<bool> {
-        let grew = self.recv_bufs.as_mut().is_some_and(BufPool::grow);
+        // Nothing to subtract: a recv picks its buffer when data arrives,
+        // so the pool's free count is already what the kernel sees.
+        let grew = self.recv_bufs.as_mut().is_some_and(|p| p.grow(0));
         if grew {
             self.sync_recv_buf_stats();
             return Ok(true);
