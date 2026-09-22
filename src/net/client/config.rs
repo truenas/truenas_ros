@@ -188,6 +188,9 @@ impl ClientConfig {
             // Server-only: a client never registers a recv pool, so there
             // is no shortage to park on.
             recv_shortage_retry: None,
+            // Server-only: the knob is on `ServerConfig`, and a client's
+            // ops are submitted unflagged.
+            force_async: crate::uring::force_async::ForceAsync::empty(),
         }
     }
 }

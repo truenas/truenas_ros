@@ -30,6 +30,7 @@ use crate::sync_fs::{
     StatxRaw, ZfsAttr,
 };
 use crate::uring::engine::Engine;
+use crate::uring::force_async::ForceAsync;
 use crate::uring::slots::SlotEntry;
 use crate::uring::sys::KernelTimespec;
 use crate::uring::sys::{
@@ -907,6 +908,11 @@ pub(crate) struct FsCore {
     /// counted.
     armed_timers: HashMap<(u32, u64), WallClock>,
     timer_cap: Option<u32>,
+    /// Which of this core's reads and writes carry `IOSQE_ASYNC`, as the
+    /// host set it ([`FsCore::set_force_async`]). Only `READ` and `WRITE`
+    /// are read here; the socket classes belong to the net reactor. Empty
+    /// for the standalone host, which exposes no knob for it.
+    force_async: ForceAsync,
     /// Host refusals awaiting delivery: embedded ops the ring never
     /// hosted - a full table, an `Allow` pair's two-slot charge, the
     /// wall-clock cap, a swept owner, a staging failure - resolved at
@@ -975,6 +981,7 @@ impl FsCore {
             closed_owners: HashMap::new(),
             armed_timers: HashMap::new(),
             timer_cap: None,
+            force_async: ForceAsync::empty(),
             refusals: VecDeque::new(),
         }
     }
@@ -987,6 +994,14 @@ impl FsCore {
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     pub(crate) fn set_timer_cap(&mut self, per_owner: u32) {
         self.timer_cap = Some(per_owner);
+    }
+
+    /// Stamp `IOSQE_ASYNC` on this core's `READV`/`WRITEV` submissions
+    /// (see the field). Setup-time only, on [`FsCore::set_timer_cap`]'s
+    /// rule.
+    #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
+    pub(crate) fn set_force_async(&mut self, classes: ForceAsync) {
+        self.force_async = classes;
     }
 
     /// Whether `owner`'s connection has already been swept.
@@ -1445,15 +1460,17 @@ impl FsCore {
         let iov_ptr = e.iov.as_ptr() as u64;
         let iov_len = e.iov.len() as u32;
 
-        let opcode = if tag == TAG_READV {
-            IORING_OP_READV
+        let (opcode, class) = if tag == TAG_READV {
+            (IORING_OP_READV, ForceAsync::READ)
         } else {
-            IORING_OP_WRITEV
+            (IORING_OP_WRITEV, ForceAsync::WRITE)
         };
+        let force = self.force_async.sqe_bit(class);
         let ud = pack_raw(tag, op_slot, gen32);
         let staged = eng.stage(ud, |sqe| {
             sqe.opcode = opcode;
             sqe.fd = raw_fd;
+            sqe.flags = force;
             sqe.addr = iov_ptr;
             sqe.len = iov_len;
             sqe.off_addr2 = off;
@@ -1508,10 +1525,12 @@ impl FsCore {
         entry.state.recv_lease = Some(hold);
         entry.state.lease_want = len as u32;
         let iov_ptr = entry.state.iov.as_ptr() as u64;
+        let force = self.force_async.sqe_bit(ForceAsync::WRITE);
         let ud = pack_raw(TAG_WRITEV, op_slot, gen32);
         let staged = eng.stage(ud, |sqe| {
             sqe.opcode = IORING_OP_WRITEV;
             sqe.fd = raw_fd;
+            sqe.flags = force;
             sqe.addr = iov_ptr;
             sqe.len = 1;
             sqe.off_addr2 = off;
@@ -1667,10 +1686,12 @@ impl FsCore {
         // drops its `File` mid-op (close-last by ownership).
         e.file = Some(Arc::clone(&file.fd));
         let iov_ptr = e.iov.as_ptr() as u64;
+        let force = self.force_async.sqe_bit(ForceAsync::READ);
         let ud = pack_raw(TAG_READV, op_slot, gen32);
         let staged = eng.stage(ud, |sqe| {
             sqe.opcode = IORING_OP_READV;
             sqe.fd = raw_fd;
+            sqe.flags = force;
             sqe.addr = iov_ptr;
             sqe.len = 1; // one iovec: buffer select refuses more
             sqe.off_addr2 = off;
@@ -7917,6 +7938,60 @@ mod routing_fuzz {
             (0..OP_SLOTS).collect::<Vec<_>>(),
             "op slots leaked or double-freed (seed {seed})"
         );
+    }
+
+    // ---- `IOSQE_ASYNC` (`FsCore::set_force_async`) ----
+
+    /// The file classes stamp `IOSQE_ASYNC` on a read, and only their own
+    /// class does. The `WRITE`-only arm is the control: it configures the
+    /// core, submits the same read, and must leave the SQE unflagged, so
+    /// an assertion that merely found the bit set could not pass it.
+    #[test]
+    fn a_pump_read_carries_iosqe_async_only_for_its_own_class() {
+        let staged_flags = |classes: ForceAsync| -> Option<u8> {
+            let mut eng = engine_or_skip()?;
+            let mut core = FsCore::new(4, OffloadBounds::default());
+            core.set_force_async(classes);
+            let dir = crate::tempdir().expect("tempdir");
+            let p = dir.path().join("f");
+            std::fs::write(&p, b"0123456789").unwrap();
+            let fd: std::os::fd::OwnedFd =
+                std::fs::File::open(&p).unwrap().into();
+            let file = File::new(Arc::new(fd));
+            core.submit_pump_read(
+                &mut eng,
+                &file,
+                PumpDest::Owned(Vec::with_capacity(8)),
+                8,
+                0,
+                (1, 1),
+            )
+            .expect("submit");
+            let flags = eng.staged_sqe(0).flags;
+            // Reap rather than drop mid-flight: the op parks an fd clone
+            // and the entry is only released by its completion.
+            eng.ring.submit_and_wait(1).expect("submit_and_wait");
+            let cqe = eng.ring.reap().expect("cqe");
+            let (tag, slot, g) = unpack_raw(cqe.user_data);
+            core.on_cqe(&mut eng, tag, slot, g, cqe.res);
+            Some(flags)
+        };
+        let Some(armed) = staged_flags(ForceAsync::READ) else {
+            return;
+        };
+        assert_eq!(
+            armed & crate::uring::sys::IOSQE_ASYNC,
+            crate::uring::sys::IOSQE_ASYNC,
+            "ForceAsync::READ must reach the pump read's SQE"
+        );
+        for wrong in [ForceAsync::empty(), ForceAsync::WRITE] {
+            let flags = staged_flags(wrong).expect("ring was available");
+            assert_eq!(
+                flags & crate::uring::sys::IOSQE_ASYNC,
+                0,
+                "a read must stay unflagged under {wrong:?}"
+            );
+        }
     }
 
     // ---- reply-path pump reads (`FsWaiter::Pump`) ----

@@ -1,5 +1,6 @@
 //! [`CoreConfig`]: the engine-read subset of a role config, shared by the core.
 
+use crate::uring::force_async::ForceAsync;
 use std::time::Duration;
 
 /// The engine-read tuning knobs a role config projects into the reactor core.
@@ -17,4 +18,5 @@ pub(crate) struct CoreConfig {
     pub(crate) send_timeout: Option<Duration>,
     pub(crate) tls_handshake_timeout: Option<Duration>,
     pub(crate) recv_shortage_retry: Option<Duration>,
+    pub(crate) force_async: ForceAsync,
 }

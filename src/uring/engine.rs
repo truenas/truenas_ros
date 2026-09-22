@@ -258,7 +258,7 @@ impl Engine {
     }
 
     /// Read back a staged (not yet submitted) SQE. See [`Ring::staged_sqe`].
-    #[cfg(all(test, not(loom), feature = "uring-fs"))]
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn staged_sqe(&self, i: u32) -> IoUringSqe {
         self.ring.staged_sqe(i)
     }
