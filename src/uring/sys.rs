@@ -144,6 +144,22 @@ pub(crate) struct IoUringRsrcUpdate {
 #[cfg(any(feature = "net-client", feature = "uring-fs"))]
 const _: () = assert!(core::mem::size_of::<IoUringRsrcUpdate>() == 16);
 
+/// `struct io_uring_rsrc_update2` (32 bytes) - arg for
+/// `IORING_REGISTER_BUFFERS_UPDATE`: install the `nr` iovecs at `data`
+/// into fixed-buffer slots starting at `offset`. `nr_args` is the struct's
+/// own size (`io_register_rsrc_update`: `if (size != sizeof(up)) -EINVAL`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct IoUringRsrcUpdate2 {
+    pub offset: u32,
+    pub resv: u32,
+    pub data: u64,
+    pub tags: u64,
+    pub nr: u32,
+    pub resv2: u32,
+}
+const _: () = assert!(core::mem::size_of::<IoUringRsrcUpdate2>() == 32);
+
 /// `struct __kernel_timespec` - the 16-byte timespec io_uring timeout ops read
 /// from `sqe.addr`. The kernel copies it at prep time, so it need only be valid
 /// at submission.
@@ -166,6 +182,12 @@ const _: () = assert!(core::mem::size_of::<KernelTimespec>() == 16);
 pub(crate) const IORING_OP_READV: u8 = 1;
 /// Vectored write; field layout mirrors `READV`.
 pub(crate) const IORING_OP_WRITEV: u8 = 2;
+/// `READ`/`WRITE` from a buffer registered in the ring's fixed-buffer
+/// table: `addr`/`len` name a sub-range of the registered buffer and
+/// `buf_index` names its slot (`io_import_reg_buf`, `io_uring/rsrc.c`,
+/// refuses a range outside it with `EFAULT`).
+pub(crate) const IORING_OP_READ_FIXED: u8 = 4;
+pub(crate) const IORING_OP_WRITE_FIXED: u8 = 5;
 /// `fsync`/`fdatasync` on an fd; `sqe.fsync_flags` (`op_flags`) may carry
 /// [`IORING_FSYNC_DATASYNC`], `sqe.off`+`sqe.len` bound the range (0 = whole
 /// file). Always punted to io-wq (`REQ_F_FORCE_ASYNC`).
@@ -386,6 +408,14 @@ pub(crate) const IORING_REGISTER_PERSONALITY: u32 = 9;
 /// Free a personality id (`nr_args` = id, `arg` must be NULL).
 pub(crate) const IORING_UNREGISTER_PERSONALITY: u32 = 10;
 pub(crate) const IORING_REGISTER_FILES2: u32 = 13;
+/// The fixed-buffer table's registration: `BUFFERS2` creates it (sparse
+/// with [`IORING_RSRC_REGISTER_SPARSE`], every slot empty) and
+/// `BUFFERS_UPDATE` installs or clears slots - an iovec of `{NULL, 0}`
+/// clears one (`io_sqe_buffer_register`, `io_uring/rsrc.c`). At most
+/// `IORING_MAX_REG_BUFFERS` (16384) slots, each at most 1 GiB.
+pub(crate) const IORING_REGISTER_BUFFERS2: u32 = 15;
+pub(crate) const IORING_REGISTER_BUFFERS_UPDATE: u32 = 16;
+pub(crate) const IORING_MAX_REG_BUFFERS: u32 = 1 << 14;
 pub(crate) const IORING_REGISTER_FILE_ALLOC_RANGE: u32 = 25;
 /// Register a **provided-buffer ring**: a group of buffers the kernel picks
 /// from at issue time, rather than an address the SQE names. `arg` is one
@@ -646,10 +676,11 @@ pub(crate) fn unregister_personality(
     }
 }
 
-/// Register a sparse (all-`-1`) file table of `count` slots - the connection
-/// "pool" that multishot accept auto-allocates into.
-pub(crate) fn register_files_sparse(
+/// Register a sparse resource table of `count` slots with `opcode`
+/// (`IORING_REGISTER_FILES2` or `IORING_REGISTER_BUFFERS2`).
+fn register_sparse(
     ring_fd: RawFd,
+    opcode: u32,
     count: u32,
 ) -> errno::Result<()> {
     let reg = IoUringRsrcRegister {
@@ -657,14 +688,62 @@ pub(crate) fn register_files_sparse(
         flags: IORING_RSRC_REGISTER_SPARSE,
         ..Default::default()
     };
-    // SAFETY: FILES2 reads one `io_uring_rsrc_register`; the kernel requires
+    // SAFETY: the kernel reads one `io_uring_rsrc_register` and requires
     // `nr_args == sizeof(rr)` (rsrc.c: `if (size != sizeof(rr)) -EINVAL`).
     unsafe {
         io_uring_register(
             ring_fd,
-            IORING_REGISTER_FILES2,
+            opcode,
             &reg as *const IoUringRsrcRegister as *const c_void,
             core::mem::size_of::<IoUringRsrcRegister>() as u32,
+        )
+    }
+}
+
+/// Register a sparse (all-`-1`) file table of `count` slots - the connection
+/// "pool" that multishot accept auto-allocates into.
+pub(crate) fn register_files_sparse(
+    ring_fd: RawFd,
+    count: u32,
+) -> errno::Result<()> {
+    register_sparse(ring_fd, IORING_REGISTER_FILES2, count)
+}
+
+/// Register a sparse fixed-buffer table of `count` empty slots.
+pub(crate) fn register_buffers_sparse(
+    ring_fd: RawFd,
+    count: u32,
+) -> errno::Result<()> {
+    register_sparse(ring_fd, IORING_REGISTER_BUFFERS2, count)
+}
+
+/// Install `[base, base + len)` into slot `slot`, or clear it with a null
+/// `base` and zero `len`. Pages stay pinned until cleared or the ring dies.
+pub(crate) fn register_buffer_update(
+    ring_fd: RawFd,
+    slot: u32,
+    base: *const u8,
+    len: usize,
+) -> errno::Result<()> {
+    let iov = [libc::iovec {
+        iov_base: base as *mut c_void,
+        iov_len: len,
+    }];
+    let update = IoUringRsrcUpdate2 {
+        offset: slot,
+        data: iov.as_ptr() as u64,
+        nr: 1,
+        ..Default::default()
+    };
+    // SAFETY: BUFFERS_UPDATE reads one `io_uring_rsrc_update2` from `arg`
+    // with `nr_args` its size, then `nr` iovecs from `data`; `iov`
+    // outlives the call.
+    unsafe {
+        io_uring_register(
+            ring_fd,
+            IORING_REGISTER_BUFFERS_UPDATE,
+            &update as *const IoUringRsrcUpdate2 as *const c_void,
+            core::mem::size_of::<IoUringRsrcUpdate2>() as u32,
         )
     }
 }

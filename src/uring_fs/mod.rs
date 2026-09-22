@@ -236,6 +236,10 @@ pub use offload_pool::OffloadBounds;
 // can drive an `FsCore` on the server's own ring; the standalone host is
 // `uring_fs`'s own `UringFs`.
 pub(crate) mod core;
+// The page-aligned staging buffer a direct write is issued from, through
+// `FsConn::pwritev2_pinned`; the ring's body pool retains them too, so
+// the type lives beside the ring and is only re-exported here.
+pub use crate::uring::aligned::AlignedBuf;
 // Exported unconditionally, not just with `net-server`. `FsConn` is the
 // callback submission facade - the only way to run several operations back to
 // back without parking a thread between them - and an out-of-tree consumer

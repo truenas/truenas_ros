@@ -57,6 +57,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "bodypool_ops"
+path = "fuzz_targets/bodypool_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "http_frame"
 path = "fuzz_targets/http_frame.rs"
 test = false
