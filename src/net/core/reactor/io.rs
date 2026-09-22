@@ -1047,10 +1047,10 @@ impl<U> Reactor<U> {
                 // `max_request_bytes` and turns into an *exact*
                 // `ReadHeader`, where there is no placement to opt into.
                 Some(p) if exact && want > p.buf_len() => None,
-                Some(p) => {
-                    p.rebalance();
-                    Some(p.bgid())
-                }
+                // Shrink cadence lives on the maintenance tick now, not
+                // here. This arm no longer reads the clock on every
+                // selecting recv.
+                Some(p) => Some(p.bgid()),
                 None => None,
             };
             if g.is_none() {
