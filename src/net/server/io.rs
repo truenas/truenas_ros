@@ -752,14 +752,13 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
                 return Ok(()); // busy, or the last chunk is already queued
             }
         }
-        // The pool's shrink cadence: pressure is answered where the kernel
-        // reports it (`-ENOBUFS` in `on_pump_read`), but quiet has no
-        // completion to ride, so it is observed here, where every body read
-        // begins. After the early returns: a call that drives nothing reads
-        // no clock.
-        if let Some(p) = self.core.body_bufs.as_mut() {
-            p.rebalance();
-        }
+        // The pool's shrink cadence is the maintenance tick (`Op::Maintain`
+        // in `net/server/mod.rs`), not here. Growth is answered where the
+        // kernel reports pressure (`-ENOBUFS` in `on_pump_read`), and
+        // shrink only needs to notice quiet within a second or two, which
+        // the tick already does every `MAINTAIN_TICK_SECS`. Reading the
+        // clock on every chunk this path drives bought no earlier a
+        // shrink than the tick gives for free.
         let gen64 = self.core.table.generation(slot);
         // Before a buffer is committed to it: a submit that fails on a full
         // table would drop the buffer with the op entry, and this path must be
