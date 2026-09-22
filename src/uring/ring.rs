@@ -808,7 +808,7 @@ impl Ring {
     /// bytes actually handed to the kernel rather than on the staging call's
     /// return. Same soundness premise as [`reset_staging`](Ring::reset_staging):
     /// with no `io_uring_enter`, the kernel has not read these slots.
-    #[cfg(all(test, not(loom), feature = "uring-fs"))]
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn staged_sqe(&self, i: u32) -> IoUringSqe {
         assert!(i < self.to_submit, "SQE {i} is not staged");
         let idx = (i & self.rings.sq_mask) as usize;

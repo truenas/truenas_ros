@@ -9,6 +9,7 @@ use crate::errno::{self, Errno};
 use crate::net::core::conn::{Op, RecvOutcome, pack};
 use crate::net::core::handles::stat;
 use crate::net::core::protocol::{CloseReason, Framing};
+use crate::uring::force_async::ForceAsync;
 use crate::uring::sys::*;
 use std::os::fd::RawFd;
 
@@ -500,11 +501,12 @@ impl<U> Reactor<U> {
             conn.recv_clock_armed = timeout_ts.is_some();
             conn.recv_clock_fired = None;
         }
+        let force = self.cfg.force_async.sqe_bit(ForceAsync::RECV);
         match timeout_ts {
             None => self.stage(pack(op, slot, generation), move |sqe| {
                 sqe.opcode = IORING_OP_RECVMSG;
                 sqe.fd = slot as i32;
-                sqe.flags = IOSQE_FIXED_FILE;
+                sqe.flags = IOSQE_FIXED_FILE | force;
                 sqe.addr = addr;
                 sqe.op_flags = libc::MSG_WAITALL as u32;
             }),
@@ -513,7 +515,7 @@ impl<U> Reactor<U> {
                 move |sqe| {
                     sqe.opcode = IORING_OP_RECVMSG;
                     sqe.fd = slot as i32;
-                    sqe.flags = IOSQE_FIXED_FILE | IOSQE_IO_LINK;
+                    sqe.flags = IOSQE_FIXED_FILE | IOSQE_IO_LINK | force;
                     sqe.addr = addr;
                     sqe.op_flags = libc::MSG_WAITALL as u32;
                 },
@@ -1178,11 +1180,12 @@ impl<U> Reactor<U> {
                 conn.served_since_idle_arm = false;
             }
         }
+        let force = self.cfg.force_async.sqe_bit(ForceAsync::RECV);
         match timeout_ts {
             None => self.stage(pack(op, slot, generation), move |sqe| {
                 sqe.opcode = opcode;
                 sqe.fd = slot as i32;
-                sqe.flags = IOSQE_FIXED_FILE;
+                sqe.flags = IOSQE_FIXED_FILE | force;
                 sqe.addr = addr;
                 sqe.len = len;
                 sqe.op_flags = flags;
@@ -1194,7 +1197,7 @@ impl<U> Reactor<U> {
                     sqe.opcode = opcode;
                     sqe.fd = slot as i32;
                     // Link the trailing timeout to this recv.
-                    sqe.flags = IOSQE_FIXED_FILE | IOSQE_IO_LINK;
+                    sqe.flags = IOSQE_FIXED_FILE | IOSQE_IO_LINK | force;
                     sqe.addr = addr;
                     sqe.len = len;
                     sqe.op_flags = flags;
@@ -1271,6 +1274,7 @@ impl<U> Reactor<U> {
         } else {
             (libc::MSG_WAITALL | libc::MSG_NOSIGNAL) as u32
         };
+        let force = self.cfg.force_async.sqe_bit(ForceAsync::SEND);
         let fill = move |sqe: &mut IoUringSqe| {
             match single {
                 Some((ptr, len)) => {
@@ -1284,7 +1288,7 @@ impl<U> Reactor<U> {
                 }
             }
             sqe.fd = slot as i32;
-            sqe.flags = IOSQE_FIXED_FILE;
+            sqe.flags = IOSQE_FIXED_FILE | force;
             sqe.op_flags = flags;
         };
         let send_ts = (self.cfg.send_timeout.is_some())
@@ -1409,11 +1413,12 @@ impl<U> Reactor<U> {
             conn.recv_clock_armed = timeout_ts.is_some();
             conn.recv_clock_fired = None;
         }
+        let force = self.cfg.force_async.sqe_bit(ForceAsync::RECV);
         match timeout_ts {
             None => self.stage(pack(op, slot, generation), move |sqe| {
                 sqe.opcode = IORING_OP_RECV;
                 sqe.fd = slot as i32;
-                sqe.flags = IOSQE_FIXED_FILE;
+                sqe.flags = IOSQE_FIXED_FILE | force;
                 sqe.addr = addr;
                 sqe.len = want as u32;
                 sqe.op_flags = libc::MSG_WAITALL as u32;
@@ -1423,7 +1428,7 @@ impl<U> Reactor<U> {
                 move |sqe| {
                     sqe.opcode = IORING_OP_RECV;
                     sqe.fd = slot as i32;
-                    sqe.flags = IOSQE_FIXED_FILE | IOSQE_IO_LINK;
+                    sqe.flags = IOSQE_FIXED_FILE | IOSQE_IO_LINK | force;
                     sqe.addr = addr;
                     sqe.len = want as u32;
                     sqe.op_flags = libc::MSG_WAITALL as u32;
@@ -2567,6 +2572,20 @@ mod tests {
         max_receipt_time: Option<Duration>,
         request_timeout: Option<Duration>,
     ) -> Option<Reactor<()>> {
+        reactor_with_force_async(
+            max_receipt_time,
+            request_timeout,
+            ForceAsync::empty(),
+        )
+    }
+
+    /// [`reactor_with_one_conn`] with the `IOSQE_ASYNC` classes named.
+    #[cfg(feature = "net-server")]
+    fn reactor_with_force_async(
+        max_receipt_time: Option<Duration>,
+        request_timeout: Option<Duration>,
+        force_async: ForceAsync,
+    ) -> Option<Reactor<()>> {
         let engine = match crate::uring::engine::Engine::new(64, 8) {
             Ok(e) => e,
             Err(crate::Error::Errno(e))
@@ -2588,6 +2607,7 @@ mod tests {
             send_timeout: None,
             tls_handshake_timeout: None,
             recv_shortage_retry: None,
+            force_async,
         };
         let pads = Box::new(KernelPads {
             deadline: KernelTimespec::default(),
@@ -2874,5 +2894,42 @@ mod tests {
                 place: true
             }
         );
+    }
+
+    /// `ForceAsync` stamps `IOSQE_ASYNC` on the class it names and on no
+    /// other. The wrong-class arm is the control: a reactor configured for
+    /// `RECV` submits the same send, so an assertion that only checked for
+    /// the bit's presence would pass there too and prove nothing about
+    /// which knob reached the SQE.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_send_carries_iosqe_async_only_for_its_own_class() {
+        let staged_send_flags = |classes: ForceAsync| -> Option<u8> {
+            let mut r = reactor_with_force_async(None, None, classes)?;
+            r.table.conn_mut(0).enqueue_reply(b"reply".to_vec());
+            r.submit_send(0, 0).expect("stage the send");
+            Some(r.engine.staged_sqe(0).flags)
+        };
+        let Some(armed) = staged_send_flags(ForceAsync::SEND) else {
+            return;
+        };
+        assert_eq!(
+            armed & IOSQE_ASYNC,
+            IOSQE_ASYNC,
+            "ForceAsync::SEND must reach the send SQE"
+        );
+        assert_eq!(
+            armed & IOSQE_FIXED_FILE,
+            IOSQE_FIXED_FILE,
+            "the flag is added to the fixed-file bit, not instead of it"
+        );
+        for wrong in [ForceAsync::empty(), ForceAsync::RECV] {
+            let flags = staged_send_flags(wrong).expect("ring was available");
+            assert_eq!(
+                flags & IOSQE_ASYNC,
+                0,
+                "a send must stay unflagged under {wrong:?}"
+            );
+        }
     }
 }

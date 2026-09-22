@@ -9,6 +9,7 @@ use crate::error::Error;
 use crate::net::core::protocol::ServerAddr;
 #[cfg(doc)]
 use crate::net::core::protocol::{Body, ClientAddr, CloseReason};
+use crate::uring::force_async::ForceAsync;
 use std::time::Duration;
 
 /// The largest usable pool slot (the `user_data` codec reserves 24 bits).
@@ -361,6 +362,18 @@ pub struct ServerConfig {
     /// in, so those arrive owned too). `None` disables placement. Default
     /// 64 KiB.
     pub body_placement_threshold: Option<usize>,
+    /// Which operation classes this server submits with `IOSQE_ASYNC`:
+    /// the socket sends and receives its connections run, and the file
+    /// reads and writes it submits on their behalf (a body pump read, a
+    /// leased upload window, and a consumer's own reads and writes through
+    /// [`fs_ops`](ServerConfig::fs_ops)).
+    ///
+    /// Empty by default, which is the submission every one of them used to
+    /// get. [`ForceAsync`] carries what the flag costs per class - the
+    /// kernel decides by whether the *file* polls, so a socket and a
+    /// regular file take it differently - and why the classes are separate
+    /// knobs rather than one switch.
+    pub force_async: ForceAsync,
 }
 
 impl Default for ServerConfig {
@@ -396,6 +409,7 @@ impl Default for ServerConfig {
             max_send_backlog: 8 * 1024 * 1024,
             max_send_coalesce: 8,
             body_placement_threshold: Some(64 * 1024),
+            force_async: ForceAsync::empty(),
         }
     }
 }
@@ -585,6 +599,7 @@ impl ServerConfig {
             send_timeout: self.send_timeout,
             tls_handshake_timeout: self.tls_handshake_timeout,
             recv_shortage_retry: self.recv_shortage_retry,
+            force_async: self.force_async,
         }
     }
 }

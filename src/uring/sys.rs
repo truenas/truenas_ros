@@ -329,6 +329,18 @@ pub(crate) const IOSQE_FIXED_FILE: u8 = 1 << 0;
 /// this op's lifetime.
 pub(crate) const IOSQE_IO_LINK: u8 = 1 << 2;
 
+/// `sqe.flags`: skip the inline issue and hand the op straight to io-wq
+/// (`REQ_F_FORCE_ASYNC`, `io_uring/io_uring.c:2367`).
+///
+/// What that costs is decided by the file, not the opcode.
+/// `io_wq_submit_work` puts `IO_URING_F_NONBLOCK` back for a pollable
+/// opcode on a pollable file and arms poll on `-EAGAIN`
+/// (`io_uring/io_uring.c:1997-2003`), so a socket op hands its worker back
+/// instead of holding it; a regular file is never pollable
+/// (`io_file_can_poll`, `io_uring/io_uring.h`), so the worker issues
+/// blocking. See `net::server::ForceAsync`, which is what sets this.
+pub(crate) const IOSQE_ASYNC: u8 = 1 << 4;
+
 /// `sqe.ioprio` for ACCEPT: arm a persistent multishot accept.
 pub(crate) const IORING_ACCEPT_MULTISHOT: u16 = 1 << 0;
 
