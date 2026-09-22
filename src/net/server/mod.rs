@@ -494,6 +494,10 @@ pub use crate::net::core::protocol::{
     Body, ClientAddr, CloseReason, Endian, Framing, PeerCred, PrefixWidth,
     SendBuf, ServerAddr, length_prefix_header,
 };
+pub use crate::uring::aligned::AlignedBuf;
+// And the fixed inventory's vocabulary: what `BodyRecycler::claim_fixed`
+// hands out, and its size.
+pub use crate::net::core::bodypool::{FIXED_RECORD, Fixed};
 pub use crate::uring::ring::RingFd;
 pub use config::{Listen, ServerConfig};
 pub use handles::{
@@ -538,6 +542,7 @@ fn count_memlock_refusal(
 /// whose framer contract it fuzzes.
 #[cfg(feature = "__fuzz")]
 pub mod fuzz {
+    pub use crate::net::core::bodypool::fuzz::Pool as BodyPool;
     pub use crate::net::core::reactor::{FrameStep, frame_step};
 }
 
@@ -571,14 +576,6 @@ const ACCEPT_RETRY_MS: u64 = 20;
 /// confirmed silence before the first give-back - hysteresis, not
 /// twitchiness.
 const MAINTAIN_TICK_SECS: u64 = 5;
-
-/// The most bytes one ring's body pool may retain for reuse. A hard
-/// ceiling over the demand-licensed target, so a storm of maximal
-/// bodies bounds at this figure per ring and quiet decays it from
-/// there - flexible growth underneath, never a runaway. Live (claimed)
-/// bodies are bounded separately, by what the endpoint admits per
-/// connection times the connections actually mid-body.
-const BODY_POOL_BUDGET: usize = 64 * 1024 * 1024;
 
 /// The kTLS handshake handler ([`Server::set_tls_handshake`]):
 /// `(furnished_fd, incoming, deferral)`, once per connection on a kTLS
@@ -956,13 +953,27 @@ where
         // reserved for a kernel that refuses the registration outright (or
         // an allocation failure under real memory pressure). Descriptors
         // are 16 bytes; the buffers behind them are allocated on demand.
-        // The body pool needs no kernel registration - it is plain
-        // userspace storage for placed and promoted bodies - so unlike the
-        // rings below it cannot fail to construct. Bounded in bytes, not
-        // buffers: retained capacity is what costs, and a count would let
-        // a few maximal bodies retain what a thousand small ones should.
+        // The body pool always constructs; bounded in bytes, not buffers,
+        // since retained capacity is what costs. Its fixed-buffer table
+        // is registered at the kernel's ceiling (sparse slots cost one
+        // pointer each) so demand, not a knob, fills it - and only under
+        // CAP_IPC_LOCK, which exempts the pinned pages from RLIMIT_MEMLOCK
+        // (`io_uring_create`); without it, or on a kernel that refuses
+        // the table, the pool serves page-aligned buffers by address.
+        let table = crate::uring::fixed::ipc_lock_held()
+            .then(|| {
+                crate::uring::fixed::FixedTable::register(
+                    core.engine.ring.raw_fd(),
+                    crate::uring::sys::IORING_MAX_REG_BUFFERS,
+                )
+                .ok()
+            })
+            .flatten();
         core.body_pool = Some(std::rc::Rc::new(std::cell::RefCell::new(
-            crate::net::core::bodypool::BodyPool::new(BODY_POOL_BUDGET),
+            crate::net::core::bodypool::BodyPool::with_table(
+                cfg.body_pool_budget,
+                table,
+            ),
         )));
         if cfg.recv_pool {
             // One buffer per connection: no more messages can be arriving
@@ -1543,6 +1554,11 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Drop
             fs.leak();
         }
         let _ = leaked;
+        // The pool may outlive this server through a recycler handle;
+        // the ring will not, so the table goes first.
+        if let Some(p) = self.core.body_pool.as_ref() {
+            p.borrow_mut().detach_table();
+        }
     }
 }
 

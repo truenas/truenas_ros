@@ -154,12 +154,20 @@ env:
   # sequential stop-screen test, pure channel state that genuinely
   # executes here; 112 adds the entry-open classifier's type table,
   # which is `matches!` over a `d_type` and a request behind no guard
-  # at all, so it moves the executing count too.) If that friction is
+  # at all, so it moves the executing count too; 115 adds the two
+  # `uring::aligned` tests - raw allocation and copies behind no
+  # guard, so they execute and are exactly what this lane is for -
+  # and the task-level pinned-write chain, ring-gated and so counted
+  # rather than claimed; 118 adds the fixed-buffer table's two tests
+  # and the task-level fixed-write chain, all three ring-gated and so
+  # counted rather than claimed; 120 adds the task-level direct-write
+  # chain on a ZFS dataset and the refused-pinned-write chain, both
+  # ring-gated and so counted rather than claimed.) If that friction is
   # unwanted,
   # `-lt` pinned at the TRUE count still catches deletion, which is
   # the failure mode; what it must not be again is a floor far below
   # what runs.
-  MIRI_TESTS: "112"
+  MIRI_TESTS: "120"
 
   # The `http` band, run as its own step under its own feature set.
   # Exact for the same reason, and bumped by the same rule: 32 at the

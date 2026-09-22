@@ -38,8 +38,8 @@ use crate::uring::sys::{
     IORING_OP_FSYNC, IORING_OP_FTRUNCATE, IORING_OP_LINKAT, IORING_OP_MKDIRAT,
     IORING_OP_OPENAT2, IORING_OP_READV, IORING_OP_RENAMEAT, IORING_OP_SPLICE,
     IORING_OP_STATX, IORING_OP_SYMLINKAT, IORING_OP_TIMEOUT,
-    IORING_OP_UNLINKAT, IORING_OP_WRITEV, IOSQE_BUFFER_SELECT, IoUringCqe,
-    SPLICE_F_MOVE,
+    IORING_OP_UNLINKAT, IORING_OP_WRITE_FIXED, IORING_OP_WRITEV,
+    IOSQE_BUFFER_SELECT, IoUringCqe, SPLICE_F_MOVE,
 };
 use crate::uring::user_data::{pack_raw, unpack_raw};
 use std::any::Any;
@@ -396,10 +396,37 @@ struct FsOpEntry {
     /// once, on [`FsDone`], for the net server to hand back to the pool.
     #[cfg(feature = "net-server")]
     recv_lease: Option<std::sync::Arc<LeaseHold>>,
-    /// The byte count a leased write asked for, so a short completion can
-    /// be told apart from a full one at reap time.
-    #[cfg(feature = "net-server")]
-    lease_want: u32,
+    /// Bytes a leased or pinned write asked for, so a short completion
+    /// is rewritten to `EIO` at the reap ([`short_is_eio`]). Zero on
+    /// every other op.
+    want: u32,
+    /// A pinned write's source ([`FsConn::pwritev2_pinned`]): held until
+    /// the CQE is reaped, dropped before the waiter runs.
+    pin: Option<Pin>,
+}
+
+/// A leased or pinned write cannot be retried short: its source is gone
+/// by the time the caller hears. ZFS returns partial writes as success,
+/// so the reap turns a short count into `EIO`.
+fn short_is_eio(res: Result<i32, Errno>, want: u32) -> Result<i32, Errno> {
+    match res {
+        Ok(n) if want > 0 && (n as u32) < want => Err(Errno::EIO),
+        other => other,
+    }
+}
+
+/// What a pinned write can be issued from: bytes, and a concrete type a
+/// refusal can hand back ([`FsDone::take_pin`]).
+pub trait PinSource: AsRef<[u8]> + std::any::Any {}
+impl<T: AsRef<[u8]> + std::any::Any> PinSource for T {}
+
+/// A pinned write's source, owned by the op until its CQE.
+type Pin = Box<dyn PinSource>;
+
+/// The kernel's `MAX_RW_COUNT`: `INT_MAX` rounded down to a page. A
+/// pinned write longer than this is refused before staging.
+fn max_rw_count() -> usize {
+    (i32::MAX as usize) & !(crate::uring::page_size() - 1)
 }
 
 /// One delivery's claim on a recv-pool buffer, shared by every leased
@@ -593,8 +620,8 @@ impl FsOpEntry {
             file: None,
             #[cfg(feature = "net-server")]
             recv_lease: None,
-            #[cfg(feature = "net-server")]
-            lease_want: 0,
+            want: 0,
+            pin: None,
         }
     }
 
@@ -627,8 +654,9 @@ impl FsOpEntry {
         #[cfg(feature = "net-server")]
         {
             self.recv_lease = None;
-            self.lease_want = 0;
         }
+        self.want = 0;
+        self.pin = None;
         self.state = FsOpState::Free;
     }
 }
@@ -679,8 +707,7 @@ struct Completed {
     strip_nonblock: Option<u64>,
     #[cfg(feature = "net-server")]
     recv_lease: Option<std::sync::Arc<LeaseHold>>,
-    #[cfg(feature = "net-server")]
-    lease_want: u32,
+    want: u32,
 }
 
 /// The fs domain's tables. The host owns the [`Engine`] and passes it in for
@@ -1506,7 +1533,7 @@ impl FsCore {
         });
         entry.state.file = Some(file);
         entry.state.recv_lease = Some(hold);
-        entry.state.lease_want = len as u32;
+        entry.state.want = len as u32;
         let iov_ptr = entry.state.iov.as_ptr() as u64;
         let ud = pack_raw(TAG_WRITEV, op_slot, gen32);
         let staged = eng.stage(ud, |sqe| {
@@ -1524,12 +1551,93 @@ impl FsCore {
                 Ok(())
             }
             Err(_) => {
-                // Never in flight: unwind the entry and hand the waiter
-                // back, so the caller's fallback still owns its callback.
-                entry.state.clear();
-                entry.generation += 1;
-                self.op_free.push(op_slot);
+                self.unstage(op_slot);
                 Err(waiter)
+            }
+        }
+    }
+
+    /// An entry whose SQE never reached the kernel: clear it, retire its
+    /// generation and free the slot.
+    fn unstage(&mut self, op_slot: u32) {
+        let entry = &mut self.ops[op_slot as usize];
+        entry.state.clear();
+        entry.generation += 1;
+        self.op_free.push(op_slot);
+    }
+
+    /// `WRITEV` (or `WRITE_FIXED` with `fixed`) from `pin`, held by the
+    /// op until its CQE and dropped before the waiter runs. A refused
+    /// submit hands both back.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit_pwritev2_pinned(
+        &mut self,
+        eng: &mut Engine,
+        pers: u16,
+        file: Arc<OwnedFd>,
+        pin: Pin,
+        fixed: Option<u16>,
+        off: u64,
+        rw_flags: u32,
+        waiter: FsWaiter,
+    ) -> Result<(), (FsWaiter, Pin)> {
+        let Some(op_slot) = self.pop_op() else {
+            return Err((waiter, pin));
+        };
+        let raw_fd = file.as_raw_fd();
+        let entry = &mut self.ops[op_slot as usize];
+        let gen32 = entry.generation as u32;
+        entry.state.state = FsOpState::InFlight { tag: TAG_WRITEV };
+        // The bytes are behind the box and do not move with it.
+        let (src_ptr, src_len) = {
+            let src: &[u8] = (*pin).as_ref();
+            (src.as_ptr(), src.len())
+        };
+        entry.state.iov.clear();
+        if fixed.is_none() {
+            entry.state.iov.push(libc::iovec {
+                iov_base: src_ptr as *mut libc::c_void,
+                iov_len: src_len,
+            });
+        }
+        entry.state.file = Some(file);
+        entry.state.pin = Some(pin);
+        debug_assert!(
+            src_len <= max_rw_count(),
+            "a pinned write of {src_len} bytes: the facade refuses these"
+        );
+        entry.state.want = src_len as u32;
+        let iov_ptr = entry.state.iov.as_ptr() as u64;
+        let ud = pack_raw(TAG_WRITEV, op_slot, gen32);
+        let staged = eng.stage(ud, |sqe| {
+            // Same op slot and tag either way.
+            match fixed {
+                Some(slot) => {
+                    sqe.opcode = IORING_OP_WRITE_FIXED;
+                    sqe.addr = src_ptr as u64;
+                    sqe.len = src_len as u32;
+                    sqe.buf_index = slot;
+                }
+                None => {
+                    sqe.opcode = IORING_OP_WRITEV;
+                    sqe.addr = iov_ptr;
+                    sqe.len = 1;
+                }
+            }
+            sqe.fd = raw_fd;
+            sqe.off_addr2 = off;
+            sqe.op_flags = rw_flags;
+            sqe.personality = pers;
+        });
+        match staged {
+            Ok(()) => {
+                entry.state.waiter = Some(waiter);
+                Ok(())
+            }
+            Err(_) => {
+                let pin = entry.state.pin.take().expect("set above");
+                self.unstage(op_slot);
+                Err((waiter, pin))
             }
         }
     }
@@ -2637,8 +2745,6 @@ impl FsCore {
         let Some(mut completed) = self.take_op(tag, op_slot, gen32) else {
             return ReapedFs::None;
         };
-        #[cfg(feature = "net-server")]
-        let leased = completed.recv_lease.is_some();
         // The buffer goes back to the pool only when its LAST share drops:
         // sibling writes in the same delivery may still be reading it, so
         // the id surfaces from exactly one completion - `into_inner` on the
@@ -2649,8 +2755,7 @@ impl FsCore {
             .take()
             .and_then(std::sync::Arc::into_inner)
             .map(LeaseHold::into_bid);
-        #[cfg(feature = "net-server")]
-        let lease_want = completed.lease_want;
+        let want = completed.want;
         let Completed {
             waiter,
             bufs,
@@ -2736,13 +2841,7 @@ impl FsCore {
         // copy path stays
         // retryable (`FsDone::into_bufs` hands the source back), which is
         // the one honest asymmetry between the two.
-        #[cfg(feature = "net-server")]
-        if leased
-            && let Ok(n) = result
-            && (n as u32) < lease_want
-        {
-            result = Err(Errno::EIO);
-        }
+        result = short_is_eio(result, want);
 
         // A selecting pump read (no owned buffer) is done with the ring,
         // whatever it answered - `-ENOBUFS` and `-ECANCELED` included.
@@ -2764,6 +2863,7 @@ impl FsCore {
                     stat,
                     #[cfg(feature = "net-server")]
                     recv_lease,
+                    pin: None,
                 },
                 owner,
             ),
@@ -2776,6 +2876,7 @@ impl FsCore {
                     stat,
                     #[cfg(feature = "net-server")]
                     recv_lease,
+                    pin: None,
                 },
                 owner,
             ),
@@ -2794,12 +2895,7 @@ impl FsCore {
         let Some(done) = self.take_op(tag, op_slot, gen32) else {
             return;
         };
-        #[cfg(feature = "net-server")]
-        let mut done = done;
-        #[cfg(feature = "net-server")]
-        let leased = done.recv_lease.take().is_some();
-        #[cfg(feature = "net-server")]
-        let lease_want = done.lease_want;
+        let want = done.want;
         let Completed {
             waiter, bufs, stat, ..
         } = done;
@@ -2809,16 +2905,7 @@ impl FsCore {
         // retry from bytes it no longer owns, and a caller that shrugs
         // stores a truncated object. The live reap rewrites it; without the
         // same rewrite here a drain is the one way to observe the count.
-        #[cfg(feature = "net-server")]
-        let res = {
-            let r = map_res(cqe.res);
-            match r {
-                Ok(n) if leased && (n as u32) < lease_want => Err(Errno::EIO),
-                other => other,
-            }
-        };
-        #[cfg(not(feature = "net-server"))]
-        let res = map_res(cqe.res);
+        let res = short_is_eio(map_res(cqe.res), want);
         // Teardown: the loop is dying - just report the outcome and hand any
         // buffers back. A file's fd is released when its op entry (and thus its
         // parked `Arc`) is dropped with the ring teardown - except an OPEN's,
@@ -2988,8 +3075,7 @@ impl FsCore {
                 .flatten(),
             #[cfg(feature = "net-server")]
             recv_lease: e.recv_lease.take(),
-            #[cfg(feature = "net-server")]
-            lease_want: e.lease_want,
+            want: e.want,
         };
         e.clear();
         entry.generation += 1;
@@ -3038,6 +3124,22 @@ impl FsCore {
         bufs: Vec<Vec<u8>>,
         file: Option<Arc<OwnedFd>>,
     ) {
+        self.refuse_with_pin(eng, waiter, err, marked, bufs, file, None);
+    }
+
+    /// [`refuse`](FsCore::refuse) carrying a pinned write's source back
+    /// to the caller on the embedded path; other waiters drop it.
+    #[allow(clippy::too_many_arguments)]
+    fn refuse_with_pin(
+        &mut self,
+        eng: &mut Engine,
+        waiter: FsWaiter,
+        err: Errno,
+        marked: bool,
+        bufs: Vec<Vec<u8>>,
+        file: Option<Arc<OwnedFd>>,
+        pin: Option<Pin>,
+    ) {
         match waiter {
             FsWaiter::Embedded { owner, cb, on_fail } => {
                 let on_fail = on_fail.take();
@@ -3058,6 +3160,7 @@ impl FsCore {
                         stat: None,
                         #[cfg(feature = "net-server")]
                         recv_lease: None,
+                        pin,
                     },
                 ));
             }
@@ -3140,6 +3243,9 @@ pub struct FsDone {
     /// meaningless to any other consumer.
     #[cfg(feature = "net-server")]
     recv_lease: Option<u16>,
+    /// A pinned write's source, handed back when the submit was refused
+    /// ([`FsDone::take_pin`]). `None` on every completion.
+    pin: Option<Pin>,
 }
 
 impl std::fmt::Debug for FsDone {
@@ -3191,6 +3297,7 @@ impl FsDone {
             stat: None,
             #[cfg(feature = "net-server")]
             recv_lease: None,
+            pin: None,
         }
     }
 
@@ -3219,6 +3326,22 @@ impl FsDone {
             stat: None,
             #[cfg(feature = "net-server")]
             recv_lease: None,
+            pin: None,
+        }
+    }
+
+    /// The source of a refused pinned write ([`FsConn::pwritev2_pinned`]),
+    /// as the type it was given; `None` after a completion, or for
+    /// another type.
+    pub fn take_pin<P: 'static>(&mut self) -> Option<P> {
+        let pin = self.pin.take()?;
+        let any: Box<dyn std::any::Any> = pin;
+        match any.downcast::<P>() {
+            Ok(p) => Some(*p),
+            Err(other) => {
+                drop(other);
+                None
+            }
         }
     }
 
@@ -4093,6 +4216,112 @@ impl<'a> FsConn<'a> {
             }
         }
         self.pwritev2(who, f, vec![src.to_vec()], off, flags, on_done);
+    }
+
+    /// Write `pin`'s bytes to `f` at `off` without copying: the op holds
+    /// `pin` until its CQE is reaped and drops it before `on_done` runs,
+    /// so a `Drop` on the pin returns a staging buffer to its pool.
+    ///
+    /// A short write is `Err(EIO)`: the source is already dropped, and
+    /// ZFS returns partial writes as success. A refused submit (op table
+    /// full, ring would not take the SQE) is a marked `EBUSY`
+    /// ([`FsDone::was_refused`]) carrying `pin` back
+    /// ([`FsDone::take_pin`]), so the caller can retry it; a pin over the
+    /// kernel's `MAX_RW_COUNT` is `EINVAL` the same way. No copy fallback:
+    /// it would be refused for the same reason.
+    ///
+    /// Whether the write is direct is the filesystem's business (see
+    /// [`AlignedBuf`](super::AlignedBuf) for ZFS's rules); this facade
+    /// checks none of it. A file opened here carries no `O_NONBLOCK`, so
+    /// io_uring punts the write to io-wq; one opened with `O_NONBLOCK` is
+    /// nowait to io_uring (`io_file_get_flags`, `io_uring/io_uring.c`)
+    /// and, as ZFS never consults `IOCB_NOWAIT`, runs an `O_DIRECT` write
+    /// inline on the ring thread. Both as of 6.18.
+    pub fn pwritev2_pinned<P, F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        pin: P,
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        P: PinSource,
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.pinned(who, f, Box::new(pin), None, off, flags, on_done);
+    }
+
+    /// [`pwritev2_pinned`](FsConn::pwritev2_pinned) as `WRITE_FIXED`:
+    /// `slot` is the table entry holding the pin's bytes. A range outside
+    /// the slot's buffer is `EFAULT`. Everything else is the pinned
+    /// write's. Only the net server registers a table today, so a
+    /// standalone `UringFs` has no slot to name.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pwritev2_fixed<P, F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        pin: P,
+        slot: u16,
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        P: PinSource,
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.pinned(who, f, Box::new(pin), Some(slot), off, flags, on_done);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pinned<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        pin: Pin,
+        fixed: Option<u16>,
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        let w = self.waiter(on_done);
+        // Over MAX_RW_COUNT the kernel would write short (EIO) or refuse
+        // the fixed range (EFAULT); refuse whole instead.
+        if pin.as_ref().as_ref().len() > max_rw_count() {
+            self.fs.refuse_with_pin(
+                self.eng,
+                w,
+                Errno::EINVAL,
+                true,
+                Vec::new(),
+                Some(f.fd),
+                Some(pin),
+            );
+            return;
+        }
+        if let Err((w, pin)) = self.fs.submit_pwritev2_pinned(
+            self.eng,
+            who.0,
+            Arc::clone(&f.fd),
+            pin,
+            fixed,
+            off,
+            flags.bits(),
+            w,
+        ) {
+            self.fs.refuse_with_pin(
+                self.eng,
+                w,
+                Errno::EBUSY,
+                true,
+                Vec::new(),
+                Some(f.fd),
+                Some(pin),
+            );
+        }
     }
 
     /// Flush `f`'s data and metadata (`fsync`) as `who`.
@@ -6997,20 +7226,24 @@ mod op_entry_size {
     /// work out the default's resident cost against the ring's locked-memory
     /// one.
     ///
-    /// It was quoted at ~180 bytes and measures 272 (280 under
-    /// `net-server`), so every worked total there understated by about
-    /// 1.5x: the default 32768-slot table is 8.5 MiB, not the 5.8 MiB the
-    /// doc arrived at. Pinned loosely, because the point is that the figure
-    /// is re-derived when the entry grows, not that it never may.
+    /// It was quoted at ~180 bytes and measured 272 (280 under
+    /// `net-server`); the pinned write's `pin` (a fat pointer) took it to
+    /// 288 (296), so the default 32768-slot table is ~9 MiB. Pinned
+    /// exactly, so the figure is re-derived when the entry grows.
     ///
     /// [`FsConfig`]: crate::uring_fs::FsConfig
     #[test]
     fn the_op_slot_is_the_size_the_config_docs_quote() {
         let n = size_of::<SlotEntry<FsOpEntry>>();
-        assert!(
-            (256..=288).contains(&n),
-            "an op slot is {n} bytes; `FsConfig`'s rustdoc quotes 272 (280 \
-             with `net-server`) - re-derive the default's resident cost there"
+        let want = if cfg!(feature = "net-server") {
+            296
+        } else {
+            288
+        };
+        assert_eq!(
+            n, want,
+            "an op slot is {n} bytes; `FsConfig`'s rustdoc quotes {want} - \
+             re-derive the default's resident cost there"
         );
     }
 }
@@ -7350,6 +7583,275 @@ mod routing_fuzz {
         let _ = core.on_cqe(&mut eng, t, s, g, 8192);
         let out = rx.try_recv().expect("delivered");
         assert_eq!(out.res, Ok(8192), "a full leased write is untouched");
+    }
+
+    /// A pin's `Drop` records where the op let go of it: `Some(true)`
+    /// once dropped. Reads as the buffer's bytes for the write.
+    struct DropPin {
+        bytes: Vec<u8>,
+        dropped: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+    impl AsRef<[u8]> for DropPin {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+    impl Drop for DropPin {
+        fn drop(&mut self) {
+            self.dropped.set(true);
+        }
+    }
+
+    /// A short pinned write is `EIO` and the pin is dropped at the reap;
+    /// a full completion is untouched.
+    #[test]
+    fn a_short_pinned_write_is_an_error() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        for (res, want) in [(4096, Err(Errno::EIO)), (8192, Ok(8192))] {
+            let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            let pin = DropPin {
+                bytes: vec![7u8; 8192],
+                dropped: std::rc::Rc::clone(&dropped),
+            };
+            let (tx, rx) = mpsc::channel();
+            let staged = core.submit_pwritev2_pinned(
+                &mut eng,
+                0,
+                Arc::clone(&file),
+                Box::new(pin),
+                None,
+                0,
+                0,
+                chan(&tx),
+            );
+            assert!(staged.is_ok(), "staged");
+            assert!(!dropped.get(), "held while in flight");
+            let [(t, s, g)] = inflight(&core)[..] else {
+                panic!("one op in flight");
+            };
+            let _ = core.on_cqe(&mut eng, t, s, g, res);
+            let out = rx.try_recv().expect("delivered");
+            assert_eq!(out.res, want, "res={res}");
+            assert!(dropped.get(), "the pin was dropped at the reap");
+        }
+    }
+
+    /// The drain reap rewrites a short pinned write too.
+    #[test]
+    fn a_drained_short_pinned_write_is_an_error() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let pin = DropPin {
+            bytes: vec![7u8; 8192],
+            dropped: std::rc::Rc::clone(&dropped),
+        };
+        let (tx, rx) = mpsc::channel();
+        let staged = core.submit_pwritev2_pinned(
+            &mut eng,
+            0,
+            file,
+            Box::new(pin),
+            None,
+            0,
+            0,
+            chan(&tx),
+        );
+        assert!(staged.is_ok(), "staged");
+        let [(t, s, g)] = inflight(&core)[..] else {
+            panic!("one op in flight");
+        };
+        let cqe = IoUringCqe {
+            user_data: pack_raw(t, s, g),
+            res: 4096, // short of the 8192 the pin holds
+            flags: 0,
+        };
+        core.on_drain_cqe(&cqe);
+        let out = rx.try_recv().expect("delivered");
+        assert_eq!(
+            out.res,
+            Err(Errno::EIO),
+            "a short pinned write survived the drain as a success"
+        );
+        assert!(dropped.get(), "and the drain let go of the pin");
+    }
+
+    /// Teardown drops every in-flight pin.
+    #[test]
+    fn teardown_drain_releases_pins() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let (tx, _rx) = mpsc::channel::<FsOutcome>();
+        let mut flags = Vec::new();
+        for _ in 0..4 {
+            // SAFETY: `synth_fd` just opened it; nothing else owns it.
+            let file =
+                Arc::new(unsafe { crate::fd::owned_from_raw(synth_fd()) });
+            let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            let pin = DropPin {
+                bytes: vec![1u8; 4096],
+                dropped: std::rc::Rc::clone(&dropped),
+            };
+            flags.push(dropped);
+            let staged = core.submit_pwritev2_pinned(
+                &mut eng,
+                1,
+                file,
+                Box::new(pin),
+                None,
+                0,
+                0,
+                chan(&tx),
+            );
+            assert!(staged.is_ok(), "staged");
+        }
+        assert!(flags.iter().all(|d| !d.get()), "all four held in flight");
+        for (tag, slot, generation) in inflight(&core) {
+            let cqe = IoUringCqe {
+                user_data: pack_raw(tag, slot, generation),
+                res: -libc::ECANCELED,
+                flags: 0,
+            };
+            core.on_drain_cqe(&cqe);
+        }
+        assert!(flags.iter().all(|d| d.get()), "teardown released every pin");
+        let mut free = core.op_free.clone();
+        free.sort_unstable();
+        assert_eq!(free, (0..8).collect::<Vec<_>>(), "and every op slot");
+    }
+
+    /// A fixed write stages `WRITE_FIXED` with the slot in `buf_index`
+    /// and the buffer's address and filled length in `addr`/`len`; the
+    /// unregistered form stages a one-iovec `WRITEV`.
+    #[test]
+    fn a_fixed_write_stages_write_fixed_and_a_pinned_one_writev() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        let bytes = vec![3u8; 12288];
+        let ptr = bytes.as_ptr() as u64;
+        let (tx, _rx) = mpsc::channel();
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let pin = DropPin {
+            bytes,
+            dropped: std::rc::Rc::clone(&dropped),
+        };
+        let staged = core.submit_pwritev2_pinned(
+            &mut eng,
+            0,
+            Arc::clone(&file),
+            Box::new(pin),
+            Some(9),
+            4096,
+            0,
+            chan(&tx),
+        );
+        assert!(staged.is_ok(), "staged");
+        let sqe = eng.staged_sqe(0);
+        assert_eq!(sqe.opcode, IORING_OP_WRITE_FIXED);
+        assert_eq!(sqe.addr, ptr, "the buffer's own address");
+        assert_eq!(sqe.len, 12288, "the filled length, not a count");
+        assert_eq!(sqe.buf_index, 9, "the slot");
+        assert_eq!(sqe.off_addr2, 4096);
+        assert_eq!(sqe.fd, fd);
+        let dropped2 = std::rc::Rc::new(std::cell::Cell::new(false));
+        let pin = DropPin {
+            bytes: vec![4u8; 100],
+            dropped: std::rc::Rc::clone(&dropped2),
+        };
+        let staged = core.submit_pwritev2_pinned(
+            &mut eng,
+            0,
+            Arc::clone(&file),
+            Box::new(pin),
+            None,
+            0,
+            0,
+            chan(&tx),
+        );
+        assert!(staged.is_ok(), "staged");
+        let sqe = eng.staged_sqe(1);
+        assert_eq!(sqe.opcode, IORING_OP_WRITEV);
+        assert_eq!(sqe.len, 1, "one iovec");
+        assert_eq!(sqe.buf_index, 0);
+        // Never submitted: the drain releases both pins.
+        eng.reset_staging();
+        for (t, s, g) in inflight(&core) {
+            core.on_drain_cqe(&crate::uring::sys::IoUringCqe {
+                user_data: pack_raw(t, s, g),
+                res: 0,
+                flags: 0,
+            });
+        }
+        assert!(dropped.get() && dropped2.get(), "both pins released");
+    }
+
+    /// A pinned submit refused for want of an op slot hands the pin back.
+    #[test]
+    fn a_pinned_submit_refused_hands_the_pin_back() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(1, OffloadBounds::default());
+        let (tx, _rx) = mpsc::channel::<FsOutcome>();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(synth_fd()) });
+        let first = DropPin {
+            bytes: vec![1u8; 4096],
+            dropped: std::rc::Rc::new(std::cell::Cell::new(false)),
+        };
+        assert!(
+            core.submit_pwritev2_pinned(
+                &mut eng,
+                1,
+                Arc::clone(&file),
+                Box::new(first),
+                None,
+                0,
+                0,
+                chan(&tx),
+            )
+            .is_ok(),
+            "the one slot"
+        );
+        let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+        let second = DropPin {
+            bytes: vec![2u8; 4096],
+            dropped: std::rc::Rc::clone(&dropped),
+        };
+        let Err((_w, pin)) = core.submit_pwritev2_pinned(
+            &mut eng,
+            1,
+            file,
+            Box::new(second),
+            None,
+            0,
+            0,
+            chan(&tx),
+        ) else {
+            panic!("a full table refuses");
+        };
+        assert!(!dropped.get(), "the caller has its pin back, undropped");
+        assert_eq!(pin.as_ref().as_ref(), &[2u8; 4096][..], "and intact");
+        drop(pin);
+        assert!(dropped.get());
     }
 
     /// N writes share one claim; the buffer surfaces from the last.

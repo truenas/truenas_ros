@@ -155,6 +155,16 @@ pub struct ServerConfig {
     /// provided-buffer rings degrades to owned buffers rather than failing
     /// to bind.
     pub recv_pool: bool,
+    /// The most bytes the ring's body pool retains between uses: placed
+    /// and promoted `Vec` bodies and the page-aligned `FIXED_RECORD`s a
+    /// direct write is staged in, together. It bounds what is
+    /// *retained*; records claimed and in flight are bounded by whatever
+    /// holds them, and they are what pinned memory follows. The ring's
+    /// fixed-buffer table is registered at the kernel's ceiling, and
+    /// only when the process holds `CAP_IPC_LOCK`, which exempts the
+    /// pinned pages from `RLIMIT_MEMLOCK`; without it records are
+    /// written by address. Default 64 MiB; at least one record.
+    pub body_pool_budget: usize,
     /// How the recv side answers a read that found the buffer pool
     /// **genuinely exhausted** - the ring at its registered bound with every
     /// buffer lent, which growth cannot answer. `Some(backoff)` (the
@@ -379,6 +389,7 @@ impl Default for ServerConfig {
             fs_body_pool: true,
             max_request_bytes: 1024 * 1024,
             recv_pool: true,
+            body_pool_budget: 64 * 1024 * 1024,
             recv_shortage_retry: Some(Duration::from_millis(10)),
             backlog: 128,
             unlink_unix: true,
@@ -463,6 +474,14 @@ impl ServerConfig {
             return Err(Error::Validation(format!(
                 "fs_body_chunk must be in \
                  {MIN_FS_BODY_CHUNK}..={MAX_FS_BODY_CHUNK}"
+            )));
+        }
+        // The pool must hold at least one record, or every direct write's
+        // staging is a fresh allocation the budget refuses to keep.
+        if self.body_pool_budget < crate::net::core::bodypool::FIXED_RECORD {
+            return Err(Error::Validation(format!(
+                "body_pool_budget must be at least {}",
+                crate::net::core::bodypool::FIXED_RECORD
             )));
         }
         // A body chunk is queued whole and counts toward `queued_bytes`, which

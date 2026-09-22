@@ -64,9 +64,11 @@ pub(crate) fn page_size() -> usize {
     if n > 0 { n as usize } else { 4096 }
 }
 
+pub(crate) mod aligned;
 #[cfg(feature = "net-server")]
 pub(crate) mod bufring;
 pub(crate) mod engine;
+pub(crate) mod fixed;
 pub(crate) mod personality;
 pub(crate) mod probe;
 pub(crate) mod ring;

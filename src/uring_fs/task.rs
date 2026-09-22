@@ -1983,8 +1983,8 @@ mod tests {
         TAG_CANCEL, TAG_WAKE, deliver_embedded, deliver_pool_completions,
     };
     use crate::uring_fs::{
-        Anchor, Leaf, OffloadBounds, OpenStep, Personality, RwFlags, StepPath,
-        ZfsAttr,
+        AlignedBuf, Anchor, Leaf, OffloadBounds, OpenStep, Personality,
+        RwFlags, StepPath, ZfsAttr,
     };
     use std::cell::Cell as StdCell;
     use std::cell::RefCell as StdRefCell;
@@ -2100,6 +2100,22 @@ mod tests {
 
     fn spec_dir() -> OpenHow {
         OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY)
+    }
+
+    /// A pin that lands in `home` when the op drops it.
+    struct HomingPin {
+        buf: Option<AlignedBuf>,
+        home: Rc<StdCell<Option<AlignedBuf>>>,
+    }
+    impl AsRef<[u8]> for HomingPin {
+        fn as_ref(&self) -> &[u8] {
+            self.buf.as_ref().map_or(&[], AsRef::as_ref)
+        }
+    }
+    impl Drop for HomingPin {
+        fn drop(&mut self) {
+            self.home.set(self.buf.take());
+        }
     }
 
     fn creating() -> OpenHow {
@@ -3313,6 +3329,627 @@ mod tests {
             "fired early: {:?}",
             started.elapsed()
         );
+    }
+
+    /// A pinned write lands the buffer's filled prefix, and the pin is
+    /// dropped before the completion runs.
+    #[test]
+    fn a_pinned_write_lands_the_buffer_and_releases_it_first() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let anchor = Anchor::open(dir.path()).expect("anchor");
+        let payload: Vec<u8> =
+            (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let done = Rc::new(StdCell::new(false));
+        let home: Rc<StdCell<Option<AlignedBuf>>> = Rc::new(StdCell::new(None));
+
+        {
+            let (done, payload, home) =
+                (Rc::clone(&done), payload.clone(), Rc::clone(&home));
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |t| async move {
+                let opened = t
+                    .fut(|c, cb| {
+                        c.open(who, &anchor, c"pinned.bin", creating(), cb)
+                    })
+                    .await;
+                let file = opened.file().expect("open");
+                let mut buf = AlignedBuf::new(1 << 20).expect("allocates");
+                assert_eq!(buf.fill(&payload), payload.len(), "fits");
+                let pin = HomingPin {
+                    buf: Some(buf),
+                    home: Rc::clone(&home),
+                };
+                // Observed inside the completion, not after the await.
+                let first: Rc<StdCell<Option<bool>>> =
+                    Rc::new(StdCell::new(None));
+                let wrote = t
+                    .fut(|c, cb| {
+                        let (home, first) =
+                            (Rc::clone(&home), Rc::clone(&first));
+                        c.pwritev2_pinned(
+                            who,
+                            file.clone(),
+                            pin,
+                            0,
+                            RwFlags::empty(),
+                            move |done, conn| {
+                                let back = home.take();
+                                first.set(Some(back.is_some()));
+                                home.set(back);
+                                cb(done, conn);
+                            },
+                        )
+                    })
+                    .await;
+                assert_eq!(
+                    wrote.result().expect("write") as usize,
+                    payload.len(),
+                    "the filled prefix, not the capacity"
+                );
+                assert_eq!(
+                    first.get(),
+                    Some(true),
+                    "the pin was home before the completion ran"
+                );
+                let released = home.take();
+                let released = released
+                    .expect("the pin was dropped before the completion ran");
+                assert_eq!(
+                    released.len(),
+                    payload.len(),
+                    "and came home intact"
+                );
+                let read = t
+                    .fut(|c, cb| {
+                        c.preadv2(
+                            who,
+                            file.clone(),
+                            vec![vec![0u8; payload.len() + 1]],
+                            0,
+                            RwFlags::empty(),
+                            cb,
+                        )
+                    })
+                    .await;
+                assert_eq!(
+                    read.result().expect("read") as usize,
+                    payload.len(),
+                    "nothing past the prefix reached the file"
+                );
+                assert_eq!(&read.into_bufs()[0][..payload.len()], &payload[..]);
+                done.set(true);
+            });
+        }
+        drive(&mut fs, &mut eng, &done, "pinned write");
+    }
+
+    /// A pinned write refused for want of an op slot is a marked `EBUSY`
+    /// that hands the pin back as the type it was given, bytes intact.
+    #[test]
+    fn a_refused_pinned_write_hands_its_buffer_back() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let who = Personality(
+            register_personality(eng.ring.raw_fd())
+                .expect("register_personality"),
+        );
+        eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm wake");
+        // One op slot: the second pinned write cannot be staged.
+        let mut fs = FsCore::new(1, OffloadBounds::default());
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let anchor = Anchor::open(dir.path()).expect("anchor");
+        let done = Rc::new(StdCell::new(false));
+        let home: Rc<StdCell<Option<AlignedBuf>>> = Rc::new(StdCell::new(None));
+        {
+            let (done, home) = (Rc::clone(&done), Rc::clone(&home));
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |t| async move {
+                let opened = t
+                    .fut(|c, cb| {
+                        c.open(who, &anchor, c"refused.bin", creating(), cb)
+                    })
+                    .await;
+                let file = opened.file().expect("open");
+                let mut first = AlignedBuf::new(1 << 16).expect("allocates");
+                assert_eq!(first.fill(&[1u8; 4096]), 4096);
+                let mut second = AlignedBuf::new(1 << 16).expect("allocates");
+                assert_eq!(second.fill(&[2u8; 4096]), 4096);
+                let pin1 = HomingPin {
+                    buf: Some(first),
+                    home: Rc::clone(&home),
+                };
+                let pin2 = HomingPin {
+                    buf: Some(second),
+                    home: Rc::new(StdCell::new(None)),
+                };
+                // Both submitted before either completes: the second
+                // finds the table full.
+                let a = t.fut(|c, cb| {
+                    c.pwritev2_pinned(
+                        who,
+                        file.clone(),
+                        pin1,
+                        0,
+                        RwFlags::empty(),
+                        cb,
+                    )
+                });
+                let b = t.fut(|c, cb| {
+                    c.pwritev2_pinned(
+                        who,
+                        file.clone(),
+                        pin2,
+                        4096,
+                        RwFlags::empty(),
+                        cb,
+                    )
+                });
+                let mut refused = b.await;
+                assert!(refused.was_refused(), "{:?}", refused.result());
+                assert!(matches!(
+                    refused.result(),
+                    Err(crate::Error::Errno(Errno::EBUSY))
+                ));
+                let mut pin = refused
+                    .take_pin::<HomingPin>()
+                    .expect("the pin rides the refusal back");
+                let buf = pin.buf.take().expect("with its buffer");
+                assert_eq!(buf.as_ref(), &[2u8; 4096][..], "bytes intact");
+                assert!(
+                    refused.take_pin::<HomingPin>().is_none(),
+                    "taken once"
+                );
+                let landed = a.await;
+                assert_eq!(
+                    landed.result().expect("first write") as usize,
+                    4096
+                );
+                done.set(true);
+            });
+        }
+        drive(&mut fs, &mut eng, &done, "refused pinned write");
+    }
+
+    /// A fixed write lands from its slot; a slot holding another buffer,
+    /// or one past the table, is `EFAULT` and the pin still comes home.
+    #[test]
+    fn a_fixed_write_lands_from_its_registered_slot() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        if !ipc_lock_or_skip() {
+            return;
+        }
+        let table =
+            crate::uring::fixed::FixedTable::register(eng.ring.raw_fd(), 2)
+                .expect("registers");
+        let dir = crate::tempdir::tempdir().expect("tempdir");
+        let anchor = Anchor::open(dir.path()).expect("anchor");
+        let payload: Vec<u8> =
+            (0..(96 * 1024u32)).map(|i| (i % 253) as u8).collect();
+        let done = Rc::new(StdCell::new(false));
+        let home: Rc<StdCell<Option<AlignedBuf>>> = Rc::new(StdCell::new(None));
+
+        let mut buf = AlignedBuf::new(1 << 20).expect("allocates");
+        assert_eq!(buf.fill(&payload), payload.len());
+        // Slot 0 holds a different live buffer.
+        let mut other = AlignedBuf::new(1 << 20).expect("allocates");
+        assert_eq!(other.fill(&vec![0xEEu8; 96 * 1024]), 96 * 1024);
+        table.install(1, &buf).expect("installs");
+        table.install(0, &other).expect("installs");
+        {
+            let (done, payload, home) =
+                (Rc::clone(&done), payload.clone(), Rc::clone(&home));
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |t| async move {
+                let opened = t
+                    .fut(|c, cb| {
+                        c.open(who, &anchor, c"fixed.bin", creating(), cb)
+                    })
+                    .await;
+                let file = opened.file().expect("open");
+                // Wrong slot: EFAULT, nothing written, pin comes home.
+                let pin = HomingPin {
+                    buf: Some(buf),
+                    home: Rc::clone(&home),
+                };
+                let wrong = t
+                    .fut(|c, cb| {
+                        c.pwritev2_fixed(
+                            who,
+                            file.clone(),
+                            pin,
+                            0,
+                            0,
+                            RwFlags::empty(),
+                            cb,
+                        )
+                    })
+                    .await;
+                assert!(
+                    matches!(
+                        wrong.result(),
+                        Err(crate::Error::Errno(Errno::EFAULT))
+                    ),
+                    "a slot holding another buffer: {:?}",
+                    wrong.result()
+                );
+                let buf =
+                    home.take().expect("the pin came home from the refusal");
+                assert_eq!(buf.len(), payload.len());
+                // A slot past the table likewise.
+                let pin = HomingPin {
+                    buf: Some(buf),
+                    home: Rc::clone(&home),
+                };
+                let past = t
+                    .fut(|c, cb| {
+                        c.pwritev2_fixed(
+                            who,
+                            file.clone(),
+                            pin,
+                            7,
+                            0,
+                            RwFlags::empty(),
+                            cb,
+                        )
+                    })
+                    .await;
+                assert!(
+                    matches!(
+                        past.result(),
+                        Err(crate::Error::Errno(Errno::EFAULT))
+                    ),
+                    "a slot past the table: {:?}",
+                    past.result()
+                );
+                let buf = home.take().expect("home again");
+                assert_eq!(buf.len(), payload.len());
+                // Slot 1 holds it: the write lands whole.
+                let pin = HomingPin {
+                    buf: Some(buf),
+                    home: Rc::clone(&home),
+                };
+                let wrote = t
+                    .fut(|c, cb| {
+                        c.pwritev2_fixed(
+                            who,
+                            file.clone(),
+                            pin,
+                            1,
+                            0,
+                            RwFlags::empty(),
+                            cb,
+                        )
+                    })
+                    .await;
+                assert_eq!(
+                    wrote.result().expect("write") as usize,
+                    payload.len()
+                );
+                assert!(
+                    home.take().is_some(),
+                    "and came home before the completion"
+                );
+                let read = t
+                    .fut(|c, cb| {
+                        c.preadv2(
+                            who,
+                            file.clone(),
+                            vec![vec![0u8; payload.len() + 1]],
+                            0,
+                            RwFlags::empty(),
+                            cb,
+                        )
+                    })
+                    .await;
+                assert_eq!(
+                    read.result().expect("read") as usize,
+                    payload.len()
+                );
+                assert_eq!(&read.into_bufs()[0][..payload.len()], &payload[..]);
+                done.set(true);
+            });
+        }
+        drive(&mut fs, &mut eng, &done, "fixed write");
+        table.clear(1).expect("clears");
+        table.clear(0).expect("clears");
+        drop(other);
+    }
+
+    /// Whether `CAP_IPC_LOCK` is held, so installs are uncharged; without
+    /// it the registered-buffer tests skip, and `TRUENAS_ROS_REQUIRE_ROOT`
+    /// makes that a failure.
+    fn ipc_lock_or_skip() -> bool {
+        let held = crate::uring::fixed::ipc_lock_held();
+        assert!(
+            held || std::env::var_os("TRUENAS_ROS_REQUIRE_ROOT").is_none(),
+            "TRUENAS_ROS_REQUIRE_ROOT is set but CAP_IPC_LOCK is not held"
+        );
+        held
+    }
+
+    /// A ZFS dataset (by `statfs` magic), or `None` to skip;
+    /// `TRUENAS_ROS_REQUIRE_ZFS` makes the skip a failure.
+    fn zfs_dir_or_skip() -> Option<std::path::PathBuf> {
+        let dir = std::env::var_os("TRUENAS_ROS_POSIX_DATASET")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/POSIXACL"));
+        let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())
+            .expect("no NUL in a path");
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: NUL-terminated path, zeroed out-struct.
+        let zfs = unsafe { libc::statfs(c.as_ptr(), &mut st) } == 0
+            && st.f_type == ZFS_SUPER_MAGIC;
+        if zfs {
+            return Some(dir);
+        }
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_ZFS").is_none(),
+            "TRUENAS_ROS_REQUIRE_ZFS is set but {} is not a ZFS dataset",
+            dir.display()
+        );
+        None
+    }
+
+    /// `(direct_write_count, direct_write_bytes)` summed over every
+    /// pool's `iostats` kstat. The count is per block.
+    fn direct_writes() -> (u64, u64) {
+        let mut count = 0;
+        let mut bytes = 0;
+        let Ok(pools) = std::fs::read_dir("/proc/spl/kstat/zfs") else {
+            return (0, 0);
+        };
+        for pool in pools.flatten() {
+            let Ok(text) = std::fs::read_to_string(pool.path().join("iostats"))
+            else {
+                continue;
+            };
+            for line in text.lines() {
+                let mut f = line.split_whitespace();
+                let (Some(name), Some(_ty), Some(v)) =
+                    (f.next(), f.next(), f.next())
+                else {
+                    continue;
+                };
+                let v: u64 = v.parse().unwrap_or(0);
+                match name {
+                    "direct_write_count" => count += v,
+                    "direct_write_bytes" => bytes += v,
+                    _ => {}
+                }
+            }
+        }
+        (count, bytes)
+    }
+
+    /// `zfs_dio_strict=1` for the guard's lifetime; `None` if it cannot
+    /// be written, which `TRUENAS_ROS_REQUIRE_ROOT` makes a failure. The
+    /// parameter is system-wide: every misaligned `O_DIRECT` write on the
+    /// host is `EINVAL` while it is engaged.
+    struct Strict(String);
+    const DIO_STRICT: &str = "/sys/module/zfs/parameters/zfs_dio_strict";
+    impl Strict {
+        fn engage() -> Option<Strict> {
+            let engaged = std::fs::read_to_string(DIO_STRICT)
+                .ok()
+                .filter(|_| std::fs::write(DIO_STRICT, "1").is_ok())
+                .map(Strict);
+            assert!(
+                engaged.is_some()
+                    || std::env::var_os("TRUENAS_ROS_REQUIRE_ROOT").is_none(),
+                "TRUENAS_ROS_REQUIRE_ROOT is set but {DIO_STRICT} cannot be set"
+            );
+            engaged
+        }
+    }
+    impl Drop for Strict {
+        fn drop(&mut self) {
+            let _ = std::fs::write(DIO_STRICT, self.0.trim());
+        }
+    }
+
+    /// The direct-write chain on a real ZFS dataset (the QEMU lane): a
+    /// file opened `O_DIRECT` on the ring, one record written by address
+    /// and one by `WRITE_FIXED`, `direct_write_bytes` moving by at least
+    /// the fixed record; then under `zfs_dio_strict=1` an aligned fixed
+    /// record accepted and an unaligned write `EINVAL`; read back through
+    /// a plain open.
+    #[test]
+    fn a_direct_write_on_zfs_bypasses_the_arc() {
+        let Some((mut eng, mut fs, who)) = rig() else {
+            return;
+        };
+        let Some(dir) = zfs_dir_or_skip() else {
+            return;
+        };
+        if !ipc_lock_or_skip() {
+            return;
+        }
+        let table =
+            crate::uring::fixed::FixedTable::register(eng.ring.raw_fd(), 2)
+                .expect("registers");
+        let anchor = Anchor::open(&dir).expect("anchor");
+        let name = std::ffi::CString::new(format!(
+            "direct-{}.bin",
+            std::process::id()
+        ))
+        .expect("name");
+        let record = 1usize << 20;
+        let mut first = AlignedBuf::new(record).expect("allocates");
+        let mut second = AlignedBuf::new(record).expect("allocates");
+        let mut third = AlignedBuf::new(record).expect("allocates");
+        let pattern = |seed: u32| -> Vec<u8> {
+            (0..record as u32)
+                .map(|i| (i.wrapping_mul(seed).wrapping_add(seed) % 251) as u8)
+                .collect()
+        };
+        let (p1, p2, p3) = (pattern(7), pattern(11), pattern(13));
+        assert_eq!(first.fill(&p1), record);
+        assert_eq!(second.fill(&p2), record);
+        assert_eq!(third.fill(&p3), record);
+        table.install(0, &second).expect("installs");
+        table.install(1, &third).expect("installs");
+        let done = Rc::new(StdCell::new(false));
+        let home: Rc<StdCell<Option<AlignedBuf>>> = Rc::new(StdCell::new(None));
+        let before = direct_writes();
+        {
+            let (done, home, dir, name) = (
+                Rc::clone(&done),
+                Rc::clone(&home),
+                dir.clone(),
+                name.clone(),
+            );
+            let (p1, p2, p3) = (p1.clone(), p2.clone(), p3.clone());
+            let mut conn = FsConn::new(&mut fs, &mut eng, None);
+            conn.spawn(move |t| async move {
+                let direct = OpenHow::new()
+                    .flags(OFlag::O_CREAT | OFlag::O_RDWR | OFlag::O_DIRECT)
+                    .mode(Mode::from_bits_truncate(0o600));
+                let opened = t
+                    .fut(|c, cb| c.open(who, &anchor, &name, direct, cb))
+                    .await;
+                let file = opened.file().expect("open O_DIRECT");
+                // Record 0 by address. A fresh file's first write is
+                // buffered while its block size grows; no kstat assert.
+                let pin = HomingPin {
+                    buf: Some(first),
+                    home: Rc::clone(&home),
+                };
+                let wrote = t
+                    .fut(|c, cb| {
+                        c.pwritev2_pinned(
+                            who,
+                            file.clone(),
+                            pin,
+                            0,
+                            RwFlags::empty(),
+                            cb,
+                        )
+                    })
+                    .await;
+                assert_eq!(wrote.result().expect("record 0") as usize, record);
+                home.take().expect("home");
+                // Record 1 from the registered slot: the direct path.
+                let pin = HomingPin {
+                    buf: Some(second),
+                    home: Rc::clone(&home),
+                };
+                let wrote = t
+                    .fut(|c, cb| {
+                        c.pwritev2_fixed(
+                            who,
+                            file.clone(),
+                            pin,
+                            0,
+                            record as u64,
+                            RwFlags::empty(),
+                            cb,
+                        )
+                    })
+                    .await;
+                assert_eq!(wrote.result().expect("record 1") as usize, record);
+                let second = home.take().expect("home");
+                let after = direct_writes();
+                assert!(
+                    after.1 >= before.1 + record as u64,
+                    "direct_write_bytes moved {} for a {record}-byte fixed \
+                     record: the write did not take the direct path \
+                     (zfs_dio_enabled off, or the dataset's `direct` \
+                     property disabled?)",
+                    after.1 - before.1
+                );
+                assert!(after.0 > before.0, "direct_write_count moved");
+                // Record 2, under strict mode where the parameter can be
+                // set: an aligned fixed record is still accepted.
+                let strict = Strict::engage();
+                let pin = HomingPin {
+                    buf: Some(third),
+                    home: Rc::clone(&home),
+                };
+                let wrote = t
+                    .fut(|c, cb| {
+                        c.pwritev2_fixed(
+                            who,
+                            file.clone(),
+                            pin,
+                            1,
+                            2 * record as u64,
+                            RwFlags::empty(),
+                            cb,
+                        )
+                    })
+                    .await;
+                assert_eq!(
+                    wrote.result().expect("record 2 under strict") as usize,
+                    record,
+                    "an aligned fixed record is direct under strict"
+                );
+                home.take().expect("home");
+                if strict.is_some() {
+                    let unaligned = t
+                        .fut(|c, cb| {
+                            c.pwritev2_pinned(
+                                who,
+                                file.clone(),
+                                vec![9u8; 4097],
+                                3 * record as u64,
+                                RwFlags::empty(),
+                                cb,
+                            )
+                        })
+                        .await;
+                    assert!(
+                        matches!(
+                            unaligned.result(),
+                            Err(crate::Error::Errno(Errno::EINVAL))
+                        ),
+                        "an unaligned write by address under strict: {:?}",
+                        unaligned.result()
+                    );
+                }
+                drop(strict);
+                drop(second);
+                // Read back through a plain open.
+                let plain = OpenHow::new().flags(OFlag::O_RDONLY);
+                let anchor = Anchor::open(&dir).expect("anchor");
+                let reopened =
+                    t.fut(|c, cb| c.open(who, &anchor, &name, plain, cb)).await;
+                let rfile = reopened.file().expect("reopen");
+                let read = t
+                    .fut(|c, cb| {
+                        c.preadv2(
+                            who,
+                            rfile.clone(),
+                            vec![vec![0u8; 3 * record + 1]],
+                            0,
+                            RwFlags::empty(),
+                            cb,
+                        )
+                    })
+                    .await;
+                assert_eq!(read.result().expect("read") as usize, 3 * record);
+                let got = read.into_bufs().remove(0);
+                assert!(got[..record] == p1[..], "record 0 read back");
+                assert!(
+                    got[record..2 * record] == p2[..],
+                    "record 1 read back"
+                );
+                assert!(
+                    got[2 * record..3 * record] == p3[..],
+                    "record 2 read back"
+                );
+                done.set(true);
+            });
+        }
+        drive(&mut fs, &mut eng, &done, "direct write on zfs");
+        table.clear(0).expect("clears");
+        table.clear(1).expect("clears");
+        let _ = std::fs::remove_file(dir.join(name.to_str().expect("utf-8")));
     }
 
     /// The core claim: a whole write chain - open, write, fsync, stat,

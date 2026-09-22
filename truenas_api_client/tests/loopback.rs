@@ -82,8 +82,26 @@ impl Conn {
         Some((h, payload))
     }
 
-    fn write(&mut self, bytes: &[u8]) {
-        self.stream.write_all(bytes).expect("server write");
+    /// Write to the peer; `false` once it has gone. A client that sends
+    /// its close and tears the socket down without waiting for the echo
+    /// leaves this server holding a frame nobody will read, and the
+    /// kernel answers `EPIPE`/`ECONNRESET` - the end of the connection,
+    /// not a failure of it. Panicking there made the whole loopback test
+    /// fail on that race.
+    fn write(&mut self, bytes: &[u8]) -> bool {
+        match self.stream.write_all(bytes) {
+            Ok(()) => true,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                false
+            }
+            Err(e) => panic!("server write: {e}"),
+        }
     }
 }
 
@@ -129,7 +147,11 @@ where
     };
     let head = conn.read_head().expect("request head");
     match conn.server.on_head(&head) {
-        ServerStep::Accept(resp) => conn.write(&resp),
+        ServerStep::Accept(resp) => {
+            if !conn.write(&resp) {
+                return;
+            }
+        }
         ServerStep::Reject(e) => panic!("rejected a valid upgrade: {e}"),
     }
     while let Some((head, payload)) = conn.read_frame() {
@@ -137,7 +159,11 @@ where
         let mut stop = false;
         for act in acts {
             match act {
-                ServerAct::Send(bytes) => conn.write(&bytes),
+                ServerAct::Send(bytes) => {
+                    if !conn.write(&bytes) {
+                        return;
+                    }
+                }
                 ServerAct::PeerClosing => stop = true,
                 ServerAct::Fault(what) => panic!("client fault: {what}"),
                 ServerAct::Notification { .. } => {}
@@ -150,11 +176,15 @@ where
                         Ok(v) => conn.server.reply(id, &v).expect("encode"),
                         Err(e) => conn.server.reply_error(id, e),
                     };
-                    conn.write(&frame);
+                    if !conn.write(&frame) {
+                        return;
+                    }
                     for (m, p) in ans.then_notify {
                         let f =
                             conn.server.notify(&m, Some(&p)).expect("notify");
-                        conn.write(&f);
+                        if !conn.write(&f) {
+                            return;
+                        }
                     }
                 }
             }
