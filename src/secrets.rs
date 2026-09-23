@@ -198,6 +198,39 @@ impl SecretMem {
         }
     }
 
+    /// Raise this process's `RLIMIT_MEMLOCK` to unlimited. The counter a
+    /// secret page is charged against is shared by every process of the
+    /// user, so a bounded limit lets any of them (a system-wide `perf`
+    /// charges 516 KiB per CPU) get this one's next page refused. Call at
+    /// start-up, before the first region and before any fork, since
+    /// children inherit it. Raising the hard limit needs
+    /// `CAP_SYS_RESOURCE`; without it the soft limit is raised to the hard
+    /// one and the `EPERM` is returned with that done.
+    pub fn unbound_memlock() -> Result<()> {
+        let unlimited = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        // SAFETY: a valid rlimit; the call reads it and touches nothing else.
+        if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &unlimited) } == 0 {
+            return Ok(());
+        }
+        let e = Errno::last();
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `lim` is a valid out-pointer for the call.
+        if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) } == 0
+            && lim.rlim_cur != lim.rlim_max
+        {
+            lim.rlim_cur = lim.rlim_max;
+            // SAFETY: as above; soft up to hard needs no privilege.
+            unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &lim) };
+        }
+        Err(e)
+    }
+
     /// The secret bytes, read-only; length is the requested `len`.
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: live mapping of `mapped >= len`; borrow tied to `&self`.
@@ -583,6 +616,26 @@ mod tests {
             libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0,
             "a refused secret page killed the child instead of erroring"
         );
+    }
+
+    /// After the raise the soft limit equals the hard one: both unlimited
+    /// with `CAP_SYS_RESOURCE`, else the soft one lifted to the hard.
+    #[test]
+    fn unbound_memlock_leaves_no_gap_below_the_hard_limit() {
+        let res = SecretMem::unbound_memlock();
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: a valid out-pointer for the call.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) },
+            0
+        );
+        assert_eq!(lim.rlim_cur, lim.rlim_max, "soft limit left below hard");
+        if res.is_ok() {
+            assert_eq!(lim.rlim_max, libc::RLIM_INFINITY);
+        }
     }
 
     #[test]
