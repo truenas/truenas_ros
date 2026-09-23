@@ -1380,7 +1380,10 @@ mod tests {
 
     /// The identity names the file image: equal across two reads of an
     /// unchanged file, different once it is rewritten, and never `same`
-    /// without a change cookie.
+    /// without a change cookie. On the ZFS dataset the QEMU job names,
+    /// since that is what the daemon reads from and tmpfs moves the
+    /// cookie too; there `TRUENAS_ROS_REQUIRE_CHANGE_COOKIE` turns a
+    /// missing cookie from a skip into a failure.
     #[cfg(feature = "secrets")]
     #[test]
     fn read_secret_path_identifies_the_image() {
@@ -1391,8 +1394,20 @@ mod tests {
             );
             return;
         }
+        /// Removes the file on the way out, on the dataset as in the tempdir.
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
         let dir = crate::tempdir().unwrap();
-        let path = dir.path().join("cred.ini");
+        let base = ["TRUENAS_ROS_POSIX_DATASET", "TRUENAS_ROS_NFS4_DATASET"]
+            .into_iter()
+            .find_map(|v| std::env::var_os(v).map(PathBuf::from))
+            .unwrap_or_else(|| dir.path().to_path_buf());
+        let path = base.join(format!("cred-{}.ini", std::process::id()));
+        let _cleanup = Cleanup(path.clone());
         std::fs::write(&path, "[user]\nkey = a\n").unwrap();
         let first = ConfigFile::raw().read_secret_path(&path).unwrap();
         let again = ConfigFile::raw().read_secret_path(&path).unwrap();
@@ -1404,6 +1419,12 @@ mod tests {
             assert!(first.same(&again));
             assert!(!first.same(&changed), "a rewrite kept the cookie");
         } else {
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_CHANGE_COOKIE").is_none(),
+                "TRUENAS_ROS_REQUIRE_CHANGE_COOKIE is set but {} reports no \
+                 change cookie",
+                path.display()
+            );
             assert!(!first.same(&again), "no cookie read as unchanged");
         }
     }
