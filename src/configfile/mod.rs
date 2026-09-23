@@ -62,6 +62,8 @@ mod write;
 use crate::AT_FDCWD;
 use crate::errno::Errno;
 use crate::error::{Error, Result};
+#[cfg(feature = "secrets")]
+use crate::sync_fs::{AtFlags, StatxMask, statx};
 use crate::sync_fs::{
     AtomicWriteOptions, Mode, OFlag, atomic_replace, safe_open,
 };
@@ -378,14 +380,18 @@ impl ConfigFile {
     ///
     /// Fails where `memfd_secret` is unavailable rather than degrading to
     /// an ordinary read.
+    ///
+    /// Returns which file image was read, so a caller can skip rebuilding
+    /// what it derived when the next read finds the same one
+    /// ([`StagedIdentity::same`]).
     #[cfg(feature = "secrets")]
-    pub fn read_secret_path(&mut self, path: &Path) -> Result<()> {
+    pub fn read_secret_path(&mut self, path: &Path) -> Result<StagedIdentity> {
         let source = path.display().to_string();
         // Staged first, and the two settings below only once it has
         // succeeded: both are one-way, so setting them ahead of a fallible
         // read permanently downgrades an already-populated interpolating
         // configuration to raw on a secret this call never got to read.
-        let staged = stage_secret_image(path)?;
+        let (id, staged) = stage_secret_image(path)?;
         self.scrub = true;
         // Read secrets verbatim. Interpolation would route a value through
         // `before_get`, whose growing accumulator orphans partial-plaintext
@@ -393,16 +399,17 @@ impl ConfigFile {
         // doc already names raw the secrets configuration.
         self.interp = Interp::None;
         match staged {
-            None => parse::read(self, &source, ""),
+            None => parse::read(self, &source, "")?,
             Some((mut mem, content)) => {
                 let slice = mem.as_mut_slice();
                 let text =
                     std::str::from_utf8(&slice[..content]).map_err(|_| {
                         Error::Parse("config file is not valid UTF-8".into())
                     })?;
-                parse::read(self, &source, text)
+                parse::read(self, &source, text)?
             }
         }
+        Ok(id)
     }
 
     /// Read each path in turn, **skipping** any that cannot be used - missing,
@@ -998,15 +1005,38 @@ fn read_filled(file: &mut std::fs::File, buf: &mut [u8]) -> Result<usize> {
     }
 }
 
+/// Which file image a secret read staged: the inode and its change cookie,
+/// taken from `statx` on the opened descriptor before the read, so a
+/// rewrite during the read shows up as a different cookie next time.
+#[cfg(feature = "secrets")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StagedIdentity {
+    /// `stx_ino`.
+    pub ino: u64,
+    /// `stx_change_cookie`, or `None` where the filesystem supplies none.
+    pub change_cookie: Option<u64>,
+}
+
+#[cfg(feature = "secrets")]
+impl StagedIdentity {
+    /// Whether `other` is the same unmodified file. Never true without a
+    /// cookie on both sides: no cookie means no way to know.
+    pub fn same(&self, other: &StagedIdentity) -> bool {
+        self.ino == other.ino
+            && self.change_cookie.is_some()
+            && self.change_cookie == other.change_cookie
+    }
+}
+
 /// Open `path` symlink-safely and stage its image - newline-normalized in
-/// place - in `memfd_secret` memory, returning the region and the
-/// content's length, or `None` for an empty file. Split from
-/// [`ConfigFile::read_secret_path`] so a test can hold the staged region
-/// and check what backs it.
+/// place - in `memfd_secret` memory, returning its identity with the
+/// region and the content's length, or `None` for an empty file. Split
+/// from [`ConfigFile::read_secret_path`] so a test can hold the staged
+/// region and check what backs it.
 #[cfg(feature = "secrets")]
 fn stage_secret_image(
     path: &Path,
-) -> Result<Option<(crate::secrets::SecretMem, usize)>> {
+) -> Result<(StagedIdentity, Option<(crate::secrets::SecretMem, usize)>)> {
     let mut file = safe_open(
         AT_FDCWD,
         path,
@@ -1014,14 +1044,29 @@ fn stage_secret_image(
         Mode::empty(),
     )?;
     let len = regular_file_len(&file, path)?;
+    let st = statx(
+        &file,
+        "",
+        AtFlags::AT_EMPTY_PATH,
+        StatxMask::INO | StatxMask::CHANGE_COOKIE,
+    )?;
+    let id = StagedIdentity {
+        ino: st.ino(),
+        change_cookie: st.change_cookie(),
+    };
     if len == 0 {
-        return Ok(None);
+        return Ok((id, None));
     }
-    let mut mem = crate::secrets::SecretMem::with_capacity(len + 1)?;
+    let mut mem = crate::secrets::SecretMem::with_capacity(len + 1).map_err(
+        |e| match e {
+            Errno::EFAULT => Error::SecretMemRefused,
+            e => Error::Errno(e),
+        },
+    )?;
     let slice = mem.as_mut_slice();
     let filled = read_filled(&mut file, slice)?;
     let content = normalize_newlines_slice(&mut slice[..filled]);
-    Ok(Some((mem, content)))
+    Ok((id, Some((mem, content))))
 }
 
 /// Read a whole file to a UTF-8 `String`, opened symlink-safely, with line
@@ -1333,6 +1378,36 @@ mod tests {
         assert!(!cfg.scrub, "and marked it scrubbed");
     }
 
+    /// The identity names the file image: equal across two reads of an
+    /// unchanged file, different once it is rewritten, and never `same`
+    /// without a change cookie.
+    #[cfg(feature = "secrets")]
+    #[test]
+    fn read_secret_path_identifies_the_image() {
+        if !crate::secrets::SecretMem::available() {
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_SECRETMEM").is_none(),
+                "memfd_secret unavailable but REQUIRE_SECRETMEM is set"
+            );
+            return;
+        }
+        let dir = crate::tempdir().unwrap();
+        let path = dir.path().join("cred.ini");
+        std::fs::write(&path, "[user]\nkey = a\n").unwrap();
+        let first = ConfigFile::raw().read_secret_path(&path).unwrap();
+        let again = ConfigFile::raw().read_secret_path(&path).unwrap();
+        assert_eq!(first, again);
+        std::fs::write(&path, "[user]\nkey = b\n").unwrap();
+        let changed = ConfigFile::raw().read_secret_path(&path).unwrap();
+        assert_eq!(first.ino, changed.ino, "rewritten in place");
+        if first.change_cookie.is_some() {
+            assert!(first.same(&again));
+            assert!(!first.same(&changed), "a rewrite kept the cookie");
+        } else {
+            assert!(!first.same(&again), "no cookie read as unchanged");
+        }
+    }
+
     /// The staged image really is `memfd_secret` memory: its VMA is the
     /// `/secretmem` pseudo-file and carries secretmem's undumpable and
     /// no-fork flags, which an ordinary heap buffer's does not. Catches
@@ -1351,7 +1426,7 @@ mod tests {
         let dir = crate::tempdir().unwrap();
         let path = dir.path().join("cred.ini");
         std::fs::write(&path, "[user]\r\nkey = sw0rdf1sh\r\n").unwrap();
-        let (mem, content) = stage_secret_image(&path).unwrap().unwrap();
+        let (mem, content) = stage_secret_image(&path).unwrap().1.unwrap();
         // Normalized in place, in the region.
         assert_eq!(&mem.as_slice()[..content], b"[user]\nkey = sw0rdf1sh\n");
         let vma = crate::secrets::vma_of(mem.as_slice().as_ptr() as usize)
