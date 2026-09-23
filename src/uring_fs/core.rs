@@ -5681,6 +5681,9 @@ mod hybrid_tests {
         while !done() {
             guard += 1;
             assert!(guard < 5_000_000, "reactor stalled");
+            // What the loops do before they block: wake the pool for
+            // every job the last pass queued (`FsCore::flush_offloads`).
+            fs.flush_offloads();
             eng.ring.submit_and_wait(1).expect("submit_and_wait");
             let mut cqes = Vec::new();
             while let Some(cqe) = eng.ring.reap() {
