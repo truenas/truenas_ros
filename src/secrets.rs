@@ -8,9 +8,11 @@
 //! secretmem sets no `VM_LOCKED`. `RLIMIT_MEMLOCK` is charged page by page
 //! at first touch, to the `locked_vm` of the user who created the file
 //! (`:65-72`, `:275`), with no `CAP_IPC_LOCK` bypass; a fault over the
-//! limit is `SIGBUS` (`:136-138`). That is stable 853043cb1294 (mainline
-//! 97d34aa65c29), shipped from 6.18.52. Earlier 6.18 kernels stamp
-//! `VM_LOCKED` too and check the limit at `mmap`.
+//! limit is `SIGBUS` (`:136-138`), so construction faults every page in
+//! from the kernel side and reports a refusal as `EFAULT` instead. That
+//! is stable 853043cb1294 (mainline 97d34aa65c29), shipped from 6.18.52.
+//! Earlier 6.18 kernels stamp `VM_LOCKED` too and check the limit at
+//! `mmap`.
 //!
 //! This is memory-access hardening, not at-rest encryption: a usable secret is
 //! plaintext in the region while the process runs; what it removes are the
@@ -53,6 +55,34 @@ fn unsupported(e: Errno) -> bool {
     matches!(e, Errno::ENOSYS | Errno::EPERM)
 }
 
+/// Fault every page of a fresh mapping in from the kernel side, by reading
+/// `len` bytes of `/dev/zero` into it. A page the kernel refuses ends the
+/// read short or with `EFAULT`; both come back as [`Errno::EFAULT`]. A
+/// userspace touch would be `SIGBUS` instead, and `MAP_POPULATE`, `mlock`
+/// and `MADV_POPULATE_WRITE` all go through `get_user_pages`, which
+/// refuses secretmem outright.
+fn prefault(p: *mut libc::c_void, len: usize) -> Result<()> {
+    let zero = std::fs::File::open("/dev/zero")
+        .map_err(|e| Errno::try_from(e).unwrap_or(Errno::EIO))?;
+    let mut done = 0;
+    while done < len {
+        // SAFETY: `p..p+len` is our own live mapping; nothing else
+        // references it yet, and the kernel writes only within it.
+        let n =
+            unsafe { libc::read(zero.as_raw_fd(), p.add(done), len - done) };
+        if n > 0 {
+            done += n as usize;
+        } else if n < 0 && matches!(Errno::last(), Errno::EINTR) {
+            continue;
+        } else if n < 0 {
+            return Err(Errno::last());
+        } else {
+            return Err(Errno::EFAULT);
+        }
+    }
+    Ok(())
+}
+
 /// The system page size, the granularity secretmem allocates in.
 fn page_size() -> usize {
     // SAFETY: `sysconf` with a valid name reads no memory and returns a long.
@@ -87,13 +117,15 @@ impl SecretMem {
     /// A `len`-byte region, zero-filled. [`Errno::ENOSYS`] if secretmem is
     /// unavailable.
     ///
-    /// `RLIMIT_MEMLOCK` is not checked here. Each page is charged when it
-    /// is first touched (`secretmem_account_folio` in `secretmem_fault`,
-    /// `mm/secretmem.c:136`), and a fault over the limit is `SIGBUS`, not
-    /// an error this call can return. The counter is per user across every
-    /// secretmem file that user created, root included, and the limit is
-    /// the faulting task's. A 6.18 kernel before .52 checks the limit at
-    /// `mmap` instead, so there this call returns `EAGAIN`.
+    /// `RLIMIT_MEMLOCK` is charged here. Each page is charged when it is
+    /// first touched (`secretmem_account_folio` in `secretmem_fault`,
+    /// `mm/secretmem.c:136`) and a refused page is `SIGBUS` on the
+    /// toucher, so every page is touched from the kernel side before this
+    /// returns and a refusal is [`Errno::EFAULT`] from this call. The
+    /// counter is per user across every secretmem file that user created,
+    /// root included, and the limit is this task's. A 6.18 kernel before
+    /// .52 checks the limit at `mmap` instead, so there this call returns
+    /// `EAGAIN`.
     pub fn with_capacity(len: usize) -> Result<SecretMem> {
         let page = page_size();
         let mapped = len
@@ -136,6 +168,11 @@ impl SecretMem {
             unsafe { libc::munmap(p, mapped) };
             return Err(e);
         }
+        if let Err(e) = prefault(p, mapped) {
+            // SAFETY: as above; nothing else has the mapping yet.
+            unsafe { libc::munmap(p, mapped) };
+            return Err(e);
+        }
         // The mapping holds its own inode reference, so drop the fd now: no
         // reopenable handle to the secret lingers in `/proc/self/fd`.
         drop(fd);
@@ -150,11 +187,10 @@ impl SecretMem {
     /// fail closed; `false` means no `CONFIG_SECRETMEM`, it was disabled, the
     /// arch gate is unmet, or seccomp blocks the syscall.
     ///
-    /// Support, not headroom. `RLIMIT_MEMLOCK` is charged page by page at
-    /// first touch, not when the syscall is made (`secretmem_account_folio`,
-    /// `mm/secretmem.c:136`), so a `true` here does not promise the next
-    /// [`with_capacity`](Self::with_capacity) fits the limit - that is a
-    /// `SIGBUS` on the first write, as documented there.
+    /// Support, not headroom: `RLIMIT_MEMLOCK` is charged by
+    /// [`with_capacity`](Self::with_capacity), which returns `EFAULT` when
+    /// a page is refused, so a `true` here does not promise the next region
+    /// fits the limit.
     pub fn available() -> bool {
         match memfd_secret() {
             Ok(_) => true,
@@ -512,6 +548,40 @@ mod tests {
         assert!(
             libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0,
             "construction did not fail closed under fd exhaustion"
+        );
+    }
+
+    /// A page the limit refuses is an error from construction, never a
+    /// signal on a later write. Forced in a child by lowering
+    /// `RLIMIT_MEMLOCK` to one page; a kernel that charges secretmem
+    /// refuses the region, one that does not hands it over, and either
+    /// way the child must exit rather than die of `SIGBUS` writing to it.
+    #[test]
+    fn a_refused_page_is_an_error_not_a_signal() {
+        if !secretmem_or_skip() {
+            return;
+        }
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let page = page_size() as libc::rlim_t;
+            let lim = libc::rlimit {
+                rlim_cur: page,
+                rlim_max: page,
+            };
+            // SAFETY: a valid rlimit for a limit this process may lower.
+            unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &lim) };
+            if let Ok(mut mem) = SecretMem::with_capacity(page_size() * 2) {
+                mem.as_mut_slice().fill(0x5A);
+            }
+            // SAFETY: async-signal-safe exit; reaching it is the verdict.
+            unsafe { libc::_exit(0) };
+        }
+        let mut st = 0;
+        unsafe { libc::waitpid(pid, &mut st, 0) };
+        assert!(
+            libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0,
+            "a refused secret page killed the child instead of erroring"
         );
     }
 
