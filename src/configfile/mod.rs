@@ -1026,6 +1026,35 @@ impl StagedIdentity {
             && self.change_cookie.is_some()
             && self.change_cookie == other.change_cookie
     }
+
+    /// The identity of `path` now, without reading it: what a caller
+    /// compares against the last
+    /// [`read_secret_path`](ConfigFile::read_secret_path) before deciding
+    /// whether to read again. Opens the file the way the read does and
+    /// stages nothing.
+    pub fn of_path(path: &Path) -> Result<StagedIdentity> {
+        let file = safe_open(
+            AT_FDCWD,
+            path,
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        regular_file_len(&file, path)?;
+        Self::of_file(&file)
+    }
+
+    fn of_file(file: &std::fs::File) -> Result<StagedIdentity> {
+        let st = statx(
+            file,
+            "",
+            AtFlags::AT_EMPTY_PATH,
+            StatxMask::INO | StatxMask::CHANGE_COOKIE,
+        )?;
+        Ok(StagedIdentity {
+            ino: st.ino(),
+            change_cookie: st.change_cookie(),
+        })
+    }
 }
 
 /// Open `path` symlink-safely and stage its image - newline-normalized in
@@ -1044,16 +1073,7 @@ fn stage_secret_image(
         Mode::empty(),
     )?;
     let len = regular_file_len(&file, path)?;
-    let st = statx(
-        &file,
-        "",
-        AtFlags::AT_EMPTY_PATH,
-        StatxMask::INO | StatxMask::CHANGE_COOKIE,
-    )?;
-    let id = StagedIdentity {
-        ino: st.ino(),
-        change_cookie: st.change_cookie(),
-    };
+    let id = StagedIdentity::of_file(&file)?;
     if len == 0 {
         return Ok((id, None));
     }
@@ -1380,7 +1400,10 @@ mod tests {
 
     /// The identity names the file image: equal across two reads of an
     /// unchanged file, different once it is rewritten, and never `same`
-    /// without a change cookie.
+    /// without a change cookie. On the ZFS dataset the QEMU job names,
+    /// since that is what the daemon reads from and tmpfs moves the
+    /// cookie too; there `TRUENAS_ROS_REQUIRE_CHANGE_COOKIE` turns a
+    /// missing cookie from a skip into a failure.
     #[cfg(feature = "secrets")]
     #[test]
     fn read_secret_path_identifies_the_image() {
@@ -1391,8 +1414,20 @@ mod tests {
             );
             return;
         }
+        /// Removes the file on the way out, on the dataset as in the tempdir.
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
         let dir = crate::tempdir().unwrap();
-        let path = dir.path().join("cred.ini");
+        let base = ["TRUENAS_ROS_POSIX_DATASET", "TRUENAS_ROS_NFS4_DATASET"]
+            .into_iter()
+            .find_map(|v| std::env::var_os(v).map(PathBuf::from))
+            .unwrap_or_else(|| dir.path().to_path_buf());
+        let path = base.join(format!("cred-{}.ini", std::process::id()));
+        let _cleanup = Cleanup(path.clone());
         std::fs::write(&path, "[user]\nkey = a\n").unwrap();
         let first = ConfigFile::raw().read_secret_path(&path).unwrap();
         let again = ConfigFile::raw().read_secret_path(&path).unwrap();
@@ -1404,8 +1439,45 @@ mod tests {
             assert!(first.same(&again));
             assert!(!first.same(&changed), "a rewrite kept the cookie");
         } else {
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_CHANGE_COOKIE").is_none(),
+                "TRUENAS_ROS_REQUIRE_CHANGE_COOKIE is set but {} reports no \
+                 change cookie",
+                path.display()
+            );
             assert!(!first.same(&again), "no cookie read as unchanged");
         }
+    }
+
+    /// The probe answers what the read would, without staging anything,
+    /// and moves with the file the same way.
+    #[cfg(feature = "secrets")]
+    #[test]
+    fn identity_of_path_matches_the_read() {
+        if !crate::secrets::SecretMem::available() {
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_SECRETMEM").is_none(),
+                "memfd_secret unavailable but REQUIRE_SECRETMEM is set"
+            );
+            return;
+        }
+        let dir = crate::tempdir().unwrap();
+        let path = dir.path().join("cred.ini");
+        std::fs::write(&path, "[user]\nkey = a\n").unwrap();
+        let probed = StagedIdentity::of_path(&path).unwrap();
+        let read = ConfigFile::raw().read_secret_path(&path).unwrap();
+        assert_eq!(probed, read);
+        std::fs::write(&path, "[user]\nkey = b\n").unwrap();
+        let after = StagedIdentity::of_path(&path).unwrap();
+        assert_eq!(after.ino, probed.ino);
+        if probed.change_cookie.is_some() {
+            assert!(probed.same(&read));
+            assert!(!after.same(&probed), "a rewrite kept the cookie");
+        }
+        StagedIdentity::of_path(&dir.path().join("nope.ini"))
+            .expect_err("a missing file has no identity");
+        StagedIdentity::of_path(dir.path())
+            .expect_err("a directory is not a secret file");
     }
 
     /// The staged image really is `memfd_secret` memory: its VMA is the
