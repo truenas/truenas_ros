@@ -9191,27 +9191,23 @@ fn server_privileged_xattr_policy_reaches_the_embedded_reactor() {
                         return deferred
                             .reply(echo_frame(format!("SET {e}").as_bytes()));
                     }
-                    fs.fremovexattr(
-                        f2,
-                        c"trusted.other".into(),
-                        move |out, fs| {
-                            if out.is_ok() {
-                                return deferred
-                                    .reply(echo_frame(b"UNCOVERED-REMOVED"));
-                            }
-                            fs.fremovexattr(
-                                f3,
-                                c"trusted.test_x".into(),
-                                move |cov, _fs| match cov {
-                                    Ok(()) => deferred
-                                        .reply(echo_frame(b"policy-enforced")),
-                                    Err(e) => deferred.reply(echo_frame(
-                                        format!("RM-COVERED {e}").as_bytes(),
-                                    )),
-                                },
-                            );
-                        },
-                    );
+                    fs.fremovexattr(f2, c"trusted.other", move |out, fs| {
+                        if out.is_ok() {
+                            return deferred
+                                .reply(echo_frame(b"UNCOVERED-REMOVED"));
+                        }
+                        fs.fremovexattr(
+                            f3,
+                            c"trusted.test_x",
+                            move |cov, _fs| match cov {
+                                Ok(()) => deferred
+                                    .reply(echo_frame(b"policy-enforced")),
+                                Err(e) => deferred.reply(echo_frame(
+                                    format!("RM-COVERED {e}").as_bytes(),
+                                )),
+                            },
+                        );
+                    });
                 },
             );
         });
@@ -9329,7 +9325,7 @@ fn fs_file_carries_personality_and_as_root() {
             let name = CString::new("user.tr_test").unwrap();
             fs.fgetxattr_as_root(
                 file.clone(),
-                &name,
+                name.clone(),
                 vec![0u8; 64],
                 move |d, fs| {
                     fs.close(file);
@@ -9441,7 +9437,7 @@ fn fs_metadata_ops_rename_truncate_xattr() {
                     fs.fgetxattr(
                         who,
                         file.clone(),
-                        &name,
+                        name.clone(),
                         vec![0u8; 64],
                         move |d, fs| {
                             fs.close(file);
@@ -10492,7 +10488,7 @@ fn fs_as_root_reads_trusted_xattr_across_privilege() {
             fs.fgetxattr(
                 peer,
                 file.clone(),
-                &name,
+                name.clone(),
                 vec![0u8; 32],
                 move |d1, fs| {
                     let peer_failed = d1.result().is_err();
@@ -10500,7 +10496,7 @@ fn fs_as_root_reads_trusted_xattr_across_privilege() {
                     // (2) As ambient root: CAP_SYS_ADMIN -> the value.
                     fs.fgetxattr_as_root(
                         file,
-                        &name2,
+                        name2.clone(),
                         vec![0u8; 32],
                         move |d2, _fs| {
                             let mut out = Vec::new();

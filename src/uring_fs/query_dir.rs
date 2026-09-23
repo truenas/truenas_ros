@@ -641,7 +641,7 @@ impl QueryDir {
                                     .start_fgetxattr(
                                         who,
                                         f,
-                                        xn,
+                                        xn.clone(),
                                         vec![0u8; 4096],
                                     )
                                     .ok();
@@ -654,7 +654,7 @@ impl QueryDir {
                                 .start_fgetxattr(
                                     who,
                                     f,
-                                    &self.opts.acl_name,
+                                    self.opts.acl_name.clone(),
                                     vec![0u8; 65536],
                                 )
                                 .ok();
@@ -688,7 +688,7 @@ impl QueryDir {
                                     .start_fgetxattr(
                                         who,
                                         f,
-                                        &dn,
+                                        dn.clone(),
                                         vec![0u8; DISCOVER_BUF],
                                     )
                                     .ok();
@@ -1371,13 +1371,13 @@ fn refetch_grow(
 ) -> Option<Vec<u8>> {
     let mut tries = 0u32;
     loop {
-        let (size, _) = h.fgetxattr(who, f, name, Vec::new());
+        let (size, _) = h.fgetxattr(who, f, name.to_owned(), Vec::new());
         let size = size.ok()?;
         if size > XATTR_SIZE_MAX {
             return None;
         }
         let cap = xattr_retry_cap(size, tries);
-        let (n, buf) = h.fgetxattr(who, f, name, vec![0u8; cap]);
+        let (n, buf) = h.fgetxattr(who, f, name.to_owned(), vec![0u8; cap]);
         match n {
             Ok(n) => return narrow(buf, n),
             Err(crate::Error::Errno(e)) if is_short_buffer(e) => {
@@ -1425,7 +1425,9 @@ pub(crate) fn scan_xattrs(
     let pending: Vec<(CString, Option<FsPending>)> = names
         .into_iter()
         .map(|n| {
-            let p = h.start_fgetxattr(who, f, &n, vec![0u8; DISCOVER_BUF]).ok();
+            let p = h
+                .start_fgetxattr(who, f, n.clone(), vec![0u8; DISCOVER_BUF])
+                .ok();
             (n, p)
         })
         .collect();

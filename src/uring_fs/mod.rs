@@ -389,6 +389,7 @@ use crate::sync_fs::{
     StatxMask, StatxRaw, ZfsAttr,
 };
 use crate::uring::wake::LoopShared;
+use std::borrow::Cow;
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -1209,12 +1210,12 @@ pub(crate) enum FsInject {
         reply: ReplyTo,
     },
     /// A metadata op on an open file: ftruncate/fallocate (no payload) or
-    /// fgetxattr/fsetxattr (owned name + value).
+    /// fgetxattr/fsetxattr (name + value).
     FdMeta {
         tag: u8,
         pers: u16,
         file: Arc<OwnedFd>,
-        name: Option<CString>,
+        name: Option<Cow<'static, CStr>>,
         value: Vec<u8>,
         off: u64,
         len64: u64,
@@ -1227,7 +1228,7 @@ pub(crate) enum FsInject {
     /// [`FsConn::fgetxattr_as_root`](core::FsConn::fgetxattr_as_root)).
     FdMetaAsRoot {
         file: Arc<OwnedFd>,
-        name: CString,
+        name: Cow<'static, CStr>,
         value: Vec<u8>,
         reply: ReplyTo,
     },
@@ -1237,7 +1238,7 @@ pub(crate) enum FsInject {
     /// (see `FsCore::remove_priv_xattr`).
     FRemoveXattr {
         file: Arc<OwnedFd>,
-        name: CString,
+        name: Cow<'static, CStr>,
         reply: ReplyTo,
     },
     /// `statx` or a directory-entry op, resolved against real anchor dirfds.
@@ -1774,7 +1775,7 @@ impl FsHandle {
         &self,
         who: Personality,
         f: &File,
-        name: &CStr,
+        name: impl Into<Cow<'static, CStr>>,
         buf: Vec<u8>,
     ) -> crate::Result<FsPending> {
         let (tx, rx) = mpsc::channel();
@@ -1782,7 +1783,7 @@ impl FsHandle {
             tag: core::TAG_FGETXATTR,
             pers: who.0,
             file: f.fd.clone(),
-            name: Some(name.to_owned()),
+            name: Some(name.into()),
             value: buf,
             off: 0,
             len64: 0,
@@ -1856,14 +1857,14 @@ impl FsHandle {
         &self,
         who: Personality,
         f: &File,
-        name: &CStr,
+        name: impl Into<Cow<'static, CStr>>,
         buf: Vec<u8>,
     ) -> (crate::Result<usize>, Vec<u8>) {
         self.fd_meta_buf(
             core::TAG_FGETXATTR,
             who,
             f,
-            Some(name.to_owned()),
+            Some(name.into()),
             buf,
             0,
             0,
@@ -1882,13 +1883,13 @@ impl FsHandle {
     pub fn fgetxattr_as_root(
         &self,
         f: &File,
-        name: &CStr,
+        name: impl Into<Cow<'static, CStr>>,
         buf: Vec<u8>,
     ) -> (crate::Result<usize>, Vec<u8>) {
         let (tx, rx) = mpsc::channel();
         let sent = self.send(FsInject::FdMetaAsRoot {
             file: f.fd.clone(),
-            name: name.to_owned(),
+            name: name.into(),
             value: buf,
             reply: ReplyTo::Sync(tx),
         });
@@ -1920,7 +1921,7 @@ impl FsHandle {
         &self,
         who: Personality,
         f: &File,
-        name: &CStr,
+        name: impl Into<Cow<'static, CStr>>,
         value: Vec<u8>,
         flags: i32,
     ) -> (crate::Result<()>, Vec<u8>) {
@@ -1928,7 +1929,7 @@ impl FsHandle {
             core::TAG_FSETXATTR,
             who,
             f,
-            Some(name.to_owned()),
+            Some(name.into()),
             value,
             0,
             0,
@@ -2020,12 +2021,16 @@ impl FsHandle {
     /// for the identity check: a caller may clear metadata this reactor
     /// wrote, and nothing else. To let a *user* remove their own attribute,
     /// do it on a thread that holds their credentials - this API cannot.
-    pub fn fremovexattr(&self, f: &File, name: &CStr) -> crate::Result<()> {
+    pub fn fremovexattr(
+        &self,
+        f: &File,
+        name: impl Into<Cow<'static, CStr>>,
+    ) -> crate::Result<()> {
         let (tx, rx) = mpsc::channel();
         let out = self.call(
             FsInject::FRemoveXattr {
                 file: f.fd.clone(),
-                name: name.to_owned(),
+                name: name.into(),
                 reply: ReplyTo::Sync(tx),
             },
             &rx,
@@ -2466,7 +2471,7 @@ impl FsHandle {
         tag: u8,
         who: Personality,
         f: &File,
-        name: Option<CString>,
+        name: Option<Cow<'static, CStr>>,
         value: Vec<u8>,
         off: u64,
         len64: u64,
