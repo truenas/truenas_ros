@@ -44,6 +44,7 @@ use crate::uring::sys::{
 };
 use crate::uring::user_data::{pack_raw, unpack_raw};
 use std::any::Any;
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -338,8 +339,10 @@ struct FsOpEntry {
     /// heap allocations, which never move while parked here.
     iov: Vec<libc::iovec>,
     /// Primary path payload: the `OPENAT2` path, a `STATX`/directory-op
-    /// leaf, an xattr name, or a symlink target.
-    path: Option<CString>,
+    /// leaf, an xattr name, or a symlink target. The SQE carries its
+    /// address, so it must not move until the CQE reaps. A `'static`
+    /// name is borrowed, which holds that without an allocation.
+    path: Option<Cow<'static, CStr>>,
     /// Secondary path payload (the destination leaf of rename/link, the
     /// link path of symlinkat).
     path2: Option<CString>,
@@ -1160,7 +1163,7 @@ impl FsCore {
     pub(crate) fn remove_priv_xattr(
         &mut self,
         file: Arc<OwnedFd>,
-        name: CString,
+        name: Cow<'static, CStr>,
         reply: ReplyTo,
     ) {
         if !self.priv_xattrs.permits(&name) {
@@ -1306,7 +1309,7 @@ impl FsCore {
         let e = &mut entry.state;
         e.state = FsOpState::InFlight { tag: TAG_OPEN };
         e.waiter = Some(waiter);
-        e.path = Some(path);
+        e.path = Some(Cow::Owned(path));
         e.how = Some(Box::new(how));
         e.strip_nonblock = guarded;
         let dirfd = anchor.raw_fd();
@@ -1929,7 +1932,7 @@ impl FsCore {
     }
 
     /// Stage a metadata op that targets an **open file**: `FTRUNCATE`/
-    /// `FALLOCATE` (no payload) and `FGETXATTR`/`FSETXATTR` (owned name +
+    /// `FALLOCATE` (no payload) and `FGETXATTR`/`FSETXATTR` (name +
     /// value). The file was permission-checked at open, and the fd is the
     /// capability; the op runs as `pers`.
     ///
@@ -1956,7 +1959,7 @@ impl FsCore {
         tag: u8,
         pers: u16,
         file: Arc<OwnedFd>,
-        name: Option<CString>,
+        name: Option<Cow<'static, CStr>>,
         value: Vec<u8>,
         off: u64,
         len64: u64,
@@ -1997,7 +2000,7 @@ impl FsCore {
         &mut self,
         eng: &mut Engine,
         file: Arc<OwnedFd>,
-        name: CString,
+        name: Cow<'static, CStr>,
         value: Vec<u8>,
         waiter: FsWaiter,
     ) {
@@ -2059,7 +2062,7 @@ impl FsCore {
         tag: u8,
         personality_raw: u16,
         file: Arc<OwnedFd>,
-        name: Option<CString>,
+        name: Option<Cow<'static, CStr>>,
         value: Vec<u8>,
         off: u64,
         len64: u64,
@@ -2259,7 +2262,7 @@ impl FsCore {
         let e = &mut entry.state;
         e.state = FsOpState::InFlight { tag };
         e.waiter = Some(waiter);
-        e.path = Some(n1);
+        e.path = Some(Cow::Owned(n1));
         e.path2 = n2;
         if tag == TAG_STATX {
             // SAFETY: `StatxRaw` is all-integer plain data; the kernel
@@ -2379,10 +2382,9 @@ impl FsCore {
         let e = &mut entry.state;
         e.state = FsOpState::InFlight { tag: TAG_LINKAT };
         e.waiter = Some(waiter);
-        // The empty source path AT_EMPTY_PATH resolves against `sqe.fd`. Owned
-        // by the entry like any other path payload: the kernel reads it at
-        // execution, which is after this call returns.
-        e.path = Some(CString::default());
+        // The empty source path AT_EMPTY_PATH resolves against `sqe.fd`. A
+        // literal, so the entry borrows it: nothing to allocate or free.
+        e.path = Some(Cow::Borrowed(c""));
         e.path2 = Some(n2);
         let old_fd = file.as_raw_fd();
         let new_dfd = a2.raw_fd();
@@ -4327,7 +4329,7 @@ impl<'a> FsConn<'a> {
         &mut self,
         who: Personality,
         f: File,
-        name: &CStr,
+        name: impl Into<Cow<'static, CStr>>,
         buf: Vec<u8>,
         on_done: F,
     ) where
@@ -4337,7 +4339,7 @@ impl<'a> FsConn<'a> {
             TAG_FGETXATTR,
             who,
             f,
-            Some(name.to_owned()),
+            Some(name.into()),
             buf,
             0,
             0,
@@ -4355,20 +4357,15 @@ impl<'a> FsConn<'a> {
     pub fn fgetxattr_as_root<F>(
         &mut self,
         f: File,
-        name: &CStr,
+        name: impl Into<Cow<'static, CStr>>,
         buf: Vec<u8>,
         on_done: F,
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
         let w = self.waiter(on_done);
-        self.fs.submit_fgetxattr_as_root(
-            self.eng,
-            f.fd,
-            name.to_owned(),
-            buf,
-            w,
-        );
+        self.fs
+            .submit_fgetxattr_as_root(self.eng, f.fd, name.into(), buf, w);
     }
 
     /// Write extended attribute `name` on `f` as `who`.
@@ -4376,7 +4373,7 @@ impl<'a> FsConn<'a> {
         &mut self,
         who: Personality,
         f: File,
-        name: &CStr,
+        name: impl Into<Cow<'static, CStr>>,
         value: Vec<u8>,
         flags: i32,
         on_done: F,
@@ -4387,7 +4384,7 @@ impl<'a> FsConn<'a> {
             TAG_FSETXATTR,
             who,
             f,
-            Some(name.to_owned()),
+            Some(name.into()),
             value,
             0,
             0,
@@ -4753,7 +4750,7 @@ impl<'a> FsConn<'a> {
         tag: u8,
         who: Personality,
         f: File,
-        name: Option<CString>,
+        name: Option<Cow<'static, CStr>>,
         value: Vec<u8>,
         off: u64,
         len64: u64,
@@ -5433,10 +5430,15 @@ impl FsConn<'_> {
     ///
     /// Takes no [`Personality`] - see `FsCore::remove_priv_xattr` for why
     /// the allowlist has to stand in for one here.
-    pub fn fremovexattr<F>(&mut self, f: File, name: CString, on_done: F)
-    where
+    pub fn fremovexattr<F>(
+        &mut self,
+        f: File,
+        name: impl Into<Cow<'static, CStr>>,
+        on_done: F,
+    ) where
         F: FnOnce(crate::Result<()>, &mut FsConn<'_>) + 'static,
     {
+        let name = name.into();
         if !self.fs.priv_xattrs.permits(&name) {
             let job = move || {
                 drop(f);
@@ -7614,7 +7616,7 @@ mod routing_fuzz {
             TAG_FSETXATTR,
             1,
             arc, // the caller's LAST reference moves in
-            Some(c"user.x".to_owned()),
+            Some(Cow::Borrowed(c"user.x")),
             payload,
             0,
             0,
@@ -7844,7 +7846,7 @@ mod routing_fuzz {
                         TAG_FGETXATTR,
                         1,
                         arc,
-                        Some(CString::new("user.x").unwrap()),
+                        Some(Cow::Borrowed(c"user.x")),
                         vec![0u8; 64],
                         0,
                         0,

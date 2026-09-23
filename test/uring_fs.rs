@@ -389,7 +389,8 @@ fn an_immutable_file_cannot_be_unlinked_or_relabelled() {
         // Metadata has to land before the lock: an immutable inode refuses
         // xattr writes (`may_write_xattr`, fs/xattr.c).
         let name = xattr_name("user.retain-until");
-        let (res, _) = h.fsetxattr(me, &f, &name, b"2099-01-01".to_vec(), 0);
+        let (res, _) =
+            h.fsetxattr(me, &f, name.clone(), b"2099-01-01".to_vec(), 0);
         res.expect("xattr before locking");
 
         match h.fset_zfs_attrs(&f, before | ZfsAttr::IMMUTABLE) {
@@ -420,7 +421,8 @@ fn an_immutable_file_cannot_be_unlinked_or_relabelled() {
             matches!(unlinked, Err(Error::Errno(Errno::EPERM))),
             "an immutable file must not unlink: {unlinked:?}"
         );
-        let (res, _) = h.fsetxattr(me, &f, &name, b"2000-01-01".to_vec(), 0);
+        let (res, _) =
+            h.fsetxattr(me, &f, name.clone(), b"2000-01-01".to_vec(), 0);
         assert!(
             matches!(res, Err(Error::Errno(Errno::EPERM))),
             "an immutable file's xattrs must be sealed: {res:?}"
@@ -825,23 +827,29 @@ fn open_metadata_close_workflow() {
         // Extended attributes, by fd. (This is the DOS-attributes shape the
         // whole reactor exists for.)
         let name = xattr_name("user.dosattrib");
-        let (res, _v) = h.fsetxattr(me, &f, &name, b"\x01\x02\x03".to_vec(), 0);
+        let (res, _v) =
+            h.fsetxattr(me, &f, name.clone(), b"\x01\x02\x03".to_vec(), 0);
         res.expect("fsetxattr");
-        let (n, val) = h.fgetxattr(me, &f, &name, vec![0u8; 64]);
+        let (n, val) = h.fgetxattr(me, &f, name.clone(), vec![0u8; 64]);
         assert_eq!(n.expect("fgetxattr"), 3);
         assert_eq!(&val[..3], b"\x01\x02\x03");
 
         // Size query with an empty buffer (the kernel's size-only form).
-        let (n, _v) = h.fgetxattr(me, &f, &name, Vec::new());
+        let (n, _v) = h.fgetxattr(me, &f, name.clone(), Vec::new());
         assert_eq!(n.expect("size query"), 3);
 
         // A too-small buffer is ERANGE, not a silent truncation.
-        let (res, _v) = h.fgetxattr(me, &f, &name, vec![0u8; 2]);
+        let (res, _v) = h.fgetxattr(me, &f, name.clone(), vec![0u8; 2]);
         assert!(matches!(res, Err(Error::Errno(Errno::ERANGE))));
 
         // XATTR_CREATE on an existing attribute must fail EEXIST.
-        let (res, _v) =
-            h.fsetxattr(me, &f, &name, b"zz".to_vec(), libc::XATTR_CREATE);
+        let (res, _v) = h.fsetxattr(
+            me,
+            &f,
+            name.clone(),
+            b"zz".to_vec(),
+            libc::XATTR_CREATE,
+        );
         assert!(matches!(res, Err(Error::Errno(Errno::EEXIST))));
 
         // Oversized is E2BIG on this path too - the sync twin's contract
@@ -855,14 +863,14 @@ fn open_metadata_close_workflow() {
         // 1 << 32 to reach and is not testable at that size.
         use truenas_ros::sync_fs::xattr::XATTR_SIZE_MAX;
         let big = vec![0u8; XATTR_SIZE_MAX + 1];
-        let (res, back) = h.fsetxattr(me, &f, &name, big, 0);
+        let (res, back) = h.fsetxattr(me, &f, name.clone(), big, 0);
         assert!(
             matches!(res, Err(Error::Errno(Errno::E2BIG))),
             "an oversized value must be refused, got {res:?}"
         );
         assert_eq!(back.len(), XATTR_SIZE_MAX + 1, "the buffer comes back");
         // ...and the refusal left the stored value alone.
-        let (n, val) = h.fgetxattr(me, &f, &name, vec![0u8; 64]);
+        let (n, val) = h.fgetxattr(me, &f, name.clone(), vec![0u8; 64]);
         assert_eq!(n.expect("fgetxattr"), 3);
         assert_eq!(&val[..3], b"\x01\x02\x03");
 
@@ -872,7 +880,7 @@ fn open_metadata_close_workflow() {
         // and the sync twin (`sync_fs::xattr::fgetxattr`) takes no buffer
         // at all and never refuses on its size.
         let (n, val) =
-            h.fgetxattr(me, &f, &name, vec![0u8; 2 * XATTR_SIZE_MAX]);
+            h.fgetxattr(me, &f, name.clone(), vec![0u8; 2 * XATTR_SIZE_MAX]);
         assert_eq!(n.expect("a generous read buffer still reads the value"), 3);
         assert_eq!(&val[..3], b"\x01\x02\x03");
 
@@ -925,12 +933,12 @@ fn fd_metadata_respects_close_last() {
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let f = h.open(me, &anchor, "a.bin", creat_rw()).unwrap();
         let name = xattr_name("user.k");
-        let (res, _v) = h.fsetxattr(me, &f, &name, b"v".to_vec(), 0);
+        let (res, _v) = h.fsetxattr(me, &f, name.clone(), b"v".to_vec(), 0);
         res.unwrap();
         h.close(f).unwrap();
         // Slot reusable immediately: the close waited for the real close.
         let f = h.open(me, &anchor, "a.bin", rdonly()).expect("reopen");
-        let (n, v) = h.fgetxattr(me, &f, &name, vec![0u8; 16]);
+        let (n, v) = h.fgetxattr(me, &f, name.clone(), vec![0u8; 16]);
         assert_eq!(n.unwrap(), 1);
         assert_eq!(&v[..1], b"v");
         h.close(f).unwrap();
@@ -1418,7 +1426,7 @@ fn privileged_xattr_allowlist_elevates_only_listed_names() {
             let (res, _) = h.fsetxattr(
                 nobody,
                 &f,
-                &xattr_name("trusted.truenas_test_meta"),
+                xattr_name("trusted.truenas_test_meta"),
                 b"server-owned".to_vec(),
                 0,
             );
@@ -1429,7 +1437,7 @@ fn privileged_xattr_allowlist_elevates_only_listed_names() {
             let (res, _) = h.fsetxattr(
                 nobody,
                 &f,
-                &xattr_name("trusted.other"),
+                xattr_name("trusted.other"),
                 b"nope".to_vec(),
                 0,
             );
@@ -1441,7 +1449,7 @@ fn privileged_xattr_allowlist_elevates_only_listed_names() {
             // The stored value is real, and readable only with privilege.
             let (res, buf) = h.fgetxattr_as_root(
                 &f,
-                &xattr_name("trusted.truenas_test_meta"),
+                xattr_name("trusted.truenas_test_meta"),
                 vec![0u8; 64],
             );
             let n = res.expect("privileged read");
@@ -1451,7 +1459,7 @@ fn privileged_xattr_allowlist_elevates_only_listed_names() {
             let (res, _) = h.fgetxattr(
                 nobody,
                 &f,
-                &xattr_name("trusted.truenas_test_meta"),
+                xattr_name("trusted.truenas_test_meta"),
                 vec![0u8; 64],
             );
             assert!(
@@ -1959,7 +1967,7 @@ fn metadata_ops_carry_the_personality() {
 
         let f = h.open(me, &anchor, "f", rdonly()).unwrap();
         let name = xattr_name("user.k");
-        let (res, _v) = h.fgetxattr(bogus, &f, &name, vec![0u8; 8]);
+        let (res, _v) = h.fgetxattr(bogus, &f, name.clone(), vec![0u8; 8]);
         assert!(matches!(res, Err(Error::Errno(Errno::EINVAL))));
         h.close(f).unwrap();
     });
@@ -2384,7 +2392,8 @@ fn query_directory_lists_and_enriches() {
         let xattr_ok = {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(me, &anchor, "a.txt", how).unwrap();
-            let (res, _) = h.fsetxattr(me, &f, &etag, b"deadbeef".to_vec(), 0);
+            let (res, _) =
+                h.fsetxattr(me, &f, etag.clone(), b"deadbeef".to_vec(), 0);
             h.close(f).unwrap();
             fd_xattr_ok("fsetxattr(user.etag)", &res)
         };
@@ -2442,7 +2451,7 @@ fn query_directory_discovers_user_xattrs() {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(me, &anchor, "a.txt", how).unwrap();
             let (res, _) =
-                h.fsetxattr(me, &f, &xattr_name(name), val.to_vec(), 0);
+                h.fsetxattr(me, &f, xattr_name(name), val.to_vec(), 0);
             h.close(f).unwrap();
             fd_xattr_ok(&format!("fsetxattr({name})"), &res)
         };
@@ -2508,7 +2517,8 @@ fn query_directory_discovers_non_utf8_name() {
         let set_ok = {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(me, &anchor, "a.txt", how).unwrap();
-            let (res, _) = h.fsetxattr(me, &f, &name, b"present".to_vec(), 0);
+            let (res, _) =
+                h.fsetxattr(me, &f, name.clone(), b"present".to_vec(), 0);
             h.close(f).unwrap();
             fd_xattr_ok("fsetxattr(user.<non-utf8>)", &res)
         };
@@ -2559,7 +2569,7 @@ fn query_directory_discovers_large_value() {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(me, &anchor, "big.bin", how).unwrap();
             let (res, _) =
-                h.fsetxattr(me, &f, &xattr_name("user.blob"), big.clone(), 0);
+                h.fsetxattr(me, &f, xattr_name("user.blob"), big.clone(), 0);
             h.close(f).unwrap();
             fd_xattr_ok("fsetxattr(user.blob)", &res)
         };
@@ -2611,7 +2621,7 @@ fn query_directory_explicit_large_value() {
         let set_ok = {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(me, &anchor, "big.bin", how).unwrap();
-            let (res, _) = h.fsetxattr(me, &f, &name, big.clone(), 0);
+            let (res, _) = h.fsetxattr(me, &f, name.clone(), big.clone(), 0);
             h.close(f).unwrap();
             fd_xattr_ok("fsetxattr(user.blob)", &res)
         };
@@ -2688,7 +2698,7 @@ fn query_directory_does_not_flag_an_entry_it_cannot_open() {
         let set_ok = {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(me, &anchor, "plain.bin", how).unwrap();
-            let (res, _) = h.fsetxattr(me, &f, &name, b"v".to_vec(), 0);
+            let (res, _) = h.fsetxattr(me, &f, name.clone(), b"v".to_vec(), 0);
             h.close(f).unwrap();
             fd_xattr_ok("fsetxattr(user.probe)", &res)
         };
@@ -2872,7 +2882,8 @@ fn query_directory_reports_an_unimplemented_acl_as_absent() {
         let set_ok = {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(me, &anchor, "obj.bin", how).unwrap();
-            let (res, _) = h.fsetxattr(me, &f, &readable, value.clone(), 0);
+            let (res, _) =
+                h.fsetxattr(me, &f, readable.clone(), value.clone(), 0);
             h.close(f).unwrap();
             fd_xattr_ok("fsetxattr(user.pretend_acl)", &res)
         };
@@ -2948,7 +2959,7 @@ fn query_directory_discovery_drops_unreadable_trusted() {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(who, &anchor, "f.txt", how).unwrap();
             let (res, _) =
-                h.fsetxattr(who, &f, &xattr_name(name), val.to_vec(), 0);
+                h.fsetxattr(who, &f, xattr_name(name), val.to_vec(), 0);
             h.close(f).unwrap();
             res
         };
@@ -3015,7 +3026,7 @@ fn query_pool_discovers_xattrs() {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(me, &anchor, "p.txt", how).unwrap();
             let (res, _) =
-                h.fsetxattr(me, &f, &xattr_name("user.tag"), b"v".to_vec(), 0);
+                h.fsetxattr(me, &f, xattr_name("user.tag"), b"v".to_vec(), 0);
             h.close(f).unwrap();
             fd_xattr_ok("fsetxattr(user.tag)", &res)
         };
@@ -3154,7 +3165,7 @@ fn fs_handle_query_xattrs_reads_user_namespace() {
 
         let set = |name: &str, val: &[u8]| {
             let (res, _) =
-                h.fsetxattr(me, &f, &xattr_name(name), val.to_vec(), 0);
+                h.fsetxattr(me, &f, xattr_name(name), val.to_vec(), 0);
             res
         };
         if !fd_xattr_ok("fsetxattr(user.a)", &set("user.a", b"1")) {
@@ -3212,7 +3223,7 @@ fn fs_handle_query_xattrs_drops_unreadable_trusted() {
 
         let set = |name: &str, val: &[u8]| {
             let (res, _) =
-                h.fsetxattr(me, &owner, &xattr_name(name), val.to_vec(), 0);
+                h.fsetxattr(me, &owner, xattr_name(name), val.to_vec(), 0);
             res
         };
         if !fd_xattr_ok("fsetxattr(user.pub)", &set("user.pub", b"public")) {
@@ -3275,7 +3286,8 @@ fn fs_handle_fgetxattr_as_root_reads_trusted() {
         let how = OpenHow::new().flags(OFlag::O_RDWR);
         let f = h.open(me, &anchor, "f.txt", how).unwrap();
         let name = xattr_name("trusted.secret");
-        let (set, _) = h.fsetxattr(me, &f, &name, b"classified".to_vec(), 0);
+        let (set, _) =
+            h.fsetxattr(me, &f, name.clone(), b"classified".to_vec(), 0);
         if !fd_xattr_ok("fsetxattr(trusted.secret)", &set) {
             return; // fd xattrs unsupported
         }
@@ -3284,11 +3296,12 @@ fn fs_handle_fgetxattr_as_root_reads_trusted() {
             .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
             .unwrap();
         // Attributed to the unprivileged peer, the read is denied.
-        let (peer_res, _) = h.fgetxattr(peer, &f, &name, vec![0u8; 64]);
+        let (peer_res, _) = h.fgetxattr(peer, &f, name.clone(), vec![0u8; 64]);
         assert!(peer_res.is_err(), "peer cannot read trusted.* as itself");
 
         // As root, the same fd yields the value regardless of any `who`.
-        let (root_res, buf) = h.fgetxattr_as_root(&f, &name, vec![0u8; 64]);
+        let (root_res, buf) =
+            h.fgetxattr_as_root(&f, name.clone(), vec![0u8; 64]);
         let n = root_res.expect("as-root read succeeds");
         assert_eq!(&buf[..n], b"classified");
 
@@ -3817,7 +3830,7 @@ fn impersonated_trusted_xattr_is_denied() {
             .unwrap();
 
         let trusted = xattr_name("trusted.probe");
-        let (res, _v) = h.fsetxattr(me, &f, &trusted, b"v".to_vec(), 0);
+        let (res, _v) = h.fsetxattr(me, &f, trusted.clone(), b"v".to_vec(), 0);
         if matches!(res, Err(Error::Errno(Errno::EOPNOTSUPP))) {
             creds.unregister(user).unwrap();
             h.close(f).unwrap();
@@ -3829,17 +3842,19 @@ fn impersonated_trusted_xattr_is_denied() {
         // the kernel's masquerade: an unprivileged *read* reports ENODATA
         // ("no such attribute"), not EPERM - it hides the attribute's
         // existence rather than its contents.
-        let (res, _v) = h.fgetxattr(user, &f, &trusted, vec![0u8; 16]);
+        let (res, _v) = h.fgetxattr(user, &f, trusted.clone(), vec![0u8; 16]);
         assert!(
             matches!(res, Err(Error::Errno(Errno::ENODATA))),
             "unprivileged trusted.* read must report ENODATA, got {res:?}"
         );
-        let (res, _v) = h.fsetxattr(user, &f, &trusted, b"z".to_vec(), 0);
+        let (res, _v) =
+            h.fsetxattr(user, &f, trusted.clone(), b"z".to_vec(), 0);
         assert!(matches!(res, Err(Error::Errno(Errno::EPERM))));
 
         // user.* on a file the personality does not own is also refused.
         let user_attr = xattr_name("user.mine");
-        let (res, _v) = h.fsetxattr(user, &f, &user_attr, b"z".to_vec(), 0);
+        let (res, _v) =
+            h.fsetxattr(user, &f, user_attr.clone(), b"z".to_vec(), 0);
         assert!(matches!(res, Err(Error::Errno(Errno::EACCES))));
 
         creds.unregister(user).unwrap();
@@ -4987,13 +5002,13 @@ fn fremovexattr_refuses_attributes_outside_the_allowlist() {
         let anchor = Anchor::open(dir).expect("anchor");
         let f = h.open(me, &anchor, "obj", creat_rw()).expect("open");
         let user = xattr_name("user.mine");
-        h.fsetxattr(me, &f, &user, b"xyz".to_vec(), 0)
+        h.fsetxattr(me, &f, user.clone(), b"xyz".to_vec(), 0)
             .0
             .expect("an unprivileged user.* set");
 
         assert!(
             matches!(
-                h.fremovexattr(&f, &user),
+                h.fremovexattr(&f, user.clone()),
                 Err(Error::Errno(Errno::EPERM))
             ),
             "an attribute the server does not own must not be removable"
@@ -5023,20 +5038,21 @@ fn fremovexattr_removes_allowlisted_attributes() {
         let f = h.open(me, &anchor, "obj", creat_rw()).expect("open");
         let owned = xattr_name("trusted.example_etag");
         let user = xattr_name("user.mine");
-        h.fsetxattr(me, &f, &owned, b"abc".to_vec(), 0)
+        h.fsetxattr(me, &f, owned.clone(), b"abc".to_vec(), 0)
             .0
             .expect("server-owned set is promoted to the reactor's creds");
-        h.fsetxattr(me, &f, &user, b"xyz".to_vec(), 0)
+        h.fsetxattr(me, &f, user.clone(), b"xyz".to_vec(), 0)
             .0
             .expect("user set");
 
-        h.fremovexattr(&f, &owned).expect("server-owned removal");
+        h.fremovexattr(&f, owned.clone())
+            .expect("server-owned removal");
         let names = h.flistxattr(&f).unwrap();
         assert!(!names.contains(&owned), "removed, not emptied: {names:?}");
         assert!(names.contains(&user), "the other attribute is untouched");
 
         // Removing what is not there is an error, not a silent success.
-        assert!(h.fremovexattr(&f, &owned).is_err());
+        assert!(h.fremovexattr(&f, owned.clone()).is_err());
         h.close(f).unwrap();
     });
 }
