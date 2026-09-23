@@ -1028,9 +1028,10 @@ impl StagedIdentity {
     }
 
     /// The identity of `path` now, without reading it: what a caller
-    /// compares against the last [`read_secret_path`]
-    /// (ConfigFile::read_secret_path) before deciding whether to read
-    /// again. Opens the file the way the read does and stages nothing.
+    /// compares against the last
+    /// [`read_secret_path`](ConfigFile::read_secret_path) before deciding
+    /// whether to read again. Opens the file the way the read does and
+    /// stages nothing.
     pub fn of_path(path: &Path) -> Result<StagedIdentity> {
         let file = safe_open(
             AT_FDCWD,
