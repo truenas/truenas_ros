@@ -40,6 +40,18 @@ where
         // callback and the payload it was handing back with it. It runs no
         // I/O of its own; whatever a continuation submits from it is reaped
         // by the teardown drain like any other in-flight op.
+        self.drain_wake_sources()?;
+        if !self.core.stopping() {
+            self.core.arm_wake()?;
+        }
+        Ok(())
+    }
+
+    /// Everything a poke asks the loop to look at, without the re-arm:
+    /// the `Op::Wake` completion re-arms because it consumed the read,
+    /// and a `Park::Drain` (`WakeHandle::park`) runs this with the read
+    /// still armed.
+    pub(super) fn drain_wake_sources(&mut self) -> errno::Result<()> {
         #[cfg(feature = "uring-fs")]
         self.drain_fs_offloads()?;
         if !self.core.stopping() {
@@ -50,7 +62,6 @@ where
             {
                 self.begin_drain()?;
             }
-            self.core.arm_wake()?;
         }
         Ok(())
     }

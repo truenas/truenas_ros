@@ -857,6 +857,9 @@ pub(crate) struct FsCore {
     /// This reactor's one blocking-work pool (shared with off-loop
     /// [`QueryPool`](super::query_dir::QueryPool)s), spawned on first use.
     pool: Arc<SharedPool>,
+    /// Jobs queued on the pool since the loop last flushed it: what the
+    /// wake at the end of the turn is for ([`Self::flush_offloads`]).
+    pending_offloads: usize,
     /// Where workers push finished jobs; drained on the loop's wake.
     completions: Arc<Mutex<VecDeque<PoolCompletion>>>,
     /// Reactor-side continuations for in-flight offloads, keyed by token.
@@ -965,6 +968,7 @@ impl FsCore {
             op_free: (0..op_slots).rev().collect(),
             pump_selecting: 0,
             pool: SharedPool::new(offload),
+            pending_offloads: 0,
             completions: Arc::new(Mutex::new(VecDeque::new())),
             offload_reg: HashMap::new(),
             next_offload: 0,
@@ -1138,11 +1142,27 @@ impl FsCore {
         Arc::clone(&self.pool)
     }
 
-    /// Submit `job` to this reactor's shared offload pool (spawned on first
-    /// use). If a worker thread cannot be spawned the job runs inline rather
-    /// than take the reactor down; see [`SharedPool::submit`].
+    /// Queue `job` on this reactor's shared offload pool (spawned on first
+    /// use) and wake nobody: the loop wakes the pool once per turn, for
+    /// every job the turn queued ([`Self::flush_offloads`]). If a worker
+    /// thread cannot be spawned the job runs inline rather than take the
+    /// reactor down; see [`SharedPool::enqueue`].
     fn submit_offload(&mut self, job: Box<dyn FnOnce() + Send>) {
-        self.pool.submit(job);
+        self.pool.enqueue(job);
+        self.pending_offloads += 1;
+    }
+
+    /// Wake the pool for everything queued since the last flush.
+    ///
+    /// **The loop calls this right before it can block**, at its park
+    /// point and ahead of its teardown drain, so no queued job waits on a
+    /// completion for someone to notice it. A turn dispatches several
+    /// completions, and under load several of them offload, so one wake
+    /// here covers what used to be one wake each - and a worker woken
+    /// once drains the whole batch before it parks again.
+    pub(crate) fn flush_offloads(&mut self) {
+        let pending = std::mem::take(&mut self.pending_offloads);
+        self.pool.flush(pending);
     }
 
     /// Remove a **server-owned** extended attribute on the blocking pool,
@@ -6975,6 +6995,10 @@ pub(crate) fn deliver_pool_completions(fs: &mut FsCore, eng: &mut Engine) {
 /// would be cancelled with the rest, and a plain callback dropped unfired
 /// already means the connection closes.
 pub(crate) fn drain_stop_window(fs: &mut FsCore, eng: &mut Engine) {
+    // A job the last turn queued and never flushed would otherwise sit
+    // until a worker happened to pass: the teardown below blocks without
+    // parking, so it flushes here.
+    fs.flush_offloads();
     deliver_pool_completions(fs, eng);
 }
 

@@ -1062,6 +1062,7 @@ where
             ));
         }
         self.core.arm_wake()?;
+        self.core.engine.shared.wake.activate();
         self.submit_maintain()?;
         for lidx in 0..self.listeners.len() as u32 {
             self.arm_accept(lidx)?;
@@ -1107,7 +1108,26 @@ where
             // `goto out` past the whole GETEVENTS block
             // (`io_uring/io_uring.c:3571-3574`), so an enter that both
             // submits and waits does neither the wait nor the flush.
-            self.core.engine.ring.submit_and_wait(1)?;
+            //
+            // Everything this turn queued on the pool, woken for once;
+            // then the parker: a poke that landed while this loop was
+            // awake wrote no eventfd, and is drained here instead of slept
+            // through (`WakeHandle::park`).
+            #[cfg(feature = "uring-fs")]
+            if let Some(fs) = self.fs.as_mut() {
+                fs.flush_offloads();
+            }
+            match self.core.engine.shared.wake.park() {
+                crate::uring::wake::Park::Block => {
+                    let waited = self.core.engine.ring.submit_and_wait(1);
+                    self.core.engine.shared.wake.unpark();
+                    waited?;
+                }
+                crate::uring::wake::Park::Drain => {
+                    self.drain_wake_sources()?;
+                    self.core.engine.ring.submit()?;
+                }
+            }
             while let Some(cqe) = self.core.engine.ring.reap() {
                 self.dispatch(cqe)?;
                 // A slot freed during this dispatch (`Reactor::reclaim_slot`
