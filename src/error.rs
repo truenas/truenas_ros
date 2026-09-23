@@ -63,6 +63,10 @@ pub enum Error {
         /// The path that is not a regular file.
         path: PathBuf,
     },
+
+    /// The kernel refused a `memfd_secret` page under `RLIMIT_MEMLOCK`,
+    /// a limit shared by every process of the user.
+    SecretMemRefused,
 }
 
 impl From<Errno> for Error {
@@ -97,6 +101,9 @@ impl fmt::Display for Error {
             }
             Error::NotRegularFile { path } => {
                 write!(f, "not a regular file: {}", path.display())
+            }
+            Error::SecretMemRefused => {
+                f.write_str("secret memory refused under RLIMIT_MEMLOCK")
             }
         }
     }

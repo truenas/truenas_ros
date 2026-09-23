@@ -1057,7 +1057,12 @@ fn stage_secret_image(
     if len == 0 {
         return Ok((id, None));
     }
-    let mut mem = crate::secrets::SecretMem::with_capacity(len + 1)?;
+    let mut mem = crate::secrets::SecretMem::with_capacity(len + 1).map_err(
+        |e| match e {
+            Errno::EFAULT => Error::SecretMemRefused,
+            e => Error::Errno(e),
+        },
+    )?;
     let slice = mem.as_mut_slice();
     let filled = read_filled(&mut file, slice)?;
     let content = normalize_newlines_slice(&mut slice[..filled]);
