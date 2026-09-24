@@ -372,6 +372,13 @@ pub(crate) const IORING_CQE_F_SOCK_NONEMPTY: u32 = 1 << 2;
 /// `io_uring_enter` flag: also wait for completions.
 pub(crate) const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
 
+/// `IORING_SQ_CQ_OVERFLOW` in the SQ ring's `flags` word: the kernel has
+/// completions backed up in its overflow list that are not in the CQ ring.
+/// It clears when an `io_uring_enter` carrying [`IORING_ENTER_GETEVENTS`]
+/// drains that list, so a loop can read it to decide whether such an enter
+/// is owed at all.
+pub(crate) const IORING_SQ_CQ_OVERFLOW: u32 = 1 << 1;
+
 // `io_uring_params.features` (kernel-reported).
 pub(crate) const IORING_FEAT_SINGLE_MMAP: u32 = 1 << 0;
 pub(crate) const IORING_FEAT_NODROP: u32 = 1 << 1;

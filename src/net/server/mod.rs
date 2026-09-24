@@ -1041,6 +1041,14 @@ where
 
     /// Run the event loop until a [`ShutdownHandle`] stops it or a fatal ring
     /// error occurs. In-flight operations are drained before returning.
+    ///
+    /// **Terminal, including on an error return**: build a fresh `Server`
+    /// rather than calling this again. The arming below is not idempotent
+    /// and an error from any of it leaves the server part-armed - a second
+    /// call would arm a second `READ` into the one shared wake buffer, a
+    /// second self-perpetuating maintenance timer, and a duplicate
+    /// multishot accept on every listener already armed. `UringFs::run`
+    /// says the same of itself for the same reason.
     pub fn serve_forever(&mut self) -> crate::Result<()> {
         if self.listeners.iter().any(|l| l.tls)
             && self.handlers.tls_handshake.is_none()
@@ -1102,14 +1110,21 @@ where
                 break; // nothing outstanding; avoid blocking forever
             }
             // `submit_and_wait` enters with GETEVENTS once the SQ is empty,
-            // which also flushes any IORING_SQ_CQ_OVERFLOW backlog, so
-            // completions can't be stranded even under NODROP. The "once the
+            // which also flushes any IORING_SQ_CQ_OVERFLOW backlog - with
+            // three exceptions it does not reach that enter through: a
+            // short submit returning `Ok(0)`, `EBUSY`/`EAGAIN` with SQEs
+            // still staged, and the trailing wait-only enter answering
+            // `EBUSY`/`EAGAIN` itself. None has been reproducible on this
+            // kernel - a deep backlog neither short-submits nor EBUSYs -
+            // but they are why the `Drain` arm gates on `cq_overflowed`
+            // rather than trusting the same sentence. The "once the
             // SQ is empty" is load-bearing: a short submit makes the kernel
             // `goto out` past the whole GETEVENTS block
             // (`io_uring/io_uring.c:3571-3574`), so an enter that both
             // submits and waits does neither the wait nor the flush.
             //
-            // Everything this turn queued on the pool, woken for once;
+            // Everything this turn queued on the pool, woken for in one
+            // pass (one wake, which the workers hand on between them);
             // then the parker: a poke that landed while this loop was
             // awake wrote no eventfd, and is drained here instead of slept
             // through (`WakeHandle::park`).
@@ -1125,7 +1140,7 @@ where
                 }
                 crate::uring::wake::Park::Drain => {
                     self.drain_wake_sources()?;
-                    self.core.engine.ring.submit()?;
+                    self.core.engine.submit_and_flush_overflow()?;
                 }
             }
             while let Some(cqe) = self.core.engine.ring.reap() {

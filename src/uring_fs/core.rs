@@ -1156,10 +1156,17 @@ impl FsCore {
     ///
     /// **The loop calls this right before it can block**, at its park
     /// point and ahead of its teardown drain, so no queued job waits on a
-    /// completion for someone to notice it. A turn dispatches several
-    /// completions, and under load several of them offload, so one wake
-    /// here covers what used to be one wake each - and a worker woken
-    /// once drains the whole batch before it parks again.
+    /// completion for someone to notice it.
+    ///
+    /// What the turn saves is the *pass*, not a batch of syscalls. A turn
+    /// dispatches several completions and under load several of them
+    /// offload; those enqueue without waking, and this is the one place
+    /// that looks at the queue. It then issues **one** wake, whatever the
+    /// batch: the worker it claims hands the next on as it takes its job,
+    /// so the recruiting happens between the workers and never as a run of
+    /// `futex_wake` calls on the reactor thread
+    /// ([`WorkerPool::flush`] carries the measurement). A saturated pool
+    /// has nobody parked and costs nothing at all.
     pub(crate) fn flush_offloads(&mut self) {
         let pending = std::mem::take(&mut self.pending_offloads);
         self.pool.flush(pending);
@@ -5677,13 +5684,66 @@ mod hybrid_tests {
             let mut c = FsConn::new(fs, eng, OWNER0);
             kickoff(&mut c);
         }
-        let mut guard = 0u32;
+        // A pass counter only advances between blocks, so it can never
+        // reach a bound while the harness is parked *inside* one: a missed
+        // wake hangs here rather than failing, which is why the defect the
+        // flush below fixes presented as a CI timeout instead of a named
+        // assertion. One outstanding timer keeps every block bounded, so a
+        // stall trips the deadline instead.
+        //
+        // The tag is unallocated in the **fs** domain - the domain this
+        // harness owns and dispatches, checked below before the domain
+        // test. The byte is partitioned, so anything under 0x80 would be
+        // borrowing one of the net stack's tags (0x01 is its `RecvHeader`)
+        // and would collide the day a harness drives both on one ring.
+        //
+        // Re-armed only when its own completion comes back, so exactly one
+        // is in flight *per call* - the loop can return with one still
+        // armed, harmless only because every caller here builds a fresh
+        // `Engine` and none reaps after `drive` returns. A second `drive`
+        // on one engine would arm a second, and the stale completion would
+        // clear the flag early and let a third follow.
+        const TAG_DRIVE_TIMER: u8 = 0xFF;
+        let ts = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        let mut timer_armed = false;
+        let mut passes = 0u64;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !done() {
-            guard += 1;
-            assert!(guard < 5_000_000, "reactor stalled");
+            // The wall clock is the whole detector now: the pass count
+            // this replaces could not fire while the harness was parked
+            // inside the block, and with the block bounded at a second it
+            // would need ~57 days of passes to trip. Passes are still
+            // reported, because a clock cannot tell a stall from a slow
+            // runner and the count can.
+            passes += 1;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reactor stalled: 60s without `done()` over {passes} \
+                 passes. ~60 is one per timer expiry, so the loop was \
+                 blocking with nothing to reap; far more means it was \
+                 reaping and `done()` never came true"
+            );
             // What the loops do before they block: wake the pool for
             // every job the last pass queued (`FsCore::flush_offloads`).
             fs.flush_offloads();
+            if !timer_armed {
+                // The kernel copies the timespec at prep, so `ts` need only
+                // outlive the submit below - it does, being declared above
+                // the loop.
+                eng.ring
+                    .push_sqe(|sqe| {
+                        sqe.opcode = IORING_OP_TIMEOUT;
+                        sqe.addr = std::ptr::addr_of!(ts) as u64;
+                        sqe.len = 1; // exactly one timespec, per the kernel
+                        sqe.user_data = pack_raw(TAG_DRIVE_TIMER, 0, 0);
+                    })
+                    .expect("stage the drive timer");
+                timer_armed = true;
+            }
             eng.ring.submit_and_wait(1).expect("submit_and_wait");
             let mut cqes = Vec::new();
             while let Some(cqe) = eng.ring.reap() {
@@ -5691,6 +5751,20 @@ mod hybrid_tests {
             }
             for cqe in cqes {
                 let (tag, slot, g) = unpack_raw(cqe.user_data);
+                if tag == TAG_DRIVE_TIMER {
+                    // `-ETIME` is the timer expiring, which is its job.
+                    // Anything else means it never armed, and without it
+                    // the block below is unbounded again - so say which
+                    // it was rather than spinning to the deadline under
+                    // the stall message.
+                    assert!(
+                        cqe.res == -libc::ETIME || cqe.res == -libc::ECANCELED,
+                        "the drive timer was refused: {}",
+                        cqe.res
+                    );
+                    timer_armed = false;
+                    continue;
+                }
                 if tag == TAG_WAKE {
                     eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm");
                     // The real delivery functions, not a copy of their

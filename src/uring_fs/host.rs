@@ -307,7 +307,8 @@ impl UringFs {
             if self.eng.inflight == 0 {
                 break; // nothing outstanding; avoid blocking forever
             }
-            // Everything this turn queued on the pool, woken for once;
+            // Everything this turn queued on the pool, woken for in one
+            // pass (one wake, which the workers hand on between them);
             // then the parker: a poke that landed while this loop was
             // awake wrote no eventfd, and is drained here instead of slept
             // through (`WakeHandle::park`).
@@ -320,7 +321,7 @@ impl UringFs {
                 }
                 crate::uring::wake::Park::Drain => {
                     self.drain_wake_sources();
-                    self.eng.ring.submit()?;
+                    self.eng.submit_and_flush_overflow()?;
                 }
             }
             while let Some(cqe) = self.eng.ring.reap() {

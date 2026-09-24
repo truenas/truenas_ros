@@ -171,7 +171,31 @@ impl WakeHandle {
     /// drains every wake source before it blocks. Called once, after the
     /// wake `READ` is armed, by the loop that owns this handle.
     pub(crate) fn activate(&self) {
-        self.state.store(ACTIVE, Ordering::Release);
+        // `LEGACY -> ACTIVE` and nothing else. An unconditional store here
+        // would overwrite whatever the handle had reached, and the state
+        // that matters is `NOTIFIED`: a poke sets it *instead of* writing
+        // the eventfd, so clobbering it back to `ACTIVE` loses that wake
+        // outright - the loop then parks with nothing owed to it.
+        //
+        // Both loops activate once, before a run that is documented as
+        // terminal, so within this tree the store was not wrong - it was
+        // load-bearing on a convention with nothing enforcing it, and
+        // `Server::serve_forever` arms two more fallible things *after*
+        // this call. The compare-exchange costs the same and removes the
+        // convention from the argument.
+        //
+        // It is not a licence to re-enter a loop: the arming either side
+        // of it is not idempotent (a second wake `READ` into one shared
+        // buffer, a second self-perpetuating maintenance timer, a
+        // duplicate multishot accept per listener), which is why both
+        // `serve_forever` and `UringFs::run` say so. This makes one step
+        // safe, not the sequence.
+        let _ = self.state.compare_exchange(
+            LEGACY,
+            ACTIVE,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
     }
 
     /// The loop's half of the parker, called by the loop right before it
@@ -193,7 +217,23 @@ impl WakeHandle {
             Ordering::Acquire,
         ) {
             Ok(_) | Err(LEGACY) => Park::Block,
-            Err(_) => {
+            Err(seen) => {
+                // `NOTIFIED` is what this arm is for: a poke that landed
+                // while the loop was awake and wrote nothing, so the loop
+                // drains instead of blocking.
+                //
+                // `PARKED` would mean a loop parked twice with no `unpark`
+                // between. Both callers are in this crate - `wake` is a
+                // `pub(crate)` module inside a private one - and both
+                // unpark before propagating an error, so it is
+                // unreachable; the assertion is free in release and the
+                // silent `store` below would otherwise hide exactly the
+                // misuse this arm is worried about. `Drain` remains the
+                // conservative answer either way.
+                debug_assert_ne!(
+                    seen, PARKED,
+                    "park() re-entered without an unpark"
+                );
                 self.state.store(ACTIVE, Ordering::Release);
                 Park::Drain
             }
@@ -368,6 +408,142 @@ mod loom_tests {
                 "drain request lost"
             );
             assert!(s.stop_requested(), "hard stop lost");
+        });
+    }
+
+    /// The parker's whole safety claim, and the only part of this file
+    /// that is lock-free: a poke that skips the eventfd write must still
+    /// reach the loop. Whatever the interleaving, once the poker has run
+    /// the loop must be able to learn of it - by a `Drain` verdict, or by
+    /// a count on the eventfd - and never block with the poke unseen.
+    ///
+    /// The item is asserted only where `state` is what carries it: a poke
+    /// that flips `ACTIVE -> NOTIFIED` releases through that CAS, and
+    /// `park`'s failed CAS acquires it. Production wake sources carry
+    /// their own locks, so this models the verdict, not the payload.
+    #[test]
+    fn loom_an_activated_poke_is_never_lost() {
+        loom::model(|| {
+            let s = shared();
+            s.wake.activate();
+            let item = Arc::new(AtomicBool::new(false));
+
+            let (p, it) = (Arc::clone(&s), Arc::clone(&item));
+            let poker = loom::thread::spawn(move || {
+                it.store(true, Ordering::Release);
+                p.wake.poke();
+            });
+
+            // The loop's half: decide whether to block, then wake again.
+            let verdict = s.wake.park();
+            let armed = s.wake.try_drain() > 0;
+            let told_now = matches!(verdict, Park::Drain) || armed;
+            let item_then = item.load(Ordering::Acquire);
+            s.wake.unpark();
+
+            poker.join().expect("poker");
+
+            if told_now {
+                assert!(
+                    item_then,
+                    "the loop was told of a poke whose item was not yet \
+                     visible"
+                );
+            }
+            // The poke has certainly happened now. Either the loop already
+            // knew, or the next park must refuse to block.
+            let told = told_now
+                || s.wake.try_drain() > 0
+                || matches!(s.wake.park(), Park::Drain);
+            assert!(told, "a poke left no trace for the loop to find");
+        });
+    }
+
+    /// The skipped write, stated directly: a poke that finds the loop awake
+    /// writes nothing, and the very next park must refuse to block. This is
+    /// what makes skipping the write safe, so it is asserted rather than
+    /// argued.
+    #[test]
+    fn loom_a_poke_taken_while_awake_refuses_the_next_park() {
+        loom::model(|| {
+            let s = shared();
+            s.wake.activate();
+
+            let p = Arc::clone(&s);
+            let poker = loom::thread::spawn(move || p.wake.poke());
+            poker.join().expect("poker");
+
+            assert_eq!(
+                s.wake.try_drain(),
+                0,
+                "a poke to an awake loop wrote the eventfd after all"
+            );
+            assert_eq!(
+                s.wake.park(),
+                Park::Drain,
+                "the loop parked with a poke outstanding"
+            );
+        });
+    }
+
+    /// `activate` is `LEGACY -> ACTIVE` and nothing else: it must not
+    /// clobber a `NOTIFIED` that a poke set *instead of* writing the
+    /// eventfd, because an unconditional store there loses that wake
+    /// outright and the loop parks with nothing owed to it.
+    ///
+    /// Both host loops are documented terminal, so this models the
+    /// property rather than a reachable caller - the point being that the
+    /// property should not rest on that documentation, which nothing
+    /// enforces.
+    #[test]
+    fn loom_activate_does_not_clobber_a_pending_poke() {
+        loom::model(|| {
+            let s = shared();
+            s.wake.activate();
+
+            let p = Arc::clone(&s);
+            let poker = loom::thread::spawn(move || p.wake.poke());
+            poker.join().expect("poker");
+
+            // The poke wrote nothing, so `state` is its only record.
+            assert_eq!(
+                s.wake.try_drain(),
+                0,
+                "a poke to an awake loop wrote the eventfd after all"
+            );
+            // The activating caller tries again after a failed arming step.
+            s.wake.activate();
+            assert_eq!(
+                s.wake.park(),
+                Park::Drain,
+                "re-activating lost a poke that had already landed"
+            );
+        });
+    }
+
+    /// Two pokes and one park. The second poke finds `NOTIFIED` and returns
+    /// having written nothing and changed nothing, which is safe only if the
+    /// first one's trace is still there to be found.
+    #[test]
+    fn loom_two_pokes_racing_one_park_leave_a_trace() {
+        loom::model(|| {
+            let s = shared();
+            s.wake.activate();
+
+            let a = Arc::clone(&s);
+            let other = loom::thread::spawn(move || a.wake.poke());
+            s.wake.poke();
+
+            let verdict = s.wake.park();
+            let armed = s.wake.try_drain() > 0;
+            s.wake.unpark();
+            other.join().expect("poker");
+
+            let told = matches!(verdict, Park::Drain)
+                || armed
+                || s.wake.try_drain() > 0
+                || matches!(s.wake.park(), Park::Drain);
+            assert!(told, "two pokes and the loop could still block");
         });
     }
 
