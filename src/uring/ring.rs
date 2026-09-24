@@ -844,6 +844,33 @@ impl Ring {
         &mut self,
         min_complete: u32,
     ) -> errno::Result<()> {
+        self.submit_and_wait_for(min_complete, None)
+    }
+
+    /// [`submit_and_wait`](Self::submit_and_wait), giving up the wait after
+    /// `timeout` when there is one. An expiry returns `Ok` like any other
+    /// wake: the caller reaps what there is, which may be nothing.
+    pub(crate) fn submit_and_wait_for(
+        &mut self,
+        min_complete: u32,
+        timeout: Option<std::time::Duration>,
+    ) -> errno::Result<()> {
+        let fd = self.raw_fd();
+        let enter = |to_submit| match timeout {
+            Some(t) => io_uring_enter_timeout(
+                fd,
+                to_submit,
+                min_complete,
+                IORING_ENTER_GETEVENTS,
+                t,
+            ),
+            None => io_uring_enter(
+                fd,
+                to_submit,
+                min_complete,
+                IORING_ENTER_GETEVENTS,
+            ),
+        };
         // A SHORT submit skips the wait entirely. `io_uring_enter` runs
         // `io_submit_sqes` and then
         // `if (ret != to_submit) { mutex_unlock(..); goto out; }`
@@ -855,15 +882,12 @@ impl Ring {
         // spin at 100% CPU when it is not. Submit to empty first, then enter
         // once more purely to wait.
         while self.to_submit > 0 {
-            match io_uring_enter(
-                self.raw_fd(),
-                self.to_submit,
-                min_complete,
-                IORING_ENTER_GETEVENTS,
-            ) {
+            match enter(self.to_submit) {
                 // Nothing accepted and no error: the SQ is not draining, so
-                // spinning here would not help. Leave the rest staged.
-                Ok(0) => return Ok(()),
+                // spinning here would not help. Leave the rest staged. An
+                // expiry reports only when nothing was submitted, so it is
+                // this case too.
+                Ok(0) | Err(Errno::ETIME) => return Ok(()),
                 Ok(n) if n >= self.to_submit => {
                     self.to_submit = 0;
                     return Ok(()); // full submit: the wait above happened
@@ -878,13 +902,8 @@ impl Ring {
         }
         // Nothing staged (or the loop drained it short of a full submit):
         // enter for the wait alone.
-        match io_uring_enter(
-            self.raw_fd(),
-            0,
-            min_complete,
-            IORING_ENTER_GETEVENTS,
-        ) {
-            Ok(_) | Err(Errno::EBUSY | Errno::EAGAIN) => Ok(()),
+        match enter(0) {
+            Ok(_) | Err(Errno::EBUSY | Errno::EAGAIN | Errno::ETIME) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -1155,6 +1174,42 @@ mod tests {
         let cqe = ring.reap().expect("a completion after waiting for one");
         assert_eq!(cqe.res, 0, "a NOP completes with 0");
         assert_eq!(cqe.user_data, 0xf00d);
+    }
+
+    /// A timed wait with nothing to complete comes back once its timeout
+    /// has passed, as an `Ok` with nothing to reap; one with a completion
+    /// due comes back for the completion, well inside a timeout it could
+    /// not have outwaited. The expiry is what bounds a loop's sleep by the
+    /// offload pool's deadline, and it reports as `ETIME`, which must not
+    /// reach the loop as an error.
+    #[test]
+    fn a_timed_wait_gives_up_at_its_timeout() {
+        use std::time::{Duration, Instant};
+        let Some(setup) = setup_or_skip(8) else {
+            return;
+        };
+        let mut ring = Ring::from_setup(setup).expect("map");
+
+        let began = Instant::now();
+        ring.submit_and_wait_for(1, Some(Duration::from_millis(20)))
+            .expect("an expiry is not an error");
+        let took = began.elapsed();
+        assert!(took >= Duration::from_millis(20), "woke early: {took:?}");
+        assert!(ring.reap().is_none(), "nothing was submitted");
+
+        ring.push_sqe(|sqe| {
+            sqe.opcode = IORING_OP_NOP;
+            sqe.user_data = 7;
+        })
+        .expect("stage");
+        let began = Instant::now();
+        ring.submit_and_wait_for(1, Some(Duration::from_secs(30)))
+            .expect("submit_and_wait_for");
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "the wait outlasted the completion it was for"
+        );
+        assert_eq!(ring.reap().map(|c| c.user_data), Some(7));
     }
 
     /// Every ring carries `NO_SQARRAY`, and the kernel answers it by leaving

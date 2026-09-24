@@ -156,18 +156,18 @@ env:
   # which is `matches!` over a `d_type` and a request behind no guard
   # at all, so it moves the executing count too; 113 adds the pool's
   # batched-wake test, real threads on a condvar behind no guard, so
-  # it executes here too; 120 retires that test - the batching it
-  # asserted is gone - for seven pool tests and one engine test. The pool
-  # seven pin the wake count and its two inputs: one wake per flush with
-  # the workers handing the rest on, none for a job a claim already covers,
-  # a flush of one waking for the whole queue but NOT growing against it,
-  # the growth threshold sampled either side of its boundary, and the
-  # unclaimed-job re-check. None of the seven touches a ring guard, so
-  # they execute rather than skipping - but note the lane-wide
-  # matched/vacuous/executing triple quoted further up predates several
-  # bumps and is stale, so do not read this as moving it by seven; it
-  # needs its own re-measurement. The engine one
-  # is guard-gated like its neighbours and skips, counted for the
+  # it executes here too; 120 replaces that test with seven pool tests
+  # and adds one engine test. The pool seven pin both wake rules and
+  # growth: a flush waking a worker per four jobs, short jobs never
+  # tripping the stall rule, a batch of blocking jobs getting a worker
+  # each, blocking jobs past the floor growing the pool, the growth
+  # threshold sampled either side of its boundary, a flush of one NOT
+  # growing against the queue, and the unclaimed-job re-check. None of
+  # the seven touches a ring guard, so they execute rather than skipping
+  # - but note the lane-wide matched/vacuous/executing triple quoted
+  # further up predates several bumps and is stale, so do not read this
+  # as moving it by seven; it needs its own re-measurement. The engine
+  # one is guard-gated like its neighbours and skips, counted for the
   # tripwire rather than claimed as coverage.) If that friction is
   # unwanted,
   # `-lt` pinned at the TRUE count still catches deletion, which is

@@ -1124,17 +1124,21 @@ where
             // submits and waits does neither the wait nor the flush.
             //
             // Everything this turn queued on the pool, woken for in one
-            // pass (one wake, which the workers hand on between them);
-            // then the parker: a poke that landed while this loop was
-            // awake wrote no eventfd, and is drained here instead of slept
-            // through (`WakeHandle::park`).
+            // pass, with the sleep bounded by when the pool next needs
+            // looking at - a connection's job queued behind another's
+            // blocked one gets its own worker then, not when that one
+            // finishes (`FsCore::flush_offloads`); then the parker: a poke
+            // that landed while this loop was awake wrote no eventfd, and
+            // is drained here instead of slept through
+            // (`WakeHandle::park`).
             #[cfg(feature = "uring-fs")]
-            if let Some(fs) = self.fs.as_mut() {
-                fs.flush_offloads();
-            }
+            let recheck = self.fs.as_mut().and_then(|fs| fs.flush_offloads());
+            #[cfg(not(feature = "uring-fs"))]
+            let recheck = None;
             match self.core.engine.shared.wake.park() {
                 crate::uring::wake::Park::Block => {
-                    let waited = self.core.engine.ring.submit_and_wait(1);
+                    let waited =
+                        self.core.engine.ring.submit_and_wait_for(1, recheck);
                     self.core.engine.shared.wake.unpark();
                     waited?;
                 }

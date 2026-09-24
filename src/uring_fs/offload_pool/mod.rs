@@ -51,40 +51,63 @@ impl Default for OffloadBounds {
 /// on the worker's own thread, never sent.
 pub(crate) type Job = Box<dyn FnOnce() + Send>;
 
-/// Jobs in the queue that no outstanding claim covers. Every `notify` is
-/// one worker already on its way, and a woken worker drains the queue
-/// whole, so those jobs need nobody new.
-fn unclaimed(g: &PoolInner) -> usize {
-    g.queue.len().saturating_sub(g.notify)
-}
-
-/// Claim one parked worker and signal it. **The only place the pool issues
-/// a wake**, so the test counter beside it counts signals delivered rather
-/// than a number computed elsewhere.
-fn claim_one(shared: &PoolShared, g: &mut PoolInner) {
-    debug_assert!(g.idle > 0, "claimed a worker with none parked");
-    g.idle -= 1;
-    g.notify += 1;
+/// Take `n` parked workers out of `idle` and count the wakes owed them.
+/// The wakes themselves are the caller's to issue, **after** it drops the
+/// guard: each is a `futex_wake`, and issued under the lock it would hold
+/// the queue shut for the length of a syscall, with the woken worker's
+/// first act being to take that lock.
+fn claim(g: &mut PoolInner, n: usize) {
+    debug_assert!(n <= g.idle, "claimed {n} workers with {} parked", g.idle);
+    g.idle -= n;
+    g.notify += n;
     #[cfg(test)]
     {
-        g.wakes_issued += 1;
+        g.wakes_issued += n;
     }
-    shared.cv.notify_one();
 }
 
-/// How many jobs a caller must declare, per worker still parked, before
-/// [`WorkerPool::flush`] spawns another one.
+/// Jobs a turn queues per worker its flush wakes, and the growth threshold
+/// alongside it: [`WorkerPool::flush`] grows when a turn queues more than
+/// this many per worker still parked.
 ///
-/// **The caller's count, not the queue's depth** - the predicate reads
-/// `pending`, deliberately: sized from the queue, the off-loop
-/// submitter's hard-coded `flush(1)` would spawn against a backlog the
-/// reactor created, on an application thread.
+/// A woken worker drains the queue whole, so one wake covers a batch of
+/// short jobs however long the batch, and every `notify_one` is a
+/// `futex_wake` on the reactor thread: batching is what keeps a short job
+/// from paying a wake of its own. What a batch of *long* jobs needs
+/// instead - a worker each - is the stall rule's
+/// ([`OFFLOAD_BLOCKED_AFTER`]), not this one's.
+///
+/// Growth reads the caller's `pending`, never the queue's depth: sized
+/// from the queue, the off-loop submitter's hard-coded `flush(1)` would
+/// spawn against a backlog the reactor created, on an application thread.
 /// `a_flush_of_one_does_not_grow_against_the_queue` pins that.
+const JOBS_PER_WAKE: usize = 4;
+
+/// How long a job may hold its worker before the pool stops counting on
+/// that worker to come back for the queue.
 ///
-/// It is a growth threshold and not a wake ratio. It carries the parent's
-/// number because the same constant answered both questions there, which
-/// is what made the coupling easy to miss when the wake rule changed.
-const JOBS_PER_WORKER_BEFORE_GROWTH: usize = 4;
+/// The pool cannot see a worker block. The kernel's own worker pool is
+/// told by the scheduler (`io_wq_worker_sleeping`, `io_uring/io-wq.c`),
+/// and when the last of its running workers blocks with work queued it
+/// starts another; this one goes by time instead. A worker this long in
+/// its job counts as blocked, and once every worker awake is blocked with
+/// jobs still queued, each of those jobs gets a parked worker of its own
+/// ([`WorkerPool::flush`]). A short job never gets here, which is what
+/// keeps a batch of them on the one worker their turn woke.
+///
+/// The loop runs the check when it has queued work and when the last
+/// check's deadline comes due ([`WorkerPool::flush`]'s return), and a loop
+/// about to sleep bounds the sleep by that deadline, so an idle loop does
+/// not sleep through it.
+const OFFLOAD_BLOCKED_AFTER: Duration = Duration::from_micros(50);
+
+/// How long a claimed worker is given to reach its job before the stall
+/// rule's deadline counts it as in one. A worker parked on an idle core
+/// first leaves the deepest idle state its core reached - cpuidle's C6
+/// `latency` is 133us on Haswell-EP - and a deadline inside that fires
+/// before the worker has started, waking the loop for nothing: a job that
+/// is short finishes and wakes the loop itself soon after.
+const OFFLOAD_WAKE_ALLOWANCE: Duration = Duration::from_micros(150);
 
 /// Ceiling on the pool's own thread count. Not a kernel limit - a sanity
 /// bound, since every one of these is a real OS thread, spawned by one
@@ -121,18 +144,21 @@ struct PoolInner {
     closed: bool,
     /// Micros since [`PoolShared::epoch`] of the last spawn, throttling growth.
     last_spawn_us: u64,
-    /// Wakes `flush` itself issued on its most recent call, written under
-    /// the same guard it makes the decision under. Separate from
-    /// `wakes_issued` because the chain starts moving that the instant
-    /// `flush` drops the lock: a test that wants *this call's* cost cannot
-    /// read a running total afterwards and know what it is looking at.
+    /// When each job now running started, in micros since
+    /// [`PoolShared::epoch`]: one entry per worker inside a job, pushed as
+    /// it pops the job and removed once it is back under the lock. What
+    /// the stall rule reads to tell a worker making progress from one it
+    /// should stop counting on ([`OFFLOAD_BLOCKED_AFTER`]).
+    running: Vec<u64>,
+    /// Wakes `flush` issued on its most recent call, written under the
+    /// guard it decides under. Test-only.
     #[cfg(test)]
     last_flush_wakes: usize,
-    /// Wakes `flush` has issued over this pool's life. Test-only, and the
-    /// only way to observe the wake *count* rather than its consequences:
-    /// an over-wake is invisible afterwards, since the extra worker finds
-    /// the queue empty, consumes its `notify` and parks again, leaving
-    /// every counter balanced.
+    /// Wakes the pool has issued over its life. Test-only, and the only
+    /// way to observe the wake *count* rather than its consequences: an
+    /// over-wake is invisible afterwards, since the extra worker finds the
+    /// queue empty, consumes its `notify` and parks again, leaving every
+    /// counter balanced.
     #[cfg(test)]
     wakes_issued: usize,
 }
@@ -146,6 +172,10 @@ struct PoolShared {
     epoch: Instant,
     cooldown: Duration,
     idle_timeout: Duration,
+    /// [`OFFLOAD_BLOCKED_AFTER`], in micros; a parameter so tests can hold
+    /// jobs for a threshold of their own choosing and loom can set it to
+    /// zero (it has no clock).
+    blocked_after_us: u64,
     /// Model-only: how many idle retirements to grant (see [`idle_expired`]).
     #[cfg(loom)]
     retire_next_idle: AtomicUsize,
@@ -163,6 +193,11 @@ struct PoolShared {
 /// retire after an idle period. It runs whatever job it is handed under the
 /// reactor's ambient credentials; any per-`who` permission check belongs to the
 /// job, not the pool.
+///
+/// Wakes follow the kernel's own worker pool: keep a worker coming back for
+/// the queue, and start another only once every worker awake is stuck in a
+/// job ([`WorkerPool::flush`]). Short jobs drain on the worker their turn
+/// woke; jobs queued behind blocked ones each get a worker of their own.
 ///
 /// Growth is hysteretic: a worker spawns only when the pool is saturated
 /// (no worker is parked) and at most once per cooldown, so a burst of fast
@@ -186,6 +221,7 @@ impl WorkerPool {
             bounds,
             OFFLOAD_SPAWN_COOLDOWN,
             OFFLOAD_IDLE_TIMEOUT,
+            OFFLOAD_BLOCKED_AFTER,
         )
     }
 
@@ -196,6 +232,7 @@ impl WorkerPool {
         bounds: OffloadBounds,
         cooldown: Duration,
         idle_timeout: Duration,
+        blocked_after: Duration,
     ) -> std::io::Result<WorkerPool> {
         let floor = bounds.floor.max(1);
         let ceiling = bounds.ceiling.max(floor);
@@ -207,6 +244,7 @@ impl WorkerPool {
                 notify: 0,
                 closed: false,
                 last_spawn_us: 0,
+                running: Vec::new(),
                 #[cfg(test)]
                 last_flush_wakes: 0,
                 #[cfg(test)]
@@ -218,6 +256,7 @@ impl WorkerPool {
             epoch: Instant::now(),
             cooldown,
             idle_timeout,
+            blocked_after_us: blocked_after.as_micros() as u64,
             #[cfg(loom)]
             retire_next_idle: AtomicUsize::new(0),
             #[cfg(loom)]
@@ -250,15 +289,14 @@ impl WorkerPool {
     #[cfg(test)]
     pub(crate) fn submit(&self, job: Job) {
         self.enqueue(job);
-        self.flush(1);
+        let _ = self.flush(1);
     }
 
     /// Queue `job` and wake nobody. The caller owes a [`flush`](Self::flush)
     /// before it can block, or the job waits for a running worker to
     /// reach it; a loop pays that once per turn for every job the turn
-    /// queued, which is what makes a batch of them one *pass* rather than
-    /// a wake per `offload`. The pass still wakes one worker per job - see
-    /// [`flush`](Self::flush) for why it does not ration them.
+    /// queued, which is what makes a batch of them one wake rather than
+    /// one per `offload`.
     pub(crate) fn enqueue(&self, job: Job) {
         let mut g = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.closed {
@@ -267,118 +305,87 @@ impl WorkerPool {
         g.queue.push_back(job);
     }
 
-    /// Wake the pool for the jobs sitting in its queue: **one** parked
-    /// worker, which hands the next on as it takes its job, and grow by one
-    /// worker where the caller's count outruns those still parked and the
-    /// cooldown has elapsed (a no-op if the pool is already dropping).
+    /// Wake the pool for what is queued, and say how long the caller may
+    /// sleep before it has to call this again.
     ///
-    /// A woken worker drains the queue whole, so one wake is *correct* for
-    /// any batch - but alone it serialises the batch onto one thread, which
-    /// is the opposite of what an offload pool is for. Measured on an idle
-    /// sixteen-worker pool, 10 ms jobs, same binary: a one-wake-per-four
-    /// rule takes 40.3 ms where the chain takes 10.1 ms, at 4, 8 and 16
-    /// queued alike.
+    /// The rules are the kernel worker pool's (`io_uring/io-wq.c`): keep a
+    /// worker coming back for the queue, and when the last worker making
+    /// progress blocks with work still queued, start another. What differs
+    /// is how a block is seen and what a wake costs - there it is the
+    /// scheduler's hook and a `wake_up_process`, here it is a clock and a
+    /// `futex_wake` - and both rules are shaped by that:
     ///
-    /// So the parallelism is recruited, but not from here. Each worker
-    /// claims the next as it pops its own job, under the lock it is already
-    /// holding ([`worker_loop`]), which keeps this call O(1): every
-    /// `notify_one` is a `futex_wake` syscall whether or not anyone is
-    /// waiting, and issuing a batch of them from here means issuing them on
-    /// the reactor thread, while holding the mutex the woken workers
-    /// immediately need. Measured p50 of this call: ~1.1 us at 16 parked
-    /// and at 64 alike, against 21 us and 77 us for a wake per job.
+    /// - **The batch.** The jobs this turn queued (`pending`) get one
+    ///   parked worker per [`JOBS_PER_WAKE`], and that worker drains the
+    ///   queue whole. Short jobs therefore cost a wake per turn, not per
+    ///   job, and a pool with every worker already awake costs nothing.
+    /// - **The stall.** When no claimed worker is on its way and every
+    ///   worker inside a job has been there past [`OFFLOAD_BLOCKED_AFTER`],
+    ///   nobody is coming back for the queue soon: each job still in it
+    ///   gets a parked worker of its own, and the pool grows once for any
+    ///   it has none for. A job queued behind a blocked one - another
+    ///   connection's digest behind this one's, a listing behind a stalled
+    ///   `readdir` - runs beside it rather than after it.
     ///
-    /// Two things made that cost unacceptable rather than merely untidy.
-    /// Below roughly 10 us of job work the wakes dominate and the batch is
-    /// slower end to end than the ratio it replaced - at depth 16 with
-    /// near-empty jobs, a wake per job spends 85% of the batch's wall time
-    /// in this function. And [`SharedPool::submit`] reaches here from
-    /// `QueryPool::query`, a public call documented non-blocking, on an
-    /// application thread and with the *reactor's* queue depth: sized per
-    /// job that is 1.2 us at an empty queue and 1.07 ms at a full one.
+    /// The stall rule fires only when called, so the return says when to
+    /// call next: the moment the last worker still making progress would
+    /// cross the threshold, while a queued job has no worker claimed for
+    /// it; `None` while nothing is waiting on a running job. A loop that
+    /// sleeps past it leaves a stall unanswered until something else wakes
+    /// it - for a batch of blocking jobs, until the first of them is done.
     ///
-    /// `pending` is the caller's "something happened this turn" gate and
-    /// the growth decision's input; it is no use as a wake count, since it
-    /// over-counts a job the pool ran inline and under-counts the jobs of
-    /// another submitter sharing this pool. What needs waking comes from
-    /// `queue` against `notify` ([`unclaimed`]) - an outstanding `notify`
-    /// is a worker already on its way. Growth keeps `pending` on purpose:
-    /// see [`JOBS_PER_WORKER_BEFORE_GROWTH`] and
-    /// `a_flush_of_one_does_not_grow_against_the_queue`.
+    /// `pending` is the caller's count of jobs queued since its last flush
+    /// and feeds the batch rule and growth; zero is a real call, the loop
+    /// coming back for the stall rule at the time this named. It is no
+    /// wake count - it over-counts a job the pool ran inline and
+    /// under-counts another submitter's.
     ///
-    /// The growth *predicate* is the parent's; its input is not frozen and
-    /// cannot be. `parked` is live `idle`, so **any** rule that recruits
-    /// more workers moves when growth fires - including this one. Measured
-    /// on the default bounds: four blocking jobs leave `idle == 0` here,
-    /// because four workers really are running them, and the next job then
-    /// grows the pool to five. The parent left `idle == 3` in the same
-    /// state, with three of those jobs still queued and nobody woken for
-    /// them, and so did not grow.
-    ///
-    /// That difference is the wake fix showing through, not a second
-    /// change: `idle` now means what it says. Growing when every worker is
-    /// occupied and more work has arrived is what the type's own docs
-    /// describe as saturation. It does mean a loaded pool reaches its
-    /// ceiling sooner than it used to, which is a behaviour change worth
-    /// knowing about even though the rule generating it is unchanged.
-    pub(crate) fn flush(&self, pending: usize) {
-        if pending == 0 {
-            return;
-        }
+    /// Wakes are issued after the guard drops: each is a `futex_wake`, and
+    /// a worker woken while this still held the lock would find the queue
+    /// shut behind a syscall.
+    pub(crate) fn flush(&self, pending: usize) -> Option<Duration> {
         let mut g = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.closed {
-            return;
+            return None;
         }
-        // Jobs with no worker coming for them: every outstanding `notify`
-        // is a claim on one queued job, so the rest are what this call
-        // has to cover. Taken from the queue rather than from `pending`
-        // for the reasons in the doc above.
+        let now = self.shared.now_us();
         let parked = g.idle;
-        // ONE wake, whatever the batch. The worker it claims hands the next
-        // one on before it goes heads-down (`worker_loop`), so a batch of N
-        // still reaches N workers - but the chain is paid one link at a
-        // time, by workers who are waking anyway and already hold this
-        // lock, instead of N `futex_wake` syscalls issued back to back by
-        // whoever called `flush` while holding the mutex those workers
-        // immediately need.
-        //
-        // That distinction is the whole cost model. Measured p50 of this
-        // call, 16 parked workers: a wake per job is 21 us at depth 16 and
-        // 77 us at 64, against ~1.3 us flat here; and `SharedPool::submit`,
-        // a public non-blocking API, reaches this on an application thread
-        // with the reactor's queue depth, not its own.
-        let claimed = usize::from(unclaimed(&g) > 0 && g.idle > 0);
-        if claimed == 1 {
-            claim_one(&self.shared, &mut g);
+        let batch = pending.div_ceil(JOBS_PER_WAKE);
+        let mut wakes = batch.min(g.idle);
+        claim(&mut g, wakes);
+        // A turn that queued more than `JOBS_PER_WAKE` jobs per parked
+        // worker - unconditionally true with nobody parked.
+        let mut saturated = batch > parked;
+
+        let blocked_after = self.shared.blocked_after_us;
+        let progressing = g
+            .running
+            .iter()
+            .filter(|&&started| now.saturating_sub(started) < blocked_after)
+            .count();
+        // `notify == 0` is part of "nobody is coming": a claimed worker
+        // has not reached the queue yet, and is making progress until it
+        // has been in its job past the threshold too.
+        if g.notify == 0 && progressing == 0 && !g.queue.is_empty() {
+            let want = if g.running.is_empty() {
+                // Nobody awake at all: jobs queued without a flush, the
+                // batch rule's case with no batch to size it. Size it by
+                // the queue, as that rule would have.
+                g.queue.len().div_ceil(JOBS_PER_WAKE)
+            } else {
+                // Every worker awake is stuck: what is queued is waiting
+                // on them, and a job each is what stops it.
+                g.queue.len()
+            };
+            let recruited = want.min(g.idle);
+            claim(&mut g, recruited);
+            wakes += recruited;
+            saturated |= want > recruited;
         }
         #[cfg(test)]
         {
-            g.last_flush_wakes = claimed;
+            g.last_flush_wakes = wakes;
         }
-        // Growth is the parent's rule, unchanged, on the parent's input.
-        // It read `g.idle == 0 && wakes < wanted` *after* waking; with
-        // `wakes = min(wanted, idle)` that is true exactly when
-        // `idle < wanted`, so it says "the turn queued more than four jobs
-        // per parked worker". Restated here on the pre-wake count, where
-        // it reads as what it means.
-        //
-        // Both of its inputs are deliberate. Deriving it from the new wake
-        // count would drop the threshold to one job per parked worker -
-        // measured, floor 4 with three workers busy grows on 2 queued jobs
-        // where the parent needs 5 - and taking it from `unclaimed` rather
-        // than `pending` would let the off-loop submitter's hard-coded
-        // `flush(1)` spawn against the reactor's queued jobs, which it
-        // never could before. Each spawn is a `pthread_create` under this
-        // lock, and `flush` runs on the reactor thread. One change in this
-        // patch: the wake count.
-        // No `.max(1)`: `pending == 0` returned above, so the quotient is
-        // already at least one. The parent carried one for the same dead
-        // reason. What the predicate really turns on is that it is
-        // unconditionally true when `parked == 0` - a turn that queued
-        // anything and found nobody parked grows, which is the saturated
-        // case the type's docs describe.
-        let saturated =
-            pending.div_ceil(JOBS_PER_WORKER_BEFORE_GROWTH) > parked;
         // Spawn under the lock, counting the worker only once it has started.
         // Reserving the slot first and handing it back on failure would put a
         // third decrement of `total` on a path with none of the guards the
@@ -396,6 +403,12 @@ impl WorkerPool {
             g.total += 1;
         }
         // A failed spawn leaves the job queued for a busy worker to pick up.
+        let next = self.shared.next_check(&g, now);
+        drop(g);
+        for _ in 0..wakes {
+            self.shared.cv.notify_one();
+        }
+        next
     }
 }
 
@@ -422,15 +435,63 @@ impl PoolShared {
         self.detach_next_drop.store(n, Ordering::Relaxed);
     }
 
+    /// Micros since [`epoch`](Self::epoch): the one clock the pool reads,
+    /// for growth's throttle and the stall rule alike.
+    fn now_us(&self) -> u64 {
+        self.epoch.elapsed().as_micros() as u64
+    }
+
+    /// When [`WorkerPool::flush`] has to run again for the stall rule to be
+    /// answered on time, or `None` when nothing would be.
+    ///
+    /// Nothing is owed while every queued job has a worker claimed for it:
+    /// no job then waits on a running one. Otherwise the rule next changes
+    /// its answer when the last worker still making progress crosses the
+    /// threshold - a claimed worker counts from when it can have started
+    /// ([`OFFLOAD_WAKE_ALLOWANCE`]) - and once every one of them already
+    /// has, the parked workers are spent and only growth is left, whose
+    /// next chance is the cooldown's end. At the ceiling there is no next
+    /// chance, and the running jobs get to the queue in their own time.
+    fn next_check(&self, g: &PoolInner, now: u64) -> Option<Duration> {
+        if g.queue.len() <= g.notify {
+            return None;
+        }
+        let mut at = if g.notify > 0 {
+            now + OFFLOAD_WAKE_ALLOWANCE.as_micros() as u64
+                + self.blocked_after_us
+        } else {
+            0
+        };
+        for &started in &g.running {
+            at = at.max(started + self.blocked_after_us);
+        }
+        if at > now {
+            return Some(Duration::from_micros(at - now));
+        }
+        if g.total < self.ceiling {
+            // Never sooner than the threshold. The flush this follows has
+            // already spawned if it could, which restarts the cooldown, so
+            // a cooldown found over is a state no flush is changing, and a
+            // deadline of what is left of it would have the loop spin on
+            // it.
+            let cooldown = self.cooldown.as_micros() as u64;
+            let left = (g.last_spawn_us + cooldown).saturating_sub(now);
+            return Some(Duration::from_micros(
+                left.max(self.blocked_after_us).max(1),
+            ));
+        }
+        None
+    }
+
     /// True at most once per [`cooldown`](Self::cooldown), claiming the slot so
     /// concurrent submits do not all spawn at once.
     ///
     /// Takes the guard because the throttle lives in [`PoolInner`]: the only
-    /// caller is `submit`, which holds the lock across the whole growth
+    /// caller is `flush`, which holds the lock across the whole growth
     /// decision, so a compare-exchange here could never lose a race and would
     /// advertise a lock-free contract the code does not implement.
     fn claim_spawn_slot(&self, inner: &mut PoolInner) -> bool {
-        let now = self.epoch.elapsed().as_micros() as u64;
+        let now = self.now_us();
         let cooldown = self.cooldown.as_micros() as u64;
         if now.saturating_sub(inner.last_spawn_us) < cooldown {
             return false;
@@ -679,16 +740,38 @@ impl SharedPool {
     /// Submit a job and wake for it at once: [`enqueue`](Self::enqueue)
     /// then a [`flush`](Self::flush) of one, for a submitter with no turn
     /// to batch in - the off-loop query helpers.
+    ///
+    /// The flush's deadline is dropped: this caller has no loop to come
+    /// back with. Its own job needs none - a flush of one claims a parked
+    /// worker for it whenever one is parked, and grows the pool when none
+    /// is - and a job it leaves queued behind stalled workers goes to the
+    /// next worker to finish, or to the reactor's next flush.
     pub(crate) fn submit(&self, job: Job) {
         self.enqueue(job);
-        self.flush(1);
+        let _ = self.flush(1);
     }
 
-    /// Wake the pool for `pending` jobs queued since the last flush
-    /// ([`WorkerPool::flush`]); nothing to do until the pool exists,
-    /// since an enqueue that found no pool ran its job inline.
-    pub(crate) fn flush(&self, pending: usize) {
-        self.pool.with(|pool| pool.flush(pending));
+    /// Wake the pool for `pending` jobs queued since the last flush, and
+    /// return when to call again ([`WorkerPool::flush`]); nothing to do
+    /// until the pool exists, since an enqueue that found no pool ran its
+    /// job inline.
+    pub(crate) fn flush(&self, pending: usize) -> Option<Duration> {
+        self.pool.with(|pool| pool.flush(pending)).flatten()
+    }
+
+    /// Workers parked with no claim on them, or `None` before the pool
+    /// exists. For fixtures that need the floor asleep before they queue:
+    /// a worker still starting up takes queued jobs on its way in, so jobs
+    /// queued into a pool that is spawning run whatever the wake rules say.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn parked(&self) -> Option<usize> {
+        self.pool.with(|pool| {
+            pool.shared
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .idle
+        })
     }
 
     /// Queue a job without a wake, spawning the pool on first use. A lost
@@ -778,23 +861,24 @@ fn worker_loop(shared: &Arc<PoolShared>) {
     ON_POOL_WORKER.with(|w| w.set(Arc::as_ptr(shared)));
     let mut g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        // Everything queued, before parking: a submit that found no idle
-        // worker queued its job and woke nobody, counting on a running
-        // worker to reach it here.
+        // Everything queued, before parking: a flush that found no worker
+        // parked woke nobody, counting on a running worker to reach the
+        // queue here.
         while let Some(job) = g.queue.pop_front() {
-            // Hand the wake on before going heads-down. This is the rest of
-            // the batch's parallelism: `flush` claims one worker, and each
-            // worker claims the next while it still holds the lock it took
-            // to pop its own job, so N queued jobs reach N workers at a cost
-            // of one `futex_wake` per worker recruited - none of them on the
-            // reactor thread, and none of them holding the lock any longer
-            // than it already was.
-            if unclaimed(&g) > 0 && g.idle > 0 {
-                claim_one(shared, &mut g);
-            }
+            // Wake nobody from here: whether the rest of the queue needs
+            // another worker depends on how long this job turns out to
+            // take, which only the loop's next flush can know. What it
+            // reads is this start time.
+            let started = shared.now_us();
+            g.running.push(started);
             drop(g);
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
             g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // Any entry with this start time will do: entries are only
+            // ever read as a count and a maximum.
+            if let Some(at) = g.running.iter().position(|&s| s == started) {
+                g.running.swap_remove(at);
+            }
         }
         if g.closed {
             g.total -= 1;
@@ -819,47 +903,26 @@ fn worker_loop(shared: &Arc<PoolShared>) {
                 false
             };
             if g.notify > 0 {
-                // A submit claimed this worker and already took it out of
-                // `idle`; the job it queued is what the drain above finds.
+                // A flush claimed this worker and has already taken it out
+                // of `idle`.
                 g.notify -= 1;
                 break;
             }
-            // **Scope.** This is a second line, not a replacement for the
-            // flush contract, and it is worth being exact about what can
-            // reach it. Claimless wakeups come from four places: a burst
-            // worker's own `wait_timeout` expiry, the broadcast a retiring
-            // worker issues, the one a worker exiting on `closed` issues,
-            // and `WorkerPool::drop`'s - plus the condvar's own spurious
-            // wakeups, which `PoolInner::notify`'s doc already names. Only
-            // the first is periodic; the rest are events.
+            // Woken with no claim - a burst worker's own timeout, the
+            // broadcast of a retiring or exiting worker or of `Drop`, a
+            // wake that landed after another worker took the claim it was
+            // issued for (`flush` signals once the guard is down), or the
+            // condvar's own spurious wakeup - with work queued: take it
+            // rather than sleep beside it. What sits in the queue with
+            // nobody claimed for it is a job queued without a flush. The
+            // loop's next flush claims for that too, but a floor worker
+            // waits untimed, so this is the only other place that looks.
             //
-            // A retire cannot be *caused* by the job sitting here, since
-            // retiring needs `g.queue.is_empty()`, but it can still arrive
-            // here: the retiring worker tests that predicate and
-            // broadcasts under the guard, and an `enqueue` that lands
-            // after it releases leaves a woken worker - a floor worker
-            // included - looking at a queue that is no longer empty. So
-            // this arm is not confined to pools above their floor, and the
-            // bound is not a clean `OFFLOAD_IDLE_TIMEOUT`.
-            //
-            // What is true unconditionally: nothing here is periodic at
-            // the floor, where every worker waits untimed. A job whose
-            // flush was missed can therefore wait arbitrarily long on a
-            // quiet pool, so the flush contract - every enqueue owing one
-            // before its caller blocks - remains the invariant, and this
-            // arm is what turns a flush that under-woke into a delay
-            // rather than a stall.
+            // After the `notify` arm, never before it: a claimed worker
+            // taking this arm would decrement `idle` a second time and leave
+            // its claim standing for another worker to consume
+            // (`loom_a_claimless_take_cannot_double_count_a_claimed_worker`).
             if !g.queue.is_empty() {
-                // Work with no claim on it: a submit only wakes workers it
-                // takes out of `idle`, so a job queued by a path that never
-                // flushed has nobody coming for it. A later claimed wake
-                // would still rescue it - the drain at the top of the outer
-                // loop empties the queue, it does not take one job - but a
-                // floor worker waits UNTIMED, so if no further work arrives
-                // there is no next wake and no tick either. Breaking here
-                // makes every wakeup this worker gets, claimed or not, a
-                // chance to notice the job; that is the re-check the timed
-                // wait used to provide for free.
                 g.idle -= 1;
                 break;
             }
@@ -867,11 +930,9 @@ fn worker_loop(shared: &Arc<PoolShared>) {
                 g.idle -= 1;
                 break;
             }
-            // No `g.queue.is_empty()` here: the claimless arm above
-            // already broke out on a non-empty queue, under this same
-            // uninterrupted guard, so it would be dead - and a dead
-            // conjunct reads as a live guard to whoever reorders these
-            // arms next. The ordering IS the guard.
+            // The queue is empty here - the arm above breaks otherwise -
+            // which is what retiring needs; a conjunct restating it would
+            // read as a live guard to whoever reorders these arms next.
             if expired && g.total > shared.floor {
                 g.idle -= 1;
                 g.total -= 1; // idle burst worker retires
@@ -903,6 +964,7 @@ mod pool_tests {
             bounds(1, 4),
             Duration::ZERO,
             Duration::from_millis(50),
+            OFFLOAD_BLOCKED_AFTER,
         )
         .expect("pool");
 
@@ -982,97 +1044,104 @@ mod pool_tests {
     /// Every worker parked and nothing owed: the quiescent state each test
     /// below returns the pool to before asserting on its books.
     fn quiesced(g: &PoolInner) -> bool {
-        g.notify == 0 && g.idle == g.total && g.queue.is_empty()
+        g.notify == 0
+            && g.idle == g.total
+            && g.queue.is_empty()
+            && g.running.is_empty()
     }
 
-    /// An `enqueue` wakes nobody; a `flush` wakes exactly one parked
-    /// worker, and the chain carries the batch from there.
-    ///
-    /// Asserted on `wakes_issued` rather than on how the jobs then run.
-    /// The wake count is the property, and it is the only one that stays
-    /// observable: an extra wake leaves no trace afterwards, since the
-    /// worker it woke finds the queue empty, consumes its `notify` and
-    /// parks again with every counter balanced.
-    #[test]
-    fn an_enqueue_wakes_nobody_and_a_flush_wakes_once_for_the_batch() {
-        // Three numbers that must not coincide: the jobs, the workers, and
-        // `JOBS_PER_WORKER_BEFORE_GROWTH`. With all three equal - which is
-        // what `bounds(JOBS, JOBS)` and `JOBS == 4` gave - every candidate
-        // wake rule returns the same count and the assertion below pins
-        // none of them.
-        const JOBS: usize = 3;
-        const FLOOR: usize = 5;
-        let pool = WorkerPool::try_elastic_tuned(
-            bounds(FLOOR, FLOOR),
-            Duration::from_millis(1),
-            Duration::from_secs(10),
-        )
-        .expect("pool");
-        settle(&pool, "floor parked", |g| g.idle == FLOOR);
+    /// Jobs that block until released, each reporting the thread it runs
+    /// on as it starts. What the stall rule is for: a worker that takes one
+    /// cannot come back for the next, so a batch of them only runs side by
+    /// side if the pool gave each its own worker.
+    struct Held {
+        release: Arc<(Mutex<bool>, Condvar)>,
+        started: mpsc::Receiver<thread::ThreadId>,
+        started_tx: mpsc::Sender<thread::ThreadId>,
+    }
 
-        // Each job blocks until released, so a worker that takes one
-        // cannot also take the next: the batch can only reach `JOBS`
-        // workers if the chain actually recruited them.
-        let hold = Arc::new((Mutex::new(false), Condvar::new()));
-        for _ in 0..JOBS {
-            let h = Arc::clone(&hold);
-            pool.enqueue(Box::new(move || {
-                let (m, cv) = &*h;
+    impl Held {
+        fn new() -> Held {
+            let (started_tx, started) = mpsc::channel();
+            Held {
+                release: Arc::new((Mutex::new(false), Condvar::new())),
+                started,
+                started_tx,
+            }
+        }
+
+        fn job(&self) -> Job {
+            let r = Arc::clone(&self.release);
+            let s = self.started_tx.clone();
+            Box::new(move || {
+                let _ = s.send(thread::current().id());
+                let (m, cv) = &*r;
                 let mut held = m.lock().unwrap();
                 while !*held {
                     held = cv.wait(held).unwrap();
                 }
-            }));
-        }
-        {
-            let g = pool.shared.inner.lock().unwrap();
-            assert_eq!(g.queue.len(), JOBS, "queued, not run");
-            assert_eq!(g.wakes_issued, 0, "an enqueue woke somebody");
-            assert_eq!(g.idle, FLOOR, "an enqueue claimed a worker");
+            })
         }
 
-        pool.flush(JOBS);
-        let flush_cost = pool.shared.inner.lock().unwrap().last_flush_wakes;
-        let chained = reaches(&pool, |g| g.wakes_issued == JOBS);
-        // Release before asserting: a failed assertion must not leave the
-        // jobs blocked and `Drop` waiting them out.
-        {
-            let (m, cv) = &*hold;
+        /// The distinct threads the first `n` held jobs to start ran on,
+        /// waiting - bounded - for them to report: a worker counts as
+        /// running from the moment it pops its job, a step before the job
+        /// reports in.
+        fn threads(
+            &self,
+            n: usize,
+        ) -> std::collections::HashSet<thread::ThreadId> {
+            let give_up = Instant::now() + Duration::from_secs(10);
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..n {
+                let left = give_up.saturating_duration_since(Instant::now());
+                match self.started.recv_timeout(left) {
+                    Ok(id) => {
+                        seen.insert(id);
+                    }
+                    Err(_) => break,
+                }
+            }
+            seen
+        }
+
+        fn release(&self) {
+            let (m, cv) = &*self.release;
             *m.lock().unwrap() = true;
             cv.notify_all();
         }
-        assert_eq!(
-            flush_cost, 1,
-            "a flush must cost the caller exactly one wake, whatever the \
-             batch: the rest are handed on by the workers"
-        );
-        assert!(chained, "the chain did not reach one worker per job");
-        settle(&pool, "quiescent", quiesced);
     }
 
-    /// A flush wakes no more workers than it has jobs for. The fixture
-    /// has four times the
-    /// workers it has jobs, so `unclaimed` and `parked` differ and a rule
-    /// that woke `parked` would show: where `floor == jobs`, as every other
-    /// fixture here has it, the two are the same number and nothing shows.
+    /// Stand in for the loop after a flush: sleep until the deadline the
+    /// pool named and flush again, until it names none - every queued job
+    /// then has a worker claimed for it. Bounded, so a pool that keeps
+    /// naming deadlines without ever recruiting fails the caller's
+    /// assertion instead of spinning.
+    fn turn_until_covered(pool: &WorkerPool, mut next: Option<Duration>) {
+        let give_up = Instant::now() + Duration::from_secs(5);
+        while let Some(d) = next {
+            if Instant::now() > give_up {
+                return;
+            }
+            thread::sleep(d);
+            next = pool.flush(0);
+        }
+    }
+
+    /// An `enqueue` wakes nobody, and a flush wakes one parked worker per
+    /// four jobs: the worker drains the queue, so short jobs need no more.
     ///
-    /// This pins one direction. The other - never claiming a worker that
-    /// is not parked - is guarded rather than asserted: both `claim_one`
-    /// call sites test `g.idle > 0` first, and `claim_one` debug-asserts
-    /// it. In release that assert is compiled out, so what actually holds
-    /// it is the `idle + notify == workers-in-the-wait` invariant, which
-    /// the loom model exercises.
-    ///
-    /// This is the wake economy the whole protocol is justified by -
-    /// `notify_one` is a `futex_wake` whether or not anyone is waiting, and
-    /// these are issued on the reactor thread under the queue lock.
+    /// Three numbers that must not coincide: the jobs, the workers parked,
+    /// and `JOBS_PER_WAKE`. Five jobs over eight workers wake two, where a
+    /// wake per job would wake five and a single wake one.
     #[test]
-    fn a_flush_wakes_no_more_workers_than_it_has_jobs_for() {
+    fn an_enqueue_wakes_nobody_and_a_flush_wakes_a_worker_per_four_jobs() {
+        const JOBS: usize = 5;
         const FLOOR: usize = 8;
-        const JOBS: usize = 2;
         let pool = WorkerPool::try_elastic_tuned(
             bounds(FLOOR, FLOOR),
             Duration::from_millis(1),
+            Duration::from_secs(10),
             Duration::from_secs(10),
         )
         .expect("pool");
@@ -1081,75 +1150,158 @@ mod pool_tests {
         for _ in 0..JOBS {
             pool.enqueue(Box::new(|| {}));
         }
-        pool.flush(JOBS);
+        {
+            let g = pool.shared.inner.lock().unwrap();
+            assert_eq!(g.queue.len(), JOBS, "queued, not run");
+            assert_eq!(g.wakes_issued, 0, "an enqueue woke somebody");
+            assert_eq!(g.idle, FLOOR, "an enqueue claimed a worker");
+        }
+        let _ = pool.flush(JOBS);
         assert_eq!(
             pool.shared.inner.lock().unwrap().last_flush_wakes,
-            1,
-            "a flush must cost one wake whatever is parked"
+            JOBS.div_ceil(JOBS_PER_WAKE),
+            "a flush wakes a worker per four jobs"
         );
         settle(&pool, "quiescent", quiesced);
-        assert!(
-            pool.shared.inner.lock().unwrap().wakes_issued <= JOBS,
-            "the chain woke workers it had no jobs for"
+        assert_eq!(
+            pool.shared.inner.lock().unwrap().wakes_issued,
+            JOBS.div_ceil(JOBS_PER_WAKE),
+            "something woke a worker the batch did not ask for"
         );
     }
 
-    /// `flush` takes its wake count from the queue, not from its caller.
-    /// The off-loop submitter ([`SharedPool::submit`]) always passes one,
-    /// having only its own job to declare, but it shares this pool with a
-    /// reactor whose jobs may already be queued unflushed - so a count of
-    /// one has to wake for all of them, or it serialises the lot onto the
-    /// single worker it woke.
+    /// Jobs shorter than the stall threshold never recruit, however deep
+    /// the queue and however often the loop comes back to look: the
+    /// workers the batch woke are making progress, and nobody else is owed
+    /// a wake. This is what keeps a burst of small jobs at the batch's
+    /// cost however often the loop looks.
+    ///
+    /// Each job sleeps a millisecond so the queue outlives many flushes;
+    /// the threshold is fifty, so no preemption short of that can pass for
+    /// a stall.
     #[test]
-    fn a_flush_of_one_wakes_for_every_job_already_queued() {
-        const QUEUED: usize = 5;
+    fn short_jobs_never_trip_the_stall_rule() {
+        const FLOOR: usize = 8;
+        const JOBS: usize = 8;
         let pool = WorkerPool::try_elastic_tuned(
-            bounds(QUEUED, QUEUED),
+            bounds(FLOOR, FLOOR),
             Duration::from_millis(1),
             Duration::from_secs(10),
+            Duration::from_millis(50),
         )
         .expect("pool");
-        settle(&pool, "floor parked", |g| g.idle == QUEUED);
+        settle(&pool, "floor parked", |g| g.idle == FLOOR);
 
-        let hold = Arc::new((Mutex::new(false), Condvar::new()));
-        for _ in 0..QUEUED {
-            let h = Arc::clone(&hold);
-            pool.enqueue(Box::new(move || {
-                let (m, cv) = &*h;
-                let mut held = m.lock().unwrap();
-                while !*held {
-                    held = cv.wait(held).unwrap();
-                }
-            }));
+        for _ in 0..JOBS {
+            pool.enqueue(Box::new(|| thread::sleep(Duration::from_millis(1))));
         }
-        // The off-loop submitter's count: one, for a queue of five.
-        pool.flush(1);
-        let flush_cost = pool.shared.inner.lock().unwrap().last_flush_wakes;
-        let chained = reaches(&pool, |g| g.wakes_issued == QUEUED);
-        {
-            let (m, cv) = &*hold;
-            *m.lock().unwrap() = true;
-            cv.notify_all();
+        let _ = pool.flush(JOBS);
+        let batch = JOBS.div_ceil(JOBS_PER_WAKE);
+        // The loop coming back to look, for as long as the batch drains -
+        // more often than a real one would, which only gives the rule more
+        // chances to misfire.
+        while !pool.shared.inner.lock().unwrap().queue.is_empty() {
+            let _ = pool.flush(0);
+            thread::sleep(Duration::from_micros(200));
         }
+        settle(&pool, "quiescent", quiesced);
         assert_eq!(
-            flush_cost, 1,
-            "an application thread paid the reactor's queue depth in wakes"
+            pool.shared.inner.lock().unwrap().wakes_issued,
+            batch,
+            "short jobs recruited past the batch's {batch} wakes"
         );
-        assert!(chained, "a flush of one serialised a queue of {QUEUED}");
+    }
+
+    /// A turn's blocking jobs each end up on a worker of their own. The
+    /// flush wakes one worker for the four of them; it takes the first and
+    /// blocks there, and once it has been in that job past the threshold
+    /// the loop's next flush gives each job still queued a parked worker.
+    /// Held jobs can only all be running at once if that happened.
+    ///
+    /// The loop comes back only when the flush says to: a pool that stopped
+    /// naming a deadline while jobs waited on a running one would leave
+    /// this loop - and a real one - asleep with three jobs stuck.
+    #[test]
+    fn blocking_jobs_queued_together_each_get_a_worker() {
+        const JOBS: usize = 4;
+        const FLOOR: usize = 8;
+        let pool = WorkerPool::try_elastic_tuned(
+            bounds(FLOOR, FLOOR),
+            Duration::from_millis(1),
+            Duration::from_secs(10),
+            Duration::from_millis(2),
+        )
+        .expect("pool");
+        settle(&pool, "floor parked", |g| g.idle == FLOOR);
+
+        let held = Held::new();
+        for _ in 0..JOBS {
+            pool.enqueue(held.job());
+        }
+        let next = pool.flush(JOBS);
+        let batch = pool.shared.inner.lock().unwrap().last_flush_wakes;
+        turn_until_covered(&pool, next);
+        let all_running = reaches(&pool, |g| g.running.len() == JOBS);
+        let threads = held.threads(JOBS);
+        let wakes = pool.shared.inner.lock().unwrap().wakes_issued;
+        held.release();
+
+        assert_eq!(batch, 1, "four jobs are one batch");
+        assert!(
+            all_running,
+            "blocking jobs queued together ran one at a time: {} of \
+             {JOBS} got a worker",
+            threads.len()
+        );
+        assert_eq!(threads.len(), JOBS, "two jobs shared a thread");
+        assert_eq!(wakes, JOBS, "a wake per blocked job, and no more");
         settle(&pool, "quiescent", quiesced);
     }
 
-    /// Removing the one-wake-per-four batching must not move the growth
-    /// threshold with it: both answers came off the same constant.
+    /// Blocking jobs past the parked workers grow the pool, a worker per
+    /// cooldown, until each has one: the stall rule's shortfall is growth's
+    /// saturation, even on a turn that queued nothing new.
+    #[test]
+    fn blocking_jobs_past_the_floor_grow_the_pool() {
+        const JOBS: usize = 4;
+        const FLOOR: usize = 2;
+        let pool = WorkerPool::try_elastic_tuned(
+            bounds(FLOOR, JOBS),
+            Duration::ZERO,
+            Duration::from_secs(10),
+            Duration::from_millis(2),
+        )
+        .expect("pool");
+        settle(&pool, "floor parked", |g| g.idle == FLOOR);
+
+        let held = Held::new();
+        for _ in 0..JOBS {
+            pool.enqueue(held.job());
+        }
+        let next = pool.flush(JOBS);
+        turn_until_covered(&pool, next);
+        let all_running = reaches(&pool, |g| g.running.len() == JOBS);
+        let total = pool.shared.inner.lock().unwrap().total;
+        held.release();
+
+        assert!(
+            all_running,
+            "{JOBS} blocking jobs on a floor of {FLOOR} did not all run"
+        );
+        assert_eq!(total, JOBS, "grew past a job each");
+    }
+
+    /// Growth fires when a turn queues more than `JOBS_PER_WAKE` jobs per
+    /// parked worker.
     ///
     /// Sampled either side of the boundary, because a point well inside it
-    /// cannot tell the rules apart - at floor 4 the parent grows from 17
-    /// jobs and a `>=` slip grows from 13, so a burst of 8 satisfies
-    /// neither and pins nothing. The spawn decision is taken inside
-    /// `flush` under the guard, so the count right after it returns is the
-    /// decision, with no race.
+    /// cannot tell rules apart - at floor 4 the rule grows from 17 jobs and
+    /// a `>=` slip grows from 13, so a burst of 8 satisfies neither and
+    /// pins nothing. The spawn decision is taken inside `flush` under the
+    /// guard, so the count right after it returns is the decision, with no
+    /// race.
     #[test]
-    fn the_growth_threshold_did_not_move_with_the_wake_count() {
+    fn growth_waits_for_more_than_four_jobs_per_parked_worker() {
         const FLOOR: usize = 4;
         // ceil(n / 4) > 4 is false at 16 and true at 17.
         for (jobs, want_total, what) in
@@ -1159,13 +1311,14 @@ mod pool_tests {
                 bounds(FLOOR, 64),
                 Duration::ZERO,
                 Duration::from_secs(10),
+                Duration::from_secs(10),
             )
             .expect("pool");
             settle(&pool, "floor parked", |g| g.idle == FLOOR);
             for _ in 0..jobs {
                 pool.enqueue(Box::new(|| {}));
             }
-            pool.flush(jobs);
+            let _ = pool.flush(jobs);
             assert_eq!(
                 pool.shared.inner.lock().unwrap().total,
                 want_total,
@@ -1176,22 +1329,22 @@ mod pool_tests {
         }
     }
 
-    /// Growth reads `pending`; the wake count reads the queue. Nothing
-    /// else in the suite holds those two inputs apart, because every other
-    /// fixture flushes exactly what it queued, where the two are equal.
+    /// Growth reads `pending`, not the queue. Every other fixture flushes
+    /// exactly what it queued, where the two are equal; this one holds them
+    /// apart.
     ///
-    /// The distinction is the whole reason growth was left alone: the
-    /// off-loop submitter ([`SharedPool::submit`]) hard-codes `flush(1)`
-    /// and shares this pool with a reactor whose jobs it knows nothing
-    /// about. Sized by the queue, that one job would spawn a thread - a
-    /// `pthread_create` under this lock - on an application thread, for a
-    /// backlog the reactor created.
+    /// The off-loop submitter ([`SharedPool::submit`]) hard-codes
+    /// `flush(1)` and shares this pool with a reactor whose jobs it knows
+    /// nothing about. Sized by the queue, that one job would spawn a
+    /// thread - a `pthread_create` under this lock - on an application
+    /// thread, for a backlog the reactor created.
     #[test]
     fn a_flush_of_one_does_not_grow_against_the_queue() {
         const FLOOR: usize = 2;
         let pool = WorkerPool::try_elastic_tuned(
             bounds(FLOOR, 64),
             Duration::ZERO,
+            Duration::from_secs(10),
             Duration::from_secs(10),
         )
         .expect("pool");
@@ -1202,7 +1355,7 @@ mod pool_tests {
         for _ in 0..10 {
             pool.enqueue(Box::new(|| {}));
         }
-        pool.flush(1);
+        let _ = pool.flush(1);
         assert_eq!(
             pool.shared.inner.lock().unwrap().total,
             FLOOR,
@@ -1211,79 +1364,28 @@ mod pool_tests {
         settle(&pool, "quiescent", quiesced);
     }
 
-    /// A flush owes wakes only for jobs no claim covers. Every outstanding
-    /// `notify` is one worker already on its way to the queue, and a woken
-    /// worker drains it whole - so re-waking for those jobs buys nothing
-    /// and costs a `futex_wake` each, on the reactor thread, under the
-    /// lock the woken workers immediately need.
-    ///
-    /// The claimed-but-not-yet-woken state is a real window - it is where
-    /// every flush leaves the pool until the workers are scheduled - but
-    /// it cannot be reached on a timer, so it is set up here directly. The
-    /// books are left exactly as a flush would leave them: two workers
-    /// taken out of `idle` with two claims standing against two queued
-    /// jobs.
-    #[test]
-    fn a_flush_does_not_re_wake_workers_a_claim_already_covers() {
-        const FLOOR: usize = 4;
-        let pool = WorkerPool::try_elastic_tuned(
-            bounds(FLOOR, FLOOR),
-            Duration::from_millis(1),
-            Duration::from_secs(10),
-        )
-        .expect("pool");
-        settle(&pool, "floor parked", |g| g.idle == FLOOR);
-        {
-            let mut g = pool.shared.inner.lock().unwrap();
-            g.queue.push_back(Box::new(|| {}));
-            g.queue.push_back(Box::new(|| {}));
-            // As a previous flush would have left it, minus the wakes it
-            // would also have issued - which is the point: those workers
-            // are spoken for.
-            g.idle -= 2;
-            g.notify += 2;
-        }
-
-        pool.flush(2);
-        assert_eq!(
-            pool.shared.inner.lock().unwrap().wakes_issued,
-            0,
-            "a flush woke again for jobs a claim already covered"
-        );
-
-        // Hand the claims back so the pool tears down on its own books.
-        pool.shared.cv.notify_all();
-        settle(&pool, "quiescent", quiesced);
-    }
-
     /// A job queued by a path that never flushed carries no wake of its
-    /// own, so the only thing that can find it is a worker re-checking the
-    /// queue on whatever wakeup it does get.
+    /// own, so without a flush the only thing that can find it is a worker
+    /// re-checking the queue on whatever wakeup it does get.
     ///
-    /// The wakeup is a burst worker's **own `wait_timeout` expiry**, not a
-    /// retiring worker's broadcast: retirement needs `queue.is_empty()`,
-    /// which is exactly what is false while such a job is sitting there,
-    /// so no retire and no broadcast can happen until it has been taken.
+    /// The wakeup here is a burst worker's **own `wait_timeout` expiry**,
+    /// not a retiring worker's broadcast: retirement needs
+    /// `queue.is_empty()`, which is exactly what is false while such a job
+    /// is sitting there, so no retire and no broadcast can happen until it
+    /// has been taken.
     ///
-    /// **Scope.** That expiry exists only above the floor - a floor worker
-    /// never retires and so waits untimed - and its period is
-    /// `OFFLOAD_IDLE_TIMEOUT`, 10 s on the default config. This fixture
-    /// uses 50 ms, so the promptness here is the fixture's, not the
-    /// pool's. It is a second line and no substitute for the flush
-    /// contract. Every enqueue path pairs with a flush, with one
-    /// qualification: `drain_stop_window` flushes and then delivers, and a
-    /// continuation reached by that delivery can enqueue again with no
-    /// flush behind it. Both hosts then go straight into a blocking
-    /// teardown drain. That is not a hang - the cancel is staged first and
-    /// `WorkerPool::drop`'s `closed` sweep runs the job - but it is the
-    /// one place the pairing does not hold, and what this arm covers is
-    /// that and a flush that under-woke.
+    /// That expiry exists only above the floor - a floor worker never
+    /// retires and so waits untimed - and its period is
+    /// `OFFLOAD_IDLE_TIMEOUT`, 10 s by default; this fixture uses 50 ms. It
+    /// is a second line behind the flush contract, not a substitute: the
+    /// loop's next flush claims a worker for such a job too.
     #[test]
     fn a_timed_wait_expiry_takes_a_job_nobody_claimed() {
         let pool = WorkerPool::try_elastic_tuned(
             bounds(1, 4),
             Duration::ZERO,
             Duration::from_millis(50),
+            Duration::from_secs(10),
         )
         .expect("pool");
 
@@ -1314,7 +1416,7 @@ mod pool_tests {
 
         // The precondition, checked HERE rather than before the release:
         // if every burst worker has already retired in the meantime there
-        // is no timed wait left, and the failure would name this patch
+        // is no timed wait left, and the failure would name the arm
         // instead of the fixture that slipped.
         let (done_tx, done_rx) = mpsc::channel();
         {
@@ -1494,8 +1596,12 @@ mod loom_tests {
         bounded_model_with(3, f);
     }
 
+    /// A model's pool: no growth throttle and a stall threshold of zero,
+    /// since loom has no clock - every worker inside a job counts as
+    /// blocked from its first instant, so the stall rule answers the same
+    /// way in every interleaving that reaches it.
     fn pool(floor: usize, ceiling: usize) -> WorkerPool {
-        WorkerPool::try_elastic_tuned(bounds(floor, ceiling), ZERO, ZERO)
+        WorkerPool::try_elastic_tuned(bounds(floor, ceiling), ZERO, ZERO, ZERO)
             .expect("the model's pool always spawns")
     }
 
@@ -1663,7 +1769,7 @@ mod loom_tests {
             // wake with no claim and take the job itself.
             let s = Arc::clone(&shared);
             let waker = loom::thread::spawn(move || s.cv.notify_all());
-            p.flush(1);
+            let _ = p.flush(1);
             waker.join().expect("waker");
 
             let g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1678,6 +1784,48 @@ mod loom_tests {
                 "notify {} exceeds total {}: more claims than workers",
                 g.notify,
                 g.total
+            );
+        });
+    }
+
+    /// The stall rule claims parked workers from the loop's thread while
+    /// workers take jobs, finish them and park on their own: three hands on
+    /// `idle`, `notify` and `running` under one lock. The books must balance
+    /// in every order - no claim past the workers parked (`claim`'s
+    /// assertion), every job run exactly once, and every `running` entry
+    /// retired by the worker that pushed it.
+    ///
+    /// Three jobs over two workers, flushed as the loop does: once with
+    /// the turn's count, which claims one worker for the batch, and once
+    /// with none, the next turn coming back for the stall rule. Where a
+    /// worker is already inside a job by then, the rule wants a worker for
+    /// each job still queued - more than are parked whenever both are.
+    #[test]
+    fn loom_the_stall_rule_and_the_workers_agree_on_the_books() {
+        bounded_model(|| {
+            let ran = Arc::new(AtomicUsize::new(0));
+            let p = pool(2, 2);
+            let shared = Arc::clone(&p.shared);
+
+            for _ in 0..3 {
+                p.enqueue(counting_job(&ran));
+            }
+            let _ = p.flush(3);
+            let _ = p.flush(0);
+            drop(p);
+
+            let g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(g.total, 0, "Drop returned with workers still live");
+            assert!(
+                g.running.is_empty(),
+                "{} running entries outlived their jobs",
+                g.running.len()
+            );
+            drop(g);
+            assert_eq!(
+                ran.load(Ordering::Relaxed),
+                3,
+                "a job was lost or run twice"
             );
         });
     }
