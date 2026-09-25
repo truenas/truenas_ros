@@ -112,8 +112,8 @@ audit = []
 # (`src/secrets.rs`): pages removed from the kernel direct map, kept off swap,
 # and absent from core dumps, plus a fail-closed availability probe and a
 # volatile burn. Standalone and dependency-free (a raw syscall over `libc`), but
-# use-case-specific — for daemons that hold secrets (the S3 server's SigV4
-# credential table) — so opt-in like the net roles rather than riding `default`.
+# use-case-specific (for daemons that hold long-lived secrets, such as a
+# credential table), so opt-in like the net roles rather than riding `default`.
 secrets = []
 # Process signals for a daemon (`src/signal.rs`): block a set on the main
 # thread before any thread exists, then receive them as values on one thread

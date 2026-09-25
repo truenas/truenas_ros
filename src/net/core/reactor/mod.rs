@@ -15,10 +15,10 @@ mod wake;
 
 // The role layers are the only consumers, so a core-alone build has
 // none: gate the re-export or it is an unused import there.
+#[cfg(feature = "net-server")]
+pub(crate) use io::recv_pool_buf_len;
 #[cfg(any(feature = "net-server", feature = "net-client"))]
 pub(crate) use io::{Enacted, Gate, RecvStep, SendStep, SpliceStep};
-#[cfg(feature = "net-server")]
-pub(crate) use io::{RECV_LEASE_DEPTH, recv_pool_buf_len};
 
 /// The pure framing decision, re-exported only under the `__fuzz` feature for
 /// the fuzz harness (`fuzz/fuzz_targets/framing_arithmetic.rs`). Not part of

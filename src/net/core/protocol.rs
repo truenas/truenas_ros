@@ -163,9 +163,9 @@ pub enum Framing {
     ///
     /// **A body that carries its own framing belongs on
     /// [`Framing::Complete`], not here.** Splice moves opaque bytes, so a
-    /// chunked transfer coding - or an inner encoding like `aws-chunked`,
-    /// whose size lines land at arbitrary offsets inside the outer chunks -
-    /// cannot be de-framed on the way past. The extent named here has to be
+    /// chunked transfer coding - or an inner encoding whose frame headers
+    /// land at arbitrary offsets inside the outer chunks - cannot be
+    /// de-framed on the way past. The extent named here has to be
     /// payload the consumer wants verbatim.
     ///
     /// `fd` must be **blocking** (its `O_NONBLOCK` clear); a non-blocking

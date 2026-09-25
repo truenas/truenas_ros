@@ -27,6 +27,10 @@ use crate::uring_fs::offload_pool::MAX_OFFLOAD_THREADS;
 const MIN_FS_BODY_CHUNK: usize = 4096;
 #[cfg(feature = "uring-fs")]
 const MAX_FS_BODY_CHUNK: usize = 16 * 1024 * 1024;
+/// Bounds for `recv_buffer_bytes`: one chunked read at least, and at most
+/// what one arrival should pin.
+const MIN_RECV_BUFFER: usize = 4096;
+const MAX_RECV_BUFFER: usize = 16 * 1024 * 1024;
 /// Upper bound on `max_in_flight_requests` (bounds per-connection read-ahead).
 const MAX_IN_FLIGHT: usize = 4096;
 /// Upper bound on `max_send_coalesce` (the kernel's `UIO_MAXIOV` - the most
@@ -65,8 +69,9 @@ pub struct ServerConfig {
     /// so size this against the deepest chain a handler submits times the
     /// connections that can be mid-chain, not against a file count.
     ///
-    /// Plain heap at ~180 bytes a slot, so this is the cheap axis to raise:
-    /// 1024 slots is 184 KiB, 128K is 23 MiB. The server adds `pool_size`
+    /// Plain heap at 312 bytes a slot (pinned by `uring_fs`'s
+    /// `op_entry_size` test), so this is the cheap axis to raise: 1024
+    /// slots is 312 KiB, 128K is 39 MiB. The server adds `pool_size`
     /// slots of its own on top, one per connection for the reply path's body
     /// reads, so a full pool of streaming bodies cannot exhaust the table out
     /// from under handler ops. Requires the `uring-fs` feature.
@@ -121,10 +126,10 @@ pub struct ServerConfig {
     /// `pool_size` connections times the two-chunks-per-body cap, clamped
     /// to the kernel's 32768-entry limit - and a descriptor slot is 16
     /// bytes, so that headroom is not a memory commitment. Backing buffers
-    /// of [`fs_body_chunk`](ServerConfig::fs_body_chunk) bytes are
-    /// allocated as demand asks: starting small, doubling when a read finds
-    /// the ring dry, halving after idle rounds. Resident memory therefore
-    /// tracks bodies in flight, never the connection table.
+    /// of [`fs_body_chunk`](ServerConfig::fs_body_chunk) bytes follow demand
+    /// from [`buf_pool_initial_bytes`](ServerConfig::buf_pool_initial_bytes),
+    /// so resident memory tracks bodies in flight, never the connection
+    /// table.
     #[cfg(feature = "uring-fs")]
     pub fs_body_pool: bool,
     /// Maximum bytes accepted for one message (header + body), a memory guard
@@ -146,16 +151,56 @@ pub struct ServerConfig {
     /// [`recv_bufs_lent`](super::ServerStats::recv_bufs_lent): at rest it
     /// settles to zero however many connections are open.
     ///
-    /// There is nothing to size here either. The ring is registered with
-    /// descriptor slots for every buffer demand can hold at once - each
-    /// connection's arriving message plus the leased writes that may still
-    /// hold theirs (`RECV_LEASE_DEPTH`) - and backing buffers are allocated
-    /// as demand asks, doubling when a completion finds the ring dry and
-    /// halving after idle rounds. A message that outgrows its buffer moves
-    /// to owned storage and carries on, and a kernel without
-    /// provided-buffer rings degrades to owned buffers rather than failing
-    /// to bind.
+    /// Sized by [`recv_lease_depth`](ServerConfig::recv_lease_depth),
+    /// [`recv_buffer_bytes`](ServerConfig::recv_buffer_bytes) and
+    /// [`buf_pool_initial_bytes`](ServerConfig::buf_pool_initial_bytes). A
+    /// message that outgrows its buffer moves to owned storage, and a kernel
+    /// without provided-buffer rings degrades to owned buffers rather than
+    /// failing to bind.
     pub recv_pool: bool,
+    /// Receive buffers a connection's handler may hold past the message they
+    /// arrived with - leased writes, leased jobs, held windows - on top of
+    /// the one a message arriving takes. The pool grows to at most
+    /// `pool_size x (recv_lease_depth + 1)` buffers, clamped to 32768 and to
+    /// [`buf_pool_max_bytes`](ServerConfig::buf_pool_max_bytes); past that,
+    /// reads park or fall back to owned buffers
+    /// ([`recv_shortage_retry`](ServerConfig::recv_shortage_retry)). A
+    /// handler that holds windows until more of its stream arrives must stay
+    /// within its depth, or its parked read waits on a buffer it holds.
+    ///
+    /// The cost is descriptor slots - 16 bytes of locked memory each,
+    /// charged to an unprivileged process's `RLIMIT_MEMLOCK`
+    /// (`__io_account_mem`) - not buffers. Default 4.
+    pub recv_lease_depth: u32,
+    /// Size of a pooled receive buffer, capped at
+    /// [`max_request_bytes`](ServerConfig::max_request_bytes). A message
+    /// that outgrows its buffer costs one copy to owned storage. Size it to
+    /// hold a codec's streamed window with its framing
+    /// (`HttpConfig::recv_buffer_bytes`), or each window takes an allocation
+    /// of its own.
+    ///
+    /// It must hold any body under
+    /// [`body_placement_threshold`](ServerConfig::body_placement_threshold),
+    /// which `validate` checks: such a body - or a header read in one exact
+    /// step - that does not fit moves its connection to owned buffers for
+    /// good. Below 16 KiB, kTLS decrypts full-size records aside and copies
+    /// them (`to_decrypt <= len` in `tls_sw_recvmsg`). Default 256 KiB;
+    /// 4 KiB to 16 MiB.
+    pub recv_buffer_bytes: usize,
+    /// Buffer storage each ring (receive, file body) starts with, per ring
+    /// and per reactor, allocated when the server is built. Too little and a
+    /// burst pays a failed read per growth step; too much and small requests
+    /// rotate through cold buffers. Default 16 MiB.
+    pub buf_pool_initial_bytes: usize,
+    /// The most storage one growth step adds to a ring; a step otherwise
+    /// doubles it. Default 16 MiB.
+    pub buf_pool_max_step_bytes: usize,
+    /// The most storage each ring may hold, per reactor. At the cap a
+    /// receive parks or falls back to an owned buffer
+    /// ([`recv_shortage_retry`](ServerConfig::recv_shortage_retry)) and a
+    /// file-body read uses an owned buffer, so a handler holding windows
+    /// must fit its share. `None` (the default): no cap below the demand.
+    pub buf_pool_max_bytes: Option<usize>,
     /// How the recv side answers a read that found the buffer pool
     /// **genuinely exhausted** - the ring at its registered bound with every
     /// buffer lent, which growth cannot answer. `Some(backoff)` (the
@@ -170,9 +215,9 @@ pub struct ServerConfig {
     /// Ordinary shortage - the pool under its working set but under its
     /// bound too - is not this: it grows the pool and re-arms immediately,
     /// whichever way this is set. The bound is `pool_size` recv slots plus
-    /// `RECV_LEASE_DEPTH` leased windows per connection, so only leases
-    /// held past their message - a pipelined ingest handler floating
-    /// writes - can reach it.
+    /// [`recv_lease_depth`](ServerConfig::recv_lease_depth) claims per
+    /// connection, so only claims held past their message - a pipelined
+    /// ingest handler floating writes - can reach it.
     pub recv_shortage_retry: Option<Duration>,
     /// `listen(2)` backlog.
     pub backlog: i32,
@@ -247,10 +292,12 @@ pub struct ServerConfig {
     ///
     /// It bounds one **message**, which is what makes it composable with a
     /// streamed body: each window is its own message, so an upload of any
-    /// size is admitted while the floor it sets a peer stays
-    /// `STREAM_WINDOW / max_receipt_time`. A buffered request is bounded
-    /// whole, at `size / max_receipt_time`. Pick it from the slowest client
-    /// worth serving, not from the largest upload.
+    /// size is admitted while the floor it sets a peer stays one window
+    /// (for a spliced body,
+    /// [`receipt_window_bytes`](ServerConfig::receipt_window_bytes)) per
+    /// `max_receipt_time`. A buffered request is bounded whole, at
+    /// `size / max_receipt_time`. Pick it from the slowest client worth
+    /// serving, not from the largest upload.
     ///
     /// Bounds only receipt, never handling: the clock is cancelled at
     /// delivery, so a request offloaded via [`Response::Defer`] may run as
@@ -264,6 +311,13 @@ pub struct ServerConfig {
     ///
     /// [`Response::Defer`]: super::Response::Defer
     pub max_receipt_time: Option<Duration>,
+    /// Bytes of a spliced body that earn another
+    /// [`max_receipt_time`](ServerConfig::max_receipt_time) budget. A spliced
+    /// body is one message however large, so without renewal the budget
+    /// would cap its size by wall clock; a peer slower than one window per
+    /// budget is still closed. Set it to the codec's window
+    /// (`HttpConfig::receipt_window_bytes`). Default 128 KiB.
+    pub receipt_window_bytes: usize,
     /// Maximum requests in flight per connection before read-ahead pauses.
     /// `1` (the default) is strict sequential keep-alive: one request is fully
     /// answered before the next is read. `N > 1` **pipelines** - while a request
@@ -392,12 +446,18 @@ impl Default for ServerConfig {
             fs_body_pool: true,
             max_request_bytes: 1024 * 1024,
             recv_pool: true,
+            recv_lease_depth: 4,
+            recv_buffer_bytes: 256 * 1024,
+            buf_pool_initial_bytes: 16 * 1024 * 1024,
+            buf_pool_max_step_bytes: 16 * 1024 * 1024,
+            buf_pool_max_bytes: None,
             recv_shortage_retry: Some(Duration::from_millis(10)),
             backlog: 128,
             unlink_unix: true,
             idle_timeout: None,
             request_timeout: None,
             max_receipt_time: None,
+            receipt_window_bytes: 128 * 1024,
             max_in_flight_requests: 1,
             send_timeout: None,
             tls_handshake_timeout: None,
@@ -519,6 +579,41 @@ impl ServerConfig {
                 i32::MAX
             )));
         }
+        if self.recv_buffer_bytes < MIN_RECV_BUFFER
+            || self.recv_buffer_bytes > MAX_RECV_BUFFER
+        {
+            return Err(Error::Validation(format!(
+                "recv_buffer_bytes must be in \
+                 {MIN_RECV_BUFFER}..={MAX_RECV_BUFFER}"
+            )));
+        }
+        // See `recv_buffer_bytes`: an unplaced body must fit a pool buffer.
+        if self.recv_pool
+            && let Some(threshold) = self.body_placement_threshold
+            && self.recv_buffer_bytes.min(self.max_request_bytes)
+                < threshold.min(self.max_request_bytes)
+        {
+            return Err(Error::Validation(format!(
+                "recv_buffer_bytes ({}) must hold a body below \
+                 body_placement_threshold ({threshold})",
+                self.recv_buffer_bytes
+            )));
+        }
+        if self.buf_pool_max_step_bytes == 0 {
+            return Err(Error::Validation(
+                "buf_pool_max_step_bytes must be non-zero".into(),
+            ));
+        }
+        if self.buf_pool_max_bytes == Some(0) {
+            return Err(Error::Validation(
+                "buf_pool_max_bytes must be non-zero".into(),
+            ));
+        }
+        if self.receipt_window_bytes == 0 {
+            return Err(Error::Validation(
+                "receipt_window_bytes must be non-zero".into(),
+            ));
+        }
         if matches!(self.idle_timeout, Some(d) if d.is_zero()) {
             return Err(Error::Validation(
                 "idle_timeout must be non-zero".into(),
@@ -596,6 +691,7 @@ impl ServerConfig {
             idle_timeout: self.idle_timeout,
             request_timeout: self.request_timeout,
             max_receipt_time: self.max_receipt_time,
+            receipt_window_bytes: self.receipt_window_bytes,
             send_timeout: self.send_timeout,
             tls_handshake_timeout: self.tls_handshake_timeout,
             recv_shortage_retry: self.recv_shortage_retry,
@@ -627,7 +723,7 @@ impl From<ServerAddr> for Listen {
     }
 }
 
-#[cfg(all(test, feature = "uring-fs"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -637,6 +733,7 @@ mod tests {
 
     /// The offload bounds spawn real threads on the reactor thread at first
     /// use, so they are bounded at construction like every other sizing knob.
+    #[cfg(feature = "uring-fs")]
     #[test]
     fn validate_bounds_the_offload_pool() {
         let a = addrs();
@@ -657,6 +754,99 @@ mod tests {
                 e.contains("fs_offload_floor"),
                 "({floor}, {ceiling}) accepted or wrong error: {e}"
             );
+        }
+    }
+
+    /// `recv_buffer_bytes` is bounded, and a zero receipt window - which
+    /// would renew a spliced body's budget on no progress - is refused, as
+    /// is a zero pool step or cap.
+    #[test]
+    fn validate_bounds_the_receive_buffers() {
+        let a = addrs();
+        for bytes in [0, MIN_RECV_BUFFER - 1, MAX_RECV_BUFFER + 1] {
+            let cfg = ServerConfig {
+                recv_buffer_bytes: bytes,
+                ..ServerConfig::default()
+            };
+            let e = cfg.validate(&a).unwrap_err().to_string();
+            assert!(
+                e.contains("recv_buffer_bytes"),
+                "{bytes} accepted or wrong error: {e}"
+            );
+        }
+        for bytes in [MIN_RECV_BUFFER, MAX_RECV_BUFFER] {
+            let cfg = ServerConfig {
+                recv_buffer_bytes: bytes,
+                body_placement_threshold: Some(MIN_RECV_BUFFER),
+                ..ServerConfig::default()
+            };
+            assert!(cfg.validate(&a).is_ok(), "{bytes} refused");
+        }
+        let cfg = ServerConfig {
+            receipt_window_bytes: 0,
+            ..ServerConfig::default()
+        };
+        let e = cfg.validate(&a).unwrap_err().to_string();
+        assert!(
+            e.contains("receipt_window_bytes"),
+            "a zero window accepted or wrong error: {e}"
+        );
+        for (cfg, field) in [
+            (
+                ServerConfig {
+                    buf_pool_max_step_bytes: 0,
+                    ..ServerConfig::default()
+                },
+                "buf_pool_max_step_bytes",
+            ),
+            (
+                ServerConfig {
+                    buf_pool_max_bytes: Some(0),
+                    ..ServerConfig::default()
+                },
+                "buf_pool_max_bytes",
+            ),
+        ] {
+            let e = cfg.validate(&a).unwrap_err().to_string();
+            assert!(e.contains(field), "zero {field} accepted: {e}");
+        }
+    }
+
+    /// The buffer must hold every body placement leaves to it, unless there
+    /// is no pool, no placement, or a request cap below the buffer.
+    #[test]
+    fn validate_keeps_unplaced_bodies_inside_a_pool_buffer() {
+        const BUF: usize = 32 * 1024;
+        let a = addrs();
+        let below = ServerConfig {
+            recv_buffer_bytes: BUF,
+            body_placement_threshold: Some(2 * BUF),
+            ..ServerConfig::default()
+        };
+        let e = below.validate(&a).unwrap_err().to_string();
+        assert!(
+            e.contains("body_placement_threshold"),
+            "a buffer below the threshold accepted or wrong error: {e}"
+        );
+        for fine in [
+            ServerConfig {
+                body_placement_threshold: Some(BUF),
+                ..below
+            },
+            ServerConfig {
+                body_placement_threshold: None,
+                ..below
+            },
+            ServerConfig {
+                recv_pool: false,
+                ..below
+            },
+            ServerConfig {
+                max_request_bytes: BUF,
+                ..below
+            },
+        ] {
+            assert!(fine.validate(&a).is_ok(), "refused: {fine:?}");
         }
     }
 }

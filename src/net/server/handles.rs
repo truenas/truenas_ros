@@ -591,16 +591,15 @@ pub struct ServerStats {
     /// count instead means buffers are not being handed back.
     pub recv_bufs_lent: u32,
     /// Buffers allocated across both registered rings (receive and file
-    /// body). Grows a doubling at a time when a completion finds a ring dry
-    /// and drains back after idle rounds, so a steady value is a pool at
-    /// its working set and a climbing one is a pool still finding it - but
-    /// one that climbs while [`recv_bufs_lent`](ServerStats::recv_bufs_lent)
-    /// stays flat is a **leak**, not sizing: ids are being stranded (the
-    /// kernel consumed their descriptors, nothing returned them) and the
-    /// pool is replacing them, which sizing noise never looks like. That
-    /// signature needs traffic behind it - a strand on a quiet server
-    /// moves neither gauge, which is what the debug-build drain check
-    /// against the kernel's consumer head exists to catch.
+    /// body). Starts at each ring's
+    /// [`buf_pool_initial_bytes`](super::ServerConfig::buf_pool_initial_bytes),
+    /// grows a doubling at a time as a ring runs low and drains back after
+    /// idle rounds, so a steady value is a pool at its working set and a
+    /// climbing one is a pool still finding it.
+    ///
+    /// A **stranded** id - consumed by the kernel, never returned - moves
+    /// neither this nor [`recv_bufs_lent`](ServerStats::recv_bufs_lent): the
+    /// ring counts it posted and neither reissues nor replaces it.
     pub recv_bufs_total: u32,
     /// Reads parked on the [`recv_shortage_retry`] backoff because the
     /// buffer pool was genuinely exhausted - at its registered bound with
@@ -611,6 +610,10 @@ pub struct ServerStats {
     ///
     /// [`recv_shortage_retry`]: super::ServerConfig::recv_shortage_retry
     pub recv_shortage_parks: u64,
+    /// Reads that found a buffer ring dry (`-ENOBUFS`) and were re-armed.
+    /// A count that climbs under steady load says bursts outrun the pools'
+    /// growth.
+    pub buf_shortages: u64,
     /// Provided-buffer rings this server asked for and did not get because
     /// `RLIMIT_MEMLOCK` refused their region.
     ///
@@ -670,6 +673,7 @@ impl StatsHandle {
             bytes_out: s.bytes_out.load(Ordering::Relaxed),
             recv_bufs_lent: s.recv_bufs_lent.load(Ordering::Relaxed) as u32,
             recv_shortage_parks: s.recv_shortage_parks.load(Ordering::Relaxed),
+            buf_shortages: s.buf_shortages.load(Ordering::Relaxed),
             recv_bufs_total: s.recv_bufs_total.load(Ordering::Relaxed) as u32,
             buf_rings_refused_memlock: s
                 .buf_rings_refused_memlock

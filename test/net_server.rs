@@ -7107,9 +7107,10 @@ fn ktls_echo_roundtrip() {
                 assert_eq!(recv_framed(&mut s)?, msg, "kTLS echo mismatch");
             }
             // A larger payload spanning multiple TLS records still frames.
-            // 512 KiB is above `RECV_POOL_BUF`, so the body is *placed* -
-            // read into its own allocation rather than the pool buffer -
-            // which is the arm the kTLS continuation's bound has to follow.
+            // 512 KiB is above the default `recv_buffer_bytes`, so the body
+            // is *placed* - read into its own allocation rather than the
+            // pool buffer - which is the arm the kTLS continuation's bound
+            // has to follow.
             // Well under the 1 MiB `max_request_bytes` a server advertises,
             // so this is an ordinary message, not an edge.
             let big = vec![0x5au8; 512 * 1024];
@@ -11145,19 +11146,69 @@ fn a_pooled_server_echoes_what_an_owned_one_does() {
     assert_eq!(s.recv_bufs_lent, 0, "buffers outstanding after every close");
 }
 
+/// The recv pool starts at what its config buys: capped by the lease depth
+/// or the byte cap, or the byte budget over the buffer size. Read before
+/// any traffic.
+#[test]
+fn the_recv_pool_is_sized_by_its_config() {
+    const CONNS: u32 = 2;
+    const BUF: usize = 1024 * 1024;
+    // More than the depth allows, so the depth bounds the start.
+    const PLENTY: usize = 64 * BUF;
+    // A half to spare: a buffer's scanning slack cannot cost one.
+    const TWELVE: usize = 12 * BUF + BUF / 2;
+    const TEN: usize = 10 * BUF + BUF / 2;
+    for (depth, budget, cap, want) in [
+        (4, PLENTY, None, CONNS * 5),
+        (32, TWELVE, None, 12),
+        (32, PLENTY, Some(TEN), 10),
+    ] {
+        let cfg = ServerConfig {
+            pool_size: CONNS,
+            recv_lease_depth: depth,
+            recv_buffer_bytes: BUF,
+            buf_pool_initial_bytes: budget,
+            buf_pool_max_bytes: cap,
+            ..ServerConfig::default()
+        };
+        let addr =
+            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let server = match Server::with_config(
+            [addr],
+            cfg,
+            length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
+        ) {
+            Ok(s) => s,
+            Err(e) if should_skip(&e) => return,
+            Err(e) => panic!("bind: {e}"),
+        };
+        let s = server.stats_handle().snapshot();
+        assert_pool_registered(&s);
+        assert_eq!(
+            s.recv_bufs_total, want,
+            "depth {depth}, budget {budget}, cap {cap:?}: {s:?}"
+        );
+    }
+}
+
 /// The property the pool exists for: a connection parked between requests
 /// holds no buffer, so buffer memory tracks concurrent *arrivals* and not the
 /// connection count.
 ///
-/// Measured with more idle connections than the pool has buffers - which an
-/// owned-buffer server would need one apiece for, and which a pool that held
-/// them across the idle gap would have to grow to cover.
+/// Measured with more idle connections than the pool starts with buffers -
+/// which an owned-buffer server would need one apiece for, and which a pool
+/// that held them across the idle gap would have to grow to cover.
 #[test]
 fn an_idle_pooled_connection_holds_no_buffer() {
-    const IDLE: usize = 16;
+    // Each buffer carries a chunk of slack, so the budget buys fewer than
+    // `BUDGET / BUF`, and `IDLE` connections outnumber them.
+    const BUF: usize = 64 * 1024;
+    const BUDGET: usize = 16 * BUF;
+    const IDLE: usize = BUDGET / BUF + 1;
     let cfg = ServerConfig {
-        pool_size: 32,
-        max_request_bytes: 8 * 1024,
+        pool_size: IDLE as u32,
+        recv_buffer_bytes: BUF,
+        buf_pool_initial_bytes: BUDGET,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -11175,6 +11226,13 @@ fn an_idle_pooled_connection_holds_no_buffer() {
     };
     let stats = server.stats_handle();
     let stop = server.shutdown_handle();
+    // The premise, read off the server.
+    let born = stats.snapshot().recv_bufs_total as usize;
+    assert!(
+        born < IDLE,
+        "the pool starts with {born} buffers, so {IDLE} idle connections \
+         prove nothing"
+    );
 
     let coordinator = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
@@ -11460,17 +11518,24 @@ fn a_placed_body_never_takes_a_pool_buffer() {
 /// the connection mid-body; it is pressure, and the answer is to grow (or,
 /// if the pool cannot, to re-issue the read with an owned buffer). The
 /// barrier makes the burst genuinely simultaneous: every client fires its
-/// request in the same instant against a pool that starts at eight.
+/// request in the same instant against a ring that starts with fewer
+/// buffers than their first reads want.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_burst_of_file_bodies_grows_the_ring_instead_of_shedding() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Barrier, Mutex, mpsc};
     use truenas_ros::sync_fs::{OFlag, OpenHow};
     use truenas_ros::uring_fs::{Anchor, FsConfig, UringFs};
 
     const CONNS: usize = 24;
-    const CHUNK: usize = 16 * 1024;
-    const SIZE: usize = 8 * CHUNK;
+    // Fewer buffers to start than the burst's first reads want.
+    const BUDGET: usize = 16 * 1024 * 1024;
+    const CHUNK: usize = 1024 * 1024;
+    const _: () = assert!(BUDGET / CHUNK < CONNS);
+    // `FILE_TAIL_BUFS`: every connection's whole share in flight.
+    const CHUNKS_PER_BODY: usize = 2;
+    const SIZE: usize = CHUNKS_PER_BODY * CHUNK;
 
     let dir = truenas_ros::tempdir().unwrap();
     std::fs::write(dir.path().join("obj"), vec![0x42u8; SIZE])
@@ -11506,8 +11571,12 @@ fn a_burst_of_file_bodies_grows_the_ring_instead_of_shedding() {
         pool_size: 32,
         fs_ops: 16,
         fs_body_chunk: CHUNK,
+        buf_pool_initial_bytes: BUDGET,
         ..ServerConfig::default()
     };
+    let sent = Arc::new(AtomicUsize::new(0));
+    let held = Arc::new(AtomicBool::new(false));
+    let (sent_srv, held_srv) = (Arc::clone(&sent), Arc::clone(&held));
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
         header: length_prefix_header::<()>(
@@ -11515,12 +11584,25 @@ fn a_burst_of_file_bodies_grows_the_ring_instead_of_shedding() {
             Endian::Big,
             false,
         ),
-        body: move |_req: Request<'_, ()>| Response::ReplyFile {
-            head: Vec::new(),
-            file: file.clone(),
-            offset: 0,
-            len: SIZE as u64,
-            close: true,
+        body: move |_req: Request<'_, ()>| {
+            // Hold the reactor until every request is on the wire, so the
+            // body reads go out in one submission, ahead of any growth.
+            // Spread across batches, grow-ahead keeps the ring from dry.
+            if !held_srv.swap(true, Ordering::Relaxed) {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while sent_srv.load(Ordering::Acquire) < CONNS
+                    && Instant::now() < deadline
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Response::ReplyFile {
+                head: Vec::new(),
+                file: file.clone(),
+                offset: 0,
+                len: SIZE as u64,
+                close: true,
+            }
         },
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -11548,16 +11630,20 @@ fn a_burst_of_file_bodies_grows_the_ring_instead_of_shedding() {
         let clients: Vec<_> = (0..CONNS)
             .map(|_| {
                 let barrier = Arc::clone(&barrier);
+                let sent = Arc::clone(&sent);
                 thread::spawn(move || -> io::Result<()> {
                     let mut s = connect_tcp(v4)?;
                     barrier.wait(); // everyone asks in the same instant
                     send_framed(&mut s, b"g")?;
-                    let mut got = vec![0u8; SIZE];
-                    s.read_exact(&mut got)?;
-                    assert!(
-                        got.iter().all(|&b| b == 0x42),
-                        "body corrupted under buffer pressure"
-                    );
+                    sent.fetch_add(1, Ordering::Release);
+                    let mut got = vec![0u8; CHUNK];
+                    for _ in 0..CHUNKS_PER_BODY {
+                        s.read_exact(&mut got)?;
+                        assert!(
+                            got.iter().all(|&b| b == 0x42),
+                            "body corrupted under buffer pressure"
+                        );
+                    }
                     Ok(())
                 })
             })
@@ -11585,6 +11671,11 @@ fn a_burst_of_file_bodies_grows_the_ring_instead_of_shedding() {
         s.recv_bufs_lent, 0,
         "buffers outstanding after close: {s:?}"
     );
+    // The premise: some read found the ring dry.
+    assert!(
+        s.buf_shortages > 0,
+        "no read found the ring dry, so nothing was proven: {s:?}"
+    );
 }
 
 /// A pump completion that closes the connection must still return its
@@ -11597,9 +11688,10 @@ fn a_burst_of_file_bodies_grows_the_ring_instead_of_shedding() {
 /// ring's head advanced. So the truncated-body close (`n == 0`, the file
 /// shrank under a committed `Content-Length`) is a completion that both
 /// carries a buffer and abandons the transfer: exactly the exit class that
-/// must requeue. Skipping it strands the id, `recv_bufs_lent` stays
-/// innocently at zero while the pool replaces each loss with a fresh
-/// allocation, and the ring drains one abandoned body at a time. The same
+/// must requeue. Skipping it strands the id - the pool still counts it
+/// posted, so it neither re-posts it nor grows to replace it - while
+/// `recv_bufs_lent` stays innocently at zero, and the ring drains one
+/// abandoned body at a time until every read comes back `-ENOBUFS`. The same
 /// duty holds on the racier exits of that class (a completion landing on a
 /// closing or recycled slot), which share this arm's fix but cannot be
 /// scheduled deterministically from a test; `rw.c:591` is the authority
@@ -11611,8 +11703,8 @@ fn a_truncated_body_close_returns_its_buffer() {
     use truenas_ros::sync_fs::{OFlag, OpenHow};
     use truenas_ros::uring_fs::{Anchor, FsConfig, UringFs};
 
-    const ROUNDS: usize = 20;
     const CHUNK: usize = 32 * 1024;
+    const POOL_SIZE: u32 = 32;
 
     let dir = truenas_ros::tempdir().unwrap();
     // Half a chunk on disk, four chunks declared: read one short chunk,
@@ -11646,12 +11738,12 @@ fn a_truncated_body_close_returns_its_buffer() {
     let file = frx.recv().expect("open outcome").expect("open");
 
     let cfg = ServerConfig {
-        // Wide enough that a stranded-id drain has room to snowball: each
-        // loss forces a replacement, the ring doubles toward its 64-entry
-        // wall, and the gauge shows a climb no sizing noise can reach.
-        pool_size: 32,
+        pool_size: POOL_SIZE,
         fs_ops: 16,
         fs_body_chunk: CHUNK,
+        // The body ring alone, born at its bound, so the gauge counts it.
+        recv_pool: false,
+        buf_pool_initial_bytes: usize::MAX,
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -11680,17 +11772,36 @@ fn a_truncated_body_close_returns_its_buffer() {
     };
     let stats = server.stats_handle();
     let stop = server.shutdown_handle();
+    let born = stats.snapshot();
+    assert_pool_registered(&born);
+    // One stranded id per round: twice the ring's size runs it dry.
+    let rounds = 2 * born.recv_bufs_total as usize;
 
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
-        for i in 0..ROUNDS {
+        for i in 0..rounds {
             let mut s = connect_tcp(v4).expect("connect");
+            // A ring of stranded ids never delivers the body: a stall
+            // fails the round instead of hanging the test.
+            s.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
             s.write_all(&1u32.to_be_bytes()).expect("len");
             s.write_all(b"g").expect("req");
             // The server sends the head and the short chunk, then closes
             // mid-body on the EOF. Drain to the reset/EOF.
             let mut sink = Vec::new();
-            let _ = s.read_to_end(&mut sink);
+            if let Err(e) = s.read_to_end(&mut sink) {
+                assert!(
+                    !matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                    ),
+                    "round {i}: the body stalled after {} bytes - the ring \
+                     ran out of buffers",
+                    sink.len()
+                );
+            }
             assert!(
                 sink.len() <= 1 + CHUNK / 2,
                 "round {i}: a truncated body was served whole"
@@ -11715,17 +11826,6 @@ fn a_truncated_body_close_returns_its_buffer() {
     let s = client.join().expect("client thread");
     assert!(s.recv_bufs_total > 0, "no ring registered: {s:?}");
     assert_eq!(s.recv_bufs_lent, 0, "buffers outstanding: {s:?}");
-    // Both rings start at 8 and these sequential one-body rounds never
-    // need more (the recv side may even shrink), so the settled total sits
-    // at 16 or below. A stranded id per truncation drains the body ring
-    // dry every eight rounds, and each drain doubles it toward the wall -
-    // 20 rounds drove the total past 30 with the requeue removed - while
-    // `lent` stayed flat throughout, which is why the total is the only
-    // gauge that can see this.
-    assert!(
-        s.recv_bufs_total <= 20,
-        "the ring drained under truncated-body closes: {s:?}"
-    );
 }
 
 /// A two-phase length-prefixed framer: deliver the 4-byte prefix, then ask
@@ -12066,6 +12166,8 @@ fn a_redelivery_does_not_retire_the_next_message_budget() {
 /// again. A one-read header hides that entirely, which is why it cannot be
 /// the only case here.
 ///
+/// And with a window larger than the body, which must be reaped.
+///
 /// The pipe is drained continuously; at 768 KiB the body is many times a
 /// pipe's capacity, so without a reader the splice would block on
 /// backpressure and the test would measure that instead.
@@ -12080,9 +12182,12 @@ fn a_large_spliced_body_is_bounded_per_window_not_whole() {
     /// is re-armed on every one and can never be what reaps this.
     const GAP: Duration = Duration::from_millis(150);
 
-    for (what, split_header) in
-        [("a one-read header", false), ("a two-read header", true)]
-    {
+    // A window larger than the body is never earned.
+    for (what, split_header, window, renews) in [
+        ("a one-read header", false, WINDOW, true),
+        ("a two-read header", true, WINDOW, true),
+        ("a window larger than the body", false, 2 * BODY, false),
+    ] {
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: `pipe(2)` fills the two-element array with {read, write}.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
@@ -12099,6 +12204,7 @@ fn a_large_spliced_body_is_bounded_per_window_not_whole() {
             // requires the receipt budget to exceed it.
             request_timeout: Some(Duration::from_millis(400)),
             idle_timeout: None,
+            receipt_window_bytes: window,
             ..ServerConfig::default()
         };
         let addr =
@@ -12219,6 +12325,15 @@ fn a_large_spliced_body_is_bounded_per_window_not_whole() {
         // race with no bearing on the budget, and it is lost in a release
         // build.
         let got = reasons.lock().unwrap().clone();
+        if !renews {
+            assert!(
+                got.contains(&CloseReason::ReceiptTimeout),
+                "{what}: no window was ever moved, so the budget should have \
+                 bounded the transfer whole (reasons: {got:?})"
+            );
+            assert!(served.is_err(), "{what}: answered after its budget");
+            continue;
+        }
         assert!(
             !got.contains(&CloseReason::ReceiptTimeout),
             "{what}: a body moving a window per third of a budget is above \

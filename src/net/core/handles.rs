@@ -132,6 +132,9 @@ pub(crate) struct StatsInner {
     /// bound with every buffer lent (counts parks, not connections).
     #[cfg(feature = "net-server")]
     pub(crate) recv_shortage_parks: AtomicU64,
+    /// Reads that found a provided-buffer ring dry (`-ENOBUFS`).
+    #[cfg(feature = "net-server")]
+    pub(crate) buf_shortages: AtomicU64,
     /// Provided-buffer rings `RLIMIT_MEMLOCK` refused at construction.
     /// Written once, before the loop starts.
     #[cfg(feature = "net-server")]
