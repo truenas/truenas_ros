@@ -291,12 +291,12 @@ fn zfs_snapshot_is_detected() {
 }
 
 // ---------------------------------------------------------------------------
-// ZFS_READONLY / ZFS_IMMUTABLE - the file-attribute semantics the S3 front's
+// ZFS_READONLY / ZFS_IMMUTABLE - the file-attribute semantics a consumer's
 // read-only objects lean on. Each of these is a **pin on fork behaviour**,
-// probed rather than assumed (the `unix_peercred` discipline): the design
-// sets `ZfsAttr::READONLY` on a staged object before it first gains a name
-// and `READONLY | IMMUTABLE` on superseded versions, and every step of that
-// choreography rests on a semantic the shipped ZFS could change under a
+// probed rather than assumed (the `unix_peercred` discipline): a consumer
+// that sets `ZfsAttr::READONLY` on a staged object before it first gains a
+// name and `READONLY | IMMUTABLE` on superseded versions rests every step of
+// that choreography on a semantic the shipped ZFS could change under a
 // train bump. A red here is the platform moving, and names the doc or the
 // landing order that has to move with it.
 // ---------------------------------------------------------------------------
@@ -389,10 +389,11 @@ fn add_zfs_attrs(f: &std::fs::File, add: ZfsAttr) -> ZfsAttr {
 /// The descriptor that holds a file open keeps writing after `READONLY`
 /// lands - the fchmod(0444) shape `zfs_zaccess_common` documents and
 /// `zfs_write` implements by exempting the flag ("Intentionally allow
-/// ZFS_READONLY through here", `zfs_vnops.c`). The S3 front's PUT flags the
-/// staged object while its own descriptor still owes writes, so a platform
-/// that starts checking the flag per-write breaks every upload: this pin is
-/// what turns that into a red lane instead of a fleet incident.
+/// ZFS_READONLY through here", `zfs_vnops.c`). A writer that flags a staged
+/// object while its own descriptor still owes writes relies on exactly
+/// this, so a platform that starts checking the flag per-write breaks every
+/// such upload: this pin is what turns that into a red lane instead of a
+/// fleet incident.
 ///
 /// The second half is the one write channel that never consults
 /// `zfs_write`: dirtying pages through a shared writable mapping. `zfs_map`
@@ -475,9 +476,9 @@ fn a_readonly_flag_is_fchmod_shaped_for_the_descriptor_holding_it() {
     // A trusted.* xattr still lands: `xattr_permission`'s trusted branch
     // is `CAP_SYS_ADMIN` alone, with no inode write check (`fs/xattr.c`),
     // and the flag's own deny is `WRITE_MASK_DATA` through `zfs_zaccess`,
-    // which a trusted write never consults. The S3 front re-stamps a
+    // which a trusted write never consults. A consumer that re-stamps a
     // superseded predecessor's index record while that predecessor is
-    // READONLY, so this is load-bearing, not a curiosity.
+    // READONLY depends on it, so this is load-bearing, not a curiosity.
     {
         use truenas_ros::sync_fs::xattr::{XattrFlags, fsetxattr};
         fsetxattr(f.as_fd(), "trusted.rostest_ro", b"v", XattrFlags::empty())
@@ -584,16 +585,16 @@ fn a_readonly_inode_gains_and_loses_names_freely() {
 /// An ordinary open-for-write is asked of ZFS at all only on an
 /// `acltype=nfsv4` dataset whose file carries a **non-trivial** ACL;
 /// everything else is answered from the mode alone. That scope is the
-/// platform contract the S3 front documents ("NFSv4 required"), and this
-/// test is the contract in executable form: the nfsv4 half proves the deny
-/// where it is promised, and the posix half proves the gap where it is
-/// documented.
+/// platform contract a consumer relying on the flag has to state ("NFSv4
+/// required"), and this test is the contract in executable form: the nfsv4
+/// half proves the deny where it is promised, and the posix half proves the
+/// gap where it is documented.
 ///
 /// **A red on either half is the platform moving, not this test rotting.**
 /// If the posix half's open starts failing, or the root open below starts
 /// failing, the fork has grown enforcement - update `ZfsAttr::READONLY`'s
-/// rustdoc and the S3 front's requirement documentation to match, then the
-/// assertions.
+/// rustdoc to match, which is what consumers state their requirements from,
+/// then the assertions.
 #[test]
 fn readonly_denies_a_fresh_writer_exactly_where_documented() {
     // --- the enforced half: acltype=nfsv4, non-trivial ACL ---------------
@@ -683,7 +684,7 @@ fn readonly_denies_a_fresh_writer_exactly_where_documented() {
     open_for_write_as_nobody(&ppath).expect(
         "documented scope: READONLY does not deny on a posixacl dataset - \
          if this starts failing the platform grew enforcement; update the \
-         ZfsAttr::READONLY rustdoc and the S3 front's requirement docs",
+         ZfsAttr::READONLY rustdoc",
     );
     std::fs::remove_file(&ppath).expect("cleanup");
 }

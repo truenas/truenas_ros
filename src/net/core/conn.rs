@@ -905,7 +905,8 @@ pub(crate) struct Connection<U> {
     /// `splice_remaining` when the current body opened, or when its last
     /// receipt budget was renewed, so an expiry can tell a window's worth of
     /// progress from a stall. Only the splice path sets it; a buffered
-    /// message is bounded whole and needs no mark. See `RECEIPT_WINDOW`.
+    /// message is bounded whole and needs no mark. See
+    /// `ServerConfig::receipt_window_bytes`.
     pub receipt_window_mark: usize,
     // ---- send side ----
     // Outgoing PDUs (request replies and pushes) queued FIFO in production

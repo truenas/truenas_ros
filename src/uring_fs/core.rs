@@ -400,10 +400,33 @@ struct FsOpEntry {
     /// once, on [`FsDone`], for the net server to hand back to the pool.
     #[cfg(feature = "net-server")]
     recv_lease: Option<std::sync::Arc<LeaseHold>>,
+    /// The shares of a gathered leased write past its first window
+    /// ([`FsConn::pwritev2_leased`]), each held to the CQE as
+    /// `recv_lease` is.
+    #[cfg(feature = "net-server")]
+    recv_lease_more: Vec<std::sync::Arc<LeaseHold>>,
     /// The byte count a leased write asked for, so a short completion can
     /// be told apart from a full one at reap time.
     #[cfg(feature = "net-server")]
     lease_want: u32,
+}
+
+/// The most iovecs one `WRITEV` may carry (the kernel's `UIO_MAXIOV`).
+#[cfg(feature = "net-server")]
+const UIO_MAXIOV: usize = 1024;
+
+/// The kernel's `MAX_RW_COUNT` (`include/linux/fs.h`): `__import_iovec`
+/// silently trims a longer write to it, which a leased write would report
+/// as a short `EIO`.
+#[cfg(feature = "net-server")]
+fn max_rw_count() -> usize {
+    i32::MAX as usize & !(crate::uring::page_size() - 1)
+}
+
+/// Whether `windows` windows of `total` bytes fit one gathered `WRITEV`.
+#[cfg(feature = "net-server")]
+fn gather_fits(windows: usize, total: usize) -> bool {
+    windows > 0 && windows <= UIO_MAXIOV && total <= max_rw_count()
 }
 
 /// One delivery's claim on a recv-pool buffer, shared by every leased
@@ -531,15 +554,13 @@ impl LeasedBytes {
 /// goes back to the pool when the last share of its claim is gone,
 /// wherever that happens.
 ///
-/// **The budget.** A connection's recv ring registers
-/// `RECV_LEASE_DEPTH` (4) buffer slots past the one arriving, and every
-/// buffer a handler keeps a claim on counts against them, whatever its
-/// size: the buffers its leased writes are still reading, the ones its
-/// jobs are reading, and the ones it holds like this. Past the
-/// registration a connection degrades to owned buffers *permanently*: a
-/// copy per window from then on, visible only as an allocation count. A
-/// handler therefore keeps its claims outstanding, all kinds together,
-/// within `RECV_LEASE_DEPTH`.
+/// **The budget.** Every buffer a handler holds a claim on - leased writes
+/// in flight, leased jobs, windows held like this - counts against
+/// [`recv_lease_depth`](crate::net::server::ServerConfig::recv_lease_depth).
+/// Past it the next read parks until a buffer comes home (or, with
+/// `recv_shortage_retry` off, the connection falls back to copies for
+/// good), so a handler holding windows until more of its stream arrives
+/// must stay within its depth or wait on itself.
 #[cfg(feature = "net-server")]
 pub struct LeasedWindow {
     view: LeasedBytes,
@@ -556,6 +577,32 @@ impl LeasedWindow {
     /// Whether the window holds no bytes.
     pub fn is_empty(&self) -> bool {
         self.view.len == 0
+    }
+
+    /// Split into `[0, mid)` and `[mid, len)`, each holding a share of the
+    /// buffer, which goes back to the pool once both are spent or dropped.
+    ///
+    /// # Panics
+    /// If `mid > len`, as [`slice::split_at`] does.
+    pub fn split_at(self, mid: usize) -> (LeasedWindow, LeasedWindow) {
+        assert!(mid <= self.view.len, "split past the window's end");
+        let LeasedWindow { view, hold } = self;
+        let tail = LeasedWindow {
+            view: LeasedBytes {
+                // In bounds: `mid <= len`, so at most one past the end.
+                ptr: view.ptr.wrapping_add(mid),
+                len: view.len - mid,
+            },
+            hold: std::sync::Arc::clone(&hold),
+        };
+        let head = LeasedWindow {
+            view: LeasedBytes {
+                ptr: view.ptr,
+                len: mid,
+            },
+            hold,
+        };
+        (head, tail)
     }
 }
 
@@ -598,6 +645,8 @@ impl FsOpEntry {
             #[cfg(feature = "net-server")]
             recv_lease: None,
             #[cfg(feature = "net-server")]
+            recv_lease_more: Vec::new(),
+            #[cfg(feature = "net-server")]
             lease_want: 0,
         }
     }
@@ -631,6 +680,7 @@ impl FsOpEntry {
         #[cfg(feature = "net-server")]
         {
             self.recv_lease = None;
+            self.recv_lease_more.clear();
             self.lease_want = 0;
         }
         self.state = FsOpState::Free;
@@ -683,6 +733,8 @@ struct Completed {
     strip_nonblock: Option<u64>,
     #[cfg(feature = "net-server")]
     recv_lease: Option<std::sync::Arc<LeaseHold>>,
+    #[cfg(feature = "net-server")]
+    recv_lease_more: Vec<std::sync::Arc<LeaseHold>>,
     #[cfg(feature = "net-server")]
     lease_want: u32,
 }
@@ -1486,47 +1538,54 @@ impl FsCore {
         }
     }
 
-    /// Stage a `WRITEV` whose single iovec points into a recv-pool buffer
-    /// the caller holds leased - nothing is parked in `bufs`, and the buffer
-    /// id rides the op entry out to [`FsDone`] so the net server hands it
-    /// back to the pool at completion. `Err` returns the waiter untouched
-    /// (a full op table or a refused SQE) for the caller to fall back with.
+    /// Stage one `WRITEV` of held windows' bytes, in order from `off`, every
+    /// share held to the CQE and each buffer's id surfaced at the reap for
+    /// the net server to hand back. `Err` hands the windows and waiter back,
+    /// never in flight: a full op table, a refused SQE, or a gather that
+    /// does not fit one `WRITEV` (`gather_fits`).
     ///
-    /// # Safety-relevant contract (enforced by the caller)
-    /// `[src, src + len)` must stay valid and un-recycled until this op's
-    /// CQE: the connection surrenders its claim to the op rather than
-    /// releasing it, and the pool reissues the id only after the server
-    /// releases `FsDone`'s lease.
+    /// # Safety-relevant contract
+    /// A window's bytes stay valid while its share lives, and the entry
+    /// keeps every share to the reap.
     #[cfg(feature = "net-server")]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn submit_pwritev2_leased(
+    pub(crate) fn submit_pwritev2_gathered(
         &mut self,
         eng: &mut Engine,
         pers: u16,
         file: Arc<OwnedFd>,
-        src: *const u8,
-        len: usize,
+        windows: Vec<LeasedWindow>,
         off: u64,
         rw_flags: u32,
-        hold: std::sync::Arc<LeaseHold>,
         waiter: FsWaiter,
-    ) -> Result<(), FsWaiter> {
+    ) -> Result<(), (Vec<LeasedWindow>, FsWaiter)> {
+        let total: usize = windows.iter().map(LeasedWindow::len).sum();
+        if !gather_fits(windows.len(), total) {
+            return Err((windows, waiter));
+        }
         let Some(op_slot) = self.pop_op() else {
-            return Err(waiter);
+            return Err((windows, waiter));
         };
         let raw_fd = file.as_raw_fd();
         let entry = &mut self.ops[op_slot as usize];
         let gen32 = entry.generation as u32;
         entry.state.state = FsOpState::InFlight { tag: TAG_WRITEV };
-        // The slot's own storage, as in `submit_rw`.
         entry.state.iov.clear();
-        entry.state.iov.push(libc::iovec {
-            iov_base: src as *mut libc::c_void,
-            iov_len: len,
-        });
+        entry.state.recv_lease_more.clear();
+        let count = windows.len() as u32;
+        for LeasedWindow { view, hold } in windows {
+            entry.state.iov.push(libc::iovec {
+                iov_base: view.ptr as *mut libc::c_void,
+                iov_len: view.len,
+            });
+            if entry.state.recv_lease.is_none() {
+                entry.state.recv_lease = Some(hold);
+            } else {
+                entry.state.recv_lease_more.push(hold);
+            }
+        }
         entry.state.file = Some(file);
-        entry.state.recv_lease = Some(hold);
-        entry.state.lease_want = len as u32;
+        entry.state.lease_want = total as u32;
         let iov_ptr = entry.state.iov.as_ptr() as u64;
         let force = self.force_async.sqe_bit(ForceAsync::WRITE);
         let ud = pack_raw(TAG_WRITEV, op_slot, gen32);
@@ -1535,7 +1594,7 @@ impl FsCore {
             sqe.fd = raw_fd;
             sqe.flags = force;
             sqe.addr = iov_ptr;
-            sqe.len = 1;
+            sqe.len = count;
             sqe.off_addr2 = off;
             sqe.op_flags = rw_flags;
             sqe.personality = pers;
@@ -1546,13 +1605,77 @@ impl FsCore {
                 Ok(())
             }
             Err(_) => {
-                // Never in flight: unwind the entry and hand the waiter
-                // back, so the caller's fallback still owns its callback.
+                // Never in flight: hand the windows back to be refused.
+                let holds = entry
+                    .state
+                    .recv_lease
+                    .take()
+                    .into_iter()
+                    .chain(entry.state.recv_lease_more.drain(..));
+                let back = entry
+                    .state
+                    .iov
+                    .iter()
+                    .zip(holds)
+                    .map(|(iov, hold)| LeasedWindow {
+                        view: LeasedBytes {
+                            ptr: iov.iov_base as *const u8,
+                            len: iov.iov_len,
+                        },
+                        hold,
+                    })
+                    .collect();
                 entry.state.clear();
                 entry.generation += 1;
                 self.op_free.push(op_slot);
-                Err(waiter)
+                Err((back, waiter))
             }
+        }
+    }
+
+    /// Submit `windows` as one gathered leased write or, when the table or
+    /// the SQ is full, refuse it with a marked `EBUSY` like any other op.
+    /// The windows drop with the refusal, so each buffer goes back as its
+    /// last share goes. The caller has checked `gather_fits`.
+    ///
+    /// Do not park a refused write for a later slot. Waiting writes take
+    /// each slot as it frees, so a full table stays full and the handler's
+    /// other ops - the open before a body, the fsync and rename after it -
+    /// are refused in their place, after the body was written.
+    #[cfg(feature = "net-server")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit_leased_or_refuse(
+        &mut self,
+        eng: &mut Engine,
+        pers: u16,
+        file: Arc<OwnedFd>,
+        windows: Vec<LeasedWindow>,
+        off: u64,
+        rw_flags: u32,
+        waiter: FsWaiter,
+    ) {
+        debug_assert!(gather_fits(
+            windows.len(),
+            windows.iter().map(LeasedWindow::len).sum()
+        ));
+        if let Err((windows, waiter)) = self.submit_pwritev2_gathered(
+            eng,
+            pers,
+            Arc::clone(&file),
+            windows,
+            off,
+            rw_flags,
+            waiter,
+        ) {
+            drop(windows);
+            self.refuse(
+                eng,
+                waiter,
+                Errno::EBUSY,
+                true,
+                Vec::new(),
+                Some(file),
+            );
         }
     }
 
@@ -2672,6 +2795,15 @@ impl FsCore {
             .take()
             .and_then(std::sync::Arc::into_inner)
             .map(LeaseHold::into_bid);
+        // In order, so a buffer two windows share surfaces once, from the
+        // later.
+        #[cfg(feature = "net-server")]
+        let recv_lease_more: Vec<u16> =
+            std::mem::take(&mut completed.recv_lease_more)
+                .into_iter()
+                .filter_map(std::sync::Arc::into_inner)
+                .map(LeaseHold::into_bid)
+                .collect();
         #[cfg(feature = "net-server")]
         let lease_want = completed.lease_want;
         let Completed {
@@ -2787,6 +2919,8 @@ impl FsCore {
                     stat,
                     #[cfg(feature = "net-server")]
                     recv_lease,
+                    #[cfg(feature = "net-server")]
+                    recv_lease_more,
                 },
                 owner,
             ),
@@ -2799,6 +2933,8 @@ impl FsCore {
                     stat,
                     #[cfg(feature = "net-server")]
                     recv_lease,
+                    #[cfg(feature = "net-server")]
+                    recv_lease_more,
                 },
                 owner,
             ),
@@ -3012,6 +3148,8 @@ impl FsCore {
             #[cfg(feature = "net-server")]
             recv_lease: e.recv_lease.take(),
             #[cfg(feature = "net-server")]
+            recv_lease_more: std::mem::take(&mut e.recv_lease_more),
+            #[cfg(feature = "net-server")]
             lease_want: e.lease_want,
         };
         e.clear();
@@ -3081,6 +3219,8 @@ impl FsCore {
                         stat: None,
                         #[cfg(feature = "net-server")]
                         recv_lease: None,
+                        #[cfg(feature = "net-server")]
+                        recv_lease_more: Vec::new(),
                     },
                 ));
             }
@@ -3163,6 +3303,10 @@ pub struct FsDone {
     /// meaningless to any other consumer.
     #[cfg(feature = "net-server")]
     recv_lease: Option<u16>,
+    /// Ids beyond `recv_lease` a gathered leased write owes back; empty for
+    /// every other op.
+    #[cfg(feature = "net-server")]
+    recv_lease_more: Vec<u16>,
 }
 
 impl std::fmt::Debug for FsDone {
@@ -3214,6 +3358,8 @@ impl FsDone {
             stat: None,
             #[cfg(feature = "net-server")]
             recv_lease: None,
+            #[cfg(feature = "net-server")]
+            recv_lease_more: Vec::new(),
         }
     }
 
@@ -3242,6 +3388,8 @@ impl FsDone {
             stat: None,
             #[cfg(feature = "net-server")]
             recv_lease: None,
+            #[cfg(feature = "net-server")]
+            recv_lease_more: Vec::new(),
         }
     }
 
@@ -3251,6 +3399,14 @@ impl FsDone {
     #[cfg(feature = "net-server")]
     pub(crate) fn take_recv_lease(&mut self) -> Option<u16> {
         self.recv_lease.take()
+    }
+
+    /// The further buffers a gathered leased write borrowed
+    /// ([`FsConn::pwritev2_leased`]), taken beside
+    /// [`take_recv_lease`](Self::take_recv_lease) and for the same reason.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn take_recv_lease_more(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.recv_lease_more)
     }
 
     /// The op's result: a byte count / `0`, or the errno it failed with.
@@ -3991,10 +4147,12 @@ impl<'a> FsConn<'a> {
     /// pool gets the buffer back when the last of them completes - zero
     /// copies, zero allocations, for as many in-bounds ranges as one
     /// delivery submits. Anything else - an unpooled connection, a placed
-    /// or owned body, a range outside the claim, a full op table, or a
-    /// call from inside a task, whose facade carries no claim - falls
-    /// back to `pwritev2` on a copy, so the call degrades instead of
-    /// failing.
+    /// or owned body, a range outside the claim, or a call from inside a
+    /// task, whose facade carries no claim - falls back to `pwritev2` on a
+    /// copy, so the call degrades instead of failing. A full op table
+    /// refuses the write with a marked `EBUSY` ([`FsDone::was_refused`]),
+    /// as it refuses a copy, and hands nothing back: the bytes were the
+    /// delivery's.
     ///
     /// The one behavioural asymmetry between the two paths is the **short
     /// write**, which ZFS returns as a success by design. On the copy path
@@ -4029,10 +4187,10 @@ impl<'a> FsConn<'a> {
     /// [`defer_stream`](crate::http::HttpRequest::defer_stream), resuming
     /// from a completion once below it - stopping the reads is the whole
     /// mechanism, since the socket buffer then fills and TCP slows the
-    /// sender. Keep the cap at or under the reactor's per-connection ring
-    /// headroom (`RECV_LEASE_DEPTH`, 4) or the excess degrades to copies,
-    /// and size `fs_ops` to cover `pool_size` x depth. At `Stage::End`,
-    /// wait for the outstanding completions with a plain
+    /// sender. Keep the cap within `ServerConfig::recv_lease_depth` (past
+    /// it reads park, or fall back to copies with `recv_shortage_retry`
+    /// off), and size `fs_ops` to cover `pool_size` x depth. At
+    /// `Stage::End`, wait for the outstanding completions with a plain
     /// [`defer`](crate::http::HttpRequest::defer) and answer from the last
     /// one; a failed window fails the request there.
     pub fn pwritev2_from<F>(
@@ -4071,6 +4229,7 @@ impl<'a> FsConn<'a> {
             // handler - but if it ever did, leasing again would write from
             // a buffer the pool may have re-issued, so it falls to the
             // copy path instead.
+            let minted = self.lease_hold.is_none();
             let hold = leased.and_then(|(bid, _)| match &self.lease_hold {
                 Some(w) => w.upgrade(),
                 None => Some(std::sync::Arc::new(LeaseHold::new(
@@ -4079,43 +4238,105 @@ impl<'a> FsConn<'a> {
                 ))),
             });
             if let (Some((_, taken)), Some(hold)) = (leased, hold) {
+                let window = LeasedWindow {
+                    view: LeasedBytes {
+                        ptr: src.as_ptr(),
+                        len: src.len(),
+                    },
+                    hold: std::sync::Arc::clone(&hold),
+                };
                 let w = self.waiter(on_done);
-                match self.fs.submit_pwritev2_leased(
+                match self.fs.submit_pwritev2_gathered(
                     self.eng,
                     who.0,
                     Arc::clone(&f.fd),
-                    src.as_ptr(),
-                    src.len(),
+                    vec![window],
                     off,
                     flags.bits(),
-                    std::sync::Arc::clone(&hold),
                     w,
                 ) {
                     Ok(()) => {
                         taken.set(true);
                         self.lease_hold =
                             Some(std::sync::Arc::downgrade(&hold));
-                        return;
                     }
-                    Err(w) => {
-                        // The op table refused; the copy path takes the
-                        // same waiter so the callback survives the detour.
-                        self.fs.submit_rw(
+                    Err((window, w)) => {
+                        drop(window);
+                        // A hold this call minted is the only share of a
+                        // claim the connection still releases at consume:
+                        // disarm it, or its drop returns the buffer twice.
+                        // An upgraded hold's claim was already taken, so
+                        // dropping it is its release.
+                        if minted
+                            && let Some(hold) = std::sync::Arc::into_inner(hold)
+                        {
+                            let _ = hold.into_bid();
+                        }
+                        self.fs.refuse(
                             self.eng,
-                            TAG_WRITEV,
-                            who.0,
-                            f.fd,
-                            vec![src.to_vec()],
-                            off,
-                            flags.bits(),
                             w,
+                            Errno::EBUSY,
+                            true,
+                            Vec::new(),
+                            Some(f.fd),
                         );
-                        return;
                     }
                 }
+                return;
             }
         }
         self.pwritev2(who, f, vec![src.to_vec()], off, flags, on_done);
+    }
+
+    /// Write windows held with [`lease_window`](Self::lease_window) to `f`
+    /// at `off` as one gathered write, in order, none copied. Windows cut at
+    /// a record boundary ([`LeasedWindow::split_at`]) fill a ZFS record
+    /// whole, skipping the zero-fill of a partial record and the regrowth
+    /// copy of a one-block file (`zfs_grow_blocksize`).
+    ///
+    /// Each buffer returns to the pool when its last share goes. A short
+    /// write fails the op with `EIO`, as
+    /// [`pwritev2_from`](Self::pwritev2_from)'s does.
+    ///
+    /// A full op table refuses the write with a marked `EBUSY`
+    /// ([`FsDone::was_refused`]), its buffers going back as the windows
+    /// drop. A gather one `WRITEV` cannot carry is written from a copy
+    /// ([`pwritev2`](Self::pwritev2)), which reports a short write as
+    /// `Ok(n)` with the copy in [`FsDone::into_bufs`], so check the count.
+    #[cfg(feature = "net-server")]
+    pub fn pwritev2_leased<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        windows: Vec<LeasedWindow>,
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        let total = windows.iter().map(LeasedWindow::len).sum();
+        if gather_fits(windows.len(), total) {
+            let w = self.waiter(on_done);
+            self.fs.submit_leased_or_refuse(
+                self.eng,
+                who.0,
+                Arc::clone(&f.fd),
+                windows,
+                off,
+                flags.bits(),
+                w,
+            );
+            return;
+        }
+        // Too many windows or bytes for one `WRITEV`: one copy instead, and
+        // the shares go back as the windows drop.
+        let mut copy = Vec::with_capacity(total);
+        for window in &windows {
+            copy.extend_from_slice(window.view.as_slice());
+        }
+        drop(windows);
+        self.pwritev2(who, f, vec![copy], off, flags, on_done);
     }
 
     /// Flush `f`'s data and metadata (`fsync`) as `who`.
@@ -6508,6 +6729,264 @@ mod hybrid_tests {
         );
     }
 
+    /// Windows one `WRITEV` cannot carry are written from one in-order copy
+    /// that holds no share.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_gather_past_uio_maxiov_is_written_from_a_copy() {
+        let mut eng = Engine::new(256, 128).expect("engine");
+        let mut fs = FsCore::new(1, OffloadBounds::default());
+        let sink: OwnedFd = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null")
+            .into();
+        let file = crate::uring_fs::File { fd: Arc::new(sink) };
+        let bytes: Vec<u8> = (0..=UIO_MAXIOV).map(|i| i as u8).collect();
+        let hold = std::sync::Arc::new(LeaseHold::detached(3));
+        let windows = bytes
+            .iter()
+            .map(|b| LeasedWindow {
+                view: LeasedBytes {
+                    ptr: std::ptr::from_ref(b),
+                    len: 1,
+                },
+                hold: std::sync::Arc::clone(&hold),
+            })
+            .collect();
+        {
+            let mut c = FsConn::new(&mut fs, &mut eng, OWNER0);
+            c.pwritev2_leased(
+                Personality(0),
+                file.clone(),
+                windows,
+                0,
+                RwFlags::empty(),
+                |_d, _c| {},
+            );
+        }
+        assert_eq!(
+            std::sync::Arc::strong_count(&hold),
+            1,
+            "the copy path kept a share"
+        );
+        let staged: Vec<_> = fs
+            .ops
+            .iter()
+            .filter(|e| matches!(e.state.state, FsOpState::InFlight { .. }))
+            .collect();
+        let [op] = staged[..] else {
+            panic!("{} ops staged, want one write", staged.len());
+        };
+        assert_eq!(op.state.bufs, vec![bytes], "one copy, in window order");
+        assert!(
+            op.state.recv_lease.is_none()
+                && op.state.recv_lease_more.is_empty(),
+            "no share rides the copy"
+        );
+    }
+
+    /// A writable descriptor nothing reads back: the refusal tests stage
+    /// their writes and synthesize every completion.
+    #[cfg(feature = "net-server")]
+    fn dev_null() -> crate::uring_fs::File {
+        let sink: OwnedFd = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null")
+            .into();
+        crate::uring_fs::File { fd: Arc::new(sink) }
+    }
+
+    /// Every staged op, as `(tag, slot, generation)`.
+    #[cfg(feature = "net-server")]
+    fn staged_ops(fs: &FsCore) -> Vec<(u8, u32, u32)> {
+        fs.ops
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e.state.state {
+                FsOpState::InFlight { tag } => {
+                    Some((tag, i as u32, e.generation as u32))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Stage a copied write that fills the table's one slot, then a leased
+    /// write of `buf` as buffer `bid`; returns whether the leased write took
+    /// its delivery's claim.
+    #[cfg(feature = "net-server")]
+    fn lease_behind(
+        fs: &mut FsCore,
+        eng: &mut Engine,
+        file: &crate::uring_fs::File,
+        buf: &[u8],
+        bid: u16,
+    ) -> bool {
+        let taken = std::cell::Cell::new(false);
+        let mut c = FsConn::new(fs, eng, OWNER0).with_recv_lease(Some(
+            RecvWriteLease {
+                ptr: buf.as_ptr(),
+                cap: buf.len(),
+                bid,
+                taken: &taken,
+            },
+        ));
+        c.pwritev2(
+            Personality(0),
+            file.clone(),
+            vec![vec![0u8; 16]],
+            0,
+            RwFlags::empty(),
+            |_d, _c| {},
+        );
+        c.pwritev2_from(
+            Personality(0),
+            file.clone(),
+            buf,
+            0,
+            RwFlags::empty(),
+            |_d, _c| {},
+        );
+        taken.get()
+    }
+
+    /// A delivery's first leased write the op table cannot take is refused
+    /// with a marked `EBUSY` and takes nothing: the connection keeps the
+    /// claim to release at consume, so the refusal returns no buffer.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_refused_leased_write_leaves_the_claim_with_the_connection() {
+        let mut eng = Engine::new(256, 128).expect("engine");
+        let mut fs = FsCore::new(1, OffloadBounds::default());
+        let file = dev_null();
+        let buf = vec![7u8; 1024];
+        assert!(
+            !lease_behind(&mut fs, &mut eng, &file, &buf, 5),
+            "a refused write took the claim"
+        );
+        let Some((_, _, done)) = fs.take_refusal() else {
+            panic!("the refused write is answered");
+        };
+        assert_eq!(done.raw_result(), Err(Errno::EBUSY));
+        assert!(done.was_refused(), "a capacity refusal is marked");
+        assert_eq!(staged_ops(&fs).len(), 1, "only the blocker in flight");
+        assert!(
+            fs.take_pool_releases().is_empty(),
+            "the refusal returned a buffer the connection still releases"
+        );
+    }
+
+    /// A leased write refused behind an earlier one of the same delivery
+    /// drops only its own share: the buffer comes back once, when the
+    /// sibling completes.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_write_refused_behind_its_sibling_returns_the_buffer_once() {
+        let mut eng = Engine::new(256, 128).expect("engine");
+        let mut fs = FsCore::new(1, OffloadBounds::default());
+        let file = dev_null();
+        let buf = vec![7u8; 1024];
+        let taken = std::cell::Cell::new(false);
+        {
+            let mut c = FsConn::new(&mut fs, &mut eng, OWNER0).with_recv_lease(
+                Some(RecvWriteLease {
+                    ptr: buf.as_ptr(),
+                    cap: buf.len(),
+                    bid: 5,
+                    taken: &taken,
+                }),
+            );
+            for half in buf.chunks(buf.len() / 2) {
+                c.pwritev2_from(
+                    Personality(0),
+                    file.clone(),
+                    half,
+                    0,
+                    RwFlags::empty(),
+                    |_d, _c| {},
+                );
+            }
+        }
+        assert!(taken.get(), "the first write took the claim");
+        let Some((_, _, done)) = fs.take_refusal() else {
+            panic!("the second write is answered");
+        };
+        assert!(done.was_refused(), "refused for the full table");
+        assert!(
+            fs.take_pool_releases().is_empty(),
+            "returned while the sibling still reads it"
+        );
+        let [(tag, slot, generation)] = staged_ops(&fs)[..] else {
+            panic!("the first write in flight");
+        };
+        let half = (buf.len() / 2) as i32;
+        let ReapedFs::Embedded(_, mut done, _) =
+            fs.on_cqe(&mut eng, tag, slot, generation, half)
+        else {
+            panic!("an embedded completion");
+        };
+        assert_eq!(
+            done.take_recv_lease(),
+            Some(5),
+            "back at the sibling's CQE"
+        );
+        assert!(fs.take_pool_releases().is_empty(), "and nowhere else");
+    }
+
+    /// A gathered write the op table cannot take is refused with a marked
+    /// `EBUSY`, and each window's buffer comes back once as it drops.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_refused_gathered_write_returns_each_buffer_once() {
+        let mut eng = Engine::new(256, 128).expect("engine");
+        let mut fs = FsCore::new(1, OffloadBounds::default());
+        let file = dev_null();
+        let bufs = [vec![1u8; 1024], vec![2u8; 1024]];
+        let windows = bufs
+            .iter()
+            .zip([5u16, 6])
+            .map(|(buf, bid)| LeasedWindow {
+                view: LeasedBytes {
+                    ptr: buf.as_ptr(),
+                    len: buf.len(),
+                },
+                hold: std::sync::Arc::new(LeaseHold::new(
+                    bid,
+                    fs.lease_returns(&eng.shared),
+                )),
+            })
+            .collect();
+        {
+            let mut c = FsConn::new(&mut fs, &mut eng, OWNER0);
+            c.pwritev2(
+                Personality(0),
+                file.clone(),
+                vec![vec![0u8; 16]],
+                0,
+                RwFlags::empty(),
+                |_d, _c| {},
+            );
+            c.pwritev2_leased(
+                Personality(0),
+                file.clone(),
+                windows,
+                0,
+                RwFlags::empty(),
+                |_d, _c| {},
+            );
+        }
+        let Some((_, _, done)) = fs.take_refusal() else {
+            panic!("the gathered write is answered");
+        };
+        assert_eq!(done.raw_result(), Err(Errno::EBUSY));
+        assert!(done.was_refused(), "a capacity refusal is marked");
+        let mut back = fs.take_pool_releases();
+        back.sort_unstable();
+        assert_eq!(back, vec![5, 6], "each buffer, once");
+    }
+
     /// A facade with no recv claim - every completion facade, every
     /// unpooled connection - sends `offload_from` down its copy path: the
     /// job sees the caller's bytes, verbatim, and the result comes back
@@ -7020,19 +7499,18 @@ mod op_entry_size {
     /// work out the default's resident cost against the ring's locked-memory
     /// one.
     ///
-    /// It was quoted at ~180 bytes and measures 272 (280 under
-    /// `net-server`), so every worked total there understated by about
-    /// 1.5x: the default 32768-slot table is 8.5 MiB, not the 5.8 MiB the
-    /// doc arrived at. Pinned loosely, because the point is that the figure
-    /// is re-derived when the entry grows, not that it never may.
+    /// It measures 280 bytes, 312 under `net-server`: the default
+    /// 32768-slot table is 8.75 MiB, 9.75 MiB with the server. Pinned
+    /// loosely, because the point is that the figure is re-derived when the
+    /// entry grows, not that it never may.
     ///
     /// [`FsConfig`]: crate::uring_fs::FsConfig
     #[test]
     fn the_op_slot_is_the_size_the_config_docs_quote() {
         let n = size_of::<SlotEntry<FsOpEntry>>();
         assert!(
-            (256..=288).contains(&n),
-            "an op slot is {n} bytes; `FsConfig`'s rustdoc quotes 272 (280 \
+            (272..=320).contains(&n),
+            "an op slot is {n} bytes; `FsConfig`'s rustdoc quotes 280 (312 \
              with `net-server`) - re-derive the default's resident cost there"
         );
     }
@@ -7330,15 +7808,19 @@ mod routing_fuzz {
 
         // Short: the kernel wrote less than the lease asked for.
         let (tx, rx) = mpsc::channel();
-        let staged = core.submit_pwritev2_leased(
+        let staged = core.submit_pwritev2_gathered(
             &mut eng,
             0,
             Arc::clone(&file),
-            buf.as_ptr(),
-            buf.len(),
+            vec![LeasedWindow {
+                view: LeasedBytes {
+                    ptr: buf.as_ptr(),
+                    len: buf.len(),
+                },
+                hold: std::sync::Arc::new(LeaseHold::detached(9)),
+            }],
             0,
             0,
-            std::sync::Arc::new(LeaseHold::detached(9)),
             chan(&tx),
         );
         assert!(staged.is_ok(), "staged");
@@ -7355,15 +7837,19 @@ mod routing_fuzz {
 
         // Full: the same submit at the written size is an ordinary success.
         let (tx, rx) = mpsc::channel();
-        let staged = core.submit_pwritev2_leased(
+        let staged = core.submit_pwritev2_gathered(
             &mut eng,
             0,
             file,
-            buf.as_ptr(),
-            buf.len(),
+            vec![LeasedWindow {
+                view: LeasedBytes {
+                    ptr: buf.as_ptr(),
+                    len: buf.len(),
+                },
+                hold: std::sync::Arc::new(LeaseHold::detached(9)),
+            }],
             0,
             0,
-            std::sync::Arc::new(LeaseHold::detached(9)),
             chan(&tx),
         );
         assert!(staged.is_ok(), "staged");
@@ -7396,16 +7882,21 @@ mod routing_fuzz {
         let hold = std::sync::Arc::new(LeaseHold::detached(9));
 
         for off in [0u64, 4096] {
-            let staged = core.submit_pwritev2_leased(
+            let staged = core.submit_pwritev2_gathered(
                 &mut eng,
                 0,
                 Arc::clone(&file),
-                // SAFETY: within `buf`, which outlives both submissions.
-                unsafe { buf.as_ptr().add(off as usize) },
-                4096,
+                vec![LeasedWindow {
+                    view: LeasedBytes {
+                        // SAFETY: within `buf`, which outlives both
+                        // submissions.
+                        ptr: unsafe { buf.as_ptr().add(off as usize) },
+                        len: 4096,
+                    },
+                    hold: std::sync::Arc::clone(&hold),
+                }],
                 off,
                 0,
-                std::sync::Arc::clone(&hold),
                 // No facade here, so no sink to arm from; every
                 // shipping submission goes through `FsConn::waiter`.
                 FsWaiter::Embedded {
@@ -7453,6 +7944,320 @@ mod routing_fuzz {
         );
     }
 
+    /// An embedded waiter for the gathered-write tests, which have no
+    /// facade to arm one from.
+    #[cfg(feature = "net-server")]
+    fn embedded_noop() -> FsWaiter {
+        FsWaiter::Embedded {
+            owner: Some((0, 0)),
+            cb: Box::new(|_d, _fs| {}),
+            on_fail: armed::unarmed(),
+        }
+    }
+
+    /// A window over `buf` holding its own share of `hold`.
+    #[cfg(feature = "net-server")]
+    fn window_over(
+        buf: &[u8],
+        hold: &std::sync::Arc<LeaseHold>,
+    ) -> LeasedWindow {
+        LeasedWindow {
+            view: LeasedBytes {
+                ptr: buf.as_ptr(),
+                len: buf.len(),
+            },
+            hold: std::sync::Arc::clone(hold),
+        }
+    }
+
+    /// Leased writes against a table with room for three, driven at random:
+    /// a write is refused only while the table is full, and across
+    /// completions (some failed), refusals, owner sweeps and dropped
+    /// windows every write is answered once and every buffer returned
+    /// once, whichever share goes last.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn refused_leased_writes_answer_and_return_every_buffer_once() {
+        use std::cell::RefCell;
+        use std::collections::HashSet;
+        use std::rc::Rc;
+        const SLOTS: u32 = 3;
+        const STEPS: usize = 3000;
+        const OWNERS: u32 = 4;
+        // Above every SQE the run stages, so nothing reaches the kernel.
+        const ENTRIES: u32 = 8192;
+        const WINDOW: usize = 4096;
+        let mut eng = match Engine::new(ENTRIES, POOL) {
+            Ok(e) => e,
+            Err(crate::Error::Errno(e))
+                if crate::uring::setup_unavailable(e) =>
+            {
+                return;
+            }
+            Err(e) => panic!("engine: {e}"),
+        };
+        let mut core = FsCore::new(SLOTS, OffloadBounds::default());
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        let buf = vec![0u8; WINDOW];
+        let answered = Rc::new(RefCell::new(Vec::new()));
+        let mut returned = HashSet::new();
+        let mut minted = Vec::new();
+        let mut generations = [0u64; OWNERS as usize];
+        let mut carry: Option<std::sync::Arc<LeaseHold>> = None;
+        let mut submitted = 0usize;
+        let mut refused = 0usize;
+        let mut rng = Rng::new(0x9A2C);
+
+        let mut surface = |bid: u16| {
+            assert!(returned.insert(bid), "buffer {bid} returned twice");
+        };
+        let complete = |core: &mut FsCore,
+                        eng: &mut Engine,
+                        surface: &mut dyn FnMut(u16),
+                        op: (u8, u32, u32),
+                        res: i32| {
+            let (tag, slot, generation) = op;
+            let reaped = core.on_cqe(eng, tag, slot, generation, res);
+            if let ReapedFs::Embedded(cb, mut done, owner) = reaped {
+                done.take_recv_lease().into_iter().for_each(&mut *surface);
+                done.take_recv_lease_more()
+                    .into_iter()
+                    .for_each(&mut *surface);
+                cb(done, &mut FsConn::new(core, eng, owner));
+            }
+        };
+
+        for _ in 0..STEPS {
+            match rng.below(10) {
+                0..=4 => {
+                    let at = rng.below(OWNERS);
+                    let owner = Some((at, generations[at as usize]));
+                    let n = 1 + rng.below(3);
+                    let mut windows = Vec::new();
+                    for w in 0..n {
+                        let hold = match (w, carry.take()) {
+                            (0, Some(h)) => h,
+                            (_, back) => {
+                                carry = back;
+                                let bid = minted.len() as u16;
+                                minted.push(bid);
+                                std::sync::Arc::new(LeaseHold::new(
+                                    bid,
+                                    core.lease_returns(&eng.shared),
+                                ))
+                            }
+                        };
+                        windows.push(window_over(&buf, &hold));
+                        if w + 1 == n && rng.below(3) == 0 {
+                            carry = Some(hold);
+                        }
+                    }
+                    let id = submitted;
+                    submitted += 1;
+                    let answered = Rc::clone(&answered);
+                    let waiter = FsWaiter::Embedded {
+                        owner,
+                        cb: Box::new(move |_d, _fs| {
+                            answered.borrow_mut().push(id)
+                        }),
+                        on_fail: armed::unarmed(),
+                    };
+                    let full = !core.has_free_op();
+                    core.submit_leased_or_refuse(
+                        &mut eng,
+                        0,
+                        Arc::clone(&file),
+                        windows,
+                        0,
+                        0,
+                        waiter,
+                    );
+                    while let Some((owner, cb, done)) = core.take_refusal() {
+                        assert!(full, "a write refused while a slot was free");
+                        assert_eq!(done.raw_result(), Err(Errno::EBUSY));
+                        assert!(done.was_refused(), "capacity: marked");
+                        refused += 1;
+                        cb(done, &mut FsConn::new(&mut core, &mut eng, owner));
+                    }
+                }
+                5..=7 => {
+                    let flight = inflight(&core);
+                    if flight.is_empty() {
+                        continue;
+                    }
+                    let op = flight[rng.below(flight.len() as u32) as usize];
+                    let want = core.ops[op.1 as usize].state.lease_want as i32;
+                    let res = if rng.below(8) == 0 {
+                        -libc::ECANCELED
+                    } else {
+                        want
+                    };
+                    complete(&mut core, &mut eng, &mut surface, op, res);
+                }
+                8 => {
+                    let at = rng.below(OWNERS);
+                    let swept = (at, generations[at as usize]);
+                    core.cancel_owned_by(&mut eng, vec![swept]);
+                    generations[at as usize] += 1;
+                }
+                _ => carry = None,
+            }
+            core.take_pool_releases().into_iter().for_each(&mut surface);
+        }
+
+        carry = None;
+        loop {
+            let flight = inflight(&core);
+            if flight.is_empty() {
+                break;
+            }
+            for op in flight {
+                let want = core.ops[op.1 as usize].state.lease_want as i32;
+                complete(&mut core, &mut eng, &mut surface, op, want);
+            }
+        }
+        drop(carry);
+        core.take_pool_releases().into_iter().for_each(&mut surface);
+        let mut answered = answered.borrow().clone();
+        answered.sort_unstable();
+        assert_eq!(
+            answered,
+            (0..submitted).collect::<Vec<_>>(),
+            "each write answered once"
+        );
+        let mut returned: Vec<u16> = returned.into_iter().collect();
+        returned.sort_unstable();
+        assert_eq!(returned, minted, "each buffer returned once");
+        assert!(refused > 0, "the run never filled the table");
+    }
+
+    /// Past `UIO_MAXIOV` iovecs the kernel refuses a write, and past
+    /// `MAX_RW_COUNT` bytes it trims one, so either takes the copy path.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_gather_fits_one_writev_or_takes_the_copy_path() {
+        let cap = max_rw_count();
+        assert!(cap < i32::MAX as usize, "the cap is page-aligned below");
+        assert!(gather_fits(1, cap));
+        assert!(!gather_fits(1, cap + 1), "trimmed by the kernel");
+        assert!(gather_fits(UIO_MAXIOV, 0));
+        assert!(!gather_fits(UIO_MAXIOV + 1, 0), "refused by the kernel");
+        assert!(!gather_fits(0, 0), "nothing to gather");
+    }
+
+    /// A gathered write returns each buffer once, from its last share -
+    /// including one two split windows share - and a short count fails it
+    /// `EIO`.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_gathered_write_returns_each_buffer_once() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let (a, b) = (vec![1u8; 8192], vec![2u8; 4096]);
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        for (res, want) in [(12288, Ok(12288)), (100, Err(Errno::EIO))] {
+            let (hold_a, hold_b) = (
+                std::sync::Arc::new(LeaseHold::detached(9)),
+                std::sync::Arc::new(LeaseHold::detached(10)),
+            );
+            let (head, tail) = window_over(&a, &hold_a).split_at(4096);
+            let windows = vec![head, window_over(&b, &hold_b), tail];
+            drop((hold_a, hold_b)); // only the windows hold shares now
+            let staged = core.submit_pwritev2_gathered(
+                &mut eng,
+                0,
+                Arc::clone(&file),
+                windows,
+                0,
+                0,
+                embedded_noop(),
+            );
+            assert!(staged.is_ok(), "staged");
+            let [(t, sl, g)] = inflight(&core)[..] else {
+                panic!("one op in flight");
+            };
+            assert_eq!(
+                core.ops[sl as usize].state.iov.len(),
+                3,
+                "one iovec per window"
+            );
+            let ReapedFs::Embedded(_, mut done, _) =
+                core.on_cqe(&mut eng, t, sl, g, res)
+            else {
+                panic!("an embedded waiter reaps embedded");
+            };
+            assert_eq!(done.raw_result(), want, "the whole op's verdict");
+            let mut bids: Vec<u16> = done
+                .take_recv_lease()
+                .into_iter()
+                .chain(done.take_recv_lease_more())
+                .collect();
+            bids.sort_unstable();
+            assert_eq!(bids, [9, 10], "each buffer once, from its last share");
+        }
+    }
+
+    /// A gathered write the core cannot take hands every window back, with
+    /// nothing in flight: none at all, or more than one `WRITEV` carries.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_refused_gathered_write_hands_its_windows_back() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let buf = vec![3u8; 64];
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        let hold = std::sync::Arc::new(LeaseHold::detached(9));
+        for n in [0, UIO_MAXIOV + 1] {
+            let windows = (0..n).map(|_| window_over(&buf, &hold)).collect();
+            let Err((back, _)) = core.submit_pwritev2_gathered(
+                &mut eng,
+                0,
+                Arc::clone(&file),
+                windows,
+                0,
+                0,
+                embedded_noop(),
+            ) else {
+                panic!("{n} windows must be refused");
+            };
+            assert_eq!(back.len(), n, "every window comes back");
+            assert!(inflight(&core).is_empty(), "nothing went in flight");
+        }
+    }
+
+    /// Both halves of a split window read the buffer, so both hold it.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_split_window_shares_its_buffer() {
+        let buf = vec![5u8; 100];
+        let hold = std::sync::Arc::new(LeaseHold::detached(9));
+        let (head, tail) = window_over(&buf, &hold).split_at(30);
+        assert_eq!((head.len(), tail.len()), (30, 70));
+        assert_eq!(tail.view.ptr, buf.as_ptr().wrapping_add(30));
+        assert_eq!(std::sync::Arc::strong_count(&hold), 3, "two halves");
+        drop((head, tail));
+        assert_eq!(std::sync::Arc::strong_count(&hold), 1, "both let go");
+    }
+
+    #[cfg(feature = "net-server")]
+    #[test]
+    #[should_panic(expected = "split past the window's end")]
+    fn a_split_past_the_end_panics() {
+        let buf = vec![5u8; 100];
+        let hold = std::sync::Arc::new(LeaseHold::detached(9));
+        let _ = window_over(&buf, &hold).split_at(101);
+    }
+
     /// The teardown drain answers a short leased write the same way the
     /// live reap does.
     ///
@@ -7473,15 +8278,19 @@ mod routing_fuzz {
         // SAFETY: `synth_fd` just opened it; nothing else owns it.
         let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
         let (tx, rx) = mpsc::channel();
-        let staged = core.submit_pwritev2_leased(
+        let staged = core.submit_pwritev2_gathered(
             &mut eng,
             0,
             file,
-            buf.as_ptr(),
-            buf.len(),
+            vec![LeasedWindow {
+                view: LeasedBytes {
+                    ptr: buf.as_ptr(),
+                    len: buf.len(),
+                },
+                hold: std::sync::Arc::new(LeaseHold::detached(9)),
+            }],
             0,
             0,
-            std::sync::Arc::new(LeaseHold::detached(9)),
             chan(&tx),
         );
         assert!(staged.is_ok(), "staged");

@@ -3095,8 +3095,8 @@ fn a_put_pacing_a_window_below_the_clock_floor_completes() {
 }
 
 /// The same pace through a STREAMED chunked upload - the default-client
-/// shape (botocore frames 128 KiB HTTP chunks and ts3 consumes them as
-/// stream windows). A plain accumulating handler dodges the floor by
+/// shape (botocore frames 128 KiB HTTP chunks, and a streaming handler
+/// consumes them as stream windows). A plain accumulating handler dodges the floor by
 /// accident (chunked bodies arrive through non-exact `More` scans, each
 /// arrival re-arming a fresh clock); a streamed window is one exact
 /// `MSG_WAITALL` read under one clock, so this is where the chunked

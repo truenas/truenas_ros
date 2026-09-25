@@ -55,9 +55,10 @@ use std::fmt;
 /// common 8 MiB limit; measured, the 22nd concurrent default-sized ring fails
 /// `ENOMEM`.
 ///
-/// `ops` is ordinary heap - 272 bytes per slot, 280 under `net-server`
-/// (pinned by `core::op_entry_size`), so the default costs ~8.5 MiB of RSS,
-/// allocated once at construction - and is not accounted against any limit.
+/// `ops` is ordinary heap - 280 bytes per slot, 312 under `net-server`
+/// (pinned by `core::op_entry_size`), so the default costs ~8.75 MiB of RSS
+/// (9.75 MiB under `net-server`), allocated once at construction - and is
+/// not accounted against any limit.
 /// That asymmetry is why the two defaults differ by 8x: raising concurrency
 /// is cheap, raising the batch size is not.
 ///
@@ -78,8 +79,8 @@ pub struct FsConfig {
     pub entries: u32,
     /// Op-table slots - the maximum number of concurrently in-flight
     /// operations, and the ceiling a fan-out actually hits: submitting past
-    /// it fails `EBUSY` however deep the ring is. Plain heap at 272 bytes a
-    /// slot, 280 under `net-server` (pinned by `core::op_entry_size`), so
+    /// it fails `EBUSY` however deep the ring is. Plain heap at 280 bytes a
+    /// slot, 312 under `net-server` (pinned by `core::op_entry_size`), so
     /// this is the cheap axis to raise - and see the type docs, which work
     /// the default's resident cost out of the same figure.
     pub ops: u32,

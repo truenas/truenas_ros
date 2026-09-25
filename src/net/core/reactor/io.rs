@@ -16,27 +16,6 @@ use std::os::fd::RawFd;
 /// Bytes to request per chunked (`Framing::More`) recv.
 const RECV_CHUNK: usize = 4096;
 
-/// Bytes of a spliced body that buy one more receipt budget.
-///
-/// `max_receipt_time` is a rate floor, not a total: `ServerConfig` promises
-/// that "each window is its own message, so an upload of any size is
-/// admitted". A *buffered* body earns that by construction - the framer
-/// splits anything above `http::framer::STREAM_WINDOW` so each window is a
-/// separate message with its own budget. A spliced body is one message
-/// however large, so without a window here the budget bounded the whole
-/// transfer and wall clock capped upload *size*: an 8 MiB body at 10 MB/s
-/// was reaped after 7 MiB, with every gap far inside the inactivity clocks.
-///
-/// Renewing per window is not the same as restarting on progress. A peer
-/// must move a *whole* window to earn another budget, which is exactly the
-/// documented floor of `RECEIPT_WINDOW / max_receipt_time`; one that stalls,
-/// or drips below it, still fails to move a window in time and is closed.
-///
-/// Kept equal to `http::framer::STREAM_WINDOW` so both paths set the same
-/// floor, and stated as a constant here because the net core does not depend
-/// on `http` (see `RECV_BUF_BYTES`, which cites it the same way).
-const RECEIPT_WINDOW: usize = 128 * 1024;
-
 /// Point a staged recv at a provided-buffer group, if one was chosen.
 ///
 /// `buf_index` is the union field the kernel reads as `buf_group`; the SQE's
@@ -55,62 +34,8 @@ fn stamp_select(sqe: &mut IoUringSqe, select: Option<u16>) {
 #[cfg(not(feature = "net-server"))]
 fn stamp_select(_sqe: &mut IoUringSqe, _select: Option<u16>) {}
 
-/// Working size of a pooled recv buffer, before the scanning read's slack.
-///
-/// A free parameter, not a derived bound: a message that outgrows its buffer
-/// promotes to owned storage (`RecvBuf::promote_for`) rather than being
-/// refused, so this trades one bounded copy on outsized messages against
-/// holding a large buffer per arrival on all of them.
-///
-/// **It has to cover a streamed body's window, or the pool is decorative.**
-/// `http::framer::STREAM_WINDOW` is 128 KiB and
-/// `body_placement_threshold` defaults to 64 KiB, so a window sits above
-/// the placement threshold: a buffer that could not hold one would send
-/// every window off to its own allocation and the pool would serve request
-/// heads and nothing that carries data. At 256 KiB a window plus its chunk
-/// header plus a pipelined remainder stay in the buffer, and the upload
-/// path allocates nothing per window.
-///
-/// It also clears the 16 KiB TLS record size kTLS zero-copy needs
-/// (`TLS_MAX_PAYLOAD_SIZE`, `include/net/tls.h`) many times over.
-#[cfg(feature = "net-server")]
-const RECV_POOL_BUF: usize = 256 * 1024;
-
-/// The leased-write depth a connection may hold, in recv-ring buffers.
-///
-/// The ring registers this *plus one* per connection: the extra slot is the
-/// message arriving while the leases are outstanding, so a handler at the
-/// cap is not the thing that pushes its own connection over the wall.
-///
-/// One would cover arrivals alone - no more messages can be arriving at
-/// once than there are connections - but a claim outlives its message:
-/// a leased write (`FsConn::pwritev2_from`) holds its buffer until the
-/// write's CQE, a leased job (`offload_from`, `offload_leased`) until its
-/// completion is taken, a `LeasedWindow` until the handler spends or
-/// drops it. A pipelined ingest handler (submit the window, return
-/// `Continue`, brake with `defer_stream` at its depth) therefore holds as
-/// many buffers as it has claims outstanding, plus the one arriving, and
-/// the registration is the wall growth stops at: past it a connection
-/// degrades to owned buffers *permanently*, which reintroduces the
-/// per-window allocation and copy under exactly the load the ring exists
-/// for. The count is what the wall meters - how a handler divides it
-/// between writes in flight, jobs reading and windows held is its own
-/// choice, and the buffers' size does not enter. Four is a pipeline a
-/// few windows deep, which covers the bandwidth-delay product of
-/// ARC-latency writes, and a descriptor slot is 16 bytes, so the
-/// headroom costs nothing - backing buffers remain demand-allocated.
-///
-/// This is SPDK's backpressure shape, checked rather than recalled: the
-/// sock layer treats a dry provided-buffer ring as flow control, not error
-/// (`module/sock/uring/uring.c` re-arms on `-ENOBUFS` and lets the socket
-/// buffer fill until TCP closes the sender's window), and nvmf/tcp caps
-/// in-flight work with a per-connection resource pool
-/// (`lib/nvmf/tcp.c` `resource_count`). Here the brake is the handler's
-/// depth and the wall is this registration.
-#[cfg(feature = "net-server")]
-pub(crate) const RECV_LEASE_DEPTH: u32 = 4;
-
-/// How large a pooled recv buffer is.
+/// How large a pooled recv buffer is: the configured working size
+/// (`ServerConfig::recv_buffer_bytes`), capped at what a request may be.
 ///
 /// The `RECV_CHUNK` term is slack, not rounding: `pump_gate` closes a
 /// connection only *above* `max_request_bytes`, so a scanning
@@ -119,8 +44,11 @@ pub(crate) const RECV_LEASE_DEPTH: u32 = 4;
 /// below the working size gets a buffer no legal read can overrun, so the
 /// promote path never fires there.
 #[cfg(feature = "net-server")]
-pub(crate) fn recv_pool_buf_len(max_request_bytes: usize) -> usize {
-    RECV_POOL_BUF
+pub(crate) fn recv_pool_buf_len(
+    buffer_bytes: usize,
+    max_request_bytes: usize,
+) -> usize {
+    buffer_bytes
         .min(max_request_bytes)
         .saturating_add(RECV_CHUNK)
 }
@@ -545,7 +473,7 @@ impl<U> Reactor<U> {
     /// caller knows: a short splice and a readiness poll both resubmit through
     /// here with the remainder, and the connection flags read the same at every
     /// entry (`splicing` is cleared on each completion). It sets the receipt
-    /// budget's window mark - see `RECEIPT_WINDOW`.
+    /// budget's window mark - see `ServerConfig::receipt_window_bytes`.
     pub(crate) fn submit_splice_recv(
         &mut self,
         slot: u32,
@@ -936,17 +864,15 @@ impl<U> Reactor<U> {
                 return Ok(()); // delivered already; this expiry lost the race
             }
             conn.receipt_deadline_armed = false;
-            // A spliced body is one message however large, so a budget that
-            // retired only at the end capped upload size by wall clock. Renew
-            // it for each whole window the peer actually moved - see
-            // `RECEIPT_WINDOW` for why that is the documented floor rather
-            // than a clock restarted by progress. A buffered message has no
-            // mark set and falls straight through to the close.
+            // A spliced body is one message however large: renew its budget
+            // per whole window moved (`ServerConfig::receipt_window_bytes`).
+            // A buffered message has no mark set and falls through to the
+            // close.
             let moved = conn
                 .receipt_window_mark
                 .saturating_sub(conn.splice_remaining);
             let splicing = conn.splicing || conn.splice_polling;
-            if splicing && moved >= RECEIPT_WINDOW {
+            if splicing && moved >= self.cfg.receipt_window_bytes {
                 conn.receipt_window_mark = conn.splice_remaining;
                 true
             } else {
@@ -1357,8 +1283,8 @@ impl<U> Reactor<U> {
     /// never healthy - this continuation exists only for the clock-cancelled
     /// case. Closing there imposes a throughput floor of `recv_want /
     /// request_timeout` on every exact read: a peer pacing a streamed
-    /// 128 KiB window slower than that dies mid-upload, with the window's
-    /// consumed bytes unrecoverable.
+    /// window slower than that dies mid-body, with the window's consumed
+    /// bytes unrecoverable.
     ///
     /// Like the kTLS continuation it re-arms with a FRESH request clock, so
     /// the clock bounds progress-per-period rather than the whole transfer:
@@ -1528,9 +1454,9 @@ impl<U> Reactor<U> {
     /// (`io_req_rw_complete`, `io_uring/rw.c:591`), so a failed, truncated
     /// or stale-slot completion has taken its descriptor off the ring
     /// exactly like a served one. An exit that skips this strands the id -
-    /// userspace still counts it posted, the kernel will never offer it
-    /// again, and the pool answers the shortfall by allocating a fresh
-    /// buffer per loss while `recv_bufs_lent` stays innocently at zero.
+    /// userspace still counts it posted, so it is neither reissued nor
+    /// replaced, the kernel will never offer it again, and the ring loses a
+    /// buffer per strand while `recv_bufs_lent` stays innocently at zero.
     ///
     /// Lend-then-release through the verified pick
     /// ([`BufPool::take_lent`](crate::uring::bufring::BufPool::take_lent)):
@@ -1584,6 +1510,7 @@ impl<U> Reactor<U> {
         slot: u32,
         generation: u32,
     ) -> errno::Result<bool> {
+        stat!(self, buf_shortages);
         // Nothing to subtract: a recv picks its buffer when data arrives,
         // so the pool's free count is already what the kernel sees.
         let grew = self.recv_bufs.as_mut().is_some_and(|p| p.grow(0));
@@ -2405,17 +2332,10 @@ impl<U> Reactor<U> {
                 // churn, and a connection with *no* claim gets one free
                 // with the read itself (the kernel picks at completion)
                 // - so placing there forfeits a zero-copy buffer to
-                // claim a copied one. On a streamed upload the
-                // no-claim case is every mid-chunk window whose predecessor
-                // leased the claim to a write, which needs a peer chunking
-                // larger than one window: at 1 MiB HTTP chunks against a
-                // 128 KiB window that is seven windows in eight, each a
-                // placed allocation plus a full copy in `pwritev2_from`'s
-                // fallback. Not the default client - botocore's HTTP chunks
-                // are one window (see `STREAM_WINDOW`), so every window
-                // carries a chunk header and holds a claim. `frame_step` cannot see any
-                // of this: it is deliberately state-free, and this is
-                // connection state.
+                // claim a copied one. In a streamed body the no-claim case
+                // is every window after the first in a codec frame, once
+                // the previous window leased the claim to a write.
+                // `frame_step` is state-free and cannot see this.
                 //
                 // The trade is a copy for a handler that wants to own the
                 // body (`Body::take` on a borrowed body copies, where a
@@ -2604,6 +2524,8 @@ mod tests {
             idle_timeout: None,
             request_timeout,
             max_receipt_time,
+            receipt_window_bytes: crate::net::server::ServerConfig::default()
+                .receipt_window_bytes,
             send_timeout: None,
             tls_handshake_timeout: None,
             recv_shortage_retry: None,
@@ -2626,6 +2548,50 @@ mod tests {
         );
         r.table.install(0, Connection::new(peer, (), 1));
         Some(r)
+    }
+
+    /// A recv that finds the pool dry below its limit grows it and reads
+    /// again, counting the shortage, rather than parking or falling back to
+    /// an owned buffer.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_recv_that_finds_the_pool_dry_grows_it_and_reads_again() {
+        let Some(mut r) = reactor_with_one_conn(None, None) else {
+            return;
+        };
+        const BUF: usize = 64;
+        const ENTRIES: u16 = 64;
+        let mut pool = crate::uring::bufring::BufPool::new(
+            r.engine.ring.raw_fd(),
+            crate::uring::bufring::BGID_RECV,
+            BUF,
+            ENTRIES,
+            crate::uring::bufring::PoolSizing::UNSIZED,
+        )
+        .expect("registers");
+        let dry = pool.allocated();
+        for bid in 0..dry {
+            assert!(pool.lend_as_the_kernel(bid), "lend {bid}");
+        }
+        r.recv_bufs = Some(pool);
+        r.table.conn_mut(0).set_recv_pooled();
+
+        assert!(
+            r.recv_buffer_shortage(0, 0).expect("shortage"),
+            "reads again"
+        );
+        let grown = r.recv_bufs.as_ref().expect("pool").allocated();
+        assert!(grown > dry, "the pool grew: {grown} from {dry}");
+        assert!(
+            r.table.conn(0).recv_needs_buffer(),
+            "the connection still draws on the pool"
+        );
+        assert_eq!(
+            r.stats
+                .buf_shortages
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     /// A budget retired and replaced inside one dispatch: the predecessor's

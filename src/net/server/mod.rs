@@ -969,23 +969,25 @@ where
         core.body_pool = Some(std::rc::Rc::new(std::cell::RefCell::new(
             crate::net::core::bodypool::BodyPool::new(BODY_POOL_BUDGET),
         )));
+        let sizing = crate::uring::bufring::PoolSizing {
+            initial_bytes: cfg.buf_pool_initial_bytes,
+            max_step_bytes: cfg.buf_pool_max_step_bytes,
+            max_bytes: cfg.buf_pool_max_bytes,
+        };
         if cfg.recv_pool {
-            // One buffer per connection: no more messages can be arriving
-            // at once than there are connections.
+            // Per connection: the handler's claims plus the message arriving.
             let r = crate::uring::bufring::BufPool::new(
                 core.engine.ring.raw_fd(),
                 crate::uring::bufring::BGID_RECV,
                 crate::net::core::reactor::recv_pool_buf_len(
+                    cfg.recv_buffer_bytes,
                     cfg.max_request_bytes,
                 ),
                 crate::uring::bufring::ring_entries(
-                    cfg.pool_size.saturating_mul(
-                        // The write depth *plus the message arriving*: a
-                        // handler at the documented cap holds that many
-                        // leased buffers and is still being read into.
-                        crate::net::core::reactor::RECV_LEASE_DEPTH + 1,
-                    ),
+                    cfg.pool_size
+                        .saturating_mul(cfg.recv_lease_depth.saturating_add(1)),
                 ),
+                sizing,
             );
             core.recv_bufs = count_memlock_refusal(&core.stats, r);
         }
@@ -1004,9 +1006,12 @@ where
                         crate::net::core::conn::FILE_TAIL_BUFS,
                     )),
                 ),
+                sizing,
             );
             core.body_bufs = count_memlock_refusal(&core.stats, r);
         }
+        // Publish the starting budget, not zero until a buffer moves.
+        core.sync_recv_buf_stats();
         // Only a server with an fs pool sweeps closed connections; tell the
         // shared reactor so `close_conn` records into `fs_closed` here and not
         // on a client (which would never drain it).
@@ -1228,14 +1233,22 @@ where
                     // before the callback runs: the op is over whatever the
                     // connection did in the meantime, and the pool - which
                     // only this dispatch can reach - is the one owner left.
-                    if let crate::uring_fs::core::ReapedFs::Embedded(_, done, _) =
-                        &mut reaped
-                        && let Some(bid) = done.take_recv_lease()
+                    if let crate::uring_fs::core::ReapedFs::Embedded(
+                        _,
+                        done,
+                        _,
+                    ) = &mut reaped
                     {
-                        if let Some(pool) = self.core.recv_bufs.as_mut() {
-                            pool.release(bid);
+                        let first = done.take_recv_lease();
+                        let more = done.take_recv_lease_more();
+                        if first.is_some() || !more.is_empty() {
+                            if let Some(pool) = self.core.recv_bufs.as_mut() {
+                                for bid in first.into_iter().chain(more) {
+                                    pool.release(bid);
+                                }
+                            }
+                            self.core.sync_recv_buf_stats();
                         }
-                        self.core.sync_recv_buf_stats();
                     }
                     if let Some(fs) = self.fs.as_mut() {
                         crate::uring_fs::core::deliver_embedded(

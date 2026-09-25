@@ -914,6 +914,7 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             // failure - re-issues the read with an owned buffer, so
             // progress never waits on the pool.
             Err(errno::Errno::ENOBUFS) => {
+                stat!(self.core, buf_shortages);
                 let armed =
                     self.fs.as_ref().map_or(0, |fs| fs.pump_selecting());
                 let grew =
@@ -962,6 +963,8 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
                         CloseReason::FileBody(errno::Errno::EIO),
                     );
                 };
+                // The loan may have grown the pool.
+                self.core.sync_recv_buf_stats();
                 // SAFETY: `n` bytes of buffer `bid`, which stays lent until
                 // the chunk flushes and `advance_sent` hands the id back.
                 unsafe {

@@ -165,6 +165,19 @@ impl HttpConfig {
                     .saturating_add(CHUNK_LINE_MAX + 4),
             )
     }
+
+    /// The [`ServerConfig::recv_buffer_bytes`] this codec wants: a streamed
+    /// window with its chunk framing, and a pipelined remainder.
+    pub fn recv_buffer_bytes(&self) -> usize {
+        STREAM_WINDOW.saturating_mul(RECV_BUFFER_WINDOWS)
+    }
+
+    /// The [`ServerConfig::receipt_window_bytes`] matching this codec's
+    /// window, so a spliced body meets the same receipt floor as a streamed
+    /// one.
+    pub fn receipt_window_bytes(&self) -> usize {
+        STREAM_WINDOW
+    }
 }
 
 /// The most body a single streamed delivery carries.
@@ -193,6 +206,9 @@ impl HttpConfig {
 /// leased; `stream_step` sizes those from `chunk_left` alone and the
 /// reactor draws them from the ring rather than placing them.
 pub(crate) const STREAM_WINDOW: usize = 128 * 1024;
+
+/// Windows per receive buffer ([`HttpConfig::recv_buffer_bytes`]).
+const RECV_BUFFER_WINDOWS: usize = 2;
 
 /// Where the connection stands between messages.
 #[derive(Debug)]

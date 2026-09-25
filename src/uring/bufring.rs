@@ -134,7 +134,7 @@ pub(crate) struct BufRing {
     /// id, so it is `entries` long for the ring's whole life. An `Absent`
     /// id can hold storage: a shrink stops posting a buffer, it does not
     /// free it.
-    bufs: Vec<Option<Box<[u8]>>>,
+    bufs: Vec<Option<Box<[std::mem::MaybeUninit<u8>]>>>,
     /// What each id is doing, parallel to `bufs`.
     slots: Vec<Slot>,
     entries: u16,
@@ -305,18 +305,25 @@ impl BufRing {
             // hold fewer buffers, not abort. `-ENOBUFS` then drops the
             // connection back to owning one, which is the same fallback a
             // pool at its ceiling takes.
-            let mut buf: Vec<u8> = Vec::new();
+            // Not zeroed: every reader stops at the bytes the kernel wrote.
+            let mut buf = Vec::<std::mem::MaybeUninit<u8>>::new();
             if buf.try_reserve_exact(self.buf_len).is_err() {
                 return false;
             }
-            buf.resize(self.buf_len, 0);
+            // SAFETY: the capacity was just reserved, and `MaybeUninit`
+            // elements need no initialization.
+            unsafe { buf.set_len(self.buf_len) };
             self.bufs[i] = Some(buf.into_boxed_slice());
             #[cfg(test)]
             {
                 self.allocs += 1;
             }
         }
-        let addr = self.bufs[i].as_mut().expect("just allocated").as_mut_ptr();
+        let addr = self.bufs[i]
+            .as_mut()
+            .expect("just allocated")
+            .as_mut_ptr()
+            .cast::<u8>();
         let slot = usize::from(self.tail & self.mask);
         // SAFETY: `slot < entries` and the mapping covers `entries`
         // descriptors, so the writes are in bounds.
@@ -416,7 +423,7 @@ impl BufRing {
         // pointer cast up from `&` is UB to write through under the borrow
         // rules even where today's codegen is indifferent.
         let b = self.bufs.get_mut(usize::from(bid))?.as_mut()?;
-        Some(b.as_mut_ptr())
+        Some(b.as_mut_ptr().cast())
     }
 
     /// Record that a completion selected `bid`.
@@ -616,8 +623,30 @@ pub(crate) const BGID_RECV: u16 = 0;
 #[cfg(feature = "uring-fs")]
 pub(crate) const BGID_FILE_BODY: u16 = 1;
 
-/// Buffers the pool starts with, before demand has said anything.
+/// The fewest buffers a pool starts with, whatever its budget buys
+/// (`ServerConfig::buf_pool_initial_bytes`).
 const POOL_INITIAL: u16 = 8;
+
+/// A pool's byte budgets (`ServerConfig::buf_pool_*`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PoolSizing {
+    /// Storage it starts with.
+    pub(crate) initial_bytes: usize,
+    /// The most storage one growth step adds.
+    pub(crate) max_step_bytes: usize,
+    /// The most storage it may hold; `None` leaves the demand bound.
+    pub(crate) max_bytes: Option<usize>,
+}
+
+impl PoolSizing {
+    /// Eight buffers to start, doubling to the demand.
+    #[cfg(test)]
+    pub(crate) const UNSIZED: PoolSizing = PoolSizing {
+        initial_bytes: 0,
+        max_step_bytes: usize::MAX,
+        max_bytes: None,
+    };
+}
 
 /// Consecutive idle rounds before the pool gives a buffer up. Growth is
 /// immediate and shrinking is not, because a pool that shrinks on the
@@ -636,14 +665,21 @@ const IDLE_ROUND: Duration = Duration::from_secs(1);
 
 /// Sizing policy over one [`BufRing`].
 ///
-/// **It grows on `-ENOBUFS` and not on a free count.** A free count is
+/// **A shortage is `-ENOBUFS`, never a free count.** A free count is
 /// observed at completion, so it cannot see the selecting ops already armed
 /// against the pool - a submit gated on it looks correct, passes a
 /// single-connection test, and sheds concurrent connections. The kernel is
 /// the only party that knows the pool ran dry, and it says so on the
-/// completion.
+/// completion. The free count only ever *adds* buffers
+/// ([`grow_ahead`](Self::grow_ahead)), which is safe for the reason gating
+/// on it is not: an extra buffer refuses nothing.
 pub(crate) struct BufPool {
     ring: BufRing,
+    /// The most buffers the pool holds: its demand, or fewer under
+    /// `max_bytes`.
+    limit: u16,
+    /// The most buffers one growth step adds.
+    max_step: u16,
     /// Consecutive idle rounds, each at least [`IDLE_ROUND`] after the
     /// observation before it.
     idle_rounds: u8,
@@ -653,8 +689,10 @@ pub(crate) struct BufPool {
 }
 
 impl BufPool {
-    /// Register a pool whose ring can hold at most `entries` buffers of
-    /// `buf_len` bytes, under group id `bgid`.
+    /// Register a pool of `buf_len`-byte buffers under group id `bgid`,
+    /// holding at most `entries` of them (fewer under `sizing.max_bytes`)
+    /// and starting with `sizing.initial_bytes` of them - never fewer than
+    /// [`POOL_INITIAL`] unless the limit is.
     ///
     /// One group per pool: a group is a set of interchangeable buffers, and
     /// selection is FIFO from the head, so a caller cannot ask a group for a
@@ -666,15 +704,21 @@ impl BufPool {
         bgid: u16,
         buf_len: usize,
         entries: u16,
+        sizing: PoolSizing,
     ) -> errno::Result<BufPool> {
+        let buffers = |bytes: usize| {
+            u16::try_from(bytes / buf_len.max(1)).unwrap_or(u16::MAX)
+        };
+        let limit = sizing
+            .max_bytes
+            .map_or(entries, |b| buffers(b).min(entries))
+            .max(1);
+        let initial =
+            buffers(sizing.initial_bytes).max(POOL_INITIAL).min(limit);
         Ok(BufPool {
-            ring: BufRing::new(
-                ring_fd,
-                bgid,
-                entries,
-                buf_len,
-                POOL_INITIAL.min(entries.max(1)),
-            )?,
+            ring: BufRing::new(ring_fd, bgid, limit, buf_len, initial)?,
+            limit,
+            max_step: buffers(sizing.max_step_bytes).max(1),
             idle_rounds: 0,
             marked: Instant::now(),
         })
@@ -708,7 +752,38 @@ impl BufPool {
     /// pool's is behind the id.
     pub(crate) fn take_lent(&mut self, bid: u16) -> Option<(*mut u8, usize)> {
         let ptr = self.ring.take_lent(bid)?;
+        self.grow_ahead();
         Some((ptr, self.ring.buf_len()))
+    }
+
+    /// A loan without [`take_lent`](Self::take_lent)'s growth, as a burst
+    /// the kernel outruns leaves the pool: a test's way to a ring dry below
+    /// its limit.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn lend_as_the_kernel(&mut self, bid: u16) -> bool {
+        self.ring.take_lent(bid).is_some()
+    }
+
+    /// Grow a step once a loan leaves a quarter or less free, ahead of
+    /// `-ENOBUFS`. Shrinking needs rounds with no loan, so the two cannot
+    /// chase each other.
+    fn grow_ahead(&mut self) {
+        let allocated = self.ring.allocated();
+        let base = self.ring.target().max(allocated);
+        if u32::from(self.ring.free()) * 4 > u32::from(allocated)
+            || base >= self.limit
+        {
+            return;
+        }
+        self.idle_rounds = 0;
+        self.ring.set_target(self.stepped(base));
+    }
+
+    /// `base` doubled, but by at most `max_step` buffers and never past the
+    /// limit.
+    fn stepped(&self, base: u16) -> u16 {
+        base.saturating_add(base.max(1).min(self.max_step))
+            .min(self.limit)
     }
 
     /// Hand a buffer back.
@@ -733,10 +808,10 @@ impl BufPool {
 
     /// Answer a completion that found the pool dry, by wanting more.
     ///
-    /// Doubling rather than stepping: the shortage says the pool is under
-    /// its working set, and a workload that opened many connections at once
-    /// would otherwise need one `-ENOBUFS` round trip per buffer to get
-    /// there. Returns whether the re-armed read can find a buffer - one
+    /// A step ([`stepped`](Self::stepped)) rather than one buffer: the
+    /// shortage says the pool is under its working set, and a workload that
+    /// opened many connections at once would otherwise need one `-ENOBUFS`
+    /// round trip per buffer to get there. Returns whether the re-armed read can find a buffer - one
     /// this call added, or one already free.
     ///
     /// The free check comes first, and it is what keeps one burst from
@@ -771,10 +846,10 @@ impl BufPool {
         }
         let allocated = self.ring.allocated();
         let base = self.ring.target().max(allocated);
-        if base >= self.ring.entries() {
+        if base >= self.limit {
             return false;
         }
-        self.ring.set_target(base.saturating_mul(2).max(1));
+        self.ring.set_target(self.stepped(base));
         self.ring.allocated() > allocated
     }
 
@@ -857,12 +932,20 @@ impl std::fmt::Debug for BufPool {
 mod tests {
     use super::*;
 
+    /// A budget that buys nothing: the pool starts at [`POOL_INITIAL`] and
+    /// doubles to its demand.
+    const NO_BUDGET: PoolSizing = PoolSizing::UNSIZED;
+
     /// `rounds` quiet observations, each a full idle round after the last.
     fn quiet(p: &mut BufPool, t: &mut Instant, rounds: u8) {
         for _ in 0..rounds {
             *t += IDLE_ROUND;
             p.rebalance_at(*t);
         }
+    }
+
+    fn kernel_picks(p: &mut BufPool, bid: u16) -> bool {
+        p.lend_as_the_kernel(bid)
     }
 
     /// The ids the ring currently holds posted.
@@ -911,7 +994,8 @@ mod tests {
         let Some(r) = ring() else {
             return;
         };
-        let mut p = BufPool::new(r.raw_fd(), 1, 64, 64).expect("registers");
+        let mut p =
+            BufPool::new(r.raw_fd(), 1, 64, 64, NO_BUDGET).expect("registers");
         assert_eq!(p.allocated(), POOL_INITIAL);
         assert!(p.grow(0), "nothing armed: the free buffers answer it");
         assert_eq!(p.allocated(), POOL_INITIAL, "and nothing is added");
@@ -1388,13 +1472,14 @@ mod tests {
         let Some(r) = ring() else {
             return;
         };
-        let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
+        let mut p =
+            BufPool::new(r.raw_fd(), 0, 64, 64, NO_BUDGET).expect("registers");
         let start = p.allocated();
         // Dry means dry: every buffer lent. A shortage with buffers free
         // is stale - already answered by an earlier doubling - and grows
         // nothing.
         for b in 0..start {
-            assert!(p.take_lent(b).is_some(), "lend {b}");
+            assert!(kernel_picks(&mut p, b), "lend {b}");
         }
         assert!(p.grow(0), "room to grow");
         assert_eq!(p.allocated(), start * 2, "doubled");
@@ -1413,7 +1498,8 @@ mod tests {
         let Some(r) = ring() else {
             return;
         };
-        let mut p = BufPool::new(r.raw_fd(), 0, 64, 4).expect("registers");
+        let mut p =
+            BufPool::new(r.raw_fd(), 0, 64, 4, NO_BUDGET).expect("registers");
         assert_eq!(p.allocated(), 4, "born at the ceiling");
         assert!(p.grow(0), "free buffers at the ceiling answer a shortage");
         assert_eq!(p.allocated(), 4, "without growing past it");
@@ -1440,10 +1526,11 @@ mod tests {
         let Some(r) = ring() else {
             return;
         };
-        let mut p = BufPool::new(r.raw_fd(), 0, 64, 4096).expect("registers");
+        let mut p = BufPool::new(r.raw_fd(), 0, 64, 4096, NO_BUDGET)
+            .expect("registers");
         let start = p.allocated();
         for b in 0..start {
-            assert!(p.take_lent(b).is_some(), "lend {b}");
+            assert!(kernel_picks(&mut p, b), "lend {b}");
         }
         assert!(p.grow(0), "a genuine shortage grows");
         let after = p.allocated();
@@ -1466,7 +1553,8 @@ mod tests {
         let Some(r) = ring() else {
             return;
         };
-        let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
+        let mut p =
+            BufPool::new(r.raw_fd(), 0, 64, 64, NO_BUDGET).expect("registers");
         p.grow(0);
         p.grow(0);
         let grown = p.target();
@@ -1488,7 +1576,8 @@ mod tests {
         let Some(r) = ring() else {
             return;
         };
-        let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
+        let mut p =
+            BufPool::new(r.raw_fd(), 0, 64, 64, NO_BUDGET).expect("registers");
         p.grow(0);
         p.grow(0);
         let grown = p.target();
@@ -1511,7 +1600,8 @@ mod tests {
         let Some(r) = ring() else {
             return;
         };
-        let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
+        let mut p =
+            BufPool::new(r.raw_fd(), 0, 64, 64, NO_BUDGET).expect("registers");
         p.grow(0);
         p.grow(0);
         let grown = p.allocated();
@@ -1535,7 +1625,8 @@ mod tests {
         let Some(r) = ring() else {
             return;
         };
-        let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
+        let mut p =
+            BufPool::new(r.raw_fd(), 0, 64, 64, NO_BUDGET).expect("registers");
         p.grow(0);
         p.grow(0);
         let grown = p.allocated();
@@ -1550,7 +1641,7 @@ mod tests {
         assert_eq!(kept, usize::from(grown), "and kept its storage");
         // Every one of them lent: the shortage that grows the pool back.
         for bid in posted_ids(&p) {
-            assert!(p.take_lent(bid).is_some(), "a posted id lends");
+            assert!(kernel_picks(&mut p, bid), "a posted id lends");
         }
         assert!(p.grow(0), "a dry ring grows");
         assert_eq!(p.allocated(), grown, "back to where it was");
@@ -1564,7 +1655,8 @@ mod tests {
         let Some(r) = ring() else {
             return;
         };
-        let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
+        let mut p =
+            BufPool::new(r.raw_fd(), 0, 64, 64, NO_BUDGET).expect("registers");
         p.grow(0);
         p.grow(0);
         let grown = p.allocated();
@@ -1597,7 +1689,8 @@ mod tests {
         let Some(r) = ring() else {
             return;
         };
-        let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
+        let mut p =
+            BufPool::new(r.raw_fd(), 0, 64, 64, NO_BUDGET).expect("registers");
         p.grow(0);
         let grown = p.target();
         let mut t = Instant::now();
@@ -1617,7 +1710,8 @@ mod tests {
         let Some(r) = ring() else {
             return;
         };
-        let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
+        let mut p =
+            BufPool::new(r.raw_fd(), 0, 64, 64, NO_BUDGET).expect("registers");
         p.grow(0);
         let grown = p.target();
         let mut t = Instant::now();
@@ -1647,7 +1741,7 @@ mod tests {
         let Some(r) = ring() else {
             return;
         };
-        let Ok(mut p) = BufPool::new(r.raw_fd(), 5, 64, 64) else {
+        let Ok(mut p) = BufPool::new(r.raw_fd(), 5, 64, 64, NO_BUDGET) else {
             return;
         };
         // Idle it down first: the target falls, and the surplus is given
@@ -1663,7 +1757,7 @@ mod tests {
 
         // Then hand every one of them out, which is what a shortage means.
         let held: Vec<u16> = (0..allocated)
-            .filter(|&b| p.take_lent(b).is_some())
+            .filter(|&b| kernel_picks(&mut p, b))
             .collect();
         assert_eq!(
             held.len(),
@@ -1682,6 +1776,148 @@ mod tests {
         );
     }
 
+    /// A pool starts with what its budget buys, between the floor and the
+    /// ring - a budget past what a `u16` counts clamped, not wrapped.
+    #[test]
+    fn a_pool_starts_with_its_byte_budget() {
+        const BUF: usize = 64;
+        const ROOMY: u16 = 1024;
+        const TIGHT: u16 = 32;
+        const BOUGHT: u16 = 100;
+        const UNDER_FLOOR: usize = POOL_INITIAL as usize - 1;
+        // One more buffer than a `u16` counts, which a cast wraps to zero.
+        const PAST_U16: usize = u16::MAX as usize + 1;
+        let Some(r) = ring() else {
+            return;
+        };
+        for (entries, budget, want) in [
+            (ROOMY, usize::from(BOUGHT) * BUF, BOUGHT),
+            (ROOMY, UNDER_FLOOR * BUF, POOL_INITIAL),
+            (ROOMY, NO_BUDGET.initial_bytes, POOL_INITIAL),
+            (TIGHT, usize::from(BOUGHT) * BUF, TIGHT),
+            (TIGHT, PAST_U16 * BUF, TIGHT),
+        ] {
+            let sizing = PoolSizing {
+                initial_bytes: budget,
+                ..NO_BUDGET
+            };
+            let p = BufPool::new(r.raw_fd(), 0, BUF, entries, sizing)
+                .expect("registers");
+            assert_eq!(
+                (p.allocated(), p.free()),
+                (want, want),
+                "{budget} bytes into {entries} entries"
+            );
+        }
+    }
+
+    /// A loan that leaves a quarter free doubles the pool, so past its
+    /// starting budget it holds at most 8/3 of its peak loans, and loans
+    /// taken one at a time never find it dry below its limit.
+    #[test]
+    fn a_pool_grows_before_it_runs_dry() {
+        let Some(r) = ring() else {
+            return;
+        };
+        let mut p = BufPool::new(r.raw_fd(), 0, 64, 1024, NO_BUDGET)
+            .expect("registers");
+        let start = p.allocated();
+        // The loan that leaves a quarter free, counted from zero.
+        let last = start - start / 4 - 1;
+        for b in 0..last {
+            assert!(p.take_lent(b).is_some(), "lend {b}");
+        }
+        assert_eq!(p.allocated(), start, "over a quarter free: nothing added");
+        assert!(p.take_lent(last).is_some(), "the next loan");
+        assert_eq!(p.allocated(), start * 2, "a quarter free: doubled");
+
+        while p.allocated() < p.limit {
+            let bid = posted_ids(&p)[0];
+            assert!(p.take_lent(bid).is_some(), "lend {bid}");
+            let (lent, held) = (u32::from(p.lent()), u32::from(p.allocated()));
+            assert!(p.free() > 0, "{lent} lent ran the ring dry at {held}");
+            assert!(3 * held <= 8 * lent, "{held} held for {lent} lent");
+        }
+    }
+
+    /// Growth stops at the demand, not at the ring's power-of-two size.
+    #[test]
+    fn a_pool_grows_to_its_demand_and_no_further() {
+        const DEMAND: u16 = 40;
+        let Some(r) = ring() else {
+            return;
+        };
+        let mut p = BufPool::new(r.raw_fd(), 0, 64, DEMAND, NO_BUDGET)
+            .expect("registers");
+        assert!(p.ring.entries() > DEMAND, "the ring rounds {DEMAND} up");
+        while p.free() > 0 {
+            let bid = posted_ids(&p)[0];
+            assert!(p.take_lent(bid).is_some(), "lend {bid}");
+            assert!(
+                p.allocated() <= DEMAND,
+                "grew to {} past a demand of {DEMAND}",
+                p.allocated()
+            );
+        }
+        assert_eq!(p.allocated(), DEMAND, "every buffer lent, at the demand");
+        assert!(
+            !p.grow(0),
+            "a shortage at the demand is not growth's to fix"
+        );
+        assert_eq!(p.allocated(), DEMAND);
+    }
+
+    /// A step doubles the pool, adding at most `max_step_bytes`.
+    #[test]
+    fn a_growth_step_is_capped() {
+        const BUF: usize = 64;
+        const STEP: u16 = 16;
+        const UNTIL: u16 = 64;
+        let Some(r) = ring() else {
+            return;
+        };
+        let sizing = PoolSizing {
+            max_step_bytes: usize::from(STEP) * BUF,
+            ..NO_BUDGET
+        };
+        let mut p =
+            BufPool::new(r.raw_fd(), 0, BUF, 1024, sizing).expect("registers");
+        let mut held = p.allocated();
+        assert!(held < STEP, "the first step must double");
+        while p.allocated() < UNTIL {
+            let bid = posted_ids(&p)[0];
+            assert!(p.take_lent(bid).is_some(), "lend {bid}");
+            let now = p.allocated();
+            if now != held {
+                assert_eq!(now, held + held.min(STEP), "a step from {held}");
+                held = now;
+            }
+        }
+    }
+
+    /// A byte cap below the demand is the pool's limit.
+    #[test]
+    fn a_pool_stays_under_its_byte_cap() {
+        const BUF: usize = 64;
+        const CAP: u16 = 20;
+        let Some(r) = ring() else {
+            return;
+        };
+        let sizing = PoolSizing {
+            max_bytes: Some(usize::from(CAP) * BUF),
+            ..NO_BUDGET
+        };
+        let mut p =
+            BufPool::new(r.raw_fd(), 0, BUF, 1024, sizing).expect("registers");
+        while p.free() > 0 {
+            let bid = posted_ids(&p)[0];
+            assert!(p.take_lent(bid).is_some(), "lend {bid}");
+            assert!(p.allocated() <= CAP, "grew to {}", p.allocated());
+        }
+        assert_eq!(p.allocated(), CAP, "every buffer lent, at the cap");
+        assert!(!p.grow(0), "a shortage at the cap is not growth's to fix");
+    }
+
     /// The pool always keeps at least one buffer: dropping to zero would
     /// mean every recv came back `-ENOBUFS` with nothing to grow from.
     #[test]
@@ -1689,7 +1925,8 @@ mod tests {
         let Some(r) = ring() else {
             return;
         };
-        let mut p = BufPool::new(r.raw_fd(), 0, 64, 64).expect("registers");
+        let mut p =
+            BufPool::new(r.raw_fd(), 0, 64, 64, NO_BUDGET).expect("registers");
         quiet(&mut p, &mut Instant::now(), SHRINK_AFTER * 8);
         assert!(p.target() >= 1, "never aims at nothing");
         assert!(p.free() >= 1, "and what it keeps is available");

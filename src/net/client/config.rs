@@ -183,6 +183,8 @@ impl ClientConfig {
             // untrusted caller holding a pool slot, so there is no slot to
             // defend.
             max_receipt_time: None,
+            // Server-only, like the budget it renews.
+            receipt_window_bytes: usize::MAX,
             send_timeout: self.send_timeout,
             tls_handshake_timeout: self.tls_handshake_timeout,
             // Server-only: a client never registers a recv pool, so there
