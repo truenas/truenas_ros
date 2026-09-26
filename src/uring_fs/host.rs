@@ -295,6 +295,7 @@ impl UringFs {
     /// errors. Terminal: build a fresh `UringFs` rather than re-running.
     pub fn run(&mut self) -> crate::Result<()> {
         self.eng.arm_wake(pack_raw(TAG_WAKE, 0, 0))?;
+        self.eng.shared.wake.activate();
         let run = self.run_loop();
         let drained = self.drain_teardown();
         run?;
@@ -307,12 +308,41 @@ impl UringFs {
             if self.eng.inflight == 0 {
                 break; // nothing outstanding; avoid blocking forever
             }
-            self.eng.ring.submit_and_wait(1)?;
+            // Everything this turn queued on the pool, woken for in one
+            // pass, with the sleep bounded by when the pool next needs
+            // looking at - a job queued behind a blocked one gets its own
+            // worker then, not when that one finishes
+            // (`FsCore::flush_offloads`); then the parker: a poke that
+            // landed while this loop was awake wrote no eventfd, and is
+            // drained here instead of slept through (`WakeHandle::park`).
+            let recheck = self.fs.flush_offloads();
+            match self.eng.shared.wake.park() {
+                crate::uring::wake::Park::Block => {
+                    let waited = self.eng.ring.submit_and_wait_for(1, recheck);
+                    self.eng.shared.wake.unpark();
+                    waited?;
+                }
+                crate::uring::wake::Park::Drain => {
+                    self.drain_wake_sources();
+                    self.eng.submit_and_flush_overflow()?;
+                }
+            }
             while let Some(cqe) = self.eng.ring.reap() {
                 self.dispatch(cqe)?;
             }
         }
         Ok(())
+    }
+
+    /// Everything a poke asks the loop to look at, without the re-arm:
+    /// the `TAG_WAKE` completion re-arms because it consumed the read, and
+    /// a `Park::Drain` runs this with the read still armed.
+    fn drain_wake_sources(&mut self) {
+        self.drain_injects();
+        // Fire on-loop deliveries from finished off-loop pool jobs
+        // (`FsConn::offload` and the hybrid lister). Additive: the
+        // `FsHandle` path never touches the pool.
+        deliver_pool_completions(&mut self.fs, &mut self.eng);
     }
 
     fn dispatch(&mut self, cqe: IoUringCqe) -> errno::Result<()> {
@@ -331,11 +361,7 @@ impl UringFs {
                 if !self.eng.stopping() {
                     self.eng.arm_wake(pack_raw(TAG_WAKE, 0, 0))?;
                 }
-                self.drain_injects();
-                // Fire on-loop deliveries from finished off-loop pool jobs
-                // (`FsConn::offload` and the hybrid lister). Additive: the
-                // `FsHandle` path never touches the pool.
-                deliver_pool_completions(&mut self.fs, &mut self.eng);
+                self.drain_wake_sources();
             }
             TAG_CANCEL => {}
             // Deliver a completion. An `FsHandle` op parks a channel waiter

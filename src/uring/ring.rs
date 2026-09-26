@@ -6,7 +6,8 @@
 //! expressed in the Rust memory model. Nothing outside this file touches the
 //! kernel-shared head/tail words.
 //!
-//! The four kernel-shared index words and the two entry arrays live behind
+//! The four kernel-shared index words, the SQ flags word the kernel
+//! writes, and the two entry arrays live behind
 //! [`SqCqRings`] - one home for the ordering discipline. In production its
 //! atomics are `*const AtomicU32` into the mmap and the accessors inline to the
 //! exact loads/stores/derefs the ring used before. Under `--cfg loom` the same
@@ -42,6 +43,15 @@ fn load_acquire(cell: &AtomicU32) -> u32 {
     cell.load(Ordering::Acquire)
 }
 
+/// Relaxed-load a kernel-written word that orders nothing and is read only
+/// as a hint. The ring's index words are NOT this: they carry the entries,
+/// and go through [`load_acquire`]. See [`SqCqRings::cq_overflowed`], the
+/// only such word today.
+#[inline]
+fn load_relaxed(cell: &AtomicU32) -> u32 {
+    cell.load(Ordering::Relaxed)
+}
+
 /// Release-store one of the ring's shared index words, publishing whatever
 /// the entry it names was filled with. See [`load_acquire`].
 #[inline]
@@ -49,7 +59,8 @@ fn store_release(cell: &AtomicU32, v: u32) {
     cell.store(v, Ordering::Release)
 }
 
-/// The kernel-shared SQ/CQ state: the four index words plus the SQE/CQE arrays.
+/// The kernel-shared SQ/CQ state: the four index words, the SQ flags word
+/// the kernel writes, and the SQE/CQE arrays.
 ///
 /// This is the single home of the acquire/release discipline. The user-side
 /// accessors ([`try_reserve`](SqCqRings::try_reserve), [`fill_sqe`](SqCqRings::fill_sqe),
@@ -58,7 +69,7 @@ fn store_release(cell: &AtomicU32, v: u32) {
 /// mutable bookkeeping - which lets a loom test share it behind an `Arc` between
 /// the user thread and a mock-kernel thread.
 ///
-/// Production (`cfg(not(loom))`): the four words are `*const AtomicU32` into the
+/// Production (`cfg(not(loom))`): the five kernel words are `*const AtomicU32` into the
 /// mmap and the arrays are `*mut` into the mmap; every accessor inlines to the
 /// same operation the ring performed inline before. Under `cfg(loom)`: owned
 /// loom atomics and `UnsafeCell`-wrapped boxed arrays, so loom models the
@@ -73,6 +84,8 @@ pub(crate) struct SqCqRings {
     #[cfg(not(loom))]
     cq_ktail: *const AtomicU32, // kernel-advanced producer tail (we Acquire-load)
     #[cfg(not(loom))]
+    sq_kflags: *const AtomicU32, // kernel-written IORING_SQ_* (Relaxed: a hint)
+    #[cfg(not(loom))]
     sqes: *mut IoUringSqe,
     #[cfg(not(loom))]
     cqes: *mut IoUringCqe,
@@ -86,6 +99,8 @@ pub(crate) struct SqCqRings {
     #[cfg(loom)]
     cq_ktail: AtomicU32,
     #[cfg(loom)]
+    sq_kflags: AtomicU32,
+    #[cfg(loom)]
     sqes: Box<[UnsafeCell<IoUringSqe>]>,
     #[cfg(loom)]
     cqes: Box<[UnsafeCell<IoUringCqe>]>,
@@ -97,7 +112,8 @@ pub(crate) struct SqCqRings {
 
 impl SqCqRings {
     /// Build from the mmap'd regions (production). `sqes` is the SQES mapping
-    /// base; the four words and the CQE array are at kernel-provided offsets in
+    /// base; the four index words, the flags word and the CQE array are at
+    /// kernel-provided offsets in
     /// the SQ/CQ mappings.
     #[cfg(not(loom))]
     fn new(
@@ -117,6 +133,8 @@ impl SqCqRings {
                 cq_khead: field_ptr::<AtomicU32>(cq_ring, p.cq_off.head)
                     as *const AtomicU32,
                 cq_ktail: field_ptr::<AtomicU32>(cq_ring, p.cq_off.tail)
+                    as *const AtomicU32,
+                sq_kflags: field_ptr::<AtomicU32>(sq_ring, p.sq_off.flags)
                     as *const AtomicU32,
                 sqes,
                 cqes: field_ptr::<IoUringCqe>(cq_ring, p.cq_off.cqes),
@@ -157,6 +175,8 @@ impl SqCqRings {
             sq_ktail: AtomicU32::new(0),
             cq_khead: AtomicU32::new(0),
             cq_ktail: AtomicU32::new(0),
+            // No kernel in a model, so nothing ever sets a flag here.
+            sq_kflags: AtomicU32::new(0),
             sqes,
             cqes,
             sq_mask: sq_entries - 1,
@@ -165,7 +185,9 @@ impl SqCqRings {
         }
     }
 
-    // The four kernel-shared index words. A raw pointer into the mmap in a
+    // The four kernel-shared index words, then the SQ flags word - which
+    // is NOT one of them: it carries no entry and is read Relaxed, see
+    // `load_relaxed`. A raw pointer into the mmap in a
     // real ring, an owned atomic in a model - the `cfg` picks the *cell*,
     // and nothing else, so the orderings below have one spelling each.
     #[inline]
@@ -189,6 +211,17 @@ impl SqCqRings {
         }
         #[cfg(loom)]
         &self.sq_ktail
+    }
+
+    #[inline]
+    fn sq_kflags(&self) -> &AtomicU32 {
+        #[cfg(not(loom))]
+        // SAFETY: as `sq_khead`, for the SQ ring's flags word.
+        unsafe {
+            &*self.sq_kflags
+        }
+        #[cfg(loom)]
+        &self.sq_kflags
     }
 
     #[inline]
@@ -231,6 +264,22 @@ impl SqCqRings {
     #[inline]
     fn cq_tail_acquire(&self) -> u32 {
         load_acquire(self.cq_ktail())
+    }
+
+    /// Whether the kernel is holding completions in its overflow list rather
+    /// than the CQ ring.
+    ///
+    /// Relaxed, and deliberately: this word orders nothing. The kernel sets
+    /// the bit with an unordered RMW on `sq_flags`, so there is no release
+    /// store for an Acquire here to pair with, and a load cannot order
+    /// writes made after it in any case. The CQEs a flush then moves in are
+    /// published by the kernel's release of `cq.tail`, which `reap`'s own
+    /// `cq_tail_acquire` already pairs with - this is a hint about whether
+    /// an enter is owed, nothing more, and a stale answer costs at most one
+    /// turn. liburing's `io_uring_cq_has_overflow` reads it the same way.
+    #[inline]
+    fn cq_overflowed(&self) -> bool {
+        load_relaxed(self.sq_kflags()) & IORING_SQ_CQ_OVERFLOW != 0
     }
 
     /// Release-store the consumer CQ head, freeing the slot for kernel reuse.
@@ -738,6 +787,42 @@ impl Ring {
         self.rings.reap(&mut self.cq_head)
     }
 
+    /// Whether the kernel has a CQ overflow backlog waiting to be flushed.
+    ///
+    /// Reading this is a plain load of a shared word - no syscall - so a
+    /// loop that must not block can ask before paying for the enter that
+    /// [`flush_overflow`](Self::flush_overflow) makes.
+    pub(crate) fn cq_overflowed(&self) -> bool {
+        self.rings.cq_overflowed()
+    }
+
+    /// Move as much of the kernel's CQ overflow backlog into the CQ ring as
+    /// the ring has room for, without submitting anything and without
+    /// waiting.
+    ///
+    /// **One call is not a drain.** The kernel moves what fits, so a
+    /// backlog deeper than `cq_entries` needs one call per ring's worth -
+    /// measured, 64 completions on a CQ of 16 took four rounds, and
+    /// `cq_overflowed` stayed true until the last. Callers that reap to
+    /// empty afterwards must not read a return here as "the ring is now
+    /// clean"; the loop converges because each turn takes a full ring's
+    /// worth and the flag clears when the backlog is gone.
+    ///
+    /// `IORING_ENTER_GETEVENTS` is what performs the flush; `min_complete`
+    /// of zero is already satisfied, so the kernel returns straight after
+    /// it. Deliberately not expressed as `submit_and_wait(0)`: that submits
+    /// first and returns early on a short submit or on `EBUSY`/`EAGAIN`
+    /// without ever reaching its trailing enter, so on exactly the paths a
+    /// backlogged ring is likely to take it would flush nothing.
+    pub(crate) fn flush_overflow(&mut self) -> errno::Result<()> {
+        match io_uring_enter(self.raw_fd(), 0, 0, IORING_ENTER_GETEVENTS) {
+            // `EBUSY`/`EAGAIN` here mean the kernel declined the enter, not
+            // that the backlog is gone; the next one retries.
+            Ok(_) | Err(Errno::EBUSY | Errno::EAGAIN) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Submit all staged SQEs without waiting.
     pub(crate) fn submit(&mut self) -> errno::Result<()> {
         while self.to_submit > 0 {
@@ -759,6 +844,33 @@ impl Ring {
         &mut self,
         min_complete: u32,
     ) -> errno::Result<()> {
+        self.submit_and_wait_for(min_complete, None)
+    }
+
+    /// [`submit_and_wait`](Self::submit_and_wait), giving up the wait after
+    /// `timeout` when there is one. An expiry returns `Ok` like any other
+    /// wake: the caller reaps what there is, which may be nothing.
+    pub(crate) fn submit_and_wait_for(
+        &mut self,
+        min_complete: u32,
+        timeout: Option<std::time::Duration>,
+    ) -> errno::Result<()> {
+        let fd = self.raw_fd();
+        let enter = |to_submit| match timeout {
+            Some(t) => io_uring_enter_timeout(
+                fd,
+                to_submit,
+                min_complete,
+                IORING_ENTER_GETEVENTS,
+                t,
+            ),
+            None => io_uring_enter(
+                fd,
+                to_submit,
+                min_complete,
+                IORING_ENTER_GETEVENTS,
+            ),
+        };
         // A SHORT submit skips the wait entirely. `io_uring_enter` runs
         // `io_submit_sqes` and then
         // `if (ret != to_submit) { mutex_unlock(..); goto out; }`
@@ -770,15 +882,12 @@ impl Ring {
         // spin at 100% CPU when it is not. Submit to empty first, then enter
         // once more purely to wait.
         while self.to_submit > 0 {
-            match io_uring_enter(
-                self.raw_fd(),
-                self.to_submit,
-                min_complete,
-                IORING_ENTER_GETEVENTS,
-            ) {
+            match enter(self.to_submit) {
                 // Nothing accepted and no error: the SQ is not draining, so
-                // spinning here would not help. Leave the rest staged.
-                Ok(0) => return Ok(()),
+                // spinning here would not help. Leave the rest staged. An
+                // expiry reports only when nothing was submitted, so it is
+                // this case too.
+                Ok(0) | Err(Errno::ETIME) => return Ok(()),
                 Ok(n) if n >= self.to_submit => {
                     self.to_submit = 0;
                     return Ok(()); // full submit: the wait above happened
@@ -793,13 +902,8 @@ impl Ring {
         }
         // Nothing staged (or the loop drained it short of a full submit):
         // enter for the wait alone.
-        match io_uring_enter(
-            self.raw_fd(),
-            0,
-            min_complete,
-            IORING_ENTER_GETEVENTS,
-        ) {
-            Ok(_) | Err(Errno::EBUSY | Errno::EAGAIN) => Ok(()),
+        match enter(0) {
+            Ok(_) | Err(Errno::EBUSY | Errno::EAGAIN | Errno::ETIME) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -1072,6 +1176,42 @@ mod tests {
         assert_eq!(cqe.user_data, 0xf00d);
     }
 
+    /// A timed wait with nothing to complete comes back once its timeout
+    /// has passed, as an `Ok` with nothing to reap; one with a completion
+    /// due comes back for the completion, well inside a timeout it could
+    /// not have outwaited. The expiry is what bounds a loop's sleep by the
+    /// offload pool's deadline, and it reports as `ETIME`, which must not
+    /// reach the loop as an error.
+    #[test]
+    fn a_timed_wait_gives_up_at_its_timeout() {
+        use std::time::{Duration, Instant};
+        let Some(setup) = setup_or_skip(8) else {
+            return;
+        };
+        let mut ring = Ring::from_setup(setup).expect("map");
+
+        let began = Instant::now();
+        ring.submit_and_wait_for(1, Some(Duration::from_millis(20)))
+            .expect("an expiry is not an error");
+        let took = began.elapsed();
+        assert!(took >= Duration::from_millis(20), "woke early: {took:?}");
+        assert!(ring.reap().is_none(), "nothing was submitted");
+
+        ring.push_sqe(|sqe| {
+            sqe.opcode = IORING_OP_NOP;
+            sqe.user_data = 7;
+        })
+        .expect("stage");
+        let began = Instant::now();
+        ring.submit_and_wait_for(1, Some(Duration::from_secs(30)))
+            .expect("submit_and_wait_for");
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "the wait outlasted the completion it was for"
+        );
+        assert_eq!(ring.reap().map(|c| c.user_data), Some(7));
+    }
+
     /// Every ring carries `NO_SQARRAY`, and the kernel answers it by leaving
     /// `sq_off.array` unset.
     ///
@@ -1278,6 +1418,93 @@ mod tests {
             Ok(cqe.user_data)
         });
         assert_eq!(worker.join().unwrap().expect("ring io"), 0x5eed);
+    }
+
+    /// A ring whose CQ overflowed keeps the surplus in a kernel-side
+    /// backlog. Only an `io_uring_enter` carrying `IORING_ENTER_GETEVENTS`
+    /// moves it into the CQ ring, and `Ring::submit` carries no such flag -
+    /// worse, with nothing staged its loop body never runs, so it issues no
+    /// syscall at all. A loop that reaps to empty after a bare `submit`
+    /// therefore sees a quiet ring with completions still owed to it.
+    ///
+    /// The kernel advertises the condition in the SQ ring's flags word
+    /// (`IORING_SQ_CQ_OVERFLOW`), which costs a plain load to read - so the
+    /// parker's `Park::Drain` arm, which must not block and should not pay
+    /// a syscall it does not owe, asks before entering. `flush_overflow`
+    /// is that enter: `GETEVENTS` with `min_complete` of zero, already
+    /// satisfied, so the kernel returns straight after the flush.
+    #[test]
+    fn a_bare_submit_leaves_the_overflow_backlog_where_it_is() {
+        let Some(setup) = setup_or_skip(8) else {
+            return;
+        };
+        let mut ring = Ring::from_setup(setup).expect("map");
+        // A fresh ring has nothing backed up. Asserted so that the flag
+        // read below distinguishes the right word from any word: a wrong
+        // offset that happened to have bit 1 set would pass the `true`
+        // assertion alone.
+        assert!(
+            !ring.cq_overflowed(),
+            "a fresh ring reports an overflow backlog"
+        );
+        // cq_entries defaults to twice sq_entries: 16 here. Submit well
+        // past that without reaping, so the kernel has to back the rest up.
+        let mut sent = 0u64;
+        for _round in 0..8 {
+            for _ in 0..8 {
+                ring.push_sqe(|sqe| {
+                    sqe.opcode = IORING_OP_NOP;
+                    sqe.user_data = 0xAA00 + sent;
+                })
+                .expect("stage");
+                sent += 1;
+            }
+            ring.submit().expect("submit");
+        }
+        let mut in_ring = 0usize;
+        while ring.reap().is_some() {
+            in_ring += 1;
+        }
+        assert!(
+            in_ring < sent as usize,
+            "no overflow to test: the ring took all {sent}"
+        );
+
+        assert!(
+            ring.cq_overflowed(),
+            "the kernel did not report the backlog it is holding"
+        );
+
+        // Nothing is staged now, so this issues no syscall whatsoever.
+        ring.submit().expect("submit");
+        let mut after_submit = 0usize;
+        while ring.reap().is_some() {
+            after_submit += 1;
+        }
+        assert_eq!(
+            after_submit, 0,
+            "a bare submit surfaced backlogged completions"
+        );
+        assert!(ring.cq_overflowed(), "a bare submit cleared the flag");
+
+        let t0 = std::time::Instant::now();
+        ring.flush_overflow().expect("flush");
+        let waited = t0.elapsed();
+        let mut after_flush = 0usize;
+        while ring.reap().is_some() {
+            after_flush += 1;
+        }
+        assert!(
+            after_flush >= (sent as usize - in_ring).min(16),
+            "GETEVENTS recovered less than a ring's worth of a backlog of \
+             {} completions",
+            sent as usize - in_ring
+        );
+        // Not an assertion: `min_complete` is 0, which the kernel satisfies
+        // unconditionally, so no bound here can fail for the reason it
+        // would name. Printed so a regression that made this enter block is
+        // visible in the log rather than silently absorbed.
+        eprintln!("flush_overflow returned in {waited:?}");
     }
 
     /// `submit_and_wait(n)` must return only once `n` completions are

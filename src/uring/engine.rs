@@ -215,6 +215,25 @@ impl Engine {
         })
     }
 
+    /// What the parker's `Park::Drain` arm owes the ring: submit whatever is
+    /// staged, and flush the kernel's CQ overflow backlog if - and only if -
+    /// there is one. Never blocks.
+    ///
+    /// The arm cannot use `submit_and_wait`, which is the call that carries
+    /// `IORING_ENTER_GETEVENTS`, so a bare `submit` there leaves a
+    /// backlogged ring looking empty to the reap that follows. Asking first
+    /// keeps the common case at exactly the syscalls it had: `cq_overflowed`
+    /// is a load of a shared word, and a ring that has never overflowed
+    /// never makes the extra enter. Both host loops park through here, so
+    /// the reasoning lives in one place.
+    pub(crate) fn submit_and_flush_overflow(&mut self) -> errno::Result<()> {
+        self.ring.submit()?;
+        if self.ring.cq_overflowed() {
+            self.ring.flush_overflow()?;
+        }
+        Ok(())
+    }
+
     /// Cancel every outstanding op, then reap until nothing is in flight.
     /// `cancel_user_data` tags the `CANCEL_ANY` op; every reaped CQE is
     /// handed to `on_reaped` so the domain can release resources a
@@ -354,6 +373,70 @@ mod tests {
             .expect("stage a 1-link chain");
         assert_eq!(eng.inflight, 1);
         assert_eq!(eng.staged_sqe(0).flags & IOSQE_IO_LINK, 0);
+    }
+
+    /// The drain arm's own call, over a ring the kernel has backed up.
+    ///
+    /// Staged, not empty: `Park::Drain` runs after `drain_wake_sources`,
+    /// so `to_submit > 0` is the state it is normally in - and that is the
+    /// path where a bare `submit` really does issue an `io_uring_enter`
+    /// and still recovers nothing, because the enter carries no
+    /// `IORING_ENTER_GETEVENTS`. Testing the primitive alone left both
+    /// call sites uncovered: reverting this helper to `self.ring.submit()`
+    /// passed the entire suite.
+    #[test]
+    fn the_drain_arm_recovers_a_backlog_with_sqes_staged() {
+        const IORING_OP_NOP: u8 = 0;
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        // CQ is twice RING_ENTRIES; overrun it well past that, reaping
+        // nothing, so the surplus can only be in the kernel's backlog.
+        let mut sent = 0u64;
+        for _ in 0..24 {
+            for _ in 0..RING_ENTRIES {
+                eng.ring
+                    .push_sqe(|sqe| {
+                        sqe.opcode = IORING_OP_NOP;
+                        sqe.user_data = 0xE000 + sent;
+                    })
+                    .expect("stage");
+                sent += 1;
+            }
+            eng.ring.submit().expect("submit");
+        }
+        let mut drained = 0usize;
+        while eng.ring.reap().is_some() {
+            drained += 1;
+        }
+        assert!(drained < sent as usize, "no backlog: the ring took all");
+        assert!(eng.ring.cq_overflowed(), "kernel reports no backlog");
+
+        // One staged SQE, as the arm would have after draining its wake
+        // sources, then exactly what the arm calls.
+        eng.ring
+            .push_sqe(|sqe| {
+                sqe.opcode = IORING_OP_NOP;
+                sqe.user_data = 0xEFFF;
+            })
+            .expect("stage");
+        eng.submit_and_flush_overflow().expect("drain arm");
+
+        let mut recovered = 0usize;
+        while eng.ring.reap().is_some() {
+            recovered += 1;
+        }
+        // A ring's worth, not `> 0`: the NOP staged just above would
+        // satisfy a floor of one on its own, on any kernel that posts a
+        // fresh completion ahead of the backlog. One flush moves what the
+        // CQ has room for and no more - `cq_entries` is twice
+        // `RING_ENTRIES` - so that is the whole of what this call owes.
+        let owed = (sent as usize - drained).min(RING_ENTRIES as usize * 2);
+        assert!(
+            recovered >= owed,
+            "the drain arm left the backlog in the kernel: recovered \
+             {recovered} where {owed} was owed"
+        );
     }
 
     /// Link-breaking works when the failure happens at **submission**: a bad

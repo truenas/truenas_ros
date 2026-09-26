@@ -129,7 +129,7 @@ env:
   # single_flight, offload_pool, user_data, sys, path::shape, errno - so
   # they genuinely execute, taking real coverage from ~9 tests to the
   # executing count above.
-  # `uring::engine`'s 6 are guard-gated and will skip; they are counted
+  # `uring::engine`'s 7 are guard-gated and will skip; they are counted
   # for the tripwire, not claimed as coverage.
   #
   # No libtest assertion can distinguish executed from vacuous. Making
@@ -154,12 +154,26 @@ env:
   # sequential stop-screen test, pure channel state that genuinely
   # executes here; 112 adds the entry-open classifier's type table,
   # which is `matches!` over a `d_type` and a request behind no guard
-  # at all, so it moves the executing count too.) If that friction is
+  # at all, so it moves the executing count too; 113 adds the pool's
+  # batched-wake test, real threads on a condvar behind no guard, so
+  # it executes here too; 120 replaces that test with seven pool tests
+  # and adds one engine test. The pool seven pin both wake rules and
+  # growth: a flush waking a worker per four jobs, short jobs never
+  # tripping the stall rule, a batch of blocking jobs getting a worker
+  # each, blocking jobs past the floor growing the pool, the growth
+  # threshold sampled either side of its boundary, a flush of one NOT
+  # growing against the queue, and the unclaimed-job re-check. None of
+  # the seven touches a ring guard, so they execute rather than skipping
+  # - but note the lane-wide matched/vacuous/executing triple quoted
+  # further up predates several bumps and is stale, so do not read this
+  # as moving it by seven; it needs its own re-measurement. The engine
+  # one is guard-gated like its neighbours and skips, counted for the
+  # tripwire rather than claimed as coverage.) If that friction is
   # unwanted,
   # `-lt` pinned at the TRUE count still catches deletion, which is
   # the failure mode; what it must not be again is a floor far below
   # what runs.
-  MIRI_TESTS: "112"
+  MIRI_TESTS: "120"
 
   # The `http` band, run as its own step under its own feature set.
   # Exact for the same reason, and bumped by the same rule: 32 at the

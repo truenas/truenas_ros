@@ -155,6 +155,20 @@ pub(crate) struct KernelTimespec {
 }
 const _: () = assert!(core::mem::size_of::<KernelTimespec>() == 16);
 
+/// `struct io_uring_getevents_arg`, the [`IORING_ENTER_EXT_ARG`] argument.
+/// Only `ts` is used here: the address of a relative [`KernelTimespec`],
+/// with no signal mask and no minimum wait. The kernel copies both at
+/// entry, so they need only outlive the call.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GeteventsArg {
+    pub sigmask: u64,
+    pub sigmask_sz: u32,
+    pub min_wait_usec: u32,
+    pub ts: u64,
+}
+const _: () = assert!(core::mem::size_of::<GeteventsArg>() == 24);
+
 // -------------------------------------------------------------------------
 // Constants (values verified against io_uring.h)
 // -------------------------------------------------------------------------
@@ -371,6 +385,16 @@ pub(crate) const IORING_CQE_F_SOCK_NONEMPTY: u32 = 1 << 2;
 
 /// `io_uring_enter` flag: also wait for completions.
 pub(crate) const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
+/// `io_uring_enter` flag: `argp` is a [`GeteventsArg`] and `argsz` its size
+/// - how a wait takes a timeout (`io_get_ext_arg`, `io_uring/io_uring.c`).
+pub(crate) const IORING_ENTER_EXT_ARG: u32 = 1 << 3;
+
+/// `IORING_SQ_CQ_OVERFLOW` in the SQ ring's `flags` word: the kernel has
+/// completions backed up in its overflow list that are not in the CQ ring.
+/// It clears when an `io_uring_enter` carrying [`IORING_ENTER_GETEVENTS`]
+/// drains that list, so a loop can read it to decide whether such an enter
+/// is owed at all.
+pub(crate) const IORING_SQ_CQ_OVERFLOW: u32 = 1 << 1;
 
 // `io_uring_params.features` (kernel-reported).
 pub(crate) const IORING_FEAT_SINGLE_MMAP: u32 = 1 << 0;
@@ -573,6 +597,48 @@ pub(crate) fn io_uring_enter(
             flags as libc::c_long,
             ptr::null::<c_void>(),
             0_usize,
+        )
+    })?;
+    Ok(ret as u32)
+}
+
+/// [`io_uring_enter`] whose `IORING_ENTER_GETEVENTS` wait gives up after
+/// `timeout`, answering `ETIME` when it did and nothing was submitted. An
+/// enter that submitted returns the count instead and the expiry goes
+/// unreported (`if (!ret) ret = ret2;`, `io_uring_enter`). The kernel arms
+/// the wait's timer with no slack (`io_cqring_schedule_timeout`), so the
+/// bound holds to the timer's resolution.
+///
+/// A retried `EINTR` restarts the timeout whole: the bound is on a sleep,
+/// and a signal can only lengthen it by what the signal cost.
+pub(crate) fn io_uring_enter_timeout(
+    ring_fd: RawFd,
+    to_submit: u32,
+    min_complete: u32,
+    flags: u32,
+    timeout: std::time::Duration,
+) -> errno::Result<u32> {
+    let ts = KernelTimespec {
+        tv_sec: i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
+        tv_nsec: i64::from(timeout.subsec_nanos()),
+    };
+    let arg = GeteventsArg {
+        ts: ptr::addr_of!(ts) as u64,
+        ..GeteventsArg::default()
+    };
+    let ret = retry_on_eintr(|| unsafe {
+        // SAFETY: `ring_fd` is a live io_uring fd; `argp` points to a
+        // `GeteventsArg` of exactly `argsz` bytes whose `ts` holds the
+        // address of a `KernelTimespec`, both on this frame for the whole
+        // call.
+        libc::syscall(
+            libc::SYS_io_uring_enter,
+            ring_fd as libc::c_long,
+            to_submit as libc::c_long,
+            min_complete as libc::c_long,
+            (flags | IORING_ENTER_EXT_ARG) as libc::c_long,
+            ptr::addr_of!(arg).cast::<c_void>(),
+            core::mem::size_of::<GeteventsArg>(),
         )
     })?;
     Ok(ret as u32)
