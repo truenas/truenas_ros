@@ -1581,9 +1581,10 @@ impl QueryPool {
         }
     }
 
-    /// Enqueue `job` (a no-op if the pool is already dropping).
+    /// Enqueue `job` (a no-op if the pool is already dropping), poking the
+    /// reactor if the pool needs it to come back ([`SharedPool::submit`]).
     fn submit(&self, job: Job) {
-        self.pool.submit(job);
+        self.pool.submit(job, &self.h.shared.wake);
     }
 
     /// Enqueue a listing of `dir` as `who` and return immediately. Pull its

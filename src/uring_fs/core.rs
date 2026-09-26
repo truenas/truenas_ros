@@ -909,6 +909,8 @@ pub(crate) struct FsCore {
     /// This reactor's one blocking-work pool (shared with off-loop
     /// [`QueryPool`](super::query_dir::QueryPool)s), spawned on first use.
     pool: Arc<SharedPool>,
+    /// Jobs queued on the pool since the last [`Self::flush_offloads`].
+    pending_offloads: usize,
     /// Where workers push finished jobs; drained on the loop's wake.
     completions: Arc<Mutex<VecDeque<PoolCompletion>>>,
     /// Reactor-side continuations for in-flight offloads, keyed by token.
@@ -1017,6 +1019,7 @@ impl FsCore {
             op_free: (0..op_slots).rev().collect(),
             pump_selecting: 0,
             pool: SharedPool::new(offload),
+            pending_offloads: 0,
             completions: Arc::new(Mutex::new(VecDeque::new())),
             offload_reg: HashMap::new(),
             next_offload: 0,
@@ -1190,11 +1193,40 @@ impl FsCore {
         Arc::clone(&self.pool)
     }
 
-    /// Submit `job` to this reactor's shared offload pool (spawned on first
-    /// use). If a worker thread cannot be spawned the job runs inline rather
-    /// than take the reactor down; see [`SharedPool::submit`].
+    /// Queue `job` on this reactor's shared offload pool (spawned on first
+    /// use) without waking a worker; the loop wakes the pool once per
+    /// iteration ([`Self::flush_offloads`]). If a worker thread cannot be
+    /// spawned the job runs inline rather than take the reactor down; see
+    /// [`SharedPool::enqueue`].
     fn submit_offload(&mut self, job: Box<dyn FnOnce() + Send>) {
-        self.pool.submit(job);
+        self.pool.enqueue(job);
+        self.pending_offloads += 1;
+    }
+
+    /// Wake the pool for everything queued since the last flush, and return
+    /// how long the loop may sleep before it must flush again
+    /// ([`WorkerPool::flush`]).
+    ///
+    /// The loop calls this every iteration right before it can block, and
+    /// before its teardown drain. It bounds its sleep by the return
+    /// (`Ring::submit_and_wait_for`), which also covers deadlines published
+    /// by off-loop submitters ([`SharedPool::submit`]).
+    ///
+    /// An iteration that queued nothing skips the pool's lock until the
+    /// deadline is due. The deadline moves earlier only when the last
+    /// claimed worker starts its job, so the check can run up to
+    /// `OFFLOAD_WAKE_ALLOWANCE` late.
+    ///
+    /// [`WorkerPool::flush`]: super::offload_pool::WorkerPool::flush
+    pub(crate) fn flush_offloads(&mut self) -> Option<std::time::Duration> {
+        let pending = std::mem::take(&mut self.pending_offloads);
+        if pending == 0 {
+            let owed = self.pool.recheck_owed()?;
+            if !owed.is_zero() {
+                return Some(owed);
+            }
+        }
+        self.pool.flush(pending)
     }
 
     /// Remove a **server-owned** extended attribute on the blocking pool,
@@ -5878,17 +5910,71 @@ mod hybrid_tests {
             let mut c = FsConn::new(fs, eng, OWNER0);
             kickoff(&mut c);
         }
-        let mut guard = 0u32;
+        // A timer bounds every block, so a missed wake fails at the
+        // deadline below instead of hanging the harness.
+        //
+        // The tag is unused in the fs domain, which this harness
+        // dispatches. Tags under 0x80 belong to the net stack.
+        //
+        // Re-armed only when its completion returns, so one is in flight
+        // per call. `drive` can return with one armed; every caller builds
+        // a fresh `Engine`, so a stale completion is never reaped.
+        const TAG_DRIVE_TIMER: u8 = 0xFF;
+        let ts = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        let mut timer_armed = false;
+        let mut passes = 0u64;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !done() {
-            guard += 1;
-            assert!(guard < 5_000_000, "reactor stalled");
-            eng.ring.submit_and_wait(1).expect("submit_and_wait");
+            // The pass count is reported because it tells a stall (about
+            // one pass per timer expiry) from a busy loop.
+            passes += 1;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reactor stalled: 60s without `done()` over {passes} \
+                 passes. ~60 is one per timer expiry, so the loop was \
+                 blocking with nothing to reap; far more means it was \
+                 reaping and `done()` never came true"
+            );
+            // As the real loops do before they block
+            // (`FsCore::flush_offloads`).
+            let recheck = fs.flush_offloads();
+            if !timer_armed {
+                // The kernel copies the timespec when it preps the SQE;
+                // `ts` outlives the submit.
+                eng.ring
+                    .push_sqe(|sqe| {
+                        sqe.opcode = IORING_OP_TIMEOUT;
+                        sqe.addr = std::ptr::addr_of!(ts) as u64;
+                        sqe.len = 1; // exactly one timespec, per the kernel
+                        sqe.user_data = pack_raw(TAG_DRIVE_TIMER, 0, 0);
+                    })
+                    .expect("stage the drive timer");
+                timer_armed = true;
+            }
+            eng.ring
+                .submit_and_wait_for(1, recheck)
+                .expect("submit_and_wait");
             let mut cqes = Vec::new();
             while let Some(cqe) = eng.ring.reap() {
                 cqes.push(cqe);
             }
             for cqe in cqes {
                 let (tag, slot, g) = unpack_raw(cqe.user_data);
+                if tag == TAG_DRIVE_TIMER {
+                    // `-ETIME` is the timer expiring. Anything else means
+                    // it never armed and the block is unbounded again.
+                    assert!(
+                        cqe.res == -libc::ETIME || cqe.res == -libc::ECANCELED,
+                        "the drive timer was refused: {}",
+                        cqe.res
+                    );
+                    timer_armed = false;
+                    continue;
+                }
                 if tag == TAG_WAKE {
                     eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm");
                     // The real delivery functions, not a copy of their
@@ -6665,6 +6751,60 @@ mod hybrid_tests {
             || got.borrow().is_some(),
         );
         assert_eq!(*got.borrow(), Some(42));
+    }
+
+    /// Blocking offloads queued in one iteration run side by side, though
+    /// the loop sleeps right after queueing them: the flush wakes one
+    /// worker, and the rest get workers when the loop wakes at the returned
+    /// deadline. The jobs meet at a barrier, so they finish only if all four
+    /// run at once.
+    ///
+    /// The floor is parked first: workers still starting would take the
+    /// jobs whatever the wake rules were.
+    #[test]
+    fn a_turns_blocking_offloads_run_side_by_side() {
+        const JOBS: usize = 4;
+        let (mut eng, mut fs, _me) = setup();
+        let floor = OffloadBounds::default().floor;
+        assert!(JOBS <= floor, "the fixture must not need growth");
+        let pool = fs.pool_handle();
+        pool.submit(Box::new(|| {}), &eng.shared.wake);
+        let parking = std::time::Instant::now();
+        // At least the floor: the warm-up's flush can grow the pool by one.
+        while pool.parked().is_none_or(|parked| parked < floor) {
+            assert!(
+                parking.elapsed() < std::time::Duration::from_secs(5),
+                "the pool's floor never parked"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(JOBS));
+        let done = Rc::new(Cell::new(0usize));
+        let d2 = done.clone();
+        let began = std::time::Instant::now();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                for _ in 0..JOBS {
+                    let b = std::sync::Arc::clone(&barrier);
+                    let d = d2.clone();
+                    c.offload(
+                        move || {
+                            b.wait();
+                        },
+                        move |_r, _c| d.set(d.get() + 1),
+                    );
+                }
+            },
+            || done.get() == JOBS,
+        );
+        let took = began.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "the blocked jobs got their workers only after {took:?}: the \
+             loop slept through the pool's deadline"
+        );
     }
 
     /// A panicking job must still deliver. Before, `push_back`/`poke` sat after
@@ -7454,6 +7594,9 @@ pub(crate) fn deliver_pool_completions(fs: &mut FsCore, eng: &mut Engine) {
 /// would be cancelled with the rest, and a plain callback dropped unfired
 /// already means the connection closes.
 pub(crate) fn drain_stop_window(fs: &mut FsCore, eng: &mut Engine) {
+    // The teardown below blocks without parking, so flush what the last
+    // iteration queued.
+    fs.flush_offloads();
     deliver_pool_completions(fs, eng);
 }
 
@@ -9527,6 +9670,63 @@ mod routing_fuzz {
 #[cfg(all(test, not(loom)))]
 mod pool_identity_tests {
     use super::*;
+
+    /// An iteration that queued nothing still bounds the loop's sleep by a
+    /// deadline an off-loop submitter left on the pool
+    /// ([`SharedPool::submit`]).
+    #[test]
+    fn a_turn_that_queued_nothing_keeps_another_submitters_deadline() {
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::{Duration, Instant};
+
+        let mut core = FsCore::new(
+            4,
+            OffloadBounds {
+                floor: 1,
+                ..OffloadBounds::default()
+            },
+        );
+        let pool = core.pool_handle();
+        pool.enqueue(Box::new(|| {}));
+        let _ = pool.flush(1);
+        let parking = Instant::now();
+        while pool.parked() != Some(1) {
+            assert!(
+                parking.elapsed() < Duration::from_secs(5),
+                "the pool's floor never parked"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(core.flush_offloads(), None, "owed with nothing queued");
+
+        // Two blocking jobs flushed as an off-loop submitter does: the one
+        // worker is claimed, and the second job waits on the first.
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        for _ in 0..2 {
+            let g = Arc::clone(&gate);
+            pool.enqueue(Box::new(move || {
+                let (m, cv) = &*g;
+                let mut open = m.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+            }));
+        }
+        assert!(pool.flush(2).is_some(), "the fixture left nothing owed");
+        // If the deadline has passed, this flushes, and the pool (still
+        // with a job behind a blocked worker) returns another.
+        let seen = core.flush_offloads();
+        {
+            let (m, cv) = &*gate;
+            *m.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        assert!(
+            seen.is_some(),
+            "a turn that queued nothing dropped the deadline another \
+             submitter left, and the loop would sleep untimed"
+        );
+    }
 
     /// A ring has exactly one offload pool: the handle minted for off-loop
     /// submitters is the core's own pool object, not a copy built from its

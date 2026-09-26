@@ -1046,6 +1046,10 @@ where
 
     /// Run the event loop until a [`ShutdownHandle`] stops it or a fatal ring
     /// error occurs. In-flight operations are drained before returning.
+    ///
+    /// Call at most once, even after an error: the arming below is not
+    /// idempotent (a second wake `READ` into the shared buffer, a second
+    /// maintenance timer, duplicate multishot accepts).
     pub fn serve_forever(&mut self) -> crate::Result<()> {
         if self.listeners.iter().any(|l| l.tls)
             && self.handlers.tls_handshake.is_none()
@@ -1067,6 +1071,7 @@ where
             ));
         }
         self.core.arm_wake()?;
+        self.core.engine.shared.wake.activate();
         self.submit_maintain()?;
         for lidx in 0..self.listeners.len() as u32 {
             self.arm_accept(lidx)?;
@@ -1106,13 +1111,34 @@ where
                 break; // nothing outstanding; avoid blocking forever
             }
             // `submit_and_wait` enters with GETEVENTS once the SQ is empty,
-            // which also flushes any IORING_SQ_CQ_OVERFLOW backlog, so
-            // completions can't be stranded even under NODROP. The "once the
+            // which also flushes any IORING_SQ_CQ_OVERFLOW backlog unless it
+            // returns before that enter (a short submit, `EBUSY`/`EAGAIN`);
+            // hence the `Drain` arm's `cq_overflowed` check. The "once the
             // SQ is empty" is load-bearing: a short submit makes the kernel
             // `goto out` past the whole GETEVENTS block
             // (`io_uring/io_uring.c:3571-3574`), so an enter that both
             // submits and waits does neither the wait nor the flush.
-            self.core.engine.ring.submit_and_wait(1)?;
+            //
+            // Wake the pool for what this iteration queued and bound the
+            // sleep by the pool's next deadline (`FsCore::flush_offloads`).
+            // Then park: a poke that landed while the loop was awake wrote
+            // no eventfd and is drained here (`WakeHandle::park`).
+            #[cfg(feature = "uring-fs")]
+            let recheck = self.fs.as_mut().and_then(|fs| fs.flush_offloads());
+            #[cfg(not(feature = "uring-fs"))]
+            let recheck = None;
+            match self.core.engine.shared.wake.park() {
+                crate::uring::wake::Park::Block => {
+                    let waited =
+                        self.core.engine.ring.submit_and_wait_for(1, recheck);
+                    self.core.engine.shared.wake.unpark();
+                    waited?;
+                }
+                crate::uring::wake::Park::Drain => {
+                    self.drain_wake_sources()?;
+                    self.core.engine.submit_and_flush_overflow()?;
+                }
+            }
             while let Some(cqe) = self.core.engine.ring.reap() {
                 self.dispatch(cqe)?;
                 // A slot freed during this dispatch (`Reactor::reclaim_slot`
