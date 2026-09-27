@@ -2037,6 +2037,8 @@ mod tests {
     /// [`drive`] bounds a stall with a deadline instead, so a broken
     /// chain names itself rather than hanging the suite.
     fn turn(fs: &mut FsCore, eng: &mut Engine) -> usize {
+        // Flush the pool before blocking, as the host loop does.
+        fs.flush_offloads();
         eng.ring.submit().expect("submit");
         let mut reaped_n = 0;
         while let Some(cqe) = eng.ring.reap() {

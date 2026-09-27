@@ -295,6 +295,7 @@ impl UringFs {
     /// errors. Terminal: build a fresh `UringFs` rather than re-running.
     pub fn run(&mut self) -> crate::Result<()> {
         self.eng.arm_wake(pack_raw(TAG_WAKE, 0, 0))?;
+        self.eng.shared.wake.activate();
         let run = self.run_loop();
         let drained = self.drain_teardown();
         run?;
@@ -307,12 +308,38 @@ impl UringFs {
             if self.eng.inflight == 0 {
                 break; // nothing outstanding; avoid blocking forever
             }
-            self.eng.ring.submit_and_wait(1)?;
+            // Wake the pool for what this iteration queued and bound the
+            // sleep by the pool's next deadline (`FsCore::flush_offloads`).
+            // Then park: a poke that landed while the loop was awake wrote
+            // no eventfd and is drained here (`WakeHandle::park`).
+            let recheck = self.fs.flush_offloads();
+            match self.eng.shared.wake.park() {
+                crate::uring::wake::Park::Block => {
+                    let waited = self.eng.ring.submit_and_wait_for(1, recheck);
+                    self.eng.shared.wake.unpark();
+                    waited?;
+                }
+                crate::uring::wake::Park::Drain => {
+                    self.drain_wake_sources();
+                    self.eng.submit_and_flush_overflow()?;
+                }
+            }
             while let Some(cqe) = self.eng.ring.reap() {
                 self.dispatch(cqe)?;
             }
         }
         Ok(())
+    }
+
+    /// Drain every wake source without re-arming the wake `READ`:
+    /// `TAG_WAKE` re-arms after consuming the read, and `Park::Drain` runs
+    /// this with the read still armed.
+    fn drain_wake_sources(&mut self) {
+        self.drain_injects();
+        // Fire on-loop deliveries from finished off-loop pool jobs
+        // (`FsConn::offload` and the hybrid lister). Additive: the
+        // `FsHandle` path never touches the pool.
+        deliver_pool_completions(&mut self.fs, &mut self.eng);
     }
 
     fn dispatch(&mut self, cqe: IoUringCqe) -> errno::Result<()> {
@@ -331,11 +358,7 @@ impl UringFs {
                 if !self.eng.stopping() {
                     self.eng.arm_wake(pack_raw(TAG_WAKE, 0, 0))?;
                 }
-                self.drain_injects();
-                // Fire on-loop deliveries from finished off-loop pool jobs
-                // (`FsConn::offload` and the hybrid lister). Additive: the
-                // `FsHandle` path never touches the pool.
-                deliver_pool_completions(&mut self.fs, &mut self.eng);
+                self.drain_wake_sources();
             }
             TAG_CANCEL => {}
             // Deliver a completion. An `FsHandle` op parks a channel waiter
@@ -704,6 +727,65 @@ mod tests {
             vec!["a"],
             "a refusal queued before the stop died with its callback"
         );
+    }
+
+    /// A burst of off-loop submits (one thread fanning out jobs, as
+    /// `QueryPool`'s callers do) gets a worker per job, on a loop with
+    /// nothing else to wake it. The burst outruns growth, so the jobs past
+    /// the floor get workers only when the loop comes back at the published
+    /// deadline. Each job holds its worker until all of them run.
+    #[test]
+    fn an_off_loop_burst_gets_a_worker_per_job() {
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::{Duration, Instant};
+        const JOBS: usize = 2 * crate::uring_fs::core::OFFLOAD_FLOOR;
+
+        let mut host = match UringFs::new(FsConfig::default()) {
+            Ok(h) => h,
+            Err(crate::Error::Errno(e)) if skip_unavailable(e) => return,
+            Err(e) => panic!("UringFs::new: {e}"),
+        };
+        let h = host.handle();
+        let stop = host.shutdown_handle();
+        // Jobs running, and whether they may finish.
+        let gate = Arc::new((Mutex::new((0usize, false)), Condvar::new()));
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for _ in 0..JOBS {
+                    let g = Arc::clone(&gate);
+                    let job = Box::new(move || {
+                        let (m, cv) = &*g;
+                        let mut st = m.lock().unwrap();
+                        st.0 += 1;
+                        cv.notify_all();
+                        while !st.1 {
+                            st = cv.wait(st).unwrap();
+                        }
+                    });
+                    h.pool.submit(job, &h.shared.wake);
+                }
+                let (m, cv) = &*gate;
+                let give_up = Instant::now() + Duration::from_secs(10);
+                let mut st = m.lock().unwrap();
+                while st.0 < JOBS && Instant::now() < give_up {
+                    st = cv
+                        .wait_timeout(st, Duration::from_millis(10))
+                        .unwrap()
+                        .0;
+                }
+                let running = st.0;
+                st.1 = true;
+                cv.notify_all();
+                drop(st);
+                stop.shutdown();
+                assert_eq!(
+                    running, JOBS,
+                    "{running} of {JOBS} jobs got a worker; the rest waited \
+                     on the ones ahead of them"
+                );
+            });
+            host.run().expect("run");
+        });
     }
 
     fn ring_or_skip(entries: u32) -> Option<Ring> {

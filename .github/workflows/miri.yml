@@ -129,7 +129,7 @@ env:
   # single_flight, offload_pool, user_data, sys, path::shape, errno - so
   # they genuinely execute, taking real coverage from ~9 tests to the
   # executing count above.
-  # `uring::engine`'s 6 are guard-gated and will skip; they are counted
+  # `uring::engine`'s 7 are guard-gated and will skip; they are counted
   # for the tripwire, not claimed as coverage.
   #
   # No libtest assertion can distinguish executed from vacuous. Making
@@ -154,12 +154,14 @@ env:
   # sequential stop-screen test, pure channel state that genuinely
   # executes here; 112 adds the entry-open classifier's type table,
   # which is `matches!` over a `d_type` and a request behind no guard
-  # at all, so it moves the executing count too.) If that friction is
+  # at all, so it moves the executing count too; 121 adds eight pool
+  # tests, which need no ring and so execute here, and one guard-gated
+  # engine test, counted rather than claimed.) If that friction is
   # unwanted,
   # `-lt` pinned at the TRUE count still catches deletion, which is
   # the failure mode; what it must not be again is a floor far below
   # what runs.
-  MIRI_TESTS: "112"
+  MIRI_TESTS: "121"
 
   # The `http` band, run as its own step under its own feature set.
   # Exact for the same reason, and bumped by the same rule: 32 at the

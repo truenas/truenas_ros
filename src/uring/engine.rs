@@ -215,6 +215,20 @@ impl Engine {
         })
     }
 
+    /// For the parker's `Park::Drain` arm: submit what is staged, then flush
+    /// the kernel's CQ overflow backlog if there is one. Never blocks.
+    ///
+    /// A bare `submit` carries no `IORING_ENTER_GETEVENTS`, so it leaves the
+    /// backlog in the kernel. `cq_overflowed` is a plain load, so a ring
+    /// with no backlog makes no extra enter.
+    pub(crate) fn submit_and_flush_overflow(&mut self) -> errno::Result<()> {
+        self.ring.submit()?;
+        if self.ring.cq_overflowed() {
+            self.ring.flush_overflow()?;
+        }
+        Ok(())
+    }
+
     /// Cancel every outstanding op, then reap until nothing is in flight.
     /// `cancel_user_data` tags the `CANCEL_ANY` op; every reaped CQE is
     /// handed to `on_reaped` so the domain can release resources a
@@ -354,6 +368,61 @@ mod tests {
             .expect("stage a 1-link chain");
         assert_eq!(eng.inflight, 1);
         assert_eq!(eng.staged_sqe(0).flags & IOSQE_IO_LINK, 0);
+    }
+
+    /// The drain arm recovers an overflow backlog with an SQE staged, the
+    /// state `Park::Drain` normally runs in. There a bare `submit` enters
+    /// the kernel but, without `GETEVENTS`, recovers nothing.
+    #[test]
+    fn the_drain_arm_recovers_a_backlog_with_sqes_staged() {
+        const IORING_OP_NOP: u8 = 0;
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        // CQ is twice RING_ENTRIES; overrun it well past that, reaping
+        // nothing, so the surplus can only be in the kernel's backlog.
+        let mut sent = 0u64;
+        for _ in 0..24 {
+            for _ in 0..RING_ENTRIES {
+                eng.ring
+                    .push_sqe(|sqe| {
+                        sqe.opcode = IORING_OP_NOP;
+                        sqe.user_data = 0xE000 + sent;
+                    })
+                    .expect("stage");
+                sent += 1;
+            }
+            eng.ring.submit().expect("submit");
+        }
+        let mut drained = 0usize;
+        while eng.ring.reap().is_some() {
+            drained += 1;
+        }
+        assert!(drained < sent as usize, "no backlog: the ring took all");
+        assert!(eng.ring.cq_overflowed(), "kernel reports no backlog");
+
+        // One staged SQE, as the arm has after draining its wake sources.
+        eng.ring
+            .push_sqe(|sqe| {
+                sqe.opcode = IORING_OP_NOP;
+                sqe.user_data = 0xEFFF;
+            })
+            .expect("stage");
+        eng.submit_and_flush_overflow().expect("drain arm");
+
+        let mut recovered = 0usize;
+        while eng.ring.reap().is_some() {
+            recovered += 1;
+        }
+        // A ring's worth, not `> 0`, which the NOP staged above satisfies
+        // alone. One flush moves at most what the CQ holds (`cq_entries` is
+        // twice `RING_ENTRIES`).
+        let owed = (sent as usize - drained).min(RING_ENTRIES as usize * 2);
+        assert!(
+            recovered >= owed,
+            "the drain arm left the backlog in the kernel: recovered \
+             {recovered} where {owed} was owed"
+        );
     }
 
     /// Link-breaking works when the failure happens at **submission**: a bad
