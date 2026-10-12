@@ -923,3 +923,61 @@ fn a_trivial_nfsv4_destination_releases_the_creation_hold() {
         "the hold was released but not to the source's mode"
     );
 }
+
+/// `stx_gen` is the generation a ZFS file handle carries, so the handle can
+/// be rebuilt from one `statx` of the descriptor.
+///
+/// Holds only where the TrueNAS kernel passes the field through `cp_statx`
+/// and ZFS fills it, and `TRUENAS_ROS_REQUIRE_STATX_GEN` turns a kernel that
+/// does not into a failure; the QEMU job arms it, as it does the change
+/// cookie's.
+#[cfg(feature = "fhandle")]
+#[test]
+fn statx_generation_is_the_file_handles() {
+    use truenas_ros::sync_fs::fhandle::{FhFlags, name_to_handle_at};
+    use truenas_ros::sync_fs::{StatxMask, statx};
+
+    let Some(dir) = zfs_dir::zfs_dir_or_skip() else {
+        return;
+    };
+    // Made here, so the generation is a txg this pool just assigned rather
+    // than one a provisioning script left behind.
+    let sub = dir.join(format!("rostest_gen_{}", std::process::id()));
+    let _ = std::fs::remove_dir(&sub);
+    std::fs::create_dir(&sub).unwrap();
+    let fd = std::fs::File::open(&sub).unwrap();
+    let mask = StatxMask::INO | StatxMask::GEN;
+    let st = statx(fd.as_fd(), "", AtFlags::AT_EMPTY_PATH, mask).unwrap();
+    let raw = name_to_handle_at(fd.as_fd(), "", FhFlags::AT_EMPTY_PATH)
+        .unwrap()
+        .to_bytes();
+    drop(fd);
+    std::fs::remove_dir(&sub).unwrap();
+
+    let Some(generation) = st.generation() else {
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_GEN").is_none(),
+            "TRUENAS_ROS_REQUIRE_STATX_GEN is set but the dataset at {} \
+             reports none: this kernel is not exposing STATX_GEN",
+            dir.display()
+        );
+        return;
+    };
+    // `zfs_fid`'s short form, after the eight-byte `struct file_handle`
+    // head: a `u16` length of ten, the object number in six little-endian
+    // bytes, then the generation in four with a zero remapped to one.
+    let fid = &raw[8..];
+    assert_eq!(fid.len(), 12, "{raw:02x?}");
+    assert_eq!(u16::from_le_bytes([fid[0], fid[1]]), 10);
+    let mut object = [0u8; 8];
+    object[..6].copy_from_slice(&fid[2..8]);
+    assert_eq!(u64::from_le_bytes(object), st.ino());
+    let in_handle = u32::from_le_bytes([fid[8], fid[9], fid[10], fid[11]]);
+    assert_eq!(
+        match generation as u32 {
+            0 => 1,
+            low => low,
+        },
+        in_handle
+    );
+}

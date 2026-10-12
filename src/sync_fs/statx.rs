@@ -48,6 +48,8 @@ tn_bitflags! {
         WRITE_ATOMIC = 0x0001_0000;
         /// Want/got the direct-I/O read alignment info.
         DIO_READ_ALIGN = 0x0002_0000;
+        /// Want/got the inode generation (`stx_gen`, [`Statx::generation`]).
+        GEN = 0x2000_0000;
         /// Want/got the change cookie (durable/persistent handle support).
         CHANGE_COOKIE = 0x4000_0000;
     }
@@ -125,11 +127,18 @@ pub struct StatxRaw {
     pub stx_atomic_write_unit_max_opt: u32,
     pub __spare2: u32,
     pub stx_change_cookie: u64,
-    pub __spare3: [u64; 7],
+    pub stx_gen: u64,
+    pub __spare3: [u64; 6],
 }
 
 const _: () = assert!(core::mem::size_of::<StatxTimestampRaw>() == 16);
 const _: () = assert!(core::mem::size_of::<StatxRaw>() == 256);
+// The fork's `include/uapi/linux/stat.h` still marks `0xc0` above
+// `__spare3`, but the change cookie took that slot and the generation the
+// next one: a reader trusting the marker reads the spare word instead.
+const _: () =
+    assert!(core::mem::offset_of!(StatxRaw, stx_change_cookie) == 0xc0);
+const _: () = assert!(core::mem::offset_of!(StatxRaw, stx_gen) == 0xc8);
 
 /// A timestamp from [`statx`], as whole seconds plus a nanosecond remainder.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -298,6 +307,22 @@ impl Statx {
         self.mask()
             .contains(StatxMask::CHANGE_COOKIE)
             .then_some(self.0.stx_change_cookie)
+    }
+
+    /// The inode generation, which tells a reused inode number from the
+    /// file that held it before.
+    ///
+    /// `None` unless [`StatxMask::GEN`] was requested *and* the filesystem
+    /// supplied it. Only the TrueNAS fork passes the field through
+    /// `cp_statx` (under `CONFIG_TRUENAS`, fs/stat.c), and only a filesystem
+    /// that sets `kstat->gen` fills it: ZFS does, from `i_generation`
+    /// (`zpl_getattr_impl`, module/os/linux/zfs/zpl_inode.c). That is the
+    /// creation txg truncated to 32 bits - the generation a ZFS file handle
+    /// carries, before `zfs_fid` remaps a zero to one.
+    pub fn generation(&self) -> Option<u64> {
+        self.mask()
+            .contains(StatxMask::GEN)
+            .then_some(self.0.stx_gen)
     }
 
     /// Last access time.
