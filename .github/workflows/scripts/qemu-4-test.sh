@@ -172,6 +172,11 @@ export TRUENAS_ROS_REQUIRE_FHANDLE=1
 # for samba. This VM boots that kernel, so the cookie test must run rather
 # than skip - it is the only place in CI where it can.
 export TRUENAS_ROS_REQUIRE_CHANGE_COOKIE=1
+# STATX_GEN is the same shape twice over: the fork's `cp_statx` passes
+# `stx_gen` through under CONFIG_TRUENAS, and only a filesystem that sets
+# `kstat->gen` fills it - the ZFS fork does, in `zpl_getattr_impl`. This VM
+# boots the paired kernel and module, so the generation test must run.
+export TRUENAS_ROS_REQUIRE_STATX_GEN=1
 # The audit suite sends REAL records over NETLINK_AUDIT. It tolerates three
 # environments - no socket, a socket without CAP_AUDIT_WRITE, and the real
 # thing - and only the third tests anything. This VM is the only place that
