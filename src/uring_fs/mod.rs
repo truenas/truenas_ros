@@ -110,6 +110,9 @@
 //! - **Blocking tails** ([`FsConn::offload_result`]) operate on the open
 //!   [`File`] too: it is [`AsFd`], so a pool job makes blocking fd-based
 //!   calls on it - descriptors, never names.
+//! - **[`File::from_fd`]** takes a descriptor opened outside the reactor,
+//!   such as one a pool job opened by file handle, so the ops above can use
+//!   it. It carries the access of its opener, not that of a personality.
 //!
 //! # Building on top: durable create, confinement, server-owned metadata
 //!
@@ -1095,6 +1098,21 @@ impl File {
         File { fd }
     }
 
+    /// Wrap a descriptor opened outside the reactor, so the reactor's
+    /// fd-based ops can take it. It may name any kind of file, and unlike
+    /// [`Anchor::from_fd`] it checks nothing.
+    ///
+    /// The descriptor carries the access it was opened with, not that of
+    /// any [`Personality`]. A read or write checks only the open mode
+    /// (`io_rw_init_file` in `io_uring/rw.c`), so one through a descriptor
+    /// opened with more privilege than the requester holds is not refused.
+    /// An op that checks access when it runs, such as
+    /// [`fgetxattr`](FsHandle::fgetxattr), checks the personality it is
+    /// submitted under. Deciding who may use the file is the caller's job.
+    pub fn from_fd(fd: OwnedFd) -> File {
+        File::new(Arc::new(fd))
+    }
+
     /// The underlying raw descriptor. It stays valid for at least this handle's
     /// lifetime; the reactor independently keeps it open across any op it holds.
     pub fn as_raw_fd(&self) -> RawFd {
@@ -1102,13 +1120,18 @@ impl File {
     }
 }
 
-/// Borrow the file's descriptor - what lets a pool job
-/// ([`FsConn::offload_result`]) run blocking fd-based calls
+/// Borrow the file's descriptor, so a pool job
+/// ([`FsConn::offload_result`]) can run blocking fd-based calls
 /// ([`statx`](crate::sync_fs::statx),
-/// [`fgetxattr`](crate::sync_fs::xattr::fgetxattr)) against a descriptor the
-/// ring opened under a [`Personality`]: the access decision was made at that
-/// open, so an fd-based call needs no identity re-attached. The `File` (or a
+/// [`fgetxattr`](crate::sync_fs::xattr::fgetxattr)) on it. The `File` (or a
 /// clone) keeps the fd open for at least the borrow.
+///
+/// Access was decided by whoever opened the descriptor. For a `File` the
+/// ring opened, that was the open under a [`Personality`]. For one from
+/// [`File::from_fd`], it was the caller's own open. A pool job runs at the
+/// process's own credentials, so a call that checks access when it runs
+/// checks those and not the requester's. Reading a ZFS NFSv4 ACL is such a
+/// call (`__zpl_xattr_nfs41acl_get` checks `ACE_READ_ACL`).
 impl AsFd for File {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()

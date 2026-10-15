@@ -529,6 +529,28 @@ fn fstatx_reports_open_file_metadata() {
     });
 }
 
+/// A descriptor opened outside the reactor serves its fd-based ops once
+/// wrapped. The ring's statx sees the inode a blocking stat sees, and a
+/// ring read gives back the bytes.
+#[test]
+fn a_descriptor_opened_outside_the_ring_serves_its_ops_once_wrapped() {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        let path = dir.join("outside.bin");
+        std::fs::write(&path, b"from outside").unwrap();
+        let ino = std::fs::metadata(&path).unwrap().ino();
+        let fd = std::fs::File::open(&path).unwrap().into();
+        let f = File::from_fd(fd);
+        let st = h
+            .fstatx(me, &f, AtFlags::empty(), StatxMask::INO)
+            .expect("fstatx");
+        assert_eq!(st.ino(), ino);
+        let (n, buf) = pread1(&h, me, &f, vec![0u8; 12], 0);
+        assert_eq!(n.expect("read"), 12);
+        assert_eq!(&buf[..12], b"from outside");
+        h.close(f).expect("close");
+    });
+}
+
 /// A `resolve` that only *hardens* must not also un-confine. `open` applies
 /// the full `CONFINED_RESOLVE` and lets a caller replace it, but only by
 /// naming a policy (`RESOLVE_BENEATH`, `RESOLVE_IN_ROOT`); a request for
@@ -4339,6 +4361,90 @@ fn change_cookie_moves_on_writes_and_not_on_reads() {
         );
 
         h.close(f).expect("close");
+    });
+}
+
+/// A file opened by handle outside the ring and wrapped answers the ring's
+/// statx with the object number and generation its handle carries, and a
+/// ring read gives back its bytes.
+///
+/// Runs on a **ZFS dataset**, since the fid layout checked is the one
+/// `zfs_fid` writes. `open_by_handle_at` needs `CAP_DAC_READ_SEARCH`
+/// (`may_decode_fh`, fs/fhandle.c), so it runs only as root. Three gates
+/// are armed in the QEMU job, `TRUENAS_ROS_REQUIRE_ZFS` for the dataset,
+/// `TRUENAS_ROS_REQUIRE_FHANDLE` for the open and
+/// `TRUENAS_ROS_REQUIRE_STATX_GEN` for the generation.
+#[cfg(feature = "fhandle")]
+#[test]
+fn a_file_opened_by_handle_serves_ring_ops_once_wrapped() {
+    use std::os::fd::AsFd;
+    use truenas_ros::sync_fs::fhandle::{FhFlags, name_to_handle_at};
+
+    let Some(ds) = zfs_dir_or_skip() else {
+        return;
+    };
+    with_fs(test_cfg(), |h, me, _dir, _stop| {
+        let path = ds.join(format!("rostest_from_fd_{}", std::process::id()));
+        std::fs::write(&path, b"by handle").unwrap();
+        let handle = name_to_handle_at(
+            truenas_ros::AT_FDCWD,
+            &path,
+            FhFlags::AT_HANDLE_MNT_ID_UNIQUE,
+        )
+        .expect("name_to_handle_at");
+        let mount = std::fs::File::open(&ds).unwrap();
+        let fd = match handle.open(mount.as_fd(), OFlag::O_RDONLY) {
+            Ok(fd) => fd,
+            Err(Error::Errno(
+                e @ (Errno::EPERM | Errno::EACCES | Errno::ENOSYS),
+            )) => {
+                std::fs::remove_file(&path).unwrap();
+                assert!(
+                    std::env::var_os("TRUENAS_ROS_REQUIRE_FHANDLE").is_none(),
+                    "TRUENAS_ROS_REQUIRE_FHANDLE is set but \
+                     open_by_handle_at failed with {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("open_by_handle_at failed with {e}"),
+        };
+        let f = File::from_fd(fd);
+        let st =
+            h.fstatx(me, &f, AtFlags::empty(), StatxMask::INO | StatxMask::GEN);
+        let (n, buf) = pread1(&h, me, &f, vec![0u8; 9], 0);
+        h.close(f).expect("close");
+        std::fs::remove_file(&path).unwrap();
+        let st = st.expect("fstatx");
+        assert_eq!(n.expect("read"), 9);
+        assert_eq!(&buf[..9], b"by handle");
+
+        // `zfs_fid`'s short form, after the eight byte `struct file_handle`
+        // head. It is a `u16` length of ten, the object number in six little
+        // endian bytes, then the generation in four with a zero remapped to
+        // one.
+        let raw = handle.to_bytes();
+        let fid = &raw[8..];
+        assert_eq!(fid.len(), 12, "{raw:02x?}");
+        let mut object = [0u8; 8];
+        object[..6].copy_from_slice(&fid[2..8]);
+        assert_eq!(u64::from_le_bytes(object), st.ino());
+        let Some(generation) = st.generation() else {
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_GEN").is_none(),
+                "TRUENAS_ROS_REQUIRE_STATX_GEN is set but the dataset at {} \
+                 reports none through the ring",
+                ds.display()
+            );
+            return;
+        };
+        let in_handle = u32::from_le_bytes([fid[8], fid[9], fid[10], fid[11]]);
+        assert_eq!(
+            match generation as u32 {
+                0 => 1,
+                low => low,
+            },
+            in_handle
+        );
     });
 }
 
