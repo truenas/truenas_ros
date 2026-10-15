@@ -164,7 +164,8 @@ export TRUENAS_ROS_REQUIRE_ROOT=1
 # fs/fhandle.c) and `name_to_handle_at` needs a filesystem that encodes
 # handles - ZFS registers `zpl_export_operations` with `.encode_fh`
 # (module/os/linux/zfs/zpl_export.c), and this job is root, so both hold.
-# One test in the whole tree drives that round trip; force it to run.
+# Two tests drive that round trip, one in /tmp and one on the ZFS dataset
+# that wraps the opened file for the ring. Force both to run.
 export TRUENAS_ROS_REQUIRE_FHANDLE=1
 # STATX_CHANGE_COOKIE reaches userspace only on this fork: upstream strips
 # it in `cp_statx` and clears it from the request mask ("kernel-only for

@@ -761,9 +761,9 @@ mod fhandle {
     /// Two distinct causes end this test early - a filesystem that cannot
     /// encode a handle, and a caller without `CAP_DAC_READ_SEARCH` for
     /// `open_by_handle_at` (`may_decode_fh`, fs/fhandle.c) - and both leave
-    /// the reopen unasserted. This is the only test in the tree that calls
-    /// that syscall, so an ungated skip means the feature's end-to-end path
-    /// is covered nowhere.
+    /// the reopen unasserted. Only this test and one on ZFS in
+    /// `test/uring_fs.rs` call that syscall, so an ungated skip here leaves
+    /// the path off ZFS covered nowhere.
     #[track_caller]
     fn refusal_is_allowed(what: &str, err: impl std::fmt::Display) {
         assert!(
