@@ -18,7 +18,8 @@
 //! umbrella modules: [`sync_fs`] (blocking fs bindings - features `sync-fs`,
 //! `xattr`, `acl`, `fhandle`, `fsiter`, `shutil`), [`mount`] (mount topology
 //! and idmapped-mount support - features `mount`, `idmap`), [`configfile`],
-//! [`audit`] (kernel audit records over `NETLINK_AUDIT`), the io_uring `net`
+//! [`audit`] (kernel audit records over `NETLINK_AUDIT`), [`log`](mod@log)
+//! (a daemon's log, sent to the journal without blocking), the io_uring `net`
 //! stack (`net-core`/`net-server`/`net-client`) with the [`http`] codec over
 //! it (`http`), the io_uring fs reactor [`uring_fs`] (`uring-fs`), and two
 //! pieces for a daemon's `main`: [`secrets`] (`memfd_secret`-backed memory,
@@ -87,6 +88,9 @@ pub mod configfile;
 
 #[cfg(feature = "audit")]
 pub mod audit;
+
+#[cfg(feature = "log")]
+pub mod log;
 
 #[cfg(feature = "secrets")]
 pub mod secrets;

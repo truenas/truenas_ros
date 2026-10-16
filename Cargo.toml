@@ -86,6 +86,7 @@ default = [
     "shutil",
     "configfile",
     "audit",
+    "log",
 ]
 
 # Blocking filesystem bindings (the `sync_fs` umbrella): `sync-fs` is the base
@@ -110,6 +111,12 @@ configfile = ["sync-fs"]
 # can block on kernel-audit backpressure, and shedding that load is the
 # embedding application's policy — see the module docs.
 audit = []
+# A daemon's log (`src/log`), a record with a level and named fields, a
+# `Logger` handle passed to the code that reports, and the journal transport,
+# which sends each record to journald as one datagram that never blocks and
+# counts a record it cannot send. Standalone and dependency-free, so it rides
+# in `default` like `audit`.
+log = []
 # `memfd_secret(2)`-backed protected memory for long-lived in-process secrets
 # (`src/secrets.rs`): pages removed from the kernel direct map, kept off swap,
 # and absent from core dumps, plus a fail-closed availability probe and a
@@ -192,6 +199,7 @@ full = [
     "shutil",
     "configfile",
     "audit",
+    "log",
     "signal",
     "net-server",
     "net-client",
