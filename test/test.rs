@@ -562,10 +562,24 @@ mod fanotify {
         }
     }
 
+    /// Hold a refusal for want of privilege to `TRUENAS_ROS_REQUIRE_ROOT`,
+    /// so a root run that is refused fails where an unprivileged one skips.
+    #[track_caller]
+    fn refusal_is_allowed(what: &str, e: Errno) {
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_ROOT").is_none(),
+            "TRUENAS_ROS_REQUIRE_ROOT is set but {what} failed with {e}"
+        );
+    }
+
     /// A group that marks the mount namespace sees a mount attached and
     /// then detached, each naming the unique mount ID statx gives.
     ///
-    /// Mount events need `CAP_SYS_ADMIN`, so it skips unless
+    /// An unprivileged process may make a group that reports mounts, but
+    /// the group is marked `FANOTIFY_UNPRIV` and refused any mark but an
+    /// inode's without `CAP_SYS_ADMIN` (`fanotify_init` and
+    /// `do_fanotify_mark` in `fs/notify/fanotify/fanotify_user.c`). So the
+    /// refusal comes at the mark, and the test skips there unless
     /// `TRUENAS_ROS_REQUIRE_ROOT` says a root run must reach it.
     #[test]
     fn a_mount_namespace_mark_sees_attach_and_detach() {
@@ -575,23 +589,22 @@ mod fanotify {
         ) {
             Ok(group) => group,
             Err(e @ (Errno::EPERM | Errno::EINVAL)) => {
-                assert!(
-                    std::env::var_os("TRUENAS_ROS_REQUIRE_ROOT").is_none(),
-                    "TRUENAS_ROS_REQUIRE_ROOT is set but fanotify_init \
-                     failed with {e}"
-                );
-                return;
+                return refusal_is_allowed("fanotify_init", e);
             }
             Err(e) => panic!("fanotify_init failed with {e}"),
         };
         let ns = std::fs::File::open("/proc/self/ns/mnt").unwrap();
-        group
-            .mark(
-                MarkFlags::ADD | MarkFlags::MNTNS,
-                EventMask::MNT_ATTACH | EventMask::MNT_DETACH,
-                &ns,
-            )
-            .expect("mark of the mount namespace");
+        match group.mark(
+            MarkFlags::ADD | MarkFlags::MNTNS,
+            EventMask::MNT_ATTACH | EventMask::MNT_DETACH,
+            &ns,
+        ) {
+            Ok(()) => {}
+            Err(e @ Errno::EPERM) => {
+                return refusal_is_allowed("the mark of the namespace", e);
+            }
+            Err(e) => panic!("the mark of the namespace failed with {e}"),
+        }
 
         let fs = fsopen("tmpfs", FsopenFlags::empty()).expect("fsopen");
         fsconfig(fs.as_fd(), FsConfig::Create).expect("fsconfig");
@@ -631,12 +644,7 @@ mod fanotify {
         let group = match Fanotify::init(InitFlags::NONBLOCK, OFlag::O_RDONLY) {
             Ok(group) => group,
             Err(e @ Errno::EPERM) => {
-                assert!(
-                    std::env::var_os("TRUENAS_ROS_REQUIRE_ROOT").is_none(),
-                    "TRUENAS_ROS_REQUIRE_ROOT is set but fanotify_init \
-                     failed with {e}"
-                );
-                return;
+                return refusal_is_allowed("fanotify_init", e);
             }
             Err(e) => panic!("fanotify_init failed with {e}"),
         };

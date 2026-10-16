@@ -53,7 +53,8 @@ tn_bitflags! {
         /// An fd the kernel could not open is reported as a negative errno.
         REPORT_FD_ERROR = 0x0000_2000;
         /// The group reports mount events of a mount namespace and nothing
-        /// else.
+        /// else. Making it needs no privilege, and marking the namespace
+        /// needs `CAP_SYS_ADMIN`.
         REPORT_MNT = 0x0000_4000;
     }
 }
@@ -238,7 +239,14 @@ impl Fanotify {
     ///
     /// `event_flags` are the open flags of the descriptor an event carries
     /// when the group reports neither FIDs nor mounts, and `O_CLOEXEC` is
-    /// added to them. Most groups need `CAP_SYS_ADMIN`.
+    /// added to them.
+    ///
+    /// A group that reports FIDs or mounts may be made without
+    /// `CAP_SYS_ADMIN`, and any other group or flag of
+    /// `FANOTIFY_ADMIN_INIT_FLAGS` needs it (`fanotify_init` in
+    /// `fs/notify/fanotify/fanotify_user.c`). A group made without it may
+    /// then mark only inodes, so one that reports mounts is refused its
+    /// mark of the namespace with `EPERM`.
     pub fn init(
         flags: InitFlags,
         event_flags: OFlag,
@@ -257,6 +265,10 @@ impl Fanotify {
     /// Change the mark on the object `fd` names itself, as the nsfs file of
     /// a mount namespace for [`MarkFlags::MNTNS`] (`fanotify_mark(2)` with
     /// no path).
+    ///
+    /// A mark of a mount, a file system or a mount namespace needs
+    /// `CAP_SYS_ADMIN` in the user namespace the group was made in
+    /// (`do_fanotify_mark`), and fails with `EPERM` without it.
     pub fn mark<Fd: AsFd>(
         &self,
         flags: MarkFlags,
