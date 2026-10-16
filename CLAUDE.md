@@ -605,7 +605,7 @@ cargo "+$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" \
 # loop both report success past a failure in the middle of the list.
 cargo clippy --no-default-features --all-targets -- -D warnings
 for f in sync-fs xattr mount acl fhandle fanotify fsiter idmap shutil \
-         configfile audit secrets signal uring net-core net-server \
+         configfile audit log secrets signal uring net-core net-server \
          net-client uring-fs http ws __fuzz; do
   cargo clippy --no-default-features --features "$f" \
     --all-targets -- -D warnings || exit 1

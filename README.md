@@ -39,6 +39,7 @@ truenas_ros = { version = "0.1", default-features = false, features = ["sync-fs"
 | `shutil` | metadata-preserving recursive `copytree` + copy / clone primitives |
 | `configfile` | INI config files byte-for-byte compatible with Python's `configparser`, read symlink-safely and written atomically; an opt-in scrub-on-release mode for secret-bearing files (with `secrets`, the file image stages in `memfd_secret` memory) |
 | `audit` | Kernel audit records over `NETLINK_AUDIT` - PAM-shaped `key=value` events sent straight to `auditd`, replacing libaudit |
+| `log` | A daemon's log - records with a level and named fields, a `Logger` handle passed to the code that reports, and a journal transport that sends each record to journald as one datagram that never blocks, or a line to stderr outside systemd |
 
 Three more are opt-in. An io_uring stack lives alongside the blocking
 bindings: `net-server` / `net-client` (stream roles over a shared reactor

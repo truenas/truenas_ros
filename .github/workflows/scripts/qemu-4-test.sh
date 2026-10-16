@@ -185,6 +185,12 @@ export TRUENAS_ROS_REQUIRE_STATX_GEN=1
 # so records are actually accepted. Unprivileged ci.yml can only reach the
 # EPERM tolerance, which is why the gate is armed here and not there.
 export TRUENAS_ROS_REQUIRE_AUDIT=1
+# The journal suite sends REAL records to journald and reads them back with
+# journalctl, and runs itself as a service through systemd-run to see
+# JOURNAL_STREAM chosen. This VM boots systemd and the job is root, so all of
+# it runs here. The unprivileged ci.yml may read none of the journal and
+# cannot start a service, which is why the gate is armed here and not there.
+export TRUENAS_ROS_REQUIRE_JOURNAL=1
 # The fsiter birth-time cutoff is skipped wholesale on a filesystem that
 # reports no btime. ZFS records one (crtime) and so does tmpfs, so both
 # scratch filesystems in this VM report it: force the cutoff assertion to
