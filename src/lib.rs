@@ -73,6 +73,7 @@ pub use tempdir::{TempDir, tempdir};
     feature = "xattr",
     feature = "acl",
     feature = "fhandle",
+    feature = "fanotify",
     feature = "fsiter",
     feature = "shutil"
 ))]

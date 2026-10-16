@@ -1,10 +1,10 @@
 # Fuzz harnesses for every decoder in the library that eats bytes it did not
 # write: the net stack's framing, the http codec, the NFSv4/POSIX.1e ACL wire
-# formats, the INI parser, the statmount reply, the file-handle and resume-
-# cursor codecs, the audit record encoder, the path checks, and the credential
-# broker's request header. A separate, unpublished dev-only crate (like the
-# kTLS test deps): it does NOT touch the library's libc+bitflags charter or its
-# 1.98 MSRV. Run with a nightly toolchain:
+# formats, the INI parser, the statmount reply, the fanotify events, the
+# file-handle and resume-cursor codecs, the audit record encoder, the path
+# checks, and the credential broker's request header. A separate, unpublished
+# dev-only crate (like the kTLS test deps): it does NOT touch the library's
+# libc+bitflags charter or its 1.98 MSRV. Run with a nightly toolchain:
 #   cargo +nightly fuzz run framer_length_prefix
 #   cargo +nightly fuzz run tree_cursor -- -dict=dicts/tree_cursor.dict
 # No corpus is checked in; regressions live in the library's own tests. See
@@ -108,6 +108,13 @@ bench = false
 [[bin]]
 name = "fhandle_bytes"
 path = "fuzz_targets/fhandle_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fanotify_events"
+path = "fuzz_targets/fanotify_events.rs"
 test = false
 doc = false
 bench = false
