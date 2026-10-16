@@ -37,6 +37,8 @@ mod zfsattr;
 
 #[cfg(feature = "acl")]
 pub mod acl;
+#[cfg(feature = "fanotify")]
+pub mod fanotify;
 #[cfg(feature = "fhandle")]
 pub mod fhandle;
 #[cfg(feature = "fsiter")]

@@ -33,6 +33,7 @@ truenas_ros = { version = "0.1", default-features = false, features = ["sync-fs"
 | `mount` | `statmount`, `listmount`, `iter_mount`, `open_tree`, `move_mount`, `mount_setattr`, `fsopen` / `fsconfig` / `fsmount`, `umount2`; higher-level `statmount_path`, `iter_mountinfo`, `umount` |
 | `acl` | NFS4 (`system.nfs4_acl_xdr`) and POSIX1E ACLs - decode / encode / validate + `fgetacl` / `fsetacl` |
 | `fhandle` | `name_to_handle_at` / `open_by_handle_at` (`FileHandle`) |
+| `fanotify` | `fanotify_init` / `fanotify_mark` notification groups (`Fanotify`) and a parser of the events a read returns, mount events included |
 | `fsiter` | single-filesystem depth-first `Iterator` yielding owned entries |
 | `idmap` | idmapped-mount user namespaces via `clone3` (`create_idmap_userns`, cached `idmap_userns`) - lives at `mount::idmap` |
 | `shutil` | metadata-preserving recursive `copytree` + copy / clone primitives |
