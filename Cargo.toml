@@ -264,6 +264,15 @@ path = "test/secrets.rs"
 name = "audit"
 path = "test/audit.rs"
 
+# The log feature's journal transport against the real journald. Sends records
+# to the journal's own socket, reads them back with `journalctl`, and runs
+# itself as a service to see `JOURNAL_STREAM` chosen. Skips without journald,
+# or when this user cannot read the journal, and TRUENAS_ROS_REQUIRE_JOURNAL=1
+# makes that a hard failure.
+[[test]]
+name = "journal"
+path = "test/journal.rs"
+
 # io_uring stream server. Live loopback tests; skip automatically when io_uring
 # is unavailable (sandbox/old kernel). Set TRUENAS_ROS_REQUIRE_IO_URING=1 to
 # make that a hard failure instead.
