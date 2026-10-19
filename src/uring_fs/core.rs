@@ -3915,6 +3915,72 @@ impl<'a> FsConn<'a> {
         );
     }
 
+    /// Open the parent of the directory `anchor` names, as `who`, and fire
+    /// `on_done` with it ([`FsDone::file`]). It is the one open that leaves
+    /// its anchor, and it goes up one level and no further, since it takes
+    /// no path and opens only `..`.
+    ///
+    /// [`open`](Self::open) cannot reach a parent. `RESOLVE_BENEATH` answers
+    /// `..` at the anchor with `EXDEV`, `RESOLVE_IN_ROOT` keeps it at the
+    /// anchor (`follow_dotdot` in `fs/namei.c`), and [`Leaf`] refuses `..`.
+    /// So this open drops the scope and keeps the rest of
+    /// [`CONFINED_RESOLVE`], which is `RESOLVE_NO_SYMLINKS` and
+    /// `RESOLVE_NO_XDEV`.
+    ///
+    /// - The kernel checks that `who` may search the directory before it
+    ///   looks up `..` (`may_lookup` in `link_path_walk`), as it does for
+    ///   any name in it. The parent is then opened as `how` asks, so an
+    ///   `O_PATH` open needs nothing of the parent itself.
+    /// - At the top of a mount the parent is on another file system, and
+    ///   the open answers `EXDEV` rather than cross to it (`follow_dotdot`).
+    ///   The parent of the process's root is that root, as for any `..`.
+    /// - The parent comes from the dentry cache (`dget_parent` in
+    ///   `follow_dotdot`), so a directory that moved answers its new
+    ///   parent. With no scope there is no check for a rename racing the
+    ///   walk (`handle_dots`), so `EXDEV` here always means the top of a
+    ///   mount.
+    ///
+    /// A `how` that creates (`O_CREAT` or `O_TMPFILE`) or states a scope
+    /// (`RESOLVE_BENEATH` or `RESOLVE_IN_ROOT`) is refused before this
+    /// returns, with the marked `EINVAL` that [`open`](Self::open) gives. A
+    /// create would make a file in the parent, `RESOLVE_BENEATH` would
+    /// always answer `EXDEV`, and `RESOLVE_IN_ROOT` would answer the
+    /// directory itself.
+    pub fn open_parent<F>(
+        &mut self,
+        who: Personality,
+        anchor: &Anchor,
+        how: OpenHow,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        // `O_TMPFILE` carries `O_DIRECTORY`, so only its other half marks a
+        // create, as in `mkdir_path`.
+        const TMPFILE_ONLY: i32 = libc::O_TMPFILE & !libc::O_DIRECTORY;
+        let mut raw = how.to_raw();
+        let creates = raw.flags & (libc::O_CREAT | TMPFILE_ONLY) as u64 != 0;
+        if creates || raw.resolve & super::CONFINEMENT_POLICY.bits() != 0 {
+            return on_done(FsDone::refused(Errno::EINVAL), self);
+        }
+        raw.resolve |= CONFINED_RESOLVE
+            .difference(crate::sync_fs::ResolveFlag::RESOLVE_BENEATH)
+            .bits();
+        // `..` is always a directory, so no special file can make the open
+        // block, and no guard rides it (`apply_special_file_guard`).
+        let w = self.waiter(on_done);
+        self.fs.submit_open(
+            self.eng,
+            who.0,
+            anchor.clone(),
+            c"..".to_owned(),
+            raw,
+            false,
+            None,
+            w,
+        );
+    }
+
     /// Create every missing directory along `path` beneath `anchor` as
     /// `who`, then open the deepest one with `how` - `mkdir -p`,
     /// confined, on the ring. The reactor twin of
@@ -6135,6 +6201,61 @@ mod hybrid_tests {
         );
     }
 
+    /// Open the parent of `at` as `me` with `how`, and give back what the
+    /// open answered.
+    fn parent_of(at: Anchor, how: OpenHow) -> FsDone {
+        let (mut eng, mut fs, me) = setup();
+        let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
+        let g2 = got.clone();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                c.open_parent(me, &at, how, move |res, _c| {
+                    *g2.borrow_mut() = Some(res);
+                });
+            },
+            || got.borrow().is_some(),
+        );
+        got.borrow_mut().take().expect("answered")
+    }
+
+    /// The parent is the one the directory has now, so a directory that
+    /// moved answers the directory it moved into.
+    #[test]
+    fn the_parent_of_a_moved_directory_is_where_it_went() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = nested();
+        std::fs::create_dir(dir.path().join("c")).expect("mkdir");
+        let at = Anchor::open(&dir.path().join("a/b")).expect("anchor");
+        std::fs::rename(dir.path().join("a/b"), dir.path().join("c/b"))
+            .expect("rename");
+        let done = parent_of(at, OpenHow::new().flags(OFlag::O_PATH));
+        let file = done.file().expect("the parent opens");
+        let st = crate::sync_fs::statx(
+            &file,
+            "",
+            AtFlags::AT_EMPTY_PATH,
+            StatxMask::INO,
+        )
+        .expect("statx");
+        let went = std::fs::metadata(dir.path().join("c")).expect("stat");
+        assert_eq!(st.ino(), went.ino(), "the parent is c, not a");
+    }
+
+    /// The parent of the top of a mount is on another file system, so the
+    /// open answers `EXDEV` and never opens the directory under the mount.
+    #[test]
+    fn a_parent_open_stops_at_the_top_of_a_mount() {
+        let at = Anchor::open("/proc").expect("anchor");
+        let done = parent_of(at, OpenHow::new().flags(OFlag::O_PATH));
+        assert!(
+            matches!(done.result(), Err(crate::Error::Errno(Errno::EXDEV))),
+            "{:?}",
+            done.result()
+        );
+    }
+
     /// The step that cannot be written before the chain starts: a name
     /// computed from the directory the previous step opened.
     #[test]
@@ -6616,6 +6737,36 @@ mod hybrid_tests {
                 how,
                 move |res, _c| *g2.borrow_mut() = Some(res),
             );
+            refused(what, got);
+        }
+
+        for (what, how) in [
+            (
+                "a creating open_parent",
+                OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_CREAT),
+            ),
+            (
+                "an open_parent of a new unnamed file",
+                OpenHow::new().flags(OFlag::O_RDWR | OFlag::O_TMPFILE),
+            ),
+            (
+                "an open_parent scoped beneath its anchor",
+                OpenHow::new()
+                    .flags(OFlag::O_PATH)
+                    .resolve(crate::sync_fs::ResolveFlag::RESOLVE_BENEATH),
+            ),
+            (
+                "an open_parent scoped to a root",
+                OpenHow::new()
+                    .flags(OFlag::O_PATH)
+                    .resolve(crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT),
+            ),
+        ] {
+            let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
+            let g2 = got.clone();
+            c.open_parent(me, &at, how, move |res, _c| {
+                *g2.borrow_mut() = Some(res);
+            });
             refused(what, got);
         }
 

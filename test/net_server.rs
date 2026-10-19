@@ -9949,6 +9949,140 @@ fn fs_broker_personality_gates_open() {
     );
 }
 
+/// A parent open checks that the caller may search the directory it starts
+/// from, as any lookup in it does, and asks nothing of the parent itself
+/// when it opens `O_PATH`. In a root-owned `0700` tree a peer is refused the
+/// parent of a `0700` directory and given the parent of a `0755` one, and
+/// the daemon is given both.
+///
+/// Root-only, since the broker needs `CAP_SETUID` to become the peer.
+/// Skipped otherwise.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn fs_parent_open_needs_search_on_the_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::OnceLock;
+    use truenas_ros::errno::Errno;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, AsUser, CredBroker, Personality};
+
+    if !root_or_skip("fs_parent_open_needs_search_on_the_directory") {
+        return;
+    }
+    const NOBODY_UID: u32 = 65_534;
+    const NOBODY_GID: u32 = 65_534;
+
+    let dir = truenas_ros::tempdir().unwrap();
+    for (name, mode) in [("locked", 0o700), ("open", 0o755)] {
+        let path = dir.path().join(name);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .unwrap();
+    }
+    let anchors = (
+        Anchor::open(&dir.path().join("locked")).expect("anchor"),
+        Anchor::open(&dir.path().join("open")).expect("anchor"),
+    );
+
+    let cell: Arc<OnceLock<(Personality, Personality)>> =
+        Arc::new(OnceLock::new());
+    let pc = Arc::clone(&cell);
+    let body = move |mut req: Request<'_, ()>| -> Response {
+        let cmd = req.body.take();
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let (root_pers, peer_pers) =
+            *pc.get().expect("personalities set before serving");
+        let who = if cmd.starts_with(b"root") {
+            root_pers
+        } else {
+            peer_pers
+        };
+        let anchor = if cmd.ends_with(b"locked") {
+            &anchors.0
+        } else {
+            &anchors.1
+        };
+        let how = OpenHow::new().flags(OFlag::O_PATH);
+        fs.open_parent(who, anchor, how, move |done, _fs| {
+            let answer = match done.result() {
+                Ok(_) => "opened".to_owned(),
+                Err(truenas_ros::Error::Errno(Errno::EACCES)) => {
+                    "denied".to_owned()
+                }
+                Err(e) => format!("{e}"),
+            };
+            deferred.reply(echo_frame(answer.as_bytes()));
+        });
+        Response::Defer(permit)
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let cfg = ServerConfig {
+        pool_size: 8,
+        fs_ops: 16,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    // The ring must exist before the broker forks, since the broker
+    // inherits its fd, and the broker must fork before any thread starts.
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    let root_pers = server.register_self().expect("register_self");
+    let broker = match CredBroker::spawn(&[&server]) {
+        Ok(b) => b,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("CredBroker::spawn: {e}"),
+    };
+    let creds = broker.handle(0).expect("broker handle");
+    let peer_pers = creds
+        .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
+        .expect("register peer");
+    cell.set((root_pers, peer_pers)).unwrap();
+
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<Vec<Vec<u8>>> {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let mut s = connect_tcp(v4)?;
+        let mut answers = Vec::new();
+        for cmd in [&b"peer locked"[..], b"peer open", b"root locked"] {
+            send_framed(&mut s, cmd)?;
+            answers.push(recv_framed(&mut s)?);
+        }
+        drop(s);
+        stop.shutdown();
+        Ok(answers)
+    });
+    server.serve_forever().expect("serve_forever broker");
+    let answers = client.join().unwrap().expect("client io");
+
+    let text: Vec<String> = answers
+        .iter()
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    assert_eq!(
+        text,
+        ["denied", "opened", "opened"],
+        "the peer may not search locked, may search open and needs nothing \
+         of their 0700 parent, and the daemon opens what the peer may not"
+    );
+}
+
 /// `open_chain`'s whole point: a directory the caller could never
 /// traverse, opened as the daemon, with the file inside it still gated
 /// on the caller.
