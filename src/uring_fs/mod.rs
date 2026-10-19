@@ -133,6 +133,8 @@
 //!   [`mkdir_path`](FsHandle::mkdir_path) creates a nested path the only sound
 //!   way - alternating confined walks with single-[`Leaf`] `mkdirat`s, because
 //!   `mkdirat` itself honours no resolve flags.
+//!   [`FsConn::open_parent`] is the one open that leaves its anchor. It goes
+//!   up one level to the parent, as the caller, and never across a mount.
 //! - **Split-credential descent.** [`FsConn::open_chain`] opens a
 //!   sequence of paths, each relative to the one before it and each
 //!   under **its own personality** - so a file inside a tree only the
