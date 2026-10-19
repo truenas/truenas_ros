@@ -9953,7 +9953,7 @@ fn fs_broker_personality_gates_open() {
 /// from, as any lookup in it does, and asks nothing of the parent itself
 /// when it opens `O_PATH`. In a root-owned `0700` tree a peer is refused the
 /// parent of a `0700` directory and given the parent of a `0755` one, and
-/// the daemon is given both.
+/// the daemon is given both. The open across a mount is refused the same.
 ///
 /// Root-only, since the broker needs `CAP_SETUID` to become the peer.
 /// Skipped otherwise.
@@ -9964,7 +9964,9 @@ fn fs_parent_open_needs_search_on_the_directory() {
     use std::sync::OnceLock;
     use truenas_ros::errno::Errno;
     use truenas_ros::sync_fs::{OFlag, OpenHow};
-    use truenas_ros::uring_fs::{Anchor, AsUser, CredBroker, Personality};
+    use truenas_ros::uring_fs::{
+        Anchor, AsUser, CredBroker, FsConn, FsDone, Personality,
+    };
 
     if !root_or_skip("fs_parent_open_needs_search_on_the_directory") {
         return;
@@ -9995,18 +9997,19 @@ fn fs_parent_open_needs_search_on_the_directory() {
         };
         let (root_pers, peer_pers) =
             *pc.get().expect("personalities set before serving");
-        let who = if cmd.starts_with(b"root") {
+        let who = if cmd.ends_with(b"as root") {
             root_pers
         } else {
             peer_pers
         };
-        let anchor = if cmd.ends_with(b"locked") {
+        let anchor = if cmd.starts_with(b"locked") || cmd.starts_with(b"across")
+        {
             &anchors.0
         } else {
             &anchors.1
         };
         let how = OpenHow::new().flags(OFlag::O_PATH);
-        fs.open_parent(who, anchor, how, move |done, _fs| {
+        let then = move |done: FsDone, _fs: &mut FsConn<'_>| {
             let answer = match done.result() {
                 Ok(_) => "opened".to_owned(),
                 Err(truenas_ros::Error::Errno(Errno::EACCES)) => {
@@ -10015,7 +10018,12 @@ fn fs_parent_open_needs_search_on_the_directory() {
                 Err(e) => format!("{e}"),
             };
             deferred.reply(echo_frame(answer.as_bytes()));
-        });
+        };
+        if cmd.starts_with(b"across") {
+            fs.open_parent_across_mount(who, anchor, how, then);
+        } else {
+            fs.open_parent(who, anchor, how, then);
+        }
         Response::Defer(permit)
     };
     let protocol = Protocol {
@@ -10060,7 +10068,9 @@ fn fs_parent_open_needs_search_on_the_directory() {
         let _stop = ShutdownOnDrop(stop.clone());
         let mut s = connect_tcp(v4)?;
         let mut answers = Vec::new();
-        for cmd in [&b"peer locked"[..], b"peer open", b"root locked"] {
+        let cmds =
+            [&b"locked"[..], b"open", b"locked as root", b"across locked"];
+        for cmd in cmds {
             send_framed(&mut s, cmd)?;
             answers.push(recv_framed(&mut s)?);
         }
@@ -10077,9 +10087,10 @@ fn fs_parent_open_needs_search_on_the_directory() {
         .collect();
     assert_eq!(
         text,
-        ["denied", "opened", "opened"],
+        ["denied", "opened", "opened", "denied"],
         "the peer may not search locked, may search open and needs nothing \
-         of their 0700 parent, and the daemon opens what the peer may not"
+         of their 0700 parent, the daemon opens what the peer may not, and \
+         the open across a mount checks the peer the same"
     );
 }
 
