@@ -3955,6 +3955,47 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
+        self.open_dotdot(who, anchor, how, false, on_done);
+    }
+
+    /// Open the parent of the directory `anchor` names, as `who`, as
+    /// [`open_parent`](Self::open_parent) does, but at the top of a mount
+    /// go on to the parent of the directory the mount covers, as `..` does
+    /// for any process (`follow_dotdot` and `choose_mountpoint` in
+    /// `fs/namei.c`).
+    ///
+    /// It keeps `RESOLVE_NO_SYMLINKS` and drops `RESOLVE_NO_XDEV`, so it is
+    /// the one open whose answer may be on another file system than its
+    /// anchor. `..` only goes up, so it never goes down into a mount, and
+    /// the parent comes from the live tree of mounts, so a directory moved
+    /// above the mount answers where it is now. The kernel checks only
+    /// that `who` may search the directory, and a `how` is refused as for
+    /// `open_parent`.
+    pub fn open_parent_across_mount<F>(
+        &mut self,
+        who: Personality,
+        anchor: &Anchor,
+        how: OpenHow,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.open_dotdot(who, anchor, how, true, on_done);
+    }
+
+    /// Open `..` of `anchor` as `who` for [`open_parent`](Self::open_parent),
+    /// and across the top of a mount when `across`.
+    fn open_dotdot<F>(
+        &mut self,
+        who: Personality,
+        anchor: &Anchor,
+        how: OpenHow,
+        across: bool,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        use crate::sync_fs::ResolveFlag;
         // `O_TMPFILE` carries `O_DIRECTORY`, so only its other half marks a
         // create, as in `mkdir_path`.
         const TMPFILE_ONLY: i32 = libc::O_TMPFILE & !libc::O_DIRECTORY;
@@ -3963,9 +4004,12 @@ impl<'a> FsConn<'a> {
         if creates || raw.resolve & super::CONFINEMENT_POLICY.bits() != 0 {
             return on_done(FsDone::refused(Errno::EINVAL), self);
         }
-        raw.resolve |= CONFINED_RESOLVE
-            .difference(crate::sync_fs::ResolveFlag::RESOLVE_BENEATH)
-            .bits();
+        let mut kept =
+            CONFINED_RESOLVE.difference(ResolveFlag::RESOLVE_BENEATH);
+        if across {
+            kept = kept.difference(ResolveFlag::RESOLVE_NO_XDEV);
+        }
+        raw.resolve |= kept.bits();
         // `..` is always a directory, so no special file can make the open
         // block, and no guard rides it (`apply_special_file_guard`).
         let w = self.waiter(on_done);
@@ -6201,9 +6245,9 @@ mod hybrid_tests {
         );
     }
 
-    /// Open the parent of `at` as `me` with `how`, and give back what the
-    /// open answered.
-    fn parent_of(at: Anchor, how: OpenHow) -> FsDone {
+    /// Open the parent of `at` as `me` with `how`, across the top of a
+    /// mount when `across`, and give back what the open answered.
+    fn parent_of(at: Anchor, how: OpenHow, across: bool) -> FsDone {
         let (mut eng, mut fs, me) = setup();
         let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
         let g2 = got.clone();
@@ -6211,36 +6255,45 @@ mod hybrid_tests {
             &mut eng,
             &mut fs,
             move |c| {
-                c.open_parent(me, &at, how, move |res, _c| {
+                let then = move |res, _c: &mut FsConn<'_>| {
                     *g2.borrow_mut() = Some(res);
-                });
+                };
+                if across {
+                    c.open_parent_across_mount(me, &at, how, then);
+                } else {
+                    c.open_parent(me, &at, how, then);
+                }
             },
             || got.borrow().is_some(),
         );
         got.borrow_mut().take().expect("answered")
     }
 
+    /// The object number and the unique mount ID of what `done` opened.
+    fn opened(done: &FsDone) -> (u64, u64) {
+        let file = done.file().expect("the parent opens");
+        let mask = StatxMask::INO | StatxMask::MNT_ID_UNIQUE;
+        let st = crate::sync_fs::statx(&file, "", AtFlags::AT_EMPTY_PATH, mask)
+            .expect("statx");
+        (st.ino(), st.mnt_id())
+    }
+
     /// The parent is the one the directory has now, so a directory that
-    /// moved answers the directory it moved into.
+    /// moved answers the directory it moved into, with either open.
     #[test]
     fn the_parent_of_a_moved_directory_is_where_it_went() {
         use std::os::unix::fs::MetadataExt;
-        let dir = nested();
-        std::fs::create_dir(dir.path().join("c")).expect("mkdir");
-        let at = Anchor::open(&dir.path().join("a/b")).expect("anchor");
-        std::fs::rename(dir.path().join("a/b"), dir.path().join("c/b"))
-            .expect("rename");
-        let done = parent_of(at, OpenHow::new().flags(OFlag::O_PATH));
-        let file = done.file().expect("the parent opens");
-        let st = crate::sync_fs::statx(
-            &file,
-            "",
-            AtFlags::AT_EMPTY_PATH,
-            StatxMask::INO,
-        )
-        .expect("statx");
-        let went = std::fs::metadata(dir.path().join("c")).expect("stat");
-        assert_eq!(st.ino(), went.ino(), "the parent is c, not a");
+        for across in [false, true] {
+            let dir = nested();
+            std::fs::create_dir(dir.path().join("c")).expect("mkdir");
+            let at = Anchor::open(&dir.path().join("a/b")).expect("anchor");
+            std::fs::rename(dir.path().join("a/b"), dir.path().join("c/b"))
+                .expect("rename");
+            let how = OpenHow::new().flags(OFlag::O_PATH);
+            let (ino, _) = opened(&parent_of(at, how, across));
+            let went = std::fs::metadata(dir.path().join("c")).expect("stat");
+            assert_eq!(ino, went.ino(), "the parent is c, not a ({across})");
+        }
     }
 
     /// The parent of the top of a mount is on another file system, so the
@@ -6248,12 +6301,28 @@ mod hybrid_tests {
     #[test]
     fn a_parent_open_stops_at_the_top_of_a_mount() {
         let at = Anchor::open("/proc").expect("anchor");
-        let done = parent_of(at, OpenHow::new().flags(OFlag::O_PATH));
+        let how = OpenHow::new().flags(OFlag::O_PATH);
+        let done = parent_of(at, how, false);
         assert!(
             matches!(done.result(), Err(crate::Error::Errno(Errno::EXDEV))),
             "{:?}",
             done.result()
         );
+    }
+
+    /// Across the top of a mount, the parent is that of the directory the
+    /// mount covers, on the file system the mount sits in. `/proc` is
+    /// mounted on the root, so its parent is `/`.
+    #[test]
+    fn a_parent_open_across_a_mount_lands_beside_it() {
+        let at = Anchor::open("/proc").expect("anchor");
+        let how = OpenHow::new().flags(OFlag::O_PATH);
+        let got = opened(&parent_of(at, how, true));
+        let mask = StatxMask::INO | StatxMask::MNT_ID_UNIQUE;
+        let root =
+            crate::sync_fs::statx(crate::AT_FDCWD, "/", AtFlags::empty(), mask)
+                .expect("statx of /");
+        assert_eq!(got, (root.ino(), root.mnt_id()), "the parent is /");
     }
 
     /// The step that cannot be written before the chain starts: a name
@@ -6762,12 +6831,20 @@ mod hybrid_tests {
                     .resolve(crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT),
             ),
         ] {
-            let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
-            let g2 = got.clone();
-            c.open_parent(me, &at, how, move |res, _c| {
-                *g2.borrow_mut() = Some(res);
-            });
-            refused(what, got);
+            for across in [false, true] {
+                let got: Rc<RefCell<Option<FsDone>>> =
+                    Rc::new(RefCell::new(None));
+                let g2 = got.clone();
+                let then = move |res, _c: &mut FsConn<'_>| {
+                    *g2.borrow_mut() = Some(res);
+                };
+                if across {
+                    c.open_parent_across_mount(me, &at, how, then);
+                } else {
+                    c.open_parent(me, &at, how, then);
+                }
+                refused(what, got);
+            }
         }
 
         let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));

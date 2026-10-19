@@ -135,6 +135,8 @@
 //!   `mkdirat` itself honours no resolve flags.
 //!   [`FsConn::open_parent`] is the one open that leaves its anchor. It goes
 //!   up one level to the parent, as the caller, and never across a mount.
+//!   [`FsConn::open_parent_across_mount`] goes up the same one level and may
+//!   cross the top of a mount to do it, onto the file system it sits in.
 //! - **Split-credential descent.** [`FsConn::open_chain`] opens a
 //!   sequence of paths, each relative to the one before it and each
 //!   under **its own personality** - so a file inside a tree only the
