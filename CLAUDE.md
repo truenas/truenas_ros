@@ -93,6 +93,18 @@ Do not reopen these without a reason that is new.
   child's request loop allocates nothing: a raw `clone3` skips glibc's
   atfork malloc mitigation, so a child allocation can deadlock on an arena
   lock held at fork time. `drop_setid_caps` runs in the parent only.
+- **A root personality's effective set is written, never inherited.**
+  Setting uid 0 from uid 0 clears no capability (`cap_emulate_setxuid`), so
+  the window writes both words of effective to exactly what the request
+  asked, never registers the broker's own credentials for uid 0, and
+  `revert` gives effective back before it clears the groups, since
+  `setgroups` needs `CAP_SETGID`. Done later nothing fails, and the broker
+  quietly keeps the root personality's groups. `Caps::ROOT_ONLY` stays in
+  the root limit of `spawn_with_root`. Pinned by
+  `set_effective_caps_writes_both_words_and_restore_gives_them_back`,
+  `a_root_window_closes_as_every_window_does`,
+  `a_root_personality_carries_exactly_what_it_asked_for` and
+  `the_broker_impersonates_again_after_minting_root`.
 - **Listings are ordered by `Order::ByPathBytes` and nothing else.**
   `cmp_path_bytes` must stay a total order - `sort_by` panics on an
   inconsistent comparator, and the names come from whoever owns the

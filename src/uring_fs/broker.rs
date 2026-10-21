@@ -71,15 +71,21 @@
 //! Two properties make this worth the process boundary:
 //!
 //! - **After [`CredBroker::spawn`] the reactor process can never obtain a
-//!   `uid == 0` (root) personality.** It permanently drops
-//!   `CAP_SETUID`/`CAP_SETGID`, so it cannot change identity itself; and the
-//!   broker refuses to mint a personality for uid 0. Note the precise
-//!   boundary: a *compromised* main still holds a [`CredHandle`] and can ask
-//!   the broker to mint a personality for any **non-root** identity, and can
-//!   free any id ([`CredHandle::unregister`] takes no ownership proof). That
-//!   is acceptable under the stated model - main runs as root, so a
-//!   compromised main is already root-equivalent - but the guarantee is "no
-//!   forged *root* identity," not "no forging."
+//!   `uid == 0` (root) personality carrying more than the root limit it
+//!   chose at spawn**, and with [`spawn`](CredBroker::spawn) or
+//!   [`spawn_with_caps`](CredBroker::spawn_with_caps) it can obtain none at
+//!   all. It permanently drops `CAP_SETUID`/`CAP_SETGID`, so it cannot
+//!   change identity itself, and the broker refuses to mint uid 0 unless
+//!   [`spawn_with_root`](CredBroker::spawn_with_root) fixed a limit for it,
+//!   and then never with a capability outside that limit, whatever the
+//!   broker itself holds. Note the precise boundary. A *compromised* main
+//!   still holds a [`CredHandle`] and can ask the broker to mint a
+//!   personality for any **non-root** identity, and for root within its
+//!   limit, and can free any id ([`CredHandle::unregister`] takes no
+//!   ownership proof). That is acceptable under the stated model - main
+//!   runs as root, so a compromised main is already root-equivalent - but
+//!   the guarantee is "no forged identity beyond the limits fixed at
+//!   spawn," not "no forging."
 //! - **A minted personality carries no elevated capability unless the
 //!   broker was spawned to allow one.** Dropping to the user's uid clears
 //!   the *effective* capability set (the kernel's setuid fixup), so by
@@ -95,6 +101,12 @@
 //!   clears permitted only when all three uids leave root. That is inert --
 //!   authorization reads effective, and no io_uring operation raises
 //!   effective from permitted - but it is the accurate statement.
+//!
+//!   A root personality gets no such clearing, since setting uid 0 from
+//!   uid 0 changes nothing the kernel reacts to (`cap_emulate_setxuid`,
+//!   `security/commoncap.c`). The window writes its effective set itself,
+//!   both words, to exactly what was asked, so nothing of the broker's own
+//!   authority rides along. See [`CredBroker::spawn_with_root`].
 
 use super::{Personality, UringFs};
 use crate::errno::{self, Errno, retry_on_eintr};
@@ -179,14 +191,19 @@ tn_bitflags! {
     /// **The bit values are the kernel's own capability numbers**, so a mask
     /// is exactly the low word of `cap_effective` that the broker installs.
     ///
-    /// # Why these three, and not the rest
+    /// # Why these, and not the rest
     ///
     /// As with [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs), the
     /// refusals are the point:
     ///
     /// - `CAP_CHOWN` changes ownership on any inode of any type on any
     ///   filesystem. [`Caps::FOWNER`] reaches ownership only through ZFS's
-    ///   NFSv4 path, and only where the ACL is non-trivial.
+    ///   NFSv4 path, and only where the ACL is non-trivial. So it is granted
+    ///   to uid 0 alone, as are [`Caps::FSETID`] and [`Caps::MKNOD`], which
+    ///   together are [`Caps::ROOT_ONLY`]. A root personality is the
+    ///   superuser of a file service, and these three are what the
+    ///   superuser's file calls check beyond the other three. Any other
+    ///   identity is refused them, at spawn.
     /// - `CAP_SYS_ADMIN` needs no explanation.
     ///
     /// The two write-side bits are defensible only where the caller confines
@@ -300,7 +317,53 @@ tn_bitflags! {
         ///
         /// (`CAP_FOWNER` is capability number 3, hence bit 3.)
         FOWNER = 0x0000_0008;
+
+        /// `CAP_CHOWN` - **change the owner and group of any file**, for
+        /// uid 0 alone (see [`Caps::ROOT_ONLY`]).
+        ///
+        /// The VFS checks it before any filesystem sees a chown
+        /// (`chown_ok` and `chgrp_ok` in `fs/attr.c`). Without it only the
+        /// owner may change the group, and only to a group it is in. On ZFS
+        /// a chown then also needs [`Caps::FOWNER`], which `zfs_setattr`
+        /// asks for through `secpolicy_vnode_chown`, so a root personality
+        /// that is to chown carries both.
+        ///
+        /// (`CAP_CHOWN` is capability number 0, hence bit 0.)
+        CHOWN = 0x0000_0001;
+
+        /// `CAP_FSETID` - **keep the set-user-ID and set-group-ID bits**,
+        /// for uid 0 alone (see [`Caps::ROOT_ONLY`]).
+        ///
+        /// Without it the kernel drops them when a regular file is written
+        /// or changes owner (`setattr_should_drop_suidgid` in `fs/attr.c`),
+        /// and keeps set-group-ID on a chmod or a create only for a member
+        /// of the group (`in_group_or_capable` and `mode_strip_sgid` in
+        /// `fs/inode.c`). ZFS asks for it in the same cases
+        /// (`secpolicy_vnode_setid_retain`, `secpolicy_vnode_setids_setgids`
+        /// and `secpolicy_vnode_setid_modify`).
+        ///
+        /// (`CAP_FSETID` is capability number 4, hence bit 4.)
+        FSETID = 0x0000_0010;
+
+        /// `CAP_MKNOD` - **make a character or block device**, for uid 0
+        /// alone (see [`Caps::ROOT_ONLY`]).
+        ///
+        /// `vfs_mknod` (`fs/namei.c`) refuses a device without it. A FIFO
+        /// and a socket need nothing.
+        ///
+        /// (`CAP_MKNOD` is capability number 27, hence bit 27.)
+        MKNOD = 0x0800_0000;
     }
+}
+
+impl Caps {
+    /// The capabilities a root personality may carry and no other may,
+    /// [`Caps::CHOWN`], [`Caps::FSETID`] and [`Caps::MKNOD`].
+    /// [`CredBroker::spawn_with_caps`] refuses them in the limit for
+    /// identities other than root, so only the limit for uid 0 that
+    /// [`CredBroker::spawn_with_root`] fixes may name them.
+    pub const ROOT_ONLY: Caps =
+        Caps::CHOWN.union(Caps::FSETID).union(Caps::MKNOD);
 }
 
 /// The identity to impersonate: everything the kernel consults for a
@@ -394,6 +457,10 @@ struct BrokerInner {
     /// `RING_FD_BASE + i`). Kept so a handle can be asked for by *ring*
     /// rather than by position - see [`CredBroker::handle_for`].
     ring_fds: Vec<RawFd>,
+    /// Whether the broker was spawned with a root limit, so that
+    /// [`CredHandle::register`] can refuse uid 0 with a clear error before
+    /// the broker refuses it with `EPERM`.
+    root: bool,
 }
 
 impl Drop for BrokerInner {
@@ -472,14 +539,16 @@ impl CredHandle {
     /// already *is* the broker's own identity, which needs no privilege and
     /// is the unprivileged path.
     ///
-    /// Registering `uid == 0` is refused: the daemon's own identity comes
-    /// from [`UringFs::register_self`], and a root personality - which
-    /// would carry the daemon's capabilities - is exactly what this design
-    /// exists to avoid.
+    /// Registering `uid == 0` is refused unless the broker was spawned with
+    /// [`CredBroker::spawn_with_root`], and then it carries no capability
+    /// outside the root limit fixed there. The daemon's own identity comes
+    /// from [`UringFs::register_self`], and a root personality carrying the
+    /// daemon's capabilities is exactly what this design exists to avoid.
     pub fn register(&self, who: &AsUser) -> crate::Result<Personality> {
-        if who.uid == 0 {
+        if who.uid == 0 && !self.broker.inner.root {
             return Err(crate::Error::Validation(
-                "refusing to register a personality for uid 0; use \
+                "refusing to register a personality for uid 0, since the \
+                 broker was not spawned with a root limit; use \
                  UringFs::register_self for the daemon's own identity"
                     .into(),
             ));
@@ -795,10 +864,64 @@ impl CredBroker {
     /// when it asks for any: that path mints the daemon's *own* credentials,
     /// and handing them extra authority is what [`UringFs::register_self`]
     /// and this whole process boundary exist to prevent.
+    ///
+    /// [`Caps::ROOT_ONLY`] in `allowed` is refused with a `Validation`
+    /// error, since those capabilities belong to uid 0 alone. This broker
+    /// mints no root personality, which only
+    /// [`spawn_with_root`](Self::spawn_with_root) does.
     pub fn spawn_with_caps<R: BrokerReactor + ?Sized>(
         reactors: &[&R],
         allowed: Caps,
     ) -> crate::Result<CredBroker> {
+        CredBroker::spawn_policy(reactors, allowed, None)
+    }
+
+    /// [`spawn_with_caps`](Self::spawn_with_caps), and also permitting a
+    /// root personality, `uid == 0`, carrying capabilities from `root`.
+    ///
+    /// `root` is a second ceiling fixed here, apart from `allowed`, and it
+    /// binds uid 0 alone. A file service that serves a remote superuser
+    /// passes the capabilities that superuser's file calls check, and
+    /// `allowed` stays the ceiling for every other identity. Only `root` may
+    /// hold [`Caps::ROOT_ONLY`].
+    ///
+    /// The window cannot lean on the kernel here. A root personality keeps
+    /// uid 0, and the kernel clears the effective set only when the euid
+    /// leaves root (`cap_emulate_setxuid`, `security/commoncap.c`), so the
+    /// window sets both words of the effective set to exactly what the
+    /// request asked for, never more, and its revert gives the broker its
+    /// own set back before it clears the groups, since `setgroups` needs
+    /// `CAP_SETGID`. A root request never takes the path that registers
+    /// the broker's own credentials. The snapshot's *permitted* set is the
+    /// broker's, inert as for every other identity, since nothing in an
+    /// io_uring operation raises effective from it.
+    ///
+    /// A root personality takes the gid and the groups of the request, so a
+    /// superuser whose primary group is not 0 keeps it, as the kernel's own
+    /// file server keeps it (`nfsd_setuser`, `fs/nfsd/auth.c`).
+    pub fn spawn_with_root<R: BrokerReactor + ?Sized>(
+        reactors: &[&R],
+        allowed: Caps,
+        root: Caps,
+    ) -> crate::Result<CredBroker> {
+        CredBroker::spawn_policy(reactors, allowed, Some(root))
+    }
+
+    /// The body of [`spawn_with_caps`](Self::spawn_with_caps) and
+    /// [`spawn_with_root`](Self::spawn_with_root), with the root limit, if
+    /// any.
+    fn spawn_policy<R: BrokerReactor + ?Sized>(
+        reactors: &[&R],
+        allowed: Caps,
+        root: Option<Caps>,
+    ) -> crate::Result<CredBroker> {
+        if allowed.intersects(Caps::ROOT_ONLY) {
+            return Err(crate::Error::Validation(format!(
+                "{:?} are for uid 0 alone, and belong in the root limit of \
+                 spawn_with_root",
+                allowed & Caps::ROOT_ONLY
+            )));
+        }
         if reactors.is_empty() || reactors.len() > MAX_RINGS {
             return Err(crate::Error::Validation(format!(
                 "a broker serves 1..={MAX_RINGS} rings, got {}",
@@ -914,6 +1037,7 @@ impl CredBroker {
                 child_end.as_raw_fd(),
                 &ring_fds,
                 allowed,
+                root,
                 req,
                 groups,
                 scratch,
@@ -935,6 +1059,7 @@ impl CredBroker {
                 pid,
                 pidfd,
                 ring_fds,
+                root: root.is_some(),
             }),
         };
         // Take the child's ready datagram before handing back a handle. A
@@ -1216,6 +1341,11 @@ struct CapData {
 /// Set the calling process's **effective** set to exactly `caps`, inside the
 /// impersonation window, leaving permitted and inheritable untouched.
 ///
+/// Both words are written. `Caps` lives in the low word, so the high word,
+/// capabilities 32 and up such as `CAP_BPF` and `CAP_PERFMON`, is cleared.
+/// A window that left root finds it empty already, and a root window finds
+/// it full, which is why it is never left as read.
+///
 /// Only effective is written, and that is deliberate rather than sloppy:
 ///
 /// - Effective is the set the kernel actually consults --
@@ -1232,7 +1362,7 @@ struct CapData {
 /// only when real, effective and saved uid all leave root
 /// (`cap_emulate_setxuid`), so permitted survives the drop with effective
 /// emptied - leaving exactly the headroom this raises back.
-fn raise_effective_caps(caps: Caps) -> errno::Result<()> {
+fn set_effective_caps(caps: Caps) -> errno::Result<()> {
     let mut hdr = CapHeader {
         version: VERSION_3,
         pid: 0,
@@ -1247,8 +1377,42 @@ fn raise_effective_caps(caps: Caps) -> errno::Result<()> {
         )
     })?;
     // `Caps` bits are kernel capability numbers, all below 32, so the mask is
-    // the low word verbatim. The high word is left as read.
+    // the low word verbatim, and the high word holds none of them.
     data[0].effective = caps.bits();
+    data[1].effective = 0;
+    // SAFETY: capset reads the same two-word layout back.
+    Errno::result(unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            std::ptr::addr_of_mut!(hdr),
+            data.as_ptr(),
+        )
+    })?;
+    Ok(())
+}
+
+/// Give the calling process's effective set back the whole of its permitted
+/// set, both words, as returning to euid 0 from another uid does
+/// (`cap_emulate_setxuid`, `security/commoncap.c`). A root window never
+/// leaves uid 0, so nothing else gives it back, and `capset` raises effective
+/// within permitted with no capability of its own (`cap_capset`).
+fn restore_effective_caps() -> errno::Result<()> {
+    let mut hdr = CapHeader {
+        version: VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapData::default(); 2];
+    // SAFETY: capget fills two CapData words for VERSION_3.
+    Errno::result(unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            std::ptr::addr_of_mut!(hdr),
+            data.as_mut_ptr(),
+        )
+    })?;
+    for word in &mut data {
+        word.effective = word.permitted;
+    }
     // SAFETY: capset reads the same two-word layout back.
     Errno::result(unsafe {
         libc::syscall(
@@ -1340,6 +1504,7 @@ fn broker_main(
     sock: RawFd,
     ring_fds: &[RawFd],
     allowed: Caps,
+    root: Option<Caps>,
     req: Vec<u8>,
     groups: Vec<u32>,
     scratch: Vec<libc::gid_t>,
@@ -1362,7 +1527,7 @@ fn broker_main(
     // image. Contain it here and exit non-zero; under `panic = "abort"` the
     // child aborts instead, which is equally safe.
     let ok = std::panic::catch_unwind(move || {
-        broker_loop(nrings, allowed, req, groups, scratch)
+        broker_loop(nrings, allowed, root, req, groups, scratch)
     })
     .is_ok();
     // SAFETY: `_exit` never runs atexit handlers or destructors - exactly what
@@ -1391,7 +1556,7 @@ pub struct Req {
     /// The identity's gid.
     pub gid: u32,
     /// Requested capabilities, already checked to be a subset of the
-    /// spawn-time ceiling.
+    /// spawn-time ceiling, the root limit for a registration of uid 0.
     pub caps: Caps,
 }
 
@@ -1403,11 +1568,16 @@ pub struct Req {
 /// it reaches `register_as`. Split out from `broker_loop` so the check is
 /// pure and can be driven by `fuzz/fuzz_targets/broker_request.rs`.
 ///
+/// A registration of uid 0 is held to `root`, the limit
+/// [`CredBroker::spawn_with_root`] fixed, and refused `EPERM` when the
+/// broker has none. Every other request is held to `allowed`.
+///
 /// Allocation-free, like its caller.
 pub fn decode_request(
     req: &[u8],
     nrings: usize,
     allowed: Caps,
+    root: Option<Caps>,
 ) -> std::result::Result<Req, i64> {
     if req.len() < HDR_LEN {
         return Err(-(libc::EINVAL as i64));
@@ -1432,8 +1602,16 @@ pub fn decode_request(
     // request; either way it is not something to silently mask off, because the
     // caller would then get a personality weaker than it asked for and discover
     // it as an EACCES far from here.
+    // uid 0 is held to the root limit alone. The id of `OP_UNREGISTER` rides
+    // in the uid field and asks for no capability, so it stays with
+    // `allowed`.
+    let ceiling = match (op, root) {
+        (OP_REGISTER, Some(root)) if uid == 0 => root,
+        (OP_REGISTER, None) if uid == 0 => return Err(-(libc::EPERM as i64)),
+        _ => allowed,
+    };
     let caps = match Caps::from_bits(caps_bits) {
-        Some(c) if allowed.contains(c) => c,
+        Some(c) if ceiling.contains(c) => c,
         // Outside the spawn-time ceiling, or not a capability this build knows
         // how to mint.
         _ => return Err(-(libc::EPERM as i64)),
@@ -1482,6 +1660,7 @@ pub fn decode_groups(req: &[u8], ngroups: usize, out: &mut [u32]) {
 fn broker_loop(
     nrings: usize,
     allowed: Caps,
+    root: Option<Caps>,
     mut req: Vec<u8>,
     mut groups: Vec<u32>,
     mut scratch: Vec<libc::gid_t>,
@@ -1498,7 +1677,7 @@ fn broker_loop(
             uid,
             gid,
             caps,
-        } = match decode_request(&req[..n], nrings, allowed) {
+        } = match decode_request(&req[..n], nrings, allowed, root) {
             Ok(r) => r,
             Err(errno) => {
                 let _ = reply(SOCK_FD, errno);
@@ -1508,7 +1687,9 @@ fn broker_loop(
         let ring_fd = RING_FD_BASE + ring as RawFd;
 
         let res: i64 = match op {
-            OP_REGISTER if uid != 0 => {
+            // `decode_request` already refused uid 0 without a root limit,
+            // and this says so again where the window opens.
+            OP_REGISTER if uid != 0 || root.is_some() => {
                 decode_groups(&req[..n], ngroups, &mut groups);
                 register_as(
                     ring_fd,
@@ -1710,6 +1891,11 @@ fn raw_getegid() -> u32 {
 /// clears the effective capability set - which is what leaves the snapshot
 /// carrying the user's authority and no `CAP_DAC_OVERRIDE`, unless `caps`
 /// asks for something the spawn-time policy allowed.
+///
+/// uid 0 never leaves root, so nothing clears its effective set. For it the
+/// window always writes the effective set itself, to exactly `caps`, and
+/// never takes the path that registers the broker's own credentials, which
+/// would be the broker's whole authority under the caller's name.
 /// Nothing else runs inside the window: no allocation, no logging, no
 /// fallible work that could unwind.
 fn register_as(
@@ -1723,8 +1909,9 @@ fn register_as(
     // Registering credentials identical to the broker's own needs no
     // privilege transition at all - and this is the path an unprivileged
     // process takes, where `setgroups` would fail even for an unchanged
-    // list (it always demands CAP_SETGID).
-    if !needs_impersonation(uid, gid, groups, scratch) {
+    // list (it always demands CAP_SETGID). Never for uid 0, whose effective
+    // set the window must write, since a broker running as root matches it.
+    if uid != 0 && !needs_impersonation(uid, gid, groups, scratch) {
         // No transition means no setuid fixup, so the broker's own effective
         // set would go into the snapshot untouched. Granting capabilities
         // here would hand out the daemon's own authority under another name.
@@ -1801,12 +1988,13 @@ fn register_as(
         return -(libc::EINVAL as i64);
     }
 
-    // Raise the requested capabilities into the *effective* set the snapshot
-    // is about to capture. Ordered after the euid check on purpose: the
-    // credentials being elevated must already be proven to be the requested
-    // identity's, never root's.
-    if !caps.is_empty()
-        && let Err(e) = raise_effective_caps(caps)
+    // Set the *effective* set the snapshot is about to capture to exactly
+    // the requested capabilities. Ordered after the euid check on purpose,
+    // since the credentials being elevated must already be proven to be the
+    // requested identity's. uid 0 always goes through here, even asking for
+    // nothing, since its effective set is still the broker's own.
+    if (uid == 0 || !caps.is_empty())
+        && let Err(e) = set_effective_caps(caps)
     {
         revert();
         return -(e as i32 as i64);
@@ -1877,12 +2065,18 @@ fn group_set_differs(cur: &[u32], groups: &[u32]) -> bool {
     groups.iter().any(|g| !cur.contains(g))
 }
 
-/// Close the impersonation window. uid first - that is what restores the
-/// privilege the remaining two calls need.
+/// Close the impersonation window. The effective capability set first, since
+/// a root window narrowed it without leaving uid 0 and `setgroups` needs
+/// `CAP_SETGID`. Done later, the gid would still come back through saved
+/// gid 0 and nothing would fail, but the broker would keep the groups of the
+/// root personality it had just minted. Then the uid, which is what restores
+/// the privilege a window that left root dropped, and then the gid and the
+/// groups.
 fn revert() {
-    // SAFETY: restoring credentials via saved-uid 0. Each call is attempted
-    // unconditionally: a failure here is unrecoverable and must not be
-    // masked by a later success.
+    // Each call is attempted unconditionally, since a failure here is
+    // unrecoverable and must not be masked by a later success.
+    let _ = restore_effective_caps();
+    // SAFETY: restoring credentials via saved-uid 0.
     unsafe {
         libc::syscall(libc::SYS_setresuid, 0, 0, 0);
         libc::syscall(libc::SYS_setresgid, 0, 0, 0);
@@ -2188,6 +2382,176 @@ mod tests {
             "CAP_SETUID/CAP_SETGID must be gone from the bounding set after \
              drop_setid_caps, else a uid-0 execve restores them"
         );
+    }
+
+    /// A root window writes the effective set itself, so it must write both
+    /// words exactly. Root holds capabilities in the high word too, such as
+    /// `CAP_BPF` and `CAP_PERFMON`, and a high word left as read would ride
+    /// into every root personality. `restore_effective_caps` then gives the
+    /// whole of permitted back, both words. Root-only, and in a forked child,
+    /// since it changes the process's capabilities. The high word of
+    /// permitted must hold something, or the test would prove nothing.
+    #[test]
+    fn set_effective_caps_writes_both_words_and_restore_gives_them_back() {
+        if !root_or_skip(
+            "set_effective_caps_writes_both_words_and_restore_gives_them_back",
+        ) {
+            return;
+        }
+        fn read() -> Option<[CapData; 2]> {
+            let mut hdr = CapHeader {
+                version: VERSION_3,
+                pid: 0,
+            };
+            let mut data = [CapData::default(); 2];
+            // SAFETY: capget fills two CapData words for VERSION_3.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_capget,
+                    std::ptr::addr_of_mut!(hdr),
+                    data.as_mut_ptr(),
+                )
+            };
+            (rc == 0).then_some(data)
+        }
+        // SAFETY: fork; the child only makes async-signal-safe syscalls and
+        // `_exit`s, so it is sound from a threaded test harness.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            let asked = Caps::CHOWN | Caps::MKNOD;
+            let set = set_effective_caps(asked).is_ok();
+            let narrowed = read().is_some_and(|d| {
+                d[0].effective == asked.bits()
+                    && d[1].effective == 0
+                    && d[1].permitted != 0
+            });
+            let restored = restore_effective_caps().is_ok();
+            let back = read().is_some_and(|d| {
+                d.iter().all(|word| word.effective == word.permitted)
+            });
+            let ok = set && narrowed && restored && back;
+            // SAFETY: `_exit` in a forked child; runs no destructors.
+            unsafe { libc::_exit(i32::from(!ok)) }
+        }
+        let mut status = 0;
+        // SAFETY: valid pid and status pointer.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "the effective set must be exactly what was asked, both words, \
+             and come back whole"
+        );
+    }
+
+    /// A root window narrows the broker's effective set without leaving uid
+    /// 0, so `revert` must give it back before it clears the groups, since
+    /// `setgroups` needs `CAP_SETGID`. The gid would come back anyway,
+    /// through saved gid 0, and nothing would fail, but the broker would keep
+    /// the groups of the root personality it had just minted. So the broker's
+    /// own credentials are read after the window, which must leave them as
+    /// every window does, uid and gid 0, no groups and the whole effective
+    /// set. Root-only, and in a forked child, since a window changes them.
+    #[test]
+    fn a_root_window_closes_as_every_window_does() {
+        if !root_or_skip("a_root_window_closes_as_every_window_does") {
+            return;
+        }
+        let ring = match Ring::new(4) {
+            Ok(r) => r,
+            Err(e) if crate::uring::setup_unavailable(e) => return,
+            Err(e) => panic!("Ring::new: {e}"),
+        };
+        fn groups(out: &mut [libc::gid_t]) -> i64 {
+            // SAFETY: raw `getgroups` into `out`, its length bounding the
+            // write.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_getgroups,
+                    out.len() as libc::c_long,
+                    out.as_mut_ptr(),
+                )
+            }
+        }
+        // SAFETY: fork; the child only makes async-signal-safe syscalls and
+        // `_exit`s, so it is sound from a threaded test harness.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            let mut after = [0; 8];
+            let mut scratch = [0 as libc::gid_t; 8];
+            let caps = Caps::DAC_OVERRIDE;
+            let id = register_as(
+                ring.raw_fd(),
+                0,
+                4400,
+                caps,
+                &[4401],
+                &mut scratch,
+            );
+            let has = groups(&mut after);
+            let mut hdr = CapHeader {
+                version: VERSION_3,
+                pid: 0,
+            };
+            let mut data = [CapData::default(); 2];
+            // SAFETY: capget fills two CapData words for VERSION_3.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_capget,
+                    std::ptr::addr_of_mut!(hdr),
+                    data.as_mut_ptr(),
+                )
+            };
+            let whole =
+                rc == 0 && data.iter().all(|w| w.effective == w.permitted);
+            let ok = id > 0
+                && raw_geteuid() == 0
+                && raw_getegid() == 0
+                && has == 0
+                && whole;
+            // SAFETY: `_exit` in a forked child; runs no destructors.
+            unsafe { libc::_exit(i32::from(!ok)) }
+        }
+        let mut status = 0;
+        // SAFETY: valid pid and status pointer.
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "after a root window the broker must have its own gid, groups and \
+             capabilities back"
+        );
+    }
+
+    /// A registration of uid 0 is held to the root limit alone, and refused
+    /// when the broker has none, while every other request is held to the
+    /// limit for other identities. The id of an unregistration rides in the
+    /// uid field, so an id of 0 there is no root.
+    #[test]
+    fn a_registration_of_uid_0_is_held_to_the_root_limit() {
+        let request = |op: u8, uid: u32, caps: Caps| {
+            let mut req = [0u8; HDR_LEN];
+            req[0] = op;
+            req[4..8].copy_from_slice(&uid.to_le_bytes());
+            req[12..16].copy_from_slice(&caps.bits().to_le_bytes());
+            req
+        };
+        let allowed = Caps::DAC_READ_SEARCH;
+        let decoded = |op, uid, caps, root| {
+            decode_request(&request(op, uid, caps), 1, allowed, root)
+                .map(|req| req.caps)
+        };
+        let eperm = Err(-(libc::EPERM as i64));
+        assert_eq!(decoded(OP_REGISTER, 0, Caps::empty(), None), eperm);
+        let root = Some(Caps::DAC_OVERRIDE | Caps::CHOWN);
+        assert_eq!(decoded(OP_REGISTER, 0, Caps::CHOWN, root), Ok(Caps::CHOWN));
+        assert_eq!(decoded(OP_REGISTER, 0, allowed, root), eperm);
+        assert_eq!(decoded(OP_REGISTER, 1000, Caps::CHOWN, root), eperm);
+        assert_eq!(decoded(OP_REGISTER, 1000, allowed, root), Ok(allowed));
+        let unregister = decoded(OP_UNREGISTER, 0, Caps::empty(), None);
+        assert_eq!(unregister, Ok(Caps::empty()));
     }
 
     /// The other half of the bounding-set drop: an unprivileged caller must

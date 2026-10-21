@@ -20,7 +20,10 @@
 //!   zeroed groups,
 //! - `caps ⊆ allowed`, the ceiling fixed when the broker was spawned; an
 //!   unknown bit must be refused rather than masked off, or the caller silently
-//!   gets a weaker personality and discovers it as an `EACCES` far away.
+//!   gets a weaker personality and discovers it as an `EACCES` far away,
+//! - and for a registration of uid 0, `caps ⊆ root` instead, the root limit
+//!   `spawn_with_root` fixed, with no registration of uid 0 accepted at all
+//!   when the broker has none.
 //!
 //! Rejection must also be honest: the only errnos the loop can reply with are
 //! `EINVAL` and `EPERM`.
@@ -61,7 +64,13 @@ fuzz_target!(|data: &[u8]| {
     let Some((&sel, rest)) = data.split_first() else {
         return;
     };
-    let Some((&cap_sel, req)) = rest.split_first() else {
+    let Some((&cap_sel, rest)) = rest.split_first() else {
+        return;
+    };
+    // A third byte for the root limit, an axis of its own. It gives none,
+    // every capability, or a ceiling drawn from the byte, so a registration
+    // of uid 0 is tried against each.
+    let Some((&root_sel, req)) = rest.split_first() else {
         return;
     };
     let nrings = 1 + usize::from(sel) % MAX_RINGS;
@@ -70,8 +79,13 @@ fuzz_target!(|data: &[u8]| {
     } else {
         Caps::from_bits_truncate(u32::from(cap_sel >> 1))
     };
+    let root = match root_sel % 3 {
+        0 => None,
+        1 => Some(Caps::all()),
+        _ => Some(Caps::from_bits_truncate(u32::from(root_sel >> 2))),
+    };
 
-    let decoded = match decode_request(req, nrings, allowed) {
+    let decoded = match decode_request(req, nrings, allowed, root) {
         Ok(r) => r,
         Err(errno) => {
             assert!(
@@ -98,9 +112,16 @@ fuzz_target!(|data: &[u8]| {
         HDR_LEN + 4 * decoded.ngroups,
         "accepted a datagram whose length does not match its group count"
     );
+    // `OP_REGISTER` is 1. A registration of uid 0 is held to the root limit,
+    // and needs one. Anything else is held to `allowed`.
+    let ceiling = if decoded.op == 1 && decoded.uid == 0 {
+        root.expect("a registration of uid 0 accepted with no root limit")
+    } else {
+        allowed
+    };
     assert!(
-        allowed.contains(decoded.caps),
-        "accepted caps {:?} outside the ceiling {allowed:?}",
+        ceiling.contains(decoded.caps),
+        "accepted caps {:?} outside the ceiling {ceiling:?}",
         decoded.caps
     );
     // An unknown bit must be refused, not masked off - a caller would
@@ -120,7 +141,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Deciding is a pure function of the inputs.
     assert_eq!(
-        decode_request(req, nrings, allowed).expect("still accepted"),
+        decode_request(req, nrings, allowed, root).expect("still accepted"),
         decoded,
         "decoding is not deterministic"
     );
