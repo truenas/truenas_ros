@@ -15,8 +15,8 @@ use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::{Arc, Condvar, Mutex, OnceCell, thread};
 use crate::uring::wake::WakeHandle;
 
-/// Per-ring sizing for the blocking-offload pool: how many worker threads it
-/// keeps warm and how far it grows.
+/// Per-ring sizing for a blocking-offload pool, the file pool or the lookup
+/// lane, which is how many worker threads it keeps warm and how far it grows.
 ///
 /// Every field is per ring, so a deployment running several multiplies them.
 /// Only `floor` is resident; workers above it exist while a job is blocked on
@@ -102,6 +102,16 @@ const OFFLOAD_WAKE_ALLOWANCE: Duration = Duration::from_micros(150);
 /// the same number: `net`'s `ServerConfig::validate` and `UringFs::check`.
 pub(crate) const MAX_OFFLOAD_THREADS: usize = 1024;
 
+/// The name of the file pool's threads, the pool behind `FsConn::offload`,
+/// the listers and the copies. Linux keeps 15 bytes of a thread's name
+/// (`TASK_COMM_LEN` in `include/linux/sched.h`), so `ps` shows
+/// `truenas-fs-work`.
+pub(crate) const FILE_WORKER: &str = "truenas-fs-worker";
+
+/// The name of the lookup lane's threads (`FsConn::offload_lookup`), short
+/// enough that `ps` shows it whole.
+pub(crate) const LOOKUP_WORKER: &str = "truenas-lookup";
+
 /// Growth is rate-limited to at most one new worker per this interval, so a
 /// burst of microsecond-fast jobs that momentarily saturates the pool does not
 /// spawn a thread per job; sustained blocking work still grows to the ceiling.
@@ -152,6 +162,8 @@ struct PoolInner {
 
 struct PoolShared {
     inner: Mutex<PoolInner>,
+    /// The name each worker thread is given.
+    name: &'static str,
     /// Signals a queued job, a shutdown, or a worker exit (`Drop` waits on it).
     cv: Condvar,
     floor: usize,
@@ -210,9 +222,11 @@ impl WorkerPool {
     /// under saturation, using the default cooldown and idle timeout. Returns
     /// the spawn error rather than panicking.
     pub(crate) fn try_elastic(
+        name: &'static str,
         bounds: OffloadBounds,
     ) -> std::io::Result<WorkerPool> {
         Self::try_elastic_tuned(
+            name,
             bounds,
             clocked(OFFLOAD_SPAWN_COOLDOWN),
             OFFLOAD_IDLE_TIMEOUT,
@@ -224,6 +238,7 @@ impl WorkerPool {
     /// a partial spawn failure the workers already started are shut down and
     /// waited for before returning, so none is orphaned.
     pub(crate) fn try_elastic_tuned(
+        name: &'static str,
         bounds: OffloadBounds,
         cooldown: Duration,
         idle_timeout: Duration,
@@ -245,6 +260,7 @@ impl WorkerPool {
                 #[cfg(test)]
                 wakes_issued: 0,
             }),
+            name,
             cv: Condvar::new(),
             floor,
             ceiling,
@@ -671,18 +687,24 @@ impl Drop for WorkerPool {
 fn spawn_worker(shared: &Arc<PoolShared>) -> std::io::Result<()> {
     let shared = Arc::clone(shared);
     thread::Builder::new()
-        .name("truenas-fs-worker".into())
+        .name(shared.name.into())
         .spawn(move || worker_loop(&shared))
         .map(|_| ())
 }
 
-/// One lazily-spawned [`WorkerPool`] shared by a reactor's on-loop offloads
-/// (`FsConn::offload`) and its off-loop `QueryPool`, so the reactor has a
-/// single blocking-work thread budget. Cheap to clone (`Arc`); the floor
-/// threads spawn on the first submit, and if a worker cannot be spawned the job
-/// runs inline (a degraded loop, not a dead one).
+/// One lazily-spawned [`WorkerPool`]. A reactor holds two. The file pool is
+/// shared by its on-loop offloads (`FsConn::offload`) and its off-loop
+/// `QueryPool`, so that work has a single thread budget. The lookup lane
+/// (`FsConn::offload_lookup`) runs jobs that may wait seconds on another
+/// machine, so they never hold a thread the file work needs. Cheap to clone
+/// (`Arc`). The floor threads spawn on the first submit. If a worker cannot
+/// be spawned, [`enqueue`](Self::enqueue) runs the job inline (a degraded
+/// loop, not a dead one), while [`try_enqueue`](Self::try_enqueue) hands it
+/// back.
 pub(crate) struct SharedPool {
     pool: OnceCell<WorkerPool>,
+    /// The name of the pool's threads.
+    name: &'static str,
     bounds: OffloadBounds,
     /// Epoch for [`retry_spawn_us`](Self::retry_spawn_us).
     epoch: Instant,
@@ -716,12 +738,16 @@ impl fmt::Debug for SharedPool {
 }
 
 impl SharedPool {
-    /// A shared pool sized by `bounds`; no threads spawn until the first
-    /// [`submit`](Self::submit).
-    pub(crate) fn new(bounds: OffloadBounds) -> Arc<SharedPool> {
+    /// A shared pool sized by `bounds`, whose threads are called `name`. No
+    /// threads spawn until the first [`submit`](Self::submit).
+    pub(crate) fn new(
+        name: &'static str,
+        bounds: OffloadBounds,
+    ) -> Arc<SharedPool> {
         let floor = bounds.floor.max(1);
         Arc::new(SharedPool {
             pool: OnceCell::new(),
+            name,
             bounds: OffloadBounds {
                 floor,
                 ceiling: bounds.ceiling.max(floor),
@@ -751,8 +777,8 @@ impl SharedPool {
 
     /// Wake the pool for `pending` jobs queued since the last flush and
     /// return when to call again ([`WorkerPool::flush`]). Before the pool
-    /// exists there is nothing to wake: an enqueue without a pool ran its
-    /// job inline.
+    /// exists there is nothing to wake, since a job queued without one ran
+    /// inline or was handed back.
     pub(crate) fn flush(&self, pending: usize) -> Option<Duration> {
         self.pool.with(|pool| pool.flush(pending)).flatten()
     }
@@ -771,12 +797,30 @@ impl SharedPool {
         })
     }
 
+    /// Back off as a failed first spawn does, and never stop, so a test can
+    /// see what a caller does with a job no thread takes. A real failure
+    /// needs a process-wide limit, which a test must not exhaust.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn back_off(&self) {
+        self.retry_spawn_us.store(u64::MAX, Ordering::Relaxed);
+    }
+
     /// Queue a job without a wake, spawning the pool on first use. A lost
     /// init race just drops the surplus pool (its `Drop` joins the idle
     /// workers); a spawn failure runs the job inline rather than take the
     /// reactor down. The caller must [`flush`](Self::flush) before it
     /// blocks.
     pub(crate) fn enqueue(&self, job: Job) {
+        if let Err(job) = self.try_enqueue(job) {
+            job();
+        }
+    }
+
+    /// [`enqueue`](Self::enqueue), but a job no thread can take is handed
+    /// back rather than run inline. That is when the pool's first spawn
+    /// fails, and for [`SPAWN_RETRY_BACKOFF`] after it, so the caller can
+    /// answer for a job that must not run on its loop.
+    pub(crate) fn try_enqueue(&self, job: Job) -> Result<(), Job> {
         // `job` is `FnOnce`, so it can only be handed to one arm; take it back
         // out of the cell when the pool was not there to receive it.
         let mut job = Some(job);
@@ -784,14 +828,15 @@ impl SharedPool {
             .pool
             .with(|pool| pool.enqueue(job.take().expect("first use")))
         {
-            return;
+            return Ok(());
         }
         let job = job.expect("untouched when the cell was empty");
         let now = self.epoch.elapsed().as_micros() as u64;
         if now < self.retry_spawn_us.load(Ordering::Relaxed) {
-            return job(); // backing off a recent failure; don't retry per job
+            // Backing off a recent failure, so no spawn is tried per job.
+            return Err(job);
         }
-        match WorkerPool::try_elastic(self.bounds) {
+        match WorkerPool::try_elastic(self.name, self.bounds) {
             Ok(pool) => {
                 // A lost race just drops the surplus pool here; its `Drop`
                 // joins the workers it started before they can touch anything.
@@ -799,13 +844,14 @@ impl SharedPool {
                 let mut job = Some(job);
                 self.pool
                     .with(|pool| pool.enqueue(job.take().expect("first use")));
+                Ok(())
             }
             Err(_) => {
                 self.retry_spawn_us.store(
                     now.saturating_add(SPAWN_RETRY_BACKOFF.as_micros() as u64),
                     Ordering::Relaxed,
                 );
-                job();
+                Err(job)
             }
         }
     }
@@ -950,6 +996,7 @@ mod pool_tests {
         // Floor 1, ceiling 4; no growth cooldown (deterministic under the
         // start-synchronised submits below) and a quick idle timeout.
         let pool = WorkerPool::try_elastic_tuned(
+            FILE_WORKER,
             bounds(1, 4),
             Duration::ZERO,
             Duration::from_millis(50),
@@ -1118,6 +1165,7 @@ mod pool_tests {
         const JOBS: usize = 5;
         const FLOOR: usize = 8;
         let pool = WorkerPool::try_elastic_tuned(
+            FILE_WORKER,
             bounds(FLOOR, FLOOR),
             Duration::from_millis(1),
             Duration::from_secs(10),
@@ -1157,6 +1205,7 @@ mod pool_tests {
         const FLOOR: usize = 8;
         const JOBS: usize = 8;
         let pool = WorkerPool::try_elastic_tuned(
+            FILE_WORKER,
             bounds(FLOOR, FLOOR),
             Duration::from_millis(1),
             Duration::from_secs(10),
@@ -1194,6 +1243,7 @@ mod pool_tests {
         const JOBS: usize = 4;
         const FLOOR: usize = 8;
         let pool = WorkerPool::try_elastic_tuned(
+            FILE_WORKER,
             bounds(FLOOR, FLOOR),
             Duration::from_millis(1),
             Duration::from_secs(10),
@@ -1233,6 +1283,7 @@ mod pool_tests {
         const JOBS: usize = 4;
         const FLOOR: usize = 2;
         let pool = WorkerPool::try_elastic_tuned(
+            FILE_WORKER,
             bounds(FLOOR, JOBS),
             Duration::ZERO,
             Duration::from_secs(10),
@@ -1270,6 +1321,7 @@ mod pool_tests {
             [(16usize, FLOOR, "below"), (17, FLOOR + 1, "above")]
         {
             let pool = WorkerPool::try_elastic_tuned(
+                FILE_WORKER,
                 bounds(FLOOR, 64),
                 Duration::ZERO,
                 Duration::from_secs(10),
@@ -1299,6 +1351,7 @@ mod pool_tests {
     fn a_flush_of_one_does_not_grow_against_the_queue() {
         const FLOOR: usize = 2;
         let pool = WorkerPool::try_elastic_tuned(
+            FILE_WORKER,
             bounds(FLOOR, 64),
             Duration::ZERO,
             Duration::from_secs(10),
@@ -1326,6 +1379,7 @@ mod pool_tests {
     #[test]
     fn a_flush_publishes_the_deadline_it_returns() {
         let pool = WorkerPool::try_elastic_tuned(
+            FILE_WORKER,
             bounds(1, 1),
             Duration::from_millis(1),
             Duration::from_secs(10),
@@ -1372,6 +1426,7 @@ mod pool_tests {
     #[test]
     fn a_timed_wait_expiry_takes_a_job_nobody_claimed() {
         let pool = WorkerPool::try_elastic_tuned(
+            FILE_WORKER,
             bounds(1, 4),
             Duration::ZERO,
             Duration::from_millis(50),
@@ -1431,7 +1486,7 @@ mod pool_tests {
     /// A fixed pool (`floor == ceiling`) never grows, even when saturated.
     #[test]
     fn fixed_pool_does_not_grow() {
-        let pool = WorkerPool::try_elastic(bounds(2, 2)).unwrap();
+        let pool = WorkerPool::try_elastic(FILE_WORKER, bounds(2, 2)).unwrap();
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let (started_tx, started_rx) = mpsc::channel::<()>();
         for _ in 0..2 {
@@ -1460,13 +1515,50 @@ mod pool_tests {
         assert_eq!(total, 2, "fixed pool stayed at its worker count");
     }
 
+    /// A pool's threads carry its name, which is how `ps` tells the lookup
+    /// lane from the file pool.
+    #[test]
+    fn a_pools_threads_carry_its_name() {
+        let pool = SharedPool::new(LOOKUP_WORKER, bounds(1, 1));
+        let (tx, rx) = mpsc::channel();
+        pool.enqueue(Box::new(move || {
+            tx.send(thread::current().name().map(str::to_owned)).ok();
+        }));
+        let _ = pool.flush(1);
+        let name = rx.recv_timeout(Duration::from_secs(5)).expect("it ran");
+        assert_eq!(name.as_deref(), Some(LOOKUP_WORKER));
+    }
+
+    /// While a pool backs off a failed first spawn, `try_enqueue` hands a
+    /// job back unrun, and `enqueue` runs it inline on the caller's thread.
+    #[test]
+    fn a_pool_with_no_thread_hands_the_job_back_or_runs_it_inline() {
+        let pool = SharedPool::new(LOOKUP_WORKER, bounds(1, 1));
+        pool.back_off();
+        let (tx, rx) = mpsc::channel();
+        let early = tx.clone();
+        let back = pool.try_enqueue(Box::new(move || {
+            early.send("handed back").ok();
+        }));
+        assert!(back.is_err(), "with no thread the job comes back");
+        drop(back);
+        assert!(rx.try_recv().is_err(), "a job handed back has not run");
+        let caller = thread::current().id();
+        pool.enqueue(Box::new(move || {
+            let on = thread::current().id();
+            tx.send(if on == caller { "inline" } else { "worker" }).ok();
+        }));
+        assert_eq!(rx.try_recv(), Ok("inline"));
+        assert!(!pool.pool.is_set(), "nothing spawned while backing off");
+    }
+
     /// A job that ends up holding the pool's last `Arc` drops it on the worker
     /// it runs on, landing `WorkerPool::drop` there; that drop must not join the
     /// pool (it would wait on the running worker itself). Mirrors a
     /// `QueryPool::query` job outliving the reactor and every handle.
     #[test]
     fn dpool_query_job_holding_the_last_pool_arc_wedges_a_worker() {
-        let pool = SharedPool::new(bounds(1, 1));
+        let pool = SharedPool::new(FILE_WORKER, bounds(1, 1));
         // The job's own clone; once the outer `pool` drops it becomes the last.
         let held = Arc::clone(&pool);
         let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
@@ -1500,8 +1592,8 @@ mod pool_tests {
     /// `recv_timeout` below would see "b joined" arrive early.
     #[test]
     fn dpool_foreign_pool_dropped_on_a_worker_is_still_joined() {
-        let a = WorkerPool::try_elastic(bounds(1, 1)).unwrap();
-        let b = WorkerPool::try_elastic(bounds(1, 1)).unwrap();
+        let a = WorkerPool::try_elastic(FILE_WORKER, bounds(1, 1)).unwrap();
+        let b = WorkerPool::try_elastic(FILE_WORKER, bounds(1, 1)).unwrap();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let (started_tx, started_rx) = mpsc::channel::<()>();
         let (order_tx, order_rx) = mpsc::channel::<&'static str>();
@@ -1593,8 +1685,14 @@ mod loom_tests {
     /// A model's pool: no growth throttle and a zero stall threshold (loom
     /// has no clock), so every running worker counts as blocked at once.
     fn pool(floor: usize, ceiling: usize) -> WorkerPool {
-        WorkerPool::try_elastic_tuned(bounds(floor, ceiling), ZERO, ZERO, ZERO)
-            .expect("the model's pool always spawns")
+        WorkerPool::try_elastic_tuned(
+            FILE_WORKER,
+            bounds(floor, ceiling),
+            ZERO,
+            ZERO,
+            ZERO,
+        )
+        .expect("the model's pool always spawns")
     }
 
     fn counting_job(n: &Arc<AtomicUsize>) -> Job {
@@ -1987,7 +2085,7 @@ mod loom_tests {
     fn loom_shared_pool_init() {
         bounded_model(|| {
             let ran = Arc::new(AtomicUsize::new(0));
-            let sp = SharedPool::new(bounds(1, 1));
+            let sp = SharedPool::new(FILE_WORKER, bounds(1, 1));
             let wake = Arc::new(
                 WakeHandle::new().expect("the model's wake never fails"),
             );

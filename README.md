@@ -71,7 +71,9 @@ weaken (`open_confined`), confined `mkdir -p` (`mkdir_path`), `O_TMPFILE`
 publication (`linkat_file`), and an allowlist that lets a server keep its own
 metadata in the `trusted.` namespace, where local users cannot read or alter
 it - and a blocking-offload seam that runs a request's opcode-less metadata
-tail as one pool job, delivered back on the reactor thread.
+tail as one pool job, delivered back on the reactor thread. A second lane
+(`offload_lookup`) takes jobs that wait on another machine, such as a name
+service lookup, so they never hold a thread the file work needs.
 
 ### Identity
 
