@@ -2828,10 +2828,13 @@ mod tests {
         let h = FsHandle {
             tx,
             shared,
-            pool: offload_pool::SharedPool::new(OffloadBounds {
-                floor: 1,
-                ceiling: 1,
-            }),
+            pool: offload_pool::SharedPool::new(
+                offload_pool::FILE_WORKER,
+                OffloadBounds {
+                    floor: 1,
+                    ceiling: 1,
+                },
+            ),
         };
 
         // SAFETY: dup(2) returns a fresh owned descriptor or -1; stderr is
@@ -2892,10 +2895,13 @@ mod tests {
         let h = FsHandle {
             tx,
             shared,
-            pool: offload_pool::SharedPool::new(OffloadBounds {
-                floor: 1,
-                ceiling: 1,
-            }),
+            pool: offload_pool::SharedPool::new(
+                offload_pool::FILE_WORKER,
+                OffloadBounds {
+                    floor: 1,
+                    ceiling: 1,
+                },
+            ),
         };
 
         // SAFETY: dup(2) returns a fresh owned descriptor or -1; stderr is
@@ -3023,10 +3029,13 @@ mod loom_tests {
         let h = FsHandle {
             tx,
             shared: Arc::clone(&shared),
-            pool: offload_pool::SharedPool::new(OffloadBounds {
-                floor: 1,
-                ceiling: 1,
-            }),
+            pool: offload_pool::SharedPool::new(
+                offload_pool::FILE_WORKER,
+                OffloadBounds {
+                    floor: 1,
+                    ceiling: 1,
+                },
+            ),
         };
         (h, rx, shared)
     }

@@ -8603,6 +8603,82 @@ fn fs_dir_listing_replies_through_the_wake_drain() {
     assert_eq!(reply, b"3", "listing counted the three entries and replied");
 }
 
+/// A server's lookup lane takes its bounds from `ServerConfig`, and its
+/// results reach the handler's `Deferred` through the wake drain. The first
+/// lookup waits for the second, which runs alongside it only if the lane
+/// has a second thread. At a ceiling of one it cannot, so the first gives
+/// up and the reply says they ran one at a time.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn a_servers_lookup_lane_takes_its_bounds_from_the_config() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let body = |mut req: Request<'_, ()>| -> Response {
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close; // built without an fs pool
+        };
+        let (tx, rx) = mpsc::channel::<()>();
+        fs.offload_lookup(
+            move || Ok(rx.recv_timeout(Duration::from_secs(2)).is_ok()),
+            move |res, _fs| match res {
+                Ok(true) => deferred.reply(echo_frame(b"together")),
+                Ok(false) => deferred.reply(echo_frame(b"one at a time")),
+                Err(_) => deferred.close(),
+            },
+        );
+        fs.offload_lookup(
+            move || {
+                tx.send(()).ok();
+                Ok(())
+            },
+            |_res, _fs| {},
+        );
+        Response::Defer(permit)
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let cfg = ServerConfig {
+        pool_size: 16,
+        fs_ops: 16,
+        lookup_offload_floor: 1,
+        lookup_offload_ceiling: 1,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        let mut s = connect_tcp(v4)?;
+        s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        send_framed(&mut s, b"look")?;
+        let reply = recv_framed(&mut s);
+        drop(s);
+        // Unconditional, so serve_forever ends even on a timeout.
+        stop.shutdown();
+        reply
+    });
+    server.serve_forever().expect("serve_forever lookups");
+    let reply = client.join().unwrap().expect("client io");
+    assert_eq!(reply, b"one at a time", "the lane kept to one thread");
+}
+
 /// `FsConn::flistxattr` enumerates a file's xattr names on-loop: it opens the
 /// file on the ring, offloads the `flistxattr` to the pool, and delivers the
 /// names on the loop, answered via `Deferred` (same drain path as the listing).

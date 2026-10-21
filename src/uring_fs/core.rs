@@ -18,7 +18,9 @@
 //!   `(tag, op-slot, generation)`; an op entry frees only at its own single
 //!   terminal CQE, so a stale / duplicate / wrong-tag completion is rejected.
 
-use super::offload_pool::{OffloadBounds, SharedPool};
+use super::offload_pool::{
+    FILE_WORKER, Job, LOOKUP_WORKER, OffloadBounds, SharedPool,
+};
 use super::{
     Anchor, CONFINED_RESOLVE, File, FsOutcome, Leaf, Personality,
     PrivilegedXattrs, ReplyTo, RwFlags, statx_at_flags,
@@ -84,6 +86,14 @@ pub(crate) const OFFLOAD_FLOOR: usize = 4;
 /// them, and sizes both through
 /// [`OffloadBounds`](crate::uring_fs::OffloadBounds).
 pub(crate) const OFFLOAD_CEILING: usize = 64;
+/// Default warm floor of the lookup lane ([`FsConn::offload_lookup`]). One,
+/// since a lookup answered from a cache or a local file is quick, and the
+/// lane is there for the ones that wait.
+pub(crate) const LOOKUP_FLOOR: usize = 1;
+/// Default ceiling of the lookup lane, the same as [`OFFLOAD_CEILING`]. A job
+/// there may wait as long as a remote service's timeouts allow, holding a
+/// socket all the while, so this bounds the sockets as well as the threads.
+pub(crate) const LOOKUP_CEILING: usize = 64;
 /// Names per off-loop `readdir` batch in [`FsConn::next_batch`].
 const DIR_BATCH: usize = 256;
 
@@ -781,6 +791,21 @@ pub(crate) fn publish<T>(
         .push_back(item);
     wake.poke();
 }
+/// Wake `pool` for the `pending` jobs queued on it since its last flush, and
+/// return its next deadline ([`FsCore::flush_offloads`]).
+fn flush_pool(
+    pool: &SharedPool,
+    pending: usize,
+) -> Option<std::time::Duration> {
+    if pending == 0 {
+        let owed = pool.recheck_owed()?;
+        if !owed.is_zero() {
+            return Some(owed);
+        }
+    }
+    pool.flush(pending)
+}
+
 /// A type-erased on-loop continuation: it downcasts the boxed job result back to
 /// the job's `R` and calls the caller's `on_done` with a fresh `FsConn`.
 type OffloadDeliver = Box<dyn FnOnce(Box<dyn Any + Send>, &mut FsConn<'_>)>;
@@ -911,6 +936,13 @@ pub(crate) struct FsCore {
     pool: Arc<SharedPool>,
     /// Jobs queued on the pool since the last [`Self::flush_offloads`].
     pending_offloads: usize,
+    /// The lookup lane, a second pool for jobs that wait on another machine
+    /// ([`FsConn::offload_lookup`]), so they never hold a thread of the pool
+    /// above. Spawned on first use.
+    lookup: Arc<SharedPool>,
+    /// Jobs queued on the lookup lane since the last
+    /// [`Self::flush_offloads`].
+    pending_lookups: usize,
     /// Where workers push finished jobs; drained on the loop's wake.
     completions: Arc<Mutex<VecDeque<PoolCompletion>>>,
     /// Reactor-side continuations for in-flight offloads, keyed by token.
@@ -1018,8 +1050,16 @@ impl FsCore {
                 .collect(),
             op_free: (0..op_slots).rev().collect(),
             pump_selecting: 0,
-            pool: SharedPool::new(offload),
+            pool: SharedPool::new(FILE_WORKER, offload),
             pending_offloads: 0,
+            lookup: SharedPool::new(
+                LOOKUP_WORKER,
+                OffloadBounds {
+                    floor: LOOKUP_FLOOR,
+                    ceiling: LOOKUP_CEILING,
+                },
+            ),
+            pending_lookups: 0,
             completions: Arc::new(Mutex::new(VecDeque::new())),
             offload_reg: HashMap::new(),
             next_offload: 0,
@@ -1203,6 +1243,22 @@ impl FsCore {
         self.pending_offloads += 1;
     }
 
+    /// Size the lookup lane. The host calls it before its loop runs, so the
+    /// lane it replaces has spawned nothing.
+    #[cfg(any(test, feature = "net-server"))]
+    pub(crate) fn set_lookup_bounds(&mut self, bounds: OffloadBounds) {
+        self.lookup = SharedPool::new(LOOKUP_WORKER, bounds);
+    }
+
+    /// Queue `job` on the lookup lane as [`Self::submit_offload`] queues on
+    /// the file pool, or hand it back when the lane has no thread to run it
+    /// ([`SharedPool::try_enqueue`]).
+    fn submit_lookup(&mut self, job: Job) -> Result<(), Job> {
+        self.lookup.try_enqueue(job)?;
+        self.pending_lookups += 1;
+        Ok(())
+    }
+
     /// Wake the pool for everything queued since the last flush, and return
     /// how long the loop may sleep before it must flush again
     /// ([`WorkerPool::flush`]).
@@ -1217,16 +1273,16 @@ impl FsCore {
     /// claimed worker starts its job, so the check can run up to
     /// `OFFLOAD_WAKE_ALLOWANCE` late.
     ///
+    /// Both pools are flushed, the file pool and the lookup lane, and the
+    /// sooner of their deadlines is returned.
+    ///
     /// [`WorkerPool::flush`]: super::offload_pool::WorkerPool::flush
     pub(crate) fn flush_offloads(&mut self) -> Option<std::time::Duration> {
-        let pending = std::mem::take(&mut self.pending_offloads);
-        if pending == 0 {
-            let owed = self.pool.recheck_owed()?;
-            if !owed.is_zero() {
-                return Some(owed);
-            }
-        }
-        self.pool.flush(pending)
+        let file = std::mem::take(&mut self.pending_offloads);
+        let lookups = std::mem::take(&mut self.pending_lookups);
+        let file = flush_pool(&self.pool, file);
+        let lookups = flush_pool(&self.lookup, lookups);
+        file.into_iter().chain(lookups).min()
     }
 
     /// Remove a **server-owned** extended attribute on the blocking pool,
@@ -5653,6 +5709,48 @@ impl FsConn<'_> {
         });
     }
 
+    /// [`offload_result`](Self::offload_result) on the lookup lane, a second
+    /// pool of this ring for jobs that wait on another machine, such as a
+    /// lookup through the name service switch.
+    ///
+    /// The lane has bounds of its own (`ServerConfig::lookup_offload_floor`
+    /// and `lookup_offload_ceiling`), so lookups stalled on a service that
+    /// does not answer queue behind each other and never take a thread from
+    /// [`offload`](Self::offload), the listers or the copies.
+    ///
+    /// The job contract is [`offload`](Self::offload)'s, but a job here
+    /// never runs on the loop. When the lane cannot spawn its first thread,
+    /// and for a second after that failure, the job is dropped unrun and
+    /// `on_done` gets `EAGAIN` on the loop, delivered as a finished job's
+    /// result is. A job that returns `EAGAIN` itself cannot be told apart
+    /// from that, so a job that can fail in a way that may pass should carry
+    /// its own error inside `T`.
+    pub fn offload_lookup<T, J, F>(&mut self, job: J, on_done: F)
+    where
+        J: FnOnce() -> crate::Result<T> + Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(crate::Result<T>, &mut FsConn<'_>) + 'static,
+    {
+        let deliver: OffloadDeliver = Box::new(move |any, conn| {
+            if let Ok(r) = any.downcast::<thread::Result<crate::Result<T>>>() {
+                on_done((*r).unwrap_or_else(|_| Err(Errno::EIO.into())), conn);
+            }
+        });
+        let token = self.fs.register_offload(self.owner, deliver);
+        let sink = self.fs.completion_sink();
+        let wake = Arc::clone(&self.eng.shared);
+        let refused = self.fs.submit_lookup(Box::new(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            finish_offload(&sink, &wake.wake, token, Box::new(r));
+        }));
+        if refused.is_err() {
+            let r: thread::Result<crate::Result<T>> =
+                Ok(Err(Errno::EAGAIN.into()));
+            let wake = &self.eng.shared.wake;
+            finish_offload(&self.fs.completions, wake, token, Box::new(r));
+        }
+    }
+
     /// Offload a `flistxattr` of `f` to the pool and deliver its attribute
     /// names (all namespaces, sorted) on the loop. The list runs at the
     /// reactor's privilege, so it proposes candidates only: a caller relaying to
@@ -7452,6 +7550,210 @@ mod hybrid_tests {
         assert!(
             fs.offload_reg.is_empty(),
             "no continuation may be stranded in the registry"
+        );
+    }
+
+    /// The lookup lane delivers on the loop as `offload_result` does, a
+    /// panicked job as exactly `EIO`, and strands no registry entry. The
+    /// second lookup is queued once the lane's thread has parked, so it runs
+    /// only if the loop's flush wakes the lane.
+    #[test]
+    fn a_lookup_delivers_on_the_loop_and_a_panic_as_eio() {
+        let (mut eng, mut fs, _me) = setup();
+        let ok: Rc<RefCell<Option<crate::Result<u64>>>> = Rc::default();
+        let bad: Rc<RefCell<Option<crate::Result<u64>>>> = Rc::default();
+        let (o2, b2) = (ok.clone(), bad.clone());
+        // One thread at most, so the lane cannot grow, and its one thread
+        // parked is the whole lane at rest.
+        fs.set_lookup_bounds(OffloadBounds {
+            floor: 1,
+            ceiling: 1,
+        });
+        let lane = Arc::clone(&fs.lookup);
+        with_silent_panics(|| {
+            drive(
+                &mut eng,
+                &mut fs,
+                move |c| {
+                    c.offload_lookup(
+                        || Ok(41u64),
+                        move |r, c| {
+                            *o2.borrow_mut() = Some(r);
+                            let parking = std::time::Instant::now();
+                            while lane.parked() != Some(1) {
+                                assert!(
+                                    parking.elapsed().as_secs() < 5,
+                                    "the lane's thread never parked"
+                                );
+                                std::thread::yield_now();
+                            }
+                            c.offload_lookup(
+                                || -> crate::Result<u64> {
+                                    panic!("lookup blew up")
+                                },
+                                move |r, _c| *b2.borrow_mut() = Some(r),
+                            );
+                        },
+                    );
+                },
+                || ok.borrow().is_some() && bad.borrow().is_some(),
+            );
+        });
+        assert!(
+            matches!(*ok.borrow(), Some(Ok(41))),
+            "the Ok lookup's value passes through: {:?}",
+            ok.borrow()
+        );
+        assert!(
+            matches!(*bad.borrow(), Some(Err(crate::Error::Errno(Errno::EIO)))),
+            "a panicked lookup is exactly EIO: {:?}",
+            bad.borrow()
+        );
+        assert!(
+            fs.offload_reg.is_empty(),
+            "no continuation may be stranded in the registry"
+        );
+    }
+
+    /// A lookup that waits never holds a thread of the file pool, and the
+    /// lane's ceiling holds a second lookup back. Both pools are cut to one
+    /// thread, so the file job runs only if the waiting lookup is on a pool
+    /// of its own, and the second lookup runs only once the first ends.
+    #[test]
+    fn a_waiting_lookup_holds_no_file_thread_and_its_lane_stays_bounded() {
+        use std::time::{Duration, Instant};
+        let mut eng = Engine::new(256, 128).expect("engine");
+        let one = OffloadBounds {
+            floor: 1,
+            ceiling: 1,
+        };
+        let mut fs = FsCore::new(256, one);
+        fs.set_lookup_bounds(one);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let release = RefCell::new(Some(release));
+        let order: Rc<RefCell<Vec<&str>>> = Rc::default();
+        let seen: RefCell<Vec<&str>> = RefCell::default();
+        let (o1, o2, o3) = (order.clone(), order.clone(), order.clone());
+        let began = Instant::now();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                c.offload_lookup(
+                    move || {
+                        // Bounded, so a lane that shares the file pool fails
+                        // the order below rather than hanging the test.
+                        let _ = held.recv_timeout(Duration::from_secs(10));
+                        Ok(())
+                    },
+                    move |_r, _c| o1.borrow_mut().push("waiting"),
+                );
+                c.offload_lookup(
+                    || Ok(()),
+                    move |_r, _c| o2.borrow_mut().push("queued"),
+                );
+                c.offload(|| (), move |_r, _c| o3.borrow_mut().push("file"));
+            },
+            || {
+                // Long past the file job, a second lane thread would have
+                // run the queued lookup, were the ceiling not one.
+                let late = began.elapsed() > Duration::from_millis(200);
+                if late
+                    && order.borrow().contains(&"file")
+                    && let Some(release) = release.borrow_mut().take()
+                {
+                    seen.borrow_mut().clone_from(&order.borrow());
+                    release.send(()).ok();
+                }
+                order.borrow().len() == 3
+            },
+        );
+        assert_eq!(
+            *seen.borrow(),
+            ["file"],
+            "the file job ran while the lookup waited, and nothing else"
+        );
+        assert_eq!(*order.borrow(), ["file", "waiting", "queued"]);
+    }
+
+    /// A lane with no thread answers `EAGAIN` on the loop, on a later pass
+    /// and not inside the call, and never runs the job, which may wait
+    /// seconds where the loop must not.
+    #[test]
+    fn a_lane_with_no_thread_answers_eagain_without_running_the_job() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (mut eng, mut fs, _me) = setup();
+        fs.lookup.back_off();
+        let ran = Arc::new(AtomicBool::new(false));
+        let got: Rc<RefCell<Option<crate::Result<()>>>> = Rc::default();
+        let (r2, g2, g3) = (ran.clone(), got.clone(), got.clone());
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                c.offload_lookup(
+                    move || {
+                        r2.store(true, Ordering::Relaxed);
+                        Ok(())
+                    },
+                    move |r, _c| *g2.borrow_mut() = Some(r),
+                );
+                assert!(g3.borrow().is_none(), "answered inside the call");
+            },
+            || got.borrow().is_some(),
+        );
+        assert!(
+            matches!(
+                *got.borrow(),
+                Some(Err(crate::Error::Errno(Errno::EAGAIN)))
+            ),
+            "a lane with no thread is EAGAIN: {:?}",
+            got.borrow()
+        );
+        assert!(!ran.load(Ordering::Relaxed), "the job ran on the loop");
+        assert!(
+            fs.offload_reg.is_empty(),
+            "no continuation may be stranded in the registry"
+        );
+    }
+
+    /// Lookups that wait together each get a thread of the lane, though the
+    /// loop sleeps right after queueing them. The lane grows past its floor
+    /// only at the deadline its flush returns, so the jobs meet at the
+    /// barrier in time only if the loop wakes for the lane's deadline as
+    /// well as the file pool's.
+    #[test]
+    fn lookups_that_wait_together_each_get_a_thread() {
+        const JOBS: usize = 3;
+        const { assert!(LOOKUP_FLOOR < JOBS, "the fixture must need growth") };
+        let (mut eng, mut fs, _me) = setup();
+        let barrier = Arc::new(std::sync::Barrier::new(JOBS));
+        let done = Rc::new(Cell::new(0usize));
+        let d2 = done.clone();
+        let began = std::time::Instant::now();
+        drive(
+            &mut eng,
+            &mut fs,
+            move |c| {
+                for _ in 0..JOBS {
+                    let b = Arc::clone(&barrier);
+                    let d = d2.clone();
+                    c.offload_lookup(
+                        move || {
+                            b.wait();
+                            Ok(())
+                        },
+                        move |_r, _c| d.set(d.get() + 1),
+                    );
+                }
+            },
+            || done.get() == JOBS,
+        );
+        let took = began.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "the waiting lookups got their threads only after {took:?}, so \
+             the loop slept through the lane's deadline"
         );
     }
 

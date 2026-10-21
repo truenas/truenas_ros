@@ -920,6 +920,10 @@ where
             // only `READ` and `WRITE` from it; passing the whole set keeps
             // one knob rather than two halves that can drift.
             fs.set_force_async(cfg.force_async);
+            fs.set_lookup_bounds(crate::uring_fs::OffloadBounds {
+                floor: cfg.lookup_offload_floor,
+                ceiling: cfg.lookup_offload_ceiling,
+            });
             fs
         });
         let mut core =

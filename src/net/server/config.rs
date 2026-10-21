@@ -100,6 +100,23 @@ pub struct ServerConfig {
     /// they queue, not to request volume.
     #[cfg(feature = "uring-fs")]
     pub fs_offload_ceiling: usize,
+    /// Warm floor of the lookup lane, the second offload pool of each ring,
+    /// for jobs that wait on another machine (`FsConn::offload_lookup`).
+    /// Default `uring_fs::core::LOOKUP_FLOOR`.
+    ///
+    /// **Per server/ring, and resident** once the lane is first used. A
+    /// server that never offloads a lookup spawns none.
+    #[cfg(feature = "uring-fs")]
+    pub lookup_offload_floor: usize,
+    /// Ceiling the lookup lane grows to when every one of its workers is
+    /// waiting. Default `uring_fs::core::LOOKUP_CEILING`.
+    ///
+    /// **Per server/ring.** A job on the lane may hold a socket until a
+    /// remote service answers or times out, so this bounds the sockets the
+    /// lane holds as well as its threads. Jobs past it wait in the lane's
+    /// queue holding neither.
+    #[cfg(feature = "uring-fs")]
+    pub lookup_offload_ceiling: usize,
     /// Chunk size for file-sourced reply bodies (`Response::ReplyFile`): each
     /// body read moves at most this many bytes, into a ring buffer the
     /// kernel picks at completion. Default 256 KiB; validated to
@@ -441,6 +458,10 @@ impl Default for ServerConfig {
             #[cfg(feature = "uring-fs")]
             fs_offload_ceiling: crate::uring_fs::core::OFFLOAD_CEILING,
             #[cfg(feature = "uring-fs")]
+            lookup_offload_floor: crate::uring_fs::core::LOOKUP_FLOOR,
+            #[cfg(feature = "uring-fs")]
+            lookup_offload_ceiling: crate::uring_fs::core::LOOKUP_CEILING,
+            #[cfg(feature = "uring-fs")]
             fs_body_chunk: 256 * 1024,
             #[cfg(feature = "uring-fs")]
             fs_body_pool: true,
@@ -524,6 +545,16 @@ impl ServerConfig {
             return Err(Error::Validation(format!(
                 "fs_offload_floor must be in \
                  1..=fs_offload_ceiling..={MAX_OFFLOAD_THREADS}"
+            )));
+        }
+        #[cfg(feature = "uring-fs")]
+        if self.lookup_offload_floor == 0
+            || self.lookup_offload_floor > self.lookup_offload_ceiling
+            || self.lookup_offload_ceiling > MAX_OFFLOAD_THREADS
+        {
+            return Err(Error::Validation(format!(
+                "lookup_offload_floor must be in \
+                 1..=lookup_offload_ceiling..={MAX_OFFLOAD_THREADS}"
             )));
         }
         // A chunk sizes one of two per-connection body buffers, and a read's
@@ -732,10 +763,11 @@ mod tests {
     }
 
     /// The offload bounds spawn real threads on the reactor thread at first
-    /// use, so they are bounded at construction like every other sizing knob.
+    /// use, so they are bounded at construction like every other sizing knob,
+    /// for the file pool and the lookup lane alike.
     #[cfg(feature = "uring-fs")]
     #[test]
-    fn validate_bounds_the_offload_pool() {
+    fn validate_bounds_both_offload_pools() {
         let a = addrs();
         assert!(ServerConfig::default().validate(&a).is_ok());
         for (floor, ceiling) in [
@@ -744,16 +776,25 @@ mod tests {
             (1, MAX_OFFLOAD_THREADS + 1), // ceiling past the cap
             (usize::MAX, usize::MAX),     // the thread storm
         ] {
-            let cfg = ServerConfig {
+            let file = ServerConfig {
                 fs_offload_floor: floor,
                 fs_offload_ceiling: ceiling,
                 ..ServerConfig::default()
             };
-            let e = cfg.validate(&a).unwrap_err().to_string();
-            assert!(
-                e.contains("fs_offload_floor"),
-                "({floor}, {ceiling}) accepted or wrong error: {e}"
-            );
+            let lookup = ServerConfig {
+                lookup_offload_floor: floor,
+                lookup_offload_ceiling: ceiling,
+                ..ServerConfig::default()
+            };
+            for (cfg, knob) in
+                [(file, "fs_offload_floor"), (lookup, "lookup_offload_floor")]
+            {
+                let e = cfg.validate(&a).unwrap_err().to_string();
+                assert!(
+                    e.contains(knob),
+                    "{knob} ({floor}, {ceiling}) accepted or wrong error: {e}"
+                );
+            }
         }
     }
 
