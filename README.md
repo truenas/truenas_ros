@@ -85,6 +85,9 @@ acting as an authenticated peer goes through `CredBroker`, a forked process
 that impersonates a user just long enough to snapshot their credentials, so
 the reactor process never changes identity itself. Wrap it in an
 `IdentityCache` to register once per identity rather than once per connection.
+The broker mints no root personality unless it is spawned with
+`CredBroker::spawn_with_root`, and then only with capabilities inside a root
+limit fixed at spawn, apart from the limit for every other identity.
 
 ```rust
 use truenas_ros::uring_fs::{AsUser, CredBroker, FsConfig, UringFs};

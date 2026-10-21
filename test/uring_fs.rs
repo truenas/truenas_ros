@@ -2059,6 +2059,23 @@ fn with_broker_caps<F>(allowed: Caps, client: F)
 where
     F: FnOnce(&FsHandle, &CredHandle, Personality, &Path) + Send,
 {
+    with_broker_policy(allowed, None, client)
+}
+
+/// [`with_broker_caps`] with a root limit too, through
+/// `CredBroker::spawn_with_root`.
+fn with_broker_root<F>(allowed: Caps, root: Caps, client: F)
+where
+    F: FnOnce(&FsHandle, &CredHandle, Personality, &Path) + Send,
+{
+    with_broker_policy(allowed, Some(root), client)
+}
+
+/// The body of [`with_broker_caps`] and [`with_broker_root`].
+fn with_broker_policy<F>(allowed: Caps, root: Option<Caps>, client: F)
+where
+    F: FnOnce(&FsHandle, &CredHandle, Personality, &Path) + Send,
+{
     pin_umask();
     let dir = truenas_ros::tempdir().expect("tempdir");
     // These tests drive ops as an impersonated user, who must be able to
@@ -2082,7 +2099,11 @@ where
         }
     };
     let me = afs.register_self().expect("register_self");
-    let broker = match CredBroker::spawn_with_caps(&[&afs], allowed) {
+    let spawned = match root {
+        None => CredBroker::spawn_with_caps(&[&afs], allowed),
+        Some(root) => CredBroker::spawn_with_root(&[&afs], allowed, root),
+    };
+    let broker = match spawned {
         Ok(b) => b,
         Err(e) => {
             if should_skip(&e) {
@@ -3673,8 +3694,9 @@ fn broker_registers_own_identity_unprivileged() {
 #[test]
 fn broker_refuses_uid_zero() {
     with_broker(|_h, creds, _me, _dir| {
-        // A root personality would carry the daemon's capabilities - the
-        // exact thing the broker exists to prevent.
+        // With no root limit fixed at spawn, uid 0 is refused outright. A
+        // root personality carrying the daemon's capabilities is the exact
+        // thing the broker exists to prevent.
         assert!(matches!(
             creds.register(&AsUser::new(0, 0)),
             Err(Error::Validation(_))
@@ -4614,6 +4636,166 @@ fn identity_cache_keys_on_the_capability_set() {
             cache.acquire(&plain).unwrap().personality().id(),
             a.personality().id()
         );
+    });
+}
+
+/// The six capabilities a file service grants its superuser, the ones its
+/// file calls check.
+const ROOT_SET: Caps = Caps::CHOWN
+    .union(Caps::DAC_OVERRIDE)
+    .union(Caps::DAC_READ_SEARCH)
+    .union(Caps::FOWNER)
+    .union(Caps::FSETID)
+    .union(Caps::MKNOD);
+
+/// A root personality carries exactly what it asked for within the root
+/// limit, and nothing of the broker's own authority. Asking for nothing,
+/// uid 0 cannot open its own mode-0000 file for writing. Asking for the set,
+/// it can, through `CAP_DAC_OVERRIDE`. What it creates is owned by uid 0 and
+/// the gid it asked for. It still cannot set a `trusted.` xattr, which needs
+/// `CAP_SYS_ADMIN` (`xattr_permission`, `fs/xattr.c`), though the daemon's
+/// own personality can.
+#[test]
+fn a_root_personality_carries_exactly_what_it_asked_for() {
+    if !root_or_skip("a_root_personality_carries_exactly_what_it_asked_for") {
+        return;
+    }
+    with_broker_root(Caps::empty(), ROOT_SET, |h, creds, me, dir| {
+        std::fs::write(dir.join("locked"), b"x").unwrap();
+        std::fs::set_permissions(
+            dir.join("locked"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let anchor = Anchor::open(dir).unwrap();
+        let rdwr = || OpenHow::new().flags(OFlag::O_RDWR);
+
+        let bare = creds.register(&AsUser::new(0, 4400)).unwrap();
+        assert!(
+            matches!(
+                h.open(bare, &anchor, "locked", rdwr()),
+                Err(Error::Errno(Errno::EACCES))
+            ),
+            "uid 0 with no capability is held to the mode like its owner"
+        );
+
+        let full = AsUser::new(0, 4400).groups(vec![4401]).caps(ROOT_SET);
+        let full = creds.register(&full).unwrap();
+        let f = h
+            .open(full, &anchor, "locked", rdwr())
+            .expect("CAP_DAC_OVERRIDE opens a mode-0000 file for writing");
+        h.close(f).unwrap();
+
+        let create = OpenHow::new()
+            .flags(OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR)
+            .mode(Mode::from_bits_truncate(0o644));
+        let f = h.open(full, &anchor, "made", create).expect("create");
+        let seen = h
+            .fstatx(full, &f, AtFlags::empty(), StatxMask::BASIC_STATS)
+            .unwrap();
+        assert_eq!((seen.uid(), seen.gid()), (0, 4400));
+
+        let name = xattr_name("trusted.truenas_ros_root_test");
+        let (res, _) = h.fsetxattr(me, &f, name.clone(), b"v".to_vec(), 0);
+        if fd_xattr_ok("a trusted xattr set as the daemon", &res) {
+            let (res, _) = h.fsetxattr(full, &f, name, b"v".to_vec(), 0);
+            assert!(
+                matches!(res, Err(Error::Errno(Errno::EPERM))),
+                "a root personality holds no CAP_SYS_ADMIN, got {res:?}"
+            );
+        }
+        h.close(f).unwrap();
+        creds.unregister(bare).unwrap();
+        creds.unregister(full).unwrap();
+    });
+}
+
+/// The root limit is a ceiling for uid 0, as the other limit is for every
+/// other identity, and neither stands in for the other. A root request for
+/// a capability outside the root limit is refused `EPERM`, and so is a
+/// request of another identity for a capability that only the root limit
+/// holds.
+#[test]
+fn the_root_limit_binds_uid_0_alone() {
+    if !root_or_skip("the_root_limit_binds_uid_0_alone") {
+        return;
+    }
+    let (allowed, root) = (Caps::DAC_READ_SEARCH, Caps::DAC_OVERRIDE);
+    with_broker_root(allowed, root, |_h, creds, _me, _dir| {
+        let eperm = |who: &AsUser| {
+            matches!(creds.register(who), Err(Error::Errno(Errno::EPERM)))
+        };
+        assert!(eperm(&AsUser::new(0, 0).caps(Caps::DAC_READ_SEARCH)));
+        let nobody = AsUser::new(CAP_NOBODY_UID, CAP_NOBODY_GID);
+        assert!(eperm(&nobody.clone().caps(Caps::DAC_OVERRIDE)));
+        let inside = creds.register(&AsUser::new(0, 0).caps(root)).unwrap();
+        let other = creds.register(&nobody.caps(allowed)).unwrap();
+        creds.unregister(inside).unwrap();
+        creds.unregister(other).unwrap();
+    });
+}
+
+/// `Caps::ROOT_ONLY` belongs to the root limit alone. In the limit for
+/// other identities it is refused before the broker forks, so the caller
+/// keeps the power to impersonate and may spawn again.
+#[test]
+fn root_only_capabilities_are_refused_in_the_other_limit() {
+    let afs = match UringFs::new(test_cfg()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("UringFs::new: {e}"),
+    };
+    for only in [Caps::CHOWN, Caps::FSETID, Caps::MKNOD] {
+        assert!(matches!(
+            CredBroker::spawn_with_caps(&[&afs], only),
+            Err(Error::Validation(_))
+        ));
+        assert!(matches!(
+            CredBroker::spawn_with_root(&[&afs], only, ROOT_SET),
+            Err(Error::Validation(_))
+        ));
+    }
+}
+
+/// Minting root narrows the broker's own effective set without leaving uid
+/// 0, so the window's revert must give it back before it restores the gid
+/// and the groups, which need `CAP_SETGID`. Done in the wrong order, the
+/// broker would keep the root personality's gid, groups and capabilities,
+/// and refuse the next identity. Here it impersonates nobody after root,
+/// and that personality still holds nothing beyond nobody's own authority.
+#[test]
+fn the_broker_impersonates_again_after_minting_root() {
+    if !root_or_skip("the_broker_impersonates_again_after_minting_root") {
+        return;
+    }
+    with_broker_root(Caps::empty(), ROOT_SET, |h, creds, _me, dir| {
+        std::fs::write(dir.join("secret"), b"root only").unwrap();
+        std::fs::set_permissions(
+            dir.join("secret"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let anchor = Anchor::open(dir).unwrap();
+        let root = AsUser::new(0, 4400).groups(vec![4401]).caps(ROOT_SET);
+        let root = creds.register(&root).unwrap();
+        let nobody = creds
+            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
+            .expect("the broker still impersonates after minting root");
+        assert!(
+            matches!(
+                h.open(nobody, &anchor, "secret", rdonly()),
+                Err(Error::Errno(Errno::EACCES))
+            ),
+            "nobody holds nothing of the root personality before it"
+        );
+        let f = h.open(root, &anchor, "secret", rdonly()).expect("root");
+        h.close(f).unwrap();
+        let again = creds
+            .register(&AsUser::new(0, 0).caps(Caps::DAC_OVERRIDE))
+            .expect("and mints root again");
+        for id in [root, nobody, again] {
+            creds.unregister(id).unwrap();
+        }
     });
 }
 
