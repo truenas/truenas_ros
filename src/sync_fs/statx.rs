@@ -1,6 +1,6 @@
 //! `statx(2)` - extended file attributes.
 
-use super::AtFlags;
+use super::{AtFlags, ZfsAttr};
 use crate::errno::{self, retry_on_eintr};
 use crate::path::TnPath;
 use std::mem::MaybeUninit;
@@ -48,6 +48,9 @@ tn_bitflags! {
         WRITE_ATOMIC = 0x0001_0000;
         /// Want/got the direct-I/O read alignment info.
         DIO_READ_ALIGN = 0x0002_0000;
+        /// Want/got the ZFS flags (`stx_zfsflags`, [`Statx::zfs_attrs`] and
+        /// [`Statx::nfs4_acl_is_trivial`]).
+        ZFSFLAGS = 0x1000_0000;
         /// Want/got the inode generation (`stx_gen`, [`Statx::generation`]).
         GEN = 0x2000_0000;
         /// Want/got the change cookie (durable/persistent handle support).
@@ -128,17 +131,18 @@ pub struct StatxRaw {
     pub __spare2: u32,
     pub stx_change_cookie: u64,
     pub stx_gen: u64,
-    pub __spare3: [u64; 6],
+    pub stx_zfsflags: u64,
+    pub __spare3: [u64; 5],
 }
 
 const _: () = assert!(core::mem::size_of::<StatxTimestampRaw>() == 16);
 const _: () = assert!(core::mem::size_of::<StatxRaw>() == 256);
-// The fork's `include/uapi/linux/stat.h` still marks `0xc0` above
-// `__spare3`, but the change cookie took that slot and the generation the
-// next one: a reader trusting the marker reads the spare word instead.
+// The fork's three fields follow the atomic-write words in this order, and
+// `include/uapi/linux/stat.h` marks the spare words behind them at `0xd8`.
 const _: () =
     assert!(core::mem::offset_of!(StatxRaw, stx_change_cookie) == 0xc0);
 const _: () = assert!(core::mem::offset_of!(StatxRaw, stx_gen) == 0xc8);
+const _: () = assert!(core::mem::offset_of!(StatxRaw, stx_zfsflags) == 0xd0);
 
 /// A timestamp from [`statx`], as whole seconds plus a nanosecond remainder.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -325,6 +329,45 @@ impl Statx {
             .then_some(self.0.stx_gen)
     }
 
+    /// The DOS attributes of a ZFS file, the bits
+    /// [`fget_zfs_attrs`](super::fget_zfs_attrs) reads, from the same
+    /// `statx` and through any descriptor, `O_PATH` included, where the ioctl
+    /// needs one opened for I/O.
+    ///
+    /// `None` unless [`StatxMask::ZFSFLAGS`] was requested *and* the
+    /// filesystem supplied it. Only the TrueNAS fork passes the field through
+    /// `cp_statx` (under `CONFIG_TRUENAS`, fs/stat.c), and only ZFS fills
+    /// it, from `z_pflags` cut to `ZFS_DOS_FL_USER_VISIBLE`
+    /// (`zpl_getattr_impl`, module/os/linux/zfs/zpl_inode.c), the mask
+    /// `zpl_ioctl_getdosflags` answers with too. The field's other bit,
+    /// `ZFS_ACL_TRIVIAL`, is [`nfs4_acl_is_trivial`](Self::nfs4_acl_is_trivial)'s
+    /// and is left out here, since the setter refuses it.
+    pub fn zfs_attrs(&self) -> Option<ZfsAttr> {
+        self.mask()
+            .contains(StatxMask::ZFSFLAGS)
+            .then(|| ZfsAttr::from_bits_truncate(self.0.stx_zfsflags))
+    }
+
+    /// Whether ZFS holds the file's NFSv4 ACL as trivial, one the mode
+    /// bits say all of (`ZFS_ACL_TRIVIAL`, include/sys/zfs_znode.h).
+    ///
+    /// `None` unless [`StatxMask::ZFSFLAGS`] was requested and supplied, as
+    /// for [`zfs_attrs`](Self::zfs_attrs). **Meaningful on an `acltype=nfsv4`
+    /// dataset alone.** `zpl_getattr_impl` reports the bit only there, since
+    /// only there does a trivial ACL send the permission check back to the
+    /// mode (`zpl_permission`, module/os/linux/zfs/zpl_xattr.c), so on any
+    /// other acltype this is `Some(false)` whatever the file holds. It is the
+    /// bit `zfs_getacl` turns into `ACL_IS_TRIVIAL` in the flags of
+    /// `system.nfs4_acl_xdr` (module/os/linux/zfs/zfs_acl.c), so it answers
+    /// what reading that attribute would, with no read.
+    pub fn nfs4_acl_is_trivial(&self) -> Option<bool> {
+        // `include/sys/zfs_znode.h`.
+        const ZFS_ACL_TRIVIAL: u64 = 0x4;
+        self.mask()
+            .contains(StatxMask::ZFSFLAGS)
+            .then_some(self.0.stx_zfsflags & ZFS_ACL_TRIVIAL != 0)
+    }
+
     /// Last access time.
     pub fn atime(&self) -> StatxTimestamp {
         ts(self.0.stx_atime)
@@ -431,4 +474,43 @@ where
     res?;
     // SAFETY: `statx` succeeded, so it initialised the whole `struct statx`.
     Ok(Statx(unsafe { buf.assume_init() }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `struct statx` whose mask is `mask` and whose ZFS flags are `flags`,
+    /// every other field zero.
+    fn filled(mask: StatxMask, flags: u64) -> Statx {
+        // SAFETY: `StatxRaw` is plain integers, for which all zero bits are
+        // a valid value.
+        let mut raw: StatxRaw = unsafe { std::mem::zeroed() };
+        raw.stx_mask = mask.bits();
+        raw.stx_zfsflags = flags;
+        Statx::from_raw(raw)
+    }
+
+    /// The values are those of `include/sys/fs/zfs.h` and
+    /// `include/sys/zfs_znode.h`, written out by hand. HIDDEN is
+    /// 0x0000000200000000, ARCHIVE 0x0000000800000000, ZFS_ACL_TRIVIAL 0x4,
+    /// and ZFS_AV_MODIFIED 0x0000040000000000, which ZFS keeps to itself.
+    #[test]
+    fn the_zfs_flags_split_into_the_dos_attributes_and_the_trivial_bit() {
+        let flags = 0x0000_0002_0000_0000
+            | 0x0000_0008_0000_0000
+            | 0x4
+            | 0x0000_0400_0000_0000;
+        let st = filled(StatxMask::ZFSFLAGS, flags);
+        assert_eq!(st.zfs_attrs(), Some(ZfsAttr::HIDDEN | ZfsAttr::ARCHIVE));
+        assert_eq!(st.nfs4_acl_is_trivial(), Some(true));
+        let st = filled(StatxMask::ZFSFLAGS, 0x0000_0002_0000_0000);
+        assert_eq!(st.zfs_attrs(), Some(ZfsAttr::HIDDEN));
+        assert_eq!(st.nfs4_acl_is_trivial(), Some(false));
+        // A kernel that did not fill the field leaves its bit out of the
+        // mask, and whatever the field holds then means nothing.
+        let st = filled(StatxMask::BASIC_STATS, flags);
+        assert_eq!(st.zfs_attrs(), None);
+        assert_eq!(st.nfs4_acl_is_trivial(), None);
+    }
 }

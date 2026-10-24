@@ -4386,6 +4386,51 @@ fn change_cookie_moves_on_writes_and_not_on_reads() {
     });
 }
 
+/// The ring's statx gives the ZFS flags the ioctl gives, since
+/// `IORING_OP_STATX` ends in the same `cp_statx` as the blocking call.
+///
+/// Runs on a **ZFS dataset**, and as root, since it sets a flag. Two gates are
+/// armed in the QEMU job, `TRUENAS_ROS_REQUIRE_ZFS` for the dataset and
+/// `TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS` for the field.
+#[test]
+fn the_rings_statx_gives_the_zfs_flags() {
+    use std::os::fd::{AsFd, OwnedFd};
+    use truenas_ros::sync_fs::{ZfsAttr, fget_zfs_attrs, fset_zfs_attrs};
+
+    let Some(ds) = zfs_dir_or_skip() else {
+        return;
+    };
+    with_fs(test_cfg(), |h, me, _dir, _stop| {
+        let path = ds.join(format!("rostest_zfsflags_{}", std::process::id()));
+        std::fs::write(&path, b"").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        // The setter takes the whole mask, so the bits ZFS set at create
+        // stay.
+        let attrs = fget_zfs_attrs(file.as_fd()).unwrap() | ZfsAttr::HIDDEN;
+        fset_zfs_attrs(file.as_fd(), attrs).unwrap();
+        let f = File::from_fd(OwnedFd::from(file));
+        let st = h.fstatx(me, &f, AtFlags::empty(), StatxMask::ZFSFLAGS);
+        h.close(f).expect("close");
+        std::fs::remove_file(&path).unwrap();
+        let st = st.expect("fstatx");
+        let Some(seen) = st.zfs_attrs() else {
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS")
+                    .is_none(),
+                "TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS is set but the dataset at \
+                 {} reports none through the ring",
+                ds.display()
+            );
+            return;
+        };
+        assert_eq!(seen, attrs);
+    });
+}
+
 /// A file opened by handle outside the ring and wrapped answers the ring's
 /// statx with the object number and generation its handle carries, and a
 /// ring read gives back its bytes.
