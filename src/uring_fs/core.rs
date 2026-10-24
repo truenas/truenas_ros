@@ -29,7 +29,7 @@ use crate::errno::{Errno, retry_on_eintr};
 use crate::sync_fs::openat2::RawOpenHow;
 use crate::sync_fs::{
     AtFlags, Mode, OFlag, OpenHow, RenameFlags, Statfs, Statx, StatxMask,
-    StatxRaw, ZfsAttr,
+    StatxRaw, ZFS_SETATTR, ZfsAttr, ZfsSetattr,
 };
 use crate::uring::engine::Engine;
 use crate::uring::force_async::ForceAsync;
@@ -4810,6 +4810,23 @@ impl<'a> FsConn<'a> {
             flags as u32,
             on_done,
         );
+    }
+
+    /// Set what `set` names on `f` as `who`, in one `FSETXATTR` of
+    /// [`ZFS_SETATTR`], so the kernel's checks run as `who`.
+    ///
+    /// [`ZfsSetattr`] says which checks apply, and a ZFS without the handler
+    /// answers `EOPNOTSUPP`.
+    pub fn fset_attrs<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        set: &ZfsSetattr,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.fsetxattr(who, f, ZFS_SETATTR, set.to_bytes(), 0, on_done);
     }
 
     /// Set `f`'s length to `len` (`ftruncate`). Needs Linux >= 6.9.

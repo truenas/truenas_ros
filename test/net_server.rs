@@ -9348,6 +9348,127 @@ fn server_privileged_xattr_policy_reaches_the_embedded_reactor() {
     assert!(get_xattr_raw(&fp, c"trusted.test_x").is_none());
 }
 
+#[cfg(feature = "uring-fs")]
+#[path = "support/zfs_dir.rs"]
+mod zfs_dir;
+
+/// `FsConn::fset_attrs` sets a mode and a ZFS attribute in one call through
+/// the embedded reactor, as `FsHandle::fset_attrs` does off it. Runs as root
+/// on ZFS, and `TRUENAS_ROS_REQUIRE_ZFS_SETATTR` fails a ZFS whose answer is
+/// `EOPNOTSUPP` for want of the handler of `system.truenas_setattr`.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn the_embedded_reactor_sets_attributes_in_one_call() {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::OnceLock;
+    use truenas_ros::sync_fs::{
+        Mode, OFlag, OpenHow, ZfsAttr, ZfsSetattr, fget_zfs_attrs,
+    };
+    use truenas_ros::uring_fs::{Anchor, Personality};
+
+    if !root_or_skip("the_embedded_reactor_sets_attributes_in_one_call") {
+        return;
+    }
+    let Some(ds) = zfs_dir::zfs_dir_or_skip() else {
+        return;
+    };
+    let dir = ds.join(format!("rostest_setattr_conn_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let fp = dir.join("f");
+    std::fs::write(&fp, b"x").unwrap();
+    std::fs::set_permissions(&fp, std::fs::Permissions::from_mode(0o644))
+        .unwrap();
+    let anchor = Anchor::open(&dir).expect("anchor open");
+
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let pc = Arc::clone(&pers);
+    let body = move |mut req: Request<'_, ()>| -> Response {
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let how = OpenHow::new().flags(OFlag::O_RDONLY);
+        fs.open(who, &anchor, c"f", how, move |done, fs| {
+            let Some(file) = done.file() else {
+                return deferred.reply(echo_frame(
+                    format!("OPEN {:?}", done.result()).as_bytes(),
+                ));
+            };
+            let set = ZfsSetattr::new()
+                .mode(Mode::from_bits_truncate(0o600))
+                .dos(ZfsAttr::HIDDEN, ZfsAttr::empty());
+            fs.fset_attrs(who, file, &set, move |out, _fs| {
+                let text = match out.result() {
+                    Ok(_) => "set".to_owned(),
+                    Err(e) => format!("SET {e:?}"),
+                };
+                deferred.reply(echo_frame(text.as_bytes()));
+            });
+        });
+        Response::Defer(permit)
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let cfg = ServerConfig {
+        pool_size: 16,
+        fs_ops: 16,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    pers.set(server.register_self().expect("register_self"))
+        .unwrap();
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        let mut s = connect_tcp(v4)?;
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        send_framed(&mut s, b"go")?;
+        let reply = recv_framed(&mut s);
+        drop(s);
+        stop.shutdown();
+        reply
+    });
+    server.serve_forever().expect("serve_forever fset_attrs");
+    let reply = client.join().unwrap().expect("client io");
+    let text = String::from_utf8_lossy(&reply).into_owned();
+    if text.contains("EOPNOTSUPP") {
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_ZFS_SETATTR").is_none(),
+            "TRUENAS_ROS_REQUIRE_ZFS_SETATTR is set but this ZFS has no \
+             handler for system.truenas_setattr"
+        );
+        return;
+    }
+    assert_eq!(text, "set", "the set through the reactor");
+    let mode = std::fs::metadata(&fp).unwrap().permissions().mode();
+    let file = std::fs::File::open(&fp).unwrap();
+    let hidden = fget_zfs_attrs(file.as_fd())
+        .unwrap()
+        .contains(ZfsAttr::HIDDEN);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!((mode & 0o7777, hidden), (0o600, true));
+}
+
 /// `FsConn::fgetxattr_as_root` reads an xattr under the reactor's ambient
 /// (root) credentials (`sqe.personality = 0`) - the sanctioned privileged-read
 /// path for a `trusted.*`/`security.*` attribute a request's own identity

@@ -393,7 +393,7 @@ use crate::path::TnPath;
 use crate::sync_fs::openat2::RawOpenHow;
 use crate::sync_fs::{
     AtFlags, Mode, OFlag, OpenHow, RenameFlags, ResolveFlag, Statfs, Statx,
-    StatxMask, StatxRaw, ZfsAttr,
+    StatxMask, StatxRaw, ZFS_SETATTR, ZfsAttr, ZfsSetattr,
 };
 use crate::uring::wake::LoopShared;
 use std::borrow::Cow;
@@ -1963,6 +1963,21 @@ impl FsHandle {
             flags as u32,
         );
         (res.map(|_| ()), buf)
+    }
+
+    /// Set what `set` names on `f` as `who`, in one `FSETXATTR` of
+    /// [`ZFS_SETATTR`], so the kernel's checks run as `who`.
+    ///
+    /// [`ZfsSetattr`] says which checks apply, and a ZFS without the handler
+    /// answers `EOPNOTSUPP`. Needs Linux >= 6.13, like
+    /// [`fsetxattr`](Self::fsetxattr).
+    pub fn fset_attrs(
+        &self,
+        who: Personality,
+        f: &File,
+        set: &ZfsSetattr,
+    ) -> crate::Result<()> {
+        self.fsetxattr(who, f, ZFS_SETATTR, set.to_bytes(), 0).0
     }
 
     /// List the extended-attribute names on the open file `f` (all namespaces).
