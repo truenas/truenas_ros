@@ -19,14 +19,15 @@ use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use truenas_ros::AT_FDCWD;
 use truenas_ros::sync_fs::acl::{
     Acl, Nfs4Ace, Nfs4AceType, Nfs4Acl, Nfs4AclFlag, Nfs4Flag, Nfs4Perm,
     Nfs4Who, PosixAce, PosixAcl, PosixPerm, PosixTag, fgetacl, fsetacl,
 };
 use truenas_ros::sync_fs::xattr::fgetxattr;
 use truenas_ros::sync_fs::{
-    AtFlags, Mode, OFlag, OpenHow, RenameFlags, ZfsAttr, fget_zfs_attrs,
-    fset_zfs_attrs, linkat, openat2, renameat2,
+    AtFlags, Mode, OFlag, OpenHow, RenameFlags, StatxMask, ZfsAttr,
+    fget_zfs_attrs, fset_zfs_attrs, linkat, openat2, renameat2, statx,
 };
 
 #[path = "support/zfs_dir.rs"]
@@ -980,4 +981,84 @@ fn statx_generation_is_the_file_handles() {
         },
         in_handle
     );
+}
+
+/// `stx_zfsflags` gives what `ZFS_IOC_GETDOSFLAGS` and the ACL's own flags
+/// give, through an `O_PATH` descriptor the ioctl cannot take.
+///
+/// Holds only where the TrueNAS kernel passes the field through `cp_statx`
+/// and ZFS fills it, in `zpl_getattr_impl`, and
+/// `TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS` turns a kernel that does not into a
+/// failure, which the QEMU job arms. On the NFSv4 dataset the trivial bit
+/// follows the file's ACL both ways, as `ACL_IS_TRIVIAL` in
+/// `system.nfs4_acl_xdr` does. On the POSIX dataset ZFS leaves it clear
+/// whatever the file holds.
+#[test]
+fn statx_zfs_flags_are_the_ioctls_and_the_acls() {
+    let Some(dir) = nfs4_dir() else {
+        return skip("no NFSv4-ACL dataset");
+    };
+    let (path, f) = scratch_file(&dir, "zfsflags");
+    let attrs = add_zfs_attrs(&f, ZfsAttr::HIDDEN | ZfsAttr::SYSTEM);
+    let how = OpenHow::new().flags(OFlag::O_PATH | OFlag::O_CLOEXEC);
+    let pinned = openat2(AT_FDCWD, &path, how).expect("an O_PATH open");
+    let flags_of = || {
+        let mask = StatxMask::ZFSFLAGS;
+        statx(pinned.as_fd(), "", AtFlags::AT_EMPTY_PATH, mask).unwrap()
+    };
+    let st = flags_of();
+    let Some(seen) = st.zfs_attrs() else {
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS").is_none(),
+            "TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS is set but the dataset at {} \
+             reports none, so this kernel is not exposing STATX_ZFSFLAGS",
+            dir.display()
+        );
+        return;
+    };
+    assert_eq!(seen, attrs, "statx and the ioctl disagree");
+    let trivial = |f: &std::fs::File| match fgetacl(f.as_fd()) {
+        Ok(Acl::Nfs4(acl)) => acl.trivial(),
+        other => panic!("expected an NFSv4 ACL, got {other:?}"),
+    };
+    assert_eq!(st.nfs4_acl_is_trivial(), Some(trivial(&f)));
+
+    // A named user makes the ACL more than the mode can say.
+    let Ok(Acl::Nfs4(acl)) = fgetacl(f.as_fd()) else {
+        panic!("expected an NFSv4 ACL");
+    };
+    let mut aces = acl.aces.clone();
+    aces.push(Nfs4Ace::new(
+        Nfs4AceType::Allow,
+        Nfs4Flag::empty(),
+        Nfs4Perm::READ_DATA
+            | Nfs4Perm::READ_ATTRIBUTES
+            | Nfs4Perm::READ_ACL
+            | Nfs4Perm::SYNCHRONIZE,
+        Nfs4Who::Named,
+        8_675_309,
+    ));
+    let named = Acl::Nfs4(Nfs4Acl::from_aces(aces, Nfs4AclFlag::empty()));
+    fsetacl(f.as_fd(), Some(&named)).expect("fsetacl nfs4");
+    assert!(!trivial(&f));
+    assert_eq!(flags_of().nfs4_acl_is_trivial(), Some(false));
+
+    // Removing the ACL leaves the trivial one the mode says.
+    fsetacl(f.as_fd(), None).expect("fsetacl None");
+    assert!(trivial(&f));
+    assert_eq!(flags_of().nfs4_acl_is_trivial(), Some(true));
+    drop(pinned);
+    let _ = std::fs::remove_file(&path);
+
+    let Some(posix) = posix_dir() else {
+        return skip("no POSIX-ACL dataset");
+    };
+    let (path, f) = scratch_file(&posix, "zfsflags");
+    let mask = StatxMask::ZFSFLAGS;
+    let st = statx(f.as_fd(), "", AtFlags::AT_EMPTY_PATH, mask).unwrap();
+    let ioctl = fget_zfs_attrs(f.as_fd());
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(st.zfs_attrs(), ioctl.ok());
+    assert_eq!(st.nfs4_acl_is_trivial(), Some(false));
 }

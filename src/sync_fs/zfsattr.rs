@@ -1,7 +1,9 @@
 //! ZFS file attributes - the upper half of `z_pflags`, by descriptor.
 //!
 //! These are the DOS/NFSv4 attribute bits ZFS keeps per file and exposes
-//! through a pair of its own ioctls. Two of them enforce object immutability
+//! through a pair of its own ioctls. On the TrueNAS kernel `statx` reads
+//! them too, through any descriptor
+//! ([`Statx::zfs_attrs`](super::Statx::zfs_attrs)). Two of them enforce object immutability
 //! at the VFS layer, which is what makes them reachable from every protocol
 //! at once rather than only from whoever set them:
 //!
@@ -70,7 +72,9 @@ tn_bitflags! {
         /// attribute - while NFS has no surface to clear it at all. The
         /// one unconditional refusal is a new shared-writable mmap,
         /// denied on every dataset flavor with no privilege fallback.
-        /// Invisible to `statx` and `lsattr`, so a refused write presents
+        /// Invisible to `lsattr`, and to `statx` but for
+        /// [`StatxMask::ZFSFLAGS`](super::StatxMask::ZFSFLAGS) on the
+        /// TrueNAS kernel, so a refused write presents
         /// as a bare `EACCES` on a file whose mode looks writable - the
         /// fallback re-decides the errno, and `EPERM` is what `IMMUTABLE`
         /// answers, refused by the VFS before ZFS is consulted.
