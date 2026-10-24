@@ -48,8 +48,8 @@ tn_bitflags! {
         WRITE_ATOMIC = 0x0001_0000;
         /// Want/got the direct-I/O read alignment info.
         DIO_READ_ALIGN = 0x0002_0000;
-        /// Want/got the ZFS flags (`stx_zfsflags`, [`Statx::zfs_attrs`] and
-        /// [`Statx::nfs4_acl_is_trivial`]).
+        /// Want/got the ZFS flags (`stx_zfsflags`, [`Statx::zfs_attrs`],
+        /// [`Statx::nfs4_acl_is_trivial`] and [`Statx::nfs4_acl_flags`]).
         ZFSFLAGS = 0x1000_0000;
         /// Want/got the inode generation (`stx_gen`, [`Statx::generation`]).
         GEN = 0x2000_0000;
@@ -339,9 +339,10 @@ impl Statx {
     /// `cp_statx` (under `CONFIG_TRUENAS`, fs/stat.c), and only ZFS fills
     /// it, from `z_pflags` cut to `ZFS_DOS_FL_USER_VISIBLE`
     /// (`zpl_getattr_impl`, module/os/linux/zfs/zpl_inode.c), the mask
-    /// `zpl_ioctl_getdosflags` answers with too. The field's other bit,
-    /// `ZFS_ACL_TRIVIAL`, is [`nfs4_acl_is_trivial`](Self::nfs4_acl_is_trivial)'s
-    /// and is left out here, since the setter refuses it.
+    /// `zpl_ioctl_getdosflags` answers with too. The field's other bits,
+    /// `ZFS_ACL_TRIVIAL` and the flags of the ACL, are
+    /// [`nfs4_acl_flags`](Self::nfs4_acl_flags)'s and are left out here,
+    /// since the setter refuses them.
     pub fn zfs_attrs(&self) -> Option<ZfsAttr> {
         self.mask()
             .contains(StatxMask::ZFSFLAGS)
@@ -366,6 +367,39 @@ impl Statx {
         self.mask()
             .contains(StatxMask::ZFSFLAGS)
             .then_some(self.0.stx_zfsflags & ZFS_ACL_TRIVIAL != 0)
+    }
+
+    /// The flags of the file's NFSv4 ACL, auto-inherit, protected, defaulted
+    /// and `ACL_IS_TRIVIAL`, as `system.nfs4_acl_xdr` gives them, with no read
+    /// of the ACL.
+    ///
+    /// `None` unless [`StatxMask::ZFSFLAGS`] was requested and supplied, as
+    /// for [`zfs_attrs`](Self::zfs_attrs). **Meaningful on an `acltype=nfsv4`
+    /// dataset alone**, as for
+    /// [`nfs4_acl_is_trivial`](Self::nfs4_acl_is_trivial), so on any other
+    /// acltype this is empty. `zpl_getattr_impl` reports `ZFS_ACL_PROTECTED`,
+    /// `ZFS_ACL_DEFAULTED` and `ZFS_ACL_AUTO_INHERIT` beside `ZFS_ACL_TRIVIAL`,
+    /// the four bits of `z_pflags` that `zfs_getsecattr` turns into these
+    /// flags (module/os/linux/zfs/zfs_acl.c). A ZFS module that reports the
+    /// trivial bit alone leaves the other three clear. `ACL_IS_DIR` is left
+    /// out, since the file type says it.
+    #[cfg(feature = "acl")]
+    pub fn nfs4_acl_flags(&self) -> Option<super::acl::Nfs4AclFlag> {
+        use super::acl::Nfs4AclFlag;
+        // `include/sys/zfs_znode.h`, in the order `zfs_getsecattr` maps them.
+        const FLAGS: [(u64, Nfs4AclFlag); 4] = [
+            (0x20, Nfs4AclFlag::DEFAULTED),
+            (0x10, Nfs4AclFlag::PROTECTED),
+            (0x40, Nfs4AclFlag::AUTO_INHERIT),
+            (0x4, Nfs4AclFlag::ACL_IS_TRIVIAL),
+        ];
+        let raw = self.0.stx_zfsflags;
+        self.mask().contains(StatxMask::ZFSFLAGS).then(|| {
+            FLAGS
+                .iter()
+                .filter(|(bit, _)| raw & bit != 0)
+                .fold(Nfs4AclFlag::empty(), |all, (_, flag)| all | *flag)
+        })
     }
 
     /// Last access time.
@@ -512,5 +546,30 @@ mod tests {
         let st = filled(StatxMask::BASIC_STATS, flags);
         assert_eq!(st.zfs_attrs(), None);
         assert_eq!(st.nfs4_acl_is_trivial(), None);
+    }
+
+    /// `include/sys/zfs_znode.h` has ZFS_ACL_PROTECTED 0x10,
+    /// ZFS_ACL_DEFAULTED 0x20 and ZFS_ACL_AUTO_INHERIT 0x40, which
+    /// `zfs_getsecattr` turns into ACL_PROTECTED 0x2, ACL_DEFAULTED 0x4 and
+    /// ACL_AUTO_INHERIT 0x1, and ZFS_ACL_TRIVIAL into ACL_IS_TRIVIAL
+    /// 0x10000, all written out by hand. ZFS_INHERIT_ACE 0x2 and
+    /// ZFS_ACL_OBJ_ACE 0x8 are bits ZFS keeps to itself.
+    #[cfg(feature = "acl")]
+    #[test]
+    fn the_zfs_flags_give_the_flags_of_the_acl() {
+        let flags = |raw| {
+            filled(StatxMask::ZFSFLAGS, raw)
+                .nfs4_acl_flags()
+                .map(|f| f.bits())
+        };
+        assert_eq!(flags(0x10), Some(0x2));
+        assert_eq!(flags(0x20), Some(0x4));
+        assert_eq!(flags(0x40), Some(0x1));
+        assert_eq!(flags(0x4), Some(0x1_0000));
+        assert_eq!(flags(0x74), Some(0x1_0007));
+        let others = 0x0000_0002_0000_0000 | 0x0000_0400_0000_0000 | 0x2 | 0x8;
+        assert_eq!(flags(others), Some(0));
+        let st = filled(StatxMask::BASIC_STATS, 0x74);
+        assert_eq!(st.nfs4_acl_flags(), None);
     }
 }
