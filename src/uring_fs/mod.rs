@@ -1899,6 +1899,30 @@ impl FsHandle {
         )
     }
 
+    /// Read extended attribute `name` of `f` into `buf` as `who`, through
+    /// the path of `f` under `/proc/thread-self/fd`, so `f` may be opened
+    /// `O_PATH`. The blocking twin of
+    /// [`FsConn::fgetxattr_proc`](crate::uring_fs::FsConn::fgetxattr_proc),
+    /// which says what it reads.
+    pub fn fgetxattr_proc(
+        &self,
+        who: Personality,
+        f: &File,
+        name: impl Into<Cow<'static, CStr>>,
+        buf: Vec<u8>,
+    ) -> (crate::Result<usize>, Vec<u8>) {
+        self.fd_meta_buf(
+            core::TAG_GETXATTR_PROC,
+            who,
+            f,
+            Some(name.into()),
+            buf,
+            0,
+            0,
+            0,
+        )
+    }
+
     /// Read extended attribute `name` from `f` under the reactor's ambient
     /// (root) credentials, not any `who`'s: the off-loop twin of
     /// [`FsConn::fgetxattr_as_root`](crate::uring_fs::FsConn::fgetxattr_as_root).
