@@ -34,6 +34,8 @@ mod statx;
 mod unlinkat;
 #[cfg(feature = "sync-fs")]
 mod zfsattr;
+#[cfg(feature = "sync-fs")]
+mod zfssetattr;
 
 #[cfg(feature = "acl")]
 pub mod acl;
@@ -73,6 +75,8 @@ pub use statx::{
 pub use unlinkat::unlinkat;
 #[cfg(feature = "sync-fs")]
 pub use zfsattr::{ZfsAttr, fget_zfs_attrs, fset_zfs_attrs};
+#[cfg(feature = "sync-fs")]
+pub use zfssetattr::{SetTime, ZFS_SETATTR, ZfsSetattr};
 
 #[cfg(feature = "sync-fs")]
 tn_bitflags! {

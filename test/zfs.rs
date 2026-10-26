@@ -1062,3 +1062,121 @@ fn statx_zfs_flags_are_the_ioctls_and_the_acls() {
     assert_eq!(st.zfs_attrs(), ioctl.ok());
     assert_eq!(st.nfs4_acl_is_trivial(), Some(false));
 }
+
+/// `stx_zfsflags` gives the flags of the ACL that `system.nfs4_acl_xdr`
+/// gives, on a file and a folder, with auto-inherit, protected and
+/// defaulted each set alone, then all three, then none, and once the ACL is
+/// removed.
+///
+/// Holds only where ZFS reports the flags of the ACL in `zpl_getattr_impl`,
+/// and `TRUENAS_ROS_REQUIRE_STATX_ACL_FLAGS` turns a module that reports the
+/// trivial bit alone into a failure. A POSIX dataset gives none.
+#[test]
+fn statx_gives_the_flags_of_the_acl() {
+    let Some(dir) = nfs4_dir() else {
+        return skip("no NFSv4-ACL dataset");
+    };
+    let (path, file) = scratch_file(&dir, "aclflags");
+    let folder =
+        dir.join(format!("rostest_aclflags_dir_{}", std::process::id()));
+    let _ = std::fs::remove_dir(&folder);
+    std::fs::create_dir(&folder).unwrap();
+    let folder_fd = std::fs::File::open(&folder).unwrap();
+    let clean_up = || {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&folder);
+    };
+    let write = |f: &std::fs::File, inherit: Nfs4Flag, flags: Nfs4AclFlag| {
+        let read = Nfs4Perm::READ_DATA
+            | Nfs4Perm::READ_ATTRIBUTES
+            | Nfs4Perm::READ_ACL
+            | Nfs4Perm::SYNCHRONIZE;
+        let owner = read | Nfs4Perm::WRITE_DATA | Nfs4Perm::WRITE_ACL;
+        let aces = [
+            Nfs4Ace::new(
+                Nfs4AceType::Allow,
+                inherit,
+                owner,
+                Nfs4Who::Owner,
+                -1,
+            ),
+            Nfs4Ace::new(
+                Nfs4AceType::Allow,
+                inherit,
+                read,
+                Nfs4Who::Named,
+                8_675_309,
+            ),
+        ];
+        let acl = Acl::Nfs4(Nfs4Acl::from_aces(aces, flags));
+        fsetacl(f.as_fd(), Some(&acl)).expect("fsetacl nfs4");
+    };
+    let from_xattr = |f: &std::fs::File| match fgetacl(f.as_fd()) {
+        Ok(Acl::Nfs4(acl)) => acl.acl_flags - Nfs4AclFlag::ACL_IS_DIR,
+        other => panic!("expected an NFSv4 ACL, got {other:?}"),
+    };
+    let from_statx = |f: &std::fs::File| {
+        let mask = StatxMask::ZFSFLAGS;
+        let st = statx(f.as_fd(), "", AtFlags::AT_EMPTY_PATH, mask).unwrap();
+        st.nfs4_acl_flags()
+    };
+
+    write(&file, Nfs4Flag::empty(), Nfs4AclFlag::PROTECTED);
+    match from_statx(&file) {
+        None => {
+            clean_up();
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS")
+                    .is_none(),
+                "TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS is set but the dataset \
+                 at {} reports none",
+                dir.display()
+            );
+            return;
+        }
+        Some(seen) if !seen.contains(Nfs4AclFlag::PROTECTED) => {
+            clean_up();
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_ACL_FLAGS")
+                    .is_none(),
+                "TRUENAS_ROS_REQUIRE_STATX_ACL_FLAGS is set but the dataset \
+                 at {} reports the trivial bit alone",
+                dir.display()
+            );
+            return;
+        }
+        Some(_) => {}
+    }
+
+    let both = Nfs4Flag::FILE_INHERIT | Nfs4Flag::DIRECTORY_INHERIT;
+    for (f, inherit) in [(&file, Nfs4Flag::empty()), (&folder_fd, both)] {
+        for flags in [
+            Nfs4AclFlag::AUTO_INHERIT,
+            Nfs4AclFlag::PROTECTED,
+            Nfs4AclFlag::DEFAULTED,
+            Nfs4AclFlag::AUTO_INHERIT
+                | Nfs4AclFlag::PROTECTED
+                | Nfs4AclFlag::DEFAULTED,
+            Nfs4AclFlag::empty(),
+        ] {
+            write(f, inherit, flags);
+            // ZFS keeps what was set, so the check below is not of two
+            // empty sets.
+            assert_eq!(from_xattr(f), flags);
+            assert_eq!(from_statx(f), Some(flags));
+        }
+        fsetacl(f.as_fd(), None).expect("fsetacl None");
+        let trivial = from_xattr(f);
+        assert!(trivial.contains(Nfs4AclFlag::ACL_IS_TRIVIAL));
+        assert_eq!(from_statx(f), Some(trivial));
+    }
+    clean_up();
+
+    let Some(posix) = posix_dir() else {
+        return skip("no POSIX-ACL dataset");
+    };
+    let (path, f) = scratch_file(&posix, "aclflags");
+    let flags = from_statx(&f);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(flags, Some(Nfs4AclFlag::empty()));
+}
