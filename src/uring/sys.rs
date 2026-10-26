@@ -312,10 +312,12 @@ pub(crate) const IORING_OP_LINKAT: u8 = 39;
 
 // Extended attributes. The `f*` forms take `needs_file` and **do** accept
 // registered-table files (`IOSQE_FIXED_FILE`) - while still performing a
-// full per-op credential check in `xattr_permission`. The path-based forms
-// (`SETXATTR = 42`, `GETXATTR = 44`) are deliberately absent: the kernel
-// hardcodes their resolution to `AT_FDCWD` + `LOOKUP_FOLLOW`, which cannot
-// be anchored. All are `REQ_F_FORCE_ASYNC`.
+// full per-op credential check in `xattr_permission`. The path-based
+// `SETXATTR = 42` is deliberately absent, since the kernel resolves its
+// path from `AT_FDCWD` with `LOOKUP_FOLLOW` (`io_setxattr` in
+// `io_uring/xattr.c`), which cannot be anchored. `GETXATTR` resolves the
+// same way, so it is staged only with the path of a held file under
+// `/proc/thread-self/fd`. All are `REQ_F_FORCE_ASYNC`.
 /// `fd` = file, `addr` = name, `addr2` = value, `len` = size,
 /// `op_flags` = `XATTR_CREATE`/`XATTR_REPLACE`.
 pub(crate) const IORING_OP_FSETXATTR: u8 = 41;
@@ -323,6 +325,9 @@ pub(crate) const IORING_OP_FSETXATTR: u8 = 41;
 /// must live to the CQE), `len` = size; `op_flags` must be 0. CQE `res` is
 /// the attribute's size.
 pub(crate) const IORING_OP_FGETXATTR: u8 = 43;
+/// `addr` = name, `addr2` = value buffer, `addr3` = path, `len` = size,
+/// `op_flags` must be 0. `fd` is not read.
+pub(crate) const IORING_OP_GETXATTR: u8 = 44;
 /// Truncate an fd (**`sqe.off` = the new length**; every other operand
 /// must be zero). Linux >= 6.9 - later than the other io_uring ops here, and
 /// still below the crate's 6.18 kernel floor, so it is always present. It is

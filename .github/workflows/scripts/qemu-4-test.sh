@@ -183,6 +183,17 @@ export TRUENAS_ROS_REQUIRE_STATX_GEN=1
 # `z_pflags` in `zpl_getattr_impl`. This VM boots the paired kernel and
 # module, so the test of the ZFS flags must run.
 export TRUENAS_ROS_REQUIRE_STATX_ZFSFLAGS=1
+# The ZFS fork also reports ZFS_ACL_PROTECTED, ZFS_ACL_DEFAULTED and
+# ZFS_ACL_AUTO_INHERIT in `stx_zfsflags` beside ZFS_ACL_TRIVIAL on an nfsv4
+# dataset (`zpl_getattr_impl` in module/os/linux/zfs/zpl_inode.c). The
+# <train>-nightly ZFS carries it, so the test of the flags of an NFSv4 ACL
+# must run, and a module that reports the trivial bit alone turns CI red.
+export TRUENAS_ROS_REQUIRE_STATX_ACL_FLAGS=1
+# The ZFS fork answers `system.truenas_setattr` (`zpl_xattr_setattr_set` in
+# module/os/linux/zfs/zpl_xattr.c), and the nightly ZFS carries the handler,
+# so the tests of the setter must run. A module without it answers
+# EOPNOTSUPP, which turns CI red.
+export TRUENAS_ROS_REQUIRE_ZFS_SETATTR=1
 # The audit suite sends REAL records over NETLINK_AUDIT. It tolerates three
 # environments - no socket, a socket without CAP_AUDIT_WRITE, and the real
 # thing - and only the third tests anything. This VM is the only place that

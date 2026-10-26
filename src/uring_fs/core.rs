@@ -38,9 +38,9 @@ use crate::uring::sys::KernelTimespec;
 use crate::uring::sys::{
     IORING_FSYNC_DATASYNC, IORING_OP_ASYNC_CANCEL, IORING_OP_FADVISE,
     IORING_OP_FALLOCATE, IORING_OP_FGETXATTR, IORING_OP_FSETXATTR,
-    IORING_OP_FSYNC, IORING_OP_FTRUNCATE, IORING_OP_LINKAT, IORING_OP_MKDIRAT,
-    IORING_OP_OPENAT2, IORING_OP_READV, IORING_OP_RENAMEAT, IORING_OP_SPLICE,
-    IORING_OP_STATX, IORING_OP_SYMLINKAT, IORING_OP_TIMEOUT,
+    IORING_OP_FSYNC, IORING_OP_FTRUNCATE, IORING_OP_GETXATTR, IORING_OP_LINKAT,
+    IORING_OP_MKDIRAT, IORING_OP_OPENAT2, IORING_OP_READV, IORING_OP_RENAMEAT,
+    IORING_OP_SPLICE, IORING_OP_STATX, IORING_OP_SYMLINKAT, IORING_OP_TIMEOUT,
     IORING_OP_UNLINKAT, IORING_OP_WRITEV, IOSQE_BUFFER_SELECT, IoUringCqe,
     SPLICE_F_MOVE,
 };
@@ -133,6 +133,10 @@ pub(crate) const TAG_TIMEOUT: u8 = 0x92;
 /// and no owner - the open's waiter carries both - so the entry's only
 /// cargo is the timespec and the open's routing token.
 pub(crate) const TAG_OPEN_DEADLINE: u8 = 0x93;
+/// `GETXATTR` of a held file through its path under
+/// `/proc/thread-self/fd`, which takes a file opened `O_PATH`. It is staged
+/// as an fd op, with the path built from the file's descriptor.
+pub(crate) const TAG_GETXATTR_PROC: u8 = 0x94;
 /// The standalone host's wake tag (an embedded host reuses its own).
 pub(crate) const TAG_WAKE: u8 = 0x9D;
 /// Tags `ASYNC_CANCEL` ops (and the teardown drain); completions ignored.
@@ -336,6 +340,17 @@ fn remove_xattr_blocking(f: &File, name: &CStr) -> crate::Result<()> {
     // NUL-terminated C string.
     retry_on_eintr(|| unsafe { libc::fremovexattr(raw, name.as_ptr()) })?;
     Ok(())
+}
+
+/// The path of `fd` under `/proc/thread-self/fd`, which `GETXATTR` resolves
+/// on the io-wq worker that runs it. The worker shares the descriptors of
+/// the thread that submitted it (`create_io_thread` in `kernel/fork.c`), and
+/// a thread of the process reaches them whatever its personality, since
+/// `proc_fd_permission` in `fs/proc/fd.c` and `__ptrace_may_access` in
+/// `kernel/ptrace.c` let the same thread group through.
+fn proc_fd_path(fd: RawFd) -> CString {
+    CString::new(format!("/proc/thread-self/fd/{fd}"))
+        .expect("a number holds no NUL")
 }
 
 /// One in-flight (or free) fs operation. Owns everything the kernel can see.
@@ -2244,6 +2259,7 @@ impl FsCore {
             TAG_SPLICE => IORING_OP_SPLICE,
             TAG_FGETXATTR => IORING_OP_FGETXATTR,
             TAG_FSETXATTR => IORING_OP_FSETXATTR,
+            TAG_GETXATTR_PROC => IORING_OP_GETXATTR,
             _ => return None,
         })
     }
@@ -2331,7 +2347,9 @@ impl FsCore {
             TAG_FSETXATTR => {
                 value.len() > crate::sync_fs::xattr::XATTR_SIZE_MAX
             }
-            TAG_FGETXATTR => value.len() > u32::MAX as usize,
+            TAG_FGETXATTR | TAG_GETXATTR_PROC => {
+                value.len() > u32::MAX as usize
+            }
             _ => false,
         };
         if unrepresentable {
@@ -2365,10 +2383,15 @@ impl FsCore {
         e.waiter = Some(waiter);
         e.file = Some(file);
         e.path = name;
+        // The kernel copies the path at prep, which is inside the enter that
+        // submits the SQE, so it is parked here as the name is. The file
+        // parked above keeps its number from being reused meanwhile.
+        e.path2 = (tag == TAG_GETXATTR_PROC).then(|| proc_fd_path(raw_fd));
         // The value rides in `bufs` so it round-trips like any data buffer
         // (an FGETXATTR's kernel writes land in it at issue time).
         e.bufs = vec![value];
         let name_ptr = e.path.as_ref().map_or(0, |n| n.as_ptr() as u64);
+        let path_ptr = e.path2.as_ref().map_or(0, |p| p.as_ptr() as u64);
         let val = &mut e.bufs[0];
         let val_ptr = val.as_mut_ptr() as u64;
         let val_len = val.len() as u32;
@@ -2413,6 +2436,12 @@ impl FsCore {
                     sqe.off_addr2 = val_ptr;
                     sqe.len = val_len;
                     sqe.op_flags = aux32;
+                }
+                TAG_GETXATTR_PROC => {
+                    sqe.addr = name_ptr;
+                    sqe.off_addr2 = val_ptr;
+                    sqe.addr3 = path_ptr;
+                    sqe.len = val_len;
                 }
                 // Unreachable: `fd_meta_opcode` refused any other tag before
                 // a slot was taken. An arm added there and not here would
@@ -4756,6 +4785,40 @@ impl<'a> FsConn<'a> {
     {
         self.fd_meta(
             TAG_FGETXATTR,
+            who,
+            f,
+            Some(name.into()),
+            buf,
+            0,
+            0,
+            0,
+            on_done,
+        );
+    }
+
+    /// Read extended attribute `name` of `f` into `buf` as `who`, through
+    /// the path of `f` under `/proc/thread-self/fd`, so `f` may be opened
+    /// `O_PATH`, which [`fgetxattr`](Self::fgetxattr) refuses with `EBADF`.
+    ///
+    /// The kernel resolves the path as `who`, and the file system checks
+    /// `who` as it does for `fgetxattr`. The last step jumps to `f` itself
+    /// (`proc_pid_get_link` in `fs/proc/base.c`), so a link opened `O_PATH`
+    /// with `O_NOFOLLOW` is read rather than its target, and a FIFO is read
+    /// without an open. It needs `/proc` mounted in the process's root. It
+    /// is a read alone, and nothing here writes through `/proc`, as the
+    /// settled decision on `O_PATH` in the crate's notes says.
+    pub fn fgetxattr_proc<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        name: impl Into<Cow<'static, CStr>>,
+        buf: Vec<u8>,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.fd_meta(
+            TAG_GETXATTR_PROC,
             who,
             f,
             Some(name.into()),
@@ -9340,9 +9403,15 @@ mod routing_fuzz {
                     });
                     tracked.push(Arc::downgrade(&arc));
                     held.push(File::new(arc.clone()));
+                    // The read through /proc parks a path besides the file.
+                    let tag = if rng.below(2) == 0 {
+                        TAG_FGETXATTR
+                    } else {
+                        TAG_GETXATTR_PROC
+                    };
                     core.submit_fd_meta(
                         eng,
-                        TAG_FGETXATTR,
+                        tag,
                         1,
                         arc,
                         Some(Cow::Borrowed(c"user.x")),
