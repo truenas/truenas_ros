@@ -68,8 +68,8 @@ pub use safe_open::safe_open;
 pub use statfs::{Statfs, fstatfs};
 #[cfg(feature = "sync-fs")]
 pub use statx::{
-    Statx, StatxAttr, StatxMask, StatxRaw, StatxTimestamp, StatxTimestampRaw,
-    makedev, statx,
+    AclType, Statx, StatxAttr, StatxMask, StatxRaw, StatxTimestamp,
+    StatxTimestampRaw, makedev, statx,
 };
 #[cfg(feature = "sync-fs")]
 pub use unlinkat::unlinkat;

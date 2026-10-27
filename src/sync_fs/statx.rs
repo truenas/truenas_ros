@@ -81,7 +81,29 @@ tn_bitflags! {
         DAX = 0x0020_0000;
         /// The file supports atomic writes.
         WRITE_ATOMIC = 0x0040_0000;
+        /// The file system keeps POSIX ACLs. TrueNAS kernels, see
+        /// [`Statx::acltype`].
+        POSIXACL = 0x0100_0000_0000_0000;
+        /// The file system keeps NFSv4 ACLs. TrueNAS kernels, see
+        /// [`Statx::acltype`].
+        NFSV4ACL = 0x0200_0000_0000_0000;
     }
+}
+
+/// The ACL type of the file system that holds a file, which the TrueNAS
+/// kernel reports in [`Statx::attributes`] from the flags of the superblock
+/// (`vfs_getattr_nosec` in `fs/stat.c`). ZFS keeps those current as
+/// `acltype` changes, with no remount (`acltype_changed_cb` in
+/// `module/os/linux/zfs/zfs_vfsops.c`), and a snapshot carries the type its
+/// own mount took.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AclType {
+    /// The file system keeps no ACL, so the mode is all there is.
+    Off,
+    /// POSIX ACLs, `system.posix_acl_access` and `system.posix_acl_default`.
+    Posix,
+    /// NFSv4 ACLs, `system.nfs4_acl_xdr`.
+    Nfsv4,
 }
 
 /// Kernel `struct statx_timestamp`.
@@ -221,6 +243,24 @@ impl Statx {
     /// Which [`Statx::attributes`] bits are supported by this filesystem.
     pub fn attributes_mask(&self) -> StatxAttr {
         StatxAttr::from_bits_retain(self.0.stx_attributes_mask)
+    }
+
+    /// The ACL type of the file's file system, or `None` on a kernel that
+    /// reports none, which [`Statx::attributes_mask`] says. The kernel sets
+    /// at most one of the two bits, and NFSv4 is read first.
+    pub fn acltype(&self) -> Option<AclType> {
+        let both = StatxAttr::POSIXACL | StatxAttr::NFSV4ACL;
+        if !self.attributes_mask().contains(both) {
+            return None;
+        }
+        let attributes = self.attributes();
+        Some(if attributes.contains(StatxAttr::NFSV4ACL) {
+            AclType::Nfsv4
+        } else if attributes.contains(StatxAttr::POSIXACL) {
+            AclType::Posix
+        } else {
+            AclType::Off
+        })
     }
 
     /// The file mode (type + permission bits).
@@ -571,5 +611,27 @@ mod tests {
         assert_eq!(flags(others), Some(0));
         let st = filled(StatxMask::BASIC_STATS, 0x74);
         assert_eq!(st.nfs4_acl_flags(), None);
+    }
+
+    /// `include/uapi/linux/stat.h` of the kernel fork has
+    /// STATX_ATTR_POSIXACL 0x0100000000000000 and STATX_ATTR_NFSV4ACL
+    /// 0x0200000000000000, written out by hand. The type is read only where
+    /// the mask of the attributes names both bits.
+    #[test]
+    fn the_acltype_is_read_against_the_mask_of_the_attributes() {
+        let with = |attributes: u64, mask: u64| {
+            // SAFETY: `StatxRaw` is plain integers, for which all zero bits
+            // are a valid value.
+            let mut raw: StatxRaw = unsafe { std::mem::zeroed() };
+            raw.stx_attributes = attributes;
+            raw.stx_attributes_mask = mask;
+            Statx::from_raw(raw).acltype()
+        };
+        let both = 0x0100_0000_0000_0000 | 0x0200_0000_0000_0000;
+        assert_eq!(with(0, both), Some(AclType::Off));
+        assert_eq!(with(0x0100_0000_0000_0000, both), Some(AclType::Posix));
+        assert_eq!(with(0x0200_0000_0000_0000, both), Some(AclType::Nfsv4));
+        assert_eq!(with(0x0200_0000_0000_0000, 0x1000), None);
+        assert_eq!(with(0, 0x0200_0000_0000_0000), None);
     }
 }
