@@ -26,7 +26,7 @@ use truenas_ros::sync_fs::acl::{
 };
 use truenas_ros::sync_fs::xattr::fgetxattr;
 use truenas_ros::sync_fs::{
-    AtFlags, Mode, OFlag, OpenHow, RenameFlags, StatxMask, ZfsAttr,
+    AclType, AtFlags, Mode, OFlag, OpenHow, RenameFlags, StatxMask, ZfsAttr,
     fget_zfs_attrs, fset_zfs_attrs, linkat, openat2, renameat2, statx,
 };
 
@@ -1179,4 +1179,65 @@ fn statx_gives_the_flags_of_the_acl() {
     let flags = from_statx(&f);
     let _ = std::fs::remove_file(&path);
     assert_eq!(flags, Some(Nfs4AclFlag::empty()));
+}
+
+/// The TrueNAS kernel reports the ACL type of a file system in
+/// `stx_attributes` from the flags of its superblock (`vfs_getattr_nosec` in
+/// fs/stat.c), which ZFS keeps current as `acltype` changes, with no remount
+/// (`acltype_changed_cb` in module/os/linux/zfs/zfs_vfsops.c). The NFSv4
+/// and POSIX datasets report their own type, a dataset made with
+/// `acltype=off` reports none, and a change of `acltype` shows at the next
+/// statx. `TRUENAS_ROS_REQUIRE_STATX_ACLTYPE` turns a kernel that reports
+/// no type into a failure.
+#[test]
+fn statx_gives_the_acltype_of_the_dataset() {
+    let (Some(nfs4), Some(posix)) = (nfs4_dir(), posix_dir()) else {
+        return skip("no NFSv4 or POSIX dataset");
+    };
+    let acltype_of = |dir: &Path| {
+        let f = std::fs::File::open(dir).unwrap();
+        let mask = StatxMask::BASIC_STATS;
+        statx(f.as_fd(), "", AtFlags::AT_EMPTY_PATH, mask)
+            .unwrap()
+            .acltype()
+    };
+    let Some(seen) = acltype_of(&nfs4) else {
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_ACLTYPE").is_none(),
+            "TRUENAS_ROS_REQUIRE_STATX_ACLTYPE is set but the kernel reports \
+             no ACL type for {}",
+            nfs4.display()
+        );
+        return;
+    };
+    assert_eq!(seen, AclType::Nfsv4);
+    assert_eq!(acltype_of(&posix), Some(AclType::Posix));
+    assert_eq!(acltype_of(Path::new("/proc/self")), Some(AclType::Off));
+
+    // A dataset of its own, since a change of acltype under the shared ones
+    // would reach the other tests.
+    let Ok(ds) = std::env::var("TRUENAS_ROS_NFS4_DS") else {
+        return skip("TRUENAS_ROS_NFS4_DS unset");
+    };
+    let name = format!("rostest_acltype_{}", std::process::id());
+    let child = format!("{ds}/{name}");
+    let zfs =
+        |args: &[&str]| std::process::Command::new("zfs").args(args).status();
+    let _ = zfs(&["destroy", "-r", &child]);
+    if !matches!(
+        zfs(&["create", "-o", "acltype=off", &child]),
+        Ok(s) if s.success()
+    ) {
+        return skip("could not create a dataset (not root, or not ours)");
+    }
+    let dir = nfs4.join(&name);
+    let off = acltype_of(&dir);
+    let _ = zfs(&["set", "acltype=posix", &child]);
+    let posix_now = acltype_of(&dir);
+    let _ = zfs(&["set", "acltype=nfsv4", &child]);
+    let nfs4_now = acltype_of(&dir);
+    let _ = zfs(&["destroy", "-r", &child]);
+    assert_eq!(off, Some(AclType::Off));
+    assert_eq!(posix_now, Some(AclType::Posix));
+    assert_eq!(nfs4_now, Some(AclType::Nfsv4));
 }

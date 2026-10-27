@@ -194,6 +194,12 @@ export TRUENAS_ROS_REQUIRE_STATX_ACL_FLAGS=1
 # so the tests of the setter must run. A module without it answers
 # EOPNOTSUPP, which turns CI red.
 export TRUENAS_ROS_REQUIRE_ZFS_SETATTR=1
+# The kernel fork reports the ACL type of a file system in `stx_attributes`
+# (STATX_ATTR_POSIXACL and STATX_ATTR_NFSV4ACL, set in `vfs_getattr_nosec`
+# in fs/stat.c from the flags of the superblock), and the nightly kernel
+# carries it, so the test of the type must run. A kernel that names neither
+# bit in `stx_attributes_mask` turns CI red.
+export TRUENAS_ROS_REQUIRE_STATX_ACLTYPE=1
 # The audit suite sends REAL records over NETLINK_AUDIT. It tolerates three
 # environments - no socket, a socket without CAP_AUDIT_WRITE, and the real
 # thing - and only the third tests anything. This VM is the only place that
