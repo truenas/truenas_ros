@@ -3523,6 +3523,76 @@ fn fgetxattr_proc_reads_an_nfs4_acl_as_the_personality() {
     });
 }
 
+/// On an NFSv4 dataset `FsHandle::fgetxattr_proc_as_root` reads the ACL of
+/// a file and of a FIFO held `O_PATH` under the ring owner's credentials,
+/// whose CAP_DAC_OVERRIDE has ZFS skip the check of READ_ACL
+/// (`__zpl_xattr_nfs41acl_get` in `zpl_xattr.c` passes `ATTR_NOACLCHECK`),
+/// so an ACL that grants nobody READ_ACL comes back whole where the same
+/// read as nobody is refused, and `fgetxattr_as_root` refuses the `O_PATH`
+/// descriptor itself. A server that answers an access check from the ACL
+/// on behalf of a caller relies on this.
+#[test]
+fn fgetxattr_proc_as_root_reads_an_nfs4_acl_its_entries_hide() {
+    if !root_or_skip(
+        "fgetxattr_proc_as_root_reads_an_nfs4_acl_its_entries_hide",
+    ) {
+        return; // the broker and the ACL need privilege
+    }
+    let Some(ds) = nfs4_dataset_or_skip() else {
+        return;
+    };
+    // OWNER@ is allowed everything and EVERYONE@ READ_ATTRIBUTES and
+    // SYNCHRONIZE alone, so no entry grants nobody READ_ACL.
+    let acl = nfs4_xdr(&[[0, 0, 1, 0x1f_01ff, 1], [0, 0, 1, 0x10_0080, 3]]);
+    const MOST: usize = 8 + 20 * 1024;
+    with_broker(|h, creds, me, _dir| {
+        let anchor = Anchor::open(ds.as_path()).unwrap();
+        let file = format!("rostest_rootacl_{}", std::process::id());
+        let fifo = format!("rostest_rootfifo_{}", std::process::id());
+        let _ = std::fs::remove_file(ds.join(&file));
+        let _ = std::fs::remove_file(ds.join(&fifo));
+        std::fs::write(ds.join(&file), b"acl").unwrap();
+        mkfifo(&ds, &fifo);
+        let nobody = creds
+            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
+            .unwrap();
+        let name = xattr_name("system.nfs4_acl_xdr");
+        for leaf in [file.as_str(), fifo.as_str()] {
+            let how = OpenHow::new().flags(OFlag::O_RDONLY);
+            let open = h.open(me, &anchor, leaf, how).unwrap();
+            let (set, _) = h.fsetxattr(me, &open, name.clone(), acl.clone(), 0);
+            set.expect("root sets the ACL");
+            let (n, stored) =
+                h.fgetxattr(me, &open, name.clone(), vec![0; MOST]);
+            let stored = stored[..n.expect("root reads the ACL")].to_vec();
+            h.close(open).unwrap();
+
+            let how = OpenHow::new().flags(OFlag::O_PATH);
+            let held = h.open(me, &anchor, leaf, how).unwrap();
+            let (res, _) =
+                h.fgetxattr_proc(nobody, &held, name.clone(), vec![0; MOST]);
+            assert!(
+                matches!(res, Err(Error::Errno(Errno::EACCES))),
+                "{leaf} refuses nobody READ_ACL, got {res:?}"
+            );
+            let (res, _) =
+                h.fgetxattr_as_root(&held, name.clone(), vec![0; MOST]);
+            assert!(
+                matches!(res, Err(Error::Errno(Errno::EBADF))),
+                "{leaf} held O_PATH refuses fgetxattr, got {res:?}"
+            );
+            let (n, got) =
+                h.fgetxattr_proc_as_root(&held, name.clone(), vec![0; MOST]);
+            let n = n.unwrap_or_else(|e| panic!("{leaf} as root: {e}"));
+            assert_eq!(got[..n], stored[..], "{leaf}");
+            h.close(held).unwrap();
+        }
+        creds.unregister(nobody).unwrap();
+        std::fs::remove_file(ds.join(&file)).unwrap();
+        std::fs::remove_file(ds.join(&fifo)).unwrap();
+    });
+}
+
 #[test]
 fn query_pool_lists_directory() {
     use std::collections::BTreeSet;

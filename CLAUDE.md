@@ -76,10 +76,13 @@ Do not reopen these without a reason that is new.
     mode or xattrs to lose; `make_symlink_meta` is correct. The rule is
     about getting around a call that *refused* the handle - only chmod and
     the xattr family.
-  - One read is the exception. `FsConn::fgetxattr_proc` reads an xattr of
-    a file held `O_PATH` as a personality, through `/proc/thread-self/fd`.
-    A read brings the whole value back and leaves the check to the file
-    system, so nothing is dropped. No write goes through `/proc`.
+  - Reads are the exception. `FsConn::fgetxattr_proc` reads an xattr of a
+    file held `O_PATH` as a personality, through `/proc/thread-self/fd`,
+    and `FsConn::fgetxattr_proc_as_root` reads one under the ring owner's
+    credentials, as `fgetxattr_as_root` does on a real descriptor, for
+    metadata a server checks itself and never hands to a request. A read
+    brings the whole value back and leaves the check to the file system,
+    so nothing is dropped. No write goes through `/proc`.
   - `copytree` opens a FIFO `O_RDONLY|O_NONBLOCK` and carries its full
     metadata, and **refuses the mode of a socket or device node** (a socket
     answers `ENXIO` to every open; a device open runs its driver). Owner

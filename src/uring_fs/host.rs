@@ -457,12 +457,14 @@ impl UringFs {
                     file,
                     name,
                     value,
+                    through_proc,
                     reply,
                 } => self.fs.submit_fgetxattr_as_root(
                     &mut self.eng,
                     file,
                     name,
                     value,
+                    through_proc,
                     FsWaiter::Channel(reply),
                 ),
                 FsInject::FRemoveXattr { file, name, reply } => {
