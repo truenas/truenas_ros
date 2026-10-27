@@ -2169,8 +2169,9 @@ impl FsCore {
     /// Fail-closed on `pers == 0`: an fd-op under the ring owner's ambient
     /// (root) credentials is a privilege this surface must never grant
     /// implicitly. The sanctioned ambient-root paths are
-    /// [`FsCore::submit_fgetxattr_as_root`] and, for writes, the
-    /// [`PrivilegedXattrs`] allowlist consulted below.
+    /// [`FsCore::submit_fgetxattr_as_root`], a read on the descriptor or
+    /// through `/proc`, and, for writes, the [`PrivilegedXattrs`] allowlist
+    /// consulted below.
     ///
     /// **The allowlist is the only place a write is promoted to ambient
     /// credentials, and the promotion is keyed on the attribute name alone.**
@@ -2222,17 +2223,29 @@ impl FsCore {
     /// perform: `sqe.personality` (not the fd's open-time cred) governs
     /// `fgetxattr`'s `CAP_SYS_ADMIN` check, and `0` runs as the ring owner
     /// (root). Deliberate - every other fd-op path fails closed on `pers == 0`.
+    ///
+    /// `FGETXATTR` on the descriptor, or when `through_proc` `GETXATTR` of
+    /// its path under `/proc/thread-self/fd`, which takes a file held
+    /// `O_PATH`. The file system runs the same check of the ring owner
+    /// either way, so a value the file's own entries hide from a request
+    /// identity comes back through both.
     pub(crate) fn submit_fgetxattr_as_root(
         &mut self,
         eng: &mut Engine,
         file: Arc<OwnedFd>,
         name: Cow<'static, CStr>,
         value: Vec<u8>,
+        through_proc: bool,
         waiter: FsWaiter,
     ) {
+        let tag = if through_proc {
+            TAG_GETXATTR_PROC
+        } else {
+            TAG_FGETXATTR
+        };
         self.stage_fd_meta(
             eng,
-            TAG_FGETXATTR,
+            tag,
             0,
             file,
             Some(name),
@@ -4846,8 +4859,45 @@ impl<'a> FsConn<'a> {
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
         let w = self.waiter(on_done);
-        self.fs
-            .submit_fgetxattr_as_root(self.eng, f.fd, name.into(), buf, w);
+        self.fs.submit_fgetxattr_as_root(
+            self.eng,
+            f.fd,
+            name.into(),
+            buf,
+            false,
+            w,
+        );
+    }
+
+    /// Read extended attribute `name` of `f` under the reactor's **ambient
+    /// root**, through the path of `f` under `/proc/thread-self/fd`, so `f`
+    /// may be opened `O_PATH`, which
+    /// [`fgetxattr_as_root`](Self::fgetxattr_as_root) refuses with `EBADF`.
+    /// The path resolves as the ring owner and the file system checks the
+    /// ring owner, as [`fgetxattr_proc`](Self::fgetxattr_proc) says of
+    /// `who`, so a value the file's own entries hide from a request identity
+    /// comes back. For metadata a server checks itself and never hands to a
+    /// request, such as an ACL it answers an access check from on behalf of
+    /// a caller the ACL refuses READ_ACL. It needs `/proc` mounted in the
+    /// process's root.
+    pub fn fgetxattr_proc_as_root<F>(
+        &mut self,
+        f: File,
+        name: impl Into<Cow<'static, CStr>>,
+        buf: Vec<u8>,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        let w = self.waiter(on_done);
+        self.fs.submit_fgetxattr_as_root(
+            self.eng,
+            f.fd,
+            name.into(),
+            buf,
+            true,
+            w,
+        );
     }
 
     /// Write extended attribute `name` on `f` as `who`.

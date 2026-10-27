@@ -9,12 +9,14 @@
 //! - **Personality is mandatory.** Every consumer-staged operation carries a
 //!   [`Personality`] - a kernel-registered credential snapshot stamped into
 //!   the SQE, under which the kernel itself performs its permission checks
-//!   (`override_creds` around issue, io-wq included). There is no
-//!   ambient-identity variant: the daemon's own identity is minted like any
-//!   other via [`UringFs::register_self`], and `sqe.personality = 0` (the
-//!   ring owner's ambient creds) is unreachable from this API. Only
-//!   [`FsHandle::close`] is exempt - teardown consults no credentials and
-//!   must be stageable from [`File`]'s `Drop`.
+//!   (`override_creds` around issue, io-wq included). The daemon's own
+//!   identity is minted like any other via [`UringFs::register_self`], and
+//!   `sqe.personality = 0` (the ring owner's ambient creds) is reachable
+//!   only through the two reads [`FsHandle::fgetxattr_as_root`] and
+//!   [`FsHandle::fgetxattr_proc_as_root`], for metadata a server checks
+//!   itself and never hands to a request, and the write allowlist of
+//!   [`PrivilegedXattrs`]. Only [`FsHandle::close`] is exempt - teardown
+//!   consults no credentials and must be stageable from [`File`]'s `Drop`.
 //! - **Resolution is anchored.** No call takes an absolute path. [`Anchor`]
 //!   is a long-lived real directory fd; `open` resolves a **relative**,
 //!   multi-component path against it (confine it in-kernel with
@@ -820,8 +822,9 @@ const TRUSTED_NS: &[u8] = b"trusted.";
 ///
 /// The reactor normally refuses `personality == 0` on every fd operation,
 /// because that is "no credential override" - the op would run as the daemon
-/// (root) rather than the requesting identity. Reads have one sanctioned
-/// exception already ([`FsHandle::fgetxattr_as_root`]); this is its write-side
+/// (root) rather than the requesting identity. Reads have two sanctioned
+/// exceptions already ([`FsHandle::fgetxattr_as_root`] and
+/// [`FsHandle::fgetxattr_proc_as_root`]); this is their write-side
 /// counterpart, and it is an allowlist rather than a blanket permit because a
 /// privileged *write* is a far sharper tool than a privileged read.
 ///
@@ -1252,11 +1255,15 @@ pub(crate) enum FsInject {
     /// A privileged `fgetxattr` under the reactor's ambient (root) credentials
     /// (`personality = 0`), reading a `trusted.*`/`security.*` attribute a
     /// request identity cannot see (the off-loop twin of
-    /// [`FsConn::fgetxattr_as_root`](core::FsConn::fgetxattr_as_root)).
+    /// [`FsConn::fgetxattr_as_root`](core::FsConn::fgetxattr_as_root)), or
+    /// `through_proc` the same read of a file held `O_PATH` by its path
+    /// under `/proc/thread-self/fd` (the twin of
+    /// [`FsConn::fgetxattr_proc_as_root`](core::FsConn::fgetxattr_proc_as_root)).
     FdMetaAsRoot {
         file: Arc<OwnedFd>,
         name: Cow<'static, CStr>,
         value: Vec<u8>,
+        through_proc: bool,
         reply: ReplyTo,
     },
     /// Remove a server-owned extended attribute. Off the ring - io_uring has
@@ -1937,11 +1944,40 @@ impl FsHandle {
         name: impl Into<Cow<'static, CStr>>,
         buf: Vec<u8>,
     ) -> (crate::Result<usize>, Vec<u8>) {
+        self.read_as_root(f, name.into(), buf, false)
+    }
+
+    /// Read extended attribute `name` of `f` under the reactor's ambient
+    /// (root) credentials through the path of `f` under
+    /// `/proc/thread-self/fd`, so `f` may be opened `O_PATH`, which
+    /// [`fgetxattr_as_root`](Self::fgetxattr_as_root) refuses with `EBADF`.
+    /// The blocking twin of
+    /// [`FsConn::fgetxattr_proc_as_root`](crate::uring_fs::FsConn::fgetxattr_proc_as_root),
+    /// which says what it reads and what it is for.
+    pub fn fgetxattr_proc_as_root(
+        &self,
+        f: &File,
+        name: impl Into<Cow<'static, CStr>>,
+        buf: Vec<u8>,
+    ) -> (crate::Result<usize>, Vec<u8>) {
+        self.read_as_root(f, name.into(), buf, true)
+    }
+
+    /// The two reads under the reactor's ambient credentials, on the
+    /// descriptor or `through_proc`.
+    fn read_as_root(
+        &self,
+        f: &File,
+        name: Cow<'static, CStr>,
+        buf: Vec<u8>,
+        through_proc: bool,
+    ) -> (crate::Result<usize>, Vec<u8>) {
         let (tx, rx) = mpsc::channel();
         let sent = self.send(FsInject::FdMetaAsRoot {
             file: f.fd.clone(),
-            name: name.into(),
+            name,
             value: buf,
+            through_proc,
             reply: ReplyTo::Sync(tx),
         });
         if let Err(msg) = sent {

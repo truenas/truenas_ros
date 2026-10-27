@@ -9581,6 +9581,124 @@ fn fs_file_carries_personality_and_as_root() {
     assert_eq!(reply, b"secret");
 }
 
+/// `FsConn::fgetxattr_proc_as_root` reads an xattr of a file held `O_PATH`
+/// under the reactor's ambient (root) credentials, through the file's path
+/// under `/proc/thread-self/fd`, where `fgetxattr_as_root` refuses the
+/// descriptor itself with `EBADF`. As above, the peer on this root host is
+/// itself root, so the privilege boundary is pinned in `test/uring_fs.rs`,
+/// and this exercises the `personality = 0` `GETXATTR` path end to end.
+#[cfg(feature = "uring-fs")]
+#[test]
+fn fs_file_held_o_path_reads_as_root_through_proc() {
+    use std::ffi::CString;
+    use std::sync::OnceLock;
+    use truenas_ros::sync_fs::{OFlag, OpenHow};
+    use truenas_ros::uring_fs::{Anchor, Personality};
+
+    let dir = truenas_ros::tempdir().unwrap();
+    let fpath = dir.path().join("f.txt");
+    std::fs::write(&fpath, b"payload").unwrap();
+    if !set_user_xattr(&fpath, b"user.tr_test", b"secret") {
+        return;
+    }
+
+    let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let anchor = match Anchor::open(dir.path()) {
+        Ok(a) => a,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("anchor open: {e}"),
+    };
+
+    let pc = Arc::clone(&pers);
+    let body = move |mut req: Request<'_, ()>| -> Response {
+        let _ = req.body.take();
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let who = *pc.get().expect("personality set before serving");
+        let anchor = anchor.clone();
+        let path = CString::new("f.txt").unwrap();
+        let how = OpenHow::new().flags(OFlag::O_PATH);
+        fs.open(who, &anchor, &path, how, move |done, fs| {
+            let Some(file) = done.file() else {
+                deferred.close();
+                return;
+            };
+            let name = CString::new("user.tr_test").unwrap();
+            let again = name.clone();
+            let held = file.clone();
+            fs.fgetxattr_as_root(file, name, vec![0u8; 64], move |d, fs| {
+                let refused =
+                    matches!(d.result(), Err(Error::Errno(Errno::EBADF)));
+                let file = held.clone();
+                fs.fgetxattr_proc_as_root(
+                    held,
+                    again,
+                    vec![0u8; 64],
+                    move |d, fs| {
+                        fs.close(file);
+                        let mut out = vec![if refused { b'1' } else { b'0' }];
+                        out.push(b':');
+                        match d.result() {
+                            Ok(n) => {
+                                let mut v =
+                                    d.into_bufs().pop().unwrap_or_default();
+                                v.truncate(n as usize);
+                                out.extend_from_slice(&v);
+                            }
+                            Err(_) => out.extend_from_slice(b"xattr-err"),
+                        }
+                        deferred.reply(echo_frame(&out));
+                    },
+                );
+            });
+        });
+        Response::Defer(permit)
+    };
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body,
+    };
+    let cfg = ServerConfig {
+        pool_size: 8,
+        fs_ops: 8,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    pers.set(server.register_self().expect("register_self"))
+        .unwrap();
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        let mut s = connect_tcp(v4)?;
+        send_framed(&mut s, b"go")?;
+        let r = recv_framed(&mut s)?;
+        drop(s);
+        stop.shutdown();
+        Ok(r)
+    });
+    server
+        .serve_forever()
+        .expect("serve_forever proc as_root xattr");
+    let reply = client.join().unwrap().expect("client io");
+    // The descriptor was refused and the proc path read the value.
+    assert_eq!(reply, b"1:secret");
+}
+
 #[cfg(feature = "uring-fs")]
 #[path = "support/xattr.rs"]
 mod xattr_probe;
