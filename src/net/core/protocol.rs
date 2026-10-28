@@ -331,8 +331,14 @@ pub struct Body<'a> {
 }
 
 enum BodyInner<'a> {
-    /// Borrowed from the connection's accumulate buffer.
+    /// Borrowed from a larger wire message a codec carved the payload out
+    /// of, as the http codec delivers an entity.
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     Inline(&'a [u8]),
+    /// Borrowed from the connection's accumulate buffer, mutably, so a
+    /// handler may transform the message where it lies, as one that opens
+    /// a sealed body does.
+    InlineMut(&'a mut [u8]),
     /// Owns an allocation in which the body is the `start..start + len`
     /// window - the whole allocation for a placed body; a sub-window when a
     /// codec carved the payload out of a larger wire message (the bytes
@@ -345,9 +351,34 @@ enum BodyInner<'a> {
 }
 
 impl<'a> Body<'a> {
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub(crate) fn inline(bytes: &'a [u8]) -> Body<'a> {
         Body {
             inner: BodyInner::Inline(bytes),
+        }
+    }
+
+    pub(crate) fn inline_mut(bytes: &'a mut [u8]) -> Body<'a> {
+        Body {
+            inner: BodyInner::InlineMut(bytes),
+        }
+    }
+
+    /// The bytes mutably, for a handler that transforms the message where
+    /// it lies rather than taking it, which the reactor's own delivery
+    /// allows, inline or placed, and the bytes read as transformed
+    /// afterwards. `None` for a body a codec borrowed out of a larger
+    /// message, which [`Body::take`] copies out.
+    pub fn bytes_mut(&mut self) -> Option<&mut [u8]> {
+        match &mut self.inner {
+            BodyInner::Inline(_) => None,
+            BodyInner::InlineMut(bytes) => Some(bytes),
+            BodyInner::Owned {
+                buf: Some(v),
+                start,
+                len,
+            } => Some(&mut v[*start..*start + *len]),
+            BodyInner::Owned { buf: None, .. } => Some(&mut []),
         }
     }
 
@@ -387,6 +418,11 @@ impl<'a> Body<'a> {
                 *bytes = &[];
                 out
             }
+            BodyInner::InlineMut(bytes) => {
+                let out = bytes.to_vec();
+                *bytes = &mut [];
+                out
+            }
             BodyInner::Owned { buf, start, len } => match buf.take() {
                 Some(mut v) => {
                     if *start > 0 {
@@ -410,7 +446,7 @@ impl<'a> Body<'a> {
     #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub(crate) fn try_take_owned(&mut self) -> Option<Vec<u8>> {
         match &mut self.inner {
-            BodyInner::Inline(_) => None,
+            BodyInner::Inline(_) | BodyInner::InlineMut(_) => None,
             BodyInner::Owned { buf, len, .. } => {
                 *len = 0;
                 buf.take()
@@ -424,6 +460,7 @@ impl std::ops::Deref for Body<'_> {
     fn deref(&self) -> &[u8] {
         match &self.inner {
             BodyInner::Inline(bytes) => bytes,
+            BodyInner::InlineMut(bytes) => bytes,
             BodyInner::Owned {
                 buf: Some(v),
                 start,
@@ -709,5 +746,19 @@ mod tests {
         let mut b = Body::inline(b"abc");
         assert!(b.try_take_owned().is_none());
         assert_eq!(&b[..], b"abc");
+        assert!(b.bytes_mut().is_none());
+        // A handler may change the bytes where they lie when the reactor
+        // delivered them, inline or placed.
+        let mut abc = *b"abc";
+        let mut b = Body::inline_mut(&mut abc);
+        assert!(b.try_take_owned().is_none());
+        b.bytes_mut().unwrap()[0] = b'x';
+        assert_eq!(&b[..], b"xbc");
+        drop(b);
+        assert_eq!(&abc, b"xbc");
+        let mut p = Body::placed(b"abc".to_vec());
+        p.bytes_mut().unwrap()[2] = b'z';
+        assert_eq!(&p[..], b"abz");
+        assert_eq!(p.take(), b"abz");
     }
 }
