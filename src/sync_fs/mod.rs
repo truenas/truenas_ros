@@ -23,6 +23,8 @@ mod mkdirat;
 #[cfg(feature = "sync-fs")]
 pub(crate) mod openat2;
 #[cfg(feature = "sync-fs")]
+mod readlink;
+#[cfg(feature = "sync-fs")]
 mod renameat2;
 #[cfg(feature = "sync-fs")]
 mod safe_open;
@@ -60,6 +62,8 @@ pub use linkat::linkat;
 pub use mkdirat::mkdirat;
 #[cfg(feature = "sync-fs")]
 pub use openat2::{OpenHow, ResolveFlag, openat2};
+#[cfg(feature = "sync-fs")]
+pub use readlink::freadlink;
 #[cfg(feature = "sync-fs")]
 pub use renameat2::{RenameFlags, renameat2};
 #[cfg(feature = "sync-fs")]
