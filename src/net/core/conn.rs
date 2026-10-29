@@ -282,35 +282,54 @@ impl RecvBuf {
         self.filled = 0;
     }
 
-    /// The claim as a write lease, for a delivery's fs facade.
-    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    /// The message at the front of the buffer, split for a delivery, the
+    /// header as it is and the body lent mutably, so that a handler may
+    /// transform the message where it lies.
+    pub(crate) fn deliver_mut(
+        &mut self,
+        header_len: usize,
+        body_len: usize,
+    ) -> (&[u8], &mut [u8]) {
+        let bytes =
+            filled_mut(self.claim.as_ref(), &mut self.owned, self.filled);
+        let (header, rest) = bytes.split_at_mut(header_len);
+        // A placed body left the buffer, so the rest may be shorter than
+        // the body, and the delivery takes the placed one instead.
+        let end = body_len.min(rest.len());
+        (header, &mut rest[..end])
+    }
+
+    /// The claim as a write lease over `extent` bytes, as a delivery makes
+    /// one, for the tests of the lease.
+    #[cfg(all(test, feature = "net-server", feature = "uring-fs"))]
     pub(crate) fn write_lease(
         &self,
         extent: usize,
     ) -> Option<crate::uring_fs::core::RecvWriteLease<'_>> {
-        // A zero extent is a *redelivery*: `deliver_one` zeroes the frame
-        // because the message's bytes were consumed at its first delivery,
-        // so there is nothing here for a write to borrow. Minted anyway,
-        // the lease still names the claim, and `pwritev2_from`'s bounds
-        // test admits a zero-length range at the base - which a
-        // redelivery's empty `Body` is - so a write with no bytes takes
-        // the claim a read-ahead recv is armed into. The same case
-        // `take_body_handoff` excludes with its `body_len > 0`.
-        if extent == 0 {
-            return None;
-        }
-        let c = self.claim.as_ref()?;
-        Some(crate::uring_fs::core::RecvWriteLease {
-            ptr: c.ptr,
-            // Bounded to the delivered message, never the buffer: bytes
-            // past the extent are the next pipelined request's - or a
-            // previous holder's, since a recycled buffer is not zeroed -
-            // so a slice reaching into them must fall to the copy path
-            // rather than be committed into a stored object.
-            cap: c.cap.min(extent),
-            bid: c.bid,
-            taken: &self.write_leased,
-        })
+        lease_of(self.claim.as_ref(), &self.write_leased, extent)
+    }
+
+    /// As [`deliver_mut`](Self::deliver_mut), plus the claim as a write
+    /// lease over the message, for a delivery's fs facade, in one borrow of
+    /// the buffer's parts, since the lease borrows the flag alone and the
+    /// body the bytes.
+    #[cfg(all(feature = "net-server", feature = "uring-fs"))]
+    pub(crate) fn deliver_leased_mut(
+        &mut self,
+        header_len: usize,
+        body_len: usize,
+    ) -> (
+        &[u8],
+        &mut [u8],
+        Option<crate::uring_fs::core::RecvWriteLease<'_>>,
+    ) {
+        let extent = header_len + body_len;
+        let lease = lease_of(self.claim.as_ref(), &self.write_leased, extent);
+        let bytes =
+            filled_mut(self.claim.as_ref(), &mut self.owned, self.filled);
+        let (header, rest) = bytes.split_at_mut(header_len);
+        let end = body_len.min(rest.len());
+        (header, &mut rest[..end], lease)
     }
 
     /// Give the buffer up, for the caller to hand back to the pool. Only
@@ -619,6 +638,56 @@ impl RecvBuf {
         v.truncate(self.filled);
         self.filled = 0;
         Some((v, self.take_owned_licence()))
+    }
+}
+
+/// The claim as a write lease over `extent` bytes, for a delivery's fs
+/// facade, borrowing the flag `taken` alone.
+#[cfg(all(feature = "net-server", feature = "uring-fs"))]
+fn lease_of<'a>(
+    claim: Option<&RecvClaim>,
+    taken: &'a std::cell::Cell<bool>,
+    extent: usize,
+) -> Option<crate::uring_fs::core::RecvWriteLease<'a>> {
+    // A zero extent is a redelivery, since `deliver_one` zeroes the
+    // frame because the message's bytes were consumed at its first
+    // delivery, so there is nothing here for a write to borrow. Minted
+    // anyway, the lease still names the claim, and `pwritev2_from`'s
+    // bounds test admits a zero-length range at the base, which a
+    // redelivery's empty `Body` is, so a write with no bytes takes the
+    // claim a read-ahead recv is armed into. The same case
+    // `take_body_handoff` excludes with its `body_len > 0`.
+    if extent == 0 {
+        return None;
+    }
+    let c = claim?;
+    Some(crate::uring_fs::core::RecvWriteLease {
+        ptr: c.ptr,
+        // Bounded to the delivered message, never the buffer, since
+        // bytes past the extent are the next pipelined request's, or a
+        // previous holder's, as a recycled buffer is not zeroed, so a
+        // slice reaching into them must fall to the copy path rather
+        // than be committed into a stored object.
+        cap: c.cap.min(extent),
+        bid: c.bid,
+        taken,
+    })
+}
+
+/// The `filled` bytes of the claim, or of `owned` without one, mutably.
+fn filled_mut<'a>(
+    claim: Option<&RecvClaim>,
+    owned: &'a mut [u8],
+    filled: usize,
+) -> &'a mut [u8] {
+    match claim {
+        // SAFETY: as the shared view below, and the kernel writes only past
+        // `filled`, so the bytes a handler changes are its own message's.
+        Some(c) => unsafe { std::slice::from_raw_parts_mut(c.ptr, filled) },
+        None => {
+            let end = filled.min(owned.len());
+            &mut owned[..end]
+        }
     }
 }
 
@@ -1271,10 +1340,11 @@ impl<U> Connection<U> {
                 licence,
             );
         }
-        let (header, rest) = self.recv_buf.split_at(self.header_len);
+        let (header, rest) =
+            self.recv_buf.deliver_mut(self.header_len, self.body_len);
         let (body, licence) = match placed {
             Some((bytes, licence)) => (Body::placed(bytes), licence),
-            None => (Body::inline(&rest[..self.body_len]), 0),
+            None => (Body::inline_mut(rest), 0),
         };
         (header, body, &self.peer, &mut self.state, licence)
     }
@@ -1310,11 +1380,12 @@ impl<U> Connection<U> {
                 licence,
             );
         }
-        let lease = self.recv_buf.write_lease(self.header_len + self.body_len);
-        let (header, rest) = self.recv_buf.split_at(self.header_len);
+        let (header, rest, lease) = self
+            .recv_buf
+            .deliver_leased_mut(self.header_len, self.body_len);
         let (body, licence) = match placed {
             Some((bytes, licence)) => (Body::placed(bytes), licence),
-            None => (Body::inline(&rest[..self.body_len]), 0),
+            None => (Body::inline_mut(rest), 0),
         };
         (header, body, &self.peer, &mut self.state, lease, licence)
     }
