@@ -39,7 +39,7 @@
 //! [`Cookie::truncate`]-ing to that `depth` and rebuilding.
 
 use crate::AT_FDCWD;
-use crate::errno::{Errno, retry_on_eintr};
+use crate::errno::Errno;
 use crate::error::{Error, Result};
 use crate::fd::dup_cloexec;
 use crate::mount::{StatmountMask, statmount};
@@ -48,7 +48,7 @@ use crate::sync_fs::{
     AtFlags, OFlag, OpenHow, ResolveFlag, Statx, StatxMask, openat2, statx,
 };
 use std::ffi::{OsStr, OsString};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -341,21 +341,7 @@ impl Entry {
 
     /// Read the target of a symbolic-link entry (via the `O_PATH` fd).
     pub fn read_link(&self) -> Result<PathBuf> {
-        let mut buf = vec![0u8; libc::PATH_MAX as usize];
-        let raw = self.fd.as_raw_fd();
-        let n = retry_on_eintr(|| unsafe {
-            libc::readlinkat(
-                raw,
-                c"".as_ptr(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-            )
-        })? as usize;
-        buf.truncate(n);
-        // A target is typically tens of bytes; do not hand back the
-        // PATH_MAX probe behind it.
-        buf.shrink_to_fit();
-        Ok(PathBuf::from(OsString::from_vec(buf)))
+        Ok(super::freadlink(&self.fd)?)
     }
 }
 
