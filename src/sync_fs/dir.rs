@@ -28,6 +28,11 @@
 //! process running as root is no check at all. So this module dups and
 //! spends the position rather than reopening and widening the right, and
 //! the position is the caller's to protect.
+//!
+//! A listing a peer resumes, as NFS READDIR does from a cookie, is
+//! [`Listing`]. It reads one entry at a time with the cookie that goes on
+//! after it, and starts from any cookie an entry gave, on the same dup and
+//! under the same contract.
 
 use std::ffi::CStr;
 use std::os::fd::{AsFd, IntoRawFd, OwnedFd};
@@ -151,6 +156,124 @@ pub fn read_names(fd: impl AsFd) -> errno::Result<Vec<DirEntryName>> {
     Ok(names)
 }
 
+/// A directory read one entry at a time from a cookie, for a listing that
+/// a peer resumes, as NFS READDIR does.
+///
+/// It reads on a dup of the descriptor it opens over, as [`read_names`]
+/// does and under the same contract, so the caller's position is spent.
+/// A cookie is what the kernel gives as `d_off`, the position of the entry
+/// after the one it came with, and [`seek`](Listing::seek) goes on from
+/// there, as `seekdir` does with what `telldir` gave. The cookie 0 is the
+/// beginning. On ZFS a cookie is a serialized ZAP cursor, which holds
+/// while the folder changes, and the kernel gives the last entry the
+/// cursor's end. `.` and `..` are left out, as [`read_names`] leaves them
+/// out, and their cookies are never given.
+#[derive(Debug)]
+pub struct Listing {
+    dir: Dir,
+    /// The record `readdir` gave last, which the entry lends from, or null
+    /// before the first read and at the end.
+    last: *mut libc::dirent,
+}
+
+/// One entry of a [`Listing`], lent until the next is read.
+#[derive(Debug)]
+pub struct Entry<'a> {
+    /// The entry's name bytes, as the directory holds them.
+    pub name: &'a [u8],
+    /// What `readdir` said it is.
+    pub kind: NameKind,
+    /// Its inode number, as `readdir` gives it.
+    pub ino: u64,
+    /// The cookie of the position after it, which [`Listing::seek`] goes
+    /// on from.
+    pub cookie: u64,
+}
+
+impl Listing {
+    /// Open a listing over `fd`, from the beginning, on a dup of it.
+    ///
+    /// An `O_PATH` descriptor is refused with `EBADF`, as [`read_names`]
+    /// says, and what is not a directory with `ENOTDIR`.
+    pub fn open(fd: impl AsFd) -> errno::Result<Listing> {
+        let dup = fd.as_fd().try_clone_to_owned().map_err(|e| {
+            Errno::from_raw(e.raw_os_error().unwrap_or(libc::EIO))
+        })?;
+        let mut dir = Dir::from_fd(dup)?;
+        dir.rewind();
+        Ok(Listing {
+            dir,
+            last: std::ptr::null_mut(),
+        })
+    }
+
+    /// Go on from `cookie`, which an entry gave, or from the beginning
+    /// for 0.
+    pub fn seek(&mut self, cookie: u64) {
+        self.last = std::ptr::null_mut();
+        // SAFETY: `self.dir.0` is a live DIR stream we own exclusively.
+        // The cookie goes through as the kernel gave it, which `seekdir`
+        // takes as `telldir`'s value.
+        unsafe { libc::seekdir(self.dir.0.as_ptr(), cookie as libc::c_long) };
+    }
+
+    /// The next entry, or `None` at the end.
+    pub fn read(&mut self) -> errno::Result<Option<Entry<'_>>> {
+        loop {
+            self.last = self.dir.read_record()?;
+            if self.last.is_null() {
+                return Ok(None);
+            }
+            // SAFETY: `last` is the record `readdir` just gave, valid until
+            // the next read, and the name is looked at and let go here.
+            let name = unsafe { fields_of(self.last).3 };
+            if name != b"." && name != b".." {
+                break;
+            }
+        }
+        // SAFETY: as above, and the entry lends the name for as long as
+        // the listing is borrowed, which ends before the next read.
+        let (d_type, d_ino, d_off, name) = unsafe { fields_of(self.last) };
+        Ok(Some(Entry {
+            name,
+            kind: NameKind::from_d_type(d_type),
+            ino: d_ino,
+            cookie: d_off,
+        }))
+    }
+}
+
+/// The type, the inode, the offset after and the name of the record `ent`.
+///
+/// # Safety
+///
+/// `ent` points at a record `readdir` gave on a stream that has not been
+/// read since, and the name is valid for `'a` only until that stream is
+/// read again.
+///
+/// A `&libc::dirent` must NOT be formed here. The reference would claim all
+/// 280 bytes of the struct, `d_name` being a `[c_char; 256]`, over a record
+/// only `d_reclen` bytes long. A short-named entry's record is 24 to 40
+/// bytes, and the last record in a filled buffer ends where the buffer's
+/// valid data does. Measured on ZFS, over 5002 entries the tightest record
+/// left 32 valid bytes. The same idiom, with the same reason, is at
+/// `uring_fs/core.rs` and `uring_fs/query_dir.rs`. `d_ino`, `d_off` and
+/// `d_type` are inside every record's fixed head, before the name.
+unsafe fn fields_of<'a>(ent: *mut libc::dirent) -> (u8, u64, u64, &'a [u8]) {
+    // SAFETY: the caller's, and every field is read through `addr_of!`.
+    unsafe {
+        (
+            std::ptr::addr_of!((*ent).d_type).read(),
+            std::ptr::addr_of!((*ent).d_ino).read(),
+            std::ptr::addr_of!((*ent).d_off).read() as u64,
+            CStr::from_ptr(
+                std::ptr::addr_of!((*ent).d_name).cast::<libc::c_char>(),
+            )
+            .to_bytes(),
+        )
+    }
+}
+
 /// One directory entry read from a [`Dir`].
 pub(crate) struct DirEntry {
     pub(crate) d_type: u8,
@@ -161,6 +284,7 @@ pub(crate) struct DirEntry {
 }
 
 /// A minimal RAII wrapper over a `DIR *` from `fdopendir`.
+#[derive(Debug)]
 pub(crate) struct Dir(NonNull<libc::DIR>);
 
 // SAFETY: a `Dir` owns its `DIR` exclusively and is never shared, so it may be
@@ -203,6 +327,25 @@ impl Dir {
     }
 
     pub(crate) fn next_entry(&mut self) -> errno::Result<Option<DirEntry>> {
+        let ent = self.read_record()?;
+        if ent.is_null() {
+            return Ok(None);
+        }
+        // SAFETY: `ent` is the record `readdir` just gave, valid until the
+        // next read, and every field is copied out before that.
+        let (d_type, d_ino, _, name) = unsafe { fields_of(ent) };
+        #[cfg(not(feature = "fsiter"))]
+        let _ = d_ino;
+        Ok(Some(DirEntry {
+            d_type,
+            #[cfg(feature = "fsiter")]
+            d_ino,
+            name: std::ffi::OsStr::from_bytes(name).to_os_string(),
+        }))
+    }
+
+    /// The next record, or null at the end.
+    fn read_record(&mut self) -> errno::Result<*mut libc::dirent> {
         // readdir signals end-of-directory and error both with NULL; clear
         // errno first to tell them apart.
         Errno::clear();
@@ -210,37 +353,11 @@ impl Dir {
         let ent = unsafe { libc::readdir(self.0.as_ptr()) };
         if ent.is_null() {
             return match Errno::last_raw() {
-                0 => Ok(None),
+                0 => Ok(ent),
                 e => Err(Errno::from_raw(e)),
             };
         }
-        // SAFETY: `ent` points into the DIR buffer, valid until the next
-        // readdir/closedir; every field is read through `addr_of!` and
-        // copied out immediately.
-        //
-        // A `&libc::dirent` must NOT be formed here. The reference would
-        // claim all 280 bytes of the struct - `d_name` is a `[c_char; 256]`
-        // - over a record only `d_reclen` bytes long: a short-named entry's
-        // record is 24-40 bytes, and the last record in a filled buffer ends
-        // where the buffer's valid data does. Measured on ZFS: over 5002
-        // entries the tightest record left 32 valid bytes. The same idiom,
-        // with the same reason, is at `uring_fs/core.rs` and
-        // `uring_fs/query_dir.rs`.
-        let (d_type, name) = unsafe {
-            (
-                std::ptr::addr_of!((*ent).d_type).read(),
-                CStr::from_ptr(
-                    std::ptr::addr_of!((*ent).d_name).cast::<libc::c_char>(),
-                ),
-            )
-        };
-        Ok(Some(DirEntry {
-            d_type,
-            #[cfg(feature = "fsiter")]
-            // SAFETY: as above; `d_ino` is inside every record's fixed head.
-            d_ino: unsafe { std::ptr::addr_of!((*ent).d_ino).read() },
-            name: std::ffi::OsStr::from_bytes(name.to_bytes()).to_os_string(),
-        }))
+        Ok(ent)
     }
 }
 
@@ -292,6 +409,62 @@ mod tests {
     }
 
     /// An empty directory answers an empty list, not an error.
+    #[test]
+    fn a_listing_goes_on_from_a_cookie_and_ends_at_the_last() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = crate::tempdir().expect("tempdir");
+        for name in ["a", "b", "c", "d", "e"] {
+            std::fs::write(tmp.path().join(name), b"x").expect("file");
+        }
+        std::fs::create_dir(tmp.path().join("sub")).expect("dir");
+        let dirf = std::fs::File::open(tmp.path()).expect("open dir");
+
+        // Every entry once, with its inode and its kind, and the cookie of
+        // each is neither 0 nor 1 nor 2, which NFS reserves.
+        let mut listing = Listing::open(dirf.as_fd()).expect("listing");
+        let mut seen = Vec::new();
+        while let Some(entry) = listing.read().expect("read") {
+            let path = tmp.path().join(std::ffi::OsStr::from_bytes(entry.name));
+            let meta = std::fs::symlink_metadata(&path).expect("metadata");
+            assert_eq!(entry.ino, meta.ino(), "{path:?}");
+            let kind = if meta.is_dir() {
+                NameKind::Dir
+            } else {
+                NameKind::File
+            };
+            let hinted = entry.kind;
+            assert!(hinted == NameKind::Unknown || hinted == kind, "{path:?}");
+            assert!(
+                entry.cookie > 2,
+                "{path:?} has the cookie {}",
+                entry.cookie
+            );
+            seen.push((entry.name.to_vec(), entry.cookie));
+        }
+        assert_eq!(seen.len(), 6, "dot and dot-dot never among them");
+
+        // From the cookie of the second entry, a fresh listing gives what
+        // came after it, and from the cookie of the last, nothing.
+        let after_second = seen[1].1;
+        let mut rest = Listing::open(dirf.as_fd()).expect("listing");
+        rest.seek(after_second);
+        let mut names = Vec::new();
+        while let Some(entry) = rest.read().expect("read") {
+            names.push(entry.name.to_vec());
+        }
+        let want: Vec<Vec<u8>> =
+            seen[2..].iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(names, want);
+        let after_last = seen[5].1;
+        rest.seek(after_last);
+        assert!(rest.read().expect("read").is_none());
+
+        // The cookie 0 is the beginning again.
+        rest.seek(0);
+        let first = rest.read().expect("read").expect("an entry");
+        assert_eq!(first.name, seen[0].0);
+    }
+
     #[test]
     fn an_empty_directory_reads_empty() {
         let tmp = crate::tempdir().expect("tempdir");
