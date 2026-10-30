@@ -1241,3 +1241,95 @@ fn statx_gives_the_acltype_of_the_dataset() {
     assert_eq!(posix_now, Some(AclType::Posix));
     assert_eq!(nfs4_now, Some(AclType::Nfsv4));
 }
+
+/// The TrueNAS kernel says, when `STATX_ACL` is asked, whether a file has a
+/// POSIX access ACL and a folder a default one, from the ACLs the inode
+/// caches (`statx_posix_acls` in fs/stat.c, through `get_inode_acl`). Each
+/// follows a set and a removal at the next statx, an ACL the mode says all
+/// of is not kept (`zpl_set_acl_impl` in module/os/linux/zfs/zpl_xattr.c),
+/// a statx that does not ask is told nothing, and the NFSv4 dataset answers
+/// without the bit. `TRUENAS_ROS_REQUIRE_STATX_POSIX_ACLS` turns a kernel
+/// that does not answer on the POSIX dataset into a failure.
+#[test]
+fn statx_says_whether_a_file_has_a_posix_acl() {
+    let (Some(posix), Some(nfs4)) = (posix_dir(), nfs4_dir()) else {
+        return skip("no POSIX or NFSv4 dataset");
+    };
+    let (path, file) = scratch_file(&posix, "posixacls");
+    let folder =
+        posix.join(format!("rostest_posixacls_dir_{}", std::process::id()));
+    let _ = std::fs::remove_dir(&folder);
+    std::fs::create_dir(&folder).unwrap();
+    let folder_fd = std::fs::File::open(&folder).unwrap();
+    let clean_up = || {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&folder);
+    };
+    let acls_of = |f: &std::fs::File, mask: StatxMask| {
+        let st = statx(f.as_fd(), "", AtFlags::AT_EMPTY_PATH, mask).unwrap();
+        (st.posix_access_acl(), st.posix_default_acl())
+    };
+    let acls = |f: &std::fs::File| acls_of(f, StatxMask::ACL);
+    if acls(&file).0.is_none() {
+        clean_up();
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_POSIX_ACLS").is_none(),
+            "TRUENAS_ROS_REQUIRE_STATX_POSIX_ACLS is set but the kernel does \
+             not answer STATX_ACL at {}",
+            posix.display()
+        );
+        return;
+    }
+    // The mode alone, then with a named user, which needs a mask.
+    let mode = |default| {
+        [PosixTag::UserObj, PosixTag::GroupObj, PosixTag::Other].map(|tag| {
+            PosixAce {
+                tag,
+                perms: PosixPerm::READ | PosixPerm::WRITE,
+                id: -1,
+                default,
+            }
+        })
+    };
+    let named = |default| {
+        let more = [(PosixTag::User, 4_200), (PosixTag::Mask, -1)];
+        let more = more.map(|(tag, id)| PosixAce {
+            tag,
+            perms: PosixPerm::READ,
+            id,
+            default,
+        });
+        [mode(default).as_slice(), &more].concat()
+    };
+    let set = |f: &std::fs::File, aces: Vec<PosixAce>| {
+        let acl = Acl::Posix(PosixAcl::from_aces(aces));
+        fsetacl(f.as_fd(), Some(&acl)).expect("fsetacl posix");
+    };
+
+    let fresh = (acls(&file), acls(&folder_fd));
+    set(&file, named(false));
+    let with_access = acls(&file);
+    set(&file, mode(false).to_vec());
+    let as_the_mode = acls(&file);
+    set(&folder_fd, [mode(false).to_vec(), named(true)].concat());
+    let with_default = acls(&folder_fd);
+    set(&folder_fd, [named(false), named(true)].concat());
+    let with_both = acls(&folder_fd);
+    let unasked = acls_of(&folder_fd, StatxMask::BASIC_STATS);
+    fsetacl(folder_fd.as_fd(), None).expect("fsetacl None");
+    let removed = acls(&folder_fd);
+    clean_up();
+    let (path, f) = scratch_file(&nfs4, "posixacls");
+    let on_nfs4 = acls(&f);
+    let _ = std::fs::remove_file(&path);
+
+    let neither = (Some(false), Some(false));
+    assert_eq!(fresh, (neither, neither));
+    assert_eq!(with_access, (Some(true), Some(false)));
+    assert_eq!(as_the_mode, neither);
+    assert_eq!(with_default, (Some(false), Some(true)));
+    assert_eq!(with_both, (Some(true), Some(true)));
+    assert_eq!(unasked, (None, None));
+    assert_eq!(removed, neither);
+    assert_eq!(on_nfs4, (None, None));
+}

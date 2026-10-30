@@ -200,6 +200,12 @@ export TRUENAS_ROS_REQUIRE_ZFS_SETATTR=1
 # carries it, so the test of the type must run. A kernel that names neither
 # bit in `stx_attributes_mask` turns CI red.
 export TRUENAS_ROS_REQUIRE_STATX_ACLTYPE=1
+# The kernel fork also says, when STATX_ACL is asked, whether a file has a
+# POSIX access ACL and a directory a default one, from the ACLs the inode
+# caches (`statx_posix_acls` in fs/stat.c), and the nightly kernel carries
+# it, so the tests of the two must run. A kernel that leaves STATX_ACL out of
+# the result mask on the POSIX dataset or the tempdir turns CI red.
+export TRUENAS_ROS_REQUIRE_STATX_POSIX_ACLS=1
 # The audit suite sends REAL records over NETLINK_AUDIT. It tolerates three
 # environments - no socket, a socket without CAP_AUDIT_WRITE, and the real
 # thing - and only the third tests anything. This VM is the only place that
