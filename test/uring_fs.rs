@@ -4672,6 +4672,76 @@ fn the_rings_statx_gives_the_zfs_flags() {
     });
 }
 
+/// The ring's statx says whether a file has a POSIX access ACL and a folder
+/// a default one, as the blocking call does, since `IORING_OP_STATX` ends in
+/// the same `vfs_getattr_nosec` (`statx_posix_acls` in fs/stat.c).
+///
+/// Runs in the tempdir, whose POSIX ACLs `TRUENAS_ROS_REQUIRE_POSIX_ACL`
+/// demands, and `TRUENAS_ROS_REQUIRE_STATX_POSIX_ACLS` turns a kernel that
+/// does not answer into a failure. Both are armed in the QEMU job.
+#[cfg(feature = "acl")]
+#[test]
+fn the_rings_statx_says_whether_a_file_has_a_posix_acl() {
+    use truenas_ros::sync_fs::acl::{
+        Acl, PosixAce, PosixAcl, PosixPerm, PosixTag, fsetacl,
+    };
+
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("plain"), b"").unwrap();
+        std::fs::write(dir.join("named"), b"").unwrap();
+        std::fs::create_dir(dir.join("both")).unwrap();
+        let aces = |default| {
+            [
+                (PosixTag::UserObj, -1),
+                (PosixTag::User, 4_200),
+                (PosixTag::GroupObj, -1),
+                (PosixTag::Mask, -1),
+                (PosixTag::Other, -1),
+            ]
+            .map(|(tag, id)| PosixAce {
+                tag,
+                perms: PosixPerm::READ,
+                id,
+                default,
+            })
+        };
+        let set = |name: &str, aces: Vec<PosixAce>| {
+            let f = std::fs::File::open(dir.join(name)).unwrap();
+            let acl = Acl::Posix(PosixAcl::from_aces(aces));
+            fsetacl(&f, Some(&acl))
+        };
+        let both = [aces(false), aces(true)].concat();
+        if let Err(e) =
+            set("named", aces(false).to_vec()).and_then(|()| set("both", both))
+        {
+            return xattr_probe::posix_acl_refusal_is_allowed(
+                "a POSIX ACL on the tempdir",
+                e,
+            );
+        }
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let acls = |name: &str| {
+            let flags = AtFlags::AT_SYMLINK_NOFOLLOW;
+            let st = h.statx(me, &anchor, leaf(name), flags, StatxMask::ACL);
+            let st = st.expect("statx");
+            (st.posix_access_acl(), st.posix_default_acl())
+        };
+        if acls("plain").0.is_none() {
+            assert!(
+                std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_POSIX_ACLS")
+                    .is_none(),
+                "TRUENAS_ROS_REQUIRE_STATX_POSIX_ACLS is set but the kernel \
+                 does not answer STATX_ACL through the ring at {}",
+                dir.display()
+            );
+            return;
+        }
+        assert_eq!(acls("plain"), (Some(false), Some(false)));
+        assert_eq!(acls("named"), (Some(true), Some(false)));
+        assert_eq!(acls("both"), (Some(true), Some(true)));
+    });
+}
+
 /// A file opened by handle outside the ring and wrapped answers the ring's
 /// statx with the object number and generation its handle carries, and a
 /// ring read gives back its bytes.

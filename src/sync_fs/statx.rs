@@ -48,6 +48,10 @@ tn_bitflags! {
         WRITE_ATOMIC = 0x0001_0000;
         /// Want/got the direct-I/O read alignment info.
         DIO_READ_ALIGN = 0x0002_0000;
+        /// Want/got whether the file has POSIX ACLs
+        /// ([`Statx::posix_access_acl`] and [`Statx::posix_default_acl`]).
+        /// TrueNAS kernels.
+        ACL = 0x0800_0000;
         /// Want/got the ZFS flags (`stx_zfsflags`, [`Statx::zfs_attrs`],
         /// [`Statx::nfs4_acl_is_trivial`] and [`Statx::nfs4_acl_flags`]).
         ZFSFLAGS = 0x1000_0000;
@@ -87,6 +91,12 @@ tn_bitflags! {
         /// The file system keeps NFSv4 ACLs. TrueNAS kernels, see
         /// [`Statx::acltype`].
         NFSV4ACL = 0x0200_0000_0000_0000;
+        /// The file has a POSIX access ACL. TrueNAS kernels, asked with
+        /// [`StatxMask::ACL`], see [`Statx::posix_access_acl`].
+        ACL_ACCESS = 0x0400_0000_0000_0000;
+        /// The directory has a POSIX default ACL. TrueNAS kernels, asked
+        /// with [`StatxMask::ACL`], see [`Statx::posix_default_acl`].
+        ACL_DEFAULT = 0x0800_0000_0000_0000;
     }
 }
 
@@ -261,6 +271,38 @@ impl Statx {
         } else {
             AclType::Off
         })
+    }
+
+    /// Whether the file has a POSIX access ACL, one that says more than the
+    /// mode, with no read of `system.posix_acl_access` once the inode holds
+    /// its ACLs.
+    ///
+    /// `None` unless [`StatxMask::ACL`] was requested and the kernel
+    /// answered it. The TrueNAS kernel answers from the ACLs the inode
+    /// caches, through `get_inode_acl` (`statx_posix_acls` in `fs/stat.c`),
+    /// on a file system that keeps POSIX ACLs, and leaves the bit out of
+    /// [`Statx::mask`] on any other, on an error, and on a file system that
+    /// reads its ACLs only through a dentry. A file system keeps no access
+    /// ACL the mode says all of (`posix_acl_update_mode` in
+    /// `fs/posix_acl.c`, `zpl_set_acl_impl` in
+    /// `module/os/linux/zfs/zpl_xattr.c`), so `Some(false)` means the mode
+    /// is all of the file's access control.
+    pub fn posix_access_acl(&self) -> Option<bool> {
+        self.posix_acl(StatxAttr::ACL_ACCESS)
+    }
+
+    /// Whether the directory has a POSIX default ACL, the one its new
+    /// children inherit, answered as for
+    /// [`posix_access_acl`](Self::posix_access_acl). Anything that is not a
+    /// directory keeps none, so it gives `Some(false)`.
+    pub fn posix_default_acl(&self) -> Option<bool> {
+        self.posix_acl(StatxAttr::ACL_DEFAULT)
+    }
+
+    fn posix_acl(&self, which: StatxAttr) -> Option<bool> {
+        self.mask()
+            .contains(StatxMask::ACL)
+            .then(|| self.attributes().contains(which))
     }
 
     /// The file mode (type + permission bits).
@@ -633,5 +675,36 @@ mod tests {
         assert_eq!(with(0x0200_0000_0000_0000, both), Some(AclType::Nfsv4));
         assert_eq!(with(0x0200_0000_0000_0000, 0x1000), None);
         assert_eq!(with(0, 0x0200_0000_0000_0000), None);
+    }
+
+    /// `include/uapi/linux/stat.h` of the kernel fork has STATX_ACL
+    /// 0x08000000, STATX_ATTR_ACL_ACCESS 0x0400000000000000 and
+    /// STATX_ATTR_ACL_DEFAULT 0x0800000000000000, written out by hand. The
+    /// two are read only where the result mask names STATX_ACL, and the
+    /// ACL type beside them says nothing of the file's own ACLs.
+    #[test]
+    fn the_posix_acls_are_read_against_the_result_mask() {
+        let acls = |mask: u32, attributes: u64| {
+            // SAFETY: `StatxRaw` is plain integers, for which all zero bits
+            // are a valid value.
+            let mut raw: StatxRaw = unsafe { std::mem::zeroed() };
+            raw.stx_mask = mask;
+            raw.stx_attributes = attributes;
+            let st = Statx::from_raw(raw);
+            (st.posix_access_acl(), st.posix_default_acl())
+        };
+        let asked = 0x0800_0000;
+        let access = 0x0400_0000_0000_0000;
+        let default = 0x0800_0000_0000_0000;
+        assert_eq!(acls(asked, 0), (Some(false), Some(false)));
+        assert_eq!(acls(asked, access), (Some(true), Some(false)));
+        assert_eq!(acls(asked, default), (Some(false), Some(true)));
+        let both = acls(asked | 0x7ff, access | default);
+        assert_eq!(both, (Some(true), Some(true)));
+        let types = 0x0100_0000_0000_0000 | 0x0200_0000_0000_0000;
+        assert_eq!(acls(asked, types), (Some(false), Some(false)));
+        // A kernel that did not answer leaves the bit out of the mask, and
+        // the attributes then mean nothing.
+        assert_eq!(acls(0x7ff, access | default), (None, None));
     }
 }
