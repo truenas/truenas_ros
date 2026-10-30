@@ -45,6 +45,7 @@ env:
   #   tempdir::                       - foreign fn `mkdtemp`, which is the
   #                                     crate's own `tempdir()` helper
   #   clone3::                        - foreign fn `sigaction`
+  #   fd::tests::                     - foreign fn `fork`
   #
   # **A skip is exactly as wide as its reason.** Two of these were not.
   #
@@ -102,6 +103,7 @@ env:
     --skip sync_fs::
     --skip tempdir::
     --skip clone3::
+    --skip fd::tests::
 
   # Exact, not a lower bound, on the loom lane's lesson: a libtest filter
   # that matches nothing exits 0, so a renamed module, a moved test or a
