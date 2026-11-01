@@ -32,10 +32,15 @@
 //! A listing a peer resumes, as NFS READDIR does from a cookie, is
 //! [`Listing`]. It reads one entry at a time with the cookie that goes on
 //! after it, and starts from any cookie an entry gave, on the same dup and
-//! under the same contract.
+//! under the same contract. It takes `getdents64` straight, into room its
+//! caller sizes, since a stream's buffer is lost at every seek.
 
 use std::ffi::CStr;
-use std::os::fd::{AsFd, IntoRawFd, OwnedFd};
+use std::fmt;
+use std::fs::File;
+use std::io::{Seek, SeekFrom};
+use std::mem::offset_of;
+use std::os::fd::{AsFd, AsRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::ptr::NonNull;
 
@@ -168,12 +173,81 @@ pub fn read_names(fd: impl AsFd) -> errno::Result<Vec<DirEntryName>> {
 /// while the folder changes, and the kernel gives the last entry the
 /// cursor's end. `.` and `..` are left out, as [`read_names`] leaves them
 /// out, and their cookies are never given.
-#[derive(Debug)]
+///
+/// It reads through `getdents64` and not glibc's `readdir`, whose buffer
+/// follows `st_blksize`, 128 KiB on a dataset's folder, and which a seek
+/// throws away. A caller that resumes for each request of a peer and
+/// wants a few hundred names would then read thousands each time and
+/// read the same ones again the next. So the caller says how much to
+/// read at a time, about what it means to take, as `room`.
 pub struct Listing {
-    dir: Dir,
-    /// The record `readdir` gave last, which the entry lends from, or null
-    /// before the first read and at the end.
-    last: *mut libc::dirent,
+    file: File,
+    /// Where `getdents64` writes, which is the room asked for.
+    buffer: Vec<u8>,
+    /// How much of `buffer` the last read filled.
+    filled: usize,
+    /// Where in `buffer` the next record starts.
+    at: usize,
+}
+
+impl fmt::Debug for Listing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Listing")
+            .field("file", &self.file)
+            .field("room", &self.buffer.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The least a [`Listing`] reads at a time. `getdents64` answers `EINVAL`
+/// when the next record does not fit, and a page holds the longest name
+/// any file system gives.
+const LEAST_ROOM: usize = 4096;
+
+/// The most a [`Listing`] reads at a time, where glibc stops too.
+const MOST_ROOM: usize = 1 << 20;
+
+/// Where the fields of a record of `getdents64` lie.
+const RECORD_INO: usize = offset_of!(libc::dirent64, d_ino);
+const RECORD_OFF: usize = offset_of!(libc::dirent64, d_off);
+const RECORD_LEN: usize = offset_of!(libc::dirent64, d_reclen);
+const RECORD_TYPE: usize = offset_of!(libc::dirent64, d_type);
+const RECORD_NAME: usize = offset_of!(libc::dirent64, d_name);
+
+/// One record of `getdents64`.
+struct Record<'a> {
+    /// How many bytes it takes, which is where the next starts.
+    len: usize,
+    ino: u64,
+    off: u64,
+    d_type: u8,
+    name: &'a [u8],
+}
+
+impl<'a> Record<'a> {
+    /// The record `bytes` begin with, or `None` for one that does not lie
+    /// within them with its name ended.
+    fn read(bytes: &'a [u8]) -> Option<Record<'a>> {
+        let word = |at: usize| -> Option<[u8; 8]> {
+            bytes.get(at..at + 8)?.try_into().ok()
+        };
+        let len = bytes.get(RECORD_LEN..RECORD_LEN + 2)?;
+        let len = u16::from_ne_bytes(len.try_into().ok()?) as usize;
+        let name = bytes.get(RECORD_NAME..len)?;
+        let end = name.iter().position(|&byte| byte == 0)?;
+        Some(Record {
+            len,
+            ino: u64::from_ne_bytes(word(RECORD_INO)?),
+            off: u64::from_ne_bytes(word(RECORD_OFF)?),
+            d_type: *bytes.get(RECORD_TYPE)?,
+            name: &name[..end],
+        })
+    }
+
+    /// Whether it is `.` or `..`, which a listing leaves out.
+    fn is_dot(&self) -> bool {
+        self.name == b"." || self.name == b".."
+    }
 }
 
 /// One entry of a [`Listing`], lent until the next is read.
@@ -181,9 +255,9 @@ pub struct Listing {
 pub struct Entry<'a> {
     /// The entry's name bytes, as the directory holds them.
     pub name: &'a [u8],
-    /// What `readdir` said it is.
+    /// What the directory said it is.
     pub kind: NameKind,
-    /// Its inode number, as `readdir` gives it.
+    /// Its inode number, as the directory gives it.
     pub ino: u64,
     /// The cookie of the position after it, which [`Listing::seek`] goes
     /// on from.
@@ -191,56 +265,101 @@ pub struct Entry<'a> {
 }
 
 impl Listing {
-    /// Open a listing over `fd`, from the beginning, on a dup of it.
+    /// Open a listing over `fd`, from the beginning, on a dup of it, that
+    /// reads about `room` bytes of records at a time. A record takes 19
+    /// bytes and its name and its NUL, rounded up to 8. It reads at least
+    /// a page and at most a MiB at a time, however little or much is asked.
     ///
     /// An `O_PATH` descriptor is refused with `EBADF`, as [`read_names`]
     /// says, and what is not a directory with `ENOTDIR`.
-    pub fn open(fd: impl AsFd) -> errno::Result<Listing> {
-        let dup = fd.as_fd().try_clone_to_owned().map_err(|e| {
-            Errno::from_raw(e.raw_os_error().unwrap_or(libc::EIO))
-        })?;
-        let mut dir = Dir::from_fd(dup)?;
-        dir.rewind();
-        Ok(Listing {
-            dir,
-            last: std::ptr::null_mut(),
-        })
+    pub fn open(fd: impl AsFd, room: usize) -> errno::Result<Listing> {
+        let file =
+            File::from(fd.as_fd().try_clone_to_owned().map_err(errno_of)?);
+        if !file.metadata().map_err(errno_of)?.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        let mut listing = Listing {
+            file,
+            buffer: vec![0; room.clamp(LEAST_ROOM, MOST_ROOM)],
+            filled: 0,
+            at: 0,
+        };
+        listing.seek(0)?;
+        Ok(listing)
     }
 
     /// Go on from `cookie`, which an entry gave, or from the beginning
-    /// for 0.
-    pub fn seek(&mut self, cookie: u64) {
-        self.last = std::ptr::null_mut();
-        // SAFETY: `self.dir.0` is a live DIR stream we own exclusively.
-        // The cookie goes through as the kernel gave it, which `seekdir`
-        // takes as `telldir`'s value.
-        unsafe { libc::seekdir(self.dir.0.as_ptr(), cookie as libc::c_long) };
+    /// for 0. A cookie the file system takes for no position is an error
+    /// here, where `seekdir` could not say so and would have gone on from
+    /// wherever the stream stood.
+    pub fn seek(&mut self, cookie: u64) -> errno::Result<()> {
+        self.filled = 0;
+        self.at = 0;
+        // The cookie goes through as the kernel gave it.
+        self.file
+            .seek(SeekFrom::Start(cookie))
+            .map_err(errno_of)
+            .map(|_| ())
     }
 
     /// The next entry, or `None` at the end.
     pub fn read(&mut self) -> errno::Result<Option<Entry<'_>>> {
-        loop {
-            self.last = self.dir.read_record()?;
-            if self.last.is_null() {
+        let at = loop {
+            if self.at >= self.filled && !self.fill()? {
                 return Ok(None);
             }
-            // SAFETY: `last` is the record `readdir` just gave, valid until
-            // the next read, and the name is looked at and let go here.
-            let name = unsafe { fields_of(self.last).3 };
-            if name != b"." && name != b".." {
-                break;
+            let at = self.at;
+            let record = self.record(at)?;
+            let (len, dot) = (record.len, record.is_dot());
+            self.at = at + len;
+            if !dot {
+                break at;
             }
-        }
-        // SAFETY: as above, and the entry lends the name for as long as
-        // the listing is borrowed, which ends before the next read.
-        let (d_type, d_ino, d_off, name) = unsafe { fields_of(self.last) };
+        };
+        let record = self.record(at)?;
         Ok(Some(Entry {
-            name,
-            kind: NameKind::from_d_type(d_type),
-            ino: d_ino,
-            cookie: d_off,
+            name: record.name,
+            kind: NameKind::from_d_type(record.d_type),
+            ino: record.ino,
+            cookie: record.off,
         }))
     }
+
+    /// The record at `at`. The kernel lays them out, so `EIO` is for one
+    /// that lies outside what it filled.
+    fn record(&self, at: usize) -> errno::Result<Record<'_>> {
+        Record::read(&self.buffer[at..self.filled]).ok_or(Errno::EIO)
+    }
+
+    /// Read the next records, and say whether there were any. A directory
+    /// removed since it opened answers `ENOENT` (`iterate_dir`), which is
+    /// the end, as glibc takes it and POSIX has it.
+    fn fill(&mut self) -> errno::Result<bool> {
+        // SAFETY: a live descriptor, and a buffer of the length given,
+        // which the kernel writes no more than.
+        let got = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                self.file.as_raw_fd(),
+                self.buffer.as_mut_ptr(),
+                self.buffer.len(),
+            )
+        };
+        if got < 0 {
+            return match Errno::last() {
+                Errno::ENOENT => Ok(false),
+                error => Err(error),
+            };
+        }
+        self.at = 0;
+        self.filled = got as usize;
+        Ok(got > 0)
+    }
+}
+
+/// The errno of `error`, which comes from a system call.
+fn errno_of(error: std::io::Error) -> Errno {
+    Errno::from_raw(error.raw_os_error().unwrap_or(libc::EIO))
 }
 
 /// The type, the inode, the offset after and the name of the record `ent`.
@@ -421,7 +540,7 @@ mod tests {
 
         // Every entry once, with its inode and its kind, and the cookie of
         // each is neither 0 nor 1 nor 2, which NFS reserves.
-        let mut listing = Listing::open(dirf.as_fd()).expect("listing");
+        let mut listing = Listing::open(dirf.as_fd(), 0).expect("listing");
         let mut seen = Vec::new();
         while let Some(entry) = listing.read().expect("read") {
             let path = tmp.path().join(std::ffi::OsStr::from_bytes(entry.name));
@@ -446,8 +565,8 @@ mod tests {
         // From the cookie of the second entry, a fresh listing gives what
         // came after it, and from the cookie of the last, nothing.
         let after_second = seen[1].1;
-        let mut rest = Listing::open(dirf.as_fd()).expect("listing");
-        rest.seek(after_second);
+        let mut rest = Listing::open(dirf.as_fd(), 0).expect("listing");
+        rest.seek(after_second).expect("seek");
         let mut names = Vec::new();
         while let Some(entry) = rest.read().expect("read") {
             names.push(entry.name.to_vec());
@@ -456,13 +575,165 @@ mod tests {
             seen[2..].iter().map(|(n, _)| n.clone()).collect();
         assert_eq!(names, want);
         let after_last = seen[5].1;
-        rest.seek(after_last);
+        rest.seek(after_last).expect("seek");
         assert!(rest.read().expect("read").is_none());
 
         // The cookie 0 is the beginning again.
-        rest.seek(0);
+        rest.seek(0).expect("seek");
         let first = rest.read().expect("read").expect("an entry");
         assert_eq!(first.name, seen[0].0);
+    }
+
+    /// A folder of a thousand names, each 40 bytes long.
+    fn names_in(path: &std::path::Path) {
+        for n in 0..1000 {
+            let name = format!("{n:040}");
+            std::fs::write(path.join(name), b"").expect("file");
+        }
+    }
+
+    /// A listing takes no more than its room from the kernel at a time, so
+    /// a caller that wants a window of names does not read past it.
+    #[test]
+    fn a_listing_reads_no_more_than_its_room() {
+        let tmp = crate::tempdir().expect("tempdir");
+        names_in(tmp.path());
+        let dirf = std::fs::File::open(tmp.path()).expect("open dir");
+        let mut listing = Listing::open(dirf.as_fd(), 8192).expect("listing");
+        assert!(listing.read().expect("read").is_some());
+        assert!(listing.filled > 0, "it read something");
+        assert!(listing.filled <= 8192, "it read {}", listing.filled);
+    }
+
+    /// A seek drops what the last read left unread, so what comes next is
+    /// what the cookie names and not the next record in the buffer.
+    #[test]
+    fn a_seek_among_what_was_read_goes_where_it_says() {
+        let tmp = crate::tempdir().expect("tempdir");
+        names_in(tmp.path());
+        let dirf = std::fs::File::open(tmp.path()).expect("open dir");
+        let mut listing = Listing::open(dirf.as_fd(), 0).expect("listing");
+        let first = listing.read().expect("read").expect("an entry").cookie;
+        let second = listing.read().expect("read").expect("an entry");
+        let second = second.name.to_vec();
+        listing.seek(first).expect("seek");
+        let again = listing.read().expect("read").expect("an entry");
+        assert_eq!(again.name, second);
+    }
+
+    /// However little room is asked for, the longest name a file system
+    /// here gives fits, where `getdents64` would answer `EINVAL`.
+    #[test]
+    fn a_room_too_small_for_a_name_still_reads_it() {
+        let tmp = crate::tempdir().expect("tempdir");
+        let name = "n".repeat(255);
+        std::fs::write(tmp.path().join(&name), b"").expect("file");
+        let dirf = std::fs::File::open(tmp.path()).expect("open dir");
+        let mut listing = Listing::open(dirf.as_fd(), 1).expect("listing");
+        let entry = listing.read().expect("read").expect("an entry");
+        assert_eq!(entry.name, name.as_bytes());
+    }
+
+    /// A listing read a window at a time, each from a fresh listing and the
+    /// cookie before it, gives every name once, across the reads of its
+    /// room, on a dataset when the gate names one, whose cookies are
+    /// serialized ZAP cursors (`zfs_readdir`), and on the temporary folder.
+    #[test]
+    fn windows_from_cookies_give_every_name_once() {
+        let tmp = crate::tempdir().expect("tempdir");
+        let dataset = std::env::var_os("TRUENAS_ROS_POSIX_DATASET");
+        let dataset = dataset.map(std::path::PathBuf::from);
+        let inside = dataset
+            .map(|base| base.join(format!("listing-{}", std::process::id())));
+        for path in [Some(tmp.path().join("many")), inside].iter().flatten() {
+            std::fs::create_dir(path).expect("folder");
+            names_in(path);
+            let dirf = std::fs::File::open(path).expect("open dir");
+            let (mut names, mut cookie) = (Vec::new(), 0);
+            'windows: loop {
+                let mut window =
+                    Listing::open(dirf.as_fd(), 4096).expect("listing");
+                window.seek(cookie).expect("seek");
+                for _ in 0..70 {
+                    let Some(entry) = window.read().expect("read") else {
+                        break 'windows;
+                    };
+                    names.push(entry.name.to_vec());
+                    cookie = entry.cookie;
+                }
+            }
+            std::fs::remove_dir_all(path).expect("clean up");
+            assert_eq!(names.len(), 1000, "{path:?}");
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(names.len(), 1000, "a name came twice in {path:?}");
+        }
+    }
+
+    /// A folder removed while a listing is open reads as ended, as it does
+    /// through `readdir`, and not as a failure of the caller's.
+    #[test]
+    fn a_listing_of_a_folder_removed_ends() {
+        let tmp = crate::tempdir().expect("tempdir");
+        let path = tmp.path().join("gone");
+        std::fs::create_dir(&path).expect("folder");
+        let dirf = std::fs::File::open(&path).expect("open dir");
+        let mut listing = Listing::open(dirf.as_fd(), 0).expect("listing");
+        std::fs::remove_dir(&path).expect("remove");
+        assert!(listing.read().expect("read").is_none());
+    }
+
+    /// A cookie that is no position is said to be one, where `seekdir`
+    /// would have gone on from wherever the stream stood.
+    #[test]
+    fn a_cookie_that_is_no_position_is_refused() {
+        let tmp = crate::tempdir().expect("tempdir");
+        let dirf = std::fs::File::open(tmp.path()).expect("open dir");
+        let mut listing = Listing::open(dirf.as_fd(), 0).expect("listing");
+        assert_eq!(listing.seek(u64::MAX), Err(Errno::EINVAL));
+    }
+
+    /// What [`read_names`] refuses at once, a listing refuses at once.
+    #[test]
+    fn a_listing_of_what_is_no_folder_is_refused() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = crate::tempdir().expect("tempdir");
+        let path = tmp.path().join("plain");
+        std::fs::write(&path, b"x").expect("file");
+        let plain = std::fs::File::open(&path).expect("open file");
+        let refused = Listing::open(plain.as_fd(), 0).expect_err("a file");
+        assert_eq!(refused, Errno::ENOTDIR);
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(tmp.path())
+            .expect("open O_PATH");
+        let refused = Listing::open(held.as_fd(), 0).expect_err("O_PATH");
+        assert_eq!(refused, Errno::EBADF);
+    }
+
+    /// A record that does not lie within what the kernel filled, or whose
+    /// name does not end, is refused rather than read past.
+    #[test]
+    fn a_record_that_does_not_fit_is_refused() {
+        let mut bytes = vec![0u8; RECORD_NAME + 8];
+        let set_len = |bytes: &mut Vec<u8>, len: u16| {
+            bytes[RECORD_LEN..RECORD_LEN + 2]
+                .copy_from_slice(&len.to_ne_bytes());
+        };
+        bytes[RECORD_NAME] = b'a';
+        set_len(&mut bytes, (RECORD_NAME + 8) as u16);
+        let record = Record::read(&bytes).expect("a record");
+        assert_eq!(record.name, b"a");
+        assert!(!record.is_dot());
+        set_len(&mut bytes, 0);
+        assert!(Record::read(&bytes).is_none(), "shorter than its head");
+        set_len(&mut bytes, (RECORD_NAME + 9) as u16);
+        assert!(Record::read(&bytes).is_none(), "past the end");
+        set_len(&mut bytes, (RECORD_NAME + 8) as u16);
+        bytes[RECORD_NAME..].fill(b'a');
+        assert!(Record::read(&bytes).is_none(), "a name with no end");
+        assert!(Record::read(&[0; 4]).is_none(), "shorter than a head");
     }
 
     #[test]
