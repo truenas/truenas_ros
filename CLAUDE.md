@@ -299,6 +299,18 @@ Do not reopen these without a reason that is new.
   op still in flight names a registered buffer by index, so freeing it
   hands the kernel freed pages. `drain_or_leak` forgets the `BufPool`.
 
+### The body pool
+
+- **Only storage a consumer marks goes home once sent, never every owned
+  reply.** A reply given inline is marked with `SendBuf::recycled`, and a
+  deferred one is sent with `Deferred::reply_recycled`. The pool keeps a
+  give that fits under its target, and the target covers the room bodies
+  claimed out of it leave behind. Replies no one claimed would fill that
+  room, and a body coming home would be freed in their place
+  (`Seg::Recycled`). Pinned by
+  `a_reply_claimed_from_the_pool_does_not_allocate_per_reply` and
+  `a_recycled_segment_gives_its_storage_back_once_sent`.
+
 ### Leased writes
 
 A streamed window is written to a file straight out of its recv buffer.

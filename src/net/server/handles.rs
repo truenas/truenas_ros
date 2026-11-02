@@ -269,12 +269,28 @@ pub struct Deferred {
 impl Deferred {
     /// Deliver the reply for this request. An empty reply completes the request
     /// without sending anything (one-way message). Consumes the handle.
-    pub fn reply(mut self, bytes: Vec<u8>) {
+    pub fn reply(self, bytes: Vec<u8>) {
+        self.deliver(bytes, Injected::Reply);
+    }
+
+    /// As [`reply`](Self::reply), for bytes in storage claimed from the
+    /// ring's body pool. Once sent, the storage goes back to the pool, as a
+    /// [`SendBuf::recycled`](crate::net::server::SendBuf::recycled)
+    /// segment's does in a reply given inline. Consumes the handle.
+    pub fn reply_recycled(self, bytes: Vec<u8>) {
+        self.deliver(bytes, Injected::ReplyRecycled);
+    }
+
+    fn deliver(
+        mut self,
+        bytes: Vec<u8>,
+        reply: fn(Token, Vec<u8>) -> Injected,
+    ) {
         self.done = true;
         let msg = if bytes.is_empty() {
             Injected::Done(self.token)
         } else {
-            Injected::Reply(self.token, bytes)
+            reply(self.token, bytes)
         };
         // The server owns the receiver for its whole life; a send error just
         // means it has already shut down, in which case the reply is moot.
@@ -686,6 +702,9 @@ impl StatsHandle {
 pub(super) enum Injected {
     /// Send these bytes as the request's reply.
     Reply(Token, Vec<u8>),
+    /// As `Reply`, with storage that goes back to the ring's body pool once
+    /// sent ([`Deferred::reply_recycled`]).
+    ReplyRecycled(Token, Vec<u8>),
     /// Send these bytes as the request's **final** reply, then close once the
     /// connection's send queue drains ([`Deferred::reply_close`]). Empty
     /// bytes queue no PDU: flush what is queued and close.

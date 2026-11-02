@@ -10,7 +10,7 @@ use super::io::Delivery;
 use crate::errno;
 use crate::net::core::conn::{Op, pack};
 use crate::net::core::handles::stat;
-use crate::net::core::protocol::{CloseReason, Framing};
+use crate::net::core::protocol::{CloseReason, Framing, SendBuf};
 use crate::net::core::table::SlotState;
 use crate::net::server::protocol::{Incoming, Request, Response};
 use crate::uring::sys::*;
@@ -418,6 +418,7 @@ where
             }
             let token = match &msg {
                 Injected::Reply(t, _)
+                | Injected::ReplyRecycled(t, _)
                 | Injected::ReplyClose(t, _)
                 | Injected::Done(t)
                 | Injected::Close(t)
@@ -461,6 +462,14 @@ where
                     // and start sending if the send side is idle. `on_send`
                     // drops the request's `outstanding` count once flushed.
                     self.core.table.conn_mut(token.slot).enqueue_reply(bytes);
+                    self.core.kick_send(token.slot, token.generation as u32)?;
+                }
+                Injected::ReplyRecycled(_, bytes) => {
+                    // As `Reply`, marked so its storage goes home once sent.
+                    self.core
+                        .table
+                        .conn_mut(token.slot)
+                        .enqueue_reply(SendBuf::recycled(bytes));
                     self.core.kick_send(token.slot, token.generation as u32)?;
                 }
                 Injected::ReplyClose(_, bytes) => {
