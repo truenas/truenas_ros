@@ -155,9 +155,11 @@ pub const MAX_GROUPS: usize = 4096;
 /// It has to clear a reactor per server thread **plus** any ring that
 /// serves no listener: a sidecar that dials another daemon under a
 /// personality needs one of its own, because a personality id is valid
-/// only on the ring it was minted against. Sized so a deployment need
-/// not trade one against the other.
-pub const MAX_RINGS: usize = 16;
+/// only on the ring it was minted against. Sized for a ring on every core
+/// of a 128-core machine, so a deployment need not trade one against the
+/// other. Each ring costs the child one descriptor and the renumbering one
+/// more (`child_fd_high_water`).
+pub const MAX_RINGS: usize = 128;
 
 /// The child's IPC socket, after `tidy_child_fds` normalizes descriptors.
 const SOCK_FD: RawFd = 3;
@@ -2139,7 +2141,7 @@ mod tests {
         let top = child_fd_high_water(60, MAX_RINGS);
         assert!(
             u64::from(top.unsigned_abs()) >= soft,
-            "16 rings over fd 60 must not fit under a soft limit of {soft}"
+            "{MAX_RINGS} rings over fd 60 must not fit under a soft limit of {soft}"
         );
         // The same daemon with one ring does fit, so the refusal is about
         // the slice and a caller can retry.

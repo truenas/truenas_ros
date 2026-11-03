@@ -311,6 +311,26 @@ Do not reopen these without a reason that is new.
   `a_reply_claimed_from_the_pool_does_not_allocate_per_reply` and
   `a_recycled_segment_gives_its_storage_back_once_sent`.
 
+### Spreading connections across rings
+
+- **A completion another ring posts is never counted in flight.** A
+  hand-off arrives as a CQE this ring never staged, tagged `TAG_POSTED`.
+  Counted, it would end the teardown drain while an op this ring did stage
+  still names its buffers, so `Engine::retire` and the drain both ask
+  `counted` (`a_completion_another_ring_posts_is_not_counted_in_flight`).
+- **A connection moves before its peer fetch and accept handler**, so its
+  state, its fs ops and its replies live on the ring that serves it, and
+  one handed in never moves again.
+- **Only a send that worked closes the sender's slot.** The close is
+  staged from the hand-off's completion, never linked behind it: a linked
+  close's `-ECANCELED` can reap after the sender kept the connection, and
+  `on_closed` would free the slot under it
+  (`a_refused_hand_off_is_served_where_it_was_accepted`).
+- **The count is slots, from a kept accept to the slot's release**,
+  published by its ring alone with no ordering. A stale read places one
+  connection a step above the fewest and never loses it. A drain and a
+  drop publish `CLOSED` first (`a_ring_that_drained_is_sent_nothing`).
+
 ### Leased writes
 
 A streamed window is written to a file straight out of its recv buffer.

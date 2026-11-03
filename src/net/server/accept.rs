@@ -32,7 +32,7 @@ where
         cqe: &IoUringCqe,
     ) -> errno::Result<()> {
         if cqe.res >= 0 {
-            self.accept_connection(cqe.res as u32, lidx)?;
+            self.accept_connection(cqe.res as u32, lidx, true)?;
         }
         // Any error CQE clears F_MORE, terminating this listener's multishot
         // accept (verified in the kernel); a successful accept keeps F_MORE.
@@ -78,14 +78,69 @@ where
         Ok(())
     }
 
-    fn accept_connection(&mut self, slot: u32, lidx: u32) -> errno::Result<()> {
-        if slot as usize >= self.core.table.len() {
+    /// A hand-off completed. Sent, the other ring holds the file and this
+    /// slot's copy closes. Refused (that ring's table full, the ring gone),
+    /// this ring keeps the connection and serves it. A send whose file
+    /// arrived but whose completion could not be posted answers
+    /// `-EOVERFLOW` (`io_msg_install_complete`), and keeping it here is still
+    /// right: that ring never learns of its copy, which holds the socket
+    /// open until that ring's table is freed.
+    pub(super) fn on_handoff(
+        &mut self,
+        slot: u32,
+        lidx: u32,
+        res: i32,
+    ) -> errno::Result<()> {
+        if res >= 0 {
+            stat!(self.core, handed_off);
+            return self.core.submit_teardown(slot, 0, false);
+        }
+        self.accept_connection(slot, lidx, false)
+    }
+
+    /// Another ring of the spread sent a connection, now in `res`'s slot of
+    /// this ring's table. It is taken as an accept that stays.
+    pub(super) fn on_handed(
+        &mut self,
+        lidx: u32,
+        res: i32,
+    ) -> errno::Result<()> {
+        match u32::try_from(res) {
+            Ok(slot) => self.accept_connection(slot, lidx, false),
+            Err(_) => Ok(()),
+        }
+    }
+
+    fn accept_connection(
+        &mut self,
+        slot: u32,
+        lidx: u32,
+        may_move: bool,
+    ) -> errno::Result<()> {
+        if slot as usize >= self.core.table.len()
+            || lidx as usize >= self.listeners.len()
+        {
             stat!(self.core, shed);
             return self.core.submit_teardown(slot, 0, true); // out of range
         }
         if self.core.draining {
             stat!(self.core, shed);
             return self.core.submit_teardown(slot, 0, true); // shed on drain
+        }
+        // A unix listener's path is this server's alone, so only a TCP
+        // connection may go to another ring of a spread.
+        if may_move
+            && matches!(
+                self.listeners[lidx as usize].addr,
+                ServerAddr::Tcp(_) | ServerAddr::Tcp6(_)
+            )
+            && let Some(ring) =
+                self.core.spread.as_ref().and_then(|j| j.target())
+        {
+            return self.submit_handoff(slot, lidx, ring);
+        }
+        if let Some(joined) = self.core.spread.as_mut() {
+            joined.took();
         }
         // A kTLS listener furnishes a real fd for the consumer's handshake
         // (the peer address is derived from that fd, so no peername fetch).
@@ -555,6 +610,25 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             sqe.opcode = IORING_OP_TIMEOUT;
             sqe.addr = ts;
             sqe.len = 1; // exactly one timespec, per the kernel
+        })
+    }
+
+    /// Send the connection in `slot` to the ring of the spread whose
+    /// descriptor is `ring`. The kernel installs it in a free slot there
+    /// and posts that ring an [`Op::Handed`] naming the slot.
+    fn submit_handoff(
+        &mut self,
+        slot: u32,
+        lidx: u32,
+        ring: std::os::fd::RawFd,
+    ) -> errno::Result<()> {
+        self.core.stage(pack(Op::Handoff, slot, lidx), move |sqe| {
+            sqe.opcode = IORING_OP_MSG_RING;
+            sqe.fd = ring;
+            sqe.addr = IORING_MSG_SEND_FD;
+            sqe.addr3 = u64::from(slot);
+            sqe.file_index = IORING_FILE_INDEX_ALLOC;
+            sqe.off_addr2 = pack(Op::Handed, lidx, 0);
         })
     }
 

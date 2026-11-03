@@ -27,7 +27,8 @@ use truenas_ros::net::server::{
     Body, ClientAddr, CloseReason, ControlHandle, DeferPermit, Deferred,
     Endian, Framing, Incoming, PeerCred, PrefixWidth, Protocol, PushHandle,
     Request, Responder, Response, Server, ServerAddr, ServerConfig,
-    ShutdownHandle, length_prefix_header, length_prefixed, setup_ring,
+    ShutdownHandle, Spread, StatsHandle, length_prefix_header, length_prefixed,
+    setup_ring,
 };
 use truenas_ros::{Errno, Error};
 
@@ -5823,6 +5824,172 @@ fn tcp_multicore_two_rings() {
     stop1.shutdown_graceful(Duration::from_secs(5));
     w0.join().expect("worker 0 join");
     w1.join().expect("worker 1 join");
+}
+
+/// Two servers on one port in one [`Spread`], the first on a port of its
+/// own and the second on that one. Each answers every request with its own
+/// index, so a client learns which ring serves it.
+struct SpreadPair {
+    addr: SocketAddrV4,
+    stops: Vec<ShutdownHandle>,
+    stats: Vec<StatsHandle>,
+    joins: Vec<thread::JoinHandle<()>>,
+}
+
+type SpreadReady = Result<(SocketAddrV4, ShutdownHandle, StatsHandle), Error>;
+
+impl SpreadPair {
+    fn start() -> Option<SpreadPair> {
+        fn worker(
+            index: u8,
+            addr: SocketAddrV4,
+            spread: Spread,
+            ready: std::sync::mpsc::Sender<SpreadReady>,
+        ) {
+            let cfg = ServerConfig {
+                reuse_port: true,
+                ..ServerConfig::default()
+            };
+            let which = move |_h: &[u8], _b: &[u8], _p: &ClientAddr| {
+                Some(echo_frame(&[index]))
+            };
+            let proto =
+                length_prefixed(PrefixWidth::U32, Endian::Big, false, which);
+            let mut server = match Server::with_config(
+                [ServerAddr::Tcp(addr)],
+                cfg,
+                proto,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = ready.send(Err(e));
+                    return;
+                }
+            };
+            server
+                .join_spread(&spread, usize::from(index))
+                .expect("join_spread");
+            let ServerAddr::Tcp(bound) = server.local_addrs().remove(0) else {
+                panic!("expected Tcp");
+            };
+            let _ = ready.send(Ok((
+                bound,
+                server.shutdown_handle(),
+                server.stats_handle(),
+            )));
+            server.serve_forever().expect("serve_forever");
+        }
+
+        let spread = Spread::new(2);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (first, tx0) = (spread.clone(), tx.clone());
+        let w0 = thread::spawn(move || {
+            worker(0, "127.0.0.1:0".parse().unwrap(), first, tx0);
+        });
+        let (addr, stop0, stats0) = match rx.recv().expect("worker 0") {
+            Ok(v) => v,
+            Err(e) if should_skip(&e) => {
+                w0.join().unwrap();
+                return None;
+            }
+            Err(e) => panic!("bind: {e}"),
+        };
+        let w1 = thread::spawn(move || worker(1, addr, spread, tx));
+        // A second ring can be refused `ENOMEM` on a fragmented box, as
+        // `tcp_multicore_two_rings` says.
+        let (_, stop1, stats1) = match rx.recv().expect("worker 1") {
+            Ok(v) => v,
+            Err(e) if should_skip(&e) => {
+                stop0.shutdown();
+                w0.join().unwrap();
+                w1.join().unwrap();
+                return None;
+            }
+            Err(e) => panic!("second Server::with_config: {e}"),
+        };
+        Some(SpreadPair {
+            addr,
+            stops: vec![stop0, stop1],
+            stats: vec![stats0, stats1],
+            joins: vec![w0, w1],
+        })
+    }
+
+    /// Open a connection and learn which ring serves it. The reply comes
+    /// after that ring has counted it, so the next connection sees the
+    /// count.
+    fn connect(&self) -> (TcpStream, u8) {
+        let mut s = connect_tcp(self.addr).expect("connect");
+        send_framed(&mut s, b"which").expect("send");
+        let ring = recv_framed(&mut s).expect("served")[0];
+        (s, ring)
+    }
+
+    fn settle(&self, ring: usize, active: u32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let st = self.stats[ring].snapshot();
+            if st.active == active {
+                return;
+            }
+            assert!(Instant::now() < deadline, "never settled: {st:?}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn stop(self) {
+        for stop in &self.stops {
+            stop.shutdown_graceful(Duration::from_secs(5));
+        }
+        for join in self.joins {
+            join.join().expect("worker join");
+        }
+    }
+}
+
+fn on(held: &[(TcpStream, u8)], ring: u8) -> usize {
+    held.iter().filter(|(_, r)| *r == ring).count()
+}
+
+/// A connection goes to the ring of the spread with the fewest, wherever the
+/// kernel's hash put it, and a closed one comes off its ring's count.
+/// Connections arrive one at a time, so each is counted before the next. The
+/// hash alone ends 64 even about one time in ten, and never with nothing
+/// handed off.
+#[test]
+fn a_spread_evens_connections_across_its_rings() {
+    let Some(pair) = SpreadPair::start() else {
+        return;
+    };
+    let mut held: Vec<(TcpStream, u8)> =
+        (0..64).map(|_| pair.connect()).collect();
+    assert_eq!((on(&held, 0), on(&held, 1)), (32, 32));
+    let handed: u64 = pair.stats.iter().map(|s| s.snapshot().handed_off).sum();
+    assert!(handed > 0, "the hash alone placed every connection");
+
+    // With ring 0 emptied, the next 32 all go there.
+    held.retain(|(_, ring)| *ring == 1);
+    pair.settle(0, 0);
+    let fresh: Vec<(TcpStream, u8)> = (0..32).map(|_| pair.connect()).collect();
+    assert_eq!(on(&fresh, 0), 32, "closed connections still counted");
+    drop((held, fresh));
+    pair.stop();
+}
+
+/// A ring that drained takes no more: every connection stays on the ring
+/// that is left, and none is sent to the one that is gone.
+#[test]
+fn a_ring_that_drained_is_sent_nothing() {
+    let Some(mut pair) = SpreadPair::start() else {
+        return;
+    };
+    pair.stops[1].shutdown_graceful(Duration::from_secs(5));
+    pair.joins.remove(1).join().expect("worker 1 join");
+    let held: Vec<(TcpStream, u8)> = (0..8).map(|_| pair.connect()).collect();
+    assert_eq!(on(&held, 0), 8);
+    assert_eq!(pair.stats[0].snapshot().handed_off, 0);
+    drop(held);
+    pair.stop();
 }
 
 /// A drain refuses new connections instead of quietly accepting them into a

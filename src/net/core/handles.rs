@@ -111,6 +111,9 @@ pub(crate) struct StatsInner {
     pub(crate) rejected: AtomicU64,
     pub(crate) shed: AtomicU64,
     pub(crate) accept_retries: AtomicU64,
+    /// Connections sent to another ring of a spread.
+    #[cfg(feature = "net-server")]
+    pub(crate) handed_off: AtomicU64,
     pub(crate) drain_listener_shutdown_failed: AtomicU64,
     pub(crate) closed: AtomicU64,
     pub(crate) active: AtomicU64,

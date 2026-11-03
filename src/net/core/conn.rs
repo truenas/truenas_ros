@@ -102,6 +102,17 @@ pub(crate) enum Op {
     /// rings get, since pressure rides completions and silence has none --
     /// and re-arms itself.
     Maintain = 23,
+    /// An `IORING_OP_MSG_RING` sending an accepted connection's descriptor
+    /// to the ring of a spread with the fewest connections (server-only).
+    /// The slot field is this ring's slot and the generation field the
+    /// listener index.
+    Handoff = 24,
+    /// The completion another ring's `Handoff` posts here: `res` is the
+    /// slot the kernel installed the connection in, and the slot field is
+    /// the listener index (server-only). Its tag is
+    /// [`TAG_POSTED`](crate::uring::user_data::TAG_POSTED), since nothing
+    /// on this ring staged it.
+    Handed = crate::uring::user_data::TAG_POSTED,
 }
 
 impl Op {
@@ -131,6 +142,8 @@ impl Op {
             21 => Op::RecvRetry,
             22 => Op::ReceiptDeadline,
             23 => Op::Maintain,
+            24 => Op::Handoff,
+            crate::uring::user_data::TAG_POSTED => Op::Handed,
             _ => return None,
         })
     }
@@ -2708,17 +2721,23 @@ mod tests {
                 | Op::Connect
                 | Op::RecvRetry
                 | Op::ReceiptDeadline
-                | Op::Maintain => {}
+                | Op::Maintain
+                | Op::Handoff
+                | Op::Handed => {}
             }
-            24
+            26
         };
         // Every decodable op value: `from_u8` must invert the discriminant
         // (a renumbered enum with a stale table shows up here), and the
         // decoded set must cover every variant.
         let ops: Vec<Op> = (0..=u8::MAX).filter_map(Op::from_u8).collect();
         assert_eq!(ops.len(), OP_COUNT, "Op::from_u8 table out of sync");
-        for (v, op) in ops.iter().enumerate() {
-            assert_eq!(*op as u8, v as u8, "discriminant vs from_u8 drift");
+        for op in &ops {
+            assert_eq!(
+                Op::from_u8(*op as u8),
+                Some(*op),
+                "discriminant vs from_u8 drift"
+            );
         }
         for op in ops {
             for &(slot, generation) in

@@ -162,6 +162,14 @@ impl<U> ConnTable<U> {
             .any(|e| matches!(e.state, SlotState::Empty))
     }
 
+    /// Whether `slot` holds nothing: free, or freed and awaiting reuse.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn is_empty(&self, slot: u32) -> bool {
+        self.slots
+            .get(slot as usize)
+            .is_none_or(|e| matches!(e.state, SlotState::Empty))
+    }
+
     /// The slot's current generation (valid in every state, including
     /// `Empty` - it guards reuse).
     pub(crate) fn generation(&self, slot: u32) -> u64 {

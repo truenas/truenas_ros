@@ -486,6 +486,7 @@ mod handles;
 mod io;
 mod listen;
 mod protocol;
+pub(crate) mod spread;
 mod wake;
 
 pub use crate::net::core::bodypool::BodyRecycler;
@@ -504,6 +505,7 @@ pub use handles::{
 pub use protocol::{
     DetachContext, Incoming, Protocol, Request, Response, length_prefixed,
 };
+pub use spread::{Spread, physical_cores};
 
 /// Adopt a registered buffer ring, counting the one refusal an operator can
 /// act on.
@@ -1202,10 +1204,7 @@ where
         // would then wait forever for a completion that will never come
         // (turning a fatal-error return into a hang in `serve_forever` and
         // `Drop`).
-        if cqe.flags & IORING_CQE_F_MORE == 0 {
-            self.core.engine.inflight =
-                self.core.engine.inflight.saturating_sub(1);
-        }
+        self.core.engine.retire(&cqe);
         // fs-domain completions (tag bit 0x80) belong to the embedded fs
         // reactor, not the stream `Op` vocabulary - route them before the
         // stream `match`, whose unknown-tag arm would silently swallow them.
@@ -1386,6 +1385,12 @@ where
             Some(Op::ReceiptDeadline) => {
                 self.core.on_receipt_deadline(slot, generation, cqe.res)?
             }
+            // Our hand-off to another ring of the spread completed. The
+            // generation field carries the listener index.
+            Some(Op::Handoff) => self.on_handoff(slot, generation, cqe.res)?,
+            // Another ring of the spread sent a connection; the slot field
+            // carries the listener index and `res` the slot it arrived in.
+            Some(Op::Handed) => self.on_handed(slot, cqe.res)?,
             Some(Op::Connect) => unreachable!("server never connects"),
             Some(Op::Cancel) | None => {}
         }
@@ -1411,6 +1416,41 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             .body_pool
             .as_ref()
             .map(|p| crate::net::core::bodypool::BodyRecycler::new(p.clone()))
+    }
+
+    /// Take `place` in `spread`, the set of servers on this port, one per
+    /// ring. From then on a TCP connection this server accepts while another
+    /// ring of the spread holds fewer goes to that ring, and this ring serves
+    /// the ones sent to it. Connections are counted from their accept to
+    /// their slot's release, ties stay where they were accepted, and a ring
+    /// that drains or drops takes no more.
+    ///
+    /// Every server of a spread binds the same addresses in the same order,
+    /// with [`reuse_port`](ServerConfig::reuse_port), since a connection keeps
+    /// its listener's index when it moves. A server on other addresses, a
+    /// place out of range or one already taken is refused with
+    /// [`Error::Validation`]. Join before [`Server::serve_forever`], so the
+    /// first connections are counted too.
+    pub fn join_spread(
+        &mut self,
+        spread: &Spread,
+        place: usize,
+    ) -> crate::Result<()> {
+        if self.core.spread.is_some() {
+            return Err(Error::Validation(
+                "this server is in a spread already".into(),
+            ));
+        }
+        let taken = self.core.table.active();
+        spread.join(
+            place,
+            self.core.engine.ring.raw_fd(),
+            self.local_addrs(),
+            taken,
+        )?;
+        self.core.spread =
+            Some(spread::Joined::new(spread.clone(), place, taken));
+        Ok(())
     }
 
     /// A `Send + Sync` handle that stops [`Server::serve_forever`] from another
@@ -1568,6 +1608,13 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Drop
     for Server<U, AcceptFn, HeaderFn, BodyFn>
 {
     fn drop(&mut self) {
+        // No ring of the spread sends here from now on. A send another ring
+        // chose before it saw this lands in a table no one reads, and that
+        // socket stays open until the spread, which holds a copy of this
+        // ring's descriptor, is dropped.
+        if let Some(joined) = self.core.spread.as_mut() {
+            joined.close();
+        }
         // If `serve_forever` ran it already drained (no-op here); otherwise
         // (early drop / panic unwind) ensure no op is in flight before the
         // buffers and ring are freed - and if that drain fails, leak the
