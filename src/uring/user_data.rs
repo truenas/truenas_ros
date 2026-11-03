@@ -18,6 +18,12 @@ pub(crate) const SLOT_MASK: u64 = 0x00ff_ffff;
 /// ignores - it must never swallow another domain's completions).
 pub(crate) const TAG_FS_DOMAIN: u8 = 0x80;
 
+/// The stream tag of a completion another ring posts to this one with
+/// `IORING_OP_MSG_RING`. This ring submitted nothing for it, so it is never
+/// counted off `inflight`: counting it would let the teardown drain stop
+/// while an op this ring did submit still names its buffers.
+pub(crate) const TAG_POSTED: u8 = 0x7f;
+
 /// Encode `(tag, slot, generation-low)` into an SQE `user_data` token.
 pub(crate) fn pack_raw(tag: u8, slot: u32, generation: u32) -> u64 {
     u64::from(tag)

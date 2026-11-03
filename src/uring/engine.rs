@@ -2,7 +2,8 @@
 //! in-flight accounting, the wake eventfd, and the cancel-everything
 //! teardown. Tag vocabularies stay with the domains: every method that names
 //! an op takes its `user_data` as a parameter, so the engine never interprets
-//! a completion.
+//! a completion, except to leave one another ring posted
+//! ([`TAG_POSTED`](crate::uring::user_data::TAG_POSTED)) out of `inflight`.
 
 use crate::errno;
 use crate::uring::probe::probe_op_supported;
@@ -26,6 +27,14 @@ use crate::sync::atomic::{AtomicBool, AtomicU64};
 /// from completions instead. See [`Engine::stage_chain`].
 #[cfg(feature = "uring-fs")]
 pub(crate) const MAX_CHAIN_LINKS: usize = 4;
+
+/// Whether a reaped completion ends an op this ring staged: one per op, so
+/// not a multishot's interim completions (`IORING_CQE_F_MORE`), and not one
+/// another ring posted ([`TAG_POSTED`](crate::uring::user_data::TAG_POSTED)).
+pub(crate) fn counted(cqe: &IoUringCqe) -> bool {
+    cqe.flags & IORING_CQE_F_MORE == 0
+        && cqe.user_data as u8 != crate::uring::user_data::TAG_POSTED
+}
 
 /// The role-agnostic io_uring engine a domain stack embeds. Field order is
 /// load-bearing: the embedding struct declares its buffer-owning tables
@@ -229,6 +238,14 @@ impl Engine {
         Ok(())
     }
 
+    /// Count a reaped completion off `inflight`, when [`counted`] says it
+    /// ends an op of this ring's.
+    pub(crate) fn retire(&mut self, cqe: &IoUringCqe) {
+        if counted(cqe) {
+            self.inflight = self.inflight.saturating_sub(1);
+        }
+    }
+
     /// Cancel every outstanding op, then reap until nothing is in flight.
     /// `cancel_user_data` tags the `CANCEL_ANY` op; every reaped CQE is
     /// handed to `on_reaped` so the domain can release resources a
@@ -249,9 +266,7 @@ impl Engine {
         while self.inflight > 0 {
             self.ring.submit_and_wait(1)?;
             while let Some(cqe) = self.ring.reap() {
-                if cqe.flags & IORING_CQE_F_MORE == 0 {
-                    self.inflight = self.inflight.saturating_sub(1);
-                }
+                self.retire(&cqe);
                 on_reaped(&cqe);
             }
         }

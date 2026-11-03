@@ -13,7 +13,7 @@ use std::path::PathBuf;
 /// Stream server type and bind address in one type-safe enum: the variant *is*
 /// the server type (the Rust-idiomatic take on `socketserver`'s server class +
 /// `server_address`), so an illegal type/address pairing cannot be expressed.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerAddr {
     /// IPv4 TCP (`AF_INET`, `SOCK_STREAM`).
     Tcp(SocketAddrV4),

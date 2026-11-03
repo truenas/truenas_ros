@@ -150,6 +150,11 @@ pub(crate) struct Reactor<U> {
     /// reason - a queued send segment points into it.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) body_bufs: Option<BufPool>,
+    /// This server's place in a spread of rings on one port, with the count
+    /// of slots it holds a connection in, which every ring of the spread
+    /// reads when it accepts.
+    #[cfg(feature = "net-server")]
+    pub(crate) spread: Option<crate::net::server::spread::Joined>,
     /// The shared io_uring engine (ring, in-flight accounting, wake, stop
     /// flags). Declared last so the ring drops after `table`'s buffers.
     pub(crate) engine: Engine,
@@ -184,6 +189,8 @@ impl<U> Reactor<U> {
             body_pool: None,
             #[cfg(all(feature = "net-server", feature = "uring-fs"))]
             body_bufs: None,
+            #[cfg(feature = "net-server")]
+            spread: None,
             engine,
         }
     }
@@ -290,6 +297,16 @@ impl<U> Reactor<U> {
                 }
                 self.sync_recv_buf_stats();
             }
+        }
+        // Every slot a server holds came through an accept it kept, which
+        // counted it in the spread, so its release takes it off whatever
+        // state it reached. A slot it shed or handed away was never counted
+        // and is still empty here.
+        #[cfg(feature = "net-server")]
+        if !self.table.is_empty(slot)
+            && let Some(joined) = self.spread.as_mut()
+        {
+            joined.gave();
         }
         if self.table.free(slot) {
             stat!(self, closed);

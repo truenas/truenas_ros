@@ -570,6 +570,10 @@ pub struct ServerStats {
     /// Transient accept errors (resource pressure) that triggered a backoff
     /// re-arm instead of terminating the server.
     pub accept_retries: u64,
+    /// Connections this ring accepted and sent to a ring of its
+    /// [`Spread`](super::Spread) holding fewer. They count in
+    /// [`accepted`](ServerStats::accepted) on the ring that serves them.
+    pub handed_off: u64,
     /// Listeners whose `shutdown(SHUT_RD)` failed at the start of a graceful
     /// drain. Non-zero means refuse-on-connect did not take effect for that
     /// listener: its backlog keeps filling with clients nobody will answer
@@ -674,6 +678,7 @@ impl StatsHandle {
             rejected: s.rejected.load(Ordering::Relaxed),
             shed: s.shed.load(Ordering::Relaxed),
             accept_retries: s.accept_retries.load(Ordering::Relaxed),
+            handed_off: s.handed_off.load(Ordering::Relaxed),
             drain_listener_shutdown_failed: s
                 .drain_listener_shutdown_failed
                 .load(Ordering::Relaxed),

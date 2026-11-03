@@ -438,7 +438,9 @@ where
                 | Op::Cred
                 | Op::Peername
                 | Op::DetachInstall
-                | Op::Maintain,
+                | Op::Maintain
+                | Op::Handoff
+                | Op::Handed,
             ) => unreachable!("client never issues {op:?}"),
         }
         Ok(())

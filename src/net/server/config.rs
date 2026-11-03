@@ -47,7 +47,8 @@ pub struct ServerConfig {
     /// per **server** - one ring/thread; a `reuse_port` multicore deployment
     /// multiplies it by the server count, but the kernel's reuseport hash is
     /// load-blind, so size each ring's pool for a skewed share rather than
-    /// the even split. Worst-case buffer memory is bounded by roughly
+    /// the even split, unless the servers share a
+    /// [`Spread`](super::Spread), which evens it. Worst-case buffer memory is bounded by roughly
     /// `pool_size x max_request_bytes` (every slot held by a near-cap
     /// request, plus per-socket kernel buffers) - the defaults give a
     /// ~512 MiB ceiling. Empty slots are near-free (~32 bytes each), so
@@ -376,8 +377,10 @@ pub struct ServerConfig {
     /// kernel load-balance incoming connections across them - the shared-nothing
     /// multi-core recipe. Each server keeps its own `pool_size` pool, and a
     /// full pool parks only that server's listener while the reuseport hash
-    /// keeps routing its share there (no rebalancing to emptier rings), so
-    /// provision per-ring pools for uneven placement. Defaults to `false`.
+    /// keeps routing its share there, so provision per-ring pools for uneven
+    /// placement. Servers that join one [`Spread`](super::Spread) send each
+    /// new connection to the ring with the fewest, though a full ring's
+    /// listener still parks. Defaults to `false`.
     /// Ignored for `AF_UNIX`.
     pub reuse_port: bool,
     /// Enable `SO_KEEPALIVE` with `TCP_KEEPIDLE` set to this duration (rounded

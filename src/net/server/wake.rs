@@ -110,6 +110,11 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     /// finish, and arm the grace-period deadline that escalates to a hard stop.
     fn begin_drain(&mut self) -> errno::Result<()> {
         self.core.draining = true;
+        // Before the listeners stop: no ring of a spread sends here once
+        // this is seen, and one sent before is shed as a drain sheds.
+        if let Some(joined) = self.core.spread.as_mut() {
+            joined.close();
+        }
 
         // Refuse new connections now, not when the listener fd closes at
         // drop. Cancelling the multishot accept below only stops this loop

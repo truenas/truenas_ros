@@ -246,6 +246,17 @@ pub(crate) const IORING_OP_RECV: u8 = 27;
 /// splice a framed message body straight from the socket to a consumer pipe.
 pub(crate) const IORING_OP_SPLICE: u8 = 30;
 pub(crate) const IORING_OP_SHUTDOWN: u8 = 34;
+/// Post a completion to another ring: `fd` = the target ring, `addr` = the
+/// command, `off` = the target CQE's `user_data`. With
+/// [`IORING_MSG_SEND_FD`], `addr3` names a slot of this ring's registered
+/// table and `file_index` the target's (`IORING_FILE_INDEX_ALLOC` picks a
+/// free one, which the target CQE's `res` names), and `len` must be 0
+/// (`io_msg_send_fd`, `io_uring/msg_ring.c`).
+#[cfg(feature = "net-server")]
+pub(crate) const IORING_OP_MSG_RING: u8 = 40;
+/// `IORING_OP_MSG_RING` command: install a registered file in the target.
+#[cfg(feature = "net-server")]
+pub(crate) const IORING_MSG_SEND_FD: u64 = 1;
 pub(crate) const IORING_OP_URING_CMD: u8 = 46;
 /// Materialize a real (installed) fd from a direct/registered descriptor
 /// (Linux >= 6.8). The new fd rides in the CQE `res`; flags go in
