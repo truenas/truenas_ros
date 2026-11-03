@@ -489,7 +489,8 @@ impl std::fmt::Debug for Body<'_> {
 ///
 /// Constructed via `From`/`Into`: `Vec<u8>`, `String`, `&'static [u8]`,
 /// `&'static str`, and `Cow<'static, [u8]>` all convert without copying.
-/// Dereferences to `[u8]`.
+/// [`SendBuf::recycled`] makes an owned segment whose storage the ring's
+/// body pool takes back once sent. Dereferences to `[u8]`.
 ///
 /// Opaque rather than a `Cow` alias so a shared-buffer representation (one
 /// cached body serving many connections at once) can arrive without
@@ -500,6 +501,15 @@ pub struct SendBuf(Seg);
 #[derive(Debug)]
 enum Seg {
     Cow(Cow<'static, [u8]>),
+    /// Owned bytes whose storage goes to the ring's body pool once they are
+    /// sent ([`SendBuf::recycled`]).
+    ///
+    /// Only storage a consumer marks goes home, never every owned segment.
+    /// The pool keeps a give that fits under its target, and the target
+    /// covers the room bodies claimed out of it leave behind, so small
+    /// replies no one claimed would fill that room, and a body coming home
+    /// would be freed in their place.
+    Recycled(Vec<u8>),
     /// A file-body chunk the kernel filled in a ring buffer.
     ///
     /// Raw because the buffer belongs to the reactor's pool, not to this
@@ -517,6 +527,30 @@ enum Seg {
 }
 
 impl SendBuf {
+    /// Owned bytes whose storage goes to the serving ring's body pool once
+    /// every byte is sent, for the next claim on that ring to reuse.
+    /// Meant for a buffer drawn from `BodyRecycler::claim`, so a reply
+    /// built in it costs no allocation once the pool is warm. The pool's
+    /// byte law keeps it while demand needs it and frees it otherwise. A
+    /// deferred reply is marked by sending it with
+    /// `Deferred::reply_recycled`.
+    ///
+    /// It is freed as any owned segment is when it is empty, when its
+    /// connection closes before it is sent, or when the ring has no body
+    /// pool.
+    pub fn recycled(bytes: Vec<u8>) -> SendBuf {
+        SendBuf(Seg::Recycled(bytes))
+    }
+
+    /// The storage of a [`recycled`](Self::recycled) segment, taken once it
+    /// has been sent, or `None` for any other kind.
+    pub(crate) fn into_recycled(self) -> Option<Vec<u8>> {
+        match self.0 {
+            Seg::Recycled(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+
     /// A segment over `len` bytes of pool buffer `bid`.
     ///
     /// # Safety
@@ -533,7 +567,7 @@ impl SendBuf {
     pub(crate) fn pooled_bid(&self) -> Option<u16> {
         match self.0 {
             Seg::Pooled { bid, .. } => Some(bid),
-            Seg::Cow(_) => None,
+            Seg::Cow(_) | Seg::Recycled(_) => None,
         }
     }
 }
@@ -543,6 +577,7 @@ impl std::ops::Deref for SendBuf {
     fn deref(&self) -> &[u8] {
         match &self.0 {
             Seg::Cow(c) => c,
+            Seg::Recycled(bytes) => bytes,
             // SAFETY: the constructor's contract - `len` initialized bytes
             // that stay valid while this segment lives.
             #[cfg(all(feature = "net-server", feature = "uring-fs"))]

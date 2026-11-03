@@ -1805,7 +1805,7 @@ impl<U> Connection<U> {
 
     /// Queue a request reply (FIFO, production order; frees a
     /// `max_in_flight` read-ahead slot once fully sent).
-    pub(crate) fn enqueue_reply(&mut self, bytes: Vec<u8>) {
+    pub(crate) fn enqueue_reply(&mut self, bytes: impl Into<SendBuf>) {
         self.enqueue(bytes, SendKind::ReplyLast);
     }
 
@@ -2179,8 +2179,14 @@ impl<U> Connection<U> {
 
     /// Advance the send cursor by `n` bytes (clamped to the armed gather):
     /// fully-sent PDUs are popped and tallied by kind; a partially-sent
-    /// leader updates the front cursor.
-    pub(crate) fn advance_sent(&mut self, n: usize) -> SendProgress {
+    /// leader updates the front cursor. The storage of each popped
+    /// [`SendBuf::recycled`] segment goes to `spent`, since only the reactor
+    /// holds the body pool it belongs in.
+    pub(crate) fn advance_sent(
+        &mut self,
+        n: usize,
+        mut spent: impl FnMut(Vec<u8>),
+    ) -> SendProgress {
         let mut n = n.min(self.armed_bytes);
         self.armed_bytes -= n;
         let mut progress = SendProgress {
@@ -2242,6 +2248,11 @@ impl<U> Connection<U> {
                         progress.freed += 1;
                     }
                 }
+            }
+            // Popped means the kernel has taken every byte, so the storage
+            // is free to reuse.
+            if let Some(bytes) = item.bytes.into_recycled() {
+                spent(bytes);
             }
         }
         progress
@@ -2319,12 +2330,12 @@ mod tests {
         assert_eq!(c.arm_send(), 30);
         // Partial completion mid-PDU-2: PDU 1 (a reply) finishes, cursor
         // lands inside PDU 2.
-        let p = c.advance_sent(15);
+        let p = c.advance_sent(15, drop);
         assert_eq!((p.replies, p.pushes, p.armed_remaining), (1, 0, 15));
         assert_eq!(c.queued_bytes(), 50);
         // Error-recovery re-arm from the cursor: PDU 2's tail + PDU 3.
         assert_eq!(c.arm_send(), 15 + 30);
-        let p = c.advance_sent(45);
+        let p = c.advance_sent(45, drop);
         assert_eq!((p.replies, p.pushes, p.armed_remaining), (1, 1, 0));
         assert_eq!(c.queued_bytes(), 0);
         assert!(!c.has_pending_send());
@@ -2332,7 +2343,7 @@ mod tests {
         // A completion never advances past what was armed.
         c.enqueue(vec![4; 8], SendKind::ReplyLast);
         assert_eq!(c.arm_send(), 8);
-        let p = c.advance_sent(usize::MAX);
+        let p = c.advance_sent(usize::MAX, drop);
         assert_eq!((p.replies, p.armed_remaining), (1, 0));
     }
 
@@ -2346,7 +2357,7 @@ mod tests {
             vec![b'B'; 40].into(),
         ]));
         assert_eq!(c.arm_send(), 12 + 40);
-        let p = c.advance_sent(12 + 40);
+        let p = c.advance_sent(12 + 40, drop);
         assert_eq!((p.replies, p.pushes, p.armed_remaining), (1, 0, 0));
     }
 
@@ -2363,9 +2374,44 @@ mod tests {
         assert_eq!(c.arm_send(), 8 + BODY.len());
         assert_eq!(c.send_iovs[1].iov_base as *const u8, BODY.as_ptr());
         assert_eq!(c.send_iovs[1].iov_len, BODY.len());
-        let p = c.advance_sent(8 + BODY.len());
+        let p = c.advance_sent(8 + BODY.len(), drop);
         assert_eq!((p.replies, p.pushes), (1, 0));
         assert_eq!(c.queued_bytes(), 0);
+    }
+
+    /// A segment marked as the pool's hands its own storage out once all of
+    /// it is sent, and no sooner. A plain owned segment hands nothing out,
+    /// so storage no one claimed never reaches the pool.
+    #[test]
+    fn a_recycled_segment_gives_its_storage_back_once_sent() {
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 4);
+        let mut head = Vec::with_capacity(64);
+        head.extend_from_slice(&[b'H'; 12]);
+        let at = head.as_ptr();
+        assert!(c.enqueue_reply_segments(vec![
+            SendBuf::recycled(head),
+            vec![b'B'; 8].into(),
+        ]));
+        assert!(
+            c.enqueue_reply_segments(vec![SendBuf::recycled(vec![b'R'; 10])])
+        );
+        assert_eq!(c.arm_send(), 12 + 8 + 10);
+        let mut spent = Vec::new();
+
+        let _ = c.advance_sent(4, |v| spent.push(v));
+        assert!(spent.is_empty(), "a partly sent segment keeps its storage");
+
+        // The rest of the head, all of the plain segment and half the last.
+        let p = c.advance_sent(8 + 8 + 5, |v| spent.push(v));
+        assert_eq!(p.replies, 1);
+        assert_eq!(spent.len(), 1, "only the marked segment is handed out");
+        assert_eq!(spent[0].as_ptr(), at, "its own storage, not a copy");
+        assert_eq!(spent[0].capacity(), 64);
+
+        let p = c.advance_sent(5, |v| spent.push(v));
+        assert_eq!((p.replies, p.armed_remaining), (1, 0));
+        assert_eq!(spent.len(), 2);
+        assert_eq!(spent[1], vec![b'R'; 10]);
     }
 
     #[test]
@@ -2730,7 +2776,7 @@ mod tests {
         // The tail's own chunks go straight through.
         c.enqueue_file_chunk(SendBuf::from(vec![b'a'; 8]), false);
         assert_eq!(c.arm_send(), 4 + 8, "head + chunk, no diverted bytes");
-        let p = c.advance_sent(12);
+        let p = c.advance_sent(12, drop);
         assert_eq!(
             (p.replies, p.pushes),
             (0, 0),
@@ -2749,7 +2795,7 @@ mod tests {
         assert_eq!(c.send_iovs[0].iov_len, 12);
         assert_eq!(c.send_iovs[1].iov_len, 2, "push held until the tail");
         assert_eq!(c.send_iovs[2].iov_len, 3, "deferred reply after it");
-        let p = c.advance_sent(12 + 2 + 3);
+        let p = c.advance_sent(12 + 2 + 3, drop);
         assert_eq!(
             (p.replies, p.pushes),
             (2, 1),
@@ -2858,7 +2904,7 @@ mod tests {
             c.enqueue_file_chunk(buf, true);
             c.finish_file_tail();
             assert_eq!(c.arm_send(), 4);
-            let _ = c.advance_sent(4);
+            let _ = c.advance_sent(4, drop);
         };
 
         // A body claims a share, and the flush gives it back - so the
@@ -3293,7 +3339,7 @@ mod tests {
         c.finish_file_tail();
         assert!(!c.tail_active(), "no successor");
         assert_eq!(c.arm_send(), 4);
-        let p = c.advance_sent(4);
+        let p = c.advance_sent(4, drop);
         assert_eq!(c.chunk_out, 0, "the share came back");
         assert_eq!(p.freed, 1, "and the buffer id rode out to the pool");
         assert_eq!(p.freed_bids[0], 7, "the one the segment held");
