@@ -1131,7 +1131,8 @@ impl AsFd for Anchor {
 /// handle (each submitted op parks its own clone loop-side until the CQE). The
 /// fd closes when the last clone - this handle plus any op still holding one --
 /// drops, which gives close-last ordering by construction; [`FsHandle::close`]
-/// simply drops the handle. Cheap to [`Clone`].
+/// simply drops the handle. Cheap to [`Clone`]. When nothing else holds it,
+/// [`File::into_fd`] takes the descriptor out instead.
 #[derive(Clone)]
 pub struct File {
     pub(crate) fd: Arc<OwnedFd>,
@@ -1170,6 +1171,17 @@ impl File {
     /// lifetime; the reactor independently keeps it open across any op it holds.
     pub fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+
+    /// Take the descriptor out, so the caller owns it and closes it, when
+    /// nothing else holds the file, or give the same `File` back.
+    ///
+    /// A clone holds it, and so does an op in flight, which parks its own
+    /// clone until its completion reaps. An [`FsDone`] keeps the clone
+    /// [`FsDone::file`] gives out until it drops, so drop the `FsDone`
+    /// before taking the descriptor of the file it carried.
+    pub fn into_fd(self) -> Result<OwnedFd, File> {
+        Arc::try_unwrap(self.fd).map_err(File::new)
     }
 }
 
