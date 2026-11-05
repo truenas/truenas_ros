@@ -6625,3 +6625,29 @@ fn reopen_proc_allows_and_refuses_what_an_open_by_name_does_on_zfs() {
         }
     });
 }
+
+/// `File::into_fd` gives the same `File` back while a clone holds it, and
+/// once the clone drops takes out the same descriptor, which then writes
+/// and reads as a `std::fs::File` the caller owns.
+#[test]
+fn into_fd_takes_the_descriptor_only_when_nothing_else_holds_it() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        let anchor = Anchor::open(&dir).unwrap();
+        let f = h.open(me, &anchor, "f", creat_rw()).unwrap();
+        let raw = f.as_raw_fd();
+        let clone = f.clone();
+        let f = f.into_fd().expect_err("a clone holds it");
+        assert_eq!(f.as_raw_fd(), raw, "the same file comes back");
+        drop(clone);
+        let fd = f.into_fd().expect("nothing else holds it");
+        assert_eq!(fd.as_raw_fd(), raw);
+        let mut file = std::fs::File::from(fd);
+        file.write_all(b"owned").unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut back = String::new();
+        file.read_to_string(&mut back).unwrap();
+        assert_eq!(back, "owned");
+    });
+}
