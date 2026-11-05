@@ -467,6 +467,23 @@ impl UringFs {
                     through_proc,
                     FsWaiter::Channel(reply),
                 ),
+                FsInject::ReopenProc {
+                    pers,
+                    file,
+                    access,
+                    reply,
+                } => {
+                    let waiter = FsWaiter::Channel(reply);
+                    let eng = &mut self.eng;
+                    match pers {
+                        Some(pers) => self.fs.submit_reopen_proc(
+                            eng, pers, file, access, waiter,
+                        ),
+                        None => self.fs.submit_reopen_proc_as_root(
+                            eng, file, access, waiter,
+                        ),
+                    }
+                }
                 FsInject::FRemoveXattr { file, name, reply } => {
                     self.fs.remove_priv_xattr(file, name, reply)
                 }
@@ -551,6 +568,7 @@ impl UringFs {
                 FsInject::FdMetaAsRoot { reply, value, .. } => {
                     (Some(reply), vec![value])
                 }
+                FsInject::ReopenProc { reply, .. } => (Some(reply), Vec::new()),
                 FsInject::FRemoveXattr { reply, .. } => {
                     (Some(reply), Vec::new())
                 }

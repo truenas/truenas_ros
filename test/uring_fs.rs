@@ -25,8 +25,8 @@ use truenas_ros::sync_fs::{
 use truenas_ros::uring_fs::{
     Advice, Anchor, AsUser, Caps, CredBroker, CredHandle, EnrichSpec, File,
     FsConfig, FsHandle, IdentityCache, Leaf, Order, Personality,
-    PrivilegedXattrs, QueryOptions, RwFlags, ShutdownHandle, TreeCursor,
-    TreeOptions, UringFs, query_directory, query_tree,
+    PrivilegedXattrs, QueryOptions, ReopenAccess, RwFlags, ShutdownHandle,
+    TreeCursor, TreeOptions, UringFs, query_directory, query_tree,
 };
 use truenas_ros::{Errno, Error};
 
@@ -6375,4 +6375,253 @@ mod zfs_setattr {
             }
         });
     }
+}
+
+/// The access mode, `O_NONBLOCK` and close on exec of the descriptor of `f`.
+fn fd_flags(f: &File) -> (i32, bool, bool) {
+    // SAFETY: `f` holds the descriptor open, and F_GETFL and F_GETFD only
+    // read its flags.
+    let (fl, fd) = unsafe {
+        (
+            libc::fcntl(f.as_raw_fd(), libc::F_GETFL),
+            libc::fcntl(f.as_raw_fd(), libc::F_GETFD),
+        )
+    };
+    assert!(
+        fl >= 0 && fd >= 0,
+        "fcntl: {}",
+        std::io::Error::last_os_error()
+    );
+    (
+        fl & libc::O_ACCMODE,
+        fl & libc::O_NONBLOCK != 0,
+        fd & libc::FD_CLOEXEC != 0,
+    )
+}
+
+/// The errno of a refusal, or `None` for success.
+fn errno_of<T>(res: &Result<T, Error>) -> Option<Errno> {
+    match res {
+        Ok(_) => None,
+        Err(Error::Errno(e)) => Some(*e),
+        Err(e) => panic!("not an errno: {e}"),
+    }
+}
+
+/// `FsHandle::reopen_proc` opens a file held `O_PATH` again through
+/// `/proc/thread-self/fd` with the access asked, close on exec and with no
+/// `O_NONBLOCK` left by the guard, and the file system checks the
+/// personality. So nobody reads a file of mode 0644 but may not write it,
+/// and is refused at 0600, which the ring owner is not. The reopen skips the
+/// walk to the file, so a folder nobody may not search, which refuses the
+/// open by name, does not refuse it. A link held `O_PATH` with `O_NOFOLLOW`
+/// is reached itself and refused (`may_open` in `fs/namei.c`), and a FIFO
+/// answers at once.
+#[test]
+fn reopen_proc_opens_a_held_file_again_as_the_personality() {
+    if !root_or_skip("reopen_proc_opens_a_held_file_again_as_the_personality") {
+        return; // the broker needs privilege
+    }
+    with_broker(|h, creds, me, dir| {
+        let mode = |name: &str, bits: u32| {
+            std::fs::set_permissions(
+                dir.join(name),
+                std::fs::Permissions::from_mode(bits),
+            )
+            .unwrap();
+        };
+        std::fs::write(dir.join("f"), b"body").unwrap();
+        mode("f", 0o644);
+        std::os::unix::fs::symlink("f", dir.join("l")).unwrap();
+        mkfifo(dir, "p");
+        std::fs::create_dir(dir.join("locked")).unwrap();
+        mode("locked", 0o700);
+        std::fs::write(dir.join("locked/g"), b"locked").unwrap();
+        mode("locked/g", 0o644);
+        let anchor = Anchor::open(dir).unwrap();
+        let held = |name: &str, flags: OFlag| {
+            let how = OpenHow::new().flags(OFlag::O_PATH | flags);
+            h.open(me, &anchor, name, how).unwrap()
+        };
+        let f = held("f", OFlag::empty());
+
+        for (access, want) in [
+            (ReopenAccess::Read, libc::O_RDONLY),
+            (ReopenAccess::Write, libc::O_WRONLY),
+            (ReopenAccess::ReadWrite, libc::O_RDWR),
+        ] {
+            let again = h.reopen_proc(me, &f, access).unwrap();
+            assert_eq!(fd_flags(&again), (want, false, true), "{access:?}");
+            h.close(again).unwrap();
+        }
+        let again = h.reopen_proc(me, &f, ReopenAccess::Read).unwrap();
+        let (n, buf) = pread1(h, me, &again, vec![0; 8], 0);
+        assert_eq!(&buf[..n.unwrap()], b"body");
+        h.close(again).unwrap();
+
+        let nobody = creds
+            .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
+            .unwrap();
+        let reopened = |who, f: &File, access| {
+            let res = h.reopen_proc(who, f, access);
+            let errno = errno_of(&res);
+            if let Ok(again) = res {
+                h.close(again).unwrap();
+            }
+            errno
+        };
+        assert_eq!(reopened(nobody, &f, ReopenAccess::Read), None);
+        let write = reopened(nobody, &f, ReopenAccess::Write);
+        assert_eq!(write, Some(Errno::EACCES), "nobody may not write");
+        mode("f", 0o600);
+        let read = reopened(nobody, &f, ReopenAccess::Read);
+        assert_eq!(read, Some(Errno::EACCES), "nobody is refused at 0600");
+        for access in [ReopenAccess::Read, ReopenAccess::ReadWrite] {
+            let again = h.reopen_proc_as_root(&f, access).unwrap();
+            h.close(again).unwrap();
+        }
+
+        let g = held("locked/g", OFlag::empty());
+        let how = OpenHow::new().flags(OFlag::O_RDONLY);
+        let by_name = h.open(nobody, &anchor, "locked/g", how);
+        assert_eq!(errno_of(&by_name), Some(Errno::EACCES), "by name");
+        assert_eq!(reopened(nobody, &g, ReopenAccess::Read), None);
+
+        let l = held("l", OFlag::O_NOFOLLOW);
+        let link = reopened(me, &l, ReopenAccess::Read);
+        assert_eq!(link, Some(Errno::ELOOP), "the link itself");
+        let fifo = held("p", OFlag::empty());
+        let again = h.reopen_proc(me, &fifo, ReopenAccess::Read).unwrap();
+        assert_eq!(fd_flags(&again), (libc::O_RDONLY, false, true));
+        h.close(again).unwrap();
+
+        creds.unregister(nobody).unwrap();
+        for file in [f, g, l, fifo] {
+            h.close(file).unwrap();
+        }
+    });
+}
+
+/// On a POSIX and an NFSv4 dataset `FsHandle::reopen_proc` allows and
+/// refuses what an open by name does, for the owner of a file of mode
+/// 0600, a reader an ACL entry grants reading, and a stranger, each for
+/// reading, writing and both. The owner may do all three, the reader read
+/// alone and the stranger nothing, so the two agree on refusals as well as
+/// on grants.
+#[test]
+fn reopen_proc_allows_and_refuses_what_an_open_by_name_does_on_zfs() {
+    if !root_or_skip(
+        "reopen_proc_allows_and_refuses_what_an_open_by_name_does_on_zfs",
+    ) {
+        return; // the broker, the owners and the ACLs need privilege
+    }
+    const OWNER: u32 = 8_675_301;
+    const READER: u32 = 8_675_302;
+    const STRANGER: u32 = 8_675_303;
+    let datasets: Vec<(&str, PathBuf)> = [
+        ("posix", "TRUENAS_ROS_POSIX_DATASET"),
+        ("nfs4", "TRUENAS_ROS_NFS4_DATASET"),
+    ]
+    .into_iter()
+    .filter_map(|(kind, var)| {
+        let dir = PathBuf::from(std::env::var_os(var)?);
+        (zfs_dir::is_zfs(&dir) == Some(true)).then_some((kind, dir))
+    })
+    .collect();
+    if datasets.len() < 2 {
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_ZFS").is_none(),
+            "TRUENAS_ROS_REQUIRE_ZFS is set but the POSIX and NFSv4 \
+             datasets are not both ZFS"
+        );
+        return;
+    }
+    // USER_OBJ rw, USER READER r, GROUP_OBJ nothing, MASK r and OTHER
+    // nothing, as `system.posix_acl_access` holds them.
+    let posix: Vec<u8> = {
+        let mut v = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [
+            (0x01u16, 0o6u16, u32::MAX),
+            (0x02, 0o4, READER),
+            (0x04, 0o0, u32::MAX),
+            (0x10, 0o4, u32::MAX),
+            (0x20, 0o0, u32::MAX),
+        ] {
+            v.extend(tag.to_le_bytes());
+            v.extend(perm.to_le_bytes());
+            v.extend(id.to_le_bytes());
+        }
+        v
+    };
+    // OWNER@ is allowed everything, READER READ_DATA, READ_ATTRIBUTES,
+    // READ_ACL and SYNCHRONIZE, and EVERYONE@ the last three.
+    let nfs4 = nfs4_xdr(&[
+        [0, 0, 1, 0x1f_01ff, 1],
+        [0, 0, 0, 0x12_0081, READER],
+        [0, 0, 1, 0x12_0080, 3],
+    ]);
+    with_broker(|h, creds, me, _dir| {
+        let people = [OWNER, READER, STRANGER]
+            .map(|uid| (uid, creds.register(&AsUser::new(uid, uid)).unwrap()));
+        for (kind, ds) in &datasets {
+            let folder =
+                ds.join(format!("rostest_reopen_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&folder);
+            std::fs::create_dir(&folder).unwrap();
+            std::fs::set_permissions(
+                &folder,
+                std::fs::Permissions::from_mode(0o777),
+            )
+            .unwrap();
+            std::fs::write(folder.join("f"), b"reopen").unwrap();
+            std::os::unix::fs::chown(
+                folder.join("f"),
+                Some(OWNER),
+                Some(OWNER),
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                folder.join("f"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            let anchor = Anchor::open(&folder).unwrap();
+            let (name, acl) = match *kind {
+                "posix" => ("system.posix_acl_access", posix.clone()),
+                _ => ("system.nfs4_acl_xdr", nfs4.clone()),
+            };
+            let how = OpenHow::new().flags(OFlag::O_RDONLY);
+            let open = h.open(me, &anchor, "f", how).unwrap();
+            let (set, _) = h.fsetxattr(me, &open, xattr_name(name), acl, 0);
+            set.unwrap_or_else(|e| panic!("{kind}: root sets the ACL: {e}"));
+            h.close(open).unwrap();
+            let held = h
+                .open(me, &anchor, "f", OpenHow::new().flags(OFlag::O_PATH))
+                .unwrap();
+            for (uid, who) in people {
+                for (access, flags) in [
+                    (ReopenAccess::Read, OFlag::O_RDONLY),
+                    (ReopenAccess::Write, OFlag::O_WRONLY),
+                    (ReopenAccess::ReadWrite, OFlag::O_RDWR),
+                ] {
+                    let how = OpenHow::new().flags(flags);
+                    let by_name = h.open(who, &anchor, "f", how);
+                    let again = h.reopen_proc(who, &held, access);
+                    let case = format!("{kind} uid {uid} {access:?}");
+                    assert_eq!(errno_of(&again), errno_of(&by_name), "{case}");
+                    let granted = uid == OWNER
+                        || (uid == READER && access == ReopenAccess::Read);
+                    assert_eq!(again.is_ok(), granted, "{case}");
+                    for file in [by_name, again].into_iter().flatten() {
+                        h.close(file).unwrap();
+                    }
+                }
+            }
+            h.close(held).unwrap();
+            std::fs::remove_dir_all(&folder).unwrap();
+        }
+        for (_, who) in people {
+            creds.unregister(who).unwrap();
+        }
+    });
 }
