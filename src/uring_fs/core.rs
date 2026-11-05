@@ -23,7 +23,7 @@ use super::offload_pool::{
 };
 use super::{
     Anchor, CONFINED_RESOLVE, File, FsOutcome, Leaf, Personality,
-    PrivilegedXattrs, ReplyTo, RwFlags, statx_at_flags,
+    PrivilegedXattrs, ReopenAccess, ReplyTo, RwFlags, statx_at_flags,
 };
 use crate::errno::{Errno, retry_on_eintr};
 use crate::sync_fs::openat2::RawOpenHow;
@@ -41,8 +41,8 @@ use crate::uring::sys::{
     IORING_OP_FSYNC, IORING_OP_FTRUNCATE, IORING_OP_GETXATTR, IORING_OP_LINKAT,
     IORING_OP_MKDIRAT, IORING_OP_OPENAT2, IORING_OP_READV, IORING_OP_RENAMEAT,
     IORING_OP_SPLICE, IORING_OP_STATX, IORING_OP_SYMLINKAT, IORING_OP_TIMEOUT,
-    IORING_OP_UNLINKAT, IORING_OP_WRITEV, IOSQE_BUFFER_SELECT, IoUringCqe,
-    SPLICE_F_MOVE,
+    IORING_OP_UNLINKAT, IORING_OP_WRITEV, IOSQE_ASYNC, IOSQE_BUFFER_SELECT,
+    IoUringCqe, SPLICE_F_MOVE,
 };
 use crate::uring::user_data::{pack_raw, unpack_raw};
 use std::any::Any;
@@ -2170,6 +2170,7 @@ impl FsCore {
     /// (root) credentials is a privilege this surface must never grant
     /// implicitly. The sanctioned ambient-root paths are
     /// [`FsCore::submit_fgetxattr_as_root`], a read on the descriptor or
+    /// through `/proc`, [`FsCore::submit_reopen_proc_as_root`], an open
     /// through `/proc`, and, for writes, the [`PrivilegedXattrs`] allowlist
     /// consulted below.
     ///
@@ -2218,7 +2219,7 @@ impl FsCore {
     }
 
     /// Read xattr `name` from `file` under the reactor's **ambient root**
-    /// (`sqe.personality = 0`) - the sole sanctioned `pers = 0` fd-op. For a
+    /// (`sqe.personality = 0`) - the sanctioned `pers = 0` read. For a
     /// privileged `trusted.*`/`security.*` read a request's own identity cannot
     /// perform: `sqe.personality` (not the fd's open-time cred) governs
     /// `fgetxattr`'s `CAP_SYS_ADMIN` check, and `0` runs as the ring owner
@@ -2255,6 +2256,109 @@ impl FsCore {
             0,
             waiter,
         );
+    }
+
+    /// Stage an `OPENAT2` of the path of `file` under `/proc/thread-self/fd`
+    /// as `pers`, which opens the file again with `access`
+    /// ([`FsConn::reopen_proc`]). Fail-closed on `pers == 0`, as every
+    /// other op on a file is. The one way to run it as the ring owner is
+    /// [`FsCore::submit_reopen_proc_as_root`].
+    pub(crate) fn submit_reopen_proc(
+        &mut self,
+        eng: &mut Engine,
+        pers: u16,
+        file: Arc<OwnedFd>,
+        access: ReopenAccess,
+        waiter: FsWaiter,
+    ) {
+        if pers == 0 {
+            self.refuse(
+                eng,
+                waiter,
+                Errno::EINVAL,
+                true,
+                Vec::new(),
+                Some(file),
+            );
+            return;
+        }
+        self.stage_reopen_proc(eng, pers, file, access, waiter);
+    }
+
+    /// Stage the reopen of [`FsCore::submit_reopen_proc`] under the ring
+    /// owner's ambient (root) credentials, `personality = 0`
+    /// ([`FsConn::reopen_proc_as_root`]).
+    pub(crate) fn submit_reopen_proc_as_root(
+        &mut self,
+        eng: &mut Engine,
+        file: Arc<OwnedFd>,
+        access: ReopenAccess,
+        waiter: FsWaiter,
+    ) {
+        self.stage_reopen_proc(eng, 0, file, access, waiter);
+    }
+
+    /// Stage a reopen stamping `sqe.personality = personality_raw`
+    /// verbatim. Internal, since the two callers own the personality
+    /// policy.
+    ///
+    /// It is an open like any other ([`TAG_OPEN`]), so its completion wraps
+    /// the new descriptor and strips the guard's `O_NONBLOCK` from it. The
+    /// path is absolute and the kernel resolves it from the root of the
+    /// process whatever the dirfd, which is `AT_FDCWD` to say so. `file` is
+    /// parked with the op, so its number is not used again before the
+    /// worker follows the link, which resolves on the io-wq worker as the
+    /// read of an xattr through `/proc` does ([`proc_fd_path`]). The open
+    /// takes `IOSQE_ASYNC`, since the link cannot resolve in the walk the
+    /// inline try makes (`proc_pid_get_link` in `fs/proc/base.c` answers
+    /// `ECHILD` with no dentry, and `io_openat2` in `io_uring/openclose.c`
+    /// sets `LOOKUP_CACHED`), so that try always fails.
+    fn stage_reopen_proc(
+        &mut self,
+        eng: &mut Engine,
+        personality_raw: u16,
+        file: Arc<OwnedFd>,
+        access: ReopenAccess,
+        waiter: FsWaiter,
+    ) {
+        let Some(op_slot) = self.pop_op() else {
+            self.refuse(
+                eng,
+                waiter,
+                Errno::EBUSY,
+                true,
+                Vec::new(),
+                Some(file),
+            );
+            return;
+        };
+        let (how, guarded) = access.how();
+        let path = proc_fd_path(file.as_raw_fd());
+        let entry = &mut self.ops[op_slot as usize];
+        let gen32 = entry.generation as u32;
+        let e = &mut entry.state;
+        e.state = FsOpState::InFlight { tag: TAG_OPEN };
+        e.waiter = Some(waiter);
+        e.file = Some(file);
+        e.path = Some(Cow::Owned(path));
+        e.how = Some(Box::new(how));
+        e.strip_nonblock = guarded;
+        let path_ptr = e.path.as_ref().expect("just set").as_ptr() as u64;
+        let how_ptr =
+            &**e.how.as_ref().expect("just set") as *const RawOpenHow as u64;
+        let ud = pack_raw(TAG_OPEN, op_slot, gen32);
+        let staged = eng.stage(ud, |sqe| {
+            sqe.opcode = IORING_OP_OPENAT2;
+            sqe.fd = libc::AT_FDCWD;
+            sqe.addr = path_ptr;
+            sqe.off_addr2 = how_ptr;
+            sqe.len = size_of::<RawOpenHow>() as u32;
+            sqe.flags |= IOSQE_ASYNC;
+            sqe.personality = personality_raw;
+        });
+        if let Err(e) = staged {
+            self.fail_op(eng, op_slot, e);
+        }
     }
 
     /// The opcode an fd-meta tag stages, or `None` for a tag with no arm.
@@ -4898,6 +5002,54 @@ impl<'a> FsConn<'a> {
             true,
             w,
         );
+    }
+
+    /// Open `f` again with `access` as `who`, through the path of `f` under
+    /// `/proc/thread-self/fd`, and fire `on_done` with the new [`File`]
+    /// ([`FsDone::file`]). `f` may be opened `O_PATH`.
+    ///
+    /// The link jumps to `f` itself (`proc_pid_get_link` in
+    /// `fs/proc/base.c`), and the open then checks `who` against the file
+    /// as an open by name does (`may_open` in `fs/namei.c`), so the file
+    /// system decides the access, its ACL included. It skips the walk to
+    /// the file, so a folder above it that `who` may not search does not
+    /// refuse it. A link held `O_PATH` with `O_NOFOLLOW` answers `ELOOP`,
+    /// since the jump reaches the link itself, and a FIFO answers at once
+    /// rather than wait for a peer. It runs on an io-wq worker and needs
+    /// `/proc` mounted in the process's root. An open is the one thing
+    /// besides a read that goes through `/proc`, as the settled decision on
+    /// `O_PATH` in the crate's notes says, since the file system checks it
+    /// in full and nothing is carried around the check.
+    pub fn reopen_proc<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        access: ReopenAccess,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        let w = self.waiter(on_done);
+        self.fs.submit_reopen_proc(self.eng, who.0, f.fd, access, w);
+    }
+
+    /// Open `f` again with `access` under the reactor's **ambient root**, as
+    /// [`reopen_proc`](Self::reopen_proc) opens it as `who`. The ring
+    /// owner's capabilities pass the check of the file, so this is for an
+    /// access a server has already decided a request may have, such as the
+    /// access left after it lowers what an open may do, never for deciding
+    /// it.
+    pub fn reopen_proc_as_root<F>(
+        &mut self,
+        f: File,
+        access: ReopenAccess,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        let w = self.waiter(on_done);
+        self.fs
+            .submit_reopen_proc_as_root(self.eng, f.fd, access, w);
     }
 
     /// Write extended attribute `name` on `f` as `who`.

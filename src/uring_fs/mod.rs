@@ -14,9 +14,11 @@
 //!   `sqe.personality = 0` (the ring owner's ambient creds) is reachable
 //!   only through the two reads [`FsHandle::fgetxattr_as_root`] and
 //!   [`FsHandle::fgetxattr_proc_as_root`], for metadata a server checks
-//!   itself and never hands to a request, and the write allowlist of
-//!   [`PrivilegedXattrs`]. Only [`FsHandle::close`] is exempt - teardown
-//!   consults no credentials and must be stageable from [`File`]'s `Drop`.
+//!   itself and never hands to a request, the reopen
+//!   [`FsHandle::reopen_proc_as_root`], for an access a server has already
+//!   decided, and the write allowlist of [`PrivilegedXattrs`]. Only
+//!   [`FsHandle::close`] is exempt - teardown consults no credentials and
+//!   must be stageable from [`File`]'s `Drop`.
 //! - **Resolution is anchored.** No call takes an absolute path. [`Anchor`]
 //!   is a long-lived real directory fd; `open` resolves a **relative**,
 //!   multi-component path against it (confine it in-kernel with
@@ -139,6 +141,8 @@
 //!   up one level to the parent, as the caller, and never across a mount.
 //!   [`FsConn::open_parent_across_mount`] goes up the same one level and may
 //!   cross the top of a mount to do it, onto the file system it sits in.
+//!   [`FsConn::reopen_proc`] takes no path, and opens again only a file
+//!   already held, through `/proc`.
 //! - **Split-credential descent.** [`FsConn::open_chain`] opens a
 //!   sequence of paths, each relative to the one before it and each
 //!   under **its own personality** - so a file inside a tree only the
@@ -713,6 +717,46 @@ pub(crate) fn apply_special_file_guard(
     true
 }
 
+/// What a reopen of a held file through `/proc` asks for
+/// ([`FsConn::reopen_proc`](core::FsConn::reopen_proc)), and all it may ask.
+/// A reopen never creates, truncates or opens `O_PATH`, since it takes a
+/// file that is already there and gives a descriptor that reads or writes
+/// it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReopenAccess {
+    /// `O_RDONLY`.
+    Read,
+    /// `O_WRONLY`.
+    Write,
+    /// `O_RDWR`.
+    ReadWrite,
+}
+
+impl ReopenAccess {
+    /// The `open_how` of the reopen, this access with `O_CLOEXEC` and
+    /// `O_NOCTTY`, and whether the special-file guard added `O_NONBLOCK`,
+    /// which it does for every access, so that a FIFO answers at once
+    /// rather than hold a worker. No resolve flag is set, since
+    /// `RESOLVE_NO_MAGICLINKS` refuses the link under `/proc` that the
+    /// reopen follows, and the path is absolute, which `RESOLVE_BENEATH`
+    /// and `RESOLVE_IN_ROOT` refuse.
+    pub(crate) fn how(self) -> (RawOpenHow, bool) {
+        let access = match self {
+            ReopenAccess::Read => libc::O_RDONLY,
+            ReopenAccess::Write => libc::O_WRONLY,
+            ReopenAccess::ReadWrite => libc::O_RDWR,
+        };
+        let flags = access | libc::O_CLOEXEC | libc::O_NOCTTY;
+        let mut raw = RawOpenHow {
+            flags: flags as u64,
+            mode: 0,
+            resolve: 0,
+        };
+        let guarded = apply_special_file_guard(&mut raw, SpecialFiles::Guard);
+        (raw, guarded)
+    }
+}
+
 /// Split an open into the pieces a submission needs, applying both of this
 /// module's rules: resolve confinement and the special-file guard.
 ///
@@ -824,9 +868,11 @@ const TRUSTED_NS: &[u8] = b"trusted.";
 /// because that is "no credential override" - the op would run as the daemon
 /// (root) rather than the requesting identity. Reads have two sanctioned
 /// exceptions already ([`FsHandle::fgetxattr_as_root`] and
-/// [`FsHandle::fgetxattr_proc_as_root`]); this is their write-side
-/// counterpart, and it is an allowlist rather than a blanket permit because a
-/// privileged *write* is a far sharper tool than a privileged read.
+/// [`FsHandle::fgetxattr_proc_as_root`]), and an open has one
+/// ([`FsHandle::reopen_proc_as_root`]), for an access a server already
+/// decided. This is their write-side counterpart for metadata, and it is an
+/// allowlist rather than a blanket permit because a privileged *write* is a
+/// far sharper tool than a privileged read.
 ///
 /// # Why it exists
 ///
@@ -1264,6 +1310,16 @@ pub(crate) enum FsInject {
         name: Cow<'static, CStr>,
         value: Vec<u8>,
         through_proc: bool,
+        reply: ReplyTo,
+    },
+    /// A reopen of `file` through `/proc/thread-self/fd` as the personality
+    /// `pers`, or as the ring owner when `None` (the twins of
+    /// [`FsConn::reopen_proc`](core::FsConn::reopen_proc) and
+    /// [`FsConn::reopen_proc_as_root`](core::FsConn::reopen_proc_as_root)).
+    ReopenProc {
+        pers: Option<u16>,
+        file: Arc<OwnedFd>,
+        access: ReopenAccess,
         reply: ReplyTo,
     },
     /// Remove a server-owned extended attribute. Off the ring - io_uring has
@@ -1993,6 +2049,56 @@ impl FsHandle {
                 out.bufs.pop().unwrap_or_default(),
             ),
             Err(_) => (Err(Errno::ECONNABORTED.into()), Vec::new()),
+        }
+    }
+
+    /// Open `f` again with `access` as `who`, through its path under
+    /// `/proc/thread-self/fd`. The blocking twin of
+    /// [`FsConn::reopen_proc`](crate::uring_fs::FsConn::reopen_proc), which
+    /// says what it checks.
+    pub fn reopen_proc(
+        &self,
+        who: Personality,
+        f: &File,
+        access: ReopenAccess,
+    ) -> crate::Result<File> {
+        self.reopen(Some(who.0), f, access)
+    }
+
+    /// Open `f` again with `access` under the reactor's ambient (root)
+    /// credentials, through its path under `/proc/thread-self/fd`. The
+    /// blocking twin of
+    /// [`FsConn::reopen_proc_as_root`](crate::uring_fs::FsConn::reopen_proc_as_root),
+    /// which says what it is for.
+    pub fn reopen_proc_as_root(
+        &self,
+        f: &File,
+        access: ReopenAccess,
+    ) -> crate::Result<File> {
+        self.reopen(None, f, access)
+    }
+
+    /// The two reopens, as the personality `pers` or as the ring owner.
+    fn reopen(
+        &self,
+        pers: Option<u16>,
+        f: &File,
+        access: ReopenAccess,
+    ) -> crate::Result<File> {
+        let (tx, rx) = mpsc::channel();
+        let out = self.call(
+            FsInject::ReopenProc {
+                pers,
+                file: f.fd.clone(),
+                access,
+                reply: ReplyTo::Sync(tx),
+            },
+            &rx,
+        )?;
+        match (out.res, out.file) {
+            (Ok(_), Some(fd)) => Ok(File::new(fd)),
+            (Err(e), _) => Err(e.into()),
+            (Ok(_), None) => Err(Errno::EIO.into()),
         }
     }
 
