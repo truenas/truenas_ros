@@ -200,6 +200,12 @@ export TRUENAS_ROS_REQUIRE_ZFS_SETATTR=1
 # carries it, so the test of the type must run. A kernel that names neither
 # bit in `stx_attributes_mask` turns CI red.
 export TRUENAS_ROS_REQUIRE_STATX_ACLTYPE=1
+# The kernel fork also says in `stx_attributes` whether a file is on a
+# read-only mount (STATX_ATTR_RDONLY, set in `vfs_statx_path` in fs/stat.c
+# from `__mnt_is_readonly`), and the nightly kernel carries it, so the test
+# of it must run. A kernel that does not name the bit in
+# `stx_attributes_mask` turns CI red.
+export TRUENAS_ROS_REQUIRE_STATX_RDONLY=1
 # The kernel fork also says, when STATX_ACL is asked, whether a file has a
 # POSIX access ACL and a directory a default one, from the ACLs the inode
 # caches (`statx_posix_acls` in fs/stat.c), and the nightly kernel carries
