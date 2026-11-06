@@ -97,6 +97,9 @@ tn_bitflags! {
         /// The directory has a POSIX default ACL. TrueNAS kernels, asked
         /// with [`StatxMask::ACL`], see [`Statx::posix_default_acl`].
         ACL_DEFAULT = 0x0800_0000_0000_0000;
+        /// The file is on a read-only mount, the mount or its superblock
+        /// read only. TrueNAS kernels, see [`Statx::read_only`].
+        RDONLY = 0x1000_0000_0000_0000;
     }
 }
 
@@ -271,6 +274,17 @@ impl Statx {
         } else {
             AclType::Off
         })
+    }
+
+    /// Whether the file is on a read-only mount, as the mount or its
+    /// superblock is read only, such as a ZFS dataset with `readonly=on`,
+    /// which takes effect with no remount, or a snapshot, or `None` on a
+    /// kernel that does not say, which [`Statx::attributes_mask`] tells.
+    pub fn read_only(&self) -> Option<bool> {
+        let bit = StatxAttr::RDONLY;
+        self.attributes_mask()
+            .contains(bit)
+            .then(|| self.attributes().contains(bit))
     }
 
     /// Whether the file has a POSIX access ACL, one that says more than the
@@ -675,6 +689,26 @@ mod tests {
         assert_eq!(with(0x0200_0000_0000_0000, both), Some(AclType::Nfsv4));
         assert_eq!(with(0x0200_0000_0000_0000, 0x1000), None);
         assert_eq!(with(0, 0x0200_0000_0000_0000), None);
+    }
+
+    /// `include/uapi/linux/stat.h` of the kernel fork has STATX_ATTR_RDONLY
+    /// 0x1000000000000000, written out by hand. It is read only where the
+    /// mask of the attributes names it.
+    #[test]
+    fn the_read_only_bit_is_read_against_the_mask_of_the_attributes() {
+        let with = |attributes: u64, mask: u64| {
+            // SAFETY: `StatxRaw` is plain integers, for which all zero bits
+            // are a valid value.
+            let mut raw: StatxRaw = unsafe { std::mem::zeroed() };
+            raw.stx_attributes = attributes;
+            raw.stx_attributes_mask = mask;
+            Statx::from_raw(raw).read_only()
+        };
+        let bit = 0x1000_0000_0000_0000;
+        assert_eq!(with(bit, bit), Some(true));
+        assert_eq!(with(0, bit), Some(false));
+        assert_eq!(with(bit, 0x0300_0000_0000_0000), None);
+        assert_eq!(with(0, 0), None);
     }
 
     /// `include/uapi/linux/stat.h` of the kernel fork has STATX_ACL

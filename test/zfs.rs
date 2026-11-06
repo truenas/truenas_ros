@@ -1242,6 +1242,70 @@ fn statx_gives_the_acltype_of_the_dataset() {
     assert_eq!(nfs4_now, Some(AclType::Nfsv4));
 }
 
+/// The TrueNAS kernel says in `stx_attributes` whether a file is on a
+/// read-only mount (`STATX_ATTR_RDONLY`, set in `vfs_statx_path` in
+/// fs/stat.c from `__mnt_is_readonly`). ZFS sets the superblock read only
+/// for `readonly=on` with no remount (`readonly_changed_cb` in
+/// module/os/linux/zfs/zfs_vfsops.c) and mounts a snapshot read only, so a
+/// dataset of its own follows the property both ways at the next statx, a
+/// file in its snapshot is read only, and `/proc` is not.
+/// `TRUENAS_ROS_REQUIRE_STATX_RDONLY` turns a kernel that does not say into
+/// a failure.
+#[test]
+fn statx_says_whether_the_mount_is_read_only() {
+    let Some(nfs4) = nfs4_dir() else {
+        return skip("no NFSv4 dataset");
+    };
+    let read_only = |path: &Path| {
+        let f = std::fs::File::open(path).unwrap();
+        let mask = StatxMask::BASIC_STATS;
+        statx(f.as_fd(), "", AtFlags::AT_EMPTY_PATH, mask)
+            .unwrap()
+            .read_only()
+    };
+    let Some(shared) = read_only(&nfs4) else {
+        assert!(
+            std::env::var_os("TRUENAS_ROS_REQUIRE_STATX_RDONLY").is_none(),
+            "TRUENAS_ROS_REQUIRE_STATX_RDONLY is set but the kernel does not \
+             say whether {} is read only",
+            nfs4.display()
+        );
+        return;
+    };
+    assert!(!shared);
+    assert_eq!(read_only(Path::new("/proc/self/status")), Some(false));
+
+    // A dataset of its own, since readonly=on under the shared one would
+    // reach the other tests.
+    let Ok(ds) = std::env::var("TRUENAS_ROS_NFS4_DS") else {
+        return skip("TRUENAS_ROS_NFS4_DS unset");
+    };
+    let name = format!("rostest_rdonly_{}", std::process::id());
+    let child = format!("{ds}/{name}");
+    let zfs =
+        |args: &[&str]| std::process::Command::new("zfs").args(args).status();
+    let _ = zfs(&["destroy", "-r", &child]);
+    if !matches!(zfs(&["create", &child]), Ok(s) if s.success()) {
+        return skip("could not create a dataset (not root, or not ours)");
+    }
+    let dir = nfs4.join(&name);
+    let file = dir.join("f");
+    let made = std::fs::write(&file, b"f").is_ok();
+    let writable = read_only(&file);
+    let _ = zfs(&["set", "readonly=on", &child]);
+    let on = (read_only(&dir), read_only(&file));
+    let _ = zfs(&["set", "readonly=off", &child]);
+    let off = read_only(&file);
+    let _ = zfs(&["snapshot", &format!("{child}@ro")]);
+    let snapshot = read_only(&dir.join(".zfs/snapshot/ro/f"));
+    let _ = zfs(&["destroy", "-r", &child]);
+    assert!(made);
+    assert_eq!(writable, Some(false));
+    assert_eq!(on, (Some(true), Some(true)));
+    assert_eq!(off, Some(false));
+    assert_eq!(snapshot, Some(true));
+}
+
 /// The TrueNAS kernel says, when `STATX_ACL` is asked, whether a file has a
 /// POSIX access ACL and a folder a default one, from the ACLs the inode
 /// caches (`statx_posix_acls` in fs/stat.c, through `get_inode_acl`). Each
