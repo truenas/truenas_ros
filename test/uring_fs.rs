@@ -6626,6 +6626,54 @@ fn reopen_proc_allows_and_refuses_what_an_open_by_name_does_on_zfs() {
     });
 }
 
+/// `File::from_shared` makes a handle of the caller's own descriptor, with
+/// no `dup`: a read through it gives what was written, the number is the
+/// caller's, and the caller's clone is not the last while the handle lives
+/// and is once it drops, when `Arc::into_inner` gives the same descriptor.
+// Under `--cfg loom` the crate's `Arc` is loom's, which a std `Arc` is
+// not, and the loom lane runs no ring.
+#[cfg(not(loom))]
+#[test]
+fn from_shared_reads_through_the_callers_descriptor() {
+    use std::os::fd::AsRawFd;
+    use std::sync::Arc;
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        let anchor = Anchor::open(&dir).unwrap();
+        let f = h.open(me, &anchor, "f", creat_rw()).unwrap();
+        let (wrote, _) = pwrite1(&h, me, &f, b"shared".to_vec(), 0);
+        assert_eq!(wrote.unwrap(), 6);
+        let fd = f.into_fd().expect("nothing else holds it");
+        let raw = fd.as_raw_fd();
+        let kept = Arc::new(fd);
+        let shared = File::from_shared(Arc::clone(&kept));
+        assert_eq!(shared.as_raw_fd(), raw, "the caller's descriptor");
+        let (read, back) = pread1(&h, me, &shared, vec![0; 6], 0);
+        assert_eq!(read.unwrap(), 6);
+        assert_eq!(back, b"shared");
+        assert!(Arc::strong_count(&kept) > 1, "the handle holds a clone");
+        drop(shared);
+        let fd = Arc::into_inner(kept).expect("the caller's clone is the last");
+        assert_eq!(fd.as_raw_fd(), raw);
+    });
+}
+
+/// `File::into_shared` gives back the very `Arc` its handle holds, so a
+/// caller keeps the reactor's `Arc` rather than a second one.
+// Under `--cfg loom` the crate's `Arc` is loom's, which a std `Arc` is
+// not, and the loom lane runs no ring.
+#[cfg(not(loom))]
+#[test]
+fn into_shared_gives_the_arc_the_file_holds() {
+    use std::sync::Arc;
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        let anchor = Anchor::open(&dir).unwrap();
+        let f = h.open(me, &anchor, "f", creat_rw()).unwrap();
+        let kept = Arc::new(f.into_fd().expect("nothing else holds it"));
+        let back = File::from_shared(Arc::clone(&kept)).into_shared();
+        assert!(Arc::ptr_eq(&back, &kept), "the same Arc comes back");
+    });
+}
+
 /// `File::into_fd` gives the same `File` back while a clone holds it, and
 /// once the clone drops takes out the same descriptor, which then writes
 /// and reads as a `std::fs::File` the caller owns.

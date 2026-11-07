@@ -1132,7 +1132,10 @@ impl AsFd for Anchor {
 /// fd closes when the last clone - this handle plus any op still holding one --
 /// drops, which gives close-last ordering by construction; [`FsHandle::close`]
 /// simply drops the handle. Cheap to [`Clone`]. When nothing else holds it,
-/// [`File::into_fd`] takes the descriptor out instead.
+/// [`File::into_fd`] takes the descriptor out instead. A caller that shares
+/// the descriptor with state of its own makes a handle from its `Arc` with
+/// [`File::from_shared`] and takes the `Arc` back with
+/// [`File::into_shared`], so neither side pays a `dup`.
 #[derive(Clone)]
 pub struct File {
     pub(crate) fd: Arc<OwnedFd>,
@@ -1165,6 +1168,29 @@ impl File {
     /// submitted under. Deciding who may use the file is the caller's job.
     pub fn from_fd(fd: OwnedFd) -> File {
         File::new(Arc::new(fd))
+    }
+
+    /// Wrap a descriptor the caller shares, as one clone of the caller's
+    /// `Arc`, so the reactor's fd-based ops take it with no `dup` and the
+    /// caller keeps its own clone, as the crate makes an [`Anchor`] of a
+    /// shared descriptor.
+    ///
+    /// The descriptor carries the access it was opened with, as
+    /// [`File::from_fd`] says, and deciding who may use it is the caller's
+    /// job. It closes with the last clone, which may be an op's, since an op
+    /// in flight keeps its own until its completion reaps and its [`FsDone`]
+    /// keeps that clone until it drops. A caller that has to close it
+    /// somewhere else of its choosing takes it back from its own clone with
+    /// `Arc::into_inner` once that `FsDone` is gone.
+    pub fn from_shared(fd: Arc<OwnedFd>) -> File {
+        File::new(fd)
+    }
+
+    /// Give back the `Arc` this handle holds, whatever else holds it, so a
+    /// caller that keeps the descriptor in state of its own keeps the very
+    /// `Arc` the reactor opened it into rather than a second one.
+    pub fn into_shared(self) -> Arc<OwnedFd> {
+        self.fd
     }
 
     /// The underlying raw descriptor. It stays valid for at least this handle's
