@@ -70,9 +70,9 @@ pub struct ServerConfig {
     /// so size this against the deepest chain a handler submits times the
     /// connections that can be mid-chain, not against a file count.
     ///
-    /// Plain heap at 312 bytes a slot (pinned by `uring_fs`'s
+    /// Plain heap at 616 bytes a slot (pinned by `uring_fs`'s
     /// `op_entry_size` test), so this is the cheap axis to raise: 1024
-    /// slots is 312 KiB, 128K is 39 MiB. The server adds `pool_size`
+    /// slots is 616 KiB, 128K is 77 MiB. The server adds `pool_size`
     /// slots of its own on top, one per connection for the reply path's body
     /// reads, so a full pool of streaming bodies cannot exhaust the table out
     /// from under handler ops. Requires the `uring-fs` feature.

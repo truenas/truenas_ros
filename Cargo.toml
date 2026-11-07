@@ -304,6 +304,14 @@ path = "test/http_live.rs"
 name = "recv_alloc"
 path = "test/recv_alloc.rs"
 
+# Does an op a handler sends on a warm ring allocate more than its callback?
+# Its own binary because it counts through a global allocator. Skips when
+# io_uring is unavailable; TRUENAS_ROS_REQUIRE_IO_URING=1 makes that a hard
+# failure.
+[[test]]
+name = "op_alloc"
+path = "test/op_alloc.rs"
+
 # io_uring fs reactor. Live tests against a tempdir (opens, vectored I/O,
 # personality registration, fixed-slot lifecycle); skip automatically when
 # io_uring is unavailable (sandbox/old kernel). Set
