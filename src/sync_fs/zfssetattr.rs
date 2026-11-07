@@ -156,6 +156,16 @@ impl ZfsSetattr {
     /// order of this machine, with no ACL after it.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(SIZE);
+        self.write_into(&mut v);
+        v
+    }
+
+    /// Write the value [`to_bytes`](Self::to_bytes) gives into `v`, in
+    /// place of whatever `v` held, so a caller that keeps one buffer for
+    /// its sets allocates nothing once that buffer has held a value.
+    pub fn write_into(&self, v: &mut Vec<u8>) {
+        v.clear();
+        v.reserve(SIZE);
         v.extend_from_slice(&VERSION.to_ne_bytes());
         v.extend_from_slice(&(SIZE as u32).to_ne_bytes());
         v.extend_from_slice(&self.valid.to_ne_bytes());
@@ -170,7 +180,6 @@ impl ZfsSetattr {
         v.extend_from_slice(&self.dos_clear.to_ne_bytes());
         // zsa_acl_len, zsa_flags and the five reserved words stay 0.
         v.resize(SIZE, 0);
-        v
     }
 }
 
@@ -242,5 +251,23 @@ mod tests {
         // 0400, then the mask 07777.
         assert_eq!(&bytes[0x10..0x18], &[0x00, 0x01, 0, 0, 0xff, 0x0f, 0, 0]);
         assert!(bytes[0x18..].iter().all(|&b| b == 0), "{bytes:02x?}");
+    }
+
+    /// [`ZfsSetattr::write_into`] writes the bytes `to_bytes` gives over a
+    /// buffer that held more, and keeps that buffer's storage.
+    #[test]
+    fn write_into_reuses_the_buffer_it_is_given() {
+        let set = ZfsSetattr::new()
+            .uid(1000)
+            .atime(SetTime::Now)
+            .mtime(SetTime::At(StatxTimestamp { sec: 5, nsec: 6 }));
+        let mut kept = vec![0xa5; SIZE + 50];
+        let storage = kept.as_ptr();
+        set.write_into(&mut kept);
+        assert_eq!(kept, set.to_bytes());
+        assert_eq!(kept.as_ptr(), storage, "the same storage");
+        ZfsSetattr::new().write_into(&mut kept);
+        assert_eq!(kept, ZfsSetattr::new().to_bytes());
+        assert_eq!(kept.as_ptr(), storage, "the same storage again");
     }
 }
