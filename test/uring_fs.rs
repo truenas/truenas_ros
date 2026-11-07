@@ -6626,6 +6626,25 @@ fn reopen_proc_allows_and_refuses_what_an_open_by_name_does_on_zfs() {
     });
 }
 
+/// A path too long for the name an op slot holds, 255 bytes with its NUL,
+/// still opens, through a copy the op owns.
+#[test]
+fn an_open_of_a_path_longer_than_the_slot_holds_still_opens() {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        let folder = "d".repeat(200);
+        std::fs::create_dir(dir.join(&folder)).unwrap();
+        let path = format!("{folder}/{}", "f".repeat(100));
+        std::fs::write(dir.join(&path), b"far").unwrap();
+        assert!(path.len() > 256, "longer than the slot holds");
+        let anchor = Anchor::open(&dir).unwrap();
+        let how = OpenHow::new().flags(OFlag::O_RDONLY);
+        let f = h.open(me, &anchor, path.as_str(), how).expect("it opens");
+        let (read, back) = pread1(&h, me, &f, vec![0; 3], 0);
+        assert_eq!(read.unwrap(), 3);
+        assert_eq!(back, b"far");
+    });
+}
+
 /// `File::from_shared` makes a handle of the caller's own descriptor, with
 /// no `dup`: a read through it gives what was written, the number is the
 /// caller's, and the caller's clone is not the last while the handle lives

@@ -1031,6 +1031,12 @@ impl<'a> Leaf<'a> {
     pub(crate) fn to_cstring(self) -> CString {
         CString::new(self.0).expect("validated: no interior NUL")
     }
+
+    /// The component's bytes, with no NUL, for an op that copies them into
+    /// its slot rather than allocating a `CString`.
+    pub(crate) fn as_bytes(&self) -> &'a [u8] {
+        self.0
+    }
 }
 
 /// A long-lived **real** directory fd that anchors every path resolution.
