@@ -351,9 +351,12 @@ const NAME_ROOM: usize = 256;
 struct FsOpEntry {
     state: FsOpState,
     waiter: Option<FsWaiter>,
-    /// Owned data buffers: `READV` destinations / `WRITEV` sources, and the
-    /// single value buffer of an `FGETXATTR`/`FSETXATTR`.
+    /// Owned data buffers: `READV` destinations / `WRITEV` sources.
     bufs: Vec<Vec<u8>>,
+    /// The value buffer of an `FGETXATTR`, an `FSETXATTR` or a `GETXATTR`
+    /// through `/proc`, on its own so the op builds no outer `Vec` for it.
+    /// An `FGETXATTR`'s kernel writes land in it at issue time.
+    value: Option<Vec<u8>>,
     /// The iovec array the SQE points at. Element pointers target `bufs`'
     /// heap allocations, which never move while parked here.
     iov: Vec<libc::iovec>,
@@ -658,6 +661,7 @@ impl FsOpEntry {
             state: FsOpState::Free,
             waiter: None,
             bufs: Vec::new(),
+            value: None,
             iov: Vec::new(),
             path: None,
             name: [0; NAME_ROOM],
@@ -694,6 +698,7 @@ impl FsOpEntry {
         // this table should have to re-establish.
         self.waiter = None;
         self.bufs = Vec::new();
+        self.value = None;
         self.stat = None;
         self.strip_nonblock = false;
         self.iov.clear();
@@ -789,6 +794,7 @@ fn strip_guard_nonblock(fd: RawFd, flags: u64) {
 struct Completed {
     waiter: Option<FsWaiter>,
     bufs: Vec<Vec<u8>>,
+    value: Option<Vec<u8>>,
     stat: Option<Box<StatxRaw>>,
     /// The op's `ECANCELED` was a retraction the caller asked for.
     retracted: bool,
@@ -2549,11 +2555,11 @@ impl FsCore {
         } else {
             0
         };
-        // The value rides in `bufs` so it round-trips like any data buffer
-        // (an FGETXATTR's kernel writes land in it at issue time).
-        e.bufs = vec![value];
+        // The value rides alone, with no outer `Vec`, and comes back
+        // through `FsDone::into_value` (an FGETXATTR's kernel writes land
+        // in it at issue time).
         let name_ptr = e.path.as_ref().map_or(0, |n| n.as_ptr() as u64);
-        let val = &mut e.bufs[0];
+        let val = e.value.insert(value);
         let val_ptr = val.as_mut_ptr() as u64;
         let val_len = val.len() as u32;
 
@@ -3086,6 +3092,7 @@ impl FsCore {
         let Completed {
             waiter,
             bufs,
+            value,
             stat,
             strip_nonblock,
             retracted,
@@ -3183,6 +3190,7 @@ impl FsCore {
         }
         match waiter {
             Some(FsWaiter::Channel(tx)) => {
+                let bufs = with_value(bufs, value);
                 let _ = tx.send(FsOutcome::new(result, bufs, file, stat));
                 ReapedFs::None
             }
@@ -3192,6 +3200,7 @@ impl FsCore {
                     result,
                     refused,
                     bufs,
+                    value,
                     file: file.map(File::new),
                     stat,
                     #[cfg(feature = "net-server")]
@@ -3206,6 +3215,7 @@ impl FsCore {
                     result,
                     refused,
                     bufs,
+                    value,
                     file: file.map(File::new),
                     stat,
                     #[cfg(feature = "net-server")]
@@ -3237,7 +3247,11 @@ impl FsCore {
         #[cfg(feature = "net-server")]
         let lease_want = done.lease_want;
         let Completed {
-            waiter, bufs, stat, ..
+            waiter,
+            bufs,
+            value,
+            stat,
+            ..
         } = done;
         // A short leased write is unrecoverable on this path too, and the
         // reason does not soften at teardown: the source was the
@@ -3275,7 +3289,7 @@ impl FsCore {
         };
         // Teardown, not a refusal: the loop is dying, so nothing here is
         // worth retrying and `ECANCELED` is the honest answer.
-        deliver(waiter, res, bufs, file, stat);
+        deliver(waiter, res, with_value(bufs, value), file, stat);
     }
 
     /// Leak the op table without dropping it - used ONLY when a teardown
@@ -3415,6 +3429,7 @@ impl FsCore {
         let done = Completed {
             waiter: e.waiter.take(),
             bufs: std::mem::take(&mut e.bufs),
+            value: e.value.take(),
             stat: e.stat.take(),
             retracted: e.retracted,
             guard: e.guard.take(),
@@ -3492,6 +3507,7 @@ impl FsCore {
                         result: Err(err),
                         refused: marked,
                         bufs,
+                        value: None,
                         file: file.map(File::new),
                         stat: None,
                         #[cfg(feature = "net-server")]
@@ -3536,7 +3552,7 @@ impl FsCore {
         let entry = &mut self.ops[op_slot as usize];
         let e = &mut entry.state;
         let waiter = e.waiter.take();
-        let bufs = std::mem::take(&mut e.bufs);
+        let bufs = with_value(std::mem::take(&mut e.bufs), e.value.take());
         // Taken out before `clear`, for the same reason the buffers are:
         // the caller surrendered its `File` to this submission, so
         // dropping the parked `Arc` here closes the descriptor of a
@@ -3573,6 +3589,8 @@ pub struct FsDone {
     /// [`FsDone::was_refused`].
     refused: bool,
     bufs: Vec<Vec<u8>>,
+    /// An xattr op's value, which [`FsDone::into_value`] gives back alone.
+    value: Option<Vec<u8>>,
     file: Option<File>,
     stat: Option<Box<StatxRaw>>,
     /// The recv-pool buffer id a leased write borrowed, owed back to the
@@ -3631,6 +3649,7 @@ impl FsDone {
             result: Err(err),
             refused: false,
             bufs: Vec::new(),
+            value: None,
             file: None,
             stat: None,
             #[cfg(feature = "net-server")]
@@ -3661,6 +3680,7 @@ impl FsDone {
             result: Err(err),
             refused: true,
             bufs,
+            value: None,
             file: None,
             stat: None,
             #[cfg(feature = "net-server")]
@@ -3714,9 +3734,22 @@ impl FsDone {
         self.file.clone()
     }
 
-    /// Take the op's buffers back (read destinations / xattr value).
+    /// Take the op's buffers back (read destinations / xattr value). An
+    /// xattr op's value comes back as the one buffer, in an outer `Vec`
+    /// built here for it, which [`into_value`](FsDone::into_value) spares.
     pub fn into_bufs(self) -> Vec<Vec<u8>> {
-        self.bufs
+        with_value(self.bufs, self.value)
+    }
+
+    /// Take back the value buffer of an xattr op, the one an `fsetxattr`
+    /// set or an `fgetxattr` read into, with no outer `Vec` around it, so a
+    /// caller that keeps its buffers allocates nothing to have one back. A
+    /// refused xattr op gives its value back here too.
+    pub fn into_value(self) -> Vec<u8> {
+        let FsDone {
+            value, mut bufs, ..
+        } = self;
+        value.or_else(|| bufs.pop()).unwrap_or_default()
     }
 
     /// Whether this errno is **this crate's**, not the kernel's: the op
@@ -8354,6 +8387,16 @@ fn map_res(res: i32) -> Result<i32, Errno> {
 /// here - `on_cqe` wraps its fd in an `Arc<OwnedFd>`, and a gone receiver
 /// drops that `Arc`, which closes the fd. No close op is staged, and there is
 /// no slot to leak.)
+/// The buffers of an op with its xattr value, if it has one, as the one
+/// buffer, for the outcomes that carry no value of their own: the blocking
+/// path's, a refusal's and the teardown drain's.
+fn with_value(bufs: Vec<Vec<u8>>, value: Option<Vec<u8>>) -> Vec<Vec<u8>> {
+    match value {
+        Some(value) => vec![value],
+        None => bufs,
+    }
+}
+
 fn deliver(
     waiter: Option<FsWaiter>,
     res: Result<i32, Errno>,
@@ -8498,8 +8541,8 @@ mod op_entry_size {
     /// work out the default's resident cost against the ring's locked-memory
     /// one.
     ///
-    /// It measures 560 bytes, 592 under `net-server`: the default
-    /// 32768-slot table is 17.5 MiB, 18.5 MiB with the server. The bytes of
+    /// It measures 584 bytes, 616 under `net-server`: the default
+    /// 32768-slot table is 18.25 MiB, 19.25 MiB with the server. The bytes of
     /// a name and the `open_how` the kernel reads at prep are most of it,
     /// kept in the slot so an op allocates nothing for them. Pinned
     /// loosely, because the point is that the figure is re-derived when the
@@ -8510,10 +8553,38 @@ mod op_entry_size {
     fn the_op_slot_is_the_size_the_config_docs_quote() {
         let n = size_of::<SlotEntry<FsOpEntry>>();
         assert!(
-            (552..=600).contains(&n),
-            "an op slot is {n} bytes; `FsConfig`'s rustdoc quotes 560 (592 \
+            (576..=624).contains(&n),
+            "an op slot is {n} bytes; `FsConfig`'s rustdoc quotes 584 (616 \
              with `net-server`) - re-derive the default's resident cost there"
         );
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod fs_done_tests {
+    use super::{Errno, FsDone};
+
+    /// An xattr op's value comes back alone through `into_value`, the very
+    /// storage it was given, and as the one buffer through `into_bufs`. A
+    /// refusal, which hands the value back among its buffers, gives it
+    /// through `into_value` too.
+    #[test]
+    fn into_value_gives_an_xattr_value_back_alone() {
+        let value = vec![1, 2, 3];
+        let storage = value.as_ptr();
+        let done = FsDone {
+            value: Some(value),
+            ..FsDone::failed(Errno::EIO)
+        };
+        let back = done.into_value();
+        assert_eq!(back.as_ptr(), storage, "the same storage");
+        let done = FsDone {
+            value: Some(back),
+            ..FsDone::failed(Errno::EIO)
+        };
+        assert_eq!(done.into_bufs(), vec![vec![1, 2, 3]]);
+        let refused = FsDone::refused_with(Errno::EBUSY, vec![vec![4]]);
+        assert_eq!(refused.into_value(), vec![4]);
     }
 }
 
