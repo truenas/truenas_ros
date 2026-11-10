@@ -61,6 +61,7 @@ poll loop), so no handler is ever installed and the reactors never see one.
 forked before the daemon starts threads and so has to be chosen deliberately.
 
 `uring-fs` covers opens, vectored positional I/O (`preadv2` / `pwritev2`),
+a positional read into the spare room of one buffer (`pread_spare`),
 `splice` from a pipe into a file, sync, the metadata and extended-attribute
 ops, cache advice (`fadvise`), the directory-entry family, and directory
 listing and subtree walks - off-loop through a blocking handle, or on the

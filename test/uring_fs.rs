@@ -55,12 +55,13 @@ fn fd_xattr_ok<T>(what: &str, res: &Result<T, Error>) -> bool {
     res.is_ok()
 }
 
-/// Single-buffer read, over the reactor's only read op.
+/// Single-buffer read into a buffer the caller filled first, over the
+/// vectored, flagged form.
 ///
-/// `uring_fs` exposes just the vectored, flagged forms - one shape to learn
-/// and one to audit - so the many tests that read a single buffer wrap it
-/// here rather than repeating `vec![..]` and `RwFlags::empty()` and then
-/// indexing the result.
+/// The many tests that read a single buffer wrap `preadv2` here rather than
+/// repeating `vec![..]` and `RwFlags::empty()` and then indexing the result.
+/// A read into the room past a buffer's length is `FsHandle::pread_spare`,
+/// which takes one buffer already.
 fn pread1(
     h: &FsHandle,
     who: Personality,
@@ -320,6 +321,93 @@ fn round_trip_write_fsync_read() {
         assert_eq!(n.expect("pread"), 5);
         assert_eq!(&buf, b"world");
         h.close(f).expect("close 2");
+    });
+}
+
+/// A read into spare room lands straight after what the buffer holds, in
+/// the same storage, and comes back short at the end of the file. A count
+/// past the room, the offset io_uring reads as the file's position, and a
+/// read the kernel refuses each hand the buffer back as it came.
+#[test]
+fn a_read_into_spare_room_keeps_what_the_buffer_holds() {
+    with_fs(test_cfg(), |h, me, dir, _stop| {
+        std::fs::write(dir.join("f"), b"hello world").unwrap();
+        let anchor = Anchor::open(dir.as_path()).expect("anchor");
+        let f = h.open(me, &anchor, "f", rdonly()).expect("open");
+        let mut buf = Vec::with_capacity(32);
+        buf.extend_from_slice(b"head");
+        let storage = buf.as_ptr();
+        let flags = RwFlags::empty();
+        let (n, buf) = h.pread_spare(me, &f, buf, 11, 0, flags);
+        assert_eq!(n.expect("read"), 11);
+        assert_eq!(buf, b"headhello world");
+        assert_eq!(buf.as_ptr(), storage, "the same storage, never grown");
+
+        let (n, buf) = h.pread_spare(me, &f, buf, 10, 6, flags);
+        assert_eq!(n.expect("a short read at the end"), 5);
+        assert_eq!(buf, b"headhello worldworld");
+
+        // Two bytes are left at 9, fewer than the room, so only the screen
+        // stops this.
+        let room = buf.capacity() - buf.len();
+        let (n, buf) = h.pread_spare(me, &f, buf, room + 1, 9, flags);
+        assert!(matches!(n, Err(Error::Errno(Errno::EINVAL))), "{n:?}");
+        assert_eq!(buf, b"headhello worldworld");
+
+        let (n, buf) = h.pread_spare(me, &f, buf, 4, u64::MAX, flags);
+        assert!(matches!(n, Err(Error::Errno(Errno::EINVAL))), "{n:?}");
+        assert_eq!(buf, b"headhello worldworld");
+        h.close(f).expect("close");
+
+        let how = OpenHow::new().flags(OFlag::O_WRONLY);
+        let w = h.open(me, &anchor, "f", how).expect("open for writing");
+        let (n, buf) = h.pread_spare(me, &w, buf, 4, 0, flags);
+        assert!(matches!(n, Err(Error::Errno(Errno::EBADF))), "{n:?}");
+        assert_eq!(buf, b"headhello worldworld");
+        assert_eq!(buf.as_ptr(), storage);
+        h.close(w).expect("close");
+    });
+}
+
+/// With both slots of a two-slot table held by parked reads, a read into
+/// spare room is refused with `EBUSY` and hands its buffer back as it came.
+#[test]
+fn a_read_into_spare_room_on_a_full_table_hands_its_buffer_back() {
+    let mut cfg = test_cfg();
+    cfg.ops = 2;
+    with_fs(cfg, |h, me, dir, _stop| {
+        mkfifo(&dir, "fifo");
+        std::fs::write(dir.join("f"), b"bytes").unwrap();
+        let anchor = Anchor::open(dir.as_path()).unwrap();
+        let f = h.open(me, &anchor, "f", rdonly()).expect("open f");
+        // O_RDWR on a FIFO opens at once with a writer attached, so a read
+        // with no data parks and holds its slot.
+        let how = OpenHow::new().flags(OFlag::O_RDWR);
+        let fifo = h.open(me, &anchor, "fifo", how).expect("open fifo");
+        let park = || {
+            h.start_preadv2(me, &fifo, vec![vec![0u8; 4]], 0, RwFlags::empty())
+                .expect("start readv")
+        };
+        let (first, second) = (park(), park());
+        let mut buf = Vec::with_capacity(8);
+        buf.push(b'h');
+        let (n, buf) = h.pread_spare(me, &f, buf, 5, 0, RwFlags::empty());
+        assert!(matches!(n, Err(Error::Errno(Errno::EBUSY))), "{n:?}");
+        assert_eq!(buf, b"h");
+        assert_eq!(buf.capacity(), 8);
+
+        let path = dir.join("fifo");
+        let writer = thread::spawn(move || {
+            use std::io::Write;
+            let mut w =
+                std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            w.write_all(b"one two ").unwrap();
+        });
+        for pending in [first, second] {
+            let (res, _) = pending.wait();
+            assert_eq!(res.expect("a parked read completes"), 4);
+        }
+        writer.join().unwrap();
     });
 }
 

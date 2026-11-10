@@ -75,8 +75,9 @@ tn_bitflags! {
         /// empty claim. What does not hold is the expectation that an
         /// outstanding read costs the pool nothing.
         RECV = 0x02;
-        /// `READV` - the file-body pump read, and a consumer's own reads
-        /// through the fs reactor.
+        /// `READV` and `READ` - the file-body pump read, and a consumer's own
+        /// reads through the fs reactor, into the length of its buffers or
+        /// the room past it.
         READ = 0x04;
         /// `WRITEV` - a leased upload window and a consumer's own writes
         /// through the fs reactor.

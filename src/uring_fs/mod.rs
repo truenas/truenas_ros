@@ -1319,6 +1319,18 @@ pub(crate) enum FsInject {
         rw_flags: u32,
         reply: ReplyTo,
     },
+    /// A read into the room past the length of one buffer
+    /// ([`FsHandle::pread_spare`]).
+    ReadSpare {
+        pers: u16,
+        file: Arc<OwnedFd>,
+        buf: Vec<u8>,
+        count: usize,
+        off: u64,
+        /// `RWF_*`, as for [`FsInject::Rw`].
+        rw_flags: u32,
+        reply: ReplyTo,
+    },
     Fsync {
         pers: u16,
         file: Arc<OwnedFd>,
@@ -1715,9 +1727,12 @@ impl FsHandle {
     /// filesystem actually implements; an unsupported flag fails the read
     /// with `EOPNOTSUPP` rather than being quietly ignored, so support is
     /// discoverable per call. Pass [`RwFlags::empty()`] for plain `preadv(2)`
-    /// behaviour, and a one-element `bufs` for a single-buffer read - this is
-    /// the whole read surface, so there is one shape to learn and one to
-    /// audit.
+    /// behaviour, and a one-element `bufs` for a single-buffer read.
+    ///
+    /// The read surface has two shapes. This one reads into buffers the
+    /// caller sized and filled first. [`pread_spare`](Self::pread_spare)
+    /// reads into the spare capacity of one buffer, past what it holds, for
+    /// a caller that would otherwise zero the room before every read.
     pub fn preadv2(
         &self,
         who: Personality,
@@ -1727,6 +1742,53 @@ impl FsHandle {
         flags: RwFlags,
     ) -> (crate::Result<usize>, Vec<Vec<u8>>) {
         self.rw(core::TAG_READV, who, f, bufs, off, flags)
+    }
+
+    /// Positional read as `who` of up to `count` bytes at `off` into the
+    /// room past the length of `buf`, with the flags of
+    /// [`preadv2`](Self::preadv2), so nothing is zeroed first. Returns the
+    /// byte count, short only at end-of-file, and the same `buf`, its
+    /// length grown by that count, or unchanged on a failure.
+    ///
+    /// A `count` past `buf`'s spare capacity or past `u32::MAX`, and an
+    /// `off` of `u64::MAX`, are refused with `EINVAL` before anything is
+    /// submitted: the buffer is never grown, which would allocate and move
+    /// it, and io_uring reads `u64::MAX` as the file's position
+    /// (`io_kiocb_update_pos`, `io_uring/rw.c`).
+    pub fn pread_spare(
+        &self,
+        who: Personality,
+        f: &File,
+        buf: Vec<u8>,
+        count: usize,
+        off: u64,
+        flags: RwFlags,
+    ) -> (crate::Result<usize>, Vec<u8>) {
+        let (tx, rx) = mpsc::channel();
+        let sent = self.send(FsInject::ReadSpare {
+            pers: who.0,
+            file: f.fd.clone(),
+            buf,
+            count,
+            off,
+            rw_flags: flags.bits(),
+            reply: ReplyTo::Sync(tx),
+        });
+        if let Err(msg) = sent {
+            // Loop gone: the buffer comes back, as from `rw`.
+            let buf = match msg {
+                FsInject::ReadSpare { buf, .. } => buf,
+                _ => Vec::new(),
+            };
+            return (Err(Errno::ECONNABORTED.into()), buf);
+        }
+        match rx.recv() {
+            Ok(mut out) => (
+                out.res.map(|n| n as usize).map_err(Into::into),
+                out.bufs.pop().unwrap_or_default(),
+            ),
+            Err(_) => (Err(Errno::ECONNABORTED.into()), Vec::new()),
+        }
     }
 
     /// Vectored positional write as `who` - `pwritev2(2)` semantics: write
