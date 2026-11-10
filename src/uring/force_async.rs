@@ -37,10 +37,16 @@ tn_bitflags! {
     ///   is punted anyway: the flag removes the inline attempt that was
     ///   going to answer `-EAGAIN`, and nothing else.
     ///
-    /// Depth does not come with it. io-wq runs a regular file's writes one
-    /// at a time per inode - `WRITEV` is `.hash_reg_file`
-    /// (`io_uring/opdef.c`), hashed in `io_prep_async_work` - so
-    /// [`Self::WRITE`] changes where a write starts, never how many run.
+    /// Depth comes with it for reads and not for writes. The flag marks the
+    /// work concurrent (`IO_WQ_WORK_CONCURRENT`, set in
+    /// `io_prep_async_work`, `io_uring/io_uring.c`), and io-wq starts
+    /// another worker for concurrent work even while one is running, where
+    /// other work waits for a worker to come free (`io_wq_enqueue`,
+    /// `io_uring/io-wq.c`). So [`Self::READ`] lets reads of one file run on
+    /// several workers at once. A regular file's writes still run one at a
+    /// time per inode - `WRITEV` is `.hash_reg_file` (`io_uring/opdef.c`),
+    /// hashed in `io_prep_async_work` - so [`Self::WRITE`] changes where a
+    /// write starts, never how many run.
     pub struct ForceAsync: u8 {
         /// `SEND` and `SENDMSG` on a connection's socket.
         ///
