@@ -36,7 +36,7 @@ use truenas_ros::net::server::{
 };
 use truenas_ros::sync_fs::{AtFlags, OFlag, OpenHow, StatxMask};
 use truenas_ros::uring_fs::{
-    Anchor, File, FsDone, Leaf, Personality, ReopenAccess,
+    Anchor, File, FsDone, Leaf, Personality, ReopenAccess, RwFlags,
 };
 use truenas_ros::{Errno, Error};
 
@@ -117,7 +117,7 @@ fn recv_framed(s: &mut TcpStream) -> io::Result<Vec<u8>> {
 /// The ops counted, in the order a pass reports them, with the
 /// allocations each may make: its callback's box, and a statx's box for
 /// its result besides.
-const OPS: [(&str, usize); 7] = [
+const OPS: [(&str, usize); 8] = [
     ("a reopen through /proc", 1),
     ("an open of a name", 1),
     ("an open of ..", 1),
@@ -125,13 +125,14 @@ const OPS: [(&str, usize); 7] = [
     ("an fstatx", 2),
     ("a read of an xattr through /proc", 1),
     ("an fsetxattr", 1),
+    ("a read into spare room", 1),
 ];
 
 /// What one pass gathers until its last op answers.
 struct Pass {
     counts: RefCell<Vec<usize>>,
-    /// Whether each xattr op gave back the very buffer it was handed,
-    /// through `FsDone::into_value`.
+    /// Whether each xattr op and the read into spare room gave back the
+    /// very buffer it was handed, through `FsDone::into_value`.
     same_value: RefCell<Vec<bool>>,
     left: Cell<usize>,
     deferred: RefCell<Option<Deferred>>,
@@ -139,7 +140,7 @@ struct Pass {
 
 impl Pass {
     /// One op answered. The last one replies with the counts, then a byte
-    /// for each xattr op that gave its buffer back.
+    /// for each op that gave its buffer back.
     fn answered(&self) {
         self.left.set(self.left.get() - 1);
         if self.left.get() > 0 {
@@ -161,10 +162,11 @@ impl Pass {
 const XATTR: &CStr = c"user.alloc";
 
 /// A reopen, an open of a name, an open of `..`, a statx of a name, an
-/// `fstatx`, a read of an xattr through `/proc` and an `fsetxattr` with a
-/// buffer the handler keeps allocate nothing on a warm ring but the box of
-/// their callback, and each statx the box of its result. An xattr op gives
-/// its buffer back through `FsDone::into_value` with no outer `Vec`.
+/// `fstatx`, a read of an xattr through `/proc`, an `fsetxattr` and a read
+/// into spare room with a buffer the handler keeps allocate nothing on a
+/// warm ring but the box of their callback, and each statx the box of its
+/// result. An xattr op and the read give their buffer back through
+/// `FsDone::into_value` with no outer `Vec`.
 #[test]
 fn a_warm_rings_ops_allocate_only_their_callback() {
     let dir = truenas_ros::tempdir().unwrap();
@@ -201,7 +203,7 @@ fn a_warm_rings_ops_allocate_only_their_callback() {
         let who = *pc.get().expect("personality set before serving");
         let pass = Rc::new(Pass {
             counts: RefCell::new(Vec::with_capacity(OPS.len())),
-            same_value: RefCell::new(Vec::with_capacity(2)),
+            same_value: RefCell::new(Vec::with_capacity(3)),
             left: Cell::new(OPS.len()),
             deferred: RefCell::new(Some(deferred)),
         });
@@ -246,8 +248,13 @@ fn a_warm_rings_ops_allocate_only_their_callback() {
         let n = counted(|| fs.fgetxattr_proc(who, f, XATTR, buf, cb));
         pass.counts.borrow_mut().push(n);
         let value = b"other".to_vec();
-        let (f, cb) = (file, gave_back(&pass, value.as_ptr()));
+        let (f, cb) = (file.clone(), gave_back(&pass, value.as_ptr()));
         let n = counted(|| fs.fsetxattr(who, f, XATTR, value, 0, cb));
+        pass.counts.borrow_mut().push(n);
+        let room = Vec::with_capacity(64);
+        let (f, cb) = (file, gave_back(&pass, room.as_ptr()));
+        let empty = RwFlags::empty();
+        let n = counted(|| fs.pread_spare(who, f, room, 5, 0, empty, cb));
         pass.counts.borrow_mut().push(n);
         Response::Defer(permit)
     };
@@ -290,12 +297,12 @@ fn a_warm_rings_ops_allocate_only_their_callback() {
     });
     server.serve_forever().expect("serve_forever");
     let reply = client.join().unwrap().expect("client io");
-    assert_eq!(reply.len(), OPS.len() * 4 + 2, "{reply:?}");
+    assert_eq!(reply.len(), OPS.len() * 4 + 3, "{reply:?}");
     for (i, (what, most)) in OPS.iter().enumerate() {
         let at = i * 4;
         let n = u32::from_be_bytes(reply[at..at + 4].try_into().unwrap());
         assert_eq!(n as usize, *most, "{what} allocated {n} times");
     }
     let gave = &reply[OPS.len() * 4..];
-    assert_eq!(gave, [1, 1], "an xattr op gives back its own buffer");
+    assert_eq!(gave, [1, 1, 1], "each gives back its own buffer");
 }

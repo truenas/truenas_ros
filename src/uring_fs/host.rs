@@ -415,6 +415,24 @@ impl UringFs {
                     rw_flags,
                     FsWaiter::Channel(reply),
                 ),
+                FsInject::ReadSpare {
+                    pers,
+                    file,
+                    buf,
+                    count,
+                    off,
+                    rw_flags,
+                    reply,
+                } => self.fs.submit_read_spare(
+                    &mut self.eng,
+                    pers,
+                    file,
+                    buf,
+                    count,
+                    off,
+                    rw_flags,
+                    FsWaiter::Channel(reply),
+                ),
                 FsInject::Fsync {
                     pers,
                     file,
@@ -557,6 +575,9 @@ impl UringFs {
             let (reply, bufs) = match msg {
                 FsInject::Open { reply, .. } => (Some(reply), Vec::new()),
                 FsInject::Rw { reply, bufs, .. } => (Some(reply), bufs),
+                FsInject::ReadSpare { reply, buf, .. } => {
+                    (Some(reply), vec![buf])
+                }
                 // The pooled lease rides inside `reply` and round-trips (or
                 // returns to the pool) via `ReplyTo::send`.
                 // A late cancel request for an op that is being torn down

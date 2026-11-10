@@ -39,10 +39,10 @@ use crate::uring::sys::{
     IORING_FSYNC_DATASYNC, IORING_OP_ASYNC_CANCEL, IORING_OP_FADVISE,
     IORING_OP_FALLOCATE, IORING_OP_FGETXATTR, IORING_OP_FSETXATTR,
     IORING_OP_FSYNC, IORING_OP_FTRUNCATE, IORING_OP_GETXATTR, IORING_OP_LINKAT,
-    IORING_OP_MKDIRAT, IORING_OP_OPENAT2, IORING_OP_READV, IORING_OP_RENAMEAT,
-    IORING_OP_SPLICE, IORING_OP_STATX, IORING_OP_SYMLINKAT, IORING_OP_TIMEOUT,
-    IORING_OP_UNLINKAT, IORING_OP_WRITEV, IOSQE_ASYNC, IOSQE_BUFFER_SELECT,
-    IoUringCqe, SPLICE_F_MOVE,
+    IORING_OP_MKDIRAT, IORING_OP_OPENAT2, IORING_OP_READ, IORING_OP_READV,
+    IORING_OP_RENAMEAT, IORING_OP_SPLICE, IORING_OP_STATX, IORING_OP_SYMLINKAT,
+    IORING_OP_TIMEOUT, IORING_OP_UNLINKAT, IORING_OP_WRITEV, IOSQE_ASYNC,
+    IOSQE_BUFFER_SELECT, IoUringCqe, SPLICE_F_MOVE,
 };
 use crate::uring::user_data::{pack_raw, unpack_raw};
 use std::any::Any;
@@ -137,6 +137,11 @@ pub(crate) const TAG_OPEN_DEADLINE: u8 = 0x93;
 /// `/proc/thread-self/fd`, which takes a file opened `O_PATH`. It is staged
 /// as an fd op, with the path built from the file's descriptor.
 pub(crate) const TAG_GETXATTR_PROC: u8 = 0x94;
+/// `READ` into the room past the length of one buffer
+/// ([`FsConn::pread_spare`]). The buffer rides in the slot's `value`, as an
+/// xattr op's does, and [`FsCore::on_cqe`] grows its length by what the
+/// kernel wrote.
+pub(crate) const TAG_READ_SPARE: u8 = 0x95;
 /// The standalone host's wake tag (an embedded host reuses its own).
 pub(crate) const TAG_WAKE: u8 = 0x9D;
 /// Tags `ASYNC_CANCEL` ops (and the teardown drain); completions ignored.
@@ -1688,6 +1693,71 @@ impl FsCore {
         }
     }
 
+    /// Stage one `READ` of up to `count` bytes of `file` at `off` into the
+    /// room past the length of `buf`, which the slot keeps in its `value`
+    /// until the CQE, where [`FsCore::on_cqe`] grows the length by what the
+    /// kernel wrote. `IORING_OP_READ` takes the address and the count
+    /// itself (`io_prep_read`, `io_uring/rw.c`), so the slot builds no
+    /// iovec.
+    ///
+    /// Refused with a marked `EINVAL` before a slot is taken whenever
+    /// [`spare_read_fits`] says no, with `buf` handed back as it came.
+    #[allow(clippy::too_many_arguments)] // an inject unpacked, not an API
+    pub(crate) fn submit_read_spare(
+        &mut self,
+        eng: &mut Engine,
+        pers: u16,
+        file: Arc<OwnedFd>,
+        buf: Vec<u8>,
+        count: usize,
+        off: u64,
+        rw_flags: u32,
+        waiter: FsWaiter,
+    ) {
+        if !spare_read_fits(buf.capacity() - buf.len(), count, off) {
+            let (bufs, file) = (vec![buf], Some(file));
+            self.refuse(eng, waiter, Errno::EINVAL, true, bufs, file);
+            return;
+        }
+        let Some(op_slot) = self.pop_op() else {
+            let (bufs, file) = (vec![buf], Some(file));
+            self.refuse(eng, waiter, Errno::EBUSY, true, bufs, file);
+            return;
+        };
+
+        let raw_fd = file.as_raw_fd();
+        let entry = &mut self.ops[op_slot as usize];
+        let gen32 = entry.generation as u32;
+        let e = &mut entry.state;
+        e.state = FsOpState::InFlight {
+            tag: TAG_READ_SPARE,
+        };
+        e.waiter = Some(waiter);
+        // Parked so the descriptor stays open to the CQE, as `submit_rw`
+        // parks it.
+        e.file = Some(file);
+        // The heap block does not move with the vector parked here, so the
+        // room the SQE names stays where it is until the CQE.
+        let val = e.value.insert(buf);
+        let room = val.spare_capacity_mut().as_mut_ptr() as u64;
+        let force = self.force_async.sqe_bit(ForceAsync::READ);
+        let ud = pack_raw(TAG_READ_SPARE, op_slot, gen32);
+        let staged = eng.stage(ud, |sqe| {
+            sqe.opcode = IORING_OP_READ;
+            sqe.fd = raw_fd;
+            sqe.flags = force;
+            sqe.addr = room;
+            // `spare_read_fits` held the count to a `u32`.
+            sqe.len = count as u32;
+            sqe.off_addr2 = off;
+            sqe.op_flags = rw_flags;
+            sqe.personality = pers;
+        });
+        if let Err(err) = staged {
+            self.fail_op(eng, op_slot, err);
+        }
+    }
+
     /// Stage one `WRITEV` of held windows' bytes, in order from `off`, every
     /// share held to the CQE and each buffer's id surfaced at the reap for
     /// the net server to hand back. `Err` hands the windows and waiter back,
@@ -3092,7 +3162,7 @@ impl FsCore {
         let Completed {
             waiter,
             bufs,
-            value,
+            mut value,
             stat,
             strip_nonblock,
             retracted,
@@ -3181,6 +3251,15 @@ impl FsCore {
             && (n as u32) < lease_want
         {
             result = Err(Errno::EIO);
+        }
+
+        if tag == TAG_READ_SPARE
+            && let (Ok(n), Some(buf)) = (result, value.as_mut())
+        {
+            // SAFETY: the kernel wrote `n` bytes into the room past the
+            // length, and `n` is at most the count `submit_read_spare` held
+            // to that room, so the first `len + n` bytes are initialized.
+            unsafe { buf.set_len(buf.len() + n as usize) };
         }
 
         // A selecting pump read (no owned buffer) is done with the ring,
@@ -3566,6 +3645,34 @@ impl FsCore {
             Some(w) => self.refuse(eng, w, err, true, bufs, file),
             None => drop((bufs, file)),
         }
+    }
+}
+
+/// Whether a read of `count` bytes at `off` into `room` bytes past a
+/// buffer's length may be staged. A count past the room would need the
+/// buffer grown, which allocates and moves it under the caller. A count past
+/// `u32::MAX` would truncate in `sqe.len`, and an `off` of `u64::MAX` is -1,
+/// which io_uring reads as the file's position (`io_kiocb_update_pos`,
+/// `io_uring/rw.c`), so the read would succeed from the wrong place.
+pub(crate) fn spare_read_fits(room: usize, count: usize, off: u64) -> bool {
+    count <= room && u32::try_from(count).is_ok() && off != u64::MAX
+}
+
+#[cfg(test)]
+mod spare_read_tests {
+    use super::spare_read_fits;
+
+    /// The screen alone, since a buffer with room for `u32::MAX` bytes is
+    /// more than a test may allocate.
+    #[test]
+    fn a_spare_read_fits_its_room_a_u32_and_a_real_offset() {
+        assert!(spare_read_fits(8, 8, 0));
+        assert!(spare_read_fits(8, 0, u64::MAX - 1));
+        assert!(!spare_read_fits(8, 9, 0), "past the room");
+        let most = u32::MAX as usize;
+        assert!(spare_read_fits(usize::MAX, most, 0));
+        assert!(!spare_read_fits(usize::MAX, most + 1, 0), "past a u32");
+        assert!(!spare_read_fits(8, 8, u64::MAX), "the file's position");
     }
 }
 
@@ -4537,6 +4644,46 @@ impl<'a> FsConn<'a> {
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
         self.rw(TAG_READV, who, f, bufs, off, flags, on_done);
+    }
+
+    /// Positional read of up to `count` bytes of `f` at `off` into the room
+    /// past the length of `buf`, with the flags of
+    /// [`preadv2`](Self::preadv2), so nothing is zeroed first. For a caller
+    /// that builds a reply in one buffer and reads a file's bytes straight
+    /// after its head, where `preadv2` fills each buffer up to the length
+    /// it already has.
+    ///
+    /// The same `buf` comes back through [`FsDone::into_value`], its length
+    /// grown by the count read, which is short only at the end of the file,
+    /// and unchanged on a failure. A `count` past `buf`'s spare capacity or
+    /// past `u32::MAX`, and an `off` of `u64::MAX`, are refused with a
+    /// marked `EINVAL` ([`FsDone::was_refused`]): the buffer is never grown,
+    /// which would allocate and move it, and io_uring reads `u64::MAX` as
+    /// the file's position (`io_kiocb_update_pos`, `io_uring/rw.c`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn pread_spare<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        buf: Vec<u8>,
+        count: usize,
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        let w = self.waiter(on_done);
+        self.fs.submit_read_spare(
+            self.eng,
+            who.0,
+            f.fd,
+            buf,
+            count,
+            off,
+            flags.bits(),
+            w,
+        );
     }
 
     /// Gathered positional write with per-operation flags (`pwritev2(2)`).
