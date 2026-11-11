@@ -3336,12 +3336,17 @@ impl FsCore {
         // copy path stays
         // retryable (`FsDone::into_bufs` hands the source back), which is
         // the one honest asymmetry between the two.
+        // The count still goes out beside the `EIO`, for a caller that
+        // answers it rather than retrying.
+        #[cfg(feature = "net-server")]
+        let mut short = None;
         #[cfg(feature = "net-server")]
         if leased
             && let Ok(n) = result
             && (n as u32) < lease_want
         {
             result = Err(Errno::EIO);
+            short = Some(n as usize);
         }
 
         if tag == TAG_READ_SPARE
@@ -3377,6 +3382,8 @@ impl FsCore {
                     recv_lease,
                     #[cfg(feature = "net-server")]
                     recv_lease_more,
+                    #[cfg(feature = "net-server")]
+                    short,
                 },
                 owner,
             ),
@@ -3392,6 +3399,8 @@ impl FsCore {
                     recv_lease,
                     #[cfg(feature = "net-server")]
                     recv_lease_more,
+                    #[cfg(feature = "net-server")]
+                    short,
                 },
                 owner,
             ),
@@ -3688,6 +3697,8 @@ impl FsCore {
                         recv_lease: None,
                         #[cfg(feature = "net-server")]
                         recv_lease_more: Vec::new(),
+                        #[cfg(feature = "net-server")]
+                        short: None,
                     },
                 ));
             }
@@ -3847,6 +3858,10 @@ pub struct FsDone {
     /// every other op.
     #[cfg(feature = "net-server")]
     recv_lease_more: Vec<u16>,
+    /// The count a short leased write wrote before it was failed with
+    /// `EIO` ([`FsDone::short_count`]). `None` for every other outcome.
+    #[cfg(feature = "net-server")]
+    short: Option<usize>,
 }
 
 impl std::fmt::Debug for FsDone {
@@ -3901,6 +3916,8 @@ impl FsDone {
             recv_lease: None,
             #[cfg(feature = "net-server")]
             recv_lease_more: Vec::new(),
+            #[cfg(feature = "net-server")]
+            short: None,
         }
     }
 
@@ -3932,6 +3949,8 @@ impl FsDone {
             recv_lease: None,
             #[cfg(feature = "net-server")]
             recv_lease_more: Vec::new(),
+            #[cfg(feature = "net-server")]
+            short: None,
         }
     }
 
@@ -3949,6 +3968,17 @@ impl FsDone {
     #[cfg(feature = "net-server")]
     pub(crate) fn take_recv_lease_more(&mut self) -> Vec<u16> {
         std::mem::take(&mut self.recv_lease_more)
+    }
+
+    /// The count a short leased write wrote before it answered `EIO`
+    /// ([`FsConn::pwritev2_from`], [`FsConn::pwritev2_leased`]), for a
+    /// caller that never retries one but must still answer how much was
+    /// written. `None` for every other outcome, a full leased write and a
+    /// short copied or owned one among them, which answer their count as
+    /// `Ok(n)`.
+    #[cfg(feature = "net-server")]
+    pub fn short_count(&self) -> Option<usize> {
+        self.short
     }
 
     /// The op's result: a byte count / `0`, or the errno it failed with.
@@ -4870,7 +4900,9 @@ impl<'a> FsConn<'a> {
     /// may retry the remainder; on the leased path the source is the
     /// receive buffer and this completion returns it to the pool, so no
     /// retry can ever be sound - a short leased write is therefore
-    /// surfaced as `Err(EIO)` rather than as an `Ok(n)` inviting one.
+    /// surfaced as `Err(EIO)` rather than as an `Ok(n)` inviting one. The
+    /// count it wrote still comes with it through [`FsDone::short_count`],
+    /// for a caller that must answer the count rather than retry.
     ///
     /// The `EIO` carries no cause because none is knowable at this
     /// completion: ZFS discards the breaking errno once any progress was
@@ -5048,8 +5080,9 @@ impl<'a> FsConn<'a> {
     /// copy of a one-block file (`zfs_grow_blocksize`).
     ///
     /// Each buffer returns to the pool when its last share goes. A short
-    /// write fails the op with `EIO`, as
-    /// [`pwritev2_from`](Self::pwritev2_from)'s does.
+    /// write fails the op with `EIO` and gives its count through
+    /// [`FsDone::short_count`], as [`pwritev2_from`](Self::pwritev2_from)'s
+    /// does.
     ///
     /// A full op table refuses the write with a marked `EBUSY`
     /// ([`FsDone::was_refused`]), its buffers going back as the windows
@@ -9622,6 +9655,46 @@ mod routing_fuzz {
             panic!("one buffer back, not {}", out.bufs.len());
         };
         assert_eq!((back.as_ptr(), back.len()), (storage, 8192));
+    }
+
+    /// A short leased write still fails with `EIO`, and the count it wrote
+    /// comes beside the failure, for a caller that answers the count
+    /// rather than retrying. A full one has no count beside its `Ok`.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_short_leased_write_gives_its_count_beside_its_eio() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let buf = vec![7u8; 8192];
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        let short = (4096, Err(Errno::EIO), Some(4096));
+        for (written, res, count) in [short, (8192, Ok(8192), None)] {
+            let hold = std::sync::Arc::new(LeaseHold::detached(9));
+            let staged = core.submit_pwritev2_gathered(
+                &mut eng,
+                0,
+                Arc::clone(&file),
+                vec![window_over(&buf, &hold)],
+                0,
+                0,
+                embedded_noop(),
+            );
+            assert!(staged.is_ok(), "staged");
+            drop(hold);
+            let [(t, s, g)] = inflight(&core)[..] else {
+                panic!("one op in flight");
+            };
+            let ReapedFs::Embedded(_, done, _) =
+                core.on_cqe(&mut eng, t, s, g, written)
+            else {
+                panic!("an embedded waiter reaps embedded");
+            };
+            assert_eq!((done.raw_result(), done.short_count()), (res, count));
+        }
     }
 
     /// N writes share one claim; the buffer surfaces from the last.
