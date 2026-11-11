@@ -9636,6 +9636,223 @@ fn the_embedded_reactor_sets_attributes_in_one_call() {
     assert_eq!((mode & 0o7777, hidden), (0o600, true));
 }
 
+/// Serve one framed request on a ring with an fs table through `body`,
+/// which is handed the ring's own personality, and give the reply. `None`
+/// on a box with no io_uring.
+// Under `--cfg loom` the crate's `Arc` is loom's, which `File::from_shared`
+// takes and a std `Arc` is not, and the loom lane runs no ring.
+#[cfg(all(feature = "uring-fs", not(loom)))]
+fn one_fs_reply<B>(cfg: ServerConfig, body: B) -> Option<Vec<u8>>
+where
+    B: Fn(Request<'_, ()>, truenas_ros::uring_fs::Personality) -> Response
+        + 'static,
+{
+    use std::sync::OnceLock;
+    let pers = Arc::new(OnceLock::new());
+    let pc = Arc::clone(&pers);
+    let protocol = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |req: Request<'_, ()>| {
+            body(req, *pc.get().expect("personality set before serving"))
+        },
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, protocol) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return None,
+        Err(e) => panic!("bind with fs pool: {e}"),
+    };
+    pers.set(server.register_self().expect("register_self"))
+        .unwrap();
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || -> io::Result<Vec<u8>> {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        let mut s = connect_tcp(v4)?;
+        s.set_read_timeout(Some(Duration::from_secs(5)))?;
+        send_framed(&mut s, b"go")?;
+        let reply = recv_framed(&mut s);
+        drop(s);
+        stop.shutdown();
+        reply
+    });
+    server.serve_forever().expect("serve_forever");
+    Some(client.join().unwrap().expect("client io"))
+}
+
+/// What an owned write answered, and whether it gave back the very buffer
+/// it was handed with the bytes it held.
+#[cfg(all(feature = "uring-fs", not(loom)))]
+fn owned_write_verdict(
+    d: truenas_ros::uring_fs::FsDone,
+    storage: *const u8,
+    held: &[u8],
+) -> String {
+    let marked = d.was_refused();
+    let res = match d.result() {
+        Ok(n) => format!("ok {n}"),
+        Err(Error::Errno(e)) => format!("{e:?}"),
+        Err(e) => format!("{e}"),
+    };
+    let back = d.into_value();
+    let same = back.as_ptr() == storage && back == held;
+    format!("{res} marked={marked} same={same}")
+}
+
+/// `FsConn::pwritev2_owned` writes just its range of a buffer at its offset
+/// on ZFS and gives the very buffer back through `FsDone::into_value`. A
+/// range past the buffer, an inverted one and an offset of `u64::MAX`,
+/// which io_uring reads as the file's position, are refused with a marked
+/// `EINVAL`, each with its buffer back and nothing written.
+#[cfg(all(feature = "uring-fs", not(loom)))]
+#[test]
+fn an_owned_write_writes_its_range_and_gives_its_buffer_back() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use truenas_ros::uring_fs::{File, RwFlags};
+
+    let Some(ds) = zfs_dir::zfs_dir_or_skip() else {
+        return;
+    };
+    let dir = ds.join(format!("rostest_owned_write_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let fp = dir.join("f");
+    std::fs::write(&fp, b"0123456789abcdef").unwrap();
+    let held: Arc<std::os::fd::OwnedFd> = Arc::new(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fp)
+            .unwrap()
+            .into(),
+    );
+    #[allow(clippy::reversed_empty_ranges)]
+    let writes = [(2..6, 4), (6..9, 0), (5..3, 0), (0..2, u64::MAX)];
+    let cfg = ServerConfig {
+        pool_size: 4,
+        fs_ops: 16,
+        ..ServerConfig::default()
+    };
+    let reply = one_fs_reply(cfg, move |mut req, who| {
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let answers = Rc::new(RefCell::new(vec![String::new(); writes.len()]));
+        let deferred = Rc::new(RefCell::new(Some(deferred)));
+        for (i, (range, off)) in writes.iter().cloned().enumerate() {
+            let buf = b"..WXYZ..".to_vec();
+            let storage = buf.as_ptr();
+            let (answers, deferred) =
+                (Rc::clone(&answers), Rc::clone(&deferred));
+            let file = File::from_shared(Arc::clone(&held));
+            let flags = RwFlags::empty();
+            fs.pwritev2_owned(
+                who,
+                file,
+                buf,
+                range,
+                off,
+                flags,
+                move |d, _| {
+                    answers.borrow_mut()[i] =
+                        owned_write_verdict(d, storage, b"..WXYZ..");
+                    if answers.borrow().iter().all(|a| !a.is_empty())
+                        && let Some(deferred) = deferred.borrow_mut().take()
+                    {
+                        let text = answers.borrow().join("\n");
+                        deferred.reply(echo_frame(text.as_bytes()));
+                    }
+                },
+            );
+        }
+        Response::Defer(permit)
+    });
+    let Some(reply) = reply else {
+        std::fs::remove_dir_all(&dir).unwrap();
+        return;
+    };
+    let file = std::fs::read(&fp).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let refused = "EINVAL marked=true same=true";
+    assert_eq!(
+        String::from_utf8_lossy(&reply),
+        ["ok 4 marked=false same=true", refused, refused, refused].join("\n")
+    );
+    assert_eq!(file, b"0123WXYZ89abcdef", "just the range, at its offset");
+}
+
+/// With both slots of a two-slot table held by reads parked on a FIFO,
+/// `FsConn::pwritev2_owned` is refused with a marked `EBUSY` and gives its
+/// buffer back as it came.
+#[cfg(all(feature = "uring-fs", not(loom)))]
+#[test]
+fn an_owned_write_on_a_full_table_gives_its_buffer_back() {
+    use std::os::unix::ffi::OsStrExt;
+    use truenas_ros::uring_fs::{File, RwFlags};
+
+    let Some(ds) = zfs_dir::zfs_dir_or_skip() else {
+        return;
+    };
+    let dir = ds.join(format!("rostest_owned_full_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let fp = dir.join("f");
+    std::fs::write(&fp, b"bytes").unwrap();
+    let fifo = dir.join("fifo");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let open = |p: &Path| -> Arc<std::os::fd::OwnedFd> {
+        // O_RDWR on a FIFO opens at once with a writer attached, so a read
+        // with no data parks and holds its slot.
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(p);
+        Arc::new(f.unwrap().into())
+    };
+    let (held, pipe) = (open(&fp), open(&fifo));
+    let cfg = ServerConfig {
+        pool_size: 1,
+        fs_ops: 1,
+        ..ServerConfig::default()
+    };
+    let reply = one_fs_reply(cfg, move |mut req, who| {
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let flags = RwFlags::empty();
+        for _ in 0..2 {
+            let parked = File::from_shared(Arc::clone(&pipe));
+            fs.preadv2(who, parked, vec![vec![0u8; 4]], 0, flags, |_, _| {});
+        }
+        let buf = b"owned".to_vec();
+        let storage = buf.as_ptr();
+        let file = File::from_shared(Arc::clone(&held));
+        fs.pwritev2_owned(who, file, buf, 0..5, 0, flags, move |d, _| {
+            let text = owned_write_verdict(d, storage, b"owned");
+            deferred.reply(echo_frame(text.as_bytes()));
+        });
+        Response::Defer(permit)
+    });
+    let file = std::fs::read(&fp).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let Some(reply) = reply else {
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&reply),
+        "EBUSY marked=true same=true"
+    );
+    assert_eq!(file, b"bytes", "nothing written");
+}
+
 /// `FsConn::fgetxattr_as_root` reads an xattr under the reactor's ambient
 /// (root) credentials (`sqe.personality = 0`) - the sanctioned privileged-read
 /// path for a `trusted.*`/`security.*` attribute a request's own identity

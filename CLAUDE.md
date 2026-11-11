@@ -255,8 +255,11 @@ Do not reopen these without a reason that is new.
 - **A short leased write surfaces as `Err(EIO)`, never `Ok(n)`.** ZFS
   returns partial writes as successes (`zfs_write`), and by then the source
   buffer is back in the pool, so a retry would write another connection's
-  bytes. The copy path stays retryable (`into_bufs` hands the source back);
-  the asymmetry is documented on `pwritev2_from`.
+  bytes. The count it wrote comes beside the `EIO` through
+  `FsDone::short_count`, for a caller that answers it rather than retrying.
+  The copy path stays retryable, since `into_bufs` hands the source back,
+  and so does an owned write (`pwritev2_owned`), whose buffer comes back
+  through `into_value`. The asymmetry is documented on `pwritev2_from`.
 - **Rings are registered at their demand bound.** A ring cannot be
   resized after registration, so `ring_entries` sizes it to the most
   buffers demand can hold at once - `pool_size x (recv_lease_depth + 1)`

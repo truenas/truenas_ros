@@ -807,7 +807,7 @@ where
         // bug, answered as one.
         Phase::ChunkedDone { stash } => {
             let head_bytes = stash.as_deref().unwrap_or(header);
-            if let Some(mut wire) = body.try_take_owned() {
+            if let Some((mut wire, _)) = body.take_owned() {
                 return match chunked::compact(&mut wire) {
                     Ok(c) => match c.trailers() {
                         Ok(trailers) => {

@@ -233,6 +233,7 @@ pub(crate) fn fill_link_timeout(sqe: &mut IoUringSqe, ts: u64) {
 pub(crate) const IORING_OP_CONNECT: u8 = 16;
 pub(crate) const IORING_OP_CLOSE: u8 = 19;
 pub(crate) const IORING_OP_READ: u8 = 22;
+pub(crate) const IORING_OP_WRITE: u8 = 23;
 /// `openat2(2)` as a ring op: `fd` = dirfd (a REAL fd - the prep rejects
 /// fixed dirfds with `-EBADF`), `addr` = path, `addr2` = `&open_how`,
 /// `len` = `sizeof(open_how)` (24), and `file_index` = slot+1 installs the
