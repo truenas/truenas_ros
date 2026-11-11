@@ -74,7 +74,11 @@ metadata in the `trusted.` namespace, where local users cannot read or alter
 it - and a blocking-offload seam that runs a request's opcode-less metadata
 tail as one pool job, delivered back on the reactor thread. A second lane
 (`offload_lookup`) takes jobs that wait on another machine, such as a name
-service lookup, so they never hold a thread the file work needs.
+service lookup, so they never hold a thread the file work needs. On the
+reactor thread it also takes read leases on files (`file_lease`), whose
+breaks, when another opens the file for writing or truncates it, reach a
+handler the server was given, so a server that caches a file for its
+clients learns when anyone else changes it.
 
 ### Identity
 

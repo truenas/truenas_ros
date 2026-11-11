@@ -1576,6 +1576,29 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         self.handlers.tls_handshake = Some(Box::new(handler));
     }
 
+    /// Install the handler a break of a file lease this server's ring holds
+    /// reaches, once for each break, with the lease and a facade on the ring
+    /// that no connection owns
+    /// ([`FsConn::file_lease`](crate::uring_fs::FsConn::file_lease)). A
+    /// ring with no handler takes no lease, since its breaks would go
+    /// unheard. Give the lease back
+    /// ([`FsConn::release_file_lease`](crate::uring_fs::FsConn::release_file_lease))
+    /// once what it guards is done, since whoever broke it waits on it for
+    /// up to `/proc/sys/fs/lease-break-time` seconds. A server with no fs
+    /// reactor (`fs_ops` of 0) takes no lease, and drops the handler.
+    #[cfg(feature = "uring-fs")]
+    pub fn set_file_lease_break_handler<F>(&mut self, handler: F)
+    where
+        F: FnMut(
+                crate::uring_fs::file_lease::FileLeaseId,
+                &mut crate::uring_fs::FsConn<'_>,
+            ) + 'static,
+    {
+        if let Some(fs) = self.fs.as_mut() {
+            fs.file_leases.set_handler(Box::new(handler));
+        }
+    }
+
     /// Install the **detach** handler, required when a `body` handler ever
     /// returns [`Response::Detach`]. Called once per detached connection with
     /// `(context, detached)`: the [`DetachContext`] (peer + `&mut state`, where
