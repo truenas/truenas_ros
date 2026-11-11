@@ -18,6 +18,7 @@
 //!   `(tag, op-slot, generation)`; an op entry frees only at its own single
 //!   terminal CQE, so a stale / duplicate / wrong-tag completion is rejected.
 
+use super::file_lease::{FileLeaseId, FileLeases};
 use super::offload_pool::{
     FILE_WORKER, Job, LOOKUP_WORKER, OffloadBounds, SharedPool,
 };
@@ -142,6 +143,9 @@ pub(crate) const TAG_GETXATTR_PROC: u8 = 0x94;
 /// xattr op's does, and [`FsCore::on_cqe`] grows its length by what the
 /// kernel wrote.
 pub(crate) const TAG_READ_SPARE: u8 = 0x95;
+/// The poll of the signalfd the breaks of the ring's file leases arrive on
+/// ([`FileLeases`]). It holds no op slot, since the ring has one at most.
+pub(crate) const TAG_FILE_LEASE: u8 = 0x96;
 /// The standalone host's wake tag (an embedded host reuses its own).
 pub(crate) const TAG_WAKE: u8 = 0x9D;
 /// Tags `ASYNC_CANCEL` ops (and the teardown drain); completions ignored.
@@ -330,6 +334,8 @@ pub(crate) enum ReapedFs {
     Embedded(EmbeddedCb, FsDone, Owner),
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     Pump(FsDone, (u32, u64)),
+    /// File leases of the ring a break reached, for its handler.
+    FileLeaseBreaks(Vec<FileLeaseId>),
 }
 
 /// `fremovexattr(2)` on `f`. Blocking, because io_uring has no opcode for it:
@@ -1098,6 +1104,9 @@ pub(crate) struct FsCore {
     /// `loom_offload_wakeup_loses_nothing` exercises against a racing
     /// drain.
     refusals: VecDeque<(Owner, EmbeddedCb, FsDone)>,
+    /// The file leases this ring holds and the signalfd their breaks
+    /// arrive on ([`FileLeases`]).
+    pub(crate) file_leases: FileLeases,
     /// Spawned tasks and their run queue (the futures layer,
     /// [`super::task`]); woken tasks are polled by the delivery
     /// functions below. **Last field on purpose**: fields drop in
@@ -1149,6 +1158,7 @@ impl FsCore {
             timer_cap: None,
             force_async: ForceAsync::empty(),
             refusals: VecDeque::new(),
+            file_leases: FileLeases::default(),
         }
     }
 
@@ -3064,9 +3074,19 @@ impl FsCore {
         gen32: u32,
         res: i32,
     ) -> ReapedFs {
+        // A poll of the file leases' signalfd that could not be staged is
+        // staged again on the ring's next completion.
+        self.file_leases.arm(eng);
         if tag == TAG_CANCEL {
             // An ASYNC_CANCEL's own completion; nothing to route.
             return ReapedFs::None;
+        }
+        if tag == TAG_FILE_LEASE {
+            let broken = self.file_leases.on_readable(eng);
+            if broken.is_empty() {
+                return ReapedFs::None;
+            }
+            return ReapedFs::FileLeaseBreaks(broken);
         }
         if tag == TAG_OPEN_DEADLINE {
             // An `Allow` open's guard: fired (`-ETIME`), retracted by
@@ -3313,7 +3333,11 @@ impl FsCore {
     /// closes the whole registered table).
     pub(crate) fn on_drain_cqe(&mut self, cqe: &IoUringCqe) {
         let (tag, op_slot, gen32) = unpack_raw(cqe.user_data);
-        if tag & 0x80 == 0 || tag == TAG_CANCEL || tag == TAG_WAKE {
+        if tag & 0x80 == 0
+            || tag == TAG_CANCEL
+            || tag == TAG_WAKE
+            || tag == TAG_FILE_LEASE
+        {
             return;
         }
         let Some(done) = self.take_op(tag, op_slot, gen32) else {
@@ -5274,6 +5298,38 @@ impl<'a> FsConn<'a> {
         let w = self.waiter(on_done);
         self.fs
             .submit_reopen_proc_as_root(self.eng, f.fd, access, w);
+    }
+
+    /// Take a read lease on `file`, a descriptor open for reading, and give
+    /// back what names it. A break of it reaches the handler the host was
+    /// given, once, as [`file_lease`](super::file_lease) says, and the
+    /// lease lasts until [`FsConn::release_file_lease`] gives it back. The
+    /// ring keeps a clone of `file` until then.
+    ///
+    /// A plain `fcntl(2)` on the ring's thread, which never blocks. It is
+    /// `EAGAIN` while anyone holds the file open for writing, `EACCES` for a
+    /// file the ring does not own without `CAP_LEASE` (`vfs_setlease` in
+    /// `fs/locks.c`), `EBUSY` for a descriptor that already holds one of
+    /// the ring's leases, and `EINVAL` where no handler was given or the
+    /// ring's thread has not blocked the signals a break comes as
+    /// ([`file_lease::block_signals`](super::file_lease::block_signals)),
+    /// since a break would then go unheard or end the process.
+    pub fn file_lease(
+        &mut self,
+        file: &File,
+    ) -> crate::Result<super::file_lease::FileLeaseId> {
+        self.fs.file_leases.take(self.eng, &file.fd)
+    }
+
+    /// Give back the lease `id`, which lets anyone waiting on its break go
+    /// on at once, and drop the ring's clone of its descriptor. A lease the
+    /// kernel dropped since its break is given back all the same. `ENOENT`
+    /// for one the ring does not hold.
+    pub fn release_file_lease(
+        &mut self,
+        id: super::file_lease::FileLeaseId,
+    ) -> crate::Result<()> {
+        self.fs.file_leases.release(id)
     }
 
     /// Write extended attribute `name` on `f` as `who`.
@@ -8502,6 +8558,300 @@ mod hybrid_tests {
             assert_eq!(b.sum, xsum(n), "xattr values correct");
         }
     }
+
+    /// Route the ring's completions, the poll of the file leases' signalfd
+    /// and reopens among them, until `until` holds, failing after 30
+    /// seconds, well short of the 45 a broken lease holds its breaker.
+    fn pump_until(
+        eng: &mut Engine,
+        fs: &mut FsCore,
+        until: impl Fn(&FsCore) -> bool,
+    ) {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !until(fs) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "nothing came of the break within 30 seconds"
+            );
+            let wait = Some(std::time::Duration::from_millis(200));
+            match eng.ring.submit_and_wait_for(1, wait) {
+                Ok(()) | Err(Errno::ETIME) | Err(Errno::EINTR) => {}
+                Err(e) => panic!("submit and wait: {e}"),
+            }
+            while let Some(cqe) = eng.ring.reap() {
+                eng.retire(&cqe);
+                let (tag, slot, g) = unpack_raw(cqe.user_data);
+                if tag & TAG_FS_DOMAIN == 0 || tag == TAG_CANCEL {
+                    continue;
+                }
+                let reaped = fs.on_cqe(eng, tag, slot, g, cqe.res);
+                deliver_embedded(fs, eng, reaped);
+            }
+        }
+    }
+
+    /// A file of a fresh folder, and a descriptor of it open for reading.
+    fn a_file() -> (crate::TempDir, std::path::PathBuf, File) {
+        let dir = crate::tempdir().expect("tempdir");
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        let read = std::fs::File::open(&path).unwrap();
+        (dir, path, File::from_fd(read.into()))
+    }
+
+    /// A handler that records each break it hears in `heard`, and gives the
+    /// lease back when `gives_back`.
+    fn hearing(
+        heard: &Rc<RefCell<Vec<super::super::file_lease::FileLeaseId>>>,
+        gives_back: bool,
+    ) -> super::super::file_lease::BreakHandler {
+        let heard = Rc::clone(heard);
+        Box::new(move |id, fs| {
+            heard.borrow_mut().push(id);
+            if gives_back {
+                fs.release_file_lease(id).expect("give the lease back");
+            }
+        })
+    }
+
+    /// An open of `path` for writing with `O_NONBLOCK`, which a lease
+    /// answers `EWOULDBLOCK` once it has begun its break.
+    fn open_nonblocking(
+        path: &std::path::Path,
+    ) -> std::io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+    }
+
+    /// An open for writing breaks a lease, its break reaches the handler on
+    /// the ring that took it, and the handler's release lets the opener go
+    /// at once rather than after `lease-break-time`.
+    #[test]
+    fn a_write_open_breaks_a_file_lease_and_its_release_lets_the_opener_go() {
+        super::super::file_lease::block_signals().unwrap();
+        let (mut eng, mut fs, _) = setup();
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        fs.file_leases.set_handler(hearing(&heard, true));
+        let (_dir, path, file) = a_file();
+        let id = FsConn::new(&mut fs, &mut eng, None)
+            .file_lease(&file)
+            .expect("a lease");
+        let opener = std::thread::spawn(move || {
+            let at = std::time::Instant::now();
+            std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            at.elapsed()
+        });
+        pump_until(&mut eng, &mut fs, |_| !heard.borrow().is_empty());
+        assert_eq!(*heard.borrow(), [id]);
+        let waited = opener.join().unwrap();
+        assert!(waited < std::time::Duration::from_secs(10), "{waited:?}");
+        assert!(fs.file_leases.held_none(), "the lease was given back");
+        // The realtime signal named the descriptor, so no lease was asked.
+        assert_eq!(fs.file_leases.sigio, 0, "the break came as F_SETSIG's");
+    }
+
+    /// A break is reported once, though a `SIGIO` after it asks every lease
+    /// again and finds it still broken, and the ring polls its signals
+    /// again after each read.
+    #[test]
+    fn a_break_is_reported_once() {
+        super::super::file_lease::block_signals().unwrap();
+        let (mut eng, mut fs, _) = setup();
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        fs.file_leases.set_handler(hearing(&heard, false));
+        let (_dir, path, file) = a_file();
+        let id = FsConn::new(&mut fs, &mut eng, None)
+            .file_lease(&file)
+            .expect("a lease");
+        let refused = open_nonblocking(&path).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::EWOULDBLOCK));
+        pump_until(&mut eng, &mut fs, |_| !heard.borrow().is_empty());
+        let read = fs.file_leases.read;
+        // SAFETY: a signal to this thread, which has it blocked.
+        let sent = unsafe {
+            libc::syscall(
+                libc::SYS_tgkill,
+                libc::getpid(),
+                libc::gettid(),
+                libc::SIGIO,
+            )
+        };
+        assert_eq!(sent, 0);
+        pump_until(&mut eng, &mut fs, |fs| fs.file_leases.read > read);
+        assert_eq!(*heard.borrow(), [id]);
+        FsConn::new(&mut fs, &mut eng, None)
+            .release_file_lease(id)
+            .unwrap();
+    }
+
+    /// A truncate breaks a lease as an open for writing does
+    /// (`vfs_truncate` in `fs/open.c`).
+    #[test]
+    fn a_truncate_breaks_a_file_lease() {
+        super::super::file_lease::block_signals().unwrap();
+        let (mut eng, mut fs, _) = setup();
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        fs.file_leases.set_handler(hearing(&heard, true));
+        let (_dir, path, file) = a_file();
+        let id = FsConn::new(&mut fs, &mut eng, None)
+            .file_lease(&file)
+            .expect("a lease");
+        let truncater = std::thread::spawn(move || {
+            let path =
+                CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: a NUL-terminated path.
+            unsafe { libc::truncate(path.as_ptr(), 0) }
+        });
+        pump_until(&mut eng, &mut fs, |_| !heard.borrow().is_empty());
+        assert_eq!(*heard.borrow(), [id]);
+        assert_eq!(truncater.join().unwrap(), 0);
+    }
+
+    /// A signal names only a descriptor's number. One left from a lease
+    /// given back, read once a new lease holds the same descriptor and is
+    /// not broken, reports nothing.
+    #[test]
+    fn a_signal_left_from_a_lease_given_back_reports_no_break() {
+        super::super::file_lease::block_signals().unwrap();
+        let (mut eng, mut fs, _) = setup();
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        fs.file_leases.set_handler(hearing(&heard, false));
+        let (_dir, path, file) = a_file();
+        let mut c = FsConn::new(&mut fs, &mut eng, None);
+        let id = c.file_lease(&file).expect("a lease");
+        // The break begins and its signal waits on this thread, unread.
+        let refused = open_nonblocking(&path).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::EWOULDBLOCK));
+        c.release_file_lease(id).unwrap();
+        let again = c.file_lease(&file).expect("a second lease");
+        assert_ne!(again, id, "a new lease on the same descriptor");
+        drop(c);
+        pump_until(&mut eng, &mut fs, |fs| fs.file_leases.read > 0);
+        assert!(heard.borrow().is_empty(), "{:?}", heard.borrow());
+    }
+
+    /// An open on the ring meets a lease with the special-file guard's
+    /// `O_NONBLOCK`, so the reopen for writing answers `EWOULDBLOCK` at
+    /// once, and the break it began reaches the handler.
+    #[test]
+    fn a_reopen_for_writing_answers_ewouldblock_and_starts_the_break() {
+        super::super::file_lease::block_signals().unwrap();
+        let (mut eng, mut fs, _) = setup();
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        fs.file_leases.set_handler(hearing(&heard, true));
+        let (_dir, _path, file) = a_file();
+        let refused = Rc::new(Cell::new(None));
+        let r = Rc::clone(&refused);
+        let mut c = FsConn::new(&mut fs, &mut eng, None);
+        let id = c.file_lease(&file).expect("a lease");
+        c.reopen_proc_as_root(
+            file.clone(),
+            ReopenAccess::Write,
+            move |d, _| {
+                r.set(Some(matches!(
+                    d.result(),
+                    Err(crate::Error::Errno(Errno::EAGAIN))
+                )));
+            },
+        );
+        drop(c);
+        pump_until(&mut eng, &mut fs, |_| {
+            refused.get().is_some() && !heard.borrow().is_empty()
+        });
+        assert_eq!(refused.get(), Some(true), "EWOULDBLOCK at once");
+        assert_eq!(*heard.borrow(), [id]);
+    }
+
+    /// The kernel refuses a read lease while anyone holds the file open for
+    /// writing, and a ring refuses one with no handler to hear its break or
+    /// on a thread that has not blocked the signals a break comes as.
+    #[test]
+    fn a_file_lease_is_refused_where_its_break_could_not_be_heard() {
+        // A thread that never blocked the signals, spawned before this one
+        // blocks them, since a thread inherits the mask.
+        let unblocked = std::thread::spawn(|| {
+            let (mut eng, mut fs, _) = setup();
+            fs.file_leases.set_handler(Box::new(|_, _| {}));
+            let (_dir, _path, file) = a_file();
+            let mut c = FsConn::new(&mut fs, &mut eng, None);
+            c.file_lease(&file).err()
+        })
+        .join()
+        .unwrap();
+        assert!(
+            matches!(unblocked, Some(crate::Error::Errno(Errno::EINVAL))),
+            "{unblocked:?}"
+        );
+        super::super::file_lease::block_signals().unwrap();
+        let (mut eng, mut fs, _) = setup();
+        let (_dir, path, file) = a_file();
+        let unheard = FsConn::new(&mut fs, &mut eng, None).file_lease(&file);
+        assert!(
+            matches!(unheard, Err(crate::Error::Errno(Errno::EINVAL))),
+            "{unheard:?}"
+        );
+        fs.file_leases.set_handler(Box::new(|_, _| {}));
+        let writer =
+            std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let mut c = FsConn::new(&mut fs, &mut eng, None);
+        let held = c.file_lease(&file);
+        assert!(
+            matches!(held, Err(crate::Error::Errno(Errno::EAGAIN))),
+            "{held:?}"
+        );
+        drop(writer);
+        let id = c.file_lease(&file).expect("a lease once the writer went");
+        c.release_file_lease(id).unwrap();
+    }
+
+    /// A break whose realtime signal cannot be queued comes as `SIGIO` with
+    /// no descriptor (`send_sigio_to_task` in `fs/fcntl.c`), and still
+    /// reaches the handler, through `F_GETLEASE` asked of every lease. It
+    /// runs in a child process whose `RLIMIT_SIGPENDING` is 0, since the
+    /// limit is the process's, and a realtime signal never passes it
+    /// (`__send_signal_locked` in `kernel/signal.c`).
+    #[test]
+    fn a_break_whose_signal_cannot_be_queued_arrives_through_sigio() {
+        const CHILD: &str = "TRUENAS_ROS_FILE_LEASE_SIGIO_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let me = "uring_fs::core::hybrid_tests::\
+                      a_break_whose_signal_cannot_be_queued_arrives_through_sigio";
+            let status =
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", me, "--test-threads=1", "--nocapture"])
+                    .env(CHILD, "1")
+                    .status()
+                    .unwrap();
+            assert!(status.success(), "the child failed: {status}");
+            return;
+        }
+        let none = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: a valid limit, in this child process alone.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_SIGPENDING, &none) },
+            0
+        );
+        super::super::file_lease::block_signals().unwrap();
+        let (mut eng, mut fs, _) = setup();
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        fs.file_leases.set_handler(hearing(&heard, true));
+        let (_dir, path, file) = a_file();
+        let id = FsConn::new(&mut fs, &mut eng, None)
+            .file_lease(&file)
+            .expect("a lease");
+        let refused = open_nonblocking(&path).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::EWOULDBLOCK));
+        pump_until(&mut eng, &mut fs, |_| !heard.borrow().is_empty());
+        assert_eq!(*heard.borrow(), [id]);
+        assert!(fs.file_leases.sigio > 0, "the break came as SIGIO");
+    }
 }
 
 fn map_res(res: i32) -> Result<i32, Errno> {
@@ -8667,6 +9017,9 @@ pub(crate) fn deliver_embedded(
         }
         ReapedFs::Pump(..) => {
             unreachable!("pump reads are routed by the net server")
+        }
+        ReapedFs::FileLeaseBreaks(broken) => {
+            FileLeases::deliver(fs, eng, broken);
         }
         ReapedFs::None => {}
     });

@@ -13578,3 +13578,92 @@ fn a_half_closed_peer_closes_when_its_one_way_request_finishes() {
         );
     }
 }
+
+/// A file lease a body handler takes on the ring reaches the server's break
+/// handler once another opens the file for writing, and the handler's
+/// release lets that opener go at once rather than after
+/// `lease-break-time`. On a temp folder, and on a ZFS dataset where one is
+/// provisioned, which takes leases as any file system does
+/// (`generic_setlease` in `zpl_file.c`).
+#[cfg(feature = "uring-fs")]
+#[test]
+fn a_file_lease_break_reaches_the_server_s_handler() {
+    use std::sync::Mutex;
+    use std::sync::mpsc;
+    use truenas_ros::uring_fs::File;
+    use truenas_ros::uring_fs::file_lease::{FileLeaseId, block_signals};
+
+    // The server runs on this thread, which its breaks are sent to.
+    block_signals().unwrap();
+    let temp = truenas_ros::tempdir().unwrap();
+    let mut dirs = vec![temp.path().to_path_buf()];
+    if let Some(ds) = zfs_dir::zfs_dir_or_skip() {
+        dirs.push(ds);
+    }
+    for dir in dirs {
+        let path = dir.join(format!("rostest_lease_{}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        let taken: Arc<Mutex<Option<FileLeaseId>>> = Arc::new(Mutex::new(None));
+        let t = Arc::clone(&taken);
+        let leased = path.clone();
+        let body = move |mut req: Request<'_, ()>| -> Response {
+            let _ = req.body.take();
+            let Some(mut fs) = req.fs.take() else {
+                return Response::Close;
+            };
+            let read = std::fs::File::open(&leased).unwrap();
+            let id = fs.file_lease(&File::from_fd(read.into()));
+            *t.lock().unwrap() = id.ok();
+            Response::Reply(echo_frame(b"leased"))
+        };
+        let protocol = Protocol {
+            accept: |_: Incoming<'_>| Some(()),
+            header: length_prefix_header::<()>(
+                PrefixWidth::U32,
+                Endian::Big,
+                false,
+            ),
+            body,
+        };
+        let cfg = ServerConfig {
+            pool_size: 8,
+            fs_ops: 8,
+            ..ServerConfig::default()
+        };
+        let addr =
+            ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+        let mut server = match Server::with_config([addr], cfg, protocol) {
+            Ok(s) => s,
+            Err(e) if should_skip(&e) => return,
+            Err(e) => panic!("bind with fs pool: {e}"),
+        };
+        let (heard, hear) = mpsc::channel();
+        server.set_file_lease_break_handler(move |id, fs| {
+            heard.send(id).unwrap();
+            fs.release_file_lease(id).expect("give the lease back");
+        });
+        let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+            panic!("expected Tcp");
+        };
+        let stop = server.shutdown_handle();
+        let writer = path.clone();
+        let client = thread::spawn(move || -> io::Result<Duration> {
+            let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+            let mut s = connect_tcp(v4)?;
+            send_framed(&mut s, b"go")?;
+            assert_eq!(recv_framed(&mut s)?, b"leased");
+            let at = Instant::now();
+            std::fs::OpenOptions::new().write(true).open(&writer)?;
+            let waited = at.elapsed();
+            drop(s);
+            stop.shutdown();
+            Ok(waited)
+        });
+        server.serve_forever().expect("serve_forever file lease");
+        let waited = client.join().unwrap().expect("client io");
+        let taken = taken.lock().unwrap().expect("the handler took a lease");
+        assert_eq!(hear.try_recv().ok(), Some(taken), "{dir:?}");
+        assert!(waited < Duration::from_secs(10), "{dir:?} {waited:?}");
+        std::fs::remove_file(&path).unwrap();
+    }
+}

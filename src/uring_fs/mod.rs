@@ -249,6 +249,8 @@ pub use offload_pool::OffloadBounds;
 // can drive an `FsCore` on the server's own ring; the standalone host is
 // `uring_fs`'s own `UringFs`.
 pub(crate) mod core;
+// Read leases a ring holds on files, and the breaks of them that reach it.
+pub mod file_lease;
 // Exported unconditionally, not just with `net-server`. `FsConn` is the
 // callback submission facade - the only way to run several operations back to
 // back without parking a thread between them - and an out-of-tree consumer
