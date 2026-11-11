@@ -448,6 +448,29 @@ pub struct ServerConfig {
     /// regular file take it differently - and why the classes are separate
     /// knobs rather than one switch.
     pub force_async: ForceAsync,
+    /// The most io-wq workers this server's ring runs at once for bounded
+    /// work, or `None`, the default, which keeps the kernel's own bound,
+    /// the lesser of the ring's submission entries and four for each CPU
+    /// (`io_init_wq_offload`, `io_uring/tctx.c`).
+    ///
+    /// **It bounds every operation on a regular file the ring sends to a
+    /// worker, not reads alone**: io-wq counts work as unbound only when its
+    /// file is not regular (`io_prep_async_work`, `io_uring/io_uring.c`), so
+    /// the xattr operations, fsync and the opens of files share the bound
+    /// with the reads. A [`ForceAsync::READ`] server whose reads never sleep
+    /// starts a worker for each read marked concurrent while none is free,
+    /// up to this bound, and a read that waits on a disk holds its worker
+    /// while it waits, so the bound is also how many such reads wait at
+    /// once.
+    ///
+    /// io-wq belongs to the thread, not the ring. The server registers the
+    /// bound when it is built (`IORING_REGISTER_IOWQ_MAX_WORKERS`), before
+    /// its ring's first submission, and a thread's io-wq takes the bounds of
+    /// the ring it first submits to (`__io_uring_add_tctx_node`,
+    /// `io_uring/tctx.c`), or those registered while it already runs. So
+    /// give every server one thread drives the same bound. 0 and a count past
+    /// `i32::MAX`, which the kernel refuses, are refused at validation.
+    pub iowq_bounded_workers: Option<u32>,
 }
 
 impl Default for ServerConfig {
@@ -494,6 +517,7 @@ impl Default for ServerConfig {
             max_send_coalesce: 8,
             body_placement_threshold: Some(64 * 1024),
             force_async: ForceAsync::empty(),
+            iowq_bounded_workers: None,
         }
     }
 }
@@ -519,6 +543,17 @@ impl ServerConfig {
         if self.pool_size == 0 || self.pool_size > MAX_POOL {
             return Err(Error::Validation(format!(
                 "pool_size must be in 1..={MAX_POOL}"
+            )));
+        }
+        // 0 would leave the kernel's bound as it is rather than bound
+        // anything, and the kernel refuses a count past `INT_MAX`
+        // (`io_register_iowq_max_workers`, `io_uring/register.c`).
+        if let Some(workers) = self.iowq_bounded_workers
+            && (workers == 0 || i32::try_from(workers).is_err())
+        {
+            return Err(Error::Validation(format!(
+                "iowq_bounded_workers must be in 1..={}",
+                i32::MAX
             )));
         }
         // The op table holds the handler's whole budget (`fs_ops`) plus one
@@ -763,6 +798,28 @@ mod tests {
 
     fn addrs() -> Vec<Listen> {
         vec![Listen::from(ServerAddr::Unix("/tmp/x".into()))]
+    }
+
+    /// A bound of io-wq workers is 1 to `i32::MAX`, since 0 would bound
+    /// nothing and the kernel refuses more, and none keeps the kernel's own.
+    #[test]
+    fn validate_bounds_the_io_wq_workers() {
+        let addrs = [Listen::from(ServerAddr::Tcp(
+            "127.0.0.1:0".parse().unwrap(),
+        ))];
+        for (workers, ok) in [
+            (None, true),
+            (Some(1), true),
+            (Some(i32::MAX as u32), true),
+            (Some(0), false),
+            (Some(i32::MAX as u32 + 1), false),
+        ] {
+            let cfg = ServerConfig {
+                iowq_bounded_workers: workers,
+                ..ServerConfig::default()
+            };
+            assert_eq!(cfg.validate(&addrs).is_ok(), ok, "{workers:?}");
+        }
     }
 
     /// The offload bounds spawn real threads on the reactor thread at first

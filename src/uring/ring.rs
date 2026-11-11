@@ -660,6 +660,18 @@ impl Ring {
         self.fd.as_raw_fd()
     }
 
+    /// Bound the io-wq workers of bounded work of the tasks that drive this
+    /// ring to `bounded`, or with 0 leave the bound as it is, and give back
+    /// the bounds of bounded and unbounded work held before, as
+    /// [`register_iowq_max_workers`] says.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn bound_iowq_workers(
+        &self,
+        bounded: u32,
+    ) -> errno::Result<[u32; 2]> {
+        register_iowq_max_workers(self.raw_fd(), [bounded, 0])
+    }
+
     /// Register the sparse file "pool" of `count` slots and confine
     /// auto-allocation to `[0, count)`.
     pub(crate) fn register_pool(&self, count: u32) -> errno::Result<()> {

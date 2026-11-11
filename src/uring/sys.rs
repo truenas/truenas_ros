@@ -435,6 +435,12 @@ pub(crate) const IORING_REGISTER_PERSONALITY: u32 = 9;
 /// Free a personality id (`nr_args` = id, `arg` must be NULL).
 pub(crate) const IORING_UNREGISTER_PERSONALITY: u32 = 10;
 pub(crate) const IORING_REGISTER_FILES2: u32 = 13;
+/// Bound the calling task's io-wq workers, `arg` two `u32`, bounded work
+/// and then unbounded, where 0 leaves that bound as it is. The kernel
+/// writes back the bounds held before (`io_register_iowq_max_workers`,
+/// `io_uring/register.c`).
+#[cfg(feature = "net-server")]
+pub(crate) const IORING_REGISTER_IOWQ_MAX_WORKERS: u32 = 19;
 pub(crate) const IORING_REGISTER_FILE_ALLOC_RANGE: u32 = 25;
 /// Register a **provided-buffer ring**: a group of buffers the kernel picks
 /// from at issue time, rather than an address the SQE names. `arg` is one
@@ -735,6 +741,34 @@ pub(crate) fn unregister_personality(
             u32::from(id),
         )
     }
+}
+
+/// Bound the io-wq workers of the ring's tasks to `counts`, the bound of
+/// bounded work and then of unbounded work, where 0 leaves a bound as it
+/// is, and give back the bounds held before.
+///
+/// io-wq belongs to the task, not the ring. The ring keeps the bounds and
+/// hands them to every task that has used it, and to the io-wq a task
+/// starts later at its first submission (`__io_uring_add_tctx_node`,
+/// `io_uring/tctx.c`). A task with no io-wq yet is given back zeros, since
+/// it holds no bounds to report.
+#[cfg(feature = "net-server")]
+pub(crate) fn register_iowq_max_workers(
+    ring_fd: RawFd,
+    counts: [u32; 2],
+) -> errno::Result<[u32; 2]> {
+    let mut counts = counts;
+    // SAFETY: IOWQ_MAX_WORKERS reads and writes back exactly two `u32` at
+    // `arg` (`nr_args` 2), which `counts` holds for the call.
+    unsafe {
+        io_uring_register(
+            ring_fd,
+            IORING_REGISTER_IOWQ_MAX_WORKERS,
+            counts.as_mut_ptr().cast(),
+            2,
+        )
+    }?;
+    Ok(counts)
 }
 
 /// Register a sparse (all-`-1`) file table of `count` slots - the connection
