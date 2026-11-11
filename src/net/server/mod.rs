@@ -813,6 +813,9 @@ where
         // pool holds only the `pool_size` connection slots regardless of
         // `fs_op_slots`.
         let mut engine = Engine::on_ring(ring, cfg.pool_size)?;
+        if let Some(workers) = cfg.iowq_bounded_workers {
+            engine.ring.bound_iowq_workers(workers)?;
+        }
 
         // Fail fast - before binding - on kernels whose io_uring can't serve
         // the per-connection peer-identity fetches; otherwise every affected
@@ -1651,5 +1654,65 @@ impl<U, AcceptFn, HeaderFn, BodyFn> std::fmt::Debug
             .field("inflight", &self.core.engine.inflight)
             .field("ring", &self.core.engine.ring)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod iowq_tests {
+    use super::*;
+
+    /// The bounds of bounded and unbounded io-wq work that the thread which
+    /// built a server over TCP holds once it is built, read by registering
+    /// zeros. The TCP probe of `build` submits on the ring, so the thread's
+    /// io-wq exists by then.
+    fn built_with(workers: Option<u32>) -> Option<([u32; 2], u32)> {
+        std::thread::spawn(move || {
+            let addrs: Vec<Listen> =
+                vec![ServerAddr::Tcp("127.0.0.1:0".parse().unwrap()).into()];
+            let cfg = ServerConfig {
+                iowq_bounded_workers: workers,
+                ..ServerConfig::default()
+            };
+            let entries = ring_entries(&cfg, &addrs).next_power_of_two();
+            let protocol = Protocol {
+                accept: |_: Incoming<'_>| Some(()),
+                header: length_prefix_header::<()>(
+                    PrefixWidth::U32,
+                    Endian::Big,
+                    false,
+                ),
+                body: |_: Request<'_, ()>| Response::Close,
+            };
+            let server = match Server::with_config(addrs, cfg, protocol) {
+                Ok(server) => server,
+                Err(Error::Errno(e)) if crate::uring::setup_unavailable(e) => {
+                    return None;
+                }
+                Err(e) => panic!("Server::with_config: {e}"),
+            };
+            let held = server.core.engine.ring.bound_iowq_workers(0);
+            Some((held.expect("the bounds read back"), entries))
+        })
+        .join()
+        .expect("the thread that built the server")
+    }
+
+    /// A server built with a bound runs its thread's io-wq with it, and one
+    /// built without keeps the kernel's own, the lesser of the ring's
+    /// submission entries and four for each CPU (`io_init_wq_offload`,
+    /// `io_uring/tctx.c`). Registering zeros to read them changes nothing.
+    #[test]
+    fn a_server_bounds_its_threads_io_wq_workers() {
+        let Some(([bounded, _], _)) = built_with(Some(3)) else {
+            return;
+        };
+        assert_eq!(bounded, 3, "the bound the server was built with");
+        let Some(([bounded, _], entries)) = built_with(None) else {
+            return;
+        };
+        // SAFETY: sysconf reads a value and touches no memory of ours.
+        let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+        let kernel = entries.min(4 * online as u32);
+        assert_eq!(bounded, kernel, "the kernel's own bound");
     }
 }
