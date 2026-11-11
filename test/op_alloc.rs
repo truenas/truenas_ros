@@ -21,7 +21,7 @@
 ))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::ffi::CStr;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddrV4, TcpStream};
@@ -31,8 +31,9 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 use truenas_ros::net::server::{
-    Deferred, Endian, Incoming, PrefixWidth, Protocol, Request, Response,
-    Server, ServerAddr, ServerConfig, ShutdownHandle, length_prefix_header,
+    BodyRecycler, Deferred, Endian, Incoming, PrefixWidth, Protocol, Request,
+    Response, Server, ServerAddr, ServerConfig, ShutdownHandle,
+    length_prefix_header,
 };
 use truenas_ros::sync_fs::{AtFlags, OFlag, OpenHow, StatxMask};
 use truenas_ros::uring_fs::{
@@ -117,7 +118,7 @@ fn recv_framed(s: &mut TcpStream) -> io::Result<Vec<u8>> {
 /// The ops counted, in the order a pass reports them, with the
 /// allocations each may make: its callback's box, and a statx's box for
 /// its result besides.
-const OPS: [(&str, usize); 8] = [
+const OPS: [(&str, usize); 9] = [
     ("a reopen through /proc", 1),
     ("an open of a name", 1),
     ("an open of ..", 1),
@@ -126,14 +127,19 @@ const OPS: [(&str, usize); 8] = [
     ("a read of an xattr through /proc", 1),
     ("an fsetxattr", 1),
     ("a read into spare room", 1),
+    ("an owned write", 1),
 ];
 
 /// What one pass gathers until its last op answers.
 struct Pass {
     counts: RefCell<Vec<usize>>,
-    /// Whether each xattr op and the read into spare room gave back the
-    /// very buffer it was handed, through `FsDone::into_value`.
+    /// Whether each xattr op, the read into spare room and the owned write
+    /// gave back the very buffer it was handed, through
+    /// `FsDone::into_value`.
     same_value: RefCell<Vec<bool>>,
+    /// Whether the body pool's storage the owned write wrote from is the
+    /// storage the pass before gave back to the pool.
+    cycled: Cell<bool>,
     left: Cell<usize>,
     deferred: RefCell<Option<Deferred>>,
 }
@@ -151,6 +157,7 @@ impl Pass {
             reply.extend_from_slice(&(*n as u32).to_be_bytes());
         }
         reply.extend(self.same_value.borrow().iter().map(|&s| u8::from(s)));
+        reply.push(u8::from(self.cycled.get()));
         let mut framed = (reply.len() as u32).to_be_bytes().to_vec();
         framed.extend_from_slice(&reply);
         if let Some(deferred) = self.deferred.borrow_mut().take() {
@@ -162,11 +169,13 @@ impl Pass {
 const XATTR: &CStr = c"user.alloc";
 
 /// A reopen, an open of a name, an open of `..`, a statx of a name, an
-/// `fstatx`, a read of an xattr through `/proc`, an `fsetxattr` and a read
-/// into spare room with a buffer the handler keeps allocate nothing on a
-/// warm ring but the box of their callback, and each statx the box of its
-/// result. An xattr op and the read give their buffer back through
-/// `FsDone::into_value` with no outer `Vec`.
+/// `fstatx`, a read of an xattr through `/proc`, an `fsetxattr`, a read
+/// into spare room with a buffer the handler keeps and an owned write from
+/// storage of the ring's body pool allocate nothing on a warm ring but the
+/// box of their callback, and each statx the box of its result. An xattr
+/// op, the read and the write give their buffer back through
+/// `FsDone::into_value` with no outer `Vec`, and the write's storage goes
+/// back to the pool and is the storage the next pass claims.
 #[test]
 fn a_warm_rings_ops_allocate_only_their_callback() {
     let dir = truenas_ros::tempdir().unwrap();
@@ -192,8 +201,11 @@ fn a_warm_rings_ops_allocate_only_their_callback() {
             .into(),
     );
     let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
+    let pool: Rc<OnceCell<BodyRecycler>> = Rc::new(OnceCell::new());
+    let claimed = Rc::new(Cell::new(std::ptr::null::<u8>()));
 
     let pc = Arc::clone(&pers);
+    let rc = Rc::clone(&pool);
     let body = move |mut req: Request<'_, ()>| -> Response {
         let _ = req.body.take();
         let (deferred, permit) = req.responder.defer();
@@ -203,7 +215,8 @@ fn a_warm_rings_ops_allocate_only_their_callback() {
         let who = *pc.get().expect("personality set before serving");
         let pass = Rc::new(Pass {
             counts: RefCell::new(Vec::with_capacity(OPS.len())),
-            same_value: RefCell::new(Vec::with_capacity(3)),
+            same_value: RefCell::new(Vec::with_capacity(4)),
+            cycled: Cell::new(false),
             left: Cell::new(OPS.len()),
             deferred: RefCell::new(Some(deferred)),
         });
@@ -252,9 +265,28 @@ fn a_warm_rings_ops_allocate_only_their_callback() {
         let n = counted(|| fs.fsetxattr(who, f, XATTR, value, 0, cb));
         pass.counts.borrow_mut().push(n);
         let room = Vec::with_capacity(64);
-        let (f, cb) = (file, gave_back(&pass, room.as_ptr()));
+        let (f, cb) = (file.clone(), gave_back(&pass, room.as_ptr()));
         let empty = RwFlags::empty();
         let n = counted(|| fs.pread_spare(who, f, room, 5, 0, empty, cb));
+        pass.counts.borrow_mut().push(n);
+        let recycler = rc.get().expect("the pool set before serving").clone();
+        let mut owned = recycler.claim(4096);
+        owned.resize(4096, b'w');
+        pass.cycled
+            .set(owned.as_ptr() == claimed.replace(owned.as_ptr()));
+        let (storage, pass_back) = (owned.as_ptr(), Rc::clone(&pass));
+        let cb = move |d: FsDone, _: &mut truenas_ros::uring_fs::FsConn<'_>| {
+            let back = d.into_value();
+            pass_back
+                .same_value
+                .borrow_mut()
+                .push(back.as_ptr() == storage);
+            recycler.recycle(back);
+            pass_back.answered();
+        };
+        let n = counted(|| {
+            fs.pwritev2_owned(who, file, owned, 0..4096, 4096, empty, cb)
+        });
         pass.counts.borrow_mut().push(n);
         Response::Defer(permit)
     };
@@ -280,6 +312,8 @@ fn a_warm_rings_ops_allocate_only_their_callback() {
     };
     pers.set(server.register_self().expect("register_self"))
         .unwrap();
+    let recycler = server.body_recycler().expect("a server keeps a body pool");
+    assert!(pool.set(recycler).is_ok(), "the pool is set once");
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
@@ -297,12 +331,17 @@ fn a_warm_rings_ops_allocate_only_their_callback() {
     });
     server.serve_forever().expect("serve_forever");
     let reply = client.join().unwrap().expect("client io");
-    assert_eq!(reply.len(), OPS.len() * 4 + 3, "{reply:?}");
+    assert_eq!(reply.len(), OPS.len() * 4 + 5, "{reply:?}");
     for (i, (what, most)) in OPS.iter().enumerate() {
         let at = i * 4;
         let n = u32::from_be_bytes(reply[at..at + 4].try_into().unwrap());
         assert_eq!(n as usize, *most, "{what} allocated {n} times");
     }
-    let gave = &reply[OPS.len() * 4..];
-    assert_eq!(gave, [1, 1, 1], "each gives back its own buffer");
+    let gave = &reply[OPS.len() * 4..OPS.len() * 4 + 4];
+    assert_eq!(gave, [1, 1, 1, 1], "each gives back its own buffer");
+    assert_eq!(
+        reply[OPS.len() * 4 + 4],
+        1,
+        "the pass wrote from the storage the warm pass gave back"
+    );
 }

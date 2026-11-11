@@ -42,8 +42,8 @@ use crate::uring::sys::{
     IORING_OP_FSYNC, IORING_OP_FTRUNCATE, IORING_OP_GETXATTR, IORING_OP_LINKAT,
     IORING_OP_MKDIRAT, IORING_OP_OPENAT2, IORING_OP_READ, IORING_OP_READV,
     IORING_OP_RENAMEAT, IORING_OP_SPLICE, IORING_OP_STATX, IORING_OP_SYMLINKAT,
-    IORING_OP_TIMEOUT, IORING_OP_UNLINKAT, IORING_OP_WRITEV, IOSQE_ASYNC,
-    IOSQE_BUFFER_SELECT, IoUringCqe, SPLICE_F_MOVE,
+    IORING_OP_TIMEOUT, IORING_OP_UNLINKAT, IORING_OP_WRITE, IORING_OP_WRITEV,
+    IOSQE_ASYNC, IOSQE_BUFFER_SELECT, IoUringCqe, SPLICE_F_MOVE,
 };
 use crate::uring::user_data::{pack_raw, unpack_raw};
 use std::any::Any;
@@ -53,6 +53,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::mem::size_of;
+use std::ops::Range;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
 // The offload sink and the `DIR*` handoff are loom-modelled (see
@@ -146,6 +147,10 @@ pub(crate) const TAG_READ_SPARE: u8 = 0x95;
 /// The poll of the signalfd the breaks of the ring's file leases arrive on
 /// ([`FileLeases`]). It holds no op slot, since the ring has one at most.
 pub(crate) const TAG_FILE_LEASE: u8 = 0x96;
+/// `WRITE` of a range of one buffer ([`FsConn::pwritev2_owned`]). The buffer
+/// rides in the slot's `value`, as a read into spare room's does, and comes
+/// back whole whatever the kernel answers.
+pub(crate) const TAG_WRITE_OWNED: u8 = 0x97;
 /// The standalone host's wake tag (an embedded host reuses its own).
 pub(crate) const TAG_WAKE: u8 = 0x9D;
 /// Tags `ASYNC_CANCEL` ops (and the teardown drain); completions ignored.
@@ -364,9 +369,10 @@ struct FsOpEntry {
     waiter: Option<FsWaiter>,
     /// Owned data buffers: `READV` destinations / `WRITEV` sources.
     bufs: Vec<Vec<u8>>,
-    /// The value buffer of an `FGETXATTR`, an `FSETXATTR` or a `GETXATTR`
-    /// through `/proc`, on its own so the op builds no outer `Vec` for it.
-    /// An `FGETXATTR`'s kernel writes land in it at issue time.
+    /// The one buffer of an `FGETXATTR`, an `FSETXATTR`, a `GETXATTR`
+    /// through `/proc`, a read into spare room or an owned write, on its own
+    /// so the op builds no outer `Vec` for it. An `FGETXATTR`'s kernel
+    /// writes land in it at issue time.
     value: Option<Vec<u8>>,
     /// The iovec array the SQE points at. Element pointers target `bufs`'
     /// heap allocations, which never move while parked here.
@@ -1759,6 +1765,71 @@ impl FsCore {
             sqe.addr = room;
             // `spare_read_fits` held the count to a `u32`.
             sqe.len = count as u32;
+            sqe.off_addr2 = off;
+            sqe.op_flags = rw_flags;
+            sqe.personality = pers;
+        });
+        if let Err(err) = staged {
+            self.fail_op(eng, op_slot, err);
+        }
+    }
+
+    /// Stage one `WRITE` of `buf[range]` to `file` at `off`, with `buf`
+    /// kept in the slot's `value` until the CQE, as
+    /// [`submit_read_spare`](Self::submit_read_spare) keeps its own.
+    /// `IORING_OP_WRITE` takes the address and the count itself
+    /// (`io_prep_write`, `io_uring/rw.c`), so the slot builds no iovec.
+    ///
+    /// Refused with a marked `EINVAL` before a slot is taken whenever
+    /// [`owned_write_fits`] says no, and with a marked `EBUSY` on a full
+    /// table, with `buf` handed back as it came either way.
+    #[allow(clippy::too_many_arguments)] // an inject unpacked, not an API
+    pub(crate) fn submit_write_owned(
+        &mut self,
+        eng: &mut Engine,
+        pers: u16,
+        file: Arc<OwnedFd>,
+        buf: Vec<u8>,
+        range: Range<usize>,
+        off: u64,
+        rw_flags: u32,
+        waiter: FsWaiter,
+    ) {
+        if !owned_write_fits(buf.len(), &range, off) {
+            let (bufs, file) = (vec![buf], Some(file));
+            self.refuse(eng, waiter, Errno::EINVAL, true, bufs, file);
+            return;
+        }
+        let Some(op_slot) = self.pop_op() else {
+            let (bufs, file) = (vec![buf], Some(file));
+            self.refuse(eng, waiter, Errno::EBUSY, true, bufs, file);
+            return;
+        };
+
+        let raw_fd = file.as_raw_fd();
+        let entry = &mut self.ops[op_slot as usize];
+        let gen32 = entry.generation as u32;
+        let e = &mut entry.state;
+        e.state = FsOpState::InFlight {
+            tag: TAG_WRITE_OWNED,
+        };
+        e.waiter = Some(waiter);
+        // Parked so the descriptor stays open to the CQE, as `submit_rw`
+        // parks it.
+        e.file = Some(file);
+        // The heap block does not move with the vector parked here, so the
+        // bytes the SQE names stay where they are until the CQE.
+        let val = e.value.insert(buf);
+        let at = val[range.clone()].as_ptr() as u64;
+        let force = self.force_async.sqe_bit(ForceAsync::WRITE);
+        let ud = pack_raw(TAG_WRITE_OWNED, op_slot, gen32);
+        let staged = eng.stage(ud, |sqe| {
+            sqe.opcode = IORING_OP_WRITE;
+            sqe.fd = raw_fd;
+            sqe.flags = force;
+            sqe.addr = at;
+            // `owned_write_fits` held the count to a `u32`.
+            sqe.len = range.len() as u32;
             sqe.off_addr2 = off;
             sqe.op_flags = rw_flags;
             sqe.personality = pers;
@@ -3682,6 +3753,23 @@ pub(crate) fn spare_read_fits(room: usize, count: usize, off: u64) -> bool {
     count <= room && u32::try_from(count).is_ok() && off != u64::MAX
 }
 
+/// Whether a write of `range` of a buffer `len` bytes long at `off` may be
+/// staged. The range must be one `get` takes, inside the buffer and not
+/// inverted, or the address the SQE names lies outside it. A count past
+/// `u32::MAX` would truncate in `sqe.len`, and an `off` of `u64::MAX` is -1,
+/// which io_uring reads as the file's position (`io_kiocb_update_pos`,
+/// `io_uring/rw.c`), so the write would land in the wrong place.
+pub(crate) fn owned_write_fits(
+    len: usize,
+    range: &Range<usize>,
+    off: u64,
+) -> bool {
+    range.start <= range.end
+        && range.end <= len
+        && u32::try_from(range.end - range.start).is_ok()
+        && off != u64::MAX
+}
+
 #[cfg(test)]
 mod spare_read_tests {
     use super::spare_read_fits;
@@ -3697,6 +3785,32 @@ mod spare_read_tests {
         assert!(spare_read_fits(usize::MAX, most, 0));
         assert!(!spare_read_fits(usize::MAX, most + 1, 0), "past a u32");
         assert!(!spare_read_fits(8, 8, u64::MAX), "the file's position");
+    }
+}
+
+#[cfg(test)]
+mod owned_write_tests {
+    use super::owned_write_fits;
+
+    /// The screen alone, since a buffer of `u32::MAX` bytes is more than a
+    /// test may allocate.
+    #[test]
+    fn an_owned_write_fits_its_buffer_a_u32_and_a_real_offset() {
+        assert!(owned_write_fits(8, &(0..8), 0));
+        assert!(owned_write_fits(8, &(3..5), u64::MAX - 1));
+        assert!(owned_write_fits(8, &(8..8), 0), "an empty range at the end");
+        assert!(!owned_write_fits(8, &(4..9), 0), "past the buffer");
+        assert!(!owned_write_fits(8, &(9..9), 0), "starts past the buffer");
+        #[allow(clippy::reversed_empty_ranges)]
+        let inverted = 5..3;
+        assert!(!owned_write_fits(8, &inverted, 0), "inverted");
+        let most = u32::MAX as usize;
+        assert!(owned_write_fits(usize::MAX, &(1..most + 1), 0));
+        assert!(!owned_write_fits(usize::MAX, &(0..most + 1), 0), "a u32");
+        assert!(
+            !owned_write_fits(8, &(0..8), u64::MAX),
+            "the file's position"
+        );
     }
 }
 
@@ -3872,10 +3986,12 @@ impl FsDone {
         with_value(self.bufs, self.value)
     }
 
-    /// Take back the value buffer of an xattr op, the one an `fsetxattr`
-    /// set or an `fgetxattr` read into, with no outer `Vec` around it, so a
-    /// caller that keeps its buffers allocates nothing to have one back. A
-    /// refused xattr op gives its value back here too.
+    /// Take back the one buffer of an op that was handed one, the value an
+    /// `fsetxattr` set or an `fgetxattr` read into, the buffer of
+    /// [`FsConn::pread_spare`] or that of [`FsConn::pwritev2_owned`]. It
+    /// comes with no outer `Vec` around it, so a caller that keeps its
+    /// buffers allocates nothing to have one back. A refused op gives its
+    /// buffer back here too.
     pub fn into_value(self) -> Vec<u8> {
         let FsDone {
             value, mut bufs, ..
@@ -4741,7 +4857,9 @@ impl<'a> FsConn<'a> {
     /// delivery submits. Anything else - an unpooled connection, a placed
     /// or owned body, a range outside the claim, or a call from inside a
     /// task, whose facade carries no claim - falls back to `pwritev2` on a
-    /// copy, so the call degrades instead of failing. A full op table
+    /// copy, so the call degrades instead of failing. A body placed in
+    /// storage of its own is written with no copy by
+    /// [`pwritev2_owned`](Self::pwritev2_owned) instead. A full op table
     /// refuses the write with a marked `EBUSY` ([`FsDone::was_refused`]),
     /// as it refuses a copy, and hands nothing back: the bytes were the
     /// delivery's.
@@ -4878,6 +4996,49 @@ impl<'a> FsConn<'a> {
             }
         }
         self.pwritev2(who, f, vec![src.to_vec()], off, flags, on_done);
+    }
+
+    /// Write `buf[range]` to `f` at `off` with the flags of
+    /// [`pwritev2`](Self::pwritev2), from `buf` itself, so a body the
+    /// reactor placed in storage of its own
+    /// ([`Body::take_owned`](crate::net::core::Body::take_owned)) is written
+    /// with no copy, and no iovec or outer `Vec` is made for it.
+    ///
+    /// The same `buf` comes back through [`FsDone::into_value`] whatever
+    /// the outcome, for the caller to keep or to give back to the ring's
+    /// body pool
+    /// ([`BodyRecycler::recycle`](crate::net::core::BodyRecycler::recycle)).
+    /// So a short write, which ZFS returns as a success (`zfs_write`),
+    /// answers `Ok(n)`, and the caller may write the rest from the same
+    /// bytes, as on the copy path. A `range` that `buf.get` does not take, a
+    /// count past `u32::MAX`, and an `off` of `u64::MAX` are refused with a
+    /// marked `EINVAL`, since io_uring reads `u64::MAX` as the file's
+    /// position (`io_kiocb_update_pos`, `io_uring/rw.c`). A full op table
+    /// refuses the write with a marked `EBUSY` ([`FsDone::was_refused`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn pwritev2_owned<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        buf: Vec<u8>,
+        range: Range<usize>,
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        let w = self.waiter(on_done);
+        self.fs.submit_write_owned(
+            self.eng,
+            who.0,
+            f.fd,
+            buf,
+            range,
+            off,
+            flags.bits(),
+            w,
+        );
     }
 
     /// Write windows held with [`lease_window`](Self::lease_window) to `f`
@@ -9431,6 +9592,36 @@ mod routing_fuzz {
         let _ = core.on_cqe(&mut eng, t, s, g, 8192);
         let out = rx.try_recv().expect("delivered");
         assert_eq!(out.res, Ok(8192), "a full leased write is untouched");
+    }
+
+    /// A short owned write is an ordinary success with its count, as a
+    /// copied one is, since the buffer comes back whole with the completion
+    /// and the caller can write the rest from it. ZFS writes short only at a
+    /// quota or a full pool, so the count is handed in.
+    #[test]
+    fn a_short_owned_write_answers_its_count_with_its_buffer() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let buf = vec![7u8; 8192];
+        let storage = buf.as_ptr();
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        let (tx, rx) = mpsc::channel();
+        let w = chan(&tx);
+        core.submit_write_owned(&mut eng, 0, file, buf, 0..8192, 0, 0, w);
+        let [(t, s, g)] = inflight(&core)[..] else {
+            panic!("one op in flight");
+        };
+        let _ = core.on_cqe(&mut eng, t, s, g, 4096);
+        let out = rx.try_recv().expect("delivered");
+        assert_eq!(out.res, Ok(4096), "a short owned write is its count");
+        let [back] = &out.bufs[..] else {
+            panic!("one buffer back, not {}", out.bufs.len());
+        };
+        assert_eq!((back.as_ptr(), back.len()), (storage, 8192));
     }
 
     /// N writes share one claim; the buffer surfaces from the last.
