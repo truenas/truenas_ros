@@ -325,7 +325,9 @@ pub enum CloseReason {
 /// overlapping move - how the http codec delivers a de-chunked entity), and a
 /// copy-out otherwise - so a handler that offloads work writes one pattern
 /// that is never wrong: `let payload = body.take();`. After `take` the body
-/// reads as empty.
+/// reads as empty. A handler that writes the body out or keeps it whole
+/// takes [`Body::take_owned`] instead, which hands over the storage with
+/// the body's range in it and never copies.
 pub struct Body<'a> {
     inner: BodyInner<'a>,
 }
@@ -439,17 +441,21 @@ impl<'a> Body<'a> {
         }
     }
 
-    /// The full backing allocation, when this body owns one - window
-    /// position discarded, every byte included - or `None` for an inline
-    /// body. The codec-side seam for in-place transforms over a delivered
-    /// wire message (the http chunked path); handlers use [`Body::take`].
-    #[cfg_attr(not(feature = "http"), allow(dead_code))]
-    pub(crate) fn try_take_owned(&mut self) -> Option<Vec<u8>> {
+    /// The whole allocation of a body that owns one, a placed body, with
+    /// the range the body takes in it, and the body reads as empty
+    /// afterwards. Nothing moves, so the bytes around the range are still
+    /// there, which the http codec de-chunks in place.
+    ///
+    /// `None` for a body that borrows the receive buffer or a larger
+    /// message, which is left as it was. [`Body::take`] would copy one of
+    /// those, so a handler that must not copy writes it out where it lies,
+    /// as `FsConn::pwritev2_from` does.
+    pub fn take_owned(&mut self) -> Option<(Vec<u8>, std::ops::Range<usize>)> {
         match &mut self.inner {
             BodyInner::Inline(_) | BodyInner::InlineMut(_) => None,
-            BodyInner::Owned { buf, len, .. } => {
-                *len = 0;
-                buf.take()
+            BodyInner::Owned { buf, start, len } => {
+                let range = *start..*start + *len;
+                buf.take().map(|v| (v, range))
             }
         }
     }
@@ -767,26 +773,33 @@ mod tests {
     }
 
     #[test]
-    fn try_take_owned_returns_the_backing_allocation() {
+    fn take_owned_hands_over_the_allocation_and_the_range() {
         let wire = b"5\r\nhello\r\n0\r\n\r\n".to_vec();
         let p0 = wire.as_ptr() as usize;
         let mut b = Body::placed(wire);
-        let w = b
-            .try_take_owned()
-            .expect("owned body hands its buffer over");
+        let (w, range) =
+            b.take_owned().expect("owned body hands its buffer over");
         assert_eq!(w.as_ptr() as usize, p0);
-        assert_eq!(w.len(), 15);
+        assert_eq!((w.len(), range), (15, 0..15));
+        assert!(b.is_empty());
+        assert!(b.take_owned().is_none(), "handed over once");
+        // A window of a larger allocation comes with its place in it, and
+        // the bytes around it stay where they were.
+        let mut b = Body::owned_range(b"..abc.".to_vec(), 2, 3);
+        let (w, range) = b.take_owned().expect("a window is owned too");
+        assert_eq!((&w[..], range), (&b"..abc."[..], 2..5));
         assert!(b.is_empty());
         // Inline bodies have no allocation to hand over, and are untouched.
         let mut b = Body::inline(b"abc");
-        assert!(b.try_take_owned().is_none());
+        assert!(b.take_owned().is_none());
         assert_eq!(&b[..], b"abc");
         assert!(b.bytes_mut().is_none());
         // A handler may change the bytes where they lie when the reactor
         // delivered them, inline or placed.
         let mut abc = *b"abc";
         let mut b = Body::inline_mut(&mut abc);
-        assert!(b.try_take_owned().is_none());
+        assert!(b.take_owned().is_none());
+        assert_eq!(&b[..], b"abc", "a body in the receive buffer stays");
         b.bytes_mut().unwrap()[0] = b'x';
         assert_eq!(&b[..], b"xbc");
         drop(b);
