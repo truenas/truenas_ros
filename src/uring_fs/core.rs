@@ -1858,33 +1858,46 @@ impl FsCore {
         }
     }
 
-    /// Stage one `WRITEV` of held windows' bytes, in order from `off`, every
+    /// Stage one write of held windows' bytes, in order from `off`, every
     /// share held to the CQE and each buffer's id surfaced at the reap for
-    /// the net server to hand back. `Err` hands the windows and waiter back,
-    /// never in flight: a full op table, a refused SQE, or a gather that
-    /// does not fit one `WRITEV` (`gather_fits`).
+    /// the net server to hand back. The windows come as a `Vec` for a
+    /// gather, or as an array of one, so a single window takes no outer
+    /// `Vec`. One window is a `WRITE`, which takes the address and the
+    /// count itself (`io_prep_write`, `io_uring/rw.c`), so it needs no
+    /// iovec and never grows the slot's array, which a slot last used by an
+    /// op with none has no room in. More are a `WRITEV`.
+    ///
+    /// `Err` hands the waiter back, never in flight. A full op table and a
+    /// gather that does not fit one `WRITEV` (`gather_fits`) hand the
+    /// windows back as they came. A refused SQE drops them in the slot,
+    /// which returns each share, since no caller does more with them.
     ///
     /// # Safety-relevant contract
     /// A window's bytes stay valid while its share lives, and the entry
     /// keeps every share to the reap.
     #[cfg(feature = "net-server")]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn submit_pwritev2_gathered(
+    pub(crate) fn submit_pwritev2_gathered<W>(
         &mut self,
         eng: &mut Engine,
         pers: u16,
         file: Arc<OwnedFd>,
-        windows: Vec<LeasedWindow>,
+        windows: W,
         off: u64,
         rw_flags: u32,
         waiter: FsWaiter,
-    ) -> Result<(), (Vec<LeasedWindow>, FsWaiter)> {
-        let total: usize = windows.iter().map(LeasedWindow::len).sum();
-        if !gather_fits(windows.len(), total) {
-            return Err((windows, waiter));
+    ) -> Result<(), (Option<W>, FsWaiter)>
+    where
+        W: AsRef<[LeasedWindow]> + IntoIterator<Item = LeasedWindow>,
+    {
+        let held = windows.as_ref();
+        let count = held.len();
+        let total: usize = held.iter().map(LeasedWindow::len).sum();
+        if !gather_fits(count, total) {
+            return Err((Some(windows), waiter));
         }
         let Some(op_slot) = self.pop_op() else {
-            return Err((windows, waiter));
+            return Err((Some(windows), waiter));
         };
         let raw_fd = file.as_raw_fd();
         let entry = &mut self.ops[op_slot as usize];
@@ -1892,12 +1905,16 @@ impl FsCore {
         entry.state.state = FsOpState::InFlight { tag: TAG_WRITEV };
         entry.state.iov.clear();
         entry.state.recv_lease_more.clear();
-        let count = windows.len() as u32;
+        let mut single = None;
         for LeasedWindow { view, hold } in windows {
-            entry.state.iov.push(libc::iovec {
-                iov_base: view.ptr as *mut libc::c_void,
-                iov_len: view.len,
-            });
+            if count == 1 {
+                single = Some(view);
+            } else {
+                entry.state.iov.push(libc::iovec {
+                    iov_base: view.ptr as *mut libc::c_void,
+                    iov_len: view.len,
+                });
+            }
             if entry.state.recv_lease.is_none() {
                 entry.state.recv_lease = Some(hold);
             } else {
@@ -1906,15 +1923,23 @@ impl FsCore {
         }
         entry.state.file = Some(file);
         entry.state.lease_want = total as u32;
-        let iov_ptr = entry.state.iov.as_ptr() as u64;
+        // `gather_fits` held the count to `UIO_MAXIOV` and the bytes to
+        // `max_rw_count`, so both fit a `u32`.
+        let (opcode, addr, len) = match single {
+            Some(view) => (IORING_OP_WRITE, view.ptr as u64, view.len as u32),
+            None => {
+                let iov = entry.state.iov.as_ptr() as u64;
+                (IORING_OP_WRITEV, iov, count as u32)
+            }
+        };
         let force = self.force_async.sqe_bit(ForceAsync::WRITE);
         let ud = pack_raw(TAG_WRITEV, op_slot, gen32);
         let staged = eng.stage(ud, |sqe| {
-            sqe.opcode = IORING_OP_WRITEV;
+            sqe.opcode = opcode;
             sqe.fd = raw_fd;
             sqe.flags = force;
-            sqe.addr = iov_ptr;
-            sqe.len = count;
+            sqe.addr = addr;
+            sqe.len = len;
             sqe.off_addr2 = off;
             sqe.op_flags = rw_flags;
             sqe.personality = pers;
@@ -1925,30 +1950,12 @@ impl FsCore {
                 Ok(())
             }
             Err(_) => {
-                // Never in flight: hand the windows back to be refused.
-                let holds = entry
-                    .state
-                    .recv_lease
-                    .take()
-                    .into_iter()
-                    .chain(entry.state.recv_lease_more.drain(..));
-                let back = entry
-                    .state
-                    .iov
-                    .iter()
-                    .zip(holds)
-                    .map(|(iov, hold)| LeasedWindow {
-                        view: LeasedBytes {
-                            ptr: iov.iov_base as *const u8,
-                            len: iov.iov_len,
-                        },
-                        hold,
-                    })
-                    .collect();
+                // Never in flight, so the clear drops every share the slot
+                // took, which returns each buffer as its last share goes.
                 entry.state.clear();
                 entry.generation += 1;
                 self.op_free.push(op_slot);
-                Err((back, waiter))
+                Err((None, waiter))
             }
         }
     }
@@ -1964,19 +1971,21 @@ impl FsCore {
     /// are refused in their place, after the body was written.
     #[cfg(feature = "net-server")]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn submit_leased_or_refuse(
+    pub(crate) fn submit_leased_or_refuse<W>(
         &mut self,
         eng: &mut Engine,
         pers: u16,
         file: Arc<OwnedFd>,
-        windows: Vec<LeasedWindow>,
+        windows: W,
         off: u64,
         rw_flags: u32,
         waiter: FsWaiter,
-    ) {
+    ) where
+        W: AsRef<[LeasedWindow]> + IntoIterator<Item = LeasedWindow>,
+    {
         debug_assert!(gather_fits(
-            windows.len(),
-            windows.iter().map(LeasedWindow::len).sum()
+            windows.as_ref().len(),
+            windows.as_ref().iter().map(LeasedWindow::len).sum()
         ));
         if let Err((windows, waiter)) = self.submit_pwritev2_gathered(
             eng,
@@ -5007,11 +5016,12 @@ impl<'a> FsConn<'a> {
                     hold: std::sync::Arc::clone(&hold),
                 };
                 let w = self.waiter(on_done);
+                // An array of one, so the write takes no outer `Vec`.
                 match self.fs.submit_pwritev2_gathered(
                     self.eng,
                     who.0,
                     Arc::clone(&f.fd),
-                    vec![window],
+                    [window],
                     off,
                     flags.bits(),
                     w,
@@ -10073,8 +10083,9 @@ mod routing_fuzz {
         let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
         let hold = std::sync::Arc::new(LeaseHold::detached(9));
         for n in [0, UIO_MAXIOV + 1] {
-            let windows = (0..n).map(|_| window_over(&buf, &hold)).collect();
-            let Err((back, _)) = core.submit_pwritev2_gathered(
+            let windows: Vec<LeasedWindow> =
+                (0..n).map(|_| window_over(&buf, &hold)).collect();
+            let Err((Some(back), _)) = core.submit_pwritev2_gathered(
                 &mut eng,
                 0,
                 Arc::clone(&file),
@@ -10083,7 +10094,7 @@ mod routing_fuzz {
                 0,
                 embedded_noop(),
             ) else {
-                panic!("{n} windows must be refused");
+                panic!("{n} windows must be refused and handed back");
             };
             assert_eq!(back.len(), n, "every window comes back");
             assert!(inflight(&core).is_empty(), "nothing went in flight");
