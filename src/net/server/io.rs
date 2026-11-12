@@ -259,10 +259,10 @@ where
             // borrows, so the disjoint access is fine.) The storage itself
             // goes home if the handler drops the body untaken.
             if let Some(pool) = self.core.body_pool.as_ref() {
-                if delivered > 0 {
-                    pool.borrow_mut().receipt_done(delivered);
+                if delivered.licence > 0 {
+                    pool.borrow_mut().receipt_done(delivered.licence);
                 }
-                body.set_home(pool);
+                body.set_home(pool, delivered.bytes);
             }
             // The fs facade borrows the engine and the fs tables - fields
             // disjoint from `self.core.table` (which `conn` holds) and

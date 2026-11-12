@@ -1639,8 +1639,8 @@ impl<U> Reactor<U> {
             // Promoted storage comes home with the message that outgrew
             // the pool buffer - licence attached - and the next
             // promotion anywhere on the ring reuses it.
-            if let Some((v, licence)) = surplus {
-                pool.borrow_mut().give_held(v, licence);
+            if let Some((v, ticket)) = surplus {
+                pool.borrow_mut().give_held(v, ticket);
             }
         }
         let Some(claim) = claim else {

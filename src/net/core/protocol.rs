@@ -423,15 +423,18 @@ impl<'a> Body<'a> {
     }
 
     /// Send the storage of a body that owns some back to `pool` if the
-    /// handler drops the body without taking it. A body that borrows its
-    /// bytes owns nothing to send.
+    /// handler drops the body without taking it, and take the `bytes` it
+    /// has on the pool's count off as the body is taken or dropped. A body
+    /// that borrows its bytes owns nothing to send and has nothing counted.
     #[cfg(feature = "net-server")]
     pub(crate) fn set_home(
         &mut self,
         pool: &crate::net::core::bodypool::PoolHandle,
+        bytes: usize,
     ) {
         if matches!(self.inner, BodyInner::Owned { buf: Some(_), .. }) {
-            self.home = Some(crate::net::core::bodypool::Home::new(pool));
+            self.home =
+                Some(crate::net::core::bodypool::Home::new(pool, bytes));
         }
     }
 
@@ -452,6 +455,9 @@ impl<'a> Body<'a> {
             }
             BodyInner::Owned { buf, start, len } => match buf.take() {
                 Some(mut v) => {
+                    // Taken, the storage leaves the pool's count.
+                    #[cfg(feature = "net-server")]
+                    drop(self.home.take());
                     if *start > 0 {
                         // Overlapping move within the same allocation; the
                         // window becomes the prefix, the tail is dropped.
@@ -480,6 +486,9 @@ impl<'a> Body<'a> {
             BodyInner::Inline(_) | BodyInner::InlineMut(_) => None,
             BodyInner::Owned { buf, start, len } => {
                 let range = *start..*start + *len;
+                // Taken, the storage leaves the pool's count.
+                #[cfg(feature = "net-server")]
+                drop(self.home.take());
                 buf.take().map(|v| (v, range))
             }
         }

@@ -100,6 +100,7 @@
 //! optimization contract, not a correctness one, and nothing breaks when
 //! an error path drops a body on the floor.
 
+use super::conn::Ticket;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -175,6 +176,15 @@ pub(crate) struct BodyPool {
     served: usize,
     /// Consecutive rebalances that observed no serve.
     idle_rounds: u8,
+    /// Bytes of storage out of this pool that the reactor holds, by
+    /// capacity. A placed or promoted body counts from its claim until it
+    /// is taken or given back, and a reply marked recycled from when it is
+    /// queued on its connection until it is sent or dropped. Each give
+    /// takes back exactly what its claim counted and never reads a
+    /// capacity again, since storage may grow while it is held.
+    ring_held: usize,
+    /// Bytes the consumer counts as its own ([`BodyRecycler::take_out`]).
+    out_held: usize,
 }
 
 impl BodyPool {
@@ -187,7 +197,25 @@ impl BodyPool {
             missed_bytes: 0,
             served: 0,
             idle_rounds: 0,
+            ring_held: 0,
+            out_held: 0,
         }
+    }
+
+    /// The bytes held out of this pool, the reactor's count and the
+    /// consumer's figure together.
+    pub(crate) fn held(&self) -> usize {
+        self.ring_held.saturating_add(self.out_held)
+    }
+
+    /// Put storage the reactor now holds on the count.
+    pub(crate) fn hold(&mut self, bytes: usize) {
+        self.ring_held = self.ring_held.saturating_add(bytes);
+    }
+
+    /// Take storage the reactor no longer holds off the count.
+    pub(crate) fn unhold(&mut self, bytes: usize) {
+        self.ring_held = self.ring_held.saturating_sub(bytes);
     }
 
     /// The best-fitting free Vec for `min_cap`, if serving it is not an
@@ -221,10 +249,23 @@ impl BodyPool {
     /// `min_cap` recorded on the windowed pot — where none does. The
     /// returned Vec is empty; its capacity covers `min_cap`.
     pub(crate) fn claim(&mut self, min_cap: usize) -> Vec<u8> {
-        let (v, licence) = self.claim_held(min_cap);
+        let (v, licence) = self.fit(min_cap);
         self.missed_bytes =
             self.missed_bytes.saturating_add(licence).min(self.budget);
         v
+    }
+
+    /// A fitting reused Vec where one waits, with no licence, or a fresh
+    /// allocation with `min_cap` as its licence.
+    fn fit(&mut self, min_cap: usize) -> (Vec<u8>, usize) {
+        match self.take_fit(min_cap) {
+            Some(mut v) => {
+                debug_assert!(v.is_empty(), "a pooled body kept bytes");
+                v.reserve_exact(min_cap);
+                (v, 0)
+            }
+            None => (Vec::with_capacity(min_cap), min_cap),
+        }
     }
 
     /// [`claim`](BodyPool::claim) for a claimant whose storage resolves
@@ -234,16 +275,14 @@ impl BodyPool {
     /// [`give_held`](BodyPool::give_held) or
     /// [`receipt_done`](BodyPool::receipt_done); held licences do not
     /// expire with the observation window, so a receipt spanning
-    /// maintenance ticks still licenses what it used.
-    pub(crate) fn claim_held(&mut self, min_cap: usize) -> (Vec<u8>, usize) {
-        match self.take_fit(min_cap) {
-            Some(mut v) => {
-                debug_assert!(v.is_empty(), "a pooled body kept bytes");
-                v.reserve_exact(min_cap);
-                (v, 0)
-            }
-            None => (Vec::with_capacity(min_cap), min_cap),
-        }
+    /// maintenance ticks still licenses what it used. The storage's
+    /// capacity goes on the count of held bytes, and rides the ticket
+    /// beside the licence so that the give takes off what was put on.
+    pub(crate) fn claim_held(&mut self, min_cap: usize) -> (Vec<u8>, Ticket) {
+        let (v, licence) = self.fit(min_cap);
+        let bytes = v.capacity();
+        self.hold(bytes);
+        (v, Ticket { licence, bytes })
     }
 
     /// A held claim's body is leaving reactor custody (delivered to
@@ -258,14 +297,18 @@ impl BodyPool {
             self.missed_bytes.saturating_add(licence).min(self.budget);
     }
 
-    /// Hand storage home with the held licence its claim recorded (0
-    /// for a pool-served claim). Cleared here so a claim never sees
-    /// stale bytes; retained only within the byte target — which
-    /// outstanding missed bytes may first raise toward it, up to the
-    /// budget — and freed on the spot otherwise.
-    pub(crate) fn give_held(&mut self, mut v: Vec<u8>, licence: usize) {
-        self.missed_bytes =
-            self.missed_bytes.saturating_add(licence).min(self.budget);
+    /// Hand storage home with the ticket its claim recorded. The ticket's
+    /// held licence, 0 for a pool-served claim, joins the pot, and its
+    /// bytes leave the count. The storage is cleared so a claim never sees
+    /// stale bytes, and kept only within the byte target, which outstanding
+    /// missed bytes may first raise toward it up to the budget. Past that
+    /// it is freed on the spot.
+    pub(crate) fn give_held(&mut self, mut v: Vec<u8>, ticket: Ticket) {
+        self.unhold(ticket.bytes);
+        self.missed_bytes = self
+            .missed_bytes
+            .saturating_add(ticket.licence)
+            .min(self.budget);
         let cap = v.capacity();
         if cap == 0 {
             return;
@@ -300,7 +343,7 @@ impl BodyPool {
     /// Hand storage home, consumer form: no held licence, so retention
     /// rides whatever the windowed pot holds.
     pub(crate) fn give(&mut self, v: Vec<u8>) {
-        self.give_held(v, 0);
+        self.give_held(v, Ticket::default());
     }
 
     /// The timer's observation: quiet long enough halves the target and
@@ -426,6 +469,35 @@ impl BodyRecycler {
     pub fn claim(&self, min_cap: usize) -> Vec<u8> {
         self.pool.borrow_mut().claim(min_cap)
     }
+
+    /// Count `bytes` the consumer holds in [`held`](Self::held), such as
+    /// storage it claimed or a body it took. Neither is on the ring's own
+    /// count, since a `Vec` the consumer drops where the pool cannot see
+    /// it would stay counted for good, so the consumer counts what it
+    /// holds here and gives exactly as much back.
+    pub fn take_out(&self, bytes: usize) {
+        let mut p = self.pool.borrow_mut();
+        p.out_held = p.out_held.saturating_add(bytes);
+    }
+
+    /// Take `bytes` the consumer counted with
+    /// [`take_out`](Self::take_out) off [`held`](Self::held) again. Past
+    /// what it counted, the figure stops at 0.
+    pub fn give_back(&self, bytes: usize) {
+        let mut p = self.pool.borrow_mut();
+        p.out_held = p.out_held.saturating_sub(bytes);
+    }
+
+    /// The bytes held out of the ring's body pool. The ring counts placed
+    /// and promoted bodies from their claim until a handler takes them or
+    /// they go back, and replies sent with
+    /// [`SendBuf::recycled`](crate::net::server::SendBuf::recycled) or
+    /// `Deferred::reply_recycled` from when they are queued until they are
+    /// sent or dropped, each by capacity. The consumer's own figure is
+    /// added to that.
+    pub fn held(&self) -> usize {
+        self.pool.borrow().held()
+    }
 }
 
 /// The ring's body pool, shared by the reactor, the connections and the
@@ -435,27 +507,50 @@ pub(crate) type PoolHandle = Rc<RefCell<BodyPool>>;
 /// The way home to the ring's body pool for storage the reactor handed on
 /// and nobody took, a placed body a handler left where it lies and a reply
 /// marked recycled that never reached the wire. Whoever holds the storage
-/// gives it back through this as it drops it.
+/// gives it back through this as it drops it. It carries the bytes the
+/// storage has on the pool's count, which leave the count as it drops,
+/// with the storage or without it, as when a handler takes a body.
 pub(crate) struct Home {
     pool: PoolHandle,
+    bytes: usize,
 }
 
 impl Home {
-    pub(crate) fn new(pool: &PoolHandle) -> Home {
+    /// The way home for storage already on the count under `bytes`.
+    pub(crate) fn new(pool: &PoolHandle, bytes: usize) -> Home {
         Home {
             pool: Rc::clone(pool),
+            bytes,
         }
     }
 
+    /// The way home for storage of `bytes` the reactor holds from now on,
+    /// which puts them on the count.
+    pub(crate) fn hold(pool: &PoolHandle, bytes: usize) -> Home {
+        pool.borrow_mut().hold(bytes);
+        Home::new(pool, bytes)
+    }
+
     /// Give `v` back, for the pool to keep or free under its byte law.
-    pub(crate) fn give(self, v: Vec<u8>) {
-        self.pool.borrow_mut().give(v);
+    pub(crate) fn give(mut self, v: Vec<u8>) {
+        let bytes = std::mem::take(&mut self.bytes);
+        self.pool
+            .borrow_mut()
+            .give_held(v, Ticket { licence: 0, bytes });
+    }
+}
+
+impl Drop for Home {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.pool.borrow_mut().unhold(self.bytes);
+        }
     }
 }
 
 impl std::fmt::Debug for Home {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Home").finish_non_exhaustive()
+        f.debug_struct("Home").field("bytes", &self.bytes).finish()
     }
 }
 
@@ -566,8 +661,8 @@ mod tests {
         let mut p = BodyPool::new(64 * MIB);
         // Concurrent, so each claim misses and licenses its own bytes.
         let claims: Vec<_> = (0..3).map(|_| p.claim_held(5 * MIB)).collect();
-        for (v, licence) in claims {
-            p.give_held(v, licence);
+        for (v, t) in claims {
+            p.give_held(v, t);
         }
         assert_eq!(p.retained(), 15 * MIB, "the storm's working set kept");
         // The workload shifts: every claim is refused as over-provision
@@ -595,15 +690,15 @@ mod tests {
     #[test]
     fn a_held_licence_survives_the_observation_window() {
         let mut p = BodyPool::new(64 * MIB);
-        let (v, licence) = p.claim_held(MIB);
-        assert_eq!(licence, MIB, "a dry pool records the bytes needed");
+        let (v, t) = p.claim_held(MIB);
+        assert_eq!(t.licence, MIB, "a dry pool records the bytes needed");
         p.rebalance(); // a tick passes mid-receipt
         p.rebalance(); // and another
-        p.give_held(v, licence);
+        p.give_held(v, t);
         assert_eq!(p.retained(), MIB, "the slow body still licenses itself");
-        let (w, licence) = p.claim_held(MIB);
-        assert_eq!(licence, 0, "and the next receipt is a pool hit");
-        p.give_held(w, 0);
+        let (w, t) = p.claim_held(MIB);
+        assert_eq!(t.licence, 0, "and the next receipt is a pool hit");
+        p.give_held(w, t);
     }
 
     /// A delivered body's licence moves to the windowed pot at
@@ -612,9 +707,9 @@ mod tests {
     #[test]
     fn a_delivered_body_recycles_on_the_deliverys_clock() {
         let mut p = BodyPool::new(64 * MIB);
-        let (v, licence) = p.claim_held(MIB);
+        let (v, t) = p.claim_held(MIB);
         p.rebalance(); // the receipt spans a tick
-        p.receipt_done(licence); // delivery: the body leaves custody
+        p.receipt_done(t.licence); // delivery: the body leaves custody
         drop(v); // the handler owns it now; it comes back via recycle
         let mut recycled = Vec::new();
         recycled.reserve_exact(MIB);
@@ -686,9 +781,9 @@ mod tests {
         // is hot with serves the big buffer never gets (a 300 KiB ask
         // refuses it as over-provision).
         for _ in 0..SHRINK_AFTER {
-            let (v, licence) = p.claim_held(300 * 1024);
-            assert_eq!(licence, 0, "the small class serves itself");
-            p.give_held(v, 0);
+            let (v, t) = p.claim_held(300 * 1024);
+            assert_eq!(t.licence, 0, "the small class serves itself");
+            p.give_held(v, t);
             p.rebalance();
         }
         assert_eq!(
@@ -697,9 +792,9 @@ mod tests {
             "the unserved high-water buffer ages out; the serving one stays"
         );
         assert_eq!(p.target(), 300 * 1024, "its licence died with it");
-        let (v, licence) = p.claim_held(300 * 1024);
-        assert_eq!(licence, 0, "and the survivor still serves");
-        p.give_held(v, 0);
+        let (v, t) = p.claim_held(300 * 1024);
+        assert_eq!(t.licence, 0, "and the survivor still serves");
+        p.give_held(v, t);
     }
 
     /// The free list is sorted by capacity, so a claim binary-searches
@@ -714,13 +809,13 @@ mod tests {
             .into_iter()
             .map(|s| p.claim_held(s))
             .collect();
-        for (v, licence) in claims {
-            p.give_held(v, licence);
+        for (v, t) in claims {
+            p.give_held(v, t);
         }
-        let (served, licence) = p.claim_held(MIB + MIB / 2);
-        assert_eq!(licence, 0, "a fitting buffer waited");
+        let (served, t) = p.claim_held(MIB + MIB / 2);
+        assert_eq!(t.licence, 0, "a fitting buffer waited");
         assert_eq!(served.capacity(), 2 * MIB, "and the best fit served");
-        p.give_held(served, 0);
+        p.give_held(served, t);
     }
 
     /// A body is served from storage near its size: the high-water
@@ -731,23 +826,61 @@ mod tests {
     #[test]
     fn a_small_body_is_not_served_from_the_high_water_buffer() {
         let mut p = BodyPool::new(64 * MIB);
-        let (big, licence) = p.claim_held(3 * MIB);
-        p.give_held(big, licence);
+        let (big, t) = p.claim_held(3 * MIB);
+        p.give_held(big, t);
         assert_eq!(p.retained(), 3 * MIB, "the big body's storage waits");
-        let (small, licence) = p.claim_held(300 * 1024);
+        let (small, small_t) = p.claim_held(300 * 1024);
         assert!(
             small.capacity() < MIB,
             "a 300 KiB body must not carry a 3 MiB allocation: {}",
             small.capacity()
         );
-        assert_eq!(licence, 300 * 1024, "unmet at its own size, licensed");
+        assert_eq!(small_t.licence, 300 * 1024, "unmet at its size, licensed");
         assert_eq!(p.retained(), 3 * MIB, "the big buffer stayed for its own");
         // Near its size, the big buffer does serve.
-        let (served, licence) = p.claim_held(MIB);
+        let (served, t) = p.claim_held(MIB);
         assert_eq!(served.capacity(), 3 * MIB, "a 1 MiB ask takes the 3 MiB");
-        assert_eq!(licence, 0);
-        p.give_held(served, 0);
-        p.give_held(small, 300 * 1024);
+        assert_eq!(t.licence, 0);
+        p.give_held(served, t);
+        p.give_held(small, small_t);
+    }
+
+    /// The count of held bytes takes off exactly what each holder put on,
+    /// whatever the storage's capacity is by then, and the consumer's own
+    /// figure moves `held` beside it.
+    #[test]
+    fn held_bytes_come_off_as_they_went_on() {
+        let pool = Rc::new(RefCell::new(BodyPool::new(64 * MIB)));
+        let (mut v, t) = pool.borrow_mut().claim_held(MIB);
+        assert_eq!(t.bytes, v.capacity(), "the ticket carries the count");
+        assert_eq!(pool.borrow().held(), t.bytes, "a claim is held");
+        // Grown while held, as promoted storage may be.
+        v.reserve_exact(4 * MIB);
+        pool.borrow_mut().give_held(v, t);
+        assert_eq!(pool.borrow().held(), 0, "what went on came off");
+
+        // A body taken out of the reactor's sight leaves the count as its
+        // way home drops, and one given back leaves it too.
+        let taken = Home::hold(&pool, MIB);
+        let given = Home::hold(&pool, 2 * MIB);
+        assert_eq!(pool.borrow().held(), 3 * MIB);
+        drop(taken);
+        assert_eq!(pool.borrow().held(), 2 * MIB);
+        given.give(Vec::with_capacity(2 * MIB));
+        assert_eq!(pool.borrow().held(), 0);
+
+        // A consumer claim is not counted, and the consumer counts it.
+        let r = BodyRecycler::new(Rc::clone(&pool));
+        let claimed = r.claim(MIB);
+        assert_eq!(r.held(), 0, "a consumer claim is the consumer's to count");
+        r.take_out(claimed.capacity());
+        assert_eq!(r.held(), claimed.capacity());
+        let _ring = Home::hold(&pool, MIB);
+        assert_eq!(r.held(), claimed.capacity() + MIB, "both figures add");
+        r.give_back(claimed.capacity());
+        assert_eq!(r.held(), MIB);
+        r.give_back(1);
+        assert_eq!(r.held(), MIB, "giving back past the figure stops at 0");
     }
 
     /// A miss does not license retention across observation windows: a

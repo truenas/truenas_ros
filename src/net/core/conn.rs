@@ -194,12 +194,22 @@ pub(crate) struct RecvClaim {
     pub(crate) cap: usize,
 }
 
-/// Storage going home to the ring's body pool with the held licence
-/// its claim recorded ([`BodyPool::claim_held`]).
+/// What storage the reactor claimed from the ring's body pool owes the
+/// pool as it leaves, the held licence the claim's miss recorded and the
+/// bytes the claim put on the pool's count of held storage
+/// (`BodyPool::claim_held`). Zero for storage that came from elsewhere.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Ticket {
+    pub(crate) licence: usize,
+    pub(crate) bytes: usize,
+}
+
+/// Storage going home to the ring's body pool with the ticket its claim
+/// recorded ([`BodyPool::claim_held`]).
 ///
 /// [`BodyPool::claim_held`]: super::bodypool::BodyPool::claim_held
 #[cfg(feature = "net-server")]
-pub(crate) type HeldStorage = (Vec<u8>, usize);
+pub(crate) type HeldStorage = (Vec<u8>, Ticket);
 
 /// The bytes a connection has accumulated for the message it is framing.
 ///
@@ -233,12 +243,13 @@ pub(crate) struct RecvBuf {
     /// kernel writes into space reserved past the tail and the count only
     /// becomes known at completion.
     filled: usize,
-    /// The held body-pool licence a promote's missed claim recorded
+    /// The ticket a promote's claim recorded
     /// ([`BodyPool::claim_held`](super::bodypool::BodyPool::claim_held)),
     /// carried until `owned` goes home so a receipt spanning
-    /// maintenance ticks keeps what it is owed.
+    /// maintenance ticks keeps the licence it is owed, and the count
+    /// loses what the claim put on it.
     #[cfg(feature = "net-server")]
-    owned_licence: usize,
+    owned_ticket: Ticket,
 }
 
 impl RecvBuf {
@@ -355,7 +366,7 @@ impl RecvBuf {
     /// of its life, which is the retention the pools exist to end.
     pub(crate) fn release(
         &mut self,
-    ) -> (Option<RecvClaim>, Option<(Vec<u8>, usize)>) {
+    ) -> (Option<RecvClaim>, Option<(Vec<u8>, Ticket)>) {
         if self.filled > 0 {
             return (None, None);
         }
@@ -367,20 +378,20 @@ impl RecvBuf {
         }
         let surplus = (self.pooled && !self.owned.is_empty()).then(|| {
             let owned = std::mem::take(&mut self.owned);
-            (owned, self.take_owned_licence())
+            (owned, self.take_owned_ticket())
         });
         (self.claim.take(), surplus)
     }
 
-    /// The held licence riding `owned`, taken - 0 where no pool exists.
-    fn take_owned_licence(&mut self) -> usize {
+    /// The ticket riding `owned`, taken, and empty where no pool exists.
+    fn take_owned_ticket(&mut self) -> Ticket {
         #[cfg(feature = "net-server")]
         {
-            std::mem::take(&mut self.owned_licence)
+            std::mem::take(&mut self.owned_ticket)
         }
         #[cfg(not(feature = "net-server"))]
         {
-            0
+            Ticket::default()
         }
     }
 
@@ -388,16 +399,16 @@ impl RecvBuf {
     /// the connection is going away, and storage dropped on the floor
     /// is one warm buffer out of the pool's loop per close.
     #[cfg(feature = "net-server")]
-    pub(crate) fn forfeit_owned(&mut self) -> Option<(Vec<u8>, usize)> {
-        let licence = std::mem::take(&mut self.owned_licence);
+    pub(crate) fn forfeit_owned(&mut self) -> Option<(Vec<u8>, Ticket)> {
+        let ticket = std::mem::take(&mut self.owned_ticket);
         // A licence with no storage under it still has to be handed
         // over: `give_held` pots it before it looks at the capacity, so
         // an empty `Vec` carries it home, and taking it here without
         // returning it is the one way it is lost outright rather than
         // held. `promote_for` writes the licence and the capacity
         // separately, so the pair really can come apart.
-        (self.owned.capacity() > 0 || licence > 0)
-            .then(|| (std::mem::take(&mut self.owned), licence))
+        (self.owned.capacity() > 0 || ticket != Ticket::default())
+            .then(|| (std::mem::take(&mut self.owned), ticket))
     }
 
     /// Whether the buffer in hand covers a whole message of `total` bytes.
@@ -431,7 +442,7 @@ impl RecvBuf {
         &mut self,
         at: usize,
         want: usize,
-        seed: impl FnOnce() -> Option<(Vec<u8>, usize)>,
+        seed: impl FnOnce() -> Option<(Vec<u8>, Ticket)>,
     ) -> Option<RecvClaim> {
         // Unreachable while a leased write holds the claim - no recv is
         // armed between the write's submit and the delivery's consume - and
@@ -452,12 +463,12 @@ impl RecvBuf {
         // the pool. A missed claim's licence rides the storage
         // (`owned_licence`) until it goes home.
         #[cfg_attr(not(feature = "net-server"), allow(unused_variables))]
-        if let Some((s, licence)) = seed() {
+        if let Some((s, ticket)) = seed() {
             debug_assert!(s.is_empty(), "a reused body kept bytes");
             self.owned = s;
             #[cfg(feature = "net-server")]
             {
-                self.owned_licence = licence;
+                self.owned_ticket = ticket;
             }
         }
         self.owned.clear();
@@ -643,14 +654,14 @@ impl RecvBuf {
     /// `pooled` one-way and `promote_for` does not: a licence dropped on
     /// the floor here is demand the pool met and never counted, and it
     /// stops growing for a working set it is already serving.
-    pub(crate) fn take_owned(&mut self) -> Option<(Vec<u8>, usize)> {
+    pub(crate) fn take_owned(&mut self) -> Option<(Vec<u8>, Ticket)> {
         if self.claim.is_some() || self.pooled {
             return None;
         }
         let mut v = std::mem::take(&mut self.owned);
         v.truncate(self.filled);
         self.filled = 0;
-        Some((v, self.take_owned_licence()))
+        Some((v, self.take_owned_ticket()))
     }
 }
 
@@ -967,7 +978,7 @@ pub(crate) struct Connection<U> {
     /// riding the storage until it leaves custody - so a body arriving
     /// slower than the pool's maintenance tick keeps what it is owed.
     #[cfg(feature = "net-server")]
-    body_licence: usize,
+    body_ticket: Ticket,
     // ---- spliced body ----
     // A framed body spliced straight from the socket to a consumer fd
     // (`Framing::SpliceBody`) instead of read into a buffer - zero-copy. The fd
@@ -1197,7 +1208,7 @@ impl<U> Connection<U> {
             transport: Transport::Plain,
             body_buf: None,
             #[cfg(feature = "net-server")]
-            body_licence: 0,
+            body_ticket: Ticket::default(),
             recv_into_body: false,
             splicing: false,
             splice_polling: false,
@@ -1360,10 +1371,10 @@ impl<U> Connection<U> {
     pub(crate) fn deliver_parts(
         &mut self,
         handoff_threshold: Option<usize>,
-    ) -> (&[u8], Body<'_>, &ClientAddr, &mut U, usize) {
+    ) -> (&[u8], Body<'_>, &ClientAddr, &mut U, Ticket) {
         let placed = self.take_placed_body();
         if placed.is_none()
-            && let Some((buf, licence)) =
+            && let Some((buf, ticket)) =
                 self.take_body_handoff(handoff_threshold)
         {
             return (
@@ -1371,16 +1382,16 @@ impl<U> Connection<U> {
                 Body::placed(buf),
                 &self.peer,
                 &mut self.state,
-                licence,
+                ticket,
             );
         }
         let (header, rest) =
             self.recv_buf.deliver_mut(self.header_len, self.body_len);
-        let (body, licence) = match placed {
-            Some((bytes, licence)) => (Body::placed(bytes), licence),
-            None => (Body::inline_mut(rest), 0),
+        let (body, ticket) = match placed {
+            Some((bytes, ticket)) => (Body::placed(bytes), ticket),
+            None => (Body::inline_mut(rest), Ticket::default()),
         };
-        (header, body, &self.peer, &mut self.state, licence)
+        (header, body, &self.peer, &mut self.state, ticket)
     }
 
     /// As [`deliver_parts`](Self::deliver_parts), plus the recv claim as a
@@ -1398,11 +1409,11 @@ impl<U> Connection<U> {
         &ClientAddr,
         &mut U,
         Option<crate::uring_fs::core::RecvWriteLease<'_>>,
-        usize,
+        Ticket,
     ) {
         let placed = self.take_placed_body();
         if placed.is_none()
-            && let Some((buf, licence)) =
+            && let Some((buf, ticket)) =
                 self.take_body_handoff(handoff_threshold)
         {
             return (
@@ -1411,17 +1422,17 @@ impl<U> Connection<U> {
                 &self.peer,
                 &mut self.state,
                 None,
-                licence,
+                ticket,
             );
         }
         let (header, rest, lease) = self
             .recv_buf
             .deliver_leased_mut(self.header_len, self.body_len);
-        let (body, licence) = match placed {
-            Some((bytes, licence)) => (Body::placed(bytes), licence),
-            None => (Body::inline_mut(rest), 0),
+        let (body, ticket) = match placed {
+            Some((bytes, ticket)) => (Body::placed(bytes), ticket),
+            None => (Body::inline_mut(rest), Ticket::default()),
         };
-        (header, body, &self.peer, &mut self.state, lease, licence)
+        (header, body, &self.peer, &mut self.state, lease, ticket)
     }
 
     /// The placed body, if it is this delivery's to hand over.
@@ -1438,7 +1449,7 @@ impl<U> Connection<U> {
     /// redelivery arriving while the pump has already armed the *next*
     /// message's body: `deliver_one` zeroes that redelivery's frame for the
     /// same reason, and an empty body is the matching answer.
-    fn take_placed_body(&mut self) -> Option<(Vec<u8>, usize)> {
+    fn take_placed_body(&mut self) -> Option<(Vec<u8>, Ticket)> {
         if self.recv_into_body {
             return None;
         }
@@ -1449,10 +1460,10 @@ impl<U> Connection<U> {
         // licence spendable - potted afterwards, the pool freed
         // exactly the storage the recycle seam exists to keep.
         #[cfg(feature = "net-server")]
-        let licence = std::mem::take(&mut self.body_licence);
+        let ticket = std::mem::take(&mut self.body_ticket);
         #[cfg(not(feature = "net-server"))]
-        let licence = 0;
-        Some((body, licence))
+        let ticket = Ticket::default();
+        Some((body, ticket))
     }
 
     /// Teardown's take of everything the ring's body pool can reuse:
@@ -1467,7 +1478,7 @@ impl<U> Connection<U> {
         let placed = self
             .body_buf
             .take()
-            .map(|v| (v, std::mem::take(&mut self.body_licence)));
+            .map(|v| (v, std::mem::take(&mut self.body_ticket)));
         (placed, self.recv_buf.forfeit_owned())
     }
 
@@ -1482,7 +1493,7 @@ impl<U> Connection<U> {
     fn take_body_handoff(
         &mut self,
         handoff_threshold: Option<usize>,
-    ) -> Option<(Vec<u8>, usize)> {
+    ) -> Option<(Vec<u8>, Ticket)> {
         if self.header_len == 0
             && self.body_len > 0
             && self.recv_buf.len() == self.body_len
@@ -1561,7 +1572,7 @@ impl<U> Connection<U> {
     /// re-enters the pump, and the next delivery releases it.
     pub(crate) fn release_recv_buf(
         &mut self,
-    ) -> (Option<RecvClaim>, Option<(Vec<u8>, usize)>) {
+    ) -> (Option<RecvClaim>, Option<(Vec<u8>, Ticket)>) {
         if self.recving {
             return (None, None);
         }
@@ -1584,7 +1595,7 @@ impl<U> Connection<U> {
         &mut self,
         at: usize,
         want: usize,
-        seed: impl FnOnce() -> Option<(Vec<u8>, usize)>,
+        seed: impl FnOnce() -> Option<(Vec<u8>, Ticket)>,
     ) -> Option<RecvClaim> {
         self.recv_buf.promote_for(at, want, seed)
     }
@@ -1649,7 +1660,7 @@ impl<U> Connection<U> {
     /// (`header_len <= buf.len() < header_len + body_len`).
     pub(crate) fn arm_body_recv(
         &mut self,
-        reuse: Option<(Vec<u8>, usize)>,
+        reuse: Option<(Vec<u8>, Ticket)>,
     ) -> usize {
         let prefix = self.recv_buf.len() - self.header_len;
         // Reused storage from the ring's body pool where one waits; the
@@ -1659,10 +1670,10 @@ impl<U> Connection<U> {
         // body leaves custody so a receipt spanning maintenance ticks
         // keeps it.
         #[cfg_attr(not(feature = "net-server"), allow(unused_variables))]
-        let (mut body, licence) = reuse.unwrap_or_default();
+        let (mut body, ticket) = reuse.unwrap_or_default();
         #[cfg(feature = "net-server")]
         {
-            self.body_licence = licence;
+            self.body_ticket = ticket;
         }
         debug_assert!(body.is_empty(), "a reused body kept bytes");
         // Exact: a pooled Vec grown amortized lands at twice its old
@@ -1885,8 +1896,11 @@ impl<U> Connection<U> {
         let mut bytes = bytes.into();
         self.queued_bytes += bytes.len();
         #[cfg(feature = "net-server")]
+        // Counted as the ring's from here until it is sent or dropped.
         let home = match (&self.body_pool, bytes.recycled_mut()) {
-            (Some(pool), Some(_)) => Some(super::bodypool::Home::new(pool)),
+            (Some(pool), Some(v)) => {
+                Some(super::bodypool::Home::hold(pool, v.capacity()))
+            }
             _ => None,
         };
         let item = SendItem {
@@ -2449,6 +2463,7 @@ mod tests {
             vec![b'B'; 8].into(),
         ]));
         assert!(c.enqueue_reply_segments(vec![SendBuf::recycled(tail)]));
+        assert_eq!(pool.borrow().held(), 64 + 16, "counted once queued");
         assert_eq!(c.arm_send(), 12 + 8 + 10);
 
         let _ = c.advance_sent(4);
@@ -2457,6 +2472,7 @@ mod tests {
             0,
             "a partly sent segment keeps its storage"
         );
+        assert_eq!(pool.borrow().held(), 64 + 16, "and stays counted");
 
         // The rest of the head, all of the plain segment and half the last.
         let p = c.advance_sent(8 + 8 + 5);
@@ -2466,10 +2482,12 @@ mod tests {
             64,
             "only the marked segment goes home"
         );
+        assert_eq!(pool.borrow().held(), 16, "and leaves the count");
 
         let p = c.advance_sent(5);
         assert_eq!((p.replies, p.armed_remaining), (1, 0));
         assert_eq!(pool.borrow().retained(), 64 + 16);
+        assert_eq!(pool.borrow().held(), 0);
         let again = pool.borrow_mut().claim(64);
         assert_eq!(again.as_ptr(), at, "its own storage, not a copy");
     }
@@ -2487,6 +2505,7 @@ mod tests {
         assert_eq!(c.arm_send(), 12);
         drop(c);
         assert_eq!(pool.borrow().retained(), 64, "the unsent reply came home");
+        assert_eq!(pool.borrow().held(), 0, "and left the count");
         let again = pool.borrow_mut().claim(64);
         assert_eq!(again.as_ptr(), at, "its own storage, not a copy");
     }
@@ -2541,7 +2560,8 @@ mod tests {
         let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
         c.set_frame(0, 100);
         // Reused pool storage, sized by a larger tenant.
-        let want = c.arm_body_recv(Some((Vec::with_capacity(1024), 0)));
+        let want = c
+            .arm_body_recv(Some((Vec::with_capacity(1024), Ticket::default())));
         assert_eq!(want, 100);
         assert!(c.recv_armed_within(), "the armed read is in bounds");
         // Partial progress up to the body's edge stays in bounds.
@@ -2556,29 +2576,36 @@ mod tests {
         );
     }
 
-    /// A delivered placed body's held licence leaves custody *with*
-    /// it - handed to the delivery for potting before the handler
-    /// runs - rather than dying on the connection or leaking onto the
-    /// next message's claim.
+    /// A ticket as a claim of 100 bytes the pool could not serve records.
+    #[cfg(feature = "net-server")]
+    const MISSED_100: Ticket = Ticket {
+        licence: 100,
+        bytes: 100,
+    };
+
+    /// A delivered placed body's ticket leaves custody *with* it, its
+    /// licence for potting before the handler runs and its bytes for the
+    /// body to give back, rather than dying on the connection or leaking
+    /// onto the next message's claim.
     #[cfg(feature = "net-server")]
     #[test]
-    fn a_delivered_bodys_licence_rides_out_with_the_body() {
+    fn a_delivered_bodys_ticket_rides_out_with_the_body() {
         let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
         c.set_frame(0, 100);
-        let want = c.arm_body_recv(Some((Vec::with_capacity(100), 100)));
+        let want = c.arm_body_recv(Some((Vec::with_capacity(100), MISSED_100)));
         let ptr = c.recv_ptr() as *mut u8;
         // SAFETY: recv_ptr points at `want` reserved-but-uninit bytes.
         unsafe { std::ptr::write_bytes(ptr, 0xCD, want) };
         assert_eq!(c.recv_result(want as i32), RecvOutcome::Complete);
         {
-            let (_h, body, _addr, _state, licence) = c.deliver_parts(None);
+            let (_h, body, _addr, _state, ticket) = c.deliver_parts(None);
             assert_eq!(body.len(), 100, "the placed body delivered");
-            assert_eq!(licence, 100, "the licence rode out with the body");
+            assert_eq!(ticket, MISSED_100, "the ticket rode out with it");
         }
         c.set_frame(0, 0);
-        let (_h, body, _addr, _state, licence) = c.deliver_parts(None);
+        let (_h, body, _addr, _state, ticket) = c.deliver_parts(None);
         assert_eq!(body.len(), 0, "the body was taken once");
-        assert_eq!(licence, 0, "and the licence with it");
+        assert_eq!(ticket, Ticket::default(), "and the ticket with it");
     }
 
     /// Teardown hands a dying connection's body storage home with the
@@ -2586,15 +2613,16 @@ mod tests {
     /// upload must not take a warm buffer out of the pool's loop.
     #[cfg(feature = "net-server")]
     #[test]
-    fn teardown_forfeits_body_storage_with_its_licence() {
+    fn teardown_forfeits_body_storage_with_its_ticket() {
         let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
         c.set_frame(0, 100);
         // Armed and mid-receive: the peer disconnects here.
-        let _want = c.arm_body_recv(Some((Vec::with_capacity(100), 100)));
+        let _want =
+            c.arm_body_recv(Some((Vec::with_capacity(100), MISSED_100)));
         let (placed, owned) = c.forfeit_body_storage();
-        let (v, licence) = placed.expect("the placed storage comes home");
+        let (v, ticket) = placed.expect("the placed storage comes home");
         assert!(v.capacity() >= 100);
-        assert_eq!(licence, 100, "with the licence its claim recorded");
+        assert_eq!(ticket, MISSED_100, "with the ticket its claim recorded");
         assert!(owned.is_none(), "nothing was promoted");
         let (placed, _) = c.forfeit_body_storage();
         assert!(placed.is_none(), "forfeit is take-once");
@@ -3260,21 +3288,26 @@ mod tests {
         assert!(rb.armed_within(0, want), "inside what the promote sized");
     }
 
-    /// A licence outlives the `pooled` flag that let it be taken, so the
+    /// A ticket outlives the `pooled` flag that let it be taken, so the
     /// three sites that move `owned` out all have to carry it.
     ///
-    /// `promote_for` writes `owned_licence` and clears `claim`; it does
+    /// `promote_for` writes `owned_ticket` and clears `claim`. It does
     /// **not** clear `pooled`, which is what makes `take_owned`
     /// unreachable from a promote alone. `set_owned` clears `pooled`, is
     /// one-way, and is reached by an ordinary oversized exact read or a
     /// pool that will not grow - so the two compose, and `take_owned`
-    /// hands the storage to the handler with the licence still on the
-    /// connection unless it takes it. A dropped licence is demand the
-    /// pool met and never counted: it stops growing for a working set it
-    /// is already serving, silently, since nothing else reads the field.
+    /// hands the storage to the handler with the ticket still on the
+    /// connection unless it takes it. A dropped licence is demand the pool
+    /// met and never counted, so it stops growing for a working set it is
+    /// already serving, silently, since nothing else reads the field. And
+    /// dropped bytes stay on the count of held storage for good.
     #[cfg(feature = "net-server")]
     #[test]
-    fn every_path_that_moves_owned_out_carries_its_licence() {
+    fn every_path_that_moves_owned_out_carries_its_ticket() {
+        const MISSED_4096: Ticket = Ticket {
+            licence: 4096,
+            bytes: 4096,
+        };
         // Promote off a pool buffer: the seed's licence lands on the
         // connection and rides `owned` from here on.
         let seed = |rb: &mut RecvBuf| {
@@ -3286,9 +3319,9 @@ mod tests {
                 cap: 64,
             });
             rb.set_filled(8);
-            rb.promote_for(8, 1 << 20, || Some((Vec::new(), 4096)))
+            rb.promote_for(8, 1 << 20, || Some((Vec::new(), MISSED_4096)))
                 .expect("a promote past the claim's cap");
-            assert_eq!(rb.owned_licence, 4096, "the seed's licence is held");
+            assert_eq!(rb.owned_ticket, MISSED_4096, "the seed's is held");
         };
 
         // The delivery handoff, once the pool has given up on this
@@ -3297,9 +3330,9 @@ mod tests {
         let mut handed = RecvBuf::default();
         seed(&mut handed);
         handed.set_owned();
-        let (v, licence) = handed.take_owned().expect("owned and unpooled");
-        assert_eq!(licence, 4096, "the handoff dropped the licence");
-        assert_eq!(handed.owned_licence, 0, "and left none behind");
+        let (v, ticket) = handed.take_owned().expect("owned and unpooled");
+        assert_eq!(ticket, MISSED_4096, "the handoff dropped the ticket");
+        assert_eq!(handed.owned_ticket, Ticket::default(), "none behind");
         assert_eq!(v.len(), 8, "with the accumulated bytes");
 
         // Teardown, with the storage already handed off: a licence with
@@ -3309,8 +3342,8 @@ mod tests {
         let mut bare = RecvBuf::default();
         seed(&mut bare);
         bare.owned = Vec::new();
-        let (_, licence) = bare.forfeit_owned().expect("a licence with no Vec");
-        assert_eq!(licence, 4096, "teardown dropped the licence");
+        let (_, ticket) = bare.forfeit_owned().expect("a ticket with no Vec");
+        assert_eq!(ticket, MISSED_4096, "teardown dropped the ticket");
 
         // And the ordinary release, for the denominator - which the
         // delivery reaches once the message it accumulated is consumed.
@@ -3320,8 +3353,8 @@ mod tests {
         let (_, surplus) = released.release();
         assert_eq!(
             surplus.expect("promoted storage comes home").1,
-            4096,
-            "release dropped the licence"
+            MISSED_4096,
+            "release dropped the ticket"
         );
     }
 

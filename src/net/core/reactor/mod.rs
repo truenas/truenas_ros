@@ -277,11 +277,11 @@ impl<U> Reactor<U> {
         if let Some(pool) = self.body_pool.as_ref() {
             let (placed, owned) = self.table.forfeit_body_storage(slot);
             let mut pool = pool.borrow_mut();
-            if let Some((v, licence)) = placed {
-                pool.give_held(v, licence);
+            if let Some((v, ticket)) = placed {
+                pool.give_held(v, ticket);
             }
-            if let Some((v, licence)) = owned {
-                pool.give_held(v, licence);
+            if let Some((v, ticket)) = owned {
+                pool.give_held(v, ticket);
             }
         }
         // Segments still queued name ring buffers; the connection is about

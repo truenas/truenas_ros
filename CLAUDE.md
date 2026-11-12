@@ -331,6 +331,17 @@ Do not reopen these without a reason that is new.
   `an_untaken_buffered_body_does_not_allocate_per_message`,
   `a_recycled_segment_queued_at_a_teardown_goes_home` and
   `a_recycled_reply_that_reaches_no_request_goes_home`.
+- **The count of held bytes is exact by construction.** The reactor counts
+  the pool storage it holds by capacity, a placed or promoted body from its
+  claim until it is taken or given back, and a reply marked recycled from
+  its queueing until it is sent or dropped. Each holder carries what it put
+  on the count (`Ticket`, `Home`) and takes exactly that off, never a
+  capacity read again, since promoted storage grows while held. Storage a
+  consumer takes leaves the count, since a `Vec` dropped where the pool
+  cannot see it would stay counted for good, and the consumer counts what
+  it holds with `BodyRecycler::take_out` and `give_back`. Pinned by
+  `held_bytes_come_off_as_they_went_on` and
+  `held_bytes_follow_a_placed_body_and_a_recycled_reply`.
 
 ### Spreading connections across rings
 

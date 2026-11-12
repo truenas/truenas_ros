@@ -14022,3 +14022,104 @@ fn a_file_lease_break_reaches_the_server_s_handler() {
         std::fs::remove_file(&path).unwrap();
     }
 }
+
+// ---- the bytes a ring holds out of its body pool ---------------------------
+
+/// The ring's count of held bytes follows a placed body from its claim into
+/// the handler, which sees it counted until it takes the body or drops it
+/// untaken, and a reply marked recycled until it is sent, so a request after
+/// both finds the count back at 0.
+#[test]
+fn held_bytes_follow_a_placed_body_and_a_recycled_reply() {
+    use std::cell::{OnceCell, RefCell};
+    use std::rc::Rc;
+    use truenas_ros::net::server::{BodyRecycler, SendBuf};
+
+    // Past a receive buffer of the default size, so it is placed.
+    const BODY: usize = 512 * 1024;
+    let seam: Rc<OnceCell<BodyRecycler>> = Rc::new(OnceCell::new());
+    // What the handler saw, `(held at delivery, held after the body)`.
+    let seen: Rc<RefCell<Vec<(usize, usize)>>> = Rc::default();
+    let (handler_seam, handler_seen) = (Rc::clone(&seam), Rc::clone(&seen));
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |mut req: Request<'_, ()>| {
+            let r = handler_seam.get().expect("filled before serving");
+            let at_delivery = r.held();
+            let mut reply = r.claim(64 * 1024);
+            match req.body.first() {
+                // Taken, so off the count as the handler has it.
+                Some(b'T') => drop(req.body.take()),
+                Some(b'O') => drop(req.body.take_owned()),
+                // Dropped untaken, so off the count as it goes home.
+                Some(b'U') => drop(req.body),
+                _ => {}
+            }
+            handler_seen.borrow_mut().push((at_delivery, r.held()));
+            reply.extend_from_slice(&echo_frame(
+                &(at_delivery as u64).to_be_bytes(),
+            ));
+            Response::ReplyVectored {
+                segments: vec![SendBuf::recycled(reply)],
+                close: false,
+            }
+        },
+    };
+    let cfg = ServerConfig {
+        body_placement_threshold: Some(1024),
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let recycler = server.body_recycler().expect("a server keeps a body pool");
+    seam.set(recycler.clone()).expect("set once");
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            for tag in *b"TOU" {
+                let mut body = vec![tag; BODY];
+                body[1] = 0;
+                send_framed(&mut s, &body)?;
+                recv_framed(&mut s)?;
+                // A small request after the reply was read, whose handler
+                // sees whatever the ring still counts.
+                send_framed(&mut s, b"p")?;
+                let held = recv_framed(&mut s)?;
+                assert_eq!(held, 0u64.to_be_bytes(), "after {}", tag as char);
+            }
+            Ok(())
+        })()
+        .expect("client io");
+        stop.shutdown();
+    });
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join");
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 6, "three bodies and three probes");
+    for (i, &(at, after)) in seen.iter().enumerate() {
+        if i % 2 == 0 {
+            assert!(
+                at >= BODY,
+                "a placed body is counted from its claim: {at}"
+            );
+            assert_eq!(after, 0, "and comes off as it leaves the reactor");
+        } else {
+            assert_eq!((at, after), (0, 0), "nothing held between requests");
+        }
+    }
+    assert_eq!(recycler.held(), 0, "and nothing once the ring is idle");
+}
