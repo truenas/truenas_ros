@@ -978,12 +978,13 @@ where
         // rings below it cannot fail to construct. Bounded in bytes, not
         // buffers: retained capacity is what costs, and a count would let
         // a few maximal bodies retain what a thousand small ones should.
-        core.body_pool = Some(std::rc::Rc::new(std::cell::RefCell::new(
-            crate::net::core::bodypool::BodyPool::new(
-                BODY_POOL_BUDGET,
-                cfg.held_cap,
-            ),
-        )));
+        let mut body_pool = crate::net::core::bodypool::BodyPool::new(
+            BODY_POOL_BUDGET,
+            cfg.held_cap,
+        );
+        body_pool.count_handed(Arc::clone(&core.engine.shared));
+        core.body_pool =
+            Some(std::rc::Rc::new(std::cell::RefCell::new(body_pool)));
         let sizing = crate::uring::bufring::PoolSizing {
             initial_bytes: cfg.buf_pool_initial_bytes,
             max_step_bytes: cfg.buf_pool_max_step_bytes,
@@ -1554,12 +1555,17 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     /// `mark` after being at or past it, so that a call the consumer holds
     /// for bytes goes on with no tick and no poll, even when every
     /// connection waits. It runs once for each fall, and once they fall if
-    /// they are at or past the mark as it is set. It runs from the loop at
-    /// its next turn, never inside [`BodyRecycler::take_out`] or
-    /// [`BodyRecycler::give_back`], so the consumer is never called back in
-    /// the middle of its own call, and before reads held at
-    /// [`held_cap`](ServerConfig::held_cap) go on, so what it takes out
-    /// comes first. A second call replaces the first hook and its mark.
+    /// they are at or past the mark as it is set. A rise to the mark counts
+    /// when the ring or the consumer's [`BodyRecycler::take_out`] makes it,
+    /// or when [`BodyRecycler::held`] shows the bytes at or past the mark,
+    /// since a rise through [`Deferred::reply_recycled`] happens away from
+    /// the loop and a consumer waits only on what it was shown. It runs
+    /// from the loop at its next turn, never inside
+    /// [`BodyRecycler::take_out`] or [`BodyRecycler::give_back`], so the
+    /// consumer is never called back in the middle of its own call, and
+    /// before reads held at [`held_cap`](ServerConfig::held_cap) go on, so
+    /// what it takes out comes first. A second call replaces the first
+    /// hook and its mark.
     pub fn set_held_hook<F>(&mut self, mark: usize, hook: F)
     where
         F: FnMut() + 'static,

@@ -101,6 +101,10 @@
 //! an error path drops a body on the floor.
 
 use super::conn::Ticket;
+#[cfg(feature = "net-server")]
+use crate::sync::Arc;
+#[cfg(feature = "net-server")]
+use crate::uring::wake::LoopShared;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -185,14 +189,20 @@ pub(crate) struct BodyPool {
     ring_held: usize,
     /// Bytes the consumer counts as its own ([`BodyRecycler::take_out`]).
     out_held: usize,
+    /// The ring's loop state, whose `handed` bytes are replies a
+    /// `Deferred` handed to the loop that it has not yet queued or sent
+    /// home, which count from that hand-off.
+    #[cfg(feature = "net-server")]
+    shared: Option<Arc<LoopShared>>,
     /// `ServerConfig::held_cap`, past which the ring holds back the read
     /// of the next placed body.
     cap: Option<usize>,
     /// The mark of the server's held hook (`Server::set_held_hook`).
     mark: Option<usize>,
-    /// Whether `held` has been at or past the mark since the hook last
-    /// ran. Set as it goes there, which only a rise can do, and cleared as
-    /// the hook runs.
+    /// Whether `held` has been seen at or past the mark since the hook
+    /// last ran, after a rise through `hold` or `take_out` or as the
+    /// consumer reads it, and cleared as the hook runs. A rise through a
+    /// hand-off alone is not seen, since it happens away from the loop.
     crossed: bool,
 }
 
@@ -208,17 +218,23 @@ impl BodyPool {
             idle_rounds: 0,
             ring_held: 0,
             out_held: 0,
+            #[cfg(feature = "net-server")]
+            shared: None,
             cap,
             mark: None,
             crossed: false,
         }
     }
 
-    /// Note a rise of `held` that reaches the hook's mark.
-    fn raised(&mut self) {
-        if self.mark.is_some_and(|mark| self.held() >= mark) {
+    /// The bytes held, noting that the hook is owed a run once they fall
+    /// if they are at or past its mark. One read serves both, so a count
+    /// at the mark that the consumer is shown is always noted.
+    fn noted(&mut self) -> usize {
+        let held = self.held();
+        if self.mark.is_some_and(|mark| held >= mark) {
             self.crossed = true;
         }
+        held
     }
 
     /// Set the mark the held hook runs under, owing it a run at once if
@@ -245,16 +261,36 @@ impl BodyPool {
         self.cap.is_some_and(|cap| self.held() >= cap)
     }
 
-    /// The bytes held out of this pool, the reactor's count and the
+    /// Count the replies handed to the ring's loop through `shared` from
+    /// their hand-off.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn count_handed(&mut self, shared: Arc<LoopShared>) {
+        self.shared = Some(shared);
+    }
+
+    /// The bytes held out of this pool, the reactor's count, the replies
+    /// handed to the loop that it has not yet queued or sent home, and the
     /// consumer's figure together.
     pub(crate) fn held(&self) -> usize {
-        self.ring_held.saturating_add(self.out_held)
+        self.ring_held
+            .saturating_add(self.out_held)
+            .saturating_add(self.handed())
+    }
+
+    /// The bytes of replies handed to the loop that it has not yet queued
+    /// or sent home.
+    fn handed(&self) -> usize {
+        #[cfg(feature = "net-server")]
+        if let Some(shared) = &self.shared {
+            return shared.handed.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        0
     }
 
     /// Put storage the reactor now holds on the count.
     pub(crate) fn hold(&mut self, bytes: usize) {
         self.ring_held = self.ring_held.saturating_add(bytes);
-        self.raised();
+        self.noted();
     }
 
     /// Take storage the reactor no longer holds off the count.
@@ -522,7 +558,7 @@ impl BodyRecycler {
     pub fn take_out(&self, bytes: usize) {
         let mut p = self.pool.borrow_mut();
         p.out_held = p.out_held.saturating_add(bytes);
-        p.raised();
+        p.noted();
     }
 
     /// Take `bytes` the consumer counted with
@@ -535,13 +571,19 @@ impl BodyRecycler {
 
     /// The bytes held out of the ring's body pool. The ring counts placed
     /// and promoted bodies from their claim until a handler takes them or
-    /// they go back, and replies sent with
-    /// [`SendBuf::recycled`](crate::net::server::SendBuf::recycled) or
-    /// `Deferred::reply_recycled` from when they are queued until they are
-    /// sent or dropped, each by capacity. The consumer's own figure is
-    /// added to that.
+    /// they go back, replies sent with
+    /// [`SendBuf::recycled`](crate::net::server::SendBuf::recycled) from
+    /// when they are queued, and replies sent with
+    /// `Deferred::reply_recycled` from that call, each until it is sent or
+    /// dropped and by capacity. The consumer's own figure is added to that.
+    ///
+    /// A count this shows at or past the mark of the held hook owes the
+    /// hook a run once the count falls under it
+    /// (`Server::set_held_hook`), since a consumer that waits on what this
+    /// showed it hears of the fall from the hook alone, and a rise through
+    /// a hand-off is seen nowhere else.
     pub fn held(&self) -> usize {
-        self.pool.borrow().held()
+        self.pool.borrow_mut().noted()
     }
 }
 

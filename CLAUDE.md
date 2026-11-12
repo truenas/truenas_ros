@@ -339,9 +339,17 @@ Do not reopen these without a reason that is new.
   capacity read again, since promoted storage grows while held. Storage a
   consumer takes leaves the count, since a `Vec` dropped where the pool
   cannot see it would stay counted for good, and the consumer counts what
-  it holds with `BodyRecycler::take_out` and `give_back`. Pinned by
-  `held_bytes_come_off_as_they_went_on` and
-  `held_bytes_follow_a_placed_body_and_a_recycled_reply`.
+  it holds with `BodyRecycler::take_out` and `give_back`. A reply given to
+  `Deferred::reply_recycled` counts from that call through `handed` in
+  `LoopShared`, which the handle adds to before it sends the reply and the
+  loop takes off before it queues the reply or sends it home, so the check
+  of the hook's mark at the queueing sees it once. The loop reads that
+  capacity again, which is still what was added, since nothing can touch
+  the storage while the reply waits in the mailbox. Pinned by
+  `held_bytes_come_off_as_they_went_on`,
+  `held_bytes_follow_a_placed_body_and_a_recycled_reply`,
+  `a_deferred_recycled_reply_counts_from_its_hand_off` and
+  `a_handed_reply_queued_under_the_mark_owes_the_hook_nothing`.
 - **At `held_cap` a placed body read waits, in order, and nothing else
   does.** The check sits where the reactor decides to place a body, before
   it claims storage, so a held connection keeps its header and frame and
@@ -354,13 +362,18 @@ Do not reopen these without a reason that is new.
   `placed_bodies_past_the_held_cap_wait_their_turn` and
   `a_new_body_read_waits_behind_held_ones`.
 - **The held hook runs from the loop's turn, once for each fall under its
-  mark.** A rise that reaches the mark, which only `hold` and `take_out`
-  can make, owes the hook a run, and the loop pays it once the count is
-  under the mark. So a rise and fall within one call of the consumer's own
-  is heard too, and the hook never runs inside `give_back`. It runs before
-  held reads go on, so what it takes out comes first. Pinned by
-  `the_hook_is_owed_one_run_for_each_fall_under_its_mark` and
-  `the_held_hook_runs_once_under_its_mark_from_the_loop`.
+  mark.** A rise that reaches the mark through `hold` or `take_out`, or a
+  count at the mark that `BodyRecycler::held` shows, owes the hook a run,
+  and the loop pays it once the count is under the mark. So a rise and fall
+  within one call of the consumer's own is heard too, and the hook never
+  runs inside `give_back`. A rise through a `Deferred` hand-off happens
+  away from the loop and owes nothing by itself, since a consumer waits
+  only on what `held` showed it, so `held` notes the debt with the same
+  read it returns. It runs before held reads go on, so what it takes out
+  comes first. Pinned by
+  `the_hook_is_owed_one_run_for_each_fall_under_its_mark`,
+  `the_held_hook_runs_once_under_its_mark_from_the_loop` and
+  `the_held_hook_hears_a_fall_that_held_showed_the_rise_of`.
 
 ### Spreading connections across rings
 

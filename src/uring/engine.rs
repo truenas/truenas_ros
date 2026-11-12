@@ -105,6 +105,8 @@ impl Engine {
             graceful: AtomicBool::new(false),
             grace_ms: AtomicU64::new(0),
             wake: WakeHandle::new()?,
+            #[cfg(feature = "net-server")]
+            handed: crate::sync::atomic::AtomicUsize::new(0),
         });
         Ok(Engine {
             shared,

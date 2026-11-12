@@ -14132,6 +14132,308 @@ fn held_bytes_follow_a_placed_body_and_a_recycled_reply() {
     assert_eq!(recycler.held(), 0, "and nothing once the ring is idle");
 }
 
+/// A reply given to `Deferred::reply_recycled` counts from that call,
+/// before the loop has it, and stays counted once the loop queues it until
+/// it is sent, with no turn where neither side counts it. One that reaches
+/// no request leaves the count as it goes home, and an empty one goes as
+/// `Done` and adds nothing.
+#[test]
+fn a_deferred_recycled_reply_counts_from_its_hand_off() {
+    use std::cell::{OnceCell, RefCell};
+    use std::rc::Rc;
+    use truenas_ros::net::server::BodyRecycler;
+
+    const ROOM: usize = 64 * 1024;
+    let seam: Rc<OnceCell<(BodyRecycler, ControlHandle)>> =
+        Rc::new(OnceCell::new());
+    // `(held, room)` as the handler saw them after each hand-off, and as
+    // the control hook saw them once the loop queued the reply.
+    let handed: Rc<RefCell<Vec<(usize, usize)>>> = Rc::default();
+    let queued: Rc<RefCell<Vec<(usize, usize)>>> = Rc::default();
+    let (h_seam, h_handed) = (Rc::clone(&seam), Rc::clone(&handed));
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |req: Request<'_, ()>| {
+            let (r, control) = h_seam.get().expect("filled before serving");
+            let framed = || {
+                let mut v = r.claim(ROOM);
+                v.extend_from_slice(&echo_frame(b"sent"));
+                v
+            };
+            let (reply, spill) = match &*req.body {
+                b"reply" => (framed(), false),
+                b"spill" => (framed(), true),
+                b"empty" => (r.claim(ROOM), false),
+                _ => {
+                    let held = (r.held() as u64).to_be_bytes();
+                    return Response::Reply(echo_frame(&held));
+                }
+            };
+            if spill {
+                // Closed in the loop's drain ahead of the reply, so the
+                // reply reaches no request.
+                req.responder.push_handle().close();
+            }
+            let room = if reply.is_empty() {
+                0
+            } else {
+                reply.capacity()
+            };
+            let (deferred, permit) = req.responder.defer();
+            deferred.reply_recycled(reply);
+            h_handed.borrow_mut().push((r.held(), room));
+            if room > 0 && !spill {
+                // Reached in the same drain right after the reply, so the
+                // hook sees it queued and not yet sent.
+                control.send(Box::new(room));
+            }
+            Response::Defer(permit)
+        },
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server =
+        match Server::with_config([addr], ServerConfig::default(), proto) {
+            Ok(s) => s,
+            Err(e) if should_skip(&e) => return,
+            Err(e) => panic!("bind: {e}"),
+        };
+    let recycler = server.body_recycler().expect("a server keeps a body pool");
+    let (hook_recycler, hook_queued) = (recycler.clone(), Rc::clone(&queued));
+    server.set_control_hook(move |m| {
+        let room = *m.downcast::<usize>().expect("a room");
+        hook_queued.borrow_mut().push((hook_recycler.held(), room));
+    });
+    seam.set((recycler.clone(), server.control_handle()))
+        .unwrap_or_else(|_| panic!("set once"));
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        (|| -> io::Result<()> {
+            let held = |s: &mut TcpStream| -> io::Result<u64> {
+                send_framed(s, b"held")?;
+                let v = recv_framed(s)?;
+                Ok(u64::from_be_bytes(v.try_into().expect("eight bytes")))
+            };
+            let mut s = connect_tcp(v4)?;
+            send_framed(&mut s, b"reply")?;
+            assert_eq!(recv_framed(&mut s)?, b"sent");
+            // The loop may learn the reply was sent after the peer has it.
+            let until = Instant::now() + Duration::from_secs(10);
+            while held(&mut s)? != 0 {
+                assert!(Instant::now() < until, "a sent reply stayed counted");
+                thread::sleep(Duration::from_millis(1));
+            }
+            // An empty reply sends nothing, so the next reply is the probe's.
+            send_framed(&mut s, b"empty")?;
+            assert_eq!(held(&mut s)?, 0, "an empty reply adds nothing");
+            send_framed(&mut s, b"spill")?;
+            let mut rest = Vec::new();
+            s.read_to_end(&mut rest)?;
+            assert!(rest.is_empty(), "the reply reached no request");
+            let mut s = connect_tcp(v4)?;
+            assert_eq!(held(&mut s)?, 0, "a spilled reply leaves the count");
+            Ok(())
+        })()
+        .expect("client io");
+        stop.shutdown();
+    });
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join");
+    let handed = handed.borrow();
+    assert_eq!(handed.len(), 3, "a reply, an empty one and a spilled one");
+    for &(held, room) in handed.iter() {
+        assert_eq!(held, room, "counted from the hand-off, before the drain");
+    }
+    let queued = queued.borrow();
+    assert_eq!(queued.len(), 1, "the reply was queued once");
+    let (held, room) = queued[0];
+    assert!(room > 0);
+    assert_eq!(held, room, "counted once queued, and once only");
+    assert_eq!(recycler.held(), 0, "and nothing once the ring is idle");
+}
+
+/// A reply handed off under the held hook's mark by less than its own size
+/// owes the hook nothing as the loop queues it, since the count has it once
+/// there, nor as it is sent.
+#[test]
+fn a_handed_reply_queued_under_the_mark_owes_the_hook_nothing() {
+    use std::cell::{Cell, OnceCell};
+    use std::rc::Rc;
+    use truenas_ros::net::server::BodyRecycler;
+
+    const MARK: usize = 256 * 1024;
+    const ROOM: usize = 64 * 1024;
+    let seam: Rc<OnceCell<BodyRecycler>> = Rc::new(OnceCell::new());
+    let runs = Rc::new(Cell::new(0u8));
+    // What the handler takes out, so the count once the reply is sent.
+    let h_out = Rc::new(Cell::new(0usize));
+    let (h_seam, h_runs) = (Rc::clone(&seam), Rc::clone(&runs));
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |req: Request<'_, ()>| {
+            let r = h_seam.get().expect("filled before serving");
+            if &*req.body != b"near" {
+                // The hook's runs, and whether the reply has left the count.
+                let sent = u8::from(r.held() == h_out.get());
+                return Response::Reply(echo_frame(&[h_runs.get(), sent]));
+            }
+            let mut reply = r.claim(ROOM);
+            reply.extend_from_slice(&echo_frame(b"sent"));
+            let room = reply.capacity();
+            // Under the mark by half the reply once it is handed off, and
+            // past it if the reply were counted twice.
+            h_out.set(MARK - room - room / 2);
+            r.take_out(h_out.get());
+            let (deferred, permit) = req.responder.defer();
+            deferred.reply_recycled(reply);
+            Response::Defer(permit)
+        },
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server =
+        match Server::with_config([addr], ServerConfig::default(), proto) {
+            Ok(s) => s,
+            Err(e) if should_skip(&e) => return,
+            Err(e) => panic!("bind: {e}"),
+        };
+    let recycler = server.body_recycler().expect("a server keeps a body pool");
+    seam.set(recycler).unwrap_or_else(|_| panic!("set once"));
+    let hook_runs = Rc::clone(&runs);
+    server.set_held_hook(MARK, move || hook_runs.set(hook_runs.get() + 1));
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            send_framed(&mut s, b"near")?;
+            assert_eq!(recv_framed(&mut s)?, b"sent");
+            let mut probe = || -> io::Result<(u8, bool)> {
+                send_framed(&mut s, b"probe")?;
+                let v = recv_framed(&mut s)?;
+                Ok((v[0], v[1] == 1))
+            };
+            // The turn in which the loop saw the reply sent runs the hook
+            // if it is owed, so the probe after the one that finds it sent
+            // sees any run.
+            let until = Instant::now() + Duration::from_secs(10);
+            loop {
+                let (runs, sent) = probe()?;
+                assert_eq!(runs, 0, "the hook ran for a fall that never came");
+                if sent {
+                    break;
+                }
+                assert!(Instant::now() < until, "the reply stayed counted");
+                thread::sleep(Duration::from_millis(1));
+            }
+            let (runs, _) = probe()?;
+            assert_eq!(runs, 0, "the hook ran for a fall that never came");
+            Ok(())
+        })()
+        .expect("client io");
+        stop.shutdown();
+    });
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join");
+}
+
+/// A reply handed off at the held hook's mark that reaches no request
+/// falls back within the loop's turn, with no rise the ring made. The hook
+/// still hears that fall, since `BodyRecycler::held` showed the count at
+/// the mark meanwhile, and a consumer waits only on what that showed it.
+#[test]
+fn the_held_hook_hears_a_fall_that_held_showed_the_rise_of() {
+    use std::cell::{Cell, OnceCell};
+    use std::rc::Rc;
+    use truenas_ros::net::server::BodyRecycler;
+
+    const MARK: usize = 256 * 1024;
+    let seam: Rc<OnceCell<BodyRecycler>> = Rc::new(OnceCell::new());
+    let runs = Rc::new(Cell::new(0u8));
+    let (h_seam, h_runs) = (Rc::clone(&seam), Rc::clone(&runs));
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |req: Request<'_, ()>| {
+            let r = h_seam.get().expect("filled before serving");
+            if &*req.body != b"spill" {
+                return Response::Reply(echo_frame(&[h_runs.get()]));
+            }
+            let mut reply = r.claim(MARK);
+            reply.extend_from_slice(&echo_frame(b"late"));
+            // Closed in the loop's drain ahead of the reply, so the reply
+            // reaches no request and goes home within that drain.
+            req.responder.push_handle().close();
+            let (deferred, permit) = req.responder.defer();
+            deferred.reply_recycled(reply);
+            assert!(r.held() >= MARK, "the hand-off takes the count there");
+            Response::Defer(permit)
+        },
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server =
+        match Server::with_config([addr], ServerConfig::default(), proto) {
+            Ok(s) => s,
+            Err(e) if should_skip(&e) => return,
+            Err(e) => panic!("bind: {e}"),
+        };
+    let recycler = server.body_recycler().expect("a server keeps a body pool");
+    seam.set(recycler.clone())
+        .unwrap_or_else(|_| panic!("set once"));
+    let hook_runs = Rc::clone(&runs);
+    server.set_held_hook(MARK, move || hook_runs.set(hook_runs.get() + 1));
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            send_framed(&mut s, b"spill")?;
+            let mut rest = Vec::new();
+            s.read_to_end(&mut rest)?;
+            assert!(rest.is_empty(), "the reply reached no request");
+            let mut s = connect_tcp(v4)?;
+            let mut ask = || -> io::Result<u8> {
+                send_framed(&mut s, b"probe")?;
+                Ok(recv_framed(&mut s)?[0])
+            };
+            let until = Instant::now() + Duration::from_secs(10);
+            while ask()? < 1 {
+                assert!(Instant::now() < until, "the fall went unheard");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(ask()?, 1, "once for that fall");
+            Ok(())
+        })()
+        .expect("client io");
+        stop.shutdown();
+    });
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join");
+    assert_eq!(recycler.held(), 0, "the spilled reply left the count");
+}
+
 /// Placed bodies past `held_cap` wait and go on in the order they arrived,
 /// one at a time as the consumer gives bytes back, so the ring passes the
 /// cap by one body at most, and every body arrives whole. A body larger
@@ -14252,8 +14554,10 @@ fn placed_bodies_past_the_held_cap_wait_their_turn() {
             Duration::from_millis(80) * u32::from(PEERS) + receipt * 2,
         );
         assert_eq!(gate.load(Ordering::SeqCst), 2, "the rest wait");
+        // Each release once the body the last one let go on has arrived,
+        // so no two held bodies go on together and finish in either order.
         for released in 0..usize::from(PEERS) {
-            wait_for(released + 1);
+            wait_for((released + 2).min(usize::from(PEERS)));
             control.send(Box::new(()));
         }
         for (tag, peer) in peers.into_iter().enumerate() {
