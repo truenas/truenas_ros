@@ -199,9 +199,10 @@ pub(crate) struct BodyPool {
     cap: Option<usize>,
     /// The mark of the server's held hook (`Server::set_held_hook`).
     mark: Option<usize>,
-    /// Whether `held` has been at or past the mark since the hook last
-    /// ran. Set as it goes there, which only a rise can do, and cleared as
-    /// the hook runs.
+    /// Whether `held` has been seen at or past the mark since the hook
+    /// last ran, after a rise through `hold` or `take_out` or as the
+    /// consumer reads it, and cleared as the hook runs. A rise through a
+    /// hand-off alone is not seen, since it happens away from the loop.
     crossed: bool,
 }
 
@@ -225,11 +226,15 @@ impl BodyPool {
         }
     }
 
-    /// Note a rise of `held` that reaches the hook's mark.
-    fn raised(&mut self) {
-        if self.mark.is_some_and(|mark| self.held() >= mark) {
+    /// The bytes held, noting that the hook is owed a run once they fall
+    /// if they are at or past its mark. One read serves both, so a count
+    /// at the mark that the consumer is shown is always noted.
+    fn noted(&mut self) -> usize {
+        let held = self.held();
+        if self.mark.is_some_and(|mark| held >= mark) {
             self.crossed = true;
         }
+        held
     }
 
     /// Set the mark the held hook runs under, owing it a run at once if
@@ -285,7 +290,7 @@ impl BodyPool {
     /// Put storage the reactor now holds on the count.
     pub(crate) fn hold(&mut self, bytes: usize) {
         self.ring_held = self.ring_held.saturating_add(bytes);
-        self.raised();
+        self.noted();
     }
 
     /// Take storage the reactor no longer holds off the count.
@@ -553,7 +558,7 @@ impl BodyRecycler {
     pub fn take_out(&self, bytes: usize) {
         let mut p = self.pool.borrow_mut();
         p.out_held = p.out_held.saturating_add(bytes);
-        p.raised();
+        p.noted();
     }
 
     /// Take `bytes` the consumer counted with
@@ -571,8 +576,14 @@ impl BodyRecycler {
     /// when they are queued, and replies sent with
     /// `Deferred::reply_recycled` from that call, each until it is sent or
     /// dropped and by capacity. The consumer's own figure is added to that.
+    ///
+    /// A count this shows at or past the mark of the held hook owes the
+    /// hook a run once the count falls under it
+    /// (`Server::set_held_hook`), since a consumer that waits on what this
+    /// showed it hears of the fall from the hook alone, and a rise through
+    /// a hand-off is seen nowhere else.
     pub fn held(&self) -> usize {
-        self.pool.borrow().held()
+        self.pool.borrow_mut().noted()
     }
 }
 

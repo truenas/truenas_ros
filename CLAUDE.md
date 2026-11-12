@@ -362,13 +362,18 @@ Do not reopen these without a reason that is new.
   `placed_bodies_past_the_held_cap_wait_their_turn` and
   `a_new_body_read_waits_behind_held_ones`.
 - **The held hook runs from the loop's turn, once for each fall under its
-  mark.** A rise that reaches the mark, which only `hold` and `take_out`
-  can make, owes the hook a run, and the loop pays it once the count is
-  under the mark. So a rise and fall within one call of the consumer's own
-  is heard too, and the hook never runs inside `give_back`. It runs before
-  held reads go on, so what it takes out comes first. Pinned by
-  `the_hook_is_owed_one_run_for_each_fall_under_its_mark` and
-  `the_held_hook_runs_once_under_its_mark_from_the_loop`.
+  mark.** A rise that reaches the mark through `hold` or `take_out`, or a
+  count at the mark that `BodyRecycler::held` shows, owes the hook a run,
+  and the loop pays it once the count is under the mark. So a rise and fall
+  within one call of the consumer's own is heard too, and the hook never
+  runs inside `give_back`. A rise through a `Deferred` hand-off happens
+  away from the loop and owes nothing by itself, since a consumer waits
+  only on what `held` showed it, so `held` notes the debt with the same
+  read it returns. It runs before held reads go on, so what it takes out
+  comes first. Pinned by
+  `the_hook_is_owed_one_run_for_each_fall_under_its_mark`,
+  `the_held_hook_runs_once_under_its_mark_from_the_loop` and
+  `the_held_hook_hears_a_fall_that_held_showed_the_rise_of`.
 
 ### Spreading connections across rings
 
