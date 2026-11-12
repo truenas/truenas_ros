@@ -5130,8 +5130,55 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let total = windows.iter().map(LeasedWindow::len).sum();
-        if gather_fits(windows.len(), total) {
+        self.write_windows(who, f, windows, off, flags, on_done);
+    }
+
+    /// Write one window held with [`lease_window`](Self::lease_window) to
+    /// `f` at `off`, as [`pwritev2_leased`](Self::pwritev2_leased) writes a
+    /// gather, from any facade on the ring that leased it, a later
+    /// callback's included, with no outer `Vec` and no iovec. So a consumer
+    /// that keeps a request across a pause writes a range of it with no
+    /// copy, cut out with [`LeasedWindow::split_at`].
+    ///
+    /// The buffer returns to the pool when the window's last share goes. A
+    /// short write fails the op with `EIO` and gives its count through
+    /// [`FsDone::short_count`], and a full op table refuses the write with
+    /// a marked `EBUSY` ([`FsDone::was_refused`]), the buffer going back as
+    /// the window drops.
+    #[cfg(feature = "net-server")]
+    pub fn pwritev2_window<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        window: LeasedWindow,
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.write_windows(who, f, [window], off, flags, on_done);
+    }
+
+    /// The write of [`pwritev2_leased`](Self::pwritev2_leased) and
+    /// [`pwritev2_window`](Self::pwritev2_window), for a `Vec` of windows or
+    /// an array of one.
+    #[cfg(feature = "net-server")]
+    fn write_windows<W, F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        windows: W,
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        W: AsRef<[LeasedWindow]> + IntoIterator<Item = LeasedWindow>,
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        let held = windows.as_ref();
+        let total = held.iter().map(LeasedWindow::len).sum();
+        if gather_fits(held.len(), total) {
             let w = self.waiter(on_done);
             self.fs.submit_leased_or_refuse(
                 self.eng,
@@ -5147,8 +5194,8 @@ impl<'a> FsConn<'a> {
         // Too many windows or bytes for one `WRITEV`: one copy instead, and
         // the shares go back as the windows drop.
         let mut copy = Vec::with_capacity(total);
-        for window in &windows {
-            copy.extend_from_slice(window.view.as_slice());
+        for window in windows.as_ref() {
+            copy.extend_from_slice(window);
         }
         drop(windows);
         self.pwritev2(who, f, vec![copy], off, flags, on_done);
@@ -9724,6 +9771,53 @@ mod routing_fuzz {
             };
             assert_eq!((done.raw_result(), done.short_count()), (res, count));
         }
+    }
+
+    /// One window is staged as one `WRITE` of its bytes, with no iovec, and
+    /// its short write fails with `EIO` and gives its count as a gather's
+    /// does, while the buffer still comes back from its last share.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_short_window_write_gives_its_count_beside_its_eio() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let buf = vec![7u8; 8192];
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        let hold = std::sync::Arc::new(LeaseHold::detached(9));
+        let staged = core.submit_pwritev2_gathered(
+            &mut eng,
+            0,
+            file,
+            [window_over(&buf, &hold)],
+            0,
+            0,
+            embedded_noop(),
+        );
+        assert!(staged.is_ok(), "staged");
+        drop(hold);
+        let sqe = eng.staged_sqe(0);
+        assert_eq!(
+            (sqe.opcode, sqe.addr, sqe.len),
+            (IORING_OP_WRITE, buf.as_ptr() as u64, 8192),
+            "one window is one WRITE of its bytes"
+        );
+        let [(t, s, g)] = inflight(&core)[..] else {
+            panic!("one op in flight");
+        };
+        let ReapedFs::Embedded(_, mut done, _) =
+            core.on_cqe(&mut eng, t, s, g, 4096)
+        else {
+            panic!("an embedded waiter reaps embedded");
+        };
+        assert_eq!(
+            (done.raw_result(), done.short_count()),
+            (Err(Errno::EIO), Some(4096))
+        );
+        assert_eq!(done.take_recv_lease(), Some(9), "the buffer comes back");
     }
 
     /// N writes share one claim; the buffer surfaces from the last.
