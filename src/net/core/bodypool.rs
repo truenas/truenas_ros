@@ -188,6 +188,12 @@ pub(crate) struct BodyPool {
     /// `ServerConfig::held_cap`, past which the ring holds back the read
     /// of the next placed body.
     cap: Option<usize>,
+    /// The mark of the server's held hook (`Server::set_held_hook`).
+    mark: Option<usize>,
+    /// Whether `held` has been at or past the mark since the hook last
+    /// ran. Set as it goes there, which only a rise can do, and cleared as
+    /// the hook runs.
+    crossed: bool,
 }
 
 impl BodyPool {
@@ -203,7 +209,34 @@ impl BodyPool {
             ring_held: 0,
             out_held: 0,
             cap,
+            mark: None,
+            crossed: false,
         }
+    }
+
+    /// Note a rise of `held` that reaches the hook's mark.
+    fn raised(&mut self) {
+        if self.mark.is_some_and(|mark| self.held() >= mark) {
+            self.crossed = true;
+        }
+    }
+
+    /// Set the mark the held hook runs under, owing it a run at once if
+    /// `held` is at or past it already.
+    pub(crate) fn set_mark(&mut self, mark: usize) {
+        self.mark = Some(mark);
+        self.crossed = self.held() >= mark;
+    }
+
+    /// Whether the held hook is owed a run, `held` having been at or past
+    /// its mark and being under it now, which clears the debt.
+    pub(crate) fn hook_due(&mut self) -> bool {
+        let due =
+            self.crossed && self.mark.is_some_and(|mark| self.held() < mark);
+        if due {
+            self.crossed = false;
+        }
+        due
     }
 
     /// Whether the bytes held are at or past the cap, so that the read of
@@ -221,6 +254,7 @@ impl BodyPool {
     /// Put storage the reactor now holds on the count.
     pub(crate) fn hold(&mut self, bytes: usize) {
         self.ring_held = self.ring_held.saturating_add(bytes);
+        self.raised();
     }
 
     /// Take storage the reactor no longer holds off the count.
@@ -488,6 +522,7 @@ impl BodyRecycler {
     pub fn take_out(&self, bytes: usize) {
         let mut p = self.pool.borrow_mut();
         p.out_held = p.out_held.saturating_add(bytes);
+        p.raised();
     }
 
     /// Take `bytes` the consumer counted with
@@ -891,6 +926,31 @@ mod tests {
         assert_eq!(r.held(), MIB);
         r.give_back(1);
         assert_eq!(r.held(), MIB, "giving back past the figure stops at 0");
+    }
+
+    /// The hook is owed a run for each fall under its mark that a rise to
+    /// it came before, a mark set over held bytes included, and for no
+    /// other change.
+    #[test]
+    fn the_hook_is_owed_one_run_for_each_fall_under_its_mark() {
+        let mut p = BodyPool::new(64 * MIB, None);
+        p.set_mark(100);
+        assert!(!p.hook_due(), "nothing has risen");
+        p.hold(100);
+        assert!(!p.hook_due(), "at the mark is not under it");
+        p.unhold(100);
+        assert!(p.hook_due(), "a fall under the mark");
+        assert!(!p.hook_due(), "is owed one run");
+        p.hold(50);
+        p.unhold(50);
+        assert!(!p.hook_due(), "a rise short of the mark owes nothing");
+        p.hold(200);
+        p.set_mark(150);
+        p.unhold(200);
+        assert!(
+            p.hook_due(),
+            "a mark set over held bytes is owed their fall"
+        );
     }
 
     /// A miss does not license retention across observation windows: a

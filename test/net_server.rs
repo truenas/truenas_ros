@@ -14279,3 +14279,86 @@ fn placed_bodies_past_the_held_cap_wait_their_turn() {
         "a held read was closed on its receipt budget"
     );
 }
+
+/// The held hook runs from the loop once the ring's held bytes fall under
+/// its mark, never inside the `give_back` that took them there, and once
+/// for each fall, even a fall no request brought about.
+#[test]
+fn the_held_hook_runs_once_under_its_mark_from_the_loop() {
+    use std::cell::{Cell, OnceCell};
+    use std::rc::Rc;
+    use truenas_ros::net::server::BodyRecycler;
+
+    const MARK: usize = 256 * 1024;
+    let seam: Rc<OnceCell<BodyRecycler>> = Rc::new(OnceCell::new());
+    let runs = Rc::new(Cell::new(0u8));
+    let (h_seam, h_runs) = (Rc::clone(&seam), Rc::clone(&runs));
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |req: Request<'_, ()>| {
+            let r = h_seam.get().expect("filled before serving");
+            match &*req.body {
+                b"up" => r.take_out(MARK),
+                b"down" => {
+                    r.give_back(MARK);
+                    assert_eq!(h_runs.get(), 0, "never inside give_back");
+                }
+                _ => {}
+            }
+            Response::Reply(echo_frame(&[h_runs.get()]))
+        },
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server =
+        match Server::with_config([addr], ServerConfig::default(), proto) {
+            Ok(s) => s,
+            Err(e) if should_skip(&e) => return,
+            Err(e) => panic!("bind: {e}"),
+        };
+    let recycler = server.body_recycler().expect("a server keeps a body pool");
+    seam.set(recycler.clone()).expect("set once");
+    let hook_runs = Rc::clone(&runs);
+    server.set_held_hook(MARK, move || hook_runs.set(hook_runs.get() + 1));
+    // A rise and fall within one call of the consumer's own, between two
+    // requests, which the hook must hear of all the same.
+    server.set_control_hook(move |_| {
+        recycler.take_out(MARK);
+        recycler.give_back(MARK);
+    });
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let control = server.control_handle();
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        (|| -> io::Result<()> {
+            let mut s = connect_tcp(v4)?;
+            let mut ask = |what: &[u8]| -> io::Result<u8> {
+                send_framed(&mut s, what)?;
+                Ok(recv_framed(&mut s)?[0])
+            };
+            assert_eq!(ask(b"up")?, 0, "at the mark, nothing to run");
+            assert_eq!(ask(b"down")?, 0, "the fall is the loop's to answer");
+            assert_eq!(ask(b"probe")?, 1, "the loop ran the hook");
+            assert_eq!(ask(b"probe")?, 1, "once for one fall");
+            control.send(Box::new(()));
+            let until = Instant::now() + Duration::from_secs(10);
+            while ask(b"probe")? < 2 {
+                assert!(Instant::now() < until, "the second fall went unheard");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(ask(b"probe")?, 2, "once for that fall too");
+            Ok(())
+        })()
+        .expect("client io");
+        stop.shutdown();
+    });
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join");
+}
