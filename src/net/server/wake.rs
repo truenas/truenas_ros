@@ -105,6 +105,17 @@ where
 
 // The drain state machine runs no handler code - bounds-free.
 impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
+    /// Drop an outcome that reaches no request. A reply marked recycled
+    /// still sends its storage to the ring's body pool, as one queued on a
+    /// connection that closes does.
+    fn spill(&self, msg: Injected) {
+        if let Injected::ReplyRecycled(_, bytes) = msg
+            && let Some(pool) = self.core.body_pool.as_ref()
+        {
+            pool.borrow_mut().give(bytes);
+        }
+    }
+
     /// Enter graceful drain: stop accepting, close idle connections, let
     /// in-flight requests (reads in progress, deferred work, queued sends)
     /// finish, and arm the grace-period deadline that escalates to a hard stop.
@@ -437,6 +448,7 @@ where
                 }
             };
             if !self.core.table.slot_matches(token.slot, token.generation) {
+                self.spill(msg);
                 continue; // connection gone (or slot recycled)
             }
             {
@@ -450,6 +462,7 @@ where
                 // `Response::Detach` from that rerun parks the slot with an op
                 // still outstanding, which `on_closed` then frees untracked.
                 if conn.teardown_owns_slot() {
+                    self.spill(msg);
                     continue;
                 }
             }
@@ -459,6 +472,7 @@ where
                 .conn_mut(token.slot)
                 .take_deferred(token.req_id)
             {
+                self.spill(msg);
                 continue; // request already answered - stale Deferred
             }
             match msg {

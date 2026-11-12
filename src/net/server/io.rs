@@ -244,10 +244,10 @@ where
             // handler's `pwritev2_from` can write the body straight from
             // the buffer.
             #[cfg(feature = "uring-fs")]
-            let (header, body, peer, state, lease, delivered) = conn
+            let (header, mut body, peer, state, lease, delivered) = conn
                 .deliver_parts_leased(self.core.cfg.body_placement_threshold);
             #[cfg(not(feature = "uring-fs"))]
-            let (header, body, peer, state, delivered) =
+            let (header, mut body, peer, state, delivered) =
                 conn.deliver_parts(self.core.cfg.body_placement_threshold);
             // A placed body is leaving custody: its held licence joins
             // the pool's windowed pot *before* the handler runs, so a
@@ -256,11 +256,13 @@ where
             // storage the recycle handed back - the licence landed one
             // step behind the give it existed to cover, every time.
             // (`body_pool` is a sibling field of the table `conn`
-            // borrows, so the disjoint access is fine.)
-            if delivered > 0
-                && let Some(pool) = self.core.body_pool.as_ref()
-            {
-                pool.borrow_mut().receipt_done(delivered);
+            // borrows, so the disjoint access is fine.) The storage itself
+            // goes home if the handler drops the body untaken.
+            if let Some(pool) = self.core.body_pool.as_ref() {
+                if delivered > 0 {
+                    pool.borrow_mut().receipt_done(delivered);
+                }
+                body.set_home(pool);
             }
             // The fs facade borrows the engine and the fs tables - fields
             // disjoint from `self.core.table` (which `conn` holds) and

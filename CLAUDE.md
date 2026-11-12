@@ -321,6 +321,16 @@ Do not reopen these without a reason that is new.
   (`Seg::Recycled`). Pinned by
   `a_reply_claimed_from_the_pool_does_not_allocate_per_reply` and
   `a_recycled_segment_gives_its_storage_back_once_sent`.
+- **Storage the reactor handed on and nobody took comes home as it
+  drops.** A placed body the handler leaves untaken goes back as its
+  `Body` drops, since the handler owns its `Request`. A reply marked
+  recycled goes back as its queue entry drops, sent or not, so a teardown
+  sends home what it drains, and the injection drain sends home one that
+  reaches no request (`Server::spill`). Freed instead, a handler that reads
+  its body where it lies costs an allocation for every message. Pinned by
+  `an_untaken_buffered_body_does_not_allocate_per_message`,
+  `a_recycled_segment_queued_at_a_teardown_goes_home` and
+  `a_recycled_reply_that_reaches_no_request_goes_home`.
 
 ### Spreading connections across rings
 

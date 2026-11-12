@@ -2116,18 +2116,8 @@ impl<U> Reactor<U> {
         // Retire the PDUs the gather flushed: replies free read-ahead slots
         // (pushes don't participate in the cap).
         let progress = {
-            // Storage a consumer marked as the pool's goes home once sent,
-            // for the pool's byte law to keep or free. A ring with no body
-            // pool frees it, as it does any owned segment.
-            #[cfg(feature = "net-server")]
-            let spent = |bytes: Vec<u8>| match self.body_pool.as_ref() {
-                Some(pool) => pool.borrow_mut().give(bytes),
-                None => drop(bytes),
-            };
-            #[cfg(not(feature = "net-server"))]
-            let spent = drop::<Vec<u8>>;
             let conn = self.table.conn_mut(slot);
-            let progress = conn.advance_sent(res as usize, spent);
+            let progress = conn.advance_sent(res as usize);
             conn.outstanding =
                 conn.outstanding.saturating_sub(progress.replies);
             // Bytes flushed to the peer: any idle clock armed before this

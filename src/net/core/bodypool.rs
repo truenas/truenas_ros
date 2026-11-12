@@ -91,13 +91,14 @@
 //!
 //! # The loop is advisory on the consumer side
 //!
-//! The reactor returns promoted storage itself, but a *delivered* body
-//! moves out through the handler, and only the consumer knows when its
-//! bytes are dead. [`BodyRecycler::recycle`] is that seam. A handler that
-//! never calls it costs exactly what the old code cost — the pool refills
-//! from misses — so the call is an optimization contract, not a
-//! correctness one, and nothing breaks when an error path drops a body on
-//! the floor.
+//! The reactor returns promoted storage itself, and a delivered body the
+//! handler leaves where it lies goes home as its `Body` drops, but a body
+//! the handler takes moves out of the reactor's sight, and only the
+//! consumer knows when its bytes are dead. [`BodyRecycler::recycle`] is
+//! that seam. A handler that never calls it costs what a pool with no
+//! recycle costs, since the pool refills from misses. So the call is an
+//! optimization contract, not a correctness one, and nothing breaks when
+//! an error path drops a body on the floor.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -383,7 +384,7 @@ impl BodyPool {
     }
 
     #[cfg(test)]
-    fn retained(&self) -> usize {
+    pub(crate) fn retained(&self) -> usize {
         self.retained
     }
 
@@ -424,6 +425,37 @@ impl BodyRecycler {
     /// placement path does, instead of minting its own per message.
     pub fn claim(&self, min_cap: usize) -> Vec<u8> {
         self.pool.borrow_mut().claim(min_cap)
+    }
+}
+
+/// The ring's body pool, shared by the reactor, the connections and the
+/// consumer's [`BodyRecycler`] on the ring's one thread.
+pub(crate) type PoolHandle = Rc<RefCell<BodyPool>>;
+
+/// The way home to the ring's body pool for storage the reactor handed on
+/// and nobody took, a placed body a handler left where it lies and a reply
+/// marked recycled that never reached the wire. Whoever holds the storage
+/// gives it back through this as it drops it.
+pub(crate) struct Home {
+    pool: PoolHandle,
+}
+
+impl Home {
+    pub(crate) fn new(pool: &PoolHandle) -> Home {
+        Home {
+            pool: Rc::clone(pool),
+        }
+    }
+
+    /// Give `v` back, for the pool to keep or free under its byte law.
+    pub(crate) fn give(self, v: Vec<u8>) {
+        self.pool.borrow_mut().give(v);
+    }
+}
+
+impl std::fmt::Debug for Home {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Home").finish_non_exhaustive()
     }
 }
 

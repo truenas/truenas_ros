@@ -2408,8 +2408,9 @@ fn a_full_op_table_refuses_leased_writes_and_returns_their_buffers() {
 // ---- the buffered side: placed bodies cycle through the recycler ----------
 
 /// N large buffered bodies on one connection, the handler recycling each
-/// delivered `Vec`; the count of large allocations is the return value.
-fn buffered_cost(messages: usize) -> Option<usize> {
+/// delivered `Vec`, or with `take` false reading each where it lies. The
+/// count of large allocations is the return value.
+fn buffered_cost(messages: usize, take: bool) -> Option<usize> {
     use std::cell::RefCell;
     use std::rc::Rc;
     use truenas_ros::http::protocol_deferrable;
@@ -2435,11 +2436,14 @@ fn buffered_cost(messages: usize) -> Option<usize> {
         |_i: Incoming<'_>| Some(0usize),
         move |mut req: HttpRequest<'_>, _: &mut usize| {
             // What a consumer does: own the body for its parse, then hand
-            // the storage home.
-            let body = req.body.take();
-            let n = body.len();
-            if let Some(r) = handler_seam.borrow().as_ref() {
-                r.recycle(body);
+            // the storage home. Or read it where it lies, and leave the
+            // storage to go home as the body drops.
+            let n = req.body.len();
+            if take {
+                let body = req.body.take();
+                if let Some(r) = handler_seam.borrow().as_ref() {
+                    r.recycle(body);
+                }
             }
             HttpVerdict::Respond(
                 HttpResponse::new(200).header("x-bytes", n.to_string()),
@@ -2505,10 +2509,10 @@ fn buffered_cost(messages: usize) -> Option<usize> {
 #[test]
 fn the_first_recycle_licenses_the_second_message() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(one) = buffered_cost(1) else {
+    let Some(one) = buffered_cost(1, true) else {
         return; // io_uring unavailable
     };
-    let Some(two) = buffered_cost(2) else {
+    let Some(two) = buffered_cost(2, true) else {
         return;
     };
     assert_eq!(
@@ -2533,10 +2537,10 @@ fn the_first_recycle_licenses_the_second_message() {
 #[test]
 fn a_recycled_buffered_body_does_not_allocate_per_message() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(small) = buffered_cost(4) else {
+    let Some(small) = buffered_cost(4, true) else {
         return; // io_uring unavailable
     };
-    let Some(large) = buffered_cost(16) else {
+    let Some(large) = buffered_cost(16, true) else {
         return;
     };
     // Twelve more messages: a per-message allocation puts ~12 between the
@@ -2546,6 +2550,27 @@ fn a_recycled_buffered_body_does_not_allocate_per_message() {
         "buffered-body cost scales with the message count: 4 messages cost \
          {small} large allocations, 16 cost {large}. A pool that is never \
          consulted on the placement path would look exactly like this."
+    );
+}
+
+/// A buffered body the handler reads where it lies and never takes must
+/// not cost an allocation per message either. Its storage goes back to the
+/// ring's body pool as the body drops, and the next one is placed in it.
+/// Freed instead, every message placed into fresh storage.
+#[test]
+fn an_untaken_buffered_body_does_not_allocate_per_message() {
+    let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(small) = buffered_cost(4, false) else {
+        return; // io_uring unavailable
+    };
+    let Some(large) = buffered_cost(16, false) else {
+        return;
+    };
+    assert!(
+        large <= small + 4,
+        "an untaken body's cost scales with the message count: 4 messages \
+         cost {small} large allocations, 16 cost {large}. Its storage is \
+         not going back to the pool as the body drops."
     );
 }
 
@@ -2692,5 +2717,108 @@ fn a_reply_claimed_from_the_pool_does_not_allocate_per_reply() {
         plain >= 60,
         "64 plain replies cost {plain} large allocations. Storage no one \
          marked reached the pool, or the count no longer sees a reply."
+    );
+}
+
+// ---- storage that reaches no request goes home ----------------------------
+
+/// `rounds` connections, one after another, each claiming a reply's
+/// storage from the ring's body pool, closing itself through a push handle
+/// and only then replying, so the reply marked recycled reaches no request.
+/// The count of large allocations is the return value.
+fn spilled_cost(rounds: usize) -> Option<usize> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use truenas_ros::net::server::{
+        BodyRecycler, Endian, PrefixWidth, Protocol, Request, Response,
+        length_prefix_header,
+    };
+
+    // Past `BIG`, so a claim the pool cannot serve is counted and the
+    // little a connection costs is not.
+    const ROOM: usize = 256 * 1024;
+
+    // Filled after the server exists. The handler runs on this same
+    // thread, so the cell is never read before serve_forever fills it.
+    let seam: Rc<RefCell<Option<BodyRecycler>>> = Rc::new(RefCell::new(None));
+    let handler_seam = Rc::clone(&seam);
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: length_prefix_header::<()>(
+            PrefixWidth::U32,
+            Endian::Big,
+            false,
+        ),
+        body: move |req: Request<'_, ()>| {
+            let mut reply = handler_seam
+                .borrow()
+                .as_ref()
+                .expect("filled before serving")
+                .claim(ROOM);
+            reply.extend_from_slice(b"late");
+            req.responder.push_handle().close();
+            let (deferred, permit) = req.responder.defer();
+            deferred.reply_recycled(reply);
+            Response::Defer(permit)
+        },
+    };
+
+    let cfg = ServerConfig {
+        pool_size: 8,
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return None,
+        Err(e) => panic!("bind: {e}"),
+    };
+    *seam.borrow_mut() = server.body_recycler();
+    assert!(
+        seam.borrow().is_some(),
+        "a server always carries a body pool"
+    );
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone());
+        let before = BIG_ALLOCS.load(Ordering::Relaxed);
+        for _ in 0..rounds {
+            let mut s = TcpStream::connect(v4).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            s.write_all(&[0, 0, 0, 1, b'q']).expect("request");
+            let mut rest = Vec::new();
+            s.read_to_end(&mut rest).expect("the server closes");
+            assert!(rest.is_empty(), "the reply reached no connection");
+        }
+        let cost = BIG_ALLOCS.load(Ordering::Relaxed) - before;
+        stop.shutdown();
+        cost
+    });
+
+    server.serve_forever().expect("serve_forever");
+    Some(client.join().expect("client thread"))
+}
+
+/// A reply marked recycled whose connection closed before it arrived goes
+/// home as the server drops it, so the next connection's claim reuses its
+/// storage. Freed instead, every round claims fresh storage.
+#[test]
+fn a_recycled_reply_that_reaches_no_request_goes_home() {
+    let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(few) = spilled_cost(2) else {
+        return; // io_uring unavailable
+    };
+    let Some(many) = spilled_cost(10) else {
+        return;
+    };
+    assert!(
+        many <= few + 3,
+        "the cost scales with the rounds: 2 cost {few} large allocations, \
+         10 cost {many}. A reply that reached no request was freed rather \
+         than sent home."
     );
 }

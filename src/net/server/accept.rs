@@ -443,6 +443,7 @@ where
         if self.core.recv_bufs.is_some() {
             conn.set_recv_pooled();
         }
+        conn.body_pool.clone_from(&self.core.body_pool);
         self.core.table.install(slot, conn);
         stat!(self.core, accepted);
         self.core

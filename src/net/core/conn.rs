@@ -736,6 +736,21 @@ struct SendItem {
     /// flushed - never a consumer PDU, whose allocation the consumer chose.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     reclaim: bool,
+    /// Where a segment marked recycled goes as this entry drops, whether
+    /// it was sent or its connection went first.
+    #[cfg(feature = "net-server")]
+    home: Option<super::bodypool::Home>,
+}
+
+#[cfg(feature = "net-server")]
+impl Drop for SendItem {
+    fn drop(&mut self) {
+        if let Some(home) = self.home.take()
+            && let Some(v) = self.bytes.recycled_mut()
+        {
+            home.give(std::mem::take(v));
+        }
+    }
 }
 
 /// Chunk buffers a file-sourced response body cycles through: one being
@@ -997,8 +1012,12 @@ pub(crate) struct Connection<U> {
     // data does not move even if the deque reallocates.
     send_queue: VecDeque<SendItem>,
     queued_bytes: usize, // total bytes across `send_queue` (backlog bound)
-    front_sent: usize,   // bytes of the front PDU already sent
-    armed_bytes: usize,  // bytes of the in-flight gather still unsent
+    /// The ring's body pool, where a reply marked recycled goes once sent
+    /// or dropped. Set by the server as it installs the connection.
+    #[cfg(feature = "net-server")]
+    pub(crate) body_pool: Option<super::bodypool::PoolHandle>,
+    front_sent: usize,  // bytes of the front PDU already sent
+    armed_bytes: usize, // bytes of the in-flight gather still unsent
     // The writev gather (up to `max_send_coalesce` entries). Heap-allocated so the
     // kernel-visible array address is stable for the life of the op.
     send_iovs: Box<[libc::iovec]>,
@@ -1190,6 +1209,8 @@ impl<U> Connection<U> {
             receipt_window_mark: 0,
             send_queue: VecDeque::new(),
             queued_bytes: 0,
+            #[cfg(feature = "net-server")]
+            body_pool: None,
             front_sent: 0,
             armed_bytes: 0,
             // SAFETY: iovec/msghdr are plain data; zeroed is a valid initial
@@ -1860,13 +1881,21 @@ impl<U> Connection<U> {
     }
 
     fn enqueue(&mut self, bytes: impl Into<SendBuf>, kind: SendKind) {
-        let bytes = bytes.into();
+        #[cfg_attr(not(feature = "net-server"), allow(unused_mut))]
+        let mut bytes = bytes.into();
         self.queued_bytes += bytes.len();
+        #[cfg(feature = "net-server")]
+        let home = match (&self.body_pool, bytes.recycled_mut()) {
+            (Some(pool), Some(_)) => Some(super::bodypool::Home::new(pool)),
+            _ => None,
+        };
         let item = SendItem {
             bytes,
             kind,
             #[cfg(all(feature = "net-server", feature = "uring-fs"))]
             reclaim: false,
+            #[cfg(feature = "net-server")]
+            home,
         };
         // Mid-file-tail, any other PDU would land between two chunks of the
         // streaming body on the wire; hold it (still counted in
@@ -1946,7 +1975,8 @@ impl<U> Connection<U> {
     ///
     /// Teardown: the connection is going away with segments that name ring
     /// buffers, and a buffer never handed back is one the pool can neither
-    /// reissue nor free.
+    /// reissue nor free. The entries drop here, so a reply marked recycled
+    /// goes home with them.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) fn drain_pooled_bids(&mut self) -> Vec<u16> {
         let mut out = Vec::new();
@@ -1985,6 +2015,7 @@ impl<U> Connection<U> {
                 SendKind::ReplyPart
             },
             reclaim: true,
+            home: None,
         });
     }
 
@@ -2192,14 +2223,9 @@ impl<U> Connection<U> {
 
     /// Advance the send cursor by `n` bytes (clamped to the armed gather):
     /// fully-sent PDUs are popped and tallied by kind; a partially-sent
-    /// leader updates the front cursor. The storage of each popped
-    /// [`SendBuf::recycled`] segment goes to `spent`, since only the reactor
-    /// holds the body pool it belongs in.
-    pub(crate) fn advance_sent(
-        &mut self,
-        n: usize,
-        mut spent: impl FnMut(Vec<u8>),
-    ) -> SendProgress {
+    /// leader updates the front cursor. A popped [`SendBuf::recycled`]
+    /// segment's storage goes back to the ring's body pool as it drops.
+    pub(crate) fn advance_sent(&mut self, n: usize) -> SendProgress {
         let mut n = n.min(self.armed_bytes);
         self.armed_bytes -= n;
         let mut progress = SendProgress {
@@ -2261,11 +2287,6 @@ impl<U> Connection<U> {
                         progress.freed += 1;
                     }
                 }
-            }
-            // Popped means the kernel has taken every byte, so the storage
-            // is free to reuse.
-            if let Some(bytes) = item.bytes.into_recycled() {
-                spent(bytes);
             }
         }
         progress
@@ -2343,12 +2364,12 @@ mod tests {
         assert_eq!(c.arm_send(), 30);
         // Partial completion mid-PDU-2: PDU 1 (a reply) finishes, cursor
         // lands inside PDU 2.
-        let p = c.advance_sent(15, drop);
+        let p = c.advance_sent(15);
         assert_eq!((p.replies, p.pushes, p.armed_remaining), (1, 0, 15));
         assert_eq!(c.queued_bytes(), 50);
         // Error-recovery re-arm from the cursor: PDU 2's tail + PDU 3.
         assert_eq!(c.arm_send(), 15 + 30);
-        let p = c.advance_sent(45, drop);
+        let p = c.advance_sent(45);
         assert_eq!((p.replies, p.pushes, p.armed_remaining), (1, 1, 0));
         assert_eq!(c.queued_bytes(), 0);
         assert!(!c.has_pending_send());
@@ -2356,7 +2377,7 @@ mod tests {
         // A completion never advances past what was armed.
         c.enqueue(vec![4; 8], SendKind::ReplyLast);
         assert_eq!(c.arm_send(), 8);
-        let p = c.advance_sent(usize::MAX, drop);
+        let p = c.advance_sent(usize::MAX);
         assert_eq!((p.replies, p.armed_remaining), (1, 0));
     }
 
@@ -2370,7 +2391,7 @@ mod tests {
             vec![b'B'; 40].into(),
         ]));
         assert_eq!(c.arm_send(), 12 + 40);
-        let p = c.advance_sent(12 + 40, drop);
+        let p = c.advance_sent(12 + 40);
         assert_eq!((p.replies, p.pushes, p.armed_remaining), (1, 0, 0));
     }
 
@@ -2387,44 +2408,87 @@ mod tests {
         assert_eq!(c.arm_send(), 8 + BODY.len());
         assert_eq!(c.send_iovs[1].iov_base as *const u8, BODY.as_ptr());
         assert_eq!(c.send_iovs[1].iov_len, BODY.len());
-        let p = c.advance_sent(8 + BODY.len(), drop);
+        let p = c.advance_sent(8 + BODY.len());
         assert_eq!((p.replies, p.pushes), (1, 0));
         assert_eq!(c.queued_bytes(), 0);
     }
 
-    /// A segment marked as the pool's hands its own storage out once all of
-    /// it is sent, and no sooner. A plain owned segment hands nothing out,
+    /// A connection on a pool, and storage for a reply claimed from it as a
+    /// consumer claims one, so the pool's law keeps what comes back.
+    #[cfg(feature = "net-server")]
+    fn pooled_conn(
+        claims: &[usize],
+    ) -> (
+        Box<Connection<()>>,
+        super::super::bodypool::PoolHandle,
+        Vec<Vec<u8>>,
+    ) {
+        let pool = std::rc::Rc::new(std::cell::RefCell::new(
+            super::super::bodypool::BodyPool::new(1 << 20),
+        ));
+        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 4);
+        c.body_pool = Some(std::rc::Rc::clone(&pool));
+        let bufs = claims.iter().map(|&n| pool.borrow_mut().claim(n)).collect();
+        (c, pool, bufs)
+    }
+
+    /// A segment marked as the pool's sends its own storage home once all
+    /// of it is sent, and no sooner. A plain owned segment sends nothing,
     /// so storage no one claimed never reaches the pool.
+    #[cfg(feature = "net-server")]
     #[test]
     fn a_recycled_segment_gives_its_storage_back_once_sent() {
-        let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 4);
-        let mut head = Vec::with_capacity(64);
+        let (mut c, pool, mut bufs) = pooled_conn(&[64, 16]);
+        let mut tail = bufs.pop().expect("claimed");
+        let mut head = bufs.pop().expect("claimed");
         head.extend_from_slice(&[b'H'; 12]);
+        tail.extend_from_slice(&[b'R'; 10]);
         let at = head.as_ptr();
         assert!(c.enqueue_reply_segments(vec![
             SendBuf::recycled(head),
             vec![b'B'; 8].into(),
         ]));
-        assert!(
-            c.enqueue_reply_segments(vec![SendBuf::recycled(vec![b'R'; 10])])
-        );
+        assert!(c.enqueue_reply_segments(vec![SendBuf::recycled(tail)]));
         assert_eq!(c.arm_send(), 12 + 8 + 10);
-        let mut spent = Vec::new();
 
-        let _ = c.advance_sent(4, |v| spent.push(v));
-        assert!(spent.is_empty(), "a partly sent segment keeps its storage");
+        let _ = c.advance_sent(4);
+        assert_eq!(
+            pool.borrow().retained(),
+            0,
+            "a partly sent segment keeps its storage"
+        );
 
         // The rest of the head, all of the plain segment and half the last.
-        let p = c.advance_sent(8 + 8 + 5, |v| spent.push(v));
+        let p = c.advance_sent(8 + 8 + 5);
         assert_eq!(p.replies, 1);
-        assert_eq!(spent.len(), 1, "only the marked segment is handed out");
-        assert_eq!(spent[0].as_ptr(), at, "its own storage, not a copy");
-        assert_eq!(spent[0].capacity(), 64);
+        assert_eq!(
+            pool.borrow().retained(),
+            64,
+            "only the marked segment goes home"
+        );
 
-        let p = c.advance_sent(5, |v| spent.push(v));
+        let p = c.advance_sent(5);
         assert_eq!((p.replies, p.armed_remaining), (1, 0));
-        assert_eq!(spent.len(), 2);
-        assert_eq!(spent[1], vec![b'R'; 10]);
+        assert_eq!(pool.borrow().retained(), 64 + 16);
+        let again = pool.borrow_mut().claim(64);
+        assert_eq!(again.as_ptr(), at, "its own storage, not a copy");
+    }
+
+    /// A segment marked as the pool's that its connection drops unsent,
+    /// as a teardown does, goes home all the same.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_recycled_segment_queued_at_a_teardown_goes_home() {
+        let (mut c, pool, mut bufs) = pooled_conn(&[64]);
+        let mut reply = bufs.pop().expect("claimed");
+        reply.extend_from_slice(&[b'R'; 12]);
+        let at = reply.as_ptr();
+        assert!(c.enqueue_reply_segments(vec![SendBuf::recycled(reply)]));
+        assert_eq!(c.arm_send(), 12);
+        drop(c);
+        assert_eq!(pool.borrow().retained(), 64, "the unsent reply came home");
+        let again = pool.borrow_mut().claim(64);
+        assert_eq!(again.as_ptr(), at, "its own storage, not a copy");
     }
 
     #[test]
@@ -2795,7 +2859,7 @@ mod tests {
         // The tail's own chunks go straight through.
         c.enqueue_file_chunk(SendBuf::from(vec![b'a'; 8]), false);
         assert_eq!(c.arm_send(), 4 + 8, "head + chunk, no diverted bytes");
-        let p = c.advance_sent(12, drop);
+        let p = c.advance_sent(12);
         assert_eq!(
             (p.replies, p.pushes),
             (0, 0),
@@ -2814,7 +2878,7 @@ mod tests {
         assert_eq!(c.send_iovs[0].iov_len, 12);
         assert_eq!(c.send_iovs[1].iov_len, 2, "push held until the tail");
         assert_eq!(c.send_iovs[2].iov_len, 3, "deferred reply after it");
-        let p = c.advance_sent(12 + 2 + 3, drop);
+        let p = c.advance_sent(12 + 2 + 3);
         assert_eq!(
             (p.replies, p.pushes),
             (2, 1),
@@ -2923,7 +2987,7 @@ mod tests {
             c.enqueue_file_chunk(buf, true);
             c.finish_file_tail();
             assert_eq!(c.arm_send(), 4);
-            let _ = c.advance_sent(4, drop);
+            let _ = c.advance_sent(4);
         };
 
         // A body claims a share, and the flush gives it back - so the
@@ -3358,7 +3422,7 @@ mod tests {
         c.finish_file_tail();
         assert!(!c.tail_active(), "no successor");
         assert_eq!(c.arm_send(), 4);
-        let p = c.advance_sent(4, drop);
+        let p = c.advance_sent(4);
         assert_eq!(c.chunk_out, 0, "the share came back");
         assert_eq!(p.freed, 1, "and the buffer id rode out to the pool");
         assert_eq!(p.freed_bids[0], 7, "the one the segment held");
