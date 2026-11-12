@@ -586,8 +586,10 @@ unsafe impl Send for LeasedBytes {}
 impl LeasedBytes {
     fn as_slice(&self) -> &[u8] {
         // SAFETY: `ptr` and `len` came from a live `&[u8]` into a leased
-        // buffer, and the share held beside this value keeps that buffer
-        // alive and unwritten until after the job using this view returns.
+        // buffer, so every byte was written, and the share held beside this
+        // value keeps that buffer alive and unwritten for as long as the
+        // share lives, which outlasts every borrow of the slice, since a job
+        // holds its share until it returns and a window holds its own.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
@@ -598,7 +600,8 @@ impl LeasedBytes {
 /// gone. What a handler that digests its windows in order keeps while
 /// an earlier window's job still runs, and spends on
 /// [`FsConn::offload_leased`] from that job's completion - no copy at
-/// either end.
+/// either end. Its bytes read as a slice through `Deref` for as long as it
+/// is held.
 ///
 /// Dropping one unspent returns its share like any other: the buffer
 /// goes back to the pool when the last share of its claim is gone,
@@ -653,6 +656,22 @@ impl LeasedWindow {
             hold,
         };
         (head, tail)
+    }
+}
+
+/// The window's bytes, which nothing writes while it holds its share. A
+/// delivery that leases its buffer takes the buffer from the connection
+/// and copies any pipelined remainder into storage of its own
+/// (`RecvBuf::drain_front`), so no later receive lands in it, a release
+/// and a forfeit refuse a leased claim, and the kernel only reads a buffer
+/// it writes to a file. The window is `Send` and not `Sync`, so the slice
+/// is read on the thread that holds the window.
+#[cfg(feature = "net-server")]
+impl std::ops::Deref for LeasedWindow {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.view.as_slice()
     }
 }
 
@@ -10069,6 +10088,20 @@ mod routing_fuzz {
             assert_eq!(back.len(), n, "every window comes back");
             assert!(inflight(&core).is_empty(), "nothing went in flight");
         }
+    }
+
+    /// A window reads as the bytes it was leased over, and so do both
+    /// halves of a split, each where it begins.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_window_reads_as_the_bytes_it_was_leased_over() {
+        let buf = b"<head|tail>".to_vec();
+        let hold = std::sync::Arc::new(LeaseHold::detached(9));
+        let window = window_over(&buf[1..10], &hold);
+        assert_eq!(&*window, b"head|tail");
+        let (head, tail) = window.split_at(5);
+        assert_eq!((&*head, &*tail), (&b"head|"[..], &b"tail"[..]));
+        assert_eq!((head.len(), tail.len()), (5, 4), "its own lengths stay");
     }
 
     /// Both halves of a split window read the buffer, so both hold it.
