@@ -1641,6 +1641,8 @@ mod loom_tests {
                 graceful: AtomicBool::new(false),
                 grace_ms: AtomicU64::new(0),
                 wake: WakeHandle::new().expect("the model's wake"),
+                #[cfg(feature = "net-server")]
+                handed: crate::sync::atomic::AtomicUsize::new(0),
             }),
         })
     }
@@ -5000,6 +5002,8 @@ mod tests {
                 graceful: std::sync::atomic::AtomicBool::new(false),
                 grace_ms: std::sync::atomic::AtomicU64::new(0),
                 wake: crate::uring::wake::WakeHandle::new().expect("eventfd"),
+                #[cfg(feature = "net-server")]
+                handed: std::sync::atomic::AtomicUsize::new(0),
             }),
             loop_thread: std::thread::current().id(),
         });

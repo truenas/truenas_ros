@@ -11884,6 +11884,7 @@ mod loom_tests {
                 graceful: crate::sync::atomic::AtomicBool::new(false),
                 grace_ms: crate::sync::atomic::AtomicU64::new(0),
                 wake: WakeHandle::new().expect("the model's wake never fails"),
+                handed: crate::sync::atomic::AtomicUsize::new(0),
             });
             let hold =
                 std::sync::Arc::new(LeaseHold::new(7, fs.lease_returns(&wake)));

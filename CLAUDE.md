@@ -339,9 +339,17 @@ Do not reopen these without a reason that is new.
   capacity read again, since promoted storage grows while held. Storage a
   consumer takes leaves the count, since a `Vec` dropped where the pool
   cannot see it would stay counted for good, and the consumer counts what
-  it holds with `BodyRecycler::take_out` and `give_back`. Pinned by
-  `held_bytes_come_off_as_they_went_on` and
-  `held_bytes_follow_a_placed_body_and_a_recycled_reply`.
+  it holds with `BodyRecycler::take_out` and `give_back`. A reply given to
+  `Deferred::reply_recycled` counts from that call through `handed` in
+  `LoopShared`, which the handle adds to before it sends the reply and the
+  loop takes off before it queues the reply or sends it home, so the check
+  of the hook's mark at the queueing sees it once. The loop reads that
+  capacity again, which is still what was added, since nothing can touch
+  the storage while the reply waits in the mailbox. Pinned by
+  `held_bytes_come_off_as_they_went_on`,
+  `held_bytes_follow_a_placed_body_and_a_recycled_reply`,
+  `a_deferred_recycled_reply_counts_from_its_hand_off` and
+  `a_handed_reply_queued_under_the_mark_owes_the_hook_nothing`.
 - **At `held_cap` a placed body read waits, in order, and nothing else
   does.** The check sits where the reactor decides to place a body, before
   it claims storage, so a held connection keeps its header and frame and

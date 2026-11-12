@@ -101,6 +101,10 @@
 //! an error path drops a body on the floor.
 
 use super::conn::Ticket;
+#[cfg(feature = "net-server")]
+use crate::sync::Arc;
+#[cfg(feature = "net-server")]
+use crate::uring::wake::LoopShared;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -185,6 +189,11 @@ pub(crate) struct BodyPool {
     ring_held: usize,
     /// Bytes the consumer counts as its own ([`BodyRecycler::take_out`]).
     out_held: usize,
+    /// The ring's loop state, whose `handed` bytes are replies a
+    /// `Deferred` handed to the loop that it has not yet queued or sent
+    /// home, which count from that hand-off.
+    #[cfg(feature = "net-server")]
+    shared: Option<Arc<LoopShared>>,
     /// `ServerConfig::held_cap`, past which the ring holds back the read
     /// of the next placed body.
     cap: Option<usize>,
@@ -208,6 +217,8 @@ impl BodyPool {
             idle_rounds: 0,
             ring_held: 0,
             out_held: 0,
+            #[cfg(feature = "net-server")]
+            shared: None,
             cap,
             mark: None,
             crossed: false,
@@ -245,10 +256,30 @@ impl BodyPool {
         self.cap.is_some_and(|cap| self.held() >= cap)
     }
 
-    /// The bytes held out of this pool, the reactor's count and the
+    /// Count the replies handed to the ring's loop through `shared` from
+    /// their hand-off.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn count_handed(&mut self, shared: Arc<LoopShared>) {
+        self.shared = Some(shared);
+    }
+
+    /// The bytes held out of this pool, the reactor's count, the replies
+    /// handed to the loop that it has not yet queued or sent home, and the
     /// consumer's figure together.
     pub(crate) fn held(&self) -> usize {
-        self.ring_held.saturating_add(self.out_held)
+        self.ring_held
+            .saturating_add(self.out_held)
+            .saturating_add(self.handed())
+    }
+
+    /// The bytes of replies handed to the loop that it has not yet queued
+    /// or sent home.
+    fn handed(&self) -> usize {
+        #[cfg(feature = "net-server")]
+        if let Some(shared) = &self.shared {
+            return shared.handed.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        0
     }
 
     /// Put storage the reactor now holds on the count.
@@ -535,11 +566,11 @@ impl BodyRecycler {
 
     /// The bytes held out of the ring's body pool. The ring counts placed
     /// and promoted bodies from their claim until a handler takes them or
-    /// they go back, and replies sent with
-    /// [`SendBuf::recycled`](crate::net::server::SendBuf::recycled) or
-    /// `Deferred::reply_recycled` from when they are queued until they are
-    /// sent or dropped, each by capacity. The consumer's own figure is
-    /// added to that.
+    /// they go back, replies sent with
+    /// [`SendBuf::recycled`](crate::net::server::SendBuf::recycled) from
+    /// when they are queued, and replies sent with
+    /// `Deferred::reply_recycled` from that call, each until it is sent or
+    /// dropped and by capacity. The consumer's own figure is added to that.
     pub fn held(&self) -> usize {
         self.pool.borrow().held()
     }

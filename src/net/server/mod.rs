@@ -978,12 +978,13 @@ where
         // rings below it cannot fail to construct. Bounded in bytes, not
         // buffers: retained capacity is what costs, and a count would let
         // a few maximal bodies retain what a thousand small ones should.
-        core.body_pool = Some(std::rc::Rc::new(std::cell::RefCell::new(
-            crate::net::core::bodypool::BodyPool::new(
-                BODY_POOL_BUDGET,
-                cfg.held_cap,
-            ),
-        )));
+        let mut body_pool = crate::net::core::bodypool::BodyPool::new(
+            BODY_POOL_BUDGET,
+            cfg.held_cap,
+        );
+        body_pool.count_handed(Arc::clone(&core.engine.shared));
+        core.body_pool =
+            Some(std::rc::Rc::new(std::cell::RefCell::new(body_pool)));
         let sizing = crate::uring::bufring::PoolSizing {
             initial_bytes: cfg.buf_pool_initial_bytes,
             max_step_bytes: cfg.buf_pool_max_step_bytes,

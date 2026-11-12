@@ -107,13 +107,26 @@ where
 impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     /// Drop an outcome that reaches no request. A reply marked recycled
     /// still sends its storage to the ring's body pool, as one queued on a
-    /// connection that closes does.
+    /// connection that closes does, and leaves the count of held bytes.
     fn spill(&self, msg: Injected) {
-        if let Injected::ReplyRecycled(_, bytes) = msg
-            && let Some(pool) = self.core.body_pool.as_ref()
-        {
-            pool.borrow_mut().give(bytes);
+        if let Injected::ReplyRecycled(_, bytes) = msg {
+            self.unhand(bytes.capacity());
+            if let Some(pool) = self.core.body_pool.as_ref() {
+                pool.borrow_mut().give(bytes);
+            }
         }
+    }
+
+    /// Take the `bytes` of a reply that `Deferred::reply_recycled` handed
+    /// to the loop off the figure its hand-off added to the count of held
+    /// bytes. Nothing has touched the reply's storage since, so its
+    /// capacity is what was added.
+    fn unhand(&self, bytes: usize) {
+        self.core
+            .engine
+            .shared
+            .handed
+            .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Enter graceful drain: stop accepting, close idle connections, let
@@ -485,6 +498,11 @@ where
                 }
                 Injected::ReplyRecycled(_, bytes) => {
                     // As `Reply`, marked so its storage goes home once sent.
+                    // Off the hand-off's figure before the queueing puts it
+                    // on the ring's count, whose check of the hook's mark
+                    // would see it twice the other way round. Nothing reads
+                    // the count between the two.
+                    self.unhand(bytes.capacity());
                     self.core
                         .table
                         .conn_mut(token.slot)

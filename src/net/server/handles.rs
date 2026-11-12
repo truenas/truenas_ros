@@ -196,13 +196,14 @@ impl Responder {
     fn test_wired() -> (Responder, mpsc::Receiver<Injected>) {
         // `crate::sync` atomics, matching `LoopShared`'s fields, so this
         // constructs under `--cfg loom` too.
-        use crate::sync::atomic::{AtomicBool, AtomicU64};
+        use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(LoopShared {
             stop: AtomicBool::new(false),
             graceful: AtomicBool::new(false),
             grace_ms: AtomicU64::new(0),
             wake: crate::uring::wake::WakeHandle::new().expect("wake"),
+            handed: AtomicUsize::new(0),
         });
         let token = Token {
             slot: 0,
@@ -276,8 +277,18 @@ impl Deferred {
     /// As [`reply`](Self::reply), for bytes in storage claimed from the
     /// ring's body pool. Once sent, the storage goes back to the pool, as a
     /// [`SendBuf::recycled`](crate::net::server::SendBuf::recycled)
-    /// segment's does in a reply given inline. Consumes the handle.
+    /// segment's does in a reply given inline. The reply counts in
+    /// [`BodyRecycler::held`](crate::net::server::BodyRecycler::held) from
+    /// this call, before the loop has it. Consumes the handle.
     pub fn reply_recycled(self, bytes: Vec<u8>) {
+        // An empty reply goes as `Done` and its storage is freed there, so
+        // it adds nothing the loop would take off. The add comes before the
+        // send, so the loop never takes off a figure not yet added.
+        if !bytes.is_empty() {
+            self.shared
+                .handed
+                .fetch_add(bytes.capacity(), Ordering::Relaxed);
+        }
         self.deliver(bytes, Injected::ReplyRecycled);
     }
 

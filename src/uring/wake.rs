@@ -1,6 +1,7 @@
 //! The wake eventfd and the cross-thread loop flags it serves: the one block
 //! of state shared (`Arc`) between a loop thread and every cross-thread
-//! handle a domain mints (shutdown handles, deferred replies, pushes, ...).
+//! handle a domain mints (shutdown handles, deferred replies, pushes, ...),
+//! and the bytes of the replies those handles have handed to the loop.
 
 use crate::errno;
 #[cfg(not(loom))]
@@ -9,6 +10,8 @@ use crate::errno::Errno;
 use crate::fd::owned_from_raw;
 // `LoopShared`'s flags are loom-modelled (`loom_graceful_publication`), so the
 // atomics come from `crate::sync` - std's outside `--cfg loom`.
+#[cfg(feature = "net-server")]
+use crate::sync::atomic::AtomicUsize;
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(not(loom))]
 use std::ffi::c_void;
@@ -28,6 +31,14 @@ pub(crate) struct LoopShared {
     pub(crate) graceful: AtomicBool,
     pub(crate) grace_ms: AtomicU64,
     pub(crate) wake: WakeHandle,
+    /// Bytes of body pool storage in replies a `Deferred` handed to the
+    /// loop with `reply_recycled` that the loop has not yet queued or sent
+    /// home, by capacity. The ring's count of held bytes adds them, since
+    /// the hand-off is where the consumer lets them go. Added before the
+    /// reply is sent and taken off once the loop has it, so the reply
+    /// orders the two and no ordering rides this.
+    #[cfg(feature = "net-server")]
+    pub(crate) handed: AtomicUsize,
 }
 
 impl LoopShared {
@@ -328,6 +339,8 @@ mod loom_tests {
             graceful: AtomicBool::new(false),
             grace_ms: AtomicU64::new(0),
             wake: WakeHandle::new().expect("the model's wake never fails"),
+            #[cfg(feature = "net-server")]
+            handed: AtomicUsize::new(0),
         })
     }
 
