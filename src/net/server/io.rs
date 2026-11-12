@@ -164,6 +164,40 @@ where
         self.pump(slot, generation)
     }
 
+    /// Let placed body reads held back by `ServerConfig::held_cap` go on, in
+    /// the order they were held, while the ring holds less than the cap.
+    /// Checked again after each, since each claims its body, so the ring
+    /// passes the cap by one body at most. A stale entry (the connection
+    /// closed, or its slot was recycled) is discarded on the way past.
+    pub(super) fn redrive_held_reads(&mut self) -> errno::Result<()> {
+        while let Some(&(slot, gen64)) = self.core.held_reads.front() {
+            if self.core.stopping()
+                || self
+                    .core
+                    .body_pool
+                    .as_ref()
+                    .is_some_and(|p| p.borrow().at_cap())
+            {
+                return Ok(());
+            }
+            self.core.held_reads.pop_front();
+            if self.core.table.generation(slot) != gen64 {
+                continue; // slot recycled under the wait
+            }
+            match self.core.table.get_conn_mut(slot) {
+                Some(conn) if conn.read_held => conn.read_held = false,
+                _ => continue, // closing, or no longer waiting
+            }
+            // The pump frames the message again and reaches the same body
+            // read, which the check lets go on this once.
+            self.core.held_turn = Some(slot);
+            let pumped = self.pump(slot, gen64 as u32);
+            self.core.held_turn = None;
+            pumped?;
+        }
+        Ok(())
+    }
+
     /// A body splice completed (`Op::SpliceRecv`). All the completion
     /// bookkeeping is core ([`Reactor::on_splice_recv_complete`]); a fully moved
     /// body pumps the next frame. The body never entered the buffer, so there is

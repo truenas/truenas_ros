@@ -185,10 +185,13 @@ pub(crate) struct BodyPool {
     ring_held: usize,
     /// Bytes the consumer counts as its own ([`BodyRecycler::take_out`]).
     out_held: usize,
+    /// `ServerConfig::held_cap`, past which the ring holds back the read
+    /// of the next placed body.
+    cap: Option<usize>,
 }
 
 impl BodyPool {
-    pub(crate) fn new(budget: usize) -> BodyPool {
+    pub(crate) fn new(budget: usize, cap: Option<usize>) -> BodyPool {
         BodyPool {
             free: Vec::new(),
             retained: 0,
@@ -199,7 +202,14 @@ impl BodyPool {
             idle_rounds: 0,
             ring_held: 0,
             out_held: 0,
+            cap,
         }
+    }
+
+    /// Whether the bytes held are at or past the cap, so that the read of
+    /// the next placed body waits.
+    pub(crate) fn at_cap(&self) -> bool {
+        self.cap.is_some_and(|cap| self.held() >= cap)
     }
 
     /// The bytes held out of this pool, the reactor's count and the
@@ -574,7 +584,7 @@ mod tests {
     /// A storm reuses one allocation instead of minting per message.
     #[test]
     fn a_cycled_body_reuses_its_storage() {
-        let mut p = BodyPool::new(64 * MIB);
+        let mut p = BodyPool::new(64 * MIB, None);
         let a = p.claim(MIB);
         let ptr = a.as_ptr() as usize;
         p.give(a);
@@ -588,7 +598,7 @@ mod tests {
     /// in bytes — and an unlicensed give past the target frees instead.
     #[test]
     fn misses_grow_retention_to_the_working_set_in_bytes() {
-        let mut p = BodyPool::new(64 * MIB);
+        let mut p = BodyPool::new(64 * MIB, None);
         let (a, b, c) = (p.claim(MIB), p.claim(MIB), p.claim(MIB));
         p.give(a);
         p.give(b);
@@ -606,7 +616,7 @@ mod tests {
     /// it cycle through the allocator, never through the pool.
     #[test]
     fn the_budget_is_a_hard_byte_ceiling() {
-        let mut p = BodyPool::new(2 * MIB);
+        let mut p = BodyPool::new(2 * MIB, None);
         let (a, b) = (p.claim(MIB), p.claim(MIB));
         let big = p.claim(8 * MIB); // over budget on its own
         p.give(big);
@@ -627,7 +637,7 @@ mod tests {
     /// claim resets the count.
     #[test]
     fn quiet_shrinks_bytes_with_hysteresis_and_traffic_resets_it() {
-        let mut p = BodyPool::new(64 * MIB);
+        let mut p = BodyPool::new(64 * MIB, None);
         let bodies: Vec<_> = (0..4).map(|_| p.claim(MIB)).collect();
         for v in bodies {
             p.give(v);
@@ -658,7 +668,7 @@ mod tests {
     /// flowed, with the only release path ~20 s of ring-wide silence.
     #[test]
     fn unservable_traffic_does_not_pin_retention() {
-        let mut p = BodyPool::new(64 * MIB);
+        let mut p = BodyPool::new(64 * MIB, None);
         // Concurrent, so each claim misses and licenses its own bytes.
         let claims: Vec<_> = (0..3).map(|_| p.claim_held(5 * MIB)).collect();
         for (v, t) in claims {
@@ -689,7 +699,7 @@ mod tests {
     /// 7-second bodies with `target` never leaving zero.
     #[test]
     fn a_held_licence_survives_the_observation_window() {
-        let mut p = BodyPool::new(64 * MIB);
+        let mut p = BodyPool::new(64 * MIB, None);
         let (v, t) = p.claim_held(MIB);
         assert_eq!(t.licence, MIB, "a dry pool records the bytes needed");
         p.rebalance(); // a tick passes mid-receipt
@@ -706,7 +716,7 @@ mod tests {
     /// the arm, however long the receipt took.
     #[test]
     fn a_delivered_body_recycles_on_the_deliverys_clock() {
-        let mut p = BodyPool::new(64 * MIB);
+        let mut p = BodyPool::new(64 * MIB, None);
         let (v, t) = p.claim_held(MIB);
         p.rebalance(); // the receipt spans a tick
         p.receipt_done(t.licence); // delivery: the body leaves custody
@@ -722,7 +732,7 @@ mod tests {
     /// `give(64 MiB)` used to set a 64 MiB target off a zero-byte miss.
     #[test]
     fn a_licence_is_bytes_not_a_count() {
-        let mut p = BodyPool::new(64 * MIB);
+        let mut p = BodyPool::new(64 * MIB, None);
         drop(p.claim(0));
         let mut giant = Vec::new();
         giant.reserve_exact(8 * MIB);
@@ -747,7 +757,7 @@ mod tests {
     /// ticks instead of five.
     #[test]
     fn a_freed_give_spends_no_licence() {
-        let mut p = BodyPool::new(64 * MIB);
+        let mut p = BodyPool::new(64 * MIB, None);
         drop(p.claim(64 * 1024)); // a 64 KiB miss licenses the pot
         let mut giant = Vec::new();
         giant.reserve_exact(8 * MIB);
@@ -770,7 +780,7 @@ mod tests {
     /// the halving path, so a pause is not an eviction.
     #[test]
     fn a_buffer_that_stops_serving_ages_out_under_load() {
-        let mut p = BodyPool::new(64 * MIB);
+        let mut p = BodyPool::new(64 * MIB, None);
         // Warm two classes concurrently: high-water and small.
         let big = p.claim_held(5 * MIB);
         let small = p.claim_held(300 * 1024);
@@ -802,7 +812,7 @@ mod tests {
     /// storm-diversified list entry by entry.
     #[test]
     fn a_claim_takes_the_smallest_fitting_buffer() {
-        let mut p = BodyPool::new(64 * MIB);
+        let mut p = BodyPool::new(64 * MIB, None);
         // Concurrent, so the inventory diversifies instead of one
         // buffer cycling through every claim.
         let claims: Vec<_> = [MIB, 3 * MIB, 2 * MIB]
@@ -825,7 +835,7 @@ mod tests {
     /// header rejects.
     #[test]
     fn a_small_body_is_not_served_from_the_high_water_buffer() {
-        let mut p = BodyPool::new(64 * MIB);
+        let mut p = BodyPool::new(64 * MIB, None);
         let (big, t) = p.claim_held(3 * MIB);
         p.give_held(big, t);
         assert_eq!(p.retained(), 3 * MIB, "the big body's storage waits");
@@ -850,7 +860,7 @@ mod tests {
     /// figure moves `held` beside it.
     #[test]
     fn held_bytes_come_off_as_they_went_on() {
-        let pool = Rc::new(RefCell::new(BodyPool::new(64 * MIB)));
+        let pool = Rc::new(RefCell::new(BodyPool::new(64 * MIB, None)));
         let (mut v, t) = pool.borrow_mut().claim_held(MIB);
         assert_eq!(t.bytes, v.capacity(), "the ticket carries the count");
         assert_eq!(pool.borrow().held(), t.bytes, "a claim is held");
@@ -887,7 +897,7 @@ mod tests {
     /// storm that ended cannot inflate what a later one holds.
     #[test]
     fn a_license_does_not_outlive_the_observation_window() {
-        let mut p = BodyPool::new(64 * MIB);
+        let mut p = BodyPool::new(64 * MIB, None);
         drop(p.claim(MIB)); // the consumer never recycled
         p.rebalance(); // the window closes; the license dies with it
         let mut late = Vec::new();

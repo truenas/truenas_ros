@@ -3982,6 +3982,14 @@ fn server_config_bounds_are_rejected_at_construction() {
             },
             "max_in_flight_requests",
         ),
+        // A cap of 0 holds every placed body back for good.
+        (
+            ServerConfig {
+                held_cap: Some(0),
+                ..ServerConfig::default()
+            },
+            "held_cap must be non-zero",
+        ),
     ] {
         expect(one(), cfg, needle);
     }
@@ -14122,4 +14130,152 @@ fn held_bytes_follow_a_placed_body_and_a_recycled_reply() {
         }
     }
     assert_eq!(recycler.held(), 0, "and nothing once the ring is idle");
+}
+
+/// Placed bodies past `held_cap` wait and go on in the order they arrived,
+/// one at a time as the consumer gives bytes back, so the ring passes the
+/// cap by one body at most, and every body arrives whole. A body larger
+/// than the cap goes on once the count is under it. A read that waits
+/// longer than `max_receipt_time` is not closed for it, since only the
+/// peer's own time counts.
+#[test]
+fn placed_bodies_past_the_held_cap_wait_their_turn() {
+    use std::cell::{OnceCell, RefCell};
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use truenas_ros::net::server::BodyRecycler;
+
+    // Past a receive buffer of the default size, so each is placed.
+    const BODY: usize = 512 * 1024;
+    const CAP: usize = 768 * 1024;
+    // Larger than the cap alone, the last to arrive.
+    const LARGE: usize = 1536 * 1024;
+    const PEERS: u8 = 6;
+    let size = |tag: u8| if tag + 1 == PEERS { LARGE } else { BODY };
+    let receipt = Duration::from_millis(300);
+
+    let seam: Rc<OnceCell<BodyRecycler>> = Rc::new(OnceCell::new());
+    // The bodies the consumer holds, each with the reply it owes.
+    type Held = VecDeque<(Deferred, Vec<u8>)>;
+    let stash: Rc<RefCell<Held>> = Rc::default();
+    // What each delivery saw, `(tag, held at delivery)`.
+    let seen: Rc<RefCell<Vec<(u8, usize)>>> = Rc::default();
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let (h_seam, h_stash, h_seen, h_delivered) = (
+        Rc::clone(&seam),
+        Rc::clone(&stash),
+        Rc::clone(&seen),
+        Arc::clone(&delivered),
+    );
+    let proto = Protocol {
+        accept: |_: Incoming<'_>| Some(()),
+        header: lsp_header,
+        body: move |mut req: Request<'_, ()>| {
+            let r = h_seam.get().expect("filled before serving");
+            let at = r.held();
+            // The consumer holds the body, and counts it, until released.
+            let body = req.body.take();
+            r.take_out(body.capacity());
+            h_seen.borrow_mut().push((body[0], at));
+            h_delivered.fetch_add(1, Ordering::SeqCst);
+            let (deferred, permit) = req.responder.defer();
+            h_stash.borrow_mut().push_back((deferred, body));
+            Response::Defer(permit)
+        },
+    };
+    let cfg = ServerConfig {
+        pool_size: 16,
+        max_request_bytes: 4 * 1024 * 1024,
+        body_placement_threshold: Some(1024),
+        held_cap: Some(CAP),
+        max_receipt_time: Some(receipt),
+        ..ServerConfig::default()
+    };
+    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
+    let recycler = server.body_recycler().expect("a server keeps a body pool");
+    seam.set(recycler.clone()).expect("set once");
+    // Each control message releases the body held longest, giving its
+    // bytes back and answering whether it arrived whole.
+    let (c_stash, c_recycler) = (Rc::clone(&stash), recycler.clone());
+    server.set_control_hook(move |_| {
+        if let Some((deferred, body)) = c_stash.borrow_mut().pop_front() {
+            c_recycler.give_back(body.capacity());
+            let tag = body[0];
+            let whole =
+                body.len() == size(tag) && body[1..].iter().all(|&b| b == tag);
+            deferred.reply(echo_frame(&[tag, u8::from(whole)]));
+        }
+    });
+    let closes = close_reason_channel(&mut server);
+    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
+        panic!("expected Tcp");
+    };
+    let stop = server.shutdown_handle();
+    let control = server.control_handle();
+    let gate = Arc::clone(&delivered);
+    let client = thread::spawn(move || {
+        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
+        let peers: Vec<_> = (0..PEERS)
+            .map(|tag| {
+                thread::spawn(move || -> io::Result<Vec<u8>> {
+                    // In order, each a beat after the one before.
+                    thread::sleep(Duration::from_millis(80) * u32::from(tag));
+                    let mut s = connect_tcp(v4)?;
+                    let n = size(tag);
+                    // The header in two parts, so its second read is part
+                    // of the message and arms the receipt budget.
+                    s.write_all(format!("Content-Length: {n}\r\n").as_bytes())?;
+                    thread::sleep(Duration::from_millis(20));
+                    s.write_all(b"\r\n")?;
+                    s.write_all(&vec![tag; n])?;
+                    recv_framed(&mut s)
+                })
+            })
+            .collect();
+        let wait_for = |n: usize| {
+            let until = Instant::now() + Duration::from_secs(20);
+            while gate.load(Ordering::SeqCst) < n {
+                assert!(Instant::now() < until, "only {n} bodies went on");
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        // Two bodies take the count past the cap, and the rest wait well
+        // past their receipt budget.
+        wait_for(2);
+        thread::sleep(
+            Duration::from_millis(80) * u32::from(PEERS) + receipt * 2,
+        );
+        assert_eq!(gate.load(Ordering::SeqCst), 2, "the rest wait");
+        for released in 0..usize::from(PEERS) {
+            wait_for(released + 1);
+            control.send(Box::new(()));
+        }
+        for (tag, peer) in peers.into_iter().enumerate() {
+            let reply = peer.join().expect("peer").expect("peer io");
+            assert_eq!(reply, [tag as u8, 1], "body {tag} arrived whole");
+        }
+        stop.shutdown();
+    });
+    server.serve_forever().expect("serve_forever");
+    client.join().expect("thread join");
+    let seen = seen.borrow();
+    let order: Vec<u8> = seen.iter().map(|&(tag, _)| tag).collect();
+    assert_eq!(order, (0..PEERS).collect::<Vec<_>>(), "in arrival order");
+    // The body that crosses the cap may be any of them, the large one too.
+    for &(tag, at) in seen.iter() {
+        assert!(
+            at <= CAP + LARGE,
+            "body {tag} found {at} held, past the cap by more than one body"
+        );
+    }
+    assert!(
+        !closes.try_iter().any(|r| r == CloseReason::ReceiptTimeout),
+        "a held read was closed on its receipt budget"
+    );
 }

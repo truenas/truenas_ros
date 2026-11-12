@@ -976,7 +976,10 @@ where
         // buffers: retained capacity is what costs, and a count would let
         // a few maximal bodies retain what a thousand small ones should.
         core.body_pool = Some(std::rc::Rc::new(std::cell::RefCell::new(
-            crate::net::core::bodypool::BodyPool::new(BODY_POOL_BUDGET),
+            crate::net::core::bodypool::BodyPool::new(
+                BODY_POOL_BUDGET,
+                cfg.held_cap,
+            ),
         )));
         let sizing = crate::uring::bufring::PoolSizing {
             initial_bytes: cfg.buf_pool_initial_bytes,
@@ -1164,6 +1167,8 @@ where
             // completion for those connections has been routed).
             #[cfg(feature = "uring-fs")]
             self.sweep_closed_fs();
+            // What this turn gave back may let held body reads go on.
+            self.redrive_held_reads()?;
             // A drain's quiescence, re-read where everything that can
             // reach it has already run. `reclaim_slot` is edge-triggered
             // on connections and cannot see a task retire; see

@@ -1078,6 +1078,12 @@ pub(crate) struct Connection<U> {
     /// [`Connection::splice_deadline_owed`], which this mirrors exactly.
     #[cfg(feature = "net-server")]
     pub receipt_deadline_owed: u32,
+    /// The read of this connection's placed body waits in the reactor's
+    /// `held_reads` for the ring's held bytes to fall under
+    /// `ServerConfig::held_cap`. The list's dedup key, set as the read is
+    /// held and cleared as it is taken off the list, and nowhere else.
+    #[cfg(feature = "net-server")]
+    pub(crate) read_held: bool,
     // A push overflowed `max_send_backlog` while the connection was detached
     // (its worker owns the raw stream, so it cannot be torn down mid-detach):
     // evict with `SendBacklog` when the worker resumes it.
@@ -1240,6 +1246,8 @@ impl<U> Connection<U> {
             receipt_deadline_armed: false,
             #[cfg(feature = "net-server")]
             receipt_deadline_owed: 0,
+            #[cfg(feature = "net-server")]
+            read_held: false,
             evict_on_resume: false,
             close_on_flush: None,
             peer_closed: None,
@@ -2438,7 +2446,7 @@ mod tests {
         Vec<Vec<u8>>,
     ) {
         let pool = std::rc::Rc::new(std::cell::RefCell::new(
-            super::super::bodypool::BodyPool::new(1 << 20),
+            super::super::bodypool::BodyPool::new(1 << 20, None),
         ));
         let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 4);
         c.body_pool = Some(std::rc::Rc::clone(&pool));
