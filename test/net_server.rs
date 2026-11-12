@@ -9636,13 +9636,17 @@ fn the_embedded_reactor_sets_attributes_in_one_call() {
     assert_eq!((mode & 0o7777, hidden), (0o600, true));
 }
 
-/// Serve one framed request on a ring with an fs table through `body`,
-/// which is handed the ring's own personality, and give the reply. `None`
-/// on a box with no io_uring.
+/// Serve the framed `request` on a ring with an fs table through `body`,
+/// which is handed the ring's own personality, and give the reply and the
+/// server's counters once it stopped. `None` on a box with no io_uring.
 // Under `--cfg loom` the crate's `Arc` is loom's, which `File::from_shared`
 // takes and a std `Arc` is not, and the loom lane runs no ring.
 #[cfg(all(feature = "uring-fs", not(loom)))]
-fn one_fs_reply<B>(cfg: ServerConfig, body: B) -> Option<Vec<u8>>
+fn one_fs_reply<B>(
+    cfg: ServerConfig,
+    request: &'static [u8],
+    body: B,
+) -> Option<(Vec<u8>, truenas_ros::net::server::ServerStats)>
 where
     B: Fn(Request<'_, ()>, truenas_ros::uring_fs::Personality) -> Response
         + 'static,
@@ -9672,19 +9676,20 @@ where
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
-    let stop = server.shutdown_handle();
+    let (stop, stats) = (server.shutdown_handle(), server.stats_handle());
     let client = thread::spawn(move || -> io::Result<Vec<u8>> {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let mut s = connect_tcp(v4)?;
         s.set_read_timeout(Some(Duration::from_secs(5)))?;
-        send_framed(&mut s, b"go")?;
+        send_framed(&mut s, request)?;
         let reply = recv_framed(&mut s);
         drop(s);
         stop.shutdown();
         reply
     });
     server.serve_forever().expect("serve_forever");
-    Some(client.join().unwrap().expect("client io"))
+    let reply = client.join().unwrap().expect("client io");
+    Some((reply, stats.snapshot()))
 }
 
 /// What an owned write answered, and whether it gave back the very buffer
@@ -9740,7 +9745,7 @@ fn an_owned_write_writes_its_range_and_gives_its_buffer_back() {
         fs_ops: 16,
         ..ServerConfig::default()
     };
-    let reply = one_fs_reply(cfg, move |mut req, who| {
+    let reply = one_fs_reply(cfg, b"go", move |mut req, who| {
         let (deferred, permit) = req.responder.defer();
         let Some(mut fs) = req.fs.take() else {
             return Response::Close;
@@ -9775,7 +9780,7 @@ fn an_owned_write_writes_its_range_and_gives_its_buffer_back() {
         }
         Response::Defer(permit)
     });
-    let Some(reply) = reply else {
+    let Some((reply, _)) = reply else {
         std::fs::remove_dir_all(&dir).unwrap();
         return;
     };
@@ -9822,7 +9827,7 @@ fn an_owned_write_on_a_full_table_gives_its_buffer_back() {
         fs_ops: 1,
         ..ServerConfig::default()
     };
-    let reply = one_fs_reply(cfg, move |mut req, who| {
+    let reply = one_fs_reply(cfg, b"go", move |mut req, who| {
         let (deferred, permit) = req.responder.defer();
         let Some(mut fs) = req.fs.take() else {
             return Response::Close;
@@ -9843,7 +9848,7 @@ fn an_owned_write_on_a_full_table_gives_its_buffer_back() {
     });
     let file = std::fs::read(&fp).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
-    let Some(reply) = reply else {
+    let Some((reply, _)) = reply else {
         return;
     };
     assert_eq!(
@@ -9851,6 +9856,139 @@ fn an_owned_write_on_a_full_table_gives_its_buffer_back() {
         "EBUSY marked=true same=true"
     );
     assert_eq!(file, b"bytes", "nothing written");
+}
+
+/// `FsConn::pwritev2_window` writes windows of the request on ZFS, the
+/// first from the delivery's own facade and the second from that write's
+/// callback, after the delivery is over, while the second window alone
+/// keeps the receive buffer. The buffer goes back to the pool once the last
+/// window's share is gone.
+#[cfg(all(feature = "uring-fs", not(loom)))]
+#[test]
+fn a_window_is_written_from_its_delivery_and_after_it() {
+    use truenas_ros::uring_fs::{File, RwFlags};
+
+    let Some(ds) = zfs_dir::zfs_dir_or_skip() else {
+        return;
+    };
+    let dir = ds.join(format!("rostest_window_write_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let fp = dir.join("f");
+    std::fs::write(&fp, b"").unwrap();
+    let held: Arc<std::os::fd::OwnedFd> = Arc::new(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fp)
+            .unwrap()
+            .into(),
+    );
+    let cfg = ServerConfig {
+        pool_size: 4,
+        fs_ops: 16,
+        ..ServerConfig::default()
+    };
+    let reply = one_fs_reply(cfg, b"0123456789", move |mut req, who| {
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let Some(window) = fs.lease_window(&req.body[..]) else {
+            deferred.reply(echo_frame(b"not leased"));
+            return Response::Defer(permit);
+        };
+        let (head, tail) = window.split_at(4);
+        let (first, later) = (
+            File::from_shared(Arc::clone(&held)),
+            File::from_shared(Arc::clone(&held)),
+        );
+        let flags = RwFlags::empty();
+        fs.pwritev2_window(who, first, head, 0, flags, move |done, fs| {
+            let first = done.result().ok();
+            fs.pwritev2_window(who, later, tail, 4, flags, move |done, _| {
+                let text = format!("{first:?} {:?}", done.result().ok());
+                deferred.reply(echo_frame(text.as_bytes()));
+            });
+        });
+        Response::Defer(permit)
+    });
+    let file = std::fs::read(&fp).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let Some((reply, stats)) = reply else {
+        return;
+    };
+    assert_eq!(String::from_utf8_lossy(&reply), "Some(4) Some(6)");
+    assert_eq!(file, b"0123456789", "each window at its offset");
+    assert!(stats.recv_bufs_total > 0, "no receive pool: {stats:?}");
+    assert_eq!(stats.recv_bufs_lent, 0, "the buffer came home: {stats:?}");
+}
+
+/// With both slots of a two-slot table held by reads parked on a FIFO,
+/// `FsConn::pwritev2_window` is refused with a marked `EBUSY`, writes
+/// nothing, and its receive buffer goes back to the pool as the window
+/// drops.
+#[cfg(all(feature = "uring-fs", not(loom)))]
+#[test]
+fn a_window_write_on_a_full_table_gives_its_buffer_back() {
+    use std::os::unix::ffi::OsStrExt;
+    use truenas_ros::uring_fs::{File, RwFlags};
+
+    let Some(ds) = zfs_dir::zfs_dir_or_skip() else {
+        return;
+    };
+    let dir = ds.join(format!("rostest_window_full_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let fp = dir.join("f");
+    std::fs::write(&fp, b"bytes").unwrap();
+    let fifo = dir.join("fifo");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let open = |p: &Path| -> Arc<std::os::fd::OwnedFd> {
+        // O_RDWR on a FIFO opens at once with a writer attached, so a read
+        // with no data parks and holds its slot.
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(p);
+        Arc::new(f.unwrap().into())
+    };
+    let (held, pipe) = (open(&fp), open(&fifo));
+    let cfg = ServerConfig {
+        pool_size: 1,
+        fs_ops: 1,
+        ..ServerConfig::default()
+    };
+    let reply = one_fs_reply(cfg, b"window", move |mut req, who| {
+        let (deferred, permit) = req.responder.defer();
+        let Some(mut fs) = req.fs.take() else {
+            return Response::Close;
+        };
+        let Some(window) = fs.lease_window(&req.body[..]) else {
+            deferred.reply(echo_frame(b"not leased"));
+            return Response::Defer(permit);
+        };
+        let flags = RwFlags::empty();
+        for _ in 0..2 {
+            let parked = File::from_shared(Arc::clone(&pipe));
+            fs.preadv2(who, parked, vec![vec![0u8; 4]], 0, flags, |_, _| {});
+        }
+        let file = File::from_shared(Arc::clone(&held));
+        fs.pwritev2_window(who, file, window, 0, flags, move |d, _| {
+            let text = match d.result() {
+                Err(Error::Errno(e)) => format!("{e:?} {}", d.was_refused()),
+                other => format!("{other:?}"),
+            };
+            deferred.reply(echo_frame(text.as_bytes()));
+        });
+        Response::Defer(permit)
+    });
+    let file = std::fs::read(&fp).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let Some((reply, stats)) = reply else {
+        return;
+    };
+    assert_eq!(String::from_utf8_lossy(&reply), "EBUSY true");
+    assert_eq!(file, b"bytes", "nothing written");
+    assert_eq!(stats.recv_bufs_lent, 0, "the buffer came home: {stats:?}");
 }
 
 /// `FsConn::fgetxattr_as_root` reads an xattr under the reactor's ambient

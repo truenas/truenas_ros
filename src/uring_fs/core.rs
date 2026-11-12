@@ -483,8 +483,9 @@ fn gather_fits(windows: usize, total: usize) -> bool {
 /// write, every leased job and every [`LeasedWindow`] reading from it.
 ///
 /// The buffer goes back to the pool when the last share goes. A reaped
-/// write and a taken job completion take the id out on the reactor
-/// ([`into_bid`](Self::into_bid), which disarms the drop); a share
+/// write and a taken job completion take the id out on the reactor of the
+/// hold's own core ([`take_bid`](Self::take_bid), which disarms the drop),
+/// and a hold of another core's pool goes home through its queue. A share
 /// dropped anywhere else - a window a handler held past its delivery
 /// and let go, on whatever thread - returns it through the fs core's
 /// returns queue and pokes the loop, the road a finished job's result
@@ -546,6 +547,22 @@ impl LeaseHold {
         self.returns = None;
         self.bid
     }
+
+    /// The buffer id for the core whose returns queue is `home` to give
+    /// back to its own pool, as [`into_bid`](Self::into_bid) takes it out,
+    /// or `None` for a hold of another core's pool, which is dropped and so
+    /// sends its id home through that core's queue. Each core's ids name
+    /// its own buffers, and a `LeasedWindow` is `Send`, so a window written
+    /// on another ring would otherwise put a buffer of its own ring into
+    /// that ring's pool, where the kernel could be handed a buffer still in
+    /// use. A hold with no core behind it, a test's, is taken as `home`'s.
+    fn take_bid(self, home: &Arc<Mutex<VecDeque<u16>>>) -> Option<u16> {
+        let ours = self
+            .returns
+            .as_ref()
+            .is_none_or(|returns| Arc::ptr_eq(&returns.queue, home));
+        if ours { Some(self.into_bid()) } else { None }
+    }
 }
 
 #[cfg(feature = "net-server")]
@@ -586,8 +603,10 @@ unsafe impl Send for LeasedBytes {}
 impl LeasedBytes {
     fn as_slice(&self) -> &[u8] {
         // SAFETY: `ptr` and `len` came from a live `&[u8]` into a leased
-        // buffer, and the share held beside this value keeps that buffer
-        // alive and unwritten until after the job using this view returns.
+        // buffer, so every byte was written, and the share held beside this
+        // value keeps that buffer alive and unwritten for as long as the
+        // share lives, which outlasts every borrow of the slice, since a job
+        // holds its share until it returns and a window holds its own.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
@@ -598,7 +617,8 @@ impl LeasedBytes {
 /// gone. What a handler that digests its windows in order keeps while
 /// an earlier window's job still runs, and spends on
 /// [`FsConn::offload_leased`] from that job's completion - no copy at
-/// either end.
+/// either end. Its bytes read as a slice through `Deref` for as long as it
+/// is held.
 ///
 /// Dropping one unspent returns its share like any other: the buffer
 /// goes back to the pool when the last share of its claim is gone,
@@ -653,6 +673,22 @@ impl LeasedWindow {
             hold,
         };
         (head, tail)
+    }
+}
+
+/// The window's bytes, which nothing writes while it holds its share. A
+/// delivery that leases its buffer takes the buffer from the connection
+/// and copies any pipelined remainder into storage of its own
+/// (`RecvBuf::drain_front`), so no later receive lands in it, a release
+/// and a forfeit refuse a leased claim, and the kernel only reads a buffer
+/// it writes to a file. The window is `Send` and not `Sync`, so the slice
+/// is read on the thread that holds the window.
+#[cfg(feature = "net-server")]
+impl std::ops::Deref for LeasedWindow {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.view.as_slice()
     }
 }
 
@@ -1434,7 +1470,7 @@ impl FsCore {
                 if let Some(bid) = e
                     .lease
                     .and_then(std::sync::Arc::into_inner)
-                    .map(LeaseHold::into_bid)
+                    .and_then(|hold| hold.take_bid(&self.lease_returns))
                 {
                     self.pool_releases.push(bid);
                 }
@@ -1839,33 +1875,46 @@ impl FsCore {
         }
     }
 
-    /// Stage one `WRITEV` of held windows' bytes, in order from `off`, every
+    /// Stage one write of held windows' bytes, in order from `off`, every
     /// share held to the CQE and each buffer's id surfaced at the reap for
-    /// the net server to hand back. `Err` hands the windows and waiter back,
-    /// never in flight: a full op table, a refused SQE, or a gather that
-    /// does not fit one `WRITEV` (`gather_fits`).
+    /// the net server to hand back. The windows come as a `Vec` for a
+    /// gather, or as an array of one, so a single window takes no outer
+    /// `Vec`. One window is a `WRITE`, which takes the address and the
+    /// count itself (`io_prep_write`, `io_uring/rw.c`), so it needs no
+    /// iovec and never grows the slot's array, which a slot last used by an
+    /// op with none has no room in. More are a `WRITEV`.
+    ///
+    /// `Err` hands the waiter back, never in flight. A full op table and a
+    /// gather that does not fit one `WRITEV` (`gather_fits`) hand the
+    /// windows back as they came. A refused SQE drops them in the slot,
+    /// which returns each share, since no caller does more with them.
     ///
     /// # Safety-relevant contract
     /// A window's bytes stay valid while its share lives, and the entry
     /// keeps every share to the reap.
     #[cfg(feature = "net-server")]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn submit_pwritev2_gathered(
+    pub(crate) fn submit_pwritev2_gathered<W>(
         &mut self,
         eng: &mut Engine,
         pers: u16,
         file: Arc<OwnedFd>,
-        windows: Vec<LeasedWindow>,
+        windows: W,
         off: u64,
         rw_flags: u32,
         waiter: FsWaiter,
-    ) -> Result<(), (Vec<LeasedWindow>, FsWaiter)> {
-        let total: usize = windows.iter().map(LeasedWindow::len).sum();
-        if !gather_fits(windows.len(), total) {
-            return Err((windows, waiter));
+    ) -> Result<(), (Option<W>, FsWaiter)>
+    where
+        W: AsRef<[LeasedWindow]> + IntoIterator<Item = LeasedWindow>,
+    {
+        let held = windows.as_ref();
+        let count = held.len();
+        let total: usize = held.iter().map(LeasedWindow::len).sum();
+        if !gather_fits(count, total) {
+            return Err((Some(windows), waiter));
         }
         let Some(op_slot) = self.pop_op() else {
-            return Err((windows, waiter));
+            return Err((Some(windows), waiter));
         };
         let raw_fd = file.as_raw_fd();
         let entry = &mut self.ops[op_slot as usize];
@@ -1873,12 +1922,16 @@ impl FsCore {
         entry.state.state = FsOpState::InFlight { tag: TAG_WRITEV };
         entry.state.iov.clear();
         entry.state.recv_lease_more.clear();
-        let count = windows.len() as u32;
+        let mut single = None;
         for LeasedWindow { view, hold } in windows {
-            entry.state.iov.push(libc::iovec {
-                iov_base: view.ptr as *mut libc::c_void,
-                iov_len: view.len,
-            });
+            if count == 1 {
+                single = Some(view);
+            } else {
+                entry.state.iov.push(libc::iovec {
+                    iov_base: view.ptr as *mut libc::c_void,
+                    iov_len: view.len,
+                });
+            }
             if entry.state.recv_lease.is_none() {
                 entry.state.recv_lease = Some(hold);
             } else {
@@ -1887,15 +1940,23 @@ impl FsCore {
         }
         entry.state.file = Some(file);
         entry.state.lease_want = total as u32;
-        let iov_ptr = entry.state.iov.as_ptr() as u64;
+        // `gather_fits` held the count to `UIO_MAXIOV` and the bytes to
+        // `max_rw_count`, so both fit a `u32`.
+        let (opcode, addr, len) = match single {
+            Some(view) => (IORING_OP_WRITE, view.ptr as u64, view.len as u32),
+            None => {
+                let iov = entry.state.iov.as_ptr() as u64;
+                (IORING_OP_WRITEV, iov, count as u32)
+            }
+        };
         let force = self.force_async.sqe_bit(ForceAsync::WRITE);
         let ud = pack_raw(TAG_WRITEV, op_slot, gen32);
         let staged = eng.stage(ud, |sqe| {
-            sqe.opcode = IORING_OP_WRITEV;
+            sqe.opcode = opcode;
             sqe.fd = raw_fd;
             sqe.flags = force;
-            sqe.addr = iov_ptr;
-            sqe.len = count;
+            sqe.addr = addr;
+            sqe.len = len;
             sqe.off_addr2 = off;
             sqe.op_flags = rw_flags;
             sqe.personality = pers;
@@ -1906,30 +1967,12 @@ impl FsCore {
                 Ok(())
             }
             Err(_) => {
-                // Never in flight: hand the windows back to be refused.
-                let holds = entry
-                    .state
-                    .recv_lease
-                    .take()
-                    .into_iter()
-                    .chain(entry.state.recv_lease_more.drain(..));
-                let back = entry
-                    .state
-                    .iov
-                    .iter()
-                    .zip(holds)
-                    .map(|(iov, hold)| LeasedWindow {
-                        view: LeasedBytes {
-                            ptr: iov.iov_base as *const u8,
-                            len: iov.iov_len,
-                        },
-                        hold,
-                    })
-                    .collect();
+                // Never in flight, so the clear drops every share the slot
+                // took, which returns each buffer as its last share goes.
                 entry.state.clear();
                 entry.generation += 1;
                 self.op_free.push(op_slot);
-                Err((back, waiter))
+                Err((None, waiter))
             }
         }
     }
@@ -1945,19 +1988,21 @@ impl FsCore {
     /// are refused in their place, after the body was written.
     #[cfg(feature = "net-server")]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn submit_leased_or_refuse(
+    pub(crate) fn submit_leased_or_refuse<W>(
         &mut self,
         eng: &mut Engine,
         pers: u16,
         file: Arc<OwnedFd>,
-        windows: Vec<LeasedWindow>,
+        windows: W,
         off: u64,
         rw_flags: u32,
         waiter: FsWaiter,
-    ) {
+    ) where
+        W: AsRef<[LeasedWindow]> + IntoIterator<Item = LeasedWindow>,
+    {
         debug_assert!(gather_fits(
-            windows.len(),
-            windows.iter().map(LeasedWindow::len).sum()
+            windows.as_ref().len(),
+            windows.as_ref().iter().map(LeasedWindow::len).sum()
         ));
         if let Err((windows, waiter)) = self.submit_pwritev2_gathered(
             eng,
@@ -3234,11 +3279,13 @@ impl FsCore {
         // the id surfaces from exactly one completion - `into_inner` on the
         // final `Arc` - and rides out `None` from every other.
         #[cfg(feature = "net-server")]
+        let home = &self.lease_returns;
+        #[cfg(feature = "net-server")]
         let recv_lease = completed
             .recv_lease
             .take()
             .and_then(std::sync::Arc::into_inner)
-            .map(LeaseHold::into_bid);
+            .and_then(|hold| hold.take_bid(home));
         // In order, so a buffer two windows share surfaces once, from the
         // later.
         #[cfg(feature = "net-server")]
@@ -3246,7 +3293,7 @@ impl FsCore {
             std::mem::take(&mut completed.recv_lease_more)
                 .into_iter()
                 .filter_map(std::sync::Arc::into_inner)
-                .map(LeaseHold::into_bid)
+                .filter_map(|hold| hold.take_bid(home))
                 .collect();
         #[cfg(feature = "net-server")]
         let lease_want = completed.lease_want;
@@ -4988,11 +5035,12 @@ impl<'a> FsConn<'a> {
                     hold: std::sync::Arc::clone(&hold),
                 };
                 let w = self.waiter(on_done);
+                // An array of one, so the write takes no outer `Vec`.
                 match self.fs.submit_pwritev2_gathered(
                     self.eng,
                     who.0,
                     Arc::clone(&f.fd),
-                    vec![window],
+                    [window],
                     off,
                     flags.bits(),
                     w,
@@ -5101,8 +5149,55 @@ impl<'a> FsConn<'a> {
     ) where
         F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
     {
-        let total = windows.iter().map(LeasedWindow::len).sum();
-        if gather_fits(windows.len(), total) {
+        self.write_windows(who, f, windows, off, flags, on_done);
+    }
+
+    /// Write one window held with [`lease_window`](Self::lease_window) to
+    /// `f` at `off`, as [`pwritev2_leased`](Self::pwritev2_leased) writes a
+    /// gather, from any facade on the ring that leased it, a later
+    /// callback's included, with no outer `Vec` and no iovec. So a consumer
+    /// that keeps a request across a pause writes a range of it with no
+    /// copy, cut out with [`LeasedWindow::split_at`].
+    ///
+    /// The buffer returns to the pool when the window's last share goes. A
+    /// short write fails the op with `EIO` and gives its count through
+    /// [`FsDone::short_count`], and a full op table refuses the write with
+    /// a marked `EBUSY` ([`FsDone::was_refused`]), the buffer going back as
+    /// the window drops.
+    #[cfg(feature = "net-server")]
+    pub fn pwritev2_window<F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        window: LeasedWindow,
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        self.write_windows(who, f, [window], off, flags, on_done);
+    }
+
+    /// The write of [`pwritev2_leased`](Self::pwritev2_leased) and
+    /// [`pwritev2_window`](Self::pwritev2_window), for a `Vec` of windows or
+    /// an array of one.
+    #[cfg(feature = "net-server")]
+    fn write_windows<W, F>(
+        &mut self,
+        who: Personality,
+        f: File,
+        windows: W,
+        off: u64,
+        flags: RwFlags,
+        on_done: F,
+    ) where
+        W: AsRef<[LeasedWindow]> + IntoIterator<Item = LeasedWindow>,
+        F: FnOnce(FsDone, &mut FsConn<'_>) + 'static,
+    {
+        let held = windows.as_ref();
+        let total = held.iter().map(LeasedWindow::len).sum();
+        if gather_fits(held.len(), total) {
             let w = self.waiter(on_done);
             self.fs.submit_leased_or_refuse(
                 self.eng,
@@ -5118,8 +5213,8 @@ impl<'a> FsConn<'a> {
         // Too many windows or bytes for one `WRITEV`: one copy instead, and
         // the shares go back as the windows drop.
         let mut copy = Vec::with_capacity(total);
-        for window in &windows {
-            copy.extend_from_slice(window.view.as_slice());
+        for window in windows.as_ref() {
+            copy.extend_from_slice(window);
         }
         drop(windows);
         self.pwritev2(who, f, vec![copy], off, flags, on_done);
@@ -9697,6 +9792,126 @@ mod routing_fuzz {
         }
     }
 
+    /// One window is staged as one `WRITE` of its bytes, with no iovec, and
+    /// its short write fails with `EIO` and gives its count as a gather's
+    /// does, while the buffer still comes back from its last share.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_short_window_write_gives_its_count_beside_its_eio() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut core = FsCore::new(8, OffloadBounds::default());
+        let buf = vec![7u8; 8192];
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        let hold = std::sync::Arc::new(LeaseHold::detached(9));
+        let staged = core.submit_pwritev2_gathered(
+            &mut eng,
+            0,
+            file,
+            [window_over(&buf, &hold)],
+            0,
+            0,
+            embedded_noop(),
+        );
+        assert!(staged.is_ok(), "staged");
+        drop(hold);
+        let sqe = eng.staged_sqe(0);
+        assert_eq!(
+            (sqe.opcode, sqe.addr, sqe.len),
+            (IORING_OP_WRITE, buf.as_ptr() as u64, 8192),
+            "one window is one WRITE of its bytes"
+        );
+        let [(t, s, g)] = inflight(&core)[..] else {
+            panic!("one op in flight");
+        };
+        let ReapedFs::Embedded(_, mut done, _) =
+            core.on_cqe(&mut eng, t, s, g, 4096)
+        else {
+            panic!("an embedded waiter reaps embedded");
+        };
+        assert_eq!(
+            (done.raw_result(), done.short_count()),
+            (Err(Errno::EIO), Some(4096))
+        );
+        assert_eq!(done.take_recv_lease(), Some(9), "the buffer comes back");
+    }
+
+    /// A hold of another core's pool, reaped here as a write's last share
+    /// or taken here as a job's, gives this core no id, and its id reaches
+    /// its own core's queue, so no ring puts another ring's buffer in its
+    /// pool. A hold of this core's pool gives its id here and nowhere else.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_hold_of_another_core_goes_home() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut fs = FsCore::new(8, OffloadBounds::default());
+        let mut other = FsCore::new(4, OffloadBounds::default());
+        let theirs = other.lease_returns(&eng.shared);
+        let buf = vec![7u8; 64];
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        // A gather of two of their buffers, then one window of ours.
+        let ours = fs.lease_returns(&eng.shared);
+        for bids in [&[5, 7][..], &[6][..]] {
+            let returns = if bids == [6] { &ours } else { &theirs };
+            let holds: Vec<_> = bids
+                .iter()
+                .map(|&bid| {
+                    std::sync::Arc::new(LeaseHold::new(bid, returns.clone()))
+                })
+                .collect();
+            let windows: Vec<LeasedWindow> =
+                holds.iter().map(|hold| window_over(&buf, hold)).collect();
+            let staged = fs.submit_pwritev2_gathered(
+                &mut eng,
+                0,
+                Arc::clone(&file),
+                windows,
+                0,
+                0,
+                embedded_noop(),
+            );
+            assert!(staged.is_ok(), "staged");
+            drop(holds);
+            let [(t, s, g)] = inflight(&fs)[..] else {
+                panic!("one op in flight");
+            };
+            let written = (buf.len() * bids.len()) as i32;
+            let ReapedFs::Embedded(_, mut done, _) =
+                fs.on_cqe(&mut eng, t, s, g, written)
+            else {
+                panic!("an embedded waiter reaps embedded");
+            };
+            let mut given: Vec<u16> =
+                done.take_recv_lease().into_iter().collect();
+            given.extend(done.take_recv_lease_more());
+            let want: &[u16] = if bids == [6] { &[6] } else { &[] };
+            assert_eq!(given, want, "{bids:?}");
+        }
+        let mut home = other.take_pool_releases();
+        home.sort_unstable();
+        assert_eq!(home, [5, 7], "the write's go home");
+        assert!(fs.take_pool_releases().is_empty(), "none came back twice");
+
+        let wake = crate::uring::wake::WakeHandle::new().expect("wake");
+        let (sink, hold) = (
+            fs.completion_sink(),
+            std::sync::Arc::new(LeaseHold::new(8, theirs)),
+        );
+        let token =
+            fs.register_leased_offload(None, Box::new(|_any, _conn| {}), hold);
+        finish_offload(&sink, &wake, token, Box::new(()));
+        assert_eq!(fs.take_pool_completions().len(), 1, "the job is taken");
+        assert!(fs.take_pool_releases().is_empty(), "no id of theirs here");
+        assert_eq!(other.take_pool_releases(), [8], "the job's goes home");
+    }
+
     /// N writes share one claim; the buffer surfaces from the last.
     ///
     /// Two leased writes read from one buffer, so releasing at the first
@@ -10054,8 +10269,9 @@ mod routing_fuzz {
         let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
         let hold = std::sync::Arc::new(LeaseHold::detached(9));
         for n in [0, UIO_MAXIOV + 1] {
-            let windows = (0..n).map(|_| window_over(&buf, &hold)).collect();
-            let Err((back, _)) = core.submit_pwritev2_gathered(
+            let windows: Vec<LeasedWindow> =
+                (0..n).map(|_| window_over(&buf, &hold)).collect();
+            let Err((Some(back), _)) = core.submit_pwritev2_gathered(
                 &mut eng,
                 0,
                 Arc::clone(&file),
@@ -10064,11 +10280,25 @@ mod routing_fuzz {
                 0,
                 embedded_noop(),
             ) else {
-                panic!("{n} windows must be refused");
+                panic!("{n} windows must be refused and handed back");
             };
             assert_eq!(back.len(), n, "every window comes back");
             assert!(inflight(&core).is_empty(), "nothing went in flight");
         }
+    }
+
+    /// A window reads as the bytes it was leased over, and so do both
+    /// halves of a split, each where it begins.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_window_reads_as_the_bytes_it_was_leased_over() {
+        let buf = b"<head|tail>".to_vec();
+        let hold = std::sync::Arc::new(LeaseHold::detached(9));
+        let window = window_over(&buf[1..10], &hold);
+        assert_eq!(&*window, b"head|tail");
+        let (head, tail) = window.split_at(5);
+        assert_eq!((&*head, &*tail), (&b"head|"[..], &b"tail"[..]));
+        assert_eq!((head.len(), tail.len()), (5, 4), "its own lengths stay");
     }
 
     /// Both halves of a split window read the buffer, so both hold it.

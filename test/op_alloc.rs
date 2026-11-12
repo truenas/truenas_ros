@@ -118,7 +118,7 @@ fn recv_framed(s: &mut TcpStream) -> io::Result<Vec<u8>> {
 /// The ops counted, in the order a pass reports them, with the
 /// allocations each may make: its callback's box, and a statx's box for
 /// its result besides.
-const OPS: [(&str, usize); 9] = [
+const OPS: [(&str, usize); 11] = [
     ("a reopen through /proc", 1),
     ("an open of a name", 1),
     ("an open of ..", 1),
@@ -128,6 +128,8 @@ const OPS: [(&str, usize); 9] = [
     ("an fsetxattr", 1),
     ("a read into spare room", 1),
     ("an owned write", 1),
+    ("a leased write of the request", 1),
+    ("a write of a window of the request", 1),
 ];
 
 /// What one pass gathers until its last op answers.
@@ -170,9 +172,10 @@ const XATTR: &CStr = c"user.alloc";
 
 /// A reopen, an open of a name, an open of `..`, a statx of a name, an
 /// `fstatx`, a read of an xattr through `/proc`, an `fsetxattr`, a read
-/// into spare room with a buffer the handler keeps and an owned write from
-/// storage of the ring's body pool allocate nothing on a warm ring but the
-/// box of their callback, and each statx the box of its result. An xattr
+/// into spare room with a buffer the handler keeps, an owned write from
+/// storage of the ring's body pool, a leased write of the request from its
+/// receive buffer and a write of a window of it allocate nothing on a warm
+/// ring but the box of their callback, and each statx the box of its result. An xattr
 /// op, the read and the write give their buffer back through
 /// `FsDone::into_value` with no outer `Vec`, and the write's storage goes
 /// back to the pool and is the storage the next pass claims.
@@ -207,7 +210,6 @@ fn a_warm_rings_ops_allocate_only_their_callback() {
     let pc = Arc::clone(&pers);
     let rc = Rc::clone(&pool);
     let body = move |mut req: Request<'_, ()>| -> Response {
-        let _ = req.body.take();
         let (deferred, permit) = req.responder.defer();
         let Some(mut fs) = req.fs.take() else {
             return Response::Close;
@@ -284,9 +286,22 @@ fn a_warm_rings_ops_allocate_only_their_callback() {
             recycler.recycle(back);
             pass_back.answered();
         };
+        let f = file.clone();
         let n = counted(|| {
             fs.pwritev2_owned(who, file, owned, 0..4096, 4096, empty, cb)
         });
+        pass.counts.borrow_mut().push(n);
+        // The first lease of a delivery makes the hold its writes share,
+        // so a window leased first leaves the write nothing to make.
+        let request = &req.body[..];
+        let held = fs.lease_window(request).expect("a pooled request");
+        let cb = done(&pass);
+        let n = counted(|| {
+            fs.pwritev2_from(who, f.clone(), request, 8192, empty, cb)
+        });
+        pass.counts.borrow_mut().push(n);
+        let cb = done(&pass);
+        let n = counted(|| fs.pwritev2_window(who, f, held, 12288, empty, cb));
         pass.counts.borrow_mut().push(n);
         Response::Defer(permit)
     };
