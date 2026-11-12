@@ -483,8 +483,9 @@ fn gather_fits(windows: usize, total: usize) -> bool {
 /// write, every leased job and every [`LeasedWindow`] reading from it.
 ///
 /// The buffer goes back to the pool when the last share goes. A reaped
-/// write and a taken job completion take the id out on the reactor
-/// ([`into_bid`](Self::into_bid), which disarms the drop); a share
+/// write and a taken job completion take the id out on the reactor of the
+/// hold's own core ([`take_bid`](Self::take_bid), which disarms the drop),
+/// and a hold of another core's pool goes home through its queue. A share
 /// dropped anywhere else - a window a handler held past its delivery
 /// and let go, on whatever thread - returns it through the fs core's
 /// returns queue and pokes the loop, the road a finished job's result
@@ -545,6 +546,22 @@ impl LeaseHold {
     fn into_bid(mut self) -> u16 {
         self.returns = None;
         self.bid
+    }
+
+    /// The buffer id for the core whose returns queue is `home` to give
+    /// back to its own pool, as [`into_bid`](Self::into_bid) takes it out,
+    /// or `None` for a hold of another core's pool, which is dropped and so
+    /// sends its id home through that core's queue. Each core's ids name
+    /// its own buffers, and a `LeasedWindow` is `Send`, so a window written
+    /// on another ring would otherwise put a buffer of its own ring into
+    /// that ring's pool, where the kernel could be handed a buffer still in
+    /// use. A hold with no core behind it, a test's, is taken as `home`'s.
+    fn take_bid(self, home: &Arc<Mutex<VecDeque<u16>>>) -> Option<u16> {
+        let ours = self
+            .returns
+            .as_ref()
+            .is_none_or(|returns| Arc::ptr_eq(&returns.queue, home));
+        if ours { Some(self.into_bid()) } else { None }
     }
 }
 
@@ -1453,7 +1470,7 @@ impl FsCore {
                 if let Some(bid) = e
                     .lease
                     .and_then(std::sync::Arc::into_inner)
-                    .map(LeaseHold::into_bid)
+                    .and_then(|hold| hold.take_bid(&self.lease_returns))
                 {
                     self.pool_releases.push(bid);
                 }
@@ -3262,11 +3279,13 @@ impl FsCore {
         // the id surfaces from exactly one completion - `into_inner` on the
         // final `Arc` - and rides out `None` from every other.
         #[cfg(feature = "net-server")]
+        let home = &self.lease_returns;
+        #[cfg(feature = "net-server")]
         let recv_lease = completed
             .recv_lease
             .take()
             .and_then(std::sync::Arc::into_inner)
-            .map(LeaseHold::into_bid);
+            .and_then(|hold| hold.take_bid(home));
         // In order, so a buffer two windows share surfaces once, from the
         // later.
         #[cfg(feature = "net-server")]
@@ -3274,7 +3293,7 @@ impl FsCore {
             std::mem::take(&mut completed.recv_lease_more)
                 .into_iter()
                 .filter_map(std::sync::Arc::into_inner)
-                .map(LeaseHold::into_bid)
+                .filter_map(|hold| hold.take_bid(home))
                 .collect();
         #[cfg(feature = "net-server")]
         let lease_want = completed.lease_want;
@@ -9818,6 +9837,79 @@ mod routing_fuzz {
             (Err(Errno::EIO), Some(4096))
         );
         assert_eq!(done.take_recv_lease(), Some(9), "the buffer comes back");
+    }
+
+    /// A hold of another core's pool, reaped here as a write's last share
+    /// or taken here as a job's, gives this core no id, and its id reaches
+    /// its own core's queue, so no ring puts another ring's buffer in its
+    /// pool. A hold of this core's pool gives its id here and nowhere else.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_hold_of_another_core_goes_home() {
+        let Some(mut eng) = engine_or_skip() else {
+            return;
+        };
+        let mut fs = FsCore::new(8, OffloadBounds::default());
+        let mut other = FsCore::new(4, OffloadBounds::default());
+        let theirs = other.lease_returns(&eng.shared);
+        let buf = vec![7u8; 64];
+        let fd = synth_fd();
+        // SAFETY: `synth_fd` just opened it; nothing else owns it.
+        let file = Arc::new(unsafe { crate::fd::owned_from_raw(fd) });
+        // A gather of two of their buffers, then one window of ours.
+        let ours = fs.lease_returns(&eng.shared);
+        for bids in [&[5, 7][..], &[6][..]] {
+            let returns = if bids == [6] { &ours } else { &theirs };
+            let holds: Vec<_> = bids
+                .iter()
+                .map(|&bid| {
+                    std::sync::Arc::new(LeaseHold::new(bid, returns.clone()))
+                })
+                .collect();
+            let windows: Vec<LeasedWindow> =
+                holds.iter().map(|hold| window_over(&buf, hold)).collect();
+            let staged = fs.submit_pwritev2_gathered(
+                &mut eng,
+                0,
+                Arc::clone(&file),
+                windows,
+                0,
+                0,
+                embedded_noop(),
+            );
+            assert!(staged.is_ok(), "staged");
+            drop(holds);
+            let [(t, s, g)] = inflight(&fs)[..] else {
+                panic!("one op in flight");
+            };
+            let written = (buf.len() * bids.len()) as i32;
+            let ReapedFs::Embedded(_, mut done, _) =
+                fs.on_cqe(&mut eng, t, s, g, written)
+            else {
+                panic!("an embedded waiter reaps embedded");
+            };
+            let mut given: Vec<u16> =
+                done.take_recv_lease().into_iter().collect();
+            given.extend(done.take_recv_lease_more());
+            let want: &[u16] = if bids == [6] { &[6] } else { &[] };
+            assert_eq!(given, want, "{bids:?}");
+        }
+        let mut home = other.take_pool_releases();
+        home.sort_unstable();
+        assert_eq!(home, [5, 7], "the write's go home");
+        assert!(fs.take_pool_releases().is_empty(), "none came back twice");
+
+        let wake = crate::uring::wake::WakeHandle::new().expect("wake");
+        let (sink, hold) = (
+            fs.completion_sink(),
+            std::sync::Arc::new(LeaseHold::new(8, theirs)),
+        );
+        let token =
+            fs.register_leased_offload(None, Box::new(|_any, _conn| {}), hold);
+        finish_offload(&sink, &wake, token, Box::new(()));
+        assert_eq!(fs.take_pool_completions().len(), 1, "the job is taken");
+        assert!(fs.take_pool_releases().is_empty(), "no id of theirs here");
+        assert_eq!(other.take_pool_releases(), [8], "the job's goes home");
     }
 
     /// N writes share one claim; the buffer surfaces from the last.
