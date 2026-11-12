@@ -14252,8 +14252,10 @@ fn placed_bodies_past_the_held_cap_wait_their_turn() {
             Duration::from_millis(80) * u32::from(PEERS) + receipt * 2,
         );
         assert_eq!(gate.load(Ordering::SeqCst), 2, "the rest wait");
+        // Each release once the body the last one let go on has arrived,
+        // so no two held bodies go on together and finish in either order.
         for released in 0..usize::from(PEERS) {
-            wait_for(released + 1);
+            wait_for((released + 2).min(usize::from(PEERS)));
             control.send(Box::new(()));
         }
         for (tag, peer) in peers.into_iter().enumerate() {
