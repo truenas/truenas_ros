@@ -321,6 +321,46 @@ Do not reopen these without a reason that is new.
   (`Seg::Recycled`). Pinned by
   `a_reply_claimed_from_the_pool_does_not_allocate_per_reply` and
   `a_recycled_segment_gives_its_storage_back_once_sent`.
+- **Storage the reactor handed on and nobody took comes home as it
+  drops.** A placed body the handler leaves untaken goes back as its
+  `Body` drops, since the handler owns its `Request`. A reply marked
+  recycled goes back as its queue entry drops, sent or not, so a teardown
+  sends home what it drains, and the injection drain sends home one that
+  reaches no request (`Server::spill`). Freed instead, a handler that reads
+  its body where it lies costs an allocation for every message. Pinned by
+  `an_untaken_buffered_body_does_not_allocate_per_message`,
+  `a_recycled_segment_queued_at_a_teardown_goes_home` and
+  `a_recycled_reply_that_reaches_no_request_goes_home`.
+- **The count of held bytes is exact by construction.** The reactor counts
+  the pool storage it holds by capacity, a placed or promoted body from its
+  claim until it is taken or given back, and a reply marked recycled from
+  its queueing until it is sent or dropped. Each holder carries what it put
+  on the count (`Ticket`, `Home`) and takes exactly that off, never a
+  capacity read again, since promoted storage grows while held. Storage a
+  consumer takes leaves the count, since a `Vec` dropped where the pool
+  cannot see it would stay counted for good, and the consumer counts what
+  it holds with `BodyRecycler::take_out` and `give_back`. Pinned by
+  `held_bytes_come_off_as_they_went_on` and
+  `held_bytes_follow_a_placed_body_and_a_recycled_reply`.
+- **At `held_cap` a placed body read waits, in order, and nothing else
+  does.** The check sits where the reactor decides to place a body, before
+  it claims storage, so a held connection keeps its header and frame and
+  claims only when it goes on. A newcomer waits behind any read already
+  waiting, and the loop's turn lets them go on in the order they were held
+  (`redrive_held_reads`, `held_turn`), checking again after each, so the
+  ring passes the cap by one body at most and a body larger than the cap
+  still goes on. Promoted storage counts but is never held back, since part
+  of its message has arrived. Pinned by
+  `placed_bodies_past_the_held_cap_wait_their_turn` and
+  `a_new_body_read_waits_behind_held_ones`.
+- **The held hook runs from the loop's turn, once for each fall under its
+  mark.** A rise that reaches the mark, which only `hold` and `take_out`
+  can make, owes the hook a run, and the loop pays it once the count is
+  under the mark. So a rise and fall within one call of the consumer's own
+  is heard too, and the hook never runs inside `give_back`. It runs before
+  held reads go on, so what it takes out comes first. Pinned by
+  `the_hook_is_owed_one_run_for_each_fall_under_its_mark` and
+  `the_held_hook_runs_once_under_its_mark_from_the_loop`.
 
 ### Spreading connections across rings
 
@@ -427,6 +467,10 @@ A streamed window is written to a file straight out of its recv buffer.
   (`a_redelivery_does_not_retire_the_next_message_budget`).
 - **Retiring at delivery keeps it a bound on receipt**: a
   `Response::Defer` may run arbitrarily long.
+- **A read held at `held_cap` retires its budget, and gets a fresh one as
+  it goes on**, since handling is not clocked and only the peer's own time
+  counts. Left armed, the budget closes a connection that waited on the
+  ring (`placed_bodies_past_the_held_cap_wait_their_turn`).
 - **"Idle" is the framer's verdict, not `buffered() == 0`.** Between a
   streaming codec's windows the buffer is empty mid-request; read off
   `buffered()`, such a connection gets `idle_timeout` and no receipt

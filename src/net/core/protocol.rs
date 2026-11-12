@@ -327,9 +327,15 @@ pub enum CloseReason {
 /// that is never wrong: `let payload = body.take();`. After `take` the body
 /// reads as empty. A handler that writes the body out or keeps it whole
 /// takes [`Body::take_owned`] instead, which hands over the storage with
-/// the body's range in it and never copies.
+/// the body's range in it and never copies. A server's placed body that is
+/// dropped untaken goes back to the ring's body pool for the next one.
 pub struct Body<'a> {
     inner: BodyInner<'a>,
+    /// The ring's body pool, for a body that owns storage the reactor read
+    /// it into, so storage the handler leaves untaken goes back for the
+    /// next body rather than being freed.
+    #[cfg(feature = "net-server")]
+    home: Option<crate::net::core::bodypool::Home>,
 }
 
 enum BodyInner<'a> {
@@ -357,12 +363,16 @@ impl<'a> Body<'a> {
     pub(crate) fn inline(bytes: &'a [u8]) -> Body<'a> {
         Body {
             inner: BodyInner::Inline(bytes),
+            #[cfg(feature = "net-server")]
+            home: None,
         }
     }
 
     pub(crate) fn inline_mut(bytes: &'a mut [u8]) -> Body<'a> {
         Body {
             inner: BodyInner::InlineMut(bytes),
+            #[cfg(feature = "net-server")]
+            home: None,
         }
     }
 
@@ -407,6 +417,24 @@ impl<'a> Body<'a> {
                 start,
                 len,
             },
+            #[cfg(feature = "net-server")]
+            home: None,
+        }
+    }
+
+    /// Send the storage of a body that owns some back to `pool` if the
+    /// handler drops the body without taking it, and take the `bytes` it
+    /// has on the pool's count off as the body is taken or dropped. A body
+    /// that borrows its bytes owns nothing to send and has nothing counted.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn set_home(
+        &mut self,
+        pool: &crate::net::core::bodypool::PoolHandle,
+        bytes: usize,
+    ) {
+        if matches!(self.inner, BodyInner::Owned { buf: Some(_), .. }) {
+            self.home =
+                Some(crate::net::core::bodypool::Home::new(pool, bytes));
         }
     }
 
@@ -427,6 +455,9 @@ impl<'a> Body<'a> {
             }
             BodyInner::Owned { buf, start, len } => match buf.take() {
                 Some(mut v) => {
+                    // Taken, the storage leaves the pool's count.
+                    #[cfg(feature = "net-server")]
+                    drop(self.home.take());
                     if *start > 0 {
                         // Overlapping move within the same allocation; the
                         // window becomes the prefix, the tail is dropped.
@@ -455,6 +486,9 @@ impl<'a> Body<'a> {
             BodyInner::Inline(_) | BodyInner::InlineMut(_) => None,
             BodyInner::Owned { buf, start, len } => {
                 let range = *start..*start + *len;
+                // Taken, the storage leaves the pool's count.
+                #[cfg(feature = "net-server")]
+                drop(self.home.take());
                 buf.take().map(|v| (v, range))
             }
         }
@@ -473,6 +507,17 @@ impl std::ops::Deref for Body<'_> {
                 len,
             } => &v[*start..*start + *len],
             BodyInner::Owned { buf: None, .. } => &[],
+        }
+    }
+}
+
+#[cfg(feature = "net-server")]
+impl Drop for Body<'_> {
+    fn drop(&mut self) {
+        if let Some(home) = self.home.take()
+            && let BodyInner::Owned { buf: Some(v), .. } = &mut self.inner
+        {
+            home.give(std::mem::take(v));
         }
     }
 }
@@ -541,17 +586,18 @@ impl SendBuf {
     /// deferred reply is marked by sending it with
     /// `Deferred::reply_recycled`.
     ///
-    /// It is freed as any owned segment is when it is empty, when its
-    /// connection closes before it is sent, or when the ring has no body
-    /// pool.
+    /// Its storage goes home as well when its connection closes before it
+    /// is sent. It is freed as any owned segment is when it is empty or
+    /// when the ring has no body pool.
     pub fn recycled(bytes: Vec<u8>) -> SendBuf {
         SendBuf(Seg::Recycled(bytes))
     }
 
-    /// The storage of a [`recycled`](Self::recycled) segment, taken once it
-    /// has been sent, or `None` for any other kind.
-    pub(crate) fn into_recycled(self) -> Option<Vec<u8>> {
-        match self.0 {
+    /// The storage of a [`recycled`](Self::recycled) segment, for its queue
+    /// entry to send home as it drops, or `None` for any other kind.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn recycled_mut(&mut self) -> Option<&mut Vec<u8>> {
+        match &mut self.0 {
             Seg::Recycled(bytes) => Some(bytes),
             _ => None,
         }

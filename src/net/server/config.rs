@@ -219,6 +219,20 @@ pub struct ServerConfig {
     /// file-body read uses an owned buffer, so a handler holding windows
     /// must fit its share. `None` (the default): no cap below the demand.
     pub buf_pool_max_bytes: Option<usize>,
+    /// The bytes of body pool storage a ring may hold before it holds back
+    /// the read of the next placed body
+    /// ([`body_placement_threshold`](ServerConfig::body_placement_threshold)),
+    /// as [`BodyRecycler::held`](crate::net::server::BodyRecycler::held)
+    /// counts them, the consumer's own figure included. A held-back read
+    /// waits with its connection's header kept, and goes on in the order it
+    /// was held once the count is under the cap, so the ring passes the cap
+    /// by one body at most and a body larger than the cap still goes on.
+    /// Its message's [`max_receipt_time`](ServerConfig::max_receipt_time)
+    /// does not run while it waits. Storage a message is promoted into
+    /// counts but is never held back, since part of the message has
+    /// arrived. `None`, the default, sets no cap, and 0 is refused, since
+    /// it would hold every placed body back for good.
+    pub held_cap: Option<usize>,
     /// How the recv side answers a read that found the buffer pool
     /// **genuinely exhausted** - the ring at its registered bound with every
     /// buffer lent, which growth cannot answer. `Some(backoff)` (the
@@ -498,6 +512,7 @@ impl Default for ServerConfig {
             buf_pool_initial_bytes: 16 * 1024 * 1024,
             buf_pool_max_step_bytes: 16 * 1024 * 1024,
             buf_pool_max_bytes: None,
+            held_cap: None,
             recv_shortage_retry: Some(Duration::from_millis(10)),
             backlog: 128,
             unlink_unix: true,
@@ -677,6 +692,9 @@ impl ServerConfig {
             return Err(Error::Validation(
                 "buf_pool_max_bytes must be non-zero".into(),
             ));
+        }
+        if self.held_cap == Some(0) {
+            return Err(Error::Validation("held_cap must be non-zero".into()));
         }
         if self.receipt_window_bytes == 0 {
             return Err(Error::Validation(

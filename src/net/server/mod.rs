@@ -617,6 +617,9 @@ struct Handlers<U, AcceptFn, HeaderFn, BodyFn> {
     /// Runs each [`ControlHandle::send`] message on the loop thread
     /// ([`Server::set_control_hook`]); without one the messages are dropped.
     control: Option<ControlFn>,
+    /// Runs as the ring's held bytes fall under a mark
+    /// ([`Server::set_held_hook`]).
+    held: Option<Box<dyn FnMut()>>,
 }
 
 /// The control hook: the message, on the loop thread, nothing else - the
@@ -976,7 +979,10 @@ where
         // buffers: retained capacity is what costs, and a count would let
         // a few maximal bodies retain what a thousand small ones should.
         core.body_pool = Some(std::rc::Rc::new(std::cell::RefCell::new(
-            crate::net::core::bodypool::BodyPool::new(BODY_POOL_BUDGET),
+            crate::net::core::bodypool::BodyPool::new(
+                BODY_POOL_BUDGET,
+                cfg.held_cap,
+            ),
         )));
         let sizing = crate::uring::bufring::PoolSizing {
             initial_bytes: cfg.buf_pool_initial_bytes,
@@ -1041,6 +1047,7 @@ where
                 tls_handshake: None,
                 detach: None,
                 control: None,
+                held: None,
             },
             listeners,
             mailbox: Mailbox {
@@ -1164,6 +1171,10 @@ where
             // completion for those connections has been routed).
             #[cfg(feature = "uring-fs")]
             self.sweep_closed_fs();
+            // What this turn gave back may be owed to the held hook, and
+            // may let held body reads go on, the hook's calls first.
+            self.run_held_hook();
+            self.redrive_held_reads()?;
             // A drain's quiescence, re-read where everything that can
             // reach it has already run. `reclaim_slot` is edge-triggered
             // on connections and cannot see a task retire; see
@@ -1536,6 +1547,40 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         F: FnMut(Box<dyn std::any::Any + Send>) + 'static,
     {
         self.handlers.control = Some(Box::new(hook));
+    }
+
+    /// Install a hook that runs on the loop thread once the bytes the ring
+    /// holds out of its body pool ([`BodyRecycler::held`]) fall under
+    /// `mark` after being at or past it, so that a call the consumer holds
+    /// for bytes goes on with no tick and no poll, even when every
+    /// connection waits. It runs once for each fall, and once they fall if
+    /// they are at or past the mark as it is set. It runs from the loop at
+    /// its next turn, never inside [`BodyRecycler::take_out`] or
+    /// [`BodyRecycler::give_back`], so the consumer is never called back in
+    /// the middle of its own call, and before reads held at
+    /// [`held_cap`](ServerConfig::held_cap) go on, so what it takes out
+    /// comes first. A second call replaces the first hook and its mark.
+    pub fn set_held_hook<F>(&mut self, mark: usize, hook: F)
+    where
+        F: FnMut() + 'static,
+    {
+        if let Some(p) = self.core.body_pool.as_ref() {
+            p.borrow_mut().set_mark(mark);
+        }
+        self.handlers.held = Some(Box::new(hook));
+    }
+
+    /// Run the held hook if the ring's held bytes fell under its mark, with
+    /// no borrow of the pool held across it.
+    fn run_held_hook(&mut self) {
+        let due = self
+            .core
+            .body_pool
+            .as_ref()
+            .is_some_and(|p| p.borrow_mut().hook_due());
+        if due && let Some(hook) = self.handlers.held.as_mut() {
+            hook();
+        }
     }
 
     /// Install a hook invoked once per connection as it begins closing:

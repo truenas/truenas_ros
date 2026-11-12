@@ -817,6 +817,34 @@ impl<U> Reactor<U> {
         })
     }
 
+    /// Whether the read of a placed body waits for the ring's held bytes to
+    /// fall under `ServerConfig::held_cap`. It waits while they are at or
+    /// past the cap, and behind any read already waiting, so that reads go
+    /// on in the order they were held, and the server lets each go on in
+    /// turn (`held_turn`). The connection keeps its header and frame and
+    /// claims no storage until then. The budget of its message is retired,
+    /// since handling is not clocked, and `submit_recv` arms a fresh one as
+    /// the read goes on, so only the peer's own time counts.
+    #[cfg(feature = "net-server")]
+    fn hold_back(&mut self, slot: u32, generation: u32) -> errno::Result<bool> {
+        if self.held_turn == Some(slot) {
+            self.held_turn = None;
+            return Ok(false);
+        }
+        if !self.table.conn(slot).read_held {
+            let full =
+                self.body_pool.as_ref().is_some_and(|p| p.borrow().at_cap());
+            if !full && self.held_reads.is_empty() {
+                return Ok(false);
+            }
+            let gen64 = self.table.generation(slot);
+            self.table.conn_mut(slot).read_held = true;
+            self.held_reads.push_back((slot, gen64));
+        }
+        self.cancel_receipt_deadline(slot, generation)?;
+        Ok(true)
+    }
+
     /// The receipt budget elapsed (`Op::ReceiptDeadline`). The message that
     /// armed it is still arriving, so the peer is under the floor the
     /// deployment set: close and reclaim the slot.
@@ -1639,8 +1667,8 @@ impl<U> Reactor<U> {
             // Promoted storage comes home with the message that outgrew
             // the pool buffer - licence attached - and the next
             // promotion anywhere on the ring reuses it.
-            if let Some((v, licence)) = surplus {
-                pool.borrow_mut().give_held(v, licence);
+            if let Some((v, ticket)) = surplus {
+                pool.borrow_mut().give_held(v, ticket);
             }
         }
         let Some(claim) = claim else {
@@ -2116,18 +2144,8 @@ impl<U> Reactor<U> {
         // Retire the PDUs the gather flushed: replies free read-ahead slots
         // (pushes don't participate in the cap).
         let progress = {
-            // Storage a consumer marked as the pool's goes home once sent,
-            // for the pool's byte law to keep or free. A ring with no body
-            // pool frees it, as it does any owned segment.
-            #[cfg(feature = "net-server")]
-            let spent = |bytes: Vec<u8>| match self.body_pool.as_ref() {
-                Some(pool) => pool.borrow_mut().give(bytes),
-                None => drop(bytes),
-            };
-            #[cfg(not(feature = "net-server"))]
-            let spent = drop::<Vec<u8>>;
             let conn = self.table.conn_mut(slot);
-            let progress = conn.advance_sent(res as usize, spent);
+            let progress = conn.advance_sent(res as usize);
             conn.outstanding =
                 conn.outstanding.saturating_sub(progress.replies);
             // Bytes flushed to the peer: any idle clock armed before this
@@ -2364,6 +2382,10 @@ impl<U> Reactor<U> {
                             .recv_bufs
                             .as_ref()
                             .is_some_and(|pool| total <= pool.buf_len()));
+                #[cfg(feature = "net-server")]
+                if place && self.hold_back(slot, generation)? {
+                    return Ok(Enacted::Done);
+                }
                 self.table.conn_mut(slot).set_frame(header_len, body_len);
                 self.submit_recv(
                     slot,
@@ -2602,6 +2624,44 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
+    }
+
+    /// A placed body read waits behind any read already waiting, even with
+    /// the ring under its cap, so that reads go on in the order they were
+    /// held. A second look keeps the one place it has, and the read whose
+    /// turn it is goes on.
+    #[cfg(feature = "net-server")]
+    #[test]
+    fn a_new_body_read_waits_behind_held_ones() {
+        let Some(mut r) = reactor_with_one_conn(None, None) else {
+            return; // io_uring unavailable
+        };
+        let peer = ClientAddr::Inet(
+            "127.0.0.1:2".parse::<std::net::SocketAddr>().unwrap(),
+        );
+        r.table.install(1, Connection::new(peer, (), 1));
+        let pool = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::net::core::bodypool::BodyPool::new(1 << 20, Some(100)),
+        ));
+        r.body_pool = Some(std::rc::Rc::clone(&pool));
+        let (g0, g1) = (r.table.generation(0), r.table.generation(1));
+
+        pool.borrow_mut().hold(100);
+        assert!(r.hold_back(0, g0 as u32).unwrap(), "at the cap it waits");
+        pool.borrow_mut().unhold(100);
+        assert!(
+            r.hold_back(1, g1 as u32).unwrap(),
+            "under the cap, a newcomer still waits behind it"
+        );
+        assert!(r.hold_back(0, g0 as u32).unwrap(), "still waiting");
+        assert_eq!(
+            r.held_reads.iter().copied().collect::<Vec<_>>(),
+            [(0, g0), (1, g1)],
+            "once each, in the order held"
+        );
+        r.held_turn = Some(0);
+        assert!(!r.hold_back(0, g0 as u32).unwrap(), "its turn goes on");
+        assert_eq!(r.held_turn, None, "and only the once");
     }
 
     /// A budget retired and replaced inside one dispatch: the predecessor's
