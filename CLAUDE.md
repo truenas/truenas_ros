@@ -674,9 +674,15 @@ separate commits even when they ship together.
 
 Write for the next person changing the code, not to defend the last change.
 
+A comment says only what the code cannot, an invariant, a constraint, a
+reason, or a warning that stops a plausible wrong change, in a few
+sentences. It leaves out the history of the code, how a problem was found
+and who found it, a figure from one run or commit, and what the code
+already says. The reasoning of a Settled decision lives at the code it
+names, and is not repeated anywhere else. A `// SAFETY:` comment gives the
+reason the block is sound and nothing else.
+
 - No back-compatibility apparatus for consumers that do not exist.
-- Do not narrate past mistakes ("the previous behaviour was X"); state the
-  constraint and the consequence.
 - Do keep a warning that stops a plausible wrong simplification.
   `is_subtree_skip` in `uring_fs/query_tree.rs` is the shape to copy.
 - Do not name a consumer of the crate; say what a consumer relies on, as
