@@ -1,24 +1,20 @@
-//! The HTTP framing state machine: a per-connection [`Phase`] plus the pure [`frame`] step mapping accumulated bytes
-//! onto [`Framing`] verdicts. All decisions live here so the step stays a pure function of `(buffer, phase, config)` -
-//! fuzzable exactly like the reactor's own `frame_step`.
+//! The HTTP framing state machine, a per-connection [`Phase`] plus the pure [`frame`] step mapping accumulated bytes
+//! onto [`Framing`] verdicts. Every decision lives here, so the step stays a pure function of
+//! `(buffer, phase, config)`, fuzzable like the reactor's own `frame_step`.
 //!
-//! Three shapes of exchange exist:
+//! - **Single message**, the normal path. The head completes, the body length is declared, and one
+//!   `Complete { header_len, body_len }` delivers both.
+//! - **The 100-continue dance.** A head with `Expect: 100-continue` and a non-empty body is delivered alone with its
+//!   bytes stashed in the phase, the glue sends the raw interim and advances the phase, and the framer then declares
+//!   the body as a second message paired with the stash.
+//! - **Chunked.** The extent is discovered, not declared. The framer keeps a resumable [`ChunkScan`] in the phase and
+//!   answers `MoreInMessage` until the terminal chunk lands, then declares the whole wire extent, which the glue
+//!   de-chunks. It composes with the dance, since boto3 sends `Expect` and `TE: chunked` together.
+//! - **Streamed**, on a connection with a stream cap. The head goes out alone, then each chunk or window is its own
+//!   message, so the body never sits in the buffer whole.
 //!
-//! - **Single message** (the normal path): the head completes, the body length is declared, and one `Complete {
-//!   header_len, body_len }` delivers head + body together.
-//! - **The 100-continue dance**: a head with `Expect: 100-continue` and a non-empty body is delivered *alone*
-//!   (`Complete { header_len, 0 }`) with the head bytes stashed in the phase; the glue replies with the raw interim
-//!   line and advances the phase; the framer then declares the body as a second message (`Complete { 0, body_len }`)
-//!   paired with the stash.
-//! - **Chunked** (`Transfer-Encoding: chunked` - what default S3 SDKs send over TLS): the body's extent isn't declared,
-//!   it's discovered - the framer keeps a resumable [`ChunkScan`] in the phase and answers `More` until the terminal
-//!   chunk lands, then declares the whole wire extent as the message body. The glue de-chunks on delivery. Composes
-//!   with the dance (boto3 sends `Expect` *and* `TE: chunked` together): after the interim, the scan runs against the
-//!   body-only messages with the head stashed.
-//!
-//! Malformed input transitions to [`Phase::Fail`] and delivers whatever is buffered as a degenerate message, so the
-//! glue can send a real error response and flush-close ([`Response::ReplyClose`]) rather than slamming the connection -
-//! the "HTTP error before hanging up" case the reactor's close semantics were designed for.
+//! Malformed input moves to [`Phase::Fail`] and delivers whatever is buffered as a degenerate message, so the glue
+//! sends a real error response and flush-closes ([`Response::ReplyClose`]) rather than slamming the connection.
 
 use crate::net::Framing;
 #[cfg(doc)]
@@ -27,39 +23,33 @@ use crate::net::server::{Response, ServerConfig};
 use super::chunked::{self, CHUNK_LINE_MAX, ChunkScan, TRAILER_LINE_MAX};
 use super::head::{BodyKind, HeadIndex, frame_facts, frame_facts_indexed, method_is_head};
 
-/// Fixed wire-overhead allowance for chunk framing on top of
-/// [`HttpConfig::max_body`]: a chunked message whose **wire** extent exceeds
-/// `max_body + CHUNK_WIRE_OVERHEAD` fails 400 even while its decoded size is still in bounds. The only way there is
-/// pathological framing (one-byte chunks, jumbo extensions) - real clients chunk at 64 KiB or more, a few hundred bytes
-/// of overhead per megabyte - so this reads as abuse, not content size, hence 400 rather than 413.
+/// Fixed wire-overhead allowance for chunk framing on top of [`HttpConfig::max_body`]. A chunked message whose **wire**
+/// extent exceeds `max_body + CHUNK_WIRE_OVERHEAD` fails 400 even while its decoded size is in bounds. Only
+/// pathological framing (one-byte chunks, jumbo extensions) gets there, so it reads as abuse rather than content size,
+/// hence 400 and not 413.
 pub(crate) const CHUNK_WIRE_OVERHEAD: usize = 16 * 1024;
 
-/// Codec limits. Both caps close the connection with a real status (431 / 413) rather than silently truncating.
+/// Codec limits. Both caps close the connection with a real status (431 or 413) rather than truncating.
 ///
-/// The reactor imposes its own whole-message cap upstream of this codec ([`ServerConfig::max_request_bytes`]), and a
-/// message that clears these caps but exceeds the reactor's is closed abruptly with **no HTTP farewell**
-/// ([`CloseReason::TooLarge`](crate::net::server::CloseReason)). Keep `max_request_bytes` at
-/// [`HttpConfig::min_request_bytes`] or above so every over-cap request receives its promised 413/431; the defaults on
-/// both sides compose exactly.
+/// The reactor's own whole-message cap ([`ServerConfig::max_request_bytes`]) closes a message past it with **no HTTP
+/// farewell** ([`CloseReason::TooLarge`](crate::net::server::CloseReason)). Keep it at
+/// [`HttpConfig::min_request_bytes`] or above so every over-cap request receives its 413 or 431. The defaults on both
+/// sides compose exactly.
 #[derive(Debug, Clone, Copy)]
 pub struct HttpConfig {
-    /// Maximum request-head size in bytes (request line + headers + terminator). Exceeding it answers `431 Request
-    /// Header Fields Too Large` and closes.
+    /// Maximum request-head size in bytes (request line, headers and terminator). Exceeding it answers
+    /// `431 Request Header Fields Too Large` and closes.
     ///
     /// It bounds each head re-parse, **not their total**. A head arriving in pieces is re-tokenized in full on every
-    /// arrival, so the work is `segments * head_len` and only the second factor is capped here - a peer choosing the
-    /// segmentation chooses the first. Measured, the rescan is about a third of the per-segment cost the connection
-    /// pays regardless (~1.5 us against ~6 us), so it is a tax on a scan rather than a surface of its own; `max_head`
-    /// is what keeps that tax from growing without limit.
+    /// arrival, so the work is `segments * head_len` and only the second factor is capped here. Measured, the rescan is
+    /// a fraction of the per-segment cost the connection pays regardless, so `max_head` alone keeps it bounded.
     pub max_head: usize,
-    /// Maximum body size accepted for an inline-buffered body: the declared `Content-Length`, or for chunked requests
-    /// the **decoded** entity size (enforced mid-stream as chunks arrive, not after buffering). Exceeding it answers
-    /// `413 Content Too Large` and closes; a chunked wire extent more than `CHUNK_WIRE_OVERHEAD` past this cap
-    /// answers 400. Bodies above the cap belong on a streaming codec
-    /// ([`protocol_streaming`](super::protocol_streaming())), which bounds them on its own and never holds one whole -
-    /// on a streaming connection this cap governs only the bodies small enough to arrive as one delivery. Raising it
-    /// past the reactor's message cap requires raising [`ServerConfig::max_request_bytes`] in step (see
-    /// [`HttpConfig::min_request_bytes`]), or the 413 path goes dead for the sizes in between.
+    /// Maximum size of a buffered body, the declared `Content-Length` or for chunked the **decoded** size, enforced
+    /// mid-stream as chunks arrive. Exceeding it answers `413 Content Too Large` and closes, and a chunked wire extent
+    /// more than `CHUNK_WIRE_OVERHEAD` past it answers 400. On a streaming connection
+    /// ([`protocol_streaming`](super::protocol_streaming())) it governs only the bodies that arrive as one delivery.
+    /// Raising it past the reactor's message cap needs [`ServerConfig::max_request_bytes`] raised in step
+    /// ([`HttpConfig::min_request_bytes`]), or the 413 path goes dead for the sizes in between.
     pub max_body: usize,
 }
 
@@ -77,12 +67,10 @@ impl Default for HttpConfig {
 }
 
 impl HttpConfig {
-    /// Reject a configuration that cannot admit any request: both caps must be non-zero.
-    /// [`protocol`](super::protocol()) and [`protocol_deferrable`](super::protocol_deferrable()) run this at
-    /// construction. The reactor cross-check stays the consumer's: the codec never sees [`ServerConfig`], so whoever
-    /// raises [`max_body`](HttpConfig::max_body) must keep [`ServerConfig::max_request_bytes`] at or above
-    /// [`min_request_bytes`](HttpConfig::min_request_bytes) in step, or a request the codec would answer 413/431 is
-    /// instead cut off with a raw close and no HTTP response.
+    /// Reject a configuration that cannot admit any request, which is either cap at zero. The builders run this at
+    /// construction. Keeping [`ServerConfig::max_request_bytes`] at or above
+    /// [`min_request_bytes`](HttpConfig::min_request_bytes) stays the caller's job, since the codec never sees
+    /// [`ServerConfig`].
     pub fn validate(&self) -> crate::Result<()> {
         if self.max_head == 0 {
             return Err(crate::Error::Validation("http max_head must be non-zero".into()));
@@ -94,27 +82,20 @@ impl HttpConfig {
     }
 
     /// The smallest [`ServerConfig::max_request_bytes`] under which every message this codec admits reaches the framer
-    /// intact. A reactor cap below this leaves a dead band - requests the codec would accept (or answer 413/431) that
-    /// the reactor instead kills with a raw close and no HTTP response.
-    ///
-    /// Three terms and a floor, because the reactor measures the **buffer** while these caps measure something
-    /// narrower:
-    ///
-    /// * `max_head + max_body + CHUNK_WIRE_OVERHEAD` - a buffered message's wire extent, the third term because a
-    ///   chunked body's wire form may legitimately exceed its decoded size.
-    /// * the chunk scanner's in-flight line. `ChunkScan` advances only over whole CRLF-delimited lines and both chunk
-    ///   caps are measured on the *scanned* extent, so a peer that pauses mid-line leaves up to `TRAILER_LINE_MAX + 1`
-    ///   bytes buffered and uncounted - one short of the length at which `find_crlf` gives up. A trailer line is the
-    ///   longer of the two lines the scanner reads.
-    /// * a floor of one head and one streamed window with its chunk framing, since `max_body` bounds only the bodies a
-    ///   delivery buffers and a streaming endpoint may set it far below a window. The pump's gate runs before the head
-    ///   is delivered, so both can sit in the buffer at once, and the window's own `Framing::Complete` is checked
-    ///   against this cap as well.
+    /// intact. A reactor cap below it leaves a dead band, where requests the codec would accept or answer 413 or 431
+    /// are instead closed raw with no HTTP response. The reactor measures the **buffer**, so this is the larger of two
+    /// sums.
     pub fn min_request_bytes(&self) -> usize {
         self.max_head
             .saturating_add(self.max_body)
             .saturating_add(CHUNK_WIRE_OVERHEAD)
+            // The chunk scanner's in-flight line. It advances only over whole lines and the chunk caps are measured on
+            // the scanned extent, so a peer pausing mid-line leaves up to a trailer line, the longer of the two,
+            // buffered and uncounted.
             .saturating_add(TRAILER_LINE_MAX + 1)
+            // One head and one streamed window, since `max_body` bounds only buffered bodies and a streaming endpoint
+            // may set it far below a window. The pump's gate runs before the head is delivered, so both can sit in the
+            // buffer at once.
             .max(
                 self.max_head
                     .saturating_add(STREAM_WINDOW)
@@ -137,23 +118,17 @@ impl HttpConfig {
     }
 }
 
-/// The most body a single streamed delivery carries.
+/// The most body a single streamed delivery carries, picked here so the peer's chunk size does not pick it.
 ///
-/// A bound this side picks, because the alternative is the peer's chunk size picking it. Three reasons, all
-/// independent: it clears one TLS record (`TLS_MAX_PAYLOAD_SIZE`, 16 KiB) by eight, which is what a kTLS recv needs
-/// before it will decrypt straight into the caller's pages; it matches ZFS's default `recordsize`; and it is the size
-/// botocore's HTTP chunks actually arrive in, so the common case is one window per chunk with no splitting.
+/// 128 KiB clears one TLS record (`TLS_MAX_PAYLOAD_SIZE`, 16 KiB) by eight, which a kTLS recv needs before it decrypts
+/// straight into the caller's pages. It matches ZFS's default `recordsize`, and it is the HTTP chunk size botocore
+/// sends (urllib3 sends one chunk per `body.read(blocksize)`, and `httpsession.py` sets `BUFFER_SIZE` to 128 KiB), so
+/// the common case is one window per chunk. The 1 MiB aws-chunked size frames the inner coding, which this layer never
+/// sees.
 ///
-/// That last one is worth pinning down, because a default S3 upload has **two** chunk sizes at two layers and only the
-/// outer one reaches this framer. urllib3 emits one HTTP chunk per `body.read(blocksize)` (`util/request.py`'s
-/// `body_to_chunks`, `connection.py`'s send loop), and botocore sets that blocksize to 128 KiB (`httpsession.py`'s
-/// `BUFFER_SIZE`). The 1 MiB `_DEFAULT_CHUNK_SIZE` in `httpchecksum.py` frames the *inner* `Content-Encoding:
-/// aws-chunked` payload, which this layer never sees - it decodes as body bytes above. `AwsChunkedWrapper::read`
-/// honours the requested size rather than returning a whole aws-chunk, so the two do not collapse into one.
-///
-/// A peer that does send HTTP chunks larger than a window gets mid-chunk windows, which carry no chunk header and so
-/// find the recv claim already leased; `stream_step` sizes those from `chunk_left` alone and the reactor draws them
-/// from the ring rather than placing them.
+/// Larger HTTP chunks arrive as mid-chunk windows, which carry no chunk header and so find the recv claim already
+/// leased. `stream_step` sizes those from `chunk_left` alone and the reactor draws them from the ring rather than
+/// placing them.
 pub(crate) const STREAM_WINDOW: usize = 128 * 1024;
 
 /// Windows per receive buffer ([`HttpConfig::recv_buffer_bytes`]).
@@ -246,12 +221,9 @@ pub(crate) enum Phase {
     StreamDone {
         /// The head this body belonged to.
         head: Vec<u8>,
-        /// Where the terminal block starts inside the delivered header.
-        ///
-        /// `chunked::step` counts a chunked body's framing from the CRLF that closed the previous payload, so a
-        /// terminal chunk arriving after one is delivered as `\r\n0\r\n...`. The trailer parser starts in its size
-        /// state, where that leading empty line is a malformed size line - so the offset travels with the phase rather
-        /// than being re-derived from the bytes.
+        /// Where the terminal block starts inside the delivered header. `chunked::step` counts a chunked body's framing
+        /// from the CRLF that closed the previous payload, and the trailer parser would read that leading empty line as
+        /// a malformed size line, so the offset travels with the phase.
         block_at: usize,
     },
     /// A request is parked for deferred completion ([`HttpRequest::defer`](super::protocol::HttpRequest::defer)): the
@@ -284,9 +256,10 @@ pub(crate) enum StreamedBody {
 pub(crate) struct StreamPark {
     /// The phase the connection returns to once the park resolves.
     pub(crate) next: Phase,
-    /// A withheld `100 Continue` the resume owes before any body byte can arrive. Only an `Open` park can carry one:
-    /// the client is holding its body back for exactly this line, so a resume that answers with silence leaves every
-    /// expecting PUT stalled until the client's own timeout.
+    /// A withheld `100 Continue` the resume owes before any body byte can arrive, released by `resume()` and by a
+    /// redrive that returns `Continue`. Only an `Open` park can carry one. The client holds its body back for exactly
+    /// this line, so a resume that answers with silence stalls every expecting upload until the client's own timeout
+    /// (`a_deferred_stream_open_still_sends_the_interim`).
     pub(crate) expect_interim: bool,
 }
 
@@ -296,13 +269,9 @@ pub(crate) struct StreamPark {
 /// protocol state.
 pub struct HttpConn<U> {
     pub(crate) phase: Phase,
-    /// Deliver bodies a chunk or window at a time rather than whole - chunked always, known-length above one window -
-    /// bounding the body at this many bytes. Set by the streaming protocol builder's accept wrapper; the other builders
-    /// leave it `None` and keep the single-delivery contract they document.
-    ///
-    /// The bound is the builder's to supply because the codec has no defensible default for it: a streamed body never
-    /// sits in a buffer for `max_body` - the bound a buffered delivery checks before reading - to protect. Refusing to
-    /// guess forces the decision to the call site that knows the protocol above (an S3 front bounds a part at 5 GiB).
+    /// Deliver bodies a chunk or window at a time rather than whole (chunked always, known-length above one window),
+    /// and bound every body at this many bytes. The streaming builder sets it, and `None` keeps the single-delivery
+    /// contract. The codec has no default for it, since a streamed body never sits in the buffer `max_body` protects.
     pub(crate) stream_cap: Option<std::num::NonZeroU64>,
     /// Where the parts of the last complete head sit, recorded by [`frame`] so that dispatch does not tokenize the head
     /// a second time.
@@ -312,16 +281,10 @@ pub struct HttpConn<U> {
 }
 
 impl<U> HttpConn<U> {
-    /// A fresh connection's protocol state around the consumer's `state` -- what the glue's accept wrapper mints for
-    /// every plain connection. Public for the one admission that wrapper cannot cover: a kTLS listener's handshake
-    /// worker, where the accept handler does not run and `AcceptDeferral::ready` takes the connection state directly.
-    ///
-    /// **On a kTLS listener served by a streaming protocol, this is the wrong constructor and nothing will say so.**
-    /// The streaming decision lives in the builder's accept closure, which `ready()` replaces, so a handshake worker
-    /// handing back `HttpConn::new` gets a connection whose bodies buffer - and whose effective ceiling is
-    /// `max_request_bytes`, not the `max_body_bytes` the protocol was built with. A limit that holds on one transport
-    /// and not the other is worse than no limit, because a deployment sets it, tests it over plain HTTP and ships it.
-    /// Use [`HttpConn::new_streaming`] with the same cap there.
+    /// A fresh connection's protocol state around the consumer's `state`, as the builders' accept wrapper mints it.
+    /// Public for a kTLS listener's handshake worker, where the accept handler does not run and `AcceptDeferral::ready`
+    /// takes the connection state directly. A streaming protocol adopts its own cap on such a connection at the first
+    /// frame.
     pub fn new(state: U) -> Self {
         Self {
             phase: Phase::Head,
@@ -331,17 +294,12 @@ impl<U> HttpConn<U> {
         }
     }
 
-    /// A connection whose bodies stream - chunked a chunk at a time, known-length a window at a time above one window -
-    /// bounded at `max_body_bytes`. The streaming builder's accept wrapper mints these; see [`HttpConn::new`] for why
-    /// the constructor is public, and for why a kTLS handshake worker must call **this** one, with the cap the protocol
-    /// was built with, rather than [`HttpConn::new`].
+    /// A connection whose bodies stream (chunked a chunk at a time, known-length a window at a time above one window),
+    /// bounded at `max_body_bytes`. A connection minted here keeps its own cap, since a streaming protocol adopts its
+    /// cap only where none is set.
     ///
-    /// `NonZeroU64` rather than a checked `u64`, because the check has one place it can be forgotten and this removes
-    /// it. The cap IS the body limit on a connection that streams, so a zero answers 413 to every body-bearing request
-    /// while a bodyless GET is served normally - an endpoint that reads healthy and admits no payload. The builder
-    /// refuses a zero of its own, but it cannot screen this constructor: the adoption site fills `stream_cap` only when
-    /// it is `None`, so a connection minted here with its own cap keeps it, and that is exactly the route this method
-    /// exists for.
+    /// The cap is the body limit on a streaming connection, so a zero would answer 413 to every body while a bodyless
+    /// GET is served normally. `NonZeroU64` rules that out here, where no builder can screen it.
     pub fn new_streaming(state: U, max_body_bytes: std::num::NonZeroU64) -> Self {
         Self {
             phase: Phase::Head,
@@ -380,15 +338,11 @@ pub(crate) fn frame<U>(buf: &[u8], conn: &mut HttpConn<U>, cfg: &HttpConfig) -> 
             header_len: buf.len(),
             body_len: 0,
         },
-        // A parked request owns the connection until its worker outcome redelivers it: hold pipelined bytes unframed.
-        // At the default in-flight cap of one the reactor never asks (delivery and reads are gated while a request is
-        // outstanding); above it, this arm is what keeps a later request from being answered around a parked earlier
-        // one.
+        // A parked request owns the connection until its outcome redelivers it, so pipelined bytes stay unframed. Above
+        // an in-flight cap of one, this arm keeps a later request from being answered around the parked one.
         Phase::Parked { .. } => Framing::More,
-        // A declared-but-undelivered chunked message: same class of scheduling surprise as Fail above (the glue's step
-        // runs between
-        // verdicts and resets the phase). Degrade to a degenerate delivery;
-        // the glue's decode will fail it as a codec bug (500) rather than mis-framing the stream.
+        // A declared but undelivered chunked message, the same scheduling surprise as Fail above. Degrade to a
+        // degenerate delivery, which the glue's decode fails as a codec bug (500) rather than mis-framing the stream.
         Phase::ChunkedDone { .. } => Framing::Complete {
             header_len: buf.len(),
             body_len: 0,
@@ -444,11 +398,9 @@ pub(crate) fn frame<U>(buf: &[u8], conn: &mut HttpConn<U>, cfg: &HttpConfig) -> 
             let head_only = method_is_head(buf);
             match frame_facts_indexed(buf, &mut conn.index) {
                 Err(status) => {
-                    // The parse-time screens (malformed, Host, version) run before the head-size cap can, because the
-                    // cap needs the head's extent and a failed parse has none. When the buffer already exceeds the cap
-                    // and no verdict was reachable within it, the promised 431 wins over the screen that only fired on
-                    // past-the-cap bytes; a screen that fires within the cap keeps its more specific status. (One
-                    // bounded re-parse, only on a connection that is already dying.)
+                    // The parse-time screens run before the head-size cap can, since the cap needs the head's extent.
+                    // When the buffer is past the cap and no verdict was reachable within it, the promised 431 wins,
+                    // and a screen that fires within the cap keeps its more specific status.
                     let status = if buf.len() > cfg.max_head && matches!(frame_facts(&buf[..cfg.max_head]), Ok(None)) {
                         431
                     } else {
@@ -475,10 +427,8 @@ pub(crate) fn frame<U>(buf: &[u8], conn: &mut HttpConn<U>, cfg: &HttpConfig) -> 
                     };
                     match body {
                         BodyKind::Known(body_len) => {
-                            // The streaming cap is what the endpoint says it accepts, so it bounds every body on the
-                            // connection - not only the ones large enough to stream. A body under one window takes the
-                            // buffered path, which is a delivery decision;
-                            // it does not make the declared bound optional, and the chunked leg applies it per chunk
+                            // The streaming cap is what the endpoint accepts, so it bounds every body on the
+                            // connection, not only the ones that stream. The chunked leg applies it per chunk
                             // regardless of size.
                             if conn.stream_cap.is_some_and(|cap| body_len as u64 > cap.get()) {
                                 return fail(&mut conn.phase, buf.len(), 413, head_only);
@@ -565,26 +515,11 @@ pub(crate) fn frame<U>(buf: &[u8], conn: &mut HttpConn<U>, cfg: &HttpConfig) -> 
     }
 }
 
-/// Advance the chunk scan against the accumulated buffer and map its verdict onto [`Framing`]: `More` while the stream
-/// is mid-message (enforcing the decoded and wire caps as it goes), `Complete` for the full wire extent once the
-/// terminal chunk and trailers land.
-/// One chunk of a streamed body, declared as its own message.
-///
-/// The contrast with [`scan_step`] is the whole of Option C: that one holds the body until the terminal chunk lands and
-/// delivers it once, so the largest body the server can accept is a buffer size. This declares each chunk as it becomes
-/// locatable, the reactor's `consume` drops it, and the body's size stops being a memory question.
-///
-/// **Re-entrant on purpose.** `frame` runs again for the same chunk while its payload is still arriving, so nothing
-/// here may advance `after_payload` - the glue does that once the payload is delivered.
-/// One step of a known-length streamed body: the next window, or the zero-byte delivery that hands the request to its
-/// `End`.
+/// One step of a known-length streamed body, declaring its next window.
 fn known_step<U>(buf: &[u8], conn: &mut HttpConn<U>) -> Framing {
     let Phase::StreamKnown { remaining, .. } = &conn.phase else {
-        // Caller invariant; nothing about the request is knowable here. `buf.len()`, not 0, for the same reason every
-        // other degrade arm passes it: `fail` promises to deliver what is buffered so the glue runs once more and sends
-        // the 500 farewell, and a `Complete { 0, 0 }` is not a message the reactor will deliver - `frame_step` answers
-        // a zero-length one with `CloseReason::Malformed`, a raw close with no HTTP response at all. The phase would be
-        // set and never read.
+        // Caller invariant. `buf.len()` and not 0, because the reactor will not deliver a zero-length `Complete`
+        // (`frame_step` closes it raw as `Malformed`), and the 500 farewell would never go out.
         return fail(&mut conn.phase, buf.len(), 500, false);
     };
     let remaining = *remaining;
@@ -597,18 +532,20 @@ fn known_step<U>(buf: &[u8], conn: &mut HttpConn<U>) -> Framing {
         // Between windows of a body already declared: nothing is buffered, and the request is still arriving.
         return Framing::MoreInMessage;
     }
-    // A full window per delivery, however little is buffered: the exact read that completes it draws from the recv
-    // pool - the `More` above re-acquires a claim when none is held, and the reactor refuses to place a frame one pool
-    // buffer can serve - so the remainder arrives zero-copy. Sizing windows to the buffered bytes instead makes them
-    // `RECV_CHUNK`-sized, ~33x the deliveries, wakes and leased writes for the same payload. The `remaining` bound
-    // keeps a pipelined next request out of the tail. (An unpooled connection reads the remainder into owned storage
-    // and the over-threshold handoff takes it per window - the degraded mode's ordinary cost.)
+    // A full window per delivery, however little is buffered. The read that completes it draws from the recv pool,
+    // since the `MoreInMessage` above re-acquires a claim and the reactor will not place a frame one pool buffer can
+    // serve, so the remainder arrives zero-copy. Windows sized to the buffered bytes would multiply deliveries, wakes
+    // and leased writes for the same payload. The `remaining` bound keeps a pipelined next request out of the tail.
     Framing::Complete {
         header_len: 0,
         body_len: remaining.min(STREAM_WINDOW as u64) as usize,
     }
 }
 
+/// One chunk of a streamed body, declared as its own message so the body's size never bounds a buffer.
+///
+/// **Re-entrant on purpose.** `frame` runs again for the same chunk while its payload is still arriving, so nothing
+/// here may advance `after_payload` or `decoded`, which the glue advances on delivery.
 fn stream_step<U>(buf: &[u8], conn: &mut HttpConn<U>) -> Framing {
     let Phase::StreamBody {
         head,
@@ -669,15 +606,17 @@ fn stream_step<U>(buf: &[u8], conn: &mut HttpConn<U>) -> Framing {
     }
 }
 
+/// Advance the chunk scan against the accumulated buffer and map its verdict onto [`Framing`]. It answers
+/// `MoreInMessage` while the body is mid-message, enforcing the decoded and wire caps as it goes, and `Complete` with
+/// the full wire extent once the terminal chunk and trailers land.
 fn scan_step<U>(buf: &[u8], conn: &mut HttpConn<U>, cfg: &HttpConfig) -> Framing {
     let Phase::ChunkedBody { stash, head_len, scan } = &mut conn.phase else {
         // Caller invariant; degrade like the other impossible phases. Nothing about the request is knowable here, so no
         // HEAD flag.
         return fail(&mut conn.phase, buf.len(), 500, false);
     };
-    // The head bytes are still at hand - stashed by the dance, or at the
-    // buffer front when the head was never consumed. Read the method now;
-    // at delivery the buffer may hold body bytes alone.
+    // The head bytes are still at hand, stashed by the dance or at the buffer front. Read the method now, since at
+    // delivery the buffer may hold body bytes alone.
     let head_only = match stash {
         Some(h) => method_is_head(h),
         None => method_is_head(buf),
@@ -686,13 +625,9 @@ fn scan_step<U>(buf: &[u8], conn: &mut HttpConn<U>, cfg: &HttpConfig) -> Framing
     let body = buf.get(header_len..).unwrap_or(&[]);
     match chunked::scan(body, scan) {
         Err(status) => {
-            // The caps describe what the scan has taken in, not which arm it left through. `scan` keeps `decoded` and
-            // `consumed` across arrivals and updates them as it walks, so an over-cap body reaches the same numbers
-            // whether the malformation is met in this arrival or a later one - only the arm differs. Checked here with
-            // the same precedence as the other two, or the same bytes answer 413 when the peer's write ends on a chunk
-            // boundary and `status` when the whole body lands at once, which is TCP segmentation deciding an HTTP
-            // status. 413 is the more useful of the two: it tells a client not to retry the body, and one that trimmed
-            // and retried would be answered 413 the second time anyway.
+            // Check the caps first, with the same precedence as the arms below. `scan` keeps `decoded` and `consumed`
+            // across arrivals, so an over-cap body reaches the same numbers whichever arrival meets the malformation,
+            // and TCP segmentation must not choose the status.
             let decoded = scan.decoded;
             let consumed = scan.consumed;
             if decoded > cfg.max_body {

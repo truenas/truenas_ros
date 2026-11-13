@@ -8,13 +8,9 @@ fn nz(n: u64) -> std::num::NonZeroU64 {
     std::num::NonZeroU64::new(n).expect("a non-zero literal cap")
 }
 
-/// A streaming protocol streams - and bounds - a connection its accept wrapper never minted.
-///
-/// A kTLS listener is admitted by `AcceptDeferral::ready`, which takes the connection state directly and never runs
-/// the accept handler, so a handshake worker can hand back `HttpConn::new`. `stream_cap` is not merely the
-/// streaming switch - it *is* the body limit and it lifts `HttpConfig::max_body` - so without this the endpoint's
-/// declared `max_body_bytes` would not apply on the TLS transport at all, and the effective ceiling would be
-/// `max_body` instead. A limit that holds on one transport and not the other is worse than no limit.
+/// A streaming protocol streams, and bounds, a connection its accept wrapper never minted, as a kTLS handshake worker's
+/// `HttpConn::new` is. Without adopting the cap, the endpoint's `max_body_bytes` would not apply on that transport and
+/// the ceiling would be `max_body`.
 #[test]
 fn a_streaming_protocol_bounds_a_connection_it_did_not_mint() {
     let cfg = HttpConfig {
@@ -167,11 +163,8 @@ fn roundtrip<U>(
 /// builder argument rather than a config field.
 #[test]
 fn a_streaming_protocol_rejects_a_zero_body_cap() {
-    // The builder's half. The constructor's half is not a test: it is `NonZeroU64` in `HttpConn::new_streaming`'s
-    // signature, so a zero cap is unrepresentable rather than refused. That matters because the adoption site fills
-    // `stream_cap` only when it is `None` - a connection minted with its own cap keeps it, and a kTLS handshake
-    // worker mints exactly that way (`a_streaming_protocol_bounds_a_connection_it_did_not_mint`), so a check here
-    // could never have covered it.
+    // The builder's half. The constructor's half is `NonZeroU64` in `HttpConn::new_streaming`'s signature, which a
+    // check here could never cover, since a connection minted with its own cap keeps it.
     assert!(
         protocol_streaming(
             cfg(),
@@ -472,11 +465,9 @@ fn expect_dance_through_the_real_glue() {
     assert!(matches!(conn.phase, Phase::Head));
 }
 
-/// An expecting client on a *streaming* endpoint gets its interim when the handler accepts at `Stage::Open`.
-///
-/// Three routes owe the withheld interim and each carries its own pin: the two deferred ones park first
-/// (`a_deferred_stream_open_still_sends_the_interim`, `a_redriven_stream_open_still_sends_the_interim`), and this
-/// is the inline one. An interim withheld here stalls an expecting upload for the client's own timeout.
+/// An expecting client on a *streaming* endpoint gets its interim when the handler accepts at `Stage::Open`. This is
+/// the inline route, and the two deferred routes have their own pins (`a_deferred_stream_open_still_sends_the_interim`,
+/// `a_redriven_stream_open_still_sends_the_interim`).
 #[test]
 fn an_accepted_streamed_open_releases_the_withheld_interim() {
     let head = b"PUT /up HTTP/1.1\r\nHost: h\r\n\
@@ -512,14 +503,9 @@ fn an_accepted_streamed_open_releases_the_withheld_interim() {
     );
 }
 
-/// A refusal at `Stage::Open` goes out *instead of* the interim, and closes.
-///
-/// This is the whole point of dispatching the head before a body byte: the peer has not committed yet. Answering
-/// while leaving the connection open would let the declined body be framed as the next request, and answering
-/// *after* a `100 Continue` would have invited a body in order to refuse it.
-///
-/// Two mechanisms close it here - `force_final` on this arm, and `respond`'s own `abandons_body` disposition - so
-/// this asserts the contract rather than either one, and it takes removing both to make it fail.
+/// A refusal at `Stage::Open` goes out *instead of* the interim, and closes, so the declined body is neither invited
+/// nor framed as the next request. Both `force_final` and `respond`'s `abandons_body` close it, so this asserts the
+/// contract and fails only when both are removed.
 #[test]
 fn a_refused_streamed_open_answers_instead_of_inviting() {
     let head = b"PUT /up HTTP/1.1\r\nHost: h\r\n\
@@ -545,11 +531,8 @@ fn a_refused_streamed_open_answers_instead_of_inviting() {
     assert!(s.contains("Connection: close\r\n"), "{s}");
 }
 
-/// A stream open during a drain is refused 503, not invited.
-///
-/// The buffered twin is `dance_while_draining_is_refused_not_invited`, and the reasoning is identical: a drain that
-/// accepts an upload it will not read closes under a client mid-body, which the client cannot tell from a
-/// truncation.
+/// A stream open during a drain is refused 503, not invited, for the reason
+/// `dance_while_draining_is_refused_not_invited` gives.
 #[test]
 fn a_streamed_open_while_draining_is_refused() {
     let head = b"PUT /up HTTP/1.1\r\nHost: h\r\n\
@@ -579,14 +562,9 @@ fn a_streamed_open_while_draining_is_refused() {
     );
 }
 
-/// A delivery that owes a reply cannot be continued past.
-///
-/// `Continue` is the streamed stages' verdict; at `Whole` or `End` there is nothing further to read, so nothing
-/// would ever answer and the connection would sit until a timeout. It closes instead, which presents as slot
-/// exhaustion rather than a hang under load.
-///
-/// Guarded twice - the `Stage`-testing arm in `dispatch` and `settle`'s backstop - so this asserts the contract
-/// rather than either arm, and it takes removing both to make it fail.
+/// A delivery that owes a reply cannot be continued past. `Continue` at `Whole` or `End` would leave nothing to answer
+/// it, so it closes. Both the `Stage` arm in `dispatch` and `settle`'s backstop guard it, so this fails only when both
+/// are removed.
 #[test]
 fn continuing_past_a_delivery_that_owes_a_reply_closes() {
     let head = b"GET /k HTTP/1.1\r\nHost: h\r\n\r\n";
@@ -610,13 +588,8 @@ fn continuing_past_a_delivery_that_owes_a_reply_closes() {
     );
 }
 
-/// A streaming connection delivers [`Stage::Whole`] too, and both shapes that reach it are ordinary: a bodyless
-/// request, and a `Content-Length` body at or under one window - each takes the buffered path because a whole
-/// delivery there is already one pooled read.
-///
-/// This is the contract a handler is written against. Read as "a streaming connection never delivers `Whole`", such
-/// a handler answers [`HttpVerdict::Continue`] for a stage it was told cannot occur and the connection closes with
-/// no HTTP response (`continuing_past_a_delivery_that_owes_a_reply_closes`).
+/// A streaming connection delivers [`Stage::Whole`] too, for a bodyless request and for a `Content-Length` body at or
+/// under one window. A handler that answers `Continue` there closes the connection with no HTTP response.
 #[test]
 fn a_streaming_connection_still_delivers_whole() {
     let cap = 4 * STREAM_WINDOW as u64;
@@ -819,9 +792,9 @@ fn chunked_trailers_exposed() {
 
 #[test]
 fn botocore_streaming_put_golden() {
-    // The default boto3-over-TLS PutObject shape, as captured on the dev box (boto3 1.37.9): Expect + TE chunked,
-    // one HTTP chunk wrapping the aws-chunked entity, checksum trailer *inside* the entity, bare HTTP terminator.
-    // The HTTP band de-chunks its own layer only - the aws-chunked entity must pass through untouched.
+    // The default boto3 PutObject shape over TLS, Expect and TE chunked with one HTTP chunk wrapping the aws-chunked
+    // entity and its checksum trailer. The codec de-chunks its own layer only, and the entity must pass through
+    // untouched.
     let head = b"PUT /bkt/hello.txt HTTP/1.1\r\n\
                      Host: 127.0.0.1:9711\r\n\
                      Expect: 100-continue\r\n\
@@ -904,9 +877,8 @@ fn handler_can_take_body_ownership() {
 
 #[test]
 fn owned_dance_body_takes_from_the_same_allocation() {
-    // The reactor hands the dance's body-only delivery its buffer (at or over the placement threshold); the
-    // de-chunked entity must reach the handler's take() from that same allocation - ownership moved, bytes didn't
-    // (single chunk), nothing allocated. The A3 contract, pointer-checked, on the golden botocore shape.
+    // The reactor hands the dance's body-only delivery its buffer, and the de-chunked entity must reach the handler's
+    // take() from that same allocation, with no bytes moved for a single chunk and nothing allocated.
     let head = b"PUT /bkt/k HTTP/1.1\r\n\
                      Host: h\r\n\
                      Expect: 100-continue\r\n\
@@ -1247,11 +1219,8 @@ fn a_redrive_may_park_again() {
     assert_eq!(conn.state, 2);
 }
 
-/// A park taken at [`Stage::End`] is redriven as `End`.
-///
-/// An `End` park carries no resume state - `settle(conn, d, None)` is what both End arms file - so the stage cannot
-/// be read back off the resume phase, and a handler that finalises an upload at `End` would be handed its terminal
-/// delivery as if the whole body had arrived in one piece.
+/// A park taken at [`Stage::End`] is redriven as `End`. An `End` park carries no resume state, so the stage cannot be
+/// read back off the resume phase, and a handler finalising at `End` would otherwise see a `Whole` delivery.
 #[test]
 fn a_park_at_end_is_redriven_as_end() {
     let head = b"PUT /up HTTP/1.1\r\nHost: h\r\n\
@@ -1313,11 +1282,8 @@ fn a_park_at_end_is_redriven_as_end() {
     );
 }
 
-/// The framer tokenizes a head and every dispatch after it views that head through the recorded index. A streamed
-/// upload dispatches its head at the open, at each window, at the end and again when a park is redriven, and none
-/// of those may tokenize it again.
-///
-/// The second half is the fallback. A head that no index describes is tokenized at dispatch and served all the
+/// The framer tokenizes a head once, and every dispatch after it, at the open, each window, the end and a redriven
+/// park, views it through the recorded index. A head no index describes is tokenized at dispatch and served all the
 /// same.
 #[test]
 fn a_head_is_tokenized_once_however_often_it_is_dispatched() {

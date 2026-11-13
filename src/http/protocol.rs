@@ -23,45 +23,33 @@ use super::response::{ConnHeader, HttpResponse, Serialized, serialize, serialize
 
 /// One HTTP request, as handed to the consumer's handler.
 ///
-/// Everything borrows from the connection buffer (or the codec's head stash on the 100-continue path); the header index
-/// is a slice into a fixed array on the caller's stack, so a request costs no per-request heap allocation. `raw_head`
-/// is the head block verbatim, byte-for-byte as the client sent
-/// it, kept for the diagnostic echo in a `SignatureDoesNotMatch` reply;
-/// SigV4 canonicalizes from the parsed [`headers`](HttpRequest::headers) views, not this block (see the field).
-/// `#[non_exhaustive]`, so future context becomes a field addition rather than a breaking change.
+/// Everything borrows from the connection buffer, or the codec's head stash, and the header index is a slice into a
+/// fixed array on the caller's stack, so a request costs no heap allocation.
 #[non_exhaustive]
 pub struct HttpRequest<'a> {
     /// Request method, verbatim (methods are case-sensitive tokens).
     pub method: &'a str,
-    /// Request-target in **origin form** (`/path?query`), undecoded - S3 keys percent-decode at the S3 layer, where
-    /// encoding is semantically load-bearing.
-    ///
-    /// One shape, whatever the client sent. Absolute-form is accepted (RFC 9112 sec. 3.2.2 requires an origin server
-    /// to) only when its authority matches `Host`, and is reduced to its path here; asterisk-form survives as `*`, and
-    /// only for `OPTIONS`; every other form is answered 400 before a handler runs. So this never carries a second
-    /// authority for a consumer to reconcile - but note that `//host/path` is ordinary origin-form and reaches a
-    /// handler verbatim, so a consumer re-parsing this as a URI *reference* must not read that as an authority.
+    /// Request-target in **origin form** (`/path?query`), undecoded. An absolute-form target is accepted only when its
+    /// authority matches `Host` and is reduced to its path here, and asterisk-form survives as `*` for `OPTIONS` only,
+    /// so this never carries a second authority. `//host/path` is ordinary origin-form and arrives verbatim, so a
+    /// consumer re-parsing this as a URI *reference* must not read that as an authority.
     pub target: &'a str,
     /// Protocol version (1.0 or 1.1; anything else died with 505).
     pub version: Version,
     /// Parsed header index, wire order preserved.
     pub headers: &'a [HeaderView<'a>],
-    /// The request body (complete - bounded by [`HttpConfig::max_body`]). Deref for in-place reads; [`Body::take`]
-    /// moves the bytes out - a zero-copy move when the reactor placed the body in its own allocation, and for a chunked
-    /// body delivered owned (the 100-continue dance path at or over the placement threshold) an in-place truncate of
-    /// the de-chunked wire - so a handler that keeps the payload (an S3 PUT) never pays a second copy.
+    /// The request body, whole at [`Stage::Whole`] and bounded by [`HttpConfig::max_body`], or this window's payload on
+    /// a streamed delivery. Deref for in-place reads. [`Body::take`] moves the bytes out without a copy when the
+    /// reactor placed the body in its own allocation, including an owned chunked body de-chunked in place.
     pub body: Body<'a>,
-    /// The head block verbatim, including the terminating CRLFCRLF - the diagnostic to echo in a
-    /// `SignatureDoesNotMatch` reply. Build the SigV4 canonical request from [`headers`](HttpRequest::headers) (borrows
-    /// into this buffer, values verbatim minus edge-trim), never by re-splitting this block: the tokenizer accepts a
-    /// bare LF as a line terminator (RFC 9112 sec. 2.2), so a CRLF-strict re-parse would draw header boundaries the
-    /// request is not served on - the header-smuggling differential the parsed view does not have.
+    /// The head block verbatim, including the terminating CRLFCRLF, for diagnostics. Anything that canonicalizes the
+    /// request builds from [`headers`](HttpRequest::headers) and never re-splits this block, since the tokenizer
+    /// accepts a bare LF as a line terminator (RFC 9112 sec. 2.2) and a CRLF-strict re-parse would draw header
+    /// boundaries the request is not served on.
     pub raw_head: &'a [u8],
-    /// Trailer fields from a chunked body (RFC 9112 sec. 7.1.2), parsed but not interpreted; empty for non-chunked
-    /// requests and for chunked bodies whose trailer section is bare. Names forbidden in trailers -- framing, routing,
-    /// and credentials (RFC 9110 sec. 6.5.1) - are dropped by the codec and never appear here, so merging these with
-    /// the headers cannot rewrite either. (botocore's checksum trailer rides *inside* the aws-chunked entity, not
-    /// here - this surfaces genuine HTTP trailers for whichever clients send them.)
+    /// Trailer fields from a chunked body (RFC 9112 sec. 7.1.2), parsed but not interpreted, and empty otherwise. Names
+    /// forbidden in trailers, being framing, routing and credentials (RFC 9110 sec. 6.5.1), are dropped by the codec,
+    /// so merging these with the headers cannot rewrite either.
     pub trailers: &'a [HeaderView<'a>],
     /// The peer's identity.
     pub peer: &'a ClientAddr,
@@ -105,17 +93,15 @@ impl<'a> HttpRequest<'a> {
         )
     }
 
-    /// Park a **streamed** delivery ([`Stage::Open`] or [`Stage::Window`]) while an async operation - typically a file
-    /// write of this very window - completes, without retaining the window.
+    /// Park a **streamed** delivery ([`Stage::Open`] or [`Stage::Window`]) while an async operation, typically a write
+    /// of this very window, completes, without retaining the window.
     ///
-    /// [`HttpRequest::defer`] copies the body into the park so [`HttpDeferred::redrive`] can re-run the handler on it.
-    /// A stream park resolved by [`HttpStreamDeferred::resume`] never re-runs the handler - the stream just moves to
-    /// its next read - so the copy buys nothing, and for a window written straight from the receive buffer
-    /// (`pwritev2_from`) it is the allocation the whole path exists to remove. The head is still retained (it is small
-    /// and [`HttpStreamDeferred::fail`] serializes against it); the body is not, which is why this deferral cannot
-    /// redrive. The window itself comes back to the caller: the park no longer holds it, and the operation this
-    /// deferral waits on is usually *of* those bytes - they stay valid for the delivery (the reactor recycles the
-    /// buffer only after the write that borrows it completes).
+    /// This exists because [`HttpRequest::defer`] copies the body into the park so [`HttpDeferred::redrive`] can re-run
+    /// the handler on it. A stream park resolved by [`HttpStreamDeferred::resume`] never re-runs the handler, so the
+    /// copy buys nothing, and for a window written straight from the receive buffer (`pwritev2_from`) it is the
+    /// allocation the path exists to remove. The park keeps the head only, for [`HttpStreamDeferred::fail`] to
+    /// serialize against, which is why it cannot redrive. The window comes back to the caller and stays valid for the
+    /// delivery, since the reactor recycles the buffer only after the write that borrows it completes.
     pub fn defer_stream(self) -> (HttpStreamDeferred, HttpDeferPermit, Body<'a>) {
         let HttpRequest {
             raw_head,
@@ -198,15 +184,11 @@ impl std::fmt::Debug for ParkedRequest {
 
 /// Where a delivery sits in a body.
 ///
-/// Every non-streaming builder delivers [`Stage::Whole`] and nothing else -- the whole body, once, as those builders
-/// document.
-///
-/// A streaming connection opens with [`Stage::Open`] before a body byte exists, hands each window over as
-/// [`Stage::Window`], and closes with [`Stage::End`] - **for the bodies it streams**. It delivers `Whole` for
-/// everything else it carries: a bodyless request, and a `Content-Length` body at or under one window, both of which
-/// take the buffered path because a whole delivery there is already one pooled read. So a streaming handler has to
-/// answer a `Whole` delivery the way a non-streaming one would; [`HttpVerdict::Continue`] is refused at `Whole` and at
-/// `End` alike, and refusing it closes the connection with no HTTP response.
+/// Every non-streaming builder delivers [`Stage::Whole`] and nothing else. A streaming connection opens with
+/// [`Stage::Open`] before a body byte exists, hands each window over as [`Stage::Window`], and closes with
+/// [`Stage::End`], **for the bodies it streams**. It still delivers `Whole` for a bodyless request and for a
+/// `Content-Length` body at or under one window, so a streaming handler answers `Whole` as a non-streaming one would.
+/// [`HttpVerdict::Continue`] at `Whole` or `End` closes the connection with no HTTP response.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Stage {
     /// The whole body arrived at once.
@@ -345,17 +327,12 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Serialize `resp` against what `head` negotiated and pick the reactor verdict: keep-alive replies, farewells
-/// flush-close. `dates` is the per-reactor cache rendering the `Date` value once a second, not once a response.
-/// `draining` forces the close: the reply goes out with a close disposition, so the reactor discards anything buffered
-/// behind it and closes once it is sent, and the head says so rather than let the peer find out on its next request.
 /// Force a reply to end the connection.
 ///
-/// A response produced while a body is still arriving has abandoned the rest of it: nothing will read those bytes, so a
-/// keep-alive answer would leave the framer to take them for the next request - a desync that presents to the client as
-/// a spurious second response. The keep-alive disposition sits in a different field for each reply shape, which is why
-/// this exists rather than a match at each of the three call sites: the one that only handled `Response::Reply`
-/// silently missed every response with a body, because those are `ReplyVectored`.
+/// A response made while a body is still arriving has abandoned the rest of it, and a keep-alive answer would leave the
+/// framer to take those bytes for the next request. The keep-alive disposition sits in a different field for each reply
+/// shape, so every call site goes through here rather than matching `Response::Reply` alone and missing the vectored
+/// and file replies.
 fn force_final(resp: Response) -> Response {
     match resp {
         Response::Reply(b) => Response::ReplyClose(b),
@@ -379,6 +356,9 @@ fn force_final(resp: Response) -> Response {
     }
 }
 
+/// Serialize `resp` against what `head` negotiated and pick the reactor verdict, where keep-alive replies and farewells
+/// flush-close. `dates` renders the `Date` value once a second. `draining` forces the close, and the head says so
+/// rather than let the peer find out on its next request.
 fn respond(
     head: &Head<'_>,
     resp: HttpResponse,
@@ -388,11 +368,8 @@ fn respond(
     // header must say so - a peer told keep-alive and then given EOF has to guess whether it was answered or cut off.
     abandons_body: bool,
 ) -> Response {
-    // A head carrying both Content-Length and Transfer-Encoding frames as chunked here because the transfer coding wins
-    // under RFC 9112 section 6.3. A front end that prefers Content-Length would frame the same bytes with a different
-    // boundary, and that difference is the CL.TE smuggling primitive. Keep the coding preference for client
-    // compatibility and make the exchange non pipelinable instead. The reply drops keep alive so no pipelined request
-    // rides behind a smuggled prefix on this connection.
+    // A CL+TE head frames as chunked (RFC 9112 sec. 6.3), the CL.TE smuggling differential, so the reply drops
+    // keep-alive and nothing rides behind a smuggled prefix on this connection.
     let (keep_alive, cl_te_conflict) = head.response_disposition();
     let keep = keep_alive && !resp.close && !cl_te_conflict && !draining && !abandons_body;
     let conn = match (keep, head.version) {
@@ -402,9 +379,7 @@ fn respond(
     };
     let head_only = head.method == "HEAD";
     match serialize_reply(resp, head_only, dates.get(now_secs()), conn) {
-        // A response with a body hands its head and body as separate segments,
-        // scattered vectored so the body is never copied into the head buffer;
-        // a HEAD or bodyless response is just the head. Keep-alive vs close is the same disposition either way.
+        // A body goes as its own segment, sent vectored so it is never copied into the head buffer.
         Serialized::Split { head: head_bytes, body } => Response::ReplyVectored {
             segments: vec![head_bytes.into(), body.into()],
             close: !keep,
@@ -613,19 +588,16 @@ where
             Dispatched::Continue => Response::Close,
         }
     }
-    /// Release, or withhold, the interim a streamed open owed. Three arms reach this - the inline open, the deferred
-    /// resume, and the redrive - and an arm that answered `Vec::new()` where the others answered the interim would
-    /// leave an expecting client waiting on its own timeout for a body the stream is already open for.
+    /// Release, or withhold, the interim a streamed open owed. The inline open, the deferred resume and the redrive all
+    /// answer through here, so none can leave an expecting client waiting on its own timeout.
     fn interim(expect: bool) -> Response {
         Response::Reply(if expect { CONTINUE_LINE.to_vec() } else { Vec::new() })
     }
 
     match std::mem::replace(&mut conn.phase, Phase::Head) {
-        // The framer's farewell: everything buffered was delivered as a degenerate message; answer and flush-close. The
-        // HEAD flag rides in the phase from the moment the failure was declared - after the dance the head bytes are
-        // consumed and the delivered bytes are the client's body, so sniffing them here would let a body that spells
-        // "HEAD " force an incomplete farewell (and a real HEAD's farewell grow a body its client would read as the
-        // next response).
+        // The framer's farewell. The HEAD flag rides in the phase from when the failure was declared, since after the
+        // dance the delivered bytes are the client's body, and sniffing them would let a body spelling "HEAD " change
+        // the farewell.
         Phase::Fail { status, head_only } => farewell(status, head_only, dates),
         // Dance message 1: the head alone. Queue the interim line verbatim (Reply sends raw bytes) and advance the
         // phase; the framer will declare the body next.
@@ -657,13 +629,9 @@ where
             );
             settle(conn, d, None)
         }
-        // A complete chunked message: de-chunk the wire extent, then dispatch the entity against the in-buffer head or
-        // the dance's stash. When the reactor handed the wire allocation over (the dance delivers the body alone, and
-        // large bodies arrive owned), de-chunk **in place**: ownership moves and the entity stays in the same
-        // allocation - the single-chunk shape default botocore sends moves no bytes at all, and the handler's take()
-        // truncates instead of copying. A borrowed delivery keeps the borrowing paths: a single-chunk entity is a
-        // borrow of the wire, only stitched multi-chunk entities allocate. The framer's scan accepted these exact
-        // bytes, so a de-chunk failure is a codec bug, answered as one.
+        // A complete chunked message, de-chunked and dispatched against the in-buffer head or the dance's stash. An
+        // owned delivery is de-chunked **in place**, so a single-chunk entity moves no bytes and the handler's take()
+        // truncates. The framer's scan accepted these bytes, so a de-chunk failure is a codec bug.
         Phase::ChunkedDone { stash } => {
             let head_bytes = stash.as_deref().unwrap_or(header);
             if let Some((mut wire, _)) = body.take_owned() {
@@ -734,14 +702,8 @@ where
             );
             settle(conn, d, None)
         }
-        // A parked request's completion, arriving as a redelivery (the frame is empty; everything real was retained at
-        // the park). A worker `reply` left the response in the cell - serialize it against the retained head. Otherwise
-        // this is a `redrive`: run the handler again over the identical request view; it may respond, park again, or
-        // close.
-        // A streamed body opens with its head and no bytes. This is the consumer's one chance to refuse before the peer
-        // commits to sending - and when the client asked for `100-continue`, the interim line is withheld until the
-        // consumer has actually accepted, so a refusal goes out *instead* of it rather than after inviting a body
-        // nobody wanted.
+        // A streamed body opens with its head and no bytes, the consumer's one chance to refuse before the peer
+        // commits. A requested interim is withheld until the consumer accepts, so a refusal goes out *instead* of it.
         Phase::StreamOpen { head, expect, body } => {
             if responder.draining() {
                 return farewell(503, method_is_head(&head), dates);
@@ -800,10 +762,9 @@ where
             decoded,
         } => {
             let delivered = body.len();
-            // How much of this chunk is still owed. Mid-chunk the answer is carried; on a chunk's first window it comes
-            // from re-reading the size line, which is exactly what `header` holds. The framer cannot leave it here
-            // instead: it re-runs for the same window while the payload arrives, and a second run would then take the
-            // mid-chunk branch and declare a different message.
+            // How much of this chunk is still owed, carried mid-chunk and read off the size line in `header` on a
+            // chunk's first window. The framer cannot leave it in the phase, since it re-runs for the same window and
+            // would then declare a different message.
             let owed = if chunk_left > 0 {
                 chunk_left
             } else {
@@ -828,8 +789,8 @@ where
                 handler,
                 Stage::Window,
             );
-            // After the dispatch, which only borrows the head: this arm runs once per window for the life of the
-            // upload, so a clone here is a head copy per 128 KiB. Its known-length twin below already moves.
+            // Built after the dispatch, which only borrows the head, so the head moves rather than being cloned once
+            // per window.
             let next = Phase::StreamBody {
                 head,
                 chunk_left: left,
@@ -902,8 +863,8 @@ where
                     conn,
                     d,
                     Some(super::framer::StreamPark {
-                        // An exhausted length owes only the End stage;
-                        // `StreamDone` is what the resume arm reads as "dispatch it now, nothing further to frame".
+                        // An exhausted length owes only the End stage, which the resume dispatches on seeing
+                        // `StreamDone`.
                         next: if left == 0 {
                             // A known-length body has no terminal block at all; the End stage is dispatched from the
                             // resume with nothing to parse.
@@ -920,10 +881,9 @@ where
         // The terminal chunk: the delivered header IS the trailer section, so the trailers are parsed from it here
         // rather than carried.
         Phase::StreamDone { head, block_at } => {
-            // The terminal block is itself a complete (empty) chunked message, so the whole-message compactor parses
-            // its trailer section. It has to outlive the dispatch: the views borrow it. `block_at` skips the CRLF that
-            // closed the last payload, which the compactor would read as an empty - malformed - size line and refuse,
-            // losing every trailer with it.
+            // The terminal block is itself a complete empty chunked message, so the compactor parses its trailers, and
+            // the wire must outlive the dispatch since the views borrow it. `block_at` skips the CRLF that closed the
+            // last payload, which would read as a malformed size line.
             let mut wire = header[block_at.min(header.len())..].to_vec();
             let compacted = chunked::compact(&mut wire).ok();
             let trailers = compacted.as_ref().and_then(|c| c.trailers().ok()).unwrap_or_default();
@@ -942,6 +902,9 @@ where
             );
             settle(conn, d, None)
         }
+        // A parked request's completion, arriving as a redelivery with an empty frame. A worker's `reply` left a
+        // response in the cell and a `resume` left a marker, and an empty cell is a `redrive`, which runs the handler
+        // again over the identical request view.
         Phase::Parked { req, resume } => {
             let ParkedRequest {
                 head,
@@ -994,9 +957,8 @@ where
                         // there would have.
                         resume.is_some(),
                     );
-                    // A worker that answered mid-body abandoned a body the peer is still sending. Nothing can read the
-                    // rest, so the reply is final: send it and flush-close, rather than resume framing bytes that
-                    // belong to a request already answered.
+                    // Final for the same reason, rather than resume framing bytes that belong to a request already
+                    // answered.
                     match resume {
                         Some(_) => force_final(out),
                         None => out,
@@ -1022,14 +984,9 @@ where
                         stage,
                     );
                     match (d, resume) {
-                        // Redriven and accepted with content to read on:
-                        // put the streaming phase back, and release any interim a parked open was still withholding -
-                        // the redrive route owes it exactly as the resume route does.
-                        //
-                        // `StreamDone` is not a phase to restore. It marks a known length already spent, so no wire
-                        // remains to frame an End delivery from - and the framer's degrade arm would declare whatever
-                        // is buffered, i.e. the *next* pipelined request's head, as this message's header. Dispatch End
-                        // here instead, which is what the resume route does with the same marker.
+                        // `StreamDone` is not a phase to restore. A spent known length leaves no wire to frame End
+                        // from, and the framer's degrade arm would declare the next pipelined request's head as this
+                        // message, so dispatch End here as the resume route does.
                         (Dispatched::Continue, Some(r)) if matches!(r.next, Phase::StreamDone { .. }) => {
                             let d = dispatch(
                                 &head,
@@ -1046,6 +1003,8 @@ where
                             );
                             settle(conn, d, None)
                         }
+                        // Redriven and accepted with content to read on. Put the streaming phase back and release any
+                        // interim a parked open still withheld, as the resume route does.
                         (Dispatched::Continue, Some(r)) => {
                             conn.phase = r.next;
                             interim(r.expect_interim)
@@ -1091,18 +1050,9 @@ where
             })
         },
         header: move |buf: &[u8], conn: &mut HttpConn<U>| {
-            // The accept wrapper above is not the only admission. A kTLS listener is admitted by
-            // `AcceptDeferral::ready`, which takes the connection state directly and never runs it
-            // (`net/server/accept.rs`: `install_conn` has exactly two callers, and only the plain-TCP one goes through
-            // the accept handler). A worker that hands back `HttpConn::new` there would otherwise get a connection with
-            // no cap at all - and `stream_cap` is not merely the streaming switch, it *is* the body limit, so the
-            // ceiling would silently become `HttpConfig::max_body` instead of the `max_body_bytes` this protocol was
-            // built with. A limit that holds on one transport and not the other is worse than no limit: a deployment
-            // sets it, tests it over plain HTTP and ships it.
-            //
-            // Adopting it here rather than at admission covers every route in, present and future. Safe at this point
-            // by construction - `HttpConn::new` leaves `Phase::Head`, so no body is ever in progress the first time
-            // this runs - and `is_none` leaves a connection minted `new_streaming` with its own cap.
+            // Adopt the protocol's cap on a connection admitted without the accept wrapper, as `AcceptDeferral::ready`
+            // admits a kTLS one, since the cap is the body limit and not only the streaming switch. `Phase::Head` holds
+            // no body the first time this runs, and `is_none` keeps a cap minted by `new_streaming`.
             if conn.stream_cap.is_none() {
                 conn.stream_cap = stream_cap;
             }
@@ -1129,30 +1079,20 @@ where
 /// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint whose handler may also reach the server's **request-bound fs
 /// facade**.
 ///
-/// The handler is [`protocol_deferrable`]'s with one more argument: the reactor's per-request
-/// [`FsConn`](crate::uring_fs::FsConn) - `Some` when the server was built with an fs pool
-/// ([`ServerConfig::fs_ops`](crate::net::server::ServerConfig::fs_ops)), else `None`. A `Protocol` is built before its
-/// `Server`, so this constructor cannot check; for a handler that asked for this constructor, `None` is a deployment
-/// misconfiguration, and answering `500` is the honest response.
+/// The handler is [`protocol_deferrable`]'s with one more argument, the reactor's per-request
+/// [`FsConn`](crate::uring_fs::FsConn). It is `Some` when the server was built with an fs pool
+/// ([`ServerConfig::fs_ops`](crate::net::server::ServerConfig::fs_ops)) and else `None`, a misconfiguration the handler
+/// answers `500`.
 ///
-/// The consumer's model, in full:
+/// - **The facade is per delivery.** It borrows the reactor for the call and cannot be stored.
+/// - **Fs work parks the request.** [`HttpRequest::defer`] it, capture the [`HttpDeferred`] in the op's continuation,
+///   return [`HttpVerdict::Defer`], and resolve it with [`HttpDeferred::reply`].
+/// - **A continuation that opens owns what it opens.** Its facade may outlive the connection, and nothing sweeps a
+///   descriptor opened after its connection closed, so a chain that opens must reach a step that closes.
+/// - **Offload jobs are never cancelled** ([`FsConn::offload`](crate::uring_fs::FsConn::offload)). A resolved
+///   [`HttpDeferred`] for a vanished request is a generation-checked no-op.
 ///
-/// - **The facade is per delivery.** It borrows the reactor for the call and cannot be stored; every invocation of the
-///   handler - first delivery or redelivery - receives a fresh one.
-/// - **Fs work parks the request.** Take the facade, then [`HttpRequest::defer`] the request (defer consumes it),
-///   capture the [`HttpDeferred`] in the op's continuation, and return [`HttpVerdict::Defer`]; the continuation, or a
-///   later offload delivery, resolves it via [`HttpDeferred::reply`].
-/// - **A continuation may `open`, and owns what it opens.** [`open`](crate::uring_fs::FsConn::open) works on every
-///   facade, including the one a continuation or offload delivery receives. That facade runs for an owner that may
-///   already be gone, and nothing sweeps a descriptor opened after its connection closed, so a chain that opens must
-///   reach a step that closes. A handler that would rather re-enter with a fresh delivery can still park its progress
-///   in the connection state `U` and call [`HttpDeferred::redrive`].
-/// - **Offload jobs are never cancelled** ([`FsConn::offload`](crate::uring_fs::FsConn::offload)): a delivery may fire
-///   for a request that is gone, and a resolved [`HttpDeferred`] for a vanished request is a generation-checked no-op
-///   rather than a hazard.
-///
-/// The parking discipline is [`protocol_deferrable`]'s, including its `max_in_flight_requests` guidance. Errors when
-/// `cfg` fails [`HttpConfig::validate`].
+/// The parking discipline is [`protocol_deferrable`]'s. Errors when `cfg` fails [`HttpConfig::validate`].
 #[cfg(feature = "uring-fs")]
 #[allow(clippy::type_complexity)]
 pub fn protocol_fs<U, A, H>(
@@ -1176,22 +1116,16 @@ where
 /// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint whose handler may **park** a request for deferred
 /// completion.
 ///
-/// `accept` is the standard admission hook returning the consumer's per-connection state `U`; `handler` runs once per
-/// delivery with the parsed [`HttpRequest`] view and `&mut U`, and returns an
-/// [`HttpVerdict`]: [`Respond`](HttpVerdict::Respond) answers inline
-/// (exactly a [`protocol`] handler), or - after [`HttpRequest::defer`] -- [`Defer`](HttpVerdict::Defer) parks the
-/// request while the reactor keeps polling. The worker then completes it through the [`HttpDeferred`]:
-/// [`redrive`](HttpDeferred::redrive) re-runs the handler on the server thread once state is warm,
-/// [`reply`](HttpDeferred::reply) delivers a worker-built response (serialized on the server thread), and
-/// [`close`](HttpDeferred::close) hangs up. Handlers still run on the server thread and must not block.
+/// `accept` returns the consumer's per-connection state `U`, and `handler` runs once per delivery with the parsed
+/// [`HttpRequest`] and `&mut U`. It returns [`Respond`](HttpVerdict::Respond) to answer inline, or, after
+/// [`HttpRequest::defer`], [`Defer`](HttpVerdict::Defer) to park the request while the reactor keeps polling. The
+/// worker completes it with [`redrive`](HttpDeferred::redrive), [`reply`](HttpDeferred::reply) or
+/// [`close`](HttpDeferred::close). Handlers run on the server thread and must not block.
 ///
-/// Intended for the default `max_in_flight_requests == 1`: while a request is parked nothing later is read or
-/// delivered, so reply order is request order. Above that cap the framer still holds pipelined requests back during a
-/// park, but the armed read-ahead then carries `request_timeout` while parked - run deferrable endpoints at the default
-/// cap.
+/// Run it at the default `max_in_flight_requests == 1`. Above that the framer still holds pipelined requests during a
+/// park, but the armed read-ahead carries `request_timeout` while parked.
 ///
-/// Errors when `cfg` fails [`HttpConfig::validate`] - a codec that can admit no request is refused here, not discovered
-/// one 431 at a time.
+/// Errors when `cfg` fails [`HttpConfig::validate`].
 // Same shape and rationale as `length_prefixed`: the three opaque closures ARE the signature; boxing them would put dyn
 // dispatch on the hot path.
 #[allow(clippy::type_complexity)]
@@ -1218,17 +1152,9 @@ where
     )
 }
 
-/// The streaming cap as the type the connection state holds.
-///
-/// The cap IS the body limit on a streaming connection - `stream_cap` bounds every body, buffered or not - so a zero is
-/// the same "admits nothing" configuration [`HttpConfig::validate`] exists to refuse: every request carrying a byte of
-/// body would be answered 413 while a bodyless GET was served normally, an endpoint that reads healthy and admits no
-/// payload. `HttpConfig::validate` cannot see it, because the cap is a builder argument rather than a config field.
-///
-/// The builders take a plain `u64` and refuse zero here, so a misconfiguration is a named `Validation` rather than a
-/// type error at the call site. Past this point it is `NonZeroU64` and there is nothing left to check - which is the
-/// half that matters, since [`HttpConn::new_streaming`](super::HttpConn::new_streaming) is public and reaches the same
-/// state without passing through any builder.
+/// The streaming cap as the type the connection state holds. A zero would answer 413 to every body while serving a
+/// bodyless GET, the configuration that admits nothing, which [`HttpConfig::validate`] refuses but cannot see here,
+/// since the cap is a builder argument. The builders refuse it as a named `Validation`.
 fn stream_cap(max_body_bytes: u64) -> crate::Result<std::num::NonZeroU64> {
     std::num::NonZeroU64::new(max_body_bytes)
         .ok_or_else(|| crate::Error::Validation("http streaming max_body_bytes must be non-zero".into()))
@@ -1236,35 +1162,23 @@ fn stream_cap(max_body_bytes: u64) -> crate::Result<std::num::NonZeroU64> {
 
 /// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint that **streams** request bodies rather than buffering them.
 ///
-/// A chunked body is delivered a chunk at a time instead of once when its terminal chunk lands, and a `Content-Length`
-/// body above one window a window at a time, so the largest body the endpoint accepts stops being a buffer size. The
+/// A chunked body is delivered a chunk at a time and a `Content-Length` body above one window a window at a time. The
 /// handler walks [`Stage::Open`] (the head, before any body byte), then [`Stage::Window`] per chunk or window, then
-/// [`Stage::End`] once any trailers are parsed - and answers with [`HttpVerdict::Continue`] until `End`, where the
-/// response belongs.
+/// [`Stage::End`] once any trailers are parsed, answering [`HttpVerdict::Continue`] until `End`, where the response
+/// belongs.
 ///
-/// `max_body_bytes` bounds the body: for chunked the decoded size, checked as each chunk is declared; for
-/// `Content-Length` the declared length, checked at the head. It is a parameter rather than a field on [`HttpConfig`]
-/// because [`HttpConfig::max_body`] is the bound a *buffered* delivery checks before reading; whoever knows the
-/// protocol above knows this number (an S3 front bounds a part at 5 GiB).
+/// `max_body_bytes` bounds every body on the connection, the decoded size for chunked as each chunk is declared and the
+/// declared length for `Content-Length` at the head. [`HttpConfig::max_body`] still bounds a body that arrives as one
+/// delivery.
 ///
-/// # What a streamed request does differently
+/// - **A refusal closes the connection**, at `Open` or mid-body, since the declined body is still being sent.
+/// - **`Expect: 100-continue` is answered by the handler.** The interim is withheld until the handler returns
+///   [`HttpVerdict::Continue`] from `Open`, so a refusal goes out instead of it. A body at or under one window takes
+///   the buffered path, where the interim invites at most one window.
+/// - **Nothing is retained between windows**, so a handler that needs the body consumes it as it arrives.
 ///
-/// - **A refusal closes the connection.** The body it declined is still being sent and nothing will read it, so a
-///   keep-alive reply would frame the remainder as the next request. That applies to a refusal at `Open` and to one
-///   mid-body alike.
-/// - **`Expect: 100-continue` is answered by the handler, not ahead of it.** The interim line is withheld until the
-///   handler returns [`HttpVerdict::Continue`] from `Open`, so a refusal goes out *instead* of the interim rather than
-///   after having invited a body. (A `Content-Length` body at or under one window takes the buffered path, where the
-///   interim invites at most one window's worth - there is no stream for a veto to save.)
-/// - **Nothing is retained between windows.** Each window's payload is dropped once the handler returns, so a handler
-///   that needs the body must consume it as it arrives.
-///
-/// Errors when `cfg` fails [`HttpConfig::validate`].
-///
-/// **A kTLS listener needs the cap passed by hand.** The streaming decision is made in this function's accept closure,
-/// and a kTLS connection is admitted by `AcceptDeferral::ready` instead - the accept handler never runs for one. A
-/// handshake worker that hands back [`HttpConn::new`] therefore gets a buffering connection whose effective ceiling is
-/// `max_request_bytes`; use [`HttpConn::new_streaming`] with `max_body_bytes` there.
+/// A connection admitted without the accept handler, as a kTLS handshake worker's is, adopts this cap at its first
+/// frame unless it was minted with [`HttpConn::new_streaming`]. Errors when `cfg` fails [`HttpConfig::validate`].
 #[allow(clippy::type_complexity)]
 pub fn protocol_streaming<U, A, H>(
     cfg: HttpConfig,
@@ -1290,16 +1204,10 @@ where
     )
 }
 
-/// [`protocol_streaming`] with the per-request fs facade, as `protocol_fs` is to [`protocol_deferrable`] - a streaming
-/// handler that writes what it receives needs somewhere to put each window, and that is the ring the server already
-/// drives.
+/// [`protocol_streaming`] with the per-request fs facade, as `protocol_fs` is to [`protocol_deferrable`], so a
+/// streaming handler can write each window on the ring the server already drives.
 ///
 /// Errors when `cfg` fails [`HttpConfig::validate`].
-///
-/// **A kTLS listener needs the cap passed by hand.** The streaming decision is made in this function's accept closure,
-/// and a kTLS connection is admitted by `AcceptDeferral::ready` instead - the accept handler never runs for one. A
-/// handshake worker that hands back [`HttpConn::new`] therefore gets a buffering connection whose effective ceiling is
-/// `max_request_bytes`; use [`HttpConn::new_streaming`] with `max_body_bytes` there.
 #[cfg(feature = "uring-fs")]
 #[allow(clippy::type_complexity)]
 pub fn protocol_streaming_fs<U, A, H>(
@@ -1323,11 +1231,10 @@ where
 
 /// Build the reactor [`Protocol`] for an HTTP/1.1 endpoint.
 ///
-/// `accept` is the standard admission hook returning the consumer's per-connection state `U`; `handler` is invoked once
-/// per request with the parsed [`HttpRequest`] view and `&mut U`, and returns the [`HttpResponse`] to serialize.
-/// Handlers run on the server thread -- compute inline like any reactor `body` handler; a handler that must wait on
-/// other threads uses [`protocol_deferrable`] instead, and one that must also touch the filesystem, `protocol_fs` (with
-/// the `uring-fs` feature).
+/// `accept` returns the consumer's per-connection state `U`, and `handler` runs once per request with the parsed
+/// [`HttpRequest`] and `&mut U` and returns the [`HttpResponse`] to serialize. Handlers run on the server thread, so
+/// one that must wait on other threads uses [`protocol_deferrable`], and one that touches the filesystem `protocol_fs`
+/// (with `uring-fs`).
 ///
 /// Errors when `cfg` fails [`HttpConfig::validate`].
 #[allow(clippy::type_complexity)]
@@ -1360,17 +1267,9 @@ mod tests;
 //
 // Run with:  RUSTFLAGS="--cfg loom" cargo test --lib --features http loom_
 //
-// The park's cross-thread protocol, the one edge in this module two threads share:
-//
-//   worker (HttpDeferred::reply)        loop (drain, then step on Parked)
-//   *answer.lock() = Some(resp)         wake.drain()
-//   tx.send(Redeliver); wake.poke()     rx.try_recv() -> Redeliver
-//                                       answer.lock().take()
-//
-// The cell is filled before the redeliver is sent, and the completion pass takes the cell only after consuming the
-// wake, so a `reply` can never be observed as a redrive. Break either half - fill after the send, or take before the
-// wake - and a schedule exists where the completion pass takes `None`: the handler reruns against a consumed handle and
-// the worker's response is lost. The model drives the real `defer`/`reply`/`step`, with the loop's recv order supplied
-// by the probe.
+// A worker's `reply` fills the answer cell before it sends the redeliver, and the completion pass takes the cell only
+// after consuming the wake, so a `reply` is never observed as a redrive. Break either half and a schedule exists where
+// the pass takes `None`, reruns the handler against a consumed handle and loses the worker's response. The model drives
+// the real `defer`, `reply` and `step`.
 #[cfg(all(test, loom))]
 mod loom_tests;

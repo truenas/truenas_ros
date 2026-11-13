@@ -6,7 +6,7 @@ use std::fmt;
 
 /// A UTC wall-clock instant formatted as an IMF-fixdate via [`fmt::Display`].
 ///
-/// Construct with [`HttpDate::from_unix`]; the glue layer feeds it `SystemTime::now()` once per response.
+/// Construct with [`HttpDate::from_unix`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpDate {
     year: i64,
@@ -76,10 +76,8 @@ impl fmt::Display for HttpDate {
 }
 
 /// A cache of the rendered `Date` value, keyed by the unix second. HTTP dates have one-second resolution and handlers
-/// run single-threaded on their reactor, so re-running the calendar math and formatting per response (~750 ns) is
-/// waste: the glue owns one of these per protocol instance (= per reactor) and re-renders only when the second changes.
-/// Pure like the rest of the module - the caller supplies the seconds, so serialization stays deterministic and
-/// testable.
+/// run single-threaded on their reactor, so the glue owns one per protocol instance and re-renders only when the second
+/// changes. The caller supplies the seconds.
 #[derive(Debug)]
 pub(crate) struct DateCache {
     /// The second the buffer holds; `None` until the first render.

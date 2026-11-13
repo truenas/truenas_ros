@@ -139,26 +139,19 @@ fn split_trailer(line: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((&line[..colon], value))
 }
 
-/// Field names that must not ride in a trailer section (RFC 9110 sec. 6.5.1): message framing, routing, and
-/// credentials. A conforming sender never puts these there, and surfacing them tempts any consumer that merges headers
-/// and trailers into letting a trailer rewrite framing or auth after the body - so a well-formed line bearing one is
-/// consumed and dropped, never surfaced.
+/// Field names that must not ride in a trailer section (RFC 9110 sec. 6.5.1), being message framing, routing and
+/// credentials. A well-formed line bearing one is consumed and dropped, never surfaced, so a consumer that merges
+/// headers and trailers cannot have framing or auth rewritten after the body.
 ///
-/// **Three of the six clauses sec. 6.5.1 names, and the doc on
-/// [`HttpRequest::trailers`](crate::http::HttpRequest::trailers) says which three.** The request modifiers, the
-/// response control data and the payload-processing fields ride through: a consumer that merges the two sections still
-/// sees an `If-Match` or a `Content-Type` arriving after the body. That is an incomplete list rather than a broken
-/// promise, and widening it changes what consumers are handed - but *credentials* is a clause this claims outright, so
-/// every field in it belongs here.
+/// This covers three of the six clauses sec. 6.5.1 names. Request modifiers, response control data and
+/// payload-processing fields still ride through, and widening the list changes what consumers are handed.
 const FORBIDDEN_TRAILERS: [&str; 6] = [
     // Message framing.
     "transfer-encoding",
     "content-length",
     // Routing.
     "host",
-    // Credentials. RFC 9110 sec. 6.5.1 names the authentication fields as a clause, not as a list of one: a proxy
-    // credential arriving after the body is the same rewrite as an origin one, and SigV4 signs the head block rather
-    // than this section.
+    // Credentials, the whole clause. A proxy credential arriving after the body is the same rewrite as an origin one.
     "authorization",
     "proxy-authorization",
     "cookie",
@@ -170,12 +163,11 @@ fn forbidden_trailer(name: &[u8]) -> bool {
         .any(|f| name.eq_ignore_ascii_case(f.as_bytes()))
 }
 
-/// The one state machine under [`scan`], [`decode`], and [`compact`]: advance over `body` from where `s` left off,
-/// reporting payload spans and validated trailer lines to the sinks **as ranges into `body`** - so an in-place caller
-/// can record positions without borrowing against a buffer it means to mutate. `Ok(Some(extent))` - the message
-/// occupies exactly the
-/// first `extent` bytes of `body`; `Ok(None)` - need more bytes;
-/// `Err(status)` - malformed (400) or oversized trailers (431).
+/// The one state machine under [`scan`], [`decode`], and [`compact`]. It advances over `body` from where `s` left off
+/// and reports payload spans and validated trailer lines to the sinks **as ranges into `body`**, so an in-place caller
+/// can record positions without borrowing a buffer it means to mutate. `Ok(Some(extent))` means the message occupies
+/// exactly the first `extent` bytes of `body`, `Ok(None)` means more bytes are needed, and `Err(status)` is malformed
+/// input (400) or oversized trailers (431).
 fn run(
     body: &[u8],
     s: &mut ChunkScan,
@@ -271,12 +263,9 @@ pub(crate) fn scan(body: &[u8], s: &mut ChunkScan) -> Result<Option<usize>, u16>
     run(body, s, &mut |_| {}, &mut |_| {})
 }
 
-/// One step of a **chunk-at-a-time** walk: where the next payload extent starts and how long it is, without scanning
-/// past it.
-///
-/// [`scan`] answers "is the whole message here yet", which requires holding the whole message. This answers "where is
-/// the next payload", which is what a caller streaming a body needs - it can consume each chunk and forget it, so the
-/// buffer never holds more than one.
+/// One step of a **chunk-at-a-time** walk, giving where the next payload extent starts and how long it is without
+/// scanning past it. Unlike [`scan`] it never needs the whole message present, so a streaming caller can consume each
+/// chunk and forget it.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Step {
     /// Not enough bytes to decide yet.
@@ -482,10 +471,8 @@ pub(crate) fn compact(wire: &mut [u8]) -> Result<Compacted, ()> {
 mod tests {
     use super::*;
 
-    /// The default boto3-over-TLS PutObject body, byte-for-byte as captured on the dev box (boto3 1.37.9): one HTTP
-    /// chunk wrapping the whole
-    /// aws-chunked entity, whose checksum trailer is *inside* the entity;
-    /// the HTTP layer terminates bare.
+    /// The default boto3 PutObject body over TLS, byte for byte. One HTTP chunk wraps the whole aws-chunked entity,
+    /// whose checksum trailer is *inside* the entity, and the HTTP layer terminates bare.
     fn botocore_wire() -> Vec<u8> {
         let mut wire = b"8e\r\n64\r\n".to_vec();
         wire.extend_from_slice(&[b'A'; 100]);
@@ -584,9 +571,8 @@ mod tests {
         assert_eq!(&entity[..], b"hello");
     }
 
-    /// A chunk-at-a-time walk over the golden botocore wire: one payload extent, then the terminal chunk with its
-    /// trailer section. The whole point is that neither answer needs the rest of the message present, which is what
-    /// lets a caller consume each chunk and forget it.
+    /// A chunk-at-a-time walk over the golden wire gives one payload extent, then the terminal chunk with its trailer
+    /// section, and neither answer needs the rest of the message present.
     #[test]
     fn step_walks_a_body_one_chunk_at_a_time() {
         let wire = botocore_wire();
@@ -625,8 +611,8 @@ mod tests {
         }
     }
 
-    /// The shape boto3 actually sends over TLS: 128 KiB HTTP chunks wrapping a 1 MiB aws-chunked stream. The walk sees
-    /// only the outer layer - the inner size line is payload here, and stripping it is the S3 band's.
+    /// The shape boto3 sends over TLS, 128 KiB HTTP chunks wrapping a 1 MiB aws-chunked stream. The walk sees only the
+    /// outer layer, and the inner size line is payload.
     #[test]
     fn step_sees_only_the_outer_framing() {
         let mut wire = b"20000\r\n".to_vec();

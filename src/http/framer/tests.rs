@@ -73,14 +73,9 @@ fn validate_rejects_zero_caps() {
     );
 }
 
-/// While the framer is still asking for bytes, everything buffered is inside the bound it publishes.
-///
-/// The reactor closes `TooLarge` on the **buffer**; the chunk caps are measured on the **scanned** extent, and the
-/// scanner advances only over whole CRLF-delimited lines. A peer that pauses mid-trailer-line therefore parks a
-/// line's worth of bytes the caps never see.
-///
-/// The fixture asserts its own reach first: without exceeding `max_head + max_body + CHUNK_WIRE_OVERHEAD` it would
-/// hold against the three-term bound and prove nothing.
+/// While the framer is still asking for bytes, everything buffered is inside the bound it publishes. The chunk caps are
+/// measured on the scanned extent, so a peer pausing mid-trailer-line parks a line's worth of bytes the caps never see.
+/// The fixture first asserts it reaches past `max_head + max_body + CHUNK_WIRE_OVERHEAD`, or it would prove nothing.
 #[test]
 fn a_paused_trailer_line_is_inside_the_published_bound() {
     let cfg = HttpConfig {
@@ -400,14 +395,14 @@ fn chunked_single_arrival() {
 
 #[test]
 fn chunked_drip_fed() {
-    // Every prefix is More; the scan resumes rather than restarting.
+    // Every prefix asks for more, and the scan resumes rather than restarting.
     let mut c = conn();
     let head = b"PUT /k HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
     let mut raw = head.to_vec();
     raw.extend_from_slice(b"3\r\nfoo\r\n4\r\nbars\r\n0\r\n\r\n");
     for cut in 0..raw.len() {
-        // Inside the head the connection is still parked for a request;
-        // from the terminator on, a body is arriving and the scan says so.
+        // Inside the head the connection waits for a request, and from the terminator on a body is arriving and the
+        // scan says so.
         let want = if cut < head.len() {
             Framing::More
         } else {
@@ -489,19 +484,9 @@ fn chunked_decoded_over_cap_fails_413() {
     assert!(matches!(c.phase, Phase::Fail { status: 413, .. }));
 }
 
-/// The decoded cap holds on a *completing* arrival too.
-///
-/// `chunked_decoded_over_cap_fails_413` drives the mid-stream branch, where the scan answers `Ok(None)`; a body
-/// whose head, chunks and terminator land in one read never passes through it. Without the check on this arm the
-/// same bytes are accepted or refused on TCP segmentation alone, which is a `max_body` bypass for any client that
-/// can get its request into a single segment. The wire-cap twin on this arm is pinned by
-/// `chunked_wire_overhead_fails_400_on_completion`. The streaming cap bounds a body under one window too.
-///
-/// `max_body_bytes` is what the endpoint declares it accepts, and the delivery decision - stream it, or buffer it
-/// because it fits one window - is not what makes it apply. Gating the check on `body_len > STREAM_WINDOW` leaves
-/// every smaller body bounded only by `HttpConfig::max_body`, which is the buffer bound and is normally much
-/// larger, so an endpoint that declared a 1 KiB limit takes 100 KiB. The chunked leg checks its cap per chunk
-/// regardless of size.
+/// The streaming cap bounds a body under one window too. `max_body_bytes` is what the endpoint declares it accepts, and
+/// gating the check on `body_len > STREAM_WINDOW` would leave a smaller body bounded only by `max_body`, so an endpoint
+/// that declared 1 KiB takes 100 KiB.
 #[test]
 fn a_known_body_under_one_window_still_meets_the_stream_cap() {
     let cfg = HttpConfig {
@@ -537,6 +522,8 @@ fn a_known_body_under_one_window_still_meets_the_stream_cap() {
     );
 }
 
+/// The decoded cap holds on a *completing* arrival too. A body whose head, chunks and terminator land in one read never
+/// passes the mid-stream branch, and without the check on this arm a single-segment request bypasses `max_body`.
 #[test]
 fn chunked_decoded_over_cap_fails_413_on_completion() {
     let mut c = conn();
@@ -582,16 +569,9 @@ fn chunked_wire_overhead_fails_400() {
     assert!(matches!(c.phase, Phase::Fail { status: 400, .. }));
 }
 
-/// A body that is both over the cap **and** malformed answers the same status whichever way the peer's writes fell.
-///
-/// `scan` reports progress (`Ok(None)`) when an arrival ends on a chunk boundary and an error when it meets the
-/// malformation, and it keeps `decoded`/`consumed` across arrivals either way - so the two segmentations reach the
-/// same numbers and only the arm differs. With the caps checked in the progress arms alone, the identical bytes
-/// answered 413 split on a boundary and 400 delivered whole. That is TCP segmentation choosing an HTTP status, and
-/// the two say different things to a client: 413 means do not retry this body, 400 means it was malformed.
-///
-/// The control is the second half: a malformed body that is *not* over the cap must still answer the framing error,
-/// so this is a precedence rule and not "413 for everything".
+/// A body that is both over the cap **and** malformed answers the same status whichever way the peer's writes fell. 413
+/// and 400 say different things to a client, so TCP segmentation must not choose between them. The control is the
+/// second half, where a malformed body within the cap keeps its framing error.
 #[test]
 fn a_chunked_verdict_does_not_depend_on_segmentation() {
     let small = HttpConfig {
@@ -748,9 +728,7 @@ fn empty_buffer_wants_more() {
     assert_eq!(frame(b"", &mut c, &cfg()), Framing::More);
 }
 
-/// The shape boto3 sends over TLS, walked a chunk at a time: the head goes out alone, each HTTP chunk is declared
-/// as its own message, and the terminal chunk closes it. No verdict ever names more than one chunk, which is what
-/// keeps the reactor's buffer off the body's size.
+/// A `Content-Length` body above one window opens alone, then streams as full windows counted down against the length.
 #[test]
 fn a_known_length_body_streams_above_one_window() {
     let mut c = HttpConn::new_streaming((), nz(1 << 30));
@@ -773,9 +751,7 @@ fn a_known_length_body_streams_above_one_window() {
         } if n == len as u64
     ));
 
-    // The glue accepts and advances; windows count the length down, each a full window regardless of what is
-    // buffered - the exact read that completes one draws from the recv pool, and sizing to the buffered bytes
-    // instead shrinks every window to a chunk read.
+    // The glue accepts and advances. Windows count the length down, each a full window whatever is buffered.
     c.phase = Phase::StreamKnown {
         head: head.as_bytes().to_vec(),
         remaining: len as u64,
@@ -818,9 +794,8 @@ fn a_known_length_body_streams_above_one_window() {
         "the tail stops at the length; what follows is the next request"
     );
 
-    // The glue retires the phase on the exhausting delivery itself;
-    // a zero remaining reaching the framer is a codec bug and gets the farewell, not a delivery that could eat
-    // pipelined bytes.
+    // The glue retires the phase on the exhausting delivery, so a zero remaining here is a codec bug and gets the
+    // farewell rather than a delivery that could eat pipelined bytes.
     c.phase = Phase::StreamKnown {
         head: head.as_bytes().to_vec(),
         remaining: 0,
@@ -912,6 +887,9 @@ fn an_expecting_known_stream_opens_instead_of_dancing() {
     ));
 }
 
+/// The shape boto3 sends over TLS, walked a chunk at a time. The head goes out alone, each HTTP chunk is declared as
+/// its own message, and the terminal chunk closes it. No verdict names more than one chunk, which keeps the reactor's
+/// buffer off the body's size.
 #[test]
 fn a_streamed_body_is_declared_one_chunk_at_a_time() {
     let mut c = HttpConn::new_streaming((), nz(1 << 20));

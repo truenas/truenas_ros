@@ -7,10 +7,9 @@
 
 use std::mem::MaybeUninit;
 
-/// Header-count cap handed to `httparse`. Sized for S3: AWS caps user metadata at 2 KiB total, but short keys can
-/// spread that budget across ~130 `x-amz-meta-*` fields, on top of the auth/content/standard fields a signed request
-/// carries - so 96 slots rejected requests inside AWS's own limits. 160 covers the worst legitimate shape with headroom
-/// (the arrays this sizes are transient stack frames, 32 B a slot), and overflow maps to 431 rather than a parse wedge.
+/// Header-count cap handed to `httparse`. It admits about 130 short `x-amz-meta-*` fields, which a 2 KiB user-metadata
+/// budget allows, on top of the auth, content and standard fields a signed request carries. The arrays it sizes are
+/// transient stack frames (32 B a slot), and overflow answers 431 rather than wedging the parse.
 pub(crate) const MAX_HEADERS: usize = 160;
 
 /// How a request's body is framed on the wire.
@@ -69,12 +68,9 @@ pub(crate) struct Head<'a> {
 pub(crate) struct FrameFacts<'a> {
     /// Bytes the head occupies, including the terminating CRLFCRLF.
     pub len: usize,
-    /// The screened request-target, reduced to origin form. Computed here already; carried out so the screen can be
-    /// asserted on rather than only exercised - see `http::fuzz::head_facts`.
-    ///
-    /// That seam is its only reader and is `__fuzz`-gated, so every shipping build has a field nothing touches. Keep
-    /// the field unconditional: the struct's lifetime is borrowed through it alone, so gating it would leave `'a`
-    /// unconstrained and cost a `PhantomData` to say less.
+    /// The screened request-target, reduced to origin form, carried out so the fuzz seam (`http::fuzz::head_facts`) can
+    /// assert on the screen. Only that `__fuzz` seam reads it, but the field stays unconditional because the struct's
+    /// lifetime is borrowed through it alone.
     #[cfg_attr(not(feature = "__fuzz"), allow(dead_code))]
     pub target: &'a str,
     /// The declared body framing, or the status the connection should die with. Kept as a `Result` so the framer
@@ -115,19 +111,16 @@ impl Span {
     }
 }
 
-/// Where the parts of one tokenized head sit, so the glue can rebuild the [`Head`] view without tokenizing the same
-/// bytes again. That saves one tokenize per request, and one per window of a streamed body, because every window is
-/// dispatched with its head.
+/// Where the parts of one tokenized head sit, so the glue rebuilds the [`Head`] view without tokenizing the same bytes
+/// again, once per request and once per window of a streamed body.
 ///
-/// The parts are kept as offsets because the head bytes move between framing and delivery. The recv buffer is copied to
-/// owned storage when a body outgrows it, and the 100-continue dance, the stream phases and a park each copy the head
-/// aside. The bytes are the same every time, so an offset from the front still finds its part where a pointer would
-/// not.
+/// The parts are offsets from the front of the head because the head bytes move between framing and delivery, and an
+/// offset still finds its part where a pointer would not.
 ///
-/// The index describes the last head that tokenized complete. No other head is tokenized before that request's last
-/// dispatch, because only the framer's `Head` phase tokenizes, and a request in the dance, mid-stream or parked keeps
-/// the connection in another phase. The length check in [`head_view`] is a tripwire behind that reasoning, not a
-/// substitute for it, so a new framer phase that tokenizes has to keep it true.
+/// The index describes the last head that tokenized complete. Only the framer's `Head` phase tokenizes, and a request
+/// in the dance, mid-stream or parked keeps the connection in another phase, so no other head is tokenized before that
+/// request's last dispatch. The length check in [`head_view`] is a tripwire behind that reasoning, so a new framer
+/// phase that tokenizes has to keep it true.
 #[derive(Debug, Default)]
 pub(crate) struct HeadIndex {
     /// The head described, or `None` when none is.
@@ -135,10 +128,9 @@ pub(crate) struct HeadIndex {
     /// Name and value of each header in wire order. The storage is reused from one head to the next, so a connection
     /// allocates it once.
     headers: Vec<(Span, Span)>,
-    /// Set when a head is recorded and cleared by the first view of it, which debug builds compare with a tokenize of
-    /// the bytes in hand. The check runs once per head and not once per view, because a streamed body views its head
-    /// for every window and a tokenize on each one slows dispatch enough to change what the timing tests measure. An
-    /// atomic and not a `Cell`, so that the type is `Sync` in both builds.
+    /// Set when a head is recorded and cleared by the first view, which debug builds check against a tokenize. Once per
+    /// head and not per view, since a tokenize per streamed window slows dispatch enough to skew the timing tests.
+    /// Atomic so the type is `Sync` in both builds.
     #[cfg(debug_assertions)]
     unchecked: std::sync::atomic::AtomicBool,
 }
@@ -249,29 +241,16 @@ fn is_http_version(tok: &[u8]) -> bool {
     )
 }
 
-/// The status for a request line `httparse` rejected as `Error::Version`. It compares the eight version bytes against
-/// `HTTP/1.0` and `HTTP/1.1` and rejects everything else the same way - a real but unsupported version like `HTTP/2.0`,
-/// and the byte soup of a malformed request line alike. Answering 505 for the latter tells the client to retry at a
-/// lower HTTP version it never named, so read the version token off the request line and answer 505 only when it is a
-/// well-formed `HTTP/<DIGIT>.<DIGIT>`.
+/// The status for a request line `httparse` rejected as `Error::Version`, which it raises for an unsupported version
+/// like `HTTP/2.0` and for a malformed request line alike. Only a well-formed `HTTP/<DIGIT>.<DIGIT>` in the third field
+/// of `request-line = method SP request-target SP HTTP-version` (RFC 9112 sec. 3) answers 505, since 505 tells the
+/// client to retry at a version it may never have named. Anything else, including a version token after a space inside
+/// the target, is 400. Leading empty lines are skipped as `httparse` skips them (RFC 9112 sec. 2.2).
 ///
-/// "Read the version token off the request line" means the **third** field of `request-line = method SP request-target
-/// SP HTTP-version` (RFC 9112 sec. 3), not the tail after the last space. A malformed line whose last space-delimited
-/// token happens to be a well-formed version - `GET /a b HTTP/1.1`, a space inside the target - is byte soup, and
-/// taking the tail answered it 505: the outcome this function exists to prevent.
-///
-/// Leading empty lines are skipped for the same reason [`method_is_head`] skips them: `httparse` does (RFC 9112 sec.
-/// 2.2 robustness), so scanning from byte 0 reads an empty line as the request line and answers 400 for a real `\r\nGET
-/// / HTTP/2.0`.
-///
-/// `None` means **the request line has not terminated yet**, so there is no version token to read and no verdict to
-/// give. `httparse` reaches `Error::Version` before the field is whole: `parse_version` takes eight bytes at once when
-/// it has them and otherwise compares what it does have against the literal `HTTP/1.` a byte at a time, answering the
-/// error at the first mismatch (`httparse-1.10.1/src/lib.rs:782-788`). `HTTP/2` is refused at six bytes, two short of a
-/// token this would accept, and reading those six as the whole field answers 400 for a version that is well formed once
-/// the rest arrives - while the same request answers 505 when its line lands in one segment. Deciding on an
-/// unterminated line makes the status a function of TCP segmentation; the caller waits instead, bounded by
-/// [`HttpConfig::max_head`](super::HttpConfig::max_head) like every other partial head.
+/// `None` means the request line has not terminated yet. `httparse` raises `Error::Version` before the field is whole,
+/// comparing against `HTTP/1.` a byte at a time (`httparse-1.10.1/src/lib.rs:782-788`), so deciding now would make the
+/// status depend on TCP segmentation. The caller waits, bounded by
+/// [`HttpConfig::max_head`](super::HttpConfig::max_head).
 fn version_status(buf: &[u8]) -> Option<u16> {
     let mut buf = buf;
     while let [b'\r', b'\n', rest @ ..] | [b'\n', rest @ ..] = buf {
@@ -287,13 +266,12 @@ fn version_status(buf: &[u8]) -> Option<u16> {
     })
 }
 
-/// Shared tokenize step: `httparse` plus the version and Host checks every caller applies. `Ok(None)` means "need more
-/// bytes"; `Err(status)` is the response status the connection should die with (400 malformed / Host rules, 431 too
-/// many headers, 505 unsupported version).
+/// Shared tokenize step, `httparse` plus the version and Host checks every caller applies. `Ok(None)` means more bytes
+/// are needed, and `Err(status)` is the status the connection dies with (400 malformed or Host rules, 431 too many
+/// headers, 505 unsupported version).
 ///
-/// `slots` is uninitialized on purpose: httparse writes only the slots it fills, and `req.headers` is that prefix.
-/// Initializing all `MAX_HEADERS` first is a 5 KiB stack fill per head, on the reactor thread, for slots a typical head
-/// never reaches.
+/// `slots` is uninitialized on purpose. httparse writes only the slots it fills, and initializing all `MAX_HEADERS`
+/// would be a 5 KiB stack fill per head on the reactor thread.
 #[allow(clippy::type_complexity)] // one parse's outputs, not an API
 fn tokenize<'s, 'b>(
     buf: &'b [u8],
@@ -329,26 +307,16 @@ fn tokenize<'s, 'b>(
     Ok(Some((req, len, version, target)))
 }
 
-/// RFC 9112 sec. 3.2: which request-target forms an **origin** server serves, and what the effective target is.
+/// RFC 9112 sec. 3.2, which request-target forms an **origin** server serves and what the effective target is.
 ///
-/// The codec refuses every other differential in this class with a rule of its own (duplicate Host, CL+TE, obs-fold, a
-/// space before a colon, a NUL in a value), and this one is the same shape. An absolute-form target carries its own
-/// authority, and sec. 3.2.1 says an origin server "MUST ignore the received Host header field (if any) and instead use
-/// the host information of the request-target". Left unchecked, two authorities arrive in one request and nothing
-/// reconciles them: a front end routing on one and this server on the other disagree about which bucket the request
-/// names.
+/// An absolute-form target carries its own authority, which sec. 3.2.1 says replaces `Host`. Left unchecked, two
+/// authorities arrive in one request, and a front end routing on one and this server on the other disagree about what
+/// the request names. So absolute-form is accepted (sec. 3.2.2) only when its authority *equals* `Host`, and is reduced
+/// to its path so every handler sees one target shape. `userinfo` and an empty authority fall out as mismatches.
 ///
-/// Absolute-form is accepted, as sec. 3.2.2 requires, on the condition that its authority *equals* the `Host` field -
-/// which is how "use the target's authority" is honoured without a second routing key - and is then reduced to its
-/// path, so every handler sees one target shape. `userinfo` (which sec. 4.2.1 forbids a sender from generating) and an
-/// empty authority fall out of that comparison as mismatches.
-///
-/// Refused: authority-form, which belongs to `CONNECT` and a proxy; `*` outside `OPTIONS`; an absolute-form with no
-/// path to reduce to (`http://h?q` is legal and its origin-form equivalent is not a substring of it, so there is
-/// nothing to hand on); and any other shape, which is a client talking to something this is not.
-///
-/// `//host/path` starts with `/` and is ordinary origin-form - legal, and passed through. A consumer re-parsing a
-/// target as a URI reference must not read that as an authority.
+/// Refused are authority-form (`CONNECT`, for a proxy), `*` outside `OPTIONS`, an absolute-form with no path to reduce
+/// to (`http://h?q`), and any other shape. `//host/path` is ordinary origin-form and passes through, so a consumer
+/// re-parsing a target as a URI reference must not read that as an authority.
 fn target_check<'b>(method: &str, target: &'b str, host: Option<&[u8]>) -> Result<&'b str, u16> {
     if target.starts_with('/') {
         return Ok(target); // origin-form: the shape this server serves
@@ -395,15 +363,12 @@ fn view<'b>(h: &httparse::Header<'b>) -> HeaderView<'b> {
     }
 }
 
-/// Whether `value` is a well-formed `Host`: `uri-host [ ":" port ]`, RFC 3986 sec. 3.2.2-3.2.3.
+/// Whether `value` is a well-formed `Host`, `uri-host [ ":" port ]` per RFC 3986 sec. 3.2.2-3.2.3.
 ///
-/// The point is what it excludes. `@`, SP, `/` and every control character are outside `reg-name`, so a `userinfo`, a
-/// path, or a header-splitting byte cannot ride into the routing key - and [`target_check`] compares an absolute-form
-/// authority against *this* value, so an unchecked `Host` is also how a malformed authority passes that comparison by
-/// matching itself.
-///
-/// `reg-name` admits the empty string, but an origin server cannot route a request that names no authority, and
-/// `target_check` documents an empty authority as falling out as a mismatch - true only if it never matches.
+/// The point is what it excludes. `@`, SP, `/` and every control byte are outside `reg-name`, so a `userinfo`, a path
+/// or a header-splitting byte cannot ride into the routing key. [`target_check`] compares an absolute-form authority
+/// against this value, so an unchecked `Host` would let a malformed authority match itself. The empty `reg-name` is
+/// refused too, since `target_check` relies on an empty authority never matching.
 fn host_is_valid(value: &[u8]) -> bool {
     if value.is_empty() {
         return false;
@@ -453,13 +418,9 @@ fn host_is_valid(value: &[u8]) -> bool {
         })
 }
 
-/// RFC 9112 sec. 3.2: an HTTP/1.1 request without a `Host` field, or any request with more than one, MUST be
-/// answered 400. Enforced at tokenize time so a Host-less request never reaches routing code (virtual-hosted S3 derives
-/// the bucket from `Host`).
-///
-/// The value is validated here too, per RFC 9110 sec. 7.2 - a `Host` whose field value is not a valid `uri-host` is
-/// answered 400 rather than handed on. Counting the field lines and passing the bytes through unread left every
-/// malformed authority reaching bucket derivation.
+/// RFC 9112 sec. 3.2 makes an HTTP/1.1 request without a `Host` field, or any request with more than one, a 400. It is
+/// enforced at tokenize time so such a request never reaches routing code that derives a name from `Host`. The value
+/// must also be a valid `uri-host` (RFC 9110 sec. 7.2), or it is answered 400 rather than handed on.
 fn host_check<'h>(headers: impl Iterator<Item = HeaderView<'h>>, version: Version) -> Result<Option<&'h [u8]>, u16> {
     let mut hosts = headers.filter(|h| h.name.eq_ignore_ascii_case("host"));
     match (hosts.next(), version) {
@@ -524,11 +485,9 @@ pub(crate) fn head_view<'a, 'buf>(
     parse_head(head, headers)
 }
 
-/// Whether raw head bytes name the `HEAD` method. `httparse` skips empty lines before the request line (RFC 9112 sec.
-/// 2.2 robustness), so this must skip them too: judging the method from byte 0 would call `\r\nHEAD ...`
-/// a non-HEAD, and its farewell would carry a body the client reads as the next response's head. Usable on heads no
-/// facts were parsed from (the malformed / missing-Host / bad-version failures), where the parsed method does not
-/// exist.
+/// Whether raw head bytes name the `HEAD` method. It skips empty lines before the request line as `httparse` does (RFC
+/// 9112 sec. 2.2), or `\r\nHEAD ...` would be judged a non-HEAD and its farewell would carry a body the client reads as
+/// the next response's head. Usable on heads no facts were parsed from.
 pub(crate) fn method_is_head(mut head: &[u8]) -> bool {
     while let [b'\r', b'\n', rest @ ..] | [b'\n', rest @ ..] = head {
         head = rest;
@@ -578,28 +537,21 @@ impl Head<'_> {
             .map(|h| h.value)
     }
 
-    /// The declared body framing, applying RFC 9112 sec. 6.3's receiver rules plus the codec's own screens:
+    /// The declared body framing, applying RFC 9112 sec. 6.3's receiver rules plus the codec's own screens.
     ///
-    /// - `Transfer-Encoding` with `chunked` as the sole coding -> chunked; a lone well-formed `Content-Length` sent
-    ///   alongside is **ignored** (TE wins - the receiver rule). botocore does NOT send this pair:
-    ///   `httpchecksum.py:486-489` deletes `Content-Length` when it sets `Transfer-Encoding: chunked`, putting the
-    ///   decoded length in `X-Amz-Decoded-Content-Length` instead. The tolerance is for other
-    ///   clients, not for boto;
-    /// - codings before a final `chunked` (`gzip, chunked`) -> 501 (framing
-    ///   is determinable, the coding is unimplemented);
-    /// - `chunked` missing, repeated, or non-final -> 400 (body length
-    ///   unknowable - the smuggling class);
-    /// - `Transfer-Encoding` on HTTP/1.0 -> 400 (RFC 9112 sec. 6.1: treat the
-    ///   framing as faulty);
-    /// - multiple `Content-Length` values -> 400 even when they agree (and even alongside TE) - agreement is what a
-    ///   smuggling payload would
-    ///   fake;
-    /// - non-digit / overflowing `Content-Length` -> 400;
-    /// - neither header -> `Known(0)` (no body).
+    /// - `Transfer-Encoding` with `chunked` as the sole coding is chunked, and a lone well-formed `Content-Length` sent
+    ///   alongside is **ignored** (TE wins, the receiver rule). A malformed one is still 400.
+    /// - Codings before a final `chunked` (`gzip, chunked`) are 501, since the framing is determinable and the coding
+    ///   is not implemented.
+    /// - `chunked` missing, repeated, or not final is 400, since the body length is unknowable (the smuggling class).
+    /// - `Transfer-Encoding` on HTTP/1.0 is 400 (RFC 9112 sec. 6.1 says to treat the framing as faulty).
+    /// - Multiple `Content-Length` values are 400 even when they agree, and even alongside TE, since agreement is what
+    ///   a smuggling payload would fake.
+    /// - A non-digit or overflowing `Content-Length` is 400.
+    /// - Neither header is `Known(0)`, no body.
     ///
-    /// At runtime the framer reads this via [`FrameFacts`]. Both call [`body_from`] over the same header views, so this
-    /// is the same expression rather than a second reading: `frame_facts_agrees_with_ parse_head` states each case's
-    /// verdict outright and this method is only the cross-check that the two callers still see the same views.
+    /// The framer reads the same [`body_from`] over the same views through [`FrameFacts`], so this is only the tests'
+    /// cross-check, and `frame_facts_agrees_with_parse_head` states each verdict outright.
     #[cfg(test)]
     pub fn body(&self) -> Result<BodyKind, u16> {
         body_from(self.views(), self.version)
@@ -607,24 +559,17 @@ impl Head<'_> {
 
     /// Whether the client asked for a `100 Continue` interim response.
     ///
-    /// True only for HTTP/1.1: RFC 9110 sec. 10.1.1 says a server MUST ignore the expectation on an HTTP/1.0 request
-    /// (and MUST NOT send interim responses to a 1.0 client that would parse one as final). `Expect` is a list-typed
-    /// field, so the token is honored wherever it appears -- any field line, any list position.
-    ///
-    /// At runtime the framer reads this via [`FrameFacts`]. Only the version guard is written twice; the token search
-    /// is the same [`has_token`] call on both sides, so - like [`body`](Self::body) - the verdict this is checked
-    /// against is the one stated in `frame_facts_agrees_with_parse_head`, not this method's answer.
+    /// True only for HTTP/1.1, since RFC 9110 sec. 10.1.1 says a server MUST ignore the expectation on an HTTP/1.0
+    /// request. `Expect` is list-typed, so the token counts on any field line and at any list position. The framer
+    /// reads the same check through [`FrameFacts`], so this is the tests' cross-check.
     #[cfg(test)]
     pub fn expects_continue(&self) -> bool {
         self.version == Version::Http11 && has_token(self.views(), "expect", b"100-continue")
     }
 
-    /// Whether the connection persists after this exchange, per the version default and any `Connection` header tokens.
-    /// `Connection` is list-typed: tokens count no matter which field line carries them (RFC 9110 sec. 5.3 - repeated
-    /// field lines are one combined list).
-    ///
-    /// At runtime the glue reads this via [`response_disposition`](Self::response_disposition); the method remains as
-    /// the tests' oracle asserting the one-pass read agrees.
+    /// Whether the connection persists after this exchange, per the version default and any `Connection` tokens on any
+    /// field line (RFC 9110 sec. 5.3). The glue reads [`response_disposition`](Self::response_disposition), and this
+    /// remains the tests' oracle.
     #[cfg(test)]
     pub fn keep_alive(&self) -> bool {
         // `close` decides on both versions: RFC 9112 sec. 9.6 makes it a receiver obligation regardless of the version
@@ -638,16 +583,11 @@ impl Head<'_> {
         }
     }
 
-    /// Whether this head carried both a `Content-Length` and a `Transfer-Encoding` field. The codec resolves the pair
-    /// by letting the transfer coding win, per the receiver rule in RFC 9112 section 6.3, and ignores the length. A
-    /// front end that prefers the length instead would frame the same bytes with a different message boundary, and that
-    /// difference is the CL.TE request smuggling primitive. The server keeps the coding preference for client
-    /// compatibility - not for botocore, which deletes `Content-Length` rather than sending the pair
-    /// (`httpchecksum.py:486-489`) - and instead makes the exchange non pipelinable. The response glue forces the
-    /// connection to close on a conflict, so no later request shares the connection with a smuggled prefix.
-    ///
-    /// At runtime the glue reads this via [`response_disposition`](Self::response_disposition); the method remains as
-    /// the tests' oracle.
+    /// Whether this head carried both a `Content-Length` and a `Transfer-Encoding` field. The codec lets the transfer
+    /// coding win (RFC 9112 sec. 6.3), and a front end preferring the length would frame the same bytes differently,
+    /// which is the CL.TE smuggling primitive. So the response glue closes the connection on a conflict, and no later
+    /// request shares it with a smuggled prefix. The glue reads [`response_disposition`](Self::response_disposition),
+    /// and this remains the tests' oracle.
     #[cfg(test)]
     pub fn cl_te_conflict(&self) -> bool {
         let mut has_cl = false;
@@ -662,13 +602,13 @@ impl Head<'_> {
         has_cl && has_te
     }
 
-    /// The two facts the response glue needs, resolved in a single pass over the header list: `(keep_alive,
-    /// cl_te_conflict)`. Equivalent to [`keep_alive`](Self::keep_alive) and [`cl_te_conflict`](Self::cl_te_conflict)
-    /// (kept as the oracle), computed together so `respond` walks the headers once rather than twice.
+    /// The two facts the response glue needs, `(keep_alive, cl_te_conflict)`, resolved in one pass over the headers.
+    /// Equal to [`keep_alive`](Self::keep_alive) and [`cl_te_conflict`](Self::cl_te_conflict), which stay as the
+    /// oracle.
     ///
-    /// The `Connection` read below open-codes `has_token`'s RFC 9110 sec. 5.3 list grammar (comma split, OWS trim,
-    /// case-fold) rather than calling it, so the walk stays single-pass; a grammar change in `has_token` must land here
-    /// too, and `response_disposition_agrees_with_the_oracle` is the fence that catches drift between the two readers.
+    /// The `Connection` read open-codes `has_token`'s list grammar (comma split, OWS trim, case-fold) to stay
+    /// single-pass, so a grammar change in `has_token` must land here too.
+    /// `response_disposition_agrees_with_the_oracle` catches drift between the two.
     pub fn response_disposition(&self) -> (bool, bool) {
         let mut conn_close = false;
         let mut conn_keep = false;
@@ -690,11 +630,8 @@ impl Head<'_> {
                 has_te = true;
             }
         }
-        // `close` wins on both versions. RFC 9112 sec. 9.6 states it as a receiver obligation ("a server that receives
-        // a close connection option MUST initiate closure after it sends the final response"), not as the 1.1 default's
-        // negation - so an HTTP/1.0 request carrying `keep-alive` *and* `close` must close. Reading only `keep-alive`
-        // on 1.0 answered that request `Connection: keep-alive` and went on serving the socket, which is the two ends
-        // disagreeing about connection reuse - the shape a chain in front desynchronizes on.
+        // `close` wins on both versions. RFC 9112 sec. 9.6 makes it a receiver obligation and not the 1.1 default's
+        // negation, so an HTTP/1.0 request carrying `keep-alive` *and* `close` must close.
         let keep_alive = !conn_close
             && match self.version {
                 Version::Http11 => true,
@@ -787,9 +724,9 @@ pub(crate) fn is_token_byte(b: u8) -> bool {
 }
 
 /// Whether a field value carries a byte a field line may not. RFC 9110 sec. 5.5 admits only field-vchar (VCHAR
-/// `0x21..=0x7E` / obs-text `0x80..=0xFF`), SP, and HTAB; every other byte is rejected - the CR/LF/NUL that split a
-/// field line, and the rest of the C0 controls and DEL. Applied to handler-emitted response values (which S3 echoes
-/// verbatim from `x-amz-meta-*`) and to trailer values off the wire; mirrors httparse's request-side header-value map.
+/// `0x21..=0x7E`, obs-text `0x80..=0xFF`), SP and HTAB, so the CR, LF and NUL that split a field line, the other C0
+/// controls and DEL are all refused. Applied to handler-emitted response values and to trailer values off the wire,
+/// mirroring httparse's request-side header-value map.
 pub(crate) fn has_field_break(value: &[u8]) -> bool {
     value.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f)
 }
@@ -813,11 +750,8 @@ fn parse_content_length(v: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
 
-    /// RFC 9110 sec. 7.2: a `Host` whose field value is not a valid `uri-host` is a 400, on **every** request shape.
-    ///
-    /// Origin-form is the whole of real traffic and runs no authority comparison, so hardening `target_check` alone
-    /// would have left it open. The value is what virtual-hosted S3 derives a bucket from, so `@`, SP and `/` reaching
-    /// it are a routing key carrying a userinfo or a path.
+    /// A `Host` whose value is not a valid `uri-host` is a 400 on every request shape (RFC 9110 sec. 7.2), including
+    /// origin-form, which runs no authority comparison.
     #[test]
     fn a_malformed_host_is_refused_on_origin_form() {
         let status = |buf: &[u8]| {
@@ -922,12 +856,8 @@ mod tests {
         });
     }
 
-    /// Which request-target forms an origin server serves.
-    ///
-    /// The codec enforces Host presence and uniqueness because routing is Host-based, and then took the target
-    /// verbatim - so an absolute-form request carried a *second* authority that nothing reconciled with the first. A
-    /// front end keyed on one and this server on the other disagree about which bucket a request names, and an S3 layer
-    /// deriving a key from the target reads `http:` as its first path segment.
+    /// Which request-target forms an origin server serves. An absolute-form target carries a second authority, which
+    /// must agree with `Host`, and is reduced to its path.
     #[test]
     fn request_target_forms() {
         let status = |buf: &[u8]| {
@@ -1021,10 +951,8 @@ mod tests {
         }
     }
 
-    /// The version verdict is a property of the request, not of how the socket cut it. `httparse` answers
-    /// `Error::Version` before the field is whole (`parse_version` compares against the literal `HTTP/1.` a byte at a
-    /// time below eight, `httparse-1.10.1/src/lib.rs:782-788`), so `HTTP/2.0` is refused at `HTTP/2` - and reading that
-    /// as the version answered the same request 400 when its request line arrived split and 505 when it arrived whole.
+    /// The version verdict is a property of the request, not of how the socket cut it. `httparse` refuses `HTTP/2.0` at
+    /// `HTTP/2`, before the field is whole, so every prefix must answer need-more or 505 and never 400.
     #[test]
     fn the_version_verdict_does_not_depend_on_segmentation() {
         for v in [&b"HTTP/2.0"[..], b"HTTP/0.9", b"HTTP/9.9"] {
@@ -1079,8 +1007,7 @@ mod tests {
             body(b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"),
             Ok(BodyKind::Chunked)
         );
-        // TE + CL together: TE wins, CL ignored. NOT a botocore shape - it deletes Content-Length when it sets chunked
-        // (`httpchecksum.py:486-489`); this covers other clients.
+        // TE and CL together, TE wins and CL is ignored.
         assert_eq!(
             body(b"PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n"),
             Ok(BodyKind::Chunked)
@@ -1277,11 +1204,8 @@ mod tests {
             b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
             b"PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\n",
             b"PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n",
-            // The other two axes the open-coded read owns. Field names and list tokens are both matched
-            // case-insensitively (RFC 9110 sec. 5.3, sec. 5.1), and `close` decides wherever it appears in the combined
-            // list - including alongside `keep-alive` on 1.1, where the version default would otherwise carry. Without
-            // these the fence passes a reader that compares either one exactly, or splits the list on the wrong
-            // delimiter.
+            // The axes the open-coded read owns. Field names and list tokens match case-insensitively (RFC 9110 sec.
+            // 5.3, sec. 5.1), and `close` decides anywhere in the combined list, even beside `keep-alive` on 1.1.
             b"GET / HTTP/1.1\r\nHost: h\r\nConnection: CLOSE\r\n\r\n",
             b"GET / HTTP/1.1\r\nHost: h\r\nconnection: Close\r\n\r\n",
             b"GET / HTTP/1.1\r\nHost: h\r\nConnection: keep-alive, close\r\n\r\n",
@@ -1318,9 +1242,8 @@ mod tests {
         );
     }
 
-    /// `Connection: close` closes on **both** versions (RFC 9112 sec. 9.6), so a 1.0 request that carries `keep-alive`
-    /// alongside it does not persist. Kept next to the 1.1 twin: the two versions differing on the same field value is
-    /// the bug this pins.
+    /// `Connection: close` closes on **both** versions (RFC 9112 sec. 9.6), so a 1.0 request carrying `keep-alive`
+    /// alongside it does not persist.
     #[test]
     fn close_beats_keep_alive_on_http10_too() {
         for raw in [
@@ -1355,11 +1278,8 @@ mod tests {
 
     #[test]
     fn frame_facts_agrees_with_parse_head() {
-        // Each case carries what the framing rules say it means, written out here. Asserting the two readers against
-        // *each other* alone cannot fail: `frame_facts` and `Head::body` both evaluate `body_from` over the same header
-        // views, so the comparison is one expression against itself and any defect in `body_from` moves both sides
-        // together. The stated expectation is what gives this test a verdict of its own; the cross-check then says the
-        // two callers still read the same views.
+        // Each case states its verdict outright. `frame_facts` and `Head::body` both evaluate `body_from` over the same
+        // views, so comparing them alone cannot fail, and the stated expectation is what gives this test a verdict.
         type Case = (&'static [u8], Result<BodyKind, u16>, bool);
         let reqs: &[Case] = &[
             (b"GET / HTTP/1.1\r\nHost: h\r\n\r\n", Ok(BodyKind::Known(0)), false),

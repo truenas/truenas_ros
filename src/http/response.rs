@@ -1,14 +1,12 @@
-//! The consumer-facing response type and its wire serialization. The codec owns the framing-critical headers -
-//! `Content-Length`, `Connection`, `Date` - and silently drops consumer attempts to set them: a handler that could
-//! desynchronize framing from the actual byte stream would reintroduce the smuggling class the head parser screens out.
-//! The single exception is [`HttpResponse::head_content_length`], honored only when the request was a HEAD, where the
-//! protocol forbids a body outright and so leaves nothing for a declared length to desynchronize. The same policy
-//! covers the header bytes themselves: names that are not RFC 9110 tokens and values with any byte outside RFC 9110's
-//! field-value grammar are dropped too, so handler-echoed input can never split a response, and statuses that don't fit
-//! the three-digit status-line grammar are replaced with 500. The screen runs once per field: [`HttpResponse::header`]
-//! applies it as the field is added, and a consumer that builds its fields ahead of the response applies it through
-//! [`ScreenedHeader::new`], which is the only way to make the value [`HttpResponse::header_screened`] stores unscreened
-//! — so there is no path onto the wire that the rule has not seen.
+//! The consumer-facing response type and its wire serialization.
+//!
+//! The codec owns the framing-critical headers, `Content-Length`, `Connection`, `Date` and `Transfer-Encoding`, and
+//! drops a handler's attempt to set them, since a handler that could desynchronize framing would reopen the smuggling
+//! class the head parser screens out. [`HttpResponse::head_content_length`] is the one exception, honored only on a
+//! HEAD, where no body follows to disagree. Header names that are not RFC 9110 tokens and values with a byte outside
+//! its field-value grammar are dropped too, so handler-echoed input cannot split a response, and a status outside
+//! `200..=999` becomes 500. Every field is screened once, by [`HttpResponse::header`] or by [`ScreenedHeader::new`], so
+//! nothing reaches the wire unscreened.
 
 use std::borrow::Cow;
 
@@ -19,12 +17,9 @@ use super::head::{has_field_break, is_token_byte};
 
 /// A response under construction, returned by the consumer's handler.
 ///
-/// Builder-style: `HttpResponse::new(200).header("etag", "\"abc\"").body(xml)`. Status text, `Date`, and
-/// `Content-Length` are supplied by the codec at serialization time.
-///
-/// Header names, values, and the body are stored as `Cow<'static, _>`:
-/// literals (the overwhelmingly common case for names, and common for values and error bodies) are kept as borrows, so
-/// building a response from static parts allocates nothing.
+/// Built as `HttpResponse::new(200).header("etag", "\"abc\"").body(xml)`. The codec supplies the status text, `Date`
+/// and `Content-Length` at serialization. Names, values and the body are `Cow<'static, _>`, so a response built from
+/// literals allocates nothing.
 #[derive(Debug)]
 pub struct HttpResponse {
     pub(crate) status: u16,
@@ -64,11 +59,9 @@ impl BodySource {
     }
 }
 
-/// Conversion into stored response bytes - the `Cow`-aware analogue of `Into<Vec<u8>>` for [`HttpResponse::header`]
-/// values and [`HttpResponse::body`]. (`Into<Cow<'static, [u8]>>` alone would reject the `&'static str` and `String`
-/// shapes handlers pass most, since std
-/// provides no str-to-byte-`Cow` conversions.) Static inputs stay borrows;
-/// owned inputs move without copying.
+/// Conversion into stored response bytes, the `Cow`-aware analogue of `Into<Vec<u8>>` for [`HttpResponse::header`]
+/// values and [`HttpResponse::body`]. `Into<Cow<'static, [u8]>>` alone would reject the `&'static str` and `String`
+/// shapes handlers pass most. Static inputs stay borrows and owned inputs move without copying.
 pub trait IntoBytes {
     /// Convert into the bytes to store.
     fn into_bytes(self) -> Cow<'static, [u8]>;
@@ -157,9 +150,8 @@ impl ScreenedHeader {
 /// case never touches the heap.
 const INLINE_HEADERS: usize = 8;
 
-/// Response headers, stored inline until they spill. The first [`INLINE_HEADERS`] pairs live in a stack array; only
-/// fields past that go to `spilled`, whose backing `Vec` stays unallocated until then. The common case - an S3 200
-/// carries a handful of fields - allocates nothing for its headers.
+/// Response headers, stored inline until they spill. The first [`INLINE_HEADERS`] pairs live in an array and only
+/// fields past that go to `spilled`, so a typical response allocates nothing for its headers.
 #[derive(Debug)]
 pub(crate) struct Headers {
     /// The first fields, in wire order; `inline_len` slots are filled.
@@ -203,20 +195,11 @@ impl Headers {
 impl HttpResponse {
     /// Start a response with `status` (e.g. `200`), empty body, no headers.
     ///
-    /// The status line's grammar is exactly three digits (RFC 9112 sec. 4); a status outside `100..=999` would
-    /// serialize as a head no client can parse, so it is replaced with `500` here rather than desynchronizing the
-    /// connection at the wire.
-    ///
-    /// A **1xx is replaced with `500` for the same reason**, one layer up. This type is the codec's *final* response
-    /// for a message, and RFC 9110 sec. 15.2 makes 1xx interim: a client that receives one keeps waiting for the final
-    /// response, while the codec has already answered the message and re-armed for the next request. The exchange then
-    /// hangs until a timeout, or - on a pipelined connection - the peer pairs every later response with the wrong
-    /// request. `101` is worse still:
-    /// the peer is told the connection is no longer HTTP/1.1 while this codec goes on framing HTTP/1.1 requests on it.
-    ///
-    /// The one interim this codec sends, the `Expect: 100-continue` line, is written as raw bytes by the framing glue
-    /// and never travels through this type, so nothing legitimate is refused here. A handler that wants a protocol
-    /// switch needs a protocol that models one ([`ws`](crate::ws)), not a status code.
+    /// A status outside `200..=999` is replaced with `500`. Below 100 or above 999 it would serialize as a head no
+    /// client can parse (RFC 9112 sec. 4). A 1xx is interim (RFC 9110 sec. 15.2), so a client receiving one keeps
+    /// waiting while the codec has already answered and re-armed, and a `101` would tell the peer the connection left
+    /// HTTP/1.1. The one interim this codec sends, `100 Continue`, is written as raw bytes and never travels through
+    /// this type. A protocol switch needs a protocol that models one ([`ws`](crate::ws)).
     pub fn new(status: u16) -> Self {
         Self {
             status: if (200..=999).contains(&status) { status } else { 500 },
@@ -227,12 +210,10 @@ impl HttpResponse {
         }
     }
 
-    /// Append a header. `Content-Length`, `Connection`, `Date`, and `Transfer-Encoding` are codec-owned and ignored
-    /// here (see module docs). Also ignored: names that are not RFC 9110 tokens and values with a byte outside RFC 9110
-    /// sec. 5.5's field-value grammar (CR, LF, NUL, the other C0 controls, or DEL) - serializing those verbatim would
-    /// let handler-echoed bytes terminate the field line early and inject response framing (response splitting).
-    ///
-    /// A `&'static str` name and a static value are stored as borrows -- no allocation.
+    /// Append a header. `Content-Length`, `Connection`, `Date` and `Transfer-Encoding` are codec-owned and ignored, and
+    /// so are names that are not RFC 9110 tokens and values with a byte outside RFC 9110 sec. 5.5's field-value grammar
+    /// (CR, LF, NUL, the other C0 controls or DEL), which would let handler-echoed bytes split the response. A
+    /// `&'static str` name and a static value are stored as borrows.
     pub fn header(mut self, name: impl Into<Cow<'static, str>>, value: impl IntoBytes) -> Self {
         let name = name.into();
         let value = value.into_bytes();
@@ -258,32 +239,24 @@ impl HttpResponse {
         self
     }
 
-    /// Send `len` bytes of `file` starting at `offset` as this response's body, read on the server's ring and sent in
-    /// bounded chunks (`ServerConfig::fs_body_chunk`) rather than buffered - so a multi-GB body costs two chunk
-    /// buffers, never its own size. A range is an `offset`/`len`; no separate mechanism.
+    /// Send `len` bytes of `file` from `offset` as this response's body, read on the server's ring and sent in bounded
+    /// chunks (`ServerConfig::fs_body_chunk`) rather than buffered. A range is an `offset` and `len`.
     ///
-    /// `len` is mandatory and IS the `Content-Length` - a snapshot the reply is held to. Reads are clamped to it, so a
-    /// file *grown* mid-send is invisible; a file that *shrinks* below it closes the connection mid-body
-    /// ([`CloseReason`](crate::net::server::CloseReason) `::FileBodyTruncated`) - the framing cannot renegotiate a
-    /// declared length, and a short body presented as complete would be a lie.
+    /// `len` IS the `Content-Length`. Reads are clamped to it, so growth mid-send is invisible, and a file that shrinks
+    /// below it closes the connection mid-body ([`CloseReason`](crate::net::server::CloseReason)
+    /// `::FileBodyTruncated`). On a HEAD the length is declared
+    /// ([`head_content_length`](HttpResponse::head_content_length) still overrides it) and no read is issued, and on a
+    /// bodyless status (1xx/204/304) the handle is dropped unread. This and [`body`](HttpResponse::body) set the same
+    /// slot, and the last call wins.
     ///
-    /// The elision rules are [`body`](HttpResponse::body)'s: on a HEAD the length is declared
-    /// ([`head_content_length`](HttpResponse::head_content_length) still overrides it) and **no read is issued**; on a
-    /// bodyless status (1xx/204/304) the handle is dropped unread and nothing is sent. One body, one origin: this and
-    /// `body` set the same slot, last call wins.
+    /// `offset + len` must fit in an `i64`, since `u64::MAX` reaches the ring as io_uring's "read from the file's own
+    /// position" sentinel. A range that does not fit closes the connection
+    /// ([`CloseReason`](crate::net::server::CloseReason)`::FileBody`), which is what a suffix range computed as
+    /// `size - n` looks like once it has wrapped, so clamp that at zero.
     ///
-    /// `offset + len` must fit in an `i64`: the offset reaches the ring as a signed `loff_t`, where `u64::MAX` is
-    /// io_uring's "read from the file's own position" sentinel and would serve the wrong bytes behind a correct
-    /// `Content-Length`. A range that does not fit closes the connection
-    /// ([`CloseReason`](crate::net::server::CloseReason)`::FileBody`) rather than reaching the kernel - which is what a
-    /// suffix range computed as `size - n` looks like once it has wrapped, so clamp that at zero.
-    ///
-    /// The handle moves into the response and the reactor holds it until the last chunk flushes or the connection
-    /// dies - dropping the caller's other clones never closes the fd under an in-flight read. Serving this requires the
-    /// server's fs pool (`ServerConfig::fs_ops`); without one the connection is closed at reply time rather than a
-    /// short body sent. A peer that stops reading mid-body is reclaimed only by `ServerConfig::send_timeout` or
-    /// `tcp_user_timeout` (TCP zero-window probing never gives up on its own), and a large body pins the connection's
-    /// slot for the duration -- set both when serving untrusted peers.
+    /// The reactor holds the handle until the last chunk flushes or the connection dies. Serving this needs the
+    /// server's fs pool (`ServerConfig::fs_ops`), or the connection closes at reply time. A peer that stops reading is
+    /// reclaimed only by `ServerConfig::send_timeout` or `tcp_user_timeout`, so set both when serving untrusted peers.
     #[cfg(feature = "uring-fs")]
     pub fn file_body(mut self, file: crate::uring_fs::File, offset: u64, len: u64) -> Self {
         self.body = BodySource::File { file, offset, len };
@@ -291,18 +264,12 @@ impl HttpResponse {
     }
 
     /// Declare the `Content-Length` this response reports **when it answers a HEAD**, in place of the measured body
-    /// length. Ignored otherwise, and ignored on a bodyless status (1xx/204/304), which carries no `Content-Length` at
-    /// all.
+    /// length. Ignored on every other request, and on a bodyless status (1xx/204/304), which carries no
+    /// `Content-Length`.
     ///
-    /// A HEAD answer is the one place a declared length cannot desynchronize framing: RFC 9110 sec. 9.3.2 forbids
-    /// content on it, the serializer elides the body regardless, and the client reads zero body bytes whatever the
-    /// header says. So the usual codec-owned rule ([`HttpResponse::header`] drops a `Content-Length` outright) can be
-    /// relaxed here without opening the smuggling class it exists to close -- and only here, which is why this is a
-    /// typed method on the HEAD path rather than a header a handler may set.
-    ///
-    /// The requirement is S3's: `HeadObject` reports the object's size, which a handler with no bytes in hand cannot
-    /// express by measuring anything. Whether the request was a HEAD is decided by the parsed request method, never by
-    /// the handler.
+    /// A HEAD answer carries no content (RFC 9110 sec. 9.3.2), so a declared length cannot desynchronize framing there,
+    /// and only there, which is why this is a typed method and not a header a handler may set. It lets a handler report
+    /// an object's size with no bytes in hand. The parsed request method decides whether the request was a HEAD.
     pub fn head_content_length(mut self, len: u64) -> Self {
         self.head_len = Some(len);
         self
@@ -356,14 +323,12 @@ pub(crate) enum ConnHeader {
     Close,
 }
 
-/// Serialize to wire bytes. `head_only` elides the body while keeping its `Content-Length` (the HEAD contract), or
-/// reporting [`HttpResponse::head_content_length`] in its place when the handler declared one; `date` is the rendered
-/// IMF-fixdate value, injected by the caller so this stays a pure function (and so the glue's per-reactor
-/// [`DateCache`](super::date::DateCache) renders it once a second, not once a response).
+/// Serialize to wire bytes. `head_only` elides the body but keeps its `Content-Length`, or reports
+/// [`HttpResponse::head_content_length`] instead when the handler declared one. `date` is the rendered IMF-fixdate,
+/// supplied by the caller so this stays pure.
 ///
-/// 1xx/204/304 responses never carry content (RFC 9110 sec. 6.4.1): body bytes are elided regardless of `head_only`,
-/// and so is `Content-Length` - a client reads zero body bytes after these statuses no matter what the header claims,
-/// so emitting one would desynchronize the next response on the connection.
+/// 1xx/204/304 responses never carry content (RFC 9110 sec. 6.4.1), so body bytes and `Content-Length` are both elided
+/// whatever `head_only` says, since a stray length would desynchronize the next response.
 pub(crate) fn serialize(resp: &HttpResponse, head_only: bool, date: &[u8], conn: ConnHeader) -> Vec<u8> {
     let bodyless = status_is_bodyless(resp.status);
     // Only in-hand bytes can ride this by-ref serializer; a file-sourced body serializes as its head alone (the reactor
@@ -481,12 +446,10 @@ pub(crate) enum Serialized {
     },
 }
 
-/// Serialize `resp` into a head buffer and, when the response carries a body, the body as its own segment - so the send
-/// path scatters head + body with one vectored write rather than copying the body into the head buffer.
-/// A HEAD response, a bodyless status (1xx/204/304), or an empty body has nothing to scatter and yields
-/// [`Serialized::HeadOnly`]; a byte body splits; a file body becomes [`Serialized::FileTail`] for the reactor to
-/// stream. Consumes `resp` so a byte body - owned or `'static` - rides into its segment as stored, without a copy, and
-/// a file body's handle moves instead of cloning.
+/// Serialize `resp` into a head buffer and, when it carries a body, the body as its own segment, so the send path
+/// scatters both with one vectored write. A HEAD, a bodyless status or an empty body yields [`Serialized::HeadOnly`], a
+/// byte body splits, and a file body becomes [`Serialized::FileTail`]. It consumes `resp` so a byte body rides into its
+/// segment without a copy and a file handle moves.
 pub(crate) fn serialize_reply(resp: HttpResponse, head_only: bool, date: &[u8], conn: ConnHeader) -> Serialized {
     let bodyless = status_is_bodyless(resp.status);
     let head = serialize_head(&resp, head_only, date, conn);
@@ -834,10 +797,8 @@ mod tests {
 
     #[test]
     fn bodyless_statuses_carry_no_content() {
-        // 1xx/204/304 MUST NOT carry content; a handler-set body is elided and no Content-Length is emitted at all. A
-        // 1xx cannot reach the serializer as a final response (`HttpResponse::new` normalizes it to 500 -
-        // `an_interim_status_cannot_be_a_final_response`), so the predicate's 1xx arm is asserted directly rather than
-        // dropped.
+        // 1xx/204/304 MUST NOT carry content, so a handler-set body is elided and no Content-Length is emitted. A 1xx
+        // cannot reach the serializer as a final response, so the predicate's 1xx arm is asserted directly.
         assert!(status_is_bodyless(100) && status_is_bodyless(199));
         for status in [204, 304] {
             let resp = HttpResponse::new(status).body("diagnostic");
