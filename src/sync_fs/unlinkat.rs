@@ -10,9 +10,7 @@ use std::os::fd::{AsFd, AsRawFd};
 /// removes an empty directory. They are one syscall and two different errors — a directory answers `EISDIR` without the
 /// flag, a file `ENOTDIR` with it — so the caller says which it means rather than discovering it.
 ///
-/// **Single component only, for [`mkdirat`](super::mkdirat)'s reason.** `unlinkat` honours no `RESOLVE_*` flags either,
-/// so a multi-component path resolves every component but the last with symlinks followed, and one planted by whoever
-/// owns an intermediate directory moves the removal somewhere else. The check is
+/// **Single component only, for [`mkdirat`](super::mkdirat)'s reason.** The check is
 /// [`path::component_defect`](crate::path::component_defect), the same rule [`uring_fs::Leaf`](crate::uring_fs::Leaf)
 /// enforces in the type for the async sibling.
 ///

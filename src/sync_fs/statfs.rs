@@ -1,12 +1,7 @@
 //! `fstatfs(2)` - filesystem-wide space and limits, by descriptor.
 //!
-//! Deliberately fd-only. There is no path-taking form here: this module's callers already hold a descriptor for the
-//! thing they are asking about, and a path-resolving variant would be a second way to name a file that the
-//! [`crate::sync_fs`] surface has otherwise avoided.
-//!
-//! [`statx`](super::statx) cannot answer this. Its fields are per-inode by construction - `stx_blocks` is the blocks
-//! allocated to *that file*, and `stx_blksize` its preferred I/O size - and no `STATX_*` request bit asks about the
-//! filesystem. The two answer different scopes.
+//! Deliberately fd-only, since a path-resolving form would be a second way to name a file. [`statx`](super::statx)
+//! cannot answer this, since its fields are per-inode and no `STATX_*` bit asks about the filesystem.
 
 use crate::errno::{self, retry_on_eintr};
 use std::mem::MaybeUninit;
@@ -83,18 +78,12 @@ impl Statfs {
 
     /// Filesystem id (`f_fsid`), as its two raw halves, unsigned.
     ///
-    /// This accessor exists because the libc crate keeps `fsid_t`'s only field private, so the value [`raw`](Self::raw)
-    /// hands back is opaque - a consumer cannot read it at all without an unsafe cast of its own.
+    /// The halves are `u32` because ZFS packs the objset guid's low 32 bits into `val[0]` and the high into `val[1]`,
+    /// so `(u64::from(id[1]) << 32) | u64::from(id[0])` recombines them, where the kernel's signed `int` would
+    /// sign-extend `val[0]`.
     ///
-    /// The halves are `u32` because that is how they are produced: ZFS packs the objset guid's low 32 bits into
-    /// `val[0]` and high 32 bits into `val[1]`, both written as `uint32_t`, making the one-id recombination
-    /// `(u64::from(id[1]) << 32) | u64::from(id[0])`. Handing out the kernel's signed `int` instead would sign-extend a
-    /// high-bit `val[0]` across the whole upper word of that expression, so any two filesystems sharing a low half
-    /// would collide.
-    ///
-    /// The id names the mount for its lifetime, no longer: ZFS reassigns it when a dataset opens into an in-core
-    /// collision, so an export/import can change it. State that must recognise a dataset across mounts should key on
-    /// the dataset's own guid instead.
+    /// The id names the mount for its lifetime only. ZFS reassigns it on an in-core collision, so an export/import can
+    /// change it, and state that must recognise a dataset across mounts keys on the dataset's own guid.
     pub fn fsid(&self) -> [u32; 2] {
         const _: () = assert!(
             std::mem::size_of::<libc::fsid_t>() == std::mem::size_of::<[u32; 2]>()

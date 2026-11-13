@@ -2,14 +2,9 @@ use super::*;
 
 /// An `O_PATH` handle is refused by name, before any syscall that would appear to work.
 ///
-/// `O_PATH` carries no file metadata: `fchmod(2)`, `fsetxattr(2)` and `setxattrat(2)`'s empty-path form all answer
-/// it `EBADF`. Two forms *do* reach the inode - `fchmodat2(2)` with `AT_EMPTY_PATH`, and
-/// `setxattr("/proc/self/fd/N", ..)` - and both have been used here and removed, because they carry only the mode:
-/// an ACL on the same handle still cannot travel, so the copy looks faithful and has silently dropped the access
-/// control. The screen is what makes a caller that pins with `O_PATH` find out at once.
-///
-/// The real descriptor on the same file is the control: without it a screen that refused everything would pass this
-/// too.
+/// The workarounds `fchmodat2(2)` with `AT_EMPTY_PATH` and `setxattr("/proc/self/fd/N", ..)` carry only the mode, so a
+/// copy through them looks faithful and has dropped the ACL. The real descriptor on the same file is the control, so a
+/// screen that refused everything fails.
 #[test]
 fn an_o_path_handle_cannot_carry_a_mode() {
     use std::os::unix::fs::PermissionsExt;
@@ -38,29 +33,13 @@ fn an_o_path_handle_cannot_carry_a_mode() {
     assert_eq!(m & 0o777, 0o640, "the refused call changed the mode anyway");
 }
 
-/// A swallowed `copy_permissions` failure releases the creation hold - or declines, and then reports no stamp.
+/// A swallowed `copy_permissions` failure releases the creation hold, or declines and then reports no stamp.
 ///
-/// `creation_mode` makes every object at a `0o700`/`0o600` hold on the promise that the source's mode lands
-/// afterwards, `copy_permissions` is the only thing that delivers it, and `copy_metadata` wraps that in `guard` -
-/// which answers `Ok(())` when `raise_error` is false, the mode `copytree`'s own docs name for salvaging a tree. So
-/// a swallowed failure left the **hold** as the final mode for the whole tree, with `copytree` answering `Ok` and
-/// plausible stats.
+/// A name the source does not have makes `fgetxattr` answer ENODATA, standing in for the `EOPNOTSUPP` of an ACL
+/// namespace mismatch between datasets. With no ACL on the destination the hold comes off and counts as a stamp. With
+/// one, an `fchmod` would rewrite it, so the release declines. A fix that always stamps, or never does, fails one half.
 ///
-/// The live trigger is an ACL-namespace mismatch - an `acltype=nfsv4` source onto an `acltype=posix` destination,
-/// or either onto `acltype=off` - which fails `fsetxattr` EOPNOTSUPP for every object, every time. That needs two
-/// dataset types and is a QEMU-lane fixture. The failure is provoked through the same door here: `copy_metadata`
-/// takes the attribute list as a parameter, so a name the source does not have makes its `fgetxattr` answer
-/// ENODATA.
-///
-/// Both halves matter and they pull opposite ways. Where the destination carries no ACL the hold comes off and that
-/// **is** a stamp, so a borrowed root keeps it - which is what `PERMISSIONS` means when `copy_permissions`
-/// succeeds. Where the destination carries one, the ACL is already the permissions and an `fchmod` would rewrite it
-/// (`aclmode=discard` replaces it outright), so the release declines and reports no stamp. A fix that always
-/// stamps, or never does, passes one half and fails the other.
-///
-/// **What this does not reach is `copytree`'s use of the answer.** `list_xattrs` reads the source's real
-/// attributes, so the failure cannot be provoked through the public entry point without two filesystems that
-/// disagree about an ACL namespace. That wiring is covered by reading, not by this.
+/// `copytree`'s use of the answer is not reached, since `list_xattrs` reads the source's real attributes.
 #[test]
 fn a_swallowed_permissions_failure_releases_the_hold() {
     use std::os::unix::fs::PermissionsExt;
@@ -171,15 +150,11 @@ fn dst_with_acl(d: &crate::TempDir) -> Option<std::fs::File> {
     Some(f)
 }
 
-/// A symbolic link is the fourth creator and carries the metadata flags the other three do.
+/// A symbolic link carries the metadata flags the other three creators do.
 ///
-/// Nothing touched a created link, so `CopyFlags::TIMESTAMPS` and `CopyFlags::OWNER` were both silently dropped for
-/// one while `copytree` answered `Ok` and counted it in `stats.symlinks`. The timestamp is the half an unprivileged
-/// run can see; ownership needs a uid to give the link away to, so it belongs to the QEMU lane (measured there: a
-/// source link at uid 1234 arrived at uid 0).
-///
-/// The regular file beside it is the control - it always carried the stamp - and the source time is far enough in
-/// the past that a link left at the copy's own clock cannot pass.
+/// The timestamp is the half an unprivileged run can see, since ownership needs a uid to give the link to. The regular
+/// file beside it is the control, and the source time is far enough in the past that a link left at the copy's own
+/// clock cannot pass.
 #[test]
 fn a_symlink_carries_the_metadata_flags() {
     fn set_link_time(p: &std::path::Path, sec: i64) {
@@ -269,20 +244,9 @@ fn mkfifo_at(path: &std::path::Path, mode: libc::mode_t) {
 
 /// `copytree` without `CopyFlags::PERMISSIONS` must leave a usable tree, not an owner-only one.
 ///
-/// Every destination object is created under a temporary hold - `0o700` for a directory, `0o600` for a file -
-/// because the source's mode is broader and lands later, so group and other are not granted access to bytes still
-/// being written. Without the flag nothing ever landed: `copy_metadata` gates `copy_permissions` on it, so the hold
-/// was final and a copy asking for `XATTRS | OWNER | TIMESTAMPS` produced `dst=0700 dst/sub=0700 dst/sub/f=0600`
-/// over a `0755` tree of `0644` files - and returned `Ok`.
-///
-/// The property is "whatever a plain `mkdir` or `open` would have produced", so the oracle is a reference tree
-/// built with exactly those calls, in the same parent and at the same depth, rather than a constant or a umask
-/// arithmetic. That is what makes it hold on a filesystem where the answer is *not* the umask: on ZFS with an
-/// inheritable ACE on the parent, `zfs_mode_compute` rebuilds a created object's rwx bits out of the inherited ACL
-/// and discards the requested ones, and under `aclmode=restricted` the requested mode is not consulted at all.
-///
-/// The `PERMISSIONS` arm is the control: it must still carry the source's modes, which a creation-mode change could
-/// otherwise mask away.
+/// The oracle is a reference tree built with a plain `mkdir` and `open` in the same parent, not a constant or umask
+/// arithmetic, so it holds where an inherited ACL decides the mode. The `PERMISSIONS` arm is the control and must still
+/// carry the source's modes.
 #[test]
 fn copytree_without_permissions_matches_a_plain_create() {
     let d = crate::tempdir().expect("tempdir");
@@ -358,15 +322,9 @@ fn copytree_without_permissions_matches_a_plain_create() {
 /// The destination root is narrowed for the duration only where a later mode is coming to release it into, and
 /// every row says which mode that is.
 ///
-/// The row that is easy to lose is `(created, PERMISSIONS)`. A created root looks like it cannot need narrowing -
-/// the umask only ever narrows what `mkdir` was asked for - so a guard written as "narrow a root we did not create"
-/// reads as complete and is not: with an inheritable ACE on the destination's parent, `zfs_mode_compute` rebuilds a
-/// created directory's rwx bits out of the inherited ACL and discards the requested ones, so `0o700` comes back
-/// `0o770`. Miss the row and the hold is gone for exactly the trees that carry ACLs, invisibly on every filesystem
-/// this suite can reach.
-///
-/// The complement is the defect that started this: narrowing a created root with no `PERMISSIONS` makes `0o700` its
-/// *final* mode, because nothing would ever put a broader one there.
+/// The row easy to lose is `(created, PERMISSIONS)`. A created root seems to need no narrowing, but with an inheritable
+/// ACE on the destination's parent `zfs_mode_compute` rebuilds its rwx bits from the inherited ACL, so `0o700` comes
+/// back `0o770`. Narrowing a created root with no `PERMISSIONS` would make `0o700` its final mode.
 #[test]
 fn the_root_is_narrowed_only_where_a_later_mode_is_coming() {
     // (grants_others, created, permissions) -> narrowed, and why.
@@ -426,11 +384,9 @@ fn a_borrowed_root_is_handed_back_as_it_was() {
 
 /// Listing an entry's xattr names is a metadata step and honours `raise_error` like every other one.
 ///
-/// It was the one that did not: a source whose name list the kernel refuses failed the whole copy in **both**
-/// modes, and two of the three call sites are directory-frame initialisers, so one such directory killed the copy
-/// of everything beneath it. `E2BIG` is reachable on a well-formed file (`listxattr`, `fs/xattr.c:989-993`,
-/// clamping at `XATTR_LIST_MAX`); driven here through an `O_PATH` handle, which the whole `f*xattr` family refuses
-/// with `EBADF`, because that needs no filesystem willing to hold 64 KiB of names.
+/// `E2BIG` is reachable on a well-formed file (`listxattr`, `fs/xattr.c:989-993`). This drives the failure through an
+/// `O_PATH` handle, which the whole `f*xattr` family refuses with `EBADF`, since that needs no filesystem willing to
+/// hold 64 KiB of names.
 #[test]
 fn listing_xattr_names_honours_raise_error() {
     let dir = crate::tempdir::tempdir().expect("tempdir");

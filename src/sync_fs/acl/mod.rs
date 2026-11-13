@@ -2,7 +2,6 @@
 //!
 //! [`fgetacl`] probes an open file to decide whether it carries an NFS4 ACL (`system.nfs4_acl_xdr`, as used by ZFS) or
 //! a POSIX1E ACL (`system.posix_acl_*`) and returns the decoded [`Acl`]. [`fsetacl`] writes one back (or removes it).
-//! The wire formats and validation exactly mirror the `truenas_os` C extension.
 //!
 //! [`PosixAcl::to_nfs4_lossy`] and [`Nfs4Acl::to_posix_lossy`] translate between the two models for a caller that needs
 //! one shape whatever the filesystem hands back. Neither is a bijection, and each documents what it drops.
@@ -124,11 +123,9 @@ pub fn validate_acl(target: AclTarget<'_>, acl: &Acl) -> Result<()> {
 
 /// Low-level: validate and write raw NFS4 XDR bytes to `system.nfs4_acl_xdr`.
 ///
-/// An **empty** `data` is refused `EINVAL`. It does not write an ACL that grants nobody anything, which is what a
-/// caller that filtered an ACL down to nothing would mean by it: the kernel leaves `kvalue` NULL for a zero-length
-/// `setxattr` (`setxattr_copy`, `fs/xattr.c:655-669`), and ZFS reads `(NULL, 0)` as the signal to strip the ACL. So the
-/// object would silently revert to mode-only permissions - the opposite of denying everyone. Removal has its own
-/// spelling, [`fsetacl`] with `None`.
+/// An **empty** `data` is refused `EINVAL`, since the kernel passes a zero-length `setxattr` on as `(NULL, 0)`
+/// (`setxattr_copy`, `fs/xattr.c:655-669`), which ZFS reads as the signal to strip the ACL, reverting to mode-only
+/// permissions rather than denying everyone. Removal has its own spelling, [`fsetacl`] with `None`.
 pub fn fsetacl_nfs4<Fd: AsFd>(fd: Fd, data: &[u8]) -> Result<()> {
     if data.is_empty() {
         return Err(Errno::EINVAL.into());
@@ -155,19 +152,12 @@ pub fn fsetacl_posix<Fd: AsFd>(fd: Fd, access: &[u8], default: Option<&[u8]>) ->
 
 /// Write both halves of a POSIX ACL, default half first.
 ///
-/// **On any error the access ACL is unchanged.** That is the whole reason for the ordering. There is no transactional
-/// xattr write, so one of the two writes has to be the one that can be left behind, and it must not be the access half:
-/// that is what the kernel consults on every open, so a get-modify-set widening access and growing the default would
-/// otherwise leave the wider rights live while returning `Err` - the caller believing nothing changed, and the
-/// directory granting what the new access ACL names.
+/// **On any error the access ACL is unchanged.** The kernel consults the access half on every open, so it must not be
+/// the write left behind when the other fails, or a widening get-modify-set would leave wider rights live while
+/// returning `Err`. `validate` does not bound size, so the kernel can still answer `E2BIG`, `ENOSPC` or `EDQUOT`.
 ///
-/// `validate` is not a defence here. It checks tag counts, canonical order, `rwx` bits and id representability, never
-/// *size*, and there is no bound on entry count - so a multi-megabyte default encodes happily and the kernel answers
-/// `E2BIG`. `ENOSPC` and `EDQUOT` reach the same place.
-///
-/// A default ACL grants nothing by itself; it is inherited by children created later. So when the access write is the
-/// one that fails, the default is put back. If that restore fails too its errno is what surfaces, and only then can the
-/// default half be left holding the new value.
+/// When the access write fails the default is put back. If that restore fails too its errno is what surfaces, and only
+/// then can the default half be left holding the new value.
 fn write_posix(fd: BorrowedFd<'_>, access: &[u8], default: Option<&[u8]>) -> Result<()> {
     // Read before writing: once the write lands the old value is gone and the restore below has nothing to put back.
     let prior = match fgetxattr(fd, posix::POSIX_DEFAULT_XATTR) {

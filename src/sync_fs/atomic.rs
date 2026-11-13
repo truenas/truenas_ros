@@ -46,11 +46,8 @@ impl Default for AtomicWriteOptions {
 /// replaced if `write_fn` returns `Ok`; on error the temporary file is removed and `target` is left untouched. Every
 /// path component is opened with `RESOLVE_NO_SYMLINKS`.
 ///
-/// `write_fn` receives the temporary [`File`] directly, so it can use the full [`std::io`] API (or anything built on
-/// it). It is handed a file that is still owner-private and at neither the requested mode nor the requested owner: both
-/// land afterwards, because a write to a regular file makes the kernel drop `S_ISUID`/`S_ISGID` and a chown before the
-/// write would open the staged bytes to the target uid. One consequence for a `write_fn` with side effects: an
-/// ownership or mode that cannot be applied is now discovered **after** it has run, not before.
+/// `write_fn` receives the temporary [`File`], still owner-private and at neither the requested mode nor owner, which
+/// land after it runs. So an ownership or mode that cannot be applied is discovered **after** `write_fn` has run.
 pub fn atomic_write<F>(target: &Path, opts: AtomicWriteOptions, write_fn: F) -> Result<()>
 where
     F: FnOnce(&mut File) -> io::Result<()>,
@@ -97,17 +94,9 @@ where
     let uid = opts.uid.or_else(|| inherit.map(|s| s.uid()));
     let gid = opts.gid.or_else(|| inherit.map(|s| s.gid()));
 
-    // The data lands first, and the owner and mode only once it has.
-    //
-    // An unprivileged write to a regular file makes the kernel drop its setuid/setgid bits (`file_remove_privs_flags`,
-    // `fs/inode.c`, through `setattr_should_drop_suidgid`, `fs/attr.c:63-78`), so a mode applied to the staging file
-    // *before* `write_fn` publishes a file that has silently lost them - `mode: 0o4755` arriving as `0o755` with an
-    // `Ok` return. Invisible to a privileged writer, which keeps them under `CAP_FSETID`, so this order is what makes
-    // the option mean the same thing for both. `copy_into` states the same rule for `copytree`.
-    //
-    // The same ordering closes the other half: chowning the staging file to the target uid while it is still empty
-    // hands that uid a window on the bytes as they are written. `create_temp` stages owner-private for as long as that
-    // window lasts.
+    // The data lands first, and the owner and mode only once it has. An unprivileged write drops setuid/setgid
+    // (`file_remove_privs_flags`, `fs/inode.c`), so a mode applied earlier would publish `0o4755` as `0o755`, and a
+    // chown to the target uid before the write would show that uid the bytes as they are written.
     let (tmp_name, mut file) = create_temp(dir)?;
     let staged = write_fn(&mut file)
         .and_then(|()| file.flush())
@@ -177,12 +166,9 @@ pub fn atomic_replace(target: &Path, data: &[u8], opts: AtomicWriteOptions) -> R
 /// The suffix is 128 random bits from `getrandom(2)`, so a single `O_CREAT | O_EXCL` open is collision-free in
 /// practice - no retry loop and no shared counter. A collision (never expected) simply surfaces as `EEXIST`.
 ///
-/// **The length is fixed rather than derived from the destination name.** A name built as `. + target + .tmp. + 32 hex`
-/// is 38 bytes longer than the target it stands in for, so a target already within 38 bytes of the filesystem's
-/// `NAME_MAX` - 218 bytes on a stock ZFS dataset - cannot be staged at all: the `openat2` below answers `ENAMETOOLONG`
-/// for a name the caller was entitled to write. `NAME_MAX` is a filesystem property (ZFS raises it to 1023 with the
-/// `longname` feature), so there is no constant to clamp against; carrying none of the target's bytes is what removes
-/// the dependency.
+/// **The length is fixed rather than derived from the destination name**, since a name carrying the target's bytes
+/// could pass `NAME_MAX` for a target the caller was entitled to write. `NAME_MAX` is a filesystem property (ZFS raises
+/// it with the `longname` feature), so there is no constant to clamp against.
 pub(crate) fn staging_name(prefix: &str) -> Result<OsString> {
     let mut rand = [0u8; 16];
     // getrandom fully fills any request of <= 256 bytes (flags 0), so on success the whole buffer is populated; only
@@ -255,12 +241,8 @@ mod tests {
 
     /// The mode lands **after** the data, so a setuid/setgid bit survives to the published file.
     ///
-    /// An unprivileged write to a regular file makes the kernel drop those bits (`file_remove_privs_flags`,
-    /// `fs/inode.c`, via `setattr_should_drop_suidgid`, `fs/attr.c:63-78`), so a mode applied to the staging file
-    /// before `write_fn` publishes `0o755` for a requested `0o4755` and returns `Ok`. The effect is **invisible to a
-    /// privileged writer**, which keeps the bits under `CAP_FSETID` - so what is asserted here is the order itself,
-    /// which a test can see whatever it is running as: the staging file the caller is handed is still owner-private,
-    /// and the mode only appears afterwards.
+    /// A privileged writer keeps the bits under `CAP_FSETID` whatever the order, so this asserts the order itself, that
+    /// the staging file handed to the caller is still owner-private and the mode appears only afterwards.
     #[test]
     fn the_mode_lands_after_the_data_not_before_it() {
         use std::os::unix::fs::MetadataExt;
@@ -293,9 +275,6 @@ mod tests {
 
     /// A target name the filesystem accepts must be writable, whatever its length: the staging name stands in for it
     /// and carries none of its bytes, so it cannot push the create past `NAME_MAX`.
-    ///
-    /// Derived from the target - `. + target + .tmp. + 32 hex` - the staging name was 38 bytes longer, and every target
-    /// of 218 bytes or more on a stock ZFS or ext4 dataset answered `ENAMETOOLONG` with nothing written.
     #[test]
     fn a_long_target_name_is_still_writable() {
         let dir = crate::tempdir().unwrap();

@@ -15,9 +15,6 @@
 //! `NOUNLINK` reads like the closer match for a retention lock - alter but do not delete - and is a trap: the same
 //! handler gates it on file *ownership* only, with no capability, so whoever owns the file can clear it and delete.
 //! Where the point is that the owner must not be able to, `IMMUTABLE` is the flag with teeth.
-//!
-//! Unlike `FS_IOC_SETFLAGS` - which reaches only immutable, append, nodump and projinherit - one ioctl here carries
-//! every bit.
 
 use crate::errno::{self, retry_on_eintr};
 use std::os::fd::{AsFd, AsRawFd};
@@ -38,23 +35,14 @@ tn_bitflags! {
         /// ZFS**. Presented to SMB clients as the READONLY DOS attribute, and deliberately fchmod-shaped: toggling does
         /// not affect existing opens or mappings, which ZFS exempts by name.
         ///
-        /// Unlike `IMMUTABLE` above, no VFS `i_flags` bit exists for this, so the deny lives in the access check
-        /// alone - and a plain read/write/exec check reaches ZFS only when the dataset is `acltype=nfsv4` *and* the
-        /// file's ACL is non-trivial. Anywhere else - posixacl, `acltype=off`, or a mode-shaped ACL - the check falls
-        /// back to `generic_permission`, which reads the mode and nothing else: **the flag sets successfully and blocks
-        /// no write.** The platform contract is therefore nfsv4 with non-trivial ACLs on the files; inherited ACEs
-        /// satisfy it, and every create flavor takes its ACL from the directory it is born in (one shared
-        /// `zfs_acl_ids_create(dzp, ..)`). `acltype` *defaults* to nfsv4 on this platform, so the failure mode is a
-        /// dataset someone switched, not one never configured - and a `system.nfs4_acl_xdr` getxattr probes it,
-        /// answering `EOPNOTSUPP` anywhere the deny would not hold.
+        /// No VFS `i_flags` bit backs it, so the deny lives in ZFS's access check, which a plain read/write/exec check
+        /// reaches only on `acltype=nfsv4` with a non-trivial ACL. Anywhere else the check falls back to
+        /// `generic_permission`, and **the flag sets successfully and blocks no write.** A `system.nfs4_acl_xdr`
+        /// getxattr answers `EOPNOTSUPP` wherever the deny would not hold.
         ///
-        /// A latch, not a lock: a privileged caller passes on the privilege fallback, the owner can clear it through
-        /// this ioctl, and an SMB client with write access can clear the DOS attribute - while NFS has no surface to
-        /// clear it at all. The one unconditional refusal is a new shared-writable mmap, denied on every dataset flavor
-        /// with no privilege fallback. Invisible to `lsattr`, and to `statx` but for
-        /// [`StatxMask::ZFSFLAGS`](super::StatxMask::ZFSFLAGS) on the TrueNAS kernel, so a refused write presents as a
-        /// bare `EACCES` on a file whose mode looks writable - the fallback re-decides the errno, and `EPERM` is what
-        /// `IMMUTABLE` answers, refused by the VFS before ZFS is consulted.
+        /// A latch, not a lock. A privileged caller passes, and the owner or an SMB client with write access can clear
+        /// it. The one unconditional refusal is a new shared-writable mmap. A refused write is a bare `EACCES` on a
+        /// file whose mode looks writable, where `IMMUTABLE` answers `EPERM`.
         READONLY = 0x0000_0001_0000_0000;
         /// HIDDEN DOS attribute - hides the file from SMB clients.
         HIDDEN = 0x0000_0002_0000_0000;

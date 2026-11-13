@@ -173,12 +173,8 @@ pub struct Nfs4Acl {
 
 /// Read the XDR wire's big-endian word at `i`.
 ///
-/// Deliberately local, and not worth folding together with the readers in `acl::posix`, `sync_fs::iter`,
-/// `sync_fs::fhandle` or `uring_fs::query_tree` even though all five look alike. They do not agree on byte order - this
-/// one is big-endian because XDR is, the POSIX xattr is little-endian because the kernel writes it that way, and the
-/// resume tokens are native-endian because nothing outside the host reads them - so a shared reader is three readers,
-/// which is what these already are. It would also have to live somewhere all of `acl`, `fsiter`, `fhandle` and
-/// `uring-fs` can reach, and each of those is required to build on its own.
+/// Kept local rather than shared with the look-alike readers in `acl::posix`, `sync_fs::iter`, `sync_fs::fhandle` and
+/// `uring_fs::query_tree`, since they differ in byte order and each of those features must build on its own.
 #[inline]
 fn be32(b: &[u8], i: usize) -> u32 {
     u32::from_be_bytes(b[i..i + 4].try_into().unwrap())
@@ -256,7 +252,7 @@ impl Nfs4Acl {
     }
 
     /// Build an ACL from ACEs, re-sorting them into Windows-canonical order (explicit-deny, explicit-allow,
-    /// inherited-deny, inherited-allow) with a stable sort, matching the C `from_aces`.
+    /// inherited-deny, inherited-allow) with a stable sort.
     pub fn from_aces<I>(aces: I, acl_flags: Nfs4AclFlag) -> Self
     where
         I: IntoIterator<Item = Nfs4Ace>,
@@ -297,13 +293,10 @@ impl Nfs4Acl {
     ///
     /// Errors if no ACE is inheritable for the given child type.
     ///
-    /// **A correct prediction is not always a writable ACL.** This answers what ZFS would create, and ZFS creates ACLs
-    /// the write path refuses: a parent ACE carrying `NO_PROPAGATE_INHERIT` yields a child ACE with every inheritance
-    /// bit stripped, so a child *directory* whose parent had no other inheritable ACE gets an ACL with nothing
-    /// inheritable in it - which the structural check [`fsetacl`] runs rejects, exactly as it rejects the trivial
-    /// directory ACL ZFS synthesises from the mode bits. A get-parent, predict, set-child caller sees the refusal
-    /// rather than a silently over-propagating grant, which is the safer of the two answers and not an obvious one; do
-    /// not reconcile it by widening what this predicts.
+    /// **A correct prediction is not always a writable ACL.** A parent ACE carrying `NO_PROPAGATE_INHERIT` yields a
+    /// child ACE with every inheritance bit stripped, so a child directory can get an ACL with nothing inheritable,
+    /// which [`fsetacl`] refuses as it refuses the trivial directory ACL ZFS synthesises. Do not reconcile this by
+    /// widening what this predicts.
     ///
     /// [`fsetacl`]: crate::sync_fs::acl::fsetacl
     pub fn generate_inherited_acl(&self, is_dir: bool) -> Result<Self> {
@@ -329,7 +322,7 @@ impl Nfs4Acl {
         Ok(Nfs4Acl { acl_flags, aces })
     }
 
-    /// Structural validation (matching the C `nfs4acl_valid`).
+    /// Structural validation.
     pub(crate) fn validate(&self, is_dir: bool) -> Result<()> {
         let mut has_propagate = false;
         let mut has_inheritable = false;
@@ -345,11 +338,9 @@ impl Nfs4Acl {
                         .into(),
                 ));
             }
-            // AUDIT and ALARM are NFSv4.1 types this crate can represent and ZFS will not store: it answers `-EINVAL`
-            // for any type but ALLOW and DENY. Refused here so the failure names itself instead of arriving as a bare
-            // `EINVAL` from `setxattr` with nothing to attribute it to. Only the write path: the decoder keeps
-            // accepting them, so an ACL read from a filesystem that does store them still round-trips through this
-            // type.
+            // AUDIT and ALARM are representable here, and ZFS answers `-EINVAL` for them, so they are refused by name
+            // rather than as a bare `EINVAL` from `setxattr`. The decoder still accepts them, so an ACL read from
+            // elsewhere round-trips.
             if matches!(a.ace_type, Nfs4AceType::Audit | Nfs4AceType::Alarm) {
                 return Err(Error::Validation(format!(
                     "{:?} entries cannot be stored: ZFS implements only \
@@ -437,11 +428,8 @@ fn bucket_key(a: &Nfs4Ace) -> u8 {
 /// return (0);
 /// ```
 ///
-/// The `NO_PROPAGATE_INHERIT` term is load-bearing for exactly one input: a child **directory** whose parent ACE
-/// carries `FILE_INHERIT` without `DIRECTORY_INHERIT`. ZFS does not pass that one down - the ACE was meant for files,
-/// and the flag says "not to grandchildren" - and a predicate that answers on the two inheritable bits alone reports a
-/// grant the filesystem will not create. `validate` admits the combination (it refuses `NO_PROPAGATE_INHERIT` only with
-/// *no* inheritable flag set), so it is reachable. For a child file the two forms agree on every input.
+/// The `NO_PROPAGATE_INHERIT` term matters for one input, a child **directory** whose parent ACE carries `FILE_INHERIT`
+/// without `DIRECTORY_INHERIT`, which ZFS does not pass down and `validate` admits.
 fn ace_is_inheritable(flags: Nfs4Flag, is_dir: bool) -> bool {
     if is_dir && flags.contains(Nfs4Flag::DIRECTORY_INHERIT) {
         true
@@ -452,15 +440,6 @@ fn ace_is_inheritable(flags: Nfs4Flag, is_dir: bool) -> bool {
     }
 }
 
-/// `aclinherit` is deliberately not a parameter, and the reason is the product's rather than the library's: TrueNAS
-/// sets `aclinherit=passthrough` on every NFSv4 dataset it creates, and passthrough is the one value under which
-/// `zfs_acl_inherit` leaves the access mask alone. Its other arms all alter what the child gets - `discard` inherits
-/// nothing, `noallow` drops ALLOW ACEs, `passthrough-x` strips `ACE_EXECUTE` from a non-directory, `restricted` clears
-/// `RESTRICTED_CLEAR` (`ACE_WRITE_ACL|ACE_WRITE_OWNER`) - so a predictor that ignored the property would be wrong under
-/// any of them. It is right under the one the product uses, and taking the property as an argument would pessimize the
-/// library for configurations that do not occur. A dataset built by hand with `zfs create` takes ZFS's own default of
-/// `restricted` and reads `SOURCE=default`, which looks stock and is not what the product produces.
-///
 /// Rewrite an ACE's flags for a newly-created child - the second half of ZFS's inheritance arithmetic, which is what
 /// this predicts and therefore the only definition that counts (`zfs_acl_inherit`, `module/os/linux/zfs/zfs_acl.c`):
 ///
@@ -481,10 +460,12 @@ fn ace_is_inheritable(flags: Nfs4Flag, is_dir: bool) -> bool {
 /// ace_flags_set(acep, newflags|ACE_INHERITED_ACE);
 /// ```
 ///
-/// `ALL_INHERIT` is all four inheritance bits plus `INHERITED` (`zfs_acl.c:86`), so the first branch leaves a child ACE
-/// that is not inheritable any further - which is the whole meaning of `NO_PROPAGATE_INHERIT`. Both of the
-/// non-propagating cases - a child file, and a child directory whose parent ACE says stop - take it, which is why they
-/// are one arm here rather than two.
+/// `ALL_INHERIT` is all four inheritance bits plus `INHERITED` (`zfs_acl.c:86`), so a child file and a child directory
+/// whose parent ACE says stop share one arm and get an ACE that is not inheritable any further.
+///
+/// `aclinherit` is not a parameter. TrueNAS sets `aclinherit=passthrough` on every NFSv4 dataset, the one value under
+/// which `zfs_acl_inherit` leaves the access mask alone, so this is right there and wrong under the others. A dataset
+/// made by hand with `zfs create` gets ZFS's default of `restricted`.
 ///
 /// The `(iflags & (FILE|DIRECTORY)) == FILE` test reduces to "no `DIRECTORY_INHERIT`" for anything that reaches this
 /// function, since [`ace_is_inheritable`] admits a child directory only when one of the two bits is set.
@@ -521,9 +502,8 @@ mod tests {
 
     /// AUDIT and ALARM are representable here and unstorable there.
     ///
-    /// ZFS answers `-EINVAL` for any ACE type but ALLOW and DENY, so writing one reached the kernel and came back as a
-    /// bare `EINVAL` from `setxattr` with nothing naming the cause. The decoder still accepts them - only the write
-    /// path refuses - so an ACL read from elsewhere round-trips.
+    /// ZFS answers `-EINVAL` for any ACE type but ALLOW and DENY, so the write path refuses them by name. The decoder
+    /// still accepts them, so an ACL read from elsewhere round-trips.
     #[test]
     fn validate_rejects_ace_types_zfs_will_not_store() {
         for t in [Nfs4AceType::Audit, Nfs4AceType::Alarm] {
@@ -551,12 +531,9 @@ mod tests {
         );
     }
 
-    /// `ace_is_inheritable` is a prediction of `zfs_ace_can_use`, so the whole truth table is the property - a row that
-    /// disagrees is an ACL this crate says a child will have and the filesystem will not give it.
-    ///
-    /// The row that used to disagree is a child **directory** whose parent ACE carries `FILE_INHERIT` without
-    /// `DIRECTORY_INHERIT` and with `NO_PROPAGATE_INHERIT`: the ACE was meant for files and the flag says "not to
-    /// grandchildren", so ZFS does not pass it down.
+    /// `ace_is_inheritable` is a prediction of `zfs_ace_can_use`, so the whole truth table is the property, including a
+    /// child **directory** whose parent ACE carries `FILE_INHERIT` and `NO_PROPAGATE_INHERIT` without
+    /// `DIRECTORY_INHERIT`, which ZFS does not pass down.
     #[test]
     fn inheritance_matches_zfs_ace_can_use() {
         use Nfs4Flag as F;
@@ -609,9 +586,9 @@ mod tests {
     /// The *flags* half of the same prediction, which the sweep above does not reach: it compares `ace_is_inheritable`
     /// only, so an ACE that ZFS and this crate agree a child receives can still arrive carrying different flags.
     ///
-    /// The row that disagreed is a child **directory** whose parent ACE carries `NO_PROPAGATE_INHERIT` alongside
-    /// `INHERIT_ONLY` and `FILE_INHERIT`: ZFS strips every inheritance bit, and keeping them hands the grandchildren a
-    /// grant the parent ACE said to stop at one level - and `validate` admits the result, so it is writable.
+    /// A child **directory** whose parent ACE carries `NO_PROPAGATE_INHERIT` alongside `INHERIT_ONLY` and
+    /// `FILE_INHERIT` must have every inheritance bit stripped, or the grandchildren get a grant meant to stop at one
+    /// level.
     #[test]
     fn inherited_flags_match_zfs_acl_inherit() {
         use Nfs4Flag as F;
@@ -664,16 +641,9 @@ mod tests {
         );
     }
 
-    /// The prediction is ZFS's, and `validate` is stricter than ZFS, so the two can disagree - pinned here so the
-    /// disagreement is a decision rather than a surprise.
-    ///
-    /// A parent ACE flagged `FILE|DIRECTORY|NO_PROPAGATE|INHERIT_ONLY` hands a child directory an ACE with every
-    /// inheritance bit gone, which is what `zfs_acl_inherit` does and what the filesystem then stores. `validate(true)`
-    /// refuses that ACL for having nothing inheritable in it - the same rule that refuses the trivial directory ACL ZFS
-    /// synthesises. So a caller that predicts and writes gets a named refusal where it used to get `Ok` and an ACE the
-    /// grandchildren inherit.
-    ///
-    /// The child *file* form is unaffected and still writes.
+    /// The prediction is ZFS's and `validate` is stricter, so the two can disagree, and this pins that as a decision. A
+    /// parent ACE flagged `FILE|DIRECTORY|NO_PROPAGATE|INHERIT_ONLY` hands a child directory an ACE with no inheritance
+    /// bit, which `validate(true)` refuses, while the child *file* form still writes.
     #[test]
     fn a_no_propagate_prediction_is_correct_and_unwritable() {
         use Nfs4Flag as F;

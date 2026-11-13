@@ -12,9 +12,8 @@ const UNCHANGED: libc::uid_t = libc::uid_t::MAX;
 /// `None` leaves that half as it is; `Some` sets it. Both `None` is a call the kernel still makes, and it still clears
 /// the setuid and setgid bits, so it is not a no-op and is not turned into one here.
 ///
-/// **Descriptor-based on purpose.** There is no path form in this module: a path re-walks every component, so the file
-/// whose ownership changes need not be the one the caller looked at. Holding the descriptor pins the inode across the
-/// check and the change.
+/// **Descriptor-based on purpose.** A path form would re-walk every component, so the file changed need not be the one
+/// the caller looked at.
 ///
 /// Changing ownership needs `CAP_CHOWN` unless the caller owns the file and is only moving its group to one it belongs
 /// to; the group change alone additionally needs `CAP_FSETID` to survive with a setgid bit intact, which this does not

@@ -7,32 +7,19 @@ use std::os::fd::{AsFd, AsRawFd};
 
 /// Give the inode named by `old_path` in `old_dirfd` a second name, `new_path` in `new_dirfd`.
 ///
-/// The completion of the name-manipulating set beside [`mkdirat`](super::mkdirat), [`unlinkat`](super::unlinkat) and
-/// [`renameat2`](super::renameat2): a rename moves a name and this one adds a name, which is what a caller wants when
-/// the inode must keep the name it already has. The `uring_fs` sibling exists for the request path; this is for job
-/// work and set-up, which hold no ring.
-///
-/// **Single components only, for [`unlinkat`](super::unlinkat)'s reason.** `linkat` honours no `RESOLVE_*` flags, so a
-/// multi-component path resolves every component but the last with symlinks followed, and one planted by whoever owns
-/// an intermediate directory redirects the link. Both names are screened with
-/// [`path::component_defect`](crate::path::component_defect); rejected are empty, `.`, `..`, and anything containing
+/// **Single components only, for [`mkdirat`](super::mkdirat)'s reason.** Both names are screened with
+/// [`path::component_defect`](crate::path::component_defect), which rejects empty, `.`, `..`, and anything containing
 /// `/`.
 ///
-/// **The screen bounds the name, not what the name resolves to, and `AT_SYMLINK_FOLLOW` is where that matters.** A
-/// one-component symlink inside `old_dirfd` passes the screen and then resolves wherever it points, so the new name
-/// lands inside the anchor as a second name for an inode outside it. The kernel offers no confinement here at all -
-/// `may_linkat` (`fs/namei.c`) governs *which* inode you may link, by `safe_hardlink_source` or
-/// `inode_owner_or_capable`, and never where the link lands, so `fs.protected_hardlinks` does not help. A caller that
-/// needs the anchor to bound the result must not pass the flag, or must `openat2` the source under
-/// `RESOLVE_NO_SYMLINKS` first and link that with `AT_EMPTY_PATH`.
+/// **The screen bounds the name, not what it resolves to.** Under `AT_SYMLINK_FOLLOW` a one-component symlink inside
+/// `old_dirfd` resolves wherever it points, and the kernel bounds which inode may be linked (`may_linkat`,
+/// `fs/namei.c`), never where it lives. A caller that needs the anchor to bound the result must not pass the flag, or
+/// must `openat2` the source under `RESOLVE_NO_SYMLINKS` first and link that with `AT_EMPTY_PATH`.
 ///
 /// `flags` takes `AT_SYMLINK_FOLLOW` to link a symlink's target rather than the symlink, and `AT_EMPTY_PATH` to link
-/// the descriptor itself, which requires `old_path` to be empty. The kernel's own test for that flag is a
-/// **disjunction** (`fs/namei.c`, under `LOOKUP_LINKAT_EMPTY`): it answers `ENOENT` only when the descriptor's
-/// open-time credentials differ from the caller's *and* the caller lacks `CAP_DAC_READ_SEARCH`. A process linking a
-/// descriptor it opened itself therefore needs no capability at all;
-/// `do_linkat`'s own comment spells the pair out. The empty name is the one spelling the component screen would
-/// otherwise refuse, so that flag lifts the screen for `old_path` and only for it: the *new* name is always a name.
+/// the descriptor itself with `old_path` empty, the one name the screen then admits. `AT_EMPTY_PATH` answers `ENOENT`
+/// only when the descriptor's open-time credentials differ from the caller's and the caller lacks `CAP_DAC_READ_SEARCH`
+/// (`do_linkat`, `fs/namei.c`).
 ///
 /// `EEXIST` where `new_path` is taken, and it is the caller's to interpret: `linkat` cannot replace a name, and this
 /// invents no idempotence the syscall does not have.

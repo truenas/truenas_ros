@@ -8,10 +8,6 @@
 //! [`CopyTreeConfig::traverse`] extends the copy across mount boundaries: after the primary filesystem, each child
 //! mount nested under `src` is copied into the matching (already-existing) destination directory.
 //! [`copytree_reporting`] adds a progress callback fired every N entries.
-//!
-//! This is a native rewrite of the `truenas_os` C extension's recursive copier:
-//! the destination-side directory stack is a plain [`Vec`] reconciled against each entry's parent path, rather than the
-//! C runner's manual frame bookkeeping.
 
 mod copy;
 
@@ -145,19 +141,12 @@ fn select_copy_fn(op: CopyTreeOp) -> CopyFn {
 /// skipped.
 ///
 /// By default the copy stays within `src`'s own filesystem. With [`CopyTreeConfig::traverse`], each child mount nested
-/// under `src` is also copied, as a post-pass, into the correspondingly-named destination directory -- which **must
-/// already exist** (it is opened, not created, so the data lands on the intended destination mount rather than its
-/// parent).
+/// under `src` is also copied, as a post-pass, into the matching destination directory, which **must already exist**.
 ///
 /// # Hardlinks are not preserved
 ///
 /// Each name in the source becomes its own inode in the destination, so N links to one file cost N copies of its data
-/// and `stats.files` counts each name. Nothing detects the sharing: `st_nlink` is read only to refuse a multiply-linked
-/// *destination*, never consulted on the source.
-///
-/// This is a divergence from the Python `shutil` this module tracks, and it is stated rather than fixed because
-/// preserving links means carrying an inode-to-first-path map for the whole walk - memory proportional to the tree, and
-/// a behaviour change for every existing caller. If you are copying a hardlink farm, that cost is yours to plan for.
+/// and `stats.files` counts each name.
 ///
 /// For progress reporting, use [`copytree_reporting`].
 pub fn copytree(src: &Path, dst: &Path, config: &CopyTreeConfig) -> Result<CopyTreeStats> {
@@ -166,10 +155,6 @@ pub fn copytree(src: &Path, dst: &Path, config: &CopyTreeConfig) -> Result<CopyT
 
 /// Like [`copytree`], but invokes `progress` every [`CopyTreeConfig::reporting_increment`] entries walked, and once
 /// more at the end. Each [`CopyTreeProgress`] carries the running [`CopyTreeStats`] and the current source path.
-///
-/// (The Python original forwards a callback into its iterator; because this crate's
-/// [`FsIter`](crate::sync_fs::iter::FsIter) is caller-driven, `copytree` fires the callback itself and reports
-/// copy-specific stats rather than the iterator's generic counts.)
 pub fn copytree_reporting(
     src: &Path,
     dst: &Path,
@@ -183,10 +168,8 @@ pub fn copytree_reporting(
             .flags(DIR_OFLAGS)
             .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
     )?;
-    // `mkdirat` has no resolve-flag mechanism, so it must never be handed a multi-component path: every component but
-    // the last would resolve with symlinks followed, and the root could land outside the intended tree. Open the parent
-    // with RESOLVE_NO_SYMLINKS and create the final component against that handle, as the rest of this module does for
-    // every name.
+    // `mkdirat` follows symlinks in every component but the last, so it is never handed a multi-component path. Open
+    // the parent with RESOLVE_NO_SYMLINKS and create the final component against that handle.
     let dst_parent = dst
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -201,12 +184,8 @@ pub fn copytree_reporting(
             .flags(DIR_OFLAGS)
             .resolve(ResolveFlag::RESOLVE_NO_SYMLINKS),
     )?;
-    // Hold the destination root owner-only (0o700) for the duration of the copy. Its real mode - which may be broader -
-    // is applied only at the end, so group/other are never granted access to the files being written before the copy
-    // completes. Owner keeps write, so children stay creatable even when the source root is not owner-writable.
-    //
-    // Without `CopyFlags::PERMISSIONS` there is no later mode to apply, so the hold has nothing to be released into and
-    // the umask's answer is the final one from the start - see [`creation_mode`].
+    // Hold the destination root owner-only (0o700) until the copy completes, so group and other never reach files still
+    // being written. Without `CopyFlags::PERMISSIONS` there is no hold, as [`creation_mode`] says.
     let created = mkdir_at(
         dst_parent_fd.as_fd(),
         dst_name,
@@ -223,29 +202,9 @@ pub fn copytree_reporting(
     // dev+ino of the destination root, so the walk never copies dst into itself -- applied to the primary pass and
     // every traversed child mount.
     let dst_self_st = statx(dst_root.as_fd(), "", AtFlags::AT_EMPTY_PATH, META_MASK)?;
-    // The root's mode can grant group or other two ways, and they are not the same question.
-    //
-    // With `exist_ok` a pre-existing root keeps whatever mode it had - a **borrowed** root, which `mkdir_at` now
-    // reports directly rather than having it inferred. And a root this copy *created* can come back broader than the
-    // mode it asked for: with an inheritable ACE on the destination's parent, `zfs_acl_ids_create` hands the new
-    // directory the inherited ACL and then recomputes its mode from it - `zfs_mode_compute`
-    // (`module/os/linux/zfs/zfs_acl.c`) keeps only `S_IFMT|S_ISUID|S_ISGID|S_ISVTX` of what was asked for and rebuilds
-    // every rwx bit out of the ACEs. Under `aclmode=restricted` the requested mode is not consulted at all:
-    // `zfs_acl_inherit` clears `need_chmod` whenever anything was inherited, so `zfs_acl_chmod` never folds it in.
-    //
-    // **Narrowing is for the duration, so it is only correct where a later mode is coming to release it into.** Two
-    // things can be that mode: `copy_permissions` stamping the source root's, under `CopyFlags::PERMISSIONS` and from
-    // the root frame when the walk completes; or the borrowed root's own, put back below. With neither - a created root
-    // and no `PERMISSIONS` - a narrowing would be the final mode, which is the whole defect [`creation_mode`] exists to
-    // close.
-    //
-    // Where an ACL governs the mode (ZFS `aclmode=restricted`) the chmod is rejected `EPERM`; there the ACL is
-    // authoritative for visibility, so proceed rather than refuse.
-    //
-    // Only a borrowed root's mode has to go back, and nothing else puts it there: a `?` on the way out, and a clean
-    // finish without `PERMISSIONS`, would both leave a directory this copy did not create at 0o700 -- locking every
-    // non-owner identity out of a share or system-dataset migration, with the original recorded nowhere for the caller
-    // to put back and nothing in the result saying so. Both are restored below.
+    // A root that `exist_ok` adopted is borrowed, and its mode is put back on both exits below, since nothing else
+    // would and a share left at 0o700 locks out every other identity. Where an ACL governs the mode (ZFS
+    // `aclmode=restricted`) the chmod is refused `EPERM`, and the ACL is authoritative, so proceed.
     let mut borrowed = None;
     let grants_others = dst_self_st.mode() & 0o077 != 0;
     if grants_others && !created {
@@ -300,16 +259,9 @@ pub fn copytree_reporting(
         }
         return Err(e);
     }
-    // The copy finished. Put the borrowed root's mode back unless the walk has already stamped one over it, and surface
-    // a failure to: unlike the error path above there is nothing else to report, and a caller told its copy succeeded
-    // would otherwise never learn the destination is still owner-only.
-    //
-    // "Has already stamped one" is the walk's own answer, not
-    // `CopyFlags::PERMISSIONS`. The flag says a stamp was *asked for*;
-    // `copy_metadata` wraps `copy_permissions` in `guard`, which swallows its failure when `raise_error` is false, so
-    // the flag being set is no evidence a mode landed. An `acltype=nfsv4` source copied onto an `acltype=posix`
-    // destination fails `fsetxattr(system.nfs4_acl_xdr)` EOPNOTSUPP on the root frame every time - not a race - and
-    // that left a borrowed root at the 0o700 hold with `copytree` returning `Ok`.
+    // Put the borrowed root's mode back unless the walk stamped one over it, and surface a failure, since a caller told
+    // the copy succeeded would never learn the root is still owner-only. Ask the walk, not `CopyFlags::PERMISSIONS`,
+    // because `guard` swallows a failed stamp under `raise_error: false`.
     if let Some((fd, mode)) = borrowed
         && !root_stamped
     {
@@ -392,8 +344,6 @@ fn copy_one_mount(
                 stats.bytes += n;
             }
             EntryType::Symlink => {
-                // `Entry::read_link` is the walk's own reader over the same `O_PATH` handle - there is no second one
-                // here.
                 let target = entry.read_link()?;
                 make_symlink(parent_dst, entry.name(), &target, &st, config)?;
                 stats.symlinks += 1;
@@ -524,9 +474,8 @@ fn traverse_child_mounts(
 }
 
 fn make_dir(parent: BorrowedFd<'_>, name: &OsStr, config: &CopyTreeConfig) -> Result<OwnedFd> {
-    // Created owner-only (0o700), as the destination root is; the source's mode is applied by `finish_dir` on ascent,
-    // once the contents have landed - or, with no source mode coming, at the umask's answer outright. [`creation_mode`]
-    // has the whole rule.
+    // Created at the hold, as the destination root is, and given the source's mode by `finish_dir` on ascent.
+    // [`creation_mode`] has the whole rule.
     mkdir_at(parent, name, creation_mode(config, true), config.exist_ok)?;
     Ok(openat2(
         parent,
@@ -545,11 +494,9 @@ fn make_file(
     config: &CopyTreeConfig,
     c_fn: CopyFn,
 ) -> Result<u64> {
-    // Always `O_EXCL`, so the data only ever lands in an inode this copy created rather than one already at the name.
-    // With `exist_ok` an existing entry is replaced by filling a fresh inode under a temporary name and renaming it
-    // into place below, not opened and truncated.
-    // Created owner-private (0o600) until copy_permissions sets the real mode - or, with no real mode coming, at the
-    // umask's answer outright. [`creation_mode`] has the whole rule.
+    // Always `O_EXCL`, so the data only lands in an inode this copy created. With `exist_ok` a taken name is replaced
+    // by filling a fresh inode under a temporary name and renaming it over, never opened and truncated. Its mode is the
+    // one [`creation_mode`] picks.
     let how = OpenHow::new()
         .flags(OFlag::O_RDWR | OFlag::O_NOFOLLOW | OFlag::O_CREAT | OFlag::O_EXCL)
         .mode(Mode::from_bits_truncate(creation_mode(config, false)))
@@ -596,10 +543,6 @@ fn copy_into(
 }
 
 /// Create a file under a fresh random name in `dir`, with the same `how` as the destination it will be renamed over.
-///
-/// The name is 128 bits from `getrandom(2)`, so a single `O_EXCL` create is collision-free in practice - no retry loop
-/// and no shared counter. Its length is fixed rather than derived from the destination name, which would risk
-/// `ENAMETOOLONG` for a name already near `NAME_MAX`.
 fn create_temp(dir: BorrowedFd<'_>, how: OpenHow) -> Result<(OsString, OwnedFd)> {
     let name = temp_name()?;
     let fd = openat2(dir, name.as_os_str(), how)?;
@@ -608,10 +551,6 @@ fn create_temp(dir: BorrowedFd<'_>, how: OpenHow) -> Result<(OsString, OwnedFd)>
 
 /// A fresh staging name, for the three creators that replace a taken destination by building beside it and renaming
 /// over.
-///
-/// One generator, shared with `atomic_write`'s, which had the same job and not the same length rule: the `NAME_MAX`
-/// reasoning [`create_temp`] states travels with the name now instead of being restated beside one of the two call
-/// sites.
 fn temp_name() -> Result<OsString> {
     crate::sync_fs::atomic::staging_name(".copytree.tmp.")
 }
@@ -628,25 +567,14 @@ fn rename_over(dir: BorrowedFd<'_>, tmp: &OsStr, name: &OsStr) -> Result<()> {
 
 /// Recreate a symbolic link at `name`, pointing at `target`.
 ///
-/// With `exist_ok` a taken name is **replaced**, the way [`make_file`] replaces one: keeping whatever is there leaves a
-/// destination whose entry types and link targets diverge from the source while `copytree` returns `Ok` and counts the
-/// link in its stats. An incremental or re-run copy is exactly where that shows up, and a name pre-created as a regular
-/// file would survive a symlink source verbatim.
+/// With `exist_ok` a taken name is **replaced**, the way [`make_file`] replaces one, so a re-run copy does not keep an
+/// entry whose type or target differs from the source.
 ///
-/// # Ownership and timestamps
-///
-/// A link is the fourth creator, and it carries [`CopyFlags::OWNER`] and [`CopyFlags::TIMESTAMPS`] like the other
-/// three. **Neither is decoration on a link**: its own uid is what `fs.protected_symlinks` (`may_follow_link`,
-/// `fs/namei.c`) compares against the follower's, and what a sticky directory's delete rule reads, so a destination
-/// whose links all belong to whoever ran the copy denies and permits differently from the source it claims to be a copy
-/// of. Both are set through an `O_PATH` pin, which is the only way to name a link without following it - hence
-/// `fchownat`/`utimensat` with `AT_EMPTY_PATH` rather than [`copy_metadata`]'s `fchown` and [`apply_timestamps`]'
-/// `futimens`, both of which answer `EBADF` on such a handle.
-///
-/// [`CopyFlags::PERMISSIONS`] is not carried, and there is nothing to carry: a symbolic link's mode is `0o777` on Linux
-/// whatever is asked for, and `fchmodat2` refuses one (measured on ZFS: `EOPNOTSUPP` through an `O_PATH` handle with
-/// `AT_EMPTY_PATH`). [`CopyFlags::XATTRS`] is skipped for [`make_special`]'s reason - the `f*xattr` family refuses an
-/// `O_PATH` descriptor - and the VFS refuses `user.*` on a link anyway (`xattr_permission`, `fs/xattr.c`).
+/// [`CopyFlags::OWNER`] and [`CopyFlags::TIMESTAMPS`] are carried, since a link's own uid is what
+/// `fs.protected_symlinks` (`may_follow_link`, `fs/namei.c`) and a sticky directory's delete rule read.
+/// [`CopyFlags::PERMISSIONS`] has nothing to carry, since a link's mode is `0o777` on Linux and `fchmodat2` refuses
+/// one. [`CopyFlags::XATTRS`] is skipped because the `f*xattr` family refuses an `O_PATH` descriptor, and the VFS
+/// refuses `user.*` on a link anyway (`xattr_permission`, `fs/xattr.c`).
 fn make_symlink(
     parent: BorrowedFd<'_>,
     name: &OsStr,
@@ -680,6 +608,10 @@ fn make_symlink(
 
 /// Set the new link's ownership and timestamps. `name` is the destination the link is destined for, and is only used to
 /// name it in an error.
+///
+/// An `O_PATH` pin is the only way to name a link without following it, so this uses `fchownat` and `utimensat` with
+/// `AT_EMPTY_PATH`, which the kernel supports on such a handle, rather than `fchown` and `futimens`, which answer it
+/// `EBADF`. That is not a way round a refused call, since a link has no mode or xattrs to lose.
 fn make_symlink_meta(
     parent: BorrowedFd<'_>,
     at: &OsStr,
@@ -690,9 +622,8 @@ fn make_symlink_meta(
     if !config.flags.intersects(CopyFlags::OWNER | CopyFlags::TIMESTAMPS) {
         return Ok(());
     }
-    // Pin the link and set both attributes through this handle, so the name resolves exactly once and cannot be
-    // redirected between the `symlinkat` and these calls - `make_special_meta`'s reason, and `O_PATH` is what opens a
-    // symlink without following it.
+    // Pin the link and set both attributes through this handle, so the name resolves once and cannot be redirected
+    // between the `symlinkat` and these calls.
     let node = openat2(
         parent,
         at,
@@ -724,8 +655,7 @@ fn make_symlink_meta(
 /// Apply `src_st`'s atime/mtime to a node pinned by an `O_PATH` handle.
 ///
 /// `utimensat` with `AT_EMPTY_PATH` rather than [`apply_timestamps`]' `futimens`, which an `O_PATH` descriptor answers
-/// `EBADF` (`fdget` masks `FMODE_PATH`). The two creators with no data descriptor to stamp through
-/// - a special node and a symbolic link - share this one.
+/// `EBADF` (`fdget` masks `FMODE_PATH`). A special node and a symbolic link, which have no data descriptor, share it.
 fn utimes_at(node: BorrowedFd<'_>, src_st: &Statx, config: &CopyTreeConfig) -> Result<()> {
     if !config.flags.contains(CopyFlags::TIMESTAMPS) {
         return Ok(());
@@ -761,53 +691,17 @@ fn symlink_at(parent: BorrowedFd<'_>, name: &OsStr, target: &OsStr) -> std::resu
     }
 }
 
-/// Recreate a special file (FIFO, socket, or block/character device) by type rather than copying contents - a special
-/// file has none, and opening one for data would block (FIFO) or run a device's `open` method. Metadata is set directly
-/// on the new node (no data fd exists for these types), each attribute gated on its copy flag.
-///
-/// # Ownership, mode and timestamps only
-///
-/// Extended attributes and ACLs do not travel onto a special node, and routing this through [`copy_xattrs`] would not
-/// carry them either. The obstacle is the **source**: the walk pins source specials `O_PATH`, and the whole `f*xattr`
-/// family refuses such a descriptor with `EBADF`. For an empty path `path_setxattrat` resolves the fd through `fdget`
-/// (`fs/xattr.c:757`), which masks out `FMODE_PATH`; `setxattrat` with `AT_EMPTY_PATH` lands on that same branch, since
-/// `getname_maybe_null` returns NULL for an empty name (`fs/namei.c:233`).
-///
-/// Neither `/proc/self/fd/N` nor re-resolving the name is used to get round that. The `/proc` form carries the mode
-/// while the access control silently does not, and re-resolving reopens the redirect window the fd-based rule exists to
-/// close - [`make_special_meta`] measures what reopening a live FIFO costs its writers. What is missed is small either
-/// way: the VFS already refuses `user.*` on anything that is not a regular file or a directory (`xattr_permission`,
-/// `fs/xattr.c:154`), and [`copy_xattrs`] skips `system.` and `security.` by charter, so the gap is `trusted.*`
-/// plus any ACL the source node carries.
-///
-/// The destination's side of this - a real descriptor, and the types that cannot be given one - is on
-/// [`make_special_meta`].
+/// Recreate a special file (FIFO, socket, or block/character device) by type rather than copying contents, since a
+/// special file has none and opening one for data would block (FIFO) or run a device's `open` method.
+/// [`make_special_meta`] carries the metadata and says what cannot travel.
 fn make_special(parent: BorrowedFd<'_>, name: &OsStr, src_st: &Statx, config: &CopyTreeConfig) -> Result<()> {
     let mode = src_st.mode() as libc::mode_t;
-    // The mode to *create* with follows [`creation_mode`]'s rule, which the commit that introduced it applied to
-    // `make_dir` and `make_file` and not to this third creator. Passing `src_st.mode()` regardless of the flag carried
-    // the source's permission bits onto a FIFO, socket or device node while a regular file beside it took the
-    // permissive form: the same flag, the same source mode, two answers, and a source node at `0o600` produced a
-    // destination node no non-owner can open.
-    //
-    // The `S_IFMT` bits are the node's *type* rather than a permission, so they ride through both arms - `mknodat`
-    // selects on them.
-    //
-    // Always created at the hold, never at the source's mode - the same pattern `make_file` and `make_dir` use, and
-    // here it is load-bearing rather than tidy. `make_special_meta` opens this node `O_RDONLY` to carry metadata
-    // through a real descriptor, and a source FIFO with no owner-read bit (`0o200`, `0o000`) would then answer its own
-    // copy `EACCES` for an unprivileged caller - measured. Note the hold is only a *request*: where the destination
-    // parent carries an inheritable ACL the filesystem computes the mode from that instead, which `make_special_meta`'s
-    // open reports by name when it lands below owner-read.
-    //
-    // Under `PERMISSIONS` the real mode lands in `make_special_meta`'s `fchmod`, which the umask made necessary anyway;
-    // without it the node keeps the hold.
+    // Created at [`creation_mode`]'s hold, never at the source's mode, since `make_special_meta` opens the node
+    // `O_RDONLY` and a source FIFO with no owner-read bit would refuse its own copy `EACCES`. The `S_IFMT` bits are the
+    // type, which `mknodat` selects on.
     let create_mode = (mode & libc::S_IFMT) | creation_mode(config, false);
-    // With `exist_ok` a taken name is **replaced**, the way `make_file` replaces one: the node is built beside it and
-    // renamed over. Keeping whatever is there leaves a destination whose entry types diverge from the source - a name
-    // pre-created as a regular file survives a FIFO source verbatim - while `copytree` returns `Ok` and counts the
-    // special in its stats. Every exit from here on has to take the staging entry with it, which is what the two-step
-    // tail below is.
+    // With `exist_ok` a taken name is replaced, the way `make_file` replaces one, by building beside it and renaming
+    // over. Every exit from here on has to take the staging entry with it.
     let staged = match mknod_at(parent, name, create_mode, src_st) {
         Ok(()) => None,
         Err(Errno::EEXIST) if config.exist_ok => {
@@ -819,11 +713,8 @@ fn make_special(parent: BorrowedFd<'_>, name: &OsStr, src_st: &Statx, config: &C
     };
     let at: &OsStr = staged.as_deref().unwrap_or(name);
     let outcome = make_special_meta(parent, at, name, src_st, config);
-    // The two arms differ on purpose. A staged entry is scratch under a random name that nothing will ever look for, so
-    // a failure takes it with it. A node created at the *destination* name is not scratch: it is part of the
-    // partially-copied tree the caller keeps along with the `Err`, exactly as `make_file` leaves a partially written
-    // file and `make_symlink` leaves its link. Unlinking it here would make specials the only creator that erases its
-    // own evidence.
+    // The two arms differ on purpose. A failed staged entry is scratch and goes. A node at the destination name stays
+    // with the `Err`, as `make_file` leaves a partly written file and `make_symlink` its link.
     match (staged, outcome) {
         (None, r) => r,
         (Some(tmp), Ok(())) => rename_over(parent, tmp.as_os_str(), name),
@@ -852,43 +743,23 @@ fn mknod_at(
 
 /// Carry the source's ownership, mode and timestamps onto the new node, through a **real descriptor** on it.
 ///
-/// A FIFO is opened `O_RDONLY|O_NONBLOCK`, which completes immediately with no writer - the non-blocking read-open is
-/// exactly the case `open(2)` documents as not waiting - and `fchmod`, `fchown` and `futimens` all work on the result.
+/// A FIFO is opened `O_RDONLY|O_NONBLOCK`, which completes at once with no writer, and the result takes the owner, mode
+/// and timestamps. The type is checked through an `O_PATH` handle first, since a real open runs the file's `open`
+/// method and `O_PATH` does not, and the two handles must be the same `(dev, ino)`, so a swap between the opens is
+/// refused.
 ///
-/// **The type is established through an `O_PATH` handle first**, because a real read-open runs the file's `open` method
-/// and `O_PATH` does not. Only then is the node opened for real, and the two handles are required to be the same `(dev,
-/// ino)`. Without that order, something planted at the destination name would be opened before anything knew what it
-/// was; with it, a swap between the two opens is refused instead. That second check is defensive and has no test:
-/// driving it needs a swap landing inside a two-syscall window, and the destination directory is held at `0o700` for
-/// the copy precisely so nothing else can create entries there.
+/// **A socket or a device node gives up its mode, and only its mode.** A socket answers `ENXIO` to every `open(2)` and
+/// opening a device runs its driver, so neither can be given the real descriptor `fchmod` needs, and [`fchmod_fd`] says
+/// why the mode is never routed round that. The refusal goes through [`guard`], so under `raise_error: false` the copy
+/// continues and the node keeps the creation hold. Owner and timestamps are still carried, through `fchownat` and
+/// `utimensat` with `AT_EMPTY_PATH` on the `O_PATH` handle, as [`make_symlink_meta`] does.
 ///
-/// **The access ACL is still not carried, for any special type**, and that is a real gap in
-/// [`CopyFlags::PERMISSIONS`] - "copy ACL xattrs, *or* `fchmod` when no ACL is present" - not a thing this function
-/// forgot. The destination FIFO has a real descriptor and could take one; the *source* does not. The walk pins source
-/// specials `O_PATH`, and that cannot read an xattr at all - `fgetxattr` and `getxattrat` with `AT_EMPTY_PATH` both
-/// answer it `EBADF`, measured.
-///
-/// Reopening the source FIFO for real is not a way out, and the cost is worse than a perturbation. Measured: a process
-/// blocked in `open(O_WRONLY)` on that FIFO is **released** by our read-open, and once we close - having read the ACL -
-/// its next `write` answers `EPIPE`, which under the default disposition kills it. A read-only copy would be
-/// terminating live processes on the tree it is reading. Reading by name instead re-resolves it, which is the hole this
-/// function exists to close. So a
-/// source `u:1000:r--` does not travel onto any special node;
-/// `a_special_file_takes_the_mode_and_not_the_acl` pins it so the limit is visible rather than discovered.
-///
-/// **A socket or a device node gives up its mode, and only its mode.** Neither can be given a real descriptor - a
-/// socket answers `ENXIO` to every `open(2)`, and opening a device runs the driver's `open` method, which a file copy
-/// must not do - so `fchmod`, which needs one, is refused. The workarounds that make *that* call appear to work -
-/// `fchmodat2(2)`'s empty-path form on an `O_PATH` pin, or `/proc/self/fd/N` - are not used here: an `O_PATH` handle
-/// cannot carry an ACL or an xattr at all (`fsetxattr` and `setxattrat` with `AT_EMPTY_PATH` both answer it `EBADF`,
-/// measured), so they carry the mode while the access control silently does not travel, and the copy reports `Ok`.
-///
-/// Ownership and timestamps are a different question and are **carried**, through `fchownat` and `utimensat` with
-/// `AT_EMPTY_PATH` on the peek - the forms the kernel supports on an `O_PATH` handle, which [`make_symlink_meta`]
-/// already uses for the same reason. Refusing those too would give up three attributes to report one.
-///
-/// The mode's refusal is a metadata-copy failure like any other, so it goes through [`guard`]: under `raise_error:
-/// false` the copy continues and the node keeps the creation hold.
+/// **No special type gets the source's ACL or xattrs.** The walk pins source specials `O_PATH`, which `fgetxattr` and
+/// `getxattrat` with `AT_EMPTY_PATH` answer `EBADF`. Reopening a source FIFO for real would release a writer blocked in
+/// `open(O_WRONLY)`, whose next `write` after our close gets `EPIPE`, which kills it by default, and reading by name
+/// re-resolves it. The VFS refuses `user.*` on a special node anyway (`xattr_permission`, `fs/xattr.c`) and
+/// [`copy_xattrs`] skips `system.` and `security.`, so the loss is `trusted.*` and any ACL.
+/// `a_special_file_takes_the_mode_and_not_the_acl` pins it.
 ///
 /// With none of the three flags set there is nothing to carry, so nothing is opened and every type is copied.
 fn make_special_meta(
@@ -899,11 +770,9 @@ fn make_special_meta(
     config: &CopyTreeConfig,
 ) -> Result<()> {
     let ifmt = libc::S_IFMT as u16;
-    // Verify the node FIRST, and for every type, whatever the flags say. `make_special`'s staging path renames this
-    // name into place afterwards, so a node swapped under the copy is one the rename would publish - metadata or no
-    // metadata. `O_PATH` never invokes the file's `open` method and a real read-open does, so the look comes before any
-    // real open: if something other than our node is at this name - a device node, which needs `CAP_MKNOD` to plant but
-    // is not impossible - opening it first would run that driver.
+    // Verify the node first, for every type and whatever the flags say, since `make_special`'s staging path renames
+    // this name into place afterwards. `O_PATH` never runs the file's `open` method, so a device node planted here is
+    // looked at and not opened.
     let peek = openat2(
         parent,
         at,
@@ -928,20 +797,9 @@ fn make_special_meta(
     }
     let kind = src_st.mode() & ifmt;
     if kind != libc::S_IFIFO as u16 {
-        // Only the **mode** is impossible on this type. `fchownat` and `utimensat` with `AT_EMPTY_PATH` are supported
-        // on an `O_PATH` handle - measured here on a socket and a FIFO, and type-agnostic in the kernel: `chown_common`
-        // (`fs/open.c:754`) tests the inode's type only to kill setid on a non-directory, and `do_utimes_path` accepts
-        // the flag outright (`fs/utimes.c:86`). They are the same two calls `make_symlink_meta` makes on a symlink,
-        // which cannot be opened any other way either. The rule they sit under is about using an empty-path form to get
-        // round a call that *refused* the handle, which is only ever chmod and the xattr family - and the chmod is
-        // exactly what is refused below rather than routed around.
-        //
-        // The peek is the only handle here, so there is no second open and no window for a swap: `changed(&peek_st)`
-        // above already verified what these calls are about to touch.
-        //
-        // `copy_metadata`'s ordering: ownership first (a chown bumps ctime and clears setid), timestamps last, and the
-        // one failure that can be swallowed after both - so what can travel does, in either disposition, and the error
-        // reports only what did not.
+        // Only the mode is impossible here. `fchownat` and `utimensat` with `AT_EMPTY_PATH` work on an `O_PATH` handle
+        // of any type (`chown_common` in `fs/open.c`, `do_utimes_path` in `fs/utimes.c`), on the peek verified above.
+        // The mode's refusal comes last, so what can travel does in either disposition.
         if config.flags.contains(CopyFlags::OWNER) {
             // Ownership failures always propagate (matching `copy_metadata`).
             retry_on_eintr(|| unsafe {
@@ -964,14 +822,8 @@ fn make_special_meta(
             libc::S_IFBLK => "block device",
             _ => "special file",
         };
-        // Through `guard`, because this is a metadata-copy failure and nothing else: it fires only *because* the mode
-        // was requested, and the node is already created and already verified above. That is the class
-        // `CopyTreeConfig::raise_error` documents as "ignored, and the copy continues" when false - the mode a
-        // migration uses to salvage a tree - and returning past it made one unix socket anywhere in the source fail the
-        // whole copy in both dispositions.
-        //
-        // Swallowed, the node keeps the creation hold: releasing that needs the `fchmod` this very refusal says the
-        // node cannot be given.
+        // Through `guard`, as any metadata-copy failure, so one socket does not fail a `raise_error: false` copy.
+        // Swallowed, the node keeps the creation hold.
         return guard(
             config,
             Err(Error::Validation(format!(
@@ -986,16 +838,9 @@ fn make_special_meta(
             ))),
         );
     }
-    // A read-open of a FIFO with `O_NONBLOCK` does not wait for a writer.
-    //
-    // `EACCES` here is the copy's own doing and must not reach a caller as a bare errno. [`creation_mode`]'s hold is a
-    // *request*: what a new node is created with is the filesystem's to decide. Where the destination parent carries an
-    // inheritable ACL the umask never applies and the mode is narrowed through the inherited entries instead -
-    // `zpl_init_acl` takes that branch into `__posix_acl_create` (`module/os/linux/zfs/zpl_xattr.c`), as the VFS does
-    // in `posix_acl_create` (`fs/posix_acl.c`), and `zfs_acl_ids_create` recomputes it outright for NFSv4 - so a parent
-    // whose inherited entries withhold owner-read produces a node this very copy cannot open. The umask reaches the
-    // same state by the other route, which is why the refusal reports the mode the peek measured rather than naming a
-    // cause it cannot tell apart.
+    // A read-open of a FIFO with `O_NONBLOCK` does not wait for a writer. `EACCES` is the copy's own doing, since the
+    // hold is only a request and an inherited ACL (`__posix_acl_create`, `zfs_acl_ids_create`) or the umask can
+    // withhold owner-read, so the error reports the mode the peek measured.
     let node = openat2(
         parent,
         at,
@@ -1051,16 +896,10 @@ fn make_special_meta(
 
 /// The names to consider copying off `fd`, or an empty list where the copy flags ask for none.
 ///
-/// Routed through [`guard`] like every other metadata step, because listing the names is one: `raise_error: false` is
-/// the mode a migration uses to salvage a tree, and this was the one metadata call that propagated regardless.
-/// `flistxattr` really does fail on a well-formed file - the kernel clamps its buffer to `XATTR_LIST_MAX` (65536,
-/// `limits.h:17`, and not raised by the patch that lifts xattr *values* to 2 MiB) and rewrites the resulting `ERANGE`
-/// to `E2BIG` (`listxattr`, `fs/xattr.c:989-993`), while ZFS with `xattr=sa` accepts far more name bytes than that. Two
-/// of the three callers are directory-frame initialisers, so one directory with a large name list killed the copy of
-/// everything beneath it.
-///
-/// The degraded entry still gets its mode, owner and timestamps: `copy_permissions` takes its `fchmod` branch when no
-/// ACL name is in the list.
+/// Routed through [`guard`] like every other metadata step. `flistxattr` fails `E2BIG` on a well-formed file whose
+/// names pass `XATTR_LIST_MAX` (`listxattr`, `fs/xattr.c`), which ZFS `xattr=sa` allows, and one such directory must
+/// not kill a `raise_error: false` copy of everything beneath it. The entry still gets its mode, owner and timestamps,
+/// since `copy_permissions` takes its `fchmod` branch when no ACL name is listed.
 fn list_xattrs(fd: BorrowedFd<'_>, config: &CopyTreeConfig) -> Result<Vec<CString>> {
     if !config.flags.intersects(CopyFlags::PERMISSIONS | CopyFlags::XATTRS) {
         return Ok(Vec::new());
@@ -1087,9 +926,8 @@ fn copy_metadata(
 ) -> Result<bool> {
     let mut stamped = false;
     let mode = src_st.mode() as u32;
-    // Ownership is applied first: chowning a non-directory makes the kernel clear its setuid/setgid bits and any
-    // `security.capability`, so the mode and the xattrs have to land after it. Ownership failures always propagate
-    // (matching the `truenas_os` C extension).
+    // Ownership is applied first, since chowning a non-directory clears its setuid/setgid bits and any
+    // `security.capability`, so the mode and the xattrs land after it. Ownership failures always propagate.
     if config.flags.contains(CopyFlags::OWNER) {
         retry_on_eintr(|| unsafe { libc::fchown(dst.as_raw_fd(), src_st.uid(), src_st.gid()) })?;
     }
@@ -1097,27 +935,9 @@ fn copy_metadata(
         let r = copy_permissions(src, dst, xattrs, mode);
         stamped = r.is_ok();
         if !stamped {
-            // `creation_mode` made this object at a `0o700`/`0o600` hold on the promise that the source's mode lands
-            // here, and the call above is the only thing that delivers it. Release the hold rather than leave it as the
-            // final mode.
-            //
-            // **Before `guard`, deliberately**, so the mode lands in either disposition. The case this exists for is
-            // `raise_error: false`, where `guard` answers `Ok(())` and `copytree` returns success with plausible stats
-            // over a tree that is owner-only root to leaf.
-            //
-            // **This object, and nothing above it.** `finish_dir` stamps a directory on *ascent*, so a `raise_error:
-            // true` walk that stops here drops every ancestor frame unstamped and they keep the `0o700` hold; an
-            // ownership failure propagates from the `fchown` above without reaching this line at all. Deliberate, not
-            // missed: an aborted copy's destination is not a finished artifact. The caller owns every object in it and
-            // can enter it
-            // - an unprivileged `fchown` to another uid is `EPERM`, so it
-            // never happened, and a privileged one is root's - while widening an incomplete tree to the source's modes
-            // would publish a partial result to identities that should not be reading it yet. A retry under the default
-            // `exist_ok` re-stamps the whole tree.
-            //
-            // A failure to release is swallowed: `r` is already an error on its way to `guard`, which is the verdict
-            // the caller asked for, and replacing it with this one would report the repair's failure in place of the
-            // cause.
+            // Release `creation_mode`'s hold before `guard`, so a `raise_error: false` copy cannot return `Ok` over an
+            // owner-only tree. Only this object is released. An aborted walk leaves its ancestors at the hold on
+            // purpose, since widening a partial tree would publish it early. A failed release keeps `r` as the cause.
             stamped = release_creation_hold(dst, mode).unwrap_or(false);
         }
         guard(config, r)?;
@@ -1185,62 +1005,26 @@ fn mkdir_at(dirfd: BorrowedFd<'_>, name: &OsStr, mode: libc::mode_t, exist_ok: b
 ///   source root's mode from the root frame once the walk completes;
 /// * a *borrowed* root's own mode, put back by `copytree` on both exits.
 ///
-/// With neither - a root this copy created, and no `PERMISSIONS` - the narrowing would be the final mode, which is the
-/// defect [`creation_mode`] exists to close. `grants_others` is the only thing worth narrowing.
-///
-/// **A created root can need this too, which is not obvious**, and getting it wrong is not visible on any filesystem
-/// that lacks NFSv4 ACLs. A created root's mode is normally at most what was asked for, since the umask can only
-/// narrow - but with an inheritable ACE on the destination's parent, ZFS hands the new directory the inherited ACL and
-/// then recomputes its mode from it: `zfs_mode_compute` (`module/os/linux/zfs/zfs_acl.c`) keeps only
-/// `S_IFMT|S_ISUID|S_ISGID|S_ISVTX` of the requested mode and rebuilds every rwx bit out of the ACEs, so `0o700` can
-/// come back `0o770`. Under `aclmode=restricted` the requested mode is not consulted at all -- `zfs_acl_inherit` clears
-/// `need_chmod` whenever anything was inherited, so `zfs_acl_chmod` never folds it in.
-///
-/// POSIX ACLs cannot reach this: default-ACL inheritance intersects with the requested mode rather than replacing it
-/// (measured on a `posixacl` dataset: a `0o777` default ACL still yields `0o700` for a `mkdir(0o700)`). So the live
-/// case belongs to the QEMU lane's `acltype=nfsv4` dataset, and what is pinned here is the decision.
+/// **A created root can need this too.** With an inheritable ACE on the destination's parent, ZFS rebuilds every rwx
+/// bit of the new directory from the inherited ACL (`zfs_mode_compute`, `module/os/linux/zfs/zfs_acl.c`), so `0o700`
+/// can come back `0o770`, and under `aclmode=restricted` the requested mode is not consulted at all (`zfs_acl_inherit`
+/// clears `need_chmod`). A POSIX default ACL only intersects with the requested mode, so only `acltype=nfsv4` shows it.
 fn narrows_the_root(grants_others: bool, created: bool, permissions: bool) -> bool {
     grants_others && (!created || permissions)
 }
 
 /// The mode a destination object is created with.
 ///
-/// `0o700`/`0o600` is a **hold**: the source's mode is broader and lands later ([`finish_dir`] on ascent for a
-/// directory, [`copy_metadata`] for a file), so group and other are not granted access to bytes still being written. It
-/// only means anything when a later mode is coming.
-///
-/// Without [`CopyFlags::PERMISSIONS`] none is, and nothing released the hold: `copy_metadata`'s `copy_permissions` call
-/// is gated on that flag, so a `copytree` asking for `XATTRS | OWNER | TIMESTAMPS` produced `0o700` directories and
-/// `0o600` files throughout and returned `Ok`, with no non-owner identity able to enter the destination and nothing in
-/// the result saying so.
-///
-/// So the permissive form is the *creation* mode there, not a mode stamped afterwards: whatever a plain `mkdir` or
-/// `open` would have produced is the only reading of "do not copy permissions" that leaves a usable tree, and handing
-/// the same mode to the same syscall is how you get it.
-///
-/// What that resolves to is the **filesystem's** business, not this function's, and "the umask" is only one of the
-/// three answers.
-///
-/// * No ACL inheritance: the caller's umask, the caller's standing statement about who may read what it creates.
-///   `mode_strip_umask` (`include/linux/namei.h`) applies it in the VFS - but *only* when `!IS_POSIXACL(dir)`; where
-///   the filesystem does POSIX ACLs the VFS defers, so this is not the universal case it reads as.
-/// * POSIX ACLs with a default ACL on the parent: `posix_acl_create` (`fs/posix_acl.c`) applies the umask on its
-///   no-default-ACL branch and otherwise lets `posix_acl_create_masq` narrow the mode by the inherited entries instead.
-///   ZFS reaches the same helper directly - `zpl_init_acl` calls `__posix_acl_create`
-///   (`module/os/linux/zfs/zpl_xattr.c`).
-/// * NFSv4 ACLs with an inheritable ACE on the parent: the inherited ACL, full stop. `zfs_acl_ids_create` recomputes
-///   the mode from it (`zfs_mode_compute` keeps only `S_IFMT|S_ISUID|S_ISGID|S_ISVTX` of what was asked for), and under
-///   `aclmode=restricted` the requested mode is not consulted at all - `zfs_acl_inherit` clears `need_chmod` whenever
-///   anything was inherited.
-///
-/// In all three the answer is the one the object would have been created with, which is the point; none of them is this
+/// Under [`CopyFlags::PERMISSIONS`], `0o700`/`0o600` is a **hold** that the source's mode releases later
+/// ([`finish_dir`] on ascent for a directory, [`copy_metadata`] for a file), so group and other never reach bytes still
+/// being written. Without it nothing would release a hold, so the object is created at the permissive form and keeps
+/// what a plain `mkdir` or `open` gives. That is the filesystem's answer, from the umask, a POSIX default ACL
+/// (`posix_acl_create`, `fs/posix_acl.c`) or an inherited NFSv4 ACL (`zfs_acl_ids_create`), and none of it is this
 /// function's to compute.
 ///
-/// Stamping it afterwards instead would put an `fchmod` on every created object, and on ZFS a chmod is never just a
-/// mode change: `zfs_acl_chmod_setattr` (`module/os/linux/zfs/zfs_acl.c`) rewrites the ACL to agree with the new mode,
-/// and under the default `aclmode=discard` replaces it outright - destroying whatever the destination parent passed
-/// down to it. Under `aclmode=restricted` it would not even do that: the chmod is refused `EPERM`, so the hold would
-/// never be released and the tree would stay owner-only anyway.
+/// Do not stamp the mode afterwards instead. On ZFS a chmod rewrites the ACL to match the mode, and replaces what the
+/// parent passed down under the default `aclmode=discard` (`zfs_acl_chmod_setattr`, `module/os/linux/zfs/zfs_acl.c`),
+/// while `aclmode=restricted` refuses it `EPERM`.
 fn creation_mode(config: &CopyTreeConfig, is_dir: bool) -> libc::mode_t {
     match (config.flags.contains(CopyFlags::PERMISSIONS), is_dir) {
         (true, true) => 0o700,
@@ -1252,16 +1036,11 @@ fn creation_mode(config: &CopyTreeConfig, is_dir: bool) -> libc::mode_t {
 
 /// Set `mode` on the open file `fd` refers to, through `fchmod(2)`.
 ///
-/// **`fd` must be a real descriptor, never `O_PATH`.** Every metadata call in this module is fd-based on purpose: the
-/// descriptor *is* the object, so no name is resolved twice and there is no window for one to be swapped. An `O_PATH`
-/// handle is not an open file - `fchmod(2)`, `fsetxattr(2)` and `setxattrat(2)`'s empty-path form all answer it
-/// `EBADF`, measured - so code that pins with `O_PATH` cannot carry metadata and must not pretend to.
-///
-/// Handed one, this fails immediately and says so, rather than routing around it. The two known workarounds are both
-/// refused here: `fchmodat2(2)`'s empty-path form, and `/proc/self/fd/N`. They make the call appear to work while
-/// leaving the caller holding a handle that cannot carry an ACL or an xattr at all, so the mode travels and the access
-/// control silently does not. If you need metadata on an object, open it for real; if it cannot be opened for real,
-/// that is the thing to report.
+/// **`fd` must be a real descriptor, never `O_PATH`.** Metadata calls here are fd-based, so no name is resolved twice.
+/// An `O_PATH` handle gets `EBADF` from `fchmod(2)`, `fsetxattr(2)` and `setxattrat(2)`'s empty-path form, so it cannot
+/// carry metadata, and handed one this fails at once. Do not route round it with `fchmodat2(2)`'s empty-path form or
+/// `/proc/self/fd/N`. Those carry the mode while the ACL and xattrs silently do not, and the copy reports `Ok`. An
+/// object that cannot be opened for real is the thing to report.
 fn fchmod_fd(fd: BorrowedFd<'_>, mode: libc::mode_t) -> Result<()> {
     if is_o_path(fd)? {
         return Err(Error::Validation(

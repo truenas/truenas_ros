@@ -5,10 +5,6 @@
 //! (`RESOLVE_NO_SYMLINKS`); entries are opened relative to their parent directory fd. The caller drives the loop, so
 //! progress reporting is just the caller's own bookkeeping (there is no internal callback).
 //!
-//! This is a from-scratch Rust rewrite, not a translation of the `truenas_os` C extension's manual directory-stack /
-//! fd-recycling machinery - but it does reproduce that extension's **recovery-cookie** resume feature natively (see
-//! [`Cookie`]).
-//!
 //! # Resuming an interrupted traversal
 //!
 //! [`FsIter::cookie`] snapshots the current directory stack as a [`Cookie`] -- an ordered list of `(path, inode)`
@@ -275,12 +271,10 @@ impl Entry {
     /// is an `O_PATH` handle (a special file may instead be a non-blocking one) usable with `statx` and
     /// [`Entry::read_link`]. Read file data only from an [`EntryType::File`] fd.
     ///
-    /// A **directory** entry's descriptor shares its open file description with this iterator, which duplicates it to
-    /// descend. Reading the directory stream through it - `getdents64`, or an `lseek` past what a `DIR` has already
-    /// buffered - moves the cursor the walk is still reading, and the walk then yields a short listing with no error
-    /// anywhere in it. Reopen for a private cursor (`openat(fd, ".", O_RDONLY | O_DIRECTORY)`, as `shutil`'s
-    /// `reopen_dir` does) rather than reading this one. `statx`, [`Entry::read_link`] and reading a file entry's data
-    /// are all unaffected.
+    /// A **directory** entry's descriptor shares its open file description with the walk, so reading its stream
+    /// (`getdents64`, or an `lseek`) moves the cursor the walk is still reading, and the walk yields a short listing
+    /// with no error. Reopen it for a private cursor (`openat(fd, ".", O_RDONLY | O_DIRECTORY)`) rather than reading
+    /// this one.
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
@@ -365,24 +359,11 @@ impl FsIter {
     /// Open and (if a directory) descend into a single directory entry. Returns `Ok(None)` for entries that are
     /// silently pruned.
     fn process(&mut self, dirent: &DirEntry) -> Result<Option<Entry>> {
-        // SECURITY: a `readdir` name is data, and the only screen above this is `is_dot` - an equality test against
-        // exactly `.` and `..`, which `../outside`, `a/b` and `a/../..` all pass. Nothing in `ITER_RESOLVE` refuses a
-        // `..` *component*: `RESOLVE_NO_SYMLINKS` governs symlinks (`fs/namei.c:1944`), and `follow_dotdot` refuses
-        // only under `LOOKUP_BENEATH` (`:2107-2108`), which is not set, while `RESOLVE_NO_XDEV` stays satisfied for as
-        // long as the escape stays on this filesystem. So `openat2` resolves the name, the entry is statx'd and
-        // btime-filtered as if it belonged, and a directory is pushed as a frame at `parent.join(name)` - the walk
-        // continues outside its root, and `Entry::name` hands the same bytes to a consumer whose own `*at` calls honour
-        // no RESOLVE flag. That is why `mkdirat`, `unlinkat`, `renameat2` and `linkat` all screen with this rule.
-        //
-        // `RESOLVE_BENEATH` is deliberately *not* the fix. Its refusal is `EXDEV`, which the mount-crossing arm below
-        // answers by re-opening with `RESOLVE_NO_SYMLINKS` alone - so it would route the escape through the one arm
-        // that drops the confinement, and a single component cannot escape a dirfd anyway once this screen is in front
-        // of it.
-        //
-        // Refused, not skipped: a listing that silently drops entries reads as complete, which is data loss for the
-        // recursive copy or delete built on it - the line `is_subtree_skip` settles for `query_tree`. The trigger is an
-        // untrustworthy `readdir` (FUSE, a corrupt directory, a foreign image), which this walk's mount-source check
-        // does not cover: it pins the dataset name, not the filesystem's honesty.
+        // SECURITY. A `readdir` name is data, and `is_dot` screens only exactly `.` and `..`. `ITER_RESOLVE` refuses no
+        // `..` component (`follow_dotdot` refuses only under `LOOKUP_BENEATH`, `fs/namei.c`), so `../outside` would be
+        // walked outside the root. `RESOLVE_BENEATH` is not the fix, since its `EXDEV` lands in the mount-crossing arm
+        // below, which reopens without confinement. Refused, not skipped, for the reason `is_subtree_skip` gives for
+        // `query_tree`.
         if crate::path::component_defect(dirent.name.as_bytes()).is_some() {
             return Err(Errno::EINVAL.into());
         }
@@ -402,10 +383,9 @@ impl FsIter {
         } else if is_lnk || is_special_hint {
             OPATH_OFLAGS
         } else {
-            // A regular file, or an entry whose type `readdir` didn't report (`DT_UNKNOWN`). Open it readably, but add
-            // `O_NONBLOCK`: if it is really a FIFO - a filesystem that doesn't fill `d_type`, or an entry swapped under
-            // us between `readdir` and here - the open returns immediately instead of blocking on an absent writer.
-            // `O_NONBLOCK` has no effect on regular-file reads, so a regular file's handed-back fd behaves normally.
+            // A regular file, or an entry whose type `readdir` didn't report (`DT_UNKNOWN`). `O_NONBLOCK` makes a FIFO
+            // hiding behind one open at once instead of blocking on an absent writer, and does not affect a regular
+            // file's reads.
             self.file_open_flags | OFlag::O_NONBLOCK
         };
 
@@ -601,9 +581,7 @@ impl FsIterBuilder {
     /// Start iterating at a subdirectory relative to the mountpoint.
     ///
     /// Judged at [`build`](Self::build) by [`crate::path::relative_defect`]: a path that is absolute, empty, or carries
-    /// a `.`/`..`/empty component is refused `EINVAL` there. Without that the joined walk escapes the mountpoint -
-    /// `../outside` resolves - and the only confinement left is the mount-source check, which catches crossing datasets
-    /// and not `..` within one.
+    /// a `.`/`..`/empty component is refused `EINVAL` there.
     pub fn relative_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.relative_path = Some(path.into());
         self
@@ -742,11 +720,8 @@ fn is_dot(name: &OsStr) -> bool {
 /// The birth-time cutoff decision for one entry: `Some(true)` to skip it, `Some(false)` to keep it, `None` when the
 /// filesystem reported no birth time and the question therefore has no answer.
 ///
-/// The mask check is what makes the filter honest, and dropping it is the tempting simplification. A filesystem that
-/// records no birth time leaves `STATX_BTIME` clear and `stx_btime` zero, so a bare compare reads every file as born at
-/// the epoch, keeps all of them, and looks exactly like a cutoff nothing happened to exceed. The caller cannot tell the
-/// two apart, which is why this reports the third case rather than guessing. ZFS always reports a birth time, so on a
-/// dataset `None` never happens.
+/// Do not drop the mask check. Without `STATX_BTIME` the `stx_btime` is zero, so a bare compare reads every file as
+/// born at the epoch and keeps it, which looks exactly like a cutoff nothing exceeded.
 fn btime_skips(st: &Statx, cutoff: i64) -> Option<bool> {
     if cutoff == 0 {
         return Some(false);
@@ -776,10 +751,8 @@ fn restore_stack(stack: &mut Vec<DirFrame>, cookie: &[DirStackEntry]) -> Result<
                     });
                 }
             };
-            // A name that is not a single component can never be the saved child - `process` refuses one, so the walk
-            // never descended into it - and it must not be opened here either, for the reason stated there. Skipped
-            // rather than refused: this loop is searching for one inode, not listing, and every entry it passes over is
-            // consumed either way.
+            // A name that is not a single component can never be the saved child, since `process` refuses one, and must
+            // not be opened here either. Skipped rather than refused, since this loop searches for one inode.
             if is_dot(&dirent.name)
                 || crate::path::component_defect(dirent.name.as_bytes()).is_some()
                 || dirent.d_ino != want
@@ -820,11 +793,8 @@ fn restore_stack(stack: &mut Vec<DirFrame>, cookie: &[DirStackEntry]) -> Result<
 #[cfg(test)]
 mod tests {
 
-    /// A persisted cookie is attacker-adjacent input: it survives a crash and a rebuild, and `from_bytes` sizes an
-    /// allocation from a `u32` read straight out of it. The depth bound has to be checked *before*
-    /// `Vec::with_capacity`, or a ten-byte blob declaring `u32::MAX` entries reserves gigabytes - the same shape as
-    /// `a_declared_string_count_cannot_size_an_allocation` in `mount/statmount.rs`. The version gate is the other half:
-    /// a blob from a format that no longer means what it says must be refused rather than decoded.
+    /// A persisted cookie is untrusted input, and `from_bytes` sizes an allocation from a `u32` read out of it, so the
+    /// depth bound is checked before `Vec::with_capacity`. A blob of another version is refused rather than decoded.
     #[test]
     fn a_cookie_cannot_declare_a_version_or_a_depth_it_does_not_have() {
         let good = Cookie::default().to_bytes();
@@ -903,10 +873,8 @@ mod tests {
     /// **SECURITY.** A `readdir` name is data the filesystem supplies, and the walk's only screen above `process` is
     /// `is_dot` - an equality test against exactly `.` and `..`.
     ///
-    /// The kernel premise is asserted first, because the screen is worth exactly what it prevents: `ITER_RESOLVE` does
-    /// not refuse a `..` component, so `openat2` resolves `../outside` from the walk's own anchor and the entry would
-    /// be statx'd, filtered and
-    /// - as a directory - descended into, all outside the root.
+    /// The kernel premise is asserted first, that `ITER_RESOLVE` does not refuse a `..` component, so an unscreened
+    /// `../outside` would be opened and walked outside the root.
     #[test]
     fn a_readdir_name_that_is_not_one_component_is_refused() {
         let dir = crate::tempdir().unwrap();

@@ -1,29 +1,16 @@
 //! Whole-directory name reads over an already-open descriptor.
 //!
-//! The base layer's answer to "what does this directory hold": one call, one `Vec` of raw names with the type `readdir`
-//! reported for each. There is no io_uring `getdents` opcode, so an async consumer runs [`read_names`] inside an
-//! offload job over a descriptor its credential-checked step already opened. The traversal built on the same stream is
-//! [`iter`](crate::sync_fs::iter) (feature `fsiter`), which owns descent, resume and mount pinning; this module is
-//! deliberately smaller — names out, nothing followed, nothing opened.
+//! [`read_names`] gives one `Vec` of raw names with the type `readdir` reported for each, and [`Listing`] reads one
+//! entry at a time from a cookie, for a listing a peer resumes, as NFS READDIR does. There is no io_uring `getdents`
+//! opcode, so an async consumer runs these in an offload job over a descriptor its credential-checked step already
+//! opened. Names out, nothing followed, nothing opened. The traversal is [`iter`](crate::sync_fs::iter) (feature
+//! `fsiter`).
 //!
-//! **The descriptor contract.** Everything here reads through a descriptor the caller supplies, and two properties
-//! travel with one.
-//!
-//! A `dup` - `F_DUPFD_CLOEXEC` included - shares the *open file description*, and a directory's read position lives
-//! there rather than in the descriptor. Two readers over dups of one description therefore consume each other's
-//! entries, and `readdir` reports nothing when they do: the loss is a short listing, not an error. **A shared
-//! description is single-reader.** That is not a lock this module can take, because the
-//! sharing is invisible from the descriptor number;
-//! [`iter::Entry::fd`](crate::sync_fs::iter::Entry::fd) states the same rule for the descriptor a walk hands out.
-//!
-//! Reopening would buy a private position, and would pay for it in authority: a fresh open is checked against the
-//! process that opens it, not against whoever obtained the descriptor it starts from - which in a process running as
-//! root is no check at all. So this module dups and spends the position rather than reopening and widening the right,
-//! and the position is the caller's to protect.
-//!
-//! A listing a peer resumes, as NFS READDIR does from a cookie, is [`Listing`]. It reads one entry at a time with the
-//! cookie that goes on after it, and starts from any cookie an entry gave, on the same dup and under the same contract.
-//! It takes `getdents64` straight, into room its caller sizes, since a stream's buffer is lost at every seek.
+//! **A shared description is single-reader.** Both read on a `dup`, which shares the open file description, and a
+//! directory's read position lives there, so two readers over dups of one description consume each other's entries, and
+//! the loss is a short listing, not an error. Reopening would buy a private position, but a fresh open is checked
+//! against the process that opens it, which as root is no check at all. So this module dups, and the position is the
+//! caller's to protect.
 
 use std::ffi::CStr;
 use std::fmt;
@@ -79,38 +66,17 @@ pub struct DirEntryName {
 
 /// Read every name in the directory open at `fd`, in filesystem order.
 ///
-/// One full drain per call: the stream is rewound first, so the result is the whole directory wherever the descriptor's
-/// offset sat. The stream runs on a `dup`, which shares the original's open file description, so **the caller's
-/// position is spent by the read** - a consuming read of the position, not a peek. A caller that is itself reading
-/// `fd`, or that has handed it to a traversal, reopens for a position of its own (`openat(fd, ".", O_RDONLY |
-/// O_DIRECTORY)`, as `shutil::reopen_dir` does) before calling here.
+/// One full drain per call. The stream is rewound first and runs on a `dup`, which shares `fd`'s open file description,
+/// so **the caller's position is spent by the read**. A caller that is itself reading `fd`, or has handed it to a
+/// traversal, reopens for a position of its own (`openat(fd, ".", O_RDONLY | O_DIRECTORY)`) first.
 ///
-/// **A `dup` cannot serve, and is not cheaper.** `fdopendir` rejects it for the same `O_PATH` reason, since a dup
-/// carries the original's access mode; and it *shares* the original's file description, so rewinding it to read from
-/// the start rewinds the caller's stream and the drain then leaves that at EOF - which makes a traversal that calls
-/// this on a directory it is walking ([`iter::Entry::fd`](crate::sync_fs::iter::Entry::fd), whose frame descends on a
-/// dup of that same fd) lose the rest of that directory with no error to say so. The dup also costs one syscall *more*:
-/// it needs a `rewinddir`, and the reopen does not.
+/// The dup keeps the read on the descriptor's own authority, where a fresh open would be checked against whoever calls.
+/// An `O_PATH` handle, such as an [`Anchor`](crate::uring_fs::Anchor), is refused by `fdopendir` with `EBADF`, where an
+/// `openat2` through it would succeed and manufacture the read it was opened without.
 ///
-/// **The dup is what keeps the read on the descriptor's own authority.** A dup carries the access `fd` was opened with
-/// and re-checks nothing, so what may be read here is what the opener was already entitled to read.
-/// A fresh open would instead be authorized against whoever calls this, and would need a right a dup does not - search
-/// (`x`) on the directory - so it would both widen and narrow the wrong way.
-///
-/// An `O_PATH` handle is a reference carrying no read, and `fdopendir` refuses one with `EBADF`. That refusal is the
-/// kernel's, not a check this module makes, and it is why the dup matters:
-/// `openat2` through an `O_PATH` descriptor *succeeds*, manufacturing the access it was deliberately opened without.
-/// [`Anchor`](crate::uring_fs::Anchor) is such a handle.
-///
-/// **Unbounded by construction.** One call, one `Vec`, every name: there is no limit, cursor or streaming variant, so a
-/// caller holds the whole directory at roughly 46-54 bytes and one allocation per entry. That is the shape a
-/// whole-drain wants and it is fine for a directory whose size the caller controls; a listing that a peer can grow
-/// belongs on [`uring_fs::query_dir`](crate::uring_fs::query_dir), which pages and enriches. No bounded twin is offered
-/// here rather than one being invented for a caller that does not exist - this function has none outside its own tests.
-///
-/// Order is the filesystem's own (ZAP hash order on ZFS); a sorted view is the caller's sort. The result is a snapshot,
-/// not an atomic one: an entry renamed while the drain runs moves relative to the cursor and can be missed or reported
-/// twice, which is `readdir`'s contract and not something this layer can close.
+/// **Unbounded.** Every name is held at once, so a listing a peer can grow belongs on
+/// [`uring_fs::query_dir`](crate::uring_fs::query_dir), which pages. Order is the filesystem's own (ZAP hash order on
+/// ZFS), and an entry renamed during the drain can be missed or reported twice, which is `readdir`'s contract.
 pub fn read_names(fd: impl AsFd) -> errno::Result<Vec<DirEntryName>> {
     let dup = fd
         .as_fd()
@@ -134,18 +100,14 @@ pub fn read_names(fd: impl AsFd) -> errno::Result<Vec<DirEntryName>> {
 
 /// A directory read one entry at a time from a cookie, for a listing that a peer resumes, as NFS READDIR does.
 ///
-/// It reads on a dup of the descriptor it opens over, as [`read_names`] does and under the same contract, so the
-/// caller's position is spent.
-/// A cookie is what the kernel gives as `d_off`, the position of the entry after the one it came with, and
-/// [`seek`](Listing::seek) goes on from there, as `seekdir` does with what `telldir` gave. The cookie 0 is the
-/// beginning. On ZFS a cookie is a serialized ZAP cursor, which holds while the folder changes, and the kernel gives
-/// the last entry the cursor's end. `.` and `..` are left out, as [`read_names`] leaves them out, and their cookies are
-/// never given.
+/// It reads on a dup, as [`read_names`] does and under the same contract, so the caller's position is spent. A cookie
+/// is the kernel's `d_off`, the position after the entry it came with, and [`seek`](Listing::seek) goes on from there.
+/// The cookie 0 is the beginning. On ZFS a cookie is a serialized ZAP cursor, which holds while the folder changes. `.`
+/// and `..` are left out.
 ///
-/// It reads through `getdents64` and not glibc's `readdir`, whose buffer follows `st_blksize`, 128 KiB on a dataset's
-/// folder, and which a seek throws away. A caller that resumes for each request of a peer and wants a few hundred names
-/// would then read thousands each time and read the same ones again the next. So the caller says how much to read at a
-/// time, about what it means to take, as `room`.
+/// It reads through `getdents64` into `room` bytes the caller sizes, and not through glibc's `readdir`, whose buffer is
+/// 128 KiB on a dataset and is thrown away at every seek, so a peer resuming for a few hundred names would read
+/// thousands each time.
 pub struct Listing {
     file: File,
     /// Where `getdents64` writes, which is the room asked for.
@@ -321,11 +283,9 @@ fn errno_of(error: std::io::Error) -> Errno {
 /// `ent` points at a record `readdir` gave on a stream that has not been read since, and the name is valid for `'a`
 /// only until that stream is read again.
 ///
-/// A `&libc::dirent` must NOT be formed here. The reference would claim all 280 bytes of the struct, `d_name` being a
-/// `[c_char; 256]`, over a record only `d_reclen` bytes long. A short-named entry's record is 24 to 40 bytes, and the
-/// last record in a filled buffer ends where the buffer's valid data does. Measured on ZFS, over 5002 entries the
-/// tightest record left 32 valid bytes. The same idiom, with the same reason, is at `uring_fs/core.rs` and
-/// `uring_fs/query_dir.rs`. `d_ino`, `d_off` and `d_type` are inside every record's fixed head, before the name.
+/// A `&libc::dirent` must NOT be formed here. It would claim all 280 bytes of the struct over a record only `d_reclen`
+/// bytes long, and the last record in a filled buffer ends where the valid data does. `d_ino`, `d_off` and `d_type` are
+/// inside every record's fixed head, before the name.
 unsafe fn fields_of<'a>(ent: *mut libc::dirent) -> (u8, u64, u64, &'a [u8]) {
     // SAFETY: the caller's, and every field is read through `addr_of!`.
     unsafe {
@@ -693,13 +653,8 @@ mod tests {
         assert_eq!(second.len(), 2);
     }
 
-    /// The record `readdir` hands back is `d_reclen` bytes, which is far less than `size_of::<libc::dirent>()` - the
-    /// invariant that makes `next_entry`'s `addr_of!` reads necessary rather than stylistic.
-    ///
-    /// Forming a `&libc::dirent` requires all 280 bytes to be dereferenceable; a short-named entry's record is a tenth
-    /// of that, and the last record in a filled buffer ends exactly where the valid data does. Driven over raw
-    /// `getdents64` so the valid region is known precisely; glibc's `readdir` hands out pointers into a buffer filled
-    /// the same way.
+    /// The record `readdir` hands back is `d_reclen` bytes, far less than `size_of::<libc::dirent>()`, which is why
+    /// `next_entry` reads through `addr_of!`. Driven over raw `getdents64` so the valid region is known precisely.
     #[test]
     fn a_directory_record_is_shorter_than_the_struct_that_describes_it() {
         use std::os::fd::AsRawFd;
@@ -739,13 +694,8 @@ mod tests {
         );
     }
 
-    /// An `O_PATH` handle is refused, and the refusal is the kernel's.
-    ///
-    /// `O_PATH` is a reference carrying no read, and `fdopendir` answers one with `EBADF`. Reading through a dup is
-    /// what keeps that enforcement: `openat2` through an `O_PATH` descriptor *succeeds*, manufacturing the access it
-    /// was opened without and checking it against this process rather than whoever obtained the handle - which where
-    /// this runs as root is no check at all. [`Anchor::open`](crate::uring_fs::Anchor) mints exactly this shape and
-    /// takes `impl AsFd` to get here.
+    /// An `O_PATH` handle is refused, and the refusal is the kernel's `EBADF` from `fdopendir`, which reading through a
+    /// dup keeps, where an `openat2` through the handle would succeed.
     #[test]
     fn an_o_path_descriptor_is_refused() {
         use std::os::fd::{FromRawFd, OwnedFd};
@@ -770,13 +720,8 @@ mod tests {
 
     /// The drain spends the caller's position, and the reopen the docs prescribe is what protects it.
     ///
-    /// `read_names` rewinds a dup, and a dup shares the open file description, so a walk holding that same description
-    /// is left at end-of-directory and reports an empty remainder with no error. That is the contract: the
-    /// alternative - reopening for a private position - re-authorizes the read against whoever calls, and an `O_PATH`
-    /// handle reopens just fine. Callers that care reopen first, as `shutil::reopen_dir` does.
-    ///
-    /// The frame is deliberately unread before the drain: glibc buffers a whole `getdents64` at the first `readdir`,
-    /// which would hide the moved offset on a small directory.
+    /// The frame is deliberately unread before the drain, since glibc buffers a whole `getdents64` at the first
+    /// `readdir`, which would hide the moved offset on a small directory.
     #[test]
     fn a_drain_spends_the_position_and_a_reopen_protects_it() {
         let tmp = crate::tempdir().expect("tempdir");

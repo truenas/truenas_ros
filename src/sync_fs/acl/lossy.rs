@@ -2,22 +2,8 @@
 //!
 //! A port of the kernel's nfsd shim (`fs/nfsd/nfs4acl.c`), which is the only implementation that has to satisfy both
 //! models against a live filesystem - so it is also what a client comparing our answer against an NFS export has
-//! already seen. The mapping is a bijection in neither direction, which is what the names say.
-//!
-//! **NFS4 -> POSIX1E drops every right POSIX cannot name.** `low_mode_from_nfs4` keeps `r` for `READ_DATA`, `w` only
-//! when `WRITE_DATA`, `APPEND_DATA` and - on a directory - `DELETE_CHILD` are *all* granted, and `x` for `EXECUTE`.
-//! `DELETE`, `WRITE_OWNER`, `WRITE_ACL`, `WRITE_ATTRIBUTES` and the named-attribute bits have no POSIX spelling and are
-//! lost. The rounding is deliberately downward: a partial NFS4 write grant becomes no POSIX write at all, because the
-//! result decides access and rounding up would grant what the source did not.
-//!
-//! **POSIX1E -> NFS4 collapses the group-class mask.** A POSIX entry's effective rights are `perm & mask` and NFS4 has
-//! no second stage, so each entry is emitted already masked. Convert back and the mask reappears as the union of what
-//! survived: `u:1000:rwx` under `mask::r-x` becomes `u:1000:r-x` under `mask::r-x`, and the stored `rwx` is gone.
-//!
-//! **Ordering carries what NFS4 has no mask for.** POSIX picks one class and stops; NFS4 accumulates over every ACE
-//! whose principal matches, and `OWNER@`, `GROUP@` and `EVERYONE@` all match the owner. An ACL granting some class more
-//! than the owner therefore needs an explicit DENY on `OWNER@` ahead of the allows, or the trailing `ALLOW EVERYONE@`
-//! hands the owner what POSIX withheld. [`PosixAcl::to_nfs4_lossy`] says what that costs.
+//! already seen. The mapping is a bijection in neither direction, which is what the names say. What each direction
+//! loses is on [`PosixAcl::to_nfs4_lossy`] and [`Nfs4Acl::to_posix_lossy`].
 //!
 //! Three things depart from nfsd, all in the NFS4 -> POSIX1E direction and all because the input here is a ZFS ACL
 //! rather than an NFSv4 protocol ACL:
@@ -226,25 +212,17 @@ impl PosixAcl {
     /// rights are `perm & mask`, NFS4 has no second stage, so every entry goes out already reduced. `u:1000:rwx` under
     /// `mask::r-x` is emitted as `r-x`, and the stored `rwx` is not recoverable from the result.
     ///
-    /// `is_dir` picks the directory reading of the rights - `w` also means `DELETE_CHILD` - and decides whether a
-    /// default ACL may be present at all. The ACL is validated against it first, because the translation
-    /// reads exactly one `USER_OBJ`, `GROUP_OBJ` and `OTHER` entry per list;
-    /// nfsd asserts that shape rather than checking it (`BUG_ON(pacl->a_count < 3)`).
-    ///
-    /// The default ACL becomes a second run of ACEs carrying `FILE_INHERIT | DIRECTORY_INHERIT | INHERIT_ONLY`, which
-    /// is how nfsd simulates one (`NFS4_INHERITANCE_FLAGS`, `fs/nfsd/nfs4acl.c`).
-    /// Nothing here produces `NO_PROPAGATE_INHERIT`, because a POSIX default ACL has no way to say it: the result is
-    /// inherited by every descendant.
+    /// `is_dir` picks the directory reading of the rights, where `w` also means `DELETE_CHILD`, and whether a default
+    /// ACL may be present. The ACL is validated against it first, since the translation reads one `USER_OBJ`,
+    /// `GROUP_OBJ` and `OTHER` per list and nfsd only asserts that (`BUG_ON(pacl->a_count < 3)`). The default ACL
+    /// becomes a second run of ACEs carrying `FILE_INHERIT | DIRECTORY_INHERIT | INHERIT_ONLY`.
     ///
     /// # The result is not always writable
     ///
     /// The validation [`fsetacl`] applies refuses DENY entries for `OWNER@`/`GROUP@`, and this emits them whenever the
-    /// source grants some class more than the owner, or `other` more than the owning group.
-    /// NFS4 accumulates over every ACE whose principal matches and `EVERYONE@` matches the owner too, so without a DENY
-    /// ahead of them the
-    /// trailing `ALLOW EVERYONE@` hands the owner what POSIX withheld;
-    /// widening silently is the worse answer. A directory whose POSIX ACL has no default half meets the other rule the
-    /// same way - a directory ACL has to carry something inheritable, and there is nothing to inherit.
+    /// source grants some class more than the owner, or `other` more than the owning group, since without them the
+    /// trailing `ALLOW EVERYONE@` hands the owner what POSIX withheld. A directory whose POSIX ACL has no default half
+    /// is refused the same way, having nothing inheritable.
     ///
     /// [`fsetacl`]: crate::sync_fs::acl::fsetacl
     pub fn to_nfs4_lossy(&self, is_dir: bool) -> Result<Nfs4Acl> {
@@ -358,9 +336,8 @@ impl AclState {
 
     /// `find_uid`/`find_gid` (`fs/nfsd/nfs4acl.c`): the slot for `id`, created on first sight seeded from `EVERYONE@`.
     ///
-    /// The seed is what makes a late named entry answer for the ACEs that preceded it: `EVERYONE@` matched this
-    /// principal too, so whatever it has already settled is already true of them. Takes the list rather than `&mut
-    /// self` so the seed can be read while the list is borrowed.
+    /// The seed is what makes a late named entry answer for the ACEs that preceded it, since `EVERYONE@` matched this
+    /// principal too.
     fn slot(list: &mut Vec<(i64, AceState)>, everyone: AceState, id: i64) -> usize {
         if let Some(i) = list.iter().position(|(x, _)| *x == id) {
             return i;
@@ -489,26 +466,16 @@ fn state_to_entries(state: &AclState, is_dir: bool, default: bool) -> Vec<PosixA
 impl Nfs4Acl {
     /// Convert to the POSIX1E ACL granting the closest access.
     ///
-    /// A port of nfsd's shim (`fs/nfsd/nfs4acl.c`). What it loses is every right POSIX cannot name: `r` survives
-    /// `READ_DATA`, `w` only when `WRITE_DATA`, `APPEND_DATA` and - on a directory - `DELETE_CHILD` are *all* granted,
-    /// and `x` survives `EXECUTE`. `DELETE`, `WRITE_OWNER`, `WRITE_ACL`, `WRITE_ATTRIBUTES` and the named-attribute
-    /// bits are dropped. The rounding is downward on purpose: a partial NFS4 write grant becomes no POSIX write at all,
-    /// because the result decides access and rounding up would grant what the source refused.
+    /// A port of nfsd's shim (`fs/nfsd/nfs4acl.c`). It loses every right POSIX cannot name, rounding down so the result
+    /// never grants what the source refused. `w` survives only when `WRITE_DATA`, `APPEND_DATA` and, on a directory,
+    /// `DELETE_CHILD` are all granted, and `DELETE`, `WRITE_OWNER`, `WRITE_ACL`, `WRITE_ATTRIBUTES` and the
+    /// named-attribute bits are dropped. A denial is written into every entity POSIX might consult.
     ///
-    /// ACEs are read in wire order, which is the order NFS4 evaluates them in - a DENY binds only the bits no earlier
-    /// ACE allowed - and a denial is written into every entity that might turn out to be the one POSIX consults, since
-    /// POSIX picks one entry per caller and this cannot know which.
+    /// `is_dir` picks the directory reading of the rights and gates the default ACL, which the inheritable ACEs become.
     ///
-    /// `is_dir` picks the directory reading of the rights and gates the default ACL, which only a directory can carry.
-    /// Inheritable ACEs become that default ACL, and `NO_PROPAGATE_INHERIT` cannot survive the trip: a POSIX default
-    /// ACL is inherited by every descendant, so the result reaches depths the source stopped short of. AUDIT and ALARM
-    /// ACEs are skipped - they settle no access, and ZFS will not store one anyway.
-    ///
-    /// The input is deliberately **not** validated: the trivial ACL ZFS synthesises for a directory carries no
-    /// inheritance flags and would fail that check, and it is the single most common thing to convert. What the result
-    /// must satisfy is checked instead, so a named principal whose id POSIX cannot hold - `0xFFFFFFFF`, which the
-    /// kernel reads back as "no id" - is refused rather than written out as an entry that would decode as something
-    /// else.
+    /// The input is not validated, since the trivial ACL ZFS synthesises for a directory carries no inheritance flags
+    /// and would fail. The result is checked instead, so a named id of `0xFFFFFFFF`, which the kernel reads back as no
+    /// id, is refused.
     ///
     /// An ACL with no ACEs at all converts to one granting nothing, as nfsd does. The empty `system.nfs4_acl_xdr` blob
     /// decodes to exactly that (see [`Nfs4Acl::from_xattr`]), so a caller holding one wants the mode bits, not this.

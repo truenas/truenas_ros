@@ -108,39 +108,21 @@ pub fn copyfile(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> errno::Result<u64> 
 /// If the source carries an access ACL xattr (POSIX access or the ZFS NFS4 blob) it is copied and `fchmod` is skipped,
 /// since the ACL is authoritative for the destination's permissions; otherwise `mode` is applied with `fchmod`.
 ///
-/// A POSIX **default** ACL travels either way. It is not an access check on this object at all - it is the template
-/// children inherit - so it is a separate xattr from the access ACL, and a directory can carry one with no access ACL
-/// at all. [`copy_xattrs`] skips the whole `system.` namespace, so if it is not copied here it is not copied anywhere.
+/// A POSIX **default** ACL travels either way, since [`copy_xattrs`] skips the whole `system.` namespace.
 ///
-/// The ACL is authoritative on ZFS `aclmode=restricted`, where a `chmod` of an object holding a non-trivial ACL is
-/// rejected with `EPERM` (`zfs_setattr`). A destination can hold such an ACL without the source having one - it
-/// inherits from the destination parent - and on `acltype=nfsv4` the source's own ACL is invisible to `flistxattr`, so
-/// the `fchmod` branch is the one taken. An `EPERM` there means the destination's ACL already governs its mode, which
-/// is the outcome this function wants; it is treated as applied rather than failing the copy, matching
-/// [`super::copytree`]'s destination-root and special-node `chmod` sites.
-/// Mirrors `truenas_os` copy.py.
+/// An `EPERM` from the `fchmod` is treated as applied. On ZFS `aclmode=restricted` it means the destination already
+/// holds a non-trivial ACL, perhaps inherited from its parent, and that ACL governs its mode (`zfs_setattr`).
 ///
 /// `S_ISUID`/`S_ISGID` are withheld - they belong to [`copy_setid`], which applies them once the destination carries
 /// the source's ownership.
 ///
 /// # The sticky bit on an ACL-bearing directory
 ///
-/// `S_ISVTX` is a mode bit with no ACL representation, and on the ACL path no `fchmod` runs, so a sticky source
-/// directory that also carries an access ACL produces a destination with `S_ISVTX` clear. The bit is given up on
-/// purpose: carrying it costs the ACL.
-///
-/// Restoring it would mean an `fchmod` on exactly the objects this branch exists to keep away from one, and on ZFS a
-/// `chmod` is never just a mode change - `zfs_acl_chmod_setattr` rewrites the ACL to agree with the new mode. Under the
-/// **default** `aclmode=discard` it replaces it with a fresh empty one (`zfs_acl_alloc`), under `groupmask` it trims
-/// the ALLOW entries, and even `passthrough` re-splits the mode-representing ACEs; only `restricted` refuses outright
-/// with `EPERM` (`zfs_setattr`). So re-stamping one bit would, on a stock dataset, destroy the ACL the copy just
-/// transported. A dropped sticky bit is a visible, repairable difference on a directory an admin can `chmod +t`; a
-/// silently discarded ACL is neither.
-///
-/// The [`copy_setid`] path withholds `S_ISUID`/`S_ISGID` from an ACL-bearing destination for the same reason, and the
-/// special-node path (`copy_metadata`'s `mknod` sibling) does run an `fchmod`, but only because a device node cannot
-/// carry an ACL for it to damage - there the `chmod` is wrapped so an ACL-governed refusal is tolerated rather than
-/// failing the copy.
+/// `S_ISVTX` has no ACL representation and the ACL path runs no `fchmod`, so a sticky source directory with an access
+/// ACL produces a destination with `S_ISVTX` clear, on purpose. On ZFS a `chmod` rewrites the ACL to agree with the
+/// mode (`zfs_acl_chmod_setattr`). The default `aclmode=discard` replaces it with an empty one (`zfs_acl_alloc`),
+/// `groupmask` trims the ALLOW entries, `passthrough` re-splits the mode ACEs, and only `restricted` refuses with
+/// `EPERM`. A dropped sticky bit is visible and repairable with `chmod +t`, while a discarded ACL is neither.
 pub fn copy_permissions(src: BorrowedFd<'_>, dst: BorrowedFd<'_>, xattr_names: &[CString], mode: u32) -> Result<()> {
     if xattr_names.iter().any(|n| n.as_c_str() == POSIX_DEFAULT) {
         let buf = fgetxattr(src, POSIX_DEFAULT)?;
@@ -162,16 +144,11 @@ pub fn copy_permissions(src: BorrowedFd<'_>, dst: BorrowedFd<'_>, xattr_names: &
 
 /// Whether a `system.nfs4_acl_xdr` blob carries nothing but the mode.
 ///
-/// The blob's first big-endian word is `vsa_aclflags` - `zfsacl_to_nfsacl41i` writes it ahead of the ACE count
-/// (`module/os/linux/zfs/zpl_xattr.c`) - and `zfs_getacl` ORs `ACL_IS_TRIVIAL` into it from `z_pflags`
-/// (`zfs_acl.c:2063`; the bit is `0x10000`, `include/os/linux/spl/sys/acl.h:87`). `__zpl_xattr_nfs41acl_get` asks for
-/// it by requesting `VSA_ACE_ACLFLAGS`, so the bit is in every blob it returns. `Nfs4AclFlag::ACL_IS_TRIVIAL` is the
-/// same bit under this crate's own name, and `truenas_os`'s `NFS4ACL.trivial` reads the same word.
+/// The blob's first big-endian word is `vsa_aclflags` (`zfsacl_to_nfsacl41i`, `module/os/linux/zfs/zpl_xattr.c`), into
+/// which `zfs_getacl` ORs `ACL_IS_TRIVIAL` from `z_pflags` (`zfs_acl.c:2063`).
 ///
-/// **Asked of the blob, and not of `listxattr`, on purpose.** `zpl_xattr_list` withholds the name for a trivial ACL and
-/// would answer this too - but io_uring has `FGETXATTR`/`GETXATTR`/`FSETXATTR`/`SETXATTR` and **no** listxattr op at
-/// all (`include/uapi/linux/io_uring.h`), so a predicate built on listing cannot follow this code to the async side.
-/// The flags word rides in bytes the caller has already fetched, which costs nothing and ports.
+/// Ask the blob and not `listxattr`, though `zpl_xattr_list` withholds the name of a trivial ACL, since io_uring has no
+/// listxattr op (`include/uapi/linux/io_uring.h`) and this check must work on the asynchronous side too.
 ///
 /// A blob too short to hold that word is unreadable rather than trivial, and an unreadable ACL is one a `chmod` must
 /// not be let near.
@@ -189,33 +166,17 @@ fn nfs4_acl_is_trivial(blob: &[u8]) -> bool {
 /// Put a plain mode on a destination whose ACL copy failed, so the creation hold is not the mode it keeps. Answers
 /// whether one was applied.
 ///
-/// `creation_mode` makes every object at `0o700`/`0o600` on the promise that the source's mode lands afterwards, and
-/// [`copy_permissions`] is the only thing that delivers it. `copy_metadata` wraps that in `guard`, which answers
-/// `Ok(())` when `raise_error` is false - the mode `copytree`'s own documentation names for salvaging a tree - so a
-/// swallowed failure left the **hold** as the final mode for every object, with `copytree` answering `Ok` and plausible
-/// stats. Not a race: an `acltype=nfsv4` source onto an `acltype=posix` destination, or either onto `acltype=off`,
-/// fails `fsetxattr` `EOPNOTSUPP` for every object in the tree.
+/// Under `raise_error: false`, `guard` swallows a failed [`copy_permissions`], as when an `acltype=nfsv4` source lands
+/// on `acltype=posix` and `fsetxattr` fails `EOPNOTSUPP`, so without this the hold would be the final mode of every
+/// object.
 ///
 /// **Declines when the destination already carries an access ACL.** There the ACL *is* the permissions and a `chmod`
-/// would rewrite it to match the mode - under ZFS's default `aclmode=discard`, replace it outright
-/// (`zfs_acl_chmod_setattr`, `module/os/linux/zfs/zfs_acl.c`). A destination holding one is not sitting at the hold, so
-/// there is nothing to release.
+/// would rewrite it to match the mode (`zfs_acl_chmod_setattr`). A POSIX access ACL is stored only when real, so its
+/// presence answers. `system.nfs4_acl_xdr` is synthesised for every object on an `acltype=nfsv4` dataset
+/// (`__zpl_xattr_nfs41acl_get`), a trivial ACL included, so [`nfs4_acl_is_trivial`] asks the blob instead.
 ///
-/// **The two names are asked different questions, because they answer differently.** A POSIX access ACL exists as a
-/// stored xattr only when there is a real one, so its presence is the answer. `system.nfs4_acl_xdr` is synthesised:
-/// `__zpl_xattr_nfs41acl_get` (`module/os/linux/zfs/zpl_xattr.c`) refuses only a non-NFSv4 dataset and an empty ACL, so
-/// **every** object on an `acltype=nfsv4` dataset answers it - a trivial ACL included, since that is still three ACEs.
-/// Presence therefore said "ACL" for every object on that row and the hold was never released there at all, which is
-/// the row a share migration lands on. [`nfs4_acl_is_trivial`] asks the blob instead.
-///
-/// `EOPNOTSUPP` means the filesystem keeps no xattrs, so there is no ACL to damage and the mode lands.
-///
-/// **Scope is the object whose [`copy_permissions`] failed.** Ancestors are
-/// stamped by `finish_dir` on ascent, so a walk that stops keeps their holds;
-/// the call site says why an aborted copy is left closed rather than widened.
-///
-/// setid is withheld exactly as [`copy_permissions`] withholds it;
-/// [`copy_setid`] applies it afterwards when ownership was preserved.
+/// `EOPNOTSUPP` means the filesystem keeps no xattrs, so there is no ACL to damage and the mode lands. setid is
+/// withheld as [`copy_permissions`] withholds it.
 pub(super) fn release_creation_hold(dst: BorrowedFd<'_>, mode: u32) -> Result<bool> {
     match fgetxattr(dst, POSIX_ACCESS) {
         Ok(_) => return Ok(false),
@@ -239,14 +200,11 @@ pub(super) fn release_creation_hold(dst: BorrowedFd<'_>, mode: u32) -> Result<bo
 
 /// Apply the `S_ISUID`/`S_ISGID` bits of `mode` that [`copy_permissions`] withholds.
 ///
-/// setid grants the identity of the file's own owner and group, so it is the source's to give only when the destination
-/// carries the source's ownership too: call this after a successful `fchown`, and not at all when ownership is not
-/// preserved. `fchown` clears setid itself (`chown(2)`), so this runs last.
+/// Call this after a successful `fchown`, and not at all when ownership is not preserved, since setid grants the
+/// identity of the file's owner and group and `fchown` clears it (`chown(2)`).
 ///
-/// A destination whose permissions came from an ACL xattr is left alone: there the mode follows the ACL, and an
-/// `fchmod` could discard it. A destination governed by an ACL it *inherited* refuses the `fchmod` with `EPERM`, which
-/// is tolerated for the reason [`copy_permissions`] gives - and here the tolerated outcome is a destination without
-/// setid, a reduction in what the copy grants, never an increase.
+/// A destination whose permissions came from an ACL xattr is left alone, since an `fchmod` could discard the ACL. An
+/// `EPERM` from an inherited ACL is tolerated, as in [`copy_permissions`], and leaves the destination without setid.
 pub fn copy_setid(dst: BorrowedFd<'_>, xattr_names: &[CString], mode: u32) -> Result<()> {
     let mode = mode as libc::mode_t & 0o7777;
     if mode & SETID_BITS == 0 || has_access_acl(xattr_names) {
@@ -262,17 +220,10 @@ pub fn copy_setid(dst: BorrowedFd<'_>, xattr_names: &[CString], mode: u32) -> Re
 /// Copy the source's xattrs to the destination, less the two namespaces a data copy has no business re-stamping.
 ///
 /// `system.*` is skipped because the ACLs live there and [`copy_permissions`] owns them. `security.*` is skipped
-/// because it is where the kernel keeps authority, not data: `security.capability` is a file capability set, so copying
-/// it verbatim would transplant privilege onto a destination whose content came from the source - `cap_setuid+ep` on a
-/// binary the caller chose. The kernel gates the write on `CAP_SETFCAP` (`cap_convert_nscap`) rather than forbidding
-/// it, so a `copytree` running as root can carry it across - and `copy_metadata` orders the `fchown` so the kernel
-/// strips the attribute, which only holds if nothing puts it back afterwards. `security.ima`/`.evm` are skipped for the
-/// same reason and because an EVM HMAC covers the inode it was computed over, so a copied one is invalid anyway; an LSM
-/// label belongs to whatever policy owns the destination.
-///
-/// This matches the refusal the asynchronous side already makes: `PrivilegedXattrs::allow_prefix` rejects the whole
-/// `security.` prefix. `truenas_os` copy.py and `cp --preserve=xattr` both copy the namespace -- this is a deliberate
-/// divergence.
+/// because it holds authority, not data. A copied `security.capability` would transplant privilege onto content the
+/// caller chose, since the kernel only gates the write on `CAP_SETFCAP` (`cap_convert_nscap`), and `copy_metadata`
+/// orders the `fchown` so the kernel strips it. An EVM HMAC covers its own inode, and an LSM label belongs to the
+/// destination's policy. `PrivilegedXattrs::allow_prefix` refuses the same prefix on the asynchronous side.
 pub fn copy_xattrs(src: BorrowedFd<'_>, dst: BorrowedFd<'_>, xattr_names: &[CString]) -> Result<()> {
     for name in xattr_names {
         if ACL_XATTRS.contains(&name.as_c_str()) || is_reserved_namespace(name) {
@@ -288,11 +239,7 @@ pub fn copy_xattrs(src: BorrowedFd<'_>, dst: BorrowedFd<'_>, xattr_names: &[CStr
 mod tests {
     use super::*;
 
-    /// The trivial bit is read out of the blob, at the right offset, in the right byte order - the whole of what
-    /// `release_creation_hold` decides an `acltype=nfsv4` destination on.
-    ///
-    /// A pure function so this runs everywhere, including the unprivileged runner: the live half needs an NFSv4 dataset
-    /// and only the QEMU lane has one, which is exactly how the defect this replaced survived.
+    /// The trivial bit is read out of the blob at the right offset and in the right byte order.
     #[test]
     fn the_nfs4_trivial_bit_is_read_from_the_blob() {
         // XDR: [aclflags, ace_count, ...aces]. ZFS writes both big-endian.

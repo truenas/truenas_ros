@@ -4,7 +4,8 @@
 //! [`fchown`], [`renameat2`], [`safe_open`], atomic writes, whole-directory name reads ([`dir`]), and the shared flag
 //! types ([`AtFlags`], [`OFlag`], [`Mode`]). Each sibling subsystem is a named submodule behind its own feature:
 //! [`xattr`], [`acl`] (NFS4/POSIX1E), [`fhandle`], [`iter`] (feature `fsiter`), and [`shutil`]. Mount topology and
-//! idmapped-mount support live in [`crate::mount`]; the io_uring reactor counterpart is the (future) `uring_fs` module.
+//! idmapped-mount support live in [`crate::mount`], and the io_uring counterpart is `crate::uring_fs` (feature
+//! `uring-fs`).
 
 #[cfg(feature = "sync-fs")]
 mod atomic;
