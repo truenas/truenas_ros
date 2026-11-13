@@ -15,8 +15,9 @@ fn a_turn_that_queued_nothing_keeps_another_submitters_deadline() {
         },
     );
     let pool = core.pool_handle();
+    // No flush here. One made while the floor worker is still starting finds nothing parked, so it grows the pool or
+    // leaves a deadline for growing it, and a worker that is starting takes the job with no wake.
     pool.enqueue(Box::new(|| {}));
-    let _ = pool.flush(1);
     let parking = Instant::now();
     while pool.parked() != Some(1) {
         assert!(
