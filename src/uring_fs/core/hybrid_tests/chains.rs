@@ -39,10 +39,9 @@ fn a_chain_reaches_a_file_two_directories_down() {
 /// A chain's last step is opened as the caller asked, so unlike every step above it, it can name a special file.
 ///
 /// `O_TRUNC` forces the open async (`io_openat_force_async`, `io_uring/openclose.c`), and `io_openat2` adds
-/// `O_NONBLOCK` only on the inline attempt (`IO_URING_F_NONBLOCK`), which a forced io-wq worker does not have - the
-/// `WARN_ON_ONCE` beside it is the kernel asserting the two are exclusive. So an unguarded step here reaches
-/// `fifo_open`'s `wait_for_partner` (`fs/pipe.c`) and parks a worker and its op slot until the owner's teardown
-/// sweep. The guard is what makes it answer instead.
+/// `O_NONBLOCK` only on the inline attempt (`IO_URING_F_NONBLOCK`), so an unguarded step here reaches `fifo_open`'s
+/// `wait_for_partner` (`fs/pipe.c`) and parks a worker and its op slot until the owner's teardown sweep. The guard
+/// makes it answer instead.
 #[test]
 fn a_chains_last_step_cannot_park_on_a_fifo() {
     let (mut eng, mut fs, me) = setup();
@@ -209,13 +208,8 @@ fn a_derived_step_names_the_next_directory() {
     assert_eq!(*got.borrow(), Some(true), "the derived name must resolve");
 }
 
-/// A chain from a continuation opens, like one from the request handler.
-///
-/// It used to be refused, on the grounds that the file it produces "would outlive the connection it would go to".
-/// It cannot: the callback runs either way (`deliver_embedded` builds an `FsConn` and calls it unconditionally),
-/// and it is handed the fd wrapped in an `Arc<OwnedFd>` that closes on drop. Nothing was ever orphaned, and the
-/// refusal silently dropped `on_done` — which closes the connection — for consumers whose work legitimately spans
-/// completions.
+/// A chain from a continuation opens, like one from the request handler. The callback runs either way
+/// (`deliver_embedded`) and is handed the fd in an `Arc<OwnedFd>` that closes on drop, so nothing is orphaned.
 #[test]
 fn a_chain_from_a_continuation_opens() {
     let (mut eng, mut fs, me) = setup();
@@ -227,7 +221,7 @@ fn a_chain_from_a_continuation_opens() {
         &mut eng,
         &mut fs,
         move |c| {
-            // One completion, then a chain from inside it: the shape the gate used to swallow.
+            // One completion, then a chain from inside it.
             c.offload(
                 || 1u64,
                 move |_, c| {
@@ -252,11 +246,9 @@ fn a_chain_from_a_continuation_opens() {
 
 /// A screen that fires mid-chain refuses the way the same screen refuses at entry.
 ///
-/// `..` in a component is refused at `open_chain`'s entry - where nothing is submitted, nothing arms the sink, and
-/// `FsConn::fut` synthesises the marked `EINVAL` (`a_refused_errno_is_marked_as_this_crates_own`) - and again on a
-/// name the caller's `DeriveName` produces after a step has opened. The second is a real completion answered by
-/// `chain`, so it has to carry the mark itself; without it the same defect reads as this crate's verdict at entry
-/// and as the kernel's three steps in, and an awaiting task takes the second for teardown.
+/// `..` in a component is refused at `open_chain`'s entry, and again on a name the caller's `DeriveName` produces after
+/// a step has opened. The second is a real completion answered by `chain`, so it carries the mark itself, or an
+/// awaiting task would take it for teardown.
 #[test]
 fn a_mid_chain_screen_refuses_the_way_the_entry_screen_does() {
     let (mut eng, mut fs, me) = setup();
@@ -298,12 +290,9 @@ fn a_mid_chain_screen_refuses_the_way_the_entry_screen_does() {
     );
 }
 
-/// An op submitted through a reborrowed facade still reports to the frame that is watching.
-///
-/// `reborrow` clones the sink - both halves of a two-step dispatch submit, and both should report - and used to
-/// reset the arm counter to a fresh copy, so a `fut` whose closure reborrowed saw nothing armed, synthesised a
-/// spurious `EINVAL` for an op in flight, and the real completion landed in the settled slot: for a creating open,
-/// a file made on disk whose descriptor was dropped under the caller. The counter is shared now.
+/// An op submitted through a reborrowed facade still reports to the frame that is watching, since the arm flag rides
+/// the shared sink. A copied flag would have `fut` synthesise a spurious `EINVAL` for an op in flight and drop a
+/// created file's descriptor under the caller.
 #[cfg(feature = "http")]
 #[test]
 fn a_reborrowed_submission_arms_the_outer_frame() {
@@ -347,11 +336,9 @@ fn a_reborrowed_submission_arms_the_outer_frame() {
     assert!(dir.path().join("made").exists(), "and it really ran");
 }
 
-/// The one-frame-one-submission rule, enforced by attribution rather than by a panic: the first submission in a
-/// frame owns the frame's slot, and a second one's refusal cannot fill it. The one-slot table makes the second
-/// open's refusal *real* - the case where both arms sharing the slot discarded the first op's completion, `File`
-/// and all, and reported the loser's `EBUSY` for an op still in flight. Both profiles now answer the same way, so
-/// this test carries no `debug_assertions` gate.
+/// The one-frame-one-submission rule, enforced by attribution rather than by a panic. The first submission in a frame
+/// owns the frame's slot, and a second one's refusal cannot fill it. The one-slot table makes the second open's refusal
+/// real, and it must not discard the first op's completion.
 #[test]
 fn a_second_submissions_refusal_cannot_answer_for_the_first() {
     let mut eng = Engine::new(256, 128).expect("engine");
@@ -391,14 +378,10 @@ fn a_second_submissions_refusal_cannot_answer_for_the_first() {
     );
 }
 
-/// The third ordering of the same violation, and the one the other two cannot see: the *first* submission takes the
-/// frame's arm and is refused **without consuming a slot** (the per-owner cap - reachable at the consumer's stated
-/// cap-1 configuration), while the second, carrying the frame's own `on_done`, submits fine and completes with a
-/// real fd. The refusal's share must not answer for the op the caller actually awaited: parked provisionally
-/// (`SlotState::Refused`), it is superseded by the real completion - where settling the slot outright reported a
-/// marked `EBUSY` for a create that ran and dropped the real `FsDone` into the settled slot, closing the fresh
-/// descriptor under the caller (a retry of that "retryable" `EBUSY` then answers `EEXIST` for a create it was told
-/// never happened).
+/// The first submission takes the frame's arm and is refused without consuming a slot (the per-owner cap), while the
+/// second, carrying the frame's own `on_done`, completes with a real fd. The refusal parks provisionally
+/// (`SlotState::Refused`) and the real completion supersedes it, or a marked `EBUSY` would be reported for a create
+/// that ran, with its fresh descriptor closed under the caller.
 #[test]
 fn a_refused_first_arm_cannot_answer_for_the_callbacks_own_op() {
     let mut eng = Engine::new(256, 128).expect("engine");
@@ -455,10 +438,9 @@ fn a_refused_first_arm_cannot_answer_for_the_callbacks_own_op() {
     assert!(dir.path().join("made").exists(), "the create really ran");
 }
 
-/// The other ordering of the same violation: when the frame's own `on_done` rides the *second* submission and that
-/// one is refused, the future resolves with that submission's own marked verdict - the queued refusal fires the
-/// callback with its `EBUSY` ([`FsCore::refuse`]) - rather than hanging, stealing the first op's answer, or reading
-/// back as the unmarked `ECANCELED` a task winds a live connection down on. `fut`'s rustdoc states both halves.
+/// When the frame's own `on_done` rides the second submission and that one is refused, the future resolves with that
+/// submission's own marked verdict ([`FsCore::refuse`]), rather than hanging, stealing the first op's answer, or
+/// reading back as the unmarked `ECANCELED` of teardown.
 #[test]
 fn a_refused_second_submission_answers_for_itself() {
     let mut eng = Engine::new(256, 128).expect("engine");
@@ -538,9 +520,8 @@ fn every_entry_screen_answers_instead_of_dropping() {
         refused(what, got);
     }
 
-    // `open`'s second screen, on a path the first admits: a zero-length `Allow` deadline would cancel the open it
-    // guards. The screens are driven separately because the first returns before the second can run - which is how
-    // this one shipped uncovered.
+    // `open`'s second screen, on a path the first admits. A zero-length `Allow` deadline would cancel the open it
+    // guards. Driven apart from the first, which returns before it can run.
     let got: Rc<RefCell<Option<FsDone>>> = Rc::new(RefCell::new(None));
     let g2 = got.clone();
     c.open(
@@ -623,9 +604,8 @@ fn every_entry_screen_answers_instead_of_dropping() {
 }
 
 /// Every refusal is judged on shape at entry, before anything is submitted, so a bad argument cannot leave a
-/// half-walked chain - and each answers `on_done` with the marked `EINVAL` before `open_chain` returns, rather than
-/// dropping it. A dropped callback closes the connection, which turns a caller bug into a shed peer; and the
-/// awaited form aside, a plain-callback caller had no way to hear the refusal at all.
+/// half-walked chain, and each answers `on_done` with the marked `EINVAL` before `open_chain` returns rather than
+/// dropping it, which would close the connection.
 #[test]
 fn a_chain_that_cannot_be_walked_is_refused_before_it_starts() {
     let (mut eng, mut fs, me) = setup();

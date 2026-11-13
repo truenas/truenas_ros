@@ -24,12 +24,9 @@ fn drive(eng: &mut Engine, fs: &mut FsCore, kickoff: impl FnOnce(&mut FsConn<'_>
         let mut c = FsConn::new(fs, eng, OWNER0);
         kickoff(&mut c);
     }
-    // A timer bounds every block, so a missed wake fails at the deadline below instead of hanging the harness.
-    //
-    // The tag is unused in the fs domain, which this harness dispatches. Tags under 0x80 belong to the net stack.
-    //
-    // Re-armed only when its completion returns, so one is in flight per call. `drive` can return with one armed;
-    // every caller builds a fresh `Engine`, so a stale completion is never reaped.
+    // A timer bounds every block, so a missed wake fails at the deadline below instead of hanging. Its tag is unused in
+    // the fs domain. Re-armed only when its completion returns, and every caller builds a fresh `Engine`, so a stale
+    // completion is never reaped.
     const TAG_DRIVE_TIMER: u8 = 0xFF;
     let ts = libc::timespec { tv_sec: 1, tv_nsec: 0 };
     let mut timer_armed = false;
@@ -80,9 +77,7 @@ fn drive(eng: &mut Engine, fs: &mut FsCore, kickoff: impl FnOnce(&mut FsConn<'_>
             }
             if tag == TAG_WAKE {
                 eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm");
-                // The real delivery functions, not a copy of their bodies: a copy silently misses whatever they
-                // grow - it missed task draining entirely, so a task spawned in a test here was polled once and
-                // then waited on a loop that would never poll it again, hanging instead of failing.
+                // The real delivery functions, not a copy of their bodies, which would miss whatever they grow.
                 deliver_pool_completions(fs, eng);
                 continue;
             }
@@ -108,8 +103,7 @@ fn fixture(n: usize) -> crate::TempDir {
     dir
 }
 
-/// Run `f` with this thread's panic printing silenced. The guard carries its own serialization now (see
-/// `quiet_panics_on_this_thread`), so this is only the shorthand.
+/// Run `f` with this thread's panic printing silenced, a shorthand for `quiet_panics_on_this_thread`.
 fn with_silent_panics<R>(f: impl FnOnce() -> R) -> R {
     let _quiet = crate::uring_fs::quiet_panics_on_this_thread();
     f()

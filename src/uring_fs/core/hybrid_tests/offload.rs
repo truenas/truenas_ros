@@ -67,9 +67,8 @@ fn a_turns_blocking_offloads_run_side_by_side() {
     );
 }
 
-/// A panicking job must still deliver. Before, `push_back`/`poke` sat after `job()`, so an unwind skipped both: the
-/// continuation never ran, the `offload_reg` entry was never retired, and anything the continuation would have
-/// released (a walk's `in_flight`) stayed held forever.
+/// A panicking job must still deliver, so the continuation runs and neither its `offload_reg` entry nor anything it
+/// releases (a walk's `in_flight`) stays held.
 #[test]
 fn offload_delivers_even_when_the_job_panics() {
     let (mut eng, mut fs, _me) = setup();
@@ -322,10 +321,9 @@ fn a_refused_gathered_write_returns_each_buffer_once() {
     assert_eq!(back, vec![5, 6], "each buffer, once");
 }
 
-/// A facade with no recv claim - every completion facade, every unpooled connection - sends `offload_from` down its
-/// copy path: the job sees the caller's bytes, verbatim, and the result comes back through the ordinary `Result`
-/// seam with a panic mapped to `EIO`. The leased path is the net server's to prove (`test/recv_alloc.rs`), since
-/// only a delivery can hold a claim.
+/// A facade with no recv claim sends `offload_from` down its copy path. The job sees the caller's bytes, and the result
+/// comes back through the ordinary `Result` seam with a panic mapped to `EIO`. The leased path is the net server's to
+/// prove (`test/recv_alloc.rs`).
 #[test]
 fn offload_from_copies_where_nothing_is_leased() {
     type Seen = Rc<RefCell<Option<crate::Result<(usize, u64)>>>>;

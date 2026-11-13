@@ -27,10 +27,8 @@ fn wake_drain_fires_every_completion() {
 
 #[test]
 fn a_failed_readdir_is_an_error_not_end_of_directory() {
-    // Point the DIR*'s fd at a non-directory (`dup2` over it, keeping the fd number valid so parallel tests and the
-    // walk's own `closedir` are unaffected): the next `readdir` fails `ENOTDIR` and returns NULL with errno set.
-    // That must be delivered as an error, not an empty end-of-directory batch that reads as a complete listing of
-    // nothing.
+    // Point the DIR*'s fd at a non-directory with `dup2`, keeping the fd number valid. The next `readdir` fails
+    // `ENOTDIR`, which must arrive as an error, not an empty batch that reads as a complete listing of nothing.
     let (mut eng, mut fs, me) = setup();
     let dir = fixture(3);
     let anchor = Anchor::open(dir.path()).unwrap();

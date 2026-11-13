@@ -56,10 +56,8 @@ fn a_turn_that_queued_nothing_keeps_another_submitters_deadline() {
     );
 }
 
-/// A ring has exactly one offload pool: the handle minted for off-loop submitters is the core's own pool object,
-/// not a copy built from its bounds. Pins the construction-time invariant - any future path that replaces
-/// `FsCore::pool` after a handle was minted (a setter, a builder) splits the floor..ceiling thread budget across
-/// two live pools, and fails here.
+/// A ring has exactly one offload pool, so the handle minted for off-loop submitters is the core's own pool object. A
+/// path that replaced `FsCore::pool` after a handle was minted would split the thread budget across two live pools.
 #[test]
 fn a_pool_handle_is_the_core_pool_itself() {
     let core = FsCore::new(4, OffloadBounds::default());

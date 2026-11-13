@@ -13,12 +13,9 @@ fn restart_codes_fold_to_eintr_like_the_kernels_rw_path() {
     assert_eq!(map_res(7), Ok(7));
 }
 
-/// The sweep leaves a signal behind, because it cannot leave a gate behind.
-///
-/// It runs once per close and a continuation woken by one of its own cancellations submits after it, so nothing
-/// stops a task whose awaits cannot fail - an offload always delivers, a timer armed afterwards expires normally -
-/// from running for a connection that is gone. `owner_is_gone` is what such a task asks, and it must answer for the
-/// swept tenant of a slot without answering for the next one to take it.
+/// The sweep leaves a signal behind, because it cannot leave a gate behind. A task whose awaits cannot fail (an
+/// offload, a timer armed after the sweep) asks `owner_is_gone`, which must answer for the swept tenant of a slot
+/// without answering for the next one to take it.
 #[test]
 fn a_swept_owner_is_visible_to_what_runs_after_the_sweep() {
     let Some(mut eng) = engine_or_skip() else {
@@ -53,10 +50,6 @@ fn a_swept_owner_is_visible_to_what_runs_after_the_sweep() {
 }
 
 /// One sweep reaches every closed owner's ops, and an idle table costs nothing to sweep.
-///
-/// A close is recorded whether or not the handler opened anything, so on a busy server the batch is ordinary and
-/// the table is `fs_ops + pool_size` deep - 28k+ entries at a real consumer's configuration. Per-owner scanning
-/// walked all of it once per close, on the reactor thread.
 #[test]
 fn one_sweep_covers_the_batch_and_an_idle_table_is_free() {
     let Some(mut eng) = engine_or_skip() else {
@@ -85,10 +78,8 @@ fn one_sweep_covers_the_batch_and_an_idle_table_is_free() {
     }
     assert_eq!(inflight(&core).len(), 4, "four parked reads");
 
-    // One call for three of them; the fourth is untouched. The batch arrives DESCENDING, because production
-    // `fs_closed` is pushed in close order and is not sorted: the membership test is a binary search, so an
-    // already-sorted batch here would pass with the sort deleted while production silently missed owners - their
-    // ops never cancelled, their fds parked until teardown.
+    // One call for three of them, and the fourth is untouched. The batch arrives descending, as production `fs_closed`
+    // is in close order, so a sorted batch here would pass with the sort deleted.
     core.cancel_owned_by(&mut eng, vec![(12, 1), (11, 1), (10, 1)]);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut reaped = Vec::new();
@@ -179,12 +170,9 @@ fn the_sweep_reaches_an_allow_open_and_its_guard_follows() {
     }
 }
 
-/// A deadline-tripped `Allow` open answers in its own vocabulary, never teardown's: the guard's expiry marks the
-/// open before staging its cancel, so the `ECANCELED` arrives with `was_refused` true - unmarked `ECANCELED` is
-/// what a task winds a whole live connection down on, and one bad filename must not read as the reactor going away.
-/// Driven with synthesized CQEs (the routing idiom above) because the live trip has two honest spellings - which
-/// one the kernel answers depends on where the cancel's signal catches the parked worker - and only this arm's
-/// ordering is the property under test.
+/// A deadline-tripped `Allow` open answers in its own vocabulary, never teardown's. The guard's expiry marks the open
+/// before staging its cancel, so the `ECANCELED` arrives with `was_refused` true. Driven with synthesized CQEs, since
+/// the live trip has two spellings and only this arm's ordering is under test.
 #[test]
 fn a_tripped_allow_deadline_answers_marked_not_as_teardown() {
     let Some(mut eng) = engine_or_skip() else {
@@ -228,12 +216,9 @@ fn a_tripped_allow_deadline_answers_marked_not_as_teardown() {
     assert_eq!(core.op_free_len_for_test(), 2, "both slots returned");
 }
 
-/// A guard that ends without firing has still stopped bounding its open, and the reachable ending is a prep
-/// failure: `push_sqe` accepts the SQE - charge taken, cancel target recorded - while `__io_timeout_prep` runs
-/// later inside `io_uring_enter` and can answer `-ENOMEM` (`io_uring/timeout.c:554-556`), with
-/// `io_submit_fail_init` posting a CQE under the guard's own tag. Screened on `-ETIME` the token was discarded and
-/// nothing ever cancelled the open, so an `Allow` open parked in `fifo_open` held an io-wq worker, its op slot and
-/// its owner's charge for as long as the peer liked.
+/// A guard that ends without firing has still stopped bounding its open. The reachable ending is a prep failure, as
+/// `__io_timeout_prep` runs inside `io_uring_enter` and can answer `-ENOMEM` (`io_uring/timeout.c:554-556`) with a CQE
+/// under the guard's own tag, and the open must still be cancelled.
 #[test]
 fn a_guard_that_never_armed_still_cancels_its_open() {
     let Some(mut eng) = engine_or_skip() else {
@@ -409,11 +394,9 @@ fn cancel_owned_by_reaches_a_pump_read() {
     assert_eq!(Arc::strong_count(&file.fd), 2, "op parks its clone");
     core.cancel_owned_by(&mut eng, vec![(5, 9)]);
 
-    // Reap until the read's own CQE routes (the cancel's is inert).
-    //
-    // Deadline rather than `submit_and_wait`: the read is parked on an empty pipe and `cancel_owned_by`'s
-    // `FsWaiter::Pump` arm is the only thing that can complete it, so a blocking wait turns the failure this test
-    // exists to catch into a hang - in CI, indistinguishable from a slow runner. Bounded, it names the arm instead.
+    // Reap until the read's own CQE routes (the cancel's is inert). Bounded by a deadline rather than
+    // `submit_and_wait`, since only `cancel_owned_by`'s `FsWaiter::Pump` arm can complete the read, and a blocking wait
+    // would turn its failure into a hang.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let reaped = loop {
         assert!(

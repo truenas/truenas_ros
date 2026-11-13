@@ -62,24 +62,20 @@ use done::deliver;
 pub(crate) use done::{deliver_embedded, deliver_pool_completions, drain_stop_window};
 use std::thread;
 
-/// Default warm floor of worker threads backing [`FsConn::offload`]; the pool is spawned on first use and grows to
+/// Default warm floor of worker threads backing [`FsConn::offload`]. The pool is spawned on first use and grows to
 /// [`OFFLOAD_CEILING`] under saturation.
 ///
-/// Four, so a small burst of concurrent listings is served without waiting on a thread spawn: growth is rate-limited to
-/// one worker per millisecond, so a pool starting at one takes three to reach four. This is the pool's only resident
-/// cost, paid per ring once anything offloads.
+/// Four, so a small burst of concurrent listings does not wait on a thread spawn, as growth is limited to one worker
+/// per millisecond.
 pub(crate) const OFFLOAD_FLOOR: usize = 4;
 /// Default ceiling the offload pool grows to under sustained blocking work (opcode-less `readdir`/`fdopendir`/copy).
 ///
-/// Generous on purpose: it caps how many *concurrently stalled* operations one ring absorbs before they queue behind
-/// each other, which is the whole reason the pool exists, and a stalled `readdir` against a cold NFS or FUSE backing
-/// can take seconds. Only the floor is resident, growth is throttled to one spawn per millisecond, and a burst worker
-/// retires once it has sat idle for `OFFLOAD_IDLE_TIMEOUT` - the keep-alive policy of tokio's blocking pool
-/// (`KEEP_ALIVE`, `runtime/blocking/pool.rs`). Retirement being idle-keyed means bursts recurring inside that window
-/// hold the recent high-water mark of workers, not the instantaneous blocked count; plan standing cost by the burst
-/// peak, not the average.
+/// Generous on purpose, since it caps how many stalled operations one ring absorbs before they queue behind each other,
+/// and a stalled `readdir` against a cold NFS or FUSE backing can take seconds. Only the floor is resident, and a burst
+/// worker retires once it has sat idle for `OFFLOAD_IDLE_TIMEOUT`, so bursts that recur inside that window hold the
+/// recent peak of workers.
 ///
-/// Every bound here is per ring. A deployment running several multiplies them, and sizes both through
+/// Every bound here is per ring, and a deployment running several sizes them through
 /// [`OffloadBounds`](crate::uring_fs::OffloadBounds).
 pub(crate) const OFFLOAD_CEILING: usize = 64;
 /// Default warm floor of the lookup lane ([`FsConn::offload_lookup`]). One, since a lookup answered from a cache or a
@@ -109,21 +105,18 @@ pub(crate) const TAG_FSETXATTR: u8 = 0x8F;
 pub(crate) const TAG_FADVISE: u8 = 0x90;
 pub(crate) const TAG_SPLICE: u8 = 0x91;
 pub(crate) const TAG_TIMEOUT: u8 = 0x92;
-/// The guard timer riding an `Allow` open (`super::SpecialFiles`): an ordinary `IORING_OP_TIMEOUT` in its own op slot
-/// whose expiry stages an `ASYNC_CANCEL` for the open, and which the open's own completion retracts. **Not** a kernel
-/// `LINK_TIMEOUT`, which cannot do this job: `io_queue_linked_timeout` runs only after `def->issue` returns
-/// (`io_uring/io_uring.c:1850-1866`), and a force-async open's one and only issue is the blocking one on io-wq
-/// (`io_queue_sqe_fallback` -> `io_queue_iowq`, no inline attempt) - so a linked deadline on exactly the shape this
-/// exists for is armed only after the block ends. Measured: an hour-long park under a 300 ms linked deadline.
-/// `ASYNC_CANCEL` reaches the parked worker as a signal
-/// (`io_wq_worker_cancel` -> `__set_notify_signal`;
-/// `wait_for_partner` sleeps interruptibly), which is the proven path.
+/// The guard timer riding an `Allow` open (`super::SpecialFiles`). An ordinary `IORING_OP_TIMEOUT` in its own op slot
+/// whose expiry stages an `ASYNC_CANCEL` for the open, and which the open's own completion retracts.
 ///
-/// Routed by its own arm in [`FsCore::on_cqe`]: no consumer callback and no owner - the open's waiter carries both - so
-/// the entry's only cargo is the timespec and the open's routing token.
+/// Not a kernel `LINK_TIMEOUT`, which `io_queue_linked_timeout` arms only after `def->issue` returns
+/// (`io_uring/io_uring.c:1850-1866`). A force-async open's one issue is the blocking one on io-wq
+/// (`io_queue_sqe_fallback` -> `io_queue_iowq`), so a linked deadline would be armed only after the block ends.
+/// `ASYNC_CANCEL` reaches the parked worker as a signal (`io_wq_worker_cancel` -> `__set_notify_signal`).
+///
+/// Routed by its own arm in [`FsCore::on_cqe`], with no consumer callback and no owner, since the open's waiter carries
+/// both.
 pub(crate) const TAG_OPEN_DEADLINE: u8 = 0x93;
-/// `GETXATTR` of a held file through its path under `/proc/thread-self/fd`, which takes a file opened `O_PATH`. It is
-/// staged as an fd op, with the path built from the file's descriptor.
+/// `GETXATTR` of a held file through its path under `/proc/thread-self/fd`, which takes a file opened `O_PATH`.
 pub(crate) const TAG_GETXATTR_PROC: u8 = 0x94;
 /// `READ` into the room past the length of one buffer ([`FsConn::pread_spare`]). The buffer rides in the slot's
 /// `value`, as an xattr op's does, and [`FsCore::on_cqe`] grows its length by what the kernel wrote.
@@ -139,41 +132,32 @@ pub(crate) const TAG_WAKE: u8 = 0x9D;
 /// Tags `ASYNC_CANCEL` ops (and the teardown drain); completions ignored.
 pub(crate) const TAG_CANCEL: u8 = 0x9E;
 
-/// A completed embedded op's callback, fired **on the loop thread** by the embedding host (a `net` server) with the
-/// outcome and a fresh [`FsConn`] for chaining - inline at the completion's dispatch, or at the wake drain for a host
-/// refusal ([`FsCore::refuse`]), which fires it with the refusal's verdict and payload instead of dropping it. Dropping
-/// it without firing is the teardown drain's shape alone now: the captured continuation drops with it, which closes the
-/// connection - the right end for a loop that is dying, and no longer the answer a live submission failure gives.
+/// A completed embedded op's callback, fired on the loop thread by the embedding host (a `net` server) with the outcome
+/// and a fresh [`FsConn`] for chaining. It fires inline at the completion's dispatch, or at the wake drain for a host
+/// refusal ([`FsCore::refuse`]). Only the teardown drain drops it unfired, which drops the captured continuation and so
+/// closes the connection.
 pub(crate) type EmbeddedCb = Box<dyn FnOnce(FsDone, &mut FsConn<'_>)>;
 
-/// Where an op that never reached the ring reports *why*, and hands back what it was given.
+/// Where an op that never reached the ring reports why, and hands back what it was given.
 ///
-/// A sink is not a callback: it runs no consumer continuation and submits nothing, it only fills a slot. That is what
-/// lets it fire from inside a `submit_*` holding `&mut self` on the fs tables, where firing a callback would deliver a
-/// completion during a submission - so the distinction the callback form cannot make (`EBUSY` retry, `EINVAL` caller
-/// bug, teardown stop) reaches an awaited frame at the moment the refusal is decided, rather than waiting on the drain
-/// that delivers the callback.
+/// A sink runs no continuation and submits nothing, it only fills a slot, so it can fire from inside a `submit_*`
+/// holding `&mut self` on the fs tables, where a callback cannot. That lets an awaited frame see the reason (`EBUSY`
+/// retry, `EINVAL` caller bug, teardown stop) when the refusal is decided.
 ///
-/// **The reason only; the payload rides the callback.** A marked refusal is queued whole ([`FsCore::refuse`]) - errno
-/// and buffers - and its delivery supersedes the parked reason, so the sink is filled with an empty payload and
-/// [`FsDone::into_bufs`] hands the real one back off the callback route. The one ending that resolves from the reason
-/// alone is a callback dropped unfired, which is teardown, where the payload is going nowhere either way.
+/// It carries the reason only. A marked refusal is queued whole ([`FsCore::refuse`]) and its delivery supersedes the
+/// parked reason, so the sink gets an empty payload and [`FsDone::into_bufs`] hands the real one back.
 ///
-/// **`Rc`, and cloned rather than taken.** A multi-step call ([`chain`], [`walk`]) submits from a fresh facade at every
-/// step after the first, so a sink one submission consumed would leave every later step reporting teardown for a
-/// refusal the caller is told to retry. The steps share one sink; the slot's "a real answer is final" precedence is
-/// what makes more than one filler safe.
-///
-/// The frame's arm flag rides the same allocation ([`SinkInner`]), so staging a frame costs one `Rc`, not two.
+/// An `Rc`, cloned rather than taken, since a multi-step call ([`chain`], [`walk`]) submits from a fresh facade at
+/// every step after the first, and a sink the first step consumed would have every later step report teardown for a
+/// refusal worth retrying. The slot's rule that a real answer is final makes more than one filler safe.
 pub(crate) type FailSink = Rc<SinkInner>;
 
-/// A staged reason sink and the frame flag that meters arms of it - one allocation, because both exist per
-/// [`FsConn::fut`] frame and the flag alone was measured at 3.5x the cost of the `Arc` clone the completion path gave
-/// up in the same series.
+/// A staged reason sink and the frame flag that meters arms of it, in one allocation since both exist per
+/// [`FsConn::fut`] frame.
 pub(crate) struct SinkInner<F: ?Sized = dyn Fn(Errno, Vec<Vec<u8>>)> {
-    /// Whether a submission in the watching frame has taken the share: set by the first [`armed::arm`] under
-    /// [`FsConn::fut`]'s frame, read back by [`FsConn::restore_fail_sink`]. Shared with every clone of the sink `Rc`,
-    /// which is what lets an arm made through a [`FsConn::reborrow`] reach the frame that is watching.
+    /// Whether a submission in the watching frame has taken the share. Set by the first [`armed::arm`] under
+    /// [`FsConn::fut`]'s frame and read back by [`FsConn::restore_fail_sink`]. Shared by every clone of the sink `Rc`,
+    /// so an arm made through a [`FsConn::reborrow`] reaches the watching frame.
     armed: Cell<bool>,
     fill: F,
 }
@@ -187,9 +171,9 @@ impl<F: Fn(Errno, Vec<Vec<u8>>)> SinkInner<F> {
     }
 }
 
-/// An opaque per-op **owner** tag: the embedding host's connection identity `(slot, generation)`, threaded through so a
-/// chained callback runs under the same connection. The core never interprets it (files close by `Arc`-drop now, not by
-/// an owner sweep); `None` on the off-loop channel path.
+/// An opaque per-op owner tag, the embedding host's connection identity `(slot, generation)`, threaded through so a
+/// chained callback runs under the same connection. The core uses it only as a key, to sweep a closed connection's ops
+/// and to meter its wall-clock holds. `None` on the off-loop channel path.
 pub(crate) type Owner = Option<(u32, u64)>;
 
 /// Where a completed fs op's outcome goes: back over a channel to an off-loop [`FsHandle`](super::FsHandle) caller, or
@@ -200,15 +184,13 @@ pub(crate) enum FsWaiter {
     Embedded {
         owner: Owner,
         cb: EmbeddedCb,
-        /// The reason-sink share [`armed::arm`] took - holding `None` for a plain callback, whose contract is that a
-        /// drop closes the connection. The wrapper is what makes hand-building this variant a build failure; see
-        /// [`armed`].
+        /// The reason-sink share [`armed::arm`] took, `None` for a plain callback, whose contract is that a drop closes
+        /// the connection. The wrapper makes hand-building this variant a build failure (see [`armed`]).
         on_fail: armed::Armed,
     },
-    /// A reactor-pump read (a `net` server streaming a file into a response body): no callback - [`FsCore::on_cqe`]
-    /// hands the outcome back as [`ReapedFs::Pump`] and the host routes it to the owning connection itself, with the
-    /// full loop state in hand. Cancelled by owner exactly like `Embedded`, so connection teardown reaches an in-flight
-    /// body read through the same sweep.
+    /// A reactor-pump read (a `net` server streaming a file into a response body), with no callback. [`FsCore::on_cqe`]
+    /// hands the outcome back as [`ReapedFs::Pump`] for the host to route to the owning connection. Cancelled by owner
+    /// like `Embedded`, so connection teardown reaches an in-flight body read.
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     Pump {
         owner: (u32, u64),
@@ -217,16 +199,10 @@ pub(crate) enum FsWaiter {
 
 /// The one producer of an [`FsWaiter::Embedded`]'s reason-sink share.
 ///
-/// [`FsConn::fut`] tells "the op is in flight and will report for itself" from "the facade refused the arguments and
-/// nothing ever will" by whether any submission armed the staged sink, so a waiter built without arming makes `fut`
-/// answer a good op with a spurious `EINVAL` - the defect the ring timer shipped with. Folding arming into
-/// [`FsConn::waiter`] closed the front door, but `FsWaiter` is crate-visible and its variant fields were plain, so any
-/// of the fifteen submit methods could still hand-build the waiter - and the compiler's own suggested fix to the naive
-/// attempt produced exactly that spelling, copied from a test 2,500 lines below.
-///
-/// Hence a module: [`Armed`]'s field is private to it, so building one outside answers `E0603` and the one hop past
-/// *that* diagnostic is an edit to this guard, not to the call site. [`arm`] is the sole producer and does the whole
-/// dance - the clone, the double-arm check, the frame accounting - so there is no partial spelling left to reach for.
+/// [`FsConn::fut`] tells an op in flight from one the facade refused by whether any submission armed the staged sink,
+/// so a waiter built without arming makes `fut` answer a good op with a spurious `EINVAL`. [`Armed`]'s field is private
+/// to this module, so a submit method cannot hand-build the waiter, and [`arm`] does the whole clone, double-arm check
+/// and frame accounting.
 mod armed {
     use super::{FailSink, FsConn};
 
@@ -242,19 +218,14 @@ mod armed {
 
     /// Clone the staged sink and record the arm on the watching frame.
     ///
-    /// **One frame, one submission** - [`FsConn::fut`]'s stated contract - and the *first* arm inside a frame is the
-    /// one that takes the share; a later arm in the same frame gets an *empty* one, so its refusal follows the
-    /// plain-callback contract (dropped unfired) rather than spending the frame's one report on a submission the caller
-    /// did not await - in both build profiles, because a panic here would run inside dispatch, on consumer input, on a
-    /// path with no containment. `chain`/`walk` steps run on a fresh facade that carries the sink but watches no frame,
-    /// so their shares stay real and a mid-chain refusal keeps its errno.
+    /// One frame, one submission. The first arm inside a frame takes the share, and a later arm in the same frame gets
+    /// an empty one, so its refusal is dropped unfired as a plain callback's is. It must not panic, in either build
+    /// profile, since it runs inside dispatch on consumer input. `chain`/`walk` steps run on a fresh facade that
+    /// watches no frame, so their shares stay real and a mid-chain refusal keeps its errno.
     ///
-    /// The dedup meters *reporting*, not correctness: shares multiply across chain steps and reborrows, so which
-    /// submission answers the frame cannot be decided here. That is the slot's own rule: a share's refusal parks
-    /// provisionally, and the submission carrying the frame's callback owns the outcome (`SlotState::Refused`,
-    /// `task.rs`). The slot rule is what keeps any share's refusal, deduped or not, from discarding a real completion
-    /// still in flight - the shape that closed a fresh descriptor under a caller told a marked `EBUSY` for a create
-    /// that ran.
+    /// Which share answers the frame is the slot's rule (`SlotState::Refused`, `task.rs`). A share's refusal parks
+    /// provisionally and the submission carrying the frame's callback owns the outcome, so no refusal discards a real
+    /// completion still in flight.
     pub(super) fn arm(conn: &mut FsConn<'_>) -> Armed {
         if conn.frame_watching
             && let Some(sink) = &conn.fail_sink
@@ -273,9 +244,7 @@ mod armed {
     }
 }
 
-/// A routed fs-domain CQE, from [`FsCore::on_cqe`]: nothing left to do (a channel op delivered in place, or an inert
-/// stale completion), an embedded callback + outcome for the host to fire once its borrow of the fs tables has ended,
-/// or a pump read's outcome for the host to route to its owning connection.
+/// A routed fs-domain CQE, from [`FsCore::on_cqe`], for the host to act on once its borrow of the fs tables has ended.
 pub(crate) enum ReapedFs {
     None,
     Embedded(EmbeddedCb, FsDone, Owner),
@@ -285,11 +254,9 @@ pub(crate) enum ReapedFs {
     FileLeaseBreaks(Vec<FileLeaseId>),
 }
 
-/// `fremovexattr(2)` on `f`. Blocking, because io_uring has no opcode for it: the kernel's xattr ops are get/set only,
-/// and an `IORING_OP_FSETXATTR` with a zero-length value does **not** remove - `__vfs_setxattr` substitutes an empty
-/// value for `size == 0` (`fs/xattr.c`, commented "empty EA, do not remove"), leaving an attribute that still lists.
-/// Removal reaches a filesystem as `handler->set(..., NULL, 0, XATTR_REPLACE)` only from the `removexattr` syscalls,
-/// which io_uring cannot reach.
+/// `fremovexattr(2)` on `f`. Blocking, because io_uring has no remove opcode, and an `IORING_OP_FSETXATTR` with a
+/// zero-length value does not remove. `__vfs_setxattr` (`fs/xattr.c`) substitutes an empty value for `size == 0`,
+/// leaving an attribute that still lists.
 fn remove_xattr_blocking(f: &File, name: &CStr) -> crate::Result<()> {
     let raw = f.as_raw_fd();
     // SAFETY: `f` is borrowed for the call, so `raw` is live; `name` is a NUL-terminated C string.
@@ -314,16 +281,13 @@ struct FsOpEntry {
     /// The iovec array the SQE points at. Element pointers target `bufs`' heap allocations, which never move while
     /// parked here.
     iov: Vec<libc::iovec>,
-    /// Primary path payload: the `OPENAT2` path, a `STATX`/directory-op leaf, an xattr name, or a symlink target. The
-    /// SQE carries its address, so it must not move until the CQE reaps. A `'static` name is borrowed, which holds that
-    /// without an allocation, and a name that fits `name` goes there instead ([`FsOpEntry::park_name`]), so only a
-    /// longer one is owned here.
+    /// Primary path payload, the `OPENAT2` path, a `STATX`/directory-op leaf, an xattr name, or a symlink target. The
+    /// SQE carries its address, so it must not move until the CQE reaps. A name that fits `name` goes there instead
+    /// ([`FsOpEntry::park_name`]).
     path: Option<Cow<'static, CStr>>,
-    /// The bytes of the op's name when it fits with its NUL: the name of an open or a path op, or the path of a
-    /// descriptor under `/proc/thread-self/fd` for a reopen or a read of an xattr through `/proc`. The kernel copies it
-    /// at prep, inside the enter that submits the SQE, and the op table is built once in [`FsCore::new`] and never
-    /// grows, so this address holds however many stages batch before that enter, and the op allocates nothing for its
-    /// name.
+    /// The bytes of the op's name when it fits with its NUL, or the path of a descriptor under `/proc/thread-self/fd`.
+    /// The kernel copies it at prep, inside the enter that submits the SQE, and the op table never grows after
+    /// [`FsCore::new`], so this address holds however many stages batch before that enter.
     name: [u8; NAME_ROOM],
     /// Secondary path payload (the destination leaf of rename/link, the link path of symlinkat).
     path2: Option<CString>,
@@ -335,25 +299,21 @@ struct FsOpEntry {
     strip_nonblock: bool,
     /// `STATX` result pad - **the kernel writes it at completion**, so it must live until the CQE reaps.
     stat: Option<Box<StatxRaw>>,
-    /// `TIMEOUT` timespec pad. The kernel copies it at prep (`__io_timeout_prep` -> `get_timespec64`), which happens
-    /// inside the enter that submits the SQE - boxed and parked here so the address holds however many stages batch
-    /// before that enter.
+    /// `TIMEOUT` timespec pad. The kernel copies it at prep (`__io_timeout_prep` -> `get_timespec64`), inside the enter
+    /// that submits the SQE, so it is boxed here until then.
     ts: Option<Box<KernelTimespec>>,
-    /// This op's `ECANCELED` was asked for - a timer's by [`FsConn::cancel_timeout`], an `Allow` open's by its own
-    /// tripped deadline - so the completion reports a marked cancellation rather than the teardown verdict -
-    /// `ECANCELED` with [`FsDone::was_refused`] false stays meaning teardown alone.
+    /// This op's `ECANCELED` was asked for, by [`FsConn::cancel_timeout`] or by an `Allow` open's own tripped deadline,
+    /// so the completion reports a marked cancellation. An unmarked `ECANCELED` means teardown alone.
     retracted: bool,
     /// On a [`TAG_OPEN_DEADLINE`] entry: the slot and full generation of the `Allow` open this guard cancels if it
     /// fires - full-width like [`FsOpEntry::guard`], so a reissued slot is inert.
     cancels: Option<(u32, u64)>,
     /// On a [`TAG_OPEN`] entry: the guard timer's slot and full generation, retracted when the open answers first.
     guard: Option<(u32, u64)>,
-    /// On a [`TAG_OPEN_DEADLINE`] entry whose open already answered: the owner whose [`WallClock::retiring`] count this
-    /// slot is holding open. The pair charges one count for two slots, so the count cannot go home at the open's CQE -
-    /// the guard slot is still parked, exactly as a retracted timer's is, and is metered the same way until its own CQE
-    /// frees it. Set by [`FsCore::take_op`] at the moment it parks the count, never at the arm: the reverse ordering
-    /// (the guard fires first) frees this slot while the open still holds its `armed` charge, and there is nothing to
-    /// park.
+    /// On a [`TAG_OPEN_DEADLINE`] entry whose open already answered, the owner whose [`WallClock::retiring`] count this
+    /// slot holds open, since the pair's one count cannot go home while this slot is parked. Set by [`FsCore::take_op`]
+    /// when it parks the count, never at the arm, as a guard that fires first frees this slot while the open still
+    /// holds its `armed` charge.
     wall_clock: Option<(u32, u64)>,
     /// Keeps a path op's dirfd alive (and its fd number un-reused) while the op is in flight.
     anchor: Option<Anchor>,
@@ -362,10 +322,9 @@ struct FsOpEntry {
     /// The file an fd-op targets, parked here so its descriptor stays open (and un-reused) until the CQE reaps - the
     /// caller may drop its `File` mid-op. Dropping this on `clear` gives close-last ordering.
     file: Option<Arc<OwnedFd>>,
-    /// This op's share of a leased recv-pool buffer (a leased write). Several writes in one delivery may read from the
-    /// same buffer, so the id rides in an [`Arc`]: the buffer must outlive every DMA that reads it, and only the
-    /// completion that drops the *last* share knows when that is - `Arc::into_inner` at reap surfaces the id exactly
-    /// once, on [`FsDone`], for the net server to hand back to the pool.
+    /// This op's share of a leased recv-pool buffer. Several writes in one delivery may read the same buffer, which
+    /// must outlive every DMA that reads it, so `Arc::into_inner` at reap surfaces the id once, on [`FsDone`], from the
+    /// completion that drops the last share.
     #[cfg(feature = "net-server")]
     recv_lease: Option<std::sync::Arc<LeaseHold>>,
     /// The shares of a gathered leased write past its first window ([`FsConn::pwritev2_leased`]), each held to the CQE
@@ -399,11 +358,9 @@ fn gather_fits(windows: usize, total: usize) -> bool {
 ///
 /// The buffer goes back to the pool when the last share goes. A reaped write and a taken job completion take the id out
 /// on the reactor of the hold's own core ([`take_bid`](Self::take_bid), which disarms the drop), and a hold of another
-/// core's pool goes home through its queue. A share dropped anywhere else - a window a handler held past its delivery
-/// and let go, on whatever thread - returns it through the fs core's returns queue and pokes the loop, the road a
-/// finished job's result takes ([`publish`]). That road is loom-modelled (`loom_dropped_share_returns_after_its_read`);
-/// the refcount is not, which is why the share is a `std::sync::Arc`: the facade keeps a `Weak` to it and the reactor
-/// paths race their `Arc::into_inner` against a drop elsewhere, and loom supplies neither.
+/// core's pool goes home through its queue. A share dropped anywhere else returns it through the fs core's returns
+/// queue and pokes the loop ([`publish`]). The share is a `std::sync::Arc` because the facade keeps a `Weak` to it and
+/// the reactor paths race `Arc::into_inner` against a drop elsewhere, and loom supplies neither.
 #[cfg(feature = "net-server")]
 pub(crate) struct LeaseHold {
     bid: u16,
@@ -411,12 +368,9 @@ pub(crate) struct LeaseHold {
     returns: Option<LeaseReturns>,
 }
 
-/// Where a share dropped off the explicit release paths sends its buffer id: the core's queue and the loop's wake.
-///
-/// The wake is a strong `Arc` - loom's `Arc` has no `Weak` - so a share a handler keeps alive keeps the loop's eventfd
-/// open with it: a descriptor and a few words, for as long as the window lives. Every drop pokes; a handler returning a
-/// backlog on the loop thread pays a syscall per window, which at the depths a lease budget allows is noise beside the
-/// buffer it frees.
+/// Where a share dropped off the explicit release paths sends its buffer id, the core's queue and the loop's wake. The
+/// wake is a strong `Arc`, since loom's `Arc` has no `Weak`, so a share a handler keeps alive keeps the loop's eventfd
+/// open with it.
 #[cfg(feature = "net-server")]
 #[derive(Clone)]
 pub(crate) struct LeaseReturns {
@@ -453,12 +407,10 @@ impl LeaseHold {
         self.bid
     }
 
-    /// The buffer id for the core whose returns queue is `home` to give back to its own pool, as
-    /// [`into_bid`](Self::into_bid) takes it out, or `None` for a hold of another core's pool, which is dropped and so
-    /// sends its id home through that core's queue. Each core's ids name its own buffers, and a `LeasedWindow` is
-    /// `Send`, so a window written on another ring would otherwise put a buffer of its own ring into that ring's pool,
-    /// where the kernel could be handed a buffer still in use. A hold with no core behind it, a test's, is taken as
-    /// `home`'s.
+    /// The buffer id for the core whose returns queue is `home`, as [`into_bid`](Self::into_bid) takes it out, or
+    /// `None` for a hold of another core's pool, which is dropped and so goes home through that core's queue. A
+    /// `LeasedWindow` is `Send`, so a window written on another ring would otherwise put its buffer into the wrong
+    /// pool, where the kernel could be handed a buffer still in use. A test's hold with no core is taken as `home`'s.
     fn take_bid(self, home: &Arc<Mutex<VecDeque<u16>>>) -> Option<u16> {
         let ours = self
             .returns
@@ -477,13 +429,12 @@ impl Drop for LeaseHold {
     }
 }
 
-/// A pool job's view of a leased recv buffer ([`FsConn::offload_from`]): the raw extent, because a `&[u8]` cannot cross
+/// A pool job's view of a leased recv buffer ([`FsConn::offload_from`]), the raw extent, because a `&[u8]` cannot cross
 /// to a worker thread with the facade's lifetime on it.
 ///
-/// Valid to read for as long as a [`LeaseHold`] share for the buffer exists, and one does for the job's whole run: the
-/// share is registered with the job's continuation before the job is submitted and dropped only when the finished job's
-/// completion is taken on the reactor. The pool re-issues a buffer only after its last share is gone, and nothing
-/// writes a delivered buffer before then, so the bytes are both alive and immutable while any thread holds this.
+/// Valid to read while a [`LeaseHold`] share for the buffer exists, and one does from before the job is submitted until
+/// its completion is taken on the reactor. The pool re-issues a buffer only after its last share is gone, and nothing
+/// writes a delivered buffer before then.
 #[cfg(feature = "net-server")]
 #[derive(Clone, Copy)]
 struct LeasedBytes {
@@ -491,35 +442,29 @@ struct LeasedBytes {
     len: usize,
 }
 
-// SAFETY: the pointer is a plain address into a buffer that stays mapped, unmoved and unwritten for the lifetime of the
-// `LeaseHold` share taken beside this value (see the type's documentation); the worker only reads through it, so moving
-// the address to another thread races with nothing.
+// SAFETY: the pointer addresses a buffer that stays mapped, unmoved and unwritten while the `LeaseHold` share taken
+// beside this value lives, and the worker only reads through it.
 #[cfg(feature = "net-server")]
 unsafe impl Send for LeasedBytes {}
 
 #[cfg(feature = "net-server")]
 impl LeasedBytes {
     fn as_slice(&self) -> &[u8] {
-        // SAFETY: `ptr` and `len` came from a live `&[u8]` into a leased buffer, so every byte was written, and the
-        // share held beside this value keeps that buffer alive and unwritten for as long as the share lives, which
-        // outlasts every borrow of the slice, since a job holds its share until it returns and a window holds its own.
+        // SAFETY: `ptr` and `len` came from a live `&[u8]` into a leased buffer, and the share held beside this value
+        // keeps that buffer alive and unwritten for longer than any borrow of the slice.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
-/// A window of the delivering connection's receive buffer, held past the delivery ([`FsConn::lease_window`]): the bytes
-/// and a share of the buffer's claim, so the pool re-issues the buffer only once this is gone. What a handler that
-/// digests its windows in order keeps while an earlier window's job still runs, and spends on
-/// [`FsConn::offload_leased`] from that job's completion - no copy at either end. Its bytes read as a slice through
-/// `Deref` for as long as it is held.
+/// A window of the delivering connection's receive buffer, held past the delivery ([`FsConn::lease_window`]). It holds
+/// the bytes and a share of the buffer's claim, and reads as a slice through `Deref`. A handler spends it on
+/// [`FsConn::offload_leased`] with no copy at either end. Dropping one unspent returns its share, and the buffer goes
+/// back to the pool when the last share of its claim is gone.
 ///
-/// Dropping one unspent returns its share like any other: the buffer goes back to the pool when the last share of its
-/// claim is gone, wherever that happens.
-///
-/// **The budget.** Every buffer a handler holds a claim on - leased writes in flight, leased jobs, windows held like
-/// this - counts against [`recv_lease_depth`](crate::net::server::ServerConfig::recv_lease_depth). Past it the next
-/// read parks until a buffer comes home (or, with `recv_shortage_retry` off, the connection falls back to copies for
-/// good), so a handler holding windows until more of its stream arrives must stay within its depth or wait on itself.
+/// Every buffer a handler holds a claim on counts against
+/// [`recv_lease_depth`](crate::net::server::ServerConfig::recv_lease_depth). Past it the next read parks until a buffer
+/// comes home, or with `recv_shortage_retry` off falls back to copies for good, so a handler holding windows until more
+/// of its stream arrives must stay within its depth or wait on itself.
 #[cfg(feature = "net-server")]
 pub struct LeasedWindow {
     view: LeasedBytes,
@@ -628,10 +573,8 @@ impl FsOpEntry {
     /// Release every payload and mark the entry free (the caller bumps the generation and returns the slot to the
     /// free-list).
     fn clear(&mut self) {
-        // Everything, including the four a caller is expected to have taken first (`take_op` does, and so does
-        // `fail_op`). Left out, the residue is inert only by coincidence of which tags read which field - a stale
-        // `strip_nonblock` is read against the *next* tenant's `how`, and reads as `None` only because `how` is cleared
-        // here - and the coincidence is not something the next op added to this table should have to re-establish.
+        // Everything, including what a caller is expected to have taken first (`take_op` and `fail_op` do). A stale
+        // field left here is read against the next tenant, as a stale `strip_nonblock` would be against its `how`.
         self.waiter = None;
         self.bufs = Vec::new();
         self.value = None;
@@ -691,23 +634,15 @@ impl FsOpEntry {
 
 /// Take the special-file guard's `O_NONBLOCK` back off a freshly opened descriptor.
 ///
-/// The flag exists to stop the *open* blocking on a planted FIFO or device;
-/// on the descriptor it leaves behind it is not inert. `io_file_get_flags` (`io_uring/io_uring.c:1793-1794`) reads it
-/// into `REQ_F_SUPPORT_NOWAIT` - the same bit `FMODE_NOWAIT` sets - so `__io_read` (`io_uring/rw.c:950-958`) takes the
-/// `IOCB_NOWAIT` branch instead of returning `-EAGAIN`, and the transfer runs in the submitting task rather than on an
-/// io-wq worker. That task is this reactor thread. The kernel strips the flag from the file it returns whenever it was
-/// the one that added it (`io_uring/openclose.c:161-162`); this is the same move for the same reason.
+/// The flag stops the open blocking on a planted FIFO or device, but on the descriptor it is not inert.
+/// `io_file_get_flags` (`io_uring/io_uring.c:1793-1794`) reads it into `REQ_F_SUPPORT_NOWAIT`, so `__io_read`
+/// (`io_uring/rw.c:950-958`) takes the `IOCB_NOWAIT` branch and runs the transfer on this reactor thread rather than on
+/// an io-wq worker. The kernel strips the flag the same way when it added it (`io_uring/openclose.c:161-162`).
 ///
-/// One `fcntl` on the reactor, ~400 ns and about 5% of the open it follows, spent to keep a whole read off this
-/// thread - a 32 MiB read of a warm ZFS file measured 22.7 ms inline against being punted. Run here because this is
-/// where the descriptor first becomes visible to anyone.
-///
-/// A failure is not worth failing the open over: the descriptor is valid either way, and what is lost is scheduling,
-/// not correctness.
+/// `F_SETFL` honours only the settable flags, so passing back the flags asked for minus `O_NONBLOCK` needs no
+/// `F_GETFL`. A failure does not fail the open, since the descriptor is valid either way and only scheduling is lost.
 fn strip_guard_nonblock(fd: RawFd, flags: u64) {
-    // SAFETY: `fd` is the descriptor OPENAT2 just returned. `F_SETFL` honours only the settable subset
-    // (`O_APPEND`/`O_ASYNC`/`O_DIRECT`/`O_NOATIME`/ `O_NONBLOCK`), so passing back what was asked for minus
-    // `O_NONBLOCK` keeps any of those the caller set and needs no `F_GETFL` first.
+    // SAFETY: `fd` is the descriptor OPENAT2 just returned, and `fcntl` with `F_SETFL` reads no memory.
     unsafe {
         libc::fcntl(fd, libc::F_SETFL, flags as i32 & !libc::O_NONBLOCK);
     }
@@ -734,20 +669,13 @@ struct Completed {
     lease_want: u32,
 }
 
-/// The fs domain's tables. The host owns the [`Engine`] and passes it in for staging; completion routing happens in
-/// [`FsCore::on_cqe`].
-/// A finished off-loop job awaiting on-loop delivery: `(token, boxed result)`.
+/// A finished off-loop job awaiting on-loop delivery, `(token, boxed result)`.
 type PoolCompletion = (u64, Box<dyn Any + Send>);
 
-/// The offload worker's epilogue: record the outcome, then wake the loop.
+/// The offload worker's epilogue, which records the outcome and then wakes the loop through [`publish`].
 ///
-/// The order is what makes the wake reliable - the queue is written under its lock *before* the poke, so a loop that
-/// wakes finds the completion there. The eventfd counts, and the loop re-arms its `READ`, so no poke is lost (the
-/// inject-path pattern).
-///
-/// A function so the loom models drive **this** epilogue rather than their own copy of it. A model with its own copy
-/// checks the memory model rather than the code: reorder the two lines in production and it stays green, which is the
-/// case it is for (`bufring::publish_tail` states the rule).
+/// A function so the loom models drive this epilogue rather than their own copy of it, which would stay green with the
+/// two steps reordered (`bufring::publish_tail` states the rule).
 pub(crate) fn finish_offload(
     sink: &Mutex<VecDeque<PoolCompletion>>,
     wake: &crate::uring::wake::WakeHandle,
@@ -757,10 +685,9 @@ pub(crate) fn finish_offload(
     publish(sink, wake, (token, outcome));
 }
 
-/// Hand `item` to the loop: push it under the queue's mutex, then poke. The one spelling of that order, for a finished
-/// job's result ([`finish_offload`]) and a dropped share's buffer id ([`LeaseHold`]) alike: the push is what makes the
-/// loop's drain observe everything the pusher did before it, and a poke that came first could be drained ahead of the
-/// push and leave the item to wait for the next.
+/// Hand `item` to the loop by pushing it under the queue's mutex and then poking. The one spelling of that order, for a
+/// finished job's result ([`finish_offload`]) and a dropped share's buffer id ([`LeaseHold`]). A poke made first could
+/// be drained ahead of the push and leave the item waiting for the next.
 pub(crate) fn publish<T>(sink: &Mutex<VecDeque<T>>, wake: &crate::uring::wake::WakeHandle, item: T) {
     sink.lock().unwrap_or_else(|e| e.into_inner()).push_back(item);
     wake.poke();
@@ -783,56 +710,45 @@ type OffloadDeliver = Box<dyn FnOnce(Box<dyn Any + Send>, &mut FsConn<'_>)>;
 /// One drained offload ready to fire: its owner, its continuation, and the boxed job result to hand it.
 type PoolDelivery = (Owner, OffloadDeliver, Box<dyn Any + Send>);
 
-/// The reactor-side half of an in-flight [`FsConn::offload`]: the owner to scope the delivering [`FsConn`] to, and the
-/// type-erased continuation (it downcasts the boxed result back to the job's `R` and calls the caller's `on_done`).
+/// The reactor-side half of an in-flight [`FsConn::offload`], the owner to scope the delivering [`FsConn`] to and its
+/// continuation.
 struct OffloadEntry {
     owner: Owner,
     deliver: OffloadDeliver,
-    /// The job's share of the delivering connection's recv-buffer claim ([`FsConn::offload_from`]), held *here* and not
-    /// by the job: this share never leaves the reactor, which drops it from [`FsCore::take_pool_completions`] once the
-    /// job has returned - the bytes the job read stay put for its whole run. `None` for every other offload.
+    /// The job's share of the delivering connection's recv-buffer claim ([`FsConn::offload_from`]), held here and not
+    /// by the job, and dropped in [`FsCore::take_pool_completions`] once the job has returned, so the bytes the job
+    /// reads stay put for its whole run. `None` for every other offload.
     #[cfg(feature = "net-server")]
     lease: Option<std::sync::Arc<LeaseHold>>,
 }
 
-/// One owner's wall-clock tenancy. `armed` is what the cap meters - each count returned at its hold's ending, or early
-/// at a timer's retraction. `retiring` counts a hold whose count has gone back to the cap while a slot it charged for
-/// is still parked awaiting its CQE, and there are two of those:
+/// One owner's wall-clock tenancy. `armed` is what the cap meters, each count returned at its hold's ending or early at
+/// a timer's retraction. `retiring` counts a hold whose count has gone back to the cap while a slot it charged for is
+/// still parked awaiting its CQE, and there are two of those.
 ///
-/// - a **retracted timer**, whose retraction hands the cap headroom back on the spot so retract-then-rearm holds inside
-///   one delivery,
-///   while the slot rides to a CQE no delivery reaps;
-/// - an **`Allow` pair whose open answered first**, which charged one count for two slots, so the guard slot outlives
-///   the CQE that would otherwise return the whole charge.
+/// - A **retracted timer**, whose retraction hands the cap headroom back at once so retract-then-rearm holds inside one
+///   delivery, while the slot rides to a CQE no delivery reaps.
+/// - An **`Allow` pair whose open answered first**, which charged one count for two slots, so the guard slot outlives
+///   the CQE that returns the charge.
 ///
-/// So the arm screens also refuse at `armed + retiring` reaching twice the cap, and both classes have to reach
-/// `retiring`, or the sum bounds one of them and the other walks the table one unreaped slot at a time. Without the
-/// clause at all the early headroom unmade the cap entirely: a retract-rearm loop inside one delivery parked the whole
-/// table with `armed` never leaving zero (cap 1 on a 64-slot table measured 64 arms, zero refusals, zero free slots).
+/// So the arm screens also refuse once `armed + retiring` reaches twice the cap. **Both classes must reach
+/// `retiring`**, or the sum bounds one of them and the other walks the table one unreaped slot at a time. A screen that
+/// counts one reads as correct and is not. Without the clause the early headroom unmakes the cap, as a retract-rearm
+/// loop parks the whole table with `armed` never leaving zero.
 ///
-/// **Both screens are counts, and a count is not a slot.** A timer's is one slot, an `Allow` pair's armed count is two,
-/// and a `retiring` count is one whichever class parked it - so the mid-swap ceiling is `2 x cap` slots for an owner
-/// arming timers and up to `3 x cap` for one arming pairs (`cap` pairs armed at two slots each, plus `cap` guard slots
-/// parked on `retiring`). That is the number the table is sized against; stating the ceiling in slots and enforcing it
-/// in counts is what the two disagree about, and converting here would have to charge each class its own weight rather
-/// than assume the heavier one, which over-refuses the timers this cap was written for.
+/// **Both screens are counts, and a count is not a slot.** A timer's count is one slot, an `Allow` pair's armed count
+/// is two, and a `retiring` count is one, so the ceiling is `2 x cap` slots for an owner arming timers and up to `3 x
+/// cap` for one arming pairs. Converting to slots would have to weigh each class on its own, since charging every count
+/// the heavier weight over-refuses timers.
 #[derive(Clone, Copy, Default)]
 struct WallClock {
     armed: u32,
     retiring: u32,
 }
 
-/// Every move of the pair, in one place.
-///
-/// The three call sites used to spell their own arithmetic and disagreed about the failure: `release_retiring`
-/// saturated, on the stated grounds that "an unmatched return is a stuck cap in release, not a `u32::MAX` that refuses
-/// the owner's every arm for the life of the reactor", while `take_op` and the retraction wrapped. Break the pairing
-/// and the release build wraps `armed` to `u32::MAX`, `refuse_wall_clock_hold` then reads `armed >= cap` and answers a
-/// marked `EBUSY` to every later timer arm and every `Allow` open by that owner - forever, with the map entry never
-/// reclaimed because `is_empty` can never be true again.
-///
-/// The `debug_assert`s live here rather than at the call sites for the same reason: the ones there fired only on a
-/// *missing* map entry, so a count already at zero had no detector in either profile.
+/// Every move of the pair, in one place, so every caller fails the same way. Each step saturates, since a wrapped
+/// `armed` reads as `armed >= cap` and refuses every later arm by that owner for good, and each decrement's
+/// `debug_assert` catches a count already at zero.
 impl WallClock {
     /// A hold armed.
     fn arm(&mut self) {
@@ -871,6 +787,8 @@ impl WallClock {
     }
 }
 
+/// The fs domain's tables. The host owns the [`Engine`] and passes it in for staging, and completion routing happens in
+/// [`FsCore::on_cqe`].
 pub(crate) struct FsCore {
     ops: Vec<SlotEntry<FsOpEntry>>,
     op_free: Vec<u32>,
@@ -907,51 +825,23 @@ pub(crate) struct FsCore {
     /// it - two reactors on one thread both start their tables at slot 0, generation 0, so slot + generation alone
     /// alias across them.
     core_id: u64,
-    /// The highest connection generation [`FsCore::cancel_owned_by`] has swept, per connection slot - what
-    /// [`FsCore::owner_is_gone`] reads. One entry per slot and slots are reused, so this is bounded by the host's
-    /// connection table and never by how many connections have come and gone. Empty for a reactor with no owners (the
-    /// standalone host).
+    /// The highest connection generation [`FsCore::cancel_owned_by`] has swept, per connection slot, which
+    /// [`FsCore::owner_is_gone`] reads. One entry per slot, and slots are reused, so this is bounded by the host's
+    /// connection table and never by how many connections have come and gone.
     closed_owners: HashMap<u32, u64>,
-    /// Wall-clock holds per owner, and the per-owner ceiling the host set ([`FsCore::set_timer_cap`]). A timer holds
-    /// its op slot for wall-clock time rather than until an I/O completes - and an `Allow` open holds two slots the
-    /// same way, its own and its guard's, until the deadline or the open ends the pair - so without a bound one
-    /// connection could park the whole shared handler budget for its arms' full duration - measured at every slot of a
-    /// consumer-sized table in 19 ms. An `Allow` pair charges one count (so a count bounds at most two slots), taken
-    /// when its guard stages and returned by whichever of its two slots frees last - parked on `retiring` in between,
-    /// exactly as a retracted timer's is ([`WallClock`]).
-    /// The ceiling is the host's `max_in_flight_requests`: the real consumer's discipline is one retry tick per
-    /// connection, walking every claimant parked on it (its `guard.rs`), so one connection needs N concurrent holds
-    /// exactly when N pipelined requests carry deadlines at once, and a smaller constant would couple this crate to the
-    /// pipelining knob of another. `None` is uncapped - the standalone host has one caller and no tenants to protect
-    /// from each other - and owner-less arms are never counted.
+    /// Wall-clock holds per owner ([`WallClock`]) and the per-owner cap the host set ([`FsCore::set_timer_cap`]).
     armed_timers: HashMap<(u32, u64), WallClock>,
     timer_cap: Option<u32>,
     /// Which of this core's reads and writes carry `IOSQE_ASYNC`, as the host set it ([`FsCore::set_force_async`]).
-    /// Only `READ` and `WRITE` are read here; the socket classes belong to the net reactor. Empty for the standalone
-    /// host, which exposes no knob for it.
+    /// Only `READ` and `WRITE` are read here, as the socket classes belong to the net reactor.
     force_async: ForceAsync,
-    /// Host refusals awaiting delivery: embedded ops the ring never hosted - a full table, an `Allow` pair's two-slot
-    /// charge, the wall-clock cap, a swept owner, a staging failure - resolved at submit time and fired at the wake
-    /// drain ([`deliver_pool_completions`]), each with its payload and its verdict. The refusal is decided inside
-    /// `submit_*`, which holds `&mut self` on the fs tables, so the callback cannot fire there; structurally it is an
-    /// offload that resolved at submit, and it rides the same push-then-poke protocol to the same drain. Queueing is
-    /// what makes the class deliverable at all: a screen that drops the callback instead hands a plain-callback caller
-    /// nothing but a closed connection, for a verdict decided at eighteen submit screens and reported at none.
-    ///
-    /// Uncapped, like the task run queue and the offload registry: bound in-flight work upstream, at the request cap -
-    /// a pass's queue depth is what one dispatch's consumer code submitted. And loop-thread state only, no instrument
-    /// beyond the borrow checker: `FsCore` is `!Send` (the `Rc`s in `tasks` see to it), so push and drain cannot race.
-    /// The one cross-thread-shaped edge - the self-poke that guarantees a drain - rests on pokes accumulating in the
-    /// eventfd counter (`eventfd_write`, `fs/eventfd.c`: `ctx->count += ucnt`, so a poke made while the READ is unarmed
-    /// completes the next arm immediately), which `loom_wake_pokes_accumulate` models and
-    /// `loom_offload_wakeup_loses_nothing` exercises against a racing drain.
+    /// Host refusals awaiting delivery ([`FsCore::refuse`]), each with its owner, callback and outcome.
     refusals: VecDeque<(Owner, EmbeddedCb, FsDone)>,
     /// The file leases this ring holds and the signalfd their breaks arrive on ([`FileLeases`]).
     pub(crate) file_leases: FileLeases,
-    /// Spawned tasks and their run queue (the futures layer, [`super::task`]); woken tasks are polled by the delivery
-    /// functions below. **Last field on purpose**: fields drop in declaration order, so `Tasks::drop` - which runs
-    /// pending task destructors - is the final thing to go, with everything above already destroyed; its own doc leans
-    /// on exactly that.
+    /// Spawned tasks and their run queue ([`super::task`]), polled by the delivery functions below. **Last field on
+    /// purpose**, since fields drop in declaration order and `Tasks::drop`, which runs pending task destructors, relies
+    /// on everything above being gone.
     pub(crate) tasks: super::task::Tasks,
 }
 
@@ -999,9 +889,15 @@ impl FsCore {
         }
     }
 
-    /// Bound armed timers per owner (see the field). Setup-time only, on [`FsCore::set_privileged_xattrs`]'s rule: the
-    /// hosts expose it through a `&mut self` setter and their run loops also take `&mut self`, so it cannot change
-    /// while operations are in flight.
+    /// Bound wall-clock holds per owner. A timer holds its op slot for wall-clock time rather than until an I/O
+    /// completes, and an `Allow` open holds two slots the same way, so without a bound one connection could park the
+    /// whole shared handler budget for its arms' full duration. An `Allow` pair charges one count, taken when its guard
+    /// stages and returned by whichever of its two slots frees last ([`WallClock`]).
+    ///
+    /// The host passes its `max_in_flight_requests`, since one connection needs N holds exactly when N pipelined
+    /// requests carry deadlines at once, and a smaller constant would couple this crate to a consumer's pipelining.
+    /// Unset is uncapped, for the standalone host, and owner-less arms are never counted. Setup-time only, on
+    /// [`FsCore::set_privileged_xattrs`]'s rule.
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     pub(crate) fn set_timer_cap(&mut self, per_owner: u32) {
         self.timer_cap = Some(per_owner);
@@ -1027,23 +923,16 @@ impl FsCore {
         self.closed_owners.get(&slot).is_some_and(|&swept| swept >= generation)
     }
 
-    /// Screen a wall-clock hold - a timer, or an `Allow` open's pair - before any slot is popped for it: a swept owner
-    /// may not park time on the table (the sweep's own `ECANCELED`, unmarked, so a continuation keyed on that
-    /// vocabulary winds down the same way in both orderings), and an owner at its cap - or mid-swap at twice its cap in
-    /// *counts*, which is two to three times that in slots depending on the class ([`WallClock`]) - is refused with the
-    /// marked `EBUSY` a full table answers. `Some` is the verdict to deliver, `(errno, marked)`.
+    /// Screen a wall-clock hold, a timer or an `Allow` open's pair, before any slot is popped for it. `Some` is the
+    /// verdict to deliver, `(errno, marked)`. A swept owner gets the sweep's own unmarked `ECANCELED`, so a
+    /// continuation keyed on it winds down the same way in both orderings. An owner at its cap, or with `armed +
+    /// retiring` at twice it ([`WallClock`]), gets the marked `EBUSY` a full table answers.
     ///
-    /// The `Embedded`-with-owner pattern is the screen's boundary as well as its key: a hold that names no owner passes
-    /// unscreened and its two slots go uncounted by any cap. Two shapes reach that - an off-loop `FsWaiter::Channel`
-    /// hold (a public [`FsHandle::open`](super::FsHandle::open) carrying a deadline), and an `Embedded` hold submitted
-    /// with `owner: None`.
-    ///
-    /// **Nothing meters them, and the only backstop is the table.** [`FsHandle`](super::FsHandle) is `Clone`, so the
-    /// number of concurrent off-loop holds is the number of caller threads, and the pair's own `op_free.len() < 2`
-    /// check is what refuses them - as `EBUSY`, to whoever asks next, including every owner that *is* metered. The
-    /// thread a `ReplyTo::Sync` reply blocks is not a second bound either: it unblocks when the *open* answers, while
-    /// the guard slot is still parked to its own CQE. Metering this needs an owner axis off-loop callers do not have,
-    /// which is why the exemption stands rather than being called a bound.
+    /// A hold that names no owner passes unscreened, an off-loop `FsWaiter::Channel` hold
+    /// ([`FsHandle::open`](super::FsHandle::open) with a deadline) or an `Embedded` one with `owner: None`. Nothing
+    /// meters those but the table, whose `op_free.len() < 2` check refuses them as `EBUSY` to whoever asks next,
+    /// metered owners included. Metering them needs an owner axis off-loop callers do not have, so this is an exemption
+    /// and not a bound.
     fn refuse_wall_clock_hold(&self, waiter: &FsWaiter) -> Option<(Errno, bool)> {
         let FsWaiter::Embedded { owner: Some(o), .. } = waiter else {
             return None;
@@ -1118,9 +1007,7 @@ pub struct FsDone {
     value: Option<Vec<u8>>,
     file: Option<File>,
     stat: Option<Box<StatxRaw>>,
-    /// The recv-pool buffer id a leased write borrowed, owed back to the
-    /// pool now that the op is over. Routed by the net server's dispatch;
-    /// meaningless to any other consumer.
+    /// The recv-pool buffer id a leased write borrowed, owed back to the pool now that the op is over.
     #[cfg(feature = "net-server")]
     recv_lease: Option<u16>,
     /// Ids beyond `recv_lease` a gathered leased write owes back; empty for every other op.
@@ -1142,14 +1029,10 @@ impl std::fmt::Debug for FsDone {
 
 /// A timer armed by [`FsConn::timeout`], for [`FsConn::cancel_timeout`].
 ///
-/// Names one arming, not the slot: it carries the reactor's identity and the **full-width** op-table generation the arm
-/// was made under, on the rule the ring's slot entries state (`uring::slots`) - a caller-retained handle must never
-/// alias a future incarnation of its slot, and the truncated 32-bit routing token is only safe because a completion
-/// cannot outlive its op, which a `Timer` held past expiry does by design. The retraction verifies all three fields
-/// against the table before staging anything, so a stale token, or one minted by a different reactor on this thread, is
-/// inert rather than a cancel of whoever holds the slot now. Copy, because retracting is idempotent and a caller that
-/// holds two deadlines should not have to track which one it has already spent; not `Send`, because it names
-/// loop-thread state and crossing threads with it could only ever reach the wrong ring.
+/// Names one arming, not the slot. It carries the reactor's identity and the full-width op-table generation of the arm
+/// (`uring::slots`), since a `Timer` held past expiry must never alias a later tenant of its slot. The retraction
+/// checks all three against the table before staging anything, so a stale token, or one from another reactor on this
+/// thread, is inert. `Copy`, since retracting is idempotent, and not `Send`, since it names loop-thread state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timer {
     core: u64,
@@ -1162,34 +1045,17 @@ pub struct Timer {
 /// for chaining. Every op runs on the server's ring, checked as the [`Personality`] passed to it, and its completion
 /// fires the `on_done` callback **inline on the loop thread**.
 ///
-/// **Re-entrancy:** callbacks run inside dispatch - never block, and drive the ring only through this facade. An
-/// argument a screen here refuses answers `on_done` with a marked `EINVAL` **before the method returns**. A refusal
-/// past the screens is the core declining to *host* the op - a full op table, an `Allow` open's two-slot charge with
-/// one slot left, the per-owner wall-clock cap, a swept owner arming a hold, a staging failure - and every one of them
-/// **delivers** `on_done` with its verdict and payload at the next wake drain (`FsCore::refuse`): the capacity refusals
-/// as a marked errno ([`FsDone::was_refused`], with [`FsDone::into_bufs`] handing the payload back for the retry the
-/// mark advises), the swept owner's as the unmarked `ECANCELED` the sweep would have dealt the op in flight -
-/// teardown's vocabulary, so a continuation keyed on it winds down the same way in both orderings. An awaited frame
-/// additionally reads a marked refusal's reason synchronously through its armed sink share (`armed::arm`), which the
-/// delivered callback then settles. These methods return `()` either way; only the timing distinguishes a screen's
-/// answer (inline) from the core's (one drain later).
-///
-/// **No method here may return data borrowed from `'a`.** The task layer parks a facade in a thread-local as
-/// `FsConn<'static>` and hands it back as `&mut FsConn<'_>`; `&mut U` is invariant in `U`, so a closure taking the
-/// facade can be instantiated at `&mut FsConn<'static>`.
-///
-/// What keeps that from leaking is **`task::with_conn`'s signature**:
-/// `impl FnOnce(&mut FsConn<'_>) -> R` desugars higher-ranked, so `R` cannot name the facade's lifetime whatever the
-/// cell holds. It is not `task::reach_in`, which is generic over a `'static` `T` and quantifies nothing - reached
-/// directly at `T = FsConn<'static>` it will hand out `&'static` borrows of a facade that died with its poll. A second
-/// wrapper beside `with_conn` has to reproduce that bound, or it is unsound from safe code.
-///
-/// The rule here is the belt to that brace, and it is `reach_in`'s path it guards, not `with_conn`'s: through
-/// `with_conn` the binder
-/// already stops a caller naming the lifetime, so a `fn x(&self) ->
-/// &'a T` added here is unexploitable there - but reached at `T = FsConn<'static>` it hands out `&'static` borrows of
-/// the ring's tables from safe code, and nothing in `reach_in`'s signature is positioned to object. Keep methods
-/// returning owned values or borrows of `&self`.
+/// **Re-entrancy.** Callbacks run inside dispatch, so they never block and drive the ring only through this facade. An
+/// argument a screen here refuses answers `on_done` with a marked `EINVAL` before the method returns. When the core
+/// declines to host an op (a full op table, an `Allow` open's two-slot charge with one slot left, the per-owner
+/// wall-clock cap, a swept owner arming a hold, a staging failure), `on_done` is delivered at the next wake drain. A
+/// capacity refusal is a marked errno ([`FsDone::was_refused`]) with [`FsDone::into_bufs`] handing the payload back for
+/// a retry, and a swept owner's is the unmarked `ECANCELED` of teardown.
+//
+// No method here may return data borrowed from `'a`. The task layer parks a facade in a thread-local as
+// `FsConn<'static>`. The higher-ranked signature of `task::with_conn` stops a caller naming the facade's lifetime, but
+// `task::reach_in` reached at `T = FsConn<'static>` would hand out `&'static` borrows of the ring's tables from safe
+// code. Keep methods returning owned values or borrows of `&self`, and give any wrapper beside `with_conn` its bound.
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
 pub struct FsConn<'a> {
     fs: &'a mut FsCore,
@@ -1205,25 +1071,19 @@ pub struct FsConn<'a> {
     /// nothing else.
     #[cfg(feature = "net-server")]
     lease_hold: Option<std::sync::Weak<LeaseHold>>,
-    /// Staged by [`FsConn::fut`] for the submissions that follow it, and *cloned* by each one's `embed` rather than
-    /// taken - see [`FailSink`]. `None` for every callback caller, which is what keeps their drop-on-refusal contract
-    /// exactly as it was.
+    /// Staged by [`FsConn::fut`] for the submissions that follow it, and cloned by each one's `embed` rather than taken
+    /// (see [`FailSink`]). `None` for every callback caller, which keeps their drop-on-refusal contract.
     fail_sink: Option<FailSink>,
-    /// Whether a [`FsConn::fut`] frame is watching this facade's submissions. The arm flag itself - whether a
-    /// submission has taken a clone of `fail_sink` since it was staged, which `fut` reads to tell "the op is in flight
-    /// and reports for itself" from "`submit` returned without handing the op to the core at all" - rides the staged
-    /// sink's own allocation ([`SinkInner`]), shared by every clone of it: a two-step dispatch submits through
-    /// [`FsConn::reborrow`], and an arm made through the reborrow must reach the frame that is watching - a copied flag
-    /// left the outer `fut` synthesising a spurious `EINVAL` for an op in flight. This bool is what stays per-facade: a
-    /// `chain`/`walk` step's fresh facade carries the sink but watches no frame, so its arms take shares without
-    /// spending the one-per-frame budget.
+    /// Whether a [`FsConn::fut`] frame is watching this facade's submissions. The arm flag itself rides the staged
+    /// sink's allocation ([`SinkInner`]), so an arm made through [`FsConn::reborrow`] reaches the watching frame. This
+    /// bool stays per facade, since a `chain`/`walk` step's fresh facade carries the sink but watches no frame, and its
+    /// arms take shares without spending the frame's one report.
     frame_watching: bool,
 }
 
-/// What [`FsConn::stage_fail_sink`] displaced, to be handed back to
-/// [`FsConn::restore_fail_sink`]: the sink staged before, and whether
-/// a frame was watching then. A `fut` nested inside another's `submit` closure must not swallow the outer's sink - or
-/// its frame.
+/// What [`FsConn::stage_fail_sink`] displaced, for [`FsConn::restore_fail_sink`], the sink staged before and whether a
+/// frame was watching then. A `fut` nested inside another's `submit` closure must not swallow the outer's sink or its
+/// frame.
 pub(crate) struct StagedSink(Option<FailSink>, bool);
 
 /// A view of the delivering connection's recv-pool claim, offered to the handler's fs facade for the duration of one
@@ -1251,10 +1111,9 @@ impl std::fmt::Debug for FsConn<'_> {
 }
 
 #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
-/// An opaque identity for the connection a facade serves - stable across every facade of one connection's deliveries
-/// and continuations, distinct across connections, across reincarnations of a slot, and across reactors. A key for
-/// consumers that multiplex per-connection state - one shared retry tick, a dedup map - sized to the same tenancy the
-/// per-owner caps meter. It carries no capability and names nothing retractable.
+/// An opaque identity for the connection a facade serves, stable across every facade of one connection's deliveries and
+/// continuations, and distinct across connections, reincarnations of a slot, and reactors. A key for consumers that
+/// keep per-connection state. It carries no capability and names nothing retractable.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ConnToken {
     core: u64,
@@ -1294,10 +1153,6 @@ impl std::fmt::Debug for StepPath {
 }
 
 /// One step of an [`FsConn::open_chain`].
-///
-/// **The credential is per step, which is the point.** A tree only the daemon may traverse is opened under its own
-/// personality, while a file inside it is still resolved under the caller's — so the kernel makes the access decision
-/// about the file the caller actually named, in a directory the caller could never have walked.
 #[derive(Debug)]
 pub struct OpenStep {
     /// What this step names, relative to the file the previous step opened (or to the chain's anchor, for the first).
@@ -1316,11 +1171,10 @@ type WalkDone = Box<dyn FnOnce(FsDone, &mut FsConn<'_>)>;
 // ---- hybrid off-loop listing: threaded readdir + on-loop enrichment --------
 
 /// A `*mut DIR` handed between the reactor and a worker thread. Sound only because the walk gives it to exactly one
-/// thread at a time (reactor -> worker for a batch, worker -> reactor on delivery) and never shares it concurrently.
+/// thread at a time and never shares it.
 ///
-/// Owns the `DIR*`: dropping it `closedir`s the handle, so a batch result that is never delivered (the walk dropped
-/// mid-flight, or a worker job unwinds) reclaims the fd instead of leaking it. Ownership is passed on, rather than
-/// duplicated, with [`SendDir::into_raw`].
+/// Owns the `DIR*`, so dropping it `closedir`s the handle, and a batch result that is never delivered reclaims the fd.
+/// [`SendDir::into_raw`] passes ownership on.
 struct SendDir(*mut libc::DIR);
 // SAFETY: single-owner-at-a-time hand-off, never aliased across threads.
 unsafe impl Send for SendDir {}
@@ -1397,23 +1251,15 @@ pub struct NameBatch {
 mod hybrid_tests;
 
 fn map_res(res: i32) -> Result<i32, Errno> {
-    // The kernel-internal restart codes, which io_uring folds to `-EINTR` for reads and writes (`io_fixup_restart_res`,
-    // `io_uring/rw.c` - "Just fail this IO with EINTR") but posts verbatim for opens and splices, where the fixup is
-    // not applied. A cancelled `SpecialFiles::Allow` open blocked in `fifo_open` surfaces `-ERESTARTSYS` this way;
-    // unmapped it decodes as `UnknownErrno`, and one teardown sweep then yields two different errnos depending on where
-    // each op was parked. Folded here, once, so every fs op behaves as the kernel's own rw path does. The stream
-    // domain's splice does the same by hand (`net/core/reactor/io.rs`).
-    // Exactly the four the kernel names - 515 between them is `ENOIOCTLCMD`, not a restart code.
+    // The kernel's restart codes, which io_uring folds to `-EINTR` for reads and writes (`io_fixup_restart_res`,
+    // `io_uring/rw.c`) but posts verbatim for opens and splices. A cancelled `SpecialFiles::Allow` open blocked in
+    // `fifo_open` surfaces `-ERESTARTSYS` this way. Exactly the four the kernel names, as 515 is `ENOIOCTLCMD`.
     if matches!(res, -512 | -513 | -514 | -516) {
         return Err(Errno::EINTR);
     }
     if res < 0 { Err(Errno::from_raw(-res)) } else { Ok(res) }
 }
 
-/// Route a completed op's outcome to its channel waiter. A gone caller (a dropped receiver - a `File`/future dropped
-/// before awaiting) simply orphans the op; nothing to do. (A successful `open` does NOT route through here - `on_cqe`
-/// wraps its fd in an `Arc<OwnedFd>`, and a gone receiver drops that `Arc`, which closes the fd. No close op is staged,
-/// and there is no slot to leak.)
 /// The buffers of an op with its xattr value, if it has one, as the one buffer, for the outcomes that carry no value of
 /// their own: the blocking path's, a refusal's and the teardown drain's.
 fn with_value(bufs: Vec<Vec<u8>>, value: Option<Vec<u8>>) -> Vec<Vec<u8>> {
@@ -1423,12 +1269,6 @@ fn with_value(bufs: Vec<Vec<u8>>, value: Option<Vec<u8>>) -> Vec<Vec<u8>> {
     }
 }
 
-/// Routing / close-last property fuzzer for the **plain-fd** core. There is no file-slot pool any more; fds are
-/// `Arc<OwnedFd>` closed by last-reference. The fuzzer drives fuzzed submit/complete schedules against a real
-/// (never-flushed) `Engine`, feeds a mix of correct and anomalous CQEs, and asserts: op slots free exactly once
-/// (`op_free` reconciles), every synthesized fd closes exactly once (never early - a parked clone outlives a dropped
-/// caller - never leaked), and stale/wrong-tag/recycled completions are inert. `ROUTING_FUZZ_SEEDS=N` overrides the
-/// seed count.
 #[cfg(all(test, not(loom)))]
 mod op_entry_size;
 
@@ -1438,29 +1278,22 @@ mod fs_done_tests;
 #[cfg(all(test, not(loom)))]
 mod wall_clock_tests;
 
+/// Routing and close-last property fuzzer. It drives fuzzed submit and complete schedules against a real, never-flushed
+/// `Engine`, and asserts that op slots free exactly once, every fd closes exactly once and never early, and stale or
+/// wrong-tag completions are inert. `ROUTING_FUZZ_SEEDS=N` overrides the seed count.
 #[cfg(all(test, not(loom)))]
 mod routing_fuzz;
 
 #[cfg(all(test, not(loom)))]
 mod pool_identity_tests;
 
-// ---------------------------------------------------------------------------
-// loom model of the offload completion handoff
-// ---------------------------------------------------------------------------
+// A loom model of the offload completion handoff. Run with
+//   RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
 //
-// Run with:  RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
-//
-// A worker finishing an offload pushes its result under the `completions` mutex and then pokes the wake eventfd
-// (`FsConn::offload`, above); the loop wakes, drains the queue with `take_pool_completions`, and re-arms the READ. The
-// claim in that code - "counting eventfd; the loop re-arms the READ, so no poke is lost" - is a lost-wakeup argument,
-// and until now nothing tested it.
-//
-// The order matters in one direction only: push *then* poke. Poke first and a loop can wake, find the queue empty,
-// drain nothing, and park again while the result it was woken for is pushed behind it - the continuation in
-// `offload_reg` then never fires, and the caller waits forever.
-//
-// The eventfd is the `cfg(loom)` counter in `crate::uring::wake`, so what this proves is conditional on a real eventfd
-// accumulating pokes the same way.
+// A worker pushes its result under the `completions` mutex and then pokes the wake eventfd, and the loop drains the
+// queue and re-arms the READ. Poke first and the loop can wake, find the queue empty and park again while the result is
+// pushed behind it. The eventfd is the `cfg(loom)` counter in `crate::uring::wake`, so the model holds if a real
+// eventfd accumulates pokes the same way.
 #[cfg(all(test, loom))]
 mod loom_tests;
 

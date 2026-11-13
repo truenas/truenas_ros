@@ -1,11 +1,8 @@
 use super::*;
 
-/// A tag with no arm must be refused before an SQE is filled.
-///
-/// `fill_sqe` zeroes the slot, and opcode 0 is `IORING_OP_NOP` (first in the kernel's `enum io_uring_op`). A
-/// fall-through therefore submitted a NOP carrying the op's real `user_data`: it completes `res = 0`, and `map_res`
-/// turns that into `Ok(0)` - an `FSETXATTR` of a `trusted.*` record reported as done that never ran. The debug half
-/// is the `debug_assert!(false)`; this is the half that ships.
+/// A tag with no arm must be refused before an SQE is filled, since `fill_sqe` zeroes the slot and opcode 0 is
+/// `IORING_OP_NOP`, which completes `res = 0` and reads as `Ok(0)` for an op that never ran. This is the release half
+/// of the guard.
 #[cfg(not(debug_assertions))]
 #[test]
 fn an_unknown_tag_is_refused_rather_than_staged_as_a_nop() {
@@ -73,11 +70,9 @@ fn an_unknown_tag_asserts_in_debug() {
     core.submit_fd_meta(&mut eng, 0x7F, 1, file, None, Vec::new(), 0, 0, 0, chan(&tx));
 }
 
-/// A short leased write must not look like success: its source is the connection's receive buffer, already on its
-/// way back to the pool by the time any caller could react, so `Ok(n)` would invite a retry from bytes that may
-/// hold another connection's request - and a caller that shrugged would store a truncated object. ZFS returns
-/// partial writes as successes by design, so the case is real, and the reap is the one place that still knows both
-/// the asked-for and the written count.
+/// A short leased write must not look like success, since its source buffer is already on its way back to the pool, and
+/// ZFS returns partial writes as successes (`zfs_write`). The reap is the one place that knows both the asked-for and
+/// the written count.
 #[cfg(feature = "net-server")]
 #[test]
 fn a_short_leased_write_is_an_error() {
@@ -294,11 +289,8 @@ fn a_hold_of_another_core_goes_home() {
     assert_eq!(other.take_pool_releases(), [8], "the job's goes home");
 }
 
-/// N writes share one claim; the buffer surfaces from the last.
-///
-/// Two leased writes read from one buffer, so releasing at the first completion re-posts it while the sibling's DMA
-/// still reads it. The id must ride out of exactly one completion - whichever drops the last share - and a short
-/// write still fails its own op alone, whether or not it is the one that releases.
+/// N writes share one claim, and the buffer surfaces from the last. Releasing at the first completion would re-post the
+/// buffer while the sibling's DMA still reads it, and a short write fails its own op alone, whether or not it releases.
 #[cfg(feature = "net-server")]
 #[test]
 fn the_last_shared_lease_releases_the_buffer() {

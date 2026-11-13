@@ -68,17 +68,14 @@ impl FsCore {
         Ok(())
     }
 
-    /// Wake the pool for everything queued since the last flush, and return how long the loop may sleep before it must
-    /// flush again ([`WorkerPool::flush`]).
+    /// Wake both pools, the file pool and the lookup lane, for everything queued since the last flush, and return the
+    /// sooner of their deadlines ([`WorkerPool::flush`]).
     ///
-    /// The loop calls this every iteration right before it can block, and before its teardown drain. It bounds its
+    /// The loop calls this every iteration right before it can block, and before its teardown drain, and bounds its
     /// sleep by the return (`Ring::submit_and_wait_for`), which also covers deadlines published by off-loop submitters
-    /// ([`SharedPool::submit`]).
-    ///
-    /// An iteration that queued nothing skips the pool's lock until the deadline is due. The deadline moves earlier
-    /// only when the last claimed worker starts its job, so the check can run up to `OFFLOAD_WAKE_ALLOWANCE` late.
-    ///
-    /// Both pools are flushed, the file pool and the lookup lane, and the sooner of their deadlines is returned.
+    /// ([`SharedPool::submit`]). An iteration that queued nothing skips the pool's lock until the deadline is due, and
+    /// the deadline moves earlier only when the last claimed worker starts its job, so the check can run up to
+    /// `OFFLOAD_WAKE_ALLOWANCE` late.
     ///
     /// [`WorkerPool::flush`]: super::offload_pool::WorkerPool::flush
     pub(crate) fn flush_offloads(&mut self) -> Option<std::time::Duration> {
@@ -92,13 +89,11 @@ impl FsCore {
     /// Remove a **server-owned** extended attribute on the blocking pool, gated on the
     /// [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs) allowlist. Refuses anything unlisted with `EPERM`.
     ///
-    /// This is the one fs mutation in the module that carries no [`Personality`], and the allowlist is what makes that
-    /// defensible rather than a hole. There is no `IORING_OP_*REMOVEXATTR`, and a zero-length `FSETXATTR` sets an empty
-    /// attribute instead of removing one (see [`remove_xattr_blocking`]) - so the call can only run on a pool thread,
-    /// under the reactor's own credentials, with no way for the kernel to check it against a request identity.
-    /// Restricting it to attributes the *server* owns keeps the promotion keyed on the name alone, exactly as the
-    /// `FSETXATTR` promotion in [`FsCore::submit_fd_meta`] is: a caller can clear the metadata this reactor wrote, and
-    /// nothing else.
+    /// The one fs mutation in the module that carries no [`Personality`]. io_uring has no remove opcode
+    /// ([`remove_xattr_blocking`]), so the call runs on a pool thread under the reactor's own credentials, where the
+    /// kernel cannot check it against a request identity. The allowlist keys the promotion on the name alone, as the
+    /// `FSETXATTR` promotion in [`FsCore::submit_fd_meta`] is, so a caller can clear the metadata this reactor wrote
+    /// and nothing else.
     pub(crate) fn remove_priv_xattr(&mut self, file: Arc<OwnedFd>, name: Cow<'static, CStr>, reply: ReplyTo) {
         if !self.priv_xattrs.permits(&name) {
             let _ = reply.send(FsOutcome::new(Err(Errno::EPERM), Vec::new(), None, None));
@@ -124,9 +119,8 @@ impl FsCore {
         let mut out = Vec::with_capacity(drained.len());
         for (token, any) in drained {
             if let Some(e) = self.offload_reg.remove(&token) {
-                // The job is over - its result is in hand - so its share of the recv claim ends here, on the reactor.
-                // The buffer surfaces only from the last share, as a leased write's completion surfaces it (`on_cqe`);
-                // sibling writes of the same delivery may still be reading it.
+                // The job is over, so its share of the recv claim ends here, on the reactor. The buffer surfaces only
+                // from the last share, as in `on_cqe`.
                 #[cfg(feature = "net-server")]
                 if let Some(bid) = e
                     .lease

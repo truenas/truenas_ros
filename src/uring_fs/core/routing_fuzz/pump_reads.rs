@@ -85,9 +85,8 @@ fn a_pump_read_routes_back_with_its_owner_and_bytes() {
 
 #[test]
 fn a_full_op_table_refuses_a_pump_read_synchronously() {
-    // The shed-one-connection discipline needs the error in hand at submit time: there is no callback whose drop
-    // could report it, and a silently dropped pump read would strand its connection mid-body with nothing left to
-    // re-drive it.
+    // The error comes back at submit time, since there is no callback to report it and a dropped pump read would strand
+    // its connection mid-body.
     let Some(mut eng) = engine_or_skip() else {
         return;
     };
@@ -118,12 +117,9 @@ fn a_full_op_table_refuses_a_pump_read_synchronously() {
     submit(&mut core, &mut eng).expect("freed slot serves the next");
 }
 
-/// A pump read whose buffer cannot hold `want` is refused, not staged.
-///
-/// The iovec points at the `Vec`'s spare capacity and carries `want` as its length, so an oversized `want` is an
-/// out-of-bounds heap write performed by the kernel on an io-wq worker - the corruption surfaces
-/// nowhere near the call. The debug half is the `debug_assert!(false)`;
-/// this is the half that ships, on `an_unknown_tag_is_refused_rather_than_staged_as_a_nop`'s pattern.
+/// A pump read whose buffer cannot hold `want` is refused, not staged, since an oversized `want` is a heap write by the
+/// kernel on an io-wq worker, far from the call. This is the release half of the guard, on
+/// `an_unknown_tag_is_refused_rather_than_staged_as_a_nop`'s pattern.
 #[cfg(not(debug_assertions))]
 #[test]
 fn a_pump_read_past_its_buffer_is_refused_not_staged() {

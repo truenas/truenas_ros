@@ -1,10 +1,7 @@
 use super::*;
 
-/// The teardown drain answers a short leased write the same way the live reap does.
-///
-/// The reason does not soften at shutdown: the write's source was the connection's receive buffer, so a caller
-/// handed `Ok(n)` cannot retry from bytes it no longer owns, and one that shrugs stores a truncated object. The
-/// drain is the only other path a leased completion can take.
+/// The teardown drain answers a short leased write as the live reap does, since a caller handed `Ok(n)` cannot retry
+/// from a source buffer it no longer owns.
 #[cfg(feature = "net-server")]
 #[test]
 fn a_drained_short_leased_write_is_an_error() {
@@ -50,11 +47,8 @@ fn a_drained_short_leased_write_is_an_error() {
     );
 }
 
-/// Teardown's drain owns the fd a successful open completes with.
-///
-/// The fd arrives in `cqe.res` and nothing parked owns it - the live path is what wraps the result - so a drain
-/// that delivers the raw count leaks the descriptor: the waiter is usually already gone at teardown, and a number
-/// nobody owns is closed by nobody.
+/// Teardown's drain owns the fd a successful open completes with. The fd arrives in `cqe.res` with nothing parked
+/// owning it, so a drain that delivered the raw count would leak the descriptor.
 #[test]
 fn a_drained_open_owns_its_fd() {
     let Some(mut eng) = engine_or_skip() else {
@@ -87,20 +81,14 @@ fn a_drained_open_owns_its_fd() {
     assert_eq!(rc, -1, "the drained open's fd was closed, not leaked");
 }
 
-/// A refused fd-op hands the caller's `File` back with the payload.
+/// A refused fd-op hands the caller's `File` back with the payload, since the facade's fd-ops take `File` by value and
+/// a marked `EBUSY` advises a retry that needs the file.
 ///
-/// The facade's fd-ops take `File` by value, so a caller that submits its last handle has surrendered it. The
-/// refusal used to drop the parked `Arc`, which **closed the descriptor** under a caller told a *marked* `EBUSY` -
-/// the errno `FsDone::was_refused` documents as "worth retrying with the payload `into_bufs` hands back". The
-/// payload came back and the file it was to be written to did not.
+/// Control first. With a slot free the same submission parks the fd and it stays open, so the weak-ref instrument is
+/// shown reading alive before it is trusted to read closed.
 ///
-/// Control first: with a slot free the same submission parks the fd and it stays open, so the weak-ref instrument
-/// is shown reading "alive" before it is trusted to read "closed".
-///
-/// This drives the *submit-time* refusals - the `pop_op` arms and the screens above them, which is where the
-/// documented `EBUSY` fan-out failure lives. `fail_op`'s arm (a slot already taken and the SQE then refused)
-/// carries the same one-line return and no test: `push_sqe` flushes and retries on a full SQ, so a staging failure
-/// needs a kernel-side refusal this suite cannot provoke.
+/// This drives the submit-time refusals. `fail_op`'s arm carries the same return and no test, since `push_sqe` flushes
+/// and retries on a full SQ, so a staging failure needs a kernel-side refusal this suite cannot provoke.
 #[test]
 fn a_refused_fd_op_hands_the_callers_file_back() {
     let Some(mut eng) = engine_or_skip() else {

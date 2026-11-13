@@ -11,13 +11,8 @@ fn a_hold_that_ends_twice_is_caught() {
     w.ended(false);
 }
 
-/// And in the build that ships, where the assert is not compiled: the count saturates at zero rather than wrapping
-/// to `u32::MAX`.
-///
-/// That is the whole point of the shared impl. `refuse_wall_clock_hold` reads `armed >= cap`, so a wrapped `armed`
-/// answers a marked `EBUSY` to every later timer arm and every `Allow` open by that owner for the life of the
-/// reactor - and `is_empty` can never be true again, so the map entry is never reclaimed either. Saturating leaves
-/// a stuck cap of one hold instead of a permanent refusal.
+/// And in the build that ships, where the assert is not compiled, the count saturates at zero rather than wrapping to
+/// `u32::MAX`, which would refuse every later hold by that owner for good and never reclaim its map entry.
 #[cfg(not(debug_assertions))]
 #[test]
 fn a_hold_that_ends_twice_saturates_rather_than_wrapping() {

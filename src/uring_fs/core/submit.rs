@@ -3,8 +3,8 @@ use super::*;
 impl FsCore {
     // ---- submission (from drained injects) -----------------------------
 
-    /// Stage an `OPENAT2` into a freshly reserved file slot. All failures are reported through `reply` (the loop never
-    /// dies for a per-op reason).
+    /// Stage an `OPENAT2` in a freshly reserved op slot. Every failure is answered through `waiter`, as the loop never
+    /// dies for a per-op reason.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn submit_open(
         &mut self,
@@ -17,16 +17,14 @@ impl FsCore {
         deadline: Option<std::time::Duration>,
         waiter: FsWaiter,
     ) {
-        // A name-resolving op with personality 0 would run under the ring owner's ambient (root) credentials - the
-        // identity this surface must never grant implicitly. `Personality` cannot be 0 by construction, so this only
-        // catches an internal misuse; fail closed regardless.
+        // Personality 0 would resolve the name under the ring owner's ambient root credentials. `Personality` cannot be
+        // 0 by construction, so this catches an internal misuse, and fails closed.
         if pers == 0 {
             self.refuse(eng, waiter, Errno::EINVAL, true, Vec::new(), None);
             return;
         }
-        // An `Allow` open is a wall-clock hold like a timer - two slots parked until the deadline or the open ends the
-        // pair - so it answers to the timer tenancy screen (`refuse_wall_clock_hold`, shared with `submit_timeout`). A
-        // guarded open cannot block and passes unscreened.
+        // An `Allow` open is a wall-clock hold like a timer, two slots parked until the deadline or the open ends the
+        // pair, so it answers to the timer's screen. A guarded open cannot block and passes unscreened.
         if deadline.is_some()
             && let Some((err, marked)) = self.refuse_wall_clock_hold(&waiter)
         {
@@ -62,8 +60,7 @@ impl FsCore {
         let how_ptr = e.how.as_ref().expect("just set") as *const RawOpenHow as u64;
         e.anchor = Some(anchor);
 
-        // No `file_index`: OPENAT2 returns a real fd as its CQE result, which `on_cqe` wraps in an `Arc<OwnedFd>` for
-        // the caller's `File`.
+        // OPENAT2 returns a real fd as its CQE result, which `on_cqe` wraps in an `Arc<OwnedFd>`.
         let ud = pack_raw(TAG_OPEN, op_slot, gen32);
         let staged = eng.stage(ud, |sqe| {
             sqe.opcode = IORING_OP_OPENAT2;
@@ -78,12 +75,9 @@ impl FsCore {
             self.fail_op(eng, op_slot, e);
             return;
         }
-        // An `Allow` open's bound: an ordinary timer in its own slot whose expiry stages the `ASYNC_CANCEL` that frees
-        // a worker parked inside `open(2)` itself (`fifo_open` in `wait_for_partner`; the cancel reaches it as a
-        // signal), and which the open's completion retracts. See [`TAG_OPEN_DEADLINE`] for why this is not a kernel
-        // `LINK_TIMEOUT`: one cannot bound a force-async op at all. Guarded opens cannot block, so they never pay the
-        // second slot; the two-slot charge was checked before the open's own pop, so this cannot fail for want of a
-        // slot.
+        // An `Allow` open's bound, an ordinary timer in its own slot whose expiry stages the `ASYNC_CANCEL` that frees
+        // a worker parked in `fifo_open`, and which the open's completion retracts ([`TAG_OPEN_DEADLINE`] says why it
+        // is not a `LINK_TIMEOUT`). The two-slot charge was checked before the open's pop, so this pop cannot fail.
         if let Some(after) = deadline {
             let guard_slot = self.pop_op().expect("reserved before the open's pop");
             let ts = Box::new(KernelTimespec {
@@ -107,28 +101,20 @@ impl FsCore {
                 Ok(()) => {
                     self.ops[op_slot as usize].state.guard =
                         Some((guard_slot, self.ops[guard_slot as usize].generation));
-                    // The pair's wall-clock charge, counted like a timer's arm: taken only once the guard is real (a
-                    // stage-failed guard never reaches here and never charges), and returned by whichever of the two
-                    // slots frees last - `take_op` moves it to `retiring` when the open answers with the guard still
-                    // parked, exactly as a retracted timer's count parks for the width of its reap.
+                    // The pair's wall-clock charge, taken only once the guard is real and returned by whichever of the
+                    // two slots frees last (`take_op` parks it on `retiring` meanwhile).
                     if let Some(o) = timer_owner {
                         self.armed_timers.entry(o).or_default().arm();
                     }
                 }
                 Err(_) => {
-                    // The open is in flight and its bound cannot be: ask for the open to be cancelled rather than let
-                    // it run unbounded, marked (`retract_op`) as the asked-for cancellation it is, so its `ECANCELED`
-                    // arrives in the deadline vocabulary (`was_refused` true, the tripped guard's own spelling) rather
-                    // than teardown's - a task winds a live connection down on the unmarked form, and one failed guard
-                    // stage is not the reactor going away. The guard's slot frees (its waiter is `None`, so the fail
-                    // delivers to nobody).
+                    // The open is in flight and its bound cannot be, so ask for the open to be cancelled, marked
+                    // (`retract_op`) so its `ECANCELED` reads as the deadline's verdict rather than teardown's. The
+                    // guard's slot frees, delivering to nobody.
                     //
-                    // The ask is all this arm can promise. It is reached *because* a stage just failed, and the cancel
-                    // goes to the same ring ([`FsCore::submit_cancel`] is best-effort), so where the failure is the SQ
-                    // being full against a CQ that has stopped draining, the open really does run to its own ending
-                    // with an io-wq worker
-                    // parked in it. Teardown is the recovery for that;
-                    // nothing here can stage its way out of a ring that will not take a submission.
+                    // The ask is all this can promise. The cancel goes to the same ring that just refused a stage
+                    // ([`FsCore::submit_cancel`] is best-effort), so the open may run to its own ending with an io-wq
+                    // worker parked in it, and teardown is the recovery for that.
                     self.fail_op(eng, guard_slot, Errno::ECANCELED);
                     self.retract_op(eng, TAG_OPEN, op_slot, open_gen);
                 }
@@ -136,11 +122,8 @@ impl FsCore {
         }
     }
 
-    /// Stage a `READV`/`WRITEV` (per `tag`) against an open file.
-    ///
-    /// `rw_flags` is the `RWF_*` set - the same field `preadv2`/`pwritev2` take, which these opcodes read directly, so
-    /// the flagged form is not a separate op. `0` is the plain `preadv`/`pwritev` behaviour. The kernel validates the
-    /// set at prep and fails the whole operation with `EOPNOTSUPP` for anything this file's filesystem does not
+    /// Stage a `READV`/`WRITEV` (per `tag`) against an open file. `rw_flags` is the `RWF_*` set `preadv2`/`pwritev2`
+    /// take, which the kernel validates at prep, failing the op with `EOPNOTSUPP` for anything the file system does not
     /// implement, so an unsupported flag is never silently dropped.
     #[allow(clippy::too_many_arguments)] // an inject unpacked, not an API
     pub(crate) fn submit_rw(
@@ -165,10 +148,8 @@ impl FsCore {
         let e = &mut entry.state;
         e.state = FsOpState::InFlight { tag };
         e.waiter = Some(waiter);
-        // Into the slot's own storage: `FsOpEntry::clear` empties this vector without releasing it, so the block a
-        // previous tenant grew is the one this op fills - assigning a fresh `Vec` here dropped that capacity and
-        // allocated once per op instead. Built before `bufs` moves below, which is fine: the heap block each iovec
-        // names does not move with the vector that owns it.
+        // Into the slot's own storage, since `FsOpEntry::clear` empties this vector without releasing it, and a fresh
+        // `Vec` here would allocate once per op. The heap block each iovec names does not move with `bufs`.
         e.iov.clear();
         e.iov.extend(bufs.iter_mut().map(|b| libc::iovec {
             iov_base: b.as_mut_ptr().cast(),
@@ -324,17 +305,13 @@ impl FsCore {
     }
 
     /// Stage one write of held windows' bytes, in order from `off`, every share held to the CQE and each buffer's id
-    /// surfaced at the reap for the net server to hand back. The windows come as a `Vec` for a gather, or as an array
-    /// of one, so a single window takes no outer `Vec`. One window is a `WRITE`, which takes the address and the count
-    /// itself (`io_prep_write`, `io_uring/rw.c`), so it needs no iovec and never grows the slot's array, which a slot
-    /// last used by an op with none has no room in. More are a `WRITEV`.
+    /// surfaced at the reap for the net server to hand back. One window is a `WRITE`, which takes the address and count
+    /// itself (`io_prep_write`, `io_uring/rw.c`), so it needs no iovec and never grows the slot's array. More are a
+    /// `WRITEV`.
     ///
     /// `Err` hands the waiter back, never in flight. A full op table and a gather that does not fit one `WRITEV`
     /// (`gather_fits`) hand the windows back as they came. A refused SQE drops them in the slot, which returns each
-    /// share, since no caller does more with them.
-    ///
-    /// # Safety-relevant contract
-    /// A window's bytes stay valid while its share lives, and the entry keeps every share to the reap.
+    /// share. A window's bytes stay valid while its share lives, and the entry keeps every share to the reap.
     #[cfg(feature = "net-server")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn submit_pwritev2_gathered<W>(
@@ -486,26 +463,19 @@ impl FsCore {
         self.armed_timers.get(owner).copied().unwrap_or_default().retiring
     }
 
-    /// Stage a reactor-pump `READV`: one positional read of up to `want` bytes at `off` into `buf`'s spare capacity,
-    /// completing back through [`ReapedFs::Pump`] rather than a callback - the submission path for reads the *reply*
-    /// path issues itself (a file-sourced response body), outside any handler delivery.
+    /// Stage a reactor-pump `READV`, one positional read of up to `want` bytes at `off`, completing through
+    /// [`ReapedFs::Pump`] rather than a callback, for reads the reply path issues itself (a file-sourced response
+    /// body).
     ///
-    /// `buf` arrives empty with `capacity() >= want`; the kernel initializes the spare capacity and the host sets the
-    /// length from the CQE count -- the stream recv path's discipline, so no byte is zeroed only to be overwritten. No
-    /// personality is stamped (the SQE is zeroed): the read runs as the ring's own credentials, because the access
-    /// decision was made at the file's open and an fd read re-checks nothing.
+    /// `dest` is a buffer this side supplies, arriving empty with `capacity() >= want`, or a group id to let the kernel
+    /// pick one from a registered ring at completion. No personality is stamped, so the read runs as the ring's own
+    /// credentials, since the access was decided at the file's open. A failure is returned (`EBUSY` on a full op table,
+    /// or the staging error), as there is no callback to report it, and a dropped pump read would strand its connection
+    /// mid-body.
     ///
-    /// Unlike the waiter-carrying submissions, a failure is returned to the caller (`EBUSY` on a full op table, or the
-    /// staging error): there is no callback whose drop could report it, and a silently dropped pump read would strand
-    /// its connection mid-body with nothing left to re-drive it.
-    ///
-    /// `dest` is either a buffer this side supplies, or a group id to let the kernel pick one from a registered ring at
-    /// completion.
-    ///
-    /// A provided buffer works here for the same reason it works on a recv: `IORING_OP_READV` carries `buffer_select`
-    /// (`io_uring/opdef.c`), and the one extra rule is a single iovec - `io_iov_buffer_select_prep` answers `-EINVAL`
-    /// above one (`io_uring/rw.c`) - which this submit already satisfies. The kernel reads the iovec for its *length*
-    /// and supplies the address itself, so `iov_base` is not dereferenced.
+    /// `IORING_OP_READV` carries `buffer_select` (`io_uring/opdef.c`) with a single iovec, since
+    /// `io_iov_buffer_select_prep` answers `-EINVAL` above one (`io_uring/rw.c`). The kernel reads that iovec for its
+    /// length and supplies the address itself.
     #[cfg_attr(not(feature = "net-server"), allow(dead_code))]
     pub(crate) fn submit_pump_read(
         &mut self,
@@ -520,13 +490,9 @@ impl FsCore {
             PumpDest::Owned(b) => (b, None),
             PumpDest::Group(g) => (Vec::new(), Some(g)),
         };
-        // The kernel writes `want` bytes into `buf`'s spare capacity, so a buffer that cannot hold them is an
-        // out-of-bounds heap write, not a short read - and it happens later, on an io-wq worker, far from here.
-        // Screened in BOTH profiles: every other kernel-visible length in this file is structural (an iovec is built
-        // from its buffer's own `len()`), and this one is the caller's to get right. Refused rather than only asserted,
-        // on `stage_fd_meta`'s rule - this function already answers `EBUSY` for a full table, so its caller has an
-        // error path either way. Buffer select is exempt: there the kernel reads the iovec for its length and supplies
-        // the address itself (`io_iov_buffer_select_prep`, `io_uring/rw.c`), so `iov_base` is never dereferenced.
+        // The kernel writes `want` bytes into `buf`'s spare capacity, so a buffer that cannot hold them is a heap
+        // overflow later on an io-wq worker. Screened in both profiles, since this length is the caller's to get right,
+        // and refused rather than only asserted. Buffer select is exempt, as the kernel supplies the address there.
         if bgid.is_none() && (!buf.is_empty() || buf.capacity() < want) {
             debug_assert!(
                 false,
@@ -546,8 +512,8 @@ impl FsCore {
         let e = &mut entry.state;
         e.state = FsOpState::InFlight { tag: TAG_READV };
         e.waiter = Some(FsWaiter::Pump { owner });
-        // The iovec targets the Vec's spare capacity; computed before the move below, and the heap block's address
-        // survives the move. Under buffer select only its length is read. The slot's own storage, as in `submit_rw`.
+        // The iovec targets the Vec's spare capacity, whose heap block survives the move below. Under buffer select
+        // only its length is read.
         e.iov.clear();
         e.iov.push(libc::iovec {
             iov_base: buf.as_mut_ptr().cast(),
@@ -627,23 +593,17 @@ impl FsCore {
         }
     }
 
-    /// Stage a standalone relative timer: one `IORING_OP_TIMEOUT` whose completion fires after `after`. Expiry is the
-    /// op's success and is delivered as `Ok(0)` - the kernel answers a pure timer (count 0) with `-ETIME`
-    /// (`io_timeout_fn`, `io_uring/timeout.c`), translated at [`FsCore::on_cqe`] because that firing is the completion
-    /// the caller asked for. No fd, no personality: a timer touches nothing a credential guards.
+    /// Stage a standalone relative timer, one `IORING_OP_TIMEOUT` that completes after `after`. Expiry is the op's
+    /// success, so the kernel's `-ETIME` for a pure timer (`io_timeout_fn`, `io_uring/timeout.c`) is delivered as
+    /// `Ok(0)` ([`FsCore::on_cqe`]). No fd and no personality, as a timer touches nothing a credential guards.
     ///
-    /// Answers the armed timer's slot and full-width generation, for [`FsConn::cancel_timeout`]'s [`Timer`]; `None`
-    /// when the arm was refused, and then the waiter has already been answered.
+    /// Answers the armed timer's slot and full-width generation, for [`FsConn::cancel_timeout`]'s [`Timer`], or `None`
+    /// when the arm was refused and the waiter has been answered.
     ///
-    /// **A swept owner may not park time on the table.** Post-sweep submissions are deliberately allowed - a handler
-    /// finishing an upload it accepted has work the disconnect does not undo - but a timer is a *wait*, not progress,
-    /// and it is the one op that holds its slot for wall-clock duration: a re-arming retry tick whose connection died
-    /// otherwise strands a slot per arm for the arm's full length, with the only holder of the [`Timer`] the dead
-    /// handler itself. The refusal is the sweep's own verdict, `ECANCELED` with no refusal mark - exactly what the same
-    /// timer would have answered had it been in flight when the sweep ran - so a continuation keyed on that vocabulary
-    /// winds down the same way in both orderings. Delivered by the callback, not the sink: [`FsCore::refuse`] fires a
-    /// sink only for *marked* refusals, so an awaited frame reads this one off the queued callback's own `FsDone`:
-    /// `ECANCELED` with [`FsDone::was_refused`] false.
+    /// **A swept owner may not park time on the table.** Other post-sweep submissions are allowed, but a timer is a
+    /// wait, not progress, and a re-arming tick whose connection died would strand a slot per arm. The refusal is the
+    /// sweep's own unmarked `ECANCELED`, so a continuation winds down the same way in both orderings, and it arrives
+    /// through the callback, since [`FsCore::refuse`] fills a sink only for a marked refusal.
     pub(crate) fn submit_timeout(
         &mut self,
         eng: &mut Engine,
@@ -659,9 +619,8 @@ impl FsCore {
             return None;
         };
 
-        // Saturating, like every Duration-to-timespec conversion in the crate: `get_timespec64` copies the struct
-        // verbatim and `timespec64_valid` only refuses a negative or over-range `tv_nsec` (`io_uring/timeout.c` via
-        // `__io_timeout_prep`), so a clamped i64::MAX is "effectively forever" rather than an error.
+        // Saturating, as every Duration-to-timespec conversion in the crate is. `timespec64_valid` only refuses a bad
+        // `tv_nsec` (`__io_timeout_prep`, `io_uring/timeout.c`), so a clamped `i64::MAX` is effectively forever.
         let ts = Box::new(KernelTimespec {
             tv_sec: i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
             tv_nsec: i64::from(after.subsec_nanos()),
@@ -684,8 +643,7 @@ impl FsCore {
             self.fail_op(eng, op_slot, err);
             return None;
         }
-        // Counted only once the arm is real - the refusals above never increment, so nothing decrements for them
-        // either.
+        // Counted only once the arm is real, so the refusals above have nothing to return.
         if let Some(FsWaiter::Embedded { owner: Some(o), .. }) = &self.ops[op_slot as usize].state.waiter {
             self.armed_timers.entry(*o).or_default().arm();
         }
@@ -693,17 +651,15 @@ impl FsCore {
     }
 
     /// Verify `(tag, slot, generation)` still names the in-flight op it was minted against and, if so, mark it
-    /// retracted and stage its `ASYNC_CANCEL` - the one spelling of asked-for cancellation, shared by a timer's
-    /// retraction, an `Allow` guard's firing, an answered open retiring its guard, and the guard-stage failure that
-    /// cancels its open. The mark is what routes the coming `ECANCELED` away from teardown's vocabulary
-    /// ([`FsDone::was_refused`]), and it is checked before it is set, so a second ask neither re-marks nor re-stages -
-    /// whatever accounting hangs off the first ask cannot fire twice. `false` for a stale generation, a reissued slot,
-    /// a tag mismatch, or an already-marked entry, all of which must stay inert.
+    /// retracted and stage its `ASYNC_CANCEL`. The one spelling of asked-for cancellation, shared by a timer's
+    /// retraction, an `Allow` guard's firing, an answered open retiring its guard, and a failed guard stage cancelling
+    /// its open. The mark routes the coming `ECANCELED` away from teardown's vocabulary ([`FsDone::was_refused`]), and
+    /// is checked before it is set, so a second ask neither re-marks nor re-stages. `false` for a stale generation, a
+    /// reissued slot, a tag mismatch, or an entry already marked.
     ///
     /// **`true` reports the mark, not the staging.** The cancel is best-effort ([`FsCore::submit_cancel`]) and can lose
-    /// its race even when it stages, so the op's own ending is what the callers see: `on_cqe` reads the mark, not the
-    /// errno the kernel chose, to decide whether a completion answers an ask (a retracted timer's `-ETIME` reads as the
-    /// marked cancellation it asked for). Nothing may take `true` to mean an `ASYNC_CANCEL` reached the kernel.
+    /// its race, so `on_cqe` reads the mark, not the errno, to decide whether a completion answers an ask. Nothing may
+    /// take `true` to mean an `ASYNC_CANCEL` reached the kernel.
     pub(super) fn retract_op(&mut self, eng: &mut Engine, tag: u8, op_slot: u32, generation: u64) -> bool {
         let Some(entry) = self.ops.get_mut(op_slot as usize) else {
             return false;
@@ -730,12 +686,9 @@ impl FsCore {
         if !self.retract_op(eng, TAG_TIMEOUT, slot, generation) {
             return;
         }
-        // The owner's cap headroom returns at the retraction, not at the CQE it hastens: the natural pattern this call
-        // invites - retract one deadline and arm its replacement inside the same delivery - would otherwise be refused
-        // at the cap for the width of a reap, which is not observable from inside the callback that retracted. The slot
-        // itself still frees at the timer's CQE, so the count moves from `armed` to `retiring`: an owner mid-swap holds
-        // up to twice its cap in slots and the arm screen refuses at that bound ([`WallClock`]), while `take_op`
-        // retires exactly the half its CQE ends.
+        // The owner's cap headroom returns at the retraction, not at the CQE, so retracting one deadline and arming its
+        // replacement in the same delivery is not refused at the cap. The slot still frees at the timer's CQE, so the
+        // count moves from `armed` to `retiring` ([`WallClock`]).
         let o = match &self.ops[slot as usize].state.waiter {
             Some(FsWaiter::Embedded { owner: Some(o), .. }) => Some(*o),
             _ => None,
@@ -749,22 +702,15 @@ impl FsCore {
         }
     }
 
-    /// Stage a metadata op that targets an **open file**: `FTRUNCATE`/ `FALLOCATE` (no payload) and
-    /// `FGETXATTR`/`FSETXATTR` (name + value). The file was permission-checked at open, and the fd is the capability;
-    /// the op runs as `pers`.
+    /// Stage a metadata op that targets an open file, as `pers`. The file was permission-checked at open, and the fd is
+    /// the capability. `off` is the truncate length or the fallocate offset, `len64` the fallocate length, and `aux32`
+    /// the fallocate mode or the xattr flags.
     ///
-    /// Scalars: `off` is the truncate length or the fallocate offset, `len64` the fallocate length, `aux32` the
-    /// fallocate mode or the xattr flags. (The xattr *size* is the value buffer's own length.)
-    ///
-    /// Fail-closed on `pers == 0`: an fd-op under the ring owner's ambient (root) credentials is a privilege this
-    /// surface must never grant implicitly. The sanctioned ambient-root paths are [`FsCore::submit_fgetxattr_as_root`],
-    /// a read on the descriptor or through `/proc`, [`FsCore::submit_reopen_proc_as_root`], an open through `/proc`,
-    /// and, for writes, the [`PrivilegedXattrs`] allowlist consulted below.
-    ///
-    /// **The allowlist is the only place a write is promoted to ambient credentials, and the promotion is keyed on the
-    /// attribute name alone.** It lives here rather than at the call sites so no public entry point can name a
-    /// personality of 0 or pick its own privilege: callers pass the request identity, and an `FSETXATTR` of an
-    /// allowlisted name - and nothing else - is rewritten to `0`.
+    /// Fail-closed on `pers == 0`, as an fd op under the ring owner's ambient root credentials is a privilege this
+    /// surface never grants implicitly. The sanctioned ambient-root paths are [`FsCore::submit_fgetxattr_as_root`],
+    /// [`FsCore::submit_reopen_proc_as_root`], and for writes the [`PrivilegedXattrs`] allowlist below. **The allowlist
+    /// is the only place a write is promoted, keyed on the attribute name alone**, so no public entry point can name a
+    /// personality of 0 or pick its own privilege.
     #[allow(clippy::too_many_arguments)] // an inject unpacked, not an API
     pub(crate) fn submit_fd_meta(
         &mut self,
@@ -793,14 +739,10 @@ impl FsCore {
         self.stage_fd_meta(eng, tag, pers, file, name, value, off, len64, aux32, waiter);
     }
 
-    /// Read xattr `name` from `file` under the reactor's **ambient root** (`sqe.personality = 0`) - the sanctioned
-    /// `pers = 0` read. For a privileged `trusted.*`/`security.*` read a request's own identity cannot perform:
-    /// `sqe.personality` (not the fd's open-time cred) governs `fgetxattr`'s `CAP_SYS_ADMIN` check, and `0` runs as the
-    /// ring owner (root). Deliberate - every other fd-op path fails closed on `pers == 0`.
-    ///
-    /// `FGETXATTR` on the descriptor, or when `through_proc` `GETXATTR` of its path under `/proc/thread-self/fd`, which
-    /// takes a file held `O_PATH`. The file system runs the same check of the ring owner either way, so a value the
-    /// file's own entries hide from a request identity comes back through both.
+    /// Read xattr `name` from `file` under the reactor's **ambient root** (`sqe.personality = 0`), the sanctioned `pers
+    /// = 0` read, for a `trusted.*`/`security.*` attribute a request's own identity cannot read. `FGETXATTR` on the
+    /// descriptor, or when `through_proc` `GETXATTR` of its path under `/proc/thread-self/fd`, which takes a file held
+    /// `O_PATH`. The file system checks the ring owner either way.
     pub(crate) fn submit_fgetxattr_as_root(
         &mut self,
         eng: &mut Engine,
@@ -844,16 +786,14 @@ impl FsCore {
         self.stage_reopen_proc(eng, 0, file, access, waiter);
     }
 
-    /// Stage a reopen stamping `sqe.personality = personality_raw` verbatim. Internal, since the two callers own the
-    /// personality policy.
+    /// Stage a reopen stamping `sqe.personality = personality_raw` verbatim, as the two callers own the personality
+    /// policy.
     ///
-    /// It is an open like any other ([`TAG_OPEN`]), so its completion wraps the new descriptor and strips the guard's
-    /// `O_NONBLOCK` from it. The path is absolute and the kernel resolves it from the root of the process whatever the
-    /// dirfd, which is `AT_FDCWD` to say so. `file` is parked with the op, so its number is not used again before the
-    /// worker follows the link, which resolves on the io-wq worker as the read of an xattr through `/proc` does
-    /// ([`park_proc_path`](FsOpEntry::park_proc_path)). The open takes `IOSQE_ASYNC`, since the link cannot resolve in
-    /// the walk the inline try makes (`proc_pid_get_link` in `fs/proc/base.c` answers `ECHILD` with no dentry, and
-    /// `io_openat2` in `io_uring/openclose.c` sets `LOOKUP_CACHED`), so that try always fails.
+    /// An open like any other ([`TAG_OPEN`]), so its completion wraps the new descriptor and strips the guard's
+    /// `O_NONBLOCK`. The path is absolute, so the dirfd is `AT_FDCWD`, and `file` is parked with the op so its number
+    /// is not reused before the io-wq worker follows the link ([`park_proc_path`](FsOpEntry::park_proc_path)). The open
+    /// takes `IOSQE_ASYNC`, since the inline try always fails, as `proc_pid_get_link` (`fs/proc/base.c`) answers
+    /// `ECHILD` with no dentry and `io_openat2` (`io_uring/openclose.c`) sets `LOOKUP_CACHED`.
     fn stage_reopen_proc(
         &mut self,
         eng: &mut Engine,
@@ -941,35 +881,21 @@ impl FsCore {
         aux32: u32,
         waiter: FsWaiter,
     ) {
-        // Decide the opcode before a slot is taken. A tag with no arm in the
-        // match below would otherwise reach `fill_sqe`, which zeroes the SQE
-        // first (`uring/ring.rs`) - leaving `opcode` at 0, which is `IORING_OP_NOP` (first in the kernel's `enum
-        // io_uring_op`). The NOP is submitted carrying the op's real `user_data`, completes `res = 0`, and `map_res`
-        // hands the waiter `Ok(0)`: a `trusted.*` record write reported as done that never happened. The three path-op
-        // siblings refuse instead, and so does this now.
+        // Decide the opcode before a slot is taken (see `fd_meta_opcode`).
         let Some(opcode) = Self::fd_meta_opcode(tag) else {
             debug_assert!(false, "not an fd-meta tag {tag:#x}");
             self.refuse(eng, waiter, Errno::EINVAL, true, vec![value], Some(file));
             return;
         };
-        // The length reaches the SQE as a `u32` (`val_len` below), so an oversized one does not fail - it *truncates*:
-        // at 1 << 32 it becomes a length of zero. That is the same reported-but-not-done failure the opcode screen
-        // above refuses, arriving by the length instead of the opcode. Both xattr tags need a bound, but not the same
-        // one, because `value` is not the same thing to each.
+        // The length reaches the SQE as a `u32`, so an oversized one truncates rather than failing, and at 1 << 32
+        // becomes zero. Each xattr tag needs its own bound.
         //
-        // FSETXATTR: `value` IS the attribute. The bound is the sync twin's, so one operation has one contract across
-        // both implementations - `sync_fs::xattr::fsetxattr` refuses above `XATTR_SIZE_MAX` before any syscall.
-        // Truncating here would store an empty attribute and complete `res = 0`, handing the waiter `Ok(())` for a
-        // write that did not happen.
+        // For FSETXATTR `value` is the attribute, bounded at `XATTR_SIZE_MAX` as `sync_fs::xattr::fsetxattr` is, so one
+        // operation has one contract. A truncated length would store an empty attribute and answer `Ok`.
         //
-        // FGETXATTR: `value` is the caller's OUTPUT buffer, and a generous one is legal - the contract on
-        // `FsHandle::fgetxattr` says only that a buffer shorter than the value fails, never that a longer one is
-        // refused, and the sync twin takes no buffer at all and never refuses on its size. (It says shorter fails
-        // `ERANGE` *or* `E2BIG`: above 64 KiB the kernel rewrites the one to the other, so neither errno is available
-        // here to mean "your buffer is unreasonable".) So `XATTR_SIZE_MAX` is the wrong bound here; the only length
-        // this path cannot represent is one past `u32::MAX`, which truncates to zero and is the kernel's size-only
-        // form: `res` comes back as the attribute's size with nothing written, and the waiter is told it read a value
-        // it did not.
+        // For FGETXATTR `value` is the caller's output buffer, and a generous one is legal (`FsHandle::fgetxattr`), so
+        // the only bound is `u32::MAX`. Past it the length truncates to zero, the kernel's size-only form, and the
+        // waiter would be told it read a value it did not.
         let unrepresentable = match tag {
             TAG_FSETXATTR => value.len() > crate::sync_fs::xattr::XATTR_SIZE_MAX,
             TAG_FGETXATTR | TAG_GETXATTR_PROC => value.len() > u32::MAX as usize,
@@ -1150,24 +1076,19 @@ impl FsCore {
         }
     }
 
-    /// `LINKAT` with `AT_EMPTY_PATH`: give the already-open `file` a name at `a2 / n2`. This is the only linkat form
-    /// that can name an **unnamed** inode, so it is how an `O_TMPFILE` is materialized - the publish step of a durable
-    /// create.
+    /// `LINKAT` with `AT_EMPTY_PATH`, giving the already-open `file` a name at `a2 / n2`. The only linkat form that can
+    /// name an unnamed inode, so it publishes an `O_TMPFILE` create. Two kernel rules decide whether it succeeds, and
+    /// both fail as `ENOENT`.
     ///
-    /// Two kernel rules govern whether it succeeds, and neither is discoverable from the error alone:
+    /// - The file must have been opened `O_TMPFILE` **without `O_EXCL`**. Only the non-`O_EXCL` path sets `I_LINKABLE`
+    ///   (`fs/namei.c:4084`), and `vfs_link` rejects a zero-`i_nlink` inode without it (`:4979`).
+    /// - `AT_EMPTY_PATH` requires `fd_file(f)->f_cred == current_cred()` or `CAP_DAC_READ_SEARCH` (`fs/namei.c:2631`),
+    ///   and io_uring takes the personality's cred as the file's `f_cred` at open, so **`pers` must carry the
+    ///   credentials that opened `file`**. The check compares pointers, so ids registered from unchanged process
+    ///   credentials are interchangeable, while brokered ids, each minted after a `setresuid`, are distinct even for
+    ///   one uid.
     ///
-    /// - The file must have been opened `O_TMPFILE` **without `O_EXCL`**. `O_EXCL` is precisely the "never link this"
-    ///   opt-out: only the non-`O_EXCL` path sets `I_LINKABLE` (`fs/namei.c:4084`), and `vfs_link` rejects a
-    ///   zero-`i_nlink` inode without it (`:4979`) -- surfacing as `ENOENT`.
-    /// - `AT_EMPTY_PATH` requires `fd_file(f)->f_cred == current_cred()` or `CAP_DAC_READ_SEARCH` (`fs/namei.c:2631`).
-    ///   io_uring captures the personality's `struct cred *` as the file's `f_cred` at open time, so **`pers` must
-    ///   carry the credentials that opened `file`**. The check is a pointer comparison and `register_personality`
-    ///   stores `get_current_cred()`, so ids registered from unchanged process credentials alias and are
-    ///   interchangeable; brokered ids, each minted after a `setresuid`, are distinct objects even for one uid.
-    ///   Mismatch is `ENOENT`, not `EPERM`.
-    ///
-    /// `IOSQE_FIXED_FILE` is deliberately never set: `io_linkat_prep` rejects a fixed file outright with `-EBADF`.
-    /// Plain-fd `File` satisfies that by construction.
+    /// `IOSQE_FIXED_FILE` is never set, as `io_linkat_prep` rejects a fixed file with `-EBADF`.
     pub(crate) fn submit_linkat_file(
         &mut self,
         eng: &mut Engine,
@@ -1177,8 +1098,7 @@ impl FsCore {
         n2: CString,
         waiter: FsWaiter,
     ) {
-        // Like every name-resolving op: personality 0 would resolve `n2` and create the link as ambient root. Fail
-        // closed.
+        // Personality 0 would create the link as ambient root. Fail closed.
         if pers == 0 {
             self.refuse(eng, waiter, Errno::EINVAL, true, Vec::new(), Some(file));
             return;

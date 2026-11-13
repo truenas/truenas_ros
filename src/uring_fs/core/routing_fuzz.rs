@@ -31,10 +31,8 @@ impl Rng {
 /// Build a real `Engine` or signal an environment skip (mirrors the integration suites' io_uring guard, gate
 /// included).
 fn engine_or_skip() -> Option<Engine> {
-    // Under Miri there is no ring to set up - `io_uring_setup` is an unsupported foreign call that aborts the
-    // interpreter, not an errno the arm below could catch - so the skip decision has to come first. The
-    // ring-dependent tests then skip themselves exactly as they do on a ring-less host, and the Miri lane (ci.yml
-    // `miri`) runs what is left: the pure-executor paths.
+    // Under Miri there is no ring to set up, as `io_uring_setup` is a foreign call that aborts the interpreter rather
+    // than an errno, so the skip comes first, and the Miri lane runs the pure-executor paths.
     if cfg!(miri) {
         return None;
     }

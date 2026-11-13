@@ -2,36 +2,27 @@ use super::*;
 
 impl FsConn<'_> {
     /// Run `job` on a blocking worker thread, then deliver its result to `on_done` **on the reactor thread** with a
-    /// fresh owner-scoped [`FsConn`]. The generic escape hatch for work with no io_uring op (readdir, `fdopendir`, an
-    /// ioctl): the reactor stays free while the job runs, and the continuation resumes on-loop like any completion
-    /// callback.
-    /// `on_done` receives a [`thread::Result`] because a panicking job must still deliver: the completion carries the
-    /// panic, so the continuation runs, the registration is retired, and any reactor-side state the caller holds is
-    /// released instead of stranded.
+    /// fresh owner-scoped [`FsConn`]. The escape hatch for work with no io_uring op (readdir, `fdopendir`, an ioctl).
+    /// `on_done` receives a [`thread::Result`], so a panicking job still delivers and the caller's reactor-side state
+    /// is released.
     ///
-    /// The consumer shape this exists for: batch a request's whole blocking metadata tail into **one job** - several
-    /// synchronous calls, one pool round trip, one delivery. [`statx`](crate::sync_fs::statx) plus
-    /// [`fgetxattr`](crate::sync_fs::xattr::fgetxattr) reads before streaming a body,
-    /// [`fsetxattr`](crate::sync_fs::xattr::fsetxattr) writes after one. A cached metadata syscall costs less than any
-    /// round trip, so the win comes from paying one handoff per batch rather than one per call.
+    /// Batch a request's whole blocking metadata tail into one job, such as [`statx`](crate::sync_fs::statx) plus
+    /// [`fgetxattr`](crate::sync_fs::xattr::fgetxattr) reads before streaming a body, since a cached metadata syscall
+    /// costs less than any round trip.
     ///
-    /// The job contract - every derived facility above and [`offload_result`](Self::offload_result) share it:
+    /// The job contract, shared by every derived facility here and [`offload_result`](Self::offload_result), follows.
     ///
-    /// - **Jobs take open [`File`]s or descriptors, never names.** The credential-checked step - the open, any path
-    ///   op - runs first on the ring as a personality-stamped SQE; the job then runs at the reactor's **ambient
-    ///   credentials** against the already-authorized fd, and the kernel checks nothing in it against a request
-    ///   identity. See [`fset_zfs_attrs`](Self::fset_zfs_attrs) and `FsCore::remove_priv_xattr` for the same reasoning.
-    /// - **Never mutate thread-wide state from a job** - credentials (`setfsuid`), umask, signal dispositions. The
-    ///   workers are shared with every consumer of the pool, the reactor's privileged offloads included.
-    /// - **An offload is never cancelled.** `cancel_owned_by` sweeps ring ops only; the job always runs to completion
-    ///   and its delivery always fires, possibly for an owner that is gone - a continuation must already tolerate that
-    ///   (a deferred reply is generation-checked, and a file it opens is its own to close).
+    /// - **Jobs take open [`File`]s or descriptors, never names.** The credential-checked step runs first on the ring
+    ///   under a personality, and the job then runs at the reactor's **ambient credentials** against the authorized fd
+    ///   (see `FsCore::remove_priv_xattr`).
+    /// - **Never mutate thread-wide state from a job** (credentials, umask, signal dispositions), as the workers are
+    ///   shared with every consumer of the pool.
+    /// - **An offload is never cancelled.** `cancel_owned_by` sweeps ring ops only, so the job runs to completion and
+    ///   its delivery always fires, possibly for an owner that is gone.
     /// - **The registry and pool queue are uncapped.** Bound in-flight jobs upstream, at the request cap. A failed
     ///   worker spawn runs the job inline on the loop rather than lose it (`SharedPool`).
-    /// - **A job runs on an ordinary thread stack** (std's default, moved by `RUST_MIN_STACK` like any other). Bound a
-    ///   job's recursion or keep it on the heap as the jobs here do: a panicking job is caught and retires alone, but
-    ///   an *overflowing* one is a `SIGSEGV` that `catch_unwind` cannot catch and that aborts the process, so it is the
-    ///   one job-side mistake the pool cannot contain.
+    /// - **A job runs on an ordinary thread stack.** A panicking job is caught, but an overflowing one is a `SIGSEGV`
+    ///   that aborts the process, so bound a job's recursion or keep it on the heap.
     pub fn offload<R, J, F>(&mut self, job: J, on_done: F)
     where
         J: FnOnce() -> R + Send + 'static,
@@ -56,23 +47,17 @@ impl FsConn<'_> {
         }));
     }
 
-    /// Run `job` over `src` on the pool - [`pwritev2_from`]'s twin for CPU work: where `src` lies inside the delivering
-    /// connection's recv-buffer claim, the job reads that buffer in place and no copy is made; anywhere else (an
-    /// unpooled connection, a placed body, a range past the claim, a completion facade) the bytes are copied and the
-    /// job runs over the copy. Either way `on_done` gets the job's [`crate::Result`] on the loop, a panicked job mapped
-    /// to `EIO` exactly as [`offload_result`](Self::offload_result) maps it.
+    /// Run `job` over `src` on the pool, [`pwritev2_from`]'s twin for CPU work. Where `src` lies inside the delivering
+    /// connection's recv-buffer claim the job reads that buffer in place, and anywhere else the bytes are copied.
+    /// `on_done` gets the job's [`crate::Result`] on the loop, a panicked job mapped to `EIO` as
+    /// [`offload_result`](Self::offload_result) maps it.
     ///
     /// The job holds a share of the same claim a leased write holds, so a window can be written with [`pwritev2_from`]
-    /// *and* digested here from one buffer: the buffer returns to the pool when the last of its writes and jobs is
-    /// over, and neither waits for the other. The share is kept by the reactor, not by the job, and is dropped when the
-    /// job's completion is taken - after the job has returned - so the bytes it reads stay put for its whole run and
-    /// the release happens where the pool lives. A streaming handler therefore need not park for the digest any more
-    /// than for the write: submit both and return `Continue`, and brake on the count in flight as [`pwritev2_from`]'s
-    /// pipelined-ingest note says.
+    /// and digested here from one buffer, which returns to the pool when the last of its writes and jobs is over. The
+    /// reactor keeps the share and drops it once the job has returned, so a streaming handler submits both and returns
+    /// `Continue`, braking on the count in flight as [`pwritev2_from`] describes.
     ///
-    /// The job contract is [`offload`](Self::offload)'s - ambient credentials, never cancelled, ordinary thread stack.
-    /// What it adds: the job must treat `src` as immutable, which it is - nothing writes a delivered buffer before its
-    /// release.
+    /// The job contract is [`offload`](Self::offload)'s, and the job must treat `src` as immutable.
     ///
     /// [`pwritev2_from`]: Self::pwritev2_from
     pub fn offload_from<T, J, F>(&mut self, src: &[u8], job: J, on_done: F)
@@ -90,13 +75,10 @@ impl FsConn<'_> {
         self.offload_result(move || job(&owned), on_done);
     }
 
-    /// Hold `src`'s receive buffer past this delivery: a share of the buffer's claim, spent later on
-    /// [`offload_leased`](Self::offload_leased) from any facade - a completion's included - or returned by the drop.
-    /// `None` where `src` is not in a pooled receive buffer this delivery claimed (a completion facade, an unpooled
-    /// connection, a body the codec moved to owned storage): the caller copies.
-    ///
-    /// The bytes are valid and immutable for as long as the window lives:
-    /// the share keeps the pool from re-issuing the buffer, and nothing writes a delivered buffer before its release.
+    /// Hold `src`'s receive buffer past this delivery, as a share of the buffer's claim spent later on
+    /// [`offload_leased`](Self::offload_leased) from any facade, or returned by the drop. `None` where `src` is not in
+    /// a pooled receive buffer this delivery claimed, and the caller copies. The bytes stay valid and immutable while
+    /// the window lives.
     #[cfg(feature = "net-server")]
     pub fn lease_window(&mut self, src: &[u8]) -> Option<LeasedWindow> {
         let (taken, hold) = self.claim_share(src)?;
@@ -122,11 +104,9 @@ impl FsConn<'_> {
         F: FnOnce(crate::Result<T>, &mut FsConn<'_>) + 'static,
     {
         let LeasedWindow { view, hold } = window;
-        // SAFETY-relevant invariants, stated once: `view` points into a recv-pool buffer a delivery claimed; the share
-        // registered below keeps the pool from re-issuing it until `take_pool_completions` drops the share, which
-        // happens after the job has returned; and no writer touches a delivered buffer before its release. So the view
-        // is valid and immutable for the job's whole run, on whatever thread the pool runs it. The raw parts, not the
-        // slice, cross to the worker - a `&[u8]` borrows the facade's lifetime and could not.
+        // `view` stays valid and immutable for the job's whole run, as the share registered below is dropped only after
+        // the job returns (`take_pool_completions`). The raw parts cross to the worker, since a `&[u8]` borrows the
+        // facade's lifetime.
         let deliver: OffloadDeliver = Box::new(move |any, conn| {
             if let Ok(r) = any.downcast::<thread::Result<crate::Result<T>>>() {
                 on_done((*r).unwrap_or_else(|_| Err(Errno::EIO.into())), conn);
@@ -142,12 +122,9 @@ impl FsConn<'_> {
     }
 
     /// [`offload`](Self::offload) for a job that already yields a [`crate::Result`], mapping a panicked job to `EIO` so
-    /// the continuation keeps its ordinary signature.
-    ///
-    /// This is the shape every derived facility here uses and the one a consumer batching its own blocking tail should
-    /// reach for; the job contract is [`offload`](Self::offload)'s. Reach for `offload` itself only when the
-    /// continuation must inspect the panic payload. Not a second spelling of one submission: the primitive delivers the
-    /// raw [`thread::Result`], and this is the normalization everything built on it shares.
+    /// the continuation keeps its ordinary signature. The shape every derived facility here uses, with
+    /// [`offload`](Self::offload)'s job contract. Use `offload` itself only when the continuation must inspect the
+    /// panic payload.
     pub fn offload_result<T, J, F>(&mut self, job: J, on_done: F)
     where
         J: FnOnce() -> crate::Result<T> + Send + 'static,
@@ -160,16 +137,14 @@ impl FsConn<'_> {
     }
 
     /// [`offload_result`](Self::offload_result) on the lookup lane, a second pool of this ring for jobs that wait on
-    /// another machine, such as a lookup through the name service switch.
+    /// another machine, such as a lookup through the name service switch. The lane has its own bounds
+    /// (`ServerConfig::lookup_offload_floor` and `lookup_offload_ceiling`), so a stalled service never takes a thread
+    /// from [`offload`](Self::offload).
     ///
-    /// The lane has bounds of its own (`ServerConfig::lookup_offload_floor` and `lookup_offload_ceiling`), so lookups
-    /// stalled on a service that does not answer queue behind each other and never take a thread from
-    /// [`offload`](Self::offload), the listers or the copies.
-    ///
-    /// The job contract is [`offload`](Self::offload)'s, but a job here never runs on the loop. When the lane cannot
-    /// spawn its first thread, and for a second after that failure, the job is dropped unrun and `on_done` gets
-    /// `EAGAIN` on the loop, delivered as a finished job's result is. A job that returns `EAGAIN` itself cannot be told
-    /// apart from that, so a job that can fail in a way that may pass should carry its own error inside `T`.
+    /// The job contract is [`offload`](Self::offload)'s, but a job here never runs on the loop, since it may wait as
+    /// long as the service's timeouts allow. When the lane cannot spawn its first thread, and for a second after that
+    /// failure, the job is dropped unrun and `on_done` gets `EAGAIN` on the loop. A job that can fail in a way that may
+    /// pass should carry its own error inside `T`, since its own `EAGAIN` looks the same.
     pub fn offload_lookup<T, J, F>(&mut self, job: J, on_done: F)
     where
         J: FnOnce() -> crate::Result<T> + Send + 'static,
@@ -242,16 +217,13 @@ impl FsConn<'_> {
         self.offload_result(move || Ok(crate::sync_fs::fget_zfs_attrs(&*f.fd)?), on_done);
     }
 
-    /// Replace `f`'s ZFS attributes with `attrs`. **The mask is absolute** -- visible bits absent from `attrs` are
-    /// cleared, so modify what [`fget_zfs_attrs`](Self::fget_zfs_attrs) returned.
+    /// Replace `f`'s ZFS attributes with `attrs`. **The mask is absolute**, so visible bits absent from `attrs` are
+    /// cleared, and a caller modifies what [`fget_zfs_attrs`](Self::fget_zfs_attrs) returned.
     ///
-    /// Takes no [`Personality`], as [`fremovexattr`](Self::fremovexattr) does not: an ioctl is checked against the
-    /// *calling* thread's credentials, and that thread is the reactor's pool, not a request identity. So the kernel
-    /// cannot decide whether this caller may lock this file, and something above must. `ZfsAttr::NOUNLINK` in
-    /// particular needs only ownership to clear, where `IMMUTABLE` needs `CAP_LINUX_IMMUTABLE`.
-    ///
-    /// Setting `IMMUTABLE` also seals the file's extended attributes (`may_write_xattr`, `fs/xattr.c`) - write metadata
-    /// that belongs with a locked object before locking it.
+    /// Takes no [`Personality`], since an ioctl is checked against the calling thread's credentials, the reactor's
+    /// pool. So the kernel cannot decide whether this caller may lock this file, and something above must.
+    /// `ZfsAttr::NOUNLINK` needs only ownership to clear, where `IMMUTABLE` needs `CAP_LINUX_IMMUTABLE`. Setting
+    /// `IMMUTABLE` also seals the file's extended attributes (`may_write_xattr`, `fs/xattr.c`), so write them first.
     pub fn fset_zfs_attrs<F>(&mut self, f: File, attrs: ZfsAttr, on_done: F)
     where
         F: FnOnce(crate::Result<()>, &mut FsConn<'_>) + 'static,
@@ -260,25 +232,16 @@ impl FsConn<'_> {
     }
 
     /// Copy `len` bytes from `src[off_src..]` to `dst[off_dst..]`, delivering the bytes copied. On a pool with ZFS
-    /// block cloning the kernel makes this metadata-only by itself — `copy_file_range(2)` is clone-first — and falls
-    /// back to a byte copy where it cannot.
+    /// block cloning the kernel clones where it can (`copy_file_range(2)` is clone-first) and falls back to a byte
+    /// copy.
     ///
-    /// **Offloaded, whole-range, one job.** A clone is not free of waiting even where it is free of data movement: with
-    /// `zfs_bclone_wait_dirty` on, a source that was written moments ago costs a transaction group while it syncs. None
-    /// of that may run on the loop, so all of it is offloaded.
+    /// Offloaded as one job, since with `zfs_bclone_wait_dirty` on, cloning a freshly written source waits a
+    /// transaction group. The whole range goes in one call, as a chunk boundary re-enters `zfs_clone_range`, retaking
+    /// both rangelocks, and forfeits the clone, since the destination's rangelock is promoted to whole-file only on its
+    /// first write, which grows the blocksize to the source's. A short return is re-issued from where it stopped.
+    /// [`QueryPool::copy_file_range`](super::query_dir::QueryPool::copy_file_range) is the twin off the loop.
     ///
-    /// The whole remaining range goes in one call rather than in chunks. A chunk boundary is a second entry into
-    /// `zfs_clone_range`, retaking both rangelocks and every property and alignment check, and it forfeits the clone
-    /// besides — the destination's rangelock is promoted to whole-file only on its first write, which is what grows the
-    /// blocksize to the source's. A short return is re-issued from where it stopped.
-    ///
-    /// This is how an embedded handler assembles a large object from parts
-    /// without leaving the loop;
-    /// [`QueryPool::copy_file_range`](super::query_dir::QueryPool::copy_file_range) is the twin for a caller that is
-    /// not already on the loop.
-    ///
-    /// Takes no [`Personality`] because both endpoints are already-open [`File`]s and the kernel authorizes the copy
-    /// from their open modes, which were established under the identity that opened them.
+    /// Takes no [`Personality`], since the kernel authorizes the copy from the two files' open modes.
     pub fn copy_file_range<F>(&mut self, src: File, dst: File, off_src: u64, off_dst: u64, len: u64, on_done: F)
     where
         F: FnOnce(crate::Result<u64>, &mut FsConn<'_>) + 'static,
@@ -290,9 +253,8 @@ impl FsConn<'_> {
     }
 
     /// Remove a **server-owned** extended attribute from `f` (`fremovexattr`), or `EPERM` if `name` is not one the
-    /// reactor's [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs) policy claims.
-    ///
-    /// Takes no [`Personality`] - see `FsCore::remove_priv_xattr` for why the allowlist has to stand in for one here.
+    /// reactor's [`PrivilegedXattrs`](crate::uring_fs::PrivilegedXattrs) policy claims. Takes no [`Personality`], so
+    /// the allowlist stands in for one (`FsCore::remove_priv_xattr`).
     pub fn fremovexattr<F>(&mut self, f: File, name: impl Into<Cow<'static, CStr>>, on_done: F)
     where
         F: FnOnce(crate::Result<()>, &mut FsConn<'_>) + 'static,
@@ -320,10 +282,9 @@ impl FsConn<'_> {
             match done.file() {
                 Some(dir) => conn.offload(
                     move || -> crate::Result<SendDir> {
-                        // Worker: dup the authorized fd and fdopendir the dup (which closedir/readdir then own; `dir`
-                        // closes its own fd as it drops here). No permission re-check, opened under `who`. The errno is
-                        // read here, on the worker's own thread, and the dup closed if fdopendir declines it (glibc
-                        // leaves it open on failure).
+                        // Worker. Dup the authorized fd and fdopendir the dup, which closedir then owns, as `dir`
+                        // closes its own fd as it drops here. The errno is read on this thread, and the dup closed if
+                        // fdopendir declines it, as glibc leaves it open.
                         // SAFETY: `dir` is a live fd for the dup; fdopendir takes ownership of the fresh dup.
                         let dup = retry_on_eintr(|| unsafe { libc::dup(dir.as_raw_fd()) })?;
                         let dp = unsafe { libc::fdopendir(dup) };
@@ -358,14 +319,12 @@ impl FsConn<'_> {
         });
     }
 
-    /// Read the next batch of entry names for `walk` off-loop - one job per walk (pull-style, natural backpressure) -
-    /// delivering a [`NameBatch`] to `on_batch` on the reactor thread. The per-name enrichment the caller does (open +
-    /// fgetxattr) stays on-loop.
+    /// Read the next batch of entry names for `walk` off-loop, one job per walk, delivering a [`NameBatch`] to
+    /// `on_batch` on the reactor thread.
     ///
-    /// Calling again while a batch is still in flight yields `EBUSY`, delivered **synchronously** on the calling stack;
-    /// every other outcome arrives later from the pool drain, so a caller must not assume `on_batch` always runs on a
-    /// fresh turn. A batch that fails mid-`readdir` delivers the error and drops the names already read: `readdir`
-    /// cannot rewind, so the walk is restart-recoverable, not resumable from the failed batch.
+    /// Calling again while a batch is still in flight yields `EBUSY` **synchronously** on the calling stack, and every
+    /// other outcome arrives later from the pool drain. A batch that fails mid-`readdir` delivers the error and drops
+    /// the names already read, since `readdir` cannot rewind, so the walk is restart-recoverable and not resumable.
     pub fn next_batch<F>(&mut self, walk: &DirWalk, on_batch: F)
     where
         F: FnOnce(crate::Result<NameBatch>, &mut FsConn<'_>) + 'static,
@@ -385,9 +344,8 @@ impl FsConn<'_> {
         let inner = Rc::clone(&walk.inner);
         self.offload(
             move || {
-                // Force whole-capture of the `Send` wrapper: 2021 disjoint captures would otherwise capture just its
-                // `*mut DIR` field and make the job `!Send`. Re-binding the whole value pins it, and the same `sdir` is
-                // handed back so its ownership is unbroken: never a second wrapper over one `DIR*`.
+                // Rebind the whole `Send` wrapper, since 2021 disjoint captures would take just its `*mut DIR` field
+                // and make the job `!Send`. The same `sdir` goes back, so one `DIR*` never has two wrappers.
                 let sdir = sdir;
                 let dp = sdir.0;
                 let mut names = Vec::with_capacity(DIR_BATCH);

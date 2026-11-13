@@ -105,8 +105,8 @@ fn loom_leased_offload_releases_after_the_job_read() {
     bounded_model(|| {
         let mut fs = FsCore::new(4, OffloadBounds::default());
         let buffer = Arc::new(Buffer(loom::cell::UnsafeCell::new(0xa5)));
-        // The job's share is the registry's alone: a leased write of the same delivery would hold another, and its
-        // CQE would have dropped it on the reactor - the model is the job's ordering, which is the new one.
+        // The job's share is the registry's alone. A leased write of the same delivery would hold another, dropped at
+        // its CQE, and the model is the job's ordering.
         let hold = std::sync::Arc::new(LeaseHold::detached(7));
         let token = fs.register_leased_offload(
             None,
