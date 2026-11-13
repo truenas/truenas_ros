@@ -35,10 +35,8 @@ use zfs_dir::zfs_dir_or_skip;
 
 /// Hold a ring-side `fsetxattr` refusal to the `TRUENAS_ROS_REQUIRE_XATTRS` gate, returning whether the set stuck.
 ///
-/// The probes here set through the fs handle rather than `libc`, so the shared module's path helper cannot serve them -
-/// but what a refusal means is identical: every xattr assertion behind it is about to be skipped, and a runner whose
-/// scratch filesystem dropped xattr support has to fail where CI arms the gate rather than pass green having tested
-/// nothing.
+/// The probes here set through the fs handle rather than `libc`, so the shared module's path helper cannot serve them,
+/// but a refusal means the same thing.
 fn fd_xattr_ok<T>(what: &str, res: &Result<T, Error>) -> bool {
     if let Err(e) = res {
         xattr_probe::refusal_is_allowed(what, e);
@@ -47,10 +45,7 @@ fn fd_xattr_ok<T>(what: &str, res: &Result<T, Error>) -> bool {
 }
 
 /// Single-buffer read into a buffer the caller filled first, over the vectored, flagged form.
-///
-/// The many tests that read a single buffer wrap `preadv2` here rather than repeating `vec![..]` and `RwFlags::empty()`
-/// and then indexing the result. A read into the room past a buffer's length is `FsHandle::pread_spare`, which takes
-/// one buffer already.
+/// A read into the room past a buffer's length is `FsHandle::pread_spare` instead.
 fn pread1(h: &FsHandle, who: Personality, f: &File, buf: Vec<u8>, off: u64) -> (Result<usize, Error>, Vec<u8>) {
     let (res, mut bufs) = h.preadv2(who, f, vec![buf], off, RwFlags::empty());
     (res, bufs.pop().unwrap_or_default())

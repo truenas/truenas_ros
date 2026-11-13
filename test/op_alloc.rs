@@ -1,9 +1,8 @@
 //! Does an op a handler sends on a warm ring allocate more than its callback?
 //!
 //! Its own test binary, since it counts through a global allocator. It counts on the ring's thread alone, around each
-//! submit, which is where an op's name, its path under `/proc`, its `open_how` and the outer `Vec` of an xattr value
-//! were allocated. So nothing else the process does reaches the count, and what the completion makes (the `Arc` of a
-//! new descriptor) is the op's answer, not its cost. The one allocation left is the box of the callback itself, and a
+//! submit, so nothing else the process does reaches the count, and what the completion makes (the `Arc` of a new
+//! descriptor) is the op's answer, not its cost. The one allocation left is the box of the callback itself, and a
 //! statx's box for its result.
 //!
 //! The ops run twice on one connection, the first pass to warm the ring, and the second pass is counted.

@@ -102,10 +102,8 @@ fn btime_cutoff_skips_newer_files() {
     let p = dir.path().join("f");
     std::fs::write(&p, b"x").unwrap();
     let st = statx(AT_FDCWD, &p, AtFlags::empty(), StatxMask::BTIME).unwrap();
-    // A filesystem with no birth time is a real case the builder handles
-    // (`a_cutoff_refuses_a_filesystem_with_no_birth_time` pins the refusal), so the skip is legitimate - but it
-    // takes the whole cutoff assertion with it, so a runner whose scratch filesystem reports no btime must say so
-    // rather than pass green.
+    // A filesystem with no birth time is a real case (`a_cutoff_refuses_a_filesystem_with_no_birth_time` pins the
+    // refusal), but the skip drops the whole cutoff assertion, so it answers to the gate.
     if !st.mask().contains(StatxMask::BTIME) || st.btime().sec <= 0 {
         assert!(
             std::env::var_os("TRUENAS_ROS_REQUIRE_BTIME").is_none(),

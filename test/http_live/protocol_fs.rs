@@ -79,11 +79,10 @@ fn http_handler_reads_a_file_through_one_batched_job() {
 
 /// `HttpDeferred::redrive` hands a handler a fresh request-handler facade, with the request state it parked in `U`.
 ///
-/// Every facade can `open` - the gate that once stopped a continuation from opening is gone, and
-/// `fs_continuation_may_open_and_its_slot_comes_back` pins that directly. What survives is the redelivery contract: a
-/// handler whose next step depends on an earlier result parks its progress, redrives from wherever the earlier result
-/// landed, and must get a facade back at all - a redelivery that dropped its continuation would close the connection
-/// instead of answering.
+/// That every facade can `open` is pinned by `fs_continuation_may_open_and_its_slot_comes_back`. This pins the
+/// redelivery contract. A handler whose next step depends on an earlier result parks its progress, redrives from
+/// wherever that result landed, and must get a facade back, since a redelivery that dropped its continuation would
+/// close the connection instead of answering.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn http_redrive_returns_a_facade_with_the_parked_state() {

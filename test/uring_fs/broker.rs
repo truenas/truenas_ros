@@ -1,16 +1,15 @@
 use super::*;
 
-// --- M3: the credential broker ---------------------------------------------
+// --- the credential broker ------------------------------------------------
 
 /// The broker forks, so it must be created before the harness starts threads. These tests each build their own reactor
 /// rather than using `with_fs`, and run the loop on a scoped thread while the test thread drives registration (the
 /// reverse of the other tests, because `UringFs` is `!Send` but `CredBroker`/`CredHandle` are `Send`).
 /// Dropping the broker must leave no zombie behind.
 ///
-/// `clone3_fork(0, 0, ..)` gives the child `exit_signal == 0`, which makes it a "clone child": `eligible_child`
-/// (`kernel/exit.c:1163`) tests `(p->exit_signal != SIGCHLD) ^ !!(wo->wo_flags & __WCLONE)`, so a plain `waitpid`
-/// answers `-1 ECHILD` at once and the task stays `Z` for the host process's life. Nothing else reaps it either - no
-/// `SIGCHLD` is delivered to hang a handler off - so this leaks one task per broker.
+/// `clone3_fork(0, 0, ..)` gives the child `exit_signal == 0`, a clone child to `eligible_child`
+/// (`kernel/exit.c:1163`), so a plain `waitpid` answers `-1 ECHILD` at once and the task stays `Z` for the host
+/// process's life, with no `SIGCHLD` delivered to reap it by.
 #[test]
 fn dropping_the_broker_leaves_no_zombie() {
     let afs = match UringFs::new(test_cfg()) {
@@ -126,7 +125,6 @@ fn impersonated_open_obeys_dac() {
         return; // cross-uid impersonation needs CAP_SETUID
     }
     with_broker(|h, creds, me, dir| {
-        // A root-owned 0600 file, and a world-readable one beside it.
         std::fs::write(dir.join("secret"), b"root only").unwrap();
         std::fs::set_permissions(dir.join("secret"), std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::write(dir.join("public"), b"everyone").unwrap();
@@ -137,11 +135,10 @@ fn impersonated_open_obeys_dac() {
             .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
             .expect("register nobody");
 
-        // The daemon (root) can read the secret...
         let f = h.open(me, &anchor, "secret", rdonly()).expect("root open");
         h.close(f).unwrap();
 
-        // ...the impersonated user cannot. This is the whole design in one assertion: the kernel refused, under
+        // The impersonated user cannot read it. This is the whole design in one assertion, the kernel refusing under
         // credentials the daemon itself does not have.
         assert!(
             matches!(
@@ -151,7 +148,6 @@ fn impersonated_open_obeys_dac() {
             "impersonated open of a 0600 root file must be denied"
         );
 
-        // A world-readable file is fine as that user.
         let f = h.open(user, &anchor, "public", rdonly()).expect("open");
         let (n, buf) = pread1(h, user, &f, vec![0u8; 16], 0);
         assert_eq!(&buf[..n.unwrap()], b"everyone");
@@ -167,7 +163,6 @@ fn impersonated_personality_holds_no_dac_override() {
         return;
     }
     with_broker(|h, creds, _me, dir| {
-        // A directory the user cannot even traverse.
         std::fs::create_dir(dir.join("vault")).unwrap();
         std::fs::write(dir.join("vault/inner"), b"x").unwrap();
         std::fs::set_permissions(dir.join("vault"), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -213,7 +208,6 @@ fn impersonated_create_is_owned_by_the_user() {
         assert_eq!(md.uid(), NOBODY_UID, "created as the impersonated user");
         assert_eq!(md.gid(), NOBODY_GID);
 
-        // Directory entries too: mkdir and unlink run as the user.
         h.mkdirat(user, &anchor, leaf("theirdir"), Mode::from_bits_truncate(0o755))
             .expect("mkdirat");
         assert_eq!(std::fs::metadata(dir.join("theirdir")).unwrap().uid(), NOBODY_UID);
@@ -253,7 +247,6 @@ fn impersonated_trusted_xattr_is_denied() {
         let (res, _v) = h.fsetxattr(user, &f, trusted.clone(), b"z".to_vec(), 0);
         assert!(matches!(res, Err(Error::Errno(Errno::EPERM))));
 
-        // user.* on a file the personality does not own is also refused.
         let user_attr = xattr_name("user.mine");
         let (res, _v) = h.fsetxattr(user, &f, user_attr.clone(), b"z".to_vec(), 0);
         assert!(matches!(res, Err(Error::Errno(Errno::EACCES))));
@@ -312,7 +305,7 @@ fn unregistered_personality_stops_working() {
     });
 }
 
-// --- M3: the identity cache (register once per *identity*, not per connection)
+// --- the identity cache (register once per *identity*, not per connection)
 
 #[test]
 fn identity_cache_registers_once_per_identity() {
@@ -320,7 +313,6 @@ fn identity_cache_registers_once_per_identity() {
         let cache = IdentityCache::new(creds.clone());
         let who = registerable_user();
 
-        // Many "connections" for one identity -> one registration.
         let leases: Vec<_> = (0..8).map(|_| cache.acquire(&who).expect("acquire")).collect();
         assert_eq!(cache.len(), 1, "one cached identity");
         let id = leases[0].personality();
@@ -341,7 +333,6 @@ fn identity_cache_registers_once_per_identity() {
             assert_eq!(cache.len(), 1);
         }
 
-        // The id works while leased.
         let anchor = Anchor::open(dir).unwrap();
         let f = h.open(id, &anchor, "c", creat_rw()).expect("open");
         h.close(f).unwrap();
@@ -381,7 +372,6 @@ fn identity_cache_invalidation_reregisters_without_disturbing_leases() {
         let f = h.open(old_id, &anchor, "old", creat_rw()).expect("old lives");
         h.close(f).unwrap();
 
-        // The next acquire mints a *fresh* personality.
         let new = cache.acquire(&who).expect("re-acquire");
         assert_ne!(new.personality(), old_id, "re-registered under a new id");
         let f = h
@@ -389,7 +379,6 @@ fn identity_cache_invalidation_reregisters_without_disturbing_leases() {
             .expect("new works");
         h.close(f).unwrap();
 
-        // Retiring the old lease does not disturb the new registration.
         drop(old);
         assert!(matches!(
             h.open(old_id, &anchor, "gone", creat_rw()),
@@ -599,7 +588,6 @@ fn spawn_time_mask_is_a_ceiling_on_requested_caps() {
             .register(&AsUser::new(CAP_NOBODY_UID, CAP_NOBODY_GID).caps(Caps::DAC_READ_SEARCH))
             .expect_err("a capability outside the ceiling must be refused");
         assert!(matches!(err, Error::Errno(Errno::EPERM)), "expected EPERM, got {err:?}");
-        // The same identity without capabilities still registers.
         let ok = creds
             .register(&AsUser::new(CAP_NOBODY_UID, CAP_NOBODY_GID))
             .expect("the plain identity is unaffected");
@@ -628,7 +616,6 @@ fn identity_cache_keys_on_the_capability_set() {
             b.personality().id(),
             "distinct capability sets must not share a personality"
         );
-        // And each is stable on re-acquire.
         assert_eq!(cache.acquire(&plain).unwrap().personality().id(), a.personality().id());
     });
 }

@@ -104,10 +104,9 @@ fn expect_dance_flushes_interim_before_body() {
 
 #[test]
 fn botocore_golden_streaming_put() {
-    // The default boto3-over-TLS PutObject shape, byte-for-byte as captured on the dev box (boto3 1.37.9): Expect + TE
-    // chunked, one HTTP chunk wrapping the aws-chunked entity, checksum trailer *inside* the entity, bare HTTP
-    // terminator. The codec de-chunks its own layer only -- the aws-chunked entity must reach the handler untouched,
-    // and no HTTP trailers exist.
+    // The default boto3-over-TLS PutObject shape, byte for byte. Expect and TE chunked, one HTTP chunk wrapping the
+    // aws-chunked entity, the checksum trailer inside the entity, and a bare HTTP terminator. The codec de-chunks its
+    // own layer only, so the aws-chunked entity must reach the handler untouched and no HTTP trailers exist.
     let Some(()) = with_http_server(|v4| {
         let mut s = connect_tcp(v4)?;
         s.write_all(
@@ -210,10 +209,9 @@ fn large_chunked_dance_takes_the_handoff_path() {
     };
 }
 
-/// Bind a **deferrable** http server: `/warm` parks on a cold shared cache and a worker warms it then redrives;
-/// `/deadline` parks and the worker
-/// replies 503 directly; `/drop` parks and the worker drops the handle;
-/// `/hi` answers inline. `None` means io_uring is unavailable (a skip).
+/// Bind a **deferrable** http server. `/warm` parks on a cold shared cache and a worker warms it then redrives,
+/// `/deadline` parks and the worker replies 503 directly, `/drop` parks and the worker drops the handle, and `/hi`
+/// answers inline. `None` means io_uring is unavailable (a skip).
 fn with_parking_server<T: Send + 'static>(
     client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
 ) -> Option<T> {

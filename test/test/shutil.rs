@@ -36,17 +36,11 @@ fn sibling_subdirectories_land_beside_each_other() {
     assert_eq!(mode(&dst.join("b")), 0o750, "b's mode landed on b");
 }
 
-/// A destination *inside* the source is skipped rather than descended into.
+/// A destination root the copy did not create gets its mode back.
 ///
-/// Without the guard the walk descends into the tree it is filling and copies its own output back into itself,
-/// which terminates only at the walk's depth limit or when the filesystem fills - after writing an exponentially
-/// duplicated tree. `copytree` advertises the skip; this A destination root the copy did not create gets its mode
-/// back.
-///
-/// The root is held at 0o700 for the duration so group and other never see a half-written tree, and the real mode
-/// is meant to be applied at the end - but the only thing that applies one is `copy_permissions`, under
-/// `CopyFlags::PERMISSIONS`. Without that flag a copy that succeeds leaves a borrowed destination owner-only, which
-/// on a share or system-dataset migration locks every other identity out and reports success.
+/// The root is held at 0o700 while the copy runs so group and other never see a half-written tree, and only
+/// `copy_permissions` under `CopyFlags::PERMISSIONS` stamps the source's mode at the end. Without that flag the restore
+/// is all that keeps a borrowed destination from staying owner-only.
 #[test]
 fn a_borrowed_destination_root_keeps_its_mode() {
     use truenas_ros::sync_fs::shutil::CopyFlags;
@@ -77,7 +71,9 @@ fn a_borrowed_destination_root_keeps_its_mode() {
     }
 }
 
-/// is what holds it.
+/// A destination *inside* the source is skipped rather than descended into. Without the guard the walk copies its own
+/// output back into itself until the depth limit or a full filesystem. `copytree` advertises the skip, and this is what
+/// holds it.
 #[test]
 fn a_destination_inside_the_source_is_not_copied_into_itself() {
     let tmp = truenas_ros::tempdir().unwrap();
@@ -164,10 +160,9 @@ fn a_file_capability_does_not_survive_a_copy() {
         .write(true)
         .open(src.join("bin"))
         .unwrap();
-    // The gated probe runs FIRST. A filesystem with no xattrs at all refuses both names, and the capability skip
-    // below is unconditional - so in the other order an xattr-less scratch filesystem returned here silently with
-    // `TRUENAS_ROS_REQUIRE_XATTRS` armed, which is exactly what the trailing `user.marker` assertion says must not
-    // happen.
+    // The gated probe runs first. A filesystem with no xattrs refuses both names and the capability skip below is
+    // unconditional, so in the other order an xattr-less filesystem would skip silently with
+    // `TRUENAS_ROS_REQUIRE_XATTRS` armed.
     if setxattr(&f, c"user.marker", b"v") != 0 {
         super::xattr_probe::refusal_is_allowed("setxattr(user.marker)", std::io::Error::last_os_error());
         return;
@@ -204,16 +199,12 @@ fn a_file_capability_does_not_survive_a_copy() {
 /// A FIFO whose own mode denies reading is still copied.
 ///
 /// `make_special_meta` carries metadata through a real descriptor, so it opens the new node `O_RDONLY|O_NONBLOCK`.
-/// If that node were created at the *source's* mode, a write-only FIFO - `0o200`, `0o000`, `0o222` - would answer
-/// its own copy `EACCES` and fail the whole tree. The `O_PATH` pin this replaced needed no read permission, so
-/// creating at the source mode used to be free. It is created at the creation hold instead and the real mode lands
-/// in the `fchmod` afterwards, which the umask made necessary anyway.
+/// Created at the source's mode, a write-only FIFO (`0o200`, `0o000`, `0o222`) would answer its own copy `EACCES`, so
+/// it is created at the creation hold and the real mode lands in the `fchmod` afterwards.
 ///
-/// DAC denies root nothing, so as root the `EACCES` is unreachable and every assertion below merely passes -
-/// measured: with the creation mode reverted to the source's, this test still reported `ok`. The copy therefore
-/// runs with `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` dropped from this thread, which makes the same mutation
-/// fail. `DacDropped::take` is a no-op for a non-root caller, so the unprivileged runner - where the regression
-/// lived, every other FIFO fixture here using a readable mode - is unchanged.
+/// DAC denies root nothing, so as root the `EACCES` is unreachable and every assertion below would merely pass. The
+/// copy therefore runs with `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` dropped from this thread. `DacDropped::take`
+/// is a no-op for a non-root caller, so the unprivileged runner is unchanged.
 #[test]
 fn a_write_only_fifo_is_still_copied() {
     use std::os::unix::ffi::OsStrExt;
@@ -222,7 +213,6 @@ fn a_write_only_fifo_is_still_copied() {
     let src = tmp.path().join("src");
     std::fs::create_dir(&src).unwrap();
     let c = std::ffi::CString::new(src.join("wo").as_os_str().as_bytes().to_vec()).unwrap();
-    // 0o200: writable by the owner, readable by nobody at all.
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o200) }, 0);
     // mkfifo is umask-masked; force the exact bits.
     std::fs::set_permissions(src.join("wo"), std::fs::Permissions::from_mode(0o200)).unwrap();
@@ -242,14 +232,10 @@ fn a_write_only_fifo_is_still_copied() {
 
 /// A special node takes the source's mode and **not** its access ACL.
 ///
-/// This pins a limitation, not a feature. The destination FIFO has a real descriptor and could take an ACL; the
-/// source does not. The walk pins source specials `O_PATH`, which cannot read an xattr, and reopening the source
-/// FIFO for real would release any writer blocked in `open(O_WRONLY)` on it - a copy must not perturb the tree it
-/// reads. Reading it by name re-resolves it, which is the hole the pin exists to close.
-///
-/// So `CopyFlags::PERMISSIONS` - "copy ACL xattrs, *or* `fchmod` when no ACL is present" - runs only its second
-/// half here. The regular file is the control: it carries the same ACL through the same copy, so this is the
-/// special-file path and not a broken fixture.
+/// This pins a limitation, not a feature. The walk pins source specials `O_PATH`, which cannot read an xattr, reopening
+/// the source FIFO for real would release any writer blocked in `open(O_WRONLY)` on it, and reading it by name
+/// re-resolves it. So `CopyFlags::PERMISSIONS` runs only its `fchmod` half here. The regular file is the control,
+/// carrying the same ACL through the same copy, so this is the special-file path and not a broken fixture.
 #[test]
 fn a_special_file_takes_the_mode_and_not_the_acl() {
     use std::os::unix::fs::PermissionsExt;
@@ -324,17 +310,14 @@ fn a_special_file_takes_the_mode_and_not_the_acl() {
 
 /// The **mode** is carried through a real descriptor or not at all.
 ///
-/// A FIFO can be opened `O_RDONLY|O_NONBLOCK` without waiting for a writer, so it takes the full metadata set. A
-/// socket refuses every `open(2)` with `ENXIO` and a device node's open runs its driver, so neither can be given
-/// one - and `copytree` says so instead of reaching for `fchmodat2`'s empty-path form on an `O_PATH` pin or
-/// `/proc/self/fd/N`. Those make the mode appear to travel while an ACL or xattr on the same handle cannot travel
-/// at all (`fsetxattr` and `setxattrat` with `AT_EMPTY_PATH` both answer an `O_PATH` descriptor `EBADF`), so the
-/// copy would report `Ok` having dropped the access control.
+/// A FIFO can be opened `O_RDONLY|O_NONBLOCK` without waiting for a writer, so it takes the full metadata set. A socket
+/// refuses every `open(2)` with `ENXIO` and a device node's open runs its driver, so neither can be given one, and
+/// `copytree` says so instead of reaching for `fchmodat2`'s empty-path form on an `O_PATH` pin or `/proc/self/fd/N`.
+/// Those carry only the mode while an ACL or xattr cannot travel (`fsetxattr` and `setxattrat` with `AT_EMPTY_PATH`
+/// both answer an `O_PATH` descriptor `EBADF`), so the copy would report `Ok` having dropped the access control.
 ///
-/// Owner and timestamps are not part of that limit and do travel;
-/// `a_socket_carries_everything_but_its_mode` is the other half.
-///
-/// With the three metadata flags cleared there is nothing to carry, so the same socket copies as a bare node.
+/// Owner and timestamps do travel, and `a_socket_carries_everything_but_its_mode` is that half. With the three metadata
+/// flags cleared there is nothing to carry, so the same socket copies as a bare node.
 #[test]
 fn a_socket_is_refused_rather_than_moded_through_a_path() {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -354,7 +337,6 @@ fn a_socket_is_refused_rather_than_moded_through_a_path() {
         "the refusal must name the type and why: {msg}"
     );
 
-    // Cleared flags: nothing to carry, so the node copies.
     let bare = tmp.path().join("bare");
     let cfg = CopyTreeConfig {
         flags: CopyFlags::empty(),
@@ -389,21 +371,15 @@ fn a_socket_is_refused_rather_than_moded_through_a_path() {
 
 /// A socket gives up its mode and nothing else.
 ///
-/// Only `fchmod` is impossible on a socket or a device node: it needs a real descriptor and neither type can be
-/// given one. `fchownat` and `utimensat` with `AT_EMPTY_PATH` are supported on the `O_PATH` peek, measured, and
-/// type-agnostic in the kernel (`chown_common`,
-/// `fs/open.c:754`, tests the inode's type only to kill setid;
-/// `do_utimes_path`, `fs/utimes.c:86`, accepts the flag outright). So refusing `OWNER` and `TIMESTAMPS` alongside
-/// the mode gave up three attributes to report one, and killed outright a copy that asked only for the two that
-/// work.
+/// Only `fchmod` needs a real descriptor. `fchownat` and `utimensat` with `AT_EMPTY_PATH` work on the `O_PATH` peek and
+/// are type-agnostic in the kernel (`chown_common`, `fs/open.c:754`, tests the inode's type only to kill setid, and
+/// `do_utimes_path`, `fs/utimes.c:86`, accepts the flag outright), so refusing them too would give up three attributes
+/// to report one.
 ///
-/// The mode assertion needs no knowledge of the umask: a regular file beside the socket is created at the same
-/// `creation_mode` permissive form, so the two are compared to each other rather than to a constant.
-///
-/// The owner half only *distinguishes* as root, which is where the
-/// source can be given an identity the copying process does not have;
-/// the timestamp half bites everywhere, and both stamps are far enough from "now" that they cannot arrive by
-/// accident.
+/// The mode assertion needs no knowledge of the umask, since a regular file beside the socket is created at the same
+/// `creation_mode` and the two are compared to each other. The owner half only distinguishes as root, where the source
+/// can be given an identity the copier does not have. The timestamp half bites everywhere, with stamps far enough from
+/// now that they cannot arrive by accident.
 #[test]
 fn a_socket_carries_everything_but_its_mode() {
     use std::os::unix::fs::MetadataExt;
@@ -424,7 +400,7 @@ fn a_socket_carries_everything_but_its_mode() {
     // Stamp the source by NAME: a socket cannot be opened to be stamped through a descriptor, which is the whole
     // reason this case exists.
     let c = std::ffi::CString::new(src.join("sock").into_os_string().into_encoded_bytes()).unwrap();
-    // SAFETY: a valid path and a two-element timespec array.
+    // SAFETY: geteuid reads the caller's credentials and cannot fail.
     let uid = unsafe { libc::geteuid() };
     let want_uid = if uid == 0 { 65534 } else { uid };
     assert_eq!(
@@ -523,12 +499,12 @@ fn a_socket_carries_everything_but_its_mode() {
 
 /// The special-type refusal is a metadata-copy failure, so `raise_error: false` swallows it like every other one.
 ///
-/// It fires only *because* metadata was requested - the node itself is created and verified before the flags are
-/// even consulted - and `CopyTreeConfig::raise_error` documents that class as "ignored, and the copy continues"
-/// when false. Returned past `guard`, one unix socket anywhere in a source tree failed the whole copy in **both**
-/// dispositions and left a partial destination behind: an ssh-agent socket in a home directory is enough.
+/// It fires only because metadata was requested, after the node itself is created and verified, and
+/// `CopyTreeConfig::raise_error` documents that class as ignored when false. Returned past `guard`, one unix socket
+/// anywhere in a source tree, such as an ssh-agent socket in a home directory, would fail the whole copy in both
+/// dispositions.
 ///
-/// Swallowed, the node is the bare special the refusal's own message tells the caller to ask for - and it keeps the
+/// Swallowed, the node is the bare special the refusal's own message tells the caller to ask for, and it keeps the
 /// creation hold, since releasing that needs the very `fchmod` a socket cannot be given.
 #[test]
 fn a_refused_special_type_is_swallowed_when_errors_are_not_raised() {
@@ -630,17 +606,15 @@ impl Drop for DacDropped {
 
 /// A destination node the copy cannot open is refused **by name**.
 ///
-/// `creation_mode`'s hold is only a *request*. Where the destination parent carries an inheritable ACL the umask
-/// never applies and the new node's mode is narrowed through the inherited entries instead (`zpl_init_acl` ->
-/// `__posix_acl_create`, `module/os/linux/zfs/zpl_xattr.c`; `posix_acl_create`, `fs/posix_acl.c`), so a parent
-/// whose entries withhold owner-read produces a node this very copy cannot open for the real descriptor its
-/// metadata needs. The `O_PATH` pin this replaced needed no read permission, so the whole state is new - and it
-/// reached the caller as a bare `EACCES` naming nothing at all.
+/// `creation_mode`'s hold is only a request. Where the destination parent carries an inheritable ACL the umask never
+/// applies and the new node's mode is narrowed through the inherited entries instead (`zpl_init_acl` ->
+/// `__posix_acl_create`, `module/os/linux/zfs/zpl_xattr.c`, and `posix_acl_create`, `fs/posix_acl.c`), so a parent
+/// whose entries withhold owner-read produces a node this copy cannot open for the descriptor its metadata needs. The
+/// error must name that node rather than surface as a bare `EACCES`.
 ///
-/// The fixture is a destination root carrying `default:user::-w-`, written as the raw `system.posix_acl_default`
-/// blob because the narrowing is what is under test and `setfacl` is not a dependency. A filesystem that refuses
-/// the xattr fails the test rather than skipping it: every temp filesystem this runs on does POSIX ACLs, and a
-/// silent pass here would be a pass having tested nothing.
+/// The fixture is a destination root carrying `default:user::-w-`, written as the raw `system.posix_acl_default` blob
+/// because the narrowing is what is under test and `setfacl` is not a dependency. A filesystem that refuses the xattr
+/// fails the test rather than skipping it, since every temp filesystem this runs on does POSIX ACLs.
 #[test]
 fn a_destination_node_without_owner_read_names_what_narrowed_it() {
     use std::os::unix::fs::PermissionsExt;
@@ -764,7 +738,6 @@ fn setid_withheld_when_ownership_is_not_preserved() {
         std::fs::set_permissions(src.join(name), std::fs::Permissions::from_mode(0o4755)).unwrap();
     }
 
-    // OWNER cleared: the destination keeps the copier's ownership, so setid must not be carried over.
     let config = CopyTreeConfig {
         flags: CopyFlags::PERMISSIONS | CopyFlags::XATTRS | CopyFlags::TIMESTAMPS,
         ..Default::default()
@@ -830,19 +803,16 @@ fn existing_destination_file_is_replaced_not_reused() {
     std::fs::create_dir(&src).unwrap();
     std::fs::write(src.join("secret"), b"SECRET-KEY-MATERIAL").unwrap();
 
-    // The destination name is pre-created by someone who keeps it open.
     let dst = tmp.path().join("dst");
     std::fs::create_dir(&dst).unwrap();
     std::fs::write(dst.join("secret"), b"planted").unwrap();
     let mut planted = std::fs::File::open(dst.join("secret")).unwrap();
     let planted_ino = planted.metadata().unwrap().ino();
 
-    // exist_ok (the default) still tolerates the existing entry.
     let stats = copytree(&src, &dst, &CopyTreeConfig::default()).unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(std::fs::read(dst.join("secret")).unwrap(), b"SECRET-KEY-MATERIAL");
 
-    // A different inode, and the held descriptor never sees the copy.
     let copied_ino = std::fs::metadata(dst.join("secret")).unwrap().ino();
     assert_ne!(copied_ino, planted_ino, "the copy reused the inode");
     let mut through_held_fd = Vec::new();
@@ -921,7 +891,6 @@ fn a_failed_posix_acl_write_leaves_the_access_half_untouched() {
     std::fs::create_dir(&d).unwrap();
     let f = std::fs::File::open(&d).unwrap();
 
-    // A narrow starting state: r-x access, r-x default.
     let mut start = access_of(rx);
     start.extend(default_of(rx));
     let start = PosixAcl::from_aces(start);
@@ -1097,10 +1066,8 @@ fn a_directory_default_acl_is_carried_to_the_copy() {
 }
 
 // The sticky bit has no ACL representation, and no chmod runs on the ACL path, so an ACL-bearing sticky directory
-// arrives without S_ISVTX. The bit is given up to keep the ACL: on ZFS a chmod rewrites the ACL to
-// match the mode - under the default aclmode=discard it replaces it
-// outright - so restoring one bit would destroy the ACL the copy just carried. Pinned here so the trade stays a
-// decision.
+// arrives without S_ISVTX. The bit is given up to keep the ACL, since on ZFS a chmod rewrites the ACL to match the
+// mode, and under the default aclmode=discard replaces it outright. Pinned here so the trade stays a decision.
 #[cfg(feature = "acl")]
 #[test]
 fn an_acl_bearing_sticky_directory_arrives_without_the_sticky_bit() {
@@ -1127,7 +1094,6 @@ fn an_acl_bearing_sticky_directory_arrives_without_the_sticky_bit() {
     let tmp = truenas_ros::tempdir().unwrap();
     let src = tmp.path().join("src");
     std::fs::create_dir(&src).unwrap();
-    // The classic sticky shape: a world-writable shared directory.
     std::fs::create_dir(src.join("shared")).unwrap();
     std::fs::write(src.join("shared/f"), b"x").unwrap();
     std::fs::set_permissions(src.join("shared"), std::fs::Permissions::from_mode(0o1777)).unwrap();
@@ -1213,7 +1179,6 @@ fn copies_into_read_only_subdirectory() {
     let stats = res.expect("read-only subdirectory should be copied into");
     assert_eq!(stats.files, 1);
     assert_eq!(std::fs::read(dst.join("sub/f")).unwrap(), b"hi");
-    // The restrictive mode is still applied - just last.
     assert_eq!(dst_mode, Some(0o555));
 }
 
@@ -1235,18 +1200,14 @@ fn copies_tree_with_content_and_metadata() {
     assert_eq!(stats.symlinks, 1); // link
     assert_eq!(stats.bytes, 5 + 4096);
 
-    // Content copied.
     assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"hello");
     assert_eq!(std::fs::read(dst.join("sub/b.bin")).unwrap(), vec![7u8; 4096]);
-    // Symlink recreated verbatim (not followed).
     assert_eq!(
         std::fs::read_link(dst.join("link")).unwrap(),
         std::path::Path::new("a.txt")
     );
-    // Permissions preserved.
     let mode = std::fs::metadata(dst.join("a.txt")).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o640);
-    // Nanosecond mtime preserved (would otherwise be the copy time).
     let dst_mtime = std::fs::metadata(dst.join("a.txt")).unwrap().modified().unwrap();
     assert_eq!(src_mtime, dst_mtime);
 }
@@ -1260,7 +1221,6 @@ fn skips_metadata_when_flags_cleared() {
     std::fs::create_dir(&src).unwrap();
     std::fs::write(src.join("f"), b"data").unwrap();
 
-    // No metadata preservation: still copies content, no fchmod-from-ACL.
     let config = CopyTreeConfig {
         flags: CopyFlags::empty(),
         ..Default::default()
@@ -1279,7 +1239,6 @@ fn reporting_callback_fires_periodically_and_finally() {
     std::fs::write(src.join("d1/b"), b"bb").unwrap();
     std::fs::write(src.join("d1/d2/c"), b"ccc").unwrap();
 
-    // increment=1 -> one callback per entry (5) plus the final call.
     let mut calls = 0u32;
     let mut last = None;
     let cfg = CopyTreeConfig {
@@ -1297,7 +1256,6 @@ fn reporting_callback_fires_periodically_and_finally() {
     assert_eq!(calls, 6, "5 entries at increment 1, plus the final call");
     assert_eq!(last.unwrap(), stats, "final call carries completed stats");
 
-    // increment=0 -> only the final call fires.
     let mut calls0 = 0u32;
     let cfg0 = CopyTreeConfig {
         reporting_increment: 0,
@@ -1321,7 +1279,6 @@ fn traverse_without_child_mounts_matches_plain_copy() {
         ..Default::default()
     };
     let trav = copytree(&src, &tmp.path().join("d2"), &cfg).unwrap();
-    // No child mounts nested under a tempdir -> traverse is a no-op.
     assert_eq!(plain, trav);
     assert_eq!(trav.dirs, 1);
     assert_eq!(trav.files, 2);
@@ -1339,7 +1296,6 @@ fn traverse_copies_child_mount() {
     std::fs::create_dir_all(src.join("child")).unwrap();
     std::fs::write(src.join("top"), b"top").unwrap();
 
-    // Mount a tmpfs at src/child (needs privilege; skip otherwise).
     let target = src.join("child");
     let ctarget = CString::new(target.as_os_str().as_bytes()).unwrap();
     let tmpfs = CString::new("tmpfs").unwrap();

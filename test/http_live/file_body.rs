@@ -64,13 +64,11 @@ fn http_file_body_streams_a_multi_chunk_file() {
             let (status, head) = read_head(&mut s)?;
             assert_eq!(status, 200);
             assert!(head.contains(&format!("Content-Length: {SIZE}\r\n")), "{head}");
-            // GET: the streamed body, byte-exact.
             s.write_all(b"GET /obj HTTP/1.1\r\nHost: t\r\n\r\n")?;
             let (status, _head, body) = read_response(&mut s)?;
             assert_eq!(status, 200);
             assert_eq!(body.len(), SIZE);
             assert_eq!(body, content, "streamed bytes match the file");
-            // Keep-alive survived the stream.
             s.write_all(b"GET /small HTTP/1.1\r\nHost: t\r\n\r\n")?;
             let (status, _head, body) = read_response(&mut s)?;
             assert_eq!(status, 200);
@@ -163,15 +161,14 @@ fn http_file_body_serves_a_range_from_a_stashed_handle() {
 /// A range whose start the caller's arithmetic wrapped is refused before it reaches the ring, and refusing sheds that
 /// one connection rather than the server.
 ///
-/// `u64::MAX` is `-1`, io_uring's "use the file's own position" sentinel: for a regular file `io_kiocb_update_pos`
-/// (linux `io_uring/rw.c:484-490`) would read `f_pos` in place of the offset asked for and `rw.c:670-671` would write
-/// the new position back, so the read would SUCCEED from the wrong place and move a position shared with every other
-/// holder of the descriptor - behind a `Content-Length` already on the wire. A start past `i64::MAX` that is not the
-/// sentinel fails much later, in `rw_verify_area`, which is also after the head has committed. `bytes=-N` past the
-/// object size is how either arrives: computing the start as `size - N` wraps in `u64` rather than clamping.
+/// `u64::MAX` is `-1`, io_uring's use-the-file-position sentinel. For a regular file `io_kiocb_update_pos` (linux
+/// `io_uring/rw.c:484-490`) would read `f_pos` in place of the offset asked for and `rw.c:670-671` would write the new
+/// position back, so the read would succeed from the wrong place behind a `Content-Length` already on the wire. A start
+/// past `i64::MAX` that is not the sentinel fails in `rw_verify_area`, also after the head has committed. A suffix
+/// range `bytes=-N` past the object size reaches either one when `size - N` wraps.
 ///
-/// The last assertion is the one that matters: a *later* connection is served. A closed connection alone cannot tell a
-/// clean shed from the reactor thread dying on the overflow, which is what an unguarded advance does in debug.
+/// The last assertion is the one that matters, that a later connection is served. A closed connection alone cannot tell
+/// a clean shed from the reactor thread dying on the overflow.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn http_file_body_refuses_a_wrapped_range() {
@@ -253,7 +250,6 @@ fn http_file_body_refuses_a_wrapped_range() {
                 );
             }
 
-            // The server is still there, and the reply path still streams.
             let mut s = connect_tcp(v4)?;
             s.set_read_timeout(Some(Duration::from_secs(10)))?;
             s.write_all(b"GET /open HTTP/1.1\r\nHost: t\r\n\r\n")?;
@@ -273,10 +269,9 @@ fn http_file_body_refuses_a_wrapped_range() {
 
 /// A body read that finds the op table full WAITS for a slot instead of severing the transfer.
 ///
-/// The table is `fs_ops + pool_size`, one free list shared by handler ops and the reply path's body reads, and nothing
-/// reserves either side's share. A missing chunk buffer waits for a flush to recycle one, so a missing op slot waits
-/// too: the same class of transient shortage must not get opposite verdicts, one of them fatal to a multi-GB download
-/// mid-stream.
+/// The table is `fs_ops + pool_size`, one free list shared by handler ops and the reply path's body reads, with no
+/// share reserved for either. A missing op slot is the same transient shortage as a missing chunk buffer, so it waits
+/// as that does rather than severing a download mid-stream.
 ///
 /// Both slots are pinned here by reads on a FIFO that cannot complete until the client writes to it, which is what a
 /// handler fan-out looks like from the reply path. The object must still arrive whole.
@@ -347,11 +342,8 @@ fn http_file_body_waits_for_an_op_slot() {
                 return; // the other open has not landed yet
             };
             // Take every op slot the table has (`fs_ops + pool_size` = 2). `u64::MAX` because a pipe refuses a real
-            // offset (ESPIPE) and takes the file-position sentinel instead.
-            //
-            // The buffer needs a LENGTH, not just capacity: `submit_rw` sets `iov_len` from `buf.len()`, so a
-            // `Vec::with_capacity(8)` asks the kernel for zero bytes, completes immediately, and pins no slot at all -
-            // which leaves the wait below unexercised.
+            // offset (ESPIPE) and takes the file-position sentinel instead. The buffer needs a length, not just
+            // capacity, since `submit_rw` sets `iov_len` from `buf.len()` and a zero-length read pins no slot.
             for _ in 0..2 {
                 fs.preadv2(
                     who,
@@ -415,18 +407,14 @@ fn http_file_body_waits_for_an_op_slot() {
 
 /// A freed op slot reaches the **parked body** before the completion's own continuation can take it back.
 ///
-/// `Server::on_cqe` calls `redrive_parked_tail()` between `fs.on_cqe(...)` (which returns the slot) and `match reaped`
-/// (which fires the handler continuation). That statement order is the whole anti-starvation property, and it reads
-/// like post-dispatch bookkeeping, so a refactor moving it below the dispatch is entirely plausible.
-/// `http_file_body_waits_for_an_op_slot` does not catch that: its pinned reads complete into `|_done, _fs| {}`, so
-/// nothing competes for the slot they free and the test passes with the two statements in either order.
+/// `Server::on_cqe` calls `redrive_parked_tail()` between `fs.on_cqe(...)`, which returns the slot, and `match reaped`,
+/// which fires the handler continuation. That order is the anti-starvation property, and it reads like bookkeeping a
+/// refactor could move below the dispatch. Here the pinned reads' continuations re-submit, so the freed slot is
+/// contended by exactly the party the order exists to beat. Swap the two statements and the body never gets a slot, and
+/// this fails on the client's read timeout.
 ///
-/// Here the pinned reads' continuations re-submit, so the freed slot is contended by exactly the party the ordering
-/// exists to beat. Swap the two statements in `on_cqe` and the re-submitted read wins the slot, the body never gets
-/// one, and this fails on the client's read timeout.
-///
-/// The continuations capture no `HttpDeferred`, so the one that loses the race (which, with the ordering correct, is
-/// the re-submit) is dropped harmlessly rather than closing the connection.
+/// The continuations capture no `HttpDeferred`, so the one that loses the race is dropped without closing the
+/// connection.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn http_a_freed_op_slot_reaches_the_parked_body_first() {
@@ -561,13 +549,11 @@ fn http_a_freed_op_slot_reaches_the_parked_body_first() {
 
 /// Pipelined file bodies are served, in order, all of them.
 ///
-/// One tail at a time is structural - two bodies' chunks would interleave on the wire - but shedding the connection to
-/// enforce that destroys the FIRST response, which is already committed: the client gets nothing, not even body one.
-/// Every other PDU in this position queues behind the tail, and so does a file body.
+/// Only one tail streams at a time, so a second file body queues behind it as every other PDU does. Shedding the
+/// connection instead would destroy the first response, which is already committed.
 ///
-/// Answered INLINE from handles a preamble stashed, not through `defer`: pipelining lets replies complete out of
-/// request order (`net::server`, the Pipelining section), which HTTP/1.1 forbids, so a deferred reply at
-/// `max_in_flight_requests > 1` is a consumer-protocol mismatch rather than anything to do with the tail.
+/// Answered inline from handles a preamble stashed, not through `defer`, since deferred replies may complete out of
+/// request order (`net::server`, the Pipelining section) and HTTP/1.1 forbids that.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn http_pipelined_file_bodies_queue_instead_of_killing_the_connection() {
@@ -630,7 +616,6 @@ fn http_pipelined_file_bodies_queue_instead_of_killing_the_connection() {
         move |v4| {
             let mut s = connect_tcp(v4)?;
             s.set_read_timeout(Some(Duration::from_secs(20)))?;
-            // One handle per pipelined GET, stashed one request at a time.
             for _ in 0..REQUESTS {
                 s.write_all(b"GET /open HTTP/1.1\r\nHost: t\r\n\r\n")?;
                 let (status, _head, body) = read_response(&mut s)?;
@@ -813,9 +798,8 @@ fn http_file_body_truncation_closes_mid_body() {
     };
 }
 
-/// A file-sourced body over kernel TLS is nothing special - chunks are plaintext buffers on the ordinary send path,
-/// encrypted in the kernel -- so the same multi-chunk stream arrives byte-exact and the connection serves the next
-/// request. Worth proving once, which is what this is.
+/// A file-sourced body over kernel TLS takes the ordinary send path, with chunks encrypted in the kernel, so the same
+/// multi-chunk stream arrives byte-exact and the connection serves the next request.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn ktls_file_body_streams_intact() {

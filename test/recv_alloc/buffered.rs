@@ -85,10 +85,9 @@ fn buffered_cost(messages: usize, take: bool) -> Option<usize> {
     Some(client.join().expect("client thread"))
 }
 
-/// The first recycle already licenses reuse: the licence is potted before the handler runs, so message 2 serves from
-/// message 1's recycled storage. Potted after the handler instead, message 1's recycle found an empty pot and freed,
-/// and message 2 allocated afresh - the pool bootstrapped one message late in the fast case, and never at all for
-/// bodies spaced past a maintenance window, where the zeroed pot ate the licence between messages every time.
+/// The first recycle already licenses reuse, since the licence is potted before the handler runs, so message 2 serves
+/// from message 1's recycled storage. Potted after the handler, the pool would bootstrap one message late, and never
+/// for bodies spaced past a maintenance window, which zeroes the pot between messages.
 #[test]
 fn the_first_recycle_licenses_the_second_message() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
@@ -111,10 +110,9 @@ fn the_first_recycle_licenses_the_second_message() {
 
 /// A recycled buffered body must not cost an allocation per message.
 ///
-/// The first body is a miss and allocates; every later one on the connection reuses that storage through the ring's
+/// The first body is a miss and allocates, and every later one on the connection reuses that storage through the ring's
 /// body pool. Comparing two run lengths rather than asserting an absolute keeps the fixed setup cost out of the
-/// verdict, as the streaming twin above does. Before the pool, each message minted its `Vec` afresh and the difference
-/// read as the message count.
+/// verdict, as the streaming twin does.
 #[test]
 fn a_recycled_buffered_body_does_not_allocate_per_message() {
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());

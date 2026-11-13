@@ -69,7 +69,6 @@ fn round_trip_write_fsync_read() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
 
-        // Write a new file through the reactor: two gathered buffers.
         let f = h.open(me, &anchor, "out.bin", creat_rw()).expect("open");
         let (n, bufs) = h.pwritev2(me, &f, vec![b"hello ".to_vec(), b"world".to_vec()], 0, RwFlags::empty());
         assert_eq!(n.expect("writev"), 11);
@@ -86,7 +85,6 @@ fn round_trip_write_fsync_read() {
         // SAFETY: geteuid is always safe.
         assert_eq!(meta.uid(), unsafe { libc::geteuid() });
 
-        // Read it back scattered: 4 + 4 + 8 byte buffers, 11 bytes total.
         let f = h.open(me, &anchor, "out.bin", rdonly()).expect("reopen");
         let (n, bufs) = h.preadv2(
             me,
@@ -100,7 +98,6 @@ fn round_trip_write_fsync_read() {
         assert_eq!(&bufs[1], b"o wo");
         assert_eq!(&bufs[2][..3], b"rld");
 
-        // Positional single-buffer read.
         let (n, buf) = pread1(&h, me, &f, vec![0u8; 5], 6);
         assert_eq!(n.expect("pread"), 5);
         assert_eq!(&buf, b"world");
@@ -277,7 +274,6 @@ fn an_immutable_file_cannot_be_unlinked_or_relabelled() {
             "statx must report the lock"
         );
 
-        // The lock holds against deletion and against relabelling.
         let unlinked = h.unlinkat(me, &anchor, leaf("locked.bin"));
         assert!(
             matches!(unlinked, Err(Error::Errno(Errno::EPERM))),
@@ -307,17 +303,13 @@ fn ranged_fsync_syncs_a_byte_range_and_whole_file() {
         let (n, _) = pwrite1(&h, me, &f, data.clone(), 0);
         assert_eq!(n.expect("pwrite"), 8192);
 
-        // Sync just the first 4 KiB (fsync range form: off=0, len=4096), then a tail range with datasync semantics,
-        // then the whole file via 0/0.
         h.fsync_range(me, &f, false, 0, 4096).expect("fsync_range head");
         h.fsync_range(me, &f, true, 4096, 4096).expect("fdatasync_range tail");
         h.fsync_range(me, &f, false, 0, 0).expect("fsync_range whole");
-        // The plain wrappers keep their whole-file behavior.
         h.fsync(me, &f).expect("fsync");
         h.fdatasync(me, &f).expect("fdatasync");
         h.close(f).expect("close");
 
-        // The data is intact on disk.
         let disk = std::fs::read(dir.join("ranged.bin")).expect("read");
         assert_eq!(disk, data);
     });
@@ -416,12 +408,10 @@ fn a_hardening_flag_does_not_opt_out_of_confinement() {
 
         let hardened = rdonly().resolve(ResolveFlag::RESOLVE_NO_MAGICLINKS);
         for (what, how) in [("default", rdonly()), ("hardened", hardened)] {
-            // An absolute path cannot be resolved from the filesystem root.
             match h.open(me, &anchor, &abs, how) {
                 Err(Error::Errno(Errno::EXDEV)) => {}
                 other => panic!("{what}: absolute path opened: {other:?}"),
             }
-            // Nor is a symlink followed, in-tree or not.
             match h.open(me, &anchor, "link", how) {
                 Err(Error::Errno(Errno::ELOOP)) => {}
                 other => panic!("{what}: symlink followed: {other:?}"),
@@ -448,13 +438,12 @@ fn validation_and_errno_mapping() {
             h.open(me, &anchor, "/etc/hostname", rdonly()),
             Err(Error::Errno(Errno::EXDEV))
         ));
-        // O_CLOEXEC is accepted now (opens return real fds) and reaches the kernel, which opens the file.
+        // O_CLOEXEC is accepted and reaches the kernel, which opens the file.
         std::fs::write(dir.join("cx"), b"cx").unwrap();
         let cloexec = OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC);
         let fc = h.open(me, &anchor, "cx", cloexec).expect("O_CLOEXEC open");
         h.close(fc).unwrap();
 
-        // Kernel errno round-trips: ENOENT for a missing file, EBADF for a write on a read-only open.
         assert!(matches!(
             h.open(me, &anchor, "missing.txt", rdonly()),
             Err(Error::Errno(Errno::ENOENT))
@@ -502,11 +491,9 @@ fn stale_personality_from_other_ring_is_einval() {
     drop(afs_a); // ring A (and its registration) outlived the use on B
 }
 
-// Files are plain reference-counted fds now - there is no per-file pool to exhaust (`ENFILE`), and dropping a token
-// does NOT cancel in-flight ops: the reactor keeps the fd alive (via the op entry's parked `Arc<OwnedFd>`) until the op
-// completes, then the fd closes with the last reference (close-last by ownership). This test covers that cancel-safety
-// property: a parked read whose only caller token is dropped mid-flight still completes correctly when data arrives -
-// no use-after-close.
+// Dropping a token does not cancel in-flight ops. The reactor keeps the fd alive through the op entry's parked
+// `Arc<OwnedFd>` until the op completes, so a parked read whose only caller token is dropped mid-flight still completes
+// correctly when data arrives.
 #[test]
 fn dropped_file_mid_op_completes_without_use_after_close() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -622,7 +609,6 @@ fn concurrent_ops_across_threads() {
                     assert_eq!(n.unwrap(), payload.len());
                     h.fsync(me, &f).unwrap();
                     h.close(f).unwrap();
-                    // Verify through a fresh open + scattered read.
                     let f = h.open(me, &anchor, name, rdonly()).unwrap();
                     let half = payload.len() / 2;
                     let (n, bufs) = h.preadv2(

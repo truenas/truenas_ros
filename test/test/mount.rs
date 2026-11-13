@@ -54,15 +54,11 @@ fn iter_mount_yields_records() {
 
 /// A recursive unmount orders children before parents by **depth**, not by mount id.
 ///
-/// `listmount`'s reverse flag walks an rbtree keyed on `mnt_id_unique` (`fs/namespace.c`), which is `++mnt_id_ctr`
-/// at mount *allocation* - so it is descending creation order, and equals children-before-parents only when every
-/// child was created after its parent. `fsmount` then `move_mount`, both exported from this module, make the
-/// opposite ordinary.
-///
-/// This builds the inversion on purpose: three tmpfs mounts allocated deepest-first, so their ids descend as depth
-/// increases, then attached parent-first. Trusting the listing order unmounts the middle mount while its child is
-/// still on it - `umount2` answers `EBUSY`, the caller is told the unmount failed, and the whole tree is left
-/// mounted.
+/// `listmount`'s reverse flag walks an rbtree keyed on `mnt_id_unique` (`fs/namespace.c`), assigned at mount
+/// allocation, so it is descending creation order and puts children first only when each child was created after its
+/// parent. `fsmount` then `move_mount`, both exported from this module, make the opposite ordinary. This builds that
+/// inversion with three tmpfs mounts allocated deepest-first and attached parent-first, so trusting the listing order
+/// would unmount the middle mount while its child is still on it and get `EBUSY`.
 ///
 /// Needs privilege to mount, so it skips unless `TRUENAS_ROS_REQUIRE_ROOT` says a root run must reach it.
 #[test]
@@ -92,10 +88,9 @@ fn recursive_umount_orders_by_depth_not_mount_id() {
     let mp = tmp.path().join("mp");
     std::fs::create_dir(&mp).unwrap();
 
-    // Mounts are process-wide and outlive a failed assertion: without this, every failing run leaks three into the
-    // namespace every other test in the binary shares, and `TempDir`'s own Drop cannot reach them. Lazy so it
-    // cannot itself block, deepest-first so a parent is never asked while a child is on it, and best-effort because
-    // the test's own unmount normally got there first.
+    // Mounts are process-wide and outlive a failed assertion, and `TempDir`'s own Drop cannot reach them. Lazy so it
+    // cannot itself block, deepest-first so a parent is never asked while a child is on it, and best-effort because the
+    // test's own unmount normally got there first.
     struct UnmountOnDrop(std::path::PathBuf);
     impl Drop for UnmountOnDrop {
         fn drop(&mut self) {
@@ -138,11 +133,9 @@ fn recursive_umount_orders_by_depth_not_mount_id() {
     std::fs::create_dir(&b).unwrap();
     attach(gc, &b);
 
-    // Retried, and the retry cannot mask what this guards. Getting the order wrong is deterministic - `umount2` of
-    // the middle mount answers EBUSY because its child is still on it, on every attempt alike, so the reverted fix
-    // fails all five (measured). What the retry absorbs is ambient: this suite runs its binaries concurrently in
-    // one mount namespace, and a freshly created leaf has been observed EBUSY for reasons outside this test -
-    // roughly one full release run in three, which is worse than no test.
+    // Retried, and the retry cannot mask what this guards, since a wrong order answers EBUSY for the middle mount on
+    // every attempt. What the retry absorbs is ambient, as this suite runs its binaries concurrently in one mount
+    // namespace and a fresh leaf is sometimes EBUSY for reasons outside this test.
     let mut r = Err(truenas_ros::Error::from(Errno::EBUSY));
     for _ in 0..5 {
         r = umount(
@@ -176,8 +169,8 @@ fn fsopen_fsconfig_fsmount_detached_tmpfs() {
     let fs = match fsopen("tmpfs", FsopenFlags::empty()) {
         Ok(fd) => fd,
         Err(e @ (Errno::EPERM | Errno::ENOSYS | Errno::EACCES)) => {
-            // The only end-to-end drive of fsopen/fsconfig/fsmount in the tree; `coverage.rs` calls fsconfig but
-            // discards every result. A root run must not reach this arm.
+            // The only end-to-end drive of fsopen, fsconfig and fsmount in the tree, so a root run must not reach this
+            // arm.
             assert!(
                 std::env::var_os("TRUENAS_ROS_REQUIRE_ROOT").is_none(),
                 "TRUENAS_ROS_REQUIRE_ROOT is set but fsopen(tmpfs): {e}"

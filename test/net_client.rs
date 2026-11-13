@@ -122,7 +122,6 @@ where
 /// close, and return the reply bodies.
 fn echo_client(addr: ServerAddr, msgs: &[&[u8]]) -> io::Result<Vec<Vec<u8>>> {
     let mut client = Client::new(ClientConfig::default(), client_framer()).map_err(to_io)?;
-    // Blocking connect: it returns a serving connection ready for requests.
     let conn = client.connect(addr, ConnectOpts::default())?;
     assert!(client.is_open(conn), "connection is open after a blocking connect");
     assert!(client.conn_state(conn).is_some(), "state reachable while open");
@@ -337,7 +336,6 @@ fn tcp_multi_conn_fanout() {
         for _ in 0..N {
             conns.push(client.connect_start(ServerAddr::Tcp(v4), ConnectOpts::default())?);
         }
-        // One ring drives all N connects to completion.
         let mut connected = 0;
         while connected < N {
             match client.next_event()? {
@@ -351,7 +349,6 @@ fn tcp_multi_conn_fanout() {
             }
         }
 
-        // Send a distinct payload on each; remember which conn expects which.
         let mut expected: HashMap<ConnId, Vec<u8>> = HashMap::new();
         for (i, &conn) in conns.iter().enumerate() {
             let payload = format!("fan-{i}").into_bytes();
@@ -359,7 +356,6 @@ fn tcp_multi_conn_fanout() {
             expected.insert(conn, payload);
         }
 
-        // Collect one reply per connection; assert each maps to its conn.
         let mut seen = 0;
         while seen < N {
             match client.next_event()? {
@@ -508,7 +504,6 @@ fn tcp_stale_connid() {
             .request(conn, frame(b"x"))
             .expect_err("request on a stale conn fails");
         assert_eq!(e.kind(), io::ErrorKind::NotConnected);
-        // Graceful no-ops (must not panic).
         client.close(conn);
         client.close_now(conn);
         Ok(())
@@ -538,8 +533,6 @@ fn tcp_send_timeout() {
         unreachable!("bound v4");
     };
     let server = thread::spawn(move || {
-        // Accept one connection and hold it open without reading a byte, long enough for the client's send_timeout to
-        // fire.
         if let Ok((stream, _)) = listener.accept() {
             thread::sleep(Duration::from_secs(2));
             drop(stream);
@@ -599,10 +592,9 @@ fn tcp_splice_body() {
     let payload: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
     let expected = payload.clone();
 
-    // Reader thread: drain the pipe until BODY bytes arrive or the write end closes. The EOF arm is what an io_uring
-    // *skip* looks like from here: `with_server` returns without ever running the client body, so nothing is spliced,
-    // and a reader that only ever stops at BODY blocks for the life of the run - a hang with no test named. The main
-    // thread closes the write end before joining, which is the EOF.
+    // Drain the pipe until BODY bytes arrive or the write end closes. The EOF arm is needed for an io_uring skip, where
+    // nothing is spliced and a reader that stopped only at BODY would hang the run. The main thread closes the write
+    // end before joining, which is the EOF.
     let reader = thread::spawn(move || {
         let mut got = vec![0u8; BODY];
         let mut off = 0;
@@ -630,9 +622,7 @@ fn tcp_splice_body() {
         let mut client = Client::new(ClientConfig::default(), splice_framer()).map_err(to_io)?;
         // The sink fd rides in `U`; the framer reads it from there.
         let conn = client.connect_with_state(ServerAddr::Tcp(v4), ConnectOpts::default(), pipe_wr)?;
-        // Send a request whose echoed reply body is spliced to the pipe.
         let id = client.send(conn, frame(&payload))?;
-        // Drive the ring to completion; the reader drains the pipe concurrently.
         match client.next_event()? {
             Some(Event::Splice {
                 conn: c,
@@ -702,12 +692,11 @@ fn tcp_splice_bad_fd() {
 
 // ---- kernel TLS (kTLS) connect --------------------------------------------
 //
-// A real end-to-end TLS handshake around the client's kernel-TLS transport: the server worker drives `truenas_ktls`
-// (the packaged accept side), the client runs `SSL_connect` in its own worker - exactly the split a real consumer
-// implements. The library brings no TLS crate; the client side uses OpenSSL as a dev-dependency, raw, because the crate
-// has no connect role. Skips when the kernel lacks the `tls` ULP (or `FIXED_FD_INSTALL`), or when libssl cannot engage
-// kTLS at all ([`ktls_engages`] - Ubuntu ships OpenSSL 3.0 without `enable-ktls`); force on a known-good host with
-// `TRUENAS_ROS_REQUIRE_KTLS`.
+// A real end-to-end TLS handshake around the client's kernel-TLS transport. The server worker drives `truenas_ktls` and
+// the client runs `SSL_connect` in its own worker. The crate has no connect role, so the client side uses OpenSSL raw
+// as a dev-dependency. Skips when the kernel lacks the `tls` ULP or `FIXED_FD_INSTALL`, or when libssl cannot engage
+// kTLS at all (`ktls_engages`, since Ubuntu's OpenSSL 3.0 is built without `enable-ktls`). `TRUENAS_ROS_REQUIRE_KTLS`
+// forces it on a known-good host.
 
 use foreign_types::ForeignType; // Ssl::as_ptr for the raw BIO/SSL_connect path
 use openssl::ssl::{Ssl, SslContext, SslMethod, SslOptions, SslVerifyMode};
@@ -729,9 +718,8 @@ fn peercred_unsupported(e: &Error) -> bool {
     unsupported
 }
 
-/// The first client-side AF_UNIX coverage: dial a unix `net::server` by path, run keep-alive echo round-trips, close
-/// gracefully. The dial path (the `sockaddr_un` build, `IORING_OP_CONNECT` on the fixed file) is otherwise exercised
-/// only over TCP.
+/// Dial a unix `net::server` by path, run keep-alive echo round-trips and close gracefully. The dial path (the
+/// `sockaddr_un` build, `IORING_OP_CONNECT` on the fixed file) is otherwise exercised only over TCP.
 #[test]
 fn unix_echo_roundtrip() {
     let dir = truenas_ros::tempdir().unwrap();
@@ -941,9 +929,9 @@ fn unix_personality_peercred() {
     };
     let stop = server.shutdown_handle();
 
-    // The minted identity must be able to *reach* the socket: connect(2) checks MAY_WRITE on the socket inode and
-    // search on every ancestor under the personality's credentials (unix_find_bsd -> path_permission), and the tempdir
-    // is 0700 root. Open both up the way a real local-API daemon does its own socket (middlewared: 0666).
+    // The minted identity must be able to reach the socket. connect(2) checks MAY_WRITE on the socket inode and search
+    // on every ancestor under the personality's credentials (`unix_find_bsd` and `path_permission`), and the tempdir is
+    // 0700 root, so open both up as a local-API daemon opens its own socket.
     for (p, mode) in [(dir.path(), 0o755), (path.as_path(), 0o666)] {
         let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).expect("no interior NUL in a tempdir path");
         // SAFETY: valid NUL-terminated path; chmod reads it and touches no other memory.

@@ -299,11 +299,9 @@ fn low_level_fsetacl_paths() {
     let _ = fsetacl_nfs4(d.as_fd(), &nfs4);
     assert!(!nfs4.is_empty(), "an empty ACL still serialises to bytes");
 
-    // An *empty* slice is refused, on both raw paths, before it can reach the filesystem. The kernel leaves
-    // `kvalue` NULL for a zero-length `setxattr` (`setxattr_copy`, `fs/xattr.c:655-669`) and ZFS reads `(NULL, 0)`
-    // as the strip signal, so writing one would silently revert the object to mode-only permissions - the opposite
-    // of the "deny everyone" a caller that filtered an ACL down to nothing means by it. Removal is `fsetacl(fd,
-    // None)`.
+    // An empty slice is refused on both raw paths before it reaches the filesystem. The kernel passes a zero-length
+    // `setxattr` on as a NULL value (`setxattr_copy`, `fs/xattr.c:655-669`) and ZFS reads that as the strip signal, so
+    // it would revert the object to mode-only permissions. Removal is `fsetacl(fd, None)`.
     assert!(matches!(
         fsetacl_nfs4(d.as_fd(), &[]),
         Err(truenas_ros::Error::Errno(Errno::EINVAL))

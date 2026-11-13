@@ -10,10 +10,9 @@ fn statx_accessors_match_std_metadata() {
     let dir = truenas_ros::tempdir().unwrap();
     let path = dir.path().join("f");
     std::fs::write(&path, b"1234567").unwrap();
-    // Give atime, mtime and ctime three distinct values first. A file written a moment ago carries all three at the
-    // same instant, so a swap between the accessors would be invisible - this test read `atime()` and `ctime()`
-    // only for their arithmetic, and `atime() -> stx_ctime` survived the whole suite. `utimensat` sets the first
-    // two; ctime follows as "now", because changing them is itself a status change.
+    // Give atime, mtime and ctime three distinct values first, since a fresh file carries all three at one instant and
+    // a swap between the accessors would be invisible. `utimensat` sets the first two, and ctime becomes now because
+    // changing them is itself a status change.
     {
         use std::os::unix::ffi::OsStrExt as _;
         let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
@@ -50,11 +49,9 @@ fn statx_accessors_match_std_metadata() {
     assert!(st.blksize() > 0);
     assert_eq!(st.mtime().sec, md.mtime());
     assert_eq!(makedev(st.dev_major(), st.dev_minor()), st.dev());
-    // The remaining field accessors, against an oracle rather than discarded. Each is one raw read off the buffer
-    // the kernel filled, so the failure they have to catch is a field named wrongly, and driving them under `let _
-    // =` cannot see it: swapping the bodies of `blocks` and `subvol` and pointing `attributes_mask` at
-    // `stx_attributes` left every target in this suite green, because nothing anywhere compared their values to
-    // anything. `blocks`, `subvol` and `attributes_mask` are read here and nowhere else in the tree.
+    // The remaining field accessors, checked against an oracle. Each is one raw read off the buffer the kernel filled,
+    // so the fault to catch is a wrongly named field, which reading them under `let _ =` cannot see. `blocks`, `subvol`
+    // and `attributes_mask` are read here and nowhere else in the tree.
     //
     // `st_blocks` is the same 512-byte count `stx_blocks` carries.
     {
@@ -69,10 +66,9 @@ fn statx_accessors_match_std_metadata() {
         "the kernel did not report the fields this test read: {:?}",
         st.mask()
     );
-    // `attributes_mask` is what the filesystem SUPPORTS, a different word from `attributes`. The VFS sets the
-    // automount/mount-root bits in it for every stat, so it is never empty - while `attributes` on an ordinary file
-    // is zero (measured: attrs 0x0, mask IMMUTABLE|APPEND|NODUMP|AUTOMOUNT|MOUNT_ROOT|DAX on ZFS). An
-    // `attributes_mask` reading the attributes word is therefore empty here, which is what this catches.
+    // `attributes_mask` is what the filesystem supports, a different word from `attributes`. The VFS sets the automount
+    // and mount-root bits in it for every stat, while `attributes` on an ordinary file is zero, so an `attributes_mask`
+    // that read the attributes word would be empty here.
     let attrs = st.attributes();
     let supported = st.attributes_mask();
     assert!(

@@ -137,9 +137,8 @@ fn fremovexattr_removes_allowlisted_attributes() {
 /// `skip_descent` can cancel it - swap the directory for a regular file inside that window and the deferred
 /// `O_DIRECTORY` open fails `ENOTDIR`.
 ///
-/// Keep any provocation here *local* to the walk. `cargo test` runs a binary's tests as threads in one process, so
-/// anything that exhausts a process-wide resource - the fd table above all - starves whatever else is running rather
-/// than only this test, and fails a different innocent test on each run depending on the fd limit.
+/// Keep any provocation here *local* to the walk. A binary's tests share one process, so exhausting a process-wide
+/// resource such as the fd table would fail an unrelated test.
 #[test]
 fn descend_open_failure_surfaces_rather_than_dropping_the_subtree() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -159,7 +158,6 @@ fn descend_open_failure_surfaces_rather_than_dropping_the_subtree() {
         std::fs::write(dir.join("sub"), b"x").unwrap();
 
         match t.next() {
-            // triggers descend("sub")
             Some(Err(Error::Errno(Errno::ENOTDIR))) => {}
             other => panic!("an unopenable subtree must surface an error, got {other:?}"),
         }

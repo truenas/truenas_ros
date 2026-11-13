@@ -3,11 +3,9 @@
 //! Its own test binary, and it has to be: the measurement is a process-wide allocation count, so anything else running
 //! in the same process is noise. One test, one server, one client.
 //!
-//! The property is the reason the recv buffer pool exists. A pool that only covered request heads would leave the
-//! upload path minting a buffer per window - at a 128 KiB window that is one allocation per 128 KiB of payload, tens of
-//! thousands of them on a multi-gigabyte PUT - and would be decorative. Measured rather than reasoned about, because
-//! the code path that decides it (`body_placement_threshold` vs the pool buffer's size) is three modules away from the
-//! allocation.
+//! A pool that covered only request heads would leave the upload path minting a buffer per window. Measured rather than
+//! reasoned about, because the code path that decides it (`body_placement_threshold` against the pool buffer's size) is
+//! three modules away from the allocation.
 #![cfg(all(target_os = "linux", feature = "http", feature = "net-server"))]
 
 use std::alloc::{GlobalAlloc, Layout, System};

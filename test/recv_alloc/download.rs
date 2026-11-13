@@ -4,8 +4,8 @@ use super::*;
 
 /// Serve one file body per connection and answer how many large allocations `conns` connections cost.
 ///
-/// Connections, not requests, is the axis that matters: chunk buffers used to be minted per connection and held until
-/// it closed, so the cost scaled with the connection table rather than with how many bodies were actually moving.
+/// Connections, not requests, is the axis that matters, since buffers held per connection would scale the cost with the
+/// connection table rather than with the bodies actually moving.
 #[cfg(feature = "uring-fs")]
 fn download_cost(warmup: usize, measured: usize) -> Option<usize> {
     use std::io::Read as _;
@@ -107,9 +107,8 @@ fn download_cost(warmup: usize, measured: usize) -> Option<usize> {
 
 /// Serving file bodies must not allocate per connection.
 ///
-/// Chunk buffers came off a per-connection pool minted on the first file reply and held until close, so N connections
-/// cost N x FILE_TAIL_BUFS buffers of `fs_body_chunk` - `pool_size` x 2 x a megabyte in a real deployment, held whether
-/// or not anything was streaming. Drawn from the reactor's ring instead, the cost is flat in the connection count.
+/// Chunk buffers are drawn from the reactor's ring, so the cost is flat in the connection count. A per-connection pool
+/// held until close would cost `FILE_TAIL_BUFS` buffers of `fs_body_chunk` for every connection, streaming or not.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn serving_file_bodies_does_not_allocate_per_connection() {

@@ -28,18 +28,15 @@ fn pipelined_put_cost(mib: usize, conns: usize, k: usize) -> Option<(usize, bool
     use truenas_ros::http::HttpDeferred;
     use truenas_ros::uring_fs::{File, Personality, RwFlags};
 
-    // `truenas_ros::tempdir()` (mkdtemp) rather than a parameter-named directory, and the drop guard rather than a
-    // trailing `remove_dir_all`, for two measured reasons: parameter-named fixtures were shared by two `recv_alloc`
-    // binaries running at once - `MEASURING` serializes only within a process - and the pre-clean deleted the other's
-    // objects mid-upload, reading as a lost write at the verify; and a hand-rolled teardown sits behind every assert,
-    // so one failing run left its RAM-backed fixtures on tmpfs. The guard cleans up on the unwind too.
+    // `truenas_ros::tempdir()` rather than a parameter-named directory, since two `recv_alloc` binaries may run at once
+    // and `MEASURING` serializes only within a process. The drop guard rather than a trailing `remove_dir_all`, since
+    // it cleans up on the unwind of a failed assert too.
     let tmp = truenas_ros::tempdir().expect("tempdir");
     let dir = tmp.path().to_owned();
     for i in 0..conns {
         std::fs::write(dir.join(format!("obj{i}")), b"").expect("create");
     }
 
-    // Pre-open one destination per connection through a standalone host.
     let files: Vec<File> = {
         use truenas_ros::sync_fs::{OFlag, OpenHow};
         use truenas_ros::uring_fs::{Anchor, FsConfig, UringFs};
@@ -720,14 +717,11 @@ fn exhaustion_run(retry: Option<Duration>, per_conn: usize, fs_ops: u32, gate: G
                             }
                         }
                     };
-                    // Float EVERY window - no depth cap - and write only its first page: a pipe write of at most
-                    // PIPE_BUF is atomic (all-or-block, pipe(7)), so it can never complete short and trip the
-                    // leased-write EIO rule, while an in-bounds subrange still holds the WHOLE window's lease until the
-                    // pipe makes room. The FIFO blocks the writes, the leases pile up: exactly the pipelined-ingest
-                    // shape that can reach the ring's
-                    // registered bound. A stream write has no position;
-                    // `u64::MAX` is the no-offset sentinel the kernel maps to f_pos (`io_kiocb_update_pos`,
-                    // io_uring/rw.c).
+                    // Float every window with no depth cap, and write only its first page. A pipe write of at most
+                    // PIPE_BUF is atomic (pipe(7)), so it never completes short and trips the leased-write EIO rule,
+                    // while the subrange still holds the whole window's lease until the pipe makes room. A stream write
+                    // has no position, and `u64::MAX` is the no-offset sentinel the kernel maps to f_pos
+                    // (`io_kiocb_update_pos`, io_uring/rw.c).
                     let probe = 4096.min(req.body.len());
                     fs.pwritev2_from(who, file.clone(), &req.body[..probe], u64::MAX, RwFlags::empty(), cont);
                     HttpVerdict::Continue
@@ -777,11 +771,11 @@ fn exhaustion_run(retry: Option<Duration>, per_conn: usize, fs_ops: u32, gate: G
     let drained = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let stop_drain = std::sync::Arc::new(AtomicBool::new(false));
 
-    // The drain: parked until the run PROVABLY exhausts the ring - parks observed when the knob is on, the lent gauge
-    // pinned at the ring's registered bound when it is off, a write refused for the full table in a refusal run - then
-    // empties the FIFO so the writes, and with them the leases, come home. Without the gate a fast drain lets the
-    // leases cycle and the run never enters the phase under test, so its assertions would hold vacuously. The bound is
-    // the pool's demand: the lease depth plus the arriving message, per connection.
+    // The drain waits until the run provably exhausts the ring (parks observed when the knob is on, the lent gauge
+    // pinned at the ring's registered bound when it is off, a write refused for the full table in a refusal run), then
+    // empties the FIFO so the writes and their leases come home. Without the gate a fast drain lets the leases cycle
+    // and the assertions hold vacuously. The bound is the pool's demand, the lease depth plus the arriving message, per
+    // connection.
     let ring_bound = conns as u32 * (EXHAUSTION_LEASE_DEPTH + 1);
     let gate_on_parks = retry.is_some();
     let d_count = std::sync::Arc::clone(&drained);
@@ -868,12 +862,11 @@ fn exhaustion_run(retry: Option<Duration>, per_conn: usize, fs_ops: u32, gate: G
     })
 }
 
-/// Genuine pool exhaustion with `recv_shortage_retry` set parks the reads instead of falling back to owned buffers: the
-/// uploads stall against TCP until the FIFO drains, then complete intact - and the cost stays FLAT when the upload
-/// doubles, because a parked read allocates nothing while it waits and resumes against pool buffers when they come
-/// home. (An absolute zero is not the law here: the run's baseline - the pool growing to its registered bound, the
-/// fixture's own buffers - is a constant, and the feature's claim is the absence of per-window cost on top of it.) The
-/// parks counter is the proof each run actually entered exhaustion rather than dodging it.
+/// Genuine pool exhaustion with `recv_shortage_retry` set parks the reads instead of falling back to owned buffers. The
+/// uploads stall against TCP until the FIFO drains, then complete intact, and the cost stays flat when the upload
+/// doubles, because a parked read allocates nothing while it waits. The run's baseline (the pool growing to its
+/// registered bound, the fixture's own buffers) is a constant, so the claim is no per-window cost on top of it. The
+/// parks counter proves each run entered exhaustion rather than dodging it.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn exhaustion_parks_reads_instead_of_allocating() {
@@ -905,8 +898,8 @@ fn exhaustion_parks_reads_instead_of_allocating() {
     );
 }
 
-/// The configurable control: `None` keeps the old answer - fall back to owned buffers and keep every connection
-/// moving - so the same uploads complete without a single park.
+/// The control. `None` falls back to owned buffers and keeps every connection moving, so the same uploads complete
+/// without a single park.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn exhaustion_without_the_knob_completes_without_parking() {

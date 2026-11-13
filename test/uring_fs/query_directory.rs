@@ -4,11 +4,10 @@ use super::*;
 
 /// The special-file guard leaves nothing behind on the descriptor.
 ///
-/// `O_NONBLOCK` stops the *open* parking on a planted FIFO, but on the file it returns it is not inert:
+/// `O_NONBLOCK` stops the *open* parking on a planted FIFO, but on the file it returns it is not inert.
 /// `io_file_get_flags` reads it into `REQ_F_SUPPORT_NOWAIT`, so `__io_read` takes the `IOCB_NOWAIT` branch and the
-/// transfer runs in the submitting task - the reactor thread - instead of on an io-wq worker. Measured at 22.7 ms
-/// inline for a 32 MiB warm ZFS read against a punt. The kernel strips the flag from files it added it to
-/// (`io_uring/openclose.c:161-162`); so does this.
+/// transfer runs on the reactor thread instead of an io-wq worker. The kernel strips the flag from files it added it to
+/// (`io_uring/openclose.c:161-162`), and so does this.
 #[test]
 fn an_open_leaves_no_guard_nonblock_on_the_descriptor() {
     use truenas_ros::sync_fs::{OFlag, OpenHow};
@@ -41,7 +40,6 @@ fn an_open_leaves_no_guard_nonblock_on_the_descriptor() {
             "a caller's own O_NONBLOCK must not be stripped"
         );
 
-        // And opting out leaves the flags exactly as given.
         let allow = FsOpenHow::from(plain).allow_blocking_special_files(std::time::Duration::from_secs(5));
         let f = h.open(me, &anchor, "f", allow).unwrap();
         assert_eq!(
@@ -96,14 +94,13 @@ fn a_creating_open_does_not_park_on_a_planted_fifo() {
 
 /// An `Allow` open that blocks is bounded by its own deadline, and the worker it parked comes back.
 ///
-/// The shape the mandatory deadline exists for: `O_WRONLY|O_CREAT` on a planted writer-less FIFO is forced onto an
-/// io-wq worker (`io_openat_force_async`) where `fifo_open` sleeps in `wait_for_partner` - with `Allow` and no
-/// deadline, forever, and the pool is one bounded set shared by every blocking fs op on the ring. The deadline is a
-/// guard timer in its own op slot whose expiry stages an `ASYNC_CANCEL` for the open (`core::TAG_OPEN_DEADLINE` -
-/// **not** a kernel `LINK_TIMEOUT`, which arms only after the blocking issue returns and so cannot bound this shape);
-/// the cancellation reaches the sleep as a signal, so the errno is `ECANCELED` or -- where the open was already parked
-/// and returns `-ERESTARTSYS`, folded by `map_res` the way the kernel's own rw path folds it -- `EINTR`. Either way the
-/// worker is freed, which the guarded open afterwards proves: it needs an io-wq worker of its own and completes.
+/// `O_WRONLY|O_CREAT` on a planted writer-less FIFO is forced onto an io-wq worker (`io_openat_force_async`) where
+/// `fifo_open` sleeps in `wait_for_partner`, forever with `Allow` and no deadline. The deadline is a guard timer in its
+/// own op slot whose expiry stages an `ASYNC_CANCEL` for the open (`core::TAG_OPEN_DEADLINE`), **not** a kernel
+/// `LINK_TIMEOUT`, which arms only after the blocking issue returns and so cannot bound this shape. The cancel reaches
+/// the sleep as a signal, so the errno is `ECANCELED`, or `EINTR` where the parked open returns `-ERESTARTSYS` and
+/// `map_res` folds it as the kernel's own rw path does. The guarded open afterwards proves the worker was freed, since
+/// it needs one of its own.
 #[test]
 fn an_allow_open_is_bounded_by_its_deadline() {
     use std::time::{Duration, Instant};
@@ -176,7 +173,6 @@ fn an_allow_open_that_completes_disarms_its_deadline() {
             .expect("a regular file answers long before its deadline");
         drop(f);
 
-        // Both slots come back once the guard's retraction lands.
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match h.open(me, &anchor, "again", allow) {
@@ -271,7 +267,6 @@ fn query_directory_lists_and_enriches() {
 
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let etag = CString::new("user.etag").unwrap();
-        // Tag a.txt; skip the xattr checks if the fs/kernel refuses user xattrs.
         let xattr_ok = {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(me, &anchor, "a.txt", how).unwrap();
@@ -380,7 +375,6 @@ fn query_directory_discovers_non_utf8_name() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
         std::fs::write(dir.join("a.txt"), b"aa").unwrap();
         let anchor = Anchor::open(dir.as_path()).unwrap();
-        // A `user.` name whose trailing bytes are not valid UTF-8.
         let name = CString::new(&b"user.\xff\xfe"[..]).unwrap();
 
         let set_ok = {
@@ -513,21 +507,15 @@ fn query_directory_explicit_large_value() {
 
 /// A listing that lost nothing must not report itself short - and one that did must.
 ///
-/// The listing opens each entry `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` to read its values through, and two ordinary entry
-/// types can never satisfy that: a symbolic link answers `ELOOP` because of `O_NOFOLLOW`, and a socket answers `ENXIO`.
-/// They do not get the same verdict, because the errno is not what decides it - what the object can hold is.
+/// The listing opens each entry `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`, which a symbolic link answers `ELOOP` and a socket
+/// `ENXIO`. What the object can hold decides the verdict, not the errno. A symlink can hold neither an access ACL
+/// (`vfs_get_acl` refuses one outright) nor a `user.*` attribute (`xattr(7)`), so "absent" is true of it, and flagging
+/// it would make `xattrs_incomplete` permanent for an ordinary directory. A socket holds both, as a regular file does,
+/// so its `ENXIO` leaves values the caller asked for unread, and reporting them absent with the flag clear is the
+/// trivial-versus-unread confusion the ACL arm in `next_batch` exists to refuse.
 ///
-/// A symlink can hold neither an access ACL (`vfs_get_acl` refuses one outright) nor a `user.*` attribute (`xattr(7)`),
-/// so "absent" is the true answer about it and flagging one would make `xattrs_incomplete` permanent for a directory
-/// containing nothing unusual - a consumer that re-queries on the flag would re-query for ever.
-///
-/// A socket holds both, exactly as a regular file does, so its `ENXIO` leaves values the caller asked for genuinely
-/// unread. Reported as absent with the flag clear, a permissions layer mirroring ACLs out of a listing records "this
-/// object has no ACL" for one that has one, which is the trivial-versus-unread confusion the ACL arm in `next_batch`
-/// exists to refuse.
-///
-/// The regular file is the live control - it opens, its value is read, and it is reported complete - so a blanket
-/// "everything is flagged" would not pass either.
+/// The regular file is the live control, opened, read and reported complete, so a blanket "everything is flagged" would
+/// not pass either.
 #[test]
 fn query_directory_does_not_flag_an_entry_it_cannot_open() {
     use truenas_ros::uring_fs::{EnrichSpec, QueryOptions, XattrNamespaces, query_directory};
@@ -540,7 +528,6 @@ fn query_directory_does_not_flag_an_entry_it_cannot_open() {
         let anchor = Anchor::open(dir.as_path()).unwrap();
         let name = xattr_name("user.probe");
 
-        // The control's value, set through the crate's own op.
         let set_ok = {
             let how = OpenHow::new().flags(OFlag::O_RDWR);
             let f = h.open(me, &anchor, "plain.bin", how).unwrap();
@@ -574,11 +561,8 @@ fn query_directory_does_not_flag_an_entry_it_cannot_open() {
             "the listing must yield every entry it was given"
         );
         for (n, incomplete, _) in &seen {
-            // Nothing here lost a value. The only name asked for is `user.probe`, and `user.*` lives only on regular
-            // files and directories (`xattr_permission`, `fs/xattr.c`), so for the symlink and the socket - neither of
-            // which can be opened by this listing - "absent" is the true answer rather than an unread one. Flagging
-            // them makes the flag permanent: both answer the same errno on every call, so a consumer that re-queries on
-            // it re-queries for ever.
+            // Nothing here lost a value. `user.*` lives only on regular files and directories (`xattr_permission`,
+            // `fs/xattr.c`), so for the symlink and the socket "absent" is the true answer rather than an unread one.
             assert!(
                 !incomplete,
                 "{n}: flagged incomplete for a `user.*` name it cannot hold"
@@ -596,14 +580,12 @@ fn query_directory_does_not_flag_an_entry_it_cannot_open() {
     });
 }
 
-/// The narrowing is two-sided: an entry that could not be opened is flagged when the request named something its type
+/// The narrowing is two-sided. An entry that could not be opened is flagged when the request named something its type
 /// *does* hold.
 ///
-/// The companion above pins the other half - a socket asked only for `user.*`, which it cannot hold, is not flagged.
-/// Here the same socket, in the same unopenable state, is asked for its access ACL, which it holds and which this
-/// listing did not read. Without both, a fix for either half reads as correct: suppressing the flag for every socket
-/// passes the first test and loses a real value silently, which is the error the `ENXIO` classification was changed to
-/// remove in the first place.
+/// The companion above pins that a socket asked only for `user.*` is not flagged. Here the same socket is asked for its
+/// access ACL, which it holds and which this listing did not read. Without both halves, suppressing the flag for every
+/// socket would pass the first test and lose a real value silently.
 ///
 /// The ACL is put on the socket through the raw syscall because the listing itself cannot open one, and `fsetxattr`
 /// needs a descriptor.
@@ -687,15 +669,14 @@ fn query_directory_flags_a_socket_whose_acl_it_could_not_read() {
 
 /// An ACL the filesystem does not implement is **absent**, not a listing that could not be completed.
 ///
-/// [`QueryOptions::acl_name`] is the caller's to choose, and a permissions layer that asks for `system.nfs4_acl_xdr`
-/// while listing an `acltype=posixacl` dataset gets `EOPNOTSUPP` for every entry - measured: tmpfs and a posixacl ZFS
-/// dataset both answer it. Classed as a failed read that raises `xattrs_incomplete` on every entry of a complete
-/// listing, for a filesystem doing exactly what it says, and a consumer that reads the flag re-queries or refuses for
-/// ever.
+/// [`QueryOptions::acl_name`] is the caller's to choose, and asking for `system.nfs4_acl_xdr` on tmpfs or an
+/// `acltype=posixacl` dataset gets `EOPNOTSUPP` for every entry. Classed as a failed read, it would raise
+/// `xattrs_incomplete` on every entry of a complete listing, and a consumer reading the flag would re-query or refuse
+/// for ever.
 ///
-/// The first half is the live control. A `None` ACL proves nothing on its own - the slot reads `None` when
-/// `EnrichSpec::ACL` was never requested, when the entry could not be opened, and when the read was refused - so the
-/// same listing machinery is first shown fetching an `acl_name` that *is* readable.
+/// The first half is the live control. A `None` ACL proves nothing alone, since the slot reads `None` when
+/// `EnrichSpec::ACL` was never requested, when the entry could not be opened and when the read was refused, so the same
+/// machinery is first shown fetching an `acl_name` that *is* readable.
 #[test]
 fn query_directory_reports_an_unimplemented_acl_as_absent() {
     use truenas_ros::uring_fs::{EnrichSpec, QueryOptions, XattrNamespaces, query_directory};
@@ -883,7 +864,6 @@ fn query_directory_enumeration_obeys_dac() {
     const NOBODY_GID: u32 = 65_534;
 
     with_broker(|h, creds, _me, dir| {
-        // A root-owned 0700 subdir the peer cannot list.
         let secret = dir.join("secret");
         std::fs::create_dir(&secret).unwrap();
         std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -932,7 +912,6 @@ fn query_directory_drop_closes_dir_fd() {
         let mut q = query_directory(&h, me, &anchor, opts).unwrap();
         let fd = q.dir_fd();
         let link = format!("/proc/self/fd/{fd}");
-        // Pull one batch, then drop mid-walk (files remain unread).
         let first = q.next().expect("a batch").unwrap();
         assert!(!first.is_empty());
         let target = std::fs::read_link(&link).expect("dir fd open during walk");

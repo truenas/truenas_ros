@@ -76,14 +76,11 @@ fn connect_tcp(addr: SocketAddrV4) -> io::Result<TcpStream> {
     Ok(s)
 }
 
-/// The shared echo handler behind [`with_http_server`] and
-/// [`with_ktls_http_server`]: `GET /hi` answers `hello`; `GET /big` the
-/// 6 MiB patterned owned body ([`big_body`]); `GET /canned` a `'static` body (served from a borrowed reply segment);
-/// `HEAD /sized` a bare 200 declaring `Content-Length: 4096` with no bytes in hand (the HeadObject shape); `PUT /echo`
-/// answers the request body verbatim, with the surfaced trailer names joined into an `x-trailers` response header (so a
-/// client
-/// can assert exactly which trailers reached [`HttpRequest::trailers`]);
-/// other `HEAD` requests answer like GET (the codec elides the body);
+/// The shared echo handler behind [`with_http_server`] and [`with_ktls_http_server`]. `GET /hi` answers `hello`, `GET
+/// /big` the 6 MiB patterned owned body ([`big_body`]), `GET /canned` a `'static` body served from a borrowed reply
+/// segment, and `HEAD /sized` a bare 200 declaring `Content-Length: 4096` with no bytes in hand. `PUT /echo` answers
+/// the request body verbatim, with the surfaced trailer names joined into an `x-trailers` response header so a client
+/// can assert exactly which trailers reached [`HttpRequest::trailers`]. Other `HEAD` requests answer like GET, and
 /// anything else is a 404.
 fn echo_handler(mut req: HttpRequest<'_>, _: &mut ()) -> HttpResponse {
     match (req.method, req.target) {
@@ -212,12 +209,11 @@ fn assert_eof<R: Read>(s: &mut R) -> io::Result<()> {
 
 // ---- the codec over kernel TLS (kTLS) -----------------------------------
 //
-// The transport S3 ships on. Everything above proves the codec over plain TCP; these prove the same seams over the
-// kernel-TLS transport, whose send path is structurally different: a plain send carries MSG_WAITALL (the kernel flushes
-// the whole gather, one full-length CQE), but the kernel TLS sendmsg rejects that flag (`submit_send`,
-// src/net/core/reactor/io.rs), so a bodied kTLS reply is a multi-iovec SENDMSG that blocks on an io-wq worker until the
-// peer drains it - and only `send_timeout`'s linked timeout interrupts it, surfacing a partial completion the reactor's
-// re-submit path must carry. Scaffolding shared with `test/net_server.rs` -- see `test/support/ktls.rs`.
+// These prove over kernel TLS the seams proved above over plain TCP, and its send path differs. The kernel TLS sendmsg
+// rejects `MSG_WAITALL` (`submit_send`, src/net/core/reactor/io.rs), so a bodied kTLS reply is a multi-iovec SENDMSG
+// that blocks on an io-wq worker until the peer drains it. Only `send_timeout`'s linked timeout interrupts it, and the
+// partial completion it leaves is what the reactor's re-submit path must carry. Scaffolding is shared with
+// `test/net_server.rs` through `test/support/ktls.rs`.
 
 #[path = "support/ktls.rs"]
 mod ktls;

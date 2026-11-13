@@ -128,11 +128,9 @@ fn connect_tcp(addr: SocketAddrV4) -> io::Result<TcpStream> {
     Err(last.expect("at least one attempt"))
 }
 
-/// kTLS installation is best-effort in libssl: a build without `enable-ktls` (Debian/Ubuntu only enable it from 3.2), a
-/// TLS 1.3 RX gap (OpenSSL < 3.2), or a kernel missing the `tls` module all fall back to userspace records. The
-/// handshake then completes, the acceptor's readback refuses the connection, the worker rejects, and the kTLS data-path
-/// tests would fail rather than skip. Probe once with a loopback handshake - the same acceptor, client, and refusal the
-/// tests use - so those tests can skip when this host cannot engage kTLS.
+/// kTLS installation is best-effort in libssl, and a host that cannot engage it falls back to userspace records, which
+/// the acceptor's readback refuses, so the kTLS data-path tests would fail rather than skip. Probe once with a loopback
+/// handshake, using the same acceptor, client and refusal the tests use, so those tests can skip there.
 fn ktls_engages() -> &'static Result<(), truenas_ktls::Error> {
     static PROBE: std::sync::OnceLock<Result<(), truenas_ktls::Error>> = std::sync::OnceLock::new();
     PROBE.get_or_init(|| {

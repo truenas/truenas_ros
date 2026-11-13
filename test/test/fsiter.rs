@@ -15,15 +15,15 @@ fn fs_source(p: &std::path::Path) -> String {
 
 /// A walk that cannot open an entry surfaces the error and then stops.
 ///
-/// The iterator prunes exactly what has nothing left to list - the same line `query_tree`'s `is_subtree_skip`
-/// draws - and everything else has to reach the caller. `copytree` is built directly on this (`let entry = res?`),
-/// so an error swallowed here is a partial tree copied as if it were whole: data loss that reads as success.
+/// The iterator prunes exactly what has nothing left to list, the line `query_tree`'s `is_subtree_skip` draws, and
+/// everything else has to reach the caller. `copytree` is built on this (`let entry = res?`), so a swallowed error
+/// would copy a partial tree as if it were whole.
 ///
-/// The `fatal` latch is the second half. Once a walk has failed its directory stack describes a position it never
-/// reached, so continuing to yield from it would produce a listing that is short *and* has no error in it.
+/// The `fatal` latch is the second half. Once a walk has failed, its directory stack describes a position it never
+/// reached, so yielding more would give a listing that is short *and* has no error in it.
 ///
-/// Provoked with `ENOTDIR` (a regular file where a directory open is demanded) rather than a permission denial,
-/// which running as root cannot stage.
+/// Provoked with `ENOTDIR` (a regular file where a directory open is demanded) rather than a permission denial, which
+/// running as root cannot stage.
 #[test]
 fn a_walk_that_cannot_open_an_entry_reports_it_and_stops() {
     let dir = truenas_ros::tempdir().unwrap();

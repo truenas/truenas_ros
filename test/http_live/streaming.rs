@@ -60,12 +60,9 @@ fn with_streaming_server<T: Send + 'static>(
 /// A known-length streamed PUT whose exhausting window is resolved with `HttpDeferred::redrive` must not eat the next
 /// pipelined request.
 ///
-/// `Phase::StreamDone` is the marker for "the length is spent; the End stage is owed and there is no wire left to frame
-/// it from". The resume route dispatches End off the park for exactly that reason. A redrive that restores the phase
-/// instead leaves the connection in `StreamDone` with bytes buffered, and the framer's degrade arm then declares those
-/// bytes - the next request's head - as this message's header, which the End dispatch parses as a trailer section. The
-/// PUT is answered while the request behind it is consumed: a desync, and the reply the peer gets next belongs to a
-/// request it never had answered.
+/// `Phase::StreamDone` marks that the length is spent and End is owed with no wire left to frame it from, so End is
+/// dispatched off the park. A redrive that restored the phase instead would leave `StreamDone` with the next request's
+/// head buffered, and the framer would hand it to End as this message's trailer section, a desync.
 #[test]
 fn a_redriven_known_length_stream_does_not_eat_the_next_request() {
     use truenas_ros::http::{HttpDeferred, HttpVerdict, Stage, protocol_streaming};
@@ -73,7 +70,6 @@ fn a_redriven_known_length_stream_does_not_eat_the_next_request() {
     const PUT_LEN: usize = 200 * 1024;
 
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    // One deferral, on the window that exhausts the declared length.
     let proto = protocol_streaming(
         HttpConfig::default(),
         1 << 20,
@@ -144,10 +140,9 @@ fn a_redriven_known_length_stream_does_not_eat_the_next_request() {
 
 /// A streamed terminal chunk carries its trailers to `Stage::End`.
 ///
-/// The trailer section is the whole point of the streaming path for an S3 front: `X-Amz-Trailer` promises a checksum
-/// that only arrives after the last byte of payload, and a handler that never sees it cannot verify what it just wrote.
-/// The buffered path is pinned by `chunked_put_and_trailers`; this is the streamed twin, and it asserts on the trailer
-/// *reaching the handler* rather than on any framing detail.
+/// A trailer can carry a checksum that only arrives after the last byte of payload, and a handler that never sees it
+/// cannot verify what it just wrote. The buffered path is pinned by `chunked_put_and_trailers`, and this streamed twin
+/// asserts on the trailer reaching the handler rather than on any framing detail.
 #[test]
 fn a_streamed_terminal_chunk_carries_its_trailers() {
     use truenas_ros::http::{HttpVerdict, Stage, protocol_streaming};
@@ -249,7 +244,6 @@ fn a_streamed_body_arrives_in_windows_and_survives_them() {
 fn one_oversized_chunk_is_delivered_in_several_windows() {
     let Some(()) = with_streaming_server(4 << 20, |v4| {
         let mut s = connect_tcp(v4)?;
-        // One chunk, three windows' worth.
         let payload = vec![b'z'; 3 * 128 * 1024];
         let mut wire = b"PUT /echo HTTP/1.1\r\nHost: t\r\n\
                          Transfer-Encoding: chunked\r\n\r\n"
@@ -297,10 +291,9 @@ fn a_streamed_body_over_the_cap_is_refused_mid_stream() {
     };
 }
 
-/// A handler that refuses partway through a body. The peer is still sending, and nothing will read the rest, so the
-/// reply has to be final:
-/// a keep-alive answer would leave the remaining chunks to be framed as the next request. The client must see the
-/// status and then EOF.
+/// A handler that refuses partway through a body. The peer is still sending and nothing will read the rest, so the
+/// reply has to be final, since a keep-alive answer would leave the remaining chunks to be framed as the next request.
+/// The client must see the status and then EOF.
 #[test]
 fn a_handler_refusing_mid_body_ends_the_connection() {
     use truenas_ros::http::{HttpVerdict, Stage, protocol_streaming};
@@ -371,10 +364,9 @@ fn a_handler_refusing_mid_body_ends_the_connection() {
     join.join().expect("client thread").expect("client io");
 }
 
-/// The redrive twin of the resume test above: a deferred `Open` resolved by `HttpDeferred::redrive` - the handler
-/// re-runs and answers `Continue` - owes the withheld interim exactly as a `resume()` does.
-/// The two routes emit independently, so each carries its own pin;
-/// without this one an expecting client holds its body back for its own timeout.
+/// The redrive twin of the resume test above. A deferred `Open` resolved by `HttpDeferred::redrive`, where the handler
+/// re-runs and answers `Continue`, owes the withheld interim exactly as a `resume()` does. The two routes emit
+/// independently, so each carries its own pin.
 #[test]
 fn a_redriven_stream_open_still_sends_the_interim() {
     use truenas_ros::http::{HttpVerdict, Stage, protocol_streaming};
@@ -473,8 +465,7 @@ fn a_deferred_stream_open_still_sends_the_interim() {
         return; // io_uring unavailable
     };
 
-    /// A streaming server whose `Open` handler defers off-thread and resumes a moment later - the review's reproducer
-    /// shape.
+    /// A streaming server whose `Open` handler defers off-thread and resumes a moment later.
     fn with_streaming_deferring_server<T: Send + 'static>(
         client: impl FnOnce(SocketAddrV4) -> io::Result<T> + Send + 'static,
     ) -> Option<T> {
@@ -525,13 +516,13 @@ fn a_deferred_stream_open_still_sends_the_interim() {
     }
 }
 
-/// A peer pacing an exact read below `want / request_timeout` used to die mid-transfer: the linked request clock
-/// cancelled the `MSG_WAITALL` recv with partial progress and the short-positive completion always closed. The
-/// clock-cancelled continuation (`resubmit_exact_recv`) resumes the read instead, so the clock bounds
-/// progress-per-period rather than imposing a throughput floor on the whole window.
+/// A peer pacing an exact read below `want / request_timeout` must not die mid-transfer. The linked request clock
+/// cancels the `MSG_WAITALL` recv with partial progress, and the clock-cancelled continuation (`resubmit_exact_recv`)
+/// resumes the read, so the clock bounds progress per period rather than imposing a throughput floor on the whole
+/// window.
 ///
-/// 128 KiB `Content-Length` body written 16 KiB per ~150 ms against a 500 ms request clock: the transfer spans ~2 clock
-/// periods, every period sees progress, and the upload must complete and echo back intact.
+/// A 128 KiB `Content-Length` body written 16 KiB per ~150 ms against a 500 ms request clock spans about two periods,
+/// every period sees progress, and the upload must complete and echo back intact.
 #[test]
 fn a_put_pacing_a_window_below_the_clock_floor_completes() {
     use truenas_ros::net::server::ServerConfig;
@@ -576,10 +567,9 @@ fn a_put_pacing_a_window_below_the_clock_floor_completes() {
     };
 }
 
-/// The same pace through a STREAMED chunked upload - the default-client shape (botocore frames 128 KiB HTTP chunks, and
-/// a streaming handler consumes them as stream windows). A plain accumulating handler dodges the floor by accident
-/// (chunked bodies arrive through non-exact `More` scans, each arrival re-arming a fresh clock); a streamed window is
-/// one exact `MSG_WAITALL` read under one clock, so this is where the chunked framing hit it.
+/// The same pace through a streamed chunked upload, the default-client shape where 128 KiB HTTP chunks become stream
+/// windows. A plain accumulating handler dodges the floor, since chunked bodies arrive through non-exact `More` scans
+/// that each re-arm a fresh clock, but a streamed window is one exact `MSG_WAITALL` read under one clock.
 #[test]
 fn a_streamed_chunked_put_pacing_below_the_clock_floor_completes() {
     use std::sync::{Arc, Mutex};
@@ -703,10 +693,10 @@ fn a_stalled_transfer_still_dies_by_the_request_clock() {
 /// chunk boundary (and after the head has gone out as `Stage::Open`) the accumulate buffer is empty, which is exactly
 /// what "parked for the next request" looks like. `Framing::MoreInMessage` is the framer saying otherwise.
 ///
-/// The negative control is the configuration: `idle_timeout` is deliberately unset here, so if the read is
-/// misclassified as idle it carries **no clock at all** and the peer holds its pool slot - taken at accept, before any
-/// authentication - forever. Reverting `known_step`/`stream_step`/ `scan_step` to plain `More` hangs this test rather
-/// than failing it fast, which is the shape of the denial it guards.
+/// `idle_timeout` is deliberately unset, so a read misclassified as idle carries **no clock at all** and the peer holds
+/// its pool slot, taken at accept before any authentication, forever. Reverting `known_step`, `stream_step` or
+/// `scan_step` to plain `More` therefore hangs this test rather than failing it fast, which is the shape of the denial
+/// it guards.
 #[test]
 fn a_stalled_streamed_upload_is_reaped_mid_body() {
     use std::sync::{Arc, Mutex};

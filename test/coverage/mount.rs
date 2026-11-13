@@ -107,14 +107,12 @@ fn recursive_umount_rejects_a_symlinked_mountpoint() {
 
 #[test]
 fn privileged_wrappers_are_callable() {
-    // Each wrapper builds its argument struct and issues its syscall;
-    // what is under test is that path, not the kernel's answer.
+    // Each wrapper builds its argument struct and issues its syscall, and that path is under test, not the kernel's
+    // answer.
     //
-    // **Every target is a name that cannot exist.** This test runs as root in the QEMU lane, where the earlier form
-    // asked the kernel to remount `/` read-only and to `move_mount` onto `/tmp` - stopped only incidentally, by the
-    // `MOUNT_ATTR_IDMAP` on a directory fd and by the source not being a mount point. Neither is a guarantee, and
-    // an edit that removed the idmap would take the runner's root filesystem read-only. Against an absent path the
-    // syscall can only fail, so the outcome is assertable too.
+    // **Every target is a name that cannot exist.** This test runs as root in the QEMU lane, so a real target such as
+    // `/` could be remounted read-only by an edit that dropped the idmap. Against an absent path the syscall can only
+    // fail, so the outcome is assertable too.
     let dir = truenas_ros::tempdir().unwrap();
     let gone = dir.path().join("no-such-mount");
     assert!(open_tree(AT_FDCWD, &gone, OpenTreeFlags::OPEN_TREE_CLONE).is_err());
@@ -132,15 +130,11 @@ fn privileged_wrappers_are_callable() {
 #[test]
 fn fsconfig_variants_reach_the_syscall() {
     use truenas_ros::errno::Errno;
-    // fsopen needs CAP_SYS_ADMIN; drive fsconfig against a plain fd instead -- every match arm is exercised and
-    // each one must reach the syscall, which refuses a descriptor that is not a filesystem context with `EINVAL`
-    // (measured on 6.18.42-production+truenas: all seven commands answer EINVAL against an `O_DIRECTORY` fd on
-    // `/`).
+    // `fsopen` needs `CAP_SYS_ADMIN`, so drive `fsconfig` against a plain fd instead. Each match arm must reach the
+    // syscall, which refuses a descriptor that is not a filesystem context with `EINVAL`.
     //
-    // The errno is the assertion and not a decoration. `Create` is the only variant `test/test.rs`'s end-to-end
-    // `fsopen_fsconfig_fsmount_detached_tmpfs` drives, and that test is root-only; discarding these results left
-    // the other six arms with no assertion anywhere in the tree, so each could stop issuing its syscall and answer
-    // `Ok(())` with every target green. A short-circuit answers `Ok`, which is what this refuses.
+    // The errno is the assertion. Only `Create` is driven anywhere else, by a root-only test, so a short-circuit that
+    // answers `Ok` without the syscall would pass every target but this one.
     let f = std::fs::File::open("/").unwrap();
     let fd = f.as_fd();
     for (what, got) in [

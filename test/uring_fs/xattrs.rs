@@ -127,11 +127,9 @@ fn fs_handle_fgetxattr_as_root_reads_trusted() {
         }
 
         let peer = creds.register(&AsUser::new(NOBODY_UID, NOBODY_GID)).unwrap();
-        // Attributed to the unprivileged peer, the read is denied.
         let (peer_res, _) = h.fgetxattr(peer, &f, name.clone(), vec![0u8; 64]);
         assert!(peer_res.is_err(), "peer cannot read trusted.* as itself");
 
-        // As root, the same fd yields the value regardless of any `who`.
         let (root_res, buf) = h.fgetxattr_as_root(&f, name.clone(), vec![0u8; 64]);
         let n = root_res.expect("as-root read succeeds");
         assert_eq!(&buf[..n], b"classified");
@@ -349,7 +347,6 @@ fn query_pool_lists_directory() {
             same_device_only: false,
             ..Default::default()
         };
-        // Non-blocking enqueue; pull batches from the handle.
         let handle = pool.query(me, anchor, opts);
         let mut names: BTreeSet<String> = BTreeSet::new();
         while let Some(batch) = handle.next() {
@@ -468,10 +465,9 @@ fn pool_copy_file_range_ranged_offload() {
 
 /// The `EXDEV` byte-copy fallback, entered where it actually runs.
 ///
-/// `copy_file_range(2)` answers `EXDEV` when the endpoints are on different filesystems, and `copy_range_rw` is what
-/// carries the bytes then. Every other copy test puts both endpoints in one tempdir, where that answer never comes:
-/// with a `panic!` at the top of `copy_range_rw` the whole privileged lane stays green and the probe never fires. Here
-/// one endpoint is on the tempdir's filesystem and the other on a ZFS dataset.
+/// `copy_file_range(2)` answers `EXDEV` when the endpoints are on different filesystems, and `copy_range_rw` carries
+/// the bytes then. Every other copy test puts both endpoints in one tempdir, where that answer never comes, so here one
+/// endpoint is on the tempdir's filesystem and the other on a ZFS dataset.
 #[test]
 fn pool_copy_file_range_across_filesystems_takes_the_byte_copy() {
     use truenas_ros::uring_fs::QueryPool;
@@ -488,7 +484,6 @@ fn pool_copy_file_range_across_filesystems_takes_the_byte_copy() {
         let content = content.clone();
         move || {
             with_fs(test_cfg(), |h, me, dir, _stop| {
-                // src on the tempdir's filesystem, dst on the dataset.
                 std::fs::write(dir.join("src"), &content).unwrap();
                 std::fs::write(scratch.join("dst"), b"").unwrap();
                 let a_src = Anchor::open(dir.as_path()).unwrap();
@@ -517,11 +512,8 @@ fn pool_copy_file_range_across_filesystems_takes_the_byte_copy() {
     }
 }
 
-/// The copy where the commit that added it actually runs: a ZFS dataset.
-///
-/// `test/support/zfs_dir.rs` states the reason - "`copy_file_range` is the clearest case - tmpfs serves it as a plain
-/// copy while ZFS serves it as a block clone (`zfs_clone_range`), which is the code that actually ships". Both tests
-/// the commit added run in `crate::tempdir()`, so they exercise the plain copy and assert nothing about the clone.
+/// The copy on a ZFS dataset, which serves it as a block clone (`zfs_clone_range`) where tmpfs serves a plain copy. The
+/// other copy tests run in `crate::tempdir()`, so they assert nothing about the clone.
 #[test]
 fn pool_copy_file_range_on_a_dataset() {
     use truenas_ros::uring_fs::QueryPool;

@@ -37,10 +37,9 @@ fn skip(why: &str) {
 
 /// Resolve an ACL-typed dataset directory, or `None` to skip the test.
 ///
-/// Checked with `statfs`, not `is_dir`: `zfs create -o mountpoint=/POSIXACL` leaves that directory behind on the root
-/// filesystem, so a dataset that stopped being mounted - one of the two degradations `qemu-4-test.sh`'s
-/// `TRUENAS_ROS_REQUIRE_ZFS` exists to catch - hands an `is_dir` gate a plain ext4/tmpfs directory whose POSIX ACLs
-/// answer perfectly well. `test/support/zfs_dir.rs` states the same reason.
+/// Checked with `statfs`, not `is_dir`, since `zfs create -o mountpoint=/POSIXACL` leaves that directory behind on the
+/// root filesystem, and a dataset that stopped being mounted would hand an `is_dir` gate a plain directory whose POSIX
+/// ACLs answer perfectly well.
 fn dataset(env_var: &str, fallback: &str) -> Option<PathBuf> {
     let dir = std::env::var_os(env_var)
         .map(PathBuf::from)
@@ -86,7 +85,6 @@ fn nfs4_codec_and_named_user_roundtrip() {
     let raw0 = fgetxattr(f.as_fd(), "system.nfs4_acl_xdr").unwrap();
     assert_eq!(acl.to_xattr().unwrap(), raw0, "codec must round-trip live ZFS bytes");
 
-    // Append a named-user ALLOW to ZFS's own (valid) entries and write it back.
     let uid = 8_675_309;
     let mut aces = acl.aces.clone();
     aces.push(Nfs4Ace::new(
@@ -99,8 +97,6 @@ fn nfs4_codec_and_named_user_roundtrip() {
     let updated = Acl::Nfs4(Nfs4Acl::from_aces(aces, Nfs4AclFlag::empty()));
     fsetacl(f.as_fd(), Some(&updated)).expect("fsetacl nfs4");
 
-    // Read back: no longer trivial, the named user is present, and our encoder byte-exactly reproduces what the kernel
-    // now stores.
     let back = match fgetacl(f.as_fd()) {
         Ok(Acl::Nfs4(a)) => a,
         other => panic!("expected nfs4, got {other:?}"),
@@ -114,7 +110,6 @@ fn nfs4_codec_and_named_user_roundtrip() {
     let raw = fgetxattr(f.as_fd(), "system.nfs4_acl_xdr").unwrap();
     assert_eq!(back.to_xattr().unwrap(), raw, "encoder must match kernel bytes");
 
-    // Removing the ACL restores triviality.
     fsetacl(f.as_fd(), None).expect("fsetacl None");
     match fgetacl(f.as_fd()) {
         Ok(Acl::Nfs4(a)) => assert!(a.trivial()),
@@ -130,10 +125,8 @@ fn posix_named_user_roundtrip_on_zfs() {
     };
     let (path, f) = scratch_file(&dir, "posix");
 
-    // Fresh file: a trivial ACL synthesised from the mode bits.
     let acl = match fgetacl(f.as_fd()) {
         Ok(Acl::Posix(a)) => a,
-        // Not a POSIX-ACL filesystem here - skip.
         _ => {
             let _ = std::fs::remove_file(&path);
             return skip("the POSIX dataset path is not a POSIX-ACL filesystem");
@@ -188,7 +181,6 @@ fn posix_default_acl_on_directory() {
             return skip("the POSIX dataset path is not a POSIX-ACL filesystem");
         }
     };
-    // Access entries plus a default (inheritable) copy of them.
     let mut aces = base.access.clone();
     for a in base.access.clone() {
         aces.push(PosixAce { default: true, ..a });
@@ -224,9 +216,7 @@ fn zfs_snapshot_is_detected() {
     let _ = std::fs::read_dir(&snap_path).map(|d| d.count());
     let sm = statmount_path(&snap_path);
     let _ = zfs(&["destroy", "-r", &snap]);
-    // Both degradations are announced. Held inside two silent `if`s, this test returned green whether it had asserted
-    // anything or not, so `REQUIRE_ZFS` could not see the fixture go missing under it - which is the whole job of the
-    // gate.
+    // Both degradations go through `skip`, so `REQUIRE_ZFS` sees the fixture go missing.
     let Ok(sm) = sm else {
         return skip("statmount of the snapshot mount failed");
     };
@@ -269,13 +259,10 @@ fn open_for_write_as_nobody(path: &Path) -> Result<(), i32> {
         // SAFETY: raw credential syscalls in the single-threaded child. setresuid to a non-zero uid clears the
         // effective capability set, so the child cannot ride CAP_DAC_OVERRIDE through the check.
         unsafe {
-            // Fail CLOSED, the discipline `register_as` states: each of these can fail after its permission check
-            // (`set_user` -> EAGAIN on the target uid's RLIMIT_NPROC, `prepare_creds` ->
-            // ENOMEM, an LSM veto in `security_task_fix_setuid`;
-            // `__sys_setresuid`, kernel/sys.c), and a child that stayed root opens every file below and exits 0. The
-            // posix-half assertion downstream expects a *successful* open, so an unchecked drop would pin nothing there
-            // for good; the nfs4 half would redden and read as the platform growing enforcement, which is what its
-            // rustdoc tells the reader to relax the READONLY docs over. 255 is outside errno.
+            // Fail closed. Each of these can fail after its permission check (`set_user` -> EAGAIN on the target uid's
+            // RLIMIT_NPROC, `prepare_creds` -> ENOMEM, an LSM veto in `security_task_fix_setuid`, `__sys_setresuid` in
+            // kernel/sys.c), and a child that stayed root would open every file below, pinning nothing in the posix
+            // half and reading as new enforcement in the nfs4 half. 255 is outside errno.
             let dropped = libc::syscall(libc::SYS_setgroups, 0usize, std::ptr::null::<u32>()) == 0
                 && libc::syscall(libc::SYS_setresgid, 65534, 65534, 65534) == 0
                 && libc::syscall(libc::SYS_setresuid, 65534, 65534, 65534) == 0
@@ -346,15 +333,12 @@ fn a_readonly_flag_is_fchmod_shaped_for_the_descriptor_holding_it() {
         .expect("a held descriptor must keep writing once READONLY lands");
     f.sync_all().expect("fsync through the held descriptor");
 
-    // A fresh *read* open is untouched; reads were never in question.
     let _ro = std::fs::File::open(&path).expect("fresh O_RDONLY open");
 
-    // A shared writable mapping is refused at creation - `zfs_map` checks the flag at the vnop with no privilege
-    // fallback and no acltype gate, so this holds even though the suite runs as root - and it is asked through `f`, the
-    // descriptor the flag grandfathered for write(2):
-    // the grandfathering covers writes, not new mappings. (Through a read-only descriptor the VFS answers EACCES before
-    // ZFS is ever consulted - a writable shared mapping needs a writable fd - so only this fd reaches the vnop verdict
-    // at all.)
+    // A shared writable mapping is refused at creation, since `zfs_map` checks the flag at the vnop with no privilege
+    // fallback and no acltype gate, so this holds as root. It is asked through `f`, the descriptor the flag
+    // grandfathered for write(2), because through a read-only descriptor the VFS answers EACCES before ZFS is
+    // consulted.
     // SAFETY: mmap with a length inside the file; the result is checked before use and never dereferenced on failure.
     let shared = unsafe {
         libc::mmap(
@@ -407,7 +391,7 @@ fn a_readonly_flag_is_fchmod_shaped_for_the_descriptor_holding_it() {
         );
     }
 
-    // Deletion needs no clearing: READONLY guards data, not names. This is why DeleteObject carries no unlatch step.
+    // Deletion needs no clearing, since READONLY guards data, not names.
     std::fs::remove_file(&path).expect("unlink of a READONLY file needs no clear step");
 }
 
@@ -490,11 +474,10 @@ fn a_readonly_inode_gains_and_loses_names_freely() {
 
 /// Where the flag actually denies, and where it documentedly does not.
 ///
-/// An ordinary open-for-write is asked of ZFS at all only on an
-/// `acltype=nfsv4` dataset whose file carries a **non-trivial** ACL;
-/// everything else is answered from the mode alone. That scope is the platform contract a consumer relying on the flag
-/// has to state ("NFSv4 required"), and this test is the contract in executable form: the nfsv4 half proves the deny
-/// where it is promised, and the posix half proves the gap where it is documented.
+/// An ordinary open-for-write is asked of ZFS at all only on an `acltype=nfsv4` dataset whose file carries a
+/// **non-trivial** ACL, and everything else is answered from the mode alone. That scope is the platform contract a
+/// consumer relying on the flag has to state ("NFSv4 required"), and this test is the contract in executable form. The
+/// nfsv4 half proves the deny where it is promised, and the posix half proves the gap where it is documented.
 ///
 /// **A red on either half is the platform moving, not this test rotting.** If the posix half's open starts failing, or
 /// the root open below starts failing, the fork has grown enforcement - update `ZfsAttr::READONLY`'s rustdoc to match,
@@ -654,27 +637,21 @@ fn immutable_locks_the_version_row_until_cleared() {
     std::fs::remove_file(&path).expect("unlink after the clear, with READONLY still set");
 }
 
-/// The creation hold is released on an `acltype=nfsv4` destination whose own ACL is trivial - and the
-/// `getxattr`/`listxattr` disagreement that made it not be.
+/// The creation hold is released on an `acltype=nfsv4` destination whose own ACL is trivial.
 ///
 /// `release_creation_hold` declines when the destination already carries an access ACL, because there the ACL *is* the
-/// permissions and a `chmod` would rewrite it. Asked as "does the xattr exist", that is answered "yes" by **every**
-/// object on an nfsv4 dataset: `__zpl_xattr_nfs41acl_get` (`module/os/linux/zfs/zpl_xattr.c`) synthesises the blob and
-/// refuses only a non-NFSv4 dataset and an empty ACL, and a trivial ACL is still three ACEs. So the hold was never
-/// released anywhere on this row, which is the row a share migration lands on.
+/// permissions and a `chmod` would rewrite it. "Does the xattr exist" is answered yes by **every** object on an nfsv4
+/// dataset, since `__zpl_xattr_nfs41acl_get` (`module/os/linux/zfs/zpl_xattr.c`) synthesises the blob and refuses only
+/// a non-NFSv4 dataset and an empty ACL, and a trivial ACL is still three ACEs. The answer is in the blob instead,
+/// whose first big-endian word is `vsa_aclflags`, into which `zfs_getacl` ORs `ACL_IS_TRIVIAL` (`zfs_acl.c:2063`). That
+/// is a `getxattr`, which io_uring has, where `listxattr` has no io_uring op at all.
 ///
-/// The answer is in the blob: its first big-endian word is `vsa_aclflags`, into which `zfs_getacl` ORs `ACL_IS_TRIVIAL`
-/// (`zfs_acl.c:2063`). That is what this pins, because it is what the fix reads - and it is a `getxattr`, which
-/// io_uring has, where `listxattr` (which would also answer) has no io_uring op at all.
+/// The failing direction is a POSIX-ACL source onto an nfsv4 destination. `copy_permissions` copies
+/// `system.posix_acl_access`, the destination answers `EOPNOTSUPP` for every object, and `raise_error: false` swallows
+/// it, so the hold release is all that stands between the caller and an owner-only tree.
 ///
-/// The failing direction is a POSIX-ACL source onto an nfsv4 destination: `copy_permissions` copies
-/// `system.posix_acl_access`, the destination answers `EOPNOTSUPP` for every object, and `raise_error: false` - the
-/// mode `copytree` documents for salvaging a tree - swallows it. The hold release is then the only thing between the
-/// caller and an owner-only tree.
-///
-/// The first half pins the platform behaviour, so a ZFS that stops publishing the flag reddens here rather than
-/// silently making the second half vacuous. `the_nfs4_trivial_bit_is_read_from_the_blob` pins the decoder itself, and
-/// runs everywhere.
+/// The first half pins the platform behaviour, so a ZFS that stops publishing the flag reddens here rather than making
+/// the second half vacuous. `the_nfs4_trivial_bit_is_read_from_the_blob` pins the decoder itself, and runs everywhere.
 #[cfg(feature = "shutil")]
 #[test]
 fn a_trivial_nfsv4_destination_releases_the_creation_hold() {
@@ -896,7 +873,6 @@ fn statx_zfs_flags_are_the_ioctls_and_the_acls() {
     assert!(!trivial(&f));
     assert_eq!(flags_of().nfs4_acl_is_trivial(), Some(false));
 
-    // Removing the ACL leaves the trivial one the mode says.
     fsetacl(f.as_fd(), None).expect("fsetacl None");
     assert!(trivial(&f));
     assert_eq!(flags_of().nfs4_acl_is_trivial(), Some(true));

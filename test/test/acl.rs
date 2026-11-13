@@ -109,17 +109,12 @@ fn nfs4_from_aces_sorts_into_canonical_buckets() {
 
 /// A scratch file on `dir`, or `None` when the dataset is not there.
 ///
-/// These two tests used to open a `raw_bytes` file at the dataset root that nothing in the tree ever created,
-/// behind an ungated `Err(_) => return`. So both returned before their assertion in every lane - including the QEMU
-/// one, where `qemu-4-test.sh` arms `TRUENAS_ROS_REQUIRE_ZFS=1` naming these very checks and promising that a skip
-/// "must turn CI red rather than pass green having tested nothing". Create the fixture instead of hoping for it,
-/// and route the absent-dataset exit through `require_zfs` so the promise is true.
+/// The fixture is created here rather than expected at the dataset root, and every early exit goes through
+/// `require_zfs`, so `TRUENAS_ROS_REQUIRE_ZFS` turns a skip red.
 fn live_acl_file(env_var: &str, fallback: &str) -> Option<(std::path::PathBuf, std::fs::File)> {
-    // Resolved the way every other ZFS fixture in the tree resolves: the provisioning script's env var first, then
-    // the convention path, and gated on `statfs` rather than on the directory existing. `is_dir` was the gate
-    // `test/zfs.rs` was moved off in the same commit that wrote this one - it says yes to a leftover mountpoint on
-    // the root filesystem and to tmpfs, which serves POSIX ACLs perfectly well, so the POSIX half would pass green
-    // having tested the filesystem this suite exists to avoid.
+    // Resolved as every other ZFS fixture is, the provisioning script's env var first and then the convention path, and
+    // gated on `statfs` rather than on the directory existing. An `is_dir` gate says yes to a leftover mountpoint and
+    // to tmpfs, which serves POSIX ACLs, so the POSIX half would pass having tested the wrong filesystem.
     let dir = std::env::var_os(env_var)
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(fallback));
@@ -180,9 +175,8 @@ fn fgetacl_live_posix_roundtrips() {
                 id: 4_200,
                 default: false,
             });
-            // Only when there is not one already: a file inheriting a default ACL from its parent arrives with a
-            // MASK, and a second one is not a valid POSIX1E ACL - `fsetacl` refuses it and the `expect` below
-            // panics. CI never saw it because `setup-test-zfs.sh` sets no default ACL.
+            // Only when there is not one already. A file inheriting a default ACL from its parent arrives with a MASK,
+            // and a second one is not a valid POSIX1E ACL, so `fsetacl` would refuse it.
             if !access.iter().any(|a| a.tag == PosixTag::Mask) {
                 access.push(PosixAce {
                     tag: PosixTag::Mask,

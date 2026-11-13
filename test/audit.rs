@@ -19,8 +19,8 @@ use truenas_ros::errno::Errno;
 
 /// Whether a missing audit subsystem should fail rather than skip.
 fn audit_required() -> bool {
-    // Presence, not the value: every other REQUIRE gate in the tree is `var_os(..).is_none()`, so `=yes` or `=true`
-    // arms all forty of them and used to leave this one - and the five tests behind it - silently skipping to green.
+    // Any value arms the gate, as for every other REQUIRE gate in the tree, so `=yes` cannot leave these tests
+    // skipping.
     std::env::var_os("TRUENAS_ROS_REQUIRE_AUDIT").is_some()
 }
 

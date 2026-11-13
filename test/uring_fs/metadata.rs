@@ -1,6 +1,6 @@
 use super::*;
 
-// --- M2: metadata ----------------------------------------------------------
+// --- metadata --------------------------------------------------------------
 
 #[test]
 fn open_metadata_close_workflow() {
@@ -13,7 +13,6 @@ fn open_metadata_close_workflow() {
         let (n, _b) = pwrite1(&h, me, &f, vec![b'x'; 4096], 0);
         assert_eq!(n.unwrap(), 4096);
 
-        // Extended attributes, by fd. (This is the DOS-attributes shape the whole reactor exists for.)
         let name = xattr_name("user.dosattrib");
         let (res, _v) = h.fsetxattr(me, &f, name.clone(), b"\x01\x02\x03".to_vec(), 0);
         res.expect("fsetxattr");
@@ -25,20 +24,16 @@ fn open_metadata_close_workflow() {
         let (n, _v) = h.fgetxattr(me, &f, name.clone(), Vec::new());
         assert_eq!(n.expect("size query"), 3);
 
-        // A too-small buffer is ERANGE, not a silent truncation.
         let (res, _v) = h.fgetxattr(me, &f, name.clone(), vec![0u8; 2]);
         assert!(matches!(res, Err(Error::Errno(Errno::ERANGE))));
 
-        // XATTR_CREATE on an existing attribute must fail EEXIST.
         let (res, _v) = h.fsetxattr(me, &f, name.clone(), b"zz".to_vec(), libc::XATTR_CREATE);
         assert!(matches!(res, Err(Error::Errno(Errno::EEXIST))));
 
-        // Oversized is E2BIG on this path too - the sync twin's contract (`sync_fs::xattr::fsetxattr`,
-        // `test/coverage.rs oversize_short_circuits_to_e2big`).
-        //
-        // This is a contract test, not a control: measured on this filesystem the kernel answers E2BIG here anyway, so
-        // removing the crate's bound does not change the result. What the bound catches is the `as u32` truncation,
-        // which needs a value of 1 << 32 to reach and is not testable at that size.
+        // Oversized is E2BIG on this path too, the sync twin's contract (`sync_fs::xattr::fsetxattr`, `test/coverage.rs
+        // oversize_short_circuits_to_e2big`). This is a contract test, not a control, since the kernel answers E2BIG
+        // here anyway. What the crate's bound catches is the `as u32` truncation, which needs a value of 1 << 32 to
+        // reach.
         use truenas_ros::sync_fs::xattr::XATTR_SIZE_MAX;
         let big = vec![0u8; XATTR_SIZE_MAX + 1];
         let (res, back) = h.fsetxattr(me, &f, name.clone(), big, 0);
@@ -47,7 +42,6 @@ fn open_metadata_close_workflow() {
             "an oversized value must be refused, got {res:?}"
         );
         assert_eq!(back.len(), XATTR_SIZE_MAX + 1, "the buffer comes back");
-        // ...and the refusal left the stored value alone.
         let (n, val) = h.fgetxattr(me, &f, name.clone(), vec![0u8; 64]);
         assert_eq!(n.expect("fgetxattr"), 3);
         assert_eq!(&val[..3], b"\x01\x02\x03");
@@ -59,7 +53,6 @@ fn open_metadata_close_workflow() {
         assert_eq!(n.expect("a generous read buffer still reads the value"), 3);
         assert_eq!(&val[..3], b"\x01\x02\x03");
 
-        // Allocation control, by fd.
         h.fallocate(me, &f, 0, 4096, 4096).expect("fallocate");
         assert_eq!(std::fs::metadata(dir.join("doc.bin")).unwrap().len(), 8192);
 
@@ -131,7 +124,6 @@ fn statx_by_leaf_and_anchor() {
             .expect("statx anchor");
         assert!(st.is_dir(), "anchor is a directory");
 
-        // A missing entry is a plain ENOENT.
         assert!(matches!(
             h.statx(me, &anchor, leaf("nope"), AtFlags::empty(), StatxMask::BASIC_STATS),
             Err(Error::Errno(Errno::ENOENT))
@@ -188,7 +180,6 @@ fn directory_entry_ops() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
         let anchor = Anchor::open(dir.as_path()).unwrap();
 
-        // mkdir / rmdir
         h.mkdirat(me, &anchor, leaf("d"), Mode::from_bits_truncate(0o750))
             .expect("mkdirat");
         let md = std::fs::metadata(dir.join("d")).unwrap();
@@ -197,7 +188,6 @@ fn directory_entry_ops() {
         h.rmdirat(me, &anchor, leaf("d")).expect("rmdirat");
         assert!(!dir.join("d").exists());
 
-        // unlink, and the rmdir/unlink distinction the kernel enforces
         std::fs::write(dir.join("f"), b"x").unwrap();
         std::fs::create_dir(dir.join("realdir")).unwrap();
         assert!(matches!(
@@ -220,7 +210,6 @@ fn directory_entry_ops() {
             Path::new("../elsewhere/target")
         );
 
-        // hard link + rename
         std::fs::write(dir.join("orig"), b"data").unwrap();
         h.linkat(me, &anchor, leaf("orig"), &anchor, leaf("hard"), AtFlags::empty())
             .expect("linkat");
@@ -231,7 +220,6 @@ fn directory_entry_ops() {
             .expect("renameat");
         assert!(dir.join("moved").exists() && !dir.join("hard").exists());
 
-        // RENAME_NOREPLACE refuses to clobber.
         assert!(matches!(
             h.renameat(
                 me,
@@ -244,7 +232,6 @@ fn directory_entry_ops() {
             Err(Error::Errno(Errno::EEXIST))
         ));
 
-        // RENAME_EXCHANGE swaps two entries atomically.
         std::fs::write(dir.join("A"), b"a").unwrap();
         std::fs::write(dir.join("B"), b"b").unwrap();
         h.renameat(me, &anchor, leaf("A"), &anchor, leaf("B"), RenameFlags::RENAME_EXCHANGE)
@@ -290,7 +277,6 @@ fn o_tmpfile_is_invisible_until_linkat_publishes_it() {
         assert_eq!(n.expect("write"), 20);
         h.fdatasync(me, &f).expect("fdatasync");
 
-        // Written, synced, and still nowhere in the namespace.
         assert_eq!(
             std::fs::read_dir(&dir).unwrap().count(),
             0,
@@ -321,7 +307,6 @@ fn linkat_file_cannot_replace_but_rename_can() {
         let (n, _) = pwrite1(&h, me, &f, b"new".to_vec(), 0);
         assert_eq!(n.expect("write"), 3);
 
-        // Straight at the live name: refused.
         assert!(
             matches!(
                 h.linkat_file(me, &f, &anchor, leaf("object")),
@@ -331,7 +316,6 @@ fn linkat_file_cannot_replace_but_rename_can() {
         );
         assert_eq!(std::fs::read(dir.join("object")).unwrap(), b"old");
 
-        // Land on a private name, then rename over the target.
         h.linkat_file(me, &f, &anchor, leaf(".tmp.object"))
             .expect("link to a staging name");
         h.renameat(
@@ -517,12 +501,10 @@ fn privileged_xattr_allowlist_elevates_only_listed_names() {
                 "an unlisted trusted.* name must not be elevated, got {res:?}"
             );
 
-            // The stored value is real, and readable only with privilege.
             let (res, buf) = h.fgetxattr_as_root(&f, xattr_name("trusted.truenas_test_meta"), vec![0u8; 64]);
             let n = res.expect("privileged read");
             assert_eq!(&buf[..n], b"server-owned");
 
-            // ...and invisible to the identity that "owns" the file.
             let (res, _) = h.fgetxattr(nobody, &f, xattr_name("trusted.truenas_test_meta"), vec![0u8; 64]);
             assert!(
                 matches!(res, Err(Error::Errno(Errno::ENODATA))),
@@ -542,11 +524,9 @@ fn preadv2_pwritev2_flags_apply_or_fail_loudly() {
         let anchor = Anchor::open(dir.as_path()).expect("anchor");
         let f = h.open(me, &anchor, "rw2", creat_rw()).expect("open");
 
-        // No flags: identical to the plain forms.
         let (n, _) = h.pwritev2(me, &f, vec![b"alpha".to_vec()], 0, RwFlags::empty());
         assert_eq!(n.expect("pwritev2"), 5);
 
-        // RWF_DSYNC: the write is itself durable, standing in for fdatasync.
         let (n, _) = h.pwritev2(me, &f, vec![b"-beta".to_vec()], 5, RwFlags::RWF_DSYNC);
         assert_eq!(n.expect("pwritev2 RWF_DSYNC"), 5);
 
@@ -562,17 +542,15 @@ fn preadv2_pwritev2_flags_apply_or_fail_loudly() {
             matches!(res, Err(Error::Errno(Errno::EOPNOTSUPP | Errno::EINVAL))),
             "an unsupported rw flag must fail the op, got {res:?}"
         );
-        // ...and must not have written anything.
         assert_eq!(std::fs::read(dir.join("rw2")).unwrap(), b"alpha-beta");
 
         h.close(f).unwrap();
     });
 }
 
-/// `open_confined` cannot be talked out of its confinement. `open` yields to a
-/// caller that *states* a policy (documented, and fine for a general opener);
-/// the confined form unions the guarantees in, so a `how` that buys in-tree symlinks through `open` buys nothing
-/// through `open_confined`.
+/// `open_confined` cannot be talked out of its confinement. `open` yields to a caller that *states* a policy, which is
+/// documented and fine for a general opener, but the confined form unions the guarantees in, so a `how` that buys
+/// in-tree symlinks through `open` buys nothing through `open_confined`.
 #[test]
 fn open_confined_cannot_be_weakened_by_the_caller() {
     with_fs(test_cfg(), |h, me, dir, _stop| {
@@ -598,7 +576,6 @@ fn open_confined_cannot_be_weakened_by_the_caller() {
             "confined open must not follow even an in-tree symlink, got {res:?}"
         );
 
-        // Neither form walks out of the anchor.
         let permissive = OpenHow::new()
             .flags(OFlag::O_RDONLY)
             .resolve(ResolveFlag::RESOLVE_NO_MAGICLINKS);
@@ -621,13 +598,11 @@ fn open_confined_cannot_be_weakened_by_the_caller() {
             "confined open must not follow a symlink out, got {res:?}"
         );
 
-        // And an absolute path cannot bypass the anchor.
         let res = h.open_confined(me, &inner, "/etc/hostname", permissive);
         assert!(res.is_err(), "confined open must refuse an absolute path");
 
-        // `RESOLVE_IN_ROOT` is the one flag that cannot be unioned in: the kernel refuses `BENEATH|IN_ROOT` outright
-        // (`fs/open.c:1264`), so the union answered `EINVAL` for every path shape - a leaf, a nested path, `"."` -
-        // while the same call through `open` worked. Refused at the boundary, where the message can name the fix.
+        // `RESOLVE_IN_ROOT` is the one flag that cannot be unioned in, since the kernel refuses `BENEATH|IN_ROOT`
+        // outright (`fs/open.c:1264`). It is refused at the boundary, where the message can name the fix.
         let in_root = OpenHow::new()
             .flags(OFlag::O_RDONLY)
             .resolve(ResolveFlag::RESOLVE_IN_ROOT);
@@ -660,7 +635,6 @@ fn mkdir_path_creates_confined_and_is_idempotent() {
         let leaf_anchor = h.mkdir_path(me, &anchor, "a/b/c", mode).expect("create a nested tree");
         assert!(dir.join("a/b/c").is_dir());
 
-        // The returned anchor really is the deepest directory: a leaf op through it lands in `a/b/c`.
         h.mkdirat(me, &leaf_anchor, leaf("d"), mode)
             .expect("mkdir through the returned anchor");
         assert!(dir.join("a/b/c/d").is_dir());
@@ -669,16 +643,14 @@ fn mkdir_path_creates_confined_and_is_idempotent() {
         // callers create the same tree).
         h.mkdir_path(me, &anchor, "a/b/c", mode)
             .expect("existing tree is not an error");
-        // Partially-existing trees extend rather than fail.
         h.mkdir_path(me, &anchor, "a/b/other/deep", mode)
             .expect("extend an existing prefix");
         assert!(dir.join("a/b/other/deep").is_dir());
 
-        // Every component must be a plain name. `a/../b` is the one worth stating: `openat2` under CONFINED_RESOLVE
-        // resolves it safely, so it is refused for a different reason - a walk creating `b` cannot know what `a/..`
-        // will turn out to be, and a path that succeeded where the tree existed and failed where it did not would name
-        // two different things. Redundant separators go with them: they name the same directory, which makes them a
-        // caller assembling a path wrongly rather than a path meaning something unintended.
+        // Every component must be a plain name. `a/../b` is refused though `openat2` under CONFINED_RESOLVE resolves it
+        // safely, since a walk creating `b` cannot know what `a/..` will be, and the same path would name different
+        // things depending on what existed. Redundant separators go too, as a sign of a caller assembling a path
+        // wrongly.
         for bad in [
             "../escape",
             "a/../../escape",
@@ -707,26 +679,17 @@ fn mkdir_path_creates_confined_and_is_idempotent() {
     });
 }
 
-/// Top-level directories that genuinely sit on another filesystem - the fixture the `RESOLVE_NO_XDEV` tests need.
+/// Top-level directories that sit on another filesystem, the fixture the `RESOLVE_NO_XDEV` tests need.
 ///
-/// `symlink_metadata`, not `metadata`: a followed symlink reports its TARGET's device, so on a usr-merged root `/lib ->
-/// usr/lib` qualifies while being an ordinary symlink on the root filesystem. The opens under test resolve with
-/// `RESOLVE_NO_SYMLINKS`, so such a candidate dies `ELOOP` before the confinement is ever reached.
+/// `symlink_metadata`, not `metadata`. A followed symlink reports its TARGET's device, so on a usr-merged root `/lib ->
+/// usr/lib` would qualify while being an ordinary symlink, and the opens under test, which resolve with
+/// `RESOLVE_NO_SYMLINKS`, would die `ELOOP` on it before reaching the confinement.
 ///
 /// **Real mounts first, and the order is deterministic.** `/proc`, `/sys`, `/dev` and `/run` are top-level mounts on
-/// every Linux host, so "is the list empty" is a question that answers itself: an emptiness gate could never fire, and
-/// the boundary actually crossed would be whichever entry `read_dir` happened to yield first - in practice procfs, and
-/// a different pick from run to run.
-///
-/// What the QEMU job pays for is a pair of ZFS datasets (`setup-test-zfs.sh` mounts `/POSIXACL` and `/NFSV4ACL`), and
-/// those are the boundary worth crossing: a pseudo filesystem shares neither ZFS's mount semantics nor its ACL
-/// behaviour, so pinning `RESOLVE_NO_XDEV` against procfs proves nothing about the platform the product ships. So the
-/// pseudo mounts sort last, and `TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY=1` demands a **real** crossing rather than merely
-/// any crossing - which is what holds the runner to what the job provisions.
-///
-/// `symlink_metadata`, not `metadata`: a followed symlink reports its TARGET's device, so on a usr-merged root `/lib ->
-/// usr/lib` qualifies while being an ordinary symlink on the root filesystem. The opens under test resolve with
-/// `RESOLVE_NO_SYMLINKS`, so such a candidate dies `ELOOP` before the confinement is ever reached.
+/// every Linux host, so an emptiness gate could never fire and the boundary crossed would be whichever entry `read_dir`
+/// yielded first. A pseudo filesystem shares neither ZFS's mount semantics nor its ACL behaviour, so the pseudo mounts
+/// sort last, and `TRUENAS_ROS_REQUIRE_MOUNT_BOUNDARY=1` demands a **real** crossing, such as the QEMU job's
+/// `/POSIXACL` and `/NFSV4ACL` datasets.
 fn mount_crossings() -> Vec<String> {
     /// Always present, so their presence proves nothing about provisioning.
     const PSEUDO: [&str; 4] = ["proc", "sys", "dev", "run"];
@@ -754,13 +717,12 @@ fn mount_crossings() -> Vec<String> {
     found
 }
 
-/// A crossing this identity can **search**, which is more than [`mount_crossings`] promises: it filters on device and
-/// nothing else, and the relocation half below opens the chosen mount as its own anchor. A top-level dataset can be
-/// root-only - TrueNAS ships `/audit`, `/conf` and `/root` at 0700, and they sort first - so an unprivileged run picked
-/// one and died `EACCES` on a fixture question rather than on the confinement under test.
+/// A crossing this identity can **search**, which is more than [`mount_crossings`] promises, since that filters on
+/// device alone and the relocation half below opens the chosen mount as its own anchor. A top-level dataset can be
+/// root-only (TrueNAS ships `/audit`, `/conf` and `/root` at 0700, and they sort first).
 ///
-/// `metadata("/<name>/.")` is exactly that question: resolving `.` inside the directory needs the search bit the test
-/// is about to need.
+/// `metadata("/<name>/.")` asks exactly that, since resolving `.` inside the directory needs the search bit the test is
+/// about to need.
 fn traversable_crossing() -> Option<String> {
     let all = mount_crossings();
     let pick = all
@@ -778,10 +740,10 @@ fn traversable_crossing() -> Option<String> {
     pick
 }
 
-/// `RESOLVE_NO_XDEV` is what makes "this tree is one filesystem" a rule the kernel enforces rather than a convention: a
-/// walk that would step onto another mount fails instead of quietly serving files from it. Uses a real
-/// mount boundary on the running system (on TrueNAS, a child dataset);
-/// self-skips where the root filesystem has no child mounts.
+/// `RESOLVE_NO_XDEV` is what makes "this tree is one filesystem" a rule the kernel enforces rather than a convention,
+/// since a walk that would step onto another mount fails instead of quietly serving files from it. Uses a real mount
+/// boundary on the running system (on TrueNAS, a child dataset), and self-skips where the root filesystem has no child
+/// mounts.
 #[test]
 fn confined_open_refuses_to_cross_a_mount_point() {
     with_fs(test_cfg(), |h, me, _dir, _stop| {
@@ -923,7 +885,6 @@ fn listing_can_be_confined_to_one_filesystem() {
             assert!(all.contains(c), "unconfined listing should include /{c}");
             assert!(!confined.contains(c), "confined listing must drop the mount point /{c}");
         }
-        // Only the crossings are dropped; same-filesystem entries survive.
         assert!(all.len() > confined.len(), "confinement should drop something here");
         for n in &confined {
             assert!(all.contains(n), "confinement must not invent entries");

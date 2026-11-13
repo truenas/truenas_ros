@@ -82,16 +82,13 @@ fn fetch_big_slowly(
 
 #[test]
 fn ktls_vectored_bodies_arrive_intact() {
-    // The S3 GET shape: head + body as two iovecs in one SENDMSG over kTLS. The client drains the 6 MiB body
-    // ([`big_body`]) slower than the 500 ms `send_timeout` flushes it, so the linked timeout cancels the io-wq-blocked
-    // send mid-flight and the reactor re-submits the tail from the partial CQE: every byte must arrive exactly once.
-    // The canned body then rides the borrowed segment, and two more requests prove each reply retired its read-ahead
-    // slot (a wrong retire count wedges them).
+    // Head and body go as two iovecs in one SENDMSG over kTLS. The client drains the 6 MiB body ([`big_body`]) slower
+    // than the 500 ms `send_timeout` flushes it, so the linked timeout cancels the io-wq-blocked send mid-flight and
+    // the reactor re-submits the tail from the partial CQE, and every byte must arrive exactly once. The canned body
+    // then rides the borrowed segment, and two more requests prove each reply retired its read-ahead slot.
     //
-    // A reclaim (EOF) is retried on a fresh connection: a cancel window in which the blocked send happened to write
-    // nothing closes the connection as SendTimeout even though this client drains throughout -- rare, timing-dependent,
-    // and a server-policy question rather than a data-path defect. A byte mismatch is NEVER retried; corruption fails
-    // on the spot.
+    // A reclaim (EOF) is retried on a fresh connection, since a cancel window in which the blocked send wrote nothing
+    // closes the connection as SendTimeout although this client drains throughout. A byte mismatch is never retried.
     let cfg = ServerConfig {
         send_timeout: Some(Duration::from_millis(500)),
         ..ServerConfig::default()

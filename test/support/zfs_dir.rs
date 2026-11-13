@@ -67,8 +67,7 @@ pub fn is_zfs(path: &std::path::Path) -> Option<bool> {
 
 /// The discriminator the gate rests on: a directory that exists is not evidence of a filesystem.
 ///
-/// `/proc` is always present on Linux and is never ZFS - an `is_dir` gate says yes to it, and to `/dev/shm`, which is
-/// how two ZFS fixtures came to pass on tmpfs with `TRUENAS_ROS_REQUIRE_ZFS` armed.
+/// `/proc` is always present on Linux and is never ZFS, yet an `is_dir` gate says yes to it, and to `/dev/shm`.
 #[test]
 fn is_zfs_reads_the_filesystem_not_the_directory() {
     let proc = std::path::Path::new("/proc");

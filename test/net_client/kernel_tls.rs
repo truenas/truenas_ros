@@ -93,15 +93,14 @@ fn ktls_server_handshake(fd: RawFd, acceptor: &Acceptor) -> Result<(), KtlsProbe
 
 /// Why a probe handshake did not engage kTLS, which is two answers and not one.
 ///
-/// [`KtlsProbe::NotEngaged`] is this **host's** verdict - libssl built without `enable-ktls`, OpenSSL's TLS 1.3 RX gap,
-/// no `tls` module - and the data-path tests skip on it. [`KtlsProbe::Broken`] is the probe's own failure, descriptor
-/// exhaustion above all, which CI and the nightly VM reach at a soft `NOFILE` of 1024. Folded into one channel the
-/// decision site cannot tell them apart even in principle: unarmed it skips silently on a suite that tested nothing,
-/// and armed it asserts "OpenSSL cannot engage kTLS: dup", sending a maintainer to the wrong subsystem.
+/// [`KtlsProbe::NotEngaged`] is this **host's** verdict (libssl built without `enable-ktls`, OpenSSL's TLS 1.3 RX gap,
+/// no `tls` module), and the data-path tests skip on it. [`KtlsProbe::Broken`] is the probe's own failure, descriptor
+/// exhaustion above all, which a soft `NOFILE` of 1024 reaches. Folded into one, an unarmed run would skip silently and
+/// an armed one would blame OpenSSL for a failed `dup`.
 ///
-/// `test/support/ktls.rs` gets this split from `truenas_ktls::Error::NotEngaged` for free. The client half here has no
-/// such type - `SSL_connect` and the `SOL_TLS` readback are two different questions asked of one `unsafe` block - so it
-/// is spelled out.
+/// `test/support/ktls.rs` gets this split from `truenas_ktls::Error::NotEngaged`. The client half has no such type,
+/// since `SSL_connect` and the `SOL_TLS` readback are two questions asked of one `unsafe` block, so it is spelled out
+/// here.
 #[derive(Debug)]
 enum KtlsProbe {
     /// This host cannot engage kTLS.
@@ -190,12 +189,11 @@ fn confirm_ktls(fd: RawFd) -> Result<(), String> {
     Ok(())
 }
 
-/// kTLS installation is best-effort in libssl: a build without `enable-ktls` (Debian/Ubuntu only enable it from 3.2), a
-/// TLS 1.3 RX gap (OpenSSL < 3.2), or a kernel missing the `tls` module all fall back to userspace records. The
-/// handshake then completes but the acceptor's readback (server side) and `confirm_ktls` (client side) refuse, every
-/// worker rejects, and the data-path tests would fail rather than skip. Probe once with a loopback handshake - the same
-/// acceptor, client context, and confirmation the tests
-/// use - so those tests can skip when this host's OpenSSL cannot engage kTLS.
+/// kTLS installation is best-effort in libssl. A build without `enable-ktls` (Debian and Ubuntu enable it only from
+/// 3.2), a TLS 1.3 RX gap (OpenSSL < 3.2), or a kernel missing the `tls` module all fall back to userspace records. The
+/// handshake then completes but the acceptor's readback (server side) and `confirm_ktls` (client side) refuse, so the
+/// data-path tests would fail rather than skip. Probe once with a loopback handshake, using the same acceptor, client
+/// context and confirmation the tests use, so those tests can skip when this host's OpenSSL cannot engage kTLS.
 fn ktls_engages() -> &'static Result<(), KtlsProbe> {
     static PROBE: std::sync::OnceLock<Result<(), KtlsProbe>> = std::sync::OnceLock::new();
     PROBE.get_or_init(|| {
@@ -531,9 +529,8 @@ fn ktls_splice_body() {
     let payload: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
     let expected = payload.clone();
 
-    // Drains until BODY arrives or the write end closes - the same reader as `tcp_splice_body`, and the EOF arm is how
-    // a kTLS *skip* (the client body never runs, nothing is spliced) ends instead of blocking. The main thread's close
-    // below is that EOF; nothing here waits on a clock.
+    // The same reader as `tcp_splice_body`. Its EOF arm ends a kTLS skip, where nothing is spliced, at the main
+    // thread's close below.
     let reader = thread::spawn(move || {
         let mut got = vec![0u8; BODY];
         let mut off = 0;
@@ -551,8 +548,8 @@ fn ktls_splice_body() {
         (off, got)
     });
 
-    // Skip is decided at the server bind inside `with_ktls_server`; on a skip the client body never runs, so drain the
-    // reader (it will time out) below.
+    // The skip is decided at the server bind inside `with_ktls_server`. On a skip the client body never runs, which
+    // `ran` records, and the reader ends at the EOF below.
     let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ran_in = Arc::clone(&ran);
     with_ktls_server(move |v4| {
@@ -583,9 +580,8 @@ fn ktls_splice_body() {
     // SAFETY: closing the test-owned write end (read end closed by the reader).
     unsafe { libc::close(pipe_wr) };
     let (off, got) = reader.join().expect("reader join");
-    // On a kTLS skip the client body never ran, so nothing was spliced; on a real run the transfer is the whole point,
-    // so assert it unconditionally. (`off > 0` does NOT mean the splice happened: one aimed at the wrong sink completes
-    // and reports the declared length with this pipe empty.)
+    // Assert only when the client body ran. `off > 0` does not prove a splice happened, since one aimed at the wrong
+    // sink completes and reports the declared length with this pipe empty.
     if ran.load(std::sync::atomic::Ordering::SeqCst) {
         assert_eq!(off, BODY, "kTLS splice moved {off} of {BODY} body bytes");
         assert_eq!(got, expected, "kTLS spliced body content mismatch");

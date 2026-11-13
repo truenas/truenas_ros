@@ -4,10 +4,6 @@ use super::*;
 
 /// Upload `mib` MiB as a streamed PUT whose handler writes every window to a real file with `pwritev2_from` +
 /// `defer_stream`, and answer (large allocations, file bytes matched).
-///
-/// This is the whole ingest path at once: kernel picks the recv buffer, the framer scans it in place, the handler's
-/// write borrows it, the claim is surrendered to the op, and the pool gets it back at the write's CQE. Any copy or
-/// allocation snuck back into that chain shows up in the count.
 #[cfg(feature = "uring-fs")]
 fn put_to_file_cost(mib: usize, wire_of: fn(&[u8]) -> Vec<u8>) -> Option<(usize, usize, bool)> {
     put_to_file_cost_ranged(mib, wire_of, false)
@@ -120,12 +116,9 @@ impl Landed {
 }
 
 /// One streamed PUT of `mib` MiB of varied bytes, framed by `wire_of`, into a server running the protocol `proto_of`
-/// builds over a pre-opened destination and the reactor's own personality (set once the server exists, before the first
-/// connection). The upload's large allocations are counted, every receive buffer is checked back home, and the
-/// destination is read back. `None` where this box has no io_uring.
-///
-/// The destination is opened through a throwaway [`UringFs`] host, not the server's own reactor: the open path is not
-/// what any caller measures, and the file is cloned into every request from here.
+/// builds over a pre-opened destination and the reactor's own personality. The upload's large allocations are counted,
+/// every receive buffer is checked back home, and the destination is read back. `None` where this box has no io_uring.
+/// The destination is opened through a throwaway [`UringFs`] host, since the open path is not what any caller measures.
 #[cfg(feature = "uring-fs")]
 fn streamed_put<U, A, H, B>(
     mib: usize,
@@ -519,11 +512,9 @@ fn put_pipelined_digest_cost(mib: usize) -> Option<(usize, usize, bool, bool)> {
 }
 
 /// A window held past its delivery and spent from an earlier job's completion costs no copy and returns its lease.
-///
-/// The pipelined shape: the stream flows while the digest runs behind it, windows waiting their turn as leases rather
-/// than copies, every one spent by `offload_leased` from a completion facade that holds no lease of its own. Flat
-/// allocation count, every buffer back, and the digest is the payload's - so the windows were read in order and none
-/// was recycled under a waiting job.
+/// Windows wait their turn as leases rather than copies, each spent by `offload_leased` from a completion facade that
+/// holds no lease of its own. The payload's digest proves the windows were read in order and none was recycled under a
+/// waiting job.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_held_window_is_digested_from_the_previous_jobs_completion() {
@@ -564,10 +555,8 @@ fn read_response_head(s: &mut TcpStream) -> io::Result<(u16, String)> {
 }
 
 /// A window digested on the pool from the receive buffer it arrived in costs no copy and returns its lease.
-///
-/// `offload_from` shares the write's claim: the write and the job read the same buffer, the buffer returns when the
-/// last of them is over, and neither falls to the copy path - so the allocation count is flat in the payload, every
-/// lease comes back, and the digest is the payload's.
+/// `offload_from` shares the write's claim, so the write and the job read the same buffer and it returns when the last
+/// of them is over.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_leased_window_is_digested_in_place() {
@@ -593,10 +582,8 @@ fn a_leased_window_is_digested_in_place() {
 }
 
 /// Writing a streamed PUT to a file must neither corrupt it nor allocate per window.
-///
-/// The windows are written from the receive buffer itself - the claim is surrendered to the write op and comes back to
-/// the pool at its CQE - and the stream park retains no copy. Byte-identical content proves the buffer was never
-/// recycled under the DMA; a flat allocation count proves neither the write nor the park fell back to copying.
+/// Byte-identical content proves the buffer was never recycled under the write, and a flat allocation count proves
+/// neither the write nor the stream park fell back to copying.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_streamed_put_writes_windows_without_copying_them() {
@@ -619,11 +606,8 @@ fn a_streamed_put_writes_windows_without_copying_them() {
 }
 
 /// Two ranges of one window both write from the claim.
-///
-/// A verifier that emits payload extents hands the handler several ranges of the same window; each borrows the same
-/// claim, so all of them must share its hold - the buffer goes back when the last completes. A single-shot lease sends
-/// every range after the first to the copy path, which at two ranges per window is one ~64 KiB allocation-and-copy per
-/// window, scaling with the payload.
+/// A verifier that emits payload extents hands the handler several ranges of the same window, and each must share the
+/// claim's hold, since a single-shot lease would send every range after the first to the copy path.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_multi_range_window_writes_every_range_from_the_claim() {
@@ -649,14 +633,13 @@ fn a_multi_range_window_writes_every_range_from_the_claim() {
 /// The same guarantee when a peer's HTTP chunks are larger than a window.
 ///
 /// A chunk of exactly one window is the single size at which every window carries its chunk header, so the connection
-/// always holds a recv claim and the cost of the no-claim arm is invisible. Fixtures framed at that size therefore
-/// prove nothing about it - which is how a copy of seven windows in eight went unnoticed.
+/// always holds a recv claim and the cost of the no-claim arm is invisible. Fixtures framed at that size prove nothing
+/// about it.
 ///
-/// 1 MiB here is not botocore: botocore's HTTP chunks are 128 KiB (see `STREAM_WINDOW`), and its 1 MiB
-/// `_DEFAULT_CHUNK_SIZE` frames an inner aws-chunked payload this layer never frames. 1 MiB is chosen as a peer that
-/// chunks eight windows at a time, so seven in eight are mid-chunk with the claim already leased to the previous
-/// window's write. Those must draw a fresh buffer from the ring, not be placed into an allocation `pwritev2_from` then
-/// copies.
+/// 1 MiB is a peer that chunks eight windows at a time. botocore's HTTP chunks are 128 KiB (see `STREAM_WINDOW`), and
+/// its 1 MiB `_DEFAULT_CHUNK_SIZE` frames an inner aws-chunked payload this layer never frames. Seven windows in eight
+/// are mid-chunk with the claim already leased to the previous window's write, and those must draw a fresh buffer from
+/// the ring, not be placed into an allocation `pwritev2_from` then copies.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_streamed_put_at_oversized_http_chunks_still_does_not_copy() {
@@ -671,8 +654,8 @@ fn a_streamed_put_at_oversized_http_chunks_still_does_not_copy() {
         return;
     };
     assert!(ok_small && ok_large, "file bytes differ from the upload");
-    // Placed-and-copied mid-chunk windows cost exactly 14 large allocations per MiB (measured: 56 and 224 here before
-    // the no-claim suppression); flat means every window drew from the ring.
+    // Placed-and-copied mid-chunk windows cost 14 large allocations per MiB, and flat means every window drew from the
+    // ring.
     assert!(
         large <= small + 8,
         "PUT-to-file cost scales with payload at 1 MiB chunks: 4 MiB cost \
@@ -681,10 +664,9 @@ fn a_streamed_put_at_oversized_http_chunks_still_does_not_copy() {
     );
 }
 
-/// A `Content-Length` body above one window streams exactly as a chunked one: windows from the receive ring, leased
-/// writes, no copy and no per-window allocation. The harness's `Whole` arm answers 500, so a body this size that fails
-/// to stream fails the test outright — the regression this exists to catch is precisely a silent fall back to
-/// buffering.
+/// A `Content-Length` body above one window streams exactly as a chunked one, with windows from the receive ring,
+/// leased writes, no copy and no per-window allocation. The harness's `Whole` arm answers 500, so a body this size that
+/// falls back to buffering fails the test outright.
 ///
 /// Counted from [`MED`], the tighter of the allocator's two thresholds, so a fallback whose unit is smaller than a full
 /// window still registers rather than sliding under a 64 KiB bar.
@@ -717,9 +699,8 @@ fn a_known_length_put_streams_without_copying() {
 fn pipelined_known_length_streams_do_not_desync() {
     use std::sync::atomic::AtomicUsize;
 
-    // Allocates ~20 buffers over `BIG` through a live server. The counter is process-global and this binary's tests run
-    // as parallel threads, so without the turn those land inside another test's measurement window - reddening a
-    // correct suite, or raising a differential's baseline arm enough to admit the regression it exists to catch.
+    // This allocates about 20 buffers over `BIG`, and the counter is process-global, so without the turn they would
+    // land inside another test's measurement window.
     let _turn = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
 
     let opens = std::sync::Arc::new(AtomicUsize::new(0));

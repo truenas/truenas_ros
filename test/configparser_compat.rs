@@ -7,10 +7,9 @@
 //! curated table of every parsing subtlety, a large batch of seeded-random documents, and a set of files read from
 //! disk, where `configparser` applies universal newlines.
 //!
-//! Like `test/zfs.rs`, this suite **skips** (returns early) when `python3` is not available, so `cargo test` stays
-//! green in a bare sandbox. CI sets `TRUENAS_ROS_REQUIRE_PYTHON` so a missing interpreter is a hard failure there
-//! rather than a silent skip, guaranteeing the parity checks actually run. Point it at a specific interpreter with
-//! `TRUENAS_ROS_PYTHON`, and/or a specific `configparser` with `TRUENAS_ROS_CPYTHON_LIB` (added to `PYTHONPATH`).
+//! This suite skips when `python3` is not available. CI sets `TRUENAS_ROS_REQUIRE_PYTHON` so a missing interpreter
+//! fails there instead. Point it at a specific interpreter with `TRUENAS_ROS_PYTHON`, and at a specific `configparser`
+//! with `TRUENAS_ROS_CPYTHON_LIB`, which is added to `PYTHONPATH`.
 #![cfg(all(target_os = "linux", feature = "configfile"))]
 
 use std::io::Write;
@@ -63,8 +62,6 @@ fn python() -> Option<String> {
     if ok {
         return Some(py);
     }
-    // In CI, TRUENAS_ROS_REQUIRE_PYTHON is set so a missing interpreter is a hard failure (the differential coverage
-    // must actually run); locally, absent that variable, we skip gracefully.
     assert!(
         std::env::var_os("TRUENAS_ROS_REQUIRE_PYTHON").is_none(),
         "TRUENAS_ROS_REQUIRE_PYTHON is set but python3 ({py:?}) is not runnable"

@@ -56,10 +56,8 @@ fn copysendfile_copies_and_empty_falls_back() {
     assert_eq!(copysendfile(s2.as_fd(), d2.as_fd()).unwrap(), 0);
 }
 
-/// The clone half runs on a ZFS dataset, because that is the only place it is the code under test: tmpfs serves
-/// `copy_file_range` as a plain copy, so a tempdir fixture takes the `Ok` arm without ever reaching
-/// `zfs_clone_range`. `EXDEV` stays tolerated - two files on different filesystems genuinely cannot clone - but on
-/// a dataset an unsupported answer is a regression, not an environment.
+/// The clone half runs on a ZFS dataset, the only place it is the code under test. `EXDEV` stays tolerated, since files
+/// on different filesystems cannot clone, but on a dataset an unsupported answer is a regression.
 #[test]
 fn clonefile_clones_on_a_dataset() {
     let Some((ds, s, d)) = zfs_pair(b"clone me") else {
@@ -175,9 +173,8 @@ fn copytree_op_variants_and_exist_ok() {
 
 /// A re-run or incremental copy must leave the destination looking like the source, whatever was at the name first.
 ///
-/// `make_file` replaced a collision with `exist_ok`; `make_symlink` and `make_special` kept it, so a destination
-/// could carry a different symlink target - or an entry of a different *type* entirely - while `copytree` returned
-/// `Ok` with stats claiming it had copied one.
+/// A symlink with a different target, or an entry of a different type, is replaced rather than kept while `copytree`
+/// reports it copied.
 #[test]
 fn copytree_replaces_a_taken_symlink_or_special() {
     let tmp = truenas_ros::tempdir().unwrap();
@@ -213,10 +210,8 @@ fn copytree_replaces_a_taken_symlink_or_special() {
 
 /// A copy that fails must leave a *borrowed* destination root at the mode it found.
 ///
-/// copytree narrows a pre-existing root to 0o700 for the duration, so group and other cannot reach files while they
-/// are being written - but only the success path restored a mode, and the original was recorded nowhere, so the
-/// caller could not put it back either. On a share or system-dataset migration that locks every non-owner identity
-/// out of the destination, and the error names no permission change.
+/// copytree narrows a pre-existing root to 0o700 while it writes, so group and other cannot reach half-written files. A
+/// failure must put the recorded mode back, or every non-owner identity stays locked out of the destination.
 #[test]
 fn a_failed_copytree_puts_a_borrowed_root_s_mode_back() {
     let tmp = truenas_ros::tempdir().unwrap();
@@ -283,8 +278,8 @@ fn copytree_permissions_only_flag() {
 
 #[test]
 fn copytree_defers_root_metadata_so_children_are_creatable() {
-    // Regression: the destination root's permissions must be applied AFTER the walk. A read-only source root would
-    // otherwise make the dst root unwritable before its children are created (EACCES unprivileged).
+    // The destination root's permissions are applied after the walk, or a read-only source root would make it
+    // unwritable before its children are created.
     let tmp = truenas_ros::tempdir().unwrap();
     let src = tmp.path().join("src");
     let dst = tmp.path().join("dst");

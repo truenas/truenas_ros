@@ -42,7 +42,6 @@ fn path_order_places_a_directory_after_its_dotted_siblings() {
             list_names(&h, me, &anchor, opts(Order::ByName)),
             ["a", "a-1.txt", "a.txt", "aa.txt"],
         );
-        // Unordered yields the same set, in whatever order the filesystem has.
         let mut raw = list_names(&h, me, &anchor, opts(Order::Readdir));
         raw.sort();
         assert_eq!(raw, ["a", "a-1.txt", "a.txt", "aa.txt"]);
@@ -136,11 +135,10 @@ fn start_after_resumes_a_path_ordered_listing_without_gaps() {
 /// invalidate every cache entry on every access.
 ///
 /// Skips where the kernel does not hand the cookie to userspace, which is a property of the *kernel*, not the
-/// filesystem: upstream strips the bit in `cp_statx` and clears it from the request mask ("kernel-only for now",
+/// filesystem. Upstream strips the bit in `cp_statx` and clears it from the request mask ("kernel-only for now",
 /// fs/stat.c), while the TrueNAS fork exposes it under `CONFIG_TRUENAS`. Runs on a **ZFS dataset**, not the default
-/// `tempdir`. tmpfs carries `i_version` too (`SB_I_VERSION`, mm/shmem.c:5375), so a tempdir fixture would pass - but it
-/// would be pinning tmpfs's cookie, and the product only ships on ZFS. What has to hold is that *ZFS* moves the cookie
-/// on a write and holds it across a read.
+/// `tempdir`, since tmpfs carries `i_version` too (`SB_I_VERSION`, `mm/shmem.c:5375`) and a tempdir fixture would pin
+/// tmpfs's cookie rather than ZFS's.
 ///
 /// Two gates, both armed in the QEMU job: `TRUENAS_ROS_REQUIRE_ZFS` for the dataset, and
 /// `TRUENAS_ROS_REQUIRE_CHANGE_COOKIE` for the kernel.
@@ -553,14 +551,12 @@ fn a_subtree_removed_between_pages_is_skipped_not_fatal() {
 
 /// The other half of the restore guard: a level that fails for a reason that is *not* a subtree skip aborts the resume.
 ///
-/// `a_subtree_removed_between_pages_is_skipped_not_fatal` pins the skip half - EACCES/EPERM/ENOENT are levels the
-/// forward walk would have skipped too, so a resume that cannot re-enter them is still at the position it saved.
-/// Everything else is not: the cursor names a place the rebuild could not reach, so continuing from a shallower level
-/// would hand back a short listing with no error in it - which is data loss for the recursive copy and delete built on
-/// this.
+/// `a_subtree_removed_between_pages_is_skipped_not_fatal` pins the skip half, since EACCES, EPERM and ENOENT are levels
+/// the forward walk would have skipped too. For anything else the cursor names a place the rebuild could not reach, so
+/// continuing from a shallower level would hand back a short listing with no error in it.
 ///
-/// Provoked by replacing the directory with a regular file between pages. The rebuild opens each level `O_DIRECTORY`,
-/// so the file answers ENOTDIR, which `is_subtree_skip` deliberately does not cover.
+/// Provoked by replacing the directory with a regular file between pages, so the rebuild's `O_DIRECTORY` open answers
+/// ENOTDIR, which `is_subtree_skip` deliberately does not cover.
 #[test]
 fn a_level_that_became_a_file_between_pages_aborts_the_resume() {
     with_fs(test_cfg(), |h, me, dir, _stop| {

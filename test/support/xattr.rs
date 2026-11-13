@@ -8,13 +8,10 @@
 
 /// Hold a probe's refusal to the `TRUENAS_ROS_REQUIRE_XATTRS` gate.
 ///
-/// The probe itself differs by call site - a path `setxattr` here, an fd `fsetxattr` in the suites that already hold a
-/// descriptor - but what a refusal means does not: every xattr assertion behind it is about to be skipped, so a runner
-/// whose scratch filesystem drops xattr support must fail loudly where CI arms the gate rather than pass green having
-/// tested nothing.
-// Each including binary uses the half it needs - the live fixtures probe by path, the suites that already hold a
-// descriptor gate an `fsetxattr` - and a `#[path]` module is compiled fresh into every one of them, so the other half
-// is dead code there and nowhere else.
+/// The probe differs by call site, a path `setxattr` here and an fd `fsetxattr` in the suites that already hold a
+/// descriptor, but either way a refusal means every xattr assertion behind it is about to be skipped.
+// Each including binary uses the half it needs, and a `#[path]` module is compiled fresh into every one of them, so
+// the other half is dead code there and nowhere else.
 #[allow(dead_code)]
 pub fn refusal_is_allowed(what: &str, err: impl std::fmt::Display) {
     assert!(
