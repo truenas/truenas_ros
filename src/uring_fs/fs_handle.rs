@@ -11,14 +11,10 @@ impl FsHandle {
     /// would leave `anchor` is rejected (`"../../etc/shadow"` cannot walk out of the share), no symlink is followed,
     /// and resolution stops at a mount point rather than crossing into a nested dataset or a `.zfs/snapshot` automount.
     ///
-    /// A caller may replace that policy, but only by *stating* one: naming [`RESOLVE_BENEATH`] or [`RESOLVE_IN_ROOT`]
-    /// gets what it names - `RESOLVE_BENEATH` alone to allow in-tree symlinks, say. What it does **not** get is a way
-    /// to leave the anchor's filesystem: `RESOLVE_NO_XDEV` rides with every policy, because "may resolution follow a
-    /// symlink" and "may resolution end on another filesystem" are separate questions and the kernel keeps them
-    /// separate. Anchor on the nested mount to serve it. A `resolve` carrying only hardening flags is additive, so it
-    /// composes with the default instead of replacing it. Use [`open_confined`](Self::open_confined) where confinement
-    /// must not be replaceable at all. The personality's DAC binds every access regardless; the metadata ops are
-    /// separately single-component-confined by [`Leaf`].
+    /// A caller that names [`RESOLVE_BENEATH`] or [`RESOLVE_IN_ROOT`] replaces that policy, `RESOLVE_BENEATH` alone to
+    /// allow in-tree symlinks for one, but `RESOLVE_NO_XDEV` stays with every policy, so anchor on a nested mount to
+    /// serve it. Hardening flags alone add to the default rather than replace it. Use
+    /// [`open_confined`](Self::open_confined) where confinement must not be replaceable at all.
     ///
     /// [`RESOLVE_BENEATH`]: crate::sync_fs::ResolveFlag::RESOLVE_BENEATH
     /// [`RESOLVE_IN_ROOT`]: crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT
@@ -67,15 +63,9 @@ impl FsHandle {
 
     /// Open `path` under [`CONFINED_RESOLVE`], which the caller **cannot weaken**.
     ///
-    /// [`open`](Self::open) confines by default but yields to a caller that states a confinement policy of its own
-    /// (`RESOLVE_BENEATH` or `RESOLVE_IN_ROOT`) - reasonable for a general-purpose opener, and wrong when confinement
-    /// is a security property of the surrounding system rather than a convenience. This form unions the confinement
-    /// flags into whatever `how` asks for, so extra restrictions compose but none of the three can be dropped.
-    ///
-    /// Use it wherever the path component comes from a remote peer. The three escapes it forecloses are `..` walking
-    /// above `anchor`, a symlink redirecting out of the tree, and resolution crossing into a different filesystem - the
-    /// last being how a nested dataset or a `.zfs/snapshot` automount would otherwise be served as though it were part
-    /// of the tree.
+    /// The confinement flags are unioned into whatever `how` asks for, so extra restrictions compose but none of the
+    /// three can be dropped, as [`open`](Self::open) allows. Use it wherever the path comes from a remote peer. A
+    /// `RESOLVE_IN_ROOT` in `how` is refused with `Validation`, since `openat2` refuses it beside `RESOLVE_BENEATH`.
     pub fn open_confined<P: ?Sized + TnPath>(
         &self,
         who: Personality,
@@ -84,9 +74,8 @@ impl FsHandle {
         how: impl Into<FsOpenHow>,
     ) -> crate::Result<File> {
         let (cpath, mut raw, guarded, deadline) = open_parts(path, how.into())?;
-        // See `scoping_conflict`: unioning the bundle over a stated `IN_ROOT` made every path - a leaf, a nested path,
-        // `"."` - fail `EINVAL`, while the same call through `open` succeeded. Refused here, where the message can say
-        // what to do instead, rather than at the syscall where it cannot.
+        // Refused here, where the message can say what to do instead, rather than as a bare `EINVAL` from the syscall
+        // (see `scoping_conflict`).
         if scoping_conflict(raw.resolve) {
             return Err(crate::Error::Validation(
                 "uring_fs open_confined: RESOLVE_IN_ROOT cannot compose \
@@ -108,18 +97,8 @@ impl FsHandle {
     /// Existing components are left alone (`EEXIST` is success, as `mkdir -p` treats it), so this is idempotent and
     /// safe to race: two callers creating the same tree both succeed.
     ///
-    /// # Why this is a primitive rather than caller code
-    ///
-    /// It cannot be written as one operation, and the obvious shortcut is unsafe. `mkdirat` honours **no** `RESOLVE_*`
-    /// flags - that is precisely why [`Leaf`] exists - so handing it `"a/b/c"` would resolve the intermediate
-    /// components with no confinement at all. The only sound construction alternates confined `openat2` walks with
-    /// single-component `mkdirat`s, one round trip per component, which every consumer would otherwise have to
-    /// rediscover.
-    ///
-    /// The fast path is one operation: an existing tree resolves in a single confined open. Only missing components
-    /// cost a `mkdir` plus an open each.
-    ///
     /// `mode` applies to directories this call creates, and is subject to the process umask exactly as `mkdir(2)` is.
+    /// A path with any component that is not a plain name is refused with `Validation` before anything is opened.
     pub fn mkdir_path<P: ?Sized + TnPath>(
         &self,
         who: Personality,
@@ -150,7 +129,7 @@ impl FsHandle {
         let mut cur = anchor.clone();
         for part in bytes.split(|&b| b == b'/') {
             if part.is_empty() {
-                // A doubled or trailing slash names the same directory.
+                // Unreachable, since `relative_defect` refused an empty component above.
                 continue;
             }
             let leaf = Leaf::new(part)?;
@@ -170,13 +149,9 @@ impl FsHandle {
     /// Vectored positional read as `who` - `preadv2(2)` semantics: fill each buffer up to its current `len()`, in
     /// order, starting at file offset `off`. Returns the byte count (short only at end-of-file) and the buffers.
     ///
-    /// See [`RwFlags`] for what the flags mean and which ones a given filesystem actually implements; an unsupported
-    /// flag fails the read with `EOPNOTSUPP` rather than being quietly ignored, so support is discoverable per call.
-    /// Pass [`RwFlags::empty()`] for plain `preadv(2)` behaviour, and a one-element `bufs` for a single-buffer read.
-    ///
-    /// The read surface has two shapes. This one reads into buffers the caller sized and filled first.
-    /// [`pread_spare`](Self::pread_spare) reads into the spare capacity of one buffer, past what it holds, for a caller
-    /// that would otherwise zero the room before every read.
+    /// An unsupported flag fails the read with `EOPNOTSUPP`, as [`RwFlags`] says. Pass [`RwFlags::empty()`] for plain
+    /// `preadv(2)` behaviour. [`pread_spare`](Self::pread_spare) reads into the spare capacity of one buffer instead,
+    /// so nothing is zeroed first.
     pub fn preadv2(
         &self,
         who: Personality,
@@ -234,10 +209,9 @@ impl FsHandle {
     /// Vectored positional write as `who` - `pwritev2(2)` semantics: write each buffer's `len()` bytes, in order,
     /// starting at `off`. Returns bytes written and the buffers.
     ///
-    /// [`RwFlags::RWF_DSYNC`] makes the write itself durable and can therefore replace a following
-    /// [`fdatasync`](Self::fdatasync) - one operation instead of two. Whether that is *faster* is a filesystem question
-    /// worth measuring: on ZFS a synchronous write goes through the ZIL, which for large writes can cost more than a
-    /// single trailing sync. Pass [`RwFlags::empty()`] for plain `pwritev(2)` behaviour.
+    /// [`RwFlags::RWF_DSYNC`] makes the write itself durable and can replace a following
+    /// [`fdatasync`](Self::fdatasync), but on ZFS a synchronous write goes through the ZIL, which for large writes can
+    /// cost more than one trailing sync. Pass [`RwFlags::empty()`] for plain `pwritev(2)` behaviour.
     pub fn pwritev2(
         &self,
         who: Personality,
@@ -249,9 +223,7 @@ impl FsHandle {
         self.rw(core::TAG_WRITEV, who, f, bufs, off, flags)
     }
 
-    /// Start a vectored read without blocking; the returned [`FsPending`] collects the outcome. (The seam the
-    /// dropped-mid-op lifecycle needs: the token can be dropped while this op is in flight - the orphan close cancels
-    /// it and the pending wait observes `ECANCELED`.)
+    /// Start a vectored read without blocking. The returned [`FsPending`] collects the outcome.
     pub fn start_preadv2(
         &self,
         who: Personality,
@@ -265,9 +237,7 @@ impl FsHandle {
 
     /// Start a vectored write without blocking - the write-side twin of [`start_preadv2`](Self::start_preadv2).
     ///
-    /// Without this, an off-loop caller writing a large object must use the blocking [`pwritev2`](Self::pwritev2) and
-    /// park a thread for every write in flight. Issuing several of these and then collecting them lets one thread keep
-    /// many writes on the ring at once, which is the whole reason the reactor exists.
+    /// Issuing several of these and then collecting them keeps many writes on the ring from one thread.
     pub fn start_pwritev2(
         &self,
         who: Personality,
@@ -337,9 +307,7 @@ impl FsHandle {
     /// of [`start_statx`](Self::start_statx).
     ///
     /// Prefer this wherever a descriptor is already in hand: no path is resolved, so the metadata is that descriptor's
-    /// and cannot belong to whatever the name resolved to a moment later. A listing that stats by name *and* opens by
-    /// name performs two independent lookups, and under rename churn they can land on two different inodes - reporting
-    /// one file's size and mtime against another file's name.
+    /// and cannot belong to whatever the name resolved to a moment later.
     pub fn start_fstatx(
         &self,
         who: Personality,
@@ -424,10 +392,10 @@ impl FsHandle {
         self.sync(who, f, true, 0, 0)
     }
 
-    /// Flush the byte range `[offset, offset + length)` of `f` (`datasync` selects `fdatasync` semantics), mirroring
-    /// `truenas_pyos`'s ranged `prep_fsync`. The kernel syncs `[offset, offset + length]` via `vfs_fsync_range`;
-    /// `offset == 0 && length == 0` syncs the whole file. `length` is the SQE's 32-bit field (<= ~4 GiB per call); a
-    /// nonzero `offset` with `length == 0` is a single-byte range at `offset`, **not** through end-of-file.
+    /// Flush the byte range `[offset, offset + length)` of `f`, with `fdatasync` semantics when `datasync` is set. The
+    /// kernel syncs `[offset, offset + length]` through `vfs_fsync_range`, and `offset == 0 && length == 0` syncs the
+    /// whole file. `length` is the SQE's 32-bit field, so one call covers at most 4 GiB, and a nonzero `offset` with
+    /// `length == 0` is a single-byte range at `offset`, **not** through end-of-file.
     pub fn fsync_range(
         &self,
         who: Personality,
@@ -451,16 +419,9 @@ impl FsHandle {
     /// # A short buffer is reported two ways
     ///
     /// A `buf` shorter than the value fails **`ERANGE` or `E2BIG`**, and which one arrives is decided by the buffer
-    /// rather than by the value. `do_getxattr` (`fs/xattr.c`) ends by rewriting the filesystem's `-ERANGE` to `-E2BIG`
-    /// whenever the caller's buffer is at or above the kernel's own `XATTR_SIZE_MAX` (65536, `uapi/linux/limits.h`),
-    /// and that rewrite carries no `IS_LARGE_XATTR` guard even though the size clamp directly above it does. On a
-    /// filesystem whose values may reach `XATTR_LARGE_SIZE_MAX` (2 MiB) a retry buffer big enough for a large value is
-    /// therefore exactly the buffer whose short read reports `E2BIG`. Measured on ZFS against a 204800-byte value: 4096
-    /// and 65535 answer `ERANGE`, 65536 and 65537 answer `E2BIG`, 204800 answers `Ok(204800)`.
-    ///
-    /// So a grow-and-retry loop must enter on **both**. Written to `ERANGE` alone it converges for small values and
-    /// drops any value past ~43 KiB as oversized, because its first 1.5x retry lands at or over 65536. `E2BIG` on its
-    /// own does not mean "too big for this filesystem"; that is what the size-only form answers.
+    /// rather than by the value. `do_getxattr` (`fs/xattr.c`) rewrites `-ERANGE` to `-E2BIG` whenever the buffer is at
+    /// or above `XATTR_SIZE_MAX` (65536), with no `IS_LARGE_XATTR` guard, and a value on ZFS may reach 2 MiB. So a
+    /// grow-and-retry loop must retry on **both**, or it gives up on any value whose retry buffer reaches 65536.
     pub fn fgetxattr(
         &self,
         who: Personality,
@@ -581,8 +542,6 @@ impl FsHandle {
     ///
     /// `flags` takes `libc::XATTR_CREATE` (fail if it exists) or `libc::XATTR_REPLACE` (fail if it does not); 0 means
     /// create-or- replace. The value is returned alongside the result, like every owned buffer here.
-    ///
-    /// Needs Linux >= 6.13, like [`fgetxattr`](Self::fgetxattr).
     pub fn fsetxattr(
         &self,
         who: Personality,
@@ -607,8 +566,7 @@ impl FsHandle {
     /// Set what `set` names on `f` as `who`, in one `FSETXATTR` of [`ZFS_SETATTR`], so the kernel's checks run as
     /// `who`.
     ///
-    /// [`ZfsSetattr`] says which checks apply, and a ZFS without the handler answers `EOPNOTSUPP`. Needs Linux >= 6.13,
-    /// like [`fsetxattr`](Self::fsetxattr).
+    /// [`ZfsSetattr`] says which checks apply, and a ZFS without the handler answers `EOPNOTSUPP`.
     pub fn fset_attrs(&self, who: Personality, f: &File, set: &ZfsSetattr) -> crate::Result<()> {
         self.fsetxattr(who, f, ZFS_SETATTR, set.to_bytes(), 0).0
     }
@@ -617,16 +575,14 @@ impl FsHandle {
     ///
     /// Runs a blocking `flistxattr` on the calling thread at its own privilege, so call it off the reactor (a worker or
     /// client thread). Names the caller is not privileged to see (`trusted.*` without `CAP_SYS_ADMIN`) are omitted by
-    /// the kernel. Unlike the fd-xattr read/write ops this needs no special kernel version.
+    /// the kernel.
     pub fn flistxattr(&self, f: &File) -> crate::Result<Vec<CString>> {
         query_dir::list_xattr_names(f)
     }
 
     /// Filesystem statistics for the mount `f` lives on.
     ///
-    /// Runs inline on the calling thread - this handle is already off the reactor, so there is nothing to offload it
-    /// *from*, exactly as [`flistxattr`](Self::flistxattr) does. io_uring has no `statfs` opcode, so the on-loop
-    /// [`FsConn`] twin has to take a pool thread; here the caller supplies one by being one.
+    /// Runs inline on the calling thread, which is already off the reactor.
     pub fn fstatfs(&self, f: &File) -> crate::Result<Statfs> {
         Ok(crate::sync_fs::fstatfs(&*f.fd)?)
     }
@@ -635,8 +591,7 @@ impl FsHandle {
     /// it.
     ///
     /// An [`Anchor`] is an `O_PATH` descriptor, which most fd-taking calls reject; this one does not, because the
-    /// kernel resolves through `f_path` and never consults `f_op` (`fd_statfs`, `fs/statfs.c`). So a bucket's free
-    /// space costs no open.
+    /// kernel resolves through `f_path` and never consults `f_op` (`fd_statfs`, `fs/statfs.c`).
     pub fn fstatfs_anchor(&self, anchor: &Anchor) -> crate::Result<Statfs> {
         Ok(crate::sync_fs::fstatfs(anchor)?)
     }
@@ -655,12 +610,9 @@ impl FsHandle {
     /// Replace `f`'s ZFS attributes with `attrs`. **The mask is absolute**: visible bits absent from `attrs` are
     /// cleared, so read with [`fget_zfs_attrs`](Self::fget_zfs_attrs) and modify that rather than writing a constant.
     ///
-    /// Note the missing [`Personality`], for the same reason [`fremovexattr`](Self::fremovexattr) has none: the kernel
-    /// checks the *calling thread's* credentials for an ioctl, and this thread carries the reactor's, not a request
-    /// identity's. Whether a given caller may lock a given file is therefore a policy question this API cannot answer -
-    /// and it matters, because `ZfsAttr::NOUNLINK` needs only ownership to clear while `IMMUTABLE` needs
-    /// `CAP_LINUX_IMMUTABLE`.
-    /// Do not expose this to a request identity without a gate above it.
+    /// It takes no [`Personality`], since the kernel checks an ioctl against the calling thread's credentials, the
+    /// process's own. Clearing `ZfsAttr::NOUNLINK` needs only ownership while `IMMUTABLE` needs `CAP_LINUX_IMMUTABLE`,
+    /// so do not expose this to a request identity without a gate above it.
     ///
     /// Setting `IMMUTABLE` also makes the file's extended attributes read-only (`may_write_xattr`, `fs/xattr.c`), so
     /// write any metadata that belongs with a locked object *before* locking it.
@@ -671,11 +623,9 @@ impl FsHandle {
     /// Remove a **server-owned** extended attribute from `f`, or `EPERM` if `name` is not covered by the reactor's
     /// [`PrivilegedXattrs`] policy.
     ///
-    /// Note the missing [`Personality`]: alone among the mutations here, this one cannot be credential-checked by the
-    /// kernel. io_uring has no removal opcode, and a zero-length `FSETXATTR` sets an *empty* attribute rather than
-    /// removing one, so the call has to run on a pool thread under the reactor's own credentials. The allowlist stands
-    /// in for the identity check: a caller may clear metadata this reactor wrote, and nothing else. To let a *user*
-    /// remove their own attribute, do it on a thread that holds their credentials - this API cannot.
+    /// It takes no [`Personality`]. io_uring has no removal opcode, and a zero-length `FSETXATTR` sets an *empty*
+    /// attribute rather than removing one, so the call runs on a pool thread under the reactor's own credentials. The
+    /// allowlist stands in for the identity check, so a user's own attribute cannot be removed through this.
     pub fn fremovexattr(&self, f: &File, name: impl Into<Cow<'static, CStr>>) -> crate::Result<()> {
         let (tx, rx) = mpsc::channel();
         let out = self.call(
@@ -707,9 +657,7 @@ impl FsHandle {
 
     /// Set the open file's length (`ftruncate`).
     ///
-    /// Uses `IORING_OP_FTRUNCATE`, which needs Linux >= 6.9 - later than the other io_uring ops this crate submits, and
-    /// still below its 6.18 floor, so it is always present and **nothing probes or gates it**. On a kernel that lacked
-    /// it the submission would answer the bare `-EINVAL` io_uring returns for any unknown opcode.
+    /// Uses `IORING_OP_FTRUNCATE`, from Linux 6.9, below the crate's 6.18 floor, so nothing probes for it.
     pub fn ftruncate(&self, who: Personality, f: &File, len: u64) -> crate::Result<()> {
         self.fd_meta_unit(core::TAG_FTRUNCATE, who, f, len, 0, 0)
     }
@@ -732,18 +680,9 @@ impl FsHandle {
     /// Move up to `len` bytes from `pipe`'s read end into `f` at `off`, without a userspace buffer
     /// (`IORING_OP_SPLICE`). Returns the number of bytes moved.
     ///
-    /// The ingest half of a zero-copy body path: whoever fills the pipe never materializes the bytes, and neither does
-    /// this. `pipe` is a plain descriptor the caller keeps open across the call - it is **not** taken into the
-    /// fixed-file pool and costs no [`FsConfig`] slot.
-    ///
-    /// # A short move is ordinary progress
-    ///
-    /// A pipe delivers what it has, so **a returned count below `len` means resubmit the remainder** - it does not mean
-    /// end of input, and it is not an error. (The kernel's `req_set_fail` on a short move -- `io_splice`,
-    /// `io_uring/splice.c` - decides only whether an `IOSQE_IO_LINK` chain continues, and this issues no chain.)
-    ///
-    /// Nothing passes through userspace, so nothing can hash the bytes in transit. A body that needs an ETag computed
-    /// on ingest has to be read conventionally instead.
+    /// `pipe` is a plain descriptor the caller keeps open across the call. A pipe delivers what it has, so **a returned
+    /// count below `len` means resubmit the remainder**, not end of input and not an error. Nothing passes through
+    /// userspace, so nothing can hash the bytes in transit.
     pub fn splice_from_pipe(&self, who: Personality, f: &File, pipe: RawFd, off: u64, len: u32) -> crate::Result<u64> {
         self.fd_meta_count(
             core::TAG_SPLICE,
@@ -761,10 +700,8 @@ impl FsHandle {
     /// Stat the entry `leaf` inside `anchor`. Does **not** follow a terminal symlink by default (the link itself is
     /// stat'd); pass `AtFlags::AT_SYMLINK_FOLLOW` to stat the target.
     ///
-    /// **A metadata op that resolves a name** rather than taking an open file. For an already-open [`File`],
-    /// [`fstatx`](Self::fstatx) stats it directly (`STATX` with `AT_EMPTY_PATH` on its plain fd); prefer that, or
-    /// [`statx_anchor`](Self::statx_anchor) when you already hold the target, and be aware that a statx-then-open pair
-    /// names the file twice: the two can disagree if it is replaced in between.
+    /// Prefer [`fstatx`](Self::fstatx) on a file already open, since a stat and then an open by name can find two
+    /// different files if the name is replaced in between.
     pub fn statx(
         &self,
         who: Personality,
@@ -907,14 +844,9 @@ impl FsHandle {
 
     /// Give the already-open `f` a name at `new_leaf` in `new` (`linkat` with `AT_EMPTY_PATH`).
     ///
-    /// This is how an `O_TMPFILE` file is materialized: it is the only link form that can name an inode which has no
-    /// name yet, and it is therefore the publish step of a durable create - write and sync an invisible file, then make
-    /// it appear, already complete, in one atomic operation. A failure before this point leaves nothing behind at all:
-    /// dropping the [`File`] releases the last reference to an unnamed inode, so there is no temporary file to clean
-    /// up, on error or after a crash.
-    ///
-    /// Note that `linkat` cannot replace an existing name (`EEXIST`); to overwrite, link to a temporary name and then
-    /// [`renameat`](Self::renameat) over the target.
+    /// This is how an `O_TMPFILE` file is published, the commit step of a durable create. Until then a failure leaves
+    /// nothing behind, since dropping the [`File`] releases an unnamed inode. `linkat` cannot replace an existing name
+    /// (`EEXIST`), so to overwrite, link to a temporary name and then [`renameat`](Self::renameat) over the target.
     ///
     /// # Requirements
     ///
@@ -927,11 +859,8 @@ impl FsHandle {
     ///   fails with `ENOENT`, not `EPERM`. In practice: hold one [`Lease`] for the whole create rather than
     ///   re-acquiring between the open and the link.
     ///
-    ///   The kernel accepts [`Caps::DAC_READ_SEARCH`] as the alternative to
-    ///   that pointer match, so a personality carrying it can publish a file
-    ///   opened under a *different* one - useful when a create genuinely
-    ///   cannot be held inside a single lease. It is a broad capability for a
-    ///   narrow problem, though; prefer the one-[`Lease`] rule.
+    ///   The kernel also accepts [`Caps::DAC_READ_SEARCH`] in place of that match, a broad capability for a narrow
+    ///   problem, so prefer the one-[`Lease`] rule.
     pub fn linkat_file(&self, who: Personality, f: &File, new: &Anchor, new_leaf: Leaf<'_>) -> crate::Result<()> {
         let (tx, rx) = mpsc::channel();
         let out = self.call(
@@ -1115,14 +1044,10 @@ impl FsHandle {
     /// A directory-entry op in the common `(anchor, leaf)` [+ destination] shape.
     ///
     /// **`EBUSY` from here has two producers and this path cannot tell them apart.** The reactor answers it when the op
-    /// table is full, which is transient and worth retrying; the kernel answers it from `is_local_mountpoint` in
-    /// `vfs_rmdir` (`fs/namei.c:4588`), `vfs_unlink` (`:4715`) and `vfs_rename` (`:5243`), which is permanent for that
-    /// path - and on TrueNAS a nested dataset is a local mountpoint under its parent, so a blocking caller that retries
-    /// on `EBUSY` alone spins on one. These signatures return `crate::Result`, which has nowhere to carry the bit that
-    /// separates them; on the [`FsConn`] facade the same distinction is readable as
-    /// [`FsDone::was_refused`](core::FsDone::was_refused) (the `FsDone`-carrying callbacks and [`FsConn::fut`] - not
-    /// the `crate::Result` shapes of `offload_fut`/`result_fut`, which drop it too). Bound the retries here, or use
-    /// that path.
+    /// table is full, which is transient, and the kernel answers it from `is_local_mountpoint` in `vfs_rmdir`
+    /// (`fs/namei.c:4588`), `vfs_unlink` (`:4715`) and `vfs_rename` (`:5243`), which is permanent for that path. A
+    /// nested dataset is a local mountpoint under its parent, so bound the retries, or use the [`FsConn`] facade, where
+    /// [`FsDone::was_refused`](core::FsDone::was_refused) tells them apart.
     #[allow(clippy::too_many_arguments)]
     fn path_op(
         &self,
@@ -1155,9 +1080,8 @@ impl FsHandle {
 
     /// Queue an inject and wake the loop. On failure (loop stopping or gone) the un-sent message is handed back as
     /// `Err(msg)` so a caller can recover the owned buffers it moved in; the error is always `ECONNABORTED`.
-    /// (`pub(crate)`: the async `rt` handle submits through the same path.)
-    // The Err IS the un-sent message, by design - its size is the payload the caller gets back (buffers, lease), not an
-    // error-path allocation to shrink.
+    // The `Err` is the un-sent message, so its size is the buffers the caller gets back, not an error-path allocation
+    // to shrink.
     #[allow(clippy::result_large_err)]
     pub(crate) fn send(&self, msg: FsInject) -> Result<(), FsInject> {
         if self.shared.stop_requested() {

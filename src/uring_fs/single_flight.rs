@@ -54,6 +54,9 @@ impl<K: Clone + Eq + Hash, V: Clone> SingleFlight<K, V> {
         let mut mint = Some(mint);
         loop {
             let slot = {
+                // This lock fails closed on poison and precedes the fast path, so a poisoned map fails every acquire
+                // before a stale identity is served. The failed mint's eviction, `invalidate`, `clear` and `len`
+                // swallow poison instead. **Hoisting the fast path above this lock removes the guarantee.**
                 let mut live = self.live.lock().map_err(|_| Errno::EIO)?;
                 live.entry(key.clone())
                     .or_insert_with(|| Arc::new(Slot::empty()))
@@ -69,10 +72,8 @@ impl<K: Clone + Eq + Hash, V: Clone> SingleFlight<K, V> {
             if let Some(v) = slot.cell.with(V::clone) {
                 return Ok(v);
             }
-            // Confirm the map still holds *this* slot before minting on it. A failed mint evicts its slot, and a caller
-            // arriving after that installs a fresh one - so a slot cloned before the eviction is now orphaned, and
-            // minting on it would let the map's current slot mint the key a second time. Restart onto the current slot
-            // instead; its fast path or gate then joins that mint rather than duplicating it.
+            // Confirm the map still holds *this* slot. A failed mint evicts its slot and a later caller installs a
+            // fresh one, so minting on an orphaned slot would mint the key twice. Restart onto the current slot.
             {
                 let live = self.live.lock().map_err(|_| Errno::EIO)?;
                 if !live.get(key).is_some_and(|s| Arc::ptr_eq(s, &slot)) {
@@ -92,17 +93,12 @@ impl<K: Clone + Eq + Hash, V: Clone> SingleFlight<K, V> {
                     return Err(e);
                 }
             };
-            // Cannot fail: the gate is held and the re-check found it empty. Publishing here is the whole of it -
-            // callers reach the value through the `Arc` the map already holds, so there is nothing to write back.
+            // Cannot fail, since the gate is held and the re-check found it empty. Callers reach the value through the
+            // `Arc` the map already holds.
             //
-            // **Do not re-install the slot afterwards.** It looks like a harmless re-affirmation and it is not: the map
-            // lock is released across `mint`, so an `invalidate` or `clear` landing in that window has removed this
-            // key, and an `entry(..).or_insert_with(..)` there puts the just-minted slot straight back. Snapshots never
-            // expire on their own ([`IdentityCache`](super::IdentityCache)), so revocation is the only mechanism there
-            // is and nothing retries it - the stale value would then be served for the life of the process. The
-            // reachable shape is ordinary: a directory-services change fires `invalidate_all` while acquires for new
-            // identities are in flight. A slot the map still holds needs no write, and one it no longer holds must not
-            // be given back.
+            // **Do not re-install the slot afterwards.** The map lock is released across `mint`, so an `invalidate` or
+            // `clear` in that window has removed this key, and putting the slot back would serve a revoked identity for
+            // the life of the process, since snapshots never expire and nothing retries a revocation.
             slot.cell.set(value.clone());
             return Ok(value);
         }
@@ -173,16 +169,8 @@ mod tests {
         }
     }
 
-    /// A poisoned map fails **every** acquire, cache hits included.
-    ///
-    /// Poison handling in `get_or_try_init` is not uniform: the first map acquisition reports `EIO`, the later ones
-    /// swallow it. What makes that safe is *position* - the first one precedes the cache-hit fast path, so no stale
-    /// identity is served out of a map whose consistency the poison declared broken, and `IdentityCache::acquire` hands
-    /// out brokered identities from it.
-    ///
-    /// So this holds against the two edits that would quietly remove the guarantee: making the first acquisition
-    /// swallow poison like its siblings, and lifting the fast path above it. A model on healthy locks cannot see
-    /// either.
+    /// A poisoned map fails **every** acquire, cache hits included. This holds against making the first acquisition
+    /// swallow poison and against lifting the fast path above it, which a model on healthy locks cannot see.
     #[test]
     fn a_poisoned_map_fails_closed_before_the_cache_hit() {
         let s: SingleFlight<Bomb, u32> = SingleFlight::new();
@@ -217,16 +205,8 @@ mod tests {
         );
     }
 
-    /// An `invalidate` that lands while a mint is running must survive it.
-    ///
-    /// The map lock is released across `mint` - deliberately, so a hit on one key does not block a mint on another -
-    /// which puts every revocation racing every in-flight acquire for that key. Driven from inside the mint rather than
-    /// from a second thread: the window is the released map lock, so a reentrant call reaches it exactly, and
-    /// deterministically, where a timing test would only sometimes.
-    ///
-    /// The harm is `IdentityCache`'s: snapshots are frozen and nothing expires on its own, so
-    /// `invalidate`/`invalidate_all` is the only revocation there is and nothing retries it. Undone once, the stale
-    /// credential is served for the life of the process.
+    /// An `invalidate` that lands while a mint is running must survive it. Driven from inside the mint, since the
+    /// window is the released map lock and a reentrant call reaches it every time.
     #[test]
     fn an_invalidate_during_a_mint_is_not_undone() {
         let s = sf();
@@ -329,10 +309,7 @@ mod loom_tests {
     /// callers are done, a third lookup is a hit.
     ///
     /// Negative control: delete the slot-identity re-check under the gate, which reddens this and
-    /// `loom_a_failed_mint_cannot_double_mint`. (Not the re-install after a successful mint - `get_or_try_init`
-    /// deliberately does not write the slot back, and the reasoning is at the publish. The guard on the *eviction* is
-    /// watched by `loom_a_failed_mint_evicts_only_its_own_slot`, which is the only model that changes a slot's identity
-    /// under a mint.)
+    /// `loom_a_failed_mint_cannot_double_mint`.
     #[test]
     fn loom_a_failed_mint_does_not_orphan_a_successful_one() {
         bounded_model(|| {
@@ -367,20 +344,12 @@ mod loom_tests {
         });
     }
 
-    /// The double-mint a two-thread model cannot reach: a failing mint evicts its slot, a second caller is still queued
-    /// on it, and a third arrives after the eviction and installs a fresh slot. Even then the key is minted at most
-    /// once, and one live value remains.
+    /// A failing mint evicts **its own** slot and no other. The map lock is released across `mint`, so an `invalidate`
+    /// in that window replaces the slot the failure is about to drop, and dropping the replacement would discard a
+    /// value minted successfully.
     ///
-    /// Negative control: delete the slot-identity re-check under the gate.
-    /// A failing mint evicts **its own** slot and no other.
-    ///
-    /// The map lock is released across `mint`, so an `invalidate` landing in that window has already replaced the slot
-    /// the failure is about to drop - and dropping the replacement discards a value that was minted successfully, with
-    /// nothing to retry it. Snapshots never expire on their own, so a directory-services change firing `invalidate`
-    /// while an acquire is in flight is the reachable shape.
-    ///
-    /// Negative control: drop the `Arc::ptr_eq` from the eviction. The other three models stay green through that,
-    /// which is why this one exists - it is the only one that moves a slot's identity while a mint is running.
+    /// The negative control is dropping the `Arc::ptr_eq` from the eviction. This is the only model that moves a slot's
+    /// identity while a mint is running.
     #[test]
     fn loom_a_failed_mint_evicts_only_its_own_slot() {
         bounded_model(|| {
@@ -405,6 +374,11 @@ mod loom_tests {
         });
     }
 
+    /// The double-mint a two-thread model cannot reach: a failing mint evicts its slot, a second caller is still queued
+    /// on it, and a third arrives after the eviction and installs a fresh slot. Even then the key is minted at most
+    /// once, and one live value remains.
+    ///
+    /// Negative control: delete the slot-identity re-check under the gate.
     #[test]
     fn loom_a_failed_mint_cannot_double_mint() {
         bounded_model(|| {

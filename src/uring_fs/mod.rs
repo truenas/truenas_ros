@@ -10,8 +10,8 @@
 //!   [`UringFs::register_self`], and `sqe.personality = 0` (the ring owner's ambient creds) is reachable only through
 //!   the two reads [`FsHandle::fgetxattr_as_root`] and [`FsHandle::fgetxattr_proc_as_root`], for metadata a server
 //!   checks itself and never hands to a request, the reopen [`FsHandle::reopen_proc_as_root`], for an access a server
-//!   has already decided, and the write allowlist of [`PrivilegedXattrs`]. Only [`FsHandle::close`] is exempt -
-//!   teardown consults no credentials and must be stageable from [`File`]'s `Drop`.
+//!   has already decided, and the write allowlist of [`PrivilegedXattrs`]. The few calls that are not ring ops, such as
+//!   [`FsHandle::close`] and [`FsHandle::fremovexattr`], take none.
 //! - **Resolution is anchored.** No call takes an absolute path. [`Anchor`] is a long-lived real directory fd; `open`
 //!   resolves a **relative**, multi-component path against it (confine it in-kernel with
 //!   [`ResolveFlag::RESOLVE_BENEATH`](crate::sync_fs::ResolveFlag)), and every subsequent operation is fd-based on the
@@ -58,67 +58,38 @@
 //!
 //! # Naming
 //!
-//! Method names follow their syscalls. The **`p`** prefix means *positional* --
-//! [`preadv2`](FsHandle::preadv2)/[`pwritev2`](FsHandle::pwritev2) take an explicit file offset, exactly as
-//! `preadv2(2)`/`pwritev2(2)` do. Every data op here is positional: ops carry their own offset rather than advance a
-//! shared file position, so there is no offsetless `read`/`write` and no `seek`. Those two are also the *whole* data
-//! surface - a single-buffer or unflagged variant would be a second spelling of one submission, so pass a one-element
-//! `bufs` and [`RwFlags::empty()`]. The **`at`** suffix is reserved for its usual meaning, the dirfd-relative syscall
-//! family ([`renameat`](FsHandle::renameat), [`unlinkat`](FsHandle::unlinkat), [`mkdirat`](FsHandle::mkdirat), ...),
-//! where the anchor dirfd is what the name refers to.
+//! Method names follow their syscalls. Every data op is positional, carrying its own offset, so there is no offsetless
+//! `read` or `write` and no `seek`. A single-buffer or unflagged read or write passes a one-element `bufs` and
+//! [`RwFlags::empty()`] rather than taking a second spelling. The `at` suffix keeps its usual meaning, a name relative
+//! to an anchor dirfd.
 //!
 //! # What operates on what
 //!
-//! The API is fd-first, so that `open -> metadata -> close` is the natural shape and a file is named exactly once:
+//! The API is fd-first, so a file is named once, by its open, and later ops take the [`File`]. The directory entry ops
+//! ([`mkdirat`](FsHandle::mkdirat), [`unlinkat`](FsHandle::unlinkat), [`renameat`](FsHandle::renameat) and the rest)
+//! take an [`Anchor`] and a validated [`Leaf`], since no kernel has an fd-only form of them. [`statx`](FsHandle::statx)
+//! resolves a name, and [`fstatx`](FsHandle::fstatx) stats an open file. A pool job ([`FsConn::offload_result`]) makes
+//! blocking calls on a [`File`] through [`AsFd`]. [`File::from_fd`] takes a descriptor opened outside the reactor,
+//! which carries the access of its opener and not that of a personality.
 //!
-//! - **On an open [`File`]:** [`preadv2`](FsHandle::preadv2) / [`pwritev2`](FsHandle::pwritev2) (vectored, carrying
-//!   [`RwFlags`]), [`splice_from_pipe`](FsHandle::splice_from_pipe) for a body that never enters userspace,
-//!   [`fsync`](FsHandle::fsync) / [`fdatasync`](FsHandle::fdatasync), [`fgetxattr`](FsHandle::fgetxattr) /
-//!   [`fsetxattr`](FsHandle::fsetxattr) / [`fremovexattr`](FsHandle::fremovexattr), [`ftruncate`](FsHandle::ftruncate),
-//!   [`fallocate`](FsHandle::fallocate), [`fadvise`](FsHandle::fadvise), and [`close`](FsHandle::close).
-//! - **[`statx`](FsHandle::statx)** resolves a name against an anchor; for an already-open file,
-//!   [`fstatx`](FsHandle::fstatx) stats it directly (`STATX` with `AT_EMPTY_PATH` on the plain fd - the `fstat`
-//!   equivalent), as does [`statx_anchor`](FsHandle::statx_anchor) for an anchor's own dirfd.
-//! - **Directory entries** - [`mkdirat`](FsHandle::mkdirat), [`unlinkat`](FsHandle::unlinkat),
-//!   [`rmdirat`](FsHandle::rmdirat), [`renameat`](FsHandle::renameat), [`symlinkat`](FsHandle::symlinkat),
-//!   [`linkat`](FsHandle::linkat) - take an [`Anchor`] plus a validated [`Leaf`]. These have no fd-only form in any
-//!   kernel (you cannot unlink an fd); dirfd-plus-name *is* their fd-based shape.
-//! - **[`linkat_file`](FsHandle::linkat_file)** is the exception that gives an *already-open* file a name
-//!   (`AT_EMPTY_PATH`) - the only way to name an `O_TMPFILE`, and so the commit step of a durable create.
-//! - **Blocking tails** ([`FsConn::offload_result`]) operate on the open [`File`] too: it is [`AsFd`], so a pool job
-//!   makes blocking fd-based calls on it - descriptors, never names.
-//! - **[`File::from_fd`]** takes a descriptor opened outside the reactor, such as one a pool job opened by file handle,
-//!   so the ops above can use it. It carries the access of its opener, not that of a personality.
+//! # Building on top
 //!
-//! # Building on top: durable create, confinement, server-owned metadata
-//!
-//! Four facilities exist because a service storing data on behalf of remote users needs them and cannot assemble them
-//! safely from the raw ops:
-//!
-//! - **Durable create.** Open `O_TMPFILE` (no `O_EXCL`), write, sync, then [`linkat_file`](FsHandle::linkat_file) to a
-//!   private name and [`renameat`](FsHandle::renameat) onto the target. Nothing is visible until the rename, which
-//!   replaces atomically, so a reader sees the old file or the new one and never a partial write - and an abandoned or
-//!   crashed create leaves *nothing* to clean up, because an unnamed inode simply disappears. (Do not fuse these into
-//!   an [`IOSQE_IO_LINK`](crate::uring_fs) chain: filesystem opcodes do not break chains on failure, so a failed link
-//!   would let the rename run anyway.)
-//! - **Confinement.** [`open_confined`](FsHandle::open_confined) applies [`CONFINED_RESOLVE`] in a way the caller
-//!   cannot weaken, and [`mkdir_path`](FsHandle::mkdir_path) creates a nested path the only sound way - alternating
-//!   confined walks with single-[`Leaf`] `mkdirat`s, because `mkdirat` itself honours no resolve flags.
-//!   [`FsConn::open_parent`] is the one open that leaves its anchor. It goes up one level to the parent, as the caller,
-//!   and never across a mount. [`FsConn::open_parent_across_mount`] goes up the same one level and may cross the top of
-//!   a mount to do it, onto the file system it sits in. [`FsConn::reopen_proc`] takes no path, and opens again only a
-//!   file already held, through `/proc`.
-//! - **Split-credential descent.** [`FsConn::open_chain`] opens a sequence of paths, each relative to the one before it
-//!   and each under **its own personality** - so a file inside a tree only the daemon may traverse is still resolved
-//!   under the caller's credential, and the kernel makes the access decision about the file the caller actually named.
-//!   Like `mkdir_path`, the walk lives here so that each step's personality and confinement are the walk's own rather
-//!   than a consumer's to repeat correctly.
+//! - **Durable create.** Open `O_TMPFILE` without `O_EXCL`, write, sync, then [`linkat_file`](FsHandle::linkat_file) to
+//!   a private name and [`renameat`](FsHandle::renameat) onto the target. A reader sees the old file or the new one,
+//!   and an abandoned create leaves nothing behind. Do not chain these with `IOSQE_IO_LINK`, since a failed filesystem
+//!   op does not break a chain and the rename would run anyway.
+//! - **Confinement.** [`open_confined`](FsHandle::open_confined) applies [`CONFINED_RESOLVE`] so the caller cannot
+//!   weaken it, and [`mkdir_path`](FsHandle::mkdir_path) creates a nested path by alternating confined walks with
+//!   single-[`Leaf`] `mkdirat`s, since `mkdirat` honours no resolve flags. [`FsConn::open_parent`] goes up one level as
+//!   the caller and never across a mount, [`FsConn::open_parent_across_mount`] may cross the top of a mount, and
+//!   [`FsConn::reopen_proc`] opens again only a file already held, through `/proc`.
+//! - **Split-credential descent.** [`FsConn::open_chain`] opens a sequence of paths, each relative to the one before
+//!   and each under **its own personality**, so the kernel decides access to the file the caller named under the
+//!   caller's credential, even inside a tree only the daemon may traverse.
 //! - **Server-owned metadata.** [`PrivilegedXattrs`] lets declared `trusted.*` attributes be written under the
-//!   reactor's own credentials, so a service can keep metadata that the user who owns the file can neither read,
-//!   change, nor see.
-//! - **Batched blocking offload.** [`FsConn::offload_result`] runs the blocking, opcode-less part of a request as one
-//!   pool job - one job per request tail, not one per call - and delivers its `crate::Result` back on the loop. The job
-//!   contract lives at [`offload`](FsConn::offload).
+//!   reactor's own credentials.
+//! - **Batched blocking offload.** [`FsConn::offload_result`] runs the blocking part of a request as one pool job and
+//!   delivers its result on the loop. The job contract lives at [`offload`](FsConn::offload).
 //!
 //! # Acting as other users
 //!
@@ -159,27 +130,13 @@
 //! nothing that happens to the reactor afterwards can widen it.
 //!
 //! Read the entry for whichever bit you are reaching for before reaching for it; none of them is narrow.
-//! [`Caps::DAC_READ_SEARCH`] is a whole-filesystem *read* grant, not a traverse-only one, and Linux offers nothing
-//! narrower on that axis. [`Caps::DAC_OVERRIDE`] adds write, and on ZFS the `chmod` and ACL rewrite with it.
-//! [`Caps::FOWNER`] adds delete-past-a-denial. Either can change ownership where the ACL is non-trivial. The last two
-//! are defensible only where every path op is confined (`RESOLVE_BENEATH`), because they bound what may be done
-//! *within* a tree and say nothing about *which* tree.
-//!
-//! # Embedding in another host
-//!
-//! The reactor core ([`FsConn`]/[`FsDone`]) is deliberately host-agnostic: a single-threaded event loop that owns its
-//! own `Engine` can drive fs ops inline and receive completions as in-loop callbacks, interleaving fs and its own SQEs
-//! on one ring. Under the `net-server` feature the io_uring net server drives the core this way.
 //!
 //! # Awaiting instead of chaining
 //!
-//! Completion callbacks stay the primitive, and a second consumption style sits on them: [`FsConn::fut`] returns one
-//! submission's outcome as a future - [`FsConn::result_fut`] for the offload-shaped methods, whose callback carries a
-//! [`crate::Result`] rather than an [`FsDone`] - and [`FsConn::spawn`] runs a `'static` future as an on-loop **task**,
-//! submitting through the [`TaskFs`] its body receives. A multi-step chain then reads as straight-line `async`/`await`
-//! instead of a hop per completion, with the same owner scoping, the same facade semantics per poll, and the ops
-//! themselves on the same ring path. The two styles mix freely within one request; see [`task`](self::TaskFs) for the
-//! contract.
+//! Completion callbacks stay the primitive. [`FsConn::fut`] returns one submission's outcome as a future,
+//! [`FsConn::result_fut`] does so for the offload-shaped methods, and [`FsConn::spawn`] runs a `'static` future as an
+//! on-loop **task** that submits through the [`TaskFs`] it receives. The two styles mix freely within one request, and
+//! the contract is at [`task`](self::TaskFs).
 
 mod broker;
 // The mint-once-per-key protocol behind `IdentityCache`, kept separate so it can be model-checked without a broker
@@ -189,15 +146,12 @@ mod single_flight;
 // the fs-domain modules that submit to it.
 pub(crate) mod offload_pool;
 pub use offload_pool::OffloadBounds;
-// `pub(crate)` so an embedding host (a server driving `FsCore` on its own can drive an `FsCore` on the server's own
-// ring; the standalone host is `uring_fs`'s own `UringFs`.
+// `pub(crate)` so a `net` server can drive an `FsCore` on its own ring.
 pub(crate) mod core;
 // Read leases a ring holds on files, and the breaks of them that reach it.
 pub mod file_lease;
-// Exported unconditionally, not just with `net-server`. `FsConn` is the callback submission facade - the only way to
-// run several operations back to back without parking a thread between them - and an out-of-tree consumer driving a
-// standalone [`UringFs`] needs it exactly as much as an embedded server does. Gating it on the server role made the
-// whole on-loop surface unreachable for anyone else.
+// Exported without `net-server`, since a consumer driving a standalone [`UringFs`] needs the `FsConn` facade to run
+// several operations back to back as much as an embedded server does.
 pub use core::{ConnToken, DeriveName, DirWalk, FsConn, FsDone, NameBatch, OpenStep, StepPath, Timer};
 // The one on-loop type that is the server's alone: a window of a pooled receive buffer, which only the net server has.
 #[cfg(feature = "net-server")]
@@ -210,15 +164,11 @@ pub use task::{FsFuture, JoinError, JoinHandle, OffloadFuture, OnDone, OnResult,
 /// Silence the panic hook for **this thread only**, until the guard drops.
 ///
 /// `set_hook` is process-wide and `cargo test` runs a binary's tests as threads in one process, so a hook that swallows
-/// everything hides a concurrent test's genuine panic message for the window it is installed - turning a legible
-/// failure elsewhere into a bare "test failed".
+/// everything would hide a concurrent test's panic message.
 ///
 /// **The filter is installed once and never taken back, because `set_hook` is a slot rather than a stack.** A guard
-/// that installed over the current hook and restored it on drop cannot compose: thread B installs over A's, A's guard
-/// drops and restores the *default*, discarding B's filter while B is still running, and B's later drop reinstates A's
-/// stale one for the rest of the process. Serializing the callers instead - which one caller here did and three did
-/// not - makes them wait on each other for no reason. One hook consulting a set of quiet threads has neither problem,
-/// and quieting is nested and counted so a guard inside a guard un-quiets nothing.
+/// that restored the previous hook on drop would discard another thread's filter while it still runs. Quieting is
+/// counted, so a guard inside a guard un-quiets nothing.
 #[cfg(all(test, not(loom)))]
 pub(crate) fn quiet_panics_on_this_thread() -> QuietPanics {
     static INSTALL: std::sync::Once = std::sync::Once::new();
@@ -277,8 +227,6 @@ pub use query_dir::{
 
 pub mod query_tree;
 pub use query_tree::{QueryTree, TreeCursor, TreeEntry, TreeOptions, query_tree};
-// `pub(crate)` so a `net` server can reuse the fixed-file-xattr capability probe (the 6.13 floor is not visible to
-// `REGISTER_PROBE`); the standalone reactor is `UringFs`.
 pub(crate) mod host;
 
 pub use crate::uring::ring::RingFd;
@@ -363,33 +311,17 @@ const CONFINEMENT_POLICY: ResolveFlag = ResolveFlag::RESOLVE_BENEATH.union(Resol
 /// `RESOLVE_NO_XDEV` answers a different question from `BENEATH`/`IN_ROOT`. Those bound where resolution may go *within
 /// a tree*; this bounds which *filesystem* it ends on, and the kernel keeps them just as separate --
 /// `__traverse_mounts` (`fs/namei.c:1485-1522`) refuses a crossing only under `LOOKUP_NO_XDEV`, and `LOOKUP_BENEATH` is
-/// consulted on the dotdot paths alone. So a caller naming `RESOLVE_BENEATH` to allow in-tree symlinks - the opt-out
-/// this module documents - was also, silently, opting into resolution walking off the anchor's filesystem: a nested
-/// dataset or a `.zfs/snapshot` automount served through a path the code calls confined, with its own permissions,
+/// consulted on the dotdot paths alone. Without this flag a caller naming `RESOLVE_BENEATH` to allow in-tree symlinks
+/// would also let resolution walk onto a nested dataset or a `.zfs/snapshot` automount, with its own permissions,
 /// quotas and snapshot policy.
-///
-/// A caller that genuinely means to serve a nested mount anchors on it and opens relative to that, which is the same
-/// answer this module gives for absolute paths and for the same reason: it says so where a reader can see it.
 const CONFINED_HARDENING: ResolveFlag = ResolveFlag::RESOLVE_NO_XDEV;
 
-/// Validate an open's `(path, how)` pair and produce the payloads an `OPENAT2` inject carries - shared by the blocking
-/// [`FsHandle::open`] and the async `rt` handle so both surfaces enforce identical rules.
-///
-/// The path may be **multi-component** and is resolved by the kernel against the anchor dirfd. It is **confined to the
-/// anchor** by the full [`CONFINED_RESOLVE`] set unless the caller names a [`CONFINEMENT_POLICY`] flag of its own, in
-/// which case that policy stands in place of the default one - `RESOLVE_BENEATH` by itself to allow in-tree symlinks,
-/// say -- alongside [`CONFINED_HARDENING`], which no policy replaces. Hardening flags do not count as a policy and are
-/// unioned on top of the default, so adding one cannot subtract confinement. Opens return a real fd, so `O_CLOEXEC` is
-/// accepted.
-///
-/// There is therefore no flag combination that resolves an **absolute** path from the filesystem root: anchor on the
-/// directory that path names and open relative to it, which says the same thing where a reader can see it.
 /// Apply the confinement rule to a caller's `resolve` word: the whole [`CONFINED_RESOLVE`] bundle where no policy was
 /// stated, and [`CONFINED_HARDENING`] on top of one that was.
 ///
-/// One function because there are two facades - the blocking [`open_parts`] and the request handler's
-/// [`FsConn::open`](core::FsConn::open) - and the second must never be the laxer of the two. Its own copy of this rule
-/// had already drifted once.
+/// Hardening flags do not count as a policy, so adding one cannot subtract confinement, and no flag combination
+/// resolves an absolute path from the filesystem root. One function, because the blocking [`open_parts`] and the
+/// request handler's [`FsConn::open`](core::FsConn::open) must never differ in how lax they are.
 pub(crate) fn confine_resolve(resolve: &mut u64) {
     if *resolve & CONFINEMENT_POLICY.bits() == 0 {
         *resolve |= CONFINED_RESOLVE.bits();
@@ -400,11 +332,10 @@ pub(crate) fn confine_resolve(resolve: &mut u64) {
 
 /// Whether `resolve` states `RESOLVE_IN_ROOT`, which cannot compose with the `RESOLVE_BENEATH` a confined walk unions
 /// in: "Scoping flags are mutually exclusive" (`build_open_flags`, `fs/open.c:1263-1265`), so every step of such a walk
-/// would answer `EINVAL` - after the earlier ones had already run, for a walk that creates. The rule is stated here
-/// once because three callers screen it - `open_confined`, `FsConn::mkdir_path` and `FsConn::open_chain`, the three
-/// sites that union the bundle unconditionally - and each used to restate it. Screening, not routing through
-/// [`confine_resolve`]: that would union only [`CONFINED_HARDENING`] once a policy bit is set, silently dropping the
-/// `RESOLVE_NO_SYMLINKS` a confined walk needs most.
+/// would answer `EINVAL`, after the earlier steps had already run for a walk that creates. `open_confined`,
+/// `FsConn::mkdir_path` and `FsConn::open_chain` screen it rather than route through [`confine_resolve`], which would
+/// union only [`CONFINED_HARDENING`] once a policy bit is set and drop the `RESOLVE_NO_SYMLINKS` a confined walk needs
+/// most.
 pub(crate) fn scoping_conflict(resolve: u64) -> bool {
     resolve & crate::sync_fs::ResolveFlag::RESOLVE_IN_ROOT.bits() != 0
 }
@@ -420,15 +351,13 @@ pub(crate) fn scoping_conflict(resolve: u64) -> bool {
 /// `O_CREAT`/`O_TRUNC`/`O_TMPFILE` open straight onto an io-wq worker, where the `op.open_flag |= O_NONBLOCK` the
 /// inline path applies never runs, and `io_openat2`'s `LOOKUP_CACHED` sends a cold dentry or any symlink component down
 /// the same road. The bounded pool is `min(sq_entries, 4 * nr_cpus)`, so a handful of planted names pins every blocking
-/// fs op on the ring - and `FsHandle::into_outcome` waits with no deadline, so each pins a caller thread too.
+/// fs op on the ring, and a blocking [`FsHandle`] call waits with no deadline, so each pins a caller thread too.
 ///
-/// # The flag is not inert on the descriptor it leaves behind
-///
-/// `O_NONBLOCK` on an open file is what `io_file_get_flags` (`io_uring/io_uring.c:1793-1794`) reads to set
-/// `REQ_F_SUPPORT_NOWAIT` - the same bit `FMODE_NOWAIT` sets - and `__io_read` (`io_uring/rw.c:950-958`) then takes the
-/// `IOCB_NOWAIT` branch instead of returning `-EAGAIN`. So the transfer runs in the *submitting task* rather than on an
-/// io-wq worker, which for every op here is the reactor thread. Measured on this crate's own rings, one 32 MiB read of
-/// a warm file:
+/// The flag is stripped from the descriptor once the open completes, as the kernel strips one it added itself
+/// (`io_uring/openclose.c:161-162`), because it is not inert there. `io_file_get_flags`
+/// (`io_uring/io_uring.c:1793-1794`) reads it to set `REQ_F_SUPPORT_NOWAIT`, and `__io_read` (`io_uring/rw.c:950-958`)
+/// then runs the transfer inline on the reactor thread instead of on an io-wq worker, as one 32 MiB read of a warm file
+/// shows.
 ///
 /// ```text
 /// ZFS    plain       enter= 7.8 ms   CQE not ready   (punted to io-wq)
@@ -437,36 +366,25 @@ pub(crate) fn scoping_conflict(resolve: u64) -> bool {
 /// tmpfs  O_NONBLOCK  enter=20.5 ms   CQE ready       (ran inline)
 /// ```
 ///
-/// ZFS is the aggravating case rather than the cause: it references neither `IOCB_NOWAIT` nor `FMODE_NOWAIT` anywhere
-/// in its tree, so where tmpfs merely copies inline, ZFS blocks inline on a cache miss. The kernel strips the flag from
-/// the file it returns when *it* added it (`io_uring/openclose.c:161-162`, guarded on the application not having
-/// asked); [`SpecialFiles::Guard`] does the same, for the same reason.
+/// ZFS references neither `IOCB_NOWAIT` nor `FMODE_NOWAIT`, so there it blocks inline on a cache miss.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SpecialFiles {
     /// Add `O_NONBLOCK` to the open so it cannot block, and strip it from the descriptor once the open completes. The
     /// default, and the right choice for any path a peer names or that another protocol can write.
-    ///
-    /// Costs one `fcntl(F_SETFL)` - ~400 ns here, about 5% of the open it rides along with, once per descriptor - to
-    /// keep a read of that descriptor off the reactor thread.
     Guard,
-    /// Leave the caller's flags exactly as given, bounded by `deadline`:
-    /// a guard timer rides the open (an `ASYNC_CANCEL` staged at expiry - deliberately not a kernel `LINK_TIMEOUT`,
-    /// which arms only after the issue it would bound returns and so cannot cover a force-async open at all; see
-    /// `core::TAG_OPEN_DEADLINE`), so one that blocks - `fifo_open` parked in `wait_for_partner` - fails when the
-    /// deadline fires instead of parking its worker for good.
-    /// An `Allow` open charges **two op slots** until it answers: its own and its guard's - so one can be refused
-    /// `EBUSY` with a slot still free. Submitted by an embedding host against a connection it names, the pair is a
-    /// wall-clock hold, metered against that owner's timer cap and refused for a swept owner exactly as a timer arm is
-    /// (`core::FsCore::armed_timers`). Off the loop, over an [`FsHandle`], there is no owner to meter it against: the
-    /// pair is bounded by the op table alone, so a caller that keeps many handle threads in deadline opens at once can
-    /// crowd out metered work (`core::FsCore::refuse_wall_clock_hold`).
+    /// Leave the caller's flags exactly as given, bounded by `deadline`. A guard timer rides the open, an
+    /// `ASYNC_CANCEL` staged at expiry rather than a kernel `LINK_TIMEOUT`, which arms only after the issue it would
+    /// bound returns and so cannot cover a force-async open (`core::TAG_OPEN_DEADLINE`). An open that trips answers
+    /// `ECANCELED`, or `EINTR` where the cancellation caught it mid-sleep.
     ///
-    /// For a tree the consumer owns outright, where no FIFO or device node *should* appear because nothing else writes
-    /// to it. The deadline is mandatory because the blast radius of being wrong is not the caller's alone: io-wq is one
-    /// bounded pool (`min(sq_entries, 4 * nr_cpus)`), so a handful of planted names pins **every** blocking fs op on
-    /// the ring - other connections' guarded creating opens included - not just the open that opted in. A deadline open
-    /// that trips answers `ECANCELED` (or `EINTR`, where the cancellation caught the open mid-sleep) and the worker
-    /// comes back; without one, recovery was connection teardown or never.
+    /// An `Allow` open charges **two op slots** until it answers, its own and its guard's, so one can be refused
+    /// `EBUSY` with a slot still free. From an embedding host the pair is metered against the owner's timer cap and
+    /// refused for a swept owner, as a timer arm is (`core::FsCore::armed_timers`). Over an [`FsHandle`] only the op
+    /// table bounds it (`core::FsCore::refuse_wall_clock_hold`).
+    ///
+    /// For a tree the consumer owns outright, where nothing else can write a FIFO or device node. The deadline is
+    /// mandatory because io-wq is one bounded pool, so a handful of planted names would pin every blocking fs op on the
+    /// ring, not just this open.
     Allow {
         /// How long the open may block before the kernel cancels it.
         deadline: std::time::Duration,
@@ -527,28 +445,14 @@ impl FsOpenHow {
 /// A caller that set `O_NONBLOCK` itself keeps it and gets `false`: the flag is theirs, and stripping it would be as
 /// surprising as leaving ours. This mirrors the kernel's own `nonblock_set` test at `io_uring/openclose.c:161-162`.
 ///
-/// The flag goes on *every* guarded open, not only `O_CREAT`/`O_TRUNC`. Those
-/// two are merely the ones `io_openat_force_async` punts unconditionally;
-/// `io_openat2` applies `LOOKUP_CACHED` on the inline attempt only, and `legitimize_links` (`fs/namei.c:808-812`) fails
-/// while that is set, so a cold dentry or any symlink component also lands on a worker where the kernel's own fixup
-/// never runs. Narrowing the flag to the forced-async flags left those open, and since the descriptor is stripped
-/// afterwards there is nothing to be gained by narrowing it.
+/// The flag goes on every guarded open, not only `O_CREAT`/`O_TRUNC`. `io_openat2` applies `LOOKUP_CACHED` on the
+/// inline attempt only, and `legitimize_links` (`fs/namei.c:808-812`) fails while that is set, so a cold dentry or any
+/// symlink component also lands on a worker where the kernel's own fixup never runs.
 pub(crate) fn apply_special_file_guard(raw: &mut RawOpenHow, special: SpecialFiles) -> bool {
-    // `O_PATH` is excluded on both counts. It never invokes the file's own `open` method, so it cannot block on a FIFO
-    // and needs no guard; and `openat2` refuses `O_PATH` alongside anything outside
-    // `O_DIRECTORY|O_NOFOLLOW|O_PATH|O_CLOEXEC` (`fs/open.c:1298-1300`), so adding the flag would turn a working open
-    // into `EINVAL`.
-    //
-    // `O_DIRECTORY` is excluded because the kernel answers before the file's `open` can block: `build_open_flags`
-    // raises `LOOKUP_DIRECTORY` (`fs/open.c:1337`) and `do_open` tests it - `if ((nd->flags & LOOKUP_DIRECTORY) &&
-    // !d_can_lookup(...)) return -ENOTDIR;`, `fs/namei.c:4003-4004` - *above* the `vfs_open` at `:4020`. Nothing
-    // creates its way past that either: `O_DIRECTORY | O_CREAT` is refused outright at `fs/open.c:1283`. An `O_TMPFILE`
-    // open rides this exemption too (`__O_TMPFILE | O_DIRECTORY`), and is safe for its own reason, not this ordering -
-    // `path_openat` routes it to `do_tmpfile` (`fs/namei.c:4173`), which creates an unnamed `S_IFREG` inode
-    // (`fs/open.c:1271` forces the mode), so it cannot name a FIFO at all. The flag is not free - the descriptor is
-    // stripped afterwards, which is one blocking `fcntl` on the reactor thread per open - and this crate's own
-    // `open_dir` walk pays it on every directory it opens. `chain` and `mkdir_path` already skipped the guard on the
-    // steps they force `O_DIRECTORY` onto, citing this same ordering; this is the rule they were stating.
+    // `O_PATH` never runs the file's `open`, and `openat2` refuses `O_NONBLOCK` beside it (`fs/open.c:1298-1300`).
+    // `O_DIRECTORY` fails `ENOTDIR` in `do_open` (`fs/namei.c:4003-4004`) before `vfs_open` can block, and
+    // `O_DIRECTORY | O_CREAT` is refused (`fs/open.c:1283`). An `O_TMPFILE` open carries `O_DIRECTORY` and creates only
+    // an `S_IFREG` inode (`do_tmpfile`). Each skip saves a blocking `fcntl` on the reactor thread.
     if matches!(special, SpecialFiles::Allow { .. })
         || raw.flags & libc::O_PATH as u64 != 0
         || raw.flags & libc::O_DIRECTORY as u64 != 0
@@ -598,9 +502,9 @@ impl ReopenAccess {
 /// Split an open into the pieces a submission needs, applying both of this module's rules: resolve confinement and the
 /// special-file guard.
 ///
-/// Returns whether the guard added `O_NONBLOCK`, so the completion can strip it back off the descriptor. **Both facades
-/// go through here** - the request-handler one in `core.rs` and the general-client one above - so neither can end up
-/// carrying a copy of half the rule.
+/// Returns whether the guard added `O_NONBLOCK`, so the completion can strip it back off the descriptor.
+/// [`FsConn::open`](core::FsConn::open) applies the same two rules through the same two functions, so neither facade
+/// carries a copy of half the rule.
 pub(crate) fn open_parts<P: ?Sized + TnPath>(
     path: &P,
     how: FsOpenHow,
@@ -641,13 +545,9 @@ tn_bitflags! {
     /// Per-operation flags for the `preadv2`/`pwritev2` forms ([`FsHandle::preadv2`], [`FsHandle::pwritev2`] and their
     /// [`FsConn`] twins) - the kernel's `RWF_*` set, carried in the SQE's read/write flags field.
     ///
-    /// These are not a separate opcode: `READV`/`WRITEV` already read this field, so the flagged forms cost nothing
-    /// extra. An **unsupported flag fails the operation** with `EOPNOTSUPP` at submission rather than being ignored
-    /// (`kiocb_set_rw_flags`), which makes support detectable per call -- there is nothing to probe up front, and a
-    /// silently-dropped durability flag is impossible.
-    ///
-    /// Support is per-filesystem and narrower than the flag list suggests. Measured against ZFS (identical results on
-    /// tmpfs):
+    /// An **unsupported flag fails the operation** with `EOPNOTSUPP` rather than being ignored (`kiocb_set_rw_flags`),
+    /// so support is detectable per call and a durability flag is never silently dropped. Support is per filesystem,
+    /// and the table gives it for ZFS.
     ///
     /// | flag | ZFS | observed | why |
     /// |---|---|---|---|
@@ -657,10 +557,6 @@ tn_bitflags! {
     /// | [`RWF_DONTCACHE`](Self::RWF_DONTCACHE) | **no** | `EOPNOTSUPP` | needs `FOP_DONTCACHE` (Linux >= 6.14), which ZFS does not set |
     /// | [`RWF_NOWAIT`](Self::RWF_NOWAIT) | **no** | `EOPNOTSUPP` | needs `FMODE_NOWAIT` on the file; io_uring drives its own non-blocking attempt regardless |
     /// | [`RWF_HIPRI`](Self::RWF_HIPRI) | **no** | `EINVAL` | requires an `IOPOLL` ring, which this reactor does not create |
-    ///
-    /// A durability note worth measuring rather than assuming: pairing [`RWF_DSYNC`](Self::RWF_DSYNC) with a write can
-    /// replace a following `fdatasync`, but on ZFS a synchronous write goes through the ZIL, which for large writes can
-    /// cost more than one trailing sync of the whole range. Benchmark before choosing it as a default.
     pub struct RwFlags: u32 {
         /// High-priority read/write (`IOPOLL` rings only).
         RWF_HIPRI = 0x00000001;
@@ -688,36 +584,12 @@ const TRUSTED_NS: &[u8] = b"trusted.";
 /// Which extended attributes may be **written** under the reactor's ambient credentials instead of the request's
 /// [`Personality`].
 ///
-/// The reactor normally refuses `personality == 0` on every fd operation, because that is "no credential override" -
-/// the op would run as the daemon (root) rather than the requesting identity. Reads have two sanctioned exceptions
-/// already ([`FsHandle::fgetxattr_as_root`] and [`FsHandle::fgetxattr_proc_as_root`]), and an open has one
-/// ([`FsHandle::reopen_proc_as_root`]), for an access a server already decided. This is their write-side counterpart
-/// for metadata, and it is an allowlist rather than a blanket permit because a privileged *write* is a far sharper tool
-/// than a privileged read.
-///
-/// # Why it exists
-///
-/// A server that stores its own metadata about a file - and needs that metadata to survive users who can write the file
-/// itself - has to put it somewhere unprivileged code cannot reach. On ZFS the `trusted.` namespace is exactly that:
-/// get, set, **and list** are all gated on `CAP_SYS_ADMIN`, so an unprivileged local, SMB, or NFS user cannot read it,
-/// change it, or even discover that it is there. Writing it therefore cannot go through the requesting identity, which
-/// by design has no such privilege.
-///
-/// # Why only `trusted.`
-///
-/// [`allow_prefix`](Self::allow_prefix) refuses every other namespace, and the refusals are the point:
-///
-/// - `security.` would permit writing `security.capability`, which grants file capabilities - a direct
-///   privilege-escalation primitive.
-/// - `system.` holds the ACLs (`system.posix_acl_access`, `system.nfs4_acl_xdr`); writing those as root would let a
-///   caller grant itself access it was just denied.
-/// - `user.` needs no privilege at all, so allowing it would silently promote ordinary writes to root for no benefit.
-///
-/// # Scope
-///
-/// The policy is set on the reactor before it runs and cannot change while it does - [`UringFs::run`] takes `&mut
-/// self`, so the borrow checker, not a convention, prevents a later call. An empty policy (the default) permits
-/// nothing.
+/// The reactor normally refuses `personality == 0`, which would run an op as the daemon rather than the requester. This
+/// allowlist is the write-side counterpart of the privileged reads ([`FsHandle::fgetxattr_as_root`],
+/// [`FsHandle::fgetxattr_proc_as_root`]) and reopen ([`FsHandle::reopen_proc_as_root`]), for metadata a server keeps
+/// where the file's owner can neither read, change nor list it. On ZFS the `trusted.` namespace is gated on
+/// `CAP_SYS_ADMIN` for get, set and list, so only `trusted.` prefixes are accepted. The policy is fixed before
+/// [`UringFs::run`], which takes `&mut self`, and an empty policy (the default) permits nothing.
 ///
 /// ```no_run
 /// use truenas_ros::uring_fs::{FsConfig, PrivilegedXattrs, UringFs};
@@ -742,11 +614,11 @@ impl PrivilegedXattrs {
 
     /// Permit attributes whose name begins with `prefix`.
     ///
-    /// Errors unless `prefix` is under `trusted.` and names at least one byte beyond it - see the type docs for why the
-    /// other namespaces are refused, and why a bare `trusted.` (which would cover the whole namespace) is too broad to
-    /// accept.
+    /// Errors with `Validation` unless `prefix` is under `trusted.` and names at least one byte beyond it.
     pub fn allow_prefix(mut self, prefix: &CStr) -> crate::Result<Self> {
         let bytes = prefix.to_bytes();
+        // `security.` would allow `security.capability`, which grants file capabilities, `system.` holds the ACLs, and
+        // `user.` needs no privilege. A bare `trusted.` would cover the whole namespace.
         if !bytes.starts_with(TRUSTED_NS) || bytes.len() <= TRUSTED_NS.len() {
             return Err(crate::Error::Validation(
                 "PrivilegedXattrs: prefix must be under `trusted.` and name \
@@ -768,13 +640,8 @@ impl PrivilegedXattrs {
 /// Cache advice for [`FsHandle::fadvise`] - the `POSIX_FADV_*` values.
 ///
 /// On ZFS these are not page-cache-only hints: [`WillNeed`](Self::WillNeed) prefetches into the ARC and
-/// [`DontNeed`](Self::DontNeed) evicts from it, on top of the generic page-cache handling. So this is the API that
-/// reaches the cache that actually matters here.
-///
-/// It has no `preadv2`/`pwritev2` equivalent. [`RwFlags::RWF_DONTCACHE`] would cover the drop half more cheaply - no
-/// second syscall, no window where the pages linger - but ZFS does not set `FOP_DONTCACHE`, so it fails `EOPNOTSUPP`
-/// (see the [`RwFlags`] support table). There is no read-ahead flag at all, so [`WillNeed`](Self::WillNeed) has no
-/// equivalent even in principle.
+/// [`DontNeed`](Self::DontNeed) evicts from it, on top of the generic page-cache handling.
+/// [`RwFlags::RWF_DONTCACHE`] cannot stand in for `DontNeed`, since ZFS answers it `EOPNOTSUPP`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Advice {
@@ -786,9 +653,7 @@ pub enum Advice {
     Sequential = 2,
     /// Fetch the range into cache now. On ZFS an ARC prefetch.
     WillNeed = 3,
-    /// Release the range's cached data. On ZFS an ARC eviction, which is the point of calling it after a large write
-    /// has been synced: the bytes are durable and will not be read back soon, so they should not be holding ARC that a
-    /// working set needs.
+    /// Release the range's cached data. On ZFS an ARC eviction, worth calling after a large write has been synced.
     DontNeed = 4,
     /// Expect a single access in the near future.
     NoReuse = 5,
@@ -798,18 +663,13 @@ pub enum Advice {
 ///
 /// This is a security boundary, not decoration. The `*at` opcodes honour no `RESOLVE_*` flags, so a name containing `/`
 /// or `..` would walk wherever it pleased, out of the anchor and across the filesystem; confining them to one component
-/// is what makes an [`Anchor`] an actual confinement. (Multi-component resolution exists in exactly one place --
-/// [`FsHandle::open`] - where `RESOLVE_BENEATH` lets the *kernel* enforce containment.)
+/// is what makes an [`Anchor`] an actual confinement.
 ///
-/// **One exception, and it is not this type's to close: `AT_SYMLINK_FOLLOW`.** A single-component symlink passes
-/// `Leaf::new`, and any op whose `AtFlags` accept that flag then resolves to wherever it points - outside the anchor,
-/// on a name a peer planted inside it.
-/// That is every entry point taking a `Leaf` *and* `AtFlags`: both `linkat`s (where the link lands outside; nothing in
-/// the kernel bounds it - `may_linkat`, `fs/namei.c:1271`, tests the **source** inode, and only when
-/// `sysctl_protected_hardlinks` is set) and both `statx` shapes plus [`FsHandle::start_statx`] (where the stat reads
-/// the target's inode, size, mode and times outside the anchor). See
-/// [`FsConn::linkat`](crate::uring_fs::FsConn::linkat) for the worked case. The ops that take a `Leaf` and **no**
-/// `AtFlags` use the name literally, and there the confinement holds unconditionally.
+/// **`AT_SYMLINK_FOLLOW` is the one exception, and it is not this type's to close.** A single-component symlink passes
+/// `Leaf::new`, and an op whose `AtFlags` take that flag resolves it to wherever it points, outside the anchor. Those
+/// are both `linkat`s, which nothing in the kernel bounds since `may_linkat` (`fs/namei.c:1271`) tests only the source
+/// inode, and the `statx` forms. See [`FsConn::linkat`](crate::uring_fs::FsConn::linkat) for the worked case. An op
+/// that takes a `Leaf` and no `AtFlags` uses the name literally.
 ///
 /// Rejected: empty, `.`, `..`, anything containing `/` or an interior NUL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -920,10 +780,7 @@ impl AsFd for Anchor {
 /// An open file: a real OS file descriptor, reference-counted so the reactor can keep it alive across an in-flight op
 /// even after the caller drops this handle (each submitted op parks its own clone loop-side until the CQE). The fd
 /// closes when the last clone - this handle plus any op still holding one -- drops, which gives close-last ordering by
-/// construction; [`FsHandle::close`] simply drops the handle. Cheap to [`Clone`]. When nothing else holds it,
-/// [`File::into_fd`] takes the descriptor out instead. A caller that shares the descriptor with state of its own makes
-/// a handle from its `Arc` with [`File::from_shared`] and takes the `Arc` back with [`File::into_shared`], so neither
-/// side pays a `dup`.
+/// construction, and [`FsHandle::close`] simply drops the handle. Cheap to [`Clone`].
 #[derive(Clone)]
 pub struct File {
     pub(crate) fd: Arc<OwnedFd>,
@@ -1034,8 +891,7 @@ pub(crate) enum ReplyTo {
 
 impl ReplyTo {
     /// Deliver the outcome (consuming the endpoint; nothing blocks). Returns `Err(out)` when the receiver is already
-    /// gone (an abandoned call, a dropped future) - most sites ignore it, but a successful `open` uses it to detect
-    /// that no [`File`] will be built to orphan-close the slot, and stages the close itself.
+    /// gone. Every site ignores that, since dropping the outcome frees its buffers and closes any fd it carries.
     pub(crate) fn send(self, out: FsOutcome) -> Result<(), FsOutcome> {
         match self {
             ReplyTo::Sync(tx) => tx.send(out).map_err(|e| e.0),
@@ -1054,9 +910,8 @@ pub(crate) enum FsInject {
         /// `open_parts` added `O_NONBLOCK` for the special-file guard, so the completion strips it back off the
         /// descriptor.
         guarded: bool,
-        /// An [`SpecialFiles::Allow`] open's bound: a guard timer in its own op slot whose expiry cancels the open
-        /// ([`core::TAG_OPEN_DEADLINE`]) - **not** a kernel `LINK_TIMEOUT`, which cannot bound a force-async open at
-        /// all. `None` for a guarded open, which cannot block.
+        /// An [`SpecialFiles::Allow`] open's bound, a guard timer in its own op slot whose expiry cancels the open
+        /// ([`core::TAG_OPEN_DEADLINE`]). `None` for a guarded open, which cannot block.
         deadline: Option<std::time::Duration>,
         reply: ReplyTo,
     },
@@ -1172,7 +1027,7 @@ impl fmt::Debug for FsPending {
 
 impl FsPending {
     /// Block until the operation completes; returns the byte count and the round-tripped buffers. A loop shut down
-    /// mid-flight yields `ECONNABORTED`; an operation cancelled by a dropped [`File`] yields `ECANCELED`.
+    /// mid-flight yields `ECANCELED` or `ECONNABORTED`.
     pub fn wait(self) -> (crate::Result<usize>, Vec<Vec<u8>>) {
         match self.rx.recv() {
             Ok(out) => (out.res.map(|n| n as usize).map_err(Into::into), out.bufs),
@@ -1231,7 +1086,7 @@ impl FsPending {
 /// The `Send + Sync` off-loop handle: blocking filesystem calls that submit to the loop and park on a per-call reply
 /// channel. Clone freely; one loop serves any number of handle threads.
 ///
-/// Every operation (except [`close`](FsHandle::close) - see the module docs) takes the [`Personality`] it runs as.
+/// Every operation that runs on the ring takes the [`Personality`] it runs as.
 /// Calls made while the loop is shutting down (or after it stopped) fail with `ECONNABORTED`.
 #[cfg_attr(not(loom), derive(Debug))]
 #[derive(Clone)]
@@ -1259,25 +1114,10 @@ mod tests;
 //
 // Run with:  RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
 //
-// `FsHandle::send` is a check-then-act against a flag another thread sets:
-//
-//   caller (FsHandle::send)                loop (host.rs / ShutdownHandle)
-//   if stop.load(Acquire) { return Err }   stop.store(true, Release)
-//   tx.send(msg)?                          wake.poke()
-//   wake.poke()                            ...final drain of the receiver...
-//
-// The window between the load and the send is real: a caller can pass the check, the loop can decide to stop, and the
-// message can land afterwards. The contract that makes that safe is not "the race cannot happen" but **an `Ok` from
-// `send` never leaves its caller parked** - either the loop drains the message, or the inject receiver is dropped,
-// which drops the queued message and with it the `ReplyTo` sender, so the caller's `rx.recv()` in `call` returns a
-// disconnect it maps to `ECONNABORTED`.
-//
-// Note what this does *not* prove. The Acquire on the stop load has no payload behind it - the shutdown side publishes
-// only the flag - so weakening it to Relaxed changes nothing this model can observe. What is verified here is the
-// liveness contract, not a memory-ordering one; loom reports a violation as a deadlock on the reply channel.
-//
-// This model drives the real `send`. What it cannot drive is the reactor's teardown, which lives in `host.rs` around
-// real io_uring work - so the loop side is a stand-in that performs the same two steps in the same order.
+// `FsHandle::send` checks a stop flag another thread sets and then sends, so a message can land after the loop decided
+// to stop. An `Ok` from `send` must never leave its caller parked. Either the loop drains the message, or dropping the
+// inject receiver drops it and its `ReplyTo`, so `call` sees a disconnect and answers `ECONNABORTED`. The model checks
+// that `send`'s answer and the queue agree, and `shutdown_disconnects_a_queued_injects_reply` covers the disconnect.
 #[cfg(all(test, loom))]
 mod loom_tests;
 

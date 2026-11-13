@@ -2,15 +2,8 @@ use super::*;
 
 /// One thread's guard dropping leaves another's alone, and a nested guard un-quiets nothing when it ends.
 ///
-/// `set_hook` is one slot, not a stack, and `cargo test` runs a binary's tests as threads - so a guard that
-/// installs over the current hook and restores it on drop cannot compose. Thread B installs over A's; A's guard
-/// drops and restores the *default*, discarding B's filter while B is still running; B's later drop reinstates A's
-/// stale filter for the rest of the process. The hook here is installed once and reads a set instead, so the
-/// property to hold is the set's.
-///
-/// Asserted on the set rather than on stderr because the alternative is not stable: a test that installs a counting
-/// hook to watch it either sits *over* the filter, where quieting is vacuous, or replaces the filter permanently
-/// for every test that runs afterwards.
+/// Asserted on the set rather than on stderr, since a counting hook would either sit over the filter or replace it
+/// for every later test.
 #[test]
 fn quieting_composes_across_threads_and_nests() {
     fn quiet(id: std::thread::ThreadId) -> bool {
@@ -56,11 +49,8 @@ fn quieting_composes_across_threads_and_nests() {
     assert!(!quiet(me), "the last one out turns the lights on");
 }
 
-/// The guard is added where a special file could block, and nowhere else - because it is not free.
-///
-/// The descriptor is stripped afterwards, which is one blocking `fcntl` on the reactor thread per open;
-/// `open_dir`'s walk opens a directory per request, and a directory cannot reach the blocking `open` the flag
-/// exists to defeat. The exemption is a kernel ordering, cited on the function.
+/// The guard is added where a special file could block, and nowhere else, since stripping it costs a blocking `fcntl`
+/// per open. The exemptions are cited on the function.
 #[test]
 fn the_special_file_guard_skips_what_cannot_block() {
     let guard = |flags: i32| {
@@ -105,12 +95,8 @@ fn the_special_file_guard_skips_what_cannot_block() {
 /// The liveness half of the inject-vs-shutdown race: a caller that got an `Ok` from [`FsHandle::send`] and is
 /// parked in [`FsHandle::call`] on its reply channel must be woken when the loop goes away, not left there.
 ///
-/// What wakes it is ownership, not a notification - dropping the inject receiver drops whatever was still queued,
-/// and each queued `FsInject` carries the `ReplyTo::Sync` sender for its own reply. So the reply channel
-/// disconnects and `recv` returns an error `call` maps to `ECONNABORTED`.
-///
-/// This is deliberately a real-threads test rather than a loom model: loom's `mpsc` has no sender count, so a
-/// disconnected `recv` blocks in its scheduler instead of returning `Err` (see the `loom_tests` note).
+/// Dropping the inject receiver drops each queued `FsInject` and the `ReplyTo::Sync` sender it carries, so the reply
+/// channel disconnects. A real-threads test, since loom's `mpsc` cannot represent a disconnect.
 #[test]
 fn shutdown_disconnects_a_queued_injects_reply() {
     let (tx, rx) = mpsc::channel();
@@ -159,14 +145,8 @@ fn shutdown_disconnects_a_queued_injects_reply() {
 
 /// A stop already visible to the caller refuses the inject, and refuses it without queueing.
 ///
-/// This is the *sequential* half of the shutdown screen, and it is not a concurrency property at all: with the flag
-/// already set, [`FsHandle::send`]'s answer is straight-line behaviour of one thread.
-/// `loom_inject_after_stop_is_refused` races the stop on its own thread and asserts only that `send`'s answer and
-/// the queue AGREE - which stays true with the `stop_requested()` arm of `send` deleted, because both halves of
-/// that equality are produced by the same path on the same thread. Measured at bfc51e2: with that arm removed every
-/// one of the 25 loom models stays green, and the only thing in the tree that notices is
-/// `teardown_with_inflight_op` in `test/uring_fs.rs`, which DEADLOCKS rather than failing. A model cannot hold this
-/// property; this can.
+/// `loom_inject_after_stop_is_refused` checks only that `send`'s answer and the queue agree, which stays true with the
+/// `stop_requested()` arm of [`FsHandle::send`] deleted, so no model holds this property and this test does.
 #[test]
 fn a_visible_stop_refuses_a_send_without_queueing() {
     let (tx, rx) = mpsc::channel();

@@ -18,38 +18,21 @@ use std::fmt;
 /// Sizing for an [`UringFs`], defaulted for a **server**: a request handler fans out many independent operations and
 /// collects their completions. Both fields are public; a consumer with a different shape sets its own.
 ///
-/// There is deliberately no open-file count here. Files are plain reference-counted descriptors (`Arc<OwnedFd>`) and no
-/// fs operation sets `IOSQE_FIXED_FILE`, so the reactor registers no fixed-file pool and has no ceiling of its own to
-/// configure - the limit on concurrently open files is the process's `RLIMIT_NOFILE`.
+/// There is no open-file count. Files are plain descriptors and the reactor registers no fixed-file pool, so the limit
+/// is the process's `RLIMIT_NOFILE`.
 ///
-/// # `entries` and `ops` bound different things
+/// `entries` is the submission queue, and staging past a full queue flushes and continues, so it is a batching knob and
+/// not a ceiling. `ops` is the table an in-flight operation holds a slot in until its completion reaps, so **`ops` is
+/// the real concurrency ceiling**, and exhausting it fails a fan-out with `EBUSY`. It should exceed `entries`.
 ///
-/// `entries` is the submission queue, and `io_uring_enter` **consumes** SQEs into kernel-side requests, freeing the
-/// slots. Staging past a full queue therefore flushes and continues rather than failing, so `entries` sets how much
-/// work rides on one `io_uring_enter` - a batching knob, not a ceiling.
+/// Only `entries` costs locked memory. A ring's queues are charged against `RLIMIT_MEMLOCK` with no capability bypass,
+/// so root is not exempt (`__io_account_mem`, `io_uring/rsrc.c:39-47`). The cost is about `entries x 96` bytes, roughly
+/// 400 KiB for the default, and against a common 8 MiB limit the 22nd concurrent default-sized ring fails `ENOMEM`.
+/// Several reactors, or a consumer that also registers buffers, must raise it (`LimitMEMLOCK=` in the unit, or
+/// `setrlimit` before the first [`UringFs::new`]). `ops` is plain heap at 584 bytes a slot, 616 under `net-server`
+/// (pinned by `core::op_entry_size`), so the default costs about 18.25 MiB and raising concurrency is cheap.
 ///
-/// `ops` is the table an in-flight operation holds a slot in until its completion reaps, so **`ops` is the real
-/// concurrency ceiling**, and exhausting it is what fails a fan-out with `EBUSY`. It should exceed `entries`, not match
-/// it.
-///
-/// # Only `entries` costs locked memory
-///
-/// A ring's queues are charged against `RLIMIT_MEMLOCK` - `__io_account_mem` (`io_uring/rsrc.c:39-47`) tests
-/// `rlimit(RLIMIT_MEMLOCK)` with **no capability bypass, so running as root does not exempt it**. The cost is about
-/// `entries x 96` bytes (a 64-byte SQE array plus a double-sized completion queue), so the default is roughly 400 KiB
-/// per reactor against a common 8 MiB limit; measured, the 22nd concurrent default-sized ring fails `ENOMEM`.
-///
-/// `ops` is ordinary heap - 584 bytes per slot, 616 under `net-server` (pinned by `core::op_entry_size`), so the
-/// default costs ~18.25 MiB of RSS (19.25 MiB under `net-server`), allocated once at construction - and is not
-/// accounted against any limit.
-/// That asymmetry is why the two defaults differ by 8x: raising concurrency is cheap, raising the batch size is not.
-///
-/// One reactor sits well inside 8 MiB. Several (a `reuse_port` reactor per core), or a consumer that also registers
-/// buffers, must raise the limit (`LimitMEMLOCK=` in the unit, or `setrlimit` before the first [`UringFs::new`]) - the
-/// symptom otherwise is a bare `ENOMEM` from ring creation with nothing pointing at the cause.
-///
-/// `#[non_exhaustive]`, so a future knob is a field addition rather than a breaking change; build one by mutating
-/// [`FsConfig::default`].
+/// `#[non_exhaustive]`, so build one by mutating [`FsConfig::default`].
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct FsConfig {
@@ -57,9 +40,7 @@ pub struct FsConfig {
     /// `io_uring_enter`. The field that costs `RLIMIT_MEMLOCK`; see the type docs.
     pub entries: u32,
     /// Op-table slots - the maximum number of concurrently in-flight operations, and the ceiling a fan-out actually
-    /// hits: submitting past it fails `EBUSY` however deep the ring is. Plain heap at 584 bytes a slot, 616 under
-    /// `net-server` (pinned by `core::op_entry_size`), so this is the cheap axis to raise - and see the type docs,
-    /// which work the default's resident cost out of the same figure.
+    /// hits. Submitting past it fails `EBUSY` however deep the ring is.
     pub ops: u32,
     /// Sizing for the blocking-offload pool that backs `FsConn::offload` and the hybrid lister. Per ring; see
     /// [`OffloadBounds`].
@@ -116,10 +97,8 @@ impl fmt::Debug for UringFs {
 
 impl Drop for UringFs {
     fn drop(&mut self) {
-        // On the normal path `run` already drained, so this is a cheap no-op (nothing in flight ->
-        // `cancel_and_reap_all` returns at once). On an early drop, or a panic unwinding out of `run`, drain here - and
-        // if that drain fails, leak the op buffers rather than free them under a still-live kernel op (mirrors the net
-        // `Server::drop`).
+        // A no-op after `run`, which already drained. On an early drop, or a panic unwinding out of `run`, drain here,
+        // and if that fails leak the op buffers rather than free them under a still-live kernel op.
         let _ = self.drain_or_leak();
     }
 }
@@ -169,11 +148,8 @@ impl UringFs {
         if cfg.entries < 4 {
             return Err(crate::Error::Validation("FsConfig::entries must be at least 4".into()));
         }
-        // Both offload bounds are real OS threads, and `floor` spawns eagerly on the reactor thread at first use
-        // (`WorkerPool::new` loops over it), so an absurd value is a thread storm inside one `offload` call rather than
-        // a bad number in a struct. `net`'s `ServerConfig::validate` screens its own pair against this same constant;
-        // this is the standalone host's half of it. The pool's documented normalisation - `floor` at least 1, `ceiling`
-        // raised to `floor` - is not second-guessed here: an inverted pair is legal and says what it means.
+        // Both offload bounds are OS threads and `floor` spawns eagerly on the reactor thread at first use, so an
+        // absurd value is a thread storm inside one `offload` call. The pool normalises an inverted pair.
         let widest = cfg.offload.floor.max(cfg.offload.ceiling);
         if widest > MAX_OFFLOAD_THREADS {
             return Err(crate::Error::Validation(format!(
@@ -288,8 +264,7 @@ impl UringFs {
     /// `Park::Drain` runs this with the read still armed.
     fn drain_wake_sources(&mut self) {
         self.drain_injects();
-        // Fire on-loop deliveries from finished off-loop pool jobs (`FsConn::offload` and the hybrid lister). Additive:
-        // the `FsHandle` path never touches the pool.
+        // Fire on-loop deliveries from finished pool jobs (`FsConn::offload` and the hybrid lister).
         deliver_pool_completions(&mut self.fs, &mut self.eng);
     }
 
@@ -311,10 +286,8 @@ impl UringFs {
                 self.drain_wake_sources();
             }
             TAG_CANCEL => {}
-            // Deliver a completion. An `FsHandle` op parks a channel waiter (routed inside `on_cqe`, which then reaps
-            // nothing); an embedded on-loop op (`FsConn`) hands its callback back to fire here with a fresh
-            // owner-scoped `FsConn`. A pump read cannot reap here -- only a `net` server submits those - and
-            // `deliver_embedded` treats one as unreachable.
+            // An `FsHandle` op's channel waiter is answered inside `on_cqe`, and an `FsConn` op's callback comes back
+            // to fire here. Only a `net` server submits pump reads, so `deliver_embedded` treats one as unreachable.
             _ => {
                 let reaped = self.fs.on_cqe(&mut self.eng, tag, slot, gen32, cqe.res);
                 deliver_embedded(&mut self.fs, &mut self.eng, reaped);
@@ -481,11 +454,9 @@ impl UringFs {
         }
     }
 
-    /// Teardown: cancel everything, reap to zero (routing each fs completion so waiters unblock and buffers free), then
-    /// flush the inject queue and any parked close waiters with `ECONNABORTED`.
-    /// Cancel and reap everything; if that drain FAILS (a hard ring error with ops possibly still in flight), leak the
-    /// op buffers and the wake pad rather than free memory the kernel may still be writing into. The net stack does the
-    /// same on its teardown-drain failure.
+    /// Cancel and reap everything, routing each fs completion so waiters unblock and buffers free. If that drain fails
+    /// with ops possibly still in flight, leak the op buffers and the wake pad rather than free memory the kernel may
+    /// still be writing into.
     fn drain_or_leak(&mut self) -> errno::Result<()> {
         let fs = &mut self.fs;
         let drained = self
@@ -498,6 +469,7 @@ impl UringFs {
         drained
     }
 
+    /// Drain the ring, then answer every inject still queued with `ECONNABORTED`.
     fn drain_teardown(&mut self) -> crate::Result<()> {
         // Before the reap, while the ring is still whole: see `drain_stop_window`.
         crate::uring_fs::core::drain_stop_window(&mut self.fs, &mut self.eng);
@@ -507,9 +479,6 @@ impl UringFs {
                 FsInject::Open { reply, .. } => (Some(reply), Vec::new()),
                 FsInject::Rw { reply, bufs, .. } => (Some(reply), bufs),
                 FsInject::ReadSpare { reply, buf, .. } => (Some(reply), vec![buf]),
-                // The pooled lease rides inside `reply` and round-trips (or returns to the pool) via `ReplyTo::send`.
-                // A late cancel request for an op that is being torn down anyway: nothing to reply to, nothing to
-                // reclaim.
                 FsInject::Fsync { reply, .. } => (Some(reply), Vec::new()),
                 FsInject::FdMeta { reply, value, .. } => (Some(reply), vec![value]),
                 FsInject::FdMetaAsRoot { reply, value, .. } => (Some(reply), vec![value]),
@@ -527,9 +496,8 @@ impl UringFs {
     }
 }
 
-/// Kernel-convention pins that need crate internals (raw rings, forged tokens): the ALLOC1 personality-id contract, the
-/// `SINGLE_ISSUER` registration gate, the explicit-index install `res` convention, and stale-token/stale-personality
-/// inertness. Environmental skips follow the integration suites' discipline (`TRUENAS_ROS_REQUIRE_IO_URING`).
+/// The host's screens and teardown, and kernel-convention pins that need raw rings. Environmental skips follow the
+/// integration suites' discipline (`TRUENAS_ROS_REQUIRE_IO_URING`).
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
@@ -547,12 +515,9 @@ mod tests {
 
     use crate::uring::setup_unavailable as skip_unavailable;
 
-    /// `FsConfig` is checked before a ring is ever created, and the `ops` ceiling is a field-width bound, not a taste
-    /// one: an op-slot index is packed into `user_data`'s 24-bit slot field (`user_data::SLOT_MASK`), so a table larger
-    /// than the field aliases indices and routes a completion to the wrong op entry - the wrong bytes delivered to the
-    /// wrong caller, or a payload freed under one. Nothing downstream re-checks it.
-    ///
-    /// Runs even where io_uring is unavailable: `check` precedes `RingFd::setup`.
+    /// `FsConfig` is checked before a ring is created. An op table wider than `user_data`'s 24-bit slot field
+    /// (`user_data::SLOT_MASK`) would alias indices and route a completion to the wrong op, and nothing downstream
+    /// re-checks it.
     #[test]
     fn a_config_the_slot_field_cannot_index_is_refused() {
         use crate::uring::user_data::SLOT_MASK;
@@ -587,11 +552,7 @@ mod tests {
     }
 
     /// The offload bounds are OS threads spawned on the reactor thread at first use, so they are screened at
-    /// construction like every other sizing knob - the rule `net`'s `ServerConfig::validate` already held for the same
-    /// pair, against the same constant.
-    ///
-    /// Never submits anything: the pool is lazy, so the screen is what is under test and no thread is spawned either
-    /// way.
+    /// construction like every other sizing knob.
     #[test]
     fn offload_bounds_past_the_thread_cap_are_refused() {
         for (floor, ceiling) in [
@@ -624,13 +585,9 @@ mod tests {
 
     /// A refusal queued in the stop window is delivered by the teardown, not dropped with its callback.
     ///
-    /// `run_loop` exits on `stopping()` and its `TAG_WAKE` arm never re-arms the wake `READ` once it has, so the poke
-    /// behind a refusal queued in that window can no longer become a `TAG_WAKE` completion - and the teardown reap
-    /// (`cancel_and_reap_all`) touches ring ops only, never `fs.refusals`. Left there, the callback dies unfired with
-    /// the payload it was handing back.
-    ///
-    /// The pass is bounded to what was already queued, and the continuation below is the documented edge of that: what
-    /// a callback asks for during teardown is going nowhere anyway.
+    /// Once `run_loop` sees `stopping()` the wake `READ` is never re-armed, and the teardown reap touches ring ops
+    /// only, never `fs.refusals`. The pass delivers only what was already queued, so what a callback asks for during
+    /// teardown is not delivered.
     #[test]
     fn teardown_delivers_a_refusal_queued_in_the_stop_window() {
         use crate::uring_fs::core::FsConn;
@@ -748,9 +705,8 @@ mod tests {
         assert_eq!(register_personality(fd), Ok(4), "cyclic, no reuse");
     }
 
-    /// sec. 6.3 of the fs-reactor design: a `SINGLE_ISSUER` ring refuses registration from any task but its creator
-    /// with `-EEXIST` - the flag our rings must never set (the credential broker registers from outside). Pin both
-    /// directions.
+    /// A `SINGLE_ISSUER` ring refuses registration from any task but its creator with `-EEXIST`, so our rings never set
+    /// the flag, since the credential broker registers from outside. Pin both directions.
     #[test]
     fn single_issuer_gates_cross_thread_registration() {
         let mut p = IoUringParams {
@@ -809,12 +765,8 @@ mod tests {
         assert_eq!(cqe.res, 0, "explicit-index install must complete with res == 0");
     }
 
-    /// Pin the xattr SQE field packing - `addr` = name, `addr2` = value, `len` = size, `xattr_flags` = flags -
-    /// independently of the fd-based xattr ops, which need no capability gate at this crate's 6.18 kernel floor.
-    ///
-    /// Deliberately submitted against a **real** fd: the encoding is what this test is for, and a real fd works on
-    /// every kernel since 5.19, so the packing stays covered on hosts older than 6.13 (where the integration tests'
-    /// fixed-file form skips).
+    /// Pin the xattr SQE field packing on a raw ring (`addr` the name, `addr2` the value, `len` the size), apart from
+    /// the reactor's xattr ops.
     #[test]
     fn xattr_sqe_packing_round_trips() {
         let Some(mut ring) = ring_or_skip(8) else {
@@ -860,9 +812,8 @@ mod tests {
         assert_eq!(&out[..got as usize], &value[..], "value round-trips");
     }
 
-    /// A forged/stale token (recycled generation) is inert: the op fails `EBADF` without touching the slot's current
-    /// occupant. And a personality id nothing registered fails `EINVAL` at submission -- the kernel refusing the stamp,
-    /// surfaced as the op's error.
+    /// A personality id nothing registered fails `EINVAL` at submission, the kernel refusing the stamp, surfaced as the
+    /// op's error.
     #[test]
     fn stale_token_and_stale_personality_are_inert() {
         let dir = crate::tempdir().unwrap();
@@ -890,8 +841,7 @@ mod tests {
                 let how = OpenHow::new().flags(OFlag::O_RDONLY);
                 let f = h.open(me, &anchor, "f", how).unwrap();
 
-                // A plain read works (files are real fds now - there is no stale `{slot, generation}` token left to
-                // forge).
+                // A plain read works.
                 let (res, bufs) = h.preadv2(me, &f, vec![vec![0u8; 4]], 0, RwFlags::empty());
                 assert_eq!(res.unwrap(), 4);
                 assert_eq!(&bufs[0], b"data");

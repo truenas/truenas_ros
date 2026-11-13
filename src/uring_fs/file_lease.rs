@@ -11,9 +11,8 @@
 //! The warning is a signal. A ring takes a lease with `F_SETSIG` set to [`signal`], a realtime signal, which carries
 //! the number of the leased descriptor, and with `F_SETOWN_EX` naming its own thread, so the signal goes to that thread
 //! alone. A realtime signal the kernel cannot queue comes as `SIGIO` instead, with no descriptor (`send_sigio_to_task`
-//! in `fs/fcntl.c`). Either one ends the process on a thread that has not blocked it, so [`block_signals`] blocks both
-//! on the main thread before any other thread exists, as [`crate::signal::block`] blocks the daemon's signals, and a
-//! ring refuses a lease while its own thread has them unblocked.
+//! in `fs/fcntl.c`). Either one ends the process on a thread that has not blocked it, so both are blocked first, by
+//! [`block_signals`].
 //!
 //! The ring reads them from a `signalfd(2)` it polls, with a plain read on its own thread, since a signalfd takes the
 //! signals of the thread that reads it (`signalfd_read` in `fs/signalfd.c`), and a read on an io-wq worker would find
@@ -176,10 +175,10 @@ impl FileLeases {
             // SAFETY: gettid has no preconditions.
             pid: unsafe { libc::gettid() },
         };
-        // SAFETY: `fd` is open for the call, since `file` holds it, and `owner` outlives the call that reads it. The
-        // signal and the owner come first, so a break right after F_SETLEASE finds them, and since F_SETLEASE makes the
-        // whole process the owner where none is set (`lease_setup` in `fs/locks.c`), whose signal any thread that has
-        // it unblocked would take, and die of.
+        // The signal and the owner come first, so a break right after `F_SETLEASE` finds them. Without an owner,
+        // `F_SETLEASE` makes it the whole process (`lease_setup` in `fs/locks.c`), and any thread with the signal
+        // unblocked would take it and die.
+        // SAFETY: `fd` is open for the call, since `file` holds it, and `owner` outlives the call that reads it.
         unsafe {
             retry_on_eintr(|| libc::fcntl(fd, F_SETSIG, signal()))?;
             let owner: *const OwnerEx = &owner;
@@ -203,10 +202,10 @@ impl FileLeases {
             Some(held) if held.serial == id.serial => {}
             _ => return Err(Errno::ENOENT.into()),
         }
-        // SAFETY: the held descriptor is open for the call. A lease the kernel dropped answers EAGAIN, and is given
-        // back all the same.
+        // SAFETY: the held descriptor is open for the call.
         let rc = retry_on_eintr(|| unsafe { libc::fcntl(id.fd, libc::F_SETLEASE, libc::F_UNLCK) });
         self.held.remove(&id.fd);
+        // A lease the kernel dropped answers `EAGAIN`, and is given back all the same.
         match rc {
             Ok(_) | Err(Errno::EAGAIN) => Ok(()),
             Err(errno) => Err(errno.into()),
