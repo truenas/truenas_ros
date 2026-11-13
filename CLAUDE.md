@@ -686,6 +686,24 @@ Cite sources rather than asserting behaviour: kernel and ZFS claims are
 checked against `/CODE/linux` and `/CODE/zfs` and cited by function or
 `file:line`.
 
+## Splitting files
+
+A file past 1,500 lines is split, tests and code alike, in a commit of its
+own.
+
+A split moves code and changes nothing else. Every item keeps its name and
+the path it is reached by, through a re-export where it moved into a new
+module, and its visibility widens only as far as the move needs. A test
+binary stays one binary, its root at the path `Cargo.toml` names and its
+parts in the folder of that name beside it. A test keeps its name and stays
+under every path a workflow picks it by, the filters, skips and `--exact`
+probe of `miri.yml` among them.
+
+A split keeps the number of tests each target runs, in debug and in
+release, and the counts CI asserts, `MODELS`, `MIRI_TESTS` and
+`MIRI_HTTP_TESTS`. `git diff --color-moved` shows it as moved lines, and
+the only new lines are module declarations, imports and visibility.
+
 ## The gate
 
 Before reporting anything done:
