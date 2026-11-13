@@ -1,16 +1,14 @@
 #![no_main]
 
-//! Fuzz the POSIX.1e ACL codec — the little-endian `system.posix_acl_access` and `system.posix_acl_default` blobs.
+//! Fuzz the POSIX.1e ACL codec, the little-endian `system.posix_acl_access` and `system.posix_acl_default` blobs.
 //!
-//! Same contract as the NFSv4 target: `parse_aces` indexes entries with unchecked `le16`/`le32` behind a version check
-//! and a `(len - HDR) % ACE_SZ == 0` check, and anything it accepts must be re-encodable. The interesting asymmetry
-//! here is the `e_id` field — the kernel writes `ACL_UNDEFINED_ID` for every non-USER/GROUP tag and ignores the field
-//! when reading one back (`fs/posix_acl.c`), so the decoder normalizes a special entry's id to -1 and rejects a named
-//! entry carrying the sentinel. Without that, `from_xattr` would accept blobs `access_bytes` either refuses outright or
-//! re-emits differently.
+//! `parse_aces` indexes entries with unchecked `le16` and `le32` reads behind a version check and a `(len - HDR) %
+//! ACE_SZ == 0` check, and anything it accepts must encode again. The kernel writes `ACL_UNDEFINED_ID` in `e_id` for
+//! every tag but USER and GROUP and ignores the field when reading one back (`fs/posix_acl.c`), so the decoder sets a
+//! special entry's id to -1 and rejects a named entry carrying the sentinel.
 //!
-//! Asserted as idempotence after one normalization pass, not byte equality: a special tag whose wire id is some stray
-//! value normalizes to the sentinel on the way out, which is correct.
+//! The round trip is idempotence after one normalization pass, not byte equality, since a special tag's stray wire id
+//! is written back as the sentinel.
 
 use libfuzzer_sys::fuzz_target;
 use truenas_ros::sync_fs::acl::PosixAcl;
@@ -61,8 +59,6 @@ fuzz_target!(|data: &[u8]| {
         "the default ACL appeared or vanished across encoding"
     );
 
-    // Re-decoding the encoder's own output must reproduce the same ACL, and encoding it again must reproduce the same
-    // bytes.
     let again = PosixAcl::from_xattr(&aenc, denc.as_deref()).expect("re-encoded ACL must re-decode");
     assert_eq!(
         (&again.access, &again.default),

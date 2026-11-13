@@ -1,20 +1,16 @@
 #![no_main]
 
-//! Fuzz the `statmount(2)` reply decoder — the highest-risk parse in the crate.
+//! Fuzz the `statmount(2)` reply decoder, the highest-risk parse in the crate.
 //!
-//! `parse` reinterprets the reply buffer as a `struct statmount` with a raw `cast::<RawStatmount>()`, then reads every
-//! string by adding a **header-declared u32 offset** to a fixed base and scanning for a NUL. The byte view it scans is
-//! clamped to `min(hdr.size, buffer)`, and the only per-string guard is `start >= bytes.len()`. A reply whose `size`,
-//! offsets, or `*_num` counts disagree with the buffer must still decode without reading out of bounds — in particular
-//! `get_str_array`, which advances `pos += end + 1` `count` times and so can walk past the end if the guard is not
-//! re-checked each iteration.
+//! `parse` casts the reply buffer to a `struct statmount`, then reads every string from a header-declared u32 offset
+//! past a fixed base up to a NUL. The bytes it scans are clamped to `min(hdr.size, buffer)`, and the only per-string
+//! guard is `start >= bytes.len()`. A reply whose `size`, offsets or `*_num` counts disagree with the buffer must still
+//! decode in bounds, `get_str_array` above all, since it advances `pos += end + 1` `count` times and must check the
+//! guard on each.
 //!
-//! Run under AddressSanitizer (cargo-fuzz's default), so an out-of-bounds read this reaches is a crash, not a silently
-//! wrong string.
-//!
-//! Nothing here asserts *what* the fields decode to: the kernel is the only authority on that, and
-//! `src/mount/statmount.rs`'s unit tests already pin the well-formed shape. The property is memory safety plus total
-//! accessors.
+//! Run it under AddressSanitizer, cargo-fuzz's default, so an out-of-bounds read is a crash. The property is memory
+//! safety and total accessors. Field values are not asserted, since the kernel is their only authority and the unit
+//! tests in `src/mount/statmount.rs` pin the well-formed shape.
 
 use libfuzzer_sys::fuzz_target;
 use truenas_ros::mount::{fuzz, is_zfs_snapshot};

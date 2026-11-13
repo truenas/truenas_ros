@@ -1,17 +1,13 @@
 #![no_main]
 
-//! Fuzz the NFSv4 ACL XDR codec — the `system.nfs4_acl_xdr` blob ZFS hands back, decoded straight off the wire.
+//! Fuzz the NFSv4 ACL XDR codec, the `system.nfs4_acl_xdr` blob ZFS hands back.
 //!
-//! `from_xattr` indexes the blob with an unchecked `be32`, guarded only by the exactness check `header + naces * ACE_SZ
-//! == data.len()` and the `checked_mul`/`checked_add` behind it. For any bytes at all it must (a) never panic, and (b)
-//! if it accepts, produce an ACL the encoder can write back: **a decode that cannot re-encode is a blob we can read and
-//! never store.**
+//! `from_xattr` indexes the blob with an unchecked `be32`, guarded only by the exactness check (`header + naces *
+//! ACE_SZ == data.len()`) and the `checked_mul` and `checked_add` behind it. For any bytes it must never panic, and an
+//! ACL it accepts must encode again, since a decode that cannot re-encode is a blob we can read and never store.
 //!
-//! The asserted round trip is *idempotence after one normalization pass*, not byte equality. The decoder is
-//! deliberately laxer than the encoder in one place — it reads only bit 0 of an ACE's `iflag` word, matching how ZFS
-//! decides "special principal", while `to_xattr` writes the whole word as 0 or
-//! 1 — so `iflag = 5` decodes fine and re-encodes as 1. Normalizing is correct;
-//! normalizing *differently on a second pass* would not be.
+//! The round trip is idempotence after one normalization pass, not byte equality. The decoder reads only bit 0 of an
+//! ACE's `iflag` word, as ZFS does, while `to_xattr` writes the whole word as 0 or 1, so `iflag = 5` re-encodes as 1.
 
 use libfuzzer_sys::fuzz_target;
 use truenas_ros::sync_fs::acl::{Nfs4Acl, PosixAcl};
@@ -75,10 +71,9 @@ fuzz_target!(|data: &[u8]| {
         };
         check_posix(&posix, is_dir);
 
-        // Anything we produced must convert back, and the pair must settle: the first pass can widen the group-class
-        // mask, because that mask is derived from the union of the NFS4 allow masks and `w` can be spelled by bits no
-        // single entry holds in full. The second pass recomputes it from entries that are already reduced, so from
-        // there on the two conversions have to be a fixed point.
+        // Anything we produced must convert back, and the pair must settle. The first pass can widen the group-class
+        // mask, which is the union of the NFS4 allow masks, since `w` can be spelled by bits no single entry holds in
+        // full. From the second pass on the two conversions are a fixed point.
         let nfs4 = posix
             .to_nfs4_lossy(is_dir)
             .expect("a POSIX ACL we produced must convert back");

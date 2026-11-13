@@ -1,13 +1,13 @@
-//! Layer 0 callback substrate - a self-contained, compiling design probe.
+//! The layer 0 callback substrate for an fs reactor, as a self-contained design probe.
 //!
-//! A completion-callback model for the FS reactor on the io_uring net-server base, distilled to the part that actually
-//! stresses the borrow checker: `submit(op, ReqKey, Callback)`, a drain loop firing each callback with `(&Completion,
-//! &mut ReqState, &mut Staging)`, and a `Staging` buffer with `linked_run` (IOSQE_IO_LINK) for the atomic-PUT tail.
+//! It keeps the part that stresses the borrow checker. That is `submit(op, ReqKey, Callback)`, a drain loop firing each
+//! callback with `(&Completion, &mut ReqState, &mut Staging)`, and a `Staging` buffer whose `linked_run`
+//! (IOSQE_IO_LINK) gives the atomic PUT its tail.
 //!
-//! NOT wired to the real reactor. The "ring" here is a synchronous mock that runs each op with one real syscall against
-//! a temp dir, so the ownership/borrow structure is exactly what the real reactor would have, while the demo genuinely
-//! creates files (and shows link fail-fast leaving no half-written object behind). No futures anywhere - a request's
-//! terminal action is a plain boxed closure; the callback layer needs no async runtime.
+//! It is not wired to the real reactor. The ring is a synchronous mock that runs each op as one real syscall against a
+//! temp dir, so the borrows are those a real reactor would have, and the demo really creates files and shows a failed
+//! link leaving no half-written object behind. A request's terminal action is a plain boxed closure, with no futures
+//! and no async runtime.
 //!
 //! Run: `cargo run --example fs_callback_layer0`
 
@@ -34,7 +34,7 @@ impl OpToken {
     }
 }
 
-/// The request-state key (pyos's `private_data`, as a slab index).
+/// The request-state key, a slab index.
 type ReqKey = usize;
 
 // ---- what a callback receives ----------------------------------------------
@@ -196,8 +196,8 @@ impl Core {
         OpToken::pack(e.generation, slot)
     }
 
-    /// Retrieve + recycle the slot for a completion. A stale/foreign token (wrong generation, or already reaped)
-    /// returns None and is inert - the property the routing/close-last fuzzer checks.
+    /// Retrieve and recycle the slot for a completion. A stale or foreign token, of the wrong generation or already
+    /// reaped, returns `None` and is inert.
     fn take_op(&mut self, tok: OpToken) -> Option<(Callback, ReqKey)> {
         let e = self.slots.get_mut(tok.slot() as usize)?;
         if !e.used || e.generation != tok.generation() {
@@ -258,8 +258,7 @@ impl Reactor {
             };
             let state = &mut self.reqs[key];
             let staging = &mut self.staging;
-            // A panicking callback must not abort the drain (pyos reports it unraisable); catch_unwind is the
-            // equivalent.
+            // A panicking callback must not abort the drain.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || cb(&comp, state, staging)));
         }
     }

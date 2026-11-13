@@ -1,20 +1,15 @@
 #![no_main]
 
-//! Fuzz the credential broker's request decoder — the sharpest privilege boundary in the crate.
+//! Fuzz the credential broker's request decoder, the sharpest privilege boundary in the crate.
 //!
-//! The broker runs in a forked child holding `CAP_SETUID`, reading fixed-layout datagrams off a socket and minting
-//! io_uring personalities from whatever the decoder accepts. Everything downstream — `register_as`, the uid/gid it
-//! assumes, the capability set it grants — trusts these fields. If a malformed datagram can produce a `Req`, it can
-//! produce a personality the caller was never entitled to.
-//!
-//! The four properties an accepted request must satisfy, each of which gates a separate downstream use:
+//! The broker runs in a forked child holding `CAP_SETUID` and mints io_uring personalities from whatever the decoder
+//! accepts, so a malformed datagram that decodes to a `Req` is a personality the caller was never entitled to. An
+//! accepted request must satisfy
 //! - `ring < nrings`, because the ring index becomes `RING_FD_BASE + ring`, a raw descriptor number in the child,
 //! - `ngroups <= MAX_GROUPS`, the bound on the caller-supplied scratch buffer,
-//! - the datagram is **exactly** `HDR_LEN + 4 * ngroups` — a lower bound would
-//!   let a receive-buffer truncation be read as though the missing tail were
-//!   zeroed groups,
-//! - `caps ⊆ allowed`, the ceiling fixed when the broker was spawned; an unknown bit must be refused rather than masked
-//!   off, or the caller silently gets a weaker personality and discovers it as an `EACCES` far away,
+//! - a length of exactly `HDR_LEN + 4 * ngroups`, since a lower bound would read a truncated datagram as though its
+//!   missing tail were zeroed groups,
+//! - `caps ⊆ allowed`, the ceiling fixed at spawn, with an unknown bit refused rather than masked off,
 //! - and for a registration of uid 0, `caps ⊆ root` instead, the root limit `spawn_with_root` fixed, with no
 //!   registration of uid 0 accepted at all when the broker has none.
 //!
@@ -30,23 +25,9 @@ use truenas_ros::uring_fs::{
 const HDR_LEN: usize = 16;
 
 fuzz_target!(|data: &[u8]| {
-    // A broker is spawned with a real ring count and a real ceiling, so model both rather than letting the fuzzer
-    // invent impossible ones. The ceiling is drawn from a selector byte rather than independently: with a random
-    // ceiling the `caps ⊆ allowed` check would almost always reject, and the accept path — the one that mints a
-    // personality — would go untested.
-    //
-    // Two selector bytes, because the ring count and the ceiling are independent axes and one byte cannot carry both:
-    //
-    // * `nrings` takes a **whole** byte. A nibble cannot express a ceiling above 15, so `usize::from(sel >> 4) %
-    //   (MAX_RINGS + 1)` was the identity once `MAX_RINGS` reached sixteen, and the maximum ring count — with it the
-    //   widest `ring < nrings` accept this target exists to explore — was unreachable. A whole byte tracks the constant
-    //   to 255, which is where the `u8` ring index really binds.
-    // * `1 +`, because `spawn_with_caps` refuses an empty slice, so a broker serving no rings is not a state worth
-    //   modelling.
-    // * a **second** byte for the ceiling. Drawing both from one byte couples them: `1 + sel % 16` makes `nrings`'
-    //   parity the exact inverse of the `sel & 1` ceiling branch, so `nrings == MAX_RINGS` would pair only with the
-    //   restrictive ceiling that mostly rejects — and the accept path is precisely what needs it. Independent bytes
-    //   reach the full cross product at every ceiling.
+    // Model a real ring count and ceiling, each from a byte of its own so neither couples the other. `nrings` takes the
+    // whole byte to reach `MAX_RINGS`, from 1 since `spawn_with_caps` refuses no rings. The ceiling is every capability
+    // or the byte's bits, since a random one almost always rejects and leaves the accept path untested.
     let Some((&sel, rest)) = data.split_first() else {
         return;
     };
@@ -108,10 +89,9 @@ fuzz_target!(|data: &[u8]| {
         "accepted caps {:?} outside the ceiling {ceiling:?}",
         decoded.caps
     );
-    // An unknown bit must be refused, not masked off - a caller would otherwise get a personality weaker than it asked
-    // for and discover it as an `EACCES` far from here. The `contains` above cannot see that happen: it is true by
-    // construction on the accept path (`decode_request` ends in `Some(c) if allowed.contains(c)`), so it holds under
-    // `from_bits_truncate` just as well. Re-derive the wire word and require the decode to have been lossless.
+    // An unknown bit must be refused, not masked off, or a caller gets a weaker personality than it asked for and finds
+    // out as an `EACCES` far from here. The `contains` above would hold under `from_bits_truncate` just as well, so
+    // re-derive the wire word and require a lossless decode.
     let caps_bits = u32::from_le_bytes([req[12], req[13], req[14], req[15]]);
     assert_eq!(
         Caps::from_bits(caps_bits),

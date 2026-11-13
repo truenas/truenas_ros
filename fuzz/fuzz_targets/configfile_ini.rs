@@ -2,29 +2,25 @@
 
 //! Fuzz the configparser-compatible INI codec: parse, serialize, reparse.
 //!
-//! The grammar is already differentially tested against real CPython `configparser` (`test/configparser_compat.rs`,
-//! including a random-document generator), so this target is not chasing grammar coverage. It chases the two things
-//! that oracle cannot reach:
+//! The grammar is already tested against CPython `configparser` in `test/configparser_compat.rs`, so this target chases
+//! the two things that oracle cannot reach.
 //!
-//! 1. **Serialization is a fixed point.** Whatever `read_str` accepts, `write_string` must render as a document that
-//!    reparses to the same configuration and renders identically the second time. A value or key that survives parsing
-//!    but re-parses differently — one carrying a newline, a delimiter, or a comment marker — is a config-rewriting bug:
-//!    read a file, write it back, and it now means something else.
-//! 2. **Interpolation terminates.** `get`/`items` run the recursive `%(name)s` expansion, which is bounded by a depth
-//!    cap and a 1 MiB output cap. Both caps must hold for adversarially self-referential documents.
+//! 1. **Serialization is a fixed point.** Whatever `read_str` accepts must render as a document that reparses to the
+//!    same configuration and renders identically the second time. A key or value that reparses differently, such as one
+//!    carrying a newline, a delimiter or a comment marker, makes a file read and written back mean something else.
+//! 2. **Interpolation terminates.** `get` and `items` expand `%(name)s` recursively under a depth cap and a 1 MiB
+//!    output cap, and both caps must hold for self-referential documents.
 //!
-//! Both delimiter modes are exercised, since `to_string_with(false)` emits `key=value` and is the shape most likely to
-//! reparse ambiguously.
+//! Both delimiter modes run, since `to_string_with(false)` emits `key=value`, the shape most likely to reparse
+//! ambiguously.
 
 use libfuzzer_sys::fuzz_target;
 use truenas_ros::configfile::ConfigFile;
 
-/// Parse, serialize, reparse, re-serialize; assert the two renderings agree and the structure survived. Returns early
-/// if the document is rejected.
 fn fixed_point(text: &str, spaced: bool) {
     let mut first = ConfigFile::new();
     if first.read_str(text).is_err() {
-        return; // not a document; nothing to say about it
+        return;
     }
     let once = first.to_string_with(spaced);
 

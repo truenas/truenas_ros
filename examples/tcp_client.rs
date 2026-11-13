@@ -1,19 +1,15 @@
 //! Driving the outbound `net::client` against an in-process `net::server` echo.
 //!
 //! `net::client` is the outbound half of the io_uring stream stack. Like the server it owns one ring on one thread and
-//! is caller-driven: `next_event` pumps the ring and *returns* completions (`Event`) rather than invoking callbacks.
-//! This example runs the whole outbound flow against a real server, entirely in one process:
+//! is caller-driven, so `next_event` pumps the ring and *returns* completions (`Event`) rather than invoking callbacks.
+//! This example runs the whole outbound flow against a real server in one process.
 //!
-//!  1. an echo `net::server` is bound on an ephemeral loopback port and run on its own thread - both roles are `!Send`
-//!     (one ring each), so they cannot share a thread; it hands its resolved address and a `ShutdownHandle`
-//!     (both `Send`) back through a channel;
-//!  2. the client opens several connections at once with `connect_start`
-//!     (non-blocking) and drives them all up on the one ring;
-//!  3. it fans out a batch of length-prefixed requests across them with `send` (non-blocking, so several are in flight
-//!     per connection at once), plus one
-//!     blocking `request` to show the simple path;
-//!  4. it pumps `next_event` to collect every echo, correlating each reply to the connection (and request id) that
-//!     produced it, and prints them.
+//!  1. An echo `net::server` binds an ephemeral loopback port on a thread of its own, since both roles are `!Send` and
+//!     cannot share one, and sends its address and a `ShutdownHandle` back through a channel.
+//!  2. The client opens several connections at once with the non-blocking `connect_start`, all on the one ring.
+//!  3. It fans out a batch of length-prefixed requests with the non-blocking `send`, several in flight per connection,
+//!     plus one blocking `request` to show the simple path.
+//!  4. It pumps `next_event` for every echo, matching each reply to the connection and request id that produced it.
 //!
 //! Run (loopback only):
 //!   cargo run --example tcp_client --features net-server,net-client

@@ -33,11 +33,9 @@ fuzz_target!(|data: &[u8]| {
                             assert!(end < hlen, "Need after prefix complete (end={end})");
                         }
                         Framing::Complete { header_len, body_len } => {
-                            // The header is exactly the prefix and was fully buffered. body_len is whatever the prefix
-                            // decodes to and is deliberately UNBOUNDED at this layer: a u64 prefix near u64::MAX yields
-                            // a body_len whose sum with header_len overflows usize. Capping it is the pump's job, not
-                            // the framer's (checked_add + max_request_bytes -> TooLarge close; the framer only reports
-                            // what it parsed). So the framer-level invariants are just the header shape + buffering.
+                            // `body_len` is deliberately unbounded here, so a u64 prefix near `u64::MAX` can overflow
+                            // `header_len + body_len`. Capping it is the pump's job (`frame_step` closes `TooLarge`),
+                            // so only the header's shape and buffering are asserted.
                             assert_eq!(header_len, hlen);
                             assert!(end >= hlen, "Complete before prefix");
                             let _ = body_len;

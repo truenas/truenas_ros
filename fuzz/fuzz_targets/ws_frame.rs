@@ -1,5 +1,6 @@
-//! Lane T2: the WebSocket frame-header parser and both framers over attacker-controlled bytes - the target
-//! `src/ws/mod.rs` never had.
+//! Fuzz the WebSocket frame-header parsers, both framers and the handshake validators over attacker-controlled bytes.
+//! Every verdict must be one the reactor can act on, and a frame the client encoder masks must parse and unmask back to
+//! its payload.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -75,12 +76,9 @@ fuzz_target!(|data: &[u8]| {
         check_verdict(server_frame_head(d), d, true);
     }
 
-    // Both framers, drip-fed through the handshake phase and then *past* it into frames.
-    //
-    // The break has to consume, not stop. A framer answers `More` only while the handshake head is still arriving; the
-    // verdict that ends that phase is a `Complete` naming the head's extent, and stopping there is stopping exactly at
-    // the point the frame phase begins - so the loop that was meant to reach `frame_step` never did. Consume each
-    // `Complete` and carry on from the remainder, which is what a driver does.
+    // Both framers, drip-fed through the handshake phase and on into frames. Each `Complete` is consumed and the loop
+    // carries on from the remainder, as a driver does, since stopping at the handshake's `Complete` stops exactly where
+    // the frame phase begins.
     for framer in [
         ws::ws_frame as fn(&[u8], &mut WsState) -> Framing,
         ws::ws_server_frame as fn(&[u8], &mut WsState) -> Framing,
@@ -88,18 +86,9 @@ fuzz_target!(|data: &[u8]| {
         let mut st = WsState::default();
         let mut buf: &[u8] = data;
         loop {
-            // Drip-feed the current message: every prefix, so a resumable ask is exercised at each byte boundary.
-            //
-            // A resumable ask is any of the FOUR - `Need`, `NeedInMessage`, `More`, `MoreInMessage` - not the two the
-            // handshake phase happens to use. The frame phase asks with `Need`/`NeedInMessage` (`ws::frame_step`
-            // answers `Need(2)` for an empty buffer), so a predicate naming only `More`/`MoreInMessage` reads the frame
-            // phase's very first ask as a terminal verdict, the `let else` below finds it is not a `Complete`, and the
-            // outer loop breaks at `end == 0` having consumed nothing. That is why the frame phase still ran no frames
-            // after the loop was rewritten to consume them: `frame_step` was entered, but only ever through its
-            // empty-buffer early return, so its `parse` was never called at all.
-            //
-            // Measured: a `panic!` on `frame_step`'s `Framing::Complete` arm survived 400 000 runs with the two-variant
-            // predicate and crashes on the seeded corpus with this one.
+            // Drip-feed every prefix. All four asks are resumable, not only the handshake's two, since the frame phase
+            // asks with `Need` (`ws::frame_step` answers `Need(2)` to an empty buffer), and a predicate naming only
+            // `More` and `MoreInMessage` would stop there and never parse a frame.
             let mut verdict = None;
             for end in 0..=buf.len() {
                 let v = framer(&buf[..end], &mut st);

@@ -22,10 +22,8 @@ fn cmp(a: &Entry, b: &Entry) -> Ordering {
 }
 
 fuzz_target!(|data: &[u8]| {
-    // Three entries out of one input: a `\xff`-separated list of names, with the leading byte supplying each name's
-    // is-a-directory bit. Keeping this byte-driven means a corpus entry reads as the names it compares — the
-    // interesting cases are prefix pairs like `a` / `a/` / `ab`, which a structured generator would rarely line up on
-    // its own.
+    // Three entries from one input, a `\xff`-separated list of names with the leading byte giving each one's directory
+    // bit. Byte-driven input lines up prefix pairs like `a`, `a/` and `ab`, which a structured generator rarely would.
     let Some((&flags, rest)) = data.split_first() else {
         return;
     };

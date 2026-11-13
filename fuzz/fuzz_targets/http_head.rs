@@ -20,14 +20,9 @@ fuzz_target!(|data: &[u8]| {
                 "head len {len} out of bounds for {}",
                 data.len()
             );
-            // The request-target screen's promise, asserted rather than merely exercised: an origin server serves
-            // origin-form, and `*` only for OPTIONS. An absolute-form that kept its authority, or an authority-form,
-            // must have died instead of being handed on - two authorities in one request is the differential the screen
-            // exists to refuse, and a front end routing on one while this server routes on the other disagree about the
-            // bucket.
-            //
-            // Only the *shape* is asserted, not the absence of a scheme: `GET /://k` is legal origin-form whose path
-            // happens to contain `://`, so a "no scheme survived" check fails on valid input.
+            // An origin server serves origin-form, and `*` only for OPTIONS. An absolute-form that kept its authority,
+            // or an authority-form, must have died, since a front end routing on one authority and this server on the
+            // other disagree about the bucket. Only the shape is asserted, since `GET /://k` is legal origin-form.
             assert!(
                 target.starts_with('/') || target == "*",
                 "unreduced target handed on: {target:?}"

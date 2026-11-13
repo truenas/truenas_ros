@@ -85,11 +85,9 @@ fn main() -> truenas_ros::Result<()> {
                     // Cheap: answer inline on the ring thread.
                     Response::Reply(frame(&body.to_ascii_uppercase()))
                 } else {
-                    // Expensive: offload so the ring thread keeps serving others.
-                    // `deferred` is the Send reply handle for the worker;
-                    // `permit` entitles returning `Response::Defer`.
-                    // `take()` moves the body without a copy when it was placed (>= body_placement_threshold), copies
-                    // otherwise.
+                    // Expensive, so offload it and keep the ring thread serving others. `deferred` is the `Send` reply
+                    // handle for the worker, `permit` entitles the handler to return `Response::Defer`, and `take()`
+                    // moves a placed body out without a copy.
                     let input = body.take();
                     let (deferred, permit) = responder.defer();
                     pool.spawn(move || deferred.reply(frame(&expensive(&input))));

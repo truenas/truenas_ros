@@ -36,12 +36,8 @@ struct Session {
 
 /// The accept handler as a standalone function.
 ///
-/// Its signature *is* the `accept` contract:
-/// `fn(Incoming<'_>) -> Option<U>` (here `U = Session`) - the [`Incoming`] carries the peer's identity plus the
-/// listener it arrived on. `None`
-/// rejects the connection (accepted then closed before any read);
-/// `Some(state)` admits it with per-connection state. The peer address is fetched per connection (race-free), so
-/// admitting by IP is sound.
+/// Its signature is the `accept` contract with `U = Session`, and the [`Incoming`] carries the peer's identity and the
+/// listener it arrived on. The peer address is fetched per connection, free of races, so admitting by IP is sound.
 fn admit(inc: Incoming<'_>) -> Option<Session> {
     match (inc.peer, inc.listener_addr) {
         // Local-trust split: anything on a unix listener is admitted...

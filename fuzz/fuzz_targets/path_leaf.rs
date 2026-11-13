@@ -1,14 +1,12 @@
 #![no_main]
 
-//! Fuzz `Leaf::new` — the single-path-component check.
+//! Fuzz `Leaf::new`, the single-path-component check.
 //!
-//! This is a documented security boundary, and it carries no unit tests. The `*at` opcodes the fs reactor issues honour
-//! no `RESOLVE_*` flags, so a name that slips a `/` or a `..` past this check escapes its anchor directory entirely —
-//! the containment the whole API rests on is this one function.
+//! This is a security boundary. The `*at` opcodes the fs reactor issues honour no `RESOLVE_*` flags, so a name that
+//! slips a `/` or a `..` past this check escapes its anchor directory.
 //!
-//! Two properties. First, nothing traversal-shaped is ever accepted. Second, `to_cstring`'s `expect("validated: no
-//! interior NUL")` is genuinely unreachable: `Leaf::new` is what discharges that precondition, so any name it accepts
-//! must convert without panicking.
+//! Nothing traversal-shaped may be accepted, and any name `Leaf::new` accepts must convert through `to_cstring` without
+//! reaching its `expect`.
 
 use libfuzzer_sys::fuzz_target;
 use truenas_ros::uring_fs::{Leaf, fuzz::leaf_to_cstring};

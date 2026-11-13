@@ -2,18 +2,16 @@
 
 //! Fuzz audit-record rendering for **log injection**.
 //!
-//! Every string on an `AuditEvent` is caller-supplied and, in practice, attacker-influenced: an account name, a client
-//! address, a method argument. The rendered text is wrapped by the kernel in `msg='…'` and later split back into
-//! `key=value` pairs by `ausearch`. So no input may be able to
+//! Every string on an `AuditEvent` is caller-supplied and may be attacker-influenced. The kernel wraps the rendered
+//! text in `msg='…'` and `ausearch` later splits it into `key=value` pairs, so no input may
 //! - introduce a space, and with it a token boundary that forges a new field,
 //! - close the value's `"` early,
 //! - close the kernel's `'` early,
 //! - or embed a newline and forge a whole record.
 //!
-//! `needs_encoding` is the kernel's own rule (`audit_string_contains_control`) plus `'`: a value is emitted bare-quoted
-//! only when every byte is in `0x21..=0x7e` and none is `"` or `'`. Otherwise it is hex. This target asserts the
-//! consequence — the record tokenizes into exactly the fields that were put on it, and every value is either a clean
-//! quoted run or pure hex.
+//! `needs_encoding` is the kernel's rule (`audit_string_contains_control`) plus `'`, so a value is quoted only when
+//! every byte is in `0x21..=0x7e` and none is `"` or `'`, and is hex otherwise. The target asserts that the record
+//! tokenizes into exactly the fields put on it, and that every value is a clean quoted run or pure hex.
 
 use libfuzzer_sys::fuzz_target;
 use truenas_ros::audit::{AuditEvent, AuditPrincipal, AuditType};
@@ -88,14 +86,9 @@ fuzz_target!(|input: (
         tokens.len()
     );
 
-    // Three tokens are written bare, all of them chosen by the crate rather than by a caller: the leading `op=`, which
-    // keeps PAM's unquoted shape when both halves are clean (its value always carries the `:`, which no hex run can, so
-    // it stays unambiguous), and the trailing `res=`, a fixed literal. Everything between them is caller-supplied and
-    // must be quoted or hex.
-    //
-    // Position, not key name, decides which rule applies. A service may name one of its own `fields` "res" or "op" —
-    // key sanitizing constrains the charset, not the vocabulary — so a token keyed `res` in the middle of the record is
-    // an ordinary caller field and gets the strict rule.
+    // The crate writes the leading `op=` bare as PAM does when both halves are clean, its value always carrying a `:`
+    // no hex run can, and the trailing `res=` is a fixed literal. Everything between is caller-supplied and must be
+    // quoted or hex. Position decides the rule, not the key, since a caller may key its own field `res` or `op`.
     let last = tokens.len() - 1;
     for (i, token) in tokens.iter().enumerate() {
         let (key, value) = token
