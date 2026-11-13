@@ -40,9 +40,8 @@ pub(crate) struct LoopShared {
 impl LoopShared {
     /// Request a hard stop.
     ///
-    /// A function, and one spelling of the ordering, so a model drives *this* store rather than its own copy of the
-    /// pairing - a model with its own copy checks the memory model rather than the code, and stays green with the
-    /// shipping ordering weakened (`bufring::publish_tail` states the same rule).
+    /// A function, and one spelling of the ordering, so a model drives this store rather than its own copy, which would
+    /// stay green with the shipping ordering weakened.
     #[inline]
     pub(crate) fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
@@ -57,15 +56,12 @@ impl LoopShared {
     /// Request a graceful drain of `grace_ms`: the period first, then the flag whose **Release** store is what makes it
     /// readable.
     ///
-    /// `grace_ms` is a Relaxed payload published by this pair - message passing, and the Release/Acquire is the only
-    /// thing making it visible. Weaken the store and a loop that sees `graceful` may still read `grace_ms == 0`, arming
-    /// a zero-length grace period and hard-killing connections it promised to drain.
+    /// `grace_ms` is a Relaxed payload, made visible only by this Release pairing with the Acquire in
+    /// [`graceful_requested`](Self::graceful_requested). Weaken the store and a loop that sees `graceful` may still
+    /// read `grace_ms == 0` and hard-kill connections it promised to drain.
     ///
-    /// **The loom lane owns this edge** (`loom_graceful_publication`):
-    /// this module's concurrency tests compile only under `--cfg loom`, so Miri interprets nothing that crosses it and
-    /// every Miri arm stays green with the store weakened - measured, against loom going red in seconds. The
-    /// mirror-image edge is the wake dedup's (`task::poll_window`), which only Miri catches; retire either lane and its
-    /// edge goes unwatched.
+    /// **The loom lane owns this edge** (`loom_graceful_publication`), since Miri runs nothing that crosses it. The
+    /// wake dedup's edge (`task::poll_window`) is caught only by Miri, so neither lane can be retired.
     #[inline]
     pub(crate) fn request_graceful(&self, grace_ms: u64) {
         self.grace_ms.store(grace_ms, Ordering::Relaxed);
@@ -83,12 +79,10 @@ impl LoopShared {
 
 /// The wake eventfd. Poking it adds 1 to the counter, completing the loop's armed `READ` so it drains pending work.
 ///
-/// Under `--cfg loom` the fd is replaced by a counter plus a condvar. A real eventfd cannot be used in a model:
-/// `loom::model` re-runs its closure once per interleaving - thousands of times - and each run would open another
-/// descriptor. The stand-in reproduces the two properties the no-lost-wakeup argument actually rests on: pokes
-/// **accumulate**, and a drain takes the whole count at once. Anything a model proves is therefore conditional on the
-/// kernel's eventfd behaving that way, which [`Engine::arm_wake`](super::engine::Engine::arm_wake) documents but
-/// nothing here verifies.
+/// Under `--cfg loom` the fd is replaced by a counter plus a condvar, since `loom::model` re-runs its closure once per
+/// interleaving and each run would open another descriptor. The stand-in keeps the two properties the no-lost-wakeup
+/// argument rests on, that pokes **accumulate** and a drain takes the whole count, which the kernel's eventfd is
+/// assumed to share.
 #[derive(Debug)]
 pub(crate) struct WakeHandle {
     #[cfg(not(loom))]
@@ -97,13 +91,13 @@ pub(crate) struct WakeHandle {
     count: crate::sync::Mutex<u64>,
     #[cfg(loom)]
     ready: crate::sync::Condvar,
-    /// Whether the loop is asleep in `io_uring_enter`, as tokio's `Parker` tracks it.
+    /// Whether the loop is asleep in `io_uring_enter`.
     ///
     /// A poke writes the eventfd only when the loop is [`PARKED`]. An [`ACTIVE`] loop drains every wake source before
     /// it parks ([`Self::park`]), so a poke that only sets [`NOTIFIED`] is seen there, without the syscall and the
     /// completion.
     ///
-    /// Opt-in per loop: a handle starts [`LEGACY`], where every poke writes, because a site that blocks without calling
+    /// Opt-in per loop. A handle starts [`LEGACY`], where every poke writes, because a site that blocks without calling
     /// [`Self::park`] (the ring tests, the teardown drain) would sleep through a skipped write. A loop opts in with
     /// [`Self::activate`].
     state: AtomicU64,
@@ -243,8 +237,8 @@ impl WakeHandle {
     /// Model-only: what the loop's armed `READ` does when it completes - block until the counter is non-zero, then
     /// drain it to 0 in one go. Returns the count consumed.
     ///
-    /// This is the half of the protocol that makes a poke arriving between a drain and the next arm safe: it is still
-    /// counted, so the next read completes immediately instead of parking.
+    /// A poke arriving between a drain and the next arm is still counted, so the next read completes at once instead
+    /// of parking.
     #[cfg(loom)]
     pub(crate) fn drain(&self) -> u64 {
         let mut n = self.count.lock().unwrap_or_else(|e| e.into_inner());
@@ -269,19 +263,8 @@ impl WakeHandle {
 //
 // Run with:  RUSTFLAGS="--cfg loom" cargo test --lib --features uring loom_
 //
-// `grace_ms` is a **Relaxed** payload published by a **Release** store of `graceful`, and read after an **Acquire**
-// load of it:
-//
-//   writer (`ShutdownHandle::shutdown_graceful`)   loop (`Server::on_wake`)
-//   LoopShared::request_graceful(ms)              LoopShared::graceful_requested()
-//   wake.poke()
-//
-// That is message passing: the Release/Acquire pair is the only thing making the Relaxed payload visible. Weaken the
-// store to Relaxed and a loop that sees `graceful` may still read `grace_ms == 0`, arming a zero-length grace period
-// and hard-killing connections it promised to drain.
-//
-// The model calls those two functions rather than re-spelling their stores, which is what makes it a test of the code
-// instead of a test of loom.
+// The model calls `request_graceful` and `graceful_requested` rather than re-spelling their stores, which makes it a
+// test of the code instead of a test of loom.
 #[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;

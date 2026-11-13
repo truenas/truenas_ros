@@ -1,93 +1,60 @@
 //! A registered **provided-buffer ring**: buffers the kernel picks from at completion time, rather than an address each
 //! SQE names.
 //!
-//! # Why an op, not a connection, owns a buffer
+//! An op, not a connection, holds a buffer. It is taken when an op completes and released when its bytes have been
+//! consumed, so the pool is sized for concurrent transfers rather than for the connection table.
 //!
-//! The alternative this replaces is a buffer per connection, sized for the largest read that connection might do and
-//! held for its whole life. That makes memory scale with the number of connections rather than with how much data is
-//! actually moving - most of it idle, most of the time.
+//! # The ring is a conveyor, not a slab
 //!
-//! Here a buffer is taken when an op completes and released when its bytes have been consumed. Nothing holds one across
-//! messages, so the pool is sized for concurrent transfers instead of for the connection table.
+//! Each descriptor carries its own `addr` and `len`, so the ring is registered once at its maximum entry count and
+//! buffers are allocated and posted on demand, as SPDK does (`uring_sock_group_populate_buf_ring`,
+//! `module/sock/uring/uring.c`). Whether storage may be freed is then a question about one id, where a slab would need
+//! a proof that nothing in the whole pool is lent.
 //!
-//! # The ring is a conveyor, not an allocator
-//!
-//! The registered region is an array of **descriptors** - each entry carries its own `addr` and `len` - and the storage
-//! behind them is entirely this side's business. So the ring is registered once at its maximum entry count and buffers
-//! are allocated and posted into it on demand: growing means posting one more, shrinking means not re-posting one that
-//! came back.
-//!
-//! That is SPDK's model (`uring_sock_group_populate_buf_ring`, `module/sock/uring/uring.c`), and it is worth copying
-//! for a reason beyond elasticity: **a buffer is freed only in [`BufRing::release`], which runs exactly when the kernel
-//! has handed it back.** The alternative - one slab per registered group, retiring a group to shrink - has to prove no
-//! buffer anywhere in the group is still lent before freeing the slab under it, which is a whole-pool invariant
-//! guarding a use-after-free. Here the question is per buffer and the answer is local.
-//!
-//! # When a buffer is allocated, and when it is freed
-//!
-//! There are exactly two places, and both are named here so the hot path is not a guess:
-//!
-//! - **[`BufRing::post`] allocates, and only for an id that has no buffer.**
-//!   An id keeps its storage across a lend/release cycle, so re-posting a buffer that came back costs nothing - it
-//!   rewrites a descriptor. Posting an id that has never been used, or was given up in a shrink, allocates once.
-//! - **[`BufRing::release`] frees, and only when the pool is over target.**
-//!   That is the shrink, and it is the only free before `Drop`.
-//!
-//! So the allocation profile is: `initial` buffers at registration, one per buffer each time the target rises past
-//! where it has been, one free per buffer as a lowered target drains, and **nothing at all in steady state** - a
-//! connection taking a buffer, filling it, and handing it back allocates nothing, which is the whole point of pooling
-//! rather than minting per message. `cycling_a_buffer_allocates_nothing` pins it.
-//!
-//! The allocation is fallible (`try_reserve_exact`): a server under memory pressure should hold fewer buffers, not
-//! abort. Failing to grow is not an error path, it is the same outcome as reaching the ceiling.
+//! - **[`BufRing::post`] allocates, and only for an id that has no storage.** Re-posting a buffer that came back
+//!   rewrites a descriptor and nothing else (`cycling_a_buffer_allocates_nothing`).
+//! - **[`BufRing::trim`] frees, and only storage behind an id neither posted nor lent.** [`BufRing::release`] takes a
+//!   surplus buffer out of the ring and keeps its storage.
 //!
 //! # The contract with the kernel
 //!
 //! - The ring is an array of [`IoUringBuf`] whose producer `tail` is **overlaid on entry zero's `resv` field**
-//!   (`include/uapi/linux/io_uring.h`). They share storage by design; a layout that separates them silently loses every
-//!   publish.
-//! - The memory must be **page aligned**, and the kernel pins it for the registration's lifetime (`io_uring/memmap.c`
-//!   rejects an unaligned `user_addr`). It is mapped rather than allocated for exactly that.
+//!   (`include/uapi/linux/io_uring.h`), so a layout that separates them loses every publish.
+//! - The memory must be **page aligned**, and the kernel pins it for the registration's lifetime (`io_uring/memmap.c`).
 //! - `ring_entries` must be a power of two under 65536 (`io_uring/kbuf.c`).
 //! - A completion carries a buffer **iff** `IORING_CQE_F_BUFFER` is set in `cqe.flags`, with the id in the upper 16
-//!   bits. That flag is the whole rule for whether [`BufRing::release`] is owed: an op that failed before selecting
-//!   one - `-ENOBUFS` especially - took nothing.
-//! - A buffer cannot be **reserved**. The kernel picks one when the op completes, not when it is submitted
-//!   (`io_ring_buffer_select`, `io_uring/kbuf.c`), so any number of selecting ops can be outstanding against a pool of
-//!   any size. Shortage is reported as `-ENOBUFS` on the completion, which is the only place it can be answered.
+//!   bits. That flag is the whole rule for whether [`BufRing::release`] is owed.
+//! - A buffer cannot be **reserved**. The kernel picks one when the op completes (`io_ring_buffer_select`,
+//!   `io_uring/kbuf.c`), so shortage is reported as `-ENOBUFS` on the completion, the only place it can be answered.
 
 use crate::errno::{self, Errno};
 use crate::uring::page_size;
 use crate::uring::sys::*;
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
-// The tail cell is `std`'s in production, reached through a raw pointer into the mapping; under loom it is loom's,
-// owned by value and carrying the model state - the same split `uring::ring` makes, and for the same reason: the
-// ordering below is then one store that both the kernel path and the model go through.
+// The tail cell is `std`'s in production and loom's in a model, as in `uring::ring`, so `publish_tail` is the one store
+// both go through.
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicU16, Ordering};
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicU16, Ordering};
 
-/// The system page size; the granularity the ring must be aligned to.
 /// Publish the producer tail.
 ///
-/// `Release` so the kernel cannot observe a tail that names a descriptor whose fields it has not yet seen: it reads the
+/// `Release` so the kernel cannot observe a tail that names a descriptor whose fields it has not yet seen. It reads the
 /// tail with `smp_load_acquire` and only then the descriptor (`io_ring_buffer_select`, `io_uring/kbuf.c:202-216`).
 ///
-/// A function rather than a store inside [`BufRing::commit`] so that the ordering exists once and the loom model drives
-/// *this* store. A model with its own copy of the pairing checks the memory model rather than the code - it passes with
-/// this weakened to `Relaxed`, which is the case it is for.
+/// A function rather than a store inside [`BufRing::commit`], so the loom model drives this store. A model with its own
+/// copy passes with this weakened to `Relaxed`.
 #[inline]
 fn publish_tail(cell: &AtomicU16, tail: u16) {
     cell.store(tail, Ordering::Release);
 }
 
-/// Where one buffer id stands.
+/// Where one buffer id stands with the kernel, not whether storage sits behind it.
 ///
-/// This is the id's standing with the kernel, not whether storage sits behind it: an `Absent` id may keep the buffer a
-/// shrink left it, so the next growth posts it without touching the allocator. What counts as allocated is what the
-/// ring holds or has lent; kept storage is neither, and [`BufRing::trim`] is where it goes.
+/// An `Absent` id may keep the storage a shrink left it, which counts as neither posted nor lent until
+/// [`BufRing::trim`] frees it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Slot {
     /// Not in the ring and not lent, with or without storage behind it.
@@ -115,9 +82,8 @@ pub(crate) struct BufRing {
     bgid: u16,
     /// How many buffers to keep allocated. Growth and shrink move this; the buffers follow.
     target: u16,
-    /// Ids with no buffer behind them, ready for growth to post. A stack rather than a scan because growth runs on the
-    /// `-ENOBUFS` path - the one place already under load - and a per-step scan makes a doubling quadratic in
-    /// `entries`.
+    /// Ids with no buffer behind them, ready for growth to post. A stack rather than a scan, since growth runs on the
+    /// `-ENOBUFS` path and a per-step scan makes a doubling quadratic in `entries`.
     absent: Vec<u16>,
     posted: u16,
     lent: u16,
@@ -129,10 +95,8 @@ pub(crate) struct BufRing {
     ring_fd: RawFd,
     /// Times a buffer has been handed to the allocator.
     ///
-    /// Test-only. The property it exists to observe - that a cycle at target reaches the allocator not at all - cannot
-    /// be seen from outside: freeing and re-allocating a same-sized buffer usually returns the same address, so
-    /// comparing pointers across a cycle reports success either way. A counter nothing reads in production is a field
-    /// that drifts, so it is not there in production.
+    /// Test-only. Comparing pointers across a cycle cannot show an allocation, since freeing and re-allocating a
+    /// same-sized buffer usually returns the same address.
     #[cfg(test)]
     allocs: u64,
 }
@@ -140,32 +104,26 @@ pub(crate) struct BufRing {
 impl BufRing {
     /// Register a ring of `entries` descriptors, and post `initial` buffers of `buf_len` bytes into it.
     ///
-    /// `entries` is rounded up to a power of two, which the kernel requires, and is the **ceiling**: it can never be
-    /// raised, because re-registering a live `bgid` is `-EEXIST` and unregistering one would pull buffers out from
-    /// under any op still holding them. Size it for the most concurrent arrivals possible - the connection count - not
-    /// for the expected load, since an unbacked descriptor slot costs 16 bytes and nothing else.
+    /// `entries` is rounded up to a power of two, as the kernel requires, and is a **ceiling** that can never be
+    /// raised, since re-registering a live `bgid` is `-EEXIST` and unregistering one would pull buffers from ops still
+    /// holding them. Size it for the most concurrent arrivals, not the expected load, since an unbacked descriptor slot
+    /// costs 16 bytes.
     pub(crate) fn new(ring_fd: RawFd, bgid: u16, entries: u16, buf_len: usize, initial: u16) -> errno::Result<BufRing> {
-        // `checked_`, because the plain form panics in debug and wraps to zero in release for anything above 32768 - so
-        // the `entries == 0` guard below could only ever fire in one of the two profiles, and the build that ships is
-        // the one where a wrapped count reaches the kernel. The kernel's own ceiling is 32768 entries
-        // (`io_uring/kbuf.c:633-637`); this refuses what it would.
+        // `checked_`, since the plain form wraps to zero in release for anything above 32768, the kernel's own ceiling
+        // (`io_uring/kbuf.c:633-637`).
         let entries = match entries.max(1).checked_next_power_of_two() {
             Some(e) => e,
             None => return Err(Errno::EINVAL),
         };
-        // A descriptor's `len` is a `u32` (`io_uring_buf`), so a length that does not fit one cannot be published:
-        // `buf_len as u32` truncates, and any nonzero multiple of 2^32 truncates to exactly the zero this guard
-        // refuses. The kernel clamps a selecting read down to the descriptor it picked (`io_ring_buffer_select`,
-        // `io_uring/kbuf.c`), so every read would then complete `res = 0`, which the recv path reads as a peer FIN.
-        // Refuse it here, where the caller still learns.
+        // A descriptor's `len` is a `u32`, and a truncated length can be zero. The kernel clamps a selecting read to
+        // the descriptor (`io_ring_buffer_select`, `io_uring/kbuf.c`), so every read would complete `res = 0`, a FIN.
         if buf_len == 0 || buf_len > u32::MAX as usize {
             return Err(Errno::EINVAL);
         }
         let ring_bytes = usize::from(entries) * size_of::<IoUringBuf>();
         let mapped = ring_bytes.next_multiple_of(page_size());
-        // SAFETY: an anonymous private mapping of a non-zero length; the kernel chooses the address, which is page
-        // aligned by construction
-        // - which is what `io_create_region` demands of `user_addr`.
+        // SAFETY: an anonymous private mapping of a non-zero length at an address the kernel picks, so page aligned as
+        // `io_create_region` demands of `user_addr`.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -179,9 +137,9 @@ impl BufRing {
         if ptr == libc::MAP_FAILED {
             return Err(Errno::last());
         }
-        // `MADV_DONTFORK`, as the SQ/CQ mapping sets on the same grounds (`ring::mmap_anon`): `CredBroker::spawn` forks
-        // holding the ring fds, and a `MAP_PRIVATE` region is otherwise copy-on-write into the child - handing it a
-        // route to descriptors naming this process's recv buffers that it never asked for and does not use.
+        // `MADV_DONTFORK`, as `ring::mmap_anon` sets. `CredBroker::spawn` forks holding the ring fds, and a
+        // `MAP_PRIVATE` region would otherwise be copied into the child with descriptors naming this process's recv
+        // buffers.
         // SAFETY: `ptr`/`mapped` are the mapping just made.
         if let Err(e) = Errno::result(unsafe { libc::madvise(ptr, mapped, libc::MADV_DONTFORK) }) {
             // SAFETY: same mapping, not yet owned by anything else and not yet registered, so the kernel holds no pin
@@ -233,9 +191,8 @@ impl BufRing {
     fn post(&mut self, bid: u16) -> bool {
         let i = usize::from(bid);
         debug_assert_eq!(self.slots[i], Slot::Absent, "posting a live buffer");
-        // THE ALLOCATION SITE. An id that already has storage keeps it, so re-posting a buffer that just came back
-        // through `release` costs a descriptor write and nothing else. Only a first use, or a re-use after a shrink
-        // gave the storage up, reaches the allocator.
+        // The only allocation site. An id keeps its storage, so re-posting a buffer back from `release` is a descriptor
+        // write and nothing else.
         if self.bufs[i].is_none() {
             // Fallible on purpose: a server under memory pressure should hold fewer buffers, not abort. `-ENOBUFS` then
             // drops the connection back to owning one, which is the same fallback a pool at its ceiling takes.
@@ -256,15 +213,13 @@ impl BufRing {
         let slot = usize::from(self.tail & self.mask);
         // SAFETY: `slot < entries` and the mapping covers `entries` descriptors, so the writes are in bounds.
         //
-        // Field by field, **never `resv`**: on entry zero `resv` is not reserved - it is the ring's published tail,
-        // which only `commit` may store. A whole-struct write here zeroes it, and every `entries`-th post lands in slot
-        // zero, so the kernel would then see a tail rewound behind its head - which it reads as a nearly full ring,
-        // since `tail == head` is its only emptiness test (`io_ring_buffer_select`, `io_uring/kbuf.c:202-216`) - and
-        // select unpublished descriptors, taking their stale `addr` verbatim as a recv destination.
-        // `a_post_never_touches_the_published_tail` pins this.
+        // Field by field, **never `resv`**. On entry zero `resv` is the ring's published tail, which only `commit` may
+        // store. A whole-struct write zeroes it, and the kernel, whose only emptiness test is `tail == head`
+        // (`io_ring_buffer_select`, `io_uring/kbuf.c:202-216`), would see a rewound tail and take stale descriptors as
+        // recv destinations. Pinned by `a_post_never_touches_the_published_tail`.
         //
-        // The ring cannot be overrun: every allocated id is posted at most once at a time, so the number of descriptors
-        // the kernel has not yet consumed is `posted`, which never exceeds `entries`.
+        // Every allocated id is posted at most once at a time, so the descriptors the kernel has not consumed number
+        // `posted`, never more than `entries`.
         unsafe {
             let d = self.ring.add(slot);
             (&raw mut (*d).addr).write(addr as u64);
@@ -282,10 +237,8 @@ impl BufRing {
 
     /// Make every descriptor written since the last commit visible.
     ///
-    /// Production only. Under `cfg(loom)` there is no mapping to publish into, and the cast below must not name loom's
-    /// `AtomicU16`: that type is eight bytes where the mapped `resv` field is two, at offset 14 of a 16-byte
-    /// descriptor, so the reference would cover memory past the entry. `uring::ring` keeps the same separation by
-    /// holding pointers into the mapping only under `cfg(not(loom))`.
+    /// The cast names `std`'s `AtomicU16`, never loom's, which is eight bytes where the mapped `resv` field is two, so
+    /// a reference to it would run past the entry.
     #[cfg(not(loom))]
     fn commit(&self) {
         // SAFETY: entry zero exists (`entries >= 1`) and its `resv` field is where the kernel reads the producer tail
@@ -300,9 +253,8 @@ impl BufRing {
 
     /// Keep `want` buffers allocated, posting or dropping to reach it.
     ///
-    /// Growth is immediate. Shrinking is not: a buffer that is lent cannot be dropped, and one that is posted cannot be
-    /// retracted - the kernel owns that descriptor until it picks it - so lowering the target only takes effect as
-    /// buffers come back through [`release`](Self::release).
+    /// Growth is immediate. Shrinking takes effect only as buffers come back through [`release`](Self::release), since
+    /// a lent buffer cannot be dropped and a posted one cannot be retracted.
     pub(crate) fn set_target(&mut self, want: u16) {
         self.target = want.clamp(1, self.entries);
         let mut posted_any = false;
@@ -330,9 +282,7 @@ impl BufRing {
     /// ours. That is safe because a posted id is handed to exactly one op - `release` is owed once per completion
     /// carrying `IORING_CQE_F_BUFFER` - so no two writers ever hold the same range.
     pub(crate) fn addr_of(&mut self, bid: u16) -> Option<*mut u8> {
-        // `as_mut_ptr` from a mutable borrow: callers write through this pointer (a recv destination, the drain's
-        // in-place copy), and a pointer cast up from `&` is UB to write through under the borrow rules even where
-        // today's codegen is indifferent.
+        // From a mutable borrow, since callers write through this pointer and writing through a `&` cast is UB.
         let b = self.bufs.get_mut(usize::from(bid))?.as_mut()?;
         Some(b.as_mut_ptr().cast())
     }
@@ -371,12 +321,9 @@ impl BufRing {
     /// Verify the kernel's pick and record the loan in one step: `bid` must name a slot this table holds `Posted`, with
     /// storage behind it, or nothing happens and the answer is `None`.
     ///
-    /// `None` is a userspace/kernel descriptor desync - an id this table never posted, or one it already lent - and it
-    /// is a *refusal*, not an assertion: the case is reachable without a bug on this side, so it must not abort the
-    /// reactor, and it must not fall through to serving storage this table cannot vouch for - an absent slot has none,
-    /// and a lent one belongs to another op. There is also nothing to hand back on this path: the storage the
-    /// completion names is not this table's, so the caller's only sound move is to fail the read the completion
-    /// answered.
+    /// `None` is a descriptor desync, an id this table never posted or already lent. It is reachable without a bug on
+    /// this side, so it is a refusal rather than an assertion, and the caller's only sound move is to fail the read the
+    /// completion answered.
     pub(crate) fn take_lent(&mut self, bid: u16) -> Option<*mut u8> {
         if self.slots.get(usize::from(bid)) != Some(&Slot::Posted) {
             return None;
@@ -491,11 +438,9 @@ pub(crate) const MAX_RING_ENTRIES: u16 = 32768;
 
 /// Descriptor slots for a ring that must cover `demand` concurrent buffers.
 ///
-/// A ring is registered once and never resized - re-registering a live `bgid` is `-EEXIST` - so it is sized to the
-/// *physical* bound, the most buffers real demand could ever hold at once, not to expected load. A descriptor slot is
-/// 16 bytes, so that headroom is not a memory commitment; backing buffers are what cost, and they are allocated only as
-/// demand asks. An artificial ceiling below the bound turns a burst into the malloc fallback this ring exists to
-/// remove.
+/// A ring is never resized, so it is sized to the most buffers demand could hold at once, not to expected load. A
+/// descriptor slot is 16 bytes and buffers are allocated only as demand asks, while a ceiling below the bound turns a
+/// burst into the allocating fallback this ring exists to remove.
 ///
 /// `BufRing::new` rounds the result up to the power of two the kernel requires, which only ever adds slots.
 pub(crate) fn ring_entries(demand: u32) -> u16 {
@@ -507,9 +452,8 @@ pub(crate) const BGID_RECV: u16 = 0;
 
 /// Group id of the file-body pool: buffers a response body is read into.
 ///
-/// A separate group because a group's buffers are interchangeable and selection is FIFO - there is no way to ask one
-/// group for a particular size - and a request buffer and a file chunk are sized for different things
-/// (`max_request_bytes` against `fs_body_chunk`).
+/// A separate group, since a group's buffers are interchangeable and a request buffer and a file chunk are sized for
+/// different things (`max_request_bytes` against `fs_body_chunk`).
 #[cfg(feature = "uring-fs")]
 pub(crate) const BGID_FILE_BODY: u16 = 1;
 
@@ -537,24 +481,20 @@ impl PoolSizing {
     };
 }
 
-/// Consecutive idle rounds before the pool gives a buffer up. Growth is immediate and shrinking is not, because a pool
-/// that shrinks on the first quiet moment spends its life allocating and freeing across a workload that merely pauses -
-/// the same hysteresis hyper applies to its read sizes (`src/proto/h1/io.rs`), for the same reason.
+/// Consecutive idle rounds before the pool shrinks. A pool that shrinks on the first quiet moment spends its life
+/// allocating and freeing across a workload that merely pauses.
 const SHRINK_AFTER: u8 = 4;
 
-/// The least time between two idle rounds. Observations arrive at every arm site, and one batch of completions re-arms
-/// several connections within microseconds, so rounds counted per call would let a single
-/// batch shrink a pool that is fully busy. A round is a second at least;
-/// on a silent pool the maintenance tick, five seconds apart, is what paces them.
+/// The least time between two idle rounds. One batch of completions re-arms several connections within microseconds,
+/// so rounds counted per call would let a single batch shrink a fully busy pool. On a silent pool the maintenance tick
+/// paces them.
 const IDLE_ROUND: Duration = Duration::from_secs(1);
 
 /// Sizing policy over one [`BufRing`].
 ///
-/// **A shortage is `-ENOBUFS`, never a free count.** A free count is observed at completion, so it cannot see the
-/// selecting ops already armed against the pool - a submit gated on it looks correct, passes a single-connection test,
-/// and sheds concurrent connections. The kernel is the only party that knows the pool ran dry, and it says so on the
-/// completion. The free count only ever *adds* buffers ([`grow_ahead`](Self::grow_ahead)), which is safe for the reason
-/// gating on it is not: an extra buffer refuses nothing.
+/// **A shortage is `-ENOBUFS`, never a free count.** A free count cannot see the selecting ops already armed against
+/// the pool, so a submit gated on it passes a single-connection test and sheds concurrent connections. The free count
+/// only ever *adds* buffers ([`grow_ahead`](Self::grow_ahead)), which refuses nothing.
 pub(crate) struct BufPool {
     ring: BufRing,
     /// The most buffers the pool holds: its demand, or fewer under `max_bytes`.
@@ -571,11 +511,6 @@ impl BufPool {
     /// Register a pool of `buf_len`-byte buffers under group id `bgid`, holding at most `entries` of them (fewer under
     /// `sizing.max_bytes`) and starting with `sizing.initial_bytes` of them - never fewer than [`POOL_INITIAL`] unless
     /// the limit is.
-    ///
-    /// One group per pool: a group is a set of interchangeable buffers, and selection is FIFO from the head, so a
-    /// caller cannot ask a group for a particular size. Two pools that want different sizes - a recv pool sized for a
-    /// request, a body pool sized for a file chunk - are two groups, and the group id is how an op says which one it
-    /// wants.
     pub(crate) fn new(
         ring_fd: RawFd,
         bgid: u16,
@@ -597,17 +532,16 @@ impl BufPool {
 
     /// The group to stamp into an op's `sqe.buf_group`.
     ///
-    /// There is nothing to choose and nothing to check: a full pool is answered by the kernel with `-ENOBUFS`, not by
-    /// refusing to arm the op, because a provided buffer cannot be reserved at submit time.
+    /// Nothing is checked here, since a provided buffer cannot be reserved at submit time and the kernel answers a
+    /// full pool with `-ENOBUFS`.
     pub(crate) fn bgid(&self) -> u16 {
         self.ring.bgid()
     }
 
     /// The most one buffer from this pool can hold.
     ///
-    /// The ceiling on an **exact** selecting read: the kernel clamps a selecting read down to the buffer it picks
-    /// (`io_ring_buffer_select`, `io_uring/kbuf.c`), so a read that asks for more than this and insists on all of it
-    /// completes short of what it asked for. A caller in that position must take an owned buffer instead of a pool one.
+    /// The kernel clamps a selecting read to the buffer it picks (`io_ring_buffer_select`, `io_uring/kbuf.c`), so an
+    /// **exact** read longer than this must take an owned buffer instead of a pool one.
     pub(crate) fn buf_len(&self) -> usize {
         self.ring.buf_len()
     }
@@ -667,22 +601,17 @@ impl BufPool {
 
     /// Answer a completion that found the pool dry, by wanting more.
     ///
-    /// A step ([`stepped`](Self::stepped)) rather than one buffer: the shortage says the pool is under its working set,
-    /// and a workload that opened many connections at once would otherwise need one `-ENOBUFS` round trip per buffer to
-    /// get there. Returns whether the re-armed read can find a buffer - one this call added, or one already free.
+    /// Grows a step ([`stepped`](Self::stepped)) rather than one buffer, so many connections opened at once do not pay
+    /// one `-ENOBUFS` round trip per buffer. Returns whether the re-armed read can find a buffer, one this call added
+    /// or one already free.
     ///
-    /// The free check comes first, and it is what keeps one burst from growing the pool once per *completion* rather
-    /// than once. A burst queues several `-ENOBUFS` completions into one CQE batch, and every one of them lands here;
-    /// the first doubling answers them all, so the rest arrive to find free buffers and a stale shortage. Doubling per
-    /// completion instead is 2^N for one batch - measured at the default config: sixteen concurrent readers ran the
-    /// pool from 8 buffers to its 4096-entry ceiling, a gigabyte of resident buffers for a burst that needed four
-    /// megabytes, with `free == allocated` at every doubling. The same check answers the ceiling honestly: a pool that
-    /// cannot grow but holds free buffers is not exhausted, and reporting failure there would demote the connection to
-    /// owned buffers for the rest of its life (`set_recv_owned` is one-way) over a shortage that no longer exists.
+    /// The free check comes first. One burst queues several `-ENOBUFS` completions in one batch and the first doubling
+    /// answers them all, so growing per completion would be 2^N for one batch. The same check keeps a pool at its
+    /// ceiling that still holds free buffers from reporting failure, which would demote the connection to owned buffers
+    /// for good (`set_recv_owned` is one-way).
     ///
-    /// The doubling is measured from whichever of target and allocated is larger. A real shortage means every allocated
-    /// buffer is lent, and an idle stretch may have lowered the target below that count while they were out; doubling
-    /// the *target* would then land at or under what is already allocated and add nothing.
+    /// The step is measured from the larger of target and allocated, since an idle stretch may have lowered the target
+    /// below the buffers still lent, and doubling the target would then add nothing.
     pub(crate) fn grow(&mut self, armed: u32) -> bool {
         self.idle_rounds = 0;
         // `free` records a pick only at its completion. A selecting read punted to io-wq holds its buffer for the whole
@@ -702,23 +631,15 @@ impl BufPool {
 
     /// Lower what the pool is trying to hold, once it has been idle for long enough. Halving, to match the growth.
     ///
-    /// **This lowers the target; the buffers follow as they cycle.** A posted descriptor cannot be retracted - the
-    /// kernel owns that entry until it picks it - so surplus leaves the ring in [`release`](BufRing::release), as each
-    /// buffer comes back, and keeps its storage there. The storage goes at the *next* shrink, through
-    /// [`trim`](BufRing::trim): a pool that was quiet long enough to shrink twice has shown the surplus is not coming
-    /// back, and a pool that shrank once and then grew again posts what it kept without reaching the allocator.
-    ///
-    /// That residue is bounded by the ring's ceiling and is no worse than what it replaces: a per-connection buffer
-    /// that grew once stayed grown for the connection's life, and there were `pool_size` of them.
+    /// **The buffers follow the target as they cycle.** A posted descriptor cannot be retracted, so surplus leaves the
+    /// ring in [`release`](BufRing::release) as each buffer comes back, keeping its storage. The storage goes at the
+    /// next shrink through [`trim`](BufRing::trim), so a pool that shrank once and grew again posts what it kept
+    /// without reaching the allocator.
     ///
     /// **The observation is the peak since the last one, never the count at an instant, and idle rounds are paced by
-    /// time, never by call.** The arm sites call this between two requests, when the arming connection holds no claim
-    /// by definition, and on a serial reactor nothing else does either - so an instantaneous count reads zero there
-    /// under any load. The peak since the previous call reads the arming connection's own loan at most arm sites; the
-    /// exception is a batch of completions that re-arms several connections back to back, where no loan falls between
-    /// two calls, and that is why a quiet call counts as a round only once [`IDLE_ROUND`] has passed since the last
-    /// observation that counted. A pool therefore shrinks only after `SHRINK_AFTER` rounds with no loan at all, which
-    /// on a silent pool the maintenance tick paces, and it holds its working set for as long as it is working.
+    /// time, never by call.** The arm sites call this between two requests, when on a serial reactor an instantaneous
+    /// count reads zero under any load. A batch of completions re-arms several connections with no loan between the
+    /// calls, so a quiet call counts as a round only once [`IDLE_ROUND`] has passed.
     pub(crate) fn rebalance(&mut self) {
         self.rebalance_at(Instant::now());
     }
@@ -768,12 +689,9 @@ mod tests;
 
 // The publication protocol `commit` shares with the kernel, as a loom model.
 //
-// The real ring cannot run under loom (mmap, a registered fd), so the model stands in a plain cell for the mapping -
-// but it publishes through `publish_tail`, the same function `commit` calls, so the ordering under test is the one that
-// ships rather than a copy of it. Descriptor fields are plain stores, and the consumer - standing in for
-// `io_ring_buffer_select`, which pairs with `smp_load_acquire(&br->tail)` (`io_uring/kbuf.c:202`) - acquires the tail
-// and only then reads the descriptor. The property is that a tail naming a descriptor happens-after that descriptor's
-// fields: weaken the store to `Relaxed` and loom fails this model, which no functional test can, because the
-// misordering is invisible on x86 and the reader is the kernel.
+// The real ring cannot run under loom, so the model stands a plain cell in for the mapping but publishes through
+// `publish_tail`, the function `commit` calls. Its consumer stands in for `io_ring_buffer_select`, which acquires the
+// tail (`io_uring/kbuf.c:202`) and only then reads the descriptor. Weaken the store to `Relaxed` and loom fails the
+// model, which no functional test can, since the misordering is invisible on x86.
 #[cfg(all(test, loom))]
 mod loom_tests;

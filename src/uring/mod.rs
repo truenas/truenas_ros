@@ -3,29 +3,22 @@
 //! the generation-guarded slot entry ([`slots`]), the `user_data` routing codec ([`user_data`]), and opcode-support
 //! probing ([`probe`]).
 //!
-//! Domain stacks build on this - `net` (the stream server/client roles) today, the async fs reactor next - each
-//! bringing its own op-tag vocabulary and completion dispatch. The engine deliberately knows neither: tags and
-//! per-completion policy are passed in ([`engine::Engine::arm_wake`], [`engine::Engine::cancel_and_reap_all`]), so one
-//! ring can serve several domains' ops on a shared submission batch.
+//! Domain stacks build on this, each bringing its own op-tag vocabulary and completion dispatch. The engine knows
+//! neither, since tags and per-completion policy are passed in ([`engine::Engine::arm_wake`],
+//! [`engine::Engine::cancel_and_reap_all`]), so one ring can serve several domains' ops on a shared submission batch.
 
-// Like `sys`, the engine keeps a deliberate superset surface: which items a build uses depends on the enabled domains
-// (a lone role - or the engine feature by itself - leaves shared primitives unused, and domain tag space is declared
-// before its domain lands). That asymmetry is expected, not dead code to prune.
+// Which items a build uses depends on the enabled domains, so an unused item here is expected, not dead code to prune.
 #![allow(dead_code)]
 
 /// Whether a ring that would not start is this environment rather than a defect - and, where CI arms
 /// `TRUENAS_ROS_REQUIRE_IO_URING`, not even that.
 ///
 /// `EPERM`/`ENOSYS`/`EACCES` mean there is no io_uring here (an old kernel, seccomp, `kernel.io_uring_disabled`).
-/// `ENOMEM` reaching a caller means *both* allocation paths in [`RingFd::setup`](ring::RingFd::setup) failed: either
-/// the `RLIMIT_MEMLOCK` ceiling, charged identically to both, or a host too fragmented even for the retry. Memlock is
-/// not always the cause, so raising `ulimit -l` is not always the answer - rings are refused at 32768 entries on a
-/// fragmented 6.18 box holding `CAP_IPC_LOCK`, where nothing is charged at all. **Everything else is a defect** -
-/// `EINVAL` above all, which is a rejected setup argument - and the caller must panic rather than skip every assertion
-/// behind it.
+/// `ENOMEM` means both allocation paths in [`RingFd::setup`](ring::RingFd::setup) failed, from `RLIMIT_MEMLOCK` or a
+/// host too fragmented even for the retry, so raising `ulimit -l` is not always the answer. **Everything else is a
+/// defect**, `EINVAL` above all, and the caller must panic rather than skip every assertion behind it.
 ///
-/// One definition, because the alternative is what it replaced: three unit-test skip helpers with three different ideas
-/// of "unavailable", one of which swallowed the lot with `.ok()` and took twenty-one tests with it.
+/// Every skip helper calls this, since a local copy of the list is how a skip stops being visible to CI.
 #[cfg(all(test, not(loom)))]
 pub(crate) fn setup_unavailable(e: crate::errno::Errno) -> bool {
     use crate::errno::Errno;

@@ -1,12 +1,10 @@
 //! Raw io_uring UAPI: the `#[repr(C)]` structs, the constants `libc` does not expose, and the three syscall wrappers
 //! (`io_uring_setup`/`enter`/`register`).
 //!
-//! Every struct here mirrors `include/uapi/linux/io_uring.h` byte-for-byte; the `const _: () = assert!(size_of...)`
-//! guards catch any layout drift at compile time. This is the crate's only direct contact with the io_uring kernel ABI
-//! -- the analogue of the local `#[repr(C)]` structs + raw `libc::syscall` in `namespace.rs`.
+//! Every struct here mirrors `include/uapi/linux/io_uring.h` byte-for-byte, and the `size_of` asserts catch layout
+//! drift at compile time. This is the crate's only direct contact with the io_uring kernel ABI.
 
-// A raw-ABI module: some constants document the kernel interface without being referenced, and several kernel-struct
-// fields are reserved/unused by us.
+// Some constants document the kernel interface without being referenced, and some struct fields are reserved.
 #![allow(dead_code)]
 
 use crate::errno::{self, Errno, retry_on_eintr};
@@ -167,7 +165,6 @@ const _: () = assert!(core::mem::size_of::<GeteventsArg>() == 24);
 
 // Operation opcodes (`enum io_uring_op` ordinals).
 /// Vectored read from an fd at an offset (`sqe.addr` = iovec array, `sqe.len` = vector count, `sqe.off` = file offset).
-/// The fs reactor's read primitive (single-buffer reads are the k=1 case).
 pub(crate) const IORING_OP_READV: u8 = 1;
 /// Vectored write; field layout mirrors `READV`.
 pub(crate) const IORING_OP_WRITEV: u8 = 2;
@@ -199,9 +196,6 @@ pub(crate) const IORING_OP_LINK_TIMEOUT: u8 = 15;
 /// Fill the trailing `IORING_OP_LINK_TIMEOUT` that bounds the `IOSQE_IO_LINK` head staged in front of it. `ts`
 /// addresses exactly one [`KernelTimespec`], which is what `len` declares and the only count the kernel accepts
 /// (`io_link_timeout_prep`).
-///
-/// Every linked op in this crate pairs with this one SQE, so the shape lives here rather than being spelled out at each
-/// staging site.
 pub(crate) fn fill_link_timeout(sqe: &mut IoUringSqe, ts: u64) {
     sqe.opcode = IORING_OP_LINK_TIMEOUT;
     sqe.fd = -1;
@@ -243,10 +237,7 @@ pub(crate) const IORING_OP_URING_CMD: u8 = 46;
 /// `O_CLOEXEC`.
 pub(crate) const IORING_OP_FIXED_FD_INSTALL: u8 = 54;
 
-// kTLS: values `libc` may not expose. The library only *probes* kTLS availability (`TCP_ULP`), reads the record-type
-// control message on kTLS recvs (`SOL_TLS`/`TLS_GET_RECORD_TYPE`), and reads each direction's key state back before
-// serving a handshake worker's ready() (`TLS_TX`/ `TLS_RX`); it never installs kTLS (the consumer's handshake does that
-// on a furnished fd).
+// kTLS values `libc` may not expose. This crate probes for kTLS and reads its state back, but never installs it.
 /// `setsockopt(SOL_TCP, TCP_ULP, "tls")` attaches the kernel-TLS ULP.
 pub(crate) const TCP_ULP: i32 = 31;
 /// `getsockopt`/cmsg level for kernel TLS.
@@ -263,16 +254,13 @@ pub(crate) const TLS_GET_RECORD_TYPE: i32 = 2;
 /// a control record we shed on).
 pub(crate) const TLS_RECORD_TYPE_DATA: u8 = 23;
 
-/// `SOCKET_URING_OP_SIOCOUTQ` - `URING_CMD` sub-op: bytes queued to send (`prot->ioctl(sk, SIOCOUTQ)`); takes no
-/// operands, CQE `res` = the count or `-errno`. Used only as a construction-time capability probe: it answers "does
-/// this kernel route socket `URING_CMD`s for this protocol?" with no bind/connect needed.
+/// `SOCKET_URING_OP_SIOCOUTQ`, a `URING_CMD` sub-op with no operands answering the bytes queued to send or `-errno`.
+/// Used only to probe at construction whether this kernel routes socket `URING_CMD`s, which needs no bind or connect.
 pub(crate) const SOCKET_URING_OP_SIOCOUTQ: u32 = 1;
 
-/// `SOCKET_URING_OP_GETSOCKOPT` - `URING_CMD` sub-op on a socket (`cmd_net.c`;
-/// `SOL_SOCKET` only). The cmd SQE overlays fields we already declare:
-/// `cmd_op` @8 (`off_addr2` low half), `level` @16 / `optname` @20 (`addr` low/ high halves on LE), `optlen` @44
-/// (`file_index`), `optval` @48 (`addr3`).
-/// The CQE `res` is the returned optlen, or `-errno`.
+/// `SOCKET_URING_OP_GETSOCKOPT`, a `URING_CMD` sub-op on a socket (`cmd_net.c`, `SOL_SOCKET` only). The cmd SQE
+/// overlays fields we already declare, `cmd_op` @8 (`off_addr2` low half), `level` @16 and `optname` @20 (`addr` low
+/// and high halves on LE), `optlen` @44 (`file_index`) and `optval` @48 (`addr3`). CQE `res` is the optlen or `-errno`.
 pub(crate) const SOCKET_URING_OP_GETSOCKOPT: u32 = 2;
 
 // Directory-entry ops. Every one takes its dirfd(s) as **real** fds in `sqe.fd` (and `sqe.len` for the second, where
@@ -303,9 +291,8 @@ pub(crate) const IORING_OP_FSETXATTR: u8 = 41;
 pub(crate) const IORING_OP_FGETXATTR: u8 = 43;
 /// `addr` = name, `addr2` = value buffer, `addr3` = path, `len` = size, `op_flags` must be 0. `fd` is not read.
 pub(crate) const IORING_OP_GETXATTR: u8 = 44;
-/// Truncate an fd (**`sqe.off` = the new length**; every other operand must be zero). Linux >= 6.9 - later than the
-/// other io_uring ops here, and still below the crate's 6.18 kernel floor, so it is always present. It is **not**
-/// probed: `probe_op_supported` is called for `OPENAT2` and `FIXED_FD_INSTALL` only.
+/// Truncate an fd (**`sqe.off` = the new length**, every other operand zero). Linux 6.9, below the crate's 6.18
+/// floor, so it is never probed.
 pub(crate) const IORING_OP_FTRUNCATE: u8 = 55;
 
 /// `sqe.fsync_flags` (the `op_flags` overlay) for `FSYNC`: `fdatasync` semantics (skip flushing non-essential
@@ -322,10 +309,7 @@ pub(crate) const IOSQE_IO_LINK: u8 = 1 << 2;
 /// `sqe.flags`: skip the inline issue and hand the op straight to io-wq (`REQ_F_FORCE_ASYNC`,
 /// `io_uring/io_uring.c:2367`).
 ///
-/// What that costs is decided by the file, not the opcode. `io_wq_submit_work` puts `IO_URING_F_NONBLOCK` back for a
-/// pollable opcode on a pollable file and arms poll on `-EAGAIN` (`io_uring/io_uring.c:1997-2003`), so a socket op
-/// hands its worker back instead of holding it; a regular file is never pollable (`io_file_can_poll`,
-/// `io_uring/io_uring.h`), so the worker issues blocking. See `net::server::ForceAsync`, which is what sets this.
+/// What that costs depends on whether the file polls, as `ForceAsync` describes.
 pub(crate) const IOSQE_ASYNC: u8 = 1 << 4;
 
 /// `sqe.ioprio` for ACCEPT: arm a persistent multishot accept.
@@ -354,8 +338,8 @@ pub(crate) const IORING_CQE_F_SOCK_NONEMPTY: u32 = 1 << 2;
 
 /// `io_uring_enter` flag: also wait for completions.
 pub(crate) const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
-/// `io_uring_enter` flag: `argp` is a [`GeteventsArg`] and `argsz` its size
-/// - how a wait takes a timeout (`io_get_ext_arg`, `io_uring/io_uring.c`).
+/// The `io_uring_enter` flag saying `argp` is a [`GeteventsArg`] and `argsz` its size, which is how a wait takes a
+/// timeout (`io_get_ext_arg`, `io_uring/io_uring.c`).
 pub(crate) const IORING_ENTER_EXT_ARG: u32 = 1 << 3;
 
 /// `IORING_SQ_CQ_OVERFLOW` in the SQ ring's `flags` word: completions are waiting in the kernel's overflow list.
@@ -372,8 +356,8 @@ pub(crate) const IORING_OFF_CQ_RING: i64 = 0x0800_0000;
 pub(crate) const IORING_OFF_SQES: i64 = 0x1000_0000;
 
 // `io_uring_register` opcodes + flags.
-/// Install fds into an already-registered file table at chosen slots - a client places a freshly-`connect`ed socket
-/// into its pool this way (the server's pool is auto-allocated by multishot accept; a client must update explicitly).
+/// Install fds into an already-registered file table at chosen slots, as a client does with a freshly `connect`ed
+/// socket.
 #[cfg(any(feature = "net-client", feature = "uring-fs"))]
 pub(crate) const IORING_REGISTER_FILES_UPDATE: u32 = 6;
 pub(crate) const IORING_REGISTER_PROBE: u32 = 8;
@@ -390,7 +374,7 @@ pub(crate) const IORING_REGISTER_FILES2: u32 = 13;
 #[cfg(feature = "net-server")]
 pub(crate) const IORING_REGISTER_IOWQ_MAX_WORKERS: u32 = 19;
 pub(crate) const IORING_REGISTER_FILE_ALLOC_RANGE: u32 = 25;
-/// Register a **provided-buffer ring**: a group of buffers the kernel picks from at issue time, rather than an address
+/// Register a **provided-buffer ring**, a group of buffers the kernel picks from as the op runs rather than an address
 /// the SQE names. `arg` is one [`IoUringBufReg`], `nr_args` is 1.
 #[cfg(feature = "net-server")]
 pub(crate) const IORING_REGISTER_PBUF_RING: u32 = 22;
@@ -452,9 +436,8 @@ pub(crate) const IORING_CQE_F_BUFFER: u32 = 1 << 0;
 pub(crate) const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 
 /// `io_uring_setup` flag: restrict submission - and `io_uring_register`, via the `-EEXIST` gate in `register.c` - to
-/// the creating task. **Never set by this crate's rings**: the fs reactor's credential broker must be able to register
-/// personalities on a ring from outside (fs-reactor design sec. 6.3). Declared for the regression probe that pins the
-/// gate's behavior.
+/// the creating task. **Never set by this crate's rings**, since the credential broker must register personalities on
+/// a ring from outside. Declared for the probe that pins the gate's behavior.
 pub(crate) const IORING_SETUP_SINGLE_ISSUER: u32 = 1 << 12;
 
 /// `io_uring_setup` flag: this process supplies the ring memory, at the addresses in `sq_off.user_addr` (the SQE array)
@@ -469,12 +452,8 @@ pub(crate) const IORING_SETUP_NO_MMAP: u32 = 1 << 14;
 /// `t & mask` directly in the kernel (`io_get_sqe`, `io_uring/io_uring.c`), which is the identity mapping this crate
 /// would otherwise write into that array itself.
 ///
-/// Saves `sq_entries * 4` bytes of the ring region - 128 KiB at the 32768-entry maximum. Set unconditionally by
-/// [`RingFd::setup`](crate::uring::ring::RingFd::setup): the flag reached 6.10 and this crate's floor is 6.18, assumed
-/// rather than probed.
-///
-/// With this set the kernel leaves `sq_off.array` at 0 (`io_uring.c:3920`), so nothing may derive an offset or extent
-/// from that field.
+/// Set unconditionally by [`RingFd::setup`](crate::uring::ring::RingFd::setup). With this set the kernel leaves
+/// `sq_off.array` at 0 (`io_uring.c:3920`), so nothing may derive an offset or extent from that field.
 pub(crate) const IORING_SETUP_NO_SQARRAY: u32 = 1 << 16;
 
 // `io_uring_probe_op.flags`: the opcode is supported by this kernel.
@@ -504,7 +483,7 @@ pub(crate) struct IoUringProbeHeader {
 const _: () = assert!(core::mem::size_of::<IoUringProbeHeader>() == 16);
 
 // -------------------------------------------------------------------------
-// Syscall wrappers (modeled on src/namespace.rs / src/mount/open_tree.rs)
+// Syscall wrappers
 // -------------------------------------------------------------------------
 
 /// `io_uring_setup(2)`: create a ring and return its owning fd. `params` is read for the requested flags and written
@@ -690,8 +669,7 @@ pub(crate) fn register_file_alloc_range(ring_fd: RawFd, off: u32, len: u32) -> e
 }
 
 /// Install `fd` into registered-file slot `slot` (`IORING_REGISTER_FILES_UPDATE`). The kernel takes its own reference
-/// (`fget`), so the caller may close `fd` afterward. Used by a client to place a freshly-`connect`ed socket into its
-/// pool at a chosen index (the server auto-allocates via multishot accept).
+/// (`fget`), so the caller may close `fd` afterward.
 #[cfg(any(feature = "net-client", feature = "uring-fs"))]
 pub(crate) fn register_file_update(ring_fd: RawFd, slot: u32, fd: RawFd) -> errno::Result<()> {
     let fds = [fd];

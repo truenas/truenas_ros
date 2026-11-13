@@ -1,7 +1,5 @@
-//! Generic opcode-support probing. `IORING_REGISTER_PROBE` is a control syscall on an already-built ring (available far
-//! below every kernel floor this crate imposes) that reports per-opcode support without executing anything - the
-//! construction-time alternative to discovering a missing opcode as a mysterious per-op `-EINVAL` at runtime.
-//! Domain-specific probes (socket commands, the TLS ULP) live with their domains; this is the shared mechanism.
+//! Generic opcode-support probing. `IORING_REGISTER_PROBE` reports per-opcode support on a built ring without executing
+//! anything, so a missing opcode shows at construction rather than as a per-op `-EINVAL` at runtime.
 
 use crate::uring::ring::Ring;
 use crate::uring::sys::*;

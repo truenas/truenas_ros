@@ -13,14 +13,11 @@ use crate::uring::wake::{LoopShared, WakeHandle};
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicU64};
 
-/// Longest chain [`Engine::stage_chain`] will stage. A cap rather than an open-ended count because every link is one
-/// more SQE that must be staged contiguously, and a chain that cannot fit the SQ is an `EBUSY` the caller has to
-/// unwind.
+/// Longest chain [`Engine::stage_chain`] will stage, since every link is one more SQE that must be staged contiguously.
 ///
-/// Four covers the deepest shape built only from opcodes that actually fail-fast - `openat2 -> writev -> writev ->
-/// close`. It is deliberately *not* sized for a durable publish tail (`write -> fsync -> link -> rename`): three of
-/// those four links cannot break a chain, so that sequence must be driven from completions instead. See
-/// [`Engine::stage_chain`].
+/// Four covers the deepest shape built only from opcodes that fail fast, `openat2 -> writev -> writev -> close`. It is
+/// deliberately *not* sized for a durable publish tail (`write -> fsync -> link -> rename`), whose fs links cannot
+/// break a chain, so that sequence is driven from completions.
 #[cfg(feature = "uring-fs")]
 pub(crate) const MAX_CHAIN_LINKS: usize = 4;
 
@@ -41,8 +38,7 @@ pub(crate) struct Engine {
     pub(crate) wake_buf: Box<u64>,
     /// Operations currently in flight on the ring.
     pub(crate) inflight: u64,
-    /// Whether the kernel supports `IORING_OP_FIXED_FD_INSTALL` (Linux >= 6.8;
-    /// probed at construction) - required to furnish real fds (kTLS handshakes, connection detach).
+    /// Whether the kernel supports `IORING_OP_FIXED_FD_INSTALL`, probed at construction and needed to furnish real fds.
     pub(crate) fixed_fd_install: bool,
     /// Declared last so it drops after everything above; see the struct doc.
     pub(crate) ring: Ring,
@@ -63,10 +59,8 @@ impl Engine {
 
     /// [`Engine::on_ring`] without the fixed-file pool, for a host whose descriptors are plain fds.
     ///
-    /// The pool exists for the net roles, which name sockets by registered slot: multishot accept auto-allocates into
-    /// it (`IORING_FILE_INDEX_ALLOC`) and every socket op carries `IOSQE_FIXED_FILE`. The fs reactor names files by raw
-    /// descriptor (`Arc<OwnedFd>`) and sets that flag nowhere, so registering a pool for it reserves kernel state
-    /// nothing can draw on.
+    /// The pool serves the net roles, which name sockets by registered slot. The fs reactor names files by raw
+    /// descriptor and never sets `IOSQE_FIXED_FILE`, so a pool there reserves kernel state nothing can draw on.
     #[cfg(feature = "uring-fs")]
     pub(crate) fn without_pool_on(setup: RingFd) -> crate::Result<Engine> {
         Self::assemble(Ring::from_setup(setup)?, |_| Ok(()))
@@ -125,18 +119,14 @@ impl Engine {
 
     /// Stage `n` SQEs as one `IOSQE_IO_LINK` chain under a **single** `user_data`, counting all `n` as in-flight.
     ///
-    /// One token for the whole chain is what makes the rest tractable: links execute in order and post their CQEs in
-    /// order, so the domain tracks a `links_remaining` countdown against one op-table slot instead of `n` entries; and
-    /// one `ASYNC_CANCEL` keyed on that token with `IORING_ASYNC_CANCEL_ALL` reaches every link. A failed link breaks
-    /// the chain, but each successor still completes `-ECANCELED`, so the countdown reaches zero deterministically and
-    /// in-flight accounting stays exact.
-    ///
-    /// `IOSQE_CQE_SKIP_SUCCESS` is deliberately not used: the accounting above assumes one CQE per SQE.
+    /// Links post their CQEs in order, so the domain tracks a countdown against one op-table slot, and one
+    /// `ASYNC_CANCEL` keyed on the token with `IORING_ASYNC_CANCEL_ALL` reaches every link. Each successor of a failed
+    /// link still completes `-ECANCELED`, so the countdown reaches zero. `IOSQE_CQE_SKIP_SUCCESS` is deliberately not
+    /// used, since the accounting assumes one CQE per SQE.
     ///
     /// # Fail-fast applies to some opcodes and not others
     ///
-    /// "A failed link cancels the rest" is **not** universal. The kernel breaks a chain only when the failing op calls
-    /// `req_set_fail()`:
+    /// The kernel breaks a chain only when the failing op calls `req_set_fail()`.
     ///
     /// | family | breaks the chain? |
     /// |---|---|
@@ -146,9 +136,9 @@ impl Engine {
     /// | `statx.c`, `xattr.c` - statx, f/getxattr, f/setxattr | **no** |
     /// | any op failing at submission (bad fd, bad prep) | yes |
     ///
-    /// An fs op that fails sets its result and stops; its successors run regardless. Chaining `linkat` to `renameat`
-    /// and expecting the rename to be skipped is therefore wrong, and dangerously so - see
-    /// `linked_fs_ops_do_not_break_the_chain`, which pins the behaviour. Sequence fs ops from completions instead.
+    /// An fs op that fails sets its result and its successors run regardless, so chaining `linkat` to `renameat` and
+    /// expecting the rename to be skipped is wrong (`linked_fs_ops_do_not_break_the_chain`). Sequence fs ops from
+    /// completions instead.
     #[cfg(feature = "uring-fs")]
     pub(crate) fn stage_chain(
         &mut self,
@@ -167,9 +157,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Arm the wake-eventfd `READ` under the domain's wake tag. Reading the 8-byte counter directly (rather than
-    /// polling the fd) auto-arms io_uring's internal fast-poll and completes only once the fd is readable, draining the
-    /// counter to 0 in the same op - no separate poll SQE, no follow-up `read()` syscall.
+    /// Arm the wake-eventfd `READ` under the domain's wake tag. Reading the 8-byte counter directly auto-arms
+    /// io_uring's fast poll, completes once the fd is readable and drains the counter to 0 in the same op.
     pub(crate) fn arm_wake(&mut self, user_data: u64) -> errno::Result<()> {
         let fd = self.shared.wake.as_raw_fd();
         let buf = std::ptr::addr_of_mut!(*self.wake_buf) as u64;
@@ -244,10 +233,8 @@ impl Engine {
         self.ring.staged_sqe(i)
     }
 
-    /// Leak the wake landing pad without freeing it. On a failed teardown drain the armed wake `READ` may still be in
-    /// flight, and completing it writes 8 bytes into [`Engine::wake_buf`]; leaking keeps that address permanently valid
-    /// rather than freeing heap the kernel is about to write. Pairs with the connection-buffer leak on the same
-    /// teardown path.
+    /// Leak the wake landing pad. On a failed teardown drain the armed wake `READ` may still be in flight and write 8
+    /// bytes into [`Engine::wake_buf`], so its address must stay valid, like the connection buffers leaked there.
     pub(crate) fn leak_wake_buf(&mut self) {
         std::mem::forget(std::mem::replace(&mut self.wake_buf, Box::new(0)));
     }
@@ -260,15 +247,11 @@ mod tests {
     const RING_ENTRIES: u32 = 32;
     const POOL: u32 = 8;
 
-    /// Skip where io_uring is unavailable (sandbox/old kernel), like the fs suites. Nothing here submits, so no other
-    /// failure mode is tolerated. [`setup_unavailable`](crate::uring::setup_unavailable) owns which errno
-    /// counts as environmental and asserts on `TRUENAS_ROS_REQUIRE_IO_URING`;
-    /// a local copy of that list is how a skip stops being visible to CI.
+    /// Skip where io_uring is unavailable, as [`setup_unavailable`](crate::uring::setup_unavailable) decides, since a
+    /// local copy of that list would hide a skip from CI. Nothing here submits, so no other failure is tolerated.
     fn engine_or_skip() -> Option<Engine> {
-        // Under Miri there is no ring to set up - `io_uring_setup` is an unsupported foreign call that aborts the
-        // interpreter, not an errno the arm below could catch - so the skip decision has to come first. The
-        // ring-dependent tests then skip themselves exactly as they do on a ring-less host, and the Miri lane (ci.yml
-        // `miri`) runs what is left: the pure-executor paths.
+        // Under Miri `io_uring_setup` is an unsupported foreign call that aborts the interpreter, not an errno the arm
+        // below could catch, so the skip comes first.
         if cfg!(miri) {
             return None;
         }
@@ -401,17 +384,11 @@ mod tests {
         unsafe { libc::close(good) };
     }
 
-    /// **A failing filesystem op does NOT break its chain**, and this test exists to keep that surprise documented
-    /// rather than rediscovered.
+    /// **A failing filesystem op does NOT break its chain.**
     ///
-    /// `IOSQE_IO_LINK` cancels successors only when the failing op calls the kernel's `req_set_fail()`.
-    /// `io_uring/rw.c`, `splice.c`, `openclose.c` and `nop.c` do; **`fs.c` (linkat/renameat/unlinkat/mkdirat/symlinkat)
-    /// and `sync.c` (fsync/fallocate) do not** - they set the result and stop. So a link that fails `EEXIST` is
-    /// followed by a rename that runs anyway.
-    ///
-    /// The consequence is why the durable-create commit is *not* built as a chain: link-then-rename would, with a stale
-    /// staging entry, rename an unrelated file onto a live object. If this test ever starts failing, the kernel gained
-    /// fail-fast for fs ops and that decision can be revisited.
+    /// `IOSQE_IO_LINK` cancels successors only when the failing op calls `req_set_fail()`, and `fs.c` and `sync.c` do
+    /// not, so a link that fails `EEXIST` is followed by a rename that runs anyway. That is why the durable-create
+    /// commit is not built as a chain. If this test starts failing, the kernel gained fail-fast for fs ops.
     #[test]
     fn linked_fs_ops_do_not_break_the_chain() {
         let Some(mut eng) = engine_or_skip() else {
@@ -484,12 +461,8 @@ mod tests {
     /// **Personality ids are per-ring and both spaces start at 1**, so the first registration on any two rings gets the
     /// same id and a crossed `Personality` resolves to a live registration instead of failing.
     ///
-    /// `xa_init_flags(&ctx->personalities, XA_FLAGS_ALLOC1)` (`io_uring/io_uring.c:367`) gives each ring its own
-    /// allocator, and submission looks the id up in this ring's table alone - `xa_load(&ctx->personalities,
-    /// personality)`, refusing with `EINVAL` only on a miss (`io_uring.c:2269-2273`). The consequence is that
-    /// ring-locality makes a crossed id succeed *wrongly* rather than fail, which is why `Personality` documents the
-    /// pairing as the caller's to keep. If this ever starts failing, the kernel gained a shared or ring-tagged id space
-    /// and that warning can be revisited.
+    /// Each ring has its own `XA_FLAGS_ALLOC1` allocator (`io_uring/io_uring.c:367`), and submission looks the id up in
+    /// that ring's table alone (`io_uring.c:2269-2273`), which is why `Personality` leaves the pairing to the caller.
     #[test]
     fn personality_ids_alias_across_rings() {
         use crate::uring::sys::register_personality;

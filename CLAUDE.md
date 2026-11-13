@@ -275,15 +275,17 @@ Do not reopen these without a reason that is new.
   heads.
 - **The ring is a conveyor of descriptors, not a slab.** Each descriptor
   carries its own address, so buffers are allocated and posted on demand
-  (SPDK's `uring_sock_group_populate_buf_ring`). A buffer is freed only in
-  `BufRing::release`, after the kernel has handed it back - a per-buffer
-  question, where a slab would need a whole-pool proof that nothing is lent.
-  Buffers are allocated uninitialized: every reader stops at the bytes the
-  kernel wrote (`post`).
-- **Shrinking lowers the target; buffers follow as they cycle.** A posted
-  descriptor cannot be retracted, so surplus is given up in `release`, one
-  buffer per cycle. A pool that goes silent keeps its residue, bounded by
-  the ring.
+  (SPDK's `uring_sock_group_populate_buf_ring`). A buffer's storage is freed
+  only by `BufRing::trim`, and only for an id neither posted nor lent, a
+  per-buffer question where a slab would need a whole-pool proof that
+  nothing is lent. Buffers are allocated uninitialized, since every reader
+  stops at the bytes the kernel wrote (`post`).
+- **Shrinking lowers the target, and buffers follow as they cycle.** A
+  posted descriptor cannot be retracted, so `release` keeps a surplus
+  buffer out of the ring, and `BufPool::rebalance` frees what is out and
+  halves the target once the pool has stayed quiet for `SHRINK_AFTER` idle
+  rounds. A pool that goes silent keeps the buffers still posted, bounded
+  by the ring.
 - **Gathering a message out of several buffers does not transfer here**
   (SPDK's `recv_stream`): a head scan needs contiguous bytes, and the join
   is the copy the ring exists to avoid. SPDK's dry-ring fallback does

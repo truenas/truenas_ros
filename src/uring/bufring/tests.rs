@@ -33,9 +33,8 @@ fn ring() -> Option<RingFd> {
     }
 }
 
-/// Registration is where the ABI is easiest to get silently wrong: the mapping has to be page aligned, the entry
-/// count a power of two, and the descriptor layout has to match what the kernel reads. A ring the kernel accepts
-/// and then releases proves all three at once.
+/// A ring the kernel accepts and then releases proves the mapping page aligned, the entry count a power of two, and
+/// the descriptor layout what the kernel reads.
 #[test]
 fn a_ring_registers_and_unregisters() {
     let Some(r) = ring() else {
@@ -51,9 +50,8 @@ fn a_ring_registers_and_unregisters() {
     assert!(again.is_ok(), "the id was freed: {again:?}");
 }
 
-/// The shortage the free count cannot see: every free buffer is already spoken for by a selecting read still in
-/// flight. `grow` used to answer that with "free buffers, nothing to do", and the re-armed read met the same empty
-/// ring - a spin, not a wait.
+/// The shortage the free count cannot see, where every free buffer is spoken for by a selecting read still in flight.
+/// Answering it with no growth would re-arm the read against the same empty ring and spin.
 #[test]
 fn a_shortage_masked_by_armed_reads_still_grows() {
     let Some(r) = ring() else {
@@ -69,9 +67,8 @@ fn a_shortage_masked_by_armed_reads_still_grows() {
 
 /// A buffer length the descriptor cannot carry is refused at registration.
 ///
-/// `io_uring_buf::len` is a `u32`. A cast would truncate, and every nonzero multiple of 2^32 truncates to the zero
-/// length the same guard refuses outright - after which the kernel clamps each selecting read to zero and the recv
-/// path reads that as the peer hanging up.
+/// `io_uring_buf::len` is a `u32`, and a truncated zero length would make every selecting read look like the peer
+/// hanging up.
 #[test]
 fn a_buffer_longer_than_the_descriptor_field_is_refused() {
     let Some(r) = ring() else {
@@ -87,10 +84,8 @@ fn a_buffer_longer_than_the_descriptor_field_is_refused() {
 
 /// The descriptor ring does not reach a forked child.
 ///
-/// `CredBroker::spawn` forks holding the ring fds and, by its own contract, needing only those. This mapping is
-/// `MAP_PRIVATE`, so without `MADV_DONTFORK` a fork copies it in - handing the child descriptors naming this
-/// process's recv buffers that it never asked for. The sibling SQ/CQ mapping is pinned the same way and by the same
-/// test (`ring::caller_allocated_ring_memory_is_not_inherited`).
+/// This mapping is `MAP_PRIVATE`, so without `MADV_DONTFORK` a fork copies in descriptors naming this process's recv
+/// buffers.
 #[test]
 fn the_descriptor_ring_is_not_inherited() {
     let Some(r) = ring() else {
@@ -136,9 +131,8 @@ fn the_descriptor_ring_is_not_inherited() {
 
 /// An entry count no `u16` power of two can describe is refused, in **both** profiles.
 ///
-/// `u16::next_power_of_two` panics in debug above 32768 and wraps to zero in release, so the plain form put the
-/// panic in front of the `entries == 0` guard in one profile and let a wrapped count through to the kernel in the
-/// other - the profile that ships. The refusal precedes the mmap and the registration, so it needs no ring.
+/// `u16::next_power_of_two` panics in debug above 32768 and wraps to zero in release, the profile that ships. The
+/// refusal precedes the mmap, so it needs no ring.
 #[test]
 fn an_entry_count_no_power_of_two_can_describe_is_refused() {
     for n in [32769u16, 65535] {
@@ -217,10 +211,8 @@ fn a_released_buffer_returns_to_the_ring() {
     assert_eq!(br.addr_of(1), Some(before), "same storage, not a new one");
 }
 
-/// A post must never store to the published tail. Entry zero's `resv` IS the tail, so this drives the ring until
-/// the next post lands in descriptor slot zero, posts, and reads the tail cell back before committing: a
-/// whole-struct descriptor write shows up here as the tail rewound to zero - which the kernel, whose only emptiness
-/// test is `tail == head`, reads as a nearly full ring of unpublished descriptors.
+/// A post never stores to the published tail. Entry zero's `resv` is the tail, so this posts into descriptor slot
+/// zero and reads the tail back before committing, where a whole-struct descriptor write shows as a rewound tail.
 #[test]
 fn a_post_never_touches_the_published_tail() {
     let Some(r) = ring() else {
@@ -230,10 +222,10 @@ fn a_post_never_touches_the_published_tail() {
     let tail_cell =
         |br: &BufRing| unsafe { (*(&raw const (*br.ring).resv).cast::<AtomicU16>()).load(Ordering::Acquire) };
     assert_eq!(tail_cell(&br), 3, "three posts published at setup");
-    // Free two ids without re-posting them (target below allocated).
+    // Take two ids out of the ring (target below allocated).
     br.set_target(1);
     br.lend(0);
-    br.release(0); // freed, not re-posted: allocated >= target
+    br.release(0); // kept out of the ring, since allocated >= target
     br.lend(1);
     br.release(1);
     assert_eq!(br.allocated(), 1);
@@ -255,9 +247,8 @@ fn a_post_never_touches_the_published_tail() {
 /// A second release of the same id is refused before it can re-post a buffer another op still owns, or wrap the
 /// loan count.
 ///
-/// The `debug_assert` fires first, so this reaches only the debug half of the guard and only in a debug build - in
-/// a release build `should_panic` has nothing to catch. The `if` beside it is what ships, and
-/// `releasing_one_id_twice_is_refused_without_asserts` covers that.
+/// Only a debug build reaches this, through the `debug_assert`. `releasing_one_id_twice_is_refused_without_asserts`
+/// covers the `if` that ships.
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "releasing a buffer nobody took")]
@@ -272,11 +263,8 @@ fn releasing_one_id_twice_is_refused() {
     br.release(1); // the second owner
 }
 
-/// A bid the table never posted is refused, and nothing moves.
-///
-/// The kernel naming such an id is a userspace/kernel descriptor desync, reachable without a bug on this side, so
-/// it must not abort the reactor in any build. There is also nothing to "hand back": no storage of the table's is
-/// behind the id, so the only sound answer is a refusal the caller turns into failing the read.
+/// A bid the table never posted is refused, and nothing moves. It is a descriptor desync reachable without a bug on
+/// this side, so it must not abort the reactor in any build.
 #[test]
 fn a_bid_never_posted_is_refused_without_an_abort() {
     let Some(r) = ring() else {
@@ -314,10 +302,7 @@ fn a_bid_already_lent_is_refused_not_reserved() {
 /// The shipping half of the same refusal: with `debug_assertions` off the `if` is the whole guard, and what it must
 /// do is nothing.
 ///
-/// A fall-through re-posts an id that is already `Posted`, so the ring would carry two descriptors naming one
-/// buffer and the kernel would hand it to two ops at once. It also decrements `lent` from zero, which wraps rather
-/// than panics here, and a wrapped loan count reads as a nearly empty pool. Asserted on state instead of a panic so
-/// the test says the same thing in either build.
+/// A fall-through would post one buffer twice, handing it to two ops at once, and wrap `lent` from zero.
 #[cfg(not(debug_assertions))]
 #[test]
 fn releasing_one_id_twice_is_refused_without_asserts() {
@@ -351,9 +336,8 @@ fn releasing_an_id_outside_the_ring_is_refused() {
     br.release(200);
 }
 
-/// The shipping half: with `debug_assertions` off the `let else` is the whole guard, and what it must do is nothing
-/// at all - no loan retired, since `lent` would otherwise be decremented for a buffer nobody took and a wrapped
-/// count reads as a nearly empty pool.
+/// The shipping half. With `debug_assertions` off the `let else` is the whole guard and must retire no loan, since a
+/// wrapped `lent` reads as a nearly empty pool.
 #[cfg(not(debug_assertions))]
 #[test]
 fn releasing_an_id_outside_the_ring_is_refused_without_asserts() {
@@ -373,12 +357,8 @@ fn releasing_an_id_outside_the_ring_is_refused_without_asserts() {
 
 /// The steady-state path allocates nothing.
 ///
-/// A buffer cycling lend -> release -> re-post keeps its storage: the only allocation site is `post`, guarded on
-/// the id having none, and the only free site is the over-target branch of `release`.
-///
-/// Counted rather than compared. An earlier version of this test read the buffer's address before and after a cycle
-/// and asserted it had not moved - which passes just as happily when the storage is freed and re-allocated, because
-/// an allocator handed back a block of the same size usually returns the one it just took.
+/// A buffer cycling lend -> release -> re-post keeps its storage. Counted rather than compared, since an allocator
+/// handed back a block of the same size usually returns the one it just took.
 #[test]
 fn cycling_a_buffer_allocates_nothing() {
     let Some(r) = ring() else {
@@ -418,8 +398,8 @@ fn a_release_over_target_keeps_the_storage_unposted() {
     assert!(br.bufs[2].is_some(), "a posted id is never trimmed");
 }
 
-/// Shrinking cannot take a buffer away from an op that holds it. The target falls, but the storage survives until
-/// the consumer releases it - which is the whole reason a buffer is freed in `release` and nowhere else.
+/// Shrinking cannot take a buffer away from an op that holds it. The target falls, but the storage survives the
+/// release and goes only when trimmed.
 #[test]
 fn a_lent_buffer_survives_a_shrink() {
     let Some(r) = ring() else {
@@ -497,10 +477,8 @@ fn a_pool_doubles_when_it_runs_dry() {
 
 /// The ceiling is not exhaustion while anything is free.
 ///
-/// `grow()`'s answer is read as "will the re-armed read find a buffer". At the ceiling with buffers free the answer
-/// is yes, and a `false` there is answered with a demotion to owned buffers that lasts the connection's life - over
-/// a shortage that no longer exists. `false` is reserved for the pool that can neither grow nor offer anything:
-/// every buffer lent, nowhere left to go.
+/// A `false` from `grow()` demotes the connection to owned buffers for its life, so at the ceiling it is reserved for
+/// a pool with every buffer lent.
 #[test]
 fn the_ceiling_is_not_exhaustion_while_anything_is_free() {
     let Some(r) = ring() else {
@@ -520,10 +498,8 @@ fn the_ceiling_is_not_exhaustion_while_anything_is_free() {
 
 /// One burst grows the pool once, not once per queued completion.
 ///
-/// A burst queues several `-ENOBUFS` completions into one CQE batch
-/// and each lands in `grow()`. The first doubling answers them all;
-/// without the free check the rest double a pool that already grew - 2^N for one batch, measured at a gigabyte of
-/// resident buffers on the default config for a burst that needed four megabytes.
+/// A burst queues several `-ENOBUFS` completions into one CQE batch and each lands in `grow()`. Without the free check
+/// the rest would double a pool that already grew, 2^N for one batch.
 #[test]
 fn a_batch_of_shortages_doubles_once() {
     let Some(r) = ring() else {
@@ -711,10 +687,8 @@ fn activity_resets_the_idle_count() {
 
 /// A shortage while the target sits *below* what is allocated still grows.
 ///
-/// An idle stretch lowers the target, and the surplus is given up only as buffers cycle - so a pool that goes quiet
-/// and then busy can hold more than it is aiming for, with every one of them lent. Measuring the doubling from the
-/// target lands at or under that count, adds nothing and reports failure, and the caller answers a reported failure
-/// by demoting the connection to owned buffers for the rest of its life.
+/// A pool that goes quiet and then busy can hold more than its target with every buffer lent. Doubling from the target
+/// would add nothing and report failure, which demotes the connection to owned buffers for good.
 #[test]
 fn a_shortage_below_a_shrunk_target_still_grows() {
     let Some(r) = ring() else {
