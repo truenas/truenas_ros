@@ -1,12 +1,9 @@
-//! kTLS connect: the outbound furnish -> park -> deferral -> install arc, the mirror of the server's kTLS accept path
-//! (`net::server`'s `accept.rs`) but triggered by an `IORING_OP_CONNECT` completion instead of an accept, running
-//! `SSL_connect` (not `SSL_accept`) in the consumer's worker, and skipping any peer fetch (the client dialed its peer).
+//! kTLS connect. A real fd is furnished after an `IORING_OP_CONNECT` completes, the slot is parked while the consumer's
+//! worker runs `SSL_connect`, and the connection is installed on the worker's verdict.
 //!
-//! The defining difference from the server: the per-connection state `U` never crosses to the worker. The caller
-//! supplied it at `connect`, so it is retained in the parked slot
-//! ([`SlotState::TlsConnecting`](crate::net::core::table)) on the loop thread, and the [`ConnectDeferral`] handed to
-//! the worker is **state-free** - it signals only success or failure. That drops the `U: Send` bound the server's
-//! `AcceptDeferral` needs.
+//! The per-connection state `U` never crosses to the worker. It stays in the parked slot
+//! ([`SlotState::TlsConnecting`](crate::net::core::table)) on the loop thread, so the [`ConnectDeferral`] carries only
+//! success or failure and needs no `U: Send` bound.
 
 use super::Client;
 use super::event::{ConnId, Event};
@@ -18,20 +15,15 @@ use crate::uring::sys::*;
 use crate::uring::wake::LoopShared;
 use std::os::fd::RawFd;
 use std::sync::atomic::Ordering;
-// `Arc` from `crate::sync`, matching `LoopShared`'s own: under `--cfg loom` the engine hands out loom's, and `std`'s is
-// a distinct type - which is what kept `--cfg loom` + `net-client` (and so `--all-features`) from compiling at all.
+// Matches `LoopShared`'s own `Arc`, since under `--cfg loom` the `std` one is a distinct type.
 use crate::sync::Arc;
 use std::sync::mpsc;
 
-/// The client kTLS handshake handler ([`Client::set_tls_handshake`]): `(furnished_fd, context, deferral)`, once per
-/// `tls` connect after its TCP connect completes. The consumer moves the fd + deferral to its own worker, runs
-/// `SSL_connect` (which installs kTLS on the socket), then signals through the deferral. Unlike the server's handler,
-/// no `U` crosses here.
+/// The client kTLS handshake handler ([`Client::set_tls_handshake`]), called with `(furnished_fd, context, deferral)`.
 pub(super) type TlsConnectFn = Box<dyn FnMut(RawFd, TlsConnectContext<'_>, ConnectDeferral)>;
 
-/// Context handed to the [`set_tls_handshake`](Client::set_tls_handshake) handler alongside the furnished fd: which
-/// connection this is and the endpoint it dialed - the client's per-endpoint policy hook (e.g. SNI / cert pinning),
-/// since a client has no listener to name.
+/// Context handed to the [`set_tls_handshake`](Client::set_tls_handshake) handler alongside the furnished fd, naming
+/// the connection and the endpoint it dialed for per-endpoint policy such as SNI or certificate pinning.
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct TlsConnectContext<'a> {
@@ -43,25 +35,20 @@ pub struct TlsConnectContext<'a> {
 
 /// The ticket a client kTLS handshake worker uses to hand a connection back once the handshake finishes (or fails).
 ///
-/// Furnished - with a real socket fd - to the [`Client::set_tls_handshake`] handler for one `tls` connect. Move it (and
-/// the fd) to your own worker, run `SSL_connect` (which installs kTLS on the socket), and call
-/// [`ready`](ConnectDeferral::ready) on success or [`reject`](ConnectDeferral::reject) on failure. Dropping it without
-/// either **rejects** the connection, so a panicked/lost worker can't strand the parked pool slot.
-///
-/// **State-free** and `Send`: the client already holds the per-connection state `U` in the parked slot, so nothing but
-/// success/failure crosses back - the deferral never carries `U`, and so never forces a `U: Send` bound.
+/// Handed with a real socket fd to the [`Client::set_tls_handshake`] handler for one `tls` connect. Move both to your
+/// own worker, run `SSL_connect` there, and call [`ready`](ConnectDeferral::ready) or
+/// [`reject`](ConnectDeferral::reject). Dropping it without either **rejects** the connection, so a lost worker cannot
+/// strand the parked pool slot. It is `Send` and never carries `U`.
 #[must_use = "call ready() or reject(), or the connection is dropped"]
 pub struct ConnectDeferral {
     slot: u32,
-    // The full u64 generation: retained across the worker's handshake, so it must not alias a future incarnation of the
-    // same slot.
+    // The full generation, since it is held across the handshake and must not match a later use of the slot.
     generation: u64,
     tx: mpsc::Sender<HandshakeResult>,
     shared: Arc<LoopShared>,
     done: bool,
-    /// The deferral's own alias of the socket, for [`ready`]'s key readback (`ConnectDeferral::ready`). A dup rather
-    /// than the furnished fd's number, because the worker owns that fd and may close it - a number can be reused, an
-    /// open description cannot.
+    /// The deferral's own dup of the socket, for `ready`'s key readback. The worker owns the furnished fd and may close
+    /// it, and its number can be reused while an open description cannot.
     sock: std::os::fd::OwnedFd,
 }
 
@@ -69,10 +56,9 @@ impl ConnectDeferral {
     /// The handshake succeeded and kTLS is active on the socket: install the connection (with the state the caller
     /// supplied at connect) and begin serving it over the kernel-TLS transport. Consumes the handle.
     ///
-    /// The worker's word is checked against the kernel before anything is served: both TLS directions must actually
-    /// hold keys (`getsockopt(SOL_TLS, TLS_TX/TLS_RX)`), or the connect fails as if rejected. A socket the kernel never
-    /// keyed (a handshake library that silently fell back to userspace records, or keyed only one direction) passes
-    /// bytes through in the clear, so serving it as encrypted would publish plaintext framed as TLS.
+    /// Both TLS directions must hold kernel keys (`getsockopt(SOL_TLS, TLS_TX/TLS_RX)`), or the connect fails as if
+    /// rejected. A handshake library that fell back to userspace records, or keyed one direction, would otherwise have
+    /// plaintext served as TLS.
     pub fn ready(mut self) {
         self.done = true;
         let keyed = crate::net::core::probe::ktls_keyed_both_ways(std::os::fd::AsRawFd::as_raw_fd(&self.sock));
@@ -87,8 +73,7 @@ impl ConnectDeferral {
     }
 
     fn send(&mut self, ready: bool) {
-        // The client owns the receiver for its whole life; a send error just means it has been dropped, in which case
-        // the outcome is moot.
+        // A send error means the client was dropped, so the outcome is moot.
         let _ = self.tx.send(HandshakeResult {
             slot: self.slot,
             generation: self.generation,
@@ -115,9 +100,7 @@ impl std::fmt::Debug for ConnectDeferral {
     }
 }
 
-/// A client kTLS handshake worker's outcome, delivered on the next loop wake -- the client-side, state-free analogue of
-/// the core `HandshakeOutcome<U>` (the server ships `U` through that channel; the client holds `U` in the slot and
-/// signals only `ready`).
+/// A client kTLS handshake worker's outcome, delivered on the next loop wake.
 pub(super) struct HandshakeResult {
     pub(super) slot: u32,
     pub(super) generation: u64,
@@ -128,9 +111,8 @@ impl<U, F> Client<U, F>
 where
     F: FnMut(&[u8], &mut U) -> Framing,
 {
-    /// Materialize a real fd from the pool descriptor for a kTLS connection, so the consumer's handshake worker can
-    /// drive `SSL_connect` on a normal socket. The slot stays `Connecting` (still holding the pending connect, `U`
-    /// included) across the install; `on_fd_install` then parks it as `TlsConnecting` and hands the fd to the worker.
+    /// Materialize a real fd from the pool descriptor for the consumer's handshake worker. The slot stays `Connecting`,
+    /// holding `U`, until `on_fd_install` parks it.
     pub(super) fn submit_fd_install(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
         self.core.stage(pack(Op::FdInstall, slot, generation), move |sqe| {
             sqe.opcode = IORING_OP_FIXED_FD_INSTALL;
@@ -140,26 +122,21 @@ where
         })
     }
 
-    /// A furnished-fd install completed (`Op::FdInstall`): `res` is the real fd (aliasing the pool socket) or `-errno`.
-    /// On success, park the slot across the handshake (retaining `U` + peer), arm the handshake timeout, arm the wake
-    /// so the worker's outcome is heard, and hand the fd + a state-free [`ConnectDeferral`] to the consumer's handshake
-    /// handler. On failure, fail the connect and shed the pool descriptor.
+    /// A furnished-fd install completed, with `res` the real fd or `-errno`. On success, park the slot, arm the
+    /// handshake timeout and the wake, and hand the fd and a [`ConnectDeferral`] to the handshake handler. On failure,
+    /// fail the connect and shed the pool descriptor.
     pub(super) fn on_fd_install(&mut self, slot: u32, generation: u32, res: i32) -> errno::Result<()> {
-        // Kernel completion -> low 32 bits. The slot is still `Connecting` (we kept the pending across the install),
-        // non-`Empty`, so it cannot recycle under us - this only guards a stale out-of-order CQE.
+        // The slot is still `Connecting` and cannot recycle, so this guards only a stale out-of-order CQE.
         if self.core.table.generation_low(slot) != generation {
             return Ok(());
         }
         if res < 0 {
-            // Install failed (or was cancelled at teardown): nothing was furnished. The slot stays `Connecting`
-            // (non-`Empty`) through the shedding CLOSE, so no concurrent connect can reuse it; `on_closed` frees it
-            // (dropping the pending `U`). The connect established (TCP up), so force the FIN out.
+            // The slot stays `Connecting` through the shedding CLOSE, so no other connect can reuse it. TCP is up, so
+            // force the FIN out.
             let gen64 = self.core.table.generation(slot);
-            // The errno the kernel gave, on the same grounds as the dup below: `FIXED_FD_INSTALL` is the one op on this
-            // path that charges the *process* fd table (`io_install_fixed_fd` -> `receive_fd` -> `get_unused_fd_flags`,
-            // fs/file.c:1367), where the registered-slot accept that produced the socket charges nothing - so `EMFILE`
-            // arrives here and nowhere else, and answering `ECONNABORTED` for it told the consumer the peer had gone. A
-            // teardown cancellation is not a descriptor failure and keeps the answer it always gave.
+            // `FIXED_FD_INSTALL` charges the process fd table (`io_install_fixed_fd` -> `receive_fd` ->
+            // `get_unused_fd_flags`, `fs/file.c:1367`), so report the kernel's errno, since `EMFILE` does not mean the
+            // peer went away. Only a teardown cancellation answers `ECONNABORTED`.
             let err = if res == -libc::ECANCELED {
                 Errno::ECONNABORTED
             } else {
@@ -172,22 +149,16 @@ where
             return self.core.submit_teardown(slot, generation, true);
         }
         let fd = res; // a real O_CLOEXEC process fd aliasing the pool socket
-        // Take the pending out of `Connecting` and re-park it as `TlsConnecting` (holding `U` + peer + dialed address)
-        // across the handshake.
         let Some(pending) = self.core.table.take_connecting(slot) else {
-            // Not connecting (stale - reaped at teardown): close the furnished fd nobody will consume.
+            // Reaped at teardown, so nobody will consume the furnished fd.
             // SAFETY: `fd` is the freshly installed fd we will not deliver.
             unsafe { libc::close(fd) };
             return Ok(());
         };
         self.core.table.park_tls_connecting(slot, pending);
-        // Arm the park's bounds BEFORE handing off the fd: the handshake-timeout (so a stalled worker can't pin the
-        // slot forever - no-op unless `tls_handshake_timeout` is set) and a wake READ (so the worker's outcome
-        // is heard). Both are ring-staging ops that can only fail on a wedged ring;
-        // on that near-impossible failure, roll the park back - close the furnished fd and force the pool descriptor
-        // closed (re-parked non-`Empty` so the slot can't recycle mid-teardown, mirroring `shed_parked`) - so nothing
-        // leaks or strands. `parked_handshakes` is bumped only once both succeed, so a failure can never later
-        // underflow it.
+        // Arm the handshake timeout and the wake READ before handing off the fd. If either fails, roll the park back,
+        // re-parked non-`Empty` as in `shed_parked` so the slot cannot recycle mid-teardown. `parked_handshakes` is
+        // bumped only once both succeed, so it cannot underflow.
         if let Err(e) = self
             .arm_handshake_timeout(slot, generation)
             .and_then(|()| self.ensure_wake_armed())
@@ -201,11 +172,9 @@ where
             return Err(e);
         }
         self.parked_handshakes += 1;
-        // Hand the fd + a state-free deferral to the consumer's handshake handler. Disjoint-field borrows: the
-        // handshake channel + shared flags (for the deferral), the table (for the dialed address), and the hook.
         let gen64 = self.core.table.generation(slot);
-        // The deferral's own alias of the socket, for ready()'s key readback. Fail closed like the staging arm above: a
-        // connection whose keys can never be confirmed must not be servable.
+        // Fail closed like the staging arm above, since a connection whose keys can never be confirmed must not be
+        // servable.
         // SAFETY: `fd` is the furnished fd, live for this call.
         let sock = match crate::fd::dup_cloexec(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }) {
             Ok(s) => s,
@@ -213,10 +182,9 @@ where
                 // SAFETY: `fd` is the furnished fd, never delivered to a worker.
                 unsafe { libc::close(fd) };
                 self.parked_handshakes -= 1;
-                // Every connect resolves to exactly one of `Connected` or `ConnectFailed` - that is what
-                // `await_connect` blocks on - so tearing the slot down without emitting one leaves the caller waiting
-                // for an event that will never arrive. The errno is the dup's own: this fails when the process is out
-                // of descriptors, and reporting `ECONNABORTED` for that told the consumer the peer had gone.
+                // Every connect must resolve to exactly one of `Connected` or `ConnectFailed`, since `await_connect`
+                // blocks on it. The errno is the dup's own, since running out of descriptors does not mean the peer
+                // went away.
                 self.events.push_back(Event::ConnectFailed {
                     conn: ConnId::new(slot, gen64),
                     err,
@@ -247,7 +215,7 @@ where
                 hook(fd, TlsConnectContext { conn, server_addr }, deferral);
             }
             None => {
-                // Guarded at connect time (a `tls` connect requires the hook), so unreachable in practice.
+                // Unreachable, since a `tls` connect requires the hook.
                 drop(deferral); // -> reject via Drop, drained next wake
                 // SAFETY: close the furnished fd we won't use.
                 unsafe { libc::close(fd) };
@@ -266,9 +234,8 @@ where
         Ok(())
     }
 
-    /// Drain kTLS handshake outcomes posted by consumer workers: install the connection (kTLS transport, emitting
-    /// [`Event::Connected`]) on success, or fail the connect (emitting [`Event::ConnectFailed`]) on rejection. A stale
-    /// outcome (slot recycled, or no longer parked) is dropped, exactly like a stale deferred reply.
+    /// Drain kTLS handshake outcomes, installing the connection with [`Event::Connected`] or failing it with
+    /// [`Event::ConnectFailed`]. A stale outcome, for a recycled or no longer parked slot, is dropped.
     pub(super) fn drain_handshake_outcomes(&mut self) -> errno::Result<()> {
         while let Ok(outcome) = self.handshake_rx.try_recv() {
             let HandshakeResult {
@@ -283,11 +250,8 @@ where
                 continue; // not parked (already resolved); outcome moot
             };
             self.parked_handshakes -= 1;
-            // Resolved in time - cancel the handshake timeout so it doesn't fire later and find the slot no longer
-            // parked. No-op unless armed.
             self.cancel_handshake_timeout(slot, generation as u32)?;
             if ready {
-                // Install the kTLS connection with the state the caller supplied.
                 let PendingConnect { peer, state, .. } = *pending;
                 let mut conn = Connection::new(peer, state, self.core.cfg.max_send_coalesce);
                 conn.install_ktls();
@@ -301,11 +265,8 @@ where
                 self.events.push_back(Event::Connected {
                     conn: ConnId::new(slot, gen64),
                 });
-                // Arm the first reply recv (the pump frames `Need(header)` on the empty buffer and submits it - a kTLS
-                // RECVMSG here).
                 self.pump(slot, gen_low)?;
             } else {
-                // Rejected (or a lost worker's Drop-reject): shed the pool descriptor and fail the connect.
                 let PendingConnect { peer, .. } = *pending;
                 self.shed_parked(slot, peer, Errno::ECONNABORTED)?;
             }
@@ -313,10 +274,8 @@ where
         Ok(())
     }
 
-    /// A parked kTLS slot's handshake timeout fired (or was cancelled - its result is irrelevant): if the slot is still
-    /// parked at this generation the worker did not call back in time, so fail the connect and shed it (a late
-    /// `ready()`/`reject()` then hits the taken slot and is dropped). Otherwise it already resolved (or the slot
-    /// recycled) - nothing to do.
+    /// A parked kTLS slot's handshake timeout fired or was cancelled. If the slot is still parked at this generation,
+    /// fail the connect and shed it, and a late `ready()` or `reject()` is then dropped as stale.
     pub(super) fn on_handshake_timeout(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
         if self.core.table.generation_low(slot) != generation {
             return Ok(()); // slot recycled
@@ -330,10 +289,9 @@ where
         self.shed_parked(slot, peer, Errno::ETIMEDOUT)
     }
 
-    /// Shed a taken parked slot: re-park it as `TlsParked` (holding `peer`, no pending state) so it stays non-`Empty` -
-    /// a concurrent `connect_start` scanning for a free slot must not reuse it while its shedding CLOSE is in flight -
-    /// then queue the failure and force the FIN out. `on_closed` frees the slot when the CLOSE reaps. The caller has
-    /// already taken the pending and decremented `parked_handshakes`.
+    /// Shed a taken parked slot, queue the failure and force the FIN out. It is re-parked as `TlsParked` so it stays
+    /// non-`Empty`, and `connect_start` cannot reuse it while its CLOSE is in flight. The caller has already taken the
+    /// pending connect and decremented `parked_handshakes`.
     fn shed_parked(&mut self, slot: u32, peer: ClientAddr, err: Errno) -> errno::Result<()> {
         let gen64 = self.core.table.generation(slot);
         self.core.table.park_tls(slot, Box::new(peer));
@@ -341,13 +299,12 @@ where
             conn: ConnId::new(slot, gen64),
             err,
         });
-        // The connect established (TCP up) and TLS may have partly handshaken: force the FIN out (shutdown-first), like
-        // the server sheds a park.
+        // TCP is up and TLS may have partly handshaken, so shut down before the close.
         self.core.submit_teardown(slot, gen64 as u32, true)
     }
 
-    /// Arm the standalone `TIMEOUT` bounding a parked kTLS handshake, keyed to `(slot, generation)`; on expiry
-    /// `on_handshake_timeout` sheds the slot if still parked. No-op unless `tls_handshake_timeout` is set.
+    /// Arm the standalone `TIMEOUT` bounding a parked kTLS handshake, keyed to `(slot, generation)`. No-op unless
+    /// `tls_handshake_timeout` is set.
     fn arm_handshake_timeout(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
         if self.core.cfg.tls_handshake_timeout.is_none() {
             return Ok(());

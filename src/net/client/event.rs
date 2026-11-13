@@ -14,9 +14,8 @@ const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
 /// A stale-safe handle to one client connection: its pool slot plus the slot's generation, so a handle retained past
 /// the connection's close never aliases a later connection recycled into the same slot.
 ///
-/// Packed into a `u64` - the slot in the low 24 bits (identical to the kernel routing codec) and the generation above
-/// it. The generation is the full loop-side counter (used for the `slot_matches` liveness check); a client runs on one
-/// thread and never approaches 2^40 recycles on a single slot, so the high-bit truncation is unobservable.
+/// Packed into a `u64` with the slot in the low 24 bits and the generation above it. Dropping the generation's top 24
+/// bits is unobservable, since no slot reaches 2^40 recycles.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ConnId(u64);
 
@@ -44,9 +43,6 @@ impl RequestId {
 }
 
 /// A completion the caller drains from [`next_event`](super::Client::next_event).
-///
-/// `#[non_exhaustive]`: further variants (e.g. a spliced-body notification) slot in without a breaking change -
-/// destructure with `..`.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum Event {
@@ -75,10 +71,8 @@ pub enum Event {
         /// The owned reply body.
         body: Body<'static>,
     },
-    /// A framed reply whose **body** was spliced straight to the caller's sink fd (a framer returned
-    /// [`Framing`](crate::net::Framing)`::SpliceBody`) instead of read into a buffer - zero-copy. The body never enters
-    /// an event; it already went to the sink fd (a blocking pipe write end the caller stashed in `U`). `header` is the
-    /// buffered header bytes and `body_len` the number of bytes moved to the sink.
+    /// A framed reply whose body was spliced straight to the caller's sink fd, a blocking pipe write end stashed in
+    /// `U`, because a framer returned [`Framing`](crate::net::Framing)`::SpliceBody`.
     Splice {
         /// The connection the reply arrived on.
         conn: ConnId,
@@ -108,24 +102,18 @@ pub struct ConnectOpts {
     /// Bind the client socket to this local address before connecting (source address/port selection). `None` lets the
     /// kernel pick.
     pub local_addr: Option<SocketAddr>,
-    /// Layer kernel TLS over the connection once the TCP connect completes: the client furnishes a real fd to the
-    /// [`set_tls_handshake`](super::Client::set_tls_handshake) worker, which runs the TLS handshake (installing kTLS)
-    /// and hands the connection back. Requires a handshake handler and a kernel with `IORING_OP_FIXED_FD_INSTALL`
-    /// (Linux >= 6.8) + the TLS ULP; a `tls` connect without them fails cleanly. `false` (the default) is plain TCP.
+    /// Layer kernel TLS over the connection once the TCP connect completes, through the
+    /// [`set_tls_handshake`](super::Client::set_tls_handshake) handler. Without that handler, or on a kernel lacking
+    /// `IORING_OP_FIXED_FD_INSTALL` or the TLS ULP, the connect fails cleanly. `false` (the default) is plain TCP.
     pub tls: bool,
-    /// Run the `IORING_OP_CONNECT` under this registered personality: the kernel resolves the id at SQE init and wraps
-    /// the whole connect - io-wq punts included - in that identity's credentials. For an `AF_UNIX` dial that identity
-    /// is what the connect leaves behind: the accepting side's `SO_PEERCRED` reports the personality's euid/egid (the
-    /// pid stays this process's), and the socket file's `MAY_WRITE` permission check runs under it too. Only the
-    /// connect is stamped - peer credentials and path DAC are captured at `connect(2)` time, and send/recv on a
-    /// connected stream check neither - so later I/O runs unstamped by design.
+    /// Run the `IORING_OP_CONNECT` under this registered personality, io-wq punts included. For an `AF_UNIX` dial the
+    /// accepting side's `SO_PEERCRED` reports the personality's euid and egid, and the socket file's `MAY_WRITE` check
+    /// runs under it. Only the connect is stamped, since peer credentials and path DAC are captured at `connect(2)` and
+    /// later send and recv check neither. `None` (the default) connects under the loop thread's own credentials.
     ///
-    /// `None` (the default) connects under the loop thread's ambient credentials, exactly as before.
-    ///
-    /// **The id must come from the ring this client runs on** (a client built with
-    /// [`with_ring`](super::Client::with_ring) on a ring the credential broker inherited, or another registration on
-    /// that same ring). An id from a different ring silently names whatever *this* ring registered under that number -
-    /// see the [`Personality`] type docs for why that cannot be caught here.
+    /// **The id must come from the ring this client runs on**, as with [`with_ring`](super::Client::with_ring) on a
+    /// ring the credential broker inherited. An id from another ring silently names whatever this ring registered under
+    /// that number (see [`Personality`]).
     pub personality: Option<Personality>,
 }
 

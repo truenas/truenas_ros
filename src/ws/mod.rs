@@ -2,59 +2,23 @@
 //! codec, and like it a codec rather than a server.
 //!
 //! A WebSocket connection speaks three shapes in sequence: one HTTP upgrade request, one HTTP response head, then RFC
-//! 6455 frames. This module owns all three as *pure* pieces and does no I/O and no dispatch. Both directions are
-//! present as mirror pairs:
+//! 6455 frames. This module owns all three as *pure* pieces for both directions and does no I/O and no dispatch.
+//! [`ws_frame`] frames a `net::client` connection and [`ws_server_frame`] a `net::server` one.
 //!
-//! - **Framers** ([`Framing`]): [`ws_frame`] drives a `net::client` (cut the `101` head, then server frames);
-//!   [`ws_server_frame`] drives a `net::server` (cut the `GET` upgrade head, then client frames).
-//! - **Header parse**: [`frame_head`] (client reading the server - refuses a mask) and [`server_frame_head`] (server
-//!   reading a client - requires the mask, folds its key into `header_len`; [`unmask`] recovers the payload). Both the
-//!   framer and a consumer re-reading a delivered header use these.
-//! - **Encode**: [`encode_frame`] (client, masked) and [`encode_server_frame`] (server, unmasked).
-//! - **Handshake**: [`upgrade_request`] + [`validate_101`] on the client;
-//!   [`validate_upgrade_request`] + [`upgrade_response`] on the server;
-//!   [`accept_for`]/[`ws_key`]/[`mask_key`] shared.
+//! What a frame *means*, from request and response to the ping and close disciplines and continuation reassembly, is
+//! the consumer's. A framer cannot send, so every frame, control frames included, is delivered whole and answered from
+//! the pump.
 //!
-//! What a frame *means* - request/response, the ping and close disciplines, continuation reassembly - is the
-//! consumer's: a framer cannot send, so every frame (control frames included) is delivered whole and answered from the
-//! pump.
+//! §5.1's mask rule is the only asymmetry between the directions. Behaviour is checked against libwebsockets
+//! (`/CODE/libwebsockets`), and this parser is stricter than its client on purpose.
 //!
-//! The framer never answers `More` in the frame phase: every WebSocket frame declares its length in its first 2..=14
-//! bytes, so exact `Need`/`NeedInMessage` asks read the header and let the reactor read the payload in one exact recv
-//! (`More` reads 4 KiB chunks and re-scans - the delimiter-hunting shape, right only for the HTTP head).
-//!
-//! # Direction and strictness
-//!
-//! §5.1's mask rule is the only asymmetry: a client masks what it sends and refuses a masked server frame; a server
-//! requires the client mask and sends unmasked. The frame length codec, control-frame rules, SHA-1, and base64 are
-//! shared.
-//!
-//! Behaviour is checked against **libwebsockets** (`/CODE/libwebsockets`), the canonical implementation, rather than
-//! the RFC prose alone: the accept digest is what its client verifies at `lib/roles/ws/client-ws.c` and its server
-//! emits at `lib/roles/ws/server-ws.c:687`.
-//!
-//! Where this parser is *stricter* than libwebsockets' client, on purpose, because the peer is one specific server
-//! (aiohttp) that never exercises the lenient corners and strictness is free safety:
-//!
-//! - **Any RSV bit is refused.** This crate negotiates no extension, so RSV1/2/3 are all illegal. lws-client only
-//!   rejects RSV when no extension is active and, with permessage-deflate on, accepts RSV2/3 without a per-bit check
-//!   (`client-parser-ws.c:281-290`).
-//! - **A non-minimal length is refused** (a 16-bit form under 126, a 64-bit form at or under `0xFFFF`). RFC 6455 §5.2
-//!   requires the sender
-//!   use the minimal form; lws-client does not check on receive.
-//! - **UTF-8 is not validated here.** A text frame is JSON, and a `serde_json` decode rejects non-UTF-8, so the codec
-//!   does not need to look - lws-client validates UTF-8 only when the context opts in (`client-parser-ws.c:228-231`).
-//!   **That is about detection, not about the verdict**, and the two are not the same: RFC 6455 §8.1 requires *failing
-//!   the connection* on invalid UTF-8, while bad JSON is an application error a role may answer and serve past. Each
-//!   consumer therefore owns its own screen - `Session::on_message` faults on any non-JSON text, and
-//!   `JsonRpcServer::on_message` checks the encoding explicitly because it answers `-32700` and keeps serving
-//!   otherwise.
-//!   A role that leaves this to `serde_json` alone will answer an invalid-UTF-8 frame instead of failing on it.
-//!
-//! Two behaviours are consciously *not* enforced, because the framer is a per-frame cutter and the peer is
-//! well-behaved: the receipt clock is not held across the frames of a fragmented message (each frame is its own
-//! delivery, and middlewared never fragments - see [`ws_frame`]), and a peer close code is echoed verbatim rather than
-//! sanitised to `1002` (the connection closes immediately either way).
+//! - **Any RSV bit is refused**, since this crate negotiates no extension. lws-client accepts RSV2/3 with
+//!   permessage-deflate on (`client-parser-ws.c:281-290`).
+//! - **A non-minimal length is refused**, as RFC 6455 §5.2 requires the minimal form. lws-client does not check.
+//! - **UTF-8 is not validated here.** lws-client validates it only when the context opts in
+//!   (`client-parser-ws.c:228-231`). RFC 6455 §8.1 requires *failing the connection* on invalid UTF-8, so each
+//!   consumer must screen text frames itself. A role that leaves it to a JSON decode answers an invalid-UTF-8 frame as
+//!   bad JSON instead of failing.
 
 use crate::net::Framing;
 
@@ -116,11 +80,10 @@ pub enum HeadVerdict {
 /// Parse a **server -> client** frame header (the peer must not mask; RFC §5.1) from the front of `buf`. This is the
 /// client-direction parse; a ws server reading client frames uses [`server_frame_head`].
 ///
-/// Total over any prefix: short input is `Incomplete` with an exact byte count (never a guess - `MSG_WAITALL` reads can
-/// still complete short on EOF, so re-entry with fewer bytes than asked must re-answer). Every protocol violation §5
-/// lets a client detect is `Invalid`: a MASK bit (§5.1: a server MUST NOT mask), a RSV bit (no extension was
-/// negotiated, §5.2), a reserved opcode, a fragmented or over-long control frame (§5.5), and a non-minimal or sign-bit
-/// extended length (§5.2).
+/// Total over any prefix. Short input is `Incomplete` with an exact byte count, since a `MSG_WAITALL` read can still
+/// complete short on EOF and re-entry with fewer bytes than asked must re-answer. Every protocol violation §5 lets a
+/// client detect is `Invalid`, namely a MASK bit (§5.1), a RSV bit (§5.2), a reserved opcode, a fragmented or over-long
+/// control frame (§5.5), and a non-minimal or sign-bit extended length (§5.2).
 pub fn frame_head(buf: &[u8]) -> HeadVerdict {
     parse_head(buf, false)
 }
@@ -215,11 +178,10 @@ fn parse_head(buf: &[u8], require_mask: bool) -> HeadVerdict {
 /// Recover a masked client frame's payload in place, using the 4-byte key at the tail of its `header` - the header
 /// [`server_frame_head`] framed, and only that.
 ///
-/// **This is not a no-op on an unmasked header, and cannot be made one.** The mask bit lives in the header's second
-/// byte, but a masked header is 6, 8 or 14 bytes and an unmasked one 2, 4 or 10 (RFC 6455 §5.2), so the last four bytes
-/// of an unmasked 4- or 10-byte header are its own length field - XORing a payload with those silently corrupts it, and
-/// a 2-byte unmasked header trips the length assert below, which is a plain `assert!` and so fires in release too.
-/// Server-to-client frames are never masked (§5.3), which is why [`frame_head`]'s output must not be passed here.
+/// **This is not a no-op on an unmasked header, and cannot be made one.** An unmasked header is 2, 4 or 10 bytes (RFC
+/// 6455 §5.2), so the last four bytes of a 4- or 10-byte one are its own length field and XORing with them silently
+/// corrupts the payload. A 2-byte one trips the plain `assert!` below, in release too. Server-to-client frames are
+/// never masked (§5.3), which is why [`frame_head`]'s output must not be passed here.
 pub fn unmask(header: &[u8], payload: &mut [u8]) {
     assert!(
         header.len() >= 4,
@@ -231,30 +193,20 @@ pub fn unmask(header: &[u8], payload: &mut [u8]) {
     }
 }
 
-/// Whether `code` may be *sent* as a Close frame status code (RFC 6455 §7.4.1, §7.4.2). The sendable defined codes are
-/// 1000-1003 and 1007-1014, plus 3000-4999 for libraries, frameworks and private agreement. 1004, 1005, 1006 and 1015
-/// are reserved values §7.4.1 says an endpoint MUST NOT set, and the rest carries no meaning to send: 0-999 is "not
-/// used", and 1016-2999 and 5000+ are undefined by this revision. 1012-1014 are absent from RFC 6455 itself but
-/// registered with IANA since, which §7.4.2 provides for - see the body comment.
+/// Whether `code` may be *sent* as a Close frame status code (RFC 6455 §7.4.1, §7.4.2), which is 1000-1003, 1007-1014
+/// and 3000-4999. 1004, 1005, 1006 and 1015 are reserved values §7.4.1 says an endpoint MUST NOT set, and the rest
+/// carry no meaning to send.
 ///
-/// A code arriving from a peer is a different question - a receiver reports whatever it was told. This bounds only what
-/// goes back out, which is why [`close_echo_code`] and not this is what the close discipline calls.
+/// A receiver reports whatever code a peer sent. This bounds only what goes back out, which is why the close
+/// discipline calls [`close_echo_code`] and not this.
 pub fn is_sendable_close_code(code: u16) -> bool {
-    // 1000-1011 are §7.4.1's own definitions, less the three it forbids an endpoint to send (1004 undefined, 1005 and
-    // 1006 reserved-not-on-wire). 1012-1014 (Service Restart, Try Again Later, Bad Gateway) appear nowhere in RFC
-    // 6455 - they are later IANA registrations, which §7.4.2 provides for ("reserved for definition by this protocol,
-    // its future revisions, and extensions specified in a permanent and readily available public specification"), so
-    // they are sendable and echoable. 1015 stays out: §7.4.1 forbids setting it. 3000-3999 are registered
-    // library/framework codes and 4000-4999 private, both sendable.
+    // 1012-1014 appear nowhere in RFC 6455. They are later IANA registrations, which §7.4.2 provides for, so they are
+    // sendable and echoable.
     //
-    // **This diverges from libwebsockets**, which the module is otherwise checked against: `ops-ws.c`'s peer-close arm
-    // rewrites 1012, 1013 and 1014 to 1002 along with the codes §7.4.1 really forbids. Two other implementations take
-    // the range this does, and one of them is the server this crate talks to: aiohttp's `ALLOWED_CLOSE_CODES` is built
-    // from a `WSCloseCode` enum that includes all three (`aiohttp/_websocket/models.py`), and Python `websockets` lists
-    // them in `EXTERNAL_CLOSE_CODES` (`websockets/frames.py`) with the same `3000..=4999` tail. Rewriting a peer's 1013
-    // "try again later" to 1002 would answer a graceful retry request with a protocol-error accusation, and
-    // middlewared's own stack would have accepted the
-    // 1013. The narrow set is the older reading; this is the registry's.
+    // **This diverges from libwebsockets**, whose peer-close arm in `ops-ws.c` rewrites 1012, 1013 and 1014 to 1002.
+    // aiohttp's `ALLOWED_CLOSE_CODES` (`aiohttp/_websocket/models.py`) and Python `websockets`' `EXTERNAL_CLOSE_CODES`
+    // (`websockets/frames.py`) take this range, and rewriting a peer's 1013 "try again later" to 1002 would answer a
+    // graceful retry request with a protocol error.
     matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 
@@ -303,23 +255,15 @@ pub struct WsState {
     phase: Phase,
 }
 
-/// The `net::client` reply framer for a middlewared connection.
+/// The `net::client` reply framer for a WebSocket connection.
 ///
-/// Handshake phase: scan for the head's terminating blank line - the one delimiter of unknown position this protocol
-/// has, so the `More` family is right here and only here. The whole head is delivered as a message of `header_len ==
-/// the head` and no body; a non-101 status is delivered too (not `Invalid`), so the session can report the status line
-/// instead of a bare close. Anything past the blank line - a server that coalesced its first frame into the same
-/// flush - stays buffered for the frame phase, which this verdict switches to.
+/// It first delivers the whole HTTP response head as a message with no body, a non-101 head included, so the consumer
+/// can report the status line rather than a bare close. Bytes past the head stay buffered for the frame phase. Each
+/// frame is then delivered as `Event::Reply` with the raw frame header and the payload as body, and the consumer
+/// re-parses the header with [`frame_head`] for FIN and opcode.
 ///
-/// Frame phase: exact asks. An empty buffer answers `Need(2)` - between messages the connection is parked idle, which
-/// is the [`Framing::Need`] contract - and a begun header answers `NeedInMessage` so the response clock covers the
-/// remainder. A complete header is `Complete { header_len, body_len: payload }`: the reactor reads exactly the payload
-/// (placing large ones in their own allocation) and delivers `Event::Reply { header: <raw frame header>, body:
-/// <payload> }`, which the session re-parses with [`frame_head`] for FIN/opcode.
-///
-/// The framer is a per-frame cutter with no memory of fragmentation, so a server that sends a non-final frame and then
-/// stalls is clocked as idle between frames (`Need(2)`), not mid-message. Reassembly and its bound live in the session,
-/// which sees each frame; middlewared never fragments, so the gap is theoretical here.
+/// Each frame is its own delivery, so a server that stalls after a non-final frame is clocked as idle rather than
+/// mid-message. Reassembly and its bound are the consumer's.
 pub fn ws_frame(buf: &[u8], st: &mut WsState) -> Framing {
     match st.phase {
         Phase::Handshake => head_step(buf, st),
@@ -327,10 +271,9 @@ pub fn ws_frame(buf: &[u8], st: &mut WsState) -> Framing {
     }
 }
 
-/// The `net::server` reply framer for a WebSocket connection - the twin of [`ws_frame`]. Handshake phase cuts the
-/// client's `GET` upgrade request head identically (blank-line delimited); frame phase parses masked client frames with
-/// [`server_frame_head`], so `Event`'s delivered header carries the 4-byte key and the body is masked (recover it with
-/// [`unmask`]).
+/// The `net::server` reply framer for a WebSocket connection, the twin of [`ws_frame`]. It cuts the client's `GET`
+/// upgrade head the same way, then parses masked client frames with [`server_frame_head`], so the delivered header
+/// carries the 4-byte key and the body arrives masked (recover it with [`unmask`]).
 pub fn ws_server_frame(buf: &[u8], st: &mut WsState) -> Framing {
     match st.phase {
         Phase::Handshake => head_step(buf, st),
@@ -338,11 +281,8 @@ pub fn ws_server_frame(buf: &[u8], st: &mut WsState) -> Framing {
     }
 }
 
-/// The handshake phase, shared by both framers: scan for the head's terminating blank line - the one delimiter of
-/// unknown position this protocol has, so the `More` family is right here and only here. The whole head is delivered as
-/// a message of `header_len == the head` and no body (a non-101/non-GET head is delivered too, not `Invalid`, so the
-/// consumer can report the status/request line). Anything past the blank line - a peer that coalesced its first frame
-/// into the same flush - stays buffered for the frame phase, which this verdict switches to.
+/// The handshake phase, shared by both framers. The head's blank line is the one delimiter of unknown position this
+/// protocol has, so the `More` family is right here and only here.
 fn head_step(buf: &[u8], st: &mut WsState) -> Framing {
     if buf.is_empty() {
         return Framing::More;
@@ -360,15 +300,10 @@ fn head_step(buf: &[u8], st: &mut WsState) -> Framing {
     Framing::MoreInMessage
 }
 
-/// The frame phase, parameterized by the direction's header parser. Exact asks: an empty buffer answers `Need(2)` -
-/// between messages the connection is parked idle, which is the [`Framing::Need`] contract - and a begun header answers
-/// `NeedInMessage` so the receive clock covers the remainder. A complete header is `Complete { header_len, body_len }`:
-/// the reactor reads exactly the payload and delivers `Event::Reply { header, body }`, which the consumer re-parses
-/// with the same header parser for FIN/opcode.
-///
-/// The framer is a per-frame cutter with no memory of fragmentation, so a peer that sends a non-final frame and then
-/// stalls is clocked as idle between frames (`Need(2)`), not mid-message. Reassembly and its bound live in the session,
-/// which sees each frame.
+/// The frame phase, parameterized by the direction's header parser. Every frame declares its length in its first
+/// 2..=14 bytes, so it never answers `More`, whose chunked re-scan suits only the head. An empty buffer answers
+/// `Need(2)`, since between messages the connection is parked idle (the [`Framing::Need`] contract), and a begun header
+/// answers `NeedInMessage` so the receive clock covers the rest.
 fn frame_step(buf: &[u8], parse: fn(&[u8]) -> HeadVerdict) -> Framing {
     if buf.is_empty() {
         return Framing::Need(2);
@@ -390,7 +325,6 @@ pub fn encode_frame(opcode: u8, payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
 }
 
 /// Encode one **server -> client** frame - the twin of [`encode_frame`], unmasked (RFC §5.1: a server MUST NOT mask).
-/// Used by the ws server role and by test harnesses that answer a client.
 pub fn encode_server_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     encode(opcode, payload, None)
 }
@@ -429,15 +363,9 @@ const MAX_TARGET: usize = 2048;
 /// Whether `endpoint` may be spliced into a request line: non-empty, no longer than 2048 bytes, beginning with `/`, and
 /// every byte a visible ASCII character.
 ///
-/// RFC 9112 §3 makes `request-line = method SP request-target SP HTTP-version CRLF`, so a target carrying CR, LF or a
-/// space does not produce a longer request line - it produces *more lines*. A `\r\n` closes the request line and
-/// everything after it is read as a header field, or as a second request; that is request splitting, and the endpoint
-/// is the one field of this handshake a deployment supplies. Rejecting every byte outside `0x21..=0x7E` also covers
-/// NUL, DEL, the C0 controls and anything non-ASCII, none of which belong in an origin-form target either (RFC 9110
-/// §4.1 keeps a target to US-ASCII, percent-encoding the rest).
-///
-/// This is a bound on shape, not a URI parser: a target that clears it can still be a path middlewared does not serve,
-/// which the server answers for itself.
+/// A CR, LF or space in a target ends the request line (RFC 9112 §3), and what follows is read as a header field or a
+/// second request. Refusing every byte outside `0x21..=0x7E` also keeps the target to US-ASCII (RFC 9110 §4.1). This
+/// bounds shape only and is not a URI parser.
 pub fn validate_request_target(endpoint: &str) -> Result<(), HandshakeError> {
     let bad = |value: &str| {
         Err(HandshakeError::BadTarget {
@@ -458,14 +386,11 @@ pub fn validate_request_target(endpoint: &str) -> Result<(), HandshakeError> {
 
 /// The upgrade request for `endpoint` (e.g. `/api/current`), carrying `key` as `Sec-WebSocket-Key`.
 ///
-/// `endpoint` goes into the request line verbatim, so it is screened by [`validate_request_target`] first and this
-/// refuses rather than splicing - the screen is the whole defence against request splitting through a configured
-/// endpoint, and a caller that could skip it would be the hole. `key` is minted by [`ws_key`] and is base64 by
-/// construction.
+/// `endpoint` goes into the request line verbatim, so it is screened by [`validate_request_target`] here and refused
+/// rather than spliced. The screen is the whole defence against request splitting, so no caller may be able to skip
+/// it. `key` is minted by [`ws_key`] and is base64 by construction.
 ///
-/// `Host: localhost` is what the reference Python client sends over the unix socket (it dials the path itself and hands
-/// its WebSocket layer a dummy `ws://localhost/...` URL), so it is the value every middlewared deployment has been
-/// accepting since the JSON-RPC API shipped.
+/// `Host: localhost` is what the reference Python client sends over the unix socket, so every server accepts it.
 pub fn upgrade_request(endpoint: &str, key: &str) -> Result<Vec<u8>, HandshakeError> {
     validate_request_target(endpoint)?;
     let mut out = Vec::with_capacity(160 + endpoint.len());
@@ -480,19 +405,14 @@ pub fn upgrade_request(endpoint: &str, key: &str) -> Result<Vec<u8>, HandshakeEr
 }
 
 /// The `Sec-WebSocket-Accept` value that proves the peer parsed `key`: base64 of SHA-1 over the key with §1.3's GUID
-/// appended. Compared byte-exact - base64 is case-sensitive - after trimming optional whitespace around the header
-/// value.
-///
-/// `pub` because the server side of a handshake needs exactly this digest too: a peer answering an upgrade (a test's
-/// scripted server, or a future `ws` server role) computes it the same way libwebsockets does at `server-ws.c:687`.
-///
-/// The SHA-1 is openssl's. It is RFC 6455-mandated and non-security (a handshake tag, not a secret), so if a
-/// FIPS-hardened OpenSSL ever refuses SHA-1 and breaks this, the fix is a FIPS-agnostic pure-Rust sha1 here rather than
-/// libcrypto - see the `openssl` dep in `Cargo.toml`.
+/// appended, as libwebsockets computes it at `server-ws.c:687`. Compared byte-exact, since base64 is case-sensitive,
+/// after trimming optional whitespace around the header value.
 pub fn accept_for(key: &str) -> String {
     let mut seed = Vec::with_capacity(key.len() + ACCEPT_GUID.len());
     seed.extend_from_slice(key.as_bytes());
     seed.extend_from_slice(ACCEPT_GUID);
+    // This SHA-1 is a handshake tag, not a secret. If a FIPS-hardened OpenSSL ever refuses it, the fix is a pure-Rust
+    // sha1 here rather than more libcrypto (see the `openssl` dep in `Cargo.toml`).
     openssl::base64::encode_block(&openssl::sha::sha1(&seed))
 }
 
@@ -572,26 +492,15 @@ impl std::error::Error for HandshakeError {}
 
 /// Whether a list-valued header field carries `token`, case-insensitively.
 ///
-/// **Only `Connection` gets this.** RFC 6455 §4.1 words its two upgrade checks differently and means it: the
-/// `Connection` field "doesn't contain a token that is an ASCII case-insensitive match for the value `Upgrade`" - a
-/// token search - while `Upgrade` is failed when it "contains a value that is not an ASCII case-insensitive match for
-/// the value `websocket`", which is an equality test on the whole field.
-/// Two references draw the same line. libwebsockets' client tokenizes `Connection` with `LWS_TOKENIZE_F_COMMA_SEP_LIST`
-/// and runs a plain
-/// `strcmp(p, "websocket")` over `Upgrade` (`lib/roles/ws/client-ws.c`);
-/// Python `websockets` flattens every `Connection` field line and asks `any(== "upgrade")`, then requires `len(upgrade)
-/// == 1 and upgrade[0] == "websocket"` (`websockets/server.py`). Handing `Upgrade` a token search would accept
-/// `Upgrade: h2c, websocket`, which both refuse.
+/// **Only `Connection` gets this.** RFC 6455 §4.1 fails `Connection` when it lacks an `Upgrade` token, but fails
+/// `Upgrade` when it "contains a value that is not an ASCII case-insensitive match for the value `websocket`", an
+/// equality test on the whole field. libwebsockets' client (`lib/roles/ws/client-ws.c`) and Python `websockets`
+/// (`websockets/server.py`) draw the same line, and a token search on `Upgrade` would accept `Upgrade: h2c, websocket`,
+/// which both refuse. `websocket-client` treats both as token lists (`_handshake.py`), but §4.1's wording is the
+/// equality one.
 ///
-/// `websocket-client` - the library the canonical TrueNAS Python client is built on - is the outlier: it treats both as
-/// token lists (`_handshake.py`'s `_HEADERS_TO_CHECK`) and would accept that. It is also the least strict of the three,
-/// and RFC 6455 §4.1's own wording is the equality one, so the strict reading wins here.
-///
-/// A sender may still split `Connection` across field lines of the same name; RFC 9110 §5.3 says combining them does
-/// not change the meaning, so `|=`-ing this over every matching line is the combined search.
-///
-/// A non-UTF-8 value carries no token rather than poisoning the scan: it cannot equal one, and the verdict is decided
-/// by whether the tokens that matter were found at all.
+/// A `Connection` split across field lines means the joined list (RFC 9110 §5.3), so callers `|=` this over every
+/// matching line. A non-UTF-8 value carries no token.
 fn has_token(value: &[u8], token: &str) -> bool {
     std::str::from_utf8(value).is_ok_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
 }
@@ -601,16 +510,12 @@ fn has_token(value: &[u8], token: &str) -> bool {
 /// the websocket tokens (case-insensitively), and `Sec-WebSocket-Accept` is byte-exactly [`accept_for`]`(key)` (base64
 /// is case-sensitive, so only surrounding whitespace is trimmed).
 ///
-/// Two rules bound what else the head may carry. §4.1 items 5 and 6 make a server-selected extension or subprotocol
-/// fatal when the client did not offer it, and [`upgrade_request`] offers neither, so a non-empty
-/// `Sec-WebSocket-Extensions` or `Sec-WebSocket-Protocol` is always [`HandshakeError::Unrequested`]. That matters here
-/// beyond conformance: [`frame_head`] refuses every RSV bit, so an extension accepted at the handshake would surface as
-/// an unexplained `Framing::Invalid` on the peer's first extended frame instead of a named handshake failure. §11.3.3
-/// makes `Sec-WebSocket-Accept` appear at most once, and a last-wins scan would let a right value excuse a wrong one
-/// behind it, so a second occurrence is [`HandshakeError::BadAccept`].
+/// A non-empty `Sec-WebSocket-Extensions` or `Sec-WebSocket-Protocol` is [`HandshakeError::Unrequested`] (§4.1 items 5
+/// and 6), since [`upgrade_request`] offers neither and [`frame_head`] could not frame an extension's RSV bits. A
+/// second `Sec-WebSocket-Accept` is [`HandshakeError::DuplicateHeader`] (§11.3.3), so a right value never excuses a
+/// wrong one.
 ///
-/// `head` is the whole response head through its terminating blank line - what the framer's handshake phase cuts and
-/// delivers.
+/// `head` is the whole response head through its terminating blank line, as the framer's handshake phase delivers it.
 pub fn validate_101(head: &[u8], key: &str) -> Result<(), HandshakeError> {
     let mut slots = [httparse::EMPTY_HEADER; 32];
     let mut resp = httparse::Response::new(&mut slots);
@@ -631,9 +536,7 @@ pub fn validate_101(head: &[u8], key: &str) -> Result<(), HandshakeError> {
     let mut upgraded: Option<bool> = None;
     let mut connection = false;
     let mut accept_ok: Option<bool> = None;
-    // §11.3.2 and §11.3.4 word these two the same way: each MAY appear multiple times in a *request* and "MUST NOT
-    // appear more than once in an HTTP response". They are the two negotiation slots, so they are tracked as two flags
-    // rather than a set.
+    // Each "MUST NOT appear more than once in an HTTP response" (§11.3.2, §11.3.4).
     let mut extensions_seen = false;
     let mut protocol_seen = false;
     for h in resp.headers.iter() {
@@ -654,9 +557,7 @@ pub fn validate_101(head: &[u8], key: &str) -> Result<(), HandshakeError> {
             }
             accept_ok = Some(std::str::from_utf8(h.value).is_ok_and(|v| v.trim() == accept_for(key)));
         } else if let Some(header) = unrequested_negotiation(h.name) {
-            // At most once in a response (§11.3.2, §11.3.4), checked before the value is read: a single *empty* line
-            // selects nothing and is tolerated, so without this a server could send two of them and neither would be
-            // refused - the one repeat rule in the handshake with no arm here.
+            // Checked before the value, since one empty line is tolerated and two would otherwise both pass.
             let seen = if header == "Sec-WebSocket-Extensions" {
                 &mut extensions_seen
             } else {
@@ -681,10 +582,7 @@ pub fn validate_101(head: &[u8], key: &str) -> Result<(), HandshakeError> {
     Ok(())
 }
 
-/// The canonical name of a negotiation header this client never offers, or `None` for anything else.
-/// [`upgrade_request`] sends no `Sec-WebSocket-Extensions` and no `Sec-WebSocket-Protocol`, so a server naming either
-/// has selected something that was not on offer (RFC 6455 §4.1 items 5 and 6, and §9's "A server MUST NOT respond with
-/// any extension not requested by the client").
+/// The canonical name of a negotiation header [`upgrade_request`] never offers, or `None` for anything else.
 fn unrequested_negotiation(name: &str) -> Option<&'static str> {
     if name.eq_ignore_ascii_case("sec-websocket-extensions") {
         Some("Sec-WebSocket-Extensions")
@@ -725,8 +623,7 @@ pub fn validate_upgrade_request(head: &[u8]) -> Result<String, HandshakeError> {
         } else if h.name.eq_ignore_ascii_case("connection") {
             connection |= has_token(h.value, "upgrade");
         } else if h.name.eq_ignore_ascii_case("sec-websocket-version") {
-            // A singleton, and refused rather than overwritten for the same reason as the key below: a second line
-            // would decide a verdict the first line already gave.
+            // A second line would decide a verdict the first already gave, so it is refused like the key below.
             if version.is_some() {
                 return Err(HandshakeError::DuplicateHeader {
                     header: "Sec-WebSocket-Version",
@@ -734,10 +631,8 @@ pub fn validate_upgrade_request(head: &[u8]) -> Result<String, HandshakeError> {
             }
             version = Some(std::str::from_utf8(h.value).is_ok_and(|v| v.trim() == "13"));
         } else if h.name.eq_ignore_ascii_case("sec-websocket-key") {
-            // The nonce is what the `101` proves possession of, so a repeated one is not a merge question - it is two
-            // different claims about which value the peer chose. Taking the last makes this endpoint compute
-            // `accept_for` over a nonce the client need never have sent, which is the whole thing the digest exists to
-            // rule out. Refuse instead of picking.
+            // The `101` proves possession of this nonce, so a second one is a different claim. Taking the last would
+            // compute `accept_for` over a nonce the client need never have sent, which the digest exists to rule out.
             if key.is_some() {
                 return Err(HandshakeError::DuplicateHeader {
                     header: "Sec-WebSocket-Key",

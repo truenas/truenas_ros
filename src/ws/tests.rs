@@ -138,8 +138,7 @@ fn frame_head_refuses_protocol_violations() {
     assert!(matches!(frame_head(&f), HeadVerdict::Invalid(_)), "sign bit");
 }
 
-/// A well-formed control frame at the size limit is accepted: FIN=1, payload 0..=125 in the 7-bit form. (The
-/// rejection is only the extended-length forms and FIN=0, tested above.)
+/// A well-formed control frame at the size limit is accepted, with FIN=1 and a payload of 0..=125 in the 7-bit form.
 #[test]
 fn frame_head_accepts_well_formed_control_frames() {
     for op in [OP_CLOSE, OP_PING, OP_PONG] {
@@ -286,8 +285,7 @@ fn encode_round_trips_and_masks() {
     }
 }
 
-/// The upgrade request is byte-exact: the head middlewared's aiohttp route has been accepting from the reference
-/// client.
+/// The upgrade request is byte-exact, the head the reference client sends.
 #[test]
 fn upgrade_request_is_byte_exact() {
     let req = upgrade_request("/api/current", "AAAA").unwrap();
@@ -302,9 +300,8 @@ fn upgrade_request_is_byte_exact() {
     );
 }
 
-/// Keys and masks draw fresh entropy: two draws differing is the cheapest observable that the plumbing is wired at
-/// all (a collision is 2^-128 / 2^-32 - the latter would flake once per four billion runs, which is acceptable for
-/// what it buys).
+/// Keys draw fresh entropy, the cheapest observable that the plumbing is wired at all. A collision has odds of
+/// 2^-128.
 #[test]
 fn keys_are_fresh() {
     assert_ne!(ws_key(), ws_key());
@@ -442,12 +439,8 @@ fn control_frames_are_masked_too() {
     }
 }
 
-/// The two rules a repeated header field gets, and which one each slot takes.
-///
-/// `Upgrade` and `Connection` are comma-separated lists, so splitting one across field lines means what the joined
-/// list means (RFC 9110 §5.3) and a validator must look in all of them. The nonce and the version are single
-/// claims: a second line is not more of the same value, it is a different answer, and taking the last would let a
-/// peer choose which of two nonces this endpoint proves.
+/// A repeated `Connection` is combined as one list (RFC 9110 §5.3), while a repeated `Upgrade`, nonce, version or
+/// negotiation slot is refused.
 #[test]
 fn a_repeated_header_is_combined_or_refused_by_what_it_is() {
     let key = "dGhlIHNhbXBsZSBub25jZQ==";
@@ -517,9 +510,7 @@ fn a_repeated_header_is_combined_or_refused_by_what_it_is() {
         ),
         "two nonces must not resolve to one of them"
     );
-    // --- the two negotiation slots, which §11.3.2 and §11.3.4 also
-    // --- cap at one per response. An *empty* one selects nothing and
-    // --- is tolerated, so the repeat is the only thing to catch.
+    // --- the two negotiation slots, at most one per response (§11.3.2, §11.3.4) ---
     for header in ["Sec-WebSocket-Extensions", "Sec-WebSocket-Protocol"] {
         let twice = format!(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
@@ -536,8 +527,7 @@ fn a_repeated_header_is_combined_or_refused_by_what_it_is() {
         );
     }
 
-    // The request direction needs the `Upgrade` duplicate rule too - the response-direction case above does not
-    // exercise this validator.
+    // The request direction needs the `Upgrade` duplicate rule too.
     let two_upgrades = "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\
              Upgrade: h2c\r\nConnection: Upgrade\r\n\
              Sec-WebSocket-Key: abc\r\nSec-WebSocket-Version: 13\r\n\r\n";
@@ -562,9 +552,8 @@ fn a_repeated_header_is_combined_or_refused_by_what_it_is() {
     );
 }
 
-/// An endpoint reaches the wire inside `request-line = method SP request-target SP HTTP-version CRLF` (RFC 9112
-/// §3), so a target carrying CR, LF or a space does not lengthen that line - it ends it, and what follows is read
-/// as a header field or a second request. The screen is what keeps a configured endpoint from forging either.
+/// A target that would end the request line early, and so forge a header or a second request, is refused before it
+/// reaches the wire.
 #[test]
 fn a_request_target_that_would_split_the_request_is_refused() {
     for good in [
@@ -609,9 +598,8 @@ fn a_request_target_that_would_split_the_request_is_refused() {
     );
 }
 
-/// §4.1 items 5 and 6: this client offers no extension and no subprotocol, so a `101` selecting either is fatal -
-/// and it must be, because `frame_head` refuses the RSV bits a negotiated extension would then set. §11.3.3:
-/// `Sec-WebSocket-Accept` at most once, so a right value behind a wrong one does not excuse it.
+/// A `101` selecting an extension or subprotocol this client never offered is refused (§4.1 items 5 and 6), and so
+/// is a second `Sec-WebSocket-Accept` (§11.3.3).
 #[test]
 fn validate_101_refuses_unoffered_negotiation_and_duplicate_accepts() {
     let key = "dGhlIHNhbXBsZSBub25jZQ==";
@@ -675,9 +663,8 @@ fn validate_101_refuses_unoffered_negotiation_and_duplicate_accepts() {
 /// wire; a sendable code is passed through unchanged.
 #[test]
 fn close_echo_refuses_the_codes_no_endpoint_may_send() {
-    // 1012, 1013 and 1014 are the IANA registrations §7.4.2 provides for and are the reason this bound is not the
-    // RFC's own 1007-1011: without them here, narrowing the range back to `1007..=1011` passes every test in both
-    // workspaces.
+    // 1012-1014 are the IANA registrations §7.4.2 provides for. Nothing else fails if the range narrows back to
+    // `1007..=1011`.
     for code in [1000u16, 1001, 1002, 1003, 1007, 1011, 1012, 1013, 1014, 3000, 4999] {
         assert!(is_sendable_close_code(code), "{code} is sendable");
         assert_eq!(

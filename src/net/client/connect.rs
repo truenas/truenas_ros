@@ -1,8 +1,6 @@
-//! Outbound connection establishment - the one client-specific subsystem.
-//!
-//! `connect_socket` creates the non-blocking client socket (CPython `_connect_sock` mechanics, minus DNS), which is
-//! installed into the pool and dialed with `IORING_OP_CONNECT`; `on_connect` turns the completion into a serving
-//! connection (arming its first reply recv) or an [`Event::ConnectFailed`](super::Event::ConnectFailed).
+//! Outbound connection establishment. A non-blocking socket is installed into the pool and dialed with
+//! `IORING_OP_CONNECT`, and `on_connect` turns the completion into a serving connection or an
+//! [`Event::ConnectFailed`](super::Event::ConnectFailed).
 
 use super::{Client, ConnId, ConnectOpts, Event};
 use crate::errno::{self, Errno};
@@ -95,13 +93,12 @@ impl<U, F> Client<U, F>
 where
     F: FnMut(&[u8], &mut U) -> Framing,
 {
-    /// Dial `addr` with a default `U`, blocking until the connection is established, and return its [`ConnId`] -
-    /// already `Serving`, so `send` and `request` work on it immediately (the simple `connect()?`/`request()?` path).
+    /// Dial `addr` with a default `U`, blocking until the connection is established, and return its [`ConnId`], ready
+    /// for `send` and `request`.
     ///
-    /// Pumps the ring until *this* connection comes up, buffering any events for other connections seen meanwhile for a
-    /// later [`next_event`](Client::next_event). Returns `Err` if the connect fails (refused, timed out, unreachable)
-    /// or on a synchronous setup failure (socket/bind, a full pool, or the ring). For the non-blocking form --
-    /// readiness delivered as an [`Event`] - see [`connect_start`](Client::connect_start).
+    /// Events for other connections seen meanwhile are kept for a later [`next_event`](Client::next_event). Returns
+    /// `Err` if the connect fails or on a synchronous setup failure (socket or bind, a full pool, or the ring). The
+    /// non-blocking form is [`connect_start`](Client::connect_start).
     pub fn connect(&mut self, addr: ServerAddr, opts: ConnectOpts) -> io::Result<ConnId>
     where
         U: Default,
@@ -130,8 +127,7 @@ where
     /// As [`connect_start`](Client::connect_start), with an explicit initial per-connection state `state`.
     pub fn connect_start_with_state(&mut self, addr: ServerAddr, opts: ConnectOpts, state: U) -> io::Result<ConnId> {
         if opts.tls {
-            // A `tls` connect needs the handshake hook plus a kernel that can furnish a real fd (`FIXED_FD_INSTALL`,
-            // Linux >= 6.8) and run kTLS (the TLS ULP) - fail cleanly here rather than mid-handshake.
+            // Fail here rather than mid-handshake.
             if self.tls_connect.is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -167,10 +163,8 @@ where
         let Some(slot) = self.core.table.reserve_connecting(pending) else {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "connection pool is full"));
         };
-        // Install the connected socket into the pool at `slot`; the kernel takes its own reference, so the userspace fd
-        // is closed right after.
+        // The kernel takes its own reference, so the userspace fd is closed right after.
         if let Err(e) = self.core.engine.ring.install_file(slot, fd.as_raw_fd()) {
-            // Nothing was installed: drop the pending state and free the slot.
             self.core.table.take_connecting(slot);
             self.core.table.free(slot);
             return Err(e.into());
@@ -184,16 +178,12 @@ where
             .connecting_addr(slot)
             .expect("slot just reserved as Connecting");
         let connect_ud = pack(Op::Connect, slot, generation);
-        // 0 = no credential override (the kernel never allocates id 0), so an opts without a personality dials under
-        // ambient credentials.
+        // 0 is no credential override, since the kernel never allocates id 0.
         let pers = opts.personality.map_or(0, Personality::id);
         let fill = move |sqe: &mut IoUringSqe| {
             sqe.opcode = IORING_OP_CONNECT;
-            // Fixed (pool) descriptor at `slot`; addr@16, addr len@8. The kernel rejects a non-zero
-            // len/op_flags/buf_index/file_index, so leave them zeroed (the SQE arrives zeroed). `personality` is not in
-            // that list: it is resolved opcode-agnostically at SQE init and applied around issue (`io_init_req`,
-            // `__io_issue_sqe`), which is what runs the connect - and the peercred capture inside it - as the minted
-            // identity.
+            // `io_connect_prep` rejects a non-zero len, op_flags, buf_index or file_index. `personality` applies to any
+            // opcode around issue (`io_init_req`, `__io_issue_sqe`), so the connect and its peercred capture run as it.
             sqe.fd = slot as i32;
             sqe.flags = IOSQE_FIXED_FILE;
             sqe.addr = addr_ptr;
@@ -214,8 +204,7 @@ where
             self.core.stage(connect_ud, fill)
         };
         if let Err(e) = staged {
-            // The socket is installed but the CONNECT never staged: uninstall the fixed descriptor (dropping the
-            // kernel's ref closes it) and free the slot.
+            // Uninstalling the fixed descriptor drops the kernel's reference, which closes the socket.
             let _ = self.core.engine.ring.install_file(slot, -1);
             self.core.table.take_connecting(slot);
             self.core.table.free(slot);
@@ -225,11 +214,9 @@ where
         Ok(ConnId::new(slot, gen64))
     }
 
-    /// The blocking half of [`connect_with_state`](Client::connect_with_state): pump the ring until `conn` reaches
-    /// [`Event::Connected`] (-> `Ok(conn)`) or [`Event::ConnectFailed`] (-> `Err`), buffering every *other*
-    /// connection's events for a later [`next_event`](Client::next_event) exactly as [`request`](Client::request) does.
-    /// The connect op is in flight when this is called, so the pump always resolves to one of the two outcomes for
-    /// `conn`.
+    /// The blocking half of [`connect_with_state`](Client::connect_with_state). Pump the ring until `conn` reaches
+    /// [`Event::Connected`] or [`Event::ConnectFailed`], keeping every other connection's events for a later
+    /// [`next_event`](Client::next_event).
     fn await_connect(&mut self, conn: ConnId) -> io::Result<ConnId> {
         let mut stash: VecDeque<Event> = VecDeque::new();
         let out = loop {
@@ -255,19 +242,16 @@ where
         out
     }
 
-    /// An `IORING_OP_CONNECT` completed: `res == 0` established the connection --
-    /// install it, emit [`Event::Connected`], and arm its first reply recv;
-    /// `res < 0` failed - emit [`Event::ConnectFailed`] and reclaim the slot (closing the installed descriptor).
+    /// An `IORING_OP_CONNECT` completed. Success installs the connection, emits [`Event::Connected`] and arms its first
+    /// reply recv. Failure emits [`Event::ConnectFailed`] and closes the installed descriptor.
     pub(super) fn on_connect(&mut self, slot: u32, generation: u32, res: i32) -> errno::Result<()> {
-        // Kernel completion -> low 32 bits. A recycled slot (stale completion) no longer matches; a `Connecting` slot
-        // cannot recycle underneath us (`reserve_connecting` skips non-`Empty` slots), so this only guards an
+        // A `Connecting` slot cannot recycle (`reserve_connecting` skips non-`Empty` slots), so this guards only an
         // out-of-order stale CQE.
         if self.core.table.generation_low(slot) != generation {
             return Ok(());
         }
         if res == 0 {
-            // A kTLS connect furnishes a real fd for the handshake worker instead of installing the connection now; the
-            // slot stays `Connecting` (holding `U` + peer) until `on_fd_install` parks it.
+            // The slot stays `Connecting`, holding `U` and the peer, until `on_fd_install` parks it.
             if self.core.table.connecting_tls(slot) {
                 return self.submit_fd_install(slot, generation);
             }
@@ -286,14 +270,12 @@ where
             self.events.push_back(Event::Connected {
                 conn: ConnId::new(slot, gen64),
             });
-            // Arm the reply recv exactly as the server arms its first read: the pump frames `Need(header)` on the empty
-            // buffer and submits it.
+            // The pump frames the first reply on the empty buffer and submits its recv.
             self.pump(slot, generation)?;
             Ok(())
         } else {
-            // Report the failure, then reclaim: the slot stays `Connecting` (non-`Empty`, so no concurrent connect can
-            // grab it) until the CLOSE frees it - closing the installed descriptor. A cancelled connect is the linked
-            // connect-timeout firing.
+            // The slot stays `Connecting`, so no other connect can take it, until the CLOSE frees it. A cancelled
+            // connect is the linked connect timeout firing.
             let gen64 = self.core.table.generation(slot);
             let err = if res == -libc::ECANCELED {
                 Errno::ETIMEDOUT
@@ -304,8 +286,7 @@ where
                 conn: ConnId::new(slot, gen64),
                 err,
             });
-            // Close the pool descriptor; `on_closed` frees the (non-serving) slot when it completes. No SHUTDOWN - the
-            // connect never established, so there is no FIN owed.
+            // No SHUTDOWN, since a connect that never established owes no FIN.
             self.core.stage(pack(Op::Close, slot, generation), move |sqe| {
                 sqe.opcode = IORING_OP_CLOSE;
                 sqe.fd = 0;

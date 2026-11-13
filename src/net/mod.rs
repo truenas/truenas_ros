@@ -11,11 +11,9 @@ pub mod server;
 #[cfg(feature = "net-client")]
 pub mod client;
 
-// Shared public vocabulary, surfaced at the `net::` root (independent of role).
 pub use core::{
     Body, ClientAddr, CloseReason, Endian, Framing, PeerCred, PrefixWidth, SendBuf, ServerAddr, length_prefix_header,
 };
 
-// The client role's public surface, surfaced at the `net::` root.
 #[cfg(feature = "net-client")]
 pub use client::{Client, ClientConfig, ConnId, ConnectDeferral, ConnectOpts, Event, RequestId, TlsConnectContext};

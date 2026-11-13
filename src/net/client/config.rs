@@ -45,27 +45,22 @@ pub struct ClientConfig {
     /// Set `TCP_USER_TIMEOUT` (unacknowledged-data abort window). `None` (the default) uses the system default. Ignored
     /// for unix.
     pub tcp_user_timeout: Option<Duration>,
-    /// Default bound on an `IORING_OP_CONNECT` (a linked timeout);
-    /// per-connect [`ConnectOpts::connect_timeout`](super::ConnectOpts) overrides it. `None` (the default) uses the
-    /// kernel's own connect timeout.
+    /// Default bound on an `IORING_OP_CONNECT`, as a linked timeout. A per-connect
+    /// [`ConnectOpts::connect_timeout`](super::ConnectOpts) overrides it. `None` (the default) uses the kernel's own
+    /// connect timeout.
     pub connect_timeout: Option<Duration>,
     /// If set, close a connection whose reply, once it has *begun* arriving, is not fully received within this
-    /// duration. Projects to the engine's `request_timeout`. `None` (the default) never times an in-progress reply out.
+    /// duration. `None` (the default) never times an in-progress reply out.
     ///
-    /// This bounds a reply that stalls partway through. It does *not* bound a server that accepts the request and then
-    /// sends nothing at all - until the first reply byte the read is idle, so that case is bounded by
-    /// [`idle_timeout`](Self::idle_timeout). Set both to fully guard against a hostile server (the same two-phase split
-    /// the server role uses). A framer that returns a `SpliceBody` verdict should set this: otherwise a server that
-    /// sends a body header then stalls mid-splice pins the connection's pool slot indefinitely (the splice inactivity
-    /// watchdog is gated on `response_timeout`).
+    /// A server that accepts the request and sends nothing is bounded by [`idle_timeout`](Self::idle_timeout) instead,
+    /// so set both against a hostile server. A framer that returns `SpliceBody` should set this, since the splice
+    /// inactivity watchdog is gated on it and a server that stalls mid-splice otherwise pins the pool slot for good.
     pub response_timeout: Option<Duration>,
     /// If set, close a connection whose in-flight send makes no progress for this long (a peer that stopped reading).
     /// `None` (the default) never times sends out.
     pub send_timeout: Option<Duration>,
     /// If set, close a connection left idle for longer than this, reclaiming its slot. "Idle" includes a connection
-    /// awaiting a reply whose first byte has not arrived, so this - not [`response_timeout`](Self::response_timeout),
-    /// which bounds an *in-progress* reply - is what bounds a server that accepts a request and then goes silent.
-    /// `None` (the default) keeps idle connections open.
+    /// awaiting a reply whose first byte has not arrived. `None` (the default) keeps idle connections open.
     pub idle_timeout: Option<Duration>,
     /// If set, bound a kTLS connect handshake: a connection parked while its consumer handshake worker runs
     /// `SSL_connect` is shed with `ConnectFailed` if the worker does not call back within this duration. `None` (the
@@ -100,8 +95,7 @@ impl Default for ClientConfig {
 }
 
 impl ClientConfig {
-    /// Construction-time validation, mirroring `ServerConfig::validate`: [`Client::new`](super::Client::new) fails with
-    /// a validation error on the first violated bound before any socket or ring is created.
+    /// Refuse the first violated bound before any socket or ring is created.
     pub(super) fn validate(&self) -> crate::Result<()> {
         if self.pool_size == 0 || self.pool_size > MAX_POOL {
             return Err(Error::Validation(format!("pool_size must be in 1..={MAX_POOL}")));
@@ -141,9 +135,8 @@ impl ClientConfig {
         Ok(())
     }
 
-    /// Project the engine-read subset into the reactor core. `response_timeout` maps to the engine's `request_timeout`
-    /// slot (both bound the receipt of a framed message that has begun arriving), and `max_reply_bytes` to its message
-    /// cap.
+    /// Project the engine-read subset into the reactor core. `response_timeout` maps to `request_timeout`, since both
+    /// bound the receipt of a message that has begun arriving.
     pub(super) fn to_core(self) -> CoreConfig {
         CoreConfig {
             max_request_bytes: self.max_reply_bytes,
