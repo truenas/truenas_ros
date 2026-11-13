@@ -815,7 +815,7 @@ mod tests {
     /// A personality id nothing registered fails `EINVAL` at submission, the kernel refusing the stamp, surfaced as the
     /// op's error.
     #[test]
-    fn stale_token_and_stale_personality_are_inert() {
+    fn a_personality_nothing_registered_fails_einval() {
         let dir = crate::tempdir().unwrap();
         std::fs::write(dir.path().join("f"), b"data").unwrap();
         // Not `FsConfig::default()`: that is server-sized and costs ~400 KiB of RLIMIT_MEMLOCK per ring, and `cargo
