@@ -9,11 +9,8 @@ fn bounds(floor: usize, ceiling: usize) -> OffloadBounds {
 
 /// Run a model under a preemption bound rather than exhaustively.
 ///
-/// Three threads parking and signalling on one mutex/condvar is past the point where full exploration terminates in
-/// useful time. A preemption bound keeps every interleaving with at most `N` forced context switches (the region
-/// where essentially all real concurrency bugs live) and drops the deeper ones. **These are bounded proofs, not
-/// exhaustive ones**, unlike the ring's SPSC model, which is small enough to explore in full. Each was checked
-/// against a deliberately broken variant to confirm the bound still catches the bug it is there to catch.
+/// Full exploration of three threads on one condvar does not finish in useful time, so **these are bounded proofs, not
+/// exhaustive ones**.
 fn bounded_model_with(preemptions: usize, f: impl Fn() + Sync + Send + 'static) {
     let mut b = loom::model::Builder::new();
     b.preemption_bound = Some(preemptions);
@@ -40,12 +37,8 @@ fn counting_job(n: &Arc<AtomicUsize>) -> Job {
 
 /// Every submitted job runs exactly once, and `Drop` waits for the queue to empty and every worker to exit.
 ///
-/// **That wait is not a guarantee, and nothing rests on it being one.** `Drop` has three exits that return with
-/// work outstanding: a drop running on one of this pool's own workers, and the two `SHUTDOWN_DETACH_AFTER` breaks.
-/// Detaching is sound because `Job` is `Box<dyn FnOnce() + Send>` and therefore `'static` - no job holds a borrow
-/// of what the dropper frees - which is what `Drop`'s own comment says. This model cannot reach any of the three
-/// either: loom delegates `wait_timeout` to `wait` and hardcodes `timed_out() == false` (`src/sync.rs`), so what it
-/// checks is the quiescent path.
+/// loom's `wait_timeout` never times out, so this checks the quiescent path and none of `Drop`'s exits that leave work
+/// outstanding.
 #[test]
 fn loom_pool_lifecycle() {
     loom::model(|| {
@@ -71,15 +64,8 @@ fn loom_pool_lifecycle() {
     });
 }
 
-/// Growth never exceeds the ceiling, and a grown pool still drains and joins cleanly. `running` is read Relaxed
-/// while `total` is read under the lock, so the saturation test can see a stale pair - that may cost a spawn
-/// opportunity, but it must never overshoot.
-///
-/// `pool(1, 1)`, deliberately: the shape is what makes the assertion bite. `submit` reads `saturated` under the
-/// same guard that just queued the job, so no worker can have picked that job up yet - with a ceiling of 2 and two
-/// submits, the second can never see `running >= total` and the model is bounded at 2 whether the ceiling is
-/// checked or not. At a ceiling of 1 the second submit does see the first job running, so deleting the `g.total <
-/// ceiling` guard grows the pool to 2 and fails here.
+/// Growth never exceeds the ceiling, and a grown pool still drains and joins cleanly. At `pool(1, 1)` a submit can find
+/// no worker parked, so deleting the `g.total < ceiling` guard grows the pool to 2 and fails here.
 #[test]
 fn loom_pool_growth_respects_the_ceiling() {
     bounded_model(|| {
@@ -107,16 +93,11 @@ fn loom_pool_growth_respects_the_ceiling() {
     });
 }
 
-/// `Drop` returns even when a worker never exits. The wait is what makes a job's effects complete before the
-/// dropper proceeds, but the dropping thread is not always one that can afford to block forever - `Drop` runs
-/// wherever the last handle falls, including on another pool's worker - so the wait is bounded and then detaches.
+/// `Drop` returns even when a worker never exits, since its wait is bounded and then detaches (see
+/// `SHUTDOWN_DETACH_AFTER`).
 ///
-/// Modelled with a worker counted in `total` that never exists, which is what a real one parked in an
-/// uninterruptible syscall looks like from here. Remove the detach and this model does not fail, it HANGS - loom
-/// reports the deadlock, which is the negative control.
-///
-/// loom's `wait_timeout` never reports a timeout, so the detach is requested through the `detach_next_drop` seam
-/// instead of a clock.
+/// Modelled with a worker counted in `total` that never exists, requested through the `detach_next_drop` seam. Remove
+/// the detach and this model HANGS, which loom reports as a deadlock.
 #[test]
 fn loom_pool_drop_detaches_a_worker_that_never_exits() {
     bounded_model(|| {
@@ -131,8 +112,7 @@ fn loom_pool_drop_detaches_a_worker_that_never_exits() {
         shared.detach_next_drop(1);
         drop(p);
 
-        // Reaching here at all is the property. The pool is still closed to new work, and the phantom worker is
-        // still counted - detaching gives up the wait, it does not falsify the books.
+        // Reaching here at all is the property. Detaching gives up the wait, so the phantom worker is still counted.
         let g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
         assert!(g.closed, "Drop returned without closing the pool");
         assert!(g.total > 0, "the model's phantom worker cannot have exited");
@@ -142,9 +122,8 @@ fn loom_pool_drop_detaches_a_worker_that_never_exits() {
 /// A flush and a worker that wakes without a claim can reach for the same parked worker. Only the claimless exit
 /// decrements `idle` itself, so if both counted the worker, `idle` would underflow here.
 ///
-/// This pins the order of the wait loop's arms, not the claimless arm itself: with the queue check ahead of the
-/// `notify` check, the race counts one worker twice. That the arm is needed is pinned by
-/// `a_timed_wait_expiry_takes_a_job_nobody_claimed`.
+/// This pins the order of the wait loop's arms, and `a_timed_wait_expiry_takes_a_job_nobody_claimed` pins the claimless
+/// arm itself.
 #[test]
 fn loom_a_claimless_take_cannot_double_count_a_claimed_worker() {
     bounded_model_with(2, || {
@@ -182,9 +161,6 @@ fn loom_a_claimless_take_cannot_double_count_a_claimed_worker() {
 /// The stall rule claims workers from the loop's thread while workers take jobs, finish and park. In every order:
 /// no claim beyond the parked workers (`claim`'s assertion), every job runs exactly once, and every `running` entry
 /// is removed by the worker that added it.
-///
-/// Three jobs on two workers, flushed as the loop does: once with the new-job count, then with zero for the stall
-/// rule.
 #[test]
 fn loom_the_stall_rule_and_the_workers_agree_on_the_books() {
     bounded_model(|| {
@@ -215,17 +191,11 @@ fn loom_the_stall_rule_and_the_workers_agree_on_the_books() {
 /// path. `Drop` is waiting for `total` to reach zero, so a retirement that took the count to zero silently would
 /// strand it forever.
 ///
-/// Two guards prevent that, and this model pins the fact that they are **individually sufficient**: `!g.closed`
-/// refuses to retire at all once `Drop` has run, and `g.total > shared.floor` refuses to retire the last worker
-/// regardless. Delete either one and the model still passes; delete both and loom reports the deadlock. Worth
-/// knowing before anyone "simplifies" the condition - the redundancy is the safety margin, not clutter.
-///
-/// loom's `wait_timeout` never reports a timeout, so the retirements are requested through the `retire_next_idle`
-/// seam instead of a clock.
+/// Two guards prevent that, and each is **sufficient alone**. `!g.closed` refuses to retire once `Drop` has run, and
+/// `g.total > shared.floor` refuses to retire the last worker. Delete both and loom reports the deadlock, so do not
+/// "simplify" the condition to one of them.
 #[test]
 fn loom_pool_idle_retire_cannot_strand_drop() {
-    // Four threads on one condvar; a tighter bound keeps this in seconds while still covering the retire-vs-close
-    // ordering.
     bounded_model_with(2, || {
         let p = pool(1, 2);
         let shared = Arc::clone(&p.shared);
@@ -266,18 +236,16 @@ fn loom_pool_self_join_is_avoided() {
         {
             let g = cell.lock().unwrap_or_else(|e| e.into_inner());
             g.as_ref().expect("just built").submit(Box::new(move || {
-                // The pool's last owner is this cell; taking it here runs `WorkerPool::drop` on a pool worker. Drop
-                // *before* marking the job done, so `ran == 1` means the pool has certainly been dropped by one
-                // side or the other.
+                // Taking the cell's pool here runs `WorkerPool::drop` on a pool worker. Drop *before* marking the job
+                // done, so `ran == 1` means the pool has certainly been dropped by one side or the other.
                 let taken = c.lock().unwrap_or_else(|e| e.into_inner()).take();
                 drop(taken);
                 n.fetch_add(1, Ordering::Relaxed);
             }));
         }
 
-        // Whoever still holds it drops it; one of the two paths is the worker's, which is the interesting one. Take
-        // it out and release the cell before dropping: `WorkerPool::drop` waits for the workers, and one of them
-        // may be blocked on this very lock.
+        // Take the pool out and release the cell before dropping, since `WorkerPool::drop` waits for the workers and
+        // one of them may be blocked on this very lock.
         let taken = cell.lock().unwrap_or_else(|e| e.into_inner()).take();
         drop(taken);
 
@@ -287,18 +255,14 @@ fn loom_pool_self_join_is_avoided() {
             loom::thread::yield_now();
         }
 
-        // The workers reclaim the shared state on their own once `closed` is set, with no join - so `total` need
-        // not be zero here, but the pool must be closed and no thread may be stuck. loom reports the self-join as a
-        // deadlock if `ON_POOL_WORKER` stops working.
+        // A self-drop skips the join, so `total` need not be zero here, but the pool must be closed.
         let g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
         assert!(g.closed, "dropping the pool did not close it");
     });
 }
 
-/// A job may instead drop the last `Arc` of a pool it is NOT a worker of. No exemption applies there: the drop
-/// joins that pool's workers like any thread would, so the full `Drop` contract holds even when teardown happens to
-/// run on some other pool's worker. Keyed on pool identity - a bare "am I a worker" flag skips this join, and the
-/// asserts below see the un-joined worker.
+/// A job may instead drop the last `Arc` of a pool it is NOT a worker of. No exemption applies there, so the drop joins
+/// that pool's workers, and a bare "am I a worker" flag would fail the asserts below.
 #[test]
 fn loom_pool_foreign_drop_still_joins() {
     bounded_model(|| {
@@ -321,8 +285,8 @@ fn loom_pool_foreign_drop_still_joins() {
 /// A loop told of an off-loop poke can read the deadline published before it. Otherwise it would sleep without a
 /// timeout while the job waits behind a busy worker.
 ///
-/// Drives `WorkerPool` directly: under loom, `SharedPool`'s `OnceCell` takes a lock that would carry the deadline
-/// itself and hide the ordering production relies on (`poke` releases, `park` acquires).
+/// Drives `WorkerPool` directly, since under loom `SharedPool`'s `OnceCell` takes a lock that would carry the deadline
+/// itself and hide the ordering under test.
 #[test]
 fn loom_a_published_deadline_reaches_the_loop_it_pokes() {
     use crate::uring::wake::Park;

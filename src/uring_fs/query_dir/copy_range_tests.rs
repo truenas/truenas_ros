@@ -12,9 +12,7 @@ fn handle(f: std::fs::File) -> File {
 ///
 /// **A request past the end must answer what moved, not what was asked for.** The caller sizes its destination from
 /// a `statx` it took earlier, so a source that has since shrunk is exactly the case where a copy that reported
-/// success on trust would publish a short object nothing re-checks. The clone ioctl this path used to try first
-/// could not express that — it either moved the whole range or refused — so the count it returned was the request,
-/// not the transfer.
+/// success on trust would publish a short object nothing re-checks.
 #[test]
 fn a_copy_reports_what_moved_not_what_was_asked_for() {
     let dir = crate::tempdir().expect("tempdir");

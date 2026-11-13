@@ -132,11 +132,9 @@ fn an_allow_opens_charge_returns_when_it_answers() {
     assert_eq!(fs.armed_timers_for_test(&(1, 1)), 0, "the answer returned the charge");
 }
 
-/// The pair charges one count for two slots, so the open's CQE cannot return the whole charge: its guard is
-/// retracted there and frees at its own later CQE, so a charge returned in full leaves that slot metered by neither
-/// bucket and the arm screen waves a fresh pair through per unreaped guard. It parks on `retiring` instead - the
-/// bucket a retracted timer uses for the same window - and the mid-swap ceiling then bounds the two classes
-/// together, which is what `a_mid_swap_owner_is_bounded_at_twice_its_cap_in_slots` pins for timers alone.
+/// The pair charges one count for two slots, so when the open answers while its guard is still retracting, the charge
+/// parks on `retiring` as a retracted timer's does, and the mid-swap ceiling bounds the two classes together. Returned
+/// in full, the guard's slot would be metered by neither bucket.
 #[test]
 fn an_answered_allow_pair_still_meters_its_parked_guard() {
     let Some((mut eng, mut fs, who)) = rig() else {
@@ -250,11 +248,9 @@ fn an_answered_allow_pair_still_meters_its_parked_guard() {
     assert!(again.is_some(), "and the owner can arm again");
 }
 
-/// The other ordering, which parks nothing and must not: the deadline trips first, so the guard's slot frees while
-/// the open still holds its `armed` charge, and there is no second half to meter. Parking one here would leave a
-/// count on `retiring` that no CQE returns - the same cap, stuck instead of loose - so the liveness test in
-/// `take_op` is what keeps the two orderings apart, and `guard.is_some()` (which stays true through both) cannot
-/// make that distinction.
+/// The other ordering, which parks nothing and must not. The deadline trips first, so the guard's slot frees while the
+/// open still holds its `armed` charge, and a count parked here would never come back. The liveness test in `take_op`
+/// tells the orderings apart, since `guard.is_some()` stays true through both.
 #[test]
 fn a_tripped_allow_deadline_leaves_no_count_parked() {
     let Some((mut eng, mut fs, who)) = rig() else {
@@ -270,14 +266,9 @@ fn a_tripped_allow_deadline_leaves_no_count_parked() {
     let owner = (3u32, 1u64);
     let free_at_start = fs.op_free_len_for_test();
 
-    // `O_WRONLY` on a FIFO with no reader parks the worker in `fifo_open`'s `wait_for_partner`; the deadline is
-    // what ends it, which is the whole reason `Allow` carries one.
-    //
-    // `O_CREAT` is load-bearing and not incidental. Without a flag in `io_openat_force_async`'s set - `O_TRUNC |
-    // O_CREAT | __O_TMPFILE` (`io_uring/openclose.c:42-50`) - the open takes the inline attempt, where `io_openat2`
-    // adds `O_NONBLOCK` itself (`:131-135`) and only retries async on `-EAGAIN` (`:155`). A FIFO answers `-ENXIO`
-    // to that, not `-EAGAIN`, so the open fails at once and no worker is ever parked: the deadline has nothing to
-    // bound and this test measures nothing.
+    // `O_WRONLY` on a FIFO with no reader parks the worker in `fifo_open`'s `wait_for_partner` until the deadline.
+    // `O_CREAT` is load-bearing, since without a flag in `io_openat_force_async`'s set (`io_uring/openclose.c:42-50`)
+    // the inline attempt adds `O_NONBLOCK` and the FIFO answers `-ENXIO` at once, parking no worker.
     let seen: Rc<StdCell<Option<bool>>> = Rc::new(StdCell::new(None));
     {
         let out = Rc::clone(&seen);
@@ -338,11 +329,9 @@ fn a_tripped_allow_deadline_leaves_no_count_parked() {
 }
 
 /// A retraction's verdict is the caller's ask, not the race. The kernel delists a timeout before posting `-ETIME`
-/// (`io_timeout_fn`, `io_uring/timeout.c:254-276`), so a cancel staged after the fire reaches nothing and the
-/// expiry stands - and `submit_cancel` is best-effort, so it may never have been staged at all. Reported as `Ok(0)`
-/// that reads as "the deadline arrived" and runs the consumer's timeout handler for work it had already finished.
-/// Driven with the `-ETIME` CQE demonstrably in hand before the retraction, so the raced ordering is the one under
-/// test rather than one the scheduler might supply.
+/// (`io_timeout_fn`, `io_uring/timeout.c:254-276`), so a cancel staged after the fire reaches nothing, and reporting
+/// `Ok(0)` would run the consumer's timeout handler for work it had already finished. Driven with the `-ETIME` CQE in
+/// hand before the retraction, so the raced ordering is the one under test.
 #[test]
 fn a_retracted_timer_that_already_expired_is_not_an_expiry() {
     let Some((mut eng, mut fs, _who)) = rig() else {

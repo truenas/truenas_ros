@@ -1,39 +1,21 @@
 //! [`query_directory`]: a **pull-based**, batched directory listing with
 //! configurable per-entry enrichment, over the blocking [`FsHandle`].
 //!
-//! There is no io_uring `getdents`/`readdir` op, so the **name feed** is a `readdir` pass over the directory fd on the
-//! caller's own thread (no worker, no channel). [`QueryDir::next`] reads the next `clump` names, then enriches them by
-//! **scattering non-blocking reactor ops** - `statx` (path-based) and `fgetxattr` on an opened entry fd - through the
-//! [`FsHandle`] `start_*` twins: all of a clump's ops are submitted before any is waited on, so they run concurrently
-//! on the ring. The directory `DIR*` is held open across `next` calls (incremental; nothing is buffered up front) and
-//! closed on `Drop`.
+//! The **name feed** is a `readdir` pass on the caller's own thread, since io_uring has no `getdents` op.
+//! [`QueryDir::next`] reads the next `clump` names, then submits every `statx` and `fgetxattr` for them through the
+//! [`FsHandle`] `start_*` twins before waiting on any, so they run concurrently on the ring. The directory is opened
+//! **under the caller's [`Personality`]**, so that open is the list-permission check. See [`Order`] for what the
+//! ordered modes cost, and [`query_tree`](super::query_tree::query_tree) to walk a subtree in path order.
 //!
-//! The directory is opened **under the caller's [`Personality`]** - that open is the DAC/list-permission check
-//! (`EACCES` if `who` cannot list), so enumeration never runs under the reactor's ambient root.
-//!
-//! Entries come in raw `readdir` order unless [`QueryOptions::order`] asks for otherwise; see [`Order`] for what the
-//! ordered modes cost, and [`query_tree`](super::query_tree::query_tree) to walk a whole subtree in path order.
-//!
-//! # A listing is not a snapshot
-//!
-//! The name feed is `readdir`, and its contract admits an entry renamed during the sweep being missed or reported
-//! twice. Sorting afterwards cannot restore what the sweep never saw, so an ordered listing is as non-atomic as an
-//! unordered one - it is merely sorted.
-//!
-//! Paging with [`QueryOptions::start_after`] widens that window rather than closing it. Each continuation is its own
-//! sweep of a directory that has moved on since the last, so an entry renamed between pages can be absent from both or
-//! present in both under two names.
-//!
-//! Measured on ZFS under rename churn: a 4,000-entry directory lost an entry in 10 of 16 listings, and a 20,000-entry
-//! one yielded between 19,998 and 20,001 distinct names across 12 rounds. Create/unlink churn and `RENAME_EXCHANGE`
-//! were exact - it is specifically a rename that *changes the name* that can move an entry across the cursor.
-//!
-//! A caller that needs a point-in-time view needs a snapshot underneath it (`.zfs/snapshot`); no listing option can
-//! supply one.
+//! **A listing is not a snapshot.** `readdir` may miss an entry renamed during the sweep or report it twice, sorting
+//! cannot restore what the sweep never saw, and each [`QueryOptions::start_after`] continuation is a fresh sweep. On
+//! ZFS it is a rename that changes the name that moves an entry across the cursor. A caller that needs a point-in-time
+//! view needs a snapshot underneath it (`.zfs/snapshot`).
 
 use super::offload_pool::{Job, SharedPool};
 use super::{Anchor, File, FsHandle, FsPending, Leaf, Personality};
 use crate::errno::{Errno, retry_on_eintr};
+use crate::sync::{Arc, mpsc};
 use crate::sync_fs::xattr::{XATTR_SIZE_MAX, XATTR_SIZE_RETRIES, flistxattr, is_short_buffer, xattr_retry_cap};
 use crate::sync_fs::{AtFlags, OFlag, OpenHow, Statx, StatxMask};
 use bitflags::bitflags;
@@ -42,9 +24,6 @@ use std::ffi::{CStr, CString, OsString};
 use std::fmt;
 use std::os::fd::{AsFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-// `Arc` and the reply channels come from `crate::sync` - std's outside `--cfg loom` - so this file compiles in the
-// pool's loom model build.
-use crate::sync::{Arc, mpsc};
 
 bitflags! {
     /// What to fetch for each directory entry. `STATX` is cheap (a path-based `statx`, no open); `XATTR`/`ACL` open the
@@ -67,13 +46,10 @@ bitflags! {
 bitflags! {
     /// Extended-attribute namespaces to enumerate for [`EnrichSpec::XATTR_LIST`].
     ///
-    /// The caller declares which namespaces it wants. Discovery runs `flistxattr` to propose candidate names, keeps
-    /// those in the selected namespaces, and reads each value under the request identity `who`; only attributes `who`
-    /// can actually read are returned (an attribute `who` lacks the privilege to read, such as `trusted.*` for a
-    /// non-privileged identity, is dropped). The kernel lists `user.`/`security.`/`system.` names to any caller and
-    /// gates `trusted.` on `CAP_SYS_ADMIN`; this crate does not re-implement that policy, it enforces the per-value
-    /// `who` check. The consumer remains responsible for understanding and filtering what is actually safe to expose to
-    /// its own callers.
+    /// Discovery runs `flistxattr` to propose names in the selected namespaces and reads each value under `who`, so
+    /// only attributes `who` can read are returned. The kernel lists `user.`, `security.` and `system.` names to any
+    /// caller and gates `trusted.` on `CAP_SYS_ADMIN`, and what is safe to expose to the consumer's own callers remains
+    /// the consumer's call.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct XattrNamespaces: u8 {
         /// The `user.` namespace (unprivileged application metadata; e.g. the `user.DosStream.*` attributes an SMB
@@ -109,28 +85,15 @@ pub struct QueryOptions {
     /// Drop entries that live on a **different filesystem** from the directory being listed - a mount point, which on
     /// ZFS means a child dataset or a `.zfs/snapshot` automount.
     ///
-    /// `readdir` honours no `RESOLVE_*` flags, so a walk has no equivalent of
-    /// [`CONFINED_RESOLVE`](crate::uring_fs::CONFINED_RESOLVE)'s `RESOLVE_NO_XDEV`: a nested mount simply appears as an
-    /// ordinary entry. Setting this restores the same rule on the listing side, so a tree that is meant to be one
-    /// filesystem lists as one filesystem.
-    ///
-    /// Requires [`EnrichSpec::STATX`] (the device number comes from `statx`);
-    /// without it the option cannot be honoured and is ignored.
-    ///
-    /// **It fails open, and one of the three ways it can is not a configuration choice.** The filter compares two
-    /// device numbers and keeps the entry whenever either is missing: with `STATX` unset (the line above), with no
-    /// device for the directory itself, and - the one a caller does not opt into - when a *per-entry* `statx` fails
-    /// while `STATX` was requested. Each entry's `statx` is a ring op, and a full op table answers a marked `EBUSY`, so
-    /// under exactly the pressure that makes a listing large a child dataset or a `.zfs/snapshot` automount can appear
-    /// as an ordinary entry in a listing whose caller asked for one filesystem. [`DirEntry`] has no equivalent of
-    /// [`DirEntry::xattrs_incomplete`] here, so a caller cannot re-check or refuse either.
-    /// [`TreeOptions`](super::query_tree::TreeOptions) surfaces this verbatim, so a subtree walk inherits it at every
-    /// level.
+    /// `readdir` honours no `RESOLVE_*` flags, so this is the listing side of
+    /// [`CONFINED_RESOLVE`](crate::uring_fs::CONFINED_RESOLVE)'s `RESOLVE_NO_XDEV`. It requires [`EnrichSpec::STATX`]
+    /// and is ignored without it. An entry this identity may not stat, or one that has gone, is dropped, and any other
+    /// `statx` failure fails the batch rather than letting the entry through. With no device for the directory itself
+    /// nothing is filtered. [`TreeOptions`](super::query_tree::TreeOptions) applies this at every level.
     pub same_device_only: bool,
     /// The `statx` mask requested for each entry when [`EnrichSpec::STATX`] is set. Defaults to
-    /// [`StatxMask::BASIC_STATS`]; widen it to ask for fields the basic set omits - notably
-    /// [`StatxMask::CHANGE_COOKIE`], which costs nothing extra here because the `statx` runs either way and gives a
-    /// caller an exact validator for anything it caches per entry (see [`Statx::change_cookie`]).
+    /// [`StatxMask::BASIC_STATS`]. Widening it to [`StatxMask::CHANGE_COOKIE`] costs nothing extra and gives an exact
+    /// validator for anything cached per entry ([`Statx::change_cookie`]).
     pub statx_mask: StatxMask,
     /// The order entries are yielded in. Defaults to [`Order::Readdir`] - see [`Order`] for what the ordered modes
     /// cost.
@@ -140,18 +103,10 @@ pub struct QueryOptions {
     /// Applied during the `readdir` pass, **before** any enrichment, so a filtered-out entry costs neither a `statx`
     /// nor an open. A batch is still filled to `clump` kept entries, so a short batch still means end-of-directory.
     pub name_prefix: Option<Vec<u8>>,
-    /// Skip entries up to and including this key, in the active [`Order`].
+    /// Skip entries up to and including this key, in the active [`Order`]. Ignored under [`Order::Readdir`].
     ///
-    /// These bytes are compared as a **literal key**, not as a bare name: to resume past the directory `a` under
-    /// [`Order::ByPathBytes`], pass `a/` -- exactly where `a/` sorts - rather than `a`, which is where a *file* named
-    /// `a` sorts.
-    ///
-    /// Ignored under [`Order::Readdir`], which has no order to be "after". Note this prunes *after* the directory has
-    /// been read and sorted - it resumes a listing, it does not make resuming cheap.
-    ///
-    /// Resuming is also not a snapshot: each continuation re-reads a directory that has moved on, so an entry renamed
-    /// between pages can be missed by both or reported by both under two names. See the module docs - this is
-    /// `readdir`'s contract, not something paging closes.
+    /// The bytes are a **literal key**, so to resume past directory `a` under [`Order::ByPathBytes`] pass `a/`, not
+    /// `a`, which is where a *file* named `a` sorts. The directory is still read and sorted in full first.
     pub start_after: Option<Vec<u8>>,
 }
 
@@ -174,10 +129,9 @@ impl Default for QueryOptions {
 
 /// The order [`QueryDir::next`] yields entries in.
 ///
-/// [`Order::Readdir`] streams: a batch costs one `readdir` of `clump` names. **Both ordered modes read the whole
-/// directory before the first batch**, so they cost one full `getdents` sweep plus an O(n log n) sort up front, and
-/// hold every name in memory for the life of the [`QueryDir`]. That is inherent - the smallest name cannot be known
-/// without seeing them all.
+/// [`Order::Readdir`] streams, a batch costing one `readdir` of `clump` names. **Both ordered modes read the whole
+/// directory before the first batch**, a full sweep and an O(n log n) sort, and hold every name for the life of the
+/// [`QueryDir`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Order {
     /// Whatever the filesystem returns. On ZFS that is hash order, not alphabetical. Cheapest, and the only streaming
@@ -189,14 +143,10 @@ pub enum Order {
     /// Byte order of the entry names **with a `/` appended to directories**, which is the order the *full paths*
     /// beneath this directory compare in.
     ///
-    /// This is the difference between sorting names and sorting keys, and it is not cosmetic. `/` is `0x2F`, so a
-    /// bare-name sort puts the directory `a` before `a-1.txt` and `a.txt`, and a depth-first walk would then emit
-    /// `a/b.txt` before both - while their full paths order `a-1.txt` < `a.txt` < `a/b.txt`. Appending the separator
-    /// that will actually follow the directory name restores agreement, so sorting each directory this way and
-    /// recursing in that order yields a subtree in global path order with no global sort.
-    ///
-    /// Directory-ness comes from the `readdir` `d_type`; entries reported as `DT_UNKNOWN` are resolved with a `statx`
-    /// before sorting, since guessing would silently reorder them.
+    /// Sorting keys, not names, since `/` is `0x2F`. A bare-name sort puts the directory `a` before `a-1.txt` and
+    /// `a.txt`, while their full paths order `a-1.txt` < `a.txt` < `a/b.txt`, and only the appended separator lets
+    /// per-directory sorting compose into a subtree in global path order. A `DT_UNKNOWN` entry is resolved with a
+    /// `statx` before sorting, since guessing would silently reorder it.
     ByPathBytes,
 }
 
@@ -217,11 +167,9 @@ pub struct DirEntry {
     pub xattrs: Vec<(CString, Option<Vec<u8>>)>,
     /// The ACL xattr value, when [`EnrichSpec::ACL`] was requested and present.
     pub acl: Option<Vec<u8>>,
-    /// Discovery could not report every attribute: the `flistxattr` itself failed (a name list past `XATTR_LIST_MAX`
-    /// yields `E2BIG`), an op slot was unavailable, or a value known to be readable could not be refetched. It
-    /// separates "this entry has no extended attributes" from "the listing could not be completed", which are otherwise
-    /// both an empty [`xattrs`](Self::xattrs). Never set for an attribute `who` simply cannot read - that is a
-    /// deliberate drop, not a failure.
+    /// Discovery could not report every attribute (a failed `flistxattr`, no op slot, or a value known to be readable
+    /// that could not be refetched), as against an entry that has none. Never set for an attribute `who` simply cannot
+    /// read, which is a deliberate drop.
     pub xattrs_incomplete: bool,
 }
 
@@ -244,10 +192,8 @@ pub struct QueryDir {
     sorted: Option<VecDeque<(OsString, u8)>>,
     /// A batch answered `Err`, so the listing is over.
     ///
-    /// **Continuing past one would be the data loss the error exists to report.** A clump's names are already off the
-    /// `readdir` stream by the time it can fail, and that stream has no rewind: calling [`next`](QueryDir::next) again
-    /// would resume at the *following* clump and hand the caller the rest of the directory with a hole in it, which
-    /// reads as a complete listing. `FsIter` carries the same flag for the same reason.
+    /// **Continuing past one would be the data loss the error exists to report.** The failed clump's names are already
+    /// off a `readdir` stream with no rewind, so the rest of the directory would read as a complete listing.
     fatal: bool,
 }
 
@@ -333,13 +279,9 @@ impl QueryDir {
     /// Give every `DT_UNKNOWN` entry a real `d_type` with a scatter-gathered `statx`, so [`Order::ByPathBytes`] never
     /// has to guess whether a name carries a trailing separator.
     ///
-    /// This is where the whole listing's directory-ness is decided ([`entry_is_dir`]), so an entry left `DT_UNKNOWN`
-    /// here is one the listing goes on to call a file, emit with a file's key, and - through [`DirEntry::is_dir`] -
-    /// never descend into. Only the answers that mean *there is nothing there to list* may be swallowed into that,
-    /// which is [`unresolved_statx_verdict`]'s split: an entry this identity cannot stat cannot be entered either, and
-    /// one that has gone is gone. Every other refusal - the marked `EBUSY` of a full op table above all, reached under
-    /// exactly the pressure that makes a listing large - fails the batch, because sorting on a guess produces a page
-    /// that reads as complete and is not.
+    /// An entry left `DT_UNKNOWN` here is emitted with a file's key and never descended into ([`entry_is_dir`]), so
+    /// only the answers [`unresolved_statx_verdict`] swallows may leave one. Every other refusal fails the batch, since
+    /// sorting on a guess produces a page that reads as complete and is not.
     fn resolve_unknown_dtypes(&self, all: &mut [(OsString, u8)]) -> crate::Result<()> {
         let mut pending: Vec<(usize, FsPending)> = Vec::new();
         for (i, (name, d)) in all.iter().enumerate() {
@@ -401,10 +343,8 @@ impl QueryDir {
         Ok(out)
     }
 
-    /// Enrich a clump of entries. For each entry, request its `statx` and open its fd, then `fgetxattr` the requested
-    /// and discovered attributes on that fd. A clump's ring ops are all submitted before any result is awaited, so they
-    /// overlap on the ring, and each runs under `who`. `XATTR_LIST` discovery lists candidate names with `flistxattr`
-    /// on the caller's own thread, then reads their values under `who` and keeps only the readable ones.
+    /// Enrich a clump of entries. Every ring op of the clump is submitted before any result is awaited, and each runs
+    /// under `who`.
     fn enrich(&self, names: Vec<(OsString, u8)>) -> crate::Result<Vec<DirEntry>> {
         let who = self.who;
         let spec = self.opts.spec;
@@ -414,14 +354,10 @@ impl QueryDir {
         let confined = self.opts.same_device_only;
         let mut refused: Option<Errno> = None;
 
-        // A descriptor is opened whenever anything below needs one. Where it is, the entry's metadata is taken from
-        // that descriptor rather than from a second resolution of the same name: two independent by-name lookups can
-        // land on two different inodes under rename churn, and pairing them reports one file's size, mtime and change
-        // cookie against another file's name. The fd-keyed `statx` is issued in the read phase below, where it overlaps
-        // the xattr reads, so this costs no op that the by-name form did not already cost.
+        // Where a descriptor is opened, the entry's metadata comes from it, since two by-name lookups can land on two
+        // inodes under rename churn and pair one file's size and change cookie with another's name.
         let wants_fd = spec.intersects(EnrichSpec::XATTR | EnrichSpec::ACL | EnrichSpec::XATTR_LIST);
 
-        // Request statx and an fd for each entry, opened as `who`.
         let requested: Vec<Requested> = names
             .into_iter()
             .map(|(name, dtype)| {
@@ -449,13 +385,8 @@ impl QueryDir {
             })
             .collect();
 
-        // Collect each entry's opened fd and, where one was issued, its by-name statx, dropping anything that crossed a
-        // mount point when the caller asked for one filesystem.
-        //
-        // That drop needs metadata, so it runs here only for the entries that have some - the no-descriptor case - and
-        // is deferred to the assembly below for the rest. The trade is deliberate: a crossed entry pays for xattr reads
-        // it did not need, and every ordinary entry is spared a second `statx`. Crossing is the rare case; being listed
-        // is not.
+        // Drop what crossed a mount point. Only entries with by-name metadata can be judged here and the rest wait for
+        // the assembly, so a crossed entry may pay for xattr reads rather than every entry paying a second `statx`.
         let cross_dev = |st: Option<&Statx>| match (self.dir_dev, st) {
             (Some(dev), Some(st)) => st.dev() != dev,
             // No device for the directory, or no statx for the entry: nothing to compare, so nothing is dropped.
@@ -485,7 +416,6 @@ impl QueryDir {
             })
             .collect();
 
-        // For each opened fd, read the explicit names and ACL, and read each discovered name into the initial buffer.
         let reading: Vec<Reading> = opened
             .into_iter()
             .map(|p| {
@@ -497,9 +427,8 @@ impl QueryDir {
                 match &p.file {
                     Some(f) => {
                         if spec.contains(EnrichSpec::STATX) {
-                            // This entry's own descriptor, so no name is resolved and the metadata cannot describe a
-                            // different inode. Issued here rather than with the open so it pipelines with the xattr
-                            // reads below instead of costing a round trip.
+                            // This entry's own descriptor, so the metadata cannot describe a different inode. Issued
+                            // here so it pipelines with the xattr reads below.
                             statx_pending = self.h.start_fstatx(who, f, AtFlags::empty(), self.opts.statx_mask).ok();
                         }
                         if spec.contains(EnrichSpec::XATTR) {
@@ -542,10 +471,9 @@ impl QueryDir {
                     }
                     None => {}
                 }
-                // No descriptor where one was wanted: every value this entry was asked for is unread, and none of the
-                // reads above ran to say so. The open is a ring op, so a full op table answers a marked `EBUSY` here -
-                // and an entry that could not be opened is not an entry with no extended attributes, which is the
-                // distinction [`DirEntry::xattrs_incomplete`] exists to carry.
+                // No descriptor where one was wanted, so every value asked for is unread, and a full op table answers
+                // the open with a marked `EBUSY`. That is not "no extended attributes"
+                // ([`DirEntry::xattrs_incomplete`]).
                 incomplete |= wants_fd
                     && p.file.is_none()
                     && open_failure_is_incompleteness(p.open_err)
@@ -574,10 +502,8 @@ impl QueryDir {
             })
             .collect();
 
-        // Assemble each entry. Explicit xattrs keep their slot, with a `None` value when absent; any value larger than
-        // the initial buffer, explicit or discovered, is refetched at its true size under `who`, and a discovered
-        // attribute `who` cannot read is dropped. The fd is held until any refetch finishes, then dropped (each
-        // in-flight op keeps its own reference).
+        // Assemble each entry. A value larger than its probe buffer is refetched at its true size under `who`, and the
+        // fd is held until any refetch finishes.
         let entries: Vec<DirEntry> = reading
             .into_iter()
             .filter_map(|p| {
@@ -586,11 +512,9 @@ impl QueryDir {
                 let (fd_statx, fd_err) = split_statx(p.statx_pending);
                 let statx = fd_statx.or(p.statx);
                 let statx_err = fd_err.or(p.statx_err);
-                // **The one place an entry's device is judged**, because it is the only one that has seen every attempt
-                // to get it: the by-name `statx`, the descriptor's own, and the by-name retry when no descriptor
-                // opened. Judging at the collection phase instead reads "no metadata yet" as a failure for every entry
-                // whose device was always going to come from a descriptor - which is every entry, whenever the caller
-                // asked for xattrs, an ACL or a name list.
+                // **The one place an entry's device is judged**, since only here has every attempt to get it been seen.
+                // Judging earlier reads "no metadata yet" as a failure for every entry whose device comes from a
+                // descriptor.
                 if confined && spec.contains(EnrichSpec::STATX) {
                     if statx.is_none() {
                         if let Some(e) = unresolved_statx_verdict(statx_err) {
@@ -606,10 +530,9 @@ impl QueryDir {
                 // Declared before the reads that report into it: every value this entry was asked for now says whether
                 // it was lost, and the ACL is one of them.
                 let mut incomplete = p.incomplete;
-                // Whether a descriptor was opened at all. A missing pending means "no op slot was free" only when there
-                // *was* a descriptor to read through; with none, the verdict was already taken above
-                // (`open_failure_is_incompleteness`), and re-taking it here reports every symlink and every socket -
-                // neither of which this open can ever resolve - as a listing that could not be completed.
+                // A missing pending means "no op slot was free" only where a descriptor existed. Without one the
+                // verdict was taken above (`open_failure_is_incompleteness`), and taking it again would flag every
+                // symlink and socket.
                 let had_fd = p.file.is_some();
                 let mut xattrs: Vec<(CString, Option<Vec<u8>>)> = p
                     .xattrs
@@ -640,15 +563,9 @@ impl QueryDir {
                         (xn, val)
                     })
                     .collect();
-                // The ACL reads like every other value, which it did not before: `pending_bytes` mapped *every* error
-                // to `None`, so a marked `EBUSY` from a full op table, a torn-down loop and a value past the probe were
-                // all reported as the attribute being **absent**, with nothing flagged. A trivial ACL and an unread one
-                // are not the same answer to a permissions layer mirroring ACLs out of a listing.
-                //
-                // The growth arm is reachable only for an `acl_name` pointing at something larger than the 64 KiB
-                // probe. It cannot be `system.nfs4_acl_xdr` on ZFS: `zpl_xattr.c` refuses `naces > NFS41ACL_MAX_ACES`
-                // (1024) at set time and `ACES_TO_XDRSIZE` is `8 + n*20`, so the largest storable value is 20488 bytes.
-                // It is here because the slot takes a caller-supplied name, not because that one overflows.
+                // The ACL reads like every other value, since mapping every error to `None` would report a full op
+                // table as an absent ACL. The growth arm serves a caller-supplied `acl_name`, since ZFS caps
+                // `system.nfs4_acl_xdr` at 20488 bytes (`zpl_xattr.c`).
                 let acl = match p.acl.map(pending_discovered) {
                     Some(DiscRead::Got(v)) => Some(v),
                     Some(DiscRead::Grow) => {
@@ -666,10 +583,8 @@ impl QueryDir {
                     // Absent - on an `acltype=nfsv4` dataset the ordinary case, since ZFS keeps no
                     // `system.nfs4_acl_xdr` for a trivial ACL - or one this identity may not read.
                     Some(DiscRead::Drop) => None,
-                    // No pending where one was asked for and a descriptor existed to ask through: the ACL read could
-                    // not be *submitted* (a full op table), which is the same unread value `DiscRead::Lost` reports for
-                    // one that was. Without the two conditions this arm also covers "no ACL requested" and "no
-                    // descriptor", neither of which is an incompleteness.
+                    // Not submitted (a full op table) where an ACL was asked for and a descriptor existed, which is the
+                    // same unread value `DiscRead::Lost` reports.
                     None => {
                         incomplete |= had_fd && spec.contains(EnrichSpec::ACL);
                         None
@@ -784,17 +699,10 @@ fn split_statx(p: Option<FsPending>) -> (Option<Statx>, Option<Errno>) {
 
 /// One entry's directory-ness, which is one answer and not two.
 ///
-/// Under [`Order::ByPathBytes`] it is the answer the **sort** committed to, which is the `d_type`
-/// [`QueryDir::resolve_unknown_dtypes`] settled before the comparator ran - not the enrichment `statx`, which is a
-/// later and separate observation of the same name. The two can disagree (the entry was replaced between them), and
-/// taking the later one emits the entry at a position its own key does not sort to: [`DirEntry::is_dir`] is what a
-/// caller appends the trailing separator from, so the next page resumes at a key that steps over siblings this page
-/// never emitted. Losing entries out of a listing that reads as complete is the failure `query_tree::is_subtree_skip`
-/// exists to prevent, and it is where a contradiction surfaces instead: a descent into something that is no longer a
-/// directory answers `ENOTDIR`, which that predicate deliberately does not swallow.
-///
-/// The unordered modes synthesize no key, so nothing there is committed to and the metadata is simply the better
-/// answer.
+/// Under [`Order::ByPathBytes`] it is the `d_type` the **sort** committed to, not the later enrichment `statx`, since
+/// [`DirEntry::is_dir`] is what a caller builds its resume key from, and an entry reported against its sort key makes
+/// the next page step over siblings never emitted. A directory replaced in between surfaces as `ENOTDIR` on descent,
+/// which `query_tree::is_subtree_skip` does not swallow. The unordered modes synthesize no key, so the metadata wins.
 fn entry_is_dir(order: Order, dtype: u8, statx_says_dir: Option<bool>) -> bool {
     match order {
         Order::ByPathBytes => dtype == libc::DT_DIR,
@@ -805,24 +713,13 @@ fn entry_is_dir(order: Order, dtype: u8, statx_says_dir: Option<bool>) -> bool {
 /// What a listing does with an entry whose `statx` did not answer: swallow this one, or fail the batch. `None` is
 /// "nothing there to list".
 ///
-/// Two callers ask it. [`QueryDir::resolve_unknown_dtypes`] asks before the
-/// sort, where an unanswered `statx` decides an entry is not a directory;
-/// the confined filter below asks after it.
-///
-/// **`same_device_only` is a confinement, and the filter behind it keeps an entry whose device is unknown.** It exists
-/// to drop what lives on another filesystem - on ZFS a child dataset or a `.zfs/snapshot` automount - so a listing that
-/// silently includes one it could not check is exactly what the caller asked not to get. With the option set, an
-/// unresolved `statx` is therefore answered for.
-///
-/// The split is `query_tree`'s `is_subtree_skip`, deliberately: skip only what has nothing left to list, surface
-/// everything else, because a partial listing that reads as complete is data loss for whatever is built on it.
+/// [`QueryDir::resolve_unknown_dtypes`] asks it before the sort, and the `same_device_only` filter after it. The split
+/// is `query_tree`'s `is_subtree_skip`, since a partial listing that reads as complete is data loss.
 ///
 /// * `EACCES`/`EPERM` - this identity may not see it, which is the per-identity behaviour the rest of this module
 ///   already has (an xattr `who` cannot read is dropped, not reported).
 /// * `ENOENT` - the entry went away between `readdir` and the `statx`. A walk over a live tree hits this routinely.
-/// * Anything else - the marked `EBUSY` of a full op table above all, which is reached under exactly the pressure that
-///   makes a listing large - is the filter failing, and the caller is told. `EBUSY` there is the documented retryable
-///   refusal.
+/// * Anything else, the marked `EBUSY` of a full op table above all, is the listing failing, and the caller is told.
 /// * No errno at all: nothing was issued where something should have been. Not "nothing to list", so it surfaces too.
 fn unresolved_statx_verdict(err: Option<Errno>) -> Option<Errno> {
     match err {
@@ -849,23 +746,11 @@ fn pending_file(p: FsPending) -> (Option<File>, Option<Errno>) {
 
 /// Whether this request asked for anything an entry of this `d_type` could actually hold.
 ///
-/// [`open_failure_is_incompleteness`] answers whether the errno left the values *unread*; it cannot answer whether
-/// there were any. A socket answers `ENXIO` to the listing's `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` open on every call, so a
-/// flag raised from the errno alone is permanent and a consumer that re-queries on it re-queries for ever - the very
-/// shape the `ELOOP` carve-out exists to prevent, moved from symlinks onto sockets. What separates a lost value from an
-/// absent one is whether the type could hold what the request named:
-///
-/// - `user.*` lives only on regular files and directories (`xattr_permission`, `fs/xattr.c`: `!S_ISREG && !S_ISDIR`
-///   answers `-ENODATA` to a read, `-EPERM` to a write), so a socket asked only for `user.*` names lost nothing and
-///   "absent" is the true answer.
-/// - an access ACL is refused on a symlink outright (`vfs_get_acl`, `fs/posix_acl.c`) and held by every other type - a
-///   socket's reads back at its full length - so a socket asked for one *does* have a value this listing did not read.
-/// - `trusted.*` and `security.*` carry no type rule at all (`xattr_permission` returns 0 for `security.*`/`system.*`
-///   and gates `trusted.*` on `CAP_SYS_ADMIN` alone), so any type could hold them.
-///
-/// This only ever *narrows* the flag: it is `&&`-ed with the errno verdict, so the settled reading of
-/// `EACCES`/`EPERM`/`ENOENT`/`ELOOP` still stands and a symlink is still never flagged. `DT_UNKNOWN` answers `true` -
-/// with no type there is nothing to rule out, and over-reporting is the safe direction.
+/// [`open_failure_is_incompleteness`] says whether the values were left *unread*, not whether there were any, and a
+/// socket answers `ENXIO` to the listing's open every time, so a flag raised from the errno alone would be permanent.
+/// `user.*` lives only on regular files and directories (`xattr_permission`, `fs/xattr.c`), an access ACL on everything
+/// but a symlink (`vfs_get_acl`, `fs/posix_acl.c`), and `trusted.*` and `security.*` on any type. This only ever
+/// *narrows* the flag, and `DT_UNKNOWN` answers `true`, since over-reporting is the safe direction.
 fn asked_for_what_this_type_can_hold(spec: EnrichSpec, opts: &QueryOptions, dtype: u8) -> bool {
     // Regular files and directories hold every namespace, so nothing a request can name is ruled out for them.
     if matches!(dtype, libc::DT_REG | libc::DT_DIR | libc::DT_UNKNOWN) {
@@ -889,27 +774,11 @@ fn asked_for_what_this_type_can_hold(spec: EnrichSpec, opts: &QueryOptions, dtyp
 /// Whether a failed entry `open` leaves this entry's values genuinely *unread* - which is what
 /// [`DirEntry::xattrs_incomplete`] reports - rather than definitely answered.
 ///
-/// The same split `pending_discovered` makes for a value read, applied to the open that precedes it: an object this
-/// identity may not open (`EACCES`/`EPERM` - the same drop [`DirEntry::xattrs_incomplete`] promises never to flag) and
-/// one that went away between `readdir` and the open (`ENOENT`, so there are no values) are definite answers, not
-/// incompletenesses.
-///
-/// **`ELOOP` joins them only because a symlink cannot hold the values.** The open is `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`,
-/// so every symbolic link answers `ELOOP` on every listing, and flagging one would make the flag permanent for a
-/// directory containing nothing unusual. That is affordable only because the kernel refuses an access ACL on a symlink
-/// outright (`vfs_get_acl`, `fs/posix_acl.c`: `if (S_ISLNK(inode->i_mode)) return ERR_PTR(-EOPNOTSUPP)`) and refuses
-/// `user.*` on anything but a regular file or directory (`xattr(7)`), so "absent" is the true answer there.
-///
-/// **`ENXIO` is not in that position and must not sit beside it.** It is what a unix socket answers, and a socket -
-/// like a FIFO or a device node - carries extended attributes and POSIX ACLs exactly as a regular file does. The errno
-/// says the object cannot be opened, nothing at all about its values, so an entry that answers it has values the
-/// listing was asked for and did not read. Classed definite, `DirEntry::acl` reports `None` (its rustdoc: "requested
-/// and **present**") and every requested `xattr_names` slot reports `None`, with nothing flagged - which is the
-/// trivial-versus-unread confusion the ACL arm in `next_batch` exists to refuse. `ENOTDIR` cannot arise here (a
-/// single-component open with no `O_DIRECTORY`) and says nothing about values either.
-///
-/// Everything else - the marked `EBUSY` of a full op table above all, and `None`, meaning no op slot was free to issue
-/// the open with - is the read failing, and is reported.
+/// `EACCES`/`EPERM` (a deliberate drop) and `ENOENT` (no values) are definite answers. **`ELOOP` joins them only
+/// because a symlink cannot hold the values**, since the `O_NOFOLLOW` open answers it for every symlink and the kernel
+/// refuses an access ACL and `user.*` on one. **`ENXIO` must not sit beside it.** A socket answers it, and a socket
+/// carries xattrs and POSIX ACLs like a regular file, so classed definite it would report a real ACL as absent.
+/// Everything else, the marked `EBUSY` of a full op table and a missing op slot included, is reported.
 fn open_failure_is_incompleteness(err: Option<Errno>) -> bool {
     !matches!(err, Some(Errno::EACCES | Errno::EPERM | Errno::ENOENT | Errno::ELOOP))
 }
@@ -934,12 +803,8 @@ fn namespace_of(name: &[u8]) -> Option<XattrNamespaces> {
 }
 
 /// `flistxattr` the entry, keep names in the requested namespaces, drop any already fetched (the `explicit` names and
-/// `fetched_acl`), and return them sorted (stable output) along with whether the listing itself succeeded. Runs on the
-/// caller's own thread (the same thread that reads the directory), at that thread's privilege: it only proposes
-/// candidates, the per-value `who` read is the authoritative gate.
-///
-/// A failed `flistxattr` returns no names and `false`, so the caller can tell it apart from an entry that genuinely has
-/// none.
+/// `fetched_acl`), and return them sorted along with whether the listing itself succeeded. It runs at the calling
+/// thread's privilege and only proposes candidates, since the per-value `who` read is the gate.
 fn discover_names(
     f: &File,
     want: XattrNamespaces,
@@ -978,16 +843,8 @@ enum DiscRead {
 }
 
 /// Narrow an owned buffer to the `n` bytes the kernel filled, keeping the allocation. For [`refetch_grow`] only, whose
-/// buffer was sized from the value's probed size ([`xattr_retry_cap`]: exact on the first fetch, 1.5x on a growth
-/// retry) - there the allocation IS the value's size, so truncating hands back what went to the kernel with nothing
-/// retained and nothing copied.
-///
-/// Do not reach for this from a fixed-probe read ([`DISCOVER_BUF`], the ACL buffer): `truncate` never shrinks capacity,
-/// so a small value would carry the whole probe buffer for as long as the caller holds it - that is what [`right_size`]
-/// is for.
-///
-/// `None` if `n` is past what the buffer holds - `truncate` alone is silently a no-op there, and a count the buffer
-/// cannot account for is not a value.
+/// buffer was sized from the value's probed size, and a fixed-probe read wants [`right_size`], since `truncate` never
+/// shrinks capacity. `None` if `n` is past what the buffer holds, where `truncate` alone would silently do nothing.
 fn narrow(mut buf: Vec<u8>, n: usize) -> Option<Vec<u8>> {
     if n > buf.len() {
         return None;
@@ -999,13 +856,9 @@ fn narrow(mut buf: Vec<u8>, n: usize) -> Option<Vec<u8>> {
 /// Narrow a fixed-size probe buffer to the `n` bytes the kernel filled, giving surplus capacity back when the value is
 /// small.
 ///
-/// The probe buffers are sized for the values they might hold (4 KiB discovery, 64 KiB ACL), not the values they do: a
-/// typical ACL is tens of bytes, and these `Vec`s land in [`DirEntry`] fields the caller holds for as long as it holds
-/// the listing - measured at 315x the value bytes for xattrs and 5041x for ACLs on a real dataset. Shrinking costs one
-/// value-sized `memcpy`; it is skipped when the value fills more than half the buffer, so the copy is only ever paid to
-/// reclaim at least its own size again.
-///
-/// Bounds exactly as [`narrow`]: a count past the buffer is refused.
+/// The probe buffers (4 KiB discovery, 64 KiB ACL) land in [`DirEntry`] fields the caller holds, and a typical ACL is
+/// tens of bytes. The shrink's copy is skipped when the value fills more than half the buffer. Bounds as [`narrow`]
+/// does.
 fn right_size(mut buf: Vec<u8>, n: usize) -> Option<Vec<u8>> {
     if n > buf.len() {
         return None;
@@ -1032,27 +885,13 @@ fn pending_discovered(p: FsPending) -> DiscRead {
             Some(v) => DiscRead::Got(v),
             None => DiscRead::Lost,
         },
-        // Both spellings of "your buffer was too small" ([`is_short_buffer`]), so the classification does not depend on
-        // how large the probe buffer that reached it happens to be - and both DO arrive here today. `do_getxattr`
-        // rewrites the filesystem's `-ERANGE` to `-E2BIG` when the caller's buffer is **at or above** `XATTR_SIZE_MAX`
-        // (65536), and the ACL probe below is exactly 65536, so an ACL larger than it answers `E2BIG` while the
-        // 4096-byte value probes answer `ERANGE`. Measured on ZFS against a 204800-byte value: buffer 4096 and 65535 ->
-        // `ERANGE`, 65536 and 65537 -> `E2BIG`, 204800 -> `Ok(204800)`. Keeping the pair together is what stops either
-        // probe buffer from silently turning growth into a drop.
+        // Both spellings of "your buffer was too small" ([`is_short_buffer`]), since `do_getxattr` rewrites `-ERANGE`
+        // to `-E2BIG` when the caller's buffer is at or above `XATTR_SIZE_MAX`, which the 64 KiB ACL probe is.
         Err(e) if is_short_buffer(e) => DiscRead::Grow,
-        // A definite answer of "no value here", which is never an incompleteness: the attribute is not set (`ENODATA`),
-        // this identity may not read it (`EACCES`/`EPERM` - `unresolved_statx_verdict`'s split, minus `ENOENT`, which
-        // names a path where these take a descriptor), or the filesystem does not implement that attribute at all.
-        //
-        // **`EOPNOTSUPP` belongs here and it is the easy one to miss.** It is what an `acltype=posixacl` dataset
-        // answers for `system.nfs4_acl_xdr` (`zpl_xattr_acl_get_access` and its NFSv4 twin,
-        // `module/os/linux/zfs/zpl_xattr.c`), and [`QueryOptions::acl_name`] is a name the *caller* supplies - so a
-        // permissions layer that asks for the NFSv4 ACL while listing a POSIX dataset gets that errno for every single
-        // entry. Classed as a failed read it would flag [`DirEntry::xattrs_incomplete`] on a listing that is complete,
-        // on every entry, for a filesystem doing exactly what it says.
-        //
-        // Everything else is the read failing - the marked `EBUSY` of a full op table above all, reached under exactly
-        // the pressure that makes a listing large - and is reported.
+        // A definite "no value here" (not set, not readable by this identity, or not implemented), never an
+        // incompleteness. **`EOPNOTSUPP` is the easy one to miss.** An `acltype=posixacl` dataset answers it for
+        // `system.nfs4_acl_xdr` (`module/os/linux/zfs/zpl_xattr.c`), and classed as a failed read it would flag every
+        // entry of a complete listing.
         Err(Errno::ENODATA | Errno::EACCES | Errno::EPERM | Errno::EOPNOTSUPP) => DiscRead::Drop,
         Err(_) => DiscRead::Lost,
     }
@@ -1125,7 +964,7 @@ pub(crate) fn scan_xattrs(
             Some(DiscRead::Got(v)) => Some(v),
             Some(DiscRead::Grow) => refetch_grow(h, who, f, &n),
             // This signature has nowhere to carry "and one was lost" the way [`DirEntry::xattrs_incomplete`] does, so a
-            // refused read is still dropped here. Widening it is a separate change.
+            // refused read is dropped here.
             Some(DiscRead::Drop | DiscRead::Lost) | None => None,
         };
         if let Some(v) = val {
@@ -1220,11 +1059,8 @@ pub fn query_directory(h: &FsHandle, who: Personality, dir: &Anchor, opts: Query
 
 /// An [`FsHandle`] bound to the reactor's shared blocking-work pool for the off-loop directory-listing
 /// ([`query`](QueryPool::query)) and byte-range copy ([`copy_file_range`](QueryPool::copy_file_range)) helpers. Each
-/// method enqueues a job and returns immediately with a handle; the pool is elastic (sized at reactor construction), so
-/// one caller thread can fan out many jobs and then collect them.
-///
-/// A walk opens its directory under its own `who` (the list-permission check), so `EACCES` surfaces as an error batch
-/// rather than a listing taken under the reactor's ambient credentials.
+/// method enqueues a job and returns a handle at once, so one caller thread can fan out many jobs and then collect
+/// them. A walk opens its directory under its own `who`, so `EACCES` surfaces as an error batch.
 pub struct QueryPool {
     pool: Arc<SharedPool>,
     h: FsHandle,
@@ -1272,12 +1108,8 @@ impl QueryPool {
     /// Copy `len` bytes from `src[off_src..]` to `dst[off_dst..]`, **always on the pool**; `src`/`dst` clone into the
     /// job (`File` is `Send`) so their fds stay open. [`CopyHandle::wait`] yields the bytes copied.
     ///
-    /// **Nothing runs on the caller's thread**, including the clone. On ZFS a block clone moves no data, which once
-    /// argued for doing it inline, but it still takes filesystem locks and - with `zfs_bclone_wait_dirty`, which this
-    /// fork defaults on - waits a transaction group for a source that was just written. That is precisely the caller
-    /// who clones what it has only now finished writing, so the wait is the expected path and not a corner: seconds of
-    /// it, on the reactor, per copy. The whole range goes in one job and the job re-issues on a short return, so the
-    /// cost of a large copy is one worker, not one worker per chunk.
+    /// **Nothing runs on the caller's thread**, including the clone, since a ZFS block clone takes filesystem locks and
+    /// can wait a transaction group for a source that was just written (`zfs_bclone_wait_dirty`).
     pub fn copy_file_range(&self, src: &File, dst: &File, off_src: u64, off_dst: u64, len: u64) -> CopyHandle {
         // Nothing to move, and nothing to wait for.
         if len == 0 {
@@ -1355,10 +1187,9 @@ impl CopyHandle {
 
 /// Largest single kernel transfer, page-aligned.
 ///
-/// A ceiling the kernel imposes on one `copy_file_range(2)`, not a chunk size this crate chose: the whole remaining
-/// range is offered on every call, and the loop below exists to re-issue what a short return left behind. Splitting a
-/// copy smaller than this costs the clone outright on ZFS, which can only take the whole-file lock a clone needs while
-/// the destination is still empty - that is, on the first write.
+/// A ceiling the kernel imposes on one `copy_file_range(2)`, not a chunk size, so the whole remaining range is offered
+/// on every call. Splitting a copy smaller costs the clone on ZFS, which can take the whole-file lock a clone needs
+/// only while the destination is still empty.
 const MAX_CHUNK: usize = 0x7FFF_FFFF & !0xFFF;
 
 /// Copy `len` bytes from `src[off_src..]` to `dst[off_dst..]`, letting the kernel clone them where it can. Returns
@@ -1369,13 +1200,10 @@ const MAX_CHUNK: usize = 0x7FFF_FFFF & !0xFFF;
 /// wait on dirty data, so there is no fast path that may run on the loop.
 ///
 /// **The clone is the kernel's, not an ioctl's.** On ZFS `copy_file_range(2)` already tries a clone and falls back to a
-/// byte copy itself, so an explicit `FICLONERANGE` buys nothing and costs: the ioctl refuses a range it can only partly
-/// clone rather than returning it short, and it refuses only after waiting a transaction group for the source to sync.
-/// Trying it first pays that wait, throws the answer away, and pays it again in the fallback.
+/// byte copy, while `FICLONERANGE` refuses a range it can only partly clone, after waiting a transaction group for the
+/// source.
 ///
-/// Needs no [`Personality`]: both endpoints are already-open [`File`]s, and the kernel authorizes the copy from *their*
-/// open modes - which were established under the identity that opened them - rather than from the calling thread's
-/// credentials.
+/// Needs no [`Personality`], since the kernel authorizes the copy from the open modes of the two [`File`]s.
 pub(crate) fn copy_range(src: &File, dst: &File, off_src: u64, off_dst: u64, len: u64) -> crate::Result<u64> {
     copy_file_range_blocking(src.as_raw_fd(), dst.as_raw_fd(), off_src, off_dst, len)
 }

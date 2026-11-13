@@ -32,11 +32,9 @@ fn a_timer_fires_after_its_duration() {
 
 /// A deadline reached early gives its op slot back, instead of holding it for the wall-clock time it was armed for.
 ///
-/// Every other op on this facade holds a slot until an I/O completes, and the table is sized on that. A timer holds
-/// one for its whole duration, so a handler arming a 30 s deadline and finishing in milliseconds spends the rest of
-/// it out of the handler budget - which is what makes the retraction load-bearing rather than a convenience. The
-/// kernel's half is `io_try_cancel` falling through to `io_timeout_cancel` (`io_uring/cancel.c`), which
-/// `submit_cancel` reaches because it leaves `IORING_ASYNC_CANCEL_FD` clear.
+/// A timer holds a slot for its whole duration, out of the handler budget, which makes the retraction load-bearing. The
+/// kernel's half is `io_try_cancel` falling through to `io_timeout_cancel` (`io_uring/cancel.c`), since `submit_cancel`
+/// leaves `IORING_ASYNC_CANCEL_FD` clear.
 #[test]
 fn a_cancelled_timer_gives_its_slot_back_before_it_expires() {
     let Some(mut eng) = engine_or_skip() else {
@@ -145,11 +143,8 @@ fn a_foreign_reactors_timer_token_retracts_nothing() {
 
 /// One connection's timers are bounded at the host's cap, and a completion returns the headroom.
 ///
-/// The cap is per owner, so the tenant beside a timer-hungry connection still arms - the two-sided starvation this
-/// exists to prevent had a full table refusing a *different* connection's first submission. The N+1th arm answers
-/// `EBUSY` with the refusal mark, exactly like a full table: the caller holds a deadline already, and its
-/// completion is when arming again makes sense - which the retraction half below proves by reclaiming the headroom
-/// early.
+/// The cap is per owner, so the tenant beside a timer-hungry connection still arms. The N+1th arm answers `EBUSY` with
+/// the refusal mark, exactly like a full table.
 #[test]
 fn a_connections_timers_are_capped_and_a_completion_frees_one() {
     let Some((mut eng, mut fs, _who)) = rig() else {
@@ -236,11 +231,10 @@ fn a_connections_timers_are_capped_and_a_completion_frees_one() {
     );
 }
 
-/// The retraction's early headroom is a cap trade, not a cap escape: each swap frees a *count* while its slot rides
-/// to a CQE no delivery inside the same dispatch will reap, so the arm screen also refuses at `armed + retiring`
-/// reaching twice the cap - the documented mid-swap slot ceiling. Asserted on the *slots*, because the shipped
-/// tests asserted the count alone and a retract-rearm loop at cap 1 walked a 64-slot table to zero free with the
-/// count never leaving zero.
+/// The retraction's early headroom is a cap trade, not a cap escape. Each swap frees a *count* while its slot rides to
+/// a CQE no delivery inside the same dispatch will reap, so the arm screen also refuses at `armed + retiring` reaching
+/// twice the cap, the documented mid-swap slot ceiling. Asserted on the *slots*, since a retract-rearm loop at cap 1
+/// can walk a table to zero free with the count never leaving zero.
 #[test]
 fn a_mid_swap_owner_is_bounded_at_twice_its_cap_in_slots() {
     let Some((mut eng, mut fs, _who)) = rig() else {
@@ -292,9 +286,8 @@ fn a_mid_swap_owner_is_bounded_at_twice_its_cap_in_slots() {
 }
 
 /// A host refusal delivers the plain callback with its verdict at the wake drain: the marked `EBUSY` a full budget
-/// answers, with `None` still returned synchronously as "no timer to retract". The synchronous `None` is not the
-/// report - a plain-callback caller has no channel but the callback, and a dropped continuation is a closed
-/// connection for a request handler.
+/// answers, with `None` returned synchronously as "no timer to retract", since a dropped continuation would close the
+/// connection.
 #[test]
 fn a_host_refusal_delivers_a_plain_callback_with_its_verdict() {
     let Some((mut eng, mut fs, _who)) = rig() else {
@@ -411,10 +404,8 @@ fn a_refusal_requeued_mid_drain_delivers_on_the_next_pass() {
 }
 
 /// The drain's trailing re-poke is load-bearing for exactly one shape: a callback that re-arms while a *sibling*
-/// refusal is still queued. The push's own poke is elided then (the queue was not empty), and the pass's wake is
-/// already consumed, so without the re-poke the requeued refusal strands until some unrelated wake happens by.
-/// Driven through the wake alone - no direct drain calls - so eliding the re-poke fails this test instead of
-/// passing it.
+/// refusal is still queued, since the push's own poke is elided then and the pass's wake is already consumed. Driven
+/// through the wake alone, so eliding the re-poke fails this test.
 #[test]
 fn a_requeued_refusal_is_not_stranded_behind_its_siblings() {
     let Some((mut eng, mut fs, _who)) = rig() else {
@@ -462,11 +453,7 @@ fn a_requeued_refusal_is_not_stranded_behind_its_siblings() {
     assert_eq!(*log.borrow(), vec!["a", "b", "a2"]);
 }
 
-/// The `Refused` state's whole transition table, on the slot alone: a parked refusal is settled only by the
-/// callback route - a real answer supersedes it, the callback dropping unfired adopts it, a second refusal cannot
-/// replace it, and a refusal reaching a slot whose callback already dropped resolves at once. Pure `Rc`/`RefCell`
-/// state with no ring behind it, so this one also genuinely executes under Miri, which is the instrument for the
-/// aliasing on the waker and `RefCell` paths here.
+/// The `Refused` state's whole transition table, on the slot alone, with no ring behind it, so it also runs under Miri.
 #[test]
 fn a_parked_refusal_is_settled_only_by_the_callback_route() {
     let waker = Waker::noop();
@@ -534,10 +521,8 @@ fn a_double_retraction_returns_the_headroom_once() {
     conn.cancel_timeout(t2);
 }
 
-/// A connection the sweep has passed may not park time on the table. Its I/O is still welcome - finishing accepted
-/// work is the sweep's own contract - but a timer holds a slot for wall-clock duration, and a re-arming tick for a
-/// dead owner strands one per arm with the only `Timer` holder the dead handler itself. The answer is the sweep's
-/// own verdict, so the continuation winds down the same way in either ordering.
+/// A connection the sweep has passed may not park time on the table, since a re-arming tick for a dead owner strands a
+/// slot per arm. The answer is the sweep's own verdict, so the continuation winds down the same way in either ordering.
 #[test]
 fn a_swept_owner_cannot_arm_a_timer() {
     let Some((mut eng, mut fs, _who)) = rig() else {

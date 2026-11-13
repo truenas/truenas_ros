@@ -1,46 +1,19 @@
 //! [`query_tree`]: a **resumable, path-ordered, recursive** walk over a
 //! directory subtree, built from the single-directory [`QueryDir`] machinery.
 //!
-//! Each level is an ordinary [`query_directory`] listing - same enrichment, same scatter-gathered `statx`/`fgetxattr`
-//! on the ring, same [`Personality`] - so this module adds only three things: descent, order that composes across
+//! Each level is an ordinary [`query_directory`] listing, so this module adds descent, an order that composes across
 //! levels, and a cursor.
 //!
-//! # Ordering
+//! Every level is read with [`Order::ByPathBytes`], forced whatever the caller put in [`QueryOptions`], since that is
+//! the order under which per-directory sorting composes into global path order. There is no global sort, and peak
+//! memory is one sorted name list per level on the stack.
 //!
-//! Every level is read with [`Order::ByPathBytes`], which is not optional and is forced regardless of what the caller
-//! put in [`QueryOptions`]. Sorting each directory by the bytes its *full path* will compare by - a directory ordered
-//! as though it already carried its trailing `/` - is exactly the condition under which per-directory sorting composes
-//! into a subtree emitted in global path order. There is no global sort, and the tree is never materialized: the walk
-//! holds one sorted name list per level on the current stack, so peak memory is bounded by depth times directory width,
-//! not by the size of the subtree.
-//!
-//! # Relationship to [`crate::sync_fs::iter`]
-//!
-//! [`FsIter`](crate::sync_fs::iter::FsIter) is the blocking sibling of this walk and the model for most of it: the
-//! descent discipline (`openat` from the parent's own descriptor, never a re-resolution from the root), the
-//! caller-driven [`skip_descent`](QueryTree::skip_descent), the depth bound, and a serializable resume token that
-//! carries a `depth` back on failure so the caller can retry from a surviving ancestor.
-//!
-//! It deliberately diverges on **one** point, and it is the important one. `FsIter`'s
-//! [`Cookie`](crate::sync_fs::iter::Cookie) records a *position* -- `(path, inode)` per level - and its resume is
-//! documented as best-effort: the deepest saved directory is re-read from the start, so entries can be yielded twice.
-//! That is the right trade for a scanner that de-duplicates downstream. It is the wrong one for a paginated listing,
-//! where a repeated key is a protocol violation.
-//!
-//! [`TreeCursor`] records a *key* instead - the last path emitted - and resume is an exact seek: each level is opened
-//! with [`QueryOptions::start_after`] set to the component the walk descended through, so nothing before the cut is
-//! read, enriched, or emitted, and nothing is emitted twice. This costs nothing extra precisely because the walk
-//! already sorts each level; a position-based cursor is only forced on `FsIter` because it does not.
-//!
-//! The key carries one bit alongside it, because a key alone cannot say everything the walk needs. A directory is
-//! emitted before its contents, so the key `"D/"` is the position *before* `D`'s subtree - right after yielding `D`,
-//! wrong after [`skip_descent`](QueryTree::skip_descent) folded `D` away, and unfixable by rewriting the key (`"D"`
-//! sorts ahead of the directory's own key and re-emits it). [`TreeCursor::skips_subtree`] distinguishes the two, which
-//! is what lets a delimiter listing page.
-//!
-//! Resume is still *best-effort about the tree*, not about the cursor: if a directory the cursor descended through has
-//! been renamed or removed, [`query_tree`] returns [`Error::IteratorRestore`](crate::Error) carrying the depth at which
-//! the chain broke.
+//! [`TreeCursor`] records the last *key* emitted, so resume is an exact seek, where `FsIter`'s
+//! [`Cookie`](crate::sync_fs::iter::Cookie) records a position and may yield entries twice, which a paginated listing
+//! cannot allow. Each level reopens with [`QueryOptions::start_after`] set to the component the walk descended through,
+//! so nothing before the cut is read. A level on the cursor's path that is gone or forbidden is skipped as the forward
+//! walk would skip it, and any other failure to reopen one returns [`Error::IteratorRestore`](crate::Error) with the
+//! depth at which the chain broke.
 
 use super::{
     Anchor, CONFINED_RESOLVE, File, FsHandle, Personality,
@@ -128,10 +101,8 @@ impl TreeEntry {
 /// across requests or process restarts. Unlike a directory offset, it stays meaningful when the tree changes
 /// underneath: it names a position in the key space, not in any directory's read order.
 ///
-/// The key alone cannot express every position the walk can be in. A directory is emitted *before* its contents, so the
-/// key `"D/"` means "just before `D`'s subtree" - which is what a resume needs after yielding `D`, and the opposite of
-/// what it needs after [`skip_descent`](QueryTree::skip_descent) folded `D` into a common prefix. Nor can the key be
-/// rewritten to say so: `"D"` sorts *before* the directory's own key and would re-emit `D` itself.
+/// The key alone cannot say whether the walk entered a directory or [`skip_descent`](QueryTree::skip_descent) folded
+/// it, since `"D/"` is the position just before `D`'s subtree and `"D"` sorts before the directory's own key.
 /// [`skips_subtree`](Self::skips_subtree) is that missing bit.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TreeCursor {
@@ -230,15 +201,9 @@ impl TreeCursor {
 /// How to walk a subtree. [`QueryOptions`] governs each level's listing; the rest governs the walk.
 #[derive(Clone, Debug)]
 pub struct TreeOptions {
-    /// Per-level listing options - enrichment, `clump`, `statx_mask`, `same_device_only`.
-    ///
-    /// Two fields are overridden by the walk and ignored here: [`order`](QueryOptions::order), which is forced to
-    /// [`Order::ByPathBytes`] because nothing else composes across levels, and
-    /// [`start_after`](QueryOptions::start_after), which belongs to [`resume`](Self::resume).
-    ///
-    /// [`name_prefix`](QueryOptions::name_prefix) applies **only to the root level**. A subtree walk is normally rooted
-    /// at the parent of the prefix being served, with the prefix's last partial component filtering that first level -
-    /// applying it further down would filter names that the caller's prefix has nothing to say about.
+    /// Per-level listing options. [`order`](QueryOptions::order) and [`start_after`](QueryOptions::start_after) are
+    /// overridden by the walk, and [`name_prefix`](QueryOptions::name_prefix) applies **only to the root level**, where
+    /// the prefix's last partial component filters the first level.
     pub entries: QueryOptions,
     /// How many levels to descend. `1` lists the root directory only, which is the non-recursive case; `MAX_DEPTH` is
     /// the ceiling.
@@ -300,25 +265,17 @@ impl std::fmt::Debug for QueryTree {
 }
 
 impl QueryTree {
-    /// Do not descend into the directory just yielded.
-    ///
-    /// This is the pruning primitive a delimiter is built from: fold the entry into a common prefix and skip it, and
-    /// the walk never opens it, never reads it, and never enriches anything beneath it. A no-op unless the last entry
-    /// was a directory the walk was about to enter.
-    ///
-    /// The pruning survives a [`cursor`](Self::cursor) round-trip: the token records it, so a page boundary landing on
-    /// a folded directory does not re-open the subtree on the next page.
+    /// Do not descend into the directory just yielded, so the walk never opens, reads or enriches anything beneath it.
+    /// A no-op unless the last entry was a directory the walk was about to enter. The pruning survives a
+    /// [`cursor`](Self::cursor) round-trip.
     pub fn skip_descent(&mut self) {
         // Only a cancelled descent counts. Called after a file - where there was nothing to descend into - this must
         // not mark the cursor, or the resume would step past a key it should merely resume after.
         self.skip_subtree |= self.pending.take().is_some();
     }
 
-    /// A cursor positioned after the last entry yielded - persist it to resume a later walk exactly here. Empty before
-    /// the first entry.
-    ///
-    /// Carries the effect of a [`skip_descent`](Self::skip_descent) made since that entry, so folding and paging
-    /// compose.
+    /// A cursor positioned after the last entry yielded, to persist and resume a later walk exactly here, carrying any
+    /// [`skip_descent`](Self::skip_descent) made since. Empty before the first entry.
     pub fn cursor(&self) -> TreeCursor {
         TreeCursor {
             key: self.last_key.clone(),
@@ -328,13 +285,9 @@ impl QueryTree {
 
     /// The next entry in path order, or `None` at the end of the subtree.
     ///
-    /// A subtree with nothing left to list is **skipped**: one this identity may not enter (`EACCES`/`EPERM`), matching
-    /// the per-entry permission behavior elsewhere in this module, or one removed out from under the walk (`ENOENT`).
-    /// Any failure that leaves the walk *unable to see* what is there - fd exhaustion, I/O, a mount not crossed, a
-    /// directory replaced by something else - is surfaced as `Some(Err)`, so an incomplete walk is never mistaken for a
-    /// fully listed one. See `is_subtree_skip` for which is which and why.
-    ///
-    /// A surfaced descent failure is per-subtree, not terminal: the walk resumes in the parent on the next call.
+    /// A subtree with nothing left to list (`EACCES`, `EPERM`, `ENOENT`) is **skipped**, and any failure that leaves
+    /// the walk *unable to see* what is there surfaces as `Some(Err)` (see `is_subtree_skip`). A surfaced descent
+    /// failure is per-subtree, and the walk resumes in the parent on the next call.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<crate::Result<TreeEntry>> {
         if self.fatal {
@@ -405,8 +358,6 @@ impl QueryTree {
                 self.stack.push(frame);
                 Ok(())
             }
-            // A subtree with nothing to list drops out quietly; a failing walk (fd exhaustion, I/O, a mount point not
-            // crossed) must not.
             Err(e) if is_subtree_skip(&e) => Ok(()),
             Err(e) => Err(e),
         }
@@ -474,15 +425,10 @@ pub fn query_tree(h: &FsHandle, who: Personality, root: &Anchor, opts: TreeOptio
     let cursor = opts.resume.clone().unwrap_or_default();
     let comps = cursor.components();
 
-    // A cursor ending in `/` named a **directory**, which the walk emits *before* its contents - so what it owes is
-    // that directory's subtree, and the resume descends through every component and starts the deepest level at its
-    // beginning. A cursor naming a file owes only what follows the file, so the deepest level is its parent, cut at the
-    // file itself. Confusing the two silently drops a whole subtree whenever a page boundary lands on a directory.
-    //
-    // A pruned directory is the third case, and it is why the bit exists: the caller folded it into a common prefix, so
-    // the walk owes what follows the whole subtree. That resumes like a file cursor - the deepest level is the parent -
-    // but cut past `D/` rather than at `D`, since the directory sorts at its slashed key and cutting at the bare name
-    // would re-emit it.
+    // A cursor ending in `/` named a directory, which is emitted before its contents, so the walk owes its subtree and
+    // starts the deepest level at its beginning. A file cursor owes what follows the file, so the deepest level is its
+    // parent, cut at the file. A pruned directory resumes like a file but cut past `D/`. Confusing them drops a whole
+    // subtree whenever a page boundary lands on a directory.
     let skip = cursor.skips_subtree();
     let into_dir = cursor.key().ends_with(b"/") && !skip;
     let descend = if into_dir {
@@ -541,11 +487,9 @@ pub fn query_tree(h: &FsHandle, who: Personality, root: &Anchor, opts: TreeOptio
         let anchor = stack.last().expect("stack is non-empty").anchor.clone();
         match open_frame(h, who, &anchor, comp, path.clone(), level_opts, cut_for(depth + 1)) {
             Ok(frame) => stack.push(frame),
-            // A level the forward walk would have skipped - this identity may not enter it (EACCES/EPERM), or it was
-            // removed between pages (ENOENT) - cannot be re-entered on resume either. The parent frame is already cut
-            // to start after this component (`cut_for(depth)`, applied when it was opened), so stopping the descent
-            // here resumes at the component's next sibling: exactly the subtree skip `descend()` makes on the forward
-            // walk. A failure that is not a subtree skip (fd exhaustion, I/O) still cannot restore the saved position.
+            // A level the forward walk would have skipped (`EACCES`, `EPERM`, `ENOENT`) is skipped here too, and the
+            // parent is already cut after this component, so the walk resumes at its next sibling. Any other failure
+            // cannot restore the saved position.
             Err(e) if is_subtree_skip(&e) => break,
             Err(_) => {
                 return Err(crate::Error::IteratorRestore {
@@ -574,11 +518,8 @@ pub fn query_tree(h: &FsHandle, who: Personality, root: &Anchor, opts: TreeOptio
 mod tests {
     use super::*;
 
-    /// Both halves of the descent contract. A subtree with nothing left to list drops out quietly; anything that leaves
-    /// the walk unable to see what is there must surface, or a partial listing reads as a complete one. Pinned here as
-    /// a predicate because the interesting errnos are awkward to provoke for real - fd exhaustion is process-wide,
-    /// `EACCES` needs a non-root runner - while the integration side in `test/uring_fs.rs` drives the two races end to
-    /// end.
+    /// Both halves of the descent contract, pinned on the predicate since the interesting errnos are awkward to provoke
+    /// for real. The integration side in `test/uring_fs.rs` drives the two races end to end.
     #[test]
     fn a_subtree_is_skipped_only_when_nothing_is_left_to_list() {
         for e in [Errno::EACCES, Errno::EPERM, Errno::ENOENT] {

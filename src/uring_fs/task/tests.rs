@@ -14,10 +14,8 @@ const POOL: u32 = 8;
 /// Build a real `Engine` or signal an environment skip (mirrors the integration suites' io_uring guard, gate
 /// included).
 fn engine_or_skip() -> Option<Engine> {
-    // Under Miri there is no ring to set up - `io_uring_setup` is an unsupported foreign call that aborts the
-    // interpreter, not an errno the arm below could catch - so the skip decision has to come first. The
-    // ring-dependent tests then skip themselves exactly as they do on a ring-less host, and the Miri lane (ci.yml
-    // `miri`) runs what is left: the pure-executor paths.
+    // Under Miri `io_uring_setup` aborts the interpreter rather than failing with an errno, so the skip decision comes
+    // first, and the Miri lane runs the pure-executor paths.
     if cfg!(miri) {
         return None;
     }
@@ -33,9 +31,7 @@ fn engine_or_skip() -> Option<Engine> {
 fn rig() -> Option<(Engine, FsCore, Personality)> {
     let mut eng = engine_or_skip()?;
     let who = Personality(register_personality(eng.ring.raw_fd()).expect("register_personality"));
-    // Armed because refusals deliver on the wake drain: without an armed wake the poke never surfaces as the
-    // TAG_WAKE completion `turn` drains on, so a test that only ever refuses would wait for a delivery nothing can
-    // make.
+    // Armed because refusals deliver on the wake drain, which a test that only ever refuses would otherwise wait on.
     eng.arm_wake(pack_raw(TAG_WAKE, 0, 0)).expect("arm wake");
     Some((eng, FsCore::new(8, OffloadBounds::default()), who))
 }
@@ -112,9 +108,8 @@ fn creating() -> OpenHow {
 
 // ---- the scoped-pointer protocol, without a ring ----------------
 //
-// Every test that reaches `with_current`/`with_conn` through an `FsConn` builds a real io_uring, and Miri aborts on
-// `io_uring_setup` rather than taking the skip path - so these drive the same `park_in`/`reach_in` with a plain
-// type, which is what lets Miri validate the module's only `unsafe`.
+// Miri aborts on `io_uring_setup`, so these drive `park_in`/`reach_in` with a plain type to let Miri check the module's
+// only `unsafe`.
 
 std::thread_local! {
     static PROBE: Cell<Option<NonNull<u32>>> = const { Cell::new(None) };
@@ -185,9 +180,7 @@ fn parks_nest_and_restore_in_order() {
 }
 
 /// The eager idiom the contract advertises: ops submitted while the body is being *assembled*, outside the async
-/// block, must reach the ring like any other. They did not before - `body` ran before any facade was parked, so
-/// each one resolved `ECANCELED` for an op that was never submitted, which reads to a task as "the connection went
-/// away".
+/// block, must reach the ring like any other rather than resolve `ECANCELED` for an op that was never submitted.
 #[test]
 fn a_body_may_submit_while_it_is_being_assembled() {
     let Some((mut eng, mut fs, who)) = rig() else {
@@ -219,9 +212,8 @@ fn a_body_may_submit_while_it_is_being_assembled() {
     drive(&mut fs, &mut eng, &done, "eager submit from the body");
 }
 
-/// A wake from an inline `spawn` poll - on the loop thread, with no drain pass running to collect it - pokes the
-/// loop. Without it the id sits queued while the host parks on a ring that has no reason to complete, and `queued`
-/// then latches so even a later off-loop wake is deduped away.
+/// A wake from an inline `spawn` poll, on the loop thread with no drain pass running, pokes the loop, or the task is
+/// never scheduled.
 #[test]
 fn an_on_loop_wake_outside_a_pass_pokes_the_loop() {
     let Some((mut eng, mut fs, _who)) = rig() else {
@@ -257,19 +249,12 @@ fn an_on_loop_wake_outside_a_pass_pokes_the_loop() {
     );
 }
 
-/// The dedup edge publishes what a deduped waker wrote - the property
-/// [`loom_a_deduped_wake_publishes_what_it_wrote`] models, spelled for **Miri**, which is the only instrument on
-/// x86 that can see it outside our own model. The hardware never shows the stale read (TSO), loom greens prove
-/// nothing (under-exploration is its documented unsoundness), so re-weakening `poll_window`'s swap back to a plain
-/// store leaves everything but that one model green - and this test, under `-Zmiri-many-seeds`, where the
-/// weak-memory emulation supplies the stale value. Natively it passes vacuously and costs nothing.
+/// The dedup edge publishes what a deduped waker wrote, spelled for **Miri**, whose weak-memory emulation under
+/// `-Zmiri-many-seeds` supplies the stale value x86 never shows. Natively it passes vacuously.
 ///
-/// **The payload must be an atomic read with `Relaxed`, and the assertion a value, not a race.** The tempting
-/// probe - a non-atomic payload, expecting Miri to report the missing happens-before as a data race - is UB on the
-/// *correct* code: a poll already in flight reads concurrently with the racing waker's pre-wake write, which no
-/// edge orders (the coverage contract is about polls that start *after* the wake), and Miri's vector clocks flag
-/// the pair even when they are seconds apart. Measured: four false races at 64 seeds with the shipped spelling. The
-/// atomic form has no UB anywhere; the weakened edge shows up as this assertion instead.
+/// **The payload must be an atomic read with `Relaxed`, and the assertion a value, not a race.** A non-atomic payload
+/// is UB on the *correct* code, since a poll already in flight reads concurrently with the racing waker's pre-wake
+/// write, which no edge orders.
 #[test]
 fn miri_a_deduped_wake_publishes_what_it_wrote() {
     let run = Arc::new(RunShared {
@@ -286,10 +271,8 @@ fn miri_a_deduped_wake_publishes_what_it_wrote() {
         }),
         loop_thread: std::thread::current().id(),
     });
-    // Iterated, because one seed is one schedule: the stale-read window needs the racing thread to skip between the
-    // latch and the poll, and a single race per execution leaves whole seed ranges never opening it. Miri's
-    // scheduler keeps drawing from the seed across iterations, so each round is a fresh interleaving - measured,
-    // this is the difference between the weakened edge surviving 16 seeds and dying inside the first.
+    // Iterated, because one seed is one schedule and a single race per execution leaves whole seed ranges never
+    // opening the stale-read window.
     for round in 0..16u64 {
         let w = Arc::new(TaskWake {
             id: TaskId { idx: 0, generation: 0 },
@@ -299,10 +282,9 @@ fn miri_a_deduped_wake_publishes_what_it_wrote() {
         let payload = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let want = round + 1;
 
-        // Latch the edge, so the racing wake below is the deduped
-        // one whenever the scheduler runs it before the window;
-        // where it runs after, the wake enqueues and the post-join drain covers it through the queue lock instead.
-        // Either way the last poll is the covering one - the same case split as the loom model.
+        // Latch the edge, so the racing wake below is the deduped one whenever the scheduler runs it before the window.
+        // Where it runs after, the wake enqueues and the post-join drain covers it through the queue lock instead.
+        // Either way the last poll is the covering one, the same case split as the loom model.
         wake_task(&w);
         let t = {
             let (w, p) = (Arc::clone(&w), Arc::clone(&payload));
@@ -325,12 +307,9 @@ fn miri_a_deduped_wake_publishes_what_it_wrote() {
 
 /// A nested drain ending does not un-mark the outer pass.
 ///
-/// `PassGuard` restores the value it displaced rather than storing `false`; get that wrong and a callback that
-/// calls [`FsConn::run_woken`] mid-delivery clears the mark for the rest of the outer pass, so every later on-loop
-/// wake in it pokes the eventfd for work the pass's own trailing drain is already about to do. The nested-restore
-/// property had no in-tree detector - reinstating the clear left the whole suite green - which is what this exists
-/// to be. The nested drain is fed a woken task of its own, because a drain with nothing queued returns before its
-/// guard exists.
+/// `PassGuard` restores the value it displaced rather than storing `false`, or every later on-loop wake in the outer
+/// pass pokes the eventfd for nothing. The nested drain is fed a woken task of its own, because a drain with nothing
+/// queued returns before its guard exists.
 #[test]
 fn a_nested_drain_keeps_the_outer_pass_marked() {
     let Some((mut eng, mut fs, _who)) = rig() else {
@@ -393,16 +372,14 @@ fn a_nested_drain_keeps_the_outer_pass_marked() {
     );
 }
 
-/// The converse, and the one that costs: a completion that resolves an op future wakes its task one statement
-/// before the drain that polls it, so the wake must not spend an eventfd write, the CQE it produces and the re-arm
-/// SQE that follows announcing work the same dispatch is already doing. The callback form pays none of that.
+/// The converse. A completion that resolves an op future wakes its task inside the pass, so it spends no eventfd write
+/// announcing work the same dispatch is already doing.
 #[test]
 fn a_completion_that_resolves_a_future_does_not_poke_the_loop() {
     let Some((mut eng, mut fs, who)) = rig() else {
         return;
     };
-    // The wake `READ` is deliberately not armed: it would consume the eventfd counter this test is counting.
-    // Nothing here needs it - every op is a ring op, delivered by `deliver_embedded`.
+    // The wake `READ` is not armed, since it would consume the eventfd counter this test counts.
     let dir = crate::tempdir::tempdir().expect("tempdir");
     let anchor = Anchor::open(dir.path()).expect("anchor");
     let done = Rc::new(StdCell::new(false));
@@ -443,10 +420,9 @@ fn a_completion_that_resolves_a_future_does_not_poke_the_loop() {
     );
 }
 
-/// A re-entrant drain - `run_woken` from inside a poll - must not consume the running task's own queued wake. The
-/// poll cleared
-/// the dedup edge before running, so that id is the only record;
-/// eat it and the task is never scheduled again.
+/// A re-entrant drain (`run_woken` from inside a poll) must not consume the running task's own queued wake. The poll
+/// cleared the dedup edge before running, so that id is the only record, and eating it leaves the task never scheduled
+/// again.
 #[test]
 fn a_reentrant_drain_does_not_eat_the_running_tasks_wake() {
     let Some((mut eng, mut fs, _who)) = rig() else {
@@ -488,9 +464,8 @@ fn a_reentrant_drain_does_not_eat_the_running_tasks_wake() {
     );
 }
 
-/// A task awaits its child's output through the handle. The parent's resume rides the leftover poke: the child's
-/// completion wakes the parent after the pass's budget was taken, so without the poke this join would stall with
-/// nothing left in flight.
+/// A task awaits its child's output through the handle. The parent's resume rides the leftover poke, since the child's
+/// completion wakes it after the pass's budget was taken.
 #[test]
 fn a_join_handle_resolves_with_the_tasks_output() {
     let Some((mut eng, mut fs, _who)) = rig() else {
@@ -533,8 +508,8 @@ fn a_dropped_join_handle_detaches() {
     drive(&mut fs, &mut eng, &done, "detached task");
 }
 
-/// A task dropped before finishing - which only teardown does - resolves its join as `None` rather than leaving it
-/// pending.
+/// A task dropped before finishing (which only teardown does) resolves its join as `JoinError::Dropped` rather than
+/// leaving it pending.
 #[test]
 fn a_task_dropped_at_teardown_resolves_its_join_as_none() {
     let Some((mut eng, mut fs, _who)) = rig() else {
@@ -567,14 +542,9 @@ fn a_task_dropped_at_teardown_resolves_its_join_as_none() {
 
 /// The run-queue count may not disagree with the queue it counts.
 ///
-/// `wake_task` pushes under the queue lock and adjusts the count after releasing it, so an off-loop waker caught
-/// between the two leaves the queue one longer than the count. A nested pass - a callback calling
-/// [`FsConn::run_woken`] from inside a delivery - then spends count the outer pass's budget was sampled from, and
-/// the outer pass pops the unaccounted id with a decrement that has nothing left to take.
-///
-/// It wraps, and [`drain`] samples exactly that as the per-pass entry bound: that bound is what returns this thread
-/// to `submit_and_wait`, so at `usize::MAX` a task that re-wakes itself keeps one pass running and every connection
-/// on the ring stops being served.
+/// A nested pass spends count the outer pass's budget was sampled from, and a count adjusted by deltas would wrap to
+/// `usize::MAX`, which [`drain`] samples as its entry bound, so a self-waking task would keep one pass running for
+/// good.
 #[test]
 fn a_nested_pass_cannot_run_the_ready_count_below_zero() {
     let Some((mut eng, mut fs, _who)) = rig() else {

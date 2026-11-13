@@ -52,12 +52,8 @@ fn a_layout_that_cannot_fit_is_refused_not_forked() {
 
 /// Both halves of the ready handshake `spawn` consults before it hands back a handle.
 ///
-/// A child that dies renumbering its descriptors never sends its ready datagram, and its socket end closes with
-/// it - so the parent's read is a short one, which is the `ECONNRESET` broker death has always spelled. A live
-/// child's eight bytes read back as a reply.
-///
-/// The other half of the protocol - that `spawn` consumes exactly this datagram, so the first `register` is not
-/// answered by it - is what every brokered test in `test/uring_fs.rs` would fail on.
+/// A child that dies renumbering never sends its ready datagram, so the parent's read is short, which is the
+/// `ECONNRESET` of broker death. A live child's eight bytes read back as a reply.
 #[test]
 fn a_child_that_dies_before_its_ready_datagram_reads_as_broker_death() {
     use std::os::fd::AsRawFd;
@@ -98,12 +94,9 @@ fn a_child_that_dies_before_its_ready_datagram_reads_as_broker_death() {
 
 /// A repeated gid must not buy the no-impersonation fast path.
 ///
-/// That path registers the broker's *own* credentials, so taking it for a request whose group list only looks like
-/// the current one hands the caller whatever the broker holds. Equal length plus one-way containment satisfies `[1,
-/// 1]` against a current `[1, 2]` - same count, every requested gid present - while the sets differ by group
-/// 2. Driven on `group_set_differs` rather than on
-/// `needs_impersonation`, which reads the live process: a host with fewer than two supplementary groups cannot
-/// forge a list at all, and on the QEMU lane the suite runs as root, whose only group is root.
+/// That path registers the broker's *own* credentials, so taking it for a request whose group list only looks like the
+/// current one hands the caller whatever the broker holds. Equal length plus one-way containment satisfies `[1, 1]`
+/// against a current `[1, 2]` (same count, every requested gid present) while the sets differ by group 2.
 #[test]
 fn a_repeated_gid_does_not_take_the_no_impersonation_path() {
     assert!(
@@ -204,11 +197,8 @@ fn register_as_rejects_the_no_change_sentinel() {
     assert_eq!(raw_geteuid(), 0, "euid restored after the caps refusal");
 }
 
-/// `drop_setid_caps` must clear CAP_SETUID/CAP_SETGID from the **bounding set**, not only
-/// effective/permitted/inheritable. A process whose real or effective uid is 0 regains its bounding set into
-/// `permitted` on the next `execve` (`handle_privileged_root`, `security/commoncap.c`), so a bounding set that
-/// still carried these caps would undo the drop the module promises is permanent. Root-only: the drop needs the
-/// caps present and CAP_SETPCAP to leave the bounding set. Done in a forked child because the drop is irreversible.
+/// `drop_setid_caps` must clear `CAP_SETUID` and `CAP_SETGID` from the **bounding set**, or a uid-0 `execve` restores
+/// them. Root-only, and in a forked child, since the drop is irreversible.
 #[test]
 fn drop_setid_caps_clears_the_bounding_set() {
     const CAP_SETGID: libc::c_long = 6;
@@ -366,11 +356,8 @@ fn a_registration_of_uid_0_is_held_to_the_root_limit() {
 
 /// The other half of the bounding-set drop: an unprivileged caller must still get `Ok`.
 ///
-/// `spawn`'s contract says a process that was already unprivileged simply has nothing to drop, and
-/// `drop_setid_caps` failing makes `spawn` fatal. `PR_CAPBSET_DROP` needs `CAP_SETPCAP`, and an ordinary process's
-/// bounding set is *full* - so reading the cap first and dropping only when present would `EPERM` here rather than
-/// skip. The uid is what the kernel's regain path is keyed on, so it is what the tolerance is keyed on. Root-only
-/// because it has to shed privilege to test the shed.
+/// `PR_CAPBSET_DROP` fails `EPERM` without `CAP_SETPCAP`, and a failure is fatal to `spawn`, so the tolerance is keyed
+/// on the uid. Root-only, because it has to shed privilege to test the shed.
 #[test]
 fn drop_setid_caps_tolerates_an_unprivileged_caller() {
     if !root_or_skip("drop_setid_caps_tolerates_an_unprivileged_caller") {
@@ -400,11 +387,8 @@ fn drop_setid_caps_tolerates_an_unprivileged_caller() {
 }
 
 /// **SECURITY.** A recv that gives up leaves the broker's reply on the socket, and the wire carries nothing naming
-/// the request it answers - so without the mark the *next* caller receives it and `register` hands one identity
-/// another's personality.
-///
-/// Both halves are here, because the mark is only worth what the hazard is: the refusal, and then the same socket
-/// with the mark cleared by hand, which really does answer the previous caller's id.
+/// the request it answers, so without the mark the *next* caller receives it. The control clears the mark by hand and
+/// gets the previous caller's id.
 #[test]
 fn a_timed_out_request_refuses_the_next_caller_not_its_reply() {
     let mut sv = [0 as RawFd; 2];
@@ -469,11 +453,8 @@ fn a_timed_out_request_refuses_the_next_caller_not_its_reply() {
 }
 
 /// Pin the kernel behaviour that shapes this whole module: an io_uring descriptor **cannot** be passed over a unix
-/// socket. `scm_fp_copy` rejects it with `EINVAL` (kernel commit `a4104821ad65`, Linux 6.8, which dropped
-/// io_uring's unix-socket GC support).
-///
-/// If this ever starts succeeding, a broker could be forked before any ring exists and receive rings later; until
-/// then the fds must be inherited across `fork`, which is why [`CredBroker::spawn`] takes the reactors themselves.
+/// socket (`scm_fp_copy` answers `EINVAL`). If this ever starts succeeding, a broker could receive rings after the
+/// fork.
 #[test]
 fn io_uring_fd_cannot_cross_scm_rights() {
     let ring = match Ring::new(4) {

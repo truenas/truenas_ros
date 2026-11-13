@@ -2,17 +2,15 @@
 //! with its unit tests and loom models in place. The job contract consumers program against lives at `FsConn::offload`;
 //! the type docs below cover the mechanics.
 
-use std::cell::Cell;
-use std::collections::VecDeque;
-use std::fmt;
-use std::time::{Duration, Instant};
-// The pool is loom-modelled (`loom_tests` below), so its primitives come from `crate::sync` - std's outside `--cfg
-// loom`.
 #[cfg(loom)]
 use crate::sync::atomic::AtomicUsize;
 use crate::sync::atomic::{AtomicU64, Ordering};
 use crate::sync::{Arc, Condvar, Mutex, OnceCell, thread};
 use crate::uring::wake::WakeHandle;
+use std::cell::Cell;
+use std::collections::VecDeque;
+use std::fmt;
+use std::time::{Duration, Instant};
 
 /// Per-ring sizing for a blocking-offload pool, the file pool or the lookup lane, which is how many worker threads it
 /// keeps warm and how far it grows.
@@ -59,32 +57,23 @@ fn claim(g: &mut PoolInner, n: usize) {
     }
 }
 
-/// Queued jobs per worker a flush wakes. A woken worker drains the whole queue, so one wake covers a batch of short
-/// jobs; blocking jobs get a worker each from the stall rule ([`OFFLOAD_BLOCKED_AFTER`]).
-///
-/// Also the growth threshold: [`WorkerPool::flush`] grows when more than this many jobs per parked worker were queued
-/// since the last flush. Growth counts the caller's `pending`, not the queue, so an off-loop `flush(1)` does not spawn
-/// for a backlog the reactor queued (`a_flush_of_one_does_not_grow_against_the_queue`).
+/// Queued jobs per worker a flush wakes, since a woken worker drains the whole queue. Blocking jobs get a worker each
+/// from the stall rule ([`OFFLOAD_BLOCKED_AFTER`]). Also the growth threshold, counted on the caller's `pending` and
+/// not the queue, so an off-loop `flush(1)` does not spawn for a backlog the reactor queued.
 const JOBS_PER_WAKE: usize = 4;
 
 /// How long a worker can be in one job before the stall rule counts it as blocked.
 ///
-/// io-wq starts a worker when the last running one blocks with work queued, and learns of the block from the scheduler
-/// (`io_wq_worker_sleeping`, `io_uring/io-wq.c`). This pool cannot see a block, so it uses time: once every awake
-/// worker has been in its job this long, each queued job gets a parked worker ([`WorkerPool::flush`]).
-///
-/// The rule runs only when the loop flushes, so the loop bounds its sleep by the deadline the flush returns.
+/// io-wq learns of a block from the scheduler (`io_wq_worker_sleeping`, `io_uring/io-wq.c`) and this pool cannot, so it
+/// uses time. The rule runs only when the loop flushes, so the loop bounds its sleep by the deadline the flush returns.
 const OFFLOAD_BLOCKED_AFTER: Duration = Duration::from_micros(50);
 
 /// Time a claimed worker gets to reach its job before the stall rule counts it. It covers wakeup latency, including
 /// exit from a deep CPU idle state; a shorter deadline wakes the loop before the worker runs.
 const OFFLOAD_WAKE_ALLOWANCE: Duration = Duration::from_micros(150);
 
-/// Ceiling on the pool's own thread count. Not a kernel limit - a sanity bound, since every one of these is a real OS
-/// thread, spawned by one reactor and on the reactor thread, for work that has no io_uring opcode.
-///
-/// Lives here rather than in a host's config so **both** hosts screen against the same number: `net`'s
-/// `ServerConfig::validate` and `UringFs::check`.
+/// Ceiling on the pool's own thread count, a sanity bound since each is a real OS thread. It lives here so **both**
+/// hosts screen against the same number (`net`'s `ServerConfig::validate` and `UringFs::check`).
 pub(crate) const MAX_OFFLOAD_THREADS: usize = 1024;
 
 /// The name of the file pool's threads, the pool behind `FsConn::offload`, the listers and the copies. Linux keeps 15
@@ -150,12 +139,10 @@ struct PoolShared {
     idle_timeout: Duration,
     /// [`OFFLOAD_BLOCKED_AFTER`] in micros. Tests set their own; loom sets zero.
     blocked_after_us: u64,
-    /// The deadline the last [`WorkerPool::flush`] returned, in micros since [`epoch`](Self::epoch), or `0` for none.
-    /// The reactor reads it ([`WorkerPool::recheck_owed`]) for flushes made off its loop.
-    ///
-    /// Stored under the lock, so the last flush wins. Loaded without it on every loop iteration that queued nothing,
-    /// hence its own cache lines. Relaxed: a submitter's store reaches the reactor through the poke that follows it
-    /// (`WakeHandle::poke` releases; `park` and `unpark` acquire).
+    /// The deadline the last [`WorkerPool::flush`] returned, in micros since [`epoch`](Self::epoch), or `0` for none,
+    /// for the reactor to read ([`WorkerPool::recheck_owed`]). Stored under the lock and loaded without it, hence its
+    /// own cache lines. Relaxed, since the poke that follows a store carries it (`WakeHandle::poke` releases, `park`
+    /// and `unpark` acquire).
     recheck_at_us: OwnLines<AtomicU64>,
     /// Model-only: how many idle retirements to grant (see [`idle_expired`]).
     #[cfg(loom)]
@@ -167,17 +154,10 @@ struct PoolShared {
 
 /// An elastic pool of worker threads running `Box<dyn FnOnce() + Send>` jobs, the shared machinery behind both the
 /// off-loop `QueryPool` helpers and the on-loop `FsConn::offload` path. It keeps `floor` threads warm and grows to
-/// `ceiling` when every worker is busy (blocked on a slow `readdir` or copy), so one stalled walk does not
-/// head-of-line-block the rest; burst workers retire after an idle period. It runs whatever job it is handed under the
-/// reactor's ambient credentials; any per-`who` permission check belongs to the job, not the pool.
+/// `ceiling` when every worker is stuck in a job, and burst workers retire after an idle period. Jobs run under the
+/// reactor's ambient credentials, so any per-`who` permission check belongs to the job.
 ///
-/// Wakes follow io-wq: keep one worker coming back for the queue, and wake another only once every awake worker is
-/// stuck in a job ([`WorkerPool::flush`]).
-///
-/// Growth is hysteretic: a worker spawns only when the pool is saturated (no worker is parked) and at most once per
-/// cooldown, so a burst of fast cached jobs clears without thread churn while genuinely blocking work grows. Dropping
-/// the pool closes the queue and waits for every worker to exit, so a job's effects are complete before the dropper
-/// proceeds - bounded by [`SHUTDOWN_DETACH_AFTER`], after which the remaining workers are left to exit on their own.
+/// Dropping the pool closes the queue and waits for every worker to exit, bounded by [`SHUTDOWN_DETACH_AFTER`].
 pub(crate) struct WorkerPool {
     shared: Arc<PoolShared>,
 }
@@ -238,7 +218,7 @@ impl WorkerPool {
             shared: Arc::clone(&shared),
         };
         for _ in 0..floor {
-            // Spawn under the lock and count only on success -- see `submit`.
+            // Spawn under the lock and count only on success, as `flush` explains.
             let spawned = {
                 let mut g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
                 spawn_worker(&shared).map(|()| g.total += 1)
@@ -251,10 +231,7 @@ impl WorkerPool {
         Ok(pool)
     }
 
-    /// [`enqueue`] then [`flush`] of one. Test-only; production goes through [`SharedPool`].
-    ///
-    /// [`enqueue`]: Self::enqueue
-    /// [`flush`]: Self::flush
+    /// [`enqueue`](Self::enqueue) then a [`flush`](Self::flush) of one. Test-only.
     #[cfg(test)]
     pub(crate) fn submit(&self, job: Job) {
         self.enqueue(job);
@@ -273,17 +250,10 @@ impl WorkerPool {
 
     /// Wake the pool for what is queued, and return how long the caller may sleep before calling this again.
     ///
-    /// Two rules, after io-wq (`io_uring/io-wq.c`):
-    ///
-    /// - Batch: the `pending` jobs queued since the last flush get one parked worker per [`JOBS_PER_WAKE`]; a woken
-    ///   worker drains the queue.
-    /// - Stall: when no claimed worker is on its way and every running worker has been in its job past
-    ///   [`OFFLOAD_BLOCKED_AFTER`], each queued job gets a parked worker, and the pool grows if it has too few.
-    ///
-    /// The stall rule is checked only here, so the return is when to check next, or `None` when no queued job waits on
-    /// a running one. It is also published for [`recheck_owed`](Self::recheck_owed).
-    ///
-    /// `pending` feeds the batch rule and growth only; zero is valid.
+    /// The `pending` jobs queued since the last flush get one parked worker per [`JOBS_PER_WAKE`]. When every running
+    /// worker has been in its job past [`OFFLOAD_BLOCKED_AFTER`], each queued job gets a parked worker and the pool
+    /// grows if it has too few. That rule is checked only here, so the return is when to check next, or `None` when no
+    /// queued job waits on a running one. `pending` may be zero.
     pub(crate) fn flush(&self, pending: usize) -> Option<Duration> {
         let mut g = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.closed {
@@ -322,12 +292,8 @@ impl WorkerPool {
         {
             g.last_flush_wakes = wakes;
         }
-        // Spawn under the lock, counting the worker only once it has started. Reserving the slot first and handing it
-        // back on failure would put a third decrement of `total` on a path with none of the guards the idle retire has:
-        // `Drop` waits for `total` to reach zero, and a reserved slot has no worker exit coming to signal on its
-        // behalf, so a submit racing a drop could lower the count in silence and park `Drop` on the condvar forever.
-        // Counting only what exists leaves a failed spawn touching no shared state. The cost is holding the lock across
-        // a thread creation, bounded by the growth cooldown.
+        // Count the worker only once it has started. A reserved slot handed back on failure would be a decrement of
+        // `total` with no worker exit to signal it, which can park `Drop` on the condvar forever.
         if saturated
             && g.total < self.shared.ceiling
             && self.shared.claim_spawn_slot(&mut g)
@@ -349,10 +315,8 @@ impl WorkerPool {
         next
     }
 
-    /// A [`flush`](Self::flush) of one from a thread with no loop. If it returns a deadline, poke the reactor
-    /// (`loop_wake`), which reads the deadline back ([`recheck_owed`](Self::recheck_owed)).
-    ///
-    /// Publish, then poke: the poke's release carries the relaxed deadline to the loop.
+    /// A [`flush`](Self::flush) of one from a thread with no loop, poking `loop_wake` when it returns a deadline. The
+    /// poke follows the publish, since its release carries the relaxed deadline to the loop.
     pub(crate) fn flush_off_loop(&self, loop_wake: &WakeHandle) {
         if self.flush(1).is_some() {
             loop_wake.poke();
@@ -360,10 +324,7 @@ impl WorkerPool {
     }
 
     /// Time until the stall rule is due, as the last [`flush`](Self::flush) published it, or `None` when nothing is
-    /// due.
-    ///
-    /// A past deadline reads as `Some(ZERO)`, not `None`: `None` lets the loop sleep without a timeout and would strand
-    /// the waiting job.
+    /// due. A past deadline reads as `Some(ZERO)`, since `None` lets the loop sleep without a timeout.
     pub(crate) fn recheck_owed(&self) -> Option<Duration> {
         let at = self.shared.recheck_at_us.0.load(Ordering::Relaxed);
         (at != 0).then(|| Duration::from_micros(at.saturating_sub(self.shared.now_us())))
@@ -371,11 +332,9 @@ impl WorkerPool {
 }
 
 impl PoolShared {
-    /// Model-only: let the next `n` workers to wake take the retire branch instead of looping. Standing in for a clock
-    /// loom does not have - see [`idle_expired`].
-    ///
-    /// A budget rather than a one-shot on purpose: with only one retirement granted the retiring worker is never the
-    /// last, so a model could not tell a pool that correctly refuses to retire its final worker from one that does not.
+    /// Model-only. Let the next `n` workers to wake retire (see [`idle_expired`]). A budget, since with a single
+    /// retirement the retiring worker is never the last, and a model could not catch a pool that retires its final
+    /// worker.
     #[cfg(all(test, loom))]
     fn retire_idle_workers(&self, n: usize) {
         self.retire_next_idle.store(n, Ordering::Relaxed);
@@ -427,9 +386,7 @@ impl PoolShared {
     /// True at most once per [`cooldown`](Self::cooldown), claiming the slot so concurrent submits do not all spawn at
     /// once.
     ///
-    /// Takes the guard because the throttle lives in [`PoolInner`]: the only caller is `flush`, which holds the lock
-    /// across the whole growth decision, so a compare-exchange here could never lose a race and would advertise a
-    /// lock-free contract the code does not implement.
+    /// Takes the guard, since its only caller, `flush`, holds the lock across the whole growth decision.
     fn claim_spawn_slot(&self, inner: &mut PoolInner) -> bool {
         let now = self.now_us();
         let cooldown = self.cooldown.as_micros() as u64;
@@ -441,18 +398,13 @@ impl PoolShared {
     }
 }
 
-// The identity of the pool this thread is a worker of (`Arc::as_ptr` of its `PoolShared`), or null off the pools.
-// `WorkerPool::drop` can run on a worker when a job drops a pool's last `Arc`; the identity tells that `Drop` whether
-// the join it wants would wait on the current thread itself (its own pool - skip it, the workers exit on `closed`
-// alone) or only on other threads (a different pool - join it like any thread would). A bare "am I a worker" flag
-// cannot tell those apart and leaks the exemption to every pool in the process. Tokio's blocking workers carry the same
-// identity by entering their runtime's context at spawn (`spawn_thread`, `runtime/blocking/pool.rs`), and a foreign
-// runtime dropped on one of them is likewise waited out (`Receiver::wait`, `runtime/blocking/shutdown.rs`).
+// The identity of the pool this thread is a worker of (`Arc::as_ptr` of its `PoolShared`), or null off the pools, so a
+// `WorkerPool::drop` run on a worker skips the join on its own pool and still joins any other. A bare "am I a worker"
+// flag cannot tell those apart and leaks the exemption to every pool in the process.
 //
-// Under loom this must be loom's thread-local, not std's: loom multiplexes every modelled thread onto one OS thread, so
-// a std `thread_local!` would
-// let a worker's identity leak into the main thread and make `Drop` skip a
-// join it really needed. (loom's macro takes no `const` initializer.)
+// Under loom this must be loom's thread-local, not std's, since loom multiplexes every modelled thread onto one OS
+// thread, so a std `thread_local!` would let a worker's identity leak into the main thread and make `Drop` skip a join
+// it really needed. (loom's macro takes no `const` initializer.)
 #[cfg(not(loom))]
 thread_local! {
     static ON_POOL_WORKER: Cell<*const PoolShared> =
@@ -466,24 +418,17 @@ loom::thread_local! {
 
 /// How long `WorkerPool::drop` waits for its workers before detaching them.
 ///
-/// The wait exists so a job's effects are complete before the dropper proceeds; it is bounded because the dropping
-/// thread is not always one that can afford to block forever. `Drop` runs wherever the last handle falls - including on
-/// ANOTHER pool's worker, or on a thread serving requests - and an offload parked in a syscall against a wedged backing
-/// would otherwise consume that thread for the life of the process.
-///
-/// A process exiting has a backstop for that and a running one does not: FUSE (`fs/fuse/dev.c:212`) and sunrpc
-/// (`net/sunrpc/sched.c:346`) both wait `TASK_KILLABLE`, so a supervisor's SIGKILL reaps the wedged worker at teardown.
-/// Mid-run nothing does, and the symptom is a daemon quietly losing threads while systemd sees a healthy unit.
-///
-/// Long enough that a pool draining normally is never detached (workers exit as soon as they finish the job in hand),
-/// short enough to bound the damage.
+/// The wait makes a job's effects complete before the dropper proceeds. It is bounded because `Drop` runs wherever the
+/// last handle falls, another pool's worker or a thread serving requests included, and an offload parked against a
+/// wedged backing would otherwise hold that thread for the life of the process. At shutdown a supervisor's SIGKILL
+/// reaps such a worker, since FUSE (`fs/fuse/dev.c:212`) and sunrpc (`net/sunrpc/sched.c:346`) wait `TASK_KILLABLE`,
+/// but mid-run nothing does.
 const SHUTDOWN_DETACH_AFTER: Duration = Duration::from_secs(2);
 
 /// Whether `Drop`'s bounded wait has run out and the remaining workers should be detached.
 ///
-/// In production this is the condvar's own answer. Under `--cfg loom` there is no clock and `Condvar::wait_timeout`
-/// always reports `timed_out() == false` (`sync.rs`), so the detach branch would be unreachable in a model. The seam
-/// lets a model ask for the detach directly, the way [`idle_expired`] does for the idle retire.
+/// In production this is the condvar's own answer. Under loom `wait_timeout` never times out (`sync.rs`), so a model
+/// asks for the detach through this seam.
 #[cfg(not(loom))]
 fn shutdown_expired(wait: &std::sync::WaitTimeoutResult, _shared: &Arc<PoolShared>) -> bool {
     wait.timed_out()
@@ -499,15 +444,10 @@ fn shutdown_expired(_wait: &loom::sync::WaitTimeoutResult, shared: &Arc<PoolShar
 
 /// The deadline `Drop`'s bounded wait runs against.
 ///
-/// Passing [`SHUTDOWN_DETACH_AFTER`] to each `wait_timeout` would restart the clock on every wake, and every worker
-/// exit notifies - so a pool of `n` workers with one wedged member bounds the wait at `n x SHUTDOWN_DETACH_AFTER`
-/// rather than at `SHUTDOWN_DETACH_AFTER`, and a spurious wake bounds it at nothing. That defeats the reason the wait
-/// is bounded at all: `Drop` runs wherever the last handle falls, including on a thread serving requests, and two
-/// minutes there is the harm this is supposed to prevent. Detaching a pool that is still draining is sound (see
-/// `Drop`), so the deadline is absolute.
-///
-/// Under `--cfg loom` there is no clock (`src/sync.rs`), and none is needed: `wait_timeout` never times out there, so
-/// the detach is driven by [`shutdown_expired`]'s model seam and the remaining duration is never read for its value.
+/// One deadline for the whole wait. Passing [`SHUTDOWN_DETACH_AFTER`] to each `wait_timeout` would restart the clock on
+/// every wake, and every worker exit notifies, so a pool of `n` workers with one wedged member would wait
+/// `n x SHUTDOWN_DETACH_AFTER`, and a spurious wake would remove the bound. Under loom there is no clock, and
+/// [`shutdown_expired`]'s seam drives the detach.
 #[cfg(not(loom))]
 struct ShutdownClock(Instant);
 
@@ -542,26 +482,15 @@ impl Drop for WorkerPool {
         let mut g = self.shared.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.closed = true;
         self.shared.cv.notify_all();
-        // Running on one of THIS pool's workers (a job dropped the pool's last `Arc`): the thread is itself counted in
-        // `total`, so waiting the workers out here would wait on this very thread forever. Each worker owns an
-        // `Arc<PoolShared>`, so they exit and reclaim the shared state on their own once `closed` is set, with no join
-        // needed. A different pool's worker gets no exemption - this pool's `total` does not count that thread, and
-        // skipping the join there would silently void the contract below for every cross-pool drop
-        // (`try_elastic_tuned`'s partial-failure unwind relies on it).
+        // On one of this pool's own workers (a job dropped the last `Arc`) the thread is counted in `total`, so waiting
+        // would wait on itself, and the workers exit on `closed` alone. Another pool's worker gets no exemption, or a
+        // cross-pool drop (`try_elastic_tuned`'s unwind) would skip its join.
         if ON_POOL_WORKER.with(Cell::get) == Arc::as_ptr(&self.shared) {
             return;
         }
-        // Wait for the workers to drain and exit, so none touches the shared state after this returns (join-on-drop
-        // without tracking handles) -- but only up to `SHUTDOWN_DETACH_AFTER`, then leave them to it.
-        //
-        // Detaching is sound because `Job` is `Box<dyn FnOnce() + Send>`, hence `'static`: a job cannot hold a borrow
-        // of anything the dropper is about to free. Each worker owns an `Arc<PoolShared>`, so the shared state outlives
-        // them too, and `closed` is already set - they exit on their own with nothing left to signal. The wait buys
-        // quiescence, not soundness, which is why it is worth bounding.
-        //
-        // One deadline for the whole wait, not one per wake: every worker exit notifies, so re-passing the full timeout
-        // would multiply the bound by the worker count and a spurious wake would remove it entirely. See
-        // [`ShutdownClock`].
+        // Wait for the workers to exit, up to `SHUTDOWN_DETACH_AFTER` on one deadline. Detaching is sound because a
+        // `Job` is `'static`, so it borrows nothing the dropper frees, and each worker owns an `Arc<PoolShared>` and
+        // exits on `closed`.
         let clock = ShutdownClock::start();
         while g.total > 0 {
             let left = clock.remaining();
@@ -577,8 +506,8 @@ impl Drop for WorkerPool {
     }
 }
 
-/// Spawn one worker thread bound to `shared`. The caller has already accounted it in `total`; the worker decrements
-/// `total` when it exits.
+/// Spawn one worker thread bound to `shared`. The caller holds the lock and counts the worker in `total` once this
+/// succeeds, and the worker takes itself off `total` when it exits.
 fn spawn_worker(shared: &Arc<PoolShared>) -> std::io::Result<()> {
     let shared = Arc::clone(shared);
     thread::Builder::new()
@@ -587,11 +516,9 @@ fn spawn_worker(shared: &Arc<PoolShared>) -> std::io::Result<()> {
         .map(|_| ())
 }
 
-/// One lazily-spawned [`WorkerPool`]. A reactor holds two. The file pool is shared by its on-loop offloads
-/// (`FsConn::offload`) and its off-loop `QueryPool`, so that work has a single thread budget. The lookup lane
-/// (`FsConn::offload_lookup`) runs jobs that may wait seconds on another machine, so they never hold a thread the file
-/// work needs. Cheap to clone (`Arc`). The floor threads spawn on the first submit. If a worker cannot be spawned,
-/// [`enqueue`](Self::enqueue) runs the job inline (a degraded loop, not a dead one), while
+/// One lazily-spawned [`WorkerPool`], cheap to clone. A reactor holds two, the file pool (`FsConn::offload` and the
+/// off-loop `QueryPool`, one thread budget) and the lookup lane (`FsConn::offload_lookup`), whose jobs may wait seconds
+/// on another machine. If a worker cannot be spawned, [`enqueue`](Self::enqueue) runs the job inline while
 /// [`try_enqueue`](Self::try_enqueue) hands it back.
 pub(crate) struct SharedPool {
     pool: OnceCell<WorkerPool>,
@@ -602,10 +529,8 @@ pub(crate) struct SharedPool {
     epoch: Instant,
     /// Micros since `epoch` before the lazy spawn is attempted again, or `0` when none has failed.
     ///
-    /// A failure backs off rather than latching. Whatever refused the thread (`EAGAIN`, an `RLIMIT_NPROC`, a cgroup
-    /// `pids.max`) is usually another process's transient squeeze, and latching would demote every later job to running
-    /// inline on the reactor for the rest of the process's life, the exact head-of-line stall this pool exists to
-    /// prevent. Jobs still run inline while backing off; a submit past the deadline retries the spawn.
+    /// A failure backs off rather than latching, since what refused the thread (`EAGAIN`, `RLIMIT_NPROC`, a cgroup
+    /// `pids.max`) is usually transient, and latching would run every later job inline on the reactor for good.
     retry_spawn_us: AtomicU64,
 }
 
@@ -642,8 +567,7 @@ impl SharedPool {
     /// [`enqueue`](Self::enqueue) then a [`flush`](Self::flush) of one, for callers with no loop (the off-loop query
     /// helpers).
     ///
-    /// Such a caller cannot come back for the stall rule, and growth adds at most one worker per cooldown, so a burst
-    /// of submits would wait on busy workers. The reactor comes back instead: `loop_wake` is poked with the deadline
+    /// Such a caller cannot come back for the stall rule, so `loop_wake` is poked to bring the reactor back
     /// ([`WorkerPool::flush_off_loop`]).
     pub(crate) fn submit(&self, job: Job, loop_wake: &WakeHandle) {
         self.enqueue(job);
@@ -678,9 +602,8 @@ impl SharedPool {
         self.retry_spawn_us.store(u64::MAX, Ordering::Relaxed);
     }
 
-    /// Queue a job without a wake, spawning the pool on first use. A lost init race just drops the surplus pool (its
-    /// `Drop` joins the idle workers); a spawn failure runs the job inline rather than take the reactor down. The
-    /// caller must [`flush`](Self::flush) before it blocks.
+    /// Queue a job without a wake, spawning the pool on first use. A spawn failure runs the job inline rather than take
+    /// the reactor down. The caller must [`flush`](Self::flush) before it blocks.
     pub(crate) fn enqueue(&self, job: Job) {
         if let Err(job) = self.try_enqueue(job) {
             job();
@@ -725,11 +648,8 @@ impl SharedPool {
 
 /// Whether a `wait_timeout` return means the worker has been idle long enough to retire.
 ///
-/// In production this is just the condvar's own answer. Under `--cfg loom` there is no clock and
-/// `Condvar::wait_timeout` always reports `timed_out() == false`, which would make the retire branch below - the one
-/// that decrements `total` *without* notifying, unlike the closing path -- unreachable in a model. The seam lets a
-/// model ask for the retirement directly, so the interleaving that branch relies on can actually be explored. See
-/// [`PoolShared::retire_next_idle`].
+/// Under loom `wait_timeout` never times out, so a model grants retirements through [`PoolShared::retire_next_idle`] to
+/// reach the branch that decrements `total` *without* notifying.
 #[cfg(not(loom))]
 fn idle_expired(wait: &std::sync::WaitTimeoutResult, _shared: &Arc<PoolShared>) -> bool {
     wait.timed_out()
@@ -744,16 +664,11 @@ fn idle_expired(_wait: &loom::sync::WaitTimeoutResult, shared: &Arc<PoolShared>)
         .is_ok()
 }
 
-/// A worker: wait for a job, run it, repeat; `K` workers run `K` jobs concurrently. A burst worker idle past the idle
-/// timeout retires (never below the floor); on shutdown every worker drains the queue and exits, decrementing `total`
-/// so [`WorkerPool`]'s `Drop` can wait them all out.
-///
-/// Each job runs under `catch_unwind`, so a panicking job retires only itself, not the worker: the pool keeps draining,
-/// and a later `submit` is not silently dropped onto a dead thread. Any handle the job owned (a `SendDir`) still closes
-/// as its unwinding frame drops.
+/// One worker, which waits for a job, runs it and repeats. A burst worker idle past the idle timeout retires (never
+/// below the floor), and on shutdown every worker drains the queue and exits, decrementing `total` so `Drop` can wait
+/// them out. Each job runs under `catch_unwind`, so a panicking job retires only itself.
 fn worker_loop(shared: &Arc<PoolShared>) {
-    // Mark this thread with the pool it serves, so a `WorkerPool::drop` triggered here (a job dropping a pool's last
-    // `Arc`) can tell its own pool (must not self-join) from any other (joined as usual).
+    // Mark this thread with the pool it serves (see `ON_POOL_WORKER`).
     ON_POOL_WORKER.with(|w| w.set(Arc::as_ptr(shared)));
     let mut g = shared.inner.lock().unwrap_or_else(|e| e.into_inner());
     loop {
@@ -797,12 +712,9 @@ fn worker_loop(shared: &Arc<PoolShared>) {
                 g.notify -= 1;
                 break;
             }
-            // Woken without a claim (a timeout, a broadcast, a wake another worker consumed first, a spurious wakeup)
-            // with work queued: take it rather than sleep beside it. A job queued without a flush has no claimed
-            // worker, and floor workers wait untimed, so otherwise nothing looks for it before the next flush.
-            //
-            // Keep this after the `notify` arm: a claimed worker taking it would decrement `idle` twice and leave its
-            // claim for another worker. Pinned by `loom_a_claimless_take_cannot_double_count_a_claimed_worker`.
+            // Woken without a claim and with work queued, take it, since a job queued without a flush has no claimed
+            // worker and floor workers wait untimed. Keep this after the `notify` arm, or a claimed worker decrements
+            // `idle` twice (`loom_a_claimless_take_cannot_double_count_a_claimed_worker`).
             if !g.queue.is_empty() {
                 g.idle -= 1;
                 break;
@@ -826,24 +738,9 @@ fn worker_loop(shared: &Arc<PoolShared>) {
 #[cfg(all(test, not(loom)))]
 mod pool_tests;
 
-// ---------------------------------------------------------------------------
-// loom models of the offload pool's lifecycle
-// ---------------------------------------------------------------------------
-//
-// Run with:  RUSTFLAGS="--cfg loom" cargo test --lib --features uring-fs loom_
-//
-// Three protocols live in this file that no amount of timing-based testing can settle, because their correctness is an
-// argument about lock ordering rather than about elapsed time:
-//
-//  * `total` is accounted under the mutex but `running` is bumped outside it,
-//    so growth reads two counters at different synchronization points;
-//  * `Drop` waits for `total` to reach zero, while one of the two paths that
-//    decrements it - the idle retire - does so **without** notifying;
-//  * a job can drop the pool's last `Arc`, re-entering `Drop` on a worker that is itself counted in `total`, which is
-//    what `ON_POOL_WORKER` exists for.
-//
-// The models are deliberately tiny: loom is exhaustive, and `loom::MAX_THREADS` is 5 including the main thread.
-// `cooldown` is zero throughout because `claim_spawn_slot` reads an `Instant`, which loom does not model - so growth is
-// always permitted here rather than throttled.
+// loom models of the pool's lifecycle, whose correctness is about lock ordering rather than elapsed time. `Drop` waits
+// for `total` to reach zero while the idle retire decrements it **without** notifying, and a job can drop the pool's
+// last `Arc`, re-entering `Drop` on a worker counted in `total`. `cooldown` is zero throughout, since loom has no
+// clock.
 #[cfg(all(test, loom))]
 mod loom_tests;

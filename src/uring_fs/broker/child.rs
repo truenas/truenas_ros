@@ -3,22 +3,11 @@ use super::*;
 /// Set the calling process's **effective** set to exactly `caps`, inside the impersonation window, leaving permitted
 /// and inheritable untouched.
 ///
-/// Both words are written. `Caps` lives in the low word, so the high word, capabilities 32 and up such as `CAP_BPF` and
-/// `CAP_PERFMON`, is cleared.
-/// A window that left root finds it empty already, and a root window finds it full, which is why it is never left as
-/// read.
-///
-/// Only effective is written, and that is deliberate rather than sloppy:
-///
-/// - Effective is the set the kernel actually consults -- `cap_capable_helper` tests `cap_raised(cred->cap_effective,
-///   cap)` - so it is the whole of what the snapshot needs.
-/// - Permitted **must not** be narrowed here. `capset` can only ever drop from permitted, never restore it, so trimming
-///   it inside the window would strip the broker's own `CAP_SETUID` for good and wedge every later request. Permitted
-///   is inert for authorization; nothing in an io_uring operation raises effective from it.
-///
-/// This works without `PR_SET_KEEPCAPS` because the window's `setresuid(uid, uid, 0)` keeps saved-uid 0: the kernel
-/// clears *permitted* only when real, effective and saved uid all leave root (`cap_emulate_setxuid`), so permitted
-/// survives the drop with effective emptied - leaving exactly the headroom this raises back.
+/// Both words are written, so the high word (capabilities 32 and up, such as `CAP_BPF`) is cleared, since a root window
+/// finds it full. Permitted **must not** be narrowed here, since `capset` can never restore it and the broker would
+/// lose its own `CAP_SETUID` for good. It stays inert, since authorization reads effective (`cap_capable_helper`) and
+/// nothing in an io_uring operation raises effective from it. The window's `setresuid(uid, uid, 0)` keeps saved-uid 0,
+/// so permitted survives the drop (`cap_emulate_setxuid`) and gives this its headroom.
 pub(super) fn set_effective_caps(caps: Caps) -> errno::Result<()> {
     let mut hdr = CapHeader {
         version: VERSION_3,
@@ -56,11 +45,8 @@ pub(super) fn broker_main(
     scratch: Vec<libc::gid_t>,
 ) -> ! {
     let nrings = tidy_child_fds(sock, ring_fds);
-    // Say the layout took, before anything can be asked of it. `dup2_or_die` exits for a reason the parent cannot see -
-    // a scratch target at or above `RLIMIT_NOFILE` answers `EBADF` (`ksys_dup3`, `/CODE/linux` `fs/file.c:1411-1412`),
-    // which a process holding descriptors near its soft limit at spawn time reaches - and `spawn`, whose failure is
-    // documented as fatal, must not report a completed security setup for a child that is already gone. Eight bytes on
-    // the same socket every reply rides, consumed by `spawn` before it hands back a handle.
+    // Say the layout took, before anything can be asked of it, since `dup2_or_die` exits where the parent cannot see.
+    // `spawn` takes this reply before it hands back a handle.
     if reply(SOCK_FD, 0).is_err() {
         // SAFETY: `_exit` in the forked child; no destructors, no flush.
         unsafe { libc::_exit(4) }
@@ -76,13 +62,8 @@ pub(super) fn broker_main(
 
 /// The broker's request loop, split out so a panic in it is catchable at the `_exit` boundary (see [`broker_main`]).
 ///
-/// The three scratch buffers are allocated by the **parent** before the fork and moved in here: a raw `clone3` bypasses
-/// glibc's atfork malloc mitigation, so allocating in the child could deadlock on an arena lock a concurrent thread
-/// held at fork time.
-///
-/// The loop is then allocation-free, and so is leaving it: the buffers are `mem::forget`ed rather than dropped, because
-/// owning them by value means the frame's drop glue is three `free()` calls - the same arena lock, from the same child.
-/// The guarantee has to cover the return, not just the steady state.
+/// The three scratch buffers are allocated by the **parent** before the fork and moved in here, so the loop allocates
+/// nothing, and leaving it frees nothing (see the end of the body).
 fn broker_loop(
     nrings: usize,
     allowed: Caps,
@@ -133,16 +114,12 @@ fn broker_loop(
             break;
         }
     }
-    // The loop is allocation-free, but *returning* was not: these three are owned here, so the frame's drop glue is
-    // three `free()` calls - on the same arena lock the raw `clone3` may have caught held, which is the deadlock this
-    // whole design avoids. `free` is not `malloc`, but it takes that lock just the same.
-    //
-    // Leaking is free: `broker_main` `_exit`s on the next line, so the kernel reclaims the child's whole address space
-    // regardless, and nothing in this process ever reads the buffers again.
+    // Dropped here, these three would be three `free()` calls on the same arena lock the raw `clone3` may have caught
+    // held. Leaking them costs nothing, since `broker_main` `_exit`s next and the kernel reclaims the child's address
+    // space.
     std::mem::forget(req);
     std::mem::forget(groups);
     std::mem::forget(scratch);
-    // Returns to `broker_main`, which `_exit`s (0 on this clean shutdown).
 }
 
 /// Renumber the child's descriptors to a fixed layout - the IPC socket at [`SOCK_FD`], ring `i` at `RING_FD_BASE + i` -
@@ -169,11 +146,8 @@ fn tidy_child_fds(sock: RawFd, ring_fds: &[RawFd]) -> usize {
         for i in 0..n {
             dup2_or_die(scratch_base + 1 + i as RawFd, RING_FD_BASE + i as RawFd);
         }
-        // Keep ONLY the socket (SOCK_FD) and the rings; scrub everything else the child inherited - the scratch copies
-        // AND fds 0/1/2, where a daemon that closed stdio could have let a ring or the parent IPC end land (a leaked
-        // ring fd is a credential capability; a leaked parent end keeps the socket from ever reaching EOF, stranding a
-        // CAP_SETUID broker). The broker never uses stdio and never execs. A pre-5.9 kernel without close_range leaves
-        // them open - best-effort; the fds are CLOEXEC-marked.
+        // Keep only the socket and the rings, closing fds 0 to 2 as well, where a daemon that closed stdio could have
+        // let a ring (a credential capability) or the parent's end (which keeps the socket from reaching EOF) land.
         libc::syscall(libc::SYS_close_range, 0u32, (SOCK_FD - 1) as libc::c_uint, 0);
         libc::syscall(
             libc::SYS_close_range,
@@ -210,19 +184,12 @@ unsafe fn dup2_or_die(from: RawFd, to: RawFd) {
 /// **The impersonation window.** Become `uid`/`gid`/`groups`, snapshot those credentials into a personality, and
 /// revert.
 ///
-/// Every credential call is a *raw* syscall: glibc's wrappers implement POSIX process-wide semantics by signalling
-/// every thread, which is both unnecessary here (the broker is single-threaded) and precisely the behaviour that makes
-/// in-process impersonation unsound.
-///
-/// Ordering is load-bearing. Groups and gids are set while still privileged; the uid drop comes last and keeps
-/// **saved-uid 0** so the window can be closed again. As euid leaves 0 the kernel's setuid fixup clears the effective
-/// capability set - which is what leaves the snapshot carrying the user's authority and no `CAP_DAC_OVERRIDE`, unless
-/// `caps` asks for something the spawn-time policy allowed.
-///
-/// uid 0 never leaves root, so nothing clears its effective set. For it the window always writes the effective set
-/// itself, to exactly `caps`, and never takes the path that registers the broker's own credentials, which would be the
-/// broker's whole authority under the caller's name.
-/// Nothing else runs inside the window: no allocation, no logging, no fallible work that could unwind.
+/// Every credential call is a *raw* syscall (see the module docs). Groups and gids are set while still privileged, and
+/// the uid drop comes last and keeps **saved-uid 0** so the window can close again. As euid leaves 0 the kernel clears
+/// the effective set, so the snapshot carries the user's authority plus only the `caps` the spawn-time policy allowed.
+/// uid 0 never leaves root, so for it the window always writes the effective set to exactly `caps` and never registers
+/// the broker's own credentials. Nothing else runs inside the window, no allocation, no logging, nothing that could
+/// unwind.
 pub(super) fn register_as(
     ring_fd: RawFd,
     uid: u32,
@@ -231,9 +198,9 @@ pub(super) fn register_as(
     groups: &[u32],
     scratch: &mut [libc::gid_t],
 ) -> i64 {
-    // Registering credentials identical to the broker's own needs no privilege transition at all - and this is the path
-    // an unprivileged process takes, where `setgroups` would fail even for an unchanged list (it always demands
-    // CAP_SETGID). Never for uid 0, whose effective set the window must write, since a broker running as root matches
+    // The broker's own credentials need no transition, which is the path an unprivileged process takes, since
+    // `setgroups` fails without `CAP_SETGID` even for an unchanged list. Never for uid 0, whose effective set the
+    // window must write.
     // it.
     if uid != 0 && !needs_impersonation(uid, gid, groups, scratch) {
         // No transition means no setuid fixup, so the broker's own effective set would go into the snapshot untouched.
@@ -247,13 +214,9 @@ pub(super) fn register_as(
         };
     }
 
-    // The window's security reasoning holds from euid 0 and from nowhere else (`cap_emulate_setxuid`,
-    // `security/commoncap.c:1132-1136`): the effective capability set is cleared only when the *old* euid was root -
-    // which is what keeps the snapshot free of the broker's own authority - and a return to euid 0 refills effective
-    // from permitted, which is what makes saved-uid 0 the way back. A broker running at another euid with CAP_SETUID
-    // raised would stamp its whole effective set into every personality and park 0 in a saved-uid `revert` then
-    // escalates into root permanently. Refuse the window rather than enter it with reasoning that does not apply; a
-    // cross-identity request from a caller with no privilege fails EPERM either way (setgroups demands CAP_SETGID).
+    // The window's reasoning holds from euid 0 alone (`cap_emulate_setxuid`, `security/commoncap.c:1132-1136`). A
+    // broker at another euid with `CAP_SETUID` raised would stamp its whole effective set into every personality, and
+    // `revert` would escalate it into root through saved-uid 0.
     if raw_geteuid() != 0 {
         return -(libc::EPERM as i64);
     }
@@ -284,21 +247,15 @@ pub(super) fn register_as(
         return -(e as i64);
     }
 
-    // Fail CLOSED: confirm the drop actually took effect before snapshotting. The kernel treats a
-    // `(uid_t)-1`/`(gid_t)-1` argument to setres*id as "leave unchanged" and returns success, so a request for uid/gid
-    // `0xFFFFFFFF` slips past the `uid != 0` guards yet leaves the broker fully root - `REGISTER_PERSONALITY` would
-    // then snapshot root creds with `CAP_DAC_OVERRIDE`. Re-reading the effective ids closes that and every future
-    // no-op/sentinel hole: a mismatch means we are not the requested identity, so refuse rather than mint a forged
-    // personality. Raw reads (see `raw_geteuid`) - no glibc between the raw `setresuid` and this check.
+    // Fail closed. setres*id treats `(uid_t)-1` as "leave unchanged" and succeeds, so a sentinel request would leave
+    // the broker fully root. Re-reading the effective ids (raw, see `raw_geteuid`) refuses that and any other no-op.
     if raw_geteuid() != uid || raw_getegid() != gid {
         revert();
         return -(libc::EINVAL as i64);
     }
 
-    // Set the *effective* set the snapshot is about to capture to exactly the requested capabilities. Ordered after the
-    // euid check on purpose, since the credentials being elevated must already be proven to be the requested
-    // identity's. uid 0 always goes through here, even asking for nothing, since its effective set is still the
-    // broker's own.
+    // Ordered after the euid check, so the credentials being elevated are proven to be the requested identity's. uid 0
+    // always goes through here, even asking for nothing, since its effective set is still the broker's own.
     if (uid == 0 || !caps.is_empty())
         && let Err(e) = set_effective_caps(caps)
     {
@@ -317,19 +274,15 @@ pub(super) fn register_as(
 
 /// Is `groups` a different *set* from the broker's current `cur`?
 ///
-/// `true` sends the request through the impersonation window, which is always sound; a wrong `false` serves it under
-/// the *broker's* credentials. Pure over its two arguments so the property can be driven from any host --
-/// `needs_impersonation` around it reads the live process, and one with fewer than two supplementary groups cannot
-/// forge a list to compare.
+/// `true` sends the request through the impersonation window, which is always sound, and a wrong `false` serves it
+/// under the *broker's* credentials. Pure, so tests can drive it on any host.
 pub(super) fn group_set_differs(cur: &[u32], groups: &[u32]) -> bool {
     if cur.len() != groups.len() {
         return true;
     }
-    // Equal length plus one-way containment is not set equality once a gid repeats: a request for `[1, 1]` against a
-    // current `[1, 2]` satisfies both and would take the fast path, registering the broker's *own* credentials - group
-    // 2 included - under the caller's name. A repeat is never something the fast path needs to serve, so it goes
-    // through the window, where `setgroups` installs exactly what was asked for. Quadratic over a supplementary list,
-    // and allocation-free, which the forked child requires.
+    // Equal length plus containment is not set equality once a gid repeats (`[1, 1]` against `[1, 2]`), and the fast
+    // path would register the broker's *own* credentials under the caller's name. A repeat goes through the window
+    // instead.
     let repeats = |l: &[u32]| l.iter().enumerate().any(|(i, g)| l[..i].contains(g));
     if repeats(groups) || repeats(cur) {
         return true;

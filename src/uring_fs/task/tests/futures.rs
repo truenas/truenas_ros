@@ -176,13 +176,9 @@ const ZFS_SUPER_MAGIC: i64 = 0x2fc1_2fc1;
 /// The offload-shaped half of the facade, awaited from one task: the capacity tail, the xattr list, the ZFS
 /// attribute ioctl, server-side copy, and the `open_dir`/`next_batch` walk whose first step is itself a ring op.
 ///
-/// This is also the module's only test whose result depends on which filesystem it runs on, and it needs no fixture
-/// to be: it reads `f_type` through the same `fstatfs` it is exercising, then requires the attribute ioctl to
-/// answer `Ok` on ZFS and `ENOTTY` anywhere else. Point `TMPDIR` at a dataset and it takes the ZFS arm; leave it on
-/// tmpfs and it takes the other. Both arms are assertions, so neither silently degrades into a skip.
-///
-/// Outcomes are collected and asserted after the drive rather than inside the body: an `assert!` in a task body is
-/// contained into its `JoinHandle`, so it would surface as this test's deadline expiring with the message lost.
+/// The attribute ioctl must answer `Ok` on ZFS and `ENOTTY` anywhere else, judged by the `f_type` this test reads, so
+/// both arms assert and neither degrades into a skip. Outcomes are asserted after the drive, since an `assert!` in a
+/// task body is contained into its `JoinHandle` and its message lost.
 #[test]
 fn a_task_awaits_the_offload_shaped_ops_and_sees_the_filesystem() {
     let Some((mut eng, mut fs, who)) = rig() else {

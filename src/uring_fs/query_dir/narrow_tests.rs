@@ -14,10 +14,8 @@ fn narrowing_reuses_the_buffer_instead_of_copying_it() {
     assert!(got.iter().all(|&b| b == 7));
 }
 
-/// `right_size`'s two regimes. A small value gives the probe buffer's surplus back - the capacity assertion is the
-/// defect guard: `truncate` alone leaves a 13-byte ACL carrying its whole 64 KiB probe buffer for as long as the
-/// listing holds it. A value past half the buffer keeps the allocation, pointer-identical, because the shrink's
-/// copy would reclaim less than it moves.
+/// `right_size`'s two regimes. A small value gives the probe buffer's surplus back, which `truncate` alone would not,
+/// and a value past half the buffer keeps the allocation, pointer-identical.
 #[test]
 fn right_sizing_returns_a_probe_buffers_surplus() {
     let got = right_size(vec![7u8; 65536], 13).expect("13 fits");

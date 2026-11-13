@@ -63,15 +63,9 @@ fn loom_a_task_wake_is_never_lost() {
     });
 }
 
-/// An **off-loop** wake landing while a pass is running still pokes: `wake_task`'s condition is `off_loop() ||
-/// !draining`, and the left arm is what covers a foreign thread whose wake the running pass may already have passed
-/// by. Narrow the condition to `!draining` alone and this model deadlocks - the loop parks while the id sits in the
-/// queue.
-///
-/// (The on-loop-inside-a-pass case is deliberately not modelled here: on the loop thread the only wake source
-/// inside a pass is a poll, which runs before the pass's leftover check, so it is sequential and
-/// `a_self_waking_task_cannot_monopolise_a_drain_pass` covers it. Modelling it as a second thread would assert an
-/// interleaving the reactor cannot produce.)
+/// An **off-loop** wake landing while a pass is running still pokes, since the running pass may already have passed its
+/// id by. Narrow `wake_task`'s `off_loop() || !draining` to `!draining` and this model deadlocks. An on-loop wake
+/// inside a pass is a poll, which is sequential, so `a_self_waking_task_cannot_monopolise_a_drain_pass` covers it.
 #[test]
 fn loom_an_off_loop_wake_during_a_pass_still_pokes() {
     bounded_model(|| {
@@ -103,10 +97,8 @@ fn loom_an_off_loop_wake_during_a_pass_still_pokes() {
     });
 }
 
-/// Two threads racing one task's dedup edge: exactly one may claim it, and the queue carries exactly one id for the
-/// edge they raced over. The models above drive a single waker, so `queued.swap`'s losing side is only ever taken
-/// by the loop's own re-wake; two foreign wakers - a completion and an off-loop hand-wake arriving together - is
-/// the shape that exercises it.
+/// Two threads race one task's dedup edge, exactly one may claim it, and the queue carries exactly one id. Two foreign
+/// wakers (a completion and an off-loop hand-wake) are what exercise `queued.swap`'s losing side.
 #[test]
 fn loom_two_wakers_race_one_edge() {
     bounded_model(|| {
@@ -136,11 +128,9 @@ fn loom_two_wakers_race_one_edge() {
     });
 }
 
-/// A pass that samples a budget of zero still leaves the id reachable. `drain` reads `ready` once at entry and
-/// polls no more than that, while `wake_task` pushes the id *before* incrementing - so a pass can genuinely see
-/// zero with an id already queued. That window is harmless because the increment precedes the poke, so the loop the
-/// poke wakes reads a budget that covers the id; the property worth holding is liveness, not any instantaneous
-/// relation between counter and queue.
+/// A pass that samples a budget of zero still leaves the id reachable. `drain` reads `ready` once and `wake_task`
+/// pushes before it publishes the count, so a pass can see zero with an id queued, and the count is published before
+/// the poke.
 #[test]
 fn loom_a_zero_budget_pass_still_delivers() {
     bounded_model(|| {
@@ -239,19 +229,10 @@ fn loom_a_wake_around_a_poll_window_is_covered() {
 
 /// The covering poll sees what the wake published, on the path where nothing else carries it.
 ///
-/// Every model above asserts a **count** - a wake is delivered, and exactly once - and a count is invariant under
-/// `Relaxed`: weaken every ordering in this module and they all stay green, because no payload crosses the edge
-/// they model. This one carries one.
-///
-/// The enqueueing wake needs no help: it pushes under `RunShared::queue` and the pop takes the same lock, so the
-/// lock is the happens-before. The **skipping** wake takes no lock - [`wake_task`] returns straight off the swap -
-/// so the only edge available is `queued` itself, and it exists only because [`poll_window`] acquires there. Weaken
-/// either half to `Relaxed` and this goes red; that is the control `CLAUDE.md` asks for, and it is why the swap is
-/// not a store.
-///
-/// The main thread latches the edge first, so the spawned wake is the deduped one whenever loom schedules it before
-/// the window - and where loom schedules it after, the flag is clear, the wake enqueues, and the trailing drain
-/// polls it under the lock. Either way the *last* poll is the covering one.
+/// Every model above asserts a **count**, which stays green under `Relaxed`, and this one carries a payload. The
+/// **skipping** wake takes no lock, so the only edge is `queued`, which exists only because [`poll_window`] acquires
+/// there. Weaken either half to `Relaxed` and this goes red. Wherever loom schedules the racing wake, the *last* poll
+/// is the covering one.
 #[test]
 fn loom_a_deduped_wake_publishes_what_it_wrote() {
     bounded_model(|| {

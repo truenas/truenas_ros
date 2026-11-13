@@ -46,9 +46,8 @@ fn an_offload_future_delivers_on_loop() {
     drive(&mut fs, &mut eng, &done, "offload future");
 }
 
-/// A detached task's output is dropped by the executor, on the delivery path. Its destructor must therefore unwind
-/// no further than the poll guard, or one request's output takes the reactor thread and every connection on it
-/// down.
+/// A detached task's output is dropped by the executor, on the delivery path, so its panicking destructor must unwind
+/// no further than the poll guard.
 #[test]
 fn a_detached_tasks_output_drops_inside_the_guard() {
     let Some((mut eng, mut fs, who)) = rig() else {
@@ -95,9 +94,7 @@ fn a_detached_tasks_output_drops_inside_the_guard() {
 
 /// A task spawned from inside a task runs, and a slot a retired task left is reused rather than grown past.
 ///
-/// Both halves are asserted. Parent and child coexist, so the table grows to two while they run; the assertion that
-/// everything retired would hold on its own even if `insert` never popped `free`, so the spawn afterwards is what
-/// pins recycling.
+/// Parent and child coexist, so the table grows to two, and the spawn afterwards is what pins recycling.
 #[test]
 fn tasks_nest_and_slots_recycle() {
     let Some((mut eng, mut fs, _who)) = rig() else {
@@ -203,9 +200,8 @@ fn a_stale_waker_does_not_poll_the_slots_next_tenant() {
 /// `TaskFs` reached outside a poll refuses. Debug builds assert;
 /// this is the release half, where the errno is the whole report.
 ///
-/// It must not be `ECANCELED`: that is this module's one meaning for "the reactor is going away", and a release
-/// consumer reading it winds a healthy server down over a caller's bug. Teardown still answers it -
-/// `a_task_dropped_at_teardown_may_reach_its_facade` is that side.
+/// It must not be `ECANCELED`, which a release consumer reads as "the reactor is going away". Teardown still answers it
+/// (`a_task_dropped_at_teardown_may_reach_its_facade`).
 #[cfg(not(debug_assertions))]
 #[test]
 fn task_fs_outside_a_poll_is_refused_rather_than_torn_down() {
@@ -225,9 +221,8 @@ fn task_fs_outside_a_poll_is_refused_rather_than_torn_down() {
     );
 }
 
-/// The three ways a join yields no output need three answers. A handle polled twice conflated with a task torn down
-/// before it finished sends a reader looking for work that did not happen, when what happened is that the work
-/// finished and this caller asked twice.
+/// The three ways a join yields no output need three answers, since a handle polled twice is not a task torn down
+/// before it finished.
 #[test]
 fn a_second_join_poll_is_not_a_task_that_never_finished() {
     let Some((mut eng, mut fs, _who)) = rig() else {
@@ -270,13 +265,9 @@ fn a_second_join_poll_is_not_a_task_that_never_finished() {
     assert!(matches!(e, JoinError::Dropped), "want Dropped, got {e}");
 }
 
-/// A task still pending at teardown has its future dropped with no poll on the stack. A guard of the "submit on
-/// drop" shape reaches `TaskFs` there, and that is not misuse - it is the documented "whatever outlives the loop is
-/// dropped with the reactor's tables". In a debug build an assert there is a second panic, and a teardown that is
-/// itself an unwind then aborts, replacing the first panic's diagnosis with a bare SIGABRT.
-///
-/// One test for both profiles: the release build never asserted, so what it pins is that the shape stays a silent
-/// no-op.
+/// A task still pending at teardown has its future dropped with no poll on the stack, and a "submit on drop" guard
+/// reaching `TaskFs` there is not misuse. One test for both profiles, since in debug an assert there would be a second
+/// panic.
 #[test]
 fn a_task_dropped_at_teardown_may_reach_its_facade() {
     let Some((mut eng, mut fs, _who)) = rig() else {
@@ -309,10 +300,8 @@ fn a_task_dropped_at_teardown_may_reach_its_facade() {
 
 /// A nested `owner_is_gone` must not call a live owner dead.
 ///
-/// Inside a `fut`'s submit closure the facade is parked out of the thread-local for the extent of the call, so the
-/// nested reach cannot read the owner's state - and answering `true` there makes the natural helper shape, a
-/// closure that both checks and submits, abandon work for a connection that is alive. Release half; the misuse
-/// asserts in debug like every sibling, so the whole test is `cfg`'d the same way.
+/// Inside a `fut`'s submit closure the facade is parked out of the thread-local, so the nested reach cannot read the
+/// owner's state, and `true` there would abandon work for a live connection. Release half, `cfg`'d like every sibling.
 #[cfg(not(debug_assertions))]
 #[test]
 fn a_nested_owner_check_does_not_call_a_live_owner_gone() {
@@ -346,11 +335,8 @@ fn a_nested_owner_check_does_not_call_a_live_owner_gone() {
 
 /// A re-arming task winds down when the server drains, on the signal alone.
 ///
-/// Every await here succeeds and the owner stays live, so neither of the other wind-down signals ever fires -
-/// without [`TaskFs::draining`] this shape holds a graceful drain open to its grace deadline, which is the case the
-/// net drain test can only bound from above. The task is given a generous iteration budget precisely so the signal,
-/// not the budget, is what ends it: the negative control (the getter hardwired `false`) runs the budget out and
-/// fails the count below.
+/// Every await here succeeds and the owner stays live, so only [`TaskFs::draining`] can end it. The iteration budget is
+/// generous so the signal, not the budget, ends the task, and the getter hardwired `false` fails the count below.
 #[test]
 fn a_rearming_task_winds_down_when_the_server_drains() {
     let Some((mut eng, mut fs, _who)) = rig() else {
@@ -398,10 +384,8 @@ fn a_rearming_task_winds_down_when_the_server_drains() {
 
 /// A task awaiting only offloads learns its owner is gone, because nothing else will tell it.
 ///
-/// The two signals this module names - "your ops start failing" and "the source feeding you closes" - are both
-/// unreachable for this shape: an offload is never cancelled and always delivers. Left to run, it holds the live
-/// gauge up and a graceful drain with it, so the reactor waits out its whole grace period on work for a connection
-/// that hung up.
+/// An offload is never cancelled and always delivers, so neither of the module's other wind-down signals reaches this
+/// shape.
 #[test]
 fn an_offload_only_task_can_see_that_its_owner_is_gone() {
     let Some((mut eng, mut fs, _who)) = rig() else {
@@ -443,10 +427,8 @@ fn an_offload_only_task_can_see_that_its_owner_is_gone() {
 
 /// One task's destructor panicking at teardown does not take the tasks queued behind it.
 ///
-/// The mark above suppresses the assert a submit-on-drop guard raises; it does nothing for a destructor that panics
-/// for its own reasons, and that panic escapes a `Drop` impl - which aborts outright when the teardown is itself an
-/// unwind. The evidence has to be a *second* task: contained means the sweep carries on, so what it drops is what
-/// says so.
+/// The teardown mark suppresses an assert, not a destructor's own panic, which would escape a `Drop` impl. The evidence
+/// has to be a *second* task, since contained means the sweep carries on.
 #[test]
 fn a_teardown_panic_does_not_take_the_tasks_behind_it() {
     let Some((mut eng, mut fs, _who)) = rig() else {
@@ -503,10 +485,8 @@ fn a_teardown_panic_does_not_take_the_tasks_behind_it() {
 
 /// A `TaskFs` that left its body cannot submit under whatever task happens to be running.
 ///
-/// Removing `Clone` does not keep it inside its body - the handle is `'static` and `!Send`, so a body can *move* it
-/// into any `'static` non-`Send` place on the loop thread and something else can pick it up there. Identity is what
-/// refuses it: without the check the op is submitted against the running task's facade and stamped its owner, so
-/// the wrong connection's teardown sweep cancels it and the right one leaves its descriptor parked.
+/// A body can *move* the handle into `'static` state on the loop thread for another task to pick up, and the task id
+/// refuses it there (see `CURRENT_TASK`).
 ///
 /// The debug half; `_without_asserts` is the release sibling, and the gate runs both profiles.
 #[cfg(debug_assertions)]
@@ -586,9 +566,8 @@ fn task_fs_outside_a_poll_debug_asserts() {
     drop(t.fut(|_c, _cb| {}));
 }
 
-/// The live gauge an embedding host's drain reads: a spawned task counts until it retires, so a drain that consults
-/// it cannot stop the loop with task work outstanding. A task pending with no op in flight is invisible to a
-/// connection count, which is the case this exists for.
+/// The live gauge an embedding host's drain reads counts a spawned task until it retires, since a task pending with no
+/// op in flight is invisible to a connection count.
 #[test]
 fn the_task_gauge_tracks_live_tasks() {
     let Some((mut eng, mut fs, _who)) = rig() else {
@@ -660,13 +639,9 @@ fn a_panicking_task_is_contained_and_reported() {
 }
 
 /// The other three misuse guards, release halves: reaching `offload_fut`, `result_fut` or `spawn` outside a poll
-/// cannot submit, so each resolves rather than pends. `CLAUDE.md` wants a test per half of a `debug_assert` + `if`
-/// pair; the debug halves are below. Left untested, the `if` is free to resolve as anything - a slot that never
-/// resolves at all included, which hangs the task holding `tasks.live` up and a graceful drain open with it.
-///
-/// `EINVAL` rather than `ECANCELED` for the two futures, on
-/// `task_fs_outside_a_poll_is_refused_rather_than_torn_down`'s reasoning. `spawn` keeps `Dropped`, which its own
-/// doc already covers both ways: the body never ran, and there is no third meaning for that answer to collide with.
+/// cannot submit, so each resolves rather than pends, since a slot that never resolves hangs the task and a graceful
+/// drain with it. `EINVAL` rather than `ECANCELED` for the two futures, as
+/// `task_fs_outside_a_poll_is_refused_rather_than_torn_down` explains, and `Dropped` for `spawn`, whose body never ran.
 #[cfg(not(debug_assertions))]
 #[test]
 fn the_other_task_fs_guards_resolve_outside_a_poll() {
@@ -768,10 +743,8 @@ fn run_woken_polls_a_hand_woken_task() {
     );
 }
 
-/// A drain pass covers exactly what was queued when it began: a task that wakes itself on every poll runs once per
-/// pass and its re-wake waits for the next, instead of the pass spinning on it forever with the ring starved. The
-/// guard inside the future is what a regression hits - an unbounded pass re-polls it past the cap and fails by name
-/// rather than hanging the suite.
+/// A drain pass covers exactly what was queued when it began, so a task that wakes itself on every poll runs once per
+/// pass. An unbounded pass re-polls the future past its cap and fails by name rather than hanging.
 #[test]
 fn a_self_waking_task_cannot_monopolise_a_drain_pass() {
     let Some((mut eng, mut fs, _who)) = rig() else {
