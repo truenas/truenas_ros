@@ -4,9 +4,6 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 /// A [`BorrowedFd`] referring to the current working directory, for use with the `*at` family of syscalls (the
 /// `AT_FDCWD` sentinel).
-///
-/// Passing this through the same `AsFd` bound as a real directory fd keeps the `*at` wrappers uniform instead of
-/// special-casing a magic integer.
 pub const AT_FDCWD: BorrowedFd<'static> =
     // SAFETY: `AT_FDCWD` is a sentinel the kernel never treats as a real fd; it is never closed, so a `'static` borrow
     // is sound.
@@ -14,13 +11,11 @@ pub const AT_FDCWD: BorrowedFd<'static> =
 
 /// Duplicate `fd` into an owned, close-on-exec descriptor.
 ///
-/// The dup aliases the same open file description, so socket state read through it (`getsockopt`) is the socket's
-/// regardless of what the original number is later reused for - which is why a handle that must outlive a caller-owned
-/// fd carries its own dup rather than the number.
+/// The dup aliases the same open file description, so a handle that must outlive a caller-owned fd carries its own dup
+/// rather than the number, which may be reused.
 ///
-/// **The errno is the answer, not a bool.** Every failure here is `EMFILE` or `ENFILE` in practice, and a caller that
-/// swallows it has to invent one: `net::client::tls` reported `ECONNABORTED` for a process out of descriptors, telling
-/// the consumer the peer had gone.
+/// Every failure here is `EMFILE` or `ENFILE` in practice. Pass the errno on, since a caller that swallows it has to
+/// invent one and blames the wrong thing.
 #[allow(dead_code)] // unused only when no feature module is compiled
 pub(crate) fn dup_cloexec(fd: BorrowedFd<'_>) -> crate::errno::Result<OwnedFd> {
     // SAFETY: `F_DUPFD_CLOEXEC` allocates a fresh descriptor >= 0; it reads no memory.

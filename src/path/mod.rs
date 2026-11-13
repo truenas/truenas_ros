@@ -4,7 +4,7 @@
 //! paths and a heap fallback for long ones, then hands it to a closure. An interior NUL byte yields [`Errno::EINVAL`].
 //!
 //! [`component_defect`] and [`relative_defect`] are the shape rules the `*at` opcodes need, since none of them honours
-//! a `RESOLVE_*` flag. See [`Defect`] for what each refuses and why there is no normalisation here.
+//! a `RESOLVE_*` flag. See [`Defect`] for what each refuses, and `shape.rs` for why nothing is normalised.
 
 use crate::errno::{Errno, Result};
 
@@ -95,7 +95,7 @@ impl TnPath for [u8] {
     where
         F: FnOnce(&CStr) -> T,
     {
-        // Paths shorter than a page are stack-allocated to avoid a heap allocation on the syscall hot path.
+        // Paths under 1 KiB are stack-allocated to avoid a heap allocation on the syscall hot path.
         const MAX_STACK_ALLOCATION: usize = 1024;
 
         if self.len() >= MAX_STACK_ALLOCATION {

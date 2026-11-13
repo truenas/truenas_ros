@@ -16,14 +16,10 @@ type Acc = Option<Vec<String>>;
 
 /// Whitespace as CPython counts it, which is not what Rust counts.
 ///
-/// `str.strip()`, `str.isspace()` and `re`'s `\s` all go through `Py_UNICODE_ISSPACE`, which includes U+001C..U+001F -
-/// the file, group, record and unit separators. Unicode's `White_Space` property, which `char::is_whitespace`
-/// implements, does not. Compared across every code point those four are the *only* disagreement in either direction,
-/// so widening by exactly them makes the two definitions identical.
-///
-/// It matters because every strip in the read loop is a strip `configparser` also performs: a key or value fenced by
-/// one of these bytes otherwise parses to a different string here than there, and `get` and `write_string` both inherit
-/// the difference.
+/// `str.strip()`, `str.isspace()` and `re`'s `\s` all go through `Py_UNICODE_ISSPACE`, which includes the separators
+/// U+001C..U+001F, and `char::is_whitespace` does not. Across every code point those four are the only disagreement in
+/// either direction, so widening by exactly them makes the two identical. A key or value fenced by one of them would
+/// otherwise parse to a different string here than there.
 fn is_py_space(c: char) -> bool {
     c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}')
 }
@@ -38,18 +34,14 @@ fn py_rstrip(s: &str) -> &str {
     s.trim_end_matches(is_py_space)
 }
 
-/// Why this loop would not read `key` back as the name it was given, or `None` if it round-trips. Each arm names its
-/// own reason.
+/// Why this loop would not read `key` back as the name it was given, or `None` if it round-trips.
 ///
-/// Keys are written verbatim - by [`super::write`], and by CPython's `_write_section` (`Lib/configparser.py:961`),
-/// which re-indents a newline in the *value* and does nothing to the key - so a name carrying this loop's syntax parses
-/// back as something else.
+/// Keys are written verbatim, by [`super::write`] and by CPython's `_write_section` (`Lib/configparser.py:961`), so a
+/// name carrying this loop's syntax parses back as something else. Screened at [`super::ConfigFile::set`], the only way
+/// in, since keys from [`read`] are safe by construction.
 ///
-/// Screened at [`super::ConfigFile::set`] rather than at write time, since that is the only way in: keys from [`read`]
-/// are safe by construction, because this loop splits on lines, splits at the first delimiter, and strips.
-///
-/// The `[` rule is blunter than [`section_header`], which also wants a closing `]` past the first column, so `[]x` is
-/// refused though it would survive. A second copy of the header rule would be free to drift from the one that decides.
+/// The `[` rule is blunter than [`section_header`], so `[]x` is refused though it would survive. A second copy of the
+/// header rule would be free to drift from the one that decides.
 pub(super) fn key_fault(key: &str) -> Option<&'static str> {
     if key.is_empty() {
         Some("is empty")
@@ -279,10 +271,9 @@ fn section_header(clean: &str) -> Option<&str> {
 
 /// Split a stripped option line into `(key, value)`.
 ///
-/// Mirrors `configparser`'s `OPTCRE`/`OPTCRE_NV`: the first `=` or `:` splits key from value, whitespace around the
-/// delimiter is dropped, and the value is
-/// stripped. With `allow_no_value`, a line with no delimiter is a valueless key;
-/// otherwise it is a syntax error (returned as `None`).
+/// Mirrors `configparser`'s `OPTCRE`/`OPTCRE_NV`. The first `=` or `:` splits key from value, whitespace around the
+/// delimiter is dropped, and the value is stripped. With `allow_no_value`, a line with no delimiter is a valueless key,
+/// and otherwise it is a syntax error (returned as `None`).
 fn parse_option(clean: &str, allow_no_value: bool) -> Option<(&str, Option<&str>)> {
     match clean.find(['=', ':']) {
         Some(p) => {

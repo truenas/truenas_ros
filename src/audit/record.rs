@@ -1,5 +1,4 @@
-//! Describing an event and rendering its record text - pure string work, no syscalls, so every rule below is unit
-//! tested directly.
+//! Describing an event and rendering its record text, as pure string work with no syscalls.
 //!
 //! The field layout mirrors linux-PAM's (`op=<service>:<verb>`, `acct=`, `addr=`, ... `res=success|failed`), so a
 //! record built here sits beside PAM's in `/var/log/audit/audit.log` and answers the same `ausearch`/`aureport`
@@ -10,14 +9,10 @@ use std::fmt::Write;
 
 /// The `AUDIT_*` type of a record: its event class, and what `ausearch -m` selects on.
 ///
-/// The values are the userspace message range, `AUDIT_FIRST_USER_MSG` ..= `AUDIT_LAST_USER_MSG` (`linux/audit.h`) - the
-/// types a process holding `CAP_AUDIT_WRITE` may originate. The kernel uapi header names only the few it treats
-/// specially, so the constants below carry the audit-userspace names from `audit-records.h`; the numbers are what
-/// matters on the wire.
-///
-/// [`AuditType::new`] admits any value in the two userspace ranges, so a type this crate predates is still reachable;
-/// anything else (a kernel-originated or `CAP_AUDIT_CONTROL` type) is rejected rather than sent for the kernel to
-/// refuse with `EINVAL`/`EPERM`.
+/// The values are the userspace message range, `AUDIT_FIRST_USER_MSG` ..= `AUDIT_LAST_USER_MSG` (`linux/audit.h`),
+/// the types a process holding `CAP_AUDIT_WRITE` may originate. The constants carry the audit-userspace names from
+/// `audit-records.h`. [`AuditType::new`] admits any value in the two userspace ranges, so a type this crate predates is
+/// still reachable.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AuditType(u16);
 
@@ -211,10 +206,9 @@ impl AuditEvent<'_> {
     /// Appends rather than replaces, so a caller can reuse one buffer across records by clearing it;
     /// [`AuditSocket`](super::AuditSocket) does exactly that.
     pub fn write_message(&self, out: &mut String) {
-        // PAM writes `op=` as a bare token and readers take it verbatim, so keep that shape when both halves are clean.
-        // The value always contains the `:`, so a bare `op=` can never be mistaken for a hex-encoded value (those are
-        // hex digits only). A caller-supplied verb carrying a space or a quote would break the record, so that case
-        // falls back to the encoded form.
+        // PAM writes `op=` as a bare token, so keep that shape when both halves are clean. The value always contains
+        // the `:`, so it can never be mistaken for a hex-encoded value. A space or quote in either half falls back to
+        // the encoded form.
         if needs_encoding(self.service) || needs_encoding(self.verb) {
             let mut op = String::with_capacity(self.service.len() + self.verb.len() + 1);
             op.push_str(self.service);
@@ -297,9 +291,8 @@ fn encode_nv(out: &mut String, key: &str, value: &str) {
 /// The kernel's rule, from `audit_string_contains_control` (`kernel/audit.c`): a `"`, or any byte outside
 /// `0x21..=0x7e`. The kernel walks the value as `unsigned char`, so that range excludes `0x7f` and `0x80..=0xff` alike.
 ///
-/// An empty value contains no such byte, so - like the kernel's loop, which simply does not run - it is *not* encoded,
-/// and [`encode_nv`] renders it as `key=""`. Encoding it instead would hex-encode zero bytes and emit a bare `key=`,
-/// which is the ambiguous unquoted form, not the safe one.
+/// An empty value is *not* encoded, since the kernel's loop does not run for it, and [`encode_nv`] renders it as
+/// `key=""`. Encoding it would emit a bare `key=`, the ambiguous unquoted form.
 ///
 /// One addition: `'` also forces encoding. The kernel wraps a user-space record's text in `msg='...'`
 /// (`kernel/audit.c`) and does not encode an apostrophe itself, so one inside a value closes that quote early.
@@ -339,9 +332,7 @@ mod tests {
         assert!(!needs_encoding("admin") && !needs_encoding("API_KEY"));
     }
 
-    /// The kernel's `audit_string_contains_control` loop does not run for a zero-length value, so an empty string is
-    /// *clean* and takes the quoted form. Encoding it instead would hex-encode nothing and emit a bare `key=` - the
-    /// ambiguous unquoted shape, not the safe one.
+    /// An empty string is clean and takes the quoted form, never a bare `key=`.
     #[test]
     fn an_empty_value_is_the_quoted_empty_string() {
         assert!(!needs_encoding(""));

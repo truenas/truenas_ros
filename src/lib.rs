@@ -1,8 +1,8 @@
 //! `truenas_ros` - idiomatic Rust bindings for modern Linux filesystem and mount syscalls that glibc does not wrap,
 //! plus NFS4/POSIX1E ACLs, a filesystem iterator, idmapped-mount user namespaces, and symlink-safe / atomic file I/O.
 //!
-//! This is the Rust equivalent of the Python `truenas_pyos` library. It targets Linux kernels 6.18 and newer and
-//! depends only on `libc` and `bitflags`.
+//! This is the Rust equivalent of the Python `truenas_pyos` library. It targets Linux kernels 6.18 and newer. The base
+//! crate depends only on `libc` and `bitflags`, the `http` and `ws` codecs add `httparse`, and `ws` adds `openssl`.
 //!
 //! # Error layering
 //!
@@ -12,13 +12,13 @@
 //! # Features and layout
 //!
 //! Functionality is split into per-subsystem Cargo features grouped under umbrella modules: [`sync_fs`] (blocking fs
-//! bindings - features `sync-fs`, `xattr`, `acl`, `fhandle`, `fsiter`, `shutil`), [`mount`] (mount topology and
-//! idmapped-mount support - features `mount`, `idmap`), [`configfile`], [`audit`] (kernel audit records over
-//! `NETLINK_AUDIT`), [`log`](mod@log) (a daemon's log, sent to the journal without blocking), the io_uring `net` stack
-//! (`net-core`/`net-server`/`net-client`) with the [`http`] codec over it (`http`), the io_uring fs reactor
-//! [`uring_fs`] (`uring-fs`), and two pieces for a daemon's `main`: [`secrets`] (`memfd_secret`-backed memory,
-//! `secrets`) and [`signal`] (block the signals a daemon acts on and receive them as values, `signal`). `full` enables
-//! everything except `uring-fs`, which is opted into on its own.
+//! bindings - features `sync-fs`, `xattr`, `acl`, `fhandle`, `fanotify`, `fsiter`, `shutil`), [`mount`] (mount
+//! topology and idmapped-mount support - features `mount`, `idmap`), [`configfile`], [`audit`] (kernel audit records
+//! over `NETLINK_AUDIT`), [`log`](mod@log) (a daemon's log, sent to the journal without blocking), the io_uring `net`
+//! stack (`net-core`/`net-server`/`net-client`) with the [`http`] codec over it (`http`) and the client WebSocket codec
+//! [`ws`] (`ws`), the io_uring fs reactor [`uring_fs`] (`uring-fs`), and two pieces for a daemon's `main`, [`secrets`]
+//! (`memfd_secret`-backed memory, `secrets`) and [`signal`] (block the signals a daemon acts on and receive them as
+//! values, `signal`). `full` enables everything except `uring-fs`, which is opted into on its own.
 #![cfg(target_os = "linux")]
 #![allow(non_camel_case_types)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -39,18 +39,14 @@ pub mod fd;
 pub mod path;
 pub mod tempdir;
 
-// std's synchronization primitives, or loom's under `--cfg loom`. A plain re-export outside a model run - see the
-// module docs. Only the subsystems with loom models import from here; the rest use `std::sync` directly.
+// std's synchronization primitives, or loom's under `--cfg loom`. Only the subsystems with loom models import from
+// here, and the rest use `std::sync` directly.
 #[cfg(any(feature = "uring", feature = "uring-fs"))]
 pub(crate) mod sync;
 
-// The shared `clone3` fork helper (pidfd + signal-handler reset), used by the credential broker and the idmapped-mount
-// userns builder.
 #[cfg(any(feature = "idmap", feature = "uring-fs"))]
 mod clone3;
 
-// The volatile zeroing burn, shared by `secrets` (which re-exports it as its public `scrub`) and `configfile`'s
-// scrub-on-release mode.
 #[cfg(any(feature = "configfile", feature = "secrets"))]
 mod scrub;
 

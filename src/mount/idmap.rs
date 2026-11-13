@@ -96,8 +96,8 @@ fn format_map(entries: &[IdmapEntry]) -> String {
 
 fn create_userns_fd(uid_text: &str, gid_text: &str) -> Result<OwnedFd> {
     let mut pidfd: RawFd = -1;
-    // SAFETY: `create_idmap_userns` documents the single-threaded-at-fork precondition; the child below runs only
-    // `pause()` (async-signal-safe).
+    // SAFETY: the child below runs only `pause()`, which is async-signal-safe, so a lock another thread held at the
+    // fork cannot deadlock it.
     let pid = unsafe { crate::clone3::clone3_fork(crate::clone3::CLONE_NEWUSER, libc::SIGCHLD as u64, &mut pidfd) }?;
     if pid == 0 {
         // CHILD: async-signal-safe only - no allocation, no locks, no panics. Block until the parent SIGKILLs us
@@ -196,9 +196,8 @@ impl IdmapCache {
                 return dup(fd);
             }
         }
-        // Minting outside the lock lets two callers race the same key; both create a namespace, and the keep-the-winner
-        // insert drops the loser's fd, reclaiming its namespace. Redundant creation is rare and bounded - the key space
-        // is a handful of mount configs.
+        // Two callers may race the same key and both create a namespace. The keep-the-winner insert drops the loser's
+        // fd, and the key space is a handful of mount configs.
         let fd = create_idmap_userns(uid_map, gid_map)?;
         let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         dup(guard.entry(key).or_insert(fd))

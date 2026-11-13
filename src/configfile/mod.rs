@@ -1,11 +1,8 @@
 //! An INI-file parser and serializer, byte-for-byte compatible with Python's standard-library `configparser`.
 //!
-//! [`ConfigFile`] mirrors `configparser.ConfigParser` (and, via [`ConfigFile::raw`], `RawConfigParser`): the same INI
-//! grammar, the same `optionxform` key-lowercasing, DEFAULT-section inheritance, `%(name)s` interpolation, and the same
-//! serialization (delimiter, blank-line, and multi-line-`\t` rules). Where `configparser` leaves durability and safety
-//! to the caller, this module wires file I/O through the crate's symlink-safe [`safe_open`] and atomic
-//! [`atomic_replace`], so [`ConfigFile::read_path`] never follows a symlink and [`ConfigFile::write_path`] replaces the
-//! target atomically (temp file, `fsync`, `rename`) with an explicit owner and mode.
+//! [`ConfigFile`] mirrors `configparser.ConfigParser`, and via [`ConfigFile::raw`] `RawConfigParser`. File I/O goes
+//! through the crate's symlink-safe [`safe_open`] and atomic [`atomic_replace`], so [`ConfigFile::read_path`] never
+//! follows a symlink and [`ConfigFile::write_path`] replaces the target atomically with an explicit owner and mode.
 //!
 //! # Compatibility scope
 //!
@@ -17,20 +14,17 @@
 //!
 //! # Secret-bearing files
 //!
-//! A configuration built with [`ConfigFile::scrubbed`] burns every buffer this module allocates for it - the file
-//! image, the parse accumulators, the stored keys and values, and the serialization buffer - with a volatile zeroing
-//! pass as each is released, so dropping the configuration leaves no heap copies behind.
-//! With the `secrets` feature, [`ConfigFile::read_secret_path`] additionally stages the raw file image in
-//! `memfd_secret`-backed memory, off the ordinary heap entirely.
+//! A configuration built with [`ConfigFile::scrubbed`] burns every buffer this module allocates for it with a volatile
+//! zeroing pass as each is released, so dropping the configuration leaves no heap copies behind. With the `secrets`
+//! feature, [`ConfigFile::read_secret_path`] also stages the raw file image in `memfd_secret`-backed memory.
 //!
-//! The guarantee's edges are stated rather than implied. Stored values are ordinary heap memory while the configuration
-//! lives - swappable, and visible in a core dump - so a long-lived secret belongs in
-//! [`Secret`](crate::secrets::Secret), moved there promptly from [`get_raw`](ConfigFile::get_raw). Whatever an accessor
-//! returns ([`get`](ConfigFile::get), [`items`](ConfigFile::items), [`write_string`](ConfigFile::write_string)) is the
-//! caller's copy and the caller's to burn, as is a [`read_str`](ConfigFile::read_str) input buffer. Interpolation
-//! intermediates are not chased - [`raw`][ConfigFile::raw] is the secrets configuration - nor are transient key copies
-//! in parse control state, and the kernel's page cache retains what was read from disk regardless of anything a process
-//! does.
+//! Stored values are ordinary heap memory while the configuration lives, swappable and visible in a core dump, so a
+//! long-lived secret belongs in [`Secret`](crate::secrets::Secret), moved there promptly from
+//! [`get_raw`](ConfigFile::get_raw). Whatever an accessor returns ([`get`](ConfigFile::get),
+//! [`items`](ConfigFile::items), [`write_string`](ConfigFile::write_string)) is the caller's copy to burn, as is a
+//! [`read_str`](ConfigFile::read_str) input buffer. Interpolation intermediates are not chased, so
+//! [`raw`][ConfigFile::raw] is the secrets configuration. Transient key copies in parse control state and the kernel's
+//! page cache are not chased either.
 //!
 //! ```
 //! use truenas_ros::configfile::ConfigFile;
@@ -71,9 +65,9 @@ enum Interp {
 
 /// A minimal insertion-ordered, string-keyed map.
 ///
-/// `entries` preserves insertion order - the Python `dict`-assignment semantics `configparser`'s ordering relies on -
-/// and `index` maps each key to its position so lookups and the upsert [`insert`](Ordered::insert) are O(1) rather than
-/// a scan. Without the index, parsing an untrusted config with very many keys in one section would be quadratic.
+/// `entries` keeps insertion order, as `configparser` relies on, and `index` makes lookups and the upsert
+/// [`insert`](Ordered::insert) O(1). Without the index, parsing an untrusted config with very many keys in one section
+/// would be quadratic.
 #[derive(Clone, Debug, Default)]
 struct Ordered<V> {
     entries: Vec<(String, V)>,
@@ -145,10 +139,8 @@ impl<V> Ordered<V> {
         self.entries.iter().map(|(k, _)| k.as_str())
     }
 
-    /// Burn the store at end of life: every key - the entries' and the
-    /// index's copies - and each value through `burn`. The one burn walk;
-    /// every scrubbing release goes through it so a missed copy cannot drift in on one path. The index is drained, so
-    /// only dropping the map should follow.
+    /// Burn every key, the entries' and the index's copies, and each value through `burn`. Every scrubbing release goes
+    /// through this one walk so no path misses a copy. The index is drained, so only dropping the map should follow.
     fn scrub_with(&mut self, mut burn: impl FnMut(&mut V)) {
         for (key, value) in &mut self.entries {
             scrub_string(key);
@@ -161,10 +153,6 @@ impl<V> Ordered<V> {
 }
 
 /// An INI configuration, compatible with Python's `configparser`.
-///
-/// Build one with [`new`](Self::new) (interpolating, like `ConfigParser`) or [`raw`](Self::raw) (like
-/// `RawConfigParser`), populate it by reading a string or file, query it with the typed getters, and serialize it back
-/// with [`write_string`](Self::write_string) or [`write_path`](Self::write_path).
 #[derive(Clone)]
 pub struct ConfigFile {
     defaults: Ordered<Option<String>>,
@@ -226,8 +214,7 @@ fn scrub_opts(opts: &mut Ordered<Option<String>>) {
     });
 }
 
-/// Burn a value displaced by an upsert. [`Ordered::insert`] hands the old value back rather than dropping it so this
-/// can run.
+/// Burn a value displaced by an upsert.
 fn scrub_displaced(scrub: bool, displaced: Option<Option<String>>) {
     if !scrub {
         return;
@@ -272,12 +259,11 @@ impl ConfigFile {
 
     /// Burn every buffer this configuration allocates - the file image, parse accumulators, and stored keys and
     /// values - with a volatile zeroing pass as each is released, the whole store included when the configuration
-    /// drops. For files that carry secrets; see the module docs for exactly where the guarantee ends. Off by default.
+    /// drops. It is for files that carry secrets, and the module docs say where the guarantee ends. Off by default.
     ///
-    /// Parsing and every accessor behave identically either way, with two exceptions. Error messages withhold what came
-    /// out of the file -- the value a typed getter or interpolation would quote, and the duplicated key or section name
-    /// a parse error would name - since for a credentials file none of it may reach a log. And a scrubbed read refuses
-    /// a non-regular file, whose stat size cannot pre-size the single burned buffer.
+    /// Parsing and every accessor behave identically either way, with two exceptions. Error messages withhold every
+    /// value and name that came out of the file, so none of it reaches a log. And a scrubbed read refuses a non-regular
+    /// file, whose stat size cannot pre-size the single burned buffer.
     pub fn scrubbed(mut self, yes: bool) -> Self {
         self.scrub = yes;
         self
@@ -285,9 +271,8 @@ impl ConfigFile {
 
     // --- reading ---------------------------------------------------------
 
-    /// Parse the INI document in `s` and merge it in (like
-    /// `configparser.read_string`). Later values override earlier ones;
-    /// duplicate sections or options *within* `s` are rejected.
+    /// Parse the INI document in `s` and merge it in (like `configparser.read_string`). Later values override earlier
+    /// ones, and duplicate sections or options *within* `s` are rejected.
     pub fn read_str(&mut self, s: &str) -> Result<()> {
         parse::read(self, "<string>", s)
     }
@@ -322,28 +307,24 @@ impl ConfigFile {
     }
 
     /// Read and parse `path` with the raw file image staged in `memfd_secret`-backed memory
-    /// ([`SecretMem`](crate::secrets::SecretMem)) - off the kernel's direct map, off swap, absent from core dumps - and
-    /// burned when the read ends. The image never touches the ordinary heap.
+    /// ([`SecretMem`](crate::secrets::SecretMem)) and burned when the read ends. The image never touches the ordinary
+    /// heap.
     ///
-    /// Reading this way marks the configuration [`scrubbed`](Self::scrubbed): the parse output it produces will be
-    /// burned on release like the image was. Only a regular file is accepted - nothing else has a stat size the staging
-    /// region can be sized from.
-    ///
-    /// Fails where `memfd_secret` is unavailable rather than degrading to an ordinary read.
+    /// Once the image is staged, the configuration is [`scrubbed`](Self::scrubbed) and [`raw`](Self::raw) for good.
+    /// Only a regular file is accepted. Fails where `memfd_secret` is unavailable rather than degrading to an ordinary
+    /// read.
     ///
     /// Returns which file image was read, so a caller can skip rebuilding what it derived when the next read finds the
     /// same one ([`StagedIdentity::same`]).
     #[cfg(feature = "secrets")]
     pub fn read_secret_path(&mut self, path: &Path) -> Result<StagedIdentity> {
         let source = path.display().to_string();
-        // Staged first, and the two settings below only once it has succeeded: both are one-way, so setting them ahead
-        // of a fallible read permanently downgrades an already-populated interpolating configuration to raw on a secret
-        // this call never got to read.
+        // Stage first. Both settings below are one-way, so setting them ahead of a fallible read would downgrade an
+        // interpolating configuration to raw over a secret this call never read.
         let (id, staged) = stage_secret_image(path)?;
         self.scrub = true;
-        // Read secrets verbatim. Interpolation would route a value through `before_get`, whose growing accumulator
-        // orphans partial-plaintext copies in freed heap the scrub-on-drop never reaches; the module doc already names
-        // raw the secrets configuration.
+        // Read secrets verbatim. The growing accumulator in `before_get` would leave partial plaintext copies in freed
+        // heap that no scrub reaches.
         self.interp = Interp::None;
         match staged {
             None => parse::read(self, &source, "")?,
@@ -369,10 +350,8 @@ impl ConfigFile {
         for path in paths {
             match self.read_path(&path) {
                 Ok(()) => read.push(path),
-                // Unusable candidate - missing, permissions, a symlink component, or a non-regular file (a scrubbed
-                // read refuses one, `read_path`'s doc): skip it, as `configparser` skips any `OSError` from `open`, so
-                // one bad entry cannot deny the whole load (including files already parsed). A file that opens but
-                // fails to parse - or grows mid-read (`Error::Validation`) - still aborts.
+                // Skipped as `configparser` skips any `OSError` from `open`, so one bad entry cannot deny the whole
+                // load. A file that opens but fails to parse, or grows mid-read, still aborts.
                 Err(Error::Errno(_)) | Err(Error::SymlinkInPath { .. }) | Err(Error::NotRegularFile { .. }) => continue,
                 Err(e) => return Err(e),
             }
@@ -397,12 +376,11 @@ impl ConfigFile {
     ///
     /// Uses [`atomic_replace`]: the content is written to a temporary file in the same directory, `fsync`ed, and
     /// `rename`d into place with the ownership and mode from `opts`, and every path component is resolved with
-    /// `RESOLVE_NO_SYMLINKS`. `configparser` itself does none of this.
+    /// `RESOLVE_NO_SYMLINKS`.
     pub fn write_path(&self, path: &Path, opts: AtomicWriteOptions) -> Result<()> {
         let mut text = self.write_string();
         let result = atomic_replace(path, text.as_bytes(), opts);
-        // The serialization buffer carried every value; for a scrubbed configuration it is burned on both outcomes.
-        // (The page-cache copy the write itself creates is the file's, not this process's.)
+        // The serialization buffer carried every value, so a scrubbed configuration burns it on both outcomes.
         if self.scrub {
             scrub_string(&mut text);
         }
@@ -424,10 +402,9 @@ impl ConfigFile {
     /// The option keys visible in `section` (its own keys plus inherited `DEFAULT` keys), or `None` if the section does
     /// not exist. Keys are lowercased.
     ///
-    /// The section's own keys come first, in file order, then the `DEFAULT` keys it did not override. That is
-    /// `configparser.options`, which copies the section and `update`s it with the defaults - the opposite order from
-    /// [`items`](Self::items), which builds up from the defaults instead. The two disagree in CPython and so they
-    /// disagree here.
+    /// The section's own keys come first, in file order, then the `DEFAULT` keys it did not override, as
+    /// `configparser.options` does. [`items`](Self::items) builds up from the defaults instead, and the two disagree in
+    /// CPython as they do here.
     pub fn options(&self, section: &str) -> Option<Vec<String>> {
         let opts = self.sections.get(section)?;
         let mut merged: Vec<String> = opts.keys().map(str::to_string).collect();
@@ -477,14 +454,10 @@ impl ConfigFile {
     ///
     /// # Where this and `int()` part company
     ///
-    /// The conversion is Rust's. `configparser` hands the string to `int()`, which additionally accepts underscores
-    /// between digits (`1_000`), any Unicode decimal digit (`١٢٣`), and a magnitude no machine integer holds;
-    /// [`get_float`](Self::get_float) inherits the first two from `float()`. All three are errors here, and matching
-    /// them would mean an arbitrary-precision integer and a port of Python's numeric-literal grammar for values a
-    /// config file does not plausibly contain.
-    ///
-    /// Every difference runs the same way - Python accepts something this rejects. Neither getter returns a *different*
-    /// number from the one `configparser` would, so a value that converts here converts there to the same thing.
+    /// `configparser` hands the string to `int()`, which also accepts underscores between digits (`1_000`), any Unicode
+    /// decimal digit (`١٢٣`), and a magnitude no machine integer holds. [`get_float`](Self::get_float) inherits the
+    /// first two from `float()`. All three are errors here. Python only ever accepts more, so a value that converts
+    /// here converts there to the same number.
     pub fn get_int(&self, section: &str, option: &str) -> Result<Option<i64>> {
         match self.get(section, option)? {
             None => Ok(None),
@@ -531,8 +504,7 @@ impl ConfigFile {
     pub fn get_bool(&self, section: &str, option: &str) -> Result<Option<bool>> {
         match self.get(section, option)? {
             None => Ok(None),
-            // `to_lowercase` is a second module-made copy of the value;
-            // under scrub both are burned.
+            // `to_lowercase` is a second module-made copy of the value, and under scrub both are burned.
             Some(mut v) => {
                 let mut lower = v.to_lowercase();
                 let res = match lower.as_str() {
@@ -556,10 +528,8 @@ impl ConfigFile {
     /// All `(key, value)` pairs visible in `section` (its own plus inherited `DEFAULT`), interpolated, or `None` if the
     /// section does not exist.
     pub fn items(&self, section: &str) -> Result<Option<Vec<(String, String)>>> {
-        // `DEFAULT` is not in `sections`, and asking for its pairs is not asking for a section that does not exist:
-        // `configparser.items` raises `NoSectionError` only `if section != self.default_section`, so there it answers
-        // the defaults. `has_option` and `raw_lookup` already carry the same special case. `options` deliberately does
-        // not - CPython's raises there, and the two are documented to disagree.
+        // `DEFAULT` is not in `sections`, but `configparser.items` raises `NoSectionError` only `if section !=
+        // self.default_section`, so it answers the defaults. `options` keeps CPython's refusal.
         if !self.sections.contains(section) && section != DEFAULT_SECTION {
             return Ok(None);
         }
@@ -607,10 +577,8 @@ impl ConfigFile {
     /// line break or a `=`/`:` delimiter, surrounded by whitespace, or opening with `[`, `#` or `;`. `parse::key_fault`
     /// has the rules.
     ///
-    /// `configparser` screens the value and the argument types, never the name (`RawConfigParser.set`,
-    /// `Lib/configparser.py:922`), so INI syntax in a name reaches its output intact: on CPython 3.13 `set(s,
-    /// "[global]", v)` writes a file that reads back carrying a section the caller never asked for. Storing
-    /// externally-supplied names as options there is an injection primitive. Values keep `configparser`'s behaviour
+    /// `configparser` screens the value and never the name (`RawConfigParser.set`, `Lib/configparser.py:922`), so there
+    /// a name such as `[global]` injects a section into the written file. Values keep `configparser`'s behaviour
     /// exactly.
     pub fn set(&mut self, section: &str, option: &str, value: Option<&str>) -> Result<()> {
         let key = optionxform(option);
@@ -713,10 +681,8 @@ impl ConfigFile {
     /// The merged (DEFAULT, then section-override) raw values used both for interpolation variable lookups and for
     /// [`items`](Self::items).
     ///
-    /// The view borrows its keys and values from the configuration rather than cloning them: interpolation needs only
-    /// lookup and iteration, so cloning the whole DEFAULT map plus every section value per `get` would be pure overhead
-    /// on the read path - and, under scrub, a transient plaintext copy of every value to burn. The borrows live as long
-    /// as the `&self` every reader holds.
+    /// The view borrows rather than clones, since a clone per `get` would cost on the read path and, under scrub, leave
+    /// a plaintext copy of every value to burn.
     fn merged_view(&self, section: &str) -> MergedView<'_> {
         let mut view = MergedView::default();
         for (k, v) in self.defaults.iter() {
@@ -782,9 +748,9 @@ impl Drop for ScrubVec {
     }
 }
 
-/// Translate `\r\n` and a lone `\r` to `\n` in place - the universal-newline decoding Python's `open(filename)`, and so
-/// `configparser.read()`, applies - with no reallocation, so no unscrubbed copy of the content is left behind. Bytes
-/// past the new length keep their old content, which is why a scrubbed buffer is burned to capacity, not length.
+/// Translate `\r\n` and a lone `\r` to `\n` in place, the universal-newline decoding `configparser.read()` gets from
+/// `open(filename)`, with no reallocation. Bytes past the new length keep their old content, which is why a scrubbed
+/// buffer is burned to capacity, not length.
 ///
 /// Only the file entry points translate: `read_string`, which [`ConfigFile::read_str`] mirrors, wraps the text in a
 /// `StringIO` with `newline='\n'`, which passes `\r` through verbatim.
@@ -995,8 +961,7 @@ mod tests {
         }
     }
 
-    /// A duplicate-option error from a scrubbed configuration must not name the key: in a credentials file it is an
-    /// identifier that must not reach a log.
+    /// A duplicate-option error from a scrubbed configuration must not name the key.
     #[test]
     fn a_duplicate_option_error_withholds_the_key_when_scrubbed() {
         let doc = "[s]\nakid = 1\nakid = 2\n";
@@ -1009,8 +974,7 @@ mod tests {
         assert!(quiet.contains("duplicate option"), "{quiet}");
     }
 
-    /// Debug output of a scrubbed configuration carries structure only; a configuration holding secrets that reaches a
-    /// log must not print them.
+    /// Debug output of a scrubbed configuration carries structure only.
     #[test]
     fn debug_redacts_a_scrubbed_configuration() {
         let mut cfg = ConfigFile::raw().scrubbed(true);
@@ -1022,12 +986,8 @@ mod tests {
         assert!(format!("{plain:?}").contains("hunter2"));
     }
 
-    /// Removing a non-last entry has to correct the recorded position of everything after it.
-    ///
-    /// Every other removal test takes the last entry, where the fixup loop is a no-op.
-    /// `get`/`get_raw`/`has_option`/`set` all reach an entry *through* `index`, so a stale position is not a crash - it
-    /// is `get_raw(s, "b")` quietly returning c's value, a silently mis-read configuration - and the last key then
-    /// indexes past the end.
+    /// Removing a non-last entry has to correct the recorded position of everything after it, or a lookup through
+    /// `index` quietly returns a neighbour's value.
     #[test]
     fn removing_a_middle_entry_keeps_the_rest_reachable() {
         let mut cfg = ConfigFile::raw();
@@ -1105,9 +1065,7 @@ mod tests {
         assert!(empty.sections().is_empty());
     }
 
-    /// `read_secret_path` reads verbatim even from a default (interpolating) configuration: a secret value must not
-    /// route through `before_get`, whose growing accumulator orphans partial-plaintext copies in freed heap the
-    /// scrub-on-drop never reaches.
+    /// `read_secret_path` reads verbatim even from a default (interpolating) configuration.
     #[cfg(feature = "secrets")]
     #[test]
     fn read_secret_path_reads_verbatim_from_a_default_config() {
@@ -1131,13 +1089,8 @@ mod tests {
         );
     }
 
-    /// `items("DEFAULT")` answers the defaults, as `configparser` does.
-    ///
-    /// `sections()` excludes `DEFAULT` in both, so keying the "no such section" refusal on it alone made this one shape
-    /// answer `None` where CPython answers the pairs: its `items` raises `NoSectionError` only `if section !=
-    /// self.default_section`.
-    /// `has_option` and `raw_lookup` already carry the same special case;
-    /// `options` deliberately does not, because CPython's raises there.
+    /// `items("DEFAULT")` answers the defaults, as `configparser` does, while `options("DEFAULT")` keeps CPython's
+    /// refusal.
     #[test]
     fn items_answers_the_default_section() {
         let mut cfg = ConfigFile::raw();
@@ -1164,12 +1117,8 @@ mod tests {
         );
     }
 
-    /// A secret read that fails leaves the configuration as it found it.
-    ///
-    /// `scrub` and `interp` are both one-way, so setting them ahead of the staging read permanently downgraded an
-    /// already-populated interpolating configuration to raw over a secret that was never read. Driven with an absent
-    /// path, which is the same failure a permission denial or a non-regular file takes; a host without `memfd_secret`
-    /// reaches it one call earlier and asserts the same thing.
+    /// A secret read that fails leaves the configuration as it found it, interpolating and unscrubbed. Driven with an
+    /// absent path, the same failure a permission denial or a non-regular file takes.
     #[cfg(feature = "secrets")]
     #[test]
     fn a_refused_secret_read_does_not_downgrade_the_configuration() {
@@ -1195,9 +1144,8 @@ mod tests {
     }
 
     /// The identity names the file image: equal across two reads of an unchanged file, different once it is rewritten,
-    /// and never `same` without a change cookie. On the ZFS dataset the QEMU job names, since that is what the daemon
-    /// reads from and tmpfs moves the cookie too; there `TRUENAS_ROS_REQUIRE_CHANGE_COOKIE` turns a missing cookie from
-    /// a skip into a failure.
+    /// and never `same` without a change cookie. Runs on the ZFS dataset the QEMU job names, where
+    /// `TRUENAS_ROS_REQUIRE_CHANGE_COOKIE` turns a missing cookie from a skip into a failure.
     #[cfg(feature = "secrets")]
     #[test]
     fn read_secret_path_identifies_the_image() {
@@ -1325,8 +1273,7 @@ mod tests {
         }
     }
 
-    /// A duplicate-section error withholds the name like the duplicate-option error withholds its key: both are
-    /// identifiers from the file.
+    /// A duplicate-section error withholds the name like the duplicate-option error withholds its key.
     #[test]
     fn a_duplicate_section_error_withholds_the_name_when_scrubbed() {
         let doc = "[acct]\na = 1\n[acct]\nb = 2\n";
@@ -1407,10 +1354,8 @@ mod tests {
 
     #[test]
     fn read_paths_skips_a_non_regular_file() {
-        // A non-regular candidate is skipped like a missing one, so one unusable path - an ops /dev/null slot, or an
-        // attacker-planted FIFO -- cannot deny a whole multi-file load, and a file already parsed stays loaded.
-        // Exercised on a scrubbed config, which refuses a non-regular file; the grow-guard (also `Validation`) still
-        // aborts.
+        // A non-regular candidate is skipped like a missing one, so one planted FIFO cannot deny a whole multi-file
+        // load. Exercised on a scrubbed config, which refuses a non-regular file.
         let dir = crate::tempdir().unwrap();
         let good = dir.path().join("creds.ini");
         std::fs::write(&good, "[user]\r\nkey = sw0rdf1sh\r\n").unwrap();

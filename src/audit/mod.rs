@@ -1,8 +1,7 @@
 //! Linux kernel audit (`NETLINK_AUDIT`) - describe an event, send the record.
 //!
 //! [`AuditSocket`] writes one record per event to the kernel audit subsystem, so a service's own events land in
-//! `/var/log/audit/audit.log` and are queryable with `ausearch`/`aureport` alongside PAM's. This replaces linking
-//! libaudit: the wire format is a 16-byte `nlmsghdr` plus `key=value` text, and the whole binding is one small module.
+//! `/var/log/audit/audit.log` and are queryable with `ausearch`/`aureport` alongside PAM's, without linking libaudit.
 //!
 //! # The record
 //!
@@ -10,8 +9,6 @@
 //! last - with an [`AuditType`] naming the event class the way `ausearch -m` selects on. Everything beyond that
 //! vocabulary rides as plain [`fields`](AuditEvent::fields), one `key=value` pair each. Values are libaudit-encoded
 //! (`key="value"` when clean, `key=HEX` otherwise), so a value can never split a record.
-//!
-//! There is no serialization layer here, by design: the caller knows its own data and renders it into fields.
 //!
 //! ```no_run
 //! use truenas_ros::audit::{AuditEvent, AuditPrincipal, AuditSocket, AuditType};
@@ -44,13 +41,12 @@
 //! # Delivery is synchronous, and can block
 //!
 //! [`AuditSocket::send`] performs the `sendto` and reads the ack on the calling thread. Under kernel-audit
-//! backpressure - `auditd` behind, backlog over `audit_backlog_limit` - that send parks the calling thread in
-//! `TASK_UNINTERRUPTIBLE` for up to `audit_backlog_wait_time` (default 60 s). The stall is gated on backlog depth,
-//! **not** on the socket's `O_NONBLOCK` flag, so no amount of non-blocking I/O avoids it.
+//! backpressure that send parks the calling thread uninterruptibly for up to `audit_backlog_wait_time`, whatever the
+//! socket's `O_NONBLOCK` flag says ([`AuditSocket`] has the details).
 //!
-//! This module deliberately ships no queue, thread, or sink: an application that cannot tolerate that stall on its hot
-//! path owns the policy - give the socket a dedicated thread, or drive it from a work loop, and shed load the way that
-//! suits it. [`AuditSocket::send_lost`] reports what such a policy dropped, so the log shows the gap.
+//! This module ships no queue, thread, or sink. An application that cannot tolerate that stall on its hot path gives
+//! the socket a dedicated thread or a work loop and sheds load its own way. [`AuditSocket::send_lost`] reports what
+//! such a policy dropped, so the log shows the gap.
 //!
 //! # When audit is not available
 //!

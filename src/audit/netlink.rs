@@ -2,11 +2,7 @@
 //!
 //! Writing needs `CAP_AUDIT_WRITE`; without it (or with kernel audit compiled out / nobody listening) the kernel
 //! replies `EPERM`/`ECONNREFUSED`, which is reported as [`SendStatus::Unavailable`] - a benign no-op, matching
-//! libaudit's `audit_send_user_message`. That distinction is what lets a caller's loop treat an unaudited host as
-//! "nothing to do" rather than a failure to retry.
-//!
-//! This owns the syscall surface directly rather than linking libaudit: the wire format is a fixed 16-byte header plus
-//! `key=value` text, and the whole binding is under 200 lines.
+//! libaudit's `audit_send_user_message`.
 
 use super::record::{AuditEvent, AuditType};
 use crate::errno::{Errno, Result, retry_on_eintr};
@@ -64,9 +60,8 @@ pub enum SendStatus {
 /// [`send`](Self::send) can block the calling thread **uninterruptibly** for up to `audit_backlog_wait_time` (default
 /// 60 s). Once the kernel's queue exceeds `audit_backlog_limit`, `kernel/audit.c:audit_receive()` parks the *sender* in
 /// `TASK_UNINTERRUPTIBLE` in its own syscall context. That stall is gated on backlog depth, **not** on the socket's
-/// `O_NONBLOCK` flag, so it cannot be avoided by making the socket non-blocking or by polling for writability.
-/// Do not call this from a latency-critical thread - give it a thread of its own, or a work loop that tolerates the
-/// stall.
+/// `O_NONBLOCK` flag, so polling for writability cannot avoid it. Give it a thread of its own, or a work loop that
+/// tolerates the stall.
 pub struct AuditSocket {
     fd: OwnedFd,
     seq: u32,
@@ -127,9 +122,6 @@ impl AuditSocket {
 
     /// Report that `n` records were dropped before reaching this socket, so the log shows the gap rather than silently
     /// missing events - the kernel signals its own overflow the same way.
-    ///
-    /// A convenience for an application queueing records ahead of this socket: the count is formatted into the socket's
-    /// own buffer, which a borrowed [`AuditEvent`] could not do.
     pub fn send_lost(&mut self, service: &str, n: u64) -> Result<SendStatus> {
         let mut count = String::new();
         let _ = write!(count, "{n}");
@@ -230,13 +222,10 @@ impl AuditSocket {
 /// Interpret one received netlink datagram as an ack for `seq`.
 ///
 /// `None` means the datagram is not attributable to `seq` - a runt, or an earlier record's ack arriving late - so the
-/// scan should keep reading.
-/// `Some` is terminal: `error == 0` is success, `-EPERM`/`-ECONNREFUSED` is benign unavailability, and any other
-/// negative errno is an error.
+/// scan should keep reading. `Some` is terminal, and carries the verdict [`AuditSocket::read_ack`] describes.
 ///
-/// Split out from [`AuditSocket::read_ack`] so the decode is pure and can be driven by
-/// `fuzz/fuzz_targets/audit_ack.rs` - the bytes come off a socket the kernel shares with every other netlink peer, and
-/// the length guards here are the only thing standing between a short datagram and an out-of-bounds index.
+/// Pure so `fuzz/fuzz_targets/audit_ack.rs` can drive it. Any netlink peer can send to the socket, and the length
+/// guards here are all that stand between a short datagram and an out-of-bounds index.
 pub(super) fn decode_ack(buf: &[u8], seq: u32) -> Option<Result<SendStatus>> {
     if buf.len() < NLMSG_HDRLEN {
         return None; // runt: not an ack we can attribute
@@ -297,12 +286,8 @@ mod tests {
         b
     }
 
-    /// Every refusal `decode_ack` makes, on bytes that arrive from a socket the kernel shares with every other netlink
-    /// peer.
-    ///
-    /// The length guard is what stands between a short datagram and an out-of-bounds index, and the sequence check is
-    /// what stops another peer's error being attributed to our record - a failed audit send reported as delivered, or
-    /// the reverse.
+    /// Every refusal `decode_ack` makes. The length guard stops an out-of-bounds index, and the sequence check stops
+    /// another record's ack being attributed to ours.
     #[test]
     fn an_ack_is_attributed_only_to_the_record_it_names() {
         // Runt: shorter than the header, so nothing can be read from it.

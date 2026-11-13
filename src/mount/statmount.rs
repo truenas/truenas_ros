@@ -190,12 +190,10 @@ impl Statmount {
     }
 }
 
-/// The reply decoder exposed to the fuzz crate (`fuzz/`) under `__fuzz` only -- the `mount` analogue of the net stack's
-/// `frame_step` re-export. Never part of the stable API.
+/// The reply decoder, exposed to the fuzz crate (`fuzz/`) under `__fuzz` only. Never part of the stable API.
 ///
-/// Driven by `fuzz/fuzz_targets/statmount_parse.rs`: [`parse`](fuzz::parse) reinterprets a caller-supplied word array
-/// as a `struct statmount` and walks its string area by the offsets the header declares, so a reply whose `size`,
-/// offsets, or `*_num` counts disagree with the buffer must still decode without reading out of bounds.
+/// `fuzz/fuzz_targets/statmount_parse.rs` drives it with replies whose `size`, offsets, or `*_num` counts may disagree
+/// with the buffer, and each must still decode without reading out of bounds.
 #[cfg(feature = "__fuzz")]
 pub mod fuzz {
     /// Decode a `statmount` reply from its raw word buffer, or `None` if the buffer is too short to hold the fixed
@@ -213,8 +211,8 @@ pub mod fuzz {
 ///
 /// See [`statmount(2)`](https://man7.org/linux/man-pages/man2/statmount.2.html).
 pub fn statmount(mnt_id: u64, mask: StatmountMask) -> errno::Result<Statmount> {
-    // 8-byte-aligned buffer (kernel writes u64 fields). Start at 1 KiB, grow by 4 KiB on EOVERFLOW, matching the
-    // `truenas_os` C extension.
+    // 8-byte-aligned buffer (kernel writes u64 fields). Start at 1 KiB, which `parse` relies on, and grow by 4 KiB on
+    // EOVERFLOW.
     let mut words = vec![0u64; 1024 / 8];
     loop {
         let byte_len = words.len() * 8;
@@ -249,9 +247,8 @@ fn parse(words: &[u64]) -> Statmount {
     // SAFETY: `words` is 8-byte aligned and at least 1 KiB (>= STR_BASE), so reading the fixed `RawStatmount` header is
     // in-bounds and aligned.
     let hdr = unsafe { &*words.as_ptr().cast::<RawStatmount>() };
-    // SAFETY: same allocation, reinterpreted as bytes for string extraction. Clamp to the kernel-reported `size` (never
-    // past the allocation) so string offsets are bounded by what the kernel actually wrote - the safety is then local,
-    // not contingent on the buffer having been zero-initialised.
+    // SAFETY: same allocation, reinterpreted as bytes for string extraction, and clamped to the kernel-reported `size`
+    // and never past the allocation, so string offsets are bounded by what the kernel actually wrote.
     let written = (hdr.size as usize).min(words.len() * 8);
     let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), written) };
     let mask = StatmountMask::from_bits_retain(hdr.mask);
@@ -265,20 +262,16 @@ fn parse(words: &[u64]) -> Statmount {
         let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
         tail[..end].to_vec()
     };
-    // The kernel emits the mount point as raw dentry bytes - `statmount_mnt_point` writes it through `seq_path_root`
-    // with an empty escape set
-    // (fs/namespace.c) - so carry it as a path without a UTF-8 round-trip;
-    // substituting U+FFFD would yield a different, still-openable path.
+    // The kernel emits the mount point as raw dentry bytes (`statmount_mnt_point` through `seq_path_root` with an empty
+    // escape set, fs/namespace.c), so carry it as a path without a UTF-8 round-trip.
     let get_path = |offset: u32| -> PathBuf { PathBuf::from(OsString::from_vec(get_bytes(offset))) };
     let get_str = |offset: u32| -> String { String::from_utf8_lossy(&get_bytes(offset)).into_owned() };
 
     // A run of `count` NUL-terminated strings starting at `offset` into `str`.
     let get_str_array = |offset: u32, count: u32| -> Vec<String> {
         let start = STR_BASE + offset as usize;
-        // `count` is header-declared, so reserving against it directly would
-        // let a reply claiming `u32::MAX` strings ask for ~100 GiB before a
-        // single byte is read. Each string consumes at least its terminator, so what remains of the string area is the
-        // real bound.
+        // `count` is declared by the reply, so reserving against it would let `u32::MAX` ask for ~100 GiB before a byte
+        // is read. Each string costs at least its terminator, so what remains of the string area is the real bound.
         let mut out = Vec::with_capacity((count as usize).min(bytes.len().saturating_sub(start)));
         let mut pos = start;
         for _ in 0..count {
@@ -393,8 +386,7 @@ mod tests {
         words
     }
 
-    // The kernel reports the mount point as raw dentry bytes, handed straight to openat2/umount2. Replacing an invalid
-    // sequence with U+FFFD would name a different, still-openable path.
+    // A non-UTF-8 mount point comes back byte for byte.
     #[test]
     fn non_utf8_mount_point_is_carried_verbatim() {
         use std::os::unix::ffi::OsStrExt;
@@ -453,9 +445,8 @@ mod tests {
         // No MNT_OPTS bit and no SB_BASIC -> nothing to report.
         assert_eq!(base(StatmountMask::MNT_BASIC).mount_opts(), None);
 
-        // SB_BASIC without MNT_OPTS -> still the prefix. This is the shape a real reply takes for a filesystem whose
-        // superblock emits no options at all (procfs, sysfs, tracefs, nsfs): the kernel returns without raising
-        // MNT_OPTS, so keying the prefix on that bit would drop the read-only status of every such mount.
+        // SB_BASIC without MNT_OPTS -> still the prefix, the shape a real reply takes for procfs, sysfs, tracefs and
+        // nsfs.
         let mut sm3 = base(StatmountMask::SB_BASIC);
         sm3.sb_flags = Some(SbFlags::empty());
         assert_eq!(sm3.mount_opts().as_deref(), Some("rw"));
@@ -463,12 +454,8 @@ mod tests {
         assert_eq!(sm3.mount_opts().as_deref(), Some("ro"));
     }
 
-    /// A string-array count is declared by the reply, not derived from it, so it must never size an allocation on its
-    /// own: `u32::MAX` options would reserve ~96 GiB before a byte is read. The real bound is what remains of the
-    /// string area, since every string costs at least its terminator.
-    ///
-    /// Found by the `statmount_parse` fuzz target; kept here because the property is about the decoder, not about any
-    /// one byte sequence.
+    /// A string-array count is declared by the reply, so it must never size an allocation on its own. The real bound is
+    /// what remains of the string area.
     #[test]
     fn a_declared_string_count_cannot_size_an_allocation() {
         let mut words = synth(b"/", b"/mnt", b"zfs", b"tank/ds");

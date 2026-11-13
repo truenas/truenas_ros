@@ -3,19 +3,9 @@
 //!
 //! # Why there is no `normpath`
 //!
-//! Normalising would be the obvious alternative: fold `a/./b` to `a/b`, `a/../b` to `b`, and hand the kernel the
-//! result. CPython implements exactly that and warns about it in the same breath (`Lib/posixpath.py:339-341`):
-//!
-//! > Normalize a path, e.g. A//B, A/./B and A/foo/../B all become A/B. It should be understood that this may change the
-//! > meaning of the path if it contains symbolic links!
-//!
-//! That is the whole problem. `a/../b` is `b` only when `a` is not a symlink; when it is, `a/..` is the *target's*
-//! parent and the two name different directories. Folding the path lexically therefore launders a traversal into
-//! something that looks confined - the exact substitution `RESOLVE_NO_SYMLINKS` exists to refuse. A create that
-//! resolved through a component the caller never named would leave a directory somewhere it never asked for, and no
-//! error would say so.
-//!
-//! So a path either names its components plainly or it is refused, and the refusal carries which component was wrong.
+//! `a/../b` is `b` only when `a` is not a symlink, so folding a path lexically, as CPython's `normpath` does and warns
+//! it may (`Lib/posixpath.py:339-341`), launders a traversal into something that looks confined. A path either names
+//! its components plainly or it is refused, and the refusal carries which component was wrong.
 //!
 //! # What is deliberately not checked
 //!
@@ -26,29 +16,12 @@
 //! **Encoding.** A POSIX name is an arbitrary non-NUL byte string. A UTF-8 rule belongs to whatever models the *keys* a
 //! service accepts, not to the syscall layer.
 //!
-//! # Nothing here copies
+//! # Where the screen applies
 //!
-//! Every function borrows the caller's bytes and answers with a `Copy` enum: [`components`] hands back subslices of its
-//! argument (`slice::split` is lazy), and the two `*_defect` functions only scan. There is no allocation on either the
-//! accepting or the refusing path, so a caller may validate a path it is about to hand to a syscall without paying for
-//! a second copy of it.
-//!
-//! **The screen is applied per call site, not by the path conversion.** No `TnPath::with_tn_path` implementation calls
-//! either function - that trait converts a path to a `CStr` and screens nothing - so going through it says nothing
-//! about whether a path was judged.
-//!
-//! Two rules of thumb, and neither is a substitute for grepping the two function names. A call that takes a **single
-//! component** against an anchor screens with [`component_defect`], because no `RESOLVE_*` flag confines a name the
-//! caller assembled: `mkdirat`, `unlinkat`, `renameat2` (both names), `linkat` (both names), and `FsIter::process` on
-//! every name `readdir` hands it. A call that takes a **relative multi-component path** it will rebuild one component
-//! at a time screens with [`relative_defect`]: `FsIterBuilder::relative_path`, and the fs reactor's `mkdir_path`/`walk`
-//! entry points.
-//!
-//! Everything else - `statx`, `name_to_handle_at`, the plain `openat2` wrappers - takes the caller's bytes as given,
-//! and its confinement is whatever `RESOLVE_*` flags and anchor it was handed, not this module.
-//!
-//! The owned components a directory *walk* carries are a different matter: those outlive the completion that consumes
-//! them and have to be owned.
+//! Nothing here allocates. **The screen is applied per call site**, and `TnPath::with_tn_path` screens nothing. A call
+//! that takes a **single component** against an anchor screens with [`component_defect`], and one that takes a
+//! **relative multi-component path** it rebuilds one component at a time screens with [`relative_defect`]. Everything
+//! else takes the caller's bytes as given and is confined by the `RESOLVE_*` flags and anchor it was handed.
 
 use std::fmt;
 
@@ -117,10 +90,6 @@ pub fn component_defect(name: &[u8]) -> Option<Defect> {
 /// wants a path resolved *with* `..` has `openat2` and its `RESOLVE_*` flags, where the kernel enforces the
 /// confinement; this rule is for the paths a walk has to take apart and create one component at a time, where it
 /// cannot.
-///
-/// The path admitted here is exactly the path a walk will rebuild, one `mkdirat` per component - no component is
-/// skipped, folded or reordered on the way. That equality is the point: anything the kernel would resolve differently
-/// from that walk is refused instead of quietly resolving one way here and another way there.
 pub fn relative_defect(path: &[u8]) -> Option<Defect> {
     if path.is_empty() {
         return Some(Defect::Empty);
@@ -153,8 +122,7 @@ mod tests {
         ] {
             assert_eq!(component_defect(name), None, "{name:?}");
         }
-        // Length is the kernel's ENAMETOOLONG to give, not this module's: NAME_MAX moves with the filesystem (ZFS
-        // `longname` raises it to 1023), so a constant here would refuse names ZFS would take.
+        // Length is the kernel's ENAMETOOLONG to give, not this module's.
         let overlong = vec![b'x'; 4096];
         assert_eq!(component_defect(&overlong), None);
     }

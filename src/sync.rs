@@ -1,19 +1,16 @@
 //! Synchronization primitives: `std` in production, `loom`'s under `--cfg loom`.
 //!
-//! Under `cfg(not(loom))` every item here is a plain re-export, so the compiled artifact is byte-for-byte what
-//! importing `std::sync` directly would produce - this module costs nothing outside a model run. Under `--cfg loom` the
-//! same names resolve to loom's permutation-checking versions, which is what lets [`loom::model`] explore every
-//! interleaving a protocol admits. See `src/uring/ring.rs` for the older, per-field form of the same trick (it also
-//! swaps `UnsafeCell`, which this module does not cover).
+//! Under `cfg(not(loom))` every item here is a plain re-export, so this module costs nothing outside a model run.
+//! Under `--cfg loom` the same names resolve to loom's permutation-checking versions, which lets [`loom::model`]
+//! explore every interleaving a protocol admits. `UnsafeCell` is not covered here, and `src/uring/ring.rs` swaps it
+//! per field.
 //!
 //! Three things loom does not provide, and how the crate copes:
 //!
-//! * **`OnceLock`.** There is no loom equivalent (only `lazy_static`, which is for statics), and no `Mutex<Option<T>>`
-//!   can hand out the `&T` that `OnceLock::get` returns. [`OnceCell`] therefore exposes a closure-taking
-//!   [`with`](OnceCell::with) instead, which both builds can implement;
-//!   production still holds a real `OnceLock` behind it, so the fast path is
-//!   the same single acquire load it always was. The offload pool's lazy init
-//!   and the identity cache's per-key slot both use it.
+//! * **`OnceLock`.** There is no loom equivalent, and no `Mutex<Option<T>>` can hand out the `&T` that
+//!   `OnceLock::get` returns. [`OnceCell`] therefore exposes a closure-taking [`with`](OnceCell::with) instead, which
+//!   both builds can implement. Production still holds a real `OnceLock` behind it, so the fast path is one acquire
+//!   load.
 //! * **Timeouts.** `loom::sync::Condvar::wait_timeout` never reports a timeout - it delegates to `wait` and hardcodes
 //!   `timed_out() == false`. Any branch predicated on a timeout is unreachable in a model and needs an explicit seam;
 //!   the offload pool's idle-retire path has one.
@@ -23,9 +20,8 @@
 //! Models are also capped at [`loom::MAX_THREADS`] (5, including the main thread), which is why every model in this
 //! crate is deliberately tiny.
 
-// `atomic` and `Arc` serve both engines; the parking primitives and [`OnceCell`] are the fs reactor's, except that a
-// loom build also wires `WakeHandle`'s eventfd stand-in onto `Mutex`/`Condvar`. Gating each name on the exact
-// cross-product of that and `--cfg loom` costs more than it says, so the unused ones are allowed through instead.
+// `atomic` and `Arc` serve both engines, and the rest mostly the fs reactor's. Gating each name on the exact features
+// costs more than it says, so the unused ones are allowed through instead.
 #[cfg_attr(not(feature = "uring-fs"), allow(unused_imports))]
 #[cfg(loom)]
 pub(crate) use loom::{
@@ -41,9 +37,8 @@ pub(crate) use std::{
 
 /// A write-once cell: [`std::sync::OnceLock`] in production, a mutex-backed stand-in under loom.
 ///
-/// The API is deliberately narrower than `OnceLock`'s - [`get`](Self::get) clones out rather than borrowing, and
-/// [`with`](Self::with) runs a closure against a borrow - because a `Mutex<Option<T>>` cannot produce a `&T` that
-/// outlives its guard. Both callers already wanted one of those two shapes.
+/// [`with`](Self::with) runs a closure against a borrow rather than returning one, because a `Mutex<Option<T>>` cannot
+/// produce a `&T` that outlives its guard.
 #[cfg_attr(not(feature = "uring-fs"), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct OnceCell<T> {
@@ -84,10 +79,9 @@ impl<T> OnceCell<T> {
 
     /// Run `f` against the contents, or return `None` if still empty.
     ///
-    /// Under loom the cell's lock is held for the duration of `f`. That is a coarser interleaving than production,
-    /// where `OnceLock::get` borrows without locking - deliberately so: what the lazy-init models need to explore is
-    /// the race to *fill* the cell, and concurrency *through* an already-filled one is covered by the models that drive
-    /// the inner type directly.
+    /// Under loom the cell's lock is held for the duration of `f`, a coarser interleaving than production. The
+    /// lazy-init models explore the race to fill the cell, and concurrency through a filled one is modelled on the
+    /// inner type.
     pub(crate) fn with<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
         #[cfg(not(loom))]
         {

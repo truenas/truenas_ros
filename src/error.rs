@@ -1,8 +1,4 @@
-//! The rich crate-level [`Error`] type.
-//!
-//! Low-level syscall wrappers return [`crate::errno::Result`] (a bare [`Errno`]). Higher-level APIs that can also fail
-//! validation, parsing, or traversal invariants return [`Result`] (this module's `Error`). `Errno` converts into
-//! `Error` via `From`, so `?` bridges the two layers.
+//! The rich crate-level [`Error`] type, for APIs that can also fail validation, parsing, or traversal invariants.
 
 use crate::errno::Errno;
 use std::fmt;

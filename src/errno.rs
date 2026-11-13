@@ -239,8 +239,8 @@ impl ErrnoSentinel for *mut c_void {
 
 /// Runs `f`, retrying while it fails with [`Errno::EINTR`].
 ///
-/// This mirrors the syscall loop in the `truenas_os` C extension. Unlike those Python bindings we have no interpreter
-/// signal check to poll, so - like the Rust standard library - we simply retry `EINTR` unconditionally.
+/// There is no interpreter signal check to poll, so like the Rust standard library this retries `EINTR`
+/// unconditionally.
 #[inline]
 #[allow(dead_code)] // unused only when no feature module is compiled
 pub(crate) fn retry_on_eintr<S, F>(mut f: F) -> Result<S>
@@ -268,13 +268,8 @@ mod tests {
         -1
     }
 
-    /// `retry_on_eintr` retries `EINTR` and **nothing else**.
-    ///
-    /// It is the single retry primitive under the audit socket, the signal fd's `ppoll`, the xattr calls, `openat2`,
-    /// the credential broker's request round trip and the atomic-write staging - every one of them running in a daemon
-    /// under signal load, which is exactly the traffic no other test produces. Getting it wrong in one direction
-    /// surfaces spurious `EINTR` to all of them; in the other it spins forever on a real error, so the call count is
-    /// asserted as well as the result.
+    /// `retry_on_eintr` retries `EINTR` and **nothing else**. A retried real error would spin forever, so the call
+    /// count is asserted as well as the result.
     #[test]
     fn eintr_is_retried_and_nothing_else_is() {
         let calls = Cell::new(0);

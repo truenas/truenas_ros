@@ -86,21 +86,11 @@ pub fn iter_mountinfo(mnt_id: u64, reverse: bool, include_snapshots: bool) -> Re
 
 /// Mount points beneath `mnt_id`, children before their parents.
 ///
-/// **`listmount`'s reverse order is not this order.** `listmnt_next` walks an rbtree keyed on `mnt_id_unique`
-/// (`fs/namespace.c`, the insert comparison), and that field is `++mnt_id_ctr` assigned when the mount is *allocated* -
-/// so reverse is descending creation order. It coincides with children-before-parents only when every child's mount was
-/// created after its parent's, and `fsmount(2)` plus `move_mount(2)` - both exported from this module - make the
-/// opposite ordinary: build the filesystem, build the one it will live under, then attach. Measured with a three-level
-/// tree whose ids descend with depth, the reverse listing unmounts the middle mount first, `umount2` answers `EBUSY`,
-/// and the caller is told the unmount failed with the whole tree still mounted.
-///
-/// Depth is what matters, so it is computed rather than assumed. `MNT_BASIC` is already requested, so `mnt_parent_id`
-/// is in hand; depth is the number of parent links back to `mnt_id`, and sorting by it descending puts every child
-/// before its parent - a child's depth always exceeds its parent's.
-///
-/// A mount whose parent chain does not reach `mnt_id` - it vanished mid-enumeration, or the listing raced - stops at
-/// the depth it reached, which orders it no later than its own descendants. The walk is bounded by the number of
-/// mounts, so a cycle cannot hang it.
+/// **[`listmount`]'s reverse order is not this order.** It is creation order, so it reaches a parent before an older
+/// child and `umount2` answers `EBUSY`. Depth is computed instead, as the number of `mnt_parent_id` links back to
+/// `mnt_id`, and sorting by it descending puts every child before its parent. A mount whose parent chain does not reach
+/// `mnt_id` stops at the depth it reached, which orders it no later than its own descendants. The walk is bounded by
+/// the number of mounts, so a cycle cannot hang it.
 fn descendants_deepest_first(mnt_id: u64) -> Result<Vec<PathBuf>> {
     let mounts = iter_mountinfo(mnt_id, false, true)?;
     let parent_of: BTreeMap<u64, u64> = mounts

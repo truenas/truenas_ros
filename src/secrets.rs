@@ -1,12 +1,8 @@
 //! `memfd_secret(2)`-backed protected memory for long-lived in-process secrets: the pages are removed from the kernel
 //! direct map, kept off swap, and excluded from core dumps (on TrueNAS, from a support bundle).
-//! `secretmem_mmap_prepare` stamps the VMA `VM_DONTDUMP` itself (`mm/secretmem.c:207`) - no separate `madvise` - and
-//! the pages stay off swap because the inode's mapping is unevictable (`mapping_set_unevictable`, `:303`), not because
-//! the VMA is locked: secretmem sets no `VM_LOCKED`. `RLIMIT_MEMLOCK` is charged page by page at first touch, to the
-//! `locked_vm` of the user who created the file (`:65-72`, `:275`), with no `CAP_IPC_LOCK` bypass; a fault over the
-//! limit is `SIGBUS` (`:136-138`), so construction faults every page in from the kernel side and reports a refusal as
-//! `EFAULT` instead. That is stable 853043cb1294 (mainline 97d34aa65c29), shipped from 6.18.52. Earlier 6.18 kernels
-//! stamp `VM_LOCKED` too and check the limit at `mmap`.
+//! `secretmem_mmap_prepare` stamps the VMA `VM_DONTDUMP` itself (`mm/secretmem.c:207`), and the pages stay off swap
+//! because the inode's mapping is unevictable (`mapping_set_unevictable`, `:303`), not because the VMA is locked.
+//! [`SecretMem::with_capacity`] says how `RLIMIT_MEMLOCK` is charged.
 //!
 //! This is memory-access hardening, not at-rest encryption: a usable secret is plaintext in the region while the
 //! process runs; what it removes are the offline paths (dump, swap, cross-process kernel read). A value copied on into
@@ -37,8 +33,8 @@ fn memfd_secret() -> Result<OwnedFd> {
 /// Whether a failed `memfd_secret` means the kernel cannot do this at all, rather than not right now - the answer a
 /// daemon disables secret handling on, for the rest of its life.
 ///
-/// `ENOSYS` is the missing syscall and `EPERM` a seccomp filter denying it;
-/// both hold for the whole process. `EMFILE`/`ENFILE`/`ENOMEM` describe the instant the probe ran.
+/// `ENOSYS` is the missing syscall and `EPERM` a seccomp filter denying it, and both hold for the whole process.
+/// `EMFILE`/`ENFILE`/`ENOMEM` describe the instant the probe ran.
 fn unsupported(e: Errno) -> bool {
     matches!(e, Errno::ENOSYS | Errno::EPERM)
 }
@@ -76,10 +72,9 @@ fn page_size() -> usize {
 
 /// A `memfd_secret`-backed region holding `len` secret bytes.
 ///
-/// Sized up to whole pages so every mapped byte is backed (an unbacked secretmem page faults `SIGBUS`), but the slices
-/// expose exactly `len`. Fill it once via [`as_mut_slice`](Self::as_mut_slice), then treat it as read-only; drop
-/// unmaps. The memfd is closed once mapped - the mapping keeps the memory alive, leaving no reopenable handle in
-/// `/proc/self/fd`. Pack many secrets into one region to spare `RLIMIT_MEMLOCK`.
+/// The mapping is rounded up to whole pages, and the slices expose exactly `len`. Fill it once via
+/// [`as_mut_slice`](Self::as_mut_slice), then treat it as read-only. Drop unmaps. Pack many secrets into one region to
+/// spare `RLIMIT_MEMLOCK`.
 pub struct SecretMem {
     ptr: *mut u8,
     /// Requested length (`<= mapped`).
@@ -89,7 +84,7 @@ pub struct SecretMem {
 }
 
 // SAFETY: `SecretMem` uniquely owns its mapping and gates access through `&`/`&mut` like `Box<[u8]>`; the raw pointer
-// is the only reason the derive is withheld. This lets the credential snapshot sit behind a shared `Arc`.
+// is the only reason the derive is withheld.
 unsafe impl Send for SecretMem {}
 // SAFETY: as `Send`.
 unsafe impl Sync for SecretMem {}
@@ -166,10 +161,10 @@ impl SecretMem {
     }
 
     /// Raise this process's `RLIMIT_MEMLOCK` to unlimited. The counter a secret page is charged against is shared by
-    /// every process of the user, so a bounded limit lets any of them (a system-wide `perf` charges 516 KiB per CPU)
-    /// get this one's next page refused. Call at start-up, before the first region and before any fork, since children
-    /// inherit it. Raising the hard limit needs `CAP_SYS_RESOURCE`; without it the soft limit is raised to the hard one
-    /// and the `EPERM` is returned with that done.
+    /// every process of the user, so under a bounded limit any of them can get this one's next page refused. Call at
+    /// start-up, before the first region and before any fork, since children inherit it. Raising the hard limit needs
+    /// `CAP_SYS_RESOURCE`. Without it the soft limit is raised to the hard one and the `EPERM` is returned with that
+    /// done.
     pub fn unbound_memlock() -> Result<()> {
         let unlimited = libc::rlimit {
             rlim_cur: libc::RLIM_INFINITY,
@@ -251,8 +246,8 @@ impl Drop for SecretMem {
 
 /// One secret in its own region.
 ///
-/// The single-value wrapper over [`SecretMem`] (redacted [`Debug`], no `Clone`), mirroring `truenas_pam::Secret`. One
-/// memfd and a locked page each, so pack many secrets into a [`SecretMem`] arena instead.
+/// The single-value wrapper over [`SecretMem`] (redacted [`Debug`], no `Clone`). It costs a memfd and a locked page
+/// each, so pack many secrets into a [`SecretMem`] arena instead.
 pub struct Secret(SecretMem);
 
 impl Secret {
@@ -397,13 +392,9 @@ mod tests {
         assert_eq!(format!("{:?}", Some(&s)), "Some(Secret(..))");
     }
 
-    /// The region is the `/secretmem` pseudo-file and carries the two VMA flags it is for: `dd` (`VM_DONTDUMP`, out of
-    /// core dumps) from `secretmem_mmap_prepare` and `dc` (`VM_DONTCOPY`) from the fork barrier. Off-swap is not a VMA
-    /// flag - it is the inode's unevictable mapping (`mapping_set_unevictable`, `mm/secretmem.c:303`) - so `lo` is not
-    /// asked for, and a 6.18 kernel before .52 that still sets it passes too. An ordinary allocation is the negative
-    /// control.
-    ///
-    /// Nothing else here would notice a kernel that kept `memfd_secret` working and stopped setting them.
+    /// The region is the `/secretmem` pseudo-file and carries `dd` (`VM_DONTDUMP`) from `secretmem_mmap_prepare` and
+    /// `dc` (`VM_DONTCOPY`) from the fork barrier. Off-swap is the inode's unevictable mapping, not a VMA flag, so `lo`
+    /// is not asked for. An ordinary allocation is the negative control.
     #[test]
     fn the_region_is_secretmem_undumpable_and_not_forked() {
         if !secretmem_or_skip() {
@@ -489,8 +480,8 @@ mod tests {
     /// Construction errors when no region can be made, rather than handing back ordinary memory that would swap and
     /// appear in dumps.
     ///
-    /// Forced by exhausting a child's descriptor table, a kernel with secretmem being unable to stop having it. The
-    /// probe should still report support: a full fd table is the instant, not the kernel.
+    /// Forced by exhausting a child's descriptor table. The probe still reports support, since a full fd table is the
+    /// instant and not the kernel.
     #[test]
     fn construction_fails_closed_when_no_region_can_be_made() {
         if !secretmem_or_skip() {
