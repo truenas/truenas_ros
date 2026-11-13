@@ -617,7 +617,7 @@ struct Handlers<U, AcceptFn, HeaderFn, BodyFn> {
     /// Runs each [`ControlHandle::send`] message on the loop thread
     /// ([`Server::set_control_hook`]); without one the messages are dropped.
     control: Option<ControlFn>,
-    /// Runs as the ring's held bytes fall under a mark
+    /// Runs once for each turn the consumer queued, as the loop reaches it
     /// ([`Server::set_held_hook`]).
     held: Option<Box<dyn FnMut()>>,
 }
@@ -1172,9 +1172,9 @@ where
             // completion for those connections has been routed).
             #[cfg(feature = "uring-fs")]
             self.sweep_closed_fs();
-            // What this turn gave back may be owed to the held hook, and
-            // may let held body reads go on, the hook's calls first.
-            self.run_held_hook();
+            // What this turn gave back may let what the cap holds back go
+            // on, the placed body reads and the consumer's turns, in the
+            // order they came.
             self.redrive_held_reads()?;
             // A drain's quiescence, re-read where everything that can
             // reach it has already run. `reclaim_slot` is edge-triggered
@@ -1550,43 +1550,26 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
         self.handlers.control = Some(Box::new(hook));
     }
 
-    /// Install a hook that runs on the loop thread once the bytes the ring
-    /// holds out of its body pool ([`BodyRecycler::held`]) fall under
-    /// `mark` after being at or past it, so that a call the consumer holds
-    /// for bytes goes on with no tick and no poll, even when every
-    /// connection waits. It runs once for each fall, and once they fall if
-    /// they are at or past the mark as it is set. A rise to the mark counts
-    /// when the ring or the consumer's [`BodyRecycler::take_out`] makes it,
-    /// or when [`BodyRecycler::held`] shows the bytes at or past the mark,
-    /// since a rise through [`Deferred::reply_recycled`] happens away from
-    /// the loop and a consumer waits only on what it was shown. It runs
-    /// from the loop at its next turn, never inside
-    /// [`BodyRecycler::take_out`] or [`BodyRecycler::give_back`], so the
-    /// consumer is never called back in the middle of its own call, and
-    /// before reads held at [`held_cap`](ServerConfig::held_cap) go on, so
-    /// what it takes out comes first. A second call replaces the first
-    /// hook and its mark.
-    pub fn set_held_hook<F>(&mut self, mark: usize, hook: F)
+    /// Install a hook that runs on the loop thread once for each turn the
+    /// consumer queues with [`BodyRecycler::queue_turn`], as the loop
+    /// reaches the turn with the bytes the ring holds out of its body pool
+    /// ([`BodyRecycler::held`]) under [`held_cap`](ServerConfig::held_cap).
+    /// Turns and the placed body reads the cap holds back go on in one
+    /// queue, in the order they came, so a call the consumer holds for
+    /// bytes goes on with no tick and no poll, even when every connection
+    /// waits, and neither a stream of turns nor one of placed bodies keeps
+    /// the other back for good. It runs from the loop, never inside
+    /// [`BodyRecycler::queue_turn`] or any other call of the consumer's, so
+    /// the consumer is never called back in the middle of its own call. What
+    /// it takes out ([`BodyRecycler::take_out`]) counts before the next
+    /// thing held back is looked at, so the ring passes the cap by one at
+    /// most. A turn whose call the consumer no longer has runs it with
+    /// nothing to let go. A second call replaces the first hook.
+    pub fn set_held_hook<F>(&mut self, hook: F)
     where
         F: FnMut() + 'static,
     {
-        if let Some(p) = self.core.body_pool.as_ref() {
-            p.borrow_mut().set_mark(mark);
-        }
         self.handlers.held = Some(Box::new(hook));
-    }
-
-    /// Run the held hook if the ring's held bytes fell under its mark, with
-    /// no borrow of the pool held across it.
-    fn run_held_hook(&mut self) {
-        let due = self
-            .core
-            .body_pool
-            .as_ref()
-            .is_some_and(|p| p.borrow_mut().hook_due());
-        if due && let Some(hook) = self.handlers.held.as_mut() {
-            hook();
-        }
     }
 
     /// Install a hook invoked once per connection as it begins closing:

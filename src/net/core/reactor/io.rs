@@ -819,12 +819,13 @@ impl<U> Reactor<U> {
 
     /// Whether the read of a placed body waits for the ring's held bytes to
     /// fall under `ServerConfig::held_cap`. It waits while they are at or
-    /// past the cap, and behind any read already waiting, so that reads go
-    /// on in the order they were held, and the server lets each go on in
-    /// turn (`held_turn`). The connection keeps its header and frame and
-    /// claims no storage until then. The budget of its message is retired,
-    /// since handling is not clocked, and `submit_recv` arms a fresh one as
-    /// the read goes on, so only the peer's own time counts.
+    /// past the cap, and behind any read or turn of the consumer's already
+    /// held back, so that both go on in the order they came, and the server
+    /// lets each go on in turn (`held_turn`). The connection keeps its
+    /// header and frame and claims no storage until then. The budget of its
+    /// message is retired, since handling is not clocked, and `submit_recv`
+    /// arms a fresh one as the read goes on, so only the peer's own time
+    /// counts.
     #[cfg(feature = "net-server")]
     fn hold_back(&mut self, slot: u32, generation: u32) -> errno::Result<bool> {
         if self.held_turn == Some(slot) {
@@ -832,14 +833,20 @@ impl<U> Reactor<U> {
             return Ok(false);
         }
         if !self.table.conn(slot).read_held {
-            let full =
-                self.body_pool.as_ref().is_some_and(|p| p.borrow().at_cap());
-            if !full && self.held_reads.is_empty() {
+            let Some(pool) = self.body_pool.as_ref() else {
+                return Ok(false);
+            };
+            let mut pool = pool.borrow_mut();
+            if pool.may_go() {
                 return Ok(false);
             }
-            let gen64 = self.table.generation(slot);
+            let read = crate::net::core::bodypool::HeldBack::Read {
+                slot,
+                generation: self.table.generation(slot),
+            };
+            pool.hold_back(read);
+            drop(pool);
             self.table.conn_mut(slot).read_held = true;
-            self.held_reads.push_back((slot, gen64));
         }
         self.cancel_receipt_deadline(slot, generation)?;
         Ok(true)
@@ -2502,6 +2509,8 @@ mod tests {
     #[cfg(feature = "net-server")]
     use crate::net::ClientAddr;
     #[cfg(feature = "net-server")]
+    use crate::net::core::bodypool::HeldBack;
+    #[cfg(feature = "net-server")]
     use crate::net::core::config::CoreConfig;
     #[cfg(feature = "net-server")]
     use crate::net::core::conn::Connection;
@@ -2626,10 +2635,10 @@ mod tests {
         );
     }
 
-    /// A placed body read waits behind any read already waiting, even with
-    /// the ring under its cap, so that reads go on in the order they were
-    /// held. A second look keeps the one place it has, and the read whose
-    /// turn it is goes on.
+    /// A placed body read waits behind any read or turn already held back,
+    /// even with the ring under its cap, so that both go on in the order
+    /// they came. A second look keeps the one place it has, and the read
+    /// whose turn it is goes on.
     #[cfg(feature = "net-server")]
     #[test]
     fn a_new_body_read_waits_behind_held_ones() {
@@ -2649,15 +2658,17 @@ mod tests {
         pool.borrow_mut().hold(100);
         assert!(r.hold_back(0, g0 as u32).unwrap(), "at the cap it waits");
         pool.borrow_mut().unhold(100);
+        pool.borrow_mut().hold_back(HeldBack::Turn);
         assert!(
             r.hold_back(1, g1 as u32).unwrap(),
-            "under the cap, a newcomer still waits behind it"
+            "under the cap, a newcomer still waits behind them"
         );
         assert!(r.hold_back(0, g0 as u32).unwrap(), "still waiting");
+        let read = |slot, generation| HeldBack::Read { slot, generation };
         assert_eq!(
-            r.held_reads.iter().copied().collect::<Vec<_>>(),
-            [(0, g0), (1, g1)],
-            "once each, in the order held"
+            pool.borrow().held_back(),
+            [read(0, g0), HeldBack::Turn, read(1, g1)],
+            "once each, in the order they came"
         );
         r.held_turn = Some(0);
         assert!(!r.hold_back(0, g0 as u32).unwrap(), "its turn goes on");

@@ -342,38 +342,37 @@ Do not reopen these without a reason that is new.
   it holds with `BodyRecycler::take_out` and `give_back`. A reply given to
   `Deferred::reply_recycled` counts from that call through `handed` in
   `LoopShared`, which the handle adds to before it sends the reply and the
-  loop takes off before it queues the reply or sends it home, so the check
-  of the hook's mark at the queueing sees it once. The loop reads that
-  capacity again, which is still what was added, since nothing can touch
-  the storage while the reply waits in the mailbox. Pinned by
+  loop takes off as it queues the reply or sends it home. The loop reads
+  that capacity again, which is still what was added, since nothing can
+  touch the storage while the reply waits in the mailbox. Pinned by
   `held_bytes_come_off_as_they_went_on`,
-  `held_bytes_follow_a_placed_body_and_a_recycled_reply`,
-  `a_deferred_recycled_reply_counts_from_its_hand_off` and
-  `a_handed_reply_queued_under_the_mark_owes_the_hook_nothing`.
-- **At `held_cap` a placed body read waits, in order, and nothing else
-  does.** The check sits where the reactor decides to place a body, before
-  it claims storage, so a held connection keeps its header and frame and
-  claims only when it goes on. A newcomer waits behind any read already
-  waiting, and the loop's turn lets them go on in the order they were held
-  (`redrive_held_reads`, `held_turn`), checking again after each, so the
-  ring passes the cap by one body at most and a body larger than the cap
-  still goes on. Promoted storage counts but is never held back, since part
-  of its message has arrived. Pinned by
-  `placed_bodies_past_the_held_cap_wait_their_turn` and
-  `a_new_body_read_waits_behind_held_ones`.
-- **The held hook runs from the loop's turn, once for each fall under its
-  mark.** A rise that reaches the mark through `hold` or `take_out`, or a
-  count at the mark that `BodyRecycler::held` shows, owes the hook a run,
-  and the loop pays it once the count is under the mark. So a rise and fall
-  within one call of the consumer's own is heard too, and the hook never
-  runs inside `give_back`. A rise through a `Deferred` hand-off happens
-  away from the loop and owes nothing by itself, since a consumer waits
-  only on what `held` showed it, so `held` notes the debt with the same
-  read it returns. It runs before held reads go on, so what it takes out
-  comes first. Pinned by
-  `the_hook_is_owed_one_run_for_each_fall_under_its_mark`,
-  `the_held_hook_runs_once_under_its_mark_from_the_loop` and
-  `the_held_hook_hears_a_fall_that_held_showed_the_rise_of`.
+  `held_bytes_follow_a_placed_body_and_a_recycled_reply` and
+  `a_deferred_recycled_reply_counts_from_its_hand_off`.
+- **At `held_cap` a placed body read and the consumer's turns wait in one
+  queue, in the order they came, and nothing else does.** The check sits
+  where the reactor decides to place a body, before it claims storage, so
+  a held connection keeps its header and frame and claims only when it
+  goes on. The queue is the body pool's (`HeldBack`), since the
+  consumer's `BodyRecycler` reaches the pool alone. A newcomer, a read or
+  a turn, waits behind anything held back (`may_go`), and the loop's turn
+  lets them go on in the order they came (`redrive_held_reads`,
+  `held_turn`), checking again after each, so the ring passes the cap by
+  one at most, a body larger than the cap still goes on, and neither a
+  stream of turns nor one of placed bodies keeps the other back for good.
+  Promoted storage counts but is never held back, since part of its
+  message has arrived. Pinned by
+  `placed_bodies_past_the_held_cap_wait_their_turn`,
+  `a_new_body_read_waits_behind_held_ones`,
+  `a_call_may_go_only_under_the_cap_with_nothing_held_back` and
+  `turns_and_placed_bodies_go_on_in_the_order_they_came`.
+- **The held hook runs from the loop's turn, once for each turn the
+  consumer queued.** It runs as the redrive reaches the turn under the cap,
+  never inside a call of the consumer's, with no borrow of the pool, and
+  what it takes out counts before the next thing held back is looked at. A
+  call that waits waits on a turn the ring keeps, and every fall of the
+  count happens in a loop turn that ends in the redrive, so no fall can
+  pass a turn by. Pinned by
+  `turns_and_placed_bodies_go_on_in_the_order_they_came`.
 
 ### Spreading connections across rings
 
