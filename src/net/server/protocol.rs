@@ -11,36 +11,23 @@ use crate::net::core::protocol::{
 };
 
 /// A body handler's decision for one request.
-///
-/// `Reply` is the synchronous fast path - the handler computed the reply inline on the server thread (an **empty**
-/// reply means "answered, nothing to send": useful for one-way/notification messages; the connection stays open and
-/// reads continue). `ReplyClose` sends a **final** reply and then closes once it has flushed (the server speaks last).
-/// `ReplyVectored` is either of those sent as ordered segments gathered in one vectored write, so a header and its
-/// payload need not be concatenated. `Defer` hands the reply off to be delivered later from another thread via a
-/// [`Deferred`] detached from the request's [`Responder`], letting the server thread return immediately to polling;
-/// `Close` ends the connection without replying.
 #[derive(Debug)]
 pub enum Response {
     /// Send this reply now. An empty vector sends nothing (a one-way message): the request is complete and the
     /// connection keeps serving.
     Reply(Vec<u8>),
-    /// Send this reply, then close the connection once it - and everything queued before it - has flushed. For
-    /// protocols where the server speaks last: a WebSocket Close acknowledgement (RFC 6455 sec. 5.5.1 - the server
-    /// closes the TCP connection first), an HTTP error before hanging up, an SMB "no protocol supported" negotiate
-    /// reply. The recv side is retired at once: nothing further is read or delivered, buffered pipelined requests are
-    /// discarded, and later worker outcomes and pushes for this connection are dropped - nothing follows the farewell.
-    /// An **empty** vector queues no PDU and closes after flushing what is already queued (unlike [`Response::Close`],
-    /// which tears down without flushing). The close hook reports [`CloseReason::HandlerClosed`]. Because the recv side
-    /// is retired at once, a peer that stops reading before the farewell drains is reclaimed only by
-    /// `ServerConfig::send_timeout` (or `tcp_user_timeout`) -- **not** `idle_timeout`/`request_timeout`, which no
-    /// longer apply once flush-closing - so set one of those when serving untrusted peers.
+    /// Send this reply, then close the connection once it and everything queued before it has flushed, for protocols
+    /// where the server speaks last (a WebSocket Close acknowledgement, an error before hanging up). The recv side is
+    /// retired at once, so buffered pipelined requests are discarded and later worker outcomes and pushes are dropped.
+    /// An **empty** vector queues no PDU and closes after flushing what is already queued, unlike [`Response::Close`],
+    /// which tears down without flushing. The close hook reports [`CloseReason::HandlerClosed`]. With no recv armed,
+    /// only `ServerConfig::send_timeout` or `tcp_user_timeout` reclaims a peer that stops reading before the farewell
+    /// drains, so set one when serving untrusted peers.
     ReplyClose(Vec<u8>),
-    /// Send this reply as an ordered sequence of byte segments, scattered to the socket with a single vectored write -
-    /// so a protocol can hand the server a header and a payload as separate buffers instead of concatenating them (an
-    /// HTTP head + body, an SMB read header + file data, an NFS reply header + data). Each segment is a [`SendBuf`]:
-    /// owned bytes move, `'static` bytes are sent by reference - a canned body or protocol constant is never copied.
-    /// Protocol-neutral: the server never inspects the boundaries, it just gathers them. Empty segments are skipped; an
-    /// all-empty reply sends nothing (a one-way message).
+    /// Send this reply as ordered byte segments gathered into one vectored write, so a protocol can hand over a header
+    /// and a payload without concatenating them. Each segment is a [`SendBuf`], where owned bytes move and `'static`
+    /// bytes are sent by reference. Empty segments are skipped, and an all-empty reply sends nothing (a one-way
+    /// message).
     ///
     /// `close` selects the disposition: `false` behaves like [`Reply`] (keep serving), `true` like [`ReplyClose`]
     /// (flush everything queued, then close, reported as [`CloseReason::HandlerClosed`]).
@@ -53,24 +40,20 @@ pub enum Response {
         /// Close the connection once the reply (and everything queued before it) has flushed.
         close: bool,
     },
-    /// Send `head`, then stream exactly `len` bytes of `file` from `offset` as the rest of this reply - a response body
-    /// sourced from a descriptor instead of memory, read on the server's own ring in bounded chunks
-    /// (`ServerConfig::fs_body_chunk`) and sent as they arrive, so the copy in flight is bounded by the chunk size,
-    /// never the body size.
+    /// Send `head`, then stream exactly `len` bytes of `file` from `offset` as the rest of this reply, read on the
+    /// server's own ring in `ServerConfig::fs_body_chunk` chunks and sent as they arrive, so the copy in flight is
+    /// bounded by the chunk size, never the body size.
     ///
-    /// Requires an fs pool (`ServerConfig::fs_ops`); without one the connection is closed ([`CloseReason::FileBody`])
-    /// rather than a short body sent. `len` is a contract, not a hint: the protocol already framed it (an HTTP
-    /// `Content-Length`), so reads are clamped to it - a file *grown* mid-send is invisible - and a read returning EOF
-    /// before `len` closes the connection mid-body ([`CloseReason::FileBodyTruncated`]): the framing cannot renegotiate
-    /// a length already sent, and a short body presented as complete would be a lie. `len == 0` behaves as
+    /// Requires an fs pool (`ServerConfig::fs_ops`), and without one the connection is closed
+    /// ([`CloseReason::FileBody`]) rather than a short body sent. `len` is a contract the protocol already framed, so
+    /// reads are clamped to it, and an EOF before `len` closes the connection mid-body
+    /// ([`CloseReason::FileBodyTruncated`]) rather than present a short body as complete. `len == 0` behaves as
     /// [`Reply`](Response::Reply)`(head)`.
     ///
-    /// While the body streams, every other PDU for this connection (a push, a pipelined request's deferred reply)
-    /// queues behind it - nothing may interleave mid-body - and one body streams at a time: a second `ReplyFile` while
-    /// one is active closes the connection. `close` matches [`ReplyVectored`](Response::ReplyVectored)'s: `true`
-    /// flush-closes once the body (and everything queued before it) drains. While flush-closing no recv is armed, so a
-    /// peer that stops reading mid-body is reclaimed only by `ServerConfig::send_timeout` (or `tcp_user_timeout`) - set
-    /// one when serving untrusted peers; a multi-GB body pins the slot for the transfer either way.
+    /// While the body streams, every other PDU for this connection queues behind it, a second `ReplyFile` included,
+    /// which starts once the first finishes. `close` matches [`ReplyVectored`](Response::ReplyVectored)'s,
+    /// flush-closing once the body and everything before it drains, and then only `ServerConfig::send_timeout` or
+    /// `tcp_user_timeout` reclaims a peer that stops reading mid-body.
     #[cfg(feature = "uring-fs")]
     ReplyFile {
         /// The reply's leading bytes (the protocol's header), sent before the file bytes.
@@ -85,13 +68,10 @@ pub enum Response {
         /// Close the connection once the reply has fully flushed.
         close: bool,
     },
-    /// The reply will arrive later through a [`Deferred`]. Carries the [`DeferPermit`] proof minted by **this
-    /// request's** [`Responder::defer`], so "deferred" cannot be claimed without an actual [`Deferred`] existing to
-    /// eventually resolve (or drop-close) the request. The permit's routing token is verified at delivery; one stashed
-    /// from a different request closes the connection instead of parking an unresolvable request. The worker resolves
-    /// the park one of three ways: [`Deferred::reply`] with the bytes, [`Deferred::redeliver`] to run the body handler
-    /// again on the server thread (for protocol glue that retained the request in its connection state), or
-    /// [`Deferred::close`].
+    /// The reply will arrive later through a [`Deferred`]. The [`DeferPermit`] comes from **this request's**
+    /// [`Responder::defer`], and its token is checked at delivery, so one from another request closes the connection
+    /// rather than park a request nothing can resolve. The worker resolves it with [`Deferred::reply`], with
+    /// [`Deferred::redeliver`] to run the body handler again on the server thread, or with [`Deferred::close`].
     Defer(DeferPermit),
     /// **Detach** the connection: hand its socket fd to your own worker for a blocking operation (e.g. ZFS send/recv),
     /// then resume or close it. Carries the [`DetachPermit`] proof minted by **this request's** [`Responder::detach`];
@@ -112,10 +92,9 @@ pub enum Response {
 pub struct Incoming<'a> {
     /// The peer's identity (fetched per connection - race-free).
     pub peer: &'a ClientAddr,
-    /// Resolved bind address of the listener this connection arrived on (the same values [`Server::local_addrs`]
-    /// reports) - the hook for per-listener policy. Deliberately the listener's address, not the connection's local
-    /// address: on a wildcard bind the two differ, and `getsockname` needs `SOCKET_URING_OP_GETSOCKNAME` (newer than
-    /// the target kernel) - a possible future `local_addr` field.
+    /// Resolved bind address of the listener this connection arrived on, as [`Server::local_addrs`] reports it, for
+    /// per-listener policy. On a wildcard bind it is not the connection's local address, which would need
+    /// `SOCKET_URING_OP_GETSOCKNAME`, newer than the target kernel.
     pub listener_addr: &'a ServerAddr,
 }
 

@@ -24,16 +24,13 @@ where
     BodyFn: FnMut(Request<'_, U>) -> Response,
 {
     pub(super) fn on_wake(&mut self) -> errno::Result<()> {
-        // The READ already drained the eventfd counter into `pads.wake_buf`. A poke means a shutdown request and/or
-        // replies handed back by offloaded workers; deliver those, then re-arm (unless we're shutting down).
+        // The READ already drained the eventfd counter. Deliver what the wake announced, then re-arm unless stopping.
         //
-        // Fire finished fs offloads first, so a continuation that answers its request via a `Deferred` has that reply
-        // drained in this pass - and unconditionally, as the standalone host does (`uring_fs::host`'s `TAG_WAKE` arm
-        // gates only the re-arm). This drain is the only route a queued host refusal has (`FsCore::refuse`), and
-        // `serve_forever`'s teardown routes reaped CQEs to `on_drain_cqe` without touching the refusal queue - so one
-        // gated out here dies unfired, taking the callback and the payload it was handing back with it. It runs no I/O
-        // of its own; whatever a continuation submits from it is reaped by the teardown drain like any other in-flight
-        // op.
+        // Finished fs offloads go first, so a continuation that answers through a `Deferred` has its reply drained in
+        // this pass, and they go unconditionally, as in the standalone host (`uring_fs::host`'s `TAG_WAKE` arm gates
+        // only the re-arm). This drain is the only consumer of the host refusal queue (`FsCore::refuse`), and the
+        // teardown routes reaped CQEs to `on_drain_cqe` without touching it, so a refusal gated out here dies unfired
+        // with its callback and payload. Gate the re-arm and the injection drain, never `drain_fs_offloads`.
         self.drain_wake_sources()?;
         if !self.core.stopping() {
             self.core.arm_wake()?;
@@ -56,20 +53,17 @@ where
         Ok(())
     }
 
-    /// Deliver the results of finished fs offload jobs ([`FsConn::offload`] and the hybrid directory lister) that
-    /// workers pushed onto the fs completion queue and signalled by poking this wake. Each fires with a fresh
-    /// owner-scoped `FsConn` for an owner that may already be gone, so a file one of them opens is its own to close.
-    /// Without this drain the server would never resolve an offloaded request and would leak the walk's `DIR*`; the
-    /// standalone host drains the same way from its own wake. It is also where the fs reactor's woken tasks are polled
-    /// (`deliver_pool_completions` ends in `task::in_pass`'s drain), so skipping it strands those too.
+    /// Deliver the results of finished fs offload jobs ([`FsConn::offload`] and the hybrid directory lister), each with
+    /// a fresh owner-scoped `FsConn` for an owner that may already be gone, so a file one opens is its own to close.
+    /// This is also where the fs reactor's woken tasks are polled (`deliver_pool_completions` ends in `task::in_pass`'s
+    /// drain). Without it an offloaded request never resolves and a walk's `DIR*` leaks.
     #[cfg(feature = "uring-fs")]
     fn drain_fs_offloads(&mut self) -> errno::Result<()> {
         if let Some(fs) = self.fs.as_mut() {
             crate::uring_fs::core::deliver_pool_completions(fs, &mut self.core.engine);
-            // A job that digested a leased recv buffer (`offload_from`) released its share when its completion was
-            // taken above, and a share dropped anywhere else - a `LeasedWindow` a handler let go, on any thread -
-            // queued its buffer id and poked this wake; both come back to the pool here, the one place that can reach
-            // it - as a leased write's does from the fs dispatch in `on_cqe`.
+            // A job that digested a leased recv buffer released its share as its completion was taken above, and a
+            // share dropped anywhere else, on any thread, queued its id and poked this wake. Both come back to the pool
+            // here, the one place that can reach it.
             let released = fs.take_pool_releases();
             if !released.is_empty() {
                 if let Some(pool) = self.core.recv_bufs.as_mut() {
@@ -117,24 +111,17 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             joined.close();
         }
 
-        // Refuse new connections now, not when the listener fd closes at drop. Cancelling the multishot accept below
-        // only stops this loop dequeuing; the kernel keeps completing handshakes into the backlog (and the in-flight
-        // accept holds a reference to the socket, so even closing the fd would change nothing until that cancel lands),
-        // and every such client waits on a server that will never answer. `shutdown(SHUT_RD)` acts on the socket
-        // itself. A TCP listener leaves TCP_LISTEN: `inet_shutdown` -> `tcp_disconnect` -> `tcp_set_state(TCP_CLOSE)`
-        // unhashes it (`inet_unhash`, which also takes it out of its `reuse_port` group), then `inet_csk_listen_stop`
-        // resets what it had queued (or hands it to a sibling when `tcp_migrate_req` is on), so a connect is refused at
-        // once or lands on a sibling. A unix listener stays TCP_LISTEN with RCV_SHUTDOWN set: `unix_stream_connect`
-        // refuses from here on, but the kernel does not touch what it had already queued.
-        // The state change wakes the armed accept: the TCP one fails with -EINVAL on its own; the unix one dequeues the
-        // queued embryos (accept does not check RCV_SHUTDOWN), which `accept_connection` sheds, then waits again until
-        // the cancel below ends it with -ECANCELED. `on_accept` ignores both while draining. Best effort: a failure
-        // leaves the old behaviour, the backlog filling until the fd closes.
+        // Refuse new connections now, not when the fd closes at drop. Cancelling the accept only stops this loop
+        // dequeuing, while the kernel keeps completing handshakes into a backlog nobody answers. A TCP listener leaves
+        // TCP_LISTEN (`inet_shutdown` -> `tcp_disconnect` -> `tcp_set_state(TCP_CLOSE)`), which takes it out of its
+        // `reuse_port` group and resets what it had queued (`inet_csk_listen_stop`), so a connect is refused or lands
+        // on a sibling. A unix listener keeps TCP_LISTEN with RCV_SHUTDOWN set, so `unix_stream_connect` refuses, while
+        // accept still dequeues the queued embryos for `accept_connection` to shed. `on_accept` ignores the TCP
+        // accept's `-EINVAL` and the unix one's final `-ECANCELED` while draining. Best effort, since a failure only
+        // leaves the backlog filling until the fd closes.
         //
-        // **`draining` must already be set when this runs.** The `-EINVAL` the TCP accept completes with is classified
-        // *fatal* by `accept_error_is_fatal`, and the only thing that keeps it from ending `serve_forever` with an
-        // error is `on_accept`'s early return for a draining server. Shutting a listener down from any path that has
-        // not set the flag turns a graceful drain into a failed one.
+        // **`draining` must already be set when this runs.** `accept_error_is_fatal` classes the TCP accept's `-EINVAL`
+        // as fatal, and only `on_accept`'s early return for a draining server keeps it from ending `serve_forever`.
         debug_assert!(
             self.core.draining,
             "listeners are shut down only once `draining` is set: the \
@@ -151,8 +138,8 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             }
         }
 
-        // Stop accepting: cancel each listener's multishot accept by its user_data. If one was parked as `deferred`
-        // (pool full) the cancel finds nothing; the re-arm guards check `draining`, so it stays down either way.
+        // Stop accepting by cancelling each listener's multishot accept. One parked on a full pool has nothing to
+        // cancel, and the re-arm guards check `draining`, so it stays down either way.
         for lidx in 0..self.listeners.len() as u32 {
             let accept_ud = pack(Op::Accept, lidx, 0);
             self.core.stage(pack(Op::Cancel, 0, 0), move |sqe| {
@@ -175,22 +162,19 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
             sqe.len = 1; // exactly one timespec, per the kernel
         })?;
 
-        // One sweep over the table: close idle serving connections now (cancel their parked recv - the -ECANCELED
-        // completion drives the normal close path; connections with work in flight drain via the `pump`/`on_send`
-        // rules), and close connections parked mid-TLS- handshake - they hold a socket but have no in-flight op to
-        // cancel, so nothing else would reclaim them. (A late worker callback then hits the bumped generation and is
-        // dropped; parked slots are not counted live, so no drain accounting.)
+        // One sweep over the table. Close idle serving connections now, through a cancel of their parked recv whose
+        // `-ECANCELED` drives the normal close, and leave connections with work in flight to drain through `pump` and
+        // `on_send`. Connections parked mid-handshake hold a socket with no op to cancel, so they are torn down here,
+        // and a late worker callback finds a new generation.
         let mut idle: Vec<(u32, u32, bool)> = Vec::new();
         let mut tls_parked: Vec<u32> = Vec::new();
         for (slot, entry) in self.core.table.iter() {
             match &entry.state {
                 SlotState::Serving(c) if !c.closing => {
                     let parked = c.recving && c.recv_idle;
-                    // A connection mid-body-splice (or awaiting its readiness poll) has work in flight even though
-                    // `recving` is false -- it must NOT be treated as quiesced, or the drain would cancel a healthy
-                    // in-flight transfer and truncate the body in the consumer's pipe. It drains naturally: the splice
-                    // completes, `pump` sees `draining` and closes once nothing is owed; a WEDGED transfer is cut off
-                    // by the grace Deadline's escalation.
+                    // A connection mid-splice has work in flight though `recving` is false. Treated as quiesced, the
+                    // drain would cancel a healthy transfer and truncate the body in the consumer's pipe, so it drains
+                    // through `pump`, and a wedged one is cut off by the grace deadline.
                     let quiesced = !c.recving
                         && !c.sending
                         && !c.splicing
@@ -242,9 +226,8 @@ where
     /// inline is dropped instead of duplicated or misdelivered.
     fn drain_injections(&mut self) -> errno::Result<()> {
         while let Ok(msg) = self.mailbox.inject_rx.try_recv() {
-            // A control message is the consumer's own: it concerns no connection, so no liveness check, and it runs
-            // here, between completion batches, whatever the loop's state - a drain included. The hook is the
-            // consumer's code; what it does with the message is not this loop's business.
+            // A control message concerns no connection, so it needs no liveness check, and it runs here between
+            // completion batches whatever the loop's state, a drain included.
             if let Injected::Control(message) = msg {
                 if let Some(hook) = self.handlers.control.as_mut() {
                     hook(message);
@@ -262,18 +245,16 @@ where
                 if self.core.draining {
                     continue; // shutting down
                 }
-                // A push reaches the connection in ANY live state - Serving, or parked across a detach (`PushHandle`'s
-                // contract is "for the connection's lifetime", and a detach window must not silently drop). A Serving
-                // connection sends now; a Detaching/Detached one only QUEUES - the worker owns the raw stream, so
-                // writing would corrupt its transfer - and the queue flushes when the worker resumes it.
+                // A push reaches the connection in any live state, since `PushHandle` promises the connection's
+                // lifetime. A serving connection sends now, and a detached one only queues, since the worker owns the
+                // raw stream, and flushes at resume.
                 let (overflow, serving) = {
                     // `self.core.table` vs `self.core.cfg`: disjoint borrows.
                     let Some((conn, serving)) = self.core.table.push_conn_mut(slot, generation) else {
                         continue; // connection gone (or slot recycled)
                     };
                     if conn.close_on_flush.is_some() {
-                        // Flush-closing: the farewell is final - a push arriving after it is dropped, never queued
-                        // behind.
+                        // Flush-closing, so the farewell is final and a later push is dropped.
                         continue;
                     }
                     if conn.queued_bytes() + bytes.len() > self.core.cfg.max_send_backlog {
@@ -288,8 +269,7 @@ where
                     }
                 };
                 if overflow && serving {
-                    // Slow consumer: evict rather than queue unboundedly. Liveness checked full-u64 above; kernel op ->
-                    // low 32.
+                    // Slow consumer, evict rather than queue without bound.
                     self.core
                         .close_conn(slot, generation as u32, CloseReason::SendBacklog)?;
                 } else if !overflow && serving {
@@ -297,10 +277,9 @@ where
                 }
                 continue;
             }
-            // A cross-thread close (`PushHandle::close`): flush-close the connection. Like a push it reaches any live
-            // state - a Serving connection flushes its queue and closes; one parked under a detach worker is only
-            // marked, the close landing at resume (after the pushes held during the window), like the backlog eviction.
-            // Processed even while draining: it can only speed the drain up.
+            // A cross-thread close (`PushHandle::close`) reaches any live state, like a push. A serving connection
+            // flushes and closes, and one parked under a detach worker is only marked, the close landing at resume.
+            // Processed while draining too, since it can only speed the drain.
             if let Injected::PushClose { slot, generation } = msg {
                 let serving = {
                     let Some((conn, serving)) = self.core.table.push_conn_mut(slot, generation) else {
@@ -317,14 +296,13 @@ where
                 }
                 continue;
             }
-            // Detach outcomes are slot-scoped (no request token). Generation is
-            // the full u64 - a worker may retain the handle across recycles;
-            // reattach only if the slot is still detached (a stale/duplicate outcome is inert). Then re-arm serving
-            // (resume) or close.
+            // Detach outcomes are slot-scoped, with the full u64 generation since a worker may hold the handle across
+            // recycles. Reattach only a slot still detached, so a stale or duplicate outcome is inert, then resume
+            // serving or close.
             if let Injected::DetachResume { slot, generation } = msg {
                 if self.core.table.generation(slot) == generation && self.core.table.reattach(slot) {
-                    // Pushes queued during the detach window flush now; an overflow during the window evicts now (it
-                    // could not tear down under the worker - see `drain_injections`' push arm).
+                    // Pushes queued during the detach flush now, and an overflow during it evicts now, since neither
+                    // could act under the worker.
                     let (evict, flush, pending) = {
                         let conn = self.core.table.conn_mut(slot);
                         (
@@ -339,9 +317,8 @@ where
                         continue;
                     }
                     if flush {
-                        // A `PushHandle::close` that landed during the detach window: flush what was held (pushes
-                        // queued in the window ride ahead of it), then close - the same lands-at-resume rule as the
-                        // backlog eviction.
+                        // A `PushHandle::close` that landed during the detach. Flush what was held, the pushes from the
+                        // window ahead of it, then close.
                         self.core.drive_flush_close(slot, generation as u32)?;
                         continue;
                     }
@@ -439,12 +416,10 @@ where
                         .close_conn(token.slot, token.generation as u32, CloseReason::WorkerClosed)?;
                 }
                 Injected::Redeliver(_) => {
-                    // The worker asks for a second delivery instead of supplying bytes: retire the parked request's
-                    // in-flight count, then run the body handler again over the (empty) current frame - the protocol
-                    // glue retained the request in its connection state. `deliver_one` mints a fresh req_id and enacts
-                    // the returned `Response` exactly as a first delivery would, so the rerun may reply, defer again,
-                    // or close. Runs during graceful drain like a `Reply` - the drain's promise is that deferred work
-                    // finishes - and the pump then closes the connection once the reply flushes.
+                    // The worker asks for a second delivery instead of supplying bytes. Retire the parked request's
+                    // count, then run the body handler again over the empty current frame, which may reply, defer again
+                    // or close. It runs during a graceful drain like a `Reply`, since the drain promises deferred work
+                    // finishes.
                     {
                         let conn = self.core.table.conn_mut(token.slot);
                         conn.outstanding = conn.outstanding.saturating_sub(1);

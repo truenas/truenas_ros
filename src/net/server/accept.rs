@@ -43,10 +43,9 @@ where
         }
         let e = Errno::from_raw(-cqe.res);
         if e == Errno::ENFILE {
-            // A full fixed-file table reports ENFILE - but so does a system-wide file-table exhaustion. Park only when
-            // the pool really is full, where the next Close re-arms the accept via `reclaim_slot`; with free slots no
-            // slot-free event is coming, so a park would idle the listener forever - back off and retry like any other
-            // transient shortage instead.
+            // A full fixed-file table reports ENFILE, and so does a system-wide file-table exhaustion. Park only when
+            // the pool really is full, where the next close re-arms the accept, since with free slots no slot-free
+            // event is coming and a park would idle the listener for good.
             if self.core.table.has_free_slot() {
                 stat!(self.core, accept_retries);
                 self.submit_accept_retry(lidx)?;
@@ -60,9 +59,8 @@ where
             // A broken listener/setup (EBADF/EINVAL/...): retrying can't help.
             return Err(e);
         } else {
-            // Transient (ENOMEM/ENOBUFS/ECONNABORTED/EMFILE/EINTR/...): never fatal - re-arm after a backoff so a
-            // sustained resource shortage can't spin the loop at 100% CPU (matches Samba's accept throttle and tokio's
-            // never-die accept). No accepted connection to shed.
+            // Transient, never fatal. Re-arm after a backoff so a sustained shortage cannot spin the loop, with no
+            // accepted connection to shed.
             stat!(self.core, accept_retries);
             self.submit_accept_retry(lidx)?;
         }
@@ -117,8 +115,7 @@ where
         if self.listeners[lidx as usize].tls {
             return self.submit_fd_install(slot, lidx);
         }
-        // Peer identity is fetched per connection - race-free, unlike a peer-address buffer shared across a multishot
-        // accept's completions -- and the accept handler runs from that fetch's completion.
+        // The accept handler runs from the peer fetch's completion.
         match self.listeners[lidx as usize].addr {
             ServerAddr::Tcp(_) | ServerAddr::Tcp6(_) => self.submit_peername(slot, lidx),
             ServerAddr::Unix(_) if self.cfg.unix_peercred => self.submit_cred(slot, lidx),
@@ -168,11 +165,9 @@ where
             stat!(self.core, shed);
             return self.core.submit_teardown(slot, generation, true);
         }
-        // Derive the peer from the real fd (getpeername is a cheap in-kernel read, fine on the loop thread). Fail
-        // CLOSED on any failure - the peer reset between accept and install, or the fd is not the TCP socket a kTLS
-        // listener guarantees: shed rather than deliver the consumer's handshake handler a connection with a wrong
-        // identity (mirrors the plain-TCP `on_peer_fetch` policy). Then park the slot: hold it (no `Connection`, no
-        // in-flight op) until the worker signals.
+        // Derive the peer from the real fd, a cheap in-kernel read. Fail closed, as `on_peer_fetch` does, rather than
+        // hand the handshake handler a wrong identity. Then park the slot, with no `Connection` and no op in flight,
+        // until the worker signals.
         let Some(peer) = sock::peer_from_fd(fd) else {
             // SAFETY: close the freshly furnished fd we will not deliver.
             unsafe { libc::close(fd) };
@@ -183,8 +178,7 @@ where
         // Bound the park: if the consumer's handshake worker never calls back in time, shed the slot (SECURITY: else a
         // stalled TLS handshake pins a pool slot indefinitely). No-op unless `tls_handshake_timeout` is set.
         if let Err(e) = self.arm_handshake_timeout(slot, generation) {
-            // SAFETY: close the freshly furnished fd we will not deliver. The slot is already parked, so shed it via
-            // teardown as the other error arms do.
+            // SAFETY: `fd` is the freshly furnished fd, owned by nothing else.
             unsafe { libc::close(fd) };
             stat!(self.core, shed);
             let _ = self.core.submit_teardown(slot, generation, true);
@@ -199,12 +193,9 @@ where
                 // SAFETY: close the freshly furnished fd we will not deliver.
                 unsafe { libc::close(fd) };
                 stat!(self.core, shed);
-                // Unlike every arm above, the slot is already parked here *and* its handshake timeout is already armed.
-                // Retire both, the way the resolve path does: left armed, that timeout fires later, finds the slot
-                // still parked and issues a SECOND teardown for the same slot and generation - against `close.rs`'s
-                // rule that the index-freeing CLOSE is a connection's last ring op. Taking the park is what makes a
-                // surviving expiry inert (`on_handshake_timeout` finds nothing parked), so the cancel is
-                // belt-and-braces and must not displace the teardown - the sibling arm above sheds the same way.
+                // The slot is parked and its handshake timeout armed here. Taking the park makes a later expiry inert
+                // (`on_handshake_timeout` finds nothing parked), where it would otherwise issue a second teardown after
+                // the index-freeing CLOSE. The cancel is a courtesy and must not replace the teardown.
                 let _ = self.core.table.take_tls_parked(slot);
                 let _ = self.cancel_handshake_timeout(slot, generation);
                 return self.core.submit_teardown(slot, generation, true);
@@ -304,10 +295,8 @@ where
         })
     }
 
-    /// A parked kTLS slot's handshake timeout fired (or was cancelled - the result is irrelevant): if the slot is still
-    /// parked at this generation the worker did not call back in time, so shed it (a late `ready()`/`reject()` then
-    /// hits the bumped generation and is dropped). Otherwise it already resolved (or the slot recycled) - nothing to
-    /// do.
+    /// A parked kTLS slot's handshake timeout fired or was cancelled. A slot still parked at this generation missed its
+    /// deadline and is shed, and a late `ready()` or `reject()` then finds a new generation and is dropped.
     pub(super) fn on_handshake_timeout(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
         if self.core.table.generation_low(slot) != generation {
             return Ok(()); // slot recycled
@@ -399,10 +388,8 @@ where
         })
     }
 
-    /// A peer-identity fetch (`SO_PEERCRED` or `SO_PEERNAME`) completed: shed the connection on a failed fetch, or run
-    /// the deferred accept path with the peer identity. The stored [`PendingPeer`] variant says which fetch this was
-    /// (the op and its landing pad are always set together), so one completion skeleton serves both - only the result
-    /// validation and the pad parsing differ.
+    /// A peer-identity fetch (`SO_PEERCRED` or `SO_PEERNAME`) completed. Shed the connection on a failed fetch, or run
+    /// the accept handler with the peer identity. The stored [`PendingPeer`] variant says which fetch this was.
     pub(super) fn on_peer_fetch(&mut self, slot: u32, generation: u32, res: i32) -> errno::Result<()> {
         // Check the generation BEFORE taking the state: a stale completion for a recycled slot must not clear the new
         // incarnation's pending fetch (matches `drain_handshake_outcomes`). Kernel completion -> compare only the low
@@ -512,26 +499,17 @@ impl<U, AcceptFn, HeaderFn, BodyFn> Server<U, AcceptFn, HeaderFn, BodyFn> {
     }
 }
 
-/// Whether an accept error means the listener/setup is broken (retrying can't help -> propagate) rather than a
-/// transient resource shortage (retry with
-/// backoff). Conservative: only genuinely unrecoverable errnos are fatal;
-/// everything else - `ENOMEM`/`ENOBUFS`/`ECONNABORTED`/`EMFILE`/`EINTR`/... - is treated as transient so a resource
-/// storm can't kill the server.
+/// Whether an accept error means the listener or its SQE is broken, so every re-arm would fail the same way, rather
+/// than a transient shortage to back off from. The fatal ones are these.
+/// * `EBADF`, the listener descriptor is not a valid open fd.
+/// * `EINVAL`, the socket is not listening or the accept arguments are malformed. A graceful drain produces this
+///   routinely, and only `on_accept`'s early return for a draining server keeps it from ending the server (see
+///   `begin_drain`).
+/// * `EFAULT`, an address argument outside our address space, a bug in how the SQE was built.
+/// * `ENOTSOCK`, the descriptor is not a socket.
 ///
-/// The fatal set is exactly the structural errors - the listener fd or the accept SQE itself is wrong, so every re-arm
-/// fails identically:
-/// * `EBADF` - the listener descriptor is not a valid open fd (closed, or never registered).
-/// * `EINVAL` - the socket is not `listen()`ing, or the accept arguments are malformed. **A graceful drain produces
-///   this routinely** and it is not fatal there: `begin_drain`'s `shutdown(SHUT_RD)` drives a TCP listener to
-///   `TCP_CLOSE`, which completes the armed multishot accept `-EINVAL`.
-///   What keeps it from ending the server is `on_accept` returning early for a draining server, *before* this
-///   classification is consulted - so `draining` must be set before any listener is shut down. See the assertion in
-///   `begin_drain`.
-/// * `EFAULT` - an address/length argument points outside our address space (a bug in how the SQE was built).
-/// * `ENOTSOCK` - the descriptor is not a socket (the wrong fd was registered).
-///
-/// Everything else can succeed on a later accept, so it backs off rather than propagating: resource pressure
-/// (`ENOMEM`/`ENOBUFS`/`EMFILE`/`ENFILE`), per-connection races (`ECONNABORTED`/`ECONNRESET`/`EPERM`), and `EINTR`.
+/// Everything else, resource pressure, per-connection races and `EINTR`, can succeed on a later accept, so it backs off
+/// rather than propagate, and a resource storm cannot kill the server.
 fn accept_error_is_fatal(e: Errno) -> bool {
     matches!(e, Errno::EBADF | Errno::EINVAL | Errno::EFAULT | Errno::ENOTSOCK)
 }

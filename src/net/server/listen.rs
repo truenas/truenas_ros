@@ -24,12 +24,9 @@ pub(crate) fn listen_socket(addr: &ServerAddr, cfg: &ServerConfig) -> crate::Res
     // SAFETY: socket() returned a fresh owned fd.
     let fd = unsafe { owned_from_raw(raw) };
 
-    // TCP-only options. Everything set on the listener here is inherited by accepted sockets on Linux, which is what
-    // makes per-connection behavior (NODELAY, keepalive, user timeout) configurable at all for direct descriptors - the
-    // server never holds an accepted connection as a normal fd it could setsockopt.
-    // Force single-stack on every IPv6 listener (as Samba does): otherwise the platform default (`net.ipv6.bindv6only`)
-    // may accept v4-mapped peers on a `::` bind - which would parse as spurious IPv6 addresses - and collide with a
-    // separate IPv4 listener on the same port.
+    // Accepted sockets inherit the listener's options, the only way to set them on a direct descriptor. IPv6 is
+    // single-stack, or `net.ipv6.bindv6only` may let v4-mapped peers onto `::`, read as spurious IPv6 addresses, and
+    // collide with an IPv4 listener on the port.
     if matches!(addr, ServerAddr::Tcp6(_)) {
         set_opt(&fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 1)?;
     }
