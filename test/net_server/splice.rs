@@ -2,12 +2,9 @@ use super::*;
 
 #[test]
 fn tcp_splice_body_recv() {
-    // A framer diverts a DATA frame's body straight from the socket to a consumer pipe with IORING_OP_SPLICE -
-    // zero-copy, the body never enters the connection buffer - while CONTROL frames deliver to the body handler as
-    // usual. Proves: (a) the spliced bytes arrive intact on the pipe; (b) a body several times the pipe capacity drives
-    // the partial-splice resubmit path and end-to-end backpressure (the ring never blocks - an io-wq worker does -
-    // while the reader drains); (c) keep-alive framing resumes after the splice (a control frame still echoes on the
-    // same connection).
+    // A framer diverts a data frame's body from the socket to a pipe with `IORING_OP_SPLICE`, while control frames
+    // deliver as usual. The body must arrive intact through partial splices and backpressure, and keep-alive framing
+    // resumes after it.
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills the two-element array with {read, write} fds.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
@@ -41,7 +38,6 @@ fn tcp_splice_body_recv() {
     const BODY: usize = 256 * 1024;
     let payload: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
 
-    // Reader thread: drain exactly BODY bytes off the pipe read end.
     let expected = payload.clone();
     let reader = thread::spawn(move || {
         let mut got = vec![0u8; BODY];
@@ -82,19 +78,14 @@ fn tcp_splice_body_recv() {
 
 #[test]
 fn tcp_splice_body_close_mid_splice() {
-    // Teardown while a body splice is genuinely IN FLIGHT - the security-critical path. A splice's SQE fd is the
-    // consumer pipe, not the socket, so the fd-keyed teardown cancel can't reach it: `close_conn` must cancel the
-    // splice by its user_data and defer the index-freeing CLOSE until it reaps (the splice pins the socket's fixed
-    // resource node exactly like a recv, so CLOSE must be the connection's last op).
+    // Teardown while a body splice is in flight. A splice's SQE fd is the consumer pipe, not the socket, so
+    // `close_conn` must cancel it by its user_data and defer the index-freeing CLOSE until it reaps, since the splice
+    // pins the socket's fixed resource node as a recv does.
     //
-    // Pin the splice in flight deterministically: a tiny pipe with NO reader, and a body larger than it. The first
-    // splice fills the pipe; the next parks in the kernel `wait_for_space` (pipe full, never drained) - an in-flight
-    // splice blocked on an io-wq worker. A graceful drain deliberately does NOT touch an in-flight splice
-    // (`begin_drain`'s quiesced test skips `splicing` -- it cannot tell this wedged transfer from a healthy one, and
-    // truncating a healthy one is the bug in `tcp_graceful_drain_lets_healthy_splice_finish`). So the wedged splice is
-    // reclaimed only when the grace Deadline escalates to a hard stop: this test proves that escalation's
-    // `cancel_and_reap_all` can cancel a splice BLOCKED in io-wq (whose SQE fd is the pipe, not the socket) rather than
-    // hanging on it - `serve_forever` returns promptly.
+    // A one-page pipe with no reader and a larger body park the second splice in the kernel's `wait_for_space` on an
+    // io-wq worker. A graceful drain leaves an in-flight splice alone, since it cannot tell a wedged transfer from a
+    // healthy one (`tcp_graceful_drain_lets_healthy_splice_finish`), so only the grace deadline's escalation reclaims
+    // it, and `cancel_and_reap_all` must cancel a splice blocked in io-wq rather than hang.
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills {read, write}.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
@@ -131,8 +122,6 @@ fn tcp_splice_body_close_mid_splice() {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         (|| -> io::Result<TcpStream> {
             let mut s = connect_tcp(v4)?;
-            // A data frame whose body overruns the unread pipe: the splice fills the pipe, then parks in flight
-            // (nothing drains it).
             splice_frame(&mut s, b'S', &vec![0xABu8; BODY])?;
             thread::sleep(Duration::from_millis(150)); // let the splice park
             stop.shutdown_graceful(Duration::from_millis(300));
@@ -166,12 +155,9 @@ fn tcp_splice_body_close_mid_splice() {
 
 #[test]
 fn tcp_splice_body_close_mid_poll() {
-    // Teardown while a splice is parked on its readiness POLL. A body splice off the non-blocking pool socket returns
-    // `-EAGAIN` when the socket is drained mid-body; the server then waits for `POLLIN` before resubmitting. Here the
-    // client sends a data-frame header but NO body, so the first splice EAGAINs and parks on the poll indefinitely. As
-    // with an in-flight splice, a graceful drain leaves the parked poll alone (`splice_polling` reads as in-flight
-    // work); the grace Deadline escalation then reaps it. This proves escalation doesn't hang on a parked splice poll -
-    // `serve_forever` returns promptly.
+    // Teardown while a splice is parked on its readiness poll. The client sends a data frame header but no body, so the
+    // first splice returns `-EAGAIN` and parks on `POLLIN`. A graceful drain leaves the parked poll alone, as it does
+    // an in-flight splice, and the grace deadline's escalation must reap it without hanging.
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills {read, write}.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
@@ -204,8 +190,6 @@ fn tcp_splice_body_close_mid_poll() {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         (|| -> io::Result<TcpStream> {
             let mut s = connect_tcp(v4)?;
-            // Header only, declaring an 8 MiB body: the splice arms, finds the socket empty, EAGAINs, and parks on the
-            // readiness poll.
             let mut hdr = vec![b'S'];
             hdr.extend_from_slice(&(8u32 * 1024 * 1024).to_be_bytes());
             s.write_all(&hdr)?;
@@ -237,11 +221,9 @@ fn tcp_splice_body_close_mid_poll() {
 
 #[test]
 fn tcp_splice_body_request_timeout_reclaims_stall() {
-    // SECURITY (slow-loris, splice path): a peer that sends a `SpliceBody` header then withholds the body must not pin
-    // its slot. The body splice EAGAINs on
-    // the drained non-blocking socket and parks on its readiness poll;
-    // `request_timeout` bounds that poll exactly like a body recv, so the stalled slot is reclaimed. (Without the bound
-    // the poll would wait forever.)
+    // A slow-loris guard. A peer that sends a `SpliceBody` header and withholds the body must not pin its slot. The
+    // splice returns `-EAGAIN` on the drained socket and parks on its readiness poll, which `request_timeout` bounds as
+    // it does a body recv.
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills {read, write}.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
@@ -276,8 +258,6 @@ fn tcp_splice_body_request_timeout_reclaims_stall() {
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
         let r = (|| -> io::Result<()> {
-            // A SpliceBody header declaring an 8 MiB body, then stall: the splice parks on its readiness poll and
-            // request_timeout reclaims the slot.
             let mut stall = connect_tcp(v4)?;
             let mut hdr = vec![b'S'];
             hdr.extend_from_slice(&(8u32 * 1024 * 1024).to_be_bytes());
@@ -300,11 +280,9 @@ fn tcp_splice_body_request_timeout_reclaims_stall() {
 
 #[test]
 fn tcp_graceful_drain_lets_healthy_splice_finish() {
-    // `shutdown_graceful`'s contract: work in flight runs to completion within the grace. A body mid-splice IS
-    // in-flight work even though `recving` is false - the drain sweep must not classify it quiesced and cancel it (that
-    // silently truncates the body in the consumer's pipe). Regression test: begin a drain while a splice is parked on
-    // its readiness poll mid-body, then let the client finish; the FULL body must reach the pipe, and the connection
-    // closes only after it does.
+    // Work in flight runs to completion within the grace, and a body mid-splice is in-flight work even though `recving`
+    // is false. A drain begun while the splice is parked on its readiness poll mid-body must let the client finish, so
+    // the full body reaches the pipe before the connection closes.
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills {read, write}.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
@@ -354,8 +332,7 @@ fn tcp_graceful_drain_lets_healthy_splice_finish() {
             thread::sleep(Duration::from_millis(100)); // let the sweep run
             s.write_all(&sent[BODY / 2..])?; // finish the transfer
 
-            // The body completes and only THEN does the drain close us -- well inside the grace (no Deadline escalation
-            // involved).
+            // The body completes and only then does the drain close us, well inside the grace.
             let mut buf = Vec::new();
             s.read_to_end(&mut buf)?;
             assert!(
@@ -382,14 +359,12 @@ fn tcp_graceful_drain_lets_healthy_splice_finish() {
     assert_eq!(got, payload, "spliced body corrupted");
 }
 
-/// SECURITY: one destination pipe, one body. Two connections splicing to the same fd do not merely queue behind each
-/// other - they **interleave**. A splice moves at most what the transport hands over in one call, and the remainder is
-/// resubmitted as a fresh op, so another connection's splice can take the pipe's mutex in between and write its own
-/// bytes.
-/// The second body is refused rather than served corrupt.
+/// One destination pipe takes one body. Two connections splicing to one fd **interleave**, since a splice moves at most
+/// one call's worth and resubmits the remainder as a fresh op, so another connection's splice can write in between. The
+/// second body is refused rather than served corrupt.
 ///
-/// A captured-fd framer closure is the shape that invites this, which is exactly what `splice_header` is - so this test
-/// is the framer every other splice test here uses, driven by two connections instead of one.
+/// A framer closure that captures an fd invites this, and `splice_header` is one, so this drives the framer every
+/// splice test here uses from two connections.
 #[test]
 fn tcp_splice_body_refuses_a_destination_already_in_use() {
     use std::sync::Mutex;
@@ -485,11 +460,10 @@ fn tcp_splice_body_refuses_a_destination_already_in_use() {
 
 #[test]
 fn tcp_splice_body_nonblocking_pipe_rejected() {
-    // A NON-BLOCKING destination breaks the splice path's contract two ways: `do_splice` promotes the output fd's
-    // O_NONBLOCK to SPLICE_F_NONBLOCK, so a full pipe fails the splice with EAGAIN before the socket is read --
-    // indistinguishable from "socket empty", which would spin the readiness poll hot (POLLIN completes instantly,
-    // splice EAGAINs again) - and the designed blocking-pipe backpressure never engages. The server refuses the fd at
-    // body start: `CloseReason::SpliceBadFd`, kernel never sees it.
+    // A non-blocking destination breaks the splice path two ways. `do_splice` turns the output fd's O_NONBLOCK into
+    // `SPLICE_F_NONBLOCK`, so a full pipe fails with EAGAIN before the socket is read, which looks like an empty socket
+    // and spins the readiness poll hot, and the blocking-pipe backpressure never engages. The server refuses the fd at
+    // body start with `CloseReason::SpliceBadFd`.
     use std::sync::Mutex;
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: `pipe(2)` fills {read, write}.
@@ -568,10 +542,9 @@ fn tcp_splice_body_nonblocking_pipe_rejected() {
 
 #[test]
 fn tcp_send_timeout_reclaims_slot() {
-    // A peer that requests a huge reply and then never reads it parks a MSG_WAITALL send forever (TCP zero-window
-    // probing never gives up). With `send_timeout`, the linked timeout cancels the stalled send and the connection's
-    // pool slot is reclaimed - proven with pool_size=1: a second client can only ever be served if the first slot was
-    // actually freed.
+    // A peer that requests a huge reply and never reads it parks a MSG_WAITALL send forever, since zero-window probing
+    // never gives up. `send_timeout` cancels the stalled send and frees the slot, which `pool_size` 1 proves, since a
+    // second client is served only if the first slot was freed.
     const BIG: usize = 8 * 1024 * 1024; // far beyond the socket send buffer
     let cfg = ServerConfig {
         pool_size: 1,

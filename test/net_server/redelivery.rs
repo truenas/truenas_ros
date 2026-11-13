@@ -1,8 +1,7 @@
 use super::*;
 
-/// A two-phase length-prefixed framer: deliver the 4-byte prefix, then ask for the payload with `Framing::Need`. The
-/// payload read therefore starts with nothing buffered and no claim held, which is the state that reaches the
-/// pool-buffer decision.
+/// A two-phase length-prefixed framer that delivers the prefix, then asks for the payload with `Framing::Need`, so the
+/// payload read starts with nothing buffered and no claim held.
 fn need_payload(buf: &[u8], pending: &mut usize) -> Framing {
     if *pending > 0 {
         if buf.len() < *pending {
@@ -27,11 +26,10 @@ fn need_payload(buf: &[u8], pending: &mut usize) -> Framing {
 
 /// An exact read larger than one pool buffer takes an owned buffer.
 ///
-/// `frame_step` admits a `Framing::Need(n)` up to `max_request_bytes` and turns it into an *exact* `ReadHeader`, and
-/// `ReadHeader` carries no placement flag - so without the size test at the arm this read is armed with
-/// `IOSQE_BUFFER_SELECT`, the kernel clamps it to the buffer it picked (`io_ring_buffer_select`, `io_uring/kbuf.c`),
-/// and the connection dies `TruncatedMessage` having answered nothing. Default config: the pool buffer is 266 240 bytes
-/// and `max_request_bytes` is 1 MiB, so every `Need` between them is in this window.
+/// `frame_step` turns a `Framing::Need(n)` up to `max_request_bytes` into an exact `ReadHeader`, which carries no
+/// placement flag, so without the size test at the arm the read selects a pool buffer, the kernel clamps it to that
+/// buffer (`io_ring_buffer_select`, `io_uring/kbuf.c`), and the connection dies `TruncatedMessage`. With the default
+/// config every `Need` between the pool buffer size and `max_request_bytes` is in this window.
 #[test]
 fn an_exact_read_over_the_pool_buffer_takes_an_owned_one() {
     const N: usize = 512 * 1024;
@@ -90,25 +88,19 @@ fn an_exact_read_over_the_pool_buffer_takes_an_owned_one() {
 
 /// A redelivery must not be handed the *read-ahead* frame.
 ///
-/// `Deferred::redeliver` documents that the handler runs again "with an empty frame (the original bytes were consumed
-/// at first delivery)". Nothing enforced it. Above the default read-ahead cap the pump can have framed the next
-/// pipelined request already - `set_frame(header_len, body_len)` recorded, its body still in flight - and the
-/// redelivery then built that message's `Body` out of a buffer holding only its header:
-/// `Body::inline(&rest[..body_len])` with `rest` empty, an out-of-range slice that panics the reactor thread and takes
-/// `serve_forever` with it. Bounds checks ship, so release panicked too.
+/// `Deferred::redeliver` runs the handler again with an empty frame. Above the default read-ahead cap the pump may have
+/// framed the next pipelined request already, its body still in flight, and delivering against that frame slices out of
+/// range on an empty buffer and panics the reactor thread. Short of the panic, `deliver_one`'s epilogue drains
+/// `frame_len().min(buffered)`, so a foreign frame eats the next request's header.
 ///
-/// Even short of the panic the state was wrong: `deliver_one`'s epilogue drains `frame_len().min(buffered)`, so a
-/// foreign frame ate the next request's header and desynced the stream.
-///
-/// The in-tree http codec never reaches this (`Phase::Parked` holds pipelined bytes unframed), so the control has to be
-/// a framer that does what `Protocol::header` allows: frame whatever is buffered.
+/// The in-tree http codec never reaches this (`Phase::Parked` holds pipelined bytes unframed), so the control is a
+/// framer that frames whatever is buffered, as `Protocol::header` allows.
 #[test]
 fn a_redelivery_does_not_take_the_read_ahead_frame() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let cfg = ServerConfig {
-        // Read-ahead is the precondition: at the default cap of one the pump stops while the first request is
-        // outstanding and never frames the second.
+        // Read-ahead is the precondition, since at the default cap of one the pump never frames the second request.
         max_in_flight_requests: 2,
         ..ServerConfig::default()
     };
@@ -120,8 +112,7 @@ fn a_redelivery_does_not_take_the_read_ahead_frame() {
         body: move |req: Request<'_, ()>| {
             let nth = seen2.fetch_add(1, Ordering::SeqCst);
             match nth {
-                // The first request parks, and is answered off-thread by a redelivery long enough afterwards for the
-                // peer's second request head to have landed and been framed.
+                // Parks, and a redelivery answers it once the second request's head has been framed.
                 0 => {
                     let (deferred, permit) = req.responder.defer();
                     thread::spawn(move || {
@@ -139,8 +130,7 @@ fn a_redelivery_does_not_take_the_read_ahead_frame() {
                     );
                     Response::Reply(echo_frame(b"first"))
                 }
-                // The pipelined request, delivered from its own frame once its body arrives - intact, not short a
-                // header.
+                // The pipelined request, delivered intact from its own frame.
                 _ => Response::Reply(echo_frame(&req.body)),
             }
         },
@@ -161,8 +151,7 @@ fn a_redelivery_does_not_take_the_read_ahead_frame() {
             let mut s = connect_tcp(v4)?;
             send_framed(&mut s, b"A")?;
             thread::sleep(Duration::from_millis(50));
-            // The second request's *header* only: the pump frames it and arms an exact read for a body that has not
-            // been sent.
+            // Only the second request's header, so the pump frames it and arms an exact read for an unsent body.
             s.write_all(&8u32.to_be_bytes())?;
             s.flush()?;
             thread::sleep(Duration::from_millis(250)); // the redelivery lands
@@ -183,11 +172,10 @@ fn a_redelivery_does_not_take_the_read_ahead_frame() {
 
 /// A redelivery must not retire the receipt budget of the message behind it.
 ///
-/// The budget belongs to whatever is *arriving*. A redelivered request was consumed - and its own budget retired - at
-/// its first delivery, so the only budget armed when a worker's `redeliver` lands belongs to a later message the
-/// read-ahead has begun. Cancelling it there restarts the one bound `max_receipt_time` exists to make un-restartable,
-/// and when the next read is already in flight (an exact body read) nothing re-arms it at all: the trickling peer is
-/// then never reclaimed.
+/// A redelivered request's budget was retired at its first delivery, so the budget armed when `redeliver` lands belongs
+/// to a later message the read-ahead has begun. Cancelling it restarts the bound `max_receipt_time` makes
+/// unrestartable, and with an exact body read already in flight nothing re-arms it, so a trickling peer is never
+/// reclaimed.
 ///
 /// The trickle is half `request_timeout`, so that clock is satisfied throughout and the close reason names which one
 /// fired.
@@ -284,26 +272,14 @@ fn a_redelivery_does_not_retire_the_next_message_budget() {
 
 /// A spliced body is bounded per window, not whole.
 ///
-/// `max_receipt_time` is a rate floor: `ServerConfig` promises "each window is its own message, so an upload of any
-/// size is admitted", and tells the operator to pick it "from the slowest client worth serving, not from the largest
-/// upload". A buffered body earns that by construction - the framer splits anything above `STREAM_WINDOW` into windows,
-/// each its own message with its own budget. A spliced body is one message however large, so a budget armed once for
-/// the whole transfer made wall clock cap upload *size*.
+/// `max_receipt_time` is a rate floor, so a body of any size is admitted at one window per budget. A spliced body is
+/// one message however large, so it earns a budget per `receipt_window_bytes` moved. Six windows, each well inside the
+/// budget, take longer than one budget, and every gap is inside both inactivity clocks, so only a total bound could
+/// reap this.
 ///
-/// Here: six windows, each moved in under a third of the budget, but the whole body needing longer than one budget.
-/// Every gap is far inside both inactivity clocks, so nothing but a total bound can reap this - and a total bound is
-/// what this must not be.
-///
-/// Run over both header shapes, because the renewal reads a mark that only the splice path sets. A header the framer
-/// reads in **two** exact steps arms the budget itself - the second read has bytes buffered, so `submit_recv` does not
-/// classify it idle - and a mark tied to whichever call armed the budget is then never set for the body at all: `moved`
-/// stays zero, no window is ever earned, and the transfer is bounded whole again. A one-read header hides that
-/// entirely, which is why it cannot be the only case here.
-///
-/// And with a window larger than the body, which must be reaped.
-///
-/// The pipe is drained continuously; at 768 KiB the body is many times a pipe's capacity, so without a reader the
-/// splice would block on backpressure and the test would measure that instead.
+/// Both header shapes run, because the renewal reads a mark only the splice path sets. A header read in **two** exact
+/// steps arms the budget itself, since `submit_recv` does not call the second read idle, so a mark tied to whichever
+/// call armed the budget never counts the body. A window larger than the body must be reaped.
 #[test]
 fn a_large_spliced_body_is_bounded_per_window_not_whole() {
     use std::sync::Mutex;
@@ -331,17 +307,15 @@ fn a_large_spliced_body_is_bounded_per_window_not_whole() {
             // One window every 150 ms, so no window is remotely near the budget - but six of them take ~900 ms, and a
             // budget armed once for the whole transfer fires at 500 ms, mid-body.
             max_receipt_time: Some(Duration::from_millis(500)),
-            // Above the per-window gap, so the readiness poll is re-armed by every window and cannot be what reaps
-            // this. `ServerConfig` also requires the receipt budget to exceed it.
+            // `ServerConfig` requires the receipt budget to exceed it.
             request_timeout: Some(Duration::from_millis(400)),
             idle_timeout: None,
             receipt_window_bytes: window,
             ..ServerConfig::default()
         };
         let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-        // The same 5-byte `[tag][len BE]` header as `splice_header`, read in one exact step or two. Both are
-        // well-formed: `frame_step` requires a splice framer to read its header with exact `Framing::Need`, so that the
-        // whole header and nothing past it is buffered.
+        // The `splice_header` shape, read in one exact step or two, since `frame_step` requires a splice framer to
+        // buffer the whole header and nothing past it.
         let header = move |buf: &[u8], _s: &mut ()| -> Framing {
             if split_header && buf.is_empty() {
                 return Framing::Need(1); // the tag, then the length
@@ -439,11 +413,10 @@ fn a_large_spliced_body_is_bounded_per_window_not_whole() {
             libc::close(pipe_rd);
         }
         let _ = drain.join();
-        // The client completing its ping is half the proof: a connection reaped mid-transfer cannot answer one, so
-        // `client io` fails first.
+        // A connection reaped mid-transfer cannot answer the ping, so `client io` fails first.
         let served = client.join().expect("thread join");
-        // The other half. Not an equality against `[PeerClosed]`: whether the peer-close is observed before `shutdown`
-        // tears the loop down is a race with no bearing on the budget, and it is lost in a release build.
+        // Not an equality against `[PeerClosed]`, since whether the peer-close is seen before `shutdown` is a race with
+        // no bearing on the budget.
         let got = reasons.lock().unwrap().clone();
         if !renews {
             assert!(
@@ -466,14 +439,12 @@ fn a_large_spliced_body_is_bounded_per_window_not_whole() {
 
 /// The receipt budget covers a spliced body, in both directions.
 ///
-/// `arm_receipt_deadline` is reachable only from `submit_recv`, which a `Framing::SpliceBody` body never enters, so the
-/// one clock that progress cannot restart did not reach the splice path at all - the two that do (`request_timeout` on
-/// the readiness poll, the kTLS watchdog) are both inactivity bounds any arriving byte re-arms. And where a multi-read
-/// header had armed one, nothing retired it: there is no `deliver_one` on this path, so the budget outlived the message
-/// it belonged to and reaped a connection that had transferred its body on time.
+/// A `Framing::SpliceBody` body never enters `submit_recv` or `deliver_one`, so `submit_splice_recv` and
+/// `on_splice_recv_complete` arm and retire the budget. Unarmed, only inactivity clocks that any arriving byte re-arms
+/// bound a trickle, and left armed past the message, the budget reaps a connection that moved its body on time.
 ///
-/// Both halves on the plain-TCP splice, which is the same code as the kTLS one up to the blocking-vs-poll difference
-/// (see `submit_splice_recv`).
+/// Both halves run on the plain TCP splice, the same code as the kTLS one up to the blocking or polling difference (see
+/// `submit_splice_recv`).
 #[test]
 fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
     use std::sync::Mutex;
@@ -581,11 +552,9 @@ fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
                  armed, since no other clock on this path is a total bound"
             );
         } else {
-            // The healthy connection ends twice over: the client's FIN goes out when its closure returns, and its
-            // `shutdown` request follows immediately. Which the loop reaches first is a race with no bearing on the
-            // budget - and the teardown winning before the hook runs leaves nothing recorded at all - so this names the
-            // benign endings rather than one of them. What may not appear is the budget: this connection finished on
-            // time.
+            // The healthy connection ends by the client's FIN or its `shutdown` request, whichever the loop reaches
+            // first, and a teardown that wins before the hook runs records nothing. That race has no bearing on the
+            // budget, so any benign ending passes, but never the budget, since this connection finished on time.
             assert!(
                 matches!(
                     got.as_slice(),
@@ -601,15 +570,13 @@ fn the_receipt_budget_bounds_a_spliced_body_and_ends_with_it() {
 
 /// A reply the handler declared final keeps the pump gate shut even when a body is still streaming ahead of it.
 ///
-/// `Connection::has_deferred_close` is that gate ("both mean no further request may be admitted"), and
-/// `Response::ReplyFile { close: true }` arriving while another body streams is what sets it. But
-/// `take_queued_file_reply` cleared the flag for whichever deferred body came off the queue next, on the grounds that
-/// installing it arms `close_on_flush` from its own `close` - true only when THAT body is the one that carried the
-/// close. With the close on a later deferred body the gate reopened for the whole read-ahead window, and every request
-/// the handler then answered was discarded unsent by `drop_queued_file_reply` when the final body retired.
+/// `Connection::has_deferred_close` is that gate, set by a `Response::ReplyFile { close: true }` that arrives while
+/// another body streams. `take_queued_file_reply` must not clear it for a deferred body that does not carry the close,
+/// or the gate reopens for the whole read-ahead window and every request answered meanwhile is discarded unsent by
+/// `drop_queued_file_reply` when the final body retires.
 ///
-/// The control is the parameter: with the close on the active tail, or on the first deferred body, the gate holds and
-/// the handler stops on time.
+/// The parameter is the control. With the close on the active tail or the first deferred body the gate holds
+/// regardless, and the close on the second deferred body is the case that bites.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_deferred_close_keeps_the_gate_shut_for_a_later_body() {
@@ -696,16 +663,9 @@ fn a_deferred_close_keeps_the_gate_shut_for_a_later_body() {
             s.write_all(&wire)?;
             s.flush()?;
             let mut got = Vec::new();
-            // The gate shuts before the refused requests are read off the socket, so they are still in the receive
-            // queue when the connection closes - and the kernel answers a close with unread data by sending RST rather
-            // than FIN (`tcp_close`, net/ipv4/tcp.c:3165-3170, `TCP_ABORT_ON_CLOSE`). Whether any are left is a timing
-            // question rather than a property of the code under test: a host whose pump framed every pipelined request
-            // before the gate shut closes cleanly, one that did not gets the reset. Both endings are healthy here.
-            //
-            // The reset is not free - it aborts the connection instead of draining it, so bytes the server had queued
-            // but not yet delivered are lost and the peer sees a truncated stream, measured here at exactly one chunk
-            // short. So the byte count is only checked exactly on the clean ending; `seen`, which the server counts, is
-            // the claim this test makes and holds either way.
+            // The gate shuts before the refused requests are read, and a close with unread data sends RST rather than
+            // FIN (`tcp_close`, `net/ipv4/tcp.c:3165-3170`). Whether any are left is timing, and a reset can lose
+            // queued bytes, so the byte count is exact only on a clean ending, while `seen` holds either way.
             let clean = match s.read_to_end(&mut got) {
                 Ok(_) => true,
                 Err(e) if e.kind() == io::ErrorKind::ConnectionReset => false,
@@ -736,16 +696,13 @@ fn a_deferred_close_keeps_the_gate_shut_for_a_later_body() {
 
 /// A peer that half-closes after its request still gets its response.
 ///
-/// `shutdown(SHUT_WR)` is politeness, not departure: the client has said it will send nothing more and is waiting to
-/// read. It completes the parked read-ahead recv with `res == 0`, which is `CloseReason::PeerClosed` - and the "does
-/// this connection still owe work?" guard was applied to `IdleTimeout` alone, so the connection was torn down with the
-/// reply owed. `closing` then makes `kick_send` swallow the queued reply, `drain_injections` drop the worker outcome
-/// and `on_pump_read` drop every file-body chunk: a correctly framed request answered with zero bytes.
+/// `shutdown(SHUT_WR)` says the client will send nothing more and is waiting to read. It completes the parked
+/// read-ahead recv with `res == 0`, `CloseReason::PeerClosed`, and the connection must still finish the work it owes,
+/// since once `closing`, `kick_send` swallows the queued reply, `drain_injections` drops the worker outcome and
+/// `on_pump_read` drops every file-body chunk.
 ///
-/// `cap` is the control and the trigger in one. At the default read-ahead of one nothing arms a second recv while a
-/// reply is owed, so the FIN is not seen until after - which is why nothing in tree meets this and why the first
-/// iteration passes on the unfixed code. Above one it is met at once. The handler defers for the same reason: an inline
-/// reply has already been sent by the time the FIN lands.
+/// `cap` is the trigger. At the default read-ahead of one nothing arms a second recv while a reply is owed, so the FIN
+/// is seen only after. The handler defers because an inline reply is sent before the FIN lands.
 #[test]
 fn a_peer_half_close_does_not_reap_a_connection_that_owes_a_reply() {
     use std::io::{Read, Write};
@@ -755,8 +712,6 @@ fn a_peer_half_close_does_not_reap_a_connection_that_owes_a_reply() {
             max_in_flight_requests: cap,
             ..Default::default()
         };
-        // The reply must still be OWED when the FIN lands, so the handler defers: an inline echo has already answered
-        // by then.
         let proto = Protocol {
             accept: |_: Incoming<'_>| Some(()),
             header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
@@ -803,15 +758,12 @@ fn a_peer_half_close_does_not_reap_a_connection_that_owes_a_reply() {
 
 /// A half-closed peer whose owed work completes with **nothing to send** must still have its connection closed.
 ///
-/// `peer_closed` retires the recv side and leaves the close to the send path. A one-way request -
-/// `Deferred::reply(Vec::new())`, the `Injected::Done` arm - retires `outstanding` and queues no PDU, so no send ever
-/// completes and that path never runs. The pump then re-arms a read, the FIN re-completes it at once, and the
-/// `peer_closed` arm in `on_recv_complete` returned without closing: the pool slot and the fd were held for the life of
-/// the server, on a peer that had already said goodbye.
+/// `peer_closed` retires the recv side and leaves the close to the send path, but a one-way request
+/// (`Deferred::reply(Vec::new())`, the `Injected::Done` arm) queues no PDU, so no send completes. The pump re-arms a
+/// read, the FIN completes it at once, and the `peer_closed` arm in `on_recv_complete` must close there, or the slot
+/// and fd are held for the life of the server.
 ///
-/// `cap` is the trigger, as in `a_peer_half_close_does_not_reap_a_connection_that_owes_a_reply`: at the default
-/// read-ahead of one nothing arms a second recv while the request is in flight, so the FIN is not seen until after and
-/// the connection closes the ordinary way.
+/// `cap` is the trigger, as in `a_peer_half_close_does_not_reap_a_connection_that_owes_a_reply`.
 #[test]
 fn a_half_closed_peer_closes_when_its_one_way_request_finishes() {
     use std::io::{Read, Write};
@@ -854,8 +806,8 @@ fn a_half_closed_peer_closes_when_its_one_way_request_finishes() {
             s.write_all(&wire)?;
             s.flush()?;
             s.shutdown(std::net::Shutdown::Write)?;
-            // The server owes a one-way reply; once it has answered it, nothing can arrive on this connection ever
-            // again, so the server must close. EOF is that close; a timeout is the leak.
+            // Nothing more can arrive once the one-way request is answered, so the server must close. EOF is that close
+            // and a timeout is the leak.
             let mut buf = [0u8; 1];
             let eof = matches!(s.read(&mut buf), Ok(0));
             stop.shutdown();

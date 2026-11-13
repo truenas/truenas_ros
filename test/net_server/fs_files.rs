@@ -411,11 +411,9 @@ fn a_window_write_on_a_full_table_gives_its_buffer_back() {
     assert_eq!(stats.recv_bufs_lent, 0, "the buffer came home: {stats:?}");
 }
 
-/// `FsConn::fgetxattr_as_root` reads an xattr under the reactor's ambient (root) credentials (`sqe.personality = 0`) -
-/// the sanctioned privileged-read path for a `trusted.*`/`security.*` attribute a request's own identity can't see.
-/// Here it reads a seeded `user.*` value end to end; the full privilege boundary (a non-root peer vs. a root-only
-/// xattr) isn't reproduced, since on this root dev host the peer identity is itself root - the point is exercising the
-/// `personality = 0` SQE path end to end.
+/// `FsConn::fgetxattr_as_root` reads an xattr under the reactor's ambient credentials (`sqe.personality = 0`), the path
+/// for a `trusted.*` or `security.*` attribute a request's own identity cannot see. The personality here is the
+/// reactor's own identity, so this exercises the `personality = 0` SQE path end to end and not a privilege boundary.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_file_carries_personality_and_as_root() {
@@ -456,8 +454,6 @@ fn fs_file_carries_personality_and_as_root() {
                 deferred.close();
                 return;
             };
-            // Read the seeded xattr under ambient root (personality 0) - no `who`. On this root host the peer is itself
-            // root, so this exercises the `personality = 0` SQE path end to end rather than a privilege boundary.
             let name = CString::new("user.tr_test").unwrap();
             fs.fgetxattr_as_root(file.clone(), name.clone(), vec![0u8; 64], move |d, fs| {
                 fs.close(file);
@@ -509,10 +505,10 @@ fn fs_file_carries_personality_and_as_root() {
     assert_eq!(reply, b"secret");
 }
 
-/// `FsConn::fgetxattr_proc_as_root` reads an xattr of a file held `O_PATH` under the reactor's ambient (root)
-/// credentials, through the file's path under `/proc/thread-self/fd`, where `fgetxattr_as_root` refuses the descriptor
-/// itself with `EBADF`. As above, the peer on this root host is itself root, so the privilege boundary is pinned in
-/// `test/uring_fs.rs`, and this exercises the `personality = 0` `GETXATTR` path end to end.
+/// `FsConn::fgetxattr_proc_as_root` reads an xattr of a file held `O_PATH` under the reactor's ambient credentials,
+/// through the file's path under `/proc/thread-self/fd`, where `fgetxattr_as_root` refuses the descriptor itself with
+/// `EBADF`. The privilege boundary is pinned in `test/uring_fs.rs`, so this exercises the `personality = 0` `GETXATTR`
+/// path end to end.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_file_held_o_path_reads_as_root_through_proc() {
@@ -768,11 +764,9 @@ fn fs_metadata_ops_rename_truncate_xattr() {
     }
 }
 
-/// The connection-close owned-file sweep. A handler opens a file on every request and **never closes it** - a
-/// deliberate leak. Across many sequential connections (each opening one file, then dropping), the process would run
-/// out of descriptors if the files were not reclaimed; the sweep closes each connection's still-open files as it
-/// closes, so every open succeeds. (Mirrors `tcp_sequential_slot_reuse`: a small pool with slack absorbs the
-/// asynchronous close, so one-at-a-time connections never outrun the sweep.)
+/// A handler opens a file on every request and **never closes it**. Across more sequential connections than `fs_ops`,
+/// every open still succeeds, since an open's op slot comes back when it completes and the file closes as its last
+/// handle drops. A connection pool with slack absorbs the asynchronous close, as in `tcp_sequential_slot_reuse`.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_owned_files_swept_on_connection_close() {
@@ -804,8 +798,7 @@ fn fs_owned_files_swept_on_connection_close() {
         let path = CString::new("f.txt").unwrap();
         let how = OpenHow::new().flags(OFlag::O_RDONLY);
         fs.open(who, &anchor, &path, how, move |done, _fs| {
-            // Deliberately DO NOT close the file: the connection-close sweep is the only thing that can reclaim its
-            // pool slot.
+            // Deliberately no `fs.close`, so the file closes only as its last handle drops.
             if done.file().is_some() {
                 deferred.reply(echo_frame(b"opened"));
             } else {
@@ -837,14 +830,12 @@ fn fs_owned_files_swept_on_connection_close() {
     let stop = server.shutdown_handle();
     let client = thread::spawn(move || -> io::Result<Vec<Vec<u8>>> {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
-        // Sequential connections, each opening one (never-closed) file, then closing - the sweep must reclaim its slot
-        // before the pool exhausts.
         let mut replies = Vec::with_capacity(N);
         for _ in 0..N {
             let mut s = connect_tcp(v4)?;
             send_framed(&mut s, b"open")?;
             replies.push(recv_framed(&mut s)?);
-            drop(s); // close -> triggers the owned-file sweep
+            drop(s);
         }
         stop.shutdown();
         Ok(replies)
@@ -861,16 +852,11 @@ fn fs_owned_files_swept_on_connection_close() {
     }
 }
 
-/// A continuation may open, and doing so reclaims its slot like any other op.
+/// A continuation may open, and doing so gives its op slot back like any other op.
 ///
-/// This used to assert the opposite - that the facade refused - on the grounds that a file minted after `close_conn`
-/// had already swept the connection would hold its slot until server teardown. It does not. `close_owned_by` is gone;
-/// `cancel_owned_by` cancels in-flight *ops* so their parked fds are released, and the fds themselves close by
-/// `Arc`-drop whether or not anyone takes them. An `openat2` completes, so its entry is reaped either way.
-///
-/// The pool is deliberately smaller than the connection count, and each connection leaves its *first* file open while
-/// chaining a second from the completion. If a chained open leaked a slot, the later connections would find none and
-/// answer `open-err` - which is what makes this a measurement rather than a restatement.
+/// The op table is smaller than the connection count, and each connection leaves its first file open while chaining a
+/// second from the completion. If a chained open leaked a slot, the later connections would find none and answer
+/// `open-err`.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_continuation_may_open_and_its_slot_comes_back() {
@@ -923,7 +909,7 @@ fn fs_continuation_may_open_and_its_slot_comes_back() {
     };
     let cfg = ServerConfig {
         pool_size: 8,
-        fs_ops: 4, // < N: the sweep must recycle between connections
+        fs_ops: 4, // fewer than N, so op slots must come back between connections
         ..ServerConfig::default()
     };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());

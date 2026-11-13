@@ -265,13 +265,11 @@ fn multi_listener_per_port_policy() {
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         (|| -> io::Result<()> {
-            // Admitted port echoes.
             let mut ok = connect_tcp(a)?;
             send_framed(&mut ok, b"yes")?;
             assert_eq!(recv_framed(&mut ok)?, b"yes");
-            // Rejected port: no echo comes back. A short read must NOT yield the payload (rejected means no reply);
-            // EOF, reset, or a plain timeout with no data all confirm "not admitted". (This asserts policy without
-            // depending on the reject-close reaching us - see the close-propagation note on the ignored tests.)
+            // Rejected means no reply, so EOF, reset or a plain timeout with no data all confirm it, without depending
+            // on the reject-close reaching us.
             let mut no = connect_tcp(b)?;
             no.set_read_timeout(Some(Duration::from_millis(300)))?;
             let _ = send_framed(&mut no, b"no");
@@ -286,7 +284,6 @@ fn multi_listener_per_port_policy() {
                     "unexpected error on rejected conn: {e:?}"
                 ),
             }
-            // The admitted listener still works afterwards.
             send_framed(&mut ok, b"again")?;
             assert_eq!(recv_framed(&mut ok)?, b"again");
             Ok(())
@@ -301,9 +298,8 @@ fn multi_listener_per_port_policy() {
 
 #[test]
 fn tcp_peername_is_per_connection() {
-    // Peer addresses are fetched per connection (SO_PEERNAME), not read from a buffer shared across a multishot
-    // accept's completions - so a burst of simultaneous connects must each see THEIR OWN source address echoed back. (A
-    // single shared address buffer would misattribute under a burst.)
+    // Peer addresses are fetched per connection with `SO_PEERNAME`, not read from a buffer shared across a multishot
+    // accept's completions, so each connect in a burst must see its own source address echoed back.
     const N: usize = 8;
     let proto = Protocol {
         accept: |inc: Incoming<'_>| match inc.peer {
@@ -355,9 +351,8 @@ fn tcp_peername_is_per_connection() {
 
 #[test]
 fn multi_listener_pool_full_rearm() {
-    // pool_size = 1 with two listeners: while the slot is held by listener
-    // A's connection, a connect on listener B is shed (kernel ENFILE close);
-    // once A's connection closes, B's parked accept re-arms and serves.
+    // With `pool_size` 1 and two listeners, a connect on listener B is shed (kernel ENFILE close) while A's connection
+    // holds the slot, and once it closes, B's parked accept re-arms and serves.
     let cfg = ServerConfig {
         pool_size: 1,
         ..ServerConfig::default()
@@ -418,10 +413,9 @@ fn multi_listener_pool_full_rearm() {
 
 #[test]
 fn tcp_reply_coalescing() {
-    // A burst of deferred replies released together is gathered into fewer SENDMSG ops (writev coalescing): 16
-    // pipelined requests all defer; one worker answers all 16 at once; the client must receive every payload intact
-    // (order-independent - deferred replies may egress out of request order) and the stats must show send_ops <
-    // replies.
+    // A burst of deferred replies released together is gathered into fewer SENDMSG ops. Sixteen pipelined requests all
+    // defer and one worker answers them at once, so the client must receive every payload intact, in any order, and
+    // `send_ops` must stay below `replies`.
     use std::sync::Mutex;
     const N: usize = 16;
     type Parked = Vec<(Vec<u8>, truenas_ros::net::server::Deferred)>;
@@ -552,10 +546,9 @@ fn tcp_graceful_shutdown_drains() {
 
 #[test]
 fn tcp_graceful_deadline_escalates() {
-    // A worker that never resolves its Deferred: the graceful drain cannot complete, so the grace deadline must
-    // escalate to a hard stop and serve_forever must still return. The handler parks each Deferred in `keep_rx` and
-    // never resolves it - rather than `mem::forget`, which leaks its channel Sender + Arc and trips LeakSanitizer -
-    // releasing it only at test end, long after the drain has been forced to escalate.
+    // A worker that never resolves its `Deferred` keeps the drain from completing, so the grace deadline must escalate
+    // to a hard stop and `serve_forever` must still return. The handler parks each `Deferred` in `keep_rx` rather than
+    // using `mem::forget`, which leaks its channel and trips LeakSanitizer.
     let (keep_tx, keep_rx) = std::sync::mpsc::channel();
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
@@ -611,10 +604,9 @@ fn tcp_graceful_deadline_escalates() {
 
 #[test]
 fn tcp_graceful_drains_pipelined_deferred_reply() {
-    // Regression: in pipelined mode a connection can hold a deferred reply in flight AND a read-ahead recv parked at
-    // once. Graceful shutdown must still deliver that reply - `begin_drain` cancels the parked recv, but the connection
-    // must finish its outstanding work before closing; tearing it down would drop the reply. At the default
-    // `max_in_flight_requests` the read-ahead is never armed during a defer, so this shape is pipelined-only.
+    // In pipelined mode a connection can hold a deferred reply in flight and a parked read-ahead recv at once. Graceful
+    // shutdown cancels the parked recv but must still deliver the reply before closing. At the default
+    // `max_in_flight_requests` no read-ahead is armed during a defer, so this shape is pipelined-only.
     let cfg = ServerConfig {
         max_in_flight_requests: 2, // pipelined -> read-ahead armed during a defer
         ..ServerConfig::default()
@@ -671,18 +663,14 @@ fn tcp_graceful_drains_pipelined_deferred_reply() {
 
 #[test]
 fn tcp_idle_timeout_keeps_pipelined_deferred_reply() {
-    // Regression (sibling of `tcp_graceful_drains_pipelined_deferred_reply`, for the idle-timeout cancellation instead
-    // of the drain one): in pipelined mode a connection can hold a deferred reply in flight AND a parked read-ahead
-    // recv at once. When `idle_timeout` fires on that read-ahead recv the connection is NOT idle - it still owes the
-    // deferred reply - so it must finish that work, not be reaped (reaping it would drop the reply: once `closing`,
-    // `kick_send`'s `!closing` guard swallows the queued send).
-    // A perfectly normal request/response client (send one request, await its reply before the next) hits this whenever
-    // the worker outlives `idle_timeout`. At the default `max_in_flight_requests` no read-ahead is armed during a
-    // defer, so this shape is pipelined-only.
+    // When `idle_timeout` fires on a parked read-ahead recv while a deferred reply is still in flight, the connection
+    // is not idle and must finish that work rather than be reaped, since once `closing`, `kick_send`'s `!closing` guard
+    // swallows the queued send. A plain request and reply client hits this whenever the worker outlives `idle_timeout`,
+    // and only in pipelined mode.
     //
-    // `WORK` being an exact multiple of `IDLE` also lands the final clock expiry in a photo-finish with the reply's
-    // flush and the client's immediate next request - the served-since-arm rule keeps every ordering of that race alive
-    // (pinned deterministically, with wide margins, by `tcp_idle_clock_resets_on_served_reply`).
+    // `WORK` being an exact multiple of `IDLE` puts the final expiry in a photo-finish with the reply's flush and the
+    // client's next request, which the served-since-arm rule keeps alive in every order
+    // (`tcp_idle_clock_resets_on_served_reply` pins it deterministically).
     const IDLE: Duration = Duration::from_millis(100);
     const WORK: Duration = Duration::from_millis(400); // outlives IDLE 4x
     let cfg = ServerConfig {
@@ -699,8 +687,6 @@ fn tcp_idle_timeout_keeps_pipelined_deferred_reply() {
             reply.extend_from_slice(&body);
             let (deferred, permit) = responder.defer();
             thread::spawn(move || {
-                // Outlives `idle_timeout`, so the read-ahead recv's idle timeout fires while this reply is still in
-                // flight.
                 thread::sleep(WORK);
                 deferred.reply(echo_frame(&reply));
             });
@@ -725,17 +711,14 @@ fn tcp_idle_timeout_keeps_pipelined_deferred_reply() {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         (|| -> io::Result<()> {
             let mut s = connect_tcp(v4)?;
-            // Send one request, then just wait for its reply - the read-ahead recv parks and its idle timeout fires
-            // long before the worker replies. Were the server to close the connection here, this read would hit EOF;
-            // the reply must instead still arrive.
+            // Were the connection reaped while the reply is owed, this read would hit EOF.
             send_framed(&mut s, b"hello")?;
             assert_eq!(
                 recv_framed(&mut s)?,
                 b"re:hello",
                 "deferred reply dropped by an idle-timeout reap"
             );
-            // The connection was not reaped, so keep-alive continues: a second round-trip on the same socket succeeds
-            // (also exercises the idle fire during the *second* defer).
+            // Not reaped, so keep-alive continues, and the idle fire repeats during the second defer.
             send_framed(&mut s, b"world")?;
             assert_eq!(recv_framed(&mut s)?, b"re:world");
             Ok(())
@@ -750,17 +733,14 @@ fn tcp_idle_timeout_keeps_pipelined_deferred_reply() {
 
 #[test]
 fn tcp_idle_clock_resets_on_served_reply() {
-    // Regression - the deterministic form of the race its sibling above only hits on a slow box: the idle clock rides
-    // the parked read-ahead recv from ARM time, so while a deferred reply is produced and flushed the clock keeps
-    // counting. Serving that reply is activity - the quiet interval must restart - yet a guard that only asks "owes
-    // work NOW?" sees nothing outstanding at the next expiry and reaps the connection out from under a client it served
-    // moments ago (the client's follow-up request then hits EOF/reset).
+    // The idle clock rides the parked read-ahead recv from arm time, so it keeps counting while a deferred reply is
+    // produced and flushed. Serving that reply is activity and must restart the quiet interval, or a guard that only
+    // asks whether work is owed now reaps a connection it served moments ago.
     //
-    // Timeline pinned here, margins in the hundreds of ms so a loaded VM
-    // cannot flip any edge: the read-ahead parks at ~0 with the clock running;
-    // the deferred reply flushes at ~WORK (300 ms); the stale clock expires at ~IDLE (600 ms) - an interval that SAW a
-    // served reply, so it must re-arm a fresh quiet interval, not reap - and the client's second request lands at ~700
-    // ms, inside that fresh interval, and must be answered.
+    // The read-ahead parks at about 0 with the clock running, the reply flushes at about `WORK` (300 ms), the stale
+    // clock expires at about `IDLE` (600 ms) and must re-arm rather than reap, and the second request lands at about
+    // 700 ms, inside the fresh interval, and must be answered. Margins are hundreds of ms so a loaded VM cannot flip an
+    // edge.
     const IDLE: Duration = Duration::from_millis(600);
     const WORK: Duration = Duration::from_millis(300);
     const CLIENT_PAUSE: Duration = Duration::from_millis(400);
@@ -804,8 +784,7 @@ fn tcp_idle_clock_resets_on_served_reply() {
             let mut s = connect_tcp(v4)?;
             send_framed(&mut s, b"hello")?;
             assert_eq!(recv_framed(&mut s)?, b"re:hello");
-            // Idle across the stale clock's expiry (but well inside the fresh interval that expiry must start):
-            // served-then-quiet, the exact window the flag-less guard reaped.
+            // Idle across the stale clock's expiry but well inside the fresh interval it must start.
             thread::sleep(CLIENT_PAUSE);
             send_framed(&mut s, b"world")?;
             assert_eq!(
@@ -825,10 +804,9 @@ fn tcp_idle_clock_resets_on_served_reply() {
 
 #[test]
 fn tcp_default_config_never_times_out_a_deferred_request() {
-    // The handler/worker phase is un-timed: a request delivered and offloaded via `Response::Defer` must never be timed
-    // out, however long the worker runs. At the default `max_in_flight_requests` (1) no read-ahead recv is armed while
-    // a defer is outstanding, so even with `idle_timeout` set well below the worker's duration nothing fires - the
-    // reply still arrives.
+    // A request handed off with `Response::Defer` is never timed out, however long the worker runs. At the default
+    // `max_in_flight_requests` of 1 no read-ahead recv is armed during a defer, so an `idle_timeout` well below the
+    // worker's duration fires nothing.
     const IDLE: Duration = Duration::from_millis(100);
     const WORK: Duration = Duration::from_millis(500); // 5x the idle timeout
     let cfg = ServerConfig {
@@ -868,8 +846,6 @@ fn tcp_default_config_never_times_out_a_deferred_request() {
         (|| -> io::Result<()> {
             let mut s = connect_tcp(v4)?;
             send_framed(&mut s, b"slow")?;
-            // The worker sleeps far longer than idle_timeout; the reply must still come back - the handled request is
-            // never timed out.
             assert_eq!(recv_framed(&mut s)?, b"slow");
             Ok(())
         })()

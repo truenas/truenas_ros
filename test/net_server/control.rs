@@ -198,10 +198,9 @@ fn control_message_without_a_hook_is_dropped() {
 
 #[test]
 fn shutdown_graceful_with_zero_grace_is_a_hard_shutdown() {
-    // `shutdown_graceful(0)` is documented as exactly `shutdown()`. The distinction is not cosmetic: the graceful path
-    // arms a grace-period TIMEOUT op and waits for connections to quiesce, so a zero duration taken literally would arm
-    // a timer that fires immediately - or, worse, a drain with no deadline at all. Delegating instead means a caller
-    // computing a grace from configuration cannot accidentally hang the shutdown by configuring zero.
+    // `shutdown_graceful(0)` must be exactly `shutdown()`. Taken literally, a zero grace would arm a timer that fires
+    // at once or a drain with no deadline, and a caller that reads its grace from configuration could hang the shutdown
+    // by setting zero.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
@@ -220,8 +219,7 @@ fn shutdown_graceful_with_zero_grace_is_a_hard_shutdown() {
 
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
-        // Serve one request so the loop is definitely running, hold the connection open, then stop with a zero grace: a
-        // drain that waited for this connection to quiesce would never return.
+        // Hold a served connection open, then stop with a zero grace.
         let r = (|| -> io::Result<TcpStream> {
             let mut s = connect_tcp(v4)?;
             send_framed(&mut s, b"ping")?;
@@ -241,10 +239,9 @@ fn shutdown_graceful_with_zero_grace_is_a_hard_shutdown() {
 
 #[test]
 fn tls_listener_without_a_handshake_handler_is_rejected() {
-    // A kTLS listener cannot serve itself: the accept handler does not run for kTLS connections, so `set_tls_handshake`
-    // IS the admission decision as well as the handshake. Construction cannot catch a missing one - the handler is
-    // installed after `bind` returns - so `serve_forever` refuses to start rather than accept connections it can only
-    // drop. Fail-fast at startup, not per connection at runtime.
+    // A kTLS listener needs `set_tls_handshake`, since the accept handler does not run for kTLS connections. The
+    // handler is installed after `bind`, so `serve_forever` refuses to start rather than accept connections it can only
+    // drop.
     use truenas_ros::net::server::Listen;
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
@@ -306,12 +303,10 @@ fn server_debug_reports_its_listeners() {
 
 #[test]
 fn tcp6_echo() {
-    // IPv6 is not just IPv4 with a longer address here: the listener asks for `AF_INET6` and sets `IPV6_V6ONLY`, and
-    // the per-connection peer fetch has to request exactly `sockaddr_in6`'s size - the kernel's `SO_PEERNAME` rejects
-    // an optlen LARGER than the actual address, and the completion then requires the returned length to match exactly,
-    // failing closed otherwise. So an address-family size mistake does not corrupt an address, it sheds every
-    // connection. A round-trip proves the sizing on both sides, and the peer handed to the accept handler proves it
-    // parsed as a real V6 address rather than something salvaged from a short pad.
+    // The listener asks for `AF_INET6` with `IPV6_V6ONLY`, and the peer fetch must request exactly `sockaddr_in6`'s
+    // size, since `SO_PEERNAME` rejects an optlen larger than the address and the completion requires the returned
+    // length to match. A size mistake sheds every connection. The round trip proves the sizing, and the peer handed to
+    // the accept handler proves it parsed as a real V6 address.
     use std::net::SocketAddrV6;
     let (peer_tx, peer_rx) = std::sync::mpsc::channel::<ClientAddr>();
     let addr = ServerAddr::Tcp6("[::1]:0".parse::<SocketAddrV6>().unwrap());
@@ -361,11 +356,9 @@ fn tcp6_echo() {
 
 #[test]
 fn tcp_detach_without_a_handler_closes() {
-    // A body handler returns `Response::Detach` on a server that never called `set_detach_handler` - a
-    // misconfiguration. The fd is furnished by the kernel before anything notices, so the loop has to close the alias
-    // it will not use, reattach the parked connection to `Serving`, and tear it down; leaking the alias would pin the
-    // socket open past the close. Reported as `HandlerClosed`, distinguishing the misconfig from an install failure
-    // (`RecvError`) and from shutdown (`ShuttingDown`).
+    // `Response::Detach` on a server with no detach handler closes the connection as `HandlerClosed`, not `RecvError`
+    // or `ShuttingDown`. The kernel furnishes the fd before anything notices, so the loop must close that alias too, or
+    // it pins the socket open past the close.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
@@ -411,10 +404,8 @@ fn tcp_detach_without_a_handler_closes() {
 
 #[test]
 fn tcp_detach_with_a_foreign_permit_closes() {
-    // `DetachPermit` proves `Responder::detach` ran, but only its token proves it ran for THIS request. A handler that
-    // mints a permit on one request, stashes it in the connection state, and returns it on a later one is claiming a
-    // detach the loop cannot route: the request it names is already answered. The token check must reject it and close,
-    // rather than park a request nothing can ever resolve.
+    // A `DetachPermit` minted on one request and returned on a later one names a request already answered. Its token
+    // check must reject it and close, rather than park a request nothing can resolve.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(None::<truenas_ros::net::server::DetachPermit>),
@@ -428,8 +419,7 @@ fn tcp_detach_with_a_foreign_permit_closes() {
                 body, state, responder, ..
             } = req;
             if &body[..] == b"stash" {
-                // Mint this request's permit and keep it; answer normally, so the request it is stamped with is
-                // retired.
+                // Mint and keep this request's permit, then answer, retiring the request it names.
                 *state = Some(responder.detach());
                 Response::Reply(echo_frame(b"stashed"))
             } else {
@@ -483,15 +473,11 @@ fn tcp_detach_with_a_foreign_permit_closes() {
 
 #[test]
 fn tcp_detach_on_an_unsettled_connection_closes() {
-    // Detach hands the raw socket to a worker, so the bytes that follow belong to the fd rather than the framer. It is
-    // only safe on a fully settled connection - nothing in flight and nothing buffered past this request.
-    // A pipelined second message still sitting in the server's buffer is exactly that: the worker would consume bytes
-    // the framer already owns, so the loop must close instead.
+    // Detach hands the raw socket to a worker, so it is safe only with nothing in flight and nothing buffered past this
+    // request. A pipelined message already in the server's buffer belongs to the framer, so the loop must close.
     //
-    // The framer has to be a scanning one for this to arise. A fixed-width length prefix asks for exact byte counts, so
-    // a pipelined follower stays in the socket and never reaches the buffer - the connection reads as settled.
-    // `lsp_header` scans for a `\r\n\r\n` terminator and so consumes opportunistically, which is what leaves the second
-    // message buffered.
+    // The framer must scan for this to arise. A fixed-width prefix reads exact counts and leaves a follower in the
+    // socket, while `lsp_header` scans for its terminator and so buffers the second message.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
@@ -516,8 +502,6 @@ fn tcp_detach_on_an_unsettled_connection_closes() {
         let _stop = ShutdownOnDrop(stop.clone());
         let r = (|| -> io::Result<Vec<u8>> {
             let mut s = connect_tcp(v4)?;
-            // Two complete LSP-framed messages in one write, so the scanning framer buffers the second while the first
-            // is being handled.
             let mut pipelined = b"Content-Length: 6\r\n\r\ndetach".to_vec();
             pipelined.extend_from_slice(b"Content-Length: 8\r\n\r\ntrailing");
             let _ = s.write_all(&pipelined);
@@ -543,11 +527,9 @@ fn tcp_detach_on_an_unsettled_connection_closes() {
 
 #[test]
 fn protocol_context_types_are_debug() {
-    // `Incoming`, `Request` and `DetachContext` are `#[non_exhaustive]`, so a consumer cannot build one to print -
-    // their `Debug` impls are reachable only from inside a live handler. They are the types that end up in a consumer's
-    // error logs, and each one deliberately withholds fields: `Request` prints `header_len` rather than the header, and
-    // neither it nor `DetachContext` prints the connection state, which is where an application keeps its secrets.
-    // Assert the shape and those omissions, not merely that formatting does not panic.
+    // These types are `#[non_exhaustive]`, so their `Debug` is reachable only from a live handler, and each withholds
+    // fields. `Request` prints `header_len` rather than the header, and neither it nor `DetachContext` prints the
+    // connection state, where an application keeps its secrets. Assert the shape and those omissions.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
     let accept_tx = tx.clone();

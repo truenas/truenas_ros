@@ -2,9 +2,8 @@ use super::*;
 
 #[test]
 fn tcp_one_way_notification() {
-    // `Response::Reply(empty)` means "answered, nothing to send" - a one-way message. The connection stays open and the
-    // next request is served. Full Protocol here; `tcp_builder_close_and_one_way` covers the same contract through the
-    // `length_prefixed` builder (`Some(empty)` one-way, `None` close).
+    // `Response::Reply` with an empty body is a one-way message, so the connection stays open and the next request is
+    // served. `tcp_builder_close_and_one_way` covers the `length_prefixed` builder.
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
         header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
@@ -105,9 +104,8 @@ fn tcp_builder_close_and_one_way() {
 
 #[test]
 fn tcp_length_prefix_overflow_rejected() {
-    // A u64 length prefix of !0 once wrapped the header+body usize total past the TooLarge guard (release) or panicked
-    // the loop on the add (debug) -- a remote crash from one 8-byte message. It must instead close that connection as
-    // TooLarge and keep serving others.
+    // A u64 length prefix of !0 must not wrap the header and body total past the `TooLarge` guard in release or panic
+    // the loop in debug. It must close that connection as `TooLarge` and keep serving others.
     use std::sync::Mutex;
     let reasons = Arc::new(Mutex::new(Vec::new()));
     let proto = length_prefixed(PrefixWidth::U64, Endian::Big, false, echo);
@@ -229,7 +227,6 @@ fn tcp_stale_deferred_dropped() {
                 thread::sleep(Duration::from_millis(30));
                 deferred.reply(echo_frame(b"late")); // must be dropped
             });
-            // Answer inline anyway - the Deferred above is now stale.
             Response::Reply(echo_frame(b"inline"))
         },
     };
@@ -285,9 +282,8 @@ fn tcp_mismatched_defer_permit_closes() {
                 body, state, responder, ..
             } = req;
             if &body[..] == b"mint" {
-                // Mint and stash the pair, then answer inline. Keeping the
-                // Deferred in the stash keeps its Drop-close from firing;
-                // it goes stale the moment this Reply answers the request.
+                // Keeping the `Deferred` in the stash keeps its drop-close from firing, and it goes stale once this
+                // reply answers the request.
                 state.pair = Some(responder.defer());
                 Response::Reply(echo_frame(b"ok"))
             } else {
@@ -364,28 +360,24 @@ fn tcp_reuse_port_and_options() {
         panic!("expected Tcp");
     };
 
-    // Second bind to the SAME port must succeed with reuse_port...
+    // A second bind to the same port must succeed with `reuse_port`.
     //
-    // `with_config` is a ring setup as well as a bind, and a second ring needs physically contiguous high-order pages:
-    // on the platform this crate targets, where ARC holds most of RAM, that is exactly the allocation that fails
-    // `ENOMEM`. That is the environmental skip `should_skip` already answers for the first server above - and
-    // `TRUENAS_ROS_REQUIRE_IO_URING`, which both CI lanes arm, turns it red where it must not happen. The message names
-    // the call, because `bind(2)` is not what refused.
+    // `with_config` also sets up a ring, and a second ring needs contiguous high-order pages, which fail `ENOMEM` where
+    // ARC holds most of RAM. `should_skip` answers that as environmental, and `TRUENAS_ROS_REQUIRE_IO_URING` turns it
+    // red where it must not happen. The message names the call, because `bind(2)` is not what refused.
     let second = match Server::with_config([ServerAddr::Tcp(v4)], cfg, proto()) {
         Ok(s) => s,
         Err(e) if should_skip(&e) => return,
         Err(e) => panic!("reuse_port second Server::with_config: {e}"),
     };
-    // ...and is dropped before any client connects, so the kernel cannot have routed our test connection into its
-    // (never-served) backlog.
+    // It is dropped before any client connects, so the kernel cannot route our test connection into its unserved
+    // backlog.
     drop(second);
 
     // Without the flag the same bind fails with EADDRINUSE.
     //
-    // `Server::bind` is `with_config` with the default config (`net/server/mod.rs`), so it sets a ring up exactly as
-    // the two calls above do - and answers the same environmental `ENOMEM` for the same reason. Screened through
-    // `should_skip` before the errno is judged, or that skip becomes `expected EADDRINUSE, got ENOMEM`: a hard failure
-    // naming the wrong syscall, on the one call in this test that was left unguarded.
+    // `Server::bind` sets a ring up as well, so it can answer the same environmental `ENOMEM`, and must be screened
+    // through `should_skip` before the errno is judged.
     let dup = Server::bind(
         [ServerAddr::Tcp(v4)],
         length_prefixed(PrefixWidth::U32, Endian::Big, false, echo),
@@ -414,9 +406,9 @@ fn tcp_reuse_port_and_options() {
 
 #[test]
 fn unix_peercred_auth() {
-    // With `unix_peercred`, the accept handler receives the peer's SO_PEERCRED (fetched via an io_uring socket
-    // URING_CMD - Linux >= 6.7; this host is newer) before running, and can authenticate on it. The body echoes the
-    // credentials back and the client checks them against its real ids.
+    // With `unix_peercred`, the accept handler receives the peer's `SO_PEERCRED`, fetched with an io_uring socket
+    // command on `AF_UNIX` (Linux >= 6.18.16), and can authenticate on it. The body echoes the credentials back and the
+    // client checks them against its real ids.
     let dir = truenas_ros::tempdir().unwrap();
     let path = dir.path().join("cred.sock");
     let cfg = ServerConfig {
@@ -469,9 +461,8 @@ fn unix_peercred_auth() {
 
 #[test]
 fn tcp_push_pub_sub() {
-    // Server push: a subscriber stashes its PushHandle via the "sub" request; a publisher's "pub" request pushes an
-    // unsolicited PDU to the subscriber. After the subscriber disconnects, further pushes are dropped harmlessly and
-    // the publisher's connection keeps working.
+    // A subscriber stashes its `PushHandle` and a publisher's request pushes to it. Once the subscriber disconnects,
+    // pushes are dropped harmlessly and the publisher keeps working.
     use std::sync::Mutex;
     let sub_handle: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
     let proto = Protocol {
@@ -519,7 +510,6 @@ fn tcp_push_pub_sub() {
             // The unsolicited push arrives on the subscriber's connection.
             assert_eq!(recv_framed(&mut sub)?, b"event-1");
 
-            // Subscriber leaves; a push to the dead connection is dropped and the publisher keeps working.
             drop(sub);
             thread::sleep(Duration::from_millis(50)); // let the close land
             send_framed(&mut publisher, b"pub:event-2")?;
@@ -538,13 +528,13 @@ fn tcp_push_pub_sub() {
 
 #[test]
 fn tcp_push_backlog_evicts() {
-    // A subscriber that stops reading: pushes accumulate until max_send_backlog, then the connection is evicted with
-    // SendBacklog.
+    // A subscriber that stops reading has pushes accumulate until `max_send_backlog`, then is evicted with
+    // `SendBacklog`.
     use std::sync::Mutex;
-    // Each push must exceed what the kernel alone can absorb - sndbuf autotunes up to tcp_wmem[2] (typically 4 MiB)
-    // plus the peer's ~128 KiB initial window - because a fully-absorbed WAITALL send completes and leaves the library
-    // queue empty. At 32 MiB the first push is still (partially) queued when the second arrives (`queued_bytes` counts
-    // the whole front PDU until fully sent), so the second deterministically overflows the cap.
+    // Each push must exceed what the kernel alone absorbs, a send buffer autotuned up to `tcp_wmem[2]` plus the peer's
+    // initial window, or a fully absorbed WAITALL send completes and leaves the queue empty. At 32 MiB the first push
+    // is still queued when the second arrives, since `queued_bytes` counts the whole front PDU until sent, so the
+    // second overflows the cap.
     const PUSH: usize = 32 * 1024 * 1024;
     let sub_handle: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
     let reasons = Arc::new(Mutex::new(Vec::new()));
@@ -681,8 +671,6 @@ fn tcp_push_held_across_detach() {
             assert_eq!(recv_framed(&mut s)?, b"ok");
             send_framed(&mut s, b"detach")?;
             parked_rx.recv().expect("parked");
-            // The connection is parked with a worker: push now. These must be HELD (not written - the worker owns the
-            // stream - and not dropped), then flushed in order at resume.
             let push = push_slot.lock().unwrap().clone().expect("stashed handle");
             for i in 0..3u8 {
                 push.push(echo_frame(format!("evt{i}").as_bytes()));

@@ -46,10 +46,9 @@ fn tcp_idle_timeout() {
 
 #[test]
 fn timeouts_duration_max_mean_never() {
-    // `Duration::MAX` (and anything >= 2^63 seconds) must mean "never fires", not "fires instantly": the
-    // kernel-timespec conversion clamps tv_sec. An unclamped `as i64` cast wraps negative, LINK_TIMEOUT prep then fails
-    // -EINVAL and takes its linked recv down -ECANCELED - misreported as IdleTimeout/RequestTimeout - closing every
-    // connection at its first parked read: the server could not hold a single client.
+    // `Duration::MAX`, and anything at or past 2^63 seconds, must mean never fires, so the kernel timespec conversion
+    // clamps `tv_sec`. An unclamped `as i64` wraps negative, LINK_TIMEOUT prep fails `-EINVAL`, and its linked recv
+    // dies `-ECANCELED`, closing every connection at its first parked read.
     let cfg = ServerConfig {
         idle_timeout: Some(Duration::MAX),
         request_timeout: Some(Duration::MAX),
@@ -96,10 +95,9 @@ fn timeouts_duration_max_mean_never() {
 
 #[test]
 fn tcp_request_timeout_reclaims_stalled_body() {
-    // SECURITY (slow-loris): a peer that sends a valid length prefix and then withholds the body must not pin its pool
-    // slot. `request_timeout` bounds an in-progress request even though `idle_timeout` (unset here) never would - the
-    // connection is not idle, it is mid-frame. An idle keep-alive connection is left untouched (that is
-    // `idle_timeout`'s job, not this).
+    // A slow-loris guard. A peer that sends a valid length prefix and withholds the body must not pin its slot, so
+    // `request_timeout` bounds the request mid-frame where `idle_timeout` never would. An idle keep-alive connection is
+    // left to `idle_timeout`.
     let cfg = ServerConfig {
         request_timeout: Some(Duration::from_millis(200)),
         ..ServerConfig::default()
@@ -124,14 +122,10 @@ fn tcp_request_timeout_reclaims_stalled_body() {
             send_framed(&mut ok, b"ping")?;
             assert_eq!(recv_framed(&mut ok)?, b"ping");
 
-            // Prefix declaring a 64-byte body, then nothing: the body recv stalls and the slot is reclaimed within
-            // request_timeout.
             let mut stall = connect_tcp(v4)?;
             stall.write_all(&64u32.to_be_bytes())?;
             expect_idle_close(&mut stall)?; // detects the prompt server close
 
-            // The idle keep-alive `ok` is NOT reclaimed by request_timeout: it still serves after well over the timeout
-            // window.
             thread::sleep(Duration::from_millis(400));
             send_framed(&mut ok, b"pong")?;
             assert_eq!(recv_framed(&mut ok)?, b"pong");
@@ -147,12 +141,10 @@ fn tcp_request_timeout_reclaims_stalled_body() {
 
 #[test]
 fn tcp_request_timeout_partial_body_reports_request_timeout() {
-    // Close-reason fidelity for the slow-loris guard: a peer that trickles SOME body bytes then stalls must be reported
-    // as RequestTimeout, not TruncatedMessage. A LINK_TIMEOUT-cancelled MSG_WAITALL recv that had consumed bytes
-    // completes with res = done_io > 0 (io_sendrecv_fail) -- bit-identical to a peer FIN mid-frame - so the server
-    // pairs the recv completion with its clock CQE (-ETIME vs -ECANCELED) to classify. Operators tuning slow-loris
-    // defenses read these reasons; "the peer vanished mid-message" for a live, merely-stalled peer sends them chasing
-    // the wrong problem.
+    // A peer that trickles some body bytes then stalls must close as `RequestTimeout`, not `TruncatedMessage`. A
+    // LINK_TIMEOUT-cancelled MSG_WAITALL recv that consumed bytes completes with `res = done_io > 0`
+    // (`io_sendrecv_fail`), the same as a peer FIN mid-frame, so the server pairs the recv completion with its clock
+    // CQE, `-ETIME` against `-ECANCELED`, to tell them apart.
     use std::sync::Mutex;
     let reasons = Arc::new(Mutex::new(Vec::new()));
     let cfg = ServerConfig {
@@ -202,10 +194,8 @@ fn tcp_request_timeout_partial_body_reports_request_timeout() {
     );
 }
 
-/// A receipt budget at or under the inactivity bound leaves the latter dead: the message is closed before a whole
-/// silent period can be observed, so `request_timeout` never fires and the pair reads as one knob with two names.
-/// Refused at validation, where the operator finds out, rather than tolerated into a configuration that means something
-/// else.
+/// A receipt budget at or under the inactivity bound leaves the latter dead, since the message is closed before a whole
+/// silent period passes. Validation refuses it, where the operator finds out.
 #[test]
 fn a_receipt_budget_may_not_pre_empt_the_inactivity_bound() {
     use truenas_ros::net::server::Listen;
@@ -264,14 +254,12 @@ fn a_receipt_budget_may_not_pre_empt_the_inactivity_bound() {
     }
 }
 
-/// SECURITY (slow-loris, the case `request_timeout` cannot reach): `request_timeout` bounds progress per period, so a
-/// peer that sends one byte just inside every period re-arms it forever and holds its pool slot indefinitely. A slot is
-/// taken at accept, before authentication, and accept is gated on a free slot - so `pool_size` such peers deny service.
-/// `max_receipt_time` is the bound that cannot be restarted by progress: it runs from a message's first byte to its
-/// delivery.
+/// `request_timeout` bounds progress per period, so a peer that sends one byte just inside every period holds its slot
+/// forever. A slot is taken at accept, before authentication, so `pool_size` such peers deny service.
+/// `max_receipt_time` cannot be restarted by progress, since it runs from a message's first byte to its delivery.
 ///
-/// The trickle here is deliberately faster than `request_timeout`, so the inactivity guard never fires and the close
-/// reason proves which clock did the reclaiming.
+/// The trickle is faster than `request_timeout`, so the inactivity guard never fires and the close reason proves which
+/// clock reclaimed the slot.
 #[test]
 fn max_receipt_time_reclaims_a_peer_trickling_under_the_floor() {
     use std::sync::Mutex;
@@ -337,10 +325,10 @@ fn max_receipt_time_reclaims_a_peer_trickling_under_the_floor() {
 /// The budget is not restarted by progress - the property that separates it from `request_timeout`, driven on the
 /// framing that can tell them apart.
 ///
-/// A length-prefixed body is a single exact read, so the arm happens once whatever the code does afterwards and a
-/// per-read re-arm is invisible. A `More`/delimiter scan re-enters `submit_recv` on every chunk, so a budget that is
-/// cancelled and re-armed there rides the trickle forever, exactly as the inactivity clock does. The gaps here are half
-/// `request_timeout`, so that clock is satisfied throughout and the close reason names which one fired.
+/// A length-prefixed body is one exact read, so a per-read re-arm is invisible there. A `More` scan re-enters
+/// `submit_recv` on every chunk, so a budget cancelled and re-armed there rides the trickle forever, as the inactivity
+/// clock does. The gaps are half `request_timeout`, so that clock is satisfied throughout and the close reason names
+/// which one fired.
 #[test]
 fn a_chunk_scan_budget_is_not_restarted_by_progress() {
     use std::sync::Mutex;
@@ -403,11 +391,10 @@ fn a_chunk_scan_budget_is_not_restarted_by_progress() {
 
 /// Exactly one budget per message, and the retire cancels the one there is.
 ///
-/// A `More`/delimiter framer reads in chunks that complete on any byte, so a trickled header is many non-idle reads of
-/// one message - the shape that tells an idempotent arm from a per-read one. Arming per read stacks a timer each time,
-/// and they all carry the same `user_data`, so the retire's `ASYNC_CANCEL` reaps one and leaves the rest to fire later
-/// against a connection that has done nothing wrong. The header here completes well inside the budget, so a close of
-/// any kind is the bug.
+/// A `More` framer's chunk reads complete on any byte, so a trickled header is many non-idle reads of one message.
+/// Arming per read stacks timers that share one `user_data`, so the retire's `ASYNC_CANCEL` reaps one and the rest fire
+/// later on a connection that has done nothing wrong. The header completes well inside the budget, so any close is the
+/// bug.
 #[test]
 fn a_trickled_header_leaves_exactly_one_receipt_budget() {
     let budget = Duration::from_millis(400);
@@ -466,10 +453,9 @@ fn a_trickled_header_leaves_exactly_one_receipt_budget() {
 
 /// The budget is retired at delivery, so it bounds receipt and nothing else.
 ///
-/// Two ways this could go wrong and both are silent: a budget that outlives its message would fire during handling or
-/// while the connection sits idle between requests, killing healthy keep-alive connections on a timer; and one that is
-/// re-armed rather than left running would degrade into the inactivity guard it exists beside. The sleeps here are
-/// several times the budget with the connection well-behaved throughout.
+/// A budget that outlived its message would fire during handling or between requests and kill healthy keep-alive
+/// connections, and one re-armed rather than left running would degrade into the inactivity guard. Both are silent, so
+/// the sleeps here are several times the budget with the connection well-behaved throughout.
 #[test]
 fn max_receipt_time_does_not_clock_handling_or_an_idle_connection() {
     let budget = Duration::from_millis(300);
@@ -520,10 +506,9 @@ fn max_receipt_time_does_not_clock_handling_or_an_idle_connection() {
 
 #[test]
 fn request_timeout_reclaims_stalled_more_scan() {
-    // SECURITY (slow-loris, chunk-read path): a `More`/delimiter framer reads in chunks that complete on any byte, so
-    // the request clock bounds them by inactivity. A peer that sends a partial header (no `\r\n\r\n`) then stalls has
-    // its non-idle chunk read time out and its slot reclaimed - the `idle_timeout` clock (unset here) would never fire
-    // mid-scan.
+    // A `More` framer's chunk reads complete on any byte, so the request clock bounds them by inactivity. A peer that
+    // sends a partial header and stalls has its non-idle chunk read time out and its slot reclaimed, where
+    // `idle_timeout` would never fire mid-scan.
     let cfg = ServerConfig {
         request_timeout: Some(Duration::from_millis(200)),
         ..ServerConfig::default()
@@ -547,8 +532,6 @@ fn request_timeout_reclaims_stalled_more_scan() {
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
         let r = (|| -> io::Result<()> {
-            // A partial LSP header with no `\r\n\r\n` terminator, then stall: the scan's next chunk read waits for a
-            // byte that never comes.
             let mut stall = connect_tcp(v4)?;
             stall.write_all(b"Content-Length: 5\r\n")?;
             expect_idle_close(&mut stall)?;

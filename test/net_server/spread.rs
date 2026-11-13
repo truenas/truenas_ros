@@ -318,10 +318,8 @@ fn draining_one_reuse_port_sibling_leaves_the_other_serving() {
 
 #[test]
 fn tcp_pipelined_out_of_order() {
-    // Pipelined (max_in_flight > 1): the client sends several requests without waiting; each is deferred to a worker
-    // that finishes in REVERSE order. With read-ahead the server reads and defers all of them before any reply, so
-    // replies egress out of request order - proving recv is decoupled from send. The body carries a 1-byte id the
-    // client matches replies against.
+    // Pipelined requests each defer to a worker that finishes in reverse order. With read-ahead the server reads and
+    // defers them all before any reply, so replies leave out of request order, proving recv is decoupled from send.
     const N: u8 = 4;
     let cfg = ServerConfig {
         max_in_flight_requests: 8,
@@ -525,10 +523,9 @@ fn tcp_reject() {
 
 #[test]
 fn server_close_reaches_peer_while_another_idles() {
-    // A server-initiated close must send the peer its FIN promptly even when another connection sits idle on a parked
-    // recv. A bare CLOSE of a direct descriptor only drops the ring's file-table reference; the socket's fput (and thus
-    // the FIN) can be deferred while the idle connection's in-flight recv pins the ring's resource node - so the closed
-    // peer would hang fully connected. The pre-close SHUTDOWN fixes that; this is the regression guard.
+    // A server-initiated close must send its FIN promptly even while another connection sits idle on a parked recv. A
+    // bare CLOSE of a direct descriptor only drops the ring's file-table reference, and the socket's fput, and so the
+    // FIN, can wait while the idle recv pins the ring's resource node, so the close shuts the socket down first.
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
         header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),

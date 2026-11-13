@@ -29,17 +29,15 @@ fn tcp_echo() {
 
 #[test]
 fn tcp_vectored_reply() {
-    // A `ReplyVectored`'s segments reach the client concatenated in order (one vectored write), and the reply retires
-    // its `outstanding` count exactly once - only the last segment is `is_reply` - so keep-alive keeps serving: three
-    // sequential roundtrips are not stranded behind the read-ahead cap. A wrong `is_reply` count would wedge the
-    // second.
+    // A `ReplyVectored`'s segments reach the client in order, and the reply retires its `outstanding` count once, since
+    // only the last segment is `is_reply`. A wrong count would wedge the second of three sequential roundtrips behind
+    // the read-ahead cap.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
         header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
             let Request { body, .. } = req;
-            // Echo as two segments: the length prefix, then the payload.
             let payload = body[..].to_vec();
             let prefix = (payload.len() as u32).to_be_bytes().to_vec();
             Response::ReplyVectored {
@@ -244,21 +242,12 @@ fn tcp_sequential_slot_reuse() {
 
 #[test]
 fn tcp_bare_close_with_inflight_sibling_reuses_slot() {
-    // SECURITY regression - fixed-slot reuse use-after-free / cross-connection corruption. When a connection is torn
-    // down on a bare-CLOSE path while an op is still in flight on its descriptor, that op pins the kernel resource
-    // node: the CLOSE frees the table slot and bitmap bit at issue and biases the next accept to that same index, but
-    // the pinned op keeps the old socket and its buffers alive. A reuse-accept then reaches `accept_connection` and
-    // overwrites the still-`Serving` slot (freed only at ops==0) - dropping the live connection under the in-flight op,
-    // and, because the generation never bumps on reuse-without-free, later steering that op's completion onto whatever
-    // connection now holds the slot. The fix cancels the in-flight op and defers the CLOSE until it reaps, so the slot
-    // frees cleanly before any reuse-accept can land.
+    // A bare close while an op is still in flight cancels the op and frees the slot only once it reaps. Freed early, a
+    // new accept would reuse the slot under the old op and later get that op's completion.
     //
-    // Repro with a wide, deterministic window: a subscriber triggers a large push to itself, then half-closes its WRITE
-    // side (the server's idle recv sees EOF -> PeerClosed, a bare close) while keeping its READ side open and never
-    // reading - so the push send stalls in flight, pinning the slot indefinitely. A fresh echo then reuses the freed
-    // index. Without the fix
-    // the reuse corrupts the connection (wrong reply, a loop panic, or a hang);
-    // with it, every echo gets its own correct reply and the server stays live.
+    // A subscriber pushes 16 MiB to itself and half-closes its write side, so the server's idle recv sees EOF and
+    // closes bare while the push send stalls, since the peer never reads. A fresh echo then reuses the freed index and
+    // must get its own reply.
     use std::net::Shutdown;
     use std::sync::Mutex;
     const ROUNDS: usize = 8;
@@ -308,20 +297,13 @@ fn tcp_bare_close_with_inflight_sibling_reuses_slot() {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         (|| -> io::Result<()> {
             for i in 0..ROUNDS {
-                // Subscribe, then push a large payload to ourselves; the server starts sending it and (keep-alive) arms
-                // an idle recv.
                 let mut sub = connect_tcp(v4)?;
                 send_framed(&mut sub, b"sub")?;
                 assert_eq!(recv_framed(&mut sub)?, b"ok");
                 send_framed(&mut sub, b"push")?;
                 assert_eq!(recv_framed(&mut sub)?, b"ok");
-                // Half-close our WRITE side: the server's idle recv sees EOF -> PeerClosed, a bare close - but the
-                // large push to us is still draining into our socket and we never read it, so its send stays in flight
-                // and pins the descriptor.
                 sub.shutdown(Shutdown::Write)?;
                 thread::sleep(Duration::from_millis(15)); // let the bare close land
-                // Reuse the just-freed index with a fresh echo; the reply must be its own, and the server must stay
-                // healthy.
                 let want = format!("echo-{i}");
                 let mut c = connect_tcp(v4)?;
                 send_framed(&mut c, want.as_bytes())?;
@@ -340,9 +322,8 @@ fn tcp_bare_close_with_inflight_sibling_reuses_slot() {
 
 #[test]
 fn tcp_lsp_framing() {
-    // LSP-style variable header: `Content-Length: N\r\n\r\n<body>`. The caller's `lsp_header` framer scans for
-    // `\r\n\r\n` (via Framing::More chunk reads) then reads exactly N body bytes - a header the old fixed-size model
-    // can't express. The body handler re-frames its reply the same way.
+    // An LSP-style variable header, `Content-Length: N\r\n\r\n<body>`. The `lsp_header` framer scans for the terminator
+    // through `Framing::More` chunk reads, then reads exactly N body bytes.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
@@ -375,7 +356,6 @@ fn tcp_lsp_framing() {
             let payload = b"{\"jsonrpc\":\"2.0\"}";
             write!(s, "Content-Length: {}\r\n\r\n", payload.len())?;
             s.write_all(payload)?;
-            // Read the LSP reply: header up to \r\n\r\n, then Content-Length body.
             read_lsp(&mut s)
         })();
         stop.shutdown();
@@ -437,18 +417,14 @@ fn tcp_stateful_counter() {
 
 #[test]
 fn tcp_deferred_offload() {
-    // The body handler offloads work to another thread (standing in for a real pool) and returns `Response::Defer`,
-    // freeing the server thread to keep polling. The worker computes the reply and hands it back via the `Deferred`;
-    // the server sends it on the next wake, and keep-alive resumes -- proven by a second round-trip on the same
-    // connection.
+    // A handler that returns `Response::Defer` frees the loop while a worker builds the reply, and keep-alive resumes
+    // once the reply is sent, as the second round trip shows.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
         header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
         body: |req: Request<'_, ()>| {
             let Request { body, responder, .. } = req;
-            // Move OWNED inputs to the worker - never a borrow of connection state - then detach the reply handle and
-            // return to the loop.
             let input = body.to_vec();
             let (deferred, permit) = responder.defer();
             thread::spawn(move || {
@@ -530,10 +506,9 @@ fn tcp_deferred_drop_closes() {
 
 #[test]
 fn tcp_redelivered_request() {
-    // A body handler stashes the request in its connection state, defers, and the worker asks for a SECOND delivery via
-    // `Deferred::redeliver` instead of supplying bytes - the pattern protocol glue (http) uses to complete a parked
-    // request on the server thread. The rerun sees the stash, replies, and keep-alive continues: two messages each make
-    // the full park-and-redeliver round trip on one connection.
+    // A handler stashes the request and defers, and the worker asks for a second delivery with `Deferred::redeliver`
+    // instead of a reply. The rerun answers from the stash, and two messages each make the full round trip on one
+    // connection.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     type Stash = Option<Vec<u8>>;
     let proto = Protocol {
@@ -655,10 +630,8 @@ fn detach_stream(fd: std::os::fd::RawFd) -> ManuallyDrop<TcpStream> {
 
 #[test]
 fn tcp_detach_resume() {
-    // A body handler DETACHES the connection: the server furnishes a real fd to a worker that does blocking I/O on the
-    // socket, then RESUMES serving. The worker echoes 5 raw bytes off the fd (proving the fd is usable); after resume
-    // the connection keeps serving with its per-connection state intact (the request counter), proven by a framed
-    // round-trip returning `2:ping`.
+    // A handler detaches the connection to a worker that does blocking I/O on the furnished fd and then resumes it. The
+    // connection keeps serving with its state intact, so the framed reply is `2:ping`.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(0u32),
@@ -719,11 +692,10 @@ fn tcp_detach_resume() {
 
 #[test]
 fn tcp_detach_resume_restores_nonblocking() {
-    // The furnished fd shares the pool socket's FILE DESCRIPTION, so a worker clearing O_NONBLOCK for its blocking
-    // transfer (as any blocking helper does) would otherwise leave the resumed connection's socket blocking -- silently
-    // disabling the splice path's EAGAIN -> readiness-poll slow-loris guard (`tcp_splice_read` takes its wait mode from
-    // the file's O_NONBLOCK). `Detached::resume` must restore the flag itself. Observed through a worker-held dup() of
-    // the furnished fd: same file description, still open after resume consumes the handle.
+    // The furnished fd shares the pool socket's file description, so a worker that clears O_NONBLOCK for blocking work
+    // would leave the resumed socket blocking. That silently disables the splice path's slow-loris guard, since
+    // `tcp_splice_read` takes its wait mode from the file's O_NONBLOCK. `Detached::resume` must restore the flag, which
+    // a dup the worker holds observes.
     let (flag_tx, flag_rx) = std::sync::mpsc::channel::<bool>();
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
@@ -886,10 +858,8 @@ fn tcp_detach_drop_closes() {
 
 #[test]
 fn tcp_deferred_worker_close_ends_the_connection() {
-    // `Deferred::close` is the worker deciding the request is fatal - distinct from dropping the handle, which closes
-    // only because a lost worker must not leak the parked slot. Both end the connection and both report `WorkerClosed`,
-    // so a test of the drop path says nothing about whether the deliberate one works. The close is also final: a
-    // request answered this way is gone, so the pipelined follower behind it is not served.
+    // `Deferred::close` ends the connection on purpose and reports `WorkerClosed`, as a dropped handle does, so the
+    // drop test proves nothing about this path. The closed request gets no reply.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
@@ -1043,10 +1013,8 @@ fn handle_types_are_debug() {
 
 #[test]
 fn push_of_an_empty_payload_is_a_no_op() {
-    // An empty push is dropped at the handle rather than travelling to the loop, so it never reaches the send queue.
-    // That matters because the server frames nothing itself: a zero-length PDU handed to the socket would be an empty
-    // write the peer cannot distinguish from a stall, and a queued empty push would still consume backlog accounting.
-    // The client must see exactly the one real push.
+    // An empty push is dropped at the handle, so it never reaches the send queue, where it would be an empty write that
+    // still counts against the backlog. The client must see exactly the one real push.
     use std::sync::Mutex;
     let stash: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
     let for_body = Arc::clone(&stash);

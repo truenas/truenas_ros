@@ -1,13 +1,11 @@
 use super::*;
 
-/// The end-to-end proof that a server acts as *authenticated peers*: the personality genuinely gates namespace access,
-/// it is not a stamp. The credential broker (spawned on the **server's** ring) registers an unprivileged uid; the
-/// handler then opens a root-owned `0600` file two ways -- under the daemon's own personality it opens and reads back,
-/// under the peer's it is refused (`EACCES`, so `done.file()` is `None`). Pure `open` + `pread`, so it runs live
-/// wherever io_uring + root are available (no xattr / 6.13 gate). The divergence is at **open** by design: DAC is
-/// checked there, not on each read of an already-open fd.
+/// A server acts as its authenticated peers, so the personality gates namespace access rather than stamping it. The
+/// credential broker, spawned on the server's ring, registers an unprivileged uid, and the handler opens a root-owned
+/// `0600` file two ways. Under the daemon's own personality it opens and reads back, and under the peer's it is refused
+/// `EACCES` at open, where DAC is checked, not on each read.
 ///
-/// Root-only (the broker needs `CAP_SETUID` to become the peer); skipped otherwise.
+/// Root-only, since the broker needs `CAP_SETUID` to become the peer. Skipped otherwise.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_broker_personality_gates_open() {
@@ -26,7 +24,6 @@ fn fs_broker_personality_gates_open() {
     const NOBODY_GID: u32 = 65_534;
 
     let dir = truenas_ros::tempdir().unwrap();
-    // A root-owned, owner-only file: openable by the daemon, not by the peer.
     let secret = dir.path().join("secret.txt");
     std::fs::write(&secret, b"topsecret").unwrap();
     let cpath = CString::new(secret.as_os_str().as_bytes()).unwrap();
@@ -51,8 +48,6 @@ fn fs_broker_personality_gates_open() {
         let (root_pers, peer_pers) = *pc.get().expect("personalities set before serving");
         let anchor = anchor.clone();
         let ro = OpenHow::new().flags(OFlag::O_RDONLY);
-        // Open the 0600 file as the daemon (`as-root`) or the peer, then, if it opened, read it back - proving the
-        // daemon both opens AND reads while the peer is refused at open.
         let who = if cmd == b"as-root" { root_pers } else { peer_pers };
         let path = CString::new("secret.txt").unwrap();
         fs.open(who, &anchor, &path, ro, move |done, fs| {
@@ -387,20 +382,15 @@ fn fs_reopen_through_proc_checks_the_peer_and_not_the_ring_owner() {
     );
 }
 
-/// `open_chain`'s whole point: a directory the caller could never traverse, opened as the daemon, with the file inside
-/// it still gated on the caller.
+/// `open_chain` opens a directory the caller could never traverse as the daemon, and still gates the file inside it on
+/// the caller.
 ///
-/// This is the property the split credential exists for. A `0700` daemon-owned tree grants nothing, so opening
-/// something under it as the daemon proves nothing about the caller — the last step has to name the caller for the
-/// kernel to decide their access to the file they actually asked for.
+/// Opening under a `0700` daemon-owned tree as the daemon proves nothing about the caller, so the last step must name
+/// the caller for the kernel to decide its access. The daemon reaches the file, the peer is refused at the file though
+/// the directory above it opened, and the peer is refused at the directory when it traverses. The second matters most,
+/// since a chain that leaked the daemon's credential into the last step would hand the peer a file it may not read.
 ///
-/// Three chains over the same tree say it three ways: the daemon reaches the file; the peer is refused at the file even
-/// though the directory above it opened; and the peer is refused at the directory when it is the one traversing. The
-/// second is the one that matters — a chain that leaked the daemon's credential into the last step would hand the peer
-/// a file it may not read.
-///
-/// Root-only (the broker needs `CAP_SETUID` to become the peer);
-/// skipped otherwise.
+/// Root-only, since the broker needs `CAP_SETUID` to become the peer. Skipped otherwise.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_open_chain_gates_the_last_step_on_its_own_personality() {
@@ -417,8 +407,7 @@ fn fs_open_chain_gates_the_last_step_on_its_own_personality() {
     const NOBODY_GID: u32 = 65_534;
 
     let dir = truenas_ros::tempdir().unwrap();
-    // `private/` is the daemon-owned tree: 0700, so the peer cannot even traverse it. `obj` inside it is 0600, so the
-    // peer cannot read it either — two separate refusals, one per step.
+    // `private/` is 0700 and `obj` inside it 0600, one refusal per step.
     let private = dir.path().join("private");
     std::fs::create_dir(&private).unwrap();
     let obj = private.join("obj");
@@ -536,20 +525,12 @@ fn fs_open_chain_gates_the_last_step_on_its_own_personality() {
     assert_eq!(got[2], b"denied", "the peer cannot traverse the 0700 directory either");
 }
 
-/// The multi-reactor shape: rings created on the main thread before the broker forks, servers built on worker threads
-/// after it, and the peer's personality minted on each ring before the thread that owns it has even mapped it. The
-/// broker's personalities then gate opens on every ring exactly as they do on a server that built its own ring, which
-/// is the proof that `setup_ring` + `with_ring` is the same server, constructed in two halves on two threads.
+/// A ring created before the thread that serves on it, then mapped and driven by that thread, serves real requests.
 ///
-/// A ring created **before** the thread that will serve on it, mapped and driven by that thread, serves real requests.
-///
-/// This is the unprivileged half of the multi-reactor recipe: `setup_ring` builds each ring on this thread with no
-/// other thread alive, then each worker takes one and calls `Server::with_ring`, which does the mapping on the thread
-/// that will drive it. Nothing here needs a credential broker, so it runs on `ci.yml`'s unprivileged runner - the job
-/// that gates merges, where `fs_broker_serves_rings_mapped_on_worker_threads` can only skip.
-///
-/// Two rings, so the per-ring construction is exercised more than once and the servers are proven independent rather
-/// than aliased.
+/// `setup_ring` builds each ring on this thread with no other thread alive, and each worker calls `Server::with_ring`,
+/// which maps the ring on the thread that will drive it. No broker is needed, so this runs on `ci.yml`'s unprivileged
+/// runner, the job that gates merges, where `fs_broker_serves_rings_mapped_on_worker_threads` can only skip. Two rings
+/// prove the servers independent rather than aliased.
 #[test]
 fn rings_created_before_the_threads_that_serve_them() {
     use std::sync::mpsc;
@@ -619,10 +600,12 @@ fn rings_created_before_the_threads_that_serve_them() {
     }
 }
 
-/// Root-only, because the **broker** half needs `CAP_SETUID` to become another uid. The skip is loud:
-/// `TRUENAS_ROS_REQUIRE_CRED_BROKER=1` (armed in the QEMU job, which runs as root) turns a mis-provisioned runner red
-/// instead of green. The unprivileged half of the same feature - a ring created on one thread and mapped, built and
-/// driven on another - is covered without privilege by `rings_created_before_the_threads_that_serve_them`.
+/// The broker's personalities gate opens on rings created before it forked and mapped later on worker threads, exactly
+/// as on a server that built its own ring, so `setup_ring` and `with_ring` make the same server in two halves on two
+/// threads. The peer is minted on each ring before its thread maps it.
+///
+/// Root-only, since the broker needs `CAP_SETUID`, and `TRUENAS_ROS_REQUIRE_CRED_BROKER=1`, armed in the QEMU job,
+/// turns the skip red. `rings_created_before_the_threads_that_serve_them` covers the unprivileged half.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_broker_serves_rings_mapped_on_worker_threads() {
@@ -691,8 +674,6 @@ fn fs_broker_serves_rings_mapped_on_worker_threads() {
     );
     drop(outsider);
 
-    // Each worker mints the peer on its still-unmapped ring, maps it, builds the server around it, and reports its
-    // address and stop handle before serving.
     let (tx, rx) = mpsc::channel::<(usize, SocketAddrV4, ShutdownHandle)>();
     let mut workers = Vec::new();
     for (i, ring) in rings.into_iter().enumerate() {
@@ -754,7 +735,6 @@ fn fs_broker_serves_rings_mapped_on_worker_threads() {
                 header: length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false),
                 body,
             };
-            // The broker needs only the fd: the peer is minted on this ring before this thread maps it.
             let peer_pers = creds
                 .register(&AsUser::new(NOBODY_UID, NOBODY_GID))
                 .expect("register peer on a ring not yet mapped");
@@ -771,7 +751,6 @@ fn fs_broker_serves_rings_mapped_on_worker_threads() {
     }
     drop(tx);
 
-    // Drive each ring in turn: both identities, both verdicts, then stop it.
     let mut served = 0u8;
     for (i, v4, stop) in rx.iter() {
         let mut s = connect_tcp(v4).expect("connect");
@@ -831,10 +810,8 @@ fn fs_as_root_reads_trusted_xattr_across_privilege() {
     // not DAC on open.
     // SAFETY: valid path; chmod cannot corrupt memory.
     assert_eq!(unsafe { libc::chmod(cpath.as_ptr(), 0o644) }, 0);
-    // Seed a `trusted.*` attribute (root/CAP_SYS_ADMIN only); skip if the fs refuses it. Through `set_user_xattr`, as
-    // the privileged-xattr fixture above already is: the one assertion this test makes sits at its end, so a
-    // hand-rolled `libc::setxattr` with a silent `return` reports ok having tested nothing - with
-    // `TRUENAS_ROS_REQUIRE_XATTRS` armed, which `qemu-4-test.sh` arms naming this very probe.
+    // Seed through `set_user_xattr`, not a hand-rolled `libc::setxattr`, since the one assertion sits at the end and a
+    // silent return would pass having tested nothing. It holds the refusal to `TRUENAS_ROS_REQUIRE_XATTRS`.
     if !set_user_xattr(&f, b"trusted.tr_test", b"cap") {
         return; // filesystem refuses trusted.* here
     }
@@ -938,11 +915,9 @@ fn fs_as_root_reads_trusted_xattr_across_privilege() {
 }
 
 /// An fd opened for a connection torn down **mid-chain** is reclaimed when the connection closes. A handler opens a
-/// FIFO and submits a read that blocks forever (no writer sends data), then the peer disconnects before the read
-/// completes. Plain-fd files close by `Arc`-drop, but an in-flight op parks the fd until its CQE - so the
-/// connection-teardown sweep (`cancel_owned_by`) cancels the op; it completes `ECANCELED`, the parked `Arc` drops, and
-/// the fd closes without waiting for whole-server teardown. Validates the Arc-model replacement for the old
-/// `close_owned_by`.
+/// FIFO and submits a read that never completes, then the peer disconnects. The in-flight op parks the fd until its
+/// CQE, so the teardown sweep (`cancel_owned_by`) cancels it, the parked `Arc` drops on the `ECANCELED` completion, and
+/// the fd closes without waiting for server teardown.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_fd_reclaimed_on_connection_close_midchain() {
@@ -1154,19 +1129,13 @@ fn fs_conn_mkdir_path_builds_a_tree_and_answers_a_real_directory() {
     assert!(dir.path().join("a/b/c").is_dir(), "the tree was created");
 }
 
-/// `FsConn::mkdir_path` refuses a path whose components it cannot rebuild, and refuses it on **shape** rather than on
-/// whether the kernel resolves it.
+/// `FsConn::mkdir_path` refuses a path whose components it cannot rebuild, on **shape** rather than on whether the
+/// kernel resolves it. `openat2` under `CONFINED_RESOLVE` resolves `a/../b`, so a probe-first order would answer it
+/// with a directory only where the tree existed, and a walk that must create `b` cannot know what `a/..` names.
 ///
-/// `a/../b` is the case worth pinning: `openat2` under `CONFINED_RESOLVE` resolves it, so a probe-first order would
-/// answer it with a directory wherever the tree happened to exist and refuse it everywhere else - one path meaning two
-/// things. A walk that has to create `b` cannot know what `a/..` names, so the answer is the same either way: refused,
-/// before anything is submitted.
-///
-/// An invalid argument answers `on_done` before `mkdir_path` returns, with `EINVAL` and the refusal mark - so the
-/// handler replies to the peer instead of the connection being shed over a caller bug, and the callback runs inline
-/// while the handler is still on its way to `Response::Defer`. That ordering is the other thing this pins: a
-/// `Deferred::reply` made before the `Defer(permit)` verdict is processed rides the injection queue and lands once the
-/// park exists.
+/// The refusal answers `on_done` inline with a marked `EINVAL` before `mkdir_path` returns, so the handler replies
+/// rather than the peer being shed. That reply, made before the `Defer(permit)` verdict is processed, rides the
+/// injection queue and lands once the park exists.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_conn_mkdir_path_refuses_a_path_it_cannot_rebuild() {
@@ -1196,8 +1165,7 @@ fn fs_conn_mkdir_path_refuses_a_path_it_cannot_rebuild() {
         let how = OpenHow::new().flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY);
         let mode = Mode::from_bits_truncate(0o755);
         fs.mkdir_path(who, &anchor, c"a/../b", mode, how, move |d, _fs| {
-            // Fired inline, before `mkdir_path` returned: the screen answers rather than dropping, and the reply below
-            // is injected ahead of the `Defer` verdict being processed.
+            // Fired inline, before `mkdir_path` returned.
             let verdict = match d.result() {
                 Err(truenas_ros::Error::Errno(e)) if d.was_refused() => {
                     format!("refused:{e:?}")
@@ -1252,20 +1220,15 @@ fn fs_conn_mkdir_path_refuses_a_path_it_cannot_rebuild() {
         "a refused path creates nothing"
     );
 }
-/// `FsConn::mkdir_path` answers with a directory or with nothing: a `how` that would make the final open produce a
-/// *file* is refused.
+/// `FsConn::mkdir_path` answers with a directory or with nothing, so a `how` whose final open would produce a *file* is
+/// refused before anything is submitted, and the peer keeps its connection.
 ///
-/// `O_CREAT` is the case that bites. The probe opens the whole path, so with `a/b` present and `c` missing it would
-/// create a regular file `c` and hand it back as though the tree had been built - success, wrong object, nothing on the
-/// wire to say so. The kernel does refuse `O_DIRECTORY | O_CREAT` (`build_open_flags`, `fs/open.c:1278-1284`),
-/// but only at the syscall, by which point the walk has created the tree;
-/// the refusal here happens before anything is submitted.
+/// `O_CREAT` is the case that bites. With `a/b` present and `c` missing, the probe of the whole path would create a
+/// regular file `c` and hand it back as the tree. The kernel refuses `O_DIRECTORY | O_CREAT` (`build_open_flags`,
+/// `fs/open.c:1278-1284`) only at the syscall, after the walk has created the tree.
 ///
-/// `O_TMPFILE` is the case that hides: it is `__O_TMPFILE | O_DIRECTORY`, so forcing `O_DIRECTORY` does not exclude it
+/// `O_TMPFILE` is the case that hides. It is `__O_TMPFILE | O_DIRECTORY`, so forcing `O_DIRECTORY` does not exclude it,
 /// and a naive `flags & O_TMPFILE` test matches every plain directory open.
-///
-/// Both refusals answer the callback inline with a marked `EINVAL`;
-/// the handler replies, and the peer keeps its connection.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_conn_mkdir_path_refuses_a_how_that_would_answer_with_a_file() {
@@ -1276,8 +1239,6 @@ fn fs_conn_mkdir_path_refuses_a_how_that_would_answer_with_a_file() {
     use truenas_ros::uring_fs::{Anchor, Personality};
 
     let dir = truenas_ros::tempdir().unwrap();
-    // The parents exist and the leaf does not - exactly the shape where an `O_CREAT` probe would succeed by creating a
-    // regular file.
     std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
     let pers: Arc<OnceLock<Personality>> = Arc::new(OnceLock::new());
     let anchor = match Anchor::open(dir.path()) {

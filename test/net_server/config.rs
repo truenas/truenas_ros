@@ -2,10 +2,9 @@ use super::*;
 
 #[test]
 fn server_config_bounds_are_rejected_at_construction() {
-    // `ServerConfig::validate` runs as the first statement of `with_config`, before a socket or a ring exists, so every
-    // case here is reachable with no io_uring at all. Each knob is checked for the message it produces, not merely that
-    // it errored: an out-of-range value accepted here becomes a truncated completion token or a thread storm much
-    // later, and the message is the only thing naming the knob that was wrong.
+    // `ServerConfig::validate` runs first in `with_config`, before a socket or ring exists, so no case needs io_uring.
+    // Each case checks the message, since a value accepted here fails much later as a truncated completion token or a
+    // thread storm, and only the message names the knob.
     use truenas_ros::net::server::Listen;
     let tcp = || ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let expect =
@@ -189,11 +188,9 @@ fn server_config_bounds_are_rejected_at_construction() {
 #[cfg(feature = "uring-fs")]
 #[test]
 fn server_config_fs_pool_bounds_are_rejected_at_construction() {
-    // The fs knobs carry their own bounds for reasons the generic ones do not: an op-slot index shares the 24-bit
-    // `user_data` slot field, so an
-    // oversized `fs_ops` would truncate a completion token rather than fail;
-    // and the offload floor spawns eagerly on the reactor thread, so an absurd value is a thread storm at first use.
-    // Both must fail here, at construction, where the message still names the knob.
+    // The fs knobs have bounds of their own. An op-slot index shares the 24-bit `user_data` slot field, so an oversized
+    // `fs_ops` would truncate a completion token, and the offload floor spawns eagerly on the reactor thread, so an
+    // absurd value is a thread storm at first use.
     use truenas_ros::net::server::Listen;
     let one = || {
         vec![Listen::from(ServerAddr::Tcp(
@@ -257,10 +254,9 @@ fn server_config_fs_pool_bounds_are_rejected_at_construction() {
     );
 }
 
-/// `Response::ReplyFile` on a server built WITHOUT an fs pool must refuse loudly - close before any reply byte - never
-/// send the head and then a body it has no reactor to read. The `File` comes from a standalone `UringFs` host: an open
-/// fd is host-independent, which is exactly the misconfiguration shape (files wired over from one reactor into a server
-/// missing `fs_ops`).
+/// `Response::ReplyFile` on a server with no fs pool must close before any reply byte, never send the head and then a
+/// body it has no reactor to read. The `File` comes from a standalone `UringFs` host, since an open fd works across
+/// hosts, which is the misconfiguration this guards.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn file_reply_without_an_fs_pool_sheds_loudly() {
@@ -351,12 +347,9 @@ fn file_reply_without_an_fs_pool_sheds_loudly() {
 
 #[test]
 fn tcp_deferred_worker_completes_with_nothing() {
-    // `Deferred::reply` with an EMPTY body is the one-way case: the worker finished, there is nothing to send, and the
-    // request must simply be retired. It travels as its own outcome rather than as an empty reply, because a queued
-    // reply has its in-flight count retired when the send flushes and here no send will ever happen - so the count is
-    // dropped where the outcome lands instead. Get that wrong and the connection keeps a phantom request forever, which
-    // the request cap would eventually stall on. Proven by continuing to serve afterwards: a leaked count would still
-    // be outstanding.
+    // `Deferred::reply` with an empty body retires the request with nothing to send. No send will flush, so the
+    // in-flight count must be dropped where the outcome lands, or the connection keeps a phantom request that the
+    // request cap stalls on. Serving afterwards proves no count leaked.
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
@@ -411,10 +404,8 @@ fn tcp_deferred_worker_completes_with_nothing() {
 
 #[test]
 fn tcp_push_close_after_the_peer_is_gone_is_inert() {
-    // A `PushHandle` outlives the connection it names - that is the point of a long-lived handle - so a `close` can
-    // always arrive after the peer has already vanished, or after the slot has been recycled onto somebody else. It
-    // must be inert rather than tearing down whoever holds the slot now. Here the subscriber disconnects, a second
-    // client takes its place, and only then does the stale handle fire.
+    // A `PushHandle` outlives its connection, so a `close` can arrive after the peer is gone and its slot is recycled.
+    // It must be inert rather than tear down whoever holds the slot now.
     use std::sync::Mutex;
     let stash: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -476,11 +467,9 @@ fn tcp_push_close_after_the_peer_is_gone_is_inert() {
 
 #[test]
 fn tcp_push_close_during_a_detach_window_lands_at_resume() {
-    // A `PushHandle::close` arriving while the connection is parked under a detach worker cannot act immediately: the
-    // worker owns the raw stream, so writing the queued farewell or tearing the socket down would corrupt its transfer.
-    // It is recorded and enacted at resume - after the pushes held during the same window, which ride ahead of it. So
-    // the client must see every held push, in order, and *then* EOF, with the close attributed to the push side rather
-    // than to the worker.
+    // A `PushHandle::close` that arrives while a detach worker owns the raw stream cannot act at once, since writing or
+    // tearing down would corrupt the worker's transfer. It is enacted at resume, after the pushes held in the same
+    // window, so the client sees every held push in order and then EOF, with the close reported as the push side's.
     use std::sync::Mutex;
     use std::sync::mpsc;
     let push_slot: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
@@ -570,10 +559,9 @@ fn tcp_push_close_during_a_detach_window_lands_at_resume() {
 
 #[test]
 fn tcp_push_close_kicks_subscriber() {
-    // `PushHandle::close`: a connection is ended from outside its own request cycle (session revocation / admin kick).
-    // A farewell pushed just before the close flushes first; a push after it is dropped (nothing follows the farewell);
-    // repeat closes are no-ops; and the kicked connection's close hook reports PushClosed while other connections keep
-    // serving.
+    // `PushHandle::close` ends a connection from outside its request cycle. A farewell pushed just before it flushes
+    // first, a push after it is dropped, repeat closes do nothing, the close hook reports `PushClosed`, and other
+    // connections keep serving.
     use std::sync::Mutex;
     let sub_handle: Arc<Mutex<Option<PushHandle>>> = Arc::new(Mutex::new(None));
     let reasons = Arc::new(Mutex::new(Vec::new()));
@@ -636,7 +624,6 @@ fn tcp_push_close_kicks_subscriber() {
             sub.read_to_end(&mut rest)?;
             assert!(rest.is_empty(), "bytes after the farewell: {rest:?}");
 
-            // The admin connection is untouched by the kick.
             send_framed(&mut admin, b"ping")?;
             assert_eq!(recv_framed(&mut admin)?, b"ping");
             Ok(())
@@ -691,7 +678,6 @@ fn tcp_stats_counts() {
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         (|| -> io::Result<()> {
-            // Two connections; three requests total, one deferred.
             let mut a = connect_tcp(v4)?;
             send_framed(&mut a, b"one")?;
             assert_eq!(recv_framed(&mut a)?, b"one");

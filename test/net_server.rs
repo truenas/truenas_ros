@@ -78,9 +78,8 @@ fn echo(_header: &[u8], body: &[u8], _peer: &ClientAddr) -> Option<Vec<u8>> {
     Some(echo_frame(body))
 }
 
-/// Consumer-side LSP framer: `Framing::More` until the `\r\n\r\n` header terminator, then parse the `Content-Length`
-/// body length. This is the kind of variable-length-header framer a caller writes - the server ships no such
-/// protocol-specific (text) parser.
+/// An LSP framer that returns `Framing::More` until the `\r\n\r\n` header terminator, then parses the `Content-Length`
+/// body length.
 fn lsp_header(buf: &[u8], _state: &mut ()) -> Framing {
     let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
         return Framing::More;

@@ -3,9 +3,7 @@ use super::*;
 #[cfg(feature = "uring-fs")]
 #[test]
 fn server_builds_with_fs_pool() {
-    // A server with `fs_ops` set drives an fs reactor on the same ring, its op table sized `fs_ops + pool_size`. Open
-    // files are plain raw fds, not registered-table slots, so the connection pool stays `pool_size`. Constructing it
-    // exercises that path on a real ring; a plain echo still serves over the same ring.
+    // A server with `fs_ops` set drives an fs reactor on the same ring, and a plain echo still serves over it.
     let cfg = ServerConfig {
         pool_size: 16,
         fs_ops: 16,
@@ -34,14 +32,12 @@ fn server_builds_with_fs_pool() {
 
 /// A graceful drain waits for a task, and stops as soon as it retires.
 ///
-/// The wait is deliberate - a task outlives the connection that spawned it - but the quiescence test has to be re-read
-/// somewhere the gauge falling can reach, or the drain sits out its whole grace period and leaves through the
-/// `Deadline` hard stop instead. The grace here is long and the task is short, so the two outcomes are seconds apart.
+/// The drain must re-read quiescence where the task gauge falling can reach it, or it sits out its grace and leaves
+/// through the `Deadline` hard stop.
 ///
-/// **Bounded on both sides, because both failures are silent.** The upper bound catches a drain that hangs to its
-/// deadline. The lower one catches the opposite and worse mutation - a drain that stops ignoring tasks altogether,
-/// dropping their work on the floor - which on a `SIGTERM` with a long grace looks exactly like a clean shutdown.
-/// Without it, discarding the task gauge entirely leaves this test green.
+/// **Bounded on both sides, because both failures are silent.** The upper bound catches a drain that runs to its
+/// deadline. The lower one catches a drain that ignores tasks and drops their work, which on a `SIGTERM` looks like a
+/// clean shutdown.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_graceful_drain_ends_when_its_last_task_retires() {
@@ -107,10 +103,9 @@ fn a_graceful_drain_ends_when_its_last_task_retires() {
     );
 }
 
-/// The M4 headline: a static-file server. Each request names a file; the body handler opens it on the server's own ring
-/// under a per-connection [`Personality`], reads it, and replies with its contents - all inline on the loop thread via
-/// `Request::fs` and the `Deferred` reuse (open -> read -> reply, no worker thread, no blocking the ring). Two requests
-/// on one keep-alive connection prove the fixed-file slot is opened and freed per request rather than leaked.
+/// A static-file server. The handler opens each named file on the server's own ring under a [`Personality`], reads it
+/// and replies, all inline on the loop thread through `Request::fs` and its `Deferred`. Two requests on one keep-alive
+/// connection prove each file is opened and closed per request rather than leaked.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_static_file_server_open_read_reply() {
@@ -158,7 +153,7 @@ fn fs_static_file_server_open_read_reply() {
                 0,
                 RwFlags::empty(),
                 move |done, fs| {
-                    fs.close(file); // fire-and-forget: free the slot
+                    fs.close(file); // fire-and-forget
                     match done.result() {
                         Ok(n) => {
                             let mut buf = done.into_bufs().pop().unwrap_or_default();
@@ -196,7 +191,6 @@ fn fs_static_file_server_open_read_reply() {
     let client = thread::spawn(move || -> io::Result<(Vec<u8>, Vec<u8>)> {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
         let mut s = connect_tcp(v4)?;
-        // Two files on ONE keep-alive connection: proves per-request open/close.
         send_framed(&mut s, b"hello.txt")?;
         let first = recv_framed(&mut s)?;
         send_framed(&mut s, b"second.txt")?;
@@ -211,11 +205,9 @@ fn fs_static_file_server_open_read_reply() {
     assert_eq!(second, b"the second file");
 }
 
-/// A directory listing replies through the wake drain. The handler lists on the ring via `open_dir`/`next_batch`, both
-/// delivered by off-loop worker jobs that poke the wake, and answers with the entry count via its `Deferred`.
-/// The reply only arrives if `on_wake` drains the fs offload pool; without that drain the completion is stranded, the
-/// request never answers, and the client read times out. The socket read timeout makes that regression a failure rather
-/// than a hang.
+/// A directory listing replies through the wake drain. `open_dir` and `next_batch` complete from off-loop worker jobs
+/// that poke the wake, so the reply arrives only if `on_wake` drains the fs offload pool. The socket read timeout turns
+/// a missing drain into a failure rather than a hang.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_dir_listing_replies_through_the_wake_drain() {
@@ -370,9 +362,7 @@ fn a_servers_lookup_lane_takes_its_bounds_from_the_config() {
     assert_eq!(reply, b"one at a time", "the lane kept to one thread");
 }
 
-/// `FsConn::flistxattr` enumerates a file's xattr names on-loop: it opens the file on the ring, offloads the
-/// `flistxattr` to the pool, and delivers the names on the loop, answered via `Deferred` (same drain path as the
-/// listing).
+/// `FsConn::flistxattr` opens the file on the ring, offloads the `flistxattr` and delivers the names on the loop.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_conn_flistxattr_lists_file_xattrs() {
@@ -384,10 +374,9 @@ fn fs_conn_flistxattr_lists_file_xattrs() {
     let dir = truenas_ros::tempdir().unwrap();
     let fp = dir.path().join("f.txt");
     std::fs::write(&fp, b"x").unwrap();
-    // Seed two user xattrs with a plain syscall (independent of fd-xattr support, which only gates the ring read/write
-    // ops). Through `set_user_xattr`, which holds the refusal to `TRUENAS_ROS_REQUIRE_XATTRS`: every assertion below is
-    // behind this probe, so a hand-rolled `libc::setxattr` with a silent `return` reports ok having tested nothing on a
-    // filesystem without xattrs.
+    // Seed with a plain syscall, independent of fd-xattr support. Use `set_user_xattr`, not a hand-rolled
+    // `libc::setxattr`, since it holds the refusal to `TRUENAS_ROS_REQUIRE_XATTRS` and a silent return would pass
+    // having tested nothing.
     if !set_user_xattr(&fp, b"user.a", b"1") || !set_user_xattr(&fp, b"user.b", b"22") {
         return; // this fs refuses user xattrs
     }
@@ -464,10 +453,9 @@ fn fs_conn_flistxattr_lists_file_xattrs() {
     assert!(text.contains("user.b"), "flistxattr listed user.b: {text:?}");
 }
 
-/// `FsConn::fstatfs`/`fstatfs_anchor` answer on-loop: each offloads to the pool (io_uring has no statfs opcode) and
-/// delivers through the completion sink. Both name the same filesystem, so their answers must agree - and the anchor
-/// form proves an `O_PATH` descriptor is accepted, which is what lets a caller ask a whole tree's capacity without
-/// opening anything inside it.
+/// `FsConn::fstatfs` and `fstatfs_anchor` offload to the pool, since io_uring has no statfs opcode, and deliver through
+/// the completion sink. Both name one filesystem, so they must agree, and the anchor form proves an `O_PATH` descriptor
+/// is accepted.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_conn_fstatfs_agrees_from_file_and_anchor() {
@@ -495,8 +483,6 @@ fn fs_conn_fstatfs_agrees_from_file_and_anchor() {
         let who = *pc.get().expect("personality set before serving");
         let anchor = anchor.clone();
         let how = OpenHow::new().flags(OFlag::O_RDONLY);
-        // `open` first, then the offloads chain behind it - the chain is what this test is about. (Every facade can
-        // open, an offload-delivery continuation's included; the gate that once said otherwise is gone.)
         fs.open(who, &anchor.clone(), c"f.txt", how, move |done, fs| {
             let Some(file) = done.file() else {
                 return deferred.reply(echo_frame(format!("OPEN {:?}", done.result()).as_bytes()));
@@ -574,12 +560,10 @@ fn fs_conn_fstatfs_agrees_from_file_and_anchor() {
     );
 }
 
-/// `FsConn::fget_zfs_attrs`/`fset_zfs_attrs` on-loop: read the mask, set `IMMUTABLE`, read it back, and restore - each
-/// hop an offload delivered through the completion sink.
+/// `FsConn::fget_zfs_attrs` and `fset_zfs_attrs` on the loop read the mask, set `IMMUTABLE`, read it back and restore,
+/// each hop an offload delivered through the completion sink.
 ///
-/// Needs a real ZFS dataset; on tmpfs the ioctl is `ENOTTY`. Resolved the way `test/zfs.rs` does, and skipped loudly
-/// under `TRUENAS_ROS_REQUIRE_ZFS` so a runner that stopped provisioning one goes red rather than reporting a green
-/// suite that exercised nothing.
+/// Needs a real ZFS dataset, since on tmpfs the ioctl is `ENOTTY`, and skips loudly under `TRUENAS_ROS_REQUIRE_ZFS`.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_conn_zfs_attrs_round_trip_through_the_pool() {
@@ -705,10 +689,9 @@ fn fs_conn_zfs_attrs_round_trip_through_the_pool() {
     assert_eq!(text, "locked-then-restored", "round trip through the pool");
 }
 
-/// The batched-blocking-offload consumer shape, end to end: the credential-checked open runs on the ring as a
-/// personality-stamped SQE, then ONE `FsConn::offload_result` job runs the whole blocking metadata tail - `statx` plus
-/// two xattr reads on the already-authorized fd (`File` is `AsFd`) - and the delivery arrives through the wake path's
-/// `drain_fs_offloads` on an owner-scoped continuation facade.
+/// The credential-checked open runs on the ring under a personality, then one `FsConn::offload_result` job runs the
+/// whole blocking tail, a `statx` and two xattr reads on the authorized fd, and the result arrives through
+/// `drain_fs_offloads` on the wake path.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn fs_conn_offload_result_batches_statx_and_xattrs_in_one_job() {
@@ -820,13 +803,11 @@ fn get_xattr_raw(path: &Path, name: &std::ffi::CStr) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// `Server::set_privileged_xattrs` reaches the embedded reactor. With a policy allowing `trusted.test_`: a covered
-/// `fsetxattr` through the request facade lands (promoted to the reactor's own credentials), an **uncovered**
-/// `fremovexattr` stays `EPERM`, and a **covered** `fremovexattr` succeeds - the leg that bites, since that path is
-/// gated on the allowlist alone and fails `EPERM` under the default empty policy whether or not the caller is
-/// privileged. The `trusted.` namespace needs `CAP_SYS_ADMIN`: unprivileged, the covered write's refusal is itself the
-/// asserted property (the promotion escalates to the daemon's own identity, which has nothing to escalate to). The qemu
-/// lane runs as root and takes the full path.
+/// `Server::set_privileged_xattrs` reaches the embedded reactor. With `trusted.test_` allowed, a covered `fsetxattr`
+/// lands under the reactor's own credentials, an uncovered `fremovexattr` stays `EPERM`, and a covered `fremovexattr`
+/// succeeds. That last leg bites, since the remove path is gated on the allowlist alone and fails `EPERM` under the
+/// default empty policy even for a privileged caller. Unprivileged, the `trusted.` write is refused for want of
+/// `CAP_SYS_ADMIN`, and that refusal is the asserted property.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn server_privileged_xattr_policy_reaches_the_embedded_reactor() {

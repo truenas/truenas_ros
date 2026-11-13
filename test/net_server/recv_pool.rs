@@ -106,8 +106,7 @@ fn the_recv_pool_is_sized_by_its_config() {
 /// The property the pool exists for: a connection parked between requests holds no buffer, so buffer memory tracks
 /// concurrent *arrivals* and not the connection count.
 ///
-/// Measured with more idle connections than the pool starts with buffers - which an owned-buffer server would need one
-/// apiece for, and which a pool that held them across the idle gap would have to grow to cover.
+/// Measured with more idle connections than the pool starts with buffers.
 #[test]
 fn an_idle_pooled_connection_holds_no_buffer() {
     // Each buffer carries a chunk of slack, so the budget buys fewer than `BUDGET / BUF`, and `IDLE` connections
@@ -143,7 +142,6 @@ fn an_idle_pooled_connection_holds_no_buffer() {
 
     let coordinator = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone());
-        // Open them all, round-trip once each so each has certainly been served, then hold them open and idle.
         let mut held = Vec::new();
         for i in 0..IDLE {
             let mut s = connect_tcp(v4).expect("connect");
@@ -377,11 +375,10 @@ fn a_placed_body_never_takes_a_pool_buffer() {
 /// A burst of file bodies wider than the ring's current buffer count must grow the ring and serve every one - never
 /// shed.
 ///
-/// The kernel picks a provided buffer when the read completes, so a burst can always outrun what is posted and the
-/// shortage arrives as `-ENOBUFS` on the pump read's completion. Treating that as a read failure closes the connection
-/// mid-body; it is pressure, and the answer is to grow (or, if the pool cannot, to re-issue the read with an owned
-/// buffer). The barrier makes the burst genuinely simultaneous: every client fires its request in the same instant
-/// against a ring that starts with fewer buffers than their first reads want.
+/// The kernel picks a provided buffer when the read completes, so a burst can outrun what is posted and the shortage
+/// arrives as `-ENOBUFS` on the pump read's completion. That is pressure, not a failed read, so the ring grows, or the
+/// read is reissued with an owned buffer when it cannot. The barrier fires every request in the same instant against a
+/// ring that starts with fewer buffers than their first reads want.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_burst_of_file_bodies_grows_the_ring_instead_of_shedding() {
@@ -522,15 +519,13 @@ fn a_burst_of_file_bodies_grows_the_ring_instead_of_shedding() {
 
 /// A pump completion that closes the connection must still return its buffer to the ring.
 ///
-/// Every completion carrying `IORING_CQE_F_BUFFER` consumed its descriptor: the kernel puts the kbuf with no guard on
-/// the result (`io_req_rw_complete`, `io_uring/rw.c:591`), and an EOF read is the measured proof - it completes `res =
-/// 0` with the flag set and the ring's head advanced. So the truncated-body close (`n == 0`, the file shrank under a
-/// committed `Content-Length`) is a completion that both carries a buffer and abandons the transfer: exactly the exit
-/// class that must requeue. Skipping it strands the id - the pool still counts it posted, so it neither re-posts it nor
-/// grows to replace it - while `recv_bufs_lent` stays innocently at zero, and the ring drains one abandoned body at a
-/// time until every read comes back `-ENOBUFS`. The same duty holds on the racier exits of that class (a completion
-/// landing on a closing or recycled slot), which share this arm's fix but cannot be scheduled deterministically from a
-/// test; `rw.c:591` is the authority that they owe the id all the same.
+/// Every completion carrying `IORING_CQE_F_BUFFER` consumed its descriptor, since the kernel puts the kbuf with no
+/// guard on the result (`io_req_rw_complete`, `io_uring/rw.c:591`), and an EOF read completes `res = 0` with the flag
+/// set. The truncated-body close (`n == 0`, the file shrank under a committed `Content-Length`) carries a buffer and
+/// abandons the transfer, so it must requeue. Skipped, the id is stranded while `recv_bufs_lent` stays at zero, since
+/// the pool still counts it posted, and the ring drains one abandoned body at a time until every read is `-ENOBUFS`.
+/// The racier exits of that class, a completion on a closing or recycled slot, owe the id the same but cannot be
+/// scheduled from a test.
 #[cfg(feature = "uring-fs")]
 #[test]
 fn a_truncated_body_close_returns_its_buffer() {

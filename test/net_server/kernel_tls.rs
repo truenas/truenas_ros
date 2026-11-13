@@ -2,9 +2,8 @@ use super::*;
 
 #[test]
 fn ktls_echo_roundtrip() {
-    // End-to-end: a kTLS listener, the consumer's OpenSSL handshake worker, and a real TLS client. Requests/replies
-    // frame with the usual 4-byte prefix over the kernel-TLS transport; the server sees plaintext (kernel decrypts) and
-    // the framer is unchanged.
+    // A kTLS listener, the consumer's OpenSSL handshake worker and a real TLS client. The kernel decrypts, so the
+    // server sees plaintext and the framer is unchanged.
     use std::sync::Mutex;
     if ktls_openssl_unsupported() {
         return;
@@ -28,7 +27,6 @@ fn ktls_echo_roundtrip() {
         let acceptor = Arc::clone(&acceptor);
         let seen = Arc::clone(&seen_listener);
         server.set_tls_handshake(move |fd, inc, deferral| {
-            // The handshake handler is the kTLS per-listener policy hook.
             *seen.lock().unwrap() = Some(inc.listener_addr.clone());
             let acceptor = Arc::clone(&acceptor);
             thread::spawn(move || match ktls_server_handshake(fd, &acceptor) {
@@ -50,11 +48,8 @@ fn ktls_echo_roundtrip() {
                 send_framed(&mut s, msg)?;
                 assert_eq!(recv_framed(&mut s)?, msg, "kTLS echo mismatch");
             }
-            // A larger payload spanning multiple TLS records still frames. 512 KiB is above the default
-            // `recv_buffer_bytes`, so the body is *placed* - read into its own allocation rather than the pool buffer -
-            // which is the arm the kTLS continuation's bound has to follow.
-            // Well under the 1 MiB `max_request_bytes` a server advertises, so this is an ordinary message, not an
-            // edge.
+            // 512 KiB spans many records and exceeds the default `recv_buffer_bytes`, so the body is placed, the arm
+            // the kTLS continuation's bound has to follow.
             let big = vec![0x5au8; 512 * 1024];
             send_framed(&mut s, &big)?;
             assert_eq!(recv_framed(&mut s)?, big);
@@ -140,10 +135,9 @@ fn ktls_rejected_handshake_sheds() {
     );
 }
 
-/// A worker's `ready()` alone does not make a socket encrypted: the deferral reads the kernel's per-direction key state
-/// back (`getsockopt(SOL_TLS, TLS_TX/TLS_RX)`) and sheds a connection whose keys the kernel does not hold. Without the
-/// readback a hook that never ran a handshake - or a library that silently fell back to userspace records - has the
-/// server framing plaintext as TLS; this test's client speaks bare TCP and must be shed unanswered.
+/// A worker's `ready()` alone does not make a socket encrypted. The deferral reads the kernel's key state back
+/// (`getsockopt(SOL_TLS, TLS_TX/TLS_RX)`) and sheds a connection whose keys the kernel does not hold, so a hook that
+/// never ran a handshake cannot have plaintext framed as TLS.
 #[test]
 fn ktls_ready_without_kernel_keys_is_shed() {
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
@@ -197,12 +191,10 @@ fn ktls_ready_without_kernel_keys_is_shed() {
 
 /// A shutdown that lands while bytes are arriving must not abort.
 ///
-/// Stopping the reactor reaps outstanding completions rather than dispatching them, so a recv the kernel has already
-/// chosen a provided buffer for is drained without that buffer ever being adopted. Its descriptor is consumed and the
-/// connection is going away, which is correct - but it means the kernel's consumer head and this side's posted count
-/// legitimately disagree at teardown, and any drain-time equality check between them fires on an ordinary shutdown.
-/// `Server` drains from `Drop`, where a panic aborts the process rather than failing a test, so such a check costs a
-/// crash on a correct path.
+/// Stopping the reactor reaps outstanding completions rather than dispatching them, so a recv the kernel already chose
+/// a provided buffer for is drained without adopting it. The kernel's consumer head and this side's posted count then
+/// legitimately disagree at teardown, and `Server` drains from `Drop`, where a drain-time equality check between them
+/// would abort the process on a correct path.
 #[test]
 fn a_shutdown_amid_arrivals_tears_down_quietly() {
     let cfg = ServerConfig {
@@ -261,13 +253,12 @@ fn a_shutdown_amid_arrivals_tears_down_quietly() {
     assert!(s.replies >= 1, "the fixture was served: {s:?}");
 }
 
-/// Half a handshake is not a handshake: a socket the kernel keyed in only **one** direction passes the other
-/// direction's bytes in the clear, so `ready()` sheds it exactly as it sheds an unkeyed one.
+/// Half a handshake is not a handshake. A socket keyed in only **one** direction passes the other direction's bytes in
+/// the clear, so `ready()` sheds it as it sheds an unkeyed one.
 ///
-/// The unkeyed case cannot see this distinction. A predicate that ORs the two directions instead of ANDing them still
-/// refuses a socket with no keys at all - passing `ktls_ready_without_kernel_keys_is_shed` - while admitting this one,
-/// whose TX side is plaintext on the wire. The hook installs the RX key only, leaving `tx_conf` at `TLS_BASE`, which is
-/// the shape a handshake library with a TLS 1.3 RX/TX gap produces.
+/// A predicate that ORs the two directions instead of ANDing them still passes `ktls_ready_without_kernel_keys_is_shed`
+/// while admitting this one. The hook installs the RX key only, leaving `tx_conf` at `TLS_BASE`, the shape a handshake
+/// library with a TLS 1.3 RX/TX gap produces.
 #[test]
 fn ktls_ready_with_only_one_direction_keyed_is_shed() {
     const SOL_TLS: libc::c_int = 282;
@@ -383,11 +374,9 @@ fn ktls_ready_with_only_one_direction_keyed_is_shed() {
 
 #[test]
 fn ktls_handshake_timeout_sheds_parked_slot() {
-    // SECURITY: a kTLS connection whose handshake never completes (the consumer's worker never calls back) parks a pool
-    // slot - it holds a descriptor but has no in-flight recv/send, so neither idle_timeout nor request_timeout (both
-    // linked to a recv) can reach it. With `tls_handshake_timeout` set the park is bounded: the slot is shed. Here the
-    // handshake handler closes the furnished fd and *holds* the deferral (never resolving, so no reject-shed), leaving
-    // only the timeout to reclaim.
+    // A kTLS connection whose handshake never completes parks a slot with no recv or send in flight, so neither
+    // `idle_timeout` nor `request_timeout` reaches it, and `tls_handshake_timeout` must shed it. The handler closes the
+    // fd and holds the deferral unresolved, so only the timeout can reclaim the slot.
     let cfg = ServerConfig {
         tls_handshake_timeout: Some(Duration::from_millis(250)),
         pool_size: 4,
@@ -405,8 +394,6 @@ fn ktls_handshake_timeout_sheds_parked_slot() {
         Err(e) if should_skip(&e) || ktls_unsupported(&e) => return,
         Err(e) => panic!("bind: {e}"),
     };
-    // Buffer each deferral (never resolving it -> no reject-shed) and close the fd we won't use; the held deferrals are
-    // released when `keep_rx` drops.
     let (keep_tx, keep_rx) = std::sync::mpsc::channel();
     server.set_tls_handshake(move |fd, _inc, deferral| {
         // SAFETY: closing the furnished fd this handler owns and won't use.
@@ -421,8 +408,6 @@ fn ktls_handshake_timeout_sheds_parked_slot() {
 
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
-        // Connect (raw TCP); the server furnishes the fd and parks. We never handshake - the park timeout must shed
-        // each slot.
         let peers: Vec<_> = (0..3).map(|_| connect_tcp(v4).expect("connect")).collect();
         let t0 = Instant::now();
         while stats.snapshot().shed < 3 && t0.elapsed() < Duration::from_secs(3) {
@@ -518,15 +503,10 @@ fn ktls_close_notify_reports_tls_control() {
 
 /// A peer's TLS 1.3 KeyUpdate closes the connection as `TlsControl`, and the request behind it is not answered.
 ///
-/// `CloseReason::TlsControl` names this case outright - "a post-handshake handshake message, TLS 1.3 KeyUpdate, or
-/// alert ... renegotiation/rekey are out of scope" - but only the alert half had a test
-/// (`ktls_close_notify_reports_tls_control`). The two halves reach the same reason down different paths: an alert
-/// completes the parked idle read SHORT (`on_recv_complete`'s `res > 0 && ktls_control_record` arm), while a KeyUpdate
-/// arrives mid-conversation with a request queued behind it.
-///
-/// Measured, not assumed: this kernel does NOT absorb an RX KeyUpdate on the server's behalf, so the record does reach
-/// the reactor. Pinning that here means a kernel or policy change that starts handling rekey - or that reclassifies the
-/// record - goes red rather than silently altering what a long-lived peer sees.
+/// Unlike an alert, which completes the parked idle read short (`on_recv_complete`'s `ktls_control_record` arm), a
+/// KeyUpdate arrives mid-conversation with a request queued behind it. The kernel does not absorb an RX KeyUpdate for
+/// the server, so the record reaches the reactor, and a change that starts handling rekey or reclassifies the record
+/// goes red here.
 #[test]
 fn ktls_peer_key_update_closes_as_tls_control() {
     use foreign_types::ForeignTypeRef;
@@ -624,14 +604,10 @@ fn ktls_peer_key_update_closes_as_tls_control() {
 
 /// SECURITY: a kTLS body splice with no `request_timeout` is refused.
 ///
-/// That clock is the **only** bound one has. `tls_sw_splice_read` blocks an io-wq worker awaiting the next TLS record,
-/// which no linked timeout can reach - the kernel arms one only after the head op's `issue()` returns, and a blocking
-/// splice's does not return until it completes - so the standalone watchdog keyed on `request_timeout` is the whole
-/// mechanism. Unset, a peer that handshakes, declares a large body and goes silent holds its slot, an io-wq worker and
-/// its destination pipe's mutex indefinitely, immune to every other timeout.
-///
-/// Plain TCP is deliberately not refused: its `-EAGAIN` readiness-poll path is already clocked. The second half of this
-/// test is that denominator.
+/// That clock is the **only** bound one has, since `tls_sw_splice_read` blocks an io-wq worker that no linked timeout
+/// can reach, the kernel arming one only after the head op's `issue()` returns. Unset, a silent peer holds its slot, an
+/// io-wq worker and its pipe's mutex indefinitely. Plain TCP is not refused, since its `-EAGAIN` readiness-poll path is
+/// already clocked, and `tcp_splice_body_recv` splices there with no `request_timeout`.
 #[test]
 fn ktls_splice_body_without_a_clock_is_refused() {
     use std::sync::Mutex;
@@ -720,16 +696,10 @@ fn ktls_splice_body_without_a_clock_is_refused() {
 
 #[test]
 fn tcp_splice_body_over_ktls() {
-    // A body splices zero-copy off a SOFTWARE kTLS socket, in the clear: the kernel routes the splice through
-    // `tls_sw_splice_read`, which decrypts.
-    //
-    // The subtle case this pins down is the recvmsg->splice handoff. kTLS decrypts a whole TLS record at a time, so
-    // when the 5-byte header read lands inside a record that also carries body bytes, the kernel decrypts the entire
-    // record, hands us 5 bytes, and stashes the record's ~16 KiB plaintext remainder (all body) in its receive list;
-    // the splice must pick that up before pulling the next record or it would silently truncate.
-    //
-    // Force the straddle: the client writes header+body as ONE buffer, so TLS record 1 = [5-byte header][~16 KiB body
-    // prefix]. A bounded reader asserts the FULL body arrives, in order.
+    // A body splices zero-copy off a software kTLS socket in the clear, since `tls_sw_splice_read` decrypts. A 5-byte
+    // header read inside a record that also carries body leaves the record's plaintext remainder in the kernel's
+    // receive list, and the splice must take it before the next record or it truncates, so the client writes header and
+    // body as one buffer.
     if ktls_openssl_unsupported() {
         return;
     }
@@ -746,9 +716,7 @@ fn tcp_splice_body_over_ktls() {
         header: splice_header(pipe_wr),
         body: |req: Request<'_, ()>| Response::Reply(echo_frame(&req.body)),
     };
-    // `request_timeout` is not optional for a kTLS splice: it is the only clock that reaches one, so a server without
-    // it refuses the body (`CloseReason::SpliceUnbounded`). Generous here - nothing in this test stalls, and the
-    // sibling stall tests are where the value matters.
+    // Required for a kTLS splice (`CloseReason::SpliceUnbounded`), and generous, since nothing here stalls.
     let cfg = ServerConfig {
         request_timeout: Some(Duration::from_secs(10)),
         ..ServerConfig::default()
@@ -847,10 +815,9 @@ fn tcp_splice_body_over_ktls() {
 
 #[test]
 fn ktls_splice_body_slow_but_progressing_survives() {
-    // The other half of the watchdog contract (the race the standalone-timeout design must NOT lose): a kTLS splice
-    // that keeps making progress - even slowly, spanning several `request_timeout` periods - must run to completion.
-    // The watchdog re-arms on progress (`splice_remaining` fell below its watermark) and only cancels on a full period
-    // of ZERO progress, so a steadily-fed transfer is never mistaken for a stall.
+    // A kTLS splice that keeps making progress, however slowly and across several `request_timeout` periods, must run
+    // to completion. The watchdog re-arms whenever `splice_remaining` falls below its watermark and cancels only on a
+    // full period with no progress.
     use std::sync::Mutex;
     if ktls_openssl_unsupported() {
         return;
@@ -975,13 +942,9 @@ fn ktls_splice_body_slow_but_progressing_survives() {
 
 #[test]
 fn ktls_splice_body_stall_reclaimed() {
-    // SECURITY (slow-loris, kTLS splice): `tls_sw_splice_read` blocks an io-wq worker waiting for the next TLS record -
-    // it honors only SPLICE_F_NONBLOCK (which the server must not set) and, unlike `tcp_splice_read`, never the
-    // socket's O_NONBLOCK - so the plain-TCP EAGAIN -> readiness-poll path that carries the request clock NEVER runs
-    // for kTLS. The clock is therefore linked to the kTLS splice itself: a peer that completes the handshake, sends a
-    // SpliceBody header, and then goes silent must be reclaimed by `request_timeout` - not pin its pool slot plus a
-    // kernel io-wq thread until full shutdown (pool_size such clients would deny all service, immune to every other
-    // timeout).
+    // `tls_sw_splice_read` honors only `SPLICE_F_NONBLOCK`, not the socket's O_NONBLOCK as `tcp_splice_read` does, so
+    // the readiness-poll path that carries the request clock never runs and the clock is linked to the kTLS splice
+    // itself. A peer that sends a `SpliceBody` header and goes silent must be reclaimed by `request_timeout`.
     use std::sync::Mutex;
     if ktls_openssl_unsupported() {
         return;
