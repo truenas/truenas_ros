@@ -195,15 +195,29 @@ pub(crate) struct BodyPool {
     #[cfg(feature = "net-server")]
     shared: Option<Arc<LoopShared>>,
     /// `ServerConfig::held_cap`, past which the ring holds back the read
-    /// of the next placed body.
+    /// of the next placed body and the consumer's own calls.
     cap: Option<usize>,
-    /// The mark of the server's held hook (`Server::set_held_hook`).
-    mark: Option<usize>,
-    /// Whether `held` has been seen at or past the mark since the hook
-    /// last ran, after a rise through `hold` or `take_out` or as the
-    /// consumer reads it, and cleared as the hook runs. A rise through a
-    /// hand-off alone is not seen, since it happens away from the loop.
-    crossed: bool,
+    /// What the ring holds back for its held bytes to fall under the cap,
+    /// the reads of placed bodies and the consumer's turns, in the order
+    /// they came, so that neither keeps the other back for good. Here and
+    /// not in the reactor, since the consumer's [`BodyRecycler`] reaches
+    /// the pool alone.
+    #[cfg(feature = "net-server")]
+    held_back: std::collections::VecDeque<HeldBack>,
+}
+
+/// One thing the ring holds back for its held bytes, in
+/// [`BodyPool`]'s queue.
+#[cfg(feature = "net-server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeldBack {
+    /// The read of the placed body of the connection in `slot`, while that
+    /// slot is of `generation`. `Connection::read_held` keeps a connection
+    /// here once, and an entry whose slot has moved on is passed over.
+    Read { slot: u32, generation: u64 },
+    /// A turn the consumer queued ([`BodyRecycler::queue_turn`]), for
+    /// which the server runs its held hook once.
+    Turn,
 }
 
 impl BodyPool {
@@ -221,44 +235,44 @@ impl BodyPool {
             #[cfg(feature = "net-server")]
             shared: None,
             cap,
-            mark: None,
-            crossed: false,
+            #[cfg(feature = "net-server")]
+            held_back: std::collections::VecDeque::new(),
         }
     }
 
-    /// The bytes held, noting that the hook is owed a run once they fall
-    /// if they are at or past its mark. One read serves both, so a count
-    /// at the mark that the consumer is shown is always noted.
-    fn noted(&mut self) -> usize {
-        let held = self.held();
-        if self.mark.is_some_and(|mark| held >= mark) {
-            self.crossed = true;
-        }
-        held
-    }
-
-    /// Set the mark the held hook runs under, owing it a run at once if
-    /// `held` is at or past it already.
-    pub(crate) fn set_mark(&mut self, mark: usize) {
-        self.mark = Some(mark);
-        self.crossed = self.held() >= mark;
-    }
-
-    /// Whether the held hook is owed a run, `held` having been at or past
-    /// its mark and being under it now, which clears the debt.
-    pub(crate) fn hook_due(&mut self) -> bool {
-        let due =
-            self.crossed && self.mark.is_some_and(|mark| self.held() < mark);
-        if due {
-            self.crossed = false;
-        }
-        due
-    }
-
-    /// Whether the bytes held are at or past the cap, so that the read of
-    /// the next placed body waits.
+    /// Whether the bytes held are at or past the cap, so that what the ring
+    /// holds back waits.
     pub(crate) fn at_cap(&self) -> bool {
         self.cap.is_some_and(|cap| self.held() >= cap)
+    }
+
+    /// Whether a placed body read or a call of the consumer's may go now,
+    /// the bytes held under the cap with nothing held back before it.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn may_go(&self) -> bool {
+        !self.at_cap() && self.held_back.is_empty()
+    }
+
+    /// Hold `what` back behind what is held back already.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn hold_back(&mut self, what: HeldBack) {
+        self.held_back.push_back(what);
+    }
+
+    /// The first thing held back, taken off the queue, if the bytes held
+    /// are under the cap so that it goes on.
+    #[cfg(feature = "net-server")]
+    pub(crate) fn let_go(&mut self) -> Option<HeldBack> {
+        if self.at_cap() {
+            return None;
+        }
+        self.held_back.pop_front()
+    }
+
+    /// What is held back, in the order it came.
+    #[cfg(all(test, not(loom), feature = "net-server"))]
+    pub(crate) fn held_back(&self) -> Vec<HeldBack> {
+        self.held_back.iter().copied().collect()
     }
 
     /// Count the replies handed to the ring's loop through `shared` from
@@ -290,7 +304,6 @@ impl BodyPool {
     /// Put storage the reactor now holds on the count.
     pub(crate) fn hold(&mut self, bytes: usize) {
         self.ring_held = self.ring_held.saturating_add(bytes);
-        self.noted();
     }
 
     /// Take storage the reactor no longer holds off the count.
@@ -558,7 +571,6 @@ impl BodyRecycler {
     pub fn take_out(&self, bytes: usize) {
         let mut p = self.pool.borrow_mut();
         p.out_held = p.out_held.saturating_add(bytes);
-        p.noted();
     }
 
     /// Take `bytes` the consumer counted with
@@ -576,14 +588,30 @@ impl BodyRecycler {
     /// when they are queued, and replies sent with
     /// `Deferred::reply_recycled` from that call, each until it is sent or
     /// dropped and by capacity. The consumer's own figure is added to that.
-    ///
-    /// A count this shows at or past the mark of the held hook owes the
-    /// hook a run once the count falls under it
-    /// (`Server::set_held_hook`), since a consumer that waits on what this
-    /// showed it hears of the fall from the hook alone, and a rise through
-    /// a hand-off is seen nowhere else.
     pub fn held(&self) -> usize {
-        self.pool.borrow_mut().noted()
+        self.pool.borrow().held()
+    }
+
+    /// Whether a call of the consumer's that holds storage of the pool may
+    /// go now, the bytes [`held`](Self::held) under
+    /// [`held_cap`](crate::net::server::ServerConfig::held_cap) with nothing
+    /// held back, neither a placed body read nor a turn. A call that may
+    /// not waits on a turn ([`queue_turn`](Self::queue_turn)), or answers
+    /// in place of waiting with no turn left over. With no cap, every call
+    /// may go.
+    #[cfg(feature = "net-server")]
+    pub fn may_go(&self) -> bool {
+        self.pool.borrow().may_go()
+    }
+
+    /// Queue a turn behind what the ring holds back, the placed body reads
+    /// and the turns queued before it, for which the server runs its held
+    /// hook once (`Server::set_held_hook`) as its loop reaches the turn
+    /// with the bytes held under the cap. The hook never runs inside this
+    /// call.
+    #[cfg(feature = "net-server")]
+    pub fn queue_turn(&self) {
+        self.pool.borrow_mut().hold_back(HeldBack::Turn);
     }
 }
 
@@ -970,29 +998,33 @@ mod tests {
         assert_eq!(r.held(), MIB, "giving back past the figure stops at 0");
     }
 
-    /// The hook is owed a run for each fall under its mark that a rise to
-    /// it came before, a mark set over held bytes included, and for no
-    /// other change.
+    /// A call may go only under the cap with nothing held back, and what is
+    /// held back goes in the order it came, only under the cap. With no cap
+    /// everything may go.
+    #[cfg(feature = "net-server")]
     #[test]
-    fn the_hook_is_owed_one_run_for_each_fall_under_its_mark() {
-        let mut p = BodyPool::new(64 * MIB, None);
-        p.set_mark(100);
-        assert!(!p.hook_due(), "nothing has risen");
+    fn a_call_may_go_only_under_the_cap_with_nothing_held_back() {
+        let mut p = BodyPool::new(64 * MIB, Some(100));
+        assert!(p.may_go(), "under the cap with nothing held back");
         p.hold(100);
-        assert!(!p.hook_due(), "at the mark is not under it");
+        assert!(!p.may_go(), "at the cap");
+        let read = HeldBack::Read {
+            slot: 3,
+            generation: 7,
+        };
+        p.hold_back(read);
+        p.hold_back(HeldBack::Turn);
+        assert_eq!(p.let_go(), None, "nothing goes at the cap");
         p.unhold(100);
-        assert!(p.hook_due(), "a fall under the mark");
-        assert!(!p.hook_due(), "is owed one run");
-        p.hold(50);
-        p.unhold(50);
-        assert!(!p.hook_due(), "a rise short of the mark owes nothing");
-        p.hold(200);
-        p.set_mark(150);
-        p.unhold(200);
-        assert!(
-            p.hook_due(),
-            "a mark set over held bytes is owed their fall"
-        );
+        assert!(!p.may_go(), "under the cap, behind what is held back");
+        assert_eq!(p.let_go(), Some(read), "in the order it came");
+        assert!(!p.may_go(), "a turn is held back too");
+        assert_eq!(p.let_go(), Some(HeldBack::Turn));
+        assert_eq!(p.let_go(), None);
+        assert!(p.may_go());
+        let mut free = BodyPool::new(64 * MIB, None);
+        free.hold(u32::MAX as usize);
+        assert!(free.may_go(), "with no cap everything goes");
     }
 
     /// A miss does not license retention across observation windows: a

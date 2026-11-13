@@ -9,6 +9,7 @@ use super::Server;
 use super::handles::{Detached, Responder};
 use crate::errno::{self, Errno};
 use crate::fd::owned_from_raw;
+use crate::net::core::bodypool::HeldBack;
 #[cfg(feature = "uring-fs")]
 use crate::net::core::conn::PendingFile;
 use crate::net::core::conn::{Op, pack};
@@ -164,23 +165,32 @@ where
         self.pump(slot, generation)
     }
 
-    /// Let placed body reads held back by `ServerConfig::held_cap` go on, in
-    /// the order they were held, while the ring holds less than the cap.
-    /// Checked again after each, since each claims its body, so the ring
-    /// passes the cap by one body at most. A stale entry (the connection
-    /// closed, or its slot was recycled) is discarded on the way past.
+    /// Let what `ServerConfig::held_cap` holds back go on, the placed body
+    /// reads and the consumer's turns, in the order they came, while the
+    /// ring holds less than the cap. Checked again after each, since a read
+    /// claims its body and the held hook takes out what it lets go for a
+    /// turn, so the ring passes the cap by one at most. A stale read (the
+    /// connection closed, or its slot was recycled) is passed over. The
+    /// hook runs with no borrow of the pool, which it reaches itself.
     pub(super) fn redrive_held_reads(&mut self) -> errno::Result<()> {
-        while let Some(&(slot, gen64)) = self.core.held_reads.front() {
-            if self.core.stopping()
-                || self
-                    .core
-                    .body_pool
-                    .as_ref()
-                    .is_some_and(|p| p.borrow().at_cap())
-            {
+        loop {
+            if self.core.stopping() {
                 return Ok(());
             }
-            self.core.held_reads.pop_front();
+            let next = match self.core.body_pool.as_ref() {
+                Some(pool) => pool.borrow_mut().let_go(),
+                None => None,
+            };
+            let (slot, gen64) = match next {
+                None => return Ok(()),
+                Some(HeldBack::Turn) => {
+                    if let Some(hook) = self.handlers.held.as_mut() {
+                        hook();
+                    }
+                    continue;
+                }
+                Some(HeldBack::Read { slot, generation }) => (slot, generation),
+            };
             if self.core.table.generation(slot) != gen64 {
                 continue; // slot recycled under the wait
             }
@@ -195,7 +205,6 @@ where
             self.core.held_turn = None;
             pumped?;
         }
-        Ok(())
     }
 
     /// A body splice completed (`Op::SpliceRecv`). All the completion

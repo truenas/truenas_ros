@@ -1078,10 +1078,10 @@ pub(crate) struct Connection<U> {
     /// [`Connection::splice_deadline_owed`], which this mirrors exactly.
     #[cfg(feature = "net-server")]
     pub receipt_deadline_owed: u32,
-    /// The read of this connection's placed body waits in the reactor's
-    /// `held_reads` for the ring's held bytes to fall under
-    /// `ServerConfig::held_cap`. The list's dedup key, set as the read is
-    /// held and cleared as it is taken off the list, and nowhere else.
+    /// The read of this connection's placed body waits in the body pool's
+    /// queue of what is held back for the ring's held bytes to fall under
+    /// `ServerConfig::held_cap`. The queue's dedup key, set as the read is
+    /// held and cleared as it is taken off the queue, and nowhere else.
     #[cfg(feature = "net-server")]
     pub(crate) read_held: bool,
     // A push overflowed `max_send_backlog` while the connection was detached

@@ -14260,180 +14260,6 @@ fn a_deferred_recycled_reply_counts_from_its_hand_off() {
     assert_eq!(recycler.held(), 0, "and nothing once the ring is idle");
 }
 
-/// A reply handed off under the held hook's mark by less than its own size
-/// owes the hook nothing as the loop queues it, since the count has it once
-/// there, nor as it is sent.
-#[test]
-fn a_handed_reply_queued_under_the_mark_owes_the_hook_nothing() {
-    use std::cell::{Cell, OnceCell};
-    use std::rc::Rc;
-    use truenas_ros::net::server::BodyRecycler;
-
-    const MARK: usize = 256 * 1024;
-    const ROOM: usize = 64 * 1024;
-    let seam: Rc<OnceCell<BodyRecycler>> = Rc::new(OnceCell::new());
-    let runs = Rc::new(Cell::new(0u8));
-    // What the handler takes out, so the count once the reply is sent.
-    let h_out = Rc::new(Cell::new(0usize));
-    let (h_seam, h_runs) = (Rc::clone(&seam), Rc::clone(&runs));
-    let proto = Protocol {
-        accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
-        body: move |req: Request<'_, ()>| {
-            let r = h_seam.get().expect("filled before serving");
-            if &*req.body != b"near" {
-                // The hook's runs, and whether the reply has left the count.
-                let sent = u8::from(r.held() == h_out.get());
-                return Response::Reply(echo_frame(&[h_runs.get(), sent]));
-            }
-            let mut reply = r.claim(ROOM);
-            reply.extend_from_slice(&echo_frame(b"sent"));
-            let room = reply.capacity();
-            // Under the mark by half the reply once it is handed off, and
-            // past it if the reply were counted twice.
-            h_out.set(MARK - room - room / 2);
-            r.take_out(h_out.get());
-            let (deferred, permit) = req.responder.defer();
-            deferred.reply_recycled(reply);
-            Response::Defer(permit)
-        },
-    };
-    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server =
-        match Server::with_config([addr], ServerConfig::default(), proto) {
-            Ok(s) => s,
-            Err(e) if should_skip(&e) => return,
-            Err(e) => panic!("bind: {e}"),
-        };
-    let recycler = server.body_recycler().expect("a server keeps a body pool");
-    seam.set(recycler).unwrap_or_else(|_| panic!("set once"));
-    let hook_runs = Rc::clone(&runs);
-    server.set_held_hook(MARK, move || hook_runs.set(hook_runs.get() + 1));
-    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
-        panic!("expected Tcp");
-    };
-    let stop = server.shutdown_handle();
-    let client = thread::spawn(move || {
-        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
-        (|| -> io::Result<()> {
-            let mut s = connect_tcp(v4)?;
-            send_framed(&mut s, b"near")?;
-            assert_eq!(recv_framed(&mut s)?, b"sent");
-            let mut probe = || -> io::Result<(u8, bool)> {
-                send_framed(&mut s, b"probe")?;
-                let v = recv_framed(&mut s)?;
-                Ok((v[0], v[1] == 1))
-            };
-            // The turn in which the loop saw the reply sent runs the hook
-            // if it is owed, so the probe after the one that finds it sent
-            // sees any run.
-            let until = Instant::now() + Duration::from_secs(10);
-            loop {
-                let (runs, sent) = probe()?;
-                assert_eq!(runs, 0, "the hook ran for a fall that never came");
-                if sent {
-                    break;
-                }
-                assert!(Instant::now() < until, "the reply stayed counted");
-                thread::sleep(Duration::from_millis(1));
-            }
-            let (runs, _) = probe()?;
-            assert_eq!(runs, 0, "the hook ran for a fall that never came");
-            Ok(())
-        })()
-        .expect("client io");
-        stop.shutdown();
-    });
-    server.serve_forever().expect("serve_forever");
-    client.join().expect("thread join");
-}
-
-/// A reply handed off at the held hook's mark that reaches no request
-/// falls back within the loop's turn, with no rise the ring made. The hook
-/// still hears that fall, since `BodyRecycler::held` showed the count at
-/// the mark meanwhile, and a consumer waits only on what that showed it.
-#[test]
-fn the_held_hook_hears_a_fall_that_held_showed_the_rise_of() {
-    use std::cell::{Cell, OnceCell};
-    use std::rc::Rc;
-    use truenas_ros::net::server::BodyRecycler;
-
-    const MARK: usize = 256 * 1024;
-    let seam: Rc<OnceCell<BodyRecycler>> = Rc::new(OnceCell::new());
-    let runs = Rc::new(Cell::new(0u8));
-    let (h_seam, h_runs) = (Rc::clone(&seam), Rc::clone(&runs));
-    let proto = Protocol {
-        accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
-        body: move |req: Request<'_, ()>| {
-            let r = h_seam.get().expect("filled before serving");
-            if &*req.body != b"spill" {
-                return Response::Reply(echo_frame(&[h_runs.get()]));
-            }
-            let mut reply = r.claim(MARK);
-            reply.extend_from_slice(&echo_frame(b"late"));
-            // Closed in the loop's drain ahead of the reply, so the reply
-            // reaches no request and goes home within that drain.
-            req.responder.push_handle().close();
-            let (deferred, permit) = req.responder.defer();
-            deferred.reply_recycled(reply);
-            assert!(r.held() >= MARK, "the hand-off takes the count there");
-            Response::Defer(permit)
-        },
-    };
-    let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server =
-        match Server::with_config([addr], ServerConfig::default(), proto) {
-            Ok(s) => s,
-            Err(e) if should_skip(&e) => return,
-            Err(e) => panic!("bind: {e}"),
-        };
-    let recycler = server.body_recycler().expect("a server keeps a body pool");
-    seam.set(recycler.clone())
-        .unwrap_or_else(|_| panic!("set once"));
-    let hook_runs = Rc::clone(&runs);
-    server.set_held_hook(MARK, move || hook_runs.set(hook_runs.get() + 1));
-    let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
-        panic!("expected Tcp");
-    };
-    let stop = server.shutdown_handle();
-    let client = thread::spawn(move || {
-        let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
-        (|| -> io::Result<()> {
-            let mut s = connect_tcp(v4)?;
-            send_framed(&mut s, b"spill")?;
-            let mut rest = Vec::new();
-            s.read_to_end(&mut rest)?;
-            assert!(rest.is_empty(), "the reply reached no request");
-            let mut s = connect_tcp(v4)?;
-            let mut ask = || -> io::Result<u8> {
-                send_framed(&mut s, b"probe")?;
-                Ok(recv_framed(&mut s)?[0])
-            };
-            let until = Instant::now() + Duration::from_secs(10);
-            while ask()? < 1 {
-                assert!(Instant::now() < until, "the fall went unheard");
-                thread::sleep(Duration::from_millis(5));
-            }
-            assert_eq!(ask()?, 1, "once for that fall");
-            Ok(())
-        })()
-        .expect("client io");
-        stop.shutdown();
-    });
-    server.serve_forever().expect("serve_forever");
-    client.join().expect("thread join");
-    assert_eq!(recycler.held(), 0, "the spilled reply left the count");
-}
-
 /// Placed bodies past `held_cap` wait and go on in the order they arrived,
 /// one at a time as the consumer gives bytes back, so the ring passes the
 /// cap by one body at most, and every body arrives whole. A body larger
@@ -14584,85 +14410,143 @@ fn placed_bodies_past_the_held_cap_wait_their_turn() {
     );
 }
 
-/// The held hook runs from the loop once the ring's held bytes fall under
-/// its mark, never inside the `give_back` that took them there, and once
-/// for each fall, even a fall no request brought about.
+/// Turns the consumer queues and placed bodies held back at the cap go on
+/// in one queue, in the order they came, one at a time while each takes the
+/// count to the cap, so a stream of turns keeps no body back and a stream
+/// of bodies keeps no turn back. The hook runs once for each turn, from the
+/// loop and never inside the call that queued it, and only under the cap.
 #[test]
-fn the_held_hook_runs_once_under_its_mark_from_the_loop() {
-    use std::cell::{Cell, OnceCell};
+fn turns_and_placed_bodies_go_on_in_the_order_they_came() {
+    use std::cell::{Cell, OnceCell, RefCell};
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use truenas_ros::net::server::BodyRecycler;
 
-    const MARK: usize = 256 * 1024;
+    // Past a receive buffer of the default size, so each is placed, and
+    // past the cap, so each takes the count to it alone.
+    const BODY: usize = 512 * 1024;
+    const CAP: usize = 256 * 1024;
     let seam: Rc<OnceCell<BodyRecycler>> = Rc::new(OnceCell::new());
-    let runs = Rc::new(Cell::new(0u8));
-    let (h_seam, h_runs) = (Rc::clone(&seam), Rc::clone(&runs));
+    // What went on, in the order it went.
+    let went: Rc<RefCell<Vec<String>>> = Rc::default();
+    let runs = Rc::new(Cell::new(0usize));
+    // What the client waits on, the bodies framed and the hook's runs.
+    let framed = Arc::new(AtomicUsize::new(0));
+    let ran = Arc::new(AtomicUsize::new(0));
+    let (h_seam, h_went, h_runs) =
+        (Rc::clone(&seam), Rc::clone(&went), Rc::clone(&runs));
+    let h_framed = Arc::clone(&framed);
+    let mut framing =
+        length_prefix_header::<()>(PrefixWidth::U32, Endian::Big, false);
     let proto = Protocol {
         accept: |_: Incoming<'_>| Some(()),
-        header: length_prefix_header::<()>(
-            PrefixWidth::U32,
-            Endian::Big,
-            false,
-        ),
-        body: move |req: Request<'_, ()>| {
-            let r = h_seam.get().expect("filled before serving");
-            match &*req.body {
-                b"up" => r.take_out(MARK),
-                b"down" => {
-                    r.give_back(MARK);
-                    assert_eq!(h_runs.get(), 0, "never inside give_back");
-                }
-                _ => {}
+        header: move |bytes: &[u8], state: &mut ()| {
+            let framed = framing(bytes, state);
+            if let Framing::Complete { body_len, .. } = framed
+                && body_len >= BODY
+            {
+                h_framed.fetch_add(1, Ordering::SeqCst);
             }
-            Response::Reply(echo_frame(&[h_runs.get()]))
+            framed
+        },
+        body: move |mut req: Request<'_, ()>| {
+            let r = h_seam.get().expect("filled before serving");
+            if req.body.len() >= BODY {
+                // Taken, so off the count, which lets the next go on.
+                let tag = req.body[0] as char;
+                h_went.borrow_mut().push(format!("body {tag}"));
+                drop(req.body.take());
+            } else {
+                match &*req.body {
+                    b"hold" => r.take_out(CAP),
+                    b"release" => r.give_back(CAP),
+                    b"turn" => {
+                        assert!(!r.may_go(), "at the cap a call waits");
+                        let before = h_runs.get();
+                        r.queue_turn();
+                        assert_eq!(h_runs.get(), before, "not inside the call");
+                    }
+                    _ => {}
+                }
+            }
+            Response::Reply(echo_frame(b"ok"))
         },
     };
+    let cfg = ServerConfig {
+        max_request_bytes: 1 << 20,
+        body_placement_threshold: Some(1024),
+        held_cap: Some(CAP),
+        ..ServerConfig::default()
+    };
     let addr = ServerAddr::Tcp("127.0.0.1:0".parse::<SocketAddrV4>().unwrap());
-    let mut server =
-        match Server::with_config([addr], ServerConfig::default(), proto) {
-            Ok(s) => s,
-            Err(e) if should_skip(&e) => return,
-            Err(e) => panic!("bind: {e}"),
-        };
+    let mut server = match Server::with_config([addr], cfg, proto) {
+        Ok(s) => s,
+        Err(e) if should_skip(&e) => return,
+        Err(e) => panic!("bind: {e}"),
+    };
     let recycler = server.body_recycler().expect("a server keeps a body pool");
-    seam.set(recycler.clone()).expect("set once");
-    let hook_runs = Rc::clone(&runs);
-    server.set_held_hook(MARK, move || hook_runs.set(hook_runs.get() + 1));
-    // A rise and fall within one call of the consumer's own, between two
-    // requests, which the hook must hear of all the same.
-    server.set_control_hook(move |_| {
-        recycler.take_out(MARK);
-        recycler.give_back(MARK);
+    seam.set(recycler.clone())
+        .unwrap_or_else(|_| panic!("set once"));
+    let (k_went, k_runs, k_ran) =
+        (Rc::clone(&went), Rc::clone(&runs), Arc::clone(&ran));
+    server.set_held_hook(move || {
+        assert!(recycler.held() < CAP, "a turn goes on only under the cap");
+        k_runs.set(k_runs.get() + 1);
+        k_went.borrow_mut().push(format!("turn {}", k_runs.get()));
+        // The turn's call holds the count at the cap until released.
+        recycler.take_out(CAP);
+        k_ran.fetch_add(1, Ordering::SeqCst);
     });
     let ServerAddr::Tcp(v4) = server.local_addrs().remove(0) else {
         panic!("expected Tcp");
     };
     let stop = server.shutdown_handle();
-    let control = server.control_handle();
     let client = thread::spawn(move || {
         let _stop = ShutdownOnDrop(stop.clone()); // fail fast on panic
-        (|| -> io::Result<()> {
-            let mut s = connect_tcp(v4)?;
-            let mut ask = |what: &[u8]| -> io::Result<u8> {
-                send_framed(&mut s, what)?;
-                Ok(recv_framed(&mut s)?[0])
-            };
-            assert_eq!(ask(b"up")?, 0, "at the mark, nothing to run");
-            assert_eq!(ask(b"down")?, 0, "the fall is the loop's to answer");
-            assert_eq!(ask(b"probe")?, 1, "the loop ran the hook");
-            assert_eq!(ask(b"probe")?, 1, "once for one fall");
-            control.send(Box::new(()));
+        let wait = |count: &AtomicUsize, n: usize| {
             let until = Instant::now() + Duration::from_secs(10);
-            while ask(b"probe")? < 2 {
-                assert!(Instant::now() < until, "the second fall went unheard");
-                thread::sleep(Duration::from_millis(5));
+            while count.load(Ordering::SeqCst) < n {
+                assert!(Instant::now() < until, "only {n} - 1 came");
+                thread::sleep(Duration::from_millis(1));
             }
-            assert_eq!(ask(b"probe")?, 2, "once for that fall too");
-            Ok(())
-        })()
-        .expect("client io");
+        };
+        let body = |tag: u8| {
+            thread::spawn(move || -> io::Result<Vec<u8>> {
+                let mut s = connect_tcp(v4)?;
+                send_framed(&mut s, &vec![tag; BODY])?;
+                recv_framed(&mut s)
+            })
+        };
+        let mut s = connect_tcp(v4).expect("connect");
+        let mut ask = |what: &[u8]| {
+            send_framed(&mut s, what).expect("send");
+            assert_eq!(recv_framed(&mut s).expect("reply"), b"ok");
+        };
+        ask(b"hold");
+        let a = body(b'A');
+        wait(&framed, 1);
+        ask(b"turn");
+        ask(b"turn");
+        let b = body(b'B');
+        wait(&framed, 2);
+        ask(b"turn");
+        // One at a time from here, each holding the count at the cap.
+        ask(b"release");
+        assert_eq!(a.join().unwrap().expect("body A"), b"ok");
+        wait(&ran, 1);
+        ask(b"release");
+        wait(&ran, 2);
+        ask(b"release");
+        assert_eq!(b.join().unwrap().expect("body B"), b"ok");
+        wait(&ran, 3);
+        ask(b"release");
         stop.shutdown();
     });
     server.serve_forever().expect("serve_forever");
     client.join().expect("thread join");
+    assert_eq!(
+        *went.borrow(),
+        ["body A", "turn 1", "turn 2", "body B", "turn 3"],
+        "in the order they came"
+    );
 }

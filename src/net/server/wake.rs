@@ -497,11 +497,9 @@ where
                     self.core.kick_send(token.slot, token.generation as u32)?;
                 }
                 Injected::ReplyRecycled(_, bytes) => {
-                    // As `Reply`, marked so its storage goes home once sent.
-                    // Off the hand-off's figure before the queueing puts it
-                    // on the ring's count, whose check of the hook's mark
-                    // would see it twice the other way round. Nothing reads
-                    // the count between the two.
+                    // As `Reply`, marked so its storage goes home once sent,
+                    // and off the hand-off's figure as the queueing puts it
+                    // on the ring's count.
                     self.unhand(bytes.capacity());
                     self.core
                         .table

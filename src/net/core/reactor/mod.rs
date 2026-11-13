@@ -150,14 +150,10 @@ pub(crate) struct Reactor<U> {
     /// reason - a queued send segment points into it.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) body_bufs: Option<BufPool>,
-    /// Connections whose placed body read waits for the ring's held bytes
-    /// to fall under `ServerConfig::held_cap`, in the order they were held.
-    /// `Connection::read_held` keeps a connection here once, and a stale
-    /// entry is discarded on the way past.
-    #[cfg(feature = "net-server")]
-    pub(crate) held_reads: std::collections::VecDeque<(u32, u64)>,
     /// The held read the server is letting go on now, which the check
-    /// passes even with others still waiting behind it.
+    /// passes even with others still waiting behind it. The reads held
+    /// back wait in the body pool's queue, beside the consumer's turns
+    /// (`BodyPool::hold_back`).
     #[cfg(feature = "net-server")]
     pub(crate) held_turn: Option<u32>,
     /// This server's place in a spread of rings on one port, with the count
@@ -199,8 +195,6 @@ impl<U> Reactor<U> {
             body_pool: None,
             #[cfg(all(feature = "net-server", feature = "uring-fs"))]
             body_bufs: None,
-            #[cfg(feature = "net-server")]
-            held_reads: std::collections::VecDeque::new(),
             #[cfg(feature = "net-server")]
             held_turn: None,
             #[cfg(feature = "net-server")]

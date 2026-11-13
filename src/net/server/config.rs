@@ -224,9 +224,11 @@ pub struct ServerConfig {
     /// ([`body_placement_threshold`](ServerConfig::body_placement_threshold)),
     /// as [`BodyRecycler::held`](crate::net::server::BodyRecycler::held)
     /// counts them, the consumer's own figure included. A held-back read
-    /// waits with its connection's header kept, and goes on in the order it
-    /// was held once the count is under the cap, so the ring passes the cap
-    /// by one body at most and a body larger than the cap still goes on.
+    /// waits with its connection's header kept, and goes on once the count
+    /// is under the cap, in one queue with the turns the consumer queues
+    /// ([`BodyRecycler::queue_turn`](crate::net::server::BodyRecycler::queue_turn))
+    /// in the order they came, so the ring passes the cap by one at most
+    /// and a body larger than the cap still goes on.
     /// Its message's [`max_receipt_time`](ServerConfig::max_receipt_time)
     /// does not run while it waits. Storage a message is promoted into
     /// counts but is never held back, since part of the message has
