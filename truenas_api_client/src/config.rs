@@ -11,27 +11,12 @@ use truenas_ros::net::client::{ClientConfig, Personality};
 /// connection** (WS close 1009), so the client refuses locally at this bound instead
 /// ([`ApiError::TooLarge`](crate::ApiError::TooLarge)).
 ///
-/// An *unauthenticated* session's cap is 8192, and this default does not
-/// use it on purpose. This client dials the unix socket, where
-/// middlewared's `core.on_connect` hook authenticates the peer by `SO_PEERCRED` *before* the first message is parsed
-/// (`check_permission`, `middlewared/plugins/auth.py`), so a session that is going to authenticate normally already has
-/// by the time it sends anything. Lowering the default unconditionally would cost every ordinary session the 8 KiB to
-/// 64 KiB range the server accepts.
-///
-/// **That hook can decline without saying so.** `check_permission` returns leaving the session unauthenticated when the
-/// peer's uid has no passwd entry, and again when PAM refuses it - the second logs server-side and tells the client
-/// nothing either way. So "connected over the unix socket" is not the same as "authenticated", and a caller cannot
-/// infer its own cap from the transport.
-///
-/// **Do not read that as "an unauthenticated session is useless".** It is not: the `auth.login*` family has to be
-/// callable before authentication or nothing could ever authenticate, and middlewared exempts a set of methods from the
-/// requirement - `core.ping` among them, which the r126 review measured answering `"pong"` on a session middlewared
-/// itself calls Anonymous. Such a session is *mid-login*, not dead, and the 8192 cap binds every byte it sends.
-///
-/// So the exposure is real and the mitigation is [`SessionOpts::max_outbound_bytes`] set to 8192 for a session expected
-/// to stay unauthenticated. That now binds everything, including the two [`MSG_SIZE_EXTENDED_METHODS`] - the exemption
-/// used to override it, and is now gated on holding the ordinary cap. Above the server's real limit middlewared does
-/// not fail the call, it closes the connection, taking every other call in flight with it.
+/// An unauthenticated session's cap is 8192. Over the unix socket middlewared authenticates the peer by `SO_PEERCRED`
+/// before the first message (`check_permission`, `middlewared/plugins/auth.py`), but it can leave the session
+/// unauthenticated without telling the client, when the uid has no passwd entry or PAM refuses it. Such a session can
+/// still call `auth.login*` and the other exempt methods, under the 8192 cap. For a session expected to stay
+/// unauthenticated, set [`SessionOpts::max_outbound_bytes`] to 8192, which then binds the [`MSG_SIZE_EXTENDED_METHODS`]
+/// too.
 pub const MIDDLEWARE_MSG_CAP: usize = 65_536;
 
 /// middlewared's extended cap, honored only for the whitelisted upload-shaped methods ([`MSG_SIZE_EXTENDED_METHODS`]).
@@ -39,23 +24,16 @@ pub const MIDDLEWARE_MSG_CAP: usize = 65_536;
 pub const MIDDLEWARE_MSG_CAP_EXTENDED: usize = 2_097_152;
 
 /// The methods middlewared exempts from [`MIDDLEWARE_MSG_CAP`], allowing them [`MIDDLEWARE_MSG_CAP_EXTENDED`] instead
-/// (`MSG_SIZE_EXTENDED_METHODS` in `middlewared/utils/limits.py`). The exemption is why they are also the methods
-/// middlewared does not audit.
+/// (`MSG_SIZE_EXTENDED_METHODS` in `middlewared/utils/limits.py`).
 pub const MSG_SIZE_EXTENDED_METHODS: [&str; 2] = ["filesystem.file_receive", "failover.datastore.sql"];
 
 /// The outbound cap that applies to `method` on a session whose ordinary cap is `ordinary`.
 ///
-/// middlewared decides this per message, after parsing, and only then: `parse_message` (`middlewared/utils/limits.py`)
-/// refuses above [`MIDDLEWARE_MSG_CAP_EXTENDED`] outright, reads `method`, returns early for a whitelisted one, and
-/// applies the ordinary cap to everything else. A single per-session number cannot mirror that - it is either too small
-/// for the upload or too large for every other call on the same session - so the cap is chosen per call here too.
+/// middlewared decides per message, after parsing (`parse_message`, `middlewared/utils/limits.py`). It refuses above
+/// [`MIDDLEWARE_MSG_CAP_EXTENDED`] outright and applies the ordinary cap to every method but the whitelisted ones.
 pub(crate) fn outbound_cap(ordinary: usize, method: &str) -> usize {
-    // The exemption only exists *above* the ordinary cap, and a session whose ordinary cap is below it has been
-    // deliberately constrained - the mitigation this file prescribes for one expected to stay unauthenticated. Granting
-    // 2 MiB there would discard that setting for exactly the two methods, and the server would not honour it anyway:
-    // `parse_message` refuses an unauthenticated message above 8192 (`limits.py`, the `not authenticated` gate)
-    // *before* `ejson.loads`, before it reads `method`, and before the whitelist is consulted - so the frame is closed
-    // on, not answered, taking every other call in flight with it.
+    // The exemption only raises a session at the ordinary cap. One lowered below it was constrained on purpose, and
+    // `parse_message` refuses an unauthenticated message above 8192 before it reads `method` anyway.
     if ordinary >= MIDDLEWARE_MSG_CAP && MSG_SIZE_EXTENDED_METHODS.contains(&method) {
         MIDDLEWARE_MSG_CAP_EXTENDED
     } else {
@@ -93,43 +71,29 @@ pub struct ApiConfig {
     /// Cap on items held in the deferred queue at once, across every session. `queue_bulk` refuses past it
     /// ([`ApiError::QueueFull`](crate::ApiError::QueueFull)).
     ///
-    /// This is a count, and a count does not bound memory: each item holds its own encoded params, and nothing bounds
-    /// those at enqueue: an item too large to flush is still accepted and fails later, when the chunk builder finds it.
-    /// [`ApiConfig::max_queued_bulk_bytes`] is the bound that does the memory, in the units it is about.
+    /// A count does not bound memory, so [`ApiConfig::max_queued_bulk_bytes`] does that. An item too large to flush is
+    /// still accepted, and fails at the flush with [`ApiError::TooLarge`](crate::ApiError::TooLarge).
     pub max_queued_bulk_items: usize,
     /// Cap on the bytes the deferred queue holds at once, across every session. Charged against the encoded params, and
     /// refused with [`ApiError::QueueFull`](crate::ApiError::QueueFull) like the item count, whichever trips first.
-    ///
-    /// The queue exists to hold work while middlewared is unreachable, which is exactly the condition under which it
-    /// grows and nothing drains it - so it is the queue that most needs a bound stated in memory rather than in items.
     pub max_queued_bulk_bytes: usize,
     /// Cap on calls one session holds queued behind its concurrency budget ([`CALL_BUDGET`](crate::CALL_BUDGET)). A
     /// submission past it is refused with [`ApiError::QueueFull`](crate::ApiError::QueueFull) rather than accepted into
     /// a queue with no bound.
     ///
-    /// This is the pipelining *depth* a caller may run beyond what middlewared will take at once, so a few hundred is
-    /// already far more outstanding work than the server's own semaphore admits.
-    ///
-    /// It does not bound memory on its own, which is why [`ApiConfig::max_queued_bytes`] exists beside it: the queue
-    /// holds encoded frames, and a frame's ceiling is per *method* - the two upload methods get
-    /// [`MIDDLEWARE_MSG_CAP_EXTENDED`] - so a count alone leaves the worst case at this times 2 MiB.
+    /// A count does not bound memory, since an upload method's frame may be [`MIDDLEWARE_MSG_CAP_EXTENDED`], so
+    /// [`ApiConfig::max_queued_bytes`] does that.
     pub max_queued_calls: usize,
     /// Cap on the bytes one session holds queued behind its concurrency budget. A submission that would push the
     /// backlog past this is refused with [`ApiError::QueueFull`](crate::ApiError::QueueFull), whichever of the two caps
     /// it trips first.
-    ///
-    /// This is the one that bounds memory, and it is stated in the units it bounds. The queue holds whole encoded
-    /// frames, so without it the reachable worst case is [`ApiConfig::max_queued_calls`] frames at the largest
-    /// per-method ceiling rather than at the ordinary one.
     pub max_queued_bytes: usize,
     /// Cap on the events a *blocking* helper ([`ApiClient::call`](crate::ApiClient::call),
     /// [`ApiClient::connect`](crate::ApiClient::connect)) may set aside while it waits for the one it wants. Past it
     /// the wait fails with [`ApiError::QueueFull`](crate::ApiError::QueueFull) rather than buffering without limit.
     ///
-    /// This is the only queue the *peer* fills: a subscribed session receiving `collection_update` events fills it at
-    /// whatever rate middlewared emits them, for as long as the call takes. The non-blocking
-    /// [`ApiClient::pump`](crate::ApiClient::pump) never buffers - it hands each event straight back - so a consumer
-    /// that wants no bound here uses the model rather than the convenience.
+    /// The peer fills this queue, at whatever rate a subscribed session's updates arrive.
+    /// [`ApiClient::pump`](crate::ApiClient::pump) buffers nothing, so a consumer that wants no bound uses it instead.
     pub max_waiting_events: usize,
 }
 
@@ -152,25 +116,20 @@ impl Default for ApiConfig {
     }
 }
 
-/// The oldest API version this client speaks: middlewared serves every version concurrently, one per directory under
-/// `middlewared/api/` (`Middleware._load_api_versions`), so which one is in force is chosen by [`ApiConfig::endpoint`]
-/// and not by the appliance release.
+/// The oldest API version this client speaks. middlewared serves every version at once
+/// (`Middleware._load_api_versions`), so [`ApiConfig::endpoint`] picks the version and not the appliance release.
 ///
-/// The floor is a job-model requirement, not a preference. `core.set_options` grew `legacy_jobs` in
-/// `api/v25_10_0/core.py`; every version below that accepts only `py_exceptions` and drops the rest (`extra="ignore"`,
-/// `api/v25_04_1/core.py`), leaves `App.legacy_jobs` at its default of `true`, and has
-/// `CoreSetOptionsResult.to_previous` rewrite the echo to `null` on the way down. A session pinned there would ask for
-/// modern job answering, be refused in silence, and then decode every job's integer id as the caller's result.
+/// Below this, `core.set_options` drops `legacy_jobs` and leaves `App.legacy_jobs` at `true` (`api/v25_04_1/core.py`,
+/// and `CoreSetOptionsResult.to_previous` in `api/v25_10_0/core.py`), so every job call would answer with its job id
+/// rather than its result.
 pub const MIN_API_VERSION: (u32, u32, u32) = (26, 0, 0);
 
-/// Screen an endpoint before it reaches the wire: a usable request-target (`ws::validate_request_target` - the endpoint
-/// is spliced into the request line, so CR, LF or a space there splits the request), and, when it names an API version,
-/// one at or above [`MIN_API_VERSION`].
+/// Screen an endpoint before it reaches the wire. It must be a usable request-target, since it is spliced into the
+/// request line, and an API version it names must be at or above [`MIN_API_VERSION`].
 ///
-/// `/api/current` and any path that does not look like a version pin pass the version test: `current` is whatever the
-/// server calls newest, and a deployment may front middlewared on some other path. Only an explicit
-/// `/api/v<major>.<minor>[.<patch>]` is compared, which is the form `Middleware._load_api_versions` derives from its
-/// own directory names.
+/// Only an explicit `/api/v<major>.<minor>[.<patch>]` is compared, and `/api/current` or any other path passes the
+/// version test. A bad target fails with [`ApiError::Handshake`] and an old version with
+/// [`ApiError::UnsupportedApiVersion`].
 pub fn validate_endpoint(endpoint: &str) -> Result<(), ApiError> {
     truenas_ros::ws::validate_request_target(endpoint).map_err(ApiError::Handshake)?;
     let Some(v) = pinned_api_version(endpoint) else {
@@ -203,12 +162,10 @@ fn pinned_api_version(endpoint: &str) -> Option<(u32, u32, u32)> {
 impl ApiConfig {
     /// The `net::client` tuning this projects to.
     ///
-    /// `expect_server_push` is unconditional: notifications arrive with nothing awaiting, and correlation is by
-    /// JSON-RPC id, never the transport's FIFO pairing. `max_in_flight` is a transport-accounting ceiling, not the
-    /// concurrency limit (that is the per-session budget against middlewared's own semaphore): control replies and
-    /// pushes drain the transport's FIFO out of step with sends, so the only requirement is "never reachable in
-    /// practice". The idle and response clocks stay off - a subscribed session is legitimately silent for hours, and a
-    /// unix-socket peer is not a slow-loris to defend against.
+    /// `expect_server_push` is unconditional, since notifications arrive with nothing awaiting. `max_in_flight` is only
+    /// a transport accounting ceiling that must never be reached, since correlation is by JSON-RPC id and the
+    /// concurrency limit is the session budget. The idle and response clocks stay off, as a subscribed session may be
+    /// silent for hours.
     pub(crate) fn to_client(&self) -> ClientConfig {
         ClientConfig {
             pool_size: self.max_sessions,
@@ -240,14 +197,10 @@ pub struct SessionOpts {
     /// Refuse an outbound message longer than this before it reaches the wire. The default is middlewared's
     /// authenticated cap ([`MIDDLEWARE_MSG_CAP`]).
     ///
-    /// This is the cap for an *ordinary* call. The whitelisted upload methods ([`MSG_SIZE_EXTENDED_METHODS`]) get
-    /// [`MIDDLEWARE_MSG_CAP_EXTENDED`] automatically, because that is how the server grants it - per method, after
-    /// parsing, not per connection. Raising this by hand for an upload would lift the cap on every other call the
-    /// session makes, and the server would close the connection over the first one above 64 KiB rather than answering
-    /// it.
-    ///
-    /// Lower it to bound what this session may send; raising it above [`MIDDLEWARE_MSG_CAP`] only moves the refusal
-    /// from here to the server, which answers with a close rather than an error.
+    /// This is the cap for an ordinary call. The upload methods ([`MSG_SIZE_EXTENDED_METHODS`]) get
+    /// [`MIDDLEWARE_MSG_CAP_EXTENDED`] automatically while this is at least [`MIDDLEWARE_MSG_CAP`], as the server
+    /// grants it per method. Do not raise this for an upload, since the server closes the connection over the first
+    /// ordinary call above its cap. Lower it to bound what this session may send.
     pub max_outbound_bytes: usize,
 }
 
@@ -280,13 +233,7 @@ mod tests {
     use super::{MIDDLEWARE_MSG_CAP, MIDDLEWARE_MSG_CAP_EXTENDED, MSG_SIZE_EXTENDED_METHODS, outbound_cap};
 
     /// The extended cap is an exemption from the ordinary one, so it may only ever raise a session that has the
-    /// ordinary one.
-    ///
-    /// Lowering `max_outbound_bytes` to 8192 is the mitigation this module prescribes for a session expected to stay
-    /// unauthenticated. Applied regardless of that setting, the exemption discards it for exactly the two whitelisted
-    /// methods - and the server will not honour it either: `parse_message` refuses an unauthenticated message above
-    /// 8192 before it parses the body or reads `method`, so the frame is closed on rather than answered, taking every
-    /// other call on the session with it.
+    /// ordinary one, and never one lowered to 8192 for an unauthenticated session.
     #[test]
     fn the_extended_cap_cannot_raise_a_lowered_session() {
         for m in MSG_SIZE_EXTENDED_METHODS {

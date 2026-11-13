@@ -1,5 +1,5 @@
-//! Manual end-to-end check against a *real* middlewared. Not a CI test - the QEMU VM has no middlewared, so this is the
-//! by-hand proof on a real TrueNAS box (25.10 or 27.0).
+//! Manual end-to-end check against a *real* middlewared on a TrueNAS box. It is not a CI test, since the QEMU VM has no
+//! middlewared.
 //!
 //! ```text
 //! # As root (the daemon's own full-admin session):
@@ -13,8 +13,7 @@
 //! ```
 //!
 //! It calls `core.ping` (expect `"pong"`), `system.info`, and `auth.me` (who the session authenticated as), printing
-//! each. A demo bulk-style call is out of scope for a read-only probe; the point here is the transport, the handshake,
-//! and the identity.
+//! each.
 
 use std::time::Duration;
 use truenas_api_client::{ApiClient, ApiConfig, AsUser, CredBroker, SessionOpts};

@@ -1,13 +1,11 @@
 //! The deferred, tick-batched submission queue.
 //!
-//! [`queue_bulk`](crate::ApiClient::queue_bulk) appends one call's arguments here and returns at once; nothing touches
-//! the wire until the next tick, when every method with queued items goes out as a single `core.bulk` call. That is the
-//! anti-overload path: background work that would otherwise be a request per item becomes one request per method per
-//! tick, and `core.bulk` runs the items server-side under the calling session's own credentials.
+//! [`queue_bulk`](crate::ApiClient::queue_bulk) appends one call's arguments here and returns at once. Nothing touches
+//! the wire until the next tick, when every method with queued items goes out as a single `core.bulk` call, so
+//! background work costs one request per method per tick rather than one per item.
 //!
-//! This module is the sans-io storage and the chunk builder for **one session**: `core.bulk` runs its items under the
-//! calling session's own credentials, so the driver holds one of these per session and flushes each on the session it
-//! belongs to. The tick clock, the flush, and the per-item result fan-out live in the driver.
+//! This is the sans-io storage and chunk builder for one session, since `core.bulk` runs its items under the calling
+//! session's credentials. The tick clock, the flush and the per-item fan-out live in the driver.
 
 use crate::error::ApiError;
 use crate::{__json, BulkTicket};
@@ -72,9 +70,8 @@ impl BulkQueue {
 
     /// How many bytes of encoded params are queued.
     ///
-    /// Kept rather than summed, for the reason the call backlog keeps its own: `queue_bulk` asks before every enqueue
-    /// and this queue is ten thousand items deep by default, so a traversal here makes filling it quadratic - measured
-    /// at 30 ms for a thousand items and 320 ms for four thousand before this was a counter.
+    /// Kept rather than summed, since `queue_bulk` asks before every enqueue and summing would make filling the queue
+    /// quadratic.
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
@@ -217,9 +214,7 @@ mod tests {
         assert_eq!(chunk.tickets, vec![BulkTicket(2)]);
     }
 
-    /// The queue refuses past its cap.
-    /// The byte counter tracks the queue exactly, in and out. It is a counter and not a traversal because `queue_bulk`
-    /// asks before every enqueue: summing made filling the default 10,000-item queue quadratic.
+    /// The byte counter tracks the queue exactly, in and out.
     #[test]
     fn the_byte_counter_matches_the_queue() {
         let mut q = BulkQueue::default();
@@ -236,11 +231,8 @@ mod tests {
             q.enqueue(BulkTicket(i), "m", args, usize::MAX).unwrap();
             assert_eq!(q.bytes(), walk(&q), "after enqueue {i}");
         }
-        // Drain in chunks small enough to force several passes, and one oversized item out through the other removal
-        // site.
-        // `take_chunk` reserves 128 bytes of envelope margin, so the usable budget is `max_frame - 128`. 160 leaves 32:
-        // room for one small item per chunk, so the ordinary removal runs several times, while the 400-byte item cannot
-        // fit even alone and takes the oversized removal. Both decrement the counter.
+        // `take_chunk` reserves 128 bytes of envelope, so 160 leaves room for one small item per chunk and the ordinary
+        // removal runs several times, while the 400-byte item takes the oversized removal.
         let mut oversized = Vec::new();
         let mut passes = 0;
         while q.take_chunk("m", 160, &mut oversized).is_some() {
@@ -253,6 +245,7 @@ mod tests {
         assert_eq!(q.bytes(), 0, "a drained queue charges nothing");
     }
 
+    /// The queue refuses past its cap.
     #[test]
     fn enqueue_refuses_at_the_cap() {
         let mut q = BulkQueue::default();

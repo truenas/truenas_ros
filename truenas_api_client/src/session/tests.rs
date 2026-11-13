@@ -36,9 +36,7 @@ fn unmask(f: &[u8]) -> (u8, Vec<u8>) {
     (f[0] & 0x0f, payload)
 }
 
-/// The libwebsockets/Autobahn fragmentation faults, on the receive side (client-parser-ws.c Findings 9a/9b): a
-/// continuation with no message in progress, and a fresh data frame while one is owed a FIN, each fail the
-/// connection.
+/// A continuation with no message in progress fails the connection.
 #[test]
 fn a_continuation_with_no_message_open_faults() {
     let mut s = session();
@@ -49,6 +47,7 @@ fn a_continuation_with_no_message_open_faults() {
     );
 }
 
+/// A fresh data frame while a fragmented message is owed a FIN fails the connection.
 #[test]
 fn a_new_data_frame_mid_fragment_faults() {
     let mut s = session();
@@ -200,9 +199,7 @@ fn the_extended_cap_applies_to_the_upload_methods_only() {
     }
 }
 
-/// The backlog has two caps and refuses on whichever trips first. The count is a pipelining depth; the bytes are
-/// what bound memory, because a frame's ceiling is per method and the upload methods carry 32x the ordinary one -
-/// so a count alone leaves the worst case at the wrong number by that factor.
+/// The backlog has two caps and refuses on whichever trips first.
 #[test]
 fn a_full_backlog_is_refused_by_bytes_as_well_as_by_count() {
     use serde_json::value::RawValue;
@@ -243,10 +240,8 @@ fn a_full_backlog_is_refused_by_bytes_as_well_as_by_count() {
     assert_eq!(s.queued_bytes, 0, "a drained queue charges nothing");
 }
 
-/// JSON-RPC 2.0 §5 reserves `id: null` for an error the server could not attribute to a request - a parse failure,
-/// or its own message failing to serialise. middlewared answers exactly that and keeps the connection serving, so
-/// treating it as "a response to no outstanding call" would fail every healthy call in flight over a message the
-/// server has already moved past.
+/// An `id: null` error is reported and the session keeps serving, since middlewared sends one and carries on (JSON-RPC
+/// 2.0 §5).
 #[test]
 fn a_null_id_error_reports_without_killing_the_session() {
     let mut s = session();
@@ -265,13 +260,8 @@ fn a_null_id_error_reports_without_killing_the_session() {
     assert!(!matches!(s.phase, Phase::Closing), "the session stays open");
 }
 
-/// An `id: null` Response names no call of ours, and under 2.0 that has exactly one meaning: the server could not
-/// work out which request the error belongs to. The call that provoked it will therefore never be answered - so it,
-/// and every other call in flight, is failed to its caller.
-///
-/// The tombstones stay. The server was told nothing by our giving up and is still running those calls, so their
-/// answers are still coming: dropping the entries makes each one fault the session with "response to no outstanding
-/// call", which is the teardown this tolerance exists to prevent. The slots come back with the answers.
+/// An `id: null` Response fails every call in flight, since the one that provoked it will never be answered. Their
+/// tombstones and slots stay until the server's answers land, or each answer would fault the session.
 #[test]
 fn a_null_id_error_fails_the_calls_in_flight_but_keeps_their_tombstones() {
     use serde_json::value::RawValue;
@@ -365,11 +355,7 @@ fn the_inbound_cap_covers_an_unfragmented_message() {
     }
 }
 
-/// §5.5.1: no data frame goes out after our Close.
-///
-/// The backlog is the one place a data frame can be born from an *inbound* event: an answer frees a concurrency
-/// slot, `on_answer` drains the queue, and each drained call is a fresh request frame. Nothing gated that on the
-/// phase, so a Response arriving between our Close and the transport teardown put a new `core.ping` on the wire.
+/// No data frame goes out after our Close (§5.5.1), even when an answer frees a slot for a queued call.
 #[test]
 fn no_data_frame_goes_out_after_our_close() {
     use serde_json::value::RawValue;
@@ -419,12 +405,8 @@ fn no_data_frame_goes_out_after_our_close() {
     assert_eq!(s.backlog.len(), 1, "the queued call stays queued");
 }
 
-/// The reachable half of the same rule: `expire` drains the backlog too, and `pump` runs it before it reaps a
-/// single completion.
-///
-/// So with `call_timeout` set and more than `CALL_BUDGET` calls in flight, one `close()` + one `pump()` was enough
-/// to put a queued request on the wire after the Close - and the caller was told that same call had failed
-/// `Closed`, while its frame was already gone.
+/// `expire` drains the backlog too, and `pump` runs it before it reaps a single completion, so it must not send after
+/// our Close either.
 #[test]
 fn expire_does_not_drain_the_backlog_after_our_close() {
     use serde_json::value::RawValue;
@@ -438,7 +420,7 @@ fn expire_does_not_drain_the_backlog_after_our_close() {
             .submit(crate::CallId(100 + i as u64), Kind::User, "core.ping", &args, Some(t0))
             .expect("under budget");
     }
-    // ...and one queued call that is NOT due, so expiry frees slots for it rather than dropping it.
+    // ...and one queued call that is not due, so expiry does not drop it.
     let _ = s
         .submit(crate::CallId(999), Kind::User, "core.ping", &args, None)
         .expect("queues");
@@ -490,9 +472,7 @@ fn an_open_reassembly_is_bounded_and_released_at_close() {
     assert!(s.frag.is_none(), "closing releases the reassembly");
 }
 
-/// Past the concurrency budget calls queue; past the queue's own bound they are refused, in `queue_bulk`'s
-/// vocabulary. Without the bound a caller that ignores the queueing holds one encoded frame per call, up to
-/// `max_outbound` each, with nothing to stop it.
+/// Past the concurrency budget calls queue, and past the queue's own bound they are refused and leave nothing behind.
 #[test]
 fn a_full_backlog_refuses_rather_than_growing() {
     use serde_json::value::RawValue;
@@ -527,12 +507,8 @@ fn a_full_backlog_refuses_rather_than_growing() {
     assert_eq!(s.pending.len(), pending_before, "a refusal leaves no tombstone");
 }
 
-/// A locally timed-out call returns its concurrency slot at `expire`, keeps its tombstone so a late answer is still
-/// recognised, and that late answer credits nothing a second time.
-///
-/// Before the fix this covers, `expire` left every slot spent, so `CALL_BUDGET` unanswered timeouts pinned `budget`
-/// at 0 for the life of the session: later calls went to `backlog`, `drain_backlog` never ran (its guard is `while
-/// self.budget > 0`), and the session accepted calls and sent none with nothing surfaced to the caller.
+/// A locally timed-out call keeps its concurrency slot and its tombstone until the server answers, and that late answer
+/// frees the slot once, releasing the next queued call.
 #[test]
 fn a_timed_out_call_frees_its_slot_and_a_late_answer_credits_once() {
     use serde_json::value::RawValue;
@@ -630,11 +606,9 @@ fn refusal(id: &serde_json::Value) -> String {
     .to_string()
 }
 
-/// A `-32000` is the shared limit saying "not now", not a verdict on the call: middlewared raises it before
-/// entering the method (`SoftHardSemaphore.__aenter__` is above `hardlimit` before `counter += 1` and before
-/// `method.call`), so nothing ran. The call is reissued after a pause rather than reported, and while that pause
-/// runs nothing else goes out either - not the queued calls, and not a call submitted meanwhile on the slot the
-/// refusal itself just returned.
+/// A `-32000` comes before the method runs (`SoftHardSemaphore.__aenter__`), so the call is reissued after a pause
+/// rather than reported. Nothing else goes out during the pause, neither the queued calls nor one submitted on the slot
+/// the refusal returned.
 #[test]
 fn a_concurrency_refusal_is_reissued_after_a_pause() {
     use serde_json::value::RawValue;
@@ -733,11 +707,8 @@ fn a_call_refused_past_its_retry_bound_reaches_its_caller() {
     assert!(s.backlog.is_empty(), "and it is not requeued again");
 }
 
-/// Consecutive refusals lengthen the pause, and an answer that is not a refusal resets it - without that, a session
-/// that hit the limit once carries the longest delay for the rest of its life.
-///
-/// Each pause is jittered, so the assertion is on the window rather than on an exact figure: equal jitter puts it
-/// in `[full/2, full]` for that step's `full`.
+/// Consecutive refusals lengthen the pause, and an answer that is not a refusal resets it. Each pause is jittered, so
+/// the check is on the window `[full/2, full]` for that step.
 #[test]
 fn the_backoff_grows_and_an_ordinary_answer_resets_it() {
     use serde_json::value::RawValue;
@@ -784,10 +755,8 @@ fn the_backoff_grows_and_an_ordinary_answer_resets_it() {
     assert_eq!(answer(&mut s, 4, false), Duration::ZERO, "no pause");
     in_window(answer(&mut s, 5, true), 0);
 
-    // And the pause is actually jittered, not merely inside the window a fixed delay would also satisfy. Every
-    // client against this shared limit is refused at the same moment; identical delays march them back in step,
-    // which is the herd re-forming. A fresh session per sample: a reissued call this test never answers would hold
-    // its slot and starve the next submission.
+    // And the pause is really jittered, not merely inside a window a fixed delay would also satisfy. A fresh session
+    // per sample, since an unanswered reissue would hold its slot.
     let first_pause = |n: u64| -> Duration {
         let mut s = session();
         let args = RawValue::from_string("[]".to_owned()).unwrap();
@@ -809,12 +778,8 @@ fn the_backoff_grows_and_an_ordinary_answer_resets_it() {
     );
 }
 
-/// A peer that answers an id it was never sent must be refused, not believed. `submit` inserts into `pending` for
-/// the backlogged branch too, so before the fix this covers, such an answer refunded a slot the call never spent,
-/// handed the caller a fabricated `CallDone`,
-/// let `drain_backlog` put the call on the wire with no `pending`
-/// entry, and then faulted the whole session when the genuine answer arrived - failing every other in-flight call
-/// with it.
+/// A peer that answers an id it was never sent is refused, not believed. Crediting it would hand the caller a
+/// fabricated result and send the call with no `pending` entry.
 #[test]
 fn an_answer_for_a_never_sent_call_is_refused() {
     use serde_json::value::RawValue;

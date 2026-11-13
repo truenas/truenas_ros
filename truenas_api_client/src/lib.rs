@@ -1,29 +1,25 @@
 //! A non-blocking client for TrueNAS middlewared's JSON-RPC 2.0 API.
 //!
-//! middlewared serves JSON-RPC only behind a WebSocket route (`GET /api/current`, text frames) on its AF_UNIX socket -
-//! the socket is an HTTP server; `AF_UNIX` changes the transport and adds `SO_PEERCRED`, not the protocol stack. This
-//! crate speaks that stack on `truenas_ros`'s io_uring `net-client` role: one upgrade request and one `101` head per
-//! connection, RFC 6455 client frames after that, JSON-RPC inside them.
+//! middlewared serves JSON-RPC behind a WebSocket route (`GET /api/current`, text frames) on its AF_UNIX socket. This
+//! crate speaks it on `truenas_ros`'s io_uring `net-client` role, one upgrade per connection and RFC 6455 client frames
+//! after that.
 //!
-//! Everything is **submit-and-pump**: [`ApiClient::call_start`] returns a [`CallId`] immediately, and
-//! [`ApiClient::pump`] surfaces completions and server notifications as [`ApiEvent`]s - no thread per call, ever.
-//! Blocking conveniences ([`ApiClient::connect`], [`ApiClient::call`]) are thin pump-until wrappers for tools and
-//! tests, not the model.
+//! Everything is submit-and-pump. [`ApiClient::call_start`] returns a [`CallId`] at once, and [`ApiClient::pump`]
+//! surfaces completions and notifications as [`ApiEvent`]s, with no thread per call. [`ApiClient::connect`] and
+//! [`ApiClient::call`] are blocking pump-until wrappers for tools and tests.
 //!
 //! # Identity
 //!
-//! A session dials under an io_uring [`Personality`], so middlewared's peer-credential auto-auth sees the minted
-//! identity: uid 0 from a non-interactive daemon is a full-admin session, any other uid authenticates as that TrueNAS
-//! user when its groups compose a privilege and PAM admits it. There are no passwords or keys anywhere in this crate -
-//! `SO_PEERCRED` is the whole mechanism. Minting non-root personalities takes the parent crate's credential broker on a
-//! ring created *before* the broker forks: [`ApiClient::setup_ring`] → [`CredBroker::spawn`] →
+//! A session dials under an io_uring [`Personality`], and middlewared authenticates it by `SO_PEERCRED` alone. Uid 0
+//! from a non-interactive daemon is a full-admin session, and any other uid authenticates as that TrueNAS user when its
+//! groups compose a privilege and PAM admits it. A non-root personality is minted by the parent crate's credential
+//! broker on a ring created before the broker forks, in the order [`ApiClient::setup_ring`], [`CredBroker::spawn`],
 //! [`ApiClient::with_ring`], then [`SessionOpts::personality`] per session.
 //!
 //! # Correlation
 //!
-//! The transport's reply pairing is FIFO-positional and means nothing under a multiplexed RPC protocol; the JSON-RPC
-//! `id` is the only correlator, and this crate never looks at the transport's `RequestId`s. Inbound frames are split by
-//! shape: a `method` member is a notification, otherwise it answers whatever `id` it names.
+//! The JSON-RPC `id` is the only correlator, never the transport's FIFO reply pairing. An inbound frame with a `method`
+//! member is a notification, and any other answers the `id` it names.
 
 #![deny(unsafe_code)]
 
@@ -40,13 +36,11 @@ pub use config::{
 pub use error::{ApiError, CALL_ERROR, CallError, ExtraError, INVALID_PARAMS, TOO_MANY_CONCURRENT_CALLS, Trace};
 pub use server::{JsonRpcServer, ServerAct, ServerStep};
 pub use session::{CALL_BUDGET, CollectionUpdate, MAX_CALL_RETRIES};
-// The WebSocket codec is the parent crate's `ws` module; the middlewared specifics (JSON-RPC, sessions, the bulk queue)
-// are what live here. A consumer that wants the handshake-refusal reason, or a mock answering a live handshake, reaches
-// these through us rather than a second import.
+// Re-exported so a consumer can match a handshake refusal, or a mock answer a live handshake, without importing the
+// parent crate.
 pub use truenas_ros::ws::{HandshakeError, accept_for};
 
-// The broker recipe's vocabulary, so a consumer needs no direct `truenas_ros` import to mint identities: create the
-// ring, fork the broker over it, build the client on it, register `AsUser`s per tenant.
+// The broker recipe's vocabulary, so a consumer can mint identities without importing `truenas_ros`.
 pub use truenas_ros::net::client::{Personality, RingFd};
 pub use truenas_ros::uring_fs::{AsUser, Caps, CredBroker, CredHandle, IdentityCache, Lease};
 
@@ -96,11 +90,9 @@ pub struct BulkTicket(u64);
 
 /// An owned, still-encoded JSON-RPC `result`: decode it into the type the method returns, or keep it raw.
 ///
-/// [`Debug`] reports its size and not its content. A method's result is whatever the caller asked middlewared for -
-/// `auth.*` tokens, a `datastore.query` row, a key - and `{:?}` on an event is how it would reach a log file.
-/// middlewared draws the same line: results go to the caller intact and through `remove_secrets` on the way to the
-/// audit record (`api/base/handler/remove_secrets.py`, used by `handler/dump_params.py`). [`OwnedResult::get`] and
-/// [`OwnedResult::decode`] are the caller's side of it.
+/// [`Debug`] reports its size and not its content, since a result may hold secrets such as `auth.*` tokens and `{:?}`
+/// is how it would reach a log. middlewared draws the same line for its audit record
+/// (`api/base/handler/remove_secrets.py`).
 pub struct OwnedResult(Box<RawValue>);
 
 impl fmt::Debug for OwnedResult {
@@ -122,10 +114,6 @@ impl OwnedResult {
 }
 
 /// What [`ApiClient::pump`] surfaces.
-///
-/// Its [`Debug`] is written out rather than derived, and the `match` in it is exhaustive on purpose: every variant that
-/// carries server data has to decide whether `{:?}` prints it, and a new one will not compile until someone does. See
-/// [`OwnedResult`] for the line being drawn.
 #[non_exhaustive]
 pub enum ApiEvent {
     /// The session finished its handshake and setup; calls flow.
@@ -200,10 +188,9 @@ pub enum ApiEvent {
         /// How many items the batch carried.
         items: usize,
     },
-    /// The server reported an error naming no call of ours: a Response with `id: null`, which JSON-RPC 2.0 §5 reserves
-    /// for an error the server could not attribute. middlewared sends one when a message of ours does not parse, or
-    /// when its own notification fails to serialise, and keeps the connection serving - so this is a report, not a
-    /// teardown, and every call in flight is unaffected.
+    /// The server reported an error naming no call of ours, a Response with `id: null` (JSON-RPC 2.0 §5). The session
+    /// keeps serving, but every call in flight on it fails, since the one that provoked the error will never be
+    /// answered.
     ServerError {
         /// The session it arrived on.
         session: SessionId,
@@ -220,6 +207,8 @@ pub enum ApiEvent {
     },
 }
 
+// Written out rather than derived, and exhaustive on purpose, so a new variant carrying server data has to decide
+// whether `{:?}` prints it. See `OwnedResult`.
 impl fmt::Debug for ApiEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -260,8 +249,7 @@ impl fmt::Debug for ApiEvent {
                 .field("collection", collection)
                 .field("error", error)
                 .finish(),
-            // A notification this client does not model, so its params are unread server data - the same question a
-            // result asks.
+            // Unread server data, the same question a result asks.
             Self::Notification {
                 session,
                 method,
@@ -311,19 +299,16 @@ impl fmt::Debug for Opaque<'_> {
 /// The reply framer type driving the underlying client.
 type Framer = fn(&[u8], &mut WsState) -> Framing;
 
-/// The non-blocking middlewared client: one io_uring ring, any number of sessions, caller-pumped. `!Send` like the
-/// client it embeds - one ring, one thread.
-/// `now + d`, or `None` when there is no bound - which is what `None` already means everywhere this feeds, and what an
-/// unrepresentable one has to mean.
+/// `now + d`, or `None` when there is no bound or the sum is unrepresentable.
 ///
-/// `Instant + Duration` panics on overflow, and the durations here are caller-supplied: `ApiConfig::call_timeout` and
-/// `connect_timeout` are plain `Option<Duration>` fields, and `pump`'s argument is whatever the caller passes -
-/// `Duration::MAX` being an ordinary way to spell "wait as long as it takes". A library must not abort the process over
-/// that.
+/// Never plain `Instant + Duration`, which panics on overflow. These durations come from the caller, and
+/// `Duration::MAX` is an ordinary way to ask for no bound.
 fn deadline_in(d: Option<Duration>) -> Option<Instant> {
     Instant::now().checked_add(d?)
 }
 
+/// The non-blocking middlewared client: one io_uring ring, any number of sessions, caller-pumped. `!Send` like the
+/// client it embeds - one ring, one thread.
 pub struct ApiClient {
     client: Client<WsState, Framer>,
     cfg: ApiConfig,
@@ -332,9 +317,8 @@ pub struct ApiClient {
     out: VecDeque<ApiEvent>,
     next_call: u64,
     next_sub: u64,
-    /// The deferred, tick-batched submission queues: one per session, because `core.bulk` executes its items under the
-    /// calling session's credentials, so an item's session is part of what it *is*. Held in first-queued order so a
-    /// flush is deterministic; the count is bounded by `max_sessions`, which makes the linear lookup free.
+    /// The deferred bulk queues, one per session, in first-queued order for a deterministic flush. At most
+    /// `max_sessions` long, so a linear lookup is cheap.
     bulk: Vec<(ConnId, BulkQueue)>,
     /// core.bulk calls in flight, each mapped to what it carries, so the batch's array result fans back out to per-item
     /// events.
@@ -496,10 +480,8 @@ impl ApiClient {
         let deadline = deadline_in(self.cfg.call_timeout);
         let acts = {
             let sess = self.session_mut(session)?;
-            // The guard `call_start` and `subscribe_start` carry, and the route the backlog gate cannot reach: this
-            // call reaches `Act::Send` through `submit`, not `drain_backlog`, so without it one public call after
-            // `close()` puts a data frame on the wire behind the session's own Close frame - which RFC 6455 §5.5.1
-            // forbids ("The application MUST NOT send any more data frames after sending a Close frame").
+            // This call reaches `Act::Send` through `submit`, past the backlog's phase gate, so without this guard a
+            // call after `close()` would put a data frame behind our Close (RFC 6455 §5.5.1).
             if !matches!(sess.phase, Phase::Open) {
                 return Err(ApiError::Closed {
                     reason: "session is not open".into(),
@@ -515,19 +497,18 @@ impl ApiClient {
         Ok(call)
     }
 
-    /// Queue one call for deferred, batched submission on `session` and return its ticket immediately - nothing goes on
-    /// the wire until the next tick ([`ApiConfig::bulk_tick`]), when every queued method flushes as one `core.bulk`
-    /// call. The per-item outcome arrives as [`ApiEvent::BulkItemDone`], and each batch's dispatch as
+    /// Queue one call for deferred, batched submission on `session` and return its ticket at once. Nothing goes on the
+    /// wire until the next tick ([`ApiConfig::bulk_tick`]), when each queued method flushes as one `core.bulk` call.
+    /// Each item's outcome arrives as [`ApiEvent::BulkItemDone`], and each batch's dispatch as
     /// [`ApiEvent::BulkFlushed`].
     ///
-    /// `args` is the argument array for one call of `method` (the same Array shape a direct call takes; [`params!`]
-    /// builds one). Use this for background work whose latency does not matter and whose volume would otherwise flood
-    /// middlewared - a per-item request becomes a per-method-per-tick one.
+    /// `args` is the argument array for one call of `method` ([`params!`] builds one). Use this for background work
+    /// whose latency does not matter and whose volume would otherwise flood middlewared.
     ///
-    /// `core.bulk` runs the items under `session`'s own credentials, so each item is queued *against* the session named
-    /// here and flushes on that session and no other - queueing against a second session opens a second queue rather
-    /// than re-aiming the first. Whichever session an item names must be one whose identity may make that call.
-    /// [`ApiConfig::max_queued_bulk_items`] bounds the client's queues together, not each one.
+    /// `core.bulk` runs the items under `session`'s credentials, so an item flushes on the session named here and no
+    /// other, and that session's identity must be allowed the call. [`ApiConfig::max_queued_bulk_items`] and
+    /// [`ApiConfig::max_queued_bulk_bytes`] bound all the client's queues together, and past either this fails with
+    /// [`ApiError::QueueFull`].
     pub fn queue_bulk<P: Serialize + ?Sized>(
         &mut self,
         session: SessionId,
@@ -539,8 +520,7 @@ impl ApiClient {
             return Err(ApiError::UnknownSession);
         }
         let raw = array_params(args)?;
-        // The cap is client-wide, so charge it against every session's queue rather than letting each hold
-        // `max_queued_bulk_items`.
+        // Both caps are client-wide, charged against every session's queue together.
         let cap = self.cfg.max_queued_bulk_items;
         let queued: usize = self.bulk.iter().map(|(_, q)| q.len()).sum();
         if queued >= cap {
@@ -549,8 +529,6 @@ impl ApiClient {
                 cap,
             });
         }
-        // The count is a depth; this is the memory. An item carries its own encoded params and nothing bounds those at
-        // enqueue, so without this the queue's ceiling is the item cap times whatever the caller queues.
         let bytes_cap = self.cfg.max_queued_bulk_bytes;
         let queued_bytes: usize = self.bulk.iter().map(|(_, q)| q.bytes()).sum();
         if queued_bytes.saturating_add(raw.get().len()) > bytes_cap {
@@ -612,8 +590,6 @@ impl ApiClient {
                 }
                 return Ok(Some(ev));
             }
-            // Fire whatever deadlines have passed, and flush the deferred queue if its tick came up, before deciding
-            // how long to wait.
             let now = Instant::now();
             self.expire(now);
             if self.bulk_tick_due(now) {
@@ -623,10 +599,8 @@ impl ApiClient {
                 continue;
             }
             let next_deadline = self.sessions.values().filter_map(Session::next_deadline).min();
-            // `checked_add` for the same reason the five deadline sites
-            // use it: `bulk_tick` is a caller-supplied `Duration` on a
-            // plain public field, and `Instant + Duration` panics on overflow. An unrepresentable tick means "not yet",
-            // which `None` already means to the wait computation below.
+            // `checked_add`, since `bulk_tick` is the caller's and `Instant + Duration` panics on overflow. An
+            // unrepresentable tick reads as no tick yet.
             let next_tick = self
                 .bulk_pending()
                 .then(|| {
@@ -694,13 +668,9 @@ impl ApiClient {
         mut pred: impl FnMut(&ApiEvent) -> bool,
     ) -> Result<ApiEvent, ApiError> {
         let mut skipped: VecDeque<ApiEvent> = VecDeque::new();
-        // Events already queued when this wait began are not buffered by it: `wait_for` restores its set-aside to the
-        // front of `self.out` on the way out, and `pump` drains `self.out` before it touches the transport, so moving
-        // one from `self.out` into `skipped` frees no memory and allocates none. Counting them made the refusal
-        // self-sustaining - the wait tripped the cap on the previous wait's own restored stash, without pumping any
-        // I/O, so once the client held `max_waiting_events` events every later `call`/`connect` was refused and the
-        // frames they had just handed the transport were never flushed. Only what arrives during this wait is new
-        // memory, so only that is counted.
+        // Events queued before this wait began are not charged against `max_waiting_events`. They go back to `self.out`
+        // on the way out and `pump` drains `self.out` first, so counting them would let one refused wait refuse every
+        // later one without any I/O.
         let mut carried = self.out.len();
         let mut buffered = 0usize;
         let out = loop {
@@ -723,11 +693,8 @@ impl ApiClient {
                     skipped.push_back(ev);
                 }
                 Ok(Some(ev)) => {
-                    // The one queue the peer fills. A subscribed session pushes `collection_update`s for as long as the
-                    // call takes, and nothing else here grows with the peer's rate, so an unbounded set-aside is the
-                    // peer's memory
-                    // budget rather than ours. Fail the wait instead;
-                    // `pump` is the unbuffered path and stays available.
+                    // The one queue the peer fills, since a subscribed session pushes updates for as long as the call
+                    // takes. Past the cap the wait fails, and `pump`, which buffers nothing, stays available.
                     if buffered >= self.cfg.max_waiting_events {
                         skipped.push_back(ev);
                         break Err(ApiError::QueueFull {
@@ -913,14 +880,9 @@ impl ApiClient {
 
     /// Drop `conn` and fail everything it had accepted.
     ///
-    /// Every route that removes a session has to come through here. The session owns the only record of the calls in
-    /// flight on it (`Session::pending`), so removing it without draining that record strands each one: the caller was
-    /// handed a `CallId` and no `CallDone` will ever answer it, and `ApiClient::call` - which waits on exactly that
-    /// event - blocks for as long as `call_timeout` allows, which is for ever by default.
-    ///
-    /// `SessionFailed` does not substitute. A caller waiting on a specific call is not watching for it, and
-    /// `wait_for`'s predicate is per-event: the session-level report is stashed as a skipped event, not delivered as
-    /// the call's answer.
+    /// Every route that removes a session must fail its pending calls as this does. A call left in `Session::pending`
+    /// is never answered, and `ApiClient::call` would wait on its `CallDone` for ever under the default `call_timeout`.
+    /// `SessionFailed` does not stand in, since `wait_for` waits for the call's own event.
     fn fail_session(&mut self, conn: ConnId, why: &str) {
         self.client.close_now(conn);
         let Some(mut sess) = self.sessions.remove(&conn) else {
@@ -951,10 +913,8 @@ impl ApiClient {
 
     /// Fire expired call deadlines across every session.
     ///
-    /// `pump` calls this on every iteration that has no event ready, so it runs far more often than any deadline
-    /// actually fires. Collecting straight into `(conn, acts)` pairs - rather than every session's `ConnId` up front,
-    /// the borrow-checker workaround `apply`'s `&mut self` would otherwise force - means the common case (nothing due)
-    /// touches the allocator not at all: an untouched `Vec` never allocates.
+    /// `pump` calls this on every idle iteration, so it collects only the sessions with something due, and the common
+    /// case of nothing due never allocates.
     fn expire(&mut self, now: Instant) {
         let mut due: Vec<(ConnId, Vec<Act>)> = Vec::new();
         for (&conn, sess) in self.sessions.iter_mut() {
@@ -981,12 +941,9 @@ impl ApiClient {
                 self.drain_bulk_to_closed(conn, "bulk session is gone");
                 continue;
             };
-            // A session still dialing is not a dead one. `queue_bulk` admits an item against any session this client
-            // knows, and the tick clock starts due (`last_tick` is `None`), so the first `pump` after a `connect_start`
-            // reaches this loop while the session is still in `AwaitingHead`. Failing the items there hands the caller
-            // `Closed` for a session that is about to be healthy - and takes the items with it, because `take_chunk`
-            // has already removed them. Hold them for a later tick instead; the only thing that may drop a queue is the
-            // session being *gone*.
+            // A session not yet open keeps its items for a later tick. The tick starts due, so the first `pump` after
+            // `connect_start` gets here while the session is still dialing, and only a session that is gone may drop
+            // its queue.
             if !matches!(sess.phase, Phase::Open) {
                 continue;
             }

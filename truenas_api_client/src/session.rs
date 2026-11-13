@@ -17,21 +17,13 @@ use truenas_ros::ws::{self, FrameHead, HandshakeError, OP_BINARY, OP_CLOSE, OP_C
 
 /// Concurrent calls this session keeps in flight; further calls queue behind the answers.
 ///
-/// A mirror of middlewared's own per-connection semaphore, which is soft 10 / hard 20 (`SoftHardSemaphore(10, 20)`,
-/// `middlewared/api/base/server/ws_handler/rpc.py`, over `middlewared/utils/lock.py`): under the soft limit the server
-/// never delays us, and the hard `-32000` refusal is out of reach of the calls one session has outstanding at once.
+/// It mirrors middlewared's per-connection semaphore, soft 10 and hard 20 (`SoftHardSemaphore(10, 20)`,
+/// `middlewared/api/base/server/ws_handler/rpc.py`), and sits under the soft limit because with `legacy_jobs` off a job
+/// method holds its server-side slot for the whole job.
 ///
-/// The ceiling sits under the soft limit rather than at it because with `legacy_jobs` off a job method holds its
-/// server-side slot for the whole job - `method.call` awaits `result.wait()` *inside* the semaphore - so concurrency
-/// there is scarce and long-held.
-///
-/// It counts what the *server* is holding, not what this client still cares about, and those differ: a slot is spent
-/// when the request goes out and returned only by its answer. Timing a call out, or failing it on an unattributable
-/// error, tells the caller it is over and tells middlewared nothing - the method is still running inside the semaphore.
-/// Crediting the slot there would let repeated timeouts put more work in front of the server than this number, which is
-/// the only way a session that obeys this ceiling can reach `-32000` at all. Calls that arrive while the slots are out
-/// queue in `backlog` and go when an answer frees one; `submit` refuses with [`ApiError::QueueFull`] once that queue
-/// hits its own bound, so the pushback is visible rather than silent.
+/// It counts what the server holds. A slot is spent when the request goes out and comes back only with its answer, so a
+/// call that times out locally keeps its slot until middlewared answers it. Calls past the budget queue, and past the
+/// queue's own bound they are refused with [`ApiError::QueueFull`].
 pub const CALL_BUDGET: usize = 8;
 
 /// What one pending entry is for, which decides how its answer surfaces.
@@ -65,12 +57,9 @@ pub(crate) struct Pending {
     /// is recognized and dropped.
     pub(crate) deadline: Option<Instant>,
     pub(crate) abandoned: bool,
-    /// The encoded request, kept so a `-32000` can be reissued without troubling the caller: middlewared raises at its
-    /// hard limit before the call is entered, so the method provably did not run.
-    ///
-    /// `None` for calls at the extended cap (the exempt upload methods, 32x the ordinary one) and for session setup.
-    /// Retention is bounded by [`CALL_BUDGET`] frames at the *ordinary* cap; letting a 2 MiB upload in would multiply
-    /// that by 32 for the calls least likely to want a silent reissue.
+    /// The encoded request, kept so a `-32000` can be reissued, since middlewared refuses at its hard limit before the
+    /// method runs. `None` for anything but a caller's own call and for a frame above the ordinary cap, so retention
+    /// stays within [`CALL_BUDGET`] ordinary frames.
     retry_frame: Option<Vec<u8>>,
     /// Reissues so far, against [`MAX_CALL_RETRIES`].
     retries: u32,
@@ -82,11 +71,9 @@ pub(crate) enum Phase {
     AwaitingHead,
     /// The `101` is in and `core.set_options` is on the wire, unanswered.
     ///
-    /// Frames flow - the setup call is one - but no *caller's* call may join them, which is what makes [`Phase::Open`]
-    /// mean "ready" to the three public guards that read it. Until the echo lands the peer's `App.legacy_jobs` is still
-    /// at its default of `true` (`api/base/server/app.py`), so a job method called here answers with the job's integer
-    /// id rather than the job's result (`api/base/server/method.py`, the `if app.legacy_jobs` arm) - exactly the silent
-    /// substitution [`legacy_jobs_in_force`] refuses the session over.
+    /// No caller's call may join yet, which is what makes [`Phase::Open`] mean ready to the public guards. Until the
+    /// echo lands the peer's `App.legacy_jobs` is still `true` (`api/base/server/app.py`), so a job method would answer
+    /// with its job id rather than its result.
     Setup,
     /// Serving: calls flow, notifications arrive.
     Open,
@@ -219,9 +206,8 @@ pub(crate) struct Session {
     legacy_jobs: bool,
     /// The peer-close report, captured when the close frame arrives so the transport-level close can name it.
     pub(crate) close_reason: Option<String>,
-    /// A `-32000` arrived and the backoff has not been given a clock yet. `on_answer` has no `Instant` (this half of
-    /// the client is sans-io), so the refusal is recorded here and `expire` - which the driver calls with `now` on
-    /// every pump iteration - turns it into `backoff_until`.
+    /// A `-32000` arrived and the backoff has no clock yet, since `on_answer` has no `Instant`. `expire` turns it into
+    /// `backoff_until`.
     backoff_armed: bool,
     /// While set, `drain_backlog` sends nothing. Cleared by `expire` once the instant passes; published through
     /// `next_deadline` so the pump wakes for it.
@@ -232,19 +218,15 @@ pub(crate) struct Session {
 
 /// Reissues of one call after a `-32000` before its caller is told.
 ///
-/// A refusal at the peer's hard concurrency limit is raised before the method is entered, so nothing ran and reissuing
-/// cannot double the call. This is how many times that is done silently. The caller's own `call_timeout` is the real
-/// bound - `expire` abandons the call whatever this says - so this exists to stop an unbounded reissue loop on a
-/// session with no call deadline set.
+/// The refusal comes before the method runs, so a reissue cannot double the call. A `call_timeout` still ends the call
+/// whatever this says, and this bound stops an endless reissue loop on a session without one.
 pub const MAX_CALL_RETRIES: u32 = 4;
 
 /// First pause after a `-32000`, doubled per consecutive refusal up to [`BACKOFF_CAP`].
 const BACKOFF_BASE: Duration = Duration::from_millis(100);
 
-/// Ceiling for the pause. What has to drain before the peer has room is other work - this client is not the only one
-/// against the limit - and a job method holds its slot for the whole job (`method.call` awaits `result.wait()` *inside*
-/// the semaphore, `api/base/server/ws_handler/rpc.py`), so the wait is seconds rather than milliseconds. Past this,
-/// waiting longer only delays noticing that the peer has recovered.
+/// Ceiling for the pause. A job method holds its server slot for the whole job, so the wait can be seconds, but past
+/// this a longer wait only delays noticing that the peer has recovered.
 const BACKOFF_CAP: Duration = Duration::from_secs(5);
 
 impl Session {
@@ -334,18 +316,13 @@ impl Session {
             // more).
             return Err(ApiError::TooLarge { len: frame.len(), cap });
         }
-        // A running backoff holds new calls too, not only the ones already queued. `-32000` frees a slot as it
-        // arrives - it is an answer - so a caller submitting on the next line would find `budget > 0` and go straight
-        // out into the same refusal, stepping around `drain_backlog`'s gate entirely.
+        // A running backoff holds new calls too. A `-32000` frees a slot as it arrives, so a call submitted next would
+        // find `budget > 0` and walk into the same refusal.
         let sending = self.budget > 0 && !self.backing_off();
-        // A backlog with no bound turns a caller that ignores backpressure into unbounded memory: every queued call
-        // holds its encoded frame, up to `max_outbound` each. Refuse the submission instead, in the vocabulary
-        // `queue_bulk` already uses for the same question. The refusal is before `pending.insert`, so a refused call
-        // leaves no tombstone to be answered.
+        // Refuse before `pending.insert`, so a refused call leaves no tombstone to be answered.
         if !sending {
-            // Two caps, and the first one tripped refuses. The count is a pipelining depth; the bytes are what actually
-            // bound memory, because a frame's ceiling is per method and the upload methods are 32x the ordinary one -
-            // so a count alone leaves the worst case at the wrong number by that factor.
+            // The count bounds pipelining depth and the bytes bound memory, since an upload method's frame may be 32
+            // times an ordinary one.
             if self.backlog.len() >= self.max_queued {
                 return Err(ApiError::QueueFull {
                     queue: "this session's call backlog, in calls",
@@ -410,10 +387,8 @@ impl Session {
                 if self.frag.is_some() {
                     return vec![Act::Fault("new data frame inside a fragmented message")];
                 }
-                // The cap covers an unfragmented message too, not only a reassembled one. The transport bounds this
-                // today - `ApiConfig::max_message_bytes` feeds both `max_reply_bytes` and `max_inbound`, so the reactor
-                // closes first - but the session is sans-io and states its own bound; a driver that framed these bytes
-                // some other way would otherwise hand `on_message` whatever the peer declared.
+                // The cap covers an unfragmented message too. The reactor already enforces it, but the session is
+                // sans-io and states its own bound for any other driver.
                 if payload.len() > self.max_inbound {
                     return vec![Act::Fault("message exceeds the inbound cap")];
                 }
@@ -561,22 +536,15 @@ impl Session {
                 return vec![Act::Fault("unparseable response")];
             }
         };
-        // JSON-RPC 2.0 §5: a Response carries `id: null` when the server could not recover an id from what it was
-        // answering - a parse error, or its own message failing to serialise. middlewared sends exactly that and keeps
-        // serving (`app.send_error(None, ...)` then `continue`, `api/base/server/ws_handler/rpc.py`), so it names no
-        // call of ours and tearing the session down over it would fail every healthy call in flight for a message the
-        // server already moved past. Surface it and carry on.
+        // JSON-RPC 2.0 §5 gives `id: null` to an error the server could not attribute. middlewared sends one and keeps
+        // serving (`api/base/server/ws_handler/rpc.py`), so it is reported and the session stays up.
         if matches!(reply.id(), Id::Null) {
             let report = match reply.outcome() {
                 Outcome::Failure(e) => from_rpc_error(e),
                 Outcome::Result(_) => ApiError::Protocol("a result Response with a null id names no call"),
             };
-            // §5 gives `null` one meaning: the server could not work out which request the error belongs to. So it
-            // belongs to none of ours in particular and to any of them in general - and the one that provoked it will
-            // never be answered, because the answer it would have had is this one. Leaving them pending strands each
-            // caller and keeps their budget slots: `expire` only abandons an entry with a deadline, `call_timeout` is
-            // `None` by default, so nothing would ever return them and `CALL_BUDGET` of these would wedge a healthy
-            // session.
+            // The call that provoked it will never be answered, and with no `call_timeout` nothing else would end it,
+            // so every call in flight is failed. See `fail_outstanding` for what they keep.
             let mut acts = vec![Act::ServerError(report)];
             acts.extend(self.fail_outstanding(
                 "the server reported an error it could not attribute to a \
@@ -587,10 +555,8 @@ impl Session {
         let Some(p) = self.pending.remove(reply.id()) else {
             return vec![Act::Fault("response to no outstanding call")];
         };
-        // An answer naming a call that never reached the wire is not a Response: JSON-RPC 2.0 §5 requires a Response's
-        // id to be the id of a Request the peer received, and this one was never sent. It is still sitting in
-        // `backlog`, so crediting a slot it never spent would put it on the wire with no `pending` entry - its real
-        // answer would then fault the session, after a fabricated result had already been handed to the caller.
+        // An answer for a call still in `backlog` names a request the peer never received (JSON-RPC 2.0 §5). Crediting
+        // it would send that call with no `pending` entry.
         if !p.sent {
             return vec![Act::Fault("answer for a call never sent")];
         }
@@ -602,10 +568,8 @@ impl Session {
             "budget {} exceeded CALL_BUDGET {CALL_BUDGET}",
             self.budget
         );
-        // A `-32000` says the peer is at its hard concurrency limit (`SoftHardSemaphore(10, 20)`,
-        // `api/base/server/ws_handler /rpc.py`). Arm the backoff *before* draining, or this answer's freed slot
-        // immediately sends a queued call into the same refusal. Abandoned or not: the refusal describes the server,
-        // not the call.
+        // A `-32000` means the peer is at its hard limit. Arm the backoff before draining, or this answer's freed slot
+        // sends a queued call into the same refusal, whether or not this call was abandoned.
         let refused = matches!(
             reply.outcome(),
             Outcome::Failure(e)
@@ -614,10 +578,8 @@ impl Session {
         if refused {
             self.backoff_armed = true;
             self.backoff_step = self.backoff_step.saturating_add(1);
-            // The limit is the server's, and this client is not the only one against it, so the call was refused for
-            // load it did not create and its caller has nothing to fix. Reissue it after the pause instead of reporting
-            // it - `__aenter__` raises above `hardlimit` before `counter += 1` and before `method.call`
-            // (`middlewared/utils/lock.py`), so the method did not run and a reissue cannot double it.
+            // Reissue the call after the pause rather than report it. `__aenter__` raises above `hardlimit` before
+            // `method.call` (`middlewared/utils/lock.py`), so the method did not run.
             if !p.abandoned
                 && p.retries < MAX_CALL_RETRIES
                 && let Some(frame) = p.retry_frame.clone()
@@ -652,9 +614,7 @@ impl Session {
         };
         match p.kind {
             Kind::SetOptions => match outcome {
-                // The server echoes the options it put in force, and the echo is the authority - not the request.
-                // Asking for modern job answering and being given legacy answering silently would make every job call's
-                // result the job's integer id where the caller expects the job's result.
+                // The echo is the authority, not the request (see `legacy_jobs_in_force`).
                 Ok(raw) => match legacy_jobs_in_force(&raw) {
                     Some(false) => {
                         // The echo is in force, so this is the moment the session may take a caller's call:
@@ -718,13 +678,8 @@ impl Session {
     /// Send whatever the refilled budget admits.
     fn drain_backlog(&mut self) -> Vec<Act> {
         let mut acts = Vec::new();
-        // §5.5.1: "MUST NOT send any more data frames after sending a Close frame". A queued call is a data frame, and
-        // the answer that frees a budget slot can arrive after our Close has gone out - the peer's own close, echoed
-        // here, or a local `close()` - so without this the next `on_answer` puts a fresh `core.*` request on a
-        // connection this endpoint already considers closed. The server role refuses the whole class one level up
-        // (`OP_TEXT | OP_CONT if closing`, `server.rs`); the client keeps reading, because an answer that has already
-        // arrived is worth delivering, and refuses only the sending. `fail_all` clears the backlog and fails those
-        // calls when the transport close lands.
+        // RFC 6455 §5.5.1 forbids data frames after our Close, and an answer that frees a slot can arrive after it.
+        // Answers are still delivered, nothing queued is sent, and `fail_all` fails the backlog at the transport close.
         if matches!(self.phase, Phase::Closing) {
             return acts;
         }
@@ -791,11 +746,8 @@ impl Session {
     /// by the server and must be recognized when they land); a tombstone still in the backlog is dropped at drain
     /// instead.
     ///
-    /// Abandoning a call does **not** return its concurrency slot. The caller has been handed [`ApiError::Timeout`] and
-    /// is free to issue another call, but middlewared was told nothing and is still running the method inside its
-    /// semaphore; crediting the slot here would put more work in front of the server than [`CALL_BUDGET`] and walk into
-    /// the `-32000` that ceiling exists to stay clear of. The slot comes back where every slot does, in `on_answer`,
-    /// when the answer this tombstone is waiting for lands.
+    /// Abandoning a call does **not** return its concurrency slot. middlewared is still running the method, so the slot
+    /// comes back in `on_answer` when the late answer lands.
     pub(crate) fn expire(&mut self, now: Instant) -> Vec<Act> {
         let mut acts = Vec::new();
         for p in self.pending.values_mut() {
@@ -816,10 +768,8 @@ impl Session {
         if self.backoff_armed {
             let step = self.backoff_step.saturating_sub(1).min(16);
             let full = BACKOFF_BASE.saturating_mul(1u32 << step).min(BACKOFF_CAP);
-            // Equal jitter: half the window, plus a random part of the rest. The limit is shared, so every client
-            // against it is refused at the same moment and a fixed delay would march them back in step - the thundering
-            // herd re-forming on each retry. Entropy from `getrandom(2)`, the source the frame masks already use,
-            // rather than a new dependency.
+            // Equal jitter, half the window plus a random part of the rest, so clients refused together do not come
+            // back in step. The entropy is the frame masks' `getrandom(2)`.
             let r = u32::from_be_bytes(ws::mask_key());
             let half = full / 2;
             let delay = half + half.mul_f64(f64::from(r) / f64::from(u32::MAX)).min(half);
@@ -833,18 +783,11 @@ impl Session {
         acts
     }
 
-    /// Every live call, failed at once - the session is going away.
     /// Fail every call this session has accepted, and keep serving.
     ///
-    /// The teardown twin below drains `pending` outright, because a session being dropped will never see another
-    /// answer. This one is called on a session that survives, so **a sent call keeps its entry and its slot**: telling
-    /// the caller the call is over says nothing to the server, which is still running it and still owes an answer.
-    /// Dropping the entry makes that answer match nothing and fault the session with "response to no outstanding
-    /// call" - the exact teardown this is here to avoid. Marking it abandoned is what `expire` does for the same
-    /// reason, and the slot comes back where every other slot does, in `on_answer`.
-    ///
-    /// `Kind::SetOptions` is not failed at all: it has no caller-visible id to report against. A setup that never
-    /// completes is what `connect_timeout` is for.
+    /// **A sent call keeps its entry and its slot**, marked abandoned as `expire` does, because the server still owes
+    /// its answer and a dropped entry would make that answer fault the session. `Kind::SetOptions` is not failed, since
+    /// it has no caller-visible id, and `connect_timeout` covers a setup that never completes.
     pub(crate) fn fail_outstanding(&mut self, why: &'static str) -> Vec<Act> {
         let mut acts = Vec::new();
         self.pending.retain(|_, p| {
@@ -873,6 +816,7 @@ impl Session {
         acts
     }
 
+    /// Every live call, failed at once - the session is going away.
     pub(crate) fn fail_all(&mut self, why: &str) -> Vec<Act> {
         self.frag = None;
         let mut acts = Vec::new();
@@ -892,17 +836,12 @@ impl Session {
 
 /// What `core.set_options` reports it put in force, or `None` if it reports nothing.
 ///
-/// middlewared echoes the applied options and the reference Python client reads `legacy_jobs` back out of that echo
-/// rather than trusting its own request (`truenas_api_client/__init__.py`, the `_set_options_call` arm).
+/// The echo, not the request, is the authority, as in the reference Python client (`truenas_api_client/__init__.py`).
 ///
-/// **`None` is a refusal, not a shrug.** Every API version that honours the option answers with a required object -
-/// `CoreSetOptionsResult { result: CoreOptions }`, and `CoreOptions` declares `legacy_jobs`
-/// (`middlewared/api/v26_0_0/core.py`). A version that does not honour it is exactly the one that answers nothing:
-/// `api/v25_04_1/core.py` accepts only `py_exceptions` and drops the rest (`extra="ignore"`), and
-/// `CoreSetOptionsResult.to_previous` in `api/v25_10_0/core.py` rewrites the echo to `null` on the way down. Its
-/// `App.legacy_jobs` then stays at its default of `true`. So a silent echo means legacy answering is in force, and the
-/// session must not proceed believing otherwise. [`validate_endpoint`] refuses those API versions up front; this is the
-/// check that does not depend on the endpoint being read correctly.
+/// **`None` is a refusal.** Every API version that honours the option echoes `legacy_jobs`
+/// (`middlewared/api/v26_0_0/core.py`), and older ones drop it and echo `null` (`api/v25_04_1/core.py`,
+/// `CoreSetOptionsResult.to_previous` in `api/v25_10_0/core.py`), leaving legacy answering in force.
+/// [`validate_endpoint`] refuses those versions up front, and this check does not depend on the endpoint.
 fn legacy_jobs_in_force(raw: &RawValue) -> Option<bool> {
     serde_json::from_str::<serde_json::Value>(raw.get())
         .ok()?

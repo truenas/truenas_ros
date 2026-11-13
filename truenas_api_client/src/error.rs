@@ -16,10 +16,9 @@ pub const TOO_MANY_CONCURRENT_CALLS: i64 = -32000;
 /// [`CallError`].
 pub const CALL_ERROR: i64 = -32001;
 
-/// JSON-RPC 2.0 §5.1's `-32602`, which middlewared answers a validation failure with - carrying the *same* `data`
-/// payload as [`CALL_ERROR`], and the only code that carries `extra` (`middlewared/api/base/server/ws_handler/rpc.py`:
-/// `send_truenas_validation_error` -> `format_truenas_validation_error` -> `format_truenas_error`). The reference
-/// Python client decodes both codes for exactly that reason.
+/// JSON-RPC 2.0 §5.1's `-32602`, which middlewared answers a validation failure with. It carries the same `data`
+/// payload as [`CALL_ERROR`], and is the only code whose `extra` is the per-attribute list
+/// (`format_truenas_validation_error`, `middlewared/api/base/server/ws_handler/rpc.py`).
 pub const INVALID_PARAMS: i64 = -32602;
 
 /// One entry of a middlewared validation error's `extra` list: `(attribute, message, errno)`.
@@ -63,12 +62,8 @@ pub struct CallError {
     pub trace: Option<Trace>,
     /// Validation failures as `(attribute, message, errno)` triples.
     ///
-    /// Populated only when `data.extra` really is that list, which is the `-32602` shape:
-    /// `send_truenas_validation_error` passes `ValidationErrors`, whose `__iter__` yields `(attribute, errmsg, errno)`.
-    /// On `-32001` the member is whatever the raiser handed `CallError(..., extra=...)`, and every raiser in
-    /// middlewared hands it a **dict** - `{'dependencies': [...]}` from `crud_service.py`'s delete-with-dependents, the
-    /// open-files report from `pool_/dataset_processes.py`. Those arrive in [`CallError::extra_raw`] instead of being
-    /// dropped.
+    /// Populated only for the `-32602` shape. On `-32001` middlewared's raisers pass a dict, such as the dependents
+    /// that block a delete, and that arrives in [`CallError::extra_raw`] instead.
     pub extra: Option<Vec<ExtraError>>,
     /// `data.extra` exactly as the server sent it, whatever its shape.
     ///
@@ -103,7 +98,7 @@ pub enum ApiError {
         /// The server's message.
         message: String,
     },
-    /// Any other JSON-RPC error object (`-32601` method not found, `-32602` invalid params, ...).
+    /// Any other JSON-RPC error object, such as `-32601` method not found.
     Rpc {
         /// The JSON-RPC error code.
         code: i64,
@@ -140,13 +135,12 @@ pub enum ApiError {
     Io(io::Error),
     /// A payload did not decode into the requested type.
     Decode(serde_json::Error),
-    /// A queue is at its bound and the work was not accepted: the deferred [`queue_bulk`](crate::ApiClient::queue_bulk)
-    /// queue ([`ApiConfig::max_queued_bulk_items`](crate::ApiConfig::max_queued_bulk_items)), or a session's own
-    /// backlog behind its concurrency budget ([`ApiConfig::max_queued_calls`](crate::ApiConfig::max_queued_calls)).
-    /// Retry once earlier work drains.
+    /// A queue is at its bound and the work was not accepted. It is the deferred
+    /// [`queue_bulk`](crate::ApiClient::queue_bulk) queue, a session's backlog behind its concurrency budget, or the
+    /// events a blocking wait set aside ([`ApiConfig`](crate::ApiConfig) holds each bound). Retry once earlier work
+    /// drains.
     QueueFull {
-        /// Which bound was reached, in the units it counts - four different queues raise this and an operator reading
-        /// the message needs to know which. See the producers in `bulk.rs`, `session.rs` and `lib.rs`.
+        /// Which bound was reached, in the units it counts.
         queue: &'static str,
         /// The configured bound, in `queue`'s units.
         cap: usize,
@@ -245,9 +239,8 @@ pub(crate) fn from_rpc_error(e: &truenas_jsonrpc::ErrorObject) -> ApiError {
 
 /// One member of a JSON-RPC `error.data` object, decoded on its own.
 ///
-/// `None` when `data` is absent or not an Object, when the member is absent or `null`, or when it will not decode into
-/// `T` - the last of which is the point: JSON-RPC 2.0 §5.1 leaves `data` entirely to the server, so a client must be
-/// able to lose one drifted member without losing the rest.
+/// `None` when `data` is not an Object, or the member is absent, `null` or will not decode into `T`. JSON-RPC 2.0 §5.1
+/// leaves `data` to the server, so one drifted member must not lose the rest.
 fn member<T: DeserializeOwned>(data: Option<&Value>, name: &str) -> Option<T> {
     data.and_then(Value::as_object)
         .and_then(|m| m.get(name))
@@ -257,9 +250,7 @@ fn member<T: DeserializeOwned>(data: Option<&Value>, name: &str) -> Option<T> {
 
 /// Decode middlewared's TrueNAS error payload out of an error object's `data`, one member at a time (see [`member`]).
 ///
-/// Shared by the two codes that carry that payload: `-32001`, and `-32602`, which is the one that actually delivers
-/// `extra`. Per-member decoding matters most here - a validation failure's `extra` is the part most likely to gain a
-/// field, and losing it must not also lose `errname`.
+/// Shared by `-32001` and `-32602`. Decoding per member means a drifted `extra` does not also lose `errname`.
 fn call_error(e: &truenas_jsonrpc::ErrorObject) -> CallError {
     let data = e.data();
     CallError {
@@ -283,11 +274,9 @@ mod tests {
     use serde_json::json;
     use truenas_jsonrpc::ErrorObject;
 
-    /// middlewared's validation failure: -32602 with the full TrueNAS payload, including the per-attribute `extra`
-    /// list. It decodes like -32001 rather than being handed back as an opaque blob. `format_truenas_error` always
-    /// emits the member - `"extra": extra` with `extra` defaulting to `None` (`api/base/server/ws_handler/rpc.py`) - so
-    /// the common `-32001` carries `"extra": null`. Without the null filter `extra_raw` would be `Some(Value::Null)`
-    /// and a caller testing `is_some()` would act on a payload that is not there.
+    /// `format_truenas_error` always emits `extra`, as `null` on a common `-32001`
+    /// (`api/base/server/ws_handler/rpc.py`). A null member is absent, so a caller testing `extra_raw.is_some()` does
+    /// not act on a payload that is not there.
     #[test]
     fn a_null_extra_is_absent_not_present() {
         let e = ErrorObject::new(CALL_ERROR, "Method call error").with_data(serde_json::json!({
@@ -355,6 +344,8 @@ mod tests {
         }
     }
 
+    /// middlewared's validation failure, `-32602` with the full TrueNAS payload and its per-attribute `extra` list,
+    /// decodes like `-32001` rather than as an opaque blob.
     #[test]
     fn a_validation_error_decodes_its_payload() {
         let e = ErrorObject::new(INVALID_PARAMS, "Invalid params").with_data(json!({

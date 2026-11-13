@@ -55,16 +55,9 @@ fn bulk_flush_groups_by_method() {
     mock.join();
 }
 
-/// A session still dialing is not a dead one.
-///
-/// `queue_bulk` admits an item against any session the client knows, and the tick clock starts due (`last_tick` is
-/// `None`), so the first `pump` after a `connect_start` reaches the flush loop while the session is still in
-/// `AwaitingHead`. The flush could not send anything there -- `call_start` refuses a session that is not `Open` - but
-/// `take_chunk` had already removed the items, so every one of them was failed `ApiError::Closed` against a session
-/// that was about to be healthy.
-///
-/// The mock holds the upgrade back so the window is wide enough to pump through; the assertion is that no ticket
-/// answers before the session is ready, and that the item then flushes and succeeds.
+/// A session still dialing is not a dead one. The tick starts due, so the first `pump` after `connect_start` reaches
+/// the flush while the session is in `AwaitingHead`, and its items must wait for it rather than fail `Closed`. The mock
+/// holds the upgrade back so the window is wide enough to pump through.
 #[test]
 fn bulk_items_survive_a_dialing_session() {
     let mock = serve_one(|mut w: Wire| {
@@ -378,9 +371,8 @@ fn bulk_tick_flushes_automatically() {
     mock.join();
 }
 
-/// RFC 6455 §5.5.1 on the wire, not just in the session: nothing with a data opcode may follow this client's own Close
-/// frame. `unsubscribe_start` was the one public call with no `Phase::Open` guard - its two siblings have one - and it
-/// reaches `Act::Send` through `submit`, so the backlog's own phase gate never sees it.
+/// Nothing with a data opcode follows this client's own Close on the wire (RFC 6455 §5.5.1), including an
+/// `unsubscribe_start`, which reaches `Act::Send` through `submit` past the backlog's phase gate.
 #[test]
 fn no_data_frame_follows_our_own_close() {
     let mock = serve_one(|mut w: Wire| {
@@ -468,8 +460,7 @@ fn an_expiry_sweep_after_our_close_sends_nothing() {
     for _ in 0..CALL_BUDGET {
         api.call_start(sid, "core.ping", &params!()).expect("start");
     }
-    // Submitted later, so its own deadline is still ahead when the eight sent calls have passed theirs and freed the
-    // budget it waits on.
+    // Submitted later, so its own deadline is still ahead when the eight sent calls pass theirs.
     std::thread::sleep(Duration::from_millis(150));
     api.call_start(sid, "queued.call", &params!()).expect("queued");
     std::thread::sleep(Duration::from_millis(80));

@@ -1,21 +1,16 @@
 //! A sans-io JSON-RPC *server* session over the `ws` server codec - the mirror of [`session`](crate::session)'s client
 //! half.
 //!
-//! It is the receiving end of the same protocol the client speaks: it accepts the upgrade (rather than requesting it),
-//! reads masked client frames (rather than unmasked server ones), and surfaces inbound *requests* for the application
-//! to answer (rather than correlating responses to its own calls). Like the client session it does no I/O: a driver
-//! feeds it the request head and unmasked frame payloads, and turns the [`ServerAct`]s it returns into socket writes.
-//! `tests/loopback.rs` drives it over a plain `UnixStream`; nothing in the parent crate can, since the dependency runs
-//! this way round and `net::server` cannot name a type from here.
+//! It accepts the upgrade, reads masked client frames, and surfaces inbound requests for the application to answer.
+//! Like the client session it does no I/O. A driver feeds it the request head and unmasked frame payloads, and turns
+//! the [`ServerAct`]s it returns into socket writes. `tests/loopback.rs` drives it over a plain `UnixStream`.
 //!
 //! A driver reads a frame's payload before the session ever sees it, so the inbound bound has to be consulted at the
 //! header: ask [`JsonRpcServer::max_message_bytes`] about the frame's declared `payload_len` and refuse the frame
 //! rather than allocating what the peer declared.
 //!
-//! What it deliberately does *not* do is dispatch: which methods exist and what they return is the application's, so a
-//! request surfaces as [`ServerAct::Request`] and the app answers with [`JsonRpcServer::reply`] /
-//! [`JsonRpcServer::reply_error`], and pushes events with [`JsonRpcServer::notify`]. This is exactly the boundary
-//! `truenas_jsonrpc` draws ("no method registry and no dispatch").
+//! It does not dispatch. A request surfaces as [`ServerAct::Request`], the app answers with [`JsonRpcServer::reply`] or
+//! [`JsonRpcServer::reply_error`], and pushes events with [`JsonRpcServer::notify`].
 
 use serde::Serialize;
 use serde_json::value::RawValue;
@@ -180,10 +175,8 @@ impl JsonRpcServer {
                     Vec::new()
                 }
             }
-            // `server_frame_head` refuses the reserved opcodes, so a driver that framed this head cannot reach here -
-            // but `on_frame` is `pub` and `FrameHead` is a plain struct with public fields and no constructor, so the
-            // invariant is asserted about a function the caller need not have used. Fault the session rather than
-            // panicking the thread that called us.
+            // `server_frame_head` refuses reserved opcodes, but `FrameHead` is a plain public struct a caller may build
+            // by hand, so fault rather than panic.
             _ => vec![ServerAct::Fault("reserved opcode")],
         }
     }
@@ -194,11 +187,8 @@ impl JsonRpcServer {
     }
 
     fn on_close_frame(&mut self, payload: &[u8]) -> Vec<ServerAct> {
-        // Nothing goes back out once this side has closed: §5.5.1 has an endpoint consider the connection closed after
-        // both sending and receiving a Close, so a second Close of ours would be a frame after the handshake finished.
-        // This guard sits above the length check because a *malformed* re-close is still a re-close - with the two in
-        // the other order a one-byte second body put another Close frame on a connection already closing, while a
-        // two-byte one was correctly silent.
+        // Nothing goes back out once this side has closed (§5.5.1). This guard sits above the length check, since a
+        // malformed re-close is still a re-close.
         if matches!(self.phase, Phase::Closing) {
             return Vec::new();
         }
@@ -221,13 +211,9 @@ impl JsonRpcServer {
             Some(code) => format!("client closed ({code})"),
             None => "client closed".to_owned(),
         });
-        // §5.5.1 says an endpoint "typically echos the status code it received", but §7.4.1 forbids ever *setting*
-        // 1005/1006/1015 and §7.4.2 leaves 0-999 unused and above 4999 undefined - so a code this endpoint may not send
-        // is answered with 1002 rather than mirrored back onto the wire. `close_echo_code` is the whole discipline, and
-        // it also catches the case an open-coded `is_sendable_close_code` test misses: §5.5.1 makes /reason/ UTF-8 and
-        // §8.1 makes an invalid stream fatal, so a reason that is not UTF-8 is answered 1007 rather than echoed. `None`
-        // means the peer sent no body, and the helper documents it as "answer with no body either" - which is what the
-        // client role does, so this role does it too rather than inventing a 1000 the peer never sent.
+        // `close_echo_code` answers a code this endpoint may not send (§7.4) with 1002, and a reason that is not UTF-8
+        // with 1007 (§8.1). `None` means the peer sent no body, and the echo carries none either, as in the client
+        // role.
         let echo = match ws::close_echo_code(payload) {
             Some(code) => code.to_be_bytes().to_vec(),
             None => Vec::new(),
@@ -239,13 +225,8 @@ impl JsonRpcServer {
     }
 
     fn on_message(&mut self, text: &[u8]) -> Vec<ServerAct> {
-        // RFC 6455 §8.1: a text frame whose payload is not valid UTF-8 fails the connection. This is not the same fault
-        // as bad JSON - that is a JSON-RPC error, answered `-32700` with the session still serving, which is what
-        // middlewared does and what the arms below implement. Only the encoding violation is a *WebSocket* one, and it
-        // is the codec's to catch: `ws` declines UTF-8 validation on the grounds that `serde_json` rejects non-UTF-8
-        // anyway, which is true of *detecting* it and says nothing about what each role then does. The client role
-        // reaches `Act::Fault` and closes; this role answered and kept serving, so a peer could stream arbitrarily many
-        // invalid-UTF-8 frames on a connection that should have been failed at the first.
+        // RFC 6455 §8.1 fails the connection over a text frame that is not UTF-8, and `ws` leaves that check to us. Bad
+        // JSON is a JSON-RPC error instead, answered `-32700` with the session still serving, as middlewared does.
         if std::str::from_utf8(text).is_err() {
             self.phase = Phase::Closing;
             self.frag = None;
@@ -271,22 +252,14 @@ impl JsonRpcServer {
             Incoming::Single(Call::Invalid { id, error, .. }) => {
                 vec![ServerAct::Send(error_frame(id, error))]
             }
-            // middlewared refuses batches, but it does not close over one: `parse_message` raises `ValueError('Batch
-            // messages are not supported at this time')` (`middlewared/utils/limits.py`) and the handler answers
-            // `-32700` and `continue`s (`api/base/server/ws_handler/rpc.py`). Mirroring it means answering, not
-            // faulting - a client that sends a batch by mistake gets an error and keeps its other calls.
+            // middlewared answers a batch `-32700` and keeps serving (`parse_message` in `middlewared/utils/limits.py`,
+            // and `api/base/server/ws_handler/rpc.py`), so this answers rather than faults.
             Incoming::Batch(_) => {
                 vec![ServerAct::Send(error_frame(Id::Null, not_an_object(text)))]
             }
-            // middlewared splits these two by *shape*, not by content, and one step earlier than this codec does.
-            // `parse_message` runs before any JSON-RPC validation: it raises for unparseable bytes, for a list, and for
-            // anything else without `.get` - and every one of those becomes `-32700` against a null id, after which the
-            // handler `continue`s (`middlewared/utils/limits.py`, `api/base/server/ws_handler/rpc.py`). Only a
-            // top-level *object* survives to `validate_message`, whose failures are `-32600` against the id it could
-            // recover.
-            //
-            // So the rule is the top-level shape: an object may be `-32600`, and everything else - a bare string, a
-            // number, `null`, an array empty or not, or bytes that are not JSON at all - is `-32700`.
+            // middlewared splits these by top-level shape in `parse_message`, before any JSON-RPC validation
+            // (`middlewared/utils/limits.py`). Only an object reaches `validate_message` and may be `-32600`, and
+            // anything else is `-32700` against a null id.
             Incoming::Invalid { error, .. } => {
                 if text.trim_ascii_start().first() == Some(&b'{') {
                     vec![ServerAct::Send(error_frame(Id::Null, error))]
@@ -323,14 +296,10 @@ impl JsonRpcServer {
 
     /// Begin a local close: the 1000 (normal closure) frame.
     ///
-    /// After this the session answers no more requests - §5.5.1 forbids a data frame after a Close - so an inbound
-    /// message is dropped rather than surfaced, and a Ping goes unanswered (§5.5.2).
+    /// After this the session surfaces no more requests and answers no Ping (§5.5.1, §5.5.2).
     ///
-    /// **Returns empty when this session has already closed**, because §5.5.1 forbids sending anything after a Close
-    /// and that includes a second Close. The peer's own Close puts the session here too, and it has already been
-    /// echoed, so a caller that then closes locally would otherwise put two Close frames on the wire.
-    /// `Session::start_close` guards from the same signature; this is the same rule for the role whose version of it is
-    /// public. Write nothing when the answer is empty.
+    /// **Returns empty when this session has already closed**, by either side, since §5.5.1 forbids a second Close.
+    /// Write nothing when the answer is empty.
     pub fn close(&mut self) -> Vec<u8> {
         if matches!(self.phase, Phase::Closing) {
             return Vec::new();
@@ -359,18 +328,15 @@ const CLOSE_PROTOCOL_ERROR: u16 = 1002;
 /// that is not valid UTF-8.
 const CLOSE_INVALID_PAYLOAD: u16 = 1007;
 
-/// middlewared's answer to anything that is not a top-level JSON object: `parse_message` raises before any JSON-RPC
-/// validation and the handler turns the `ValueError` into `INVALID_JSON` (`-32700`) against a `None` id, then keeps
-/// serving (`middlewared/utils/limits.py`, `api/base/server/ws_handler/rpc.py`). Its own text for the list case is
-/// kept, since a batch is the shape a client is most likely to send on purpose.
+/// middlewared's `-32700` answer to anything that is not a top-level JSON object, with its own reason text
+/// (`middlewared/utils/limits.py`, `api/base/server/ws_handler/rpc.py`).
 fn not_an_object(text: &[u8]) -> ErrorObject {
     let e = ErrorObject::parse_error();
     if text.trim_ascii_start().first() == Some(&b'[') {
         return e.with_reason("Batch messages are not supported at this time");
     }
-    // Well-formed JSON that is simply not an object - a bare string, a number, `true`, `null`. middlewared reaches
-    // these through the same `except Exception` and says something different, so this does too: telling a client that
-    // sent `"hello"` that batches are unsupported diagnoses the wrong thing.
+    // Well-formed JSON that is not an object, such as a bare string, gets middlewared's other text rather than the
+    // batch reason, which would diagnose the wrong thing.
     if serde_json::from_slice::<serde_json::Value>(text).is_ok() {
         return e.with_reason("Invalid Message Format");
     }
@@ -623,14 +589,8 @@ mod tests {
     }
 
     /// A text frame that is not valid UTF-8 fails the connection (RFC 6455 §8.1), rather than being answered and served
-    /// past.
-    ///
-    /// This is a narrower rule than "bad input closes": JSON that is valid UTF-8 but not a JSON-RPC message is answered
-    /// `-32700` with the session still open, because that is a JSON-RPC error and what middlewared does. Only the
-    /// encoding violation is a WebSocket protocol one. The two controls below are what separate them - the codec
-    /// declines UTF-8 validation on the grounds that `serde_json` rejects non-UTF-8 anyway, which is true of detecting
-    /// it and says nothing about what the role then does, and this role answered and kept serving where the client role
-    /// faults.
+    /// past. The controls show where the line falls, since valid UTF-8 that is not JSON is answered `-32700` with the
+    /// session still serving.
     #[test]
     fn invalid_utf8_in_a_text_frame_fails_the_connection() {
         // 0xFF is not a valid UTF-8 byte anywhere.
@@ -671,15 +631,8 @@ mod tests {
         );
     }
 
-    /// Only one Close ever goes out, whoever started it.
-    ///
-    /// §5.5.1 forbids sending anything after a Close, and that includes a second Close. The peer's Close already puts
-    /// this session in `Closing` and has been echoed, so a caller that then closes locally would put two on the wire.
-    /// `Session::start_close` guards from the same signature and is `pub(crate)`; this one is `pub`, so it is the one a
-    /// consumer can trip.
-    ///
-    /// The two controls are what make this more than "close returns empty": a lone local close must still emit, and a
-    /// *second* peer Close must not be echoed either.
+    /// Only one Close ever goes out, whoever started it (§5.5.1). The controls check that a lone local close still
+    /// emits and that a second peer Close is not echoed either.
     #[test]
     fn only_one_close_frame_goes_out() {
         // The peer closed first; the echo is that one Close.
@@ -710,8 +663,7 @@ mod tests {
         );
     }
 
-    /// A close releases the reassembly buffer instead of holding it to the session's own end. `Session` does this; this
-    /// role did not.
+    /// A close releases the reassembly buffer instead of holding it to the session's own end.
     #[test]
     fn a_close_releases_an_open_reassembly() {
         for close_locally in [true, false] {
@@ -798,9 +750,8 @@ mod tests {
         }
     }
 
-    /// §5.5.1: once a Close has been both sent and received the connection is closed, so no second Close goes out -
-    /// including for a re-close whose body is malformed, which the length check used to answer ahead of the closing
-    /// guard.
+    /// Once a Close has been both sent and received the connection is closed, so no second Close goes out, even for a
+    /// re-close whose body is malformed (§5.5.1).
     #[test]
     fn cr5_a_malformed_re_close_stays_silent() {
         let mut s = open_server();
@@ -810,8 +761,7 @@ mod tests {
         // A SECOND close with a 2-byte body is correctly silent.
         let quiet = s.on_frame(head(true, OP_CLOSE, 2), vec![0x03, 0xE8]);
         assert!(quiet.is_empty(), "2-byte re-close is silent: {quiet:?}");
-        // A second close with a ONE-byte body is not: the length check sits above the Phase::Closing guard, so it emits
-        // a second Close frame.
+        // So is one with a one-byte body, since the closing guard sits above the length check.
         let again = s.on_frame(head(true, OP_CLOSE, 1), vec![0x03]);
         assert!(
             again.is_empty(),

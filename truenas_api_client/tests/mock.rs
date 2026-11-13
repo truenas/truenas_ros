@@ -323,8 +323,7 @@ fn fragmented_message_with_interleaved_ping() {
     mock.join();
 }
 
-/// A hundred pings answered without wedging anything - the `awaiting`-FIFO analysis pinned at the API level - and a
-/// call still round-trips afterwards.
+/// A hundred pings are answered without wedging anything, and a call still round-trips afterwards.
 #[test]
 fn ping_flood_never_wedges() {
     const FLOOD: usize = 100;
@@ -411,10 +410,8 @@ fn server_close_mid_call() {
 
 /// A timed-out call surfaces `Timeout`, its late answer is dropped silently, and the session keeps working.
 ///
-/// The mock never *withholds* the fresh call's answer - a mock is sequential, so sleeping before reading the fresh call
-/// would time the fresh call out too, which is a test artifact, not the behavior under test. Instead it reads the slow
-/// call, waits for the fresh call (the client sends it only after the slow one times out), answers the fresh one at
-/// once, and answers the slow one *late* - the abandoned answer the session must swallow.
+/// The mock answers the fresh call at once and the slow one after it, since a sequential mock that slept would time the
+/// fresh call out too.
 #[test]
 fn call_timeout_abandons() {
     let mock = serve_one(|mut w: Wire| {
@@ -621,23 +618,16 @@ fn call_start_is_non_blocking() {
     mock.join();
 }
 
-/// A timed-out call returns its concurrency slot. `CALL_BUDGET` calls the server never answers, all timed out locally,
-/// must not leave the session unable to send anything further: the caller has just been handed `Timeout` for each and
-/// is entitled to issue more.
-///
-/// Under the defect this covers, the call after the timeouts is accepted (`call_start` answers `Ok`) but never reaches
-/// the wire, so the mock's `expect_call("after.timeouts")` reads the close frame instead and panics - a failure, not a
-/// hang.
+/// A timed-out call keeps its concurrency slot until the server answers it. With `CALL_BUDGET` calls timed out a
+/// further call waits, and the late answer to one of them frees the slot that sends it.
 #[test]
 fn a_timed_out_call_returns_its_budget_slot() {
     let mock = serve_one(|mut w: Wire| {
         w.accept_session("/api/current");
         // Fill the budget and answer none of it.
         let ids: Vec<_> = (0..CALL_BUDGET).map(|_| w.expect_call("core.ping").0).collect();
-        // A call issued after every one of those timed out must NOT reach the wire: this server is still holding all
-        // eight, and being told nothing by the client giving up.
-        // Long enough to cover the client's submission (which follows the 250 ms timeouts) and short enough that the
-        // answer below still beats that submission's own deadline.
+        // A call issued after those time out must not reach the wire while this server holds every slot. The quiet
+        // window covers the client's submission after the 250 ms timeouts and ends before that call's own deadline.
         let quiet = w.count_client_text_frames_until_quiet(Duration::from_millis(350));
         assert_eq!(quiet, 0, "the client sent more while the server held every slot");
         // Answering one is what frees a slot - and the tombstone for that long-abandoned call must still correlate, or
@@ -695,11 +685,8 @@ fn a_timed_out_call_returns_its_budget_slot() {
 }
 
 /// `core.set_options`' answer is the authority on what is in force, not the request. A server that answers
-/// `legacy_jobs: true` after this session asked for modern answering must fail setup, because every job call's result
-/// would then be the job's integer id where the caller expects the job's result — a silently wrong value, not an error.
-///
-/// The reference Python client reads the same echo (`truenas/api_client`, the `_set_options_call` arm) rather than
-/// trusting its own request.
+/// `legacy_jobs: true` after this session asked for modern answering must fail setup, or every job call would silently
+/// return its job id.
 #[test]
 fn a_set_options_echo_contradicting_the_request_fails_setup() {
     let mock = serve_one(|mut w: Wire| {
@@ -856,16 +843,8 @@ fn an_unrepresentable_timeout_is_no_timeout() {
 }
 
 /// Every route that removes a session drains `pending` first, so a call the session accepted is answered rather than
-/// stranded.
-///
-/// This is the surviving half of what `Phase::Setup` made unconstructible. `call_start` now refuses until the setup
-/// echo lands, so no caller call can be in flight when `Act::SetupFailed` or `Act::Failed` fires - but the property
-/// those two routes were given `fail_session` for is about *every* removal route, and `Act::Fault` reaches a session
-/// that is fully open with real work outstanding.
-///
-/// Strand it and `ApiClient::call` waits on a `CallDone` that can never come, for as long as `call_timeout` allows -
-/// which is for ever by default. `SessionClosed` does not substitute: `wait_for`'s predicate is per-event, so a
-/// session-level report is stashed as a skipped event rather than delivered as the call's answer.
+/// stranded. `Act::Fault` reaches a session that is fully open with work outstanding, and a stranded call would leave
+/// `ApiClient::call` waiting for ever under the default `call_timeout`.
 #[test]
 fn a_faulted_session_answers_the_call_it_accepted() {
     let mock = serve_one(|mut w: Wire| {
@@ -917,12 +896,7 @@ fn a_faulted_session_answers_the_call_it_accepted() {
 }
 
 /// No caller's call joins a session whose setup has not answered, and a setup that then fails still reports itself.
-///
-/// `connect_start` promises calls before ready are refused, and the window this closes is the one where they were not:
-/// `Phase::Open` used to be set at the `101`, with `core.set_options` still outstanding. In that window the peer's
-/// `App.legacy_jobs` is at its default of `true` (`api/base/server/app.py`), so a job method answers with the job's
-/// integer id rather than the job's result (`api/base/server/method.py`) - the silent substitution
-/// `legacy_jobs_in_force` fails the whole session over when the echo says it.
+/// Until the echo lands the peer would answer a job method with its job id (`api/base/server/app.py`).
 #[test]
 fn no_call_is_accepted_before_setup_answers() {
     let mock = serve_one(|mut w: Wire| {
@@ -1062,12 +1036,8 @@ fn a_blocking_wait_will_not_buffer_without_bound() {
     mock.join();
 }
 
-/// A wait refused by `max_waiting_events` must not be refused again on the events the refusal itself put back.
-///
-/// `wait_for` restores its set-aside to the front of `self.out`, and `pump` drains `self.out` before it touches the
-/// transport. Counting a restored event made the refusal self-sustaining: every later `call` tripped the cap on the
-/// previous one's stash without doing any I/O, so a healthy server answering every request could not get an answer
-/// through, and the frames those calls had just handed the transport were never flushed.
+/// A wait refused by `max_waiting_events` must not be refused again on the events the refusal itself put back, or every
+/// later `call` would be refused without any I/O and its frame never flushed.
 #[test]
 fn a_refused_wait_does_not_refuse_the_calls_that_follow_it() {
     use std::sync::Arc;
@@ -1109,12 +1079,8 @@ fn a_refused_wait_does_not_refuse_the_calls_that_follow_it() {
     }
     mock.join();
     let n = seen.load(Ordering::SeqCst);
-    // With the refusal counting its own restored stash, exactly ONE of the twenty ever reached the wire - the wait
-    // short-circuited before any I/O, so even the frames already handed to the transport were never flushed.
-    //
-    // The number that should reach it is the concurrency budget, and no more: this mock answers nothing, and a call the
-    // server has not answered is one it is still running, so its slot does not come back when the client times out.
-    // What the wedge did is bound this by the *wait* rather than by the budget.
+    // The concurrency budget, and not a refused wait, bounds how many reach the wire. This mock answers nothing, so no
+    // slot comes back when a call times out.
     assert_eq!(
         n, CALL_BUDGET,
         "the concurrency budget is what bounds how many of the {ISSUED} \
