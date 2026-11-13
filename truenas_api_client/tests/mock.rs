@@ -621,7 +621,7 @@ fn call_start_is_non_blocking() {
 /// A timed-out call keeps its concurrency slot until the server answers it. With `CALL_BUDGET` calls timed out a
 /// further call waits, and the late answer to one of them frees the slot that sends it.
 #[test]
-fn a_timed_out_call_returns_its_budget_slot() {
+fn a_timed_out_call_holds_its_slot_until_the_server_answers() {
     let mock = serve_one(|mut w: Wire| {
         w.accept_session("/api/current");
         // Fill the budget and answer none of it.

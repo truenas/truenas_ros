@@ -510,7 +510,7 @@ fn a_full_backlog_refuses_rather_than_growing() {
 /// A locally timed-out call keeps its concurrency slot and its tombstone until the server answers, and that late answer
 /// frees the slot once, releasing the next queued call.
 #[test]
-fn a_timed_out_call_frees_its_slot_and_a_late_answer_credits_once() {
+fn a_timed_out_call_keeps_its_slot_until_a_late_answer_frees_it_once() {
     use serde_json::value::RawValue;
     let mut s = session();
     let args = RawValue::from_string("[]".to_owned()).unwrap();
