@@ -34,9 +34,7 @@ fn stamp_select(_sqe: &mut IoUringSqe, _select: Option<u16>) {}
 /// request may be.
 ///
 /// The `RECV_CHUNK` term is slack, not rounding: `pump_gate` closes a connection only *above* `max_request_bytes`, so a
-/// scanning (`Framing::More`) read can be armed at that offset and still ask for `RECV_CHUNK` more. Including it means
-/// a server whose cap already sits below the working size gets a buffer no legal read can overrun, so the promote path
-/// never fires there.
+/// scanning (`Framing::More`) read can be armed at that offset and still ask for `RECV_CHUNK` more.
 #[cfg(feature = "net-server")]
 pub(crate) fn recv_pool_buf_len(buffer_bytes: usize, max_request_bytes: usize) -> usize {
     buffer_bytes.min(max_request_bytes).saturating_add(RECV_CHUNK)
@@ -111,18 +109,13 @@ fn need_step(n: usize, buffered: usize, max_request_bytes: usize, in_message: bo
     }
 }
 
-/// The pump's per-verdict framing decision, factored out as a **pure** function so it can be exhaustively fuzzed
-/// (`fuzz/fuzz_targets/framing_arithmetic.rs`) independently of the io_uring loop: given a framer's [`Framing`]
-/// verdict, the bytes currently buffered, and the two size limits, decide what to do next -- read more, deliver, or
-/// close - applying every overflow and cap guard.
+/// Decide what the pump does with one [`Framing`] verdict, given the bytes buffered and the two size limits.
 ///
-/// The safety contract the fuzzer verifies for **every** input: a [`FrameStep::Deliver`] implies `header_len +
-/// body_len` does not overflow and is `<= buffered` (so delivery's `buf[..header_len]` then `[..body_len]` slices stay
-/// in bounds); a placing [`FrameStep::ReadBody`] implies `header_len <= buffered < header_len + body_len` (so the
-/// placement carve cannot underflow); a [`FrameStep::SpliceBody`] implies `buffered == header_len` (the whole header,
-/// and nothing past it, is buffered - the body is spliced, never sliced from `buf`) and that `header_len + body_len`
-/// does not overflow. Any verdict that would breach a cap or overflow becomes [`FrameStep::Close`], never an
-/// out-of-bounds action.
+/// Pure, so it is fuzzed apart from the loop (`fuzz/fuzz_targets/framing_arithmetic.rs`) against this contract for
+/// every input. A [`FrameStep::Deliver`] has a `header_len + body_len` that does not overflow and is `<= buffered`. A
+/// placing [`FrameStep::ReadBody`] has `header_len <= buffered < header_len + body_len`. A [`FrameStep::SpliceBody`]
+/// has `buffered == header_len` and a sum that does not overflow. Any verdict that would breach a cap or overflow
+/// becomes [`FrameStep::Close`].
 pub fn frame_step(
     verdict: Framing,
     buffered: usize,
@@ -304,21 +297,14 @@ impl<U> Reactor<U> {
         self.kick_send(slot, generation)
     }
 
-    /// Continue a kTLS exact recv whose completion came up short: io_uring cannot `MSG_WAITALL`-accumulate a `RECVMSG`
-    /// carrying a control buffer, so the remainder is read with a fresh op. The connection's cursor was
-    /// already advanced ([`crate::net::core::conn::RecvOutcome::Again`]);
-    /// re-point the `msghdr` (which also resets the control buffer for the next record-type cmsg) and re-arm. Like the
-    /// initial recv it carries the request clock (a continuation is mid-request), so a kTLS body that stalls after its
-    /// first record segment is still reclaimed; the clock bounds inactivity between segments (a steadily-arriving body
-    /// resets it). See `request_timeout`.
+    /// Continue a kTLS exact recv whose completion came up short. io_uring cannot `MSG_WAITALL`-accumulate a `RECVMSG`
+    /// carrying a control buffer, so the remainder is read with a fresh op from the cursor already advanced
+    /// ([`crate::net::core::conn::RecvOutcome::Again`]). It carries the request clock like the initial recv, so a kTLS
+    /// body that stalls between record segments is still reclaimed.
     pub(crate) fn resubmit_ktls_recv(&mut self, slot: u32, generation: u32, op: Op) -> errno::Result<()> {
-        // The continuation re-arms off the advanced cursor with no fresh reserve, so `recv_ptr`'s SAFETY contract - the
-        // offset stays within the allocation - rests on the initial arm having refused a pool buffer an exact read
-        // would overrun (`submit_recv`). Checked in every build rather than asserted: what is on the other side is the
-        // kernel writing past that allocation, and a `debug_assert` is compiled out of the build that ships, so the
-        // case it exists for would be silent exactly where it matters. One `checked_add` and a comparison, before
-        // anything is armed or counted, so the refusal needs no unwind - closing is what this reactor answers every
-        // other unusable recv with.
+        // The re-arm has no fresh reserve, so `recv_ptr`'s SAFETY contract rests on the initial arm refusing a pool
+        // buffer an exact read would overrun (`submit_recv`). Checked in every build, not only by `debug_assert`, since
+        // a miss is the kernel writing past the allocation.
         if !self.table.conn(slot).recv_armed_within() {
             debug_assert!(false, "kTLS continuation would arm past the recv buffer");
             return self.close_conn(slot, generation, CloseReason::RecvError(errno::Errno::EIO));
@@ -335,10 +321,8 @@ impl<U> Reactor<U> {
         // SECURITY: carry the request clock onto the continuation too (see `request_timeout`) - else a kTLS peer could
         // send one record then stall and pin the slot past the initial recv's timeout.
         //
-        // NOTE: a continuation cancelled with partial progress completes `Again` (positive `done_io`, data record) and
-        // re-arms with a FRESH clock - so a trickling kTLS slow-loris can cost one extra timeout period per fired clock
-        // before the zero-progress `-ECANCELED` (or the paired short-read classification) finally closes it. Bounded,
-        // and strictly better than not carrying the clock at all.
+        // A continuation cancelled with partial progress re-arms with a fresh clock, so a trickling peer costs one
+        // extra period per fired clock before a zero-progress cancel closes it.
         let timeout_ts = self
             .cfg
             .request_timeout
@@ -374,22 +358,17 @@ impl<U> Reactor<U> {
         }
     }
 
-    /// Submit an `IORING_OP_SPLICE` moving up to `len` body bytes from the connection's pool socket (the **fixed
-    /// input**) straight to the consumer's `fd` (a regular pipe write-end - the output), zero-copy. Records the splice
-    /// cursor and marks the connection `splicing`, a distinct in-flight flag from `recving`: the SQE's `fd` is the
-    /// pipe, not the socket, so `close_conn`'s fd-keyed cancel can't reach it (it cancels the splice by `user_data`
-    /// instead - see `submit_cancel_splice`).
+    /// Submit an `IORING_OP_SPLICE` moving up to `len` body bytes from the connection's fixed socket straight to the
+    /// consumer's `fd`, a regular pipe write end. It marks the connection `splicing`, apart from `recving` because the
+    /// SQE's `fd` is the pipe, so `close_conn`'s fd-keyed cancel cannot reach it (`submit_cancel_splice` cancels it by
+    /// `user_data`).
     ///
-    /// A socket->pipe splice, like a kTLS recv, cannot carry `MSG_WAITALL`, so a completion may be short (the socket
-    /// had less buffered, or the pipe filled); `on_splice_recv` resubmits the remainder. A full pipe blocks the splice
-    /// on an io-wq worker - never the ring - which is the transfer's automatic backpressure: the consumer's reader
-    /// drains the pipe, TCP flow control pushes back on the sender, and the ring keeps serving other connections
-    /// throughout.
+    /// A socket to pipe splice cannot carry `MSG_WAITALL`, so a completion may be short and `on_splice_recv` resubmits
+    /// the remainder. A full pipe blocks the splice on an io-wq worker, never the ring, which is the backpressure.
     ///
-    /// `first` says whether this call opens a body or continues one. Only the caller knows: a short splice and a
-    /// readiness poll both resubmit through here with the remainder, and the connection flags read the same at every
-    /// entry (`splicing` is cleared on each completion). It sets the receipt budget's window mark - see
-    /// `ServerConfig::receipt_window_bytes`.
+    /// `first` says whether this call opens a body or continues one, which only the caller knows, since a short splice
+    /// and a readiness poll both resubmit through here. It sets the receipt budget's window mark
+    /// (`ServerConfig::receipt_window_bytes`).
     pub(crate) fn submit_splice_recv(
         &mut self,
         slot: u32,
@@ -423,33 +402,20 @@ impl<U> Reactor<U> {
             sqe.len = chunk;
         })?;
         // SECURITY: a kTLS splice BLOCKS on an io-wq worker awaiting the next TLS record - `tls_sw_splice_read` honors
-        // only `SPLICE_F_NONBLOCK` (which must stay unset: it would also make a full pipe `-EAGAIN`, see the `pump`
-        // fcntl guard) and, unlike `tcp_splice_read`, never the socket's own O_NONBLOCK - so the plain-TCP `-EAGAIN` ->
-        // readiness-poll path (whose linked timeout carries the request clock) never runs.
-        // A LINK_TIMEOUT can't cover it either: the kernel arms a linked timeout only AFTER the head op's `issue()`
-        // returns, and a blocking splice's `issue()` doesn't return until the splice completes. So a stalled kTLS
-        // splice would pin the slot AND an io-wq worker past every timeout. Bound it with a STANDALONE inactivity
-        // watchdog (`arm_splice_deadline`) whose expiry issues an explicit `ASYNC_CANCEL` of the blocked splice - that
-        // DOES signal the io-wq worker (`__io_wq_worker_cancel` -> `__set_notify_signal`), and the record wait returns
-        // via `signal_pending`. Plain-TCP splices need none of this (their poll path is already clocked).
+        // only `SPLICE_F_NONBLOCK`, which must stay unset, and never the socket's own `O_NONBLOCK`, so the plain TCP
+        // readiness poll and its clock never run. A LINK_TIMEOUT cannot cover it either, since the kernel arms one only
+        // after the head op's `issue()` returns. So a standalone watchdog bounds it, and its `ASYNC_CANCEL` does signal
+        // the io-wq worker (`__io_wq_worker_cancel` -> `__set_notify_signal`).
         if ktls {
             self.arm_splice_deadline(slot, generation)?;
         }
-        // The total-receipt budget covers a spliced body like any other. It cannot arm itself here the way a buffered
-        // message does: the only arm site is `submit_recv`, and a spliced body never enters it, so without this the one
-        // clock that is not restarted by progress does not reach the framing that needs it most - both clocks above are
-        // inactivity bounds that any arriving byte re-arms. Idempotent on `receipt_deadline_armed`, so the resubmit and
-        // readiness-poll paths extend the message's budget rather than restarting it, and a header that already armed
-        // one keeps it.
+        // A spliced body never enters `submit_recv`, the budget's other arm site, so it is armed here. Idempotent, so a
+        // resubmit or readiness poll extends the message's budget rather than restarting it.
         #[cfg(feature = "net-server")]
         {
-            // The mark is where this body started, so it is set once, when the body is opened. A short-splice resubmit
-            // must not move it, or no expiry could tell a window's progress from a stall.
-            //
-            // Not "when this call armed the budget": a framer whose header takes more than one read arms it in
-            // `submit_recv` (the second header read has bytes buffered, so it is not idle), leaving the mark at the
-            // previous message's - zero on the connection's first - and `moved` pinned at zero for the whole body. The
-            // renewal below can then never fire, which is the whole-transfer bound this window exists to remove.
+            // The mark is where this body started, so only the opening call sets it, or no expiry could tell progress
+            // from a stall. It cannot follow the arm instead, since a header taking more than one read arms the budget
+            // in `submit_recv` and the mark would stay at the previous message's.
             if first {
                 let conn = self.table.conn_mut(slot);
                 conn.receipt_window_mark = conn.splice_remaining;
@@ -478,9 +444,7 @@ impl<U> Reactor<U> {
             sqe.op_flags = libc::POLLIN as u32;
         };
         // SECURITY: the poll is the splice's slow-loris guard. Without a bound, a peer that sends a `SpliceBody` header
-        // then stalls mid-body parks this poll forever and pins the slot. Carry the request-receive clock (like a body
-        // recv): each arriving segment completes the poll and re-arms it, so the timeout bounds inactivity between body
-        // segments.
+        // then stalls pins the slot forever. The request clock bounds inactivity between body segments.
         let timeout_ts = self
             .cfg
             .request_timeout
@@ -511,31 +475,19 @@ impl<U> Reactor<U> {
         place_body: bool,
         in_message: bool,
     ) -> errno::Result<()> {
-        // A connection with no buffer acquires one with the read itself: `IOSQE_BUFFER_SELECT` has the kernel pick at
-        // completion, so an idle recv costs nothing until bytes actually land.
+        // Nothing is reserved here and nothing can be. `IOSQE_BUFFER_SELECT` has the kernel pick a buffer at
+        // completion, so gating this submit on the pool's free count would shed connections. A dry pool comes back as
+        // `-ENOBUFS` on the completion, where `recv_buffer_shortage` grows it and re-arms.
         //
-        // Nothing is reserved here and nothing can be: the pick happens at completion, so every parked connection can
-        // have a selecting recv armed against a pool of any size. Arming one the pool cannot cover is therefore normal,
-        // not an error - `-ENOBUFS` comes back on the completion and `recv_buffer_shortage` grows and re-arms. The
-        // rebalance here is the pool's shrink cadence and its response to pressure it *can* see.
-        //
-        // A placed body is exempt: it reads into its own allocation, so it needs no buffer and must not be given one.
-        // The kernel clamps a selecting read to the buffer it picked (`io_ring_buffer_select`, `io_uring/kbuf.c`), so
-        // an exact read longer than a pool buffer would complete short of what the frame declared and close the
-        // connection as truncated.
+        // A placed body reads into its own allocation and must not take a pool buffer. The kernel clamps a selecting
+        // read to the buffer it picked (`io_ring_buffer_select`, `io_uring/kbuf.c`), so an exact read longer than one
+        // would complete short of what the frame declared and close the connection as truncated.
         #[cfg(feature = "net-server")]
         let select = if !place_body && self.table.conn(slot).recv_needs_buffer() {
             let g = match self.recv_bufs.as_mut() {
-                // An exact read larger than one pool buffer must not take one, for the reason stated just above: the
-                // kernel clamps the selection and the read then completes short of what the frame declared.
-                // `promote_recv_buffer` below cannot cover this - it moves bytes out of a claim the connection already
-                // holds, and a connection reaches here precisely when it holds none - so the escape is to own the
-                // buffer, exactly as a placed body does. Reachable from `Framing::Need(n)`, which `frame_step` admits
-                // up to `max_request_bytes` and turns into an *exact* `ReadHeader`, where there is no placement to opt
-                // into.
+                // An exact read larger than one pool buffer owns its buffer instead, for the same clamp. A promote
+                // cannot cover it, since the connection holds no claim here. Reachable from `Framing::Need(n)`.
                 Some(p) if exact && want > p.buf_len() => None,
-                // Shrink cadence lives on the maintenance tick now, not here. This arm no longer reads the clock on
-                // every selecting recv.
                 Some(p) => Some(p.bgid()),
                 None => None,
             };
@@ -556,14 +508,9 @@ impl<U> Reactor<U> {
         if !place_body {
             self.promote_recv_buffer(slot, want);
         }
-        // The connection is idle - parked for the next request - when this is a header read with nothing yet
-        // accumulated *and the framer has not said otherwise*. Only such reads carry the idle timeout; body and
-        // mid-header continuation reads are active transfers.
-        //
-        // `buffered() == 0` alone cannot answer this. A streaming codec consumes each window as its own message, so
-        // between windows - and after a 100-continue dance has consumed the head - the buffer is empty while the
-        // request is very much in progress. `in_message` carries the framer's own verdict (`Framing::MoreInMessage`),
-        // which is the only place that distinction exists.
+        // Idle, parked for the next request, is a header read with nothing accumulated that the framer has not marked
+        // in-message (`Framing::MoreInMessage`). `buffered() == 0` alone cannot answer it, since between a streaming
+        // codec's windows the buffer is empty while the request is under way.
         let idle = op == Op::RecvHeader && !in_message && self.table.conn(slot).buffered() == 0;
         // SECURITY: a message is under way, so its total-receipt budget runs from here - the one place that knows the
         // read belongs to a message already begun.
@@ -571,10 +518,8 @@ impl<U> Reactor<U> {
         if !idle {
             self.arm_receipt_deadline(slot, generation)?;
         }
-        // Reused storage for a placed body, claimed before the table borrow: the pool cleared it, so only capacity
-        // carries over. The client role has no pool and places into fresh storage as before. Claimed at the body's real
-        // size - the frame declared it - so a miss records the bytes actually needed, and held, so the licence survives
-        // however many maintenance ticks a slow-link receipt spans.
+        // Claimed at the body's declared size, so a miss records the bytes actually needed, and held, so the licence
+        // survives however many maintenance ticks a slow receipt spans.
         #[cfg(feature = "net-server")]
         let reuse = place_body
             .then(|| {
@@ -604,29 +549,18 @@ impl<U> Reactor<U> {
         conn.recv_idle = idle;
         conn.ops += 1;
         let ptr = conn.recv_ptr();
-        // Plain connections use `RECV` (destination in the SQE, no msghdr import). kTLS connections use `RECVMSG` with
-        // a control buffer so the record type can be read - a plain recv returns -EIO on any non-data record. With
-        // MSG_WAITALL a plain exact read fills the whole buffer before completing (io_uring accumulates in-kernel). For
-        // kTLS it
-        // CANNOT: io_uring disables its WAITALL accumulation whenever the msghdr carries a control buffer (`io_recvmsg`
-        // sets `min_ret` only when `msg_controllen == 0`), so a kTLS exact read completes with whatever fully-arrived
-        // records the TLS layer had - `recv_result` answers `Again` and `resubmit_ktls_recv` continues the read. A
-        // chunk read takes whatever is available.
+        // kTLS needs `RECVMSG` with a control buffer to read the record type. io_uring then does no `MSG_WAITALL`
+        // accumulation (`io_recvmsg` sets `min_ret` only when `msg_controllen == 0`), so a kTLS exact read can complete
+        // short as `Again` and `resubmit_ktls_recv` continues it.
         let (opcode, addr, len) = if conn.is_ktls() {
             (IORING_OP_RECVMSG, conn.arm_ktls_recv(ptr, want), 0u32)
         } else {
             (IORING_OP_RECV, ptr, want as u32)
         };
         let flags = if exact { libc::MSG_WAITALL as u32 } else { 0 };
-        // A recv carries at most one linked timeout. An idle header read -- parked for the next request with nothing
-        // buffered - uses the idle clock; any read for a request already in progress (a body, a `Need` header
-        // remainder, or a `More` chunk scan) uses the request-receive clock.
-        //
-        // SECURITY: the request clock is the slow-loris guard. Without it a peer that sends a partial frame (e.g. a
-        // valid length prefix) then stalls pins its pool slot forever - `idle_timeout` can't fire, the connection is no
-        // longer idle - so a few such peers exhaust the pool. For an exact read (`MSG_WAITALL`) the clock bounds the
-        // whole transfer; for a chunk read it bounds inactivity (each arriving byte completes the read and re-arms),
-        // which still reclaims a stalled slot.
+        // A recv carries one linked timeout, the idle clock when idle and the request clock for a request under way.
+        // The request clock is the slow-loris guard, since `idle_timeout` cannot fire on a connection that is not idle.
+        // It bounds an exact read's whole transfer and a chunk read's inactivity.
         let timeout_ts = if idle && self.cfg.idle_timeout.is_some() {
             Some(std::ptr::addr_of!(self.pads.idle_timeout) as u64)
         } else if !idle && self.cfg.request_timeout.is_some() {
@@ -682,37 +616,15 @@ impl<U> Reactor<U> {
         let ktls = conn.is_ktls();
         // SECURITY: over kTLS, a positive send completion is NOT delivery, and this reactor cannot make it one.
         //
-        // `tls_sw_sendmsg` accepts bytes into records that may still sit in the layer's own `tx_list`. The teardown's
-        // `SHUTDOWN(SHUT_RDWR)` is not a TLS operation - the ULP overrides `close` and `sendmsg`, never `shutdown`
-        // (`net/tls/tls_main.c:949-976`) - so it sets `SEND_SHUTDOWN`, and the `CLOSE` behind it finds every remaining
-        // record unsendable: `tls_sw_release_resources_tx` (`net/tls/tls_sw.c:2602`) does try `tls_tx_records` first,
-        // but `tcp_sendmsg_locked` refuses a shut-down socket, so the loop below it frees them. The peer reads a clean
-        // FIN and this server counts a reply. Measured at one whole 16384-byte record.
-        //
-        // **The obvious remedy is closed, and it is worth saying which.** What decides it is whether the `sendmsg`
-        // carries `MSG_DONTWAIT`: `tls_tx_records(sk, -1)` at close replays each record's own `rec->tx_flags`, so a
-        // record queued blocking would be pushed blocking. io_uring adds `MSG_DONTWAIT` whenever it issues with
-        // `IO_URING_F_NONBLOCK` (`io_uring/net.c:566-567`, `:664-665`), and `IOSQE_ASYNC` does **not** take that away
-        // for a socket: `io_wq_submit_work` puts the flag straight back for any pollable opcode on a pollable file
-        // (`io_uring/io_uring.c:1982-1988`), and `SEND`/`SENDMSG` are both `.pollout = 1`. Measured on this kernel: a
-        // forced-async `SEND` of 4 MiB into a 4 KiB sndbuf with the peer not reading returns a short count of 8064 in 5
-        // ms rather than blocking. On `-EAGAIN` the same loop arms poll and returns, so the blocking retry two lines
-        // further down is unreachable for a socket as well. There is no SQE flag that yields a blocking `sendmsg` here.
-        //
-        // What is left is a policy call the reactor cannot make for the deployment: drop the `SHUT_RDWR` for kTLS so
-        // the close at least attempts the flush (partial - the records still carry `MSG_DONTWAIT`, so it pushes only
-        // what the sndbuf takes at that instant, and `close` on a socket with unread receive data sends RST rather than
-        // FIN), or delay the teardown after the last send by a grace period, which is a duration nothing here can
-        // derive.
+        // Records can still sit in the TLS layer's `tx_list`, and the teardown's `SHUT_RDWR` is not a TLS operation, so
+        // the `CLOSE` behind it frees them unsent (`tls_sw_release_resources_tx`) while the peer reads a clean FIN.
+        // Forcing a blocking send does not help. Each record replays its own flags at close, and io_uring issues a
+        // socket send with `MSG_DONTWAIT` even under `IOSQE_ASYNC` (`io_wq_submit_work`). What is left is a deployment
+        // policy, dropping `SHUT_RDWR` for kTLS or a grace period before teardown, which nothing here can derive.
         let msg = conn.send_msg_ptr();
-        // A one-PDU gather takes the plain `SEND` opcode (ptr/len in the SQE, no msghdr import); `SENDMSG` is reserved
-        // for real multi-PDU gathers.
-        // MSG_NOSIGNAL: never raise SIGPIPE - the library must not depend on the host runtime ignoring it (Rust's does;
-        // an embedding might not).
-        //
-        // MSG_WAITALL flushes the whole gather in-kernel (one CQE per fully-sent batch, no userspace partial-send
-        // loop) - but the kernel TLS sendmsg rejects MSG_WAITALL (-EOPNOTSUPP; it validates flags strictly), so kTLS
-        // sends omit it and lean on `on_send`'s partial-send re-submit instead.
+        // `MSG_NOSIGNAL` because the library must not depend on the host ignoring SIGPIPE. `MSG_WAITALL` flushes the
+        // whole gather in-kernel, but kTLS sendmsg rejects it with -EOPNOTSUPP, so kTLS sends rely on `on_send`'s
+        // partial-send resubmit.
         let flags = if ktls {
             libc::MSG_NOSIGNAL as u32
         } else {
@@ -775,24 +687,16 @@ impl<U> Reactor<U> {
         fired && !was_idle && !self.draining && !self.stopping() && !self.table.conn(slot).is_ktls()
     }
 
-    /// Re-arm a plain-TCP exact read whose request clock cancelled it with partial progress (the cursor already
-    /// advanced past what landed, [`Connection::advance_exact_partial`]). io_uring accumulates a plain `MSG_WAITALL`
-    /// recv itself, so unlike kTLS a short completion here is never healthy - this continuation exists only for the
-    /// clock-cancelled case. Closing there imposes a throughput floor of `recv_want / request_timeout` on every exact
-    /// read: a peer pacing a streamed window slower than that dies mid-body, with the window's consumed bytes
-    /// unrecoverable.
+    /// Re-arm a plain TCP exact read that its request clock cancelled with partial progress, the cursor already
+    /// advanced past what landed ([`Connection::advance_exact_partial`]).
     ///
-    /// Like the kTLS continuation it re-arms with a FRESH request clock, so the clock bounds progress-per-period rather
-    /// than the whole transfer: a trickling slow-loris costs one timeout period per fired clock, bounded by the armed
-    /// read's length (for a header, by `max_request_bytes`) - the same trade `resubmit_ktls_recv` documents. A period
-    /// with NO progress still closes (the zero-progress `-ECANCELED` never reaches here), and an idle partial still
-    /// closes.
+    /// Closing instead would put a throughput floor of `recv_want / request_timeout` on every exact read. The re-arm
+    /// takes a fresh request clock, so the clock bounds progress per period, the trade `resubmit_ktls_recv` makes. A
+    /// period with no progress still closes, and so does an idle partial.
     ///
     /// [`Connection::advance_exact_partial`]: crate::net::core::conn::Connection::advance_exact_partial
     pub(crate) fn resubmit_exact_recv(&mut self, slot: u32, generation: u32, op: Op) -> errno::Result<()> {
-        // Same guard as the kTLS continuation, for the same reason: the re-arm points `recv_ptr` past the advanced
-        // cursor with no fresh reserve, and what is on the other side of a miscount is the kernel writing past the
-        // allocation.
+        // Same guard as the kTLS continuation, for the same reason.
         if !self.table.conn(slot).recv_armed_within() {
             debug_assert!(false, "exact continuation would arm past the recv buffer");
             return self.close_conn(slot, generation, CloseReason::RecvError(errno::Errno::EIO));
@@ -843,10 +747,9 @@ impl<U> Reactor<U> {
         }
     }
 
-    /// A recv's linked idle/request clock reaped (`Op::RecvClock`): `-ETIME` when it fired (and cancelled its recv),
-    /// `-ECANCELED` when the recv completed first. Not counted in `conn.ops` (exactly like the generic `LinkTimeout`
-    /// CQEs this op split from). Resolves a parked short-positive recv (`recv_close_stash`) or records the outcome for
-    /// a recv CQE later in this batch; on an already-closing (or recycled) slot it is inert.
+    /// A recv's linked clock reaped (`Op::RecvClock`), `-ETIME` when it fired and cancelled its recv, `-ECANCELED` when
+    /// the recv completed first. Not counted in `conn.ops`. It resolves a parked short-positive recv
+    /// (`recv_close_stash`) or records the outcome for a recv CQE later in this batch, and is inert on a closing slot.
     pub(crate) fn on_recv_clock(&mut self, slot: u32, generation: u32, res: i32) -> errno::Result<()> {
         if !self.table.slot_matches_cqe(slot, generation) {
             return Ok(());
@@ -864,23 +767,14 @@ impl<U> Reactor<U> {
             match conn.recv_close_stash.take() {
                 Some(stash) => stash,
                 None => {
-                    // No recv is parked on this clock. Record ONLY a genuine expiry, for a recv still in flight to read
-                    // when it completes short. A `-ECANCELED` here is never the current recv timing out - it is the
-                    // recv having already won its link (handled in `on_recv`), or a STALE clock
-                    // from a prior kTLS `Again` continuation whose recv won;
-                    // recording its `false` would clobber the fresh recv's state and misclassify a real timeout as a
-                    // truncation.
+                    // No recv is parked on this clock, so record only a genuine expiry, for a recv still in flight. A
+                    // `-ECANCELED` is the recv having won its link or a stale clock from a kTLS `Again` continuation,
+                    // and recording it would misread a real timeout as a truncation.
                     //
-                    // A stale `-ETIME` cannot be told apart: a clock that fires in the same instant its recv completes
-                    // in full posts `-ETIME` with nothing cancelled (`io_link_timeout_fn` finds `timeout->head` NULL
-                    // and `io_req_task_link_timeout` completes `-ETIME`, io_uring/timeout.c:340-343), and by the time
-                    // it is reaped the next recv - armed while ITS recv's CQE was dispatched earlier in this same
-                    // batch - owns these fields. The pollution is bounded: it misreads only a short-POSITIVE on that
-                    // successor (an EOF partial resumes once and re-completes empty into the same truncation close; a
-                    // real expiry records true twice), never a zero-progress close, and the next arm resets it. The
-                    // fired clock's failed cancel can likewise surface `ret` instead of `-ETIME` (`ret ?: -ETIME`,
-                    // timeout.c:337) and read as "recv won": that race needs the recv already completing on its own, so
-                    // the truncation verdict it produces is the truth.
+                    // A stale `-ETIME` cannot be told apart, since a clock firing as its recv completes in full posts
+                    // `-ETIME` with nothing cancelled (`io_req_task_link_timeout`, `io_uring/timeout.c:340-343`). It
+                    // misreads only a short positive on the next recv, never a zero-progress close, and the next arm
+                    // resets it.
                     if fired {
                         conn.recv_clock_fired = Some(true);
                     }
@@ -898,22 +792,12 @@ impl<U> Reactor<U> {
         self.close_conn(slot, generation, reason)
     }
 
-    /// The core of a recv completion (`RecvHeader`/`RecvBody`): all the bookkeeping - the stat, the op-count drain, the
-    /// flush-close swallow, the `recv_result` trichotomy (failed/kTLS-again/complete), the short-positive
-    /// stash-vs-close, the kTLS control-record close - returning the [`RecvStep`] its role wrapper enacts
-    /// (`Deliver`/`Pump` re-enter role code; `Done` is self-contained). The two recv kinds share the whole skeleton and
-    /// differ only in idle eligibility and the delivery tail.
     /// Hand back a file-body buffer whose pump read will not queue it.
     ///
-    /// Owed on **every** exit that saw `IORING_CQE_F_BUFFER`: the kernel puts the kbuf and advances its head with no
-    /// guard on the result (`io_req_rw_complete`, `io_uring/rw.c:591`), so a failed, truncated or stale-slot completion
-    /// has taken its descriptor off the ring exactly like a served one. An exit that skips this strands the id -
-    /// userspace still counts it posted, so it is neither reissued nor replaced, the kernel will never offer it again,
-    /// and the ring loses a buffer per strand while `recv_bufs_lent` stays innocently at zero.
-    ///
-    /// Lend-then-release through the verified pick ([`BufPool::take_lent`](crate::uring::bufring::BufPool::take_lent)):
-    /// `release` is the only repost and requires the loan recorded first, and a bid the pool does not hold `Posted` is
-    /// dropped rather than recorded, since nothing of the pool's is behind it.
+    /// Owed on every exit that saw `IORING_CQE_F_BUFFER`. The kernel puts the kbuf and advances its head whatever the
+    /// result (`io_req_rw_complete`, `io_uring/rw.c:591`), so a failed, truncated or stale-slot completion has taken
+    /// its descriptor off the ring like a served one. An exit that skips this strands the id for good, while
+    /// `recv_bufs_lent` stays at zero.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) fn requeue_body_bid(&mut self, bid: Option<u16>) {
         let Some(bid) = bid else { return };
@@ -928,22 +812,14 @@ impl<U> Reactor<U> {
         self.sync_recv_buf_stats();
     }
 
-    /// Answer a recv that found the pool dry (`-ENOBUFS`). Returns whether the caller should re-pump now; `false` means
+    /// Answer a recv that found the pool dry (`-ENOBUFS`). Returns whether the caller should re-pump now. `false` means
     /// the read is parked on a `RecvRetry` timer and the pump is that timer's to run.
     ///
-    /// The kernel picks a provided buffer at completion, so a shortage cannot be seen at submit and this is the only
-    /// place it is reported. Growing here sizes the pool to concurrent *arrivals*, which is the quantity that actually
-    /// bounds it - and bounds it at `pool_size` buffers, no worse than the per-connection buffer the pool replaced.
-    ///
-    /// Growth failing means the ring is at its registered bound with every buffer lent - only leases held past their
-    /// message can get there, so it is sustained pressure, not sizing. `recv_shortage_retry` picks the answer: park the
-    /// read and retry on a timer (backpressure - the unread socket fills and TCP slows the peer, while pool memory
-    /// holds at its bound), or drop the connection back to owning its buffer (progress through the spike, paid in
-    /// unpooled allocation). Either way the read cannot come back `-ENOBUFS` unanswered: the owned fallback cannot want
-    /// a pool buffer at all, and a parked retry that finds the pool still dry parks again.
-    ///
-    /// One live timer per connection (`recv_retry_armed`): a park re-entered while the timer is pending - another path
-    /// pumped the connection into the still-dry pool - keeps the pending timer rather than stacking a second.
+    /// The kernel picks a provided buffer at completion, so this is the only place a shortage is seen, and growing here
+    /// sizes the pool to concurrent arrivals. Growth fails only at the ring's registered bound with every buffer lent.
+    /// Then `recv_shortage_retry` picks between parking the read on a timer, so TCP slows the peer, and falling back to
+    /// an owned buffer. Either way the read cannot come back `-ENOBUFS` unanswered, since a parked retry that finds the
+    /// pool still dry parks again. One live timer per connection (`recv_retry_armed`), never a stacked second.
     #[cfg(feature = "net-server")]
     pub(crate) fn recv_buffer_shortage(&mut self, slot: u32, generation: u32) -> errno::Result<bool> {
         stat!(self, buf_shortages);
@@ -955,10 +831,8 @@ impl<U> Reactor<U> {
             return Ok(true);
         }
         if self.recv_bufs.is_some() && self.cfg.recv_shortage_retry.is_some() {
-            // The pool guard is belt-and-braces: only a buffer-select recv can complete `-ENOBUFS`, and only a pooled
-            // server arms one. It keeps the contract literal - parking waits for POOL buffers to come home, so a
-            // shortage with no pool behind it (whatever produced it) takes the owned fallback below, which needs
-            // nothing returned to it.
+            // Parking waits for pool buffers to come home, so a shortage with no pool behind it takes the owned
+            // fallback below, though only a pooled server's buffer-select recv completes `-ENOBUFS`.
             self.sync_recv_buf_stats();
             stat!(self, recv_shortage_parks);
             let conn = self.table.conn_mut(slot);
@@ -982,12 +856,9 @@ impl<U> Reactor<U> {
     /// Whether a connection other than `slot` is currently splicing a body to `fd` - the destination-sharing refusal
     /// ([`CloseReason::SpliceFdInUse`]).
     ///
-    /// `splice_fd` is only meaningful while one of the two in-flight marks is set: it keeps its last value after a body
-    /// finishes, and a connection that has never spliced holds `-1`.
-    ///
-    /// Every state that owns a `Connection`, not just `Serving`. A body in flight is what makes the destination unsafe
-    /// to share, and the cost of missing one is two bodies interleaved on the same pipe - so the scan is deliberately
-    /// wider than the states that can reach it today.
+    /// `splice_fd` means something only while `splicing` or `splice_polling` is set, since it keeps its last value. The
+    /// scan covers every state that owns a `Connection`, not just `Serving`, since a miss interleaves two bodies on one
+    /// pipe.
     pub(crate) fn splice_fd_in_use(&self, slot: u32, fd: RawFd) -> bool {
         use crate::net::core::table::SlotState;
         self.table.iter().any(|(i, e)| {
@@ -1070,13 +941,11 @@ impl<U> Reactor<U> {
 
     /// Adopt the pool buffer a completion selected, if it carried one.
     ///
-    /// `IORING_CQE_F_BUFFER` is the whole rule for whether a buffer was taken: an op that failed before selecting one -
-    /// `-ENOBUFS` above all
-    /// - carries nothing and owes nothing back.
+    /// `IORING_CQE_F_BUFFER` alone says whether a buffer was taken. An op that failed before selecting one, `-ENOBUFS`
+    /// above all, carries nothing and owes nothing back.
     ///
-    /// `false` means the completion is unusable: it names a buffer this reactor cannot vouch for (a descriptor desync,
-    /// or a flag with no pool behind it), so its bytes cannot be located and the read it answered must fail - the
-    /// caller closes the connection rather than framing from a buffer that was never installed.
+    /// `false` means the completion names a buffer this reactor cannot vouch for (a descriptor desync, or a flag with
+    /// no pool behind it), so the caller closes the connection rather than frame from a buffer never installed.
     #[cfg(feature = "net-server")]
     pub(crate) fn adopt_recv_buffer(&mut self, slot: u32, generation: u32, cqe_flags: u32) -> bool {
         if cqe_flags & IORING_CQE_F_BUFFER == 0 {
@@ -1086,18 +955,14 @@ impl<U> Reactor<U> {
         let Some(pool) = self.recv_bufs.as_mut() else {
             return false;
         };
-        // The verified pick: `Posted`, storage behind it, loan recorded. Refused for an id the pool never posted or
-        // already lent - a userspace/kernel descriptor desync. There is nothing to strand *or* return on that path: the
-        // storage the completion names is not this pool's, and "handing it back" through the state machine would either
-        // abort (the id is not lent) or retire a loan some other op still holds.
+        // The verified pick refuses an id the pool never posted or already lent, a descriptor desync. Nothing is owed
+        // back then, since the storage is not this pool's, and a release would retire a loan some other op still holds.
         let Some((ptr, cap)) = pool.take_lent(bid) else {
             return false;
         };
-        // A guard, not a handled case: a slot is freed only once nothing is in flight on it, so a recv completion
-        // should never outlive its connection. It is here because the cost of being wrong is a panic (`conn_mut` on a
-        // slot that is not serving) or a buffer installed on whoever holds the slot now, and because the buffer is owed
-        // back either way - `on_recv_complete` makes the same check a moment later and by then it would be too late to
-        // return it.
+        // A guard, since a slot is freed only once nothing is in flight on it. Were that ever wrong, the buffer would
+        // land on whoever holds the slot now, and it is owed back either way, which `on_recv_complete`'s own check
+        // comes too late to do.
         if !self.table.slot_matches_cqe(slot, generation) {
             pool.release(bid);
             self.sync_recv_buf_stats();

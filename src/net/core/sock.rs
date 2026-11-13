@@ -120,8 +120,7 @@ pub(crate) fn parse_inet(storage: &libc::sockaddr_storage) -> Option<SocketAddr>
             Some(SocketAddr::V6(SocketAddrV6::new(
                 Ipv6Addr::from(sin6.sin6_addr.s6_addr),
                 u16::from_be(sin6.sin6_port),
-                // Verbatim (no swap) - see `build_sockaddr`: std treats `sin6_flowinfo` as an opaque pass-through in
-                // both directions, and interop (comparing against std's `peer_addr()`) requires matching that.
+                // Verbatim, as in `build_sockaddr`.
                 sin6.sin6_flowinfo,
                 sin6.sin6_scope_id,
             )))
@@ -136,20 +135,16 @@ pub(crate) fn parse_peer(storage: &libc::sockaddr_storage, kind: &ServerAddr) ->
         // Unix stream clients are unnamed; credentials (if enabled) are fetched separately by the server before the
         // accept handler runs.
         ServerAddr::Unix(_) => Some(ClientAddr::Unix { cred: None }),
-        // TCP listeners: decode by the address's own family. A pad that does not parse as `AF_INET`/`AF_INET6` - a
-        // short or rewritten peer-name result, e.g. from a cgroup getsockopt BPF program - yields `None` so the caller
-        // sheds, rather than fabricating a local `Unix` identity for a remote peer (fail closed, matching
-        // `peer_from_fd`).
+        // A pad that does not parse as `AF_INET` or `AF_INET6`, such as a peer-name result a cgroup getsockopt BPF
+        // program rewrote, yields `None` so the caller sheds rather than inventing a local identity for a remote peer.
         ServerAddr::Tcp(_) | ServerAddr::Tcp6(_) => parse_inet(storage).map(ClientAddr::Inet),
     }
 }
 
-/// The peer address of a connected socket via `getpeername(2)` - used for kTLS connections, whose peer is read from the
-/// furnished real fd rather than an accept buffer. kTLS listeners are validated TCP, so the peer MUST parse as
-/// `AF_INET`/`AF_INET6`; a getpeername failure (e.g. `ENOTCONN` after an early RST) or any other family returns `None`
-/// and the caller sheds - fail CLOSED, like the `SO_PEERNAME` accept path. Returning a fabricated identity here (a
-/// `Unix { cred: None }` fallback) would let a remote TCP peer read as a local unix one to per-listener policy and
-/// audit hooks.
+/// The peer address of a connected socket via `getpeername(2)`, for kTLS connections whose peer is read from the
+/// furnished real fd rather than an accept buffer. A getpeername failure or a family other than `AF_INET` or `AF_INET6`
+/// returns `None` and the caller sheds. A fabricated `Unix { cred: None }` fallback would let a remote TCP peer read as
+/// a local one to per-listener policy and audit hooks.
 pub(crate) fn peer_from_fd(fd: RawFd) -> Option<ClientAddr> {
     // SAFETY: sockaddr_storage is plain data; zeroed is a valid initial value.
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -275,10 +270,7 @@ mod tests {
 
     #[test]
     fn flowinfo_passes_through_unswapped() {
-        // std stores `sin6_flowinfo` verbatim in both its to-C and from-C conversions, so this module must too - a byte
-        // swap on either side makes the kernel see a different flow label than the same SocketAddrV6 bound via
-        // std::net, and makes peers surfaced in ClientAddr compare unequal to std's `peer_addr()` for the very same
-        // connection.
+        // std stores `sin6_flowinfo` verbatim in both directions, so this module must too.
         let flow: u32 = 0x0001_2345;
         let addr: SocketAddrV6 = SocketAddrV6::new("fe80::1".parse().unwrap(), 9000, flow, 3);
         let sa = build_sockaddr(&ServerAddr::Tcp6(addr)).unwrap();

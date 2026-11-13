@@ -12,13 +12,10 @@ use std::os::fd::AsRawFd;
 
 /// Do the kernel's TLS TX **and** RX directions both hold keys on `fd`?
 ///
-/// The per-direction oracle is `getsockopt(SOL_TLS, TLS_TX/TLS_RX)` with the 4-byte `tls_crypto_info` header: it
-/// answers 0 only once that direction's keys are installed, `-EBUSY` for a ULP with no keys, and `-ENOPROTOOPT` with no
-/// ULP at all (`do_tls_getsockopt_conf`, `net/tls/tls_main.c` - `TLS_CRYPTO_INFO_READY` gates the copy-out).
-///
-/// This is what stands between a worker's `ready()` word and the wire: a socket the kernel never keyed - or keyed in
-/// one direction - passes bytes through in the clear, so serving it as encrypted publishes plaintext. Measured on this
-/// kernel: ULP with no keys and RX-only both leave TX in the clear.
+/// `getsockopt(SOL_TLS, TLS_TX/TLS_RX)` with the 4-byte `tls_crypto_info` header answers 0 only once that direction's
+/// keys are installed, `-EBUSY` for a ULP with no keys, and `-ENOPROTOOPT` with no ULP at all (`do_tls_getsockopt_conf`
+/// in `net/tls/tls_main.c`). A socket keyed in neither or one direction passes bytes through in the clear, so serving
+/// it as encrypted publishes plaintext.
 pub(crate) fn ktls_keyed_both_ways(fd: std::os::fd::RawFd) -> bool {
     let keyed = |dir: i32| {
         // The 4-byte header form (version + cipher_type): the kernel refuses anything shorter and fills exactly this
@@ -104,11 +101,10 @@ pub(crate) fn probe_unix_peercred(ring: &mut Ring) -> crate::Result<()> {
     )))
 }
 
-/// Probe whether this kernel serves the socket `GETSOCKOPT` `URING_CMD` (Linux >= 6.8) - the exact command every TCP
-/// accept's per-connection `SO_PEERNAME` fetch issues. Probing the real command (not the older `SIOCOUTQ`, which landed
-/// a release earlier) is what makes this guarantee hold: a `SO_TYPE` getsockopt on a fresh, unconnected TCP socket
-/// needs no bind/connect and returns the 4-byte type where supported, completing with `-EOPNOTSUPP` where not - turning
-/// "every TCP connection mysteriously shed" into an immediate, actionable construction error.
+/// Probe whether this kernel serves the socket `GETSOCKOPT` `URING_CMD` (Linux >= 6.8), the exact command every TCP
+/// accept's `SO_PEERNAME` fetch issues. It probes that command and not the older `SIOCOUTQ`, which landed a release
+/// earlier. A `SO_TYPE` getsockopt on a fresh unconnected TCP socket returns the 4-byte type where supported and
+/// `-EOPNOTSUPP` where not.
 pub(crate) fn probe_tcp_cmd(ring: &mut Ring) -> crate::Result<()> {
     // SAFETY: standard socket() call; result checked against the sentinel.
     let raw = Errno::result(unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) })?;
@@ -148,10 +144,9 @@ pub(crate) fn probe_tcp_cmd(ring: &mut Ring) -> crate::Result<()> {
     )))
 }
 
-/// Probe whether this kernel has the TLS ULP (the `tls` module / `CONFIG_TLS`) that kernel-TLS listeners require.
-/// Attaching `TCP_ULP="tls"` to a fresh, unconnected TCP socket returns `ENOPROTOOPT` when the ULP is absent and
-/// something else (`ENOTCONN` - the ULP init wants an established socket) when present, so it distinguishes
-/// availability without a handshake. Turns "every kTLS connection mysteriously shed" into a clear construction error.
+/// Probe whether this kernel has the TLS ULP (the `tls` module or `CONFIG_TLS`) that kernel-TLS listeners require.
+/// Attaching `TCP_ULP="tls"` to a fresh unconnected TCP socket fails `ENOTCONN` when the ULP is present, since its init
+/// wants an established socket, so it shows availability without a handshake.
 pub(crate) fn probe_ktls() -> crate::Result<()> {
     // SAFETY: standard socket() call; result checked against the -1 sentinel.
     let raw = Errno::result(unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) })?;
@@ -172,12 +167,9 @@ pub(crate) fn probe_ktls() -> crate::Result<()> {
         return Ok(()); // attached (unusual on an unconnected socket, but fine)
     }
     let err = Errno::last();
-    // Fail CLOSED, like `probe_tcp_cmd`. On an unconnected socket the only signal the ULP is actually present is the
-    // TLS ULP's own init refusing a non-established socket with `ENOTCONN` (net/tls: `tls_init` checks `sk_state ==
-    // TCP_ESTABLISHED`). Every other result means it is absent: an unregistered ULP name (`CONFIG_TLS=n`, or the `tls`
-    // module isn't loaded - the common case) reports `ENOENT` from `__tcp_ulp_find_autoload`, not `ENOPROTOOPT`; a
-    // kernel with no TCP_ULP support at all reports `ENOPROTOOPT`. Treating `ENOENT` as success would defeat this
-    // gate - every kTLS connection would then be silently shed at its first recv.
+    // Fail closed. Only `ENOTCONN` from `tls_init`, which refuses a socket not in `TCP_ESTABLISHED`, shows the ULP is
+    // present. A ULP name that is not registered reports `ENOENT` from `__tcp_ulp_find_autoload` and a kernel with no
+    // TCP_ULP support `ENOPROTOOPT`, so treating `ENOENT` as success would quietly shed every kTLS connection.
     if err == Errno::ENOTCONN {
         return Ok(());
     }

@@ -1,10 +1,9 @@
 //! The connection table: one typed state machine per pool slot.
 //!
-//! A slot is always in exactly one [`SlotState`] state - the union makes the "never a `Connection` and a pending peer
-//! fetch at once" invariant a type rather than a discipline - and carries the generation that outlives every state
-//! transition (bumped on free, so tokens minted for a recycled slot go stale). Accessors here borrow only the reactor's
-//! `table` field, which is what lets a stage hold a connection across a role callback (`self.core.table` vs the role's
-//! disjoint `handlers`/framer field, so the callback runs while a connection is borrowed).
+//! A slot is always in exactly one [`SlotState`], so a `Connection` and a pending peer fetch can never coexist, and it
+//! carries a generation bumped on free, so tokens minted for a recycled slot go stale. Accessors here borrow only the
+//! reactor's `table` field, which lets a stage hold a connection while a role callback borrows the role's disjoint
+//! fields.
 
 use crate::net::core::conn::Connection;
 use crate::net::core::protocol::ClientAddr;
@@ -16,11 +15,10 @@ use crate::uring::slots::SlotEntry;
 #[cfg(feature = "net-client")]
 use crate::uring::sys::KernelTimespec;
 
-/// The landing pad for a post-accept peer-identity fetch: stable boxed storage the kernel writes while the `URING_CMD`
-/// is in flight, held in the slot's [`SlotState::PeerFetch`](crate::net::core::table::SlotState) state between an
-/// accept and its completion. Carries the listener index through to `finish_accept`.
-/// (Peer identity is fetched per connection - never through a buffer shared across accepts - so a burst of accepts
-/// cannot misattribute addresses.)
+/// The landing pad for a post-accept peer-identity fetch, stable boxed storage the kernel writes while the `URING_CMD`
+/// is in flight, held in [`SlotState::PeerFetch`](crate::net::core::table::SlotState) between an accept and its
+/// completion. Carries the listener index through to `finish_accept`. Identity is fetched per connection and never
+/// through a buffer shared across accepts, so a burst of accepts cannot misattribute addresses.
 pub(crate) enum PendingPeer {
     /// `SO_PEERCRED` for a unix connection (`unix_peercred`).
     Cred { listener: u32, pad: Box<libc::ucred> },
@@ -31,13 +29,11 @@ pub(crate) enum PendingPeer {
     },
 }
 
-/// The pending state of an outbound connect: the boxed target sockaddr (the kernel copies it at `IORING_OP_CONNECT`
-/// prep, so it must outlive submission -- the slot holds it), the resolved peer address, the caller's initial
-/// per-connection state, and whether this connect layers kernel TLS once the TCP connect completes. Client-only.
+/// The pending state of an outbound connect. The boxed target sockaddr must outlive submission, since the kernel copies
+/// it at `IORING_OP_CONNECT` prep. Client-only.
 ///
-/// The state (`U`) rides here on the loop thread across the whole connect -- including a kTLS handshake, where it is
-/// retained in the parked slot rather than crossing to the consumer's worker (the client's handshake deferral is
-/// state-free). It is never accessed from another thread.
+/// The state `U` stays here on the loop thread across the whole connect, a kTLS handshake included, and is never
+/// accessed from another thread.
 #[cfg(feature = "net-client")]
 pub(crate) struct PendingConnect<U> {
     pub addr: Box<SockAddr>,
@@ -46,10 +42,8 @@ pub(crate) struct PendingConnect<U> {
     /// The dialed address, retained for the kTLS handshake context (`TlsConnectContext::server_addr`) - the client's
     /// per-endpoint policy hook, since a client has no listener to name.
     pub server_addr: ServerAddr,
-    /// The connect-timeout timespec, boxed with the pending state so its address is stable and per-connect (a shared
-    /// pad would alias when several
-    /// connects are staged before submission). Zero when no timeout is armed;
-    /// only pointed at by a `LINK_TIMEOUT` when one is.
+    /// The connect-timeout timespec, boxed with the pending state so its address is stable and per connect, since a
+    /// shared pad would alias when several connects are staged before submission. Zero when no timeout is armed.
     pub timeout: KernelTimespec,
     /// Layer kernel TLS once the TCP connect completes: `on_connect` furnishes a real fd for the consumer's handshake
     /// worker instead of installing the connection immediately.
@@ -60,24 +54,19 @@ pub(crate) struct PendingConnect<U> {
 pub(crate) enum SlotState<U> {
     /// Free (or freed and awaiting reuse; the entry's generation was bumped).
     Empty,
-    /// An outbound `IORING_OP_CONNECT` is in flight on a client socket installed into this slot; holds the
-    /// pending-connect state until the connect completes (client-only - the server never dials out). A kTLS connect
-    /// stays in this state across the follow-on `FIXED_FD_INSTALL` too (the pending state is retained until the slot
-    /// parks for the handshake).
+    /// An outbound `IORING_OP_CONNECT` is in flight on a client socket installed into this slot. A kTLS connect stays
+    /// here across the follow-on `FIXED_FD_INSTALL` too, until the slot parks for the handshake. Client-only.
     #[cfg(feature = "net-client")]
     Connecting(Box<PendingConnect<U>>),
-    /// A client kTLS connection parked across the consumer's handshake worker: a real fd was furnished and the slot
-    /// holds the pending-connect state (its `U` + peer, retained on the loop thread - the client's deferral is
-    /// state-free) until the worker signals via its `ConnectDeferral`. The outbound analogue of the server's
-    /// `TlsParked`, but retaining `U` (the caller supplied it at connect; the worker only signals success/failure).
-    /// Client-only.
+    /// A client kTLS connection parked across the consumer's handshake worker until it signals via its
+    /// `ConnectDeferral`. The outbound twin of `TlsParked`, but it keeps `U` on the loop thread, since the worker only
+    /// signals success or failure. Client-only.
     #[cfg(feature = "net-client")]
     TlsConnecting(Box<PendingConnect<U>>),
     /// A `SO_PEERCRED`/`SO_PEERNAME` `URING_CMD` is in flight; holds its stable landing pad.
     PeerFetch(PendingPeer),
-    /// A kTLS connection whose real-fd `FIXED_FD_INSTALL` is in flight;
-    /// carries the listener index through to the install completion (the handshake handler receives it as
-    /// `Incoming::listener_addr`).
+    /// A kTLS connection whose real-fd `FIXED_FD_INSTALL` is in flight. Carries the listener index through to the
+    /// install completion, which hands it to the handshake handler as `Incoming::listener_addr`.
     TlsInstalling {
         /// Index of the listener the connection arrived on.
         listener: u32,
@@ -217,11 +206,10 @@ impl<U> ConnTable<U> {
 
     /// The connection in `slot` at a completion's `generation`, serving or parked across a detach.
     ///
-    /// For a completion that must retire per-connection state whether or not the connection is reachable for work right
-    /// now - a standalone timer's dedup flag, above all. [`ConnTable::begin_detach`] keeps the same `Connection` and
-    /// does **not** bump the generation, so a flag retired only behind [`ConnTable::slot_matches_cqe`] is retired only
-    /// sometimes: left set, it stays set for the rest of that connection's life and suppresses every later arm. What
-    /// each flag then costs is at its own site.
+    /// For a completion that must retire per-connection state, such as a standalone timer's dedup flag, whether or not
+    /// the connection is reachable for work now. [`ConnTable::begin_detach`] keeps the same `Connection` and
+    /// generation, so a flag retired only behind [`ConnTable::slot_matches_cqe`] stays set across a detach and
+    /// suppresses every later arm.
     pub(crate) fn conn_at_cqe_mut(&mut self, slot: u32, generation: u32) -> Option<&mut Connection<U>> {
         let e = self.slots.get_mut(slot as usize)?;
         if e.generation as u32 != generation {
@@ -449,9 +437,8 @@ impl<U> ConnTable<U> {
     /// Take whatever pool buffer this slot's connection holds, whatever its state and whatever is buffered in it, so
     /// the caller can return it before the connection goes away.
     ///
-    /// Unlike `Connection::release_recv_buf` this does not wait for the buffer to be empty: its bytes die with the
-    /// connection, and a buffer not handed back is one the pool can never reissue *and* never retire the group of -
-    /// `BufPool::rebalance` retires only at `lent() == 0`.
+    /// Unlike `Connection::release_recv_buf` this does not wait for the buffer to be empty. Its bytes die with the
+    /// connection, and a buffer not handed back is one the pool can never reissue.
     #[cfg(feature = "net-server")]
     pub(crate) fn forfeit_recv_claim(&mut self, slot: u32) -> Option<super::conn::RecvClaim> {
         let e = self.slots.get_mut(slot as usize)?;
@@ -569,13 +556,8 @@ mod tests {
         assert_eq!(t.generation(0), 2); // but still bumps
     }
 
-    /// A detach keeps the same `Connection` at the same generation, so the two "is this completion current" questions
-    /// come apart there: `slot_matches_cqe` answers "may this completion do work" and says no, while the connection
-    /// whose state the completion must retire is still sitting in the slot.
-    ///
-    /// A standalone timer's dedup flag is the case that matters. Retiring it only behind `slot_matches_cqe` retires it
-    /// only sometimes, and the flag then suppresses every future arm - `recv_retry_armed` leaves a parked read with
-    /// nothing to wake it, `splice_deadline_armed` disables the one clock a kTLS body splice has.
+    /// A detach keeps the same `Connection` at the same generation, so `slot_matches_cqe` refuses work against the slot
+    /// while `conn_at_cqe_mut` still reaches the connection whose timer flag a completion must retire.
     #[test]
     fn a_detached_slot_keeps_the_connection_a_completion_must_reach() {
         let mut t: ConnTable<()> = ConnTable::new(1);
@@ -616,18 +598,15 @@ mod tests {
 
     #[test]
     fn generation_width_split() {
-        // The generation is u64 so a long-retained channel handle can't alias a future incarnation, but the kernel
-        // routing token packs only its low 32 bits. 2^32 recycles are untestable end to end, so force the generation
-        // past u32::MAX and check the two matchers honour that split. Model the
-        // ABA: a handle minted at generation 5 (before the wrap) vs a slot now at (1<<32)|5, whose low 32 bits are
-        // again 5.
+        // The generation is u64 so a long-retained channel handle cannot alias a future incarnation, but the kernel
+        // token packs only its low 32 bits. Force the generation past u32::MAX to model the ABA, a handle minted at
+        // generation 5 against a slot now at (1<<32)|5.
         let mut t: ConnTable<()> = ConnTable::new(1);
         let conn = crate::net::core::conn::Connection::new(ClientAddr::Unix { cred: None }, (), 1);
         t.install(0, conn);
         t.slots[0].generation = (1u64 << 32) | 5;
 
-        // Channel side (full u64): the pre-wrap handle's generation `5` does NOT
-        // match - no cross-connection injection.
+        // The channel side compares the full u64, so the pre-wrap handle's generation 5 does not match.
         assert!(t.slot_matches(0, (1u64 << 32) | 5));
         assert!(!t.slot_matches(0, 5));
         assert_eq!(t.generation(0), (1u64 << 32) | 5);

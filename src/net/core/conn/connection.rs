@@ -1,16 +1,13 @@
 use super::*;
 
 impl<U> Connection<U> {
-    /// Whether a teardown already owns this connection's remaining completions: either the flushing kind
-    /// (`close_on_flush`, the farewell is final) or the immediate kind (`closing`, a SHUTDOWN/CLOSE is staged).
+    /// Whether a teardown already owns this connection's remaining completions, either the flushing kind
+    /// (`close_on_flush`, the farewell is final) or the immediate kind (`closing`, a SHUTDOWN or CLOSE is staged).
     ///
-    /// A late arrival for such a connection (a worker outcome, a redelivery, a stashed recv) must be dropped rather
-    /// than acted on: the teardown path is what will free the slot, and re-entering the connection can walk it into a
-    /// state that path does not account for.
-    ///
-    /// Deliberately not used at every site that tests one of the two flags. Some check only `close_on_flush` because
-    /// the immediate case cannot reach them, and swapping this predicate in there would be a behaviour change, not a
-    /// refactor. Analyse the site before widening it.
+    /// A late arrival for such a connection (a worker outcome, a redelivery, a stashed recv) must be dropped, since the
+    /// teardown path frees the slot and re-entering the connection can walk it into a state that path does not account
+    /// for. Not used at every site that tests one of the flags. Some check only `close_on_flush` because the immediate
+    /// case cannot reach them, and swapping this in there would change behaviour.
     pub(crate) fn teardown_owns_slot(&self) -> bool {
         self.closing || self.close_on_flush.is_some()
     }
@@ -154,22 +151,18 @@ impl<U> Connection<U> {
         (&self.recv_buf, &mut self.state)
     }
 
-    /// The current message's `(header bytes, body length)` for a body being spliced (`Framing::SpliceBody`): the header
-    /// is the buffered prefix (`buffered == header_len` when a splice is armed) and the body length is the count being
-    /// moved to the sink fd. Snapshotted by the client when the splice is armed, so its `Event::Splice` carries the
-    /// header even though `consume` drops it from the buffer once the body finishes moving.
+    /// The current message's header bytes and body length for a body being spliced (`Framing::SpliceBody`). The client
+    /// snapshots it as the splice is armed, so its `Event::Splice` carries the header that `consume` later drops.
     #[cfg(feature = "net-client")]
     pub(crate) fn splice_frame_parts(&self) -> (&[u8], usize) {
         (&self.recv_buf[..self.header_len], self.body_len)
     }
 
-    /// `(header, body, peer, state, licence)` for a complete message, borrow-split for the body handler call; the last
-    /// element is the placed body's held pool licence (0 otherwise), for the delivery to pot before the handler runs. A
-    /// placed body is moved out of `body_buf`; an inline body borrows `buf` - except a **body-only** message (an http
-    /// 100-continue dance body, delivered with `header_len == 0`) whose extent is exactly the buffered bytes: at or
-    /// over `handoff_threshold`, the accumulate buffer itself is handed over, so the handler's [`Body::take`] is as
-    /// free as a placed body's. The same "large bodies arrive owned" policy as placement - and gated the same way,
-    /// because the reactor grows a fresh buffer afterwards.
+    /// `(header, body, peer, state, ticket)` for a complete message, borrow-split for the body handler call. The ticket
+    /// is the placed body's (default otherwise), for the delivery to pot before the handler runs. A placed body is
+    /// moved out of `body_buf` and an inline body borrows `buf`, except a **body-only** message (`header_len == 0`)
+    /// whose extent is exactly the buffered bytes. At or over `handoff_threshold` its accumulate buffer itself is
+    /// handed over, so the handler's [`Body::take`] is as free as a placed body's.
     // Dead only in a server-with-fs build that carries no client: the server's delivery takes the leased twin below and
     // the client is the remaining caller.
     #[cfg_attr(
@@ -225,14 +218,10 @@ impl<U> Connection<U> {
 
     /// The placed body, if it is this delivery's to hand over.
     ///
-    /// `body_buf` is the destination of an in-flight `RECV` for as long as `recv_into_body` is set: `recv_ptr` handed
-    /// the kernel a pointer into its spare capacity, under the contract stated there - *"Stable until the CQE: neither
-    /// `buf` nor `body_buf` is touched while `recving`."* Moving it out gives the handler a Vec the kernel is still
-    /// writing into, and dropping that `Request` frees it under an armed op.
-    ///
-    /// A wire-driven delivery is unaffected, because `finish_body_recv` clears the flag as it completes the body. What
-    /// this stops is a redelivery arriving while the pump has already armed the *next* message's body: `deliver_one`
-    /// zeroes that redelivery's frame for the same reason, and an empty body is the matching answer.
+    /// `body_buf` is the destination of an in-flight `RECV` while `recv_into_body` is set (`recv_ptr`), so moving it
+    /// out would give the handler a Vec the kernel is still writing into. A wire delivery never meets that, since
+    /// `finish_body_recv` clears the flag. A redelivery can, when the pump has already armed the next message's body,
+    /// and gets an empty body to match its zeroed frame.
     fn take_placed_body(&mut self) -> Option<(Vec<u8>, Ticket)> {
         if self.recv_into_body {
             return None;
@@ -259,10 +248,8 @@ impl<U> Connection<U> {
 
     /// The owned-buffer handoff predicate shared by both delivery forms.
     ///
-    /// `body_len > 0` keeps a zero-length frame (a redelivery, where the original bytes were already consumed) out of
-    /// the handoff: with a zero threshold it would otherwise `take` the accumulate buffer while a read-ahead recv may
-    /// be writing into its spare capacity. `consume` drains `frame_len().min(buf.len())` = 0 afterwards, so the handoff
-    /// composes with the normal delivery epilogue.
+    /// `body_len > 0` keeps a redelivery's zero-length frame out, since with a zero threshold it would take the
+    /// accumulate buffer while a read-ahead recv may be writing into its spare capacity.
     fn take_body_handoff(&mut self, handoff_threshold: Option<usize>) -> Option<(Vec<u8>, Ticket)> {
         if self.header_len == 0
             && self.body_len > 0
@@ -291,9 +278,8 @@ impl<U> Connection<U> {
         self.body_len = body_len;
     }
 
-    /// Bytes of the current message (header + body). `frame_step` proves the sum fits `max_request_bytes` (<=
-    /// `i32::MAX`) before any `set_frame`, so the `saturating_add` never saturates in a reachable state - it is a
-    /// defence-in-depth guard against a future caller that skips that check.
+    /// Bytes of the current message (header + body). `frame_step` proves the sum fits `max_request_bytes` before any
+    /// `set_frame`, so the saturation is a guard that never fires.
     pub(crate) fn frame_len(&self) -> usize {
         self.header_len.saturating_add(self.body_len)
     }
@@ -311,24 +297,14 @@ impl<U> Connection<U> {
     /// Hand the recv buffer back once nothing is buffered, so the next read acquires afresh and an idle connection
     /// holds none.
     ///
-    /// **Refused while a recv is in flight**, exactly as [`Connection::take_placed_body`] is and for the same reason:
-    /// [`recv_ptr`](Connection::recv_ptr) handed the kernel a raw pointer into whichever storage this holds - a pool
-    /// buffer's `claim.ptr` when one is claimed, `owned`'s allocation when a promote left one - under the contract
-    /// stated there, *"Stable until the CQE: neither `buf` nor `body_buf` is touched while `recving`"*. Releasing a
-    /// claim reposts its descriptor for the kernel to hand to some other connection's read - or frees the buffer
-    /// outright, since `BufRing::release` is where a shrinking pool gives storage up - while this connection's recv
-    /// still writes into it.
+    /// **Refused while a recv is in flight.** [`recv_ptr`](Connection::recv_ptr) handed the kernel a pointer into this
+    /// storage, and a released claim is reposted for another connection's read, or freed by a shrinking pool, while
+    /// this recv still writes into it. [`RecvBuf::release`]'s `filled > 0` is not that check, since both partial paths
+    /// advance `recv_at` and leave `filled` alone, and a spliced body consumes its header without releasing the claim.
     ///
-    /// [`RecvBuf::release`]'s `filled > 0` is not that check. Both partial paths advance `recv_at` and deliberately
-    /// leave `filled` alone (`recv_result`'s kTLS arm, and [`advance_exact_partial`](Connection::advance_exact_partial)
-    /// for a plain-TCP read its request clock cut short), and a spliced body consumes its header without releasing the
-    /// claim - so across those whole windows the connection holds a claim, has a recv armed into it, and reports
-    /// `filled == 0`.
-    ///
-    /// A wire-driven delivery cannot reach this state: `on_recv_complete` clears `recving` before it can answer
-    /// `RecvStep::Deliver`, and `pump_gate` stops on the flag. What this stops is the redelivery route, which reaches
-    /// `deliver_one` from `drain_injections` directly and past neither. The buffer is not stranded: the completing recv
-    /// re-enters the pump, and the next delivery releases it.
+    /// A wire delivery cannot reach this with `recving` set, since `on_recv_complete` clears it first. The redelivery
+    /// route from `drain_injections` can, and the buffer is not stranded, since the completing recv re-enters the pump
+    /// and the next delivery releases it.
     pub(crate) fn release_recv_buf(&mut self) -> (Option<RecvClaim>, Option<(Vec<u8>, Ticket)>) {
         if self.recving {
             return (None, None);
@@ -383,16 +359,9 @@ impl<U> Connection<U> {
 
     // ---- recv side ----
 
-    /// Reserve `want` bytes of spare capacity past the buffer tail as the next recv's destination. `exact` selects an
-    /// `MSG_WAITALL` read vs a chunk read.
-    ///
-    /// The destination is **spare capacity**, exactly like a placed body: the kernel initializes it and `recv_result`
-    /// sets the length from the CQE count (a `resize` here would memset up to `want` bytes the kernel immediately
-    /// overwrites - pure hot-path waste, since the zeros are never observable: the framer runs only while no recv is
-    /// armed, an exact read either fills the whole region or closes the connection, and a chunk read exposes only the
-    /// bytes that arrived).
-    /// Returns the length actually armed, which is `want` except against a pool buffer with less room than that - see
-    /// `RecvBuf::reserve_at`.
+    /// Reserve `want` bytes past what is buffered as the next recv's destination. `exact` selects an `MSG_WAITALL` read
+    /// or a chunk read. Returns the length armed, which is `want` except against a pool buffer with less room
+    /// (`RecvBuf::reserve_at`). Only the completion's count extends what is buffered (`recv_result`).
     pub(crate) fn arm_recv(&mut self, want: usize, exact: bool) -> usize {
         self.recv_at = self.recv_buf.len();
         let want = self.recv_buf.reserve_at(self.recv_at, want);
@@ -421,9 +390,8 @@ impl<U> Connection<U> {
             self.body_ticket = ticket;
         }
         debug_assert!(body.is_empty(), "a reused body kept bytes");
-        // Exact: a pooled Vec grown amortized lands at twice its old capacity - an 8 MiB allocation for a 5 MiB body,
-        // the spare never written and charged in full to the byte budget - where the fresh-allocation path was always
-        // exact.
+        // Exact, since a pooled `Vec` grown amortized ends at twice its old capacity, and the spare is never written
+        // but charged in full to the byte budget.
         body.reserve_exact(self.body_len);
         body.extend_from_slice(&self.recv_buf[self.header_len..]);
         self.recv_buf.truncate(self.header_len);
@@ -445,23 +413,19 @@ impl<U> Connection<U> {
                 // SAFETY: `recv_at <= body_len <= capacity`, so the offset stays within the allocation.
                 unsafe { body.as_mut_ptr().add(self.recv_at) as u64 }
             }
-            // The accumulate buffer's cursor likewise points into spare capacity (`recv_at` sits at - or,
-            // mid-kTLS-continuation, past -- the length). SAFETY: `arm_recv` reserved through `recv_at + recv_want`,
-            // and the kTLS continuation re-arms the same reserved range advanced by what completed (`recv_armed_within`
-            // asserts it), so the offset stays within the allocation.
+            // SAFETY: `arm_recv` reserved through `recv_at + recv_want`, and the kTLS continuation re-arms the same
+            // range advanced by what completed (`recv_armed_within` asserts it), so the offset stays within the
+            // allocation.
             _ => self.recv_buf.write_ptr(self.recv_at) as u64,
         }
     }
 
-    /// Process a recv result. An exact read completes only at the requested count; a chunk read completes with any
-    /// `res > 0` (`recv_buf` truncated to the bytes actually received).
+    /// Process a recv result. An exact read completes only at the requested count, and a chunk read with any `res > 0`.
     ///
-    /// kTLS exact reads have one extra healthy shape: io_uring cannot `MSG_WAITALL`-accumulate a `RECVMSG` that carries
-    /// a control buffer (`io_recvmsg` sets `min_ret` only when `msg_controllen == 0` -- io_uring/net.c), so the
-    /// completion delivers however many fully-arrived records the TLS layer had and stops. A short, positive,
-    /// `application_data` read therefore advances the cursor and returns [`RecvOutcome::Again`] for the caller to
-    /// re-arm. Plain-TCP exact reads never complete short healthy (io_uring itself accumulates), so there a short read
-    /// still means EOF mid-frame.
+    /// A kTLS exact read can also complete short and healthy. io_uring cannot `MSG_WAITALL`-accumulate a `RECVMSG` that
+    /// carries a control buffer (`io_recvmsg` sets `min_ret` only when `msg_controllen == 0`, io_uring/net.c), so a
+    /// short, positive `application_data` read advances the cursor and returns [`RecvOutcome::Again`] for the caller to
+    /// re-arm. A short plain-TCP exact read still means EOF mid-frame.
     pub(crate) fn recv_result(&mut self, res: i32) -> RecvOutcome {
         if self.recv_exact {
             if res == self.recv_want as i32 {
@@ -511,21 +475,13 @@ impl<U> Connection<U> {
         self.recv_want -= n;
     }
 
-    /// Does the currently-armed recv range `[recv_at, recv_at + recv_want)` stay inside the buffer behind it? A guard
-    /// for the kTLS continuation, which re-arms off the advanced cursor without a fresh reserve: with the initial arm
-    /// refusing a pool buffer too small for an exact read (`submit_recv`), the range is always inside, and this makes
-    /// that checkable rather than assumed.
+    /// Whether the armed range `[recv_at, recv_at + recv_want)` stays inside the buffer behind it. A guard for the kTLS
+    /// continuation, which re-arms off the advanced cursor without a fresh reserve.
     pub(crate) fn recv_armed_within(&self) -> bool {
-        // The same two arms as `recv_ptr`, because what this bounds is the allocation that call is about to name. A
-        // placed body reads into `body_buf` - reserved to `body_len` by `arm_body_recv`, which truncates the accumulate
-        // buffer to the header - so asking `recv_buf` about it inspects unrelated storage, and answers "outside" for
-        // every body larger than its own head.
-        //
-        // Bounded by `body_len`, not `body.capacity()`: the two were equal when every body was freshly allocated, but a
-        // pooled buffer carries whatever capacity its largest tenant left - 16x the body at the defaults - and the
-        // spare bytes past `body_len` are a previous message's, from any connection on the ring. `recv_at + recv_want
-        // == body_len` is the invariant every partial path preserves, so this is the exact bound the cursor is supposed
-        // to satisfy (and `capacity >= body_len` by `arm_body_recv`'s reserve, so it is the tighter of the two).
+        // The same two arms as `recv_ptr`, since this bounds the allocation that call names. A placed body is bounded
+        // by `body_len`, not `body.capacity()`, since a pooled buffer carries whatever capacity its largest tenant left
+        // and the bytes past `body_len` are a previous message's. Every partial path keeps `recv_at + recv_want ==
+        // body_len`.
         match &self.body_buf {
             Some(_) if self.recv_into_body => self
                 .recv_at
@@ -651,7 +607,7 @@ impl<U> Connection<U> {
         self.file_tail.is_some()
     }
 
-    /// Without a server-side fs pool no tail can exist; the flush-close dry checks compile to their old shape.
+    /// Without a server-side fs pool no tail can exist.
     #[cfg(not(all(feature = "net-server", feature = "uring-fs")))]
     pub(crate) fn tail_active(&self) -> bool {
         false
@@ -718,15 +674,12 @@ impl<U> Connection<U> {
         });
     }
 
-    /// Advance the tail past a completed body read and queue its bytes as the next chunk; `true` when that was the last
+    /// Advance the tail past a completed body read and queue its bytes as the next chunk. `true` when that was the last
     /// of the declared length, which also retires the tail and releases the diversion.
     ///
-    /// The advance is the segment's length and nothing else - the count the read ACTUALLY returned, which is why the
-    /// requested length is not a parameter here. A short read must leave the rest for the next iteration and continue
-    /// from the offset it reached; advancing by the length asked for would skip the unread bytes and send whatever the
-    /// next read landed on in their place, a body correct in its framing and wrong in its content. That is the failure
-    /// the deliberate absence of `IOSQE_IO_LINK` on the read exists to prevent, and short reads are ordinary on ZFS,
-    /// where every ring read is punted to an io-wq worker.
+    /// The advance is the count the read returned, never the length asked for. Short reads are ordinary on ZFS, where
+    /// every ring read is punted to an io-wq worker, and advancing by the request would skip the unread bytes and send
+    /// a body correct in its framing and wrong in its content. The read carries no `IOSQE_IO_LINK` for the same reason.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) fn advance_file_tail(&mut self, buf: SendBuf) -> bool {
         let n = buf.len() as u64;
@@ -799,12 +752,9 @@ impl<U> Connection<U> {
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) fn take_queued_file_reply(&mut self) -> Option<PendingFile> {
         let next = self.next_file.take();
-        // Installing this one arms `close_on_flush` from ITS own `close`, which takes the gate over from here - but the
-        // flag summarises every deferred body, not just this one. A close carried by a body still queued BEHIND it has
-        // nothing else holding the gate, so recompute from the followers rather than clearing outright. Cleared, the
-        // gate opens for as many further requests as the read-ahead cap allows, and every one the handler then answers
-        // is discarded unsent by `drop_queued_file_reply` when the final body retires - the admission
-        // `has_deferred_close` exists to refuse.
+        // Installing this one arms `close_on_flush` from its own `close`, but this flag covers every deferred body, so
+        // recompute it from the followers rather than clearing it. Cleared, the gate admits requests whose answers
+        // `drop_queued_file_reply` then discards unsent.
         self.deferred_close = self
             .next_file_pending
             .iter()
@@ -812,20 +762,17 @@ impl<U> Connection<U> {
         next
     }
 
-    /// Drop a deferred file body **and everything queued behind it** - the connection is flush-closing, so the deferred
-    /// response will never be sent.
+    /// Drop a deferred file body **and everything queued behind it**, since the connection is flush-closing and the
+    /// deferred response will never be sent.
     ///
-    /// The followers go with it because a response's association with its request is its position: queueing them here
-    /// would put the next response on the wire where the dropped one belonged, and the peer would read it as the answer
-    /// to a request it does not answer. That is the same "response out of order" this diversion exists to prevent
-    /// ([`PendingItem`]), arriving by the close path instead of the send path. A peer that sees the close knows what
-    /// went unanswered and can retry it; a peer that sees the wrong body cannot tell.
+    /// A response is tied to its request by position, so queueing the followers would put the next response where the
+    /// dropped one belonged, and the peer would read it as the answer to the wrong request. A peer that sees the close
+    /// knows what went unanswered and can retry it.
     #[cfg(all(feature = "net-server", feature = "uring-fs"))]
     pub(crate) fn drop_queued_file_reply(&mut self) {
-        // Every discarded item was charged to `outstanding` when it was delivered - a file body at `begin_file_reply`,
-        // an ordinary reply credited back only when its `ReplyLast` segment flushes. Nothing here will flush, so the
-        // charges are returned by hand or they leak: the read-ahead gate, the idle timeout's owes-work test and the
-        // drain's quiesced predicate all read `outstanding`.
+        // Every discarded item was charged to `outstanding` as it was delivered, and nothing here will flush to credit
+        // it, so the charges are returned by hand. The read-ahead gate, the idle timeout and the drain all read
+        // `outstanding`.
         let mut charged = u32::from(self.next_file.is_some());
         self.next_file = None;
         // Whatever close a discarded body carried is subsumed by the `close_on_flush` that brought us here.
@@ -836,12 +783,9 @@ impl<U> Connection<U> {
                 // A deferred body has queued no bytes yet - a file tail is queued a chunk at a time, and this one never
                 // started.
                 PendingItem::File(_) => charged += 1,
-                // A reply retires on its final segment, so only that one carries a charge; `Push` segments carry none.
-                // The bytes are `enqueue`'s, which counts them into `queued_bytes` before the diversion holds the item
-                // back, so they go home here for the same reason the `outstanding` charges do - nothing will flush to
-                // credit them, and `queued_bytes` is what the send-backlog check reads. (Never a pooled buffer:
-                // `enqueue_file_chunk` is the only pooled queuer and it bypasses the diversion, so there is no id owed
-                // back with them.)
+                // Only a reply's final segment carries a charge, and a push carries none. `enqueue` counted the bytes
+                // into `queued_bytes` before the diversion held them back, so they come off here too. None is a pooled
+                // buffer, since `enqueue_file_chunk` bypasses the diversion.
                 PendingItem::Pdu(pdu) => {
                     bytes += pdu.bytes.len();
                     if matches!(pdu.kind, SendKind::ReplyLast) {
@@ -934,11 +878,9 @@ impl<U> Connection<U> {
             if item.reclaim {
                 self.chunk_out = self.chunk_out.saturating_sub(1);
                 if let Some(bid) = item.bytes.pooled_bid() {
-                    // The array bound and the queue bound are the same constant on purpose: `tail_claim_chunk` refuses
-                    // past `FILE_TAIL_BUFS`, so no more than that many reclaim segments can ever be queued, and a flush
-                    // pass can therefore never pop more. If the claim cap and this array ever diverge, the `get_mut`
-                    // below drops a bid on the floor - a buffer the pool can neither reissue nor free - which is what
-                    // the assert is guarding.
+                    // `tail_claim_chunk` refuses past `FILE_TAIL_BUFS`, so a flush can never pop more reclaim segments
+                    // than this array holds. If the two ever diverge, `get_mut` drops a bid the pool can neither
+                    // reissue nor free, which the assert guards.
                     debug_assert!(
                         (progress.freed as usize) < progress.freed_bids.len(),
                         "at most FILE_TAIL_BUFS chunks can be queued at once"
@@ -958,13 +900,11 @@ impl<U> Connection<U> {
         ptr::addr_of!(self.send_msg) as u64
     }
 
-    /// The armed gather's lone segment when it has exactly one - the plain `SEND` fast path (no per-op `msghdr`
-    /// import): `(ptr, len)`.
+    /// The armed gather's lone segment as `(ptr, len)` when it has exactly one, for the plain `SEND` fast path.
     ///
-    /// The length is clamped to `i32::MAX`, never cast-wrapped: an SQE length is `u32` and a CQE result `i32` (the
-    /// kernel itself clamps every iter at `MAX_RW_COUNT`), so a >= 4 GiB PDU would otherwise wrap - worst case to a
-    /// 0-byte send that reads as a fatal `SendError`. A clamped send completes short and the re-submit carries the
-    /// tail, exactly like any partial send.
+    /// The length is clamped to `i32::MAX`, never cast-wrapped, since an SQE length is `u32` and a CQE result `i32`,
+    /// and a wrapped length can become a 0-byte send read as a fatal `SendError`. A clamped send completes short and
+    /// the re-submit carries the rest, like any partial send.
     pub(crate) fn send_single(&self) -> Option<(u64, u32)> {
         (self.send_msg.msg_iovlen == 1).then(|| {
             (

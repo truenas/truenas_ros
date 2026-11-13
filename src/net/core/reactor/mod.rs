@@ -103,12 +103,9 @@ pub(crate) struct Reactor<U> {
     pub(crate) has_fs_pool: bool,
     /// Recv buffers drawn from a registered ring rather than owned per connection.
     ///
-    /// A connection takes one when data actually arrives and gives it back once its message is consumed, so a
-    /// keep-alive connection parked on an idle recv holds nothing - `IOSQE_BUFFER_SELECT` has the kernel pick a buffer
-    /// at *completion* rather than at submit, which is the whole reason this is a provided-buffer ring and not a free
-    /// list.
-    ///
-    /// Declared after `table` so connections drop first: a claim points into this pool's storage.
+    /// A provided-buffer ring and not a free list, since `IOSQE_BUFFER_SELECT` has the kernel pick at completion, so a
+    /// keep-alive connection parked on an idle recv holds nothing. Declared after `table` so connections drop first,
+    /// since a claim points into this pool's storage.
     #[cfg(feature = "net-server")]
     pub(crate) recv_bufs: Option<BufPool>,
     /// Ring-owned storage for placed and promoted request bodies - the recv-side sibling of the chunk ring's rule that
@@ -192,11 +189,8 @@ impl<U> Reactor<U> {
                 // teardown path.
                 unsafe { libc::close(cqe.res) };
             }
-            // Anything not the reactor's own. A host sharing this ring (the server's fs op table) owns completions the
-            // reactor cannot classify, and this drain does not dispatch - so without routing them an `openat2` that
-            // completes here leaks a real process fd, which survives the ring's close and matters whenever the process
-            // outlives the server. The tag vocabularies are disjoint (`TAG_FS_DOMAIN`), so each side ignores the
-            // other's.
+            // Anything not the reactor's own goes to the host sharing this ring, since this drain does not dispatch and
+            // an `openat2` completing here would leak a process fd. Tags are disjoint (`TAG_FS_DOMAIN`).
             other(cqe);
         })
     }
@@ -211,10 +205,8 @@ impl<U> Reactor<U> {
             pool.release(claim.bid);
             self.sync_recv_buf_stats();
         }
-        // The dying connection's placed and promoted body storage goes home too - with the held licences their claims
-        // recorded - for the pool to retain or free under its byte law. Dropped on the floor instead, every abandoned
-        // large upload took one warm buffer out of the loop, for the cost of a Content-Length header and a disconnect,
-        // no authentication required.
+        // The dying connection's placed and promoted body storage goes home too, with its held licences. Dropped
+        // instead, every abandoned large upload would take a warm buffer out of the loop at no cost to the peer.
         #[cfg(feature = "net-server")]
         if let Some(pool) = self.body_pool.as_ref() {
             let (placed, owned) = self.table.forfeit_body_storage(slot);
@@ -261,16 +253,11 @@ impl<U> Reactor<U> {
     }
 
     /// Teardown drain for a role's `Drop`: cancel and reap every in-flight op so the kernel holds no reference to a
-    /// connection buffer before the buffers are freed. If the drain itself fails - a hard `io_uring_enter` error (not
-    /// `EBUSY`/`EAGAIN`, which are retried) that returns with ops still in flight - leak the kernel-visible buffers
-    /// instead of freeing them: the ring fd still closes as the engine drops (cancelling the ops), but now against
-    /// permanently-valid memory. Mirrors the `mem::forget` the peercred probe uses when `io_uring_enter` fails under
-    /// it.
-    /// Returns `true` if the drain failed and the buffers were leaked - an embedding host with its own kernel-visible
-    /// buffers on this ring (the server's fs op table) must then leak those too.
-    /// `other` is called with every reaped CQE, so a host sharing this ring (the server's fs op table) can route its
-    /// own domain's completions -- freeing what they carry - as they land. A role with nothing else on the ring passes
-    /// a no-op.
+    /// connection buffer before the buffers are freed. If the drain fails with ops still in flight, leak the
+    /// kernel-visible buffers instead, so the ring's close cancels the ops against memory that stays valid.
+    ///
+    /// Returns `true` if the buffers were leaked, and a host with its own kernel-visible buffers on this ring must then
+    /// leak those too. `other` is called with every reaped CQE, so such a host can route its own completions.
     pub(crate) fn drain_or_leak(&mut self, other: &mut dyn FnMut(&IoUringCqe)) -> bool {
         if self.cancel_and_reap_all(other).is_err() {
             self.table.leak();

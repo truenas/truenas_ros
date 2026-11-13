@@ -146,11 +146,8 @@ fn a_new_body_read_waits_behind_held_ones() {
 /// A budget retired and replaced inside one dispatch: the predecessor's expiry must not be charged to the
 /// successor.
 ///
-/// `deliver_one` retires (clearing the flag and *staging* a cancel that `run_loop` submits only at the top of the
-/// next iteration) and `pump -> submit_recv -> arm_receipt_deadline` re-arms, all before the reap loop reaches the
-/// old timer's `-ETIME` - which is posted at exactly the deadline the retire sat on, i.e. whenever a peer finishes
-/// just inside its budget. `user_data` carries the slot's generation, not the timer's, so the two expiries are
-/// bit-identical and the flag alone cannot tell them apart.
+/// The retire only stages its cancel, and the re-arm runs before the reap loop reaches the old timer's `-ETIME`, which
+/// carries the same `user_data`, so the flag alone cannot tell the two expiries apart.
 #[cfg(feature = "net-server")]
 #[test]
 fn a_retired_receipt_budget_is_not_charged_to_its_successor() {
@@ -257,11 +254,9 @@ fn frame_step_needs_and_caps() {
             in_message: true
         }
     );
-    // An exact read from an empty buffer is ambiguous on its own: for a length-prefix framer it is the next
-    // message's first read, and for one that parsed a body length out of a head it has already consumed it is a
-    // continuation. Only the framer knows, so only the framer can say - and a `Need` that should have been
-    // `NeedInMessage` arms no receipt budget and takes the idle clock, which where `idle_timeout` is unset is no
-    // clock at all.
+    // An exact read from an empty buffer is ambiguous on its own, the next message's first read for a length-prefix
+    // framer or a continuation for one that consumed its head. Only the framer knows, and a `Need` that should have
+    // been `NeedInMessage` arms no receipt budget and takes the idle clock.
     assert_eq!(
         frame_step(Framing::Need(64), 0, MAX, None),
         FrameStep::ReadHeader {
@@ -300,8 +295,7 @@ fn frame_step_needs_and_caps() {
 
 #[test]
 fn frame_step_complete_paths() {
-    // Overflowing header+body is rejected before any slice (the U64-prefix remote-panic class the fuzzer
-    // rediscovered).
+    // Overflowing header+body is rejected before any slice.
     assert_eq!(
         frame_step(
             Framing::Complete {

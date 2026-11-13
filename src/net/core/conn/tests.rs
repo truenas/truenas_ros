@@ -157,10 +157,9 @@ fn body_placement_bookkeeping() {
     assert_eq!(c.buffered(), 0, "placed body never re-enters buf");
 }
 
-/// The kTLS continuation's every-build guard bounds the placed-body cursor by the *body*, not by its buffer. The
-/// two were equal when every body was freshly allocated; a pooled buffer carries whatever capacity its largest
-/// tenant left, and the spare bytes past `body_len` are a previous message's - so a cursor walked past the body
-/// while still inside the allocation must be refused.
+/// The kTLS continuation's guard bounds the placed-body cursor by the *body*, not its buffer. A pooled buffer carries
+/// whatever capacity its largest tenant left, and the bytes past `body_len` are a previous message's, so a cursor past
+/// the body must be refused even inside the allocation.
 #[test]
 fn a_placed_cursor_is_bounded_by_the_body_not_its_buffer() {
     let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
@@ -228,10 +227,8 @@ fn teardown_forfeits_body_storage_with_its_ticket() {
 
 /// A redelivery must not be handed the buffer an in-flight `RECV` is writing into.
 ///
-/// With a read-ahead cap above one the pump can frame and arm the *next* message's body while a handler is parked
-/// on `Response::Defer`. The redelivery that follows zeroes its own frame (`deliver_one`), and the delivery must
-/// not `take` `body_buf` while it is an armed op's destination: the handler would be handed a Vec freed the moment
-/// its `Request` drops, with the kernel still writing into it.
+/// The pump can arm the next message's body while a handler is parked on `Response::Defer`, and a `Vec` taken from
+/// under that recv is freed as its `Request` drops, with the kernel still writing into it.
 #[test]
 fn a_redelivery_does_not_steal_the_armed_body_buffer() {
     let mut c = Connection::new(ClientAddr::Unix { cred: None }, (), 8);
@@ -364,10 +361,8 @@ fn deferred_request_gating() {
 
 #[test]
 fn user_data_round_trip() {
-    // Force this test to be revisited whenever a variant is added: the compiler errors here, and the count assert
-    // below then proves the new variant is reachable through `from_u8` (i.e. was added to its table -
-    // `SpliceRecv`'s token doubles as an ASYNC_CANCEL match key, so a `from_u8` gap silently breaks mid-splice
-    // teardown).
+    // The match stops compiling when a variant is added, and the count below then proves `from_u8` decodes it.
+    // `SpliceRecv`'s token is an `ASYNC_CANCEL` match key, so a gap in `from_u8` breaks mid-splice teardown.
     const OP_COUNT: usize = {
         match Op::Accept {
             Op::Accept
@@ -483,10 +478,8 @@ fn file_tail_diverts_reclaims_and_releases_in_order() {
 
 /// Dropping a stranded body returns the followers' bytes as well as their `outstanding` charges.
 ///
-/// `enqueue` counts a diverted PDU into `queued_bytes` before the diversion holds it back - deliberately, so the
-/// send-backlog check sees it - and nothing will flush to credit it once the flush-close discards it. Left behind,
-/// `queued_bytes` reports bytes the connection is not holding, which is the same class of leak the `outstanding`
-/// charges beside it are returned by hand to avoid.
+/// `enqueue` counts a diverted PDU into `queued_bytes` before the diversion holds it back, and nothing flushes to
+/// credit it once the flush-close discards it.
 #[cfg(all(feature = "net-server", feature = "uring-fs"))]
 #[test]
 fn dropping_a_stranded_body_returns_the_followers_bytes() {
@@ -546,10 +539,8 @@ fn a_short_read_continues_from_the_offset_it_reached() {
     assert_eq!(c.queued_bytes(), 300, "both chunks queued, nothing else");
 }
 
-/// The pool outlives the body that minted it. A connection serving many file responses mints `FILE_TAIL_BUFS`
-/// buffers **once** and cycles them for the rest of its life. Scoped to `FileTail` instead, every `ReplyFile`
-/// started from an empty pool and minted again - two fresh allocations per response, and `fs_body_chunk` is a
-/// megabyte in a realistic deployment.
+/// A body's share of the ring comes back as it flushes, so each body on a connection starts from the same share however
+/// many ran before it.
 #[cfg(all(feature = "net-server", feature = "uring-fs"))]
 #[test]
 fn chunk_buffers_outlive_the_body_that_minted_them() {
@@ -601,10 +592,8 @@ fn a_leased_claim_is_refused_to_every_path_but_the_write() {
 
 /// The lease is bounded to the delivered message, never the buffer.
 ///
-/// A recycled pool buffer is not zeroed, so bytes past the message are a previous holder's - another connection's
-/// request, in the worst case - and `pwritev2_from`'s containment gate reads this cap as the line between "write
-/// straight from the ring" and "fall to the copy path". A cap of the whole buffer would lease those bytes into a
-/// stored object.
+/// A recycled pool buffer is not zeroed, so bytes past the message are a previous holder's, and `pwritev2_from` reads
+/// this cap as the line between writing straight from the ring and falling to the copy path.
 #[cfg(all(feature = "net-server", feature = "uring-fs"))]
 #[test]
 fn a_lease_never_reaches_past_the_delivered_message() {
@@ -705,15 +694,10 @@ fn draining_a_lease_with_no_claim_fails_closed_without_asserts() {
 
 /// A delivery must not hand a lent pool buffer back while a recv is still writing into it.
 ///
-/// `deliver_one` ends every delivery with `consume()` then `release_recv_buffer(slot)`, unconditionally, and a
-/// *redelivery* reaches it from `drain_injections` rather than through `pump_gate` -- so the `!recving` test the
-/// wire path relies on is not in the way.
-/// A redelivery's frame is zeroed, so its `consume` drains nothing and `filled` stays where the armed read left it.
-///
-/// `filled == 0` under an armed read is not exotic: a spliced body consumes its header without releasing the claim,
-/// and both partial paths (`recv_result`'s kTLS arm, `advance_exact_partial`) advance `recv_at` and leave `filled`
-/// alone by design. Released there, the descriptor is reposted for the kernel to hand to another connection (or the
-/// buffer freed, if the pool is shrinking) with this connection's DMA still aimed at it.
+/// A redelivery reaches `release_recv_buffer` from `drain_injections`, past the `!recving` test the wire path relies
+/// on, and its zeroed frame drains nothing. `filled == 0` under an armed read is ordinary after a spliced body's
+/// consume or a partial read, and released there the descriptor is reposted for another connection with this one's DMA
+/// still aimed at it.
 #[cfg(feature = "net-server")]
 #[test]
 fn a_delivery_does_not_release_a_buffer_under_an_armed_recv() {
@@ -756,15 +740,9 @@ fn a_delivery_does_not_release_a_buffer_under_an_armed_recv() {
 
 /// A promote that copies nothing still has to leave the connection reading into the storage it just installed.
 ///
-/// `submit_recv` decides the buffer select first, off a claim still held, so the SQE goes out with no
-/// `IOSQE_BUFFER_SELECT`; the promote then hands that claim back. If `needs_buffer` answers `true` behind it,
-/// `reserve_at` grants the whole read without allocating - past the `granted < want && exact` refusal, which is
-/// documented as unreachable for exactly this reason - and `write_ptr` hands the kernel address 0 with
-/// `MSG_WAITALL` and nothing to select. `access_ok(NULL, n)` passes on x86_64, so the copy faults and the
-/// connection dies `RecvError(EFAULT)` with nothing in either profile to say why.
-///
-/// Reachable past a spliced body: `on_splice_recv_complete` consumes the header without releasing the claim, so the
-/// next exact read larger than one pool buffer promotes with nothing accumulated.
+/// `submit_recv` decides the buffer select before the promote hands the claim back, so the SQE carries no
+/// `IOSQE_BUFFER_SELECT`. If `needs_buffer` then answered `true`, `write_ptr` would hand the kernel address 0 and the
+/// connection would die `RecvError(EFAULT)`. Reachable after a spliced body's consume, which keeps the claim.
 #[cfg(feature = "net-server")]
 #[test]
 fn a_promote_that_copies_nothing_still_has_a_destination() {
@@ -797,15 +775,11 @@ fn a_promote_that_copies_nothing_still_has_a_destination() {
     assert!(rb.armed_within(0, want), "inside what the promote sized");
 }
 
-/// A ticket outlives the `pooled` flag that let it be taken, so the three sites that move `owned` out all have to
-/// carry it.
+/// A ticket outlives the `pooled` flag that let it be taken, so the three sites that move `owned` out all carry it.
 ///
-/// `promote_for` writes `owned_ticket` and clears `claim`. It does **not** clear `pooled`, which is what makes
-/// `take_owned` unreachable from a promote alone. `set_owned` clears `pooled`, is one-way, and is reached by an
-/// ordinary oversized exact read or a pool that will not grow - so the two compose, and `take_owned` hands the
-/// storage to the handler with the ticket still on the connection unless it takes it. A dropped licence is demand
-/// the pool met and never counted, so it stops growing for a working set it is already serving, silently, since
-/// nothing else reads the field. And dropped bytes stay on the count of held storage for good.
+/// `promote_for` writes `owned_ticket` but does not clear `pooled`, and `set_owned` clears it one-way, so `take_owned`
+/// can hand promoted storage to the handler. A dropped licence is demand the pool met and never counted, and dropped
+/// bytes stay on the count of held storage for good.
 #[cfg(feature = "net-server")]
 #[test]
 fn every_path_that_moves_owned_out_carries_its_ticket() {
@@ -957,16 +931,9 @@ fn a_chunk_outliving_its_tail_still_frees_its_buffer() {
 
 /// A redelivery owns no bytes, so it must not be handed a write lease.
 ///
-/// `deliver_one` zeroes a redelivery's frame - the message's bytes went at its first delivery - so
-/// `deliver_parts_leased` asked `write_lease(0)`, which still minted a lease naming the claim with `cap == 0`.
-/// `pwritev2_from`'s containment gate is `at >= base && at + len <= base + cap`, and a redelivery's `Body` is an
-/// EMPTY slice at the claim base (`RecvBuf::deref` is `from_raw_parts(c.ptr, 0)`), so a zero-length write passed
-/// it: `taken` was set, the op recorded `LeaseHold(bid)`, and `consume`'s leased arm surrendered the claim to it -
-/// while the pump's read-ahead recv was armed into that same buffer. The op's completion then releases the id to
-/// the pool under a live DMA, which is the hazard `a_delivery_does_not_release_a_buffer_under_an_armed_recv` closes
-/// on the other door.
-///
-/// `take_body_handoff` already excludes the same zero-frame case, for the same reason, with its `body_len > 0`.
+/// Its frame is zeroed, and its empty `Body` sits at the claim base, which `pwritev2_from`'s bounds test admits. A
+/// zero-length write would then take the claim and release it to the pool from its completion while the read-ahead recv
+/// is still armed into that buffer. `take_body_handoff` excludes the same case with its `body_len > 0`.
 #[cfg(all(feature = "net-server", feature = "uring-fs"))]
 #[test]
 fn a_redelivery_is_not_handed_a_write_lease() {

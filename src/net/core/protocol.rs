@@ -9,8 +9,8 @@ use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 
-/// Stream server type and bind address in one type-safe enum: the variant *is* the server type (the Rust-idiomatic take
-/// on `socketserver`'s server class + `server_address`), so an illegal type/address pairing cannot be expressed.
+/// Stream server type and bind address in one enum. The variant is the server type, so an illegal pairing of type and
+/// address cannot be expressed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerAddr {
     /// IPv4 TCP (`AF_INET`, `SOCK_STREAM`).
@@ -60,15 +60,14 @@ pub enum Framing {
     Need(usize),
     /// [`Need`](Framing::Need) for a message the peer has already begun.
     ///
-    /// Identical in what it reads. The difference is which clock the read carries, exactly as
-    /// [`MoreInMessage`](Framing::MoreInMessage) is to [`More`](Framing::More): this says "a message is under way", so
-    /// the read takes [`ServerConfig::request_timeout`] rather than [`ServerConfig::idle_timeout`] and arms
-    /// [`ServerConfig::max_receipt_time`].
+    /// It reads the same, but the read takes [`ServerConfig::request_timeout`] rather than
+    /// [`ServerConfig::idle_timeout`] and arms [`ServerConfig::max_receipt_time`], as
+    /// [`MoreInMessage`](Framing::MoreInMessage) does for [`More`](Framing::More).
     ///
     /// **SECURITY: a framer that answers `Need` here loses both bounds.** A peer that sends a partial message and stops
-    /// is then held by the idle clock alone - by nothing at all where that is unset - with its pool slot taken at
-    /// accept, before any authentication. The exact shape is easy to reach: a framer that reads a length prefix as its
-    /// own message, consumes it, and answers `Need(payload_len)` from an empty buffer.
+    /// is then held by the idle clock alone, or by nothing where that is unset, with its pool slot taken before any
+    /// authentication. A framer that consumes a length prefix as its own message and then answers `Need(payload_len)`
+    /// from an empty buffer gets there easily.
     ///
     /// [`ServerConfig::idle_timeout`]: crate::net::server::ServerConfig::idle_timeout
     /// [`ServerConfig::request_timeout`]: crate::net::server::ServerConfig::request_timeout
@@ -86,14 +85,13 @@ pub enum Framing {
     More,
     /// [`More`](Framing::More) for a message the peer has already begun.
     ///
-    /// Identical in what it reads. The difference is which clock the read carries: the server cannot tell a mid-message
-    /// scan from an idle park once the framer has consumed everything buffered, and only the framer knows. This says "a
-    /// message is under way", so the read takes [`ServerConfig::request_timeout`] rather than
-    /// [`ServerConfig::idle_timeout`] and arms [`ServerConfig::max_receipt_time`].
+    /// It reads the same, but the read takes [`ServerConfig::request_timeout`] rather than
+    /// [`ServerConfig::idle_timeout`] and arms [`ServerConfig::max_receipt_time`]. Once the framer has consumed
+    /// everything buffered the server cannot tell a mid-message scan from an idle park, and only the framer knows.
     ///
     /// **SECURITY: a framer that answers `More` here loses both bounds.** A peer that sends a partial message and stops
-    /// is then held by the idle clock alone - by nothing at all where that is unset - with its pool slot taken at
-    /// accept, before any authentication.
+    /// is then held by the idle clock alone, or by nothing where that is unset, with its pool slot taken before any
+    /// authentication.
     ///
     /// [`ServerConfig::idle_timeout`]: crate::net::server::ServerConfig::idle_timeout
     /// [`ServerConfig::request_timeout`]: crate::net::server::ServerConfig::request_timeout
@@ -108,40 +106,25 @@ pub enum Framing {
         /// Length of the body portion.
         body_len: usize,
     },
-    /// The message is completely framed, but its **body** should be spliced straight from the socket to `fd` (a
-    /// consumer-owned pipe, e.g. feeding a ZFS `lzc_receive`) instead of read into the connection buffer - zero-copy
-    /// (`IORING_OP_SPLICE`). The first `header_len` accumulated bytes are the header; the next `body_len` bytes are
-    /// spliced to `fd`. The server never owns or closes `fd`; the framer must read its header with exact
-    /// [`Framing::Need`] so no body byte is over-read into the buffer.
+    /// The message is completely framed, but its body is spliced straight from the socket to `fd` (`IORING_OP_SPLICE`)
+    /// instead of read into the connection buffer. The first `header_len` accumulated bytes are the header and the next
+    /// `body_len` bytes go to `fd`. The server never owns or closes `fd`, and the framer must read its header with
+    /// exact [`Framing::Need`] so no body byte is over-read into the buffer.
     ///
-    /// Works over plain TCP/unix **and kernel TLS**: the kernel routes the splice through the socket's `splice_read`,
-    /// which for kTLS is `tls_sw_splice_read` - it decrypts and moves plaintext, so the body splices in the clear, and
-    /// body bytes the header read left buffered in the kernel's TLS receive list are picked up too. A mid-stream TLS
-    /// control record (a TLS 1.3 KeyUpdate, or an alert) cannot be spliced and closes the connection with
-    /// [`CloseReason::TlsControl`]. NIC-offloaded kTLS RX (`tls_device`) uses this **same** `tls_sw_splice_read` path
-    /// (the NIC decrypts, the software layer still frames records with a decrypt fallback), so splice is expected to
-    /// work there too - though it is untested without offload-capable hardware. The legacy `TLS_HW_RECORD` full-offload
-    /// mode (TOE-style) delivers a plain stream and is out of scope.
+    /// It works over kernel TLS too, since `tls_sw_splice_read` decrypts and moves plaintext, and it picks up body
+    /// bytes the header read left in the kernel's TLS receive list. A mid-stream TLS control record cannot be spliced
+    /// and closes the connection with [`CloseReason::TlsControl`]. Over kTLS a splice moves one record and no more,
+    /// since `tls_sw_splice_read` (`net/tls/tls_sw.c`) has no loop and `tls_rx_reader_acquire` admits one reader per
+    /// socket, so a body moves in `TLS_MAX_PAYLOAD_SIZE` steps, one per round trip. Plain TCP loops in
+    /// `tcp_splice_read`.
     ///
-    /// **Over kTLS a splice moves one TLS record and no more, and that cap cannot be amortised.** `tls_sw_splice_read`
-    /// (`net/tls/tls_sw.c`) has no loop: it takes one record, splices `min(rxm->full_len, len)` of it, and returns - so
-    /// a body moves in `TLS_MAX_PAYLOAD_SIZE` (`1 << 14`, `include/net/tls.h`) steps, each blocking an io-wq worker.
-    /// Queue depth does not help, because `tls_rx_reader_acquire` admits one reader per socket at a time and a blocked
-    /// splice holds that gate while it waits for its record; the per-connection ceiling is one record per round trip,
-    /// strictly serialised. Plain TCP has neither limit - `tcp_splice_read` (`net/ipv4/tcp.c`) loops `while
-    /// (tss.len)` - so this is a kTLS property, not a splice one.
+    /// A body that carries its own framing belongs on [`Framing::Complete`], since splice moves opaque bytes and cannot
+    /// de-frame a chunked or inner encoding on the way past.
     ///
-    /// **A body that carries its own framing belongs on [`Framing::Complete`], not here.** Splice moves opaque bytes,
-    /// so a chunked transfer coding - or an inner encoding whose frame headers land at arbitrary offsets inside the
-    /// outer chunks - cannot be de-framed on the way past. The extent named here has to be payload the consumer wants
-    /// verbatim.
-    ///
-    /// `fd` must be **blocking** (its `O_NONBLOCK` clear); a non-blocking destination is rejected with
-    /// [`CloseReason::SpliceBadFd`] - see that variant for why. Backpressure is the pipe itself: a full pipe blocks the
-    /// splice on an io-wq worker (never the ring), TCP flow control pushes back on the sender, and the ring keeps
-    /// serving other connections. Over kTLS, `ServerConfig::request_timeout` (when set) also clocks each spliced
-    /// record - including time blocked on a full pipe, which the kernel cannot distinguish from a stalled peer - so a
-    /// consumer draining slower than a record per period is evicted as a slow-loris would be.
+    /// `fd` must be blocking, or the connection closes with [`CloseReason::SpliceBadFd`]. A full pipe blocks the splice
+    /// on an io-wq worker, never the ring, and TCP flow control pushes back on the sender. Over kTLS,
+    /// `ServerConfig::request_timeout` clocks each spliced record, time blocked on a full pipe included, so a consumer
+    /// draining slower than a record per period is evicted.
     SpliceBody {
         /// Length of the header portion (buffered).
         header_len: usize,
@@ -214,52 +197,36 @@ pub enum CloseReason {
     /// KeyUpdate, or alert). The server closes rather than handle it (renegotiation/rekey are out of scope); a
     /// `close_notify` from the peer surfaces here too.
     TlsControl,
-    /// The fd a framer handed to [`Framing::SpliceBody`] was unusable: closed, or opened **non-blocking**. This is a
-    /// consumer bug, not peer behavior. The destination must be a blocking pipe write end: `splice` promotes the output
-    /// fd's `O_NONBLOCK` to `SPLICE_F_NONBLOCK`, making a full pipe fail `-EAGAIN` before the socket is read -
-    /// indistinguishable from "no socket data", which would spin the readiness poll at full CPU. A blocking pipe blocks
-    /// the splice on an io-wq worker instead:
-    /// that is the transfer's designed backpressure.
+    /// The fd a framer handed to [`Framing::SpliceBody`] was unusable, closed or opened non-blocking. This is a
+    /// consumer bug, not peer behavior. `splice` turns the output fd's `O_NONBLOCK` into `SPLICE_F_NONBLOCK`, so a full
+    /// pipe fails `-EAGAIN` before the socket is read, which looks like no socket data and would spin the readiness
+    /// poll.
     ///
-    /// Over kTLS the block is not only "the pipe is full" - see the `net::server` module docs: the destination pipe's
-    /// mutex is held across a wait for the next TLS record, so one silent peer stalls every other body spliced to the
-    /// same fd. Give each connection its own pipe there.
+    /// Over kTLS the destination pipe's mutex is held across a wait for the next TLS record, so one silent peer stalls
+    /// every other body spliced to the same fd. Give each connection its own pipe there.
     SpliceBadFd,
-    /// A framer named a [`Framing::SpliceBody`] destination that another connection is already splicing to. **Sharing
-    /// one pipe across connections corrupts bodies, not just latency.**
-    ///
-    /// A splice moves at most what the transport hands over in one call - over kTLS, one TLS record - and the reactor
-    /// resubmits the remainder as a fresh op. Between those two, another connection's splice can take the pipe's mutex
-    /// and write its own bytes, so two bodies sharing a destination **interleave**. The head-of-line stall a shared
-    /// pipe also causes (see [`CloseReason::SpliceBadFd`]) is the same configuration, noticed from the other end.
-    ///
-    /// Give each connection its own pipe. This is a consumer bug, not peer behaviour - a captured-fd closure is the
-    /// shape that invites it.
+    /// A framer named a [`Framing::SpliceBody`] destination that another connection is already splicing to. Sharing one
+    /// pipe corrupts bodies. A splice moves at most what the transport hands over in one call, and the reactor
+    /// resubmits the remainder as a fresh op, so between the two another connection's splice can write its own bytes.
+    /// Give each connection its own pipe.
     SpliceFdInUse,
     /// A kTLS [`Framing::SpliceBody`] on a role with no request clock - `ServerConfig::request_timeout`, or its client
     /// spelling `ClientConfig::response_timeout`.
     ///
-    /// That clock is the *only* bound a kTLS body splice has. It blocks on an io-wq worker awaiting the next TLS
-    /// record, which no linked timeout can reach (the kernel arms one only after the head op's `issue()` returns, and a
-    /// blocking splice's does not return until it completes), so the standalone watchdog keyed on `request_timeout` is
-    /// what cancels a stalled one. Unset, a peer that handshakes, declares a large body and goes silent holds its slot,
-    /// an io-wq worker and its destination pipe's mutex for as long as it likes.
-    ///
-    /// Refused rather than served unbounded: the remedy is one configuration line, and a silent unbounded stall is not
-    /// something an operator can find. Plain-TCP splices are unaffected - their readiness-poll path is already clocked.
+    /// That clock is the only bound a kTLS body splice has. The splice blocks on an io-wq worker awaiting the next
+    /// record, and the kernel arms a linked timeout only after the head op's `issue()` returns, which a blocking
+    /// splice's does not until it completes. Unset, a silent peer would hold its slot, an io-wq worker and its pipe's
+    /// mutex for good, so the splice is refused. Plain-TCP splices are already clocked through their readiness poll.
     SpliceUnbounded,
 }
 
 /// The current message's body, as handed to the `body` handler.
 ///
-/// Dereferences to `[u8]` for in-place reads. [`Body::take`] yields the bytes as an owned `Vec<u8>` - a zero-copy move
-/// when the body was **placed** in its own allocation (bodies at or over `ServerConfig::body_placement_threshold`), an
-/// in-place truncate when the body owns a **window** of a larger wire buffer (no allocation, at most one overlapping
-/// move - how the http codec delivers a de-chunked entity), and a copy-out otherwise - so a handler that offloads work
-/// writes one pattern that is never wrong: `let payload = body.take();`. After `take` the body reads as empty. A
-/// handler that writes the body out or keeps it whole takes [`Body::take_owned`] instead, which hands over the storage
-/// with the body's range in it and never copies. A server's placed body that is dropped untaken goes back to the ring's
-/// body pool for the next one.
+/// Dereferences to `[u8]` for in-place reads. [`Body::take`] yields the bytes as an owned `Vec<u8>`, a move when the
+/// body was placed in its own allocation, an in-place truncate when it owns a window of a larger wire buffer, and a
+/// copy otherwise, so `let payload = body.take();` is never wrong. After `take` the body reads as empty.
+/// [`Body::take_owned`] hands over the storage with the body's range in it and never copies. A placed body dropped
+/// untaken goes back to the ring's body pool.
 pub struct Body<'a> {
     inner: BodyInner<'a>,
     /// The ring's body pool, for a body that owns storage the reactor read it into, so storage the handler leaves
@@ -442,18 +409,15 @@ impl std::fmt::Debug for Body<'_> {
     }
 }
 
-/// One outgoing reply segment's bytes: an owned buffer, or a borrow that lives for the whole process. The send queue
-/// holds a segment until the peer drains it - across partial writes and suspended sends - so a borrowed segment must
-/// outlive every retry; `'static` is the bound that makes pinning it free, and it is exactly what a canned reply body
-/// or protocol constant already has. Anything shorter-lived must be owned.
+/// One outgoing reply segment's bytes, an owned buffer or a `'static` borrow. The send queue holds a segment until the
+/// peer drains it, across partial writes and suspended sends, so a borrowed segment must outlive every retry and
+/// anything shorter-lived must be owned.
 ///
 /// Constructed via `From`/`Into`: `Vec<u8>`, `String`, `&'static [u8]`, `&'static str`, and `Cow<'static, [u8]>` all
 /// convert without copying. [`SendBuf::recycled`] makes an owned segment whose storage the ring's body pool takes back
 /// once sent. Dereferences to `[u8]`.
-///
-/// Opaque rather than a `Cow` alias so a shared-buffer representation (one cached body serving many connections at
-/// once) can arrive without changing the segment type.
 #[derive(Debug)]
+// Opaque rather than a `Cow` alias, so a shared-buffer form can arrive without changing the segment type.
 pub struct SendBuf(Seg);
 
 #[derive(Debug)]
@@ -481,10 +445,8 @@ enum Seg {
 
 impl SendBuf {
     /// Owned bytes whose storage goes to the serving ring's body pool once every byte is sent, for the next claim on
-    /// that ring to reuse.
-    /// Meant for a buffer drawn from `BodyRecycler::claim`, so a reply built in it costs no allocation once the pool is
-    /// warm. The pool's byte law keeps it while demand needs it and frees it otherwise. A deferred reply is marked by
-    /// sending it with `Deferred::reply_recycled`.
+    /// that ring to reuse. Meant for a buffer drawn from `BodyRecycler::claim`, so a reply built in it costs no
+    /// allocation once the pool is warm. A deferred reply is marked by sending it with `Deferred::reply_recycled`.
     ///
     /// Its storage goes home as well when its connection closes before it is sent. It is freed as any owned segment is
     /// when it is empty or when the ring has no body pool.

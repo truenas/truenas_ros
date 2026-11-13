@@ -1,12 +1,9 @@
 use super::*;
 
 impl<U> Reactor<U> {
-    /// Arm the standalone kTLS-splice inactivity watchdog: a single `TIMEOUT` per connection (the
-    /// `splice_deadline_armed` flag makes it idempotent -- at most one is ever in flight, which is what keeps a stale
-    /// expiry from ever aliasing a later body's splice). On expiry `on_splice_deadline` re-arms if the body made
-    /// progress, or cancels the stalled splice. Keyed `(slot, generation)` so a recycled slot's expiry is inert. No-op
-    /// unless `request_timeout` is set (the watchdog is that clock for the kTLS splice, which no linked timeout can
-    /// reach).
+    /// Arm the standalone kTLS-splice inactivity watchdog, one armed `TIMEOUT` per connection, idempotent on
+    /// `splice_deadline_armed`. On expiry `on_splice_deadline` re-arms if the body made progress, or cancels the
+    /// stalled splice. A no-op unless `request_timeout` is set, since the watchdog is that clock for the kTLS splice.
     pub(super) fn arm_splice_deadline(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
         if self.cfg.request_timeout.is_none() {
             return Ok(());
@@ -55,25 +52,17 @@ impl<U> Reactor<U> {
         })
     }
 
-    /// The kTLS-splice inactivity watchdog fired or was cancelled. Acts ONLY on a genuine expiry (`-ETIME`) of the
-    /// CURRENT watchdog on a live slot:
-    ///  * not `-ETIME` -> a cancel completion (body done / close) - ignore;
-    ///  * slot recycled / not serving / disarmed -> stale - ignore;
-    ///  * body no longer actively splicing (finished, or the brief gap
-    ///    between records) -> self-stop;
-    ///  * `splice_remaining` fell below the watermark -> progress -> re-arm against the new remaining (never cancels a
-    ///    healthy transfer, even
-    ///    if the expiry raced a record landing);
-    ///  * remaining unchanged for a whole `request_timeout` -> stalled -> cancel the blocked splice by `user_data`; its
-    ///    `-ECANCELED`/interrupted completion is classified `RequestTimeout` in `on_splice_recv`.
+    /// The kTLS-splice inactivity watchdog fired or was cancelled. It acts only on a genuine expiry (`-ETIME`) of the
+    /// current watchdog on a live slot.
+    ///  * A body no longer splicing stops the watchdog.
+    ///  * A body whose `splice_remaining` fell below the watermark made progress, so the watchdog re-arms against the
+    ///    new remaining and never cancels a healthy transfer.
+    ///  * A body unchanged for a whole `request_timeout` is stalled, and its splice is cancelled by `user_data`. That
+    ///    completion is classified `RequestTimeout` in `on_splice_recv`.
     pub(crate) fn on_splice_deadline(&mut self, slot: u32, generation: u32, res: i32) -> errno::Result<()> {
-        // A retired watchdog still owes one completion, and the retire only staged its cancel - `run_loop` submits at
-        // the top of the next iteration, after this reap loop drains. So the old timer's `-ETIME` can already be posted
-        // when its body finishes "just inside" the period, while the successor is armed one dispatch later inside the
-        // same batch (`on_splice_recv_complete` -> pump -> `submit_splice_recv`). Read off the flag alone that expiry
-        // takes the live path and reaches `Next::Cancel` - `splice_watermark` equals `splice_remaining` at every arm -
-        // so it cancels the *successor's* splice, which completes `-ECANCELED` and is classified `RequestTimeout`: a
-        // healthy transfer killed at its first record, with the watchdog now disarmed.
+        // A retired watchdog still owes one completion, and its cancel is only staged until the next loop pass. Its
+        // `-ETIME` can arrive after the successor was armed in the same batch, and read off the flag alone it would
+        // cancel the successor's healthy splice, since `splice_watermark` equals `splice_remaining` at every arm.
         if let Some(conn) = self.table.conn_at_cqe_mut(slot, generation)
             && conn.splice_deadline_owed > 0
         {
@@ -118,19 +107,14 @@ impl<U> Reactor<U> {
         }
     }
 
-    /// Arm the total-receipt budget for the message now arriving: a single standalone `TIMEOUT` per connection,
-    /// idempotent on `receipt_deadline_armed`.
+    /// Arm the total-receipt budget for the message now arriving, one standalone `TIMEOUT` per connection, idempotent
+    /// on `receipt_deadline_armed`. A no-op unless `max_receipt_time` is set.
     ///
-    /// **Never cancel before arming here.** A `More`/delimiter scan re-enters `submit_recv` on every chunk, so a
-    /// cancel-then-arm rides the trickle and reproduces `request_timeout` under a second name
-    /// (`a_chunk_scan_budget_is_not_restarted_by_progress`). The early return below is dedup only - one timer in flight
-    /// rather than one per chunk read; a stacked timer would not break the bound, since `on_receipt_deadline` charges
-    /// an expiry it did not arm to the retired count instead.
+    /// **Never cancel before arming here.** A `More` scan re-enters `submit_recv` on every chunk, so cancel-then-arm
+    /// would restart the budget on every trickle (`a_chunk_scan_budget_is_not_restarted_by_progress`).
     ///
-    /// Keyed `(slot, generation)`, so a recycled slot's expiry is inert.
-    /// That is the slot's generation, not the timer's, so it does **not** tell one budget from its successor -
-    /// `receipt_deadline_owed` is what does.
-    /// No-op unless `max_receipt_time` is set.
+    /// Keyed `(slot, generation)`, the slot's generation and not the timer's, so the key does not tell one budget from
+    /// its successor. `receipt_deadline_owed` does.
     #[cfg(feature = "net-server")]
     pub(super) fn arm_receipt_deadline(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
         if self.cfg.max_receipt_time.is_none() {
@@ -151,12 +135,7 @@ impl<U> Reactor<U> {
         })
     }
 
-    /// Cancel a parked read's pool-shortage retry timer, for a connection that is closing.
-    ///
-    /// The same reason the other two standalone timers are cancelled there: it is not an `ops`-counted op, so nothing
-    /// else reaps it, and an uncancelled one keeps `inflight` up until it expires - delaying an otherwise idle
-    /// `serve_forever`'s exit. It is also the only one armed by default (`recv_shortage_retry`), so it is the one most
-    /// likely to be pending at a close.
+    /// Cancel a parked read's pool-shortage retry timer, for a connection that is closing (see `close_conn`).
     #[cfg(feature = "net-server")]
     pub(crate) fn cancel_recv_retry(&mut self, slot: u32, generation: u32) -> errno::Result<()> {
         let armed = match self.table.get_conn_mut(slot) {
@@ -177,8 +156,7 @@ impl<U> Reactor<U> {
         })
     }
 
-    /// Retire the receipt budget: the message was delivered, or its connection is closing. Clears the flag and cancels
-    /// the in-flight `TIMEOUT`; the cancelled timer completes `-ECANCELED`, which `on_receipt_deadline` ignores.
+    /// Retire the receipt budget, since the message was delivered or its connection is closing.
     ///
     /// Called at **delivery**, which is what keeps this a bound on receipt and not on handling: a request offloaded to
     /// a worker has already had its clock retired by the time the handler runs.
@@ -238,16 +216,12 @@ impl<U> Reactor<U> {
     /// The receipt budget elapsed (`Op::ReceiptDeadline`). The message that armed it is still arriving, so the peer is
     /// under the floor the deployment set: close and reclaim the slot.
     ///
-    /// A `-ECANCELED` is the retire path's own cancel and means the message landed in time. A stale `-ETIME` - the
-    /// timer expiring after its cancel was staged - is consumed against [`Connection::receipt_deadline_owed`], not
-    /// against the flag: the successor can be armed before the stale expiry is reaped, and the two carry identical
-    /// `user_data`.
+    /// A retired budget's completion, its cancel or an `-ETIME` that beat the cancel, is consumed against
+    /// [`Connection::receipt_deadline_owed`] and not the flag, since the successor can be armed before it is reaped and
+    /// the two carry identical `user_data`.
     #[cfg(feature = "net-server")]
     pub(crate) fn on_receipt_deadline(&mut self, slot: u32, generation: u32, res: i32) -> errno::Result<()> {
-        // The retired budget's own completion - see `Connection::receipt_deadline_owed`. `deliver_one` retires and
-        // `pump -> submit_recv -> arm_receipt_deadline` re-arms inside one dispatch, and the retire is where the old
-        // deadline sits, so a peer that finished just inside its budget posts an `-ETIME` that the successor's flag
-        // would answer with `ReceiptTimeout` on a connection that did nothing wrong.
+        // Read off the flag alone, a peer that finished just inside its budget would be closed with `ReceiptTimeout`.
         if let Some(conn) = self.table.conn_at_cqe_mut(slot, generation)
             && conn.receipt_deadline_owed > 0
         {
