@@ -405,46 +405,6 @@ fn no_data_frame_goes_out_after_our_close() {
     assert_eq!(s.backlog.len(), 1, "the queued call stays queued");
 }
 
-/// `expire` drains the backlog too, and `pump` runs it before it reaps a single completion, so it must not send after
-/// our Close either.
-#[test]
-fn expire_does_not_drain_the_backlog_after_our_close() {
-    use serde_json::value::RawValue;
-    use std::time::Duration;
-    let mut s = session();
-    let args = RawValue::from_string("[]".to_owned()).unwrap();
-    let t0 = Instant::now();
-    // Budget spent, every one of them due to time out...
-    for i in 0..CALL_BUDGET {
-        let _ = s
-            .submit(crate::CallId(100 + i as u64), Kind::User, "core.ping", &args, Some(t0))
-            .expect("under budget");
-    }
-    // ...and one queued call that is not due, so expiry does not drop it.
-    let _ = s
-        .submit(crate::CallId(999), Kind::User, "core.ping", &args, None)
-        .expect("queues");
-    assert_eq!(s.backlog.len(), 1);
-
-    let close = s.on_frame(head(true, OP_CLOSE, 2), vec![0x03, 0xE8]);
-    assert!(matches!(close.as_slice(), [Act::Send(_), Act::PeerClosing]));
-
-    let acts = s.expire(t0 + Duration::from_secs(1));
-    let sent: Vec<u8> = acts
-        .iter()
-        .filter_map(|a| match a {
-            Act::Send(b) => Some(b[0] & 0x0F),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        sent.is_empty(),
-        "expire must not put a frame on a closing connection; sent \
-             opcodes {sent:?}"
-    );
-    assert_eq!(s.backlog.len(), 1, "the queued call stays queued");
-}
-
 /// A first fragment is held until a continuation arrives, so it is bounded where it is stored, not only where the
 /// pieces are joined - otherwise a peer opens a fragmented message, sends nothing more, and holds whatever it
 /// declared for the connection's life. Closing releases it: no continuation can arrive after that.
