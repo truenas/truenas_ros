@@ -144,11 +144,19 @@ fn pump_until(eng: &mut Engine, fs: &mut FsCore, until: impl Fn(&FsCore) -> bool
 }
 
 /// A file of a fresh folder, and a descriptor of it open for reading.
+///
+/// The file is made with no writer. The kernel refuses a read lease while any process holds the file open for
+/// writing, and a test that forks lends its child a copy of whatever writer is open at that moment.
 fn a_file() -> (crate::TempDir, std::path::PathBuf, File) {
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = crate::tempdir().expect("tempdir");
     let path = dir.path().join("f");
-    std::fs::write(&path, b"x").unwrap();
-    let read = std::fs::File::open(&path).unwrap();
+    let read = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CREAT)
+        .mode(0o644)
+        .open(&path)
+        .unwrap();
     (dir, path, File::from_fd(read.into()))
 }
 
@@ -320,7 +328,17 @@ fn a_file_lease_is_refused_where_its_break_could_not_be_heard() {
     let held = c.file_lease(&file);
     assert!(matches!(held, Err(crate::Error::Errno(Errno::EAGAIN))), "{held:?}");
     drop(writer);
-    let id = c.file_lease(&file).expect("a lease once the writer went");
+    // A fork elsewhere in the process may hold a copy of the writer for a moment longer, so the lease is asked again
+    // while the answer is EAGAIN, up to a deadline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let id = loop {
+        match c.file_lease(&file) {
+            Err(crate::Error::Errno(Errno::EAGAIN)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            other => break other.expect("a lease once the writer went"),
+        }
+    };
     c.release_file_lease(id).unwrap();
 }
 
